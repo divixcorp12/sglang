@@ -5,7 +5,9 @@
 #include <sgl_kernel/tensor.h>
 
 #include "lease_device.cuh"
+#include "stream_wait.cuh"
 #include "tensor_checks.h"
+#include "wait_layout.h"
 
 namespace sglang {
 
@@ -167,6 +169,55 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   st_release_sys(page + kAdviseHead, advice);
 }
 
+// Publish one wait request to an independent CPU monitor. The following stream
+// memory operation sleeps without an SM, then the original wait kernel validates
+// this generation once. Reuse is safe because each preparation follows the
+// preceding completion and validator in the same execution chain.
+struct WaitPrepareParams {
+  uint8_t* page;
+  int32_t* state;
+  uint8_t* lease;
+  uint8_t* completion;
+  const int32_t* count;  // null for the legacy wait, whose count is clamped
+  int64_t lanes;
+  int64_t timeout_ns;
+  bool use_request_deadline;
+};
+
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_wait_prepare_kernel(
+    const __grid_constant__ WaitPrepareParams p) {
+  using namespace device::expert_stream;
+  if (threadIdx.x != 0) return;
+  st_relaxed_sys<uint32_t>(p.completion + kWaitCompletionReady, 0u);
+  const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
+  const uint64_t generation =
+      seq != 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(p.state[kPendingEpoch])) << 32) | seq : 0ull;
+  int64_t duration =
+      p.use_request_deadline ? static_cast<int64_t>(load_deadline(p.state) - global_ns()) : p.timeout_ns;
+  if (duration < 0) duration = 0;
+  st_relaxed_sys<uint64_t>(p.completion + kWaitCompletionTimeoutNs, static_cast<uint64_t>(duration));
+  uint64_t tag = kWaitTagPending;
+  if (p.state[kSticky] != 0 || (p.use_request_deadline && p.state[kReqFailed] != 0) ||
+      ld_acquire_sys(p.page + kFatal) != 0 ||
+      (p.lease != nullptr && ld_acquire_sys(p.lease + kLeaseHeaderShutdown) != 0)) {
+    tag = kWaitTagAborted;
+  } else if (seq == 0 || (p.count != nullptr && (p.count[0] > kLeaseLanes || p.count[0] > p.lanes))) {
+    // The validator still diagnoses invalid plans. Do not wait for the host to
+    // serve a request that the validator is already required to reject.
+    tag = kWaitTagBypass;
+  }
+  if (tag == kWaitTagPending) p.state[kWaits] += 1;
+  st_release_sys64(p.completion + kWaitCompletionToken, tagged_word(tag, generation));
+  if (tag != kWaitTagPending) st_release_sys(p.completion + kWaitCompletionReady, 1u);
+}
+
+SGL_DEVICE uint64_t wait_completion_tag(const uint8_t* completion, uint64_t generation) {
+  using namespace device::expert_stream;
+  const uint64_t token = ld_acquire_sys64(completion + kWaitCompletionToken);
+  // A stale completion can never commit a new request's copy plan.
+  return (token & ((1ull << 56) - 1)) == generation ? token >> 56 : kWaitTagAborted;
+}
+
 struct WaitParams {
   uint8_t* page;
   int32_t* state;
@@ -180,6 +231,7 @@ struct WaitParams {
   float* keep;
   int64_t* ram_miss;
   int64_t timeout_ns;
+  const uint8_t* completion;
 };
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_wait_kernel(
@@ -195,37 +247,20 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   int64_t* __restrict__ const host_rows = p.host_rows;
   float* __restrict__ const keep = p.keep;
   int64_t* __restrict__ const ram_miss = p.ram_miss;
-  const int64_t timeout_ns = p.timeout_ns;
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   // D15: the page's fatal word too, not only this device's sticky flag.
   bool ok = state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0;
   const uint32_t seq = static_cast<uint32_t>(state[kPending]);
   if (ok && seq != 0) {
-    state[kWaits] += 1;
-    const uint64_t start = global_ns();
-    int64_t polls = 0;
-    bool aborted = false;
-    uint32_t done = ld_acquire_sys(page + kDemandDone);
-    while (!reached(done, seq) && static_cast<int64_t>(global_ns() - start) < timeout_ns) {
-      // A fatal word ends the wait early, as in the lease waits: nobody will serve this request. There is no lease
-      // header here, so no shutdown word to check.
-      if (ld_acquire_sys(page + kFatal) != 0) {
-        aborted = true;
-        break;
-      }
-      __nanosleep(256);
-      ++polls;
-      done = ld_acquire_sys(page + kDemandDone);
-    }
-    const int64_t total = static_cast<int64_t>(state[kPolls]) + polls;
-    state[kPolls] = static_cast<int32_t>(total < 0x7fffffffLL ? total : 0x7fffffffLL);
-    if (!reached(done, seq)) {
+    const uint64_t generation =
+        (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq;
+    const uint64_t outcome = wait_completion_tag(p.completion, generation);
+    const uint32_t done = ld_acquire_sys(page + kDemandDone);
+    if (outcome != kWaitTagReady || !reached(done, seq)) {
+      if (outcome == kWaitTagTimeout) state[kTimeouts] += 1;
+      raise_fatal(page, seq);
       ok = false;
-      if (!aborted) {  // the page is already failed on an abort: no timeout to count and no fatal word to raise
-        state[kTimeouts] += 1;
-        raise_fatal(page, seq);
-      }
     } else {
       // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
@@ -283,6 +318,7 @@ struct LeaseWaitParams {
   int64_t lease_d;
   int32_t* go_count;
   int64_t* lane_ctx;
+  const uint8_t* completion;
 };
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_wait_kernel(
@@ -296,7 +332,6 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   int64_t* __restrict__ const host_rows = p.host_rows;
   float* __restrict__ const keep = p.keep;
   int64_t* __restrict__ const ram_miss = p.ram_miss;
-  const int64_t timeout_ns = p.timeout_ns;
   uint8_t* __restrict__ const lease = p.lease;
   const int64_t lease_d = p.lease_d;
   int32_t* __restrict__ const go_count = p.go_count;
@@ -320,31 +355,16 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     fatal_word = 0xFFFFFFFFu;
   }
   if (ok && seq != 0) {
-    state[kWaits] += 1;
-    const uint64_t start = global_ns();
-    int64_t polls = 0;
-    bool aborted = false;
-    uint32_t done = ld_acquire_sys(page + kDemandDone);
-    while (!reached(done, seq) && static_cast<int64_t>(global_ns() - start) < timeout_ns) {
-      // A fatal word or the header's shutdown ends the wait early (D4): nobody will serve this request.
-      if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) {
-        aborted = true;
-        break;
-      }
-      __nanosleep(256);
-      ++polls;
-      done = ld_acquire_sys(page + kDemandDone);
-    }
-    const int64_t total = static_cast<int64_t>(state[kPolls]) + polls;
-    state[kPolls] = static_cast<int32_t>(total < 0x7fffffffLL ? total : 0x7fffffffLL);
-    if (!reached(done, seq)) {
+    const uint64_t outcome = wait_completion_tag(p.completion, generation);
+    const uint32_t done = ld_acquire_sys(page + kDemandDone);
+    if (outcome != kWaitTagReady || !reached(done, seq)) {
       ok = false;
-      if (aborted) {
-        reason = kLeaseReasonAborted;
-      } else {
+      if (outcome == kWaitTagTimeout) {
         state[kTimeouts] += 1;
         reason = kLeaseReasonTimeout;
         fatal_word = seq;
+      } else {
+        reason = kLeaseReasonAborted;
       }
     } else {
       // `done` came from an acquire load, which orders every load below after it: no fence needed.
@@ -605,6 +625,7 @@ struct RestWaitParams {
   int32_t* go_2;
   int64_t* lane_ctx_2;
   int32_t* origin_2;
+  const uint8_t* completion;
 };
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_rest_wait_kernel(
@@ -651,29 +672,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       seq != 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq : 0ull;
 
   if (ok && seq != 0) {
-    state[kWaits] += 1;
-    const uint64_t deadline = load_deadline(state);
-    int64_t polls = 0;
-    bool aborted = false;
-    uint32_t done = ld_acquire_sys(page + kDemandDone);
-    while (!reached(done, seq) && static_cast<int64_t>(global_ns() - deadline) < 0) {
-      if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) {
-        aborted = true;
-        break;
-      }
-      __nanosleep(256);
-      ++polls;
-      done = ld_acquire_sys(page + kDemandDone);
-    }
-    const int64_t total = static_cast<int64_t>(state[kPolls]) + polls;
-    state[kPolls] = static_cast<int32_t>(total < 0x7fffffffLL ? total : 0x7fffffffLL);
-    if (!reached(done, seq)) {
+    const uint64_t outcome = wait_completion_tag(p.completion, generation);
+    const uint32_t done = ld_acquire_sys(page + kDemandDone);
+    if (outcome != kWaitTagReady || !reached(done, seq)) {
       ok = false;
-      if (aborted) {
-        reason = kLeaseReasonAborted;
-      } else {
+      if (outcome == kWaitTagTimeout) {
         state[kTimeouts] += 1;
         reason = kLeaseReasonTimeout;
+      } else {
+        reason = kLeaseReasonAborted;
       }
     } else {
       // `done` came from an acquire load, which orders every load below after it: no fence needed.
@@ -930,9 +937,44 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
 /// lease_ack, lease_hit_wait, lease_rest_wait, lease_stage_ack, lease_finalize and lease_stream_hit_wait.
 ///
 /// Every tensor argument is verified with `TensorMatcher` (named via `verify_named`) and every address/offset with
-/// `RuntimeCheck` before the params struct is built and the kernel launched. FFI signatures are unchanged from the
-/// free launchers they replace, so Python call sites do not change.
+/// `RuntimeCheck` before the params struct is built and the kernel launched. The three long waits additionally
+/// receive the monitor's pinned completion mailbox and enqueue preparation, stream wait, and validation in order.
 struct LeaseProtocolKernel {
+  static uint8_t* prepare_wait(
+      cudaStream_t stream,
+      uint8_t* page,
+      int32_t* state,
+      uint8_t* lease,
+      const int32_t* count,
+      int64_t lanes,
+      int64_t timeout_ns,
+      bool use_request_deadline,
+      int64_t completion_address) {
+    using namespace host;
+    using namespace expert_stream::wire;
+    RuntimeCheck(
+        completion_address != 0 && completion_address % 8 == 0,
+        "completion_address: must name an aligned pinned completion mailbox");
+    CUdeviceptr mapped = 0;
+    expert_stream_driver_check(
+        cuMemHostGetDevicePointer(&mapped, reinterpret_cast<void*>(completion_address), 0),
+        "cuMemHostGetDevicePointer(completion)");
+    uint8_t* completion = reinterpret_cast<uint8_t*>(mapped);
+    const auto params = WaitPrepareParams{
+        .page = page,
+        .state = state,
+        .lease = lease,
+        .completion = completion,
+        .count = count,
+        .lanes = lanes,
+        .timeout_ns = timeout_ns,
+        .use_request_deadline = use_request_deadline,
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_wait_prepare_kernel, params);
+    enqueue_expert_stream_wait(stream, mapped + kWaitCompletionReady, 1u, CU_STREAM_WAIT_VALUE_EQ);
+    return completion;
+  }
+
   static void post(
       tvm::ffi::TensorView page,
       tvm::ffi::TensorView state,
@@ -1033,7 +1075,8 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView host_rows,
       tvm::ffi::TensorView keep,
       tvm::ffi::TensorView ram_miss,
-      int64_t timeout_ns) {
+      int64_t timeout_ns,
+      int64_t completion_address) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1064,6 +1107,16 @@ struct LeaseProtocolKernel {
         "ram_miss", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), ram_miss);
 
     const auto stream = LaunchKernel::resolve_device(state.device());
+    uint8_t* completion = prepare_wait(
+        stream,
+        static_cast<uint8_t*>(page.data_ptr()),
+        static_cast<int32_t*>(state.data_ptr()),
+        nullptr,
+        nullptr,
+        lanes,
+        timeout_ns,
+        false,
+        completion_address);
     const auto params = WaitParams{
         .page = static_cast<uint8_t*>(page.data_ptr()),
         .state = static_cast<int32_t*>(state.data_ptr()),
@@ -1077,6 +1130,7 @@ struct LeaseProtocolKernel {
         .keep = static_cast<float*>(keep.data_ptr()),
         .ram_miss = static_cast<int64_t*>(ram_miss.data_ptr()),
         .timeout_ns = timeout_ns,
+        .completion = completion,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_wait_kernel, params);
   }
@@ -1094,7 +1148,8 @@ struct LeaseProtocolKernel {
       int64_t lease_address,
       int64_t lease_d,
       tvm::ffi::TensorView go_count,
-      tvm::ffi::TensorView lane_ctx) {
+      tvm::ffi::TensorView lane_ctx,
+      int64_t completion_address) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1132,6 +1187,16 @@ struct LeaseProtocolKernel {
     }
 
     const auto stream = LaunchKernel::resolve_device(state.device());
+    uint8_t* completion = prepare_wait(
+        stream,
+        static_cast<uint8_t*>(page.data_ptr()),
+        static_cast<int32_t*>(state.data_ptr()),
+        reinterpret_cast<uint8_t*>(lease_address),
+        static_cast<const int32_t*>(count.data_ptr()),
+        lanes,
+        timeout_ns,
+        false,
+        completion_address);
     const auto params = LeaseWaitParams{
         .page = static_cast<uint8_t*>(page.data_ptr()),
         .state = static_cast<int32_t*>(state.data_ptr()),
@@ -1147,6 +1212,7 @@ struct LeaseProtocolKernel {
         .lease_d = lease_d,
         .go_count = static_cast<int32_t*>(go_count.data_ptr()),
         .lane_ctx = static_cast<int64_t*>(lane_ctx.data_ptr()),
+        .completion = completion,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_wait_kernel, params);
   }
@@ -1391,7 +1457,8 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView claimed,
       tvm::ffi::TensorView go_2,
       tvm::ffi::TensorView lane_ctx_2,
-      tvm::ffi::TensorView origin_2) {
+      tvm::ffi::TensorView origin_2,
+      int64_t completion_address) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1435,6 +1502,16 @@ struct LeaseProtocolKernel {
     }
 
     const auto stream = LaunchKernel::resolve_device(state.device());
+    uint8_t* completion = prepare_wait(
+        stream,
+        static_cast<uint8_t*>(page.data_ptr()),
+        static_cast<int32_t*>(state.data_ptr()),
+        reinterpret_cast<uint8_t*>(lease_address),
+        static_cast<const int32_t*>(count.data_ptr()),
+        lanes,
+        0,
+        true,
+        completion_address);
     const auto params = RestWaitParams{
         .page = static_cast<uint8_t*>(page.data_ptr()),
         .state = static_cast<int32_t*>(state.data_ptr()),
@@ -1452,6 +1529,7 @@ struct LeaseProtocolKernel {
         .go_2 = static_cast<int32_t*>(go_2.data_ptr()),
         .lane_ctx_2 = static_cast<int64_t*>(lane_ctx_2.data_ptr()),
         .origin_2 = static_cast<int32_t*>(origin_2.data_ptr()),
+        .completion = completion,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_rest_wait_kernel, params);
   }

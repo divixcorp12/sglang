@@ -62,3 +62,35 @@ def test_delayed_request_times_out_without_device_polling(tmp_path):
     finally:
         host.inject(delay_s=0.0)
         _close(host, slabs)
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["lease", "rest"])
+def test_delayed_lease_copy_completes_without_device_polling(tmp_path, staged):
+    from test_exl3_lease_kernels_cuda import Service, _delivered
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    service = Service(tmp_path)
+    try:
+        service.plan([3, 5])
+        service.host.inject(delay_s=0.03)
+        dev = service.dev
+        if not staged:
+            service.step()
+        else:
+            dev.post(0, service.planned, service.count, service.routes, -1)
+            dev.hit_wait(0, service.planned, service.count, service.dest_slots, 0)
+            copy_expert_row_segments_gpu(service.segments, dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+            dev.stage_ack(1)
+            dev.rest_wait(0, service.planned, service.count, service.dest_slots, service.ram_miss)
+            copy_expert_row_segments_gpu(service.segments, dev.host_rows_2, dev.dst_slots_2, dev.go_2)
+            dev.stage_ack(2)
+            dev.finalize(service.count, service.keep)
+        torch.cuda.synchronize()
+        assert service.keep.item() == 1.0
+        _delivered(service, [3, 5])
+        assert dev.stats()["polls"] == 0
+        assert service.until(lambda: service.host.counters()["leases_acked"] == 2)
+        assert service.host.fatal_seq() == 0
+    finally:
+        service.host.inject(delay_s=0.0)
+        service.close()

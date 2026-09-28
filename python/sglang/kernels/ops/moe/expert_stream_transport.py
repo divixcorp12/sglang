@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
 
 # Rows per io_uring batch, and per bounce bank: the C++ reader has kBanks = 2 banks of kBounceRows = 8
@@ -1214,11 +1214,40 @@ def _device_module(layout: str = "exl3") -> Module:
 
 
 @cache_once
+def _wait_completion_module() -> Module:
+    return load_jit(
+        "expert_stream_wait_completion",
+        cpp_files=["moe/expert_stream_wait.cpp"],
+        extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden"],
+        extra_ldflags=["-lpthread"],
+        header_only=False,
+    )
+
+
+# If CUDA cannot establish quiescence, retain the monitor and its buffers for the
+# process lifetime rather than freeing memory a queued graph may still access.
+_wait_completion_quarantine: list[tuple] = []
+
+
+def _close_wait_completion(module, handle: int, _owners: tuple, device: torch.device) -> None:
+    # Keep servicing cancellation until queued preparations and waits have drained.
+    # Joining first could strand a preparation that has not executed yet.
+    module.expert_stream_wait_completion_cancel(handle)
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:
+        _wait_completion_quarantine.append((module, handle, _owners, device))
+        raise
+    module.expert_stream_wait_completion_close(handle)
+
+
+@cache_once
 def _device_module_cached(layout: str) -> Module:
     return load_jit(
         f"expert_stream_{layout}",
         cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
+        extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],
     )
 
 
@@ -1233,6 +1262,7 @@ def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Mo
         cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
         extra_cuda_cflags=[f"-D{d}" for d in defines],
+        extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],
     )
 
 
@@ -1409,6 +1439,24 @@ class ExpertStreamDevice:
             self.stream_fault = torch.zeros(len(STREAM_FAULT_WORDS), dtype=torch.int32, device=device)
             self._lease_p = int(lease_layout.piece_offset)
 
+        # Construct before capture: a CPU monitor owns the long wait, and GPU work
+        # uses a fixed-address stream memory dependency. One sequential chain per mailbox.
+        self._completion_address = 0
+        self._wait_completion = None
+        self._wait_completion_finalizer = None
+        if torch.device(device).type == "cuda":
+            self._wait_completion = torch.zeros(32, dtype=torch.uint8, pin_memory=True)
+            module = _wait_completion_module()
+            handle = int(module.expert_stream_wait_completion_open(
+                self.page, self._wait_completion, self._lease_address,
+            ))
+            self._completion_address = int(self._wait_completion.data_ptr())
+            self._wait_completion_finalizer = weakref.finalize(
+                self, _close_wait_completion, module, handle,
+                (self.page, self._wait_completion, self.lease_block),
+                self.state.device,
+            )
+
     def _kernels(self):
         if self._module is None:
             self._module = _device_module(self._layout)
@@ -1464,10 +1512,12 @@ class ExpertStreamDevice:
             self._kernels().expert_stream_lease_wait(
                 self.page, self.state, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns,
                 self._lease_address, self._lease_d, self.go_count, self.lane_ctx,
+                self._completion_address,
             )
             return
         self._kernels().expert_stream_wait(
-            self.page, self.state, self.slot_map, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns
+            self.page, self.state, self.slot_map, planned, count, row, host_rows, keep, ram_miss, self.timeout_ns,
+            self._completion_address,
         )
 
     def ack(self, keep) -> None:
@@ -1526,6 +1576,7 @@ class ExpertStreamDevice:
         self._kernels().expert_stream_lease_rest_wait(
             self.page, self.state, planned, count, dst_slots, row, self.host_rows_2, self.dst_slots_2, ram_miss,
             self._lease_address, self._lease_d, self.claimed, self.go_2, self.lane_ctx_2, self.origin_2,
+            self._completion_address,
         )
 
     def stream(self, row: int, planned, count, dst_slots, ram_miss, segments, segment_map) -> None:

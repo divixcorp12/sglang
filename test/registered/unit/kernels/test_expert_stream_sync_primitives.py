@@ -43,8 +43,8 @@ def kernel_body(name: str, kernel: str) -> str:
     return text[start : text.index("\n}", start)]
 
 
-def test_the_three_device_headers_are_found():
-    assert sorted(HEADERS) == ["lease_device.cuh", "lease_kernels.cuh", "row_copy_kernels.cuh"]
+def test_the_device_and_stream_headers_are_found():
+    assert sorted(HEADERS) == ["lease_device.cuh", "lease_kernels.cuh", "row_copy_kernels.cuh", "stream_wait.cuh"]
 
 
 def test_cache_hinted_copies_and_the_timer_use_intrinsics_not_ptx():

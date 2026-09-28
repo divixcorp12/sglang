@@ -294,7 +294,7 @@ def _unserved_device(timeout_ms):
     return page, dev, b, seq
 
 
-def test_a_fatal_raised_while_the_wait_polls_ends_it_promptly():
+def test_a_fatal_raised_while_the_stream_waits_ends_it_promptly():
     """The plain wait rechecks the page's fatal word inside its poll loop, as the lease waits do: once the service
     has failed nobody will serve the request, so the wait fails closed at once instead of running out its timeout,
     counts no timeout and raises no fatal word of its own."""
@@ -313,7 +313,7 @@ def test_a_fatal_raised_while_the_wait_polls_ends_it_promptly():
     assert elapsed < 0.25, f"the wait took {elapsed:.3f} s against a 5 s timeout"
     stats = dev.stats()
     assert stats["timeouts"] == 0 and stats["failures"] == 0 and stats["sticky"] == 1 and stats["pending"] == 0
-    assert stats["waits"] == 1 and stats["polls"] > 0
+    assert stats["waits"] == 1 and stats["polls"] == 0
     assert b["keep"].item() == 0.0 and page_word(page, "fatal") == 99
 
 
@@ -326,7 +326,7 @@ def test_an_unserved_wait_still_times_out_and_raises_fatal():
     torch.cuda.synchronize()
     assert time.perf_counter() - start >= 0.2
     stats = dev.stats()
-    assert stats["timeouts"] == 1 and stats["sticky"] == 1 and stats["polls"] > 0
+    assert stats["timeouts"] == 1 and stats["sticky"] == 1 and stats["polls"] == 0
     assert b["keep"].item() == 0.0 and page_word(page, "fatal") == seq
 
 
