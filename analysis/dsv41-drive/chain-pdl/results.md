@@ -432,3 +432,37 @@ both sides of the upgrade:
 The conclusion does not depend on it, since base without PDL stalls at least as often as the shipped configuration.
 From 23:38, NVML (`nvidia-smi`) fails with "Driver/library version mismatch", which stopped the A/B arms before any
 server started.
+
+### Production-recipe decode A/B (2026-09-28)
+
+**Setup:**
+- **Worktree:** `/data/models/slang/nvfp4-work/wt-lpdl-m`, detached at a2f0ae97b0 (`expert-stream-lease-pdl`), clean.
+  The Python tree is registered as generation `lease-pdl-a2f0ae97b0`.
+- **Recipe:** `arm_env` as is (`PINNED_HOST_NUMA_MB 0:61440,1:40960`).
+- **Arms:** A has `SGLANG_DSV41_ENABLE_LEASE_PDL=0`; B has `=1`.
+- **Order:** A then B, one run each, through `run_arm.sh` with EXPECT_SHA a2f0ae97b0 on port 30021.
+- **Locks:** rowimg-disk.lock was held throughout, and cc-gpu.lock was taken per arm.
+- **Before each arm:** `nvidia-smi` agreed with `/proc/driver/nvidia/version` (615.71.09), and no foreign
+  pytest/cc1plus/nvcc process was running.
+- **Gates:** the harness's gates passed in both arms: preflight, generation, env, and readiness (3 warm-up rounds each,
+  0 compile events). The verdict for both was "valid except the acknowledged step-latency gap".
+
+Command: `arm_metrics.py A=<A> B=<B>`, with A = `servers/lpdl-A/run-20260928-012727` and B =
+`servers/lpdl-B/run-20260928-014542`.
+
+| session | A, flag off | B, flag on | B − A |
+|---|---:|---:|---:|
+| `...ETR/2004/page_261.pdf-1` (85 tokens) | 101.5 ms/token (9.856 tok/s) | 101.6 ms/token (9.844 tok/s) | +0.1 |
+| `...CDW/2015/page_35.pdf-2` (7 tokens) | 127.3 ms/token | 127.7 ms/token | +0.4 |
+| pooled | 103.2 ms/token | 103.3 ms/token | +0.1 |
+| TTFT, mean | 8.31 s | 8.31 s | |
+| stalls ≥ 0.5 s / ≥ 2 s | 0 / 0 | 0 / 0 | |
+| outputs | | **2 of 2 byte-identical to A** | |
+
+**Reading.** Outputs are byte-identical. The delta is +0.1 ms/token, which is noise: it is below the ~1 ms/token
+threshold. That matches the expected saving of ~1 µs/layer (~0.04 ms/token).
+
+**`paired.py` refused to pair the arms** (`ClockProfileMismatchError`: mean 2771 vs 2970 MHz). The cause is arm A's
+7-token session, which started at 2572 MHz and ended at 2955. Every other session, including the 85-token session that
+carries the comparison, started at 2970 MHz. So the refusal concerns the short session, and the long-session figures
+are the comparable ones.
