@@ -304,6 +304,13 @@ class UringReader {
     const int rc = io_uring_queue_init_params(depth_, &ring_, &p);
     if (rc < 0) {
       if (requested_flags_ != 0) error("requested io_uring setup mode is unsupported or unavailable", rc);
+      // Explicit registration options refuse too, never quietly: the ring's own memory can be charged to the memlock
+      // limit (RLIMIT_MEMLOCK=0 refuses it with ENOMEM on 6.12), the same limit registration is charged to.
+      if (fixed_reads() || options_.fixed_files) {
+        const std::string operation = "creating the ring for registered buffers or files (RLIMIT_MEMLOCK=" +
+                                      memlock_limit() + ")";
+        error(operation.c_str(), rc);
+      }
       return false;
     }
     ready_ = true;
@@ -372,15 +379,16 @@ class UringReader {
     uint64_t bytes = 0;
     for (const auto& r : regions_)
       bytes += r.bytes;
-    rlimit limit{};
-    const bool known = getrlimit(RLIMIT_MEMLOCK, &limit) == 0;
-    const std::string memlock = !known                           ? std::string("unknown")
-                                : limit.rlim_cur == RLIM_INFINITY ? std::string("unlimited")
-                                                                  : std::to_string(limit.rlim_cur);
+    const std::string memlock = memlock_limit();
     throw std::runtime_error(
         "expert stream registering fixed buffers (regions=" + std::to_string(regions_.size()) +
         ", chunks=" + std::to_string(chunks) + ", bytes=" + std::to_string(bytes) + ", largest=" +
         std::to_string(largest) + ", cap=" + std::to_string(chunk_cap_) + ", RLIMIT_MEMLOCK=" + memlock + "): " + why);
+  }
+  static std::string memlock_limit() {
+    rlimit limit{};
+    if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0) return "unknown";
+    return limit.rlim_cur == RLIM_INFINITY ? std::string("unlimited") : std::to_string(limit.rlim_cur);
   }
   void close_ring() noexcept {
     if (!ready_) return;
