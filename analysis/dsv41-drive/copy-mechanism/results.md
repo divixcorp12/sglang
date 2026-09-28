@@ -421,7 +421,8 @@ trials and 6,300 GPU reads.
 - **Whether the WC slab's reads were actually no-snoop is unknown.**
   - The driver exposes no no-snoop setting: `/proc/driver/nvidia/params` has only `EnablePCIERelaxedOrderingMode: 0`.
   - No TLP capture was taken.
-  - The GPU's DevCtl `NoSnoop+/-` bit (in `lspci -vvv`) was not in the readout.
+  - The GPU's DevCtl reads `RlxdOrd+ ExtTag+ PhantFunc- AuxPwr- NoSnoop+` (the user's `lspci -vvv`), so the GPU
+    is *allowed* to set the no-snoop attribute, but whether the WC reads actually did remains unknown.
 
   If the reads were snooped, this check could not have failed. Then the zero says the driver does not use no-snoop
   for these reads, not that no-snoop would be safe.
