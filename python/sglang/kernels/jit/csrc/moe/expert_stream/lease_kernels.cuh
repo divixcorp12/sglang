@@ -36,6 +36,8 @@ struct PostParams {
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_post_kernel(
     const __grid_constant__ PostParams p) {
+  const device::expert_stream::TestPdlEntry test_pdl_entry(1);  // test builds only (kTestPdl)
+  device::expert_stream::test_pdl_trigger();  // test builds only (kTestPdlEarly): see results.md, chain PDL
   uint8_t* __restrict__ const page = p.page;
   int32_t* __restrict__ const state = p.state;
   const int32_t* __restrict__ const slot_map = p.slot_map;
@@ -522,6 +524,8 @@ struct StreamHitWaitParams {
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_stream_hit_wait_kernel(
     const __grid_constant__ StreamHitWaitParams p) {
+  const device::expert_stream::TestPdlEntry test_pdl_entry(2);  // test builds only (kTestPdl)
+  device::expert_stream::test_pdl_trigger();  // test builds only (kTestPdlEarly): see results.md, chain PDL
   uint8_t* __restrict__ const page = p.page;
   int32_t* __restrict__ const state = p.state;
   const int64_t* __restrict__ const planned = p.planned;
@@ -746,6 +750,8 @@ struct StageAckParams {
 
 __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ram_miss_lease_stage_ack_kernel(
     const __grid_constant__ StageAckParams p) {
+  const device::expert_stream::TestPdlEntry test_pdl_entry(3);  // test builds only (kTestPdl)
+  device::expert_stream::test_pdl_trigger();  // test builds only (kTestPdlEarly): see results.md, chain PDL
   uint8_t* __restrict__ const page = p.page;
   uint8_t* __restrict__ const lease = p.lease;
   const int64_t lease_d = p.lease_d;
@@ -808,6 +814,8 @@ struct FinalizeParams {
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_finalize_kernel(
     const __grid_constant__ FinalizeParams p) {
+  const device::expert_stream::TestPdlEntry test_pdl_entry(6);  // test builds only (kTestPdl)
+  device::expert_stream::test_pdl_trigger();  // test builds only (kTestPdlEarly): see results.md, chain PDL
   uint8_t* __restrict__ const page = p.page;
   int32_t* __restrict__ const state = p.state;
   const int32_t* __restrict__ const count = p.count;
@@ -916,6 +924,22 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
 /// `RuntimeCheck` before the params struct is built and the kernel launched. FFI signatures are unchanged from the
 /// free launchers they replace, so Python call sites do not change.
 struct LeaseProtocolKernel {
+#ifdef EXL3_RAM_MISS_TEST_PDL_STAMP
+  // Test builds only: the chain-PDL stamp ring (lease_device.cuh) into int64 `out` [kPdlStampSlots * 4 + 1], on the
+  // host, its last entry the number of stamps written; then the ring's count is reset. Synchronizes the device.
+  static void pdl_stamps(tvm::ffi::TensorView out) {
+    using namespace device::expert_stream;
+    host::RuntimeCheck(out.size(0) == kPdlStampSlots * 4 + 1, "pdl_stamps: out holds ", kPdlStampSlots * 4 + 1, " int64");
+    CHECK_CUDA(cudaDeviceSynchronize()) << "pdl_stamps";
+    auto* dst = static_cast<int64_t*>(out.data_ptr());
+    CHECK_CUDA(cudaMemcpyFromSymbol(dst, g_pdl_stamp, sizeof(g_pdl_stamp))) << "pdl_stamps";
+    uint32_t seq = 0;
+    CHECK_CUDA(cudaMemcpyFromSymbol(&seq, g_pdl_seq, sizeof(seq))) << "pdl_stamps";
+    dst[kPdlStampSlots * 4] = seq;
+    seq = 0;
+    CHECK_CUDA(cudaMemcpyToSymbol(g_pdl_seq, &seq, sizeof(seq))) << "pdl_stamps";
+  }
+#endif
   static void post(
       tvm::ffi::TensorView page,
       tvm::ffi::TensorView state,
@@ -1003,7 +1027,7 @@ struct LeaseProtocolKernel {
         .dst_count = dst_slots.size(0),
         .copy_engine = copy_engine,
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_post_kernel, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream).enable_pdl(device::expert_stream::kTestPdl)(exl3_ram_miss_post_kernel, params);
   }
 
   static void wait(
@@ -1356,7 +1380,7 @@ struct LeaseProtocolKernel {
         .stream_count = static_cast<uint32_t*>(stream_count.data_ptr()),
         .stream_abort = static_cast<int32_t*>(stream_abort.data_ptr()),
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_stream_hit_wait_kernel, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream).enable_pdl(device::expert_stream::kTestPdl)(exl3_ram_miss_lease_stream_hit_wait_kernel, params);
   }
 
   static void lease_rest_wait(
@@ -1487,7 +1511,7 @@ struct LeaseProtocolKernel {
         .origin = static_cast<const int32_t*>(origin.data_ptr()),
         .violated = static_cast<int32_t*>(violated.data_ptr()),
     };
-    LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream)(
+    LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream).enable_pdl(device::expert_stream::kTestPdl)(
         exl3_ram_miss_lease_stage_ack_kernel, params);
   }
 
@@ -1543,7 +1567,7 @@ struct LeaseProtocolKernel {
         .lease = reinterpret_cast<uint8_t*>(lease_address),
         .lease_d = lease_d,
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_finalize_kernel, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream).enable_pdl(device::expert_stream::kTestPdl)(exl3_ram_miss_lease_finalize_kernel, params);
   }
 };
 

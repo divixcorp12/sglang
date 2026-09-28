@@ -221,6 +221,8 @@ struct StreamParams {
 
 __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3_ram_miss_lease_stream_kernel(
     const __grid_constant__ StreamParams p) {
+  const device::expert_stream::TestPdlEntry test_pdl_entry(4);  // test builds only (kTestPdl)
+  device::expert_stream::test_pdl_trigger();  // test builds only (kTestPdlEarly): see results.md, chain PDL
   uint8_t* __restrict__ const page = p.page;
   int32_t* __restrict__ const state = p.state;
   const int64_t* __restrict__ const planned = p.planned;
@@ -519,6 +521,8 @@ struct CopyWaitParams {
 
 __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void exl3_ram_miss_lease_copy_wait_kernel(
     const __grid_constant__ CopyWaitParams p) {
+  const device::expert_stream::TestPdlEntry test_pdl_entry(5);  // test builds only (kTestPdl)
+  device::expert_stream::test_pdl_trigger();  // test builds only (kTestPdlEarly): see results.md, chain PDL
   uint8_t* __restrict__ const page = p.page;
   int32_t* __restrict__ const state = p.state;
   const int32_t* __restrict__ const count = p.count;
@@ -765,7 +769,7 @@ struct RowCopyKernel {
         .piece_runs = static_cast<const int32_t*>(piece_runs.data_ptr()),
         .fault = static_cast<const int32_t*>(fault.data_ptr()),
     };
-    LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream)(
+    LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream).enable_pdl(device::expert_stream::kTestPdl)(
         exl3_ram_miss_lease_stream_kernel, params);
   }
 
@@ -820,7 +824,7 @@ struct RowCopyKernel {
         .sm_count = sm_count,
         .go_ce = static_cast<int32_t*>(go_ce.data_ptr()),
     };
-    LaunchKernel(1, threads, stream)(exl3_ram_miss_lease_copy_wait_kernel, params);
+    LaunchKernel(1, threads, stream).enable_pdl(device::expert_stream::kTestPdl)(exl3_ram_miss_lease_copy_wait_kernel, params);
   }
 };
 

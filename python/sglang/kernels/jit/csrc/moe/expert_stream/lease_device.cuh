@@ -53,6 +53,22 @@ constexpr int kCopyWaits = 18;     // requests whose copy-engine lanes the copy 
 constexpr int kCopySpun = 19;      // ... of which CopyDone was not yet published on the first read
 constexpr int kStateWords = 20;
 
+// Test builds only (device_module_with_hooks; the chain-PDL probe of
+// docs/superpowers/plans/2026-09-27-expert-stream-transfer-measurement.md, Task 8): EXL3_RAM_MISS_TEST_PDL launches the
+// chain's six kernels (post, W1, A1/A2, S, CW, F) with PDL and makes each wait for its predecessor as its first
+// statement, in every thread (TestPdlEntry). _EARLY also triggers the dependent (test_pdl_trigger). Production
+// defines neither: both calls compile to nothing and the launchers pass enable_pdl(false), which adds no attribute.
+#ifdef EXL3_RAM_MISS_TEST_PDL
+constexpr bool kTestPdl = true;
+#else
+constexpr bool kTestPdl = false;
+#endif
+#ifdef EXL3_RAM_MISS_TEST_PDL_EARLY
+constexpr bool kTestPdlEarly = true;
+#else
+constexpr bool kTestPdlEarly = false;
+#endif
+
 SGL_DEVICE uint32_t ld_acquire_sys(const uint8_t* address) {
   return ::sglang::device::ptx::load_acquire_sys(reinterpret_cast<const uint32_t*>(address));
 }
@@ -110,6 +126,46 @@ SGL_DEVICE int32_t ld_relaxed_gpu(const int32_t* word) {
 
 SGL_DEVICE uint64_t global_ns() {
   return cuda::ptx::get_sreg_globaltimer();
+}
+
+#ifdef EXL3_RAM_MISS_TEST_PDL_STAMP
+// Test builds only: thread 0 of every block of a hooked kernel stamps {kernel | block << 8, entry, after the PDL wait,
+// exit} into a ring the chain-PDL probe reads back (LeaseProtocolKernel::pdl_stamps). The entry-to-wait gap is the
+// kernel's pre-wait prologue; a dependent's entry before its predecessor's exit is launch latency PDL hid.
+constexpr int kPdlStampSlots = 16384;
+__device__ uint64_t g_pdl_stamp[kPdlStampSlots][4];
+__device__ uint32_t g_pdl_seq;
+#endif
+
+// The chain kernels' first statement in a test build (see kTestPdl): the PDL wait, and under
+// EXL3_RAM_MISS_TEST_PDL_STAMP the stamps around it and at scope exit. Without the test macros it is empty.
+struct TestPdlEntry {
+#ifdef EXL3_RAM_MISS_TEST_PDL_STAMP
+  uint32_t slot = kPdlStampSlots;
+#endif
+  SGL_DEVICE explicit TestPdlEntry([[maybe_unused]] int kernel) {
+#ifdef EXL3_RAM_MISS_TEST_PDL_STAMP
+    if (threadIdx.x == 0) {
+      slot = atomicAdd(&g_pdl_seq, 1u) % kPdlStampSlots;
+      g_pdl_stamp[slot][0] = static_cast<uint64_t>(kernel) | (static_cast<uint64_t>(blockIdx.x) << 8);
+      g_pdl_stamp[slot][1] = global_ns();
+    }
+#endif
+    ::sglang::device::PDLWaitPrimary<kTestPdl>();
+#ifdef EXL3_RAM_MISS_TEST_PDL_STAMP
+    if (threadIdx.x == 0) g_pdl_stamp[slot][2] = global_ns();
+#endif
+  }
+#ifdef EXL3_RAM_MISS_TEST_PDL_STAMP
+  SGL_DEVICE ~TestPdlEntry() {
+    if (threadIdx.x == 0) g_pdl_stamp[slot][3] = global_ns();
+  }
+#endif
+};
+
+// The early trigger of a test build (EXL3_RAM_MISS_TEST_PDL_EARLY); where each kernel calls it is documented there.
+SGL_DEVICE void test_pdl_trigger() {
+  ::sglang::device::PDLTriggerSecondary<kTestPdlEarly>();
 }
 
 SGL_DEVICE void store_deadline(int32_t* state, uint64_t deadline) {
