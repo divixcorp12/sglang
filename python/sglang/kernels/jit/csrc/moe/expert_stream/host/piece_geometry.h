@@ -6,15 +6,16 @@
 namespace sglang {
 namespace expert_stream {
 
-// Piece streaming, sub-reads (plan §4.1): part `e` as its sub-reads, in file order, into `out` (kSubReads entries);
-// returns how many. Each is len_k = round_up(ceil(length / kSubReads), kPage) bytes and the last takes what is left,
-// so a part tiles exactly, a small part gives fewer than kSubReads and no sub-read is empty. A zero-length part gives
-// none. The part's offset, dest and length are whole pages (the builder's), so every sub-read's are too.
-inline int split_part(const Read& e, Read* out) {
+// Piece streaming, sub-reads (plan §4.1): part `e` as its sub-reads, in file order, into `out` (at most `per_part`
+// entries, per_part <= kSubReads); returns how many. Each is len_k = round_up(ceil(length / per_part), kPage) bytes and
+// the last takes what is left, so a part tiles exactly, a small part gives fewer than per_part and no sub-read is
+// empty. A zero-length part gives none. The part's offset, dest and length are whole pages (the builder's), so every
+// sub-read's are too.
+inline int split_part(const Read& e, int per_part, Read* out) {
   if (e.length <= 0) return 0;
-  const int64_t len_k = ((e.length + kSubReads - 1) / kSubReads + kPage - 1) / kPage * kPage;
+  const int64_t len_k = ((e.length + per_part - 1) / per_part + kPage - 1) / kPage * kPage;
   int n = 0;
-  for (int64_t at = 0; at < e.length && n < kSubReads; at += len_k) {
+  for (int64_t at = 0; at < e.length && n < per_part; at += len_k) {
     out[n++] = Read{e.file, e.offset + at, std::min(len_k, e.length - at), e.dest + at};
   }
   return n;
@@ -46,15 +47,22 @@ struct RowGeometry {
 // so the pieces partition the needed bytes; pieces past the row's sub-read count are empty. Segments are sorted by
 // source offset (exl3_expert_format.py) and file order is dest order within a row (tables_from), so the cuts are
 // monotone. deps[j] is exactly the set of sub-reads whose file bytes the piece's bytes touch. Returns false for a
-// row that cannot be cut: more sub-reads than pieces, or a piece with bytes that no sub-read reads.
+// row that cannot be cut: more reading parts than pieces, or a piece with bytes that no sub-read reads.
 inline bool row_geometry(const Tables& t, size_t row_index, RowGeometry& g, PieceRun* runs) {
   const size_t parts = static_cast<size_t>(t.parts);
   const size_t base = row_index * parts;
   g = RowGeometry{};
   g.start = t.starts[row_index];
+  // The row's reading parts share the pieces (sub_reads_per_part); a zero-length part (a 0 mirror weight) reads nothing
+  // and takes none, so 1:0:1 cuts like a 2-part row.
+  int reading = 0;
+  for (size_t p = 0; p < parts; ++p)
+    reading += t.extents[base + p].length > 0 ? 1 : 0;
+  if (reading > kPieces) return false;
+  const int per_part = sub_reads_per_part(reading);
   for (size_t p = 0; p < parts; ++p) {
     Read split[kSubReads];
-    const int n = split_part(t.extents[base + p], split);
+    const int n = split_part(t.extents[base + p], per_part, split);
     if (g.subs + n > kPieces) return false;
     for (int k = 0; k < n; ++k) {
       g.sub[g.subs] = split[k];
