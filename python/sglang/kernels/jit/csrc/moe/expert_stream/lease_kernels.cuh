@@ -622,8 +622,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   for (int64_t i = 0; i < lanes; ++i)
     host_rows_2[i] = 0;
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
-  int64_t unclaimed = 0;
-  for (int64_t i = 0; i < planned_count; ++i)
+  // The count is not clamped (lease_layout.h) and is refused only below, while `claimed` is kLeaseLanes wide and
+  // stage 1 clears only the lanes it owns: never read past either bound. Stage 1 claims nothing from a plan over
+  // the bound (it refuses it first), so a lane past the bound is unclaimed.
+  const int64_t claimable = min(planned_count, min(static_cast<int64_t>(kLeaseLanes), lanes));
+  int64_t unclaimed = planned_count - claimable;
+  for (int64_t i = 0; i < claimable; ++i)
     if (claimed[i] == 0) ++unclaimed;
 
   bool ok = state[kSticky] == 0 && state[kReqFailed] == 0 && ld_acquire_sys(page + kFatal) == 0 &&
@@ -682,7 +686,11 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   if (!ok) {
     state[kReqFailed] = 1;
     if (state[kFailReason] == 0) state[kFailReason] = static_cast<int32_t>(reason);
-    ram_miss[0] += unclaimed;  // nothing was served for the lanes stage 1 did not claim
+    // Every unserved lane is counted in ram_miss exactly once across the two stages. Stage 1 never adds to it (a
+    // lane it claims is served; a request it refuses it leaves to this stage), so a failed request counts here
+    // every lane stage 1 did not claim: the whole plan, past kLeaseLanes too, when the count itself was refused,
+    // as the batched lease wait counts `planned_count` for a refused request.
+    ram_miss[0] += unclaimed;
     return;
   }
   if (planned_count == 0) return;
