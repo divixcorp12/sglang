@@ -173,7 +173,10 @@ def main():
         else:
             scores_all = _scores(args.predictor, checkpoint, rows, experts)
         window = WINDOW_MS[kinds[target]]
-        per_layer[target] = {"mixer": kinds[target], "window_ms": window}
+        per_layer[target] = {"mixer": kinds[target]}
+        if args.predictor == "llapor":
+            # The target layer's gap window, which bounds the side-stream copy below.
+            per_layer[target]["window_ms"] = window
         for split in ("dev", "shifted_test"):
             for kind in FORWARD_KINDS:
                 keep = (
@@ -198,36 +201,34 @@ def main():
                 )
                 for key, entry in recall.items():
                     per_layer[target][f"{split}_{kind}_{key}"] = entry
-                if not is_oracle:
-                    # In-graph side-stream copy, LLaPor's next-layer target only.
-                    if args.predictor == "llapor":
-                        source_entry_key = f"{split}_{kind}_b{budgets[0]}"
-                        source_entry = per_layer.get(source_layer, {}).get(
-                            source_entry_key, {}
-                        )
-                        source_copy_ms = (
-                            IN_GRAPH_FIXED_MS
-                            + source_entry.get("missed_per_token", 0.0)
-                            * IN_GRAPH_ROW_MS
-                        )
-                        for budget in budgets:
-                            entry = per_layer[target][f"{split}_{kind}_b{budget}"]
-                            for label, side_window in (
-                                ("gap", window),
-                                ("overlap", window + source_copy_ms),
-                            ):
-                                ready = side_stream_ready_rows(
-                                    budget=budget, window_ms=side_window
-                                )
-                                side_hits = (
-                                    budget_hits(scores, native, resident, ready)[1]
-                                    if ready
-                                    else torch.zeros(scores.shape[0])
-                                )
-                                entry[f"side_ready_rows_{label}"] = ready
-                                entry[f"side_saving_ms_{label}"] = float(
-                                    side_hits.double().mean() * IN_GRAPH_ROW_MS
-                                )
+                # In-graph side-stream copy, LLaPor's next-layer target only.
+                if args.predictor == "llapor":
+                    source_entry_key = f"{split}_{kind}_b{budgets[0]}"
+                    source_entry = per_layer.get(source_layer, {}).get(
+                        source_entry_key, {}
+                    )
+                    source_copy_ms = (
+                        IN_GRAPH_FIXED_MS
+                        + source_entry.get("missed_per_token", 0.0) * IN_GRAPH_ROW_MS
+                    )
+                    for budget in budgets:
+                        entry = per_layer[target][f"{split}_{kind}_b{budget}"]
+                        for label, side_window in (
+                            ("gap", window),
+                            ("overlap", window + source_copy_ms),
+                        ):
+                            ready = side_stream_ready_rows(
+                                budget=budget, window_ms=side_window
+                            )
+                            side_hits = (
+                                budget_hits(scores, native, resident, ready)[1]
+                                if ready
+                                else torch.zeros(scores.shape[0])
+                            )
+                            entry[f"side_ready_rows_{label}"] = ready
+                            entry[f"side_saving_ms_{label}"] = float(
+                                side_hits.double().mean() * IN_GRAPH_ROW_MS
+                            )
         print(json.dumps({"layer": target, "mixer": kinds[target]}), flush=True)
 
     totals = {}
