@@ -218,11 +218,31 @@ interpreter and `PYTHONPATH`. These are correctness results, not latency results
   **74 tests and 7 subtests**. The later explicit-CPU metadata regression passed
   **6 tests** locally; it includes empty and populated metadata under a non-CPU
   default device.
+- At `49d3c6b840`, the final native, integration, metadata and fake-driver checks
+  passed **54 tests, zero skips** using the command below. This includes all four
+  ring modes, fixed shard buffers, shared-arena fixed vectored reads, queue depth
+  two, same-reader recovery after submission failure, explicit SQ affinity, and
+  the combined-mode spin change. A second private checkout kept the concurrent
+  CUDA build's source tree immutable.
 - Existing reader regressions: **850 passed, 1 failed** with the command below.
   The failure was `test_the_seqlock_reader_never_accepts_a_torn_record`: its
   one-second stress run accepted only 23 samples versus a requirement of >100;
   it observed **zero torn records**. A subsequent isolated run of the entire
   tier file passed **57 tests**. No seqlock implementation or threshold was changed.
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-sleep-free-uring-verify
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
+  flock -w 30 /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 \
+  /data/models/slang/.venv/bin/python -m pytest \
+  test/registered/unit/kernels/test_expert_stream_uring_native.py \
+  test/registered/unit/kernels/test_expert_stream_uring_integration.py \
+  test/registered/unit/kernels/test_expert_stream_buffer_regions.py \
+  test/registered/unit/kernels/test_expert_stream_uring_options.py \
+  -q -x -rs -p no:randomly --basetemp=/mnt/nvme2/nvfp4-work/uring-config-integration-tests
+```
+
+The larger regression run and isolated rerun were in the original private checkout:
 
 ```bash
 PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
@@ -242,3 +262,43 @@ PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
 
 For future runs, also take the GPU lock around the larger invocation if CUDA is
 available, because the tier file includes that device-input refusal test.
+
+CUDA 13.4 / RTX 5090: at `ba58e8a5a1`, **22 tests passed** with shared slabs,
+fixed files/bounce buffers and SQPOLL. The first run rebuilt EXL3 before running
+the tests. This covered real CUDA host registration, graph replay, eviction,
+prefill handoff, delayed service, timeouts and lease copies.
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-sleep-free-lease-wait
+export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 MAX_JOBS=8 CUDA_HOME=/usr/local/cuda-13.4
+export SGLANG_EXL3_SRC=/data/models/slang/nvfp4-work/exllamav3
+export SGLANG_EXL3_BUILD_DIR=/data/models/slang/nvfp4-work/cc-expert-prediction/exl3-build
+export SGLANG_EXPERT_STREAM_URING_MODE=sqpoll
+export SGLANG_EXPERT_STREAM_URING_FIXED_FILES=1
+export SGLANG_EXPERT_STREAM_URING_READ_MODE=fixed
+export SGLANG_EXPERT_STREAM_URING_SLAB_ARENA=1
+flock -w 30 /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 \
+  /data/models/slang/.venv/bin/python -m pytest \
+  test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py \
+  test/manual/dsv41/test_expert_stream_sleep_free_cuda.py -q -x -p no:randomly
+```
+
+That initial invocation did not set SQ affinity. For future invocations also
+set `SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=32` (or another permitted CPU).
+
+An additional four-case GPU check at `49d3c6b840`, switching to `readv_fixed`
+and spin waiting with SQ CPU 32, **did not run**: the 30-second GPU flock timed
+out and `lslocks` confirmed another holder. Native tests for these options
+passed; no GPU result is claimed for this additional combination. To run it
+in the next free-GPU window, use the CUDA/EXL3 exports above and:
+
+```bash
+export SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=32
+export SGLANG_EXPERT_STREAM_URING_WAIT_MODE=spin
+export SGLANG_EXPERT_STREAM_URING_READ_MODE=readv_fixed
+flock -w 30 /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 \
+  /data/models/slang/.venv/bin/python -m pytest \
+  test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py::test_ram_misses_inside_a_replay_are_served \
+  test/manual/dsv41/test_expert_stream_sleep_free_cuda.py::test_delayed_requests_complete_without_device_polling \
+  -q -x -p no:randomly
+```
