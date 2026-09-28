@@ -1226,19 +1226,22 @@ def _wait_completion_module() -> Module:
 
 # If CUDA cannot establish quiescence, retain the monitor and its buffers for the
 # process lifetime rather than freeing memory a queued graph may still access.
-_wait_completion_quarantine: list[tuple] = []
+_WAIT_COMPLETION_BYTES = 32
+_wait_completion_quarantine: list[tuple[Module, int, tuple[object, ...], torch.device]] = []
 
 
-def _close_wait_completion(module, handle: int, _owners: tuple, device: torch.device) -> None:
+def _close_wait_completion(
+    module: Module, handle: int, _owners: tuple[object, ...], device: torch.device,
+) -> None:
     # Keep servicing cancellation until queued preparations and waits have drained.
     # Joining first could strand a preparation that has not executed yet.
-    module.expert_stream_wait_completion_cancel(handle)
     try:
+        module.expert_stream_wait_completion_cancel(handle)
         torch.cuda.synchronize(device)
+        module.expert_stream_wait_completion_close(handle)
     except Exception:
         _wait_completion_quarantine.append((module, handle, _owners, device))
         raise
-    module.expert_stream_wait_completion_close(handle)
 
 
 @cache_once
@@ -1445,7 +1448,7 @@ class ExpertStreamDevice:
         self._wait_completion = None
         self._wait_completion_finalizer = None
         if torch.device(device).type == "cuda":
-            self._wait_completion = torch.zeros(32, dtype=torch.uint8, pin_memory=True)
+            self._wait_completion = torch.zeros(_WAIT_COMPLETION_BYTES, dtype=torch.uint8, pin_memory=True)
             module = _wait_completion_module()
             handle = int(module.expert_stream_wait_completion_open(
                 self.page, self._wait_completion, self._lease_address,
