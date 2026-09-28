@@ -5356,12 +5356,13 @@ mechanism, unchanged. `finish_pass` then runs the late layers over each needed s
 (penultimate before final), discarding every output but the true final span's.
 
 **CPU tests (`test/registered/unit/layer_major/`, all `register_cpu_ci`):**
-- `test_c1_late_layer_write_coverage.py`: drives the real `finish_pass` through the adapter with a
-  stand-in `causal_lm.forward_late_tail` recording which positions the late layers ran over, using
-  no symbol the fix adds. RED at `43d7813a41` for suffix lengths `chunk*2+8` and `chunk*2+127`
-  (assertion failure: positions `[s-window, s-r)` never covered, not an ImportError); GREEN at the
-  fix head for those two plus the `chunk*2` and `chunk*2+window` boundary cases, which were already
-  correct and stay so.
+- The C1 proof is `test_c1_late_layer_write_coverage.py`, RED at `43d7813a41` and GREEN at the fix
+  head. It calls the unbound `finish_pass` with stand-ins for `causal_lm`/backend/store, recording
+  which positions the late layers ran over (not a GPU-verified write), using no symbol the fix
+  adds. RED at `43d7813a41` for suffix lengths `chunk*2+8` and `chunk*2+127` (assertion failure:
+  positions `[s-window, s-r)` never covered, not an ImportError); GREEN at the fix head for those
+  two plus the `chunk*2` and `chunk*2+window` boundary cases, which were already correct and stay
+  so. A separate case asserts the call order and the exact per-span metadata pairing.
 - `test_c1_late_layer_tail_coverage.py`: pure `tail_run_spans` unit tests for the same four cases.
 - `test_dsv4_backend_install.py::TestRunLayerPenultimateTailMetadata`: `run_layer` installs each
   needed span's own tail metadata (penultimate distinct from final), not None and not the final
@@ -5388,14 +5389,14 @@ First 20 decoded tokens:
 - chunked / (b): `[63, 7640, 94, 2619, 39981, 23809, 14, 418, 420, 119683, 666, 369, 2619, 96, 856, 16, 20, 666, 369, 223]` (identical)
 - (a): `[63, 7640, 94, 420, 119683, 25137, 369, 5420, 24, 16, 2402, 369, 223, 21, 13656, 14, 223, 7833, 13523, 14]` (diverges at index 3)
 
-Reading: token 0 is identical on both arms, as expected (C1 cannot move it). (a) (pre-fix) shows
-the predicted degraded decode: it diverges from chunked after only 3 of 64 tokens and its mean
-output-token logprob is the furthest from chunked's. (b) (fix head) matches chunked's first 20
-tokens exactly and diverges only at index 45/64, consistent with the documented cross-server decode
-drift (27.19) rather than a correctness gap; its mean logprob is not exactly chunked's, which is
-expected under that same drift and is not the gating criterion (`compare()` gates on token 0 only).
-This is the GPU case the original review (`final-review.md`, C1) found unreproduced; `len8200` now
-reproduces the pre-fix defect and confirms the fix closes it, modulo documented drift.
+Reading: token 0 is identical on both arms, as expected (C1 cannot move it). (a) diverges at decode
+index 3, inside the 27.19 drift envelope; with one sample it neither shows nor rules out C1. (b)
+matches chunked's first 20 tokens exactly and diverges only at index 45/64, consistent with drift.
+Its mean logprob (-0.416) is further from chunked's (-0.310) than (a)'s (-0.343); mean self-logprob
+is not comparable across arms once they diverge. The GPU result is inconclusive. The proof of C1
+and its fix is the CPU write-coverage RED/GREEN. A decisive GPU check remains open: a NaN-sentinel
+assert on late-layer SWA slots for `[s-128, s)`, or >=5 repeats per arm against the
+chunked-vs-chunked spread.
 
 **I1 fix.** `scheduler_layer_major_refusal` (`layer_major/gate.py`) refuses a launch when
 `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS < chunked_prefill_size + page_size` (the ring size), naming

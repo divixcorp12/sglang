@@ -38,9 +38,7 @@ def ring_len_ok(*, chunk: int, page: int, window: int) -> bool:
 
 def tail_run_spans(spans: list[ChunkSpan], *, window: int, prefix_len: int) -> list[ChunkSpan]:
     """Spans, oldest first, whose own last min(window, rows) rows must run the late layers so decode's
-    reach [max(prefix_len, s-window), s) is fully written, s = spans[-1].end. Mirrors chunked prefill,
-    where every extend runs its own tail: walk back from the final span until one span's start reaches
-    the target, since chunk >= window makes one earlier span always enough in practice."""
+    reach [max(prefix_len, s-window), s) is fully written, s = spans[-1].end."""
     target_start = max(prefix_len, spans[-1].end - window)
     needed = []
     for span in reversed(spans):
@@ -256,9 +254,7 @@ class DeepseekV4LayerMajorAdapter:
     def finish_pass(self, handle: _Pass, store: StateStore) -> Any:
         prefix_len = int(handle.schedule_batch.prefix_lens[0])
         tail_spans = tail_run_spans(handle.spans, window=DSV4_WINDOW, prefix_len=prefix_len)
-        # C1: when the final span is shorter than the window, decode's reach [s-window, s) dips into an
-        # earlier span. Run that span's own tail first, mirroring chunked prefill; its output is not the
-        # request's own and is discarded. The true final span always runs last and its output is returned.
+        # C1: run every needed span's own tail, oldest first; only the true final span's output returns.
         for span in tail_spans[:-1]:
             self._run_late_layers(handle, store, span)
         output = self._run_late_layers(handle, store, tail_spans[-1])

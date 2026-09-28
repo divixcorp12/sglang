@@ -68,9 +68,6 @@ def _supports_top_logprobs(port):
 def _all_cases(ids):
     # (name, prompt, flush first): prefix-warm -> prefix is the intended radix hit, and after follows it unflushed.
     cases = [(f"len{n}", ids[:n], True) for n in LENGTHS]
-    # C1: chunk*2 + 8 at chunked_prefill_size=4096 -- a final span of 8 rows, well inside the
-    # SWA window, is the case the review found unreproduced on GPU (final-fix-brief.md).
-    cases.append(("len8200", ids[:8200], True))
     cases.append(("prefix-warm", ids[5000:6024], True))
     cases.append(("prefix", ids[5000:6024] + ids[:32768], False))
     cases.append(("after", ids[100:356], False))
@@ -87,8 +84,14 @@ def _all_cases(ids):
 QUICK_CASES = {"len8192", "len32768", "len33000", "prefix-warm", "prefix",
               "chain-32768", "chain-32868", "chain-32868-again"}
 
-# C1 verification: just the short-final-span case (final-fix-brief.md).
+# C1 verification: the short-final-span case (final-fix-brief.md). Not part of _all_cases/"all": an
+# "all" run recorded before this case existed must stay comparable to one recorded after.
 C1_CASES = {"len8200"}
+
+
+def _c1_cases(ids):
+    return [("len8200", ids[:8200], True)]
+
 
 # The named --cases subsets compare() accepts against a full ("all") baseline.
 _CASE_SUBSETS = {"quick": QUICK_CASES, "c1": C1_CASES}
@@ -101,9 +104,12 @@ def run(a):
     ids = tok(open(a.text).read(), add_special_tokens=False)["input_ids"]
     while len(ids) < 70000:
         ids = ids + ids
-    cases = _all_cases(ids)
-    if a.cases in _CASE_SUBSETS:
-        cases = [c for c in cases if c[0] in _CASE_SUBSETS[a.cases]]
+    if a.cases == "c1":
+        cases = _c1_cases(ids)
+    else:
+        cases = _all_cases(ids)
+        if a.cases == "quick":
+            cases = [c for c in cases if c[0] in QUICK_CASES]
     top_logprobs_num = 5 if _supports_top_logprobs(a.port) else None
     if top_logprobs_num:
         _flush(a.port)  # clear the probe's own cache footprint before the first real case
@@ -210,7 +216,7 @@ def compare(path_a, path_b, *, allow_head_mismatch=False, allow_dirty=False):
         mlp_a, mlp_b = a[case].get("mean_output_logprob"), b[case].get("mean_output_logprob")
         if mlp_a is not None and mlp_b is not None:
             print(f"   mean output-token logprob (64 tokens): a={mlp_a:.4g} b={mlp_b:.4g}"
-                  "  [informational, not gating: this is what C1 degrades, not token 0]")
+                  "  [informational, not gating; not comparable across arms once they diverge]")
         print(f"   first 20 tokens: a={ids_a[:20]!r}")
         print(f"                    b={ids_b[:20]!r}")
     return 1 if bad else 0

@@ -1,16 +1,16 @@
-"""C1 write-coverage RED/GREEN test: after finish_pass, every decode-visible late-layer SWA slot for
-positions [max(prefix_len, s-window), s) must have been run, s = the final span's end.
+"""C1 write-coverage RED/GREEN test: calls the unbound finish_pass with stand-ins for
+causal_lm/backend/store, and checks it ran the late layers over every position in
+[max(prefix_len, s-window), s), s = the final span's end. "Ran over" here means the stand-in
+causal_lm recorded the position, not a verified KV write (that is what the GPU check is for).
 
 Deliberately uses no symbol the fix adds (no tail_run_spans, no tail_by_span import): only
 chunk_spans, ChunkSpan, DSV4_WINDOW and DeepseekV4LayerMajorAdapter, all present at 43d7813a41. This
 lets the same file run unchanged against that commit, where it fails on the +8 and +127 cases
-because the old finish_pass calls forward_late_tail on the final span only and never covers the
-penultimate span's window rows -- a real RED, not an ImportError.
+because the old finish_pass calls forward_late_tail on the final span only.
 
 The handle gives every span that MIGHT need to run a tail (the final span, plus the one before it
-when it exists) real tail metadata; which of those the code under test actually calls
-forward_late_tail on is exactly what each commit's finish_pass decides for itself, and is what this
-test observes through the stand-in causal_lm.
+when it exists) real tail metadata; which of those finish_pass actually calls forward_late_tail on
+is what each commit's own code decides, and is what this test observes through the stand-in.
 """
 
 import unittest
@@ -40,9 +40,11 @@ class _FakeTail:
 class _RecordingBackend:
     def __init__(self):
         self.tail_forward_metadata = None
+        self.calls = []  # (metadata, tail_metadata), in install order
 
     def install_forward_metadata(self, metadata, *, tail_metadata=None):
         self.tail_forward_metadata = tail_metadata
+        self.calls.append((metadata, tail_metadata))
 
 
 class _RecordingCausalLM:
@@ -107,7 +109,7 @@ def _run_finish_pass(*, seq_len, prefix_len=0, chunk=CHUNK, window=DSV4_WINDOW):
     required = set(range(max(prefix_len, spans[-1].end - window), spans[-1].end))
     return SimpleNamespace(
         calls=causal_lm.calls, output=output, covered=covered, required=required,
-        finalize_calls=finalize_calls,
+        finalize_calls=finalize_calls, backend_calls=backend.calls, tail_meta_by_index=tail_meta_by_index,
     )
 
 
@@ -130,6 +132,15 @@ class TestLateLayerWriteCoverage(unittest.TestCase):
     def test_final_chunk_of_exactly_the_window_is_fully_covered(self):
         r = _run_finish_pass(seq_len=CHUNK * 2 + DSV4_WINDOW)
         self.assertEqual(r.covered, r.required)
+
+    def test_call_order_and_metadata_pairing_for_a_short_final_chunk(self):
+        # Pins existing (already-fixed) behavior; not a RED case like the two above.
+        r = _run_finish_pass(seq_len=CHUNK * 2 + 8)
+        self.assertEqual(r.calls, [(1, list(range(8064, 8192))), (2, list(range(8192, 8200)))])
+        self.assertEqual(
+            r.backend_calls,
+            [("META1", r.tail_meta_by_index[1]), ("META2", r.tail_meta_by_index[2])],
+        )
 
     def test_the_requests_own_output_still_comes_from_the_true_final_span(self):
         spans = chunk_spans(prefix_len=0, seq_len=CHUNK * 2 + 8, chunk=CHUNK)
