@@ -517,6 +517,9 @@ void mech_fresh(tvm::ffi::TensorView jobs, tvm::ffi::TensorView words, tvm::ffi:
     host::RuntimeCheck(std::chrono::steady_clock::now() < deadline, "fresh check: blocks never reached the midpoint");
   }
   std::memcpy(src.data_ptr(), pattern.data_ptr(), static_cast<size_t>(src.size(0)));
+#if defined(__x86_64__)
+  _mm_sfence();  // a write-combined source's stores drain from the WC buffers only at a fence; release alone is not one
+#endif
   __atomic_store_n(w, 1u, __ATOMIC_RELEASE);
   CHECK_CUDA(cudaStreamSynchronize(stream)) << "fresh check";
 }
@@ -583,5 +586,36 @@ int64_t mech_ce_batch(tvm::ffi::TensorView jobs, tvm::ffi::TensorView dev) {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 #endif
+
+// Write-combined slab probe (wc_bench.py): host allocations by flag, and the host's own write and read rates.
+int64_t mech_host_alloc(int64_t bytes, int64_t flags) {
+  void* p = nullptr;
+  CHECK_CUDA(cudaHostAlloc(&p, static_cast<size_t>(bytes), static_cast<unsigned>(flags))) << "cudaHostAlloc";
+  return reinterpret_cast<int64_t>(p);
+}
+
+void mech_host_free(int64_t p) {
+  CHECK_CUDA(cudaFreeHost(reinterpret_cast<void*>(p))) << "cudaFreeHost";
+}
+
+int64_t mech_host_write_ns(int64_t dst, int64_t bytes, int64_t value) {
+  const auto t0 = std::chrono::steady_clock::now();
+  std::memset(reinterpret_cast<void*>(dst), static_cast<int>(value), static_cast<size_t>(bytes));
+#if defined(__x86_64__)
+  _mm_sfence();
+#endif
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+int64_t mech_host_read_ns(int64_t src, int64_t bytes) {
+  const auto* p = reinterpret_cast<const volatile uint64_t*>(src);
+  uint64_t sum = 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int64_t i = 0; i < bytes / 8; ++i)
+    sum += p[i];
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+  asm volatile("" ::"r"(sum));
+  return ns;
+}
 
 }  // namespace sglang
