@@ -126,6 +126,13 @@ GATHER_REFUSALS = {
         },
         "victim_valid: must be a bool tensor",
     ),
+    "live_out_not_bool": (
+        lambda: {
+            **_gather_args(),
+            "live_out": torch.zeros(6, dtype=torch.uint8, device=CUDA),
+        },
+        "live_out: must be a bool tensor",
+    ),
 }
 
 COMMIT_REFUSALS = {
@@ -158,6 +165,17 @@ COMMIT_REFUSALS = {
             "keep": torch.ones(1, dtype=torch.int32, device=CUDA),
         },
         "^keep: ",
+    ),
+    "slot_dump_not_last_slot_column": (
+        lambda: {**_commit_args(), "slot_dump": 7},
+        "slot_dump must be slot_to_expert's last column",
+    ),
+    "delivered_int64_not_int32": (
+        lambda: {
+            **_commit_args(),
+            "delivered": torch.zeros(1, dtype=torch.int64, device=CUDA),
+        },
+        "^delivered: ",
     ),
 }
 
