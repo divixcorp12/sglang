@@ -441,6 +441,39 @@ def test_the_device_side_passes_its_pdl_flag_to_the_post_launch(lease_pdl):
     assert name == "expert_stream_post" and args[-1] == int(lease_pdl)
 
 
+# The row-table capacity word (lease block, row table, +4): written once by the host when the service is built.
+CAPACITY_WORD = "kLeaseRowTable + row * kLeaseRowTableBytes + 4"
+
+
+def test_w1_and_s_take_the_row_capacity_as_a_kernel_argument_not_from_the_pinned_row_table():
+    """W1 (lease_hit_wait_body, shared by both hit-wait kernels) and S read the capacity from their params, frozen into
+    the captured graph, instead of a host-pinned load on the critical path. Red when either reads the word again."""
+    for name in ("lease_device.cuh", "row_copy_kernels.cuh"):
+        assert CAPACITY_WORD not in (CSRC / "expert_stream" / name).read_text(), name
+    lease = (CSRC / "expert_stream" / "lease_kernels.cuh").read_text()
+    rows = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
+    for text, params in ((lease, "LeaseHitWaitParams"), (lease, "StreamHitWaitParams"), (rows, "StreamParams")):
+        struct = text[text.index(f"struct {params} {{"):]
+        assert "uint32_t row_capacity;" in struct[:struct.index("};")], params
+
+
+def test_the_device_side_passes_the_lease_layouts_row_capacity_to_the_hit_wait_launch():
+    from sglang.kernels.ops.moe import expert_lease_block as lease
+
+    layout = lease.lease_layout([5, 7])
+    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
+    slot_map = torch.full((2, 4), -1, dtype=torch.int32)
+    dev = ExpertStreamDevice(page, slot_map, device="cpu", layers=2, timeout_ms=10, advise=False,
+                             lease_block=lease.new_lease_block(layout, pin=False), lease_layout=layout)
+    recorder = _Recorder()
+    dev._kernels = lambda: recorder
+    a = _args()
+    for row in (0, 1):
+        dev.hit_wait(row, a["planned"], a["count"], torch.zeros(6, dtype=torch.int32), 1000)
+    assert [(name, args[-1]) for name, args in recorder.calls] == [("expert_stream_lease_hit_wait", 5),
+                                                                  ("expert_stream_lease_hit_wait", 7)]
+
+
 def test_the_exl3_host_file_is_only_bindings():
     """Every export body lives once, in HostExports (expert_stream/host/ffi_exports.h); the EXL3 file only names its
     layout and reader. Red when a body grows back into exl3_ram_miss_host.cpp."""
