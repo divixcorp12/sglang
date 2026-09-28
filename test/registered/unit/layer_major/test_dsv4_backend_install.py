@@ -123,5 +123,43 @@ class TestRunLayerTailMetadata(unittest.TestCase):
         self.assertEqual(backend.calls, [("META0", None), ("META1", "TAIL")])
 
 
+class TestRunLayerPenultimateTailMetadata(unittest.TestCase):
+    """C1: when the final span is short, the penultimate span is also a needed tail. run_layer
+    must hand the candidate-source layer THAT span's own tail metadata (distinct from the final
+    span's), not None and not the final one's -- this is what lets it publish tail-only candidate
+    masks scoped to exactly the penultimate span's rows (the general publish/consume mechanism
+    itself is pinned generically in test_dsv4_candidate_indexer.py's tail-publish tests)."""
+
+    def test_each_needed_span_gets_its_own_tail_not_the_final_ones(self):
+        # Mirrors a real C1 case: chunk 0 (not needed), chunk 1 (penultimate, needed),
+        # chunk 2 (the true final span, needed) -- two distinct tails installed.
+        spans = [
+            ChunkSpan(index=0, start=0, end=4096),
+            ChunkSpan(index=1, start=4096, end=8192),
+            ChunkSpan(index=2, start=8192, end=8200),
+        ]
+        handle = SimpleNamespace(
+            spans=spans,
+            forward_batches=[SimpleNamespace(positions=None, input_ids=None) for _ in spans],
+            schedule_batch=SimpleNamespace(prefix_lens=[0]),
+            tail_by_span={1: "TAIL_PENULTIMATE", 2: "TAIL_FINAL"},
+        )
+        store = _FakeStore({0: "META0", 1: "META1", 2: "META2"})
+        backend = _RecordingBackend()
+        model = SimpleNamespace(hc_mult=1, hidden_size=4, start_layer=0, layers=[_FakeLayer()])
+        adapter_self = SimpleNamespace(runner=SimpleNamespace(device="cpu"), model=model, backend=backend)
+        recorder = SimpleNamespace(with_current_layer=lambda layer_id: contextlib.nullcontext())
+        with mock.patch(
+            "sglang.srt.eplb.expert_distribution.get_global_expert_distribution_recorder",
+            return_value=recorder,
+        ):
+            for chunk in range(len(spans)):
+                DeepseekV4LayerMajorAdapter.run_layer(adapter_self, handle, layer_id=0, chunk=chunk, store=store)
+        self.assertEqual(
+            backend.calls,
+            [("META0", None), ("META1", "TAIL_PENULTIMATE"), ("META2", "TAIL_FINAL")],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
