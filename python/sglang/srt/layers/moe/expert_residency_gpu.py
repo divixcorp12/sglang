@@ -426,10 +426,10 @@ class GpuResidencyUpdater:
           missed expert's scratch row from them; DIRECT drives both the copy and
           the residency commit from that one ``count``, which is what makes them
           unable to disagree.
-        * The doorbell copier writes slots from its own stream at any time
-          between post and completion, and reports a timed-out request
-          undelivered while its copy may still land. Under DIRECT that would
-          overwrite a slot the mapping has already committed.
+        * A backend that posts its own plan buffers can write slots from its
+          own stream at any time between post and completion, and can report a
+          timed-out request undelivered while its copy may still land. Under
+          DIRECT that would overwrite a slot the mapping has already committed.
         * A prefetch pull owns a dedicated row and covers routes that then never
           enter residency, and it reads cache rows from a side stream.
         """
@@ -475,8 +475,8 @@ class GpuResidencyUpdater:
                 or plan.count.data_ptr() != streamer._graph_miss_count.data_ptr()
             ):
                 raise ValueError(
-                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE needs each graph gather's own miss plan; "
-                    "leave SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY at 0"
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE needs each graph gather's own miss plan, "
+                    "not plan buffers posted by another backend"
                 )
             if (
                 self.insert_direct
