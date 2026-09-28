@@ -57,9 +57,8 @@ void exl3_silu_mul_clamp_half(tvm::ffi::TensorView input, tvm::ffi::TensorView o
   auto M = SymbolicSize{"rows"};
   auto D = SymbolicSize{"gate_up_dim"};
   auto H = SymbolicSize{"inter"};
-  device.set_options<kDLCUDA>();
-  TensorMatcher({M, D}).with_dtype<fp16_t>().with_device(device).verify(input);
-  TensorMatcher({M, H}).with_dtype<fp16_t>().with_device(device).verify(output);
+  TensorMatcher({M, D}).with_dtype<fp16_t>().with_device<kDLCUDA>(device).verify(input);
+  TensorMatcher({M, H}).with_dtype<fp16_t>().with_device<kDLCUDA>(device).verify(output);
   RuntimeCheck(D.unwrap() == 2 * H.unwrap(), "gate_up must be twice as wide as the output");
   const auto inter = static_cast<uint32_t>(H.unwrap());
   RuntimeCheck(inter > 0 && inter % 8 == 0, "inter must be a positive multiple of 8");

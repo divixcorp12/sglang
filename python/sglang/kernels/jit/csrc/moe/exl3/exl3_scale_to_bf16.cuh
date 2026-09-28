@@ -31,9 +31,8 @@ void exl3_scale_to_bf16(tvm::ffi::TensorView input, tvm::ffi::TensorView output,
   using namespace host;
   auto device = SymbolicDevice{};
   auto N = SymbolicSize{"n"};
-  device.set_options<kDLCUDA>();
-  TensorMatcher({N}).with_dtype<fp32_t>().with_device(device).verify(input);
-  TensorMatcher({N}).with_dtype<bf16_t>().with_device(device).verify(output);
+  TensorMatcher({N}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(input);
+  TensorMatcher({N}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(output);
   const int64_t n = N.unwrap();
   if (n == 0) {
     return;
