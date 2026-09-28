@@ -134,8 +134,11 @@ is gated on the expert-stream-native-sync merge and has not run.
   1.45 GB/s; 8 lanes 2.68 vs 3.98 GB/s, host 101.7 vs 74.8 us. On the large segments batch matches per-segment
   copies on the device (13.69 vs 13.62 GB/s at 4 rows) but costs 1.70x the host time (85.6 vs 50.3 us).
 - **Fewer, larger pieces / more, smaller pieces.** Condition: Part C only -> **pending (Part C gated)**.
-- **PDL on the chain** (Part B, `../chain-pdl/results.md`). The skeleton bound is 1.48 us/layer (mode 2, work_ns 2000),
-  below the 2 us gate -> **no (bound below threshold)**.
+- **PDL on the chain** (Part B, `../chain-pdl/results.md`). The first skeleton bound was 1.48 us/layer (mode 2,
+  work_ns 2000), below the 2 us gate. The pre-wait probe changes this. With 200-500 ns of prologue per stage, the early
+  trigger saves 3.26-5.25 us/layer, which crosses the gate. The implicit trigger saves 0.77. Both are at most 0.31% of
+  the step, below the 1% ship bar. -> **gate met for the early trigger if real prologues are >= ~200 ns; Task 8 still
+  gated on the merge.**
 
 ### Did the Gen3 expectation hold?
 
@@ -169,3 +172,87 @@ The copy-engine columns below are bound by host enqueue time (see the batch row 
 | 2 | | | | 2.731 (16.3) |
 | 4 | 3.218 (40.7) | 2.354 (57.1) | 5.364 | 3.360 (13.3) |
 | 8 | 3.979 (74.8) | 2.684 (101.7) | 6.690 | 3.808 (11.7) |
+
+## 5. Follow-up probes (2026-09-27, commit 3ee723bd8b)
+
+Run in `wt-xfer` under the exclusive `cc-gpu.lock` with `TMPDIR` on NVMe. Command:
+
+```bash
+mech_bench.py --repo $PWD --probe gen3/probe.json --out gen3/divix01-probes.jsonl --only sm_line,tma   # MECH_EXIT=0
+```
+
+The report run (`mech_report.py gen3/divix01-probes.jsonl`) exited 0. In the same run: `nc_control` stale, `tma` fresh,
+serial acquire 706.5 ns, RTT p50 1408 ns.
+
+### 5a. Partial-line reads: why the SM path stops at 12.31 GB/s while the copy engine reaches 13.69
+
+**Hypothesis tested.** The SM's sysmem path fetches whole 128 B lines, and the host answers each with 128 B
+completions, while the copy engine gets completions at the full max payload.
+
+**Probe.** `sm_line<T>` is the `sm_cv16` loop, `.cv` 16 B loads, at two plateau shapes: G8 U8 (256 KiB loaded in
+flight) and G32 U4 (512 KiB). It loads only the first T bytes of every 128 B line, over the same 2.1 GB source and
+213 MB of rotated destinations. Useful GB/s counts the bytes loaded; line GB/s counts lines touched x 128 B. The two
+shapes agree to within 0.4%, so only G8 U8 is shown:
+
+| bytes touched per 128 B line | time (ms, 416,112 lines) | useful GB/s | line GB/s | lines (requests) per second |
+|---:|---:|---:|---:|---:|
+| 16 | 1.760 | 3.784 | 30.27 | 236.5 M |
+| 32 | 1.761 | 7.564 | 30.25 | 236.4 M |
+| 64 | 2.634 | 10.110 | 20.22 | 158.0 M |
+| 128 | 4.324 | 12.319 | 12.32 | 96.2 M |
+
+**What the data shows.**
+
+- **Neither stated prediction holds.**
+  - The whole-line hypothesis is refuted. Line GB/s would stay about 12.3 if the SM fetched whole lines. Instead it
+    reaches 30.3 GB/s at 16 B and 32 B, nearly twice what a 15.75 GB/s link can carry. So the SM does not fetch lines
+    it only partly reads; it requests the touched sectors.
+  - Useful GB/s does not stay near 12.3 at 32 B either: it is 7.56. So the SM is not sector-limited at the link rate
+    either. `mech_report`'s verdict is "mixed" (32 B / 128 B = 0.61).
+- **At 16 B and 32 B the time is the same to 0.05%** (1.760 vs 1.761 ms). The limit there is a fixed request rate,
+  236 M requests per second, whatever the request size up to 32 B. That is 4.23 ns per request, or 1.08 us per request
+  if 256 are outstanding. That matches a read's latency on this link: 707-780 ns serial, 1.34-1.41 us round trip.
+  **This supports the 8-bit-tag hypothesis for small requests.** The GPU has `10BitTagReq` disabled (below), so it can
+  keep at most 256 non-posted reads outstanding, and 256 / 1.08 us = 236 M/s.
+- **At full lines the tags are not the limit.** Touching 128 B of a line needs 96 M requests/s, 41% of the rate the
+  small-touch cells show the GPU can issue, and the plateau there is 12.32 GB/s. So the 12.31 GB/s SM ceiling comes
+  from how efficiently each request is carried on the link, not from the number outstanding.
+- **Completion size.** The 12.32 GB/s plateau lies between the predictions for 64 B completions (11.6 GB/s) and 128 B
+  completions (13.2 GB/s): payload / (payload + 20 B TLP overhead) x 15.754 x 0.97 for link-control traffic. The copy
+  engine's 13.69 needs 128-256 B completions (256 B predicts 14.2). The root port's 64 B RCB lets it split completions
+  at 64 B boundaries. Consistent with "SM reads get smaller completions than copy-engine reads", but not conclusive:
+  no TLP-level capture was taken.
+- **At 64 B touched,** 158 M requests/s and 10.1 GB/s fit neither limit cleanly: under the tag rate, and below the
+  64 B completion prediction. It is recorded, not explained.
+
+**PCIe configuration.** `sudo -n lspci -vvv` was refused on divix01 ("a password is required"), and no other route was
+tried. The values below are the user's own `lspci -vvv` readout:
+
+| device | LnkCap | LnkSta | MaxPayload (DevCap / DevCtl) | MaxReadReq | RCB | 10-bit tags |
+|---|---|---|---|---|---|---|
+| GPU 37:00.0 (RTX 5090) | 32 GT/s x16 | 8 GT/s (downgraded) x16 | 256 / 256 B | 4096 B | 64 B | DevCap2 10BitTagReq+, DevCtl2 10BitTagReq- (disabled); ExtTag+ |
+| Root port 36:00.0 (Intel Sky Lake-E Root Port A) | 8 GT/s max | | 256 B (DevCtl) | 128 B (only for reads the port itself originates) | 64 B | DevCap2 10BitTagComp- |
+
+Root port cache line size: 64 B.
+
+- **The Gen3 cap is the CPU's root port.** The GPU is Gen5-capable (32 GT/s) and trained down to 8 GT/s.
+- **Completion-size arithmetic.** 64, 128 and 256 B completions predict about 11.6, 13.2 and 14.2 GB/s. The measured
+  SM 12.31 and copy engine 13.69 fall inside that range: consistent, not conclusive.
+- **10-bit tags.** The root port cannot complete 10-bit tags, so the GPU runs with 8-bit tags: 256 outstanding reads,
+  16-32 KiB in flight at 64-128 B per request. The partial-line data supports this as the limit on small requests (the
+  236 M/s rate). It does not make tags the limit at the 12.31 plateau, which needs well under that rate.
+- **What to check on a Gen5 host:** 10BitTagReq+ on the GPU **and** 10BitTagComp+ on its root port (otherwise the
+  256-read cap stays), the MaxPayload of both ends, and LnkSta. See `README.md`, "New host pre-flight".
+
+### 5b. TMA without the proxy fence (`tma_nofence`)
+
+**Probe.** `tma_nofence` is the `tma` fresh check's exact kernel, stages 4, 4 KiB chunks, 8 blocks, without
+`fence.proxy.async.global`. The SASS confirms the only difference: `tma` has `FENCE.VIEW.ASYNC.G` after the acquire,
+`tma_nofence` has none.
+
+**Result.** `tma_nofence` read **fresh**. `tma` read fresh, and `nc_control` stale, in the same run.
+
+**Conclusion.** The fresh check cannot detect a missing proxy fence on this path, so it does not certify the fence
+safety of TMA or of LDGSTS. Both bypass L1, and the check's only demonstrated sensitivity is to a stale L1 line. Their
+visibility rests on the PTX rules (acquire, then `fence.proxy.async.global` before an async-proxy read), not on this
+measurement. No verdict changes: TMA and LDGSTS were not adopted (Decision-table rows above).

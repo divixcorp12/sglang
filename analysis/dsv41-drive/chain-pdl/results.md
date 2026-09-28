@@ -52,3 +52,43 @@ Gen3 divix01. Launch latency is a property of the GPU and driver, not the link, 
 expected to differ much. That expectation is untested.
 
 Task 8 is gated twice: by this bound, and by the expert-stream-native-sync merge. It was not started.
+
+## Pre-wait work probe (2026-09-27, commit 3ee723bd8b)
+
+The review's caveat was that the skeleton has no prologue for PDL to overlap. This probe gives every chain stage a
+spin of `pre_ns` on all threads before `griddepcontrol.wait`, at `work_ns` 2000, and runs modes 0/1/2 at
+`pre_ns` 0, 200 and 500 in one job. The `moe` stage has none. Every-word-reads-R check: passed in all nine records,
+`SKEL_EXIT=0`.
+
+```bash
+skeleton.py --repo $PWD --out analysis/dsv41-drive/chain-pdl/skeleton-prewait.jsonl --work-ns 2000 --pre-ns 0,200,500
+python3 skeleton_report.py skeleton-prewait.jsonl
+```
+
+| pre-wait ns | mode 0 us/layer | mode 1 us/layer | mode 2 us/layer | mode 1 saving | mode 2 saving | mode 2 per step | share of 66.8 ms | >= 2 us gate |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 0 | 24.168 | 23.387 | 22.461 | 0.782 | 1.708 | 68.3 us | 0.102% | no |
+| 200 | 25.912 | 25.136 | 22.649 | 0.776 | **3.263** | 130.5 us | 0.195% | **yes** |
+| 500 | 28.212 | 27.446 | 22.962 | 0.766 | **5.250** | 210.0 us | 0.314% | **yes** |
+
+The pre-0 row repeats the first run within noise (mode 2 saving 1.71 vs 1.48 us/layer).
+
+- **With the early trigger (mode 2), the prologue is almost entirely hidden.** Mode 2's per-layer time rises only
+  0.19 us at 200 ns and 0.50 us at 500 ns, against 1.74 and 4.04 us for mode 0. So each edge hides about 200-500 ns
+  of prologue behind its predecessor's body.
+- **With the implicit trigger (mode 1), none of it is hidden.** The saving stays at 0.77-0.78 us. The dependent cannot
+  launch until the primary exits, so its prologue still runs after the primary.
+
+**Does the PDL row flip?** Yes, for the early trigger, once real stages do about 200 ns or more of work before their
+dependent read: the skeleton's saving crosses the 2 us/layer gate (3.26 us at 200 ns, 5.25 us at 500 ns). The Task 8
+gate therefore reads "run Task 8" for mode 2, provided the real chain's pre-wait work is at least about 200 ns per
+stage. That is unmeasured: Task 8, or a trace of the real stages' prologues, would measure it.
+
+Two things do not change:
+- **Task 8 stays blocked** by the expert-stream-native-sync merge gate (NOT_MERGED at the time of writing).
+- **Even the flipped figure is small.** It is 0.20-0.31% of the 66.8 ms step. This is **above** the 0.1% the request
+  anticipated, but still below the 1% (0.67 ms/step) needed to put a ship decision to the user.
+
+Decision-table row "PDL on the chain", updated: **gate met for the early trigger if real prologues are >= ~200 ns
+(skeleton: 3.26-5.25 us/layer); gate not met for the implicit trigger (0.77 us/layer). Ship bar not met (<= 0.31% of
+step). Task 8 remains gated on the merge.**
