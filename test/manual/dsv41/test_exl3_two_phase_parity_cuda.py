@@ -2,7 +2,8 @@
 chain's graph topology and output parity, against real CUDA kernels on a real GPU.
 
 T8: the graph D7 (``Exl3RamMissRowBackend.post``, two-phase branch) captures is the linear chain
-``post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F`` -- checked with ``cudaGraphGetEdges``, not assumed
+``post -> W1 -> C1 -> A1 -> W2.prepare -> W2.gate -> W2.validate -> C2 -> A2 -> F``
+-- checked with ``cudaGraphGetEdges``, not assumed
 (PER_ROW_TRANSFER.md section 5.2 item 1). The harness for reading a captured graph's node/edge
 structure is copied from ``cuda_graph_dedup_mixin.py``'s ``graph_signature``, not derived: kernel
 identity comes from ``cuGraphKernelNodeGetParams(node).func``, a stable per-``__global__``-function
@@ -187,29 +188,39 @@ def service(tmp_path):
 def _kernel_func(fn):
     """Capture exactly one call of ``fn`` in its own graph and return its sole kernel node's ``func`` handle.
 
-    ``fn`` must issue exactly one kernel launch when called (true of every ``ExpertStreamDevice`` stage method
-    and of ``copy_expert_row_segments_gpu``); more than one is a harness bug, caught by the assertion below
-    rather than silently mis-tagging a stage.
+    ``fn`` must issue exactly one kernel launch when called. The long request waits have a separate helper
+    because their preparation kernel, memory-wait node, and validator are three distinct ordered operations.
     """
+    typed = _captured_call_chain(fn)
+    assert len(typed) == 1 and typed[0][0] == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL, (
+        f"{fn} must capture exactly one kernel node", typed
+    )
+    return typed[0][1]
+
+
+def _wait_kernel_funcs(fn):
+    """Learn both kernel identities only after checking the gate's incoming and outgoing dependencies."""
+    typed = _captured_call_chain(fn)
+    assert [node_type for node_type, _ in typed] == [
+        cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL,
+        cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_BATCH_MEM_OP,
+        cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL,
+    ], typed
+    assert typed[0][1] != typed[2][1], "preparation and validation must be distinct kernels"
+    return typed[0][1], typed[2][1]
+
+
+def _captured_call_chain(fn):
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         fn()
     stream.synchronize()
-    g = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(g, stream=stream):
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph, stream=stream):
         fn()
-    raw = g.raw_cuda_graph()
-    _, num_nodes = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw, 0))
-    nodes, _ = checkCudaErrors(cuda_drv.cuGraphGetNodes(raw, num_nodes))
-    kernel_funcs = []
-    for node in nodes:
-        node_type = checkCudaErrors(cuda_drv.cuGraphNodeGetType(node))
-        if node_type == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
-            params = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node))
-            kernel_funcs.append(int(params.func))
-    assert len(kernel_funcs) == 1, f"{fn} captured {len(kernel_funcs)} kernel nodes, expected exactly 1"
-    del g
-    return kernel_funcs[0]
+    typed, _, _ = _graph_kernel_chain(graph.raw_cuda_graph())
+    del graph
+    return typed
 
 
 def _graph_kernel_chain(raw_graph):
@@ -323,9 +334,10 @@ class TestGraphTopology:
         _cuda_ready()
         assert s.dev.go_count.item() == 2, "both experts must be resident before stage 1 has anything to claim"
 
-        # Learn each stage's kernel identity from a graph that captures only that one call.
+        # Learn each stage's kernel identities from a graph that captures only that one call.
+        # W2 must itself be a direct preparation -> memory-wait -> validator chain.
         # D sums the stages' copy counts into go_total, the count a DIRECT residency commit reads.
-        expected_names = ["post", "W1", "C1", "A1", "W2", "C2", "A2", "F", "D"]
+        expected_names = ["post", "W1", "C1", "A1", "W2.prepare", "W2.gate", "W2.validate", "C2", "A2", "F", "D"]
         expected_funcs = {
             "post": _kernel_func(lambda: s.dev.post(0, s.planned, s.count, s.routes, -1)),
             "W1": _kernel_func(lambda: s.dev.hit_wait(0, s.planned, s.count, s.dest_slots, 100_000)),
@@ -333,7 +345,7 @@ class TestGraphTopology:
                 lambda: copy_expert_row_segments_gpu(s.segments, s.dev.host_rows_1, s.dev.dst_slots_1, s.dev.go_1)
             ),
             "A1": _kernel_func(lambda: s.dev.stage_ack(1)),
-            "W2": _kernel_func(lambda: s.dev.rest_wait(0, s.planned, s.count, s.dest_slots, s.ram_miss)),
+            "W2": _wait_kernel_funcs(lambda: s.dev.rest_wait(0, s.planned, s.count, s.dest_slots, s.ram_miss)),
             "C2": _kernel_func(
                 lambda: copy_expert_row_segments_gpu(s.segments, s.dev.host_rows_2, s.dev.dst_slots_2, s.dev.go_2)
             ),
@@ -341,6 +353,10 @@ class TestGraphTopology:
             "F": _kernel_func(lambda: s.dev.finalize(s.count, s.keep)),
             "D": _kernel_func(lambda: torch.add(s.dev.go_1, s.dev.go_2, out=s.dev.go_total)),
         }
+        expected_funcs["W2.prepare"], expected_funcs["W2.validate"] = expected_funcs.pop("W2")
+        kernel_type = cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
+        expected_nodes = {name: (kernel_type, func) for name, func in expected_funcs.items()}
+        expected_nodes["W2.gate"] = (cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_BATCH_MEM_OP, None)
         # C1 and C2 are the same kernel (copy_expert_row_segments_gpu_kernel): confirm that identity assumption
         # rather than let it silently make the chain assertion below vacuous.
         assert expected_funcs["C1"] == expected_funcs["C2"], "stage 1 and stage 2 use different copy kernels"
@@ -358,34 +374,19 @@ class TestGraphTopology:
         typed, node_count, edge_count = _graph_kernel_chain(raw)
         del graph
 
-        # post's _stage_planned is a device-to-device tensor copy (a MEMCPY node, not a kernel launch); it leads
-        # the chain every replay refreshes it from the plan. Everything after it must be the 9-kernel chain.
-        assert node_count == 10 and edge_count == 9, (node_count, edge_count)
-        assert typed[0][0] == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY, typed[0]
-        kernel_nodes = typed[1:]
-        assert all(t == cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL for t, _ in kernel_nodes), typed
-        funcs = [f for _, f in kernel_nodes]
-
-        # Resolve each captured node to a stage name by its position among same-identity stages (C1 then C2).
-        remaining = dict(expected_funcs)
-        resolved = []
-        for func in funcs:
-            match = None
-            for name in expected_names:
-                if name in resolved:
-                    continue
-                if remaining.get(name) == func:
-                    match = name
-                    break
-            assert match is not None, (func, resolved, remaining)
-            resolved.append(match)
-        assert resolved == expected_names, resolved
+        # The planned-buffer MEMCPY leads ten kernels and one memory-wait node. The path walk above
+        # checks every direct edge, so a detached gate, bypass around it, or missing validator dependency
+        # fails even if all expected kernel identities still appear somewhere in the graph.
+        expected_chain = [(cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMCPY, None)]
+        expected_chain.extend(expected_nodes[name] for name in expected_names)
+        assert node_count == 12 and edge_count == 11, (node_count, edge_count)
+        assert typed == expected_chain, (expected_names, typed, expected_chain)
 
     @NEEDS_EXL3_SRC
     def test_finalize_precedes_the_fused_moe_consumer(self, tmp_path):
         """T8's "-> fused" clause: the checklist row is ``post -> ... -> F -> fused``, not ``... -> F``.
 
-        The sibling test above captures ``backend.post`` alone and pins the 10-node RAM-miss chain
+        The sibling test above captures ``backend.post`` alone and pins the 12-node RAM-miss chain
         exactly; it says nothing about the fused MoE kernel that reads the rows F's success gates,
         because that kernel is not in that capture. This test captures the real production apply
         (``Exl3MoEMethod._apply_graph``, the same shape T9 uses) and checks that nothing in that larger
