@@ -200,6 +200,9 @@ def base_env() -> dict[str, str]:
         # The lease chain's kernels launch with PDL: at most ~1 us/layer, outputs identical
         # (analysis/dsv41-drive/chain-pdl/results.md, on expert-stream-transfer-measurement). Needs the leases above.
         "SGLANG_DSV41_ENABLE_LEASE_PDL": "1",
+        # Suffixes of 8192+ uncached tokens prefill layer-major: token 0 identical to chunked at 8k-33k
+        # (DSV41_REFERENCE.md 27.19, 27.20). Not yet measured at 128k+. An arm sets "0" to force chunked.
+        "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
     }
 
 
