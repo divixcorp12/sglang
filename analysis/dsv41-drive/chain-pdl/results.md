@@ -421,3 +421,14 @@ Every failure is `[kernel]` replay 0 at 2.000 s. h2d and d2h never failed in 237
   the mutant is among the lowest.
 - So the mutant shows no scheduling hazard in this test. The source-order test (`test_exl3_ram_miss_device_args.py`)
   and the SASS gate are what catch a trigger moved above its wait.
+
+**Caveat: the driver changed during the run.** divix01's NVIDIA userspace packages were upgraded from 610.57.04 to
+615.71.09 at 23:12–23:17. That was during rounds 9–13 of the control, and the loaded kernel module stayed at 610.57.04.
+CUDA kept working in new processes through round 20 (23:27), and every tree-run completed normally. The stalls fall on
+both sides of the upgrade:
+- base: rounds 4, 14, 16, 18;
+- PDL-on trees: spread over rounds 1–14.
+
+The conclusion does not depend on it, since base without PDL stalls at least as often as the shipped configuration.
+From 23:38, NVML (`nvidia-smi`) fails with "Driver/library version mismatch", which stopped the A/B arms before any
+server started.
