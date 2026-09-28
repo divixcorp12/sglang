@@ -1,9 +1,21 @@
 """NUMA placement for the pinned host expert tier.
 
-A placement is an ordered list of (node, bytes). Each slab is one anonymous mapping whose row ranges are bound
-(``mbind(MPOL_BIND)``) to the nodes in that order, in proportion to their bytes, before any page is touched. The
-slab stays one contiguous range, so every reader that addresses a row as ``base + slot * row_bytes`` (the C++
-RAM-miss service, io_uring fixed buffers, the copy kernels) is unaffected by where its pages live.
+A placement is an ordered list of (node, bytes). Each slab is one anonymous mapping, 2 MiB aligned, whose row
+ranges are bound (``mbind(MPOL_BIND)``) to the nodes in that order before any page is touched. The slab stays one
+contiguous range, so every reader that addresses a row as ``base + slot * row_bytes`` (the C++ RAM-miss service,
+io_uring fixed buffers, the copy kernels) is unaffected by where its pages live.
+
+The rows are divided in proportion to the nodes' bytes, but the binding is not exact to the row: every place where
+the node changes is rounded to a 2 MiB boundary of the mapping (``plan_bindings``), so the rows around it lie partly
+or wholly on the neighbouring node. With two nodes each node's bound bytes stay within 2 MiB of what its rows asked
+for (with more nodes, within (nodes - 1) x 2 MiB), because each boundary is rounded in whichever direction keeps the
+running per-node error smallest, not independently. The last binding runs past the slab to the next 2 MiB boundary
+(bound to the last node, counted in its bound bytes, never touched), so the slab's last huge page is not split either.
+
+Why 2 MiB: an ``mbind`` range splits the mapping's VMA at its ends, and a split that is not 2 MiB aligned leaves the
+huge page around it backed by 4 KiB pages. An io_uring registered buffer that mixes 4 KiB and 2 MiB folios does not
+coalesce, and the 6.12 kernel then charges its pin accounting against every page of every buffer registered before
+it, so registering the tier grew quadratically (plan 2026-09-28-reader-crtp-uring-registration, Tasks 9 and 10).
 
 Binding replaces first touch, which put the tier wherever the faulting thread ran and let an over-sized tier spill
 onto a nearly full node, where the allocation stalled in reclaim instead of failing (arm_env's SERVER_CORES note).
@@ -24,6 +36,8 @@ import torch
 
 PAGE_BYTES = mmap.PAGESIZE
 MIB = 1 << 20
+# Transparent huge page size: every mapping base and every node change in it sits on a multiple of this.
+HUGE_BYTES = 2 << 20
 # Left free on every node the tier uses: the server allocates after the tier (bounce buffers, the Engram slab,
 # CUDA's host-side state) with the default local policy, so a node filled to the byte would push those elsewhere.
 NODE_HEADROOM_BYTES = 4 << 30
@@ -139,22 +153,100 @@ def _mbind(address: int, length: int, node: int) -> None:
         raise OSError(err, f"mbind to NUMA node {node} failed: {os.strerror(err)}")
 
 
-def allocate_bound(nbytes: int, runs: Sequence[tuple[int, int, int]], row_bytes: int) -> torch.Tensor:
-    """A fresh page-aligned uint8 host tensor of ``nbytes`` whose row runs are bound to their nodes.
+def plan_bindings(nbytes: int, runs: Sequence[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+    """The ``mbind`` ranges, as (node, start, end) byte offsets from a 2 MiB-aligned base, for byte ``runs``.
 
-    A run boundary that falls inside a page is rounded down to the page, so a page shared by two rows goes to the
-    later run's node. Nothing is touched here: pages land on their node when first written or registered.
+    ``runs`` are (node, start, end) byte ranges in address order, as the rows ask for them. The ranges returned tile
+    ``[0, nbytes rounded up to HUGE_BYTES)`` with no gap or overlap, one range per change of node (adjacent runs on
+    the same node merge, and so do the gaps between runs), and every range start but the first, and the last range's
+    end, is a multiple of ``HUGE_BYTES``.
+
+    The tail past ``nbytes``, up to the next 2 MiB boundary, is bound to the last run's node. The caller maps it as
+    slack and never touches it; it exists so that the mapping's last huge page lies wholly inside one binding. Ending
+    at the page-rounded ``nbytes`` instead split the VMA there and left that huge page on 4 KiB folios, so the last
+    registered io_uring chunk of every mapping could not coalesce (plan 2026-09-28-reader-crtp-uring-registration,
+    final review Important 1). The tail counts as bound to that node: in the totals the ranges give (so in
+    ``_numa_bound_bytes``) and in the running error below, so the last node change shifts to compensate for it.
+
+    Each node change goes to the multiple of ``HUGE_BYTES`` just below or just above its ideal place (the next run's
+    start), whichever leaves the two nodes' running errors (bytes bound minus bytes asked, so far) smaller; the error
+    is carried forward instead of each boundary rounding to its nearest, which would drift about 1 MiB per boundary
+    over an arena's many slab joins. With two nodes each node's total, tail included, stays within ``HUGE_BYTES`` of
+    its ask (plus the gaps between runs, which no run asks for). A range can round away to nothing: a run shorter
+    than 2 MiB between two others is then bound to its neighbours' node.
+    """
+    end_all = -(-nbytes // HUGE_BYTES) * HUGE_BYTES
+    segments: list[list[int]] = []  # [node, start, end, bytes asked], same-node runs merged
+    for node, lo, hi in runs:
+        hi = min(hi, nbytes)
+        if hi <= lo:
+            continue
+        if segments and segments[-1][0] == node:
+            segments[-1][2] = hi
+            segments[-1][3] += hi - lo
+        else:
+            segments.append([node, lo, hi, hi - lo])
+    if not segments:
+        return []
+    error: Counter = Counter()
+    for node, lo, hi, asked in segments:
+        error[node] += (hi - lo) - asked  # gaps inside a merged segment
+    error[segments[0][0]] += segments[0][1]  # a gap before the first run
+    error[segments[-1][0]] += end_all - segments[-1][2]  # the tail past the last run, up to the 2 MiB end
+    bindings, start = [], 0
+    for (node, _, hi, _), (following, ideal, _, _) in zip(segments, segments[1:]):
+        error[node] += ideal - hi  # the gap up to the next run goes to this node
+        down = max(start, min(end_all, ideal // HUGE_BYTES * HUGE_BYTES))
+        up = max(start, min(end_all, -(-ideal // HUGE_BYTES) * HUGE_BYTES))
+        end = min(
+            (down, up),
+            key=lambda r: (max(abs(error[node] + r - ideal), abs(error[following] - (r - ideal))), abs(r - ideal), r),
+        )
+        error[node] += end - ideal
+        error[following] -= end - ideal
+        if end > start:
+            if bindings and bindings[-1][0] == node:
+                bindings[-1] = (node, bindings[-1][1], end)
+            else:
+                bindings.append((node, start, end))
+        start = end
+    node = segments[-1][0]
+    if end_all > start:
+        if bindings and bindings[-1][0] == node:
+            bindings[-1] = (node, bindings[-1][1], end_all)
+        else:
+            bindings.append((node, start, end_all))
+    return bindings
+
+
+def allocate_bound(nbytes: int, runs: Sequence[tuple[int, int, int]], row_bytes: int) -> torch.Tensor:
+    """A fresh 2 MiB-aligned uint8 host tensor of ``nbytes`` whose (node, first row, row count) runs are bound.
+
+    The binding follows ``plan_bindings``: node changes sit on 2 MiB boundaries of the tensor, so a row across one,
+    and whole rows within 2 MiB of one, are bound to the neighbouring node, and the last binding runs past the tensor
+    to the next 2 MiB boundary. The actual bytes bound per node, that tail included, are in the tensor's
+    ``_numa_bound_bytes`` ({node: bytes}). The mapping is over-allocated for the alignment and the tail: nbytes
+    rounded up to 2 MiB, plus 2 MiB. The tail is bound but never touched; the slack before the base and past the
+    tail is neither bound nor touched. Nothing is touched here: pages land on their node when first written or
+    registered.
     """
     if nbytes == 0:
-        return torch.empty(0, dtype=torch.uint8)
-    mapping = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-    tensor = torch.frombuffer(mapping, dtype=torch.uint8)  # holds the mapping alive
+        tensor = torch.empty(0, dtype=torch.uint8)
+        tensor._numa_bound_bytes = {}
+        return tensor
+    mapping = mmap.mmap(
+        -1, -(-nbytes // HUGE_BYTES) * HUGE_BYTES + HUGE_BYTES, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+    )
+    whole = torch.frombuffer(mapping, dtype=torch.uint8)
+    offset = -whole.data_ptr() % HUGE_BYTES
+    tensor = whole[offset : offset + nbytes]  # holds the mapping alive
     base = tensor.data_ptr()
-    for node, first, count in runs:
-        lo = (first * row_bytes) // PAGE_BYTES * PAGE_BYTES
-        hi = min(nbytes, (first + count) * row_bytes)
-        if hi > lo:
-            _mbind(base + lo, -(-(hi - lo) // PAGE_BYTES) * PAGE_BYTES, node)
+    bound: Counter = Counter()
+    byte_runs = [(node, first * row_bytes, (first + count) * row_bytes) for node, first, count in runs]
+    for node, lo, hi in plan_bindings(nbytes, byte_runs):
+        _mbind(base + lo, hi - lo, node)
+        bound[node] += hi - lo
+    tensor._numa_bound_bytes = dict(bound)
     return tensor
 
 

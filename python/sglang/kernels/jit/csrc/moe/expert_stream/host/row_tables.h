@@ -2,7 +2,9 @@
 #pragma once
 
 #include "../row_layout.h"
+#include "file_reader.h"  // RegisteredRegion
 #include "reader_base.h"
+#include <sys/uio.h>
 
 namespace sglang {
 namespace expert_stream {
@@ -37,6 +39,8 @@ struct Tables {
   int64_t need_end = 0;  // the row's last needed byte + 1, from its start: max(src + bytes) over segments
   std::vector<std::vector<uint8_t*>> slabs;
   std::vector<int64_t> row_bytes;
+  // One per named slab tensor retained by Python tables.keepalive, with its row size: registered as row-aligned chunks.
+  std::vector<RegisteredRegion> buffer_regions;
   // Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, plan 2026-09-24-dsv41-row-images): the files are
   // exl3_row_image layer files, not checkpoint shards. A row's needed bytes are then its image, [0, need_end) of
   // the extents' destination coordinates, and the segments tile it in source order, so every image byte has
@@ -53,7 +57,7 @@ inline std::vector<int32_t> ids_of(TensorView tensor) {
 // when every byte a read returns has exactly one destination and the row's reads return exactly its image. So: the
 // row starts at 0 of its reads, the segments tile [0, need_end) in source order inside their names' slab rows, and
 // each row's reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is
-// RowReader::open's.
+// RowReader::check_image_alignment's, at open.
 template <ExpertRowLayout Layout>
 inline void check_image_tables(const Tables& t) {
   const std::string prefix = error_prefix<Layout>();
@@ -107,6 +111,7 @@ inline Tables tables_from(
     TensorView segments,
     TensorView slabs,
     TensorView row_bytes,
+    TensorView buffer_regions,
     const std::string& paths,
     const std::string& source_paths,
     int64_t slot_bytes,
@@ -118,6 +123,15 @@ inline Tables tables_from(
         std::to_string(slabs.size(1)) + " and " + std::to_string(row_bytes.size(0)));
   }
   Tables t;
+  const auto* regions = static_cast<const int64_t*>(buffer_regions.data_ptr());
+  for (int64_t i = 0; i < buffer_regions.size(0); ++i) {
+    const int64_t base = regions[3 * i], bytes = regions[3 * i + 1], row = regions[3 * i + 2];
+    if (base <= 0 || bytes <= 0 || row <= 0 || bytes % row != 0 ||
+        static_cast<uint64_t>(base) + static_cast<uint64_t>(bytes) < static_cast<uint64_t>(base))
+      throw std::runtime_error(prefix + "invalid I/O registration buffer region");
+    t.buffer_regions.push_back(
+        {reinterpret_cast<void*>(static_cast<uintptr_t>(base)), static_cast<size_t>(bytes), static_cast<size_t>(row)});
+  }
   t.images = row_images != 0;
   t.layers = extents.size(0);
   t.experts = extents.size(1);
@@ -154,7 +168,7 @@ inline Tables tables_from(
       throw std::runtime_error(prefix + "an extent names no file or falls outside its bounce slot");
     }
   }
-  // The EOF guard (RowReader::admit_batch) decides a whole row from ONE of its parts: it reads that
+  // The EOF guard (ReaderCore::admit_batch) decides a whole row from ONE of its parts: it reads that
   // part's `offset - dest` as the row's aligned base and its file size as the row's file size. Both are
   // true by construction of today's builder - exl3_ram_miss.py repeats one source size across all the
   // parts of a shard, and the mirror layout puts two files under a row only as two copies of the SAME

@@ -96,6 +96,22 @@ def _checked_rows(tables, row: int, experts, slots) -> tuple[torch.Tensor, torch
     return expert_ids, slot_ids
 
 
+def _table_buffer_regions(tables) -> torch.Tensor:
+    """One registration region per slab tensor, with its row size: the reader cuts registration on row boundaries
+    (plan_chunks), so the slab allocation itself stays one contiguous tensor. Arena owners are not registered whole: a
+    2.69 GB arena is past io_uring's 1 GiB per-buffer limit (the 2026-09-28 S3 refusal)."""
+    regions: dict[int, tuple[int, int, int]] = {}
+    for slab in getattr(tables, "keepalive", ()):
+        if not isinstance(slab, torch.Tensor):
+            raise ValueError("I/O buffer owners must be tensors")
+        if slab.device.type != "cpu" or not slab.is_contiguous():
+            raise ValueError("I/O buffer slabs must be contiguous CPU tensors")
+        nbytes = slab.numel() * slab.element_size()
+        if nbytes and slab.dim() >= 1 and slab.shape[0] > 0:
+            regions.setdefault(slab.data_ptr(), (slab.data_ptr(), nbytes, nbytes // slab.shape[0]))
+    return torch.tensor(list(regions.values()), dtype=torch.int64, device="cpu").reshape(-1, 3)
+
+
 def _table_args(tables, direct: bool) -> tuple:
     return (
         tables.extents,
@@ -104,6 +120,7 @@ def _table_args(tables, direct: bool) -> tuple:
         tables.segments,
         tables.slabs,
         tables.row_bytes,
+        _table_buffer_regions(tables),
         "\n".join(tables.paths),
         "\n".join(tables.source_paths),
         tables.slot_bytes,
@@ -156,6 +173,9 @@ def _fault_tensor(
     short_is_eof: bool = False,
     hold_until_probe_ms: int = 0,
     last_publish_delay_ns: int = 0,
+    fixed_chunk_cap: int = 0,
+    leg: int = -1,
+    ring_reset_fail: bool = False,
 ) -> torch.Tensor:
     return torch.tensor(
         [
@@ -187,6 +207,9 @@ def _fault_tensor(
             int(short_is_eof),
             hold_until_probe_ms,
             last_publish_delay_ns,
+            fixed_chunk_cap,
+            leg,
+            int(ring_reset_fail),
         ],
         dtype=torch.int64,
     )
@@ -276,17 +299,22 @@ def read_rows_with_fault(
     sub-reads and vets rows piece by piece (it needs ``pack_workers``); ``sub`` then narrows the ``part``
     faults, and ``hold_ordinal``, to that sub-read of the part. ``publish_twice`` publishes the k-th piece the
     reader publishes a second time (the readiness word must refuse it); ``short_is_eof`` makes the ``part_short``
-    completion the end of its sub-read, as a file ending there would.
+    completion the end of its sub-read, as a file ending there would. ``fixed_chunk_cap`` (bytes, 0: 1 GiB) caps the
+    registered-buffer chunks of a fixed read mode, so small slabs register as many chunks; ``leg`` narrows the
+    ``part``, ``cqe_error`` and ``hold_ordinal`` faults to that leg of a fanned-out fixed read (-1: any).
+    ``ring_reset_fail`` makes the next ring reset fail (with a ``submit_error`` that leaves SQEs unconsumed): the
+    first read then raises "io_uring ring reset failed" and no second read runs.
 
     Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
     completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,
-    ``unfinished_jobs`` (packing jobs a worker still held when the first read returned: always 0) and
-    ``pack_workers``.
+    ``unfinished_jobs`` (packing jobs a worker still held when the first read returned: always 0),
+    ``pack_workers``, and after the first read ``fixed_cuts`` (reads fanned out to more than one leg) and
+    ``fanout_sqes`` (their SQEs).
     """
     first = _checked_rows(tables, row, experts, slots)
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
-    results = torch.zeros(8, dtype=torch.int64)
+    results = torch.zeros(10, dtype=torch.int64)
     _host_module(layout).expert_stream_read_rows_faulted(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
@@ -295,7 +323,7 @@ def read_rows_with_fault(
     if stats is not None:
         stats.update(
             stale_cqes=int(results[4]), generation_wraps=int(results[5]), unfinished_jobs=int(results[6]),
-            pack_workers=int(results[7]),
+            pack_workers=int(results[7]), fixed_cuts=int(results[8]), fanout_sqes=int(results[9]),
         )
     return int(results[0]), int(results[1])
 
@@ -314,20 +342,24 @@ def read_rows_sqes(
 ) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
     """Test only: ``read_rows_traced``'s read, also returning every SQE the reader prepared, in order, as
     ``(file, offset, length, bounce_offset)``, and ``info``: ``sqes`` (the count), ``descriptors``, ``credit``
-    (the ring's) and ``cqes``. Faults and ``pack_workers``/``pack_split``/``piece_stream`` as ``read_rows_with_fault``."""
+    (the ring's), ``cqes``, ``fixed_cuts`` (reads fanned out to more than one leg) and ``fanout_sqes`` (their SQEs,
+    first attempts). Faults and ``pack_workers``/``pack_split``/``piece_stream`` as ``read_rows_with_fault``."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
     record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     sqes = torch.zeros((max_sqes, 4), dtype=torch.int64)
-    info = torch.zeros(5, dtype=torch.int64)
+    info = torch.zeros(7, dtype=torch.int64)
     _host_module(layout).expert_stream_read_rows_sqes(
         *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
     )
-    result, count, descriptors, credit, cqes = info.tolist()
+    result, count, descriptors, credit, cqes, fixed_cuts, fanout_sqes = info.tolist()
     if count > max_sqes:
         raise RuntimeError(f"{count} SQEs, more than max_sqes {max_sqes}")
     log = [tuple(entry) for entry in sqes[:count].tolist()]
-    return result, log, dict(sqes=count, descriptors=descriptors, credit=credit, cqes=cqes), stage_records(
+    info = dict(
+        sqes=count, descriptors=descriptors, credit=credit, cqes=cqes, fixed_cuts=fixed_cuts, fanout_sqes=fanout_sqes
+    )
+    return result, log, info, stage_records(
         record.unsqueeze(0)
     )[0]
 
@@ -767,7 +799,7 @@ class ExpertStreamHost:
         self.handle = int(
             self._module.expert_stream_open(
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
-                tables.slabs, tables.row_bytes, tables.capacity, "\n".join(tables.paths),
+                tables.slabs, tables.row_bytes, _table_buffer_regions(tables), tables.capacity, "\n".join(tables.paths),
                 "\n".join(tables.source_paths), tables.slot_bytes, int(tables.row_images), int(direct), self.lease_block,
                 int(pack_workers),
                 self.hot_page if self.hot_page is not None else torch.empty(0, dtype=torch.uint8),

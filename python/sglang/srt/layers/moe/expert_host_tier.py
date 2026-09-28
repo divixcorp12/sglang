@@ -268,8 +268,11 @@ def allocate_host_slab(
     ``cudaHostRegister`` in row-aligned chunks, as the host arena does.
     Page alignment also lets io_uring fill it with ``O_DIRECT``.
 
-    A non-empty ``placement`` (host_numa) maps the slab on its own and binds
-    its rows to NUMA nodes in proportion before any page is touched.
+    A non-empty ``placement`` (host_numa) maps the slab on its own, 2 MiB
+    aligned, and binds its rows to NUMA nodes in proportion before any page is
+    touched, with every node change on a 2 MiB boundary
+    (``host_numa.plan_bindings``). The slab then carries the bytes bound per
+    node as ``_numa_bound_bytes``.
     """
     shape = (int(rows),) + tuple(int(dimension) for dimension in row_shape)
     nbytes = math.prod(shape) * dtype.itemsize
@@ -280,9 +283,13 @@ def allocate_host_slab(
         storage = allocate_bound(nbytes, split_rows(shape[0], placement), row_bytes)
         start = 0
     else:
+        # Page-aligned only, not 2 MiB: the slab's first and last huge pages can mix folio sizes, so io_uring fixed
+        # buffers over it can meet uncoalesced registration (host_numa's docstring). Every recipe sets a placement.
         storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8, device="cpu")
         start = (-storage.data_ptr()) % PAGE_BYTES
     slab = storage[start : start + nbytes].view(dtype).view(shape)
+    if placement:
+        slab._numa_bound_bytes = storage._numa_bound_bytes
     if register and nbytes:
         # Imported here: expert_stream imports this module while the model
         # loader package is still importing, and mem_cache.pool_host's package
@@ -293,14 +300,73 @@ def allocate_host_slab(
     return slab
 
 
+def allocate_host_slab_arena(
+    rows: int,
+    specs: Mapping[str, tuple[tuple[int, ...], torch.dtype]],
+    *,
+    register: bool,
+    placement: "Placement" = (),
+) -> dict[str, torch.Tensor]:
+    """Page-aligned named slabs sharing one allocation and CUDA registration.
+
+    Each view retains its uint8 owner as ``_expert_stream_slab_arena``. The
+    owner's pointer and byte count describe the whole span, including alignment
+    gaps. NUMA placement divides each named slab's rows as in the separate-slab
+    allocator, then binds the whole arena as one ``allocate_bound`` call, so
+    the node changes at slab joins also sit on 2 MiB boundaries and each node's
+    total is kept within 2 MiB across all of them (the owner's
+    ``_numa_bound_bytes``). Registration is deliberately one span, even for
+    large arenas.
+    """
+    rows = int(rows)
+    if rows < 0:
+        raise ValueError("host slab arena rows must be nonnegative")
+    layout: dict[str, tuple[int, int, tuple[int, ...], torch.dtype]] = {}
+    nbytes = 0
+    for name, (row_shape, dtype) in specs.items():
+        shape = (rows, *row_shape)
+        if any(dimension < 0 for dimension in shape):
+            raise ValueError("host slab arena dimensions must be nonnegative")
+        offset = -(-nbytes // PAGE_BYTES) * PAGE_BYTES
+        size = math.prod(shape) * dtype.itemsize
+        layout[name] = (offset, size, shape, dtype)
+        nbytes = offset + size
+    if placement:
+        from sglang.srt.layers.moe.host_numa import allocate_bound, split_rows
+
+        runs = [
+            (node, offset + first * (size // rows), count * (size // rows))
+            for offset, size, _, _ in layout.values()
+            if rows and size
+            for node, first, count in split_rows(rows, placement)
+        ]
+        arena = allocate_bound(nbytes, runs, 1)
+    else:
+        arena = allocate_host_slab(1, (nbytes,), torch.uint8, register=False).view(-1)
+    slabs = {}
+    for name, (offset, size, shape, dtype) in layout.items():
+        slab = arena[offset : offset + size].view(dtype).view(shape)
+        slab._expert_stream_slab_arena = arena
+        slabs[name] = slab
+    if register and nbytes:
+        from sglang.srt.mem_cache.pool_host.common import _cuda_host_register
+
+        _cuda_host_register(arena)
+    return slabs
+
+
 def release_host_slabs(slabs: Sequence[torch.Tensor]) -> None:
-    """Unregister slabs that ``allocate_host_slab(..., register=True)`` registered."""
+    """Unregister separate slabs or each shared arena once."""
     if not slabs:
         return
     from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
 
+    owners: dict[int, torch.Tensor] = {}
     for slab in slabs:
-        _cuda_host_unregister(slab)
+        owner = getattr(slab, "_expert_stream_slab_arena", slab)
+        owners[id(owner)] = owner
+    for owner in owners.values():
+        _cuda_host_unregister(owner)
 
 
 # The list only makes the quarantine countable. The protection is the extra reference taken below: interpreter
