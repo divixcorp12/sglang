@@ -10,7 +10,8 @@ EXL3 slabs and row sizes, rows split 5:4 across nodes 0 and 1 and bound by ``all
 registers every named slab with the production ``RegisteredBufferTable`` in row-aligned chunks of at most 1 GiB,
 one ``update_tag`` per chunk, timing each (the logic of Task 9's ``regtime.cpp`` harness, kept here).
 
-Recorded per run: the per-chunk times and a least-squares line through them (the slope is the growth per chunk), the
+Recorded per run: the per-chunk times and ``growth``, a least-squares line of each big chunk's ms per GiB against the
+GiB registered before it (its slope is the quadratic term: ~1,000 uncoalesced, a few ms coalesced), the
 THP coverage (``AnonHugePages`` against the tier), the ``thp_fault_*`` deltas across allocation and touch, and the
 chunks lying in a VMA with non-THP pages (an upper bound: which pages inside a VMA are 4 KiB is root-only here).
 
@@ -222,13 +223,33 @@ def build_tier(total_bytes: int, placement, layers: int):
     ]
 
 
-def fit(ms: list[float]) -> dict:
+def fit(ms: list[float], xs: list[float] | None = None) -> dict:
+    """Least squares y = intercept + slope * x (x: the chunk index unless given)."""
+    xs = list(range(len(ms))) if xs is None else xs
     n = len(ms)
     if n < 2:
-        return {"slope_ms_per_chunk": 0.0, "intercept_ms": ms[0] if ms else 0.0}
-    mean_x, mean_y = (n - 1) / 2, sum(ms) / n
-    slope = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(ms)) / sum((i - mean_x) ** 2 for i in range(n))
-    return {"slope_ms_per_chunk": slope, "intercept_ms": mean_y - slope * mean_x}
+        return {"slope": 0.0, "intercept": ms[0] if ms else 0.0}
+    mean_x, mean_y = sum(xs) / n, sum(ms) / n
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ms)) / sum((x - mean_x) ** 2 for x in xs)
+    return {"slope": slope, "intercept": mean_y - slope * mean_x}
+
+
+def growth(ms: list[float], lengths: list[int]) -> dict:
+    """Cost per GiB of chunk against the GiB registered before it, over the chunks of at least 256 MiB.
+
+    headpage_already_acct walks every bvec of every earlier buffer for each new head page, so a chunk's cost per GiB
+    rises with the bytes registered before it. The slope (ms per GiB of chunk, per earlier GiB) is small for
+    coalesced chunks (512 bvecs per earlier GiB) and ~1,000 ms for uncoalesced ones (Task 9: +1.13 s per earlier GiB).
+    """
+    before, xs, ys = 0, [], []
+    for chunk_ms, length in zip(ms, lengths):
+        if length >= 256 * MIB:
+            xs.append(before / GIB)
+            ys.append(chunk_ms / (length / GIB))
+        before += length
+    result = fit(ys, xs)
+    return {"ms_per_gib_per_earlier_gib": result["slope"], "ms_per_gib_at_start": result["intercept"],
+            "chunks": len(xs)}
 
 
 def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collapse=False, abort_s=300.0,
@@ -319,9 +340,8 @@ def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collap
     result["chunk_ms"] = [round(x, 1) for x in ms]
     result["chunk_len"] = [out_len[i] for i in range(max(done, 0))]
     result["register_sum_ms"] = sum(ms)
-    result["fit"] = fit(ms)
-    big = [x for x, length in zip(ms, result["chunk_len"]) if length >= 256 * MIB]
-    result["fit_big_chunks"] = fit(big)
+    result["fit_ms_per_chunk_index"] = fit(ms)
+    result["growth"] = growth(ms, result["chunk_len"])
 
     # Chunks lying in a VMA with non-THP resident pages (upper bound on chunks holding a 4 KiB page).
     maps = [v for v in vmas() if v[2] > v[3]]
@@ -353,14 +373,14 @@ def test_aligned_registration_grows_linearly(gib, tmp_path):
     assert result["register_error"] == "", result["register_error"]
     assert result["chunks_registered"] == result["chunks_planned"]
     assert result["base_2mib_aligned"] == result["layers"]
-    # Task 9 measured +1,130 ms per earlier chunk for uncoalesced chunks, ~+3 ms for pure THP.
-    assert result["fit"]["slope_ms_per_chunk"] < 50, result["fit"]
+    # Task 9 measured +1,130 ms per GiB per earlier GiB for uncoalesced chunks and ~+3 ms for pure THP.
+    assert result["growth"]["ms_per_gib_per_earlier_gib"] < 20, result["growth"]
 
 
 def test_old_alignment_control_reproduces_the_quadratic_growth(tmp_path):
     result = _gib_run(8, tmp_path, old=True)
     assert result["register_error"] == "", result["register_error"]
-    assert result["fit"]["slope_ms_per_chunk"] > 250, result["fit"]
+    assert result["growth"]["ms_per_gib_per_earlier_gib"] > 250, result["growth"]
 
 
 def main() -> int:
