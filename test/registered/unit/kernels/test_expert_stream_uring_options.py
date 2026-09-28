@@ -107,6 +107,12 @@ inline unsigned consume_limit=999;
 inline io_uring* last_ring=nullptr;
 inline std::vector<int> mapped_files;
 inline std::vector<io_uring_sqe> submitted_log;
+inline bool delay_completions=false;
+inline unsigned cq_observations=0;
+inline std::deque<io_uring_cqe> delayed_cq;
+inline void publish_delayed(io_uring* r) {
+ while(!delayed_cq.empty()) { r->cq.push_back(delayed_cq.front()); delayed_cq.pop_front(); }
+}
 inline int io_uring_queue_init_params(unsigned n, io_uring* r, io_uring_params* p) {
  ++setups; if (setup_error) return setup_error; r->flags=p->flags; r->sq.clear(); r->cq.clear();
  p->sq_entries=n; p->cq_entries=2*n; p->features=17; last_ring=r; return 0;
@@ -126,13 +132,18 @@ inline int io_uring_submit(io_uring* r) {
  unsigned n=std::min<unsigned>(r->sq.size(),consume_limit);
  for(unsigned i=0;i<n;++i) { auto s=r->sq.front(); r->sq.pop_front();
    int bytes=s.len; if(s.opcode>=2) { bytes=0;for(unsigned j=0;j<s.len;++j)bytes+=s.iov[j].iov_len; }
-   submitted_log.push_back(s);r->cq.push_back({s.user_data,bytes}); }
+   submitted_log.push_back(s);
+   if(delay_completions)delayed_cq.push_back({s.user_data,bytes});else r->cq.push_back({s.user_data,bytes}); }
  return n;
 }
 inline int io_uring_submit_and_wait(io_uring* r,unsigned) { ++wait_calls;return io_uring_submit(r); }
-inline unsigned io_uring_cq_ready(io_uring* r) { return r->cq.size(); }
+inline unsigned io_uring_cq_ready(io_uring* r) {
+ // SQPOLL's kernel thread eventually publishes polled completions independently.
+ if(delay_completions && (r->flags & IORING_SETUP_SQPOLL) && ++cq_observations>=3)publish_delayed(r);
+ return r->cq.size();
+}
 inline unsigned io_uring_sq_ready(io_uring* r) { return r->sq.size(); }
-inline int io_uring_get_events(io_uring*) { ++get_events_calls;return 0; }
+inline int io_uring_get_events(io_uring* r) { ++get_events_calls;publish_delayed(r);return 0; }
 inline int io_uring_peek_cqe(io_uring* r,io_uring_cqe** c) { if(r->cq.empty())return -EAGAIN;*c=&r->cq.front();return 0; }
 inline int io_uring_wait_cqe(io_uring* r,io_uring_cqe** c) { return io_uring_peek_cqe(r,c); }
 inline void io_uring_cqe_seen(io_uring* r,io_uring_cqe*) { r->cq.pop_front(); }
@@ -202,6 +213,15 @@ int main() {
  r.drain(3);assert(last_ring->sq.empty() && last_ring->cq.empty() && setups==old_setups);
  assert(r.prep_read(99,arena,16,0,25));const int old_waits=wait_calls;
  assert(r.submit(1)>=0 && wait_calls==old_waits);std::vector<ReadCompletion> out;r.reap(out);
+ }
+ for(const char* mode : {"iopoll", "sqpoll_iopoll"}) {
+ env("MODE",mode);UringReader r;assert(r.init(8));r.configure_resources(files,buffers,true);
+ delay_completions=true;cq_observations=0;const int before=get_events_calls;
+ assert(r.prep_read(99,arena,16,0,27));assert(r.submit(1)>=0);
+ if(std::string(mode)=="iopoll")assert(get_events_calls>before);
+ else assert(get_events_calls==before);
+ std::vector<ReadCompletion> out;assert(r.reap(out)==1 && out[0].data==27);
+ assert(delayed_cq.empty());delay_completions=false;
  }
  env("MODE","iopoll");
  { UringReader r;assert(r.init(8));rejected([&]{r.configure_resources(files,buffers,false);}); }
