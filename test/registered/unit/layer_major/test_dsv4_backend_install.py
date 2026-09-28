@@ -95,7 +95,7 @@ class TestRunLayerTailMetadata(unittest.TestCase):
                 SimpleNamespace(positions=None, input_ids=None) for _ in spans
             ],
             schedule_batch=SimpleNamespace(prefix_lens=[0]),
-            final_tail_metadata="TAIL",
+            tail_by_span={1: "TAIL"},
         )
         store = _FakeStore({0: "META0", 1: "META1"})
         backend = _RecordingBackend()

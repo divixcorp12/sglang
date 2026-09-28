@@ -53,6 +53,8 @@ def launch_refusal(
 
 def scheduler_layer_major_refusal(
     *,
+    min_tokens: int,
+    ring_tokens: int,
     raw_chunked_prefill_size: int | None,
     effective_chunked_prefill_size: int | None,
     is_hybrid_swa_allocator: bool,
@@ -61,6 +63,14 @@ def scheduler_layer_major_refusal(
 ) -> str | None:
     """The refusals that need scheduler/allocator/model state gate_from_env's caller can only
     gather once init_model_worker has run, not just the raw server args launch_refusal checks."""
+    if min_tokens < ring_tokens:
+        # Below the ring (chunked_prefill_size + page_size), an admitted request's alloc_extend_swa_tail
+        # assertion fails inside scheduling, outside run_batch's exception containment (SIGQUITs the process).
+        return (
+            f"SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS={min_tokens} is below the ring size "
+            f"({ring_tokens} = chunked_prefill_size + page_size); a request just above min_tokens "
+            "would crash the scheduler"
+        )
     if effective_chunked_prefill_size is None:
         return "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS requires chunked prefill to be enabled (--chunked-prefill-size > 0)"
     if effective_chunked_prefill_size != raw_chunked_prefill_size:

@@ -36,6 +36,21 @@ def ring_len_ok(*, chunk: int, page: int, window: int) -> bool:
     return page >= window and chunk >= 2 * page
 
 
+def tail_run_spans(spans: list[ChunkSpan], *, window: int, prefix_len: int) -> list[ChunkSpan]:
+    """Spans, oldest first, whose own last min(window, rows) rows must run the late layers so decode's
+    reach [max(prefix_len, s-window), s) is fully written, s = spans[-1].end. Mirrors chunked prefill,
+    where every extend runs its own tail: walk back from the final span until one span's start reaches
+    the target, since chunk >= window makes one earlier span always enough in practice."""
+    target_start = max(prefix_len, spans[-1].end - window)
+    needed = []
+    for span in reversed(spans):
+        needed.append(span)
+        if span.start <= target_start:
+            break
+    needed.reverse()
+    return needed
+
+
 def engram_history(ids: list[int], start: int, n: int) -> list[int]:
     window = list(ids[max(0, start - n) : start])
     return [0] * (n - len(window)) + window
@@ -48,7 +63,7 @@ class _Pass(msgspec.Struct):
     hash_ids: list
     extend_full_locs: torch.Tensor
     ring: torch.Tensor
-    final_tail_metadata: Any
+    tail_by_span: dict
     copy_stream: Any
     finalized: bool = False
 
@@ -121,8 +136,11 @@ class DeepseekV4LayerMajorAdapter:
                 f"candidate_source_layer_id={candidate_source_layer_id} has a consumer inside the "
                 f"layer-major range (< {self.model.late_layer_start - 1})"
             )
+        # Spans whose own tail the late layers must also run: the mirror of a chunked extend's tail,
+        # needed whenever the final span alone is shorter than the window (C1).
+        tail_indices = {s.index for s in tail_run_spans(spans, window=DSV4_WINDOW, prefix_len=prefix_len)}
         handle = _Pass(schedule_batch=schedule_batch, spans=spans, forward_batches=[], hash_ids=[],
-                       extend_full_locs=full, ring=ring, final_tail_metadata=None,
+                       extend_full_locs=full, ring=ring, tail_by_span={},
                        copy_stream=torch.cuda.Stream())
         try:
             # Map the whole suffix once, before the per-chunk loop: mapping per span left a begin_pass failure
@@ -138,9 +156,9 @@ class DeepseekV4LayerMajorAdapter:
                 # mapping when metadata is built.
                 self.backend.init_forward_metadata(fb)
                 meta = self.backend.forward_metadata
-                meta.layer_major_skip_candidates = span is not spans[-1]
-                if span is spans[-1]:
-                    handle.final_tail_metadata = self.backend.tail_forward_metadata
+                meta.layer_major_skip_candidates = span.index not in tail_indices
+                if span.index in tail_indices:
+                    handle.tail_by_span[span.index] = self.backend.tail_forward_metadata
                 store.park(span.index, meta)
                 hash_ids = None
                 if self.model.engram_hasher is not None:
@@ -208,9 +226,9 @@ class DeepseekV4LayerMajorAdapter:
             prev_pre = torch.empty((rows, self.model.hc_mult), dtype=torch.float32, device=device)
             store.read_into("prev_pre", offset, prev_pre, stream=None)
         meta = store.unpark(span.index, torch.device(device))
-        # Only the final chunk has a tail: the layer-20 source can then publish tail-only
-        # masks; earlier chunks have none and rely on layer_major_skip_candidates instead.
-        tail_metadata = handle.final_tail_metadata if span is handle.spans[-1] else None
+        # Only spans the late layers will also run over (tail_run_spans) have a tail: the layer-20 source
+        # can then publish tail-only masks; other chunks have none and rely on layer_major_skip_candidates.
+        tail_metadata = handle.tail_by_span.get(span.index)
         self.backend.install_forward_metadata(meta, tail_metadata=tail_metadata)
         layer = self.model.layers[layer_id]
         if layer.engram is not None:
@@ -236,8 +254,19 @@ class DeepseekV4LayerMajorAdapter:
         store.park(span.index, self.backend.forward_metadata)
 
     def finish_pass(self, handle: _Pass, store: StateStore) -> Any:
-        span = handle.spans[-1]
-        fb = handle.forward_batches[-1]
+        prefix_len = int(handle.schedule_batch.prefix_lens[0])
+        tail_spans = tail_run_spans(handle.spans, window=DSV4_WINDOW, prefix_len=prefix_len)
+        # C1: when the final span is shorter than the window, decode's reach [s-window, s) dips into an
+        # earlier span. Run that span's own tail first, mirroring chunked prefill; its output is not the
+        # request's own and is discarded. The true final span always runs last and its output is returned.
+        for span in tail_spans[:-1]:
+            self._run_late_layers(handle, store, span)
+        output = self._run_late_layers(handle, store, tail_spans[-1])
+        self._finalize_ring(handle)
+        return output
+
+    def _run_late_layers(self, handle: _Pass, store: StateStore, span: ChunkSpan) -> Any:
+        fb = handle.forward_batches[span.index]
         offset = span.start - int(handle.schedule_batch.prefix_lens[0])
         rows = span.end - span.start
         device = self.runner.device
@@ -246,11 +275,9 @@ class DeepseekV4LayerMajorAdapter:
         store.read_into("hidden", offset, hidden, stream=None)
         store.read_into("prev_pre", offset, prev_pre, stream=None)
         self.backend.install_forward_metadata(store.unpark(span.index, torch.device(device)),
-                                              tail_metadata=handle.final_tail_metadata)
-        output = self.causal_lm.forward_late_tail(forward_batch=fb, hidden_states=hidden, prev_pre=prev_pre,
-                                                  hash_ids=handle.hash_ids[-1])
-        self._finalize_ring(handle)
-        return output
+                                              tail_metadata=handle.tail_by_span[span.index])
+        return self.causal_lm.forward_late_tail(forward_batch=fb, hidden_states=hidden, prev_pre=prev_pre,
+                                                hash_ids=handle.hash_ids[span.index])
 
     def _finalize_ring(self, handle: _Pass) -> None:
         if handle.finalized:
