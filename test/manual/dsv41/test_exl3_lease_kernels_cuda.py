@@ -253,6 +253,37 @@ class TestHandDriven:
         assert terminal["word"] == _tagged(lease.TERMINAL_TAG, 1) and terminal["mask"] == 0xFF
         assert terminal["reason"] == REASON["count"] and page_word(rig.page, "fatal") == 0xFFFFFFFF
 
+    @pytest.mark.parametrize(
+        "experts, dst_lanes",
+        [(list(range(9)), LANES), ([1, 2, 3, 4, 5], 4)],
+        ids=["count_9_over_kLeaseLanes", "count_5_over_4_lanes"],
+    )
+    def test_two_phase_refuses_a_plan_over_its_bound_and_counts_every_lane_once(self, experts, dst_lanes):
+        """post -> W1 -> W2 -> F for a plan longer than the stages may claim (kLeaseLanes, or the lanes the dst buffer
+        holds). Stage 1 refuses it before claiming anything and counts nothing, so stage 2 must count every planned
+        lane in ram_miss exactly once and never read `claimed` past its bound.
+
+        `claimed` is the first kLeaseLanes words of a buffer whose other words are poisoned: stage 1 clears only the
+        lanes it owns, so a read past the bound sees 7 and loses that lane from the count.
+        """
+        rig = Rig(lanes=max(len(experts), LANES))
+        backing = torch.full((2 * LANES,), 7, dtype=torch.int32, device="cuda")
+        rig.dev.claimed = backing[:LANES]
+        rig.plan(experts)
+        seq = rig.post()
+        dst = torch.arange(dst_lanes, dtype=torch.int32, device="cuda")
+        rig.dev.hit_wait(0, rig.planned, rig.count, dst, 100_000)
+        rig.dev.rest_wait(0, rig.planned, rig.count, dst, rig.ram_miss)
+        rig.dev.finalize(rig.count, rig.keep)
+        _cuda_ready()
+        assert rig.state("req_failed") == 1 and rig.state("fail_reason") == REASON["count"]
+        assert int(rig.dev.go_1[0]) == 0 and int(rig.dev.go_2[0]) == 0 and rig.keep.item() == 0.0
+        assert rig.ram_miss.item() == len(experts)
+        terminal = rig.block.terminal(_idx(seq))
+        assert terminal["reason"] == REASON["count"]
+        assert terminal["mask"] == (1 << min(len(experts), LANES)) - 1
+        assert page_word(rig.page, "fatal") == seq
+
     def test_the_epoch_advances_when_the_sequence_wraps_and_names_the_generation(self):
         rig = Rig(demand_head=0xFFFFFFFE)
         rig.plan([1])
