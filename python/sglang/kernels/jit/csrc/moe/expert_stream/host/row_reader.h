@@ -85,9 +85,49 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader> {
 
   void open_workers(cpu_set_t /*inherited*/) {}
 
-  // The memory reads land in, registered with the ring: one region per named slab, with its row size.
+  // The memory reads land in, registered with the ring: one region per named slab, with its row size. In a fixed read
+  // mode every slab is checked against them first (check_slab_regions).
   std::vector<RegisteredRegion> registered_regions() const {
+    if (this->fixed_reads()) check_slab_regions();
     return t_.buffer_regions;
+  }
+
+  // Fixed read modes: each slab must start on a row boundary of one registered region whose row size is the slab's
+  // own, with room for a row, as _table_buffer_regions builds them from tables.keepalive. A slab missing from
+  // keepalive, or registered with another row size, would otherwise fail its first read mid-serve on the service
+  // thread ("lies in no registered buffer"); refuse at open instead, naming the slab. The slot range is the caller's
+  // (read_rows_once and the tier check slots against tables.capacity), so rows past the region still fail at read
+  // time. A null slab (a layer with no rows) is skipped.
+  void check_slab_regions() const {
+    for (size_t layer = 0; layer < t_.slabs.size(); ++layer) {
+      for (size_t name = 0; name < t_.slabs[layer].size(); ++name) {
+        const auto base = reinterpret_cast<uintptr_t>(t_.slabs[layer][name]);
+        const auto row = static_cast<uint64_t>(t_.row_bytes[name]);
+        if (base == 0 || row == 0) continue;
+        const std::string slab = "slab " + std::string(Layout::kNames[name]) + " of layer " + std::to_string(layer);
+        const RegisteredRegion* holder = nullptr;
+        for (const RegisteredRegion& r : t_.buffer_regions) {
+          const auto start = reinterpret_cast<uintptr_t>(r.base);
+          if (base >= start && base - start < r.bytes) {
+            holder = &r;
+            break;
+          }
+        }
+        if (holder == nullptr) {
+          throw std::runtime_error(
+              error_prefix<Layout>() + "fixed reads: " + slab +
+              " lies in no registered buffer region (is its tensor missing from tables.keepalive?)");
+        }
+        const uint64_t offset = base - reinterpret_cast<uintptr_t>(holder->base);
+        if (holder->row_bytes != row || offset % row != 0 || offset + row > holder->bytes) {
+          throw std::runtime_error(
+              error_prefix<Layout>() + "fixed reads: " + slab + " (row_bytes " + std::to_string(row) +
+              ") lies in a registered buffer region with row_bytes " + std::to_string(holder->row_bytes) +
+              " at offset " + std::to_string(offset) + " of its " + std::to_string(holder->bytes) +
+              " bytes; each slab needs a region of its own row size, starting on one of its rows");
+        }
+      }
+    }
   }
 
   size_t max_iovecs() const {

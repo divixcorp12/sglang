@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 import pytest
+import torch
 
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_sqes, read_rows_with_fault
@@ -263,3 +264,21 @@ except RuntimeError as e:
     print("RAISED", e)
 print("CLOSED")
 '''
+
+
+def test_a_region_with_another_row_size_is_refused_at_open(tmp_path, uring_env, monkeypatch):
+    # Final review Minor 2: a slab registered under a region whose row size is not its own used to fail its first read
+    # mid-serve ("lies in no registered buffer"); a fixed mode now refuses at open, naming the slab. The normal mode
+    # never uses the regions, so it still reads.
+    s = _setup(tmp_path, True)
+    regions = ops._table_buffer_regions
+    halved = lambda tables: regions(tables) * torch.tensor([1, 1, 1]) // torch.tensor([1, 1, 2])  # noqa: E731
+    monkeypatch.setattr(ops, "_table_buffer_regions", halved)
+    assert _read(s)[0] == 1
+    uring_env(READ_MODE="readv_fixed")
+    with pytest.raises(RuntimeError, match=r"fixed reads: slab \w+ of layer 0 \(row_bytes \d+\) lies in a registered "
+                                           r"buffer region with row_bytes \d+"):
+        _supported(lambda: _read(s, fixed_chunk_cap=CAP))
+    monkeypatch.setattr(ops, "_table_buffer_regions", lambda tables: regions(tables)[1:])  # one slab unregistered
+    with pytest.raises(RuntimeError, match=r"fixed reads: slab \w+ of layer \d+ lies in no registered buffer region"):
+        _supported(lambda: _read(s, fixed_chunk_cap=CAP))
