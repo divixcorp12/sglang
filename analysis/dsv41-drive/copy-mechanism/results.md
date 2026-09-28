@@ -140,6 +140,12 @@ is gated on the expert-stream-native-sync merge and has not run.
   the step, below the 1% ship bar. -> **gate met for the early trigger if real prologues are >= ~200 ns; Task 8 still
   gated on the merge.**
 
+  **Task 8, the real chain (superseding the above).** The real stages' prologues are 16-160 ns, not 200-500 ns. With
+  the service thread pinned and 5 rounds, the early trigger saves 1.06 us/layer in `all_hit` (0.063% of 66.8 ms,
+  0.038% of 111 ms). In the production recipe (`all_hit_ce_sm`) the saving is within +-1 us of zero. PDL edges
+  survive graph capture, and correctness is identical in every mode. -> **no, do not ship (below the 2 us gate and
+  the 1% ship bar)**; the user is asked to confirm.
+
 ### Did the Gen3 expectation hold?
 
 - **Every SM method at 12.1-12.4 GB/s:** held. `sm_cv16`, `sm_cv32`, `sm_weak16`, `sm_weak32`, `ldgsts` and `tma`
