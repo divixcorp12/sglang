@@ -197,6 +197,9 @@ def base_env() -> dict[str, str]:
         # outputs identical, ~1 ms/step in a node-mode trace, within noise untraced (DSV41_REFERENCE.md 27.14).
         # Needs the copy engine above.
         "SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES": "1",
+        # Suffixes of 8192+ uncached tokens prefill layer-major: token 0 identical to chunked at 8k-33k
+        # (DSV41_REFERENCE.md 27.19, 27.20). Not yet measured at 128k+. An arm sets "0" to force chunked.
+        "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
     }
 
 
