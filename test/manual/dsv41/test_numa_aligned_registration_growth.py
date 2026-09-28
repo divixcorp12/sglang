@@ -24,6 +24,18 @@ run under the locks by hand (task-10 report), not a pytest case:
 
 ``--collapse`` is a measurement only: ``madvise(MADV_COLLAPSE)`` per slab after the touch, before registration.
 Production code does not do this.
+
+``--separate-slabs`` (final review, Important 1) builds the tier as ``SLAB_ARENA=0`` does instead: one
+``allocate_host_slab`` (so one ``allocate_bound`` mapping) per named slab per layer, the same row sizes and split.
+Every mapping then has a tail, and before the fix (46a514d746) the last binding ended at the page-rounded span, so
+each mapping's last huge page was split onto 4 KiB folios and its last registered chunk could not coalesce.
+``--old-tail`` reproduces that ending (the last range clipped back to the page-rounded span) as the control. pytest
+runs the separate-slab layout at 32 GiB; the tier-scale separate-slab run and the 8 GiB old-tail control are
+commands:
+
+    taskset -c 0-63 python test_numa_aligned_registration_growth.py --gib 8 --separate-slabs --old-tail
+    flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-63 python test_numa_aligned_registration_growth.py \
+        --tier-90g --separate-slabs --gate
 """
 
 import argparse
@@ -174,6 +186,18 @@ def page_rounded_allocate_bound(nbytes, runs, row_bytes):
     return tensor
 
 
+def old_tail_plan_bindings(plan_bindings):
+    """plan_bindings with its last range ending at the page-rounded span, as before 46a514d746 (for the control)."""
+    from sglang.srt.layers.moe import host_numa
+
+    def plan(nbytes, runs):
+        span = -(-nbytes // host_numa.PAGE_BYTES) * host_numa.PAGE_BYTES
+        bindings = [(node, lo, min(hi, span)) for node, lo, hi in plan_bindings(nbytes, runs)]
+        return [(node, lo, hi) for node, lo, hi in bindings if hi > lo]
+
+    return plan
+
+
 def vmstat() -> dict:
     with open("/proc/vmstat") as f:
         return {k: int(v) for k, v in (line.split() for line in f) if k.startswith(("thp_", "compact_"))}
@@ -211,16 +235,33 @@ def node_available_mib(node: int) -> int:
     return (memory["free"] + memory["reclaimable"]) >> 20
 
 
-def build_tier(total_bytes: int, placement, layers: int):
-    """One allocate_host_slab_arena per layer, rows spread as the manager does (differ by at most one)."""
-    from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab_arena
+def build_tier(total_bytes: int, placement, layers: int, separate: bool = False):
+    """One allocate_host_slab_arena per layer, rows spread as the manager does (differ by at most one); with
+    ``separate``, one allocate_host_slab per named slab per layer instead (SLAB_ARENA=0)."""
+    from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab, allocate_host_slab_arena
 
     rows = total_bytes // ROW_BYTES
     specs = {name: ((row,), torch.uint8) for name, row in EXL3_ROWS}
-    return [
-        allocate_host_slab_arena(rows // layers + (layer < rows % layers), specs, register=False, placement=placement)
-        for layer in range(layers)
-    ]
+    counts = [rows // layers + (layer < rows % layers) for layer in range(layers)]
+    if separate:
+        return [
+            {name: allocate_host_slab(count, (row,), torch.uint8, register=False, placement=placement)
+             for name, row in EXL3_ROWS}
+            for count in counts
+        ]
+    return [allocate_host_slab_arena(count, specs, register=False, placement=placement) for count in counts]
+
+
+def owners_of(tier) -> list[torch.Tensor]:
+    """The mappings: each layer's arena owner, or every separate slab."""
+    owners, seen = [], set()
+    for slabs in tier:
+        for slab in slabs.values():
+            owner = getattr(slab, "_expert_stream_slab_arena", slab)
+            if owner.nbytes and owner.data_ptr() not in seen:
+                seen.add(owner.data_ptr())
+                owners.append(owner)
+    return owners
 
 
 def fit(ms: list[float], xs: list[float] | None = None) -> dict:
@@ -253,26 +294,30 @@ def growth(ms: list[float], lengths: list[int]) -> dict:
 
 
 def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collapse=False, abort_s=300.0,
-        workdir: Path) -> dict:
+        workdir: Path, separate=False, old_tail=False) -> dict:
     import sglang
     from sglang.srt.layers.moe import host_numa
 
     lib = build_library(workdir)
     result = {"sglang": sglang.__file__, "pid": os.getpid(), "total_bytes": total_bytes, "layers": layers,
-              "placement": [[n, b >> 20] for n, b in placement], "old_alignment": old_alignment}
+              "placement": [[n, b >> 20] for n, b in placement], "old_alignment": old_alignment,
+              "separate_slabs": separate, "old_tail": old_tail}
     huge0, stat0 = anon_huge_kib(), vmstat()
-    saved = host_numa.allocate_bound
+    saved, saved_plan = host_numa.allocate_bound, host_numa.plan_bindings
     if old_alignment:
         host_numa.allocate_bound = page_rounded_allocate_bound
+    if old_tail:
+        host_numa.plan_bindings = old_tail_plan_bindings(saved_plan)
     try:
         t = time.monotonic()
-        tier = build_tier(total_bytes, placement, layers)
+        tier = build_tier(total_bytes, placement, layers, separate=separate)
         result["allocate_s"] = time.monotonic() - t
     finally:
-        host_numa.allocate_bound = saved
-    owners = [next(iter(slabs.values()))._expert_stream_slab_arena for slabs in tier]
+        host_numa.allocate_bound, host_numa.plan_bindings = saved, saved_plan
+    owners = owners_of(tier)
     tier_bytes = sum(owner.nbytes for owner in owners)
     result["tier_bytes"] = tier_bytes
+    result["mappings"] = len(owners)
     result["base_2mib_aligned"] = sum(owner.data_ptr() % host_numa.HUGE_BYTES == 0 for owner in owners)
     bound = {}
     for owner in owners:
@@ -358,11 +403,11 @@ def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collap
     return result
 
 
-def _gib_run(gib: int, tmp_path: Path, old: bool = False) -> dict:
+def _gib_run(gib: int, tmp_path: Path, old: bool = False, separate: bool = False) -> dict:
     total = gib * GIB
     layers = max(1, math.ceil(total // ROW_BYTES / ROWS_PER_LAYER))
     placement = ((0, 5 * total // 9), (1, total - 5 * total // 9))  # the 90 GiB tier's 5:4
-    result = run(total, placement, layers, old_alignment=old, workdir=tmp_path)
+    result = run(total, placement, layers, old_alignment=old, workdir=tmp_path, separate=separate)
     print(json.dumps(result))
     return result
 
@@ -372,8 +417,17 @@ def test_aligned_registration_grows_linearly(gib, tmp_path):
     result = _gib_run(gib, tmp_path)
     assert result["register_error"] == "", result["register_error"]
     assert result["chunks_registered"] == result["chunks_planned"]
-    assert result["base_2mib_aligned"] == result["layers"]
+    assert result["base_2mib_aligned"] == result["mappings"] == result["layers"]
     # Task 9 measured +1,130 ms per GiB per earlier GiB for uncoalesced chunks and ~+3 ms for pure THP.
+    assert result["growth"]["ms_per_gib_per_earlier_gib"] < 20, result["growth"]
+
+
+def test_separate_slab_registration_grows_linearly(tmp_path):
+    # SLAB_ARENA=0: one mapping per named slab per layer, each ending in a tail that is now bound out to 2 MiB.
+    result = _gib_run(32, tmp_path, separate=True)
+    assert result["register_error"] == "", result["register_error"]
+    assert result["chunks_registered"] == result["chunks_planned"]
+    assert result["base_2mib_aligned"] == result["mappings"] == 6 * result["layers"]
     assert result["growth"]["ms_per_gib_per_earlier_gib"] < 20, result["growth"]
 
 
@@ -389,6 +443,8 @@ def main() -> int:
     parser.add_argument("--tier-90g", action="store_true", help="node 0 51200 MiB, node 1 40960 MiB, 40 layers")
     parser.add_argument("--old-alignment", action="store_true")
     parser.add_argument("--collapse", action="store_true", help="measurement only: MADV_COLLAPSE before registering")
+    parser.add_argument("--separate-slabs", action="store_true", help="one mapping per named slab per layer")
+    parser.add_argument("--old-tail", action="store_true", help="control: last binding ends at the page-rounded span")
     parser.add_argument("--gate", action="store_true", help="refuse unless both nodes clear the 90 GiB gate")
     parser.add_argument("--abort-s", type=float, default=300.0)
     parser.add_argument("--workdir", default="/mnt/nvme1/numa-regtime")
@@ -404,13 +460,13 @@ def main() -> int:
     if args.tier_90g:
         total = sum(nbytes for _, nbytes in TIER_90G)
         result = run(total, TIER_90G, LAYERS_90G, old_alignment=args.old_alignment, collapse=args.collapse,
-                     abort_s=args.abort_s, workdir=workdir)
+                     abort_s=args.abort_s, workdir=workdir, separate=args.separate_slabs, old_tail=args.old_tail)
     else:
         total = args.gib * GIB
         layers = max(1, math.ceil(total // ROW_BYTES / ROWS_PER_LAYER))
         placement = ((0, 5 * total // 9), (1, total - 5 * total // 9))
         result = run(total, placement, layers, old_alignment=args.old_alignment, collapse=args.collapse,
-                     abort_s=args.abort_s, workdir=workdir)
+                     abort_s=args.abort_s, workdir=workdir, separate=args.separate_slabs, old_tail=args.old_tail)
     print(json.dumps(result), flush=True)
     return 0
 
