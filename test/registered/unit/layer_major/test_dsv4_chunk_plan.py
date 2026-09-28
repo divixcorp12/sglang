@@ -39,7 +39,7 @@ class TestDsv4ChunkPlan(unittest.TestCase):
     def test_ring_len_ok_matches_production_geometry(self):
         self.assertTrue(ring_len_ok(chunk=4096, page=256, window=DSV4_WINDOW))
         a = _adapter(chunk=4096, page=256)
-        a._check_ring_len(a.chunk + a.page)  # does not raise
+        a._check_ring_len()  # does not raise
 
     def test_chunk_equal_to_page_raises(self):
         # The N1 regression: chunk == page passed the old (weaker) check but leaves no second margin page,
@@ -47,12 +47,12 @@ class TestDsv4ChunkPlan(unittest.TestCase):
         self.assertFalse(ring_len_ok(chunk=256, page=256, window=DSV4_WINDOW))
         a = _adapter(chunk=256, page=256)
         with self.assertRaises(ValueError):
-            a._check_ring_len(a.chunk + a.page)
+            a._check_ring_len()
 
     def test_page_below_window_raises(self):
         a = _adapter(chunk=4096, page=64)
         with self.assertRaises(ValueError):
-            a._check_ring_len(a.chunk + a.page)
+            a._check_ring_len()
 
     def test_backend_and_allocator_read_lazily_at_construction(self):
         # TpModelWorker builds the adapter before ModelRunner sets attn_backend (missing entirely) and

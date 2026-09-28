@@ -143,19 +143,24 @@ def compare(path_a, path_b, *, allow_head_mismatch=False, allow_dirty=False):
     if int(header_a.get("min_tokens", -1)) == 0 and int(header_b.get("min_tokens", -1)) == 0:
         print("NOT COMPARABLE:\n  both arms have min_tokens=0 (chunked); nothing ran layer-major")
         return 2
-    # A quick-cases arm can compare against a full baseline: use the smaller file's cases, and require every
-    # one of them present in the larger file. The larger file's extra cases are not an error.
     smaller, larger, smaller_path, larger_path = (a, b, path_a, path_b) if len(a) <= len(b) else (b, a, path_b, path_a)
+    smaller_header = header_a if smaller is a else header_b
+    # A subset is only ever legitimate as the deliberate --cases quick set, not an accident (e.g. a crashed arm's
+    # partial jsonl): require the smaller file's own header to say so and its cases to match exactly.
+    if len(smaller) < len(larger):
+        if smaller_header.get("cases") != "quick" or set(smaller) != QUICK_CASES:
+            print(f"NOT COMPARABLE:\n  {smaller_path} has {len(smaller)} cases, {larger_path} has {len(larger)}, "
+                  f"and {smaller_path} is not exactly the quick set (cases={smaller_header.get('cases')!r})")
+            return 2
     problems = [f"case {c} (in {smaller_path}) missing from {larger_path}" for c in smaller if c not in larger]
     for case in sorted(smaller):
         if case not in larger:
             continue
-        ha, hb = a[case].get("prompt_hash") if case in a else None, b[case].get("prompt_hash") if case in b else None
+        ha, hb = a[case].get("prompt_hash"), b[case].get("prompt_hash")
         if ha is None or hb is None or ha != hb:
             problems.append(f"case {case}: prompt hash differs or is missing (a={ha} b={hb})")
-        if not a.get(case, {}).get("ids") or not b.get(case, {}).get("ids"):
-            problems.append(f"case {case}: no output ids (a={a.get(case, {}).get('ids')!r} "
-                            f"b={b.get(case, {}).get('ids')!r})")
+        if not a[case].get("ids") or not b[case].get("ids"):
+            problems.append(f"case {case}: no output ids (a={a[case].get('ids')!r} b={b[case].get('ids')!r})")
     if problems:
         print("NOT COMPARABLE:\n  " + "\n  ".join(problems))
         return 2

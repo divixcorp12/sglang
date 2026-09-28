@@ -74,12 +74,11 @@ class DeepseekV4LayerMajorAdapter:
         # Not cached in __init__: TpModelWorker builds this adapter before init_memory_pools() runs.
         return self.runner.token_to_kv_pool_allocator
 
-    def _check_ring_len(self, ring_len: int) -> None:
-        assert ring_len == self.chunk + self.page
-        if self.page < DSV4_WINDOW:
-            raise ValueError(f"page {self.page} is below window {DSV4_WINDOW}: the predecessor window does not "
-                             f"fit in one page")
-        if self.chunk < 2 * self.page:
+    def _check_ring_len(self) -> None:
+        if not ring_len_ok(chunk=self.chunk, page=self.page, window=DSV4_WINDOW):
+            if self.page < DSV4_WINDOW:
+                raise ValueError(f"page {self.page} is below window {DSV4_WINDOW}: the predecessor window does "
+                                 f"not fit in one page")
             raise ValueError(f"chunk {self.chunk} holds fewer than 2 pages ({2 * self.page}): the ring cannot "
                              f"cover the no-branch keep floor")
 
@@ -110,7 +109,7 @@ class DeepseekV4LayerMajorAdapter:
         seq_len = int(schedule_batch.seq_lens_cpu[0])
         full = self.runner.req_to_token_pool.req_to_token[slot, prefix_len:seq_len].to(torch.int64)
         ring_len = self.chunk + self.page
-        self._check_ring_len(ring_len)
+        self._check_ring_len()
         ring = self.allocator.ring_slots(full[-ring_len:])
         if ring.numel() != ring_len:
             raise ValueError(f"window ring has {ring.numel()} slots, expected {ring_len}")

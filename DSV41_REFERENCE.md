@@ -5192,7 +5192,7 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
   context as it did to 30k.
 - Steady decode ms/token at the smaller hot cache.
 
-### 27.19 Task 12 fix round: layer-major vs chunked GPU equivalence, radix crash closed (2026-09-27, round 2)
+### 27.19 Task 12 fix round: layer-major vs chunked GPU equivalence, radix crash closed (2026-09-27, round 3)
 
 Phase 0's numbers (TTFT, chunk times at 128k, peak VRAM, indexer path, node-1 free) are §27.18; not repeated here.
 
@@ -5239,10 +5239,12 @@ tokens) is below `min_tokens` (8192) and runs chunked on both arms, so no layer-
 admission's branch logic. The chunked arm hits the identical `#cached-token: 32512` at 17:48:36/17:48:53 for its
 own `chain-32868`/`chain-32868-again`, consistent with an ordinary radix hit, not a fix-specific code path.
 
-With the fix in place, a real branch point needs the SWA cache to have evicted part of a still-referenced live
-window out from under an in-progress admission -- a race condition, not something any of `equiv.py`'s prompts can
-force deterministically on a lightly-loaded single-request server. **No GPU case in this run exercises the
-branch-kept path.** Coverage of that path is the CPU test
+**No GPU case in this run exercises the branch-kept path.** It is constructible on GPU without a race: an
+unflushed follow-up like `ids[:20000] + <2000 fresh tokens>` after the unflushed `ids[:32768]` would get a device
+match of 0 (below `chain-32768`'s live floor of 32256, since this key diverges earlier) and a branch point at the
+tombstone boundary 19968, and at seq_len 22000 (>= 8192) it would run layer-major with keep 19456 >= `oldest_intact`
+17664 -- the round-1 reviewer's construction, the shape `test_prefix_hit_capped_at_a_tombstone_branch_point`
+already covers on CPU. Not run in this pass; deferred per controller ruling. Coverage of that path is the CPU test
 `test_layer_major_radix_insert.py::test_prefix_hit_capped_at_a_tombstone_branch_point` (a pre-seeded tombstoned
 tree, `prefix_len=0`, branch point 1792) and the new
 `test_live_prefix_with_a_branch_clamps_to_the_prefix` (a pre-seeded live prefix of 1024 with a tombstoned branch at
@@ -5278,10 +5280,12 @@ documented decode drift, not gating -- `len33000`, `len32868`, `after` are byte-
 allocation failed with OOM"`: chunked 1 (recovered, between `prefix-warm` and `prefix`, unrelated to layer-major),
 layer-major-8k 0.
 
-The e2e figures above include the 64 decode tokens and are single-run wall-clock, not averaged. Layer-major beats
-chunked at every length except `chain-32768` (196.9 s chunked vs 201.4 s layer-major); no causal claim is made
-about why (both paths still stream experts per chunk in phase 1), and this is one run on one box, not a claim that
-generalizes.
+The e2e figures above include the 64 decode tokens and are single-run wall-clock, not averaged. Of the 7 rows where
+layer-major actually ran (`len8192`, `len16384`, `len32768`, `len33000`, `len32868`, `prefix`, `chain-32768`), 6 ran
+faster than chunked and 1 (`chain-32768`, 196.9 s chunked vs 201.4 s layer-major) ran slower. The other 4 rows
+(`prefix-warm`, `after`, `chain-32868`, `chain-32868-again`) ran chunked on both arms and are not a layer-major
+comparison. No causal claim is made about the 6/7 split (both paths still stream experts per chunk in phase 1), and
+this is one run on one box, not a claim that generalizes.
 
 **Check (d).** The `262144 x 4 x 5120` bf16 `hidden` StateStore field is `262144 * 4 * 5120 * 2 bytes = 10.0 GiB`.
 Measured NUMA node-1 free minimum, with that store already resident: chunked arm 26.2 GiB, layer-major-8k arm

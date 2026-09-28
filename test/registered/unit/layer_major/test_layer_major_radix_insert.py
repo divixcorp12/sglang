@@ -198,8 +198,8 @@ class TestLayerMajorRadixInsert(unittest.TestCase):
         self.assertGreater(prefix_len, 0)
         self.assertEqual((keep_from, drop_branch), (prefix_len, False))
         self.assertGreater(keep_from, 768)  # the branch-derived floor alone, which the clamp overrides
-        # Without the clamp, finalize_ring(extend_start=1024, keep_from=768, ...) would compute a negative
-        # split and fail its own range assert -- the clamp is load-bearing, not just more conservative.
+        # Without the clamp, 768 < oldest_intact (1024) routes to the no-branch fallback instead, which drops
+        # the branch point and returns (1792, True) -- not just a more conservative keep_from.
         self.assertEqual(req.kv.cache_protected_len, 1280)  # the insert's own cap is the branch point, not keep_from
         self._assert_matches(1280)
         self._finish(req)
