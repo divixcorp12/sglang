@@ -19,7 +19,7 @@
 #include <unistd.h>
 #include <vector>
 
-#include "io/registered_buffers.h"
+#include "registered_buffers.h"
 
 namespace sglang {
 
