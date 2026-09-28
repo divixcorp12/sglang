@@ -251,7 +251,7 @@ def exl3_swiglu_mlp(
     x: torch.Tensor, gate_up: nn.Module, down: nn.Module, swiglu_limit: float
 ) -> torch.Tensor:
     """DeepseekV2MLP's gate_up -> silu_and_mul_clamp -> down for one bf16 row, fp16 between the EXL3 gemvs."""
-    from sglang.kernels.ops.moe.dsv41_cast_fusion import exl3_silu_mul_clamp_half
+    from sglang.kernels.ops.moe.exl3_cast_fusion import exl3_silu_mul_clamp_half
 
     hidden = exl3_silu_mul_clamp_half(
         exl3_gemm_bs1(exl3_half_input(x), gate_up.exl3_tensors), swiglu_limit
@@ -490,7 +490,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         if streamer is not None and streamer.serves_graph_gather(topk):
             if self.cast_fusion and scale is not None and x.dtype == torch.bfloat16:
-                from sglang.kernels.ops.moe.dsv41_cast_fusion import exl3_scale_to_bf16
+                from sglang.kernels.ops.moe.exl3_cast_fusion import exl3_scale_to_bf16
 
                 out = self._apply_graph(
                     layer,

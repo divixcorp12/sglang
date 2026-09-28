@@ -15,7 +15,7 @@ from sglang.kernels.ops.layernorm.hc_combine_norm import (
     hc_combine_norm,
     hc_combine_norm_half,
 )
-from sglang.kernels.ops.moe.dsv41_cast_fusion import (
+from sglang.kernels.ops.moe.exl3_cast_fusion import (
     exl3_scale_to_bf16,
     exl3_silu_mul_clamp_half,
 )
