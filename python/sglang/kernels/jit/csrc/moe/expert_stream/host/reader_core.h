@@ -130,10 +130,11 @@ class ReaderCore {
     stale_waiting_ = false;
     if (fault.generation_start != 0) generation_ = static_cast<uint32_t>(fault.generation_start);
     if constexpr (requires { io_.set_submit_fault(SubmitFault{}); }) {
-      io_.set_submit_fault(
-          SubmitFault{fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call});
+      io_.set_submit_fault(SubmitFault{
+          fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call, fault.ring_reset_fail});
     } else if (
-        fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0) {
+        fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0 ||
+        fault.ring_reset_fail) {
       // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs RowReader
       // with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above always
       // fires there. This is the fallback for a Reader that cannot inject submit faults at all.
@@ -323,7 +324,14 @@ class ReaderCore {
       int exceptions;
       ~Quiesce() {
         reader->derived().quiesce();
-        if (std::uncaught_exceptions() > exceptions) reader->drain(reader->c_.pending);
+        if (std::uncaught_exceptions() > exceptions) {
+          // Already unwinding: a failed ring reset here leaves nothing in flight (it waits for every consumed SQE
+          // first, and the reader is then closed), so the exception in flight is the one the caller should see.
+          try {
+            reader->drain(reader->c_.pending);
+          } catch (const std::exception&) {
+          }
+        }
       }
     } quiesce_on_exit{this, std::uncaught_exceptions()};
     // 0 forces the first turn to fire immediately, so a short read still gets one call before it
@@ -1325,7 +1333,10 @@ class ReaderCore {
 
   // After a failure, empty the ring before the bounce is reused or freed: settle every read prepared or
   // in flight so nothing can still write the bounce once the caller reuses or frees it.
+  // The count is zeroed before io_.drain: a failed ring reset throws out of it, and Quiesce's drain on the way out
+  // must then see nothing pending, not the stale count, which no longer matches the ring's (0) and would terminate.
   void drain(unsigned pending) {
+    c_.pending = 0;
     io_.drain(pending);
   }
 

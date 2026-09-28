@@ -175,6 +175,7 @@ def _fault_tensor(
     last_publish_delay_ns: int = 0,
     fixed_chunk_cap: int = 0,
     leg: int = -1,
+    ring_reset_fail: bool = False,
 ) -> torch.Tensor:
     return torch.tensor(
         [
@@ -208,6 +209,7 @@ def _fault_tensor(
             last_publish_delay_ns,
             fixed_chunk_cap,
             leg,
+            int(ring_reset_fail),
         ],
         dtype=torch.int64,
     )
@@ -300,6 +302,8 @@ def read_rows_with_fault(
     completion the end of its sub-read, as a file ending there would. ``fixed_chunk_cap`` (bytes, 0: 1 GiB) caps the
     registered-buffer chunks of a fixed read mode, so small slabs register as many chunks; ``leg`` narrows the
     ``part``, ``cqe_error`` and ``hold_ordinal`` faults to that leg of a fanned-out fixed read (-1: any).
+    ``ring_reset_fail`` makes the next ring reset fail (with a ``submit_error`` that leaves SQEs unconsumed): the
+    first read then raises "io_uring ring reset failed" and no second read runs.
 
     Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
     completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,

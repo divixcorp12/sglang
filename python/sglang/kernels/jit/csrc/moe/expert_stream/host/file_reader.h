@@ -63,6 +63,9 @@ struct SubmitFault {
   int64_t call = 0;           // 1-based count of submits over the reader's life
   bool submit_first = false;  // submit the prepared reads before failing (reads are then in flight)
   int64_t short_call = 0;     // that submit consumes nothing and reports success
+  // The next ring reset (drain() discarding unconsumed SQEs) fails as if re-creating the ring had failed. Readers
+  // without a ring reset ignore it.
+  bool ring_reset_fail = false;
 };
 
 }  // namespace expert_stream

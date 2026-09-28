@@ -11,6 +11,9 @@ class FaultyReader {
  public:
   void set_submit_fault(const SubmitFault& fault) {
     fault_ = fault;
+    if constexpr (requires(Inner& reader) { reader.set_ring_reset_fail(true); }) {
+      inner_.set_ring_reset_fail(fault.ring_reset_fail);
+    }
   }
   bool init(unsigned depth) {
     return inner_.init(depth);

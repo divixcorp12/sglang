@@ -226,3 +226,40 @@ try:
 except RuntimeError as e:
     print("REFUSED", e)
 '''
+
+
+@pytest.mark.parametrize("read_mode", ["normal", "readv_fixed"])
+def test_a_failed_ring_reset_raises_its_reason_instead_of_aborting(tmp_path, uring_env, read_mode):
+    # Final review Important 2. The first submit fails with every SQE still unconsumed, so the failure-path drain
+    # resets the ring, and fault word 30 (ring_reset_fail) makes that reset fail. read() must rethrow "io_uring ring
+    # reset failed" to its caller; before the fix Quiesce's second drain saw a stale pending count and called
+    # std::terminate, losing the reason. The default mode is here too: the reset is not a fixed-mode feature. The
+    # read runs in a child, because an abort is a signal, not an exception. The reader is then destroyed (close())
+    # on the way out of the call, and the child must go on to exit cleanly.
+    if read_mode != "normal":
+        uring_env(READ_MODE=read_mode, FIXED_FILES=1)
+    child = subprocess.run(
+        [sys.executable, "-c", _RESET_CHILD, str(tmp_path / "child"), str(CAP if read_mode != "normal" else 0)],
+        capture_output=True, text=True, timeout=120)
+    if "unsupported by the running kernel" in child.stdout or "requires liburing 2.10" in child.stdout:
+        pytest.skip(child.stdout)
+    assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
+    assert "RAISED" in child.stdout and "io_uring ring reset failed" in child.stdout, child.stdout
+    assert child.stdout.rstrip().endswith("CLOSED"), child.stdout
+
+
+_RESET_CHILD = r'''
+import errno, pathlib, sys
+from sglang.kernels.ops.moe.expert_stream_transport import read_rows_with_fault
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+root = pathlib.Path(sys.argv[1]); root.mkdir(parents=True)
+s = ram_miss_setup(root, capacity=12, experts=12, row_images=True)
+try:
+    result = read_rows_with_fault(
+        s.tables, 1, [10, 3, 7, 0], [7, 0, 11, 3], [11, 5], [9, 1], direct=False, submit_error=errno.EIO,
+        submit_call=1, ring_reset_fail=True, fixed_chunk_cap=int(sys.argv[2]))
+    print("NO ERROR", result)  # the reset did not fail, or its failure was swallowed: the assertion names it
+except RuntimeError as e:
+    print("RAISED", e)
+print("CLOSED")
+'''

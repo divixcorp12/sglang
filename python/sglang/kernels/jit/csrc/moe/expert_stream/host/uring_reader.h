@@ -236,6 +236,11 @@ class UringReader {
 
   void drain(unsigned pending) {
     if (pending != outstanding_) std::terminate();
+    // A failed ring reset closed the ring (outstanding_ 0): nothing it held can still be in flight.
+    if (!ready_) {
+      if (outstanding_ != 0) std::terminate();
+      return;
+    }
     if (options_.sqpoll()) {
       // SQPOLL consumes concurrently: no snapshot may classify SQEs as safe to abandon.
       // Publish/retry EVERY prepared read, then retire EVERY completion before releasing buffers.
@@ -262,10 +267,26 @@ class UringReader {
     if (unsubmitted != 0) {
       close_ring();
       outstanding_ = 0;
-      if (!create_ring()) throw std::runtime_error("io_uring ring reset failed");
-      register_resources();
+      // A failed reset leaves the reader closed (ready() false, so a later read() returns 0 and close() has nothing
+      // to settle) and throws its reason to the caller: "io_uring ring reset failed", create_ring's own error, or
+      // register_resources' refusal.
+      const bool injected = reset_fail_;
+      reset_fail_ = false;
+      if (injected || !create_ring()) throw std::runtime_error("io_uring ring reset failed");
+      try {
+        register_resources();
+      } catch (...) {
+        close_ring();
+        throw;
+      }
       diagnostics();
     }
+  }
+
+  // Test only (fault word ring_reset_fail, through FaultyReader): the next reset in drain() fails as if create_ring()
+  // had, after closing the old ring. Fires once.
+  void set_ring_reset_fail(bool fail) {
+    reset_fail_ = fail;
   }
 
  private:
@@ -479,6 +500,7 @@ class UringReader {
   size_t chunk_cap_ = sglang::io::kMaxRegisteredBufferBytes;
   uint64_t fixed_reads_ = 0, fixed_cuts_ = 0, fanout_sqes_ = 0, next_report_ = uint64_t{1} << 16;
   double register_ms_ = 0;
+  bool reset_fail_ = false;  // test only (set_ring_reset_fail)
 };
 
 static_assert(AsyncFileReader<UringReader>);
