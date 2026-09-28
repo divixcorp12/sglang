@@ -89,8 +89,10 @@ def run(repo: Path, tmp: Path, scenario: str, mode: str, module, edges_mod, repl
     original = ops._device_module
     if module is not None:
         ops._device_module = lambda layout="exl3": module  # before the service: its warm-up request uses it too
+    work = tmp / f"{scenario}-{mode}{'-stamp' if stamp else ''}"
+    work.mkdir(parents=True, exist_ok=True)  # write_fake_exl3 writes into it but does not create it
     try:
-        s = StreamService(tmp / f"{scenario}-{mode}{'-stamp' if stamp else ''}", **SCENARIOS[scenario])
+        s = StreamService(work, **SCENARIOS[scenario])
     finally:
         ops._device_module = original
     records = []
