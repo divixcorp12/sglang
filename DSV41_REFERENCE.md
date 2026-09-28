@@ -5330,6 +5330,95 @@ python equiv.py compare chunked.jsonl layer-major-8k.jsonl     # EXIT=0
 Evidence: `divix01:/mnt/nvme1/layer-major/equiv-t12fix/{chunked,layer-major-8k}/` (`driver.log`, `server.log`,
 `vram.csv`, `numa.log`, `phases.txt`) and `equiv-t12fix/{chunked,layer-major-8k}.jsonl`.
 
+### 27.20 Final-review fix pass: C1 late-layer SWA tail coverage, I1 launch refusal (2026-09-27)
+
+**C1 mechanism.** `finish_pass` (`models/deepseek_v4_layer_major.py`) ran the late layers
+(`late_layer_start..end`) once, over the final span's own tail only. When the final span has
+`r < SWA_WINDOW` rows -- e.g. an 8200-token suffix at `chunked_prefill_size=4096` splits into spans
+of 4096, 4096, 8 -- the late layers never ran over the penultimate span's positions
+`[s-window, s-r)`. Their layer-21..39 SWA slots for those positions kept whatever an earlier
+position or request had left there. Decode then attends, for up to `window - r` steps, to KV that
+was never written in this pass. Token 0 cannot see this: the tail is floored at the tail start, so
+it is exactly the rows the (buggy) pass did write. Chunked prefill does not have this failure mode,
+because every extend under bounded replay runs its own tail (`min(window, rows)`), never skipping
+one.
+
+**Fix.** `tail_run_spans(spans, window, prefix_len)` (pure) walks back from the final span and
+returns every span, oldest first, whose own last `min(window, rows)` rows fall inside decode's
+reach `[max(prefix_len, s-window), s)` -- in practice the final span plus, only when it is short,
+the one before it (guaranteed sufficient by the existing ring invariant `chunk >= 2*page`,
+`page >= window`, so every non-final span has `>= window` rows). `begin_pass` captures each needed
+span's own tail metadata (already built by `init_forward_metadata` for every span, previously kept
+only for the final one) and gates candidate-mask publishing on the same needed-span set, so the
+candidate-source layer (20) also publishes tail-only masks for the penultimate span when required,
+via the existing `layer_major_skip_candidates`/`candidate_tail_only`/`candidate_publish_rows`
+mechanism, unchanged. `finish_pass` then runs the late layers over each needed span in order
+(penultimate before final), discarding every output but the true final span's.
+
+**CPU tests (`test/registered/unit/layer_major/`, all `register_cpu_ci`):**
+- `test_c1_late_layer_write_coverage.py`: drives the real `finish_pass` through the adapter with a
+  stand-in `causal_lm.forward_late_tail` recording which positions the late layers ran over, using
+  no symbol the fix adds. RED at `43d7813a41` for suffix lengths `chunk*2+8` and `chunk*2+127`
+  (assertion failure: positions `[s-window, s-r)` never covered, not an ImportError); GREEN at the
+  fix head for those two plus the `chunk*2` and `chunk*2+window` boundary cases, which were already
+  correct and stay so.
+- `test_c1_late_layer_tail_coverage.py`: pure `tail_run_spans` unit tests for the same four cases.
+- `test_dsv4_backend_install.py::TestRunLayerPenultimateTailMetadata`: `run_layer` installs each
+  needed span's own tail metadata (penultimate distinct from final), not None and not the final
+  one's -- the generic "publish exactly the tail's rows" mechanism itself is pinned generically in
+  `test_dsv4_candidate_indexer.py`'s existing tail-publish tests, reused unchanged here.
+- Registered suites unaffected by the rename (`_Pass.final_tail_metadata` -> `_Pass.tail_by_span`)
+  were updated to the new field name; behavior of those tests is otherwise unchanged.
+- On divix01 at the fix head (`0a96af96df`): `unit/layer_major` 77 passed, 2 skipped;
+  `test_dsv4_candidate_indexer.py` 43 passed; `test_dsv41_torch_indexer_chunking.py` 4 passed, 3
+  skipped.
+
+**GPU verification.** `equiv.py` gained a `len8200` case, a `--cases c1` subset (just that case),
+and `compare()` accepts a `c1` run against a full baseline the same way it already accepted
+`quick`. Corpus, locks and `/mnt/nvme1` scratch per the run protocol; production untouched
+throughout.
+
+| arm | worktree (head) | min_tokens | path (server.log) | token 0 | first differing decode index | mean output-token logprob |
+|---|---|---:|---|---|---:|---:|
+| chunked | `wt-lm-final-fix` (`0a96af96df`) | 0 | chunked (no layer-major) | -- | -- | -0.3103 |
+| (a) pre-fix | `wt-lm-final-prefix` (`43d7813a41`, dirty: `equiv.py` copied in) | 8192 | `layer-major prefill: 8200 tokens in 3 chunks` | IDENTICAL vs chunked | 3 / 64 | -0.3434 |
+| (b) fix head | `wt-lm-final-fix` (`0a96af96df`) | 8192 | `layer-major prefill: 8200 tokens in 3 chunks` | IDENTICAL vs chunked | 45 / 64 | -0.4156 |
+
+First 20 decoded tokens:
+- chunked / (b): `[63, 7640, 94, 2619, 39981, 23809, 14, 418, 420, 119683, 666, 369, 2619, 96, 856, 16, 20, 666, 369, 223]` (identical)
+- (a): `[63, 7640, 94, 420, 119683, 25137, 369, 5420, 24, 16, 2402, 369, 223, 21, 13656, 14, 223, 7833, 13523, 14]` (diverges at index 3)
+
+Reading: token 0 is identical on both arms, as expected (C1 cannot move it). (a) (pre-fix) shows
+the predicted degraded decode: it diverges from chunked after only 3 of 64 tokens and its mean
+output-token logprob is the furthest from chunked's. (b) (fix head) matches chunked's first 20
+tokens exactly and diverges only at index 45/64, consistent with the documented cross-server decode
+drift (27.19) rather than a correctness gap; its mean logprob is not exactly chunked's, which is
+expected under that same drift and is not the gating criterion (`compare()` gates on token 0 only).
+This is the GPU case the original review (`final-review.md`, C1) found unreproduced; `len8200` now
+reproduces the pre-fix defect and confirms the fix closes it, modulo documented drift.
+
+**I1 fix.** `scheduler_layer_major_refusal` (`layer_major/gate.py`) refuses a launch when
+`SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS < chunked_prefill_size + page_size` (the ring size), naming
+both values and the env var; before this, such a launch passed and the first eligible request hit
+`alloc_extend_swa_tail`'s assertion inside scheduling (outside `run_batch`'s exception containment),
+SIGQUITing the server. CPU test: refusal at 4096, acceptance at 4352 (chunk 4096, page 256).
+
+**Commands:** `drive_equiv.sh` itself has no `--cases` flag; a scratch copy
+(`/mnt/nvme1/lm-final-fix/drive_equiv_c1.sh`, not committed) added `--cases c1` to its `equiv.py run`
+line. (a)'s worktree is pre-fix, so its own `equiv.py` (no `len8200`/`c1` case) was overwritten with
+the fix head's copy (scratch only, not committed) before the run.
+```bash
+# divix01, wt-lm-final-fix / wt-lm-final-prefix at cc/lm-final-fix (0a96af96df) / 43d7813a41
+bash /mnt/nvme1/lm-final-fix/drive_equiv_c1.sh chunked <wt-fix> 0 /mnt/nvme1/layer-major/equiv-final
+bash /mnt/nvme1/lm-final-fix/drive_equiv_c1.sh layer-major-a <wt-prefix> 8192 /mnt/nvme1/layer-major/equiv-final
+bash /mnt/nvme1/lm-final-fix/drive_equiv_c1.sh layer-major-b <wt-fix> 8192 /mnt/nvme1/layer-major/equiv-final
+cd /mnt/nvme1/layer-major/equiv-final
+python equiv.py compare chunked.jsonl layer-major-a.jsonl --allow-head-mismatch --allow-dirty   # EXIT=0
+python equiv.py compare chunked.jsonl layer-major-b.jsonl --allow-head-mismatch --allow-dirty   # EXIT=0
+```
+Evidence: `divix01:/mnt/nvme1/layer-major/equiv-final/{chunked,layer-major-a,layer-major-b}/`
+(`driver.log`, `server.log`) and `equiv-final/{chunked,layer-major-a,layer-major-b}.jsonl`.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
