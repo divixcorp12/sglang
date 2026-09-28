@@ -80,13 +80,17 @@ def graph_edges(edges_mod, graph) -> list[list]:
     return [[f, t, int(ty), int(port)] for f, t, ty, port in (r.split("\t") for r in rows)]
 
 
-def run(repo: Path, tmp: Path, scenario: str, mode: str, module, edges_mod, replays: int, stamp: bool) -> list[dict]:
+def run(repo: Path, tmp: Path, scenario: str, mode: str, module, edges_mod, replays: int, stamp: bool,
+        spin_cpu: int) -> list[dict]:
     sys.path.insert(0, str(repo / "test/manual/dsv41"))
     from test_exl3_piece_stream_cuda import TOP_K, StreamService
 
     from sglang.kernels.ops.moe import expert_stream_transport as ops
 
-    original = ops._device_module
+    original, start = ops._device_module, ops.ExpertStreamHost.start_thread
+    # StreamService starts the service thread unpinned; pin it (the service's own cpu_core knob) so a host-bound
+    # scenario does not time whichever core the scheduler handed it.
+    ops.ExpertStreamHost.start_thread = lambda self, **kw: start(self, **{**kw, "cpu_core": spin_cpu})
     if module is not None:
         ops._device_module = lambda layout="exl3": module  # before the service: its warm-up request uses it too
     work = tmp / f"{scenario}-{mode}{'-stamp' if stamp else ''}"
@@ -94,7 +98,7 @@ def run(repo: Path, tmp: Path, scenario: str, mode: str, module, edges_mod, repl
     try:
         s = StreamService(work, **SCENARIOS[scenario])
     finally:
-        ops._device_module = original
+        ops._device_module, ops.ExpertStreamHost.start_thread = original, start
     records = []
     try:
         base = list(range(TOP_K))
@@ -139,7 +143,9 @@ def run(repo: Path, tmp: Path, scenario: str, mode: str, module, edges_mod, repl
         rec = {"kind": "chain", "scenario": scenario, "mode": mode, "stamp": stamp,
                "replay_us_p50": round(statistics.median(times), 2), "replay_us_p10": round(sorted(times)[len(times) // 10], 2),
                "hits_mean": round(statistics.mean(hits), 2), "replays": replays,
-               "spin_cpu": s.counters()["spin_cpu"]}  # the unpinned service thread's core: host-bound runs vary with it
+               "spin_cpu": s.counters()["spin_cpu"]}
+        if rec["spin_cpu"] != spin_cpu:
+            raise SystemExit(f"service thread on core {rec['spin_cpu']}, not the pinned {spin_cpu}")
         if stamp:
             module.expert_stream_pdl_stamps(ring)
             count = int(ring[-1])
@@ -165,6 +171,8 @@ def main() -> int:
     ap.add_argument("--replays", type=int, default=200)
     ap.add_argument("--stamp", action="store_true")
     ap.add_argument("--scenarios", default=",".join(SCENARIOS))
+    ap.add_argument("--spin-cpu", type=int, default=40,
+                    help="the service thread's core (GPU's NUMA node on divix01); the harness's own threads avoid it")
     ap.add_argument("--rounds", type=int, default=1, help="repeat every scenario, modes interleaved and rotated")
     a = ap.parse_args()
     repo = Path(a.repo).resolve()
@@ -179,6 +187,10 @@ def main() -> int:
     edges_mod = load_jit("chain_pdl_graph", cuda_files=[str(HERE / "chain_graph.cuh")],
                          cuda_wrappers=[("chain_graph_edges", "chain_graph_edges")])
     modules = {mode: build(defines, a.stamp) for mode, defines in MODES.items()}  # all built before any service
+    allowed = os.sched_getaffinity(0)
+    if a.spin_cpu not in allowed or len(allowed) < 4:
+        raise SystemExit(f"--spin-cpu {a.spin_cpu} must be one of this process's cores {sorted(allowed)}")
+    os.sched_setaffinity(0, allowed - {a.spin_cpu})  # main thread and the packing workers (inherited) keep off it
     tmp = Path(a.tmp or tempfile.mkdtemp(prefix="chain-pdl-"))
     tmp.mkdir(parents=True, exist_ok=True)
     with open(a.out, "a") as out:
@@ -186,7 +198,8 @@ def main() -> int:
             order = list(MODES)[rnd % len(MODES):] + list(MODES)[:rnd % len(MODES)]  # rotate which mode goes first
             for scenario in a.scenarios.split(","):
                 for mode in order:
-                    for rec in run(repo, tmp / f"r{rnd}", scenario, mode, modules[mode], edges_mod, a.replays, a.stamp):
+                    for rec in run(repo, tmp / f"r{rnd}", scenario, mode, modules[mode], edges_mod, a.replays, a.stamp,
+                                   a.spin_cpu):
                         rec["round"] = rnd
                         line = json.dumps(rec)
                         print(line if rec["kind"] != "graph" else json.dumps({**rec, "edges": len(rec["edges"])}),
