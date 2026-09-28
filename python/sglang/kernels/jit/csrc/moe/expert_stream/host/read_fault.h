@@ -16,8 +16,8 @@ struct ReadFault {
   // Per-extent faults, keyed by the extent's part index (-1: none). They hit the FIRST completion
   // of a part-`part` extent, whichever row it is in and however the kernel orders completions.
   int64_t part = -1;
-  int part_error = 0;         // errno that replaces that completion's result
-  int64_t part_short = 0;     // >0: that completion reports at most this many bytes (block multiple)
+  int part_error = 0;      // errno that replaces that completion's result
+  int64_t part_short = 0;  // >0: that completion reports at most this many bytes (block multiple)
   // Process each reaped batch of completions back to front. Nothing in the reader may
   // depend on delivery order, and the kernel gives no ordering guarantee across drives,
   // so this makes that requirement testable rather than assumed.
@@ -111,14 +111,14 @@ inline ReadFault fault_from(const int64_t* f) {
 
 template <ExpertRowLayout Layout>
 inline void check_fault_words(TensorView fault) {
-  if (fault.size(0) != kFaultWords) throw std::runtime_error(error_prefix<Layout>() + "the fault tensor has the wrong length");
+  if (fault.size(0) != kFaultWords)
+    throw std::runtime_error(error_prefix<Layout>() + "the fault tensor has the wrong length");
 }
 
 // Entry points' abandon callback: stop once `after` batches were admitted (0: never).
 inline std::function<bool(size_t)> abandon_after(int64_t after) {
   return [after](size_t admitted) { return after > 0 && admitted >= static_cast<size_t>(after); };
 }
-
 
 }  // namespace expert_stream
 }  // namespace sglang

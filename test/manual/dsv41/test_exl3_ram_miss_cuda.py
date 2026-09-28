@@ -278,6 +278,58 @@ def test_the_wait_honours_a_fatal_raised_on_the_page():
     assert b["keep"].item() == 0.0 and dev.stats()["sticky"] == 1
 
 
+def _unserved_device(timeout_ms):
+    """A non-lease device over a page nobody serves, with one armed request (expert 2 is not resident) pending."""
+    from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamDevice, new_page
+
+    page = new_page(pin=True)
+    slot_map = torch.full((1, EXPERTS), -1, dtype=torch.int32).pin_memory()
+    dev = ExpertStreamDevice(page, slot_map, device="cuda", layers=1, timeout_ms=timeout_ms, advise=False)
+    b = _buffers()
+    _set(b, [2], [2])
+    dev.post(0, b["planned"], b["count"], b["routes"], -1)  # also builds the module, so no JIT time is measured below
+    torch.cuda.synchronize()
+    seq = dev.stats()["pending"]
+    assert seq != 0
+    return page, dev, b, seq
+
+
+def test_a_fatal_raised_while_the_wait_polls_ends_it_promptly():
+    """The plain wait rechecks the page's fatal word inside its poll loop, as the lease waits do: once the service
+    has failed nobody will serve the request, so the wait fails closed at once instead of running out its timeout,
+    counts no timeout and raises no fatal word of its own."""
+    import threading
+
+    from sglang.kernels.ops.moe.expert_stream_transport import WORDS, page_word
+
+    page, dev, b, _ = _unserved_device(timeout_ms=5000)
+    timer = threading.Timer(0.02, lambda: page[WORDS["fatal"] : WORDS["fatal"] + 4].view(torch.int32).fill_(99))
+    timer.start()
+    start = time.perf_counter()
+    dev.wait(0, b["planned"], b["count"], b["host_rows"], b["keep"], b["ram_miss"])
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    timer.join()
+    assert elapsed < 0.25, f"the wait took {elapsed:.3f} s against a 5 s timeout"
+    stats = dev.stats()
+    assert stats["timeouts"] == 0 and stats["failures"] == 0 and stats["sticky"] == 1 and stats["pending"] == 0
+    assert stats["waits"] == 1 and stats["polls"] > 0
+    assert b["keep"].item() == 0.0 and page_word(page, "fatal") == 99
+
+
+def test_an_unserved_wait_still_times_out_and_raises_fatal():
+    from sglang.kernels.ops.moe.expert_stream_transport import page_word
+
+    page, dev, b, seq = _unserved_device(timeout_ms=200)
+    start = time.perf_counter()
+    dev.wait(0, b["planned"], b["count"], b["host_rows"], b["keep"], b["ram_miss"])
+    torch.cuda.synchronize()
+    assert time.perf_counter() - start >= 0.2
+    stats = dev.stats()
+    assert stats["timeouts"] == 1 and stats["sticky"] == 1 and stats["polls"] > 0
+    assert b["keep"].item() == 0.0 and page_word(page, "fatal") == seq
+
+
 def test_layer_posts_advise_the_next_layer(tmp_path):
     layout, fmt, specs, slabs, host, dev = _service(tmp_path, advise=True, layers=2)
     try:

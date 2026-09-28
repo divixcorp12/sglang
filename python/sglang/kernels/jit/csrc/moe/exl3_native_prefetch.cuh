@@ -15,19 +15,18 @@
 //
 // The page layout mirrors exl3_ram_miss_host.cpp (kPf*) and ops/moe/expert_stream_transport.py (PREFETCH_FIELDS).
 
-#include "expert_stream/lease_layout.h"
-
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
 
-#include <cuda_bf16.h>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "expert_stream/lease_layout.h"
 #include <cmath>
 #include <cstdint>
+#include <cuda_bf16.h>
 #include <stdexcept>
 
 namespace sglang {
@@ -54,7 +53,7 @@ constexpr int kAborted = 7;      // commits that timed out or saw the fatal / sh
 constexpr int kWindowNs = 8;     // %globaltimer ns from each post to its commit's entry: the compute the copy overlaps
 constexpr int kWaitNs = 9;       // ns each commit spent waiting for its done word: the copy time left exposed
 constexpr int kCounters = 10;
-constexpr int kPending = 6;      // pending record: {valid, expert, slot, generation, post ns, unused}
+constexpr int kPending = 6;  // pending record: {valid, expert, slot, generation, post ns, unused}
 
 __device__ __forceinline__ uint32_t ld_acquire_sys(const uint8_t* address) {
   uint32_t value;
@@ -120,8 +119,8 @@ __global__ __launch_bounds__(exl3_native_prefetch_device::kPlanBlock, 1) void ex
   __shared__ int top[kTopK];
   const int tid = threadIdx.x;
   for (int e = tid; e < experts; e += kPlanBlock) {
-    const float b = kBiasBf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(bias)[e])
-                              : static_cast<const float*>(bias)[e];
+    const float b =
+        kBiasBf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(bias)[e]) : static_cast<const float*>(bias)[e];
     keys[e] = biased_score(logits[e], b);
   }
   __syncthreads();
@@ -185,7 +184,8 @@ __global__ __launch_bounds__(exl3_native_prefetch_device::kPlanBlock, 1) void ex
     const int64_t slot = pvictims[i];
     const int64_t held = slot_to_expert[slot];
     bool predicted = false;
-    for (int k = 0; k < kTopK; ++k) predicted = predicted || held == top[k];
+    for (int k = 0; k < kTopK; ++k)
+      predicted = predicted || held == top[k];
     if (predicted) continue;
     victim = slot;
     break;
@@ -267,7 +267,8 @@ __global__ __launch_bounds__(32, 1) void exl3_native_prefetch_commit_kernel(
   slot_generations[slot] += 1;
   counters[kCopied] += 1;
   bool used = false;
-  for (int64_t i = 0; i < route_count; ++i) used = used || routes[i] == expert;
+  for (int64_t i = 0; i < route_count; ++i)
+    used = used || routes[i] == expert;
   if (used) counters[kUsed] += 1;
 }
 

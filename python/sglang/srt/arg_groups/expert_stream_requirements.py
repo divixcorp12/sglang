@@ -324,11 +324,6 @@ def eager_expert_stream_requirements(
                 f"{label} expert caching does not support "
                 "SGLANG_MOE_GPU_RESIDENCY_UPDATE; set it to 0"
             )
-        if envs.SGLANG_MOE_EXPERT_DOORBELL.get():
-            raise ValueError(
-                f"{label} expert caching does not support "
-                "SGLANG_MOE_EXPERT_DOORBELL; set it to 0"
-            )
         graph_config = cfg.cuda_graph_config
         if graph_config is not None and (
             graph_config.decode.backend != Backend.DISABLED

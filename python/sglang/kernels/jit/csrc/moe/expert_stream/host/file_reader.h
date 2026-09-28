@@ -20,17 +20,24 @@ struct ReadCompletion {
 // thread and reads on its own), so an implementation must not bind itself to its creating thread.
 // Buffers and iovec arrays passed to prep_* stay the caller's and must outlive the read's completion.
 template <typename R>
-concept AsyncFileReader =
-    requires(R& r, const R& cr, int fd, void* buf, const iovec* iov, unsigned n, uint64_t off, uint64_t tag,
-             std::vector<ReadCompletion>& out) {
-      { r.init(n) } -> std::same_as<bool>;                         // n: reads prepared and not yet reaped, at most
-      { cr.ready() } -> std::same_as<bool>;
-      { r.prep_read(fd, buf, n, off, tag) } -> std::same_as<bool>;  // false: no room, reap first
-      { r.prep_readv(fd, iov, n, off, tag) } -> std::same_as<bool>;
-      { r.submit(n) } -> std::same_as<int>;                         // wait for n completions (0: none); <0 is -errno
-      { r.reap(out) } -> std::same_as<unsigned>;                    // appends, never blocks
-      { r.drain(n) } -> std::same_as<void>;                         // n prepared-or-in-flight reads: settle all
-    };
+concept AsyncFileReader = requires(
+    R& r,
+    const R& cr,
+    int fd,
+    void* buf,
+    const iovec* iov,
+    unsigned n,
+    uint64_t off,
+    uint64_t tag,
+    std::vector<ReadCompletion>& out) {
+  { r.init(n) } -> std::same_as<bool>;  // n: reads prepared and not yet reaped, at most
+  { cr.ready() } -> std::same_as<bool>;
+  { r.prep_read(fd, buf, n, off, tag) } -> std::same_as<bool>;  // false: no room, reap first
+  { r.prep_readv(fd, iov, n, off, tag) } -> std::same_as<bool>;
+  { r.submit(n) } -> std::same_as<int>;       // wait for n completions (0: none); <0 is -errno
+  { r.reap(out) } -> std::same_as<unsigned>;  // appends, never blocks
+  { r.drain(n) } -> std::same_as<void>;       // n prepared-or-in-flight reads: settle all
+};
 
 // Test-only description of a submit fault, shared by every AsyncFileReader decorator that injects one.
 struct SubmitFault {

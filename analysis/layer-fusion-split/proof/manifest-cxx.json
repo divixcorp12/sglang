@@ -1,0 +1,43 @@
+{
+ "base": "72954c49a05cf6cacc875f3b16f8fccbe30d8de7",
+ "sources": [
+  "python/sglang/kernels/jit/csrc/moe/dsv41_layer_fusion.cuh"
+ ],
+ "files": {
+  "python/sglang/kernels/jit/csrc/moe/expert_residency/direct_gather.cuh": [
+   [
+    "python/sglang/kernels/jit/csrc/moe/dsv41_layer_fusion.cuh",
+    19,
+    19
+   ],
+   [
+    "python/sglang/kernels/jit/csrc/moe/dsv41_layer_fusion.cuh",
+    31,
+    155
+   ],
+   [
+    "python/sglang/kernels/jit/csrc/moe/dsv41_layer_fusion.cuh",
+    214,
+    371
+   ]
+  ],
+  "python/sglang/kernels/jit/csrc/moe/exl3/exl3_route_tables.cuh": [
+   [
+    "python/sglang/kernels/jit/csrc/moe/dsv41_layer_fusion.cuh",
+    21,
+    30
+   ],
+   [
+    "python/sglang/kernels/jit/csrc/moe/dsv41_layer_fusion.cuh",
+    156,
+    213
+   ],
+   [
+    "python/sglang/kernels/jit/csrc/moe/dsv41_layer_fusion.cuh",
+    372,
+    442
+   ]
+  ],
+  "python/sglang/kernels/jit/csrc/moe/dsv41_layer_fusion.cuh": []
+ }
+}

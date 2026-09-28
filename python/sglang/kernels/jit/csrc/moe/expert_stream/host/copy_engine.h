@@ -27,7 +27,7 @@ struct CopyJob {
   int count = 0;
   CopyLane lanes[kLeaseLanes];
   int64_t submit_ns = 0;
-  int64_t token = -1;  // the backend's completion marker, recorded after the job's last copy
+  int64_t token = -1;     // the backend's completion marker, recorded after the job's last copy
   bool prefetch = false;  // a native-prefetch job: issued only behind demand jobs, completed into PrefetchDone
   // Its row has SM entries (set at issue): the copy wait reads them from the leased slots, so the leases are released
   // only once it acknowledged its reads (SmAck), not on the DMA's completion. Never a prefetch job: no kernel reads
@@ -50,7 +50,7 @@ class CopyBackend {
   static constexpr int kDone = 0;
   static constexpr int kPending = 1;
   virtual ~CopyBackend() = default;
-  virtual std::string init() = 0;  // empty on success
+  virtual std::string init() = 0;                                    // empty on success
   virtual int issue(uint64_t dst, uint64_t src, int64_t bytes) = 0;  // 0 or an error code
   virtual int mark(int64_t* token) = 0;
   virtual int query(int64_t token) = 0;  // kDone, kPending, or an error code (negative for the host backend)
@@ -90,7 +90,8 @@ class CudaCopyBackend : public CopyBackend {
     if (int r = cu_init_(0)) return "cuInit failed: " + std::to_string(r);
     if (int r = cu_device_get_(&cu_device_, device_)) return "cuDeviceGet failed: " + std::to_string(r);
     // The primary context: the one PyTorch uses, so the slabs' registrations and the destinations are valid here.
-    if (int r = cu_primary_retain_(&context_, cu_device_)) return "cuDevicePrimaryCtxRetain failed: " + std::to_string(r);
+    if (int r = cu_primary_retain_(&context_, cu_device_))
+      return "cuDevicePrimaryCtxRetain failed: " + std::to_string(r);
     retained_ = true;
     if (int r = cu_ctx_set_current_(context_)) return "cuCtxSetCurrent failed: " + std::to_string(r);
     constexpr unsigned kNonBlocking = 1;  // CU_STREAM_NON_BLOCKING: no implicit sync with the legacy stream
@@ -101,7 +102,8 @@ class CudaCopyBackend : public CopyBackend {
     // with up to 64 blocked. sglang creates no other greatest-priority stream.
     int least = 0;
     int greatest = 0;
-    if (int r = cu_priority_range_(&least, &greatest)) return "cuCtxGetStreamPriorityRange failed: " + std::to_string(r);
+    if (int r = cu_priority_range_(&least, &greatest))
+      return "cuCtxGetStreamPriorityRange failed: " + std::to_string(r);
     if (int r = cu_stream_create_(&stream_, kNonBlocking, greatest)) {
       return "cuStreamCreateWithPriority failed: " + std::to_string(r);
     }
@@ -238,8 +240,16 @@ class CopyEngine {
 
   // `thread_name` is the copy thread's pthread name (e.g. Layout::kName + "-copy-eng"), truncated to 15 bytes
   // (pthread_setname_np's limit).
-  CopyEngine(std::unique_ptr<CopyBackend> backend, int64_t rows, int64_t spin_ns, std::atomic<int64_t>* counters,
-             Handler complete, Handler acked, Failure fail, std::string prefix, std::string thread_name)
+  CopyEngine(
+      std::unique_ptr<CopyBackend> backend,
+      int64_t rows,
+      int64_t spin_ns,
+      std::atomic<int64_t>* counters,
+      Handler complete,
+      Handler acked,
+      Failure fail,
+      std::string prefix,
+      std::string thread_name)
       : backend_(std::move(backend)),
         tables_(static_cast<size_t>(rows)),
         spin_ns_(spin_ns),
@@ -349,7 +359,7 @@ class CopyEngine {
     ready_cv_.notify_all();
     if (!error.empty()) return;
     std::deque<CopyJob> in_flight;
-    std::deque<CopyJob> held;  // prefetch jobs not yet issued: demand goes first on the link
+    std::deque<CopyJob> held;    // prefetch jobs not yet issued: demand goes first on the link
     std::deque<CopyJob> acking;  // copies completed, CopyDone published; the leases wait for the copy wait's SmAck
     int64_t last_active = now_ns();
     while (true) {
@@ -375,7 +385,8 @@ class CopyEngine {
       // so a mispredicted row never sits on the copy stream ahead of a demand row. Once issued it cannot be preempted;
       // the device never posts a demand while its own layer's prefetch is outstanding, so none can queue behind it.
       bool demand_in_flight = false;
-      for (const CopyJob& job : in_flight) demand_in_flight = demand_in_flight || !job.prefetch;
+      for (const CopyJob& job : in_flight)
+        demand_in_flight = demand_in_flight || !job.prefetch;
       if (!held.empty() && (demand_fresh || demand_in_flight)) {
         if (!held_counted_) counters_[kPrefetchHeld].fetch_add(1);
         held_counted_ = true;
@@ -508,13 +519,12 @@ class CopyEngine {
   int64_t drain_deadline_ = 0;
   bool started_ = false;
   std::string init_error_;
-  int broken_ = 0;  // copy thread only: the first backend error
+  int broken_ = 0;             // copy thread only: the first backend error
   bool held_counted_ = false;  // copy thread only: the current hold was counted in kPrefetchHeld
   std::atomic<uint64_t> ballast_dst_{0};
   std::atomic<uint64_t> ballast_src_{0};
   std::atomic<int64_t> ballast_bytes_{0};
 };
-
 
 }  // namespace expert_stream
 }  // namespace sglang

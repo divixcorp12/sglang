@@ -1,6 +1,6 @@
 // Wire layout of the expert-stream request page, lease block and prefetch page (LEASE_PROTOCOL.md section 4).
-// Mirrored by ops/moe/expert_stream_transport.py and ops/moe/expert_lease_block.py; test_exl3_ram_miss_device_args checks both.
-// Only `constexpr <type> kName = <integer expression>;` lines: that test parses them.
+// Mirrored by ops/moe/expert_stream_transport.py and ops/moe/expert_lease_block.py; test_exl3_ram_miss_device_args
+// checks both. Only `constexpr <type> kName = <integer expression>;` lines: that test parses them.
 #pragma once
 
 #include <cstdint>
@@ -45,8 +45,8 @@ constexpr uint16_t kFailed = 2;
 // and lease_device.cuh both include this header) and mirrored in ops/moe/expert_lease_block.py;
 // test_exl3_ram_miss_device_args checks they agree. The
 // publication word (tag << 56 | generation) is built in code: the layout test parses these lines with + - * only.
-constexpr int64_t kLeaseRing = 16;   // == kDemandRecords
-constexpr int64_t kLeaseLanes = 8;   // == kMaxIds
+constexpr int64_t kLeaseRing = 16;  // == kDemandRecords
+constexpr int64_t kLeaseLanes = 8;  // == kMaxIds
 constexpr int64_t kLeaseHeaderRing = 8;
 constexpr int64_t kLeaseHeaderLanes = 12;
 constexpr int64_t kLeaseHeaderShutdown = 20;
@@ -130,11 +130,11 @@ constexpr uint32_t kLeaseReasonCount = 5;
 // A pinned 256-byte page beside the lease block. The device (the plan kernel) writes the request line, the service
 // the done line. The device posts one request and waits for its done word before it posts the next, so one request
 // line is enough; `gen` is the device's 56-bit prefetch counter, tagged kPfTagRequest.
-constexpr int64_t kPfReqGen = 0;      // u64 tagged(kPfTagRequest, gen), stored last with a release
-constexpr int64_t kPfReqRow = 8;      // i32 streamed row of the target layer
-constexpr int64_t kPfReqExpert = 12;  // i32 expert
-constexpr int64_t kPfReqDst = 16;     // i32 destination hot slot of the target layer
-constexpr int64_t kPfDoneGen = 128;   // u64 tagged(kPfTagCopied | kPfTagSkipped, gen), service-written
+constexpr int64_t kPfReqGen = 0;        // u64 tagged(kPfTagRequest, gen), stored last with a release
+constexpr int64_t kPfReqRow = 8;        // i32 streamed row of the target layer
+constexpr int64_t kPfReqExpert = 12;    // i32 expert
+constexpr int64_t kPfReqDst = 16;       // i32 destination hot slot of the target layer
+constexpr int64_t kPfDoneGen = 128;     // u64 tagged(kPfTagCopied | kPfTagSkipped, gen), service-written
 constexpr int64_t kPfDoneReason = 136;  // u32, why a request was skipped (kPfSkip*), stored before kPfDoneGen
 constexpr int64_t kPrefetchPageBytes = 256;
 constexpr uint64_t kPfTagRequest = 1;

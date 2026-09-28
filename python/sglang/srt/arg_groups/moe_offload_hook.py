@@ -84,7 +84,6 @@ def check_moe_offload_config(server_args: Any) -> None:
             pp_size=cfg.pp_size,
             dp_size=cfg.dp_size,
             dp_attention=cfg.enable_dp_attention,
-            allowed_cpus=os.sched_getaffinity(0),
             nvfp4_hot_cache=_nvfp4_hot_cache(server_args, cfg),
         )
     except ValueError as error:

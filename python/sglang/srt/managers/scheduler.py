@@ -1923,13 +1923,6 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
-        model_runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
-        expert_hot_cache_manager = getattr(model_runner, "expert_hot_cache_manager", None)
-        if expert_hot_cache_manager is not None:
-            try:
-                expert_hot_cache_manager.stop_doorbell()
-            except Exception:
-                logger.exception("Stopping the expert doorbell failed; releasing the remaining host resources.")
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -4901,7 +4894,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
-        self._expert_doorbell_fail_stop_check()
+        self._run_expert_fail_stop_checks()
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
@@ -4917,20 +4910,16 @@ class Scheduler(
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
 
-    def _expert_doorbell_fail_stop_check(self) -> None:
-        """Hold the next forward until committed doorbell copies a drain gave up on have landed.
+    def _run_expert_fail_stop_checks(self) -> None:
+        """Run the expert hot cache's fail-stop checks after every forward's results.
 
-        Runs after every forward's results, in every mode, since any 1-token gather posts to
-        the doorbell (eager prefill and extend included). It synchronizes the current stream
-        on every call: a replayed CUDA graph posts device-side without entering Python, so a
-        flag recording whether a post ran reads False on exactly the steps that posted. With
-        no exhausted drain it waits for nothing. Requires --disable-overlap-schedule (refused
-        otherwise in the model runner).
+        Runs in every forward mode, before the next forward. A check raises to stop the
+        process (the EXL3 RAM-miss service registers one) and never synchronizes the device.
         """
         model_runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
         manager = getattr(model_runner, "expert_hot_cache_manager", None)
         if manager is not None:
-            manager.doorbell_fail_stop_check(synchronize=True)
+            manager.run_fail_stop_checks()
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

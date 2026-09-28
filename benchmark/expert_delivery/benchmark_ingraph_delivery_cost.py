@@ -3,10 +3,9 @@
 
 This is a defensible-upper-bound instrument for expert-row delivery cost,
 deliberately built through ``InGraphRowBackend`` (python/sglang/srt/layers/moe/
-expert_row_plan.py) rather than the doorbell copier: ``post`` issues
-``copy_expert_row_segments_gpu`` synchronously on the current stream, so it
-serializes with whatever compute shares that stream. The doorbell's own
-DOORBELL_ROW_MS number is not used anywhere in this script or its arithmetic.
+expert_row_plan.py): ``post`` issues ``copy_expert_row_segments_gpu``
+synchronously on the current stream, so it serializes with whatever compute
+shares that stream.
 
 A single production ``post()`` call moves at most ``top_k`` rows for one
 target layer (scratch is sized ``bs * top_k`` rows/layer, not sized for a
@@ -18,8 +17,8 @@ plus per_row_ms times the token's total miss count -- linear in total misses,
 independent of how they are spread across layers.
 
 Row geometry (H=2560, I=640, the six NVFP4_STREAM_TENSORS) reproduces the
-real per-expert-row byte layout used by benchmark/expert_doorbell/bench_doorbell.py
-on divix01 (cc-pcie-bench Setup): total 2,764,808 B/row, 8 bytes more than the
+real per-expert-row byte layout of the removed benchmark/expert_doorbell/bench_doorbell.py (last at 29c7d4e2b1).
+Total 2,764,808 B/row, 8 bytes more than the
 2,764,800 planning-doc rounding (two float32 alpha scalars). This script
 derives the actual byte total from the constructed segments table rather than
 hardcoding either constant.
@@ -39,7 +38,7 @@ from collections.abc import Sequence
 import torch
 
 # Real per-expert-row tensor shapes (H=2560, I=640), matching production and
-# benchmark/expert_doorbell's cc-pcie-bench Setup (verified on divix01).
+# the cc-pcie-bench Setup of the removed benchmark/expert_doorbell (verified on divix01).
 H, INTER = 2560, 640
 TENSOR_SHAPES: tuple[tuple[str, tuple[int, ...], torch.dtype], ...] = (
     ("w13_weight", (2 * INTER, H // 2), torch.uint8),

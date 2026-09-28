@@ -31,13 +31,13 @@ enum Counter : int {
   kVersion,
   kRunning,
   kSpinCpu,
-  kDeferred,  // demands held back because their only victims are leased: one per deferral, none evicted
-  kLeasesGranted,     // one per lane of a served request in lease mode
-  kLeasesAcked,       // released by the device's acknowledgement
-  kLeasesVoided,      // released by a terminal record that named the lane
-  kLeaseDoubleSignal, // a lane signalled by both, or twice: released once, counted here
-  kLateAfterTerminal, // a request the device had already given up on: dropped without a lease
-  kDeferredReuse,     // a demand held back because its request slot still holds an unretired lease row
+  kDeferred,           // demands held back because their only victims are leased: one per deferral, none evicted
+  kLeasesGranted,      // one per lane of a served request in lease mode
+  kLeasesAcked,        // released by the device's acknowledgement
+  kLeasesVoided,       // released by a terminal record that named the lane
+  kLeaseDoubleSignal,  // a lane signalled by both, or twice: released once, counted here
+  kLateAfterTerminal,  // a request the device had already given up on: dropped without a lease
+  kDeferredReuse,      // a demand held back because its request slot still holds an unretired lease row
   // S7. The hit-lane subset of kLeasesGranted: lanes granted BEFORE read() by V1's first phase. Separate because
   // kLeasesGranted cannot distinguish the groups, so a build that publishes nothing early -- falling through to
   // the batched grant -- would satisfy every timing assertion by accident. Zero on the single-phase path.
@@ -52,8 +52,8 @@ enum Counter : int {
   kCopyIssueNs,          // host ns in the copy thread's CUDA calls that issue copies and record events, summed
   kCopyLatencyNs,        // submit (the grant) to completion observed, summed over jobs
   kCopyLatencyMaxNs,
-  kCopyFallbacks,        // hit lanes published READY while the copy engine was armed (flag off, no table, bad slot)
-  kCopyErrors,           // CUDA errors on the copy thread: the page is fatal and the leases stay held
+  kCopyFallbacks,  // hit lanes published READY while the copy engine was armed (flag off, no table, bad slot)
+  kCopyErrors,     // CUDA errors on the copy thread: the page is fatal and the leases stay held
   kCopyGenerationMismatches,  // a completed lane whose slot generation moved: fatal, CopyDone never published
   // Native prefetch (plan 2026-09-25-dsv41-native-prefetch): advisory next-layer copies through the copy engine.
   kPrefetchRequests,         // prefetch requests the device posted and the service read
@@ -149,6 +149,10 @@ struct Outstanding {
   uint64_t gen = 0;
   int64_t row = 0;
   uint32_t count = 0;
+  // A lane of this entry was retired by an ack or a terminal, and a second signal for it may still land after the
+  // entry closed: retire_leases keeps comparing a watched entry's words until a settle pass (host/ram_tier.h) or
+  // the ring index's reuse ends the watch.
+  bool watched = false;
   LaneLease lane[kLeaseLanes];
 };
 
@@ -225,7 +229,6 @@ class StageRing {
   std::atomic<int64_t> dropped_{0};
   int64_t unreported_ = 0;  // producer only: drops since the last record that got in
 };
-
 
 }  // namespace expert_stream
 }  // namespace sglang

@@ -430,27 +430,6 @@ class Envs:
     # pass instead of two, and idle lanes move no bytes. Off by default until a
     # serving arm accepts it, so the measured stage-1 config stays reproducible.
     SGLANG_MOE_HOT_FUSED_INSERT = EnvBool(False)
-    # Serve graph-gather miss copies through the doorbell copier thread: the
-    # gather posts its miss plan and waits in-graph, falling back to the
-    # in-graph copy on timeout. Requires SGLANG_MOE_EXPERT_GRAPH_GATHER.
-    SGLANG_MOE_EXPERT_DOORBELL = EnvBool(False)
-    SGLANG_MOE_EXPERT_DOORBELL_CPU = EnvInt(71)
-    # Wait budgets in polls (about 250 ns each); 0 sizes them from the largest
-    # per-layer miss copy.
-    SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS = EnvInt(0)
-    SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS = EnvInt(0)
-    # Polls a timed-out resolve of a request the thread committed to drains
-    # before the doorbell is disabled for good (the resolve then keeps waiting
-    # for that request's copies); 0 uses about 2 s.
-    SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS = EnvInt(0)
-    # Which layer a doorbell plan targets: "current" posts and resolves layer
-    # L's misses inside layer L; "next_layer" is reserved for prediction.
-    SGLANG_MOE_EXPERT_DOORBELL_MODE = EnvStr("current")
-    # Seconds a disabled drain may wait for a committed copy before the
-    # doorbell watchdog aborts the process (a crash instead of a hang).
-    SGLANG_MOE_EXPERT_DOORBELL_FATAL_WAIT_S = EnvFloat(30.0)
-    # Static plan capacity per target layer; 0 uses the layer's scratch rows.
-    SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY = EnvInt(0)
     SGLANG_MOE_HOT_LOG_INTERVAL = EnvInt(100)
     SGLANG_MOE_HOT_METRICS_FILE = EnvStr("")
     SGLANG_MOE_PREFETCH_MAX_CANDIDATES = EnvInt(0)
@@ -2316,6 +2295,12 @@ def _invert_bool(value: str) -> str:
     return "0" if value.lower() in ("true", "1", "yes", "y") else "1"
 
 
+_DOORBELL_REMOVED_NOTE = (
+    "The doorbell side-thread expert copier was removed on 2026-09-27; graph-gather "
+    "misses are always copied in-graph. Unset this env."
+)
+
+
 # The single registry for deprecated environment variables, processed once at
 # import by _handle_deprecated_envs(). Add new deprecations here instead of
 # ad-hoc warnings. For a rename where the old name must keep working through a
@@ -2399,6 +2384,21 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="The unified radix tree is the default tree cache now; unset this "
         "env. The field is still defined for legacy call sites."
     ),
+    # The doorbell copier and all its knobs (removed 2026-09-27). Production launches
+    # still pin SGLANG_MOE_EXPERT_DOORBELL=0, so a set value warns rather than refuses.
+    **{
+        name: _DeprecatedEnv(note=_DOORBELL_REMOVED_NOTE)
+        for name in (
+            "SGLANG_MOE_EXPERT_DOORBELL",
+            "SGLANG_MOE_EXPERT_DOORBELL_CPU",
+            "SGLANG_MOE_EXPERT_DOORBELL_TIMEOUT_POLLS",
+            "SGLANG_MOE_EXPERT_DOORBELL_DEGRADED_POLLS",
+            "SGLANG_MOE_EXPERT_DOORBELL_DRAIN_POLLS",
+            "SGLANG_MOE_EXPERT_DOORBELL_MODE",
+            "SGLANG_MOE_EXPERT_DOORBELL_FATAL_WAIT_S",
+            "SGLANG_MOE_EXPERT_DOORBELL_PLAN_CAPACITY",
+        )
+    },
 }
 
 

@@ -218,6 +218,75 @@ def test_a_lane_signalled_by_both_an_acknowledgement_and_a_terminal_is_counted_a
     assert host.counters()["leases_acked"] + host.counters()["leases_voided"] == 1
 
 
+def test_a_terminal_landing_after_its_lane_retired_by_ack_is_counted_on_the_next_pass(world):
+    """The ack retires the lane and closes the entry in one pass; the terminal for the same generation lands after
+    it. Another request still holds a lease, so the next pass runs, and it must count the double signal.
+    Mutation: retire_leases skips an entry once it is inactive, so the second signal is never compared."""
+    s, page, host, sim = world
+    req, waited = _serve(host, sim, 0, [1])
+    held, _ = _serve(host, sim, 0, [2])  # keeps lanes outstanding, so no pass takes the idle early-out
+    slot = _slot_of(host, 0, 1)
+    sim.ack(req, waited)
+    sim.deliver()
+    host.pump()
+    assert not host.lease_entry(req.idx)["active"] and _leases(host, 0)[slot] == 0
+    assert host.counters()["lease_double_signal"] == 0
+    sim.terminal(req, mask=0b1)
+    sim.deliver()
+    host.pump()
+    counters = host.counters()
+    assert counters["lease_double_signal"] == 1
+    assert counters["leases_acked"] == 1 and counters["leases_voided"] == 0 and _leases(host, 0)[slot] == 0
+    host.pump()
+    assert host.counters()["lease_double_signal"] == 1, "counted once, not once per pass"
+
+
+def test_a_terminal_landing_after_the_last_lease_retired_is_counted_once_the_next_request_is_posted(world):
+    """As above, with nothing else outstanding: the idle pass returns early, so the count comes from the pass after
+    the next request is posted. By assumption A1 (one stream, serialized) the device emitted every signal of a
+    request before it posted the next one, so that pass sees the terminal.
+    Mutation: retire_leases skips an entry once it is inactive, so the second signal is never compared."""
+    s, page, host, sim = world
+    req, waited = _serve(host, sim, 0, [1])
+    slot = _slot_of(host, 0, 1)
+    _release(host, sim, req, waited)
+    assert not host.lease_entry(req.idx)["active"] and _leases(host, 0)[slot] == 0
+    sim.terminal(req, mask=0b1)
+    sim.deliver()
+    later, later_waited = _serve(host, sim, 0, [2])
+    counters = host.counters()
+    assert counters["lease_double_signal"] == 1
+    assert counters["leases_acked"] == 1 and counters["leases_voided"] == 0 and _leases(host, 0)[slot] == 0
+    _release(host, sim, later, later_waited)
+    _serve(host, sim, 0, [2])
+    assert host.counters()["lease_double_signal"] == 1, "counted once, not once per settle"
+
+
+def test_an_ack_then_a_terminal_for_a_later_generation_on_the_same_lane_counts_nothing(world):
+    """Legitimate sequences: lane 0 is acknowledged for generation g, then voided by a terminal for g + 1 (the next
+    request, another ring index) and for g + DEMAND_RECORDS (the same ring index and lane, reused). Neither is a
+    second signal for g. Mutation: the watch compares a signal's generation against anything but its own entry's."""
+    s, page, host, sim = world
+    first, waited = _serve(host, sim, 0, [1])
+    _release(host, sim, first, waited)
+    voided = 0
+    for n in range(1, DEMAND_RECORDS + 1):
+        req, waited = _serve(host, sim, 0, [1])
+        if n in (1, DEMAND_RECORDS):
+            assert req.gen == first.gen + n and (req.idx == first.idx) == (n == DEMAND_RECORDS)
+            sim.terminal(req, mask=0b1)
+            sim.deliver()
+            host.pump()
+            voided += 1
+        else:
+            _release(host, sim, req, waited)
+    settle, waited = _serve(host, sim, 0, [2])  # the settle pass for every earlier request
+    _release(host, sim, settle, waited)
+    counters = host.counters()
+    assert counters["leases_voided"] == voided and counters["lease_double_signal"] == 0
+    assert _leases(host, 0) == [0, 0, 0]
+
+
 def test_a_request_the_device_already_gave_up_on_is_dropped_without_a_lease(world):
     """Mutation: the service serves and leases a request whose terminal it has already seen."""
     s, page, host, sim = world

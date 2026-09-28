@@ -2,8 +2,6 @@
 // instantiation's former exl3_ram_miss.cuh).
 #pragma once
 
-#include "lease_layout.h"
-
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -11,11 +9,15 @@
 
 #include <sgl_kernel/distributed/ptx.cuh>
 
+#include <cuda/atomic>
+#include <cuda/ptx>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "lease_layout.h"
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang {
 namespace device::expert_stream {
@@ -34,7 +36,7 @@ constexpr int kPolls = 5;
 constexpr int kSticky = 6;
 constexpr int kAdvised = 7;
 constexpr int kUnservedMisses = 8;
-constexpr int kEpoch = 9;         // times seq32 wrapped; the device owns it (LEASE_PROTOCOL.md 11.3)
+constexpr int kEpoch = 9;          // times seq32 wrapped; the device owns it (LEASE_PROTOCOL.md 11.3)
 constexpr int kPendingEpoch = 10;  // the epoch of the request kPending names
 // D5. One absolute deadline per request, written once by the post kernel and compared against by both stages, so a
 // two-stage request cannot run to 2 x SGLANG_DSV41_RAM_MISS_TIMEOUT_MS. `state` is int32[], so it takes two words.
@@ -43,7 +45,7 @@ constexpr int kDeadlineHi = 12;
 // D6. An earlier stage of THIS request failed. kSticky cannot serve here: it is a process-lifetime fail-stop latch
 // with no clear site, so using it would refuse every later request in the process.
 constexpr int kReqFailed = 13;
-constexpr int kFailReason = 14;  // the kLeaseReason* the failing stage recorded, for the terminal F publishes
+constexpr int kFailReason = 14;    // the kLeaseReason* the failing stage recorded, for the terminal F publishes
 constexpr int kStreamPieces = 15;  // piece slices the stream kernel's block 0 copied, cumulative
 constexpr int kStreamPolls = 16;   // stream-kernel leader passes, summed over its blocks, cumulative
 constexpr int kW1Passes = 17;      // stage 1's polling passes over its unclaimed lanes, cumulative
@@ -73,14 +75,41 @@ SGL_DEVICE uint64_t tagged_word(uint64_t tag, uint64_t generation) {
   return (tag << 56) | generation;
 }
 
-SGL_DEVICE int32_t ld_volatile(const int32_t* address) {
-  return *reinterpret_cast<const volatile int32_t*>(address);
+// Every word the host or another kernel accesses concurrently goes through one of these, so each call site states
+// its ordering. Relaxed is a volatile access: the PTX memory model treats ld/st.volatile as relaxed at system scope,
+// and nvcc emits LDG/STG.E.STRONG.SYS for it. Not cuda::atomic_ref: with CUDA 13.4's libcu++, an access through a
+// __grid_constant__ parameter gains a run-time local-pointer check with a byte-copy fallback, and adjacent relaxed
+// accesses are merged and reordered (plan 2026-09-27-expert-stream-native-sync, Task 2).
+template <typename T>
+SGL_DEVICE T ld_relaxed_sys(const T* word) {
+  return *reinterpret_cast<const volatile T*>(word);
+}
+
+template <typename T>
+SGL_DEVICE void st_relaxed_sys(T* word, std::type_identity_t<T> value) {
+  *reinterpret_cast<volatile T*>(word) = value;
+}
+
+// A wire field at a byte address (lease_layout.h offsets); T names the field's type.
+template <typename T>
+SGL_DEVICE T ld_relaxed_sys(const uint8_t* address) {
+  return ld_relaxed_sys(reinterpret_cast<const T*>(address));
+}
+
+template <typename T>
+SGL_DEVICE void st_relaxed_sys(uint8_t* address, std::type_identity_t<T> value) {
+  st_relaxed_sys<T>(reinterpret_cast<T*>(address), value);
+}
+
+// Device scope, for the stream kernel's abort word, which only its own blocks write.
+SGL_DEVICE int32_t ld_relaxed_gpu(const int32_t* word) {
+  int32_t value;
+  asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];" : "=r"(value) : "l"(word) : "memory");
+  return value;
 }
 
 SGL_DEVICE uint64_t global_ns() {
-  uint64_t value;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
-  return value;
+  return cuda::ptx::get_sreg_globaltimer();
 }
 
 SGL_DEVICE void store_deadline(int32_t* state, uint64_t deadline) {
@@ -105,26 +134,30 @@ SGL_DEVICE bool listed(const int32_t* ids, int count, int32_t id) {
 }
 
 SGL_DEVICE void write_record(
-    uint8_t* record, uint32_t seq, int64_t row, const int32_t* need, int need_count, const int32_t* protect,
-    int protect_count, uint32_t after, uint32_t armed, uint32_t lanes) {
-  volatile uint32_t* words = reinterpret_cast<volatile uint32_t*>(record);
-  volatile uint16_t* halves = reinterpret_cast<volatile uint16_t*>(record);
+    uint8_t* record,
+    uint32_t seq,
+    int64_t row,
+    const int32_t* need,
+    int need_count,
+    const int32_t* protect,
+    int protect_count,
+    uint32_t after,
+    uint32_t armed,
+    uint32_t lanes) {
   // Seqlock writer: invalidate seq before touching the payload, so a lapped record that
   // is half rewritten never passes the thread's read_record seq re-check.
-  words[kRecSeq / 4] = 0u;
-  __threadfence_system();
-  halves[kRecRow / 2] = static_cast<uint16_t>(row);
-  halves[kRecNeedCount / 2] = static_cast<uint16_t>(need_count);
-  halves[kRecProtectCount / 2] = static_cast<uint16_t>(protect_count);
-  halves[kRecStatus / 2] = 0;
-  words[kRecAfter / 4] = after;
-  words[kRecArmed / 4] = armed;
-  words[kRecLanes / 4] = lanes;
-  volatile int32_t* need_out = reinterpret_cast<volatile int32_t*>(record + kRecNeed);
-  volatile int32_t* protect_out = reinterpret_cast<volatile int32_t*>(record + kRecProtect);
+  st_relaxed_sys<uint32_t>(record + kRecSeq, 0u);
+  cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
+  st_relaxed_sys<uint16_t>(record + kRecRow, static_cast<uint16_t>(row));
+  st_relaxed_sys<uint16_t>(record + kRecNeedCount, static_cast<uint16_t>(need_count));
+  st_relaxed_sys<uint16_t>(record + kRecProtectCount, static_cast<uint16_t>(protect_count));
+  st_relaxed_sys<uint16_t>(record + kRecStatus, 0);
+  st_relaxed_sys<uint32_t>(record + kRecAfter, after);
+  st_relaxed_sys<uint32_t>(record + kRecArmed, armed);
+  st_relaxed_sys<uint32_t>(record + kRecLanes, lanes);
   for (int i = 0; i < kMaxIds; ++i) {
-    need_out[i] = i < need_count ? need[i] : -1;
-    protect_out[i] = i < protect_count ? protect[i] : -1;
+    st_relaxed_sys<int32_t>(record + kRecNeed + 4 * i, i < need_count ? need[i] : -1);
+    st_relaxed_sys<int32_t>(record + kRecProtect + 4 * i, i < protect_count ? protect[i] : -1);
   }
   // The seqlock order the thread's read_record relies on: seq=0, fence, payload, seq last. The release store is the
   // second fence: it orders every payload store above before the seq.
@@ -147,9 +180,9 @@ SGL_DEVICE void raise_fatal(uint8_t* page, uint32_t seq) {
 //
 // The belt of 11.4 is a seqlock re-read of the ready word, and it has two halves. The host clears a lane's ready
 // word before rewriting its payload (grant_lane_group_locked). The reader must order its payload loads before the
-// re-read with a system fence: an acquire orders only what follows it, so without the fence the re-read may be
-// served before the payload and a rewrite caught half-way passes. Hence read, fence, re-read, judge; a caller that
-// polls several lanes reads them all and pays one fence (stage 1).
+// re-read with an acquire fence (Boehm's seqlock reader): an acquire *load* orders only what follows it, so without
+// the fence the re-read may be served before the payload and a rewrite caught half-way passes. Hence read, fence,
+// re-read, judge; a caller that polls several lanes reads them all and pays one fence (stage 1).
 struct LaneRead {
   uint64_t ready;
   uint32_t slot_generation;
@@ -160,15 +193,15 @@ struct LaneRead {
 SGL_DEVICE LaneRead lane_result_read(const uint8_t* result) {
   LaneRead r;
   r.ready = ld_acquire_sys64(result + kLeaseRrReady);
-  r.slot_generation = *reinterpret_cast<const volatile uint32_t*>(result + kLeaseRrSlotGeneration);
-  r.host_slot = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrHostSlot);
-  r.expert = *reinterpret_cast<const volatile int32_t*>(result + kLeaseRrExpert);
+  r.slot_generation = ld_relaxed_sys<uint32_t>(result + kLeaseRrSlotGeneration);
+  r.host_slot = ld_relaxed_sys<int32_t>(result + kLeaseRrHostSlot);
+  r.expert = ld_relaxed_sys<int32_t>(result + kLeaseRrExpert);
   return r;
 }
 
 // Relaxed: the caller's fence already orders it after the payload loads, and nothing after it depends on it.
 SGL_DEVICE uint64_t lane_result_reread(const uint8_t* result) {
-  return *reinterpret_cast<const volatile uint64_t*>(result + kLeaseRrReady);
+  return ld_relaxed_sys<uint64_t>(result + kLeaseRrReady);
 }
 
 SGL_DEVICE bool lane_result_judge(
@@ -193,7 +226,8 @@ SGL_DEVICE bool lane_result_judge(
                  (accept_copying && tag == kLeaseTagCopying)) &&
                 current;
   const bool valid = *ready_seen && again == r.ready && static_cast<int64_t>(r.expert) == expected_expert &&
-                     r.host_slot >= 0 && static_cast<uint32_t>(r.host_slot) < capacity;  // also bounds the ack SlotGen read
+                     r.host_slot >= 0 &&
+                     static_cast<uint32_t>(r.host_slot) < capacity;  // also bounds the ack SlotGen read
   if (valid) {
     *out_slot = r.host_slot;
     *out_slot_generation = r.slot_generation;
@@ -214,26 +248,33 @@ SGL_DEVICE bool lane_result_valid(
     bool accept_copying = false,
     bool* copying = nullptr) {
   const LaneRead r = lane_result_read(result);
-  __threadfence_system();
+  cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
   return lane_result_judge(
-      r, lane_result_reread(result), generation, expected_expert, capacity, out_slot, out_slot_generation, ready_seen,
-      accept_loading, loading, accept_copying, copying);
+      r,
+      lane_result_reread(result),
+      generation,
+      expected_expert,
+      capacity,
+      out_slot,
+      out_slot_generation,
+      ready_seen,
+      accept_loading,
+      loading,
+      accept_copying,
+      copying);
 }
-
-
 
 // A Terminal record (LEASE_PROTOCOL.md 13): the mask and the reason first, the tagged generation word last with a
 // release store, so a reader that acquires the word sees the mask. Named lanes never start a copy afterwards: the
 // caller has already left go_count at zero.
 SGL_DEVICE void publish_terminal(
     uint8_t* lease, int64_t lease_d, uint32_t seq, uint64_t generation, uint32_t skipped_mask, uint32_t reason) {
-  uint8_t* terminal = lease + lease_d + kLeaseTerminal + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseTerminalBytes;
-  *reinterpret_cast<volatile uint32_t*>(terminal + kLeaseTermSkippedMask) = skipped_mask;
-  *reinterpret_cast<volatile uint32_t*>(terminal + kLeaseTermReason) = reason;
+  uint8_t* terminal =
+      lease + lease_d + kLeaseTerminal + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseTerminalBytes;
+  st_relaxed_sys<uint32_t>(terminal + kLeaseTermSkippedMask, skipped_mask);
+  st_relaxed_sys<uint32_t>(terminal + kLeaseTermReason, reason);
   st_release_sys64(terminal + kLeaseTermGen, tagged_word(kLeaseTagTerminal, generation));
 }
-
-
 
 // Stage 1's body, shared by the two-phase W1 and piece streaming's W1 (which also resets the stream kernel's words).
 SGL_DEVICE void lease_hit_wait_body(
@@ -263,8 +304,8 @@ SGL_DEVICE void lease_hit_wait_body(
   }
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
 
-  bool ok = state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0 &&
-            ld_acquire_sys(lease + kLeaseHeaderShutdown) == 0;
+  bool ok =
+      state[kSticky] == 0 && ld_acquire_sys(page + kFatal) == 0 && ld_acquire_sys(lease + kLeaseHeaderShutdown) == 0;
   if (ok && (planned_count > kLeaseLanes || planned_count > lanes)) {
     ok = false;
     state[kFailReason] = static_cast<int32_t>(kLeaseReasonCount);
@@ -280,10 +321,9 @@ SGL_DEVICE void lease_hit_wait_body(
   // stage 2 is where it is diagnosed, so this stage simply claims nothing.
   if (seq == 0 || planned_count == 0) return;
 
-  const uint8_t* results = lease + kLeaseRowResult +
-                           static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
-  const uint32_t capacity =
-      *reinterpret_cast<const volatile uint32_t*>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
+  const uint8_t* results =
+      lease + kLeaseRowResult + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseLanes * kLeaseRowResultBytes;
+  const uint32_t capacity = ld_relaxed_sys<uint32_t>(lease + kLeaseRowTable + row * kLeaseRowTableBytes + 4);
   const uint64_t deadline = load_deadline(state);
   int32_t slots[kMaxIds];
   uint32_t slot_generations[kMaxIds];
@@ -300,7 +340,8 @@ SGL_DEVICE void lease_hit_wait_body(
     for (int64_t i = 0; i < planned_count; ++i) {
       if (claimed[i] == 0) reads[i] = lane_result_read(results + i * kLeaseRowResultBytes);
     }
-    __threadfence_system();  // one per pass: every lane's payload loads before any lane's re-read
+    // One per pass: every lane's payload loads before any lane's re-read.
+    cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
     int64_t streaming = 0;
     for (int64_t i = 0; i < planned_count && !hard_fail; ++i) {
       if (claimed[i] != 0) continue;
@@ -308,9 +349,18 @@ SGL_DEVICE void lease_hit_wait_body(
       bool loading = false;
       bool copying = false;
       if (lane_result_judge(
-              reads[i], lane_result_reread(results + i * kLeaseRowResultBytes), generation, planned[i], capacity,
-              &slots[i], &slot_generations[i], &ready_seen, /*accept_loading=*/false, &loading,
-              /*accept_copying=*/true, &copying)) {
+              reads[i],
+              lane_result_reread(results + i * kLeaseRowResultBytes),
+              generation,
+              planned[i],
+              capacity,
+              &slots[i],
+              &slot_generations[i],
+              &ready_seen,
+              /*accept_loading=*/false,
+              &loading,
+              /*accept_copying=*/true,
+              &copying)) {
         // 2: the service's copy engine owns this lane; S skips it, C1 and A1 never see it, the copy wait awaits it.
         claimed[i] = copying ? 2 : 1;
         ++taken;
@@ -344,7 +394,8 @@ SGL_DEVICE void lease_hit_wait_body(
     // rather than patching the arithmetic downstream: stage 2's `unclaimed` then counts the whole request,
     // which is what actually went unserved. The request still fails on its own account (copied != planned),
     // so this is the counters telling the truth, not a change of outcome.
-    for (int64_t i = 0; i < planned_count; ++i) claimed[i] = 0;
+    for (int64_t i = 0; i < planned_count; ++i)
+      claimed[i] = 0;
     state[kUnservedMisses] += static_cast<int32_t>(planned_count);
     return;  // go_1 stays 0: no copy, no acknowledgement; the finalize kernel publishes the terminal
   }
@@ -363,7 +414,6 @@ SGL_DEVICE void lease_hit_wait_body(
   }
   go_1[0] = static_cast<int32_t>(n);  // the single commit point
 }
-
 
 }  // namespace device::expert_stream
 }  // namespace sglang

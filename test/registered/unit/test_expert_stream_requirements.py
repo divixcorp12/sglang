@@ -310,18 +310,15 @@ class TestEagerFormatRequirements(_GateTest):
         ):
             memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 
-    def test_doorbell_is_refused(self):
+    def test_the_removed_doorbell_variable_is_not_a_gate_setting(self):
+        # Removed 2026-09-27: set, it only warns at import (sglang.srt.environ); the gate ignores it.
         os.environ["SGLANG_MOE_EXPERT_DOORBELL"] = "1"
-        with self.assertRaisesRegex(
-            ValueError, "SGLANG_MOE_EXPERT_DOORBELL; set it to 0"
-        ):
-            memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
+        memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 
-    def test_it_accepts_a_launch_with_all_three_settings_off(self):
+    def test_it_accepts_a_launch_with_both_settings_off(self):
         os.environ.update(
             SGLANG_MOE_PREFETCH_MAX_CANDIDATES="0",
             SGLANG_MOE_GPU_RESIDENCY_UPDATE="0",
-            SGLANG_MOE_EXPERT_DOORBELL="0",
         )
         memory_hook.handle_offload_compatibility(_launch(quantization="eager_test"))
 
