@@ -106,6 +106,7 @@ PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
 flock /data/models/slang/nvfp4-work/rowimg-disk.lock taskset -c 0-63 \
   /data/models/slang/.venv/bin/python -m pytest \
   test/registered/unit/kernels/test_expert_stream_uring_native.py \
+  test/registered/unit/kernels/test_expert_stream_uring_integration.py \
   -q -rs -p no:randomly --basetemp=/mnt/nvme2/nvfp4-work/uring-config-native-tests
 
 PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 \
@@ -146,7 +147,10 @@ failed requests, resource-registration errors or unexpected fallback.
 For SQPOLL, compare idle timeouts (for example `100`, `1000`) only after the
 main comparison. Assign a permitted, measured CPU near the drive's NUMA node;
 avoid reserved cores 64–71 and account for the SQ thread's CPU separately from
-the service thread. Do not change CPU placement and polling mode in the same
+the service thread. Explicit `SQ_THREAD_CPU` is required for SQPOLL experiments
+on divix01: unpinned kernel SQ threads can use online CPUs outside the process's
+`taskset` mask. The native and integration tests pin their SQ threads to the
+lowest CPU in the test process's allowed mask. Do not change CPU placement and polling mode in the same
 first comparison. Registered resources can increase startup time and locked RAM.
 
 Capture exact commit and `python/` tree SHA, requested variables, diagnostic
@@ -202,3 +206,39 @@ persistent host but buffered tmpfs fixtures; it is not an NVMe/IOPOLL benchmark.
 
 No full-model performance result is claimed by this implementation. Promote a
 configuration only after the same-workload end-to-end comparisons above.
+
+## Verification record
+
+The following checks ran in the private divix01 checkout with the documented
+interpreter and `PYTHONPATH`. These are correctness results, not latency results.
+
+- At `a5b4c87bb7`, the native matrix command above (native file alone) passed
+  **37 tests** on `/mnt/nvme2`, with no capability skips.
+- At the same commit, the five-file allocator/configuration command above passed
+  **74 tests and 7 subtests**. The later explicit-CPU metadata regression passed
+  **6 tests** locally; it includes empty and populated metadata under a non-CPU
+  default device.
+- Existing reader regressions: **850 passed, 1 failed** with the command below.
+  The failure was `test_the_seqlock_reader_never_accepts_a_torn_record`: its
+  one-second stress run accepted only 23 samples versus a requirement of >100;
+  it observed **zero torn records**. A subsequent isolated run of the entire
+  tier file passed **57 tests**. No seqlock implementation or threshold was changed.
+
+```bash
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
+  taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
+  test/registered/unit/kernels/test_exl3_ram_miss_tier.py \
+  test/registered/unit/kernels/test_exl3_ram_miss_row_images.py \
+  test/registered/unit/kernels/test_expert_stream_second_layout.py \
+  test/registered/unit/kernels/test_exl3_ram_miss_pack_workers.py \
+  -q -p no:randomly
+
+# Isolated rerun; includes one CUDA-input refusal test, so takes the GPU lock.
+PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
+  flock -w 30 /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 \
+  /data/models/slang/.venv/bin/python -m pytest \
+  test/registered/unit/kernels/test_exl3_ram_miss_tier.py -q -x -p no:randomly
+```
+
+For future runs, also take the GPU lock around the larger invocation if CUDA is
+available, because the tier file includes that device-input refusal test.

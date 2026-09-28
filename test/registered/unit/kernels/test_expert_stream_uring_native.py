@@ -89,6 +89,11 @@ std::string unsupported_capability(const std::string& mode, const std::string& r
   if (mode == "sqpoll" || mode == "sqpoll_iopoll") {
     params.flags |= IORING_SETUP_SQPOLL;
     params.sq_thread_idle = 1000;
+    const int cpu = std::stoi(setting("SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU", "-1"));
+    if (cpu >= 0) {
+      params.flags |= IORING_SETUP_SQ_AFF;
+      params.sq_thread_cpu = cpu;
+    }
   }
   io_uring ring{};
   const int rc = io_uring_queue_init_params(8, &ring, &params);
@@ -307,7 +312,9 @@ def _run_native(binary, tmp_path, *, mode, read_mode, fixed_files, wait_mode="bl
         SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH="4" if wait_mode == "spin" else "0",
         SGLANG_EXPERT_STREAM_URING_WAIT_MODE=wait_mode,
         SGLANG_EXPERT_STREAM_URING_SQ_THREAD_IDLE_MS="1000",
-        SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU="-1",
+        SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU=(
+            str(min(os.sched_getaffinity(0))) if "sqpoll" in mode else "-1"
+        ),
         SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS="1",
         URING_TEST_DIRECT=str(int(direct)),
     )

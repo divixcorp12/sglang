@@ -62,10 +62,13 @@ def test_registered_io_through_tables_and_ffi_recovers_after_request_failure(
         if name.startswith("SGLANG_EXPERT_STREAM_URING_"):
             monkeypatch.delenv(name)
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_MODE", mode)
+    if "sqpoll" in mode:
+        monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU", str(min(os.sched_getaffinity(0))))
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_READ_MODE", read_mode)
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_FIXED_FILES", "1")
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH", "2")
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_DIAGNOSTICS", "1")
+    (tmp_path / "checkpoint").mkdir()
     setup = ram_miss_setup(
         tmp_path / "checkpoint", capacity=3, experts=6, mirror_weights=(1.0, 1.0),
         hidden=256, inter=256, row_images=row_images,

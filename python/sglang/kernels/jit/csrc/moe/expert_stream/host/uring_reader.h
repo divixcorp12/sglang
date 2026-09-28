@@ -154,8 +154,9 @@ class UringReader {
         const int rc = io_uring_submit(&ring_);
         if (rc < 0) return rc;
       }
-      // IOPOLL needs GETEVENTS to poll storage. SQPOLL alone can observe its CQ entirely in userspace.
-      if (options_.iopoll()) {
+      // Without SQPOLL, IOPOLL needs GETEVENTS to drive storage polling. With both flags, the kernel
+      // SQ thread drives IOPOLL too; the application only observes its CQ and need not enter the kernel.
+      if (options_.iopoll() && !options_.sqpoll()) {
         const int rc = io_uring_get_events(&ring_);
         if (rc < 0) return rc;
       }
