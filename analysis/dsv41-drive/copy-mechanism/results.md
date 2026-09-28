@@ -322,7 +322,108 @@ see staleness on WC memory, and the fenced host rewrite is visible to `.cv` read
 
 CPU writes to WC are 2.6x faster, and CPU reads of it are about 150x slower.
 
-**A speedup here would NOT have cleared WC for production, and the absence of one is not a safety result either.**
-NVMe `O_DIRECT` writes may land in the LLC through DDIO, and a no-snoop GPU read could miss them. That needs its own
-NVMe-write check, which was not requested and was not run. On divix01, WC buys nothing on the GPU side and makes any
-CPU read of the slab very slow.
+**WC is not cleared for production, and there is no reason to adopt it.** The NVMe-write check (5d) then
+tested the DDIO concern directly: no stale or wrong word in 2,100 `O_DIRECT` trials across pinned, `cudaHostAlloc`
+and WC slabs, read by `.cv`, weak-after-acquire and copy-engine reads. That is evidence, not proof, and it is unknown
+whether the WC reads were issued no-snoop at all (5d). WC also buys nothing on the GPU side on divix01, and it makes
+any CPU read of the slab about 150x slower.
+
+### 5d. NVMe O_DIRECT writes into a WC slab, then GPU reads (2026-09-27, commit 93e89cad13)
+
+**Question.** Production fills the slabs with NVMe `O_DIRECT` reads. On Sky Lake-E, DDIO can leave those inbound
+writes in the LLC. Does a GPU read of a write-combined slab, which may be issued no-snoop, then return stale DRAM
+contents?
+
+**Procedure** (`nvme_wc_check.py`, `nvme_report.py`). Run under `rowimg-disk.lock`, then the exclusive `cc-gpu.lock`,
+with `TMPDIR` on NVMe. Source: the row images on the mirror root `/mnt/nvme0/dsv41_flash/exl3_row_images/`
+(`layer-000..039.rows`), opened read-only. Each trial, on one slab:
+
+1. The CPU writes pattern A into every 8 B word of the slab, then sfences. A is a per-trial counter, mixed and XORed
+   with a constant; it occurred in no reference region (0 `pattern_in_file` records in 2,100 trials).
+2. A kernel is launched that waits on a host flag. Its half-grids read the slab: 8 blocks with plain weak loads after
+   the flag's acquire, 8 with `.cv` loads, S's pattern.
+3. `pread` with `O_DIRECT` fills the slab from a 4 KiB-aligned region of a row image.
+4. As `pread` returns, the host sfences and releases the flag, and at once issues `cudaMemcpyAsync` (the copy
+   engine) of the slab on a stream of its own. So all three reads start together, with no CPU touch of the slab
+   after the DMA.
+5. On the GPU, each device copy is compared 8 B word by word with a reference of the same file region. The reference
+   was loaded once through buffered I/O into ordinary memory and moved to the GPU; it was never read back from a slab.
+   - A word is **stale** if it still equals A.
+   - A word is **wrong** if it differs from the file at all.
+
+Slabs, all page-aligned and interleaved per region, with the slab that reads the region first rotated each time:
+
+- `pinned`: `allocate_host_slab`, NUMA node 0.
+- `hostalloc`: `cudaHostAlloc(Mapped)`.
+- `wc`: `cudaHostAlloc(Mapped | WriteCombined)`.
+
+Both `cudaHostAlloc` slabs were allocated on the GPU's node 0.
+
+Sizes and trials per slab: 64 KiB x 300, 1,662,976 B (one piece, 406 pages) x 300, 13,312,000 B (one row, 3,250
+pages) x 100. Every trial read a distinct region of its size, rotating over the 40 layer files.
+
+- **Row size ran 100 trials, not a few hundred.** That keeps the disk volume modest: about 5.5 GB of `O_DIRECT` plus
+  1.9 GB of references. DDIO keeps only a few MB of LLC, so the 64 KiB and 1.66 MB sizes are the more sensitive ones.
+- **Page cache.** mincore before and after: 0 of 4,800 and 0 of 121,800 pages resident at the two small sizes, and
+  681 of 325,000 (0.2%) at the row size. The same 681 were resident before and after, so the trials did not load
+  them. `O_DIRECT` reads the device regardless of cached clean pages.
+
+`NVME_EXIT=0`, `REPORT_EXIT=0`. Result:
+
+```
+| slab | method | size (B) | trials | stale words | wrong words | trials with any |
+|---|---|---:|---:|---:|---:|---:|
+| hostalloc | ce | 65536 | 300 | 0 | 0 | 0 |
+| hostalloc | sm_cv16 | 65536 | 300 | 0 | 0 | 0 |
+| hostalloc | weak | 65536 | 300 | 0 | 0 | 0 |
+| pinned | ce | 65536 | 300 | 0 | 0 | 0 |
+| pinned | sm_cv16 | 65536 | 300 | 0 | 0 | 0 |
+| pinned | weak | 65536 | 300 | 0 | 0 | 0 |
+| wc | ce | 65536 | 300 | 0 | 0 | 0 |
+| wc | sm_cv16 | 65536 | 300 | 0 | 0 | 0 |
+| wc | weak | 65536 | 300 | 0 | 0 | 0 |
+| hostalloc | ce | 1662976 | 300 | 0 | 0 | 0 |
+| hostalloc | sm_cv16 | 1662976 | 300 | 0 | 0 | 0 |
+| hostalloc | weak | 1662976 | 300 | 0 | 0 | 0 |
+| pinned | ce | 1662976 | 300 | 0 | 0 | 0 |
+| pinned | sm_cv16 | 1662976 | 300 | 0 | 0 | 0 |
+| pinned | weak | 1662976 | 300 | 0 | 0 | 0 |
+| wc | ce | 1662976 | 300 | 0 | 0 | 0 |
+| wc | sm_cv16 | 1662976 | 300 | 0 | 0 | 0 |
+| wc | weak | 1662976 | 300 | 0 | 0 | 0 |
+| hostalloc | ce | 13312000 | 100 | 0 | 0 | 0 |
+| hostalloc | sm_cv16 | 13312000 | 100 | 0 | 0 | 0 |
+| hostalloc | weak | 13312000 | 100 | 0 | 0 | 0 |
+| pinned | ce | 13312000 | 100 | 0 | 0 | 0 |
+| pinned | sm_cv16 | 13312000 | 100 | 0 | 0 | 0 |
+| pinned | weak | 13312000 | 100 | 0 | 0 | 0 |
+| wc | ce | 13312000 | 100 | 0 | 0 | 0 |
+| wc | sm_cv16 | 13312000 | 100 | 0 | 0 | 0 |
+| wc | weak | 13312000 | 100 | 0 | 0 | 0 |
+```
+
+Median `pread` time (O_DIRECT, queue depth 1) is the same on every slab:
+
+| size | pinned | hostalloc | WC |
+|---:|---:|---:|---:|
+| 64 KiB | 42.7 us | 42.9 us | 45.3 us |
+| 1.66 MB | 646 us | 655 us | 665 us |
+| 13.3 MB | 4.02 ms | 4.00 ms | 4.01 ms |
+
+**Result: zero stale and zero wrong words in every cell.** That covers 3 slabs x 3 read methods x 3 sizes, 2,100
+trials and 6,300 GPU reads.
+
+**What this does and does not show.**
+
+- **A zero is evidence, not proof.** Staleness from a no-snoop read racing a DDIO write is timing-dependent, and the
+  reads here start about as early after the DMA as the host can arrange. A rare race could still exist below this
+  sample's resolution.
+- **Whether the WC slab's reads were actually no-snoop is unknown.**
+  - The driver exposes no no-snoop setting: `/proc/driver/nvidia/params` has only `EnablePCIERelaxedOrderingMode: 0`.
+  - No TLP capture was taken.
+  - The GPU's DevCtl `NoSnoop+/-` bit (in `lspci -vvv`) was not in the readout.
+
+  If the reads were snooped, this check could not have failed. Then the zero says the driver does not use no-snoop
+  for these reads, not that no-snoop would be safe.
+- **Scope: this is a safety record, not a path to adoption.** WC gave no H2D speedup (5c), so nothing here argues for
+  using it.
