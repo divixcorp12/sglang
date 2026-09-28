@@ -47,6 +47,8 @@ class TestGate(unittest.TestCase):
 
     def test_scheduler_refusals(self):
         ok = dict(
+            min_tokens=4352,
+            ring_tokens=4352,
             raw_chunked_prefill_size=4096,
             effective_chunked_prefill_size=4096,
             is_hybrid_swa_allocator=True,
@@ -54,6 +56,11 @@ class TestGate(unittest.TestCase):
             adapter_missing_model_name=None,
         )
         self.assertIsNone(scheduler_layer_major_refusal(**ok))
+        self.assertIn(
+            "below the ring size",
+            scheduler_layer_major_refusal(**{**ok, "min_tokens": 4096}),
+        )
+        self.assertIsNone(scheduler_layer_major_refusal(**{**ok, "min_tokens": 4352}))
         self.assertIn(
             "chunked prefill to be enabled",
             scheduler_layer_major_refusal(**{**ok, "effective_chunked_prefill_size": None}),

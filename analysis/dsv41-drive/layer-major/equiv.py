@@ -1,7 +1,7 @@
 """Layer-major vs chunked prefill: greedy token-0 identity is the gate (plan 2026-09-27, Task 12 fix round).
 
 Usage: equiv.py run --port P --model M --text FILE --out OUT.jsonl --commit SHA --dirty 0/1 --min-tokens N
-                    [--cases all|quick]
+                    [--cases all|quick|c1]
        equiv.py compare A.jsonl B.jsonl [--allow-head-mismatch]
 
 Pass criterion: token-0 id equality, not full 64-token completion identity -- DSV4.1 decode is not bitwise-stable
@@ -44,6 +44,15 @@ def _top0_logprobs(meta):
     return top[0] if top else None
 
 
+def _mean_output_logprob(meta):
+    # C1: mean of the sampled token's own logprob over the 64 output tokens -- token 0 alone
+    # cannot see C1 (the tail is floored at the tail start), so decode quality is read from this.
+    lps = meta.get("output_token_logprobs")
+    if not lps:
+        return None
+    return sum(row[0] for row in lps) / len(lps)
+
+
 def _supports_top_logprobs(port):
     # A one-time probe before any case runs: a per-case try/except would re-send a case's own prompt on
     # failure, which inside the unflushed chain changes the cache state the chain is testing.
@@ -75,6 +84,18 @@ def _all_cases(ids):
 QUICK_CASES = {"len8192", "len32768", "len33000", "prefix-warm", "prefix",
               "chain-32768", "chain-32868", "chain-32868-again"}
 
+# C1 verification: the short-final-span case (final-fix-brief.md). Not part of _all_cases/"all": an
+# "all" run recorded before this case existed must stay comparable to one recorded after.
+C1_CASES = {"len8200"}
+
+
+def _c1_cases(ids):
+    return [("len8200", ids[:8200], True)]
+
+
+# The named --cases subsets compare() accepts against a full ("all") baseline.
+_CASE_SUBSETS = {"quick": QUICK_CASES, "c1": C1_CASES}
+
 
 def run(a):
     from transformers import AutoTokenizer
@@ -83,9 +104,12 @@ def run(a):
     ids = tok(open(a.text).read(), add_special_tokens=False)["input_ids"]
     while len(ids) < 70000:
         ids = ids + ids
-    cases = _all_cases(ids)
-    if a.cases == "quick":
-        cases = [c for c in cases if c[0] in QUICK_CASES]
+    if a.cases == "c1":
+        cases = _c1_cases(ids)
+    else:
+        cases = _all_cases(ids)
+        if a.cases == "quick":
+            cases = [c for c in cases if c[0] in QUICK_CASES]
     top_logprobs_num = 5 if _supports_top_logprobs(a.port) else None
     if top_logprobs_num:
         _flush(a.port)  # clear the probe's own cache footprint before the first real case
@@ -99,9 +123,12 @@ def run(a):
                 _flush(a.port)
             r = _generate(a.port, prompt, top_logprobs_num=top_logprobs_num)
             top0 = _top0_logprobs(r["meta"]) if top_logprobs_num else None
+            mean_lp = _mean_output_logprob(r["meta"])
             record = {"case": name, "prompt_len": len(prompt), "prompt_hash": _prompt_hash(prompt), **r}
             if top0 is not None:
                 record["top0_logprobs"] = top0
+            if mean_lp is not None:
+                record["mean_output_logprob"] = mean_lp
             f.write(json.dumps(record) + "\n")
             f.flush()
             print(name, len(prompt), repr(r["text"][:60]), flush=True)
@@ -145,12 +172,13 @@ def compare(path_a, path_b, *, allow_head_mismatch=False, allow_dirty=False):
         return 2
     smaller, larger, smaller_path, larger_path = (a, b, path_a, path_b) if len(a) <= len(b) else (b, a, path_b, path_a)
     smaller_header = header_a if smaller is a else header_b
-    # A subset is only ever legitimate as the deliberate --cases quick set, not an accident (e.g. a crashed arm's
-    # partial jsonl): require the smaller file's own header to say so and its cases to match exactly.
+    # A subset is only ever legitimate as a deliberate --cases quick/c1 set, not an accident (e.g. a crashed
+    # arm's partial jsonl): require the smaller file's own header to say so and its cases to match exactly.
     if len(smaller) < len(larger):
-        if smaller_header.get("cases") != "quick" or set(smaller) != QUICK_CASES:
+        allowed = _CASE_SUBSETS.get(smaller_header.get("cases"))
+        if allowed is None or set(smaller) != allowed:
             print(f"NOT COMPARABLE:\n  {smaller_path} has {len(smaller)} cases, {larger_path} has {len(larger)}, "
-                  f"and {smaller_path} is not exactly the quick set (cases={smaller_header.get('cases')!r})")
+                  f"and {smaller_path} is not exactly a known subset (cases={smaller_header.get('cases')!r})")
             return 2
     problems = [f"case {c} (in {smaller_path}) missing from {larger_path}" for c in smaller if c not in larger]
     for case in sorted(smaller):
@@ -185,6 +213,12 @@ def compare(path_a, path_b, *, allow_head_mismatch=False, allow_dirty=False):
         delta = _max_abs_logprob_delta(a[case].get("top0_logprobs"), b[case].get("top0_logprobs"))
         if delta is not None:
             print(f"   token 0 top-5 logprob max |delta|: {delta:.4g}  [informational, not gating]")
+        mlp_a, mlp_b = a[case].get("mean_output_logprob"), b[case].get("mean_output_logprob")
+        if mlp_a is not None and mlp_b is not None:
+            print(f"   mean output-token logprob (64 tokens): a={mlp_a:.4g} b={mlp_b:.4g}"
+                  "  [informational, not gating; not comparable across arms once they diverge]")
+        print(f"   first 20 tokens: a={ids_a[:20]!r}")
+        print(f"                    b={ids_b[:20]!r}")
     return 1 if bad else 0
 
 
@@ -199,7 +233,7 @@ if __name__ == "__main__":
     r.add_argument("--commit", required=True)
     r.add_argument("--dirty", required=True)
     r.add_argument("--min-tokens", dest="min_tokens", required=True)
-    r.add_argument("--cases", choices=["all", "quick"], default="all")
+    r.add_argument("--cases", choices=["all", "quick", "c1"], default="all")
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")

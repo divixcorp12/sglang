@@ -1483,6 +1483,8 @@ class Scheduler(
         if reason is None:
             model_cls = type(self.tp_worker.model_runner.model)
             reason = scheduler_layer_major_refusal(
+                min_tokens=self.layer_major_gate.min_tokens,
+                ring_tokens=self.layer_major_ring_tokens,
                 raw_chunked_prefill_size=raw_chunked_prefill_size,
                 effective_chunked_prefill_size=self.chunked_prefill_size,
                 is_hybrid_swa_allocator=isinstance(
