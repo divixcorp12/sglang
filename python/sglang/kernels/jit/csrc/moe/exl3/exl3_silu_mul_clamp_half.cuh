@@ -13,6 +13,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include "../../deepseek_v4/silu_and_mul_masked_post_quant.cuh"
+#include "../expert_stream/tensor_checks.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -50,6 +51,11 @@ __launch_bounds__(1024, 2) void exl3_silu_mul_clamp_half_kernel(const SiluAndMul
   PDLTriggerSecondary<kUsePDL>();
 }
 
+/// \brief Checked launcher for `exl3_silu_mul_clamp_half_kernel`: the shared expert's fp16 gate_up to the down
+/// projection's fp16 input, through bf16 silu_mul_clamp.
+///
+/// `input` is [rows, 2 * inter] fp16 and `output` [rows, inter] fp16, both CUDA tensors on one device; `inter` must be
+/// a positive multiple of 8.
 template <bool kUsePDL>
 void exl3_silu_mul_clamp_half(tvm::ffi::TensorView input, tvm::ffi::TensorView output, double swiglu_limit) {
   using namespace host;
@@ -57,8 +63,9 @@ void exl3_silu_mul_clamp_half(tvm::ffi::TensorView input, tvm::ffi::TensorView o
   auto M = SymbolicSize{"rows"};
   auto D = SymbolicSize{"gate_up_dim"};
   auto H = SymbolicSize{"inter"};
-  TensorMatcher({M, D}).with_dtype<fp16_t>().with_device<kDLCUDA>(device).verify(input);
-  TensorMatcher({M, H}).with_dtype<fp16_t>().with_device<kDLCUDA>(device).verify(output);
+  expert_stream::verify_named("input", TensorMatcher({M, D}).with_dtype<fp16_t>().with_device<kDLCUDA>(device), input);
+  expert_stream::verify_named(
+      "output", TensorMatcher({M, H}).with_dtype<fp16_t>().with_device<kDLCUDA>(device), output);
   RuntimeCheck(D.unwrap() == 2 * H.unwrap(), "gate_up must be twice as wide as the output");
   const auto inter = static_cast<uint32_t>(H.unwrap());
   RuntimeCheck(inter > 0 && inter % 8 == 0, "inter must be a positive multiple of 8");

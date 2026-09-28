@@ -1,3 +1,5 @@
+// REQUIRED BUILD FLAG: none; never -use_fast_math. It implies -ftz, which could flush subnormal products and inputs
+// that torch keeps (the __fmul_rn and __float2half_rn below), and bit parity with the torch chain breaks.
 // The EXL3 fused MoE's route tables and input staging (exl3_fused_moe.route_tables and the copies around it) in one
 // launch per layer, bit for bit: integer bookkeeping plus two exact float conversions, so nothing reorders a sum.
 #pragma once

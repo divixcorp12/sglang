@@ -1,3 +1,4 @@
+// REQUIRED BUILD FLAG: none; both kernels are integer-only, so no build flag changes their results.
 // DIRECT residency bookkeeping for the GPU hot cache (GpuResidencyUpdater), one launch per layer each: the gather's
 // destinations and the residency commit. Both reproduce their torch chains bit for bit (integer bookkeeping only).
 // Nothing here depends on the expert format or the model.

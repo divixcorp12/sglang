@@ -11,6 +11,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "../expert_stream/tensor_checks.h"
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -27,12 +28,16 @@ __global__ void exl3_scale_to_bf16_kernel(
   }
 }
 
+/// \brief Checked launcher for `exl3_scale_to_bf16_kernel`: the fused MoE's fp32 output to bf16, times the routed
+/// scaling factor.
+///
+/// `input` [n] fp32 and `output` [n] bf16 must be CUDA tensors on one device; an empty input launches nothing.
 void exl3_scale_to_bf16(tvm::ffi::TensorView input, tvm::ffi::TensorView output, double factor) {
   using namespace host;
   auto device = SymbolicDevice{};
   auto N = SymbolicSize{"n"};
-  TensorMatcher({N}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(input);
-  TensorMatcher({N}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(output);
+  expert_stream::verify_named("input", TensorMatcher({N}).with_dtype<fp32_t>().with_device<kDLCUDA>(device), input);
+  expert_stream::verify_named("output", TensorMatcher({N}).with_dtype<bf16_t>().with_device<kDLCUDA>(device), output);
   const int64_t n = N.unwrap();
   if (n == 0) {
     return;
