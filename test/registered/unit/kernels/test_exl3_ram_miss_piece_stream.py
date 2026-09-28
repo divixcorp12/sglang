@@ -25,6 +25,7 @@ import test_exl3_ram_miss_two_phase as two_phase
 import test_exl3_ram_miss_two_phase_victim as two_phase_victim
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
+from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamHost,
     new_page,
@@ -227,21 +228,28 @@ def test_u1_geometry_of_every_row_of_a_real_layout(tmp_path, weights, dims):
 
 
 def _one_row_tables(part_pages):
-    """One layer, one expert, one segment spanning the row: part p reads part_pages[p] pages of file p, in order."""
+    """One layer, one expert, one segment spanning the row: part p reads part_pages[p] pages of file p, in order.
+
+    slabs/row_bytes are indexed by name (the layout's EXL3_STREAMED_NAMES, unrelated to the row's mirror parts) and
+    the exl3 host module's tables_from checks their width against the layout's fixed name count, so they are padded
+    to it here even though only name 0 (the one segment) is used."""
     parts = len(part_pages)
+    names = len(EXL3_STREAMED_NAMES)
     total = sum(part_pages) * PAGE
     extents = torch.zeros((1, 1, parts, 4), dtype=torch.int64)
     dest = 0
     for p, pages in enumerate(part_pages):
         extents[0, 0, p] = torch.tensor([p, dest, pages * PAGE, dest])
         dest += pages * PAGE
+    row_bytes = torch.zeros((names,), dtype=torch.int64)
+    row_bytes[0] = total
     return SimpleNamespace(
         extents=extents,
         starts=torch.zeros((1, 1), dtype=torch.int64),
         file_sizes=torch.tensor([total] * parts, dtype=torch.int64),
         segments=torch.tensor([(0, 0, 0, total)], dtype=torch.int64),
-        slabs=torch.zeros((1, 1), dtype=torch.int64),
-        row_bytes=torch.tensor([total], dtype=torch.int64),
+        slabs=torch.zeros((1, names), dtype=torch.int64),
+        row_bytes=row_bytes,
         paths=[f"/nonexistent/{p}" for p in range(parts)],
         source_paths=["/nonexistent/source"] * parts,
         slot_bytes=total,
