@@ -570,12 +570,13 @@ def test_three_parts_every_bit_a_reader_can_see_names_bytes_already_stored(tmp_p
 def test_three_parts_a_failed_sub_read_publishes_none_of_its_pieces(tmp_path, fault):
     """Part 2's second sub-read of row 1 fails (EIO) or ends a page in, as at end of file. The read fails, no piece that
     depends on it is vetted or published, and nothing is published under another generation. The row's empty pieces
-    may already be published: the device still sees a word short of all eight bits and a request not served."""
+    are published: the device still sees a word short of all eight bits and a request not served."""
     s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0, 1.0), hidden=256, inter=512)
     experts, slots = [4, 1, 2], [0, 1, 2]
     sub_reads, pieces = piece_geometry(s.tables, 1, experts[1])
     bad = next(k for k, sub in enumerate(sub_reads) if (sub["part"], sub["k"]) == (2, 1))
     assert sub_reads[bad]["length"] > PAGE  # the short fault can fire
+    assert len(sub_reads) == 6
     result, record, masks, info = read_rows_pieces(
         s.tables, 1, experts, slots, direct=False, generation=GEN, piece_stream=True, pack_workers=2,
         part=2, sub=1, ordinal=1, poison=True, **fault,
@@ -585,6 +586,7 @@ def test_three_parts_a_failed_sub_read_publishes_none_of_its_pieces(tmp_path, fa
     dependent = [j for j, piece in enumerate(pieces) if piece["deps"] >> bad & 1]
     assert dependent and all(row1["seq"][j] == 0 and not bits >> j & 1 for j in dependent)
     assert bits != FULL
+    assert all(bits >> j & 1 for j in range(len(sub_reads), PIECES))
     assert all(word >> 8 == GEN for word in _words(masks))
 
 
