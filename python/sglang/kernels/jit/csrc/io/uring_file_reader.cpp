@@ -19,12 +19,13 @@
 #include <unistd.h>
 #include <vector>
 
+#include "io/registered_buffers.h"
+
 namespace sglang {
 
 namespace {
 
 constexpr unsigned kRegisteredBufferSlots = 1024;
-constexpr uint64_t kMaxRegisteredBufferBytes = 1ULL << 30;
 constexpr uint64_t kMaxReadBytes = 1ULL << 30;
 constexpr uint64_t kPageBytes = 4096;
 constexpr unsigned kPageShift = 12;
@@ -93,10 +94,7 @@ struct UringFileReaderObj : public tvm::ffi::Object {
     queue_depth_ = static_cast<unsigned>(queue_depth);
     init_ring(queue_depth_, &ring_);
     open_ = true;
-    buffers_supported_ = io_uring_register_buffers_sparse(&ring_, kRegisteredBufferSlots) == 0;
-    if (buffers_supported_) {
-      slot_used_.assign(kRegisteredBufferSlots, false);
-    }
+    buffers_supported_ = table_.init(&ring_, kRegisteredBufferSlots);
   }
 
   ~UringFileReaderObj() {
@@ -141,46 +139,16 @@ struct UringFileReaderObj : public tvm::ffi::Object {
   /// support registration or rejects the memory; reads then pin per request.
   int64_t register_buffer(int64_t address, int64_t nbytes) {
     enter_();
-    if (!buffers_supported_ || nbytes <= 0) {
-      return 0;
-    }
-    uint64_t base = static_cast<uint64_t>(address);
-    uint64_t remaining = static_cast<uint64_t>(nbytes);
-    for (const Buffer& buffer : buffers_) {
-      if (buffer.base < base + remaining && base < buffer.base + buffer.length) {
-        return 0;
-      }
-    }
-    std::vector<unsigned> added;
-    while (remaining > 0) {
-      auto free_slot = std::find(slot_used_.begin(), slot_used_.end(), false);
-      if (free_slot == slot_used_.end()) {
-        rollback_(added);
-        return 0;
-      }
-      unsigned slot = static_cast<unsigned>(free_slot - slot_used_.begin());
-      uint64_t length = std::min(remaining, kMaxRegisteredBufferBytes);
-      struct iovec vector{reinterpret_cast<void*>(base), static_cast<size_t>(length)};
-      __u64 tag = 0;
-      if (io_uring_register_buffers_update_tag(&ring_, slot, &vector, &tag, 1) != 1) {
-        rollback_(added);
-        return 0;
-      }
-      slot_used_[slot] = true;
-      buffers_.push_back(Buffer{base, length, slot});
-      added.push_back(slot);
-      base += length;
-      remaining -= length;
-    }
-    sort_buffers_();
-    return static_cast<int64_t>(added.size());
+    return buffers_supported_ && nbytes > 0
+               ? table_.add(static_cast<uint64_t>(address), static_cast<uint64_t>(nbytes), 0)
+               : 0;
   }
 
   /// Unregister every chunk lying inside ``[address, address + nbytes)``.
   int64_t unregister_buffer(int64_t address, int64_t nbytes) {
     enter_();
     uint64_t low = static_cast<uint64_t>(address);
-    return unregister_range_(low, low + static_cast<uint64_t>(std::max<int64_t>(nbytes, 0)));
+    return table_.remove_range(low, low + static_cast<uint64_t>(std::max<int64_t>(nbytes, 0)));
   }
 
   /// Queue ``[address, address + nbytes)`` for unregistration; any thread may
@@ -228,7 +196,7 @@ struct UringFileReaderObj : public tvm::ffi::Object {
       request.destination = static_cast<uint64_t>(destination_values[index]);
       request.length = static_cast<uint64_t>(length_values[index]);
       request.done = 0;
-      request.buffer_index = find_buffer_(request.destination, request.length);
+      request.buffer_index = table_.find(request.destination, request.length);
     }
     return static_cast<int64_t>(run_requests_(capacity));
   }
@@ -539,20 +507,14 @@ struct UringFileReaderObj : public tvm::ffi::Object {
       ::close(file.fd);
     }
     files_.clear();
-    buffers_.clear();
     io_uring_queue_exit(&ring_);
+    table_.clear();
   }
 
  private:
   struct File {
     int fd;
     uint64_t size;
-  };
-
-  struct Buffer {
-    uint64_t base;
-    uint64_t length;
-    unsigned slot;
   };
 
   struct Request {
@@ -601,7 +563,7 @@ struct UringFileReaderObj : public tvm::ffi::Object {
       UnregisterRequest* request = unregister_requests_.exchange(nullptr);
       while (request != nullptr) {
         UnregisterRequest* next = request->next;
-        unregister_range_(request->low, request->high);
+        table_.remove_range(request->low, request->high);
         delete request;
         request = next;
       }
@@ -621,61 +583,13 @@ struct UringFileReaderObj : public tvm::ffi::Object {
     return files_[static_cast<size_t>(file_id)];
   }
 
-  int find_buffer_(uint64_t destination, uint64_t length) const {
-    auto after =
-        std::upper_bound(buffers_.begin(), buffers_.end(), destination, [](uint64_t value, const Buffer& buffer) {
-          return value < buffer.base;
-        });
-    if (after == buffers_.begin()) {
-      return -1;
-    }
-    const Buffer& buffer = *(after - 1);
-    if (destination + length <= buffer.base + buffer.length) {
-      return static_cast<int>(buffer.slot);
-    }
-    return -1;
-  }
-
-  int64_t unregister_range_(uint64_t low, uint64_t high) {
-    std::vector<unsigned> removed;
-    for (const Buffer& buffer : buffers_) {
-      if (buffer.base >= low && buffer.base + buffer.length <= high) {
-        removed.push_back(buffer.slot);
-      }
-    }
-    rollback_(removed);
-    return static_cast<int64_t>(removed.size());
-  }
-
-  void rollback_(const std::vector<unsigned>& slots) {
-    for (unsigned slot : slots) {
-      struct iovec empty{nullptr, 0};
-      __u64 tag = 0;
-      io_uring_register_buffers_update_tag(&ring_, slot, &empty, &tag, 1);
-      slot_used_[slot] = false;
-    }
-    buffers_.erase(
-        std::remove_if(
-            buffers_.begin(),
-            buffers_.end(),
-            [&](const Buffer& buffer) { return std::find(slots.begin(), slots.end(), buffer.slot) != slots.end(); }),
-        buffers_.end());
-  }
-
-  void sort_buffers_() {
-    std::sort(buffers_.begin(), buffers_.end(), [](const Buffer& left, const Buffer& right) {
-      return left.base < right.base;
-    });
-  }
-
   const pid_t owner_;
   io_uring ring_{};
   unsigned queue_depth_ = 0;
   bool open_ = false;
   bool buffers_supported_ = false;
-  std::vector<bool> slot_used_;
+  sglang::io::RegisteredBufferTable table_;
   std::vector<File> files_;
-  std::vector<Buffer> buffers_;
   std::vector<Request> requests_;
   std::vector<uint32_t> pending_;
   std::vector<PageKey> page_keys_;
