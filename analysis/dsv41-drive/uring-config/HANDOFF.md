@@ -76,6 +76,8 @@ On 2026-09-28, divix01 reported kernel `6.12.0-211.60.1.el10_2.x86_64`,
 liburing `2.12`, `nvme.poll_queues=1`, and `queue/io_poll=1` on all four
 enumerated NVMe namespaces. Recheck after reboot; probe capability instead of
 inferring backported features from the kernel version.
+The real-kernel matrix passed all 37 cases on this host, including IOPOLL and
+READV_FIXED; its 6.12 kernel does advertise the newer opcode.
 
 Commit and push locally, then fetch/fast-forward the private remote worktree.
 Never copy an uncommitted tree or test from the production checkout. Follow
@@ -159,7 +161,9 @@ a lower I/O median alone is not a production win.
 
 `benchmarks/dsv41_baseline/run_arm.sh` is the existing end-to-end harness. It
 accepts explicit `KEY=VALUE` overrides, records them and verifies the process
-environment. Use a free non-production port (never 7867). Register the current
+environment. It requires a production-down, free-GPU window: the harness refuses
+to launch if production port 7867 is listening or another GPU compute process
+exists. Use a free non-production port (never 7867). Register the current
 `python/` tree in `benchmarks/dsv41_baseline/generations.json` before launch;
 commit that provenance change locally, push and fast-forward remotely again.
 The registry helper is `generations.register(tree_sha, label)`, where tree_sha
@@ -185,6 +189,9 @@ OMP_NUM_THREADS=8 flock /data/models/slang/nvfp4-work/rowimg-disk.lock \
 The harness acquires the GPU lock itself; do not wrap it in another GPU flock.
 Disk lock must come first. A held GPU lock causes the harness to refuse the arm;
 retry later. Use distinct arm names and change only the intended variables.
+The outer `OMP_NUM_THREADS=8` caps harness work. The server recipe explicitly
+sets OMP/MKL threads to 16 and affinity to `0-7,16-17,36-53`; keep those effective
+values identical across arms, or pass explicit overrides to change the experiment.
 Check the harness's resolved recipe, including shard vs row-image layout, before
 choosing stages C–E; these are separate within-layout comparisons.
 
