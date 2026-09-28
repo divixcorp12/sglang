@@ -294,9 +294,13 @@ def test_nine_parts_cannot_be_cut():
     assert piece_geometry(_one_row_tables((1,) * 9), 0, 0) is None
 
 
-def test_u1_the_geometry_is_what_the_reader_reads(tmp_path):
+@pytest.mark.parametrize(
+    "weights", [(1.0, 1.0), (1.0, 1.0, 1.0), (1.0, 0.0, 1.0), (3.0, 1.0, 2.0)],
+    ids=["halves", "thirds", "zero_middle", "uneven"],
+)
+def test_u1_the_geometry_is_what_the_reader_reads(tmp_path, weights):
     """The exported geometry is the reader's own: a piece-streaming read issues exactly those sub-reads."""
-    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=weights, hidden=256, inter=512)
     experts, slots = [3, 0, 5], [0, 1, 2]
     result, log, info, _ = read_rows_sqes(s.tables, 1, experts, slots, direct=False, piece_stream=True, pack_workers=2)
     assert result == 1
@@ -501,6 +505,112 @@ def test_a_sub_read_that_ends_short_leaves_its_pieces_unvetted_unpublished_and_f
     assert dependent and all(row1["seq"][j] == 0 and not bits >> j & 1 for j in dependent)
 
 
+# ---- Three mirror parts (up to eight): the same properties, one more part cutting the pieces finer ----
+
+THREE = [(1.0, 1.0, 1.0), (3.0, 1.0, 2.0), (1.0, 0.0, 1.0)]
+THREE_IDS = ["thirds", "uneven", "zero_middle"]
+
+
+@pytest.mark.parametrize("weights", THREE, ids=THREE_IDS)
+def test_three_parts_publish_each_piece_after_its_sub_reads_and_the_empty_ones_at_admission(tmp_path, weights):
+    """Three mirror parts, completions reversed and part 2's second sub-read of row 0 held back. Every piece with bytes
+    is vetted after its last dependency lands and published after it is vetted. Every piece past the row's sub-reads
+    (6 and 7 when all three parts read) has no dependencies and is vetted at admission, before any of the row's
+    sub-reads landed, so the device's all-eight-bits exit is reached with no device change. Rows land exact."""
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=weights, hidden=256, inter=512)
+    experts, slots = [4, 1, 2], [0, 1, 2]
+    for slot in slots:
+        split._sentinel(s, 1, slot)
+    assert _sub_read(s, 1, experts[0], 2, 1)["length"] > 0  # the held sub-read exists for every weighting here
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=False, generation=GEN, piece_stream=True, pack_workers=2,
+        reverse_cqes=True, hold_ordinal=0, part=2, sub=1, poison=True,
+    )
+    assert result == 1 and info["refused"] == 0 and record["piece_publish_refused"] == 0
+    assert _words(masks) == [piece_word(GEN, FULL)] * len(experts)
+    assert record["pieces_published"] == PIECES * len(experts)
+    split._assert_rows(s, 1, experts, slots)
+    for row, expert in zip(record["pieces"], experts):
+        sub_reads, pieces = piece_geometry(s.tables, 1, expert)
+        n = len(sub_reads)
+        assert n == len(_row_sub_reads(s.tables, 1, expert))
+        assert n == (8 if 0.0 in weights else 6), (expert, n)  # 1:0:1 cuts like two parts
+        first_landing = min(row["sub_seq"][k] for k in range(n))
+        for j, piece in enumerate(pieces):
+            assert row["publish"][j] > row["seq"][j] > 0, (row["row"], j)
+            deps = [k for k in range(n) if piece["deps"] >> k & 1]
+            if j >= n:
+                assert not deps and row["seq"][j] < first_landing, (row["row"], j)
+            else:
+                assert deps and row["seq"][j] > max(row["sub_seq"][k] for k in deps), (row["row"], j)
+
+
+@pytest.mark.parametrize("weights", THREE, ids=THREE_IDS)
+def test_three_parts_every_bit_a_reader_can_see_names_bytes_already_stored(tmp_path, weights):
+    """U3 over three parts: a thread polls the words while the read runs and checks each bit it sees against a
+    reference copy, the empty pieces' bits included (they name no bytes, so they can never differ)."""
+    s = ram_miss_setup(tmp_path, capacity=8, mirror_weights=weights, hidden=256, inter=512)
+    experts, slots, ref_slots = [4, 1, 2], [0, 1, 2], [5, 6, 7]
+    assert read_rows_traced(s.tables, 1, experts, ref_slots, direct=False)[0] == 1
+    for slot in slots:
+        split._sentinel(s, 1, slot)
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=False, generation=GEN, reference=s.tables.slabs, ref_slots=ref_slots,
+        piece_stream=True, pack_workers=2, pack_split=1, pack_delay_ns=10_000_000, poison=True,
+    )
+    assert result == 1 and info["refused"] == 0
+    assert info["checked"] == PIECES * len(experts) and info["differed"] == 0
+    assert _words(masks) == [piece_word(GEN, FULL)] * len(experts)
+    split._assert_rows(s, 1, experts, slots)
+
+
+@pytest.mark.parametrize(
+    "fault", [dict(part_error=5), dict(part_short=PAGE, short_is_eof=True)], ids=["eio", "short_at_eof"]
+)
+def test_three_parts_a_failed_sub_read_publishes_none_of_its_pieces(tmp_path, fault):
+    """Part 2's second sub-read of row 1 fails (EIO) or ends a page in, as at end of file. The read fails, no piece that
+    depends on it is vetted or published, and nothing is published under another generation. The row's empty pieces
+    may already be published: the device still sees a word short of all eight bits and a request not served."""
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0, 1.0), hidden=256, inter=512)
+    experts, slots = [4, 1, 2], [0, 1, 2]
+    sub_reads, pieces = piece_geometry(s.tables, 1, experts[1])
+    bad = next(k for k, sub in enumerate(sub_reads) if (sub["part"], sub["k"]) == (2, 1))
+    assert sub_reads[bad]["length"] > PAGE  # the short fault can fire
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=False, generation=GEN, piece_stream=True, pack_workers=2,
+        part=2, sub=1, ordinal=1, poison=True, **fault,
+    )
+    assert result == 0 and info["refused"] == 0
+    row1, bits = record["pieces"][1], _words(masks)[1] & FULL
+    dependent = [j for j, piece in enumerate(pieces) if piece["deps"] >> bad & 1]
+    assert dependent and all(row1["seq"][j] == 0 and not bits >> j & 1 for j in dependent)
+    assert bits != FULL
+    assert all(word >> 8 == GEN for word in _words(masks))
+
+
+@pytest.mark.parametrize("credit", [1, 5, 48])
+def test_three_parts_a_prefill_sized_read_over_both_banks_lands_every_row(tmp_path, credit):
+    """16 rows, both banks full (the most a request carries), of three parts: 6 sub-reads a row, 96 SQEs, against the
+    3-part ring's 48 credits or fewer. Every sub-read is issued once, every piece published once, every row exact."""
+    s = ram_miss_setup(tmp_path, capacity=16, experts=16, mirror_weights=(1.0, 1.0, 1.0), hidden=256, inter=512)
+    experts, slots = list(range(16))[::-1], list(range(16))
+    for slot in slots:
+        split._sentinel(s, 1, slot)
+    result, log, info, record = read_rows_sqes(
+        s.tables, 1, experts, slots, direct=False, piece_stream=True, pack_workers=2, step=8, max_outstanding=credit
+    )
+    assert result == 1
+    reads = sum(len(piece_geometry(s.tables, 1, e)[0]) for e in experts)
+    assert reads == 16 * 6
+    assert info["sqes"] == info["cqes"] == record["extents"] == reads
+    assert info["descriptors"] == 16 * 3 * SUB_READS and info["credit"] == 16 * 3
+    assert record["pending_max"] <= credit
+    if credit < 16 * 3:
+        assert record["pending_max"] == credit
+    assert record["pieces_published"] == PIECES * len(experts) and record["piece_publish_refused"] == 0
+    split._assert_rows(s, 1, experts, slots)
+
+
 # ---- U10: with the flag off the reader is today's ----
 
 
@@ -629,9 +739,24 @@ def test_the_reader_refuses_piece_streaming_without_packing_workers(tmp_path):
 
 
 def test_the_reader_refuses_more_mirror_parts_than_the_pieces_can_name(tmp_path):
-    s = ram_miss_setup(tmp_path, mirror_weights=(1.0, 1.0, 1.0))
-    with pytest.raises(RuntimeError, match="mirror parts"):
+    s = ram_miss_setup(tmp_path, mirror_weights=(1.0,) * 9)
+    with pytest.raises(RuntimeError, match="at most 8 mirror parts .* not 9"):
         read_rows_traced(s.tables, 1, [0], [0], direct=False, piece_stream=True, pack_workers=1)
+
+
+@pytest.mark.parametrize("weights", [(1.0,) * 3, (1.0,) * 4, (1.0,) * 8], ids=["three", "four", "eight"])
+def test_the_reader_streams_pieces_over_three_to_eight_mirror_parts(tmp_path, weights):
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=weights, hidden=256, inter=512)
+    experts, slots = [4, 1, 2], [0, 1, 2]
+    for slot in slots:
+        split._sentinel(s, 1, slot)
+    result, record, masks, info = read_rows_pieces(
+        s.tables, 1, experts, slots, direct=False, generation=GEN, piece_stream=True, pack_workers=2, poison=True
+    )
+    assert result == 1 and info["refused"] == 0 and record["piece_publish_refused"] == 0
+    assert _words(masks) == [piece_word(GEN, FULL)] * len(experts)
+    assert record["pieces_published"] == PIECES * len(experts)
+    split._assert_rows(s, 1, experts, slots)
 
 
 @pytest.mark.parametrize("field", ["slabs", "row_bytes"])
@@ -645,9 +770,9 @@ def test_the_reader_refuses_a_slab_row_base_that_is_not_128_byte_aligned(tmp_pat
         read_rows_traced(tables, 1, [0], [0], direct=False, piece_stream=True, pack_workers=1)
 
 
-def _host(tmp_path, workers, *, lease_mode=True, two_phase=True, piece_stream=True):
+def _host(tmp_path, workers, *, lease_mode=True, two_phase=True, piece_stream=True, weights=(1.0, 1.0)):
     """A tier as the service builds it for piece streaming: lease mode, two-phase, packing workers, the flag."""
-    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=weights, hidden=256, inter=512)
     page = new_page(pin=False)
     host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=workers
@@ -702,6 +827,25 @@ def test_the_tier_publishes_every_piece_of_a_read_row_into_each_lane_that_names_
         host.start_thread()
         with pytest.raises(RuntimeError, match="before the service thread starts"):
             host.enable_piece_stream()
+    finally:
+        host.stop()
+
+
+def test_a_three_root_tier_publishes_all_eight_bits_into_each_lane_that_names_a_read_row(tmp_path):
+    """The tier over three mirror parts: the same lanes as the two-part test, and every lane naming a row read ends
+    with all eight bits (six with bytes, two empty) under the request's generation; the hit lane's word is untouched."""
+    s, page, host, sim = _host(tmp_path, 2, weights=(1.0, 1.0, 1.0))
+    try:
+        assert s.tables.parts == 3
+        _serve(host, sim, [3])
+        host.enable_trace()
+        req, waited = _serve(host, sim, [3, 4, 5, 4])
+        assert waited.status == 1 and waited.go == 4
+        assert [_piece_word_of(sim, req, lane) for lane in range(4)] == [0] + [piece_word(req.gen, FULL)] * 3
+        (record,) = host.drain_trace()
+        assert record["pieces_published"] == 2 * PIECES and record["piece_publish_refused"] == 0
+        assert record["extents"] == 2 * 3 * 2  # two rows, three parts, two sub-reads each
+        _assert_mapped(s, host, [4, 5])
     finally:
         host.stop()
 
