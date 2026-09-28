@@ -5370,9 +5370,11 @@ mechanism, unchanged. `finish_pass` then runs the late layers over each needed s
   `test_dsv4_candidate_indexer.py`'s existing tail-publish tests, reused unchanged here.
 - Registered suites unaffected by the rename (`_Pass.final_tail_metadata` -> `_Pass.tail_by_span`)
   were updated to the new field name; behavior of those tests is otherwise unchanged.
-- On divix01 at the fix head (`0a96af96df`): `unit/layer_major` 77 passed, 2 skipped;
-  `test_dsv4_candidate_indexer.py` 43 passed; `test_dsv41_torch_indexer_chunking.py` 4 passed, 3
-  skipped.
+- On divix01 at `1e8d22ed39` (`PYTHONPATH=$WT/python CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=8
+  taskset -c 18-35,54-63 .venv/bin/python -m pytest <target> -q -p no:randomly
+  --basetemp=/mnt/nvme1/pytest-tmp/...; echo EXIT=${PIPESTATUS[0]}`): `unit/layer_major` 78
+  passed, 2 skipped, `EXIT=0`; `test_dsv4_candidate_indexer.py` 43 passed, `EXIT=0`;
+  `test_dsv41_torch_indexer_chunking.py` 4 passed, 3 skipped, `EXIT=0`.
 
 **GPU verification.** `equiv.py` gained a `len8200` case, a `--cases c1` subset (just that case),
 and `compare()` accepts a `c1` run against a full baseline the same way it already accepted
