@@ -7,6 +7,8 @@ old form.
 
 import re
 
+import pytest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.expert_stream_sources import device_sources
 
@@ -32,6 +34,13 @@ def matches(pattern: str) -> list[tuple[str, int, str]]:
         for number, code in code_lines(name)
         if re.search(pattern, code)
     ]
+
+
+def kernel_body(name: str, kernel: str) -> str:
+    """The code of `kernel` in header `name`, comments and blank lines removed, up to its closing brace at column 0."""
+    text = "\n".join(code for _, code in code_lines(name))
+    start = text.index(f"void {kernel}(")
+    return text[start : text.index("\n}", start)]
 
 
 def test_the_three_device_headers_are_found():
@@ -71,3 +80,25 @@ def test_the_seqlock_fences_are_two_acquires_and_three_releases():
         ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
     ]
+
+
+@pytest.mark.parametrize("kernel", ["exl3_ram_miss_lease_stage_ack_kernel", "exl3_ram_miss_lease_ack_kernel"])
+def test_the_ack_kernels_combine_lane_verdicts_with_syncthreads_or_not_a_shared_flag(kernel):
+    # Several lanes storing to one __shared__ int is a data race; __syncthreads_or combines the verdicts, and it is
+    # reached by every thread at the kernel's top level, never inside the lane branch.
+    body = kernel_body("lease_kernels.cuh", kernel)
+    assert "__shared__" not in body
+    assert re.findall(r"__syncthreads\w*\(", body) == ["__syncthreads_or("]
+    assert re.search(r"^  const int any = __syncthreads_or\(bad\);$", body, re.MULTILINE)
+
+
+def test_rest_wait_bounds_its_claimed_loop_before_the_count_check():
+    # `claimed` is kLeaseLanes wide and the plan's count is not clamped (lease_layout.h), so the loop that counts
+    # the unclaimed lanes runs before the count is refused and must carry its own bound.
+    body = kernel_body("lease_kernels.cuh", "exl3_ram_miss_lease_rest_wait_kernel")
+    loop = re.search(r"for \(int64_t i = 0; i < (\w+); \+\+i\)\s*if \(claimed\[i\] == 0\) \+\+unclaimed;", body)
+    assert loop, "the unclaimed-lane loop is missing"
+    bound = re.search(
+        rf"const int64_t {loop.group(1)} = min\(planned_count, min\(static_cast<int64_t>\(kLeaseLanes\), lanes\)\);", body
+    )
+    assert bound and bound.start() < loop.start() < body.index("reason = kLeaseReasonCount")

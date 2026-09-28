@@ -205,8 +205,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     state[kWaits] += 1;
     const uint64_t start = global_ns();
     int64_t polls = 0;
+    bool aborted = false;
     uint32_t done = ld_acquire_sys(page + kDemandDone);
     while (!reached(done, seq) && static_cast<int64_t>(global_ns() - start) < timeout_ns) {
+      // A fatal word ends the wait early, as in the lease waits: nobody will serve this request. There is no lease
+      // header here, so no shutdown word to check.
+      if (ld_acquire_sys(page + kFatal) != 0) {
+        aborted = true;
+        break;
+      }
       __nanosleep(256);
       ++polls;
       done = ld_acquire_sys(page + kDemandDone);
@@ -214,9 +221,11 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     const int64_t total = static_cast<int64_t>(state[kPolls]) + polls;
     state[kPolls] = static_cast<int32_t>(total < 0x7fffffffLL ? total : 0x7fffffffLL);
     if (!reached(done, seq)) {
-      state[kTimeouts] += 1;
-      raise_fatal(page, seq);
       ok = false;
+      if (!aborted) {  // the page is already failed on an abort: no timeout to count and no fatal word to raise
+        state[kTimeouts] += 1;
+        raise_fatal(page, seq);
+      }
     } else {
       // `done` came from an acquire load, which orders every load below after it: no fence needed.
       const uint8_t* record = page + kDemandRing + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kRecordBytes;
@@ -622,8 +631,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   for (int64_t i = 0; i < lanes; ++i)
     host_rows_2[i] = 0;
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
-  int64_t unclaimed = 0;
-  for (int64_t i = 0; i < planned_count; ++i)
+  // The count is not clamped (lease_layout.h) and is refused only below, while `claimed` is kLeaseLanes wide and
+  // stage 1 clears only the lanes it owns: never read past either bound. Stage 1 claims nothing from a plan over
+  // the bound (it refuses it first), so a lane past the bound is unclaimed.
+  const int64_t claimable = min(planned_count, min(static_cast<int64_t>(kLeaseLanes), lanes));
+  int64_t unclaimed = planned_count - claimable;
+  for (int64_t i = 0; i < claimable; ++i)
     if (claimed[i] == 0) ++unclaimed;
 
   bool ok = state[kSticky] == 0 && state[kReqFailed] == 0 && ld_acquire_sys(page + kFatal) == 0 &&
@@ -682,7 +695,11 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   if (!ok) {
     state[kReqFailed] = 1;
     if (state[kFailReason] == 0) state[kFailReason] = static_cast<int32_t>(reason);
-    ram_miss[0] += unclaimed;  // nothing was served for the lanes stage 1 did not claim
+    // Every unserved lane is counted in ram_miss exactly once across the two stages. Stage 1 never adds to it (a
+    // lane it claims is served; a request it refuses it leaves to this stage), so a failed request counts here
+    // every lane stage 1 did not claim: the whole plan, past kLeaseLanes too, when the count itself was refused,
+    // as the batched lease wait counts `planned_count` for a refused request.
+    ram_miss[0] += unclaimed;
     return;
   }
   if (planned_count == 0) return;
@@ -754,11 +771,9 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
   const int32_t* __restrict__ const origin = p.origin;
   int32_t* __restrict__ const violated = p.violated;
   using namespace device::expert_stream;
-  __shared__ int any_violated;
-  if (threadIdx.x == 0) any_violated = 0;
-  __syncthreads();
   const int64_t entry = threadIdx.x;
   const int64_t n = go_count[0];
+  bool bad = false;  // this thread's lane was acknowledged VIOLATED
   if (entry < n && entry < kLeaseLanes) {
     const uint64_t generation = static_cast<uint64_t>(lane_ctx[4 * entry + 0]);
     const uint32_t slot_generation = static_cast<uint32_t>(lane_ctx[4 * entry + 1]);
@@ -772,11 +787,13 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
     st_release_sys64(
         lease + lease_d + kLeaseLaneAck + (idx * kLeaseLanes + lane) * kLeaseLaneAckBytes,
         tagged_word(consumed ? kLeaseTagConsumed : kLeaseTagViolated, generation));
-    if (!consumed) any_violated = 1;
+    bad = !consumed;
   }
-  // Also orders every lane's LaneAck store before thread 0's fatal release; a warp vote would not document that.
-  __syncthreads();
-  if (threadIdx.x == 0 && any_violated != 0) {
+  // Every thread reaches this. __syncthreads_or has full __syncthreads semantics, so besides combining the lanes'
+  // verdicts without a shared flag (several lanes storing to one would race) it still orders every lane's LaneAck
+  // store before thread 0's fatal release; a warp vote would not document that.
+  const int any = __syncthreads_or(bad);
+  if (threadIdx.x == 0 && any) {
     violated[0] = 1;
     raise_fatal(page, static_cast<uint32_t>(lane_ctx[0]));
   }
@@ -883,11 +900,9 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
   const int64_t* __restrict__ const lane_ctx = p.lane_ctx;
   float* __restrict__ const keep = p.keep;
   using namespace device::expert_stream;
-  __shared__ int violated;
-  if (threadIdx.x == 0) violated = 0;
-  __syncthreads();
   const int64_t lane = threadIdx.x;
   const int64_t n = go_count[0];
+  bool bad = false;  // this lane was acknowledged VIOLATED
   if (lane < n && lane < kLeaseLanes) {
     const uint64_t generation = static_cast<uint64_t>(lane_ctx[4 * lane + 0]);
     const uint32_t slot_generation = static_cast<uint32_t>(lane_ctx[4 * lane + 1]);
@@ -900,10 +915,12 @@ __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ra
     st_release_sys64(
         lease + lease_d + kLeaseLaneAck + (idx * kLeaseLanes + lane) * kLeaseLaneAckBytes,
         tagged_word(consumed ? kLeaseTagConsumed : kLeaseTagViolated, generation));
-    if (!consumed) violated = 1;
+    bad = !consumed;
   }
-  __syncthreads();  // as in the stage ack: also orders the lanes' LaneAck stores before the fatal release
-  if (threadIdx.x == 0 && violated != 0) {
+  // As in the stage ack: every thread reaches this, and __syncthreads_or has full __syncthreads semantics, so it
+  // also orders the lanes' LaneAck stores before thread 0's fatal release.
+  const int any = __syncthreads_or(bad);
+  if (threadIdx.x == 0 && any) {
     keep[0] = 0.0f;
     raise_fatal(page, static_cast<uint32_t>(lane_ctx[0]));
   }
