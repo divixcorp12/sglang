@@ -6,15 +6,10 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "../deepseek_v4/silu_and_mul_masked_post_quant.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
-
-#include "../deepseek_v4/silu_and_mul_masked_post_quant.cuh"
-
-// Kernels of the DSV4.1 EXL3 decode cast fusion (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION). exl3_gemm reads and writes
-// fp16 while the model runs in bf16, so every EXL3 linear sits between two casts. These kernels keep each rounding
-// of the unfused chain, in the same order, and only drop the round trips through memory.
 
 namespace sglang {
 
@@ -22,8 +17,8 @@ namespace sglang {
 // projection's fp16 input [rows, inter] out. Built with the same -use_fast_math as silu_mul_clamp_kernel, whose
 // silu_and_mul it calls, so the activation is computed by the same instructions.
 template <bool kUsePDL>
-__global__ __launch_bounds__(1024, 2) void exl3_silu_mul_clamp_half_kernel(
-    const SiluAndMulClampParams __grid_constant__ params) {
+__global__
+__launch_bounds__(1024, 2) void exl3_silu_mul_clamp_half_kernel(const SiluAndMulClampParams __grid_constant__ params) {
   using namespace device;
   using Vec = AlignedVector<fp16x2_t, 4>;
   const auto row = blockIdx.x / params.blocks_per_row;
