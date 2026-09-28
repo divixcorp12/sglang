@@ -1061,6 +1061,38 @@ untouched.
 CUPTI tracing makes the launch synchronous and holds off the copy thread's calls, which deadlocks CW
 (engram-no-hostnode plan, section 9). Node mode is the one to use.
 
+### 7.7 PDL on the lease chain (`SGLANG_DSV41_ENABLE_LEASE_PDL`, needs lease mode)
+
+With the flag, the chain's six kernels are launched with programmatic dependent launch (PDL): post, W1
+(`stream_hit_wait`), both stage acks, S, CW and finalize. Each is launched with `enable_pdl` and instantiated with
+`kUsePDL = true`. Its **first** statement is `griddepcontrol.wait` (`PDLWaitPrimary`), and its second is
+`griddepcontrol.launch_dependents` (`PDLTriggerSecondary`). C1 and the ops between layers are unchanged. The launch
+attribute becomes a **programmatic edge** in the captured decode graph (`cudaGraphGetEdges`: edge type 1, port
+`cudaGraphKernelNodePortProgrammatic`). What it buys: the next kernel's launch latency overlaps the current kernel's
+body, about 0.2-0.5 µs per edge and at most ~1 µs per layer. Measured in `analysis/dsv41-drive/chain-pdl/results.md`
+on `expert-stream-transfer-measurement`. Outputs are unchanged.
+
+Why the trigger right after the wait is safe:
+
+1. **Nothing before the wait touches global memory.** The wait is the first statement. In SASS, only constant-bank and
+   special-register reads (`LDC`, `S2R`, `LDCU`) come before `ACQBULK`; there is no `LDG`, `STG` or `ATOM`.
+2. **An early dependent cannot starve its primary.** The dependent is scheduled only once every block of the primary
+   has triggered (or exited), which happens right after each block's own wait. So all of the primary's blocks are
+   already resident. S has 8 blocks and the others 1, so at most 9 blocks of the chain are ever resident together.
+   The dependent then idles in its wait.
+3. **The host protocol does not change.** Every read and write of a chain word (`state`, `count`, `go_*`, `lane_ctx`,
+   `claimed`, row results, LaneRequest, LaneAck, SmAck, CopyDone, `kFatal`) happens after the wait, in the order it
+   has without PDL. The service sees the same sequence of device publications. It never sees a launch.
+4. **Ordering is transitive.** `griddepcontrol.wait` returns only after the primary grid has **completed and its
+   memory operations are visible**. The trigger publishes nothing and orders nothing. The primary itself passed its
+   own wait before its first access, so its completion implies its predecessor's, and so on up the chain. A kernel
+   without the PDL attribute (C1, the ops between layers) waits for its predecessor in the ordinary way and never
+   triggers early. Its PDL dependent (A1 after C1, the next layer's post) is released only when it exits, and still
+   waits. So when kernel K passes its wait, every earlier kernel on the stream has completed, exactly as without PDL.
+
+The order within each kernel is what makes (1) and (4) hold. `test_exl3_ram_miss_device_args.py` pins it: each chain
+kernel's first two statements must be the wait, then the trigger.
+
 ## 8. Lease lifecycle and the eviction predicate
 
 Lane state machine (service-private, per `Outstanding` lane):

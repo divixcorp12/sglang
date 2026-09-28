@@ -712,6 +712,8 @@ class Exl3RamMissService:
         # unarmed. Once armed, an eager forward and a Triton module load first drain the device.
         self.copy_engine = False
         self.sm_small_copies = False
+        # SGLANG_DSV41_ENABLE_LEASE_PDL (LEASE_PROTOCOL.md 7.7): the lease chain's kernels launch with PDL.
+        self.lease_pdl = False
         self._copy_armed = False
         self._copy_decodes = 0
         self.copy_engine_module_loads = 0  # Triton loads that drained the device first
@@ -796,6 +798,10 @@ class Exl3RamMissService:
                 raise RuntimeError(
                     "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
                 )
+            if cfg.enable_lease_pdl and not lease_mode:
+                raise RuntimeError(
+                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_LEASE_PDL needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
+                )
             piece_stream = cfg.enable_ram_miss_piece_stream
             check_piece_stream(cfg, row_images=tables.row_images)
             if cfg.enable_prefill_fills and not tables.row_images:
@@ -866,6 +872,7 @@ class Exl3RamMissService:
         self.copy_engine = copy_engine
         self.native_prefetch = native_prefetch
         self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
+        self.lease_pdl = cfg.enable_lease_pdl
         self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
         self.fill_timeout_s = watchdog_wait_s(cfg.ram_miss_timeout_ms) + 5.0
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
@@ -957,6 +964,7 @@ class Exl3RamMissService:
                 hot_page=self.hot_page if self.gpu_hot_enabled else None,
                 piece_stream=self.piece_stream,
                 piece_runs=self.host.piece_runs() if self.piece_stream else None,
+                lease_pdl=self.lease_pdl,
             )
             # Every layer's backend reaches the prefetch hooks through its device side (Exl3MoEMethod._apply_graph).
             self.device_side.native_prefetch = self.native_prefetch

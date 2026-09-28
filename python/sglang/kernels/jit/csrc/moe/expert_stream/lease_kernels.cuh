@@ -34,8 +34,16 @@ struct PostParams {
   int64_t copy_engine;
 };
 
+template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_post_kernel(
     const __grid_constant__ PostParams p) {
+  // Lease-chain PDL (kUsePDL = SGLANG_DSV41_ENABLE_LEASE_PDL; the argument is LEASE_PROTOCOL.md 7.7). (1) The wait
+  // is first: nothing before it touches global memory. (2) The trigger follows it, so the next chain kernel can be
+  // resident only once all 1 block of this grid are; it then idles in its own wait. (3) Every chain and host word is read
+  // and written after the wait, in the order it has without PDL. (4) The dependent's wait returns only once this grid
+  // has completed and flushed, and this grid's wait did the same for its primary: the ordering is transitive.
+  device::PDLWaitPrimary<kUsePDL>();
+  device::PDLTriggerSecondary<kUsePDL>();
   uint8_t* __restrict__ const page = p.page;
   int32_t* __restrict__ const state = p.state;
   const int32_t* __restrict__ const slot_map = p.slot_map;
@@ -461,6 +469,15 @@ struct HitWaitParams {
   int32_t* claimed;
   int32_t* violated;
   int64_t budget_ns;
+  // The row's pinned-slot capacity, the value of its row-table word in the lease block, passed by the launcher so the
+  // kernel does not read it across PCIe. A kernel argument is frozen into the captured decode graph, which is safe
+  // because the word never changes for the life of the process: its one writer is RamTier::init_lease_block
+  // (host/ram_tier.h:1325), called only from the RamTier constructor (ram_tier.h:81) before the service thread or
+  // any device exists; Tier::capacity is assigned only there (ram_tier.h:70); the service builds its host once
+  // (exl3_ram_miss.py ensure_started returns early once self.host is set, and refuses after shutdown), and each
+  // ExpertStreamHost allocates its own lease block (expert_stream_transport.py, ExpertStreamHost.__init__). The
+  // launcher checks the argument against the word (RuntimeCheck), so a mismatch is refused at launch and capture.
+  uint32_t row_capacity;
 };
 
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_hit_wait_kernel(
@@ -500,7 +517,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       origin_1,
       claimed,
       violated,
-      budget_ns);
+      budget_ns,
+      p.row_capacity);
 }
 
 // Piece streaming's W1: stage 1 exactly, after resetting every word the stream kernel and the finalize kernel read
@@ -524,13 +542,30 @@ struct StreamHitWaitParams {
   int32_t* claimed;
   int32_t* violated;
   int64_t budget_ns;
+  // The row's pinned-slot capacity, the value of its row-table word in the lease block, passed by the launcher so the
+  // kernel does not read it across PCIe. A kernel argument is frozen into the captured decode graph, which is safe
+  // because the word never changes for the life of the process: its one writer is RamTier::init_lease_block
+  // (host/ram_tier.h:1325), called only from the RamTier constructor (ram_tier.h:81) before the service thread or
+  // any device exists; Tier::capacity is assigned only there (ram_tier.h:70); the service builds its host once
+  // (exl3_ram_miss.py ensure_started returns early once self.host is set, and refuses after shutdown), and each
+  // ExpertStreamHost allocates its own lease block (expert_stream_transport.py, ExpertStreamHost.__init__). The
+  // launcher checks the argument against the word (RuntimeCheck), so a mismatch is refused at launch and capture.
+  uint32_t row_capacity;
   int32_t* go_2;
   uint32_t* stream_count;
   int32_t* stream_abort;
 };
 
+template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_stream_hit_wait_kernel(
     const __grid_constant__ StreamHitWaitParams p) {
+  // Lease-chain PDL (kUsePDL = SGLANG_DSV41_ENABLE_LEASE_PDL; the argument is LEASE_PROTOCOL.md 7.7). (1) The wait
+  // is first: nothing before it touches global memory. (2) The trigger follows it, so the next chain kernel can be
+  // resident only once all 1 block of this grid are; it then idles in its own wait. (3) Every chain and host word is read
+  // and written after the wait, in the order it has without PDL. (4) The dependent's wait returns only once this grid
+  // has completed and flushed, and this grid's wait did the same for its primary: the ordering is transitive.
+  device::PDLWaitPrimary<kUsePDL>();
+  device::PDLTriggerSecondary<kUsePDL>();
   uint8_t* __restrict__ const page = p.page;
   int32_t* __restrict__ const state = p.state;
   const int64_t* __restrict__ const planned = p.planned;
@@ -572,7 +607,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       origin_1,
       claimed,
       violated,
-      budget_ns);
+      budget_ns,
+      p.row_capacity);
 }
 
 // V1 two-phase, stage 2 (D2). The rest of the request: it waits on kDemandDone as the batched wait does, because
@@ -761,8 +797,16 @@ struct StageAckParams {
   int32_t* violated;
 };
 
+template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kLeaseLanes, 1) void exl3_ram_miss_lease_stage_ack_kernel(
     const __grid_constant__ StageAckParams p) {
+  // Lease-chain PDL (kUsePDL = SGLANG_DSV41_ENABLE_LEASE_PDL; the argument is LEASE_PROTOCOL.md 7.7). (1) The wait
+  // is first: nothing before it touches global memory. (2) The trigger follows it, so the next chain kernel can be
+  // resident only once all 1 block of this grid are; it then idles in its own wait. (3) Every chain and host word is read
+  // and written after the wait, in the order it has without PDL. (4) The dependent's wait returns only once this grid
+  // has completed and flushed, and this grid's wait did the same for its primary: the ordering is transitive.
+  device::PDLWaitPrimary<kUsePDL>();
+  device::PDLTriggerSecondary<kUsePDL>();
   uint8_t* __restrict__ const page = p.page;
   uint8_t* __restrict__ const lease = p.lease;
   const int64_t lease_d = p.lease_d;
@@ -823,8 +867,16 @@ struct FinalizeParams {
   int64_t lease_d;
 };
 
+template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_finalize_kernel(
     const __grid_constant__ FinalizeParams p) {
+  // Lease-chain PDL (kUsePDL = SGLANG_DSV41_ENABLE_LEASE_PDL; the argument is LEASE_PROTOCOL.md 7.7). (1) The wait
+  // is first: nothing before it touches global memory. (2) The trigger follows it, so the next chain kernel can be
+  // resident only once all 1 block of this grid are; it then idles in its own wait. (3) Every chain and host word is read
+  // and written after the wait, in the order it has without PDL. (4) The dependent's wait returns only once this grid
+  // has completed and flushed, and this grid's wait did the same for its primary: the ordering is transitive.
+  device::PDLWaitPrimary<kUsePDL>();
+  device::PDLTriggerSecondary<kUsePDL>();
   uint8_t* __restrict__ const page = p.page;
   int32_t* __restrict__ const state = p.state;
   const int32_t* __restrict__ const count = p.count;
@@ -952,7 +1004,8 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView hot_slots,
       int64_t hot_capacity,
       tvm::ffi::TensorView dst_slots,
-      int64_t copy_engine) {
+      int64_t copy_engine,
+      int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1020,7 +1073,8 @@ struct LeaseProtocolKernel {
         .dst_count = dst_slots.size(0),
         .copy_engine = copy_engine,
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_post_kernel, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream).enable_pdl(use_pdl != 0)(
+        use_pdl != 0 ? exl3_ram_miss_post_kernel<true> : exl3_ram_miss_post_kernel<false>, params);
   }
 
   static void wait(
@@ -1214,7 +1268,8 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView origin_1,
       tvm::ffi::TensorView claimed,
       tvm::ffi::TensorView violated,
-      int64_t budget_ns) {
+      int64_t budget_ns,
+      int64_t row_capacity) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1279,6 +1334,7 @@ struct LeaseProtocolKernel {
         .claimed = static_cast<int32_t*>(claimed.data_ptr()),
         .violated = static_cast<int32_t*>(violated.data_ptr()),
         .budget_ns = budget_ns,
+        .row_capacity = expert_stream::checked_row_capacity(lease_address, row, row_capacity),
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_hit_wait_kernel, params);
   }
@@ -1302,7 +1358,9 @@ struct LeaseProtocolKernel {
       int64_t budget_ns,
       tvm::ffi::TensorView go_2,
       tvm::ffi::TensorView stream_count,
-      tvm::ffi::TensorView stream_abort) {
+      tvm::ffi::TensorView stream_abort,
+      int64_t row_capacity,
+      int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1369,11 +1427,13 @@ struct LeaseProtocolKernel {
         .claimed = static_cast<int32_t*>(claimed.data_ptr()),
         .violated = static_cast<int32_t*>(violated.data_ptr()),
         .budget_ns = budget_ns,
+        .row_capacity = expert_stream::checked_row_capacity(lease_address, row, row_capacity),
         .go_2 = static_cast<int32_t*>(go_2.data_ptr()),
         .stream_count = static_cast<uint32_t*>(stream_count.data_ptr()),
         .stream_abort = static_cast<int32_t*>(stream_abort.data_ptr()),
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_stream_hit_wait_kernel, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream).enable_pdl(use_pdl != 0)(
+        use_pdl != 0 ? exl3_ram_miss_lease_stream_hit_wait_kernel<true> : exl3_ram_miss_lease_stream_hit_wait_kernel<false>, params);
   }
 
   static void lease_rest_wait(
@@ -1464,7 +1524,8 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView go_count,
       tvm::ffi::TensorView lane_ctx,
       tvm::ffi::TensorView origin,
-      tvm::ffi::TensorView violated) {
+      tvm::ffi::TensorView violated,
+      int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1504,8 +1565,8 @@ struct LeaseProtocolKernel {
         .origin = static_cast<const int32_t*>(origin.data_ptr()),
         .violated = static_cast<int32_t*>(violated.data_ptr()),
     };
-    LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream)(
-        exl3_ram_miss_lease_stage_ack_kernel, params);
+    LaunchKernel(1, static_cast<int>(device::expert_stream::kLeaseLanes), stream).enable_pdl(use_pdl != 0)(
+        use_pdl != 0 ? exl3_ram_miss_lease_stage_ack_kernel<true> : exl3_ram_miss_lease_stage_ack_kernel<false>, params);
   }
 
   static void lease_finalize(
@@ -1518,7 +1579,8 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView violated,
       tvm::ffi::TensorView keep,
       int64_t lease_address,
-      int64_t lease_d) {
+      int64_t lease_d,
+      int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
@@ -1560,7 +1622,8 @@ struct LeaseProtocolKernel {
         .lease = reinterpret_cast<uint8_t*>(lease_address),
         .lease_d = lease_d,
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_finalize_kernel, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream).enable_pdl(use_pdl != 0)(
+        use_pdl != 0 ? exl3_ram_miss_lease_finalize_kernel<true> : exl3_ram_miss_lease_finalize_kernel<false>, params);
   }
 };
 

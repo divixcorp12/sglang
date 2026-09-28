@@ -356,6 +356,124 @@ def _lease_device_only_constants():
 
 
 
+# Lease-chain PDL (SGLANG_DSV41_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL on the lease chain"): the six chain kernels,
+# their source file, and the Python method that launches each.
+PDL_KERNELS = {
+    "exl3_ram_miss_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),
+    "exl3_ram_miss_lease_stream_hit_wait_kernel": ("lease_kernels.cuh", "expert_stream_lease_stream_hit_wait"),
+    "exl3_ram_miss_lease_stage_ack_kernel": ("lease_kernels.cuh", "expert_stream_lease_stage_ack"),
+    "exl3_ram_miss_lease_finalize_kernel": ("lease_kernels.cuh", "expert_stream_lease_finalize"),
+    "exl3_ram_miss_lease_stream_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_stream"),
+    "exl3_ram_miss_lease_copy_wait_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_copy_wait"),
+}
+
+
+def _body_statements(text: str, kernel: str) -> list[str]:
+    """The first statements of `kernel`'s body, comments dropped; asserts it is templated on `bool kUsePDL`."""
+    match = re.search(r"template <bool kUsePDL>\s*__global__[^{;]*?\b" + kernel + r"\([^)]*\)\s*\{", text)
+    assert match, f"{kernel} is not a template <bool kUsePDL> kernel"
+    body = text[match.end():]
+    lines = [re.sub(r"//.*", "", line).strip() for line in body.splitlines()]
+    return [line for line in lines if line][:2]
+
+
+@pytest.mark.parametrize("kernel", sorted(PDL_KERNELS))
+def test_each_chain_kernel_waits_first_and_triggers_right_after_the_wait(kernel):
+    """The wait is the first statement: nothing may touch global memory before it. The trigger comes right after it,
+    never before: a dependent launched early is safe only because its own wait covers this kernel's completion, and
+    this kernel's wait covers its primary's (transitivity). Red when a trigger moves above its wait."""
+    text = (CSRC / "expert_stream" / PDL_KERNELS[kernel][0]).read_text()
+    assert _body_statements(text, kernel) == [
+        "device::PDLWaitPrimary<kUsePDL>();",
+        "device::PDLTriggerSecondary<kUsePDL>();",
+    ]
+
+
+@pytest.mark.parametrize("kernel", sorted(PDL_KERNELS))
+def test_each_chain_launcher_picks_the_instantiation_and_the_launch_attribute_from_one_flag(kernel):
+    text = (CSRC / "expert_stream" / PDL_KERNELS[kernel][0]).read_text()
+    launch = re.search(r"\.enable_pdl\(use_pdl != 0\)\(\s*use_pdl != 0 \? " + kernel + r"<true> : " + kernel
+                       + r"<false>", text)
+    assert launch, f"{kernel}'s launcher does not launch {kernel}<use_pdl> with .enable_pdl(use_pdl)"
+
+
+def test_no_other_expert_stream_kernel_uses_pdl():
+    text = joined_text(device_sources())
+    waits = re.findall(r"PDLWaitPrimary<", text)
+    triggers = re.findall(r"PDLTriggerSecondary<", text)
+    assert len(waits) == len(triggers) == len(PDL_KERNELS)
+    assert len(re.findall(r"\.enable_pdl\(", text)) == len(PDL_KERNELS)
+
+
+def test_the_python_side_passes_the_pdl_flag_to_exactly_the_six_chain_launchers():
+    tree = ast.parse(Path(ram_miss.__file__).read_text())
+    last_args = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr.startswith("expert_stream_") and isinstance(node.func.value, ast.Call)
+                and getattr(node.func.value.func, "attr", None) == "_kernels"):
+            last_args.setdefault(node.func.attr, []).append(ast.unparse(node.args[-1]) if node.args else "")
+    pdl = {name for name, args in last_args.items() if any("lease_pdl" in a for a in args)}
+    assert pdl == {launcher for _, launcher in PDL_KERNELS.values()}
+    for name in pdl:
+        assert last_args[name] == ["int(self.lease_pdl)"] * len(last_args[name]), name
+
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        return lambda *args: self.calls.append((name, args))
+
+
+@pytest.mark.parametrize("lease_pdl", [False, True])
+def test_the_device_side_passes_its_pdl_flag_to_the_post_launch(lease_pdl):
+    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
+    slot_map = torch.full((2, 4), -1, dtype=torch.int32)
+    kwargs = {} if not lease_pdl else {"lease_pdl": True}
+    dev = ExpertStreamDevice(page, slot_map, device="cpu", layers=2, timeout_ms=10, advise=False, **kwargs)
+    assert dev.lease_pdl is lease_pdl  # off unless asked for
+    recorder = _Recorder()
+    dev._kernels = lambda: recorder
+    _post(dev, _args())
+    ((name, args),) = recorder.calls
+    assert name == "expert_stream_post" and args[-1] == int(lease_pdl)
+
+
+# The row-table capacity word (lease block, row table, +4): written once by the host when the service is built.
+CAPACITY_WORD = "kLeaseRowTable + row * kLeaseRowTableBytes + 4"
+
+
+def test_w1_and_s_take_the_row_capacity_as_a_kernel_argument_not_from_the_pinned_row_table():
+    """W1 (lease_hit_wait_body, shared by both hit-wait kernels) and S read the capacity from their params, frozen into
+    the captured graph, instead of a host-pinned load on the critical path. Red when either reads the word again."""
+    for name in ("lease_device.cuh", "row_copy_kernels.cuh"):
+        assert CAPACITY_WORD not in (CSRC / "expert_stream" / name).read_text(), name
+    lease = (CSRC / "expert_stream" / "lease_kernels.cuh").read_text()
+    rows = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
+    for text, params in ((lease, "HitWaitParams"), (lease, "StreamHitWaitParams"), (rows, "StreamParams")):
+        struct = text[text.index(f"struct {params} {{"):]
+        assert "uint32_t row_capacity;" in struct[:struct.index("};")], params
+
+
+def test_the_device_side_passes_the_lease_layouts_row_capacity_to_the_hit_wait_launch():
+    from sglang.kernels.ops.moe import expert_lease_block as lease
+
+    layout = lease.lease_layout([5, 7])
+    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
+    slot_map = torch.full((2, 4), -1, dtype=torch.int32)
+    dev = ExpertStreamDevice(page, slot_map, device="cpu", layers=2, timeout_ms=10, advise=False,
+                             lease_block=lease.new_lease_block(layout, pin=False), lease_layout=layout)
+    recorder = _Recorder()
+    dev._kernels = lambda: recorder
+    a = _args()
+    for row in (0, 1):
+        dev.hit_wait(row, a["planned"], a["count"], torch.zeros(6, dtype=torch.int32), 1000)
+    assert [(name, args[-1]) for name, args in recorder.calls] == [("expert_stream_lease_hit_wait", 5),
+                                                                  ("expert_stream_lease_hit_wait", 7)]
+
+
 def test_the_exl3_host_file_is_only_bindings():
     """Every export body lives once, in HostExports (expert_stream/host/ffi_exports.h); the EXL3 file only names its
     layout and reader. Red when a body grows back into exl3_ram_miss_host.cpp."""

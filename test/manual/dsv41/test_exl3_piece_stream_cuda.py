@@ -399,6 +399,22 @@ def _post_and_wait_for_hits(s, hits):
 # G2: S streams. The host withholds pieces 1..7 until it acquires StreamProbe == tagged(1, gen), which S stores after
 # copying a piece. A wait-for-every-bit S (M3b) never copies, the probe never fires, and the request times out.
 # ---------------------------------------------------------------------------------------------------------------
+def test_the_w1_and_s_launchers_refuse_a_row_capacity_that_is_not_the_row_tables(service):
+    """The capacity is a kernel argument frozen into the captured graph; each launcher checks it against the pinned
+    row-table word the service wrote, so a stale or wrong value is refused at launch (and capture), not copied."""
+    s = service
+    good = s.dev._lease_capacities
+    s.dev._lease_capacities = tuple(c + 1 for c in good)
+    try:
+        with pytest.raises(Exception, match="row_capacity"):
+            s.hit_wait()
+        with pytest.raises(Exception, match="row_capacity"):
+            s.stream()
+    finally:
+        s.dev._lease_capacities = good
+    torch.cuda.synchronize()
+
+
 def test_g2_s_copies_a_piece_before_the_rest_are_published(tmp_path):
     s = StreamService(tmp_path, timeout_ms=1000)
     try:
