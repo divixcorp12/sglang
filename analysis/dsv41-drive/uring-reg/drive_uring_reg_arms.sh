@@ -5,7 +5,7 @@
 # SGLANG_EXPERT_STREAM_URING_* knobs are passed explicitly in both arms as run_arm.sh KEY=VAL overrides.
 # Rule: R3 goes to a confirmation plan only if it beats R0 by >= 1.5 ms/token pooled with byte-identical output.
 # Template: analysis/dsv41-drive/reader-crtp/drive_reader_crtp_pair.sh (changes: one worktree; the arms differ only in
-# their io_uring overrides; the node-0 gate starts at the FULL recipe tier and may cut twice before R0; memory samples
+# their io_uring overrides; a fixed 90 GiB tier with node-0 and node-1 gates; startup memory/vmstat/stack samplers; memory samples
 # before R0 and after each arm's "ready"; the server's `expert stream io_uring:` lines are kept per arm; stop on a
 # registration refusal or on diagnostics showing the arm's modes did not take effect).
 # Lock order: rowimg-disk.lock is held across both arms; cc-gpu.lock is polled here and taken by run_arm.sh itself.
@@ -26,13 +26,10 @@
 # arm this driver resolves them with the worktree's python/ tree against arm_env.MODEL_PATH and stops unless the label
 # is EXL3 (benchmarks/dsv41_flash/arm_config.py check_gate is the worked example).
 #
-# Pinned tier: settled before R0 and passed to BOTH arms as identical KEY=VAL overrides (arm_env's base_env is never
-# edited). The node-0 check is check_capacity's (MemFree + Active(file) + Inactive(file) from node0/meminfo) against the
-# node-0 share + 4096 MiB headroom + the server's observed pre-check node-0 footprint (15360). The sequence:
-#   FULL    0:61440,1:40960 / 102400 (the recipe's own tier; need 80896 MiB)
-#   REDUCED 0:57344,1:40960 /  98304 (only if node 0 is short for FULL)
-#   CUT     0:53248,1:40960 /  94208 (one further 4096 MiB cut, only if short for REDUCED)
-# and otherwise stop. Before R3 the driver re-checks the SAME tier and stops if short; it never cuts there.
+# Pinned tier: a fixed 90 GiB tier, 0:51200,1:40960 / 92160, passed to BOTH arms as identical KEY=VAL overrides
+# (arm_env's base_env is never edited), with node-0 and node-1 gates before each arm and no cut (see node0_gate). The
+# first run (/mnt/nvme1/uring-reg, full tier 0:61440,1:40960) hung in R3's startup; this tier is the controller's
+# re-run directive.
 #
 # Memory: $OUT/memory.jsonl gets node-0/node-1 MemFree and /proc/meminfo VmallocUsed and Slab as a baseline before R0's
 # launch and again after each arm's "ready" line (R3 registers ~100 GB of row slabs; node 0 is tight).
@@ -99,36 +96,39 @@ raise SystemExit(0 if label == 'EXL3' else 'the launch gate resolved ' + repr(la
 " || { say "EXL3 gate failed for $arm ($wt)"; return 1; }
 }
 
-# Tier sequence (node-0 share in MiB, node 1 fixed): FULL, then REDUCED, then CUT; see the header.
-TIER_NAMES=(full reduced cut); TIER_N0=(61440 57344 53248); TIER_IDX=0
-N0_MIB=${TIER_N0[0]}; N1_MIB=40960; HEADROOM_MIB=4096
+# Fixed 90 GiB tier (controller directive, 2026-09-28, after the full-tier R3 startup hang): the same in both arms,
+# never cut. Gates, before each arm, both logged to the driver log and $OUT/node0-gate.jsonl:
+#   node 0: MemFree + page cache >= 51200 + 4096 headroom + 15360 pre-check footprint = 70656 MiB
+#   node 1: MemFree + page cache >= 40960 + 4096 headroom + 10000 footprint           = 55056 MiB
+# The node-1 footprint is observed: the first run's R0 (/mnt/nvme1/uring-reg/memory.jsonl) went from node-1 MemFree
+# 51231 MiB before launch to 1193 MiB at "ready" with a 40960 MiB node-1 share, i.e. ~9078 MiB beyond the share.
+TIER_NAME=90g; N0_MIB=51200; N1_MIB=40960; HEADROOM_MIB=4096
 # The server's node-0 footprint before check_capacity runs, observed (see drive_mirror3_arms.sh).
 PRECHECK_FOOTPRINT_MIB=15360
-node0_memory_mib() {  # "<MemFree> <Active(file)+Inactive(file)>" for node 0 in MiB: host_numa.node_memory's free, reclaimable
+NODE1_FOOTPRINT_MIB=10000
+node_memory_mib() {  # <node>: "<MemFree> <Active(file)+Inactive(file)>" in MiB: host_numa.node_memory's free, reclaimable
     awk '$3 == "MemFree:" { f += $4 } $3 == "Active(file):" || $3 == "Inactive(file):" { c += $4 }
-         END { print int(f / 1024), int(c / 1024) }' /sys/devices/system/node/node0/meminfo
+         END { print int(f / 1024), int(c / 1024) }' "/sys/devices/system/node/node$1/meminfo"
 }
 FIRST_ARM=R0
-node0_gate() {  # <arm>: settle (R0, may step down the tier sequence) or re-check (R3, never cuts) the node-0 share
-    local arm=$1 free cache avail need ok
-    while :; do
-        read -r free cache < <(node0_memory_mib)
-        avail=$((free + cache)); need=$((N0_MIB + HEADROOM_MIB + PRECHECK_FOOTPRINT_MIB))
-        ok=$([ "$avail" -ge "$need" ] && echo true || echo false)
-        say "node 0 before $arm (tier ${TIER_NAMES[$TIER_IDX]}): MemFree ${free} MiB + page cache ${cache} MiB = ${avail} MiB," \
-            "need ${need} MiB (share ${N0_MIB} + headroom ${HEADROOM_MIB} + pre-check footprint ${PRECHECK_FOOTPRINT_MIB}): ok=$ok"
-        printf '{"arm": "%s", "utc": "%s", "tier": "%s", "memfree_mib": %d, "page_cache_mib": %d, "available_mib": %d, "need_mib": %d, "node0_share_mib": %d, "node1_share_mib": %d, "total_mib": %d, "ok": %s}\n' \
-            "$arm" "$(date -u +%FT%TZ)" "${TIER_NAMES[$TIER_IDX]}" "$free" "$cache" "$avail" "$need" "$N0_MIB" "$N1_MIB" \
-            "$((N0_MIB + N1_MIB))" "$ok" >> "$OUT/node0-gate.jsonl"
-        [ "$ok" = true ] && return 0
-        if [ "$arm" = "$FIRST_ARM" ] && [ $((TIER_IDX + 1)) -lt ${#TIER_N0[@]} ]; then
-            TIER_IDX=$((TIER_IDX + 1)); N0_MIB=${TIER_N0[$TIER_IDX]}
-            say "node 0 short: stepping to the ${TIER_NAMES[$TIER_IDX]} tier for BOTH arms -> 0:${N0_MIB},1:${N1_MIB} (total $((N0_MIB + N1_MIB)))"
-            continue
-        fi
-        say "node 0 short before $arm at 0:${N0_MIB},1:${N1_MIB} (${avail} < ${need} MiB); no further cut, stopping before this arm"
-        return 1
-    done
+node0_gate() {  # <arm>: node 0 and node 1 must both clear the fixed tier; no cut
+    local arm=$1 free cache avail need ok free1 cache1 avail1 need1 ok1
+    read -r free cache < <(node_memory_mib 0)
+    read -r free1 cache1 < <(node_memory_mib 1)
+    avail=$((free + cache)); need=$((N0_MIB + HEADROOM_MIB + PRECHECK_FOOTPRINT_MIB))
+    avail1=$((free1 + cache1)); need1=$((N1_MIB + HEADROOM_MIB + NODE1_FOOTPRINT_MIB))
+    ok=$([ "$avail" -ge "$need" ] && echo true || echo false)
+    ok1=$([ "$avail1" -ge "$need1" ] && echo true || echo false)
+    say "node 0 before $arm (tier $TIER_NAME): MemFree ${free} MiB + page cache ${cache} MiB = ${avail} MiB," \
+        "need ${need} MiB (share ${N0_MIB} + headroom ${HEADROOM_MIB} + pre-check footprint ${PRECHECK_FOOTPRINT_MIB}): ok=$ok"
+    say "node 1 before $arm (tier $TIER_NAME): MemFree ${free1} MiB + page cache ${cache1} MiB = ${avail1} MiB," \
+        "need ${need1} MiB (share ${N1_MIB} + headroom ${HEADROOM_MIB} + footprint ${NODE1_FOOTPRINT_MIB}): ok=$ok1"
+    printf '{"arm": "%s", "utc": "%s", "tier": "%s", "memfree_mib": %d, "page_cache_mib": %d, "available_mib": %d, "need_mib": %d, "node1_memfree_mib": %d, "node1_page_cache_mib": %d, "node1_available_mib": %d, "node1_need_mib": %d, "node0_share_mib": %d, "node1_share_mib": %d, "total_mib": %d, "ok": %s, "node1_ok": %s}\n' \
+        "$arm" "$(date -u +%FT%TZ)" "$TIER_NAME" "$free" "$cache" "$avail" "$need" "$free1" "$cache1" "$avail1" "$need1" \
+        "$N0_MIB" "$N1_MIB" "$((N0_MIB + N1_MIB))" "$ok" "$ok1" >> "$OUT/node0-gate.jsonl"
+    [ "$ok" = true ] && [ "$ok1" = true ] && return 0
+    say "a node is short before $arm at 0:${N0_MIB},1:${N1_MIB}; the tier is fixed, stopping before this arm"
+    return 1
 }
 tier_overrides() {
     echo "SGLANG_MOE_PINNED_HOST_NUMA_MB=0:${N0_MIB},1:${N1_MIB}" "SGLANG_MOE_PINNED_HOST_MB=$((N0_MIB + N1_MIB))"
@@ -141,10 +141,38 @@ memory_sample() {  # <label>: node-0/node-1 MemFree and VmallocUsed/Slab (MiB) a
     vm=$(awk '$1 == "VmallocUsed:" { print int($2 / 1024) }' /proc/meminfo)
     slab=$(awk '$1 == "Slab:" { print int($2 / 1024) }' /proc/meminfo)
     printf '{"label": "%s", "utc": "%s", "tier": "%s", "node0_memfree_mib": %d, "node1_memfree_mib": %d, "vmalloc_used_mib": %d, "slab_mib": %d}\n' \
-        "$label" "$(date -u +%FT%TZ)" "${TIER_NAMES[$TIER_IDX]}" "$n0" "$n1" "$vm" "$slab" >> "$OUT/memory.jsonl"
+        "$label" "$(date -u +%FT%TZ)" "$TIER_NAME" "$n0" "$n1" "$vm" "$slab" >> "$OUT/memory.jsonl"
     say "memory $label: node0 MemFree ${n0} MiB, node1 MemFree ${n1} MiB, VmallocUsed ${vm} MiB, Slab ${slab} MiB"
 }
 mkdir -p "$OUT"
+# Startup sampler (both arms), from launch until "ready" or run_arm.sh's exit, every ~10 s:
+#   $OUT/<arm>-startup-mem.jsonl: node-0/node-1 MemFree and /proc/vmstat's compaction, direct reclaim and THP-fallback
+#   counters (allocstall_* raw and summed), to tell reclaim from compaction if startup stalls;
+#   $OUT/<arm>-stacks.txt, once a minute: /proc/<server pid>/task/*/stack when readable (else one "not readable" line)
+#   plus each task's state, wchan and stime, from the server pid run_arm.sh logs ("server pid=N").
+startup_sampler() {  # <arm>
+    local arm=$1 mem=$OUT/$1-startup-mem.jsonl stacks=$OUT/$1-stacks.txt n=0 spid="" t
+    while :; do
+        awk -v utc="$(date -u +%FT%TZ)" -v n0="$(awk '$3 == "MemFree:" { print int($4 / 1024) }' /sys/devices/system/node/node0/meminfo)" \
+            -v n1="$(awk '$3 == "MemFree:" { print int($4 / 1024) }' /sys/devices/system/node/node1/meminfo)" '
+            /^(compact_stall|compact_fail|compact_success|pgscan_direct|pgsteal_direct|thp_fault_fallback|thp_collapse_alloc_failed) / { v[$1] = $2 }
+            /^allocstall_/ { v[$1] = $2; stall += $2 }
+            END { printf "{\"utc\": \"%s\", \"node0_memfree_mib\": %d, \"node1_memfree_mib\": %d, \"allocstall_sum\": %d", utc, n0, n1, stall
+                  for (k in v) printf ", \"%s\": %d", k, v[k]; print "}" }' /proc/vmstat >> "$mem"
+        [ -n "$spid" ] || spid=$(sed -n 's/^server pid=\([0-9]*\).*/\1/p' "$OUT/$arm-run_arm.log" 2>/dev/null | head -1)
+        if [ -n "$spid" ] && [ $((n % 6)) = 0 ] && [ -d "/proc/$spid" ]; then
+            {
+                echo "=== $(date -u +%FT%TZ) server pid $spid"
+                for t in /proc/"$spid"/task/*; do
+                    echo "--- task ${t##*/} $(awk '{ s = $0; sub(/.*\) /, "", s); split(s, f, " "); print "state=" f[1], "stime=" f[13] }' "$t/stat" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null) comm=$(cat "$t/comm" 2>/dev/null)"
+                    cat "$t/stack" 2>/dev/null || echo "    (stack not readable)"
+                done
+            } >> "$stacks"
+        fi
+        n=$((n + 1))
+        sleep 10
+    done
+}
 
 # PIDs this driver started, with their start times so a recycled PID is never killed.
 PIDS_FILE=$OUT/driver-pids.txt
@@ -249,14 +277,14 @@ check_modes() {  # <arm> <run_dir>: the setup line must show the arm's modes too
 
 run_one() {  # <arm> [KEY=VAL ...]
     local arm=$1; shift
-    local done_log=$OUT/$arm.done rc pid_c run errors sampled=0
+    local done_log=$OUT/$arm.done rc pid_c pid_s run errors sampled=0
     : > "$done_log"
     ports_free || return 1
     exl3_gate "$arm" "$WT" || return 1
     wait_for_quiet_box
     node0_gate "$arm" || return 1
     set -- "$@" $(tier_overrides)
-    say "arm $arm tier ${TIER_NAMES[$TIER_IDX]} worktree $WT at $SHA overrides: $*"
+    say "arm $arm tier $TIER_NAME worktree $WT at $SHA overrides: $*"
     [ "$arm" = "$FIRST_ARM" ] && memory_sample baseline-before-R0
     # 8>&- everywhere: no child may inherit (and outlive the driver holding) rowimg-disk.lock.
     setsid nohup taskset -c 20-23 nvidia-smi --query-gpu=timestamp,clocks.sm,clocks.max.sm --format=csv -lms 1000 \
@@ -269,10 +297,13 @@ run_one() {  # <arm> [KEY=VAL ...]
     EXPECT_SHA=$SHA DSV41_WORKTREE=$WT setsid bash "$RUN_ARM" "$arm" "$PORT" "$@" \
         > "$OUT/$arm-run_arm.log" 2>&1 < /dev/null 8>&- &
     ARM_PID=$!; track "$ARM_PID" "$arm run_arm.sh"
+    startup_sampler "$arm" < /dev/null 8>&- &
+    pid_s=$!; track "$pid_s" "$arm startup sampler"
     # Watch for run_arm.sh's "<arm> ready:" line to take the post-ready memory sample; run_arm.sh's own timeouts
     # (health 900 s, up to 12 warm-up rounds) are untouched.
     while kill -0 "$ARM_PID" 2>/dev/null; do
         if [ "$sampled" = 0 ] && grep -q "^$arm ready:" "$OUT/$arm-run_arm.log" 2>/dev/null; then
+            stop_pid "$pid_s"
             memory_sample "$arm-ready"; sampled=1
         fi
         sleep 5
@@ -281,6 +312,7 @@ run_one() {  # <arm> [KEY=VAL ...]
     ARM_PID=""
     echo "DRIVER DONE rc=$rc" >> "$done_log"
     stop_pid "$pid_c"
+    stop_pid "$pid_s"
     run=$(run_dir_of "$arm")
     say "arm $arm rc=$rc run: $run"
     [ "$sampled" = 1 ] || say "arm $arm: never logged 'ready'; no post-ready memory sample"
@@ -304,7 +336,7 @@ run_one R3 "${URING_R3[@]}"
 rc=$?
 r0=$(run_dir_of R0)
 r3=$(run_dir_of R3)
-say "tier that ran: ${TIER_NAMES[$TIER_IDX]} (0:${N0_MIB},1:${N1_MIB} / $((N0_MIB + N1_MIB)))"
+say "tier that ran: $TIER_NAME (0:${N0_MIB},1:${N1_MIB} / $((N0_MIB + N1_MIB)))"
 say "R0 run: $r0"
 say "R3 run: $r3"
 if [ "$rc" = 0 ]; then
@@ -318,7 +350,7 @@ def arm(run_dir, clocks_csv):
             'clocks': {'timed_window': m.clock_summary(clocks_csv, *m.timed_window_utc(run_dir)),
                        'session_start_end_mhz': m.session_clocks(run_dir)},
             'ram_miss': m.ram_miss(run_dir)}
-out = {'tier': '${TIER_NAMES[$TIER_IDX]} 0:${N0_MIB},1:${N1_MIB} / $((N0_MIB + N1_MIB))',
+out = {'tier': '$TIER_NAME 0:${N0_MIB},1:${N1_MIB} / $((N0_MIB + N1_MIB))',
        'R0': arm('$r0', '$OUT/R0-clocks.csv'), 'R3': arm('$r3', '$OUT/R3-clocks.csv'),
        'identical': m.identity('$r0', '$r3')}
 out['all_identical'] = all(out['identical'].values())
