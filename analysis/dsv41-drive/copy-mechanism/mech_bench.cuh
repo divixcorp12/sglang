@@ -15,6 +15,8 @@
 #include <cstring>
 #include <vector>
 
+#include <unistd.h>  // pread (the WC NVMe-write check)
+
 #include "moe/expert_stream/row_copy_kernels.cuh"  // copy_wait_read: the copy wait's own SM small-copy loop
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -427,6 +429,26 @@ inline bool launch_line(int g, int64_t touch, const Job* jobs, int64_t njobs, cu
   return false;
 }
 
+// The WC NVMe-write check's GPU reads: thread 0 of every block acquires `flag` (the host releases it once the
+// O_DIRECT read has returned), then the first half of the grid copies src -> dst_weak with plain weak loads and the
+// second half copies src -> dst_cv with .cv loads, S's pattern (one 16 B unit per thread per pass).
+__global__ __launch_bounds__(kThreads, 1) void nvme_check_kernel(const uint8_t* src, uint8_t* dst_weak, uint8_t* dst_cv,
+                                                                 int64_t bytes, const uint32_t* flag) {
+  if (threadIdx.x == 0)
+    while (ld_acquire(flag) == 0)
+      __nanosleep(100);
+  __syncthreads();
+  const int half = gridDim.x / 2;
+  const bool weak = static_cast<int>(blockIdx.x) < half;
+  const int b = static_cast<int>(blockIdx.x) % half;
+  uint8_t* dst = weak ? dst_weak : dst_cv;
+  for (int64_t u = static_cast<int64_t>(b) * kThreads + threadIdx.x; u < bytes / 16;
+       u += static_cast<int64_t>(half) * kThreads) {
+    const Vec<16> v = weak ? load<16, kLoadWeak>(src + 16 * u) : load<16, kLoadCv>(src + 16 * u);
+    store<16>(dst + 16 * u, v);
+  }
+}
+
 // Every copy kernel of this file behind one switch; Tasks 4 (kinds 2, 3) extend it.
 inline void launch(int64_t kind, const Job* jobs, int64_t njobs, int64_t grid, int64_t a, int64_t b, uint32_t* fresh,
                    cudaStream_t stream) {
@@ -615,6 +637,50 @@ int64_t mech_host_read_ns(int64_t src, int64_t bytes) {
     sum += p[i];
   const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
   asm volatile("" ::"r"(sum));
+  return ns;
+}
+
+// One trial of the WC NVMe-write check, on host `buf` (a slab of any kind):
+//   1. CPU stores `pattern` into every 8 B word of buf[0, length), then sfence;
+//   2. launch nvme_check_kernel (it waits on words[0]);
+//   3. pread(fd, buf, length, offset) with fd opened O_DIRECT: the NVMe DMA writes buf, with no CPU touch after;
+//   4. release words[0] (sfence first), and at once cudaMemcpyAsync buf -> dst_ce on a stream of its own;
+//   5. wait for both. Returns the pread's ns; throws unless it read exactly `length` bytes.
+int64_t mech_nvme_trial(tvm::ffi::TensorView words, int64_t buf, int64_t length, int64_t fd, int64_t offset,
+                        int64_t pattern, tvm::ffi::TensorView dst_weak, tvm::ffi::TensorView dst_cv,
+                        tvm::ffi::TensorView dst_ce, int64_t grid) {
+  static cudaStream_t ce_stream = [] {
+    cudaStream_t s;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)) << "ce stream";
+    return s;
+  }();
+  host::RuntimeCheck(length % 16 == 0 && grid % 2 == 0, "nvme trial: length a multiple of 16, grid even");
+  auto* w = static_cast<uint32_t*>(words.data_ptr());
+  __atomic_store_n(w, 0u, __ATOMIC_RELEASE);
+  auto* p = reinterpret_cast<uint64_t*>(buf);
+  for (int64_t i = 0; i < length / 8; ++i)
+    p[i] = static_cast<uint64_t>(pattern);
+#if defined(__x86_64__)
+  _mm_sfence();
+#endif
+  const auto stream = host::LaunchKernel::resolve_device(dst_weak.device());
+  host::LaunchKernel(static_cast<int>(grid), mech::kThreads, stream)(
+      mech::nvme_check_kernel, reinterpret_cast<const uint8_t*>(buf), static_cast<uint8_t*>(dst_weak.data_ptr()),
+      static_cast<uint8_t*>(dst_cv.data_ptr()), length, static_cast<const uint32_t*>(w));
+  const auto t0 = std::chrono::steady_clock::now();
+  const ssize_t got = ::pread(static_cast<int>(fd), reinterpret_cast<void*>(buf), static_cast<size_t>(length),
+                              static_cast<off_t>(offset));
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+#if defined(__x86_64__)
+  _mm_sfence();
+#endif
+  __atomic_store_n(w, 1u, __ATOMIC_RELEASE);
+  CHECK_CUDA(cudaMemcpyAsync(dst_ce.data_ptr(), reinterpret_cast<const void*>(buf), static_cast<size_t>(length),
+                             cudaMemcpyHostToDevice, ce_stream))
+      << "nvme trial CE copy";
+  CHECK_CUDA(cudaStreamSynchronize(ce_stream)) << "nvme trial CE";
+  CHECK_CUDA(cudaStreamSynchronize(stream)) << "nvme trial kernel";
+  host::RuntimeCheck(got == length, "pread returned ", static_cast<int64_t>(got), " of ", length, " bytes");
   return ns;
 }
 
