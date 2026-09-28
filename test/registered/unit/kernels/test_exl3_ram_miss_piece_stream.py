@@ -45,7 +45,7 @@ register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 from test_exl3_ram_miss_two_phase import hang_guard, running  # noqa: E402,F401  (the reused two-phase tests' fixtures)
 
 PAGE = 4096
-SUB_READS = 4
+SUB_READS = 4  # the most sub-reads a part is cut into (the C++ kSubReads)
 PIECES = ops.STAGE_PIECES
 ALIGN = 128
 
@@ -54,19 +54,31 @@ def _round_up(value, to):
     return -(-value // to) * to
 
 
-def _expected_sub_reads(part):
-    """Plan section 4.1, written out independently of the C++: len_k = round_up(ceil(len / 4), page)."""
+def _per_part(reading):
+    """Sub-reads per reading part of a row that reads ``reading`` nonzero parts (the C++ sub_reads_per_part): the
+    pieces shared out, at most SUB_READS. 1 or 2 -> 4 (the cut before N parts), 3 or 4 -> 2, 5 to 8 -> 1."""
+    return SUB_READS if reading <= 0 else min(SUB_READS, PIECES // reading)
+
+
+def _expected_sub_reads(part, per_part=SUB_READS):
+    """Plan section 4.1, written out independently of the C++: len_k = round_up(ceil(len / per_part), page)."""
     file, offset, length, dest = part
     if length <= 0:
         return []
-    len_k = _round_up(-(-length // SUB_READS), PAGE)
+    len_k = _round_up(-(-length // per_part), PAGE)
     return [(file, offset + at, min(len_k, length - at), dest + at) for at in range(0, length, len_k)]
 
 
+def _row_parts(tables, row, expert):
+    return [tables.extents[row, expert, p].tolist() for p in range(tables.extents.shape[2])]
+
+
 def _row_sub_reads(tables, row, expert):
+    parts = _row_parts(tables, row, expert)
+    per_part = _per_part(sum(length > 0 for _, _, length, _ in parts))
     out = []
-    for p in range(tables.extents.shape[2]):
-        out += [(p, k, sub) for k, sub in enumerate(_expected_sub_reads(tables.extents[row, expert, p].tolist()))]
+    for p, part in enumerate(parts):
+        out += [(p, k, sub) for k, sub in enumerate(_expected_sub_reads(part, per_part))]
     return out
 
 
@@ -78,10 +90,12 @@ def _assert_geometry(tables, row, expert):
     sub_reads, pieces = got
     expected = _row_sub_reads(tables, row, expert)
     assert [(s["part"], s["k"], (s["file"], s["offset"], s["length"], s["dest"])) for s in sub_reads] == expected
-    for p in range(tables.extents.shape[2]):
-        file, offset, length, dest = tables.extents[row, expert, p].tolist()
+    parts = _row_parts(tables, row, expert)
+    per_part = _per_part(sum(length > 0 for _, _, length, _ in parts))
+    assert len(sub_reads) <= PIECES
+    for p, (file, offset, length, dest) in enumerate(parts):
         mine = [s for s in sub_reads if s["part"] == p]
-        assert len(mine) <= SUB_READS
+        assert len(mine) <= per_part
         for s in mine:
             assert s["offset"] % PAGE == 0 and s["dest"] % PAGE == 0 and s["length"] % PAGE == 0 and s["length"] > 0
         # They tile the part: contiguous, in order, covering it exactly.
@@ -147,10 +161,20 @@ def _synthetic_tables(seed, *, experts=8, parts=2):
         pages = _round_up(start + need_end, PAGE) // PAGE
         if parts == 1:
             split_pages = [pages]
-        else:
+        elif parts == 2:
             # Row 0 is split evenly, so the layout always has a row with every sub-read.
             first = pages // 2 if r == 0 else rng.choice([0, pages, 1, pages - 1, rng.randrange(pages + 1)])
             split_pages = [first, pages - first]
+        elif r == 0:
+            split_pages = [pages // parts] * (parts - 1) + [pages - pages // parts * (parts - 1)]
+        else:
+            # Any cut, and every third row gives one part's pages to its neighbour (a 0 share, or a rounding).
+            cuts = sorted(rng.randrange(pages + 1) for _ in range(parts - 1))
+            split_pages = [b - a for a, b in zip([0] + cuts, cuts + [pages])]
+            if r % 3 == 1:
+                z = rng.randrange(parts)
+                split_pages[(z + 1) % parts] += split_pages[z]
+                split_pages[z] = 0
         dest = 0
         for p, n in enumerate(split_pages):
             extents[r // experts, r % experts, p] = torch.tensor([p, base + dest, n * PAGE, dest])
@@ -173,7 +197,7 @@ def _synthetic_tables(seed, *, experts=8, parts=2):
 
 
 @pytest.mark.parametrize("seed", range(12))
-@pytest.mark.parametrize("parts", [1, 2])
+@pytest.mark.parametrize("parts", [1, 2, 3, 4, 8])
 def test_u1_geometry_of_every_row_of_a_random_layout(seed, parts):
     tables = _synthetic_tables(seed, parts=parts)
     counts = set()
@@ -181,20 +205,81 @@ def test_u1_geometry_of_every_row_of_a_random_layout(seed, parts):
         for expert in range(tables.extents.shape[1]):
             sub_reads, _ = _assert_geometry(tables, row, expert)
             counts.add(len(sub_reads))
-    assert max(counts) == SUB_READS * parts  # the layout has rows long enough for every sub-read
+    # Row 0 is split evenly and long enough for every sub-read: 4, 8, 6, 8, 8 of them.
+    assert max(counts) == _per_part(parts) * parts
 
 
 @pytest.mark.parametrize(
     "weights, dims",
     [(None, {}), ((1.0, 1.0), {}), ((0.0, 1.0), {}), ((1.0, 1.0), dict(hidden=256, inter=512)),
-     ((3.0, 1.0), dict(hidden=256, inter=512)), (None, dict(hidden=256, inter=512))],
-    ids=["one_part", "halves", "zero_first_part", "large_halves", "small_last_part", "large_one_part"],
+     ((3.0, 1.0), dict(hidden=256, inter=512)), (None, dict(hidden=256, inter=512)),
+     ((1.0, 1.0, 1.0), dict(hidden=256, inter=512)), ((3.0, 1.0, 2.0), dict(hidden=256, inter=512)),
+     ((1.0, 0.0, 1.0), dict(hidden=256, inter=512)), ((1.0,) * 4, dict(hidden=256, inter=512)),
+     ((1.0,) * 8, dict(hidden=256, inter=512))],
+    ids=["one_part", "halves", "zero_first_part", "large_halves", "small_last_part", "large_one_part",
+         "thirds", "uneven_thirds", "zero_middle_third", "quarters", "eighths"],
 )
 def test_u1_geometry_of_every_row_of_a_real_layout(tmp_path, weights, dims):
     s = ram_miss_setup(tmp_path, capacity=2, mirror_weights=weights, **dims)
     for row in range(s.tables.extents.shape[0]):
         for expert in range(s.tables.extents.shape[1]):
             _assert_geometry(s.tables, row, expert)
+
+
+def _one_row_tables(part_pages):
+    """One layer, one expert, one segment spanning the row: part p reads part_pages[p] pages of file p, in order."""
+    parts = len(part_pages)
+    total = sum(part_pages) * PAGE
+    extents = torch.zeros((1, 1, parts, 4), dtype=torch.int64)
+    dest = 0
+    for p, pages in enumerate(part_pages):
+        extents[0, 0, p] = torch.tensor([p, dest, pages * PAGE, dest])
+        dest += pages * PAGE
+    return SimpleNamespace(
+        extents=extents,
+        starts=torch.zeros((1, 1), dtype=torch.int64),
+        file_sizes=torch.tensor([total] * parts, dtype=torch.int64),
+        segments=torch.tensor([(0, 0, 0, total)], dtype=torch.int64),
+        slabs=torch.zeros((1, 1), dtype=torch.int64),
+        row_bytes=torch.tensor([total], dtype=torch.int64),
+        paths=[f"/nonexistent/{p}" for p in range(parts)],
+        source_paths=["/nonexistent/source"] * parts,
+        slot_bytes=total,
+    )
+
+
+def _assert_empty_past(pieces, n):
+    """Pieces 0..n-1 have bytes and dependencies; pieces n..7 have neither, so the reader publishes them at admission."""
+    assert all(piece["deps"] != 0 for piece in pieces[:n])
+    assert all(piece["deps"] == 0 and all(lo == hi for lo, hi in piece["runs"]) for piece in pieces[n:])
+
+
+@pytest.mark.parametrize("parts, per_part", [(1, 4), (2, 4), (3, 2), (4, 2), (5, 1), (8, 1)])
+def test_a_row_reading_every_part_cuts_each_into_its_share_of_the_pieces(parts, per_part):
+    sub_reads, pieces = piece_geometry(_one_row_tables((8,) * parts), 0, 0)
+    assert [sum(s["part"] == p for s in sub_reads) for p in range(parts)] == [per_part] * parts
+    assert [(s["part"], s["k"]) for s in sub_reads] == [(p, k) for p in range(parts) for k in range(per_part)]
+    _assert_empty_past(pieces, parts * per_part)
+
+
+@pytest.mark.parametrize(
+    "part_pages, per_part",
+    [((8, 0, 8), 4), ((0, 8, 8), 4), ((8, 8, 0), 4), ((8, 0, 0), 4), ((8, 8, 8), 2), ((8, 1, 8), 2), ((1, 1, 1), 2),
+     ((8, 8, 8, 0), 2), ((8, 0, 8, 0), 4)],
+)
+def test_a_zero_part_gives_its_pieces_to_the_parts_that_read(part_pages, per_part):
+    """A zero-length part (a 0 mirror weight, or a rounding) reads nothing and does not count: the reading parts share
+    all eight pieces. A part shorter than its share in pages is cut into fewer sub-reads, never an empty one."""
+    tables = _one_row_tables(part_pages)
+    sub_reads, pieces = piece_geometry(tables, 0, 0)
+    counts = [sum(s["part"] == p for s in sub_reads) for p in range(len(part_pages))]
+    assert counts == [min(per_part, pages) for pages in part_pages]
+    _assert_empty_past(pieces, len(sub_reads))
+    _assert_geometry(tables, 0, 0)
+
+
+def test_nine_parts_cannot_be_cut():
+    assert piece_geometry(_one_row_tables((1,) * 9), 0, 0) is None
 
 
 def test_u1_the_geometry_is_what_the_reader_reads(tmp_path):
