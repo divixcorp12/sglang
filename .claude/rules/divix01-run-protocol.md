@@ -116,9 +116,10 @@ result is only meaningful next to the restored baseline.
 ## CPU and cores
 
 Every CPU job runs under `taskset -c 0-63` with threads capped
-(`OMP_NUM_THREADS`). Cores 64-71 stay free: core 71 is production's doorbell
-spin core. GPU work runs under `cc-gpu.lock` on cores 32-63, never as a bare
-command. Two ways, both on divix01:
+(`OMP_NUM_THREADS`). Cores 64-71 stay free: NVMe completion interrupts are
+pinned there, and the RAM-miss path reads rows from NVMe. GPU work runs under
+`cc-gpu.lock` on cores 32-63, never as a bare command. Two ways, both on
+divix01:
 
 - `/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/gpu-run.sh <cmd>`
   (not in any repo). It retries the lock every 60 s and **gives up after 30 min

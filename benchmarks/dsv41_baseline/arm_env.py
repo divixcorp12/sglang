@@ -83,7 +83,7 @@ MAX_TOKENS = 128
 # Driver cores 8-15 are node 0 too and are excluded here so the two never overlap.
 SERVER_CORES = "0-7,16-17,36-53"
 DRIVER_CORES = "8-15"
-FREE_CORES = "64-71"  # never touched; core 71 is production's doorbell spin core.
+FREE_CORES = "64-71"  # never touched; NVMe completion interrupts are pinned there.
 
 # Host-memory budget, resized 2026-09-22. The server's threads all sit on NUMA node 0
 # (see SERVER_CORES), so the pinned buffer plus the weights must fit in node 0's free
