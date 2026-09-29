@@ -16,6 +16,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #if defined(IO_URING_VERSION_MAJOR) && \
     (IO_URING_VERSION_MAJOR > 2 || (IO_URING_VERSION_MAJOR == 2 && IO_URING_VERSION_MINOR >= 10))
@@ -90,7 +91,9 @@ class UringReader {
       try {
         if (outstanding_ != 0) drain(outstanding_);
       } catch (...) {
-        std::terminate();  // Never let a caller free memory that the kernel might still own.
+        // A refused NOP drain throws after closing the ring with nothing left in the kernel: safe to go on. Anything
+        // else might leave memory the kernel still owns, so never let the caller free it.
+        if (ready_ || outstanding_ != 0) std::terminate();
       }
       close_ring();
       if (options_.diagnostics && fixed_reads_ != 0) report_fixed();
@@ -311,6 +314,13 @@ class UringReader {
   void set_nop_flush_refused(bool refused) {
     nop_flush_refused_ = refused;
   }
+  // Test only: publishes the prepared SQEs to the kernel's SQ tail without entering the kernel, as liburing's submit
+  // does before an io_uring_enter that then fails. drain() must treat them as unconsumed and NOP them too.
+  void publish_sq_without_enter() {
+    if (options_.sqpoll()) throw std::logic_error("publish_sq_without_enter needs a ring without SQPOLL");
+    ring_.sq.sqe_head = ring_.sq.sqe_tail;
+    __atomic_store_n(ring_.sq.ktail, ring_.sq.sqe_tail, __ATOMIC_RELEASE);
+  }
 
   // Test only (fault word 30 bit 1, through FaultyReader): the next reset in drain() (a refused NOP drain outside
   // the fixed read modes) fails as if create_ring() had, after closing the old ring. Fires once.
@@ -513,14 +523,19 @@ class UringReader {
     }
     int refused = nop_flush_refused_ ? -EIO : 0;
     nop_flush_refused_ = false;
-    unsigned soft = 0;
+    // EAGAIN (no request memory), EBUSY and EINTR are transient: retry with a backoff for up to kNopRetryWindow, well
+    // under fatal_wait, before refusing (a refusal fail-stops a fixed read mode).
+    const auto give_up = std::chrono::steady_clock::now() + kNopRetryWindow;
+    auto backoff = std::chrono::microseconds(10);
     while (refused == 0 && io_uring_sq_ready(&ring_) != 0) {
       const int rc = io_uring_submit(&ring_);
       if (rc >= 0) continue;
-      if (!soft_error(rc) || ++soft > kNopSoftRetries)
+      if (!soft_error(rc) || std::chrono::steady_clock::now() >= give_up) {
         refused = rc;
-      else
-        spin_hint();
+      } else {
+        std::this_thread::sleep_for(backoff);
+        backoff = std::min(backoff * 2, std::chrono::microseconds(10000));
+      }
     }
     const unsigned unconsumed = io_uring_sq_ready(&ring_);
     while (outstanding_ > unconsumed)
@@ -579,8 +594,10 @@ class UringReader {
   uint64_t registrations_ = 0;  // register_resources() calls (registrations())
   bool reset_fail_ = false;  // test only (set_ring_reset_fail)
   bool nop_flush_refused_ = false;                  // test only (set_nop_flush_refused)
-  static constexpr uint64_t kNopTag = ~uint64_t{0};  // a discarded SQE's user_data (drain retires it unread)
-  static constexpr unsigned kNopSoftRetries = 64;    // EINTR/EAGAIN/EBUSY on the NOP submit, then refuse
+  // A discarded SQE's user_data (drain retires it unread). Not ~0: that is liburing's LIBURING_UDATA_TIMEOUT, whose
+  // CQEs its peek swallows on kernels without IORING_FEAT_EXT_ARG.
+  static constexpr uint64_t kNopTag = ~uint64_t{0} - 1;
+  static constexpr std::chrono::milliseconds kNopRetryWindow{2000};  // soft errors on the NOP submit, then refuse
 };
 
 static_assert(AsyncFileReader<UringReader>);

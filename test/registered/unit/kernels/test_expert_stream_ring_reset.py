@@ -102,7 +102,7 @@ bool untouched(const Fixture& fx, size_t row) {
 
 int main(int argc, char** argv) {
   try {
-    require(argc == 3, "usage: harness <dir> unconsumed|mixed|refused|refused_fail");
+    require(argc == 3, "usage: harness <dir> unconsumed|mixed|published|refused|refused_fail|refused_close");
     const std::string scenario = argv[2];
     Fixture fx(argv[1]);
     UringReader reader;
@@ -120,6 +120,16 @@ int main(int argc, char** argv) {
       first_abandoned = 2;
     }
     for (size_t row = first_abandoned; row < 4; ++row) prep(reader, fx, row);
+    // `published`: the SQEs reach the kernel's tail (a failed io_uring_enter after liburing's flush), unconsumed.
+    if (scenario == "published") reader.publish_sq_without_enter();
+    if (scenario == "refused_close") {
+      // close() with reads still unsubmitted drains them; a refused NOP drain in a fixed mode throws after closing the
+      // ring, and close() (noexcept) must finish instead of terminating.
+      reader.set_nop_flush_refused(true);
+      reader.close();
+      std::cout << "READY " << reader.ready() << "\nCLOSED\n";
+      return 0;
+    }
     if (scenario == "refused" || scenario == "refused_fail") reader.set_nop_flush_refused(true);
     if (scenario == "refused_fail") reader.set_ring_reset_fail(true);
 
@@ -199,7 +209,7 @@ def _value(stdout, key):
     return match[1]
 
 
-@pytest.mark.parametrize("scenario", ["unconsumed", "mixed"])
+@pytest.mark.parametrize("scenario", ["unconsumed", "mixed", "published"])
 @pytest.mark.parametrize("read_mode", ["normal", "fixed", "readv_fixed"])
 def test_discarding_unconsumed_sqes_keeps_the_ring_and_its_registrations(harness, tmp_path, scenario, read_mode):
     stdout, output = _run(harness, tmp_path, scenario, read_mode)
@@ -229,4 +239,10 @@ def test_a_refused_nop_drain_in_a_fixed_mode_throws_instead_of_re_registering(ha
 def test_a_failed_fallback_reset_raises_and_leaves_the_reader_closed(harness, tmp_path):
     stdout, output = _run(harness, tmp_path, "refused_fail", "normal")
     assert "RAISED io_uring ring reset failed" in stdout, output
+    assert _value(stdout, "READY") == "0" and stdout.rstrip().endswith("CLOSED"), output
+
+
+@pytest.mark.parametrize("read_mode", ["normal", "readv_fixed"])
+def test_close_with_unsubmitted_reads_survives_a_refused_nop_drain(harness, tmp_path, read_mode):
+    stdout, output = _run(harness, tmp_path, "refused_close", read_mode)
     assert _value(stdout, "READY") == "0" and stdout.rstrip().endswith("CLOSED"), output
