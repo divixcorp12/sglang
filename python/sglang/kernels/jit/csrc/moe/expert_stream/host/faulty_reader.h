@@ -14,6 +14,9 @@ class FaultyReader {
     if constexpr (requires(Inner& reader) { reader.set_ring_reset_fail(true); }) {
       inner_.set_ring_reset_fail(fault.ring_reset_fail);
     }
+    if constexpr (requires(Inner& reader) { reader.set_nop_flush_refused(true); }) {
+      inner_.set_nop_flush_refused(fault.nop_flush_refused);
+    }
   }
   bool init(unsigned depth) {
     return inner_.init(depth);

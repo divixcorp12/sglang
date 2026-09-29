@@ -158,15 +158,29 @@ def test_one_failing_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_path,
 
 @pytest.mark.parametrize("submit_first", [False, True], ids=["unconsumed", "in_flight"])
 @pytest.mark.parametrize("read_mode", ["fixed", "readv_fixed"])
-def test_ring_reset_mid_fan_out(tmp_path, uring_env, read_mode, submit_first):
+def test_ring_reset_mid_fan_out(tmp_path, uring_env, capfd, read_mode, submit_first):
     s = _setup(tmp_path)
-    uring_env(READ_MODE=read_mode, FIXED_FILES=1)
-    # The first submit fails with a fanned-out read's legs prepared: either none reached the kernel (drain resets the
-    # ring and must re-create the sparse table, re-add every chunk and re-register the files) or all did (drain waits
-    # for every leg). Either way the clean second read on the same reader succeeds.
+    uring_env(READ_MODE=read_mode, FIXED_FILES=1, DIAGNOSTICS=1)
+    # The first submit fails with a fanned-out read's legs prepared: either none reached the kernel (drain rewrites
+    # them as NOPs on the same ring) or all did (drain waits for every leg). Either way the clean second read on the
+    # same reader succeeds, and the tier was registered exactly once: the diagnostics line (register_ms=) prints once
+    # per registration, and a ring reset would print it again (plan 2026-09-29-ring-reset-nop-drain).
     first, then = _supported(lambda: read_rows_with_fault(
         s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], submit_error=errno.EIO, submit_call=1, submit_first=submit_first, fixed_chunk_cap=CAP))
     assert (first, then) == (0, 1)
+    assert capfd.readouterr().err.count("register_ms=") == 1
+
+
+def test_a_refused_nop_drain_through_the_reader(tmp_path, uring_env, capfd):
+    # Fault word 30 bit 0 on the default read mode: the drain's NOP submission is refused, so the reader resets its
+    # ring and registers (its fixed files) again. The read fails once and the same reader's next read is clean.
+    s = _setup(tmp_path)
+    uring_env(FIXED_FILES=1, DIAGNOSTICS=1)
+    first, then = read_rows_with_fault(
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], submit_error=errno.EIO, submit_call=1,
+        nop_flush_refused=True)
+    assert (first, then) == (0, 1)
+    assert capfd.readouterr().err.count("register_ms=") == 2
 
 
 @pytest.mark.parametrize("weights", [(1.0, 1.0, 1.0), (1.0, 0.0, 1.0)], ids=["three", "zero_mid"])
@@ -218,8 +232,8 @@ except RuntimeError as e:
 
 @pytest.mark.parametrize("read_mode", ["normal", "readv_fixed"])
 def test_a_failed_ring_reset_raises_its_reason_instead_of_aborting(tmp_path, uring_env, read_mode):
-    # Final review Important 2. The first submit fails with every SQE still unconsumed, so the failure-path drain
-    # resets the ring, and fault word 30 (ring_reset_fail) makes that reset fail. read() must rethrow "io_uring ring
+    # Final review Important 2. The first submit fails with every SQE still unconsumed, and fault word 30
+    # (ring_reset_fail) refuses the drain's NOP submission and fails the reset that follows in the default mode. read() must rethrow "io_uring ring
     # reset failed" to its caller; before the fix Quiesce's second drain saw a stale pending count and called
     # std::terminate, losing the reason. The default mode is here too: the reset is not a fixed-mode feature. The
     # read runs in a child, because an abort is a signal, not an exception. The reader is then destroyed (close())
@@ -232,7 +246,9 @@ def test_a_failed_ring_reset_raises_its_reason_instead_of_aborting(tmp_path, uri
     if "unsupported by the running kernel" in child.stdout or "requires liburing 2.10" in child.stdout:
         pytest.skip(child.stdout)
     assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
-    assert "RAISED" in child.stdout and "io_uring ring reset failed" in child.stdout, child.stdout
+    # A fixed read mode never resets (plan 2026-09-29-ring-reset-nop-drain): the refused NOP drain throws its own cause.
+    reason = "io_uring ring reset failed" if read_mode == "normal" else "refused the NOP drain"
+    assert "RAISED" in child.stdout and reason in child.stdout, child.stdout
     assert child.stdout.rstrip().endswith("CLOSED"), child.stdout
 
 
