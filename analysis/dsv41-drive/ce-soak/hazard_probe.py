@@ -58,7 +58,7 @@ def main() -> int:
     from test_exl3_piece_stream_cuda import StreamService
 
     tmp = Path(tempfile.mkdtemp(prefix="ce-hazard-probe-", dir="/mnt/nvme1/pytest-tmp"))
-    s = StreamService(tmp, copy_engine=True, timeout_ms=3000)
+    s = StreamService(tmp, copy_engine=True, timeout_ms=3000, variant="instr")  # copy_engine_ballast is instr-only
     src = torch.empty(256 << 20, dtype=torch.uint8).pin_memory()
     dst = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
     cudart = torch.cuda.cudart()

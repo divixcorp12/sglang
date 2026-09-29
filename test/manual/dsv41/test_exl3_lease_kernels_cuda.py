@@ -727,7 +727,9 @@ class TestServiceEndToEnd:
             _cuda_ready()
             assert s.keep.item() == 1.0 and s.dev.go_count.item() == 2
             _delivered(s, [3, 5])
-            assert s.until(lambda: s.host.counters()["advisories"] >= 1 and s.host.contains(1, 9) and s.host.contains(1, 10))
+            # contains() is true from the slot claim, before the advisory's read lands: wait on the landed rows instead.
+            assert s.until(lambda: s.host.counters()["advisory_rows"] == 2)
+            assert s.host.contains(1, 9) and s.host.contains(1, 10)
             assert s.until(lambda: s.host.counters()["leases_acked"] == 4), s.host.counters()
             counters = s.host.counters()
             assert counters["advisory_rows"] == 2 and counters["leases_granted"] == 4, counters  # the advisory took no lease

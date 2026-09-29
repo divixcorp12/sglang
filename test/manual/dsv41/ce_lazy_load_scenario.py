@@ -45,7 +45,8 @@ def main() -> int:
     side = torch.cuda.Stream()
 
     (tmp / "svc").mkdir(exist_ok=True)
-    s = StreamService(tmp / "svc", copy_engine=True, timeout_ms=3000)
+    # Outside pytest nothing picks the instrumented build, and copy_engine_ballast exists only there.
+    s = StreamService(tmp / "svc", copy_engine=True, timeout_ms=3000, variant="instr")
     src = torch.empty(256 << 20, dtype=torch.uint8).pin_memory()
     dst = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
     try:

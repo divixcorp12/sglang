@@ -151,9 +151,10 @@ class TestRealServiceFailures:
             _cuda_ready()
             assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
             counters = s.host.counters()
-            # Not vacuous: the two rows before the failure really did pack, and the failed row never did.
+            # Not vacuous: the two rows before the failure really did pack. The failed row's slot is not asserted:
+            # O_DIRECT lands a row image in its slot directly, and an injected part error replaces the completion's
+            # result, not the bytes. The invariant is that it is never published (rows_read, contains, leases below).
             assert _slab_holds(s, 3, want) and _slab_holds(s, 5, want), "rows 0 and 1 packed before row 2 failed"
-            assert not _slab_holds(s, 7, want), "the failing row never packed"
             # The property: nothing published, so the device refused the whole request and nothing was copied.
             assert counters["read_errors"] == 1 and counters["rows_read"] == 0, counters
             assert s.keep.item() == 0.0 and s.dev.go_count.item() == 0

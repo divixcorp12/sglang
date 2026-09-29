@@ -143,11 +143,14 @@ class StreamService:
     chain is
     post -> W1 -> C1 -> A1 -> S -> A2 -> F; flag off, today's post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F.
     ``layers`` streamed layers are built and every request goes to streamed row ``row``. ``copy_engine`` enables and
-    arms the service's copy engine (LEASE_PROTOCOL.md 7.6), posts with its flag and adds the copy wait before F."""
+    arms the service's copy engine (LEASE_PROTOCOL.md 7.6), posts with its flag and adds the copy wait before F.
+    ``variant`` is the host build (ExpertStreamHost's ``variant``); None follows host_variant(), which the manual
+    conftest sets to "instr" under pytest. A script outside pytest that calls a test-only export (copy_engine_ballast)
+    passes "instr"."""
 
     def __init__(
         self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, layers=LAYERS,
-        row=0, copy_engine=False, native_prefetch=False, sm_small=False, mirror_weights=None,
+        row=0, copy_engine=False, native_prefetch=False, sm_small=False, mirror_weights=None, variant=None,
     ):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
@@ -174,7 +177,7 @@ class StreamService:
             self.tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp_path, mirror_weights)
             self.page = new_page(pin=True)
             self.slot_map = torch.full((layers, EXPERTS), -1, dtype=torch.int32).pin_memory()
-            self.host = ExpertStreamHost(self.tables, page=self.page, slot_map=self.slot_map)
+            self.host = ExpertStreamHost(self.tables, page=self.page, slot_map=self.slot_map, variant=variant)
             self.host.enable_lease_mode()
             self.host.enable_two_phase()
             if piece_stream:
