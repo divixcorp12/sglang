@@ -19,7 +19,8 @@ Options (all measurements; nothing here is production code):
   --madvise hugepage   madvise(MADV_HUGEPAGE) on each mapping before the fault (defrag=madvise then compacts)
   --madvise nohugepage madvise(MADV_NOHUGEPAGE) on each mapping before the fault: 4 KiB pages only
   --strategies ...     re-register the same faulted tier other ways (see strategy_items): order, clone,
-                       clone-rowsplit, prod
+                       clone-rowsplit, prod. WARNING: the clone strategies leak page pins on divix01's
+                       6.12.0-211 kernel (results.md); the memory stays stranded until a reboot. Do not run them.
   --inject K           MADV_NOHUGEPAGE on one 2 MiB piece in each of K evenly spaced chunks: K mixed chunks
   --repair refault     after the fault, MADV_DONTNEED + re-touch every non-THP 2 MiB range (with MADV_HUGEPAGE)
   --repair collapse    after the fault, MADV_COLLAPSE every non-THP 2 MiB range
@@ -171,7 +172,7 @@ _STRATEGY_SOURCE = r"""
 using Clock = std::chrono::steady_clock;
 
 // Registers items (base, len) as one buffer each, in the given order, into a sparse table of n slots.
-// clone == 0: RegisteredBufferTable(false)::add straight into the ring (production's call before the clone fix).
+// clone == 0: RegisteredBufferTable::add straight into the ring (production's call).
 // clone == 1: each item is registered alone into slot 0 of a scratch ring, whose pin accounting then scans only
 // itself, and cloned into slot i of the ring (IORING_REGISTER_CLONE_BUFFERS, DST_REPLACE); the scratch slot is
 // emptied again. Returns the items registered; out_ms gets each one's time.
@@ -181,7 +182,7 @@ extern "C" int register_items(unsigned n, const uint64_t* base, const uint64_t* 
     io_uring ring, scratch;
     int rc = io_uring_queue_init(8, &ring, 0);
     if (rc) { std::snprintf(error, error_len, "ring: %s", std::strerror(-rc)); return -1; }
-    sglang::io::RegisteredBufferTable table(false);  // clone == 1 does its own cloning below
+    sglang::io::RegisteredBufferTable table;  // direct; clone == 1 does its own cloning below
     if (!table.init(&ring, n)) {
       std::snprintf(error, error_len, "sparse: %s", table.last_error_context().c_str());
       io_uring_queue_exit(&ring);
@@ -301,7 +302,6 @@ def main() -> int:
     ap.add_argument("--repair", choices=["none", "refault", "collapse"], default="none")
     ap.add_argument("--fault", choices=["touch", "none"], default="touch")
     ap.add_argument("--no-register", action="store_true")
-    ap.add_argument("--direct", action="store_true", help="register directly (the table's pre-clone path)")
     ap.add_argument("--abort-s", type=float, default=600)
     ap.add_argument("--workdir", default="/mnt/nvme1/thp-fallback")
     ap.add_argument("--label", default="")
@@ -414,7 +414,7 @@ def main() -> int:
         t = time.monotonic()
         done = lib.register_regions(n, arr(r[0] for r in regions), arr(r[1] for r in regions),
                                     arr(r[2] for r in regions), cap, ob, ol, oms, ctypes.byref(planned),
-                                    args.abort_s * 1000.0, error, 512, int(not args.direct))
+                                    args.abort_s * 1000.0, error, 512)
         result["register_s"] = time.monotonic() - t
         result["register_error"] = error.value.decode()
         result["chunks_registered"] = done

@@ -11,7 +11,7 @@ probe() { taskset -c 32-63 "$PY" analysis/dsv41-drive/thp-fallback/thp_probe.py 
 run() {
   numastat -m | grep -E 'MemFree|AnonHuge'
   case $sweep in
-    # Main registration: the production table (clones since the fix); strategy prod: the same layout, direct.
+    # WARNING: --strategies clone* leaks page pins on this kernel (results.md); strategies prod/order/cap* are safe.
     inject) for k in 0 1 2 4 8 15; do
       probe --gib 16 --madvise hugepage --inject "$k" --strategies prod --label "inject$k" "$@"; done ;;
     size) for g in 4 8 12 16; do probe --gib "$g" --madvise hugepage --inject 999 --label "size$g-allmixed" "$@";
