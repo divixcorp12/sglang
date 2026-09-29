@@ -105,11 +105,11 @@ def owner_span(owner) -> tuple[int, int]:
     return base, base + -(-owner.nbytes // HUGE) * HUGE
 
 
-def plan(regions) -> list[tuple[int, int]]:
-    """(base, length) of every registered chunk, as plan_chunks cuts them (row-aligned, <= 1 GiB)."""
+def plan(regions, cap: int = GIB) -> list[tuple[int, int]]:
+    """(base, length) of every registered chunk, as plan_chunks cuts them (row-aligned, <= cap)."""
     chunks = []
     for base, nbytes, row in regions:
-        step = (GIB // row) * row
+        step = (cap // row) * row
         chunks += [(base + at, min(step, nbytes - at)) for at in range(0, nbytes, step)]
     return chunks
 
@@ -263,6 +263,9 @@ def strategy_items(name: str, chunks_rows, model) -> list[tuple[int, int]]:
             else:
                 items.append((b, n))
         return items
+    if name.startswith(("cap", "clone-cap")):  # every region cut at a smaller row-aligned cap (MiB), THP-blind
+        cap = int(name.rsplit("cap", 1)[1]) * MIB
+        return [item for b, n, row in chunks_rows for item in plan([(b, n, row)], cap)]
     raise ValueError(name)
 
 

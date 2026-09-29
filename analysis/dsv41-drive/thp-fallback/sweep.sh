@@ -15,7 +15,7 @@ run() {
     size) for g in 4 8 12 16; do probe --gib "$g" --madvise hugepage --inject 999 --label "size$g-allmixed" "$@";
                                   probe --gib "$g" --madvise hugepage --label "size$g-clean" "$@"; done ;;
     strategies) T=0:61440,1:40960
-      probe --placement $T --strategies order,clone,clone-rowsplit --label "full-none-strategies" "$@"
+      probe --placement $T --strategies order,cap64,clone,clone-rowsplit,clone-cap64,clone-cap256,prod --label "full-none-strategies" "$@"
       probe --placement $T --madvise nohugepage --label "full-nohugepage" "$@" ;;
     inject-rerun) for k in 1 2 4; do probe --gib 16 --madvise hugepage --inject "$k" --label "inject$k" "$@"; done ;;
     # The production tier's split. Order matters: MADV_HUGEPAGE compacts, which changes what the next run finds.
