@@ -9,6 +9,7 @@ commit_lens follows the DSpark contract: accepted drafts + bonus (a + 1); the bo
 the next block's anchor, so the history takes anchor + a drafts.
 """
 
+import os
 import random
 from types import SimpleNamespace
 
@@ -183,3 +184,16 @@ def test_oracle_matches_plain_decode():
         got = h(torch.tensor([seq[i]]), fb)
         toks, blk = _oracle_tokens(seq, i, 1)
         assert torch.equal(got[0], _oracle_hash(h, toks, blk)[0]), i
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1",
+    reason="Triton kernels on CPU need TRITON_INTERPRET=1 set before import",
+)
+@pytest.mark.parametrize("seed", range(3))
+def test_triton_kernel_path_matches_oracle(seed, monkeypatch):
+    """Same scenario through engram_hash_ids / engram_commit_history (interpreter)."""
+    import sglang.srt.layers.engram as engram
+
+    monkeypatch.setattr(engram, "_cuda_kernels", lambda t: True)
+    _run([1, 2, 3, 6], steps=6, seed=seed)
