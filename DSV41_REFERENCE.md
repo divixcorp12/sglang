@@ -48,6 +48,11 @@ three mirror roots, always uses row images and lease mode (the packed path, its 
 `MEM_FRACTION_STATIC` 0.885, hot cache 15400 MB and context 131072 on NVIDIA driver 615.71.09 (§29.11). The last
 merge, the copy thread's completion word (§29.9), went in without review or a decode A/B.
 
+**Update (2026-09-29, evening):** the copy wait is stream-ordered and no longer spins (§29.14). The recipe runs at
+`MEM_FRACTION_STATIC` 0.875 and hot cache 16080 MB (§29.15). It warms the prefill Triton variants at startup (§29.16),
+serves `--language-model-only` without the empty vision tower (§29.18), and backs HiCache with a ~9 GB host pool on
+the direct IO backend (§29.19). A grammar request no longer crashes the single-GPU server (§29.17).
+
 Sections 1 to 15 preserve the original September 18 scoping. Sections 16 to 22 record
 dated experiments; **§23 is the current recipe and progress ledger**, with §24 its
 2026-09-24 addendum. Together they supersede earlier present-tense plans or defaults
@@ -4955,6 +4960,7 @@ poisoned bytes change the output, the true bytes restore it bitwise (parity file
 **The production recipe reused no prefix for a returning 4k-token conversation.** The hierarchical cache (HiCache)
 restores it, at about 50x lower revisit TTFT, and is now in the recipe (`arm_env.ServerArgs.argv`):
 `--enable-hierarchical-cache --hicache-ratio 2 --hicache-size 0 --hicache-write-policy write_through`.
+(Superseded 2026-09-29: ratio 14 with `page_first_direct`, which resolves to the direct IO backend, §29.19.)
 
 **Single-turn benchmark: no effect.** The standard arm with the HiCache flags ran at ratio 1.004 against the recipe,
 byte-identical. It is compatible with the DSV4 pools, adding ~0.7 GB of host pools. A single-turn arm never revisits a
@@ -5565,7 +5571,7 @@ Decode figures are pooled ms/token over `run_arm.sh`'s 2 timed sessions (90 deco
 campaign's noise bar is ±1.5 ms/token, so sub-millisecond deltas below are noise. The arms ran at different tiers and
 memory fractions, so compare figures only within the pair or set that produced them.
 
-**What the recipe runs now** (`benchmarks/dsv41_baseline/arm_env.py` at `0473d52f00`):
+**What the recipe runs now** (`benchmarks/dsv41_baseline/arm_env.py` at `1b8380eb6c`):
 
 | Setting | Value | Since | Where |
 |---|---|---|---|
@@ -5575,7 +5581,11 @@ memory fractions, so compare figures only within the pair or set that produced t
 | `SGLANG_DSV41_ENABLE_LEASE_PDL` | 1 | 2026-09-28 | §29.2 |
 | `SGLANG_EXPERT_STREAM_URING_*` | not set, so defaults: `MODE=default`, `READ_MODE=normal`, `FIXED_FILES=0`, `SLAB_ARENA=0`, `READ_CUTS=auto` (on only under IOPOLL) | unchanged | §29.4, §29.5 |
 | Copy-thread completion | stream-written completion word, no `cuEventQuery`; no flag, no fallback | 2026-09-29 | §29.9 (**unverified**) |
-| `MEM_FRACTION_STATIC` / `SGLANG_MOE_HOT_GPU_MB` / `CONTEXT_LENGTH` | 0.885 / 15400 / 131072 | 2026-09-29 | §29.11 |
+| `MEM_FRACTION_STATIC` / `SGLANG_MOE_HOT_GPU_MB` / `CONTEXT_LENGTH` | 0.875 / 16080 / 131072 (0.885 / 15400 until the evening) | 2026-09-29 | §29.11, §29.15 |
+| Copy wait (CW) | stream-ordered `cuStreamWaitValue32_v2` on a gate word; lease ABI 4 | 2026-09-29 | §29.14 |
+| `--warmups dsv41_prefill_shapes` | on | 2026-09-29 | §29.16 |
+| `--language-model-only` | on (no vision tower) | 2026-09-29 | §29.18 |
+| HiCache | ratio 14 (~9 GB host), `page_first_direct`, direct IO, write_through | 2026-09-29 | §29.19 |
 | `CUDA_MODULE_LOADING` | EAGER | unchanged | §29.11 |
 
 **Also merged in the window, covered elsewhere or without measurements:** `e10d2ca067` and `43d7813a41` (layer-major
@@ -5865,6 +5875,7 @@ after the reboot (available 0.14 / 0.17 GB against a 0.23 GB SWA floor). This is
 
 **What changed.** `MEM_FRACTION_STATIC` 0.90 → **0.885**, `SGLANG_MOE_HOT_GPU_MB` 16100 → **15400**, `CONTEXT_LENGTH`
 262144 → **131072** (`benchmarks/dsv41_baseline/arm_env.py`). §27.17's recipe line carries a superseded note.
+(Superseded the same evening: 0.875 / 16080 after a 419-token prompt OOMed at 0.885, §29.15.)
 
 **Cause: the driver, not the code** (`analysis/dsv41-drive/recipe-mem/diagnosis.md`).
 - NVIDIA driver 610.57.04 → 615.71.09 (dnf transaction 477, 2026-09-27 23:11, live after the 09-28 00:30 reboot) made
@@ -5926,8 +5937,10 @@ byte-identical. Treat it as an estimate against the weight pairs' ±0.3 spread.
 
 1. **Verify P2** (§29.9): review, mutants, TSan, the `dlsym` path, the clock-count gate, the forced interleaving, and a
    decode A/B.
-2. **Run the startup pool check at context 131072** (§29.11).
-3. **A startup warm-up before KV sizing** (§29.11); the chunked 16k peak leaves 229 MiB.
+2. **Guard the pool against the context.** Every launch since has accepted context 131072, but at 0.875 / 15400 the
+   server also started with a 7,936-token pool, so nothing refuses a pool below the context (§29.15).
+3. **A startup warm-up before KV sizing** (§29.11) is still not built. The post-sizing `--warmups` (§29.16) moves the
+   kernel loads before traffic but does not change what KV sizing sees.
 4. **Fixed buffers stay off.** Before re-enabling: never the clone path on 6.12.0-211; the untried options are in
    §29.6. Any future clone-based fix must check the system-wide orphan count (`thp-fallback/results.md`).
 5. **IOPOLL follow-ups #7-#9** and the pre-existing IOPOLL `real_kernel` big-slab 300 s timeout (§29.5, §29.7).
@@ -5939,6 +5952,194 @@ byte-identical. Treat it as an estimate against the weight pairs' ±0.3 spread.
 8. **The copy thread's submission floor:** `cuMemcpyAsync` takes 8 libcuda mutexes per call; fewer calls per job
    (`cuMemcpyBatchAsync`) is not measured (`hotpath/results.md` §9d).
 9. **The chain-PDL results file** is not on `master` (§29.2).
+10. **Validate the stream-ordered copy wait** (§29.14): run its tests, a decode A/B against the spinning wait, and a
+    node-mode trace re-run. Also check the head-of-queue risk.
+11. **Measure the hot cache at 16080** against 15080 (decode ms/token), and the prefill headroom (0.16 GiB minimum in
+    the warmup) on a 16k chunked prompt (§29.15).
+12. **HiCache on the direct backend** (§29.19): measure revisit TTFT and whether its backups slow prefill or decode
+    alongside the RAM-miss copy engine.
+13. **`get_and_clear_swa_pages_kernel` still loads after startup** (§29.16).
+
+### 29.14 Stream-ordered copy wait (`c7ce4aa337`, `264ddece72`, `d835f1b045`, 2026-09-29)
+
+**The problem: node-mode Nsight traces of the prod recipe hung** (`divix01:/mnt/nvme1/dsv41-nsys/prod-node-trace-20260929/results.md`).
+- With `--cuda-graph-trace=node`, the RAM-miss request never completed once capture started. The server fail-stopped at
+  the RAM-miss timeout: 2 s at the recipe value, and exactly 30 s with `SGLANG_DSV41_RAM_MISS_TIMEOUT_MS=30000`.
+- **Not P2:** the bisect at `7d4c0eeb69`, before the completion word (§29.9), hangs the same way.
+- **The copy engine is required:** the same capture with `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=0` (and
+  `SM_SMALL_COPIES=0`, which the startup check then requires) ran 1,110 decode steps cleanly.
+- **Hang shape (Case A):**
+  - The GPU sat at 100% SM, 0% memory utilisation, ~176 W.
+  - `exl3-copy-eng` was live, polling in its own loop, with no libcuda, CUPTI or ioctl frames.
+  - The scheduler was blocked in `copy_done.synchronize()`.
+  - No thread was blocked on a CUDA/CUPTI mutex.
+- **Reading:** under CUPTI node tracing, the copy stream's DMA and its stream-written completion word never ran
+  behind CW's spinning wait kernel. In production, the same spin cost one SM per waiting layer.
+
+**The fix: CW no longer spins.** It is three stream-ordered steps:
+1. **Arm kernel (PDL).** It closes a u32 gate word in lease area C and publishes `CopyArm = tagged(G)`. After a
+   system fence it re-reads `CopyDone`; if that already carries G with the exact lane mask, it opens the gate itself.
+2. **`cuStreamWaitValue32_v2(gate, GEQ open)`.** This holds the decode stream; it is a memop node in the graph with
+   no programmatic edge.
+3. **Plain commit kernel.** It checks the gate outcome, `CopyDone == G` and the lane mask, never waits, and fails
+   closed on the fatal word.
+
+**Gate word:** `seq << 2 | state` (29-bit seq), with bit 31 set when closed. Read as an int32, a closed word is negative,
+so the GEQ wait holds.
+
+**Releasers.** Each host releaser opens the gate only by a CAS from G's exact closed word:
+- the copy thread, after `CopyDone`;
+- the service, on every `pump_demand`;
+- `close_admission`;
+- the RamThread watchdog, which owns the copy-wait deadline: fatal word first, then gate = timeout.
+
+A releaser stalled past CW's own open of G, and past G + 1's close, therefore changes nothing.
+
+**Shutdown and startup.**
+- `stop_thread` and `close` raise the shutdown word and open an armed gate (`abort_copy_waits`) before joining.
+- `start_thread` is refused after an abort.
+- The copy thread refuses to start on a driver or device where a v2 stream wait on host-mapped memory does not
+  both hold and release. The probe uses the production closed word, with bit 31 set.
+
+**ABI and docs.** Lease block ABI 3 → 4 (gate and `CopyArm` lines in area C). `LEASE_PROTOCOL.md` 7.6 documents the
+new wait interval: it is watchdog-timed from the arm, so post-to-fail-stop can take ~2x the timeout plus 20 ms.
+
+**Evidence.**
+- Every launch since `d835f1b045` passed the init probe and captured `segments=1 breaks=0`.
+- RAM misses were served through the new wait with `copy_errors: 0`. The counters at the 16:43 OOM read `served` 616
+  and `rows_read` 1,324; this is `logs/prod-server-20260929-163831-streamwait.log`.
+- A user session on `1b8380eb6c` decoded 121 log intervals at a mean 10.35 gen tok/s (max 13.03) with no RAM-miss
+  timeout (`logs/prod-server-20260929-180120-lmonly-hicache14.log`).
+
+**Not done.**
+- The commits' tests were updated but not run.
+- No decode A/B against the spinning wait.
+- No node-mode trace re-run to confirm the hang is gone.
+- Open risk (`LEASE_PROTOCOL.md`): a wait node at the head of a hardware queue may block other streams on that queue.
+
+### 29.15 Recipe memory after a 419-token OOM (`08afb8561e`, `89ef36ede0`, then `3f6154c8a5`, 2026-09-29)
+
+**At 0.885 / 15400, a 419-token prompt OOMed in prefill.**
+- Free memory fell from 2.70 GB after capture to 37 MB, and a 256 MiB `exl3_linear` output could not be allocated.
+- Late Triton kernel loads came first. Earlier launches had bottomed out at 0.12 GB.
+- Log: `logs/prod-server-20260929-163831-streamwait.log`.
+
+**The KV pool is only the remainder of the fraction.**
+- `MEM_FRACTION_STATIC` 0.875 alone shrank the pool from 161,536 to **7,936 tokens**, with 3.12 GB free after capture
+  (`...-165242-mf0875.log`).
+- The server still started with `context_len=131072`, so **nothing refuses a pool smaller than the context**.
+- The ~320 MiB was taken from the hot cache instead, 15400 → 15080 (`89ef36ede0`). Pool 225,792, 2.96 GB free
+  (`...-165638-hot15080.log`).
+
+**Hot cache 15080 → 16080 with `--language-model-only`** (§29.18). The freed vision memory went to the hot cache, and
+the KV pool held.
+
+Launches on 2026-09-29, 16:38-18:01:
+
+| Log (`logs/prod-server-20260929-*`) | Recipe | KV pool, tokens | Free after capture | Outcome |
+|---|---|---|---|---|
+| `163831-streamwait` | 0.885 / 15400 | 161,536 | 2.70 GB | OOM on a 419-token prompt |
+| `165242-mf0875` | 0.875 / 15400 | 7,936 | 3.12 GB | pool collapsed |
+| `165638-hot15080` | 0.875 / 15080 | 225,792 | 2.96 GB | ok |
+| `172700-warmup` | + warmup | 177,408 | 3.00 GB | grammar request crashed (§29.17) |
+| `173859-grammarsync` | + sampler fix | 195,840 | 2.99 GB | ok |
+| `174941-lmonly` | + language-model-only, 16080 | - | - | assert at decode capture (§29.18) |
+| `175813-lmonly-hicache` | + `--hicache-size 10` | 272,128 | 2.86 GB | refused at tree-cache init (§29.19) |
+| `180120-lmonly-hicache14` | + ratio 14 | 238,080 | 2.85 GB | ok, current |
+
+**Headroom is thinner at 16080.** The lowest free VRAM during the warmup was 0.16 GiB, against 0.27 GiB at 15080. The
+4096-token chunk and the grammar request both passed. If a long prompt OOMs, move MiB back from the hot cache.
+
+### 29.16 Startup warmup of prefill Triton variants (`2cc4313906`, grammar request `5c4725dc90`)
+
+**Why kernels loaded late.** Prefill Triton kernels compile one variant per token-count class, and a class first seen
+mid-serving loads its cubin with ~0.2 GiB free.
+- The class comes from `_block_m_for` in `mhc.py`, the M thresholds in `hc_combine_norm`, and Triton's own
+  specialization on M == 1 and M % 16.
+- The default 193-token server warmup covers one class.
+- The load watcher (`utils/triton_load_watch.py`) warns only below 1 GiB free.
+
+**What it does.** `--warmups dsv41_prefill_shapes` (`entrypoints/warmup.py`) sends one `max_new_tokens=1` prompt per
+class before the server listens: sizes 1, 5, 8, 16, 33, 64, 257, 400, 2048, 2049 and 4096. It then sends a 16-token
+regex-constrained request, which loads xgrammar's bitmask kernel and exercises the grammar token sync (§29.17).
+
+**Cost and effect.**
+- The 11 prompts take ~71 s of startup, and the prompts of 256 tokens or more seed the hot cache.
+- Their loads now land during startup. `_fwd_kernel` loads during the built-in 193-token warmup, still before
+  "fired up".
+- The recipe passes the flag to prod and to the arms alike, keeping their argv identical.
+
+**Still late:** `get_and_clear_swa_pages_kernel` loaded after "fired up" at 0.16 GiB free
+(`...-180120-lmonly-hicache14.log`, 18:04:55).
+
+### 29.17 Grammar requests crashed the single-GPU server (`5c4725dc90`, `1cfdf9cc59`)
+
+**What happened.** A structured-output request died in sampling with `NCCL ... Failed to CUDA calloc 536870912 bytes`
+(`...-172700-warmup.log`).
+
+**Cause.** `Sampler._sync_token_ids_across_tp` all-reduces the next token ids whenever a batch has grammars.
+- On one TP rank that all-reduce is an identity.
+- Its first call creates the NCCL communicator, which allocated 512 MiB with 0.27 GiB free.
+- None of the ungrammared warmups reached it.
+
+**Fix** (`layers/sampler.py`). The sync runs only at a TP world size above 1, the guard the status sync in the same
+file already had. The grammar manager's own all-gather already skipped size 1.
+
+**Test.** `test/registered/unit/sampling/test_sampler_token_sync.py`: 3 passed on divix01. With the guard removed it
+fails 1 of 3; restored, it passes 3 of 3.
+
+### 29.18 The vision tower is not built (`3f6154c8a5`, `dde35cecd9`)
+
+**What was wasted.** The checkpoint keeps `vision_config` (32 blocks, dim 1024) but ships no vision weights.
+- The ViT (~411M params) and aligner (~73M) were built empty: ~0.97 GB in bf16. Startup logged "Some weights are not
+  initialized: vision.blocks...".
+- The multimodal path also reserved 0.10 GB of the KV budget.
+
+**A correctness bug with it.** The 40 per-layer `e_score_correction_bias_vl` parameters were left as `torch.empty`,
+because the loader keeps them whenever the tower exists. The fused gate applies them to any token equal to
+`image_token_id` 129264 (`multimodal/dsv41/vl_routing.py`).
+
+**Fix.**
+- `--language-model-only` now sets `vision_n_layers = 0` for a V4.1 config in `ModelConfig`. Every vision site keys
+  off that value: the ViT and aligner, the VL bias, and the Engram image-token bypass.
+- `DeepseekV4ForCausalLM` joins the flag's allowlist (`server_args.py`).
+- The recipe passes the flag.
+- **Result:** "Load weight end" `mem usage` fell 9.98 → **9.04 GB**, and the uninitialized-weights warning is gone.
+
+**What it exposed.** V4.1 had only ever routed through `vision_topk`.
+- Without the VL bias, the MoE fell back to `self.topk`. Under `moe_runner_backend=flashinfer_mxfp4` with non-FP4
+  (EXL3) experts, that emits the BYPASSED format.
+- The expert layer's `format_is_standard` assert then failed at decode capture (`...-174941-lmonly.log`).
+- `dde35cecd9` keeps every V4.1 layer on `vision_topk`, with no `input_ids` when there is no VL bias. That turns the
+  fused gate's image-token switch off, so text-token routing is the same kernel call as before.
+- V4.1 has no hash layers, which `vision_topk` does not implement.
+- DSpark's draft layers, previously on `self.topk`, now take `vision_topk` too. That path is not exercised in
+  production.
+
+### 29.19 HiCache host pool ~9 GB, direct IO (`ea4c01b618`, `1b8380eb6c`)
+
+**Size.** DeepSeek V4 HiCache refuses `--hicache-size` at tree-cache init (`_deepseek_v4_num_host_pages`), so the host
+pool is sized by ratio instead.
+- Each sub-pool's host pages are ratio x device pages.
+- Ratio 2 held 1.14 GB at a 195,840-token pool.
+- Each unit is ~0.25 GB of SWA plus ~1.6 KB per GPU pool token.
+- **`--hicache-ratio 14`** gives ~6.7-10.6 GB over the 140k-311k-token pools seen, and **8.96 GB** at 238,080. With it,
+  available system RAM went 45 → 38 GB.
+
+**Layout.** `--hicache-mem-layout page_first_direct` with `--hicache-io-backend kernel` is rewritten to the direct
+backend (`hicache_hook.resolve_layout_io_compatibility`).
+- DSV4 backups then use `transfer_kv_all_layer_direct_lf_pf`, which issues cudaMemcpy DMA on the copy engines the
+  RAM-miss path also uses.
+- This drops the staged write-back kernel that the page_first/kernel pair used.
+- **Not measured:** prefill or revisit TTFT against §27.16's ratio 2, page_first/kernel.
+
+### 29.20 Operations
+
+- **`/data/models/slang/nvfp4-work/server.log`** always names the running production log. After taking `cc-gpu.lock`,
+  `launch_prod.sh` renames a fresh symlink over it to its stdout's file (`d804ce7a5f`, `SERVER_LOG_LINK` overrides the
+  path). A refused start, a terminal or a pipe leaves the link alone.
+- **Restart only an idle server.** A SIGTERM during a request drains it and holds `cc-gpu.lock`, so the next launch
+  is refused. Check the log's last `#running-req` first.
 
 ## Sources
 
