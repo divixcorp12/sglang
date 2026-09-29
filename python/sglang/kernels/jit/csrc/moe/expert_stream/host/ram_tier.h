@@ -238,6 +238,7 @@ class RamTier {
 
   // Serve the next posted demand record, if any. True when it handled one.
   bool pump_demand() {
+    release_copy_gate();  // a copy wait armed after its CopyDone was published: no copy-thread call opens it
     // The head is read before the retirement pass, so a posted demand makes that pass a settle pass (retire_leases):
     // every signal of each older request is then visible. Once per demand, so a deferred one's polls stay cheap.
     const uint32_t head = load_acquire(page_ + kDemandHead);
@@ -656,7 +657,9 @@ class RamTier {
 
   // Copy engine (LEASE_PROTOCOL.md 7.6): a thread that copies the reservation hold's hit lanes with the DMA engine.
   // `device` < 0 is the CPU test backend (HostCopyBackend). Before the service thread starts; unarmed until arm().
-  void enable_copy_engine(int64_t device, int64_t spin_ns) {
+  // `wait_timeout_ns`: how long an armed copy wait may hold the decode stream before the watchdog opens its gate as a
+  // timeout (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS).
+  void enable_copy_engine(int64_t device, int64_t spin_ns, int64_t wait_timeout_ns) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable the copy engine before the service thread starts");
     if (copy_engine_ != nullptr)
@@ -680,8 +683,72 @@ class RamTier {
         this,
         copy_prefix,
         std::string(Layout::kName) + "-copy-eng");
+    if (wait_timeout_ns <= 0) throw std::runtime_error(error_prefix<Layout>() + "the copy-wait timeout must be positive");
+    copy_wait_timeout_ns_ = wait_timeout_ns;
     engine->start();
     copy_engine_ = std::move(engine);
+  }
+
+  // ---- The copy wait's gate (LEASE_PROTOCOL.md 7.6, "The stream-ordered copy wait") ----
+  //
+  // The decode stream waits (cuStreamWaitValue32) on area C's gate, which CW closed before it published CopyArm = G.
+  // Any thread may call release_copy_gate: it opens the gate of the armed request at most once, with the outcome its
+  // words show. The copy thread calls it after publishing CopyDone, the service on every pump_demand (the arm may
+  // follow CopyDone), close_admission after the shutdown word, and the watchdog every poll, with the timeout.
+  // Exactly once per G (the CAS on gate_released_) is what makes it safe: the device cannot pass G's wait before that
+  // one store lands, so no store for G is still in flight when a later request closes the gate. No lock, clock or
+  // allocation: atomics and pinned words only, so it touches no tier state and needs no owner.
+
+  // The generation of the request whose copy wait is armed and whose gate no releaser opened, else 0.
+  uint64_t armed_copy_wait() const {
+    if (lease_ == nullptr || copy_engine_ == nullptr) return 0;
+    const uint64_t arm = load_acquire64(lease_ + lease_c_ + kLeaseCopyArm);
+    if (tag_of(arm) != kLeaseTagCopyArm) return 0;
+    const uint64_t gen = generation_of(arm);
+    return gate_released_.load(std::memory_order_acquire) == gen ? 0 : gen;
+  }
+
+  int64_t copy_wait_timeout_ns() const {
+    return copy_wait_timeout_ns_;
+  }
+
+  // `expired`: the watchdog saw generation `expired` armed for longer than the copy-wait timeout (0: none). True when
+  // this call opened the gate.
+  bool release_copy_gate(uint64_t expired = 0) {
+    if (lease_ == nullptr || copy_engine_ == nullptr) return false;
+    uint8_t* area_c = lease_ + lease_c_;
+    uint64_t released = gate_released_.load(std::memory_order_acquire);
+    const uint64_t arm = load_acquire64(area_c + kLeaseCopyArm);
+    if (tag_of(arm) != kLeaseTagCopyArm) return false;
+    const uint64_t gen = generation_of(arm);
+    if (released == gen) return false;
+    const uint32_t seq = static_cast<uint32_t>(gen);
+    const uint8_t* done = area_c + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseCopyDoneBytes;
+    uint32_t outcome = kLeaseGateClosed;
+    if (load_acquire64(done + kLeaseCdGen) == tagged_word(kLeaseTagCopied, gen)) {
+      outcome = kLeaseGateOpen;
+    } else if (load_acquire(page_ + kFatal) != 0 || load_acquire(lease_ + kLeaseHeaderShutdown) != 0) {
+      outcome = kLeaseGateAborted;
+    } else if (expired == gen) {
+      outcome = kLeaseGateTimeout;
+    } else {
+      return false;
+    }
+    // A releaser that read an older `released` loses here to the one that opened G, or to one that opened a later
+    // request (then G's gate was opened before that request could arm).
+    if (!gate_released_.compare_exchange_strong(released, gen, std::memory_order_acq_rel)) return false;
+    if (outcome == kLeaseGateTimeout) {
+      std::fprintf(
+          stderr,
+          "ERROR %scopy wait of request %llu timed out after %.3f s; failing stop\n",
+          error_prefix<Layout>().c_str(),
+          static_cast<unsigned long long>(gen),
+          static_cast<double>(copy_wait_timeout_ns_) / 1e9);
+      std::fflush(stderr);
+      raise_fatal(seq);  // before the gate: F then finds the fatal word raised, as after a device timeout
+    }
+    store_release(area_c + kLeaseCopyGate, outcome);
+    return true;
   }
 
   // Row `row`'s copy table: `entries` rows of {source slab address, destination tensor address, row bytes}. Bit i
@@ -867,6 +934,10 @@ class RamTier {
   void close_admission() {
     admission_closed_.store(true);
     if (lease_ != nullptr) store_release(lease_ + kLeaseHeaderShutdown, 1u);
+    // The shutdown word before the read of CopyArm: a wait armed before it is opened here, one armed after it opens
+    // itself (CW re-reads the word after arming).
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    release_copy_gate();
   }
 
   // Test only: sleep `ns` between serving a demand and storing demand_done. InstrBuild only.
@@ -1523,6 +1594,8 @@ class RamTier {
       uint8_t* done = lease_ + lease_c_ + job.idx * kLeaseCopyDoneBytes;
       std::memcpy(done + kLeaseCdMask, &job.mask, 4);
       store_release64(done + kLeaseCdGen, tagged_word(kLeaseTagCopied, job.gen));
+      std::atomic_thread_fence(std::memory_order_seq_cst);  // CopyDone before the read of CopyArm
+      release_copy_gate();
       if (job.sm) return false;  // handed back once the copy wait acknowledged its SM reads (copy_acked)
     }
     hand_back(job);
@@ -1749,7 +1822,7 @@ class RamTier {
     lease_p_ = piece_offset;
     const int64_t copy_offset = round_up_page(piece_offset + kLeaseAreaPieceMaskBytes);
     lease_c_ = copy_offset;
-    const int64_t needed = round_up_page(copy_offset + kLeaseAreaCopyDoneBytes);
+    const int64_t needed = round_up_page(copy_offset + kLeaseAreaCBytes);
     if (lease_bytes < needed) {
       throw std::runtime_error(
           error_prefix<Layout>() + "the lease block has " + std::to_string(lease_bytes) + " bytes, its layout needs " +
@@ -1757,7 +1830,7 @@ class RamTier {
     }
     auto put_u32 = [&](int64_t offset, uint32_t value) { std::memcpy(lease_ + offset, &value, 4); };
     put_u32(0, 0x4C534531u);  // "LSE1"
-    put_u32(4, 3u);           // ABI version (exl3_lease_block.ABI_VERSION; 3: 128-byte LaneRequest, area C)
+    put_u32(4, 4u);           // ABI version (exl3_lease_block.ABI_VERSION; 4: area C's copy-wait gate)
     put_u32(kLeaseHeaderRing, static_cast<uint32_t>(kLeaseRing));
     put_u32(kLeaseHeaderLanes, static_cast<uint32_t>(kLeaseLanes));
     put_u32(16, static_cast<uint32_t>(layers_));
@@ -1770,6 +1843,9 @@ class RamTier {
       put_u32(kLeaseRowTable + 8 * row, static_cast<uint32_t>(slot_gen_base_[row]));
       put_u32(kLeaseRowTable + 8 * row + 4, static_cast<uint32_t>(capacity[row]));
     }
+    // Open, with nothing armed: a copy wait that arms nothing passes its stream wait on this value.
+    put_u32(copy_offset + kLeaseCopyGate, kLeaseGateOpen);
+    std::memset(lease_ + copy_offset + kLeaseCopyArm, 0, 8);
     slot_gen_ = reinterpret_cast<uint32_t*>(lease_ + kLeaseSlotGen);
     _mm_sfence();
   }
@@ -2341,6 +2417,8 @@ class RamTier {
   // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
   std::unique_ptr<Engine> copy_engine_;
   std::atomic<bool> copy_armed_{false};
+  int64_t copy_wait_timeout_ns_ = 0;           // set with the copy engine, before any thread reads it
+  std::atomic<uint64_t> gate_released_{0};     // the last armed generation whose copy-wait gate a releaser opened
   // Native prefetch: the page (null when off), the last request generation read (service thread), the one lease a
   // prefetch holds (at most one is outstanding: the device waits for its done word before posting the next), and per
   // row the copied expert its next request judges. The last two are the owner's.

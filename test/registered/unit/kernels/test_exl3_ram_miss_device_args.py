@@ -328,6 +328,13 @@ def _lease_python_constants():
         "kLeaseCdMask": lease.COPY_DONE_FIELDS["mask"],
         "kLeaseCdGen": lease.COPY_DONE_FIELDS["gen"],
         "kLeaseAreaCopyDoneBytes": lease.AREA_COPY_DONE_BYTES,
+        "kLeaseCopyGate": lease.COPY_GATE,
+        "kLeaseCopyArm": lease.COPY_ARM,
+        "kLeaseAreaCBytes": lease.AREA_C_BYTES,
+        "kLeaseGateClosed": lease.GATE["closed"],
+        "kLeaseGateOpen": lease.GATE["open"],
+        "kLeaseGateTimeout": lease.GATE["timeout"],
+        "kLeaseGateAborted": lease.GATE["aborted"],
     }
 
 
@@ -347,6 +354,7 @@ def _lease_device_only_constants():
         "kLeaseTagTerminal": lease.TERMINAL_TAG,
         "kLeaseTagStreamed": lease.STREAM_PROBE_TAG,
         "kLeaseTagSmAck": lease.SM_ACK_TAG,
+        "kLeaseTagCopyArm": lease.COPY_ARM_TAG,
         "kLeaseReasonTimeout": lease.TERMINAL_REASONS["timeout"],
         "kLeaseReasonAborted": lease.TERMINAL_REASONS["aborted"],
         "kLeaseReasonFailed": lease.TERMINAL_REASONS["failed"],
@@ -403,6 +411,25 @@ def test_no_other_expert_stream_kernel_uses_pdl():
     triggers = re.findall(r"PDLTriggerSecondary<", text)
     assert len(waits) == len(triggers) == len(PDL_KERNELS)
     assert len(re.findall(r"\.enable_pdl\(", text)) == len(PDL_KERNELS)
+
+
+def test_the_copy_wait_is_an_arm_kernel_a_stream_wait_on_the_gate_and_a_plain_commit_kernel():
+    """The stream-ordered copy wait (LEASE_PROTOCOL.md 7.6): the PDL arm kernel, then cuStreamWaitValue32 on area C's
+    gate (GEQ open), then the commit kernel with no launch attribute. Red when the wait moves, compares against another
+    value, or the commit kernel gains PDL (a programmatic edge would let it run before the wait node ends)."""
+    text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
+    launcher = text[text.index("static void lease_copy_wait("):]
+    arm = launcher.index("exl3_ram_miss_lease_copy_wait_kernel<true>")
+    wait = launcher.index("stream_wait_value32()(")
+    commit = launcher.index("(exl3_ram_miss_lease_copy_commit_kernel, commit)")
+    assert arm < wait < commit
+    call = launcher[wait:launcher.index(";", wait)]
+    assert "kLeaseCopyGate" in call and "kLeaseGateOpen" in call and "kStreamWaitValueGeq" in call, call
+    assert re.search(r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(exl3_ram_miss_lease_copy_commit_kernel", launcher)
+    body = text[text.index("void exl3_ram_miss_lease_copy_commit_kernel("):]
+    body = body[: body.index("\n}\n")]
+    assert "PDL" not in body and "while" not in body and "__nanosleep" not in body, "the commit kernel must not wait"
+    assert '"cuStreamWaitValue32_v2"' in text
 
 
 def test_the_python_side_passes_the_pdl_flag_to_exactly_the_six_chain_launchers():

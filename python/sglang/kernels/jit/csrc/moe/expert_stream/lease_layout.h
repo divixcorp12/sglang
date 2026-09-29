@@ -105,7 +105,20 @@ constexpr int64_t kLeaseCopyDoneBytes = 16;
 constexpr int64_t kLeaseCdMask = 0;
 constexpr int64_t kLeaseCdGen = 8;
 constexpr int64_t kLeaseAreaCopyDoneBytes = kLeaseRing * kLeaseCopyDoneBytes;
+// Area C, after CopyDone[] (ABI 4, LEASE_PROTOCOL.md 7.6 "The stream-ordered copy wait"): the copy wait's gate, one
+// u32 on its own line. CW closes it (kLeaseGateClosed) before it arms; a host releaser opens it once per armed
+// request with an outcome; the decode stream waits on it with cuStreamWaitValue32 (GEQ kLeaseGateOpen) in between.
+// Then CopyArm, u64 tagged(kLeaseTagCopyArm, generation) on the next line, device-written after the gate closed:
+// the one request whose gate a host releaser may open.
+constexpr int64_t kLeaseCopyGate = kLeaseAreaCopyDoneBytes;
+constexpr int64_t kLeaseCopyArm = kLeaseCopyGate + 128;
+constexpr int64_t kLeaseAreaCBytes = kLeaseCopyArm + 8;
+constexpr uint32_t kLeaseGateClosed = 0;
+constexpr uint32_t kLeaseGateOpen = 1;     // CopyDone carries the armed generation
+constexpr uint32_t kLeaseGateTimeout = 2;  // the host's copy-wait deadline passed; the page's fatal word is raised
+constexpr uint32_t kLeaseGateAborted = 3;  // the fatal word or the header's shutdown word was raised
 static_assert(kLeaseSmAck + kLeaseRing * kLeaseSmAckBytes <= 4096, "area D fits one page");
+static_assert(kLeaseAreaCBytes <= 4096, "area C fits one page");
 
 // Tags of the byte above the 56-bit request generation, and the reasons a Terminal record carries (section 4.3, 13).
 constexpr uint64_t kLeaseTagDemand = 1;
@@ -114,7 +127,8 @@ constexpr uint64_t kLeaseTagLoading = 2;  // RowResult.ready: leased, still load
 // RowResult.ready: leased; the service's copy engine writes this lane's destination slot, so no kernel copies it
 // and nothing reads the slot before CopyDone carries the generation.
 constexpr uint64_t kLeaseTagCopying = 3;
-constexpr uint64_t kLeaseTagCopied = 1;  // CopyDone
+constexpr uint64_t kLeaseTagCopied = 1;   // CopyDone
+constexpr uint64_t kLeaseTagCopyArm = 1;  // CopyArm
 constexpr uint64_t kLeaseTagConsumed = 1;
 constexpr uint64_t kLeaseTagViolated = 2;
 constexpr uint64_t kLeaseTagTerminal = 1;

@@ -85,6 +85,15 @@ class LeaseSim:
         tag, gen = lease.untag(self.read_u64(base + lease.COPY_DONE_FIELDS["gen"]))
         return tag, gen, int(self._i32(base + lease.COPY_DONE_FIELDS["mask"])[0]) & 0xFFFFFFFF
 
+    def copy_gate(self) -> int:
+        """Area C's copy-wait gate (lease.GATE), the word the decode stream's cuStreamWaitValue32 waits on."""
+        return int(self._i32(self.layout.copy_offset + lease.COPY_GATE)[0]) & 0xFFFFFFFF
+
+    def arm_copy_wait(self, req: SimRequest) -> None:
+        """The copy wait's arm kernel for a request with COPYING lanes: close the gate, then publish CopyArm = G."""
+        self._i32(self.layout.copy_offset + lease.COPY_GATE)[0] = lease.GATE["closed"]
+        self.write_u64(self.layout.copy_offset + lease.COPY_ARM, lease.tagged(lease.COPY_ARM_TAG, req.gen))
+
     def dst_slot(self, req: SimRequest, lane: int) -> int:
         """The lane's destination slot as the post kernel wrote it into the LaneRequest."""
         base = self._d(lease.LANE_REQUEST + req.idx * lease.LANE_REQUEST_BYTES) + lease.LANE_REQUEST_FIELDS["dst_slot"]

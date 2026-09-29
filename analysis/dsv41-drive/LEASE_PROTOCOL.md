@@ -435,6 +435,9 @@ that request's COPYING lanes, whose lanes the mask names. The copy wait CW reads
 with `ld.acquire.sys`, then the mask. A request slot's word is rewritten only for `G + 16`, which
 the device cannot post before G's chain has ended. All 16 records share two lines with one writer.
 Allocated for every lease-mode service; with the flag off nothing writes or reads it.
+**ABI 4 appends, in area C,** the copy wait's **gate** (u32 at `+256`, its own line) and **CopyArm** (u64 at
+`+384`, the next line): the gate is closed by CW and opened by a host releaser, CopyArm is device-written
+(`tagged(1, G)`); 7.6, "The stream-ordered copy wait". The service initialises the gate open.
 
 ### 4.4 Which of `{request_generation, slot_generation, host_slot, status}` lives where
 
@@ -965,7 +968,7 @@ allocation) it calls nothing that synchronizes (no `cu*Synchronize`), allocates,
 memory or loads a module, and it never touches the decode stream or a graph.
 
 **The copy stream needs a hardware queue of its own.** Nothing CUDA knows about orders CW after the
-copy, so nothing obliges the driver to run the copy while CW spins. Streams share
+copy, so nothing obliges the driver to run the copy while CW holds the decode stream. Streams share
 `CUDA_DEVICE_MAX_CONNECTIONS` hardware queues (the server sets 8) and a queue runs in order: a copy
 stream sharing a queue with any stream whose head waits on the decode graph (the overlap scheduler's
 result copies, another stream's event wait) cannot start until CW gives up. `copy-engine/hol_probe.py`
@@ -987,7 +990,7 @@ oldest job alone. Liveness without a clock: after 2^16 consecutive pending polls
 `cuStreamQuery` once; an error fails stop, and an idle stream fails stop only if a re-load of the
 word is still short (a lost write; the re-load closes the race where the word lands between the
 first load and the query). A failed copy or write never writes the word, so its leases stay held
-(E5), and the device copy wait's own deadline remains the only timeout. Rejected in P1:
+(E5), and the copy wait's host deadline (below) remains the only timeout. Rejected in P1:
 `cuEventQuery` (a libcuda mutex per poll), and a one-thread kernel doing a system-scope release
 store (needs an SM and a module load, and lands ~2.5 us later).
 
@@ -1001,15 +1004,65 @@ the device's critical path; it is safe because both follow the observed completi
 **Device.** W1 claims a valid COPYING lane with `claimed = 2`: it is left out of C1's compacted
 plan and A1's acknowledgements, and S skips it. A COPYING lane W1's budget missed is handed over by
 S (`stream_admit` validates it and clears the lane from S's set). The copy wait **CW**
-(`exl3_ram_miss_lease_copy_wait_kernel`) runs after A2 and before F: it reads every planned lane's
-ready word, forms the mask of COPYING lanes of this generation, and waits for
-`CopyDone[idx] == tagged(COPIED, G)` and a CopyDone mask equal to it, under the request's shared
-deadline (D5), leaving early on the fatal word or the header's shutdown. Only then does it commit
+(`exl3_ram_miss_lease_copy_wait_kernel`, then a stream wait, then
+`exl3_ram_miss_lease_copy_commit_kernel`) runs after A2 and before F: it reads every planned lane's
+ready word, forms the mask of COPYING lanes of this generation, and waits (below) for
+`CopyDone[idx] == tagged(COPIED, G)` and a CopyDone mask equal to it, bounded by the host's
+copy-wait deadline, ended early by the fatal word or the header's shutdown. Only then does it commit
 `go_ce = popcount(mask)`. Any other exit leaves `go_ce == 0` and records `kReqFailed` and the
 reason; F requires `go_1 + go_2 + go_ce == count`, so the request fails closed (keep 0, a terminal,
 the fatal word). CW writes neither `keep` nor a terminal. The chain is post -> W1 -> C1 -> A1 -> S ->
 A2 -> CW -> F -> add, and `go_total = go_1 + go_2 + go_ce`. Placing CW after S lets the hits' DMA
 copies overlap S's reads and piece copies.
+
+**The stream-ordered copy wait (ABI 4).** CW used to spin a kernel on CopyDone. Under node-level CUDA
+tracing (work serialized), the copy stream's DMA and completion write never ran behind the spinning
+kernel: 100% SM, 0% memory traffic, the copy thread polling until the timeout fail-stopped
+(`divix01:/mnt/nvme1/dsv41-nsys/prod-node-trace-20260929/results.md`, hang-diag and ce-off), and in
+production every waiting layer burned an SM. Nothing on the device spins now. CW is three stream-ordered steps:
+
+1. **Arm kernel** (the PDL chain kernel, 1 block). The SM small copies and SmAck as before, then the mask. With a
+   mask: if the fatal or shutdown word is raised it fails the request (`aborted`) without arming. Else it
+   closes the gate (`kLeaseGateClosed` = 0), release-stores `CopyArm = tagged(1, G)` (the release orders the
+   close), leaves the mask in the device word `ce_mask`, takes a seq_cst system fence (store->load), and re-reads
+   the fatal and shutdown words; raised now, it opens the gate itself with `aborted`. `copy_waits` counts arms, `copy_spun` those whose CopyDone was not yet published at the
+   arm (the stream wait then held the stream).
+2. **`cuStreamWaitValue32_v2(gate, 1, GEQ)`** on the decode stream, a memory-op node in the captured graph. The
+   gate's values are a fixed set (0 closed, 1 open, 2 timeout, 3 aborted), not a counter: the cyclic compare
+   `(int32_t)(gate - 1) >= 0` never wraps and passes for every open outcome. Which request it opened for is
+   carried by CopyArm and checked on CopyDone, never by the wait.
+3. **Commit kernel** (plain launch, 1 block). `ce_mask == 0`: nothing armed, `go_ce` stays 0. Else: gate
+   `timeout` -> reason timeout (`timeouts` += 1); `aborted` -> aborted; not open, or CopyDone not `tagged(COPIED,
+   G)` -> failed (the host opens only on that CopyDone, so this is an internal error); mask differs -> identity;
+   otherwise commit. It never waits.
+
+**Host releasers.** `RamTier::release_copy_gate(expired)` reads CopyArm = G; if the last opened generation
+(`gate_released_`) is not G, it picks the outcome from the words (CopyDone carries G -> open; fatal or
+shutdown -> aborted; `expired == G` -> timeout, raising the page's fatal word first), CASes `gate_released_` to
+G and stores the outcome. The CAS makes the open **exactly once per G**, and that is the safety argument: the
+device passes G's wait only once that one store landed, so no store for G is still in flight when a later
+request closes the gate; the device never opens the gate itself except on the sticky fatal/shutdown words,
+after which no request arms. A releaser only opens after reading CopyArm = G, and CopyArm follows the close,
+so an open never lands before its own close. Callers, every one lock-, clock- and allocation-free except the
+watchdog's clock:
+
+| Path that ends the wait | Who opens the gate |
+|---|---|
+| CopyDone published, device already armed | the copy thread, right after the CopyDone store (seq_cst fence, then CopyArm) |
+| CopyDone published before the device armed | the service thread, at the top of every `pump_demand`; the watchdog as a backstop |
+| copy-wait timeout (`wait_timeout_ms` of `enable_copy_engine`, the server passes `SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`) | the watchdog (`RamThread::watch`, every 20 ms, measured from its first sight of the arm): fatal word, then gate `timeout` |
+| copy-engine driver error or E6 mismatch (fatal raised by the copy thread) | the service's next `pump_demand`, or the watchdog: gate `aborted` |
+| fatal raised by a device kernel or elsewhere | as above |
+| fatal or shutdown already raised when CW runs | CW does not arm; the gate stays open, the commit commits nothing |
+| fatal or shutdown raised between CW's check and its arm | CW's re-read after arming opens it `aborted` itself; if the re-read missed it, `close_admission` (its fence pairs with CW's) or the service/watchdog poll |
+| shutdown (`close_admission`) | `close_admission`, after the shutdown store and a seq_cst fence; the watchdog and service as backstops |
+
+The deadline sits on the watchdog because it is the one host thread that neither drives the copy stream nor
+reads NVMe: a copy thread stuck in a driver call, or a service stuck in a read, still has its wait ended there.
+Pump mode (no service thread, CPU tests) has no watchdog, so no copy-wait timeout. The copy thread's start
+refuses a device or driver without the op: a `cuStreamWaitValue32_v2` on a host-mapped probe word must hold
+its stream until a host store releases it (`CudaCopyBackend::probe_stream_wait`), and the launcher refuses a
+libcuda without the symbol.
 
 **The invariants, for a COPYING lane.**
 
@@ -1031,14 +1084,14 @@ copies overlap S's reads and piece copies.
 
 **Failure.** A driver error on the copy thread (issue, record or query) raises the page's fatal
 word, keeps every lease it holds (E5), never publishes those CopyDone words, and stops issuing;
-later jobs fail the same way. CW then leaves on the fatal word and F fails the request. A request
+later jobs fail the same way. A releaser then opens CW's gate `aborted` on the fatal word and F fails the request. A request
 the device gave up on (timeout, a W1/S failure) keeps its COPYING leases until their copies
 complete; the Terminal changes nothing for them. At shutdown the copy thread drains in-flight jobs
 for up to 5 s; a job that does not complete keeps its leases and its stream, so the quarantine of
 14.1 covers it.
 
 **Module loading.** A CUDA module load holds the context lock that `cuMemcpyAsync` needs and can
-wait for the device, which is spinning in CW for that copy: a deadlock only the device deadline
+wait for the device, whose stream CW holds for that copy: a deadlock only the copy-wait deadline
 breaks, and the process fails stop (engram-no-hostnode plan, section 10; seen in the server twice,
 copy-compute-overlap plan section 10). The guards: rule 2 above (eager forwards never allow the copy
 engine); once armed, an eager forward drains the device first (`_copy_engine_barrier`) and so does
@@ -1065,12 +1118,17 @@ untouched.
 
 **Profiling.** Never capture a copy-engine run with `nsys --cuda-graph-trace=graph`: graph-mode
 CUPTI tracing makes the launch synchronous and holds off the copy thread's calls, which deadlocks CW
-(engram-no-hostnode plan, section 9). Node mode is the one to use.
+(engram-no-hostnode plan, section 9). Node mode is the one to use. Node mode also hung the spinning CW
+(the DMA never ran behind it); the stream-ordered wait above holds no SM, and whether node mode now
+completes is for a GPU run to show.
 
 ### 7.7 PDL on the lease chain (`SGLANG_DSV41_ENABLE_LEASE_PDL`, needs lease mode)
 
 With the flag, the chain's six kernels are launched with programmatic dependent launch (PDL): post, W1
-(`stream_hit_wait`), both stage acks, S, CW and finalize. Each is launched with `enable_pdl` and instantiated with
+(`stream_hit_wait`), both stage acks, S, CW and finalize. CW here is its arm kernel. Its stream wait is a memory-op
+node, which has no programmatic edge: it waits for the arm kernel's completion, and the commit kernel after it is a
+plain launch (no attribute, no trigger), so the wait fully orders before the commit. F keeps its PDL attribute; its
+edge from the commit kernel is programmatic, and with no trigger in the commit kernel F is released when it exits. Each is launched with `enable_pdl` and instantiated with
 `kUsePDL = true`. Its **first** statement is `griddepcontrol.wait` (`PDLWaitPrimary`), and its second is
 `griddepcontrol.launch_dependents` (`PDLTriggerSecondary`). C1 and the ops between layers are unchanged. The launch
 attribute becomes a **programmatic edge** in the captured decode graph (`cudaGraphGetEdges`: edge type 1, port

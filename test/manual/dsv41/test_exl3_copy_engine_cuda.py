@@ -120,7 +120,8 @@ def test_the_completion_word_counts_every_copy_job_at_shutdown(tmp_path, capfd):
 
 
 def test_a_delayed_completion_is_waited_for_and_the_lease_holds_until_it(ce):
-    """The ballast delays every job's completion by ~5 ms: CW must spin for it, and the bytes after F must be right.
+    """The ballast delays every job's completion by ~5 ms: CW's stream wait must hold the decode stream for it
+    (copy_spun counts arms that found CopyDone unpublished), and the bytes after F must be right.
     Mutants: complete a job before its completion word, publish CopyDone at the grant, or a CW that does not wait --
     each red on the snapshot."""
     s = ce
@@ -196,20 +197,19 @@ def test_s_hands_a_copying_lane_w1_did_not_claim_to_the_copy_wait(tmp_path):
 
 
 def test_a_copy_wait_timeout_fails_closed_and_the_terminal_does_not_release_the_copying_lease(tmp_path):
-    """A 256 MiB ballast (~20 ms) against a 10 ms deadline: CW times out, F fails the request and names the lane in
-    its terminal. The lease must stay held until the copy completes, then be released by its handed-back completion
-    alone.
-    The warm-up miss runs under the default 2 s deadline (a cold O_DIRECT miss can take ~50 ms); the 10 ms deadline
-    applies from the hit's post on."""
-    s = StreamService(tmp_path, copy_engine=True)
-    src = torch.empty(256 << 20, dtype=torch.uint8).pin_memory()
-    dst = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+    """A 1 GiB ballast (~80 ms) against a 10 ms copy-wait timeout: the service watchdog (20 ms polls) opens CW's gate
+    as a timeout and raises the fatal word, F fails the request and names the lane in its terminal. The lease must stay
+    held until the copy completes, then be released by its handed-back completion alone.
+    The copy-wait timeout is the host's (enable_copy_engine), so the warm-up miss below, which never arms a copy wait,
+    still runs under the device's default 2 s deadline."""
+    s = StreamService(tmp_path, copy_engine=True, copy_wait_timeout_ms=10)
+    src = torch.empty(1 << 30, dtype=torch.uint8).pin_memory()
+    dst = torch.empty(1 << 30, dtype=torch.uint8, device="cuda")
     try:
         s.plan([3])
         s.step()
         assert s.keep.item() == 1.0, (s.counters(), s.stats())  # row 3 is resident: the request below is a hit
         assert s.until(lambda: _all_retired(s))
-        s.dev.timeout_ns = 10_000_000  # post() passes the deadline from it: 10 ms from the next post on
         slot = s.host.mapping(0)[3]
         voided = s.counters()["leases_voided"]
         s.host.copy_engine_ballast(dst, src)
@@ -381,9 +381,11 @@ def test_the_captured_chain_waits_in_cw_and_replays_right_armed_and_unarmed(ce):
     chain = _chain(graph.raw_cuda_graph())
     cw = _kernel_nodes(s.copy_wait)
     finalize = _kernel_nodes(lambda: s.dev.finalize(s.count, s.keep))
-    assert len(cw) == 1 and len(finalize) == 1
+    # The stream-ordered copy wait (LEASE_PROTOCOL.md 7.6): arm kernel, memory-op wait on the gate, commit kernel.
+    assert len(cw) == 3 and len(finalize) == 1, cw
+    assert cw[1][0] == int(cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_BATCH_MEM_OP), cw
     position = chain.index(cw[0])
-    assert chain[position + 1] == finalize[0], chain
+    assert chain[position : position + 3] == cw and chain[position + 3] == finalize[0], chain
     rng = random.Random(11)
     for armed in (False, True, False, True):
         s.host.arm_copy_engine(armed)

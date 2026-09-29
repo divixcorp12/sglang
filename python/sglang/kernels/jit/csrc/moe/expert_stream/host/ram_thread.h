@@ -33,6 +33,8 @@ namespace expert_stream {
 // demand, advisory or fill stays in service for fatal_wait (a hung read): it times how long one busy episode
 // (RamTier::busy_episode) persists, so the clock is read on the watchdog thread only (D6). It outlives the service
 // thread's join in stop(), so a stop during a hung read, demand or advisory, still ends in its abort.
+// It is also the copy wait's deadline (LEASE_PROTOCOL.md 7.6): a gate armed for longer than the copy-wait timeout is
+// opened as a timeout here, and every poll opens one whose CopyDone, fatal or shutdown word no other releaser acted on.
 // pause()/resume() are not reentrant: their one owner is the slot table's depth counter
 // (Task 14), which calls pause at depth 0->1 and resume at 1->0.
 template <class Tier>
@@ -208,6 +210,8 @@ class RamThread {
     bool reported = false;
     uint64_t episode = 0;       // the busy episode last seen, 0: idle
     int64_t episode_since = 0;  // when the watchdog first saw it
+    uint64_t armed = 0;         // the copy wait last seen armed and not released, 0: none
+    int64_t armed_since = 0;
     while (!watch_stop_.load()) {
       const uint32_t fatal = load_acquire(page_ + kFatal);
       const int64_t now = now_ns();
@@ -225,6 +229,14 @@ class RamThread {
       }
       // D6: the clock is read here, every 20 ms, never by the service. One episode held past fatal_wait is a hung
       // request; detection is at most 20 ms late against a 30 s deadline.
+      // The copy wait's deadline lives here, not on the copy thread or the service: a copy thread stuck in a driver
+      // call, or a service stuck in a read, must still end the device's wait (at most 20 ms late).
+      const uint64_t gate = tier_->armed_copy_wait();
+      if (gate != armed) {
+        armed = gate;
+        armed_since = now;
+      }
+      tier_->release_copy_gate(armed != 0 && now - armed_since > tier_->copy_wait_timeout_ns() ? armed : 0);
       const uint64_t busy = tier_->busy_episode();
       if (busy != episode) {
         episode = busy;

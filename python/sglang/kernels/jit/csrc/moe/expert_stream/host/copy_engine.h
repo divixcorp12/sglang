@@ -68,7 +68,9 @@ static_assert(CompletionWord::kDone == CopyBackend::kDone && CompletionWord::kPe
 // on another stream, a graph launch or the device (no synchronize, no module load, no allocation per job).
 //
 // No fallback: the production recipe needs the copy engine, so init() refuses (and the copy engine's start() throws)
-// when the v2 write-value op cannot be resolved, errors, or its first write does not reach the word.
+// when the v2 write-value op cannot be resolved, errors, or its first write does not reach the word; and when the v2
+// wait-value op, which the decode stream's copy wait needs on host-mapped memory (LEASE_PROTOCOL.md 7.6), cannot be
+// resolved, errors, does not hold its stream, or is not released by a host store.
 class CudaCopyBackend : public CopyBackend {
  public:
   CudaCopyBackend(int device, std::string prefix) : device_(device), prefix_(std::move(prefix)) {}
@@ -98,6 +100,7 @@ class CudaCopyBackend : public CopyBackend {
     // The v2 stream memory op, never the plain name: that is the v1 API, gated by NVreg_EnableStreamMemOPs (its _V1
     // device attribute reads 0 on divix01, while the v2 ops work; results.md 9b).
     get(cu_write_value32_, "cuStreamWriteValue32_v2");
+    get(cu_wait_value32_, "cuStreamWaitValue32_v2");
     if (!missing.empty()) return "libcuda.so.1 lacks " + missing + ", which the copy engine needs";
     if (int r = cu_init_(0)) return "cuInit failed: " + std::to_string(r);
     if (int r = cu_device_get_(&cu_device_, device_)) return "cuDeviceGet failed: " + std::to_string(r);
@@ -109,7 +112,7 @@ class CudaCopyBackend : public CopyBackend {
     constexpr unsigned kNonBlocking = 1;  // CU_STREAM_NON_BLOCKING: no implicit sync with the legacy stream
     // The greatest priority, for a hardware queue of its own. Streams share CUDA_DEVICE_MAX_CONNECTIONS queues (the
     // server sets 8) and a queue runs in order, so a copy queued behind a stream whose head waits on the decode graph
-    // cannot start until CW gives up: a deadlock only the device deadline breaks. hol_probe.py (raw streams): a fresh
+    // cannot start until CW gives up: a deadlock only the copy-wait timeout breaks. hol_probe.py (raw streams): a fresh
     // default-priority stream waited 596 ms behind 8 blocked ones; greatest-priority kernels and copies never waited,
     // with up to 64 blocked. sglang creates no other greatest-priority stream.
     int least = 0;
@@ -119,7 +122,8 @@ class CudaCopyBackend : public CopyBackend {
     if (int r = cu_stream_create_(&stream_, kNonBlocking, greatest)) {
       return "cuStreamCreateWithPriority failed: " + std::to_string(r);
     }
-    return init_word();
+    if (std::string error = init_word(); !error.empty()) return error;
+    return probe_stream_wait();
   }
 
   int issue(uint64_t dst, uint64_t src, int64_t bytes) override {
@@ -186,6 +190,47 @@ class CudaCopyBackend : public CopyBackend {
     return "";
   }
 
+  // The copy wait's primitive, tried once on this stream at start-up (a bounded poll, as init_word): a wait on a
+  // host-mapped word must hold the stream until a host store satisfies it, then complete. The decode stream's gate
+  // is the same kind of memory and the same op, so a device or driver without it is refused here, not found by a
+  // decode that never ends.
+  std::string probe_stream_wait() {
+    constexpr unsigned kDeviceMap = 2;  // CU_MEMHOSTALLOC_DEVICEMAP
+    constexpr unsigned kGeq = 0;        // CU_STREAM_WAIT_VALUE_GEQ
+    void* host = nullptr;
+    if (int r = cu_mem_host_alloc_(&host, sizeof(uint32_t), kDeviceMap))
+      return "cuMemHostAlloc of the stream-wait probe word failed: " + std::to_string(r);
+    auto* word = static_cast<uint32_t*>(host);
+    __atomic_store_n(word, 0u, __ATOMIC_RELEASE);
+    uint64_t device_word = 0;
+    std::string error;
+    if (int r = cu_mem_host_device_ptr_(&device_word, host, 0)) {
+      error = "cuMemHostGetDevicePointer of the stream-wait probe word failed: " + std::to_string(r);
+    } else if (int r = cu_wait_value32_(stream_, device_word, 1u, kGeq)) {
+      error = "cuStreamWaitValue32_v2 failed (" + std::to_string(r) +
+              "): the copy wait needs the v2 stream wait on host-mapped memory";
+    } else {
+      constexpr int kPolls = 100'000;  // x >= 10 us: at least a second
+      int q = cu_stream_query_(stream_);
+      if (q == 0) {
+        error = "cuStreamWaitValue32_v2 did not hold its stream: the copy wait could not order the decode stream";
+      } else if (q != CompletionWord::kNotReady) {
+        error = "the stream-wait probe failed: cuStreamQuery " + std::to_string(q);
+      }
+      __atomic_store_n(word, 1u, __ATOMIC_RELEASE);  // releases the wait; also on an error, so nothing stays queued
+      for (int i = 0; error.empty(); ++i) {
+        q = cu_stream_query_(stream_);
+        if (q == 0) break;
+        if (q != CompletionWord::kNotReady) error = "the stream-wait probe failed: cuStreamQuery " + std::to_string(q);
+        if (i == kPolls) error = "cuStreamWaitValue32_v2 was not released by a host store within a second";
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+      }
+    }
+    // Freed only once the stream no longer waits on it; a probe that never completed leaks its 4 bytes instead.
+    if (error.empty() || cu_stream_query_(stream_) == 0) cu_mem_free_host_(host);
+    return error;
+  }
+
   int device_;
   std::string prefix_;
   int cu_device_ = 0;
@@ -210,6 +255,7 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_mem_host_device_ptr_)(uint64_t*, void*, unsigned) = nullptr;
   int (*cu_mem_free_host_)(void*) = nullptr;
   int (*cu_write_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
+  int (*cu_wait_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 
 // The copy engine's queues (spec A7/A8): the service's job ring and the copy thread's in-flight, held and acking

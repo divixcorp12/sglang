@@ -49,8 +49,10 @@ constexpr int kFailReason = 14;    // the kLeaseReason* the failing stage record
 constexpr int kStreamPieces = 15;  // piece slices the stream kernel's block 0 copied, cumulative
 constexpr int kStreamPolls = 16;   // stream-kernel leader passes, summed over its blocks, cumulative
 constexpr int kW1Passes = 17;      // stage 1's polling passes over its unclaimed lanes, cumulative
-constexpr int kCopyWaits = 18;     // requests whose copy-engine lanes the copy wait waited for, cumulative
-constexpr int kCopySpun = 19;      // ... of which CopyDone was not yet published on the first read
+constexpr int kCopyWaits = 18;     // requests whose copy-engine lanes the copy wait armed its stream wait for, cumulative
+// ... of which CopyDone was not yet published when CW armed, so the stream wait held the decode stream. The name is
+// the spinning wait's; nothing spins since the stream-ordered copy wait (LEASE_PROTOCOL.md 7.6), and the index stays.
+constexpr int kCopySpun = 19;
 constexpr int kStateWords = 20;
 
 SGL_DEVICE uint32_t ld_acquire_sys(const uint8_t* address) {

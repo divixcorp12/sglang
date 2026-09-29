@@ -35,8 +35,9 @@ HEADER = {
 }
 MAGIC = 0x4C534531  # "LSE1"
 # 2: StreamProbe appended to area D (piece streaming). 3: LaneRequest grown to 128 bytes (destination slots and
-# flags) and area C (CopyDone) appended (copy engine). A block of another version is refused at attach.
-ABI_VERSION = 3
+# flags) and area C (CopyDone) appended (copy engine). 4: area C's copy-wait gate and CopyArm (the stream-ordered copy
+# wait: the decode stream waits on the gate). A block of another version is refused at attach.
+ABI_VERSION = 4
 
 ROW_TABLE = HEADER_BYTES  # rows * {u32 slot_gen_base; u32 capacity}
 ROW_TABLE_ENTRY_BYTES = 8
@@ -84,12 +85,20 @@ AREA_PIECE_MASK_BYTES = RING * LANES * PIECE_MASK_LINE_BYTES
 COPY_DONE_BYTES = 16
 COPY_DONE_FIELDS = {"mask": 0, "gen": 8}
 AREA_COPY_DONE_BYTES = RING * COPY_DONE_BYTES
+# After CopyDone[] (ABI 4, LEASE_PROTOCOL.md 7.6): the copy wait's gate, a u32 on its own line that CW closes before it
+# arms and a host releaser opens once per armed request with an outcome (the decode stream waits on it with
+# cuStreamWaitValue32, GEQ GATE["open"]); then CopyArm, tagged(COPY_ARM_TAG, generation), device-written, the next line.
+COPY_GATE = AREA_COPY_DONE_BYTES
+COPY_ARM = COPY_GATE + 128
+AREA_C_BYTES = COPY_ARM + 8
+GATE = {"closed": 0, "open": 1, "timeout": 2, "aborted": 3}
 
 # Tags of the 8-bit field above the 56-bit generation.
 READY = 1  # RowResult.ready
 LOADING = 2  # RowResult.ready: leased, still loading (piece-streaming plan; task 1)
 COPYING = 3  # RowResult.ready: leased, the service's copy engine writes the lane's destination slot
 COPIED = 1  # CopyDone.gen
+COPY_ARM_TAG = 1  # CopyArm, written by the copy wait
 CONSUMED, VIOLATED = 1, 2  # LaneAck
 DEMAND_TAG = 1  # LaneRequest.gen, written by the post kernel
 TERMINAL_TAG = 1  # Terminal.gen, written by the wait kernel
@@ -151,7 +160,7 @@ def lease_layout(capacities: Sequence[int]) -> LeaseLayout:
         d_offset=d_offset,
         piece_offset=piece_offset,
         copy_offset=copy_offset,
-        total_bytes=_align(copy_offset + AREA_COPY_DONE_BYTES),
+        total_bytes=_align(copy_offset + AREA_C_BYTES),
     )
 
 

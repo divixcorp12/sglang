@@ -1129,12 +1129,16 @@ class ExpertStreamHost:
         """Read each part as sub-reads and vet rows piece by piece; before the thread starts, and needs pack workers."""
         self._module.expert_stream_set_piece_stream(self.handle, 1)
 
-    def enable_copy_engine(self, device: int, *, spin_us: int = 5000) -> None:
+    def enable_copy_engine(self, device: int, *, spin_us: int = 5000, wait_timeout_ms: int = 2000) -> None:
         """Start the copy-engine thread on CUDA device ``device`` (-1: the CPU test backend); before the thread starts.
 
         It copies nothing until :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
+        ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog opens its gate as a timeout (and raises
+        the fatal word) once it has held the decode stream that long (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS in a server).
         """
-        self._module.expert_stream_enable_copy_engine(self.handle, int(device), int(spin_us * 1e3))
+        self._module.expert_stream_enable_copy_engine(
+            self.handle, int(device), int(spin_us * 1e3), int(wait_timeout_ms * 1e6)
+        )
 
     def set_copy_table(self, row: int, table: torch.Tensor, dst_rows: int, *, sm_mask: int = 0) -> None:
         """Row ``row``'s copy table: int64 ``[n, 3]`` of (source slab, destination tensor, row bytes) addresses, as
@@ -1378,7 +1382,8 @@ STATE_WORDS = {
     "stream_polls": 16,
     # Stage 1's (W1's) polling passes, cumulative: under piece streaming it stops once every lane is claimed or LOADING.
     "w1_passes": 17,
-    # The copy wait: requests with copy-engine lanes it waited for, and those whose CopyDone was not yet published.
+    # The copy wait: requests it armed its stream wait for, and those whose CopyDone was not yet published at the arm
+    # (the wait then held the stream; the name is the old spinning wait's).
     "copy_waits": 18,
     "copy_spun": 19,
 }
@@ -1559,6 +1564,7 @@ class ExpertStreamDevice:
         self.claimed = None
         self.violated = None
         self.go_ce = None
+        self.ce_mask = None
         self._lease_c = 0
         # Set by the row backend when it captures a post that lets the service copy (the service arms on it).
         self.copy_engine_captured = False
@@ -1597,6 +1603,8 @@ class ExpertStreamDevice:
             self.violated = torch.zeros(1, dtype=torch.int32, device=device)
             # Lanes the copy wait found COPYING and saw CopyDone for; stays 0 in a chain without a copy wait.
             self.go_ce = torch.zeros(1, dtype=torch.int32, device=device)
+            # The lane mask the copy wait armed for, handed from its arm kernel to its commit kernel; 0: none.
+            self.ce_mask = torch.zeros(1, dtype=torch.int32, device=device)
             self._lease_c = int(lease_layout.copy_offset)
         # Piece streaming (plan 5): the stream kernel S replaces W2 and C2. Its one counter word and abort word are
         # reset by the stream W1 every replay; `stream_fault` is the test-only fault tensor, zero in production.
@@ -1783,8 +1791,11 @@ class ExpertStreamDevice:
     def copy_wait(self, count, sm_table: Optional[torch.Tensor] = None) -> None:
         """The copy-engine wait (LEASE_PROTOCOL.md 7.6), after S and its acknowledgement and before :meth:`finalize`.
 
-        It commits ``go_ce`` once the service's CopyDone names this request and exactly its COPYING lanes. With
-        ``sm_table`` (int64 ``[n, 3]`` on the device, the copy-table rows the service's ``sm_mask`` named), it first
+        Three stream-ordered steps: a kernel that arms area C's gate when the request has COPYING lanes, a
+        ``cuStreamWaitValue32`` on the gate (the decode stream waits, no SM spins), and a kernel that commits ``go_ce``
+        only if the service opened the gate on a CopyDone naming this request and exactly its COPYING lanes. The service
+        opens it on a timeout, the fatal word or shutdown too, and the commit then fails closed. With ``sm_table``
+        (int64 ``[n, 3]`` on the device, the copy-table rows the service's ``sm_mask`` named), the arm kernel first
         reads those entries of every COPYING lane from its leased slot and publishes SmAck.
         """
         if not self.piece_stream:
@@ -1799,7 +1810,7 @@ class ExpertStreamDevice:
             sm_address, sm_count = sm_table.data_ptr(), int(sm_table.shape[0])
         self._kernels().expert_stream_lease_copy_wait(
             self.page, self.state, count, self._lease_address, self._lease_c, self._lease_d, sm_address, sm_count,
-            self.go_ce, int(self.lease_pdl),
+            self.go_ce, self.ce_mask, int(self.lease_pdl),
         )
 
     def finalize(self, count, keep) -> None:

@@ -20,7 +20,9 @@
 // or fails closed with go_count 0 and a Terminal record; lease_ack is launched after the copy kernel, in the
 // same stream, and release-stores one LaneAck word per committed lane (section 6.4 says why it is a separate kernel).
 // Copy engine (LEASE_PROTOCOL.md 7.6): the service may publish a hit lane as COPYING and copy it with the DMA engine
-// itself; copy_wait then waits for the service's CopyDone word instead of any kernel copying or acknowledging it.
+// itself; copy_wait then waits for the service's CopyDone word instead of any kernel copying or acknowledging it. That
+// wait does not spin: a kernel arms area C's gate, cuStreamWaitValue32 holds the stream until a host releaser opens it
+// (CopyDone, a timeout, the fatal or shutdown word), and a commit kernel checks what it opened on.
 
 #include "exl3/exl3_row_layout.h"
 #include "expert_stream/lease_kernels.cuh"

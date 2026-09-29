@@ -218,7 +218,7 @@ def test_the_lane_request_carries_the_destination_slots_and_the_flag(tmp_path):
         f = lease.LANE_REQUEST_FIELDS
         assert sim._i32(base + f["dst_slot"], lease.LANES).tolist() == [7, 9] + [-1] * (lease.LANES - 2)
         assert int(sim._i32(base + f["flags"])[0]) == lease.LANE_REQUEST_FLAG_COPY_ENGINE
-        assert host.lease_header()["abi_version"] == lease.ABI_VERSION == 3
+        assert host.lease_header()["abi_version"] == lease.ABI_VERSION == 4
         assert host.lease_header()["copy_offset"] == host.lease_layout.copy_offset
     finally:
         host.stop()
@@ -401,3 +401,97 @@ def test_the_sm_table_refuses_a_small_tensor_off_16_byte_alignment():
     for bad in (0b0010, 0b0100, 0b1000):
         with pytest.raises(ValueError, match="16-byte"):
             sm_copy_table(segments, bad)
+
+
+# ---- The stream-ordered copy wait (LEASE_PROTOCOL.md 7.6): the host opens the gate the decode stream waits on ----
+
+
+def test_the_gate_starts_open_so_a_copy_wait_that_arms_nothing_passes(tmp_path):
+    s, page, host, sim = _host(tmp_path)
+    try:
+        _copy_engine(s, host)
+        assert sim.copy_gate() == lease.GATE["open"]
+    finally:
+        host.stop()
+
+
+def test_the_copy_thread_opens_an_armed_gate_once_copydone_is_published(tmp_path):
+    """The device armed before the copy completed: the copy thread opens the gate right after CopyDone. Mutant: open on
+    the grant, or before CopyDone -- red on the closed-gate check made while the mark is held."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        _copy_engine(s, host)
+        _load(sim, host, [3])
+        req = sim.post(ROW, [3], dst=[2], copy_engine=True)
+        assert host.pump() == 1 and sim.row_result(req, 0)["tag"] == lease.COPYING
+        sim.arm_copy_wait(req)
+        host.pump()
+        time.sleep(0.05)  # every releaser has had its chance to open early
+        assert sim.copy_gate() == lease.GATE["closed"], "the gate opened before CopyDone"
+        host.copy_engine_release(1)
+        assert _until(lambda: sim.copy_gate() == lease.GATE["open"]), sim.copy_gate()
+        assert sim.copy_done(req) == (lease.COPIED, req.gen, 1)
+        assert page_word(page, "fatal") == 0
+    finally:
+        host.stop()
+
+
+def test_a_gate_armed_after_its_copydone_is_opened_by_the_service(tmp_path):
+    """The DMA finished before the device armed, so the copy thread found nothing armed: the service's next poll
+    opens the gate. Mutant: open only from the copy thread -- red here (the gate stays closed)."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        _copy_engine(s, host)
+        _load(sim, host, [3])
+        req = sim.post(ROW, [3], dst=[2], copy_engine=True)
+        assert host.pump() == 1
+        host.copy_engine_release(1)
+        assert _until(lambda: sim.copy_done(req) == (lease.COPIED, req.gen, 1))
+        sim.arm_copy_wait(req)
+        time.sleep(0.02)
+        assert sim.copy_gate() == lease.GATE["closed"]
+        host.pump()
+        assert sim.copy_gate() == lease.GATE["open"]
+    finally:
+        host.stop()
+
+
+def test_close_admission_opens_an_armed_gate_as_aborted(tmp_path):
+    s, page, host, sim = _host(tmp_path)
+    try:
+        _copy_engine(s, host)
+        _load(sim, host, [3])
+        req = sim.post(ROW, [3], dst=[2], copy_engine=True)
+        assert host.pump() == 1
+        sim.arm_copy_wait(req)
+        host.close_admission()
+        assert sim.copy_gate() == lease.GATE["aborted"]
+    finally:
+        host.copy_engine_release(-1)
+        host.stop()
+
+
+def test_the_watchdog_times_out_a_copy_wait_whose_copy_never_completes(tmp_path):
+    """A copy held forever against a 50 ms copy-wait timeout: the watchdog raises the fatal word, then opens the gate
+    as a timeout, with the copy thread (the job's mark is never released) and the service both idle."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=50)
+        dst = {n: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype) for n, slab in s.slabs[ROW].items()}
+        table = torch.tensor(
+            [[slab.data_ptr(), dst[n].data_ptr(), slab[0].numel() * slab.element_size()] for n, slab in s.slabs[ROW].items()],
+            dtype=torch.int64,
+        )
+        host.set_copy_table(ROW, table, DST_ROWS)
+        host.arm_copy_engine()
+        _load(sim, host, [3])
+        req = sim.post(ROW, [3], dst=[2], copy_engine=True)
+        assert host.pump() == 1 and sim.row_result(req, 0)["tag"] == lease.COPYING
+        host.start_thread()
+        sim.arm_copy_wait(req)
+        assert _until(lambda: sim.copy_gate() == lease.GATE["timeout"], 5.0), sim.copy_gate()
+        assert page_word(page, "fatal") != 0
+        assert sim.copy_done(req)[:2] != (lease.COPIED, req.gen)
+    finally:
+        host.copy_engine_release(-1)
+        host.stop()

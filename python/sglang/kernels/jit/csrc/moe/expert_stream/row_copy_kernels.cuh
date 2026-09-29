@@ -8,6 +8,7 @@
 #include "row_layout.h"
 #include "tensor_checks.h"
 #include <bit>
+#include <dlfcn.h>
 
 namespace sglang {
 
@@ -511,10 +512,15 @@ SGL_DEVICE void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) 
     device::expert_stream::stream_copy1(src + b, dst + b);
 }
 
-// Copy-engine wait (LEASE_PROTOCOL.md 7.6), after S and A2 and before F. The COPYING lanes are read back from the row
-// results rather than from W1's claims, because S also hands over the ones W1's budget missed. It commits go_ce only
-// once CopyDone carries this generation and exactly that lane mask; any other exit leaves go_ce 0 and records the
-// failure for F, which publishes the terminal. It never writes keep, a terminal or the fatal word.
+// Copy-engine wait (LEASE_PROTOCOL.md 7.6), after S and A2 and before F: three stream-ordered steps, and nothing
+// spins. (1) This kernel reads the COPYING lanes back from the row results rather than from W1's claims (S also hands
+// over the ones W1's budget missed) and, when there are any, arms: it closes area C's gate, publishes CopyArm =
+// tagged(kLeaseTagCopyArm, G) and leaves the lane mask in `ce_mask`. (2) cuStreamWaitValue32 holds the decode stream
+// (no SM) until a host releaser opens the gate: with kLeaseGateOpen once CopyDone carries G, kLeaseGateTimeout at the
+// host's deadline, kLeaseGateAborted on the fatal or shutdown word. (3) The commit kernel commits go_ce only if the
+// gate is open, CopyDone carries G and exactly that lane mask; any other exit leaves go_ce 0 and records the failure
+// for F, which publishes the terminal. Neither kernel writes keep or a terminal; neither raises the fatal word (a
+// host timeout raised it before opening the gate).
 //
 // SM small copies (`sm_count` > 0, SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): the copy engine copied only the
 // row's other entries, so first the whole block reads the `sm_count` entries of `sm_table` ({source slab, destination
@@ -531,6 +537,15 @@ struct CopyWaitParams {
   int64_t lease_d;
   const int64_t* sm_table;
   int64_t sm_count;
+  int32_t* go_ce;
+  int32_t* ce_mask;  // the armed lane mask, for the commit kernel; 0: nothing armed
+};
+
+struct CopyCommitParams {
+  int32_t* state;
+  const uint8_t* lease;
+  int64_t lease_c;
+  const int32_t* ce_mask;
   int32_t* go_ce;
 };
 
@@ -553,6 +568,7 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   const int64_t* __restrict__ const sm_table = p.sm_table;
   const int64_t sm_count = p.sm_count;
   int32_t* __restrict__ const go_ce = p.go_ce;
+  int32_t* __restrict__ const ce_mask = p.ce_mask;
   using namespace device::expert_stream;
   __shared__ uint32_t sm_mask;  // the lanes whose SM entries this kernel read; the commit must name exactly them
   if (sm_count > 0) {
@@ -607,7 +623,8 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
     }
   }
   if (threadIdx.x != 0) return;
-  go_ce[0] = 0;  // fail closed
+  go_ce[0] = 0;    // fail closed
+  ce_mask[0] = 0;  // nothing armed: the commit kernel commits nothing
   const int64_t planned_count = max(static_cast<int64_t>(count[0]), static_cast<int64_t>(0));
   const uint32_t seq = static_cast<uint32_t>(state[kPending]);
   // An earlier stage's failure is F's to publish; a request that never armed has no copy-engine lanes.
@@ -630,27 +647,56 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
     return;
   }
   if (mask == 0) return;
-  state[kCopyWaits] += 1;
-  const uint8_t* done = lease + lease_c + idx * kLeaseCopyDoneBytes;
-  const uint64_t expected = tagged_word(kLeaseTagCopied, generation);
-  const uint64_t deadline = load_deadline(state);
-  uint32_t reason = 0;
-  uint64_t word = ld_acquire_sys64(done + kLeaseCdGen);
-  if (word != expected) state[kCopySpun] += 1;
-  while (word != expected) {
-    if (static_cast<int64_t>(global_ns() - deadline) >= 0) {
-      reason = kLeaseReasonTimeout;
-      break;
-    }
-    if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) {
-      reason = kLeaseReasonAborted;
-      break;
-    }
-    __nanosleep(256);
-    word = ld_acquire_sys64(done + kLeaseCdGen);
+  // The fatal and shutdown words are sticky: with either raised no request arms, and this one fails as the spinning
+  // wait's early exit did.
+  if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) {
+    state[kReqFailed] = 1;
+    if (state[kFailReason] == 0) state[kFailReason] = static_cast<int32_t>(kLeaseReasonAborted);
+    return;
   }
-  // The acquire of the tagged word orders this load after it: the service stores the mask first.
-  if (reason == 0 && ld_relaxed_sys<uint32_t>(done + kLeaseCdMask) != mask) {
+  state[kCopyWaits] += 1;
+  // Arm: close the gate, then name G. A host releaser opens the gate only after it read CopyArm == G, so its store
+  // lands after this close; one of G's own is the only store that can open it (LEASE_PROTOCOL.md 7.6).
+  uint8_t* const area_c = lease + lease_c;
+  st_relaxed_sys<uint32_t>(area_c + kLeaseCopyGate, kLeaseGateClosed);
+  st_release_sys64(area_c + kLeaseCopyArm, tagged_word(kLeaseTagCopyArm, generation));  // the release orders the close
+  ce_mask[0] = static_cast<int32_t>(mask);
+  __threadfence_system();  // store->load: the arm before the reads below (Dekker with close_admission's fence)
+  const uint8_t* done = area_c + idx * kLeaseCopyDoneBytes;
+  if (ld_acquire_sys64(done + kLeaseCdGen) != tagged_word(kLeaseTagCopied, generation)) state[kCopySpun] += 1;
+  if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) {
+    // Raised after the check above: open the gate ourselves, so the wait ends with no host thread left to poll. Safe
+    // only because both words are sticky: no later request arms, so a host store for G landing late opens nothing.
+    st_release_sys(area_c + kLeaseCopyGate, kLeaseGateAborted);
+  }
+}
+
+// The copy wait's step (3), after the stream wait on the gate: a plain launch (no PDL; the wait node before it is not
+// a kernel, so there is no programmatic edge to keep). It never waits: a gate or CopyDone that is not what it needs is
+// a failure, recorded for F exactly as the spinning wait's timeout and identity exits were.
+__global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_copy_commit_kernel(
+    const __grid_constant__ CopyCommitParams p) {
+  using namespace device::expert_stream;
+  if (threadIdx.x != 0) return;
+  int32_t* __restrict__ const state = p.state;
+  const uint32_t mask = static_cast<uint32_t>(p.ce_mask[0]);
+  if (mask == 0) return;  // nothing armed: go_ce stays the 0 the arm kernel wrote
+  // kPending and kPendingEpoch change only at the next post, stream-ordered after this kernel.
+  const uint32_t seq = static_cast<uint32_t>(state[kPending]);
+  const uint64_t generation = (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq;
+  const int64_t idx = static_cast<int64_t>((seq - 1u) % kDemandRecords);
+  const uint8_t* area_c = p.lease + p.lease_c;
+  const uint8_t* done = area_c + idx * kLeaseCopyDoneBytes;
+  const uint32_t gate = ld_acquire_sys(area_c + kLeaseCopyGate);
+  uint32_t reason = 0;
+  if (gate == kLeaseGateTimeout) {
+    reason = kLeaseReasonTimeout;
+  } else if (gate == kLeaseGateAborted) {
+    reason = kLeaseReasonAborted;
+  } else if (gate != kLeaseGateOpen || ld_acquire_sys64(done + kLeaseCdGen) != tagged_word(kLeaseTagCopied, generation)) {
+    reason = kLeaseReasonFailed;  // the host opens the gate only on this CopyDone: an internal error, fail closed
+  } else if (ld_relaxed_sys<uint32_t>(done + kLeaseCdMask) != mask) {
+    // The acquire of the tagged word orders this load after it: the service stores the mask first.
     reason = kLeaseReasonIdentity;
   }
   if (reason != 0) {
@@ -659,8 +705,25 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
     if (reason == kLeaseReasonTimeout) state[kTimeouts] += 1;
     return;
   }
-  go_ce[0] = __popc(mask);  // the single commit point
+  p.go_ce[0] = __popc(mask);  // the single commit point
 }
+
+namespace expert_stream {
+
+// cuStreamWaitValue32_v2 from libcuda.so.1, resolved once. The v2 name, never the plain one: that is the v1 API,
+// gated by NVreg_EnableStreamMemOPs (copy_engine.h). Null when the driver lacks it; the launcher then refuses.
+using StreamWaitValue32 = int (*)(void*, uint64_t, uint32_t, unsigned);
+inline StreamWaitValue32 stream_wait_value32() {
+  static const StreamWaitValue32 fn = [] {
+    void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (lib == nullptr) lib = dlopen("libcuda.so.1", RTLD_NOW);
+    return lib == nullptr ? nullptr : reinterpret_cast<StreamWaitValue32>(dlsym(lib, "cuStreamWaitValue32_v2"));
+  }();
+  return fn;
+}
+constexpr unsigned kStreamWaitValueGeq = 0;  // CU_STREAM_WAIT_VALUE_GEQ: (int32_t)(*addr - value) >= 0
+
+}  // namespace expert_stream
 
 /// \brief Checked host launchers for the row-copy kernels above (lease_stream, lease_copy_wait), templated on the
 /// streamed row's compile-time layout facts (name count, small-tensor mask). FFI signatures are unchanged from the
@@ -807,6 +870,7 @@ struct RowCopyKernel {
       int64_t sm_table_address,
       int64_t sm_count,
       tvm::ffi::TensorView go_ce,
+      tvm::ffi::TensorView ce_mask,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -823,6 +887,8 @@ struct RowCopyKernel {
         state);
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named("go_ce", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_ce);
+    expert_stream::verify_named(
+        "ce_mask", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ce_mask);
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -830,6 +896,9 @@ struct RowCopyKernel {
     if (lease_address != 0) {
       RuntimeCheck(lease_d % kLeaseBlockAlign == 0, "lease_d: must be a multiple of kLeaseBlockAlign");
       RuntimeCheck(lease_c % kLeaseBlockAlign == 0, "lease_c: must be a multiple of kLeaseBlockAlign");
+      RuntimeCheck(
+          expert_stream::stream_wait_value32() != nullptr,
+          "the copy wait needs cuStreamWaitValue32_v2, which libcuda.so.1 does not provide");
     }
     RuntimeCheck(
         sm_count <= static_cast<int64_t>(std::popcount(L::kSmallMask)),
@@ -848,9 +917,29 @@ struct RowCopyKernel {
         .sm_table = reinterpret_cast<const int64_t*>(sm_table_address),
         .sm_count = sm_count,
         .go_ce = static_cast<int32_t*>(go_ce.data_ptr()),
+        .ce_mask = static_cast<int32_t*>(ce_mask.data_ptr()),
     };
     LaunchKernel(1, threads, stream).enable_pdl(use_pdl != 0)(
         use_pdl != 0 ? exl3_ram_miss_lease_copy_wait_kernel<true> : exl3_ram_miss_lease_copy_wait_kernel<false>, params);
+    // The gate's values are a fixed set, not a counter, so the cyclic GEQ never wraps: (int32_t)(gate - 1) >= 0 holds
+    // for every open outcome and fails only for kLeaseGateClosed. Which request the gate opened for is the arm's
+    // CopyArm and the commit kernel's CopyDone check, never this compare. Captured as a memory-op node of the graph.
+    if (lease_address != 0) {
+      const int r = expert_stream::stream_wait_value32()(
+          static_cast<void*>(stream),
+          static_cast<uint64_t>(lease_address + lease_c + kLeaseCopyGate),
+          kLeaseGateOpen,
+          expert_stream::kStreamWaitValueGeq);
+      RuntimeCheck(r == 0, "the copy wait's cuStreamWaitValue32_v2 on the gate failed: CUresult ", r);
+    }
+    const auto commit = CopyCommitParams{
+        .state = static_cast<int32_t*>(state.data_ptr()),
+        .lease = reinterpret_cast<const uint8_t*>(lease_address),
+        .lease_c = lease_c,
+        .ce_mask = static_cast<const int32_t*>(ce_mask.data_ptr()),
+        .go_ce = static_cast<int32_t*>(go_ce.data_ptr()),
+    };
+    LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_copy_commit_kernel, commit);
   }
 };
 

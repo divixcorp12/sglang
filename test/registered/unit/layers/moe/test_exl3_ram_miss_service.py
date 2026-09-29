@@ -1155,7 +1155,7 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
     else:
         monkeypatch.setenv("CUDA_MODULE_LOADING", value)
 
-    def reached(self, device):
+    def reached(self, device, **kwargs):
         raise _CopyEngineReached
 
     monkeypatch.setattr(module.ExpertStreamHost, "enable_copy_engine", reached)

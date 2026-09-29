@@ -52,6 +52,18 @@ def test_area_c_follows_area_p_and_the_block_ends_after_it():
     assert lease.HEADER["copy_offset"] == lease.HEADER["piece_offset"] + 4 < lease.HEADER_BYTES
 
 
+def test_area_c_holds_the_copy_wait_gate_and_arm_word_on_lines_of_their_own():
+    """ABI 4 (LEASE_PROTOCOL.md 7.6, the stream-ordered copy wait): the gate the decode stream waits on and CopyArm,
+    each on its own 128-byte line after CopyDone[], all inside area C's page."""
+    layout = lease.lease_layout([5, 7])
+    assert lease.ABI_VERSION == 4
+    assert lease.COPY_GATE >= lease.AREA_COPY_DONE_BYTES and lease.COPY_GATE % 128 == 0
+    assert lease.COPY_ARM >= lease.COPY_GATE + 128 and lease.COPY_ARM % 128 == 0
+    assert lease.AREA_C_BYTES == lease.COPY_ARM + 8 <= lease.BLOCK_ALIGN
+    assert layout.copy_offset + lease.AREA_C_BYTES <= layout.total_bytes
+    assert lease.GATE == {"closed": 0, "open": 1, "timeout": 2, "aborted": 3}
+
+
 def test_area_p_header_offset_is_a_new_header_word_beside_d_offset():
     assert lease.HEADER["piece_offset"] == lease.HEADER["d_offset"] + 4
     assert lease.HEADER["piece_offset"] < lease.HEADER_BYTES

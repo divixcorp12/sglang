@@ -549,7 +549,7 @@ PREFILL_SHARE_ROWS = EXL3_MAX_GATHER_ROWS
 
 # The copy engine needs every kernel of every library loaded before it arms (LEASE_PROTOCOL.md 7.6, "Module loading").
 # Under LAZY (torch's default) a kernel loads at its first launch, and a first launch after arming can stop the copy
-# thread's copies until the device deadline fail-stops the server: the soak's seeded pair of min_p requests (a 525-
+# thread's copies until the copy-wait timeout fail-stops the server: the soak's seeded pair of min_p requests (a 525-
 # token prompt, then a 3,314-token one) did so on the second's 14th decode step, every time, and never under EAGER
 # (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). EAGER loads a library's kernels when it is loaded, so
 # what remains is a library loaded after arming, which the module-load guard drains for.
@@ -738,7 +738,8 @@ class Exl3RamMissService:
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE needs "
                         "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM"
                     )
-                host.enable_copy_engine(torch.cuda.current_device())  # before the thread starts; unarmed
+                # Before the thread starts; unarmed. The watchdog bounds each copy wait by the RAM-miss timeout.
+                host.enable_copy_engine(torch.cuda.current_device(), wait_timeout_ms=cfg.ram_miss_timeout_ms)
             native_prefetch = None
             if cfg.enable_native_prefetch:
                 if not copy_engine:
@@ -1027,7 +1028,7 @@ class Exl3RamMissService:
         before a module loads.
 
         ``cuModuleLoadData`` takes the driver lock that the copy thread's ``cuMemcpyAsync`` needs and then waits for
-        the device, which may be spinning in a copy wait for exactly that copy: a deadlock the device deadline ends in
+        the device, whose stream may be held in a copy wait for exactly that copy: a deadlock the copy-wait timeout ends in
         a fail-stop (smoke diag/arm1eager83-on: the scheduler in ``loadBinary`` -> ``cuModuleLoadData``, the copy
         thread in ``cuMemcpyAsync`` on the lock, 20 s). Draining first is safe, because no load holds the lock yet.
         """

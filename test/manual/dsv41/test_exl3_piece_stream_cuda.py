@@ -151,6 +151,7 @@ class StreamService:
     def __init__(
         self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, layers=LAYERS,
         row=0, copy_engine=False, native_prefetch=False, sm_small=False, mirror_weights=None, variant=None,
+        copy_wait_timeout_ms=None,
     ):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
@@ -183,7 +184,11 @@ class StreamService:
             if piece_stream:
                 self.host.enable_piece_stream()
             if copy_engine:
-                self.host.enable_copy_engine(torch.cuda.current_device())
+                # The copy wait's deadline is the service watchdog's (LEASE_PROTOCOL.md 7.6), not the device's.
+                self.host.enable_copy_engine(
+                    torch.cuda.current_device(),
+                    wait_timeout_ms=timeout_ms if copy_wait_timeout_ms is None else copy_wait_timeout_ms,
+                )
             self.prefetch_page = None
             if native_prefetch:  # the native-prefetch request and done lines (test_exl3_native_prefetch_cuda.py)
                 from sglang.kernels.ops.moe.expert_stream_transport import new_prefetch_page

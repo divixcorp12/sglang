@@ -64,10 +64,13 @@ def test_volatile_lives_only_in_the_relaxed_helpers():
     ]
 
 
-def test_only_the_smack_publish_keeps_a_seq_cst_system_fence():
+def test_only_the_smack_publish_and_the_copy_wait_arm_keep_a_seq_cst_system_fence():
     # The five seqlock fences are acquire/release (Boehm's shape, paired with the host's); SmAck orders other
     # threads' loads through __syncthreads before thread 0's release, a different argument, so it stays seq_cst.
+    # The copy wait's arm orders its CopyArm store before its loads of the fatal and shutdown words (a Dekker pair
+    # with the host's seq_cst fence after raising either, LEASE_PROTOCOL.md 7.6): store->load needs seq_cst.
     assert [(name, code) for name, _, code in matches(r"__threadfence_system\(\)")] == [
+        ("row_copy_kernels.cuh", "__threadfence_system();"),
         ("row_copy_kernels.cuh", "__threadfence_system();"),
     ]
 

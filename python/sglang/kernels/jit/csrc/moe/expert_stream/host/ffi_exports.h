@@ -828,8 +828,8 @@ struct HostExports {
     find(handle)->set_piece_stream(on != 0);
   }
 
-  static void enable_copy_engine(int64_t handle, int64_t device, int64_t spin_ns) {
-    find(handle)->enable_copy_engine(device, spin_ns);
+  static void enable_copy_engine(int64_t handle, int64_t device, int64_t spin_ns, int64_t wait_timeout_ns) {
+    find(handle)->enable_copy_engine(device, spin_ns, wait_timeout_ns);
   }
 
   // entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination;
