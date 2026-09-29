@@ -58,7 +58,8 @@ FILLS_CHILD = textwrap.dedent("""
     _load = ops._host_module_cached
     ops._host_module_cached = lambda layout, variant: (
         ops._host_module_tsan(layout) if variant == "instr" else _load(layout, variant))
-    code = pytest.main(["-q", "-p", "no:randomly", "-p", "no:cacheprovider", "-x", *sys.argv[1:]])
+    # -s: pytest's fd capture would swallow a TSan report, which is written to fd 2 just before TSan exits (66).
+    code = pytest.main(["-q", "-s", "-p", "no:randomly", "-p", "no:cacheprovider", "-x", *sys.argv[1:]])
     print("TSAN-FILLS-EXIT", int(code))
     sys.exit(int(code))
 """)
