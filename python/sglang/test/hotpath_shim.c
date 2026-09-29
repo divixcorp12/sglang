@@ -15,6 +15,16 @@
 // "<path>.<pid>" when the path already exists, so no process overwrites another's counts. The destructor runs at a
 // normal exit (exit(), which Python's own shutdown calls); a process killed by a signal writes nothing.
 //
+// Call-site capture (HOTPATH_SHIM_STACKS=<path>, final-fix round: attributing arm C's copy-thread counts): the shim is
+// armed at load, as with HOTPATH_SHIM_OUT, and for each (role, kind) it records the backtrace() of the first
+// HOTPATH_SHIM_STACKS_FIRST calls (default 256) and then of every HOTPATH_SHIM_STACKS_EVERY-th call (default 65536)
+// into a fixed static table (the sampled records cycle through the table's remaining slots, so the last ones are
+// kept). At exit the process that recognized a tracked thread writes, with open/write and no allocation, one line
+// per record, "S <role> <kind> <seq> <depth> <addr>...", then its /proc/self/maps as "M <line>" lines, to <path> (or
+// <path>.<pid> when taken). sglang.test.hotpath_shim.read_stacks/symbolize turn that into call sites. backtrace() is
+// primed in the constructor (its first call loads libgcc_s and allocates), and while a thread captures, a thread-local
+// flag makes every hook pass straight through: the unwinder's own calls are neither counted nor captured.
+//
 // What a zero from this shim does NOT rule out (the calls it cannot see):
 //   - allocations libc makes internally (e.g. inside fopen, qsort, getaddrinfo or the dynamic loader), which call
 //     the allocator without going through the interposed PLT symbols;
@@ -28,6 +38,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -48,8 +59,43 @@ static _Atomic int armed;
 // through __tls_get_addr (which may itself allocate for dynamically loaded modules).
 static __thread int who __attribute__((tls_model("initial-exec"))) = -1;  // 0 service, 1 copy engine, -1 untracked
 
-#define COUNT(kind) do { if (who >= 0 && atomic_load_explicit(&armed, memory_order_relaxed)) \
-    atomic_fetch_add_explicit(&counts[who][kind], 1, memory_order_relaxed); } while (0)
+// Call-site capture (HOTPATH_SHIM_STACKS). A record is written by the one thread that drew its slot; a reader (the
+// exit dump) takes only records whose `ready` is set, after the thread has left.
+enum { kStackDepth = 32, kStackSlots = 512 };
+struct StackRecord {
+  _Atomic int ready;
+  int depth;
+  long seq;  // the call's index in its (role, kind) count
+  void* frames[kStackDepth];
+};
+static struct StackRecord stacks[2][kKinds][kStackSlots];
+static int stacks_on;
+static long stacks_first = 256, stacks_every = 65536;
+static char stacks_path[4096];
+static __thread int capturing __attribute__((tls_model("initial-exec")));  // inside backtrace(): pass everything through
+
+static void capture(int role, int kind, long seq) {
+  long slot;
+  if (seq < stacks_first) {
+    slot = seq;
+  } else if (seq % stacks_every == 0) {
+    slot = stacks_first + (seq / stacks_every) % (kStackSlots - stacks_first);
+  } else {
+    return;
+  }
+  if (slot < 0 || slot >= kStackSlots) return;
+  struct StackRecord* r = &stacks[role][kind][slot];
+  atomic_store_explicit(&r->ready, 0, memory_order_relaxed);
+  capturing = 1;
+  r->depth = backtrace(r->frames, kStackDepth);
+  capturing = 0;
+  r->seq = seq;
+  atomic_store_explicit(&r->ready, 1, memory_order_release);
+}
+
+#define COUNT(kind) do { if (who >= 0 && !capturing && atomic_load_explicit(&armed, memory_order_relaxed)) { \
+    long seq_ = atomic_fetch_add_explicit(&counts[who][kind], 1, memory_order_relaxed); \
+    if (stacks_on) capture(who, kind, seq_); } } while (0)
 
 extern void* __libc_malloc(size_t);
 extern void* __libc_calloc(size_t, size_t);
@@ -106,6 +152,21 @@ __attribute__((constructor)) static void resolve(void) {
     strcpy(out_path, out);
     atomic_store(&armed, 1);
   }
+  const char* st = getenv("HOTPATH_SHIM_STACKS");
+  if (st != NULL && st[0] != '\0' && strlen(st) < sizeof(stacks_path) - 32) {
+    strcpy(stacks_path, st);
+    const char* first = getenv("HOTPATH_SHIM_STACKS_FIRST");
+    const char* every = getenv("HOTPATH_SHIM_STACKS_EVERY");
+    if (first != NULL && first[0] != '\0') stacks_first = atol(first);
+    if (every != NULL && every[0] != '\0') stacks_every = atol(every);
+    if (stacks_first < 0) stacks_first = 0;
+    if (stacks_first > kStackSlots - 1) stacks_first = kStackSlots - 1;
+    if (stacks_every < 1) stacks_every = 1;
+    void* prime[4];
+    backtrace(prime, 4);  // loads libgcc_s and allocates now, on no tracked thread
+    stacks_on = 1;
+    atomic_store(&armed, 1);
+  }
 }
 
 // A hook still NULL when it is first called (a call made before the constructor ran, e.g. from another preloaded
@@ -160,8 +221,63 @@ long hotpath_shim_threads(int thread) { return atomic_load(&threads_seen[thread]
 
 static const char* const kKindNames[kKinds] = {"malloc", "free", "mutex", "cond", "clock", "sleep", "futex"};
 
-// The exit dump (HOTPATH_SHIM_OUT). Formats into a stack buffer and writes with open/write: no stdio, no allocation.
+// Opens `path` for a new dump, or "<path>.<pid>" when a process already wrote `path`. -1 on failure.
+static int open_dump(const char* path) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd < 0 && errno == EEXIST) {
+    char alt[4096 + 16];
+    snprintf(alt, sizeof(alt), "%s.%d", path, (int)getpid());
+    fd = open(alt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  }
+  return fd;
+}
+
+static void write_all(int fd, const char* buf, size_t n) {
+  for (size_t off = 0; off < n;) {
+    ssize_t w = write(fd, buf + off, n - off);
+    if (w <= 0) return;
+    off += (size_t)w;
+  }
+}
+
+// The HOTPATH_SHIM_STACKS dump: every ready record, then this process's maps (for symbolizing the addresses).
+static void dump_stacks(void) {
+  int fd = open_dump(stacks_path);
+  if (fd < 0) return;
+  char line[64 + kStackDepth * 20];
+  for (int t = 0; t < 2; ++t)
+    for (int k = 0; k < kKinds; ++k)
+      for (int i = 0; i < kStackSlots; ++i) {
+        const struct StackRecord* r = &stacks[t][k][i];
+        if (!atomic_load_explicit(&r->ready, memory_order_acquire)) continue;
+        int n = snprintf(line, sizeof(line), "S %d %d %ld %d", t, k, r->seq, r->depth);
+        for (int f = 0; f < r->depth; ++f) n += snprintf(line + n, sizeof(line) - n, " %lx", (unsigned long)r->frames[f]);
+        n += snprintf(line + n, sizeof(line) - n, "\n");
+        write_all(fd, line, (size_t)n);
+      }
+  int maps = open("/proc/self/maps", O_RDONLY);
+  if (maps >= 0) {
+    char chunk[4096], cur[4096 + 3];
+    size_t len = 0;
+    ssize_t got;
+    while ((got = read(maps, chunk, sizeof(chunk))) > 0) {
+      for (ssize_t i = 0; i < got; ++i) {
+        if (len == 0) { cur[0] = 'M'; cur[1] = ' '; len = 2; }
+        if (len < sizeof(cur) - 1) cur[len++] = chunk[i];
+        if (chunk[i] == '\n') { write_all(fd, cur, len); len = 0; }
+      }
+    }
+    close(maps);
+  }
+  close(fd);
+}
+
+// The exit dumps (HOTPATH_SHIM_OUT, HOTPATH_SHIM_STACKS). Formats into stack buffers and writes with open/write: no
+// stdio, no allocation.
 __attribute__((destructor)) static void dump(void) {
+  if (out_path[0] == '\0' && stacks_path[0] == '\0') return;
+  if (atomic_load(&threads_seen[0]) + atomic_load(&threads_seen[1]) == 0) return;  // not the service's process
+  if (stacks_path[0] != '\0') dump_stacks();
   if (out_path[0] == '\0') return;
   const long seen0 = atomic_load(&threads_seen[0]), seen1 = atomic_load(&threads_seen[1]);
   if (seen0 + seen1 == 0) return;  // not the process that ran the service: leave the file to the one that did
@@ -176,17 +292,8 @@ __attribute__((destructor)) static void dump(void) {
     n += snprintf(buf + n, sizeof(buf) - n, "}");
   }
   n += snprintf(buf + n, sizeof(buf) - n, "}\n");
-  int fd = open(out_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
-  if (fd < 0 && errno == EEXIST) {
-    char alt[sizeof(out_path) + 16];
-    snprintf(alt, sizeof(alt), "%s.%d", out_path, (int)getpid());
-    fd = open(alt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  }
+  int fd = open_dump(out_path);
   if (fd < 0) return;
-  for (int off = 0; off < n;) {
-    ssize_t w = write(fd, buf + off, n - off);
-    if (w <= 0) break;
-    off += (int)w;
-  }
+  write_all(fd, buf, (size_t)n);
   close(fd);
 }

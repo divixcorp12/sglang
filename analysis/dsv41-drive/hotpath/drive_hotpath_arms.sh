@@ -34,6 +34,12 @@
 # 0:51200,1:40960 / 92160; both passed to every arm as identical overrides; re-checked before each later arm at the
 # same values, and short means stop.
 # Lock order: rowimg-disk.lock is held across all arms; cc-gpu.lock is polled here and taken by run_arm.sh itself.
+# Final-fix round (call-site attribution of C's counts): two more arms, run by ARMS="CS CM", never by default:
+#   - CS: the branch under the shim (as C) with HOTPATH_SHIM_STACKS=$OUT/CS-stacks.txt, HOTPATH_SHIM_OUT=$OUT/CS-shim.json;
+#   - CM: master with master's recipe under the same shim, $OUT/CM-stacks.txt and $OUT/CM-shim.json.
+#   Neither needs A: they are not timed and have no identity gate before them; each arm's stacks are attributed by
+#   final-fix/attribute_stacks.py once it ends. With REF_RUN=<a run dir> (Task 18's A), every arm's output is also
+#   compared byte for byte with it; hotpath_report.py runs only when ARMS includes A.
 # Usage: drive_hotpath_arms.sh <base_worktree> <base_sha> <branch_worktree> <branch_sha> <out_dir under /mnt/nvme1> [port]
 set -u
 BASE_WT=${1:?base worktree}; BASE_SHA=${2:?base commit}; BRANCH_WT=${3:?branch worktree}; BRANCH_SHA=${4:?branch commit}
@@ -316,8 +322,8 @@ build_check() {  # <arm> <server.log>: master's thread-started line has no build
     [ -n "$line" ] || { say "arm $arm: no 'exl3 RAM miss thread started' line"; return 1; }
     say "arm $arm: $line"
     case $arm in
-        A|A2) [[ $line != *build* ]] ;;
-        B|C) [[ $line == *"build prod" ]] ;;
+        A|A2|CM) [[ $line != *build* ]] ;;
+        B|C|CS) [[ $line == *"build prod" ]] ;;
         *) false ;;
     esac || { say "arm $arm: the thread-started line does not show the arm's build"; return 1; }
 }
@@ -415,6 +421,23 @@ raise SystemExit(0 if not any(bad.values()) else 'output differs from A')
 " "$(run_dir_of A)" "B=$(run_dir_of B)" "A2=$(run_dir_of A2)"
 }
 
+attribute() {  # <arm>: the arm's shim counts and stacks, attributed to call sites (CS, CM)
+    PYTHONPATH=$BRANCH_WT/python $PY "$BRANCH_WT/analysis/dsv41-drive/hotpath/final-fix/attribute_stacks.py" \
+        "$OUT/$1-stacks.txt" "$OUT/$1-shim.json" "$OUT/$1-attribution.json" 65536
+}
+
+same_as_ref() {  # <arm>: byte identity against REF_RUN (Task 18's A), when given
+    [ -n "${REF_RUN:-}" ] || return 0
+    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3 $PY -c "
+import sys, mirror3_report as m
+same = m.identity(sys.argv[1], sys.argv[2])
+bad = [k for k, v in same.items() if not v]
+print('$1 identity vs REF_RUN:', 'identical' if not bad else f'{len(bad)} turns differ: {bad}', f'({len(same)} turns)')
+raise SystemExit(0 if not bad else 'output differs from REF_RUN')
+" "$REF_RUN" "$(run_dir_of "$1")"
+}
+
+STACKS_ENV=(HOTPATH_SHIM_STACKS_FIRST=256 HOTPATH_SHIM_STACKS_EVERY=65536)
 rc=0
 for arm in "${ARMS[@]}"; do
     case $arm in
@@ -424,15 +447,21 @@ for arm in "${ARMS[@]}"; do
             identical_so_far || { say "B or A2 differs from A: not running C (stop-and-report)"; rc=1; break; }
             rm -f "$OUT/C-shim.json" "$OUT"/C-shim.json.*
             run_one "$arm" "$BRANCH_WT" "$BRANCH_SHA" "LD_PRELOAD=$SHIM_SO" "HOTPATH_SHIM_OUT=$OUT/C-shim.json" ;;
+        CS|CM)
+            rm -f "$OUT/$arm-shim.json" "$OUT/$arm-shim.json".* "$OUT/$arm-stacks.txt" "$OUT/$arm-stacks.txt".*
+            if [ "$arm" = CS ]; then set -- "$BRANCH_WT" "$BRANCH_SHA"; else set -- "$BASE_WT" "$BASE_SHA" "${MASTER_RECIPE[@]}"; fi
+            run_one "$arm" "$@" "LD_PRELOAD=$SHIM_SO" "HOTPATH_SHIM_OUT=$OUT/$arm-shim.json" \
+                "HOTPATH_SHIM_STACKS=$OUT/$arm-stacks.txt" "${STACKS_ENV[@]}" && attribute "$arm" ;;
         *) say "unknown arm $arm"; false ;;
     esac || { say "arm $arm failed; stopping the pass (see $OUT/$arm-run_arm.log)"; rc=1; break; }
+    same_as_ref "$arm" || { say "arm $arm differs from REF_RUN; stopping the pass"; rc=1; break; }
 done
 say "tier that ran: $TIER_NAME (0:${N0_MIB},1:${N1_MIB} / $((N0_MIB + N1_MIB)))"
 RUNS=""
 for arm in "${ARMS[@]}"; do
     r=$(run_dir_of "$arm" 2>/dev/null); say "$arm run: $r"; [ -z "$r" ] || RUNS+="$arm=$r "
 done
-if [ "$rc" = 0 ]; then
+if [ "$rc" = 0 ] && [[ " ${ARMS[*]} " == *" A "* ]]; then
     PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3:$BRANCH_WT/analysis/dsv41-drive/iopoll-cuts \
         $PY "$BRANCH_WT/analysis/dsv41-drive/hotpath/hotpath_report.py" "$OUT" \
         "0:${N0_MIB},1:${N1_MIB} / $((N0_MIB + N1_MIB)) ($TIER_NAME)" "$PARANOID" $RUNS || rc=1

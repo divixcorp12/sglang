@@ -107,6 +107,46 @@ def test_hotpath_shim_out_arms_at_load_and_dumps_at_exit(shim, tmp_path):
     assert json.loads(out.read_text()) == got, "the first process's dump was overwritten"
 
 
+STACKS_PROBE = r'''
+    #define _GNU_SOURCE
+    #include <pthread.h>
+    #include <stdlib.h>
+    __attribute__((noinline)) void hot_site(void) { for (int i = 0; i < 10; ++i) free(malloc(64)); }
+    static void* named(void* name) { pthread_setname_np(pthread_self(), (const char*)name); hot_site(); return 0; }
+    static void run(const char* name) { pthread_t t; pthread_create(&t, 0, named, (void*)name); pthread_join(t, 0); }
+    int main(void) { run("x-ram-miss"); run("x-copy-eng"); hot_site(); return 0; }
+'''
+
+
+def test_hotpath_shim_stacks_records_the_first_and_every_nth_call_site(shim, tmp_path):
+    """The final-fix round's call-site capture: with HOTPATH_SHIM_STACKS, FIRST=2 and EVERY=4, each named thread's 10
+    mallocs leave records for calls 0, 1, 4 and 8, each of whose backtraces symbolizes (through the dump's own maps)
+    to the probe's hot_site; the capture itself is neither counted (the counts stay exactly 10) nor recorded; and the
+    unnamed main thread's identical calls leave nothing."""
+    src = tmp_path / "stacks_probe.c"
+    src.write_text(textwrap.dedent(STACKS_PROBE))
+    exe = tmp_path / "stacks_probe"
+    subprocess.run(["cc", "-O0", "-o", str(exe), str(src), "-lpthread"], check=True)
+    stacks, out = tmp_path / "stacks.txt", tmp_path / "counts.json"
+    env = {"LD_PRELOAD": str(shim), "HOTPATH_SHIM_STACKS": str(stacks), "HOTPATH_SHIM_STACKS_FIRST": "2",
+           "HOTPATH_SHIM_STACKS_EVERY": "4", "HOTPATH_SHIM_OUT": str(out)}
+    subprocess.run([str(exe)], env=env, check=True)
+    got = json.loads(out.read_text())
+    for th in hotpath_shim.THREADS:
+        assert got[th]["malloc"] == 10 and got[th]["free"] == 10 and got[th]["mutex"] == 0, got
+    records, maps = hotpath_shim.read_stacks(stacks)
+    assert maps, "the dump carries no maps to symbolize with"
+    symbolize = hotpath_shim.Symbolizer(maps)
+    for th in hotpath_shim.THREADS:
+        for kind in ("malloc", "free"):
+            mine = [r for r in records if r["thread"] == th and r["kind"] == kind]
+            assert sorted(r["seq"] for r in mine) == [0, 1, 4, 8], (th, kind, mine)
+            for r in mine:
+                sites = [symbolize(a) for a in r["frames"]]
+                assert any(site.startswith("stacks_probe!hot_site+") for site in sites), sites
+    assert {r["kind"] for r in records} == {"malloc", "free"}, records
+
+
 def test_characterize_the_hot_path(shim, tmp_path):
     """Prints the per-request counts of the production build (the one a service loads with no trace or fault), so the
     baseline (master) and every later phase can be compared. It asserts that the measurement happened -- the

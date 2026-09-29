@@ -141,3 +141,84 @@ def run_child(shim: Path, *, variant: str = "default", requests: int = 200, warm
     line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("HOTPATH-COUNTS ")), None)
     assert proc.returncode == 0 and line, proc.stdout[-4000:] + proc.stderr[-4000:]
     return json.loads(line.split(" ", 1)[1])
+
+
+# ---- Call-site capture (HOTPATH_SHIM_STACKS; the record format is hotpath_shim.c's dump_stacks) ----
+
+
+def read_stacks(path) -> tuple[list[dict], list[tuple[int, int, int, str]]]:
+    """The records ({"thread", "kind", "seq", "frames"}) and the maps ((start, end, file offset, path) of each
+    file-backed mapping) of one HOTPATH_SHIM_STACKS dump."""
+    records, maps = [], []
+    for line in Path(path).read_text(errors="replace").splitlines():
+        if line.startswith("S "):
+            f = line.split()
+            depth = int(f[4])
+            records.append({"thread": THREADS[int(f[1])], "kind": KINDS[int(f[2])], "seq": int(f[3]),
+                            "frames": [int(a, 16) for a in f[5:5 + depth]]})
+        elif line.startswith("M "):
+            f = line[2:].split(maxsplit=5)
+            if len(f) == 6 and f[5].startswith("/"):
+                lo, hi = (int(x, 16) for x in f[0].split("-"))
+                maps.append((lo, hi, int(f[2], 16), f[5]))
+    return records, maps
+
+
+class Symbolizer:
+    """Address -> "module!symbol+0xoff" from a dump's maps, the modules' PT_LOAD segments (readelf) and their symbol
+    tables (nm, then nm -D for a stripped module such as libcuda); "module+0xoff" when no symbol precedes it."""
+
+    def __init__(self, maps):
+        self.maps = sorted(maps)
+        self._loads, self._syms = {}, {}
+
+    def _segments(self, path):
+        if path not in self._loads:
+            out = subprocess.run(["readelf", "-lW", path], capture_output=True, text=True).stdout
+            segs = []
+            for line in out.splitlines():
+                f = line.split()
+                if f and f[0] == "LOAD":
+                    segs.append((int(f[1], 16), int(f[2], 16), int(f[4], 16)))  # offset, vaddr, filesz
+            self._loads[path] = segs
+        return self._loads[path]
+
+    def _symbols(self, path):
+        if path not in self._syms:
+            syms = {}
+            for extra in ([], ["-D"]):
+                out = subprocess.run(["nm", "-n", "-C", "--defined-only", *extra, path], capture_output=True,
+                                     text=True).stdout
+                for line in out.splitlines():
+                    f = line.split(maxsplit=2)
+                    if len(f) == 3 and f[1] in "tTwWiu":
+                        syms.setdefault(int(f[0], 16), f[2])
+            self._syms[path] = sorted(syms.items())
+        return self._syms[path]
+
+    def __call__(self, addr: int) -> str:
+        for lo, hi, off, path in self.maps:
+            if lo <= addr < hi:
+                break
+        else:
+            return hex(addr)
+        file_off = addr - lo + off
+        vaddr = file_off
+        for seg_off, seg_vaddr, filesz in self._segments(path):
+            if seg_off <= file_off < seg_off + filesz:
+                vaddr = file_off - seg_off + seg_vaddr
+                break
+        name = os.path.basename(path)
+        syms = self._symbols(path)
+        # A return address points past its call: look up the byte before it.
+        lo_i, hi_i = 0, len(syms)
+        while lo_i < hi_i:
+            mid = (lo_i + hi_i) // 2
+            if syms[mid][0] <= vaddr - 1:
+                lo_i = mid + 1
+            else:
+                hi_i = mid
+        if lo_i == 0:
+            return f"{name}+{vaddr:#x}"
+        base, sym = syms[lo_i - 1]
+        return f"{name}!{sym}+{vaddr - base:#x}"
