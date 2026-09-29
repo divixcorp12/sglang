@@ -282,6 +282,9 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "0",
             "--hicache-write-policy",
             "write_through",
+            # Loads each prefill Triton variant before serving, while device memory is still free (entrypoints/warmup.py).
+            "--warmups",
+            "dsv41_prefill_shapes",
         ]
         if self.decode_log_interval is not None:
             argv += ["--decode-log-interval", str(self.decode_log_interval)]

@@ -159,3 +159,34 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# One prompt per prefill Triton variant that DSV4.1 kernels select by token count M:
+# Triton's own M == 1 / M % 16 == 0 / other specialization, crossed with the M
+# thresholds the launchers branch on (8 and 48 in hc_combine_norm, 64-384 and
+# 2048 in mhc's hc_mix_stats), plus a full 4096-token prefill chunk.
+_DSV41_PREFILL_WARMUP_SIZES = (1, 5, 8, 16, 33, 64, 257, 400, 2048, 2049, 4096)
+
+
+@warmup("dsv41_prefill_shapes")
+async def dsv41_prefill_shapes(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Load every prefill Triton variant before the server takes traffic.
+
+    A variant first used mid-serving loads its cubin with little device memory free
+    (the triton_load_watch warning). Unlike prefill_shapes, this covers M == 1 and
+    non-multiples of 16 and stops at one chunk, because each DSV4.1 prefill chunk
+    streams its routed experts and costs seconds.
+    """
+    rng = np.random.default_rng(0)
+    for size in tqdm.tqdm(_DSV41_PREFILL_WARMUP_SIZES, desc="Warmup DSV4.1 prefill"):
+        req = GenerateReqInput(
+            input_ids=rng.integers(2**16, size=size).tolist(),
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+        )
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass
