@@ -6,8 +6,10 @@ one). Cells are shuffled with a fixed seed to spread drift; every combo reads th
 
   phase main: 48 combos x 2 weights x QD {1, 2} x 2 reps.
   phase top:  the combos named by --top (their labels), QD 4 at the default ring, and QD 1 and 4 at a 4096-entry ring.
+  phase repair: re-run the cells named one per line in --labels-file (full cell labels, as analyze_uring.py lists the
+              ones caught in an SPCC slow episode).
 
-Usage: python3 run_uring_sweep.py <bench> <out.jsonl> main|top [--top LABEL ...]
+Usage: python3 run_uring_sweep.py <bench> <out.jsonl> main|top|repair [--top LABEL ...] [--labels-file F]
 """
 
 import argparse
@@ -60,9 +62,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("bench")
     p.add_argument("out")
-    p.add_argument("phase", choices=["main", "top"])
+    p.add_argument("phase", choices=["main", "top", "repair"])
     p.add_argument("--top", nargs="*", default=[])
     p.add_argument("--reps", type=int, default=2)
+    p.add_argument("--labels-file")
     a = p.parse_args()
     by_label = {label(c): c for c in combos()}
     cells = []
@@ -70,6 +73,12 @@ def main():
     if a.phase == "main":
         for c, (wk, w), qd, rep in itertools.product(combos(), weights.items(), [1, 2], range(1, a.reps + 1)):
             cells.append((c, wk, w, qd, rep, 0))
+    elif a.phase == "repair":
+        for line in open(a.labels_file):
+            if not line.strip():
+                continue
+            name, wk, qd, rep, ring = line.strip().split("/")
+            cells.append((by_label[name], wk, weights[wk], int(qd[2:]), int(rep[1:]), int(ring[4:])))
     else:
         for name in a.top:
             c = by_label[name]
