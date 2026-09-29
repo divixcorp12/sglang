@@ -85,6 +85,18 @@ def test_ram_miss_reads_the_last_shutdown_counters(tmp_path):
     assert out["stream"] == {"vram_misses": 3, "ram_misses": 2, "read_ms": 1.5}
 
 
+def test_ram_miss_names_a_metric_the_production_build_does_not_count(tmp_path):
+    # A production server's shutdown line carries only the core counters: its absent metrics read "not in this build",
+    # never None or 0, while an absent core key stays None.
+    thread = {"served": 7, "rows_read": 9, "copy_errors": 0, "overruns": 0, "late_after_fatal": 0,
+              "piece_stream_refused": 0}
+    (tmp_path / "server.log").write_text("exl3 RAM miss thread counters " + json.dumps(thread) + "\n")
+    out = report.ram_miss(tmp_path)["thread"]
+    assert out["copy_fallbacks"] == out["piece_publish_refused"] == report.NOT_IN_BUILD == "not in this build"
+    assert out["read_errors"] is None
+    assert {k: out[k] for k in thread} == thread
+
+
 def test_ram_miss_is_none_when_the_server_never_wrote_its_counters(tmp_path):
     (tmp_path / "server.log").write_text("killed\n")
     out = report.ram_miss(tmp_path)

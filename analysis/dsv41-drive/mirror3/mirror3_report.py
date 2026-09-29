@@ -27,6 +27,11 @@ RAM_MISS_KEYS = (
     "served", "rows_read", "read_errors", "copy_errors", "copy_fallbacks", "overruns", "late_after_fatal",
     "piece_stream_refused", "piece_publish_refused",
 )
+# Metrics, not core counters, since plan 2026-09-29-hotpath-zero-overhead: the production build does not compile them,
+# so its shutdown line has no such key. An absent one reads NOT_IN_BUILD, never None or 0, so a production run's report
+# cannot pass off "this build does not count it" as "nothing happened" (F25). A core key that is absent stays None.
+METRIC_ONLY_KEYS = ("copy_fallbacks", "piece_publish_refused")
+NOT_IN_BUILD = "not in this build"
 STREAM_KEYS = ("vram_misses", "ram_misses", "read_ms")
 
 
@@ -150,7 +155,8 @@ def ram_miss(run_dir):
     return {
         "scope": "server lifetime (warm-up, prefill and the timed set)",
         "warmup_rounds": len(list(run_dir.glob("results-warmup-*.jsonl"))),
-        "thread": {k: thread.get(k) for k in RAM_MISS_KEYS} if thread else None,
+        "thread": {k: thread.get(k, NOT_IN_BUILD if k in METRIC_ONLY_KEYS else None) for k in RAM_MISS_KEYS}
+        if thread else None,
         "stream": {k: stream.get(k) for k in STREAM_KEYS} if stream else None,
     }
 
