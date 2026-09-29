@@ -137,7 +137,7 @@ void same(const uint8_t* got, const DataFile& file, size_t off, size_t n, const 
 
 int main(int argc, char** argv) {
   try {
-    require(argc == 3, "usage: harness <dir> read|memlock");
+    require(argc == 3, "usage: harness <dir> read|memlock|reset");
     const std::string read_mode = setting("SGLANG_EXPERT_STREAM_URING_READ_MODE", "");
     require(read_mode == "fixed" || read_mode == "readv_fixed", "READ_MODE must be fixed or readv_fixed");
     require(setting("SGLANG_EXPERT_STREAM_URING_FIXED_FILES", "0") == "1", "FIXED_FILES must be 1");
@@ -174,6 +174,29 @@ int main(int argc, char** argv) {
     reader.configure_resources(fds, regions, true);
     const double register_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     require(chunks == 3, "expected 3 chunks (306 + 154 rows, then the small slab), planned " + std::to_string(chunks));
+
+    if (std::string(argv[2]) == "reset") {
+      // Two legs prepared and never submitted. drain() must discard them without re-registering the 1.5 GiB slab
+      // (plan 2026-09-29-ring-reset-nop-drain), leave both rows unwritten, and leave the ring reading.
+      std::memset(big.data + 305 * kBigRow, 0xcd, 2 * kBigRow);
+      std::vector<FixedLeg> legs;
+      const iovec row305{big.data + 305 * kBigRow, kBigRow}, row306{big.data + 306 * kBigRow, kBigRow};
+      prep_legs(reader, file.fd, &row305, 1, 0, 100, legs);
+      prep_legs(reader, file.fd, &row306, 1, kBigRow, 200, legs);
+      const auto d0 = std::chrono::steady_clock::now();
+      reader.drain(2);
+      const double drain_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
+      for (size_t i = 0; i < 2 * kBigRow; ++i)
+        require(big.data[305 * kBigRow + i] == 0xcd, "a discarded read wrote its row");
+      require(prep_legs(reader, file.fd, &row305, 1, 0, 300, legs) == 1, "row 305 leg after the drain");
+      auto done = settle(reader, 1);
+      expect(done, 300, kBigRow);
+      same(big.data + 305 * kBigRow, file, 0, kBigRow, "row 305 after the drain");
+      std::cout << std::fixed << "RESET drain_ms=" << drain_ms << " register_ms=" << register_ms
+                << " registrations=" << reader.registrations() << '\n';
+      reader.close();
+      return 0;
+    }
 
     // Every row lies in one buffer: big rows [0, 306) in buffer 0, [306, 460) in 1, small rows in 2.
     for (size_t k = 0; k < kBigRows; ++k) {
@@ -296,3 +319,17 @@ def test_big_fixed_slab_memlock_refused(harness, tmp_path):
     # The registration refusal, not the ring-setup one, naming the limit and the kernel's ENOMEM.
     assert "REFUSED expert stream registering fixed buffers" in run.stdout, output
     assert f"RLIMIT_MEMLOCK={limit}" in run.stdout and "Cannot allocate memory" in run.stdout, output
+
+
+def test_a_ring_reset_keeps_the_big_slab_registered(harness, tmp_path):
+    run = subprocess.run([str(harness), str(tmp_path), "reset"], env=_env(), capture_output=True, text=True,
+                         timeout=300, check=False)
+    output = run.stdout + run.stderr
+    print(output)
+    assert run.returncode == 0, output
+    found = re.search(r"RESET drain_ms=([\d.]+) register_ms=([\d.]+) registrations=(\d+)", run.stdout)
+    assert found, output
+    drain_ms, register_ms, registrations = float(found[1]), float(found[2]), int(found[3])
+    print(f"DIAG reset drain_ms={drain_ms:.3f} register_ms={register_ms:.1f} registrations={registrations}")
+    assert registrations == 1, output  # a ring reset re-registers the slab: 2
+    assert drain_ms < max(50.0, register_ms / 10), output  # a reset costs about one registration

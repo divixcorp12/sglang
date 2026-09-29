@@ -176,6 +176,11 @@ class UringReader {
   uint64_t fanout_sqes() const {
     return fanout_sqes_;
   }
+  // How many times the ring's resources were registered: 1 per configure_resources, +1 per ring reset. Cold path
+  // only (tests read it to prove a drain kept the registered tier).
+  uint64_t registrations() const {
+    return registrations_;
+  }
   bool prep_readv_fixed(int fd, const iovec* iov, unsigned count, uint64_t off, int buffer, uint64_t tag) {
     require_ready();
     if (!fixed_reads()) throw std::logic_error("prep_readv_fixed needs a fixed read mode");
@@ -367,6 +372,7 @@ class UringReader {
   // ring reset, which re-creates the table and re-adds every chunk). Any failure is an explicit error (refuse), never
   // a fallback to unregistered reads.
   void register_resources() {
+    ++registrations_;
     if (!files_.empty()) {
       const int rc = io_uring_register_files(&ring_, files_.data(), static_cast<unsigned>(files_.size()));
       if (rc < 0) error("registering fixed files", rc);
@@ -525,6 +531,7 @@ class UringReader {
   size_t chunk_cap_ = sglang::io::kMaxRegisteredBufferBytes;
   uint64_t fixed_reads_ = 0, fixed_cuts_ = 0, fanout_sqes_ = 0, next_report_ = uint64_t{1} << 16;
   double register_ms_ = 0;
+  uint64_t registrations_ = 0;  // register_resources() calls (registrations())
   bool reset_fail_ = false;  // test only (set_ring_reset_fail)
 };
 

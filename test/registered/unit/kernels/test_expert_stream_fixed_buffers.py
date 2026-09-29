@@ -170,16 +170,18 @@ def test_one_failing_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_path,
 
 @pytest.mark.parametrize("submit_first", [False, True], ids=["unconsumed", "in_flight"])
 @pytest.mark.parametrize("read_mode", ["fixed", "readv_fixed"])
-def test_ring_reset_mid_fan_out(tmp_path, uring_env, read_mode, submit_first):
+def test_ring_reset_mid_fan_out(tmp_path, uring_env, capfd, read_mode, submit_first):
     s = _setup(tmp_path, True)
-    uring_env(READ_MODE=read_mode, FIXED_FILES=1)
-    # The first submit fails with a fanned-out read's legs prepared: either none reached the kernel (drain resets the
-    # ring and must re-create the sparse table, re-add every chunk and re-register the files) or all did (drain waits
-    # for every leg). Either way the clean second read on the same reader succeeds.
+    uring_env(READ_MODE=read_mode, FIXED_FILES=1, DIAGNOSTICS=1)
+    # The first submit fails with a fanned-out read's legs prepared: either none reached the kernel (drain rewrites
+    # them as NOPs on the same ring) or all did (drain waits for every leg). Either way the clean second read on the
+    # same reader succeeds, and the tier was registered exactly once: the diagnostics line (register_ms=) prints once
+    # per registration, and a ring reset would print it again (plan 2026-09-29-ring-reset-nop-drain).
     first, then = _supported(lambda: read_rows_with_fault(
         s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=False,
         submit_error=errno.EIO, submit_call=1, submit_first=submit_first, fixed_chunk_cap=CAP))
     assert (first, then) == (0, 1)
+    assert capfd.readouterr().err.count("register_ms=") == 1
 
 
 @pytest.mark.parametrize("images", [False, True], ids=["bounce", "images"])
