@@ -554,3 +554,218 @@ flock ... pytest test/registered/unit/layers/moe -q -p no:randomly --continue-on
   The result equals §1's 1119 + 1 (Task 18's shim test) + 4.
 - **layers/moe: `2 failed, 1087 passed, 12 errors, 12405 subtests passed`.** These are the same 2 failures and the
   same 12 errors as §2 and base: 11 pyarrow collection errors and the `trace_on` teardown error.
+
+## 9. Phase 2 Task P1: copy-thread attribution by entry point, and the completion word
+
+Date: 2026-09-29, 11:19-11:35. No product change. The tooling is in `2bfa660596`, `0529f5d945` and `f4771aa409`:
+- `completion_word/probe_completion_word.cu` and `run_probe.sh`;
+- `completion_word/attribute_entry.py`;
+- `hotpath_shim.c`'s `HOTPATH_SHIM_STACK_SLOTS` (default 512, unchanged);
+- the driver's `SHIM_SLOTS` and `STACKS_EVERY` knobs.
+
+`generations.json` was registered in `b9a44bb6b9` and reverted in `7c98dd26ff`. Private worktree:
+`divix01:/data/models/slang/nvfp4-work/wt-hotpath-p1`.
+
+### 9a. Attribution: the copy thread's libcuda mutex and malloc calls, by entry point
+
+**Arm CS3.**
+- **Tree.** The branch at `b9a44bb6b9`: python tree `e66048bd17`, the product of `2470fb133a` plus the shim's
+  slot macro.
+- **Recipe.** The production recipe, with Task 18's B tier and overrides: tier full `0:61440,1:40960` / `102400`, and
+  no env beyond the shim's.
+- **Result.** `rc` 0, `read_errors` 0, 2964 served. The output is byte-identical to Task 18's A (2/2 turns).
+  - The driver's own identity step failed only on an import: `hotpath_report` needs `iopoll-cuts` on
+    `PYTHONPATH`, fixed in `0529f5d945`.
+  - The comparison was re-run by hand with that path and gave `{...t0: True, ...t0: True}`.
+- **perf on the service thread.** `instructions:u` 99.92 G and `cycles:u` 100.69 G.
+- **Sampling.** The shim was built with 16384 record slots and `HOTPATH_SHIM_STACKS_EVERY=4099`. That gave 8,941
+  copy/mutex records, every one kept: 256 first calls and 8,685 sampled. §8e had 256 of each.
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath-p1 && H=$(git rev-parse HEAD) && ARMS=CS SHIM_SLOTS=16384 \
+  STACKS_EVERY=4099 REF_RUN=/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-baseline/servers/A/run-20260929-081421 \
+  nohup bash analysis/dsv41-drive/hotpath/drive_hotpath_arms.sh $PWD $H $PWD $H /mnt/nvme1/dsv41-hotpath/p1/arm-20260929-112147 30031 \
+  > /mnt/nvme1/dsv41-hotpath/p1/driver-20260929-112147.log 2>&1 &'      # H = b9a44bb6b9
+PYTHONPATH=$PWD/python taskset -c 0-63 /data/models/slang/.venv/bin/python \
+  analysis/dsv41-drive/hotpath/completion_word/attribute_entry.py $O/CS-callsites.txt $O/CS-shim.json $O/CS-entry.json 4099
+```
+
+**How a record is classified.** Each record is walked out to its first host-module frame.
+- `CudaCopyBackend::query`, `::init` and `::shutdown` appear as frames and name the class directly.
+- `::issue` and `::mark` are devirtualized and inlined into `CopyEngine::run` at -O2. Those records are classified by
+  their outermost libcuda frame, which is the exported entry point the host called: `cuMemcpyAsync` (145 records) or
+  `cuEventRecord` (19).
+
+**Whole-run counts.**
+- copy: mutex 35,603,559; malloc/free 72/72; cond 1; futex 8,946; clock 0.
+- service: malloc 0, free 1, mutex 0, futex 5.
+
+**Per job.** Production does not count copy jobs, so per-job figures use master's `copy_jobs` 10,911 (§8e, 2944
+served; CS3 served 2964).
+- Cross-check: `cuEventRecord` takes 4 mutexes per call (9b), so its estimate gives 61.5 k / 4 = 15.4 k jobs, with a
+  95% CI of [9.3 k, 25.3 k]. That interval contains 10.9 k.
+
+| copy-thread calls | entry point | CS3 whole run: est. [95% CI] | CS3 per job | master CM per job (§8e, / 10,911) |
+|---|---|---:|---:|---:|
+| mutex | `cuEventQuery` (completion polling) | **35,082,931** [34.99 M, 35.17 M] (98.5%) | **~3,215** | ~3,666 (40.0 M) |
+| mutex | `cuMemcpyAsync` (submission) | 459,136 [382 k, 552 k] | ~42 (8 per call, so ~5.3 copies) | not separable (in the unsampled rest) |
+| mutex | `cuEventRecord` (submission) | 61,491 [37 k, 101 k] | ~5.6 (4 per call, one call per job) | not separable |
+| mutex | `cuLaunchKernel` | 0 (the copy thread launches nothing) | 0 | 0 |
+| mutex | other, steady state | 0 of 8,685 sampled (≤ 15.7 k) | 0 | ~6,425: the loop's own `mutex_` (70.1 M) |
+| mutex | init: `cuEventCreate` ×32, `cuStreamCreateWithPriority`, `cuInit`, `PrimaryCtxRetain`, and the `start_mutex_` handshake | 45 + 1 (exact) | start-up | same |
+| mutex | shutdown: `cuEventDestroy` ×64, `cuStreamDestroy`, `PrimaryCtxRelease` | ~75 (the probe's replay, 9b; not sampled here) | exit | same |
+| malloc | init: `CudaCopyBackend::init` | 72 (exact) | **0** | ~12,476 (the `std::deque` per turn, 136.1 M) |
+| free | shutdown: `cuEventDestroy` ×64, `cuStreamDestroy` ×3; libcuda TLS destructors and the `std::thread` state | 67 + 5 (exact) | 0 | -- |
+
+The estimates sum to the count: 35.083 M + 0.459 M + 0.061 M + 46 + ~75 = 35.60 M. **At steady state the copy thread
+takes about 3,260 libcuda mutexes and 0 mallocs per job.** 98.5% of those mutexes are `cuEventQuery` polls, and ~48
+are submission.
+
+### 9b. The completion word: probe on divix01's RTX 5090 (driver 615.71.09, CUDA 13.4 headers)
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath-p1 && bash analysis/dsv41-drive/hotpath/completion_word/run_probe.sh \
+  /mnt/nvme1/dsv41-hotpath/p1/probe-20260929-111919'      # at b9a44bb6b9; PROBE_EXIT=0, FAULT_wv32_EXIT=0, FAULT_kern_EXIT=0
+```
+
+**Setup.**
+- **The measuring thread.** It is named `probe-copy-eng`, so the counting shim (preloaded) counts it as the copy
+  thread.
+- **Stream.** Non-blocking, greatest priority, as `CudaCopyBackend` creates it.
+- **Copies.** 12 `cuMemcpyAsync` H2D per job, from `cuMemHostRegister`ed memory (like the slabs) into `cuMemAlloc`
+  memory.
+- **Sizes.** "tiny" is 12 × 4 KiB (2,000 jobs); "large" is 12 × 512 KiB (500 jobs, ~460 µs each). Each mechanism
+  first runs 20 warm-up jobs.
+- **The word.** One `cuMemHostAlloc(DEVICEMAP)` page.
+
+**Attributes.** `CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS` does not exist in the CUDA 13.4 `cuda.h`, which defines
+only the `_V1` form and the current forms below.
+
+| attribute (id) | value |
+|---|---:|
+| `CAN_USE_STREAM_MEM_OPS_V1` (92) | 0 |
+| `CAN_USE_64_BIT_STREAM_MEM_OPS_V1` (93) | 0 |
+| `CAN_USE_STREAM_WAIT_VALUE_NOR_V1` (94) | 0 |
+| **`CAN_USE_64_BIT_STREAM_MEM_OPS` (122)** | **1** |
+| `CAN_USE_STREAM_WAIT_VALUE_NOR` (123) | 1 |
+| `CAN_FLUSH_REMOTE_WRITES` (98) | 0 |
+| `CAN_MAP_HOST_MEMORY` / `UNIFIED_ADDRESSING` / `CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM` | 1 / 1 / 1 |
+
+**The v1 API reads 0; the v2 mem ops are supported, 64-bit included.**
+- `cuda.h` maps `cuStreamWriteValue32/64` to the `_v2` symbols, and `libcuda` exports both the plain and the `_v2`
+  names.
+- A `dlsym` backend must therefore resolve `cuStreamWriteValue64_v2`, not the plain name, which is v1.
+
+**Per job, on the submitting thread** (probe; malloc and free are 0 in every row):
+
+| mechanism | copies: mutex | completion op: mutex | op enqueue µs p50 / p99 | poll: driver calls / mutex (large) | submit end -> seen µs p50 / p99 (large) | (tiny) | order violations |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ev1: `cuEventRecord`, then `cuEventQuery` every turn | 96 (8 per call) | 4 | 0.26 / 0.76 | 2,396 / 2,396 | 460.2 / 461.4 | 2.9 / 3.4 | 0 |
+| ev8: the same, queried every 8 turns (the branch) | 96 | 4 | 0.26 / 0.64 | 821 / 821 | 460.2 / 461.3 | 2.9 / 3.8 | 0 |
+| **(a) `cuStreamWriteValue32`** | 96 | 6 | 1.60 / 2.68 | **0 / 0** | 459.8 / 462.8 | 1.8 / 3.7 | 0 |
+| **(a) `cuStreamWriteValue64`** | 96 | 6 | 1.59 / 2.47 | **0 / 0** | 459.8 / 463.5 | 1.8 / 3.6 | 0 |
+| (b) `cuLaunchKernel`, a 1-thread system-scope release store | 96 | 5 | 2.19 / 5.83 | 0 / 0 | 460.1 / 466.5 | 2.7 / 3.6 | 0 |
+| control: `WriteValue32` on a second stream | 96 | 6 | 1.31 | 0 / 0 | 21.2 (early) | 1.6 | **500 / 500** (large) |
+
+**Stream order.** On observing completion, the probe reads back the last 4 KiB of the job's last copy (legacy stream,
+unordered with the copy stream) and compares it with the job's pattern.
+- Mechanisms (a) and (b): 0 violations in 2,500 jobs each.
+- The control, whose word is not ordered after the copies, fails every large job. The check therefore has the power
+  to detect a word that lands early.
+- (a) uses the default flags. The v2 API has no `NO_MEMORY_BARRIER`, and the write fences the stream's prior work,
+  like a stream-scoped `__threadfence_system`.
+
+**Latency: when the copy is done, how soon does the host see it?** Two observers ran at once: the word, polled on
+this thread, and `cuEventQuery`, polled every turn on a second thread. The table gives the event's sighting minus the
+word's, in µs (p50 / p99).
+
+| ordering on the stream | wv32 tiny | wv32 large | wv64 large | kern large |
+|---|---:|---:|---:|---:|
+| completion op, then event | +0.44 / +0.58 | +0.34 / +0.50 | +0.35 / +0.51 | +0.53 / +0.62 |
+| event, then completion op | -0.18 / +0.03 | -0.92 / -0.15 | -0.92 / -0.13 | -2.32 / -1.47 |
+
+- The word becomes visible within ~0.2-0.9 µs of the event completing, even when it is queued behind the event. The
+  host sees it ~0.4 µs before a best-case (every-turn) event poller sees a later event.
+- The kernel lags ~2.3-2.7 µs: it needs a launch onto an SM.
+- Either way the difference is noise against a ~2 ms copy job.
+
+**Host read cost.** 0.27 ns per acquire load of the word, over 10^7 loads, with 0 mutex, 0 malloc, 0 futex and 0 driver
+calls.
+
+**For comparison:**
+- `cuEventQuery` on a completed event: 118.6 ns and 1 mutex per call;
+- `cuStreamQuery` on an idle stream: 127.0 ns and 1 mutex.
+
+**Lifecycle (start-up and exit only).**
+- Replay of `CudaCopyBackend::init`: mutex 77, malloc 132. The replay's malloc count differs from the server's 72,
+  because the probe's process state differs.
+- Replay of shutdown: mutex 75, free 132.
+- The word's setup (`cuMemHostAlloc` + `cuMemHostGetDevicePointer`): mutex 9, malloc 5, free 1, once.
+
+**Fail closed (`--fault`, separate processes).** The completion op targets an unmapped device address after a large
+job's copies.
+
+| fault | word | first `cuStreamQuery` check (turn 65,536) | time to verdict |
+|---|---|---|---:|
+| wv32 | never seen | `719 CUDA_ERROR_LAUNCH_FAILED` | 2.73 ms |
+| kern | never seen | `700 CUDA_ERROR_ILLEGAL_ADDRESS` | 9.85 ms |
+
+A failed op never writes the word, and one budgeted stream query with no clock surfaces the sticky error.
+
+### 9c. Decision: (a), `cuStreamWriteValue64_v2` into a host-mapped pinned word
+
+**Evidence.**
+- Supported on this card and driver: `CAN_USE_64_BIT_STREAM_MEM_OPS` = 1, and the op works.
+- Stream-ordered after the copies: 0 violations in 2,500 jobs, where the unordered control fails 500/500.
+- Seen as fast as the best `cuEventQuery` poller: submit to seen, 459.8 µs against 460.2 µs.
+- It removes every poll-side driver call: ~3,215 `cuEventQuery` mutexes per job become 0.27 ns plain loads.
+
+**Why not (b).**
+- It costs one fewer mutex per job (5 against 6), but its enqueue takes +0.6 µs and it lands +2.5 µs later.
+- It needs an SM on the copy stream. The copy wait kernel spins on an SM for this very completion, and the decode
+  graph holds SMs. The probe ran on an idle GPU, so SM starvation is untested. A stream mem op is executed by the
+  GPU front end, which is the documented model; this probe did not measure it.
+- The host module is built by the host compiler (`load_jit`, `cpp_files`, no nvcc). (b) would need
+  `cuModuleLoadData` of an embedded PTX or cubin at init.
+
+**How stream order holds.**
+- Each job's `issue` ends with `cuStreamWriteValue64(stream, word_dev, job_seq, 0)` in place of `cuEventRecord`.
+  `job_seq` is a 64-bit counter that never wraps.
+- The default flags make the write execute only after the stream's prior copies complete, with a memory fence before
+  it.
+- Because the stream is in order, `word >= token` means every job up to `token` is done. The poll compares the head
+  job's token against one acquire load; the host needs no event pool.
+
+**How the fail-closed semantics hold with clockless pacing.**
+- **Device.** The copy wait kernel is unchanged. It commits `go_ce` only on a matching CopyDone, and otherwise times
+  out at its `global_ns` deadline with `go_ce` 0. The request fails closed whatever the host does.
+- **Host: leases.** The copy thread publishes CopyDone and releases leases only after the word passes the job's token.
+  A failed copy or op never writes the word, so its leases stay held (E5).
+- **Host: detecting the failure, without a clock.** While a job is in flight, one `cuStreamQuery` runs per budget of
+  poll turns. The budget is a turn count set in `start()`, the same way as `idle_budget`; the probe used 2^16
+  `pause`s, ~2.7 ms.
+  - `NOT_READY`: keep polling.
+  - An error code: `broken_`, then `copy_failed` for every held job (fail stop, as today).
+  - `SUCCESS` with the word short of the head token: a lost write, which also fails stop.
+  - The probe's fault runs reached that verdict at the first check.
+  - Cost: one mutex per ~2.7 ms of in-flight time, so about one per job at the 2.17 ms mean, against ~3,215 today.
+- The drain deadline in `stop()` keeps its clock. It is read only once a stop has been asked for.
+
+### 9d. The per-job floor after the change
+
+| per job | today (CS3) | after (a) |
+|---|---:|---:|
+| `cuMemcpyAsync` | ~5.3 calls × 8 = ~42 mutex | unchanged: ~42 mutex |
+| completion op | `cuEventRecord`: 4 mutex | `cuStreamWriteValue64_v2`: 6 mutex |
+| completion polling | `cuEventQuery`: ~3,215 mutex | 0 (plain loads) |
+| liveness check | -- | ≤ ~1 mutex (`cuStreamQuery` per ~2.7 ms in flight) |
+| **total mutex** | **~3,260** | **~49** (8 × copies + 6, + ≤1) |
+| malloc / free / cond / futex | 0 / 0 / 0 / idle-path futex only | 0 / 0 / 0 / unchanged |
+
+- **Why the floor is not 0.** `cuMemcpyAsync` takes 8 libcuda mutexes per call, and every submission is a driver
+  call. Removing those would need fewer calls per job (e.g. `cuMemcpyBatchAsync`, not measured here) or no driver on
+  the copy thread at all.
+- **Limits:**
+  - per-job figures depend on master's `copy_jobs` proxy (the production build counts no jobs);
+  - the submission estimates carry the Wilson intervals above;
+  - the probe ran on an otherwise idle GPU.
