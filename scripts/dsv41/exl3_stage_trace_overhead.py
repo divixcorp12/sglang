@@ -93,7 +93,7 @@ class Arm:
     def __init__(self, root, name, trace, ring):
         root.mkdir()
         self.name, self.trace = name, trace
-        self.s = ram_miss_setup(root, capacity=CAPACITY, experts=EXPERTS)
+        self.s = ram_miss_setup(root, capacity=CAPACITY, experts=EXPERTS, row_images=True)
         self.page = new_page(pin=False)
         self.host = ExpertStreamHost(
             self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32)

@@ -47,30 +47,29 @@ def world(tmp_path, monkeypatch):
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None
     streamers, caches = {}, {}
-    env = service_row_images(tmp_path)
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
-        for layer_id in range(LAYERS):
-            layer = torch.nn.Module()
-            layer.layer_id = layer_id
-            fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
-            streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
-            layer._nvfp4_expert_streamer = streamer
-            caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
-            streamers[layer_id] = streamer
-    service = module.Exl3RamMissService.get()
-    service.ensure_started()
-    order = []
-    # A CUDA device is pretended, so the barrier path runs; the barrier itself is a fake the test controls.
-    monkeypatch.setattr(module.Exl3RamMissService, "_cuda_active", lambda self: True)
-    close_admission, stop = service.host.close_admission, service.host.stop
-    monkeypatch.setattr(service.host, "close_admission", lambda: (order.append("close_admission"), close_admission()))
-    monkeypatch.setattr(service.host, "stop", lambda: (order.append("stop"), stop()))
-    for layer_id, cache in caches.items():
-        close, quarantine = cache.close, cache.quarantine
-        monkeypatch.setattr(cache, "close", lambda close=close, i=layer_id: (order.append(f"free{i}"), close()))
-        monkeypatch.setattr(cache, "quarantine", lambda q=quarantine, i=layer_id: (order.append(f"quarantine{i}"), q()))
-    yield service, caches, order
-    env.close()
+    with service_row_images(tmp_path):
+        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+            for layer_id in range(LAYERS):
+                layer = torch.nn.Module()
+                layer.layer_id = layer_id
+                fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
+                streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
+                layer._nvfp4_expert_streamer = streamer
+                caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
+                streamers[layer_id] = streamer
+        service = module.Exl3RamMissService.get()
+        service.ensure_started()
+        order = []
+        # A CUDA device is pretended, so the barrier path runs; the barrier itself is a fake the test controls.
+        monkeypatch.setattr(module.Exl3RamMissService, "_cuda_active", lambda self: True)
+        close_admission, stop = service.host.close_admission, service.host.stop
+        monkeypatch.setattr(service.host, "close_admission", lambda: (order.append("close_admission"), close_admission()))
+        monkeypatch.setattr(service.host, "stop", lambda: (order.append("stop"), stop()))
+        for layer_id, cache in caches.items():
+            close, quarantine = cache.close, cache.quarantine
+            monkeypatch.setattr(cache, "close", lambda close=close, i=layer_id: (order.append(f"free{i}"), close()))
+            monkeypatch.setattr(cache, "quarantine", lambda q=quarantine, i=layer_id: (order.append(f"quarantine{i}"), q()))
+        yield service, caches, order
     module.Exl3RamMissService._instance = None
 
 
