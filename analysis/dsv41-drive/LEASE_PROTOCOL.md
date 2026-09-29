@@ -265,7 +265,7 @@ section 18:
 | E4 | The device publishes a terminal skip for a lane only when no copy for that lane can start or is running. | 13 |
 | E5 | If completion cannot be established (CUDA error, synchronization timeout), leases are never decremented and the memory is quarantined until process teardown. | 14 |
 | E6 | The acknowledgement kernel re-checks the slot generation after the copy. A mismatch makes the request fail and is counted; it cannot end as a success. | 6.5 |
-| E7 | Copy engine: a COPYING lane's lease is released only by the service's copy thread, after `cuEventQuery` observed its copies complete; no acknowledgement or terminal releases it, and the device reads its destination only after CopyDone. | 7.6 |
+| E7 | Copy engine: a COPYING lane's lease is released only by the service's copy thread, after the copy stream's completion word showed its copies complete; no acknowledgement or terminal releases it, and the device reads its destination only after CopyDone. | 7.6 |
 
 **Tag LOADING reader contract (piece-streaming plan).** I1 as stated is the tag-READY
 case: the whole slot is unchanged from readiness. A miss lane granted at reservation is
@@ -955,14 +955,14 @@ through the driver API resolved from `libcuda.so.1` (the module still builds wit
 
 | When | Calls |
 |---|---|
-| start, before the service thread | `cuInit`, `cuDeviceGet`, `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`, `cuCtxGetStreamPriorityRange`, `cuStreamCreateWithPriority(CU_STREAM_NON_BLOCKING, greatest)`, 32 x `cuEventCreate(CU_EVENT_DISABLE_TIMING)` |
-| per job | one `cuMemcpyAsync(dst + dst_slot * bytes, src + host_slot * bytes, bytes, stream)` per table entry per lane, then one `cuEventRecord(event, stream)` |
-| polling, oldest job first | `cuEventQuery(event)` |
-| stop, only when nothing is in flight and no call failed | `cuEventDestroy`, `cuStreamDestroy`, `cuDevicePrimaryCtxRelease` |
+| start, before the service thread | `cuInit`, `cuDeviceGet`, `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`, `cuCtxGetStreamPriorityRange`, `cuStreamCreateWithPriority(CU_STREAM_NON_BLOCKING, greatest)`, `cuMemHostAlloc(DEVICEMAP)` of the 32-bit completion word, `cuMemHostGetDevicePointer_v2`, one `cuStreamWriteValue32_v2(word, 0)` and a bounded `cuStreamQuery` poll until it lands (a failure refuses the start) |
+| per job | one `cuMemcpyAsync(dst + dst_slot * bytes, src + host_slot * bytes, bytes, stream)` per table entry per lane, then one `cuStreamWriteValue32_v2(stream, word, job sequence, 0)` |
+| polling, oldest job first | none: one acquire load of the word per poll; one `cuStreamQuery` per 2^16 consecutive pending polls (liveness) |
+| stop, only when nothing is in flight and no call failed | `cuMemFreeHost` (the word), `cuStreamDestroy`, `cuDevicePrimaryCtxRelease`; the word's final value, the exact job count, is logged first |
 
-Every call is on its own non-blocking stream in the primary context. It calls nothing that
-synchronizes (no `cu*Synchronize`), allocates, frees, registers memory or loads a module, and it
-never touches the decode stream or a graph.
+Every call is on its own non-blocking stream in the primary context. Past start-up (the word's one
+allocation) it calls nothing that synchronizes (no `cu*Synchronize`), allocates, frees, registers
+memory or loads a module, and it never touches the decode stream or a graph.
 
 **The copy stream needs a hardware queue of its own.** Nothing CUDA knows about orders CW after the
 copy, so nothing obliges the driver to run the copy while CW spins. Streams share
@@ -974,16 +974,22 @@ default-priority stream waited 596 ms behind 8 blocked streams, while greatest-p
 copies never waited with up to 64 blocked. The copy stream is therefore created at the greatest
 priority. This hardening did **not** cure the startup deadlock of the copy-overlap plan's section 10.
 
-**Completion mechanism: `cuEventQuery` on an event recorded after the job's last copy.** The event
-completes only once all earlier work of the same stream has completed, so a `CUDA_SUCCESS` from the
-query is an observation by the service that every copy of the job has finished reading its source
-slot and writing its destination. The query never blocks, so the thread keeps polling the next job
-and never parks inside the driver waiting on the device; one event per job lets it poll the oldest
-job alone, in stream order. Rejected: `cuStreamQuery` (would couple a job's completion to jobs issued
-after it), `cuEventSynchronize` (blocks the thread in the driver), and the probe's stream-ordered
-4-byte copy of the generation into a device word, which publishes without the service observing
-anything and rests on cross-engine visibility of the data before the flag, which CUDA does not
-document.
+**Completion mechanism: a stream-written completion word** (phase 2 Task P2, replacing `cuEventQuery`,
+whose libcuda mutex per call was ~98.5% of the copy thread's driver traffic: `hotpath/results.md` 9).
+After a job's copies the stream writes the job's 32-bit sequence number into one host-mapped pinned
+word with `cuStreamWriteValue32_v2` and the default flags: the write executes only after the
+stream's prior work and is preceded by a memory fence over it (the v2 API has no
+`NO_MEMORY_BARRIER`). The stream runs in order, so a word that reached a job's sequence (wrap-safe,
+`(int32_t)(word - token) >= 0`) is an observation by the service that the job's copies, and every
+earlier job's, finished reading their source slots and writing their destinations. The copy thread
+reads the word with one acquire load per poll, never calls the driver to poll, and still polls the
+oldest job alone. Liveness without a clock: after 2^16 consecutive pending polls (~5.5 ms) it asks
+`cuStreamQuery` once; an error fails stop, and an idle stream fails stop only if a re-load of the
+word is still short (a lost write; the re-load closes the race where the word lands between the
+first load and the query). A failed copy or write never writes the word, so its leases stay held
+(E5), and the device copy wait's own deadline remains the only timeout. Rejected in P1:
+`cuEventQuery` (a libcuda mutex per poll), and a one-thread kernel doing a system-scope release
+store (needs an SM and a module load, and lands ~2.5 us later).
 
 **Then, in this order:** (a) the host E6: each lane's `SlotGen` word still equals its leased
 generation (a lock-free acquire of the mirrored word; a mismatch fails stop and publishes

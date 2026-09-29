@@ -3,6 +3,7 @@ clockless liveness check, the lost-write rule's re-load after an idle stream (th
 lands between the poll's load and the stream query must not fail stop), and the acquire that orders what the word
 guards (under ThreadSanitizer where the compiler has it: a relaxed load is a reported race there)."""
 
+import os
 import subprocess
 
 import pytest
@@ -115,7 +116,8 @@ def _build_and_run(tmp_path, name, program, sanitize):
     src.write_text(program)
     exe = tmp_path / name
     flags = ["-fsanitize=thread", "-O1", "-g"] if sanitize else ["-O2"]
-    built = subprocess.run(["c++", "-std=c++20", *flags, "-o", str(exe), str(src), "-lpthread"],
+    # $CXX, as load_jit honors it: divix01's GCC has no libtsan runtime installed, its Clang has one.
+    built = subprocess.run([os.environ.get("CXX", "c++"), "-std=c++20", *flags, "-o", str(exe), str(src), "-lpthread"],
                            capture_output=True, text=True)
     if sanitize and built.returncode != 0:
         pytest.skip(f"no ThreadSanitizer here: {built.stderr[-300:]}")
