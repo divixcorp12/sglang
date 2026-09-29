@@ -280,10 +280,17 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "2",
+            # 10 GB since 2026-09-29, overriding the ratio: at 2x a ~0.7 GB GPU KV pool the host held ~1.4 GB.
             "--hicache-size",
-            "0",
+            "10",
+            "--hicache-io-backend",
+            "kernel",
             "--hicache-write-policy",
             "write_through",
+            # hicache_hook.resolve_layout_io_compatibility turns kernel + page_first_direct into the direct
+            # backend, so KV backups are cudaMemcpy DMA copies on the copy engines the RAM-miss path also uses.
+            "--hicache-mem-layout",
+            "page_first_direct",
             # The checkpoint has no vision weights; without this the ViT and aligner are built empty in VRAM.
             "--language-model-only",
             # Loads each prefill Triton variant before serving, while device memory is still free (entrypoints/warmup.py).

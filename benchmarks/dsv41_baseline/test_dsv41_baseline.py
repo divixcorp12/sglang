@@ -990,7 +990,13 @@ def test_server_args_back_the_prefix_cache_with_host_memory():
     # Without it a 4k-token conversation's SWA tail is evicted from the 3584-slot pool and revisits reuse nothing.
     argv = arm_env.ServerArgs(port=31050).argv()
     assert "--enable-hierarchical-cache" in argv
-    flags = {"--hicache-ratio": "2", "--hicache-size": "0", "--hicache-write-policy": "write_through"}
+    flags = {
+        "--hicache-ratio": "2",
+        "--hicache-size": "10",
+        "--hicache-io-backend": "kernel",
+        "--hicache-write-policy": "write_through",
+        "--hicache-mem-layout": "page_first_direct",
+    }
     for flag, value in flags.items():
         assert argv[argv.index(flag) + 1] == value
 
