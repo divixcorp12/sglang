@@ -201,12 +201,15 @@ class CudaCopyBackend : public CopyBackend {
     if (int r = cu_mem_host_alloc_(&host, sizeof(uint32_t), kDeviceMap))
       return "cuMemHostAlloc of the stream-wait probe word failed: " + std::to_string(r);
     auto* word = static_cast<uint32_t*>(host);
-    __atomic_store_n(word, 0u, __ATOMIC_RELEASE);
+    // The production encoding (lease_layout.h): a closed gate word (bit 31 set) that an open word releases.
+    const uint32_t closed = kLeaseGateClosed;
+    const uint32_t open_word = kLeaseGateOpen;
+    __atomic_store_n(word, closed, __ATOMIC_RELEASE);
     uint64_t device_word = 0;
     std::string error;
     if (int r = cu_mem_host_device_ptr_(&device_word, host, 0)) {
       error = "cuMemHostGetDevicePointer of the stream-wait probe word failed: " + std::to_string(r);
-    } else if (int r = cu_wait_value32_(stream_, device_word, 1u, kGeq)) {
+    } else if (int r = cu_wait_value32_(stream_, device_word, kLeaseGateOpen, kGeq)) {
       error = "cuStreamWaitValue32_v2 failed (" + std::to_string(r) +
               "): the copy wait needs the v2 stream wait on host-mapped memory";
     } else {
@@ -217,7 +220,7 @@ class CudaCopyBackend : public CopyBackend {
       } else if (q != CompletionWord::kNotReady) {
         error = "the stream-wait probe failed: cuStreamQuery " + std::to_string(q);
       }
-      __atomic_store_n(word, 1u, __ATOMIC_RELEASE);  // releases the wait; also on an error, so nothing stays queued
+      __atomic_store_n(word, open_word, __ATOMIC_RELEASE);  // releases the wait; also on an error, so nothing stays queued
       for (int i = 0; error.empty(); ++i) {
         q = cu_stream_query_(stream_);
         if (q == 0) break;

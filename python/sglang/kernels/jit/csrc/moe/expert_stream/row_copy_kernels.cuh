@@ -669,8 +669,8 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   if (ld_acquire_sys64(done + kLeaseCdGen) == tagged_word(kLeaseTagCopied, generation) &&
       ld_relaxed_sys<uint32_t>(done + kLeaseCdMask) == mask) {
     // The copy completed before the arm, so the copy thread may already have read the old CopyArm and left: open
-    // the gate here rather than wait for the service's next poll. A host store for G may also land (it read CopyArm
-    // == G); it too is an open of G, and the commit kernel accepts a gate only on CopyDone == G, fatal clear.
+    // the gate here rather than wait for the service's next poll. A host releaser changes the gate only by a CAS from
+    // closed(G), so it cannot overwrite this open, nor a later request's close.
     st_release_sys(area_c + kLeaseCopyGate, copy_gate_word(seq, kLeaseGateOpen));
     return;
   }
@@ -685,8 +685,8 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
 // The copy wait's step (3), after the stream wait on the gate: a plain launch (no PDL; the wait node before it is not
 // a kernel, so there is no programmatic edge to keep). It never waits: a gate or CopyDone that is not what it needs is
 // a failure, recorded for F exactly as the spinning wait's timeout and identity exits were. The gate is only the
-// wake-up; CopyDone == G with the exact mask, fatal clear, is what commits. A gate that names another request (a host
-// store that lost a race, LEASE_PROTOCOL.md 7.6) commits on that alone, else fails.
+// wake-up; CopyDone == G with the exact mask, fatal clear, is what commits. A gate that names another request (not
+// expected: host releasers CAS from G's closed word, LEASE_PROTOCOL.md 7.6) commits on that alone, else fails.
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_copy_commit_kernel(
     const __grid_constant__ CopyCommitParams p) {
   using namespace device::expert_stream;

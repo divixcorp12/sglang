@@ -694,10 +694,9 @@ class RamTier {
   // The decode stream waits (cuStreamWaitValue32) on area C's gate, which CW closed for G (the word names G's seq)
   // before it published CopyArm = G. CW opens it itself when CopyDone already carries G at the arm (its Dekker half);
   // otherwise a host releaser does. Any thread may call release_copy_gate: it records G opened at most once (the CAS
-  // on gate_released_) and stores its outcome only over G's own closed word, so a gate CW already opened, or one a
-  // later request closed, is left alone. The one remaining race, a releaser stalled between that check and its store
-  // while CW opens G and the next request closes, opens the next request early; its commit kernel then commits only
-  // on its own CopyDone, else fails closed. The copy thread calls it after publishing CopyDone, the service on every
+  // on gate_released_) and changes the gate only by a CAS from G's own closed word, so a gate CW already opened, or
+  // one a later request closed, is left alone however long the releaser stalls. The copy thread calls it after
+  // publishing CopyDone, the service on every
   // pump_demand, close_admission and abort_copy_waits after the shutdown word, and the watchdog every poll, with the
   // timeout. No lock, clock or allocation: atomics and pinned words only, so it touches no tier state and needs no
   // owner.
@@ -715,6 +714,10 @@ class RamTier {
     if (gate_released_.load(std::memory_order_acquire) == gen) return 0;
     const uint32_t gate = load_acquire(lease_ + lease_c_ + kLeaseCopyGate);
     return gate == gate_word(static_cast<uint32_t>(gen), kLeaseGateClosed) ? gen : 0;
+  }
+
+  bool copy_waits_aborted() const {
+    return copy_waits_aborted_.load();
   }
 
   int64_t copy_wait_timeout_ns() const {
@@ -764,9 +767,17 @@ class RamTier {
       // Before the gate, and sticky: a CW open that overwrites this timeout still meets it in the commit kernel.
       raise_fatal(seq);
     }
-    // Only over G's own closed word: CW may have opened G since the check above.
-    if (load_acquire(area_c + kLeaseCopyGate) != closed) return true;
-    store_release(area_c + kLeaseCopyGate, gate_word(seq, outcome));
+    // Only G's exact closed word changes: a CAS, not a check and a store, so a releaser stalled here past CW's own
+    // open of G and the next request's close finds closed(G + 1) and changes nothing. A locked cmpxchg on the host
+    // line is atomic against the device's posted stores to it.
+    uint32_t expected = closed;
+    __atomic_compare_exchange_n(
+        reinterpret_cast<uint32_t*>(area_c + kLeaseCopyGate),
+        &expected,
+        gate_word(seq, outcome),
+        false,
+        __ATOMIC_SEQ_CST,
+        __ATOMIC_ACQUIRE);
     return true;
   }
 
@@ -775,6 +786,7 @@ class RamTier {
   // the copy engine, the one thing that arms a copy wait; the shutdown word is sticky, like close_admission's.
   void abort_copy_waits() {
     if (lease_ == nullptr || copy_engine_ == nullptr) return;
+    copy_waits_aborted_.store(true);  // RamThread::start refuses from now on: the shutdown word never clears
     store_release(lease_ + kLeaseHeaderShutdown, 1u);
     std::atomic_thread_fence(std::memory_order_seq_cst);  // the shutdown word before the read of CopyArm
     release_copy_gate();
@@ -2447,7 +2459,8 @@ class RamTier {
   std::unique_ptr<Engine> copy_engine_;
   std::atomic<bool> copy_armed_{false};
   int64_t copy_wait_timeout_ns_ = 0;           // set with the copy engine, before any thread reads it
-  std::atomic<uint64_t> gate_released_{0};     // the last armed generation whose copy-wait gate a releaser opened
+  std::atomic<uint64_t> gate_released_{0};
+  std::atomic<bool> copy_waits_aborted_{false};  // abort_copy_waits ran: no service may start again     // the last armed generation whose copy-wait gate a releaser opened
   // Native prefetch: the page (null when off), the last request generation read (service thread), the one lease a
   // prefetch holds (at most one is outstanding: the device waits for its done word before posting the next), and per
   // row the copied expert its next request judges. The last two are the owner's.

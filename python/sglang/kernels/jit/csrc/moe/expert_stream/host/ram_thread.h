@@ -67,6 +67,12 @@ class RamThread {
           error_prefix<typename Tier::Layout>() +
           "start_thread with a prefill fill running (or not yet ended): call fill_end() first");
     }
+    if (tier_->copy_waits_aborted()) {
+      throw std::runtime_error(
+          error_prefix<typename Tier::Layout>() +
+          "start_thread after the service was stopped with the copy engine on: stopping raised the lease block's "
+          "sticky shutdown word, so every copy wait would fail; build a new host");
+    }
     spin_iters_ = idle_budget(spin_ns_);  // on the caller's thread: the service thread never reads the clock to pace
     tier_->set_parked(false);
     tier_->set_threaded(true);

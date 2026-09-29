@@ -1047,12 +1047,10 @@ production every waiting layer burned an SM. Nothing on the device spins now. CW
 closed word, CW opened it: it records G in `gate_released_` (so the watchdog stops timing it) and stores
 nothing. Else it picks the outcome from the words (CopyDone carries G -> open; fatal or shutdown -> aborted;
 `expired == G` -> timeout, raising the page's fatal word first), CASes `gate_released_` to G (one host store per
-G), re-checks that the gate still holds G's closed word, and only then stores the outcome. A releaser only
+G), then changes the gate by a CAS from G's exact closed word to its outcome. A releaser only
 opens after reading CopyArm = G, and CopyArm follows the close, so an open never lands before its own close.
-**Residual race, fail-closed:** a releaser stalled between that re-check and its store, while CW opens G and
-the next request G' arms and closes, lands G's open over G''s closed word and releases G' early. G''s commit
-sees a gate naming another request and commits only on G''s own CopyDone, else fails the request (a spurious
-fail-stop, never a stale read). Closing it would need an atomic the device and host share over PCIe. Callers,
+A releaser stalled past CW's own open of G and G + 1's close cannot open G + 1: its CAS expects closed(G) and
+finds closed(G + 1) (a locked cmpxchg on the host line is atomic against the device's posted stores). Callers,
 every one lock-, clock- and allocation-free except the watchdog's clock:
 
 | Path that ends the wait | Who opens the gate |

@@ -547,3 +547,52 @@ def test_stopping_the_service_thread_opens_an_armed_gate_as_aborted(tmp_path):
     finally:
         host.copy_engine_release(-1)
         host.stop()
+
+
+def test_a_stale_release_for_g_leaves_the_next_requests_closed_gate_alone(tmp_path):
+    """A releaser that still reads CopyArm == G (CW opened G itself and has already closed the gate for G + 1, not yet
+    renamed CopyArm) must not open G + 1: the host changes the gate only by a CAS from G's exact closed word.
+    Mutant: a plain store of G's outcome -- red on the gate word (it would read open for G)."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        _copy_engine(s, host)
+        _load(sim, host, [3])
+        req = sim.post(ROW, [3], dst=[2], copy_engine=True)
+        assert host.pump() == 1
+        host.copy_engine_release(1)
+        assert _until(lambda: sim.copy_done(req) == (lease.COPIED, req.gen, 1))
+        sim.arm_copy_wait(req)  # CopyArm = G ...
+        next_closed = lease.gate_word(req.seq + 1, "closed")
+        sim._set_gate(next_closed)  # ... and the gate already closed for G + 1
+        host.pump()
+        host.close_admission()  # every host release path, the abort included
+        assert sim.copy_gate() == next_closed
+    finally:
+        host.stop()
+
+
+def test_start_thread_is_refused_after_a_stop_raised_the_shutdown_word(tmp_path):
+    """Stopping the service with the copy engine on raises the sticky shutdown word (abort_copy_waits): a restarted
+    service would fail every copy wait, so start_thread refuses with a clear error instead."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        _copy_engine(s, host)
+        host.start_thread()
+        host._module.expert_stream_stop_thread(host.handle)
+        host.threaded = False
+        with pytest.raises(Exception, match="sticky shutdown word"):
+            host.start_thread()
+        host.threaded = False
+    finally:
+        host.stop()
+
+
+def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
+    """Source pin for the release above: no plain store to the gate is left in the host."""
+    from pathlib import Path
+
+    import sglang.kernels.ops.moe.expert_stream_transport as transport
+
+    tier = (Path(transport.__file__).resolve().parents[2] / "jit/csrc/moe/expert_stream/host/ram_tier.h").read_text()
+    assert "store_release(area_c + kLeaseCopyGate" not in tier
+    assert "__atomic_compare_exchange_n(\n        reinterpret_cast<uint32_t*>(area_c + kLeaseCopyGate)" in tier
