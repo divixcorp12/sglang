@@ -86,13 +86,21 @@ class LeaseSim:
         return tag, gen, int(self._i32(base + lease.COPY_DONE_FIELDS["mask"])[0]) & 0xFFFFFFFF
 
     def copy_gate(self) -> int:
-        """Area C's copy-wait gate (lease.GATE), the word the decode stream's cuStreamWaitValue32 waits on."""
+        """Area C's copy-wait gate (lease.gate_word), the word the decode stream's cuStreamWaitValue32 waits on."""
         return int(self._i32(self.layout.copy_offset + lease.COPY_GATE)[0]) & 0xFFFFFFFF
 
     def arm_copy_wait(self, req: SimRequest) -> None:
-        """The copy wait's arm kernel for a request with COPYING lanes: close the gate, then publish CopyArm = G."""
-        self._i32(self.layout.copy_offset + lease.COPY_GATE)[0] = lease.GATE["closed"]
+        """The copy wait's arm kernel for a request with COPYING lanes: close the gate for G, then publish CopyArm = G.
+        (Its Dekker re-read, which opens the gate itself when CopyDone is already there, is ``open_copy_gate``.)"""
+        self._set_gate(lease.gate_word(req.seq, "closed"))
         self.write_u64(self.layout.copy_offset + lease.COPY_ARM, lease.tagged(lease.COPY_ARM_TAG, req.gen))
+
+    def open_copy_gate(self, req: SimRequest, outcome: str = "open") -> None:
+        """The arm kernel's own open of G's gate (CopyDone seen at the re-read, or fatal/shutdown)."""
+        self._set_gate(lease.gate_word(req.seq, outcome))
+
+    def _set_gate(self, word: int) -> None:
+        self._i32(self.layout.copy_offset + lease.COPY_GATE)[0] = word - (1 << 32) if word >= (1 << 31) else word
 
     def dst_slot(self, req: SimRequest, lane: int) -> int:
         """The lane's destination slot as the post kernel wrote it into the LaneRequest."""

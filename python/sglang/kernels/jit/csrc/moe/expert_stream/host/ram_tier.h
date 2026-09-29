@@ -691,21 +691,30 @@ class RamTier {
 
   // ---- The copy wait's gate (LEASE_PROTOCOL.md 7.6, "The stream-ordered copy wait") ----
   //
-  // The decode stream waits (cuStreamWaitValue32) on area C's gate, which CW closed before it published CopyArm = G.
-  // Any thread may call release_copy_gate: it opens the gate of the armed request at most once, with the outcome its
-  // words show. The copy thread calls it after publishing CopyDone, the service on every pump_demand (the arm may
-  // follow CopyDone), close_admission after the shutdown word, and the watchdog every poll, with the timeout.
-  // Exactly once per G (the CAS on gate_released_) is what makes it safe: the device cannot pass G's wait before that
-  // one store lands, so no store for G is still in flight when a later request closes the gate. No lock, clock or
-  // allocation: atomics and pinned words only, so it touches no tier state and needs no owner.
+  // The decode stream waits (cuStreamWaitValue32) on area C's gate, which CW closed for G (the word names G's seq)
+  // before it published CopyArm = G. CW opens it itself when CopyDone already carries G at the arm (its Dekker half);
+  // otherwise a host releaser does. Any thread may call release_copy_gate: it records G opened at most once (the CAS
+  // on gate_released_) and stores its outcome only over G's own closed word, so a gate CW already opened, or one a
+  // later request closed, is left alone. The one remaining race, a releaser stalled between that check and its store
+  // while CW opens G and the next request closes, opens the next request early; its commit kernel then commits only
+  // on its own CopyDone, else fails closed. The copy thread calls it after publishing CopyDone, the service on every
+  // pump_demand, close_admission and abort_copy_waits after the shutdown word, and the watchdog every poll, with the
+  // timeout. No lock, clock or allocation: atomics and pinned words only, so it touches no tier state and needs no
+  // owner.
 
-  // The generation of the request whose copy wait is armed and whose gate no releaser opened, else 0.
+  static uint32_t gate_word(uint32_t seq, uint32_t low) {
+    return ((seq & kLeaseGateSeqMask) << kLeaseGateSeqShift) | low;
+  }
+
+  // The generation of the request whose copy wait is armed and whose gate is still closed for it, else 0.
   uint64_t armed_copy_wait() const {
     if (lease_ == nullptr || copy_engine_ == nullptr) return 0;
     const uint64_t arm = load_acquire64(lease_ + lease_c_ + kLeaseCopyArm);
     if (tag_of(arm) != kLeaseTagCopyArm) return 0;
     const uint64_t gen = generation_of(arm);
-    return gate_released_.load(std::memory_order_acquire) == gen ? 0 : gen;
+    if (gate_released_.load(std::memory_order_acquire) == gen) return 0;
+    const uint32_t gate = load_acquire(lease_ + lease_c_ + kLeaseCopyGate);
+    return gate == gate_word(static_cast<uint32_t>(gen), kLeaseGateClosed) ? gen : 0;
   }
 
   int64_t copy_wait_timeout_ns() const {
@@ -723,8 +732,15 @@ class RamTier {
     const uint64_t gen = generation_of(arm);
     if (released == gen) return false;
     const uint32_t seq = static_cast<uint32_t>(gen);
+    const uint32_t closed = gate_word(seq, kLeaseGateClosed);
+    if (load_acquire(area_c + kLeaseCopyGate) != closed) {
+      // CW opened G itself (CopyArm is stored after the close, so a gate read after CopyArm == G is G's close or
+      // later). Record it, so the watchdog stops timing it; nothing to store.
+      gate_released_.compare_exchange_strong(released, gen, std::memory_order_acq_rel);
+      return false;
+    }
     const uint8_t* done = area_c + static_cast<int64_t>((seq - 1u) % kDemandRecords) * kLeaseCopyDoneBytes;
-    uint32_t outcome = kLeaseGateClosed;
+    uint32_t outcome = kLeaseGateOpen;
     if (load_acquire64(done + kLeaseCdGen) == tagged_word(kLeaseTagCopied, gen)) {
       outcome = kLeaseGateOpen;
     } else if (load_acquire(page_ + kFatal) != 0 || load_acquire(lease_ + kLeaseHeaderShutdown) != 0) {
@@ -745,10 +761,23 @@ class RamTier {
           static_cast<unsigned long long>(gen),
           static_cast<double>(copy_wait_timeout_ns_) / 1e9);
       std::fflush(stderr);
-      raise_fatal(seq);  // before the gate: F then finds the fatal word raised, as after a device timeout
+      // Before the gate, and sticky: a CW open that overwrites this timeout still meets it in the commit kernel.
+      raise_fatal(seq);
     }
-    store_release(area_c + kLeaseCopyGate, outcome);
+    // Only over G's own closed word: CW may have opened G since the check above.
+    if (load_acquire(area_c + kLeaseCopyGate) != closed) return true;
+    store_release(area_c + kLeaseCopyGate, gate_word(seq, outcome));
     return true;
+  }
+
+  // Teardown with no service to follow (RamThread's stop, via the FFI's stop_thread and close): raise the header's
+  // shutdown word and open an armed gate, so an in-flight replay's copy wait ends aborted instead of never. Only with
+  // the copy engine, the one thing that arms a copy wait; the shutdown word is sticky, like close_admission's.
+  void abort_copy_waits() {
+    if (lease_ == nullptr || copy_engine_ == nullptr) return;
+    store_release(lease_ + kLeaseHeaderShutdown, 1u);
+    std::atomic_thread_fence(std::memory_order_seq_cst);  // the shutdown word before the read of CopyArm
+    release_copy_gate();
   }
 
   // Row `row`'s copy table: `entries` rows of {source slab address, destination tensor address, row bytes}. Bit i
@@ -1844,7 +1873,7 @@ class RamTier {
       put_u32(kLeaseRowTable + 8 * row + 4, static_cast<uint32_t>(capacity[row]));
     }
     // Open, with nothing armed: a copy wait that arms nothing passes its stream wait on this value.
-    put_u32(copy_offset + kLeaseCopyGate, kLeaseGateOpen);
+    put_u32(copy_offset + kLeaseCopyGate, gate_word(0, kLeaseGateOpen));
     std::memset(lease_ + copy_offset + kLeaseCopyArm, 0, 8);
     slot_gen_ = reinterpret_cast<uint32_t*>(lease_ + kLeaseSlotGen);
     _mm_sfence();

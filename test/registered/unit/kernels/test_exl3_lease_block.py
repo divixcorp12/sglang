@@ -61,7 +61,23 @@ def test_area_c_holds_the_copy_wait_gate_and_arm_word_on_lines_of_their_own():
     assert lease.COPY_ARM >= lease.COPY_GATE + 128 and lease.COPY_ARM % 128 == 0
     assert lease.AREA_C_BYTES == lease.COPY_ARM + 8 <= lease.BLOCK_ALIGN
     assert layout.copy_offset + lease.AREA_C_BYTES <= layout.total_bytes
-    assert lease.GATE == {"closed": 0, "open": 1, "timeout": 2, "aborted": 3}
+    assert lease.GATE == {"closed": 0x80000001, "open": 1, "timeout": 2, "aborted": 3}
+
+
+def test_the_gate_word_names_its_request_and_only_open_words_pass_the_cyclic_geq():
+    """cuStreamWaitValue32(gate, GATE["open"], GEQ) passes iff (int32)(gate - 1) >= 0: every open outcome of every seq
+    passes and every closed word blocks, so the wait never wraps; the seq field tells two requests' words apart."""
+
+    def passes(word):
+        diff = (word - lease.GATE["open"]) & 0xFFFFFFFF
+        return diff < (1 << 31)
+
+    for seq in (1, 2, 15, 16, lease.GATE_SEQ_MASK, lease.GATE_SEQ_MASK + 1, 0xFFFFFFFF):
+        assert not passes(lease.gate_word(seq, "closed"))
+        for outcome in ("open", "timeout", "aborted"):
+            word = lease.gate_word(seq, outcome)
+            assert passes(word) and word & lease.GATE_OUTCOME_MASK == lease.GATE[outcome]
+    assert lease.gate_word(1, "open") != lease.gate_word(2, "open")
 
 
 def test_area_p_header_offset_is_a_new_header_word_beside_d_offset():

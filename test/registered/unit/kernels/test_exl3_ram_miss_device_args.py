@@ -335,6 +335,9 @@ def _lease_python_constants():
         "kLeaseGateOpen": lease.GATE["open"],
         "kLeaseGateTimeout": lease.GATE["timeout"],
         "kLeaseGateAborted": lease.GATE["aborted"],
+        "kLeaseGateOutcomeMask": lease.GATE_OUTCOME_MASK,
+        "kLeaseGateSeqShift": lease.GATE_SEQ_SHIFT,
+        "kLeaseGateSeqMask": lease.GATE_SEQ_MASK,
     }
 
 

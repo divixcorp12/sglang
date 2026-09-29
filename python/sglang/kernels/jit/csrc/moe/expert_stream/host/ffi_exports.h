@@ -1213,6 +1213,8 @@ struct HostExports {
       const auto owner = registry().find(handle);
       if (owner != registry().end()) tier = owner->second;
     }
+    // Before the join: an in-flight replay's copy wait would otherwise wait for a service that is gone.
+    if (tier) tier->abort_copy_waits();
     thread->stop();
     // The final settle (LEASE_PROTOCOL.md 7.5): no demand follows the last one to settle it, so a late second signal
     // on it is compared here, before ExpertStreamHost.stop writes its counters line. Here and not in RamThread::stop,
@@ -1251,6 +1253,8 @@ struct HostExports {
         registry().erase(found);
       }
     }
+    // A service still running also ends any armed copy wait first (its lease block is alive: the thread uses it).
+    if (thread && tier) tier->abort_copy_waits();
     if (thread) thread->stop();
   }
 };

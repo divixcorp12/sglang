@@ -1827,6 +1827,9 @@ class Envs:
     # thread may take per MoE layer, in ms, before the process fails stop. The
     # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),
     # so it always outlasts this wait and the eager pause bound (2x this + 1 s).
+    # With the copy engine, the copy wait gets this again, timed by that watchdog from
+    # when it first sees the wait armed (LEASE_PROTOCOL.md 7.6): post to fail-stop can
+    # then take about 2x this (+20 ms).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level

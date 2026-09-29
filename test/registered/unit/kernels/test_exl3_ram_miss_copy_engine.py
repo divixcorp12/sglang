@@ -427,9 +427,9 @@ def test_the_copy_thread_opens_an_armed_gate_once_copydone_is_published(tmp_path
         sim.arm_copy_wait(req)
         host.pump()
         time.sleep(0.05)  # every releaser has had its chance to open early
-        assert sim.copy_gate() == lease.GATE["closed"], "the gate opened before CopyDone"
+        assert sim.copy_gate() == lease.gate_word(req.seq, "closed"), "the gate opened before CopyDone"
         host.copy_engine_release(1)
-        assert _until(lambda: sim.copy_gate() == lease.GATE["open"]), sim.copy_gate()
+        assert _until(lambda: sim.copy_gate() == lease.gate_word(req.seq, "open")), sim.copy_gate()
         assert sim.copy_done(req) == (lease.COPIED, req.gen, 1)
         assert page_word(page, "fatal") == 0
     finally:
@@ -437,8 +437,9 @@ def test_the_copy_thread_opens_an_armed_gate_once_copydone_is_published(tmp_path
 
 
 def test_a_gate_armed_after_its_copydone_is_opened_by_the_service(tmp_path):
-    """The DMA finished before the device armed, so the copy thread found nothing armed: the service's next poll
-    opens the gate. Mutant: open only from the copy thread -- red here (the gate stays closed)."""
+    """The DMA finished before the device armed, so the copy thread found nothing armed, and here the arm kernel's
+    own re-read (the device half, not simulated) missed it too: the service's next poll opens the gate, the backstop.
+    Mutant: open only from the copy thread -- red here (the gate stays closed)."""
     s, page, host, sim = _host(tmp_path)
     try:
         _copy_engine(s, host)
@@ -449,9 +450,9 @@ def test_a_gate_armed_after_its_copydone_is_opened_by_the_service(tmp_path):
         assert _until(lambda: sim.copy_done(req) == (lease.COPIED, req.gen, 1))
         sim.arm_copy_wait(req)
         time.sleep(0.02)
-        assert sim.copy_gate() == lease.GATE["closed"]
+        assert sim.copy_gate() == lease.gate_word(req.seq, "closed")
         host.pump()
-        assert sim.copy_gate() == lease.GATE["open"]
+        assert sim.copy_gate() == lease.gate_word(req.seq, "open")
     finally:
         host.stop()
 
@@ -465,7 +466,7 @@ def test_close_admission_opens_an_armed_gate_as_aborted(tmp_path):
         assert host.pump() == 1
         sim.arm_copy_wait(req)
         host.close_admission()
-        assert sim.copy_gate() == lease.GATE["aborted"]
+        assert sim.copy_gate() == lease.gate_word(req.seq, "aborted")
     finally:
         host.copy_engine_release(-1)
         host.stop()
@@ -489,9 +490,60 @@ def test_the_watchdog_times_out_a_copy_wait_whose_copy_never_completes(tmp_path)
         assert host.pump() == 1 and sim.row_result(req, 0)["tag"] == lease.COPYING
         host.start_thread()
         sim.arm_copy_wait(req)
-        assert _until(lambda: sim.copy_gate() == lease.GATE["timeout"], 5.0), sim.copy_gate()
+        assert _until(lambda: sim.copy_gate() == lease.gate_word(req.seq, "timeout"), 5.0), sim.copy_gate()
         assert page_word(page, "fatal") != 0
         assert sim.copy_done(req)[:2] != (lease.COPIED, req.gen)
+    finally:
+        host.copy_engine_release(-1)
+        host.stop()
+
+
+def test_a_gate_the_arm_kernel_opened_itself_is_left_alone_and_never_times_out(tmp_path):
+    """The Dekker half on the device: CopyDone was there at the arm's re-read, so CW opened G's gate itself. No host
+    releaser may store over it (the word stays CW's), and the watchdog must not time it out: it no longer reads as
+    armed. Mutants: a releaser that stores without re-checking the closed word, or a watchdog that times by CopyArm
+    alone -- red on the gate word or the fatal word."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=50)
+        dst = {n: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype) for n, slab in s.slabs[ROW].items()}
+        table = torch.tensor(
+            [[slab.data_ptr(), dst[n].data_ptr(), slab[0].numel() * slab.element_size()] for n, slab in s.slabs[ROW].items()],
+            dtype=torch.int64,
+        )
+        host.set_copy_table(ROW, table, DST_ROWS)
+        host.arm_copy_engine()
+        _load(sim, host, [3])
+        req = sim.post(ROW, [3], dst=[2], copy_engine=True)
+        assert host.pump() == 1
+        host.copy_engine_release(1)
+        assert _until(lambda: sim.copy_done(req) == (lease.COPIED, req.gen, 1))
+        sim.arm_copy_wait(req)
+        sim.open_copy_gate(req, "timeout")  # a word no host releaser would write here: an overwrite shows
+        host.start_thread()
+        time.sleep(0.3)  # six watchdog polls past the 50 ms timeout, and many service polls
+        assert sim.copy_gate() == lease.gate_word(req.seq, "timeout"), "a releaser stored over the device's open"
+        assert page_word(page, "fatal") == 0, "the watchdog timed out a gate the device had opened"
+    finally:
+        host.stop()
+
+
+def test_stopping_the_service_thread_opens_an_armed_gate_as_aborted(tmp_path):
+    """Teardown without close_admission (ExpertStreamHost.stop, the atexit hook): the service is going away, so an
+    in-flight replay's copy wait must end. stop_thread raises the shutdown word and opens the gate before the join.
+    Mutant: no abort in stop_thread -- red on the gate word (it stays closed)."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        _copy_engine(s, host)
+        _load(sim, host, [3])
+        req = sim.post(ROW, [3], dst=[2], copy_engine=True)
+        assert host.pump() == 1
+        host.start_thread()
+        sim.arm_copy_wait(req)  # the mark is held: no CopyDone, nothing else would open it before the timeout
+        host._module.expert_stream_stop_thread(host.handle)
+        host.threaded = False
+        assert sim.copy_gate() == lease.gate_word(req.seq, "aborted")
+        assert host.lease_header()["shutdown"] == 1
     finally:
         host.copy_engine_release(-1)
         host.stop()

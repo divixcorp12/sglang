@@ -86,12 +86,16 @@ COPY_DONE_BYTES = 16
 COPY_DONE_FIELDS = {"mask": 0, "gen": 8}
 AREA_COPY_DONE_BYTES = RING * COPY_DONE_BYTES
 # After CopyDone[] (ABI 4, LEASE_PROTOCOL.md 7.6): the copy wait's gate, a u32 on its own line that CW closes before it
-# arms and a host releaser opens once per armed request with an outcome (the decode stream waits on it with
-# cuStreamWaitValue32, GEQ GATE["open"]); then CopyArm, tagged(COPY_ARM_TAG, generation), device-written, the next line.
+# arms and CW or a host releaser opens once per armed request (the decode stream waits on it with cuStreamWaitValue32,
+# GEQ GATE["open"]); the word names its request (gate_word). Then CopyArm, tagged(COPY_ARM_TAG, generation),
+# device-written, the next line.
 COPY_GATE = AREA_COPY_DONE_BYTES
 COPY_ARM = COPY_GATE + 128
 AREA_C_BYTES = COPY_ARM + 8
-GATE = {"closed": 0, "open": 1, "timeout": 2, "aborted": 3}
+GATE = {"closed": 0x80000001, "open": 1, "timeout": 2, "aborted": 3}
+GATE_OUTCOME_MASK = 3
+GATE_SEQ_SHIFT = 2
+GATE_SEQ_MASK = 0x1FFFFFFF
 
 # Tags of the 8-bit field above the 56-bit generation.
 READY = 1  # RowResult.ready
@@ -119,6 +123,11 @@ def tagged(tag: int, generation: int) -> int:
     if not 0 < generation <= GENERATION_MASK:
         raise ValueError(f"generation {generation} does not fit 56 bits or is zero (zero is never a valid generation)")
     return (tag << TAG_SHIFT) | generation
+
+
+def gate_word(seq: int, low: str) -> int:
+    """The copy-wait gate word for request ``seq``: ``low`` is a GATE key (closed, or an outcome)."""
+    return ((seq & GATE_SEQ_MASK) << GATE_SEQ_SHIFT) | GATE[low]
 
 
 def untag(word: int) -> tuple[int, int]:

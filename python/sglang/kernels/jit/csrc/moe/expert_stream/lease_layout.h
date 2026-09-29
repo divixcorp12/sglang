@@ -106,17 +106,21 @@ constexpr int64_t kLeaseCdMask = 0;
 constexpr int64_t kLeaseCdGen = 8;
 constexpr int64_t kLeaseAreaCopyDoneBytes = kLeaseRing * kLeaseCopyDoneBytes;
 // Area C, after CopyDone[] (ABI 4, LEASE_PROTOCOL.md 7.6 "The stream-ordered copy wait"): the copy wait's gate, one
-// u32 on its own line. CW closes it (kLeaseGateClosed) before it arms; a host releaser opens it once per armed
-// request with an outcome; the decode stream waits on it with cuStreamWaitValue32 (GEQ kLeaseGateOpen) in between.
-// Then CopyArm, u64 tagged(kLeaseTagCopyArm, generation) on the next line, device-written after the gate closed:
-// the one request whose gate a host releaser may open.
+// u32 on its own line. CW closes it before it arms; it is opened, once per armed request, by CW itself when CopyDone
+// already carries the request, else by a host releaser; the decode stream waits on it with cuStreamWaitValue32 (GEQ
+// kLeaseGateOpen) in between. The word names the request: (seq & kLeaseGateSeqMask) << kLeaseGateSeqShift, OR'd with
+// kLeaseGateClosed (bit 31 set: the cyclic GEQ blocks) or an outcome (1..3: it passes). Then CopyArm, u64
+// tagged(kLeaseTagCopyArm, generation) on the next line, device-written after the gate closed.
 constexpr int64_t kLeaseCopyGate = kLeaseAreaCopyDoneBytes;
 constexpr int64_t kLeaseCopyArm = kLeaseCopyGate + 128;
 constexpr int64_t kLeaseAreaCBytes = kLeaseCopyArm + 8;
-constexpr uint32_t kLeaseGateClosed = 0;
-constexpr uint32_t kLeaseGateOpen = 1;     // CopyDone carries the armed generation
+constexpr uint32_t kLeaseGateClosed = 0x80000001u;  // with the request's seq field: (int32_t)(gate - 1) < 0
+constexpr uint32_t kLeaseGateOpen = 1;               // CopyDone carries the armed generation
 constexpr uint32_t kLeaseGateTimeout = 2;  // the host's copy-wait deadline passed; the page's fatal word is raised
 constexpr uint32_t kLeaseGateAborted = 3;  // the fatal word or the header's shutdown word was raised
+constexpr uint32_t kLeaseGateOutcomeMask = 3;
+constexpr uint32_t kLeaseGateSeqShift = 2;
+constexpr uint32_t kLeaseGateSeqMask = 0x1FFFFFFF;  // 29 bits of the request's seq
 static_assert(kLeaseSmAck + kLeaseRing * kLeaseSmAckBytes <= 4096, "area D fits one page");
 static_assert(kLeaseAreaCBytes <= 4096, "area C fits one page");
 

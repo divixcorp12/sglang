@@ -542,6 +542,7 @@ struct CopyWaitParams {
 };
 
 struct CopyCommitParams {
+  const uint8_t* page;
   int32_t* state;
   const uint8_t* lease;
   int64_t lease_c;
@@ -647,33 +648,45 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
     return;
   }
   if (mask == 0) return;
-  // The fatal and shutdown words are sticky: with either raised no request arms, and this one fails as the spinning
-  // wait's early exit did.
-  if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) {
+  // The fatal word is sticky: with it raised no request arms, and this one fails closed. Shutdown alone does not
+  // refuse: the re-read below still commits a request whose CopyDone already carries G, as the spinning wait did.
+  if (ld_acquire_sys(page + kFatal) != 0) {
     state[kReqFailed] = 1;
     if (state[kFailReason] == 0) state[kFailReason] = static_cast<int32_t>(kLeaseReasonAborted);
     return;
   }
   state[kCopyWaits] += 1;
-  // Arm: close the gate, then name G. A host releaser opens the gate only after it read CopyArm == G, so its store
-  // lands after this close; one of G's own is the only store that can open it (LEASE_PROTOCOL.md 7.6).
+  // Arm: close the gate for G, then name G. A host releaser opens it only after it read CopyArm == G and only over
+  // this exact closed word, so its store lands after this close (LEASE_PROTOCOL.md 7.6).
   uint8_t* const area_c = lease + lease_c;
-  st_relaxed_sys<uint32_t>(area_c + kLeaseCopyGate, kLeaseGateClosed);
+  st_relaxed_sys<uint32_t>(area_c + kLeaseCopyGate, copy_gate_word(seq, kLeaseGateClosed));
   st_release_sys64(area_c + kLeaseCopyArm, tagged_word(kLeaseTagCopyArm, generation));  // the release orders the close
   ce_mask[0] = static_cast<int32_t>(mask);
-  __threadfence_system();  // store->load: the arm before the reads below (Dekker with close_admission's fence)
+  // store->load: the arm before the reads below. A Dekker pair with the copy thread (CopyDone store, fence, CopyArm
+  // read) and with close_admission / teardown (shutdown store, fence, CopyArm read): one side always sees the other.
+  __threadfence_system();
   const uint8_t* done = area_c + idx * kLeaseCopyDoneBytes;
-  if (ld_acquire_sys64(done + kLeaseCdGen) != tagged_word(kLeaseTagCopied, generation)) state[kCopySpun] += 1;
+  if (ld_acquire_sys64(done + kLeaseCdGen) == tagged_word(kLeaseTagCopied, generation) &&
+      ld_relaxed_sys<uint32_t>(done + kLeaseCdMask) == mask) {
+    // The copy completed before the arm, so the copy thread may already have read the old CopyArm and left: open
+    // the gate here rather than wait for the service's next poll. A host store for G may also land (it read CopyArm
+    // == G); it too is an open of G, and the commit kernel accepts a gate only on CopyDone == G, fatal clear.
+    st_release_sys(area_c + kLeaseCopyGate, copy_gate_word(seq, kLeaseGateOpen));
+    return;
+  }
+  state[kCopySpun] += 1;
   if (ld_acquire_sys(page + kFatal) != 0 || ld_acquire_sys(lease + kLeaseHeaderShutdown) != 0) {
     // Raised after the check above: open the gate ourselves, so the wait ends with no host thread left to poll. Safe
-    // only because both words are sticky: no later request arms, so a host store for G landing late opens nothing.
-    st_release_sys(area_c + kLeaseCopyGate, kLeaseGateAborted);
+    // because both words are sticky: no later request needs a host to open its gate, and a failed commit follows.
+    st_release_sys(area_c + kLeaseCopyGate, copy_gate_word(seq, kLeaseGateAborted));
   }
 }
 
 // The copy wait's step (3), after the stream wait on the gate: a plain launch (no PDL; the wait node before it is not
 // a kernel, so there is no programmatic edge to keep). It never waits: a gate or CopyDone that is not what it needs is
-// a failure, recorded for F exactly as the spinning wait's timeout and identity exits were.
+// a failure, recorded for F exactly as the spinning wait's timeout and identity exits were. The gate is only the
+// wake-up; CopyDone == G with the exact mask, fatal clear, is what commits. A gate that names another request (a host
+// store that lost a race, LEASE_PROTOCOL.md 7.6) commits on that alone, else fails.
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_copy_commit_kernel(
     const __grid_constant__ CopyCommitParams p) {
   using namespace device::expert_stream;
@@ -688,13 +701,17 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const uint8_t* area_c = p.lease + p.lease_c;
   const uint8_t* done = area_c + idx * kLeaseCopyDoneBytes;
   const uint32_t gate = ld_acquire_sys(area_c + kLeaseCopyGate);
+  const bool mine = (gate & ~kLeaseGateOutcomeMask) == copy_gate_word(seq, 0);
+  const uint32_t outcome = mine ? (gate & kLeaseGateOutcomeMask) : kLeaseGateOpen;
   uint32_t reason = 0;
-  if (gate == kLeaseGateTimeout) {
+  if (outcome == kLeaseGateTimeout) {
     reason = kLeaseReasonTimeout;
-  } else if (gate == kLeaseGateAborted) {
+  } else if (outcome == kLeaseGateAborted) {
     reason = kLeaseReasonAborted;
-  } else if (gate != kLeaseGateOpen || ld_acquire_sys64(done + kLeaseCdGen) != tagged_word(kLeaseTagCopied, generation)) {
-    reason = kLeaseReasonFailed;  // the host opens the gate only on this CopyDone: an internal error, fail closed
+  } else if (ld_acquire_sys(p.page + kFatal) != 0) {
+    reason = kLeaseReasonAborted;  // a device open may have overwritten a host timeout: fatal is raised first, sticky
+  } else if (outcome != kLeaseGateOpen || ld_acquire_sys64(done + kLeaseCdGen) != tagged_word(kLeaseTagCopied, generation)) {
+    reason = kLeaseReasonFailed;  // opened without this CopyDone: never committed on
   } else if (ld_relaxed_sys<uint32_t>(done + kLeaseCdMask) != mask) {
     // The acquire of the tagged word orders this load after it: the service stores the mask first.
     reason = kLeaseReasonIdentity;
@@ -921,9 +938,9 @@ struct RowCopyKernel {
     };
     LaunchKernel(1, threads, stream).enable_pdl(use_pdl != 0)(
         use_pdl != 0 ? exl3_ram_miss_lease_copy_wait_kernel<true> : exl3_ram_miss_lease_copy_wait_kernel<false>, params);
-    // The gate's values are a fixed set, not a counter, so the cyclic GEQ never wraps: (int32_t)(gate - 1) >= 0 holds
-    // for every open outcome and fails only for kLeaseGateClosed. Which request the gate opened for is the arm's
-    // CopyArm and the commit kernel's CopyDone check, never this compare. Captured as a memory-op node of the graph.
+    // The gate is not a counter, so the cyclic GEQ never wraps: an open word (29-bit seq << 2 | outcome 1..3) is in
+    // [1, 2^31) and passes, a closed word has bit 31 set and blocks. Whether it opened for this request is the commit
+    // kernel's check (the seq field and CopyDone), never this compare. Captured as a memory-op node of the graph.
     if (lease_address != 0) {
       const int r = expert_stream::stream_wait_value32()(
           static_cast<void*>(stream),
@@ -933,6 +950,7 @@ struct RowCopyKernel {
       RuntimeCheck(r == 0, "the copy wait's cuStreamWaitValue32_v2 on the gate failed: CUresult ", r);
     }
     const auto commit = CopyCommitParams{
+        .page = static_cast<const uint8_t*>(page.data_ptr()),
         .state = static_cast<int32_t*>(state.data_ptr()),
         .lease = reinterpret_cast<const uint8_t*>(lease_address),
         .lease_c = lease_c,

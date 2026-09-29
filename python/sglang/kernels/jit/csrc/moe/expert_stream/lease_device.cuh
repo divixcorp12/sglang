@@ -77,6 +77,11 @@ SGL_DEVICE uint64_t tagged_word(uint64_t tag, uint64_t generation) {
   return (tag << 56) | generation;
 }
 
+// The copy wait's gate word for request `seq`: `low` is kLeaseGateClosed or an outcome (lease_layout.h).
+SGL_DEVICE uint32_t copy_gate_word(uint32_t seq, uint32_t low) {
+  return ((seq & kLeaseGateSeqMask) << kLeaseGateSeqShift) | low;
+}
+
 // Every word the host or another kernel accesses concurrently goes through one of these, so each call site states
 // its ordering. Relaxed is a volatile access: the PTX memory model treats ld/st.volatile as relaxed at system scope,
 // and nvcc emits LDG/STG.E.STRONG.SYS for it. Not cuda::atomic_ref: with CUDA 13.4's libcu++, an access through a
