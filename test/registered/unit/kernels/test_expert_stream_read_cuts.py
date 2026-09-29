@@ -1,0 +1,162 @@
+"""Device-sized read cuts in the expert-stream reader (plan 2026-09-28-iopoll-read-cuts). The native part compiles
+read_cuts.h alone; the FFI part (Tasks 4-5) reads through the reader with a test-only cut cap (fault word
+leg_cut_cap). Why the cuts exist: analysis/dsv41-drive/iopoll/diagnosis.md."""
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=40, suite="base-a-test-cpu")
+
+ROOT = Path(__file__).resolve().parents[4]
+INCLUDE = ROOT / "python/sglang/kernels/jit/csrc"
+
+_UNIT = r"""
+#include "moe/expert_stream/host/read_cuts.h"
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <fcntl.h>
+#include <fstream>
+#include <iostream>
+#include <unistd.h>
+#include <vector>
+using namespace sglang::expert_stream;
+
+static DeviceLimits lim(int64_t cut, uint64_t mask) { return DeviceLimits{cut, mask, "test"}; }
+
+struct Plan { std::vector<CutLeg> legs; std::vector<iovec> iov; unsigned n; };
+static Plan plan(std::vector<iovec> in, const DeviceLimits& l, unsigned max_legs = 64) {
+  Plan p; p.legs.resize(max_legs); p.iov.resize(in.size() + max_legs);
+  p.n = cut_legs(in.data(), in.size(), l, p.iov.data(), p.iov.size(), p.legs.data(), max_legs);
+  return p;
+}
+// The legs tile the input: same bytes, same addresses, in order, every leg within the cut.
+static void tiles(const std::vector<iovec>& in, const Plan& p, int64_t cut) {
+  size_t i = 0, off = 0, k = 0;
+  for (unsigned g = 0; g < p.n; ++g) {
+    assert(p.legs[g].first == k && p.legs[g].bytes > 0 && p.legs[g].bytes <= cut);
+    int64_t sum = 0;
+    for (unsigned j = 0; j < p.legs[g].count; ++j, ++k) {
+      assert(p.iov[k].iov_base == static_cast<uint8_t*>(in[i].iov_base) + off);
+      sum += p.iov[k].iov_len; off += p.iov[k].iov_len;
+      if (off == in[i].iov_len) { ++i; off = 0; }
+    }
+    assert(sum == p.legs[g].bytes);
+  }
+  assert(i == in.size());
+}
+
+int main(int, char** argv) {
+  // cut_bytes_for: max_sectors_kb, and max_segments less one page (a leg that starts mid-page spans one more).
+  assert(cut_bytes_for(512, 128) == 520192);   // Samsung 990 EVO Plus on divix01
+  assert(cut_bytes_for(256, 65) == 262144);    // SPCC on divix01
+  assert(cut_bytes_for(1024, 33) == 131072);
+  assert(cut_bytes_for(1, 128) == 4096);       // never below one page
+  assert(cut_bytes_for(10, 0) == 8192);        // max_segments unknown: max_sectors_kb only, whole pages
+
+  uint8_t* a = static_cast<uint8_t*>(std::aligned_alloc(4096, 1 << 20));
+  uint8_t* b = static_cast<uint8_t*>(std::aligned_alloc(4096, 1 << 20));
+  const int64_t C = 8192;
+  { // size only: 3C + 512 in one page-aligned iovec -> C, C, C, 512
+    std::vector<iovec> in{{a, 3 * C + 512}};
+    Plan p = plan(in, lim(C, 4095)); assert(p.n == 4); tiles(in, p, C);
+    for (unsigned g = 0; g < p.n; ++g) assert(!p.legs[g].gap);
+  }
+  { // gap: the first iovec ends off the page (9216 B) -> a new leg at the join even under a huge cut
+    std::vector<iovec> in{{a, 9216}, {b, 4096}};
+    Plan p = plan(in, lim(1 << 30, 4095)); assert(p.n == 2 && !p.legs[0].gap && p.legs[1].gap); tiles(in, p, 1 << 30);
+  }
+  { // aligned join: one leg
+    std::vector<iovec> in{{a, 8192}, {b, 4096}};
+    Plan p = plan(in, lim(1 << 30, 4095)); assert(p.n == 1 && p.legs[0].count == 2);
+  }
+  { // the next iovec starts off the page -> gap
+    std::vector<iovec> in{{a, 8192}, {b + 512, 4096}};
+    Plan p = plan(in, lim(1 << 30, 4095)); assert(p.n == 2 && p.legs[1].gap);
+  }
+  { // no virt boundary (mask 0): no gap rule
+    std::vector<iovec> in{{a, 9216}, {b + 512, 4096}};
+    Plan p = plan(in, lim(1 << 30, 0)); assert(p.n == 1);
+  }
+  { // gap and size together: 9216 -> C, 1024 | gap | 3C -> C, C, C
+    std::vector<iovec> in{{a, 9216}, {b, 3 * C}};
+    Plan p = plan(in, lim(C, 4095)); assert(p.n == 5); tiles(in, p, C);
+    assert(!p.legs[0].gap && !p.legs[1].gap && p.legs[2].gap && !p.legs[3].gap && !p.legs[4].gap);
+  }
+  { // overflow: more legs than the caller sized
+    std::vector<iovec> in{{a, 10 * C}};
+    assert(plan(in, lim(C, 4095), 4).n == 5);
+  }
+  { // leg_bound holds over random shapes (512-aligned, the reader's alignment)
+    uint64_t s = 88172645463325252ull;
+    auto next = [&] { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    for (int t = 0; t < 2000; ++t) {
+      const unsigned n = 1 + next() % 6; std::vector<iovec> in; int64_t total = 0;
+      uint8_t* at = a;
+      for (unsigned i = 0; i < n; ++i) {
+        const size_t len = 512 * (1 + next() % 200);
+        const size_t skip = 512 * (next() % 9);
+        at += skip; if (at + len > a + (1 << 20)) break;
+        in.push_back({at, len}); total += len; at += len;
+      }
+      if (in.empty()) continue;
+      const int64_t cut = 4096 * (1 + next() % 16);
+      Plan p = plan(in, lim(cut, 4095), 255);
+      assert(p.n <= leg_bound(total, in.size(), cut)); tiles(in, p, cut);
+    }
+  }
+  { // a queue directory: values read, source named; a missing attribute is a clear refusal
+    const std::string dir = argv[1];
+    std::ofstream(dir + "/max_sectors_kb") << "256\n";
+    std::ofstream(dir + "/max_segments") << "65\n";
+    std::ofstream(dir + "/virt_boundary_mask") << "4095\n";
+    DeviceLimits d; std::string why;
+    assert(limits_from_queue_dir(dir, &d, &why) && d.cut_bytes == 262144 && d.virt_mask == 4095 && d.source == dir);
+    std::remove((dir + "/virt_boundary_mask").c_str());
+    assert(limits_from_queue_dir(dir, &d, &why) && d.virt_mask == 4095);   // absent: conservative 4095
+    std::remove((dir + "/max_segments").c_str());
+    assert(!limits_from_queue_dir(dir, &d, &why) && why.find("max_segments") != std::string::npos);
+  }
+  { // a file on tmpfs has no block queue: the fallback, with its reason
+    const int fd = open(argv[2], O_RDONLY);
+    assert(fd >= 0);
+    const DeviceLimits d = device_limits(fd);
+    close(fd);
+    assert(d.cut_bytes == kFallbackCutBytes && d.virt_mask == kFallbackVirtMask);
+    assert(d.source.rfind("fallback: ", 0) == 0);
+    std::cout << "fallback source: " << d.source << "\n";
+  }
+  std::cout << "PASS read_cuts\n";
+}
+"""
+
+
+def test_read_cuts_planner_and_limits(tmp_path):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("C++ compiler unavailable")
+    if not Path("/dev/shm").is_dir():
+        pytest.skip("no /dev/shm (tmpfs) for the fallback case")
+    source = tmp_path / "cuts.cpp"
+    source.write_text(_UNIT)
+    binary = tmp_path / "cuts"
+    subprocess.run(
+        [compiler, "-std=c++20", "-Wall", "-Wextra", "-I", str(INCLUDE), str(source), "-o", str(binary)],
+        check=True,
+    )
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    shm = Path("/dev/shm") / f"read-cuts-{os.getpid()}"
+    shm.write_bytes(b"\0" * 4096)
+    try:
+        done = subprocess.run([binary, str(queue), str(shm)], text=True, capture_output=True, timeout=30)
+    finally:
+        shm.unlink()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "PASS read_cuts" in done.stdout
