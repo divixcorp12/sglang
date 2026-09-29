@@ -20,7 +20,7 @@ _TABLE = frozenset({(16, 128), (16, 512), (64, 128)})
 @pytest.fixture(autouse=True)
 def fake_capabilities(monkeypatch):
     mod._flashinfer_dsv4_decode_capabilities.cache_clear()
-    mod._flashinfer_dsv4_decode_supports.cache_clear()
+    mod.flashinfer_dsv4_decode_supports.cache_clear()
     mod._log_flashinfer_fallback_once.cache_clear()
     monkeypatch.setattr(
         mod,
@@ -42,7 +42,7 @@ def fake_capabilities(monkeypatch):
         lambda *a, **k: calls.append("triton") or ("tri", None),
     )
     yield calls
-    mod._flashinfer_dsv4_decode_supports.cache_clear()
+    mod.flashinfer_dsv4_decode_supports.cache_clear()
     mod._log_flashinfer_fallback_once.cache_clear()
 
 
@@ -120,6 +120,7 @@ def test_old_flashinfer_without_table_falls_back(monkeypatch, fake_capabilities)
     monkeypatch.setattr(
         mod, "_flashinfer_dsv4_decode_capabilities", lambda: (0, frozenset(), frozenset())
     )
+    mod.flashinfer_dsv4_decode_supports.cache_clear()
     monkeypatch.setattr(mod, "_sm120_default_backend", "flashinfer")
     monkeypatch.setattr(mod, "_sm120_backend_forced", False)
     _call(16, 128)

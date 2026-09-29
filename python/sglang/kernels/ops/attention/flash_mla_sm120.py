@@ -206,7 +206,11 @@ def _sm120_sparse_decode_fwd(
 
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
+# When the variable is unset, FlashInfer is used per call only if it has a kernel
+# for the exact (num_heads, top_k) pair and Triton is used otherwise. When it is
+# set explicitly to "flashinfer", an unsupported pair raises instead.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+_sm120_backend_forced = envs.SGLANG_SM120_FLASHMLA_BACKEND.is_set()
 
 
 SM120_DECODE_MAX_TOKENS = 64
@@ -269,19 +273,24 @@ def _flash_mla_sm120_prefill(
 
 
 @lru_cache(maxsize=1)
-def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
-    """Read the installed FlashInfer DSV4 decode capabilities once."""
+def _flashinfer_dsv4_decode_capabilities() -> (
+    Tuple[int, FrozenSet[int], FrozenSet[Tuple[int, int]]]
+):
+    """Read the installed FlashInfer DSV4 decode capabilities once.
+
+    Returns (decode max tokens, supported head counts, supported
+    (num_heads, top_k) pairs); top_k is the main index width.
+    """
     try:
         from flashinfer.mla._sparse_mla_sm120 import (
             _DECODE_DSV4_DISPATCH,
             _DECODE_MAX_TOKENS,
         )
     except (AttributeError, ImportError):
-        return 0, frozenset()
+        return 0, frozenset(), frozenset()
 
-    return int(_DECODE_MAX_TOKENS), frozenset(
-        heads for heads, _ in _DECODE_DSV4_DISPATCH
-    )
+    pairs = frozenset((int(h), int(k)) for h, k in _DECODE_DSV4_DISPATCH)
+    return int(_DECODE_MAX_TOKENS), frozenset(h for h, _ in pairs), pairs
 
 
 def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
@@ -292,8 +301,28 @@ def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -
     The padded 64-head decode path remains the safe fallback for older builds.
     Prefill head selection is handled separately by the caller.
     """
-    decode_max_tokens, supported_heads = _flashinfer_dsv4_decode_capabilities()
+    decode_max_tokens, supported_heads, _ = _flashinfer_dsv4_decode_capabilities()
     return num_tokens <= decode_max_tokens and num_heads in supported_heads
+
+
+@lru_cache(maxsize=None)
+def flashinfer_dsv4_decode_supports(num_heads: int, top_k: int) -> bool:
+    """Return whether FlashInfer has a DSV4 decode kernel for this exact pair.
+
+    Resolved once per (num_heads, top_k) and cached, so it is free on the
+    decode hot path.
+    """
+    return (num_heads, top_k) in _flashinfer_dsv4_decode_capabilities()[2]
+
+
+@lru_cache(maxsize=None)
+def _log_flashinfer_fallback_once(num_heads: int, top_k: int) -> None:
+    logger.warning(
+        "FlashInfer has no SM120 DSV4 decode kernel for num_heads=%d, top_k=%d; "
+        "using the Triton sparse decode for this shape.",
+        num_heads,
+        top_k,
+    )
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
@@ -314,7 +343,20 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
-    if _sm120_default_backend == "flashinfer":
+    backend = _sm120_default_backend
+    if backend == "flashinfer" and q.shape[0] <= SM120_DECODE_MAX_TOKENS:
+        num_heads, top_k = q.shape[-2], indices.shape[-1]
+        if not flashinfer_dsv4_decode_supports(num_heads, top_k):
+            if _sm120_backend_forced:
+                raise RuntimeError(
+                    "SGLANG_SM120_FLASHMLA_BACKEND=flashinfer but FlashInfer has "
+                    f"no SM120 DSV4 decode kernel for num_heads={num_heads}, "
+                    f"top_k={top_k}; unset it to fall back to Triton per call."
+                )
+            _log_flashinfer_fallback_once(num_heads, top_k)
+            backend = "triton"
+
+    if backend == "flashinfer":
         if q.shape[0] > SM120_DECODE_MAX_TOKENS:
             return _flash_mla_sm120_prefill(
                 q,
@@ -341,7 +383,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
             extra_topk_length,
         )
 
-    if _sm120_default_backend == "triton":
+    if backend == "triton":
         from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
             flash_mla_sparse_decode_triton,
         )
