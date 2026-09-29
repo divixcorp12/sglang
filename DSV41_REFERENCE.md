@@ -42,6 +42,12 @@ recipe defaults, and the tier is 60 GiB on node 0 plus 40 GiB on node 1 (§23.1,
 - **The 100 GiB tier:** it moved the decode bottleneck to the host-to-GPU link (§24.6).
 - §24 also lists the next decode work.
 
+**Update (2026-09-29):** §29 records the merges of 2026-09-27 to 2026-09-29. The recipe now reads expert rows from
+three mirror roots, always uses row images and lease mode (the packed path, its pack workers and the
+`SGLANG_DSV41_ENABLE_RAM_MISS_LEASES` knob are deleted), launches the lease chain with PDL, and runs at
+`MEM_FRACTION_STATIC` 0.885, hot cache 15400 MB and context 131072 on NVIDIA driver 615.71.09 (§29.11). The last
+merge, the copy thread's completion word (§29.9), went in without review or a decode A/B.
+
 Sections 1 to 15 preserve the original September 18 scoping. Sections 16 to 22 record
 dated experiments; **§23 is the current recipe and progress ledger**, with §24 its
 2026-09-24 addendum. Together they supersede earlier present-tense plans or defaults
@@ -62,7 +68,8 @@ needs a measurement before anyone quotes it).
 - Expert weights and Engram tables read from NVMe with our io_uring reader.
 - The original plan was to move experts to `/mnt/nvme1` (Gen3 x4) and keep Engram
   tables on `/mnt/nvme2` (Gen3 x2). The live recipe instead reads the EXL3 shards on
-  `/mnt/nvme2` and uses expert-row mirrors on `/mnt/nvme0` and `/mnt/nvme4`.
+  `/mnt/nvme2` and uses expert-row mirrors on `/mnt/nvme0` and `/mnt/nvme4` (and on `/mnt/nvme2` as a third root since
+  2026-09-28, §29.3).
 
 The original design follows in §9 and its then-open decisions are in §12. Current
 settings and remaining measurements are in §23.
@@ -145,7 +152,8 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-direct-
 `EXPECT_SHA` pins the tree: the arm refuses if the worktree is not at that exact commit.
 Expert-row mirroring, Engram host-node io_uring, leases, DIRECT insertion, eight
 pack workers, and the fused expert planner need no override — they are in
-`base_env()`. Note that mirroring
+`base_env()`. (Since 2026-09-29 there are no pack workers and no lease knob: row images and lease mode are
+unconditional, §29.8.) Note that mirroring
 applies to *expert rows* (`SGLANG_MOE_EXPERT_MIRROR_DIRS`), not to the Engram tables,
 which are read from `SGLANG_DSV41_ENGRAM_TABLE_DIR` on `/mnt/nvme2` and are unmirrored.
 
@@ -2950,6 +2958,9 @@ a repeat, not a finding.
 
 ### Leases are not visible in throughput, and this is the wrong instrument for them
 
+*Note 2026-09-29: the knob below and the packed path are deleted (merge `2810a7ad48`, §29.8); lease mode is always on,
+and a set value warns and is ignored (`python/sglang/srt/environ.py`). The measurement stands as history.*
+
 `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES` on vs off differs by **1.8%** (2.141 vs 2.102
 token-weighted), with per-session values spanning 1.67-2.28 within a single arm. At n=1
 against a spread that wide, the comparison resolves nothing except that lease mode plus
@@ -3296,6 +3307,8 @@ area P and the E1, §2, §4.3 and §4.4 amendments.
 - **Flag:** `SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM`, default off.
   - Startup refuses it unless two-phase is on, leases are on, and there are one or more
     pack workers.
+  - *Since 2026-09-29 (§29.8):* pack workers and the lease knob are gone; the service always reads row images in
+    lease mode.
 - **What changes:** each RAM-miss row (13,320,192 B) is read as two mirror halves of four
   sub-reads each: 8 pieces.
   - Each piece has its own pack job.
@@ -3644,6 +3657,10 @@ cold copies with the source on node 0, where the bounce slots live:
   second option at about 4 ms/token.)
 
 ### 24.9 Row images: reads land straight in the pinned slabs (2026-09-24)
+
+*Note 2026-09-29: row images are now the only reader; `SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES` and
+`SGLANG_DSV41_RAM_MISS_PACK_WORKERS` are deprecated (warn, ignored) and a root without row images refuses at startup
+(§29.8, `python/sglang/srt/environ.py`).*
 
 **What changed.** With `SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES=1`, the RAM-miss reader
 reads each sub-read with one O_DIRECT `readv` whose iovecs are the pinned slab rows it
@@ -4117,7 +4134,8 @@ link rate. A 30k-token prompt (59 chunks) would take on the order of 15 minutes 
    Fewer NVMe misses (the RAM tier, and item 2) or faster streaming are the levers. The earlier "copy-thread" reading
    of this time was wrong (§27.3).
 4. **Long prompts: done (§27.17).** 4096-token prefill chunks, with the hot cache cut by 1 GiB and the static fraction
-   lowered to 0.90: a 16k prompt's TTFT fell 444 -> 107 s.
+   lowered to 0.90: a 16k prompt's TTFT fell 444 -> 107 s. (Superseded 2026-09-29: 0.885 / 15400 / context 131072,
+   §29.11.)
 5. **Per-layer RAM split: tried, no gain; not merged.** Branch `cc/pinned-layer-weights`: `SGLANG_MOE_PINNED_HOST_LAYER_WEIGHTS`
    plus `scripts/dsv41/ram_split.py`.
    - **Replay:** an LRU stack-distance replay of the varied24 route log reproduces the measured per-layer ranking, but
@@ -5113,7 +5131,10 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
 | 2048 | 16100 | 0.925 | OOM | | | 934k | | 3 |
 
 - Headroom at the 4096 arm's peak was recorded as ~470 MiB, but that is nvidia-smi's 32,607 MiB total minus the peak
-  (32,134 MiB, `c4096-16k-h16100-m090/vram.csv`). CUDA can use only 32,150 MiB, so the real margin was ~16 MiB (§27.18).
+  (32,134 MiB, `c4096-16k-h16100-m090/vram.csv`). CUDA can reach 32,202 MiB, so the real margin was ~68 MiB (§27.18).
+  *Corrected 2026-09-29:* this line first said "CUDA can use only 32,150 MiB ... ~16 MiB"; the measured ceiling is
+  32,202 MiB (torch's total is 33,766,572,032 B, and a chunked 16k prompt peaked at 32,201 MiB `memory.used`).
+  Evidence: `analysis/dsv41-drive/recipe-mem/results.md`, "Verification at 0.885 / 15400".
 - Decode after the long prompt read 109-121 ms/token across arms. These are 64 tokens right after a prefill that
   evicts decode's RAM set (§27.2), and the 512 -> 2048 change at the same hot size moved it as much as the hot-cache
   cut did, so this is not a measure of the cut. §27.7's slope suggests the 1 GiB cut costs ~2-3 ms/token of steady
@@ -5123,6 +5144,11 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
 
 **In the recipe:** `CHUNKED_PREFILL_SIZE = 4096`, `MEM_FRACTION_STATIC = 0.90`, `SGLANG_MOE_HOT_GPU_MB = 16100` and
 `CONTEXT_LENGTH = 262144`.
+
+**Superseded 2026-09-29:** the recipe is now `MEM_FRACTION_STATIC = 0.885`, `SGLANG_MOE_HOT_GPU_MB = 15400` and
+`CONTEXT_LENGTH = 131072` (`CHUNKED_PREFILL_SIZE` stays 4096). NVIDIA driver 615.71.09 (from 610.57.04) grew the EAGER
+CUDA context, and 0.90 / 16100 no longer fit the KV pool. Merge `cfe4d822da`; `benchmarks/dsv41_baseline/arm_env.py`;
+§29.11.
 
 ### 27.18 128k prefill: the layer-20 candidate mask OOM (result, 2026-09-27)
 
@@ -5135,7 +5161,7 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
   stays alive through `flash_mla` and layers 21-39, though only its last 128 rows are ever read
   (`deepseek_v4_backend.py`, `enter_late_layer_tail`). Mask size scales with the prefix: 62.5 MiB at 16k, 240 MiB at the 61k
   failure, 512 MiB at 131k, and 1 GiB at 262k (build peak is 2x that). This is the diagnosis's top-ranked hypothesis
-  (`oom-diagnosis.md` Q3.1): the failing run sat 9-44 MiB below the 32,150 MiB CUDA limit (`phase0-128k/vram.csv`:
+  (`oom-diagnosis.md` Q3.1): the failing run sat 61-96 MiB below the 32,202 MiB CUDA limit (`phase0-128k/vram.csv`:
   32,106-32,141 MiB used) from chunk 1, and the mask's growth alone exceeds that margin, with allocator
   fragmentation as the proximate trigger. The fixed 128k run passing (below) supports the hypothesis but does not
   prove it: the confirming memory snapshot (Q4) was not run, and an unattributed ~258 MiB request (Q3.3) remains
@@ -5155,19 +5181,24 @@ a 256-token warm-up, then one 16,000-token prompt, context 32768, one run each:
 - **Step 3, the 128k run with the fix:** `long rc=0`, 0 OOM retries, 0 "memory allocation failed with OOM" lines.
   TTFT 931.5 s (8-token completion, decode 168.9 ms/token). 256 cached warm-up tokens, then 31 full 4,096-token
   chunks plus a 3,840-token remainder. Chunk intervals 25-44 s, median 26 s, last full-size interval 25 s (the final
-  two chunks log at the same second and cannot be timed individually). Peak VRAM 32,136 MiB, ~14 MiB below the
-  32,150 MiB CUDA limit — thin, matching §27.17's corrected margin. Minimum NUMA node-1 free: 44,568 (MB).
+  two chunks log at the same second and cannot be timed individually). Peak VRAM 32,136 MiB, ~66 MiB below the
+  32,202 MiB CUDA limit — thin, matching §27.17's corrected margin. Minimum NUMA node-1 free: 44,568 (MB).
 - **Gate:** `long rc=0`, 0 OOM retries, last full-size chunk (25 s) within 1.5x the first (27 s) → **Done. Resume
-  layer-major Task 12.** 128k passes with only ~14 MiB of real headroom; 262k was not run (the fix shrinks its mask
+  layer-major Task 12.** 128k passes with only ~66 MiB of real headroom; 262k was not run (the fix shrinks its mask
   from 1 GiB to ~32 MiB, but other T- and P-scaled items are untested there).
 - Tree tested: `cee8138fc4` (`f22e3607f8` after the rebase onto the expert-stream master).
+- *Corrected 2026-09-29:* the margins above first read 9-44 MiB (failing run) and ~14 MiB (128k peak), against a
+  "32,150 MiB CUDA limit". CUDA reaches 32,202 MiB (`analysis/dsv41-drive/recipe-mem/results.md`), so the margins are
+  recomputed from the same `vram.csv` peaks: 32,202 − 32,141..32,106 = 61-96 MiB, and 32,202 − 32,136 = 66 MiB.
 - Evidence: `divix01:/mnt/nvme1/prefill-chunk/oom0b-base-16k/`, `oom0b-fix-16k/`, `oom0b-fix-128k/`, `phase0-128k/`,
   `c4096-16k-h16100-m090/` (`driver.log`, `server.log`, `vram.csv`, `numa.log`, `long.json`); diagnosis at
   `.superpowers/sdd/2026-09-27-dsv41-layer-major-prefill-phase1/oom-diagnosis.md`.
 
 **Traced 4096-token chunk** (`trace-c4096-12k`, today's recipe at context 262144; a 12,288-token prompt, node mode;
 `prefill_trace.py`).
-- The server started at context 262144 with a 374,016-token KV pool and 2.43 GB free, as at 32768.
+- The server started at context 262144 with a 374,016-token KV pool and 2.43 GB free, as at 32768. (Driver 610.57.04,
+  0.90 / 16100. Superseded 2026-09-29: at 0.885 / 15400 on driver 615.71.09 the pool is 150,784-232,448 tokens and the
+  recipe's context is 131072; `analysis/dsv41-drive/recipe-mem/results.md`, §29.11.)
 - TTFT was 81.6 s traced, ~27 s per chunk, against ~17 s untraced; node mode's per-launch cost on ~170k eager kernels
   per chunk accounts for the difference. Proportions below are per chunk and traced.
 
@@ -5525,6 +5556,389 @@ numactl --membind=1 taskset -c 0-15  python bench.py perf 384 8,16 2,6 node0core
 numactl --membind=1 taskset -c 18-35 python handoff.py run -1 12    # and 16
 ```
 Each ran under `flock cc-gpu.lock` and exited 0.
+
+## 29. Expert-stream I/O, hot path and recipe changes (2026-09-27 to 2026-09-29)
+
+This section records the merges to `master` from 2026-09-27 to 2026-09-29, one subsection per merge, roughly in merge order.
+Every figure comes from the file or merge commit message cited next to it (`git show <merge>` prints the message).
+Decode figures are pooled ms/token over `run_arm.sh`'s 2 timed sessions (90 decode tokens), one pass per arm. The
+campaign's noise bar is ±1.5 ms/token, so sub-millisecond deltas below are noise. The arms ran at different tiers and
+memory fractions, so compare figures only within the pair or set that produced them.
+
+**What the recipe runs now** (`benchmarks/dsv41_baseline/arm_env.py` at `0473d52f00`):
+
+| Setting | Value | Since | Where |
+|---|---|---|---|
+| Expert-row mirror roots | 3: `/mnt/nvme0`, `/mnt/nvme4`, `/mnt/nvme2` (`*/dsv41_flash`) | 2026-09-28 | §29.3 |
+| Mirror weights (`SGLANG_MOE_EXPERT_MIRROR_WEIGHTS`) | unset, i.e. 1:1:1 | unchanged | §29.10 |
+| RAM-miss reader | row images, lease mode, unconditional; no pack workers | 2026-09-29 | §29.8 |
+| `SGLANG_DSV41_ENABLE_LEASE_PDL` | 1 | 2026-09-28 | §29.2 |
+| `SGLANG_EXPERT_STREAM_URING_*` | not set, so defaults: `MODE=default`, `READ_MODE=normal`, `FIXED_FILES=0`, `SLAB_ARENA=0`, `READ_CUTS=auto` (on only under IOPOLL) | unchanged | §29.4, §29.5 |
+| Copy-thread completion | stream-written completion word, no `cuEventQuery`; no flag, no fallback | 2026-09-29 | §29.9 (**unverified**) |
+| `MEM_FRACTION_STATIC` / `SGLANG_MOE_HOT_GPU_MB` / `CONTEXT_LENGTH` | 0.885 / 15400 / 131072 | 2026-09-29 | §29.11 |
+| `CUDA_MODULE_LOADING` | EAGER | unchanged | §29.11 |
+
+**Also merged in the window, covered elsewhere or without measurements:** `e10d2ca067` and `43d7813a41` (layer-major
+prefill, §27.19-§27.20); `6474fe3d36` (CPU experts, §28); `b5d50d0734` (the layer-fusion and cast-fusion kernels split
+into generic expert-residency and EXL3 files, with byte-reproduction proofs in `analysis/layer-fusion-split/proof/`);
+`4d8a9444cd` (expert-stream follow-ups: exact out-buffer checks, the double-signal counter, U7 and pack-thread flake
+fixes); `b9d7b7f2f1` (prefill-OOM phase 0b minors).
+
+### 29.1 Native sync primitives, lease kernel fixes, doorbell removal (2026-09-27/28)
+
+**Native sync primitives (`7da74eb569`).** The expert-stream device code uses `__ldcv`/`__stcg` and `globaltimer` intrinsics,
+named relaxed/acquire/release helpers, and acquire/release seqlock fences.
+- **SASS:** identical to base except 16 `MEMBAR.SC.SYS` → `MEMBAR.ALL.SYS`. The copy wait's SmAck fence stays
+  `MEMBAR.SC.SYS`.
+- **`cuda::atomic_ref` was tried and reverted.** libcu++ adds a local-pointer check to every access through a
+  `__grid_constant__` parameter, and it merged and reordered relaxed accesses.
+- **Tests:** `unit/kernels` 1778 → 1784 passed on divix01; manual GPU tests 26 passed.
+- Evidence: merge message; plan `docs/superpowers/plans/2026-09-27-expert-stream-native-sync.md`.
+
+**Lease kernel fixes (`48467f2ade`),** from an external review of `lease_kernels.cuh`:
+- The ack kernels' racy shared flag becomes `__syncthreads_or` (one `BAR.RED.OR`; the fence before the fatal release
+  is kept).
+- `rest_wait` no longer reads `claimed[]` past its 8 entries for a count above the bound (compute-sanitizer: 1
+  invalid read at base, 0 on the branch), and counts every unserved lane once.
+- The plain wait now ends on a fatal raised mid-poll instead of sitting out its timeout.
+- Only `wait`, `stage_ack`, `lease_ack` and `rest_wait` change in SASS. Each fix's mutant turns its own tests red.
+- The seqlock stress floor miss seen once is a load-dependent flake: 20/20 green alternating base and branch, torn 0.
+- Evidence: merge message.
+
+**Doorbell removal (`7f982d6be6`, leftovers `50bba481f1`).** The doorbell side-thread copier, superseded by the lease
+protocol and unused in production, is gone with its ops module, tests, benchmarks and wiring.
+- The eight `SGLANG_MOE_EXPERT_DOORBELL*` variables are deprecated: a set variable warns and does not fail.
+  `--moe-offload-preset doorbell` is refused.
+- The per-batch fail-stop hook, also used by the EXL3 RAM-miss path, is now `ExpertHotCacheManager.run_fail_stop_checks`.
+- Cores 64-71 stay reserved, but the reason is now NVMe completion interrupts, not the
+  doorbell's spin core.
+- The offline prefetch pricing model loses its doorbell arms, and `price_prefetch.py`'s result JSON keys changed.
+- Evidence: both merge messages. §8's doorbell row already carries the removal.
+
+### 29.2 Lease-chain PDL, on in the recipe (`da243bbbfa`, 2026-09-28)
+
+**What changed.** The lease chain (W1 → S → copy kernels) launches with programmatic dependent launch behind
+`SGLANG_DSV41_ENABLE_LEASE_PDL`. W1 and S take the row-table capacity as a kernel argument.
+
+**Result.** Decode A/B at `a2f0ae97b0` on driver 615.71.09: outputs byte-identical over 2/2 sessions, 101.5 → 101.6
+ms/token on the 85-token session (+0.1, noise). `arm_env.py` summarizes it as "at most ~1 us/layer".
+
+**In the recipe:** on (`SGLANG_DSV41_ENABLE_LEASE_PDL=1`).
+
+**Evidence:** merge message. The results file `analysis/dsv41-drive/chain-pdl/results.md` is on branch
+`expert-stream-transfer-measurement` (`6bba593810`) and **is not on `master`**; `arm_env.py` cites it there.
+
+### 29.3 Three mirror roots via a per-row piece cut (`9428a6812a`, 2026-09-28)
+
+**What changed.** Piece streaming cuts each reading part into its share of a row's 8 pieces, so a row can be read
+from up to 8 mirror parts (tests cover 3 to 8); it refuses only more than 8 (`dc94f6724d`, `edfa9326e0`). The recipe adds `/mnt/nvme2` as a
+third mirror root (`4fe0c37a41`).
+
+**Result.** 2 vs 3 roots at one commit, both on the same reduced pinned tier: **109.9 → 101.7 ms/token** pooled,
+byte-identical, reads ~33% per drive.
+- The reduced tier is `0:57344,1:40960` / 98304 MiB, 4096 MiB smaller on node 0 than the recipe: the ZFS ARC holds
+  node-0 memory that `host_numa.check_capacity` does not count as reclaimable, and the recipe's 0:61440 was refused
+  1463 MiB short (`analysis/dsv41-drive/mirror3/drive_mirror3_arms.sh`, header).
+
+**In the recipe:** 3 roots (`EXPERT_MIRROR_DIRS`), equal weights.
+
+**Known gaps.** No `results.md` for this pair is committed; the figures above are in the recipe commit's message
+(`4fe0c37a41`) and in `arm_env.py`'s comment, with raw data at `divix01:/mnt/nvme1/mirror3-20260928-121453`.
+`arm_env.py` says `/mnt/nvme2` is "now x4"; §1 lists it as Gen3 x2, and no link-width reading is recorded in the
+analysis files.
+
+**Evidence:** `4fe0c37a41`; `analysis/dsv41-drive/mirror3/` (driver, `mirror3_report.py`); plan
+`docs/superpowers/plans/2026-09-28-mirror3-piece-stream.md`.
+
+### 29.4 Reader CRTP split, io_uring registered buffers and files, 2 MiB NUMA splits (`e1559b948b`, 2026-09-28)
+
+**Reader split.** `ReaderCore` plus `PackReader` / `RowReader` / `AnyReader`; the default path is unchanged (golden
+unedited). Refactor pair on the reduced 98304 MiB tier: **102.40 (base) vs 102.56 (split) ms/token**, byte-identical
+2/2, `read_errors` 0 in both. (`PackReader` was later deleted with the packed path, §29.8.) Evidence:
+`analysis/dsv41-drive/reader-crtp/results.md`.
+
+**Registered buffers and fixed files work, and stay off.** Registration uses row-aligned ≤1 GiB chunks; a fixed read
+whose iovecs meet several chunks fans out into one SQE per chunk.
+- R0 (defaults) vs R3 (`SLAB_ARENA=1 READ_MODE=readv_fixed FIXED_FILES=1`), full tier `0:61440,1:40960` / 102400:
+  **101.46 vs 101.65 ms/token**, byte-identical. The rule needed R3 to win by ≥1.5 ms/token, so the defaults stay.
+- R3 registered 280 chunks, 107,363,553,792 B, in **59,231 ms**. First log line to "fired up": 113 s (R0) vs 172 s
+  (R3). 33,736 of 101,208 fixed reads (33%) fanned out across chunks.
+- Evidence: `analysis/dsv41-drive/uring-reg/results.md`.
+
+**2 MiB-aligned NUMA splits (Task 10, `40452dacc2`).** The first full-tier R3 hung in registration for 13+ minutes.
+- **Cause:** quadratic pin accounting in the 6.12 kernel's buffer registration (`io_buffer_account_pin` →
+  `headpage_already_acct`). `host_numa.allocate_bound` placed its per-node `mbind` splits on page-rounded row
+  boundaries, so chunks spanning them mixed folio sizes and did not coalesce.
+- **Fix:** 2 MiB-aligned mapping bases and node-change boundaries (`host_numa.plan_bindings`). Harness registration at
+  the 90 GiB layout fell from an extrapolated hour to 58.4 s.
+- **Check on the placement change:** R0 before vs after, full tier, 101.89 → 101.46 ms/token, byte-identical.
+- The kernel frame is inferred from the v6.12 source and the linear-per-chunk growth; kernel stacks are root-only.
+- Evidence: `analysis/dsv41-drive/uring-reg/results.md`, "How we got here".
+
+**Configuration surface.** The reader's ring is configured by ten `SGLANG_EXPERT_STREAM_URING_*` variables (`MODE`,
+`QUEUE_DEPTH`, `FIXED_FILES`, `READ_MODE`, `WAIT_MODE`, `SQ_THREAD_IDLE_MS`, `SQ_THREAD_CPU`, `DIAGNOSTICS`,
+`READ_CUTS` (added in §29.5), `SLAB_ARENA`), all defaulting to the previous behavior. Evidence: `analysis/dsv41-drive/uring-config/HANDOFF.md`
+(its "2026-09-28 update" paragraph is the corrected account of registration cost; §29.6).
+
+**Merge-time suite:** kernels 1911 passed / 23 skipped (merge message).
+
+### 29.5 IOPOLL wait fix, read cuts, 10 s SQPOLL idle (`ba01695c35`, 2026-09-28)
+
+**Why IOPOLL was slower** (`analysis/dsv41-drive/iopoll/diagnosis.md`). Two effects that only hurt together:
+1. **Every production read punted to io-wq.** One row-image sub-read is a ~2.2 MB `READV`; the drives take at most
+   512 KiB (Samsung 990 EVO Plus) or 256 KiB (SPCC) per request, and a non-page-aligned iovec join crosses the NVMe
+   `virt_boundary`. The block layer will not split a `REQ_NOWAIT` polled bio, so it returns `-EAGAIN` and the read
+   is re-issued from io-wq.
+2. **The punted reads queue behind the waiter's lock.** `WAIT_MODE=block` on an IOPOLL ring polls inside
+   `io_uring_enter(GETEVENTS, min_complete=n)` holding `uring_lock`, and each io-wq worker spins for it. Row p50 went
+   1.70 → 3.2 ms in the microbenchmark.
+The kernel paths are from upstream source and fit every measurement; they are not confirmed by kernel stacks
+(root-only).
+
+**What changed.**
+- An IOPOLL ring without SQPOLL now reaps (`effective_wait=reap`) instead of block-waiting.
+- `READ_CUTS=auto` cuts READV legs at each drive's `max_sectors_kb` and at `virt_boundary` gaps, on only under IOPOLL,
+  so nothing punts.
+- `SQ_THREAD_IDLE_MS` defaults to 10000 (1000 before 2026-09-28; user decision, `uring-config/HANDOFF.md`). It
+  applies only to SQPOLL modes, which the recipe does not use.
+
+**Result** (full tier, all byte-identical, 0 io-wq workers over every whole run; `analysis/dsv41-drive/iopoll-cuts/results.md`):
+
+| Arm | Setting | ms/token | Δ vs mean(A, A2) = 100.61 |
+|---|---|---:|---:|
+| A | default, cuts off | 100.95 | +0.34 |
+| B | default, cuts on | 100.75 | +0.14 |
+| C | `iopoll`, cuts on, reap wait | 101.23 | +0.62 (was +10.2 ms/token in the Codex S4 arm, with 12-14 io-wq workers) |
+| D | `sqpoll_iopoll`, cuts on | 100.79 | +0.18; the SQ thread used 24.34 CPU-s in a ~24.5 s window |
+| A2 | default, cuts off | 100.27 | −0.34 |
+
+- **In the recipe:** unchanged, `MODE=default`, `READ_CUTS=auto`. Nothing reached the −1.5 ms/token promotion bar.
+  What holds is "C removed the +10 ms regression", not "C is 0.6 ms slower".
+- Mutants M1-M9 killed; kernels suite 1933 / 23 (merge message; `iopoll-cuts/mutants.md`).
+- **Open:** follow-ups #7 (fold the IOPOLL reap loop's peek and `get_events` into one call; cold path), #8 (test gaps:
+  EOF-clamped cut leg, files on two devices with different limits, fallback wording), #9 (the `read cuts:` line prints
+  at every reader `open()`). The SPCC's slow episodes, below in §29.13.
+
+### 29.6 THP fallback and the clone-buffers pin leak on kernel 6.12.0-211 (`af765201a3`, 2026-09-29; write-up only)
+
+**Do not use `IORING_REGISTER_CLONE_BUFFERS` on this kernel (6.12.0-211.60.1.el10_2). Fixed buffers are off by
+default, and registration cost is paid only by an arm that turns them on.**
+
+**Root cause, refined.** Registration is slow because the kernel's pin accounting walks, for every huge page of a new
+chunk, every bvec of every buffer registered before it. A chunk holding any 4 KiB page does not coalesce and keeps
+262,144 bvecs per GiB.
+- What costs time is *where* the 4 KiB pages sit relative to the huge pages registered after them, not how many: 0.18%
+  of a 16 GiB tier, in 15 chunks, takes registration from 0.52 s to 68.75 s.
+- Each mixed 1 GiB chunk costs ~0.85 s per GiB of THP registered after it.
+- In production 8-22% of the 100 GiB tier lands on 4 KiB pages, depending on fragmentation at launch; direct
+  registration took 18.9-103.5 s across these launches.
+- Even an all-THP 100 GiB tier registers quadratically, 12-21 s by the per-chunk model (~19 s).
+
+**Mitigations that failed at full size:** `MADV_HUGEPAGE` (4× slower registration: 103.5 s), re-faulting (0 of 4,440
+frames recovered), `MADV_COLLAPSE` (3,839 of 3,982 calls failed), reordering (18.6 s vs 18.9 s), 64 MiB chunks
+(18.9 s). Node 0 has too few order-9 blocks.
+
+**The clone fix and the leak.** Registering each chunk in a scratch ring and cloning it in cut 18.9 s to 1.1 s, but
+the pinned pages stay allocated after both rings and the process are gone.
+- Controlled repro, 2 GiB tier: direct −2 MiB orphaned, clone **+1025 MiB**.
+- Five 100 GiB clone registrations stranded **~149.5 GiB**, node-0 MemFree fell to 670 MiB with 41 GiB of swap in use,
+  and only the 2026-09-29 02:02 reboot freed it (§29.12).
+- The fix was reverted (`f82f61f3d7`). No code change lands; the merge also corrects the overclaim in
+  `uring-config/HANDOFF.md`.
+- The kernel source was not read, so which reference leaks is not established.
+
+**Options not tried, predicted:** split 4 KiB rows into their own chunks registered last (8-13 s), leave mixed chunks
+unregistered (7-12 s), 4 KiB-only tier (`MADV_NOHUGEPAGE`, ~0 walk; decode cost unmeasured), 1 GiB hugetlbfs (root).
+Registering mixed chunks first is the worst order (900-2,700 s).
+
+**Evidence:** `analysis/dsv41-drive/thp-fallback/results.md`.
+
+### 29.7 Ring reset drains unconsumed SQEs as NOPs (`65754399e3`, 2026-09-29)
+
+**The defect.** When a failed submit left SQEs the kernel never consumed, `UringReader::drain` closed and re-created
+the ring and re-registered every fixed buffer and file: 31-53 s at a 90 GiB tier by extrapolation, past the 30 s
+`fatal_wait`, so the process would abort with "a request stayed in service".
+
+**The fix.** Without SQPOLL the unconsumed SQEs still belong to userspace, so `drain()` zeroes them, rewrites them as
+`IORING_OP_NOP`, and submits and retires them on the same ring. In a fixed read mode a refused NOP drain throws with the
+cause instead of the slow reset; other modes keep the cheap reset.
+
+**Result** (divix01 after the reboot, 1,613,631,488 B slab in 3 chunks):
+
+| MODE / READ_MODE | drain_ms before → after | registrations |
+|---|---|---|
+| default / fixed | 595.5 → 0.011 | 2 → 1 |
+| default / readv_fixed | 898.6 → 0.017 | 2 → 1 |
+| iopoll / readv_fixed | 780.1 → 0.012 | 2 → 1 |
+
+- Kernels suite 1933 → 1949 passed / 23 skipped (+16 new). Mutants M1, M2, M4-M8 killed; M3 (no `memset`) survives on
+  the real kernel and is caught by the fake-liburing contract.
+- **Open, pre-existing:** `test_big_fixed_slab_real_kernel` with `MODE=iopoll` times out at 300 s at master too.
+- **In the recipe:** it matters only when fixed buffers are on, which they are not.
+- Evidence: `analysis/dsv41-drive/ringreset/results.md`; merge message.
+
+### 29.8 Zero-overhead hot path (`2810a7ad48`, merged at `b35dc14de4`, 2026-09-29)
+
+**What changed** (plan `docs/superpowers/plans/2026-09-29-hotpath-zero-overhead.md`):
+- **The packed path is deleted.** Row images are the only reader, and lease mode is unconditional.
+  `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES`, `SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES` and
+  `SGLANG_DSV41_RAM_MISS_PACK_WORKERS` are deprecated: a set value warns and is ignored, and a checkpoint without row
+  images refuses at startup (`python/sglang/srt/environ.py`).
+- **Metrics compile out.** `ProdBuild` removes stats, trace and fault state from the production instantiation;
+  `InstrBuild` is picked when a trace or fault env var is set.
+- **No tier mutex.** The service thread owns the tier state. Copy completions and unpaused Python calls reach it
+  through SPSC rings, and the copy engine's queue is an SPSC ring with a futex wake only when its thread sleeps.
+- Clockless pacing, and `FixedVec` in place of per-request containers.
+
+**Result.**
+- **Decode A/B/A2** (master `65754399e3` / branch / master): **100.52 / 99.99 / 100.10 ms/token**, byte-identical,
+  `read_errors` 0. A later pass of the branch at `1d522c5207`: 99.93. Evidence: `analysis/dsv41-drive/hotpath/results.md`
+  §8a, §8e.
+- **Service thread:** ~16-19% fewer instructions per served request (33.5 M vs 41.5 M / 40.0 M; 17.8% vs mean(A, A2);
+  the merge message says −18%) over the same cycles, which are its idle loop (§8b). TSan clean (merge message).
+- **Counts per request, CPU shim, prod build** (§5a): service malloc 14.00 → 0, mutex 1758.29 → 0, clock 4958.40 → 0;
+  copy malloc 2.65 → 0, mutex 2.65 → 0.
+- **Whole run, production server under the shim** (§8e, branch CS2 vs master CM): service malloc 159,085 → 0 and
+  mutex 114,655,774 → 0; copy malloc 136,131,275 → 72 (start-up only). Copy mutexes 110,094,979 → 36,594,783, all of
+  them libcuda's.
+
+**P1 attribution (`hotpath/results.md` §9a, arm CS3).** The copy thread's remaining mutexes are libcuda's:
+- **98.5% are `cuEventQuery` polling:** 35,082,931 [95% CI 34.99 M, 35.17 M] of 35,603,559.
+- Per job that is **~2,280-3,215**, over two estimates of the job count (15.4 k and 10.9 k), since production does not
+  count jobs. The merge message quotes ~3,215, the 10.9 k end.
+- Submission (`cuMemcpyAsync`, 8 mutexes per call; `cuEventRecord`, 4) is ~1.5% of the total.
+
+**Suite counts are not comparable across this merge.** The kernels suite collects 1956 → 1140 IDs (1119 passed / 21
+skipped at `2a3aaee887`, 1124 / 21 at `c40e834e96`): 944 packed-path IDs were deleted and 128 added (`hotpath/results.md`
+§1a, §8f).
+
+**Open:** the copy thread's libcuda traffic, which §29.9 addresses; `test_the_seqlock_reader_never_accepts_a_torn_record`
+misses its throughput floor 10/200 at head vs 9/200 at base, with 0 torn records (§6).
+
+### 29.9 Completion word, P2 (`688cc004d8`, 2026-09-29): merged unverified
+
+> **Open risk. This merge went in at the user's request without review, mutants, TSan or a decode A/B** (merge
+> message). It is unconditional: whenever the copy engine is on, as in the recipe, the copy thread uses it, and there
+> is no event fallback. Any production checkout updated past `688cc004d8` runs it.
+
+**What changed** (tests `65bf4610f6`, implementation `fcdaff8230`):
+- `CudaCopyBackend::mark` writes the job's 32-bit sequence into a host-mapped pinned word with
+  `cuStreamWriteValue32_v2` (default flags: after the stream's prior copies, fenced), resolved by `dlsym`.
+- `query()` is one acquire load of the word with a wrap-safe compare and no driver call. The event pool and
+  `cuEventRecord`/`cuEventQuery` are gone, and the head is polled every turn (the hot path's 1-in-8 cadence existed only
+  to ration `cuEventQuery`).
+- Liveness without a clock: one `cuStreamQuery` per 2^16 consecutive pending polls. An error fails stop; an idle
+  stream fails stop only if a re-load of the word is still short.
+- `init()` refuses the start if the v2 op cannot be resolved, errors, or its first write does not land.
+- The word's final value, the exact job count, is logged at shutdown.
+
+**What supports the design** (probe on divix01's RTX 5090, driver 615.71.09; `hotpath/results.md` §9b-§9d):
+- The v2 write-value ops are supported (`CAN_USE_64_BIT_STREAM_MEM_OPS` = 1; the v1 attributes read 0).
+- Stream order: 0 violations in 2,500 jobs, where an unordered control fails 500/500.
+- Submit to seen: 459.8 µs vs 460.2 µs for an every-turn `cuEventQuery` poller. A word load costs 0.27 ns; a
+  `cuEventQuery` on a completed event 118.6 ns and 1 mutex.
+- Predicted copy-thread mutexes per job: ~2,320-3,260 → ~37-49 [estimate]. `cuMemcpyAsync`'s 8 mutexes per call remain.
+
+**Not tested before the merge,** named in §9b-§9c as P2's gates: the `dlsym` path (the probe linked `-lcuda`), a
+copy-thread clock count of 0 for the write and `cuStreamQuery`, the forced interleaving where the word lands between the
+load and a `SUCCESS` query, and any decode arm.
+
+### 29.10 SPCC mirror weight 1:0.9:1: no gain (`7d4c0eeb69`, 2026-09-29; analysis only)
+
+**Question.** Does down-weighting the DRAM-less SPCC mirror (`/mnt/nvme4`) improve decode?
+
+**Result.** W (1:0.9:1) is **+0.38 ms/token** against U (1:1:1) over 3 alternating pairs (sd 0.46, range +0.01 to
++0.89); means 100.77 vs 100.39. Output byte-identical in every arm.
+- The weights take effect: the SPCC's share falls 33.2% → 30.9%. RAM misses per token are unchanged (8.94-9.03).
+- The SPCC's device time per read request falls 7.0 → 5.6 ms, while the Samsungs rise (nvme0 7.5 → 8.2, nvme2 4.3 →
+  4.8 ms). Under decode's concurrent reads the SPCC is not the straggler the QD1 bench measured.
+- The predicted −1.9 ms/token gain is excluded by all three pairs.
+
+**In the recipe:** equal weights (unset).
+
+**Deviation.** Every arm ran at `DSV41_MEM_FRACTION_STATIC=0.91`, because 0.90 was refused at KV sizing before and
+after the reboot (available 0.14 / 0.17 GB against a 0.23 GB SWA floor). This is the problem §29.11 fixes.
+
+**Evidence:** `analysis/dsv41-drive/mirror-scaling/weight-pair.md`.
+
+### 29.11 Recipe GPU memory for driver 615.71.09 (`cfe4d822da`, 2026-09-29)
+
+**What changed.** `MEM_FRACTION_STATIC` 0.90 → **0.885**, `SGLANG_MOE_HOT_GPU_MB` 16100 → **15400**, `CONTEXT_LENGTH`
+262144 → **131072** (`benchmarks/dsv41_baseline/arm_env.py`). §27.17's recipe line carries a superseded note.
+
+**Cause: the driver, not the code** (`analysis/dsv41-drive/recipe-mem/diagnosis.md`).
+- NVIDIA driver 610.57.04 → 615.71.09 (dnf transaction 477, 2026-09-27 23:11, live after the 09-28 00:30 reboot) made
+  the pre-load footprint larger and jittery. "Load weight begin" fell from 29.90-29.91 GB to 29.21-29.45 GB.
+- Bare-context probe under 615.71.09: EAGER 1961 / 1973 / 1903 MiB, LAZY 697 / 697 MiB.
+- Sources differ on the size: the diagnosis and `arm_env.py` say ~0.5 GiB; the merge message says ~0.5-0.7 GB. The
+  diagnosis's own footprint figures, 2.0-2.24 GiB against a steady 1.54 GiB before, span both.
+- At 0.90 all of it came out of the KV pool: available 0.80 → 0.14-0.38 GB against the 0.23 GB SWA floor, so some
+  launches were refused. The 09-27 code on today's driver behaves like master, which clears the code.
+- 0.91 / 16100 restored the pool but a 16k layer-major prompt OOMed; 0.895 / 15400 put the cut into the KV pool and a
+  chunked 16k prompt needed 2 allocator retries with 1 MiB free at peak.
+
+**Verification at 0.885 / 15400** (`analysis/dsv41-drive/recipe-mem/results.md`). 9 launches: KV available 0.46-0.59
+GB, KV pool **150,784-232,448 tokens** (against ~387k at 0.90 on the old driver), 2.67-2.72 GB free after decode graph
+capture. Prefill, 4096-token chunks, two runs each (free = 32,202 MiB − peak `memory.used`):
+
+| prompt | run 1: TTFT s, peak MiB, free MiB, retries | run 2: TTFT s, peak MiB, free MiB, retries |
+|---|---|---|
+| layer-major 16,384 | 83.9, 31,589, 613, 0 | 83.9, 31,607, 595, 0 |
+| layer-major 65,536 | 339.9, 31,649, 553, 0 | 322.9, 31,665, 537, 0 |
+| chunked 16,384 | 88.9, 31,973, **229**, 0 | 89.2, 31,969, **233**, 0 |
+| chunked 65,536 | 352.8, 31,949, 253, 0 | 352.6, 31,945, 257, 0 |
+
+- No OOM and no allocator retry. The chunked path is the tightest, and it is the path every prompt under 8,192
+  uncached tokens takes.
+- **CUDA reaches 32,202 MiB, not 32,150.** §27.17 and §27.18 are corrected.
+
+**Decode cost:** 102.44 ms/token at 0.885 / 15400 against 100.58 at 0.91 / 16100, **~+1.9 ms/token**, one arm each,
+byte-identical. Treat it as an estimate against the weight pairs' ±0.3 spread.
+
+**Open.**
+- **The startup pool check at 131072 was cancelled and not run.** No launch has shown that the server accepts context
+  131072 or that the pool at the merged commit is at or above it; the margin rests on the 9 launches above, smallest
+  pool 150,784 tokens.
+- A startup eager-prefill warm-up before KV sizing, so the profile sees what serving uses, is recommended and not
+  implemented (diagnosis, Q2).
+- Keep `CUDA_MODULE_LOADING=EAGER`: LAZY would return ~1.3 GiB but reopens LEASE_PROTOCOL 7.6's unguarded fail-stop.
+
+### 29.12 divix01 environment changes (2026-09-27 to 2026-09-29)
+
+- **NVIDIA driver 610.57.04 → 615.71.09** (dnf transaction 477, 2026-09-27 23:11), with the kernel moving to
+  `6.12.0-211.60.1.el10_2` and system cuDNN to 9.26 (torch loads the venv's cuDNN 9.20). Live after the 2026-09-28 00:30
+  reboot. The driver cannot be rolled back without root. Evidence: `recipe-mem/diagnosis.md`.
+- **Reboot 2026-09-29 02:02 CDT** to free the ~149-150 GiB of page pins the clone-buffers experiment stranded (§29.6).
+  Evidence: `mirror-scaling/weight-pair.md` (timeline), `thp-fallback/results.md` (incident), `ringreset/results.md`
+  (timings re-taken after it).
+- **Device names moved at that reboot; the mount-to-drive mapping did not.** Before it (2026-09-28): `/mnt/nvme0` =
+  nvme0n1 (Samsung 990 EVO Plus, xfs, 512 KiB max request), `/mnt/nvme4` = nvme2n1 (SPCC, ext4, 256 KiB), `/mnt/nvme2`
+  = nvme3n1 (Samsung 990 EVO Plus, xfs, 512 KiB) (`iopoll/diagnosis.md`, "Host facts"). After it, `/mnt/nvme2` is
+  nvme1n1 and the SPCC is still nvme2n1 (`mirror-scaling/weight-pair.md`, "How it ran"). Resolve drives from the mounts,
+  never from a remembered `/dev` name. The post-reboot name of `/mnt/nvme0`'s drive is not recorded.
+- **Host I/O facts (2026-09-28):** liburing 2.12, `nvme.poll_queues=1`, `io_poll=1` on all four NVMe namespaces, THP
+  `enabled=always`, `defrag=madvise`, `perf_event_paranoid=2` (no kernel profiling), `bpftrace` absent
+  (`iopoll/diagnosis.md`, `thp-fallback/results.md`, `uring-config/HANDOFF.md`).
+- **Node-0 memory:** the ZFS ARC holds node-0 memory that `check_capacity` does not count as reclaimable, and some arms
+  ran a 98304 MiB tier for it (§29.3).
+
+### 29.13 Open follow-ups from these results
+
+1. **Verify P2** (§29.9): review, mutants, TSan, the `dlsym` path, the clock-count gate, the forced interleaving, and a
+   decode A/B.
+2. **Run the startup pool check at context 131072** (§29.11).
+3. **A startup warm-up before KV sizing** (§29.11); the chunked 16k peak leaves 229 MiB.
+4. **Fixed buffers stay off.** Before re-enabling: never the clone path on 6.12.0-211; the untried options are in
+   §29.6. Any future clone-based fix must check the system-wide orphan count (`thp-fallback/results.md`).
+5. **IOPOLL follow-ups #7-#9** and the pre-existing IOPOLL `real_kernel` big-slab 300 s timeout (§29.5, §29.7).
+6. **The SPCC's slow episodes:** in 7 of 24 multi-row microbenchmark runs its per-SQE p50 was 10-35 ms; it is
+   DRAM-less with a 64 MiB HMB over a 191 GB span, and smart-log reads healthy (`iopoll-cuts/results.md`). Weighting it
+   down does not help (§29.10).
+7. **nvme0 sees half nvme2's IOPS at the same MB/s** (requests twice the size); not investigated
+   (`mirror-scaling/weight-pair.md`).
+8. **The copy thread's submission floor:** `cuMemcpyAsync` takes 8 libcuda mutexes per call; fewer calls per job
+   (`cuMemcpyBatchAsync`) is not measured (`hotpath/results.md` §9d).
+9. **The chain-PDL results file** is not on `master` (§29.2).
 
 ## Sources
 
