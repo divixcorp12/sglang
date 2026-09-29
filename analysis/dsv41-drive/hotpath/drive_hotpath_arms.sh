@@ -41,6 +41,10 @@
 #   Neither needs A: they are not timed and have no identity gate before them; each arm's stacks are attributed by
 #   final-fix/attribute_stacks.py once it ends. With REF_RUN=<a run dir> (Task 18's A), every arm's output is also
 #   compared byte for byte with it; hotpath_report.py runs only when ARMS includes A.
+# Phase 2 Task P1 (a denser call-site sample of CS): SHIM_SLOTS=<n> builds the shim with that many records per
+# (role, kind) (default 512, the shim's own) and STACKS_EVERY=<n> samples every n-th call (default 65536). P1 ran
+# ARMS=CS SHIM_SLOTS=16384 STACKS_EVERY=4099. An arm list without A or CM needs no master tree: pass the branch's
+# worktree and commit as <base_worktree> <base_sha> too.
 # Usage: drive_hotpath_arms.sh <base_worktree> <base_sha> <branch_worktree> <branch_sha> <out_dir under /mnt/nvme1> [port]
 set -u
 BASE_WT=${1:?base worktree}; BASE_SHA=${2:?base commit}; BRANCH_WT=${3:?branch worktree}; BRANCH_SHA=${4:?branch commit}
@@ -53,6 +57,8 @@ DRIVER_VERSION=615.71.09
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
 SHIM_SO=$OUT/hotpath_shim.so
+SHIM_SLOTS=${SHIM_SLOTS:-512}
+STACKS_EVERY=${STACKS_EVERY:-65536}
 MASTER_RECIPE=(
     SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES=1 SGLANG_DSV41_ENABLE_RAM_MISS_LEASES=1
     SGLANG_DSV41_RAM_MISS_PACK_WORKERS=8
@@ -149,9 +155,9 @@ memory_sample() {  # <label>: node-0/node-1 MemFree and VmallocUsed/Slab (MiB) a
 mkdir -p "$OUT"
 
 # The shim for arm C, built from the branch tree into $OUT (never into a worktree: run_arm.sh refuses a dirty one).
-cc -shared -fPIC -O2 -o "$SHIM_SO" "$BRANCH_WT/python/sglang/test/hotpath_shim.c" -ldl -lpthread \
-    || { say "cannot build the counting shim"; exit 1; }
-say "shim built: $SHIM_SO"
+cc -shared -fPIC -O2 -DHOTPATH_SHIM_STACK_SLOTS="$SHIM_SLOTS" -o "$SHIM_SO" \
+    "$BRANCH_WT/python/sglang/test/hotpath_shim.c" -ldl -lpthread || { say "cannot build the counting shim"; exit 1; }
+say "shim built: $SHIM_SO (stack slots $SHIM_SLOTS, stacks every $STACKS_EVERY)"
 PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid)
 say "perf_event_paranoid=$PARANOID"
 
@@ -425,7 +431,7 @@ raise SystemExit(0 if not any(bad.values()) else 'output differs from A')
 
 attribute() {  # <arm>: the arm's shim counts and stacks, attributed to call sites (CS, CM)
     PYTHONPATH=$BRANCH_WT/python $PY "$BRANCH_WT/analysis/dsv41-drive/hotpath/final-fix/attribute_stacks.py" \
-        "$OUT/$1-callsites.txt" "$OUT/$1-shim.json" "$OUT/$1-attribution.json" 65536
+        "$OUT/$1-callsites.txt" "$OUT/$1-shim.json" "$OUT/$1-attribution.json" "$STACKS_EVERY"
 }
 
 same_as_ref() {  # <arm>: byte identity against REF_RUN (Task 18's A), when given
@@ -439,7 +445,7 @@ raise SystemExit(0 if not bad else 'output differs from REF_RUN')
 " "$REF_RUN" "$(run_dir_of "$1")"
 }
 
-STACKS_ENV=(HOTPATH_SHIM_STACKS_FIRST=256 HOTPATH_SHIM_STACKS_EVERY=65536)
+STACKS_ENV=(HOTPATH_SHIM_STACKS_FIRST=256 "HOTPATH_SHIM_STACKS_EVERY=$STACKS_EVERY")
 rc=0
 for arm in "${ARMS[@]}"; do
     case $arm in

@@ -61,7 +61,13 @@ static __thread int who __attribute__((tls_model("initial-exec"))) = -1;  // 0 s
 
 // Call-site capture (HOTPATH_SHIM_STACKS). A record is written by the one thread that drew its slot; a reader (the
 // exit dump) takes only records whose `ready` is set, after the thread has left.
-enum { kStackDepth = 32, kStackSlots = 512 };
+// kStackSlots: records kept per (role, kind). -DHOTPATH_SHIM_STACK_SLOTS=<n> raises it for a denser sample (phase 2
+// Task P1 builds it with 16384 and HOTPATH_SHIM_STACKS_EVERY=4099: ~9k copy-thread mutex records, every one kept).
+// The table is static BSS, so only the process that dumps touches it all.
+#ifndef HOTPATH_SHIM_STACK_SLOTS
+#define HOTPATH_SHIM_STACK_SLOTS 512
+#endif
+enum { kStackDepth = 32, kStackSlots = HOTPATH_SHIM_STACK_SLOTS };
 struct StackRecord {
   _Atomic int ready;
   int depth;
