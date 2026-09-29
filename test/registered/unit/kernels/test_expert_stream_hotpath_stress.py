@@ -54,15 +54,20 @@ def _check_tier(s, host, rows):
 
 def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
     """Run the four parties for ``seconds`` against a threaded host, then park the service and check the tier.
-    Raises AssertionError on a broken tier invariant; returns the parties' counts, ``fatal``, the service's counters
-    and the final rows, for the caller's checks that every party ran."""
+    Raises AssertionError on a party's error or a broken tier invariant; returns the parties' counts, ``fatal``, the
+    service's counters and the final rows, for the caller's checks that every party ran.
+
+    The pauser runs on the calling thread, the one that built the host: every eager call that may touch an io_uring
+    reader (``pause``, ``assign``, ``resume``, and ``RamMissSetup.reference``, whose shared Exl3ShardRowSource reader
+    belongs to the thread that first opened it) must come from that owner, as master's eager contract requires. The
+    device, the copy releaser and the noise run on worker threads."""
     s, page, host, sim, dst = hp.build_host(tmp_path, variant=variant)
     host.start_thread(fatal_wait_s=60.0, spin_us=2000)
     stop, quiet, idle = threading.Event(), threading.Event(), threading.Event()
     stats = {
         "armed": 0, "copy_posts": 0, "terminals": 0, "timeouts": 0, "failed": 0,
         "lanes_ready": 0, "lanes_loading": 0, "lanes_copying": 0,
-        "releases": 0, "noise": 0, "pauses": 0, "refused": 0, "assigns": 0, "errors": [],
+        "releases": 0, "marked": 0, "noise": 0, "pauses": 0, "refused": 0, "assigns": 0, "errors": [],
     }
 
     def guard(name, fn):
@@ -72,44 +77,52 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
             except BaseException as error:  # noqa: BLE001 - reported through stats["errors"], and every party stops
                 stats["errors"].append(f"{name}: {error!r}")
                 stop.set()
-        return threading.Thread(target=run, name=f"stress-{name}", daemon=True)
+        return run
 
     def device():
         rng = random.Random(seed)
-        while not stop.is_set():
-            if quiet.is_set():
-                idle.set()
-                time.sleep(0.001)
-                continue
-            row = rng.randrange(hp.LAYERS)
-            lanes = rng.sample(DEVICE_EXPERTS, rng.randint(1, 3))
-            hp.write_hot_record(page, host, hp.next_seq(page), [])
-            use_copy = rng.random() < 0.5
-            req = sim.post(row, lanes, dst=list(range(len(lanes))) if use_copy else None, copy_engine=use_copy)
-            stats["armed"] += 1
-            stats["copy_posts"] += int(use_copy)
-            status = sim_wait(page, req.seq, 10.0)
-            if status != 1:
-                stats["timeouts" if status == 0 else "failed"] += 1
-                raise AssertionError(f"request {req.seq} (row {row}, lanes {lanes}) ended with sim_wait {status}")
-            for lane in range(len(req.lanes)):
-                result = sim.row_result(req, lane)
-                if result["gen"] != req.gen or result["tag"] not in LANE_TAGS:
-                    raise AssertionError(f"request {req.seq} lane {lane} was served without a grant: {result}")
-                stats[LANE_TAGS[result["tag"]]] += 1
-            waited, ack_lanes = hp.accept(sim, req)
-            if rng.random() < 0.1:
-                sim.terminal(req, (1 << len(req.lanes)) - 1)
-                stats["terminals"] += 1
-            else:
-                sim.ack(req, waited, lanes=ack_lanes)
-            sim.deliver()
+        try:
+            while not stop.is_set():
+                if quiet.is_set():
+                    idle.set()
+                    time.sleep(0.001)
+                    continue
+                row = rng.randrange(hp.LAYERS)
+                lanes = rng.sample(DEVICE_EXPERTS, rng.randint(1, 3))
+                hp.write_hot_record(page, host, hp.next_seq(page), [])
+                use_copy = rng.random() < 0.5
+                req = sim.post(row, lanes, dst=list(range(len(lanes))) if use_copy else None, copy_engine=use_copy)
+                stats["armed"] += 1
+                stats["copy_posts"] += int(use_copy)
+                status = sim_wait(page, req.seq, 10.0)
+                if status != 1:
+                    stats["timeouts" if status == 0 else "failed"] += 1
+                    raise AssertionError(f"request {req.seq} (row {row}, lanes {lanes}) ended with sim_wait {status}")
+                for lane in range(len(req.lanes)):
+                    result = sim.row_result(req, lane)
+                    if result["gen"] != req.gen or result["tag"] not in LANE_TAGS:
+                        raise AssertionError(f"request {req.seq} lane {lane} was served without a grant: {result}")
+                    stats[LANE_TAGS[result["tag"]]] += 1
+                waited, ack_lanes = hp.accept(sim, req)
+                if rng.random() < 0.1:
+                    sim.terminal(req, (1 << len(req.lanes)) - 1)
+                    stats["terminals"] += 1
+                else:
+                    sim.ack(req, waited, lanes=ack_lanes)
+                sim.deliver()
+        finally:
+            idle.set()  # a device that left (stop, or an error) is quiet: a pauser waiting on it must not time out
 
     def releaser():
+        # HostCopyBackend::release(n) adds n marks of credit and release(-1) is sticky ("every mark, from now on"), so
+        # each tick releases one mark, and only while a mark is outstanding (marked > released): copies complete one
+        # by one, at the releaser's pace, instead of all of them from the first tick on. -1 is kept for the final drain.
+        rng = random.Random(seed + 3)
         while not stop.is_set():
-            host.copy_engine_release(-1)
-            stats["releases"] += 1
-            time.sleep(0.0005)
+            if host.copy_engine_marked() > stats["releases"]:
+                host.copy_engine_release(1)
+                stats["releases"] += 1
+            time.sleep(rng.uniform(0.0002, 0.001))
 
     def noise():
         rng = random.Random(seed + 1)
@@ -121,14 +134,25 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
             stats["noise"] += 1
             time.sleep(0.0002)
 
+    def quiesce_device():
+        """Ask the device to stop posting and wait until it has; False when every party is stopping instead."""
+        idle.clear()
+        quiet.set()
+        deadline = time.monotonic() + 15.0
+        while not idle.wait(0.05):
+            if stop.is_set():
+                return False
+            if time.monotonic() > deadline:
+                raise AssertionError("the device did not go quiet within 15 s")
+        return True
+
     def pauser():
         rng = random.Random(seed + 2)
-        while not stop.wait(0.2):
-            idle.clear()
-            quiet.set()
+        deadline = time.monotonic() + seconds
+        while not stop.wait(0.2) and time.monotonic() < deadline:
             try:
-                if not idle.wait(15.0):
-                    raise AssertionError("the device did not go quiet within 15 s")
+                if not quiesce_device():
+                    return
                 try:
                     host.pause(5.0)
                 except RuntimeError as error:
@@ -158,18 +182,20 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
             finally:
                 quiet.clear()
 
-    threads = [guard(name, fn) for name, fn in
-               (("device", device), ("releaser", releaser), ("noise", noise), ("pauser", pauser))]
+    threads = [threading.Thread(target=guard(name, fn), name=f"stress-{name}", daemon=True)
+               for name, fn in (("device", device), ("releaser", releaser), ("noise", noise))]
     try:
         for t in threads:
             t.start()
-        stop.wait(seconds)
+        guard("pauser", pauser)()  # on this thread, the host's owner
         stop.set()
         for t in threads:
             t.join(30.0)
         alive = [t.name for t in threads if t.is_alive()]
         assert not alive, f"parties still running after stop: {alive}; errors {stats['errors']}"
+        assert not stats["errors"], f"a party failed: {stats['errors']}"
         # Final quiesce: every ack and terminal was delivered, and the copy thread drains once its marks complete.
+        stats["marked"] = host.copy_engine_marked()
         host.copy_engine_release(-1)
         assert host.copy_engine_idle(5.0), "the copy engine did not go idle"
         host.pause(5.0)
@@ -187,6 +213,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
 def test_every_party_against_the_service_keeps_the_tier_invariants(tmp_path):
     report = run_stress(tmp_path, seconds=8.0, seed=1)
     stats, counters = report["stats"], report["counters"]
+    print("STRESS stats", {k: v for k, v in stats.items() if k != "errors"}, "counters", counters)
     assert stats["errors"] == [], stats["errors"]
     assert stats["timeouts"] == 0 and stats["failed"] == 0
     assert report["fatal"] == 0 and counters["read_errors"] == 0, (report["fatal"], counters)
@@ -198,5 +225,7 @@ def test_every_party_against_the_service_keeps_the_tier_invariants(tmp_path):
     assert stats["lanes_loading"] > 0 and stats["lanes_ready"] > 0, stats
     assert stats["copy_posts"] > 0 and stats["lanes_copying"] > 0, stats
     assert stats["terminals"] > 0, stats
-    assert stats["releases"] > 100 and stats["noise"] > 100, stats
+    # Copies completed one mark at a time (C: the releaser never grants credit ahead of an outstanding mark).
+    assert 100 < stats["releases"] <= stats["marked"], stats
+    assert stats["noise"] > 100, stats
     assert stats["pauses"] >= 8 and stats["assigns"] == stats["pauses"], stats
