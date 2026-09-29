@@ -190,3 +190,13 @@ async def dsv41_prefill_shapes(
             req.bootstrap_host = FAKE_BOOTSTRAP_HOST
         async for _ in tokenizer_manager.generate_request(req, None):
             pass
+    # A grammar request loads xgrammar's bitmask kernel and runs the sampler's grammar token sync.
+    req = GenerateReqInput(
+        input_ids=rng.integers(2**16, size=16).tolist(),
+        sampling_params={"max_new_tokens": 2, "temperature": 0.0, "regex": "(yes|no)"},
+    )
+    if disaggregation_mode != "null":
+        req.bootstrap_room = 0
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+    async for _ in tokenizer_manager.generate_request(req, None):
+        pass
