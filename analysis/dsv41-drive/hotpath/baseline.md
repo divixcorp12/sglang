@@ -801,3 +801,67 @@ sudo -n true     # "sudo: a password is required" -- passwordless sudo NOT avail
 - `/data/models/slang/nvfp4-work/wt-hotpath-base`: created this task, detached at `ba01695c35`. Clean.
 - `/data/models/slang/nvfp4-work/wt-hotpath`: did not exist before this task; created in Step 5 below, detached at
   `origin/cc/hotpath-zero-overhead` after the push.
+
+## 6. Hot-path shim counts: master, per request (Task 3)
+
+Measured with the LD_PRELOAD counting shim (`python/sglang/test/hotpath_shim.c`) on branch commit `e3a66073b4`, whose
+C++ host module is unchanged from `ba01695c35` (the branch so far adds only tests and analysis), so these are master's
+counts. The shim recognizes threads by the names they set at HEAD: `exl3-ram-miss` (`ram_thread.h`, `RamThread::run`:
+`Layout::kName + "-ram-miss"`, truncated to 15 bytes) and `exl3-copy-eng` (`ram_tier.h` -> `copy_engine.h`,
+`CopyEngine::run`). Both runs saw exactly one thread per role (`threads == {"service": 1, "copy": 1}`).
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath && export PYTHONPATH=$PWD/python \
+  OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
+  && taskset -c 0-63 /data/models/slang/.venv/bin/python -c "import sglang; print(sglang.__file__)" \
+  && taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
+     test/registered/unit/kernels/test_expert_stream_hotpath_shim.py -q -rs -s -p no:randomly 2>&1 | tail -25; \
+  echo "EXIT=${PIPESTATUS[0]}"'
+```
+
+`sglang.__file__` = `/data/models/slang/nvfp4-work/wt-hotpath/python/sglang/__init__.py`; `2 passed`, `EXIT=0`.
+Scenario: 200 measured requests after 50 warm-up, each two lanes on row 0 through the copy engine
+(`hotpath_shim.run_child` defaults, `start_thread(spin_us=50_000)`).
+
+| thread  | kind   | run 1 raw | run 1 / req | run 2 raw | run 2 / req |
+|---------|--------|----------:|------------:|----------:|------------:|
+| service | malloc |     2,800 |       14.00 |     2,800 |       14.00 |
+| service | free   |     2,800 |       14.00 |     2,800 |       14.00 |
+| service | mutex  |   351,658 |     1758.29 |   243,925 |     1219.62 |
+| service | cond   |         0 |        0.00 |         0 |        0.00 |
+| service | clock  |   991,680 |     4958.40 |   621,734 |     3108.67 |
+| service | sleep  |         0 |        0.00 |         0 |        0.00 |
+| copy    | malloc |       530 |        2.65 |       354 |        1.77 |
+| copy    | free   |       530 |        2.65 |       354 |        1.77 |
+| copy    | mutex  |       530 |        2.65 |       354 |        1.77 |
+| copy    | cond   |       265 |        1.32 |       177 |        0.89 |
+| copy    | clock  |       795 |        3.98 |       531 |        2.65 |
+| copy    | sleep  |         0 |        0.00 |         0 |        0.00 |
+
+Run 2 is the restored-baseline run after the shim mutants (section 6a), in a private worktree at the same commit.
+
+Reading:
+
+- **Service malloc/free: exactly 14 per request, identical across runs.** This is the request path's own allocation
+  (deterministic), and it is nonzero, so the shim is intercepting the host module (the plan's Step 4 stop condition).
+- **Service mutex and clock are dominated by the idle spin, not the request.** Between requests `RamThread::run`
+  calls `now_ns()` every spin iteration and polls `pump_demand`/`pump_prefetch`/`pump_advice`, which take locks; the
+  count scales with wall time between the Python driver's posts (it differs 1.4x between the two runs). A later zero
+  assertion for mutex/clock must either remove those from the poll loop too or measure a window that excludes idle
+  polls; the per-request share cannot be separated with this scenario.
+- **Copy counts vary with batching** (2.65 vs 1.77 per request): the copy thread's allocations, locks and condvar calls
+  are per pass, and a pass drains however many jobs are queued. Nonzero malloc matches the spec's per-pass deque.
+- **No condvar on the service, no sleep on either thread** in the window: the 50 ms spin keeps the service out of its
+  50 µs idle sleep, as intended.
+
+### 6a. The shim fails loudly when it measures nothing
+
+Mutants in the private worktree `/data/models/slang/nvfp4-work/wt-hotpath-mut` at `e3a66073b4`, reverted with
+`git checkout --`, worktree removed afterwards. Command: `taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest
+test/registered/unit/kernels/test_expert_stream_hotpath_shim.py -q -p no:randomly`.
+
+| mutant | change | result |
+|---|---|---|
+| M1 | shim matches `-ram-mist` instead of `-ram-miss` | `2 failed`, `EXIT=1`: `assert {'service': 0, 'copy': 1} == {'service': 1, 'copy': 1}` (and the self-test) |
+| M2 | `run_child` drops `LD_PRELOAD` from the child env | `1 failed, 1 passed`, `EXIT=1`: `hotpath shim is not preloaded (LD_PRELOAD did not reach the child)` |
+| restored | none | `2 passed`, `EXIT=0` (run 2 above) |
