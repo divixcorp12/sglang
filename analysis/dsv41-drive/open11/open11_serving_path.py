@@ -16,6 +16,9 @@ other three are CUDA graph replays (serving replays a graph, unlike the eager 8 
 
 Run under gpu-run.sh, taskset -c 0-63, OMP_NUM_THREADS=1, SGLANG_EXL3_SRC set, PYTHONPATH at the tree under test.
     python open11_serving_path.py --lease 0|1 [--reps 300]
+
+Since 2026-09-29 (plan hotpath-zero-overhead, Task 7) the switch is gone: lease mode is unconditional, so only
+`--lease 1` runs at or after that commit. `--lease 0` is refused; the A/B is reproducible only at an older commit.
 """
 import argparse
 import json
@@ -73,8 +76,10 @@ def main():
     from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
+    if not args.lease:
+        raise SystemExit("--lease 0: lease mode is unconditional since 2026-09-29; run the A arm at an older commit")
     with tempfile.TemporaryDirectory() as tmp:
-        layer, streamer, service, checks = harness._layers(Path(tmp), lease=bool(args.lease))
+        layer, streamer, service, checks = harness._layers(Path(tmp))
         out = {"lease": bool(args.lease), "service_lease_mode": service.lease_mode, "route": ROUTE}
         try:
             x = torch.zeros((1, harness.HIDDEN), device="cuda", dtype=torch.bfloat16)

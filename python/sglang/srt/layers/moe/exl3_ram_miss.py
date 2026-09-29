@@ -68,7 +68,7 @@ class Exl3RamMissTables:
     row_bytes: torch.Tensor  # int64 [6]
     capacity: torch.Tensor  # int64 [L]
     slot_bytes: int
-    # Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES): the files are exl3_row_image layer files, a row's parts
+    # Row images (the only reader): the files are exl3_row_image layer files, a row's parts
     # tile its image (``starts`` 0, extents' destination = position in the image), the segments are the six identity
     # segments and the C++ reader reads straight into the slabs (its direct mode). ``slot_bytes`` is the image size.
     row_images: bool = False
@@ -232,40 +232,33 @@ def check_sm_small_copies(cfg: Dsv41Config) -> None:
         )
 
 
-def check_piece_stream(cfg: Dsv41Config, *, row_images: bool) -> None:
-    """Refuse SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM without what it needs. It is a mode of two-phase (itself a mode
-    of lease mode), and the inline no-pool pack path (pack_workers == 0) has no publisher for a piece job, so it is
-    refused rather than silently packing whole rows. Row images copy nothing: the reader publishes each piece on its
-    own thread, so they need no workers."""
-    if not cfg.enable_ram_miss_piece_stream:
-        return
-    publisher = cfg.ram_miss_pack_workers > 0 or row_images
-    if not (cfg.enable_ram_miss_two_phase and cfg.enable_ram_miss_leases and publisher):
+def check_piece_stream(cfg: Dsv41Config) -> None:
+    """Refuse SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM without two-phase: it is a mode of two-phase. The row-image
+    reader publishes each piece on its own thread, so piece streaming needs nothing else."""
+    if cfg.enable_ram_miss_piece_stream and not cfg.enable_ram_miss_two_phase:
         raise RuntimeError(
-            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM needs "
-            "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE, SGLANG_DSV41_ENABLE_RAM_MISS_LEASES and "
-            "SGLANG_DSV41_RAM_MISS_PACK_WORKERS > 0 (or SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES)"
+            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM needs SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE"
         )
 
 
-def open_service_row_images(cfg: Dsv41Config, layout, segments, mirrors: dict, direct: bool, streamers) -> Optional[RowImageSet]:
-    """The row images the service reads with (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES), or None with the flag off.
+def open_service_row_images(layout, segments, mirrors: dict, direct: bool, streamers) -> RowImageSet:
+    """The row images the service reads with: the only reader (plan 2026-09-29-hotpath-zero-overhead D4).
 
     The images live beside the mirrored shards, one set per mirror root, and are split across the roots exactly as the
     mirrors are (``mirrors`` is ``mirror_table_args()``). Refused without mirror dirs (there is nowhere to read them
-    from), without O_DIRECT reads (the point is a readv straight into the pinned slabs), without leases, and by
-    ``open_row_images`` unless every root holds a complete set matching this checkpoint for every streamed layer."""
-    if not cfg.enable_ram_miss_row_images:
-        return None
-    if not cfg.enable_ram_miss_leases:
-        # A direct read overwrites its victim slot from submission, not after the read as packing did; only the lease
-        # check in victim selection is known to keep a slot a GPU copy may still be reading from being chosen.
-        raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES")
+    from), without O_DIRECT reads (the point is a readv straight into the pinned slabs), and by ``open_row_images``
+    unless every root holds a complete set matching this checkpoint for every streamed layer, naming the converter
+    (scripts/dsv41/build_row_images.py). The service runs in lease mode unconditionally: a direct read overwrites its
+    victim slot from submission, and only the lease check in victim selection keeps a slot a GPU copy may still be
+    reading from being chosen."""
     if not mirrors:
-        raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES needs SGLANG_MOE_EXPERT_MIRROR_DIRS")
+        raise RuntimeError(
+            "exl3 RAM miss: the RAM-miss service reads row images and needs SGLANG_MOE_EXPERT_MIRROR_DIRS (roots "
+            "holding images built by scripts/dsv41/build_row_images.py)"
+        )
     if not direct:
         raise RuntimeError(
-            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES needs SGLANG_MOE_EXPERT_FILE_READER=uring_direct"
+            "exl3 RAM miss: the RAM-miss service reads row images and needs SGLANG_MOE_EXPERT_FILE_READER=uring_direct"
         )
     from sglang.srt.layers.moe.exl3_row_image import open_row_images
 
@@ -630,8 +623,9 @@ class Exl3RamMissService:
         self._shut_down = False
         self._quarantined = False
         self._completed = False
-        # Fixed once, in ensure_started, from SGLANG_DSV41_ENABLE_RAM_MISS_LEASES: the host and the device are both
-        # configured from this one field, so they cannot disagree about whether a record is leased.
+        # Set once ensure_started has put the host in lease mode, which it always does (row images need it): the host
+        # and the device are both configured from this one field, so they cannot disagree about whether a record is
+        # leased.
         self.lease_mode = False
         # Task 6 V1, fixed in ensure_started beside lease_mode so the host, the device and every backend cannot
         # disagree about which chain this process runs.
@@ -697,7 +691,7 @@ class Exl3RamMissService:
             fmt.segment_map(),
             {layer_id: s.pinned_host_cache.tensors for layer_id, s in streamers.items()},
             **mirrors,
-            row_images=open_service_row_images(cfg, fmt.layout, fmt.segment_map(), mirrors, direct, streamers),
+            row_images=open_service_row_images(fmt.layout, fmt.segment_map(), mirrors, direct, streamers),
         )
         layout_names, _ = host_layout()
         if layout_names != EXL3_STREAMED_NAMES:
@@ -718,26 +712,13 @@ class Exl3RamMissService:
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
-            lease_mode = cfg.enable_ram_miss_leases
-            # Two-phase is a mode of lease mode, not an independent one: without leases there are no row results to
-            # publish early, so it is refused rather than silently ignored.
+            # Lease mode is unconditional: a row-image read overwrites its victim slot from submission, so only the
+            # lease check in victim selection keeps a slot the device may still be copying from out of reach.
+            lease_mode = True
             two_phase = cfg.enable_ram_miss_two_phase
-            if two_phase and not lease_mode:
-                raise RuntimeError(
-                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
-                )
-            if cfg.enable_lease_pdl and not lease_mode:
-                raise RuntimeError(
-                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_LEASE_PDL needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"
-                )
             piece_stream = cfg.enable_ram_miss_piece_stream
-            check_piece_stream(cfg, row_images=tables.row_images)
-            if cfg.enable_prefill_fills and not tables.row_images:
-                raise RuntimeError(
-                    "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_FILLS needs SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES"
-                )
-            if lease_mode:
-                host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
+            check_piece_stream(cfg)
+            host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
             if two_phase:
                 host.enable_two_phase()
             if piece_stream:
@@ -812,10 +793,10 @@ class Exl3RamMissService:
         if share_recorder is not None:
             share_recorder.register_pre_forward_observer(self._set_prefill_share)
         logger.info(
-            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases %s, "
-            "row images %s, copy engine %s",
+            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases on, "
+            "row images on, copy engine %s",
             len(tables.layer_ids), len(tables.paths), tables.slot_bytes, cfg.ram_miss_timeout_ms,
-            "on" if lease_mode else "off", "on" if tables.row_images else "off", "on" if copy_engine else "off",
+            "on" if copy_engine else "off",
         )
 
     def before_host_use(self) -> None:
@@ -874,7 +855,7 @@ class Exl3RamMissService:
         if self.device_side is None:
             from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
 
-            if self.lease_mode and self.host.lease_header()["abi_version"] != expert_lease_block.ABI_VERSION:
+            if self.host.lease_header()["abi_version"] != expert_lease_block.ABI_VERSION:
                 raise RuntimeError(
                     f"exl3 RAM miss: the lease block's ABI version is {self.host.lease_header()['abi_version']}, "
                     f"the device kernels speak {expert_lease_block.ABI_VERSION}"
@@ -887,8 +868,8 @@ class Exl3RamMissService:
                 timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
                 advise=prefetch_enabled(),
                 # The host owns the block (ExpertStreamHost allocates it); the device reads the same one.
-                lease_block=self.host.lease_block if self.lease_mode else None,
-                lease_layout=self.host.lease_layout if self.lease_mode else None,
+                lease_block=self.host.lease_block,
+                lease_layout=self.host.lease_layout,
                 hot_page=self.hot_page if self.gpu_hot_enabled else None,
                 piece_stream=self.piece_stream,
                 piece_runs=self.host.piece_runs() if self.piece_stream else None,
@@ -966,8 +947,6 @@ class Exl3RamMissService:
             self._hot_lists[layer_id] = [int(e) for e in self._hot_snapshot[row, :capacity].tolist() if e >= 0]
 
     def _enable_gpu_hot(self, updater) -> None:
-        if not self.lease_mode:
-            raise ValueError("EXL3 DIRECT requires RAM-miss leases")
         self._gpu_hot_updater = updater
         self._hot_snapshot = torch.empty_like(
             updater.slot_to_expert, device="cpu", pin_memory=updater.device.type == "cuda"

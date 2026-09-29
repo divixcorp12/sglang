@@ -99,9 +99,9 @@ def service_row_images(source) -> contextlib.ExitStack:
     them with. Returns the entered env overrides; close the stack when the test is done.
 
     The formats must be built inside the stack with ``source_root=source`` and no ``direct`` (so
-    SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production). SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES
-    and SGLANG_DSV41_ENABLE_RAM_MISS_LEASES (which the images need) are set until those knobs are removed (plan
-    2026-09-29-hotpath-zero-overhead Task 7). Modelled on test_exl3_prefill_fills_service._build."""
+    SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production). Row images and lease mode need no env:
+    both are unconditional (plan 2026-09-29-hotpath-zero-overhead Task 7). Modelled on
+    test_exl3_prefill_fills_service._build."""
     from sglang.srt.environ import envs
 
     source = pathlib.Path(source)
@@ -116,8 +116,6 @@ def service_row_images(source) -> contextlib.ExitStack:
     for env, value in (
         (envs.SGLANG_MOE_EXPERT_MIRROR_DIRS, str(root)),
         (envs.SGLANG_MOE_EXPERT_FILE_READER, "uring_direct"),
-        (envs.SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, True),
-        (envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES, True),
     ):
         stack.enter_context(env.override(value))
     return stack

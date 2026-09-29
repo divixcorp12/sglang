@@ -447,7 +447,7 @@ def piece_geometry(tables, row: int, expert: int, *, layout: str = "exl3") -> Op
 # to the last row's, which overlaps the reads (see StageRecord).
 # The byte split, terminal status, per-row packing and per-extent CQE stamps are defined at StageRecord.
 # STAGE_TRACE_ROWS / STAGE_TRACE_EXTENTS are its kTraceRows / kTraceExtents.
-# Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, the reader's direct mode) copy nothing: the drive writes the
+# Row images (the only reader since 2026-09-29, its direct mode) copy nothing: the drive writes the
 # slab rows. The pack stamps then mean publish time: with piece streaming row_pack_start/end are the clocks of the
 # row's first and last piece publish, without it both are the clock the row's reads were vetted and it was finished;
 # pack_start/pack_end/pack_ns are built from them as for packing. pack_workers and pack_split are 0 and useful_bytes still

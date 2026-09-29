@@ -472,7 +472,6 @@ def _fused_layer(tmp_path, *, two_phase: bool, timeout_ms=2000):
         envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
         envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
         envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(two_phase),
     ):
         layer = torch.nn.Module()

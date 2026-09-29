@@ -42,7 +42,7 @@ def test_shutdown_does_not_free_a_tier_while_the_gpu_still_has_work_in_flight(tm
 
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
-    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=2000, lease=True)
+    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=2000)
     try:
         x = torch.zeros((1, HIDDEN), device="cuda", dtype=torch.bfloat16)
         weights = torch.full((1, TOP_K), 1.0 / TOP_K, device="cuda")
@@ -88,7 +88,7 @@ def test_shutdown_ends_a_gpu_reader_waiting_on_the_service_without_waiting_out_i
 
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
-    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=20000, lease=True)
+    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=20000)
     try:
         x = torch.zeros((1, HIDDEN), device="cuda", dtype=torch.bfloat16)
         weights = torch.full((1, TOP_K), 1.0 / TOP_K, device="cuda")
@@ -145,7 +145,7 @@ def child(mode, log, tmp):
             f.write("unregister\n")
 
     common._cuda_host_unregister = logged
-    layer, streamer, service, checks = _layers(_P(tmp), timeout_ms=200, lease=True)
+    layer, streamer, service, checks = _layers(_P(tmp), timeout_ms=200)
     if mode == "cuda_error":
         bad = torch.tensor([10**9], device="cuda")
         torch.ones(4, device="cuda")[bad]  # an asynchronous device-side assert: the next synchronize raises

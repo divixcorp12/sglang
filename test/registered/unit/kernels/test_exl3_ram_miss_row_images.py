@@ -16,10 +16,9 @@ import torch
 import test_exl3_ram_miss_split as split
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_pieces, read_rows_sqes, read_rows_traced
-from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.layers.moe import exl3_row_image as ri
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
-from sglang.srt.layers.moe.exl3_ram_miss import check_piece_stream, exl3_ram_miss_tables, open_service_row_images
+from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables, open_service_row_images
 from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
@@ -327,48 +326,19 @@ def _sub_reads(s, row, expert):
 # ---- The service ----
 
 
-def _cfg(**overrides):
-    return Dsv41Config(**{**{f: getattr(Dsv41Config.from_envs(), f) for f in Dsv41Config.__struct_fields__}, **overrides})
-
-
-def test_the_service_opens_images_only_with_the_flag_mirrors_o_direct_and_leases(tmp_path):
-    """Negative-branch contract of the wiring: off means the shard tables (None), and on is refused without mirror
-    dirs (nowhere to read), without O_DIRECT (the readv into the slabs is the point) or without leases (only the lease
-    check keeps a direct read from overwriting a slot a GPU copy may still read), naming the missing setting."""
+def test_the_service_opens_images_only_with_mirrors_and_o_direct(tmp_path):
+    """Negative-branch contract of the wiring: row images are the only reader, refused without mirror dirs (nowhere
+    to read) or without O_DIRECT (the readv into the slabs is the point), naming the missing setting. Lease mode is
+    unconditional, so there is no lease refusal left to pin."""
     s = ram_miss_setup(tmp_path, capacity=3)
     mirrors = dict(roots=s.roots, policy=StaticSplitPolicy((1.0,)), source_root=str(tmp_path))
     segments, layers = s.fmt.segment_map(), {0: None, 1: None}
-    assert open_service_row_images(_cfg(enable_ram_miss_row_images=False), s.layout, segments, mirrors, True, layers) is None
-    with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"):
-        open_service_row_images(
-            _cfg(enable_ram_miss_row_images=True, enable_ram_miss_leases=False), s.layout, segments, mirrors, True, layers
-        )
-    on = _cfg(enable_ram_miss_row_images=True, enable_ram_miss_leases=True)
     with pytest.raises(RuntimeError, match="SGLANG_MOE_EXPERT_MIRROR_DIRS"):
-        open_service_row_images(on, s.layout, segments, {}, True, layers)
+        open_service_row_images(s.layout, segments, {}, True, layers)
     with pytest.raises(RuntimeError, match="uring_direct"):
-        open_service_row_images(on, s.layout, segments, mirrors, False, layers)
-    images = open_service_row_images(on, s.layout, segments, mirrors, True, layers)
+        open_service_row_images(s.layout, segments, mirrors, False, layers)
+    images = open_service_row_images(s.layout, segments, mirrors, True, layers)
     assert sorted(images.paths) == [0, 1] and images.roots == s.roots
-
-
-@pytest.mark.parametrize(
-    "workers, images, refused",
-    [(0, False, True), (0, True, False), (2, False, False)],
-    ids=["no_publisher", "images_publish_inline", "workers"],
-)
-def test_the_service_refuses_piece_streaming_without_a_publisher_unless_it_reads_row_images(workers, images, refused):
-    """Negative-branch contract of the service gate: with two-phase and leases on, piece streaming still needs a
-    publisher, packing workers or the direct mode's own; without either it is refused, not run on the inline packer."""
-    cfg = _cfg(
-        enable_ram_miss_piece_stream=True, enable_ram_miss_two_phase=True, enable_ram_miss_leases=True,
-        ram_miss_pack_workers=workers,
-    )
-    if refused:
-        with pytest.raises(RuntimeError, match="PACK_WORKERS > 0"):
-            check_piece_stream(cfg, row_images=images)
-    else:
-        check_piece_stream(cfg, row_images=images)
 
 
 if __name__ == "__main__":

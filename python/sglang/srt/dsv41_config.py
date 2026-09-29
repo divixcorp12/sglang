@@ -24,14 +24,11 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     expert_trace_path: str
     router_capture_path: str
     ram_miss_timeout_ms: int
-    ram_miss_pack_workers: int
     ram_miss_fault: str
     enable_expert_prefetch: bool
-    enable_ram_miss_leases: bool
     enable_ram_miss_two_phase: bool
     ram_miss_hit_wait_us: int
     enable_ram_miss_piece_stream: bool
-    enable_ram_miss_row_images: bool
     enable_ram_miss_copy_engine: bool
     enable_ram_miss_sm_small_copies: bool
     enable_lease_pdl: bool
@@ -62,14 +59,11 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             expert_trace_path=envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get(),
             router_capture_path=envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get(),
             ram_miss_timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
-            ram_miss_pack_workers=envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.get(),
             ram_miss_fault=envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get(),
             enable_expert_prefetch=envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get(),
-            enable_ram_miss_leases=envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get(),
             enable_ram_miss_two_phase=envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.get(),
             ram_miss_hit_wait_us=envs.SGLANG_DSV41_RAM_MISS_HIT_WAIT_US.get(),
             enable_ram_miss_piece_stream=envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.get(),
-            enable_ram_miss_row_images=envs.SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES.get(),
             enable_ram_miss_copy_engine=envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get(),
             enable_ram_miss_sm_small_copies=envs.SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES.get(),
             enable_lease_pdl=envs.SGLANG_DSV41_ENABLE_LEASE_PDL.get(),

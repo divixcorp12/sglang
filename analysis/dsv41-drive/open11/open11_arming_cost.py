@@ -42,11 +42,14 @@ class Rig:
     def __init__(self, tmp, lease: bool, timeout_ms=2000):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
-        from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
         from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+        from sglang.test.dsv41_ram_miss_fixtures import image_tables
 
         self.lease = lease
+        # The checkpoint in a subdirectory: image_tables writes its image root beside it, so both stay under tmp.
+        tmp = Path(tmp) / "ckpt"
+        tmp.mkdir()
         write_fake_exl3(str(tmp), num_layers=LAYERS, num_experts=EXPERTS, hidden=1024, inter=512, finite=True)
         self.layout = build_exl3_expert_layout(str(tmp))
         self.fmt = Exl3ExpertFormat(self.layout, 0, direct=False)
@@ -54,10 +57,11 @@ class Rig:
         self.names = EXL3_STREAMED_NAMES
         self.slabs = {lid: {n: allocate_host_slab(CAPACITY, self.specs[n].row_shape, self.specs[n].dtype, register=True)
                             for n in self.names} for lid in range(LAYERS)}
-        tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
+        # Row images are the only reader (plan 2026-09-29-hotpath-zero-overhead D4), read with O_DIRECT.
+        tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp)
         self.page = new_page(pin=True)
         slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
-        self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
+        self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map)
         kw = {}
         if lease:
             self.host.enable_lease_mode()

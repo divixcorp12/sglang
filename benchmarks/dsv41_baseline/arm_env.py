@@ -4,8 +4,8 @@ Env names and the option-C EXL3 budget (graph gather on, prefetch off, the faste
 measured DSV4.1 recipe, DSV41_REFERENCE.md section 17.6) originally came from
 `divix01:/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/
 env-full.sh` (layered onto phase 3a's `env.sh`). The current default additionally
-enables DIRECT insert on miss, RAM miss leases, eight RAM miss pack workers,
-two-phase RAM-miss copies with piece streaming, a NUMA-placed 100 GiB pinned tier,
+enables DIRECT insert on miss, two-phase RAM-miss copies with piece streaming (the
+RAM-miss service always reads row images, in lease mode), a NUMA-placed 100 GiB pinned tier,
 the fused expert graph planner, and Engram host-node io_uring lookups; it
 must be measured as a new recipe, not compared as a historical phase-3b baseline.
 A V2 storage change under test is
@@ -157,15 +157,10 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
         "SGLANG_MOE_EXPERT_FUSED_PLAN": "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
-        "SGLANG_DSV41_ENABLE_RAM_MISS_LEASES": "1",
-        "SGLANG_DSV41_RAM_MISS_PACK_WORKERS": "8",
         # Two-phase RAM-miss copies with piece streaming (DSV41_REFERENCE.md section 24).
         "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE": "1",
         "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100",
         "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM": "1",
-        # Reads land straight in the pinned slabs, no pack workers (section 24.9). Needs the row images built on
-        # every mirror root by scripts/dsv41/build_row_images.py; startup refuses a root without a matching set.
-        "SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES": "1",
         # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical
         # (docs/superpowers/plans/2026-09-25-dsv41-layer-fusion.md).
         "SGLANG_DSV41_ENABLE_LAYER_FUSION": "1",
@@ -184,7 +179,8 @@ def base_env() -> dict[str, str]:
         "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
         # Prefill's pinned-tier misses read by the RAM-miss service's reader straight into the slabs, a layer's reads
         # issued up front: TTFT 21.06/17.79 -> 12.05/11.14 s, decode unchanged, byte-identical (DSV41_REFERENCE.md 27.6).
-        # Needs the row images above.
+        # Reads the row images the RAM-miss service always reads (built on every mirror root by
+        # scripts/dsv41/build_row_images.py; startup refuses a root without a matching set).
         "SGLANG_DSV41_ENABLE_PREFILL_FILLS": "1",
         # Fewer fp16/bf16 casts around the EXL3 gemvs at BS1 decode: 358 fewer kernels per step, bit-identical,
         # 112.4 -> 111.8 ms/token (within noise; DSV41_REFERENCE.md 27.8).

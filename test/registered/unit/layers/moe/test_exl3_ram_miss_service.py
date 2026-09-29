@@ -120,6 +120,25 @@ def test_the_service_refuses_a_mirror_configuration_the_eager_source_refuses(tie
             caches[1].ensure_rows(torch.tensor([4]))
 
 
+def _start_service_on_mirrors_without_images(tiers, tmp_path):
+    """Start the ``tiers`` service over a mirror root that holds a copy of the checkpoint's shards and no
+    exl3_row_images: a checkpoint nobody converted."""
+    service, streamers, caches = tiers
+    root = tmp_path.parent / f"{tmp_path.name}_mirror_without_images"
+    shutil.copytree(tmp_path, root)
+    assert not (root / "exl3_row_images").exists()
+    with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(str(root)):
+        service.ensure_started()
+
+
+def test_the_service_refuses_a_checkpoint_without_row_images(tiers, tmp_path):
+    """Row images are mandatory (D4): mirror roots without exl3_row_images refuse at startup, naming the converter."""
+    service, streamers, caches = tiers
+    with pytest.raises((RuntimeError, ValueError), match="build_row_images"):
+        _start_service_on_mirrors_without_images(tiers, tmp_path)
+    assert service.host is None, "a refused start left a host behind"
+
+
 def test_rows_the_thread_loads_reach_the_eager_map_on_next_host_use(tiers):
     service, streamers, caches = tiers
     service.ensure_started()
@@ -189,8 +208,7 @@ def test_attach_registers_once_and_pushes_residency(tiers):
 
 def test_gpu_hot_snapshot_handoff_keeps_seed_protection_then_uses_device_map(tiers):
     service, streamers, caches = tiers
-    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
-        service.ensure_started()
+    service.ensure_started()
     table = caches[0]._lru
     # The initial reassignment predates the updater: this path must use the
     # Python hot list until the GPU bank has been created.
@@ -245,22 +263,20 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
     updater.insert_direct = True
     updater.streamers = [streamer]
     with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"):
-        with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(False):
-            with pytest.raises(ValueError, match="ENABLE_RAM_MISS_LEASES=1"):
-                updater.check_miss_plans()
-        with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
-            # Two-phase copies hit lanes into the same DIRECT destinations before the NVMe rows land,
-            # and a failed request fail-stops the process, so it composes with DIRECT.
-            with envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True):
-                updater.check_miss_plans()
-            with envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(True):
-                with pytest.raises(ValueError, match="ENABLE_EXPERT_PREFETCH=0"):
-                    updater.check_miss_plans()
-            streamer.row_backend = object()
-            with pytest.raises(ValueError, match="native EXL3 RAM-miss backend"):
-                updater.check_miss_plans()
-            streamer.row_backend = backend
+        # Leases are unconditional (the RAM-miss service always runs in lease mode), so DIRECT needs no lease switch.
+        updater.check_miss_plans()
+        # Two-phase copies hit lanes into the same DIRECT destinations before the NVMe rows land,
+        # and a failed request fail-stops the process, so it composes with DIRECT.
+        with envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True):
             updater.check_miss_plans()
+        with envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(True):
+            with pytest.raises(ValueError, match="ENABLE_EXPERT_PREFETCH=0"):
+                updater.check_miss_plans()
+        streamer.row_backend = object()
+        with pytest.raises(ValueError, match="native EXL3 RAM-miss backend"):
+            updater.check_miss_plans()
+        streamer.row_backend = backend
+        updater.check_miss_plans()
     with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("always"):
         with pytest.raises(ValueError, match="PREFETCH_PULL_MODE=off"):
             updater.check_miss_plans()
@@ -504,7 +520,7 @@ def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl)
     """SGLANG_DSV41_ENABLE_LEASE_PDL -> Dsv41Config -> the service -> ExpertStreamDevice(lease_pdl=...), which passes
     it to the six chain launchers (test_exl3_ram_miss_device_args.py)."""
     service, streamers, caches = tiers
-    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True), envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(pdl):
+    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(pdl):
         _attach_all(service, streamers)
     assert service.lease_pdl is pdl and service.device_side.lease_pdl is pdl
     with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(not pdl):
@@ -512,30 +528,28 @@ def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl)
     assert service.device_side.lease_pdl is pdl
 
 
-def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_with_the_hosts_block(tiers, monkeypatch):
-    """One env read (ensure_started) feeds both sides, so the device's arming and the service's leasing cannot disagree."""
+def test_the_service_always_leases_configuring_the_host_before_its_thread_and_the_device_with_the_hosts_block(
+    tiers, monkeypatch
+):
+    """Lease mode is unconditional (row images need it): the host is put in lease mode before its thread starts, and
+    the device always carries the host's lease block, so the device's arming and the service's leasing cannot
+    disagree."""
     service, streamers, caches = tiers
     order = []
     enable, start = module.ExpertStreamHost.enable_lease_mode, module.ExpertStreamHost.start_thread
     monkeypatch.setattr(module.ExpertStreamHost, "enable_lease_mode", lambda self: (order.append("lease"), enable(self))[1])
     monkeypatch.setattr(module.ExpertStreamHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
-    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True):
-        _attach_all(service, streamers)
+    _attach_all(service, streamers)
     assert order == ["lease", "thread"] and service.lease_mode is True
     device = service.device_side
     assert device.lease_block is service.host.lease_block  # the block the host writes, not a second one
     assert device.go_count is not None and device.go_count.dtype == torch.int32 and device.go_count.shape == (1,)
-    # The env is read once, when the service starts: flipping it afterwards changes nothing.
-    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(False):
-        service.ensure_started()
-    assert service.lease_mode is True
 
 
 def test_piece_stream_refuses_without_two_phase(tiers):
-    """Config/env refusal (piece-streaming plan Sec 4.4): piece streaming is a mode of two-phase. (Converted from
-    test_piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold: its no_lease case is refused first by
-    the row images' own lease check, and its no_pack_workers case is accepted, since the one reader publishes each
-    piece itself.)"""
+    """Config/env refusal (piece-streaming plan Sec 4.4): piece streaming is a mode of two-phase, its one remaining
+    need. (Converted from test_piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold: leases are
+    unconditional and the row-image reader publishes each piece itself, so neither of its other cases exists.)"""
     service, streamers, caches = tiers
     with (
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
@@ -545,13 +559,11 @@ def test_piece_stream_refuses_without_two_phase(tiers):
             service.ensure_started()
 
 
-def test_piece_stream_is_accepted_by_the_config_refusal_once_all_three_hold(tiers):
+def test_piece_stream_is_accepted_by_the_config_refusal_with_two_phase(tiers):
     service, streamers, caches = tiers
     with (
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
-        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
     ):
         service.ensure_started()
     assert service.piece_stream is True
@@ -566,9 +578,7 @@ def test_piece_stream_reaches_the_host_reader_before_its_thread_and_only_when_on
     monkeypatch.setattr(module.ExpertStreamHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
     with (
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(piece_stream),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
-        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
     ):
         service.ensure_started()
     assert order == (["piece", "thread"] if piece_stream else ["thread"])
@@ -603,9 +613,7 @@ def _attach_with_copy_tables(service, streamers, *, drop_name=None):
 def _piece_stream_env():
     return (
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
-        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(1),
     )
 
 
@@ -614,8 +622,8 @@ def test_piece_stream_builds_the_stream_chain_on_the_device_side_and_every_backe
     backend streams, with a segment map per copy table naming each row segment's entry. (The chain's kernels and
     graph shape are the GPU tests' business: test/manual/dsv41/test_exl3_piece_stream_cuda.py.)"""
     service, streamers, caches = tiers
-    a, b, c, d = _piece_stream_env()
-    with a, b, c, d:
+    a, b = _piece_stream_env()
+    with a, b:
         tables = _attach_with_copy_tables(service, streamers)
     dev = service.device_side
     assert dev.piece_stream is True
@@ -633,8 +641,8 @@ def test_piece_stream_builds_the_stream_chain_on_the_device_side_and_every_backe
 
 def test_piece_stream_refuses_a_copy_table_missing_a_streamed_name(tiers):
     service, streamers, caches = tiers
-    a, b, c, d = _piece_stream_env()
-    with a, b, c, d, pytest.raises(ValueError, match="no entry for streamed names"):
+    a, b = _piece_stream_env()
+    with a, b, pytest.raises(ValueError, match="no entry for streamed names"):
         _attach_with_copy_tables(service, streamers, drop_name=2)
 
 
@@ -689,16 +697,13 @@ def test_attach_refuses_a_lease_block_of_another_abi_version(tiers, monkeypatch)
     monkeypatch.setattr(
         module.ExpertStreamHost, "lease_header", lambda self: {**header(self), "abi_version": lease.ABI_VERSION + 1}
     )
-    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True), pytest.raises(RuntimeError, match="ABI version"):
+    with pytest.raises(RuntimeError, match="ABI version"):
         _attach_with_copy_tables(service, streamers)
 
 
 def test_without_piece_stream_the_backends_do_not_stream(tiers):
     service, streamers, caches = tiers
-    with (
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
-    ):
+    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True):
         _attach_with_copy_tables(service, streamers)
     assert service.device_side.piece_stream is False and service.device_side.piece_runs is None
     assert all(s.row_backend.piece_stream is False and s.row_backend.stream_maps is None for s in streamers.values())
@@ -1151,9 +1156,8 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     # monkeypatch, not envs.override: override restores nothing when an exception leaves its block, so a mutant that
     # reaches enable_copy_engine here would leak the copy-engine config into every later test.
-    for name in ("COPY_ENGINE", "PIECE_STREAM", "LEASES", "TWO_PHASE"):
+    for name in ("COPY_ENGINE", "PIECE_STREAM", "TWO_PHASE"):
         monkeypatch.setenv(f"SGLANG_DSV41_ENABLE_RAM_MISS_{name}", "1")
-    monkeypatch.setenv("SGLANG_DSV41_RAM_MISS_PACK_WORKERS", "1")
     if value == "EAGER":
         with pytest.raises(_CopyEngineReached):
             service.ensure_started()

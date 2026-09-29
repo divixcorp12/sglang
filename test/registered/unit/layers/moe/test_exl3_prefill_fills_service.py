@@ -30,7 +30,7 @@ def hang_guard():
     faulthandler.cancel_dump_traceback_later()
 
 
-def _build(tmp_path, *, row_images=True, fills=True, device="cpu"):
+def _build(tmp_path, *, fills=True, device="cpu"):
     source = tmp_path / "ckpt"
     source.mkdir()
     write_fake_exl3(str(source), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
@@ -44,8 +44,6 @@ def _build(tmp_path, *, row_images=True, fills=True, device="cpu"):
         (envs.SGLANG_MOE_EXPERT_ROW_SOURCE, "shards"),
         (envs.SGLANG_MOE_EXPERT_GRAPH_GATHER, True),
         (envs.SGLANG_MOE_EXPERT_MIRROR_DIRS, str(root)),
-        (envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES, True),
-        (envs.SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, row_images),
         (envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS, fills),
     ):
         stack.enter_context(env.override(value))
