@@ -138,6 +138,20 @@ The plan wrote the mutants against its own shapes. Each is mapped to the committ
     snapshot answered on the caller while the service idles is still consistent.
   - `test_a_set_hot_burst_past_the_ring_is_applied_in_order`: see concern 1 in the report; the timing assertion cannot
     tell a queued burst from a direct one.
+
+  **B3 fix round (b1e0201af0): the burst test now kills M3 without TSan.** It times the burst before `sim_wait`, not
+  after the 300 ms read. Queued, the 65th `set_hot` waits for the service to drain the full ring at the end of the
+  read (~0.25 s); applied directly, the burst takes about 1 ms. Laptop, private worktree
+  `…/535dc605…/scratchpad/wt-b3f-red` at `b1e0201af0`. Command:
+  `PYTHONPATH=$S/stubs OMP_NUM_THREADS=4 MUTANTS_TMP=$S/b3f_mut_tmp systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=0 $PY analysis/dsv41-drive/hotpath/mutants.py --python $PY --only M3 --no-tsan`
+  (`EXIT=0`; `sglang.__file__` under the worktree's `python/`; `git status --short` empty afterwards).
+
+  | target | mutant run (exit) | restored run (exit) |
+  |---|---|---|
+  | `test_unpaused_eager_calls_refuse_or_snapshot` | 1 passed (0) | 1 passed (0) |
+  | `test_a_set_hot_burst_past_the_ring_is_applied_in_order` | **1 failed (1)**: `the burst returned in 0.001 s, while the read ran: nothing was queued` | 1 passed (0) |
+
+  M3 is now KILLED by a registered test as well as by the TSan stress child.
 - **M4b:** `test_exl3_ram_miss_copy_engine.py` (1 failed) and `test_expert_stream_hotpath_golden.py` (2 failed: the
   script's `copy` step then shows the miss lane released).
 - **M5b:** TSan's stress child. It is a data race:
