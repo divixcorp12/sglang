@@ -16,6 +16,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #if defined(IO_URING_VERSION_MAJOR) && \
     (IO_URING_VERSION_MAJOR > 2 || (IO_URING_VERSION_MAJOR == 2 && IO_URING_VERSION_MINOR >= 10))
@@ -90,7 +91,9 @@ class UringReader {
       try {
         if (outstanding_ != 0) drain(outstanding_);
       } catch (...) {
-        std::terminate();  // Never let a caller free memory that the kernel might still own.
+        // A refused NOP drain throws after closing the ring with nothing left in the kernel: safe to go on. Anything
+        // else might leave memory the kernel still owns, so never let the caller free it.
+        if (ready_ || outstanding_ != 0) std::terminate();
       }
       close_ring();
       if (options_.diagnostics && fixed_reads_ != 0) report_fixed();
@@ -175,6 +178,11 @@ class UringReader {
   }
   uint64_t fanout_sqes() const {
     return fanout_sqes_;
+  }
+  // How many times the ring's resources were registered: 1 per configure_resources, +1 per ring reset. Cold path
+  // only (tests read it to prove a drain kept the registered tier).
+  uint64_t registrations() const {
+    return registrations_;
   }
   bool prep_readv_fixed(int fd, const iovec* iov, unsigned count, uint64_t off, int buffer, uint64_t tag) {
     require_ready();
@@ -268,32 +276,54 @@ class UringReader {
     const unsigned unsubmitted = std::min(pending, io_uring_sq_ready(&ring_));
     while (outstanding_ > unsubmitted)
       wait_one();
-    if (unsubmitted != 0) {
+    if (unsubmitted == 0) return;
+    // Discard them on the same ring, as NOPs, so the registered buffer table and file table survive. Re-creating the
+    // ring re-registered the whole tier: 59 s for 107 GB on divix01 (analysis/dsv41-drive/uring-reg/results.md),
+    // past RamThread's 30 s fatal_wait, which aborts a request held in service that long.
+    const int refused = flush_as_nops(unsubmitted);
+    if (refused == 0) return;
+    // The kernel refused the NOP submission. What is left never entered the kernel, so the ring can close now.
+    close_ring();
+    outstanding_ = 0;
+    // A fixed read mode never resets: re-registering its buffers would outlast fatal_wait, so the watchdog would abort
+    // with a misleading "request stayed in service". Fail stop now, naming the cause. The reader is closed (ready()
+    // false), as after a failed reset below.
+    if (fixed_reads())
+      throw std::runtime_error(
+          std::string("expert stream io_uring: the kernel refused the NOP drain of unconsumed reads (") +
+          std::strerror(-refused) + "); re-registering the fixed buffers would exceed the watchdog's fatal_wait, so "
+          "the reader is closed instead of resetting its ring");
+    // Without registered buffers the reset is cheap (at most the fixed file table).
+    // A failed reset leaves the reader closed (ready() false, so a later read() returns 0 and close() has nothing
+    // to settle) and throws its reason to the caller: "io_uring ring reset failed", create_ring's own error, or
+    // register_resources' refusal.
+    const bool injected = reset_fail_;
+    reset_fail_ = false;
+    if (injected || !create_ring()) throw std::runtime_error("io_uring ring reset failed");
+    try {
+      register_resources();
+    } catch (...) {
       close_ring();
-      outstanding_ = 0;
-      // In a fixed read mode the reset re-registers the whole tier: about 59 s at tier scale (the plan's Task 10,
-      // 90 GiB), past RamThread's 30 s fatal_wait, so one submit failure that leaves SQEs unconsumed likely
-      // fail-stops the server. Keeping the ring and rewriting the unconsumed SQEs as IORING_OP_NOP (clearing
-      // IOSQE_FIXED_FILE; they still belong to userspace) would avoid both the re-registration and most of this
-      // failure path: a follow-up.
-      // A failed reset leaves the reader closed (ready() false, so a later read() returns 0 and close() has nothing
-      // to settle) and throws its reason to the caller: "io_uring ring reset failed", create_ring's own error, or
-      // register_resources' refusal.
-      const bool injected = reset_fail_;
-      reset_fail_ = false;
-      if (injected || !create_ring()) throw std::runtime_error("io_uring ring reset failed");
-      try {
-        register_resources();
-      } catch (...) {
-        close_ring();
-        throw;
-      }
-      diagnostics();
+      throw;
     }
+    diagnostics();
   }
 
-  // Test only (fault word ring_reset_fail, through FaultyReader): the next reset in drain() fails as if create_ring()
-  // had, after closing the old ring. Fires once.
+  // Test only (fault word 30 bit 0, through FaultyReader): the next drain() that discards unconsumed SQEs finds its
+  // NOP submission refused (EIO), as if the kernel had failed it. Fires once.
+  void set_nop_flush_refused(bool refused) {
+    nop_flush_refused_ = refused;
+  }
+  // Test only: publishes the prepared SQEs to the kernel's SQ tail without entering the kernel, as liburing's submit
+  // does before an io_uring_enter that then fails. drain() must treat them as unconsumed and NOP them too.
+  void publish_sq_without_enter() {
+    if (options_.sqpoll()) throw std::logic_error("publish_sq_without_enter needs a ring without SQPOLL");
+    ring_.sq.sqe_head = ring_.sq.sqe_tail;
+    __atomic_store_n(ring_.sq.ktail, ring_.sq.sqe_tail, __ATOMIC_RELEASE);
+  }
+
+  // Test only (fault word 30 bit 1, through FaultyReader): the next reset in drain() (a refused NOP drain outside
+  // the fixed read modes) fails as if create_ring() had, after closing the old ring. Fires once.
   void set_ring_reset_fail(bool fail) {
     reset_fail_ = fail;
   }
@@ -364,9 +394,10 @@ class UringReader {
     return true;
   }
   // Registers the fixed files, then every region as row-aligned chunks in a sparse buffer table (also on drain()'s
-  // ring reset, which re-creates the table and re-adds every chunk). Any failure is an explicit error (refuse), never
-  // a fallback to unregistered reads.
+  // fallback ring reset, taken only outside the fixed read modes when the kernel refuses the NOP drain). Any failure
+  // is an explicit error (refuse), never a fallback to unregistered reads.
   void register_resources() {
+    ++registrations_;
     if (!files_.empty()) {
       const int rc = io_uring_register_files(&ring_, files_.data(), static_cast<unsigned>(files_.size()));
       if (rc < 0) error("registering fixed files", rc);
@@ -476,6 +507,41 @@ class UringReader {
     if (rc < 0) std::terminate();
     retire(cqe);
   }
+  // Rewrites the last `n` prepared SQEs, none consumed by the kernel, as NOPs, then submits and retires them. Without
+  // SQPOLL the kernel reads an SQE only inside io_uring_enter, so positions [sqe_tail - n, sqe_tail) still belong to
+  // this thread, whether or not an earlier submit flushed them to the kernel's tail. create_ring never sets SQE128,
+  // so an SQE's slot is its position. The whole SQE is zeroed: liburing's prep_* helpers leave flags
+  // (IOSQE_FIXED_FILE) and buf_index to get_sqe. Returns 0, or the refusing submit's negative errno: every NOP the
+  // kernel consumed has then retired, and the rest stay unconsumed and counted in outstanding_.
+  int flush_as_nops(unsigned n) {
+    const unsigned tail = ring_.sq.sqe_tail;
+    for (unsigned i = tail - n; i != tail; ++i) {
+      io_uring_sqe* sqe = &ring_.sq.sqes[i & ring_.sq.ring_mask];
+      std::memset(static_cast<void*>(sqe), 0, sizeof(*sqe));
+      io_uring_prep_nop(sqe);
+      io_uring_sqe_set_data64(sqe, kNopTag);
+    }
+    int refused = nop_flush_refused_ ? -EIO : 0;
+    nop_flush_refused_ = false;
+    // EAGAIN (no request memory), EBUSY and EINTR are transient: retry with a backoff for up to kNopRetryWindow, well
+    // under fatal_wait, before refusing (a refusal fail-stops a fixed read mode).
+    const auto give_up = std::chrono::steady_clock::now() + kNopRetryWindow;
+    auto backoff = std::chrono::microseconds(10);
+    while (refused == 0 && io_uring_sq_ready(&ring_) != 0) {
+      const int rc = io_uring_submit(&ring_);
+      if (rc >= 0) continue;
+      if (!soft_error(rc) || std::chrono::steady_clock::now() >= give_up) {
+        refused = rc;
+      } else {
+        std::this_thread::sleep_for(backoff);
+        backoff = std::min(backoff * 2, std::chrono::microseconds(10000));
+      }
+    }
+    const unsigned unconsumed = io_uring_sq_ready(&ring_);
+    while (outstanding_ > unconsumed)
+      wait_one();  // a NOP completes at issue; IOPOLL rings retire it through the same reap loop
+    return refused;
+  }
   void diagnostics() const {
     if (!options_.diagnostics) return;
     std::fprintf(
@@ -525,7 +591,13 @@ class UringReader {
   size_t chunk_cap_ = sglang::io::kMaxRegisteredBufferBytes;
   uint64_t fixed_reads_ = 0, fixed_cuts_ = 0, fanout_sqes_ = 0, next_report_ = uint64_t{1} << 16;
   double register_ms_ = 0;
+  uint64_t registrations_ = 0;  // register_resources() calls (registrations())
   bool reset_fail_ = false;  // test only (set_ring_reset_fail)
+  bool nop_flush_refused_ = false;                  // test only (set_nop_flush_refused)
+  // A discarded SQE's user_data (drain retires it unread). Not ~0: that is liburing's LIBURING_UDATA_TIMEOUT, whose
+  // CQEs its peek swallows on kernels without IORING_FEAT_EXT_ARG.
+  static constexpr uint64_t kNopTag = ~uint64_t{0} - 1;
+  static constexpr std::chrono::milliseconds kNopRetryWindow{2000};  // soft errors on the NOP submit, then refuse
 };
 
 static_assert(AsyncFileReader<UringReader>);

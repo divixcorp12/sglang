@@ -67,9 +67,12 @@ struct ReadFault {
   // Fixed reads (Task 7): narrows part_error, part_short (and short_is_eof), cqe_error and hold_ordinal to the
   // completions of leg `leg` of a fanned-out read (-1: any leg). Default reads are one leg, leg 0.
   int64_t leg = -1;
-  // The next ring reset fails (SubmitFault::ring_reset_fail): with a submit fault that leaves SQEs unconsumed, the
-  // failure-path drain's reset throws "io_uring ring reset failed" and read() must rethrow it, not abort.
+  // Word 30 bit 1: the next ring reset fails (SubmitFault::ring_reset_fail). With a submit fault that leaves SQEs
+  // unconsumed and a refused NOP drain (bit 0, implied), the failure-path drain's reset throws "io_uring ring reset
+  // failed" and read() must rethrow it, not abort.
   bool ring_reset_fail = false;
+  // Word 30 bit 0: the drain's NOP submission of unconsumed SQEs is refused (SubmitFault::nop_flush_refused).
+  bool nop_flush_refused = false;
 };
 
 // A packing worker's chunk stamp: the same gated clock as every other stamp (a job is armed with it only
@@ -85,7 +88,8 @@ inline int64_t worker_stamp(const void* trace) {
 // one chunk per worker); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
 // streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27
 // last_publish_delay_ns. Word 28 (fixed_chunk_cap, not a fault) caps the registered-buffer chunk size before the
-// reader opens (0: 1 GiB), word 29 is leg, word 30 ring_reset_fail and word 31 (leg_cut_cap, not a fault) cuts every
+// reader opens (0: 1 GiB), word 29 is leg, word 30 the ring-reset bits (bit 0 nop_flush_refused, bit 1
+// ring_reset_fail) and word 31 (leg_cut_cap, not a fault) cuts every
 // read at that many bytes before the reader opens (0: READ_CUTS and the device limits). Keep the layout in step with _fault_tensor
 // in ops/moe/expert_stream_transport.py.
 constexpr int64_t kFaultWords = 32;
@@ -116,7 +120,8 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.hold_until_probe_ms = f[26];
   fault.last_publish_delay_ns = f[27];
   fault.leg = f[29];
-  fault.ring_reset_fail = f[30] != 0;
+  fault.nop_flush_refused = (f[30] & 1) != 0;
+  fault.ring_reset_fail = (f[30] & 2) != 0;
   return fault;
 }
 

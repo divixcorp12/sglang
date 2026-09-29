@@ -136,10 +136,11 @@ class ReaderCore {
     if (fault.generation_start != 0) generation_ = static_cast<uint32_t>(fault.generation_start);
     if constexpr (requires { io_.set_submit_fault(SubmitFault{}); }) {
       io_.set_submit_fault(SubmitFault{
-          fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call, fault.ring_reset_fail});
+          fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call, fault.ring_reset_fail,
+          fault.nop_flush_refused});
     } else if (
         fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0 ||
-        fault.ring_reset_fail) {
+        fault.ring_reset_fail || fault.nop_flush_refused) {
       // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs the readers
       // (AnyReader) with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above
       // always fires there. This is the fallback for a Reader that cannot inject submit faults at all.
