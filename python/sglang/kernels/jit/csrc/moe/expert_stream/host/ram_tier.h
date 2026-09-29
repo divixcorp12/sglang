@@ -41,6 +41,9 @@ class RamTier {
  public:
   using Layout = typename Source::LayoutType;
   using Build = typename Source::BuildType;  // ProdBuild or InstrBuild (build_policy.h)
+  using Engine = CopyEngine<Build, RamTier>;
+  // The copy engine calls copy_completed, copy_acked and copy_failed, and reads stats_ for its latency max.
+  friend Engine;
 
   RamTier(
       uint8_t* page,
@@ -536,15 +539,11 @@ class RamTier {
     } else {
       backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device));
     }
-    auto engine = std::make_unique<CopyEngine<Build>>(
+    auto engine = std::make_unique<Engine>(
         std::move(backend),
         layers_,
         spin_ns,
-        &copy_core_,
-        &stats_,
-        [this](const CopyJob& job) { return copy_completed(job); },
-        [this](const CopyJob& job) { return copy_acked(job); },
-        [this](const CopyJob& job, int error) { copy_failed(job, error); },
+        this,
         std::string(Layout::kName) + " RAM miss copy engine: ",
         std::string(Layout::kName) + "-copy-eng");
     engine->start();
@@ -1297,7 +1296,9 @@ class RamTier {
     }
   }
 
-  // Copy thread. Completion cannot be established: the leases stay held (E5) and the page fails stop.
+  // Copy thread, or the submitter when the copy engine's job ring is full (an internal error: error -1000).
+  // Completion cannot be established: the leases stay held (E5) and the page fails stop. The message is built only
+  // here, on the error path.
   void copy_failed(const CopyJob& job, int error) {
     std::fprintf(
         stderr,
@@ -2004,7 +2005,7 @@ class RamTier {
   int64_t lease_c_ = 0;                 // byte offset of area C (CopyDone)
   bool piece_stream_ = false;           // set before the service thread starts, with the reader's flag
   // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
-  std::unique_ptr<CopyEngine<Build>> copy_engine_;
+  std::unique_ptr<Engine> copy_engine_;
   std::atomic<bool> copy_armed_{false};
   // Native prefetch: the page (null when off), the last request generation read (service thread), the one lease a
   // prefetch holds (at most one is outstanding: the device waits for its done word before posting the next), and per

@@ -37,7 +37,7 @@ REC_SEQ = 0
 REC_STATUS = 10
 
 
-def build_host(tmp_path, *, variant=None, threaded=False):
+def build_host(tmp_path, *, variant=None, threaded=False, copy_spin_us=200):
     s = ram_miss_setup(tmp_path, capacity=CAPACITY, layers=LAYERS, experts=EXPERTS, row_images=True,
                        mirror_weights=(1.0, 1.0))
     page = new_page(pin=False)
@@ -47,7 +47,7 @@ def build_host(tmp_path, *, variant=None, threaded=False):
     host.enable_lease_mode()
     host.enable_two_phase()
     host.enable_piece_stream()
-    host.enable_copy_engine(-1, spin_us=200)
+    host.enable_copy_engine(-1, spin_us=copy_spin_us)
     dst = {}
     for row in range(LAYERS):
         dst[row] = {n: torch.zeros((DST_ROWS,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[row].items()}

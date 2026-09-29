@@ -238,8 +238,8 @@ NON_TRACE_CLOCK_READS = {
     # through it) and stop()'s drain deadline, which the copy thread reads only once a stop was asked for.
     "if (now_ns() > deadline_ns) return false;": 1,
     "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
-    "drain_deadline_ = now_ns() + drain_ns;": 1,
-    "if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline)) break;": 1,
+    "drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);": 1,
+    "if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;": 1,
     # Metrics, compiled only into InstrBuild (each inside `if constexpr (Build::kMetrics)`): copy_issue_ns, the copy
     # latency's submit and completion reads, and native prefetch's prefetch_latency_ns pair.
     "if constexpr (Build::kMetrics) start = now_ns();  // copy_issue_ns, a metric": 1,

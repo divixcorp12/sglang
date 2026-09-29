@@ -1,6 +1,6 @@
-// LD_PRELOAD counting shim for plan 2026-09-29-hotpath-zero-overhead: counts allocator, mutex, condvar, clock and
-// sleep calls made by the RAM-miss service thread (a name ending "-ram-miss") and the copy-engine thread ("-copy-eng")
-// while armed. Test only; never loaded in production.
+// LD_PRELOAD counting shim for plan 2026-09-29-hotpath-zero-overhead: counts allocator, mutex, condvar, clock,
+// sleep and futex calls made by the RAM-miss service thread (a name ending "-ram-miss") and the copy-engine thread
+// ("-copy-eng") while armed. Test only; never loaded in production.
 //
 // At ba01695c35 the two threads name themselves Layout::kName + "-ram-miss" (ram_thread.h, RamThread::run) and
 // Layout::kName + "-copy-eng" (ram_tier.h -> copy_engine.h, CopyEngine::run), truncated to 15 bytes; for the exl3
@@ -12,21 +12,24 @@
 //   - allocations libc makes internally (e.g. inside fopen, qsort, getaddrinfo or the dynamic loader), which call
 //     the allocator without going through the interposed PLT symbols;
 //   - pthread_rwlock_* and std::shared_mutex (not interposed), and any lock that is not a pthread mutex;
-//   - raw futex syscalls, std::atomic::wait/notify and std::counting_semaphore, which never enter pthread_mutex_* or
-//     pthread_cond_*;
+//   - futex calls that do not go through libc's syscall() (glibc's own lock internals, inline-asm syscalls,
+//     std::atomic::wait/notify and std::counting_semaphore); only syscall(SYS_futex, ...) is counted, which is how
+//     spsc_ring.h's futex_wait/futex_wake enter the kernel;
 //   - clock reads that skip clock_gettime: rdtsc, the vDSO called directly, gettimeofday/time(), and clock_gettime
 //     calls made from inside libc itself;
 //   - sleeps other than nanosleep/clock_nanosleep (usleep, sched_yield, poll/epoll/select timeouts).
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
 
-enum { kMalloc, kFree, kMutex, kCond, kClock, kSleep, kKinds };
+enum { kMalloc, kFree, kMutex, kCond, kClock, kSleep, kFutex, kKinds };
 static _Atomic long counts[2][kKinds];
 static _Atomic long threads_seen[2];
 static _Atomic int armed;
@@ -70,6 +73,7 @@ static int (*real_clock_gettime)(clockid_t, struct timespec*);
 static int (*real_nanosleep)(const struct timespec*, struct timespec*);
 static int (*real_clock_nanosleep)(clockid_t, int, const struct timespec*, struct timespec*);
 static int (*real_setname)(pthread_t, const char*);
+static long (*real_syscall)(long, ...);
 
 __attribute__((constructor)) static void resolve(void) {
   real_mutex_lock = dlsym(RTLD_NEXT, "pthread_mutex_lock");
@@ -83,6 +87,7 @@ __attribute__((constructor)) static void resolve(void) {
   real_nanosleep = dlsym(RTLD_NEXT, "nanosleep");
   real_clock_nanosleep = dlsym(RTLD_NEXT, "clock_nanosleep");
   real_setname = dlsym(RTLD_NEXT, "pthread_setname_np");
+  real_syscall = dlsym(RTLD_NEXT, "syscall");
 }
 
 // A hook still NULL when it is first called (a call made before the constructor ran, e.g. from another preloaded
@@ -100,6 +105,20 @@ int pthread_cond_broadcast(pthread_cond_t* c) { COUNT(kCond); RESOLVE(real_cond_
 int clock_gettime(clockid_t k, struct timespec* t) { COUNT(kClock); RESOLVE(real_clock_gettime, "clock_gettime"); return real_clock_gettime(k, t); }
 int nanosleep(const struct timespec* a, struct timespec* b) { COUNT(kSleep); RESOLVE(real_nanosleep, "nanosleep"); return real_nanosleep(a, b); }
 int clock_nanosleep(clockid_t k, int f, const struct timespec* a, struct timespec* b) { COUNT(kSleep); RESOLVE(real_clock_nanosleep, "clock_nanosleep"); return real_clock_nanosleep(k, f, a, b); }
+
+// syscall(2) takes up to six word-sized arguments after the number; forwarding all six is what glibc's own wrapper
+// reads, whatever the call. Only SYS_futex is counted (the copy engine's futex_wait on the copy thread, futex_wake on
+// the service thread).
+long syscall(long number, ...) {
+  va_list args;
+  va_start(args, number);
+  long a[6];
+  for (int i = 0; i < 6; ++i) a[i] = va_arg(args, long);
+  va_end(args);
+  if (number == SYS_futex) COUNT(kFutex);
+  RESOLVE(real_syscall, "syscall");
+  return real_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
+}
 
 int pthread_setname_np(pthread_t thread, const char* name) {
   if (pthread_equal(thread, pthread_self())) {
