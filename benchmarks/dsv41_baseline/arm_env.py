@@ -63,7 +63,10 @@ CONTEXT_LENGTH = 262144
 # 0.90 since 2026-09-26, with the hot cache 1 GiB smaller: ~815 MiB goes back to the 4096-token prefill chunk's
 # activations, and the KV pool still grows (~387k tokens). At 0.925 a smaller hot cache only grows the KV pool, and
 # 2048- and 4096-token chunks run out of memory (27.17).
-MEM_FRACTION_STATIC = 0.90
+# 0.91 since 2026-09-29: at 0.90 the KV pool no longer fit (0.14-0.17 GB available vs the 0.23 GB SWA floor) after
+# start-of-load free memory fell 0.10 GB and weights grew 0.04 GB; at 0.91: 0.52 GB spare, 191,488 KV tokens
+# (analysis/dsv41-drive/mirror-scaling/weight-pair.md on cc/spcc-weight-pair).
+MEM_FRACTION_STATIC = 0.91
 # 4096 since 2026-09-26: a chunk's cost is streaming the experts it routes to, nearly the same at 512 and 4096 tokens,
 # so a 16k prompt's TTFT fell 444 -> 107 s (27.17).
 CHUNKED_PREFILL_SIZE = 4096
