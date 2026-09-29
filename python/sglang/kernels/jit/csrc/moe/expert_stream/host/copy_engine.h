@@ -394,6 +394,7 @@ class CopyEngine {
 
  private:
   static constexpr int kRingOverflow = -1000;
+  static constexpr uint32_t kQueryEvery = 8;  // turns per query of the in-flight head (run())
   using Queue = FixedDeque<CopyJob, kCopyRing>;
 
   struct Table {
@@ -417,6 +418,7 @@ class CopyEngine {
     Queue held;    // prefetch jobs not yet issued: demand goes first on the link
     Queue acking;  // copies completed, CopyDone published; the leases wait for the copy wait's SmAck
     uint64_t idle = 0;  // empty polls since the last progress: the spin budget counts these (spec M8)
+    uint32_t query_turn = 0;  // turns since the in-flight head was last queried (kQueryEvery)
     while (true) {
       // Read before the ring: stop() is asked only after the last submit, so a stop seen here has every job in the
       // ring.
@@ -449,7 +451,14 @@ class CopyEngine {
         held.pop_front();
         issue_or_fail(next, in_flight);
       }
-      while (!in_flight.empty() && broken_ == 0) {
+      // The head mark is queried once every kQueryEvery turns, not every turn: each cuEventQuery takes a libcuda
+      // mutex, and one per _mm_pause turn was ~7,900 queries (85.6 M mutex calls) per ~2.2 ms copy job over arm CS's
+      // run (final-fix round, item 5). The turns between are an _mm_pause each, so a completion is seen at most
+      // kQueryEvery - 1 pauses (well under a microsecond) later. A completion found re-queries at once: the loop below
+      // takes every finished job in mark order, and the next turn queries again.
+      const bool query_now = ++query_turn >= kQueryEvery;
+      if (query_now) query_turn = 0;
+      while (query_now && !in_flight.empty() && broken_ == 0) {
         const int state = backend_->query(in_flight.front().token);
         if (state == CopyBackend::kPending) break;
         if (state != CopyBackend::kDone) {
@@ -465,6 +474,7 @@ class CopyEngine {
           push_or_fail(acking, done);
         }
         progressed = true;
+        query_turn = kQueryEvery - 1;  // the next job may be finishing too: query it on the next turn
       }
       const size_t acking_before = acking.size();
       acking.erase_if([this](CopyJob& waiting) {
