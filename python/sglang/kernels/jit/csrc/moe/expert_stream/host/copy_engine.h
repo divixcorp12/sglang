@@ -371,7 +371,9 @@ class CopyEngine {
     if (!thread_.joinable()) return;
     drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);
     stop_.store(true, std::memory_order_release);
-    wake_.fetch_add(1, std::memory_order_relaxed);
+    // Release, so a copy thread whose acquire load of wake_ (sleep_until_submit's `seen`) reads this bump also sees
+    // stop_ and does not sleep; one that reads the value before it fails futex_wait's compare or gets this wake.
+    wake_.fetch_add(1, std::memory_order_release);
     futex_wake(&wake_);
     thread_.join();
   }

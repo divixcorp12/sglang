@@ -883,7 +883,8 @@ class ExpertStreamHost:
     the thread runs unpaused, ``contains``, ``touch``, ``assign``, ``release`` and ``fill_begin`` raise
     ``RuntimeError`` ("... needs the service thread paused"); ``set_hot`` is queued and applied by the service before
     its next request (it returns before then); ``inject_lease`` and the snapshots (``slot_info``, ``slot_to_expert``,
-    ``lease_entry``, ``lru_order``, ``victim_census``, ``prefetch_lease``) are answered by the service and waited for;
+    ``lease_entry``, ``lru_order``, ``victim_census``, ``prefetch_lease``) are answered by the service and waited for
+    (mid-read too, unless a queued ``set_hot``/``inject_lease`` precedes them: then at the end of the request);
     ``mapping``, ``counters``, ``busy_episode`` and ``layer_rows`` read published words without waiting. Paused, or
     with no thread, every call runs at once.
     """
@@ -1059,7 +1060,9 @@ class ExpertStreamHost:
     def slot_info(self, row: int) -> list[tuple[int, int, int, int]]:
         """Per slot: (state, expert, leases, generation); state 0 FREE, 1 LOADING, 2 READY, 3 QUARANTINE (piece
         streaming: a failed read's slot a lane still leases; its expert reads -1). A snapshot: with the thread running,
-        the service answers it between requests or from inside a read."""
+        the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot`` or
+        ``inject_lease``, it waits for the end of the current request (the queue keeps its order): never take one on
+        the thread a read in service is gated on (a test's device release, say), or it waits until the watchdog."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 4, dtype=torch.int64)
         self._module.expert_stream_slot_info(self.handle, row, out)
@@ -1241,7 +1244,9 @@ class ExpertStreamHost:
 
     def set_hot(self, row: int, experts: Iterable[int]) -> None:
         """The row's hot set (never evicted). With the thread running unpaused it is queued and applied, in order,
-        before the service's next request; the call does not wait for that. At most 1024 experts per row."""
+        before the service's next request; the call does not wait for that. At most 1024 experts per row. A snapshot
+        (``slot_info`` and the others) queued after it waits for the end of the current request, since a mutator is
+        applied only between requests: so a thread that a read in service is gated on must not take one then."""
         self._check(row)
         self._module.expert_stream_set_hot(self.handle, row, _ids(e for e in experts if e >= 0))
 

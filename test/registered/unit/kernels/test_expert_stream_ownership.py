@@ -258,3 +258,28 @@ def test_a_stop_mid_pause_joins_the_running_fill_before_its_final_settle(tmp_pat
         host.inject_fault()
     finally:
         host.stop()
+
+
+def test_start_thread_refuses_a_tier_whose_fill_is_still_running(tmp_path):
+    """B3 review Important 1: a pump-mode caller that began a fill and then starts the service thread would leave the
+    service and the fill thread sharing the reader (spec 6.2/D8), and fill_end() would then run the epilogue on the
+    Python thread while the service owns the tier. start_thread refuses instead, until the fill's owner ended it; after
+    fill_end it starts, and a later fill_end has nothing owed and touches nothing."""
+    s, host = _fill_host(tmp_path)
+    try:
+        host.inject_fault(pack_delay_ns=SLOW_PACK_NS)
+        slots, _ = host.fill_begin(0, [0, 1])  # pump mode: the caller owns the tier
+        assert len(slots) == 2 and host.fill_landed() < 2  # still running
+        with pytest.raises(RuntimeError, match="fill_end"):
+            host.start_thread(fatal_wait_s=30.0)
+        assert not host.threaded
+        assert host.fill_landed() < 2, "start_thread waited for the fill instead of refusing"
+        assert host.fill_end()  # the owner (still the pump caller) joins it and runs the epilogue
+        host.release(0, slots[1])  # the epilogue ran here: the slot is no longer filling
+        host.inject_fault()
+        host.start_thread(fatal_wait_s=30.0)  # nothing owed now
+        assert host.fill_end()  # unpaused, nothing owed: no epilogue, so nothing to refuse
+        with pytest.raises(RuntimeError, match="paused"):
+            host.release(0, slots[0])  # and the service owns the tier again
+    finally:
+        host.stop()

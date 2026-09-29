@@ -564,8 +564,12 @@ class RamTier {
   // other join of fill_thread_ (resume, stop_thread's final_settle), so no two threads join it at once. The caller
   // owns the tier whenever an epilogue is owed: a fill starts only on the owner (fill_begin), and resume() joins it
   // before it hands the tier back.
+  //
+  // An owed epilogue writes the tier (finish_fill_owned), so a caller that does not own it is refused, not let race the
+  // service. RamThread::start refuses a tier with a fill owed, so this is the backstop, not the gate.
   int64_t fill_end() {
     std::lock_guard<std::mutex> caller(caller_mutex_);
+    if (fill_unfinished_) require_owner("fill_end with a prefill fill's epilogue owed");
     fill_join();
     return fill_state_.load(std::memory_order_acquire) == kFillFailed ? 0 : 1;
   }
@@ -576,6 +580,12 @@ class RamTier {
   void fill_join() {
     if (fill_thread_.joinable()) fill_thread_.join();
     if (fill_unfinished_) finish_fill_owned();
+  }
+
+  // True from fill_begin until the owner's fill_join ran the epilogue. Read under caller_mutex_ by a caller that owns
+  // the tier (RamThread::start, before the service exists): the flag is the owner's.
+  bool fill_owed() const {
+    return fill_unfinished_;
   }
 
   // Lease mode: the service reads each armed request's lane request, leases every lane's source slot and publishes

@@ -51,8 +51,20 @@ class RamThread {
     stop();
   }
 
-  // Throws when the thread cannot be pinned to cpu_core (it is then joined, never left floating).
+  // Throws when the thread cannot be pinned to cpu_core (it is then joined, never left floating), and refuses a tier
+  // whose prefill fill (begun in pump mode) still owes its epilogue: the service would then share the reader with the
+  // fill thread (the serialized issuers, spec 6.2/D8), and the epilogue would run off the owner. It refuses rather than
+  // joins: the FFI's start_thread holds the registry lock, and a join there would stall every handle's calls behind a
+  // slow or hung fill read; fill_end() first is the caller's to do. Under caller_mutex(), which also orders the
+  // set_parked/set_threaded writes below against every Python caller. The service thread never takes it, so holding
+  // it across the thread's start and pin handshake cannot deadlock.
   void start() {
+    std::lock_guard<std::mutex> caller(tier_->caller_mutex());
+    if (tier_->fill_owed()) {
+      throw std::runtime_error(
+          error_prefix<typename Tier::Layout>() +
+          "start_thread with a prefill fill running (or not yet ended): call fill_end() first");
+    }
     spin_iters_ = idle_budget(spin_ns_);  // on the caller's thread: the service thread never reads the clock to pace
     tier_->set_parked(false);
     tier_->set_threaded(true);
@@ -95,7 +107,9 @@ class RamThread {
     pause_epoch_.store(epoch);
     const int64_t deadline = now_ns() + timeout_ns;
     while (parked_epoch_.load(std::memory_order_acquire) != epoch) {
-      if (now_ns() > deadline) {
+      // A stop() racing this pause: the service is leaving and will not park for this epoch, so do not wait out the
+      // whole timeout. stop_ is its first store, threaded_ its last; either says so.
+      if (now_ns() > deadline || stop_.load(std::memory_order_acquire) || !tier_->threaded()) {
         resume_locked();
         return 0;
       }

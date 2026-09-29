@@ -693,8 +693,11 @@ struct HostExports {
 
   // 1 served a demand record, 3 a native-prefetch request, 2 an advisory record, 0 nothing posted. Refused while a
   // thread pumps. The order is the service thread's: demand, prefetch, advisory.
+  // Under caller_mutex(): pump() consumes the copy-completion ring (and owns the tier), so it is serialized against
+  // every other Python caller, whose owned calls and wait_copy_idle drain the same ring. Tests only; no hot-path cost.
   static int64_t pump(int64_t handle) {
     const auto tier = find(handle);
+    std::lock_guard<std::mutex> caller(tier->caller_mutex());
     if (tier->threaded()) throw std::runtime_error(error_prefix<Layout>() + "pump() while the service thread runs");
     if (tier->pump_demand()) return 1;
     if (tier->pump_prefetch()) return 3;
