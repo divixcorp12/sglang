@@ -183,6 +183,18 @@ def test_the_service_thread_allocates_nothing_per_request(shim, tmp_path, varian
     assert counts["service"]["malloc"] == 0 and counts["service"]["free"] == 0, counts
 
 
+def test_the_service_thread_allocates_nothing_from_its_first_request(shim, tmp_path):
+    """Final-fix round, item 5: the production server's service thread made one malloc over a whole run, and the shim's
+    call sites put it in the first read(): std::uncaught_exceptions() in read()'s quiesce guard made __tls_get_addr
+    allocate libstdc++'s per-thread exception globals on first use. With no warm-up the window starts at the thread's
+    first request, which is where that allocation showed."""
+    counts = hotpath_shim.run_child(shim, variant="prod", requests=30, warmup=0, tmp=tmp_path)
+    assert counts["requests"] == 30 and counts["threads"] == {"service": 1, "copy": 1}, counts
+    assert counts["copy_jobs"] > 0, counts
+    print("HOTPATH first requests", counts)
+    assert counts["service"]["malloc"] == 0 and counts["service"]["free"] == 0, counts
+
+
 def _measured(counts):
     """The window covered what the zeros below are about: every step served, copy jobs on the copy thread and a
     completed CopyDone for each, and a deferral (a request held back by a slot under a copy lease)."""

@@ -35,8 +35,9 @@
 # same values, and short means stop.
 # Lock order: rowimg-disk.lock is held across all arms; cc-gpu.lock is polled here and taken by run_arm.sh itself.
 # Final-fix round (call-site attribution of C's counts): two more arms, run by ARMS="CS CM", never by default:
-#   - CS: the branch under the shim (as C) with HOTPATH_SHIM_STACKS=$OUT/CS-stacks.txt, HOTPATH_SHIM_OUT=$OUT/CS-shim.json;
-#   - CM: master with master's recipe under the same shim, $OUT/CM-stacks.txt and $OUT/CM-shim.json.
+#   - CS: the branch under the shim (as C) with HOTPATH_SHIM_STACKS=$OUT/CS-callsites.txt, HOTPATH_SHIM_OUT=$OUT/CS-shim.json;
+#   - CM: master with master's recipe under the same shim, $OUT/CM-callsites.txt and $OUT/CM-shim.json.
+#   (Not <arm>-stacks.txt: that is the startup sampler's kernel-stack file.)
 #   Neither needs A: they are not timed and have no identity gate before them; each arm's stacks are attributed by
 #   final-fix/attribute_stacks.py once it ends. With REF_RUN=<a run dir> (Task 18's A), every arm's output is also
 #   compared byte for byte with it; hotpath_report.py runs only when ARMS includes A.
@@ -423,7 +424,7 @@ raise SystemExit(0 if not any(bad.values()) else 'output differs from A')
 
 attribute() {  # <arm>: the arm's shim counts and stacks, attributed to call sites (CS, CM)
     PYTHONPATH=$BRANCH_WT/python $PY "$BRANCH_WT/analysis/dsv41-drive/hotpath/final-fix/attribute_stacks.py" \
-        "$OUT/$1-stacks.txt" "$OUT/$1-shim.json" "$OUT/$1-attribution.json" 65536
+        "$OUT/$1-callsites.txt" "$OUT/$1-shim.json" "$OUT/$1-attribution.json" 65536
 }
 
 same_as_ref() {  # <arm>: byte identity against REF_RUN (Task 18's A), when given
@@ -448,10 +449,10 @@ for arm in "${ARMS[@]}"; do
             rm -f "$OUT/C-shim.json" "$OUT"/C-shim.json.*
             run_one "$arm" "$BRANCH_WT" "$BRANCH_SHA" "LD_PRELOAD=$SHIM_SO" "HOTPATH_SHIM_OUT=$OUT/C-shim.json" ;;
         CS|CM)
-            rm -f "$OUT/$arm-shim.json" "$OUT/$arm-shim.json".* "$OUT/$arm-stacks.txt" "$OUT/$arm-stacks.txt".*
+            rm -f "$OUT/$arm-shim.json" "$OUT/$arm-shim.json".* "$OUT/$arm-callsites.txt" "$OUT/$arm-callsites.txt".*
             if [ "$arm" = CS ]; then set -- "$BRANCH_WT" "$BRANCH_SHA"; else set -- "$BASE_WT" "$BASE_SHA" "${MASTER_RECIPE[@]}"; fi
             run_one "$arm" "$@" "LD_PRELOAD=$SHIM_SO" "HOTPATH_SHIM_OUT=$OUT/$arm-shim.json" \
-                "HOTPATH_SHIM_STACKS=$OUT/$arm-stacks.txt" "${STACKS_ENV[@]}" && attribute "$arm" ;;
+                "HOTPATH_SHIM_STACKS=$OUT/$arm-callsites.txt" "${STACKS_ENV[@]}" && attribute "$arm" ;;
         *) say "unknown arm $arm"; false ;;
     esac || { say "arm $arm failed; stopping the pass (see $OUT/$arm-run_arm.log)"; rc=1; break; }
     same_as_ref "$arm" || { say "arm $arm differs from REF_RUN; stopping the pass"; rc=1; break; }

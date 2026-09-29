@@ -12,9 +12,22 @@ JIT .so cache, libcuda) -- on divix01, right after the arm."""
 
 import collections
 import json
+import re
 import sys
 
 from sglang.test.hotpath_shim import Symbolizer, read_stacks
+
+
+def condense(frame: str) -> str:
+    """Template arguments and the expert_stream namespace dropped, the host module and libcuda abbreviated."""
+    while True:
+        shorter = re.sub(r"<[^<>]*>", "", frame)
+        if shorter == frame:
+            break
+        frame = shorter
+    frame = re.sub(r"sgl_kernel_jit_expert_stream_host_\w+?\.so", "HOST", frame)
+    frame = re.sub(r"libcuda\.so[.\d]*", "libcuda", frame)
+    return frame.replace("sglang::expert_stream::", "").replace("[abi:cxx11]", "")
 
 
 def main(argv):
@@ -27,7 +40,7 @@ def main(argv):
     # The first-N records of a (thread, kind) fill slots 0..N-1 in call order; N is the highest seq < every observed.
     for r in records:
         frames = [sym(a) for a in r["frames"]]
-        frames = [f for f in frames if not f.startswith("hotpath_shim.so")]
+        frames = [condense(f) for f in frames if not f.startswith("hotpath_shim.so")]
         site = " <- ".join(frames[:depth])
         g = groups[(r["thread"], r["kind"], site)]
         first = r["seq"] < 256  # HOTPATH_SHIM_STACKS_FIRST as the driver sets it

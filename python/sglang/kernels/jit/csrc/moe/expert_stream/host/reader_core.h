@@ -421,12 +421,15 @@ class ReaderCore {
     // releases the slots on return and the next read reuses the bounce. Runs on exceptions too.
     // An exception (one of the accounting guards) leaves reads in flight: drain them too before unwinding past the
     // caller, which releases the slots. In direct mode those reads write the slab rows themselves.
+    // "Unwinding" is every exit but the two returns below, which set `returned` just before returning. Not
+    // std::uncaught_exceptions(): its first call on a thread makes __tls_get_addr allocate libstdc++'s exception
+    // globals (dynamic TLS), which was the production service thread's one malloc (final-fix round, item 5).
     struct Quiesce {
       ReaderCore* reader;
-      int exceptions;
+      bool returned = false;
       ~Quiesce() {
         reader->derived().quiesce();
-        if (std::uncaught_exceptions() > exceptions) {
+        if (!returned) {
           // Already unwinding: a failed ring reset here leaves nothing in flight (it waits for every consumed SQE
           // first, and the reader is then closed), so the exception in flight is the one the caller should see.
           try {
@@ -435,7 +438,7 @@ class ReaderCore {
           }
         }
       }
-    } quiesce_on_exit{this, std::uncaught_exceptions()};
+    } quiesce_on_exit{this};
     while (true) {
       // Progress runs every turn: the caller's hook (retire_leases) returns at once when no lane is outstanding, and
       // gating it on a clock put a clock read on every turn of the hot path (spec M4). Not gated on a completion being
@@ -477,8 +480,10 @@ class ReaderCore {
     if (c.failed) {
       account_unfinished();
       drain(c.pending);
+      quiesce_on_exit.returned = true;
       return 0;
     }
+    quiesce_on_exit.returned = true;
     return c.abandoned && c.next_batch < c.batches ? -1 : 1;
   }
 
