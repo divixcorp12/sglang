@@ -12,6 +12,7 @@ Writes <out_dir>/pairs-report.json and prints a summary.
 """
 
 import json
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -42,6 +43,13 @@ def read_await(samples, start, end, devices):
     return out
 
 
+def memory_pool(run_dir):
+    """The DSV4 KV sizing line: available_bytes (GB) and full_token (KV pool size in tokens)."""
+    log = (Path(run_dir) / "server.log").read_text(errors="replace")
+    found = re.findall(r"DSV4 memory calculation: .*?available_bytes=([0-9.]+) GB.*?full_token=([0-9]+)", log)
+    return {"available_gb": float(found[-1][0]), "full_tokens": int(found[-1][1])} if found else None
+
+
 def generated_tokens(run_dir):
     run_dir = Path(run_dir)
     total = 0
@@ -63,6 +71,7 @@ def arm(out_dir, name, run_dir, devices):
         "decode": m.decode(run_dir),
         "clocks": {"timed_window": m.clock_summary(Path(out_dir) / f"{name}-clocks.csv", *m.timed_window_utc(run_dir)),
                    "session_start_end_mhz": m.session_clocks(run_dir)},
+        "memory_pool": memory_pool(run_dir),
         "ram_miss": rm,
         "generated_tokens_lifetime": tokens,
         "ram_misses_served_per_generated_token": served / tokens if served is not None and tokens else None,
@@ -104,7 +113,7 @@ def main(argv):
               "sessions", {s: round(v["pooled_ms_per_token"], 2) for s, v in a["decode"]["sessions"].items()},
               "share", {k: round(v["share_pct"], 1) for k, v in d.items()},
               "await", {k: round(v, 3) if v else v for k, v in a["read_ms_per_request"].items()},
-              "miss/tok", round(a["ram_misses_served_per_generated_token"] or 0, 2))
+              "pool", a["memory_pool"], "miss/tok", round(a["ram_misses_served_per_generated_token"] or 0, 2))
     print("pair deltas W-U", {p: round(v, 2) for p, v in deltas.items()}, "all identical", out["all_identical"])
     return 0 if out["all_identical"] else "an arm's output differs"
 
