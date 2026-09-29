@@ -235,6 +235,8 @@ static void* worker(void* arg) {
 
 // ---------- io-wq sampler ----------
 #define MAXW 4096
+#define MAXWC 32
+static char wchan_name[MAXWC][64]; static long wchan_n[MAXWC]; static int nwchan = 0; static long wstate[128];
 static int wtid[MAXW]; static double wcpu[MAXW]; static int nw = 0, wmax_live = 0;
 static void* sampler(void* arg) {
   (void)arg;
@@ -257,6 +259,16 @@ static void* sampler(void* arg) {
       f = fopen(path, "r"); if (!f) continue;
       char buf[1024]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
       char* r = strrchr(buf, ')'); unsigned long ut = 0, st = 0;
+      if (r && r[1] == ' ') wstate[(unsigned char)r[2] & 127]++;
+      {  // where it sleeps (0 when running); readable for our own threads without root
+        char wp[300], wc[64] = "?";
+        snprintf(wp, sizeof wp, "/proc/self/task/%s/wchan", e->d_name);
+        FILE* g = fopen(wp, "r");
+        if (g) { size_t m = fread(wc, 1, sizeof wc - 1, g); wc[m] = 0; fclose(g); }
+        int j; for (j = 0; j < nwchan && strcmp(wchan_name[j], wc); ++j) {}
+        if (j == nwchan && nwchan < MAXWC) { strcpy(wchan_name[nwchan++], wc); }
+        if (j < MAXWC) wchan_n[j]++;
+      }
       if (r) sscanf(r + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st);
       int k; for (k = 0; k < nw && wtid[k] != tid; ++k) {}
       if (k == nw && nw < MAXW) { wtid[nw] = tid; wcpu[nw] = 0; ++nw; }
@@ -373,6 +385,10 @@ int main(int argc, char** argv) {
     printf(" %s=%.0f/%.0f", part_name[f], m ? v[m / 2] : 0.0, m ? v[(size_t)(0.99 * (m - 1))] : 0.0);
     free(v);
   }
+  printf("\n  iowq_samples: state");
+  for (int c = 0; c < 128; ++c) if (wstate[c]) printf(" %c=%ld", c, wstate[c]);
+  printf(" wchan");
+  for (int j = 0; j < nwchan; ++j) printf(" %s=%ld", wchan_name[j], wchan_n[j]);
   printf("\n");
   (void)seg_name;
   return errs || shorts ? 3 : 0;
