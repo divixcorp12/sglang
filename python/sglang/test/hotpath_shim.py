@@ -41,7 +41,7 @@ CHILD = textwrap.dedent(
     from sglang.test import hotpath_script as hp
 
     variant, requests, warmup, tmp = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-    s, page, host, sim, dst = hp.build_host(Path(tmp) / "s", variant=None if variant == "default" else variant)
+    s, page, host, sim, dst = hp.build_host(Path(tmp), variant=None if variant == "default" else variant)
     host.start_thread(fatal_wait_s=60.0, spin_us=50_000)  # 50 ms of spin: the measured window never idles into sleep
     stop = threading.Event()
 
