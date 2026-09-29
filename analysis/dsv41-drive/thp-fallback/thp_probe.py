@@ -231,8 +231,9 @@ def main() -> int:
     result["chunks"] = len(chunks)
 
     if args.inject:
-        picks = sorted({round(i * (len(chunks) - 1) / max(1, args.inject - 1)) for i in range(args.inject)}) \
-            if args.inject > 1 else [len(chunks) // 2]
+        big = [k for k, (_, length) in enumerate(chunks) if length >= 256 * MIB]
+        picks = sorted({big[round(i * (len(big) - 1) / max(1, args.inject - 1))] for i in range(args.inject)}) \
+            if args.inject > 1 else [big[len(big) // 2]]
         injected = []
         for k in picks:
             base, length = chunks[k]
@@ -260,7 +261,7 @@ def main() -> int:
     if args.fault == "touch":
         present = present_now()
         result["after_fault"] = summarize(present, tier_bytes)
-        result["after_fault"]["mixed_chunks"] = sum(not r["coalesced"] for r in chunk_model(chunks, present))
+        result["after_fault"]["mixed_chunks"] = sum(r["small_pages"] > 0 for r in chunk_model(chunks, present))
 
         if args.repair != "none":
             spans = [owner_span(o) for o in owners]
@@ -281,7 +282,7 @@ def main() -> int:
             result["repair"] = {"frames": len(frames), "failed_calls": failed, "s": time.monotonic() - t,
                                 "vmstat": {k: stat2[k] - stat1.get(k, 0) for k in stat2 if stat2[k] != stat1.get(k, 0)},
                                 "after": summarize(present, tier_bytes)}
-            result["repair"]["after"]["mixed_chunks"] = sum(not r["coalesced"] for r in chunk_model(chunks, present))
+            result["repair"]["after"]["mixed_chunks"] = sum(r["small_pages"] > 0 for r in chunk_model(chunks, present))
 
     if not args.no_register:
         workdir = Path(args.workdir)
@@ -306,7 +307,8 @@ def main() -> int:
         result["after_register"] = summarize(present, tier_bytes)
         model = chunk_model(chunks, present)[:done]
         ms = [oms[i] for i in range(done)]
-        result["mixed_chunks"] = sum(not r["coalesced"] for r in model)
+        result["mixed_chunks"] = sum(r["small_pages"] > 0 for r in model)
+        result["uncoalesced_chunks"] = sum(not r["coalesced"] for r in model)
         result["fit"] = lsq([r["visits"] for r in model], ms)
         result["visits_total_g"] = sum(r["visits"] for r in model) / 1e9
         result["ms_mixed_chunks"] = sum(m for m, r in zip(ms, model) if not r["coalesced"])
