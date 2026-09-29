@@ -76,3 +76,12 @@ def test_characterize_the_hot_path(shim, tmp_path):
     per = {th: {k: round(v / counts["requests"], 2) for k, v in counts[th].items()} for th in hotpath_shim.THREADS}
     print("HOTPATH raw", counts)
     print("HOTPATH per request", per)
+
+
+def test_the_prod_service_thread_reads_no_clock_per_request(shim, tmp_path):
+    """Spec M3/M4/M8 and D6: the watchdog's episode word, turn-counted progress and iteration-budget pacing leave
+    the service thread no clock read while it serves (the watchdog thread reads the clock instead)."""
+    counts = hotpath_shim.run_child(shim, variant="prod", tmp=tmp_path)
+    # A zero from a shim that never recognized the thread would prove nothing.
+    assert counts["requests"] == REQUESTS and counts["threads"] == {"service": 1, "copy": 1}, counts
+    assert counts["service"]["clock"] == 0, counts

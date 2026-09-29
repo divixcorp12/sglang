@@ -196,7 +196,7 @@ while host.counters()["deferred"] != 1:
 start = time.perf_counter()
 busy_max = seq_max = fatal_max = samples = 0
 while time.perf_counter() - start < 5 * FATAL_WAIT:
-    busy_max = max(busy_max, host.busy_since_ns())
+    busy_max = max(busy_max, host.busy_episode())
     seq_max = max(seq_max, page_word(page, "busy_seq"))
     fatal_max = max(fatal_max, page_word(page, "fatal"))
     assert page_word(page, "demand_done") != req.seq and host.counters()["deferred"] == 1
@@ -216,8 +216,8 @@ print("alive", flush=True)
 def test_a_long_deferral_does_not_trip_the_watchdog_and_the_demand_is_served_after_the_lease_retires(tmp_path):
     """R1. A subprocess, because the watchdog's abort kills the interpreter. The deferral is observed to be older
     than five times ``fatal_wait`` on the script's own clock (else nothing could have aborted), the busy word and
-    ``busy_since`` are sampled throughout, and the process must be alive at the end with the demand served.
-    Mutations: the deferral marks itself busy at its first observation (abort), or on every poll (``busy_since``
+    ``busy_episode`` are sampled throughout, and the process must be alive at the end with the demand served.
+    Mutations: the deferral marks itself busy at its first observation (abort), or on every poll (``busy_episode``
     nonzero); it publishes ``busy_seq``; it raises the fatal word (the fatal-held rule aborts)."""
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(_DEFERRAL_SCRIPT), str(tmp_path)],

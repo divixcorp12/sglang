@@ -699,7 +699,7 @@ class TestServiceEndToEnd:
             assert terminal["reason"] == REASON["timeout"]
             assert s.block.ack_area() == bytes(lease.RING * LANES * lease.LANE_ACK_BYTES)
             # The service finishes its delayed read, meets the terminal and does not lease, or voids what it leased.
-            assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+            assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
             counters = s.host.counters()
             assert counters["leases_acked"] == 0 and s.leases() == [0] * CAPACITY, counters
             assert counters["leases_granted"] == counters["leases_voided"], counters

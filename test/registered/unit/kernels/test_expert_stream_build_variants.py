@@ -51,6 +51,31 @@ def test_an_unknown_variant_is_refused():
         ops._host_module("exl3", "fast")
 
 
+def test_a_production_host_reports_only_the_core_counters(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=2)
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+                            variant="prod")
+    try:
+        assert tuple(host.counters()) == ops.CORE_COUNTERS
+    finally:
+        host.stop()
+
+
+def test_the_instrumented_host_still_reports_every_counter(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=2)
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+                            variant="instr")
+    try:
+        assert tuple(host.counters()) == tuple(ops.COUNTERS) and set(ops.CORE_COUNTERS) < set(ops.COUNTERS)
+    finally:
+        host.stop()
+
+
+def test_the_python_core_counters_are_the_hosts():
+    mask = int(ops._host_module("exl3", "prod").expert_stream_core_counter_mask())
+    assert {name for i, name in enumerate(ops.COUNTERS) if mask >> i & 1} == set(ops.CORE_COUNTERS)
+
+
 if __name__ == "__main__":
     import sys
 

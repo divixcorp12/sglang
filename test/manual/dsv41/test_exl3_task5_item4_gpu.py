@@ -149,7 +149,7 @@ class TestRealServiceFailures:
                 s.dest[n].zero_()
             s.step()
             _cuda_ready()
-            assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+            assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
             counters = s.host.counters()
             # Not vacuous: the two rows before the failure really did pack, and the failed row never did.
             assert _slab_holds(s, 3, want) and _slab_holds(s, 5, want), "rows 0 and 1 packed before row 2 failed"
@@ -180,7 +180,7 @@ class TestRealServiceFailures:
             s.plan(experts)
             s.step()
             _cuda_ready()
-            assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+            assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
             counters = s.host.counters()
             assert not any(_slab_holds(s, e, want) for e in experts), "no row packed"
             assert counters["read_errors"] == 1 and counters["rows_read"] == 0, counters
@@ -223,7 +223,7 @@ class TestRealServiceFailures:
             assert s.keep.item() == 0.0 and s.dev.go_count.item() == 0 and s.host.fatal_seq() != 0
             # The service finishes its delayed read AFTER the device gave up. Whatever it then does, no
             # acknowledgement appears, no lease survives, and no lane is ever counted as consumed.
-            assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+            assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
             time.sleep(0.2)  # let retire_leases run over whatever the late serve left
             counters = s.host.counters()
             print("late-serve counters", counters)
@@ -311,7 +311,7 @@ def _run_two_layers_with_a_fatal_error(tmp_path, cause):
         result["fatal"] = service.host.fatal_seq()
         result["go_count"] = service.device_side.go_count.item()
         deadline = time.perf_counter() + 20.0
-        while time.perf_counter() < deadline and service.host.busy_since_ns() != 0:
+        while time.perf_counter() < deadline and service.host.busy_episode() != 0:
             time.sleep(0.01)
         time.sleep(0.2)
         result["acked_delta"] = service.host.counters()["leases_acked"] - acked_before

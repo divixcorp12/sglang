@@ -367,7 +367,7 @@ class StreamService:
         """Clear the faults and let the service finish whatever read a test left running."""
         self.host.inject(delay_s=0.0)
         self.host.inject_fault()
-        assert self.until(lambda: self.host.busy_since_ns() == 0, timeout_s=15.0)
+        assert self.until(lambda: self.host.busy_episode() == 0, timeout_s=15.0)
 
 
 @pytest.fixture

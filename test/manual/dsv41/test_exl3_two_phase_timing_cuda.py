@@ -330,7 +330,7 @@ def test_t7_one_request_deadline_not_one_per_stage(tmp_path):
         assert elapsed < 1.4 * (timeout_ms / 1000), elapsed
     finally:
         s.host.inject(delay_s=0.0)
-        assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+        assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
         s.close()
 
 
@@ -360,7 +360,7 @@ def test_t10_all_miss_request_does_not_pay_the_read_wait_twice(tmp_path):
         assert elapsed < 0.3, elapsed
     finally:
         s.host.inject(delay_s=0.0)
-        assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+        assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
         s.close()
 
 

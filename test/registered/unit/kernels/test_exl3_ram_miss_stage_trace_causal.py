@@ -219,45 +219,47 @@ def test_an_enabled_trace_reads_the_clock_at_every_stamp(tmp_path):
 NON_TRACE_CLOCK_READS = {
     "inline int64_t now_ns() {": 1,  # the clock itself
     "return now_ns();": 1,  # stamp() itself
-    # the watchdog's stuck-request marker, needed with the trace off (the third is a prefill fill's, below)
-    "busy_since_.store(now_ns());": 3,
+    # Deadlines of callers that wait, never the service or copy thread serving a request: RamThread::pause() (and its
+    # copy-idle wait), fill_wait (the third "deadline" line and the "return -1" line), and the test exports sim_wait
+    # (the second "if (now_ns() > deadline) {") and seqlock_stress (the duration pair).
     "const int64_t deadline = now_ns() + timeout_ns;": 3,
     "if (now_ns() > deadline) {": 2,
+    "tier_->wait_copy_idle(now_ns() + timeout_ns);": 1,
+    "if (now_ns() > deadline) return -1;": 1,
     "const int64_t deadline = now_ns() + duration_ns;": 1,
     "while (now_ns() < deadline) {": 1,
-    "if (now_ns() - last_active < spin_ns_) {": 1,
-    # RamThread's watchdog poll (unchanged) and RowReader::read()'s progress-callback gate (phase 1,
-    # ram-miss-progress-phase1): only reached when a `progress` callback was passed, so the disabled
-    # (production-off) path still reads no clock when nothing is registered to run periodically.
-    "const int64_t now = now_ns();": 2,
+    # The spin budget (spec M8): idle_budget() times kProbe pauses once, on the thread that calls start() (RamThread and
+    # CopyEngine), so neither the service nor the copy thread reads the clock to pace itself.
+    "const int64_t t0 = now_ns();": 1,
+    "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
+    # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread.
+    "const int64_t now = now_ns();": 1,
+    # The copy engine (LEASE_PROTOCOL.md 7.6): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
+    # through it) and stop()'s drain deadline, which the copy thread reads only once a stop was asked for.
+    "if (now_ns() > deadline_ns) return false;": 1,
+    "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
+    "drain_deadline_ = now_ns() + drain_ns;": 1,
+    "if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline)) break;": 1,
+    # Metrics, compiled only into InstrBuild (each inside `if constexpr (Build::kMetrics)`): copy_issue_ns, the copy
+    # latency's submit and completion reads, and native prefetch's prefetch_latency_ns pair.
+    "if constexpr (Build::kMetrics) start = now_ns();  // copy_issue_ns, a metric": 1,
+    "count<kCopyIssueNs>(now_ns() - start);": 1,
+    "if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric": 1,
+    "const int64_t latency = now_ns() - job.submit_ns;": 1,
+    "if constexpr (Build::kMetrics) read_ns = now_ns();  // prefetch_latency_ns, a metric": 1,
+    "if constexpr (Build::kMetrics) copy_count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);": 1,
     # The hold_until_probe_ms test fault (piece streaming, G2): read only when that fault is set; the second
     # line's `c.hold_until == 0` short-circuits before the clock read otherwise.
     "c.hold_until = now_ns() + fault_.hold_until_probe_ms * 1000000;": 1,
     "if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;": 1,
-    # The copy engine (LEASE_PROTOCOL.md 7.6), reached only with it enabled: its thread's spin and drain clock (the
-    # second "last_active" pair), the idle waits of pause() and of the test hook, and four reads per copy job for the
-    # always-on copy_issue_ns and copy_latency_ns counters, which are how stages.jsonl times the copies.
-    "int64_t last_active = now_ns();": 2,
-    "last_active = now_ns();": 2,
-    "} else if (!in_flight.empty() || !held.empty() || !acking.empty() || now_ns() - last_active < spin_ns_) {": 1,
-    "if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline)) break;": 1,
-    "drain_deadline_ = now_ns() + drain_ns;": 1,
-    "if (now_ns() > deadline_ns) return false;": 1,
-    "tier_->wait_copy_idle(now_ns() + timeout_ns);": 1,
-    "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
-    "job.submit_ns = now_ns();": 1,
-    "const int64_t start = now_ns();": 1,
-    "counters_[kCopyIssueNs].fetch_add(now_ns() - start);": 1,
-    "const int64_t latency = now_ns() - job.submit_ns;": 1,
-    # Native prefetch (plan 2026-09-25-dsv41-native-prefetch), reached only with it enabled: two reads per request
-    # served, for the always-on prefetch_latency_ns counter.
-    "const int64_t read_ns = now_ns();": 1,
-    "counters_[kPrefetchLatencyNs].fetch_add(now_ns() - job.submit_ns);": 1,
-    # Prefill fills (plan 2026-09-25-dsv41-prefill-fills), reached only with them enabled: the fill thread's
-    # watchdog marker (counted with the stuck-request marker above) and fill_wait's deadline (counted with the
-    # deadlines above, and this line).
-    "if (now_ns() > deadline) return -1;": 1,
 }
+
+
+def test_no_ungated_clock_read_remains_on_the_request_path():
+    """Spec M3/M4 (plan 2026-09-29-hotpath-zero-overhead Task 9): the watchdog's clock-stamped marker and the drain
+    loop's clock-gated progress are gone from the sources; the shim's clock count is the runtime proof."""
+    text = joined_text(host_sources())
+    assert "busy_since_" not in text and "kProgressIntervalNs" not in text
 
 
 def test_no_clock_read_bypasses_the_trace_gate():

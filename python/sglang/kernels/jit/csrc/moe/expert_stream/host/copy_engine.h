@@ -249,7 +249,8 @@ class CopyEngine {
       std::unique_ptr<CopyBackend> backend,
       int64_t rows,
       int64_t spin_ns,
-      std::atomic<int64_t>* counters,
+      LineCounters<kCounterCount>* core,
+      Stats<Build::kMetrics, kCounterCount>* stats,
       Handler complete,
       Handler acked,
       Failure fail,
@@ -258,7 +259,8 @@ class CopyEngine {
       : backend_(std::move(backend)),
         tables_(static_cast<size_t>(rows)),
         spin_ns_(spin_ns),
-        counters_(counters),
+        core_(core),
+        stats_(stats),
         complete_(std::move(complete)),
         acked_(std::move(acked)),
         fail_(std::move(fail)),
@@ -271,6 +273,7 @@ class CopyEngine {
 
   // Starts the thread and returns once the backend is initialised on it; throws with the backend's error.
   void start() {
+    spin_iters_ = idle_budget(spin_ns_);  // on the caller's thread: the copy thread never reads the clock to pace
     thread_ = std::thread([this] { run(); });
     std::unique_lock<std::mutex> lock(mutex_);
     ready_cv_.wait(lock, [this] { return started_; });
@@ -366,7 +369,7 @@ class CopyEngine {
     std::deque<CopyJob> in_flight;
     std::deque<CopyJob> held;    // prefetch jobs not yet issued: demand goes first on the link
     std::deque<CopyJob> acking;  // copies completed, CopyDone published; the leases wait for the copy wait's SmAck
-    int64_t last_active = now_ns();
+    uint64_t idle = 0;           // empty polls since the last progress: the spin budget counts these (spec M8)
     while (true) {
       std::deque<CopyJob> fresh;
       bool stopping = false;
@@ -393,7 +396,7 @@ class CopyEngine {
       for (const CopyJob& job : in_flight)
         demand_in_flight = demand_in_flight || !job.prefetch;
       if (!held.empty() && (demand_fresh || demand_in_flight)) {
-        if (!held_counted_) counters_[kPrefetchHeld].fetch_add(1);
+        if (!held_counted_) count<kPrefetchHeld>();
         held_counted_ = true;
       }
       while (!held.empty() && ((!demand_fresh && !demand_in_flight) || stopping)) {
@@ -435,10 +438,11 @@ class CopyEngine {
           in_flight.pop_front();
         }
       }
+      // The drain deadline is read only once a stop was asked for (short-circuit): never while serving.
       if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline)) break;
       if (progressed) {
-        last_active = now_ns();
-      } else if (!in_flight.empty() || !held.empty() || !acking.empty() || now_ns() - last_active < spin_ns_) {
+        idle = 0;
+      } else if (!in_flight.empty() || !held.empty() || !acking.empty() || ++idle < spin_iters_) {
         _mm_pause();
       } else {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -464,7 +468,8 @@ class CopyEngine {
 
   int issue(CopyJob& job) {
     const Table& table = tables_[job.row];
-    const int64_t start = now_ns();
+    int64_t start = 0;
+    if constexpr (Build::kMetrics) start = now_ns();  // copy_issue_ns, a metric
     int64_t bytes = 0;
     if (const int64_t ballast = ballast_bytes_.load(); ballast > 0) {
       if (const int r = backend_->issue(ballast_dst_.load(), ballast_src_.load(), ballast)) return r;
@@ -481,21 +486,40 @@ class CopyEngine {
       }
     }
     const int r = backend_->mark(&job.token);
-    counters_[kCopyIssueNs].fetch_add(now_ns() - start);
-    counters_[kCopyBytes].fetch_add(bytes);
+    if constexpr (Build::kMetrics) {
+      count<kCopyIssueNs>(now_ns() - start);
+      count<kCopyBytes>(bytes);
+    }
     return r;
   }
 
+  // copy_latency_ns and its max: metrics, so ProdBuild reads no clock here.
   void record_latency(const CopyJob& job) {
-    const int64_t latency = now_ns() - job.submit_ns;
-    counters_[kCopyLatencyNs].fetch_add(latency);
-    int64_t seen = counters_[kCopyLatencyMaxNs].load();
-    while (latency > seen && !counters_[kCopyLatencyMaxNs].compare_exchange_weak(seen, latency)) {
+    if constexpr (Build::kMetrics) {
+      const int64_t latency = now_ns() - job.submit_ns;
+      count<kCopyLatencyNs>(latency);
+      std::atomic<int64_t>& max = stats_->v[kCopyLatencyMaxNs];
+      int64_t seen = max.load(std::memory_order_relaxed);
+      while (latency > seen && !max.compare_exchange_weak(seen, latency, std::memory_order_relaxed)) {
+      }
+    } else {
+      (void)job;
+    }
+  }
+
+  // The copy thread's counters: a core one into its own line-private block (the tier's copy_core_), a metric into the
+  // shared stats (InstrBuild only).
+  template <Counter K>
+  void count(int64_t n = 1) {
+    if constexpr (is_core_counter(K)) {
+      core_->add(K, n);
+    } else {
+      stats_->add(K, n);
     }
   }
 
   void finish_failed(const CopyJob& job, int error_code) {
-    counters_[kCopyErrors].fetch_add(1);
+    count<kCopyErrors>();
     fail_(job, error_code);
     finish();
   }
@@ -508,7 +532,9 @@ class CopyEngine {
   std::unique_ptr<CopyBackend> backend_;
   std::vector<Table> tables_;
   int64_t spin_ns_;
-  std::atomic<int64_t>* counters_;
+  uint64_t spin_iters_ = 1;  // idle polls before the condvar wait: idle_budget(spin_ns_), set in start()
+  LineCounters<kCounterCount>* core_;             // the tier's copy_core_: written by the copy thread only
+  Stats<Build::kMetrics, kCounterCount>* stats_;  // the tier's metrics (InstrBuild)
   Handler complete_;
   Handler acked_;
   Failure fail_;

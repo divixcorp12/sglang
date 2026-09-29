@@ -72,12 +72,6 @@ struct ReadFault {
   bool ring_reset_fail = false;
 };
 
-// A packing worker's chunk stamp: the same gated clock as every other stamp (a job is armed with it only
-// for a traced read).
-inline int64_t worker_stamp(const void* trace) {
-  return stamp(static_cast<const StageRecord*>(trace));
-}
-
 // The fault tensor of the test entry points: kFaultWords int64 words. Five of them are not reader faults:
 // abandon_after makes the entry point's abandon callback say stop once that many batches were admitted
 // (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and words 19-20 (formerly

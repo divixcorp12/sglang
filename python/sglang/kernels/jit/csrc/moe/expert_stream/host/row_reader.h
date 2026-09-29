@@ -36,6 +36,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   using Base::rows_;
   using Base::t_;
   using Base::take_ready_row;
+  using Base::trace_stamp;
   using typename Base::BounceRow;
   using typename Base::Call;
   using typename Base::ExtentDesc;
@@ -150,7 +151,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
     bool any = false;
     int64_t now = -1;
     const auto clock = [&] {
-      if (now < 0) now = stamp(c.trace);
+      if (now < 0) now = trace_stamp();
       return now;
     };
     const auto delay = [&] {

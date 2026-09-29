@@ -69,6 +69,21 @@ enum Counter : int {
   kCounterCount,
 };
 
+// Counters the production build keeps (plan 2026-09-29-hotpath-zero-overhead D1): the shutdown line's served, rows and
+// errors, the failure evidence a fail-stop message prints, the admission policy's outcomes, and the functional version.
+constexpr bool is_core_counter(int k) {
+  switch (k) {
+    case kServedRequests: case kTouchOnly: case kRowsRead: case kReadErrors: case kEvictions: case kOverruns:
+    case kLateAfterFatal: case kNoVictim: case kVersion: case kRunning: case kSpinCpu: case kDeferred:
+    case kDeferredReuse: case kPieceStreamRefused: case kSlotsQuarantined: case kCopyErrors:
+    case kCopyGenerationMismatches:
+      return true;
+    default:
+      return false;
+  }
+}
+static_assert(is_core_counter(kVersion), "version is functional (Python's LRU view invalidates on it): never a metric");
+
 inline uint32_t load_acquire(const uint8_t* address) {
   return __atomic_load_n(reinterpret_cast<const uint32_t*>(address), __ATOMIC_ACQUIRE);
 }

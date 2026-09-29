@@ -468,8 +468,9 @@ def test_a_lease_acknowledged_mid_read_retires_before_that_read_returns(tmp_path
         assert host.counters()["leases_granted"] == 1, "req1's lease was not granted; nothing to retire mid-flight"
 
         # Packing is inline on the owner thread (pack_workers defaults to 0) and one row at a time, so three
-        # missing rows at 50 ms each span ~150 ms -- comfortably longer than kProgressIntervalNs (200 us) and
-        # than the poll deadline below, so an ack delivered now can only be seen mid-read, not after req2 ends.
+        # missing rows at 50 ms each span ~150 ms -- comfortably longer than a drain-loop turn (progress runs every
+        # turn) and than the poll deadline below, so an ack delivered now can only be seen mid-read, not after req2
+        # ends.
         host.inject_fault(pack_delay_ns=50_000_000)
         req2 = sim.post(0, [2, 3, 4])
 

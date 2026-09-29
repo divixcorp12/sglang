@@ -97,6 +97,18 @@ inline int64_t now_ns() {
   return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
+// How many idle polls approximate spin_ns (spec M8; setup only: two clock reads on the caller's thread). An idle poll
+// is at least one _mm_pause plus the loop's empty pumps, so the real spin is at least spin_ns; the budget is a floor.
+// The service and copy threads count polls against it instead of reading the clock on every turn.
+inline uint64_t idle_budget(int64_t spin_ns) {
+  constexpr int kProbe = 4096;
+  const int64_t t0 = now_ns();
+  for (int i = 0; i < kProbe; ++i)
+    _mm_pause();
+  const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);
+  return static_cast<uint64_t>(std::max<int64_t>(1, spin_ns / per_pause));
+}
+
 struct StageRecord;
 
 // Clock reads taken for a trace record, so a test can show a disabled trace takes none. Written

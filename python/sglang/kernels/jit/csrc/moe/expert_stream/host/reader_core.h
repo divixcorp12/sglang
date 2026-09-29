@@ -328,11 +328,10 @@ class ReaderCore {
   // Null costs a branch per event and no clock read; the stamps only read the clock and add to
   // `trace`, so they cannot change what is submitted, reaped, drained or copied.
   //
-  // `progress`, when set, is invoked periodically from inside the drain loop -- at most once every
-  // kProgressIntervalNs, never once per turn, since a turn can be as short as a single _mm_pause().
+  // `progress`, when set, is invoked once per turn of the drain loop (never behind a clock: spec M4).
   // The reader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
   // its own periodic work (retire_leases()) while a read is in flight, exactly as `abandon` is how the
-  // caller decides when to stop admitting. Null costs one comparison per turn and no clock read.
+  // caller decides when to stop admitting. Null costs one comparison per turn.
   //
   // This is the hot path and checks nothing: `layer`, `experts` and `slots` must be in
   // range and `experts.size() == slots.size()`. The service (Task 11) and
@@ -363,19 +362,19 @@ class ReaderCore {
     c.capacity = fault_.max_outstanding > 0
                      ? std::min<unsigned>(queue_depth(), static_cast<unsigned>(fault_.max_outstanding))
                      : queue_depth();
-    c.trace = trace;
+    if constexpr (Build::kMetrics) c.trace = trace;  // ProdBuild: no record, whatever the caller passed
     c.packed = packed;
     c.publish = piece_stream_ ? publish : nullptr;
     if (c.publish != nullptr && c.publish->probe != nullptr && fault_.hold_until_probe_ms > 0) {
       c.hold_until = now_ns() + fault_.hold_until_probe_ms * 1000000;
     }
     if (packed) packed->assign(c.total, 0);
-    if (trace) {
-      trace->rows_asked = static_cast<int64_t>(c.total);
-      trace->pack_workers = derived().pack_workers();
-      trace->pack_split = derived().pack_split();
-      trace->piece_stream = piece_stream_ ? 1 : 0;
-    }
+    on_trace([&](StageRecord& t) {
+      t.rows_asked = static_cast<int64_t>(c.total);
+      t.pack_workers = derived().pack_workers();
+      t.pack_split = derived().pack_split();
+      t.piece_stream = piece_stream_ ? 1 : 0;
+    });
     reset_pipeline();
     held_.clear();
     // Whatever way this call ends, no packing worker may still be copying when it does: the caller
@@ -397,24 +396,11 @@ class ReaderCore {
         }
       }
     } quiesce_on_exit{this, std::uncaught_exceptions()};
-    // 0 forces the first turn to fire immediately, so a short read still gets one call before it
-    // returns rather than waiting a full interval that may outlast the whole request.
-    int64_t next_progress_ns = 0;
     while (true) {
-      // Gated on elapsed time, not on a completion being reaped: reaped completions are this
-      // reader's own I/O finishing, uncorrelated with the device acknowledging a lease (that arrives
-      // through the lease block serve() owns), so a request whose reads finish early but is still
-      // packing would otherwise stop calling progress() before the read returns. Time keeps firing
-      // regardless of which sub-phase the loop is in. The interval is sized well under a typical
-      // request's span (tens of ms, see the plan) so a lease is retired promptly, while staying far
-      // above a single turn (as short as one _mm_pause()) so this never becomes a per-turn mutex take.
-      if (progress) {
-        const int64_t now = now_ns();
-        if (now >= next_progress_ns) {
-          progress();
-          next_progress_ns = now + kProgressIntervalNs;
-        }
-      }
+      // Progress runs every turn: the caller's hook (retire_leases) returns at once when no lane is outstanding, and
+      // gating it on a clock put a clock read on every turn of the hot path (spec M4). Not gated on a completion being
+      // reaped either: those are this reader's own I/O, uncorrelated with the device acknowledging a lease.
+      if (progress) progress();
       derived().collect();  // before admit: a bank whose last copy just finished is free for the next batch
       if (!c.failed) admit(abandon);
       if (!c.failed) refill();
@@ -439,15 +425,15 @@ class ReaderCore {
         clean = clean && rows_busy_[b] == 0 && bank_live_[b] == 0;
       if (!clean || (!c.abandoned && c.next_batch < c.batches)) c.failed = true;
     }
-    if (trace && c.first_seen != 0) {
-      trace->submit = c.submitted;
-      trace->first_cqe = c.first_seen;
-      trace->last_cqe = c.last_seen;
-      trace->submit_to_first_cqe_ns = c.first_seen - c.submitted;
-      trace->first_to_last_cqe_ns = c.last_seen - c.first_seen;
-    } else if (trace) {
-      trace->submit = c.submitted;
-    }
+    on_trace([&](StageRecord& t) {
+      t.submit = c.submitted;
+      if (c.first_seen != 0) {
+        t.first_cqe = c.first_seen;
+        t.last_cqe = c.last_seen;
+        t.submit_to_first_cqe_ns = c.first_seen - c.submitted;
+        t.first_to_last_cqe_ns = c.last_seen - c.first_seen;
+      }
+    });
     if (c.failed) {
       account_unfinished();
       drain(c.pending);
@@ -494,13 +480,6 @@ class ReaderCore {
   static constexpr uint8_t kPoisonFill = 0xA5;
 
   static constexpr int32_t kPoisonSlot = 0x7EADBEEF;
-
-  // How often read()'s drain loop may call its optional `progress` callback. Arbitrary; chosen to sit
-  // well under a request's typical span (tens of ms; see docs/superpowers/plans/2026-09-22-ram-miss-
-  // progress-loop.md) so a lease is retired promptly, and far above one loop turn (a bare _mm_pause())
-  // so the callback's own cost (a mutex and a walk over kDemandRecords, on the caller's side) cannot
-  // dominate the loop.
-  static constexpr int64_t kProgressIntervalNs = 200000;  // 200 us
 
   // Packing: handed to a packing worker, which owns the copy until the owner sees its job done.
   enum class RowState : uint8_t { Free, Reading, Ready, Packing };
@@ -561,6 +540,10 @@ class ReaderCore {
 
   using Completion = ReadCompletion;
 
+  // The stage trace (spec M9): ProdBuild's Call carries no record pointer at all, so no site can test or stamp one.
+  struct NoTrace {};
+  using TracePtr = std::conditional_t<Build::kMetrics, StageRecord*, NoTrace>;
+
   // One read() call's state. Everything the pipeline mutates lives here or in the members below, all
   // sized at open(); read() allocates nothing.
   struct Call {
@@ -577,7 +560,7 @@ class ReaderCore {
     unsigned pending = 0;  // SQEs prepared and not yet reaped
     size_t queue_head = 0;
     size_t queue_count = 0;
-    StageRecord* trace = nullptr;
+    [[no_unique_address]] TracePtr trace{};  // ProdBuild: an empty member, so no site can test or stamp it
     std::vector<uint8_t>* packed = nullptr;
     bool failed = false;
     bool abandoned = false;
@@ -590,6 +573,23 @@ class ReaderCore {
     size_t published = 0;    // piece streaming: pieces published so far (the last_publish_delay_ns fault)
     int64_t hold_until = 0;  // piece streaming: when the hold_until_probe_ms fault gives up (0: no hold)
   };
+
+  // Runs `f` on this read's stage record, if it has one. ProdBuild compiles every call to nothing.
+  template <class F>
+  void on_trace(F&& f) {
+    if constexpr (Build::kMetrics) {
+      if (c_.trace != nullptr) f(*c_.trace);  // on_trace: the one null test of the record
+    }
+  }
+
+  // A trace stamp of this read (0 without a record); ProdBuild's is the constant 0, no branch and no clock.
+  int64_t trace_stamp() {
+    if constexpr (Build::kMetrics) {
+      return stamp(c_.trace);  // trace_stamp: the one stamp of the record
+    } else {
+      return 0;
+    }
+  }
 
   // How many reads may be outstanding at once. Credit-based preparation in refill() means
   // this bounds concurrency, not batch size: a batch larger than the ring waits for credit
@@ -834,7 +834,7 @@ class ReaderCore {
       const size_t bank = c.next_batch % static_cast<size_t>(kBanks);
       if (rows_busy_[bank] != 0) {
         // The bank still holds rows that have not packed: the kernel must not write it again.
-        if (!c.stalled && c.trace) ++c.trace->bank_stalls;
+        if (!c.stalled) on_trace([&](StageRecord& t) { ++t.bank_stalls; });
         c.stalled = true;
         return;
       }
@@ -896,11 +896,13 @@ class ReaderCore {
       // The slot is Free (checked above), so its piece runs may be written before the batch is known good.
       if (piece_stream_ && !plan_pieces(bank * kBounceRows + i, row_index, geometry_[i])) return false;
     }
-    const int64_t admitted = stamp(c.trace);
-    if (c.trace) ++c.trace->batches;
+    const int64_t admitted = trace_stamp();
+    on_trace([&](StageRecord& t) { ++t.batches; });
     for (size_t i = 0; i < count; ++i) {
       const size_t ordinal = first + i;
-      if (c.trace && ordinal < static_cast<size_t>(kTraceRows)) c.trace->row_admit[ordinal] = admitted;
+      on_trace([&](StageRecord& t) {
+        if (ordinal < static_cast<size_t>(kTraceRows)) t.row_admit[ordinal] = admitted;
+      });
       const size_t slot = bank * kBounceRows + i;
       const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[ordinal]);
       const size_t base = row_index * parts;
@@ -931,22 +933,23 @@ class ReaderCore {
         ++rows_[slot].extents_left;
         ++bank_live_[bank];
         queue_push(index);
-        if (c.trace) {
+        on_trace([&](StageRecord& t) {
           const size_t drive = file_drive_[extent->file];
-          c.trace->drive_dev[drive] = drive_dev_[drive];
-          c.trace->drive_extents[drive] += 1;
-          const int64_t trace_slot = c.trace->extents++;
+          t.drive_dev[drive] = drive_dev_[drive];
+          t.drive_extents[drive] += 1;
+          const int64_t trace_slot = t.extents++;
           if (trace_slot < kTraceExtents) {
-            c.trace->extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | static_cast<int64_t>(p);
+            t.extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | static_cast<int64_t>(p);
             d.trace_slot = static_cast<int32_t>(trace_slot);
           } else {
-            ++c.trace->extents_untraced;
+            ++t.extents_untraced;
           }
-        }
+        });
       }
     }
-    if (c.trace)
-      c.trace->rows_reading_max = std::max<int64_t>(c.trace->rows_reading_max, static_cast<int64_t>(c.reading_rows));
+    on_trace([&](StageRecord& t) {
+      t.rows_reading_max = std::max<int64_t>(t.rows_reading_max, static_cast<int64_t>(c.reading_rows));
+    });
     return true;
   }
 
@@ -967,7 +970,6 @@ class ReaderCore {
   // index is unique whatever the row's cut. Credit is untouched: refill() takes it per SQE, so a sub-read costs one
   // like a part did. Pieces with no bytes (past the row's sub-reads) are vetted here, at admission.
   void queue_sub_reads(size_t slot, size_t ordinal, const RowGeometry& g, int64_t admitted) {
-    Call& c = c_;
     const size_t parts = static_cast<size_t>(t_.parts);
     const size_t bank = slot / kBounceRows;
     BounceRow& r = rows_[slot];
@@ -992,19 +994,19 @@ class ReaderCore {
       ++r.extents_left;
       ++bank_live_[bank];
       queue_push(index);
-      if (c.trace) {
+      on_trace([&](StageRecord& t) {
         const size_t drive = file_drive_[extent->file];
-        c.trace->drive_dev[drive] = drive_dev_[drive];
-        c.trace->drive_extents[drive] += 1;
-        const int64_t trace_slot = c.trace->extents++;
+        t.drive_dev[drive] = drive_dev_[drive];
+        t.drive_extents[drive] += 1;
+        const int64_t trace_slot = t.extents++;
         if (trace_slot < kTraceExtents) {
-          c.trace->extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) |
+          t.extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) |
                                            static_cast<int64_t>(g.part[s]);
           d.trace_slot = static_cast<int32_t>(trace_slot);
         } else {
-          ++c.trace->extents_untraced;
+          ++t.extents_untraced;
         }
-      }
+      });
     }
     vet_pieces(slot, admitted);
   }
@@ -1016,7 +1018,9 @@ class ReaderCore {
     r.landed |= static_cast<uint8_t>(1u << sub);
     r.sub_done[sub] = done;
     const int64_t seq = ++c.events;
-    if (c.trace && r.ordinal < static_cast<size_t>(kTraceRows)) c.trace->sub_land_seq[r.ordinal][sub] = seq;
+    on_trace([&](StageRecord& t) {
+      if (r.ordinal < static_cast<size_t>(kTraceRows)) t.sub_land_seq[r.ordinal][sub] = seq;
+    });
     vet_pieces(slot, returned);
   }
 
@@ -1034,13 +1038,13 @@ class ReaderCore {
       }
       r.vetted |= bit;
       const int64_t seq = ++c.events;
-      if (c.trace) {
-        ++c.trace->pieces_vetted;
+      on_trace([&](StageRecord& t) {
+        ++t.pieces_vetted;
         if (r.ordinal < static_cast<size_t>(kTraceRows)) {
-          c.trace->piece_cqe[r.ordinal][j] = when;
-          c.trace->piece_seq[r.ordinal][j] = seq;
+          t.piece_cqe[r.ordinal][j] = when;
+          t.piece_seq[r.ordinal][j] = seq;
         }
-      }
+      });
     }
   }
 
@@ -1129,21 +1133,21 @@ class ReaderCore {
                   remaining,
                   static_cast<int64_t>(d.slot) * t_.slot_bytes + d.read->dest + g.start + g.done});
         }
-        if (c.trace) {
-          c.trace->submitted_bytes += remaining;
-          if (g.done > 0 || d.retries > 0) c.trace->retried_bytes += remaining;
-          c.trace->pending_max = std::max<int64_t>(c.trace->pending_max, static_cast<int64_t>(c.pending));
+        on_trace([&](StageRecord& t) {
+          t.submitted_bytes += remaining;
+          if (g.done > 0 || d.retries > 0) t.retried_bytes += remaining;
+          t.pending_max = std::max<int64_t>(t.pending_max, static_cast<int64_t>(c.pending));
           if (d.trace_slot >= 0) {
             if (fresh) {
-              if (c.trace->extent_submit[d.trace_slot] == 0) {
-                if (prepared == 0) prepared = stamp(c.trace);
-                c.trace->extent_submit[d.trace_slot] = prepared;
+              if (t.extent_submit[d.trace_slot] == 0) {
+                if (prepared == 0) prepared = trace_stamp();
+                t.extent_submit[d.trace_slot] = prepared;
               }
             } else {
-              ++c.trace->extent_attempts[d.trace_slot];
+              ++t.extent_attempts[d.trace_slot];
             }
           }
-        }
+        });
       }
     }
   }
@@ -1165,20 +1169,20 @@ class ReaderCore {
       completions_.assign(held_.begin(), held_.end());
       held_.clear();
       again_.clear();
-      const int64_t released = stamp(c.trace);
+      const int64_t released = trace_stamp();
       for (size_t k = 0; k < completions_.size(); ++k)
         process(completions_[k], released);
-      if (c.trace) {
+      on_trace([&](StageRecord&) {
         if (c.first_seen == 0) c.first_seen = released;
         c.last_seen = released;
-      }
+      });
       if (!c.failed) {
         for (uint32_t index : again_)
           queue_push(index);
       }
       return;
     }
-    if (c.trace && c.submitted == 0) c.submitted = stamp(c.trace);
+    on_trace([&](StageRecord& t) { if (c.submitted == 0) c.submitted = trace_stamp(); });
     // Fault: reversing only reorders one reaped batch, so wait for every read in flight; otherwise whether
     // anything is reversed depends on how the device happened to batch its completions.
     const unsigned wait_nr = fault_.reverse_cqes && c.pending > 0 ? c.pending : (ready ? 0u : 1u);
@@ -1194,7 +1198,7 @@ class ReaderCore {
     } else {
       c.soft_errors = 0;
     }
-    const int64_t returned = stamp(c.trace);
+    const int64_t returned = trace_stamp();
     completions_.clear();
     again_.clear();
     const unsigned seen = io_.reap(completions_);
@@ -1227,9 +1231,11 @@ class ReaderCore {
     }
     for (size_t k = 0; k < completions_.size(); ++k)
       process(completions_[k], returned);
-    if (c.trace && seen > 0) {
-      if (c.first_seen == 0) c.first_seen = returned;
-      c.last_seen = returned;
+    if (seen > 0) {
+      on_trace([&](StageRecord&) {
+        if (c.first_seen == 0) c.first_seen = returned;
+        c.last_seen = returned;
+      });
     }
     if (c.failed) return;
     for (uint32_t index : again_)
@@ -1327,12 +1333,12 @@ class ReaderCore {
       delivered += legs[k].done;
       if (legs[k].done < legs[k].bytes) break;
     }
-    if (c.trace) {
+    on_trace([&](StageRecord& t) {
       const size_t drive = file_drive_[d.read->file];
-      c.trace->drive_bytes[drive] += d.done;
-      c.trace->bytes += d.done;
-      if (d.trace_slot >= 0) c.trace->extent_cqe[d.trace_slot] = returned;
-    }
+      t.drive_bytes[drive] += d.done;
+      t.bytes += d.done;
+      if (d.trace_slot >= 0) t.extent_cqe[d.trace_slot] = returned;
+    });
     const size_t slot = static_cast<size_t>(d.slot);
     rows_[slot].filled += delivered;
     if (piece_stream_) land_sub_read(slot, d.sub, delivered, returned);
@@ -1394,17 +1400,17 @@ class ReaderCore {
         for (int attempt = 0; attempt < (twice ? 2 : 1); ++attempt) {
           if (publish_piece(target.words[w], c.publish->generation, bit)) continue;
           ++publish_refused_;
-          if (c.trace) ++c.trace->piece_publish_refused;
+          on_trace([&](StageRecord& t) { ++t.piece_publish_refused; });
           c.failed = true;
         }
       }
     }
     const int64_t seq = ++c.events;
-    if (c.trace) {
-      ++c.trace->pieces_published;
-      if ((r.published >> (j + 1)) != 0) ++c.trace->pieces_out_of_order;  // a higher-numbered piece went first
-      if (r.ordinal < static_cast<size_t>(kTraceRows)) c.trace->piece_publish[r.ordinal][j] = seq;
-    }
+    on_trace([&](StageRecord& t) {
+      ++t.pieces_published;
+      if ((r.published >> (j + 1)) != 0) ++t.pieces_out_of_order;  // a higher-numbered piece went first
+      if (r.ordinal < static_cast<size_t>(kTraceRows)) t.piece_publish[r.ordinal][j] = seq;
+    });
     r.published |= bit;
   }
 
@@ -1422,20 +1428,20 @@ class ReaderCore {
   void finish_row(size_t best, int64_t start, int64_t end) {
     Call& c = c_;
     const size_t ordinal = rows_[best].ordinal;
-    if (c.trace) {
+    on_trace([&](StageRecord& t) {
       if (ordinal < static_cast<size_t>(kTraceRows)) {
-        c.trace->row_pack_start[ordinal] = start;
-        c.trace->row_pack_end[ordinal] = end;
+        t.row_pack_start[ordinal] = start;
+        t.row_pack_end[ordinal] = end;
       } else {
-        ++c.trace->rows_untraced;
+        ++t.rows_untraced;
       }
       for (const Segment& segment : t_.segments)
-        c.trace->useful_bytes += segment.bytes;
+        t.useful_bytes += segment.bytes;
       // Rows pack in completion order and may overlap, so the first to finish is not always the first to start.
-      if (c.trace->pack_start == 0 || start < c.trace->pack_start) c.trace->pack_start = start;
-      c.trace->pack_end = std::max(c.trace->pack_end, end);
-      c.trace->pack_ns += end - start;
-    }
+      if (t.pack_start == 0 || start < t.pack_start) t.pack_start = start;
+      t.pack_end = std::max(t.pack_end, end);
+      t.pack_ns += end - start;
+    });
     if (c.packed) (*c.packed)[ordinal] = 1;
     derived().after_finish(best);
     rows_[best] = BounceRow{};
@@ -1445,15 +1451,15 @@ class ReaderCore {
   // A failed call: what every extent still live was owed but never returned is cancelled. Extents that
   // retired were accounted when they did.
   void account_unfinished() {
-    Call& c = c_;
-    if (!c.trace) return;
-    for (const ExtentDesc& d : descs_) {
-      if (d.generation == 0) continue;
-      const size_t drive = file_drive_[d.read->file];
-      c.trace->drive_bytes[drive] += d.done;
-      c.trace->bytes += d.done;
-      c.trace->cancelled_bytes += std::max<int64_t>(0, d.expected - d.done);
-    }
+    on_trace([&](StageRecord& t) {
+      for (const ExtentDesc& d : descs_) {
+        if (d.generation == 0) continue;
+        const size_t drive = file_drive_[d.read->file];
+        t.drive_bytes[drive] += d.done;
+        t.bytes += d.done;
+        t.cancelled_bytes += std::max<int64_t>(0, d.expected - d.done);
+      }
+    });
   }
 
   // Submit the prepared SQEs, waiting for `wait_nr` completions (0: do not block).

@@ -63,8 +63,6 @@ class RamTier {
     hot_stride_ = ((kHotHeaderBytes + (experts_ + 7) / 8 + kHotAlignment - 1) / kHotAlignment) * kHotAlignment;
     if (hot_page_ != nullptr && hot_bytes != kHotRecords * hot_stride_)
       throw std::runtime_error(error_prefix<Layout>() + "hot bitmap sidecar size disagrees with expert count");
-    for (auto& counter : counters_)
-      counter.store(0);
     for (int64_t row = 0; row < layers_; ++row) {
       Tier& tier = tiers_[row];
       tier.capacity = capacity[row];
@@ -81,7 +79,8 @@ class RamTier {
     if (lease_ != nullptr) init_lease_block(capacity, lease_bytes);
   }
 
-  // The copy thread's callbacks use tiers_, mutex_ and counters_, which are destroyed before copy_engine_ would be.
+  // The copy thread's callbacks use tiers_, mutex_ and the counter blocks, which are destroyed before copy_engine_
+  // would be.
   ~RamTier() {
     fill_join();  // the fill thread reads through reader_ into the slabs
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
@@ -99,11 +98,32 @@ class RamTier {
   uint8_t* page() const {
     return page_;
   }
-  int64_t busy_since() const {
-    return busy_since_.load();
+  // The watchdog's hung-request marker (D6): nonzero while a demand, an advisory or a fill is in service, a new value
+  // per episode. The watchdog thread times how long one value persists; the service reads no clock for it.
+  uint64_t busy_episode() const {
+    return busy_.load(std::memory_order_acquire);
   }
+  // The service thread's set-once words (kRunning, kSpinCpu), written by that thread only.
   void set_counter(int index, int64_t value) {
-    counters_[index].store(value);
+    core_.set(index, value);
+  }
+
+  // Counters (plan 2026-09-29-hotpath-zero-overhead D1). A core counter (is_core_counter) lives in the writing thread's
+  // own line-private block: count() is the service thread's (or the caller owning the tier while it is paused or
+  // pumped; the Python-side writers of a core counter hold mutex_, as every service-side writer of that counter does),
+  // copy_count() the copy thread's, fill_count() the prefill fill thread's (plan F10, until the fill's epilogue moves
+  // to the owner). Every other counter is a metric: InstrBuild keeps it as a shared relaxed atomic, ProdBuild has none.
+  template <Counter K>
+  void count(int64_t n = 1) {
+    count_into<K>(core_, n);
+  }
+  template <Counter K>
+  void copy_count(int64_t n = 1) {
+    count_into<K>(copy_core_, n);
+  }
+  template <Counter K>
+  void fill_count(int64_t n = 1) {
+    count_into<K>(fill_core_, n);
   }
   void request_pause(bool paused) {
     pause_requested_.store(paused);
@@ -136,7 +156,7 @@ class RamTier {
     begin_stage(kStageDemand, next_demand_, head - next_demand_);
     if (head - next_demand_ >= kDemandRecords) {
       // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq.
-      counters_[kOverruns].fetch_add(head - next_demand_ - (kDemandRecords - 2));
+      count<kOverruns>(head - next_demand_ - (kDemandRecords - 2));
       next_demand_ = skip_zero(head - kDemandRecords + 2u);
     }
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
@@ -148,38 +168,44 @@ class RamTier {
           !gpu_hot || (request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
                        load_acquire(record + kRecSeq) == next_demand_);
       if (!hot_ok) {
-        counters_[kOverruns].fetch_add(1);
+        count<kOverruns>();
         set_status(record, kFailed);
       } else if (lease_mode_ && request.armed && !read_lane_request(next_demand_, &request)) {
-        counters_[kOverruns].fetch_add(1);  // a later request overwrote the lane request: a lapped record
+        count<kOverruns>();  // a later request overwrote the lane request: a lapped record
       } else if (lease_mode_ && request.armed && terminal_seen(request)) {
-        counters_[kLateAfterTerminal].fetch_add(1);  // the device gave up on it: serve nothing, lease nothing
+        count<kLateAfterTerminal>();  // the device gave up on it: serve nothing, lease nothing
       } else {
         if (gpu_hot) apply_gpu_hot(request);
         const Defer reason = request.armed ? defers(request) : Defer::kNone;
         if (reason != Defer::kNone) {
-          // Held back, not failed and not served: return before handle_demand (so busy_since_ and kBusySeq stay
+          // Held back, not failed and not served: return before handle_demand (so the busy episode and kBusySeq stay
           // untouched, or the watchdog would count the wait as a hung read) and before the tail (no demand_done, no
           // advance). No stage record is pushed; the first observation time is kept for the one written when it is
           // served.
           if (deferred_seq_ != next_demand_) {
             deferred_seq_ = next_demand_;
-            deferred_observed_ns_ = cur_ != nullptr ? cur_->observed : 0;
-            counters_[reason == Defer::kRequestSlot ? kDeferredReuse : kDeferred].fetch_add(1);
+            if constexpr (Build::kMetrics) deferred_observed_ns_ = trace_.cur != nullptr ? trace_.cur->observed : 0;
+            if (reason == Defer::kRequestSlot) {
+              count<kDeferredReuse>();
+            } else {
+              count<kDeferred>();
+            }
           }
           deferred_stamp_ = lease_changes_.load();
           deferred_gen_ = request.gen;
-          cur_ = nullptr;
+          if constexpr (Build::kMetrics) trace_.cur = nullptr;
           return false;
         } else {
-          if (cur_ != nullptr && deferred_seq_ == next_demand_ && deferred_observed_ns_ != 0) {
-            cur_->observed = deferred_observed_ns_;
+          if constexpr (Build::kMetrics) {
+            if (trace_.cur != nullptr && deferred_seq_ == next_demand_ && deferred_observed_ns_ != 0) {
+              trace_.cur->observed = deferred_observed_ns_;
+            }
           }
           handle_demand(request, record);
         }
       }
     } else {
-      counters_[kOverruns].fetch_add(1);  // status stays pending: a waiting layer fails stop
+      count<kOverruns>();  // status stays pending: a waiting layer fails stop
     }
     deferred_seq_ = 0;
     if (const int64_t stall = done_stall_ns_.load(); stall > 0) {
@@ -199,7 +225,7 @@ class RamTier {
     if (head == 0 || !reached(head, next_advice_)) return false;
     begin_stage(kStageAdvisory, next_advice_, head - next_advice_);
     if (head - next_advice_ >= kAdviseRecords) {
-      counters_[kAdvisoriesSkipped].fetch_add(head - next_advice_ - (kAdviseRecords - 2));
+      count<kAdvisoriesSkipped>(head - next_advice_ - (kAdviseRecords - 2));
       next_advice_ = skip_zero(head - kAdviseRecords + 2u);
     }
     uint8_t* record = page_ + record_offset(kAdviseRing, kAdviseRecords, next_advice_);
@@ -210,17 +236,17 @@ class RamTier {
                        reached(load_acquire(page_ + kDemandHead), request.after + 1u) ||
                        load_acquire(page_ + kFatal) != 0 || pause_requested_.load();
     if (stale) {
-      cur_ = nullptr;  // a skipped advisory is no service: no stage record
-      counters_[kAdvisoriesSkipped].fetch_add(1);
+      if constexpr (Build::kMetrics) trace_.cur = nullptr;  // a skipped advisory is no service: no stage record
+      count<kAdvisoriesSkipped>();
     } else {
       in_advice_.store(true);
-      counters_[kAdvisories].fetch_add(1);
+      count<kAdvisories>();
       // An advisory gives up only between rows, not inside a blocking read: the watchdog's
       // stuck rule covers it like a demand, or a hung read would block stop()'s join forever.
-      busy_since_.store(now_ns());
+      begin_busy();
       int64_t rows = 0;
       serve(request, true, &rows);
-      busy_since_.store(0);
+      end_busy();
       in_advice_.store(false);
     }
     store_release(page_ + kAdviseDone, next_advice_);
@@ -232,25 +258,40 @@ class RamTier {
   // ---- Stage trace: one StageRecord per served request, drained by Python ----
 
   // Allocates the ring, then turns the trace on. Before the service thread starts, so the flag
-  // never flips under a request being served.
+  // never flips under a request being served. The instrumented build only (spec M9).
   void enable_trace(size_t capacity) {
-    if (threaded_.load())
-      throw std::runtime_error(error_prefix<Layout>() + "enable the stage trace before the service thread starts");
-    std::lock_guard<std::mutex> guard(trace_mutex_);
-    ring_ = std::make_unique<StageRing>(capacity);
-    trace_on_.store(true, std::memory_order_release);
+    if constexpr (!Build::kMetrics) {
+      (void)capacity;
+      throw_no_trace();
+    } else {
+      if (threaded_.load())
+        throw std::runtime_error(error_prefix<Layout>() + "enable the stage trace before the service thread starts");
+      std::lock_guard<std::mutex> guard(trace_.mutex);
+      trace_.ring = std::make_unique<StageRing>(capacity);
+      trace_.on.store(true, std::memory_order_release);
+    }
   }
 
   // Up to `max` records into `out` (stage_words() int64 each); returns how many. The count of records
   // dropped for a full ring is `trace_dropped()`.
   int64_t drain_trace(StageRecord* out, int64_t max) {
-    std::lock_guard<std::mutex> guard(trace_mutex_);
-    return ring_ ? ring_->drain(out, max) : 0;
+    if constexpr (!Build::kMetrics) {
+      (void)out;
+      (void)max;
+      throw_no_trace();
+    } else {
+      std::lock_guard<std::mutex> guard(trace_.mutex);
+      return trace_.ring ? trace_.ring->drain(out, max) : 0;
+    }
   }
 
   int64_t trace_dropped() {
-    std::lock_guard<std::mutex> guard(trace_mutex_);
-    return ring_ ? ring_->dropped() : 0;
+    if constexpr (!Build::kMetrics) {
+      throw_no_trace();
+    } else {
+      std::lock_guard<std::mutex> guard(trace_.mutex);
+      return trace_.ring ? trace_.ring->dropped() : 0;
+    }
   }
 
   // ---- Python-facing bookkeeping; eager callers pause the thread first (Task 12) ----
@@ -287,7 +328,7 @@ class RamTier {
     tier.stamp[slot] = ++tick_;
     tier.expert_slot[expert] = static_cast<int32_t>(slot);
     publish_map(row, expert, static_cast<int32_t>(slot));
-    counters_[kVersion].fetch_add(1);
+    count<kVersion>();
     return slot;
   }
 
@@ -307,7 +348,7 @@ class RamTier {
           error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while a fill writes it");
     }
     release_locked(row, slot);
-    counters_[kVersion].fetch_add(1);
+    count<kVersion>();
   }
 
   // ---- Prefill fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS, plan 2026-09-25-dsv41-prefill-fills) ----
@@ -317,8 +358,8 @@ class RamTier {
   // `fallback`), and one helper thread reads the claimed rows through the service's reader while the caller gathers.
   // A claimed slot is kReady and mapped at once, as assign() leaves it, and flagged filling until the read ends: no
   // admission can evict it and release() refuses it. The read's progress publishes how many rows have landed, as a
-  // prefix of the claim order (fill_wait). The helper holds busy_since_, so the watchdog aborts a hung fill the way it
-  // aborts a hung demand. fill_end() joins it; the service thread's resume() joins it first too, so the service
+  // prefix of the claim order (fill_wait). The helper holds a busy episode, so the watchdog aborts a hung fill the way
+  // it aborts a hung demand. fill_end() joins it; the service thread's resume() joins it first too, so the service
   // thread and a fill never use the reader at once. Returns the count claimed; slots[i] is expert i's slot.
   int64_t fill_begin(
       int64_t row,
@@ -358,7 +399,7 @@ class RamTier {
         claimed.push_back(expert);
         taken.push_back(slot);
       }
-      if (!taken.empty()) counters_[kVersion].fetch_add(1);
+      if (!taken.empty()) count<kVersion>();
     }
     for (size_t i = 0; i < taken.size(); ++i)
       slots[i] = taken[i];
@@ -486,7 +527,8 @@ class RamTier {
         std::move(backend),
         layers_,
         spin_ns,
-        counters_,
+        &copy_core_,
+        &stats_,
         [this](const CopyJob& job) { return copy_completed(job); },
         [this](const CopyJob& job) { return copy_acked(job); },
         [this](const CopyJob& job, int error) { copy_failed(job, error); },
@@ -559,8 +601,9 @@ class RamTier {
     std::atomic_thread_fence(std::memory_order_acquire);
     if (load_acquire64(prefetch_page_ + kPfReqGen) != word) return false;  // rewritten under us: read it again
     last_prefetch_gen_ = gen;
-    counters_[kPrefetchRequests].fetch_add(1);
-    const int64_t read_ns = now_ns();
+    count<kPrefetchRequests>();
+    int64_t read_ns = 0;
+    if constexpr (Build::kMetrics) read_ns = now_ns();  // prefetch_latency_ns, a metric
     uint32_t skip = 0;
     CopyJob job;
     if (admission_closed_.load() || copy_engine_ == nullptr || !copy_armed_.load(std::memory_order_acquire) ||
@@ -590,15 +633,17 @@ class RamTier {
       }
     }
     if (skip != 0) {
-      counters_
-          [skip == kPfSkipUnarmed    ? kPrefetchSkippedUnarmed
-           : skip == kPfSkipNotReady ? kPrefetchSkippedNotReady
-                                     : kPrefetchSkippedInvalid]
-              .fetch_add(1);
+      if (skip == kPfSkipUnarmed) {
+        count<kPrefetchSkippedUnarmed>();
+      } else if (skip == kPfSkipNotReady) {
+        count<kPrefetchSkippedNotReady>();
+      } else {
+        count<kPrefetchSkippedInvalid>();
+      }
       publish_prefetch_done(kPfTagSkipped, gen, skip);
       return true;
     }
-    counters_[kPrefetchIssued].fetch_add(1);
+    count<kPrefetchIssued>();
     copy_engine_->submit(job);
     return true;
   }
@@ -818,7 +863,7 @@ class RamTier {
           job.lanes[job.count++] = CopyLane{static_cast<int32_t>(lane), slot, dst, tier.generation[slot]};
           job.mask |= 1u << lane;
         } else {
-          counters_[kCopyFallbacks].fetch_add(1);
+          this->template count<kCopyFallbacks>();  // `count` is also this function's lane count
         }
       }
     }
@@ -852,16 +897,16 @@ class RamTier {
       store_release64(results + lane * kLeaseRowResultBytes + kLeaseRrReady, tagged_word(tags[lane], request.gen));
     }
     lanes_outstanding_.fetch_add(static_cast<int64_t>(taken));
-    counters_[kLeasesGranted].fetch_add(static_cast<int64_t>(taken));
-    if (hit_phase) counters_[kHitLeasesGranted].fetch_add(static_cast<int64_t>(hits));  // S7: resident lanes
+    this->template count<kLeasesGranted>(static_cast<int64_t>(taken));
+    if (hit_phase) this->template count<kHitLeasesGranted>(static_cast<int64_t>(hits));  // S7: resident lanes
     if (job.count > 0) {
       // After the COPYING words are published: the copy thread may complete and publish CopyDone at once.
       job.gen = request.gen;
       job.idx = idx;
       job.row = request.row;
-      job.submit_ns = now_ns();
-      counters_[kCopyJobs].fetch_add(1);
-      counters_[kCopyLanes].fetch_add(job.count);
+      if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
+      this->template count<kCopyJobs>();
+      this->template count<kCopyLanes>(job.count);
       copy_engine_->submit(job);
     }
     return true;
@@ -913,10 +958,10 @@ class RamTier {
         const bool voided = terminated && (mask >> lane & 1u) != 0;
         if (held.state == 1) {
           if (acknowledged) {
-            release_lease_locked(tier, held, kLeasesAcked);
+            this->template release_lease_locked<kLeasesAcked>(tier, held);  // declared below
             entry.watched = true;
           } else if (voided) {
-            release_lease_locked(tier, held, kLeasesVoided);
+            this->template release_lease_locked<kLeasesVoided>(tier, held);
             entry.watched = true;
           }
           // Plan 3.3: the last lease of a quarantined slot frees it. Its mapping was cleared on entry, so
@@ -931,7 +976,7 @@ class RamTier {
         // the same lane or ring index never matches entry.gen.
         if (!held.counted && ((held.state == 2 && voided) || (held.state == 3 && acknowledged))) {
           held.counted = true;
-          counters_[kLeaseDoubleSignal].fetch_add(1);
+          count<kLeaseDoubleSignal>();
         }
       }
       // S4. A lane whose grant has not run yet is still open. Under V1 the miss lanes sit ungranted between the
@@ -952,15 +997,19 @@ class RamTier {
     return lanes_outstanding_.load();
   }
 
-  // One lease released, exactly once: the per-lane state machine is what makes a second signal harmless.
-  void release_lease_locked(Tier& tier, LaneLease& held, int counter) {
+  // One lease released, exactly once: the per-lane state machine is what makes a second signal harmless. Called by the
+  // service (retire_leases) and by the copy thread (release_copied), so K must be a metric: a core counter has one
+  // writer per block.
+  template <Counter K>
+  void release_lease_locked(Tier& tier, LaneLease& held) {
+    static_assert(!is_core_counter(K), "a lease release is counted from two threads: it must be a metric");
     if (tier.leases[held.slot] == 0) {
       throw std::runtime_error(error_prefix<Layout>() + "lease underflow on slot " + std::to_string(held.slot));
     }
     tier.leases[held.slot] -= 1;
-    held.state = counter == kLeasesVoided ? 3 : 2;
+    held.state = K == kLeasesVoided ? 3 : 2;
     lanes_outstanding_.fetch_sub(1);
-    counters_[counter].fetch_add(1);
+    stats_.add(K);
     lease_changes_.fetch_add(1);
   }
 
@@ -1097,9 +1146,11 @@ class RamTier {
     fault_pending_.store(true, std::memory_order_release);
   }
 
+  // Relaxed reads of every block: a core counter is the sum of its writers' blocks (each word has one writer), a
+  // metric is stats_'s (always 0 in ProdBuild; Python reports only the core counters of a production host).
   void counters(int64_t* out) const {
     for (int i = 0; i < kCounterCount; ++i)
-      out[i] = counters_[i].load();
+      out[i] = core_.get(i) + copy_core_.get(i) + fill_core_.get(i) + stats_.get(i);
   }
 
  private:
@@ -1116,7 +1167,7 @@ class RamTier {
     for (int i = 0; i < job.count; ++i) {
       const CopyLane& lane = job.lanes[i];
       if (load_acquire(reinterpret_cast<const uint8_t*>(generations + lane.host_slot)) != lane.slot_generation) {
-        counters_[kCopyGenerationMismatches].fetch_add(1);
+        copy_count<kCopyGenerationMismatches>();
         raise_fatal(static_cast<uint32_t>(job.gen));
         return true;
       }
@@ -1145,14 +1196,14 @@ class RamTier {
     Outstanding& entry = outstanding_[job.idx];
     if (!entry.active || entry.gen != job.gen) {
       // Nothing but this completion releases a COPYING lane, so its entry cannot have closed: an internal error.
-      counters_[kCopyErrors].fetch_add(1);
+      copy_count<kCopyErrors>();
       raise_fatal(static_cast<uint32_t>(job.gen));
       return;
     }
     Tier& tier = tiers_[entry.row];
     for (int i = 0; i < job.count; ++i) {
       LaneLease& held = entry.lane[job.lanes[i].lane];
-      if (held.state == 1 && held.copy_engine) release_lease_locked(tier, held, kLeasesCopied);
+      if (held.state == 1 && held.copy_engine) release_lease_locked<kLeasesCopied>(tier, held);
     }
     bool open = entry.grants_pending;
     for (uint32_t lane = 0; lane < entry.count; ++lane)
@@ -1167,25 +1218,25 @@ class RamTier {
     const CopyLane& lane = job.lanes[0];
     const uint32_t* generations = slot_gen_ + slot_gen_base_[job.row];
     if (load_acquire(reinterpret_cast<const uint8_t*>(generations + lane.host_slot)) != lane.slot_generation) {
-      counters_[kCopyGenerationMismatches].fetch_add(1);
+      copy_count<kCopyGenerationMismatches>();
       raise_fatal(static_cast<uint32_t>(job.gen));
       return;
     }
     std::lock_guard<std::mutex> guard(mutex_);
     if (!prefetch_lease_.active || prefetch_lease_.gen != job.gen) {
-      counters_[kCopyErrors].fetch_add(1);
+      copy_count<kCopyErrors>();
       raise_fatal(static_cast<uint32_t>(job.gen));
       return;
     }
     Tier& tier = tiers_[prefetch_lease_.row];
     if (tier.leases[prefetch_lease_.slot] == 0) {
-      counters_[kCopyErrors].fetch_add(1);
+      copy_count<kCopyErrors>();
       raise_fatal(static_cast<uint32_t>(job.gen));
       return;
     }
     judge_[job.row] = PrefetchJudge{true, prefetch_lease_.expert};
-    counters_[kPrefetchCopied].fetch_add(1);
-    counters_[kPrefetchLatencyNs].fetch_add(now_ns() - job.submit_ns);
+    copy_count<kPrefetchCopied>();
+    if constexpr (Build::kMetrics) copy_count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);
     publish_prefetch_done(kPfTagCopied, job.gen, 0);
     tier.leases[prefetch_lease_.slot] -= 1;
     lease_changes_.fetch_add(1);  // a demand deferred on this slot may retry
@@ -1207,7 +1258,11 @@ class RamTier {
     if (!judge.pending) return;
     judge.pending = false;
     const bool used = listed(request.protect, judge.expert) || listed(request.need, judge.expert);
-    counters_[used ? kPrefetchUsed : kPrefetchWasted].fetch_add(1);
+    if (used) {
+      count<kPrefetchUsed>();
+    } else {
+      count<kPrefetchWasted>();
+    }
   }
 
   // Copy thread. Completion cannot be established: the leases stay held (E5) and the page fails stop.
@@ -1234,43 +1289,87 @@ class RamTier {
   }
 
   // Called the moment a posted record is found. With the trace off this is one relaxed load and
-  // no clock read; requests are served one at a time, so one member record serves them all.
+  // no clock read; requests are served one at a time, so one member record serves them all. ProdBuild: nothing.
   void begin_stage(int64_t kind, uint32_t seq, uint32_t backlog) {
-    if (!trace_on_.load(std::memory_order_relaxed)) {
-      cur_ = nullptr;
-      return;
+    if constexpr (Build::kMetrics) {
+      if (!trace_.on.load(std::memory_order_relaxed)) {
+        trace_.cur = nullptr;
+        return;
+      }
+      StageRecord& stage = trace_.stage;
+      const int64_t observed = stamp(&stage);  // before the reset below: the record is found, not built
+      stage = StageRecord{};
+      stage.observed = observed;
+      stage.kind = kind;
+      stage.seq = seq;
+      stage.backlog = backlog;
+      stage.prev_done = trace_.last_done;
+      stage.pack_workers = reader_.pack_workers();
+      stage.pack_split = reader_.pack_split();
+      stage.piece_stream = reader_.piece_stream() ? 1 : 0;
+      trace_.cur = &stage;
+    } else {
+      (void)kind;
+      (void)seq;
+      (void)backlog;
     }
-    const int64_t observed = stamp(&stage_);  // before the reset below: the record is found, not built
-    stage_ = StageRecord{};
-    stage_.observed = observed;
-    stage_.kind = kind;
-    stage_.seq = seq;
-    stage_.backlog = backlog;
-    stage_.prev_done = last_done_;
-    stage_.pack_workers = reader_.pack_workers();
-    stage_.pack_split = reader_.pack_split();
-    stage_.piece_stream = reader_.piece_stream() ? 1 : 0;
-    cur_ = &stage_;
   }
 
   // Service thread, before a read: install the fault inject_fault() left, on the reader only this thread drives.
+  // ProdBuild: nothing (its faults are the instrumented build's, plan Task 10).
   void apply_pending_fault() {
-    if (!fault_pending_.load(std::memory_order_acquire)) return;
-    ReadFault fault;
-    {
-      std::lock_guard<std::mutex> guard(fault_mutex_);
-      fault = pending_fault_;
-      fault_pending_.store(false, std::memory_order_relaxed);
+    if constexpr (Build::kFaults) {
+      if (!fault_pending_.load(std::memory_order_acquire)) return;
+      ReadFault fault;
+      {
+        std::lock_guard<std::mutex> guard(fault_mutex_);
+        fault = pending_fault_;
+        fault_pending_.store(false, std::memory_order_relaxed);
+      }
+      reader_.set_fault(fault);
     }
-    reader_.set_fault(fault);
   }
 
   void end_stage() {
-    if (cur_ == nullptr) return;
-    cur_->done = stamp(cur_);
-    last_done_ = cur_->done;
-    ring_->push(*cur_);
-    cur_ = nullptr;
+    if constexpr (Build::kMetrics) {
+      StageRecord* cur = trace_.cur;
+      if (cur == nullptr) return;
+      cur->done = stamp(cur);
+      trace_.last_done = cur->done;
+      trace_.ring->push(*cur);
+      trace_.cur = nullptr;
+    }
+  }
+
+  // The request in service's stage record, or null: always null in ProdBuild.
+  StageRecord* stage_record() const {
+    if constexpr (Build::kMetrics) {
+      return trace_.cur;
+    } else {
+      return nullptr;
+    }
+  }
+
+  [[noreturn]] static void throw_no_trace() {
+    throw std::runtime_error(
+        error_prefix<Layout>() + "the stage trace is in the instrumented host build only "
+        "(set SGLANG_DSV41_EXPERT_TRACE_PATH so the service loads it)");
+  }
+
+  template <Counter K>
+  void count_into(LineCounters<kCounterCount>& core, int64_t n) {
+    if constexpr (is_core_counter(K)) {
+      core.add(K, n);
+    } else {
+      stats_.add(K, n);
+    }
+  }
+
+  void begin_busy() {
+    busy_.store(++episodes_, std::memory_order_release);
+  }
+  void end_busy() {
+    busy_.store(0, std::memory_order_release);
   }
 
   static int64_t round_up_page(int64_t value) {
@@ -1361,7 +1460,7 @@ class RamTier {
   }
 
   void run_fill() {
-    busy_since_.store(now_ns());
+    begin_busy();
     apply_pending_fault();  // test only: inject_fault() acts on a fill's read as on a demand's
     std::vector<uint8_t> packed;
     size_t landed = 0;
@@ -1398,8 +1497,8 @@ class RamTier {
         if (result != 1 && !(i < packed.size() && packed[i] != 0)) release_locked(fill_row_, slot);
       }
       if (result != 1) {
-        counters_[kReadErrors].fetch_add(1);
-        counters_[kVersion].fetch_add(1);
+        fill_count<kReadErrors>();
+        fill_count<kVersion>();
       }
     }
     if (result == 1) {
@@ -1407,7 +1506,7 @@ class RamTier {
     } else {
       advance();
     }
-    busy_since_.store(0);
+    end_busy();
     fill_state_.store(result == 1 ? kFillOk : kFillFailed, std::memory_order_release);
   }
 
@@ -1443,7 +1542,7 @@ class RamTier {
       if (best >= 0) {
         *evicted = tier.slot_to_expert[best];
         release_locked(row, best);  // unmaps it before its bytes are overwritten (D11) and ends its ownership
-        counters_[kEvictions].fetch_add(1);
+        count<kEvictions>();
         slot = best;
       } else if (stop_at_share) {
         *evicted = -1;
@@ -1481,7 +1580,7 @@ class RamTier {
     }
     if (best < 0 && fallback) best = spare;
     if (best < 0) {
-      counters_[kNoVictim].fetch_add(1);
+      count<kNoVictim>();
       return -1;
     }
     const int32_t victim = tier.slot_to_expert[best];
@@ -1491,7 +1590,7 @@ class RamTier {
     tier.state[best] = kFree;
     disown_locked(tier, best);
     *evicted = victim;
-    counters_[kEvictions].fetch_add(1);
+    count<kEvictions>();
     return best;
   }
 
@@ -1519,7 +1618,7 @@ class RamTier {
     tier.slot_to_expert[slot] = -1;
     tier.state[slot] = kQuarantine;
     disown_locked(tier, slot);
-    counters_[kSlotsQuarantined].fetch_add(1);
+    count<kSlotsQuarantined>();
   }
 
   bool demand_pending() const {
@@ -1557,7 +1656,8 @@ class RamTier {
   bool serve(const Request& request, bool advisory, int64_t* rows, bool* deferred = nullptr) {
     *rows = 0;
     if (deferred != nullptr) *deferred = false;
-    if (cur_) cur_->lanes = request.lanes;
+    StageRecord* const cur = stage_record();  // null in ProdBuild, so every `if (cur)` below folds away
+    if (cur) cur->lanes = request.lanes;
     std::vector<int32_t> wanted;
     for (const auto* ids : {&request.protect, &request.need}) {
       for (int32_t expert : *ids) {
@@ -1576,7 +1676,7 @@ class RamTier {
     // is taken (the service refuses the flag too; this is the tier's own guard).
     const bool piece_stream = reader_.piece_stream();
     if (ok && piece_stream && !(two_phase_ && lease_mode_)) {
-      counters_[kPieceStreamRefused].fetch_add(1);
+      count<kPieceStreamRefused>();
       ok = false;
     }
     bool publishing = false;  // piece streaming: this request's miss lanes have readiness words to publish into
@@ -1605,7 +1705,7 @@ class RamTier {
         const int64_t want = static_cast<int64_t>(missing.size());
         if (census.free + census.evictable < want && census.free + census.evictable + census.leased >= want) {
           if (!advisory) {
-            counters_[kDeferred].fetch_add(1);
+            count<kDeferred>();
             if (deferred != nullptr) *deferred = true;
           }
           ok = false;
@@ -1667,11 +1767,11 @@ class RamTier {
           release_locked(request.row, slot);
         }
         // Each slot taken may have evicted a row, and that eviction stays: the map moved.
-        if (!slots.empty()) counters_[kVersion].fetch_add(1);
+        if (!slots.empty()) count<kVersion>();
         slots.clear();
       }
     }
-    if (cur_) cur_->reserved = stamp(cur_);
+    if (cur) cur->reserved = stamp(cur);
     int64_t status = kStatusNoRead;
     // Per slot: the row was packed whole (read() sets it). A member, not a local, so that the buffer
     // the pipeline writes into is allocated once rather than per served demand on the service thread
@@ -1689,7 +1789,7 @@ class RamTier {
         std::this_thread::sleep_for(std::chrono::nanoseconds(delay));
       }
       if (fail_reads_.load()) {
-        counters_[kReadErrors].fetch_add(1);
+        count<kReadErrors>();
         ok = false;
         status = kStatusFailed;
       } else {
@@ -1703,7 +1803,7 @@ class RamTier {
               return advisory && (demand_pending() || pause_requested_.load() || stop_requested_.load() ||
                                   (abandon_after > 0 && admitted >= static_cast<size_t>(abandon_after)));
             },
-            cur_,
+            cur,
             &packed,
             advisory ? 1 : SIZE_MAX,
             // Safety, not just style: read() runs here with mutex_ NOT held -- the only lock_guard in
@@ -1713,8 +1813,8 @@ class RamTier {
             // read()'s drain loop under a lock, this callback would deadlock against it.
             [this] { retire_leases(); },
             publishing ? &piece_publish_ : nullptr);
-        if (piece_stream) counters_[kPiecePublishRefused].store(reader_.publish_refused());
-        if (result == 0) counters_[kReadErrors].fetch_add(1);
+        if (piece_stream) stats_.store(kPiecePublishRefused, reader_.publish_refused());
+        if (result == 0) count<kReadErrors>();
         ok = result == 1;
         cancelled = result == -1;
         status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
@@ -1748,7 +1848,7 @@ class RamTier {
           }
         }
         (advisory ? tier.rows_advisory : tier.rows_demand) += published;
-        counters_[kVersion].fetch_add(1);
+        count<kVersion>();
       }
     }
     if (lease_mode_ && !advisory) {
@@ -1779,16 +1879,16 @@ class RamTier {
         if (!grant_lanes_locked(request)) ok = false;
       }
     }
-    if (cur_) {
-      cur_->mapped = stamp(cur_);
-      cur_->row = request.row;
-      cur_->ok = ok ? 1 : 0;
-      cur_->status = ok || status != kStatusNoRead ? status : kStatusFailed;
-      cur_->rows = published;
+    if (cur) {
+      cur->mapped = stamp(cur);
+      cur->row = request.row;
+      cur->ok = ok ? 1 : 0;
+      cur->status = ok || status != kStatusNoRead ? status : kStatusFailed;
+      cur->rows = published;
     }
     if (published > 0) {
-      counters_[kRowsRead].fetch_add(published);
-      if (advisory) counters_[kAdvisoryRows].fetch_add(published);
+      count<kRowsRead>(published);
+      if (advisory) count<kAdvisoryRows>(published);
     }
     if (ok) *rows = published;
     return ok;
@@ -1819,24 +1919,30 @@ class RamTier {
   }
 
   void handle_demand(const Request& request, uint8_t* record) {
-    busy_since_.store(now_ns());
+    begin_busy();
     store_release(page_ + kBusySeq, request.seq);
-    if (load_acquire(page_ + kFatal) != 0) counters_[kLateAfterFatal].fetch_add(1);
+    if (load_acquire(page_ + kFatal) != 0) count<kLateAfterFatal>();
     int64_t rows = 0;
     const bool ok = request.armed ? serve(request, false, &rows) : touch_request(request);
-    if (cur_ && !request.armed) {
-      cur_->kind = kStageTouch;
-      cur_->lanes = request.lanes;
-      cur_->row = request.row;
-      cur_->ok = ok ? 1 : 0;
-      cur_->status = ok ? kStatusTouch : kStatusFailed;
+    if (StageRecord* const cur = stage_record(); cur && !request.armed) {
+      cur->kind = kStageTouch;
+      cur->lanes = request.lanes;
+      cur->row = request.row;
+      cur->ok = ok ? 1 : 0;
+      cur->status = ok ? kStatusTouch : kStatusFailed;
     }
     // Classified by what was read: an empty need whose protect ids had to be read is D12's race.
-    if (ok) counters_[rows == 0 ? kTouchOnly : kServedRequests].fetch_add(1);
+    if (ok) {
+      if (rows == 0) {
+        count<kTouchOnly>();
+      } else {
+        count<kServedRequests>();
+      }
+    }
     _mm_sfence();
     set_status(record, ok ? kServed : kFailed);
     store_release(page_ + kBusySeq, 0);
-    busy_since_.store(0);
+    end_busy();
   }
 
   uint8_t* page_;
@@ -1916,7 +2022,10 @@ class RamTier {
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> threaded_{false};
   std::atomic<uint32_t> skip_advice_upto_{0};
-  std::atomic<int64_t> busy_since_{0};
+  // The watchdog's hung-request marker (D6), see busy_episode(): a new value per demand, advisory or fill in service,
+  // 0 when none. episodes_ is the service thread's, or a fill's (they never run at once: a fill needs the pause).
+  std::atomic<uint64_t> busy_{0};
+  uint64_t episodes_ = 0;
   std::atomic<int64_t> delay_ns_{0};
   std::atomic<int64_t> delay_after_{0};
   std::atomic<int64_t> abandon_after_{0};
@@ -1924,14 +2033,22 @@ class RamTier {
   std::mutex fault_mutex_;  // guards pending_fault_ between inject_fault() and the service thread
   ReadFault pending_fault_{};
   std::atomic<bool> fault_pending_{false};
-  std::atomic<int64_t> counters_[kCounterCount];
-  // Stage trace. cur_ points at stage_ while a traced request is in service, else null.
-  std::atomic<bool> trace_on_{false};
-  std::mutex trace_mutex_;  // guards ring_ against a drain racing enable_trace
-  std::unique_ptr<StageRing> ring_;
-  StageRecord stage_{};
-  StageRecord* cur_ = nullptr;
-  int64_t last_done_ = 0;
+  // Counters, see count(). One line-private block per writer thread; the metrics only in InstrBuild.
+  LineCounters<kCounterCount> core_;       // service thread (or the caller owning the tier while it is paused)
+  LineCounters<kCounterCount> copy_core_;  // copy thread only
+  LineCounters<kCounterCount> fill_core_;  // prefill fill thread only (plan F10; Task 15 moves its epilogue off it)
+  [[no_unique_address]] Stats<Build::kMetrics, kCounterCount> stats_;  // InstrBuild: any thread, relaxed RMW
+  // Stage trace (spec M9), InstrBuild only. cur points at stage while a traced request is in service, else null.
+  struct TraceState {
+    std::atomic<bool> on{false};
+    std::mutex mutex;  // guards ring against a drain racing enable_trace (Python only)
+    std::unique_ptr<StageRing> ring;
+    StageRecord stage{};
+    StageRecord* cur = nullptr;
+    int64_t last_done = 0;
+  };
+  struct NoTraceState {};
+  [[no_unique_address]] std::conditional_t<Build::kMetrics, TraceState, NoTraceState> trace_;
 };
 
 }  // namespace expert_stream

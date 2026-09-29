@@ -764,8 +764,9 @@ struct HostExports {
     result[2] = census.leased;
   }
 
-  static int64_t busy_since(int64_t handle) {
-    return find(handle)->busy_since();
+  // The watchdog's busy episode (D6): nonzero while a request or fill is in service, a new value per episode.
+  static int64_t busy_episode(int64_t handle) {
+    return static_cast<int64_t>(find(handle)->busy_episode());
   }
 
   static void close_admission(int64_t handle) {
@@ -924,6 +925,16 @@ struct HostExports {
     expert_stream::verify_named(
         "out", TensorMatcher({expert_stream::kCounterCount}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     find(handle)->counters(static_cast<int64_t*>(out.data_ptr()));
+  }
+
+  // Bit k set: counter k is a core counter (is_core_counter), kept by the production build. Python's CORE_COUNTERS
+  // is checked against it.
+  static int64_t core_counter_mask() {
+    static_assert(expert_stream::kCounterCount <= 63, "the core-counter mask is one int64");
+    int64_t mask = 0;
+    for (int k = 0; k < expert_stream::kCounterCount; ++k)
+      mask |= expert_stream::is_core_counter(k) ? int64_t{1} << k : 0;
+    return mask;
   }
 
   static void layer_rows(int64_t handle, int64_t advisory, TensorView out) {
@@ -1207,7 +1218,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_lease, Exports::inject_lease);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lease_entry, Exports::lease_entry);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_victim_census, Exports::victim_census);                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_busy_since, Exports::busy_since);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_busy_episode, Exports::busy_episode);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_close_admission, Exports::close_admission);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_lease_mode, Exports::set_lease_mode);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_gpu_hot, Exports::set_gpu_hot);                       \
@@ -1232,6 +1243,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_counters, Exports::counters);                             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_core_counter_mask, Exports::core_counter_mask);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layer_rows, Exports::layer_rows);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_words, Exports::trace_words);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_enable, Exports::trace_enable);                     \

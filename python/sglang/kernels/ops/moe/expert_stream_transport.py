@@ -705,6 +705,31 @@ COUNTERS = (
     "prefetch_latency_ns",
 )
 
+# The counters a production host keeps (plan 2026-09-29-hotpath-zero-overhead D1; tier_protocol.h is_core_counter,
+# checked against expert_stream_core_counter_mask): the shutdown line's served, rows and errors, the failure evidence a
+# fail-stop message prints, the admission policy's outcomes, and the functional version. In COUNTERS order. Every other
+# counter is a metric the production build does not compile: its ``counters()`` has no such key.
+CORE_COUNTERS = (
+    "served",
+    "touch_only",
+    "rows_read",
+    "read_errors",
+    "evictions",
+    "overruns",
+    "late_after_fatal",
+    "no_victim",
+    "version",
+    "running",
+    "spin_cpu",
+    "deferred",
+    "deferred_reuse",
+    "piece_stream_refused",
+    "slots_quarantined",
+    "copy_errors",
+    "copy_generation_mismatches",
+)
+assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
+
 # The native-prefetch page (exl3_ram_miss_host.cpp kPf*, exl3_native_prefetch.cuh): the device's request line and
 # the service's done line. Tags sit in the top byte over a 56-bit request generation, as in the lease block.
 PREFETCH_PAGE_BYTES = 256
@@ -1000,9 +1025,10 @@ class ExpertStreamHost:
         """Shutdown, first step: the service serves nothing new and the header's shutdown word is set."""
         self._module.expert_stream_close_admission(self.handle)
 
-    def busy_since_ns(self) -> int:
-        """When the request now in service began (0 when none): what the watchdog's stuck rule reads."""
-        return int(self._module.expert_stream_busy_since(self.handle))
+    def busy_episode(self) -> int:
+        """The busy episode of the request (or fill) now in service, 0 when none: a new value per episode, which the
+        watchdog times on its own thread (its stuck rule)."""
+        return int(self._module.expert_stream_busy_episode(self.handle))
 
     def enable_lease_mode(self) -> None:
         """Lease every armed request's lanes and publish their row results (LEASE_PROTOCOL.md 7); before the thread starts."""
@@ -1198,9 +1224,11 @@ class ExpertStreamHost:
         return int(self._module.expert_stream_trace_clock_reads())
 
     def counters(self) -> dict[str, int]:
+        """Every counter on the instrumented build; only ``CORE_COUNTERS`` on production, which has no metrics."""
         out = torch.zeros(len(COUNTERS), dtype=torch.int64)
         self._module.expert_stream_counters(self.handle, out)
-        return dict(zip(COUNTERS, out.tolist()))
+        values = dict(zip(COUNTERS, out.tolist()))
+        return values if self.variant == "instr" else {k: values[k] for k in CORE_COUNTERS}
 
     def layer_rows(self) -> list[int]:
         """Rows read for demands only (not advisories), per streamed layer: the RAM misses behind ``f``.

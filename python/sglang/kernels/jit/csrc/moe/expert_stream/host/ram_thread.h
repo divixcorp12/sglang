@@ -7,14 +7,16 @@ namespace sglang {
 namespace expert_stream {
 
 // Pumps one RamTier on its own thread (plan D19): demands first, then advisories; spins
-// with _mm_pause() for spin_ns after the last request, else sleeps 50 us between polls.
+// with _mm_pause() for spin_ns after the last request, else sleeps 50 us between polls. The spin is an idle-poll
+// budget calibrated once in start() (idle_budget), so the thread reads no clock while it serves (spec M8).
 // pause() is a handshake: it asks every advisory in flight to give up at its next row,
 // skips advisories posted so far (resume() skips those posted during the pause), and returns once the loop has
 // acknowledged the pause between two requests. While paused the loop takes no request, so an eager caller owns the
 // slots until resume(). The watchdog (plan D15), on its own thread so a stuck read cannot silence it, aborts the
 // process when the fatal word stays raised for fatal_wait without stop() (the process did not fail stop), or when one
-// demand or advisory stays in service for fatal_wait (a hung read). It outlives the service thread's
-// join in stop(), so a stop during a hung read, demand or advisory, still ends in its abort.
+// demand, advisory or fill stays in service for fatal_wait (a hung read): it times how long one busy episode
+// (RamTier::busy_episode) persists, so the clock is read on the watchdog thread only (D6). It outlives the service
+// thread's join in stop(), so a stop during a hung read, demand or advisory, still ends in its abort.
 // pause()/resume() are not reentrant: their one owner is the slot table's depth counter
 // (Task 14), which calls pause at depth 0->1 and resume at 1->0.
 template <class Tier>
@@ -35,6 +37,7 @@ class RamThread {
 
   // Throws when the thread cannot be pinned to cpu_core (it is then joined, never left floating).
   void start() {
+    spin_iters_ = idle_budget(spin_ns_);  // on the caller's thread: the service thread never reads the clock to pace
     tier_->set_threaded(true);
     thread_ = std::thread([this] { run(); });
     while (pin_error_.load() == kPinPending)
@@ -109,7 +112,7 @@ class RamThread {
     pin_error_.store(error);
     if (error != 0) return;
     tier_->set_counter(kRunning, 1);
-    int64_t last_active = now_ns();
+    uint64_t idle = 0;  // empty polls since the last request: the spin budget counts these, not elapsed time
     uint32_t heartbeat = 0;
     uint32_t iterations = 0;
     while (!stop_.load(std::memory_order_relaxed)) {
@@ -123,14 +126,14 @@ class RamThread {
         continue;
       }
       if (tier_->pump_demand() || tier_->pump_prefetch() || tier_->pump_advice()) {
-        last_active = now_ns();
+        idle = 0;
         iterations = 0;  // one heartbeat per request served
         continue;
       }
-      if (now_ns() - last_active < spin_ns_) {
+      if (++idle < spin_iters_) {
         _mm_pause();
       } else {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        std::this_thread::sleep_for(std::chrono::microseconds(50));  // the idle path (spec L12): kept
       }
     }
     tier_->set_counter(kRunning, 0);
@@ -139,6 +142,8 @@ class RamThread {
   void watch() {
     int64_t fatal_since = 0;
     bool reported = false;
+    uint64_t episode = 0;       // the busy episode last seen, 0: idle
+    int64_t episode_since = 0;  // when the watchdog first saw it
     while (!watch_stop_.load()) {
       const uint32_t fatal = load_acquire(page_ + kFatal);
       const int64_t now = now_ns();
@@ -154,10 +159,16 @@ class RamThread {
         }
         if (fatal_since == 0) fatal_since = now;
       }
-      const int64_t busy_since = tier_->busy_since();
+      // D6: the clock is read here, every 20 ms, never by the service. One episode held past fatal_wait is a hung
+      // request; detection is at most 20 ms late against a 30 s deadline.
+      const uint64_t busy = tier_->busy_episode();
+      if (busy != episode) {
+        episode = busy;
+        episode_since = now;
+      }
       // Once stop() began, the process is failing stop: only a hung read can still abort.
       const bool fatal_held = !stop_.load() && fatal_since != 0 && now - fatal_since > fatal_wait_ns_;
-      const bool stuck = busy_since != 0 && now - busy_since > fatal_wait_ns_;
+      const bool stuck = episode != 0 && now - episode_since > fatal_wait_ns_;
       if (fatal_held || stuck) {
         std::fprintf(
             stderr,
@@ -180,6 +191,7 @@ class RamThread {
   int cpu_core_;
   int64_t fatal_wait_ns_;
   int64_t spin_ns_;
+  uint64_t spin_iters_ = 1;  // idle polls before the idle sleep: idle_budget(spin_ns_), set in start()
   std::thread thread_;
   std::thread watchdog_;
   static constexpr int kPinPending = -1;

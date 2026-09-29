@@ -76,7 +76,7 @@ def test_a_demand_whose_only_victims_are_leased_is_neither_served_nor_failed_and
     assert (host.counters()["evictions"], host.counters()["version"], host.slot_info(0), host.mapping(0)) == before
     assert host.counters()["deferred"] == 1, "one deferral, not one per poll"
     assert host.counters()["no_victim"] == 0 and host.counters()["read_errors"] == 0
-    assert host.busy_since_ns() == 0 and page_word(page, "busy_seq") == 0, (
+    assert host.busy_episode() == 0 and page_word(page, "busy_seq") == 0, (
         "a deferral is not a request in service: the watchdog's stuck rule would count the wait as a hung read"
     )
 
