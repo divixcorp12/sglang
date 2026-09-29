@@ -21,6 +21,7 @@ import argparse
 import glob
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -113,12 +114,14 @@ MUTANTS = [
 def run_target(target: str, root: Path, python: str, tsan_cxx: str | None, tag: str) -> tuple[int, str]:
     """Run one pytest target; (pytest's exit status, a one-line summary incl. any TSan report's SUMMARY line)."""
     base = Path(os.environ.get("MUTANTS_TMP", "/tmp")) / f"hotpath-mut-{os.getpid()}" / tag
-    env = dict(os.environ, PYTHONPATH=str(root / "python"))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(root / "python"), os.environ.get("PYTHONPATH")])))
     if target.startswith(TSAN) and tsan_cxx:
         env["CXX"] = tsan_cxx
     cmd = [python, "-m", "pytest", target, "-q", "-p", "no:randomly", "-p", "no:cacheprovider", f"--basetemp={base}"]
+    base.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
     proc = subprocess.run(cmd, cwd=root, env=env, capture_output=True, text=True, timeout=3600)
+    base.with_suffix(".log").write_text(proc.stdout + proc.stderr)
     lines = [ln for ln in proc.stdout.splitlines() if re.search(r"\d+ (passed|failed|skipped|error)", ln)]
     summary = lines[-1].strip() if lines else (proc.stdout.strip().splitlines() or ["?"])[-1]
     races = []
@@ -145,6 +148,9 @@ def main() -> int:
     ap.add_argument("--only", default="")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    # A stopped runner still reverts the mutant it applied (the finally below runs on SystemExit, not on SIGKILL).
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(129))
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip())
     if "dsv41-direct-prod" in str(root):
         sys.exit("refusing to mutate the production checkout")

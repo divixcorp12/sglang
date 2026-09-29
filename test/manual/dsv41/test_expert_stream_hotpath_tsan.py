@@ -15,6 +15,7 @@ runtime package that is not installed; Clang's is ``libclang_rt.tsan.so`` in its
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -92,7 +93,13 @@ def _run(child: str, args: list[str], tmp_path: Path) -> subprocess.CompletedPro
     runtime, why = tsan_runtime()
     if runtime is None:
         pytest.skip(why)
-    env = dict(os.environ, LD_PRELOAD=runtime, TSAN_OPTIONS=TSAN_OPTIONS, OMP_NUM_THREADS="1")
+    options = TSAN_OPTIONS
+    if "clang_rt" in runtime and shutil.which("llvm-symbolizer") is None:
+        # Without llvm-symbolizer Clang's runtime falls back to addr2line, whose reply parser trips a CHECK that then
+        # deadlocks re-symbolizing its own failure (divix01, Clang 21): report module+offset frames instead, and
+        # symbolize them offline (addr2line -f -C -e <module> <offset>).
+        options += " symbolize=0"
+    env = dict(os.environ, LD_PRELOAD=runtime, TSAN_OPTIONS=options, OMP_NUM_THREADS="1")
     proc = subprocess.run([sys.executable, "-c", child, *args], env=env, cwd=REPO, capture_output=True, text=True,
                           timeout=1800)
     (tmp_path / "child.stdout").write_text(proc.stdout)
