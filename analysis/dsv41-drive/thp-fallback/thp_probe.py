@@ -17,6 +17,9 @@ least-squares fit of chunk ms against visits gives the cost per visit, i.e. the 
 
 Options (all measurements; nothing here is production code):
   --madvise hugepage   madvise(MADV_HUGEPAGE) on each mapping before the fault (defrag=madvise then compacts)
+  --madvise nohugepage madvise(MADV_NOHUGEPAGE) on each mapping before the fault: 4 KiB pages only
+  --strategies ...     re-register the same faulted tier other ways (see strategy_items): order, clone,
+                       clone-rowsplit, prod
   --inject K           MADV_NOHUGEPAGE on one 2 MiB piece in each of K evenly spaced chunks: K mixed chunks
   --repair refault     after the fault, MADV_DONTNEED + re-touch every non-THP 2 MiB range (with MADV_HUGEPAGE)
   --repair collapse    after the fault, MADV_COLLAPSE every non-THP 2 MiB range
@@ -150,9 +153,117 @@ def chunk_model(chunks, present) -> list[dict]:
         else:
             self_visits = sum(max(h, first) - first for h in heads) // PAGE
         rows.append({"base": base, "length": length, "pages": pages, "heads": len(heads), "small_pages": small_pages,
-                     "coalesced": coalesced, "bvecs": bvecs, "visits": self_visits + len(heads) * earlier})
+                     "coalesced": coalesced, "bvecs": bvecs, "self": self_visits,
+                     "visits": self_visits + len(heads) * earlier})
         earlier += bvecs
     return rows
+
+
+_STRATEGY_SOURCE = r"""
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+
+#include "io/registered_buffers.h"
+
+using Clock = std::chrono::steady_clock;
+
+// Registers items (base, len) as one buffer each, in the given order, into a sparse table of n slots.
+// clone == 0: RegisteredBufferTable::add straight into the ring (production's call).
+// clone == 1: each item is registered alone into slot 0 of a scratch ring, whose pin accounting then scans only
+// itself, and cloned into slot i of the ring (IORING_REGISTER_CLONE_BUFFERS, DST_REPLACE); the scratch slot is
+// emptied again. Returns the items registered; out_ms gets each one's time.
+extern "C" int register_items(unsigned n, const uint64_t* base, const uint64_t* len, int clone, double* out_ms,
+                              double abort_ms, char* error, unsigned error_len) {
+  try {
+    io_uring ring, scratch;
+    int rc = io_uring_queue_init(8, &ring, 0);
+    if (rc) { std::snprintf(error, error_len, "ring: %s", std::strerror(-rc)); return -1; }
+    sglang::io::RegisteredBufferTable table;
+    if (!table.init(&ring, n)) {
+      std::snprintf(error, error_len, "sparse: %s", table.last_error_context().c_str());
+      io_uring_queue_exit(&ring);
+      return -1;
+    }
+    if (clone) {
+      rc = io_uring_queue_init(8, &scratch, 0);
+      if (!rc) rc = io_uring_register_buffers_sparse(&scratch, 1);
+      if (rc) { std::snprintf(error, error_len, "scratch: %s", std::strerror(-rc)); io_uring_queue_exit(&ring); return -1; }
+    }
+    const auto all = Clock::now();
+    unsigned done = 0;
+    for (; done < n; ++done) {
+      const auto t = Clock::now();
+      if (!clone) {
+        if (table.add(base[done], len[done], len[done]) != 1) {
+          std::snprintf(error, error_len, "item %u: %s", done, table.last_error_context().c_str());
+          break;
+        }
+      } else {
+        struct iovec v { reinterpret_cast<void*>(base[done]), static_cast<size_t>(len[done]) };
+        __u64 tag = 0;
+        rc = io_uring_register_buffers_update_tag(&scratch, 0, &v, &tag, 1);
+        if (rc != 1) { std::snprintf(error, error_len, "item %u scratch: %d", done, rc); break; }
+        rc = io_uring_clone_buffers_offset(&ring, &scratch, done, 0, 1, IORING_REGISTER_DST_REPLACE);
+        if (rc < 0) { std::snprintf(error, error_len, "item %u clone: %s", done, std::strerror(-rc)); break; }
+        struct iovec empty { nullptr, 0 };
+        rc = io_uring_register_buffers_update_tag(&scratch, 0, &empty, &tag, 1);
+        if (rc != 1) { std::snprintf(error, error_len, "item %u unscratch: %d", done, rc); break; }
+      }
+      out_ms[done] = std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+      if (std::chrono::duration<double, std::milli>(Clock::now() - all).count() > abort_ms) {
+        ++done;
+        std::snprintf(error, error_len, "aborted");
+        break;
+      }
+    }
+    if (clone) io_uring_queue_exit(&scratch);
+    io_uring_queue_exit(&ring);
+    return done;
+  } catch (const std::exception& e) {
+    std::snprintf(error, error_len, "%s", e.what());
+    return -1;
+  }
+}
+"""
+
+
+def build_strategy_library(directory: Path) -> ctypes.CDLL:
+    import shutil
+    import subprocess
+
+    source, library = directory / "strategy.cpp", directory / "libstrategy.so"
+    source.write_text(_STRATEGY_SOURCE)
+    built = subprocess.run([shutil.which("c++"), "-std=c++20", "-O2", "-shared", "-fPIC", "-I",
+                            str(ROOT / "python/sglang/kernels/jit/csrc"), str(source), "-luring", "-o", str(library)],
+                           capture_output=True, text=True, check=False)
+    assert built.returncode == 0, built.stdout + built.stderr
+    lib = ctypes.CDLL(str(library))
+    u64p = ctypes.POINTER(ctypes.c_uint64)
+    lib.register_items.argtypes = [ctypes.c_uint, u64p, u64p, ctypes.c_int, ctypes.POINTER(ctypes.c_double),
+                                   ctypes.c_double, ctypes.c_char_p, ctypes.c_uint]
+    lib.register_items.restype = ctypes.c_int
+    return lib
+
+
+def strategy_items(name: str, chunks_rows, model) -> list[tuple[int, int]]:
+    """The buffers a strategy registers, in its order. chunks_rows: (base, length, row bytes) per planned chunk."""
+    if name in ("prod", "clone"):
+        return [(b, n) for b, n, _ in chunks_rows]
+    if name == "order":  # coalesced chunks first, then the rest by THP count, most first (Smith's rule, equal P)
+        keyed = sorted(range(len(chunks_rows)), key=lambda k: (not model[k]["coalesced"], -model[k]["heads"], k))
+        return [chunks_rows[k][:2] for k in keyed]
+    if name == "clone-rowsplit":  # every chunk holding 4 KiB pages registered row by row
+        items = []
+        for (b, n, row), m in zip(chunks_rows, model):
+            if m["small_pages"]:
+                items += [(b + at, row) for at in range(0, n, row)]
+            else:
+                items.append((b, n))
+        return items
+    raise ValueError(name)
 
 
 def lsq(xs, ys) -> dict:
@@ -182,7 +293,7 @@ def main() -> int:
     ap.add_argument("--gib", type=float, default=4)
     ap.add_argument("--placement", default="", help="node:MiB,... (default: --gib split 5:4 over nodes 0 and 1)")
     ap.add_argument("--layers", type=int, default=0)
-    ap.add_argument("--madvise", choices=["none", "hugepage"], default="none")
+    ap.add_argument("--madvise", choices=["none", "hugepage", "nohugepage"], default="none")
     ap.add_argument("--inject", type=int, default=0)
     ap.add_argument("--repair", choices=["none", "refault", "collapse"], default="none")
     ap.add_argument("--fault", choices=["touch", "none"], default="touch")
@@ -190,6 +301,8 @@ def main() -> int:
     ap.add_argument("--abort-s", type=float, default=600)
     ap.add_argument("--workdir", default="/mnt/nvme1/thp-fallback")
     ap.add_argument("--label", default="")
+    ap.add_argument("--strategies", default="", help="comma list of order,clone,clone-rowsplit,prod: each registers "
+                    "the same faulted tier again on a fresh ring, after the production-harness registration")
     args = ap.parse_args()
 
     import sglang
@@ -214,9 +327,9 @@ def main() -> int:
 
     def allocate(nbytes, runs, row_bytes):
         tensor = real_allocate(nbytes, runs, row_bytes)
-        if args.madvise == "hugepage" and nbytes:
+        if args.madvise != "none" and nbytes:
             lo, hi = owner_span(tensor)
-            err = madvise(lo, hi - lo, MADV_HUGEPAGE)
+            err = madvise(lo, hi - lo, MADV_HUGEPAGE if args.madvise == "hugepage" else MADV_NOHUGEPAGE)
             assert err == 0, os.strerror(err)
         return tensor
 
@@ -316,6 +429,30 @@ def main() -> int:
         result["ms_coalesced_chunks"] = sum(m for m, r in zip(ms, model) if r["coalesced"])
         result["per_chunk"] = [[round(m, 1), r["coalesced"], r["small_pages"], r["heads"], r["visits"]]
                                for m, r in zip(ms, model)]
+    if args.strategies and not args.no_register:
+        slib = build_strategy_library(Path(args.workdir))
+        chunks_rows = [(b, n, row) for b_, n_, row in regions
+                       for b, n in plan([(b_, n_, row)])]
+        present = present_now()
+        model = chunk_model(chunks, present)
+        result["strategies"] = {}
+        for name in args.strategies.split(","):
+            items = strategy_items(name, chunks_rows, model)
+            n = len(items)
+            if n > (1 << 14):
+                result["strategies"][name] = {"error": f"{n} items > 16384 slots"}
+                continue
+            bases = (ctypes.c_uint64 * n)(*[b for b, _ in items])
+            lens = (ctypes.c_uint64 * n)(*[l for _, l in items])
+            oms, error = (ctypes.c_double * n)(), ctypes.create_string_buffer(512)
+            t = time.monotonic()
+            done = slib.register_items(n, bases, lens, int(name.startswith("clone")), oms, args.abort_s * 1000.0,
+                                       error, 512)
+            result["strategies"][name] = {"items": n, "done": done, "s": time.monotonic() - t,
+                                          "error": error.value.decode(),
+                                          "max_item_ms": max((oms[i] for i in range(max(done, 0))), default=0)}
+            print(name, json.dumps(result["strategies"][name]), file=sys.stderr, flush=True)
+        result["self_visits_g"] = sum(m["self"] for m in model) / 1e9
     result["node_available_mib_after"] = {n: growth.node_available_mib(n) for n, _ in placement}
     print(json.dumps(result), flush=True)
     return 0
