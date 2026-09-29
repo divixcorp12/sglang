@@ -5422,6 +5422,110 @@ python equiv.py compare chunked.jsonl layer-major-b.jsonl --allow-head-mismatch 
 Evidence: `divix01:/mnt/nvme1/layer-major/equiv-final/{chunked,layer-major-a,layer-major-b}/`
 (`driver.log`, `server.log`) and `equiv-final/{chunked,layer-major-a,layer-major-b}.jsonl`.
 
+## 28. Computing RAM-resident experts on the CPU: kernel and handoff microbenchmarks (2026-09-29)
+
+**Why.** Decode spends ~67 ms/token moving ~68 RAM-hit experts of 13.3 MB over the Gen3 link (§§25-27); the lease
+protocol, service thread and copy thread together cost ~2-4 ms/token. The alternative is to leave RAM-hit experts in
+RAM and compute them on the CPU, sending only the hidden state (10 KB) down and the expert output (20 KB) back. These
+two microbenchmarks measure both halves. No server ran; nothing here is a decode arm.
+
+**Kernel.** exllamav3's own CPU MoE kernel, `exllamav3_ext/cpu/moe_mul1.cpp` at `02aef45` (turboderp, upstream):
+the mul1 codebook fused into integer dot products, with scalar / AVX2 / AVX-512BW / VNNI / VBMI tiers. The Xeon 6154
+runs the AVX-512BW tier (no VNNI). It quantizes activations to int8, so it is not bit-identical to the GPU path.
+
+**Harness.** `analysis/dsv41-drive/cpu-experts/`: `bench.py` + `bench_ext.cpp` (kernel and DRAM-read probe),
+`handoff.py` + `handoff_ext.cu` (40-layer CUDA graph with a GPU->CPU->GPU handoff per layer), the three drivers
+`run.sh`/`run2.sh`/`run3.sh` as run. The raw `results.jsonl` stays on divix01 beside them (the repo ignores
+`*.jsonl`). exllamav3 is cloned beside the scripts, not vendored.
+- DSV4.1 geometry (5120 x 2304, 3 bpw, 13,315,584 B per expert, gated SiLU), 384 random-trellis experts (5.1 GB)
+  per run. Calls rotate through them so no expert repeats within 384/topk calls: every read is cold (L3 24.75 MB).
+  Throughput does not depend on the trellis values.
+- `EXL3_MOE_CPU_PIN=0` in every run: the kernel's pool pins workers to the machine's first physical cores and ignores
+  `taskset`. Cores were physical only (node 0: 0-17, node 1: 18-35) with `numactl --membind` to the same node.
+- All runs held `cc-gpu.lock`. Another session's CPU unit tests (`pytest test/registered/unit/kernels`) ran during
+  r2 and the handoff runs, so those numbers lean pessimistic.
+
+**Accuracy (DSV4.1 shapes, 2 experts, 1 thread).** The BW tier is 1.4% relative L2 from the tier-scalar fp32
+reference (the int8 activation quantization; upstream's tolerance is 5%). The band-contiguous ("swizzled") layout is
+bit-identical to the native one.
+
+### 28.1 CPU expert throughput
+
+| | node 1, r1 (pre-reboot) | node 1, r2 | node 0, r2 |
+|---|---:|---:|---:|
+| DRAM streaming read, 8-12 threads | 32.3 GB/s | 34.9 GB/s | **62.0 GB/s** |
+| ms per expert, 1 thread | 3.92 | 4.04 | - |
+| ms per expert, 4 threads | 1.02 | 1.02 | - |
+| ms per expert, 8 threads | 0.57 | 0.55 | 0.56 |
+| ms per expert, 12 threads | 0.45 | 0.40 | 0.39 |
+| ms per expert, 18 threads | 0.46 | 0.37 | **0.28** |
+
+Per-expert figures are 6 experts per call (p50). One expert per call costs about the same per expert (node 1,
+12 threads: 0.46 ms at 1, 0.42 at 2, 0.40 at 6), which matters because decode has 1-2 RAM hits per layer.
+
+- **One core decodes ~3.3 GB/s of EXL3**, so the kernel is compute-bound below ~8 threads and memory-bound above
+  it on node 1, where 12 threads reach ~92% of the socket's read ceiling.
+- **Node 0's memory reads 1.8x faster than node 1's**, so the two sockets' DIMM population evidently differs.
+  On node 0 the kernel stays core-bound at 18 threads (47 GB/s effective).
+- **Cross-socket costs nothing here:** node-0 cores reading node-1 memory ran 0.44 ms per expert at 16 threads (r1),
+  the same as local. Node 1's DRAM is the limit, not the socket link.
+- **Against the link:** the copy engine moves one expert in ~0.98 ms (13.6 GB/s). The CPU is 2.1-3.5x faster per
+  expert, depending on the socket.
+
+### 28.2 Per-layer GPU->CPU->GPU handoff
+
+Per layer, the GPU publishes the fp16 hidden state and a ready flag to pinned host memory. A spinning worker on node 1
+clears the flag, runs the kernel (12 threads, cold experts) and publishes a fp32 output and a done flag. The GPU waits,
+pulls the output into VRAM, and a consumer kernel makes the next layer's input depend on it. Two GPU sides were
+captured and replayed: **kernel** (zero-copy stores + a spin-wait kernel with a 2 s abort) and **memop**
+(`cudaMemcpyAsync` + `cuStreamWriteValue32`/`cuStreamWaitValue32`, no SM spinning). Overhead is per-layer time minus
+the worker's own measured work (p50). No replay aborted.
+
+| Experts per layer | kernel: per layer | kernel: overhead | memop: per layer | memop: overhead |
+|---:|---:|---:|---:|---:|
+| 0 (worker copies the output only) | 18.5 us | 8.6 us | 25.8 us | 16.0 us |
+| 1 | 473 us | 12 us | 481 us | 19 us |
+| 2 | 853 us | 16 us | 863 us | 23 us |
+| 4 | 1,647 us | 19 us | 1,671 us | 23 us |
+
+- **The handoff costs 9-23 us per layer, 0.4-0.9 ms per token.** Today's path spends ~45 us per layer between a
+  layer's post and its first copy (§27.3) before any bytes move.
+- **Compute inside the loop matches standalone:** 461 us for one expert against 0.40-0.46 ms in §28.1.
+- **16 threads:** within noise at 1 expert per layer (475-478 us), 5-15% faster at 2-4, with more jitter.
+
+### 28.3 What it implies [estimate]
+
+- ~68 RAM-hit experts per token at ~0.42 ms is ~28 ms on node 1 alone, against ~67 ms on the link today. Using node 0
+  as well gets ~15-20 ms if each socket computes the rows in its own memory, or ~21 ms if node 1 shares bands of each
+  expert with the link.
+- With NVMe exposure (~17 ms) and GPU compute (~14.6 ms) unchanged, decode lands near **50-60 ms/token (17-20
+  tok/s)** against ~100 today.
+
+**Not established:**
+- Quality: a logprob/KL comparison of the int8-activation CPU path on real DSV4.1 weights.
+- DSV4.1's clamped SwiGLU (limit 10) is not one of the kernel's activations; SiLU was measured (same cost).
+- Behaviour under a running server: service threads, NVMe DMA into node-1 memory, co-tenants.
+- CPU load on node 0 cuts H2D by 27-43% (§25.4); that matters less once the link carries little.
+- An expert computed on the CPU is not promoted into VRAM; the idle link could do that in the background.
+
+**Operational traps:**
+- The kernel's pool pins its own workers unless `EXL3_MOE_CPU_PIN=0` (above).
+- Pinning the handoff worker to one core made the pool it spawns inherit that core. Twelve spinning threads on one
+  core livelocked and held `cc-gpu.lock` for ~12 minutes; `handoff.py` now refuses a pinned worker.
+
+**Commands** (divix01, `/data/models/slang/nvfp4-work/cc-exl3-cpu-bench`, which also holds `results.jsonl` and the logs;
+`EXL3_MOE_CPU_PIN=0`, `.venv` python):
+```bash
+numactl --membind=1 taskset -c 18-21 python bench.py tiers
+numactl --membind=1 taskset -c 18-35 python bench.py bw 4 1,4,8,12,18 node1-local-r2
+numactl --membind=0 taskset -c 0-17  python bench.py bw 4 1,4,8,12,18 node0-local-r2
+numactl --membind=1 taskset -c 18-35 python bench.py perf 384 1,4,8,12,16,18 1,2,6 node1-local-r2
+numactl --membind=0 taskset -c 0-17  python bench.py perf 384 8,12,18 1,2,6 node0-local-r2
+numactl --membind=1 taskset -c 0-15  python bench.py perf 384 8,16 2,6 node0cores-node1mem       # r1
+numactl --membind=1 taskset -c 18-35 python handoff.py run -1 12    # and 16
+```
+Each ran under `flock cc-gpu.lock` and exited 0.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
