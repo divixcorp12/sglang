@@ -142,10 +142,12 @@ inline unsigned cut_legs(
   return n;
 }
 
-// An upper bound on the legs of a read of `longest` bytes over `iovecs` iovecs cut at `cut_bytes`: the size cuts, one
-// more per gap-separated run, and one more per registered-buffer change at a join (fixed read modes).
+// An upper bound on the legs of a read of `longest` bytes over `iovecs` iovecs cut at `cut_bytes`, including the
+// fixed modes' further cuts at registered-buffer changes. A join splits a read at most once (a gap, or a buffer
+// change), and a run between split joins of r bytes gives at most ceil(r / cut) legs, so the legs are at most
+// 1 + (iovecs - 1) + sum(ceil(r / cut) - 1) <= iovecs + longest / cut.
 inline size_t leg_bound(int64_t longest, size_t iovecs, int64_t cut_bytes) {
-  return static_cast<size_t>(longest / cut_bytes) + 2 * iovecs;
+  return static_cast<size_t>(longest / cut_bytes) + iovecs;
 }
 
 }  // namespace sglang::expert_stream
