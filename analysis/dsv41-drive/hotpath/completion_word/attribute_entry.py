@@ -58,7 +58,7 @@ def classify(frames: list[str]) -> tuple[str, str]:
                 return CLASSES.get(m.group(1), "other: CudaCopyBackend::" + m.group(1)), last_cuda
             # A backend call the compiler devirtualized and inlined into its caller (issue/mark inside
             # CopyEngine::run): the outermost libcuda frame is then the exported entry point the host called.
-            e = re.match(r"libcuda!(cu\w+?)(_v\d+)?$", last_cuda)
+            e = re.match(r"libcuda[^!]*!(cu\w+?)(_v\d+)?$", last_cuda)
             if e:
                 return ENTRY.get(e.group(1), "other entry: " + e.group(1)), last_cuda
             if "launch" in f.lower() and "Kernel" in f:
