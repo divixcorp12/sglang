@@ -72,7 +72,8 @@ CONTEXT_LENGTH = 131072
 # GB available), not prefill headroom: a chunked 16k prompt peaked 1 MiB short of the 32,202 MiB CUDA can use. 0.885
 # spends ~320 MiB of that KV spare on prefill headroom (analysis/dsv41-drive/recipe-mem/diagnosis.md, results.md).
 # 0.875 since 2026-09-29: at 0.885 a 419-token prompt OOMed in prefill (free fell 2.70 GB -> 37 MB with late Triton
-# loads; earlier launches bottomed at 0.12 GB), so another ~320 MiB moves from the KV pool to prefill headroom.
+# loads; earlier launches bottomed at 0.12 GB). The ~320 MiB comes out of the hot cache (15400 -> 15080), not the KV
+# pool: that pool is only the few hundred MB left in the fraction, and 0.875 alone shrank it 161,536 -> 7,936 tokens.
 MEM_FRACTION_STATIC = 0.875
 # 4096 since 2026-09-26: a chunk's cost is streaming the experts it routes to, nearly the same at 512 and 4096 tokens,
 # so a 16k prompt's TTFT fell 444 -> 107 s (27.17).
@@ -154,7 +155,8 @@ def base_env() -> dict[str, str]:
         # MEM_FRACTION_STATIC. Cut to 16100 for 4096-token prefill chunks and a 262144 context (27.17); the decode cost
         # of the cut is not measured (27.7's slope suggests ~2-3 ms/token). Cut to 15400 on 2026-09-29 for driver
         # 615.71.09's larger EAGER footprint, with MEM_FRACTION_STATIC 0.885 (recipe-mem/diagnosis.md, results.md).
-        "SGLANG_MOE_HOT_GPU_MB": "15400",
+        # 15080 since 2026-09-29, with MEM_FRACTION_STATIC 0.875: its ~320 MiB goes to prefill headroom.
+        "SGLANG_MOE_HOT_GPU_MB": "15080",
         "SGLANG_MOE_HOT_DYNAMIC": "1",
         "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
         "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "1",
