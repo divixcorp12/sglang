@@ -8,6 +8,8 @@
 #                                                      [mem_fraction_static]
 #   CHUNK_NSYS=1  captures the long prompt with Nsight Systems (node mode) to <out>/trace.nsys-rep, plus PCIe RX/TX
 #                 from a root metrics session to <out>/trace-pcie.nsys-rep.
+#   SMOKE_ENV="K=V ..."  further env overrides on the recipe (e.g. SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0 forces
+#                 chunked prefill), recorded in env.txt.
 #   mem_fraction_static  replaces the recipe's (default: keep it). The hot cache counts against it, so a smaller hot
 #                        cache at the same fraction grows the KV pool and leaves activation headroom unchanged.
 #
@@ -52,7 +54,7 @@ ss -ltn 'sport = :7867' | grep -q LISTEN && { say "production up; refusing"; exi
 rm -f $OUT/stages.jsonl
 mapfile -t ENV < <(PYTHONPATH=$H $PY -c "
 import arm_env
-e = arm_env.arm_env({'SGLANG_MOE_HOT_GPU_MB': '$HOT_MB'})
+e = arm_env.arm_env({'SGLANG_MOE_HOT_GPU_MB': '$HOT_MB', **dict(kv.split('=', 1) for kv in '${SMOKE_ENV:-}'.split())})
 e['SGLANG_DSV41_EXPERT_TRACE_PATH'] = '$OUT/stages.jsonl'
 e['PYTHONPATH'] = '$WT/python'
 e['PYTHONUNBUFFERED'] = '1'
