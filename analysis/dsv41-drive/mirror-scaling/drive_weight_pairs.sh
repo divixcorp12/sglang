@@ -3,7 +3,8 @@
 # Arms: W = SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=1:0.9:1, U = 1:1:1 (parse_mirror_weights maps unset to exactly (1.0,)*3,
 # so 1:1:1 is the default, set explicitly so both arms' env differs in that one value only). Everything else is the
 # standard recipe (arm_env.base_env: 3 mirrors, default block wait, untraced).
-# Order: alternating pairs, balanced: ARMS="W1 U1 U2 W2 W3 U3" by default (add "U4 W4 W5 U5" for more pairs).
+# Order: a discarded warm-up arm X0 (U weights; cold page cache after a reboot), then alternating pairs, balanced:
+# ARMS="X0 W1 U1 U2 W2 W3 U3" by default (add "U4 W4 W5 U5" for more pairs). X arms are in no pair.
 # Template: analysis/dsv41-drive/iopoll-cuts/drive_iopoll_cuts_arms.sh. Changes:
 #   - both locks are taken PER ARM and released between arms (rowimg-disk.lock first, then cc-gpu.lock is polled and
 #     taken by run_arm.sh itself), so other lanes can slot in; a lost race for cc-gpu.lock retries the arm;
@@ -24,11 +25,13 @@ PROD_PORT=7867
 DRIVER_VERSION=615.71.09
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
-DEVS="nvme0n1 nvme2n1 nvme3n1"  # /mnt/nvme0 (Samsung), /mnt/nvme4 (SPCC), /mnt/nvme2 (Samsung): the mirror roots' order
+# The mirror roots' drives, in SGLANG_MOE_EXPERT_MIRROR_DIRS order (/mnt/nvme0, /mnt/nvme4 = SPCC, /mnt/nvme2), resolved
+# from the mounts: /dev names move across reboots.
+DEVS=$(for m in /mnt/nvme0 /mnt/nvme4 /mnt/nvme2; do basename "$(findmnt -no SOURCE "$m")" | sed 's/p[0-9]*$//'; done | tr '\n' ' ')
 W_WEIGHTS=1:0.9:1
 U_WEIGHTS=1:1:1
 MEM_WAIT_S=${MEM_WAIT_S:-5400}
-read -r -a ARMS <<< "${ARMS:-W1 U1 U2 W2 W3 U3}"
+read -r -a ARMS <<< "${ARMS:-X0 W1 U1 U2 W2 W3 U3}"
 say() { echo "$(date +%T) $*"; }
 case $OUT in /mnt/nvme1/*) ;; *) say "out dir must be under /mnt/nvme1"; exit 1 ;; esac
 mkdir -p "$OUT"
@@ -45,8 +48,10 @@ check_worktree() {
 check_worktree "$WT" "$SHA" || exit 1
 driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader)
 [ "$driver" = "$DRIVER_VERSION" ] || { say "NVIDIA driver is '$driver', expected $DRIVER_VERSION"; exit 1; }
-[ "$(findmnt -no SOURCE /mnt/nvme0)" = /dev/nvme0n1p1 ] && [ "$(findmnt -no SOURCE /mnt/nvme4)" = /dev/nvme2n1p1 ] \
-    && [ "$(findmnt -no SOURCE /mnt/nvme2)" = /dev/nvme3n1p1 ] || { say "mirror mounts are not nvme0n1/nvme2n1/nvme3n1"; exit 1; }
+[ "$(echo $DEVS | wc -w)" = 3 ] || { say "cannot resolve the three mirror drives: '$DEVS'"; exit 1; }
+spcc=$(echo $DEVS | cut -d' ' -f2)
+grep -q SPCC "/sys/block/$spcc/device/model" || { say "/mnt/nvme4 ($spcc) is not the SPCC"; exit 1; }
+say "mirror drives (nvme0, SPCC nvme4, nvme2): $DEVS"
 
 listening() { ss -ltn "sport = :$1" | grep -q LISTEN; }
 ports_free() {
@@ -217,7 +222,7 @@ attempt() {  # <arm> <pair> <weights>: one locked attempt. rc 0 ok, 75 retry lat
 
 run_one() {  # <arm>
     local arm=$1 kind=${1:0:1} pair=${1:1} weights deadline rc
-    case $kind in W) weights=$W_WEIGHTS ;; U) weights=$U_WEIGHTS ;; *) say "unknown arm $arm"; return 1 ;; esac
+    case $kind in W) weights=$W_WEIGHTS ;; U|X) weights=$U_WEIGHTS ;; *) say "unknown arm $arm"; return 1 ;; esac
     deadline=$(( $(date +%s) + MEM_WAIT_S ))
     while :; do
         attempt "$arm" "$pair" "$weights"; rc=$?
