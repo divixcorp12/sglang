@@ -991,14 +991,15 @@ def test_server_args_back_the_prefix_cache_with_host_memory():
     argv = arm_env.ServerArgs(port=31050).argv()
     assert "--enable-hierarchical-cache" in argv
     flags = {
-        "--hicache-ratio": "2",
-        "--hicache-size": "10",
+        "--hicache-ratio": "14",
         "--hicache-io-backend": "kernel",
         "--hicache-write-policy": "write_through",
         "--hicache-mem-layout": "page_first_direct",
     }
     for flag, value in flags.items():
         assert argv[argv.index(flag) + 1] == value
+    # DeepSeek V4 HiCache raises on --hicache-size at tree-cache init; the ratio sizes the host pool.
+    assert "--hicache-size" not in argv
 
 
 def test_server_args_binds_loopback_by_default():

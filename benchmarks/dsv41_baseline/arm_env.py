@@ -278,11 +278,11 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             # A 4k-token conversation's SWA tail does not survive another's prefill in the 3584-slot pool, so revisits
             # reused nothing; the host copy restores them (DSV41_REFERENCE.md 27.16). Costs ~6k tokens of GPU KV.
             "--enable-hierarchical-cache",
+            # 14 since 2026-09-29, for a ~10 GB host pool; DSV4 HiCache refuses --hicache-size. Ratio 2 held 1.14 GB
+            # at a 195,840-token GPU pool. Each unit is ~0.25 GB of SWA plus ~1.6 KB per GPU pool token, so 14 gives
+            # ~6.7-10.6 GB over the 140k-311k-token pools seen across launches.
             "--hicache-ratio",
-            "2",
-            # 10 GB since 2026-09-29, overriding the ratio: at 2x a ~0.7 GB GPU KV pool the host held ~1.4 GB.
-            "--hicache-size",
-            "10",
+            "14",
             "--hicache-io-backend",
             "kernel",
             "--hicache-write-policy",
