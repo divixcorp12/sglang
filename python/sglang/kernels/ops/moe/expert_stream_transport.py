@@ -177,6 +177,7 @@ def _fault_tensor(
     leg: int = -1,
     ring_reset_fail: bool = False,
     leg_cut_cap: int = 0,
+    nop_flush_refused: bool = False,
 ) -> torch.Tensor:
     return torch.tensor(
         [
@@ -210,7 +211,7 @@ def _fault_tensor(
             last_publish_delay_ns,
             fixed_chunk_cap,
             leg,
-            int(ring_reset_fail),
+            (1 if (nop_flush_refused or ring_reset_fail) else 0) | (2 if ring_reset_fail else 0),
             leg_cut_cap,
         ],
         dtype=torch.int64,
@@ -304,8 +305,10 @@ def read_rows_with_fault(
     completion the end of its sub-read, as a file ending there would. ``fixed_chunk_cap`` (bytes, 0: 1 GiB) caps the
     registered-buffer chunks of a fixed read mode, so small slabs register as many chunks; ``leg`` narrows the
     ``part``, ``cqe_error`` and ``hold_ordinal`` faults to that leg of a fanned-out fixed read (-1: any).
-    ``ring_reset_fail`` makes the next ring reset fail (with a ``submit_error`` that leaves SQEs unconsumed): the
-    first read then raises "io_uring ring reset failed" and no second read runs. ``leg_cut_cap`` (bytes, 0: READ_CUTS
+    ``nop_flush_refused`` (with a ``submit_error`` that leaves SQEs unconsumed) refuses the drain's NOP submission of
+    those SQEs: a fixed read mode then raises "refused the NOP drain" and closes the reader, any other mode resets
+    its ring. ``ring_reset_fail`` also makes that reset fail: the first read then raises "io_uring ring reset failed"
+    (in a fixed read mode the NOP-drain error) and no second read runs. ``leg_cut_cap`` (bytes, 0: READ_CUTS
     and the device limits) cuts every read into legs of at most that many bytes on a 4 KiB boundary, whatever
     READ_CUTS says (plan 2026-09-28-iopoll-read-cuts); ``leg`` then narrows the faults to a cut leg as well.
 

@@ -120,7 +120,8 @@ int main(int argc, char** argv) {
       first_abandoned = 2;
     }
     for (size_t row = first_abandoned; row < 4; ++row) prep(reader, fx, row);
-    // (Task 2 inserts the refused / refused_fail hooks here.)
+    if (scenario == "refused" || scenario == "refused_fail") reader.set_nop_flush_refused(true);
+    if (scenario == "refused_fail") reader.set_ring_reset_fail(true);
 
     const auto t0 = std::chrono::steady_clock::now();
     try {
@@ -205,3 +206,27 @@ def test_discarding_unconsumed_sqes_keeps_the_ring_and_its_registrations(harness
     assert "PASS" in stdout, output
     assert _value(stdout, "REGISTRATIONS") == "1", output  # a ring reset registers a second time
     assert _value(stdout, "SQ_SPACE") == "16", output
+
+
+def test_a_refused_nop_drain_resets_a_ring_without_registered_buffers(harness, tmp_path):
+    # Normal read mode has no buffer table to rebuild, so a refused NOP drain still resets the ring (re-registering
+    # only the fixed files).
+    stdout, output = _run(harness, tmp_path, "refused", "normal")
+    assert "PASS" in stdout, output
+    assert _value(stdout, "REGISTRATIONS") == "2", output
+    assert _value(stdout, "SQ_SPACE") == "16", output
+
+
+@pytest.mark.parametrize("read_mode", ["fixed", "readv_fixed"])
+def test_a_refused_nop_drain_in_a_fixed_mode_throws_instead_of_re_registering(harness, tmp_path, read_mode):
+    # A reset would re-register the fixed buffers, which at tier scale outlasts the watchdog's fatal_wait: fail stop
+    # with the cause instead, leaving the reader closed and never registering again.
+    stdout, output = _run(harness, tmp_path, "refused", read_mode)
+    assert "RAISED" in stdout and "refused the NOP drain" in stdout and "fatal_wait" in stdout, output
+    assert _value(stdout, "READY") == "0" and stdout.rstrip().endswith("CLOSED"), output
+
+
+def test_a_failed_fallback_reset_raises_and_leaves_the_reader_closed(harness, tmp_path):
+    stdout, output = _run(harness, tmp_path, "refused_fail", "normal")
+    assert "RAISED io_uring ring reset failed" in stdout, output
+    assert _value(stdout, "READY") == "0" and stdout.rstrip().endswith("CLOSED"), output
