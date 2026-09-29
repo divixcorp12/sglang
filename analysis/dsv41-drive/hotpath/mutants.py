@@ -111,6 +111,54 @@ MUTANTS = [
 ]
 
 
+FRAME = re.compile(r"^\s+#(\d+) .*\((\S+?\.so)\+(0x[0-9a-f]+)\) \(BuildId: ([0-9a-f]+)\)")
+
+
+def _short(name: str) -> str:
+    while True:
+        shorter = re.sub(r"<[^<>]*>", "", name)
+        if shorter == name:
+            return re.sub(r"\([^()]*\)", "()", name.replace("sglang::expert_stream::", ""))
+        name = shorter
+
+
+def _module_by_build_id(build_id: str, module: str) -> str | None:
+    """The JIT cache's copy of a module by BuildId: a report can name a staging path that load_jit since removed."""
+    if os.path.exists(module):
+        return module
+    roots = [os.environ.get("SGLANG_JIT_CACHE_DIR", ""), str(Path.home() / ".cache/sglang/jit")]
+    for root in filter(None, roots):
+        for path in glob.glob(f"{root}/**/{Path(module).name}", recursive=True):
+            out = subprocess.run(["readelf", "-n", path], capture_output=True, text=True).stdout
+            if build_id in out:
+                return path
+    return None
+
+
+def symbolize(report: str) -> str:
+    """The first TSan report with the host module's frames symbolized offline (addr2line; function names without
+    template arguments). The children run with symbolize=0 under Clang without llvm-symbolizer, and GCC's in-process
+    symbolizer cannot read a module whose staging path is gone."""
+    lines = report.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("WARNING: ThreadSanitizer")), None)
+    if start is None:
+        return ""
+    end = next((i for i in range(start, len(lines)) if lines[i].startswith("SUMMARY:")), len(lines) - 1)
+    out = []
+    for ln in lines[start : end + 1]:
+        match = FRAME.match(ln)
+        if match and "expert_stream_host" in match.group(2):
+            path = _module_by_build_id(match.group(4), match.group(2))
+            if path:
+                fn = subprocess.run(["addr2line", "-f", "-C", "-e", path, match.group(3)], capture_output=True,
+                                    text=True).stdout.splitlines()
+                if fn:
+                    loc = fn[1].split("/host/")[-1] if len(fn) > 1 else ""
+                    ln = f"    #{match.group(1)} {_short(fn[0])} {loc}"
+        out.append(ln)
+    return "\n".join(out)
+
+
 def child_env(root: Path) -> dict[str, str]:
     return dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(root / "python"), os.environ.get("PYTHONPATH")])))
 
@@ -130,10 +178,14 @@ def run_target(target: str, root: Path, python: str, tsan_cxx: str | None, tag: 
     summary = lines[-1].strip() if lines else (proc.stdout.strip().splitlines() or ["?"])[-1]
     races = []
     for path in glob.glob(str(base / "**" / "child.stderr"), recursive=True):
-        races += [ln.strip() for ln in Path(path).read_text(errors="replace").splitlines()
-                  if ln.startswith("SUMMARY: ThreadSanitizer")]
+        report = symbolize(Path(path).read_text(errors="replace"))
+        if report:
+            races.append(report)
     if races:
-        summary += " | " + races[0][:300]
+        base.with_suffix(".tsan.txt").write_text(races[0] + "\n")
+        kind = races[0].splitlines()[0].removeprefix("WARNING: ThreadSanitizer: ").split(" (pid")[0]
+        tops = [ln.strip() for ln in races[0].splitlines() if re.match(r"^\s+#0 ", ln)][:2]
+        summary += f" | TSan {kind}: " + " vs ".join(tops)
     if "skipped" in summary and target.startswith(TSAN):
         skip = [ln for ln in proc.stdout.splitlines() if "SKIPPED" in ln]
         summary += " | " + (skip[0][:200] if skip else "")
