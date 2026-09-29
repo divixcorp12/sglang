@@ -83,6 +83,10 @@ int main(int, char** argv) {
     std::vector<iovec> in{{a, 8192}, {b + 512, 4096}};
     Plan p = plan(in, lim(1 << 30, 4095)); assert(p.n == 2 && p.legs[1].gap);
   }
+  { // a virtually contiguous join (the next iovec starts where the last ended) is no gap, even off the page
+    std::vector<iovec> in{{a, 9216}, {a + 9216, 4096}};
+    Plan p = plan(in, lim(1 << 30, 4095)); assert(p.n == 1 && p.legs[0].count == 2); tiles(in, p, 1 << 30);
+  }
   { // no virt boundary (mask 0): no gap rule
     std::vector<iovec> in{{a, 9216}, {b + 512, 4096}};
     Plan p = plan(in, lim(1 << 30, 0)); assert(p.n == 1);
@@ -121,6 +125,9 @@ int main(int, char** argv) {
     std::ofstream(dir + "/virt_boundary_mask") << "4095\n";
     DeviceLimits d; std::string why;
     assert(limits_from_queue_dir(dir, &d, &why) && d.cut_bytes == 262144 && d.virt_mask == 4095 && d.source == dir);
+    std::ofstream(dir + "/chunk_sectors") << "256\n";   // a boundary the cuts do not model: named in the source
+    assert(limits_from_queue_dir(dir, &d, &why) && d.cut_bytes == 262144 && d.source.find("chunk_sectors=256") != std::string::npos);
+    std::remove((dir + "/chunk_sectors").c_str());
     std::remove((dir + "/virt_boundary_mask").c_str());
     assert(limits_from_queue_dir(dir, &d, &why) && d.virt_mask == 4095);   // absent: conservative 4095
     std::remove((dir + "/max_segments").c_str());
@@ -213,9 +220,11 @@ def _pieces(images, on):
 
 def test_cuts_off_keeps_todays_credit_and_legs(tmp_path, uring_env):
     s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    assert s.tables.segments.shape[0] > 1  # a multi-segment row image: a read has several iovecs
     result, _, info, _, _ = _read(s)
     assert result == 1 and info["cut_reads"] == 0 and info["min_cut_bytes"] == 0
     assert info["credit"] == 16 * 3
+    assert info["leg_stride"] == 1  # a default read is one leg: no per-iovec leg storage, no >255-segment refusal
 
 
 def test_credit_scales_with_the_leg_bound(tmp_path, uring_env):
