@@ -111,10 +111,14 @@ MUTANTS = [
 ]
 
 
+def child_env(root: Path) -> dict[str, str]:
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(root / "python"), os.environ.get("PYTHONPATH")])))
+
+
 def run_target(target: str, root: Path, python: str, tsan_cxx: str | None, tag: str) -> tuple[int, str]:
     """Run one pytest target; (pytest's exit status, a one-line summary incl. any TSan report's SUMMARY line)."""
     base = Path(os.environ.get("MUTANTS_TMP", "/tmp")) / f"hotpath-mut-{os.getpid()}" / tag
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(root / "python"), os.environ.get("PYTHONPATH")])))
+    env = child_env(root)
     if target.startswith(TSAN) and tsan_cxx:
         env["CXX"] = tsan_cxx
     cmd = [python, "-m", "pytest", target, "-q", "-p", "no:randomly", "-p", "no:cacheprovider", f"--basetemp={base}"]
@@ -157,9 +161,12 @@ def main() -> int:
     if git(root, "status", "--porcelain", "--", H):
         sys.exit(f"{H} has local changes: mutants need a clean private worktree")
     head = git(root, "log", "-1", "--format=%h %s").strip()
-    import sglang  # noqa: F401 - the interpreter trap: print where sglang comes from before trusting a result
-
-    print("sglang.__file__ =", sglang.__file__, flush=True)
+    # The interpreter trap: where the targets' sglang comes from, before trusting a result.
+    where = subprocess.run([args.python, "-c", "import sglang; print(sglang.__file__)"], cwd=root, env=child_env(root),
+                           capture_output=True, text=True).stdout.strip()
+    print("sglang.__file__ =", where, flush=True)
+    if not where.startswith(str(root / "python")):
+        sys.exit(f"sglang resolves to {where!r}, not this worktree's python/")
     only = set(filter(None, args.only.split(",")))
     rows = [f"Mutants at {head}; python {args.python}; tsan CXX {args.tsan_cxx or os.environ.get('CXX', 'c++')}", "",
             "| mutant | file:line | target | mutant run (exit) | restored run (exit) | killed | restored green |",

@@ -9,3 +9,6 @@ called_from_lib:libtorch_python.so
 mutex:libtorch_python.so
 mutex:libtorch_cpu.so
 mutex:torchvision
+# A statically linked interpreter (divix01's venv python is miniconda's python3.13 binary, no libpython3.so): the same
+# interpreter mutex report, attributed to the executable.
+mutex:python3

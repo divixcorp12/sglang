@@ -36,6 +36,9 @@ STRESS_CHILD = textwrap.dedent("""
     from pathlib import Path
     from sglang.kernels.ops.moe import expert_stream_transport as ops
     ops._ALLOW_TSAN = True
+    # The device side too (sim_post, sim_wait, the page helpers): a record published through the uninstrumented
+    # production module is a plain memcpy to TSan, with its release store invisible, so the service's read races it.
+    ops._DEFAULT_VARIANT = "instr_tsan"
     sys.path.insert(0, "test/registered/unit/kernels")
     from test_expert_stream_hotpath_stress import run_stress
     report = run_stress(Path(sys.argv[1]), variant="instr_tsan", seconds=20.0, seed=7, fills=True)
@@ -60,14 +63,13 @@ FILLS_CHILD = textwrap.dedent("""
     sys.exit(int(code))
 """)
 
-# Timing tests, not ordering ones: under TSan's 5-15x slowdown their wall-clock bounds do not hold.
+# Timing tests, not ordering ones: under TSan's slowdown their wall-clock bounds do not hold. (-k, not --deselect:
+# node ids are relative to a rootdir that differs between checkouts.)
 FILLS_TARGETS = [
     "test/registered/unit/kernels/test_exl3_ram_miss_prefill_fills.py",
     "test/registered/unit/kernels/test_expert_stream_ownership.py",
-    "--deselect",
-    "test/registered/unit/kernels/test_exl3_ram_miss_prefill_fills.py::test_fill_wait_returns_as_a_prefix_lands",
-    "--deselect",
-    "test/registered/unit/kernels/test_expert_stream_ownership.py::test_a_set_hot_burst_past_the_ring_is_applied_in_order",
+    "-k",
+    "not test_fill_wait_returns_as_a_prefix_lands and not test_a_set_hot_burst_past_the_ring_is_applied_in_order",
 ]
 
 
