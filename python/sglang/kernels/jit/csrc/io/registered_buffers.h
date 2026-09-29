@@ -51,11 +51,66 @@ inline std::vector<ChunkPlan> plan_chunks(uint64_t base, uint64_t bytes, uint64_
   return plan;
 }
 
+namespace detail {
+// Whether liburing declares io_uring_clone_buffers_offset (2.9+). A dependent call, so a header without it (the
+// fake liburing of test_expert_stream_uring_options.py) makes this false instead of failing to compile.
+template <class Ring>
+constexpr bool kHasCloneBuffers = requires(Ring* ring) { io_uring_clone_buffers_offset(ring, ring, 0u, 0u, 0u, 0u); };
+constexpr unsigned kCloneDstReplace = 1u << 1;  // IORING_REGISTER_DST_REPLACE
+
+// Pins `vector` in slot 0 of `scratch`, clones it into `slot` of `ring`, and empties the scratch slot again.
+// Returns 1 or a negative errno; `cloned` is false when the failure came before the clone could happen.
+template <class Ring>
+int clone_into(Ring* ring, Ring* scratch, unsigned slot, const iovec& vector, bool& cloned) {
+  cloned = false;
+  if constexpr (kHasCloneBuffers<Ring>) {
+    __u64 tag = 0;
+    int rc = io_uring_register_buffers_update_tag(scratch, 0, &vector, &tag, 1);
+    if (rc != 1) return rc < 0 ? rc : -EIO;
+    rc = io_uring_clone_buffers_offset(ring, scratch, slot, 0, 1, kCloneDstReplace);
+    cloned = rc >= 0;
+    struct iovec empty {
+      nullptr, 0
+    };
+    io_uring_register_buffers_update_tag(scratch, 0, &empty, &tag, 1);
+    return rc < 0 ? rc : 1;
+  } else {
+    return -EOPNOTSUPP;
+  }
+}
+
+template <class Ring>
+bool open_scratch(Ring* scratch) {
+  if constexpr (kHasCloneBuffers<Ring>) {
+    if (io_uring_queue_init(1, scratch, 0) != 0) return false;
+    if (io_uring_register_buffers_sparse(scratch, 1) == 0) return true;
+    io_uring_queue_exit(scratch);
+  }
+  return false;
+}
+}  // namespace detail
+
 /// A sparse io_uring registered-buffer table: fixed slots filled and emptied with
 /// ``io_uring_register_buffers_update_tag``, tracked by base address so a destination range can be looked up by
 /// containment and released by range.
+///
+/// Each chunk is registered in slot 0 of a private one-slot scratch ring and cloned into its slot of the table's ring
+/// (IORING_REGISTER_CLONE_BUFFERS), not registered there directly. Registering pins the chunk and charges it with
+/// io_buffer_account_pin, whose headpage_already_acct walks every page of every buffer already in that ring for each
+/// huge page of the new chunk. Over a tier whose transparent huge pages fell back to 4 KiB under fragmentation, that
+/// walk made direct registration quadratic: 23-103 s for a 100 GiB tier on divix01. In the scratch ring the walk
+/// sees only the chunk itself, and a clone takes references to the pinned pages without accounting them again
+/// (analysis/dsv41-drive/thp-fallback/results.md). A liburing or kernel without cloning keeps the direct path.
 class RegisteredBufferTable {
  public:
+  /// `clone` false always registers directly into the ring (tests of both paths).
+  explicit RegisteredBufferTable(bool clone = true) : clone_(clone) {}
+  RegisteredBufferTable(const RegisteredBufferTable&) = delete;
+  RegisteredBufferTable& operator=(const RegisteredBufferTable&) = delete;
+  ~RegisteredBufferTable() {
+    close_scratch_();
+  }
+
   /// Sparse-registers `slots` empty entries on `ring`. False: the ring does not support it (errno in last_error()).
   bool init(io_uring* ring, unsigned slots) {
     ring_ = ring;
@@ -71,11 +126,19 @@ class RegisteredBufferTable {
       last_error_ = -rc;
       last_error_context_ = "register_buffers_sparse: " + std::string(std::strerror(-rc));
     }
+    close_scratch_();
+    if (supported_ && clone_) scratch_open_ = detail::open_scratch(&scratch_);
     return supported_;
   }
 
   bool supported() const {
     return supported_;
+  }
+
+  /// Whether the next chunk goes through the scratch ring and a clone. Turns false for good (until init) the first
+  /// time a clone is refused, e.g. by a kernel without IORING_REGISTER_CLONE_BUFFERS.
+  bool cloning() const {
+    return scratch_open_;
   }
 
   /// Registers plan_chunks(base, bytes, row_bytes, cap) into free slots. Returns the chunk count; 0 on overlap, no
@@ -104,8 +167,7 @@ class RegisteredBufferTable {
       struct iovec vector {
         reinterpret_cast<void*>(chunk.base), static_cast<size_t>(chunk.length)
       };
-      __u64 tag = 0;
-      int rc = io_uring_register_buffers_update_tag(ring_, slot, &vector, &tag, 1);
+      int rc = register_slot_(slot, vector);
       if (rc != 1) {
         // update_tag returns the entries it updated: 0 with no errno (nothing registered) is reported as EIO.
         int error = rc < 0 ? -rc : EIO;
@@ -152,6 +214,7 @@ class RegisteredBufferTable {
 
   /// Forgets every slot, without touching the (already torn-down) ring. Safe to `init` again afterward.
   void clear() {
+    close_scratch_();
     buffers_.clear();
     slot_used_.clear();
     supported_ = false;
@@ -189,6 +252,24 @@ class RegisteredBufferTable {
   }
 
  private:
+  int register_slot_(unsigned slot, const iovec& vector) {
+    if (scratch_open_) {
+      bool cloned = false;
+      const int rc = detail::clone_into(ring_, &scratch_, slot, vector, cloned);
+      if (rc == 1 || cloned) return rc;
+      // Pinning in the scratch ring or the clone itself was refused: stop cloning and register directly, which
+      // reports its own error if the chunk cannot be registered at all.
+      close_scratch_();
+    }
+    __u64 tag = 0;
+    return io_uring_register_buffers_update_tag(ring_, slot, &vector, &tag, 1);
+  }
+
+  void close_scratch_() {
+    if (scratch_open_) io_uring_queue_exit(&scratch_);
+    scratch_open_ = false;
+  }
+
   struct Buffer {
     uint64_t base;
     uint64_t length;
@@ -219,6 +300,9 @@ class RegisteredBufferTable {
   }
 
   io_uring* ring_ = nullptr;
+  bool clone_ = true;
+  bool scratch_open_ = false;
+  io_uring scratch_{};
   bool supported_ = false;
   std::vector<bool> slot_used_;
   std::vector<Buffer> buffers_;
