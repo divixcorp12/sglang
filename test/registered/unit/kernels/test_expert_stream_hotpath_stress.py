@@ -55,7 +55,8 @@ def _check_tier(s, host, rows):
 def _fill_while_owned(s, host, rng):
     """The paused owner starts a prefill fill of up to two missing experts of a row, admits a third into that row while
     the fill thread reads (the owner's census reads the filling flags the fill must leave alone), then ends the fill
-    or, half the time, leaves it running for resume() to join and finish before the service runs again."""
+    or, half the time, leaves it running for resume() to join and finish before the service runs again. True when it
+    left the fill running."""
     row = rng.randrange(hp.LAYERS)
     mapping = host.mapping(row)
     missing = [e for e in DEVICE_EXPERTS if mapping[e] < 0]
@@ -70,6 +71,8 @@ def _fill_while_owned(s, host, rng):
     if slots and rng.random() < 0.5:
         host.fill_wait(len(slots), 10.0)
         assert host.fill_end(), "a prefill fill failed"
+        return False
+    return bool(slots)
 
 
 def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
@@ -188,6 +191,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
                         raise  # a pause that timed out is a hang, not a legal refusal
                     stats["refused"] += 1
                     continue
+                left_running = False
                 try:
                     stats["pauses"] += 1
                     _check_tier(s, host, range(hp.LAYERS))
@@ -206,9 +210,14 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
                     stats["assigns"] += 1
                     _check_tier(s, host, [row])
                     if fills:
-                        _fill_while_owned(s, host, rng)
+                        left_running = _fill_while_owned(s, host, rng)
                         stats["fills"] += 1
                 finally:
+                    if left_running:
+                        # The device may post while the fill still runs: resume() must join the fill and run its
+                        # epilogue before it hands the tier back, or the service serves that demand beside them.
+                        quiet.clear()
+                        time.sleep(0.005)
                     host.resume()
             finally:
                 quiet.clear()
