@@ -2,7 +2,12 @@
 process (plan 2026-09-29-hotpath-zero-overhead Task 3). ``run_child`` returns per-thread counts over ``requests``
 requests posted after ``warmup`` requests (the window is armed only around the measured requests), and how many
 threads the shim recognized per role (``threads``), so that a count of zero can be told apart from a shim that never
-saw the thread."""
+saw the thread.
+
+The service thread's ``sleep`` count is 0 only because the child starts the thread with ``spin_us=50_000``: the
+measured window never idles for 50 ms, so ``RamThread`` never reaches its idle ``nanosleep``. A smaller ``spin_us``
+(production's default) lets idle gaps between posts sleep and count, which is the idle path (spec L12), not the
+request path. What a zero cannot rule out at all is listed in ``hotpath_shim.c``'s header comment."""
 
 from __future__ import annotations
 
@@ -86,6 +91,6 @@ def run_child(shim: Path, *, variant: str = "default", requests: int = 200, warm
     env = dict(os.environ, LD_PRELOAD=str(shim))
     proc = subprocess.run([sys.executable, "-c", CHILD, variant, str(requests), str(warmup), str(tmp)],
                           env=env, capture_output=True, text=True, timeout=600)
-    line = next((l for l in proc.stdout.splitlines() if l.startswith("HOTPATH-COUNTS ")), None)
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("HOTPATH-COUNTS ")), None)
     assert proc.returncode == 0 and line, proc.stdout[-4000:] + proc.stderr[-4000:]
     return json.loads(line.split(" ", 1)[1])
