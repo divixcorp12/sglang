@@ -176,6 +176,7 @@ def _fault_tensor(
     fixed_chunk_cap: int = 0,
     leg: int = -1,
     ring_reset_fail: bool = False,
+    leg_cut_cap: int = 0,
 ) -> torch.Tensor:
     return torch.tensor(
         [
@@ -210,6 +211,7 @@ def _fault_tensor(
             fixed_chunk_cap,
             leg,
             int(ring_reset_fail),
+            leg_cut_cap,
         ],
         dtype=torch.int64,
     )
@@ -303,18 +305,21 @@ def read_rows_with_fault(
     registered-buffer chunks of a fixed read mode, so small slabs register as many chunks; ``leg`` narrows the
     ``part``, ``cqe_error`` and ``hold_ordinal`` faults to that leg of a fanned-out fixed read (-1: any).
     ``ring_reset_fail`` makes the next ring reset fail (with a ``submit_error`` that leaves SQEs unconsumed): the
-    first read then raises "io_uring ring reset failed" and no second read runs.
+    first read then raises "io_uring ring reset failed" and no second read runs. ``leg_cut_cap`` (bytes, 0: READ_CUTS
+    and the device limits) cuts every read into legs of at most that many bytes on a 4 KiB boundary, whatever
+    READ_CUTS says (plan 2026-09-28-iopoll-read-cuts); ``leg`` then narrows the faults to a cut leg as well.
 
     Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
     completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,
     ``unfinished_jobs`` (packing jobs a worker still held when the first read returned: always 0),
     ``pack_workers``, and after the first read ``fixed_cuts`` (reads fanned out to more than one leg) and
-    ``fanout_sqes`` (their SQEs).
+    ``fanout_sqes`` (their SQEs), ``cut_reads`` (reads cut into more than one device-sized run) and ``gap_cuts`` (runs
+    a boundary gap opened).
     """
     first = _checked_rows(tables, row, experts, slots)
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
-    results = torch.zeros(10, dtype=torch.int64)
+    results = torch.zeros(12, dtype=torch.int64)
     _host_module(layout).expert_stream_read_rows_faulted(
         *_table_args(tables, direct), row, *first, *then, fault, results
     )
@@ -324,6 +329,7 @@ def read_rows_with_fault(
         stats.update(
             stale_cqes=int(results[4]), generation_wraps=int(results[5]), unfinished_jobs=int(results[6]),
             pack_workers=int(results[7]), fixed_cuts=int(results[8]), fanout_sqes=int(results[9]),
+            cut_reads=int(results[10]), gap_cuts=int(results[11]),
         )
     return int(results[0]), int(results[1])
 
@@ -342,22 +348,25 @@ def read_rows_sqes(
 ) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
     """Test only: ``read_rows_traced``'s read, also returning every SQE the reader prepared, in order, as
     ``(file, offset, length, bounce_offset)``, and ``info``: ``sqes`` (the count), ``descriptors``, ``credit``
-    (the ring's), ``cqes``, ``fixed_cuts`` (reads fanned out to more than one leg) and ``fanout_sqes`` (their SQEs,
-    first attempts). Faults and ``pack_workers``/``pack_split``/``piece_stream`` as ``read_rows_with_fault``."""
+    (the ring's), ``cqes``, ``fixed_cuts`` (reads fanned out to more than one leg), ``fanout_sqes`` (their SQEs,
+    first attempts), ``cut_reads``, ``gap_cuts``, ``min_cut_bytes`` (the smallest cut in force, 0: cuts off) and
+    ``leg_stride`` (the legs a read may have). Faults and ``pack_workers``/``pack_split``/``piece_stream`` as ``read_rows_with_fault``."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
     record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     sqes = torch.zeros((max_sqes, 4), dtype=torch.int64)
-    info = torch.zeros(7, dtype=torch.int64)
+    info = torch.zeros(11, dtype=torch.int64)
     _host_module(layout).expert_stream_read_rows_sqes(
         *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
     )
-    result, count, descriptors, credit, cqes, fixed_cuts, fanout_sqes = info.tolist()
+    (result, count, descriptors, credit, cqes, fixed_cuts, fanout_sqes, cut_reads, gap_cuts, min_cut_bytes,
+     leg_stride) = info.tolist()
     if count > max_sqes:
         raise RuntimeError(f"{count} SQEs, more than max_sqes {max_sqes}")
     log = [tuple(entry) for entry in sqes[:count].tolist()]
     info = dict(
-        sqes=count, descriptors=descriptors, credit=credit, cqes=cqes, fixed_cuts=fixed_cuts, fanout_sqes=fanout_sqes
+        sqes=count, descriptors=descriptors, credit=credit, cqes=cqes, fixed_cuts=fixed_cuts, fanout_sqes=fanout_sqes,
+        cut_reads=cut_reads, gap_cuts=gap_cuts, min_cut_bytes=min_cut_bytes, leg_stride=leg_stride,
     )
     return result, log, info, stage_records(
         record.unsqueeze(0)

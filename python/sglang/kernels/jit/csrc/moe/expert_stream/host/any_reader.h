@@ -87,6 +87,21 @@ class AnyReader {
   int64_t fanout_sqes() const {
     return visit([](auto& r) { return r.fanout_sqes(); });
   }
+  void set_leg_cut_cap(int64_t cap) {
+    visit([&](auto& r) { r.set_leg_cut_cap(cap); });
+  }
+  int64_t cut_reads() const {
+    return visit([](auto& r) { return r.cut_reads(); });
+  }
+  int64_t gap_cuts() const {
+    return visit([](auto& r) { return r.gap_cuts(); });
+  }
+  int64_t min_cut_bytes() const {
+    return visit([](auto& r) { return r.min_cut_bytes(); });
+  }
+  int64_t leg_stride() const {
+    return visit([](auto& r) { return r.leg_stride(); });
+  }
   bool open() {
     return visit([](auto& r) { return r.open(); });
   }

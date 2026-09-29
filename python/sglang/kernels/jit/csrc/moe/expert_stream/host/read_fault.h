@@ -85,9 +85,10 @@ inline int64_t worker_stamp(const void* trace) {
 // one chunk per worker); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
 // streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27
 // last_publish_delay_ns. Word 28 (fixed_chunk_cap, not a fault) caps the registered-buffer chunk size before the
-// reader opens (0: 1 GiB), word 29 is leg and word 30 ring_reset_fail. Keep the layout in step with _fault_tensor
+// reader opens (0: 1 GiB), word 29 is leg, word 30 ring_reset_fail and word 31 (leg_cut_cap, not a fault) cuts every
+// read at that many bytes before the reader opens (0: READ_CUTS and the device limits). Keep the layout in step with _fault_tensor
 // in ops/moe/expert_stream_transport.py.
-constexpr int64_t kFaultWords = 31;
+constexpr int64_t kFaultWords = 32;
 
 inline ReadFault fault_from(const int64_t* f) {
   ReadFault fault;

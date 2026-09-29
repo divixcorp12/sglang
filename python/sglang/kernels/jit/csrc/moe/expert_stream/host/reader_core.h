@@ -2,6 +2,8 @@
 // images): io_uring superset reads of whole expert rows through per-extent descriptors, ring credit and banks.
 #pragma once
 
+#include <cstdio>
+
 #include "../row_layout.h"
 #include "file_reader.h"
 #include "piece_geometry.h"
@@ -183,6 +185,19 @@ class ReaderCore {
     return fanout_sqes_;
   }
 
+  // Test only (fault word leg_cut_cap): cut every read at `cap` bytes (whole pages) on a 4 KiB boundary, whatever
+  // READ_CUTS says, before open(). 0 restores READ_CUTS and the device limits.
+  void set_leg_cut_cap(int64_t cap) {
+    leg_cut_cap_ = std::max<int64_t>(0, cap);
+  }
+  // Reads planned as more than one cut run, and the runs a boundary gap opened (first plans).
+  int64_t cut_reads() const {
+    return cut_reads_;
+  }
+  int64_t gap_cuts() const {
+    return gap_cuts_;
+  }
+
   // Legs a read may have (storage stride) and the smallest cut in force (0: cuts off).
   int64_t leg_stride() const {
     return leg_stride_;
@@ -230,6 +245,24 @@ class ReaderCore {
     }
     if (!derived().open_memory()) return false;
     size_legs();
+    if (cuts_) {  // one line per drive: the cut in force and where it came from (a fallback names its reason)
+      std::vector<bool> said(devs_.size(), false);
+      for (size_t f = 0; f < fds_.size(); ++f) {
+        const size_t drive = file_drive_[f];
+        if (drive >= said.size() || said[drive]) continue;
+        said[drive] = true;
+        const auto dev = static_cast<dev_t>(devs_[drive]);
+        std::fprintf(
+            stderr,
+            "expert stream io_uring: read cuts: drive=%zu dev=%u:%u cut_bytes=%lld virt_mask=%llu source=%s\n",
+            drive,
+            major(dev),
+            minor(dev),
+            static_cast<long long>(limits_[f].cut_bytes),
+            static_cast<unsigned long long>(limits_[f].virt_mask),
+            limits_[f].source.c_str());
+      }
+    }
     if (!size_extents()) return false;
     if (!io_.init(queue_depth())) return false;
     // A read's legs are reserved all at once, so the ring must hold the widest read's legs: a fixed read has a leg per
@@ -689,38 +722,56 @@ class ReaderCore {
     }
   }
 
-  // A descriptor's legs, on its first preparation: its iovecs from `done` 0 (destination), then one leg covering them
-  // all, or (fixed modes) one per run of iovecs in one registered buffer. Each leg's `start` is the prefix sum of the
-  // earlier legs' bytes; a leg wholly past the read's end-of-file expectation is Done at once.
+  // A descriptor's legs, on its first preparation: its iovecs from `done` 0 (destination); with read cuts, rewritten
+  // into runs within its file's device limits (cut_legs); in a fixed read mode each run cut again at registered-
+  // buffer changes (fixed_legs). Without either it is one leg, today's read. Each leg's `start` is the prefix sum of
+  // the earlier legs' bytes; a leg wholly past the read's end-of-file expectation is Done at once.
   void plan_legs(uint32_t index) {
     ExtentDesc& d = descs_[index];
     iovec* iov = &iovecs_[static_cast<size_t>(index) * iov_stride_];
-    const unsigned count = derived().destination(d, iov);
+    unsigned count = derived().destination(d, iov);
     Leg* legs = &legs_[static_cast<size_t>(index) * leg_stride_];
-    unsigned n = 1;
-    if constexpr (requires(const Reader& reader, const iovec* v, unsigned k, FixedLeg* out) {
-                    reader.fixed_legs(v, k, out);
-                  }) {
-      if (fixed_reads()) {
-        FixedLeg* fixed = fixed_scratch_.data();  // count <= iov_stride_ (size_legs)
-        n = io_.fixed_legs(iov, count, fixed);
-        int64_t start = 0;
-        for (unsigned l = 0; l < n; ++l) {
-          const int64_t bytes = static_cast<int64_t>(fixed[l].bytes);
-          legs[l] = Leg{start, bytes, std::clamp<int64_t>(d.expected - start, 0, bytes), 0, fixed[l].first,
-                        fixed[l].count, fixed[l].buffer, LegState::Idle};
-          start += bytes;
-        }
-        if (start != d.read->length)
-          throw std::logic_error(error_prefix<Layout>() + "a fixed read's legs do not cover the read");
-        io_.note_fanout(n);
-        if (n > 1) {
-          ++fixed_cuts_;
-          fanout_sqes_ += n;
-        }
+    CutLeg* runs = cut_scratch_.data();
+    unsigned run_count = 1;
+    runs[0] = CutLeg{0, count, d.read->length, false};
+    if (cuts_) {
+      run_count = cut_legs(
+          iov, count, limits_[d.read->file], iov_scratch_.data(), static_cast<unsigned>(iov_stride_), runs, leg_stride_);
+      if (run_count > leg_stride_)
+        throw std::logic_error(error_prefix<Layout>() + "a read needs more legs than open() sized");
+      count = runs[run_count - 1].first + runs[run_count - 1].count;
+      std::copy(iov_scratch_.begin(), iov_scratch_.begin() + count, iov);
+      if (run_count > 1) ++cut_reads_;
+      for (unsigned r = 0; r < run_count; ++r)
+        gap_cuts_ += runs[r].gap ? 1 : 0;
+    }
+    unsigned n = 0;
+    int64_t start = 0;
+    for (unsigned r = 0; r < run_count; ++r) {
+      FixedLeg* parts = fixed_scratch_.data();
+      unsigned k = 1;
+      parts[0] = FixedLeg{0, runs[r].count, -1, static_cast<size_t>(runs[r].bytes)};
+      if constexpr (requires(const Reader& reader, const iovec* v, unsigned c, FixedLeg* out) {
+                      reader.fixed_legs(v, c, out);
+                    }) {
+        if (fixed_reads()) k = io_.fixed_legs(iov + runs[r].first, runs[r].count, parts);
+      }
+      for (unsigned l = 0; l < k; ++l) {
+        if (n == leg_stride_) throw std::logic_error(error_prefix<Layout>() + "a read needs more legs than open() sized");
+        const int64_t bytes = static_cast<int64_t>(parts[l].bytes);
+        legs[n++] = Leg{start, bytes, std::clamp<int64_t>(d.expected - start, 0, bytes), 0,
+                        runs[r].first + parts[l].first, parts[l].count, parts[l].buffer, LegState::Idle};
+        start += bytes;
       }
     }
-    if (!fixed_reads()) legs[0] = Leg{0, d.read->length, d.expected, 0, 0, count, -1, LegState::Idle};
+    if (start != d.read->length) throw std::logic_error(error_prefix<Layout>() + "a read's legs do not cover the read");
+    if constexpr (requires(Reader& reader) { reader.note_fanout(1u); }) {
+      if (fixed_reads()) io_.note_fanout(n);
+    }
+    if (fixed_reads() && n > 1) {
+      ++fixed_cuts_;
+      fanout_sqes_ += n;
+    }
     for (unsigned l = 0; l < n; ++l)
       if (legs[l].expected == 0) legs[l].state = LegState::Done;
     d.legs = static_cast<uint8_t>(n);
@@ -1411,6 +1462,8 @@ class ReaderCore {
   std::vector<Leg> legs_;  // leg_stride_ per descriptor (size_extents)
   int64_t fixed_cuts_ = 0;   // reads prepared as more than one leg (first attempts), over the reader's life
   int64_t fanout_sqes_ = 0;  // the SQEs those reads issued (first attempts)
+  int64_t cut_reads_ = 0;    // reads planned as more than one cut run (first plans)
+  int64_t gap_cuts_ = 0;     // runs a boundary gap opened (first plans)
   std::vector<Completion> held_;  // fault: completions withheld from the reader (hold_ordinal)
   std::vector<uint32_t> again_;
   BounceRow rows_[kBounceSlots];

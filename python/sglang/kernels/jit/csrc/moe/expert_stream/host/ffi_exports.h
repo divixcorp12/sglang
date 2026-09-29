@@ -174,6 +174,7 @@ struct HostExports {
     reader.set_owner_core(owner_core);
     if (f[22] != 0) reader.set_piece_stream(true);
     reader.set_fixed_chunk_cap(f[28]);
+    reader.set_leg_cut_cap(f[31]);
     if (!reader.open()) return 0;
     reader.set_fault(fault_from(f));
     StageRecord stage;
@@ -188,9 +189,10 @@ struct HostExports {
   // Test only: one reader reads `experts` into `slots` with `fault` injected
   // (see ReadFault and fault_from), then reads `then_experts` into `then_slots` with no fault (no second read when
   // there are none). Results go to
-  // `results[0..9]`: the two reads' results, the completions the reader had reaped after each, then its
+  // `results[0..11]`: the two reads' results, the completions the reader had reaped after each, then its
   // stale completions, generation wraps, the packing jobs still open when the first read returned, the
-  // number of packing workers the reader has, and its fixed_cuts and fanout_sqes after the first read.
+  // number of packing workers the reader has, and its fixed_cuts, fanout_sqes, cut_reads and gap_cuts after the first
+  // read.
   static void read_rows_faulted(
       TensorView extents,
       TensorView starts,
@@ -219,7 +221,7 @@ struct HostExports {
     verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
     verify_named("then_experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_experts);
     verify_named("then_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_slots);
-    verify_named("results", TensorMatcher({10}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), results);
+    verify_named("results", TensorMatcher({12}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), results);
     auto* out = static_cast<int64_t*>(results.data_ptr());
     check_fault_words<Layout>(fault);
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
@@ -231,6 +233,7 @@ struct HostExports {
         f[20]);
     if (f[22] != 0) reader.set_piece_stream(true);
     reader.set_fixed_chunk_cap(f[28]);
+    reader.set_leg_cut_cap(f[31]);
     if (!reader.open()) {
       std::fill(out, out + 10, 0);
       return;
@@ -245,6 +248,8 @@ struct HostExports {
     out[7] = reader.pack_workers();
     out[8] = reader.fixed_cuts();
     out[9] = reader.fanout_sqes();
+    out[10] = reader.cut_reads();
+    out[11] = reader.gap_cuts();
     reader.set_fault(ReadFault{});
     if (then_experts.size(0) == 0) return;  // a test that only wants the first read's state
     out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, abandon_after(0));
@@ -252,9 +257,9 @@ struct HostExports {
   }
 
   // Test only (U10): expert_stream_read_rows_traced's read, recording every SQE the reader prepared. `sqes` receives
-  // up to sqes.size(0) rows of 4 int64 (file, offset, length, bounce byte offset), in preparation order; `info` 7
-  // int64: the result, the SQE count, the descriptor count, the ring credit, the completions reaped, fixed_cuts and
-  // fanout_sqes. `fault` as the faulted call's (word 22 turns piece streaming on, word 28 caps registered chunks).
+  // up to sqes.size(0) rows of 4 int64 (file, offset, length, bounce byte offset), in preparation order; `info` 11
+  // int64: the result, the SQE count, the descriptor count, the ring credit, the completions reaped, fixed_cuts,
+  // fanout_sqes, cut_reads, gap_cuts, min_cut_bytes and leg_stride. `fault` as the faulted call's (word 22 turns piece streaming on, word 28 caps registered chunks).
   static void read_rows_sqes(
       TensorView extents,
       TensorView starts,
@@ -284,7 +289,7 @@ struct HostExports {
     verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
     verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
     verify_named("sqes", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), sqes);
-    verify_named("info", TensorMatcher({7}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
+    verify_named("info", TensorMatcher({11}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
     check_fault_words<Layout>(fault);
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
     auto* out = static_cast<int64_t*>(info.data_ptr());
@@ -297,6 +302,7 @@ struct HostExports {
         f[20]);
     if (f[22] != 0) reader.set_piece_stream(true);
     reader.set_fixed_chunk_cap(f[28]);
+    reader.set_leg_cut_cap(f[31]);
     if (!reader.open()) return;
     reader.set_fault(fault_from(f));
     std::vector<typename Source::SqeRecord> log;
@@ -322,6 +328,10 @@ struct HostExports {
     out[4] = reader.cqes();
     out[5] = reader.fixed_cuts();
     out[6] = reader.fanout_sqes();
+    out[7] = reader.cut_reads();
+    out[8] = reader.gap_cuts();
+    out[9] = reader.min_cut_bytes();
+    out[10] = reader.leg_stride();
   }
 
   // Test only (U8): the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
@@ -397,6 +407,7 @@ struct HostExports {
     Source reader(Tables(t), direct != 0, f[19], f[20]);
     if (f[22] != 0) reader.set_piece_stream(true);
     reader.set_fixed_chunk_cap(f[28]);
+    reader.set_leg_cut_cap(f[31]);
     if (!reader.open()) return;
     reader.set_fault(fault_from(f));
 
