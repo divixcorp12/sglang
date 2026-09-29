@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Scaled THP-fallback sweeps (results.md, "Scaling"). Run on divix01 from the worktree root; takes rowimg-disk.lock
 # then cc-gpu.lock (lock order in .claude/rules/divix01-run-protocol.md), since some runs pin up to 16 GiB.
-#   analysis/dsv41-drive/thp-fallback/sweep.sh <out.jsonl> <sweep: inject|size|natural> [extra probe args]
+#   analysis/dsv41-drive/thp-fallback/sweep.sh <out.jsonl> <sweep: inject|inject-rerun|size|natural> [extra probe args]
 set -u
 out=$1; sweep=$2; shift 2
 cd "$(dirname "$0")/../../.."
@@ -14,7 +14,14 @@ run() {
     inject) for k in 0 1 2 4 8 15; do probe --gib 16 --madvise hugepage --inject "$k" --label "inject$k" "$@"; done ;;
     size) for g in 4 8 12 16; do probe --gib "$g" --madvise hugepage --inject 999 --label "size$g-allmixed" "$@";
                                   probe --gib "$g" --madvise hugepage --label "size$g-clean" "$@"; done ;;
-    natural) probe --label natural "$@" ;;
+    inject-rerun) for k in 1 2 4; do probe --gib 16 --madvise hugepage --inject "$k" --label "inject$k" "$@"; done ;;
+    # The production tier's split. Order matters: MADV_HUGEPAGE compacts, which changes what the next run finds.
+    natural) T=0:61440,1:40960
+      probe --placement $T --label "full-none" "$@"
+      probe --placement $T --madvise hugepage --label "full-hugepage" "$@"
+      probe --placement $T --label "full-none-again" "$@"
+      probe --placement $T --repair refault --label "full-none-refault" "$@"
+      probe --placement $T --repair collapse --label "full-none-collapse" "$@" ;;
   esac
 }
 exec 8>/data/models/slang/nvfp4-work/rowimg-disk.lock; flock 8
