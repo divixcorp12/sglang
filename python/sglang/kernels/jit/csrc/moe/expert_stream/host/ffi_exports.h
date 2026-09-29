@@ -158,8 +158,9 @@ struct HostExports {
 
   // Test only: expert_stream_read_rows with the reader's StageRecord copied to `record`
   // (stage_words() int64), with `ok` and `status` set from the result. `fault` is the faulted call's
-  // tensor, laid out as expert_stream_read_rows_faulted's (kFaultWords words); an all-zero tensor injects nothing
-  // except that ordinal 0 selects row 0: the Python wrapper sends -1.
+  // tensor, laid out as expert_stream_read_rows_faulted's (kFaultWords words); a _fault_tensor() with no fault kwargs
+  // injects nothing. (An all-zero tensor is not that: 0 in word 15 selects row 0 and in word 16 arms a hold; the
+  // Python wrapper sends -1 in both.)
   // `owner_core` (test-only owner-pinning scaffold, PACK_WORKERS.md): -1 (the Python wrapper's default)
   // leaves the reader byte-for-byte what it is without this parameter; >= 0 pins the calling/owner thread
   // to that core and excludes it from the packing pool's mask (ReaderCore::set_owner_core).
@@ -1020,9 +1021,9 @@ struct HostExports {
     return find(handle)->drain_trace(static_cast<expert_stream::StageRecord*>(out.data_ptr()), out.size(0));
   }
 
-  // Test only: InstrBuild only (ProdBuild has no trace, so nothing to count).
+  // Test only: InstrBuild only (ProdBuild has no trace, so nothing to count). Gated on kMetrics, the trace's own flag.
   static int64_t trace_clock_reads() {
-    if constexpr (!Build::kFaults) {
+    if constexpr (!Build::kMetrics) {
       test_only("trace_clock_reads");
     } else {
       return expert_stream::traced_clock_reads().load(std::memory_order_relaxed);

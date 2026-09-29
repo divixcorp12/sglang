@@ -78,13 +78,13 @@ struct ReadFault {
 // The fault tensor of the test entry points: kFaultWords int64 words. Five of them are not reader faults:
 // abandon_after makes the entry point's abandon callback say stop once that many batches were admitted
 // (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and words 19-20 (formerly
-// pack_workers, pack_split) are reserved and ignored (the packed path is gone); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
-// streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27
-// last_publish_delay_ns. Word 28 (fixed_chunk_cap, not a fault) caps the registered-buffer chunk size before the
-// reader opens (0: 1 GiB), word 29 is leg, word 30 the ring-reset bits (bit 0 nop_flush_refused, bit 1
-// ring_reset_fail) and word 31 (leg_cut_cap, not a fault) cuts every
-// read at that many bytes before the reader opens (0: READ_CUTS and the device limits). Keep the layout in step with _fault_tensor
-// in ops/moe/expert_stream_transport.py.
+// pack_workers, pack_split) are reserved and ignored (the packed path is gone); word 21 is hold_rest; word 22
+// (piece_stream, not a fault) turns the reader's piece streaming on before it opens; word 23 is sub, 24
+// publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27 last_publish_delay_ns. Word 28 (fixed_chunk_cap, not
+// a fault) caps the registered-buffer chunk size before the reader opens (0: 1 GiB), word 29 is leg, word 30 the
+// ring-reset bits (bit 0 nop_flush_refused, bit 1 ring_reset_fail) and word 31 (leg_cut_cap, not a fault) cuts every
+// read at that many bytes before the reader opens (0: READ_CUTS and the device limits). Keep the layout in step with
+// _fault_tensor in ops/moe/expert_stream_transport.py.
 constexpr int64_t kFaultWords = 32;
 
 inline ReadFault fault_from(const int64_t* f) {

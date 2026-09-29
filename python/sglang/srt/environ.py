@@ -1889,7 +1889,8 @@ class Envs:
     # Prefill fills (plan 2026-09-25-dsv41-prefill-fills): eager pinned-tier misses are read by the RAM-miss service's
     # native reader straight into the pinned slabs (row images, every mirror drive at once) instead of the Python bounce
     # read and CPU copy. A layer's misses are all issued once its routing is known, on a helper thread, and each gather
-    # chunk waits only for its own rows. Needs the native slot table (SGLANG_MOE_EXPERT_GRAPH_GATHER). Read once when the service starts. Off by default.
+    # chunk waits only for its own rows. Needs the native slot table (SGLANG_MOE_EXPERT_GRAPH_GATHER). Read once when
+    # the service starts. Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_FILLS = EnvBool(False)
     # Prefill share (plan 2026-09-25-dsv41-prefill-eviction): during a prefill forward, a layer's pinned-tier
     # admissions own at most one gather chunk (EXL3_MAX_GATHER_ROWS) of rows; past that they evict the prefill's own

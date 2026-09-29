@@ -68,6 +68,9 @@ struct SqeRecord {
 template <class Derived, ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 class ReaderCore {
   static_assert(BuildPolicy<Build>);
+  // Faults lean on metrics (the cqe_call fault counts through metric(&ReaderMetrics::cqes)): a build with faults and
+  // no metrics would inject at the wrong completion, silently.
+  static_assert(!Build::kFaults || Build::kMetrics, "a build with faults needs metrics");
 
  public:
   using LayoutType = Layout;  // named so it cannot shadow the template parameter
@@ -1674,6 +1677,10 @@ class ReaderCore {
   // The diagnostic counters (ReaderMetrics) and the test-only fault state (FaultState): see their types above.
   [[no_unique_address]] std::conditional_t<Build::kMetrics, ReaderMetrics, NoReaderMetrics> metrics_;
   [[no_unique_address]] std::conditional_t<Build::kFaults, FaultState, NoFaultState> faults_;
+  // The type-system half of the prod proof: nm cannot see state whose names are inlined away, so ProdBuild's metric
+  // and fault members are asserted empty types (with [[no_unique_address]], they take no storage).
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(metrics_)>, "ProdBuild has no metrics");
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(faults_)>, "ProdBuild has no faults");
 };
 
 }  // namespace expert_stream

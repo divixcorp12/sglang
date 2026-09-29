@@ -2103,6 +2103,11 @@ class RamTier {
   };
   struct NoTraceState {};
   [[no_unique_address]] std::conditional_t<Build::kMetrics, TraceState, NoTraceState> trace_;
+  // The type-system half of the prod proof (nm cannot see state whose names are inlined away): ProdBuild's fault,
+  // metric and trace members are empty types, which [[no_unique_address]] gives no storage.
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(faults_)>, "ProdBuild has no faults");
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(stats_)>, "ProdBuild has no metrics");
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(trace_)>, "ProdBuild has no trace");
 };
 
 }  // namespace expert_stream

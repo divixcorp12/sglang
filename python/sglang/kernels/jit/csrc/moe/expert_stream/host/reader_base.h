@@ -255,8 +255,8 @@ struct StageRecord {
   int64_t submit = 0;     // just before the first io_uring submit
   int64_t first_cqe = 0;  // the call that returned the first completion, returned
   int64_t last_cqe = 0;   // the call that returned the last completion, returned
-  // With packing workers (SGLANG_DSV41_RAM_MISS_PACK_WORKERS) rows pack concurrently and a row's span starts at
-  // its first chunk, after the worker woke: do not read overlap or "waited for the packer" out of these stamps.
+  // Historical: under the removed packed path's packing workers, rows packed concurrently and a row's span started at
+  // its first chunk, after the worker woke. A row-image read never packs; these stamp its rows' publishes.
   int64_t pack_start = 0;  // the earliest row's packing started
   int64_t pack_end = 0;    // the last row's packing ended
   int64_t mapped = 0;      // slots marked READY and slot-map entries published

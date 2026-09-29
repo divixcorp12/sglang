@@ -104,7 +104,9 @@ class BasicUringReader {
         if (ready_ || outstanding_ != 0) std::terminate();
       }
       close_ring();
-      if (options_.diagnostics && fixed_reads_ != 0) report_fixed();
+      if constexpr (Build::kMetrics) {
+        if (options_.diagnostics && fanout_.reads != 0) report_fixed();
+      }
     }
     files_.clear();
     fd_index_.clear();
@@ -169,23 +171,30 @@ class BasicUringReader {
     }
     return legs;
   }
-  // Counts a fixed read's legs (diagnostics only): reads prepared, those cut into more than one leg, and their SQEs.
-  void note_fanout(unsigned legs) {
-    ++fixed_reads_;
-    if (legs > 1) {
-      ++fixed_cuts_;
-      fanout_sqes_ += legs;
-    }
-    if (options_.diagnostics && fixed_reads_ >= next_report_) {
-      next_report_ <<= 1;
-      report_fixed();
+  // Counts a fixed read's legs (diagnostics only, spec M10): reads prepared, those cut into more than one leg, and
+  // their SQEs. InstrBuild only; on ProdBuild the call is empty and the counters and their accessors do not exist.
+  void note_fanout([[maybe_unused]] unsigned legs) {
+    if constexpr (Build::kMetrics) {
+      ++fanout_.reads;
+      if (legs > 1) {
+        ++fanout_.cuts;
+        fanout_.sqes += legs;
+      }
+      if (options_.diagnostics && fanout_.reads >= fanout_.next_report) {
+        fanout_.next_report <<= 1;
+        report_fixed();
+      }
     }
   }
-  uint64_t fixed_cuts() const {
-    return fixed_cuts_;
+  uint64_t fixed_cuts() const
+    requires Build::kMetrics
+  {
+    return fanout_.cuts;
   }
-  uint64_t fanout_sqes() const {
-    return fanout_sqes_;
+  uint64_t fanout_sqes() const
+    requires Build::kMetrics
+  {
+    return fanout_.sqes;
   }
   // How many times the ring's resources were registered: 1 per configure_resources, +1 per ring reset. Cold path
   // only (tests read it to prove a drain kept the registered tier).
@@ -485,13 +494,15 @@ class BasicUringReader {
       throw std::invalid_argument("read fd is absent from the registered file table");
     return fd_index_[static_cast<size_t>(fd)];
   }
-  void report_fixed() const {
+  void report_fixed() const
+    requires Build::kMetrics
+  {
     std::fprintf(
         stderr,
         "expert stream io_uring: fixed_reads=%llu fixed_cuts=%llu fanout_sqes=%llu\n",
-        static_cast<unsigned long long>(fixed_reads_),
-        static_cast<unsigned long long>(fixed_cuts_),
-        static_cast<unsigned long long>(fanout_sqes_));
+        static_cast<unsigned long long>(fanout_.reads),
+        static_cast<unsigned long long>(fanout_.cuts),
+        static_cast<unsigned long long>(fanout_.sqes));
   }
   void finish_prep(io_uring_sqe* sqe, uint64_t tag) {
     if (options_.fixed_files) sqe->flags |= IOSQE_FIXED_FILE;
@@ -609,7 +620,12 @@ class BasicUringReader {
   sglang::io::RegisteredBufferTable table_;
   std::vector<RegisteredRegion> regions_;  // fixed read modes only
   size_t chunk_cap_ = sglang::io::kMaxRegisteredBufferBytes;
-  uint64_t fixed_reads_ = 0, fixed_cuts_ = 0, fanout_sqes_ = 0, next_report_ = uint64_t{1} << 16;
+  // note_fanout()'s counters (spec M10): InstrBuild only.
+  struct FanoutStats {
+    uint64_t reads = 0, cuts = 0, sqes = 0, next_report = uint64_t{1} << 16;
+  };
+  struct NoFanoutStats {};
+  [[no_unique_address]] std::conditional_t<Build::kMetrics, FanoutStats, NoFanoutStats> fanout_;
   double register_ms_ = 0;
   uint64_t registrations_ = 0;  // register_resources() calls (registrations())
   struct TestHooks {
@@ -618,6 +634,8 @@ class BasicUringReader {
   };
   struct NoTestHooks {};
   [[no_unique_address]] std::conditional_t<Build::kFaults, TestHooks, NoTestHooks> hooks_;  // InstrBuild only
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(fanout_)>, "ProdBuild has no metrics");
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(hooks_)>, "ProdBuild has no faults");
   // A discarded SQE's user_data (drain retires it unread). Not ~0: that is liburing's LIBURING_UDATA_TIMEOUT, whose
   // CQEs its peek swallows on kernels without IORING_FEAT_EXT_ARG.
   static constexpr uint64_t kNopTag = ~uint64_t{0} - 1;
