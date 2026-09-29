@@ -22,11 +22,6 @@ run under the locks by hand (task-10 report), not a pytest case:
     flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-63 python test_numa_aligned_registration_growth.py \
         --tier-90g --gate [--collapse]
 
-Since the THP-fallback fix (analysis/dsv41-drive/thp-fallback) the production table registers each chunk in a
-scratch ring and clones it, which also removes the growth these controls reproduce, so the controls (and
-``--direct``) register directly with ``RegisteredBufferTable(false)``. ``test_mixed_folio_chunks_register_without_the_
-quadratic_walk`` is that fix's regression case.
-
 ``--collapse`` is a measurement only: ``madvise(MADV_COLLAPSE)`` per slab after the touch, before registration.
 Production code does not do this.
 
@@ -76,8 +71,6 @@ LAYERS_90G, ROWS_PER_LAYER = 40, 181  # the dsv41 tier: 40 streamed layers, ~181
 TIER_90G = ((0, 51200 * MIB), (1, 40960 * MIB))
 GATE_90G_MIB = {0: 70656, 1: 55056}  # free + page cache needed right before the 90 GiB run
 MADV_COLLAPSE = 25
-MADV_HUGEPAGE, MADV_NOHUGEPAGE = 14, 15
-HUGE = 2 << 20
 
 _SOURCE = r"""
 #include <chrono>
@@ -100,7 +93,7 @@ static double ms_since(Clock::time_point t) {
 // Returns the chunks registered; out_* receive each planned chunk (max_chunks at most) and its time.
 extern "C" int register_regions(unsigned regions, const uint64_t* base, const uint64_t* bytes, const uint64_t* row,
                                 unsigned max_chunks, uint64_t* out_base, uint64_t* out_len, double* out_ms,
-                                unsigned* planned, double abort_ms, char* error, unsigned error_len, int clone) {
+                                unsigned* planned, double abort_ms, char* error, unsigned error_len) {
   try {
     std::vector<sglang::io::ChunkPlan> chunks;
     std::vector<uint64_t> chunk_row;
@@ -120,7 +113,7 @@ extern "C" int register_regions(unsigned regions, const uint64_t* base, const ui
       std::snprintf(error, error_len, "ring: %s", std::strerror(-rc));
       return -1;
     }
-    sglang::io::RegisteredBufferTable table(clone != 0);
+    sglang::io::RegisteredBufferTable table;
     if (!table.init(&ring, chunks.size())) {
       std::snprintf(error, error_len, "sparse init: %s", table.last_error_context().c_str());
       io_uring_queue_exit(&ring);
@@ -169,8 +162,7 @@ def build_library(directory: Path) -> ctypes.CDLL:
     lib = ctypes.CDLL(str(library))
     u64p, dp = ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_double)
     lib.register_regions.argtypes = [ctypes.c_uint, u64p, u64p, u64p, ctypes.c_uint, u64p, u64p, dp,
-                                     ctypes.POINTER(ctypes.c_uint), ctypes.c_double, ctypes.c_char_p, ctypes.c_uint,
-                                     ctypes.c_int]
+                                     ctypes.POINTER(ctypes.c_uint), ctypes.c_double, ctypes.c_char_p, ctypes.c_uint]
     lib.register_regions.restype = ctypes.c_int
     return lib
 
@@ -301,7 +293,7 @@ def growth(ms: list[float], lengths: list[int]) -> dict:
             "chunks": len(xs)}
 
 
-def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collapse=False, abort_s=300.0, clone=True,
+def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collapse=False, abort_s=300.0,
         workdir: Path, separate=False, old_tail=False) -> dict:
     import sglang
     from sglang.srt.layers.moe import host_numa
@@ -385,9 +377,7 @@ def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collap
     planned, error = ctypes.c_uint(), ctypes.create_string_buffer(512)
     t = time.monotonic()
     done = lib.register_regions(n, arr(r[0] for r in regions), arr(r[1] for r in regions), arr(r[2] for r in regions),
-                                cap, out_base, out_len, out_ms, ctypes.byref(planned), abort_s * 1000.0, error, 512,
-                                int(clone))
-    result["clone"] = clone
+                                cap, out_base, out_len, out_ms, ctypes.byref(planned), abort_s * 1000.0, error, 512)
     result["register_total_ms"] = (time.monotonic() - t) * 1000.0
     result["chunks_planned"], result["chunks_registered"] = planned.value, done
     result["register_error"] = error.value.decode()
@@ -413,11 +403,11 @@ def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collap
     return result
 
 
-def _gib_run(gib: int, tmp_path: Path, old: bool = False, separate: bool = False, clone: bool = True) -> dict:
+def _gib_run(gib: int, tmp_path: Path, old: bool = False, separate: bool = False) -> dict:
     total = gib * GIB
     layers = max(1, math.ceil(total // ROW_BYTES / ROWS_PER_LAYER))
     placement = ((0, 5 * total // 9), (1, total - 5 * total // 9))  # the 90 GiB tier's 5:4
-    result = run(total, placement, layers, old_alignment=old, workdir=tmp_path, separate=separate, clone=clone)
+    result = run(total, placement, layers, old_alignment=old, workdir=tmp_path, separate=separate)
     print(json.dumps(result))
     return result
 
@@ -442,78 +432,9 @@ def test_separate_slab_registration_grows_linearly(tmp_path):
 
 
 def test_old_alignment_control_reproduces_the_quadratic_growth(tmp_path):
-    # Direct registration (no scratch-ring clone): the table now clones, which removes this growth too.
-    result = _gib_run(8, tmp_path, old=True, clone=False)
+    result = _gib_run(8, tmp_path, old=True)
     assert result["register_error"] == "", result["register_error"]
     assert result["growth"]["ms_per_gib_per_earlier_gib"] > 250, result["growth"]
-
-
-_madvise_fn = ctypes.CDLL(None, use_errno=True).madvise
-_madvise_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-
-
-def _madvise(start: int, length: int, advice: int) -> None:
-    assert _madvise_fn(start, length, advice) == 0, os.strerror(ctypes.get_errno())
-
-
-def _register(lib, regions, clone: bool) -> tuple[float, list[float], str]:
-    n, cap = len(regions), 1 << 14
-    arr = lambda values: (ctypes.c_uint64 * n)(*values)  # noqa: E731
-    out_base, out_len, out_ms = (ctypes.c_uint64 * cap)(), (ctypes.c_uint64 * cap)(), (ctypes.c_double * cap)()
-    planned, error = ctypes.c_uint(), ctypes.create_string_buffer(512)
-    done = lib.register_regions(n, arr(r[0] for r in regions), arr(r[1] for r in regions), arr(r[2] for r in regions),
-                                cap, out_base, out_len, out_ms, ctypes.byref(planned), 600_000.0, error, 512, int(clone))
-    assert done == planned.value, error.value.decode()
-    ms = [out_ms[i] for i in range(done)]
-    return sum(ms), ms, error.value.decode()
-
-
-def test_mixed_folio_chunks_register_without_the_quadratic_walk(tmp_path):
-    """The THP-fallback case (analysis/dsv41-drive/thp-fallback/results.md): 4 GiB split 5:4, MADV_HUGEPAGE so it is
-    THP-backed, then 2 MiB forced onto 4 KiB pages (MADV_NOHUGEPAGE before the fault) in each of three 1 GiB chunks,
-    the shape THP fault fallback leaves under fragmentation. Each such mixed chunk cannot coalesce, and a direct
-    registration charges every later chunk's huge pages a walk over its 262,144 pages. The same faulted tier registers
-    through the production table (scratch ring + clone) and directly, the control that must still show the cost.
-    4 GiB keeps it under the 4 GiB lock threshold."""
-    from sglang.srt.layers.moe import host_numa
-
-    total = 4 * GIB
-    placement = ((0, 5 * total // 9 // MIB * MIB), (1, total - 5 * total // 9 // MIB * MIB))
-    layers = max(1, -(-(total // ROW_BYTES) // ROWS_PER_LAYER))
-    real = host_numa.allocate_bound
-
-    def hugepage_bound(nbytes, runs, row_bytes):
-        tensor = real(nbytes, runs, row_bytes)
-        if nbytes:
-            _madvise(tensor.data_ptr(), -(-nbytes // HUGE) * HUGE, MADV_HUGEPAGE)
-        return tensor
-
-    host_numa.allocate_bound = hugepage_bound
-    try:
-        tier = build_tier(total, placement, layers)
-    finally:
-        host_numa.allocate_bound = real
-    regions = [(s.data_ptr(), s.nbytes, s.nbytes // s.shape[0]) for slabs in tier for s in slabs.values() if s.nbytes]
-    big = [(b + at, min((GIB // row) * row, n - at)) for b, n, row in regions for at in range(0, n, (GIB // row) * row)]
-    big = [c for c in big if c[1] >= 512 * MIB]
-    assert len(big) >= 3
-    for base, length in (big[0], big[len(big) // 2], big[-2]):
-        _madvise((base + length // 2) // HUGE * HUGE, HUGE, MADV_NOHUGEPAGE)
-    huge0 = anon_huge_kib()
-    for owner in owners_of(tier):
-        owner.fill_(1)
-    thp = (anon_huge_kib() - huge0) * 1024 / sum(o.nbytes for o in owners_of(tier))
-    if thp < 0.95:
-        pytest.skip(f"only {thp:.0%} of the tier is THP-backed: the node is too fragmented to set the case up")
-
-    lib = build_library(tmp_path)
-    cloned_ms, cloned, _ = _register(lib, regions, clone=True)
-    direct_ms, direct, _ = _register(lib, regions, clone=False)
-    print(f"4 GiB, 3 mixed chunks: cloned {cloned_ms:.0f} ms (max chunk {max(cloned):.0f}), "
-          f"direct {direct_ms:.0f} ms (max chunk {max(direct):.0f})")
-    # The control: direct registration still walks the mixed chunks' pages (~0.85 s per later GiB each).
-    assert direct_ms > 1500, direct_ms
-    assert cloned_ms < direct_ms / 4, (cloned_ms, direct_ms)
 
 
 def main() -> int:
@@ -525,7 +446,6 @@ def main() -> int:
     parser.add_argument("--separate-slabs", action="store_true", help="one mapping per named slab per layer")
     parser.add_argument("--old-tail", action="store_true", help="control: last binding ends at the page-rounded span")
     parser.add_argument("--gate", action="store_true", help="refuse unless both nodes clear the 90 GiB gate")
-    parser.add_argument("--direct", action="store_true", help="control: register directly, not through the clone")
     parser.add_argument("--abort-s", type=float, default=300.0)
     parser.add_argument("--workdir", default="/mnt/nvme1/numa-regtime")
     args = parser.parse_args()
@@ -540,15 +460,13 @@ def main() -> int:
     if args.tier_90g:
         total = sum(nbytes for _, nbytes in TIER_90G)
         result = run(total, TIER_90G, LAYERS_90G, old_alignment=args.old_alignment, collapse=args.collapse,
-                     abort_s=args.abort_s, workdir=workdir, separate=args.separate_slabs, old_tail=args.old_tail,
-                     clone=not args.direct)
+                     abort_s=args.abort_s, workdir=workdir, separate=args.separate_slabs, old_tail=args.old_tail)
     else:
         total = args.gib * GIB
         layers = max(1, math.ceil(total // ROW_BYTES / ROWS_PER_LAYER))
         placement = ((0, 5 * total // 9), (1, total - 5 * total // 9))
         result = run(total, placement, layers, old_alignment=args.old_alignment, collapse=args.collapse,
-                     abort_s=args.abort_s, workdir=workdir, separate=args.separate_slabs, old_tail=args.old_tail,
-                     clone=not args.direct)
+                     abort_s=args.abort_s, workdir=workdir, separate=args.separate_slabs, old_tail=args.old_tail)
     print(json.dumps(result), flush=True)
     return 0
 
