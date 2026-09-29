@@ -4,8 +4,14 @@ under the counting shim, not timed), from drive_hotpath_arms.sh's out dir.
 Usage: hotpath_report.py <out_dir> <tier text> <perf_event_paranoid> A=<run_dir> B=<run_dir> A2=<run_dir> [C=<run_dir>]
 (PYTHONPATH: analysis/dsv41-drive/mirror3 and analysis/dsv41-drive/iopoll-cuts). Writes <out_dir>/arms-report.json and
 exits non-zero unless the pass condition holds: B and A2 byte-identical to A (and C, when present), read_errors == 0 in
-every arm, B's pooled ms/token <= mean(A, A2) + max(1.5, |A2 - A|), and, when C ran, C's whole-run service- and
-copy-thread malloc, free, mutex and cond counts all 0.
+every arm, B's pooled ms/token <= mean(A, A2) + max(1.5, |A2 - A|), and, when C ran, C's whole-run *service*-thread
+malloc, mutex and cond counts are 0 and its free count is at most the measured lifecycle floor (1, the std::thread
+teardown). The copy thread's counts are reported, never asserted: its start handshake alone costs free 1, mutex 1 and
+cond 1, and libcuda's cuMemcpyAsync/cuEventQuery may allocate inside the driver (results.md SS8e/SS8f).
+
+Identity is hardened against passing vacuously: a comparison that dropped any error row (mirror3_report.identity's
+_turns silently excludes rows carrying "error"), covered zero turns, or matched on empty content in either arm is
+treated as a failure, not a silent pass.
 
 Per arm: mirror3_report.decode (session and pooled ms/token, TTFT), identity against A, the shutdown line's served,
 rows_read and read_errors, the exl3-ram-miss thread's CPU seconds over the timed window (thread_sampler.report), and
@@ -24,6 +30,12 @@ import thread_sampler as ts
 
 TIMED = ("A", "B", "A2")
 ZERO_KINDS = ("malloc", "free", "mutex", "cond")
+# The service thread's measured lifecycle floor (results.md SS8e/SS8f): std::thread's own teardown frees once, and
+# nothing else in its start handshake touches the heap or the kernel. The copy thread's floor is higher (free 1,
+# mutex 1, cond 1 from its own start handshake, plus whatever libcuda allocates inside cuMemcpyAsync/cuEventQuery), so
+# its counts are reported but never asserted against a floor.
+SERVICE_ZERO_KINDS = ("malloc", "mutex", "cond")
+SERVICE_FREE_FLOOR = 1
 
 
 def perf(path: Path) -> dict | None:
@@ -99,11 +111,38 @@ def shim(out_dir: Path) -> dict:
                 "ok": False, "why": f"expected exactly one dump (the scheduler's), found {len(dumps)}"}
     d = dumps[0]
     seen_ok = d["threads"].get("service", 0) >= 1 and d["threads"].get("copy", 0) >= 1
-    zeros = {th: {k: d[th][k] for k in ZERO_KINDS} for th in ("service", "copy")}
-    ok = seen_ok and all(v == 0 for th in zeros.values() for v in th.values())
-    return {**d, "file": str(paths[0]), "ok": ok,
-            "why": None if ok else ("a tracked thread was never recognized" if not seen_ok
-                                    else f"nonzero malloc/free/mutex/cond: {zeros}")}
+    counts = {th: {k: d[th][k] for k in ZERO_KINDS} for th in ("service", "copy")}
+    service = counts["service"]
+    service_ok = (all(service[k] == 0 for k in SERVICE_ZERO_KINDS) and service["free"] <= SERVICE_FREE_FLOOR)
+    ok = seen_ok and service_ok
+    why = None
+    if not ok:
+        why = ("a tracked thread was never recognized" if not seen_ok
+               else f"service thread past the lifecycle floor (malloc=mutex=cond=0, free<={SERVICE_FREE_FLOOR}): "
+                    f"{service}")
+    return {**d, "file": str(paths[0]), "ok": ok, "counts": counts, "why": why}
+
+
+def identity_checked(ref_dir: str, new_dir: str) -> dict:
+    """mirror3_report.identity, hardened against a vacuous pass (review finding B-2):
+    - _turns silently drops any row carrying "error", so a turn that errored in both arms would otherwise vanish
+      from the comparison instead of failing it. Detected by comparing the raw row count to the turn count: if
+      _turns dropped anything, they differ.
+    - zero turns compared (e.g. both arms produced nothing) must not read as "identical".
+    - a turn whose content is empty (falsy/whitespace-only) in either arm must not count as a match."""
+    ref_rows, new_rows = m.load_jsonl(Path(ref_dir) / "results.jsonl"), m.load_jsonl(Path(new_dir) / "results.jsonl")
+    same = m.identity(ref_dir, new_dir)
+    if not same:
+        raise ValueError(f"{ref_dir} vs {new_dir}: identity compared zero turns")
+    if len(ref_rows) != len(same) or len(new_rows) != len(same):
+        raise ValueError(f"{ref_dir} vs {new_dir}: error rows were dropped from the comparison "
+                          f"(ref {len(ref_rows)} rows, new {len(new_rows)} rows, {len(same)} turns compared)")
+    ref_turns, new_turns = m._turns(ref_dir), m._turns(new_dir)
+    empty = [k for k in same if not str(ref_turns[k].get("content") or "").strip()
+             or not str(new_turns[k].get("content") or "").strip()]
+    if empty:
+        raise ValueError(f"{ref_dir} vs {new_dir}: empty content on turns {empty}")
+    return same
 
 
 def main(argv: list[str]) -> int:
@@ -111,7 +150,7 @@ def main(argv: list[str]) -> int:
     runs = dict(kv.split("=", 1) for kv in argv[4:])
     arms = {name: arm(out_dir, name, run) for name, run in runs.items()}
     ref = runs["A"]
-    identity = {n: m.identity(ref, r) for n, r in runs.items() if n != "A"}
+    identity = {n: identity_checked(ref, r) for n, r in runs.items() if n != "A"}
     out = {"tier": tier, "perf_event_paranoid": paranoid, "arms": arms,
            "identical_to_A": {n: all(v.values()) for n, v in identity.items()},
            "differing_turns": {n: [k for k, same in v.items() if not same] for n, v in identity.items()}}

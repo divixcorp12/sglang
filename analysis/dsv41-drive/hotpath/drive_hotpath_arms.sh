@@ -412,11 +412,12 @@ run_one() {  # <arm> <worktree> <sha> [KEY=VAL ...]
 }
 
 identical_so_far() {  # A2 and B must match A byte for byte before C runs
-    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3 $PY -c "
-import sys, mirror3_report as m
+    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3:$BRANCH_WT/analysis/dsv41-drive/hotpath $PY -c "
+import sys, hotpath_report as hr
 ref = sys.argv[1]
-bad = {name: [k for k, same in m.identity(ref, run).items() if not same] for name, run in
-       (kv.split('=', 1) for kv in sys.argv[2:])}
+bad = {}
+for name, run in (kv.split('=', 1) for kv in sys.argv[2:]):
+    bad[name] = [k for k, same in hr.identity_checked(ref, run).items() if not same]
 print('identity vs A:', {n: ('identical' if not b else f'{len(b)} turns differ: {b}') for n, b in bad.items()})
 raise SystemExit(0 if not any(bad.values()) else 'output differs from A')
 " "$(run_dir_of A)" "B=$(run_dir_of B)" "A2=$(run_dir_of A2)"
@@ -429,9 +430,9 @@ attribute() {  # <arm>: the arm's shim counts and stacks, attributed to call sit
 
 same_as_ref() {  # <arm>: byte identity against REF_RUN (Task 18's A), when given
     [ -n "${REF_RUN:-}" ] || return 0
-    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3 $PY -c "
-import sys, mirror3_report as m
-same = m.identity(sys.argv[1], sys.argv[2])
+    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3:$BRANCH_WT/analysis/dsv41-drive/hotpath $PY -c "
+import sys, hotpath_report as hr
+same = hr.identity_checked(sys.argv[1], sys.argv[2])
 bad = [k for k, v in same.items() if not v]
 print('$1 identity vs REF_RUN:', 'identical' if not bad else f'{len(bad)} turns differ: {bad}', f'({len(same)} turns)')
 raise SystemExit(0 if not bad else 'output differs from REF_RUN')

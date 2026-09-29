@@ -350,8 +350,8 @@ CPU seconds from `thread_sampler.report` over the timed window (~26.6 s). perf s
   `/proc/<pid>/task/<tid>/status` and `sched`, sampled every ~5 s by the driver (`<arm>-sched.jsonl`).
 - The thread's cycles are its idle loop, not its requests: it spins `spin_us`, then sleeps 50 µs (spec L12), so
   cycles/request is the same in all arms and ~200 voluntary switches/request are idle sleeps. Instructions differ:
-  B retires **~17-19% fewer instructions per served request** than A/A2 (33.5 M against 41.5 M / 40.0 M) over the same
-  cycles.
+  B retires **~16-19% fewer instructions per served request** than A/A2 (33.5 M against 41.5 M / 40.0 M: 19.3% vs A,
+  16.3% vs A2, 17.8% vs mean(A, A2)) over the same cycles.
 
 ### 8c. C: whole-run shim counts of the production server
 
