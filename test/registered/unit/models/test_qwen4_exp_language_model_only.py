@@ -41,6 +41,11 @@ def test_qwen4_exp_is_accepted():
     _handle("Qwen4ExpForConditionalGeneration")
 
 
+def test_deepseek_v4_is_accepted():
+    # V4.1 checkpoints load as DeepseekV4ForCausalLM; the DSV4.1 recipe launches with the flag.
+    _handle("DeepseekV4ForCausalLM")
+
+
 def test_unlisted_architecture_is_still_rejected():
     with pytest.raises(ValueError, match="does not support"):
         _handle("Qwen3VLForConditionalGeneration")

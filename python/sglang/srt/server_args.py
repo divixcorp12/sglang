@@ -335,6 +335,8 @@ class ServerArgs:
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
         "Qwen4ExpForConditionalGeneration",
+        # V4.1 configs load under the V4 name; the flag zeroes vision_n_layers (ModelConfig).
+        "DeepseekV4ForCausalLM",
     )
 
     # The attention-backend allow-list is enforced via

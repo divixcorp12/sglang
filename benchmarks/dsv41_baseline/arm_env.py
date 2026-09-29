@@ -156,7 +156,9 @@ def base_env() -> dict[str, str]:
         # of the cut is not measured (27.7's slope suggests ~2-3 ms/token). Cut to 15400 on 2026-09-29 for driver
         # 615.71.09's larger EAGER footprint, with MEM_FRACTION_STATIC 0.885 (recipe-mem/diagnosis.md, results.md).
         # 15080 since 2026-09-29, with MEM_FRACTION_STATIC 0.875: its ~320 MiB goes to prefill headroom.
-        "SGLANG_MOE_HOT_GPU_MB": "15080",
+        # 16080 since 2026-09-29: --language-model-only frees the ~0.97 GB vision tower (no weights in the
+        # checkpoint) and the 0.10 GB multimodal reservation; 1000 MiB of that goes here.
+        "SGLANG_MOE_HOT_GPU_MB": "16080",
         "SGLANG_MOE_HOT_DYNAMIC": "1",
         "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
         "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "1",
@@ -282,6 +284,8 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "0",
             "--hicache-write-policy",
             "write_through",
+            # The checkpoint has no vision weights; without this the ViT and aligner are built empty in VRAM.
+            "--language-model-only",
             # Loads each prefill Triton variant before serving, while device memory is still free (entrypoints/warmup.py).
             "--warmups",
             "dsv41_prefill_shapes",

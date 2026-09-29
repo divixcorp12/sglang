@@ -513,6 +513,10 @@ class ModelConfig:
         self.is_lm_only = language_model_only or getattr(
             self.hf_config, "language_model_only", False
         )
+        if self.is_lm_only and self.hf_config.model_type == "deepseek_v41":
+            # Every V4.1 vision site (ViT and aligner, the per-layer VL routing bias,
+            # the image-token Engram bypass) keys off vision_n_layers.
+            self.hf_config.vision_n_layers = 0
         self.model_is_mrope = (
             not self.is_lm_only
             and rope_scaling is not None
