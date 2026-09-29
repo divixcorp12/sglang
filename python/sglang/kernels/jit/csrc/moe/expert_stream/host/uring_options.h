@@ -40,6 +40,19 @@ struct UringOptions {
   bool iopoll() const {
     return mode == UringMode::IoPoll || mode == UringMode::SqPollIoPoll;
   }
+  // IOPOLL without SQPOLL: io_uring_enter(GETEVENTS, min_complete>0) polls the device inside the kernel holding the
+  // ring's uring_lock, and a read punted to io-wq cannot queue itself on the poll list until the waiter lets go: the
+  // punted reads then issue one after another behind completions (+1.5 ms per row; diagnosis.md table 3). Such a
+  // ring therefore always waits with min_complete=0 passes.
+  bool polls_in_wait() const {
+    return iopoll() && !sqpoll();
+  }
+  bool blocking_wait() const {
+    return wait_mode == UringWaitMode::Block && !polls_in_wait();
+  }
+  const char* effective_wait_name() const {
+    return blocking_wait() ? "block" : polls_in_wait() ? "reap" : "spin";
+  }
   const char* mode_name() const {
     switch (mode) {
       case UringMode::Default:

@@ -129,6 +129,10 @@ class UringReader {
   bool fixed_reads() const {
     return options_.read_mode != UringReadMode::Normal;
   }
+  // Cut reads into device-sized legs (READ_CUTS; ReaderCore plans them): the resolved option, for diagnostics.
+  bool read_cuts() const {
+    return options_.read_cuts_on();
+  }
   unsigned sq_space() const {
     return io_uring_sq_space_left(&ring_);
   }
@@ -199,7 +203,7 @@ class UringReader {
   }
 
   int submit(unsigned wait_nr) {
-    if (options_.wait_mode == UringWaitMode::Block)
+    if (options_.blocking_wait())
       return wait_nr != 0 ? io_uring_submit_and_wait(&ring_, wait_nr) : io_uring_submit(&ring_);
     const int submitted = io_uring_submit(&ring_);
     if (submitted < 0 || wait_nr == 0) return submitted;
@@ -452,6 +456,19 @@ class UringReader {
   }
   void wait_one() {
     io_uring_cqe* cqe = nullptr;
+    if (options_.polls_in_wait()) {
+      // Never io_uring_wait_cqe here: see UringOptions::polls_in_wait.
+      for (;;) {
+        const int rc = io_uring_peek_cqe(&ring_, &cqe);
+        if (rc == 0) break;
+        if (rc != -EAGAIN && rc != -EINTR) std::terminate();
+        const int got = io_uring_get_events(&ring_);
+        if (got < 0 && !soft_error(got)) std::terminate();
+        spin_hint();
+      }
+      retire(cqe);
+      return;
+    }
     int rc;
     do {
       rc = io_uring_wait_cqe(&ring_, &cqe);
@@ -466,7 +483,7 @@ class UringReader {
         "expert stream io_uring: mode=%s read_mode=%s wait=%s requested_flags=0x%x effective_flags=0x%x "
         "requested_depth=%u sq_entries=%u cq_entries=%u features=0x%x fixed_files=%zu "
         "fixed_buffers=%zu registered_bytes=%llu sq_thread_idle_ms=%u sq_thread_cpu=%d "
-        "regions=%zu chunks=%zu largest_chunk=%llu chunk_cap=%zu register_ms=%.1f\n",
+        "regions=%zu chunks=%zu largest_chunk=%llu chunk_cap=%zu register_ms=%.1f read_cuts=%s:%d effective_wait=%s\n",
         options_.mode_name(),
         options_.read_mode_name(),
         options_.wait_mode == UringWaitMode::Spin ? "spin" : "block",
@@ -485,7 +502,10 @@ class UringReader {
         table_.chunks(),
         static_cast<unsigned long long>(table_.largest()),
         static_cast<size_t>(chunk_cap_),
-        register_ms_);
+        register_ms_,
+        options_.read_cuts_name(),
+        options_.read_cuts_on() ? 1 : 0,
+        options_.effective_wait_name());
   }
 
   io_uring ring_{};
