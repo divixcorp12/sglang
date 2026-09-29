@@ -34,3 +34,19 @@ fixed)
     run --label fixed-row-cut256 --file $F0 --file $F4 --file $F2 --workload row --qd 1 --mode $m --cut 262144 --fixed-files
   done ;;
 esac; done
+# repeat: interleaved default/iopoll pairs, QD1 rows, to average out the SPCC drive's run-to-run swings.
+if [[ " $PHASES " == *" repeat "* ]]; then
+  for rep in 1 2 3 4 5; do for m in default iopoll; do
+    run --label rep-prod --file $F0 --file $F4 --file $F2 --workload row --qd 1 --mode $m
+    run --label rep-cut256 --file $F0 --file $F4 --file $F2 --workload row --qd 1 --mode $m --cut 262144
+    run --label rep-cut256-nogap --file $F0 --file $F4 --file $F2 --workload row --qd 1 --mode $m --cut 262144 --no-gap-cut
+    run --label rep-cut512 --file $F0 --file $F4 --file $F2 --workload row --qd 1 --mode $m --cut 524288
+  done; done
+fi
+# qd: rows in flight 1/2/4, prod vs cut256, interleaved.
+if [[ " $PHASES " == *" qd "* ]]; then
+  for rep in 1 2 3; do for qd in 2 4; do for m in default iopoll; do
+    run --label qd-prod --file $F0 --file $F4 --file $F2 --workload row --qd $qd --mode $m
+    run --label qd-cut256 --file $F0 --file $F4 --file $F2 --workload row --qd $qd --mode $m --cut 262144
+  done; done; done
+fi

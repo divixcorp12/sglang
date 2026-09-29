@@ -45,7 +45,7 @@ static const uint64_t image_bytes = 13315584, row_stride = 13316096;
 
 static const char* files[MAX_FILES];
 static int nfiles = 0, fds[MAX_FILES];
-static int iopoll = 0, fixed_files = 0, use_read = 0, row_mode = 0, threads = 1, qd = 1, per_part = 2;
+static int gap_cut = 1, iopoll = 0, fixed_files = 0, use_read = 0, row_mode = 0, threads = 1, qd = 1, per_part = 2;
 static uint64_t sqe_bytes = 262144, cut = 0;
 static double seconds = 3.0;
 static atomic_int stop_sampler;
@@ -83,10 +83,15 @@ typedef struct {
   char* slab[NSEG];
   // results
   double* lat; size_t nlat, caplat;
+  double* flat_[MAX_FILES]; size_t nf[MAX_FILES], capf[MAX_FILES];
   uint64_t ops, bytes, sqes, errors, eagain, shorts;
   struct rusage ru;
 } Thr;
 
+static void file_push(Thr* t, int f, double v) {
+  if (t->nf[f] == t->capf[f]) { t->capf[f] = t->capf[f] ? 2 * t->capf[f] : 4096; t->flat_[f] = realloc(t->flat_[f], t->capf[f] * sizeof(double)); }
+  t->flat_[f][t->nf[f]++] = v;
+}
 static void lat_push(Thr* t, double v) {
   if (t->nlat == t->caplat) { t->caplat = t->caplat ? 2 * t->caplat : 4096; t->lat = realloc(t->lat, t->caplat * sizeof(double)); }
   t->lat[t->nlat++] = v;
@@ -126,7 +131,7 @@ static int build_row(Thr* t, uint64_t row, int slot, Sqe* out, struct iovec* iv)
             struct iovec* pv = &iv[niv - 1];
             uintptr_t pend = (uintptr_t)pv->iov_base + pv->iov_len;
             int gap = (pend % PAGE) != 0 || ((uintptr_t)v->iov_base % PAGE) != 0;
-            if (use_read || (cut && gap)) break;
+            if (use_read || (cut && gap_cut && gap)) break;
           }
           uint64_t room = cut ? cut - q->len : UINT64_MAX;
           if (cut && room == 0) break;
@@ -196,7 +201,7 @@ static void* worker(void* arg) {
           else
             io_uring_prep_readv(s, fd, q->iov, q->iovcnt, q->off);
           if (fixed_files) s->flags |= IOSQE_FIXED_FILE;
-          io_uring_sqe_set_data64(s, ((uint64_t)i << 32) | (uint64_t)q->len);
+          io_uring_sqe_set_data64(s, ((uint64_t)i << 40) | ((uint64_t)q->file << 32) | (uint64_t)q->len);
           o->bytes += q->len;
         }
         t->sqes += o->nsq;
@@ -210,7 +215,8 @@ static void* worker(void* arg) {
     double tn = now_us();
     io_uring_for_each_cqe(&t->ring, head, c) {
       uint64_t d = io_uring_cqe_get_data64(c);
-      Op* o = &ops[d >> 32];
+      Op* o = &ops[d >> 40];
+      file_push(t, (int)((d >> 32) & 0xff), tn - o->t0);
       uint64_t want = d & 0xffffffffULL;
       if (c->res < 0) { int z = 0; atomic_compare_exchange_strong(&first_error, &z, c->res); t->errors++; if (c->res == -EAGAIN) t->eagain++; }
       else if ((uint64_t)c->res != want) t->shorts++;
@@ -302,6 +308,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "--per-part")) { per_part = atoi(v); ++i; }
     else if (!strcmp(a, "--seconds")) { seconds = atof(v); ++i; }
     else if (!strcmp(a, "--fixed-files")) { fixed_files = 1; }
+    else if (!strcmp(a, "--no-gap-cut")) { gap_cut = 0; }
     else if (!strcmp(a, "--label")) { label = v; ++i; }
     else { fprintf(stderr, "unknown arg %s\n", a); return 2; }
   }
@@ -346,17 +353,27 @@ int main(int argc, char** argv) {
   double wq_cpu = 0; for (int i = 0; i < nw; ++i) wq_cpu += wcpu[i];
   uint64_t dreq = 0, dsec = 0;
   for (int i = 0; i < nfiles; ++i) { dreq += r1[i] - r0[i]; dsec += s1[i] - s0[i]; }
-  printf("{\"label\":\"%s\",\"workload\":\"%s\",\"mode\":\"%s\",\"op\":\"%s\",\"size\":%llu,\"cut\":%llu,\"files\":%d,"
+  printf("{\"label\":\"%s\",\"workload\":\"%s\",\"mode\":\"%s\",\"op\":\"%s\",\"size\":%llu,\"cut\":%llu,\"gap_cut\":%d,\"files\":%d,"
          "\"fixed_files\":%d,\"threads\":%d,\"qd\":%d,\"wall_s\":%.3f,\"ops\":%llu,\"sqes\":%llu,\"sqes_per_op\":%.2f,"
          "\"MBps\":%.1f,\"p50_us\":%.1f,\"p90_us\":%.1f,\"p99_us\":%.1f,\"max_us\":%.1f,\"errors\":%llu,\"first_error\":%d,\"eagain\":%llu,"
          "\"short\":%llu,\"proc_cpu_s\":%.3f,\"submitter_cpu_s\":%.3f,\"iowq_workers\":%d,\"iowq_max_live\":%d,"
          "\"iowq_cpu_s\":%.3f,\"disk_reqs\":%llu,\"disk_reqs_per_sqe\":%.2f,\"disk_MB\":%.1f}\n",
          label, row_mode ? "row" : "flat", iopoll ? "iopoll" : "default", use_read ? "read" : "readv",
-         (unsigned long long)sqe_bytes, (unsigned long long)(cut > (UINT64_MAX / 4) ? 0 : cut), nfiles, fixed_files,
+         (unsigned long long)sqe_bytes, (unsigned long long)(cut > (UINT64_MAX / 4) ? 0 : cut), gap_cut, nfiles, fixed_files,
          threads, qd, wall, (unsigned long long)ops, (unsigned long long)sqes, ops ? (double)sqes / ops : 0,
          bytes / wall / 1e6, PCT(0.5), PCT(0.9), PCT(0.99), n ? all[n - 1] : 0, (unsigned long long)errs, atomic_load(&first_error),
          (unsigned long long)eag, (unsigned long long)shorts, proc_cpu, sub_cpu, nw, wmax_live, wq_cpu,
          (unsigned long long)dreq, sqes ? (double)dreq / sqes : 0, dsec * 512 / 1e6);
+  printf("  sqe_p50_us_by_file:");
+  for (int f = 0; f < nfiles; ++f) {
+    size_t m = 0; for (int i = 0; i < threads; ++i) m += th[i].nf[f];
+    double* v = malloc((m ? m : 1) * sizeof(double)); size_t j = 0;
+    for (int i = 0; i < threads; ++i) { memcpy(v + j, th[i].flat_[f], th[i].nf[f] * sizeof(double)); j += th[i].nf[f]; }
+    qsort(v, m, sizeof(double), cmp);
+    printf(" %s=%.0f/%.0f", part_name[f], m ? v[m / 2] : 0.0, m ? v[(size_t)(0.99 * (m - 1))] : 0.0);
+    free(v);
+  }
+  printf("\n");
   (void)seg_name;
   return errs || shorts ? 3 : 0;
 }
