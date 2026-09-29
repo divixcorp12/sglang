@@ -1,8 +1,8 @@
 """Every party that touches the RAM-miss service concurrently -- the device, the copy thread's completions, unpaused
 Python calls, and an eager caller's pause/resume -- against the running service thread, with the invariants that the
-tier mutex protects today checked at every pause and at the end (plan 2026-09-29-hotpath-zero-overhead Task 4). Green
-at ba01695c35; the lock-free single-owner tier (Tasks 13-15) must keep it green, and Task 16 runs ``run_stress``
-under ThreadSanitizer."""
+tier mutex protected at ba01695c35 checked at every pause and at the end (plan 2026-09-29-hotpath-zero-overhead
+Task 4). Green at ba01695c35; the lock-free single-owner tier (Tasks 13-15) must keep it green, and Task 16 runs
+``run_stress`` under ThreadSanitizer."""
 
 import random
 import threading

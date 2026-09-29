@@ -22,6 +22,8 @@ struct Tier {
   // decode. `owned` counts them. Only take_admit_slot_locked sets it, so it stays all zero with the share off.
   std::vector<uint8_t> prefill_owned;
   int64_t owned = 0;
+  // Written by the owner's serve() only (a relaxed store through std::atomic_ref), read relaxed by layer_rows from
+  // any thread.
   int64_t rows_demand = 0;
   int64_t rows_advisory = 0;
 };
@@ -94,7 +96,7 @@ class RamTier {
   // The copy thread's callbacks use slot_gen_, the lease block, copy_done_ and the counter blocks, which are destroyed
   // before copy_engine_ would be.
   ~RamTier() {
-    fill_join();  // the fill thread reads through reader_ into the slabs
+    fill_join();  // the fill thread reads through reader_ into the slabs; nothing else holds the tier by now
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
   }
 
@@ -121,10 +123,10 @@ class RamTier {
   }
 
   // Counters (plan 2026-09-29-hotpath-zero-overhead D1). A core counter (is_core_counter) lives in the writing thread's
-  // own line-private block: count() is the service thread's (or the caller owning the tier while it is paused or
-  // pumped; the Python-side writers of a core counter hold mutex_, as every service-side writer of that counter does),
-  // copy_count() the copy thread's, fill_count() the prefill fill thread's (plan F10, until the fill's epilogue moves
-  // to the owner). Every other counter is a metric: InstrBuild keeps it as a shared relaxed atomic, ProdBuild has none.
+  // own line-private block: count() is the tier's owner's (the service thread, or the caller owning the tier while it
+  // is paused or pumped: one writer at a time, handed over by the same edges as the tier), copy_count() the copy
+  // thread's. The prefill fill thread counts nothing: its epilogue runs on the owner (finish_fill_owned, Task 15).
+  // Every other counter is a metric: InstrBuild keeps it as a shared relaxed atomic, ProdBuild has none.
   template <Counter K>
   void count(int64_t n = 1) {
     count_into<K>(core_, n);
@@ -132,10 +134,6 @@ class RamTier {
   template <Counter K>
   void copy_count(int64_t n = 1) {
     count_into<K>(copy_core_, n);
-  }
-  template <Counter K>
-  void fill_count(int64_t n = 1) {
-    count_into<K>(fill_core_, n);
   }
   void request_pause(bool paused) {
     pause_requested_.store(paused);
@@ -293,7 +291,7 @@ class RamTier {
               count<kDeferred>();
             }
           }
-          deferred_stamp_ = lease_changes_.load();
+          deferred_stamp_ = lease_changes_;
           deferred_gen_ = request.gen;
           if constexpr (Build::kMetrics) trace_.cur = nullptr;
           return false;
@@ -410,15 +408,15 @@ class RamTier {
   // On the owner every one of them runs directly, after draining whatever an earlier caller queued.
   //
   // caller_mutex_ serializes Python-side callers against each other only; the service, copy and fill threads never
-  // take it. mutex_ is still taken inside each owned body until Task 15 deletes it: the fill thread's epilogue still
-  // changes tier state under it, so an owned read here must not run without it yet. The copy thread no longer touches
-  // the tier (Task 14): it hands its completions back through copy_done_.
+  // take it. The tier has no other lock (Task 15): single ownership is what keeps its state consistent. The copy
+  // thread touches no tier state (Task 14: it hands its completions back through copy_done_), nor does the prefill
+  // fill thread (Task 15: it drives the reader and publishes fill_landed_/fill_state_; its epilogue runs on the owner,
+  // finish_fill_owned, after the join).
 
   bool has(int64_t row, int64_t expert) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("contains");
     drain_commands();
-    std::lock_guard<std::mutex> guard(mutex_);
     return tiers_[row].expert_slot[expert] >= 0;
   }
 
@@ -426,7 +424,6 @@ class RamTier {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("touch");
     drain_commands();
-    std::lock_guard<std::mutex> guard(mutex_);
     Tier& tier = tiers_[row];
     const int32_t slot = tier.expert_slot[expert];
     if (slot >= 0) {
@@ -442,7 +439,6 @@ class RamTier {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("assign");
     drain_commands();
-    std::lock_guard<std::mutex> guard(mutex_);
     Tier& tier = tiers_[row];
     if (tier.expert_slot[expert] >= 0) {
       *evicted = -2;
@@ -464,7 +460,6 @@ class RamTier {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("release");
     drain_commands();
-    std::lock_guard<std::mutex> guard(mutex_);
     if (tiers_[row].state[slot] == kLoading) {
       // The service is filling it and will publish it; freeing it would hand it out twice.
       throw std::runtime_error(
@@ -491,7 +486,9 @@ class RamTier {
   // admission can evict it and release() refuses it. The read's progress publishes how many rows have landed, as a
   // prefix of the claim order (fill_wait). The helper holds a busy episode, so the watchdog aborts a hung fill the way
   // it aborts a hung demand. fill_end() joins it; the service thread's resume() joins it first too, so the service
-  // thread and a fill never use the reader at once. Returns the count claimed; slots[i] is expert i's slot.
+  // thread and a fill never use the reader at once. The helper touches no tier state (ownership rule 3): the claimed
+  // slots stay filling, and a failed fill's unlanded rows stay mapped, until the owner joins it and runs the epilogue
+  // (fill_join, finish_fill_owned). Returns the count claimed; slots[i] is expert i's slot.
   int64_t fill_begin(
       int64_t row,
       const std::vector<int32_t>& experts,
@@ -507,7 +504,6 @@ class RamTier {
     std::vector<int64_t> taken;
     *evictions = 0;
     {
-      std::lock_guard<std::mutex> guard(mutex_);
       Tier& tier = tiers_[row];
       for (const int32_t expert : experts) {
         if (tier.expert_slot[expert] >= 0) {
@@ -540,6 +536,8 @@ class RamTier {
     fill_row_ = row;
     fill_experts_ = std::move(claimed);
     fill_slots_ = std::move(taken);
+    fill_result_ = 0;
+    fill_unfinished_ = true;  // the epilogue is owed: fill_join runs it once, on the owner, after the join
     fill_thread_ = std::thread([this] { run_fill(); });
     return static_cast<int64_t>(fill_slots_.size());
   }
@@ -562,14 +560,22 @@ class RamTier {
   }
 
   // Joins the fill: 1 when every claimed row landed (or nothing was claimed), 0 when it failed; a failed fill has
-  // released its rows that did not land.
+  // released its rows that did not land (here, on the caller: finish_fill_owned). Under caller_mutex_, like every
+  // other join of fill_thread_ (resume, stop_thread's final_settle), so no two threads join it at once. The caller
+  // owns the tier whenever an epilogue is owed: a fill starts only on the owner (fill_begin), and resume() joins it
+  // before it hands the tier back.
   int64_t fill_end() {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
     fill_join();
     return fill_state_.load(std::memory_order_acquire) == kFillFailed ? 0 : 1;
   }
 
+  // The owner (the caller of fill_end, resume() and stop_thread's final_settle, each under caller_mutex_; or the
+  // destructor). The join is the synchronization point: every store the fill thread made (fill_result_, the fill's
+  // packed flags, the reader's state, the slab bytes) happens-before the epilogue that follows it here.
   void fill_join() {
     if (fill_thread_.joinable()) fill_thread_.join();
+    if (fill_unfinished_) finish_fill_owned();
   }
 
   // Lease mode: the service reads each armed request's lane request, leases every lane's source slot and publishes
@@ -615,7 +621,6 @@ class RamTier {
   }
 
   void apply_gpu_hot(const Request& request) {
-    std::lock_guard<std::mutex> guard(mutex_);
     Tier& tier = tiers_[request.row];
     for (int64_t expert = 0; expert < experts_; ++expert)
       tier.hot[expert] = (request.hot_bitmap[expert / 8] >> (expert % 8)) & 1;
@@ -743,7 +748,6 @@ class RamTier {
     } else if (row < 0 || row >= layers_ || expert < 0 || expert >= experts_ || !copy_engine_->eligible(row, dst)) {
       skip = kPfSkipInvalid;
     } else {
-      std::lock_guard<std::mutex> guard(mutex_);
       Tier& tier = tiers_[row];
       const int32_t slot = tier.expert_slot[expert];
       if (slot < 0 || tier.state[slot] != kReady || tier.slot_to_expert[slot] != expert || prefetch_lease_.active) {
@@ -782,7 +786,6 @@ class RamTier {
   // Test only: the service's prefetch lease, {active, row, slot}. A snapshot (run_as_owner).
   void prefetch_lease(int64_t* out) {
     snapshot(0, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      std::lock_guard<std::mutex> guard(self->mutex_);
       c.out[0] = self->prefetch_lease_.active ? 1 : 0;
       c.out[1] = self->prefetch_lease_.row;
       c.out[2] = self->prefetch_lease_.slot;
@@ -822,11 +825,15 @@ class RamTier {
     return idle;
   }
 
-  // stop_thread's final settle, on the caller once the service joined: drain, then a settle pass. Under mutex_ until
-  // Task 15, because a prefill fill's epilogue (still under mutex_ on the fill thread) may run if the service stopped
-  // mid-pause; the service thread's own passes take no lock.
+  // stop_thread's final settle, on the caller once the service joined (RamThread::stop released threaded_ after the
+  // join, so this caller owns the tier). A stop that arrives mid-pause can find a prefill fill still running: it is
+  // joined first and its epilogue runs here (fill_join), so the fill thread's last write happens-before the drain and
+  // the settle pass, and they run with no other thread touching the tier. caller_mutex_ orders this against the
+  // pausing caller, which may still be in an owned call (or its own fill_end) on another thread: no tier lock, and
+  // no deadlock with a snapshot waiter, which saw threaded_ clear and needs nothing from this thread to finish.
   void final_settle() {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    fill_join();
     drain_copy_completions();
     retire_leases(true);
   }
@@ -906,7 +913,6 @@ class RamTier {
   // because the take loop evicts a victim per call and keeps that eviction when the request then fails).
   Defer defers(const Request& request) {
     if (request.row < 0 || request.row >= layers_) return Defer::kNone;
-    std::lock_guard<std::mutex> guard(mutex_);
     if (lease_mode_ && !request.lane_experts.empty() &&
         outstanding_[static_cast<int64_t>((request.seq - 1u) % kDemandRecords)].active) {
       return Defer::kRequestSlot;
@@ -932,10 +938,12 @@ class RamTier {
 
   // A deferred demand is retried only when a lease was released since it was last refused, or the device gave up on it.
   bool deferral_may_retry() const {
-    if (lease_changes_.load() != deferred_stamp_) return true;
+    if (lease_changes_ != deferred_stamp_) return true;
     return lease_mode_ && terminal_seen_for(deferred_seq_, deferred_gen_);
   }
 
+  // A `_locked` suffix, here and below, now means "the owner's": the tier mutex it once named is gone (Task 15).
+  //
   // S1. Open the ring entry for a request, ONCE, with its full lane count and every lane ungranted.
   //
   // V1 (two-phase) grants a request's lanes in two calls -- the hit lanes inside serve()'s reservation hold, the
@@ -1074,7 +1082,9 @@ class RamTier {
       if (!take[lane]) continue;
       store_release64(results + lane * kLeaseRowResultBytes + kLeaseRrReady, tagged_word(tags[lane], request.gen));
     }
-    lanes_outstanding_.fetch_add(static_cast<int64_t>(taken));
+    // One writer (the owner): a relaxed load and store, no RMW. graph_leases_outstanding reads it lock-free.
+    lanes_outstanding_.store(
+        lanes_outstanding_.load(std::memory_order_relaxed) + static_cast<int64_t>(taken), std::memory_order_relaxed);
     this->template count<kLeasesGranted>(static_cast<int64_t>(taken));
     if (hit_phase) this->template count<kHitLeasesGranted>(static_cast<int64_t>(hits));  // S7: resident lanes
     if (job.count > 0) {
@@ -1175,7 +1185,7 @@ class RamTier {
   // anything else (a promotion, in Task 8) is not counted, because it protects its own slot (LEASE_PROTOCOL.md 17.1
   // R2).
   int64_t graph_leases_outstanding() const {
-    return lanes_outstanding_.load();
+    return lanes_outstanding_.load(std::memory_order_relaxed);
   }
 
   // One lease released, exactly once: the per-lane state machine is what makes a second signal harmless. Called by the
@@ -1188,9 +1198,9 @@ class RamTier {
     }
     tier.leases[held.slot] -= 1;
     held.state = K == kLeasesVoided ? 3 : 2;
-    lanes_outstanding_.fetch_sub(1);
+    lanes_outstanding_.store(lanes_outstanding_.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
     stats_.add(K);
-    lease_changes_.fetch_add(1);
+    ++lease_changes_;
   }
 
   // The extents the introspection methods below write, for the FFI's exact out-buffer checks: none of those
@@ -1212,7 +1222,6 @@ class RamTier {
   void slot_info(int64_t row, int64_t* out) {
     row_capacity(row);  // range-checked on the caller: the owner may be the service thread, which must not throw
     snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      std::lock_guard<std::mutex> guard(self->mutex_);
       const Tier& tier = self->tiers_[c.row];
       for (int64_t slot = 0; slot < tier.capacity; ++slot) {
         c.out[4 * slot] = tier.state[slot];
@@ -1230,7 +1239,6 @@ class RamTier {
     if (idx < 0 || idx >= kDemandRecords)
       throw std::runtime_error(error_prefix<Layout>() + "request slot out of range");
     snapshot(idx, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      std::lock_guard<std::mutex> guard(self->mutex_);
       const Outstanding& entry = self->outstanding_[c.row];
       c.out[0] = entry.active;
       c.out[1] = entry.grants_pending;
@@ -1272,7 +1280,6 @@ class RamTier {
     row_capacity(row);
     int64_t out[3] = {};
     snapshot(row, out, &wanted, [](RamTier* self, const Command& c) -> int64_t {
-      std::lock_guard<std::mutex> guard(self->mutex_);
       const VictimCensus census =
           self->census_locked(c.row, *static_cast<const std::vector<int32_t>*>(c.input));
       c.out[0] = census.free;
@@ -1294,7 +1301,6 @@ class RamTier {
   void slot_to_expert(int64_t row, int64_t* out) {
     row_capacity(row);
     snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      std::lock_guard<std::mutex> guard(self->mutex_);
       const Tier& tier = self->tiers_[c.row];
       for (int64_t slot = 0; slot < tier.capacity; ++slot)
         c.out[slot] = tier.slot_to_expert[slot];
@@ -1307,7 +1313,6 @@ class RamTier {
   int64_t lru_order(int64_t row, int64_t* out) {
     row_capacity(row);
     return snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      std::lock_guard<std::mutex> guard(self->mutex_);
       const Tier& tier = self->tiers_[c.row];
       std::vector<int64_t> slots;
       for (int64_t slot = 0; slot < tier.capacity; ++slot) {
@@ -1385,7 +1390,7 @@ class RamTier {
   // metric is stats_'s (always 0 in ProdBuild; Python reports only the core counters of a production host).
   void counters(int64_t* out) const {
     for (int i = 0; i < kCounterCount; ++i)
-      out[i] = core_.get(i) + copy_core_.get(i) + fill_core_.get(i) + stats_.get(i);
+      out[i] = core_.get(i) + copy_core_.get(i) + stats_.get(i);
   }
 
  private:
@@ -1467,7 +1472,6 @@ class RamTier {
   }
 
   void set_hot_owned(int64_t row, const uint64_t* hot) {
-    std::lock_guard<std::mutex> guard(mutex_);
     Tier& tier = tiers_[row];
     for (int64_t expert = 0; expert < experts_; ++expert) {
       tier.hot[expert] = (hot[expert / 64] >> (expert % 64)) & 1u;
@@ -1478,11 +1482,10 @@ class RamTier {
 
   // False on an underflow, which changes nothing.
   bool inject_lease_owned(int64_t row, int64_t slot, int64_t delta) {
-    std::lock_guard<std::mutex> guard(mutex_);
     Tier& tier = tiers_[row];
     if (delta < 0 && tier.leases[slot] < static_cast<uint32_t>(-delta)) return false;
     tier.leases[slot] = static_cast<uint32_t>(static_cast<int64_t>(tier.leases[slot]) + delta);
-    if (delta < 0) lease_changes_.fetch_add(1);
+    if (delta < 0) ++lease_changes_;
     return true;
   }
 
@@ -1574,7 +1577,7 @@ class RamTier {
     if constexpr (Build::kMetrics) count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);
     publish_prefetch_done(kPfTagCopied, job.gen, 0);
     tier.leases[prefetch_lease_.slot] -= 1;
-    lease_changes_.fetch_add(1);  // a demand deferred on this slot may retry
+    ++lease_changes_;  // a demand deferred on this slot may retry
     prefetch_lease_.active = false;
   }
 
@@ -1588,7 +1591,6 @@ class RamTier {
   // is judged by its target layer's own forward.
   void judge_prefetch(const Request& request) {
     if (prefetch_page_ == nullptr || request.row < 0 || request.row >= layers_) return;
-    std::lock_guard<std::mutex> guard(mutex_);
     PrefetchJudge& judge = judge_[request.row];
     if (!judge.pending) return;
     judge.pending = false;
@@ -1825,19 +1827,9 @@ class RamTier {
       result = 0;
     }
     _mm_sfence();  // the rows' bytes land before the caller is told (fill_landed_)
-    {
-      std::lock_guard<std::mutex> guard(mutex_);
-      Tier& tier = tiers_[fill_row_];
-      for (size_t i = 0; i < fill_slots_.size(); ++i) {
-        const int64_t slot = fill_slots_[i];
-        tier.filling[slot] = 0;
-        if (result != 1 && !(i < packed.size() && packed[i] != 0)) release_locked(fill_row_, slot);
-      }
-      if (result != 1) {
-        fill_count<kReadErrors>();
-        fill_count<kVersion>();
-      }
-    }
+    // No tier state here (ownership rule 3): the owner runs the epilogue after the join (finish_fill_owned). Until
+    // then the claimed slots stay filling, so no admission takes one and release() refuses it.
+    fill_result_ = result;
     if (result == 1) {
       fill_landed_.store(static_cast<int64_t>(fill_slots_.size()), std::memory_order_release);
     } else {
@@ -1845,6 +1837,23 @@ class RamTier {
     }
     end_busy();
     fill_state_.store(result == 1 ? kFillOk : kFillFailed, std::memory_order_release);
+  }
+
+  // The fill's epilogue, on the owner after the join (fill_join): a fill thread never writes the tier (ownership rule
+  // 3). Clears every claimed slot's filling flag; a failed fill releases (unmaps) its rows that did not land, and
+  // counts the read error and the map's change on the owner's counters.
+  void finish_fill_owned() {
+    fill_unfinished_ = false;
+    Tier& tier = tiers_[fill_row_];
+    for (size_t i = 0; i < fill_slots_.size(); ++i) {
+      const int64_t slot = fill_slots_[i];
+      tier.filling[slot] = 0;
+      if (fill_result_ != 1 && !(i < fill_packed_.size() && fill_packed_[i] != 0)) release_locked(fill_row_, slot);
+    }
+    if (fill_result_ != 1) {
+      count<kReadErrors>();
+      count<kVersion>();
+    }
   }
 
   void publish_map(int64_t row, int64_t expert, int32_t slot) {
@@ -1968,7 +1977,6 @@ class RamTier {
   // recency of its assigned rows: no eviction, no read. False for an invalid record.
   bool touch_request(const Request& request) {
     if (request.row < 0 || request.row >= layers_) return false;
-    std::lock_guard<std::mutex> guard(mutex_);
     Tier& tier = tiers_[request.row];
     for (const auto* ids : {&request.protect, &request.need}) {
       for (int32_t expert : *ids) {
@@ -2020,7 +2028,6 @@ class RamTier {
     }
     bool publishing = false;  // piece streaming: this request's miss lanes have readiness words to publish into
     if (ok) {
-      std::lock_guard<std::mutex> guard(mutex_);
       Tier& tier = tiers_[request.row];
       for (int32_t expert : wanted) {
         if (expert < 0 || expert >= experts_) {
@@ -2063,15 +2070,19 @@ class RamTier {
         tier.expert_slot[missing[i]] = static_cast<int32_t>(slot);
         slots.push_back(slot);
       }
-      // S2. Grant and publish the HIT lanes here: in the same mutex_ hold as the reservation, after the take loop
-      // has completed with ok still true, and before the hold is dropped for read(). A lane is a hit iff its
+      // S2. Grant and publish the HIT lanes here: in the same reservation hold as the take loop, after it has
+      // completed with ok still true, and before the hold ends at read(). The hold is no lock since Task 15: it is
+      // the stretch of the owner's code from the census to read(), which nothing else runs inside -- no other thread
+      // writes the tier (ownership rules 1-3), and the owner's own interleaved passes (drain_copy_completions,
+      // retire_leases, answer_snapshots, applied commands) run only between requests or from read()'s progress
+      // hook, after this block. A lane is a hit iff its
       // expert is not in `missing`. This is the whole of V1: these row results become visible to the device while
       // the missing rows are still being read, so their copies overlap the read instead of following it.
       //
       // Neither ordering below it is available. Before the take loop, the !ok bail here returns with no lease
       // unwind, and the deferral branch above sets ok = false for a request that is retried under the same seq --
-      // either way leases outlive a request that never ran. After the hold is dropped, the hit slot can be
-      // evicted in exactly the window this task exists to close, and the grant buys nothing.
+      // either way leases outlive a request that never ran. After the hold ends, the hit slot can be evicted (by a
+      // later admission on the owner) in exactly the window this task exists to close, and the grant buys nothing.
       //
       // Piece streaming grants the MISS lanes here too (plan 3.2): under tag LOADING, into the slots just reserved,
       // in the same all-or-nothing call and behind the same one fence, after init_piece_words_locked has stored and
@@ -2156,10 +2167,8 @@ class RamTier {
             cur,
             &packed,
             advisory ? 1 : SIZE_MAX,
-            // read() runs here with mutex_ NOT held -- the only lock_guard in serve() near it is the scoped S2
-            // reservation hold above, which closes before this call. The hook takes no lock itself: the drain and
-            // retire_leases are the owner's lock-free passes (Task 14); a snapshot's thunk still takes mutex_ until
-            // Task 15, which is deadlock-free only because nothing here holds it.
+            // The hook takes no lock (the tier has none since Task 15): the drain and retire_leases are the owner's
+            // passes, and a snapshot's thunk is a read-only pass on the owner.
             // The service stays the tier's owner for the whole read, so it releases the COPYING leases the copy
             // thread handed back (D7) and answers queued snapshots here too (Task 13): neither waits for a read's
             // length, and a test can observe a slot mid-read.
@@ -2182,7 +2191,6 @@ class RamTier {
     // a cancelled advisory, the rows that completed before it stopped. A failed request publishes none.
     int64_t published = 0;
     {
-      std::lock_guard<std::mutex> guard(mutex_);
       if (!slots.empty()) {
         Tier& tier = tiers_[request.row];
         for (size_t i = 0; i < slots.size(); ++i) {
@@ -2205,7 +2213,7 @@ class RamTier {
         }
         // One writer (the owner), read lock-free by layer_rows: a relaxed store.
         int64_t& rows_total = advisory ? tier.rows_advisory : tier.rows_demand;
-        __atomic_store_n(&rows_total, rows_total + published, __ATOMIC_RELAXED);
+        std::atomic_ref<int64_t>(rows_total).store(rows_total + published, std::memory_order_relaxed);
         count<kVersion>();
       }
     }
@@ -2225,7 +2233,6 @@ class RamTier {
       //
       // Piece streaming has no S3: the miss lanes were granted under tag LOADING at reservation, and their readiness
       // is the PieceMask words plus the request's status, not a second grant.
-      std::lock_guard<std::mutex> guard(mutex_);
       if (two_phase_) {
         if (ok && !piece_stream) {
           if (!grant_lane_group_locked(
@@ -2320,7 +2327,7 @@ class RamTier {
   std::atomic<bool> copy_armed_{false};
   // Native prefetch: the page (null when off), the last request generation read (service thread), the one lease a
   // prefetch holds (at most one is outstanding: the device waits for its done word before posting the next), and per
-  // row the copied expert its next request judges. The last two are guarded by mutex_.
+  // row the copied expert its next request judges. The last two are the owner's.
   struct PrefetchLease {
     bool active = false;
     uint64_t gen = 0;
@@ -2343,9 +2350,11 @@ class RamTier {
   bool lease_mode_ = false;  // set before the service thread starts; off is today's protocol
   bool two_phase_ = false;   // Task 6 V1: hit lanes granted before read(); off is the Task 5 batched grant
   Outstanding outstanding_[kDemandRecords];    // by request slot; the owner's
-  std::atomic<int64_t> lanes_outstanding_{0};  // lanes GRANTED and not yet retired: an early-out for retire_leases
+  // Lanes GRANTED and not yet retired: an early-out for retire_leases. Written by the owner only (a relaxed load and
+  // store), read lock-free by graph_leases_outstanding.
+  std::atomic<int64_t> lanes_outstanding_{0};
   std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new; retirement continues
-  std::atomic<uint64_t> lease_changes_{0};     // bumped whenever a lease is released: what wakes a deferred demand
+  uint64_t lease_changes_ = 0;  // the owner's: bumped whenever a lease is released, what wakes a deferred demand
   // The demand held back, if any (service thread only): its sequence, the changes seen when it was last refused,
   // its generation (a terminal for it also wakes it) and when it was first observed (for the stage record).
   uint32_t deferred_seq_ = 0;
@@ -2359,7 +2368,8 @@ class RamTier {
   std::vector<uint8_t> packed_;  // serve()'s per-row packed flags, reserved to kWanted, reused every request
   std::vector<uint8_t> hot_scratch_;  // (experts_+7)/8 bytes, sized at construction: the hot bitmap of the record read
   std::vector<uint8_t> fill_packed_;  // run_fill's per-row packed flags, reserved to the largest row capacity
-  // Prefill fills: written by fill_begin before the thread starts and read by it; the caller reads only the atomics.
+  // Prefill fills: written by fill_begin before the thread starts and read by it; the caller reads only the atomics
+  // until it joins (fill_join), and then the rest.
   static constexpr int kFillOk = 0;
   static constexpr int kFillRunning = 1;
   static constexpr int kFillFailed = 2;
@@ -2369,8 +2379,9 @@ class RamTier {
   std::vector<int64_t> fill_slots_;
   std::atomic<int64_t> fill_landed_{0};
   std::atomic<int> fill_state_{kFillOk};
-  std::vector<Tier> tiers_;
-  std::mutex mutex_;
+  int fill_result_ = 0;           // run_fill's read result: the fill thread's, read by the owner after the join
+  bool fill_unfinished_ = false;  // an epilogue is owed (fill_begin started a thread); caller_mutex_ / the owner's
+  std::vector<Tier> tiers_;  // the owner's, with every other non-atomic member: the tier has no mutex (Task 15)
   uint64_t tick_ = 0;
   std::atomic<int64_t> prefill_share_{0};  // any thread stores it, relaxed; see set_prefill_share
   uint32_t next_demand_ = 1;
@@ -2409,9 +2420,8 @@ class RamTier {
   struct NoTierFaults {};
   [[no_unique_address]] std::conditional_t<Build::kFaults, TierFaults, NoTierFaults> faults_;
   // Counters, see count(). One line-private block per writer thread; the metrics only in InstrBuild.
-  LineCounters<kCounterCount> core_;       // service thread (or the caller owning the tier while it is paused)
+  LineCounters<kCounterCount> core_;       // the tier's owner: the service thread, or the caller while it owns it
   LineCounters<kCounterCount> copy_core_;  // copy thread only
-  LineCounters<kCounterCount> fill_core_;  // prefill fill thread only (plan F10; Task 15 moves its epilogue off it)
   [[no_unique_address]] Stats<Build::kMetrics, kCounterCount> stats_;  // InstrBuild: any thread, relaxed RMW
   // Stage trace (spec M9), InstrBuild only. cur points at stage while a traced request is in service, else null.
   struct TraceState {

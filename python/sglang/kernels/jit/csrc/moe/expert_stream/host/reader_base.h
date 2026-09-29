@@ -251,7 +251,7 @@ struct StageRecord {
   int64_t backlog = 0;    // records already posted behind this one when the service saw it
   int64_t prev_done = 0;  // `done` of the request served just before this one (0: the first)
   int64_t observed = 0;   // the service saw the record posted (first poll that found it)
-  int64_t reserved = 0;   // slots reserved under the tier mutex
+  int64_t reserved = 0;   // slots reserved in the owner's reservation hold
   int64_t submit = 0;     // just before the first io_uring submit
   int64_t first_cqe = 0;  // the call that returned the first completion, returned
   int64_t last_cqe = 0;   // the call that returned the last completion, returned

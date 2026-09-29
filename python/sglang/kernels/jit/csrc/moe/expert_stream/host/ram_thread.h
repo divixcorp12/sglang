@@ -20,7 +20,10 @@ namespace expert_stream {
 //     (acquire), then sets the tier's parked_ (release), which later Python callers acquire in caller_owns().
 //   - caller -> service: resume() clears parked_, then stores pause_epoch_ (release); the parked loop loads it
 //     (acquire) before it touches the tier again.
-//   - stop(): the join orders every service write before stop()'s release of threaded_ (plan F14).
+//   - stop(): the join orders every service write before stop()'s release of threaded_ (plan F14). A prefill fill a
+//     pausing caller left running is joined by stop_thread's final settle (RamTier::final_settle), under
+//     caller_mutex(), before it drains and settles: the fill thread writes no tier state, so that join is the only
+//     edge it needs.
 // Each pause has its own epoch (odd while requested), so a pause that follows a resume at once can never take the
 // previous pause's acknowledgement for its own while the service is already running again. pause() and resume() take
 // the tier's caller_mutex(); the service thread never does.
@@ -122,7 +125,9 @@ class RamThread {
   // pause_epoch_ (the parked loop acquires it). parked_ is cleared first, so a caller that then takes caller_mutex()
   // sees the service as the owner and queues instead of touching the tier. A timed-out pause never set parked_.
   void resume_locked() {
-    tier_->fill_join();  // a prefill fill uses the reader the service thread is about to use
+    // A prefill fill uses the reader the service thread is about to use: join it, and run its epilogue here, on the
+    // owner (the fill thread writes no tier state), before the release below hands the tier back.
+    tier_->fill_join();
     tier_->skip_advice_posted_so_far();
     tier_->set_parked(false);
     const uint64_t epoch = pause_epoch_.load(std::memory_order_relaxed);

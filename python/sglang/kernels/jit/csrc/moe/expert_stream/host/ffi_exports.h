@@ -1215,7 +1215,9 @@ struct HostExports {
     // on it is compared here, before ExpertStreamHost.stop writes its counters line. Here and not in RamThread::stop,
     // which ~RamThread also runs and which could then read a lease page the Python side already freed; at this point
     // the thread has joined and the page is still alive, because close() runs after this call.
-    if (tier) tier->final_settle();  // the COPYING leases handed back after the service's last poll, then the settle
+    // A fill still running (a stop mid-pause) is joined and its epilogue run first; then the COPYING leases handed back
+    // after the service's last poll, then the settle.
+    if (tier) tier->final_settle();
   }
 
   static int64_t pause(int64_t handle, int64_t timeout_ns) {
