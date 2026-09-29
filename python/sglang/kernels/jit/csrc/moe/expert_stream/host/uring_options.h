@@ -13,6 +13,7 @@ namespace sglang::expert_stream {
 enum class UringMode { Default, IoPoll, SqPoll, SqPollIoPoll };
 enum class UringReadMode { Normal, Fixed, ReadvFixed };
 enum class UringWaitMode { Block, Spin };
+enum class UringReadCuts { Auto, Off, On };
 
 struct UringOptions {
   unsigned queue_depth = 0;  // 0 keeps RowReader's 16 * parts credit limit.
@@ -20,15 +21,37 @@ struct UringOptions {
   bool fixed_files = false;
   UringReadMode read_mode = UringReadMode::Normal;
   UringWaitMode wait_mode = UringWaitMode::Block;
-  unsigned sq_thread_idle_ms = 1000;
+  unsigned sq_thread_idle_ms = 10000;
   int sq_thread_cpu = -1;
   bool diagnostics = false;
+  // Cut every read into legs the block device takes whole (read_cuts.h; plan 2026-09-28-iopoll-read-cuts). auto: on
+  // exactly when IOPOLL is, where an uncut read is punted to io-wq (analysis/dsv41-drive/iopoll/diagnosis.md).
+  UringReadCuts read_cuts = UringReadCuts::Auto;
+  bool read_cuts_on() const {
+    return read_cuts == UringReadCuts::On || (read_cuts == UringReadCuts::Auto && iopoll());
+  }
+  const char* read_cuts_name() const {
+    return read_cuts == UringReadCuts::Auto ? "auto" : read_cuts == UringReadCuts::On ? "on" : "off";
+  }
 
   bool sqpoll() const {
     return mode == UringMode::SqPoll || mode == UringMode::SqPollIoPoll;
   }
   bool iopoll() const {
     return mode == UringMode::IoPoll || mode == UringMode::SqPollIoPoll;
+  }
+  // IOPOLL without SQPOLL: io_uring_enter(GETEVENTS, min_complete>0) polls the device inside the kernel holding the
+  // ring's uring_lock, and a read punted to io-wq cannot queue itself on the poll list until the waiter lets go: the
+  // punted reads then issue one after another behind completions (+1.5 ms per row; diagnosis.md table 3). Such a
+  // ring therefore always waits with min_complete=0 passes.
+  bool polls_in_wait() const {
+    return iopoll() && !sqpoll();
+  }
+  bool blocking_wait() const {
+    return wait_mode == UringWaitMode::Block && !polls_in_wait();
+  }
+  const char* effective_wait_name() const {
+    return blocking_wait() ? "block" : polls_in_wait() ? "reap" : "spin";
   }
   const char* mode_name() const {
     switch (mode) {
@@ -86,10 +109,19 @@ struct UringOptions {
       o.wait_mode = UringWaitMode::Spin;
     else
       invalid("WAIT_MODE", "expected block or spin");
-    o.sq_thread_idle_ms = number<unsigned>("SQ_THREAD_IDLE_MS", 1000, 0, std::numeric_limits<unsigned>::max());
+    o.sq_thread_idle_ms = number<unsigned>("SQ_THREAD_IDLE_MS", 10000, 0, std::numeric_limits<unsigned>::max());
     o.sq_thread_cpu = number<int>("SQ_THREAD_CPU", -1, -1, std::numeric_limits<int>::max());
     if (o.sq_thread_cpu != -1 && !o.sqpoll()) invalid("SQ_THREAD_CPU", "requires a sqpoll mode");
     o.diagnostics = boolean("DIAGNOSTICS", false);
+    const auto cuts = value("READ_CUTS", "auto");
+    if (cuts == "auto")
+      o.read_cuts = UringReadCuts::Auto;
+    else if (cuts == "0")
+      o.read_cuts = UringReadCuts::Off;
+    else if (cuts == "1")
+      o.read_cuts = UringReadCuts::On;
+    else
+      invalid("READ_CUTS", "expected auto, 0, or 1");
     return o;
   }
 

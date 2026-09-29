@@ -25,7 +25,10 @@ def test_uring_environment_validation(tmp_path):
 #include "moe/expert_stream/host/uring_options.h"
 #include <iostream>
 int main() {
- try { auto o = sglang::expert_stream::UringOptions::from_env(); std::cout << o.queue_depth; }
+ try {
+   auto o = sglang::expert_stream::UringOptions::from_env();
+   std::cout << o.queue_depth << " " << o.sq_thread_idle_ms << " " << o.read_cuts_name() << " " << o.read_cuts_on();
+ }
  catch (const std::exception& e) { std::cerr << e.what(); return 2; }
 }
 """)
@@ -35,7 +38,20 @@ int main() {
         check=True,
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith(PREFIX)}
-    assert subprocess.check_output([binary], env=env, text=True) == "0"
+    # Defaults: depth 0 (16 * parts), SQPOLL idle 10 s (user, 2026-09-28), cuts auto and off outside IOPOLL.
+    assert subprocess.check_output([binary], env=env, text=True) == "0 10000 auto 0"
+
+    def probe(**values):
+        return subprocess.check_output(
+            [binary], env=env | {PREFIX + k: v for k, v in values.items()}, text=True
+        ).split()
+
+    assert probe(MODE="iopoll")[2:] == ["auto", "1"]  # auto follows IOPOLL
+    assert probe(MODE="sqpoll_iopoll")[2:] == ["auto", "1"]
+    assert probe(MODE="sqpoll")[2:] == ["auto", "0"]
+    assert probe(READ_CUTS="1")[2:] == ["on", "1"]
+    assert probe(MODE="iopoll", READ_CUTS="0")[2:] == ["off", "0"]
+    assert probe(SQ_THREAD_IDLE_MS="1000")[1] == "1000"  # an explicit value still wins
     for key, value in [
         ("QUEUE_DEPTH", "64"),
         ("MODE", "sqpoll_iopoll"),
@@ -45,6 +61,7 @@ int main() {
         ("DIAGNOSTICS", "1"),
         ("SQ_THREAD_CPU", "2"),
         ("SQ_THREAD_IDLE_MS", "0"),
+        ("READ_CUTS", "auto"),
     ]:
         result = subprocess.run(
             [binary], env=env | {PREFIX + key: value}, capture_output=True, text=True
@@ -67,6 +84,9 @@ int main() {
         ("SQ_THREAD_CPU", "-2"),
         ("SQ_THREAD_IDLE_MS", "-1"),
         ("DIAGNOSTICS", "yes"),
+        ("READ_CUTS", "on"),
+        ("READ_CUTS", "2"),
+        ("READ_CUTS", ""),
     ]:
         result = subprocess.run(
             [binary], env=env | {PREFIX + key: value}, capture_output=True, text=True
@@ -114,8 +134,11 @@ inline std::deque<io_uring_cqe> delayed_cq;
 inline void publish_delayed(io_uring* r) {
  while(!delayed_cq.empty()) { r->cq.push_back(delayed_cq.front()); delayed_cq.pop_front(); }
 }
+inline int wait_cqe_calls=0;
+inline unsigned last_sq_thread_idle=0;
 inline int io_uring_queue_init_params(unsigned n, io_uring* r, io_uring_params* p) {
  ++setups; if (setup_error) return setup_error; r->flags=p->flags; r->sq.clear(); r->cq.clear();
+ last_sq_thread_idle=p->sq_thread_idle;
  p->sq_entries=n; p->cq_entries=2*n; p->features=17; last_ring=r; return 0;
 }
 inline void io_uring_queue_exit(io_uring* r) { ++exits; r->sq.clear(); r->cq.clear(); }
@@ -146,7 +169,7 @@ inline unsigned io_uring_cq_ready(io_uring* r) {
 inline unsigned io_uring_sq_ready(io_uring* r) { return r->sq.size(); }
 inline int io_uring_get_events(io_uring* r) { ++get_events_calls;publish_delayed(r);return 0; }
 inline int io_uring_peek_cqe(io_uring* r,io_uring_cqe** c) { if(r->cq.empty())return -EAGAIN;*c=&r->cq.front();return 0; }
-inline int io_uring_wait_cqe(io_uring* r,io_uring_cqe** c) { return io_uring_peek_cqe(r,c); }
+inline int io_uring_wait_cqe(io_uring* r,io_uring_cqe** c) { ++wait_cqe_calls; return io_uring_peek_cqe(r,c); }
 inline void io_uring_cqe_seen(io_uring* r,io_uring_cqe*) { r->cq.pop_front(); }
 inline void io_uring_cq_advance(io_uring* r,unsigned n) { while(n--)r->cq.pop_front(); }
 #define io_uring_for_each_cqe(r,head,cqe) for(head=0;head<(r)->cq.size() && ((cqe)=&(r)->cq[head],true);++head)
@@ -261,6 +284,27 @@ int main() {
  std::vector<ReadCompletion> out;assert(r.reap(out)==1 && out[0].data==27);
  assert(delayed_cq.empty());delay_completions=false;
  }
+ // The wait trap (plan 2026-09-28-iopoll-read-cuts Task 2): IOPOLL without SQPOLL never waits in
+ // io_uring_submit_and_wait / io_uring_wait_cqe, whatever WAIT_MODE says -- it reaps with GETEVENTS min_complete=0.
+ env("WAIT_MODE","block");
+ for(const char* mode : {"iopoll", "sqpoll_iopoll", "default"}) {
+ env("MODE",mode);UringReader r;assert(r.init(8));r.configure_resources(files,buffers,true);
+ const bool trap=std::string(mode)=="iopoll";
+ delay_completions=trap;cq_observations=0;
+ const int waits=wait_calls, events=get_events_calls, cqe_waits=wait_cqe_calls;
+ assert(r.prep_read(99,arena,16,0,40));assert(r.submit(1)>=0);
+ std::vector<ReadCompletion> out;assert(r.reap(out)==1 && out[0].data==40);
+ if(trap)assert(wait_calls==waits && get_events_calls>events);
+ else assert(wait_calls==waits+1);
+ // drain -> wait_one: a read in flight with no completion yet.
+ delay_completions=trap;const int events2=get_events_calls;
+ assert(r.prep_read(99,arena,16,0,41));assert(r.submit(0)>=0);r.drain(1);
+ if(trap)assert(wait_cqe_calls==cqe_waits && get_events_calls>events2);
+ else if(std::string(mode)=="default")assert(wait_cqe_calls==cqe_waits+1);  // SQPOLL drains by peeking instead
+ assert(delayed_cq.empty());delay_completions=false;
+ }
+ env("MODE","sqpoll");env("WAIT_MODE","spin");
+ { UringReader r;assert(r.init(8));assert(last_sq_thread_idle==10000); }   // the 10 s default reaches the ring
  env("MODE","iopoll");
  { UringReader r;assert(r.init(8));rejected([&]{r.configure_resources(files,buffers,false);}); }
  env("MODE","default");

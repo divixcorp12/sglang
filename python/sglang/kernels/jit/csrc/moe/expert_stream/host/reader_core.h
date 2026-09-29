@@ -2,9 +2,12 @@
 // images): io_uring superset reads of whole expert rows through per-extent descriptors, ring credit and banks.
 #pragma once
 
+#include <cstdio>
+
 #include "../row_layout.h"
 #include "file_reader.h"
 #include "piece_geometry.h"
+#include "read_cuts.h"
 #include "uring_options.h"
 
 namespace sglang {
@@ -159,8 +162,10 @@ class ReaderCore {
   }
 
   // A fixed read (READ_MODE fixed/readv_fixed) whose iovecs lie in k registered buffers is prepared as k legs, one SQE
-  // each, submitted together (plan 2026-09-28-reader-crtp-uring-registration Task 7). A read has at most kMaxLegs.
-  static constexpr unsigned kMaxLegs = 16;
+  // each, submitted together (plan 2026-09-28-reader-crtp-uring-registration Task 7); with read cuts a read is also
+  // cut into device-sized legs (read_cuts.h). Legs per read are sized at open() (leg_stride_); kMaxLegs is the tag's
+  // 8-bit leg field.
+  static constexpr unsigned kMaxLegs = 255;
 
   // Test only (fault word fixed_chunk_cap): the registration chunk cap, before open() (0: the 1 GiB default).
   void set_fixed_chunk_cap(int64_t cap) {
@@ -178,6 +183,31 @@ class ReaderCore {
 
   int64_t fanout_sqes() const {
     return fanout_sqes_;
+  }
+
+  // Test only (fault word leg_cut_cap): cut every read at `cap` bytes (whole pages) on a 4 KiB boundary, whatever
+  // READ_CUTS says, before open(). 0 restores READ_CUTS and the device limits.
+  void set_leg_cut_cap(int64_t cap) {
+    leg_cut_cap_ = std::max<int64_t>(0, cap);
+  }
+  // Reads planned as more than one cut run, and the runs a boundary gap opened (first plans).
+  int64_t cut_reads() const {
+    return cut_reads_;
+  }
+  int64_t gap_cuts() const {
+    return gap_cuts_;
+  }
+
+  // Legs a read may have (storage stride) and the smallest cut in force (0: cuts off).
+  int64_t leg_stride() const {
+    return leg_stride_;
+  }
+  int64_t min_cut_bytes() const {
+    if (!cuts_) return 0;
+    int64_t least = INT64_MAX;
+    for (const auto& l : limits_)
+      least = std::min(least, l.cut_bytes);
+    return least;
   }
 
   bool open() {
@@ -214,21 +244,46 @@ class ReaderCore {
       drive_dev_[slot] = drive < kMaxDrives ? devs_[drive] : -1;
     }
     if (!derived().open_memory()) return false;
+    size_legs();
+    if (cuts_) {  // one line per drive: the cut in force and where it came from (a fallback names its reason)
+      std::vector<bool> said(devs_.size(), false);
+      for (size_t f = 0; f < fds_.size(); ++f) {
+        const size_t drive = file_drive_[f];
+        if (drive >= said.size() || said[drive]) continue;
+        said[drive] = true;
+        const auto dev = static_cast<dev_t>(devs_[drive]);
+        std::fprintf(
+            stderr,
+            "expert stream io_uring: read cuts: drive=%zu dev=%u:%u cut_bytes=%lld virt_mask=%llu source=%s\n",
+            drive,
+            major(dev),
+            minor(dev),
+            static_cast<long long>(limits_[f].cut_bytes),
+            static_cast<unsigned long long>(limits_[f].virt_mask),
+            limits_[f].source.c_str());
+      }
+    }
     if (!size_extents()) return false;
     if (!io_.init(queue_depth())) return false;
-    if (fixed_reads()) {
-      // A fixed read has a leg per registered buffer its iovecs meet, at most one per iovec, all reserved at once.
-      const size_t widest = derived().max_iovecs();
-      if (widest > kMaxLegs) {
-        throw std::runtime_error(
-            error_prefix<Layout>() + "fixed reads fan out to at most " + std::to_string(kMaxLegs) + " legs, not " +
-            std::to_string(widest));
-      }
-      if (queue_depth() < widest) {
-        throw std::runtime_error(
-            error_prefix<Layout>() + "fixed reads need a queue depth of at least " + std::to_string(widest) +
-            " (the widest fanned-out read); SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=" + std::to_string(queue_depth()));
-      }
+    // A read's legs are reserved all at once, so the ring must hold the widest read's legs: a fixed read has a leg per
+    // registered buffer its iovecs meet, a cut read its device-sized legs as well (leg_stride_ bounds both).
+    if (fixed_reads() && leg_stride_ < std::max<size_t>(1, derived().max_iovecs()))
+      throw std::logic_error(error_prefix<Layout>() + "a fixed read mode opened with one-leg storage");
+    if (cuts_ && configured_queue_depth_ != 0) {
+      const unsigned scaled = static_cast<unsigned>(std::min<size_t>(
+          32768, static_cast<size_t>(kQueueDepth) * static_cast<size_t>(t_.parts) * leg_stride_));
+      if (configured_queue_depth_ < scaled)
+        std::fprintf(
+            stderr,
+            "expert stream io_uring: read cuts: SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=%u is below the cut default %u "
+            "(16 x %zu parts x %u legs): fewer reads fit in flight than uncut\n",
+            configured_queue_depth_, scaled, static_cast<size_t>(t_.parts), leg_stride_);
+    }
+    if ((fixed_reads() || cuts_) && queue_depth() < leg_stride_) {
+      throw std::runtime_error(
+          error_prefix<Layout>() + "reads fanned out or cut into legs need a queue depth of at least " +
+          std::to_string(leg_stride_) + " (the widest read's legs); SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=" +
+          std::to_string(queue_depth()));
     }
     if constexpr (requires(Reader& reader, const std::vector<int>& files, const std::vector<RegisteredRegion>& buffers) {
                     reader.configure_resources(files, buffers, true);
@@ -398,6 +453,8 @@ class ReaderCore {
  protected:
   ReaderCore(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {
     configured_queue_depth_ = UringOptions::from_env().queue_depth;
+    cuts_requested_ = UringOptions::from_env().read_cuts_on();
+    fixed_requested_ = UringOptions::from_env().read_mode != UringReadMode::Normal;
   }
 
   ~ReaderCore() {
@@ -452,7 +509,7 @@ class ReaderCore {
     int32_t slot = -1;        // bounce slot: bank * kBounceRows + row within the bank
     int32_t trace_slot = -1;  // index into the record's extent arrays, -1 when not stamped
     int32_t sub = 0;          // piece streaming: the sub-read's ordinal in its row's file order
-    uint8_t legs = 0;           // planned legs (legs_[index * kMaxLegs ...]); 0: not yet prepared
+    uint8_t legs = 0;           // planned legs (legs_[index * leg_stride_ ...]); 0: not yet prepared
     uint8_t legs_inflight = 0;  // legs prepared and not yet reaped
     bool queued = false;        // in queue_ (or about to be, through again_): a descriptor is queued at most once
   };
@@ -533,7 +590,12 @@ class ReaderCore {
   // rather than overrunning it. Scaled by parts so splitting a row across roots does not
   // halve the number of rows in flight.
   unsigned queue_depth() const {
-    return configured_queue_depth_ != 0 ? configured_queue_depth_ : kQueueDepth * static_cast<unsigned>(t_.parts);
+    if (configured_queue_depth_ != 0) return configured_queue_depth_;
+    // Credit counts SQEs: with read cuts a read issues up to leg_stride_ of them, so the default grows with it and the
+    // rows in flight stay what they were uncut.
+    const size_t per_read = cuts_ ? leg_stride_ : 1;
+    return static_cast<unsigned>(
+        std::min<size_t>(32768, static_cast<size_t>(kQueueDepth) * static_cast<size_t>(t_.parts) * per_read));
   }
 
   uint32_t next_generation() {
@@ -542,6 +604,45 @@ class ReaderCore {
       ++generation_wraps_;
     }
     return generation_;
+  }
+
+  // Per-file limits (read cuts) and the leg/iovec strides every descriptor's storage uses. With cuts off a read has
+  // one leg, or (fixed modes) one per registered buffer its iovecs meet: at most max_iovecs(), today's bound.
+  void size_legs() {
+    cuts_ = cuts_requested_ || leg_cut_cap_ > 0;
+    limits_.clear();
+    for (size_t f = 0; cuts_ && f < fds_.size(); ++f) {  // sysfs is read only when reads are cut
+      if (leg_cut_cap_ > 0) {
+        limits_.push_back(
+            DeviceLimits{std::max(kCutPage, leg_cut_cap_ / kCutPage * kCutPage), kFallbackVirtMask, "test cap"});
+      } else {
+        limits_.push_back(device_limits(fds_[f]));
+      }
+    }
+    // io_ is not initialized yet, so the fixed read mode comes from the options (fixed_reads() reads them after init).
+    bool fixed = false;
+    if constexpr (requires(const Reader& reader, const iovec* v, unsigned c, FixedLeg* out) {
+                    reader.fixed_legs(v, c, out);
+                  }) {
+      fixed = fixed_requested_;
+    }
+    const size_t iovecs = std::max<size_t>(1, derived().max_iovecs());
+    const size_t want = cuts_ ? leg_bound(longest_read(), iovecs, min_cut_bytes()) : fixed ? iovecs : 1;
+    if (want > kMaxLegs) {
+      throw std::runtime_error(
+          error_prefix<Layout>() + "reads cut at " + std::to_string(min_cut_bytes()) + " B need up to " +
+          std::to_string(want) + " legs, more than " + std::to_string(kMaxLegs) + "; the cut is too small for reads of " +
+          std::to_string(longest_read()) + " B");
+    }
+    leg_stride_ = static_cast<unsigned>(want);
+    iov_stride_ = iovecs + (cuts_ ? leg_stride_ : 0);
+  }
+
+  int64_t longest_read() const {
+    int64_t longest = 0;
+    for (const auto& e : t_.extents)
+      longest = std::max(longest, e.length);
+    return longest;
   }
 
   // Every buffer the pipeline uses is sized here, once: a descriptor per (bounce slot, part, sub-read), a queue
@@ -556,7 +657,7 @@ class ReaderCore {
     // that check: bytes would be credited to the wrong extent.
     if (extents > 0xFFFFFFull) return false;
     descs_.assign(extents, ExtentDesc{});
-    legs_.assign(extents * kMaxLegs, Leg{});
+    legs_.assign(extents * leg_stride_, Leg{});
     queue_.assign(extents, 0);
     completions_.reserve(extents + 1);
     held_.reserve(extents);
@@ -565,7 +666,10 @@ class ReaderCore {
     // Each descriptor's iovecs (max_iovecs), rebuilt from its `done` whenever it is prepared (destination). Direct
     // mode: a read lies inside the image and the segments tile it, so it touches at most one run per segment
     // (image_iovecs). The bounce path: one, the read's span of its bounce slot.
-    iovecs_.assign(extents * derived().max_iovecs(), iovec{});
+    iovecs_.assign(extents * iov_stride_, iovec{});
+    iov_scratch_.assign(iov_stride_, iovec{});
+    cut_scratch_.assign(leg_stride_, CutLeg{});
+    fixed_scratch_.assign(iov_stride_, FixedLeg{});
     piece_runs_.assign(
         piece_stream_ ? static_cast<size_t>(kBounceSlots * kPieces) * t_.segments.size() : 0, PieceRun{});
     return true;
@@ -637,38 +741,56 @@ class ReaderCore {
     }
   }
 
-  // A descriptor's legs, on its first preparation: its iovecs from `done` 0 (destination), then one leg covering them
-  // all, or (fixed modes) one per run of iovecs in one registered buffer. Each leg's `start` is the prefix sum of the
-  // earlier legs' bytes; a leg wholly past the read's end-of-file expectation is Done at once.
+  // A descriptor's legs, on its first preparation: its iovecs from `done` 0 (destination); with read cuts, rewritten
+  // into runs within its file's device limits (cut_legs); in a fixed read mode each run cut again at registered-
+  // buffer changes (fixed_legs). Without either it is one leg, today's read. Each leg's `start` is the prefix sum of
+  // the earlier legs' bytes; a leg wholly past the read's end-of-file expectation is Done at once.
   void plan_legs(uint32_t index) {
     ExtentDesc& d = descs_[index];
-    iovec* iov = &iovecs_[static_cast<size_t>(index) * derived().max_iovecs()];
-    const unsigned count = derived().destination(d, iov);
-    Leg* legs = &legs_[static_cast<size_t>(index) * kMaxLegs];
-    unsigned n = 1;
-    if constexpr (requires(const Reader& reader, const iovec* v, unsigned k, FixedLeg* out) {
-                    reader.fixed_legs(v, k, out);
-                  }) {
-      if (fixed_reads()) {
-        FixedLeg fixed[kMaxLegs];  // count <= max_iovecs() <= kMaxLegs: open() refuses a wider table
-        n = io_.fixed_legs(iov, count, fixed);
-        int64_t start = 0;
-        for (unsigned l = 0; l < n; ++l) {
-          const int64_t bytes = static_cast<int64_t>(fixed[l].bytes);
-          legs[l] = Leg{start, bytes, std::clamp<int64_t>(d.expected - start, 0, bytes), 0, fixed[l].first,
-                        fixed[l].count, fixed[l].buffer, LegState::Idle};
-          start += bytes;
-        }
-        if (start != d.read->length)
-          throw std::logic_error(error_prefix<Layout>() + "a fixed read's legs do not cover the read");
-        io_.note_fanout(n);
-        if (n > 1) {
-          ++fixed_cuts_;
-          fanout_sqes_ += n;
-        }
+    iovec* iov = &iovecs_[static_cast<size_t>(index) * iov_stride_];
+    unsigned count = derived().destination(d, iov);
+    Leg* legs = &legs_[static_cast<size_t>(index) * leg_stride_];
+    CutLeg* runs = cut_scratch_.data();
+    unsigned run_count = 1;
+    runs[0] = CutLeg{0, count, d.read->length, false};
+    if (cuts_) {
+      run_count = cut_legs(
+          iov, count, limits_[d.read->file], iov_scratch_.data(), static_cast<unsigned>(iov_stride_), runs, leg_stride_);
+      if (run_count > leg_stride_)
+        throw std::logic_error(error_prefix<Layout>() + "a read needs more legs than open() sized");
+      count = runs[run_count - 1].first + runs[run_count - 1].count;
+      std::copy(iov_scratch_.begin(), iov_scratch_.begin() + count, iov);
+      if (run_count > 1) ++cut_reads_;
+      for (unsigned r = 0; r < run_count; ++r)
+        gap_cuts_ += runs[r].gap ? 1 : 0;
+    }
+    unsigned n = 0;
+    int64_t start = 0;
+    for (unsigned r = 0; r < run_count; ++r) {
+      FixedLeg* parts = fixed_scratch_.data();
+      unsigned k = 1;
+      parts[0] = FixedLeg{0, runs[r].count, -1, static_cast<size_t>(runs[r].bytes)};
+      if constexpr (requires(const Reader& reader, const iovec* v, unsigned c, FixedLeg* out) {
+                      reader.fixed_legs(v, c, out);
+                    }) {
+        if (fixed_reads()) k = io_.fixed_legs(iov + runs[r].first, runs[r].count, parts);
+      }
+      for (unsigned l = 0; l < k; ++l) {
+        if (n == leg_stride_) throw std::logic_error(error_prefix<Layout>() + "a read needs more legs than open() sized");
+        const int64_t bytes = static_cast<int64_t>(parts[l].bytes);
+        legs[n++] = Leg{start, bytes, std::clamp<int64_t>(d.expected - start, 0, bytes), 0,
+                        runs[r].first + parts[l].first, parts[l].count, parts[l].buffer, LegState::Idle};
+        start += bytes;
       }
     }
-    if (!fixed_reads()) legs[0] = Leg{0, d.read->length, d.expected, 0, 0, count, -1, LegState::Idle};
+    if (start != d.read->length) throw std::logic_error(error_prefix<Layout>() + "a read's legs do not cover the read");
+    if constexpr (requires(Reader& reader) { reader.note_fanout(1u); }) {
+      if (fixed_reads()) io_.note_fanout(n);
+    }
+    if (fixed_reads() && n > 1) {
+      ++fixed_cuts_;
+      fanout_sqes_ += n;
+    }
     for (unsigned l = 0; l < n; ++l)
       if (legs[l].expected == 0) legs[l].state = LegState::Done;
     d.legs = static_cast<uint8_t>(n);
@@ -953,20 +1075,20 @@ class ReaderCore {
       if (d.legs == 0) plan_legs(index);
       // First attempt: nothing landed and nothing retried (a descriptor is re-queued only by a short or retried leg).
       const bool fresh = d.done == 0 && d.retries == 0;
-      Leg* legs = &legs_[static_cast<size_t>(index) * kMaxLegs];
+      Leg* legs = &legs_[static_cast<size_t>(index) * leg_stride_];
       unsigned n = 0;
       for (unsigned l = 0; l < d.legs; ++l)
         n += legs[l].state == LegState::Idle ? 1u : 0u;
       if (!(c.pending + n <= c.capacity || c.pending == 0)) break;
       if constexpr (requires(const Reader& reader) { reader.sq_space(); }) {
-        if (fixed_reads() && io_.sq_space() < n) break;
+        if (n > 1 && io_.sq_space() < n) break;
       }
       c.queue_head = (c.queue_head + 1) % queue_.size();
       --c.queue_count;
       d.queued = false;
       // A resubmission (short read, -EINTR/-EAGAIN) starts past what already landed: advance_leg trims the leg's
       // iovecs, which a mid-file O_DIRECT short read leaves on a block boundary.
-      iovec* iov = &iovecs_[static_cast<size_t>(index) * derived().max_iovecs()];
+      iovec* iov = &iovecs_[static_cast<size_t>(index) * iov_stride_];
       const int fd = fds_[d.read->file];
       for (unsigned l = 0; l < d.legs; ++l) {
         Leg& g = legs[l];
@@ -1116,13 +1238,13 @@ class ReaderCore {
     // Stale unless it names a live descriptor's leg that is in flight: a dead generation, a leg the read does not
     // have, or a leg already reaped.
     if (index >= descs_.size() || generation == 0 || descs_[index].generation != generation ||
-        l >= descs_[index].legs || legs_[static_cast<size_t>(index) * kMaxLegs + l].state != LegState::Inflight) {
+        l >= descs_[index].legs || legs_[static_cast<size_t>(index) * leg_stride_ + l].state != LegState::Inflight) {
       ++stale_cqes_;
       c.failed = true;
       return;
     }
     ExtentDesc& d = descs_[index];
-    Leg& g = legs_[static_cast<size_t>(index) * kMaxLegs + l];
+    Leg& g = legs_[static_cast<size_t>(index) * leg_stride_ + l];
     g.state = LegState::Idle;
     --d.legs_inflight;
     // A fault's part is the descriptor's part whatever the sub-read count (subs_ is 1 with the flag off).
@@ -1173,7 +1295,7 @@ class ReaderCore {
     }
     g.state = LegState::Done;
     if (d.legs_inflight != 0) return;
-    const Leg* legs = &legs_[static_cast<size_t>(index) * kMaxLegs];
+    const Leg* legs = &legs_[static_cast<size_t>(index) * leg_stride_];
     for (unsigned k = 0; k < d.legs; ++k)
       if (legs[k].state != LegState::Done) return;
     retire(index, completion, returned);
@@ -1194,7 +1316,7 @@ class ReaderCore {
     // What the read delivered contiguously from its start: the legs in order, up to the first that ended short (only
     // the end of file, or the short_is_eof fault, ends a leg short). With one leg this is d.done.
     int64_t delivered = 0;
-    const Leg* legs = &legs_[static_cast<size_t>(index) * kMaxLegs];
+    const Leg* legs = &legs_[static_cast<size_t>(index) * leg_stride_];
     for (unsigned k = 0; k < d.legs; ++k) {
       delivered += legs[k].done;
       if (legs[k].done < legs[k].bytes) break;
@@ -1356,9 +1478,11 @@ class ReaderCore {
   std::vector<ExtentDesc> descs_;
   std::vector<uint32_t> queue_;  // ring of descriptors waiting for credit; each appears at most once
   std::vector<Completion> completions_;
-  std::vector<Leg> legs_;  // kMaxLegs per descriptor (size_extents)
+  std::vector<Leg> legs_;  // leg_stride_ per descriptor (size_extents)
   int64_t fixed_cuts_ = 0;   // reads prepared as more than one leg (first attempts), over the reader's life
   int64_t fanout_sqes_ = 0;  // the SQEs those reads issued (first attempts)
+  int64_t cut_reads_ = 0;    // reads planned as more than one cut run (first plans)
+  int64_t gap_cuts_ = 0;     // runs a boundary gap opened (first plans)
   std::vector<Completion> held_;  // fault: completions withheld from the reader (hold_ordinal)
   std::vector<uint32_t> again_;
   BounceRow rows_[kBounceSlots];
@@ -1373,6 +1497,16 @@ class ReaderCore {
   // reader is destroyed.
   Reader io_;
   unsigned configured_queue_depth_ = 0;
+  bool cuts_requested_ = false;       // READ_CUTS resolved (UringOptions::read_cuts_on)
+  bool fixed_requested_ = false;      // READ_MODE fixed/readv_fixed (the options, before io_ is initialized)
+  bool cuts_ = false;                 // in force: requested, or a test cap
+  int64_t leg_cut_cap_ = 0;           // test only (fault word leg_cut_cap): every file cut at this, 0: device limits
+  std::vector<DeviceLimits> limits_;  // per file, t_.paths order
+  unsigned leg_stride_ = 1;
+  size_t iov_stride_ = 1;
+  std::vector<iovec> iov_scratch_;
+  std::vector<CutLeg> cut_scratch_;
+  std::vector<FixedLeg> fixed_scratch_;
   // Piece streaming (set_piece_stream; off by default). subs_ is the most sub-reads per part: 1 with the flag off,
   // which makes descriptor (slot, part, sub) the old (slot, part), and kSubReads with it on whatever a row's cut
   // (row_geometry cuts each reading part into sub_reads_per_part <= kSubReads). sub_reads_ holds each live sub-read's
