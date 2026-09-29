@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdio>
+#include <memory>
 #include <span>
 #include <type_traits>
 
@@ -350,7 +351,9 @@ class ReaderCore {
   // Null costs a branch per event and no clock read; the stamps only read the clock and add to
   // `trace`, so they cannot change what is submitted, reaped, drained or copied.
   //
-  // `progress`, unless it is NoProgress, is invoked once per turn of the drain loop (never behind a clock: spec M4).
+  // `progress`, unless it is NoProgress, is invoked once per turn of the drain loop (never behind a clock: spec M4),
+  // and again as each row finishes (finish_row), so a caller that publishes the landed prefix (run_fill's advance)
+  // sees every row as it lands, not once per turn: one reap can return every row of a read at once.
   // The reader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
   // its own periodic work (retire_leases()) while a read is in flight, exactly as `abandon` is how the
   // caller decides when to stop admitting. NoProgress compiles to nothing.
@@ -393,6 +396,12 @@ class ReaderCore {
     }
     if constexpr (Build::kMetrics) c.trace = trace;  // ProdBuild: no record, whatever the caller passed
     c.packed = packed;
+    if constexpr (!std::is_same_v<std::decay_t<Progress>, NoProgress>) {
+      // Type-erased as a function pointer and the closure's address: no std::function, nothing allocated (spec A6).
+      // The closure outlives the call (it is read()'s own parameter), and finish_row runs only inside the loop below.
+      c.progress = [](void* closure) { (*static_cast<std::remove_reference_t<Progress>*>(closure))(); };
+      c.progress_closure = const_cast<void*>(static_cast<const void*>(std::addressof(progress)));
+    }
     c.publish = piece_stream_ ? publish : nullptr;
     if constexpr (Build::kFaults) {
       if (c.publish != nullptr && c.publish->probe != nullptr && faults_.fault.hold_until_probe_ms > 0) {
@@ -622,6 +631,8 @@ class ReaderCore {
     size_t queue_count = 0;
     [[no_unique_address]] TracePtr trace{};  // ProdBuild: an empty member, so no site can test or stamp it
     std::vector<uint8_t>* packed = nullptr;
+    void (*progress)(void*) = nullptr;  // read()'s progress hook, also run as each row finishes (null: NoProgress)
+    void* progress_closure = nullptr;
     bool failed = false;
     bool abandoned = false;
     bool stalled = false;  // a batch is waiting for its bank to retire
@@ -1595,6 +1606,9 @@ class ReaderCore {
     derived().after_finish(best);
     rows_[best] = BounceRow{};
     --rows_busy_[best / kBounceRows];
+    // Last, with the reader's bookkeeping settled: a fill publishes this row's landing now, not after the turn's last
+    // row (the landed-prefix defect, flake-bisect.md).
+    if (c.progress != nullptr) c.progress(c.progress_closure);
   }
 
   // A failed call: what every extent still live was owed but never returned is cancelled. Extents that

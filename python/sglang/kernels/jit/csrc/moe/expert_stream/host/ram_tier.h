@@ -1318,8 +1318,10 @@ class RamTier {
     });
   }
 
-  // A snapshot: the READY slots' experts, least recently used first; returns how many. Its sort allocates, on the
-  // owner between requests: an eager path, never the request path.
+  // A snapshot: the READY slots' experts, least recently used first; returns how many. Its vector allocates on the
+  // owner: between requests, or -- when it is queued while the service runs unpaused -- mid-read, from read()'s
+  // progress hook (answer_snapshots). Production calls it only while paused (NativePinnedSlotTable, inside
+  // host_use()), where the caller is the owner and nothing is being served; an unpaused call is test-only.
   int64_t lru_order(int64_t row, int64_t* out) {
     row_capacity(row);
     return snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
@@ -2181,7 +2183,10 @@ class RamTier {
             // passes, and a snapshot's thunk is a read-only pass on the owner.
             // The service stays the tier's owner for the whole read, so it releases the COPYING leases the copy
             // thread handed back (D7) and answers queued snapshots here too (Task 13): neither waits for a read's
-            // length, and a test can observe a slot mid-read.
+            // length, and a test can observe a slot mid-read. read() runs it once per drain-loop turn and once per
+            // finished row: all three passes are the owner's, early-out when idle (retire_leases on
+            // lanes_outstanding_, the rings on an empty front), allocate nothing and take no lock, so the extra
+            // per-row calls cost a few loads each.
             [this] {  // a template argument (spec A6): no std::function, no allocation
               drain_copy_completions();
               retire_leases();
