@@ -9,7 +9,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import torch
 
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_sqes, read_rows_with_fault
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -231,3 +230,118 @@ def test_explicit_depth_below_the_leg_bound_is_refused(tmp_path, uring_env):
     uring_env(QUEUE_DEPTH=2)
     with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=2"):
         _read(s, leg_cut_cap=CUT)
+
+
+@pytest.mark.parametrize("images", [False, True], ids=["bounce", "images"])
+@pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
+def test_cut_reads_are_byte_identical_and_within_the_cut(tmp_path, uring_env, images, pieces):
+    s = _setup(tmp_path, images, (1.0, 1.0, 1.0))
+    base_result, base_log, _, base_rec, base_bytes = _read(s, **_pieces(images, pieces))
+    result, log, info, rec, cut_bytes = _read(s, leg_cut_cap=CUT, **_pieces(images, pieces))
+    assert base_result == result == 1 and _equal(cut_bytes, base_bytes)
+    assert info["cut_reads"] > 0 and all(0 < length <= CUT for _, _, length, _ in log)
+    assert all(offset % 512 == 0 and length % 512 == 0 for _, offset, length, _ in log)
+    assert rec["retried_bytes"] == 0 and rec["submitted_bytes"] == base_rec["submitted_bytes"]
+
+    # The cut SQEs cover exactly the uncut ones' file ranges.
+    def ranges(entries):
+        spans = sorted((f, o, o + n) for f, o, n, _ in entries)
+        merged = []
+        for f, a, b in spans:
+            if merged and merged[-1][0] == f and merged[-1][2] == a:
+                merged[-1] = (f, merged[-1][1], b)
+            else:
+                merged.append((f, a, b))
+        return merged
+
+    assert ranges(log) == ranges(base_log)
+
+
+def test_cuts_are_off_by_default_outside_iopoll(tmp_path, uring_env):
+    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    _, base_log, _, _, _ = _read(s)
+    uring_env(MODE="default", READ_CUTS="auto")
+    result, log, info, _, _ = _read(s)
+    assert result == 1 and info["cut_reads"] == info["gap_cuts"] == 0 and sorted(log) == sorted(base_log)
+
+
+def test_read_cuts_on_uses_the_files_device_limits(tmp_path, uring_env):
+    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    _, _, _, _, base_bytes = _read(s)
+    uring_env(READ_CUTS=1)
+    result, log, info, _, cut_bytes = _read(s)
+    assert result == 1 and _equal(cut_bytes, base_bytes)
+    assert info["min_cut_bytes"] >= 4096 and all(length <= info["min_cut_bytes"] for _, _, length, _ in log)
+
+
+def test_gap_cuts_at_slab_rows_off_the_page(tmp_path, uring_env):
+    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    off_page = [name for layer in s.slabs.values() for name, t in layer.items()
+                if (t.numel() * t.element_size() // t.shape[0]) % 4096]
+    assert off_page, "the fixture has no slab row off the page; gap cuts are untested"
+    _, _, _, _, base_bytes = _read(s)
+    result, _, info, _, cut_bytes = _read(s, leg_cut_cap=1 << 30)   # a huge cut: only gaps cut
+    assert result == 1 and info["gap_cuts"] > 0 and _equal(cut_bytes, base_bytes)
+
+
+@pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
+def test_cut_legs_completing_out_of_order(tmp_path, uring_env, pieces):
+    s = _setup(tmp_path, True)
+    _, _, _, _, base_bytes = _read(s, **_pieces(True, pieces))
+    result, _, info, _, cut_bytes = _read(s, leg_cut_cap=CUT, reverse_cqes=True, **_pieces(True, pieces))
+    assert result == 1 and info["cut_reads"] > 0 and _equal(cut_bytes, base_bytes)
+
+
+@pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
+def test_a_held_cut_leg_keeps_its_read_unretired_and_its_pieces_unpublished(tmp_path, uring_env, pieces):
+    s = _setup(tmp_path, True)
+    _, _, _, _, base_bytes = _read(s, **_pieces(True, pieces))
+    result, _, _, rec, cut_bytes = _read(s, leg_cut_cap=CUT, hold_ordinal=0, leg=1, **_pieces(True, pieces))
+    assert result == 1 and _equal(cut_bytes, base_bytes)
+    if pieces:
+        assert rec["pieces_published"] == len(EXPERTS) * 8 and rec["piece_publish_refused"] == 0
+
+
+def test_one_short_cut_leg_resubmits_only_that_leg(tmp_path, uring_env):
+    s = _setup(tmp_path, True)
+    _, clean_log, _, _, base_bytes = _read(s, leg_cut_cap=CUT)
+    result, log, _, rec, cut_bytes = _read(s, leg_cut_cap=CUT, part=0, part_short=512, leg=1)
+    assert result == 1 and _equal(cut_bytes, base_bytes)
+    assert len(log) == len(clean_log) + 1
+    extra = sorted(set(log) - set(clean_log))
+    assert len(extra) == 1 and rec["retried_bytes"] == extra[0][2]
+
+
+@pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
+def test_one_failing_cut_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_path, uring_env, pieces):
+    s = _setup(tmp_path, True)
+    stats, cqes = {}, []
+    first, then = read_rows_with_fault(
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=False, part=0, part_error=errno.EIO,
+        ordinal=0, leg=1, leg_cut_cap=CUT, stats=stats, cqes=cqes, **_pieces(True, pieces))
+    assert (first, then) == (0, 1)
+    assert stats["unfinished_jobs"] == 0 and stats["cut_reads"] > 0
+
+
+@pytest.mark.parametrize("submit_first", [False, True], ids=["unconsumed", "in_flight"])
+def test_ring_reset_with_cut_legs(tmp_path, uring_env, submit_first):
+    s = _setup(tmp_path, True)
+    first, then = read_rows_with_fault(
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=False,
+        submit_error=errno.EIO, submit_call=1, submit_first=submit_first, leg_cut_cap=CUT)
+    assert (first, then) == (0, 1)
+
+
+@pytest.mark.parametrize("read_mode", ["fixed", "readv_fixed"])
+def test_cuts_compose_with_the_fixed_fan_out(tmp_path, uring_env, read_mode):
+    s = _setup(tmp_path, True)
+    _, _, _, _, base_bytes = _read(s)
+    uring_env(READ_MODE=read_mode)
+    try:
+        result, log, info, _, cut_bytes = _read(s, leg_cut_cap=CUT, fixed_chunk_cap=64 * 1024)
+    except RuntimeError as e:
+        if "unsupported by the running kernel" in str(e) or "requires liburing 2.10" in str(e):
+            pytest.skip(str(e))
+        raise
+    assert result == 1 and _equal(cut_bytes, base_bytes)
+    assert info["cut_reads"] > 0 and info["fixed_cuts"] > 0 and all(length <= CUT for _, _, length, _ in log)
