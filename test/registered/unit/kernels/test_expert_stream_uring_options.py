@@ -25,7 +25,10 @@ def test_uring_environment_validation(tmp_path):
 #include "moe/expert_stream/host/uring_options.h"
 #include <iostream>
 int main() {
- try { auto o = sglang::expert_stream::UringOptions::from_env(); std::cout << o.queue_depth; }
+ try {
+   auto o = sglang::expert_stream::UringOptions::from_env();
+   std::cout << o.queue_depth << " " << o.sq_thread_idle_ms << " " << o.read_cuts_name() << " " << o.read_cuts_on();
+ }
  catch (const std::exception& e) { std::cerr << e.what(); return 2; }
 }
 """)
@@ -35,7 +38,20 @@ int main() {
         check=True,
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith(PREFIX)}
-    assert subprocess.check_output([binary], env=env, text=True) == "0"
+    # Defaults: depth 0 (16 * parts), SQPOLL idle 10 s (user, 2026-09-28), cuts auto and off outside IOPOLL.
+    assert subprocess.check_output([binary], env=env, text=True) == "0 10000 auto 0"
+
+    def probe(**values):
+        return subprocess.check_output(
+            [binary], env=env | {PREFIX + k: v for k, v in values.items()}, text=True
+        ).split()
+
+    assert probe(MODE="iopoll")[2:] == ["auto", "1"]  # auto follows IOPOLL
+    assert probe(MODE="sqpoll_iopoll")[2:] == ["auto", "1"]
+    assert probe(MODE="sqpoll")[2:] == ["auto", "0"]
+    assert probe(READ_CUTS="1")[2:] == ["on", "1"]
+    assert probe(MODE="iopoll", READ_CUTS="0")[2:] == ["off", "0"]
+    assert probe(SQ_THREAD_IDLE_MS="1000")[1] == "1000"  # an explicit value still wins
     for key, value in [
         ("QUEUE_DEPTH", "64"),
         ("MODE", "sqpoll_iopoll"),
@@ -45,6 +61,7 @@ int main() {
         ("DIAGNOSTICS", "1"),
         ("SQ_THREAD_CPU", "2"),
         ("SQ_THREAD_IDLE_MS", "0"),
+        ("READ_CUTS", "auto"),
     ]:
         result = subprocess.run(
             [binary], env=env | {PREFIX + key: value}, capture_output=True, text=True
@@ -67,6 +84,9 @@ int main() {
         ("SQ_THREAD_CPU", "-2"),
         ("SQ_THREAD_IDLE_MS", "-1"),
         ("DIAGNOSTICS", "yes"),
+        ("READ_CUTS", "on"),
+        ("READ_CUTS", "2"),
+        ("READ_CUTS", ""),
     ]:
         result = subprocess.run(
             [binary], env=env | {PREFIX + key: value}, capture_output=True, text=True
