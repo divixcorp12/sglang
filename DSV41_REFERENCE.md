@@ -5610,7 +5610,7 @@ protocol and unused in production, is gone with its ops module, tests, benchmark
 - The eight `SGLANG_MOE_EXPERT_DOORBELL*` variables are deprecated: a set variable warns and does not fail.
   `--moe-offload-preset doorbell` is refused.
 - The per-batch fail-stop hook, also used by the EXL3 RAM-miss path, is now `ExpertHotCacheManager.run_fail_stop_checks`.
-- Cores 64-71 stay reserved, but the reason is now NVMe completion interrupts (16 queues across nvme0-3), not the
+- Cores 64-71 stay reserved, but the reason is now NVMe completion interrupts, not the
   doorbell's spin core.
 - The offline prefetch pricing model loses its doorbell arms, and `price_prefetch.py`'s result JSON keys changed.
 - Evidence: both merge messages. §8's doorbell row already carries the removal.
