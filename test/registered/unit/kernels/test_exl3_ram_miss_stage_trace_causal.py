@@ -248,9 +248,10 @@ NON_TRACE_CLOCK_READS = {
     "const int64_t latency = now_ns() - job.submit_ns;": 1,
     "if constexpr (Build::kMetrics) read_ns = now_ns();  // prefetch_latency_ns, a metric": 1,
     "if constexpr (Build::kMetrics) copy_count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);": 1,
-    # The hold_until_probe_ms test fault (piece streaming, G2): read only when that fault is set; the second
-    # line's `c.hold_until == 0` short-circuits before the clock read otherwise.
-    "c.hold_until = now_ns() + fault_.hold_until_probe_ms * 1000000;": 1,
+    # The hold_until_probe_ms test fault (piece streaming, G2): InstrBuild only (both under `if constexpr
+    # (Build::kFaults)`), read only when that fault is set; the second line's `c.hold_until == 0` short-circuits
+    # before the clock read otherwise.
+    "c.hold_until = now_ns() + faults_.fault.hold_until_probe_ms * 1000000;": 1,
     "if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;": 1,
 }
 

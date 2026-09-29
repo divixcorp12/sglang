@@ -141,6 +141,7 @@ def one_read(tables, experts, mode, *, scenario: str, direct: bool = False, owne
         tables, 1, experts, list(range(n)), direct=direct, step=8,
         hold_ordinal={"natural": -1, "last": n - 1, "burst": 0}[scenario], hold_rest=scenario == "burst",
         pack_workers=workers, pack_split=split, owner_core=owner_core,
+        variant="instr",  # the stage record and the hold faults are the instrumented build's (hotpath Task 10)
     )
     cpu, wall = time.process_time() - cpu0, time.perf_counter() - wall0
     assert result == 1, rec

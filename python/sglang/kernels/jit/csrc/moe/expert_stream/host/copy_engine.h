@@ -342,10 +342,13 @@ class CopyEngine {
   }
 
   // Test only: one more copy of `bytes` issued ahead of every job's own, so each job completes that much later.
-  void set_ballast(uint64_t dst, uint64_t src, int64_t bytes) {
-    ballast_dst_.store(dst);
-    ballast_src_.store(src);
-    ballast_bytes_.store(bytes);
+  // InstrBuild only.
+  void set_ballast(uint64_t dst, uint64_t src, int64_t bytes)
+    requires(Build::kFaults)
+  {
+    ballast_.dst.store(dst);
+    ballast_.src.store(src);
+    ballast_.bytes.store(bytes);
   }
 
  private:
@@ -471,8 +474,10 @@ class CopyEngine {
     int64_t start = 0;
     if constexpr (Build::kMetrics) start = now_ns();  // copy_issue_ns, a metric
     int64_t bytes = 0;
-    if (const int64_t ballast = ballast_bytes_.load(); ballast > 0) {
-      if (const int r = backend_->issue(ballast_dst_.load(), ballast_src_.load(), ballast)) return r;
+    if constexpr (Build::kFaults) {
+      if (const int64_t ballast = ballast_.bytes.load(); ballast > 0) {
+        if (const int r = backend_->issue(ballast_.dst.load(), ballast_.src.load(), ballast)) return r;
+      }
     }
     job.sm = table.sm && !job.prefetch;
     for (int i = 0; i < job.count; ++i) {
@@ -552,9 +557,13 @@ class CopyEngine {
   std::string init_error_;
   int broken_ = 0;             // copy thread only: the first backend error
   bool held_counted_ = false;  // copy thread only: the current hold was counted in kPrefetchHeld
-  std::atomic<uint64_t> ballast_dst_{0};
-  std::atomic<uint64_t> ballast_src_{0};
-  std::atomic<int64_t> ballast_bytes_{0};
+  struct Ballast {  // set_ballast: InstrBuild only
+    std::atomic<uint64_t> dst{0};
+    std::atomic<uint64_t> src{0};
+    std::atomic<int64_t> bytes{0};
+  };
+  struct NoBallast {};
+  [[no_unique_address]] std::conditional_t<Build::kFaults, Ballast, NoBallast> ballast_;
 };
 
 }  // namespace expert_stream

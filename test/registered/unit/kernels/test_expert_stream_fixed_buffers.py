@@ -223,7 +223,7 @@ root = pathlib.Path(sys.argv[1]); root.mkdir(parents=True)
 s = ram_miss_setup(root, capacity=12, experts=12, row_images=True)
 resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))
 try:
-    read_rows_sqes(s.tables, 1, [0, 1], [0, 1])
+    read_rows_sqes(s.tables, 1, [0, 1], [0, 1], variant="instr")  # a subprocess: the conftest's default does not reach it
     print("READ WITHOUT REGISTRATION")  # a silent fallback: the missing REFUSED fails the test
 except RuntimeError as e:
     print("REFUSED", e)
@@ -261,7 +261,7 @@ s = ram_miss_setup(root, capacity=12, experts=12, row_images=True)
 try:
     result = read_rows_with_fault(
         s.tables, 1, [10, 3, 7, 0], [7, 0, 11, 3], [11, 5], [9, 1], submit_error=errno.EIO,
-        submit_call=1, ring_reset_fail=True, fixed_chunk_cap=int(sys.argv[2]))
+        submit_call=1, ring_reset_fail=True, fixed_chunk_cap=int(sys.argv[2]), variant="instr")
     print("NO ERROR", result)  # the reset did not fail, or its failure was swallowed: the assertion names it
 except RuntimeError as e:
     print("RAISED", e)

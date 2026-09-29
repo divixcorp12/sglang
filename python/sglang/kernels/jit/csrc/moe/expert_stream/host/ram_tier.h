@@ -208,8 +208,10 @@ class RamTier {
       count<kOverruns>();  // status stays pending: a waiting layer fails stop
     }
     deferred_seq_ = 0;
-    if (const int64_t stall = done_stall_ns_.load(); stall > 0) {
-      std::this_thread::sleep_for(std::chrono::nanoseconds(stall));  // test only: see inject_done_stall
+    if constexpr (Build::kFaults) {
+      if (const int64_t stall = faults_.done_stall_ns.load(); stall > 0) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(stall));  // test only: see inject_done_stall
+      }
     }
     _mm_sfence();
     store_release(page_ + kDemandDone, next_demand_);
@@ -661,7 +663,9 @@ class RamTier {
     return copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
   }
 
-  void copy_engine_ballast(uint64_t dst, uint64_t src, int64_t bytes) {
+  void copy_engine_ballast(uint64_t dst, uint64_t src, int64_t bytes)
+    requires(Build::kFaults)
+  {
     if (copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     copy_engine_->set_ballast(dst, src, bytes);
   }
@@ -679,8 +683,14 @@ class RamTier {
     if (lease_ != nullptr) store_release(lease_ + kLeaseHeaderShutdown, 1u);
   }
 
+  // Test only: sleep `ns` between serving a demand and storing demand_done. InstrBuild only.
   void inject_done_stall(int64_t ns) {
-    done_stall_ns_.store(ns);
+    if constexpr (!Build::kFaults) {
+      (void)ns;
+      test_only("inject_done_stall");
+    } else {
+      faults_.done_stall_ns.store(ns);
+    }
   }
 
   // The seqlock read of the device's lane request for `seq`: false when a later request has already overwritten it.
@@ -1123,11 +1133,17 @@ class RamTier {
   // Test-only faults: sleep `delay_ns` before each advisory read and before each demand
   // read once `after_demands` demands have read rows; report reads as failed; make an advisory
   // give up once `abandon_after_batches` of its batches (rows) were admitted (0: never).
+  // InstrBuild only.
   void inject(int64_t delay_ns, bool fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
-    delay_ns_.store(delay_ns);
-    fail_reads_.store(fail_reads);
-    delay_after_.store(after_demands);
-    abandon_after_.store(abandon_after_batches);
+    if constexpr (!Build::kFaults) {
+      (void)delay_ns, (void)fail_reads, (void)after_demands, (void)abandon_after_batches;
+      test_only("inject");
+    } else {
+      faults_.delay_ns.store(delay_ns);
+      faults_.fail_reads.store(fail_reads);
+      faults_.delay_after.store(after_demands);
+      faults_.abandon_after.store(abandon_after_batches);
+    }
   }
 
   // Test only: carry a whole ReadFault down to this tier's reader, where inject() reaches it only as a
@@ -1139,11 +1155,16 @@ class RamTier {
   // (piece_stream) are not faults and are ignored, and words 19-20 (formerly pack_workers, pack_split) are reserved:
   // use inject() for the abandon point and set_piece_stream() for the mode. The reader's counters (submit and
   // completion calls) run over the reader's whole life, so a call-numbered fault (submit_call, cqe_call) is relative to
-  // a fresh tier.
+  // a fresh tier. InstrBuild only: ProdBuild refuses rather than store a fault it would never apply.
   void inject_fault(const int64_t* words) {
-    std::lock_guard<std::mutex> guard(fault_mutex_);
-    pending_fault_ = fault_from(words);
-    fault_pending_.store(true, std::memory_order_release);
+    if constexpr (!Build::kFaults) {
+      (void)words;
+      test_only("inject_fault");
+    } else {
+      std::lock_guard<std::mutex> guard(faults_.fault_mutex);
+      faults_.pending_fault = fault_from(words);
+      faults_.fault_pending.store(true, std::memory_order_release);
+    }
   }
 
   // Relaxed reads of every block: a core counter is the sum of its writers' blocks (each word has one writer), a
@@ -1319,12 +1340,12 @@ class RamTier {
   // ProdBuild: nothing (its faults are the instrumented build's, plan Task 10).
   void apply_pending_fault() {
     if constexpr (Build::kFaults) {
-      if (!fault_pending_.load(std::memory_order_acquire)) return;
+      if (!faults_.fault_pending.load(std::memory_order_acquire)) return;
       ReadFault fault;
       {
-        std::lock_guard<std::mutex> guard(fault_mutex_);
-        fault = pending_fault_;
-        fault_pending_.store(false, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> guard(faults_.fault_mutex);
+        fault = faults_.pending_fault;
+        faults_.fault_pending.store(false, std::memory_order_relaxed);
       }
       reader_.set_fault(fault);
     }
@@ -1783,26 +1804,38 @@ class RamTier {
     packed.clear();
     bool cancelled = false;
     if (ok && !missing.empty()) {
-      apply_pending_fault();
-      const int64_t delay = delay_ns_.load();
-      if (delay > 0 && (advisory || demands_read_ >= delay_after_.load())) {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(delay));
+      bool fail_reads = false;
+      int64_t abandon_after = 0;
+      if constexpr (Build::kFaults) {  // the test faults (inject, inject_fault): InstrBuild only
+        apply_pending_fault();
+        const int64_t delay = faults_.delay_ns.load();
+        if (delay > 0 && (advisory || demands_read_ >= faults_.delay_after.load())) {
+          std::this_thread::sleep_for(std::chrono::nanoseconds(delay));
+        }
+        fail_reads = faults_.fail_reads.load();
+        abandon_after = faults_.abandon_after.load();
       }
-      if (fail_reads_.load()) {
+      if (fail_reads) {
         count<kReadErrors>();
         ok = false;
         status = kStatusFailed;
       } else {
-        const int64_t abandon_after = abandon_after_.load();
+        // ProdBuild: the advisory rule alone (abandon_after is the constant 0 there).
+        const auto abandon = [&](size_t admitted) {
+          bool stop = advisory && (demand_pending() || pause_requested_.load() || stop_requested_.load());
+          if constexpr (Build::kFaults) {
+            stop = stop || (advisory && abandon_after > 0 && admitted >= static_cast<size_t>(abandon_after));
+          } else {
+            (void)admitted;
+          }
+          return stop;
+        };
         const int result = reader_.read(
             request.row,
             missing,
             slots,
             advisory ? 1 : kBounceRows,
-            [&](size_t admitted) {
-              return advisory && (demand_pending() || pause_requested_.load() || stop_requested_.load() ||
-                                  (abandon_after > 0 && admitted >= static_cast<size_t>(abandon_after)));
-            },
+            abandon,
             cur,
             &packed,
             advisory ? 1 : SIZE_MAX,
@@ -1987,7 +2020,6 @@ class RamTier {
   Outstanding outstanding_[kDemandRecords];    // by request slot; guarded by mutex_
   std::atomic<int64_t> lanes_outstanding_{0};  // lanes GRANTED and not yet retired: an early-out for retire_leases
   std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new; retirement continues
-  std::atomic<int64_t> done_stall_ns_{0};      // test only: sleep between serving a demand and storing demand_done
   std::atomic<uint64_t> lease_changes_{0};     // bumped whenever a lease is released: what wakes a deferred demand
   // The demand held back, if any (service thread only): its sequence, the changes seen when it was last refused,
   // its generation (a terminal for it also wakes it) and when it was first observed (for the stage record).
@@ -2026,13 +2058,19 @@ class RamTier {
   // 0 when none. episodes_ is the service thread's, or a fill's (they never run at once: a fill needs the pause).
   std::atomic<uint64_t> busy_{0};
   uint64_t episodes_ = 0;
-  std::atomic<int64_t> delay_ns_{0};
-  std::atomic<int64_t> delay_after_{0};
-  std::atomic<int64_t> abandon_after_{0};
-  std::atomic<bool> fail_reads_{false};
-  std::mutex fault_mutex_;  // guards pending_fault_ between inject_fault() and the service thread
-  ReadFault pending_fault_{};
-  std::atomic<bool> fault_pending_{false};
+  // Test-only faults (inject, inject_fault, inject_done_stall): InstrBuild only (plan Task 10).
+  struct TierFaults {
+    std::atomic<int64_t> delay_ns{0};
+    std::atomic<int64_t> delay_after{0};
+    std::atomic<int64_t> abandon_after{0};
+    std::atomic<bool> fail_reads{false};
+    std::atomic<int64_t> done_stall_ns{0};  // sleep between serving a demand and storing demand_done
+    std::mutex fault_mutex;                 // guards pending_fault between inject_fault() and the service thread
+    ReadFault pending_fault{};
+    std::atomic<bool> fault_pending{false};
+  };
+  struct NoTierFaults {};
+  [[no_unique_address]] std::conditional_t<Build::kFaults, TierFaults, NoTierFaults> faults_;
   // Counters, see count(). One line-private block per writer thread; the metrics only in InstrBuild.
   LineCounters<kCounterCount> core_;       // service thread (or the caller owning the tier while it is paused)
   LineCounters<kCounterCount> copy_core_;  // copy thread only

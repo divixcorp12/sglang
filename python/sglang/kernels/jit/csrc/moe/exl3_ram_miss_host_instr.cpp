@@ -9,9 +9,13 @@
 
 namespace sglang {
 
-using Exl3Reader = expert_stream::FaultyReader<expert_stream::UringReader>;
+using Exl3Reader = expert_stream::FaultyReader<expert_stream::InstrUringReader>;
 static_assert(expert_stream::AsyncFileReader<Exl3Reader>);
 using Exl3HostExports = expert_stream::HostExports<exl3::Exl3RowLayout, Exl3Reader, expert_stream::InstrBuild>;
+
+static_assert(
+    Exl3HostExports::kReaderFaults && Exl3HostExports::kSqeLog && Exl3HostExports::kBallast,
+    "the instrumented build keeps every fault");
 
 EXPERT_STREAM_HOST_EXPORTS(Exl3HostExports)
 

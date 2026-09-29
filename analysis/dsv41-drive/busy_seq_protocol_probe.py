@@ -32,7 +32,8 @@ def _host(capacity=6):
     s = ram_miss_setup(pathlib.Path(tempfile.mkdtemp(prefix="busy_seq_probe_")), capacity=capacity, experts=6,
                        row_images=True)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
+    # The instrumented build: inject() and the `advisories` metric exist only there (plan hotpath-zero-overhead Task 10).
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr")
     return page, host
 
 

@@ -9,6 +9,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_sqes
@@ -23,8 +24,8 @@ GOLDEN = Path(__file__).parent / "golden" / "hotpath_golden.json"
 SQE_REQUESTS = [(0, [0], [0]), (0, [1, 2, 3], [1, 2, 3]), (1, [7, 0, 5, 2], [0, 1, 2, 3])]
 
 
-def scenario(tmp_path):
-    s, page, host, sim, dst = hp.build_host(tmp_path)
+def scenario(tmp_path, variant=None):
+    s, page, host, sim, dst = hp.build_host(tmp_path, variant=variant)
     try:
         return hp.run_script(s, page, host, sim, dst)
     finally:
@@ -44,9 +45,12 @@ def sqe_golden(tmp_path):
     return out
 
 
-def test_the_scripted_scenario_matches_the_golden(tmp_path):
+# Both builds (plan Task 10): the functional counters the golden records are core counters, present in both, so the
+# production module, which has no metrics, trace or faults, must reproduce the same file byte for byte.
+@pytest.mark.parametrize("variant", ("prod", "instr"))
+def test_the_scripted_scenario_matches_the_golden(tmp_path, variant):
     golden = json.loads(GOLDEN.read_text())
-    snaps = scenario(tmp_path)
+    snaps = scenario(tmp_path, variant)
     for snap in snaps:
         for row in snap["rows"].values():
             assert all(entry["exact"] for entry in row["ready"].values()), "a READY row differs from the checkpoint"

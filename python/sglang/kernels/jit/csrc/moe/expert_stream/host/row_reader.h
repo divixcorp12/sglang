@@ -26,7 +26,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   friend class ReaderCore<RowReader<Layout, Reader, Build>, Layout, Reader, Build>;
   using Base::c_;
   using Base::direct_;
-  using Base::fault_;
+  using Base::faults_;
   using Base::fds_;
   using Base::finish_row;
   using Base::holding_for_probe;
@@ -154,10 +154,12 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
       if (now < 0) now = trace_stamp();
       return now;
     };
-    const auto delay = [&] {
-      if (fault_.pack_delay_ns <= 0) return;
-      std::this_thread::sleep_for(std::chrono::nanoseconds(fault_.pack_delay_ns));
-      now = -1;
+    const auto delay = [&] {  // the pack_delay_ns fault: InstrBuild only
+      if constexpr (Build::kFaults) {
+        if (faults_.fault.pack_delay_ns <= 0) return;
+        std::this_thread::sleep_for(std::chrono::nanoseconds(faults_.fault.pack_delay_ns));
+        now = -1;
+      }
     };
     if (!piece_stream_) {
       while (true) {
@@ -213,8 +215,10 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   }
 
   // The poison fault: fill the destination slab rows the row in `slot` is read into, so a byte published without
-  // having been read shows.
-  void poison_slot(size_t slot, uint8_t fill) {
+  // having been read shows. InstrBuild only.
+  void poison_slot(size_t slot, uint8_t fill)
+    requires(Build::kFaults)
+  {
     const Call& c = c_;
     const int64_t dest = (*c.slots)[rows_[slot].ordinal];
     for (size_t name = 0; name < t_.slabs[c.layer].size(); ++name) {

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../../../io/registered_buffers.h"  // relative: the JIT build does not put jit/csrc on the include path
+#include "build_policy.h"
 #include "file_reader.h"
 #include "uring_options.h"
 #include <sys/resource.h>
@@ -27,12 +28,19 @@
 
 namespace sglang::expert_stream {
 
-class UringReader {
+// `Build` (build_policy.h) gates the reader's own test hooks (the ring-reset faults FaultyReader forwards, and
+// publish_sq_without_enter): ProdBuild has neither the hooks nor their state (plan 2026-09-29-hotpath-zero-overhead
+// Task 10). UringReader is the production reader; InstrUringReader is the one the instrumented build wraps in
+// FaultyReader and the ring-reset harness drives.
+template <class Build>
+class BasicUringReader {
+  static_assert(BuildPolicy<Build>);
+
  public:
-  UringReader() = default;
-  UringReader(const UringReader&) = delete;
-  UringReader& operator=(const UringReader&) = delete;
-  ~UringReader() {
+  BasicUringReader() = default;
+  BasicUringReader(const BasicUringReader&) = delete;
+  BasicUringReader& operator=(const BasicUringReader&) = delete;
+  ~BasicUringReader() {
     close();
   }
 
@@ -297,8 +305,11 @@ class UringReader {
     // A failed reset leaves the reader closed (ready() false, so a later read() returns 0 and close() has nothing
     // to settle) and throws its reason to the caller: "io_uring ring reset failed", create_ring's own error, or
     // register_resources' refusal.
-    const bool injected = reset_fail_;
-    reset_fail_ = false;
+    bool injected = false;
+    if constexpr (Build::kFaults) {
+      injected = hooks_.reset_fail;
+      hooks_.reset_fail = false;
+    }
     if (injected || !create_ring()) throw std::runtime_error("io_uring ring reset failed");
     try {
       register_resources();
@@ -311,12 +322,16 @@ class UringReader {
 
   // Test only (fault word 30 bit 0, through FaultyReader): the next drain() that discards unconsumed SQEs finds its
   // NOP submission refused (EIO), as if the kernel had failed it. Fires once.
-  void set_nop_flush_refused(bool refused) {
-    nop_flush_refused_ = refused;
+  void set_nop_flush_refused(bool refused)
+    requires(Build::kFaults)
+  {
+    hooks_.nop_flush_refused = refused;
   }
   // Test only: publishes the prepared SQEs to the kernel's SQ tail without entering the kernel, as liburing's submit
   // does before an io_uring_enter that then fails. drain() must treat them as unconsumed and NOP them too.
-  void publish_sq_without_enter() {
+  void publish_sq_without_enter()
+    requires(Build::kFaults)
+  {
     if (options_.sqpoll()) throw std::logic_error("publish_sq_without_enter needs a ring without SQPOLL");
     ring_.sq.sqe_head = ring_.sq.sqe_tail;
     __atomic_store_n(ring_.sq.ktail, ring_.sq.sqe_tail, __ATOMIC_RELEASE);
@@ -324,8 +339,10 @@ class UringReader {
 
   // Test only (fault word 30 bit 1, through FaultyReader): the next reset in drain() (a refused NOP drain outside
   // the fixed read modes) fails as if create_ring() had, after closing the old ring. Fires once.
-  void set_ring_reset_fail(bool fail) {
-    reset_fail_ = fail;
+  void set_ring_reset_fail(bool fail)
+    requires(Build::kFaults)
+  {
+    hooks_.reset_fail = fail;
   }
 
  private:
@@ -521,8 +538,11 @@ class UringReader {
       io_uring_prep_nop(sqe);
       io_uring_sqe_set_data64(sqe, kNopTag);
     }
-    int refused = nop_flush_refused_ ? -EIO : 0;
-    nop_flush_refused_ = false;
+    int refused = 0;
+    if constexpr (Build::kFaults) {
+      refused = hooks_.nop_flush_refused ? -EIO : 0;
+      hooks_.nop_flush_refused = false;
+    }
     // EAGAIN (no request memory), EBUSY and EINTR are transient: retry with a backoff for up to kNopRetryWindow, well
     // under fatal_wait, before refusing (a refusal fail-stops a fixed read mode).
     const auto give_up = std::chrono::steady_clock::now() + kNopRetryWindow;
@@ -592,14 +612,25 @@ class UringReader {
   uint64_t fixed_reads_ = 0, fixed_cuts_ = 0, fanout_sqes_ = 0, next_report_ = uint64_t{1} << 16;
   double register_ms_ = 0;
   uint64_t registrations_ = 0;  // register_resources() calls (registrations())
-  bool reset_fail_ = false;  // test only (set_ring_reset_fail)
-  bool nop_flush_refused_ = false;                  // test only (set_nop_flush_refused)
+  struct TestHooks {
+    bool reset_fail = false;         // set_ring_reset_fail
+    bool nop_flush_refused = false;  // set_nop_flush_refused
+  };
+  struct NoTestHooks {};
+  [[no_unique_address]] std::conditional_t<Build::kFaults, TestHooks, NoTestHooks> hooks_;  // InstrBuild only
   // A discarded SQE's user_data (drain retires it unread). Not ~0: that is liburing's LIBURING_UDATA_TIMEOUT, whose
   // CQEs its peek swallows on kernels without IORING_FEAT_EXT_ARG.
   static constexpr uint64_t kNopTag = ~uint64_t{0} - 1;
   static constexpr std::chrono::milliseconds kNopRetryWindow{2000};  // soft errors on the NOP submit, then refuse
 };
 
+using UringReader = BasicUringReader<ProdBuild>;
+using InstrUringReader = BasicUringReader<InstrBuild>;
 static_assert(AsyncFileReader<UringReader>);
+static_assert(AsyncFileReader<InstrUringReader>);
+template <class R>
+concept HasRingFaultHooks = requires(R& r) { r.set_nop_flush_refused(true); };
+static_assert(!HasRingFaultHooks<UringReader>, "the production reader has no fault hooks");
+static_assert(HasRingFaultHooks<InstrUringReader>);
 
 }  // namespace sglang::expert_stream

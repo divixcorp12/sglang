@@ -23,6 +23,12 @@ struct HostExports {
   using Tier = RamTier<Source>;
   using Thread = RamThread<Tier>;
 
+  // What the fault machinery compiles to in this build (plan Task 10): the instantiation files static_assert these,
+  // so a ProdBuild module that regained a fault entry, an SQE log or the ballast fails to compile.
+  static constexpr bool kReaderFaults = requires(Source& reader, const ReadFault& fault) { reader.set_fault(fault); };
+  static constexpr bool kSqeLog = requires(Source& reader) { reader.set_sqe_log(nullptr); };
+  static constexpr bool kBallast = requires(Tier& tier) { tier.copy_engine_ballast(0, 0, 0); };
+
   static std::vector<int64_t> slots_of(TensorView slots) {
     const auto* data = static_cast<const int64_t*>(slots.data_ptr());
     return std::vector<int64_t>(data, data + slots.size(0));
@@ -137,6 +143,19 @@ struct HostExports {
     return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
   }
 
+  // The fault words `f` for a read available in both builds (read_rows_traced, read_rows_pieces): installed on
+  // InstrBuild; on ProdBuild, which has no fault state, a tensor that injects one is refused (`what` names it) and an
+  // inert one (only the non-fault words: abandon_after, step, piece_stream, the chunk and cut caps) is accepted.
+  static void install_fault(Source& reader, const int64_t* f, const char* what) {
+    if constexpr (Build::kFaults) {
+      (void)what;
+      reader.set_fault(fault_from(f));
+    } else {
+      (void)reader;
+      if (injects_fault(f)) test_only(what);
+    }
+  }
+
   // Test only: expert_stream_read_rows with the reader's StageRecord copied to `record`
   // (stage_words() int64), with `ok` and `status` set from the result. `fault` is the faulted call's
   // tensor, laid out as expert_stream_read_rows_faulted's (kFaultWords words); an all-zero tensor injects nothing
@@ -182,7 +201,7 @@ struct HostExports {
     reader.set_fixed_chunk_cap(f[28]);
     reader.set_leg_cut_cap(f[31]);
     if (!reader.open()) return 0;
-    reader.set_fault(fault_from(f));
+    install_fault(reader, f, "a fault on read_rows_traced");
     StageRecord stage;
     const int result =
         reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
@@ -219,45 +238,49 @@ struct HostExports {
       TensorView then_slots,
       TensorView fault,
       TensorView results) {
-    using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
-    auto cpu = SymbolicDevice{};
-    verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
-    verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
-    verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
-    verify_named("then_experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_experts);
-    verify_named("then_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_slots);
-    verify_named("results", TensorMatcher({12}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), results);
-    auto* out = static_cast<int64_t*>(results.data_ptr());
-    check_fault_words<Layout>(fault);
-    const auto* f = static_cast<const int64_t*>(fault.data_ptr());
-    Source reader(
-        tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
-        direct != 0);
-    if (f[22] != 0) reader.set_piece_stream(true);
-    reader.set_fixed_chunk_cap(f[28]);
-    reader.set_leg_cut_cap(f[31]);
-    if (!reader.open()) {
-      std::fill(out, out + 12, 0);
-      return;
+    if constexpr (!Build::kFaults) {
+      test_only("read_rows_faulted");
+    } else {
+      using namespace host;
+      check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
+      auto cpu = SymbolicDevice{};
+      verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+      verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+      verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+      verify_named("then_experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_experts);
+      verify_named("then_slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), then_slots);
+      verify_named("results", TensorMatcher({12}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), results);
+      auto* out = static_cast<int64_t*>(results.data_ptr());
+      check_fault_words<Layout>(fault);
+      const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+      Source reader(
+          tables_from<Layout>(
+              extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
+          direct != 0);
+      if (f[22] != 0) reader.set_piece_stream(true);
+      reader.set_fixed_chunk_cap(f[28]);
+      reader.set_leg_cut_cap(f[31]);
+      if (!reader.open()) {
+        std::fill(out, out + 12, 0);
+        return;
+      }
+      reader.set_fault(fault_from(f));
+      const size_t step = f[18] > 0 ? static_cast<size_t>(f[18]) : static_cast<size_t>(kBounceRows);
+      out[0] = reader.read(row, ids_of(experts), slots_of(slots), step, abandon_after(f[17]));
+      out[2] = reader.cqes();
+      out[4] = reader.stale_cqes();
+      out[5] = reader.generation_wraps();
+      out[6] = 0;  // reserved: formerly the packing jobs still open (the packed path is gone)
+      out[7] = reader.pack_workers();
+      out[8] = reader.fixed_cuts();
+      out[9] = reader.fanout_sqes();
+      out[10] = reader.cut_reads();
+      out[11] = reader.gap_cuts();
+      reader.set_fault(ReadFault{});
+      if (then_experts.size(0) == 0) return;  // a test that only wants the first read's state
+      out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, abandon_after(0));
+      out[3] = reader.cqes();
     }
-    reader.set_fault(fault_from(f));
-    const size_t step = f[18] > 0 ? static_cast<size_t>(f[18]) : static_cast<size_t>(kBounceRows);
-    out[0] = reader.read(row, ids_of(experts), slots_of(slots), step, abandon_after(f[17]));
-    out[2] = reader.cqes();
-    out[4] = reader.stale_cqes();
-    out[5] = reader.generation_wraps();
-    out[6] = 0;  // reserved: formerly the packing jobs still open (the packed path is gone)
-    out[7] = reader.pack_workers();
-    out[8] = reader.fixed_cuts();
-    out[9] = reader.fanout_sqes();
-    out[10] = reader.cut_reads();
-    out[11] = reader.gap_cuts();
-    reader.set_fault(ReadFault{});
-    if (then_experts.size(0) == 0) return;  // a test that only wants the first read's state
-    out[1] = reader.read(row, ids_of(then_experts), slots_of(then_slots), kBounceRows, abandon_after(0));
-    out[3] = reader.cqes();
   }
 
   // Test only (U10): expert_stream_read_rows_traced's read, recording every SQE the reader prepared. `sqes` receives
@@ -285,55 +308,59 @@ struct HostExports {
       TensorView record,
       TensorView sqes,
       TensorView info) {
-    using namespace host;
-    check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
-    auto cpu = SymbolicDevice{};
-    verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
-    verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
-    verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
-    verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
-    verify_named("sqes", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), sqes);
-    verify_named("info", TensorMatcher({11}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
-    check_fault_words<Layout>(fault);
-    const auto* f = static_cast<const int64_t*>(fault.data_ptr());
-    auto* out = static_cast<int64_t*>(info.data_ptr());
-    std::fill(out, out + 7, 0);
-    Source reader(
-        tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
-        direct != 0);
-    if (f[22] != 0) reader.set_piece_stream(true);
-    reader.set_fixed_chunk_cap(f[28]);
-    reader.set_leg_cut_cap(f[31]);
-    if (!reader.open()) return;
-    reader.set_fault(fault_from(f));
-    std::vector<typename Source::SqeRecord> log;
-    reader.set_sqe_log(&log);
-    StageRecord stage;
-    const int result =
-        reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
-    stage.ok = result == 1 ? 1 : 0;
-    stage.status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
-    std::memcpy(record.data_ptr(), &stage, sizeof(stage));
-    auto* rows = static_cast<int64_t*>(sqes.data_ptr());
-    const size_t kept = std::min<size_t>(log.size(), static_cast<size_t>(sqes.size(0)));
-    for (size_t i = 0; i < kept; ++i) {
-      rows[4 * i] = log[i].file;
-      rows[4 * i + 1] = log[i].offset;
-      rows[4 * i + 2] = log[i].length;
-      rows[4 * i + 3] = log[i].bounce;
+    if constexpr (!Build::kFaults) {
+      test_only("read_rows_sqes");
+    } else {
+      using namespace host;
+      check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
+      auto cpu = SymbolicDevice{};
+      verify_named("fault", TensorMatcher({kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+      verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
+      verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
+      verify_named("record", TensorMatcher({stage_words()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), record);
+      verify_named("sqes", TensorMatcher({-1, 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), sqes);
+      verify_named("info", TensorMatcher({11}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), info);
+      check_fault_words<Layout>(fault);
+      const auto* f = static_cast<const int64_t*>(fault.data_ptr());
+      auto* out = static_cast<int64_t*>(info.data_ptr());
+      std::fill(out, out + 7, 0);
+      Source reader(
+          tables_from<Layout>(
+              extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
+          direct != 0);
+      if (f[22] != 0) reader.set_piece_stream(true);
+      reader.set_fixed_chunk_cap(f[28]);
+      reader.set_leg_cut_cap(f[31]);
+      if (!reader.open()) return;
+      reader.set_fault(fault_from(f));
+      std::vector<typename Source::SqeRecord> log;
+      reader.set_sqe_log(&log);
+      StageRecord stage;
+      const int result =
+          reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), abandon_after(f[17]), &stage);
+      stage.ok = result == 1 ? 1 : 0;
+      stage.status = result == 1 ? kStatusServed : result == 0 ? kStatusFailed : kStatusCancelled;
+      std::memcpy(record.data_ptr(), &stage, sizeof(stage));
+      auto* rows = static_cast<int64_t*>(sqes.data_ptr());
+      const size_t kept = std::min<size_t>(log.size(), static_cast<size_t>(sqes.size(0)));
+      for (size_t i = 0; i < kept; ++i) {
+        rows[4 * i] = log[i].file;
+        rows[4 * i + 1] = log[i].offset;
+        rows[4 * i + 2] = log[i].length;
+        rows[4 * i + 3] = log[i].bounce;
+      }
+      out[0] = result;
+      out[1] = static_cast<int64_t>(log.size());
+      out[2] = static_cast<int64_t>(reader.descriptors());
+      out[3] = reader.credit();
+      out[4] = reader.cqes();
+      out[5] = reader.fixed_cuts();
+      out[6] = reader.fanout_sqes();
+      out[7] = reader.cut_reads();
+      out[8] = reader.gap_cuts();
+      out[9] = reader.min_cut_bytes();
+      out[10] = reader.leg_stride();
     }
-    out[0] = result;
-    out[1] = static_cast<int64_t>(log.size());
-    out[2] = static_cast<int64_t>(reader.descriptors());
-    out[3] = reader.credit();
-    out[4] = reader.cqes();
-    out[5] = reader.fixed_cuts();
-    out[6] = reader.fanout_sqes();
-    out[7] = reader.cut_reads();
-    out[8] = reader.gap_cuts();
-    out[9] = reader.min_cut_bytes();
-    out[10] = reader.leg_stride();
   }
 
   // Test only (U8): the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
@@ -411,7 +438,7 @@ struct HostExports {
     reader.set_fixed_chunk_cap(f[28]);
     reader.set_leg_cut_cap(f[31]);
     if (!reader.open()) return;
-    reader.set_fault(fault_from(f));
+    install_fault(reader, f, "a fault on read_rows_pieces");
 
     // The checker: the pieces' runs per row, then poll until the read returns, and once more after.
     const bool checking = reference.numel() > 0;
@@ -748,7 +775,11 @@ struct HostExports {
   }
 
   static void inject_lease(int64_t handle, int64_t row, int64_t slot, int64_t delta) {
-    find(handle)->inject_lease(row, slot, delta);
+    if constexpr (!Build::kFaults) {
+      test_only("inject_lease");
+    } else {
+      find(handle)->inject_lease(row, slot, delta);
+    }
   }
 
   // out: free, evictable, leased.
@@ -847,12 +878,20 @@ struct HostExports {
   }
 
   static void copy_engine_fail(int64_t handle, int64_t issue, int64_t query) {
-    find(handle)->host_copy_backend().fail(issue != 0, query != 0);
+    if constexpr (!Build::kFaults) {
+      test_only("copy_engine_fail");
+    } else {
+      find(handle)->host_copy_backend().fail(issue != 0, query != 0);
+    }
   }
 
   // Test only: delay every copy job's completion by one extra copy of `bytes` from `src` to `dst` (0 bytes: off).
   static void copy_engine_ballast(int64_t handle, int64_t dst, int64_t src, int64_t bytes) {
-    find(handle)->copy_engine_ballast(static_cast<uint64_t>(dst), static_cast<uint64_t>(src), bytes);
+    if constexpr (!Build::kFaults) {
+      test_only("copy_engine_ballast");
+    } else {
+      find(handle)->copy_engine_ballast(static_cast<uint64_t>(dst), static_cast<uint64_t>(src), bytes);
+    }
   }
 
   static int64_t copy_engine_marked(int64_t handle) {
@@ -860,7 +899,11 @@ struct HostExports {
   }
 
   static void inject_done_stall(int64_t handle, int64_t ns) {
-    find(handle)->inject_done_stall(ns);
+    if constexpr (!Build::kFaults) {
+      test_only("inject_done_stall");
+    } else {
+      find(handle)->inject_done_stall(ns);
+    }
   }
 
   static void mapping(int64_t handle, int64_t row, TensorView out) {
@@ -904,19 +947,28 @@ struct HostExports {
     find(handle)->set_hot(row, static_cast<const int64_t*>(experts.data_ptr()), experts.size(0));
   }
 
+  // Test only (RamTier::inject): InstrBuild only.
   static void
   inject(int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
-    find(handle)->inject(delay_ns, fail_reads != 0, after_demands, abandon_after_batches);
+    if constexpr (!Build::kFaults) {
+      test_only("inject");
+    } else {
+      find(handle)->inject(delay_ns, fail_reads != 0, after_demands, abandon_after_batches);
+    }
   }
 
   // Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
   static void inject_fault(int64_t handle, TensorView fault) {
-    using namespace host;
-    auto cpu = SymbolicDevice{};
-    expert_stream::verify_named(
-        "fault", TensorMatcher({expert_stream::kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
-    expert_stream::check_fault_words<Layout>(fault);
-    find(handle)->inject_fault(static_cast<const int64_t*>(fault.data_ptr()));
+    if constexpr (!Build::kFaults) {
+      test_only("inject_fault");
+    } else {
+      using namespace host;
+      auto cpu = SymbolicDevice{};
+      expert_stream::verify_named(
+          "fault", TensorMatcher({expert_stream::kFaultWords}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), fault);
+      expert_stream::check_fault_words<Layout>(fault);
+      find(handle)->inject_fault(static_cast<const int64_t*>(fault.data_ptr()));
+    }
   }
 
   static void counters(int64_t handle, TensorView out) {
@@ -968,8 +1020,13 @@ struct HostExports {
     return find(handle)->drain_trace(static_cast<expert_stream::StageRecord*>(out.data_ptr()), out.size(0));
   }
 
+  // Test only: InstrBuild only (ProdBuild has no trace, so nothing to count).
   static int64_t trace_clock_reads() {
-    return expert_stream::traced_clock_reads().load(std::memory_order_relaxed);
+    if constexpr (!Build::kFaults) {
+      test_only("trace_clock_reads");
+    } else {
+      return expert_stream::traced_clock_reads().load(std::memory_order_relaxed);
+    }
   }
 
   static int64_t trace_dropped(int64_t handle) {
@@ -1052,54 +1109,58 @@ struct HostExports {
   // order (seq = 0, fence, payload, fence, a new seq) while this thread reads it with
   // read_record. out = {records accepted, accepted records whose payload is not their seq's}.
   static void seqlock_stress(int64_t duration_ns, TensorView out) {
-    {
-      using namespace host;
-      auto cpu = SymbolicDevice{};
-      expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    }
-    alignas(64) uint8_t record[kRecordBytes] = {};
-    std::atomic<bool> done{false};
-    const auto expected_ids = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
-    std::thread writer([&] {
-      for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
-        const uint16_t row = static_cast<uint16_t>(round), count = expected_ids(round);
-        const int32_t id = static_cast<int32_t>(round);
-        store_release(record + kRecSeq, 0u);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        std::memset(record + 4, 0, kRecordBytes - 4);
-        std::memcpy(record + kRecRow, &row, 2);
-        std::memcpy(record + kRecNeedCount, &count, 2);
-        std::memcpy(record + kRecProtectCount, &count, 2);
-        std::memcpy(record + kRecAfter, &round, 4);
-        for (int i = 0; i < count; ++i) {
-          std::memcpy(record + kRecNeed + 4 * i, &id, 4);
-          std::memcpy(record + kRecProtect + 4 * i, &id, 4);
-        }
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
+    if constexpr (!Build::kFaults) {
+      test_only("seqlock_stress");
+    } else {
+      {
+        using namespace host;
+        auto cpu = SymbolicDevice{};
+        expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
       }
-    });
-    int64_t accepted = 0, torn = 0;
-    const int64_t deadline = now_ns() + duration_ns;
-    while (now_ns() < deadline) {
-      const uint32_t seq = load_acquire(record + kRecSeq);
-      Request request;
-      if (seq == 0 || !read_record(record, seq, &request)) continue;
-      ++accepted;
-      const uint32_t round = (seq - 1u) / kDemandRecords;
-      bool whole = request.after == round && request.row == static_cast<uint16_t>(round) &&
-                   request.need.size() == expected_ids(round) && request.protect.size() == expected_ids(round);
-      for (int32_t id : request.need)
-        whole = whole && id == static_cast<int32_t>(round);
-      for (int32_t id : request.protect)
-        whole = whole && id == static_cast<int32_t>(round);
-      if (!whole) ++torn;
+      alignas(64) uint8_t record[kRecordBytes] = {};
+      std::atomic<bool> done{false};
+      const auto expected_ids = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
+      std::thread writer([&] {
+        for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
+          const uint16_t row = static_cast<uint16_t>(round), count = expected_ids(round);
+          const int32_t id = static_cast<int32_t>(round);
+          store_release(record + kRecSeq, 0u);
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          std::memset(record + 4, 0, kRecordBytes - 4);
+          std::memcpy(record + kRecRow, &row, 2);
+          std::memcpy(record + kRecNeedCount, &count, 2);
+          std::memcpy(record + kRecProtectCount, &count, 2);
+          std::memcpy(record + kRecAfter, &round, 4);
+          for (int i = 0; i < count; ++i) {
+            std::memcpy(record + kRecNeed + 4 * i, &id, 4);
+            std::memcpy(record + kRecProtect + 4 * i, &id, 4);
+          }
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
+        }
+      });
+      int64_t accepted = 0, torn = 0;
+      const int64_t deadline = now_ns() + duration_ns;
+      while (now_ns() < deadline) {
+        const uint32_t seq = load_acquire(record + kRecSeq);
+        Request request;
+        if (seq == 0 || !read_record(record, seq, &request)) continue;
+        ++accepted;
+        const uint32_t round = (seq - 1u) / kDemandRecords;
+        bool whole = request.after == round && request.row == static_cast<uint16_t>(round) &&
+                     request.need.size() == expected_ids(round) && request.protect.size() == expected_ids(round);
+        for (int32_t id : request.need)
+          whole = whole && id == static_cast<int32_t>(round);
+        for (int32_t id : request.protect)
+          whole = whole && id == static_cast<int32_t>(round);
+        if (!whole) ++torn;
+      }
+      done.store(true);
+      writer.join();
+      auto* result = static_cast<int64_t*>(out.data_ptr());
+      result[0] = accepted;
+      result[1] = torn;
     }
-    done.store(true);
-    writer.join();
-    auto* result = static_cast<int64_t*>(out.data_ptr());
-    result[0] = accepted;
-    result[1] = torn;
   }
 
   static void start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns) {

@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 
@@ -24,6 +26,12 @@ struct InstrBuild {
 
 template <class B>
 concept BuildPolicy = std::is_same_v<B, ProdBuild> || std::is_same_v<B, InstrBuild>;
+
+// The refusal of a test-only entry point (fault injection, SQE logs, stress harnesses) on ProdBuild, which compiles
+// none of their machinery (plan Task 10). One message, so Python and C++ refusals read alike.
+[[noreturn]] inline void test_only(const char* name) {
+  throw std::runtime_error(std::string(name) + " is test-only: it exists in the instrumented host build");
+}
 
 // Counters with one writer each (the thread that owns the instance): add() is a relaxed load and a relaxed store of
 // the sum, which on x86 is a plain add with no lock prefix and no fence. Readers on other threads load relaxed; a

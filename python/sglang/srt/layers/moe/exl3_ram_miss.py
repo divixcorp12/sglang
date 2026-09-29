@@ -703,11 +703,17 @@ class Exl3RamMissService:
         hot_page = new_hot_page(tables.starts.shape[1], pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
+        # The build is chosen once, here (spec D3): the instrumented one whenever this service will enable the stage
+        # trace or inject the test fault, whichever way they were switched on (the cached trace object or the config,
+        # not only their env vars), so it never loads production and then calls an entry point production refuses.
+        fault = parse_fault(cfg.ram_miss_fault)
+        instrumented = get_exl3_stream_trace().enabled or fault is not None
         host = ExpertStreamHost(
             tables,
             page=page,
             slot_map=slot_map,
             hot_page=hot_page,
+            variant="instr" if instrumented else None,
         )
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
@@ -764,7 +770,6 @@ class Exl3RamMissService:
                         "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
                     )
             host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
-            fault = parse_fault(cfg.ram_miss_fault)
             if fault is not None:
                 demands, seconds = fault
                 host.inject(delay_s=seconds, delay_after_demands=demands)

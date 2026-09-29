@@ -10,7 +10,7 @@
 
 namespace sglang {
 
-using TwoNameReader = expert_stream::FaultyReader<expert_stream::UringReader>;
+using TwoNameReader = expert_stream::FaultyReader<expert_stream::InstrUringReader>;
 using TwoNameHostExports =
     expert_stream::HostExports<expert_stream::testing::TwoNameLayout,
                                TwoNameReader, expert_stream::InstrBuild>;

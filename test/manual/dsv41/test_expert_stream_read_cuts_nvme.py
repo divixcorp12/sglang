@@ -69,7 +69,7 @@ lengths, ok, info = [], True, {}
 try:
     for _ in range(20):
         result, log, info, _ = read_rows_sqes(s.tables, 1, list(range(8)), list(range(8)),
-                                              max_sqes=65536, leg_cut_cap=cap)
+                                              max_sqes=65536, leg_cut_cap=cap, variant="instr")
         ok = ok and result == 1
         lengths += [n for _, _, n, _ in log]
 finally:

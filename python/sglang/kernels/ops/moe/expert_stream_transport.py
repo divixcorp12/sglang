@@ -66,6 +66,30 @@ def host_variant() -> str:
     return "prod"
 
 
+# The test-only entry points (plan 2026-09-29-hotpath-zero-overhead Task 10): each exists only in the instrumented
+# build, so on production both its Python wrapper (before building any tensor) and its C++ export raise
+# RuntimeError("<name> is test-only: it exists in the instrumented host build"). The stage trace (enable_trace,
+# drain_trace, trace_dropped) refuses on production too, from C++, naming the same build. For documentation.
+TEST_ONLY_EXPORTS: tuple[str, ...] = (
+    "read_rows_faulted",
+    "read_rows_sqes",
+    "inject",
+    "inject_fault",
+    "inject_done_stall",
+    "inject_lease",
+    "copy_engine_fail",
+    "copy_engine_ballast",
+    "seqlock_stress",
+    "trace_clock_reads",
+)
+
+
+def _refuse_test_only(name: str, variant: Optional[str]) -> None:
+    """Raise, as the C++ export would, when ``name`` (a ``TEST_ONLY_EXPORTS`` entry) is called on production."""
+    if (host_variant() if variant is None else variant) == "prod":
+        raise RuntimeError(f"{name} is test-only: it exists in the instrumented host build")
+
+
 # cache_once keys f(), f("exl3") and f(layout="exl3") apart; each cached loader below is called only positionally,
 # through a wrapper, so a layout and variant have exactly one module whatever the call form.
 def _host_module(layout: str = "exl3", variant: Optional[str] = None) -> Module:
@@ -267,7 +291,12 @@ def read_rows_traced(
     core before open(). Production is untouched: nothing wires this argument to the real service.
 
     The result is 1 (every row landed), 0 (failed) or -1 (abandoned: ``abandon_after`` batches were
-    admitted, the rows admitted were still read and packed, the rest never read)."""
+    admitted, the rows admitted were still read and packed, the rest never read).
+
+    Available in both builds. On production (``variant="prod"``) the record's stages stay 0 (it has no trace; only
+    ``ok`` and ``status`` are set), and a fault argument that injects a fault is refused with a RuntimeError naming the
+    instrumented build (``piece_stream``, ``abandon_after``, ``step``, ``fixed_chunk_cap`` and ``leg_cut_cap`` are not
+    faults and work in both)."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
     record = torch.zeros(_stage_words(layout, variant), dtype=torch.int64)
@@ -343,7 +372,10 @@ def read_rows_with_fault(
     ``fixed_cuts`` (reads fanned out to more than one leg) and
     ``fanout_sqes`` (their SQEs), ``cut_reads`` (reads cut into more than one device-sized run) and ``gap_cuts`` (runs
     a boundary gap opened).
+
+    Instrumented build only (``TEST_ONLY_EXPORTS``): production raises before building anything.
     """
+    _refuse_test_only("read_rows_faulted", variant)
     first = _checked_rows(tables, row, experts, slots)
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
@@ -378,7 +410,9 @@ def read_rows_sqes(
     ``(file, offset, length, bounce_offset)``, and ``info``: ``sqes`` (the count), ``descriptors``, ``credit``
     (the ring's), ``cqes``, ``fixed_cuts`` (reads fanned out to more than one leg), ``fanout_sqes`` (their SQEs,
     first attempts), ``cut_reads``, ``gap_cuts``, ``min_cut_bytes`` (the smallest cut in force, 0: cuts off) and
-    ``leg_stride`` (the legs a read may have). Faults and ``piece_stream`` as ``read_rows_with_fault``."""
+    ``leg_stride`` (the legs a read may have). Faults and ``piece_stream`` as ``read_rows_with_fault``. Instrumented
+    build only (``TEST_ONLY_EXPORTS``)."""
+    _refuse_test_only("read_rows_sqes", variant)
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
     record = torch.zeros(_stage_words(layout, variant), dtype=torch.int64)
@@ -437,7 +471,10 @@ def read_rows_pieces(
     checks, while the read runs, the destination bytes behind every bit it sees set on each row's first word.
     Returns the result, the stage record, ``masks`` and ``info``: ``refused`` (the reader's refused publishes),
     ``checked`` / ``differed`` (pieces the checker compared, and those whose bytes were not the reference's) and
-    ``early`` (bits it saw before the read returned)."""
+    ``early`` (bits it saw before the read returned).
+
+    Available in both builds, as ``read_rows_traced``: on production the record's stages stay 0, ``refused`` is 0
+    (a metric), and a fault argument that injects a fault is refused."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     if masks is None:
         masks = torch.full((len(expert_ids), 1), piece_word(generation), dtype=torch.int64)
@@ -792,7 +829,8 @@ def sim_wait(page, seq: int, timeout_s: float, *, layout: str = "exl3", variant:
 
 
 def seqlock_stress(seconds: float, *, layout: str = "exl3", variant: Optional[str] = None) -> tuple[int, int]:
-    """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted)."""
+    """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted). Instrumented build only."""
+    _refuse_test_only("seqlock_stress", variant)
     out = torch.zeros(2, dtype=torch.int64)
     _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
     return int(out[0]), int(out[1])
@@ -1013,7 +1051,9 @@ class ExpertStreamHost:
         }
 
     def inject_lease(self, row: int, slot: int, delta: int) -> None:
-        """Test only: stand in for a GPU reader's lease (the service grants its own from step 3)."""
+        """Test only: stand in for a GPU reader's lease (the service grants its own from step 3). Instrumented build
+        only."""
+        _refuse_test_only("inject_lease", self.variant)
         self._check(row, slot=slot)
         self._module.expert_stream_inject_lease(self.handle, row, slot, delta)
 
@@ -1101,12 +1141,15 @@ class ExpertStreamHost:
         self._module.expert_stream_copy_engine_release(self.handle, int(marks))
 
     def copy_engine_fail(self, *, issue: bool = False, query: bool = False) -> None:
-        """Test only (CPU backend): make issuing a copy, or asking whether a mark completed, return an error."""
+        """Test only (CPU backend): make issuing a copy, or asking whether a mark completed, return an error.
+        Instrumented build only."""
+        _refuse_test_only("copy_engine_fail", self.variant)
         self._module.expert_stream_copy_engine_fail(self.handle, int(issue), int(query))
 
     def copy_engine_ballast(self, dst: Optional[torch.Tensor], src: Optional[torch.Tensor]) -> None:
         """Test only: copy ``src`` into ``dst`` (same byte size) ahead of every copy job, delaying its completion;
-        ``None`` turns it off. The caller keeps both tensors alive while it is on."""
+        ``None`` turns it off. The caller keeps both tensors alive while it is on. Instrumented build only."""
+        _refuse_test_only("copy_engine_ballast", self.variant)
         if dst is None or src is None:
             self._module.expert_stream_copy_engine_ballast(self.handle, 0, 0, 0)
             return
@@ -1120,7 +1163,8 @@ class ExpertStreamHost:
         return int(self._module.expert_stream_copy_engine_marked(self.handle))
 
     def inject_done_stall(self, seconds: float) -> None:
-        """Test only: sleep between serving a demand and storing demand_done."""
+        """Test only: sleep between serving a demand and storing demand_done. Instrumented build only."""
+        _refuse_test_only("inject_done_stall", self.variant)
         self._module.expert_stream_inject_done_stall(self.handle, int(seconds * 1e9))
 
     def lease_header(self) -> dict[str, int]:
@@ -1175,7 +1219,9 @@ class ExpertStreamHost:
         abandon_after_batches: int = 0,
     ) -> None:
         """Test-only faults (see RamTier::inject). ``abandon_after_batches``: an advisory gives up once
-        that many of its rows (batches) were admitted; the rows admitted still complete and publish."""
+        that many of its rows (batches) were admitted; the rows admitted still complete and publish. Instrumented
+        build only."""
+        _refuse_test_only("inject", self.variant)
         self._module.expert_stream_inject(
             self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands, abandon_after_batches
         )
@@ -1199,7 +1245,9 @@ class ExpertStreamHost:
         the fault acts on rows that already packed. It is installed before the next read, stays until
         replaced, and ``inject_fault()`` with no keywords clears it. ``abandon_after`` and ``step``
         are not faults and are ignored (``inject`` takes the abandon
-        point). Call-numbered faults (``submit_call``, ``cqe_call``) count from the reader's creation."""
+        point). Call-numbered faults (``submit_call``, ``cqe_call``) count from the reader's creation. Instrumented
+        build only: production refuses rather than store a fault it has no code to apply."""
+        _refuse_test_only("inject_fault", self.variant)
         self._module.expert_stream_inject_fault(self.handle, _fault_tensor(**faults))
 
     def enable_trace(self, capacity: int = 8192) -> None:
@@ -1223,7 +1271,8 @@ class ExpertStreamHost:
 
     def trace_clock_reads(self) -> int:
         """Clock reads taken for trace records, process-wide and cumulative: zero growth while the
-        trace is off is what shows a disabled trace does no timing work."""
+        trace is off is what shows a disabled trace does no timing work. Instrumented build only."""
+        _refuse_test_only("trace_clock_reads", self.variant)
         return int(self._module.expert_stream_trace_clock_reads())
 
     def counters(self) -> dict[str, int]:
