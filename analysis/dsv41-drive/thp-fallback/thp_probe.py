@@ -113,6 +113,7 @@ def plan(regions) -> list[tuple[int, int]]:
 
 def chunk_model(chunks, present) -> list[dict]:
     """Per chunk: pages, THP folios, coalescible, bvecs and predicted headpage_already_acct visits."""
+    present = sorted(present)  # owners are mapped top-down, so their scans do not come in address order
     huge_ranges = [(lo, hi) for lo, hi, h in present if h]
     small = [(lo, hi) for lo, hi, h in present if not h]
     import bisect
