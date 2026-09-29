@@ -201,6 +201,20 @@ def test_a_failed_read_publishes_only_whole_exact_pieces(tmp_path, fault):
     assert info["differed"] == 0 and info["checked"] == published == record["pieces_published"]
 
 
+def test_a_stale_completion_is_caught_in_rows_mode_and_the_next_read_lands_exact(tmp_path):
+    """FAILURES' stale_cqe_call case runs in pieces mode and asserts only what was published. Here, in rows mode, the
+    redelivered completion of a recycled descriptor must be counted as stale (it was really injected and caught), fail
+    the read, and leave the reader able to land a clean read exactly."""
+    s = ram_miss_setup(tmp_path, capacity=32, experts=16, mirror_weights=(1.0, 1.0))
+    stats = {}
+    results = ops.read_rows_with_fault(
+        s.tables, 1, list(range(16)), list(range(16)), [3, 4, 5], [16, 17, 18], stale_cqe_call=1, step=4, stats=stats,
+    )
+    assert results == (0, 1), (results, stats)
+    assert stats["stale_cqes"] == 1, stats
+    split._assert_rows(s, 1, [3, 4, 5], [16, 17, 18])
+
+
 # ---- Refusals ----
 
 
@@ -210,6 +224,14 @@ def test_the_reader_refuses_shard_tables(tmp_path):
     s = ram_miss_setup(tmp_path)
     with pytest.raises((ValueError, RuntimeError), match="row image"):
         exl3_ram_miss_tables(s.layout, s.fmt.segment_map(), s.slabs)  # no row_images: shard tables
+
+
+def test_the_cpp_reader_refuses_tables_not_marked_row_images(tmp_path):
+    """The Python refusal above is not the only guard: tables that reach C++ without the row-image flag (a caller that
+    builds its own) are refused by RowReader's constructor, naming the converter, before any read."""
+    s = ram_miss_setup(tmp_path)
+    with pytest.raises(Exception, match="row image tables only"):
+        read_rows_traced(_tables_with(s, row_images=False), 0, [1], [0])
 
 
 def test_the_reader_refuses_buffered_reads_of_row_images(tmp_path):

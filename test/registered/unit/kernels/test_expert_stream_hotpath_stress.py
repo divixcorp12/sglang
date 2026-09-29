@@ -64,6 +64,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
     s, page, host, sim, dst = hp.build_host(tmp_path, variant=variant)
     host.start_thread(fatal_wait_s=60.0, spin_us=2000)
     stop, quiet, idle = threading.Event(), threading.Event(), threading.Event()
+    device_gone = threading.Event()  # set once the device thread has left: the releaser outlives its last wait
     stats = {
         "armed": 0, "copy_posts": 0, "terminals": 0, "timeouts": 0, "failed": 0,
         "lanes_ready": 0, "lanes_loading": 0, "lanes_copying": 0,
@@ -112,13 +113,16 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
                 sim.deliver()
         finally:
             idle.set()  # a device that left (stop, or an error) is quiet: a pauser waiting on it must not time out
+            device_gone.set()
 
     def releaser():
         # HostCopyBackend::release(n) adds n marks of credit and release(-1) is sticky ("every mark, from now on"), so
         # each tick releases one mark, and only while a mark is outstanding (marked > released): copies complete one
         # by one, at the releaser's pace, instead of all of them from the first tick on. -1 is kept for the final drain.
+        # It runs until the device has left, not until stop: the device's request in flight at stop may be deferred on
+        # a COPYING lease that only a released mark retires, and stopping first deadlocks it until sim_wait times out.
         rng = random.Random(seed + 3)
-        while not stop.is_set():
+        while not device_gone.is_set():
             if host.copy_engine_marked() > stats["releases"]:
                 host.copy_engine_release(1)
                 stats["releases"] += 1

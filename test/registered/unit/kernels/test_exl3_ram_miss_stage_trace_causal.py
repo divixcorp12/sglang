@@ -6,6 +6,7 @@ Ordering only: nothing here asserts a wall-time bound.
 import collections
 import errno
 import faulthandler
+import re
 
 import pytest
 import torch
@@ -214,10 +215,12 @@ def test_an_enabled_trace_reads_the_clock_at_every_stamp(tmp_path):
         host.stop()
 
 
-# Every clock read in the file that is not a trace stamp. A new one fails this test until it is either
-# routed through stamp() (so the disabled trace skips it) or added here as a deliberate non-trace read.
+# Every clock read in the file that is not a trace stamp: now_ns(), and any direct libc or std::chrono clock read
+# (CLOCK_READ below). A new one fails this test until it is either routed through stamp() (so the disabled trace
+# skips it) or added here as a deliberate non-trace read.
 NON_TRACE_CLOCK_READS = {
     "inline int64_t now_ns() {": 1,  # the clock itself
+    "clock_gettime(CLOCK_MONOTONIC, &ts);": 1,  # now_ns()'s body
     "return now_ns();": 1,  # stamp() itself
     # Deadlines of callers that wait, never the service or copy thread serving a request: RamThread::pause() (and its
     # copy-idle wait), fill_wait (the third "deadline" line and the "return -1" line), and the test exports sim_wait
@@ -253,7 +256,15 @@ NON_TRACE_CLOCK_READS = {
     # before the clock read otherwise.
     "c.hold_until = now_ns() + faults_.fault.hold_until_probe_ms * 1000000;": 1,
     "if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;": 1,
+    # UringReader, std::chrono directly. register_resources(): the buffer registration's duration (register_ms), at
+    # open and at a ring reset, never per read.
+    "const auto t0 = std::chrono::steady_clock::now();": 1,
+    "register_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();": 1,
+    # flush_as_nops(): the NOP drain's soft-error retry window, reached only when a read failed with SQEs unconsumed.
+    "const auto give_up = std::chrono::steady_clock::now() + kNopRetryWindow;": 1,
+    "if (!soft_error(rc) || std::chrono::steady_clock::now() >= give_up) {": 1,
 }
+CLOCK_READ = re.compile(r"\bnow_ns\(\)|\b(?:steady|system|high_resolution)_clock::now\b|\bclock_gettime\s*\(")
 
 
 def test_no_ungated_clock_read_remains_on_the_request_path():
@@ -265,7 +276,7 @@ def test_no_ungated_clock_read_remains_on_the_request_path():
 
 def test_no_clock_read_bypasses_the_trace_gate():
     lines = [line.strip() for line in joined_text(host_sources()).splitlines()]
-    reads = collections.Counter(line for line in lines if "now_ns()" in line and not line.startswith("//"))
+    reads = collections.Counter(line for line in lines if CLOCK_READ.search(line) and not line.startswith("//"))
     assert reads == NON_TRACE_CLOCK_READS, {
         line: count for line, count in (reads - collections.Counter(NON_TRACE_CLOCK_READS)).items()
     }
