@@ -281,3 +281,120 @@ for i in $(seq 1 10); do taskset -c 0-63 /data/models/slang/.venv/bin/python -m 
 
 Commit `analysis(hotpath): suites, GPU tests and hot-path counts at the branch head`, both trailers, pushed with
 `git push origin cc/hotpath-zero-overhead`.
+
+## 8. Decode arms A (master) / B (branch) / A2 (master), and C (branch under the counting shim)
+
+Date: 2026-09-29, 08:14-08:31 local. Driver `analysis/dsv41-drive/hotpath/drive_hotpath_arms.sh` at `0c50b9241c`, report
+`hotpath_report.py`. Out dir `divix01:/mnt/nvme1/dsv41-hotpath/20260929-081400/` (`arms-report.json`,
+driver log `/mnt/nvme1/dsv41-hotpath/driver-20260929-081400.log`).
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath && nohup bash analysis/dsv41-drive/hotpath/drive_hotpath_arms.sh \
+  /data/models/slang/nvfp4-work/wt-hotpath-master 65754399e394cc6f9a3529ba02b33e3af40f9555 \
+  /data/models/slang/nvfp4-work/wt-hotpath $(git rev-parse HEAD) /mnt/nvme1/dsv41-hotpath/$TS 30031 \
+  > /mnt/nvme1/dsv41-hotpath/driver-$TS.log 2>&1 &'      # TS=20260929-081400, HEAD=0c50b9241c
+```
+
+- **Trees.** A and A2: master `65754399e3` (the master this branch merged; python tree `83e046cc87`, registered
+  `hotpath-base`) in the private worktree `wt-hotpath-master`. B and C: the branch at `0c50b9241c` (python tree
+  `ee964852b2`, registered `hotpath-zero-overhead`) in `wt-hotpath`. Every arm ran the branch's `run_arm.sh`,
+  `arm_env` and `generations.json`. `check_worktree` passed for both (at the commit, clean, `sglang.__file__` under
+  each tree's own `python/`).
+- **EXL3 gate.** Before every arm the driver resolved the launch's expert-stream requirements with that arm's own
+  `python/` tree: `EXL3` for all four (not the silent NVFP4 fallback).
+- **Tier: full, `0:61440,1:40960` / `102400`.** Before A: node 0 MemFree 77986 + page cache 9550 = 87536 MiB against
+  80896 needed; node 1 52305 + 32380 = 84685 MiB against 55056. Re-checked before B, A2 and C at the same values; all
+  passed. The full tier equals `base_env`'s, so it is no diff below.
+- **Effective env against the branch's `base_env`** (`<arm>-env-diff.json`):
+  - A, A2: `SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES=1`, `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES=1`,
+    `SGLANG_DSV41_RAM_MISS_PACK_WORKERS=8` (master's recipe; the branch's `arm_env` no longer sets them);
+  - B: none;
+  - C: `LD_PRELOAD=<out>/hotpath_shim.so` (built from the branch's `hotpath_shim.c`),
+    `HOTPATH_SHIM_OUT=<out>/C-shim.json`.
+  `run_arm.sh` verified each set against the live server's `/proc/<pid>/environ` (51 vars for A).
+- **Build check** (the "exl3 RAM miss thread started" line once "fired up"): A and A2 end in `copy engine on` with no
+  build field; B and C end in `copy engine on, build prod`.
+- `perf_event_paranoid` = 2. No lock waits: every arm started at its first attempt.
+
+### 8a. Decode
+
+| Arm | pooled ms/token | session CDW / ETR | median TTFT s | Δ vs mean(A, A2) | identical to A | served | rows_read | read_errors |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| A | 100.52 | 123.95 / 98.84 | 7.96 | +0.21 | (reference) | 2907 | 4082 | 0 |
+| B | **99.99** | 123.64 / 98.30 | 7.97 | **-0.32** | **yes (2/2 turns)** | 2953 | 4169 | 0 |
+| A2 | 100.10 | 123.73 / 98.41 | 7.96 | -0.21 | yes | 2922 | 4124 | 0 |
+| C (untimed) | 100.47 | 123.89 / 98.80 | 8.01 | (excluded) | yes | 2995 | 4234 | 0 |
+
+90 decode tokens per arm (the harness's 2-session timed set). SM clock over every timed window: 2940-2970 MHz, median
+2951-2962. `served`/`rows_read` are the server's lifetime counters (warm-up, prefill and the timed set).
+
+- baseline mean(A, A2) = 100.31 ms/token; drift A2 - A = -0.42; allowance max(1.5, 0.42) = 1.5; limit 101.81.
+- **B = 99.99 <= 101.81: B is not slower.** Byte identity holds for B, A2 and C against A. `read_errors` = 0 everywhere.
+
+### 8b. The service thread's CPU and counters
+
+CPU seconds from `thread_sampler.report` over the timed window (~26.6 s). perf stat on the `exl3-ram-miss` thread from
+"fired up" to the arm's end, divided by the lifetime `served` (so slightly over-estimated, identically per arm).
+
+| Arm | ram-miss CPU s (timed) | cycles:u / req | instructions:u / req | voluntary switches / req | involuntary / req | migrations / req |
+|---|---:|---:|---:|---:|---:|---:|
+| A | 7.99 | 34.3 M | 41.5 M | 200.0 | 0.034 | 0.312 |
+| B | 7.70 | 33.7 M | **33.5 M** | 198.3 | 0.021 | 0.353 |
+| A2 | 7.89 | 33.5 M | 40.0 M | 199.3 | 0.020 | 0.352 |
+| C | 6.63 | 33.6 M | 33.3 M | 195.2 | 0.021 | 0.386 |
+
+- **perf's `context-switches` and `cpu-migrations` read 0 in every arm, and that 0 means nothing.** Under
+  `perf_event_paranoid` 2 perf adds `:u` to software events, which then never count (checked on divix01 before the
+  run: a thread that slept ~27k times in 3 s read 0 and 0). The switch and migration columns above come from
+  `/proc/<pid>/task/<tid>/status` and `sched`, sampled every ~5 s by the driver (`<arm>-sched.jsonl`).
+- The thread's cycles are its idle loop, not its requests: it spins `spin_us`, then sleeps 50 µs (spec L12), so
+  cycles/request is the same in all arms and ~200 voluntary switches/request are idle sleeps. Instructions differ:
+  B retires **~17-19% fewer instructions per served request** than A/A2 (33.5 M against 41.5 M / 40.0 M) over the same
+  cycles.
+
+### 8c. C: whole-run shim counts of the production server
+
+The shim is armed at load, so it counts each tracked thread from the moment it names itself until process exit,
+including thread start-up and teardown. One dump (the scheduler, pid 1067138); both threads recognized once.
+
+| thread | malloc | free | mutex | cond | clock | sleep | futex |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| service (`exl3-ram-miss`) | **1** | **1** | 0 | 0 | 0 | 854,870 | 8 |
+| copy (`exl3-copy-eng`) | **72** | **72** | **90,035,468** | **1** | 0 | 0 | 9,395 |
+
+**The zero rule is not met as a whole-run count: this is an open finding, not a pass.**
+
+To separate thread lifecycle from serving, the same shim mode was run on the branch's production host with no requests
+at all (CPU `HostCopyBackend`, `hotpath_script.build_host(variant="prod")`, `start_thread`, idle 0.5 s or 3 s, then
+`stop`, under `taskset -c 0-63`). Both runs gave service `{malloc 0, free 1}` and copy `{malloc 0, free 1, mutex 1,
+cond 1}`. That lifecycle floor is:
+- the `std::thread` state that libstdc++ deletes on the new thread after `run()` returns (one free on each thread);
+- `CopyEngine::start`'s handshake on the copy thread (`start_mutex_`, `ready_cv_`: one mutex and one condvar).
+
+Against that floor:
+- **Service:** `free 1` and `mutex 0`/`cond 0` are the floor. **`malloc 1` is one allocation beyond it,
+  unattributed.** It is one call over the whole run, not per request (2995 served), but the shim cannot say where.
+- **Copy:** `cond 1` and one mutex are the floor. **The rest (90.0 M mutex, 72 malloc/free, 9,395 futex) come from the
+  CUDA copy backend.** The CPU backend's per-request copy counts are 0 (§5a, Task 15), and the only difference here is
+  `CudaCopyBackend`, which calls `cuMemcpyAsync`, `cuEventRecord` and `cuEventQuery` through libcuda. ~90 M mutex ops
+  over the server's life is what a copy thread polling `cuEventQuery` in its spin loop would produce if libcuda takes a
+  pthread mutex per query. That is an inference: the shim records no call sites.
+- `sleep` 854,870 on the service is the idle 50 µs sleep plus the parked 20 µs sleep during pauses: both are
+  `sleep_for`, and the shim cannot tell them apart. Copy `sleep` 0: its idle wait is a futex. Service `futex` 8 are
+  `submit()`'s wakes of a sleeping copy thread; the copy thread's 9,395 futex calls include its idle waits and any
+  that libcuda makes through `syscall()`.
+
+### 8d. Verdict and limits
+
+- **Timed arms pass:** byte-identical output (B, A2 and C against A), `read_errors` 0, and B 0.32 ms/token faster than
+  mean(A, A2), inside a 1.5 ms allowance with 0.42 ms drift.
+- **C does not meet the whole-run zero rule** for malloc/free/mutex/cond. `arms-report.json`'s `pass` is `false` for
+  that reason alone. What is still open:
+  - the service thread's single unattributed malloc;
+  - the copy thread's libcuda-side mutex, malloc and futex traffic, which production's CUDA copy backend incurs and the
+    CPU shim tests cannot see.
+  Attributing both needs a shim that records call sites (e.g. a backtrace of the first N calls per kind) or a window
+  armed after start-up, in one more server run.
+- **Limits:** one pass of 90 decode tokens per arm, so the ms/token comparison resolves about the 1.5 ms allowance and
+  no finer. perf and `served` cover different spans. The instruction saving is the only per-request CPU difference
+  large enough to read.
