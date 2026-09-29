@@ -50,3 +50,12 @@ if [[ " $PHASES " == *" qd "* ]]; then
     run --label qd-cut256 --file $F0 --file $F4 --file $F2 --workload row --qd $qd --mode $m --cut 262144
   done; done; done
 fi
+# wait: block (submit_and_wait, min_complete=1) vs spin (GETEVENTS min_complete=0 loop), prod shape and cut256,
+# interleaved. Tests whether the punted reads' cost is the io-wq worker waiting on uring_lock held by the polling waiter.
+if [[ " $PHASES " == *" wait "* ]]; then
+  for rep in 1 2 3; do for w in block spin; do for m in default iopoll; do
+    run --label wait-prod --file $F0 --file $F4 --file $F2 --workload row --qd 1 --mode $m --wait $w
+    run --label wait-cut256 --file $F0 --file $F4 --file $F2 --workload row --qd 1 --mode $m --wait $w --cut 262144
+  done; done; done
+  for w in block spin; do run --label wait-flat2m --file $F0 --workload flat --size 2228224 --qd 8 --mode iopoll --wait $w; done
+fi

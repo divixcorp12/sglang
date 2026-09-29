@@ -45,7 +45,7 @@ static const uint64_t image_bytes = 13315584, row_stride = 13316096;
 
 static const char* files[MAX_FILES];
 static int nfiles = 0, fds[MAX_FILES];
-static int gap_cut = 1, iopoll = 0, fixed_files = 0, use_read = 0, row_mode = 0, threads = 1, qd = 1, per_part = 2;
+static int spin_wait = 0, gap_cut = 1, iopoll = 0, fixed_files = 0, use_read = 0, row_mode = 0, threads = 1, qd = 1, per_part = 2;
 static uint64_t sqe_bytes = 262144, cut = 0;
 static double seconds = 3.0;
 static atomic_int stop_sampler;
@@ -209,7 +209,18 @@ static void* worker(void* arg) {
       }
     }
     if (inflight == 0) break;
-    rc = io_uring_submit_and_wait(&t->ring, 1);
+    if (!spin_wait) {
+      // block: io_uring_enter(GETEVENTS, min_complete=1). With IOPOLL the kernel polls here, holding uring_lock.
+      rc = io_uring_submit_and_wait(&t->ring, 1);
+    } else {
+      // spin (the reader's WAIT_MODE=spin): submit, then GETEVENTS with min_complete=0 (one polling pass, lock
+      // released on return) until a CQE is visible. Without IOPOLL, just peek.
+      rc = io_uring_submit(&t->ring);
+      while (rc >= 0 && io_uring_cq_ready(&t->ring) == 0) {
+        if (iopoll) { int g = io_uring_get_events(&t->ring); if (g < 0) rc = g; }
+        else __builtin_ia32_pause();
+      }
+    }
     if (rc < 0 && rc != -EINTR && rc != -EAGAIN && rc != -EBUSY) { fprintf(stderr, "submit: %s\n", strerror(-rc)); exit(1); }
     struct io_uring_cqe* c; unsigned head, seen = 0;
     double tn = now_us();
@@ -321,6 +332,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "--seconds")) { seconds = atof(v); ++i; }
     else if (!strcmp(a, "--fixed-files")) { fixed_files = 1; }
     else if (!strcmp(a, "--no-gap-cut")) { gap_cut = 0; }
+    else if (!strcmp(a, "--wait")) { spin_wait = !strcmp(v, "spin"); ++i; }
     else if (!strcmp(a, "--label")) { label = v; ++i; }
     else { fprintf(stderr, "unknown arg %s\n", a); return 2; }
   }
@@ -366,13 +378,13 @@ int main(int argc, char** argv) {
   uint64_t dreq = 0, dsec = 0;
   for (int i = 0; i < nfiles; ++i) { dreq += r1[i] - r0[i]; dsec += s1[i] - s0[i]; }
   printf("{\"label\":\"%s\",\"workload\":\"%s\",\"mode\":\"%s\",\"op\":\"%s\",\"size\":%llu,\"cut\":%llu,\"gap_cut\":%d,\"files\":%d,"
-         "\"fixed_files\":%d,\"threads\":%d,\"qd\":%d,\"wall_s\":%.3f,\"ops\":%llu,\"sqes\":%llu,\"sqes_per_op\":%.2f,"
+         "\"fixed_files\":%d,\"threads\":%d,\"qd\":%d,\"wait\":\"%s\",\"wall_s\":%.3f,\"ops\":%llu,\"sqes\":%llu,\"sqes_per_op\":%.2f,"
          "\"MBps\":%.1f,\"p50_us\":%.1f,\"p90_us\":%.1f,\"p99_us\":%.1f,\"max_us\":%.1f,\"errors\":%llu,\"first_error\":%d,\"eagain\":%llu,"
          "\"short\":%llu,\"proc_cpu_s\":%.3f,\"submitter_cpu_s\":%.3f,\"iowq_workers\":%d,\"iowq_max_live\":%d,"
          "\"iowq_cpu_s\":%.3f,\"disk_reqs\":%llu,\"disk_reqs_per_sqe\":%.2f,\"disk_MB\":%.1f}\n",
          label, row_mode ? "row" : "flat", iopoll ? "iopoll" : "default", use_read ? "read" : "readv",
          (unsigned long long)sqe_bytes, (unsigned long long)(cut > (UINT64_MAX / 4) ? 0 : cut), gap_cut, nfiles, fixed_files,
-         threads, qd, wall, (unsigned long long)ops, (unsigned long long)sqes, ops ? (double)sqes / ops : 0,
+         threads, qd, spin_wait ? "spin" : "block", wall, (unsigned long long)ops, (unsigned long long)sqes, ops ? (double)sqes / ops : 0,
          bytes / wall / 1e6, PCT(0.5), PCT(0.9), PCT(0.99), n ? all[n - 1] : 0, (unsigned long long)errs, atomic_load(&first_error),
          (unsigned long long)eag, (unsigned long long)shorts, proc_cpu, sub_cpu, nw, wmax_live, wq_cpu,
          (unsigned long long)dreq, sqes ? (double)dreq / sqes : 0, dsec * 512 / 1e6);
