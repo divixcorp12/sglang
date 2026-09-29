@@ -36,14 +36,50 @@ test_w4afp8_deepep_post_reorder.py, test_w4afp8_requant_geometry.py
 
 It reproduces at any commit with none of this branch's work present, and pytest aborts the whole run on collection
 errors, so `SUITE` (as the global-context template defines it, `kernels` + `layers/moe` together) gives **no signal**
-at `ba01695c35`. This is not a regression to fix; it is a pre-existing environment defect. No `SUITE` pass/skip count
-exists to compare against at this base commit.
+at `ba01695c35` when run without `--continue-on-collection-errors`. This is not a regression to fix; it is a
+pre-existing environment defect. Section 1b below gives the usable baseline for `layers/moe`.
+
+**Ruling: layers/moe is compared with `--continue-on-collection-errors`; the collection-error file set must stay
+identical.** Any later task's `layers/moe` run must use the same flag and diff its pass/skipped/failed/errors counts,
+and its collection-error file set, against section 1b -- not against a plain, unflagged run (which still aborts with
+`EXIT=2` and gives no count).
+
+## 1b. layers/moe baseline (with `--continue-on-collection-errors`)
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-hotpath-base && export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
+  CUDA_HOME=/usr/local/cuda-13.4 \
+  && /data/models/slang/.venv/bin/python -c "import sglang; print(sglang.__file__)" \
+  && flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 /data/models/slang/.venv/bin/python -m pytest \
+     test/registered/unit/layers/moe -q -p no:randomly --continue-on-collection-errors
+```
+
+`sglang.__file__` resolved to `/data/models/slang/nvfp4-work/wt-hotpath-base/python/sglang/__init__.py` (correct
+worktree). **Result: `2 failed, 1094 passed, 12 errors, 12405 subtests passed` in 90.31s (0:01:30), `EXIT=1`**
+(`${PIPESTATUS[0]}` read explicitly).
+
+- **11 of the 12 errors are the same collection-time `pyarrow.PyExtensionType` AttributeError as section 1**, in
+  exactly the same 11 files: `test_deepep_v2_buffer_lifecycle.py`, `test_deepep_v2_masked_slab.py`,
+  `test_deepep_v2_wire_dtype.py`, `test_flashinfer_a2a_wide_ep.py`, `test_fused_moe_native.py`,
+  `test_fused_shared_expert_scaling.py`, `test_mega_moe_deepgemm_api.py`, `test_topk_correction_bias_cache.py`,
+  `test_w4afp8_deepep_dtype.py`, `test_w4afp8_deepep_post_reorder.py`, `test_w4afp8_requant_geometry.py`. This is the
+  collection-error file set that must stay identical in later comparisons.
+- **The 12th error is not a collection error**: it is a teardown-time error in
+  `test_exl3_ram_miss_service.py::test_graph_routes_are_logged_only_when_the_stage_trace_is_on[trace_on]`, raised in
+  the `tiers` fixture's `service.shutdown()` call
+  (`python/sglang/srt/layers/moe/exl3_ram_miss.py:1348`, `_quarantine`), with reason `"closing admission or the
+  barrier failed: AttributeError(\"'types.SimpleNamespace' object has no attribute 'state'\")"`. It is unrelated to
+  pyarrow and is recorded here as a pre-existing base-commit condition, not diagnosed (out of scope for Task 1).
+- **2 failures** (pre-existing, not diagnosed):
+  `test_expert_plugins_cuda.py::TestPinnedTierCuda::test_a_split_chunk_copies_its_row_index_to_the_device_once` and
+  `test_expert_row_source.py::TestGatherReadStats::test_a_gather_without_host_reads_keeps_its_stats_object`.
 
 ## 2. kernels-only (the lead's comparison target)
 
 ```bash
 cd /data/models/slang/nvfp4-work/wt-hotpath-base && export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
   CUDA_HOME=/usr/local/cuda-13.4 \
+  && /data/models/slang/.venv/bin/python -c "import sglang; print(sglang.__file__)" \
   && flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 /data/models/slang/.venv/bin/python -m pytest \
      test/registered/unit/kernels -q -p no:randomly
 ```
@@ -54,7 +90,9 @@ cd /data/models/slang/nvfp4-work/wt-hotpath-base && export PYTHONPATH=$PWD/pytho
 
 ```bash
 cd /data/models/slang/nvfp4-work/wt-hotpath-base && export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
-  CUDA_HOME=/usr/local/cuda-13.4 && flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 \
+  CUDA_HOME=/usr/local/cuda-13.4 \
+  && /data/models/slang/.venv/bin/python -c "import sglang; print(sglang.__file__)" \
+  && flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 \
   /data/models/slang/.venv/bin/python -m pytest -q -rf -p no:randomly \
     test/manual/dsv41/test_exl3_ram_miss_cuda.py test/manual/dsv41/test_exl3_lease_kernels_cuda.py \
     test/manual/dsv41/test_exl3_copy_engine_cuda.py test/manual/dsv41/test_exl3_piece_stream_row_images_cuda.py \
