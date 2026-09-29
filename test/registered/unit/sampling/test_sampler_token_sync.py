@@ -13,7 +13,6 @@ import torch
 
 from sglang.srt.layers import sampler as sampler_mod
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -34,7 +33,7 @@ def _sync(world_size, grammars):
     return all_reduce
 
 
-class TestSamplerTokenSync(CustomTestCase):
+class TestSamplerTokenSync(unittest.TestCase):
     def test_single_rank_grammar_skips_the_collective(self):
         self.assertFalse(_sync(1, [object()]).called)
 
