@@ -2,14 +2,18 @@
 read_cuts.h alone; the FFI part (Tasks 4-5) reads through the reader with a test-only cut cap (fault word
 leg_cut_cap). Why the cuts exist: analysis/dsv41-drive/iopoll/diagnosis.md."""
 
+import errno
 import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+import torch
 
+from sglang.kernels.ops.moe.expert_stream_transport import read_rows_sqes, read_rows_with_fault
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -160,3 +164,70 @@ def test_read_cuts_planner_and_limits(tmp_path):
         shm.unlink()
     assert done.returncode == 0, done.stdout + done.stderr
     assert "PASS read_cuts" in done.stdout
+
+PREFIX = "SGLANG_EXPERT_STREAM_URING_"
+EXPERTS = [10, 3, 7, 0, 11, 5, 1, 8, 2, 9, 4]
+SLOTS = [7, 0, 11, 3, 9, 1, 5, 10, 2, 8, 4]
+CUT = 8192
+
+
+@pytest.fixture
+def uring_env(monkeypatch):
+    for key in list(os.environ):
+        if key.startswith(PREFIX):
+            monkeypatch.delenv(key)
+
+    def set_(**values):
+        for key, value in values.items():
+            monkeypatch.setenv(PREFIX + key, str(value))
+
+    return set_
+
+
+def _setup(tmp_path, images, weights=None):
+    root = tmp_path / "ckpt"
+    root.mkdir()
+    dims = {} if images else dict(hidden=256, inter=512)
+    return ram_miss_setup(root, capacity=12, experts=12, mirror_weights=weights, row_images=images, **dims)
+
+
+def _snapshot(slabs):
+    if isinstance(slabs, dict):
+        return {k: _snapshot(v) for k, v in slabs.items()}
+    return slabs.clone()
+
+
+def _equal(a, b):
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_equal(a[k], b[k]) for k in a)
+    return same_bytes(a, b)
+
+
+def _read(s, **faults):
+    result, log, info, record = read_rows_sqes(s.tables, 1, EXPERTS, SLOTS, direct=False, max_sqes=65536, **faults)
+    return result, log, info, record, _snapshot(s.slabs)
+
+
+def _pieces(images, on):
+    return ({"piece_stream": True} | ({} if images else {"pack_workers": 2})) if on else {}
+
+
+def test_cuts_off_keeps_todays_credit_and_legs(tmp_path, uring_env):
+    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    result, _, info, _, _ = _read(s)
+    assert result == 1 and info["cut_reads"] == 0 and info["min_cut_bytes"] == 0
+    assert info["credit"] == 16 * 3
+
+
+def test_credit_scales_with_the_leg_bound(tmp_path, uring_env):
+    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    result, _, info, _, _ = _read(s, leg_cut_cap=CUT)
+    assert result == 1 and info["leg_stride"] > 1 and info["min_cut_bytes"] == CUT
+    assert info["credit"] == min(32768, 16 * 3 * info["leg_stride"])
+
+
+def test_explicit_depth_below_the_leg_bound_is_refused(tmp_path, uring_env):
+    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    uring_env(QUEUE_DEPTH=2)
+    with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=2"):
+        _read(s, leg_cut_cap=CUT)
