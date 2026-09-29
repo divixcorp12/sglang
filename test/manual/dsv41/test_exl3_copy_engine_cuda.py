@@ -1,7 +1,8 @@
 """The copy engine (LEASE_PROTOCOL.md 7.6) against the real C++ service and the real kernel chain. GPU only.
 
 The service copies each request's resident lanes with cuMemcpyAsync on its copy thread and publishes CopyDone once
-cuEventQuery observed the copies complete; the chain post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F waits for it in CW.
+the stream-written completion word (cuStreamWriteValue32_v2 after the job's copies) reached the job's sequence; the
+chain post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F waits for it in CW.
 Every byte check reads a snapshot the test enqueues on the decode stream right after F, before anything synchronizes
 the device: a CopyDone published before the copies completed, or a CW that does not wait, shows as stale bytes there,
 most visibly under the ballast, which delays every copy job's completion by one large extra copy.
@@ -12,6 +13,7 @@ Run on divix01 holding cc-gpu.lock, with PYTHONPATH pointing at the tree under t
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -92,9 +94,34 @@ def test_every_lane_holds_its_row_under_host_slot_victim_reuse(ce):
     assert s.stats()["copy_waits"] == c["copy_jobs"]
 
 
+def test_the_completion_word_counts_every_copy_job_at_shutdown(tmp_path, capfd):
+    """Phase 2 Task P2: the copy stream writes each job's sequence into a host-mapped word, the only completion the copy
+    thread polls. Every job completes through it (the bytes check), and at shutdown the word equals both the jobs the
+    copy thread marked and the jobs the service handed it: one write per job, none lost, none extra."""
+    s = StreamService(tmp_path, copy_engine=True)
+    try:
+        rng = random.Random(11)
+        for _ in range(12):
+            experts = rng.sample(range(EXPERTS), TOP_K)
+            s.plan(experts)
+            snapshot = _snapshot_step(s)
+            assert s.keep.item() == 1.0, (experts, s.counters(), s.stats())
+            _check(s, experts, snapshot)
+            assert s.until(lambda: _all_retired(s)), s.counters()
+        c = s.counters()
+        assert c["copy_jobs"] > 0 and c["copy_errors"] == 0, c
+    finally:
+        s.close()
+    err = capfd.readouterr().err
+    found = re.findall(r"RAM miss copy engine: completion word (\d+) at shutdown, (\d+) jobs marked", err)
+    assert len(found) == 1, err[-2000:]
+    word, marked = (int(v) for v in found[0])
+    assert word == marked == c["copy_jobs"], (word, marked, c["copy_jobs"])
+
+
 def test_a_delayed_completion_is_waited_for_and_the_lease_holds_until_it(ce):
     """The ballast delays every job's completion by ~5 ms: CW must spin for it, and the bytes after F must be right.
-    Mutants: complete a job without querying its event, publish CopyDone at the grant, or a CW that does not wait --
+    Mutants: complete a job before its completion word, publish CopyDone at the grant, or a CW that does not wait --
     each red on the snapshot."""
     s = ce
     src = torch.empty(BALLAST_BYTES, dtype=torch.uint8).pin_memory()
