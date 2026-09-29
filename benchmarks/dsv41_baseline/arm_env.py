@@ -71,7 +71,9 @@ CONTEXT_LENGTH = 131072
 # 0.23 GB SWA floor). 0.91 restored the pool but a 16k prompt OOMed. 0.895 + 15400 put the cut into the KV pool (0.71-0.88
 # GB available), not prefill headroom: a chunked 16k prompt peaked 1 MiB short of the 32,202 MiB CUDA can use. 0.885
 # spends ~320 MiB of that KV spare on prefill headroom (analysis/dsv41-drive/recipe-mem/diagnosis.md, results.md).
-MEM_FRACTION_STATIC = 0.885
+# 0.875 since 2026-09-29: at 0.885 a 419-token prompt OOMed in prefill (free fell 2.70 GB -> 37 MB with late Triton
+# loads; earlier launches bottomed at 0.12 GB), so another ~320 MiB moves from the KV pool to prefill headroom.
+MEM_FRACTION_STATIC = 0.875
 # 4096 since 2026-09-26: a chunk's cost is streaming the experts it routes to, nearly the same at 512 and 4096 tokens,
 # so a 16k prompt's TTFT fell 444 -> 107 s (27.17).
 CHUNKED_PREFILL_SIZE = 4096
