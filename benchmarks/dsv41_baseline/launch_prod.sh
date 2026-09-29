@@ -5,6 +5,8 @@
 # Usage: launch_prod.sh >> server.log 2>&1
 #        DRY_RUN=1 launch_prod.sh    print the checkout, cores, env and argv, take no lock, start nothing
 # Holds cc-gpu.lock for the server's lifetime (fd 9 survives the exec) and refuses to start if it is taken.
+# Once it holds the lock, points the SERVER_LOG_LINK symlink at the file its stdout goes to (not when stdout is a
+# terminal or pipe), so the link always names the running server's log.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -29,6 +31,15 @@ fi
 
 exec 9>"$gpu_lock"
 flock --nonblock 9 || { echo "cc-gpu.lock is held by another GPU job; not starting production" >&2; exit 1; }
+
+log_link=${SERVER_LOG_LINK:-/data/models/slang/nvfp4-work/server.log}
+log_file=$(readlink -f "/proc/$$/fd/1" || true)
+if [ -f "$log_file" ]; then
+    # A temporary link renamed over the old one, so the link is never missing.
+    ln -sfn "$log_file" "$log_link.tmp.$$"
+    mv -T "$log_link.tmp.$$" "$log_link"
+    echo "$log_link -> $log_file"
+fi
 
 cd "$repo"
 export PYTHONPATH="$repo/python:$here"
