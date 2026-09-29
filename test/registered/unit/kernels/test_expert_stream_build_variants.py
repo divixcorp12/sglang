@@ -71,6 +71,22 @@ def test_the_instrumented_host_still_reports_every_counter(tmp_path):
         host.stop()
 
 
+@pytest.mark.parametrize("variant", ["instr", "instr_tsan"])
+def test_every_instrumented_variant_reports_every_counter(variant):
+    # The filter is "not prod", not "== instr": the TSan build is instrumented too (final review, Minor 2). A stub
+    # module stands in for the TSan .so, which needs the compiler's TSan runtime preloaded.
+    class Module:
+        @staticmethod
+        def expert_stream_counters(handle, out):
+            out.copy_(torch.arange(out.numel(), dtype=torch.int64))
+
+    host = ExpertStreamHost.__new__(ExpertStreamHost)
+    host.variant, host.handle, host._module = variant, 0, Module()
+    assert host.counters() == {name: i for i, name in enumerate(ops.COUNTERS)}
+    host.variant = "prod"
+    assert tuple(host.counters()) == ops.CORE_COUNTERS
+
+
 def test_the_python_core_counters_are_the_hosts():
     mask = int(ops._host_module("exl3", "prod").expert_stream_core_counter_mask())
     assert {name for i, name in enumerate(ops.COUNTERS) if mask >> i & 1} == set(ops.CORE_COUNTERS)

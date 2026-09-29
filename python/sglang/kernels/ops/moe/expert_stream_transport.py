@@ -1322,7 +1322,8 @@ class ExpertStreamHost:
         out = torch.zeros(len(COUNTERS), dtype=torch.int64)
         self._module.expert_stream_counters(self.handle, out)
         values = dict(zip(COUNTERS, out.tolist()))
-        return values if self.variant == "instr" else {k: values[k] for k in CORE_COUNTERS}
+        # Every instrumented variant ("instr", "instr_tsan") compiles the metrics; only "prod" drops them.
+        return values if self.variant != "prod" else {k: values[k] for k in CORE_COUNTERS}
 
     def layer_rows(self) -> list[int]:
         """Rows read for demands only (not advisories), per streamed layer: the RAM misses behind ``f``.
