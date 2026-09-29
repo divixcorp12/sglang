@@ -94,6 +94,8 @@ def _refuse_test_only(name: str, variant: Optional[str]) -> None:
 # through a wrapper, so a layout and variant have exactly one module whatever the call form.
 def _host_module(layout: str = "exl3", variant: Optional[str] = None) -> Module:
     variant = host_variant() if variant is None else variant
+    if variant == "instr_tsan" and _ALLOW_TSAN:
+        return _host_module_tsan(layout)
     if variant not in VARIANTS:
         raise ValueError(f"unknown host build variant {variant!r}; expected one of {VARIANTS}")
     if variant not in LAYOUTS[layout].host_sources:
@@ -110,6 +112,23 @@ def _host_module_cached(layout: str, variant: str) -> Module:
         cpp_files=[LAYOUTS[layout].host_sources[variant]],
         extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden"],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
+        header_only=False,
+    )
+
+
+# The instrumented build under ThreadSanitizer (plan 2026-09-29-hotpath-zero-overhead Task 16), for the manual test
+# test/manual/dsv41/test_expert_stream_hotpath_tsan.py only: ExpertStreamHost(..., variant="instr_tsan") loads it when
+# that test sets _ALLOW_TSAN, and is an unknown variant otherwise. The process must preload the compiler's TSan runtime.
+_ALLOW_TSAN = False
+
+
+@cache_once
+def _host_module_tsan(layout: str = "exl3") -> Module:
+    return load_jit(
+        f"expert_stream_host_{layout}_instr_tsan",
+        cpp_files=[LAYOUTS[layout].host_sources["instr"]],
+        extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden", "-fsanitize=thread", "-O1", "-g"],
+        extra_ldflags=["-luring", "-lpthread", "-ldl", "-fsanitize=thread"],
         header_only=False,
     )
 

@@ -52,10 +52,34 @@ def _check_tier(s, host, rows):
     return out
 
 
-def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
+def _fill_while_owned(s, host, rng):
+    """The paused owner starts a prefill fill of up to two missing experts of a row, admits a third into that row while
+    the fill thread reads (the owner's census reads the filling flags the fill must leave alone), then ends the fill
+    or, half the time, leaves it running for resume() to join and finish before the service runs again."""
+    row = rng.randrange(hp.LAYERS)
+    mapping = host.mapping(row)
+    missing = [e for e in DEVICE_EXPERTS if mapping[e] < 0]
+    rng.shuffle(missing)
+    slots, _evictions = host.fill_begin(row, missing[:2], fallback=True)
+    if len(missing) > 2:
+        slot, _evicted = host.assign(row, missing[2])
+        oracle = s.reference(s.tables.layer_ids[row], [missing[2]])
+        for n in EXL3_STREAMED_NAMES:
+            s.slabs[row][n][slot].copy_(oracle[n][0])
+    host.slot_info(row)
+    if slots and rng.random() < 0.5:
+        host.fill_wait(len(slots), 10.0)
+        assert host.fill_end(), "a prefill fill failed"
+
+
+def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
     """Run the four parties for ``seconds`` against a threaded host, then park the service and check the tier.
     Raises AssertionError on a party's error or a broken tier invariant; returns the parties' counts, ``fatal``, the
     service's counters and the final rows, for the caller's checks that every party ran.
+
+    ``fills`` (Task 16's ThreadSanitizer child): every pause also starts a prefill fill, admits a row into the filled
+    row while the fill thread reads (spec 6.3 item 3), and either ends the fill or leaves it for ``resume()`` to join,
+    so the fill thread and the owner's epilogue meet every other party.
 
     The pauser runs on the calling thread, the one that built the host: every eager call that may touch an io_uring
     reader (``pause``, ``assign``, ``resume``, and ``RamMissSetup.reference``, whose shared Exl3ShardRowSource reader
@@ -68,7 +92,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
     stats = {
         "armed": 0, "copy_posts": 0, "terminals": 0, "timeouts": 0, "failed": 0,
         "lanes_ready": 0, "lanes_loading": 0, "lanes_copying": 0,
-        "releases": 0, "marked": 0, "noise": 0, "pauses": 0, "refused": 0, "assigns": 0, "errors": [],
+        "releases": 0, "marked": 0, "noise": 0, "pauses": 0, "refused": 0, "assigns": 0, "fills": 0, "errors": [],
     }
 
     def guard(name, fn):
@@ -181,6 +205,9 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1):
                         s.slabs[row][n][slot].copy_(oracle[n][0])
                     stats["assigns"] += 1
                     _check_tier(s, host, [row])
+                    if fills:
+                        _fill_while_owned(s, host, rng)
+                        stats["fills"] += 1
                 finally:
                     host.resume()
             finally:

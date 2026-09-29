@@ -1,0 +1,11 @@
+# The interpreter and torch are not instrumented; races TSan attributes to them are false positives here.
+called_from_lib:libpython3
+called_from_lib:libtorch_cpu.so
+called_from_lib:libc10.so
+called_from_lib:libgomp.so
+called_from_lib:libtorch_python.so
+# torch's (and torchvision's) operator registration unlocks mutexes at import and at exit that TSan's interceptor never
+# saw locked: reports about torch's own mutexes, which the host module never touches.
+mutex:libtorch_python.so
+mutex:libtorch_cpu.so
+mutex:torchvision
