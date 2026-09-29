@@ -114,11 +114,13 @@ def _measured(counts):
 
 @pytest.mark.parametrize("variant", ["prod", "instr"])
 def test_the_copy_thread_allocates_nothing_and_waits_on_no_condvar(shim, tmp_path, variant):
-    """Spec A7, A8, L8, L9: no per-pass deque, no queue node, no condition variable, and a submit that nests no lock.
-    The copy thread's one remaining lock is the tier mutex taken to release a COPYING lease (Task 14 removes it): at
-    most one per job. With the tests' 200 us copy spin the copy thread goes to sleep between the Python-paced steps, so
-    this run also covers the futex idle path: a wait on the copy thread each time it sleeps, and at most one wake per
-    submitted job on the service thread (submit wakes only a thread that is asleep)."""
+    """Spec A7, A8, L8, L9 and 6.3 item 4: no per-pass deque, no queue node, no condition variable, a submit that nests
+    no lock, and no lock at all on the copy thread: it hands each completed job back to the owner through an SPSC ring
+    (Task 14), and the owner releases the COPYING lease. The service thread's drain of that ring and its lease
+    retirement run every loop turn and take no lock either, so its mutex count is per request (serve()'s holds, which
+    Task 15 deletes), not per spin turn. With the tests' 200 us copy spin the copy thread goes to sleep between the
+    Python-paced steps, so this run also covers the futex idle path: a wait on the copy thread each time it sleeps, and
+    at most one wake per submitted job on the service thread (submit wakes only a thread that is asleep)."""
     counts = hotpath_shim.run_child(shim, variant=variant, tmp=tmp_path)
     print("HOTPATH", variant, counts)
     _measured(counts)
@@ -126,7 +128,10 @@ def test_the_copy_thread_allocates_nothing_and_waits_on_no_condvar(shim, tmp_pat
     assert service["malloc"] == 0 and service["free"] == 0, counts
     assert copy["malloc"] == 0 and copy["free"] == 0 and copy["cond"] == 0, counts
     assert service["cond"] == 0, counts
-    assert copy["mutex"] <= counts["copy_jobs"], counts
+    assert copy["mutex"] == 0, counts
+    # Per posted request: apply_gpu_hot, defers and serve()'s three holds (5), plus a deferred request's re-checks. A
+    # per-turn lock (the pre-Task 14 retire_leases) counted hundreds of thousands here.
+    assert service["mutex"] <= 8 * counts["posts"], counts
     assert copy["sleep"] == 0, counts  # the copy thread's idle wait is a futex, never a nanosleep
     if variant == "prod":
         assert copy["clock"] == 0, counts  # InstrBuild's copy latency and issue-time metrics read the clock

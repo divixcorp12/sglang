@@ -91,8 +91,8 @@ class RamTier {
     fill_packed_.reserve(static_cast<size_t>(widest));
   }
 
-  // The copy thread's callbacks use tiers_, mutex_ and the counter blocks, which are destroyed before copy_engine_
-  // would be.
+  // The copy thread's callbacks use slot_gen_, the lease block, copy_done_ and the counter blocks, which are destroyed
+  // before copy_engine_ would be.
   ~RamTier() {
     fill_join();  // the fill thread reads through reader_ into the slabs
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
@@ -248,6 +248,7 @@ class RamTier {
     // acquire above made the caller's earlier push visible. The loop drains between requests too (RamThread::run).
     // Pump mode queues nothing (its caller owns the tier), so only the service thread looks.
     if (posted) drain_commands_on_service();
+    drain_copy_completions();  // D7: the COPYING leases the copy thread handed back, released before the pass below
     retire_leases(posted && settled_seq_ != next_demand_);  // first, so that an idle pump still retires
     if (posted) settled_seq_ = next_demand_;
     if (admission_closed_.load()) return false;
@@ -409,9 +410,9 @@ class RamTier {
   // On the owner every one of them runs directly, after draining whatever an earlier caller queued.
   //
   // caller_mutex_ serializes Python-side callers against each other only; the service, copy and fill threads never
-  // take it. mutex_ is still taken inside each owned body until Task 15 deletes it: the copy thread's
-  // release_copied/prefetch_completed (Task 14) and the fill thread's epilogue (Task 15) still change tier state
-  // under it, so an owned read here must not run without it yet.
+  // take it. mutex_ is still taken inside each owned body until Task 15 deletes it: the fill thread's epilogue still
+  // changes tier state under it, so an owned read here must not run without it yet. The copy thread no longer touches
+  // the tier (Task 14): it hands its completions back through copy_done_.
 
   bool has(int64_t row, int64_t expert) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
@@ -716,7 +717,8 @@ class RamTier {
   // Serve the device's posted prefetch request, if a new one is there. True when it handled one. Called after
   // pump_demand, so a demand posted meanwhile is always served first. A prefetch never reads NVMe: a row that is not
   // READY in the pinned tier is skipped. A served one leases its pinned slot like a COPYING lane and is handed to the
-  // copy thread; only that thread's observed completion publishes COPIED and releases the lease.
+  // copy thread; only that thread's observed completion, handed back to the owner, publishes COPIED and releases the
+  // lease (prefetch_completed_owned).
   bool pump_prefetch() {
     if (prefetch_page_ == nullptr) return false;
     const uint64_t word = load_acquire64(prefetch_page_ + kPfReqGen);
@@ -788,16 +790,45 @@ class RamTier {
     });
   }
 
-  // Every job handed to the copy thread has completed (or failed) and been retired. Any thread (the FFI's
-  // copy_engine_idle): it reads the copy engine's own counters only.
-  bool wait_copy_idle(int64_t deadline_ns) {
-    return copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
+  // The owner (the service thread, the pausing caller, or the caller of pump()): release every lease the copy thread
+  // handed back, in completion order. Takes no lock: the copy thread touches no tier state (it only pushes), and
+  // every other writer of what this changes is the owner itself. An empty ring costs two loads (its own tail, relaxed;
+  // the producer's head, acquire) and no store.
+  void drain_copy_completions() {
+    CopyJob job;
+    while (copy_done_.pop(&job)) {
+      if (job.prefetch) {
+        prefetch_completed_owned(job);
+      } else {
+        release_copied_owned(job);
+      }
+    }
   }
 
-  // The same, on the owner (RamThread::pause, once the service parked). Task 14 adds the drain of the copy
-  // completion ring here.
+  // The owner (RamThread::pause, once the service parked): every job handed to the copy thread has completed (or
+  // failed), then everything handed back is released here.
   bool wait_copy_idle_owned(int64_t deadline_ns) {
-    return copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
+    const bool idle = copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
+    drain_copy_completions();
+    return idle;
+  }
+
+  // Any thread (the FFI's copy_engine_idle): the same wait, then the drain when this caller owns the tier (pump mode,
+  // or a paused service). With the service running unpaused it is the service's own next poll that releases (D7).
+  bool wait_copy_idle(int64_t deadline_ns) {
+    const bool idle = copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    if (caller_owns()) drain_copy_completions();
+    return idle;
+  }
+
+  // stop_thread's final settle, on the caller once the service joined: drain, then a settle pass. Under mutex_ until
+  // Task 15, because a prefill fill's epilogue (still under mutex_ on the fill thread) may run if the service stopped
+  // mid-pause; the service thread's own passes take no lock.
+  void final_settle() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    drain_copy_completions();
+    retire_leases(true);
   }
 
   void copy_engine_ballast(uint64_t dst, uint64_t src, int64_t bytes)
@@ -1082,9 +1113,12 @@ class RamTier {
   // skips unsettled watches, which the next posted demand's settle pass then covers (or pause, or stop_thread's
   // final settle). Clearing `watched` at a settle only bounds the cost of later passes: correctness does not depend
   // on it, since every comparison matches on the generation and a ring index's reuse resets the entry anyway.
+  //
+  // The owner only, and no lock (Task 14): with the copy thread's releases moved to the owner, nothing else writes an
+  // entry or a lease while the owner runs. The service thread calls it every loop turn and every read turn, so a
+  // mutex here was a lock per turn.
   void retire_leases(bool settle = false) {
     if (lease_ == nullptr || (!settle && lanes_outstanding_.load(std::memory_order_relaxed) == 0)) return;
-    std::lock_guard<std::mutex> guard(mutex_);
     for (int64_t idx = 0; idx < kDemandRecords; ++idx) {
       Outstanding& entry = outstanding_[idx];
       if (!entry.active && !entry.watched) continue;
@@ -1145,11 +1179,10 @@ class RamTier {
   }
 
   // One lease released, exactly once: the per-lane state machine is what makes a second signal harmless. Called by the
-  // service (retire_leases) and by the copy thread (release_copied), so K must be a metric: a core counter has one
-  // writer per block.
+  // owner only (retire_leases, drain_copy_completions). K is a metric (leases_acked, _voided, _copied): kept so.
   template <Counter K>
   void release_lease_locked(Tier& tier, LaneLease& held) {
-    static_assert(!is_core_counter(K), "a lease release is counted from two threads: it must be a metric");
+    static_assert(!is_core_counter(K), "the lease release counters are metrics");
     if (tier.leases[held.slot] == 0) {
       throw std::runtime_error(error_prefix<Layout>() + "lease underflow on slot " + std::to_string(held.slot));
     }
@@ -1453,49 +1486,61 @@ class RamTier {
     return true;
   }
 
-  // Copy thread. Completion was observed, so no copy of this job reads its slots any more: publish CopyDone, then
-  // release. A leased slot's generation cannot move (E1); if one did, the bytes are not the lease's, so fail stop.
-  // A job whose row has SM entries is not released here (false): the copy wait still reads those slots, and
-  // copy_acked releases them once it acknowledged. True otherwise, fail-stops included (the leases stay held, E5).
+  // Copy thread. Completion was observed, so no copy of this job reads its slots any more. E6 here, on the words this
+  // thread may read (slot_gen_, written by the owner with release): a leased slot's generation cannot move (E1); if
+  // one did, the bytes are not the lease's, so fail stop, publish nothing and hand nothing back (E5: the leases stay
+  // held). Then CopyDone, here, so the device's wait ends as soon as the DMA did; the lease itself is released by the
+  // owner (drain_copy_completions), one owner poll later (D7). A job whose row has SM entries is not handed back yet
+  // (false): the copy wait still reads those slots, and copy_acked hands it back once it acknowledged. True otherwise.
+  // A prefetch job publishes nothing here: PrefetchDone is the owner's (prefetch_completed_owned).
   bool copy_completed(const CopyJob& job) {
-    if (job.prefetch) {
-      prefetch_completed(job);
-      return true;
-    }
     const uint32_t* generations = slot_gen_ + slot_gen_base_[job.row];
     for (int i = 0; i < job.count; ++i) {
       const CopyLane& lane = job.lanes[i];
       if (load_acquire(reinterpret_cast<const uint8_t*>(generations + lane.host_slot)) != lane.slot_generation) {
         copy_count<kCopyGenerationMismatches>();
         raise_fatal(static_cast<uint32_t>(job.gen));
-        return true;
+        return true;  // E5: the lease stays held
       }
     }
-    uint8_t* done = lease_ + lease_c_ + job.idx * kLeaseCopyDoneBytes;
-    std::memcpy(done + kLeaseCdMask, &job.mask, 4);
-    store_release64(done + kLeaseCdGen, tagged_word(kLeaseTagCopied, job.gen));
-    if (job.sm) return false;
-    release_copied(job);
+    if (!job.prefetch) {
+      uint8_t* done = lease_ + lease_c_ + job.idx * kLeaseCopyDoneBytes;
+      std::memcpy(done + kLeaseCdMask, &job.mask, 4);
+      store_release64(done + kLeaseCdGen, tagged_word(kLeaseTagCopied, job.gen));
+      if (job.sm) return false;  // handed back once the copy wait acknowledged its SM reads (copy_acked)
+    }
+    hand_back(job);
     return true;
   }
 
   // Copy thread, a job copy_completed left waiting: true once the copy wait's SmAck for its ring index carries this
   // request's generation or a later one (the copy wait of a later request in the index ran, so this one's finished),
-  // after which no SM read of the job's slots can be in flight, and the leases are released.
+  // after which no SM read of the job's slots can be in flight, and the job is handed back to the owner.
   bool copy_acked(const CopyJob& job) {
     const uint64_t word = load_acquire64(lease_ + lease_d_ + kLeaseSmAck + job.idx * kLeaseSmAckBytes);
     if (tag_of(word) != kLeaseTagSmAck || generation_of(word) < job.gen) return false;
-    release_copied(job);
+    hand_back(job);
     return true;
   }
 
-  // Copy thread: release a completed job's COPYING leases, the only place one is released.
-  void release_copied(const CopyJob& job) {
-    std::lock_guard<std::mutex> guard(mutex_);
+  // Copy thread: the job goes back to the owner through copy_done_, before the copy engine counts it finished (its
+  // caller finish()es after this returns), so an owner that saw the engine idle (wait_idle's acquire of finished_)
+  // pops it. At most kDemandRecords + 1 jobs are outstanding, handed-back ones included (a ring index's entry stays
+  // active, and the prefetch lease stays active, until the owner drains its job), and the ring holds kCopyRing: a
+  // full ring is an internal error, and the answer that keeps every lease held (E5) is to fail stop.
+  void hand_back(const CopyJob& job) {
+    if (!copy_done_.push(job)) {
+      copy_count<kCopyErrors>();
+      raise_fatal(static_cast<uint32_t>(job.gen));
+    }
+  }
+
+  // The owner: release a completed job's COPYING leases, the only place one is released.
+  void release_copied_owned(const CopyJob& job) {
     Outstanding& entry = outstanding_[job.idx];
     if (!entry.active || entry.gen != job.gen) {
       // Nothing but this completion releases a COPYING lane, so its entry cannot have closed: an internal error.
-      copy_count<kCopyErrors>();
+      count<kCopyErrors>();
       raise_fatal(static_cast<uint32_t>(job.gen));
       return;
     }
@@ -1510,32 +1555,23 @@ class RamTier {
     if (!open) entry.active = false;
   }
 
-  // Copy thread, a prefetch job: the same E6 check as a COPYING lane, then the judge entry for the target's next
-  // request and COPIED, then the lease release (all after the observed completion). A mismatch fails stop and
-  // publishes nothing, so the device's wait for this request ends only on the fatal word.
-  void prefetch_completed(const CopyJob& job) {
-    const CopyLane& lane = job.lanes[0];
-    const uint32_t* generations = slot_gen_ + slot_gen_base_[job.row];
-    if (load_acquire(reinterpret_cast<const uint8_t*>(generations + lane.host_slot)) != lane.slot_generation) {
-      copy_count<kCopyGenerationMismatches>();
-      raise_fatal(static_cast<uint32_t>(job.gen));
-      return;
-    }
-    std::lock_guard<std::mutex> guard(mutex_);
+  // The owner, a prefetch job the copy thread handed back (its E6 check passed there): the judge entry for the
+  // target's next request and COPIED, then the lease release.
+  void prefetch_completed_owned(const CopyJob& job) {
     if (!prefetch_lease_.active || prefetch_lease_.gen != job.gen) {
-      copy_count<kCopyErrors>();
+      count<kCopyErrors>();
       raise_fatal(static_cast<uint32_t>(job.gen));
       return;
     }
     Tier& tier = tiers_[prefetch_lease_.row];
     if (tier.leases[prefetch_lease_.slot] == 0) {
-      copy_count<kCopyErrors>();
+      count<kCopyErrors>();
       raise_fatal(static_cast<uint32_t>(job.gen));
       return;
     }
     judge_[job.row] = PrefetchJudge{true, prefetch_lease_.expert};
-    copy_count<kPrefetchCopied>();
-    if constexpr (Build::kMetrics) copy_count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);
+    count<kPrefetchCopied>();
+    if constexpr (Build::kMetrics) count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);
     publish_prefetch_done(kPfTagCopied, job.gen, 0);
     tier.leases[prefetch_lease_.slot] -= 1;
     lease_changes_.fetch_add(1);  // a demand deferred on this slot may retry
@@ -2120,14 +2156,15 @@ class RamTier {
             cur,
             &packed,
             advisory ? 1 : SIZE_MAX,
-            // Safety, not just style: read() runs here with mutex_ NOT held -- the only lock_guard in
-            // serve() near it is the scoped S2 reservation hold above, which closes before this call.
-            // retire_leases() takes mutex_ itself, so this is deadlock-free today. That is a property
-            // of the code as it stands, not a guarantee: if a future yield point is ever added to
-            // read()'s drain loop under a lock, this callback would deadlock against it.
-            // The service stays the tier's owner for the whole read, so it answers queued snapshots here too (Task
-            // 13): a snapshot is not held for a read's length, and a test can observe a slot mid-read.
+            // read() runs here with mutex_ NOT held -- the only lock_guard in serve() near it is the scoped S2
+            // reservation hold above, which closes before this call. The hook takes no lock itself: the drain and
+            // retire_leases are the owner's lock-free passes (Task 14); a snapshot's thunk still takes mutex_ until
+            // Task 15, which is deadlock-free only because nothing here holds it.
+            // The service stays the tier's owner for the whole read, so it releases the COPYING leases the copy
+            // thread handed back (D7) and answers queued snapshots here too (Task 13): neither waits for a read's
+            // length, and a test can observe a slot mid-read.
             [this] {  // a template argument (spec A6): no std::function, no allocation
+              drain_copy_completions();
               retire_leases();
               answer_snapshots();
             },
@@ -2305,7 +2342,7 @@ class RamTier {
   PiecePublish piece_publish_;
   bool lease_mode_ = false;  // set before the service thread starts; off is today's protocol
   bool two_phase_ = false;   // Task 6 V1: hit lanes granted before read(); off is the Task 5 batched grant
-  Outstanding outstanding_[kDemandRecords];    // by request slot; guarded by mutex_
+  Outstanding outstanding_[kDemandRecords];    // by request slot; the owner's
   std::atomic<int64_t> lanes_outstanding_{0};  // lanes GRANTED and not yet retired: an early-out for retire_leases
   std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new; retirement continues
   std::atomic<uint64_t> lease_changes_{0};     // bumped whenever a lease is released: what wakes a deferred demand
@@ -2349,6 +2386,10 @@ class RamTier {
   std::atomic<bool> parked_{false};
   std::mutex caller_mutex_;
   SpscRing<Command, 64> commands_;
+  // Copy thread -> owner (Task 14): jobs whose copies completed (and whose SM reads were acknowledged), E6-checked and,
+  // for a demand job, CopyDone-published on the copy thread. The consumer is always the current owner (the same
+  // handoffs as commands_); drain_copy_completions releases their leases.
+  SpscRing<CopyJob, kCopyRing> copy_done_;
   std::atomic<uint32_t> skip_advice_upto_{0};
   // The watchdog's hung-request marker (D6), see busy_episode(): a new value per demand, advisory or fill in service,
   // 0 when none. episodes_ is the service thread's, or a fill's (they never run at once: a fill needs the pause).

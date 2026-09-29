@@ -250,7 +250,7 @@ NON_TRACE_CLOCK_READS = {
     "if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric": 1,
     "const int64_t latency = now_ns() - job.submit_ns;": 1,
     "if constexpr (Build::kMetrics) read_ns = now_ns();  // prefetch_latency_ns, a metric": 1,
-    "if constexpr (Build::kMetrics) copy_count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);": 1,
+    "if constexpr (Build::kMetrics) count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);": 1,
     # The hold_until_probe_ms test fault (piece streaming, G2): InstrBuild only (both under `if constexpr
     # (Build::kFaults)`), read only when that fault is set; the second line's `c.hold_until == 0` short-circuits
     # before the clock read otherwise.

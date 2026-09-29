@@ -170,7 +170,8 @@ def test_s_hands_a_copying_lane_w1_did_not_claim_to_the_copy_wait(tmp_path):
 
 def test_a_copy_wait_timeout_fails_closed_and_the_terminal_does_not_release_the_copying_lease(tmp_path):
     """A 256 MiB ballast (~20 ms) against a 10 ms deadline: CW times out, F fails the request and names the lane in
-    its terminal. The lease must stay held until the copy completes, then be released by the copy thread alone.
+    its terminal. The lease must stay held until the copy completes, then be released by its handed-back completion
+    alone.
     The warm-up miss runs under the default 2 s deadline (a cold O_DIRECT miss can take ~50 ms); the 10 ms deadline
     applies from the hit's post on."""
     s = StreamService(tmp_path, copy_engine=True)
@@ -205,7 +206,11 @@ def test_a_copy_wait_timeout_fails_closed_and_the_terminal_does_not_release_the_
         assert s.host.copy_engine_idle(10.0)
         c = s.counters()
         assert c["leases_voided"] == voided and c["lease_double_signal"] == 0, c
-        assert s.host.slot_info(0)[slot][2] == 0 and s.host.lease_entry(idx)["lane_state"][0] == 2
+        # D7 (plan 2026-09-29-hotpath-zero-overhead Task 14): the copy thread hands the job back and the running
+        # service releases the lease at its next poll, so an idle copy engine does not yet mean a released lease.
+        assert s.until(
+            lambda: s.host.slot_info(0)[slot][2] == 0 and s.host.lease_entry(idx)["lane_state"][0] == 2
+        ), s.counters()
     finally:
         s.host.copy_engine_ballast(None, None)
         s.close()

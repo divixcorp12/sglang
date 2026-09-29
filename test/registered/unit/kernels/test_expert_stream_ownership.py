@@ -1,13 +1,16 @@
-"""The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Task 13): what an unpaused Python call does while the
-service thread runs, and that queued commands are applied in order before the next request."""
+"""The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Tasks 13-14): what an unpaused Python call does while
+the service thread runs, that queued commands are applied in order before the next request, and that a copy
+completion comes back to the owner, which releases its lease (D7)."""
 
 import faulthandler
+import threading
 import time
 
 import pytest
 import torch
 
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
+from sglang.test import hotpath_script as hp
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
@@ -78,3 +81,59 @@ def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
     assert (free, evictable, leased) == (0, 1, 0)  # only expert 3 is neither hot nor wanted: the LAST set_hot won
     assert host.counters()["commands_applied"] - applied == 201 + 1, "a command was dropped (the +1 is the census)"
     assert time.perf_counter() - start > 0.1, "the burst was applied while the read ran: nothing was queued"
+
+
+def _copy_request(s, page, host, sim):
+    """A resident expert 0 of row 0, then a request whose lane 0 is COPYING; returns (req, slot)."""
+    hp.write_hot_record(page, host, hp.next_seq(page), [])
+    first = sim.post(0, [0])
+    while host.pump():
+        pass
+    waited, lanes = hp.accept(sim, first)
+    sim.ack(first, waited, lanes=lanes)
+    sim.deliver()
+    while host.pump():
+        pass
+    hp.write_hot_record(page, host, hp.next_seq(page), [])
+    req = sim.post(0, [0], dst=[0], copy_engine=True)
+    while host.pump():
+        pass
+    return req, host.mapping(0)[0]
+
+
+def test_a_copying_lease_is_released_at_the_owners_next_poll_not_by_the_copy_thread(tmp_path):
+    """D7: the copy thread publishes CopyDone and hands the job back; the owner releases the lease when it next runs."""
+    s, page, host, sim, dst = hp.build_host(tmp_path)
+    try:
+        req, slot = _copy_request(s, page, host, sim)
+        host.copy_engine_release(-1)
+        deadline = time.time() + 5
+        while sim.copy_done(req)[:2] != (hp.lease.COPIED, req.gen):
+            assert time.time() < deadline
+            time.sleep(0.001)
+        assert host.slot_info(0)[slot][2] == 1, "the copy thread released the lease itself"
+        host.pump()
+        assert host.slot_info(0)[slot][2] == 0, "the owner's poll did not release it"
+    finally:
+        host.stop()
+
+
+def test_a_pause_retires_a_copy_that_completed_while_parked(tmp_path):
+    """Review Focus 3: pause() waits for the copy engine to go idle, then the pausing caller (the owner) drains the
+    completion ring and retires the COPYING lease itself, so the pause is not refused. A pause with nothing
+    outstanding is not refused either."""
+    s, page, host, sim, dst = hp.build_host(tmp_path)
+    try:
+        req, slot = _copy_request(s, page, host, sim)
+        host.start_thread(fatal_wait_s=60.0, spin_us=2000)
+        threading.Timer(0.2, lambda: host.copy_engine_release(-1)).start()
+        host.pause(5.0)  # waits for the copy engine to go idle, then the pausing caller drains and retires
+        try:
+            assert host.slot_info(0)[slot][2] == 0
+            assert sim.copy_done(req)[:2] == (hp.lease.COPIED, req.gen)
+        finally:
+            host.resume()
+        host.pause(5.0)  # nothing outstanding: the second pause is not refused
+        host.resume()
+    finally:
+        host.stop()

@@ -1146,7 +1146,9 @@ class ExpertStreamHost:
         self._module.expert_stream_arm_copy_engine(self.handle, int(bool(on)))
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
-        """Whether every job handed to the copy thread completed (or failed) and was retired within ``timeout_s``."""
+        """Whether every job handed to the copy thread completed (or failed) within ``timeout_s``. The copy thread hands
+        each completed job back to the tier's owner, which releases its COPYING leases (D7): here, when the caller
+        owns the tier (no thread, or paused); otherwise at the running service's next poll."""
         return bool(self._module.expert_stream_copy_engine_idle(self.handle, int(timeout_s * 1e9)))
 
     def copy_engine_release(self, marks: int = -1) -> None:

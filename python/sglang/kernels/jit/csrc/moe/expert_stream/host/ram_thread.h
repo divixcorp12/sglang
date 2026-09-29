@@ -100,8 +100,8 @@ class RamThread {
     }
     // The service parked for this epoch (it drained the command ring first): this caller owns the tier until resume.
     tier_->set_parked(true);
-    // The caller synchronized the stream, so every copy wait has seen its CopyDone; the copy thread releases just
-    // after.
+    // The caller synchronized the stream, so every copy wait has seen its CopyDone. Once the copy engine is idle every
+    // job is in the completion ring, and this caller, the owner now, drains it and releases their COPYING leases (D7).
     tier_->wait_copy_idle_owned(now_ns() + timeout_ns);
     tier_->retire_leases(true);  // a settle pass: the synchronized stream left no signal still to land
     if (tier_->graph_leases_outstanding() > 0) {
