@@ -8,6 +8,13 @@
 // `threads_seen` counts the matches whether or not the shim is armed, so a caller can tell "no calls" from "no
 // thread was ever recognized".
 //
+// Whole-process mode (Task 18's arm C, a production server under LD_PRELOAD): when HOTPATH_SHIM_OUT is set, the
+// constructor arms the shim at load, so every tracked thread is counted from the moment it names itself, and a
+// destructor writes {"pid", "threads", "service", "copy"} as JSON to that path at exit -- only from a process that
+// recognized at least one tracked thread (a server forks several processes, and all of them load the shim), and to
+// "<path>.<pid>" when the path already exists, so no process overwrites another's counts. The destructor runs at a
+// normal exit (exit(), which Python's own shutdown calls); a process killed by a signal writes nothing.
+//
 // What a zero from this shim does NOT rule out (the calls it cannot see):
 //   - allocations libc makes internally (e.g. inside fopen, qsort, getaddrinfo or the dynamic loader), which call
 //     the allocator without going through the interposed PLT symbols;
@@ -20,14 +27,18 @@
 //   - sleeps other than nanosleep/clock_nanosleep (usleep, sched_yield, poll/epoll/select timeouts).
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <time.h>
+#include <unistd.h>
 
 enum { kMalloc, kFree, kMutex, kCond, kClock, kSleep, kFutex, kKinds };
 static _Atomic long counts[2][kKinds];
@@ -74,6 +85,7 @@ static int (*real_nanosleep)(const struct timespec*, struct timespec*);
 static int (*real_clock_nanosleep)(clockid_t, int, const struct timespec*, struct timespec*);
 static int (*real_setname)(pthread_t, const char*);
 static long (*real_syscall)(long, ...);
+static char out_path[4096];  // HOTPATH_SHIM_OUT, copied at load; empty: no exit dump
 
 __attribute__((constructor)) static void resolve(void) {
   real_mutex_lock = dlsym(RTLD_NEXT, "pthread_mutex_lock");
@@ -88,6 +100,12 @@ __attribute__((constructor)) static void resolve(void) {
   real_clock_nanosleep = dlsym(RTLD_NEXT, "clock_nanosleep");
   real_setname = dlsym(RTLD_NEXT, "pthread_setname_np");
   real_syscall = dlsym(RTLD_NEXT, "syscall");
+  // Test code: a raw getenv, read once at load, before any tracked thread exists.
+  const char* out = getenv("HOTPATH_SHIM_OUT");
+  if (out != NULL && out[0] != '\0' && strlen(out) < sizeof(out_path) - 32) {
+    strcpy(out_path, out);
+    atomic_store(&armed, 1);
+  }
 }
 
 // A hook still NULL when it is first called (a call made before the constructor ran, e.g. from another preloaded
@@ -139,3 +157,36 @@ void hotpath_shim_arm(int on) { atomic_store(&armed, on); }
 void hotpath_shim_reset(void) { for (int t = 0; t < 2; ++t) for (int k = 0; k < kKinds; ++k) atomic_store(&counts[t][k], 0); }
 long hotpath_shim_count(int thread, int kind) { return atomic_load(&counts[thread][kind]); }
 long hotpath_shim_threads(int thread) { return atomic_load(&threads_seen[thread]); }
+
+static const char* const kKindNames[kKinds] = {"malloc", "free", "mutex", "cond", "clock", "sleep", "futex"};
+
+// The exit dump (HOTPATH_SHIM_OUT). Formats into a stack buffer and writes with open/write: no stdio, no allocation.
+__attribute__((destructor)) static void dump(void) {
+  if (out_path[0] == '\0') return;
+  const long seen0 = atomic_load(&threads_seen[0]), seen1 = atomic_load(&threads_seen[1]);
+  if (seen0 + seen1 == 0) return;  // not the process that ran the service: leave the file to the one that did
+  char buf[1024];
+  int n = snprintf(buf, sizeof(buf), "{\"pid\": %d, \"threads\": {\"service\": %ld, \"copy\": %ld}", (int)getpid(),
+                   seen0, seen1);
+  for (int t = 0; t < 2; ++t) {
+    n += snprintf(buf + n, sizeof(buf) - n, ", \"%s\": {", t == 0 ? "service" : "copy");
+    for (int k = 0; k < kKinds; ++k)
+      n += snprintf(buf + n, sizeof(buf) - n, "%s\"%s\": %ld", k ? ", " : "", kKindNames[k],
+                    atomic_load(&counts[t][k]));
+    n += snprintf(buf + n, sizeof(buf) - n, "}");
+  }
+  n += snprintf(buf + n, sizeof(buf) - n, "}\n");
+  int fd = open(out_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd < 0 && errno == EEXIST) {
+    char alt[sizeof(out_path) + 16];
+    snprintf(alt, sizeof(alt), "%s.%d", out_path, (int)getpid());
+    fd = open(alt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  }
+  if (fd < 0) return;
+  for (int off = 0; off < n;) {
+    ssize_t w = write(fd, buf + off, n - off);
+    if (w <= 0) break;
+    off += (int)w;
+  }
+  close(fd);
+}

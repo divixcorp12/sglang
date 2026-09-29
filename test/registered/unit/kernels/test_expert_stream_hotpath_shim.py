@@ -1,6 +1,7 @@
 """The counting shim (plan 2026-09-29-hotpath-zero-overhead Task 3), and the hot path's per-request allocator, mutex,
 condvar, clock and sleep counts on the service and copy threads, measured on the build production loads."""
 
+import json
 import subprocess
 import textwrap
 
@@ -66,6 +67,44 @@ def test_the_shim_counts_a_named_threads_calls_and_nothing_else(shim, tmp_path):
     assert counts == {"service": expected, "copy": expected}, counts
     # Two ram-miss threads were recognized (the disarmed one too), so its zero is "not counted", not "not seen".
     assert values[2 * kinds:] == [2, 1], values
+
+
+EXIT_PROBE = r'''
+    #define _GNU_SOURCE
+    #include <pthread.h>
+    #include <stdlib.h>
+    #include <time.h>
+    static void work(void) { struct timespec t, zero = {0, 0}; for (int i = 0; i < 3; ++i) free(malloc(64));
+      clock_gettime(CLOCK_MONOTONIC, &t); nanosleep(&zero, 0); }
+    static void* named(void* name) { pthread_setname_np(pthread_self(), (const char*)name); work(); return 0; }
+    static void run(const char* name) { pthread_t t; pthread_create(&t, 0, named, (void*)name); pthread_join(t, 0); }
+    int main(int argc, char** argv) { if (argc > 1) { run("x-ram-miss"); run("x-copy-eng"); } else work(); return 0; }
+'''
+
+
+def test_hotpath_shim_out_arms_at_load_and_dumps_at_exit(shim, tmp_path):
+    """Task 18's whole-run mode: with HOTPATH_SHIM_OUT set the shim is armed from load (the probe never calls
+    hotpath_shim_arm) and writes both threads' counts as JSON at exit; a process that recognized no tracked thread
+    (the probe without arguments, like a server's other processes) writes nothing; and a second process that did finds
+    the path taken and writes <path>.<pid> instead of overwriting it."""
+    src = tmp_path / "exit_probe.c"
+    src.write_text(textwrap.dedent(EXIT_PROBE))
+    exe = tmp_path / "exit_probe"
+    subprocess.run(["cc", "-O0", "-o", str(exe), str(src), "-lpthread"], check=True)
+    out = tmp_path / "counts.json"
+    env = {"LD_PRELOAD": str(shim), "HOTPATH_SHIM_OUT": str(out)}
+    subprocess.run([str(exe)], env=env, check=True)
+    assert not out.exists(), "a process with no tracked thread must not write the dump"
+    subprocess.run([str(exe), "named"], env=env, check=True)
+    got = json.loads(out.read_text())
+    expected = {"malloc": 3, "free": 3, "mutex": 0, "cond": 0, "clock": 1, "sleep": 1, "futex": 0}
+    assert got["threads"] == {"service": 1, "copy": 1}, got
+    assert got["service"] == expected and got["copy"] == expected, got
+    second = subprocess.run([str(exe), "named"], env=env, check=True)
+    assert second.returncode == 0
+    extra = [p for p in tmp_path.iterdir() if p.name.startswith("counts.json.")]
+    assert len(extra) == 1 and json.loads(extra[0].read_text())["service"] == expected, extra
+    assert json.loads(out.read_text()) == got, "the first process's dump was overwritten"
 
 
 def test_characterize_the_hot_path(shim, tmp_path):
