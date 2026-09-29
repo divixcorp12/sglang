@@ -663,6 +663,9 @@ class DeepseekV2MoE(nn.Module):
             is_deepseek_v4=is_deepseek_v4,
             vl_correction_bias=vl_correction_bias,
         )
+        # V4.1 routes through vision_topk with or without a vision tower: it always emits the
+        # standard top-k format, while self.topk bypasses under flashinfer_mxfp4 with non-FP4 experts.
+        self.v41_router = is_deepseek_v4 and config.model_type == "deepseek_v41"
         if is_deepseek_v4 and not is_nextn and envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get():
             from sglang.srt.layers.moe.exl3_native_prefetch import register_gate
 
@@ -1050,11 +1053,14 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            if self.gate.e_score_correction_bias_vl is not None:
+            if self.v41_router:
                 topk_output = vision_topk(
                     self,
                     router_logits,
-                    input_ids_global,
+                    # No VL bias without a vision tower: the image-token bias switch is off.
+                    input_ids_global
+                    if self.gate.e_score_correction_bias_vl is not None
+                    else None,
                     num_token_non_padded=num_token_non_padded,
                 )
             else:
@@ -1292,11 +1298,14 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            if self.gate.e_score_correction_bias_vl is not None:
+            if self.v41_router:
                 topk_output = vision_topk(
                     self,
                     router_logits,
-                    input_ids_global,
+                    # No VL bias without a vision tower: the image-token bias switch is off.
+                    input_ids_global
+                    if self.gate.e_score_correction_bias_vl is not None
+                    else None,
                     num_token_non_padded=num_token_non_padded,
                 )
             else:
