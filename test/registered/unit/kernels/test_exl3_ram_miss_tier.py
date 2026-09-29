@@ -566,18 +566,25 @@ def test_the_host_refuses_a_page_or_slot_map_it_cannot_index(tmp_path, page_fn, 
         ExpertStreamHost(s.tables, page=page_fn(), slot_map=map_fn())
 
 
-def test_release_refuses_a_slot_that_is_still_loading(tier):
+def test_an_owned_call_waits_for_a_pump_on_another_thread(tier):
+    """B3 fix round (review Minor 3): the caller of pump() owns the tier for its whole request, and pump() takes
+    caller_mutex_, so another Python thread's owned call is serialized behind that request instead of racing it: it
+    never sees the claimed slot still LOADING. (This test used to release from a second thread mid-read, expecting the
+    "loading" refusal: that second thread is the second owner the single-owner rule forbids. release()'s refusal stays
+    as a backstop no legal caller reaches.)"""
     s, page, slot_map, host = tier
     host.inject(delay_s=0.5)
     seq = sim_post(page, 0, need=[1], protect=[1])
     pumper = threading.Thread(target=host.pump)
     pumper.start()
     try:
-        assert _until(lambda: 1 in host.slot_to_expert(0))
-        slot = host.slot_to_expert(0).index(1)
-        assert slot_map[0, 1].item() == -1  # LOADING: not published yet
-        with pytest.raises(RuntimeError, match="loading"):
-            host.release(0, slot)
+        assert _until(lambda: page_word(page, "busy_seq") == seq)  # a lock-free word: the pump is in the request
+        start = time.perf_counter()
+        assert host.contains(0, 1)  # an owned call: it waits for the pump's request to end
+        waited = time.perf_counter() - start
+        slot = slot_map[0, 1].item()
+        assert slot >= 0, "the owned call ran while the pump's slot was still LOADING"
+        assert waited > 0.2, f"the owned call returned after {waited:.3f} s, inside the 0.5 s read"
     finally:
         pumper.join(timeout=10)
     assert sim_wait(page, seq, 1.0) == 1 and slot_map[0, 1].item() == slot
@@ -585,7 +592,7 @@ def test_release_refuses_a_slot_that_is_still_loading(tier):
 
 _CLOSE_DURING_PUMP = """
 import pathlib, sys, threading, time
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word, sim_post, sim_wait
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
@@ -597,8 +604,11 @@ results = []
 pumper = threading.Thread(target=lambda: results.append(host.pump()))
 pumper.start()
 deadline = time.perf_counter() + 5.0
-while 1 not in host.slot_to_expert(0) and time.perf_counter() < deadline:
+# busy_seq, a lock-free word: a snapshot would now wait for the pump (it holds caller_mutex_), and the close below
+# must land while the pump is inside the read.
+while page_word(page, "busy_seq") != seq and time.perf_counter() < deadline:
     time.sleep(0.005)
+assert page_word(page, "busy_seq") == seq
 host.stop()  # closes the handle while the pump is inside a read
 pumper.join(timeout=10)
 assert results == [1] and sim_wait(page, seq, 1.0) == 1, results

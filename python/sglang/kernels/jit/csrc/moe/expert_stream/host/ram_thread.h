@@ -108,8 +108,13 @@ class RamThread {
     const int64_t deadline = now_ns() + timeout_ns;
     while (parked_epoch_.load(std::memory_order_acquire) != epoch) {
       // A stop() racing this pause: the service is leaving and will not park for this epoch, so do not wait out the
-      // whole timeout. stop_ is its first store, threaded_ its last; either says so.
-      if (now_ns() > deadline || stop_.load(std::memory_order_acquire) || !tier_->threaded()) {
+      // whole timeout. stop_ is its first store, threaded_ its last; either says so. (The deadline test keeps its own
+      // line: test_exl3_ram_miss_stage_trace_causal counts the clock reads by line.)
+      if (stop_.load(std::memory_order_acquire) || !tier_->threaded()) {
+        resume_locked();
+        return 0;
+      }
+      if (now_ns() > deadline) {
         resume_locked();
         return 0;
       }
