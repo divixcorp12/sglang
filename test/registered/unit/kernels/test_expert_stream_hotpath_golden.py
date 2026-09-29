@@ -66,6 +66,10 @@ if __name__ == "__main__" and "--regen" in sys.argv:
     import tempfile
 
     with tempfile.TemporaryDirectory(dir=Path.home()) as a, tempfile.TemporaryDirectory(dir=Path.home()) as b:
+        # write_fake_exl3 writes into an existing directory (pytest's tmp_path is one), and ram_miss_setup puts the
+        # row images beside it, so each fixture gets a fresh subdirectory of its own temporary directory.
+        (Path(a) / "s").mkdir()
+        (Path(b) / "q").mkdir()
         GOLDEN.parent.mkdir(exist_ok=True)
         GOLDEN.write_text(json.dumps({"scenario": scenario(Path(a) / "s"), "sqes": sqe_golden(Path(b) / "q")},
                                      indent=1, sort_keys=True))
