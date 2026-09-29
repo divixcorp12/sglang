@@ -49,15 +49,22 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     s = ram_miss_setup(tmp_path)
     t = s.tables
     keep = t.segments[:, 0] < 2
+    # A row image is read whole, and the reader refuses a read of bytes no segment names: the one part (one root) is
+    # cut to the kept names' bytes, [0, the end of the last kept segment), which the image lays out first.
+    kept = t.segments[keep]
+    assert t.parts == 1 and int(kept[:, 2].min()) == 0
+    extents = t.extents.clone()
+    extents[..., 2] = int((kept[:, 2] + kept[:, 3]).max())
     tables = dataclasses.replace(
-        t, slabs=t.slabs[:, :2].contiguous(), row_bytes=t.row_bytes[:2].contiguous(), segments=t.segments[keep].contiguous()
+        t, slabs=t.slabs[:, :2].contiguous(), row_bytes=t.row_bytes[:2].contiguous(),
+        segments=kept.contiguous(), extents=extents,
     )
     loaded = []
     real = transport._host_module
     monkeypatch.setattr(transport, "_host_module", lambda layout="exl3": loaded.append(layout) or real(layout))
     page = new_page(pin=False)
     slot_map = torch.full(tuple(t.starts.shape), -1, dtype=torch.int32)
-    host = ExpertStreamHost(tables, page=page, slot_map=slot_map, direct=False, layout="two")
+    host = ExpertStreamHost(tables, page=page, slot_map=slot_map, direct=True, layout="two")
     try:
         assert (host.layout_names, host.small_mask) == (("a", "b"), 0b10)
         host.enable_trace()

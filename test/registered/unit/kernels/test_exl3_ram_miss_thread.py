@@ -33,7 +33,7 @@ def _host(tmp_path, capacity=3, fatal_wait_s=5.0):
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=True)
     host.start_thread(fatal_wait_s=fatal_wait_s)
     return s, page, slot_map, host
 
@@ -163,7 +163,7 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
 page = new_page(pin=False)
-host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
 """
 
 
@@ -269,7 +269,7 @@ def test_a_process_that_stops_after_fatal_is_not_aborted(tmp_path):
 def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
     s = ram_miss_setup(tmp_path)
     host = ExpertStreamHost(
-        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
+        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True
     )
     try:
         core = min(os.sched_getaffinity(0))
@@ -284,7 +284,7 @@ def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
 def test_a_reserved_or_unusable_core_is_refused(tmp_path, core, error, match):
     s = ram_miss_setup(tmp_path)
     host = ExpertStreamHost(
-        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
+        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True
     )
     try:
         with pytest.raises(error, match=match):
@@ -336,7 +336,7 @@ def _tier(tmp_path, capacity=6):
     """A host with no service thread: the tests pump it, so nothing races."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
     return s, page, host
 
 

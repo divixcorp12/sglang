@@ -210,7 +210,9 @@ def _equal(a, b):
 
 
 def _read(s, **faults):
-    result, log, info, record = read_rows_sqes(s.tables, 1, EXPERTS, SLOTS, direct=False, max_sqes=65536, **faults)
+    result, log, info, record = read_rows_sqes(
+        s.tables, 1, EXPERTS, SLOTS, direct=bool(s.tables.row_images), max_sqes=65536, **faults
+    )
     return result, log, info, record, _snapshot(s.slabs)
 
 
@@ -326,7 +328,7 @@ def test_one_failing_cut_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_p
     s = _setup(tmp_path, True)
     stats, cqes = {}, []
     first, then = read_rows_with_fault(
-        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=False, part=0, part_error=errno.EIO,
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=True, part=0, part_error=errno.EIO,
         ordinal=0, leg=1, leg_cut_cap=CUT, stats=stats, cqes=cqes, **_pieces(True, pieces))
     assert (first, then) == (0, 1)
     assert stats["unfinished_jobs"] == 0 and stats["cut_reads"] > 0
@@ -336,7 +338,7 @@ def test_one_failing_cut_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_p
 def test_ring_reset_with_cut_legs(tmp_path, uring_env, submit_first):
     s = _setup(tmp_path, True)
     first, then = read_rows_with_fault(
-        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=False,
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=True,
         submit_error=errno.EIO, submit_call=1, submit_first=submit_first, leg_cut_cap=CUT)
     assert (first, then) == (0, 1)
 

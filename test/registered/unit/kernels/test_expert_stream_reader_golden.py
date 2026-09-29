@@ -600,7 +600,7 @@ def _measure(root, weights, images, faults):
     for slabs in (s.slabs.values() if isinstance(s.slabs, dict) else s.slabs):
         for t in (slabs.values() if isinstance(slabs, dict) else [slabs]):
             t.view(torch.uint8).fill_(0x5A)  # a fixed prior content, so unread bytes are pinned too
-    result, log, info, record = read_rows_sqes(s.tables, 1, EXPERTS, SLOTS, direct=False, **faults)
+    result, log, info, record = read_rows_sqes(s.tables, 1, EXPERTS, SLOTS, direct=images, **faults)
     h = hashlib.sha256()
     _slab_digest(s.slabs, h)
     return {

@@ -64,7 +64,7 @@ def _equal(a, b):
 
 
 def _read(s, **faults):
-    result, log, info, record = read_rows_sqes(s.tables, 1, EXPERTS, SLOTS, direct=False, **faults)
+    result, log, info, record = read_rows_sqes(s.tables, 1, EXPERTS, SLOTS, direct=bool(s.tables.row_images), **faults)
     return result, log, info, record, _snapshot(s.slabs)
 
 
@@ -162,7 +162,7 @@ def test_one_failing_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_path,
     # is clean. (unfinished_jobs counts packing jobs, not SQEs, so it cannot see the drain; the drain guard is
     # test_ring_reset_mid_fan_out.)
     first, then = _supported(lambda: read_rows_with_fault(
-        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=False, part=0, part_error=errno.EIO,
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=True, part=0, part_error=errno.EIO,
         ordinal=0, leg=1, fixed_chunk_cap=CAP, stats=stats, cqes=cqes, **_pieces(True, pieces)))
     assert (first, then) == (0, 1)
     assert stats["unfinished_jobs"] == 0 and stats["fixed_cuts"] > 0
@@ -177,7 +177,7 @@ def test_ring_reset_mid_fan_out(tmp_path, uring_env, read_mode, submit_first):
     # ring and must re-create the sparse table, re-add every chunk and re-register the files) or all did (drain waits
     # for every leg). Either way the clean second read on the same reader succeeds.
     first, then = _supported(lambda: read_rows_with_fault(
-        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=False,
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=True,
         submit_error=errno.EIO, submit_call=1, submit_first=submit_first, fixed_chunk_cap=CAP))
     assert (first, then) == (0, 1)
 
@@ -223,7 +223,7 @@ root = pathlib.Path(sys.argv[1]); root.mkdir(parents=True)
 s = ram_miss_setup(root, capacity=12, experts=12, row_images=True)
 resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))
 try:
-    read_rows_sqes(s.tables, 1, [0, 1], [0, 1], direct=False)
+    read_rows_sqes(s.tables, 1, [0, 1], [0, 1], direct=True)
     print("READ WITHOUT REGISTRATION")  # a silent fallback: the missing REFUSED fails the test
 except RuntimeError as e:
     print("REFUSED", e)
@@ -258,7 +258,7 @@ root = pathlib.Path(sys.argv[1]); root.mkdir(parents=True)
 s = ram_miss_setup(root, capacity=12, experts=12, row_images=True)
 try:
     result = read_rows_with_fault(
-        s.tables, 1, [10, 3, 7, 0], [7, 0, 11, 3], [11, 5], [9, 1], direct=False, submit_error=errno.EIO,
+        s.tables, 1, [10, 3, 7, 0], [7, 0, 11, 3], [11, 5], [9, 1], direct=True, submit_error=errno.EIO,
         submit_call=1, ring_reset_fail=True, fixed_chunk_cap=int(sys.argv[2]))
     print("NO ERROR", result)  # the reset did not fail, or its failure was swallowed: the assertion names it
 except RuntimeError as e:

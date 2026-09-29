@@ -63,7 +63,8 @@ def _direct(s):
 
 
 def _images_setup(tmp_path, **kwargs):
-    return ram_miss_setup(tmp_path, row_images=True, **kwargs)
+    # A reused test pinned to shard tables (row_images=False) is rerun here on images all the same.
+    return ram_miss_setup(tmp_path, **{**kwargs, "row_images": True})
 
 
 @pytest.fixture(params=[False, True], ids=["img", "img_pieces"])
@@ -177,6 +178,48 @@ ONE_READ_PER_PART = {
 }
 
 
+# Every suite reads row images by default (plan 2026-09-29-hotpath-zero-overhead Task 5), so the tests reused above now
+# run on images in their own modules too. Those still pinned to the packed reader (shard tables, buffered) until the
+# packed path is deleted (Task 6) are NOT_REUSED and ONE_READ_PER_PART above, every test of
+# test_exl3_ram_miss_pack_workers, and these, each with why it is bounce-only:
+BOUNCE_ONLY_PINNED = {
+    "test_exl3_ram_miss_stage_trace.py::test_one_record_per_request_in_order": (
+        "asserts pack_ns > 0: a direct row is finished at one clock, so its span is 0"
+    ),
+    "test_exl3_ram_miss_tier.py::test_a_fault_injected_at_the_tier_fails_a_row_after_others_packed_and_publishes_none": (
+        "the bounce's untouched-slot rule: a direct read lands the failed row's other part in its slot"
+    ),
+    "test_exl3_ram_miss_row_images.py::test_the_direct_mode_leaves_every_slab_byte_as_the_bounce_path_does": (
+        "its bounce side is the packed reader the direct mode is compared with"
+    ),
+    "test_exl3_ram_miss_prefill_fills.py::*[shards-*]": "the shard parameter of a fixture that runs both readers",
+    "test_expert_stream_fixed_buffers.py::*[bounce-*]": "the bounce parameter of a test that runs both readers",
+    "test_expert_stream_read_cuts.py::*[bounce-*]": "the bounce parameter of a test that runs both readers",
+    "test_expert_stream_reader_golden.py::test_reader_matches_the_base_commit[<shard shapes>]": (
+        "the bounce shapes of the reader golden (one_root, halves, three_roots, three_roots_zero_mid)"
+    ),
+    "test_exl3_ram_miss_piece_stream_parts.py::*[<shard shapes>]": "the bounce shapes of the part-geometry golden",
+    "test_expert_stream_uring_integration.py::*[fixed-shard-bounce]": "the bounce parameter of a test that runs both",
+    "layers/moe/test_exl3_ram_miss_service.py::test_the_service_reads_through_the_mirror_roots_the_env_names": (
+        "asserts the shard tables' part split of the page-rounded superset"
+    ),
+    "layers/moe/test_exl3_ram_miss_service.py::test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_block": (
+        "its subject is leases off, which row images refuse"
+    ),
+    "layers/moe/test_exl3_ram_miss_service.py::test_lease_pdl_without_leases_is_refused": (
+        "its subject is leases off, which row images refuse first"
+    ),
+    "layers/moe/test_exl3_ram_miss_service.py::test_piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold": (
+        "the packing-worker rule and leases off; images need no workers"
+    ),
+    "manual/dsv41/test_exl3_ram_miss_graph_gpu.py::*[leases_off*]": "leases off, which row images refuse",
+    "manual/dsv41/test_exl3_ram_miss_graph_gpu.py::test_lease_mode_*_is_byte_exact_against_off": (
+        "its off arm (_layers(lease=False)) is leases off; its on arm reads row images"
+    ),
+    "manual/dsv41/test_exl3_task5_item4_gpu.py::*[leases_off-*]": "leases off (_layers(lease=False))",
+}
+
+
 def _reuse(module, fixture_of, prefix=""):
     for name, test in vars(module).items():
         if not (name.startswith("test_") and inspect.isfunction(test)) or name in NOT_REUSED:
@@ -211,6 +254,16 @@ def test_the_fixture_puts_a_reused_test_on_row_images_read_with_o_direct(tmp_pat
     assert result == 1 and record["piece_stream"] == int(row_images) and record["pack_workers"] == 0
 
 
+def test_the_fixture_builds_row_image_tables_by_default_and_requires_o_direct(tmp_path, monkeypatch):
+    s = ram_miss_setup(tmp_path / "a")
+    assert s.tables.row_images and all(path.endswith(".rows") for path in s.tables.paths)
+    from sglang.test import dsv41_ram_miss_fixtures as fx
+
+    monkeypatch.setattr(fx, "_takes_o_direct", lambda path: False)
+    with pytest.raises(RuntimeError, match="O_DIRECT"):
+        fx.ram_miss_setup(tmp_path / "b")
+
+
 # ---- The direct mode lands the same bytes as the bounce path ----
 
 
@@ -237,7 +290,9 @@ def test_the_direct_mode_leaves_every_slab_byte_as_the_bounce_path_does(tmp_path
     batch, and every mirror split; the image's last part ends inside a page, so the padding is never read."""
     for name in ("bounce", "direct"):
         (tmp_path / name).mkdir()
-    bounce = ram_miss_setup(tmp_path / "bounce", capacity=12, experts=12, mirror_weights=weights, hidden=256, inter=256)
+    bounce = ram_miss_setup(
+        tmp_path / "bounce", capacity=12, experts=12, mirror_weights=weights, hidden=256, inter=256, row_images=False
+    )
     direct = _images_setup(tmp_path / "direct", capacity=12, experts=12, mirror_weights=weights)
     assert direct.tables.slot_bytes % PAGE != 0  # the image ends inside its last page
     requests = [(0, [4], [2], 8), (1, list(range(11))[::-1], [7, 0, 11, 3, 9, 1, 5, 10, 2, 8, 4], 8), (0, [4, 1, 3], [2, 0, 1], 1)]

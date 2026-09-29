@@ -42,7 +42,7 @@ def running(request, tmp_path):
         s.tables,
         page=page,
         slot_map=torch.full((2, 6), -1, dtype=torch.int32),
-        direct=False,
+        direct=True,
         pack_workers=request.param,
     )
     host.enable_lease_mode()
@@ -135,7 +135,7 @@ def world(tmp_path):
     """The service driven by hand (no thread): every retirement pass is a ``pump``."""
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
     host.enable_lease_mode()
     yield s, page, host, LeaseSim(host, page, s.slabs)
     host.stop()

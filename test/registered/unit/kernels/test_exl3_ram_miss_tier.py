@@ -48,7 +48,7 @@ def tier(tmp_path, request):
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=True)
     yield s, page, slot_map, host
     host.stop()
 
@@ -98,7 +98,7 @@ def test_gpu_hot_sidecar_arms_no_read_lease_and_protects_a_victim(tmp_path, two_
     s = ram_miss_setup(tmp_path, capacity=3)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=True, hot_page=hot_page)
     try:
         host.enable_lease_mode()
         if two_phase:
@@ -133,7 +133,7 @@ def test_gpu_hot_sidecar_fails_closed_on_stale_bitmap_and_wraps(tmp_path, fault)
     s = ram_miss_setup(tmp_path, capacity=3)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False, hot_page=hot_page)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=True, hot_page=hot_page)
     try:
         host.enable_lease_mode()
         host.enable_gpu_hot()
@@ -235,19 +235,24 @@ def _row_states(s, layer, experts):
 
 
 @pytest.fixture
-def mirrored_tier(tmp_path):
-    """A tier whose rows each read as two extents (two mirror parts), so a fault can hit one part of one row."""
-    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+def mirrored_tier(tmp_path, request):
+    """A tier whose rows each read as two extents (two mirror parts), so a fault can hit one part of one row. Row-image
+    tables; ``False`` as the indirect parameter builds shard tables instead (a bounce-only test pinned to the packed
+    reader, test_exl3_ram_miss_row_images.BOUNCE_ONLY_PINNED)."""
+    row_images = getattr(request, "param", True)
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0), row_images=row_images)
     for slot in range(6):
         for name in EXL3_STREAMED_NAMES:
             s.slabs[1][name][slot].view(torch.uint8).fill_(0xAB)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=row_images)
     yield s, page, slot_map, host
     host.stop()
 
 
+# The bounce's untouched-slot rule: a direct read lands the failed row's other part in its slot.
+@pytest.mark.parametrize("mirrored_tier", [False], indirect=True, ids=["shards"])
 def test_a_fault_injected_at_the_tier_fails_a_row_after_others_packed_and_publishes_none(mirrored_tier):
     """The case fail_reads cannot reach: that flag returns before the reader runs, so nothing has packed and
     'publishes none of the rows it packed' holds vacuously. inject_fault reaches the reader, so rows 0 and 1
@@ -305,7 +310,7 @@ def test_a_slab_table_narrower_than_the_layout_is_refused(tmp_path):
     s = ram_miss_setup(tmp_path)
     narrow = dataclasses.replace(s.tables, slabs=s.tables.slabs[:, :5].contiguous(), row_bytes=s.tables.row_bytes[:5])
     with pytest.raises(RuntimeError, match="^slabs: "):
-        expert_stream_transport.read_rows_once(narrow, row=0, experts=[0], slots=[0], direct=False)
+        expert_stream_transport.read_rows_once(narrow, row=0, experts=[0], slots=[0], direct=True)
 
 
 def test_open_refuses_an_extent_table_of_the_wrong_dtype(tmp_path):
@@ -315,7 +320,7 @@ def test_open_refuses_an_extent_table_of_the_wrong_dtype(tmp_path):
     s = ram_miss_setup(tmp_path)
     bad = dataclasses.replace(s.tables, extents=s.tables.extents.to(torch.int32))
     with pytest.raises(Exception, match="^extents: "):
-        expert_stream_transport.read_rows_once(bad, row=0, experts=[0], slots=[0], direct=False)
+        expert_stream_transport.read_rows_once(bad, row=0, experts=[0], slots=[0], direct=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device to show experts is refused off it")
@@ -325,7 +330,7 @@ def test_read_rows_refuses_a_cuda_experts_tensor(tmp_path):
     (``_ids``), so this device refusal is only observable by calling the raw C++ export directly."""
     s = ram_miss_setup(tmp_path)
     module = expert_stream_transport._host_module()
-    args = expert_stream_transport._table_args(s.tables, False)
+    args = expert_stream_transport._table_args(s.tables, True)
     experts = torch.tensor([0], dtype=torch.int64, device="cuda")
     slots = torch.tensor([0], dtype=torch.int64)
     with pytest.raises(Exception, match="^experts: "):
@@ -438,7 +443,7 @@ import pathlib, sys, torch
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
-host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
 try:
     host._module.expert_stream_mapping(host.handle, host.layers, torch.empty(host.experts, dtype=torch.int64))
     print("no refusal")
@@ -581,7 +586,7 @@ def test_a_repeated_protect_id_takes_one_slot(tier):
 def test_the_host_refuses_a_page_or_slot_map_it_cannot_index(tmp_path, page_fn, map_fn):
     s = ram_miss_setup(tmp_path)
     with pytest.raises(ValueError):
-        ExpertStreamHost(s.tables, page=page_fn(), slot_map=map_fn(), direct=False)
+        ExpertStreamHost(s.tables, page=page_fn(), slot_map=map_fn(), direct=True)
 
 
 def test_release_refuses_a_slot_that_is_still_loading(tier):
@@ -608,7 +613,7 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
 page = new_page(pin=False)
-host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
 host.inject(delay_s=0.5)
 seq = sim_post(page, 0, need=[1], protect=[1])
 results = []
@@ -639,7 +644,7 @@ def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, 
         s = ram_miss_setup(tmp_path / str(i))
         hosts.append(
             ExpertStreamHost(
-                s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
+                s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True
             )
         )
 

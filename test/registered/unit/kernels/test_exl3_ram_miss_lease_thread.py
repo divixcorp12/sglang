@@ -37,7 +37,7 @@ def hang_guard():
 def running(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
     host.enable_lease_mode()
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
     yield s, page, host, LeaseSim(host, page, s.slabs)
@@ -180,7 +180,7 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 FATAL_WAIT = 0.3
 s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=2)
 page = new_page(pin=False)
-host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
 host.enable_lease_mode()
 sim = LeaseSim(host, page, s.slabs)
 host.start_thread(fatal_wait_s=FATAL_WAIT, spin_us=200)

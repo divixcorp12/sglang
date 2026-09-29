@@ -52,19 +52,31 @@ def _mode_id(mode):
 def packing(request, monkeypatch):
     """Every reader a reused test builds packs on workers, unless the test names its own ``pack_workers``, and
     streams pieces in the piece-stream modes whenever it has workers (the flag needs them)."""
-    yield from _packing(request.param, monkeypatch)
+    yield from _packing(request.param, monkeypatch, request)
 
 
 @pytest.fixture(params=[mode for mode in MODES if not mode[2]], ids=_mode_id)
 def packing_without_pieces(request, monkeypatch):
     """``packing``'s modes without piece streaming, for the tests in ONE_READ_PER_PART."""
-    yield from _packing(request.param, monkeypatch)
+    yield from _packing(request.param, monkeypatch, request)
 
 
-def _packing(mode, monkeypatch):
+def _shard_setup(tmp_path, **kwargs):
+    return ram_miss_setup(tmp_path, **{**kwargs, "row_images": False})
+
+
+def _packing(mode, monkeypatch, request):
+    """Every test here is about the packing pool, which only the packed reader has: until it is deleted (plan
+    2026-09-29-hotpath-zero-overhead Task 6) the reused tests stay on what they tested, shard tables read buffered
+    (a test that parametrizes ``direct`` itself keeps it), though their own modules now read row images with O_DIRECT."""
     workers, chunks, piece_stream = mode
-    fault_tensor, host_init = ops._fault_tensor, ExpertStreamHost.__init__
+    fault_tensor, host_init, table_args = ops._fault_tensor, ExpertStreamHost.__init__, ops._table_args
     monkeypatch.setattr(split, "PIECE_STREAM", piece_stream)
+    for module in (split, thread):
+        monkeypatch.setattr(module, "ram_miss_setup", _shard_setup)
+    buffered = "direct" not in getattr(getattr(request.node, "callspec", None), "params", {})
+    if buffered:
+        monkeypatch.setattr(ops, "_table_args", lambda tables, direct: table_args(tables, False))
 
     def with_workers(**faults):
         faults.setdefault("pack_workers", workers)
@@ -73,9 +85,10 @@ def _packing(mode, monkeypatch):
             faults.setdefault("piece_stream", True)
         return fault_tensor(**faults)
 
-    def init(self, *args, pack_workers=None, **kwargs):
-        host_init(self, *args, pack_workers=workers if pack_workers is None else pack_workers, **kwargs)
-        if piece_stream and (workers if pack_workers is None else pack_workers) > 0:
+    def init(self, *args, pack_workers=None, direct=False, **kwargs):
+        workers_ = workers if pack_workers is None else pack_workers
+        host_init(self, *args, pack_workers=workers_, direct=direct and not buffered, **kwargs)
+        if piece_stream and workers_ > 0:
             self.enable_piece_stream()
 
     monkeypatch.setattr(ops, "_fault_tensor", with_workers)
@@ -151,7 +164,7 @@ def _pack_threads():
 
 def test_the_fixture_puts_a_reused_test_on_the_workers_it_names(tmp_path, packing):
     """The reused tests name no worker count of their own: this is what shows the fixture reached the reader."""
-    s = ram_miss_setup(tmp_path, capacity=6)
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=6)
     stats = {}
     assert ops.read_rows_with_fault(s.tables, 1, [0, 1], [0, 1], [2], [2], direct=False, stats=stats) == (1, 1)
     assert stats["pack_workers"] == packing[0]
@@ -164,7 +177,7 @@ def test_the_flag_defaults_to_off():
 def test_no_worker_thread_exists_unless_asked_for_and_close_joins_them(tmp_path):
     def host(workers):
         (tmp_path / f"w{workers}").mkdir()
-        s = ram_miss_setup(tmp_path / f"w{workers}", capacity=3)
+        s = ram_miss_setup(tmp_path / f"w{workers}", row_images=False, capacity=3)
         return ExpertStreamHost(
             s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
             direct=False, pack_workers=workers,
@@ -277,7 +290,7 @@ def test_the_unpinned_service_thread_keeps_off_the_packing_workers_cpus(tmp_path
     jobs and publishes the pieces: on a worker's CPU it would wait behind that worker's copy."""
     if len(os.sched_getaffinity(0) - set(range(64, 72))) < 3:
         pytest.skip("needs three allowed cores")
-    s = ram_miss_setup(tmp_path)
+    s = ram_miss_setup(tmp_path, row_images=False)
     host = ExpertStreamHost(
         s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False,
         pack_workers=2,
@@ -308,7 +321,7 @@ def test_workers_copy_rows_concurrently_and_a_row_is_cut_across_them(tmp_path):
     of them in a row; with three workers the copies overlap (a row per worker, or a chunk of every row
     per worker), so the whole read takes about one. Without this a 'worker' that merely runs the same
     serial copy on another thread would pass every byte-exactness test."""
-    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=6, mirror_weights=(1.0, 1.0))
     experts, slots = [3, 0, 5], [0, 1, 2]
 
     def read(workers, chunks):
@@ -333,7 +346,7 @@ def test_workers_copy_rows_concurrently_and_a_row_is_cut_across_them(tmp_path):
 
 @pytest.mark.parametrize("workers, chunks", [(2, 64), (1, 100_000), (4, 7)])
 def test_a_row_cut_into_many_more_chunks_than_it_has_lines_is_byte_exact(tmp_path, workers, chunks):
-    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=6, mirror_weights=(1.0, 1.0))
     experts, slots = [3, 0, 5, 1], [0, 1, 2, 3]
     result, _ = read_rows_traced(
         s.tables, 1, experts, slots, direct=False, pack_workers=workers, pack_split=chunks, poison=True
@@ -346,7 +359,7 @@ def test_a_failure_returns_only_when_no_copy_is_still_running(tmp_path, packing)
     """A hard error arrives while workers are still copying already-vetted rows. The caller releases
     every slot when the read returns and the next read reuses the bounce, so a copy still running then
     would write into a released slot and read a bank the next read is filling."""
-    s = ram_miss_setup(tmp_path, capacity=8, experts=8, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=8, experts=8, mirror_weights=(1.0, 1.0))
     experts, slots = [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]
     for slot in slots:
         split._sentinel(s, 1, slot)
@@ -370,7 +383,7 @@ def test_a_failure_returns_only_when_no_copy_is_still_running(tmp_path, packing)
 def test_a_row_short_of_its_segments_is_never_handed_to_a_worker(tmp_path, packing):
     """The coverage check runs on the owner before dispatch. A row it refuses must not be copied at all,
     not copied and then reported failed: the slot stays as it was."""
-    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=6, mirror_weights=(1.0, 1.0))
     need_end = int((s.tables.segments[:, 2] + s.tables.segments[:, 3]).max())
     assert int(s.tables.starts[1, 1]) + need_end > 0
     s.tables.extents[1, 1, 1, 2] -= PAGE
@@ -388,7 +401,7 @@ def test_no_extent_reuses_a_bank_before_the_copies_out_of_it_are_done(tmp_path, 
     would let the next batch's reads land in the bank while the copy is still reading it. Every extent
     of the batch that reuses the bank must be submitted after row 0's copy has ended, and the bytes
     must be exact under a poisoned bounce. (With instant copies the two orders cannot be told apart.)"""
-    s = ram_miss_setup(tmp_path, capacity=12, experts=12, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=12, experts=12, mirror_weights=(1.0, 1.0))
     experts, slots = list(range(11, -1, -1)), list(range(12))
     result, record = read_rows_traced(
         s.tables, 1, experts, slots, direct=False, step=4, hold_ordinal=0, pack_delay_ns=20_000_000, poison=True
@@ -422,7 +435,7 @@ def test_the_ordering_assertion_fires_on_a_record_that_violates_it():
 
 def test_held_rows_are_released_together_and_read_byte_exact(tmp_path, packing):
     """hold_rest is the knob the benchmark uses to hand the packer several rows at once."""
-    s = ram_miss_setup(tmp_path, capacity=8, experts=8, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=8, experts=8, mirror_weights=(1.0, 1.0))
     experts, slots = list(range(5)), list(range(5))
     result, record = read_rows_traced(s.tables, 1, experts, slots, direct=False, hold_ordinal=1, hold_rest=True)
     assert result == 1
@@ -433,7 +446,7 @@ def test_held_rows_are_released_together_and_read_byte_exact(tmp_path, packing):
 
 
 def test_pack_ns_is_the_sum_of_the_rows_spans(tmp_path, packing):
-    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=6, mirror_weights=(1.0, 1.0))
     result, record = read_rows_traced(s.tables, 1, [5, 0, 2, 3], [0, 1, 2, 3], direct=False, pack_delay_ns=2_000_000)
     assert result == 1
     spans = [row["end"] - row["start"] for row in record["row_pack"]]
@@ -445,7 +458,7 @@ def test_credit_and_rows_in_flight_do_not_depend_on_where_the_copy_runs(tmp_path
     """The reader's admission and credit accounting are the owner's alone: the high-water marks match
     the inline reader's for the same read. Piece streaming has no inline reader, so there the reference is
     one worker copying each row whole."""
-    s = ram_miss_setup(tmp_path, capacity=16, experts=16, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=16, experts=16, mirror_weights=(1.0, 1.0))
     experts, slots = list(range(16)), list(range(16))
     kwargs = dict(direct=False, max_outstanding=5)
     reference = dict(pack_workers=1, pack_split=1) if packing[2] else dict(pack_workers=0)
@@ -464,7 +477,7 @@ def test_a_stage_record_carries_the_packing_mode_that_produced_it(tmp_path, work
     """Inline is pack_workers 0. Without the two fields a worker-mode record is indistinguishable from an inline
     one, and the analysis reads the workers' wake-up delay as a busy packer. ``split`` is what the reader
     keeps: one chunk per worker unless told otherwise."""
-    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=6, mirror_weights=(1.0, 1.0))
     result, record = read_rows_traced(
         s.tables, 1, [3, 0, 5], [0, 1, 2], direct=False, pack_workers=workers, pack_split=chunks
     )
@@ -475,7 +488,7 @@ def test_a_stage_record_carries_the_packing_mode_that_produced_it(tmp_path, work
 def _served_records(tmp_path, workers, rows=(2,)):
     """A demand that reads ``rows``, one that finds them resident (no_read) and an unarmed one (touch), through a
     host built with ``workers``: the three shapes of record a request can end in."""
-    s = ram_miss_setup(tmp_path, capacity=6)
+    s = ram_miss_setup(tmp_path, row_images=False, capacity=6)
     page = new_page(pin=False)
     host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=workers
