@@ -47,12 +47,19 @@ def sqe_golden(tmp_path):
 def test_the_scripted_scenario_matches_the_golden(tmp_path):
     golden = json.loads(GOLDEN.read_text())
     snaps = scenario(tmp_path)
-    assert len(snaps) == len(golden["scenario"])
-    for step, (got, want) in enumerate(zip(snaps, golden["scenario"])):
-        assert json.loads(json.dumps(got)) == want, f"step {step} ({hp.SCRIPT[step][0]}) diverged"
     for snap in snaps:
         for row in snap["rows"].values():
             assert all(entry["exact"] for entry in row["ready"].values()), "a READY row differs from the checkpoint"
+        assert all(copy["exact"] for copy in snap["copies"]), "a copy-engine destination row differs from the checkpoint"
+        assert snap["page"]["fatal"] == 0
+    assert snaps[-1]["copies"], "the scenario completed no copy-engine copy, so no destination bytes were checked"
+    records = snaps[-1]["page"]["records"]
+    assert len(records) == sum(kind == "post" for kind, *_ in hp.SCRIPT)
+    assert all(r["ring_seq"] == r["seq"] for r in records), "a posted record's sequence word was overwritten"
+    # The byte and ring checks above hold whatever the golden says; then every snapshot must match it.
+    assert len(snaps) == len(golden["scenario"])
+    for step, (got, want) in enumerate(zip(snaps, golden["scenario"])):
+        assert json.loads(json.dumps(got)) == want, f"step {step} ({hp.SCRIPT[step][0]}) diverged"
 
 
 def test_row_image_reads_prepare_the_golden_sqes_and_land_exact_bytes(tmp_path):

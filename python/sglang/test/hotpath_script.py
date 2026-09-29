@@ -10,7 +10,10 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import (
+    DEMAND_RECORDS,
+    DEMAND_RING,
     HOT_RECORDS,
+    RECORD_BYTES,
     ExpertStreamHost,
     hot_record_bytes,
     new_page,
@@ -28,6 +31,10 @@ FUNCTIONAL = (
     "served", "touch_only", "rows_read", "read_errors", "overruns", "late_after_fatal",
     "evictions", "deferred", "deferred_reuse", "no_victim", "version",
 )
+# A demand record's fields (lease_layout.h kRecSeq, kRecStatus): the uint32 sequence and the uint16 status the service
+# publishes (expert_stream_transport.STATUS). The transport module exports the ring's geometry but not these offsets.
+REC_SEQ = 0
+REC_STATUS = 10
 
 
 def build_host(tmp_path, *, variant=None, threaded=False):
@@ -88,9 +95,45 @@ def _digest(t: torch.Tensor) -> str:
     return hashlib.sha256(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
 
 
-def snapshot(s, page, host, sim, reqs):
-    snap = {"rows": {}, "entries": [host.lease_entry(i) for i in range(16)], "page": {
-        "demand_done": page_word(page, "demand_done"), "fatal": page_word(page, "fatal")}}
+def _records(page) -> list[dict]:
+    """Every posted demand record still in the ring (seq 1..demand_head, the last DEMAND_RECORDS of them): its sequence
+    word as the ring holds it and the status the service published."""
+    head = page_word(page, "demand_head")
+    out = []
+    for seq in range(max(1, head - DEMAND_RECORDS + 1), head + 1):
+        base = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
+        out.append({
+            "seq": seq,
+            "ring_seq": int(page[base + REC_SEQ : base + REC_SEQ + 4].view(torch.int32)[0]) & 0xFFFFFFFF,
+            "status": int(page[base + REC_STATUS : base + REC_STATUS + 2].view(torch.int16)[0]) & 0xFFFF,
+        })
+    return out
+
+
+def completed_copies(s, sim, req, dst) -> list[dict]:
+    """The copy-engine lanes of ``req`` whose CopyDone the service published: each lane's destination row, and whether
+    its bytes (every streamed name) are the checkpoint's bytes of its expert."""
+    tag, gen, mask = sim.copy_done(req)
+    if tag != lease.COPIED or gen != req.gen:
+        return []
+    out = []
+    for lane, expert in enumerate(req.lanes):
+        result = sim.row_result(req, lane)
+        if not mask >> lane & 1 or result["tag"] != lease.COPYING or result["gen"] != req.gen:
+            continue
+        slot = sim.dst_slot(req, lane)
+        oracle = s.reference(s.tables.layer_ids[req.row], [expert])
+        out.append({
+            "seq": req.seq, "lane": lane, "row": req.row, "dst_slot": slot, "expert": expert,
+            "digest": "".join(_digest(dst[req.row][n][slot]) for n in EXL3_STREAMED_NAMES),
+            "exact": all(same_bytes(dst[req.row][n][slot], oracle[n][0]) for n in EXL3_STREAMED_NAMES),
+        })
+    return out
+
+
+def snapshot(s, page, host, sim, reqs, dst, copies):
+    snap = {"rows": {}, "entries": [host.lease_entry(i) for i in range(DEMAND_RECORDS)], "page": {
+        "demand_done": page_word(page, "demand_done"), "fatal": page_word(page, "fatal"), "records": _records(page)}}
     for row in range(LAYERS):
         info = host.slot_info(row)
         ready = {}
@@ -108,6 +151,8 @@ def snapshot(s, page, host, sim, reqs):
          "pieces": [sim.piece_word(r, lane) for lane in range(len(r.lanes))], "copy_done": list(sim.copy_done(r))}
         for r in reqs[-2:]
     ]
+    snap["copies"] = list(copies)
+    snap["dst"] = {str(row): "".join(_digest(dst[row][n]) for n in EXL3_STREAMED_NAMES) for row in sorted(dst)}
     counters = host.counters()
     snap["counters"] = {k: counters[k] for k in FUNCTIONAL}
     return snap
@@ -147,7 +192,7 @@ def next_seq(page) -> int:
 
 
 def run_script(s, page, host, sim, dst):
-    reqs, waits, snaps, hot = [], [], [], {0: [], 1: []}
+    reqs, waits, snaps, hot, copies = [], [], [], {0: [], 1: []}, []
     for kind, row, lanes, extra in SCRIPT:
         if kind == "post":
             write_hot_record(page, host, next_seq(page), hot[row])
@@ -166,8 +211,10 @@ def run_script(s, page, host, sim, dst):
         elif kind == "copy":
             host.copy_engine_release(-1)
             assert host.copy_engine_idle(5.0)
+            _drain(host)
+            copies += completed_copies(s, sim, reqs[-1], dst)
         elif kind == "hot":
             hot[row] = list(lanes)
         _drain(host)
-        snaps.append(snapshot(s, page, host, sim, reqs))
+        snaps.append(snapshot(s, page, host, sim, reqs, dst, copies))
     return snaps
