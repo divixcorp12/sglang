@@ -25,6 +25,8 @@
 
   The node has too few order-9 blocks, and compaction cannot make more. What remains needs root or a kernel change
   (see "Options that remain").
+- Even an **all-THP** tier registers quadratically at 100 GiB, ~19 s by the model ("The all-THP floor"). So no
+  allocation-side fix can go below that.
 - The branch carries **no code change**: `git diff origin/master -- python test benchmarks` is empty. It holds only
   this analysis.
 
@@ -150,17 +152,71 @@ Tests:
   - clone into the wrong slot (the read returns an error);
   - scratch ring never closed (descriptor count grows).
 
-The leak, measured on divix01 after the full-size runs:
-- Leaked pages show up as `Active(anon) + Inactive(anon) − AnonPages`: anonymous pages still on the LRU that no
-  process maps.
-- That figure was flat at **149.5 GiB** with nothing of this work running.
-- Controlled repro (`thp_probe.py --gib 2 --madvise hugepage`, then 5 s after exit):
-  - direct registration: −2 MiB;
-  - production table with the clone: **+1,025 MiB**.
-- The clone in this backport keeps page references after the source slot is emptied and both rings have exited.
+### The pin leak: `IORING_REGISTER_CLONE_BUFFERS` is unsafe on 6.12.0-211.60.1.el10_2
 
-The unit test did not catch the leak. Its buffers were a few pages, and it did not check the system-wide orphan
-count. Any retry of cloning must include the orphan check above as a test.
+**How orphaned memory is measured.** Pinned pages whose owner has exited stay allocated and stay on the anon LRU, but
+no process maps them any more. So the leak is the anonymous LRU minus the mapped anonymous pages, read system-wide
+from `/proc/meminfo`, with no root needed:
+
+```bash
+orph() { awk '/^Active\(anon\)|^Inactive\(anon\)/{a+=$2} /^AnonPages/{m=$2} END{print int((a-m)/1024)}' /proc/meminfo; }
+```
+
+The swap cache also counts in the LRU; `SwapCached` was 0.3 GiB throughout, so it does not explain the figure.
+
+**Controlled repro** (divix01, 01:4x on 2026-09-29, worktree `wt-thp-fallback` at `5ba8ea0400`, nothing else of
+this work running). A 2 GiB tier (`MADV_HUGEPAGE`, faulted) is registered once through the production
+`RegisteredBufferTable` and then released: the ring exits and the process exits. The only difference between the arms
+is the registration path.
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-thp-fallback && export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8
+P=/data/models/slang/.venv/bin/python
+echo "orphan MiB start $(orph)"
+for mode in --direct ""; do    # --direct: RegisteredBufferTable(false); "": the table's clone path
+  taskset -c 0-63 $P analysis/dsv41-drive/thp-fallback/thp_probe.py --gib 2 --madvise hugepage $mode \
+      --workdir /mnt/nvme1/thp-fallback/leak --label leak >/dev/null 2>&1; echo "rc=$?"
+  sleep 5; echo "after [${mode:-clone}] orphan MiB $(orph)"
+done
+```
+
+```
+orphan MiB start 148546
+rc=0
+after [--direct] orphan MiB 148544      # -2 MiB
+rc=0
+after [clone] orphan MiB 149569         # +1025 MiB
+```
+
+**The clone path, exactly as run.** liburing 2.12 `io_uring_clone_buffers_offset`. For each chunk:
+1. `io_uring_register_buffers_update_tag(scratch, 0, {base, len})` on a 1-entry scratch ring made sparse with 1 slot.
+2. `io_uring_clone_buffers_offset(dst, scratch, slot, 0, 1, IORING_REGISTER_DST_REPLACE)` into a destination ring made
+   sparse with N slots.
+3. `io_uring_register_buffers_update_tag(scratch, 0, {NULL, 0})` to empty the scratch slot.
+
+At teardown both rings get `io_uring_queue_exit`, then the process exits.
+
+**Findings:**
+- About half of each registered 2 GiB stays pinned for good.
+- The full-size strategies run registered a 100 GiB tier through clone paths five times: the production table with
+  the fix, plain clone, clone at 64 MiB and 256 MiB chunks, and clone with per-row splits. That left **149.5 GiB**
+  orphaned.
+- The figure did not fall over the following ~10 minutes with no io_uring rings of this work alive.
+- No `iou-*` worker or kworker was blocked in io_uring.
+- Node-0 MemFree fell to 670 MiB, and 41 GiB of swap was in use.
+
+**Conclusion.** On this kernel the clone path keeps page references that no unregistration or ring exit drops.
+`IORING_REGISTER_CLONE_BUFFERS` is **unsafe on 6.12.0-211.60.1.el10_2**. The kernel source was not read (the EL10
+tree was not consulted), so which reference leaks is not established. The repro above is self-contained enough for a
+Rocky/RHEL report.
+
+Why the unit test missed it: its buffers were a few pages, and it never checked the system-wide orphan count. Any
+future clone-based fix must carry that check (register ~1 GiB, exit, `orph` back within noise).
+
+**Metadata-only / hot-path question** (team lead): moot, since the clone is reverted. Not verified here: whether the
+clone copies page data, the kernel source of `io_clone_buffers`, and a fixed-mode read comparison between clone and
+direct. The unit test at `5ba8ea0400` did show `READ_FIXED` through a cloned slot returning the file's bytes, on the
+laptop's 7.0 kernel and on divix01.
 
 ## Full-size before / after
 
@@ -186,18 +242,60 @@ count. Any retry of cloning must include the orphan check above as a test.
 - Freeing it needs a reboot (root).
 - Scratch reruns of the clone strategies are disabled in `sweep.sh`, and `thp_probe.py` warns against them.
 
-## Options that remain (all need root or a kernel change, or are unmeasured)
+## The all-THP floor
 
-1. **Reserved hugetlbfs pages + `MAP_HUGETLB`** for the tier. Every folio is 2 MiB, so every chunk coalesces and
-   registration becomes linear and fragmentation-proof. This needs `vm.nr_hugepages` per node, which is root.
-2. **Compact before launch** (`echo 1 > /proc/sys/vm/compact_memory`, root), or change `defrag`. This is best effort
-   only: `MADV_HUGEPAGE`'s direct compaction already failed 12,259 times here.
-3. **A kernel whose clone does not leak.** Then re-enable `5ba8ea0400`, with an orphan-count test (register, exit,
-   check `Active+Inactive(anon) − AnonPages`).
-4. **`MADV_NOHUGEPAGE` on the tier** (user level). Registration becomes linear. The decode cost of 4 KiB host pages
-   (GPU H2D) must be measured before adopting it.
-5. **Leave fixed buffers off**, which is today's default: `uring-reg` kept R0. The cost exists only when
-   `SGLANG_EXPERT_STREAM_URING_READ_MODE=fixed|readv_fixed` is turned on, and on drain's ring reset in that mode.
+Even with 0 % 4 KiB pages, direct registration is quadratic. Every coalesced chunk keeps one bvec per 2 MiB folio, and
+each head page of a later chunk walks all of them. The per-chunk model predicts 0.15 / 0.64 / 2.31 s at
+8 / 16 / 32 GiB, against the 0.14 / 0.54 / 2.06 s measured in `uring-reg`. For a 100 GiB all-THP tier it predicts
+**12–21 s** (the range comes from calibrating ns/visit on each layout). So removing THP fallback entirely would
+still leave ~19 s. Only the following get below that floor:
+- fewer heads: 1 GiB hugetlb pages, or 4 KiB-only memory;
+- per-chunk accounting isolation: the clone, or separate rings.
+
+## Options not tried that do not use the clone, predicted from the per-chunk model
+
+`predict.py natural.jsonl strategies.jsonl` (raw JSONL in `divix01:/mnt/nvme1/thp-fallback/`) rebuilds the 315
+production chunks of each recorded 100 GiB layout. It calibrates ns/visit on that layout's measured direct
+registration, then re-runs the model on each reordered or re-cut chunk list. All times are seconds for 100 GiB.
+
+| layout (4 KiB share) | measured direct | ns/visit | A: coalesced first, mixed last | B: two rings | C: mixed unregistered | D: split 4 KiB rows out, register last | E: mixed first | all THP (0 % 4 KiB) |
+|---|---|---|---|---|---|---|---|---|
+| full-none (21.6 %) | 23.5 | 11.1 | 16.8 | 16.2 | 8.5 | 9.0 | 2744 | 20.4 |
+| full-hugepage (9.5 %) | 103.5 | 9.2 | 73.8 | 72.0 | 8.0 | 10.0 | 1968 | 16.6 |
+| full-none-again (9.3 %) | 37.9 | 11.9 | 25.4 | 24.6 | 12.2 | 13.0 | 1706 | 21.4 |
+| full-none-refault (8.7 %) | 23.0 | 9.6 | 15.7 | 15.4 | 10.3 | 10.7 | 1206 | 17.4 |
+| full-none-collapse (7.7 %) | 72.7 | 6.9 | 15.6 | 15.0 | 7.2 | 7.8 | 921 | 12.5 |
+| full-none-strategies (13.5 %) | 18.9 | 10.5 | 14.2 (**measured 18.6**) | 13.8 | 10.0 | 10.4 | 1831 | 19.0 |
+
+What each option is:
+- **A. Homogeneous order.** Register the coalesced chunks first, then the mixed ones by head count, most first
+  (Smith's rule for this cost). Its one measurement came out 18.6 s, 31 % above the model's 14.2 s, so read the
+  predictions as optimistic by about that much. It helps only on layouts whose mixed chunks carry many heads
+  (full-hugepage: 104 → ~74).
+- **E. Mixed first.** The team lead listed this ordering as an option; it is the worst possible order. Every later
+  head walks all the mixed chunks' 4 KiB bvecs: **900–2,700 s**. Do not do it.
+- **B. Mixed chunks on their own ring,** registered as fixed buffers there, with fixed files on both rings. It saves
+  little over A, because the second ring still walks mixed-against-mixed. It also needs the reader to route each read
+  to the ring that owns its destination.
+- **C. Leave the mixed chunks unregistered** (fixed files only). Reads into them take the non-fixed path. This cuts
+  registration to the coalesced floor (7–12 s), at the cost of fixed-buffer reads for 8–22 % of the tier.
+- **D. Split the mixed ranges out as smaller chunks.** Re-cut each chunk containing 4 KiB pages on row boundaries, so
+  the rows holding 4 KiB pages form their own chunk, registered last. The THP rest coalesces.
+  - Predicted 8–13 s. That is at or below the all-THP floor, because the 4 KiB rows carry almost no heads.
+  - It needs PAGEMAP_SCAN (unprivileged) at registration time.
+  - Its slot count stays well under 16,384.
+  - The model assumes each chunk's 4 KiB pages form one contiguous run.
+
+Beyond these:
+- **4 KiB only** (`MADV_NOHUGEPAGE` on the tier) predicts ~0 walk. `uring-reg` measured 0.6 s per 32 GiB. Its decode
+  cost (GPU H2D from 4 KiB-backed pinned memory) is unmeasured. NVMe request counts are unchanged, since
+  `max_segments` × 4 KiB ≥ `max_sectors_kb` on every drive.
+- **Root or kernel options:**
+  - hugetlbfs 1 GiB pages (`MAP_HUGETLB | MAP_HUGE_1GB`, one head per GiB) predicts ~0;
+  - hugetlbfs 2 MiB pages only reach the all-THP floor (~19 s);
+  - compaction before launch is best effort;
+  - a kernel whose clone does not leak, which brings back the measured 1.1 s.
+- **Fixed buffers off** is today's default (`uring-reg` kept R0), and then none of this cost is paid.
 
 ## File overlap with hotpath (`cc/hotpath-zero-overhead`)
 
