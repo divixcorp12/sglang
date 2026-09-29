@@ -11,14 +11,14 @@ probe() { taskset -c 32-63 "$PY" analysis/dsv41-drive/thp-fallback/thp_probe.py 
 run() {
   numastat -m | grep -E 'MemFree|AnonHuge'
   case $sweep in
-    # WARNING: --strategies clone* leaks page pins on this kernel (results.md); strategies prod/order/cap* are safe.
     inject) for k in 0 1 2 4 8 15; do
       probe --gib 16 --madvise hugepage --inject "$k" --strategies prod --label "inject$k" "$@"; done ;;
     size) for g in 4 8 12 16; do probe --gib "$g" --madvise hugepage --inject 999 --label "size$g-allmixed" "$@";
                                   probe --gib "$g" --madvise hugepage --label "size$g-clean" "$@"; done ;;
     strategies) T=0:61440,1:40960
-      probe --placement $T --strategies prod,order,cap64,clone,clone-rowsplit,clone-cap64,clone-cap256 \
-        --label "full-none-strategies" "$@"
+      # The recorded run also passed clone,clone-rowsplit,clone-cap64,clone-cap256. Never again: the clone strategies
+      # leak page pins on this kernel, and that run stranded ~149 GiB until a reboot (results.md).
+      probe --placement $T --strategies prod,order,cap64 --label "full-none-strategies" "$@"
       probe --placement $T --madvise nohugepage --strategies prod --label "full-nohugepage" "$@" ;;
     # The production tier's split. Order matters: MADV_HUGEPAGE compacts, which changes what the next run finds.
     natural) T=0:61440,1:40960

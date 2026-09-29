@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Queued after the probe sweeps: startup pairs (master, branch, master, branch), then the kernels suite at both.
+# Not run to completion: stopped at the pin leak (results.md). Queued after the probe sweeps: startup pairs (master, branch, master, branch), then the kernels suite at both.
 set -u
 A=/data/models/slang/nvfp4-work/wt-thp-fallback; B=/data/models/slang/nvfp4-work/wt-thp-fallback-base
 O=/mnt/nvme1/thp-fallback/startup
