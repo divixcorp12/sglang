@@ -4,6 +4,8 @@
 #pragma once
 
 #include <cstdio>
+#include <span>
+#include <type_traits>
 
 #include "../row_layout.h"
 #include "build_policy.h"
@@ -14,6 +16,11 @@
 
 namespace sglang {
 namespace expert_stream {
+
+// read()'s default progress callback: none. A distinct type, so read() compiles the call out rather than testing it.
+struct NoProgress {
+  void operator()() const {}
+};
 
 // Test only (U10): one prepared SQE, as ReaderCore::set_sqe_log records it.
 struct SqeRecord {
@@ -280,6 +287,9 @@ class ReaderCore {
     }
     if (!size_extents()) return false;
     if (!io_.init(queue_depth())) return false;
+    // One reap returns at most a queue depth of CQEs (plus a withheld stale one): reserved here, so the widest reap
+    // never grows the list on the service thread (spec A9). Supersedes size_extents' smaller extents + 1.
+    completions_.reserve(queue_depth() + 1);
     // A read's legs are reserved all at once, so the ring must hold the widest read's legs: a fixed read has a leg per
     // registered buffer its iovecs meet, a cut read its device-sized legs as well (leg_stride_ bounds both).
     if (fixed_reads() && leg_stride_ < std::max<size_t>(1, derived().max_iovecs()))
@@ -337,32 +347,37 @@ class ReaderCore {
   // Null costs a branch per event and no clock read; the stamps only read the clock and add to
   // `trace`, so they cannot change what is submitted, reaped, drained or copied.
   //
-  // `progress`, when set, is invoked once per turn of the drain loop (never behind a clock: spec M4).
+  // `progress`, unless it is NoProgress, is invoked once per turn of the drain loop (never behind a clock: spec M4).
   // The reader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
   // its own periodic work (retire_leases()) while a read is in flight, exactly as `abandon` is how the
-  // caller decides when to stop admitting. Null costs one comparison per turn.
+  // caller decides when to stop admitting. NoProgress compiles to nothing.
+  //
+  // `abandon` and `progress` are template parameters, not std::function (spec A6): a closure past std::function's
+  // local storage would be heap-allocated per read. `experts` and `slots` are spans, so the service passes its
+  // fixed-size lists without copying them into vectors.
   //
   // This is the hot path and checks nothing: `layer`, `experts` and `slots` must be in
   // range and `experts.size() == slots.size()`. The service (Task 11) and
   // read_rows_once (Python) validate at their boundaries.
+  template <class Abandon, class Progress = NoProgress>
   int read(
       int64_t layer,
-      const std::vector<int32_t>& experts,
-      const std::vector<int64_t>& slots,
+      std::span<const int32_t> experts,
+      std::span<const int64_t> slots,
       size_t step,
-      const std::function<bool(size_t)>& abandon,
+      Abandon&& abandon,
       StageRecord* trace = nullptr,
       std::vector<uint8_t>* packed = nullptr,
       size_t max_reading_rows = SIZE_MAX,
-      const std::function<void()>& progress = nullptr,
+      Progress&& progress = Progress{},
       const PiecePublish* publish = nullptr) {
     if (!io_.ready()) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     Call& c = c_;
     c = Call{};
     c.layer = layer;
-    c.experts = &experts;
-    c.slots = &slots;
+    c.experts = experts;
+    c.slots = slots;
     c.step = step;
     c.total = experts.size();
     c.batches = (c.total + step - 1) / step;
@@ -413,7 +428,7 @@ class ReaderCore {
       // Progress runs every turn: the caller's hook (retire_leases) returns at once when no lane is outstanding, and
       // gating it on a clock put a clock read on every turn of the hot path (spec M4). Not gated on a completion being
       // reaped either: those are this reader's own I/O, uncorrelated with the device acknowledging a lease.
-      if (progress) progress();
+      if constexpr (!std::is_same_v<std::decay_t<Progress>, NoProgress>) progress();
       derived().collect();  // before admit: a bank whose last copy just finished is free for the next batch
       if (!c.failed) admit(abandon);
       if (!c.failed) refill();
@@ -590,8 +605,8 @@ class ReaderCore {
   // sized at open(); read() allocates nothing.
   struct Call {
     int64_t layer = 0;
-    const std::vector<int32_t>* experts = nullptr;
-    const std::vector<int64_t>* slots = nullptr;
+    std::span<const int32_t> experts;
+    std::span<const int64_t> slots;
     size_t step = 1;
     size_t total = 0;
     size_t batches = 0;
@@ -897,7 +912,8 @@ class ReaderCore {
 
   // Admit batches while a bank is free. The abandon check comes first: once it says stop, no further
   // work is submitted, but what was already submitted is reaped by the loop.
-  void admit(const std::function<bool(size_t)>& abandon) {
+  template <class Abandon>
+  void admit(Abandon& abandon) {
     Call& c = c_;
     while (!c.failed && !c.abandoned && c.next_batch < c.batches) {
       if (abandon(c.next_batch)) {
@@ -938,7 +954,7 @@ class ReaderCore {
     }
     // Validate the whole batch before touching any state, so a bad row leaves nothing to undo.
     for (size_t i = 0; i < count; ++i) {
-      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[first + i]);
+      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + c.experts[first + i]);
       const size_t base = row_index * parts;
       // The bytes the expert needs are [start, start + need_end) of its aligned superset; they
       // must all lie inside the file. What an extent's page-aligned tail overruns past end of
@@ -979,7 +995,7 @@ class ReaderCore {
         if (ordinal < static_cast<size_t>(kTraceRows)) t.row_admit[ordinal] = admitted;
       });
       const size_t slot = bank * kBounceRows + i;
-      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[ordinal]);
+      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + c.experts[ordinal]);
       const size_t base = row_index * parts;
       rows_[slot] = BounceRow{RowState::Reading, ordinal, 0};
       rows_[slot].needed = t_.starts[row_index] + t_.need_end;

@@ -85,3 +85,14 @@ def test_the_prod_service_thread_reads_no_clock_per_request(shim, tmp_path):
     # A zero from a shim that never recognized the thread would prove nothing.
     assert counts["requests"] == REQUESTS and counts["threads"] == {"service": 1, "copy": 1}, counts
     assert counts["service"]["clock"] == 0, counts
+
+
+@pytest.mark.parametrize("variant", ["prod", "instr"])
+def test_the_service_thread_allocates_nothing_per_request(shim, tmp_path, variant):
+    """Spec A1-A6, A9: after warm-up the service thread makes no allocator call while it serves (the instrumented
+    build too, with its trace off: its metrics are fixed-size)."""
+    counts = hotpath_shim.run_child(shim, variant=variant, tmp=tmp_path)
+    # A zero from a shim that never recognized the thread would prove nothing.
+    assert counts["requests"] == REQUESTS and counts["threads"] == {"service": 1, "copy": 1}, counts
+    print("HOTPATH", variant, counts)
+    assert counts["service"]["malloc"] == 0 and counts["service"]["free"] == 0, counts

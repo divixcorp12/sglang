@@ -134,7 +134,7 @@ inline void check_fault_words(TensorView fault) {
 }
 
 // Entry points' abandon callback: stop once `after` batches were admitted (0: never).
-inline std::function<bool(size_t)> abandon_after(int64_t after) {
+inline auto abandon_after(int64_t after) {
   return [after](size_t admitted) { return after > 0 && admitted >= static_cast<size_t>(after); };
 }
 

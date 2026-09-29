@@ -203,7 +203,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   // per segment the range meets (the segments tile the image in source order: check_image_tables). Returns how many.
   unsigned image_iovecs(size_t slot, int64_t from, int64_t to, iovec* out) const {
     const Call& c = c_;
-    const int64_t dest = (*c.slots)[rows_[slot].ordinal];
+    const int64_t dest = c.slots[rows_[slot].ordinal];
     unsigned count = 0;
     for (const Segment& s : t_.segments) {
       const int64_t lo = std::max(from, s.src), hi = std::min(to, s.src + s.bytes);
@@ -220,7 +220,7 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
     requires(Build::kFaults)
   {
     const Call& c = c_;
-    const int64_t dest = (*c.slots)[rows_[slot].ordinal];
+    const int64_t dest = c.slots[rows_[slot].ordinal];
     for (size_t name = 0; name < t_.slabs[c.layer].size(); ++name) {
       std::memset(t_.slabs[c.layer][name] + dest * t_.row_bytes[name], fill, static_cast<size_t>(t_.row_bytes[name]));
     }

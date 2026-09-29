@@ -505,7 +505,7 @@ struct HostExports {
           &stage,
           nullptr,
           SIZE_MAX,
-          nullptr,
+          NoProgress{},
           &publish);
     } catch (...) {
       reading.store(false, std::memory_order_release);

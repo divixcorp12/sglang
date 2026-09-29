@@ -77,6 +77,14 @@ class RamTier {
       tier.prefill_owned.assign(tier.capacity, 0);
     }
     if (lease_ != nullptr) init_lease_block(capacity, lease_bytes);
+    // The request path's buffers, sized once (spec A2, A10): nothing on it grows after construction.
+    hot_scratch_.assign(static_cast<size_t>((experts_ + 7) / 8), 0);
+    packed_.reserve(kWanted);
+    piece_targets_.reserve(kWanted);
+    int64_t widest = 0;
+    for (int64_t c : capacity)
+      widest = std::max(widest, c);
+    fill_packed_.reserve(static_cast<size_t>(widest));
   }
 
   // The copy thread's callbacks use tiers_, mutex_ and the counter blocks, which are destroyed before copy_engine_
@@ -466,19 +474,22 @@ class RamTier {
     gpu_hot_mode_.store(on);
   }
 
-  bool read_gpu_hot(uint32_t expected, Request* request) const {
+  // The hot bitmap of `expected`'s record, copied into the service-owned hot_scratch_ (spec A2): not const, it writes
+  // that scratch. request->hot_bitmap points into it until the next call.
+  bool read_gpu_hot(uint32_t expected, Request* request) {
     if (hot_page_ == nullptr) return false;
     const uint8_t* record = hot_page_ + static_cast<int64_t>((expected - 1u) % kHotRecords) * hot_stride_;
     if (load_acquire(record) != expected) return false;
     uint32_t count = 0;
     std::memcpy(&count, record + 4, 4);
     if (count != experts_) return false;
-    const int64_t bytes = (experts_ + 7) / 8;
-    request->hot_bitmap.assign(record + kHotHeaderBytes, record + kHotHeaderBytes + bytes);
+    const size_t bytes = hot_scratch_.size();
+    std::memcpy(hot_scratch_.data(), record + kHotHeaderBytes, bytes);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (load_acquire(record) != expected) return false;
-    if (experts_ % 8 != 0 && (request->hot_bitmap.back() & static_cast<uint8_t>(~((1u << (experts_ % 8)) - 1u))) != 0)
+    if (experts_ % 8 != 0 && (hot_scratch_[bytes - 1] & static_cast<uint8_t>(~((1u << (experts_ % 8)) - 1u))) != 0)
       return false;
+    request->hot_bitmap = hot_scratch_.data();
     return true;
   }
 
@@ -743,9 +754,9 @@ class RamTier {
         outstanding_[static_cast<int64_t>((request.seq - 1u) % kDemandRecords)].active) {
       return Defer::kRequestSlot;
     }
-    std::vector<int32_t> wanted;
-    for (const auto* ids : {&request.protect, &request.need, &request.lane_experts}) {
-      for (int32_t expert : *ids) {
+    FixedVec<int32_t, kWanted> wanted;
+    for (std::span<const int32_t> ids : {request.protect.span(), request.need.span(), request.lane_experts.span()}) {
+      for (int32_t expert : ids) {
         if (expert >= 0 && expert < experts_ && !listed(wanted, expert)) wanted.push_back(expert);
       }
     }
@@ -835,7 +846,7 @@ class RamTier {
   // any ready word of the request is visible. Null `loading` is the two-phase grant exactly as it was.
   template <typename Select>
   bool grant_lane_group_locked(
-      const Request& request, Select select, bool hit_phase = false, const std::vector<int64_t>* loading = nullptr) {
+      const Request& request, Select select, bool hit_phase = false, const std::span<const int64_t>* loading = nullptr) {
     if (request.lane_experts.empty()) return true;
     const size_t count = request.lane_experts.size();
     const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
@@ -1461,7 +1472,7 @@ class RamTier {
 
   // A kQuarantine slot is counted as none of free, evictable or leased: it can never help a deferred request, so it
   // must not make one wait (plan 3.2).
-  VictimCensus census_locked(int64_t row, const std::vector<int32_t>& wanted) const {
+  VictimCensus census_locked(int64_t row, std::span<const int32_t> wanted) const {
     const Tier& tier = tiers_[row];
     VictimCensus census;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
@@ -1483,7 +1494,7 @@ class RamTier {
   void run_fill() {
     begin_busy();
     apply_pending_fault();  // test only: inject_fault() acts on a fill's read as on a demand's
-    std::vector<uint8_t> packed;
+    std::vector<uint8_t>& packed = fill_packed_;  // reserved to the widest row at construction (spec A10)
     size_t landed = 0;
     auto advance = [&] {
       while (landed < packed.size() && packed[landed] != 0)
@@ -1548,7 +1559,7 @@ class RamTier {
   // qualifies, it is take_slot_locked's choice (a free slot first); with `stop_at_share`, when no owned row qualifies
   // it is none (-1). Under a share the slot becomes prefill-owned.
   int64_t take_admit_slot_locked(
-      int64_t row, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted, bool stop_at_share = false) {
+      int64_t row, std::span<const int32_t> protect, bool fallback, int64_t* evicted, bool stop_at_share = false) {
     Tier& tier = tiers_[row];
     int64_t slot = -1;
     if (prefill_share_ > 0 && tier.owned >= prefill_share_ &&
@@ -1579,7 +1590,7 @@ class RamTier {
   }
 
   // Takes only a kFree slot or evicts an unleased kReady one: kLoading and kQuarantine slots are never taken.
-  int64_t take_slot_locked(int64_t row, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted) {
+  int64_t take_slot_locked(int64_t row, std::span<const int32_t> protect, bool fallback, int64_t* evicted) {
     Tier& tier = tiers_[row];
     *evicted = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
@@ -1679,7 +1690,8 @@ class RamTier {
     if (deferred != nullptr) *deferred = false;
     StageRecord* const cur = stage_record();  // null in ProdBuild, so every `if (cur)` below folds away
     if (cur) cur->lanes = request.lanes;
-    std::vector<int32_t> wanted;
+    // Fixed-size locals (spec A4, A5): a request names at most kWanted distinct experts, so none of these allocates.
+    FixedVec<int32_t, kWanted> wanted;
     for (const auto* ids : {&request.protect, &request.need}) {
       for (int32_t expert : *ids) {
         if (!listed(wanted, expert)) wanted.push_back(expert);  // one slot per expert (device bytes may repeat)
@@ -1689,8 +1701,8 @@ class RamTier {
     for (int32_t expert : request.lane_experts) {
       if (!listed(wanted, expert)) wanted.push_back(expert);
     }
-    std::vector<int32_t> missing;
-    std::vector<int64_t> slots;
+    FixedVec<int32_t, kWanted> missing;
+    FixedVec<int64_t, kWanted> slots;
     bool ok = request.row >= 0 && request.row < layers_;
     // Piece streaming publishes into the lease block's readiness words, initialised in the reservation hold below
     // before the two-phase hit grant. Without two-phase and lease mode there is neither, so refuse before any slot
@@ -1766,9 +1778,10 @@ class RamTier {
           // fenced before any ready word of the request. Only after the entry opened: an active entry means an
           // older request may still be reading this ring index's words, and opening refuses it.
           if (piece_stream) publishing = init_piece_words_locked(request, missing);
+          const std::span<const int64_t> slots_span = slots.span();  // after the take loop: every reserved slot
           if (!(piece_stream
                     ? grant_lane_group_locked(
-                          request, [](size_t) { return true; }, true, &slots)
+                          request, [](size_t) { return true; }, true, &slots_span)
                     : grant_lane_group_locked(
                           request, [&](size_t lane) { return !listed(missing, request.lane_experts[lane]); }, true))) {
             close_pending_grants_locked(request);  // granted nothing: retire the entry rather than leak the ring slot
@@ -1794,9 +1807,8 @@ class RamTier {
     }
     if (cur) cur->reserved = stamp(cur);
     int64_t status = kStatusNoRead;
-    // Per slot: the row was packed whole (read() sets it). A member, not a local, so that the buffer
-    // the pipeline writes into is allocated once rather than per served demand on the service thread
-    // - read()'s assign() below only grows it, and it never shrinks.
+    // Per slot: the row was packed whole (read() sets it). A member, not a local, reserved to kWanted at construction,
+    // so read()'s assign() never allocates on the service thread.
     std::vector<uint8_t>& packed = packed_;
     // Cleared, not merely reused: the publish gate below reads packed[i] whenever the vector is long
     // enough, and read() only rewrites it when it actually runs. Carrying the PREVIOUS request's flags
@@ -1820,7 +1832,8 @@ class RamTier {
         ok = false;
         status = kStatusFailed;
       } else {
-        // ProdBuild: the advisory rule alone (abandon_after is the constant 0 there).
+        // ProdBuild: the advisory rule alone (abandon_after is the constant 0 there). Passed to read() as its own type
+        // (spec A6): its closure is 24 bytes, which a std::function would have heap-allocated per read.
         const auto abandon = [&](size_t admitted) {
           bool stop = advisory && (demand_pending() || pause_requested_.load() || stop_requested_.load());
           if constexpr (Build::kFaults) {
@@ -1844,7 +1857,7 @@ class RamTier {
             // retire_leases() takes mutex_ itself, so this is deadlock-free today. That is a property
             // of the code as it stands, not a guarantee: if a future yield point is ever added to
             // read()'s drain loop under a lock, this callback would deadlock against it.
-            [this] { retire_leases(); },
+            [this] { retire_leases(); },  // a template argument (spec A6): no std::function, no allocation
             publishing ? &piece_publish_ : nullptr);
         if (piece_stream) stats_.store(kPiecePublishRefused, reader_.publish_refused());
         if (result == 0) count<kReadErrors>();
@@ -1930,7 +1943,7 @@ class RamTier {
   // Store piece_word(gen) into the readiness word of every lane whose expert is read (in `missing`), then fence,
   // and record those words as the owner's publish targets, by the row's ordinal in the read. Service thread only:
   // it is the only writer of area P. False when no lane names a missing row (nothing to publish).
-  bool init_piece_words_locked(const Request& request, const std::vector<int32_t>& missing) {
+  bool init_piece_words_locked(const Request& request, std::span<const int32_t> missing) {
     const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
     piece_targets_.assign(missing.size(), PieceTarget{});
     bool any = false;
@@ -2031,7 +2044,9 @@ class RamTier {
   int64_t layers_;
   int64_t experts_;
   Source reader_;
-  std::vector<uint8_t> packed_;  // serve()'s per-row packed flags, sized by read(), reused every request
+  std::vector<uint8_t> packed_;  // serve()'s per-row packed flags, reserved to kWanted, reused every request
+  std::vector<uint8_t> hot_scratch_;  // (experts_+7)/8 bytes, sized at construction: the hot bitmap of the record read
+  std::vector<uint8_t> fill_packed_;  // run_fill's per-row packed flags, reserved to the largest row capacity
   // Prefill fills: written by fill_begin before the thread starts and read by it; the caller reads only the atomics.
   static constexpr int kFillOk = 0;
   static constexpr int kFillRunning = 1;
