@@ -34,6 +34,28 @@ OWN = T + "test_expert_stream_ownership.py::"
 TSAN = "test/manual/dsv41/test_expert_stream_hotpath_tsan.py::"
 TSAN_STRESS = TSAN + "test_the_single_owner_tier_is_race_free_under_tsan"
 TSAN_FILLS = TSAN + "test_prefill_fills_and_ownership_are_race_free_under_tsan"
+# Phase 2 Task P2: the completion word. GPU targets: run the whole runner under the GPU lock on cores 32-63.
+CW = T + "test_expert_stream_completion_word.py::"
+CW_TSAN = CW + "test_the_poll_orders_what_the_word_guards[tsan]"
+CE_CUDA = "test/manual/dsv41/test_exl3_copy_engine_cuda.py::"
+_ISSUE_COPIES = """    if constexpr (Build::kFaults) {
+      if (const int64_t ballast = ballast_.bytes.load(); ballast > 0) {
+        if (const int r = backend_->issue(ballast_.dst.load(), ballast_.src.load(), ballast)) return r;
+      }
+    }
+    job.sm = table.sm && !job.prefetch;
+    for (int i = 0; i < job.count; ++i) {
+      const CopyLane& lane = job.lanes[i];
+      for (const CopyEntry& entry : table.entries) {
+        if (entry.sm && job.sm) continue;
+        const uint64_t dst = entry.dst + static_cast<uint64_t>(lane.dst_slot) * static_cast<uint64_t>(entry.bytes);
+        const uint64_t src = entry.src + static_cast<uint64_t>(lane.host_slot) * static_cast<uint64_t>(entry.bytes);
+        if (const int r = backend_->issue(dst, src, entry.bytes)) return r;
+        bytes += entry.bytes;
+      }
+    }
+"""
+_MARK = "    const int r = backend_->mark(&job.token);\n"
 
 
 @dataclass
@@ -122,6 +144,36 @@ MUTANTS = [
         "    fill_result_ = result;\n    for (const int64_t slot : fill_slots_) tiers_[fill_row_].filling[slot] = 0;\n",
         [TSAN_FILLS, TSAN_STRESS, OWN + "test_a_fill_holds_its_slots_until_the_owner_joins_it"],
     ),
+    Mutant(
+        "P2a", "the copy stream never writes the completion word (mark issues no write)", H + "copy_engine.h",
+        "    return cu_write_value32_(stream_, word_dev_, seq, 0);  // default flags: after the prior copies, fenced\n",
+        "    return 0;  // P2a: no write\n",
+        [CE_CUDA + "test_the_completion_word_counts_every_copy_job_at_shutdown",
+         CE_CUDA + "test_every_lane_holds_its_row_under_host_slot_victim_reuse"],
+    ),
+    # On x86 an acquire and a relaxed 32-bit load are the same mov, so only a model checker sees this: TSan, on the
+    # CPU analog of the GPU's payload-then-word writes. The GPU test is listed to record that it cannot kill it.
+    Mutant(
+        "P2b", "the host reads the completion word relaxed, not acquire", H + "completion_word.h",
+        "return __atomic_load_n(word_, __ATOMIC_ACQUIRE);",
+        "return __atomic_load_n(word_, __ATOMIC_RELAXED);",
+        [CW_TSAN, CW + "test_the_poll_orders_what_the_word_guards[plain]",
+         CE_CUDA + "test_the_completion_word_counts_every_copy_job_at_shutdown"],
+    ),
+    Mutant(
+        "P2c", "the completion write is issued before the job's copies (and its ballast)", H + "copy_engine.h",
+        "    int64_t bytes = 0;\n" + _ISSUE_COPIES + _MARK,
+        "    int64_t bytes = 0;\n" + _MARK + _ISSUE_COPIES,
+        [CE_CUDA + "test_a_delayed_completion_is_waited_for_and_the_lease_holds_until_it",
+         T + "test_exl3_ram_miss_copy_engine.py"],
+    ),
+    Mutant(
+        "P2d", "an idle stream with a short word fails stop without re-loading the word (the P1 review's C1)",
+        H + "completion_word.h",
+        "    return reached(load(), token) ? kDone : kLostWrite;\n",
+        "    return kLostWrite;\n",
+        [CW + "test_the_completion_word_rules_hold"],
+    ),
 ]
 
 
@@ -181,7 +233,7 @@ def run_target(target: str, root: Path, python: str, tsan_cxx: str | None, tag: 
     """Run one pytest target; (pytest's exit status, a one-line summary incl. any TSan report's SUMMARY line)."""
     base = Path(os.environ.get("MUTANTS_TMP", "/tmp")) / f"hotpath-mut-{os.getpid()}" / tag
     env = child_env(root)
-    if target.startswith(TSAN) and tsan_cxx:
+    if (target.startswith(TSAN) or target.endswith("[tsan]")) and tsan_cxx:
         env["CXX"] = tsan_cxx
     cmd = [python, "-m", "pytest", target, "-q", "-p", "no:randomly", "-p", "no:cacheprovider", f"--basetemp={base}"]
     base.parent.mkdir(parents=True, exist_ok=True)
@@ -200,7 +252,7 @@ def run_target(target: str, root: Path, python: str, tsan_cxx: str | None, tag: 
         kind = races[0].splitlines()[0].removeprefix("WARNING: ThreadSanitizer: ").split(" (pid")[0]
         tops = [ln.strip() for ln in races[0].splitlines() if re.match(r"^\s+#0 ", ln)][:2]
         summary += f" | TSan {kind}: " + " vs ".join(tops)
-    if "skipped" in summary and target.startswith(TSAN):
+    if "skipped" in summary and (target.startswith(TSAN) or target.endswith("[tsan]")):
         skip = [ln for ln in proc.stdout.splitlines() if "SKIPPED" in ln]
         summary += " | " + (skip[0][:200] if skip else "")
     return proc.returncode, f"{summary} ({time.monotonic() - t0:.0f} s)"
@@ -240,7 +292,7 @@ def main() -> int:
     for m in MUTANTS:
         if only and m.id not in only:
             continue
-        targets = [t for t in m.targets if not (args.no_tsan and t.startswith(TSAN))]
+        targets = [t for t in m.targets if not (args.no_tsan and (t.startswith(TSAN) or t.endswith("[tsan]")))]
         path = root / m.file
         text = path.read_text()
         assert text.count(m.old) == 1, (m.id, text.count(m.old))

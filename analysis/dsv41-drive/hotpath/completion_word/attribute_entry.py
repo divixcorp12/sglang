@@ -7,9 +7,9 @@ internal functions (named after the nearest exported symbol, so one entry point 
 instead walks each record outward to the first frame in the host module (HOST) and classifies the record by it:
 
   CudaCopyBackend::issue    -> cuMemcpyAsync   (steady state, per copy)
-  CudaCopyBackend::mark     -> cuEventRecord   (steady state, once per job)
-  CudaCopyBackend::query    -> cuEventQuery    (steady state, completion polling)
-  CudaCopyBackend::init     -> init            (start-up)
+  CudaCopyBackend::mark     -> cuEventRecord   (steady state, once per job; P2: cuStreamWriteValue32_v2)
+  CudaCopyBackend::query    -> cuEventQuery    (steady state, completion polling; P2: cuStreamQuery, the liveness check)
+  CudaCopyBackend::init     -> init            (start-up; P2: also ::init_word)
   CudaCopyBackend::shutdown -> shutdown        (exit)
   another HOST function whose callee is an exported cu* entry (a devirtualized, inlined backend call: at -O2
   CudaCopyBackend::issue and ::mark are inlined into CopyEngine::run) -> that entry point's class
@@ -30,16 +30,21 @@ import sys
 
 from sglang.test.hotpath_shim import Symbolizer, read_stacks
 
+# Phase 2 Task P2 replaced cuEventRecord/cuEventQuery with the completion word: mark() is one cuStreamWriteValue32_v2,
+# query() polls the word with no driver call and asks cuStreamQuery once per budget (the liveness check). A class is
+# named by the entry point, when one is below the host frame, so a P1 dump keeps its classes.
 CLASSES = {
     "issue": "cuMemcpyAsync",
-    "mark": "cuEventRecord",
-    "query": "cuEventQuery",
+    "mark": "mark",
+    "query": "query",
     "init": "init",
+    "init_word": "init",
     "shutdown": "shutdown",
 }
 
 
 ENTRY = {"cuMemcpyAsync": "cuMemcpyAsync", "cuEventRecord": "cuEventRecord", "cuEventQuery": "cuEventQuery",
+         "cuStreamWriteValue32": "cuStreamWriteValue32_v2", "cuStreamQuery": "cuStreamQuery (liveness)",
          "cuLaunchKernel": "launch"}
 
 
@@ -55,7 +60,11 @@ def classify(frames: list[str]) -> tuple[str, str]:
         if f.startswith("sgl_kernel_jit_expert_stream_host") or "expert_stream_host" in f.split("!")[0]:
             m = re.search(r"CudaCopyBackend::(\w+)(\[abi:cxx11\])?\(", f)
             if m:
-                return CLASSES.get(m.group(1), "other: CudaCopyBackend::" + m.group(1)), last_cuda
+                cls = CLASSES.get(m.group(1), "other: CudaCopyBackend::" + m.group(1))
+                e = re.match(r"libcuda[^!]*!(cu\w+?)(_v\d+)?$", last_cuda)
+                if cls in ("mark", "query"):
+                    cls = ENTRY.get(e.group(1), "other entry: " + e.group(1)) if e else cls + " (no libcuda frame)"
+                return cls, last_cuda
             # A backend call the compiler devirtualized and inlined into its caller (issue/mark inside
             # CopyEngine::run): the outermost libcuda frame is then the exported entry point the host called.
             e = re.match(r"libcuda[^!]*!(cu\w+?)(_v\d+)?$", last_cuda)

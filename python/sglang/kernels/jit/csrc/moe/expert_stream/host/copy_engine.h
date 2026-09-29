@@ -3,6 +3,7 @@
 
 #include "../lease_layout.h"
 #include "build_policy.h"
+#include "completion_word.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
 
@@ -29,7 +30,7 @@ struct CopyJob {
   int count = 0;
   CopyLane lanes[kLeaseLanes];
   int64_t submit_ns = 0;
-  int64_t token = -1;     // the backend's completion marker, recorded after the job's last copy
+  int64_t token = -1;     // the backend's completion marker after the job's last copy (CUDA: the job's sequence)
   bool prefetch = false;  // a native-prefetch job: issued only behind demand jobs, completed into PrefetchDone
   // Its row has SM entries (set at issue): the copy wait reads them from the leased slots, so the leases are released
   // only once it acknowledged its reads (SmAck), not on the DMA's completion. Never a prefetch job: no kernel reads
@@ -58,22 +59,28 @@ class CopyBackend {
   virtual int query(int64_t token) = 0;  // kDone, kPending, or an error code (negative for the host backend)
   virtual void shutdown(bool idle) = 0;
 };
+static_assert(CompletionWord::kDone == CopyBackend::kDone && CompletionWord::kPending == CopyBackend::kPending);
 
 // The CUDA driver, resolved from libcuda.so.1 when the copy engine is enabled, so this module still builds and loads
-// without a CUDA toolkit. It calls cuMemcpyAsync, cuEventRecord and cuEventQuery on its own non-blocking stream, and
-// nothing that waits on another stream, a graph launch or the device (no synchronize, no module load, no allocation).
+// without a CUDA toolkit. Per job it calls cuMemcpyAsync per copy and one cuStreamWriteValue32_v2 of the job's
+// sequence number into the completion word (completion_word.h) on its own non-blocking stream; it polls with plain
+// acquire loads of that word, plus one cuStreamQuery per CompletionWord budget while a job is pending. Nothing waits
+// on another stream, a graph launch or the device (no synchronize, no module load, no allocation per job).
+//
+// No fallback: the production recipe needs the copy engine, so init() refuses (and the copy engine's start() throws)
+// when the v2 write-value op cannot be resolved, errors, or its first write does not reach the word.
 class CudaCopyBackend : public CopyBackend {
  public:
-  explicit CudaCopyBackend(int device) : device_(device) {}
+  CudaCopyBackend(int device, std::string prefix) : device_(device), prefix_(std::move(prefix)) {}
 
   std::string init() override {
     void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
     if (lib == nullptr) lib = dlopen("libcuda.so.1", RTLD_NOW);
     if (lib == nullptr) return "cannot open libcuda.so.1";
-    bool ok = true;
+    std::string missing;
     auto get = [&](auto& fn, const char* name) {
       fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, name));
-      ok = ok && fn != nullptr;
+      if (fn == nullptr && missing.empty()) missing = name;
     };
     get(cu_init_, "cuInit");
     get(cu_device_get_, "cuDeviceGet");
@@ -83,12 +90,15 @@ class CudaCopyBackend : public CopyBackend {
     get(cu_stream_create_, "cuStreamCreateWithPriority");
     get(cu_priority_range_, "cuCtxGetStreamPriorityRange");
     get(cu_stream_destroy_, "cuStreamDestroy_v2");
-    get(cu_event_create_, "cuEventCreate");
-    get(cu_event_destroy_, "cuEventDestroy_v2");
-    get(cu_event_record_, "cuEventRecord");
-    get(cu_event_query_, "cuEventQuery");
+    get(cu_stream_query_, "cuStreamQuery");
     get(cu_memcpy_async_, "cuMemcpyAsync");
-    if (!ok) return "libcuda.so.1 lacks a driver entry point the copy engine needs";
+    get(cu_mem_host_alloc_, "cuMemHostAlloc");
+    get(cu_mem_host_device_ptr_, "cuMemHostGetDevicePointer_v2");
+    get(cu_mem_free_host_, "cuMemFreeHost");
+    // The v2 stream memory op, never the plain name: that is the v1 API, gated by NVreg_EnableStreamMemOPs (its _V1
+    // device attribute reads 0 on divix01, while the v2 ops work; results.md 9b).
+    get(cu_write_value32_, "cuStreamWriteValue32_v2");
+    if (!missing.empty()) return "libcuda.so.1 lacks " + missing + ", which the copy engine needs";
     if (int r = cu_init_(0)) return "cuInit failed: " + std::to_string(r);
     if (int r = cu_device_get_(&cu_device_, device_)) return "cuDeviceGet failed: " + std::to_string(r);
     // The primary context: the one PyTorch uses, so the slabs' registrations and the destinations are valid here.
@@ -109,48 +119,83 @@ class CudaCopyBackend : public CopyBackend {
     if (int r = cu_stream_create_(&stream_, kNonBlocking, greatest)) {
       return "cuStreamCreateWithPriority failed: " + std::to_string(r);
     }
-    constexpr unsigned kDisableTiming = 2;  // CU_EVENT_DISABLE_TIMING
-    for (auto& event : events_) {
-      if (int r = cu_event_create_(&event, kDisableTiming)) return "cuEventCreate failed: " + std::to_string(r);
-    }
-    return "";
+    return init_word();
   }
 
   int issue(uint64_t dst, uint64_t src, int64_t bytes) override {
     return cu_memcpy_async_(dst, src, static_cast<size_t>(bytes), stream_);
   }
 
-  // Events are reused round robin: there are more of them than jobs can be outstanding (one per request slot).
+  // The job's token is its sequence number, written into the word after the job's copies (stream order).
   int mark(int64_t* token) override {
-    const int64_t index = next_event_++ % static_cast<int64_t>(events_.size());
-    *token = index;
-    return cu_event_record_(events_[index], stream_);
+    const uint32_t seq = ++marked_;
+    *token = seq;
+    return cu_write_value32_(stream_, word_dev_, seq, 0);  // default flags: after the prior copies, fenced
   }
 
   int query(int64_t token) override {
-    constexpr int kNotReady = 600;  // CUDA_ERROR_NOT_READY
-    const int r = cu_event_query_(events_[token]);
-    return r == 0 ? kDone : r == kNotReady ? kPending : r;
+    return word_.poll(static_cast<uint32_t>(token), [this] { return cu_stream_query_(stream_); });
   }
 
-  // After an error, or with copies in flight, keep the stream, events and context: a copy may still read a slab.
+  // The word's final value is the exact number of jobs the stream completed (the Task P2 job count). After an error,
+  // or with copies in flight, keep the stream, word and context: a copy may still read a slab, the stream may still
+  // write the word.
   void shutdown(bool idle) override {
-    if (!idle) return;
-    for (auto& event : events_) {
-      if (event != nullptr) cu_event_destroy_(event);
+    if (word_host_ != nullptr) {
+      std::fprintf(
+          stderr,
+          "%scompletion word %u at shutdown, %u jobs marked\n",
+          prefix_.c_str(),
+          static_cast<unsigned>(word_.load()),
+          static_cast<unsigned>(marked_));
+      std::fflush(stderr);
     }
+    if (!idle) return;
+    if (word_host_ != nullptr) cu_mem_free_host_(word_host_);
     if (stream_ != nullptr) cu_stream_destroy_(stream_);
     if (retained_) cu_primary_release_(cu_device_);
   }
 
  private:
+  // One host-mapped pinned word, then a first write through the stream, waited for here (start-up only; a bounded
+  // poll with a sleep, no clock): an op the driver rejects, or a write that never lands, refuses the start.
+  std::string init_word() {
+    constexpr unsigned kDeviceMap = 2;  // CU_MEMHOSTALLOC_DEVICEMAP
+    void* host = nullptr;
+    if (int r = cu_mem_host_alloc_(&host, sizeof(uint32_t), kDeviceMap))
+      return "cuMemHostAlloc of the completion word failed: " + std::to_string(r);
+    word_host_ = static_cast<uint32_t*>(host);
+    __atomic_store_n(word_host_, 0xFFFFFFFFu, __ATOMIC_RELEASE);  // not 0: the first write below must change it
+    if (int r = cu_mem_host_device_ptr_(&word_dev_, host, 0))
+      return "cuMemHostGetDevicePointer of the completion word failed: " + std::to_string(r);
+    if (int r = cu_write_value32_(stream_, word_dev_, 0, 0)) {
+      return "cuStreamWriteValue32_v2 failed (" + std::to_string(r) +
+             "): the copy engine needs the v2 stream memory operations for its completion word";
+    }
+    constexpr int kPolls = 100'000;  // x >= 10 us: at least a second
+    for (int i = 0;; ++i) {
+      const int r = cu_stream_query_(stream_);
+      if (r == 0) break;
+      if (r != CompletionWord::kNotReady)
+        return "the completion word's first write failed: cuStreamQuery " + std::to_string(r);
+      if (i == kPolls) return "the completion word's first write did not complete within a second";
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+    word_.bind(word_host_);
+    if (word_.load() != 0) return "the completion word's first write completed but did not reach host memory";
+    return "";
+  }
+
   int device_;
+  std::string prefix_;
   int cu_device_ = 0;
   void* context_ = nullptr;
   void* stream_ = nullptr;
   bool retained_ = false;
-  std::array<void*, 2 * kDemandRecords> events_{};
-  int64_t next_event_ = 0;
+  uint32_t* word_host_ = nullptr;  // host-mapped pinned (cuMemHostAlloc DEVICEMAP); the stream writes it
+  uint64_t word_dev_ = 0;          // its device address
+  CompletionWord word_;            // copy thread only
+  uint32_t marked_ = 0;            // copy thread only: the last job sequence written (wraps at 2^32)
   int (*cu_init_)(unsigned) = nullptr;
   int (*cu_device_get_)(int*, int) = nullptr;
   int (*cu_primary_retain_)(void**, int) = nullptr;
@@ -159,11 +204,12 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_stream_create_)(void**, unsigned, int) = nullptr;
   int (*cu_priority_range_)(int*, int*) = nullptr;
   int (*cu_stream_destroy_)(void*) = nullptr;
-  int (*cu_event_create_)(void**, unsigned) = nullptr;
-  int (*cu_event_destroy_)(void*) = nullptr;
-  int (*cu_event_record_)(void*, void*) = nullptr;
-  int (*cu_event_query_)(void*) = nullptr;
+  int (*cu_stream_query_)(void*) = nullptr;
   int (*cu_memcpy_async_)(uint64_t, uint64_t, size_t, void*) = nullptr;
+  int (*cu_mem_host_alloc_)(void**, size_t, unsigned) = nullptr;
+  int (*cu_mem_host_device_ptr_)(uint64_t*, void*, unsigned) = nullptr;
+  int (*cu_mem_free_host_)(void*) = nullptr;
+  int (*cu_write_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 
 // The copy engine's queues (spec A7/A8): the service's job ring and the copy thread's in-flight, held and acking
@@ -394,7 +440,6 @@ class CopyEngine {
 
  private:
   static constexpr int kRingOverflow = -1000;
-  static constexpr uint32_t kQueryEvery = 8;  // turns per query of the in-flight head (run())
   using Queue = FixedDeque<CopyJob, kCopyRing>;
 
   struct Table {
@@ -418,7 +463,6 @@ class CopyEngine {
     Queue held;    // prefetch jobs not yet issued: demand goes first on the link
     Queue acking;  // copies completed, CopyDone published; the leases wait for the copy wait's SmAck
     uint64_t idle = 0;  // empty polls since the last progress: the spin budget counts these (spec M8)
-    uint32_t query_turn = 0;  // turns since the in-flight head was last queried (kQueryEvery)
     while (true) {
       // Read before the ring: stop() is asked only after the last submit, so a stop seen here has every job in the
       // ring.
@@ -451,14 +495,10 @@ class CopyEngine {
         held.pop_front();
         issue_or_fail(next, in_flight);
       }
-      // The head mark is queried once every kQueryEvery turns, not every turn: each cuEventQuery takes a libcuda
-      // mutex, and one per _mm_pause turn was ~7,900 queries (85.6 M mutex calls) per ~2.2 ms copy job over arm CS's
-      // run (final-fix round, item 5). The turns between are an _mm_pause each, so a completion is seen at most
-      // kQueryEvery - 1 pauses (well under a microsecond) later. A completion found re-queries at once: the loop below
-      // takes every finished job in mark order, and the next turn queries again.
-      const bool query_now = ++query_turn >= kQueryEvery;
-      if (query_now) query_turn = 0;
-      while (query_now && !in_flight.empty() && broken_ == 0) {
+      // The head job is polled every turn, oldest first. CudaCopyBackend's poll is one acquire load of the completion
+      // word, no driver call (the cuEventQuery it replaces took a libcuda mutex per call: ~2,300-3,200 per job over
+      // arm CS3, results.md 9a), and one cuStreamQuery per CompletionWord budget while the head stays pending.
+      while (!in_flight.empty() && broken_ == 0) {
         const int state = backend_->query(in_flight.front().token);
         if (state == CopyBackend::kPending) break;
         if (state != CopyBackend::kDone) {
@@ -474,7 +514,6 @@ class CopyEngine {
           push_or_fail(acking, done);
         }
         progressed = true;
-        query_turn = kQueryEvery - 1;  // the next job may be finishing too: query it on the next turn
       }
       const size_t acking_before = acking.size();
       acking.erase_if([this](CopyJob& waiting) {

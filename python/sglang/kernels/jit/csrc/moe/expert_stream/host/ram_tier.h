@@ -666,18 +666,19 @@ class RamTier {
       throw std::runtime_error(
           error_prefix<Layout>() + "the copy engine needs lease mode, two-phase and piece streaming");
     }
+    const std::string copy_prefix = std::string(Layout::kName) + " RAM miss copy engine: ";
     std::unique_ptr<CopyBackend> backend;
     if (device < 0) {
       backend = std::make_unique<HostCopyBackend>();
     } else {
-      backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device));
+      backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device), copy_prefix);
     }
     auto engine = std::make_unique<Engine>(
         std::move(backend),
         layers_,
         spin_ns,
         this,
-        std::string(Layout::kName) + " RAM miss copy engine: ",
+        copy_prefix,
         std::string(Layout::kName) + "-copy-eng");
     engine->start();
     copy_engine_ = std::move(engine);
