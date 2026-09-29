@@ -63,10 +63,11 @@ CONTEXT_LENGTH = 262144
 # 0.90 since 2026-09-26, with the hot cache 1 GiB smaller: ~815 MiB goes back to the 4096-token prefill chunk's
 # activations, and the KV pool still grows (~387k tokens). At 0.925 a smaller hot cache only grows the KV pool, and
 # 2048- and 4096-token chunks run out of memory (27.17).
-# 0.91 since 2026-09-29: at 0.90 the KV pool no longer fit (0.14-0.17 GB available vs the 0.23 GB SWA floor) after
-# start-of-load free memory fell 0.10 GB and weights grew 0.04 GB; at 0.91: 0.52 GB spare, 191,488 KV tokens
-# (analysis/dsv41-drive/mirror-scaling/weight-pair.md on cc/spcc-weight-pair).
-MEM_FRACTION_STATIC = 0.91
+# 0.895 since 2026-09-29, with the hot cache cut to 15400: NVIDIA driver 615.71.09 (from 610.57.04) takes ~0.5 GiB more
+# before weights load under CUDA_MODULE_LOADING=EAGER, all of it out of the KV pool (0.80 -> 0.14-0.38 GB available vs a
+# 0.23 GB SWA floor). 0.91 restored the pool but cut prefill headroom and a 16k prompt OOMed; 0.895 gives the headroom
+# back and the smaller hot cache refills the pool (analysis/dsv41-drive/recipe-mem/diagnosis.md, results.md).
+MEM_FRACTION_STATIC = 0.895
 # 4096 since 2026-09-26: a chunk's cost is streaming the experts it routes to, nearly the same at 512 and 4096 tokens,
 # so a 16k prompt's TTFT fell 444 -> 107 s (27.17).
 CHUNKED_PREFILL_SIZE = 4096
@@ -145,8 +146,9 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_PINNED_HOST_NUMA_MB": PINNED_HOST_NUMA_MB,
         # 14336 + 3072 on the indexer cap's freed VRAM: 110.1 -> 103.0 ms/token, byte-identical (27.7). Counts against
         # MEM_FRACTION_STATIC. Cut to 16100 for 4096-token prefill chunks and a 262144 context (27.17); the decode cost
-        # of the cut is not measured (27.7's slope suggests ~2-3 ms/token).
-        "SGLANG_MOE_HOT_GPU_MB": "16100",
+        # of the cut is not measured (27.7's slope suggests ~2-3 ms/token). Cut to 15400 on 2026-09-29 for driver
+        # 615.71.09's larger EAGER footprint, with MEM_FRACTION_STATIC 0.895 (recipe-mem/diagnosis.md, results.md).
+        "SGLANG_MOE_HOT_GPU_MB": "15400",
         "SGLANG_MOE_HOT_DYNAMIC": "1",
         "SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS": "256",
         "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS": "1",
