@@ -517,7 +517,7 @@ class UringReader {
     const unsigned tail = ring_.sq.sqe_tail;
     for (unsigned i = tail - n; i != tail; ++i) {
       io_uring_sqe* sqe = &ring_.sq.sqes[i & ring_.sq.ring_mask];
-      std::memset(sqe, 0, sizeof(*sqe));
+      std::memset(static_cast<void*>(sqe), 0, sizeof(*sqe));
       io_uring_prep_nop(sqe);
       io_uring_sqe_set_data64(sqe, kNopTag);
     }

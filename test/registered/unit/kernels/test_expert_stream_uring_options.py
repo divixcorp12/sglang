@@ -117,7 +117,18 @@ _FAKE_LIBURING = r"""
 #endif
 struct io_uring_sqe { int fd = -1, opcode = -1, buf_index = -1; unsigned flags = 0, len = 0; uint64_t user_data = 0; const iovec* iov = nullptr; };
 struct io_uring_cqe { uint64_t user_data; int res; };
-struct io_uring { std::deque<io_uring_sqe> sq; std::deque<io_uring_cqe> cq; unsigned flags; };
+// The SQ keeps liburing's shape (sqes ring, sqe_head/sqe_tail, khead/ktail, ring_mask): drain() rewrites unconsumed
+// SQEs in place. size/empty/front/back read the unconsumed entries [khead, sqe_tail).
+struct fake_sq {
+ io_uring_sqe sqes[8]; unsigned sqe_head=0, sqe_tail=0, khead_v=0, ktail_v=0, ring_mask=7;
+ unsigned* khead=&khead_v; unsigned* ktail=&ktail_v;
+ unsigned size() const { return sqe_tail-khead_v; }
+ bool empty() const { return size()==0; }
+ io_uring_sqe& front() { return sqes[khead_v&7]; }
+ io_uring_sqe& back() { return sqes[(sqe_tail-1)&7]; }
+ void clear() { sqe_head=sqe_tail=khead_v=ktail_v=0; }
+};
+struct io_uring { fake_sq sq; std::deque<io_uring_cqe> cq; unsigned flags; };
 struct io_uring_params { unsigned flags=0, sq_thread_idle=0, sq_thread_cpu=0, sq_entries=0, cq_entries=0, features=0; };
 struct io_uring_probe {};
 inline int setups=0, exits=0, register_files_calls=0, register_buffers_calls=0, unregister_files_calls=0;
@@ -142,7 +153,13 @@ inline int io_uring_queue_init_params(unsigned n, io_uring* r, io_uring_params* 
  p->sq_entries=n; p->cq_entries=2*n; p->features=17; last_ring=r; return 0;
 }
 inline void io_uring_queue_exit(io_uring* r) { ++exits; r->sq.clear(); r->cq.clear(); }
-inline io_uring_sqe* io_uring_get_sqe(io_uring* r) { if(r->sq.size() == 8) return nullptr; return &r->sq.emplace_back(); }
+inline io_uring_sqe* io_uring_get_sqe(io_uring* r) {
+ if(r->sq.size() == 8) return nullptr;
+ io_uring_sqe* s=&r->sq.sqes[r->sq.sqe_tail++ & 7];
+ *s=io_uring_sqe{};
+ return s;
+}
+inline void io_uring_prep_nop(io_uring_sqe* s) { s->opcode=9; s->fd=-1; s->len=0; s->iov=nullptr; }
 inline void io_uring_prep_read(io_uring_sqe* s,int fd,void*,unsigned n,uint64_t) { s->fd=fd;s->len=n;s->opcode=0; }
 inline void io_uring_prep_read_fixed(io_uring_sqe* s,int fd,void* p,unsigned n,uint64_t o,int index) { io_uring_prep_read(s,fd,p,n,o);s->opcode=1;s->buf_index=index; }
 inline void io_uring_prep_readv(io_uring_sqe* s,int fd,const iovec* v,unsigned n,uint64_t) { s->fd=fd;s->iov=v;s->len=n;s->opcode=2; }
@@ -152,9 +169,13 @@ inline void io_uring_prep_readv_fixed(io_uring_sqe* s,int fd,const iovec* v,unsi
 inline void io_uring_sqe_set_data64(io_uring_sqe* s,uint64_t d) { s->user_data=d; }
 inline uint64_t io_uring_cqe_get_data64(const io_uring_cqe* c) { return c->user_data; }
 inline int io_uring_submit(io_uring* r) {
- ++submit_calls; if(submit_error_once) { int e=submit_error_once;submit_error_once=0;return e; }
+ // liburing publishes the SQ tail before entering the kernel, so a failed enter leaves published, unconsumed SQEs.
+ ++submit_calls;
+ r->sq.sqe_head=r->sq.sqe_tail;
+ *r->sq.ktail=r->sq.sqe_tail;
+ if(submit_error_once) { int e=submit_error_once;submit_error_once=0;return e; }
  unsigned n=std::min<unsigned>(r->sq.size(),consume_limit);
- for(unsigned i=0;i<n;++i) { auto s=r->sq.front(); r->sq.pop_front();
+ for(unsigned i=0;i<n;++i) { auto s=r->sq.front(); ++r->sq.khead_v;
    int bytes=s.len; if(s.opcode>=2) { bytes=0;for(unsigned j=0;j<s.len;++j)bytes+=s.iov[j].iov_len; }
    submitted_log.push_back(s);
    if(delay_completions)delayed_cq.push_back({s.user_data,bytes});else r->cq.push_back({s.user_data,bytes}); }
@@ -224,9 +245,16 @@ int main() {
  rejected([&]{r.prep_readv_fixed(99,v,2,0,0,1);});assert(last_ring->sq.empty());
  assert(fixed(r,13,&first,1,0,2));assert(last_ring->sq.front().fd==1);assert(last_ring->sq.front().opcode==1);
  assert(last_ring->sq.front().flags & IOSQE_FIXED_FILE);assert(last_ring->sq.front().buf_index==0);
+ // drain() discards the unconsumed SQE as a cleared NOP on the same ring: no re-setup, no re-registration
+ // (plan 2026-09-29-ring-reset-nop-drain; a reset re-registered the whole tier).
  const int old_setups=setups, old_registration=register_files_calls, old_buffers=register_buffers_calls;
- r.drain(1);assert(setups==old_setups+1 && register_files_calls==old_registration+1);
- assert(register_buffers_calls==old_buffers+1 && registered_chunks==1);
+ r.drain(1);assert(setups==old_setups && register_files_calls==old_registration);
+ assert(register_buffers_calls==old_buffers && registered_chunks==1 && r.registrations()==1);
+ assert(submitted_log.back().opcode==9 && submitted_log.back().flags==0 && submitted_log.back().buf_index==0);
+ assert(last_ring->sq.empty() && last_ring->cq.empty() && r.ready());
+ // A transient EAGAIN on the NOP submit is retried, not refused.
+ assert(fixed(r,13,&first,1,0,4));submit_error_once=-EAGAIN;r.drain(1);
+ assert(setups==old_setups && r.registrations()==1 && submitted_log.back().opcode==9 && r.ready());
  assert(fixed(r,13,&first,1,0,3));r.submit(0);r.close();assert(!r.ready());
  }
 #ifndef FAKE_OLD_HEADERS
