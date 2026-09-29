@@ -418,7 +418,7 @@ run_one() {  # <arm> <worktree> <sha> [KEY=VAL ...]
 }
 
 identical_so_far() {  # A2 and B must match A byte for byte before C runs
-    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3:$BRANCH_WT/analysis/dsv41-drive/hotpath $PY -c "
+    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3:$BRANCH_WT/analysis/dsv41-drive/hotpath:$BRANCH_WT/analysis/dsv41-drive/iopoll-cuts $PY -c "
 import sys, hotpath_report as hr
 ref = sys.argv[1]
 bad = {}
@@ -436,7 +436,7 @@ attribute() {  # <arm>: the arm's shim counts and stacks, attributed to call sit
 
 same_as_ref() {  # <arm>: byte identity against REF_RUN (Task 18's A), when given
     [ -n "${REF_RUN:-}" ] || return 0
-    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3:$BRANCH_WT/analysis/dsv41-drive/hotpath $PY -c "
+    PYTHONPATH=$BRANCH_WT/analysis/dsv41-drive/mirror3:$BRANCH_WT/analysis/dsv41-drive/hotpath:$BRANCH_WT/analysis/dsv41-drive/iopoll-cuts $PY -c "
 import sys, hotpath_report as hr
 same = hr.identity_checked(sys.argv[1], sys.argv[2])
 bad = [k for k, v in same.items() if not v]

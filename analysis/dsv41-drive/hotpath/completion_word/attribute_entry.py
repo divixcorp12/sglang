@@ -11,6 +11,8 @@ instead walks each record outward to the first frame in the host module (HOST) a
   CudaCopyBackend::query    -> cuEventQuery    (steady state, completion polling)
   CudaCopyBackend::init     -> init            (start-up)
   CudaCopyBackend::shutdown -> shutdown        (exit)
+  another HOST function whose callee is an exported cu* entry (a devirtualized, inlined backend call: at -O2
+  CudaCopyBackend::issue and ::mark are inlined into CopyEngine::run) -> that entry point's class
   any other HOST function   -> "other: <function>" (e.g. CopyEngine::run's start handshake)
   no HOST frame             -> "other: no host frame" (thread start/exit, libcuda TLS destructors)
 
@@ -37,6 +39,10 @@ CLASSES = {
 }
 
 
+ENTRY = {"cuMemcpyAsync": "cuMemcpyAsync", "cuEventRecord": "cuEventRecord", "cuEventQuery": "cuEventQuery",
+         "cuLaunchKernel": "launch"}
+
+
 def classify(frames: list[str]) -> tuple[str, str]:
     """(class, outermost libcuda frame below the host frame)."""
     last_cuda = ""
@@ -47,9 +53,14 @@ def classify(frames: list[str]) -> tuple[str, str]:
             last_cuda = re.sub(r"\+0x[0-9a-f]+$", "", f)
             continue
         if f.startswith("sgl_kernel_jit_expert_stream_host") or "expert_stream_host" in f.split("!")[0]:
-            m = re.search(r"CudaCopyBackend::(\w+)\(", f)
+            m = re.search(r"CudaCopyBackend::(\w+)(\[abi:cxx11\])?\(", f)
             if m:
                 return CLASSES.get(m.group(1), "other: CudaCopyBackend::" + m.group(1)), last_cuda
+            # A backend call the compiler devirtualized and inlined into its caller (issue/mark inside
+            # CopyEngine::run): the outermost libcuda frame is then the exported entry point the host called.
+            e = re.match(r"libcuda!(cu\w+?)(_v\d+)?$", last_cuda)
+            if e:
+                return ENTRY.get(e.group(1), "other entry: " + e.group(1)), last_cuda
             if "launch" in f.lower() and "Kernel" in f:
                 return "launch", last_cuda
             fn = f.split("!", 1)[-1]
