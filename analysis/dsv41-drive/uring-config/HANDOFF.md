@@ -56,8 +56,14 @@ one address span. Row-image experiments therefore need `SLAB_ARENA=1`.
 **2026-09-28 update** (plan `docs/superpowers/plans/2026-09-28-reader-crtp-uring-registration.md`, Task 7): the
 paragraph above is superseded. `fixed` and `readv_fixed` now fan a read whose iovecs meet several registered buffers
 out into one SQE per buffer, submitted together, so multi-iovec row-image reads work in both modes and row images no
-longer need `SLAB_ARENA=1`. Separate slabs register without the quadratic pin accounting once each mapping's tail is
-bound out to its 2 MiB end (final review Important 1, fixed on the same branch).
+longer need `SLAB_ARENA=1`. Binding each mapping's tail out to its 2 MiB end (final review Important 1) removed only
+the tail's share of the quadratic pin accounting, not all of it. Registration of the tier stays superlinear:
+- THP fault fallback still leaves 8-22 % of a 100 GiB tier on 4 KiB pages. Direct registration then took 18.9-103.5 s
+  across launches, and 59 s at 90 GiB in `uring-reg`.
+- Even an all-THP tier is quadratic, at about 19 s for 100 GiB by the per-chunk model.
+
+`analysis/dsv41-drive/thp-fallback/results.md` has the measurements. Its one working fix, cloning through a scratch
+ring, leaks page pins on this kernel and was reverted.
 
 `readv_fixed` requires liburing 2.10+ headers and a kernel advertising
 `IORING_OP_READV_FIXED`. The reader probes the running kernel. Enabling NVMe poll
