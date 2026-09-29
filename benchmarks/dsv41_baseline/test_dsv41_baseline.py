@@ -979,7 +979,7 @@ def test_judge_missing_residency_sample_is_unacknowledged_problem(residency):
 def test_server_args_matches_current_context_and_prefix_cache_mode():
     argv = arm_env.ServerArgs(port=31050).argv()
     context_index = argv.index("--context-length")
-    assert arm_env.CONTEXT_LENGTH == 262144
+    assert arm_env.CONTEXT_LENGTH == 131072
     assert argv[context_index + 1] == str(arm_env.CONTEXT_LENGTH)
     assert argv[argv.index("--chunked-prefill-size") + 1] == "4096"
     assert "--disable-radix-cache" not in argv

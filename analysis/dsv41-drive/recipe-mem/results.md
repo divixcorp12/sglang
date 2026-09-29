@@ -36,9 +36,10 @@ only 32,150 MiB" is wrong by 52 MiB.** Its "~16 MiB margin" for the 09-26 chunke
 - **Every launch clears the KV floor.** The lowest available is 0.46 GB, against the 0.23 GB SWA floor.
 - **The pool is smaller than the old recipe's.** It holds 150k–232k tokens, against ~387k at 0.90 on the old driver.
   One 64k prompt fits several times over.
-- **Open: long contexts.** The GPU KV pool is now below `CONTEXT_LENGTH` (262,144), and `arm_env`'s comment above it
-  ("~387k tokens") is stale. Whether a 250k prompt still runs, for example through the hierarchical cache, was not
-  tested.
+- **Context capped to 131,072.** The GPU KV pool (150k–232k tokens) had fallen below `CONTEXT_LENGTH` 262,144. The
+  cause is the driver 615.71.09 memory loss plus the smaller fraction and hot cache. The recipe's context is now
+  capped at 131,072, below the smallest measured pool with margin for launch-to-launch variation. See "Context cap"
+  below.
 
 ### Prefill: 4096-token chunks; lm = recipe (≥ 8192 uncached tokens run layer-major), ch = `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0`
 

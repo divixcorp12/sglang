@@ -52,9 +52,12 @@ CUDA_HOME = "/usr/local/cuda-13.2"
 PYTHON = "/data/models/slang/.venv/bin/python"
 GPU_LOCK = f"{NVFP4_WORK}/cc-gpu.lock"
 
-# 262144 since 2026-09-26, for 250k-token prompts; the KV pool at the settings below holds ~387k tokens. No prompt
+# 262144 since 2026-09-26, for 250k-token prompts; the KV pool then (driver 610.57.04) held ~387k tokens. No prompt
 # past 32k has been run at this recipe. Older benchmark arms used 4096, then 32768.
-CONTEXT_LENGTH = 262144
+# 131072 since 2026-09-29: driver 615.71.09's larger EAGER footprint and MEM_FRACTION_STATIC 0.885 / hot cache 15400
+# shrank the GPU KV pool to 150k-232k tokens across launches, so the context is capped below the smallest measured pool
+# (analysis/dsv41-drive/recipe-mem/results.md).
+CONTEXT_LENGTH = 131072
 # 0.83 since 2026-09-25, with CUDA_MODULE_LOADING=EAGER (base_env): eager loading keeps every kernel resident, ~1 GiB,
 # and at 0.80 the KV cache no longer fit. At 0.83 it holds 204,288 tokens (0.80 under LAZY: 209,408), with the same
 # ~4.7 GB left over. An arm run at 0.80 is not comparable on memory, only on speed.
