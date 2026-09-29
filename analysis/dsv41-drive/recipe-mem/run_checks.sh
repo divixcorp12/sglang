@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Recipe memory checks (EXPECT_MFS, default 0.895; hot cache read from arm_env) on divix01, at the recipe as committed (no fraction override):
+# Recipe memory checks (EXPECT_MFS, default 0.885; hot cache read from arm_env) on divix01, at the recipe as committed (no fraction override):
 #   1. one standard decode arm (run_arm.sh), for ms/token and the KV sizing;
 #   2. long-prompt prefill smokes (prefill-chunk/chunk_smoke.sh, 4096-token chunks, the recipe's hot cache):
 #      16k and 64k at the recipe, each twice (-2 steps), (suffixes >= 8192 prefill layer-major), then 16k and 64k with
@@ -15,7 +15,7 @@ OUT=/mnt/nvme1/recipe-mem
 DISK_LOCK=/data/models/slang/nvfp4-work/rowimg-disk.lock
 GPU_LOCK=/data/models/slang/nvfp4-work/cc-gpu.lock
 PORT=30051
-TAGP=${TAGP:-mem0895}  # tag prefix for the arm and smoke dirs
+TAGP=${TAGP:-mem0885}  # tag prefix for the arm and smoke dirs
 mkdir -p "$OUT"
 say() { echo "$(date +%T) $*"; }
 
@@ -23,7 +23,7 @@ say() { echo "$(date +%T) $*"; }
 [ -z "$(git -C "$WT" status --porcelain --untracked-files=no)" ] || { say "$WT has tracked changes"; exit 1; }
 PYTHONPATH=$WT/python $PY -c "import sglang; print('sglang from', sglang.__file__)" || exit 1
 mfs=$(PYTHONPATH=$WT/benchmarks/dsv41_baseline $PY -c "import arm_env; print(arm_env.MEM_FRACTION_STATIC)")
-[ "$mfs" = "${EXPECT_MFS:-0.895}" ] || { say "arm_env.MEM_FRACTION_STATIC is $mfs, not ${EXPECT_MFS:-0.895}"; exit 1; }
+[ "$mfs" = "${EXPECT_MFS:-0.885}" ] || { say "arm_env.MEM_FRACTION_STATIC is $mfs, not ${EXPECT_MFS:-0.885}"; exit 1; }
 HOT=$(PYTHONPATH=$WT/benchmarks/dsv41_baseline $PY -c "import arm_env; print(arm_env.base_env()['SGLANG_MOE_HOT_GPU_MB'])")
 say "recipe: MEM_FRACTION_STATIC=$mfs SGLANG_MOE_HOT_GPU_MB=$HOT"
 [ -z "${DSV41_MEM_FRACTION_STATIC:-}" ] || { say "DSV41_MEM_FRACTION_STATIC is set; this check runs the constant"; exit 1; }
@@ -72,14 +72,17 @@ smoke() {  # <tag> <tokens> [SMOKE_ENV]: chunk_smoke.sh takes both locks itself,
     rc=$?
     say "$tag: chunk_smoke rc=$rc ($(grep -E 'long prompt:|OOM retries|long rc' /mnt/nvme1/prefill-chunk/$TAGP-$tag/driver.log | tr '\n' ' '))"
     [ "$rc" = 0 ] || return $rc
-    # Minimum free at the peak: CUDA can use 32,150 MiB of the card (DSV41_REFERENCE 27.18), so free = 32150 - peak
-    # memory.used (50 ms samples). Under 64 MiB stops the pass.
-    local peak free
+    # Minimum free at the peak: CUDA reaches 32,202 MiB of the card (torch total 33766572032 B; a chunked 16k prompt
+    # peaked at 32,201 MiB memory.used, so DSV41_REFERENCE 27.18's 32,150 is too low), free = 32202 - peak memory.used
+    # (50 ms samples). Under 64 MiB, or any allocator OOM retry, stops the pass.
+    local peak free retries
     peak=$(awk -F', ' '$2 ~ /^[0-9]+$/ { if ($2 > m) m = $2 } END { print m + 0 }' "/mnt/nvme1/prefill-chunk/$TAGP-$tag/vram.csv")
-    free=$((32150 - peak))
-    say "$tag: peak memory.used ${peak} MiB, min free ${free} MiB"
-    echo "{\"step\": \"$tag\", \"peak_mib\": $peak, \"min_free_mib\": $free}" >> "$OUT/peaks.jsonl"
+    free=$((32202 - peak))
+    retries=$(cat "/mnt/nvme1/prefill-chunk/$TAGP-$tag/retries.txt")
+    say "$tag: peak memory.used ${peak} MiB, min free ${free} MiB, allocator OOM retries ${retries}"
+    echo "{\"step\": \"$tag\", \"peak_mib\": $peak, \"min_free_mib\": $free, \"oom_retries\": $retries}" >> "$OUT/peaks.jsonl"
     [ "$free" -ge 64 ] || { say "$tag: min free ${free} MiB < 64; stopping"; return 1; }
+    [ "$retries" = 0 ] || { say "$tag: ${retries} allocator OOM retries; stopping"; return 1; }
 }
 
 for step in "${STEPS[@]}"; do
