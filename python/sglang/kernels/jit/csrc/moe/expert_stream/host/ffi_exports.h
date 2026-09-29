@@ -235,7 +235,7 @@ struct HostExports {
     reader.set_fixed_chunk_cap(f[28]);
     reader.set_leg_cut_cap(f[31]);
     if (!reader.open()) {
-      std::fill(out, out + 10, 0);
+      std::fill(out, out + 12, 0);
       return;
     }
     reader.set_fault(fault_from(f));

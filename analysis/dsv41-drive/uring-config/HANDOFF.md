@@ -39,7 +39,7 @@ each benchmark arm. Changing options requires no source edit or JIT variant.
 | `SQ_THREAD_IDLE_MS` | `10000` | SQPOLL kernel thread's idle timeout in milliseconds (1000 before 2026-09-28; user decision) |
 | `SQ_THREAD_CPU` | `-1` | `-1` unpinned; nonnegative CPU requires an SQPOLL mode |
 | `DIAGNOSTICS` | `0` | `1` logs effective flags, depths, features and registrations |
-| `READ_CUTS` | `auto` | `auto` (on with IOPOLL), `0`, `1`: cut reads into device-sized legs (plan 2026-09-28-iopoll-read-cuts) |
+| `READ_CUTS` | `auto` | `auto` (on with IOPOLL), `0`, `1`: cut reads into device-sized legs (plan 2026-09-28-iopoll-read-cuts). With cuts on, the default depth grows to 16 x parts x legs per read; an explicit `QUEUE_DEPTH` below that logs once at open (fewer reads in flight than uncut), and one below the widest read's legs is refused |
 | `SLAB_ARENA` | `0` | `1` enables the shared per-layer host slab allocation |
 
 Booleans accept only `0` or `1`. Invalid option values fail explicitly.

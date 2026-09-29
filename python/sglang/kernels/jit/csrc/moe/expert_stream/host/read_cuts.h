@@ -3,6 +3,9 @@
 // bio (-EAGAIN) and io_uring punts the read to an io-wq worker. A read needs a split when it is larger than the
 // queue's max_sectors_kb / max_segments, or when two of its iovecs meet off the NVMe PRP boundary (virt_boundary_mask).
 // Cutting at both keeps every leg one request (analysis/dsv41-drive/iopoll/diagnosis.md).
+// Out of scope (none applies to the NVMe mirror drives this serves): chunk_sectors (a RAID/zoned boundary a request must
+// not cross: a nonzero value is named in the drive's `read cuts:` line, not modeled), max_segment_size below a page
+// (NVMe reports 4 GiB), and max_segments == 1 (then only max_sectors_kb bounds a leg).
 #pragma once
 
 #include <limits.h>
@@ -58,6 +61,9 @@ inline bool limits_from_queue_dir(const std::string& dir, DeviceLimits* out, std
   }
   if (!read_sysfs_number(dir + "/virt_boundary_mask", &mask)) mask = static_cast<int64_t>(kFallbackVirtMask);
   *out = DeviceLimits{cut_bytes_for(kb, segments), static_cast<uint64_t>(mask), dir};
+  int64_t chunk = 0;
+  if (read_sysfs_number(dir + "/chunk_sectors", &chunk) && chunk > 0)
+    out->source += " (chunk_sectors=" + std::to_string(chunk) + ": boundary splits not modeled)";
   return true;
 }
 
@@ -117,8 +123,10 @@ inline unsigned cut_legs(
   for (unsigned i = 0; i < count; ++i) {
     auto* at = static_cast<uint8_t*>(in[i].iov_base);
     size_t left = in[i].iov_len;
-    const bool gap = i > 0 && !(on_boundary(reinterpret_cast<uintptr_t>(in[i - 1].iov_base) + in[i - 1].iov_len) &&
-                                on_boundary(reinterpret_cast<uintptr_t>(at)));
+    // A join is a gap unless the next iovec continues the last one in memory, or both sides sit on the boundary.
+    const uintptr_t prev_end = i > 0 ? reinterpret_cast<uintptr_t>(in[i - 1].iov_base) + in[i - 1].iov_len : 0;
+    const bool gap = i > 0 && prev_end != reinterpret_cast<uintptr_t>(at) &&
+                     !(on_boundary(prev_end) && on_boundary(reinterpret_cast<uintptr_t>(at)));
     bool open_leg = n == 0 || gap;
     bool first_piece = true;
     while (left > 0) {

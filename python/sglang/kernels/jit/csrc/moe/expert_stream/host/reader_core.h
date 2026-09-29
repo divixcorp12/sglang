@@ -267,6 +267,18 @@ class ReaderCore {
     if (!io_.init(queue_depth())) return false;
     // A read's legs are reserved all at once, so the ring must hold the widest read's legs: a fixed read has a leg per
     // registered buffer its iovecs meet, a cut read its device-sized legs as well (leg_stride_ bounds both).
+    if (fixed_reads() && leg_stride_ < std::max<size_t>(1, derived().max_iovecs()))
+      throw std::logic_error(error_prefix<Layout>() + "a fixed read mode opened with one-leg storage");
+    if (cuts_ && configured_queue_depth_ != 0) {
+      const unsigned scaled = static_cast<unsigned>(std::min<size_t>(
+          32768, static_cast<size_t>(kQueueDepth) * static_cast<size_t>(t_.parts) * leg_stride_));
+      if (configured_queue_depth_ < scaled)
+        std::fprintf(
+            stderr,
+            "expert stream io_uring: read cuts: SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=%u is below the cut default %u "
+            "(16 x %zu parts x %u legs): fewer reads fit in flight than uncut\n",
+            configured_queue_depth_, scaled, static_cast<size_t>(t_.parts), leg_stride_);
+    }
     if ((fixed_reads() || cuts_) && queue_depth() < leg_stride_) {
       throw std::runtime_error(
           error_prefix<Layout>() + "reads fanned out or cut into legs need a queue depth of at least " +
@@ -442,6 +454,7 @@ class ReaderCore {
   ReaderCore(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {
     configured_queue_depth_ = UringOptions::from_env().queue_depth;
     cuts_requested_ = UringOptions::from_env().read_cuts_on();
+    fixed_requested_ = UringOptions::from_env().read_mode != UringReadMode::Normal;
   }
 
   ~ReaderCore() {
@@ -598,7 +611,7 @@ class ReaderCore {
   void size_legs() {
     cuts_ = cuts_requested_ || leg_cut_cap_ > 0;
     limits_.clear();
-    for (size_t f = 0; f < fds_.size(); ++f) {
+    for (size_t f = 0; cuts_ && f < fds_.size(); ++f) {  // sysfs is read only when reads are cut
       if (leg_cut_cap_ > 0) {
         limits_.push_back(
             DeviceLimits{std::max(kCutPage, leg_cut_cap_ / kCutPage * kCutPage), kFallbackVirtMask, "test cap"});
@@ -606,9 +619,15 @@ class ReaderCore {
         limits_.push_back(device_limits(fds_[f]));
       }
     }
+    // io_ is not initialized yet, so the fixed read mode comes from the options (fixed_reads() reads them after init).
+    bool fixed = false;
+    if constexpr (requires(const Reader& reader, const iovec* v, unsigned c, FixedLeg* out) {
+                    reader.fixed_legs(v, c, out);
+                  }) {
+      fixed = fixed_requested_;
+    }
     const size_t iovecs = std::max<size_t>(1, derived().max_iovecs());
-    size_t want = iovecs;
-    if (cuts_) want = leg_bound(longest_read(), iovecs, min_cut_bytes());
+    const size_t want = cuts_ ? leg_bound(longest_read(), iovecs, min_cut_bytes()) : fixed ? iovecs : 1;
     if (want > kMaxLegs) {
       throw std::runtime_error(
           error_prefix<Layout>() + "reads cut at " + std::to_string(min_cut_bytes()) + " B need up to " +
@@ -1479,6 +1498,7 @@ class ReaderCore {
   Reader io_;
   unsigned configured_queue_depth_ = 0;
   bool cuts_requested_ = false;       // READ_CUTS resolved (UringOptions::read_cuts_on)
+  bool fixed_requested_ = false;      // READ_MODE fixed/readv_fixed (the options, before io_ is initialized)
   bool cuts_ = false;                 // in force: requested, or a test cap
   int64_t leg_cut_cap_ = 0;           // test only (fault word leg_cut_cap): every file cut at this, 0: device limits
   std::vector<DeviceLimits> limits_;  // per file, t_.paths order
