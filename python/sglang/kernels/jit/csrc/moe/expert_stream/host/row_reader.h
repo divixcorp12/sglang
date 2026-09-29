@@ -168,6 +168,13 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
         delay();
         finish_row(best, clock(), clock());
         any = true;
+        if constexpr (Build::kFaults) {
+          // The slow publisher (pack_delay_ns) finishes one row per turn, so the loop reaps between rows as a real
+          // publisher's would: without it, rows 1..n that landed before row 0 are all finished (n delays) before row 0
+          // is even reaped, and a claim-order prefix stalls behind a row that landed long ago. InstrBuild only;
+          // ProdBuild's finish has no delay and takes every ready row in one pass.
+          if (faults_.fault.pack_delay_ns > 0) return any;
+        }
       }
     }
     const size_t segments = t_.segments.size();
