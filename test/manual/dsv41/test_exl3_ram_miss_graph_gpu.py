@@ -8,6 +8,7 @@ rows, and graph vs the eager streamed apply (exl3_moe_loop, the less accurate ar
 ~1.5e-2 on these fake rows) stays within Task 9's 2.5e-2.
 """
 
+import contextlib
 import sys
 import time
 
@@ -74,11 +75,15 @@ def _layers(tmp_path, timeout_ms=2000, lease=False, num_layers=1):
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=num_layers, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     with (
+        # Leases on: the service reads row images with O_DIRECT, as in production. Leases off is the service as it was
+        # before them (shard tables, buffered), until that switch is removed.
+        service_row_images(tmp_path) if lease else contextlib.nullcontext(),
         envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
         envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
         # Read when attach builds the device side, so attach runs inside this block.
@@ -92,7 +97,8 @@ def _layers(tmp_path, timeout_ms=2000, lease=False, num_layers=1):
             layer = torch.nn.Module()
             layer.layer_id = layer_id
             layer.top_k = TOP_K
-            fmt = Exl3ExpertFormat(layout, layer_id, direct=False)
+            # With images no ``direct``: SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production.
+            fmt = Exl3ExpertFormat(layout, layer_id, direct=None if lease else False, source_root=str(tmp_path))
             streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
             layer._nvfp4_expert_streamer = streamer
             ExpertPinnedHostCache(streamer, 8, **fmt.pinned_tier_options(layer))
@@ -147,6 +153,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
 
     experts = 36
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=experts, hidden=HIDDEN, inter=INTER, finite=True)
@@ -156,6 +163,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
     service = service_module.Exl3RamMissService.get()
     try:
         with (
+            service_row_images(tmp_path),  # the service reads row images with O_DIRECT, as in production
             envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
             envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
             envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
@@ -169,7 +177,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             model = torch.nn.Module()
             layer = torch.nn.Module()
             layer.layer_id, layer.top_k = 0, TOP_K
-            fmt = Exl3ExpertFormat(layout, 0, direct=False)
+            fmt = Exl3ExpertFormat(layout, 0, source_root=str(tmp_path))  # direct from the reader env
             # A tiny synthetic checkpoint uses its routed width as the eager
             # staging bound; production leaves the format's 64-row bound.
             fmt.max_gather_rows = TOP_K

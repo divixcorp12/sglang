@@ -1,15 +1,16 @@
 """Option C wiring on the host: the native slot table under the pinned tier, the fail-stop
 check, residency pushes and the per-step graph trace (CPU; the thread runs, no device)."""
 
+import contextlib
 import faulthandler
 import os
 import shutil
+import time
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import sim_post, sim_wait
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -18,6 +19,8 @@ from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+from sglang.test.dsv41_lease_sim import LeaseSim
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -33,26 +36,56 @@ def hang_guard():
     faulthandler.cancel_dump_traceback_later()
 
 
+# The indirect parameter of ``tiers`` that builds the service as it was before row images: shard tables read buffered,
+# leases off. Only for a test whose subject is that configuration (test_exl3_ram_miss_row_images.BOUNCE_ONLY_PINNED).
+SHARDS = pytest.mark.parametrize("tiers", ["shards"], indirect=True)
+
+
 @pytest.fixture
-def tiers(tmp_path, monkeypatch):
-    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS)
+def tiers(tmp_path, monkeypatch, request):
+    """The service reads row images with O_DIRECT (service_row_images), as in production; leases are on, which the
+    images need, so a demand is posted as the device posts it (_demand)."""
+    images = getattr(request, "param", "images") == "images"
+    dims = dict(hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM) if images else {}
+    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, **dims)
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None
     streamers, caches = {}, {}
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
-        for layer_id in range(LAYERS):
-            layer = torch.nn.Module()
-            layer.layer_id = layer_id
-            fmt = Exl3ExpertFormat(layout, layer_id, direct=False, source_root=str(tmp_path))
-            streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
-            layer._nvfp4_expert_streamer = streamer
-            options = fmt.pinned_tier_options(layer)
-            caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **options)
-            streamers[layer_id] = streamer
-    service = module.Exl3RamMissService.get()
-    yield service, streamers, caches
-    service.shutdown()
+    with contextlib.ExitStack() as stack:
+        if images:
+            stack.enter_context(service_row_images(tmp_path))
+        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+            for layer_id in range(LAYERS):
+                layer = torch.nn.Module()
+                layer.layer_id = layer_id
+                # No ``direct`` with images: SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production.
+                fmt = Exl3ExpertFormat(layout, layer_id, direct=None if images else False, source_root=str(tmp_path))
+                streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
+                layer._nvfp4_expert_streamer = streamer
+                options = fmt.pinned_tier_options(layer)
+                caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **options)
+                streamers[layer_id] = streamer
+        service = module.Exl3RamMissService.get()
+        yield service, streamers, caches
+        service.shutdown()
     module.Exl3RamMissService._instance = None
+
+
+def _demand(service, row, experts, *, status=1):
+    """One armed demand for ``experts`` of ``row`` as the device posts it in lease mode (its lane request with it),
+    waited for with ``status``; served, its leases are acknowledged and retired, so its rows are evictable again."""
+    sim = LeaseSim(service.host, service.page, {})
+    req = sim.post(row, experts)
+    waited = sim.wait(req, timeout_s=10.0)
+    assert waited.status == status, waited
+    if status != 1:
+        return
+    sim.ack(req, waited)
+    sim.deliver()
+    deadline = time.perf_counter() + 10.0
+    while any(info[2] for info in service.host.slot_info(row)):
+        assert time.perf_counter() < deadline, "the acknowledged leases were never retired"
+        time.sleep(0.002)
 
 
 def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
@@ -66,6 +99,7 @@ def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
     assert service.slot_map[row, 4].item() == cache.expert_to_slot[4].item()
 
 
+@SHARDS  # asserts the shard tables' part split
 def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_path):
     service, streamers, caches = tiers
     roots = [tmp_path.parent / f"{tmp_path.name}_mirror{i}" for i in range(2)]
@@ -95,7 +129,7 @@ def test_rows_the_thread_loads_reach_the_eager_map_on_next_host_use(tiers):
     service, streamers, caches = tiers
     service.ensure_started()
     row = service.row_of(0)
-    assert sim_wait(service.page, sim_post(service.page, row, need=[5], protect=[5]), 10) == 1
+    _demand(service, row, [5])
     caches[0].lookup(torch.tensor([5]))  # before_host_use refreshes the device-side copy
     assert caches[0].expert_to_slot[5].item() == service.host.mapping(row)[5] >= 0
 
@@ -110,7 +144,7 @@ def test_nested_host_use_pauses_and_refreshes_only_at_the_outermost_level(tiers,
     pause, resume = service.host.pause, service.host.resume
     monkeypatch.setattr(service.host, "pause", lambda timeout_s: (pauses.append("pause"), pause(timeout_s)))
     monkeypatch.setattr(service.host, "resume", lambda: (pauses.append("resume"), resume()))
-    assert sim_wait(service.page, sim_post(service.page, row, need=[1], protect=[1]), 10) == 1
+    _demand(service, row, [1])
     with cache.host_use():
         with cache.host_use():  # nested: another version change must not refresh here
             service.host.assign(row, 3)
@@ -128,7 +162,7 @@ def test_the_fail_stop_check_raises_once_fatal_is_set(tiers):
     service.fail_stop_check()  # nothing raised yet
     service.host.inject(fail_reads=True)
     row = service.row_of(0)
-    assert sim_wait(service.page, sim_post(service.page, row, need=[1], protect=[1]), 10) == 2
+    _demand(service, row, [1], status=2)
     with pytest.raises(RuntimeError, match="exl3 RAM miss"):
         service.fail_stop_check()
     # fatal stays raised: stop now, before the watchdog's fatal-held rule can abort pytest.
@@ -470,6 +504,7 @@ def tier_sim_load_forwards(path):
     return tier_sim.load_forwards(str(path))
 
 
+@SHARDS  # its subject is leases off, which row images refuse
 def test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_block(tiers, monkeypatch):
     service, streamers, caches = tiers
     enabled = []
@@ -493,6 +528,7 @@ def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl)
     assert service.device_side.lease_pdl is pdl
 
 
+@SHARDS  # its subject is leases off, which row images refuse first
 def test_lease_pdl_without_leases_is_refused(tiers):
     service, streamers, caches = tiers
     with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(False), envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(True):
@@ -524,6 +560,7 @@ def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_w
     [(False, False, 0), (True, False, 0), (True, True, 0)],
     ids=["no_lease", "no_two_phase", "no_pack_workers"],
 )
+@SHARDS  # the packing-worker rule; row images need no workers, and refuse leases off first
 def test_piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold(
     tiers, lease_mode, two_phase, pack_workers
 ):
@@ -1238,7 +1275,7 @@ def test_decode_rows_survive_a_prefills_admissions_under_the_prefill_share(tiers
     assert len(recorder.observers) == int(on)
     row = service.row_of(1)
     for expert in (0, 1, 2):  # decode fills the tier (capacity 3); 0 is the LRU row
-        assert sim_wait(service.page, sim_post(service.page, row, need=[expert], protect=[expert]), 10) == 1
+        _demand(service, row, [expert])
     for observer in recorder.observers:
         observer(7, _mode(prefill=True))
     for expert in (3, 4, 5):
