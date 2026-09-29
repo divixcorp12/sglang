@@ -105,8 +105,9 @@ MUTANTS = [
         "  void resume_locked() {\n",
         "  void resume_locked() {\n    { const uint64_t e = pause_epoch_.load(std::memory_order_relaxed);\n"
         "      if (e & 1u) pause_epoch_.store(e + 1u, std::memory_order_release); }\n",
-        [TSAN_STRESS, TSAN_FILLS, T + "test_expert_stream_ownership.py",
-         T + "test_exl3_ram_miss_prefill_fills.py"],
+        # Not test_exl3_ram_miss_prefill_fills.py: its test_fill_wait_returns_as_a_prefix_lands is the known timing
+        # flake (fails at the restored tree too), so the file's exit says nothing about the mutant.
+        [TSAN_STRESS, TSAN_FILLS, T + "test_expert_stream_ownership.py"],
     ),
     Mutant(
         "M6", "drain_copy_completions dropped from pump_demand's top", H + "ram_tier.h",
