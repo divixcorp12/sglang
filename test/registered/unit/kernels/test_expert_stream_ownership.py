@@ -79,11 +79,15 @@ def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
         # another: a dropped or reordered one changes the count below or the last writer.
         host.set_hot(0, [e for e in range(8) if i >> e & 1])
     host.set_hot(0, [0, 1, 2])
+    # Taken before sim_wait (Task 16's M3 passed the old check, taken after the 300 ms read): queued, the 65th set_hot
+    # waits for the service to drain the full ring, which it does only once the read ends, ~0.25 s from `start`.
+    # Applied directly, the whole burst takes milliseconds.
+    burst_s = time.perf_counter() - start
     assert sim_wait(page, seq, 5.0) == 1
     free, evictable, leased = host.victim_census(0, [])  # a snapshot: queued behind the burst, answered after it
     assert (free, evictable, leased) == (0, 1, 0)  # only expert 3 is neither hot nor wanted: the LAST set_hot won
     assert host.counters()["commands_applied"] - applied == 201 + 1, "a command was dropped (the +1 is the census)"
-    assert time.perf_counter() - start > 0.1, "the burst was applied while the read ran: nothing was queued"
+    assert burst_s > 0.1, f"the burst returned in {burst_s:.3f} s, while the read ran: nothing was queued"
 
 
 def _copy_request(s, page, host, sim):

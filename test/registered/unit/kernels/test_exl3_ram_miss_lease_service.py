@@ -448,12 +448,20 @@ def test_a_lease_acknowledged_mid_read_retires_before_that_read_returns(tmp_path
     Mutation: remove read()'s in-loop progress() call, leaving retire_leases() reachable only from the top of
     pump(). The acknowledgement (delivered once the second request's read has verifiably started, and while it
     is still packing, slowed by pack_delay_ns) would then not retire until the read returns and pump() loops
-    back to serve nothing -- this test's poll, bounded well inside the read's own span, would still see
-    leases_acked at 0 when the deadline is reached, so it fails there rather than on a wrong value.
+    back to serve nothing -- this test's poll, which ends at req2's return, would see demand_done name req2
+    while leases_acked is still 0, so it fails there rather than on a wrong value.
 
     The ack is delivered only after busy_seq names req2: pump_demand() itself starts with an unconditional
     retire_leases() call, unrelated to phase 1, so delivering the ack any earlier races that call -- it could
     retire the lease before req2's read even starts, which would pass under the mutant too and prove nothing.
+
+    B3 fix round (lease-ack-flake.md): progress runs once per drain-loop turn, and one turn packs every row whose
+    reads have landed (publish_landed), each behind pack_delay_ns. When all three rows landed in one reap, the only
+    progress after the ack was the one just before read() returned, microseconds ahead of demand_done: a fixed
+    100 ms poll missed it, and no poll could have told it from the mutant's retirement just after. So the last row is
+    withheld (hold_ordinal) until the others have packed: the turn that releases it runs progress first, one whole
+    pack delay before req2 returns. The poll is bounded by req2's return, not by a wall-clock window; its deadline
+    is only a hang guard, derived from the injected delay.
     """
     s = ram_miss_setup(tmp_path, capacity=4)
     page = new_page(pin=False)
@@ -467,11 +475,11 @@ def test_a_lease_acknowledged_mid_read_retires_before_that_read_returns(tmp_path
         assert waited1.status == 1 and waited1.go == 1
         assert host.counters()["leases_granted"] == 1, "req1's lease was not granted; nothing to retire mid-flight"
 
-        # Packing is inline on the owner thread (pack_workers defaults to 0) and one row at a time, so three
-        # missing rows at 50 ms each span ~150 ms -- comfortably longer than a drain-loop turn (progress runs every
-        # turn) and than the poll deadline below, so an ack delivered now can only be seen mid-read, not after req2
-        # ends.
-        host.inject_fault(pack_delay_ns=50_000_000)
+        # Packing is inline on the owner thread, one row at a time, so three missing rows at 50 ms each span
+        # ~150 ms. The last row (ordinal 2) is withheld until rows 0 and 1 have packed, so a later turn, whose
+        # progress call comes first, still has a whole pack delay to run after it: the ack is retired there.
+        pack_delay_ns, rows = 50_000_000, 3
+        host.inject_fault(pack_delay_ns=pack_delay_ns, hold_ordinal=rows - 1)
         req2 = sim.post(0, [2, 3, 4])
 
         started = time.perf_counter() + 2.0
@@ -481,17 +489,19 @@ def test_a_lease_acknowledged_mid_read_retires_before_that_read_returns(tmp_path
         sim.ack(req1, waited1)
         sim.deliver()
 
-        deadline = time.perf_counter() + 0.1
-        retired_mid_flight = False
-        while time.perf_counter() < deadline:
+        # Until the lease retires or req2 returns, whichever comes first. The ack count is read before
+        # demand_done, so a retirement seen with req2 still unanswered happened before req2 returned.
+        hang_guard = time.perf_counter() + 20 * rows * pack_delay_ns / 1e9 + 2.0
+        while True:
             if host.counters()["leases_acked"] == 1:
-                retired_mid_flight = True
+                returned = page_word(page, "demand_done") == req2.seq
                 break
+            if page_word(page, "demand_done") == req2.seq:
+                returned = True
+                break
+            assert time.perf_counter() < hang_guard, "req2 neither returned nor retired the lease"
             time.sleep(0.002)
-        assert retired_mid_flight, "the acknowledged lease was not retired while req2's read was still running"
-        assert page_word(page, "demand_done") != req2.seq, (
-            "req2 had already finished by the time the poll succeeded: it proved nothing about mid-read retirement"
-        )
+        assert not returned, "the acknowledged lease was not retired before req2's read returned"
 
         waited2 = sim.wait(req2, timeout_s=10.0)
         assert waited2.status == 1 and waited2.go == 3
