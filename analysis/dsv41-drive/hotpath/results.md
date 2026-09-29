@@ -1,0 +1,822 @@
+# Hotpath zero-overhead: suites, GPU tests and hot-path counts at the branch head
+
+Date: 2026-09-29. Branch head verified: `2a3aaee887` (`origin/cc/hotpath-zero-overhead`), checked out detached at
+`/data/models/slang/nvfp4-work/wt-hotpath` after `SYNC`. Base for every comparison: `ba01695c35`
+(`/data/models/slang/nvfp4-work/wt-hotpath-base`), the same commit `baseline.md` used.
+
+All arithmetic below is recomputed from actual `--collect-only -q` test-ID diffs between `ba01695c35` and `2a3aaee887`
+(F17), not from any task report's running total. The per-task reports are cited only to explain *why* a given file's
+ID set changed, not for their numbers.
+
+## 1. SUITE: kernels
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-hotpath && export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
+  CUDA_HOME=/usr/local/cuda-13.4 \
+  && /data/models/slang/.venv/bin/python -c "import sglang; print(sglang.__file__)" \
+  && flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 /data/models/slang/.venv/bin/python -m pytest \
+     test/registered/unit/kernels -q -p no:randomly --durations=0
+```
+
+`sglang.__file__` = `/data/models/slang/nvfp4-work/wt-hotpath/python/sglang/__init__.py` (correct worktree).
+
+**Result: `1119 passed, 21 skipped` in 334.01s (0:05:34), `EXIT=0`** (`${PIPESTATUS[0]}` read explicitly).
+
+Baseline (`baseline.md` §2): `1933 passed, 23 skipped`, `EXIT=0`. Delta: **-814 passed, -2 skipped** (net -816
+collected IDs: 1956 -> 1140).
+
+### 1a. Collected-ID diff (ground truth for the delta)
+
+```bash
+# base
+cd /data/models/slang/nvfp4-work/wt-hotpath-base && export PYTHONPATH=$PWD/python \
+  && /data/models/slang/.venv/bin/python -m pytest --collect-only -q test/registered/unit/kernels -p no:randomly \
+  | grep "::" | sort > base-ids.txt      # 1956 IDs
+# head
+cd /data/models/slang/nvfp4-work/wt-hotpath && export PYTHONPATH=$PWD/python \
+  && /data/models/slang/.venv/bin/python -m pytest --collect-only -q test/registered/unit/kernels -p no:randomly \
+  | grep "::" | sort > head-ids.txt      # 1140 IDs
+diff base-ids.txt head-ids.txt           # 944 removed ("<"), 128 added (">")
+```
+
+1956 - 944 + 128 = 1140 = 1119 passed + 21 skipped. Exact.
+
+**Removed (944), by file — all from Task 6 deleting the packed path** (`task-6-report.md`, "the packed path is
+deleted; RowReader is the only reader"; every removed ID is a packed-path/shard-table/bounce-buffer test whose
+subject no longer exists):
+
+| File | removed |
+|---|---:|
+| test_exl3_ram_miss_pack_workers.py | 550 (file deleted: packing-worker pool tests) |
+| test_exl3_ram_miss_row_images.py | 235 (213 shard-vs-image reuse clones + refusal/mode cases whose packed leg is gone) |
+| test_exl3_ram_miss_split.py | 53 (bounce-only split functions; the `direct` param collapsed) |
+| test_exl3_ram_miss_piece_stream.py | 36 (bounce-only piece-stream functions; workers/chunks params collapsed) |
+| test_expert_stream_reader_golden.py | 15 (12 shard shape/mode cases + 3 `direct_split_traced` cases) |
+| test_expert_stream_fixed_buffers.py | 12 (`[*-bounce]` cases; renamed to `[*-images]`, counted under added) |
+| test_exl3_ram_miss_prefill_fills.py | 10 (`tier[shards]` cases; `tier[row_images]` renamed to no-param, counted under added) |
+| test_exl3_ram_miss_tier.py | 9 (8 `pack_pool_affinity`/`pack_worker_cpus` extent cases + 1 rename, see below) |
+| test_expert_stream_uring_integration.py | 8 (`[fixed-shard-bounce-*]`; renamed to `[readv-fixed-shared-arena-*]`) |
+| test_exl3_ram_miss_task5_item5_ack_independence.py | 6 (`running[inline_pack/two_pack_workers]` collapsed) |
+| test_expert_stream_read_cuts.py | 4 (`[*-bounce]`; renamed to `[*-images]`) |
+| test_exl3_ram_miss_piece_stream_parts.py | 4 (4 shard shapes; no image equivalent — coverage given up, per Task 6 Concern 4) |
+| test_expert_stream_reader_split.py | 1 (`..._through_any_reader`; renamed `..._through_the_row_reader`) |
+| test_exl3_ram_miss_device_args.py | 1 (`test_the_exl3_host_file_is_only_bindings`; Task 8 parametrizes it `[exl3_ram_miss_host.cpp]`/`[exl3_ram_miss_host_instr.cpp]`) |
+
+**Added (128), by file:**
+
+| File | added | Source / reason |
+|---|---:|---|
+| test_expert_stream_build_variants.py | 28 | Task 8 (+6: `ProdBuild`/`InstrBuild` selection) and Task 10 (+21: test-only export refusal on prod, per-build counters, `test_a_faulted_read_refuses_on_prod`), plus `test_an_unknown_variant_is_refused`/`test_a_production_host_reports_only_the_core_counters` counted once each |
+| test_exl3_ram_miss_row_images.py | 22 | Task 6 (+18: image-mode reuse clones + 2 refusal tests it kept) and Task 7 (renamed `..._opens_images_only_with_the_flag_mirrors_o_direct_and_leases` -> `..._opens_images_only_with_mirrors_and_o_direct`, dropping the flag/lease legs) |
+| test_expert_stream_ring_reset.py | 15 | New file, from the `origin/master` merge (`merge-65754399-report.md`): NOP-drain ring reset, independent of the reader stack |
+| test_expert_stream_hotpath_shim.py | 10 | Task 8 build selection, Task 9 (`test_the_prod_service_thread_reads_no_clock_per_request`), Task 12 (copy-thread alloc/condvar `[prod]`/`[instr]`, spinning-copy-thread), Task 15 (`test_the_service_and_copy_threads_take_no_lock_and_never_wait_on_a_condvar[prod]`/`[instr]`) |
+| test_expert_stream_ownership.py | 9 | New file, Task 13 (Review Focus 1 and 4: unpaused-eager-call refusal, set_hot burst-past-ring), Task 14 (Review Focus 3: copy released at owner's poll, pause retires a completed copy), Task 15 (Review Focus 2/lock-audit: tier declares only caller's mutex, fill-holds-slots, failed-fill release, stop-mid-pause join), B3 fix round (`test_start_thread_refuses_a_tier_whose_fill_is_still_running`, `b3-fix-report.md`) |
+| test_expert_stream_fixed_buffers.py | 7 | Master merge's `test_a_refused_nop_drain_through_the_reader` (converted onto row images) + Task 6's `[*-bounce]`->`[*-images]` renames (6 IDs, matching the 12 removed above 1:1 minus the collapsed pieces param) |
+| test_exl3_ram_miss_split.py | 5 | Task 6: `direct` param collapsed from `[True]/[False]` to single-value IDs on the two short-read tests |
+| test_exl3_ram_miss_prefill_fills.py | 5 | Task 6: `tier[row_images]` renamed to no-param IDs (5, matching 5 of the 10 removed 1:1; the `[shards]` legs have no successor) |
+| test_exl3_ram_miss_piece_stream.py | 5 | Task 6: bounce-only functions' `workers`/`chunks` params collapsed (u2/u3/flag_off cases) |
+| test_expert_stream_uring_integration.py | 4 | Task 6: `[fixed-shard-bounce-*]` renamed to `[readv-fixed-shared-arena-*]` |
+| test_expert_stream_hotpath_golden.py | 3 | Task 9/10: `test_row_image_reads_prepare_the_golden_sqes_and_land_exact_bytes` (new) + `test_the_scripted_scenario_matches_the_golden[prod]`/`[instr]` (Task 10's ProdBuild/InstrBuild parametrization; no base-commit predecessor existed to remove, since the unparametrized test post-dates `ba01695c35`) |
+| test_exl3_ram_miss_task5_item5_ack_independence.py | 3 | Task 6: `running[inline_pack/two_pack_workers]` collapsed to 3 unparametrized IDs |
+| test_expert_stream_spsc_ring.py | 2 | Task 12: `test_the_ring_delivers_every_item_in_order_across_threads[plain]`/`[tsan]` (the SPSC ring, "the ring 2" in the brief) |
+| test_expert_stream_read_cuts.py | 2 | Task 6: `[*-bounce]` renamed to `[*-images]` |
+| test_exl3_ram_miss_device_args.py | 2 | Task 8: `test_the_exl3_host_file_is_only_bindings` parametrized `[exl3_ram_miss_host.cpp]`/`[exl3_ram_miss_host_instr.cpp]`, replacing the single removed ID |
+| test_expert_stream_reader_split.py | 1 | Task 6: `..._through_the_row_reader` (renamed from `..._through_any_reader`) |
+| test_expert_stream_prod_build_symbols.py | 1 | Task 10: `test_prod_has_no_trace_or_fault_symbols_and_instr_has_them` (the `nm` symbols test) |
+| test_expert_stream_hotpath_stress.py | 1 | `test_every_party_against_the_service_keeps_the_tier_invariants` (stress test registration; predates its Task-16 TSan/fills extension, which added no new ID) |
+| test_expert_stream_fixed_vec.py | 1 | Task 11: `test_fixed_vec_pushes_assigns_clears_and_throws_on_overflow` (`FixedVec`, "FixedVec 1" in the brief) |
+| test_exl3_ram_miss_tier.py | 1 | B3 fix round: `test_an_owned_call_waits_for_a_pump_on_another_thread` (renamed from the removed `test_release_refuses_a_slot_that_is_still_loading`) |
+| test_exl3_ram_miss_stage_trace_causal.py | 1 | Task 9: `test_no_ungated_clock_read_remains_on_the_request_path` |
+
+**Every one of the 944 removed and 128 added IDs is accounted for.** No unexplained count.
+
+The brief's category list is fully covered: golden 3 (2 param variants + 1 new function; matches "golden 2 (4 with
+Task 10's parametrization)" — the base predates the pre-parametrized single test, so there is no removal to pair
+with the +2), shim (10), stress (1, pre-existing registration), build variants (28, covering both Task 8's build
+selection and Task 10's test-only refusals), the symbols test (1), FixedVec (1), the ring (2, `spsc_ring.py`),
+ownership (9), and the Task 5-7 refusals (the `row_images.py` refusal tests kept through Task 6's -235/+22, and
+Task 7's rename dropping the flag/lease legs).
+
+## 2. SUITE: layers/moe (with `--continue-on-collection-errors`, per the baseline's F17-equivalent ruling)
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-hotpath && export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
+  CUDA_HOME=/usr/local/cuda-13.4 \
+  && flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 /data/models/slang/.venv/bin/python -m pytest \
+     test/registered/unit/layers/moe -q -p no:randomly --continue-on-collection-errors
+```
+
+**Result: `2 failed, 1087 passed, 23 warnings, 12 errors, 12405 subtests passed` in 88.39s (0:01:28), `EXIT=1`**
+(`${PIPESTATUS[0]}` read explicitly).
+
+Baseline (`baseline.md` §1b): `2 failed, 1094 passed, 12 errors, 12405 subtests passed`, `EXIT=1`.
+
+- **The 11 pyarrow collection errors are byte-identical to the base's set**: `test_deepep_v2_buffer_lifecycle.py`,
+  `test_deepep_v2_masked_slab.py`, `test_deepep_v2_wire_dtype.py`, `test_flashinfer_a2a_wide_ep.py`,
+  `test_fused_moe_native.py`, `test_fused_shared_expert_scaling.py`, `test_mega_moe_deepgemm_api.py`,
+  `test_topk_correction_bias_cache.py`, `test_w4afp8_deepep_dtype.py`, `test_w4afp8_deepep_post_reorder.py`,
+  `test_w4afp8_requant_geometry.py`. Pre-existing, environmental (pyarrow 25.0.1), unrelated to this branch.
+- **The 12th error is the same teardown-time error**, at the same test:
+  `test_exl3_ram_miss_service.py::test_graph_routes_are_logged_only_when_the_stage_trace_is_on[trace_on]`
+  (`service.shutdown()` -> `_quarantine`, `AttributeError("'types.SimpleNamespace' object has no attribute
+  'state'")`). Pre-existing at base, recorded there as undiagnosed, unchanged here.
+- **The 2 failures are the same 2 as base**: `test_expert_plugins_cuda.py::TestPinnedTierCuda::
+  test_a_split_chunk_copies_its_row_index_to_the_device_once` and `test_expert_row_source.py::TestGatherReadStats::
+  test_a_gather_without_host_reads_keeps_its_stats_object`. Pre-existing, undiagnosed at base, unchanged.
+- **Passed delta: 1087 - 1094 = -7**, matching the collect-only ID diff exactly (15 removed, 8 added, net -7; see
+  §2a). No new failure, no new error, and the collection-error file set is identical to base.
+
+### 2a. Collected-ID diff, layers/moe
+
+```bash
+python -m pytest --collect-only -q test/registered/unit/layers/moe -p no:randomly --continue-on-collection-errors \
+  | grep "::" | sort
+```
+
+Base: 1096 IDs. Head: 1089 IDs. Diff: 15 removed, 8 added (net -7), all in `test_exl3_ram_miss_service.py`,
+`test_exl3_ram_miss_tables.py` and `test_exl3_prefill_fills_service.py::test_the_flag_is_refused_without_row_images`
+(1 removed, no successor — the flag no longer exists to refuse, per Task 7). The remaining 14 removed / 8 added are
+Task 7's mandatory-row-images-and-leases rewrite (`task-7-report.md` §"Per-test list"): the packed-workers/shards
+config-refusal tests (`piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold[no_lease/no_pack_workers/
+no_two_phase]`, `lease_pdl_without_leases_is_refused`, `lease_switch_defaults_off...`) have no successor (leases and
+row images are now mandatory, not configurable), and `test_exl3_ram_miss_tables.py` is rewritten from 11 shard-based
+IDs to 8 image-based ones. This exactly matches Task 7's per-test table.
+
+## 3. GPU manual test list (minus `test_exl3_piece_stream_cuda.py`, per Task 1 Step 3)
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-hotpath && export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
+  CUDA_HOME=/usr/local/cuda-13.4 \
+  && flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 \
+  /data/models/slang/.venv/bin/python -m pytest -q -rf -p no:randomly \
+    test/manual/dsv41/test_exl3_ram_miss_cuda.py test/manual/dsv41/test_exl3_lease_kernels_cuda.py \
+    test/manual/dsv41/test_exl3_copy_engine_cuda.py test/manual/dsv41/test_exl3_piece_stream_row_images_cuda.py \
+    test/manual/dsv41/test_exl3_two_phase_parity_cuda.py test/manual/dsv41/test_exl3_two_phase_failure_cuda.py \
+    test/manual/dsv41/test_exl3_two_phase_timing_cuda.py test/manual/dsv41/test_exl3_native_prefetch_cuda.py \
+    test/manual/dsv41/test_exl3_task5_item4_gpu.py test/manual/dsv41/test_exl3_task5_item6_shutdown_gpu.py \
+    test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py
+```
+
+**Result: `15 failed, 119 passed, 3 skipped` in 167.41s (0:02:47), `EXIT=1`.**
+
+Baseline (`baseline.md` §3): `24 failed, 119 passed, 3 skipped`, `EXIT=1`. Same 119 passed, same 3 skipped.
+
+**All 15 head failures map onto the base's 24 pre-existing failures; there are 0 new failures.** The 9-failure
+reduction is exactly Task 7's deletion of the `leases_off`/lease-A-B parametrizations (`task-7-report.md`, "Manual
+GPU" table):
+
+- `test_exl3_task5_item4_gpu.py::..._fatal_demand_error_...[leases_off-timeout]`, `[leases_off-read_fault]` — the
+  `leases_off` param no longer exists; `[leases_on-timeout]`/`[leases_on-read_fault]` survive as the unparametrized
+  `[timeout]`/`[read_fault]`, both still red (matches head's `test_a_fatal_demand_error_...[timeout]`/`[read_fault]`).
+- `test_exl3_ram_miss_graph_gpu.py::test_ram_misses_inside_a_replay_are_served[leases_off]` and
+  `test_a_forced_timeout_fails_stop_without_hanging[leases_off]` — same param removal; the `[leases_on]` legs survive
+  unparametrized, both still red.
+- `test_exl3_ram_miss_graph_gpu.py::test_many_layers_in_one_replay_are_served[leases_off-layers_4]`,
+  `[leases_off-layers_20]` — same; `[leases_on-layers_4]`/`[leases_on-layers_20]` survive as `[layers_4]`/`[layers_20]`,
+  both still red.
+- `test_exl3_ram_miss_graph_gpu.py::test_lease_mode_output_is_byte_exact_against_off` and
+  `test_lease_mode_multi_layer_graph_is_byte_exact_against_off[layers_4]`, `[layers_20]` — the leases-off-vs-on A/B is
+  deleted outright (Task 7; leases are unconditional, so there is no "off" arm to compare against).
+
+`24 - 9 = 15`, and every surviving ID appears in both lists. Every remaining failure (item4 timeout/read_fault, item6
+default_stream/side_stream/waiting-reader, graph_gpu's 6 `direct_insert_replay...` params, `ram_misses_inside_a_
+replay_are_served`, `a_forced_timeout_fails_stop_without_hanging`, `many_layers...[layers_4]`/`[layers_20]`) was
+already diagnosed as pre-existing and not a lease-invariant product bug in `gpu4-diagnosis.md` (classes (a)/(b)/(d):
+test races and harness preconditions exposed by O_DIRECT/row-image timing, not product regressions). No skip count
+changed (3, both trees: GPU-unavailable-class skips, unrelated to this branch).
+
+## 4. NVMe and fixed-buffer manual tests (reader; `rowimg-disk.lock` then `cc-gpu.lock`)
+
+```bash
+export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
+  && flock /data/models/slang/nvfp4-work/rowimg-disk.lock flock /data/models/slang/nvfp4-work/cc-gpu.lock \
+     taskset -c 32-63 /data/models/slang/.venv/bin/python -m pytest -q -rs -p no:randomly \
+    test/manual/dsv41/test_expert_stream_read_cuts_nvme.py test/manual/dsv41/test_expert_stream_fixed_buffers_big.py
+```
+
+| Tree | Result | EXIT |
+|---|---|---|
+| `wt-hotpath-base` (`ba01695c35`) | `3 passed, 2 skipped` in 6.30s | 0 |
+| `wt-hotpath` (`2a3aaee887`) | `4 passed, 2 skipped` in 7.33s | 0 |
+
+Both skips are identical and pre-existing: `IOPOLL_CUTS_DIR` is unset (`test_expert_stream_read_cuts_nvme.py:94,104`),
+so the two IOPOLL cut cases skip on both trees. The +1 passed is a new test ID,
+`test_expert_stream_fixed_buffers_big.py::test_a_ring_reset_keeps_the_big_slab_registered`, which exists only at
+head; it comes from the `origin/master` merge's ring-reset NOP-drain work (`merge-65754399-report.md`), same as
+§1's `test_expert_stream_ring_reset.py`. No regression, no unexplained delta.
+
+## 5. Hot-path shim and stress (`taskset -c 0-63`)
+
+### 5a. Shim
+
+```bash
+cd /data/models/slang/nvfp4-work/wt-hotpath && export PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
+  CUDA_HOME=/usr/local/cuda-13.4 \
+  && taskset -c 0-63 /data/models/slang/.venv/bin/python -c "import sglang; print(sglang.__file__)" \
+  && taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
+     test/registered/unit/kernels/test_expert_stream_hotpath_shim.py -q -rs -s -p no:randomly
+```
+
+`sglang.__file__` = `/data/models/slang/nvfp4-work/wt-hotpath/python/sglang/__init__.py`. **`10 passed`**, EXIT=0,
+87.51s. Scenario: 200 measured requests, `requests=200`, `posts=208`, `copies_done=200`, `deferrals=8`,
+`copy_jobs=200` in every sub-scenario (unchanged across prod/instr/spinning/no-lock variants — the copy-job and
+deferral load is identical regardless of build or lock instrumentation).
+
+### Table: master (baseline.md §6, run 1) vs branch head, prod build, per request
+
+| thread | kind | master (`e3a66073b4`) raw | master / req | branch head (`2a3aaee887`) prod raw | branch / req |
+|---|---|---:|---:|---:|---:|
+| service | malloc | 2,800 | 14.00 | 0 | **0.00** |
+| service | free | 2,800 | 14.00 | 0 | **0.00** |
+| service | mutex | 351,658 | 1758.29 | 0 | **0.00** |
+| service | cond | 0 | 0.00 | 0 | 0.00 |
+| service | clock | 991,680 | 4958.40 | 0 | **0.00** |
+| service | sleep | 0 | 0.00 | 0 | 0.00 |
+| service | futex | n/a (shim had no futex kind at master) | n/a | 3-4 | 0.015-0.02 |
+| copy | malloc | 530 | 2.65 | 0 | **0.00** |
+| copy | free | 530 | 2.65 | 0 | **0.00** |
+| copy | mutex | 530 | 2.65 | 0 | **0.00** |
+| copy | cond | 265 | 1.32 | 0 | **0.00** |
+| copy | clock | 795 | 3.98 | 0 | **0.00** |
+| copy | sleep | 0 | 0.00 | 0 | 0.00 |
+| copy | futex | n/a | n/a | 11-12 | 0.055-0.06 |
+
+Every branch-head prod value the plan's four rules require to be zero is zero: service malloc/free/mutex/cond/clock/
+sleep, and copy malloc/free/mutex/cond. This is the plan's target state reached — master's service thread did 14
+mallocs/frees and ~1758 mutex ops per request; the branch's does none. The only nonzero counters on either thread are
+`futex` (3-4 on service, 11-12 on copy), which the controller ruling requires reported with a note, not asserted
+zero: they are the copy engine's documented sleep/wake protocol (`H/spsc_ring.h`'s `futex_wait`/`futex_wake`, Task
+12) — the service's `submit()` wakes a sleeping copy thread only when the ring was empty and the thread parked; they
+do not scale with `copy_jobs` (200) because the 50 ms Python-driver spin between posts keeps the copy thread mostly
+out of its idle sleep, matching baseline's own reading for master's mutex/clock ("dominated by the idle spin, not the
+request").
+
+The instr build (not required to be zero) shows the expected InstrBuild-only cost: `service clock == 200` (1/request,
+Task 15's assertion) and `copy clock == 600` (3/copy_job, Task 15's assertion), with malloc/free/mutex/cond still 0 on
+both threads.
+
+Copy jobs and deferrals (from the child, every scenario): `copies_done=200`, `deferrals=8`, `copy_jobs=200`.
+
+### 5b. Stress (10 runs)
+
+```bash
+for i in $(seq 1 10); do taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
+  test/registered/unit/kernels/test_expert_stream_hotpath_stress.py -q -p no:randomly; echo "EXIT=${PIPESTATUS[0]}"; done
+```
+
+**10/10 `1 passed`, `EXIT=0` every run** (~11.4s each).
+
+## 6. Known flakes (rates, not regressions)
+
+- **`test_fill_wait_returns_as_a_prefix_lands`** (`test_exl3_ram_miss_prefill_fills.py`): pre-existing timing flake
+  under load, tracked as a follow-up since Task 6/10. Not rerun for a rate here; it did not fail in this batch's
+  kernels-suite run (§1) or the 10-run stress loop (§5b). **Superseded by §8f:** the flake is not present at master
+  (10/10 idle and under load at `ba01695c35`); it was this branch's, and it is fixed at `8c7b5b9496`.
+- **`test_the_seqlock_reader_never_accepts_a_torn_record`** (`test_exl3_ram_miss_tier.py`): pre-existing
+  throughput-floor flake (`seqlock-reader-report.md`). Recorded rate: **190/200 head (`f2ea4d3493`) vs 191/200 base
+  (`ba01695c35`)**, every failure a throughput-floor miss (`accepted <= 100`) with `torn == 0` in all cases (no
+  correctness failure in 400 combined runs). Statistically indistinguishable from base; load-sensitive, not a
+  regression.
+
+## 7. Commit
+
+Commit `analysis(hotpath): suites, GPU tests and hot-path counts at the branch head`, both trailers, pushed with
+`git push origin cc/hotpath-zero-overhead`.
+
+## 8. Decode arms A (master) / B (branch) / A2 (master), and C (branch under the counting shim)
+
+Date: 2026-09-29, 08:14-08:31 local. Driver `analysis/dsv41-drive/hotpath/drive_hotpath_arms.sh` at `0c50b9241c`, report
+`hotpath_report.py`. Out dir `divix01:/mnt/nvme1/dsv41-hotpath/20260929-081400/` (`arms-report.json`,
+driver log `/mnt/nvme1/dsv41-hotpath/driver-20260929-081400.log`).
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath && nohup bash analysis/dsv41-drive/hotpath/drive_hotpath_arms.sh \
+  /data/models/slang/nvfp4-work/wt-hotpath-master 65754399e394cc6f9a3529ba02b33e3af40f9555 \
+  /data/models/slang/nvfp4-work/wt-hotpath $(git rev-parse HEAD) /mnt/nvme1/dsv41-hotpath/$TS 30031 \
+  > /mnt/nvme1/dsv41-hotpath/driver-$TS.log 2>&1 &'      # TS=20260929-081400, HEAD=0c50b9241c
+```
+
+- **Trees.** A and A2: master `65754399e3` (the master this branch merged; python tree `83e046cc87`, registered
+  `hotpath-base`) in the private worktree `wt-hotpath-master`. B and C: the branch at `0c50b9241c` (python tree
+  `ee964852b2`, registered `hotpath-zero-overhead`) in `wt-hotpath`. Every arm ran the branch's `run_arm.sh`,
+  `arm_env` and `generations.json`. `check_worktree` passed for both (at the commit, clean, `sglang.__file__` under
+  each tree's own `python/`).
+- **EXL3 gate.** Before every arm the driver resolved the launch's expert-stream requirements with that arm's own
+  `python/` tree: `EXL3` for all four (not the silent NVFP4 fallback).
+- **Tier: full, `0:61440,1:40960` / `102400`.** Before A: node 0 MemFree 77986 + page cache 9550 = 87536 MiB against
+  80896 needed; node 1 52305 + 32380 = 84685 MiB against 55056. Re-checked before B, A2 and C at the same values; all
+  passed. The full tier equals `base_env`'s, so it is no diff below.
+- **Effective env against the branch's `base_env`** (`<arm>-env-diff.json`):
+  - A, A2: `SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES=1`, `SGLANG_DSV41_ENABLE_RAM_MISS_LEASES=1`,
+    `SGLANG_DSV41_RAM_MISS_PACK_WORKERS=8` (master's recipe; the branch's `arm_env` no longer sets them);
+  - B: none;
+  - C: `LD_PRELOAD=<out>/hotpath_shim.so` (built from the branch's `hotpath_shim.c`),
+    `HOTPATH_SHIM_OUT=<out>/C-shim.json`.
+  `run_arm.sh` verified each set against the live server's `/proc/<pid>/environ` (51 vars for A).
+- **Build check** (the "exl3 RAM miss thread started" line once "fired up"): A and A2 end in `copy engine on` with no
+  build field; B and C end in `copy engine on, build prod`.
+- `perf_event_paranoid` = 2. No lock waits: every arm started at its first attempt.
+
+### 8a. Decode
+
+| Arm | pooled ms/token | session CDW / ETR | median TTFT s | Δ vs mean(A, A2) | identical to A | served | rows_read | read_errors |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| A | 100.52 | 123.95 / 98.84 | 7.96 | +0.21 | (reference) | 2907 | 4082 | 0 |
+| B | **99.99** | 123.64 / 98.30 | 7.97 | **-0.32** | **yes (2/2 turns)** | 2953 | 4169 | 0 |
+| A2 | 100.10 | 123.73 / 98.41 | 7.96 | -0.21 | yes | 2922 | 4124 | 0 |
+| C (untimed) | 100.47 | 123.89 / 98.80 | 8.01 | (excluded) | yes | 2995 | 4234 | 0 |
+
+90 decode tokens per arm (the harness's 2-session timed set). SM clock over every timed window: 2940-2970 MHz, median
+2951-2962. `served`/`rows_read` are the server's lifetime counters (warm-up, prefill and the timed set).
+
+- baseline mean(A, A2) = 100.31 ms/token; drift A2 - A = -0.42; allowance max(1.5, 0.42) = 1.5; limit 101.81.
+- **B = 99.99 <= 101.81: B is not slower.** Byte identity holds for B, A2 and C against A. `read_errors` = 0 everywhere.
+
+### 8b. The service thread's CPU and counters
+
+CPU seconds from `thread_sampler.report` over the timed window (~26.6 s). perf stat on the `exl3-ram-miss` thread from
+"fired up" to the arm's end, divided by the lifetime `served` (so slightly over-estimated, identically per arm).
+
+| Arm | ram-miss CPU s (timed) | cycles:u / req | instructions:u / req | voluntary switches / req | involuntary / req | migrations / req |
+|---|---:|---:|---:|---:|---:|---:|
+| A | 7.99 | 34.3 M | 41.5 M | 200.0 | 0.034 | 0.312 |
+| B | 7.70 | 33.7 M | **33.5 M** | 198.3 | 0.021 | 0.353 |
+| A2 | 7.89 | 33.5 M | 40.0 M | 199.3 | 0.020 | 0.352 |
+| C | 6.63 | 33.6 M | 33.3 M | 195.2 | 0.021 | 0.386 |
+
+- **perf's `context-switches` and `cpu-migrations` read 0 in every arm, and that 0 means nothing.** Under
+  `perf_event_paranoid` 2 perf adds `:u` to software events, which then never count (checked on divix01 before the
+  run: a thread that slept ~27k times in 3 s read 0 and 0). The switch and migration columns above come from
+  `/proc/<pid>/task/<tid>/status` and `sched`, sampled every ~5 s by the driver (`<arm>-sched.jsonl`).
+- The thread's cycles are its idle loop, not its requests: it spins `spin_us`, then sleeps 50 µs (spec L12), so
+  cycles/request is the same in all arms and ~200 voluntary switches/request are idle sleeps. Instructions differ:
+  B retires **~16-19% fewer instructions per served request** than A/A2 (33.5 M against 41.5 M / 40.0 M: 19.3% vs A,
+  16.3% vs A2, 17.8% vs mean(A, A2)) over the same cycles.
+
+### 8c. C: whole-run shim counts of the production server
+
+The shim is armed at load, so it counts each tracked thread from the moment it names itself until process exit,
+including thread start-up and teardown. One dump (the scheduler, pid 1067138); both threads recognized once.
+
+| thread | malloc | free | mutex | cond | clock | sleep | futex |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| service (`exl3-ram-miss`) | **1** | **1** | 0 | 0 | 0 | 854,870 | 8 |
+| copy (`exl3-copy-eng`) | **72** | **72** | **90,035,468** | **1** | 0 | 0 | 9,395 |
+
+**The zero rule is not met as a whole-run count: this is an open finding, not a pass.**
+
+To separate thread lifecycle from serving, the same shim mode was run on the branch's production host with no requests
+at all (CPU `HostCopyBackend`, `hotpath_script.build_host(variant="prod")`, `start_thread`, idle 0.5 s or 3 s, then
+`stop`, under `taskset -c 0-63`). Both runs gave service `{malloc 0, free 1}` and copy `{malloc 0, free 1, mutex 1,
+cond 1}`. That lifecycle floor is:
+- the `std::thread` state that libstdc++ deletes on the new thread after `run()` returns (one free on each thread);
+- `CopyEngine::start`'s handshake on the copy thread (`start_mutex_`, `ready_cv_`: one mutex and one condvar).
+
+Against that floor:
+- **Service:** `free 1` and `mutex 0`/`cond 0` are the floor. **`malloc 1` is one allocation beyond it,
+  unattributed.** It is one call over the whole run, not per request (2995 served), but the shim cannot say where.
+- **Copy:** `cond 1` and one mutex are the floor. **The rest (90.0 M mutex, 72 malloc/free, 9,395 futex) come from the
+  CUDA copy backend.** The CPU backend's per-request copy counts are 0 (§5a, Task 15), and the only difference here is
+  `CudaCopyBackend`, which calls `cuMemcpyAsync`, `cuEventRecord` and `cuEventQuery` through libcuda. ~90 M mutex ops
+  over the server's life is what a copy thread polling `cuEventQuery` in its spin loop would produce if libcuda takes a
+  pthread mutex per query. That is an inference: the shim records no call sites.
+- `sleep` 854,870 on the service is the idle 50 µs sleep plus the parked 20 µs sleep during pauses: both are
+  `sleep_for`, and the shim cannot tell them apart. Copy `sleep` 0: its idle wait is a futex. Service `futex` 8 are
+  `submit()`'s wakes of a sleeping copy thread; the copy thread's 9,395 futex calls include its idle waits and any
+  that libcuda makes through `syscall()`.
+
+### 8d. Verdict and limits
+
+- **Timed arms pass:** byte-identical output (B, A2 and C against A), `read_errors` 0, and B 0.32 ms/token faster than
+  mean(A, A2), inside a 1.5 ms allowance with 0.42 ms drift.
+- **C does not meet the whole-run zero rule** for malloc/free/mutex/cond. `arms-report.json`'s `pass` is `false` for
+  that reason alone. What is still open:
+  - the service thread's single unattributed malloc;
+  - the copy thread's libcuda-side mutex, malloc and futex traffic, which production's CUDA copy backend incurs and the
+    CPU shim tests cannot see.
+  Attributing both needs a shim that records call sites (e.g. a backtrace of the first N calls per kind) or a window
+  armed after start-up, in one more server run.
+- **Limits:** one pass of 90 decode tokens per arm, so the ms/token comparison resolves about the 1.5 ms allowance and
+  no finer. perf and `served` cover different spans. The instruction saving is the only per-request CPU difference
+  large enough to read.
+
+### 8e. Final-fix round: C's counts attributed to call sites, branch against master
+
+Date: 2026-09-29, 08:44-09:08. The shim gained call-site capture (`HOTPATH_SHIM_STACKS`, `8d401bc7fb`). For each
+(thread, kind) it records `backtrace()` for the first 256 calls and for every 65,536th call after that. The records
+are symbolized through the dump's own `/proc/self/maps` (`hotpath_shim.Symbolizer`), using `nm -D` for libcuda,
+which is stripped. `final-fix/attribute_stacks.py` groups them by their first 6 frames below the shim.
+
+- **Estimated calls.** For a count above 256, `est.` = the site's share of the sampled records × the whole-run count.
+  At or below 256, every call was recorded, so the numbers are exact.
+- **Arms.** `drive_hotpath_arms.sh` has two new arms:
+  - **CS:** the branch plus the shim, the production recipe;
+  - **CM:** master `65754399e3` plus the shim, with the A-arm overrides `ROW_IMAGES=1`, `LEASES=1`, `PACK_WORKERS=8`.
+- **Identity.** Each arm is compared byte for byte against Task 18's A output (`REF_RUN`).
+- **generations.json.** Registered in `aa18ec32fd` and `1d522c5207`, and reverted in `af874a17d6`.
+
+```bash
+# pass 1: CS at aa18ec32fd (python tree c0f133ad0d: items 1-4 and the shim), CM at master
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath && ARMS="CS CM" \
+  REF_RUN=/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-baseline/servers/A/run-20260929-081421 \
+  nohup bash analysis/dsv41-drive/hotpath/drive_hotpath_arms.sh /data/models/slang/nvfp4-work/wt-hotpath-master \
+  65754399e394cc6f9a3529ba02b33e3af40f9555 /data/models/slang/nvfp4-work/wt-hotpath $(git rev-parse HEAD) \
+  /mnt/nvme1/dsv41-hotpath/20260929-084407 30031 > /mnt/nvme1/dsv41-hotpath/driver-20260929-084407.log 2>&1 &'
+# pass 2: B (timed) and CS at 1d522c5207 (tree 29d9d99220: + the service malloc fix and the copy-query cadence)
+#   same, with ARMS="B CS" and out dir /mnt/nvme1/dsv41-hotpath/20260929-085852
+# attribution (pass 1 wrote its dumps to <arm>-stacks.txt.<pid>; since 7bebddbead the driver writes <arm>-callsites.txt)
+taskset -c 0-63 env PYTHONPATH=$PWD/python /data/models/slang/.venv/bin/python \
+  analysis/dsv41-drive/hotpath/final-fix/attribute_stacks.py <dump> <arm>-shim.json <arm>-attribution.json 65536 6
+```
+
+**Whole-run counts.** CS1 is branch pass 1, CS2 is branch pass 2 (after the fixes below), CM is master.
+
+| thread | kind | CS1 | CS2 | CM (master) |
+|---|---|---:|---:|---:|
+| service | malloc / free | 1 / 1 | **0** / 1 | 159,085 / 159,083 |
+| service | mutex / cond / clock | 0 / 0 / 0 | 0 / 0 / 0 | 114,655,774 / 10,911 / 166,563,916 |
+| service | sleep / futex | 858,054 / 4 | 856,610 / 5 | 852,154 / 0 |
+| copy | malloc / free | 72 / 72 | 72 / 72 | 136,131,275 / 136,131,275 |
+| copy | mutex / cond / clock | 85,601,824 / 1 / 0 | **36,594,783** / 1 / 0 | 110,094,979 / 69,277 / 17,638,682 |
+| copy | futex | 8,981 | 9,006 | 0 |
+
+Every arm had `read_errors` 0 and output byte-identical to Task 18's A (2/2 turns). Requests served: CS1 2889,
+CS2 2949, CM 2944. Master's `copy_jobs` was 10,911, with a mean copy latency of 2.17 ms. Production does not count
+copy jobs (it is a metric), so the per-job figures below use master's count as a proxy for the branch's.
+
+**Attribution** (`HOST` is the host module, `libcuda` is `libcuda.so.615.71.09`):
+
+| thread / kind | call site (innermost first) | branch (CS1 -> CS2) | master (CM) | class |
+|---|---|---:|---:|---|
+| copy / mutex | `libcuda!cuEventQuery` <- `HOST!CudaCopyBackend::query` <- `CopyEngine::run` | ~85.6 M (256/256 sampled) -> ~36.0 M (252/256) | ~40.0 M (93/256) | per poll turn while a job is in flight |
+| copy / mutex | `CopyEngine::run` own `mutex_` (queue swap, every turn) | 0 | ~70.1 M (163/256) | per turn (master only) |
+| copy / mutex | `libcuda!cuMemcpyAsync` internals (9 sites) and `cuEventRecord` (4 sites) | ~1.3 M in CS2 (~143 k per sampled site) | (in the unsampled rest) | per copy (driver) |
+| copy / mutex | `cuInit`, `cuDevicePrimaryCtxRetain`, `cuStreamCreateWithPriority`, `cuEventCreate` ×32, `start_mutex_` | ~46 | same init | start-up |
+| copy / malloc | `CudaCopyBackend::init`: `cuEventCreate` (32 events × 2) + `cuCtxSetCurrent` 4 + `cuStreamCreateWithPriority` 4 | 72 (exact) | same init | start-up |
+| copy / malloc | `std::deque` map in `CopyEngine::run` (`fresh` per turn) | 0 | ~136.1 M | per turn (master only) |
+| copy / free | `cuEventDestroy` 64, `cuStreamDestroy` 3, libcuda TLS destructors 4, `std::thread` state 1 | 72 (exact) | -- | shutdown |
+| copy / futex, cond | `CopyEngine::run` -> `sleep_until_submit` futex_wait; start handshake `notify_all` | 8,981-9,006; cond 1 | cond 69,277 (condvar idle wait) | idle path; start-up |
+| service / malloc | `ld.so!__tls_get_addr` <- `__cxa_get_globals` <- `std::uncaught_exceptions()` <- `ReaderCore::read` | 1 (first read) -> **0** | -- | first request, **fixed** |
+| service / malloc | `vector::_M_realloc_append` in `pump_demand`; `operator new` in `serve` | 0 | ~159 k (~54/request) | per request (master only) |
+| service / mutex, clock | `retire_leases` lock; `RamThread::run` clock per turn | 0 | ~114.7 M; ~166.6 M | per turn (master only) |
+| service / futex | `CopyEngine::submit` futex_wake (copy thread asleep) | 4-5 | 0 | per wake |
+| service / free | `std::thread` state, deleted on the thread after `run()` returns | 1 | -- | shutdown |
+
+**What changed as a result:**
+
+- **Service malloc: 1 -> 0 (`7bebddbead`).**
+  - `ReaderCore::read`'s quiesce guard no longer calls `std::uncaught_exceptions()`. Its first call on a thread made
+    `__tls_get_addr` allocate libstdc++'s dynamic-TLS exception globals.
+  - The guard now drains on every exit except the two returns, which set a flag first. That covers the same cases.
+  - Test: `test_the_service_thread_allocates_nothing_from_its_first_request`, with no warm-up. Mutant M2, which
+    reintroduces the call, fails it (`malloc 1`). The restored tree passes.
+- **Copy mutex: 85.6 M -> 36.6 M (`197cbc091e`).**
+  - The copy loop called `cuEventQuery` on every `_mm_pause` turn while a job was in flight: about 7,850 queries per
+    job (85.6 M / 10.9 k), where master made about 3,670.
+  - It now queries the head mark once every 8 turns, and re-queries on the next turn after a completion. The turns in
+    between are one `_mm_pause` each, so a completion is seen at most 7 pauses later, against a 2.17 ms mean copy.
+  - The count fell 2.3x, not 8x, because a turn without a query is cheaper, so the loop runs more turns. That is about
+    3,300 queries per job, below master's.
+  - Our loop's CUDA calls per copy job: lanes (~2.1) × table entries (at most 6) `cuMemcpyAsync`, plus 1
+    `cuEventRecord`, plus about 3.3 k `cuEventQuery`.
+- **Pass 2 decode.** B (branch at `1d522c5207`): **99.93 ms/token pooled**, median TTFT 7.95 s, byte-identical to
+  Task 18's A, `read_errors` 0.
+  - Task 18's baseline was mean(A, A2) = 100.31, with limit 101.81. Pass 2 ran about 45 minutes after that baseline,
+    so drift was not re-measured.
+  - B served 2921 requests, with perf `instructions:u` 99.29 G and `cycles:u` 99.49 G, about 34.0 M each per served
+    request.
+
+**What remains nonzero on the copy thread, and why it stays:**
+
+- Every remaining copy-thread mutex is libcuda's: `cuEventQuery`, `cuMemcpyAsync` and `cuEventRecord` each take one
+  internally. Any CUDA driver call does, so the count cannot reach 0 while completion is established through
+  `cuEventQuery`.
+- Getting to 0 would take a completion word, `cuStreamWriteValue32` into pinned host memory, polled with plain loads.
+  That is a design change: a follow-up, not part of this round.
+- Its 72 mallocs and frees are backend start-up and shutdown only: none happens per request.
+- The service thread's whole-run counts are now malloc 0, mutex 0, cond 0 and clock 0. The one free is the
+  `std::thread` state at exit.
+
+### 8f. Final-fix round: the prefill prefix test, and the suites at the final head
+
+**The test.** `test_exl3_ram_miss_prefill_fills.py::test_fill_wait_returns_as_a_prefix_lands`, 10 sequential runs at
+each commit. Every run's pytest status was read directly (`final-fix/repeat_test.sh`, `taskset -c 0-63`,
+`OMP_NUM_THREADS=8`).
+
+**"Load"** means `LOAD=64`: 64 busy-loop shells on cores 0-63 for the whole loop.
+
+| commit | idle | under load |
+|---|---:|---:|
+| `ba01695c35` (master the branch started from) | 10/10 | 10/10 |
+| `4a7e6fe30f` (the branch before this round) | -- | 5/10 |
+| `af874a17d6` (+ `8ec16f42f8`: `finish_row` runs the progress hook) | 10/10 | 9/10 |
+| `8c7b5b9496` (+ the slow-publisher fault finishes one row per turn) | 10/10 | 20/20 |
+
+**The flake was not present at master.** Master's fill read went through the packing path; this branch made
+O_DIRECT row images the only reader.
+
+**`8ec16f42f8`.** The per-row hook cut the failure rate but did not remove it.
+
+**The remaining failure** had `first` equal to `whole` to within 15 µs:
+
+- When row 0's read lands after rows 1-3, `publish_landed` finishes rows 1-3 under the 300 ms `pack_delay_ns` fault
+  before the loop reaps row 0.
+- The claim-order prefix therefore holds at 0 until the end.
+
+**`8c7b5b9496`.** Under that fault, the slow publisher now returns after each row. This affects InstrBuild only;
+ProdBuild's finish has no delay.
+
+**Mutants** (`final-fix/mutants.sh`, in the private worktree `wt-hotpath-mut` at `c40e834e96`):
+
+- **M1** removes the `finish_row` hook. It **survives** under load (10/10), and the restored tree is 10/10.
+  - With the fault finishing one row per turn, the per-turn hook at the loop's top already publishes each row. The
+    test therefore no longer isolates the `finish_row` call.
+  - The call's effect is pinned by the history instead: 5/10 before it, 9/10 with it.
+  - In ProdBuild, the difference it makes is at most one loop turn.
+- **M2** makes `read()` call `std::uncaught_exceptions()` again. It is **killed**: the first-request test sees
+  `service malloc 1`. The restored tree passes 1/1.
+
+**Suites at `c40e834e96`.**
+
+```bash
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 /data/models/slang/.venv/bin/python -m pytest \
+  test/registered/unit/kernels -q -p no:randomly                                            # EXIT=0
+flock ... pytest test/registered/unit/layers/moe -q -p no:randomly --continue-on-collection-errors   # EXIT=1
+```
+
+- **kernels: `1124 passed, 21 skipped`.** 1145 IDs were collected, against 1141 at `4a7e6fe30f`. The +4 are exactly
+  this round's new tests:
+  - `test_every_instrumented_variant_reports_every_counter[instr]`
+  - `test_every_instrumented_variant_reports_every_counter[instr_tsan]`
+  - `test_hotpath_shim_stacks_records_the_first_and_every_nth_call_site`
+  - `test_the_service_thread_allocates_nothing_from_its_first_request`
+
+  The result equals §1's 1119 + 1 (Task 18's shim test) + 4.
+- **layers/moe: `2 failed, 1087 passed, 12 errors, 12405 subtests passed`.** These are the same 2 failures and the
+  same 12 errors as §2 and base: 11 pyarrow collection errors and the `trace_on` teardown error.
+
+## 9. Phase 2 Task P1: copy-thread attribution by entry point, and the completion word
+
+Date: 2026-09-29, 11:19-11:35. No product change. The tooling is in `2bfa660596`, `0529f5d945` and `f4771aa409`:
+- `completion_word/probe_completion_word.cu` and `run_probe.sh`;
+- `completion_word/attribute_entry.py`;
+- `hotpath_shim.c`'s `HOTPATH_SHIM_STACK_SLOTS` (default 512, unchanged);
+- the driver's `SHIM_SLOTS` and `STACKS_EVERY` knobs.
+
+`generations.json` was registered in `b9a44bb6b9` and reverted in `7c98dd26ff`. Private worktree:
+`divix01:/data/models/slang/nvfp4-work/wt-hotpath-p1`.
+
+### 9a. Attribution: the copy thread's libcuda mutex and malloc calls, by entry point
+
+**Arm CS3.**
+- **Tree.** The branch at `b9a44bb6b9`: python tree `e66048bd17`, the product of `2470fb133a` plus the shim's
+  slot macro.
+- **Recipe.** The production recipe, with Task 18's B tier and overrides: tier full `0:61440,1:40960` / `102400`, and
+  no env beyond the shim's.
+- **Result.** `rc` 0, `read_errors` 0, 2964 served. The output is byte-identical to Task 18's A (2/2 turns).
+  - The driver's own identity step failed only on an import: `hotpath_report` needs `iopoll-cuts` on
+    `PYTHONPATH`, fixed in `0529f5d945`.
+  - The comparison was re-run by hand with that path and gave `{...t0: True, ...t0: True}`.
+- **perf on the service thread.** `instructions:u` 99.92 G and `cycles:u` 100.69 G.
+- **Sampling.** The shim was built with 16384 record slots and `HOTPATH_SHIM_STACKS_EVERY=4099`. That gave 8,941
+  copy/mutex records, every one kept: 256 first calls and 8,685 sampled. §8e had 256 of each.
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath-p1 && H=$(git rev-parse HEAD) && ARMS=CS SHIM_SLOTS=16384 \
+  STACKS_EVERY=4099 REF_RUN=/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-baseline/servers/A/run-20260929-081421 \
+  nohup bash analysis/dsv41-drive/hotpath/drive_hotpath_arms.sh $PWD $H $PWD $H /mnt/nvme1/dsv41-hotpath/p1/arm-20260929-112147 30031 \
+  > /mnt/nvme1/dsv41-hotpath/p1/driver-20260929-112147.log 2>&1 &'      # H = b9a44bb6b9
+PYTHONPATH=$PWD/python taskset -c 0-63 /data/models/slang/.venv/bin/python \
+  analysis/dsv41-drive/hotpath/completion_word/attribute_entry.py $O/CS-callsites.txt $O/CS-shim.json $O/CS-entry.json 4099
+```
+
+**How a record is classified.** Each record is walked out to its first host-module frame.
+- `CudaCopyBackend::query`, `::init` and `::shutdown` appear as frames and name the class directly.
+- `::issue` and `::mark` are devirtualized and inlined into `CopyEngine::run` at -O2. Those records are classified by
+  their outermost libcuda frame, which is the exported entry point the host called: `cuMemcpyAsync` (145 records) or
+  `cuEventRecord` (19).
+
+**Whole-run counts.**
+- copy: mutex 35,603,559; malloc/free 72/72; cond 1; futex 8,946; clock 0.
+- service: malloc 0, free 1, mutex 0, futex 5.
+
+**Per job.** Production does not count copy jobs, so this run has no job count. Every per-job figure below is
+therefore a range over two estimates of it:
+- **10.9 k:** master's `copy_jobs` 10,911 (§8e, 2944 served), a different program that issues jobs differently;
+- **15.4 k:** CS3's own `cuEventRecord` estimate divided by its 4 mutexes per call (9b). One record per job makes this
+  the job count; its 95% CI is [9.3 k, 25.3 k].
+
+The whole-run split is the solid result: 98.5% `cuEventQuery`, with a narrow interval. Query records carry a
+non-inlined `CudaCopyBackend::query` frame, so that class does not depend on libcuda symbol names. **P2 records the
+exact job count:** the completion word's final value is the job sequence, read once at shutdown and logged.
+
+| copy-thread calls | entry point | CS3 whole run: est. [95% CI] | CS3 per job (15.4 k -> 10.9 k jobs) | master CM per job (§8e, / 10,911) |
+|---|---|---:|---:|---:|
+| mutex | `cuEventQuery` (completion polling) | **35,082,931** [34.99 M, 35.17 M] (98.5%) | **~2,280-3,215** | ~3,666 (40.0 M) |
+| mutex | `cuMemcpyAsync` (submission) | 459,136 [382 k, 552 k] | ~30-42 (8 per call: ~3.7-5.3 copies) | not separable (in the unsampled rest) |
+| mutex | `cuEventRecord` (submission) | 61,491 [37 k, 101 k] | 4 by construction (one call per job, 4 mutexes each); the estimate is what sets the 15.4 k | not separable |
+| mutex | `cuLaunchKernel` | 0 (the copy thread launches nothing) | 0 | 0 |
+| mutex | other, steady state | 0 of 8,685 sampled (≤ 15.7 k) | 0 | ~6,425: the loop's own `mutex_` (70.1 M) |
+| mutex | init: `cuEventCreate` ×32, `cuStreamCreateWithPriority`, `cuInit`, `PrimaryCtxRetain`, and the `start_mutex_` handshake | 45 + 1 (exact) | start-up | same |
+| mutex | shutdown: `cuEventDestroy` ×64, `cuStreamDestroy`, `PrimaryCtxRelease` | ~75 (the probe's replay, 9b; not sampled here) | exit | same |
+| malloc | init: `CudaCopyBackend::init` | 72 (exact) | **0** | ~12,476 (the `std::deque` per turn, 136.1 M) |
+| free | shutdown: `cuEventDestroy` ×64, `cuStreamDestroy` ×3; libcuda TLS destructors and the `std::thread` state | 67 + 5 (exact) | 0 | -- |
+
+- At the full CI extremes (9.3 k and 25.3 k jobs), `cuEventQuery` is ~1,390-3,770 per job.
+- **At steady state the copy thread takes about 2,320-3,260 libcuda mutexes per job, and 0 mallocs.**
+- Submission is ~520 k mutexes over the whole run whichever job count is right: about 1.5% of the copy thread's
+  total. The rest is `cuEventQuery` polling.
+- The table's estimates sum to the count only because each is a share of that same total, so the sum is no check.
+
+### 9b. The completion word: probe on divix01's RTX 5090 (driver 615.71.09, CUDA 13.4 headers)
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-hotpath-p1 && bash analysis/dsv41-drive/hotpath/completion_word/run_probe.sh \
+  /mnt/nvme1/dsv41-hotpath/p1/probe-20260929-111919'      # at b9a44bb6b9; PROBE_EXIT=0, FAULT_wv32_EXIT=0, FAULT_kern_EXIT=0
+```
+
+**Setup.**
+- **The measuring thread.** It is named `probe-copy-eng`, so the counting shim (preloaded) counts it as the copy
+  thread.
+- **Stream.** Non-blocking, greatest priority, as `CudaCopyBackend` creates it.
+- **Copies.** 12 `cuMemcpyAsync` H2D per job, from `cuMemHostRegister`ed memory (like the slabs) into `cuMemAlloc`
+  memory.
+- **Sizes.** "tiny" is 12 × 4 KiB (2,000 jobs); "large" is 12 × 512 KiB (500 jobs, ~460 µs each). Each mechanism
+  first runs 20 warm-up jobs.
+- **The word.** One `cuMemHostAlloc(DEVICEMAP)` page.
+
+**Attributes.** `CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS` does not exist in the CUDA 13.4 `cuda.h`, which defines
+only the `_V1` form and the current forms below.
+
+| attribute (id) | value |
+|---|---:|
+| `CAN_USE_STREAM_MEM_OPS_V1` (92) | 0 |
+| `CAN_USE_64_BIT_STREAM_MEM_OPS_V1` (93) | 0 |
+| `CAN_USE_STREAM_WAIT_VALUE_NOR_V1` (94) | 0 |
+| **`CAN_USE_64_BIT_STREAM_MEM_OPS` (122)** | **1** |
+| `CAN_USE_STREAM_WAIT_VALUE_NOR` (123) | 1 |
+| `CAN_FLUSH_REMOTE_WRITES` (98) | 0 |
+| `CAN_MAP_HOST_MEMORY` / `UNIFIED_ADDRESSING` / `CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM` | 1 / 1 / 1 |
+
+**The v1 API reads 0; the v2 mem ops are supported, 64-bit included.**
+- `cuda.h` maps `cuStreamWriteValue32/64` to the `_v2` symbols, and `libcuda` exports both the plain and the `_v2`
+  names.
+- A `dlsym` backend must therefore resolve the `_v2` symbol (`cuStreamWriteValue32_v2`, per 9c), not the plain name, which is v1.
+
+**Per job, on the submitting thread** (probe; malloc and free are 0 in every row):
+
+| mechanism | copies: mutex | completion op: mutex | op enqueue µs p50 / p99 | poll: driver calls / mutex (large) | submit end -> seen µs p50 / p99 (large) | (tiny) | order violations |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ev1: `cuEventRecord`, then `cuEventQuery` every turn | 96 (8 per call) | 4 | 0.26 / 0.76 | 2,396 / 2,396 | 460.2 / 461.4 | 2.9 / 3.4 | 0 |
+| ev8: the same, queried every 8 turns (the branch) | 96 | 4 | 0.26 / 0.64 | 821 / 821 | 460.2 / 461.3 | 2.9 / 3.8 | 0 |
+| **(a) `cuStreamWriteValue32`** | 96 | 6 | 1.60 / 2.68 | **0 / 0** | 459.8 / 462.8 | 1.8 / 3.7 | 0 |
+| **(a) `cuStreamWriteValue64`** | 96 | 6 | 1.59 / 2.47 | **0 / 0** | 459.8 / 463.5 | 1.8 / 3.6 | 0 |
+| (b) `cuLaunchKernel`, a 1-thread system-scope release store | 96 | 5 | 2.19 / 5.83 | 0 / 0 | 460.1 / 466.5 | 2.7 / 3.6 | 0 |
+| control: `WriteValue32` on a second stream | 96 | 6 | 1.31 | 0 / 0 | 21.2 (early) | 1.6 | **500 / 500** (large) |
+
+**Stream order.** On observing completion, the probe reads back the last 4 KiB of the job's last copy (legacy stream,
+unordered with the copy stream) and compares it with the job's pattern.
+- Mechanisms (a) and (b): 0 violations in 2,500 jobs each.
+- The control, whose word is not ordered after the copies, fails every large job. The check therefore has the power
+  to detect a word that lands early.
+- (a) uses the default flags. The v2 API has no `NO_MEMORY_BARRIER`, and the write fences the stream's prior work,
+  like a stream-scoped `__threadfence_system`.
+
+**Latency: when the copy is done, how soon does the host see it?** Two observers ran at once: the word, polled on
+this thread, and `cuEventQuery`, polled every turn on a second thread. The table gives the event's sighting minus the
+word's, in µs (p50 / p99).
+
+| ordering on the stream | wv32 tiny | wv32 large | wv64 large | kern large |
+|---|---:|---:|---:|---:|
+| completion op, then event | +0.44 / +0.58 | +0.34 / +0.50 | +0.35 / +0.51 | +0.53 / +0.62 |
+| event, then completion op | -0.18 / +0.03 | -0.92 / -0.15 | -0.92 / -0.13 | -2.32 / -1.47 |
+
+- The word becomes visible within ~0.2-0.9 µs of the event completing, even when it is queued behind the event. The
+  host sees it ~0.4 µs before a best-case (every-turn) event poller sees a later event.
+- The kernel lags ~2.3-2.7 µs: it needs a launch onto an SM.
+- Either way the difference is noise against a ~2 ms copy job.
+
+**Host read cost.** 0.27 ns per acquire load of the word, over 10^7 loads, with 0 mutex, 0 malloc, 0 futex and 0 driver
+calls.
+
+**For comparison:**
+- `cuEventQuery` on a completed event: 118.6 ns and 1 mutex per call;
+- `cuStreamQuery` on an idle stream: 127.0 ns and 1 mutex.
+
+**Clock reads: not measured per call.** The shim's clock kind (`clock_gettime`) was not in this run's per-phase
+snapshot. The probe process's copy thread totalled 1.6 M, unattributed.
+- `snap()` now also reads the clock kind (`probe_completion_word.cu`, per-job `copies/op/poll_clock_per_job`), but
+  nothing has been rerun.
+- Production CS3's copy thread read clock 0 with `cuMemcpyAsync`/`cuEventRecord`/`cuEventQuery`.
+- Whether `cuStreamWriteValue*_v2` or `cuStreamQuery` read a clock is therefore unknown. **P2's arm C gates on a
+  copy-thread clock count of 0.**
+
+**Lifecycle (start-up and exit only).**
+- Replay of `CudaCopyBackend::init`: mutex 77, malloc 132. The replay's malloc count differs from the server's 72,
+  because the probe's process state differs.
+- Replay of shutdown: mutex 75, free 132.
+- The word's setup (`cuMemHostAlloc` + `cuMemHostGetDevicePointer`): mutex 9, malloc 5, free 1, once.
+
+**Fail closed (`--fault`, separate processes).** The completion op targets an unmapped device address after a large
+job's copies.
+
+| fault | word | first `cuStreamQuery` check (turn 65,536) | time to verdict |
+|---|---|---|---:|
+| wv32 | never seen | `719 CUDA_ERROR_LAUNCH_FAILED` | 2.73 ms |
+| kern | never seen | `700 CUDA_ERROR_ILLEGAL_ADDRESS` | 9.85 ms |
+
+A failed op never writes the word, and one budgeted stream query with no clock surfaces the sticky error.
+- These fault runs cannot exercise the lost-write rule (9c): their word is never written.
+- They put an MMU fault on the GPU, so `run_probe.sh` now runs them only with `RUN_FAULT=1`.
+
+### 9c. Decision: (a), a stream-written completion word (`cuStreamWriteValue32_v2` recommended) in host-mapped pinned memory
+
+**Evidence.**
+- Supported on this card and driver: the v2 write-value ops (32- and 64-bit) work with no module flag, and
+  `CAN_USE_64_BIT_STREAM_MEM_OPS` = 1.
+- Stream-ordered after the copies: 0 violations in 2,500 jobs, where the unordered control fails 500/500.
+- Seen as fast as the best `cuEventQuery` poller: submit to seen, 459.8 µs against 460.2 µs.
+- It removes every poll-side driver call: ~2,280-3,215 `cuEventQuery` mutexes per job become 0.27 ns plain loads.
+
+**Width: 32-bit, with a wrap-safe compare, for P2.**
+- The probe measured the two widths as equal: 6 mutexes each, the same latency, 0 violations each.
+- Single-copy atomicity of a 64-bit stream mem-op write into sysmem is not documented. A torn host read could only
+  mislead at a 2^32 crossing, but the 32-bit word avoids the question entirely.
+- The 32-bit form needs no `CAN_USE_64_BIT_STREAM_MEM_OPS`.
+- The compare is `(int32_t)(word - token) >= 0`, correct while fewer than 2^31 jobs are outstanding. At most
+  `kCopyRing` (32) can be.
+- `init` resolves `cuStreamWriteValue32_v2` by `dlsym`. The plain name is the gated v1 API. The probe linked `-lcuda`
+  and never took the `dlsym` path: P2's arm C is the first test of it.
+
+**Why not (b).**
+- It costs one fewer mutex per job (5 against 6), but its enqueue takes +0.6 µs and it lands +2.5 µs later.
+- It needs an SM on the copy stream. The copy wait kernel spins on an SM for this very completion, and the decode
+  graph holds SMs. The probe ran on an idle GPU, so SM starvation is untested. A stream mem op is executed by the
+  GPU front end, which is the documented model; this probe did not measure it.
+- The host module is built by the host compiler (`load_jit`, `cpp_files`, no nvcc). (b) would need
+  `cuModuleLoadData` of an embedded PTX or cubin at init.
+
+**How stream order holds.**
+- Each job's `issue` ends with `cuStreamWriteValue32_v2(stream, word_dev, job_seq, 0)` in place of
+  `cuEventRecord`. `job_seq` is the job sequence truncated to 32 bits.
+- The default flags make the write execute only after the stream's prior copies complete, with a memory fence before
+  it.
+- Because the stream is in order, a word that reaches `token` (wrap-safe) means every job up to it is done. The poll
+  compares the head job's token against one acquire load, and the host needs no event pool (64 fewer
+  `cuEventCreate`/`Destroy` at start-up and exit).
+- **The device side is unchanged:** DMA to vidmem, the fenced word write, the host's acquire, the host's release
+  publish of CopyDone, the copy wait's system-scope acquire, then the SM reads `dst`. This is the chain the
+  `cuEventQuery` design already relies on: an event's completion is also a front-end release after the copy
+  engine's work.
+  - The probe checked the bytes' visibility with a copy-engine readback, not an SM load. That suffices because
+    nothing device-side changes, provided the copy wait keeps its acquire of CopyDone before any `dst` read.
+
+**How the fail-closed semantics hold with clockless pacing.**
+- **Device.** The copy wait kernel is unchanged. It commits `go_ce` only on a matching CopyDone, and otherwise times
+  out at its `global_ns` deadline with `go_ce` 0. The request fails closed whatever the host does.
+- **Host: leases.** The copy thread publishes CopyDone and releases leases only after the word passes the job's token.
+  A failed copy or op never writes the word, so its leases stay held (E5).
+- **Host: detecting the failure, without a clock.** While a job is in flight, one `cuStreamQuery` runs per budget of
+  poll turns. The budget is a turn count set in `start()`, the same way as `idle_budget`.
+  - `NOT_READY`: keep polling.
+  - An error code: `broken_`, then `copy_failed` for every held job (fail stop, as today).
+  - `SUCCESS`: **re-load the word with acquire after the query.** Fail stop as a lost write only if the word is still
+    short of the head token.
+    - Why: the word is loaded before the query. A write that lands between the load and the query makes a healthy,
+      now idle stream look like a lost write.
+    - At ~0.1-0.2 µs of window per check, that would be about one false fail-stop per run.
+    - Once `SUCCESS` says the stream is idle, its write, if made, is already visible, so the re-load settles it.
+      `probe_completion_word.cu`'s `run_fault` now does this.
+    - **P2 must test the forced interleaving:** the word lands between the load and a `SUCCESS` query, and the
+      engine must not fail stop.
+  - **The budget in production terms.** 2^16 turns was ~2.7 ms in the probe's bare `pause` loop. A production turn
+    also pops the ring and scans `acking`: §9a implies ~2.17 ms / (3,215 × 8) ≈ 84 ns per turn, so 2^16 turns is
+    ~5.5 ms.
+    - That is ≤ 0.4 checks per ~2.17 ms job.
+    - Error detection moves from sub-µs to ~3-6 ms. That is harmless: the device copy wait fails closed on its own
+      deadline, and the host already had no in-flight timeout (a healthy stuck stream is left to that deadline,
+      leases held).
+  - The probe's fault runs reached their verdict at the first check.
+- The drain deadline in `stop()` keeps its clock. It is read only once a stop has been asked for.
+
+### 9d. The per-job floor after the change
+
+Ranges are over 15.4 k -> 10.9 k jobs (9a). P2 replaces them with the exact count.
+
+| per job | today (CS3) | after (a) |
+|---|---:|---:|
+| `cuMemcpyAsync` | ~3.7-5.3 calls × 8 = ~30-42 mutex | unchanged: ~30-42 mutex |
+| completion op | `cuEventRecord`: 4 mutex | `cuStreamWriteValue32_v2`: 6 mutex |
+| completion polling | `cuEventQuery`: ~2,280-3,215 mutex | 0 (plain loads) |
+| liveness check | -- | ≤ 0.4 mutex (`cuStreamQuery` per ~5.5 ms in flight) |
+| **total mutex** | **~2,320-3,260** | **~37-49** (8 × copies + 6, + ≤ 0.4) |
+| malloc / free / cond / futex | 0 / 0 / 0 / idle-path futex only | 0 / 0 / 0 / unchanged |
+| clock | 0 (CS3) | expected 0; unmeasured for the write and `cuStreamQuery`, so P2's arm C gates on it |
+
+- **Why the floor is not 0.** `cuMemcpyAsync` takes 8 libcuda mutexes per call, and every submission is a driver
+  call. Removing those would need fewer calls per job (e.g. `cuMemcpyBatchAsync`, not measured here) or no driver on
+  the copy thread at all.
+- **Limits:**
+  - the job count is estimated, not counted;
+  - the per-call constants come from the probe on an otherwise idle GPU;
+  - the probe used `-lcuda`, not production's `dlsym`.

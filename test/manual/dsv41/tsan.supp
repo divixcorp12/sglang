@@ -1,0 +1,14 @@
+# The interpreter and torch are not instrumented; races TSan attributes to them are false positives here.
+called_from_lib:libpython3
+called_from_lib:libtorch_cpu.so
+called_from_lib:libc10.so
+called_from_lib:libgomp.so
+called_from_lib:libtorch_python.so
+# torch's (and torchvision's) operator registration unlocks mutexes at import and at exit that TSan's interceptor never
+# saw locked: reports about torch's own mutexes, which the host module never touches.
+mutex:libtorch_python.so
+mutex:libtorch_cpu.so
+mutex:torchvision
+# A statically linked interpreter (divix01's venv python is miniconda's python3.13 binary, no libpython3.so): the same
+# interpreter mutex report, attributed to the executable.
+mutex:python3

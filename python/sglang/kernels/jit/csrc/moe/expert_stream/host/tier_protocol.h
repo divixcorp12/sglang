@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../lease_layout.h"
+#include "fixed_vec.h"
 #include "row_reader.h"
 
 namespace sglang {
@@ -66,8 +67,26 @@ enum Counter : int {
   kPrefetchWasted,           // copied rows it did not route
   kPrefetchHeld,             // prefetch jobs the copy thread held back behind a demand job
   kPrefetchLatencyNs,        // request read to completion observed, summed over copied prefetches
+  // The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Task 13): Python commands (set_hot, inject_lease, the
+  // snapshots) the tier's owner applied, queued through the command ring or run directly. A metric: tests only (F24).
+  kCommandsApplied,
   kCounterCount,
 };
+
+// Counters the production build keeps (plan 2026-09-29-hotpath-zero-overhead D1): the shutdown line's served, rows and
+// errors, the failure evidence a fail-stop message prints, the admission policy's outcomes, and the functional version.
+constexpr bool is_core_counter(int k) {
+  switch (k) {
+    case kServedRequests: case kTouchOnly: case kRowsRead: case kReadErrors: case kEvictions: case kOverruns:
+    case kLateAfterFatal: case kNoVictim: case kVersion: case kRunning: case kSpinCpu: case kDeferred:
+    case kDeferredReuse: case kPieceStreamRefused: case kSlotsQuarantined: case kCopyErrors:
+    case kCopyGenerationMismatches:
+      return true;
+    default:
+      return false;
+  }
+}
+static_assert(is_core_counter(kVersion), "version is functional (Python's LRU view invalidates on it): never a metric");
 
 inline uint32_t load_acquire(const uint8_t* address) {
   return __atomic_load_n(reinterpret_cast<const uint32_t*>(address), __ATOMIC_ACQUIRE);
@@ -114,20 +133,27 @@ inline int64_t record_offset(int64_t ring, uint32_t records, uint32_t seq) {
   return ring + static_cast<int64_t>((seq - 1u) % records) * kRecordBytes;
 }
 
+// A request's distinct experts: its need and protect ids and its lanes' experts (plan 2026-09-29-hotpath-zero-overhead
+// Task 11). Every per-request list of the service is bounded by it, so none needs the heap.
+constexpr size_t kWanted = 2 * kMaxIds + kLeaseLanes;
+static_assert(kWanted == 24, "the wire format's per-request bound (spec section 5)");
+
+// One demand or advisory record, as the service thread reads it: fixed-size, so reading one allocates nothing (spec A1-A3,
+// A11).
 struct Request {
   uint32_t seq = 0;
   int64_t row = 0;
   uint32_t after = 0;
   bool armed = true;
   uint32_t lanes = 0;
-  std::vector<int32_t> need;
-  std::vector<int32_t> protect;
-  std::vector<uint8_t> hot_bitmap;
+  FixedVec<int32_t, kMaxIds> need;
+  FixedVec<int32_t, kMaxIds> protect;
+  const uint8_t* hot_bitmap = nullptr;  // GPU hot mode: RamTier::hot_scratch_, valid until the next record read
   // Lease mode: the device's lane list and 56-bit request generation, from the lane request (not the record).
   uint64_t gen = 0;
-  std::vector<int32_t> lane_experts;
-  std::vector<int32_t> lane_dst;  // the plan's destination slot per lane, -1 unknown
-  uint32_t lane_flags = 0;        // kLeaseLrFlag*
+  FixedVec<int32_t, kLeaseLanes> lane_experts;
+  FixedVec<int32_t, kLeaseLanes> lane_dst;  // the plan's destination slot per lane, -1 unknown
+  uint32_t lane_flags = 0;                  // kLeaseLrFlag*
 };
 
 // The service's private account of one request's leases, by request slot (LEASE_PROTOCOL.md 5.2).
@@ -181,10 +207,6 @@ inline bool read_record(const uint8_t* record, uint32_t expected, Request* reque
 
 inline void set_status(uint8_t* record, uint16_t status) {
   __atomic_store_n(reinterpret_cast<uint16_t*>(record + kRecStatus), status, __ATOMIC_RELEASE);
-}
-
-inline bool listed(const std::vector<int32_t>& ids, int32_t id) {
-  return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
 
 // Fixed-capacity single-producer single-consumer queue of stage records: the service thread

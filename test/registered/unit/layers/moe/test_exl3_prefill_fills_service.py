@@ -30,7 +30,7 @@ def hang_guard():
     faulthandler.cancel_dump_traceback_later()
 
 
-def _build(tmp_path, *, row_images=True, fills=True, device="cpu"):
+def _build(tmp_path, *, fills=True, device="cpu"):
     source = tmp_path / "ckpt"
     source.mkdir()
     write_fake_exl3(str(source), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
@@ -44,8 +44,6 @@ def _build(tmp_path, *, row_images=True, fills=True, device="cpu"):
         (envs.SGLANG_MOE_EXPERT_ROW_SOURCE, "shards"),
         (envs.SGLANG_MOE_EXPERT_GRAPH_GATHER, True),
         (envs.SGLANG_MOE_EXPERT_MIRROR_DIRS, str(root)),
-        (envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES, True),
-        (envs.SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, row_images),
         (envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS, fills),
     ):
         stack.enter_context(env.override(value))
@@ -128,16 +126,6 @@ def test_a_layers_prefetch_serves_its_chunks_and_ends_with_the_host_use(tiers, m
     for chunk, out in outputs:
         assert _same({n: t.cpu() for n, t in out.items()}, _reference(layout, source, 0, chunk))
     assert cache.stats.populated_rows == 4  # 5 by ensure_rows, then 0, 1, 3 by the prefetch
-
-
-def test_the_flag_is_refused_without_row_images(tmp_path):
-    stack, layout, source, streamers, caches = _build(tmp_path, row_images=False)
-    try:
-        with pytest.raises(RuntimeError, match="ROW_IMAGES"):
-            caches[0].ensure_rows(torch.tensor([1]))
-    finally:
-        module.Exl3RamMissService._instance = None
-        stack.close()
 
 
 def test_the_flag_is_refused_without_the_native_slot_table(tmp_path):

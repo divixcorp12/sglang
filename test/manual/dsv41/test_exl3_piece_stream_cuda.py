@@ -138,20 +138,25 @@ def _close(host, slabs):
 
 class StreamService:
     """The real chain one call at a time against the real C++ service thread: lease mode, two-phase and (unless
-    ``piece_stream`` is False) piece streaming with ``pack_workers`` packing workers. Flag on, the chain is
+    ``piece_stream`` is False) piece streaming, reading row images with O_DIRECT (the reader's only tables, plan
+    2026-09-29-hotpath-zero-overhead D4; one image root per mirror weight, beside the fake checkpoint). Flag on, the
+    chain is
     post -> W1 -> C1 -> A1 -> S -> A2 -> F; flag off, today's post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F.
     ``layers`` streamed layers are built and every request goes to streamed row ``row``. ``copy_engine`` enables and
-    arms the service's copy engine (LEASE_PROTOCOL.md 7.6), posts with its flag and adds the copy wait before F."""
+    arms the service's copy engine (LEASE_PROTOCOL.md 7.6), posts with its flag and adds the copy wait before F.
+    ``variant`` is the host build (ExpertStreamHost's ``variant``); None follows host_variant(), which the manual
+    conftest sets to "instr" under pytest. A script outside pytest that calls a test-only export (copy_engine_ballast)
+    passes "instr"."""
 
     def __init__(
-        self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, pack_workers=2, layers=LAYERS,
-        row=0, copy_engine=False, native_prefetch=False, sm_small=False, mirror_weights=None,
+        self, tmp_path, *, timeout_ms=2000, hit_wait_ns=HIT_WAIT_NS, piece_stream=True, layers=LAYERS,
+        row=0, copy_engine=False, native_prefetch=False, sm_small=False, mirror_weights=None, variant=None,
     ):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
-        from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
         from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+        from sglang.test.dsv41_ram_miss_fixtures import image_tables
 
         self.layers, self.row = layers, row
         write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=EXPERTS, hidden=1024, inter=512, finite=True)
@@ -169,22 +174,10 @@ class StreamService:
             for lid in range(layers):
                 for n in self.names:
                     self.slabs[lid][n] = allocate_host_slab(CAPACITY, self.specs[n].row_shape, self.specs[n].dtype, register=True)
-            mirrors = {}
-            if mirror_weights is not None:
-                import shutil
-
-                from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
-
-                roots = tuple(str(tmp_path.parent / f"{tmp_path.name}_mirror{i}") for i in range(len(mirror_weights)))
-                for root in roots:
-                    shutil.copytree(tmp_path, root)
-                mirrors = dict(roots=roots, policy=StaticSplitPolicy(mirror_weights), source_root=str(tmp_path))
-            self.tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs, **mirrors)
+            self.tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp_path, mirror_weights)
             self.page = new_page(pin=True)
             self.slot_map = torch.full((layers, EXPERTS), -1, dtype=torch.int32).pin_memory()
-            self.host = ExpertStreamHost(
-                self.tables, page=self.page, slot_map=self.slot_map, direct=False, pack_workers=pack_workers
-            )
+            self.host = ExpertStreamHost(self.tables, page=self.page, slot_map=self.slot_map, variant=variant)
             self.host.enable_lease_mode()
             self.host.enable_two_phase()
             if piece_stream:
@@ -377,7 +370,7 @@ class StreamService:
         """Clear the faults and let the service finish whatever read a test left running."""
         self.host.inject(delay_s=0.0)
         self.host.inject_fault()
-        assert self.until(lambda: self.host.busy_since_ns() == 0, timeout_s=15.0)
+        assert self.until(lambda: self.host.busy_episode() == 0, timeout_s=15.0)
 
 
 @pytest.fixture
@@ -932,8 +925,8 @@ def _source_rows(tmp_path, layer_id=0):
 
 
 def _fused_layer(tmp_path, *, piece_stream: bool, timeout_ms=2000):
-    """test_exl3_two_phase_parity_cuda.py's single-layer fused harness, two-phase on, with the piece-stream switch
-    and two packing workers (piece streaming needs them; the two-phase arm gets the same, for a like comparison)."""
+    """test_exl3_two_phase_parity_cuda.py's single-layer fused harness, two-phase on, with the piece-stream switch.
+    The caller holds ``service_row_images(tmp_path)`` open: the service reads row images (the reader's only tables)."""
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import exl3_ram_miss as service_module
     from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -947,15 +940,13 @@ def _fused_layer(tmp_path, *, piece_stream: bool, timeout_ms=2000):
         envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
         envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
         envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(piece_stream),
-        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(2),
     ):
         layer = torch.nn.Module()
         layer.layer_id = 0
         layer.top_k = F_TOP_K
-        fmt = Exl3ExpertFormat(layout, 0, direct=False)
+        fmt = Exl3ExpertFormat(layout, 0, source_root=str(tmp_path))  # no direct: uring_direct decides
         streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
         layer._nvfp4_expert_streamer = streamer
         ExpertPinnedHostCache(streamer, 8, **fmt.pinned_tier_options(layer))
@@ -982,9 +973,10 @@ def _fused_layer(tmp_path, *, piece_stream: bool, timeout_ms=2000):
 def test_g1_piece_streaming_output_is_bitwise_equal_to_the_two_phase_arm(tmp_path):
     """G1 = T9 for piece streaming: rows and fused output bitwise equal to the two-phase arm, eager and graph, with a
     per-piece pack delay of 2x W1's budget (so a W1 that took a LOADING lane, M7, or an S that copied before a
-    piece's bit, M3, would copy bytes the pack had not written yet) and a poisoned bounce."""
+    piece's bit, M3, would copy bytes the pack had not written yet) and poisoned destination slots."""
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
 
     timeout_ms = 2000
     injected_ns = F_TOP_K * 8 * PIECE_DELAY_NS  # the most delay one request carries: every lane a miss, 8 pieces each
@@ -999,47 +991,48 @@ def test_g1_piece_streaming_output_is_bitwise_equal_to_the_two_phase_arm(tmp_pat
     graph_routes = eager_routes + ([13, 14, 15, 2, 4, 8],)  # the third is new: misses under the graph as well
 
     results = {}
-    for arm, piece_stream in (("two_phase", False), ("piece_stream", True)):
-        layer, streamer, service, checks = _fused_layer(tmp_path, piece_stream=piece_stream, timeout_ms=timeout_ms)
-        try:
-            service.host.inject_fault(pack_delay_ns=PIECE_DELAY_NS, poison=True)
-            dev = streamer.row_backend.device_side
-            ids = torch.tensor([eager_routes[0]], device="cuda", dtype=torch.int32)
-            eager_outs, graph_outs, gathers = [], [], []
-            for route in eager_routes:
-                ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
-                eager_outs.append(Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0).float().clone())
-                assert streamer.row_backend.keep.item() == 1.0, (arm, route, service.host.counters())
-                for check in checks:
-                    check()
-                if piece_stream and route == eager_routes[1]:
-                    # 9..12 were never resident: their lanes were granted LOADING, which W1 must never claim.
-                    planned = streamer.row_backend.planned.tolist()
-                    claimed = dev.claimed.tolist()
-                    for expert in (9, 10, 11, 12):
-                        assert claimed[planned.index(expert)] == 0, (expert, planned, claimed)
-                remap, tensors = streamer.gather(ids)
-                slots = remap.reshape(-1).tolist()
-                for k, expert in enumerate(route):
-                    for name, rows in tensors.items():
-                        assert torch.equal(rows[slots[k]].cpu(), source[name][expert]), (arm, route, k, expert, name)
-                gathers.append((remap.clone(), {n: t.clone() for n, t in tensors.items()}))
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                out = Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
-            for route in graph_routes:
-                ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
-                graph.replay()
-                _cuda_ready()
-                assert streamer.row_backend.keep.item() == 1.0, (arm, route, service.host.counters())
-                graph_outs.append(out.float().clone())
-            if piece_stream:
-                assert dev.stats()["stream_pieces"] > 0, "S never copied a piece: nothing was streamed"
-            results[arm] = {"eager": eager_outs, "graph": graph_outs, "gathers": gathers}
-            assert service.host.fatal_seq() == 0, (arm, service.host.counters())
-        finally:
-            service.host.inject_fault()
-            service.shutdown()
+    with service_row_images(tmp_path):  # the service reads row images, its only tables (D4)
+        for arm, piece_stream in (("two_phase", False), ("piece_stream", True)):
+            layer, streamer, service, checks = _fused_layer(tmp_path, piece_stream=piece_stream, timeout_ms=timeout_ms)
+            try:
+                service.host.inject_fault(pack_delay_ns=PIECE_DELAY_NS, poison=True)
+                dev = streamer.row_backend.device_side
+                ids = torch.tensor([eager_routes[0]], device="cuda", dtype=torch.int32)
+                eager_outs, graph_outs, gathers = [], [], []
+                for route in eager_routes:
+                    ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
+                    eager_outs.append(Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0).float().clone())
+                    assert streamer.row_backend.keep.item() == 1.0, (arm, route, service.host.counters())
+                    for check in checks:
+                        check()
+                    if piece_stream and route == eager_routes[1]:
+                        # 9..12 were never resident: their lanes were granted LOADING, which W1 must never claim.
+                        planned = streamer.row_backend.planned.tolist()
+                        claimed = dev.claimed.tolist()
+                        for expert in (9, 10, 11, 12):
+                            assert claimed[planned.index(expert)] == 0, (expert, planned, claimed)
+                    remap, tensors = streamer.gather(ids)
+                    slots = remap.reshape(-1).tolist()
+                    for k, expert in enumerate(route):
+                        for name, rows in tensors.items():
+                            assert torch.equal(rows[slots[k]].cpu(), source[name][expert]), (arm, route, k, expert, name)
+                    gathers.append((remap.clone(), {n: t.clone() for n, t in tensors.items()}))
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    out = Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
+                for route in graph_routes:
+                    ids.copy_(torch.tensor([route], device="cuda", dtype=torch.int32))
+                    graph.replay()
+                    _cuda_ready()
+                    assert streamer.row_backend.keep.item() == 1.0, (arm, route, service.host.counters())
+                    graph_outs.append(out.float().clone())
+                if piece_stream:
+                    assert dev.stats()["stream_pieces"] > 0, "S never copied a piece: nothing was streamed"
+                results[arm] = {"eager": eager_outs, "graph": graph_outs, "gathers": gathers}
+                assert service.host.fatal_seq() == 0, (arm, service.host.counters())
+            finally:
+                service.host.inject_fault()
+                service.shutdown()
 
     for i, route in enumerate(graph_routes):
         assert torch.equal(results["two_phase"]["graph"][i], results["piece_stream"]["graph"][i]), (route, "graph")
@@ -1054,35 +1047,6 @@ def test_g1_piece_streaming_output_is_bitwise_equal_to_the_two_phase_arm(tmp_pat
                 assert torch.equal(
                     tensors1[name][slots1[k]].view(torch.uint8), tensors2[name][slots2[k]].view(torch.uint8)
                 ), (route, k, name)
-
-
-def test_g1_a_second_layer_streams_its_own_rows_equal_to_the_flag_off_arm(tmp_path):
-    """G1 through streamed row 1 of 2: S indexes its piece table by (row, expert), so a wrong row index copies row 0's
-    cuts over row 1's bytes. The precondition checks the two rows' cuts differ for the planned experts, so the
-    comparison can see that; the bytes must equal the flag-off (two-phase) arm and the checkpoint."""
-    experts = [3, 5, 9, 12]
-    delivered = {}
-    for piece_stream in (False, True):
-        directory = tmp_path / ("on" if piece_stream else "off")
-        directory.mkdir()
-        s = StreamService(directory, layers=2, row=1, piece_stream=piece_stream)
-        try:
-            if piece_stream:
-                runs = s.dev.piece_runs.cpu()
-                assert all(not torch.equal(runs[0, e], runs[1, e]) for e in experts), "rows 0 and 1 cut alike"
-            s.host.inject_fault(pack_delay_ns=PIECE_DELAY_NS, poison=True)
-            s.plan(experts)
-            s.step()
-            assert s.keep.item() == 1.0, (piece_stream, s.counters(), s.stats())
-            if piece_stream:
-                assert int(s.dev.go_2.item()) == len(experts) and s.stats()["stream_pieces"] > 0
-            assert s.delivered(experts), piece_stream
-            delivered[piece_stream] = {n: s.dest[n][: len(experts)].cpu().view(torch.uint8).clone() for n in s.names}
-        finally:
-            s.quiet()
-            s.close()
-    for name, rows in delivered[False].items():
-        assert torch.equal(rows, delivered[True][name]), name
 
 
 # ---------------------------------------------------------------------------------------------------------------

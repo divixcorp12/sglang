@@ -83,9 +83,9 @@ class TwoPhaseService:
     def __init__(self, tmp_path, *, timeout_ms=2000, hit_wait_ns=100_000, advise=False):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
-        from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
         from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+        from sglang.test.dsv41_ram_miss_fixtures import image_tables
 
         write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=1024, inter=512, finite=True)
         self.layout = build_exl3_expert_layout(str(tmp_path))
@@ -99,11 +99,11 @@ class TwoPhaseService:
             for lid in range(LAYERS):
                 for n in self.names:
                     self.slabs[lid][n] = allocate_host_slab(CAPACITY, self.specs[n].row_shape, self.specs[n].dtype, register=True)
-            tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
+            tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp_path)  # row images (D4)
             self.page = new_page(pin=True)
             slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.slot_map = slot_map
-            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
+            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map)
             self.host.enable_lease_mode()  # two-phase is refused without lease mode
             self.host.enable_two_phase()
             self.host.start_thread(fatal_wait_s=60.0)
@@ -330,7 +330,7 @@ def test_t7_one_request_deadline_not_one_per_stage(tmp_path):
         assert elapsed < 1.4 * (timeout_ms / 1000), elapsed
     finally:
         s.host.inject(delay_s=0.0)
-        assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+        assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
         s.close()
 
 
@@ -360,7 +360,7 @@ def test_t10_all_miss_request_does_not_pay_the_read_wait_twice(tmp_path):
         assert elapsed < 0.3, elapsed
     finally:
         s.host.inject(delay_s=0.0)
-        assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+        assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
         s.close()
 
 

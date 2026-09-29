@@ -65,7 +65,7 @@ def _setup(tmp_path, *, copy_engine=True, arm=True):
     s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False)
     host = ExpertStreamHost(
-        s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False, pack_workers=2
+        s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32)
     )
     host.enable_lease_mode()
     host.enable_two_phase()

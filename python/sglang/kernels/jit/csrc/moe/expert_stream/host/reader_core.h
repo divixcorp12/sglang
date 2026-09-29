@@ -1,10 +1,15 @@
-// ReaderCore: the pipeline the expert-stream host readers share (PackReader, bounce and pack; RowReader, direct row
-// images): io_uring superset reads of whole expert rows through per-extent descriptors, ring credit and banks.
+// ReaderCore: the pipeline of the expert-stream host reader, RowReader (direct row images; the packed path was deleted
+// by plan 2026-09-29-hotpath-zero-overhead D4): io_uring superset reads of whole expert rows through per-extent
+// descriptors, ring credit and banks.
 #pragma once
 
 #include <cstdio>
+#include <memory>
+#include <span>
+#include <type_traits>
 
 #include "../row_layout.h"
+#include "build_policy.h"
 #include "file_reader.h"
 #include "piece_geometry.h"
 #include "read_cuts.h"
@@ -13,15 +18,20 @@
 namespace sglang {
 namespace expert_stream {
 
+// read()'s default progress callback: none. A distinct type, so read() compiles the call out rather than testing it.
+struct NoProgress {
+  void operator()() const {}
+};
+
 // Test only (U10): one prepared SQE, as ReaderCore::set_sqe_log records it.
 struct SqeRecord {
   int64_t file, offset, length, bounce;  // bounce: byte offset of the destination from the bounce's start
 };
 
-// io_uring superset reads of whole expert rows through per-extent descriptors, for both derived readers: PackReader
-// reads into page-aligned bounce banks and then splits each row per name into the pinned slabs
-// (Exl3ShardRowSource.read's copies); RowReader reads the row images straight into the slab rows. "Bank" and "slot"
-// below name pipeline state in both; only PackReader backs them with bounce memory.
+// io_uring superset reads of whole expert rows through per-extent descriptors, for the one derived reader: RowReader
+// reads the row images with O_DIRECT straight into the slab rows. "Bank", "bounce slot" and "packing" below name
+// pipeline state (a row's descriptors, its bank's references, its finish), not memory: no bounce buffer is allocated
+// and nothing is copied. The base/derived split separates this pipeline from the destination and publishing hooks.
 //
 // Pipeline (plan Task 4). A read() call is split into batches of `step` rows; batch b fills bank
 // b % kBanks. Every bounce slot is one row's aligned superset, and every extent has its own
@@ -53,10 +63,19 @@ struct SqeRecord {
 // destination, advance, collect, quiesce, poison_slot and after_finish, each private to the derived reader, which
 // befriends this class; `Derived::kScatter` picks the read opcode. Derived readers are never deleted through this
 // class, so its destructor is protected and not virtual.
-template <class Derived, ExpertRowLayout Layout, AsyncFileReader Reader>
+//
+// `Build` (ProdBuild or InstrBuild, build_policy.h) is explicit, never read from `Derived`: `Derived` is incomplete
+// while this base is instantiated, and the derived reader forwards the same `Build` it was given.
+template <class Derived, ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 class ReaderCore {
+  static_assert(BuildPolicy<Build>);
+  // Faults lean on metrics (the cqe_call fault counts through metric(&ReaderMetrics::cqes)): a build with faults and
+  // no metrics would inject at the wrong completion, silently.
+  static_assert(!Build::kFaults || Build::kMetrics, "a build with faults needs metrics");
+
  public:
   using LayoutType = Layout;  // named so it cannot shadow the template parameter
+  using BuildType = Build;
   using SqeRecord = expert_stream::SqeRecord;
 
   ReaderCore(const ReaderCore&) = delete;  // owns fds and the ring
@@ -68,9 +87,8 @@ class ReaderCore {
 
   // Piece streaming (sub_reads_per_part(reading) sub-reads per reading part, per-piece vetting, packing and
   // publishing); off by default. Before open(), or on an idle reader after it (the tier sets it before its service
-  // thread starts), since it resizes the descriptor arrays and the packing queue. Refused without packing workers
-  // (the inline path has no piece publisher), with more mirror parts than pieces (a reading part needs a piece of
-  // its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
+  // thread starts), since it resizes the descriptor arrays. Refused with more mirror parts than pieces (a reading part
+  // needs a piece of its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
   void set_piece_stream(bool on) {
     if (on) {
       derived().check_piece_stream_support();
@@ -100,9 +118,10 @@ class ReaderCore {
     return piece_stream_;
   }
 
-  // Pieces a readiness word refused to publish, over the reader's life (each also failed its read).
+  // Pieces a readiness word refused to publish, over the reader's life (each also failed its read). A metric: 0 in
+  // ProdBuild.
   int64_t publish_refused() const {
-    return publish_refused_;
+    return metric(&ReaderMetrics::publish_refused);
   }
 
   // Test only (U10): the descriptor count and the ring credit this reader runs with.
@@ -115,24 +134,29 @@ class ReaderCore {
   }
 
   // Test only (U10): every SQE prepared is appended here, while set (null: nothing recorded, one branch per SQE).
-  void set_sqe_log(std::vector<SqeRecord>* log) {
-    sqe_log_ = log;
+  // InstrBuild only.
+  void set_sqe_log(std::vector<SqeRecord>* log)
+    requires(Build::kFaults)
+  {
+    faults_.sqe_log = log;
   }
 
   // Test-only scaffold (PACK_WORKERS.md owner-pinning measurement): pin the owner thread to `core`
-  // at open() and build the packing pool's mask as the inherited set minus that core, so the owner and
-  // the workers never share a core. -1 (the default) leaves open() byte-for-byte what it is today: no
-  // pin, and the pool's mask is exactly the creating thread's inherited affinity.
+  // at open(). -1 (the default) leaves open() unpinned. The packing pool this once kept the owner off is
+  // gone with the packed path, so only the pin remains.
   void set_owner_core(int64_t core) {
     owner_core_ = core;
   }
 
-  void set_fault(const ReadFault& fault) {
-    fault_ = fault;
-    part_fired_ = false;
-    retired_ = 0;
-    stale_armed_ = false;
-    stale_waiting_ = false;
+  // Test only (ReadFault, read_fault.h): InstrBuild only. ProdBuild has no fault state at all (plan Task 10).
+  void set_fault(const ReadFault& fault)
+    requires(Build::kFaults)
+  {
+    faults_.fault = fault;
+    faults_.part_fired = false;
+    faults_.retired = 0;
+    faults_.stale_armed = false;
+    faults_.stale_waiting = false;
     if (fault.generation_start != 0) generation_ = static_cast<uint32_t>(fault.generation_start);
     if constexpr (requires { io_.set_submit_fault(SubmitFault{}); }) {
       io_.set_submit_fault(SubmitFault{
@@ -141,25 +165,26 @@ class ReaderCore {
     } else if (
         fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0 ||
         fault.ring_reset_fail || fault.nop_flush_refused) {
-      // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs the readers
-      // (AnyReader) with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above
+      // No test reaches this today: the instrumented instantiation (exl3_ram_miss_host_instr.cpp) pairs the reader
+      // (RowReader) with FaultyReader<InstrUringReader>, which has set_submit_fault, so the `if constexpr` branch above
       // always fires there. This is the fallback for a Reader that cannot inject submit faults at all.
       throw std::runtime_error(error_prefix<Layout>() + "this reader cannot inject submit faults");
     }
   }
 
-  // Completions reaped over the reader's life (tests: a zero-length extent must add none).
+  // Completions reaped over the reader's life (tests: a zero-length extent must add none). The reader's diagnostic
+  // counters are metrics: every getter below returns 0 in ProdBuild.
   int64_t cqes() const {
-    return cqes_;
+    return metric(&ReaderMetrics::cqes);
   }
 
   // Completions that named no live descriptor, and generation counter wraps (tests).
   int64_t stale_cqes() const {
-    return stale_cqes_;
+    return metric(&ReaderMetrics::stale_cqes);
   }
 
   int64_t generation_wraps() const {
-    return generation_wraps_;
+    return metric(&ReaderMetrics::generation_wraps);
   }
 
   // A fixed read (READ_MODE fixed/readv_fixed) whose iovecs lie in k registered buffers is prepared as k legs, one SQE
@@ -179,11 +204,11 @@ class ReaderCore {
 
   // Logical reads prepared as more than one leg, and the SQEs those reads issued (first attempts), over the life.
   int64_t fixed_cuts() const {
-    return fixed_cuts_;
+    return metric(&ReaderMetrics::fixed_cuts);
   }
 
   int64_t fanout_sqes() const {
-    return fanout_sqes_;
+    return metric(&ReaderMetrics::fanout_sqes);
   }
 
   // Test only (fault word leg_cut_cap): cut every read at `cap` bytes (whole pages) on a 4 KiB boundary, whatever
@@ -193,10 +218,10 @@ class ReaderCore {
   }
   // Reads planned as more than one cut run, and the runs a boundary gap opened (first plans).
   int64_t cut_reads() const {
-    return cut_reads_;
+    return metric(&ReaderMetrics::cut_reads);
   }
   int64_t gap_cuts() const {
-    return gap_cuts_;
+    return metric(&ReaderMetrics::gap_cuts);
   }
 
   // Legs a read may have (storage stride) and the smallest cut in force (0: cuts off).
@@ -266,6 +291,9 @@ class ReaderCore {
     }
     if (!size_extents()) return false;
     if (!io_.init(queue_depth())) return false;
+    // One reap returns at most a queue depth of CQEs (plus a withheld stale one): reserved here, so the widest reap
+    // never grows the list on the service thread (spec A9). Supersedes size_extents' smaller extents + 1.
+    completions_.reserve(queue_depth() + 1);
     // A read's legs are reserved all at once, so the ring must hold the widest read's legs: a fixed read has a leg per
     // registered buffer its iovecs meet, a cut read its device-sized legs as well (leg_stride_ bounds both).
     if (fixed_reads() && leg_stride_ < std::max<size_t>(1, derived().max_iovecs()))
@@ -323,66 +351,85 @@ class ReaderCore {
   // Null costs a branch per event and no clock read; the stamps only read the clock and add to
   // `trace`, so they cannot change what is submitted, reaped, drained or copied.
   //
-  // `progress`, when set, is invoked periodically from inside the drain loop -- at most once every
-  // kProgressIntervalNs, never once per turn, since a turn can be as short as a single _mm_pause().
+  // `progress`, unless it is NoProgress, is invoked once per turn of the drain loop (never behind a clock: spec M4),
+  // and again as each row finishes (finish_row), so a caller that publishes the landed prefix (run_fill's advance)
+  // sees every row as it lands, not once per turn: one reap can return every row of a read at once.
   // The reader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
   // its own periodic work (retire_leases()) while a read is in flight, exactly as `abandon` is how the
-  // caller decides when to stop admitting. Null costs one comparison per turn and no clock read.
+  // caller decides when to stop admitting. NoProgress compiles to nothing.
+  //
+  // `abandon` and `progress` are template parameters, not std::function (spec A6): a closure past std::function's
+  // local storage would be heap-allocated per read. `experts` and `slots` are spans, so the service passes its
+  // fixed-size lists without copying them into vectors.
   //
   // This is the hot path and checks nothing: `layer`, `experts` and `slots` must be in
   // range and `experts.size() == slots.size()`. The service (Task 11) and
   // read_rows_once (Python) validate at their boundaries.
+  template <class Abandon, class Progress = NoProgress>
   int read(
       int64_t layer,
-      const std::vector<int32_t>& experts,
-      const std::vector<int64_t>& slots,
+      std::span<const int32_t> experts,
+      std::span<const int64_t> slots,
       size_t step,
-      const std::function<bool(size_t)>& abandon,
+      Abandon&& abandon,
       StageRecord* trace = nullptr,
       std::vector<uint8_t>* packed = nullptr,
       size_t max_reading_rows = SIZE_MAX,
-      const std::function<void()>& progress = nullptr,
+      Progress&& progress = Progress{},
       const PiecePublish* publish = nullptr) {
     if (!io_.ready()) return 0;
     step = std::max<size_t>(1, std::min<size_t>(step, kBounceRows));
     Call& c = c_;
     c = Call{};
     c.layer = layer;
-    c.experts = &experts;
-    c.slots = &slots;
+    c.experts = experts;
+    c.slots = slots;
     c.step = step;
     c.total = experts.size();
     c.batches = (c.total + step - 1) / step;
     c.max_reading = std::max<size_t>(1, max_reading_rows);
     // Credit is the ring's alone: banks and rows in flight do not enter it.
-    c.capacity = fault_.max_outstanding > 0
-                     ? std::min<unsigned>(queue_depth(), static_cast<unsigned>(fault_.max_outstanding))
-                     : queue_depth();
-    c.trace = trace;
+    c.capacity = queue_depth();
+    if constexpr (Build::kFaults) {
+      if (faults_.fault.max_outstanding > 0)
+        c.capacity = std::min<unsigned>(c.capacity, static_cast<unsigned>(faults_.fault.max_outstanding));
+    }
+    if constexpr (Build::kMetrics) c.trace = trace;  // ProdBuild: no record, whatever the caller passed
     c.packed = packed;
+    if constexpr (!std::is_same_v<std::decay_t<Progress>, NoProgress>) {
+      // Type-erased as a function pointer and the closure's address: no std::function, nothing allocated (spec A6).
+      // The closure outlives the call (it is read()'s own parameter), and finish_row runs only inside the loop below.
+      c.progress = [](void* closure) { (*static_cast<std::remove_reference_t<Progress>*>(closure))(); };
+      c.progress_closure = const_cast<void*>(static_cast<const void*>(std::addressof(progress)));
+    }
     c.publish = piece_stream_ ? publish : nullptr;
-    if (c.publish != nullptr && c.publish->probe != nullptr && fault_.hold_until_probe_ms > 0) {
-      c.hold_until = now_ns() + fault_.hold_until_probe_ms * 1000000;
+    if constexpr (Build::kFaults) {
+      if (c.publish != nullptr && c.publish->probe != nullptr && faults_.fault.hold_until_probe_ms > 0) {
+        c.hold_until = now_ns() + faults_.fault.hold_until_probe_ms * 1000000;
+      }
     }
     if (packed) packed->assign(c.total, 0);
-    if (trace) {
-      trace->rows_asked = static_cast<int64_t>(c.total);
-      trace->pack_workers = derived().pack_workers();
-      trace->pack_split = derived().pack_split();
-      trace->piece_stream = piece_stream_ ? 1 : 0;
-    }
+    on_trace([&](StageRecord& t) {
+      t.rows_asked = static_cast<int64_t>(c.total);
+      t.pack_workers = derived().pack_workers();
+      t.pack_split = derived().pack_split();
+      t.piece_stream = piece_stream_ ? 1 : 0;
+    });
     reset_pipeline();
-    held_.clear();
+    if constexpr (Build::kFaults) faults_.held.clear();
     // Whatever way this call ends, no packing worker may still be copying when it does: the caller
     // releases the slots on return and the next read reuses the bounce. Runs on exceptions too.
     // An exception (one of the accounting guards) leaves reads in flight: drain them too before unwinding past the
     // caller, which releases the slots. In direct mode those reads write the slab rows themselves.
+    // "Unwinding" is every exit but the two returns below, which set `returned` just before returning. Not
+    // std::uncaught_exceptions(): its first call on a thread makes __tls_get_addr allocate libstdc++'s exception
+    // globals (dynamic TLS), which was the production service thread's one malloc (final-fix round, item 5).
     struct Quiesce {
       ReaderCore* reader;
-      int exceptions;
+      bool returned = false;
       ~Quiesce() {
         reader->derived().quiesce();
-        if (std::uncaught_exceptions() > exceptions) {
+        if (!returned) {
           // Already unwinding: a failed ring reset here leaves nothing in flight (it waits for every consumed SQE
           // first, and the reader is then closed), so the exception in flight is the one the caller should see.
           try {
@@ -391,36 +438,23 @@ class ReaderCore {
           }
         }
       }
-    } quiesce_on_exit{this, std::uncaught_exceptions()};
-    // 0 forces the first turn to fire immediately, so a short read still gets one call before it
-    // returns rather than waiting a full interval that may outlast the whole request.
-    int64_t next_progress_ns = 0;
+    } quiesce_on_exit{this};
     while (true) {
-      // Gated on elapsed time, not on a completion being reaped: reaped completions are this
-      // reader's own I/O finishing, uncorrelated with the device acknowledging a lease (that arrives
-      // through the lease block serve() owns), so a request whose reads finish early but is still
-      // packing would otherwise stop calling progress() before the read returns. Time keeps firing
-      // regardless of which sub-phase the loop is in. The interval is sized well under a typical
-      // request's span (tens of ms, see the plan) so a lease is retired promptly, while staying far
-      // above a single turn (as short as one _mm_pause()) so this never becomes a per-turn mutex take.
-      if (progress) {
-        const int64_t now = now_ns();
-        if (now >= next_progress_ns) {
-          progress();
-          next_progress_ns = now + kProgressIntervalNs;
-        }
-      }
+      // Progress runs every turn: the caller's hook (retire_leases) returns at once when no lane is outstanding, and
+      // gating it on a clock put a clock read on every turn of the hot path (spec M4). Not gated on a completion being
+      // reaped either: those are this reader's own I/O, uncorrelated with the device acknowledging a lease.
+      if constexpr (!std::is_same_v<std::decay_t<Progress>, NoProgress>) progress();
       derived().collect();  // before admit: a bank whose last copy just finished is free for the next batch
       if (!c.failed) admit(abandon);
       if (!c.failed) refill();
       if (c.failed) break;
       const bool ready = has_ready();
-      if (c.pending == 0 && !ready && held_.empty() && c.packing == 0) break;
+      if (c.pending == 0 && !ready && held_empty() && c.packing == 0) break;
       // Submit what was prepared before packing, so storage stays busy while the CPU copies; only
       // block for a completion when there is no complete row to pack. With rows packing on workers the
       // owner cannot be woken from a blocking wait when one finishes, so it polls instead. The
       // withheld completions of the slow-drive fault arrive only once every other row has packed.
-      if (c.pending > 0 || (!ready && c.packing == 0 && !held_.empty())) reap(ready || c.packing > 0);
+      if (c.pending > 0 || (!ready && c.packing == 0 && !held_empty())) reap(ready || c.packing > 0);
       if (c.failed) break;
       // (The hold_until_probe_ms fault keeps direct-mode pieces vetted but unpublished with nothing to wait on.)
       if (!derived().advance() && (c.packing > 0 || c.hold_until != 0)) _mm_pause();
@@ -434,20 +468,22 @@ class ReaderCore {
         clean = clean && rows_busy_[b] == 0 && bank_live_[b] == 0;
       if (!clean || (!c.abandoned && c.next_batch < c.batches)) c.failed = true;
     }
-    if (trace && c.first_seen != 0) {
-      trace->submit = c.submitted;
-      trace->first_cqe = c.first_seen;
-      trace->last_cqe = c.last_seen;
-      trace->submit_to_first_cqe_ns = c.first_seen - c.submitted;
-      trace->first_to_last_cqe_ns = c.last_seen - c.first_seen;
-    } else if (trace) {
-      trace->submit = c.submitted;
-    }
+    on_trace([&](StageRecord& t) {
+      t.submit = c.submitted;
+      if (c.first_seen != 0) {
+        t.first_cqe = c.first_seen;
+        t.last_cqe = c.last_seen;
+        t.submit_to_first_cqe_ns = c.first_seen - c.submitted;
+        t.first_to_last_cqe_ns = c.last_seen - c.first_seen;
+      }
+    });
     if (c.failed) {
       account_unfinished();
       drain(c.pending);
+      quiesce_on_exit.returned = true;
       return 0;
     }
+    quiesce_on_exit.returned = true;
     return c.abandoned && c.next_batch < c.batches ? -1 : 1;
   }
 
@@ -489,13 +525,6 @@ class ReaderCore {
   static constexpr uint8_t kPoisonFill = 0xA5;
 
   static constexpr int32_t kPoisonSlot = 0x7EADBEEF;
-
-  // How often read()'s drain loop may call its optional `progress` callback. Arbitrary; chosen to sit
-  // well under a request's typical span (tens of ms; see docs/superpowers/plans/2026-09-22-ram-miss-
-  // progress-loop.md) so a lease is retired promptly, and far above one loop turn (a bare _mm_pause())
-  // so the callback's own cost (a mutex and a walk over kDemandRecords, on the caller's side) cannot
-  // dominate the loop.
-  static constexpr int64_t kProgressIntervalNs = 200000;  // 200 us
 
   // Packing: handed to a packing worker, which owns the copy until the owner sees its job done.
   enum class RowState : uint8_t { Free, Reading, Ready, Packing };
@@ -556,12 +585,45 @@ class ReaderCore {
 
   using Completion = ReadCompletion;
 
+  // The reader's diagnostic counters, over its life: metrics (InstrBuild only). The `c.first_seen`, `c.last_seen`
+  // and `c.submitted` Call fields stay plain in both builds: only the trace sets them, and they cost a store, not a
+  // branch.
+  struct ReaderMetrics {
+    int64_t cqes = 0;              // completions reaped
+    int64_t stale_cqes = 0;        // completions that named no live descriptor
+    int64_t generation_wraps = 0;  // generation counter wraps
+    int64_t cut_reads = 0;         // reads planned as more than one cut run (first plans)
+    int64_t gap_cuts = 0;          // runs a boundary gap opened (first plans)
+    int64_t fixed_cuts = 0;        // reads prepared as more than one leg (first attempts)
+    int64_t fanout_sqes = 0;       // the SQEs those reads issued (first attempts)
+    int64_t publish_refused = 0;   // publish attempts a readiness word refused
+  };
+  struct NoReaderMetrics {};
+  // Test-only fault state (set_fault, set_sqe_log): InstrBuild only, so ProdBuild's request path tests none of it.
+  struct FaultState {
+    ReadFault fault{};
+    bool part_fired = false;
+    int64_t retired = 0;          // extents retired (the stale_cqe_call fault counts them)
+    Completion stale{0, 0};
+    uint32_t stale_index = 0;
+    bool stale_waiting = false;   // a retired completion is held until its descriptor is recycled
+    bool stale_armed = false;     // ... and has been: deliver it with the next reap
+    int64_t publishes = 0;        // pieces published over the reader's life (the publish_twice fault counts them)
+    std::vector<SqeRecord>* sqe_log = nullptr;  // set_sqe_log
+    std::vector<Completion> held;  // completions withheld from the reader (hold_ordinal)
+  };
+  struct NoFaultState {};
+
+  // The stage trace (spec M9): ProdBuild's Call carries no record pointer at all, so no site can test or stamp one.
+  struct NoTrace {};
+  using TracePtr = std::conditional_t<Build::kMetrics, StageRecord*, NoTrace>;
+
   // One read() call's state. Everything the pipeline mutates lives here or in the members below, all
   // sized at open(); read() allocates nothing.
   struct Call {
     int64_t layer = 0;
-    const std::vector<int32_t>* experts = nullptr;
-    const std::vector<int64_t>* slots = nullptr;
+    std::span<const int32_t> experts;
+    std::span<const int64_t> slots;
     size_t step = 1;
     size_t total = 0;
     size_t batches = 0;
@@ -572,8 +634,10 @@ class ReaderCore {
     unsigned pending = 0;  // SQEs prepared and not yet reaped
     size_t queue_head = 0;
     size_t queue_count = 0;
-    StageRecord* trace = nullptr;
+    [[no_unique_address]] TracePtr trace{};  // ProdBuild: an empty member, so no site can test or stamp it
     std::vector<uint8_t>* packed = nullptr;
+    void (*progress)(void*) = nullptr;  // read()'s progress hook, also run as each row finishes (null: NoProgress)
+    void* progress_closure = nullptr;
     bool failed = false;
     bool abandoned = false;
     bool stalled = false;  // a batch is waiting for its bank to retire
@@ -585,6 +649,52 @@ class ReaderCore {
     size_t published = 0;    // piece streaming: pieces published so far (the last_publish_delay_ns fault)
     int64_t hold_until = 0;  // piece streaming: when the hold_until_probe_ms fault gives up (0: no hold)
   };
+
+  // Runs `f` on this read's stage record, if it has one. ProdBuild compiles every call to nothing.
+  template <class F>
+  void on_trace(F&& f) {
+    if constexpr (Build::kMetrics) {
+      if (c_.trace != nullptr) f(*c_.trace);  // on_trace: the one null test of the record
+    }
+  }
+
+  // A trace stamp of this read (0 without a record); ProdBuild's is the constant 0, no branch and no clock.
+  int64_t trace_stamp() {
+    if constexpr (Build::kMetrics) {
+      return stamp(c_.trace);  // trace_stamp: the one stamp of the record
+    } else {
+      return 0;
+    }
+  }
+
+  // A diagnostic counter's value: 0 in ProdBuild, which keeps none.
+  int64_t metric(int64_t ReaderMetrics::*field) const {
+    if constexpr (Build::kMetrics) {
+      return metrics_.*field;
+    } else {
+      (void)field;
+      return 0;
+    }
+  }
+
+  // Adds to a diagnostic counter; ProdBuild compiles it to nothing.
+  void add_metric(int64_t ReaderMetrics::*field, int64_t n = 1) {
+    if constexpr (Build::kMetrics) {
+      metrics_.*field += n;
+    } else {
+      (void)field;
+      (void)n;
+    }
+  }
+
+  // No completion is withheld (the hold_ordinal fault): always true in ProdBuild.
+  bool held_empty() const {
+    if constexpr (Build::kFaults) {
+      return faults_.held.empty();
+    } else {
+      return true;
+    }
+  }
 
   // How many reads may be outstanding at once. Credit-based preparation in refill() means
   // this bounds concurrency, not batch size: a batch larger than the ring waits for credit
@@ -602,7 +712,7 @@ class ReaderCore {
   uint32_t next_generation() {
     if (++generation_ == 0) {  // 0 means retired: skip it when the counter wraps
       ++generation_;
-      ++generation_wraps_;
+      add_metric(&ReaderMetrics::generation_wraps);
     }
     return generation_;
   }
@@ -661,7 +771,7 @@ class ReaderCore {
     legs_.assign(extents * leg_stride_, Leg{});
     queue_.assign(extents, 0);
     completions_.reserve(extents + 1);
-    held_.reserve(extents);
+    if constexpr (Build::kFaults) faults_.held.reserve(extents);
     again_.reserve(extents);
     sub_reads_.assign(piece_stream_ ? extents : 0, Read{});
     // Each descriptor's iovecs (max_iovecs), rebuilt from its `done` whenever it is prepared (destination). Direct
@@ -761,9 +871,11 @@ class ReaderCore {
         throw std::logic_error(error_prefix<Layout>() + "a read needs more legs than open() sized");
       count = runs[run_count - 1].first + runs[run_count - 1].count;
       std::copy(iov_scratch_.begin(), iov_scratch_.begin() + count, iov);
-      if (run_count > 1) ++cut_reads_;
-      for (unsigned r = 0; r < run_count; ++r)
-        gap_cuts_ += runs[r].gap ? 1 : 0;
+      if constexpr (Build::kMetrics) {
+        if (run_count > 1) ++metrics_.cut_reads;
+        for (unsigned r = 0; r < run_count; ++r)
+          metrics_.gap_cuts += runs[r].gap ? 1 : 0;
+      }
     }
     unsigned n = 0;
     int64_t start = 0;
@@ -788,9 +900,11 @@ class ReaderCore {
     if constexpr (requires(Reader& reader) { reader.note_fanout(1u); }) {
       if (fixed_reads()) io_.note_fanout(n);
     }
-    if (fixed_reads() && n > 1) {
-      ++fixed_cuts_;
-      fanout_sqes_ += n;
+    if constexpr (Build::kMetrics) {
+      if (fixed_reads() && n > 1) {
+        ++metrics_.fixed_cuts;
+        metrics_.fanout_sqes += n;
+      }
     }
     for (unsigned l = 0; l < n; ++l)
       if (legs[l].expected == 0) legs[l].state = LegState::Done;
@@ -817,7 +931,8 @@ class ReaderCore {
 
   // Admit batches while a bank is free. The abandon check comes first: once it says stop, no further
   // work is submitted, but what was already submitted is reaped by the loop.
-  void admit(const std::function<bool(size_t)>& abandon) {
+  template <class Abandon>
+  void admit(Abandon& abandon) {
     Call& c = c_;
     while (!c.failed && !c.abandoned && c.next_batch < c.batches) {
       if (abandon(c.next_batch)) {
@@ -829,7 +944,7 @@ class ReaderCore {
       const size_t bank = c.next_batch % static_cast<size_t>(kBanks);
       if (rows_busy_[bank] != 0) {
         // The bank still holds rows that have not packed: the kernel must not write it again.
-        if (!c.stalled && c.trace) ++c.trace->bank_stalls;
+        if (!c.stalled) on_trace([&](StageRecord& t) { ++t.bank_stalls; });
         c.stalled = true;
         return;
       }
@@ -858,7 +973,7 @@ class ReaderCore {
     }
     // Validate the whole batch before touching any state, so a bad row leaves nothing to undo.
     for (size_t i = 0; i < count; ++i) {
-      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[first + i]);
+      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + c.experts[first + i]);
       const size_t base = row_index * parts;
       // The bytes the expert needs are [start, start + need_end) of its aligned superset; they
       // must all lie inside the file. What an extent's page-aligned tail overruns past end of
@@ -891,19 +1006,23 @@ class ReaderCore {
       // The slot is Free (checked above), so its piece runs may be written before the batch is known good.
       if (piece_stream_ && !plan_pieces(bank * kBounceRows + i, row_index, geometry_[i])) return false;
     }
-    const int64_t admitted = stamp(c.trace);
-    if (c.trace) ++c.trace->batches;
+    const int64_t admitted = trace_stamp();
+    on_trace([&](StageRecord& t) { ++t.batches; });
     for (size_t i = 0; i < count; ++i) {
       const size_t ordinal = first + i;
-      if (c.trace && ordinal < static_cast<size_t>(kTraceRows)) c.trace->row_admit[ordinal] = admitted;
+      on_trace([&](StageRecord& t) {
+        if (ordinal < static_cast<size_t>(kTraceRows)) t.row_admit[ordinal] = admitted;
+      });
       const size_t slot = bank * kBounceRows + i;
-      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + (*c.experts)[ordinal]);
+      const size_t row_index = static_cast<size_t>(c.layer * t_.experts + c.experts[ordinal]);
       const size_t base = row_index * parts;
       rows_[slot] = BounceRow{RowState::Reading, ordinal, 0};
       rows_[slot].needed = t_.starts[row_index] + t_.need_end;
       ++rows_busy_[bank];
       ++c.reading_rows;
-      if (fault_.poison) derived().poison_slot(slot, kPoisonFill);
+      if constexpr (Build::kFaults) {
+        if (faults_.fault.poison) derived().poison_slot(slot, kPoisonFill);
+      }
       if (piece_stream_) {
         queue_sub_reads(slot, ordinal, geometry_[i], admitted);
         continue;
@@ -922,26 +1041,27 @@ class ReaderCore {
         d.expected = std::min(extent->length, t_.file_sizes[extent->file] - extent->offset);
         d.generation = next_generation();
         d.slot = static_cast<int32_t>(slot);
-        if (stale_waiting_ && index == stale_index_) stale_armed_ = true;  // the fault's descriptor was just recycled
+        arm_stale(index);
         ++rows_[slot].extents_left;
         ++bank_live_[bank];
         queue_push(index);
-        if (c.trace) {
+        on_trace([&](StageRecord& t) {
           const size_t drive = file_drive_[extent->file];
-          c.trace->drive_dev[drive] = drive_dev_[drive];
-          c.trace->drive_extents[drive] += 1;
-          const int64_t trace_slot = c.trace->extents++;
+          t.drive_dev[drive] = drive_dev_[drive];
+          t.drive_extents[drive] += 1;
+          const int64_t trace_slot = t.extents++;
           if (trace_slot < kTraceExtents) {
-            c.trace->extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | static_cast<int64_t>(p);
+            t.extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | static_cast<int64_t>(p);
             d.trace_slot = static_cast<int32_t>(trace_slot);
           } else {
-            ++c.trace->extents_untraced;
+            ++t.extents_untraced;
           }
-        }
+        });
       }
     }
-    if (c.trace)
-      c.trace->rows_reading_max = std::max<int64_t>(c.trace->rows_reading_max, static_cast<int64_t>(c.reading_rows));
+    on_trace([&](StageRecord& t) {
+      t.rows_reading_max = std::max<int64_t>(t.rows_reading_max, static_cast<int64_t>(c.reading_rows));
+    });
     return true;
   }
 
@@ -962,7 +1082,6 @@ class ReaderCore {
   // index is unique whatever the row's cut. Credit is untouched: refill() takes it per SQE, so a sub-read costs one
   // like a part did. Pieces with no bytes (past the row's sub-reads) are vetted here, at admission.
   void queue_sub_reads(size_t slot, size_t ordinal, const RowGeometry& g, int64_t admitted) {
-    Call& c = c_;
     const size_t parts = static_cast<size_t>(t_.parts);
     const size_t bank = slot / kBounceRows;
     BounceRow& r = rows_[slot];
@@ -982,24 +1101,24 @@ class ReaderCore {
       d.generation = next_generation();
       d.slot = static_cast<int32_t>(slot);
       d.sub = s;
-      if (stale_waiting_ && index == stale_index_) stale_armed_ = true;  // the fault's descriptor was just recycled
+      arm_stale(index);
       r.sub_dest[s] = extent->dest;
       ++r.extents_left;
       ++bank_live_[bank];
       queue_push(index);
-      if (c.trace) {
+      on_trace([&](StageRecord& t) {
         const size_t drive = file_drive_[extent->file];
-        c.trace->drive_dev[drive] = drive_dev_[drive];
-        c.trace->drive_extents[drive] += 1;
-        const int64_t trace_slot = c.trace->extents++;
+        t.drive_dev[drive] = drive_dev_[drive];
+        t.drive_extents[drive] += 1;
+        const int64_t trace_slot = t.extents++;
         if (trace_slot < kTraceExtents) {
-          c.trace->extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) |
+          t.extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) |
                                            static_cast<int64_t>(g.part[s]);
           d.trace_slot = static_cast<int32_t>(trace_slot);
         } else {
-          ++c.trace->extents_untraced;
+          ++t.extents_untraced;
         }
-      }
+      });
     }
     vet_pieces(slot, admitted);
   }
@@ -1011,7 +1130,9 @@ class ReaderCore {
     r.landed |= static_cast<uint8_t>(1u << sub);
     r.sub_done[sub] = done;
     const int64_t seq = ++c.events;
-    if (c.trace && r.ordinal < static_cast<size_t>(kTraceRows)) c.trace->sub_land_seq[r.ordinal][sub] = seq;
+    on_trace([&](StageRecord& t) {
+      if (r.ordinal < static_cast<size_t>(kTraceRows)) t.sub_land_seq[r.ordinal][sub] = seq;
+    });
     vet_pieces(slot, returned);
   }
 
@@ -1029,13 +1150,13 @@ class ReaderCore {
       }
       r.vetted |= bit;
       const int64_t seq = ++c.events;
-      if (c.trace) {
-        ++c.trace->pieces_vetted;
+      on_trace([&](StageRecord& t) {
+        ++t.pieces_vetted;
         if (r.ordinal < static_cast<size_t>(kTraceRows)) {
-          c.trace->piece_cqe[r.ordinal][j] = when;
-          c.trace->piece_seq[r.ordinal][j] = seq;
+          t.piece_cqe[r.ordinal][j] = when;
+          t.piece_seq[r.ordinal][j] = seq;
         }
-      }
+      });
     }
   }
 
@@ -1116,29 +1237,31 @@ class ReaderCore {
         g.state = LegState::Inflight;
         ++d.legs_inflight;
         ++c.pending;
-        if (sqe_log_) {
-          sqe_log_->push_back(
-              SqeRecord{
-                  d.read->file,
-                  d.read->offset + g.start + g.done,
-                  remaining,
-                  static_cast<int64_t>(d.slot) * t_.slot_bytes + d.read->dest + g.start + g.done});
-        }
-        if (c.trace) {
-          c.trace->submitted_bytes += remaining;
-          if (g.done > 0 || d.retries > 0) c.trace->retried_bytes += remaining;
-          c.trace->pending_max = std::max<int64_t>(c.trace->pending_max, static_cast<int64_t>(c.pending));
-          if (d.trace_slot >= 0) {
-            if (fresh) {
-              if (c.trace->extent_submit[d.trace_slot] == 0) {
-                if (prepared == 0) prepared = stamp(c.trace);
-                c.trace->extent_submit[d.trace_slot] = prepared;
-              }
-            } else {
-              ++c.trace->extent_attempts[d.trace_slot];
-            }
+        if constexpr (Build::kFaults) {
+          if (faults_.sqe_log) {
+            faults_.sqe_log->push_back(
+                SqeRecord{
+                    d.read->file,
+                    d.read->offset + g.start + g.done,
+                    remaining,
+                    static_cast<int64_t>(d.slot) * t_.slot_bytes + d.read->dest + g.start + g.done});
           }
         }
+        on_trace([&](StageRecord& t) {
+          t.submitted_bytes += remaining;
+          if (g.done > 0 || d.retries > 0) t.retried_bytes += remaining;
+          t.pending_max = std::max<int64_t>(t.pending_max, static_cast<int64_t>(c.pending));
+          if (d.trace_slot >= 0) {
+            if (fresh) {
+              if (t.extent_submit[d.trace_slot] == 0) {
+                if (prepared == 0) prepared = trace_stamp();
+                t.extent_submit[d.trace_slot] = prepared;
+              }
+            } else {
+              ++t.extent_attempts[d.trace_slot];
+            }
+          }
+        });
       }
     }
   }
@@ -1152,31 +1275,22 @@ class ReaderCore {
   }
 
   // Submit, wait for a completion only when `ready` is false, then drain the CQ before processing
-  // it so the CQ frees early and a fault can reorder the completions.
+  // it so the CQ frees early and a fault can reorder the completions. The fault branches exist in InstrBuild only.
   void reap(bool ready) {
     Call& c = c_;
-    if (!ready && c.pending == 0 && !held_.empty()) {
-      // Fault: every other row is done, so the withheld completions arrive now.
-      completions_.assign(held_.begin(), held_.end());
-      held_.clear();
-      again_.clear();
-      const int64_t released = stamp(c.trace);
-      for (size_t k = 0; k < completions_.size(); ++k)
-        process(completions_[k], released);
-      if (c.trace) {
-        if (c.first_seen == 0) c.first_seen = released;
-        c.last_seen = released;
+    if constexpr (Build::kFaults) {
+      if (!ready && c.pending == 0 && !faults_.held.empty()) {
+        release_held();
+        return;
       }
-      if (!c.failed) {
-        for (uint32_t index : again_)
-          queue_push(index);
-      }
-      return;
     }
-    if (c.trace && c.submitted == 0) c.submitted = stamp(c.trace);
-    // Fault: reversing only reorders one reaped batch, so wait for every read in flight; otherwise whether
-    // anything is reversed depends on how the device happened to batch its completions.
-    const unsigned wait_nr = fault_.reverse_cqes && c.pending > 0 ? c.pending : (ready ? 0u : 1u);
+    on_trace([&](StageRecord& t) { if (c.submitted == 0) c.submitted = trace_stamp(); });
+    unsigned wait_nr = ready ? 0u : 1u;
+    if constexpr (Build::kFaults) {
+      // Fault: reversing only reorders one reaped batch, so wait for every read in flight; otherwise whether
+      // anything is reversed depends on how the device happened to batch its completions.
+      if (faults_.fault.reverse_cqes && c.pending > 0) wait_nr = c.pending;
+    }
     const int rc = submit(wait_nr);
     if (rc < 0) {
       // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again
@@ -1189,24 +1303,65 @@ class ReaderCore {
     } else {
       c.soft_errors = 0;
     }
-    const int64_t returned = stamp(c.trace);
+    const int64_t returned = trace_stamp();
     completions_.clear();
     again_.clear();
     const unsigned seen = io_.reap(completions_);
     c.pending -= seen;
-    if (fault_.reverse_cqes) std::reverse(completions_.begin(), completions_.end());
-    if (fault_.hold_ordinal >= 0) {
+    if constexpr (Build::kFaults) apply_reap_faults();
+    for (size_t k = 0; k < completions_.size(); ++k)
+      process(completions_[k], returned);
+    if (seen > 0) {
+      on_trace([&](StageRecord&) {
+        if (c.first_seen == 0) c.first_seen = returned;
+        c.last_seen = returned;
+      });
+    }
+    if (c.failed) return;
+    for (uint32_t index : again_)
+      queue_push(index);
+  }
+
+  // Fault (hold_ordinal): every other row is done, so the withheld completions arrive now. InstrBuild only.
+  void release_held()
+    requires(Build::kFaults)
+  {
+    Call& c = c_;
+    completions_.assign(faults_.held.begin(), faults_.held.end());
+    faults_.held.clear();
+    again_.clear();
+    const int64_t released = trace_stamp();
+    for (size_t k = 0; k < completions_.size(); ++k)
+      process(completions_[k], released);
+    on_trace([&](StageRecord&) {
+      if (c.first_seen == 0) c.first_seen = released;
+      c.last_seen = released;
+    });
+    if (!c.failed) {
+      for (uint32_t index : again_)
+        queue_push(index);
+    }
+  }
+
+  // The reap faults on one reaped batch, before it is processed: reverse_cqes, hold_ordinal and the stale
+  // redelivery. InstrBuild only.
+  void apply_reap_faults()
+    requires(Build::kFaults)
+  {
+    const ReadFault& fault = faults_.fault;
+    if (fault.reverse_cqes) std::reverse(completions_.begin(), completions_.end());
+    if (fault.hold_ordinal >= 0) {
       size_t kept = 0;
       for (size_t k = 0; k < completions_.size(); ++k) {
         const uint32_t index = tag_index(completions_[k].data);
         const bool live = index < descs_.size() && descs_[index].generation != 0 &&
                           descs_[index].generation == tag_generation(completions_[k].data);
         if (live &&
-            (fault_.hold_rest ? static_cast<int64_t>(rows_[descs_[index].slot].ordinal) >= fault_.hold_ordinal
-                              : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault_.hold_ordinal) &&
-            (fault_.sub < 0 || fault_matches_sub(index)) &&
-            (fault_.leg < 0 || static_cast<int64_t>(tag_leg(completions_[k].data)) == fault_.leg)) {
-          held_.push_back(completions_[k]);
+            (fault.hold_rest ? static_cast<int64_t>(rows_[descs_[index].slot].ordinal) >= fault.hold_ordinal
+                             : static_cast<int64_t>(rows_[descs_[index].slot].ordinal) == fault.hold_ordinal) &&
+            (fault.sub < 0 || fault_matches_sub(index)) &&
+            (fault.leg < 0 || static_cast<int64_t>(tag_leg(completions_[k].data)) == fault.leg)) {
+          faults_.held.push_back(completions_[k]);
         } else {
           completions_[kept++] = completions_[k];
         }
@@ -1216,19 +1371,20 @@ class ReaderCore {
     // Fault: a completion of an extent that retired earlier arrives after its descriptor was recycled.
     // It names a dead generation, so it must fail the read and touch nothing; without the generation
     // it would complete whichever extent now lives in that descriptor, publishing bytes never read.
-    if (stale_armed_) {
-      completions_.push_back(stale_);
-      stale_armed_ = stale_waiting_ = false;
+    if (faults_.stale_armed) {
+      completions_.push_back(faults_.stale);
+      faults_.stale_armed = faults_.stale_waiting = false;
     }
-    for (size_t k = 0; k < completions_.size(); ++k)
-      process(completions_[k], returned);
-    if (c.trace && seen > 0) {
-      if (c.first_seen == 0) c.first_seen = returned;
-      c.last_seen = returned;
+  }
+
+  // Fault (stale_cqe_call): descriptor `index` was just recycled; if the held completion named it, deliver it with
+  // the next reap. ProdBuild: nothing.
+  void arm_stale(uint32_t index) {
+    if constexpr (Build::kFaults) {
+      if (faults_.stale_waiting && index == faults_.stale_index) faults_.stale_armed = true;
+    } else {
+      (void)index;
     }
-    if (c.failed) return;
-    for (uint32_t index : again_)
-      queue_push(index);
   }
 
   void process(const Completion& completion, int64_t returned) {
@@ -1240,7 +1396,7 @@ class ReaderCore {
     // have, or a leg already reaped.
     if (index >= descs_.size() || generation == 0 || descs_[index].generation != generation ||
         l >= descs_[index].legs || legs_[static_cast<size_t>(index) * leg_stride_ + l].state != LegState::Inflight) {
-      ++stale_cqes_;
+      add_metric(&ReaderMetrics::stale_cqes);
       c.failed = true;
       return;
     }
@@ -1248,23 +1404,26 @@ class ReaderCore {
     Leg& g = legs_[static_cast<size_t>(index) * leg_stride_ + l];
     g.state = LegState::Idle;
     --d.legs_inflight;
-    // A fault's part is the descriptor's part whatever the sub-read count (subs_ is 1 with the flag off).
-    const size_t part = (index / subs_) % static_cast<size_t>(t_.parts);
-    const bool leg_matches = fault_.leg < 0 || static_cast<int64_t>(l) == fault_.leg;
     int res = completion.res;
     bool eof = false;  // fault (short_is_eof): this completion ends the sub-read
-    ++cqes_;
-    if (fault_.cqe_error != 0 && cqes_ == fault_.cqe_call && leg_matches) res = -fault_.cqe_error;
-    if (fault_.part >= 0 && !part_fired_ && static_cast<int64_t>(part) == fault_.part && leg_matches &&
-        (fault_.sub < 0 || static_cast<int64_t>(index % subs_) == fault_.sub) &&
-        (fault_.ordinal < 0 || static_cast<int64_t>(rows_[d.slot].ordinal) == fault_.ordinal)) {
-      if (fault_.part_error != 0) {
-        part_fired_ = true;
-        res = -fault_.part_error;
-      } else if (fault_.part_short > 0 && res > fault_.part_short) {
-        part_fired_ = true;
-        res = static_cast<int>(fault_.part_short);
-        eof = fault_.short_is_eof;
+    add_metric(&ReaderMetrics::cqes);
+    if constexpr (Build::kFaults) {
+      const ReadFault& fault = faults_.fault;
+      // A fault's part is the descriptor's part whatever the sub-read count (subs_ is 1 with the flag off).
+      const size_t part = (index / subs_) % static_cast<size_t>(t_.parts);
+      const bool leg_matches = fault.leg < 0 || static_cast<int64_t>(l) == fault.leg;
+      if (fault.cqe_error != 0 && metric(&ReaderMetrics::cqes) == fault.cqe_call && leg_matches) res = -fault.cqe_error;
+      if (fault.part >= 0 && !faults_.part_fired && static_cast<int64_t>(part) == fault.part && leg_matches &&
+          (fault.sub < 0 || static_cast<int64_t>(index % subs_) == fault.sub) &&
+          (fault.ordinal < 0 || static_cast<int64_t>(rows_[d.slot].ordinal) == fault.ordinal)) {
+        if (fault.part_error != 0) {
+          faults_.part_fired = true;
+          res = -fault.part_error;
+        } else if (fault.part_short > 0 && res > fault.part_short) {
+          faults_.part_fired = true;
+          res = static_cast<int>(fault.part_short);
+          eof = fault.short_is_eof;
+        }
       }
     }
     // The leg, not the row: two parts of one row, and two legs of one read, complete independently.
@@ -1302,10 +1461,13 @@ class ReaderCore {
     retire(index, completion, returned);
   }
 
-  // Fault (hold_ordinal with sub): the completion is of sub-read fault_.sub of part fault_.part (any part at -1).
-  bool fault_matches_sub(uint32_t index) const {
+  // Fault (hold_ordinal with sub): the completion is of sub-read fault.sub of part fault.part (any part at -1).
+  bool fault_matches_sub(uint32_t index) const
+    requires(Build::kFaults)
+  {
+    const ReadFault& fault = faults_.fault;
     const int64_t part = static_cast<int64_t>((index / subs_) % static_cast<size_t>(t_.parts));
-    return static_cast<int64_t>(index % subs_) == fault_.sub && (fault_.part < 0 || part == fault_.part);
+    return static_cast<int64_t>(index % subs_) == fault.sub && (fault.part < 0 || part == fault.part);
   }
 
   // The extent's last completion: account it, retire the descriptor, and when it was its row's last
@@ -1322,23 +1484,29 @@ class ReaderCore {
       delivered += legs[k].done;
       if (legs[k].done < legs[k].bytes) break;
     }
-    if (c.trace) {
+    on_trace([&](StageRecord& t) {
       const size_t drive = file_drive_[d.read->file];
-      c.trace->drive_bytes[drive] += d.done;
-      c.trace->bytes += d.done;
-      if (d.trace_slot >= 0) c.trace->extent_cqe[d.trace_slot] = returned;
-    }
+      t.drive_bytes[drive] += d.done;
+      t.bytes += d.done;
+      if (d.trace_slot >= 0) t.extent_cqe[d.trace_slot] = returned;
+    });
     const size_t slot = static_cast<size_t>(d.slot);
     rows_[slot].filled += delivered;
     if (piece_stream_) land_sub_read(slot, d.sub, delivered, returned);
     --bank_live_[slot / kBounceRows];
-    if (fault_.stale_cqe_call > 0 && ++retired_ == fault_.stale_cqe_call) {
-      stale_ = completion;
-      stale_index_ = index;
-      stale_waiting_ = true;
+    if constexpr (Build::kFaults) {
+      if (faults_.fault.stale_cqe_call > 0 && ++faults_.retired == faults_.fault.stale_cqe_call) {
+        faults_.stale = completion;
+        faults_.stale_index = index;
+        faults_.stale_waiting = true;
+      }
+    } else {
+      (void)completion;
     }
     d = ExtentDesc{};
-    if (fault_.poison) d.slot = kPoisonSlot;
+    if constexpr (Build::kFaults) {
+      if (faults_.fault.poison) d.slot = kPoisonSlot;
+    }
     if (--rows_[slot].extents_left == 0) {
       rows_[slot].state = RowState::Ready;
       --c.reading_rows;
@@ -1379,37 +1547,45 @@ class ReaderCore {
     Call& c = c_;
     BounceRow& r = rows_[slot];
     const uint8_t bit = static_cast<uint8_t>(1u << j);
-    const bool twice = ++publishes_ == fault_.publish_twice;  // fault: publish_twice is 0 when off
-    if (++c.published == c.total * kPieces && fault_.last_publish_delay_ns > 0) {
-      std::this_thread::sleep_for(std::chrono::nanoseconds(fault_.last_publish_delay_ns));
+    bool twice = false;
+    if constexpr (Build::kFaults) {
+      twice = ++faults_.publishes == faults_.fault.publish_twice;  // fault: publish_twice is 0 when off
+      if (++c.published == c.total * kPieces && faults_.fault.last_publish_delay_ns > 0) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(faults_.fault.last_publish_delay_ns));
+      }
     }
     if (c.publish != nullptr && c.publish->rows != nullptr) {
       const PieceTarget& target = c.publish->rows[r.ordinal];
       for (int w = 0; w < target.count; ++w) {
         for (int attempt = 0; attempt < (twice ? 2 : 1); ++attempt) {
           if (publish_piece(target.words[w], c.publish->generation, bit)) continue;
-          ++publish_refused_;
-          if (c.trace) ++c.trace->piece_publish_refused;
+          add_metric(&ReaderMetrics::publish_refused);
+          on_trace([&](StageRecord& t) { ++t.piece_publish_refused; });
           c.failed = true;
         }
       }
     }
     const int64_t seq = ++c.events;
-    if (c.trace) {
-      ++c.trace->pieces_published;
-      if ((r.published >> (j + 1)) != 0) ++c.trace->pieces_out_of_order;  // a higher-numbered piece went first
-      if (r.ordinal < static_cast<size_t>(kTraceRows)) c.trace->piece_publish[r.ordinal][j] = seq;
-    }
+    on_trace([&](StageRecord& t) {
+      ++t.pieces_published;
+      if ((r.published >> (j + 1)) != 0) ++t.pieces_out_of_order;  // a higher-numbered piece went first
+      if (r.ordinal < static_cast<size_t>(kTraceRows)) t.piece_publish[r.ordinal][j] = seq;
+    });
     r.published |= bit;
   }
 
   // The hold_until_probe_ms fault: true while the request's StreamProbe does not yet read tagged(1, generation) and
   // the hold has not timed out. A failing read is never held: quiesce() must collect every piece.
+  // ProdBuild: never (the fault does not exist there).
   bool holding_for_probe() const {
-    const Call& c = c_;
-    if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;
-    const uint64_t want = (uint64_t{1} << 56) | (c.publish->generation & ((uint64_t{1} << 56) - 1));
-    return __atomic_load_n(c.publish->probe, __ATOMIC_ACQUIRE) != want;
+    if constexpr (Build::kFaults) {
+      const Call& c = c_;
+      if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;
+      const uint64_t want = (uint64_t{1} << 56) | (c.publish->generation & ((uint64_t{1} << 56) - 1));
+      return __atomic_load_n(c.publish->probe, __ATOMIC_ACQUIRE) != want;
+    } else {
+      return false;
+    }
   }
 
   // The row is packed whole: account it, flag it and free its slot. Packing is the last reference the bank
@@ -1417,38 +1593,41 @@ class ReaderCore {
   void finish_row(size_t best, int64_t start, int64_t end) {
     Call& c = c_;
     const size_t ordinal = rows_[best].ordinal;
-    if (c.trace) {
+    on_trace([&](StageRecord& t) {
       if (ordinal < static_cast<size_t>(kTraceRows)) {
-        c.trace->row_pack_start[ordinal] = start;
-        c.trace->row_pack_end[ordinal] = end;
+        t.row_pack_start[ordinal] = start;
+        t.row_pack_end[ordinal] = end;
       } else {
-        ++c.trace->rows_untraced;
+        ++t.rows_untraced;
       }
       for (const Segment& segment : t_.segments)
-        c.trace->useful_bytes += segment.bytes;
+        t.useful_bytes += segment.bytes;
       // Rows pack in completion order and may overlap, so the first to finish is not always the first to start.
-      if (c.trace->pack_start == 0 || start < c.trace->pack_start) c.trace->pack_start = start;
-      c.trace->pack_end = std::max(c.trace->pack_end, end);
-      c.trace->pack_ns += end - start;
-    }
+      if (t.pack_start == 0 || start < t.pack_start) t.pack_start = start;
+      t.pack_end = std::max(t.pack_end, end);
+      t.pack_ns += end - start;
+    });
     if (c.packed) (*c.packed)[ordinal] = 1;
     derived().after_finish(best);
     rows_[best] = BounceRow{};
     --rows_busy_[best / kBounceRows];
+    // Last, with the reader's bookkeeping settled: a fill publishes this row's landing now, not after the turn's last
+    // row (the landed-prefix defect, flake-bisect.md).
+    if (c.progress != nullptr) c.progress(c.progress_closure);
   }
 
   // A failed call: what every extent still live was owed but never returned is cancelled. Extents that
   // retired were accounted when they did.
   void account_unfinished() {
-    Call& c = c_;
-    if (!c.trace) return;
-    for (const ExtentDesc& d : descs_) {
-      if (d.generation == 0) continue;
-      const size_t drive = file_drive_[d.read->file];
-      c.trace->drive_bytes[drive] += d.done;
-      c.trace->bytes += d.done;
-      c.trace->cancelled_bytes += std::max<int64_t>(0, d.expected - d.done);
-    }
+    on_trace([&](StageRecord& t) {
+      for (const ExtentDesc& d : descs_) {
+        if (d.generation == 0) continue;
+        const size_t drive = file_drive_[d.read->file];
+        t.drive_bytes[drive] += d.done;
+        t.bytes += d.done;
+        t.cancelled_bytes += std::max<int64_t>(0, d.expected - d.done);
+      }
+    });
   }
 
   // Submit the prepared SQEs, waiting for `wait_nr` completions (0: do not block).
@@ -1471,20 +1650,12 @@ class ReaderCore {
   std::vector<int64_t> devs_;        // st_dev of each distinct filesystem, in first-opened order
   std::vector<uint8_t> file_drive_;  // per file: its drive slot in a StageRecord
   int64_t drive_dev_[kMaxDrives] = {};
-  ReadFault fault_{};
-  int64_t cqes_ = 0;
-  bool part_fired_ = false;
   // Pipeline state (see the class comment).
   Call c_;
   std::vector<ExtentDesc> descs_;
   std::vector<uint32_t> queue_;  // ring of descriptors waiting for credit; each appears at most once
   std::vector<Completion> completions_;
   std::vector<Leg> legs_;  // leg_stride_ per descriptor (size_extents)
-  int64_t fixed_cuts_ = 0;   // reads prepared as more than one leg (first attempts), over the reader's life
-  int64_t fanout_sqes_ = 0;  // the SQEs those reads issued (first attempts)
-  int64_t cut_reads_ = 0;    // reads planned as more than one cut run (first plans)
-  int64_t gap_cuts_ = 0;     // runs a boundary gap opened (first plans)
-  std::vector<Completion> held_;  // fault: completions withheld from the reader (hold_ordinal)
   std::vector<uint32_t> again_;
   BounceRow rows_[kBounceSlots];
   // Test-only owner-pinning scaffold (set_owner_core; -1 by default, meaning "no pin"). `unpinned_affinity_`
@@ -1519,19 +1690,16 @@ class ReaderCore {
   std::vector<PieceRun> piece_runs_;
   std::vector<iovec> iovecs_;  // direct mode: segments.size() per descriptor (size_extents)
   RowGeometry geometry_[kBounceRows];
-  std::vector<SqeRecord>* sqe_log_ = nullptr;  // test only (set_sqe_log)
-  int64_t publishes_ = 0;          // pieces published over the reader's life (the publish_twice fault counts them)
-  int64_t publish_refused_ = 0;    // publish attempts a readiness word refused
   size_t rows_busy_[kBanks] = {};  // rows not yet packed, per bank: the packing references
   size_t bank_live_[kBanks] = {};  // extents not yet retired, per bank: the I/O references
   uint32_t generation_ = 0;
-  int64_t generation_wraps_ = 0;
-  int64_t stale_cqes_ = 0;
-  int64_t retired_ = 0;
-  Completion stale_{0, 0};
-  uint32_t stale_index_ = 0;
-  bool stale_waiting_ = false;  // a retired completion is held until its descriptor is recycled
-  bool stale_armed_ = false;    // ... and has been: deliver it with the next reap
+  // The diagnostic counters (ReaderMetrics) and the test-only fault state (FaultState): see their types above.
+  [[no_unique_address]] std::conditional_t<Build::kMetrics, ReaderMetrics, NoReaderMetrics> metrics_;
+  [[no_unique_address]] std::conditional_t<Build::kFaults, FaultState, NoFaultState> faults_;
+  // The type-system half of the prod proof: nm cannot see state whose names are inlined away, so ProdBuild's metric
+  // and fault members are asserted empty types (with [[no_unique_address]], they take no storage).
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(metrics_)>, "ProdBuild has no metrics");
+  static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(faults_)>, "ProdBuild has no faults");
 };
 
 }  // namespace expert_stream

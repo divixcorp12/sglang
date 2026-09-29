@@ -457,10 +457,6 @@ class GpuResidencyUpdater:
                 from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
 
                 cfg = Dsv41Config.from_envs()
-                if not cfg.enable_ram_miss_leases:
-                    raise ValueError(
-                        "EXL3 DIRECT requires SGLANG_DSV41_ENABLE_RAM_MISS_LEASES=1"
-                    )
                 if cfg.enable_expert_prefetch:
                     raise ValueError(
                         "EXL3 DIRECT requires SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=0"

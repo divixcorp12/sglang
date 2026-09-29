@@ -75,23 +75,16 @@ struct ReadFault {
   bool nop_flush_refused = false;
 };
 
-// A packing worker's chunk stamp: the same gated clock as every other stamp (a job is armed with it only
-// for a traced read).
-inline int64_t worker_stamp(const void* trace) {
-  return stamp(static_cast<const StageRecord*>(trace));
-}
-
 // The fault tensor of the test entry points: kFaultWords int64 words. Five of them are not reader faults:
 // abandon_after makes the entry point's abandon callback say stop once that many batches were admitted
-// (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and pack_workers / pack_split
-// configure the reader's packing pool before it opens (0 workers: pack inline on the owner; split 0:
-// one chunk per worker); word 21 is hold_rest; word 22 (piece_stream, not a fault) turns the reader's piece
-// streaming on before it opens; word 23 is sub, 24 publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27
-// last_publish_delay_ns. Word 28 (fixed_chunk_cap, not a fault) caps the registered-buffer chunk size before the
-// reader opens (0: 1 GiB), word 29 is leg, word 30 the ring-reset bits (bit 0 nop_flush_refused, bit 1
-// ring_reset_fail) and word 31 (leg_cut_cap, not a fault) cuts every
-// read at that many bytes before the reader opens (0: READ_CUTS and the device limits). Keep the layout in step with _fault_tensor
-// in ops/moe/expert_stream_transport.py.
+// (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and words 19-20 (formerly
+// pack_workers, pack_split) are reserved and ignored (the packed path is gone); word 21 is hold_rest; word 22
+// (piece_stream, not a fault) turns the reader's piece streaming on before it opens; word 23 is sub, 24
+// publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27 last_publish_delay_ns. Word 28 (fixed_chunk_cap, not
+// a fault) caps the registered-buffer chunk size before the reader opens (0: 1 GiB), word 29 is leg, word 30 the
+// ring-reset bits (bit 0 nop_flush_refused, bit 1 ring_reset_fail) and word 31 (leg_cut_cap, not a fault) cuts every
+// read at that many bytes before the reader opens (0: READ_CUTS and the device limits). Keep the layout in step with
+// _fault_tensor in ops/moe/expert_stream_transport.py.
 constexpr int64_t kFaultWords = 32;
 
 inline ReadFault fault_from(const int64_t* f) {
@@ -125,6 +118,15 @@ inline ReadFault fault_from(const int64_t* f) {
   return fault;
 }
 
+// Whether fault words `f` inject a fault, i.e. set a word that arms one (the words that only narrow a fault -- the
+// call numbers, part, ordinal, sub, leg, submit_first, short_is_eof, hold_rest -- arm nothing alone, and words 17-20,
+// 22, 28 and 31 are not faults). A production host has no fault state and refuses a tensor for which this is true
+// (HostExports::install_fault); it needs no ReadFault to decide.
+inline bool injects_fault(const int64_t* f) {
+  return f[0] != 0 || f[3] != 0 || f[6] != 0 || f[7] != 0 || f[8] != 0 || f[9] > 0 || f[10] > 0 || f[11] != 0 ||
+         f[12] > 0 || f[13] != 0 || f[14] != 0 || f[16] >= 0 || f[24] > 0 || f[26] > 0 || f[27] > 0 || f[30] != 0;
+}
+
 template <ExpertRowLayout Layout>
 inline void check_fault_words(TensorView fault) {
   if (fault.size(0) != kFaultWords)
@@ -132,7 +134,7 @@ inline void check_fault_words(TensorView fault) {
 }
 
 // Entry points' abandon callback: stop once `after` batches were admitted (0: never).
-inline std::function<bool(size_t)> abandon_after(int64_t after) {
+inline auto abandon_after(int64_t after) {
   return [after](size_t admitted) { return after > 0 && admitted >= static_cast<size_t>(after); };
 }
 

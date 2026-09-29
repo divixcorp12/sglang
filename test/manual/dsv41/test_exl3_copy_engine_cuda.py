@@ -170,14 +170,19 @@ def test_s_hands_a_copying_lane_w1_did_not_claim_to_the_copy_wait(tmp_path):
 
 def test_a_copy_wait_timeout_fails_closed_and_the_terminal_does_not_release_the_copying_lease(tmp_path):
     """A 256 MiB ballast (~20 ms) against a 10 ms deadline: CW times out, F fails the request and names the lane in
-    its terminal. The lease must stay held until the copy completes, then be released by the copy thread alone."""
-    s = StreamService(tmp_path, copy_engine=True, timeout_ms=10)
+    its terminal. The lease must stay held until the copy completes, then be released by its handed-back completion
+    alone.
+    The warm-up miss runs under the default 2 s deadline (a cold O_DIRECT miss can take ~50 ms); the 10 ms deadline
+    applies from the hit's post on."""
+    s = StreamService(tmp_path, copy_engine=True)
     src = torch.empty(256 << 20, dtype=torch.uint8).pin_memory()
     dst = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
     try:
         s.plan([3])
         s.step()
+        assert s.keep.item() == 1.0, (s.counters(), s.stats())  # row 3 is resident: the request below is a hit
         assert s.until(lambda: _all_retired(s))
+        s.dev.timeout_ns = 10_000_000  # post() passes the deadline from it: 10 ms from the next post on
         slot = s.host.mapping(0)[3]
         voided = s.counters()["leases_voided"]
         s.host.copy_engine_ballast(dst, src)
@@ -201,7 +206,11 @@ def test_a_copy_wait_timeout_fails_closed_and_the_terminal_does_not_release_the_
         assert s.host.copy_engine_idle(10.0)
         c = s.counters()
         assert c["leases_voided"] == voided and c["lease_double_signal"] == 0, c
-        assert s.host.slot_info(0)[slot][2] == 0 and s.host.lease_entry(idx)["lane_state"][0] == 2
+        # D7 (plan 2026-09-29-hotpath-zero-overhead Task 14): the copy thread hands the job back and the running
+        # service releases the lease at its next poll, so an idle copy engine does not yet mean a released lease.
+        assert s.until(
+            lambda: s.host.slot_info(0)[slot][2] == 0 and s.host.lease_entry(idx)["lane_state"][0] == 2
+        ), s.counters()
     finally:
         s.host.copy_engine_ballast(None, None)
         s.close()
@@ -289,6 +298,13 @@ def test_work_queued_behind_the_graph_on_other_streams_does_not_hold_the_copy_ba
         backend.post(0, plan)
     torch.cuda.synchronize()
     assert s.until(lambda: _all_retired(s))
+    # Load the waiter's own kernels and copies now, not while CW spins: under lazy module loading the first launch of
+    # dev.add_ waits on the device, holding the copy thread's cuMemcpyAsync back until the deadline.
+    with torch.cuda.stream(behind):
+        dev.copy_(host, non_blocking=True)
+        host.copy_(dev, non_blocking=True)
+        dev.add_(1)
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph, stream=forward):
         backend.post(0, plan)

@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -29,22 +30,24 @@ def hang_guard():
 
 @pytest.fixture
 def tiers(tmp_path):
-    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS)
+    """The service reads row images (service_row_images) with O_DIRECT, as in production."""
+    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None
     streamers = {}
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
-        for layer_id in range(LAYERS):
-            layer = torch.nn.Module()
-            layer.layer_id = layer_id
-            fmt = Exl3ExpertFormat(layout, layer_id, direct=False, source_root=str(tmp_path))
-            streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
-            layer._nvfp4_expert_streamer = streamer
-            ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
-            streamers[layer_id] = streamer
-    service = module.Exl3RamMissService.get()
-    yield service, streamers
-    service.shutdown()
+    with service_row_images(tmp_path):
+        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+            for layer_id in range(LAYERS):
+                layer = torch.nn.Module()
+                layer.layer_id = layer_id
+                fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
+                streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
+                layer._nvfp4_expert_streamer = streamer
+                ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
+                streamers[layer_id] = streamer
+        service = module.Exl3RamMissService.get()
+        yield service, streamers
+        service.shutdown()
     module.Exl3RamMissService._instance = None
 
 

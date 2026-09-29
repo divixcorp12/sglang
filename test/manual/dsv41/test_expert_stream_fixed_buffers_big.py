@@ -2,7 +2,7 @@
 2026-09-28-reader-crtp-uring-registration, Task 8).
 
 A native harness maps a populated 1.5 GiB slab of dsv41 rows (460 x 3,501,056 B) and a 64-row slab of 49,152 B rows,
-configures the production UringReader from the environment (READ_MODE fixed or readv_fixed, FIXED_FILES=1) with both
+configures the UringReader from the environment (READ_MODE fixed or readv_fixed, FIXED_FILES=1) with both
 slabs as RegisteredRegions under the default 1 GiB cap, and reads a 16 MiB O_DIRECT file into them through
 fixed_legs + prep_readv_fixed. It proves that the big slab registers as 306 + 154 rows (chunk 1 starts at
 306 x 3,501,056), that the two rows around the cut land in buffers 0 and 1, that an iovec straddling the cut is
@@ -10,6 +10,9 @@ refused, and that a two-slab destination fans out into two legs submitted togeth
 
 A second case lowers RLIMIT_MEMLOCK to 256 KiB in the child: the ring still sets up, and the real registration
 ENOMEM must surface as the explicit fixed-buffer refusal naming the limit.
+
+The harness drives InstrUringReader: the fan-out counters it asserts (fixed_cuts, fanout_sqes) are InstrBuild
+metrics (spec M10) and do not exist on the production UringReader, whose I/O code is the same template.
 
 Run on divix01 (see the brief's Step 2 command): under rowimg-disk.lock, numactl --membind=1, taskset -c 0-63.
 """
@@ -43,7 +46,7 @@ _SOURCE = r'''
 using sglang::expert_stream::FixedLeg;
 using sglang::expert_stream::ReadCompletion;
 using sglang::expert_stream::RegisteredRegion;
-using sglang::expert_stream::UringReader;
+using UringReader = sglang::expert_stream::InstrUringReader;  // fixed_cuts/fanout_sqes: InstrBuild metrics
 
 constexpr size_t kBigRow = 3501056, kBigRows = 460, kBigBytes = kBigRow * kBigRows;  // 1,610,485,760 B
 constexpr size_t kSmallRow = 49152, kSmallRows = 64, kSmallBytes = kSmallRow * kSmallRows;

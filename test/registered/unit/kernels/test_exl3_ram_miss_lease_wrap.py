@@ -33,7 +33,7 @@ def world(tmp_path):
     page = new_page(pin=False)
     for name in ("demand_head", "demand_done"):
         page[WORDS[name] : WORDS[name] + 4].view(torch.int32)[0] = -BELOW_WRAP  # 2**32 - 6
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.enable_lease_mode()
     yield s, page, host, LeaseSim(host, page, s.slabs)
     host.stop()

@@ -50,11 +50,10 @@ def _assert_rows(setup, layer, experts, slots):
 
 
 @pytest.mark.parametrize("mode", ["default", "iopoll", "sqpoll", "sqpoll_iopoll"])
-@pytest.mark.parametrize("row_images", [False, True], ids=["fixed-shard-bounce", "readv-fixed-shared-arena"])
 def test_registered_io_through_tables_and_ffi_recovers_after_request_failure(
-    tmp_path, monkeypatch, uring_native_binary, mode, row_images
+    tmp_path, monkeypatch, uring_native_binary, mode
 ):
-    read_mode = "readv_fixed" if row_images else "fixed"
+    read_mode = "readv_fixed"
     # An optional feature may skip only after the native harness probes the
     # running kernel and verifies production refusal; FFI failures below fail.
     _run_native(uring_native_binary, tmp_path, mode=mode, read_mode=read_mode, fixed_files=True)
@@ -70,22 +69,21 @@ def test_registered_io_through_tables_and_ffi_recovers_after_request_failure(
     (tmp_path / "checkpoint").mkdir()
     setup = ram_miss_setup(
         tmp_path / "checkpoint", capacity=3, experts=6, mirror_weights=(1.0, 1.0),
-        hidden=256, inter=256, row_images=row_images,
+        hidden=256, inter=256,
     )
     # A fixed read reserves all its legs at once, so a fanned-out read needs a ring at least as deep as it is wide:
-    # the row-image reads meet every named slab (one leg per segment), the bounce reads one slot.
-    depth = int(setup.tables.segments.shape[0]) if row_images else 2
+    # the row-image reads meet every named slab (one leg per segment).
+    depth = int(setup.tables.segments.shape[0])
     monkeypatch.setenv("SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH", str(depth))
-    if row_images:
-        _use_shared_slab_arenas(setup)
-        # The metadata crossing FFI describes each named slab of each layer, with
-        # its row size, never the arena as a whole (an arena can exceed 1 GiB).
-        regions = ops._table_buffer_regions(setup.tables)
-        assert regions.shape == (len(setup.tables.layer_ids) * len(EXL3_STREAMED_NAMES), 3)
-    assert setup.tables.row_images == row_images
+    _use_shared_slab_arenas(setup)
+    # The metadata crossing FFI describes each named slab of each layer, with
+    # its row size, never the arena as a whole (an arena can exceed 1 GiB).
+    regions = ops._table_buffer_regions(setup.tables)
+    assert regions.shape == (len(setup.tables.layer_ids) * len(EXL3_STREAMED_NAMES), 3)
+    assert setup.tables.row_images
 
     experts, slots = [5, 0, 3], [2, 0, 1]
-    result, trace = ops.read_rows_traced(setup.tables, 1, experts, slots, direct=True)
+    result, trace = ops.read_rows_traced(setup.tables, 1, experts, slots)
     assert result == 1
     assert 0 < trace["pending_max"] <= depth
     assert trace["bytes"] > 0
@@ -101,7 +99,7 @@ def test_registered_io_through_tables_and_ffi_recovers_after_request_failure(
         stats = {}
         failed, recovered = ops.read_rows_with_fault(
             setup.tables, 1, [0, 5, 3], [0, 1, 2], recovered_experts, recovered_slots,
-            direct=True, submit_error=errno.EIO, submit_call=1, submit_first=submitted_first,
+            submit_error=errno.EIO, submit_call=1, submit_first=submitted_first,
             stats=stats,
         )
         assert (failed, recovered) == (0, 1)

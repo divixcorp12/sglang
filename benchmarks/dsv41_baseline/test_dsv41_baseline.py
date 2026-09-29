@@ -1037,7 +1037,14 @@ def test_server_args_includes_decode_log_interval_when_set():
 def test_base_env_launches_the_lease_chain_with_pdl():
     env = arm_env.base_env()
     assert env["SGLANG_DSV41_ENABLE_LEASE_PDL"] == "1"
-    assert env["SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"] == "1"  # the flag is refused without lease mode
+    # Lease mode, row images and the packed path's workers are no longer knobs (2026-09-29): a set value only warns,
+    # so the recipe sets none of them.
+    for removed in (
+        "SGLANG_DSV41_ENABLE_RAM_MISS_LEASES",
+        "SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES",
+        "SGLANG_DSV41_RAM_MISS_PACK_WORKERS",
+    ):
+        assert removed not in env, removed
 
 
 def test_base_env_mirrors_expert_rows_by_default():
@@ -1174,12 +1181,11 @@ def test_the_numa_placement_is_in_the_env_and_sums_to_the_budget():
 
 
 def test_piece_streaming_defaults_carry_their_prerequisites():
-    # The server refuses piece streaming without two-phase, leases and pack workers.
+    # The server refuses piece streaming without two-phase (leases are unconditional, and row images need no
+    # pack workers).
     env = arm_env.base_env()
     assert env["SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM"] == "1"
     assert env["SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE"] == "1"
-    assert env["SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"] == "1"
-    assert int(env["SGLANG_DSV41_RAM_MISS_PACK_WORKERS"]) > 0
 
 
 # --- run_arm.sh's Nsight options (nsys_capture.py) ---

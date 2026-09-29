@@ -26,9 +26,15 @@ def hang_guard():
 def _host(tmp_path):
     s = ram_miss_setup(tmp_path)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.start_thread(fatal_wait_s=5.0)
     return page, host
+
+
+def _holds(host, row, expert):
+    """True once ``expert`` holds a slot of ``row`` (LOADING or READY), as ``contains`` says, but through a snapshot:
+    ``contains`` refuses while the service thread runs unpaused (plan 2026-09-29-hotpath-zero-overhead Task 13)."""
+    return expert in host.slot_to_expert(row)
 
 
 def _until(predicate, timeout_s=5.0):
@@ -44,11 +50,11 @@ def test_an_advisory_loads_rows_before_their_demand(tmp_path):
     page, host = _host(tmp_path)
     try:
         sim_post(page, 1, need=[4, 5], protect=[4, 5], advisory=True, after=page_word(page, "demand_head") + 10)
-        # contains() is true once the thread has claimed a slot, before the read: the rows are
+        # _holds is true once the thread has claimed a slot, before the read: the rows are
         # loaded when the per-layer advisory count says so. The thread bumps its global
         # counters after that, so wait for the bump too: the baseline below must include it.
         assert _until(lambda: host.layer_advisory_rows() == [0, 2] and host.counters()["advisory_rows"] == 2)
-        assert host.contains(1, 4) and host.contains(1, 5) and host.layer_rows() == [0, 0]
+        assert _holds(host, 1, 4) and _holds(host, 1, 5) and host.layer_rows() == [0, 0]
         # The demand then finds them in RAM: a touch-only request, no read.
         before = host.counters()["rows_read"]
         assert sim_wait(page, sim_post(page, 1, need=[], protect=[4, 5]), 10) == 1
@@ -64,7 +70,7 @@ def test_an_advisory_whose_layer_already_posted_its_demand_is_skipped(tmp_path):
         assert sim_wait(page, seq, 10) == 1
         sim_post(page, 1, need=[3], protect=[3], advisory=True, after=seq - 1)  # its demand seq is reached
         assert _until(lambda: host.counters()["advisories_skipped"] >= 1)
-        assert not host.contains(1, 3)
+        assert not _holds(host, 1, 3)
     finally:
         host.stop()
 
@@ -78,7 +84,7 @@ def test_a_demand_preempts_an_advisory_in_flight(tmp_path):
         started = time.perf_counter()
         assert sim_wait(page, sim_post(page, 0, need=[], protect=[]), 10) == 1
         assert time.perf_counter() - started < 0.8  # the advisory gave up after at most its first read delay
-        assert not any(host.contains(1, e) for e in (1, 2, 3))
+        assert not any(_holds(host, 1, e) for e in (1, 2, 3))
     finally:
         host.inject(delay_s=0.0)
         host.stop()

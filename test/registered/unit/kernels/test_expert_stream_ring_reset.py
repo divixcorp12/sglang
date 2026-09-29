@@ -38,7 +38,9 @@ _SOURCE = r'''
 using sglang::expert_stream::FixedLeg;
 using sglang::expert_stream::ReadCompletion;
 using sglang::expert_stream::RegisteredRegion;
-using sglang::expert_stream::UringReader;
+// The reader with the ring-reset fault hooks (set_nop_flush_refused, set_ring_reset_fail, publish_sq_without_enter):
+// they exist only in the instrumented build's reader (plan 2026-09-29-hotpath-zero-overhead Task 10).
+using UringReader = sglang::expert_stream::InstrUringReader;
 
 constexpr size_t kRow = 65536, kRows = 64, kBytes = kRow * kRows;
 constexpr unsigned kDepth = 16;

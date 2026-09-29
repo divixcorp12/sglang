@@ -149,11 +149,12 @@ class TestRealServiceFailures:
                 s.dest[n].zero_()
             s.step()
             _cuda_ready()
-            assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+            assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
             counters = s.host.counters()
-            # Not vacuous: the two rows before the failure really did pack, and the failed row never did.
+            # Not vacuous: the two rows before the failure really did pack. The failed row's slot is not asserted:
+            # O_DIRECT lands a row image in its slot directly, and an injected part error replaces the completion's
+            # result, not the bytes. The invariant is that it is never published (rows_read, contains, leases below).
             assert _slab_holds(s, 3, want) and _slab_holds(s, 5, want), "rows 0 and 1 packed before row 2 failed"
-            assert not _slab_holds(s, 7, want), "the failing row never packed"
             # The property: nothing published, so the device refused the whole request and nothing was copied.
             assert counters["read_errors"] == 1 and counters["rows_read"] == 0, counters
             assert s.keep.item() == 0.0 and s.dev.go_count.item() == 0
@@ -165,7 +166,7 @@ class TestRealServiceFailures:
             assert s.block.ack_area() == NO_ACKS, "a skipped copy emits no acknowledgement"
             assert counters["leases_granted"] == 0 and counters["leases_acked"] == 0, counters
             assert s.leases() == [0] * len(s.leases())
-            assert not any(s.host.contains(0, e) for e in experts)
+            assert not any(e in s.host.slot_to_expert(0) for e in experts)
         finally:
             s.host.inject_fault()
             s.close()
@@ -180,7 +181,7 @@ class TestRealServiceFailures:
             s.plan(experts)
             s.step()
             _cuda_ready()
-            assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+            assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
             counters = s.host.counters()
             assert not any(_slab_holds(s, e, want) for e in experts), "no row packed"
             assert counters["read_errors"] == 1 and counters["rows_read"] == 0, counters
@@ -223,7 +224,7 @@ class TestRealServiceFailures:
             assert s.keep.item() == 0.0 and s.dev.go_count.item() == 0 and s.host.fatal_seq() != 0
             # The service finishes its delayed read AFTER the device gave up. Whatever it then does, no
             # acknowledgement appears, no lease survives, and no lane is ever counted as consumed.
-            assert s.until(lambda: s.host.busy_since_ns() == 0, timeout_s=15.0)
+            assert s.until(lambda: s.host.busy_episode() == 0, timeout_s=15.0)
             time.sleep(0.2)  # let retire_leases run over whatever the late serve left
             counters = s.host.counters()
             print("late-serve counters", counters)
@@ -250,12 +251,12 @@ class TestRealServiceFailures:
 # ---------------------------------------------------------------------------------------------------------------
 # Dependent compute: the fused MoE of the failed layer and of every later layer runs nothing.
 # ---------------------------------------------------------------------------------------------------------------
-def _run_two_layers_with_a_fatal_error(tmp_path, lease_on, cause):
+def _run_two_layers_with_a_fatal_error(tmp_path, cause):
     from test_exl3_ram_miss_graph_gpu import HIDDEN, TOP_K, _layers, _step_route
 
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
-    pairs, service, checks = _layers(tmp_path, timeout_ms=100, lease=lease_on, num_layers=2)
+    pairs, service, checks = _layers(tmp_path, timeout_ms=100, num_layers=2)
     try:
         gen = torch.Generator(device="cpu").manual_seed(5)
         inputs = []
@@ -282,16 +283,15 @@ def _run_two_layers_with_a_fatal_error(tmp_path, lease_on, cause):
             assert streamer.row_backend.keep.item() == 1.0, (layer_id, service.host.counters())
         baseline = [o.clone() for o in outs]
         assert all(b.float().abs().sum().item() > 0 for b in baseline), "the baseline computes something"
-        block = Block(service.host.lease_block, service.host.lease_layout) if lease_on else None
-        if lease_on:
-            deadline = time.perf_counter() + 10.0
-            while time.perf_counter() < deadline:
-                c = service.host.counters()
-                if c["leases_granted"] > 0 and c["leases_acked"] == c["leases_granted"]:
-                    break
-                time.sleep(0.005)
-            acked_before = service.host.counters()["leases_acked"]
-            acks_before = block.ack_area()
+        block = Block(service.host.lease_block, service.host.lease_layout)
+        deadline = time.perf_counter() + 10.0
+        while time.perf_counter() < deadline:
+            c = service.host.counters()
+            if c["leases_granted"] > 0 and c["leases_acked"] == c["leases_granted"]:
+                break
+            time.sleep(0.005)
+        acked_before = service.host.counters()["leases_acked"]
+        acks_before = block.ack_area()
         # Layer 0 now routes to experts the tier does not hold and the service fails to read; layer 1's route is
         # the same resident one as in the baseline.
         route0 = _step_route(0, 0)
@@ -310,15 +310,14 @@ def _run_two_layers_with_a_fatal_error(tmp_path, lease_on, cause):
         result["keeps"] = [streamer.row_backend.keep.item() for _, streamer in pairs]
         result["expert_counts"] = [int(layer._exl3_fused_moe.expert_count.count_nonzero()) for layer, _ in pairs]
         result["fatal"] = service.host.fatal_seq()
-        if lease_on:
-            result["go_count"] = service.device_side.go_count.item()
-            deadline = time.perf_counter() + 20.0
-            while time.perf_counter() < deadline and service.host.busy_since_ns() != 0:
-                time.sleep(0.01)
-            time.sleep(0.2)
-            result["acked_delta"] = service.host.counters()["leases_acked"] - acked_before
-            result["acks_unchanged"] = block.ack_area() == acks_before
-            result["leases_left"] = sum(sum(info[2] for info in service.host.slot_info(r)) for r in range(2))
+        result["go_count"] = service.device_side.go_count.item()
+        deadline = time.perf_counter() + 20.0
+        while time.perf_counter() < deadline and service.host.busy_episode() != 0:
+            time.sleep(0.01)
+        time.sleep(0.2)
+        result["acked_delta"] = service.host.counters()["leases_acked"] - acked_before
+        result["acks_unchanged"] = block.ack_area() == acks_before
+        result["leases_left"] = sum(sum(info[2] for info in service.host.slot_info(r)) for r in range(2))
         with pytest.raises(RuntimeError, match="exl3 RAM miss"):
             for check in checks:
                 check()
@@ -333,11 +332,8 @@ def _run_two_layers_with_a_fatal_error(tmp_path, lease_on, cause):
 
 
 @pytest.mark.parametrize("cause", ["timeout", "read_fault"])
-@pytest.mark.parametrize("lease_on", [False, True], ids=["leases_off", "leases_on"])
-def test_a_fatal_demand_error_drops_the_failed_layer_and_every_later_layer_and_runs_no_expert(
-    tmp_path, lease_on, cause
-):
-    r = _run_two_layers_with_a_fatal_error(tmp_path, lease_on, cause)
+def test_a_fatal_demand_error_drops_the_failed_layer_and_every_later_layer_and_runs_no_expert(tmp_path, cause):
+    r = _run_two_layers_with_a_fatal_error(tmp_path, cause)
     assert r["fatal"] != 0
     assert r["keeps"] == [0.0, 0.0], "layer 0 failed, layer 1 was dropped behind it"
     # The dependent compute: no expert ran (the fused MoE's per-slot counts are all zero) and the output is
@@ -347,7 +343,6 @@ def test_a_fatal_demand_error_drops_the_failed_layer_and_every_later_layer_and_r
     for layer_id, (out, base) in enumerate(zip(r["outs"], r["baseline"])):
         assert int(out.count_nonzero()) == 0, layer_id
         assert int(base.count_nonzero()) > 0, layer_id
-    if lease_on:
-        assert r["go_count"] == 0
-        assert r["acked_delta"] == 0 and r["acks_unchanged"], "a refused replay acknowledged nothing"
-        assert r["leases_left"] == 0
+    assert r["go_count"] == 0
+    assert r["acked_delta"] == 0 and r["acks_unchanged"], "a refused replay acknowledged nothing"
+    assert r["leases_left"] == 0

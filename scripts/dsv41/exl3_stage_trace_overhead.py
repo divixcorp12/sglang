@@ -93,10 +93,12 @@ class Arm:
     def __init__(self, root, name, trace, ring):
         root.mkdir()
         self.name, self.trace = name, trace
-        self.s = ram_miss_setup(root, capacity=CAPACITY, experts=EXPERTS)
+        self.s = ram_miss_setup(root, capacity=CAPACITY, experts=EXPERTS, row_images=True)
         self.page = new_page(pin=False)
+        # Both arms on the instrumented build: the trace and trace_clock_reads exist only there (plan
+        # 2026-09-29-hotpath-zero-overhead Task 10), so the trace-off arm measures InstrBuild with the trace off.
         self.host = ExpertStreamHost(
-            self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), direct=False
+            self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), variant="instr"
         )
         if trace:
             self.host.enable_trace(capacity=ring)

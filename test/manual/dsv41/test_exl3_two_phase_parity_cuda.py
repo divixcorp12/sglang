@@ -86,9 +86,9 @@ class Service:
     def __init__(self, tmp_path, *, timeout_ms=2000):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
-        from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
         from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+        from sglang.test.dsv41_ram_miss_fixtures import image_tables
 
         write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=1024, inter=512, finite=True)
         self.layout = build_exl3_expert_layout(str(tmp_path))
@@ -101,11 +101,11 @@ class Service:
             for lid in range(LAYERS):
                 for n in self.names:
                     self.slabs[lid][n] = allocate_host_slab(CAPACITY, self.specs[n].row_shape, self.specs[n].dtype, register=True)
-            tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
+            tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp_path)  # row images (D4)
             self.page = new_page(pin=True)
             slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.slot_map = slot_map
-            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
+            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map)
             self.host.enable_lease_mode()
             self.host.enable_two_phase()
             self.host.start_thread(fatal_wait_s=60.0)
@@ -454,7 +454,8 @@ def _fused_layer(tmp_path, *, two_phase: bool, timeout_ms=2000):
 
     Copied in shape from test_exl3_ram_miss_graph_gpu.py's ``_layers`` (single-layer case), with the
     two-phase override added. The service is a process-wide singleton, so a caller must
-    ``service.shutdown()`` this arm before building the other.
+    ``service.shutdown()`` this arm before building the other. The service reads row images (its only tables, plan
+    2026-09-29-hotpath-zero-overhead D4), built once beside the checkpoint by ``service_row_images``.
     """
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import exl3_ram_miss as service_module
@@ -462,20 +463,21 @@ def _fused_layer(tmp_path, *, two_phase: bool, timeout_ms=2000):
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
+    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
 
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     with (
+        service_row_images(tmp_path),
         envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
         envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
         envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(timeout_ms),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(True),
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(two_phase),
     ):
         layer = torch.nn.Module()
         layer.layer_id = 0
         layer.top_k = F_TOP_K
-        fmt = Exl3ExpertFormat(layout, 0, direct=False)
+        fmt = Exl3ExpertFormat(layout, 0, source_root=str(tmp_path))  # no direct: uring_direct decides
         streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
         layer._nvfp4_expert_streamer = streamer
         ExpertPinnedHostCache(streamer, 8, **fmt.pinned_tier_options(layer))

@@ -25,14 +25,17 @@ def _service(tmp_path, *, expert_dir=None, layer=0, capacity=8, timeout_ms=2000,
     from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
+    from sglang.srt.layers.moe.exl3_row_image import open_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import image_tables
     from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 
-    if expert_dir is None:
+    real = expert_dir is not None
+    if not real:
         write_fake_exl3(str(tmp_path), num_layers=layers, num_experts=EXPERTS, hidden=1024, inter=512, finite=True)
         expert_dir = str(tmp_path)
     layout = build_exl3_expert_layout(expert_dir)
-    fmt = Exl3ExpertFormat(layout, layer, direct=expert_dir != str(tmp_path))
+    fmt = Exl3ExpertFormat(layout, layer, direct=real, source_root=expert_dir)
     specs = {s.name: s for s in fmt.tensor_specs(None)}
     layer_ids = [layer, layer + 1][:layers]
     slabs = {lid: {} for lid in layer_ids}
@@ -41,10 +44,19 @@ def _service(tmp_path, *, expert_dir=None, layer=0, capacity=8, timeout_ms=2000,
         for lid in layer_ids:
             for n in EXL3_STREAMED_NAMES:
                 slabs[lid][n] = allocate_host_slab(capacity, specs[n].row_shape, specs[n].dtype, register=True)
-        tables = exl3_ram_miss_tables(layout, fmt.segment_map(), slabs)
+        # Row images are the reader's only tables (plan 2026-09-29-hotpath-zero-overhead D4). A real checkpoint's are
+        # the production ones under SGLANG_MOE_EXPERT_MIRROR_DIRS (never written here); a fake one's are built beside it.
+        if real:
+            mirrors = fmt.mirror_table_args()
+            if not mirrors:
+                raise RuntimeError("DSV41_EXL3_DIR needs SGLANG_MOE_EXPERT_MIRROR_DIRS naming roots with row images")
+            images = open_row_images(mirrors["roots"], layout, fmt.segment_map(), mirrors["source_root"], layer_ids)
+            tables = exl3_ram_miss_tables(layout, fmt.segment_map(), slabs, **mirrors, row_images=images)
+        else:
+            tables, _ = image_tables(layout, fmt.segment_map(), slabs, tmp_path)
         page = new_page(pin=True)
         slot_map = torch.full((len(layer_ids), layout.num_experts), -1, dtype=torch.int32).pin_memory()
-        host = ExpertStreamHost(tables, page=page, slot_map=slot_map, direct=fmt.direct)
+        host = ExpertStreamHost(tables, page=page, slot_map=slot_map)
         host.start_thread(fatal_wait_s=30.0)
         dev = ExpertStreamDevice(page, slot_map, device="cuda", layers=len(layer_ids), timeout_ms=timeout_ms, advise=advise)
     except BaseException:
@@ -344,7 +356,7 @@ def test_layer_posts_advise_the_next_layer(tmp_path):
         while time.perf_counter() < deadline and host.counters()["advisory_rows"] != 3:
             time.sleep(0.005)
         assert host.counters()["advisory_rows"] == 3
-        assert all(host.contains(1, e) for e in (9, 10, 11))
+        assert all(e in host.slot_to_expert(1) for e in (9, 10, 11))
         assert dev.last_routes[0, 0].item() == 2  # layer 0 remembered this token's routes
     finally:
         _close(host, slabs)

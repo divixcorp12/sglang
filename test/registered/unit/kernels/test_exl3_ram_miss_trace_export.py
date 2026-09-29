@@ -34,7 +34,7 @@ def _lines(path):
 def test_a_request_line_carries_the_causal_stamps_and_the_drop_position(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.enable_trace(capacity=2)
     trace_path = tmp_path / "trace.jsonl"
     trace = Exl3StreamTrace(str(trace_path))

@@ -33,9 +33,26 @@ def _host(tmp_path, capacity=3, fatal_wait_s=5.0):
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
     host.start_thread(fatal_wait_s=fatal_wait_s)
     return s, page, slot_map, host
+
+
+def _holds(host, row, expert):
+    """True once ``expert`` holds a slot of ``row`` (LOADING or READY), as ``contains`` says, but through a snapshot:
+    ``contains`` refuses while the service thread runs unpaused (plan 2026-09-29-hotpath-zero-overhead Task 13)."""
+    return expert in host.slot_to_expert(row)
+
+
+def _ready_map(host, row, experts=6):
+    """Each expert's READY slot, else -1, from the tier's own slot states. ``mapping()`` reads the published slot map
+    itself (plan 2026-09-29-hotpath-zero-overhead Task 13), so a check of that map must derive the READY slots
+    independently."""
+    ready = [-1] * experts
+    for slot, (state, expert, _, _) in enumerate(host.slot_info(row)):
+        if state == 2 and expert >= 0:
+            ready[expert] = slot
+    return ready
 
 
 def _until(predicate, timeout_s=5.0):
@@ -51,7 +68,7 @@ def test_the_thread_serves_demands_without_a_pump(tmp_path):
     s, page, slot_map, host = _host(tmp_path)
     try:
         assert sim_wait(page, sim_post(page, 0, need=[1, 2], protect=[1, 2]), 10) == 1
-        assert host.contains(0, 1) and host.counters()["running"] == 1
+        assert _holds(host, 0, 1) and host.counters()["running"] == 1
         with pytest.raises(RuntimeError, match="pump"):
             host.pump()
     finally:
@@ -85,7 +102,7 @@ def test_no_advisory_starts_while_paused(tmp_path):
         host.resume()
         # The advisory posted during the pause is skipped (it predates the eager use).
         assert _until(lambda: host.counters()["advisories_skipped"] == 1)
-        assert not host.contains(1, 3) and host.contains(1, 4)
+        assert not _holds(host, 1, 3) and _holds(host, 1, 4)
     finally:
         host.stop()
 
@@ -149,7 +166,7 @@ def test_concurrent_eager_use_and_advisories_never_share_a_slot(tmp_path):
             mapping = host.mapping(0)
             slots = [m for m in mapping if m >= 0]
             assert len(slots) == len(set(slots))
-            assert slot_map[0].tolist() == mapping  # the device-visible map equals the READY slots
+            assert slot_map[0].tolist() == mapping == _ready_map(host, 0)  # the device-visible map: the READY slots
         finally:
             host.resume()
     finally:
@@ -163,7 +180,7 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 import torch
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
 page = new_page(pin=False)
-host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr")
 """
 
 
@@ -269,7 +286,7 @@ def test_a_process_that_stops_after_fatal_is_not_aborted(tmp_path):
 def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
     s = ram_miss_setup(tmp_path)
     host = ExpertStreamHost(
-        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
+        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32)
     )
     try:
         core = min(os.sched_getaffinity(0))
@@ -284,7 +301,7 @@ def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
 def test_a_reserved_or_unusable_core_is_refused(tmp_path, core, error, match):
     s = ram_miss_setup(tmp_path)
     host = ExpertStreamHost(
-        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False
+        s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32)
     )
     try:
         with pytest.raises(error, match=match):
@@ -336,7 +353,7 @@ def _tier(tmp_path, capacity=6):
     """A host with no service thread: the tests pump it, so nothing races."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     return s, page, host
 
 
@@ -548,7 +565,7 @@ def test_multi_row_advisories_cut_short_by_pauses_leave_only_whole_rows(tmp_path
             time.sleep(0.001)
         host.pause(timeout_s=2.0)
         try:
-            assert slot_map[0].tolist() == host.mapping(0)
+            assert slot_map[0].tolist() == host.mapping(0) == _ready_map(host, 0)
             _assert_resident_rows_exact(s, host, 0)
         finally:
             host.resume()

@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -40,32 +41,35 @@ def hang_guard():
 
 @pytest.fixture
 def world(tmp_path, monkeypatch):
-    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS)
+    """The service reads row images with O_DIRECT (service_row_images), as in production; leases are on, which the
+    images need. The env stays set until teardown."""
+    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None
     streamers, caches = {}, {}
-    with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
-        for layer_id in range(LAYERS):
-            layer = torch.nn.Module()
-            layer.layer_id = layer_id
-            fmt = Exl3ExpertFormat(layout, layer_id, direct=False, source_root=str(tmp_path))
-            streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
-            layer._nvfp4_expert_streamer = streamer
-            caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
-            streamers[layer_id] = streamer
-    service = module.Exl3RamMissService.get()
-    service.ensure_started()
-    order = []
-    # A CUDA device is pretended, so the barrier path runs; the barrier itself is a fake the test controls.
-    monkeypatch.setattr(module.Exl3RamMissService, "_cuda_active", lambda self: True)
-    close_admission, stop = service.host.close_admission, service.host.stop
-    monkeypatch.setattr(service.host, "close_admission", lambda: (order.append("close_admission"), close_admission()))
-    monkeypatch.setattr(service.host, "stop", lambda: (order.append("stop"), stop()))
-    for layer_id, cache in caches.items():
-        close, quarantine = cache.close, cache.quarantine
-        monkeypatch.setattr(cache, "close", lambda close=close, i=layer_id: (order.append(f"free{i}"), close()))
-        monkeypatch.setattr(cache, "quarantine", lambda q=quarantine, i=layer_id: (order.append(f"quarantine{i}"), q()))
-    yield service, caches, order
+    with service_row_images(tmp_path):
+        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+            for layer_id in range(LAYERS):
+                layer = torch.nn.Module()
+                layer.layer_id = layer_id
+                fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
+                streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
+                layer._nvfp4_expert_streamer = streamer
+                caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
+                streamers[layer_id] = streamer
+        service = module.Exl3RamMissService.get()
+        service.ensure_started()
+        order = []
+        # A CUDA device is pretended, so the barrier path runs; the barrier itself is a fake the test controls.
+        monkeypatch.setattr(module.Exl3RamMissService, "_cuda_active", lambda self: True)
+        close_admission, stop = service.host.close_admission, service.host.stop
+        monkeypatch.setattr(service.host, "close_admission", lambda: (order.append("close_admission"), close_admission()))
+        monkeypatch.setattr(service.host, "stop", lambda: (order.append("stop"), stop()))
+        for layer_id, cache in caches.items():
+            close, quarantine = cache.close, cache.quarantine
+            monkeypatch.setattr(cache, "close", lambda close=close, i=layer_id: (order.append(f"free{i}"), close()))
+            monkeypatch.setattr(cache, "quarantine", lambda q=quarantine, i=layer_id: (order.append(f"quarantine{i}"), q()))
+        yield service, caches, order
     module.Exl3RamMissService._instance = None
 
 

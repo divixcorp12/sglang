@@ -37,7 +37,7 @@ def hang_guard():
 def running(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.enable_lease_mode()
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
     yield s, page, host, LeaseSim(host, page, s.slabs)
@@ -51,6 +51,17 @@ def _until(predicate, timeout_s=5.0):
             return True
         time.sleep(0.002)
     return False
+
+
+def _assign_paused(host, row, experts):
+    """Eager assignments as production makes them: the service thread paused, so the caller owns the tier (assign
+    refuses unpaused, plan 2026-09-29-hotpath-zero-overhead Task 13)."""
+    host.pause(2.0)
+    try:
+        for expert in experts:
+            host.assign(row, expert, protected=[expert])
+    finally:
+        host.resume()
 
 
 def _leases(host, row):
@@ -84,7 +95,7 @@ def test_a_pause_is_refused_promptly_while_a_graph_lane_lease_is_outstanding_and
 def test_a_host_lease_does_not_block_an_eager_pause(running):
     """Mutation: the pause counts every lease, so one in-flight promotion refuses every eager host use (R2)."""
     s, page, host, sim = running
-    host.assign(0, 3, protected=[3])
+    _assign_paused(host, 0, [3])
     host.inject_lease(0, 0, +1)
     start = time.perf_counter()
     host.pause(2.0)
@@ -98,8 +109,7 @@ def test_a_deferred_demand_does_not_stop_the_worker_from_pausing_or_stopping(run
     hangs. The lease is a host lease here, so the pause is granted, not refused. That an advisory is still processed
     is asserted by the two R2 tests below, on counters that a stale skip cannot move."""
     s, page, host, sim = running
-    host.assign(0, 3, protected=[3])
-    host.assign(0, 4, protected=[4])
+    _assign_paused(host, 0, [3, 4])
     for slot in (0, 1):
         host.inject_lease(0, slot, +1)
     seq = sim.post(0, [1, 2]).seq
@@ -117,8 +127,7 @@ def test_a_deferred_demand_does_not_stop_the_worker_from_pausing_or_stopping(run
 def _deferred_demand(running):
     """Row 0 full of host leases, and a demand for two experts it cannot hold: deferred, and observed to be."""
     s, page, host, sim = running
-    host.assign(0, 3, protected=[3])
-    host.assign(0, 4, protected=[4])
+    _assign_paused(host, 0, [3, 4])
     for slot in (0, 1):
         host.inject_lease(0, slot, +1)
     seq = sim.post(0, [1, 2]).seq
@@ -180,12 +189,14 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 FATAL_WAIT = 0.3
 s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=2)
 page = new_page(pin=False)
-host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr")
 host.enable_lease_mode()
 sim = LeaseSim(host, page, s.slabs)
 host.start_thread(fatal_wait_s=FATAL_WAIT, spin_us=200)
+host.pause(2.0)  # the eager owner assigns (assign refuses while the service runs unpaused)
 host.assign(0, 3, protected=[3])
 host.assign(0, 4, protected=[4])
+host.resume()
 for slot in (0, 1):
     host.inject_lease(0, slot, +1)
 req = sim.post(0, [1, 2])
@@ -196,7 +207,7 @@ while host.counters()["deferred"] != 1:
 start = time.perf_counter()
 busy_max = seq_max = fatal_max = samples = 0
 while time.perf_counter() - start < 5 * FATAL_WAIT:
-    busy_max = max(busy_max, host.busy_since_ns())
+    busy_max = max(busy_max, host.busy_episode())
     seq_max = max(seq_max, page_word(page, "busy_seq"))
     fatal_max = max(fatal_max, page_word(page, "fatal"))
     assert page_word(page, "demand_done") != req.seq and host.counters()["deferred"] == 1
@@ -216,8 +227,8 @@ print("alive", flush=True)
 def test_a_long_deferral_does_not_trip_the_watchdog_and_the_demand_is_served_after_the_lease_retires(tmp_path):
     """R1. A subprocess, because the watchdog's abort kills the interpreter. The deferral is observed to be older
     than five times ``fatal_wait`` on the script's own clock (else nothing could have aborted), the busy word and
-    ``busy_since`` are sampled throughout, and the process must be alive at the end with the demand served.
-    Mutations: the deferral marks itself busy at its first observation (abort), or on every poll (``busy_since``
+    ``busy_episode`` are sampled throughout, and the process must be alive at the end with the demand served.
+    Mutations: the deferral marks itself busy at its first observation (abort), or on every poll (``busy_episode``
     nonzero); it publishes ``busy_seq``; it raises the fatal word (the fatal-held rule aborts)."""
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(_DEFERRAL_SCRIPT), str(tmp_path)],

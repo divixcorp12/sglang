@@ -32,7 +32,7 @@ def hang_guard():
 def tier(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     yield s, page, host
     host.stop()
 
@@ -101,7 +101,8 @@ def test_one_record_per_request_in_order(tier):
         assert record["prev_done"] == previous_done and record["observed"] >= previous_done
         previous_done = record["done"]
     read, empty, one = records
-    assert read["batches"] == 1 and read["extents"] == 2 and read["submit"] > 0 and read["pack_ns"] > 0
+    # pack_ns == 0: a row image is finished at one clock (RowReader copies nothing), so a row's pack span is empty.
+    assert read["batches"] == 1 and read["extents"] == 2 and read["submit"] > 0 and read["pack_ns"] == 0
     assert empty["batches"] == 0 and empty["extents"] == 0 and empty["bytes"] == 0 and empty["submit"] == 0
     assert one["extents"] == 1
 
@@ -154,7 +155,7 @@ def test_a_backlog_is_seen_when_records_queue_behind_a_slow_one(tier):
 def test_a_served_advisory_is_recorded_and_a_skipped_one_is_not(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.enable_trace()
     host.start_thread(fatal_wait_s=5.0)
     try:
@@ -253,7 +254,7 @@ def test_an_invalid_request_is_failed_not_a_silent_no_read(tier):
 def test_a_cancelled_advisory_is_terminal_and_names_its_missing_stages(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.enable_trace()
     host.inject(delay_s=0.6, delay_after_demands=10**6)  # only the advisory sleeps, before its first batch
     host.start_thread(fatal_wait_s=5.0)
@@ -286,7 +287,7 @@ def test_disabled_tracing_serves_the_same_bytes_and_state_as_enabled(tmp_path):
         s = ram_miss_setup(root, capacity=6)
         page = new_page(pin=False)
         slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-        host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, direct=False)
+        host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
         if trace:
             host.enable_trace()
         try:

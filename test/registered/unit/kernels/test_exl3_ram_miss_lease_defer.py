@@ -34,7 +34,7 @@ def world(tmp_path, request):
     capacity = getattr(request, "param", 2)
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.enable_lease_mode()
     host.enable_trace()
     yield s, page, host, LeaseSim(host, page, s.slabs)
@@ -76,7 +76,7 @@ def test_a_demand_whose_only_victims_are_leased_is_neither_served_nor_failed_and
     assert (host.counters()["evictions"], host.counters()["version"], host.slot_info(0), host.mapping(0)) == before
     assert host.counters()["deferred"] == 1, "one deferral, not one per poll"
     assert host.counters()["no_victim"] == 0 and host.counters()["read_errors"] == 0
-    assert host.busy_since_ns() == 0 and page_word(page, "busy_seq") == 0, (
+    assert host.busy_episode() == 0 and page_word(page, "busy_seq") == 0, (
         "a deferral is not a request in service: the watchdog's stuck rule would count the wait as a hung read"
     )
 
@@ -190,7 +190,7 @@ def test_a_demand_blocked_only_by_an_injected_lease_defers_with_lease_mode_off(t
     interim assertion that such a demand fails: it now waits, evicts nothing, and is served once the lease drops."""
     s = ram_miss_setup(tmp_path, capacity=2)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     try:
         from sglang.kernels.ops.moe.expert_stream_transport import sim_post, sim_wait
 

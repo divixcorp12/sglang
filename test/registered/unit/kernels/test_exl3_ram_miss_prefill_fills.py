@@ -34,10 +34,10 @@ def _host(s, **kwargs):
     )
 
 
-@pytest.fixture(params=["shards", "row_images"])
-def tier(tmp_path, request):
-    s = ram_miss_setup(tmp_path, capacity=4, row_images=request.param == "row_images")
-    host = _host(s, direct=False)
+@pytest.fixture
+def tier(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=4)
+    host = _host(s)
     yield s, host
     host.fill_end()
     host.stop()
@@ -45,9 +45,10 @@ def tier(tmp_path, request):
 
 @pytest.fixture
 def slow_tier(tmp_path):
-    """Shard tables, whose rows pack on the owner, so the pack_delay fault can hold a fill open."""
+    """Row-image tables: the pack_delay fault delays each row's publish (RowReader::publish_landed), so it can hold a
+    fill open."""
     s = ram_miss_setup(tmp_path, capacity=4)
-    host = _host(s, direct=False)
+    host = _host(s)
     yield s, host
     host.fill_end()
     host.stop()
@@ -123,7 +124,7 @@ def test_a_slot_being_filled_is_never_a_victim_and_cannot_be_released(slow_tier)
 
 def test_fill_wait_returns_as_a_prefix_lands(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=4)
-    host = _host(s, direct=False)
+    host = _host(s)
     try:
         host.inject_fault(pack_delay_ns=SLOW_PACK_NS)
         started = time.perf_counter()
@@ -163,7 +164,7 @@ def test_waiting_for_more_rows_than_were_claimed_raises(tier):
 
 def test_a_failed_fill_releases_the_rows_that_did_not_land(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=4)
-    host = _host(s, direct=False)
+    host = _host(s)
     try:
         path = s.tables.paths[int(s.tables.extents[1, 2, 0, 0])]
         with open(path, "r+b") as f:
@@ -188,7 +189,7 @@ def test_a_fill_of_a_resident_expert_is_refused(tier):
 
 def test_a_threaded_service_refuses_a_fill_until_paused_and_resume_joins_it(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=4)
-    host = _host(s, direct=False)
+    host = _host(s)
     try:
         host.start_thread(fatal_wait_s=30.0)
         with pytest.raises(RuntimeError, match="paused"):

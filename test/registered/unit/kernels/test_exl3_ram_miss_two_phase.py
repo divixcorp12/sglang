@@ -37,7 +37,7 @@ def hang_guard():
 def running(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=3)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.enable_lease_mode()
     host.enable_two_phase()
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
@@ -106,7 +106,7 @@ def test_a_resident_lane_is_published_before_read_returns(running):
     assert seen["miss"]["tag"] == 0, "the missing lane was published before its row had been read"
     assert seen["done"] != req.seq, "demand_done had already reached the request: the read was not still running"
     # T2's observation, taken at the same moment. It has no falsifying mutant (see the checklist's O3): with one
-    # service thread, taking the lease in a SECOND mutex_ hold right after the reservation leaves this green.
+    # service thread, taking the lease in a SECOND hold right after the reservation leaves this green.
     assert seen["hit_leases"] == 1, "the hit slot was not leased when its row result was published"
 
     assert waited.status == 1 and waited.go == 2

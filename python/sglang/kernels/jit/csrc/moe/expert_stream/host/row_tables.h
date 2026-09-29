@@ -41,10 +41,12 @@ struct Tables {
   std::vector<int64_t> row_bytes;
   // One per named slab tensor retained by Python tables.keepalive, with its row size: registered as row-aligned chunks.
   std::vector<RegisteredRegion> buffer_regions;
-  // Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, plan 2026-09-24-dsv41-row-images): the files are
+  // Row images (plan 2026-09-24-dsv41-row-images; always on since the packed path's removal): the files are
   // exl3_row_image layer files, not checkpoint shards. A row's needed bytes are then its image, [0, need_end) of
   // the extents' destination coordinates, and the segments tile it in source order, so every image byte has
   // exactly one slab destination. The reader reads straight into the slab rows (RowReader, direct mode): no bounce.
+  // RowReader is the only reader and refuses tables without it (plan 2026-09-29-hotpath-zero-overhead D4); "bounce
+  // slot" in the checks below names a row's pipeline slot, not memory.
   bool images = false;
 };
 
