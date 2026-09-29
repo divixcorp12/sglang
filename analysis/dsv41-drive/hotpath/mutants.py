@@ -78,6 +78,19 @@ MUTANTS = [
         "if (held.state == 1) release_lease_locked<kLeasesCopied>(tier, held);",
         [T + "test_exl3_ram_miss_copy_engine.py"],
     ),
+    # M4 as literally written is equivalent: a job's lanes are exactly its request's copy_engine lanes (the grant adds
+    # a lane to the job only when it tags it COPYING), so the dropped test is always true. M4b is the plan's intent:
+    # a completion releases every lane its entry holds, the device's READY/LOADING hit lanes included.
+    Mutant(
+        "M4b", "a copy completion releases every lane its entry holds (the device's READY/LOADING lanes too)",
+        H + "ram_tier.h",
+        "    for (int i = 0; i < job.count; ++i) {\n      LaneLease& held = entry.lane[job.lanes[i].lane];\n"
+        "      if (held.state == 1 && held.copy_engine) release_lease_locked<kLeasesCopied>(tier, held);\n    }\n",
+        "    for (uint32_t l = 0; l < entry.count; ++l) {\n      LaneLease& held = entry.lane[l];\n"
+        "      if (held.state == 1) release_lease_locked<kLeasesCopied>(tier, held);\n    }\n",
+        [T + "test_exl3_ram_miss_copy_engine.py", T + "test_expert_stream_hotpath_golden.py",
+         T + "test_expert_stream_hotpath_stress.py"],
+    ),
     Mutant(
         "M5", "resume_locked hands the tier back (pause_epoch_ release) before set_parked(false)", H + "ram_thread.h",
         "    tier_->set_parked(false);\n    const uint64_t epoch = pause_epoch_.load(std::memory_order_relaxed);\n"
