@@ -1,6 +1,7 @@
 {
  "scenario": [
   {
+   "copies": [],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -13,6 +14,10 @@
     "served": 1,
     "touch_only": 0,
     "version": 1
+   },
+   "dst": {
+    "0": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -594,7 +599,14 @@
    ],
    "page": {
     "demand_done": 1,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -719,6 +731,7 @@
    }
   },
   {
+   "copies": [],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -731,6 +744,10 @@
     "served": 1,
     "touch_only": 0,
     "version": 1
+   },
+   "dst": {
+    "0": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -1312,7 +1329,14 @@
    ],
    "page": {
     "demand_done": 1,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -1437,6 +1461,7 @@
    }
   },
   {
+   "copies": [],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -1449,6 +1474,10 @@
     "served": 2,
     "touch_only": 0,
     "version": 2
+   },
+   "dst": {
+    "0": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -2030,7 +2059,19 @@
    ],
    "page": {
     "demand_done": 2,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -2188,6 +2229,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -2200,6 +2252,10 @@
     "served": 2,
     "touch_only": 0,
     "version": 2
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -2781,7 +2837,19 @@
    ],
    "page": {
     "demand_done": 2,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -2939,6 +3007,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -2951,6 +3030,10 @@
     "served": 2,
     "touch_only": 0,
     "version": 2
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -3532,7 +3615,19 @@
    ],
    "page": {
     "demand_done": 2,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -3690,6 +3785,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -3702,6 +3808,10 @@
     "served": 3,
     "touch_only": 0,
     "version": 3
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -4283,7 +4393,24 @@
    ],
    "page": {
     "demand_done": 3,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -4446,6 +4573,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -4458,6 +4596,10 @@
     "served": 3,
     "touch_only": 0,
     "version": 3
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -5039,7 +5181,24 @@
    ],
    "page": {
     "demand_done": 3,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -5202,6 +5361,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -5214,6 +5384,10 @@
     "served": 4,
     "touch_only": 0,
     "version": 4
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -5795,7 +5969,29 @@
    ],
    "page": {
     "demand_done": 4,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     },
+     {
+      "ring_seq": 4,
+      "seq": 4,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -5958,6 +6154,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -5970,6 +6177,10 @@
     "served": 4,
     "touch_only": 0,
     "version": 4
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -6551,7 +6762,29 @@
    ],
    "page": {
     "demand_done": 4,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     },
+     {
+      "ring_seq": 4,
+      "seq": 4,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -6714,6 +6947,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -6726,6 +6970,10 @@
     "served": 4,
     "touch_only": 1,
     "version": 4
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -7307,7 +7555,34 @@
    ],
    "page": {
     "demand_done": 5,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     },
+     {
+      "ring_seq": 4,
+      "seq": 4,
+      "status": 1
+     },
+     {
+      "ring_seq": 5,
+      "seq": 5,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -7462,6 +7737,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -7474,6 +7760,10 @@
     "served": 4,
     "touch_only": 1,
     "version": 4
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -8055,7 +8345,34 @@
    ],
    "page": {
     "demand_done": 5,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     },
+     {
+      "ring_seq": 4,
+      "seq": 4,
+      "status": 1
+     },
+     {
+      "ring_seq": 5,
+      "seq": 5,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -8210,6 +8527,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -8222,6 +8550,10 @@
     "served": 5,
     "touch_only": 1,
     "version": 5
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -8803,7 +9135,39 @@
    ],
    "page": {
     "demand_done": 6,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     },
+     {
+      "ring_seq": 4,
+      "seq": 4,
+      "status": 1
+     },
+     {
+      "ring_seq": 5,
+      "seq": 5,
+      "status": 1
+     },
+     {
+      "ring_seq": 6,
+      "seq": 6,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -8966,6 +9330,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -8978,6 +9353,10 @@
     "served": 5,
     "touch_only": 1,
     "version": 5
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -9559,7 +9938,39 @@
    ],
    "page": {
     "demand_done": 6,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     },
+     {
+      "ring_seq": 4,
+      "seq": 4,
+      "status": 1
+     },
+     {
+      "ring_seq": 5,
+      "seq": 5,
+      "status": 1
+     },
+     {
+      "ring_seq": 6,
+      "seq": 6,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -9722,6 +10133,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -9734,6 +10156,10 @@
     "served": 6,
     "touch_only": 1,
     "version": 6
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -10315,7 +10741,44 @@
    ],
    "page": {
     "demand_done": 7,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     },
+     {
+      "ring_seq": 4,
+      "seq": 4,
+      "status": 1
+     },
+     {
+      "ring_seq": 5,
+      "seq": 5,
+      "status": 1
+     },
+     {
+      "ring_seq": 6,
+      "seq": 6,
+      "status": 1
+     },
+     {
+      "ring_seq": 7,
+      "seq": 7,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
@@ -10523,6 +10986,17 @@
    }
   },
   {
+   "copies": [
+    {
+     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
+     "dst_slot": 0,
+     "exact": true,
+     "expert": 0,
+     "lane": 0,
+     "row": 0,
+     "seq": 2
+    }
+   ],
    "counters": {
     "deferred": 0,
     "deferred_reuse": 0,
@@ -10535,6 +11009,10 @@
     "served": 6,
     "touch_only": 1,
     "version": 6
+   },
+   "dst": {
+    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
+    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
    "entries": [
     {
@@ -11116,7 +11594,44 @@
    ],
    "page": {
     "demand_done": 7,
-    "fatal": 0
+    "fatal": 0,
+    "records": [
+     {
+      "ring_seq": 1,
+      "seq": 1,
+      "status": 1
+     },
+     {
+      "ring_seq": 2,
+      "seq": 2,
+      "status": 1
+     },
+     {
+      "ring_seq": 3,
+      "seq": 3,
+      "status": 1
+     },
+     {
+      "ring_seq": 4,
+      "seq": 4,
+      "status": 1
+     },
+     {
+      "ring_seq": 5,
+      "seq": 5,
+      "status": 1
+     },
+     {
+      "ring_seq": 6,
+      "seq": 6,
+      "status": 1
+     },
+     {
+      "ring_seq": 7,
+      "seq": 7,
+      "status": 1
+     }
+    ]
    },
    "results": [
     {
