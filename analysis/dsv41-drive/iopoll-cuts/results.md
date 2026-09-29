@@ -73,6 +73,27 @@ The rule: promote an arm only at Δ ≤ −1.5 ms/token vs mean(A, A2), with ide
 
 **Limits of this pass.** One pass gives one sample per arm. A2 bounds drift at 0.68 ms/token, which is smaller than the 1.5 ms bar but larger than B's and D's deltas. B, C and D are therefore indistinguishable from A at this resolution. The claim that holds is "C removed the +10 ms regression", not "C is 0.6 ms slower".
 
+## Final-review fix round (after the arms)
+
+Mutant evidence and verification counts are in `mutants.md`. The fixes, none of which changes an SQE in the arms' configurations:
+- **Leg storage.** Default mode keeps one-leg storage (`leg_stride` 1). Fixed modes keep `max_iovecs`.
+- **sysfs.** It is read only when cuts are on.
+- **Contiguous joins.** A virtually contiguous join is no longer a gap. No production read has one:
+  - each row-image iovec is slot k of a different named slab, and slabs are separate allocations;
+  - with `SLAB_ARENA=1`, slab Y starts `capacity` rows past slab X, so slot k of X ends where slot k of Y starts only if the capacity is 1;
+  - the bounce path reads one iovec.
+- **`chunk_sectors`.** A nonzero value is named in the drive's `read cuts:` line.
+- **Explicit `QUEUE_DEPTH`.** Below the scaled default it logs once.
+- **Failed open.** It zeroes all 12 result words.
+
+Recorded follow-ups, not done:
+- **#7.** The IOPOLL reap loop in `wait_one` makes a peek and then a `get_events` syscall per pass. Folding them into one `io_uring_enter(GETEVENTS, min_complete=0)` plus peek would halve the syscalls. It is a cold path (drain only).
+- **#8.** Test gaps named by the review:
+  - an EOF-clamped cut leg (bounce path at a file's tail);
+  - a cut read on a fixture whose files lie on two devices with different limits (the per-file `limits_` lookup is covered only by the arms' `check_modes`);
+  - fallback-line wording.
+- **#9.** The `read cuts:` line is printed at every reader `open()`: one line per drive per reader. That is few in production (one tier reader), but noisy for tests that open many readers. Print once per process per device if it becomes a problem.
+
 ## Open item (not in scope)
 
 **The SPCC drive (nvme2n1, `/mnt/nvme4`) has slow episodes.** In 7 of 24 multi-row microbenchmark runs its per-SQE p50 was 10–35 ms (`analysis/dsv41-drive/iopoll/diagnosis.md`, "System").
