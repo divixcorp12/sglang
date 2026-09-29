@@ -52,6 +52,10 @@ from sglang.kernels.ops.moe.expert_stream_transport import read_rows_sqes
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 root = Path(sys.argv[1]); cap = int(sys.argv[2])
 s = ram_miss_setup(root, capacity=8, experts=8, layers=2, row_images=True, hidden=2048, inter=1536)
+# The fixture was just written through the page cache: flush it, or a NOWAIT O_DIRECT read of a range that still
+# needs writeback (or holds delayed-allocation blocks) returns -EAGAIN and is punted whatever its size. The mirror
+# roots' real row images are long settled.
+os.sync()
 seen, stop = set(), threading.Event()
 def sample():
     while not stop.is_set():
