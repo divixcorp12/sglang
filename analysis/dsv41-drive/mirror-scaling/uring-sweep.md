@@ -85,7 +85,7 @@ gcc -O2 -pthread -o mb2 $W/analysis/dsv41-drive/mirror-scaling/mirror_bench.c -l
 taskset -c 0-17 python3 $W/analysis/dsv41-drive/mirror-scaling/run_uring_sweep.py ./mb2 uring-main.jsonl main
 taskset -c 0-17 python3 .../run_uring_sweep.py ./mb2 uring-repairN.jsonl repair --labels-file results/uring-episodes-N.txt
 taskset -c 0-17 python3 .../run_uring_sweep.py ./mb2 uring-top.jsonl top --top <5 combo labels>
-python3 analysis/dsv41-drive/mirror-scaling/analyze_uring.py results/uring-main.jsonl results/uring-repair{1,2,3}.jsonl results/uring-top.jsonl
+python3 analysis/dsv41-drive/mirror-scaling/analyze_uring.py results/uring-main.jsonl.gz results/uring-repair{1,2,3}.jsonl.gz results/uring-top.jsonl.gz
 ```
 
 All 492 runs exited 0, with 0 errors and 0 short reads.

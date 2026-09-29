@@ -3,7 +3,7 @@
 Per (root set, QD): the median over reps of row p50/p90/p99/max and GB/s, and per drive the median SQE/part
 latencies, utilization, GB/s and straggler share. Then the per-drive-type fit part_time = a + b * part_bytes at QD1
 (least squares over every rep and root set), and the prediction it gives for each root set: max over its drives.
-Usage: python3 analyze.py results/matrix.jsonl [raw.csv.gz]
+Usage: python3 analyze.py results/matrix.jsonl.gz [results/matrix-raw.csv.gz]
 """
 
 import csv
@@ -20,7 +20,7 @@ ORDER = ["s-nvme0", "s-spcc", "s-nvme2", "p-nvme0+spcc", "p-nvme0+nvme2", "p-spc
 
 def load(path):
     cells = defaultdict(list)
-    for line in open(path):
+    for line in (gzip.open(path, "rt") if path.endswith(".gz") else open(path)):
         if not line.startswith("{"):
             continue
         j = json.loads(line)

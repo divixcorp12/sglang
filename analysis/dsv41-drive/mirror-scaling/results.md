@@ -60,15 +60,15 @@ These choices were fixed across every run:
 gcc -O2 -pthread -o /mnt/nvme1/mirror-scaling/mb analysis/dsv41-drive/mirror-scaling/mirror_bench.c -luring
 bash analysis/dsv41-drive/mirror-scaling/run_matrix.sh ./mb matrix.jsonl raw.csv 3
 bash analysis/dsv41-drive/mirror-scaling/run_weights.sh ./mb weights.jsonl weights-raw.csv 3
-python3 analysis/dsv41-drive/mirror-scaling/analyze.py results/matrix.jsonl results/matrix-raw.csv.gz
+python3 analysis/dsv41-drive/mirror-scaling/analyze.py results/matrix.jsonl.gz results/matrix-raw.csv.gz
 ```
 
 The mirror_bench.c at `a7f0b89029` produced these numbers. The later io_uring-options version keeps the same defaults
 and the same row sequence. Raw data is in `results/`:
 
-- `matrix.jsonl` and `weights.jsonl`: one line per cell;
+- `matrix.jsonl.gz` and `weights.jsonl.gz`: one line per cell;
 - `*-raw.csv.gz`: one line per row, with label, row, layer, expert, row µs and each root's part-completion µs;
-- `run.log`.
+- `run.txt` (the runs' rc log).
 
 Drive names: nvme0 = nvme0n1, Samsung 990 EVO Plus (/mnt/nvme0). SPCC = nvme2n1, DRAM-less, 64 MiB HMB (/mnt/nvme4).
 nvme2 = nvme3n1, Samsung 990 EVO Plus (/mnt/nvme2).

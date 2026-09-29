@@ -6,6 +6,7 @@ A cell caught in an SPCC slow episode (see episode()) is excluded; a later file'
 Usage: python3 analyze_uring.py uring-main.jsonl [uring-repair*.jsonl ...] [uring-top*.jsonl ...] [--list-episodes]
 """
 
+import gzip
 import json
 import statistics as st
 import sys
@@ -26,7 +27,7 @@ def load(*paths, flagged_out=None):
     """Every cell's latest clean record (later files re-run earlier files' episode cells)."""
     recs = []
     for path in paths:
-        for line in open(path):
+        for line in (gzip.open(path, "rt") if path.endswith(".gz") else open(path)):
             if line.startswith("{"):
                 j = json.loads(line)
                 if j["errors"] or j["short"]:
