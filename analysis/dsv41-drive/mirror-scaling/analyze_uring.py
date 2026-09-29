@@ -19,7 +19,7 @@ def episode(j, med):
     """An SPCC slow episode: the row far above its class median, or the Samsungs starved (util < 0.65) while the
     SPCC is saturated. Clean cells sit within 1.12x of the median with Samsung util >= 0.71 (a clear gap)."""
     sams = min(d["util"] for d in j["drives"] if d["disk"] != SPCC)
-    return j["p50_us"] > 1.5 * med or (j["qd"] <= 2 and sams < 0.65)
+    return j["p50_us"] > 1.5 * med or sams < 0.65
 
 
 def load(*paths, flagged_out=None):
