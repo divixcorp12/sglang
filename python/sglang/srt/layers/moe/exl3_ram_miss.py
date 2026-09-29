@@ -794,9 +794,9 @@ class Exl3RamMissService:
             share_recorder.register_pre_forward_observer(self._set_prefill_share)
         logger.info(
             "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases on, "
-            "row images on, copy engine %s",
+            "row images on, copy engine %s, build %s",
             len(tables.layer_ids), len(tables.paths), tables.slot_bytes, cfg.ram_miss_timeout_ms,
-            "on" if copy_engine else "off",
+            "on" if copy_engine else "off", self.host.variant,
         )
 
     def before_host_use(self) -> None:

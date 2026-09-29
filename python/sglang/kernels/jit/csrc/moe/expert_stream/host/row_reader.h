@@ -20,10 +20,10 @@ namespace expert_stream {
 // Trace: with no packing, row_pack_start/end are the clocks of a row's first and last publish (piece streaming)
 // or both the clock it was finished (without), pack_workers and pack_split are 0, and useful_bytes still counts its
 // segments.
-template <ExpertRowLayout Layout, AsyncFileReader Reader>
-class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader> {
-  using Base = ReaderCore<RowReader<Layout, Reader>, Layout, Reader>;
-  friend class ReaderCore<RowReader<Layout, Reader>, Layout, Reader>;
+template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
+class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Reader, Build> {
+  using Base = ReaderCore<RowReader<Layout, Reader, Build>, Layout, Reader, Build>;
+  friend class ReaderCore<RowReader<Layout, Reader, Build>, Layout, Reader, Build>;
   using Base::c_;
   using Base::direct_;
   using Base::fault_;

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "../lease_layout.h"
+#include "build_policy.h"
 #include "tier_protocol.h"
 
 namespace sglang {
@@ -231,7 +232,11 @@ class HostCopyBackend : public CopyBackend {
 // The copy thread: issues each job's copies on the backend's stream, records one mark after them, polls marks in
 // order and hands each completed job to `complete`. A backend error hands every job it still holds to `fail` and
 // stops issuing: nothing it issued may be assumed complete, so none of those leases is released (E5).
+// `Build`: the tier's build policy (build_policy.h).
+template <class Build>
 class CopyEngine {
+  static_assert(BuildPolicy<Build>);
+
  public:
   // complete: the job's copies completed; false when it still waits for the copy wait's SmAck, which `acked` then
   // polls (true once it released the job's leases).

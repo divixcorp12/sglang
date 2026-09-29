@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include "../row_layout.h"
+#include "build_policy.h"
 #include "file_reader.h"
 #include "piece_geometry.h"
 #include "read_cuts.h"
@@ -54,10 +55,16 @@ struct SqeRecord {
 // destination, advance, collect, quiesce, poison_slot and after_finish, each private to the derived reader, which
 // befriends this class; `Derived::kScatter` picks the read opcode. Derived readers are never deleted through this
 // class, so its destructor is protected and not virtual.
-template <class Derived, ExpertRowLayout Layout, AsyncFileReader Reader>
+//
+// `Build` (ProdBuild or InstrBuild, build_policy.h) is explicit, never read from `Derived`: `Derived` is incomplete
+// while this base is instantiated, and the derived reader forwards the same `Build` it was given.
+template <class Derived, ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 class ReaderCore {
+  static_assert(BuildPolicy<Build>);
+
  public:
   using LayoutType = Layout;  // named so it cannot shadow the template parameter
+  using BuildType = Build;
   using SqeRecord = expert_stream::SqeRecord;
 
   ReaderCore(const ReaderCore&) = delete;  // owns fds and the ring

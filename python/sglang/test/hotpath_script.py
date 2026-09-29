@@ -42,9 +42,8 @@ def build_host(tmp_path, *, variant=None, threaded=False):
                        mirror_weights=(1.0, 1.0))
     page = new_page(pin=False)
     hot = torch.zeros(HOT_RECORDS * hot_record_bytes(EXPERTS), dtype=torch.uint8)
-    kwargs = {} if variant is None else {"variant": variant}
     host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32),
-                            hot_page=hot, **kwargs)
+                            hot_page=hot, variant=variant)
     host.enable_lease_mode()
     host.enable_two_phase()
     host.enable_piece_stream()

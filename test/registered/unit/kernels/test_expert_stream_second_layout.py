@@ -16,8 +16,10 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 TWO_NAME = Path(__file__).resolve().parent / "expert_stream_two_name"
+# The instrumented build only (the tests' default variant, sglang.test.expert_stream_variant): the fixture's
+# enable_trace needs it, and the layout is what this file tests, not the build.
 TWO = TransportBuild(
-    host_source=str(TWO_NAME / "two_name_host.cpp"),
+    host_sources={"instr": str(TWO_NAME / "two_name_host.cpp")},
     device_source=str(TWO_NAME / "two_name_device.cuh"),
     device_layout="sglang::expert_stream::testing::TwoNameLayout",
 )
@@ -61,7 +63,9 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     )
     loaded = []
     real = transport._host_module
-    monkeypatch.setattr(transport, "_host_module", lambda layout="exl3": loaded.append(layout) or real(layout))
+    monkeypatch.setattr(
+        transport, "_host_module", lambda layout="exl3", variant=None: loaded.append(layout) or real(layout, variant)
+    )
     page = new_page(pin=False)
     slot_map = torch.full(tuple(t.starts.shape), -1, dtype=torch.int32)
     host = ExpertStreamHost(tables, page=page, slot_map=slot_map, layout="two")

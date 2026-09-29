@@ -474,10 +474,11 @@ def test_the_device_side_passes_the_lease_layouts_row_capacity_to_the_hit_wait_l
                                                                   ("expert_stream_lease_hit_wait", 7)]
 
 
-def test_the_exl3_host_file_is_only_bindings():
-    """Every export body lives once, in HostExports (expert_stream/host/ffi_exports.h); the EXL3 file only names its
-    layout and reader. Red when a body grows back into exl3_ram_miss_host.cpp."""
-    path = CSRC / "exl3_ram_miss_host.cpp"
+@pytest.mark.parametrize("name", ["exl3_ram_miss_host.cpp", "exl3_ram_miss_host_instr.cpp"])
+def test_the_exl3_host_file_is_only_bindings(name):
+    """Every export body lives once, in HostExports (expert_stream/host/ffi_exports.h); each EXL3 file (one per build)
+    only names its layout, reader and build. Red when a body grows back into one of them."""
+    path = CSRC / name
     lines = path.read_text().splitlines()
     bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]
     assert not bodies, f"{path.name} defines functions: {bodies}"

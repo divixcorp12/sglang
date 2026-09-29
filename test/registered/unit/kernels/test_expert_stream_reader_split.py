@@ -21,13 +21,13 @@ def test_the_core_names_no_path_specific_mechanism():
     for word in ("t_.images", "bounce_", "pool_", "jobs_", "PackPool", "image_iovecs", "publish_landed",
                  "posix_memalign", "check_image_alignment"):
         assert word not in core, word
-    assert "template <class Derived, ExpertRowLayout Layout, AsyncFileReader Reader>" in core
+    assert "template <class Derived, ExpertRowLayout Layout, AsyncFileReader Reader, class Build>" in core
     assert "class ReaderCore" in core
 
 
 def test_each_derived_reader_holds_only_its_own_mechanism():
     row = _code("row_reader.h")
-    assert "class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader>" in row
+    assert "class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Reader, Build>" in row
     for word in ("bounce_", "pool_", "PackPool", "PackJob", "dispatch_ready", "set_pack", "packing_cpus"):
         assert word not in row, word
 
@@ -38,6 +38,6 @@ def test_the_bounce_path_keeps_the_scalar_read_opcode():
 
 
 def test_the_tier_and_ffi_read_through_the_row_reader():
-    assert "using Source = RowReader<Layout, Reader>;" in _code("ffi_exports.h")
+    assert "using Source = RowReader<Layout, Reader, Build>;" in _code("ffi_exports.h")
     for gone in ("pack_reader.h", "pack_pool.h", "any_reader.h"):
         assert not (HOST / gone).exists(), gone

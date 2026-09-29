@@ -17,6 +17,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
+from sglang.srt.environ import envs
 
 # Rows per io_uring batch, and per bounce bank: the C++ reader has kBanks = 2 banks of kBounceRows = 8
 # row slots each. A bank is reused only after every row read into it has packed.
@@ -27,38 +28,62 @@ if TYPE_CHECKING:
 
 
 class TransportBuild(msgspec.Struct, frozen=True):
-    """One instantiation of the transport: the host translation unit that binds its C++ layout and file reader, the
-    device translation unit RowCopyKernel is compiled in, and the device layout type it is instantiated with."""
+    """One instantiation of the transport: the host translation units that bind its C++ layout and file reader, one
+    per build variant (``VARIANTS``), the device translation unit RowCopyKernel is compiled in, and the device layout
+    type it is instantiated with."""
 
-    host_source: str
+    host_sources: dict[str, str]
     device_source: str
     device_layout: str
 
 
 # One row per format the transport is built for; adding a format adds a row, its instantiation files
-# (host_source, device_source) and the layout type they define.
+# (host_sources, device_source) and the layout type they define.
 LAYOUTS = {
     "exl3": TransportBuild(
-        host_source="moe/exl3_ram_miss_host.cpp",
+        host_sources={"prod": "moe/exl3_ram_miss_host.cpp", "instr": "moe/exl3_ram_miss_host_instr.cpp"},
         device_source="moe/exl3_ram_miss.cuh",
         device_layout="sglang::exl3::Exl3RowLayout",
     )
 }
 
+# The host builds (plan 2026-09-29-hotpath-zero-overhead D2, build_policy.h): production (ProdBuild) and instrumented
+# (InstrBuild). Each is its own module exporting the same entry points.
+VARIANTS = ("prod", "instr")
+# Tests set this (sglang.test.expert_stream_variant, through test/registered/unit/{kernels,layers/moe}/conftest.py)
+# to load the instrumented build, whose test-only entry points (faults, the stage trace) most of them use. None:
+# host_variant() decides.
+_DEFAULT_VARIANT: Optional[str] = None
+
+
+def host_variant() -> str:
+    """The host build a new service loads (spec D3): the instrumented one when this process writes a stream trace
+    (SGLANG_DSV41_EXPERT_TRACE_PATH) or injects a RAM-miss fault (SGLANG_TEST_DSV41_RAM_MISS_FAULT), else production."""
+    if _DEFAULT_VARIANT is not None:
+        return _DEFAULT_VARIANT
+    if envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get() or envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get():
+        return "instr"
+    return "prod"
+
 
 # cache_once keys f(), f("exl3") and f(layout="exl3") apart; each cached loader below is called only positionally,
-# through a wrapper, so a layout has exactly one module whatever the call form.
-def _host_module(layout: str = "exl3") -> Module:
-    return _host_module_cached(layout)
+# through a wrapper, so a layout and variant have exactly one module whatever the call form.
+def _host_module(layout: str = "exl3", variant: Optional[str] = None) -> Module:
+    variant = host_variant() if variant is None else variant
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown host build variant {variant!r}; expected one of {VARIANTS}")
+    if variant not in LAYOUTS[layout].host_sources:
+        raise ValueError(f"layout {layout!r} has no {variant!r} host build variant")
+    return _host_module_cached(layout, variant)
 
 
 @cache_once
-def _host_module_cached(layout: str) -> Module:
+def _host_module_cached(layout: str, variant: str) -> Module:
     # Hidden by default: HostExports' registries and members stay private to each module's .so; only the
     # TVM_FFI_DLL_EXPORT entry points (visibility "default") are exported.
     return load_jit(
-        f"expert_stream_host_{layout}",
-        cpp_files=[LAYOUTS[layout].host_source],
+        f"expert_stream_host_{layout}_{variant}",
+        cpp_files=[LAYOUTS[layout].host_sources[variant]],
         extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden"],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
@@ -72,7 +97,7 @@ def host_layout(layout: str = "exl3") -> tuple[tuple[str, ...], int]:
 
 @cache_once
 def _host_layout_cached(layout: str) -> tuple[tuple[str, ...], int]:
-    module = _host_module(layout)
+    module = _host_module(layout)  # the default variant: every variant of a layout has the same layout
     return tuple(str(module.expert_stream_layout_names()).split("\n")), int(module.expert_stream_layout_small_mask())
 
 
@@ -132,14 +157,16 @@ def _table_args(tables, direct: bool = True) -> tuple:
     )
 
 
-def read_rows_once(tables, row: int, experts, slots, *, step: int = BOUNCE_ROWS, layout: str = "exl3") -> int:
+def read_rows_once(
+    tables, row: int, experts, slots, *, step: int = BOUNCE_ROWS, layout: str = "exl3", variant: Optional[str] = None
+) -> int:
     """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++: 1 ok, 0 failed.
 
     ``step`` rows go to io_uring per batch (at most ``BOUNCE_ROWS``).
     """
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     return int(
-        _host_module(layout).expert_stream_read_rows(
+        _host_module(layout, variant).expert_stream_read_rows(
             *_table_args(tables), row, expert_ids, slot_ids, int(step)
         )
     )
@@ -227,6 +254,7 @@ def read_rows_traced(
     step: int = BOUNCE_ROWS,
     owner_core: int = -1,
     layout: str = "exl3",
+    variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, dict]:
     """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
@@ -241,9 +269,9 @@ def read_rows_traced(
     admitted, the rows admitted were still read and packed, the rest never read)."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout, variant), dtype=torch.int64)
     result = int(
-        _host_module(layout).expert_stream_read_rows_traced(
+        _host_module(layout, variant).expert_stream_read_rows_traced(
             *_table_args(tables),
             row,
             expert_ids,
@@ -268,6 +296,7 @@ def read_rows_with_fault(
     cqes: Optional[list[int]] = None,
     stats: Optional[dict] = None,
     layout: str = "exl3",
+    variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, int]:
     """Test only: on one C++ reader, read with an injected fault, then read cleanly.
@@ -316,7 +345,7 @@ def read_rows_with_fault(
     then = _checked_rows(tables, row, then_experts, then_slots)
     fault = _fault_tensor(**faults)
     results = torch.zeros(12, dtype=torch.int64)
-    _host_module(layout).expert_stream_read_rows_faulted(
+    _host_module(layout, variant).expert_stream_read_rows_faulted(
         *_table_args(tables), row, *first, *then, fault, results
     )
     if cqes is not None:
@@ -339,6 +368,7 @@ def read_rows_sqes(
     step: int = BOUNCE_ROWS,
     max_sqes: int = 4096,
     layout: str = "exl3",
+    variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
     """Test only: ``read_rows_traced``'s read, also returning every SQE the reader prepared, in order, as
@@ -348,10 +378,10 @@ def read_rows_sqes(
     ``leg_stride`` (the legs a read may have). Faults and ``piece_stream`` as ``read_rows_with_fault``."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout, variant), dtype=torch.int64)
     sqes = torch.zeros((max_sqes, 4), dtype=torch.int64)
     info = torch.zeros(11, dtype=torch.int64)
-    _host_module(layout).expert_stream_read_rows_sqes(
+    _host_module(layout, variant).expert_stream_read_rows_sqes(
         *_table_args(tables), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
     )
     (result, count, descriptors, credit, cqes, fixed_cuts, fanout_sqes, cut_reads, gap_cuts, min_cut_bytes,
@@ -368,11 +398,13 @@ def read_rows_sqes(
     )[0]
 
 
-def publish_piece(word: int, generation: int, bit: int, *, layout: str = "exl3") -> tuple[bool, int]:
+def publish_piece(
+    word: int, generation: int, bit: int, *, layout: str = "exl3", variant: Optional[str] = None
+) -> tuple[bool, int]:
     """Test only: the reader owner's publish primitive on one readiness word holding ``word`` (``generation << 8 |
     bits``): whether it set ``bit``, and the word afterwards."""
     cell = torch.tensor([word - (1 << 64) if word >= 1 << 63 else word], dtype=torch.int64)
-    done = int(_host_module(layout).expert_stream_publish_piece(cell, int(generation), int(bit)))
+    done = int(_host_module(layout, variant).expert_stream_publish_piece(cell, int(generation), int(bit)))
     return bool(done), int(cell[0]) & 0xFFFFFFFFFFFFFFFF
 
 
@@ -393,6 +425,7 @@ def read_rows_pieces(
     ref_slots=None,
     step: int = BOUNCE_ROWS,
     layout: str = "exl3",
+    variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, dict, torch.Tensor, dict]:
     """Test only: ``read_rows_traced``'s read with piece streaming's publishing: row ordinal o's pieces are published
@@ -406,11 +439,11 @@ def read_rows_pieces(
     if masks is None:
         masks = torch.full((len(expert_ids), 1), piece_word(generation), dtype=torch.int64)
     fault = _fault_tensor(**faults)
-    record = torch.zeros(_stage_words(layout), dtype=torch.int64)
+    record = torch.zeros(_stage_words(layout, variant), dtype=torch.int64)
     info = torch.zeros(5, dtype=torch.int64)
     ref = reference if reference is not None else torch.zeros(0, dtype=torch.int64)
     ref_ids = _ids(ref_slots) if ref_slots is not None else torch.zeros(0, dtype=torch.int64)
-    _host_module(layout).expert_stream_read_rows_pieces(
+    _host_module(layout, variant).expert_stream_read_rows_pieces(
         *_table_args(tables), row, expert_ids, slot_ids, int(step), fault, record, masks, int(generation), ref,
         ref_ids, info,
     )
@@ -420,7 +453,9 @@ def read_rows_pieces(
     )
 
 
-def piece_geometry(tables, row: int, expert: int, *, layout: str = "exl3") -> Optional[tuple[list[dict], list[dict]]]:
+def piece_geometry(
+    tables, row: int, expert: int, *, layout: str = "exl3", variant: Optional[str] = None
+) -> Optional[tuple[list[dict], list[dict]]]:
     """Test only: the sub-reads and pieces the C++ reader cuts expert ``expert`` of streamed row ``row`` into
     under piece streaming, or None when it refuses the row. Sub-reads, in file order: ``{file, offset, length,
     dest, part, k}``. Pieces (``STAGE_PIECES``): ``{deps, runs}``, ``deps`` the bitmask of sub-reads the piece
@@ -429,7 +464,9 @@ def piece_geometry(tables, row: int, expert: int, *, layout: str = "exl3") -> Op
     subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
     pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
     count = int(
-        _host_module(layout).expert_stream_piece_geometry(*_table_args(tables)[:-1], row, expert, subs, pieces)
+        _host_module(layout, variant).expert_stream_piece_geometry(
+            *_table_args(tables)[:-1], row, expert, subs, pieces
+        )
     )
     if count < 0:
         return None
@@ -495,8 +532,8 @@ STAGE_ORDER = (
 )
 
 
-def _stage_words(layout: str = "exl3") -> int:
-    words = int(_host_module(layout).expert_stream_trace_words())
+def _stage_words(layout: str = "exl3", variant: Optional[str] = None) -> int:
+    words = int(_host_module(layout, variant).expert_stream_trace_words())
     if words != len(STAGE_FIELDS):
         raise RuntimeError(f"C++ StageRecord has {words} words, STAGE_FIELDS {len(STAGE_FIELDS)}")
     return words
@@ -704,6 +741,7 @@ def sim_post(
     armed: bool = True,
     lanes: Optional[int] = None,
     layout: str = "exl3",
+    variant: Optional[str] = None,
 ) -> int:
     """Post a record as the device post kernel does; returns its sequence.
 
@@ -714,21 +752,21 @@ def sim_post(
     its need is non-empty or advisories are on; the thread only touches for an unarmed one.
     """
     return int(
-        _host_module(layout).expert_stream_sim_post(
+        _host_module(layout, variant).expert_stream_sim_post(
             page, row, _ids(need), _ids(protect), int(advisory), after, int(armed), len(list(need)) if lanes is None else int(lanes)
         )
     )
 
 
-def sim_wait(page, seq: int, timeout_s: float, *, layout: str = "exl3") -> int:
+def sim_wait(page, seq: int, timeout_s: float, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
     """Wait as the device wait kernel does: 1 served, 2 failed, 0 timed out, 3 fatal already raised."""
-    return int(_host_module(layout).expert_stream_sim_wait(page, seq, int(timeout_s * 1e9)))
+    return int(_host_module(layout, variant).expert_stream_sim_wait(page, seq, int(timeout_s * 1e9)))
 
 
-def seqlock_stress(seconds: float, *, layout: str = "exl3") -> tuple[int, int]:
+def seqlock_stress(seconds: float, *, layout: str = "exl3", variant: Optional[str] = None) -> tuple[int, int]:
     """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted)."""
     out = torch.zeros(2, dtype=torch.int64)
-    _host_module(layout).expert_stream_seqlock_stress(int(seconds * 1e9), out)
+    _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
     return int(out[0]), int(out[1])
 
 
@@ -750,7 +788,8 @@ class ExpertStreamHost:
     ``tables``: ``Exl3RamMissTables``; ``page``: a ``new_page`` tensor; ``slot_map``:
     int32 ``[layers, experts]`` filled with -1 (pinned for a real device). Row ``r`` is
     streamed layer ``tables.layer_ids[r]``. Requests are served by ``pump()`` until
-    ``start_thread()``, then by the C++ service thread until ``stop()``.
+    ``start_thread()``, then by the C++ service thread until ``stop()``. ``variant``: the host build to load
+    (``VARIANTS``), by default ``host_variant()``'s choice; kept as ``self.variant``.
     """
 
     def __init__(
@@ -762,6 +801,7 @@ class ExpertStreamHost:
         lease_block: Optional[torch.Tensor] = None,
         hot_page: Optional[torch.Tensor] = None,
         layout: str = "exl3",
+        variant: Optional[str] = None,
     ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
             raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
@@ -773,7 +813,9 @@ class ExpertStreamHost:
         if not bool((slot_map == -1).all()):
             raise ValueError("slot_map must start filled with -1 (the C++ tiers start empty)")
         self._layout = layout
-        self._module = _host_module(self._layout)
+        # The host build (VARIANTS), chosen once here: every later call goes to this module.
+        self.variant = host_variant() if variant is None else variant
+        self._module = _host_module(self._layout, self.variant)
         self.threaded = False
         # The lease block (LEASE_PROTOCOL.md section 4): the service writes its header and slot generations
         # through a raw address, so this object holds it. Allocated here when the caller passes none.
@@ -1134,7 +1176,7 @@ class ExpertStreamHost:
     def enable_trace(self, capacity: int = 8192) -> None:
         """Record one stage record per served request, up to ``capacity`` undrained (more are dropped
         and counted). Before ``start_thread``; with it off the service takes no timestamps."""
-        _stage_words(layout=self._layout)
+        _stage_words(self._layout, self.variant)
         self._module.expert_stream_trace_enable(self.handle, int(capacity))
 
     def drain_trace(self, limit: int = 4096) -> list[dict]:

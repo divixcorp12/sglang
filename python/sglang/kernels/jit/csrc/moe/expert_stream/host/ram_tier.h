@@ -40,6 +40,7 @@ template <class Source>
 class RamTier {
  public:
   using Layout = typename Source::LayoutType;
+  using Build = typename Source::BuildType;  // ProdBuild or InstrBuild (build_policy.h)
 
   RamTier(
       uint8_t* page,
@@ -481,7 +482,7 @@ class RamTier {
     } else {
       backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device));
     }
-    auto engine = std::make_unique<CopyEngine>(
+    auto engine = std::make_unique<CopyEngine<Build>>(
         std::move(backend),
         layers_,
         spin_ns,
@@ -1851,7 +1852,7 @@ class RamTier {
   int64_t lease_c_ = 0;                 // byte offset of area C (CopyDone)
   bool piece_stream_ = false;           // set before the service thread starts, with the reader's flag
   // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
-  std::unique_ptr<CopyEngine> copy_engine_;
+  std::unique_ptr<CopyEngine<Build>> copy_engine_;
   std::atomic<bool> copy_armed_{false};
   // Native prefetch: the page (null when off), the last request generation read (service thread), the one lease a
   // prefetch holds (at most one is outstanding: the device waits for its done word before posting the next), and per

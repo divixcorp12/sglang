@@ -20,6 +20,8 @@ namespace expert_stream {
 template <class Tier>
 class RamThread {
  public:
+  using Build = typename Tier::Build;
+
   RamThread(std::shared_ptr<Tier> tier, int cpu_core, int64_t fatal_wait_ns, int64_t spin_ns)
       : tier_(std::move(tier)),
         page_(tier_->page()),

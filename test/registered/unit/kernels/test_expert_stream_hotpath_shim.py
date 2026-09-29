@@ -63,11 +63,11 @@ def test_the_shim_counts_a_named_threads_calls_and_nothing_else(shim, tmp_path):
 
 
 def test_characterize_the_hot_path(shim, tmp_path):
-    """Prints the per-request counts of the build the service loads, so the baseline (master) and every later phase
-    can be compared. It asserts that the measurement happened -- the requested window was measured, every kind was
-    read for both threads, and the shim recognized exactly one service and one copy thread by name -- not what the
-    counts are; the zero-count tests of later tasks do that."""
-    counts = hotpath_shim.run_child(shim, requests=REQUESTS, tmp=tmp_path)
+    """Prints the per-request counts of the production build (the one a service loads with no trace or fault), so the
+    baseline (master) and every later phase can be compared. It asserts that the measurement happened -- the
+    requested window was measured, every kind was read for both threads, and the shim recognized exactly one service
+    and one copy thread by name -- not what the counts are; the zero-count tests of later tasks do that."""
+    counts = hotpath_shim.run_child(shim, variant="prod", requests=REQUESTS, tmp=tmp_path)
     assert counts["requests"] == REQUESTS
     for th in hotpath_shim.THREADS:
         assert set(counts[th]) == set(hotpath_shim.KINDS), (th, counts[th])

@@ -1,10 +1,12 @@
 // The expert-stream host FFI surface, written once for every row layout and file reader. An instantiation file
-// names a layout and a reader and expands EXPERT_STREAM_HOST_EXPORTS; see exl3_ram_miss_host.cpp.
+// names a layout, a reader and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS; see
+// exl3_ram_miss_host.cpp (ProdBuild) and exl3_ram_miss_host_instr.cpp (InstrBuild).
 #pragma once
 
 #include <sgl_kernel/tensor.h>
 
 #include "../tensor_checks.h"
+#include "build_policy.h"
 #include "row_reader.h"
 #include "ram_thread.h"
 
@@ -14,9 +16,10 @@ using tvm::ffi::TensorView;
 
 /// \brief Every host export of one transport instantiation. Its function-local registries are per instantiation,
 /// and each layout is its own module, so one layout's handles can never resolve in another's.
-template <ExpertRowLayout Layout, AsyncFileReader Reader>
+template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 struct HostExports {
-  using Source = RowReader<Layout, Reader>;
+  static_assert(BuildPolicy<Build>);
+  using Source = RowReader<Layout, Reader, Build>;
   using Tier = RamTier<Source>;
   using Thread = RamThread<Tier>;
 
@@ -81,6 +84,11 @@ struct HostExports {
     const auto found = thread_registry().find(handle);
     if (found == thread_registry().end()) throw std::runtime_error(error_prefix<Layout>() + "no service thread");
     return found->second;
+  }
+
+  /// \brief The build policy this module was compiled with: "prod" or "instr" (build_policy.h).
+  static std::string build_name() {
+    return std::string(Build::kName);
   }
 
   /// \brief The layout this module was built for: its tensor names in copy-table order, newline-joined.
@@ -1173,6 +1181,7 @@ struct HostExports {
 
 // One line per export; the list is the module's whole Python-visible surface.
 #define EXPERT_STREAM_HOST_EXPORTS(Exports)                                                             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_build_name, Exports::build_name);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_names, Exports::layout_names);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_small_mask, Exports::layout_small_mask);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                           \
