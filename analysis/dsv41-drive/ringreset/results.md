@@ -13,10 +13,10 @@ Commits:
   tag is `~0 - 1`; a test hook, `publish_sq_without_enter`, is added.
 - `2c4a598712`: the fake-liburing driver contract now asserts the NOP drain.
 
-> **Memory-pressure caveat.** From about 01:15 CDT on 2026-09-29, divix01 had about 150 GiB of pinned host memory
-> leaked by another agent's clone-buffers experiment: node 0 had 1.2 GiB free and swap was in use. **Every divix01
-> timing number below was taken after 01:15 and is not valid as a timing. Re-take them after the reboot.**
-> Pass/fail results were checked the same way, but repeat them too.
+> **Timing provenance.** The numbers below were re-taken after divix01's reboot (2026-09-29 02:05-02:56 CDT, about
+> 133 GiB free, swap unused). A first set was taken after about 01:15 under memory pressure: another agent's
+> clone-buffers experiment had leaked about 150 GiB of pinned memory and swap was in use. That set appears only in
+> the "Earlier runs" note and is not valid as a timing.
 
 ## The defect
 
@@ -68,30 +68,36 @@ NOP, which every io_uring kernel has.
 In every case the abandoned rows stay unwritten (0xcd fill). The next read on the same ring gets exactly one
 completion, its own, with the right bytes.
 
-## Reset time at 1.5 GiB (divix01, under memory pressure: re-take)
+## Reset time at 1.5 GiB (divix01, after the reboot)
 
-These come from `test/manual/dsv41/test_expert_stream_fixed_buffers_big.py::test_a_ring_reset_keeps_the_big_slab_registered`,
-with a 1,613,631,488 B slab in 3 chunks, run under `numactl --membind=1`.
+Test: `test/manual/dsv41/test_expert_stream_fixed_buffers_big.py::test_a_ring_reset_keeps_the_big_slab_registered`.
+It uses a 1,613,631,488 B slab in 3 chunks and runs under `rowimg-disk.lock`, `numactl --membind=1` and
+`taskset -c 0-63`. Each worktree printed its `sglang.__file__`.
 
 | commit | MODE / READ_MODE | drain_ms | register_ms | registrations |
 |---|---|---|---|---|
-| before `0931fbe42f` | default / fixed | 535.9 | 535.3 | 2 |
-| before `0931fbe42f` | default / readv_fixed | 109.3 | 91.6 | 2 |
-| after `e5291d8c52` | default / fixed | 0.010 | 774.5 | 1 |
-| after `e5291d8c52` | default / readv_fixed | 0.011 | 742.4 | 1 |
-| after `e5291d8c52` | iopoll / readv_fixed | 0.013 | 1403.0 | 1 |
+| before `0931fbe42f` | default / fixed | 595.5 | 555.0 | 2 |
+| before `0931fbe42f` | default / readv_fixed | 898.6 | 839.4 | 2 |
+| before `0931fbe42f` | iopoll / readv_fixed | 780.1 | 777.7 | 2 |
+| after `f8307deb21` | default / fixed | 0.011 | 739.3 | 1 |
+| after `f8307deb21` | default / readv_fixed | 0.017 | 731.6 | 1 |
+| after `f8307deb21` | iopoll / readv_fixed | 0.012 | 565.5 | 1 |
 
-Before the fix a reset costs one full registration: `drain_ms ≈ register_ms`. After it, the drain costs about
-10 µs whatever the tier size. The `register_ms` spread (92-1403 ms for the same 1.5 GiB) shows the memory pressure
-and THP state, which is why these numbers need re-taking.
+- **Before the fix,** a reset costs one full registration plus the ring teardown: `drain_ms ≈ register_ms + 3-60 ms`.
+- **After the fix,** the drain takes 11-17 µs and never registers.
 
 **Extrapolated to 90 GiB:**
 
-- **Before:** measured production was 59.2 s at 100 GiB. Scaling linearly gives about 53 s at 90 GiB. That is a
-  lower bound, because the pin accounting is superlinear when THP falls back to 4 KiB. Scaling this run's
-  1.5 GiB figures linearly gives 5.5-46 s, which shows how much the pressured numbers vary.
-- **After:** about 10 µs, independent of size. The drain touches only the ≤ queue-depth unconsumed SQEs and never
-  the table.
+- **Before:** measured production was 59.2 s at 100 GiB (uring-reg R3), so linear scaling gives about 53 s at
+  90 GiB. That is a lower bound, because the pin accounting is superlinear when THP falls back to 4 KiB. Linear
+  scaling from 1.5 GiB gives 31-47 s at 90 GiB (60 × 0.52-0.78 s), which also runs past the 30 s `fatal_wait`.
+- **After:** about 10-20 µs. The drain touches only the unconsumed SQEs (at most the queue depth), whatever the
+  tier size.
+
+**Earlier runs, under memory pressure, not valid as timings:**
+
+- before: fixed 535.9 / 535.3 ms; readv_fixed 109.3 / 91.6 ms (drain / register);
+- after: 0.010-0.013 ms, with `registrations` of 2 before and 1 after, the same as the re-take.
 
 ## Mutants (divix01, private worktree `wt-ringreset-mut` at `0a1f682b9e`, removed afterwards)
 
@@ -125,25 +131,40 @@ PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_HOME=/usr/local/cuda-13.4 \
 |---|---|
 | master `ba01695c35` (`wt-ringreset-base`) | 1933 passed, 23 skipped, EXIT=0 |
 | `0a1f682b9e` | 1947 passed, 2 failed, 23 skipped. The failures were both `test_uring_reader_driver_contract` cases: its fake liburing had no SQ ring to rewrite, and it asserted the old reset. Fixed in `2c4a598712`. |
-| head `2c4a598712` | PENDING (queued behind `cc-gpu.lock`) |
+| head `f8307deb21` (after the reboot) | **1949 passed**, 23 skipped, EXIT=0 |
+
+The delta is +16 passed: the 15 cases of the new `test_expert_stream_ring_reset.py`, plus
+`test_a_refused_nop_drain_through_the_reader` in `test_expert_stream_fixed_buffers.py`. There are no new failures
+or skips. The master count was taken before 01:15, before the memory pressure.
 
 Targeted run at head `2c4a598712`, CPU, `taskset -c 0-63`: `test_expert_stream_uring_options.py`,
 `test_expert_stream_ring_reset.py` and `test_expert_stream_fixed_buffers.py` gave 48 passed, EXIT=0.
 
 ## Pre-existing, not caused by this branch
 
-- `test_big_fixed_slab_memlock_refused` fails at master `ba01695c35` as well. Under `RLIMIT_MEMLOCK=262144` the
-  ring's own creation already fails with ENOMEM ("creating the ring for registered buffers or files"), before any
-  registration. So the test's expected "registering fixed buffers" refusal never appears.
-- With `MODE=iopoll`, `test_big_fixed_slab_real_kernel` ran into its 300 s subprocess timeout at the branch head.
-  The master run of the same case was stopped when the lead held big-slab runs, so it is not yet known whether
-  master hangs too. Re-check both after the reboot: this may be a pre-existing IOPOLL issue in the harness's
-  `settle` loop, or it may be the memory pressure. The `reset` case, in the same file and mode, passed
-  (`registrations=1`, `drain_ms=0.013`).
+- **`test_big_fixed_slab_real_kernel` with `MODE=iopoll` times out after 300 s at master `ba01695c35` as well**
+  (02:22 CDT, after the reboot). The head times out the same way. So the hang is a pre-existing problem between the
+  big-slab harness's `settle` loop and IOPOLL, not this branch. The `reset` case under IOPOLL passes at the head
+  (`registrations=1`, `drain_ms=0.012`). The IOPOLL NOP drain therefore works on a polled NVMe queue.
+- `test_big_fixed_slab_memlock_refused` failed at master before the reboot, when ring creation itself hit ENOMEM
+  under `RLIMIT_MEMLOCK=262144`. It **passes after the reboot** at the head in both default modes. The earlier
+  failure was environmental.
 
-## To re-take after the reboot
+## Verdict
 
-1. The big-slab `reset` case, before (`0931fbe42f`) and after (head): default/fixed, default/readv_fixed and
-   iopoll/readv_fixed.
-2. The IOPOLL `test_big_fixed_slab_real_kernel` case at master and at head.
-3. The kernels suite at head, if the queued run finished under pressure.
+The branch is ready to merge, as far as this defect is concerned:
+
+- the unit, contract and suite tests are green;
+- the re-registration is gone (registrations 2 → 1);
+- the reset cost fell from one registration to microseconds;
+- 8 mutants were run, and all are killed, M3 through the fake contract.
+
+Two conflicts with `cc/hotpath-zero-overhead` are expected, both small:
+
+- `read_fault.h`: the `ReadFault` field, the word-30 decode and the layout comment;
+- `reader_core.h`: `set_fault`'s `SubmitFault` initializer and condition.
+
+This branch also touches `file_reader.h` (`SubmitFault`), `faulty_reader.h` and
+`test_expert_stream_uring_options.py` (the fake).
+
+Open follow-up, unrelated to this fix: the IOPOLL `real_kernel` harness hang, which also happens at master.
