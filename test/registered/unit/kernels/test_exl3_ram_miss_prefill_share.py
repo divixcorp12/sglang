@@ -31,7 +31,7 @@ def tier(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=4, experts=EXPERTS)
     page = new_page(pin=False)
     host = ExpertStreamHost(
-        s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), direct=True
+        s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32)
     )
     yield page, host
     host.stop()

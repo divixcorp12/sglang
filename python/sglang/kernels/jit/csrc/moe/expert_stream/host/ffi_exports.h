@@ -5,7 +5,7 @@
 #include <sgl_kernel/tensor.h>
 
 #include "../tensor_checks.h"
-#include "any_reader.h"
+#include "row_reader.h"
 #include "ram_thread.h"
 
 namespace sglang::expert_stream {
@@ -16,7 +16,7 @@ using tvm::ffi::TensorView;
 /// and each layout is its own module, so one layout's handles can never resolve in another's.
 template <ExpertRowLayout Layout, AsyncFileReader Reader>
 struct HostExports {
-  using Source = AnyReader<Layout, Reader>;
+  using Source = RowReader<Layout, Reader>;
   using Tier = RamTier<Source>;
   using Thread = RamThread<Tier>;
 
@@ -168,9 +168,7 @@ struct HostExports {
     Source reader(
         tables_from<Layout>(
             extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
-        direct != 0,
-        f[19],
-        f[20]);
+        direct != 0);
     reader.set_owner_core(owner_core);
     if (f[22] != 0) reader.set_piece_stream(true);
     reader.set_fixed_chunk_cap(f[28]);
@@ -228,9 +226,7 @@ struct HostExports {
     Source reader(
         tables_from<Layout>(
             extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
-        direct != 0,
-        f[19],
-        f[20]);
+        direct != 0);
     if (f[22] != 0) reader.set_piece_stream(true);
     reader.set_fixed_chunk_cap(f[28]);
     reader.set_leg_cut_cap(f[31]);
@@ -244,7 +240,7 @@ struct HostExports {
     out[2] = reader.cqes();
     out[4] = reader.stale_cqes();
     out[5] = reader.generation_wraps();
-    out[6] = reader.unfinished_jobs();
+    out[6] = 0;  // reserved: formerly the packing jobs still open (the packed path is gone)
     out[7] = reader.pack_workers();
     out[8] = reader.fixed_cuts();
     out[9] = reader.fanout_sqes();
@@ -297,9 +293,7 @@ struct HostExports {
     Source reader(
         tables_from<Layout>(
             extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
-        direct != 0,
-        f[19],
-        f[20]);
+        direct != 0);
     if (f[22] != 0) reader.set_piece_stream(true);
     reader.set_fixed_chunk_cap(f[28]);
     reader.set_leg_cut_cap(f[31]);
@@ -404,7 +398,7 @@ struct HostExports {
         targets[o].words[targets[o].count++] = words + o * lanes + l;
     }
     const PiecePublish publish{static_cast<uint64_t>(generation), targets.data()};
-    Source reader(Tables(t), direct != 0, f[19], f[20]);
+    Source reader(Tables(t), direct != 0);
     if (f[22] != 0) reader.set_piece_stream(true);
     reader.set_fixed_chunk_cap(f[28]);
     reader.set_leg_cut_cap(f[31]);
@@ -602,63 +596,6 @@ struct HostExports {
     return refused;
   }
 
-  // Test only: build a packing pool as if the creating thread could run on the cores set in `inherited`
-  // (two int64 words, cores 0-127) and write each worker's affinity, as the kernel reports it, to `out`
-  // (two words per worker). Throws, like the pool, when no core is left.
-  static void pack_pool_affinity(TensorView inherited, int64_t workers, TensorView out) {
-    using namespace host;
-    auto cpu = SymbolicDevice{};
-    expert_stream::verify_named(
-        "inherited", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), inherited);
-    // Exact: two words per requested worker, bound before the pool starts a thread (the pool never builds fewer).
-    // A non-positive count would make the extent a wildcard or a negative size, so it is refused first.
-    if (workers < 1) throw std::runtime_error(error_prefix<Layout>() + "a packing pool needs at least one worker");
-    expert_stream::verify_named(
-        "out", TensorMatcher({2 * workers}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    for (int core = 0; core < 128; ++core) {
-      if ((static_cast<uint64_t>(bits[core / 64]) >> (core % 64)) & 1u) CPU_SET(core, &mask);
-    }
-    PackPool pool(
-        static_cast<unsigned>(workers),
-        mask,
-        static_cast<size_t>(kBounceSlots),
-        error_prefix<Layout>(),
-        std::string(Layout::kName) + "-pack");
-    auto* words = static_cast<int64_t*>(out.data_ptr());
-    for (size_t w = 0; w < pool.workers(); ++w) {
-      const cpu_set_t set = pool.worker_affinity(w);
-      words[2 * w] = words[2 * w + 1] = 0;
-      for (int core = 0; core < 128; ++core) {
-        if (CPU_ISSET(core, &set)) words[2 * w + core / 64] |= static_cast<int64_t>(uint64_t{1} << (core % 64));
-      }
-    }
-  }
-
-  // Test only: the cores a packing worker may use when the creating thread may use those set in `inherited`
-  // (two int64 words, cores 0-127), as two words in `out`. Starts no thread.
-  static void pack_worker_cpus(TensorView inherited, TensorView out) {
-    using namespace host;
-    auto cpu = SymbolicDevice{};
-    expert_stream::verify_named(
-        "inherited", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), inherited);
-    expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    const auto* bits = static_cast<const int64_t*>(inherited.data_ptr());
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    for (int core = 0; core < 128; ++core) {
-      if ((static_cast<uint64_t>(bits[core / 64]) >> (core % 64)) & 1u) CPU_SET(core, &mask);
-    }
-    const cpu_set_t allowed = expert_stream::pack_worker_cpus(mask);
-    auto* words = static_cast<int64_t*>(out.data_ptr());
-    words[0] = words[1] = 0;
-    for (int core = 0; core < 128; ++core) {
-      if (CPU_ISSET(core, &allowed)) words[core / 64] |= static_cast<int64_t>(uint64_t{1} << (core % 64));
-    }
-  }
-
   static int64_t open(
       TensorView page,
       TensorView slot_map,
@@ -676,7 +613,6 @@ struct HostExports {
       int64_t row_images,
       int64_t direct,
       TensorView lease,
-      int64_t pack_workers,
       TensorView hot_page) {
     using namespace host;
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
@@ -709,7 +645,6 @@ struct HostExports {
             extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
         std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
         direct != 0,
-        pack_workers,
         hot_page.size(0) ? static_cast<uint8_t*>(hot_page.data_ptr()) : nullptr,
         hot_page.size(0));
     if (!tier->open()) return -1;
@@ -1248,8 +1183,6 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_pieces, Exports::read_rows_pieces);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_geometry, Exports::piece_geometry);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_runs, Exports::piece_runs);                         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pack_pool_affinity, Exports::pack_pool_affinity);         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pack_worker_cpus, Exports::pack_worker_cpus);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_open, Exports::open);                                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_close, Exports::close);                                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump, Exports::pump);                                     \

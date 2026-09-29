@@ -190,11 +190,10 @@ def uring_env(monkeypatch):
     return set_
 
 
-def _setup(tmp_path, images, weights=None):
+def _setup(tmp_path, weights=None):
     root = tmp_path / "ckpt"
     root.mkdir()
-    dims = {} if images else dict(hidden=256, inter=512)
-    return ram_miss_setup(root, capacity=12, experts=12, mirror_weights=weights, row_images=images, **dims)
+    return ram_miss_setup(root, capacity=12, experts=12, mirror_weights=weights)
 
 
 def _snapshot(slabs):
@@ -211,17 +210,17 @@ def _equal(a, b):
 
 def _read(s, **faults):
     result, log, info, record = read_rows_sqes(
-        s.tables, 1, EXPERTS, SLOTS, direct=bool(s.tables.row_images), max_sqes=65536, **faults
+        s.tables, 1, EXPERTS, SLOTS, max_sqes=65536, **faults
     )
     return result, log, info, record, _snapshot(s.slabs)
 
 
-def _pieces(images, on):
-    return ({"piece_stream": True} | ({} if images else {"pack_workers": 2})) if on else {}
+def _pieces(on):
+    return {"piece_stream": True} if on else {}
 
 
 def test_cuts_off_keeps_todays_credit_and_legs(tmp_path, uring_env):
-    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    s = _setup(tmp_path, (1.0, 1.0, 1.0))
     assert s.tables.segments.shape[0] > 1  # a multi-segment row image: a read has several iovecs
     result, _, info, _, _ = _read(s)
     assert result == 1 and info["cut_reads"] == 0 and info["min_cut_bytes"] == 0
@@ -230,25 +229,24 @@ def test_cuts_off_keeps_todays_credit_and_legs(tmp_path, uring_env):
 
 
 def test_credit_scales_with_the_leg_bound(tmp_path, uring_env):
-    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    s = _setup(tmp_path, (1.0, 1.0, 1.0))
     result, _, info, _, _ = _read(s, leg_cut_cap=CUT)
     assert result == 1 and info["leg_stride"] > 1 and info["min_cut_bytes"] == CUT
     assert info["credit"] == min(32768, 16 * 3 * info["leg_stride"])
 
 
 def test_explicit_depth_below_the_leg_bound_is_refused(tmp_path, uring_env):
-    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    s = _setup(tmp_path, (1.0, 1.0, 1.0))
     uring_env(QUEUE_DEPTH=2)
     with pytest.raises(RuntimeError, match="SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=2"):
         _read(s, leg_cut_cap=CUT)
 
 
-@pytest.mark.parametrize("images", [False, True], ids=["bounce", "images"])
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
-def test_cut_reads_are_byte_identical_and_within_the_cut(tmp_path, uring_env, images, pieces):
-    s = _setup(tmp_path, images, (1.0, 1.0, 1.0))
-    base_result, base_log, _, base_rec, base_bytes = _read(s, **_pieces(images, pieces))
-    result, log, info, rec, cut_bytes = _read(s, leg_cut_cap=CUT, **_pieces(images, pieces))
+def test_cut_reads_are_byte_identical_and_within_the_cut(tmp_path, uring_env, pieces):
+    s = _setup(tmp_path, (1.0, 1.0, 1.0))
+    base_result, base_log, _, base_rec, base_bytes = _read(s, **_pieces(pieces))
+    result, log, info, rec, cut_bytes = _read(s, leg_cut_cap=CUT, **_pieces(pieces))
     assert base_result == result == 1 and _equal(cut_bytes, base_bytes)
     assert info["cut_reads"] > 0 and all(0 < length <= CUT for _, _, length, _ in log)
     assert all(offset % 512 == 0 and length % 512 == 0 for _, offset, length, _ in log)
@@ -269,7 +267,7 @@ def test_cut_reads_are_byte_identical_and_within_the_cut(tmp_path, uring_env, im
 
 
 def test_cuts_are_off_by_default_outside_iopoll(tmp_path, uring_env):
-    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    s = _setup(tmp_path, (1.0, 1.0, 1.0))
     _, base_log, _, _, _ = _read(s)
     uring_env(MODE="default", READ_CUTS="auto")
     result, log, info, _, _ = _read(s)
@@ -277,7 +275,7 @@ def test_cuts_are_off_by_default_outside_iopoll(tmp_path, uring_env):
 
 
 def test_read_cuts_on_uses_the_files_device_limits(tmp_path, uring_env):
-    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    s = _setup(tmp_path, (1.0, 1.0, 1.0))
     _, _, _, _, base_bytes = _read(s)
     uring_env(READ_CUTS=1)
     result, log, info, _, cut_bytes = _read(s)
@@ -286,7 +284,7 @@ def test_read_cuts_on_uses_the_files_device_limits(tmp_path, uring_env):
 
 
 def test_gap_cuts_at_slab_rows_off_the_page(tmp_path, uring_env):
-    s = _setup(tmp_path, True, (1.0, 1.0, 1.0))
+    s = _setup(tmp_path, (1.0, 1.0, 1.0))
     off_page = [name for layer in s.slabs.values() for name, t in layer.items()
                 if (t.numel() * t.element_size() // t.shape[0]) % 4096]
     assert off_page, "the fixture has no slab row off the page; gap cuts are untested"
@@ -297,24 +295,24 @@ def test_gap_cuts_at_slab_rows_off_the_page(tmp_path, uring_env):
 
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
 def test_cut_legs_completing_out_of_order(tmp_path, uring_env, pieces):
-    s = _setup(tmp_path, True)
-    _, _, _, _, base_bytes = _read(s, **_pieces(True, pieces))
-    result, _, info, _, cut_bytes = _read(s, leg_cut_cap=CUT, reverse_cqes=True, **_pieces(True, pieces))
+    s = _setup(tmp_path)
+    _, _, _, _, base_bytes = _read(s, **_pieces(pieces))
+    result, _, info, _, cut_bytes = _read(s, leg_cut_cap=CUT, reverse_cqes=True, **_pieces(pieces))
     assert result == 1 and info["cut_reads"] > 0 and _equal(cut_bytes, base_bytes)
 
 
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
 def test_a_held_cut_leg_keeps_its_read_unretired_and_its_pieces_unpublished(tmp_path, uring_env, pieces):
-    s = _setup(tmp_path, True)
-    _, _, _, _, base_bytes = _read(s, **_pieces(True, pieces))
-    result, _, _, rec, cut_bytes = _read(s, leg_cut_cap=CUT, hold_ordinal=0, leg=1, **_pieces(True, pieces))
+    s = _setup(tmp_path)
+    _, _, _, _, base_bytes = _read(s, **_pieces(pieces))
+    result, _, _, rec, cut_bytes = _read(s, leg_cut_cap=CUT, hold_ordinal=0, leg=1, **_pieces(pieces))
     assert result == 1 and _equal(cut_bytes, base_bytes)
     if pieces:
         assert rec["pieces_published"] == len(EXPERTS) * 8 and rec["piece_publish_refused"] == 0
 
 
 def test_one_short_cut_leg_resubmits_only_that_leg(tmp_path, uring_env):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     _, clean_log, _, _, base_bytes = _read(s, leg_cut_cap=CUT)
     result, log, _, rec, cut_bytes = _read(s, leg_cut_cap=CUT, part=0, part_short=512, leg=1)
     assert result == 1 and _equal(cut_bytes, base_bytes)
@@ -325,27 +323,26 @@ def test_one_short_cut_leg_resubmits_only_that_leg(tmp_path, uring_env):
 
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
 def test_one_failing_cut_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_path, uring_env, pieces):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     stats, cqes = {}, []
     first, then = read_rows_with_fault(
-        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=True, part=0, part_error=errno.EIO,
-        ordinal=0, leg=1, leg_cut_cap=CUT, stats=stats, cqes=cqes, **_pieces(True, pieces))
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], part=0, part_error=errno.EIO,
+        ordinal=0, leg=1, leg_cut_cap=CUT, stats=stats, cqes=cqes, **_pieces(pieces))
     assert (first, then) == (0, 1)
     assert stats["unfinished_jobs"] == 0 and stats["cut_reads"] > 0
 
 
 @pytest.mark.parametrize("submit_first", [False, True], ids=["unconsumed", "in_flight"])
 def test_ring_reset_with_cut_legs(tmp_path, uring_env, submit_first):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     first, then = read_rows_with_fault(
-        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=True,
-        submit_error=errno.EIO, submit_call=1, submit_first=submit_first, leg_cut_cap=CUT)
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], submit_error=errno.EIO, submit_call=1, submit_first=submit_first, leg_cut_cap=CUT)
     assert (first, then) == (0, 1)
 
 
 @pytest.mark.parametrize("read_mode", ["fixed", "readv_fixed"])
 def test_cuts_compose_with_the_fixed_fan_out(tmp_path, uring_env, read_mode):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     _, _, _, _, base_bytes = _read(s)
     uring_env(READ_MODE=read_mode)
     try:

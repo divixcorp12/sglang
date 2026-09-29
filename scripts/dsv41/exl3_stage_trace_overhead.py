@@ -96,7 +96,7 @@ class Arm:
         self.s = ram_miss_setup(root, capacity=CAPACITY, experts=EXPERTS)
         self.page = new_page(pin=False)
         self.host = ExpertStreamHost(
-            self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), direct=False
+            self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32)
         )
         if trace:
             self.host.enable_trace(capacity=ring)

@@ -102,19 +102,6 @@ class RamThread {
       CPU_ZERO(&cpus);
       CPU_SET(cpu_core_, &cpus);
       error = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
-    } else {
-      // Unpinned, it still keeps off the packing workers' CPUs: they copy there while a read is in service, and this
-      // is the thread that posts their jobs and publishes the pieces. Measured with parked workers only
-      // (PACK_WORKERS.md, 2026-09-24): with spinning workers the narrowing crowded the CPUs that take the SPCC
-      // mirror's completion interrupts and stalled its reads.
-      cpu_set_t cpus;
-      CPU_ZERO(&cpus);
-      if (pthread_getaffinity_np(pthread_self(), sizeof(cpus), &cpus) == 0) {
-        for (int cpu : tier_->packing_cpus())
-          CPU_CLR(cpu, &cpus);
-        // Best effort: a narrowing that fails leaves the thread as it was, which is how it ran before.
-        if (CPU_COUNT(&cpus) > 0) pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
-      }
     }
     tier_->set_counter(kSpinCpu, error != 0 ? -error : sched_getcpu());
     pin_error_.store(error);

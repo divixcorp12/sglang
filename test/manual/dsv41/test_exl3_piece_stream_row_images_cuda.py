@@ -1,10 +1,10 @@
 """Piece streaming's device side over the reader's direct mode (row images, plan 2026-09-24-dsv41-row-images Part B.6).
 
-Every test of test_exl3_piece_stream_cuda runs again here with the service's tables reading row images through
-O_DIRECT readv straight into the (cudaHostRegister'd) pinned slabs, so S, the stages and the fused consumer see
-pieces the drive wrote and the reader published without a copy. The images are built by the fixtures' reference
-builder beside the fake checkpoint; the harness is otherwise unchanged (its ``pack_workers`` are ignored by the direct
-mode, which starts no pool).
+Every test of test_exl3_piece_stream_cuda is collected here too, reading row images through O_DIRECT readv straight
+into the (cudaHostRegister'd) pinned slabs, so S, the stages and the fused consumer see pieces the drive wrote and the
+reader published without a copy. Since the packed path was deleted (plan 2026-09-29-hotpath-zero-overhead D4) that
+suite's harness builds row images itself, so this file no longer patches anything: it keeps the GPU run's entry point
+(and its test IDs) and adds the two tests below.
 
 Run on divix01 holding cc-gpu.lock, with PYTHONPATH pointing at the tree under test.
 """
@@ -21,47 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_exl3_piece_stream_cuda as cuda_suite  # noqa: E402
 from test_exl3_piece_stream_cuda import service  # noqa: E402,F401  (fixture of the reused tests)
 
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost  # noqa: E402
-from sglang.srt.layers.moe import exl3_ram_miss as ram_miss  # noqa: E402
-
 pytestmark = cuda_suite.pytestmark
 
 
-@pytest.fixture(autouse=True)
-def row_images(monkeypatch):
-    from sglang.srt.layers.moe.exl3_row_image import open_row_images
-    from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
-    from sglang.test.dsv41_ram_miss_fixtures import write_row_images
-
-    tables_of, host_init = ram_miss.exl3_ram_miss_tables, ExpertStreamHost.__init__
-
-    def image_tables(layout, segments, slabs, **mirrors):
-        # G1's real service passes row_images=None (the flag is off in its environment). A StreamService built with
-        # mirror_weights passes roots, policy and source_root: images then go on one root per mirror, split alike.
-        mirrors = {key: value for key, value in mirrors.items() if value is not None}
-        source = os.path.dirname(next(iter(layout.records.values())).path)
-        if mirrors:
-            assert set(mirrors) == {"roots", "policy", "source_root"}, sorted(mirrors)
-            roots = [source.rstrip("/") + f"_images{i}" for i in range(len(mirrors["roots"]))]
-            policy = mirrors["policy"]
-        else:
-            roots, policy = [source.rstrip("/") + "_images"], StaticSplitPolicy((1.0,))
-        write_row_images(layout, segments, source, roots, sorted(slabs))
-        images = open_row_images(roots, layout, segments, source, sorted(slabs))
-        return tables_of(
-            layout, segments, slabs, roots=roots, policy=policy, source_root=source, row_images=images,
-        )
-
-    def direct_host(self, tables, *args, direct, **kwargs):
-        host_init(self, tables, *args, direct=direct or tables.row_images, **kwargs)
-
-    monkeypatch.setattr(ram_miss, "exl3_ram_miss_tables", image_tables)
-    monkeypatch.setattr(ExpertStreamHost, "__init__", direct_host)
-    yield
-
-
 def test_the_harness_reads_row_images_with_o_direct(tmp_path):
-    """The fixture is what this file adds: without it every test below is a plain rerun of the bounce path."""
+    """The harness's tables are row images (the reader's only tables), and serving from them starts no pool."""
     s = cuda_suite.StreamService(tmp_path)
     try:
         assert s.tables.row_images and all(path.endswith(".rows") for path in s.tables.paths)
@@ -85,11 +49,11 @@ def _threads():
     return out
 
 
-# Its precondition is that two streamed rows are cut differently, so a wrong row index in S's piece table shows. Row
-# images cut every (row, expert) alike (identity segments, one image layout), so the precondition cannot hold and a
-# wrong row index is harmless for the table. What it also covers, a second layer's image file and slabs reaching S,
-# is test_a_second_layer_streams_its_own_image_rows below.
-NOT_REUSED = {"test_g1_a_second_layer_streams_its_own_rows_equal_to_the_flag_off_arm"}
+# test_g1_a_second_layer_streams_its_own_rows_equal_to_the_flag_off_arm was never collected here and is now deleted:
+# its precondition, two streamed rows cut differently, cannot hold for row images (identity segments cut every
+# (row, expert) alike). What it also covered, a second layer's image file and slabs reaching S, is
+# test_a_second_layer_streams_its_own_image_rows below.
+NOT_REUSED = set()
 
 
 def test_a_second_layer_streams_its_own_image_rows(tmp_path):

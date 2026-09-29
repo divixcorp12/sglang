@@ -1,5 +1,6 @@
 """The CRTP split's shape (plan 2026-09-28-reader-crtp-uring-registration Task 4): the shared pipeline names no
-bounce, pool or image mechanism; each derived reader holds only its own; the tier reads through AnyReader."""
+bounce, pool or image mechanism, and the derived reader holds only its own. Since plan 2026-09-29-hotpath-zero-overhead
+D4 the one derived reader is RowReader, and the tier reads through it directly."""
 
 import pathlib
 
@@ -25,12 +26,9 @@ def test_the_core_names_no_path_specific_mechanism():
 
 
 def test_each_derived_reader_holds_only_its_own_mechanism():
-    pack, row = _code("pack_reader.h"), _code("row_reader.h")
-    assert "class PackReader : public ReaderCore<PackReader<Layout, Reader>, Layout, Reader>" in pack
+    row = _code("row_reader.h")
     assert "class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader>" in row
-    for word in ("image_iovecs", "publish_landed", "check_image_alignment"):
-        assert word not in pack, word
-    for word in ("bounce_", "pool_", "PackPool", "PackJob", "dispatch_ready"):
+    for word in ("bounce_", "pool_", "PackPool", "PackJob", "dispatch_ready", "set_pack", "packing_cpus"):
         assert word not in row, word
 
 
@@ -39,7 +37,7 @@ def test_the_bounce_path_keeps_the_scalar_read_opcode():
     assert "io_.prep_read(" in core and "io_.prep_readv(" in core
 
 
-def test_the_tier_and_ffi_read_through_any_reader():
-    assert "using Source = AnyReader<Layout, Reader>;" in _code("ffi_exports.h")
-    any_reader = _code("any_reader.h")
-    assert "std::variant<std::monostate, PackReader<Layout, Reader>, RowReader<Layout, Reader>>" in any_reader
+def test_the_tier_and_ffi_read_through_the_row_reader():
+    assert "using Source = RowReader<Layout, Reader>;" in _code("ffi_exports.h")
+    for gone in ("pack_reader.h", "pack_pool.h", "any_reader.h"):
+        assert not (HOST / gone).exists(), gone

@@ -130,16 +130,6 @@ def test_a_layers_prefetch_serves_its_chunks_and_ends_with_the_host_use(tiers, m
     assert cache.stats.populated_rows == 4  # 5 by ensure_rows, then 0, 1, 3 by the prefetch
 
 
-def test_the_flag_is_refused_without_row_images(tmp_path):
-    stack, layout, source, streamers, caches = _build(tmp_path, row_images=False)
-    try:
-        with pytest.raises(RuntimeError, match="ROW_IMAGES"):
-            caches[0].ensure_rows(torch.tensor([1]))
-    finally:
-        module.Exl3RamMissService._instance = None
-        stack.close()
-
-
 def test_the_flag_is_refused_without_the_native_slot_table(tmp_path):
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS)
     layout = build_exl3_expert_layout(str(tmp_path))

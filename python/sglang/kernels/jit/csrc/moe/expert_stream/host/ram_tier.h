@@ -49,7 +49,6 @@ class RamTier {
       Tables tables,
       std::vector<int64_t> capacity,
       bool direct,
-      int64_t pack_workers,
       uint8_t* hot_page,
       int64_t hot_bytes)
       : page_(page),
@@ -58,7 +57,7 @@ class RamTier {
         hot_page_(hot_page),
         layers_(tables.layers),
         experts_(tables.experts),
-        reader_(std::move(tables), direct, pack_workers),
+        reader_(std::move(tables), direct),
         tiers_(static_cast<size_t>(layers_)) {
     hot_stride_ = ((kHotHeaderBytes + (experts_ + 7) / 8 + kHotAlignment - 1) / kHotAlignment) * kHotAlignment;
     if (hot_page_ != nullptr && hot_bytes != kHotRecords * hot_stride_)
@@ -94,10 +93,6 @@ class RamTier {
     next_advice_ = load_acquire(page_ + kAdviseDone) + 1u;
     if (next_advice_ == 0) next_advice_ = 1;
     return true;
-  }
-
-  std::vector<int> packing_cpus() const {
-    return reader_.packing_cpus();
   }
 
   uint8_t* page() const {
@@ -460,8 +455,7 @@ class RamTier {
   }
 
   // Piece streaming (SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM): the reader reads each part as sub-reads and vets
-  // rows piece by piece. Before the thread starts. The reader refuses it without packing workers; the service
-  // refuses it without two-phase and lease mode.
+  // rows piece by piece. Before the thread starts. The service refuses it without two-phase and lease mode.
   void set_piece_stream(bool on) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "set piece streaming before the service thread starts");
@@ -1091,9 +1085,9 @@ class RamTier {
   // int64; see fault_from). Unlike fail_reads the fault does NOT short-circuit ahead of the reader: the read
   // runs, so the fault's part errors, pack delay and the rest act on rows that have already packed. The
   // service thread applies it just before its next read (the reader is that thread's alone), and it then
-  // stays until replaced; an all-default tensor clears it. Words 17-20 (abandon_after, step, pack_workers,
-  // pack_split) and 22 (piece_stream) are not faults and are ignored: use inject() for the abandon point, the
-  // tier's own constructor for the packing pool and set_piece_stream() for the mode. The reader's counters (submit and
+  // stays until replaced; an all-default tensor clears it. Words 17-18 (abandon_after, step) and 22
+  // (piece_stream) are not faults and are ignored, and words 19-20 (formerly pack_workers, pack_split) are reserved:
+  // use inject() for the abandon point and set_piece_stream() for the mode. The reader's counters (submit and
   // completion calls) run over the reader's whole life, so a call-numbered fault (submit_call, cqe_call) is relative to
   // a fresh tier.
   void inject_fault(const int64_t* words) {

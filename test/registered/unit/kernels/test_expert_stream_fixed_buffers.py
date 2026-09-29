@@ -22,13 +22,6 @@ PREFIX = "SGLANG_EXPERT_STREAM_URING_"
 EXPERTS = [10, 3, 7, 0, 11, 5, 1, 8, 2, 9, 4]
 SLOTS = [7, 0, 11, 3, 9, 1, 5, 10, 2, 8, 4]
 CAP = 64 * 1024
-# The bounce fixture's slots are 159744 B, past CAP, so the bounce is registered under a cap that still cuts it into
-# one-slot chunks (a slot is the bounce region's row): the bounce is chunked as well, and a bounce read stays one leg.
-BOUNCE_CAP = 4 * CAP
-
-
-def _cap(images):
-    return CAP if images else BOUNCE_CAP
 
 
 @pytest.fixture
@@ -44,11 +37,10 @@ def uring_env(monkeypatch):
     return set_
 
 
-def _setup(tmp_path, images, weights=None):
+def _setup(tmp_path, weights=None):
     root = tmp_path / "ckpt"
     root.mkdir()
-    dims = {} if images else dict(hidden=256, inter=512)
-    return ram_miss_setup(root, capacity=12, experts=12, mirror_weights=weights, row_images=images, **dims)
+    return ram_miss_setup(root, capacity=12, experts=12, mirror_weights=weights)
 
 
 def _snapshot(slabs):
@@ -64,7 +56,7 @@ def _equal(a, b):
 
 
 def _read(s, **faults):
-    result, log, info, record = read_rows_sqes(s.tables, 1, EXPERTS, SLOTS, direct=bool(s.tables.row_images), **faults)
+    result, log, info, record = read_rows_sqes(s.tables, 1, EXPERTS, SLOTS, **faults)
     return result, log, info, record, _snapshot(s.slabs)
 
 
@@ -77,72 +69,68 @@ def _supported(fn):
         raise
 
 
-def _pieces(images, on):
-    return ({"piece_stream": True} | ({} if images else {"pack_workers": 2})) if on else {}
+def _pieces(on):
+    return {"piece_stream": True} if on else {}
 
 
 def test_regions_are_one_per_slab_with_its_row_bytes(tmp_path):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     regions = ops._table_buffer_regions(s.tables).tolist()
     assert regions and all(nbytes % row == 0 and row > 0 for _, nbytes, row in regions)
     assert len({base for base, _, _ in regions}) == len(regions)
 
 
-@pytest.mark.parametrize("images", [False, True], ids=["bounce", "images"])
 @pytest.mark.parametrize("read_mode", ["fixed", "readv_fixed"])
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
-def test_fanned_out_reads_are_byte_identical(tmp_path, uring_env, images, read_mode, pieces):
-    s = _setup(tmp_path, images)
-    base_result, base_log, _, base_rec, base_bytes = _read(s, **_pieces(images, pieces))
+def test_fanned_out_reads_are_byte_identical(tmp_path, uring_env, read_mode, pieces):
+    s = _setup(tmp_path)
+    base_result, base_log, _, base_rec, base_bytes = _read(s, **_pieces(pieces))
     uring_env(READ_MODE=read_mode)
-    result, log, info, rec, fixed_bytes = _supported(
-        lambda: _read(s, fixed_chunk_cap=_cap(images), **_pieces(images, pieces)))
+    result, log, info, rec, fixed_bytes = _supported(lambda: _read(s, fixed_chunk_cap=CAP, **_pieces(pieces)))
     assert base_result == result == 1 and _equal(fixed_bytes, base_bytes)
     assert rec["retried_bytes"] == 0 and rec["submitted_bytes"] == base_rec["submitted_bytes"]
     assert rec["bytes"] == base_rec["bytes"] and rec["useful_bytes"] == base_rec["useful_bytes"]
     assert sum(entry[2] for entry in log) == rec["submitted_bytes"]
-    if images:  # a multi-slab image read fans out: more SQEs than logical reads, the same byte ranges in the file
-        assert info["fixed_cuts"] > 0 and info["fanout_sqes"] > info["fixed_cuts"]
-        assert len(log) == len(base_log) - info["fixed_cuts"] + info["fanout_sqes"]
-    else:       # one bounce slot is one row: never fanned out
-        assert info["fixed_cuts"] == info["fanout_sqes"] == 0 and sorted(log) == sorted(base_log)
+    # A multi-slab image read fans out: more SQEs than logical reads, the same byte ranges in the file.
+    assert info["fixed_cuts"] > 0 and info["fanout_sqes"] > info["fixed_cuts"]
+    assert len(log) == len(base_log) - info["fixed_cuts"] + info["fanout_sqes"]
 
 
 def test_normal_mode_never_fans_out(tmp_path, uring_env):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     result, _, info, _, _ = _read(s, fixed_chunk_cap=CAP)
     assert result == 1 and info["fixed_cuts"] == info["fanout_sqes"] == 0
 
 
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
 def test_legs_completing_out_of_order(tmp_path, uring_env, pieces):
-    s = _setup(tmp_path, True)
-    _, _, _, _, base_bytes = _read(s, **_pieces(True, pieces))
+    s = _setup(tmp_path)
+    _, _, _, _, base_bytes = _read(s, **_pieces(pieces))
     uring_env(READ_MODE="readv_fixed")
     # reverse_cqes: every reaped batch (waiting for all in flight) is processed back to front, so each read's legs
     # land last-first.
     result, _, info, _, fixed_bytes = _supported(
-        lambda: _read(s, fixed_chunk_cap=CAP, reverse_cqes=True, **_pieces(True, pieces)))
+        lambda: _read(s, fixed_chunk_cap=CAP, reverse_cqes=True, **_pieces(pieces)))
     assert result == 1 and info["fixed_cuts"] > 0 and _equal(fixed_bytes, base_bytes)
 
 
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
 def test_a_held_leg_keeps_its_read_unretired_and_its_pieces_unpublished(tmp_path, uring_env, pieces):
-    s = _setup(tmp_path, True)
-    _, _, _, _, base_bytes = _read(s, **_pieces(True, pieces))
+    s = _setup(tmp_path)
+    _, _, _, _, base_bytes = _read(s, **_pieces(pieces))
     uring_env(READ_MODE="readv_fixed")
     # Leg 1 of every read of row 0 is withheld until nothing else is pending: the row may neither retire nor (piece
     # streaming) publish a piece that depends on it before it lands. A reader that retired on the first completion
     # would vet row 0 short and fail the read.
     result, _, _, rec, fixed_bytes = _supported(lambda: _read(
-        s, fixed_chunk_cap=CAP, hold_ordinal=0, leg=1, **_pieces(True, pieces)))
+        s, fixed_chunk_cap=CAP, hold_ordinal=0, leg=1, **_pieces(pieces)))
     assert result == 1 and _equal(fixed_bytes, base_bytes)
     if pieces:
         assert rec["pieces_published"] == len(EXPERTS) * 8 and rec["piece_publish_refused"] == 0
 
 
 def test_one_short_leg_resubmits_only_that_leg(tmp_path, uring_env):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     uring_env(READ_MODE="readv_fixed")
     _, clean_log, clean_info, _, base_bytes = _supported(lambda: _read(s, fixed_chunk_cap=CAP))
     result, log, info, rec, fixed_bytes = _read(s, fixed_chunk_cap=CAP, part=0, part_short=512, leg=1)
@@ -155,15 +143,15 @@ def test_one_short_leg_resubmits_only_that_leg(tmp_path, uring_env):
 
 @pytest.mark.parametrize("pieces", [False, True], ids=["whole", "pieces"])
 def test_one_failing_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_path, uring_env, pieces):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     uring_env(READ_MODE="readv_fixed")
     stats, cqes = {}, []
     # Leg 1 of row 0 fails with EIO while its other legs succeed. The read fails once, and the same reader's next read
     # is clean. (unfinished_jobs counts packing jobs, not SQEs, so it cannot see the drain; the drain guard is
     # test_ring_reset_mid_fan_out.)
     first, then = _supported(lambda: read_rows_with_fault(
-        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=True, part=0, part_error=errno.EIO,
-        ordinal=0, leg=1, fixed_chunk_cap=CAP, stats=stats, cqes=cqes, **_pieces(True, pieces)))
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], part=0, part_error=errno.EIO,
+        ordinal=0, leg=1, fixed_chunk_cap=CAP, stats=stats, cqes=cqes, **_pieces(pieces)))
     assert (first, then) == (0, 1)
     assert stats["unfinished_jobs"] == 0 and stats["fixed_cuts"] > 0
 
@@ -171,21 +159,19 @@ def test_one_failing_leg_fails_the_read_once_after_every_leg_is_reaped(tmp_path,
 @pytest.mark.parametrize("submit_first", [False, True], ids=["unconsumed", "in_flight"])
 @pytest.mark.parametrize("read_mode", ["fixed", "readv_fixed"])
 def test_ring_reset_mid_fan_out(tmp_path, uring_env, read_mode, submit_first):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     uring_env(READ_MODE=read_mode, FIXED_FILES=1)
     # The first submit fails with a fanned-out read's legs prepared: either none reached the kernel (drain resets the
     # ring and must re-create the sparse table, re-add every chunk and re-register the files) or all did (drain waits
     # for every leg). Either way the clean second read on the same reader succeeds.
     first, then = _supported(lambda: read_rows_with_fault(
-        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], direct=True,
-        submit_error=errno.EIO, submit_call=1, submit_first=submit_first, fixed_chunk_cap=CAP))
+        s.tables, 1, EXPERTS[:4], SLOTS[:4], EXPERTS[4:], SLOTS[4:], submit_error=errno.EIO, submit_call=1, submit_first=submit_first, fixed_chunk_cap=CAP))
     assert (first, then) == (0, 1)
 
 
-@pytest.mark.parametrize("images", [False, True], ids=["bounce", "images"])
 @pytest.mark.parametrize("weights", [(1.0, 1.0, 1.0), (1.0, 0.0, 1.0)], ids=["three", "zero_mid"])
-def test_fixed_files_with_three_mirror_roots(tmp_path, uring_env, images, weights):
-    s = _setup(tmp_path, images, weights)
+def test_fixed_files_with_three_mirror_roots(tmp_path, uring_env, weights):
+    s = _setup(tmp_path, weights)
     base_result, base_log, _, _, base_bytes = _read(s)
     uring_env(FIXED_FILES=1)
     result, log, _, _, fixed_bytes = _read(s)
@@ -193,12 +179,12 @@ def test_fixed_files_with_three_mirror_roots(tmp_path, uring_env, images, weight
     roots_read = {str(r) for f, *_ in log for r in s.roots if s.tables.paths[f].startswith(str(r))}
     assert len(roots_read) == sum(1 for w in weights if w > 0)
     uring_env(READ_MODE="readv_fixed")
-    result, _, _, _, both_bytes = _supported(lambda: _read(s, fixed_chunk_cap=_cap(images)))
+    result, _, _, _, both_bytes = _supported(lambda: _read(s, fixed_chunk_cap=CAP))
     assert result == 1 and _equal(both_bytes, base_bytes)
 
 
 def test_registration_refusal_is_a_clear_error_not_a_fallback(tmp_path, uring_env):
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     uring_env(READ_MODE="readv_fixed")
     with pytest.raises(RuntimeError, match="does not fit one registered buffer"):
         _read(s, fixed_chunk_cap=4096)  # the fixture's 49152 B rows exceed a 4 KiB cap
@@ -223,7 +209,7 @@ root = pathlib.Path(sys.argv[1]); root.mkdir(parents=True)
 s = ram_miss_setup(root, capacity=12, experts=12, row_images=True)
 resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))
 try:
-    read_rows_sqes(s.tables, 1, [0, 1], [0, 1], direct=True)
+    read_rows_sqes(s.tables, 1, [0, 1], [0, 1])
     print("READ WITHOUT REGISTRATION")  # a silent fallback: the missing REFUSED fails the test
 except RuntimeError as e:
     print("REFUSED", e)
@@ -258,7 +244,7 @@ root = pathlib.Path(sys.argv[1]); root.mkdir(parents=True)
 s = ram_miss_setup(root, capacity=12, experts=12, row_images=True)
 try:
     result = read_rows_with_fault(
-        s.tables, 1, [10, 3, 7, 0], [7, 0, 11, 3], [11, 5], [9, 1], direct=True, submit_error=errno.EIO,
+        s.tables, 1, [10, 3, 7, 0], [7, 0, 11, 3], [11, 5], [9, 1], submit_error=errno.EIO,
         submit_call=1, ring_reset_fail=True, fixed_chunk_cap=int(sys.argv[2]))
     print("NO ERROR", result)  # the reset did not fail, or its failure was swallowed: the assertion names it
 except RuntimeError as e:
@@ -271,7 +257,7 @@ def test_a_region_with_another_row_size_is_refused_at_open(tmp_path, uring_env, 
     # Final review Minor 2: a slab registered under a region whose row size is not its own used to fail its first read
     # mid-serve ("lies in no registered buffer"); a fixed mode now refuses at open, naming the slab. The normal mode
     # never uses the regions, so it still reads.
-    s = _setup(tmp_path, True)
+    s = _setup(tmp_path)
     regions = ops._table_buffer_regions
     halved = lambda tables: regions(tables) * torch.tensor([1, 1, 1]) // torch.tensor([1, 1, 2])  # noqa: E731
     monkeypatch.setattr(ops, "_table_buffer_regions", halved)

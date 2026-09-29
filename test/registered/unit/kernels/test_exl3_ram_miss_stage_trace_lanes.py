@@ -25,7 +25,7 @@ def hang_guard():
 def tier(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.enable_trace()
     yield s, page, host
     host.stop()

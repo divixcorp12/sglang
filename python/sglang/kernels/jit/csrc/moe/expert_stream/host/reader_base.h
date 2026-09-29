@@ -1,4 +1,5 @@
-// The bounce-bank pool geometry and per-row stage-trace constants shared by every host reader.
+// The bank geometry (pipeline state; the one reader, RowReader, backs it with no bounce memory) and the per-row
+// stage-trace constants of the host reader.
 #pragma once
 
 #include <sys/prctl.h>
@@ -181,8 +182,10 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // is only what was missing. Not clamped to kMaxIds, so a plan wider than the lanes the service is asked
 // for shows here.
 //
-// pack_workers, pack_split (schema 5): the packing mode the reader ran this request in, the reader's own
-// pack_workers_ / pack_split_ (SGLANG_DSV41_RAM_MISS_PACK_WORKERS). pack_workers 0 is the inline reader:
+// pack_workers, pack_split (schema 5): the packing mode the reader ran this request in. Since the packed path was
+// deleted (plan 2026-09-29-hotpath-zero-overhead D4) the one reader, RowReader, never packs and both are always 0;
+// the fields stay for the schema. What follows describes the records of the deleted packed path (older traces).
+// pack_workers 0 was the inline reader:
 // the owner thread packs each row itself, so a row's pack_start follows the extent's reap by however long the
 // owner was busy, and pack_ns is a sum of spans that never overlap. pack_workers > 0 hands each row to a
 // worker: pack_start is then when the worker had woken and taken a chunk, not when the packer was free, and

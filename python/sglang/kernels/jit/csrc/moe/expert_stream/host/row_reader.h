@@ -2,6 +2,8 @@
 // no packing.
 #pragma once
 
+#include <stdexcept>
+
 #include "reader_core.h"
 
 namespace sglang {
@@ -16,7 +18,8 @@ namespace expert_stream {
 // only in slots the caller has not published, the ring is drained before read() returns, and a failed read leaves
 // published whole pieces (never a torn one) and otherwise bytes of unpublished slots the caller releases.
 // Trace: with no packing, row_pack_start/end are the clocks of a row's first and last publish (piece streaming)
-// or both the clock it was finished (without), pack_workers is 0, and useful_bytes still counts its segments.
+// or both the clock it was finished (without), pack_workers and pack_split are 0, and useful_bytes still counts its
+// segments.
 template <ExpertRowLayout Layout, AsyncFileReader Reader>
 class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader> {
   using Base = ReaderCore<RowReader<Layout, Reader>, Layout, Reader>;
@@ -39,31 +42,22 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader> {
   using typename Base::RowState;
 
  public:
-  RowReader(Tables tables, bool direct, int64_t pack_workers = 0, int64_t pack_split = 0)
-      : Base(std::move(tables), direct) {
-    if (!t_.images) throw std::runtime_error(error_prefix<Layout>() + "RowReader reads row image tables only");
-    set_pack(pack_workers, pack_split);
+  // Row images read with O_DIRECT are the only reader (plan 2026-09-29-hotpath-zero-overhead D4): shard tables would
+  // need the bounce-and-pack copy, and a buffered read copies through the page cache.
+  RowReader(Tables tables, bool direct) : Base(std::move(tables), direct) {
+    if (!t_.images) {
+      throw std::invalid_argument(
+          error_prefix<Layout>() + "the reader reads row image tables only (build them with "
+          "scripts/dsv41/build_row_images.py); shard tables were refused");
+    }
+    if (!direct) throw std::invalid_argument(error_prefix<Layout>() + "row images are read with O_DIRECT only");
   }
 
-  // Direct mode copies nothing, so it never starts a pool: the setting is ignored (and traced as 0).
-  void set_pack(int64_t /*workers*/, int64_t split) {
-    pack_split_ = split > 0 ? static_cast<unsigned>(split) : 0u;
-  }
-
+  // Kept for the stage record's schema-5 fields: a row-image read never packs.
   unsigned pack_workers() const {
     return 0;
   }
-
-  // Direct mode keeps the split set_pack stored (traced as given), though nothing is cut by it.
   unsigned pack_split() const {
-    return pack_split_;
-  }
-
-  std::vector<int> packing_cpus() const {
-    return {};
-  }
-
-  int64_t unfinished_jobs() const {
     return 0;
   }
 
@@ -286,9 +280,6 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader>, Layout, Reader> {
 
   // Direct mode: the bytes are the slot's own now, and the caller publishes them.
   void after_finish(size_t /*slot*/) {}
-
-  // set_pack's split, traced as given; nothing is cut by it.
-  unsigned pack_split_ = 0;
 };
 
 }  // namespace expert_stream

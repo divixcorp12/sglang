@@ -524,9 +524,9 @@ class Service:
     def __init__(self, tmp_path, *, timeout_ms=2000, advise=False):
         from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES, Exl3ExpertFormat
         from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
-        from sglang.srt.layers.moe.exl3_ram_miss import exl3_ram_miss_tables
         from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab
         from sglang.test.dsv41_fake_exl3 import write_fake_exl3
+        from sglang.test.dsv41_ram_miss_fixtures import image_tables
 
         write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=1024, inter=512, finite=True)
         self.layout = build_exl3_expert_layout(str(tmp_path))
@@ -539,11 +539,11 @@ class Service:
             for lid in range(LAYERS):
                 for n in self.names:
                     self.slabs[lid][n] = allocate_host_slab(CAPACITY, self.specs[n].row_shape, self.specs[n].dtype, register=True)
-            tables = exl3_ram_miss_tables(self.layout, self.fmt.segment_map(), self.slabs)
+            tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp_path)  # row images (D4)
             self.page = new_page(pin=True)
             slot_map = torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory()
             self.slot_map = slot_map
-            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map, direct=False)
+            self.host = ExpertStreamHost(tables, page=self.page, slot_map=slot_map)
             self.host.enable_lease_mode()
             self.host.start_thread(fatal_wait_s=60.0)
             self.dev = ExpertStreamDevice(

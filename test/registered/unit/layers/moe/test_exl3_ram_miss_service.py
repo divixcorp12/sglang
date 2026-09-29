@@ -20,7 +20,7 @@ from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStr
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 from sglang.test.dsv41_lease_sim import LeaseSim
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images, write_row_images
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -36,30 +36,22 @@ def hang_guard():
     faulthandler.cancel_dump_traceback_later()
 
 
-# The indirect parameter of ``tiers`` that builds the service as it was before row images: shard tables read buffered,
-# leases off. Only for a test whose subject is that configuration (test_exl3_ram_miss_row_images.BOUNCE_ONLY_PINNED).
-SHARDS = pytest.mark.parametrize("tiers", ["shards"], indirect=True)
-
-
 @pytest.fixture
-def tiers(tmp_path, monkeypatch, request):
+def tiers(tmp_path, monkeypatch):
     """The service reads row images with O_DIRECT (service_row_images), as in production; leases are on, which the
     images need, so a demand is posted as the device posts it (_demand)."""
-    images = getattr(request, "param", "images") == "images"
-    dims = dict(hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM) if images else {}
-    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, **dims)
+    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None
     streamers, caches = {}, {}
     with contextlib.ExitStack() as stack:
-        if images:
-            stack.enter_context(service_row_images(tmp_path))
+        stack.enter_context(service_row_images(tmp_path))
         with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
             for layer_id in range(LAYERS):
                 layer = torch.nn.Module()
                 layer.layer_id = layer_id
                 # No ``direct`` with images: SGLANG_MOE_EXPERT_FILE_READER=uring_direct decides it, as in production.
-                fmt = Exl3ExpertFormat(layout, layer_id, direct=None if images else False, source_root=str(tmp_path))
+                fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
                 streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
                 layer._nvfp4_expert_streamer = streamer
                 options = fmt.pinned_tier_options(layer)
@@ -99,20 +91,23 @@ def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
     assert service.slot_map[row, 4].item() == cache.expert_to_slot[4].item()
 
 
-@SHARDS  # asserts the shard tables' part split
 def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_path):
     service, streamers, caches = tiers
     roots = [tmp_path.parent / f"{tmp_path.name}_mirror{i}" for i in range(2)]
     for root in roots:
         shutil.copytree(tmp_path, root)
+    fmt = streamers[1].format
+    write_row_images(fmt.layout, fmt.segment_map(), str(tmp_path), [str(root) for root in roots])
     with envs.SGLANG_MOE_EXPERT_MIRROR_DIRS.override(os.pathsep.join(map(str, roots))):
         with envs.SGLANG_MOE_EXPERT_MIRROR_WEIGHTS.override("3:1"):
             caches[1].ensure_rows(torch.tensor([4, 2]))
     tables = service.host.tables
     assert tables.parts == 2
     assert all(path.startswith(str(root)) for path, root in zip(tables.paths, roots * len(tables.paths)))
-    # Every row's parts are what the eager policy plans for 3:1.
-    planned = StaticSplitPolicy((3.0, 1.0)).plan(int(tables.slot_bytes)).part_bytes
+    # Every row's parts are what the eager policy plans for 3:1 over the page-rounded image, clipped at its end.
+    image = int(tables.slot_bytes)
+    split = StaticSplitPolicy((3.0, 1.0)).plan(-(-image // 4096) * 4096)
+    planned = [min(lo + n, image) - min(lo, image) for lo, n in zip(split.starts, split.part_bytes)]
     assert bool((tables.extents[..., 2] == torch.tensor(planned)).all())
     row = service.row_of(1)
     assert service.host.contains(row, 4) and service.host.contains(row, 2)
@@ -504,17 +499,6 @@ def tier_sim_load_forwards(path):
     return tier_sim.load_forwards(str(path))
 
 
-@SHARDS  # its subject is leases off, which row images refuse
-def test_the_lease_switch_defaults_off_and_the_device_is_built_without_a_lease_block(tiers, monkeypatch):
-    service, streamers, caches = tiers
-    enabled = []
-    monkeypatch.setattr(module.ExpertStreamHost, "enable_lease_mode", lambda self: enabled.append(self))
-    assert envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.get() is False
-    _attach_all(service, streamers)
-    assert enabled == [] and service.lease_mode is False
-    assert service.device_side.lease_block is None and service.device_side.go_count is None
-
-
 @pytest.mark.parametrize("pdl", [False, True], ids=["pdl_off", "pdl_on"])
 def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl):
     """SGLANG_DSV41_ENABLE_LEASE_PDL -> Dsv41Config -> the service -> ExpertStreamDevice(lease_pdl=...), which passes
@@ -526,14 +510,6 @@ def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl)
     with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(not pdl):
         service.ensure_started()
     assert service.device_side.lease_pdl is pdl
-
-
-@SHARDS  # its subject is leases off, which row images refuse first
-def test_lease_pdl_without_leases_is_refused(tiers):
-    service, streamers, caches = tiers
-    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(False), envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(True):
-        with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_LEASE_PDL needs SGLANG_DSV41_ENABLE_RAM_MISS_LEASES"):
-            service.ensure_started()
 
 
 def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_with_the_hosts_block(tiers, monkeypatch):
@@ -555,23 +531,15 @@ def test_the_lease_switch_configures_the_host_before_its_thread_and_the_device_w
     assert service.lease_mode is True
 
 
-@pytest.mark.parametrize(
-    "lease_mode,two_phase,pack_workers",
-    [(False, False, 0), (True, False, 0), (True, True, 0)],
-    ids=["no_lease", "no_two_phase", "no_pack_workers"],
-)
-@SHARDS  # the packing-worker rule; row images need no workers, and refuse leases off first
-def test_piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold(
-    tiers, lease_mode, two_phase, pack_workers
-):
-    """Config/env refusal (piece-streaming plan Sec 4.4): the inline no-pool pack path has no publisher, so
-    piece streaming needs two-phase, lease mode and pack_workers > 0 together, not any two of the three."""
+def test_piece_stream_refuses_without_two_phase(tiers):
+    """Config/env refusal (piece-streaming plan Sec 4.4): piece streaming is a mode of two-phase. (Converted from
+    test_piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold: its no_lease case is refused first by
+    the row images' own lease check, and its no_pack_workers case is accepted, since the one reader publishes each
+    piece itself.)"""
     service, streamers, caches = tiers
     with (
         envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_LEASES.override(lease_mode),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(two_phase),
-        envs.SGLANG_DSV41_RAM_MISS_PACK_WORKERS.override(pack_workers),
+        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(False),
     ):
         with pytest.raises(RuntimeError, match="PIECE_STREAM needs"):
             service.ensure_started()

@@ -1,5 +1,6 @@
-// ReaderCore: the pipeline the expert-stream host readers share (PackReader, bounce and pack; RowReader, direct row
-// images): io_uring superset reads of whole expert rows through per-extent descriptors, ring credit and banks.
+// ReaderCore: the pipeline of the expert-stream host reader, RowReader (direct row images; the packed path was deleted
+// by plan 2026-09-29-hotpath-zero-overhead D4): io_uring superset reads of whole expert rows through per-extent
+// descriptors, ring credit and banks.
 #pragma once
 
 #include <cstdio>
@@ -18,10 +19,10 @@ struct SqeRecord {
   int64_t file, offset, length, bounce;  // bounce: byte offset of the destination from the bounce's start
 };
 
-// io_uring superset reads of whole expert rows through per-extent descriptors, for both derived readers: PackReader
-// reads into page-aligned bounce banks and then splits each row per name into the pinned slabs
-// (Exl3ShardRowSource.read's copies); RowReader reads the row images straight into the slab rows. "Bank" and "slot"
-// below name pipeline state in both; only PackReader backs them with bounce memory.
+// io_uring superset reads of whole expert rows through per-extent descriptors, for the one derived reader: RowReader
+// reads the row images with O_DIRECT straight into the slab rows. "Bank", "bounce slot" and "packing" below name
+// pipeline state (a row's descriptors, its bank's references, its finish), not memory: no bounce buffer is allocated
+// and nothing is copied. The base/derived split separates this pipeline from the destination and publishing hooks.
 //
 // Pipeline (plan Task 4). A read() call is split into batches of `step` rows; batch b fills bank
 // b % kBanks. Every bounce slot is one row's aligned superset, and every extent has its own
@@ -68,9 +69,8 @@ class ReaderCore {
 
   // Piece streaming (sub_reads_per_part(reading) sub-reads per reading part, per-piece vetting, packing and
   // publishing); off by default. Before open(), or on an idle reader after it (the tier sets it before its service
-  // thread starts), since it resizes the descriptor arrays and the packing queue. Refused without packing workers
-  // (the inline path has no piece publisher), with more mirror parts than pieces (a reading part needs a piece of
-  // its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
+  // thread starts), since it resizes the descriptor arrays. Refused with more mirror parts than pieces (a reading part
+  // needs a piece of its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
   void set_piece_stream(bool on) {
     if (on) {
       derived().check_piece_stream_support();
@@ -120,9 +120,8 @@ class ReaderCore {
   }
 
   // Test-only scaffold (PACK_WORKERS.md owner-pinning measurement): pin the owner thread to `core`
-  // at open() and build the packing pool's mask as the inherited set minus that core, so the owner and
-  // the workers never share a core. -1 (the default) leaves open() byte-for-byte what it is today: no
-  // pin, and the pool's mask is exactly the creating thread's inherited affinity.
+  // at open(). -1 (the default) leaves open() unpinned. The packing pool this once kept the owner off is
+  // gone with the packed path, so only the pin remains.
   void set_owner_core(int64_t core) {
     owner_core_ = core;
   }
@@ -140,8 +139,8 @@ class ReaderCore {
     } else if (
         fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0 ||
         fault.ring_reset_fail) {
-      // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs the readers
-      // (AnyReader) with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above
+      // No test reaches this today: the one production instantiation (exl3_ram_miss_host.cpp) pairs the reader
+      // (RowReader) with FaultyReader<UringReader>, which has set_submit_fault, so the `if constexpr` branch above
       // always fires there. This is the fallback for a Reader that cannot inject submit faults at all.
       throw std::runtime_error(error_prefix<Layout>() + "this reader cannot inject submit faults");
     }

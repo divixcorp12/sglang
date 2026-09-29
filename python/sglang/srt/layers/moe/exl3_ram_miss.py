@@ -1,8 +1,8 @@
 """Option C for EXL3 streamed experts (plan D8-D23).
 
-``exl3_ram_miss_tables`` flattens what ``Exl3ShardRowSource`` knows (the per-expert
-superset reads and the per-name segment map) plus each layer's pinned slabs into
-int64 tensors, so the C++ thread reads and splits rows without Python.
+``exl3_ram_miss_tables`` flattens a checkpoint's row images (per-expert image reads and the
+identity segment map) plus each layer's pinned slabs into int64 tensors, so the C++ thread reads
+rows with O_DIRECT straight into the slabs without Python.
 """
 
 from __future__ import annotations
@@ -36,11 +36,9 @@ from sglang.srt.layers.moe.exl3_expert_format import EXL3_MAX_GATHER_ROWS, EXL3_
 from sglang.srt.layers.moe.exl3_expert_layout import Exl3ExpertLayout
 from sglang.srt.layers.moe.exl3_read_split import SplitPolicy, StaticSplitPolicy
 from sglang.srt.layers.moe.exl3_row_image import RowImageSet
-from sglang.srt.layers.moe.exl3_row_reader import mirror_path
 from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
-from sglang.srt.model_loader.file_row_reader import PAGE_BYTES
 
 logger = logging.getLogger(__name__)
 _SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
@@ -89,89 +87,21 @@ def exl3_ram_miss_tables(
     source_root: Optional[str] = None,
     row_images: Optional[RowImageSet] = None,
 ) -> Exl3RamMissTables:
-    """Tables for the streamed layers in ``slabs_by_layer`` (ascending layer id = row order).
+    """Tables for the streamed layers in ``slabs_by_layer`` (ascending layer id = row order), over ``row_images``
+    (an ``open_row_images`` set over ``roots``, split across them as ``policy`` splits the mirrors): see
+    ``_row_image_tables``. ``source_root`` is accepted so ``mirror_table_args()`` can be passed whole.
 
-    With ``roots`` (byte-identical mirrors of the checkpoint under ``source_root``), each row's
-    aligned read is split across them as ``policy`` plans it, the same policy the eager
-    ``read_split`` uses. ``paths`` is then shard-major, root-minor: part ``p`` of the shard with
-    source index ``s`` is file ``s * parts + p``. With no roots ``parts == 1``, the files are the
-    source shards and every extent starts at destination offset 0.
-
-    With ``row_images`` (an ``open_row_images`` set over the same roots) the tables read the images instead:
-    see ``_row_image_tables``.
+    Row images are the only tables (plan 2026-09-29-hotpath-zero-overhead D4): the C++ reader reads them with
+    O_DIRECT straight into the slabs. Shard tables would need the deleted bounce-and-pack path, so a call without
+    ``row_images`` is refused, naming the converter.
     """
-    if row_images is not None:
-        return _row_image_tables(layout, segments, slabs_by_layer, row_images, roots=roots, policy=policy)
-    roots = tuple(roots)
-    if roots:
-        if policy is None or source_root is None:
-            raise ValueError("mirror roots need both a split policy and the source root")
-    else:
-        if policy is not None:
-            raise ValueError("a split policy needs mirror roots")
-        policy = StaticSplitPolicy((1.0,))
-    parts = len(roots) or 1
-    planned = len(policy.plan(PAGE_BYTES).part_bytes)
-    if planned != parts:
-        raise ValueError(f"split policy plans {planned} parts for {parts} roots")
-    layer_ids = sorted(slabs_by_layer)
-    source_paths: list[str] = []
-    source_index: dict[str, int] = {}
-    extents = torch.empty((len(layer_ids), layout.num_experts, parts, 4), dtype=torch.int64)
-    starts = torch.empty((len(layer_ids), layout.num_experts), dtype=torch.int64)
-    splits: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}  # aligned length -> (part bytes, part starts)
-    widest = 0
-    for row, layer_id in enumerate(layer_ids):
-        for expert in range(layout.num_experts):
-            record = layout.records[(layer_id, expert)]
-            if record.path not in source_index:
-                source_index[record.path] = len(source_paths)
-                source_paths.append(record.path)
-            offset, length, start = record.aligned_read(PAGE_BYTES)
-            if length not in splits:
-                split = policy.plan(length)
-                splits[length] = (split.part_bytes, split.starts)
-            part_bytes, part_starts = splits[length]
-            for part in range(parts):
-                extents[row, expert, part, 0] = source_index[record.path] * parts + part
-                extents[row, expert, part, 1] = offset + part_starts[part]
-                extents[row, expert, part, 2] = part_bytes[part]
-                extents[row, expert, part, 3] = part_starts[part]
-            starts[row, expert] = start
-            widest = max(widest, length)
-    paths = (
-        [mirror_path(source_root, root, path) for path in source_paths for root in roots]
-        if roots
-        else source_paths
-    )
-    # What each file is a copy of, for the reader's open-time size check to name.
-    copied = [path for path in source_paths for _ in range(parts)]
-    # A mirror is a byte-identical copy, so every part of a shard is bounded by the source's size
-    # (as in the eager reader); the open-time check that each copy really has it is the reader's.
-    source_sizes = [os.path.getsize(path) for path in source_paths]
-    names = {name: index for index, name in enumerate(EXL3_STREAMED_NAMES)}
-    segment_table = torch.tensor(
-        [[names[s.name], s.dst_offset, s.src_offset, s.nbytes] for s in segments], dtype=torch.int64
-    )
-    row_bytes = torch.tensor(
-        [sum(s.nbytes for s in segments if s.name == name) for name in EXL3_STREAMED_NAMES], dtype=torch.int64
-    )
-    slabs, capacity = _slab_table(layer_ids, slabs_by_layer, row_bytes.tolist(), names)
-    return Exl3RamMissTables(
-        layer_ids=layer_ids,
-        paths=paths,
-        source_paths=copied,
-        file_sizes=torch.tensor([size for size in source_sizes for _ in range(parts)], dtype=torch.int64),
-        extents=extents,
-        starts=starts,
-        parts=parts,
-        segments=segment_table,
-        slabs=slabs,
-        row_bytes=row_bytes,
-        capacity=capacity,
-        slot_bytes=-(-widest // PAGE_BYTES) * PAGE_BYTES,
-        keepalive=tuple(slabs_by_layer[layer_id][name] for layer_id in layer_ids for name in EXL3_STREAMED_NAMES),
-    )
+    del source_root  # the images carry their own paths; the mirrors' source root names nothing here
+    if row_images is None:
+        raise ValueError(
+            "the RAM-miss reader reads row images only: build them for this checkpoint with "
+            "scripts/dsv41/build_row_images.py and pass the opened set (row_images=...); shard tables were refused"
+        )
+    return _row_image_tables(layout, segments, slabs_by_layer, row_images, roots=roots, policy=policy)
 
 
 def _slab_table(layer_ids, slabs_by_layer, row_bytes, names) -> tuple[torch.Tensor, torch.Tensor]:
@@ -783,9 +713,7 @@ class Exl3RamMissService:
             tables,
             page=page,
             slot_map=slot_map,
-            direct=direct,
             hot_page=hot_page,
-            pack_workers=cfg.ram_miss_pack_workers,
         )
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace

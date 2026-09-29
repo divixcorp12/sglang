@@ -64,7 +64,7 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     monkeypatch.setattr(transport, "_host_module", lambda layout="exl3": loaded.append(layout) or real(layout))
     page = new_page(pin=False)
     slot_map = torch.full(tuple(t.starts.shape), -1, dtype=torch.int32)
-    host = ExpertStreamHost(tables, page=page, slot_map=slot_map, direct=True, layout="two")
+    host = ExpertStreamHost(tables, page=page, slot_map=slot_map, layout="two")
     try:
         assert (host.layout_names, host.small_mask) == (("a", "b"), 0b10)
         host.enable_trace()

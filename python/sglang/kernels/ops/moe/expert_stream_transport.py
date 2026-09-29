@@ -112,7 +112,10 @@ def _table_buffer_regions(tables) -> torch.Tensor:
     return torch.tensor(list(regions.values()), dtype=torch.int64, device="cpu").reshape(-1, 3)
 
 
-def _table_args(tables, direct: bool) -> tuple:
+def _table_args(tables, direct: bool = True) -> tuple:
+    """The table arguments of every C++ reader entry. ``direct`` stays internal: the public helpers always pass 1,
+    since the reader reads row images with O_DIRECT only (plan 2026-09-29-hotpath-zero-overhead D4); a test hands
+    C++ ``direct=False`` to check that it refuses a buffered read."""
     return (
         tables.extents,
         tables.starts,
@@ -129,7 +132,7 @@ def _table_args(tables, direct: bool) -> tuple:
     )
 
 
-def read_rows_once(tables, row: int, experts, slots, *, direct: bool, step: int = BOUNCE_ROWS, layout: str = "exl3") -> int:
+def read_rows_once(tables, row: int, experts, slots, *, step: int = BOUNCE_ROWS, layout: str = "exl3") -> int:
     """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++: 1 ok, 0 failed.
 
     ``step`` rows go to io_uring per batch (at most ``BOUNCE_ROWS``).
@@ -137,7 +140,7 @@ def read_rows_once(tables, row: int, experts, slots, *, direct: bool, step: int 
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     return int(
         _host_module(layout).expert_stream_read_rows(
-            *_table_args(tables, direct), row, expert_ids, slot_ids, int(step)
+            *_table_args(tables), row, expert_ids, slot_ids, int(step)
         )
     )
 
@@ -164,8 +167,6 @@ def _fault_tensor(
     hold_ordinal: int = -1,
     abandon_after: int = 0,
     step: int = 0,
-    pack_workers: int = 0,
-    pack_split: int = 0,
     hold_rest: bool = False,
     piece_stream: bool = False,
     sub: int = -1,
@@ -199,8 +200,8 @@ def _fault_tensor(
             hold_ordinal,
             abandon_after,
             step,
-            pack_workers,
-            pack_split,
+            0,  # word 19: reserved (formerly pack_workers; the packed path is gone)
+            0,  # word 20: reserved (formerly pack_split)
             int(hold_rest),
             int(piece_stream),
             sub,
@@ -223,7 +224,6 @@ def read_rows_traced(
     experts,
     slots,
     *,
-    direct: bool,
     step: int = BOUNCE_ROWS,
     owner_core: int = -1,
     layout: str = "exl3",
@@ -235,9 +235,7 @@ def read_rows_traced(
 
     ``owner_core`` (test-only owner-pinning scaffold, PACK_WORKERS.md): -1, the default, leaves the
     reader byte-for-byte what it is without this argument. >= 0 pins the calling/owner thread to that
-    core before open() and builds the packing pool's mask as the selected cores minus that core, so the
-    owner and the workers never share a core. Production is untouched: nothing wires this argument to
-    the real service.
+    core before open(). Production is untouched: nothing wires this argument to the real service.
 
     The result is 1 (every row landed), 0 (failed) or -1 (abandoned: ``abandon_after`` batches were
     admitted, the rows admitted were still read and packed, the rest never read)."""
@@ -246,7 +244,7 @@ def read_rows_traced(
     record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     result = int(
         _host_module(layout).expert_stream_read_rows_traced(
-            *_table_args(tables, direct),
+            *_table_args(tables),
             row,
             expert_ids,
             slot_ids,
@@ -267,7 +265,6 @@ def read_rows_with_fault(
     then_experts,
     then_slots,
     *,
-    direct: bool,
     cqes: Optional[list[int]] = None,
     stats: Optional[dict] = None,
     layout: str = "exl3",
@@ -296,9 +293,8 @@ def read_rows_with_fault(
     together, so they become ready in one reap); ``submit_short_call``
     makes that submit consume nothing and report success; ``abandon_after`` stops admitting batches
     after that many; ``step`` is the faulted read's rows per batch (default ``BOUNCE_ROWS``).
-    ``pack_workers`` packs on that many copy threads instead of the owner (0: inline, the default),
-    each row in ``pack_split`` byte-range chunks (0: one per worker). ``piece_stream`` reads each part as
-    sub-reads and vets rows piece by piece (it needs ``pack_workers``); ``sub`` then narrows the ``part``
+    ``piece_stream`` reads each part as
+    sub-reads and vets rows piece by piece; ``sub`` then narrows the ``part``
     faults, and ``hold_ordinal``, to that sub-read of the part. ``publish_twice`` publishes the k-th piece the
     reader publishes a second time (the readiness word must refuse it); ``short_is_eof`` makes the ``part_short``
     completion the end of its sub-read, as a file ending there would. ``fixed_chunk_cap`` (bytes, 0: 1 GiB) caps the
@@ -311,8 +307,8 @@ def read_rows_with_fault(
 
     Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
     completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,
-    ``unfinished_jobs`` (packing jobs a worker still held when the first read returned: always 0),
-    ``pack_workers``, and after the first read ``fixed_cuts`` (reads fanned out to more than one leg) and
+    ``unfinished_jobs`` and ``pack_workers`` (both always 0: the packed path is gone), and after the first read
+    ``fixed_cuts`` (reads fanned out to more than one leg) and
     ``fanout_sqes`` (their SQEs), ``cut_reads`` (reads cut into more than one device-sized run) and ``gap_cuts`` (runs
     a boundary gap opened).
     """
@@ -321,7 +317,7 @@ def read_rows_with_fault(
     fault = _fault_tensor(**faults)
     results = torch.zeros(12, dtype=torch.int64)
     _host_module(layout).expert_stream_read_rows_faulted(
-        *_table_args(tables, direct), row, *first, *then, fault, results
+        *_table_args(tables), row, *first, *then, fault, results
     )
     if cqes is not None:
         cqes[:] = [int(results[2]), int(results[3])]
@@ -340,7 +336,6 @@ def read_rows_sqes(
     experts,
     slots,
     *,
-    direct: bool,
     step: int = BOUNCE_ROWS,
     max_sqes: int = 4096,
     layout: str = "exl3",
@@ -350,14 +345,14 @@ def read_rows_sqes(
     ``(file, offset, length, bounce_offset)``, and ``info``: ``sqes`` (the count), ``descriptors``, ``credit``
     (the ring's), ``cqes``, ``fixed_cuts`` (reads fanned out to more than one leg), ``fanout_sqes`` (their SQEs,
     first attempts), ``cut_reads``, ``gap_cuts``, ``min_cut_bytes`` (the smallest cut in force, 0: cuts off) and
-    ``leg_stride`` (the legs a read may have). Faults and ``pack_workers``/``pack_split``/``piece_stream`` as ``read_rows_with_fault``."""
+    ``leg_stride`` (the legs a read may have). Faults and ``piece_stream`` as ``read_rows_with_fault``."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
     record = torch.zeros(_stage_words(layout), dtype=torch.int64)
     sqes = torch.zeros((max_sqes, 4), dtype=torch.int64)
     info = torch.zeros(11, dtype=torch.int64)
     _host_module(layout).expert_stream_read_rows_sqes(
-        *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
+        *_table_args(tables), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
     )
     (result, count, descriptors, credit, cqes, fixed_cuts, fanout_sqes, cut_reads, gap_cuts, min_cut_bytes,
      leg_stride) = info.tolist()
@@ -392,7 +387,6 @@ def read_rows_pieces(
     experts,
     slots,
     *,
-    direct: bool,
     generation: int,
     masks: Optional[torch.Tensor] = None,
     reference: Optional[torch.Tensor] = None,
@@ -417,7 +411,7 @@ def read_rows_pieces(
     ref = reference if reference is not None else torch.zeros(0, dtype=torch.int64)
     ref_ids = _ids(ref_slots) if ref_slots is not None else torch.zeros(0, dtype=torch.int64)
     _host_module(layout).expert_stream_read_rows_pieces(
-        *_table_args(tables, direct), row, expert_ids, slot_ids, int(step), fault, record, masks, int(generation), ref,
+        *_table_args(tables), row, expert_ids, slot_ids, int(step), fault, record, masks, int(generation), ref,
         ref_ids, info,
     )
     result, refused, checked, differed, early = info.tolist()
@@ -435,7 +429,7 @@ def piece_geometry(tables, row: int, expert: int, *, layout: str = "exl3") -> Op
     subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
     pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
     count = int(
-        _host_module(layout).expert_stream_piece_geometry(*_table_args(tables, False)[:-1], row, expert, subs, pieces)
+        _host_module(layout).expert_stream_piece_geometry(*_table_args(tables)[:-1], row, expert, subs, pieces)
     )
     if count < 0:
         return None
@@ -456,7 +450,7 @@ def piece_geometry(tables, row: int, expert: int, *, layout: str = "exl3") -> Op
 # Row images (SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES, the reader's direct mode) copy nothing: the drive writes the
 # slab rows. The pack stamps then mean publish time: with piece streaming row_pack_start/end are the clocks of the
 # row's first and last piece publish, without it both are the clock the row's reads were vetted and it was finished;
-# pack_start/pack_end/pack_ns are built from them as for packing. pack_workers is 0 (no pool) and useful_bytes still
+# pack_start/pack_end/pack_ns are built from them as for packing. pack_workers and pack_split are 0 and useful_bytes still
 # counts the segment bytes that landed in the slabs. The schema is unchanged.
 STAGE_DRIVES = 4
 STAGE_TRACE_ROWS = 16
@@ -765,10 +759,8 @@ class ExpertStreamHost:
         *,
         page: torch.Tensor,
         slot_map: torch.Tensor,
-        direct: bool,
         lease_block: Optional[torch.Tensor] = None,
         hot_page: Optional[torch.Tensor] = None,
-        pack_workers: int = 0,
         layout: str = "exl3",
     ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
@@ -809,8 +801,7 @@ class ExpertStreamHost:
             self._module.expert_stream_open(
                 page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
                 tables.slabs, tables.row_bytes, _table_buffer_regions(tables), tables.capacity, "\n".join(tables.paths),
-                "\n".join(tables.source_paths), tables.slot_bytes, int(tables.row_images), int(direct), self.lease_block,
-                int(pack_workers),
+                "\n".join(tables.source_paths), tables.slot_bytes, int(tables.row_images), 1, self.lease_block,
                 self.hot_page if self.hot_page is not None else torch.empty(0, dtype=torch.uint8),
             )
         )
@@ -1125,7 +1116,7 @@ class ExpertStreamHost:
         runs = torch.zeros(
             (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[0]), 2), dtype=torch.int32
         )
-        refused = int(self._module.expert_stream_piece_runs(*_table_args(tables, False)[:-1], runs))
+        refused = int(self._module.expert_stream_piece_runs(*_table_args(tables)[:-1], runs))
         if refused:
             # A refused row's runs are empty: S would admit a READY hit of it, copy nothing and commit.
             raise RuntimeError(f"exl3 RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces")
@@ -1135,8 +1126,8 @@ class ExpertStreamHost:
         """Test only: hand the tier's reader a whole ``ReadFault`` (the keywords of ``_fault_tensor``, the same
         vocabulary ``read_rows_faulted`` takes). Unlike ``inject(fail_reads=True)`` the read still runs, so
         the fault acts on rows that already packed. It is installed before the next read, stays until
-        replaced, and ``inject_fault()`` with no keywords clears it. ``abandon_after``, ``step``,
-        ``pack_workers`` and ``pack_split`` are not faults and are ignored (``inject`` takes the abandon
+        replaced, and ``inject_fault()`` with no keywords clears it. ``abandon_after`` and ``step``
+        are not faults and are ignored (``inject`` takes the abandon
         point). Call-numbered faults (``submit_call``, ``cqe_call``) count from the reader's creation."""
         self._module.expert_stream_inject_fault(self.handle, _fault_tensor(**faults))
 

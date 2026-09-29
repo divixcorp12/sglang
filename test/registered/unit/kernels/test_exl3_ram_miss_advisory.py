@@ -26,7 +26,7 @@ def hang_guard():
 def _host(tmp_path):
     s = ram_miss_setup(tmp_path)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.start_thread(fatal_wait_s=5.0)
     return page, host
 

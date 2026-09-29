@@ -74,7 +74,7 @@ def _drive(tmp_path, *, advisory, seed, used):
     if used:
         # The slot a phantom seq 0 would read: (0 - 1) % records, as the service computes it.
         _set_word(page, ring + (records - 1) * RECORD_BYTES, STALE_SEQ)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     try:
         posted = [sim_post(page, 1, need=[expert], protect=[expert], advisory=advisory) for expert in (0, 1, 2, 3)]
         done = []
@@ -129,7 +129,7 @@ def test_a_lap_that_would_resume_at_sequence_zero_skips_it(tmp_path, advisory):
     page = new_page(pin=False)
     _set_word(page, WORDS[f"{kind}_head"], 0xFFFFFFFD)
     _set_word(page, WORDS[f"{kind}_done"], 0xFFFFFFFD)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     try:
         posted = [
             sim_post(page, 1, need=[i % 6], protect=[i % 6], advisory=advisory) for i in range(records)
@@ -158,7 +158,7 @@ def test_the_service_thread_serves_a_real_waiter_for_every_sequence_through_the_
     _set_word(page, WORDS["demand_done"], 0xFFFFFFFD)
     if used:
         _set_word(page, DEMAND_RING + (DEMAND_RECORDS - 1) * RECORD_BYTES, STALE_SEQ)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), direct=True)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     host.start_thread(fatal_wait_s=5.0)
     try:
         posted = [sim_post(page, 1, need=[expert], protect=[expert]) for expert in (0, 1, 2, 3)]

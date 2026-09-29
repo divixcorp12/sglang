@@ -35,7 +35,7 @@ def sqe_golden(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=4, layers=2, experts=8, row_images=True, mirror_weights=(1.0, 1.0))
     out = []
     for row, experts, slots in SQE_REQUESTS:
-        result, sqes, info, _record = read_rows_sqes(s.tables, row, experts, slots, direct=True)
+        result, sqes, info, _record = read_rows_sqes(s.tables, row, experts, slots)
         oracle = s.reference(s.tables.layer_ids[row], experts)
         exact = all(same_bytes(s.slabs[row][n][slot], oracle[n][i])
                     for n in EXL3_STREAMED_NAMES for i, slot in enumerate(slots))

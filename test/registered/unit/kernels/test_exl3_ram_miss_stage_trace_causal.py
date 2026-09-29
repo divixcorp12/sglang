@@ -32,7 +32,7 @@ def _host(tmp_path, *, trace_capacity=None, capacity=6):
     """A tier and its host; ``trace_capacity`` None leaves the trace off."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, capacity), -1, dtype=torch.int32), direct=True)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, capacity), -1, dtype=torch.int32))
     if trace_capacity is not None:
         host.enable_trace(capacity=trace_capacity)
     return s, page, host
@@ -73,7 +73,7 @@ def test_a_rows_chain_holds_while_a_global_stage_order_does_not(tmp_path, weight
     the chain is checked per row."""
     s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=weights)
     result, record = read_rows_traced(
-        s.tables, 1, [3, 0, 5, 1, 4, 2], list(range(6)), direct=True, hold_ordinal=5, **fault
+        s.tables, 1, [3, 0, 5, 1, 4, 2], list(range(6)), hold_ordinal=5, **fault
     )
     assert result == 1 and record["status"] == "served"
     _assert_row_chain(record)
@@ -84,7 +84,7 @@ def test_a_rows_chain_holds_while_a_global_stage_order_does_not(tmp_path, weight
 
 def test_the_first_prepared_extent_precedes_the_first_submit(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
-    result, record = read_rows_traced(s.tables, 1, [0, 1, 2, 3], list(range(4)), direct=True)
+    result, record = read_rows_traced(s.tables, 1, [0, 1, 2, 3], list(range(4)))
     assert result == 1
     assert 0 < min(extent["submit"] for extent in record["extent_cqe"]) <= record["submit"] <= record["first_cqe"]
     assert all(extent["attempts"] == 0 for extent in record["extent_cqe"])
@@ -95,7 +95,7 @@ def test_a_credit_bound_read_prepares_its_extents_in_later_turns(tmp_path):
     """One SQE of credit: extents are prepared turn by turn, so their submit stamps are issue-ordered
     and not all one instant, and each is still before its own completion."""
     s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
-    result, record = read_rows_traced(s.tables, 1, [0, 1, 2, 3], list(range(4)), direct=True, max_outstanding=1)
+    result, record = read_rows_traced(s.tables, 1, [0, 1, 2, 3], list(range(4)), max_outstanding=1)
     assert result == 1
     submits = [extent["submit"] for extent in record["extent_cqe"]]
     assert len(set(submits)) > 1 and submits == sorted(submits)
@@ -109,7 +109,7 @@ def test_a_credit_bound_read_prepares_its_extents_in_later_turns(tmp_path):
 )
 def test_a_resubmitted_extent_counts_an_attempt_and_keeps_its_first_submit(tmp_path, fault):
     s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0))
-    result, record = read_rows_traced(s.tables, 1, [0, 1, 2], list(range(3)), direct=True, **fault)
+    result, record = read_rows_traced(s.tables, 1, [0, 1, 2], list(range(3)), **fault)
     assert result == 1
     assert record["retried_bytes"] > 0, "the fault did not fire"
     assert sum(extent["attempts"] for extent in record["extent_cqe"]) >= 1
@@ -121,8 +121,7 @@ def test_a_failure_after_some_rows_packed_marks_exactly_the_stages_not_reached(t
     admitted and prepared but never completed; row 4 was admitted but never prepared."""
     s = ram_miss_setup(tmp_path, capacity=6)
     result, record = read_rows_traced(
-        s.tables, 1, [0, 1, 2, 3, 4], list(range(5)), direct=True,
-        max_outstanding=1, part=0, part_error=errno.EIO, ordinal=3,
+        s.tables, 1, [0, 1, 2, 3, 4], list(range(5)), max_outstanding=1, part=0, part_error=errno.EIO, ordinal=3,
     )
     assert result == 0 and record["status"] == "failed" and record["ok"] == 0
     packs = {row["row"]: row for row in record["row_pack"]}
