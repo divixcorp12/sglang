@@ -19,10 +19,11 @@ using namespace sglang::expert_stream;
 int main() {{
   SpscRing<uint64_t, 32> ring;
   uint64_t v = 0;
-  assert(ring.empty() && !ring.pop(&v));
+  assert(ring.empty() && !ring.pop(&v) && ring.front() == nullptr);
   for (uint64_t i = 0; i < 32; ++i) assert(ring.push(i));
   assert(!ring.push(99));  // full at exactly N
-  for (uint64_t i = 0; i < 32; ++i) {{ assert(ring.pop(&v) && v == i); }}
+  for (uint64_t i = 0; i < 32; ++i) {{ assert(ring.front() && *ring.front() == i && ring.pop(&v) && v == i); }}
+  assert(ring.front() == nullptr);  // front() peeks: it never removes (Task 13's snapshot-only drain)
   constexpr uint64_t kItems = {items};
   std::thread producer([&] {{ for (uint64_t i = 1; i <= kItems; ++i) while (!ring.push(i)) {{}} }});
   uint64_t next = 1;

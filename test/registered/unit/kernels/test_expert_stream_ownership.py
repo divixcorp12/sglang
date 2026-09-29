@@ -1,0 +1,80 @@
+"""The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Task 13): what an unpaused Python call does while the
+service thread runs, and that queued commands are applied in order before the next request."""
+
+import faulthandler
+import time
+
+import pytest
+import torch
+
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def hang_guard():
+    # A broken ownership handoff hangs in C++ (a snapshot nobody answers): dump every stack and exit instead.
+    faulthandler.dump_traceback_later(120, exit=True)
+    yield
+    faulthandler.cancel_dump_traceback_later()
+
+
+@pytest.fixture
+def running(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=4, layers=2, experts=8)
+    page = new_page(pin=False)
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 8), -1, dtype=torch.int32))
+    for expert in range(4):
+        host.assign(0, expert)  # pump mode: the caller owns the tier
+    host.start_thread(fatal_wait_s=60.0, spin_us=2000)
+    yield s, page, host
+    host.stop()
+
+
+def test_unpaused_eager_calls_refuse_or_snapshot(running):
+    s, page, host = running
+    for call in (
+        lambda: host.assign(0, 5),
+        lambda: host.touch(0, 1),
+        lambda: host.contains(0, 1),
+        lambda: host.release(0, 0),
+        lambda: host.fill_begin(0, [5]),
+    ):
+        with pytest.raises(RuntimeError, match="paused"):
+            call()
+    info = host.slot_info(0)
+    mapping = host.mapping(0)
+    assert sorted(e for _, e, _, _ in info if e >= 0) == [0, 1, 2, 3]
+    assert all(mapping[e] >= 0 and info[mapping[e]][1] == e for e in range(4))
+    assert host.lease_entry(0)["active"] in (0, False)
+    assert sorted(host.lru_order(0)) == [0, 1, 2, 3] and sorted(host.slot_to_expert(0)) == [0, 1, 2, 3]
+    assert host.victim_census(0, []) == (0, 4, 0)
+    host.pause(5.0)
+    try:
+        slot, _evicted = host.assign(0, 5)  # the owner may assign (it evicts an LRU row: capacity is full)
+        assert slot >= 0 and host.mapping(0)[5] == slot
+        assert host.contains(0, 5)
+    finally:
+        host.resume()
+
+
+def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
+    s, page, host = running
+    host.inject(delay_s=0.3)  # instr: every advisory and demand read sleeps 300 ms first
+    applied = host.counters()["commands_applied"]  # instr: every command the owner applied, queued or direct
+    seq = sim_post(page, 1, need=[6], protect=[6])  # a long read on row 1 keeps the service busy
+    time.sleep(0.05)
+    start = time.perf_counter()
+    for i in range(200):  # the command ring holds 64: the producer must wait, never drop
+        # Every command carries its own payload (the bits of i over the row's 8 experts), so none can stand in for
+        # another: a dropped or reordered one changes the count below or the last writer.
+        host.set_hot(0, [e for e in range(8) if i >> e & 1])
+    host.set_hot(0, [0, 1, 2])
+    assert sim_wait(page, seq, 5.0) == 1
+    free, evictable, leased = host.victim_census(0, [])  # a snapshot: queued behind the burst, answered after it
+    assert (free, evictable, leased) == (0, 1, 0)  # only expert 3 is neither hot nor wanted: the LAST set_hot won
+    assert host.counters()["commands_applied"] - applied == 201 + 1, "a command was dropped (the +1 is the census)"
+    assert time.perf_counter() - start > 0.1, "the burst was applied while the read ran: nothing was queued"

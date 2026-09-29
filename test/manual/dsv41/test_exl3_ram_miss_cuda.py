@@ -356,7 +356,7 @@ def test_layer_posts_advise_the_next_layer(tmp_path):
         while time.perf_counter() < deadline and host.counters()["advisory_rows"] != 3:
             time.sleep(0.005)
         assert host.counters()["advisory_rows"] == 3
-        assert all(host.contains(1, e) for e in (9, 10, 11))
+        assert all(e in host.slot_to_expert(1) for e in (9, 10, 11))
         assert dev.last_routes[0, 0].item() == 2  # layer 0 remembered this token's routes
     finally:
         _close(host, slabs)

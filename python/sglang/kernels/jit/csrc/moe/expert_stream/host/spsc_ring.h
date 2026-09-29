@@ -41,6 +41,16 @@ class SpscRing {
     tail_.store(tail + 1, std::memory_order_release);
     return true;
   }
+  // Consumer: the oldest item without removing it (pop() does), or null when empty. The pointer is valid until the
+  // consumer's next pop: the producer never writes a slot the consumer has not released.
+  const T* front() {
+    const uint64_t tail = tail_.load(std::memory_order_relaxed);
+    if (tail == head_seen_) {
+      head_seen_ = head_.load(std::memory_order_acquire);
+      if (tail == head_seen_) return nullptr;
+    }
+    return &slots_[tail & (N - 1)];
+  }
   bool empty() const {  // either side; exact only on the consumer
     return head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_acquire);
   }

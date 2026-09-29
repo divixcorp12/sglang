@@ -53,6 +53,17 @@ def _until(predicate, timeout_s=5.0):
     return False
 
 
+def _assign_paused(host, row, experts):
+    """Eager assignments as production makes them: the service thread paused, so the caller owns the tier (assign
+    refuses unpaused, plan 2026-09-29-hotpath-zero-overhead Task 13)."""
+    host.pause(2.0)
+    try:
+        for expert in experts:
+            host.assign(row, expert, protected=[expert])
+    finally:
+        host.resume()
+
+
 def _leases(host, row):
     return [info[2] for info in host.slot_info(row)]
 
@@ -84,7 +95,7 @@ def test_a_pause_is_refused_promptly_while_a_graph_lane_lease_is_outstanding_and
 def test_a_host_lease_does_not_block_an_eager_pause(running):
     """Mutation: the pause counts every lease, so one in-flight promotion refuses every eager host use (R2)."""
     s, page, host, sim = running
-    host.assign(0, 3, protected=[3])
+    _assign_paused(host, 0, [3])
     host.inject_lease(0, 0, +1)
     start = time.perf_counter()
     host.pause(2.0)
@@ -98,8 +109,7 @@ def test_a_deferred_demand_does_not_stop_the_worker_from_pausing_or_stopping(run
     hangs. The lease is a host lease here, so the pause is granted, not refused. That an advisory is still processed
     is asserted by the two R2 tests below, on counters that a stale skip cannot move."""
     s, page, host, sim = running
-    host.assign(0, 3, protected=[3])
-    host.assign(0, 4, protected=[4])
+    _assign_paused(host, 0, [3, 4])
     for slot in (0, 1):
         host.inject_lease(0, slot, +1)
     seq = sim.post(0, [1, 2]).seq
@@ -117,8 +127,7 @@ def test_a_deferred_demand_does_not_stop_the_worker_from_pausing_or_stopping(run
 def _deferred_demand(running):
     """Row 0 full of host leases, and a demand for two experts it cannot hold: deferred, and observed to be."""
     s, page, host, sim = running
-    host.assign(0, 3, protected=[3])
-    host.assign(0, 4, protected=[4])
+    _assign_paused(host, 0, [3, 4])
     for slot in (0, 1):
         host.inject_lease(0, slot, +1)
     seq = sim.post(0, [1, 2]).seq
@@ -184,8 +193,10 @@ host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dty
 host.enable_lease_mode()
 sim = LeaseSim(host, page, s.slabs)
 host.start_thread(fatal_wait_s=FATAL_WAIT, spin_us=200)
+host.pause(2.0)  # the eager owner assigns (assign refuses while the service runs unpaused)
 host.assign(0, 3, protected=[3])
 host.assign(0, 4, protected=[4])
+host.resume()
 for slot in (0, 1):
     host.inject_lease(0, slot, +1)
 req = sim.post(0, [1, 2])

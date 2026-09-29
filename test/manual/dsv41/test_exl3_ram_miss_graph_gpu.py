@@ -237,7 +237,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             # admits cold rows before another same-layer graph post.
             protected = 19
             streamer.pinned_host_cache.ensure_rows(torch.tensor([30, 31, 32, 33, 34, 35]))
-            assert service.host.contains(0, protected)
+            assert protected in service.host.slot_to_expert(0)
             replay(
                 list(range(24, 30)) if fused else [24, 24, 25, 25, 26, 26]
             )  # generic duplicate misses copy once per unique expert
@@ -251,8 +251,8 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
                 # read. replay() checks both rows' bytes in their DIRECT slots and the committed mapping.
                 device_side = streamer.row_backend.device_side
                 mapping = manager.gpu_residency.mapping[0, :experts].cpu()
-                ram_hit = next(e for e in range(experts) if service.host.contains(0, e) and mapping[e] < 0)
-                cold = next(e for e in range(experts) if not service.host.contains(0, e) and mapping[e] < 0)
+                ram_hit = next(e for e in range(experts) if e in service.host.slot_to_expert(0) and mapping[e] < 0)
+                cold = next(e for e in range(experts) if e not in service.host.slot_to_expert(0) and mapping[e] < 0)
                 # Hold the NVMe read past stage 1's poll bound so the cold lane cannot publish during stage 1.
                 service.host.inject(delay_s=1.0)
                 replay([ram_hit, cold, 30, 31, 32, 33])
@@ -264,7 +264,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             assert manager.gpu_residency.insertion_truncated[0].item() == 0
             before_failure = manager.gpu_residency.mapping[0].clone()
             if failure == "timeout":
-                cold = next(e for e in range(experts) if not service.host.contains(0, e)
+                cold = next(e for e in range(experts) if e not in service.host.slot_to_expert(0)
                             and before_failure[e].item() < 0)
                 service.host.inject(delay_s=10.0)
                 ids.copy_(torch.tensor([[cold, 30, 31, 32, 33, 34]], device="cuda", dtype=torch.int32))
@@ -286,7 +286,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
 
                 updater = manager.gpu_residency
                 backend = streamer.row_backend
-                cold = next(e for e in range(experts) if service.host.contains(0, e)
+                cold = next(e for e in range(experts) if e in service.host.slot_to_expert(0)
                             and before_failure[e].item() < 0)
                 before_slots = updater.slot_to_expert[0].clone()
                 streamer._graph_source_rows[0] = cold

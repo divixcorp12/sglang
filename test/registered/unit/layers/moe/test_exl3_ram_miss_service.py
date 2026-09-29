@@ -63,6 +63,12 @@ def tiers(tmp_path, monkeypatch):
     module.Exl3RamMissService._instance = None
 
 
+def _holds(host, row, expert):
+    """True once ``expert`` holds a slot of ``row`` (LOADING or READY), as ``contains`` says, but through a snapshot:
+    ``contains`` refuses while the service thread runs unpaused (plan 2026-09-29-hotpath-zero-overhead Task 13)."""
+    return expert in host.slot_to_expert(row)
+
+
 def _demand(service, row, experts, *, status=1):
     """One armed demand for ``experts`` of ``row`` as the device posts it in lease mode (its lane request with it),
     waited for with ``status``; served, its leases are acknowledged and retired, so its rows are evictable again."""
@@ -86,7 +92,7 @@ def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
     assert isinstance(cache._lru, module.NativePinnedSlotTable)
     cache.ensure_rows(torch.tensor([4, 2]))
     row = service.row_of(1)
-    assert service.host.contains(row, 4) and service.host.contains(row, 2)
+    assert _holds(service.host, row, 4) and _holds(service.host, row, 2)
     assert cache.expert_to_slot[4].item() == service.host.mapping(row)[4]
     assert service.slot_map[row, 4].item() == cache.expert_to_slot[4].item()
 
@@ -110,7 +116,7 @@ def test_the_service_reads_through_the_mirror_roots_the_env_names(tiers, tmp_pat
     planned = [min(lo + n, image) - min(lo, image) for lo, n in zip(split.starts, split.part_bytes)]
     assert bool((tables.extents[..., 2] == torch.tensor(planned)).all())
     row = service.row_of(1)
-    assert service.host.contains(row, 4) and service.host.contains(row, 2)
+    assert _holds(service.host, row, 4) and _holds(service.host, row, 2)
 
 
 def test_the_service_refuses_a_mirror_configuration_the_eager_source_refuses(tiers, tmp_path):
@@ -201,9 +207,9 @@ def test_attach_registers_once_and_pushes_residency(tiers):
         caches[layer_id].ensure_rows(torch.tensor([2]))
     hot_row, cold_row = service.row_of(1), service.row_of(0)
     # The pushed hot map kept 3 in layer 1: the LRU-oldest non-hot row, 0, went instead.
-    assert [service.host.contains(hot_row, e) for e in (3, 0, 1, 2)] == [True, False, True, True]
+    assert [_holds(service.host, hot_row, e) for e in (3, 0, 1, 2)] == [True, False, True, True]
     # Layer 0 got no push, so its LRU-oldest row, 3, went.
-    assert [service.host.contains(cold_row, e) for e in (3, 0, 1, 2)] == [False, True, True, True]
+    assert [_holds(service.host, cold_row, e) for e in (3, 0, 1, 2)] == [False, True, True, True]
 
 
 def test_gpu_hot_snapshot_handoff_keeps_seed_protection_then_uses_device_map(tiers):
@@ -296,7 +302,7 @@ def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_ho
     streamers[0].hot_cache = SimpleNamespace(slot_to_expert=[0, -1])
     assert cache.evictable_rows() == 2  # is_pinned already protects 0
     cache.ensure_rows(torch.tensor([4]))  # chunk 2's admission
-    assert [service.host.contains(row, e) for e in (0, 1, 2, 4)] == [True, False, True, True]
+    assert [_holds(service.host, row, e) for e in (0, 1, 2, 4)] == [True, False, True, True]
 
 
 def test_expert_to_slot_is_rebuilt_only_when_the_slot_map_changes(tiers, monkeypatch):

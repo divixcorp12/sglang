@@ -67,6 +67,9 @@ enum Counter : int {
   kPrefetchWasted,           // copied rows it did not route
   kPrefetchHeld,             // prefetch jobs the copy thread held back behind a demand job
   kPrefetchLatencyNs,        // request read to completion observed, summed over copied prefetches
+  // The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Task 13): Python commands (set_hot, inject_lease, the
+  // snapshots) the tier's owner applied, queued through the command ring or run directly. A metric: tests only (F24).
+  kCommandsApplied,
   kCounterCount,
 };
 

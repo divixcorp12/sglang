@@ -717,19 +717,23 @@ class TestServiceEndToEnd:
             s.step(row=1)  # last_routes[1] = [9, 10]; both are read into row 1's RAM
             _cuda_ready()
             assert s.until(lambda: s.host.counters()["leases_acked"] == 2), s.host.counters()
-            for slot, (state, expert, leases, _gen) in enumerate(s.host.slot_info(1)):
-                if expert in (9, 10) and state == 2:
-                    s.host.release(1, slot)  # out of RAM again, so the next post advises them
-            assert not s.host.contains(1, 9) and not s.host.contains(1, 10)
+            s.host.pause(2.0)  # release is an eager owner's call: it refuses while the service runs unpaused
+            try:
+                for slot, (state, expert, leases, _gen) in enumerate(s.host.slot_info(1)):
+                    if expert in (9, 10) and state == 2:
+                        s.host.release(1, slot)  # out of RAM again, so the next post advises them
+            finally:
+                s.host.resume()
+            assert 9 not in s.host.slot_to_expert(1) and 10 not in s.host.slot_to_expert(1)
             rows_before = s.host.counters()["rows_read"]
             s.plan([3, 5])
             s.step(row=0, next_row=1)  # demand for row 0, and an advisory for row 1's [9, 10]
             _cuda_ready()
             assert s.keep.item() == 1.0 and s.dev.go_count.item() == 2
             _delivered(s, [3, 5])
-            # contains() is true from the slot claim, before the advisory's read lands: wait on the landed rows instead.
+            # slot_to_expert, like contains, holds a row from its claim, before the read lands: wait on landed rows.
             assert s.until(lambda: s.host.counters()["advisory_rows"] == 2)
-            assert s.host.contains(1, 9) and s.host.contains(1, 10)
+            assert 9 in s.host.slot_to_expert(1) and 10 in s.host.slot_to_expert(1)
             assert s.until(lambda: s.host.counters()["leases_acked"] == 4), s.host.counters()
             counters = s.host.counters()
             assert counters["advisory_rows"] == 2 and counters["leases_granted"] == 4, counters  # the advisory took no lease
@@ -804,7 +808,7 @@ class TestDelayedConsumption:
             s.step_with(newer)
             _cuda_ready()
             assert s.keep.item() == 1.0 and newer.go_count.item() == len(experts), experts
-            assert s.until(lambda: all(s.host.contains(0, e) for e in experts)), (experts, _resident(s))
+            assert s.until(lambda: all(e in s.host.slot_to_expert(0) for e in experts)), (experts, _resident(s))
 
         # CAPACITY is 8 and the lease holds 3: the first two rounds fill the tier, the last two can only be served
         # by evicting, and every eviction has to walk past the three leased slots to find its victim.
@@ -847,7 +851,7 @@ class TestDelayedConsumption:
         evicted_before = s.host.counters()["evictions"]
         press([1, 2])
         assert s.host.counters()["evictions"] - evicted_before == 2, s.host.counters()
-        gone = [expert for expert in held if not s.host.contains(0, expert)]
+        gone = [expert for expert in held if expert not in s.host.slot_to_expert(0)]
         assert gone == [3, 4], (gone, _resident(s))
 
 

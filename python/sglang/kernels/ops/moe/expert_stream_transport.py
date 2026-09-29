@@ -692,8 +692,8 @@ WORDS = {
 STATUS = {"pending": 0, "served": 1, "failed": 2}
 # Order of the C++ counters. ``rows_read`` counts every row read, demand AND advisory
 # (``advisory_rows`` is the advisory part); it is not the RAM-miss count behind ``f``. Demand
-# rows come only from ``ExpertStreamHost.layer_rows()``: per streamed layer, demand-only, and
-# read under the host's lock. Do not derive them as ``rows_read - advisory_rows``: the two
+# rows come only from ``ExpertStreamHost.layer_rows()``: per streamed layer, demand-only, one
+# word per layer written by the tier's owner. Do not derive them as ``rows_read - advisory_rows``: the two
 # counters are separate atomics bumped after the rows are published, so a read can tear.
 COUNTERS = (
     "served",
@@ -743,6 +743,8 @@ COUNTERS = (
     "prefetch_wasted",
     "prefetch_held",
     "prefetch_latency_ns",
+    # The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Task 13): Python commands the owner applied.
+    "commands_applied",
 )
 
 # The counters a production host keeps (plan 2026-09-29-hotpath-zero-overhead D1; tier_protocol.h is_core_counter,
@@ -856,6 +858,15 @@ class ExpertStreamHost:
     streamed layer ``tables.layer_ids[r]``. Requests are served by ``pump()`` until
     ``start_thread()``, then by the C++ service thread until ``stop()``. ``variant``: the host build to load
     (``VARIANTS``), by default ``host_variant()``'s choice; kept as ``self.variant``.
+
+    The tier has one owner at a time (plan 2026-09-29-hotpath-zero-overhead Task 13): the service thread while it
+    runs, the caller between ``pause()`` and ``resume()``, and the caller of ``pump()`` when there is no thread. While
+    the thread runs unpaused, ``contains``, ``touch``, ``assign``, ``release`` and ``fill_begin`` raise
+    ``RuntimeError`` ("... needs the service thread paused"); ``set_hot`` is queued and applied by the service before
+    its next request (it returns before then); ``inject_lease`` and the snapshots (``slot_info``, ``slot_to_expert``,
+    ``lease_entry``, ``lru_order``, ``victim_census``, ``prefetch_lease``) are answered by the service and waited for;
+    ``mapping``, ``counters``, ``busy_episode`` and ``layer_rows`` read published words without waiting. Paused, or
+    with no thread, every call runs at once.
     """
 
     def __init__(
@@ -967,7 +978,8 @@ class ExpertStreamHost:
     def contains(self, row: int, expert: int) -> bool:
         """True once the expert holds a slot in ``row``: from the moment the thread claims the
         slot, before its read has finished. It does not mean the bytes are in RAM; the read is
-        done when ``layer_rows()`` / ``layer_advisory_rows()`` count the row."""
+        done when ``layer_rows()`` / ``layer_advisory_rows()`` count the row. Needs the thread paused (or no
+        thread); ``slot_to_expert`` answers the same question as a snapshot while it runs."""
         self._check(row, expert)
         return bool(self._module.expert_stream_contains(self.handle, row, expert))
 
@@ -1027,7 +1039,8 @@ class ExpertStreamHost:
 
     def slot_info(self, row: int) -> list[tuple[int, int, int, int]]:
         """Per slot: (state, expert, leases, generation); state 0 FREE, 1 LOADING, 2 READY, 3 QUARANTINE (piece
-        streaming: a failed read's slot a lane still leases; its expert reads -1)."""
+        streaming: a failed read's slot a lane still leases; its expert reads -1). A snapshot: with the thread running,
+        the service answers it between requests or from inside a read."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 4, dtype=torch.int64)
         self._module.expert_stream_slot_info(self.handle, row, out)
@@ -1187,6 +1200,7 @@ class ExpertStreamHost:
         return [w & 0xFFFFFFFF for w in self.lease_block[start : start + 4 * capacity].view(torch.int32).tolist()]
 
     def mapping(self, row: int) -> list[int]:
+        """Each expert's READY slot, else -1: the published slot map (``slot_map``), read without waiting."""
         self._check(row)
         out = torch.empty(self.experts, dtype=torch.int64)
         self._module.expert_stream_mapping(self.handle, row, out)
@@ -1205,6 +1219,8 @@ class ExpertStreamHost:
         return out[:count].tolist()
 
     def set_hot(self, row: int, experts: Iterable[int]) -> None:
+        """The row's hot set (never evicted). With the thread running unpaused it is queued and applied, in order,
+        before the service's next request; the call does not wait for that. At most 1024 experts per row."""
         self._check(row)
         self._module.expert_stream_set_hot(self.handle, row, _ids(e for e in experts if e >= 0))
 

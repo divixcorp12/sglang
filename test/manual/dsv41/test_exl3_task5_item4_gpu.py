@@ -166,7 +166,7 @@ class TestRealServiceFailures:
             assert s.block.ack_area() == NO_ACKS, "a skipped copy emits no acknowledgement"
             assert counters["leases_granted"] == 0 and counters["leases_acked"] == 0, counters
             assert s.leases() == [0] * len(s.leases())
-            assert not any(s.host.contains(0, e) for e in experts)
+            assert not any(e in s.host.slot_to_expert(0) for e in experts)
         finally:
             s.host.inject_fault()
             s.close()

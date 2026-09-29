@@ -227,7 +227,7 @@ NON_TRACE_CLOCK_READS = {
     # (the second "if (now_ns() > deadline) {") and seqlock_stress (the duration pair).
     "const int64_t deadline = now_ns() + timeout_ns;": 3,
     "if (now_ns() > deadline) {": 2,
-    "tier_->wait_copy_idle(now_ns() + timeout_ns);": 1,
+    "tier_->wait_copy_idle_owned(now_ns() + timeout_ns);": 1,
     "if (now_ns() > deadline) return -1;": 1,
     "const int64_t deadline = now_ns() + duration_ns;": 1,
     "while (now_ns() < deadline) {": 1,
