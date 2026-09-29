@@ -41,6 +41,17 @@ only 32,150 MiB" is wrong by 52 MiB.** Its "~16 MiB margin" for the 09-26 chunke
   capped at 131,072, below the smallest measured pool with margin for launch-to-launch variation. See "Context cap"
   below.
 
+### Context cap (`69554615c0`)
+
+`CONTEXT_LENGTH` 262,144 → 131,072 in `arm_env.py`. `launch_prod.sh` takes it from `arm_env`'s argv, and the test pin
+and the `session_subset.py` docstring are updated to match. `test_dsv41_baseline.py` passed on divix01 in a worktree at
+`69554615c0` (160 passed, exit 0).
+
+**The startup pool check was not run.** A startup at 131,072 (`launch_to_pool.sh <wt> ctx131k`) was queued behind
+another lane on `rowimg-disk.lock` and was cancelled by user override before it took any lock or the GPU. So no launch
+has yet shown that the server accepts context 131,072 or that the pool at this commit is at or above it. The margin
+rests only on the 9 launches above, where the smallest pool was 150,784 tokens.
+
 ### Prefill: 4096-token chunks; lm = recipe (≥ 8192 uncached tokens run layer-major), ch = `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0`
 
 | prompt | run 1: TTFT s, peak MiB, free MiB, retries | run 2: TTFT s, peak MiB, free MiB, retries |
