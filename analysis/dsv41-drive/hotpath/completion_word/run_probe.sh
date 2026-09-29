@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Phase 2 Task P1: builds and runs probe_completion_word.cu on divix01 (RTX 5090, driver 615.71.09), from a pulled
 # worktree. The shim and the probe are built into <out> (never into the worktree). The measuring run is under the
-# counting shim (python/sglang/test/hotpath_shim.c, armed at load by HOTPATH_SHIM_OUT); the two --fault runs are
+# counting shim (python/sglang/test/hotpath_shim.c, armed at load by HOTPATH_SHIM_OUT); the two --fault runs (opt-in, RUN_FAULT=1) are
 # separate processes, because a device fault poisons the context. GPU work runs under cc-gpu.lock on cores 32-63
 # (the probe needs no disk, so it takes no rowimg-disk.lock); builds under taskset -c 0-63.
-# Usage: run_probe.sh <out dir under /mnt/nvme1> [tiny jobs] [large jobs]
+# Usage: [RUN_FAULT=1] run_probe.sh <out dir under /mnt/nvme1> [tiny jobs] [large jobs]
 set -u
 OUT=${1:?out dir}; SMALL=${2:-2000}; LARGE=${3:-500}
 case $OUT in /mnt/nvme1/*) ;; *) echo "out dir must be under /mnt/nvme1"; exit 1 ;; esac
@@ -25,6 +25,9 @@ flock "$GPU_LOCK" taskset -c 32-63 env LD_PRELOAD="$OUT/hotpath_shim.so" HOTPATH
 rc=$?
 cat "$OUT/probe.log"; echo "PROBE_EXIT=$rc"
 echo "shim whole-process dump: $(cat "$OUT/probe-shim.json" 2>/dev/null)"
+# The --fault runs put an MMU fault on the GPU (contained to the probe's context, but never while production shares
+# the GPU): opt-in only, RUN_FAULT=1.
+[ "${RUN_FAULT:-0}" = 1 ] || { echo "fault runs skipped (RUN_FAULT=1 to run them)"; exit "$rc"; }
 for how in wv32 kern; do
     flock "$GPU_LOCK" taskset -c 32-63 "$OUT/probe" "$OUT/fault-$how.json" "--fault=$how" > "$OUT/fault-$how.log" 2>&1
     frc=$?

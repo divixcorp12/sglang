@@ -76,18 +76,19 @@ __global__ void release_store_kernel(unsigned long long* word, unsigned long lon
 using CountFn = long (*)(int, int);
 static CountFn shim_count = nullptr;
 struct Counts {
-  long malloc_ = 0, free_ = 0, mutex = 0, cond = 0, futex = 0;
+  long malloc_ = 0, free_ = 0, mutex = 0, cond = 0, futex = 0, clock = 0;
   Counts operator-(const Counts& o) const {
-    return {malloc_ - o.malloc_, free_ - o.free_, mutex - o.mutex, cond - o.cond, futex - o.futex};
+    return {malloc_ - o.malloc_, free_ - o.free_, mutex - o.mutex, cond - o.cond, futex - o.futex, clock - o.clock};
   }
   Counts& operator+=(const Counts& o) {
-    malloc_ += o.malloc_, free_ += o.free_, mutex += o.mutex, cond += o.cond, futex += o.futex;
+    malloc_ += o.malloc_, free_ += o.free_, mutex += o.mutex, cond += o.cond, futex += o.futex, clock += o.clock;
     return *this;
   }
 };
 static Counts snap() {
   if (shim_count == nullptr) return {};
-  return {shim_count(1, 0), shim_count(1, 1), shim_count(1, 2), shim_count(1, 3), shim_count(1, 6)};
+  return {shim_count(1, 0), shim_count(1, 1), shim_count(1, 2), shim_count(1, 3), shim_count(1, 6),
+          shim_count(1, 4)};  // kinds: malloc, free, mutex, cond, futex, clock (clock_gettime)
 }
 
 static double ns_per_tick = 1.0;
@@ -271,6 +272,8 @@ static void run_mech(Mech m, size_t entry_bytes, int jobs, int warm, const char*
          kMechName[m], size_label, jobs, kEntries, copies_c.mutex / n, copies_c.malloc_ / n, op_c.mutex / n,
          op_c.malloc_ / n, queries / n, poll_c.mutex / n, poll_c.malloc_ / n, L.p50, L.p90, L.p99, L.max, S.p50,
          C.p50, O.p50, violations);
+  printf("      clock_gettime per job: copies %.2f, op %.2f, poll %.2f (the zero rule's clock kind)\n", copies_c.clock / n,
+         op_c.clock / n, poll_c.clock / n);
   jsep();
   jprint("  {\"test\": \"mech\", \"mech\": \"%s\", \"size\": \"%s\", \"entry_bytes\": %zu, \"entries\": %d, "
          "\"jobs\": %d, \"copies_mutex_per_job\": %.4f, \"copies_malloc_per_job\": %.4f, \"copies_free_per_job\": %.4f, "
@@ -279,11 +282,13 @@ static void run_mech(Mech m, size_t entry_bytes, int jobs, int warm, const char*
          "\"poll_malloc_per_job\": %.4f, \"poll_futex_per_job\": %.4f, \"cond_per_job\": %.4f, "
          "\"latency_us\": {\"p50\": %.2f, \"p90\": %.2f, \"p99\": %.2f, \"max\": %.2f, \"mean\": %.2f}, "
          "\"submit_us_p50\": %.3f, \"copies_us_p50\": %.3f, \"op_us_p50\": %.3f, \"op_us_p99\": %.3f, "
+         "\"copies_clock_per_job\": %.4f, \"op_clock_per_job\": %.4f, \"poll_clock_per_job\": %.4f, "
          "\"order_violations\": %ld}",
          kMechName[m], size_label, entry_bytes, kEntries, jobs, copies_c.mutex / n, copies_c.malloc_ / n,
          copies_c.free_ / n, op_c.mutex / n, op_c.malloc_ / n, op_c.free_ / n, queries / n, turns / n,
          poll_c.mutex / n, poll_c.malloc_ / n, poll_c.futex / n, (copies_c.cond + op_c.cond + poll_c.cond) / n, L.p50,
-         L.p90, L.p99, L.max, L.mean, S.p50, C.p50, O.p50, O.p99, violations);
+         L.p90, L.p99, L.max, L.mean, S.p50, C.p50, O.p50, O.p99, copies_c.clock / n, op_c.clock / n, poll_c.clock / n,
+         violations);
 }
 
 // ---- dual observers: the word (this thread) against cuEventQuery every turn (a helper thread) ----
@@ -381,8 +386,8 @@ static void query_cost() {
   for (int i = 0; i < kN; ++i) CK(cuStreamQuery(st));
   t1 = rdtsc();
   d = snap() - a;
-  printf("cuStreamQuery (idle): %.1f ns/call, mutex %.3f malloc %.3f per call\n", (t1 - t0) * ns_per_tick / kN,
-         d.mutex / double(kN), d.malloc_ / double(kN));
+  printf("cuStreamQuery (idle): %.1f ns/call, mutex %.3f malloc %.3f clock %.3f per call\n",
+         (t1 - t0) * ns_per_tick / kN, d.mutex / double(kN), d.malloc_ / double(kN), d.clock / double(kN));
   jsep();
   jprint("  {\"test\": \"call_cost\", \"call\": \"cuStreamQuery\", \"ns\": %.2f, \"mutex\": %.4f, \"malloc\": %.4f}",
          (t1 - t0) * ns_per_tick / kN, d.mutex / double(kN), d.malloc_ / double(kN));
@@ -496,7 +501,15 @@ static int run_fault(const char* how) {
     ++checks;
     const CUresult r = cuStreamQuery(st);
     if (r == CUDA_ERROR_NOT_READY) continue;
-    verdict = r == CUDA_SUCCESS ? CUDA_ERROR_UNKNOWN : r;  // idle stream, no word: the write is lost -> fail stop
+    if (r == CUDA_SUCCESS) {
+      // The word was loaded before the query. A write that landed in between would make a healthy stream look like
+      // a lost write, so re-load it (acquire) after the SUCCESS: the stream is idle, so its write, if made, is now
+      // visible. Fail only if it is still short (P2 must test this interleaving).
+      if (__atomic_load_n(w32, __ATOMIC_ACQUIRE) == 1u) break;
+      verdict = CUDA_ERROR_UNKNOWN;  // idle stream, word still short after the re-load: a lost write -> fail stop
+      break;
+    }
+    verdict = r;
     break;
   }
   const uint64_t t1 = rdtsc();
