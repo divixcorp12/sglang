@@ -114,7 +114,7 @@ def test_gpu_hot_sidecar_aborts_on_a_stale_or_malformed_record_after_a_wrap(tmp_
             start = (seq - 1) % DEMAND_RECORDS * hot_record_bytes(host.experts)
             orig = sim.post
             def post(*args, **kwargs):
-                hot_page[start + 4 : start + 8].view(torch.int32)[0] = host.experts + 1
+                hot_page[start + 8] = int(hot_page[start + 8]) | 0x80  # a bit past the last expert
                 return orig(*args, **kwargs)
             sim.post = post
         sim.post_gpu_hot(hot_page, 0, [3], hot=[0], hot_seq=1 if fault == "stale" else None)
