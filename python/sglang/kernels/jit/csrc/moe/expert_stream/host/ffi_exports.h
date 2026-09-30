@@ -1,7 +1,8 @@
-// The expert-stream host FFI surface the server uses (the test-only exports are in ffi_test_exports.h), written once
-// for every row layout and file reader. An instantiation file names a layout, a reader and a build policy
-// (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and EXPERT_STREAM_HOST_TEST_EXPORTS; see
-// exl3_ram_miss_host.cpp (ProdBuild) and exl3_ram_miss_host_instr.cpp (InstrBuild).
+// The expert-stream host exports the server's path reaches, through expert_stream_transport.py (the test and tool
+// exports are in ffi_test_exports.h), written once for every row layout and file reader. An instantiation file
+// names a layout, a reader and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and
+// EXPERT_STREAM_HOST_TEST_EXPORTS; see exl3_ram_miss_host.cpp (ProdBuild) and
+// exl3_ram_miss_host_instr.cpp (InstrBuild).
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -15,7 +16,8 @@ namespace sglang::expert_stream {
 
 using tvm::ffi::TensorView;
 
-/// \brief The server-facing host exports of one transport instantiation; HostTestExports adds the test-only ones.
+/// \brief The host exports of one transport instantiation that the server's path reaches; HostTestExports adds the
+/// test and tool exports the server does not call.
 /// The function-local registries are per instantiation, and each layout is its own module, so one layout's
 /// handles can never resolve in another's.
 template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>

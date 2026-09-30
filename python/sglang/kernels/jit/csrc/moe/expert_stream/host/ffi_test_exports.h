@@ -1,5 +1,7 @@
-// The expert-stream host exports only tests call; ffi_exports.h holds the surface the server uses. Every site that
-// expands EXPERT_STREAM_HOST_EXPORTS(Exports) also expands EXPERT_STREAM_HOST_TEST_EXPORTS(Exports).
+// The expert-stream host exports the server does not call: tests use them, and analysis tools call some of them on a
+// live module. Every site that expands EXPERT_STREAM_HOST_EXPORTS(Exports) also expands
+// EXPERT_STREAM_HOST_TEST_EXPORTS(Exports), the production build included: only some of these refuse there
+// (test_only()), and tools use others.
 #pragma once
 
 #include "ffi_exports.h"
@@ -9,7 +11,7 @@ namespace sglang::expert_stream {
 template <class Exports>
 struct HostTestExports;
 
-/// \brief The test-only host exports of one HostExports instantiation. Derived from it, so a handle its open()
+/// \brief The test and tool host exports of one HostExports instantiation. Derived from it, so a handle its open()
 /// returned resolves here: both use the same function-local registries.
 template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout, Reader, Build> {
@@ -679,16 +681,16 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_geometry, Exports::piece_geometry);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump, Exports::pump);                                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_info, Exports::slot_info);                           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lease_entry, Exports::lease_entry);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_lease, Exports::inject_lease);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lease_entry, Exports::lease_entry);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_victim_census, Exports::victim_census);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_busy_episode, Exports::busy_episode);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_idle, Exports::copy_engine_idle);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_release, Exports::copy_engine_release);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_fail, Exports::copy_engine_fail);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_marked, Exports::copy_engine_marked);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_ballast, Exports::copy_engine_ballast);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);            \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_marked, Exports::copy_engine_marked);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);
