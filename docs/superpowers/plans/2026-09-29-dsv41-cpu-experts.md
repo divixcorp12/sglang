@@ -255,6 +255,31 @@ expert, p50 (p90 ≤ 1.1x p50):
 - **With native `c_cpu` ≈ 0.53 ms, `k*(n)` becomes ~0.65·n:** n = 1 → 1, 2 → 1-2 (a tie), 3 → 2, 4 → 3,
   6 → 4. With swizzled (0.42), n = 2 → 2.
 
+**Activation quantization options** (`d2b154cb13`, `SGLANG_EXL3_CPU_ACT_RESIDUAL` / `SGLANG_EXL3_CPU_ACT_BLOCK`).
+- Same runs as above per build flavor: `acc-<flavor>` and `perf-<flavor>`, 12 threads, cores 18-29. Driver
+  `/tmp/p0_flavors.sh` on divix01, logs `p0_{build,test,acc,perf}-<flavor>*.log`.
+- The manual kernel test (`test/manual/dsv41/test_exl3_cpu_act_quant.py`) passes 3/3 on every flavor:
+  swizzled output = native bit-for-bit, and a 5-token batch = single-token runs.
+- Relative L2 against the fp32 reference, p50 over groups (worst max); ms per expert at 1 / 2 / 6 per call:
+
+| Flavor | CPU error | CPU vs GPU path | native | swizzled |
+|---|---|---|---|---|
+| upstream | 1.38-1.86% (2.23%) | 1.71-2.30% (2.75%) | 0.558 / 0.511 / 0.475 | 0.459 / 0.416 / 0.395 |
+| residual | 0.16-0.44% (1.25%) | 1.06-1.44% (1.93%) | 0.778 / 0.725 / 0.692 | 0.604 / 0.554 / 0.513 |
+| block 128 | 0.99-1.43% (1.82%) | 1.18-1.58% (1.89%) | 0.458 / 0.412 / 0.384 | 0.644 / 0.593 / 0.572 |
+| **residual + block 128** | **0.16-0.44% (1.25%)** | **1.06-1.44% (1.93%)** | **0.575 / 0.518 / 0.475** | 0.735 / 0.670 / 0.631 |
+
+- **Pick: residual + block 128 on the native layout.**
+  - Error sits at the scalar fp32 tier's floor (0.16-0.44%), below the GPU path's own 1.05-1.38%. The remaining
+    CPU-vs-GPU difference is the GPU's error.
+  - It runs at upstream-native speed: 0.52-0.58 ms per expert at decode's 1-2 per layer, ~1.8x faster than a link
+    copy.
+  - It needs no swizzled tier, so no GPU unswizzle on the copy path.
+- **Blocking speeds up the native layout by ~18%.** Per k-block, a worker reads 8 whole k-tile rows of its column
+  range back to back instead of striding a band down all of k. That is the same effect the swizzle buys, which is
+  why blocking plus swizzle is slower than either alone. It also pays for the residual row.
+- `k*(n)` at c_cpu ~0.55 ms: n = 1 -> 1, 2 -> 1-2 (a tie), 3 -> 2, 4 -> 3, 6 -> 4.
+
 **Still open in P0:**
 - `c_cpu` under concurrent NVMe DMA into node-1 slabs and under copy-engine H2D load.
 - Node-1 cores reading node-0 memory.
