@@ -124,7 +124,7 @@ def test_a_faulted_read_refuses_on_prod(tmp_path):
 # The Python wrappers refuse before building a tensor; these call the production module's C++ exports directly, so
 # the C++ refusal is pinned too (a wrapper that forgot to refuse would otherwise reach a silent C++ fallback).
 RAW_EXPORTS = {
-    "inject": lambda m, h: m.expert_stream_inject(h, 0, 1, 0, 0),
+    "inject": lambda m, h: m.expert_stream_inject(h, 0, 1, 0),
     "inject_fault": lambda m, h: m.expert_stream_inject_fault(h, ops._fault_tensor(part=0, part_error=5)),
     "inject_lease": lambda m, h: m.expert_stream_inject_lease(h, 0, 0, 1),
     "copy_engine_fail": lambda m, h: m.expert_stream_copy_engine_fail(h, 1, 0),

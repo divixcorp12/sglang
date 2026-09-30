@@ -107,9 +107,10 @@ def test_one_record_per_request_in_order(tier):
         previous_done = record["done"]
     read, empty, one = records
     # pack_ns == 0: a row image is finished at one clock (RowReader copies nothing), so a row's pack span is empty.
-    assert read["batches"] == 1 and read["extents"] == 2 and read["submit"] > 0 and read["pack_ns"] == 0
+    # The service streams pieces: every row is the same number of sub-reads (one part, up to 4 page-aligned cuts).
+    assert one["extents"] >= 1
+    assert read["batches"] == 1 and read["extents"] == 2 * one["extents"] and read["submit"] > 0 and read["pack_ns"] == 0
     assert empty["batches"] == 0 and empty["extents"] == 0 and empty["bytes"] == 0 and empty["submit"] == 0
-    assert one["extents"] == 1
 
 
 def test_per_drive_bytes_sum_to_the_request_total(tier):
@@ -117,7 +118,8 @@ def test_per_drive_bytes_sum_to_the_request_total(tier):
     host.enable_trace()
     _serve(page, host, 1, [0, 1, 2, 3, 4, 5])
     (record,) = host.drain_trace()
-    assert record["extents"] == 6 and record["bytes"] > 0
+    per_row = {row: sum(e["row"] == row for e in record["extent_cqe"]) for row in range(6)}
+    assert len(set(per_row.values())) == 1 and record["extents"] == 6 * per_row[0] and record["bytes"] > 0
     assert sum(d["bytes"] for d in record["drives"]) == record["bytes"]
     assert sum(d["extents"] for d in record["drives"]) == record["extents"]
     assert [d["dev"] for d in record["drives"]] == [os.stat(s.tables.paths[0]).st_dev]
@@ -169,12 +171,14 @@ def test_a_served_request_has_per_row_stamps_in_causal_order(tier):
     _serve(page, host, 1, [2, 5, 4])
     (record,) = host.drain_trace()
     _assert_terminal(record, "served", [])
-    assert record["rows"] == record["rows_asked"] == 3 and record["extents"] == 3
-    assert len(record["row_pack"]) == 3 and len(record["extent_cqe"]) == 3
-    cqe_by_row = {extent["row"]: extent["cqe"] for extent in record["extent_cqe"]}
+    assert record["rows"] == record["rows_asked"] == 3 and record["extents"] == len(record["extent_cqe"]) >= 3
+    assert len(record["row_pack"]) == 3
     for row in record["row_pack"]:
-        # Only this row's own completion must precede its packing; other rows' are not compared.
-        assert record["submit"] <= cqe_by_row[row["row"]] <= row["start"] <= row["end"] <= record["mapped"], row
+        # Only this row's own completions are compared with its packing: with pieces streamed, the row starts packing
+        # once its first sub-read landed and ends after its last.
+        cqes = [extent["cqe"] for extent in record["extent_cqe"] if extent["row"] == row["row"]]
+        assert record["submit"] <= min(cqes) <= row["start"] <= row["end"] <= record["mapped"], row
+        assert max(cqes) <= row["end"], row
     # pack_one picks the lowest-ordinal row among those currently READY, so packing follows
     # completion order, not request order: the aggregate brackets the rows, it does not track
     # ordinal 0 and ordinal -1.

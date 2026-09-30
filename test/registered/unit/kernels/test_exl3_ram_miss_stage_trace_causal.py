@@ -57,14 +57,19 @@ def _extents_by_row(record):
     return by_row
 
 
-def _assert_row_chain(record, rows=None):
+def _assert_row_chain(record, rows=None, *, pieces=False):
     """One row's own stamps, never one sorted list across rows: admit <= each of its extents' submit <=
-    that extent's cqe <= the row's pack_start <= pack_end. Every stamp of a packed row must exist."""
+    that extent's cqe <= the row's pack_start <= pack_end. Every stamp of a packed row must exist. With ``pieces``
+    (the service streams them) a row starts packing once its first sub-read landed, so only the first cqe precedes
+    pack_start, and every cqe precedes pack_end."""
     by_row = _extents_by_row(record)
     for row in record["row_pack"] if rows is None else rows:
         assert row["admit"] > 0 and row["start"] > 0 and row["end"] >= row["start"], row
-        for extent in by_row[row["row"]]:
-            assert row["admit"] <= extent["submit"] <= extent["cqe"] <= row["start"], (row, extent)
+        extents = by_row[row["row"]]
+        for extent in extents:
+            assert row["admit"] <= extent["submit"] <= extent["cqe"] <= (row["end"] if pieces else row["start"]), (
+                row, extent)
+        assert min(extent["cqe"] for extent in extents) <= row["start"], row
 
 
 @pytest.mark.parametrize("weights", [None, (1.0, 1.0)])
@@ -149,7 +154,7 @@ def test_a_served_request_is_reserved_before_any_row_is_admitted(tmp_path):
         host.stop()
     assert record["observed"] <= record["reserved"] <= min(row["admit"] for row in record["row_pack"])
     assert record["dropped_before"] == 0
-    _assert_row_chain(record)
+    _assert_row_chain(record, pieces=True)
 
 
 def test_a_full_ring_says_where_the_records_were_lost(tmp_path):
