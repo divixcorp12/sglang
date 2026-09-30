@@ -363,7 +363,11 @@ def test_graph_routes_are_logged_only_when_the_stage_trace_is_on(tiers, monkeypa
     from sglang.srt.layers.moe import expert_row_plan
 
     monkeypatch.setattr(expert_row_plan, "copy_expert_row_segments_gpu", lambda *args: None)
-    service.device_side = SimpleNamespace(lease_block=None, post=lambda *a: None, wait=lambda *a: None)
+    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *args: None)
+    service.device_side = SimpleNamespace(
+        post=lambda *a, **kw: None, hit_wait=lambda *a: None, stream=lambda *a: None, copy_wait=lambda *a: None,
+        host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False,
+    )
     for backend in backends:
         backend.device_side = service.device_side
     for row, backend in enumerate(backends):  # one forward, as _apply_graph then the gather leave it
