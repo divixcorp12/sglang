@@ -335,7 +335,8 @@ def _replay_step(pairs, service, inputs, graph, step, checks):
     """Replay every layer on routes that miss its pinned tier; each layer's misses must be read and none dropped."""
     expected = []
     for layer_id, (_, streamer) in enumerate(pairs):
-        hot, tier = streamer.hot_cache.slot_to_expert, streamer.pinned_host_cache._lru
+        # A snapshot: the running service owns the tier, and membership queries refuse unpaused.
+        hot, tier = streamer.hot_cache.slot_to_expert, service.host.slot_to_expert(service.row_of(streamer.layer_id))
         missing = [e for e in _step_route(layer_id, step) if e not in hot and e not in tier]
         # A layer with nothing to read would post an all-hit request and leave the RAM-miss path unexercised.
         assert missing, (layer_id, step)
