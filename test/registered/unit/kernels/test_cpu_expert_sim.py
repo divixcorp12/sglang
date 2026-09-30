@@ -8,9 +8,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "dsv41"))
 
+import tier_sim  # noqa: E402
 from cpu_expert_sim import (  # noqa: E402
     MAX_ROUTES,
     CostModel,
+    _cpu_chooser,
     c_cpu_at,
     histogram,
     load_c_cpu_table,
@@ -125,6 +127,48 @@ def test_replay_counts_ram_hits_and_nvme_misses_per_decode_layer():
     assert out["n"].tolist() == [[0], [1], [0]]
     assert out["m"].tolist() == [[2], [0], [1]]
     assert out["validation"]["decode_tokens"] == 3
+
+
+def _ram_hit_loaded():
+    # One layer, one hot slot, a 4-row pinned tier. 2 and 3 miss both and are inserted in turn, so the tier
+    # holds 2 when forward 3 routes it again: a RAM hit (n = 1), which the CPU policies do not insert.
+    routes = [[2], [3], [2], [2], [2]]
+    return {
+        "layer_ids": [0],
+        "hot_capacity": {0: 1},
+        "forwards": [_graph(seq, r, [0]) for seq, r in enumerate(routes, start=1)],
+    }
+
+
+def test_insert_all_policy_is_the_p1_replay():
+    loaded = _ram_hit_loaded()
+    base = replay_nm(loaded, ram_rows=4, num_experts=8)
+    out = replay_nm(loaded, ram_rows=4, num_experts=8, policy="insert_all", split=[0, 1, 1, 2, 3, 3, 4])
+    assert out["n"].tolist() == base["n"].tolist() == [[0], [0], [1], [0], [0]]
+    assert out["m"].tolist() == base["m"].tolist() == [[1], [1], [0], [0], [0]]
+    assert out["residency"]["hot_hit_rate"] == pytest.approx(2 / 5)
+    assert out["residency"]["cpu_lanes_per_token"] == pytest.approx(1 / 5)
+
+
+def test_a_cpu_lane_is_never_inserted_and_a_deferred_one_lands_a_forward_later():
+    loaded = _ram_hit_loaded()
+    split = [0, 1, 1, 2, 3, 3, 4]
+    order = replay_nm(loaded, ram_rows=4, num_experts=8, policy="cpu_lane_order", split=split)
+    assert order["n"].tolist() == [[0], [0], [1], [1], [1]]  # 2 stays a RAM hit: the victim kept 3
+    assert order["residency"]["hot_hit_rate"] == 0.0
+    late = replay_nm(loaded, ram_rows=4, num_experts=8, policy="cpu_deferred", split=split)
+    assert late["n"].tolist() == [[0], [0], [1], [1], [0]]  # inserted at forward 4's commit
+    assert late["residency"]["deferred_link_rows_per_token"] == pytest.approx(1 / 5)
+
+
+def test_cpu_by_score_takes_the_lowest_ranked_ram_hit():
+    sim = tier_sim.DirectInsertReplay({0: [0]}, {0: 1}, 8)
+    sim.scores[0, 5], sim.scores[0, 6] = 2.0, 1.0
+    for policy, want in (("cpu_lane_order", {5}), ("cpu_by_score", {6})):
+        chosen = {}
+        assert _cpu_chooser(policy, sim, [0, 1, 1], {0: [5, 6]}, chosen)(0, [5, 6]) == want
+    sim.scores[0, 6] = 2.0  # a tie goes to the higher expert, as the victim ranking evicts it first
+    assert _cpu_chooser("cpu_by_score", sim, [0, 1, 1], {0: [5, 6]}, {})(0, [5, 6]) == {6}
 
 
 if __name__ == "__main__":
