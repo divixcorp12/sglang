@@ -64,13 +64,12 @@ def test_volatile_lives_only_in_the_relaxed_helpers():
     ]
 
 
-def test_only_the_smack_publish_and_the_copy_wait_arm_keep_a_seq_cst_system_fence():
-    # The five seqlock fences are acquire/release (Boehm's shape, paired with the host's); SmAck orders other
-    # threads' loads through __syncthreads before thread 0's release, a different argument, so it stays seq_cst.
-    # The copy wait's arm orders its CopyArm store before its loads of the fatal and shutdown words (a Dekker pair
-    # with the host's seq_cst fence after raising either, LEASE_PROTOCOL.md 7.6): store->load needs seq_cst.
-    # The post's CPU-input staging is SmAck's shape: every thread's stores of x to the host row, ordered through
-    # __syncthreads before thread 0 releases the LaneRequest the CPU expert thread acquires.
+def test_only_the_post_staging_and_cws_done_and_gate_close_keep_a_seq_cst_system_fence():
+    # The post's CPU-input staging: every thread's stores of x to the host row, ordered through __syncthreads before
+    # thread 0 publishes the request. CW's Done: its block's SM reads, ordered through __syncthreads, performed at
+    # system scope before the host can see Done and rewrite a slot. CW's gate close orders its store before its
+    # CopyDone load (a Dekker pair with the copy thread's seq_cst fence, LEASE_PROTOCOL.md "Copy engine"):
+    # store->load needs seq_cst.
     assert [(name, code) for name, _, code in matches(r"__threadfence_system\(\)")] == [
         ("lease_kernels.cuh", "__threadfence_system();"),
         ("row_copy_kernels.cuh", "__threadfence_system();"),
@@ -78,33 +77,17 @@ def test_only_the_smack_publish_and_the_copy_wait_arm_keep_a_seq_cst_system_fenc
     ]
 
 
-def test_the_seqlock_fences_are_two_acquires_and_three_releases():
+def test_the_seqlock_writers_fences_are_three_releases():
+    # write_record, the hot bitmap record and the LaneRequest: seq (or gen) 0, a release fence, the payload, then the
+    # word with a release store. The device reads no seqlock, so it has no acquire fence.
     assert [(name, code) for name, _, code in matches(r"atomic_thread_fence")] == [
         ("lease_device.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
-        ("lease_device.cuh", "cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);"),
-        ("lease_device.cuh", "cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);"),
         ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
     ]
 
 
-@pytest.mark.parametrize("kernel", ["exl3_ram_miss_lease_stage_ack_kernel", "exl3_ram_miss_lease_ack_kernel"])
-def test_the_ack_kernels_combine_lane_verdicts_with_syncthreads_or_not_a_shared_flag(kernel):
-    # Several lanes storing to one __shared__ int is a data race; __syncthreads_or combines the verdicts, and it is
-    # reached by every thread at the kernel's top level, never inside the lane branch.
-    body = kernel_body("lease_kernels.cuh", kernel)
-    assert "__shared__" not in body
-    assert re.findall(r"__syncthreads\w*\(", body) == ["__syncthreads_or("]
-    assert re.search(r"^  const int any = __syncthreads_or\(bad\);$", body, re.MULTILINE)
+if __name__ == "__main__":
+    import sys
 
-
-def test_rest_wait_bounds_its_claimed_loop_before_the_count_check():
-    # `claimed` is kLeaseLanes wide and the plan's count is not clamped (lease_layout.h), so the loop that counts
-    # the unclaimed lanes runs before the count is refused and must carry its own bound.
-    body = kernel_body("lease_kernels.cuh", "exl3_ram_miss_lease_rest_wait_kernel")
-    loop = re.search(r"for \(int64_t i = 0; i < (\w+); \+\+i\)\s*if \(claimed\[i\] == 0\) \+\+unclaimed;", body)
-    assert loop, "the unclaimed-lane loop is missing"
-    bound = re.search(
-        rf"const int64_t {loop.group(1)} = min\(planned_count, min\(static_cast<int64_t>\(kLeaseLanes\), lanes\)\);", body
-    )
-    assert bound and bound.start() < loop.start() < body.index("reason = kLeaseReasonCount")
+    sys.exit(pytest.main([__file__]))

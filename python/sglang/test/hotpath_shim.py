@@ -55,7 +55,7 @@ CHILD = textwrap.dedent(
     shim.hotpath_shim_threads.restype = ctypes.c_long
 
     from sglang.kernels.ops.moe import expert_lease_block as lease
-    from sglang.kernels.ops.moe.expert_stream_transport import page_word, sim_wait
+    from sglang.kernels.ops.moe.expert_stream_transport import page_word
     from sglang.test import hotpath_script as hp
 
     variant, requests, warmup, tmp = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
@@ -77,17 +77,16 @@ CHILD = textwrap.dedent(
         return sim.post(0, lanes, **kw)
 
     def serve(req):
-        assert sim_wait(page, req.seq, 10.0) == 1, "request not served"
-        waited, ack_lanes = hp.accept(sim, req)
-        sim.ack(req, waited, lanes=ack_lanes)
-        sim.deliver()
-        return any(sim.row_result(req, lane)["tag"] == lease.COPYING for lane in range(len(req.lanes)))
+        assert sim.wait(req, 10.0).served, "request not served"
+        copying = any(sim.row_result(req, lane)["tag"] == lease.COPYING for lane in range(len(req.lanes)))
+        sim.done(req)
+        return copying
 
     def step(i):
         free = cold()
         miss = min(free, key=lambda e: (e - (last[0] or 0)) %% hp.EXPERTS)
         lanes = [miss] if last[0] is None else [last[0], miss]
-        req = post(lanes, dst=[0, 1][: len(lanes)], copy_engine=True)
+        req = post(lanes, dst=[0, 1][: len(lanes)], captured=True)
         copying = serve(req)
         defer = i %% DEFER_EVERY == DEFER_EVERY - 1
         if defer:
@@ -103,8 +102,7 @@ CHILD = textwrap.dedent(
         if copying:
             host.copy_engine_release(1)  # this step's mark, and only it
             assert host.copy_engine_idle(5.0), "the copy thread did not retire the job"
-            tag, gen, _mask = sim.copy_done(req)
-            seen["copies_done"] += tag == lease.COPIED and gen == req.gen
+            seen["copies_done"] += sim.copy_done(req) == req.gen
         if defer:
             serve(held)
             last[0] = wanted[-1]

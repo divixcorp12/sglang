@@ -11,9 +11,10 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test import hotpath_script as hp
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 from sglang.test.expert_stream_sources import MOE
 
@@ -69,9 +70,10 @@ def test_unpaused_eager_calls_refuse_or_snapshot(running):
 
 def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
     s, page, host = running
-    host.inject(delay_s=0.3)  # instr: every advisory and demand read sleeps 300 ms first
+    host.inject(delay_s=0.3)  # instr: every demand read sleeps 300 ms first
     applied = host.counters()["commands_applied"]  # instr: every command the owner applied, queued or direct
-    seq = sim_post(page, 1, need=[6], protect=[6])  # a long read on row 1 keeps the service busy
+    sim = LeaseSim(host, page, s.slabs)
+    req = sim.post(1, [6])  # a long read on row 1 keeps the service busy
     time.sleep(0.05)
     start = time.perf_counter()
     for i in range(200):  # the command ring holds 64: the producer must wait, never drop
@@ -79,11 +81,12 @@ def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
         # another: a dropped or reordered one changes the count below or the last writer.
         host.set_hot(0, [e for e in range(8) if i >> e & 1])
     host.set_hot(0, [0, 1, 2])
-    # Taken before sim_wait (Task 16's M3 passed the old check, taken after the 300 ms read): queued, the 65th set_hot
+    # Taken before the wait (Task 16's M3 passed the old check, taken after the 300 ms read): queued, the 65th set_hot
     # waits for the service to drain the full ring, which it does only once the read ends, ~0.25 s from `start`.
     # Applied directly, the whole burst takes milliseconds.
     burst_s = time.perf_counter() - start
-    assert sim_wait(page, seq, 5.0) == 1
+    assert sim.wait(req, 5.0).served
+    sim.done(req)
     free, evictable, leased = host.victim_census(0, [])  # a snapshot: queued behind the burst, answered after it
     assert (free, evictable, leased) == (0, 1, 0)  # only expert 3 is neither hot nor wanted: the LAST set_hot won
     assert host.counters()["commands_applied"] - applied == 201 + 1, "a command was dropped (the +1 is the census)"
@@ -96,13 +99,11 @@ def _copy_request(s, page, host, sim):
     first = sim.post(0, [0])
     while host.pump():
         pass
-    waited, lanes = hp.accept(sim, first)
-    sim.ack(first, waited, lanes=lanes)
-    sim.deliver()
+    sim.done(first)
     while host.pump():
         pass
     hp.write_hot_record(page, host, hp.next_seq(page), [])
-    req = sim.post(0, [0], dst=[0], copy_engine=True)
+    req = sim.post(0, [0], dst=[0], captured=True)
     while host.pump():
         pass
     return req, host.mapping(0)[0]
@@ -115,7 +116,7 @@ def test_a_copying_lease_is_released_at_the_owners_next_poll_not_by_the_copy_thr
         req, slot = _copy_request(s, page, host, sim)
         host.copy_engine_release(-1)
         deadline = time.time() + 5
-        while sim.copy_done(req)[:2] != (hp.lease.COPIED, req.gen):
+        while sim.copy_done(req) != req.gen:
             assert time.time() < deadline
             time.sleep(0.001)
         assert host.slot_info(0)[slot][2] == 1, "the copy thread released the lease itself"
@@ -137,7 +138,7 @@ def test_a_pause_retires_a_copy_that_completed_while_parked(tmp_path):
         host.pause(5.0)  # waits for the copy engine to go idle, then the pausing caller drains and retires
         try:
             assert host.slot_info(0)[slot][2] == 0
-            assert sim.copy_done(req)[:2] == (hp.lease.COPIED, req.gen)
+            assert sim.copy_done(req) == req.gen
         finally:
             host.resume()
         host.pause(5.0)  # nothing outstanding: the second pause is not refused
@@ -166,7 +167,7 @@ def test_the_tier_declares_only_the_callers_mutex():
     TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; it locks nothing else, and no other
     lock stands in for the deleted mutex_: no rwlock, recursive, timed or pthread lock, no atomic_flag or exchange spin
     lock, no raw futex (the only futex is the copy engine's documented idle protocol, in spsc_ring.h), and the one
-    compare-exchange is raise_fatal's one-shot store of the fatal word."""
+    compare-exchange is cas_gate's open of the copy wait's gate (LEASE_PROTOCOL.md, "Copy engine")."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
     assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex"}
     assert "std::mutex fault_mutex;" in _struct(code, "TierFaults"), "fault_mutex left TierFaults"
@@ -178,7 +179,7 @@ def test_the_tier_declares_only_the_callers_mutex():
                   ".exchange(", "futex", ".wait(", "notify_one", "notify_all", "condition_variable"):
         assert other not in code, other
     assert code.count("compare_exchange") == 1 and "__atomic_compare_exchange_n(" in code
-    assert "__atomic_compare_exchange_n(" in _struct(code, "raise_fatal", opener="void raise_fatal(")
+    assert "__atomic_compare_exchange_n(" in _struct(code, "cas_gate", opener="void cas_gate(")
 
 
 # One row's pack takes this long under the pack_delay fault, so a fill of a few rows is still running when checked.

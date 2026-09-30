@@ -112,7 +112,6 @@ def _snapshot(granted, acked, served=100):
         "touch_only",
         "rows_read",
         "read_errors",
-        "late_after_fatal",
         "leases_granted",
         "leases_acked",
         "leases_voided",

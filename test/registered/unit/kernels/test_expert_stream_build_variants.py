@@ -98,7 +98,6 @@ def test_the_python_core_counters_are_the_hosts():
 TEST_ONLY_CALLS = {
     "inject": lambda h: h.inject(fail_reads=True),
     "inject_fault": lambda h: h.inject_fault(part=0, part_error=5),
-    "inject_done_stall": lambda h: h.inject_done_stall(0.001),
     "inject_lease": lambda h: h.inject_lease(0, 0, 1),
     "trace": lambda h: h.enable_trace(16),
 }
@@ -127,11 +126,9 @@ def test_a_faulted_read_refuses_on_prod(tmp_path):
 RAW_EXPORTS = {
     "inject": lambda m, h: m.expert_stream_inject(h, 0, 1, 0, 0),
     "inject_fault": lambda m, h: m.expert_stream_inject_fault(h, ops._fault_tensor(part=0, part_error=5)),
-    "inject_done_stall": lambda m, h: m.expert_stream_inject_done_stall(h, 1000),
     "inject_lease": lambda m, h: m.expert_stream_inject_lease(h, 0, 0, 1),
     "copy_engine_fail": lambda m, h: m.expert_stream_copy_engine_fail(h, 1, 0),
     "copy_engine_ballast": lambda m, h: m.expert_stream_copy_engine_ballast(h, 0, 0, 0),
-    "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "trace_clock_reads": lambda m, h: m.expert_stream_trace_clock_reads(),
 }
 
@@ -156,13 +153,12 @@ def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
         host.stop()
 
 
-@pytest.mark.parametrize("helper", ("read_rows_with_fault", "read_rows_sqes", "seqlock_stress"))
+@pytest.mark.parametrize("helper", ("read_rows_with_fault", "read_rows_sqes"))
 def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
     s = ram_miss_setup(tmp_path)
     calls = {
         "read_rows_with_fault": lambda: ops.read_rows_with_fault(s.tables, 0, [1], [0], [], [], variant="prod"),
         "read_rows_sqes": lambda: ops.read_rows_sqes(s.tables, 0, [1], [0], variant="prod"),
-        "seqlock_stress": lambda: ops.seqlock_stress(0.001, variant="prod"),
     }
     export = {"read_rows_with_fault": "read_rows_faulted"}.get(helper, helper)  # the name the error carries
     with pytest.raises(RuntimeError, match=f"{export} is test-only"):

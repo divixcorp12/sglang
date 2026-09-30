@@ -6,9 +6,10 @@ import json
 import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ops
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.layers.moe.exl3_stream_trace import RAM_MISS_TRACE_SCHEMA, Exl3StreamTrace
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -38,13 +39,18 @@ def test_a_request_line_carries_the_causal_stamps_and_the_drop_position(tmp_path
     host.enable_trace(capacity=2)
     trace_path = tmp_path / "trace.jsonl"
     trace = Exl3StreamTrace(str(trace_path))
+    sim = LeaseSim(host, page, s.slabs)
+
+    def serve(expert):
+        req = sim.post(1, [expert])
+        assert host.pump() == 1 and sim.wait(req, timeout_s=1.0).served
+        sim.done(req)
+
     try:
         for expert in (2, 5, 4, 3):  # four requests through a two-slot ring: two are lost
-            seq = sim_post(page, 1, need=[expert], protect=[expert])
-            assert host.pump() == 1 and sim_wait(page, seq, timeout_s=1.0) == 1
+            serve(expert)
         trace.record_ram_miss_requests(host.drain_trace(), [10, 11])
-        seq = sim_post(page, 1, need=[0], protect=[0])
-        assert host.pump() == 1 and sim_wait(page, seq, timeout_s=1.0) == 1
+        serve(0)
         trace.record_ram_miss_requests(host.drain_trace(), [10, 11])
     finally:
         trace.close()
@@ -53,13 +59,13 @@ def test_a_request_line_carries_the_causal_stamps_and_the_drop_position(tmp_path
     assert {line["schema"] for line in (first, second, after_loss)} == {RAM_MISS_TRACE_SCHEMA}
     assert [line["dropped_before"] for line in (first, second, after_loss)] == [0, 0, 2]
     assert first["layer"] == 11
-    assert first["request"]["lanes"] == 1  # sim_post defaults to one lane per need id: the layer and the lanes travel together
+    assert first["request"]["lanes"] == 1  # the layer and the lanes travel together
     (row,) = first["row_pack_ns"]
     assert set(row) == {"row", "admit", "start", "end"} and 0 < row["admit"] <= row["start"] <= row["end"]
-    (extent,) = first["extent_cqe_ns"]
-    assert set(extent) == {"row", "part", "sub", "submit", "attempts", "cqe"}
-    assert extent["sub"] == 0 and first["pieces"] == [] and first["request"]["piece_stream"] == 0  # the flag is off
-    assert row["admit"] <= extent["submit"] <= extent["cqe"] <= row["start"]
+    extents = first["extent_cqe_ns"]
+    assert extents and all(set(e) == {"row", "part", "sub", "submit", "attempts", "cqe"} for e in extents)
+    assert first["pieces"] and first["request"]["piece_stream"] == 1  # the service always streams pieces
+    assert all(row["admit"] <= e["submit"] <= e["cqe"] for e in extents)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
-"""A scripted RAM-miss scenario in the production configuration (row images, leases, two-phase, piece streaming,
-the copy engine on the CPU backend, GPU hot), driven in pump mode, snapshotting everything the device and the
+"""A scripted RAM-miss scenario in the production configuration (row images, the copy engine on the CPU backend, GPU
+hot), driven in pump mode, snapshotting everything the device and the
 eager callers can observe after each step. Plan 2026-09-29-hotpath-zero-overhead Tasks 2 and 4."""
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     page_word,
 )
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
-from sglang.test.dsv41_lease_sim import LeaseSim
+from sglang.test.dsv41_lease_sim import LeaseSim, post_record, served
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
 CAPACITY = 4
@@ -28,13 +28,9 @@ LAYERS = 2
 EXPERTS = 8
 DST_ROWS = 6
 FUNCTIONAL = (
-    "served", "touch_only", "rows_read", "read_errors", "overruns", "late_after_fatal",
+    "served", "touch_only", "rows_read", "read_errors", "overruns",
     "evictions", "deferred", "deferred_reuse", "no_victim", "version",
 )
-# A demand record's fields (lease_layout.h kRecSeq, kRecStatus): the uint32 sequence and the uint16 status the service
-# publishes (expert_stream_transport.STATUS). The transport module exports the ring's geometry but not these offsets.
-REC_SEQ = 0
-REC_STATUS = 10
 
 
 def build_host(tmp_path, *, variant=None, threaded=False, copy_spin_us=200):
@@ -44,9 +40,6 @@ def build_host(tmp_path, *, variant=None, threaded=False, copy_spin_us=200):
     hot = torch.zeros(HOT_RECORDS * hot_record_bytes(EXPERTS), dtype=torch.uint8)
     host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32),
                             hot_page=hot, variant=variant)
-    host.enable_lease_mode()
-    host.enable_two_phase()
-    host.enable_piece_stream()
     host.enable_copy_engine(-1, spin_us=copy_spin_us)
     dst = {}
     for row in range(LAYERS):
@@ -60,26 +53,25 @@ def build_host(tmp_path, *, variant=None, threaded=False, copy_spin_us=200):
     return s, page, host, LeaseSim(host, page, s.slabs), dst
 
 
-# (kind, row, lanes, extra): "post" posts and serves a request whose lanes are the experts listed; "ack" acknowledges
-# the last served request's committed lanes; "term" voids its lanes with a terminal; "copy" releases every held copy
-# mark; "hot" sets the row's VRAM-hot experts, which every later post of that row writes into its sidecar record.
-# Every step ends with pump() until idle.
+# (kind, row, lanes, extra): "post" posts and serves a request whose lanes are the experts listed; "done" publishes
+# the last served request's Done (CW's); "copy" releases every held copy mark; "hot" sets the row's VRAM-hot experts,
+# which every later post of that row writes into its sidecar record. Every step ends with pump() until idle.
 SCRIPT = [
     ("post", 0, [0, 1], {}),             # two misses: read, LOADING grant, pieces
-    ("ack", 0, None, {}),
-    ("post", 0, [0, 2], {"copy_engine": True, "dst": [0, 1]}),  # hit 0 through the copy engine, miss 2
+    ("done", 0, None, {}),
+    ("post", 0, [0, 2], {"captured": True, "dst": [0, 1]}),  # hit 0 through the copy engine, miss 2
     ("copy", 0, None, {}),
-    ("ack", 0, None, {}),
+    ("done", 0, None, {}),
     ("post", 0, [3, 4], {}),             # fills capacity 4: evictions from here on
-    ("ack", 0, None, {}),
+    ("done", 0, None, {}),
     ("post", 0, [5, 6], {}),             # evicts two LRU rows
-    ("term", 0, None, {}),               # the device gives up: leases voided
+    ("done", 0, None, {}),
     ("post", 1, [7], {"armed": False}),  # an unarmed touch-only record on row 1
     ("hot", 0, [5], {}),                 # from here expert 5 of row 0 is VRAM-hot: never a victim
     ("post", 0, [1, 2, 3], {}),
-    ("ack", 0, None, {}),
+    ("done", 0, None, {}),
     ("post", 1, [0, 1, 2, 3], {}),
-    ("ack", 1, None, {}),
+    ("done", 1, None, {}),
 ]
 
 
@@ -96,15 +88,15 @@ def _digest(t: torch.Tensor) -> str:
 
 def _records(page) -> list[dict]:
     """Every posted demand record still in the ring (seq 1..demand_head, the last DEMAND_RECORDS of them): its sequence
-    word as the ring holds it and the status the service published."""
+    word as the ring holds it, and whether demand_done says it was served."""
     head = page_word(page, "demand_head")
     out = []
     for seq in range(max(1, head - DEMAND_RECORDS + 1), head + 1):
         base = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
         out.append({
             "seq": seq,
-            "ring_seq": int(page[base + REC_SEQ : base + REC_SEQ + 4].view(torch.int32)[0]) & 0xFFFFFFFF,
-            "status": int(page[base + REC_STATUS : base + REC_STATUS + 2].view(torch.int16)[0]) & 0xFFFF,
+            "ring_seq": int(page[base : base + 4].view(torch.int32)[0]) & 0xFFFFFFFF,
+            "served": served(page, seq),
         })
     return out
 
@@ -112,13 +104,12 @@ def _records(page) -> list[dict]:
 def completed_copies(s, sim, req, dst) -> list[dict]:
     """The copy-engine lanes of ``req`` whose CopyDone the service published: each lane's destination row, and whether
     its bytes (every streamed name) are the checkpoint's bytes of its expert."""
-    tag, gen, mask = sim.copy_done(req)
-    if tag != lease.COPIED or gen != req.gen:
+    if sim.copy_done(req) != req.gen:
         return []
     out = []
     for lane, expert in enumerate(req.lanes):
         result = sim.row_result(req, lane)
-        if not mask >> lane & 1 or result["tag"] != lease.COPYING or result["gen"] != req.gen:
+        if result["tag"] != lease.COPYING or result["gen"] != req.gen:
             continue
         slot = sim.dst_slot(req, lane)
         oracle = s.reference(s.tables.layer_ids[req.row], [expert])
@@ -132,11 +123,11 @@ def completed_copies(s, sim, req, dst) -> list[dict]:
 
 def snapshot(s, page, host, sim, reqs, dst, copies):
     snap = {"rows": {}, "entries": [host.lease_entry(i) for i in range(DEMAND_RECORDS)], "page": {
-        "demand_done": page_word(page, "demand_done"), "fatal": page_word(page, "fatal"), "records": _records(page)}}
+        "demand_done": page_word(page, "demand_done"), "records": _records(page)}}
     for row in range(LAYERS):
         info = host.slot_info(row)
         ready = {}
-        for slot, (state, expert, _leases, _gen) in enumerate(info):
+        for slot, (state, expert, _leases) in enumerate(info):
             if state == 2 and expert >= 0:
                 oracle = s.reference(s.tables.layer_ids[row], [expert])
                 ready[str(slot)] = {
@@ -147,7 +138,8 @@ def snapshot(s, page, host, sim, reqs, dst, copies):
         snap["rows"][str(row)] = {"slot_info": [list(i) for i in info], "mapping": host.mapping(row), "ready": ready}
     snap["results"] = [
         {"seq": r.seq, "lanes": [dict(sim.row_result(r, lane)) for lane in range(len(r.lanes))],
-         "pieces": [sim.piece_word(r, lane) for lane in range(len(r.lanes))], "copy_done": list(sim.copy_done(r))}
+         "pieces": [sim.piece_word(r, lane) for lane in range(len(r.lanes))], "copy_done": sim.copy_done(r),
+         "done": sim.done_word(r)}
         for r in reqs[-2:]
     ]
     snap["copies"] = list(copies)
@@ -172,41 +164,23 @@ def write_hot_record(page, host, seq, hot):
     record[:4].view(torch.int32)[0] = seq
 
 
-def accept(sim, req):
-    """The wait kernel's view of a served request, as test_exl3_ram_miss_copy_engine._accept_and_ack builds it: every
-    lane's (host_slot, slot_generation), and the lanes the device will acknowledge (READY or LOADING; a COPYING lane
-    is released by its copy's completion, never by an ack)."""
-    ctx, ack_lanes = [], []
-    for lane in range(len(req.lanes)):
-        result = sim.row_result(req, lane)
-        ctx.append((result["host_slot"], result["slot_generation"]))
-        if result["gen"] == req.gen and result["tag"] in (lease.READY, lease.LOADING):
-            ack_lanes.append(lane)
-    return type("Waited", (), {"go": len(ctx), "ctx": ctx})(), ack_lanes
-
-
 def next_seq(page) -> int:
     seq = (page_word(page, "demand_head") + 1) & 0xFFFFFFFF
     return seq or 1
 
 
 def run_script(s, page, host, sim, dst):
-    reqs, waits, snaps, hot, copies = [], [], [], {0: [], 1: []}, []
+    reqs, snaps, hot, copies = [], [], {0: [], 1: []}, []
     for kind, row, lanes, extra in SCRIPT:
         if kind == "post":
-            write_hot_record(page, host, next_seq(page), hot[row])
-            req = sim.post(row, lanes, armed=extra.get("armed", True), dst=extra.get("dst"),
-                           copy_engine=extra.get("copy_engine", False))
+            if extra.get("armed", True):
+                write_hot_record(page, host, next_seq(page), hot[row])
+                reqs.append(sim.post(row, lanes, dst=extra.get("dst"), captured=extra.get("captured", False)))
+            else:
+                post_record(page, row, lanes, armed=False)
             _drain(host)
-            reqs.append(req)
-            waits.append(accept(sim, req) if extra.get("armed", True) else None)
-        elif kind == "ack":
-            waited, ack_lanes = waits[-1]
-            sim.ack(reqs[-1], waited, lanes=ack_lanes)
-            sim.deliver()
-        elif kind == "term":
-            sim.terminal(reqs[-1], (1 << len(reqs[-1].lanes)) - 1)
-            sim.deliver()
+        elif kind == "done":
+            sim.done(reqs[-1])
         elif kind == "copy":
             host.copy_engine_release(-1)
             assert host.copy_engine_idle(5.0)

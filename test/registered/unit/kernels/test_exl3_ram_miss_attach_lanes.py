@@ -29,8 +29,10 @@ def hang_guard():
 
 
 @pytest.fixture
-def tiers(tmp_path):
-    """The service reads row images (service_row_images) with O_DIRECT, as in production."""
+def tiers(tmp_path, monkeypatch):
+    """The service reads row images (service_row_images) with O_DIRECT, as in production. The attached layers' copy
+    tables are stubs, so their piece maps are too: what is under test is the gather width."""
+    monkeypatch.setattr(module, "stream_segment_map", lambda segments, tables, row: None)
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None

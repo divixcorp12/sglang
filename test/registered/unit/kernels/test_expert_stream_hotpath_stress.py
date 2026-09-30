@@ -9,7 +9,7 @@ import threading
 import time
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, page_word, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test import hotpath_script as hp
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,16 +29,15 @@ LANE_TAGS = {lease.READY: "lanes_ready", lease.LOADING: "lanes_loading", lease.C
 
 
 def _check_tier(s, host, rows):
-    """The tier invariants for an owner that holds the service parked: no lease, no LOADING or QUARANTINE slot,
-    mapping and slot_info agree both ways, the lease block's SlotGen words are the tier's generations, and every READY
-    slot holds its expert's checkpoint bytes. Returns the rows' (slot_info, mapping)."""
+    """The tier invariants for an owner that holds the service parked: no lease, no LOADING slot, mapping and
+    slot_info agree both ways, and every READY slot holds its expert's checkpoint bytes. Returns the rows' (slot_info,
+    mapping)."""
     out = {}
     for row in rows:
-        info, mapping, gens = host.slot_info(row), host.mapping(row), host.mapped_slot_generations(row)
-        for slot, (state, expert, leases, gen) in enumerate(info):
+        info, mapping = host.slot_info(row), host.mapping(row)
+        for slot, (state, expert, leases) in enumerate(info):
             assert leases == 0, f"row {row} slot {slot} still leased: {info}"
             assert state in (FREE, READY), f"row {row} slot {slot} in state {state} with the service parked: {info}"
-            assert gens[slot] == gen & 0xFFFFFFFF, f"row {row} slot {slot}: SlotGen {gens[slot]} != generation {gen}"
             if state == READY:
                 assert mapping[expert] == slot, f"row {row}: READY slot {slot} of expert {expert}, mapping {mapping}"
                 oracle = s.reference(s.tables.layer_ids[row], [expert])
@@ -77,8 +76,8 @@ def _fill_while_owned(s, host, rng):
 
 def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
     """Run the four parties for ``seconds`` against a threaded host, then park the service and check the tier.
-    Raises AssertionError on a party's error or a broken tier invariant; returns the parties' counts, ``fatal``, the
-    service's counters and the final rows, for the caller's checks that every party ran.
+    Raises AssertionError on a party's error or a broken tier invariant; returns the parties' counts, the service's
+    counters and the final rows, for the caller's checks that every party ran.
 
     ``fills`` (Task 16's ThreadSanitizer child): every pause also starts a prefill fill, admits a row into the filled
     row while the fill thread reads (spec 6.3 item 3), and either ends the fill or leaves it for ``resume()`` to join,
@@ -93,7 +92,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
     stop, quiet, idle = threading.Event(), threading.Event(), threading.Event()
     device_gone = threading.Event()  # set once the device thread has left: the releaser outlives its last wait
     stats = {
-        "armed": 0, "copy_posts": 0, "terminals": 0, "timeouts": 0, "failed": 0,
+        "armed": 0, "copy_posts": 0, "timeouts": 0,
         "lanes_ready": 0, "lanes_loading": 0, "lanes_copying": 0,
         "releases": 0, "marked": 0, "noise": 0, "pauses": 0, "refused": 0, "assigns": 0, "fills": 0, "errors": [],
     }
@@ -119,25 +118,18 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
                 lanes = rng.sample(DEVICE_EXPERTS, rng.randint(1, 3))
                 hp.write_hot_record(page, host, hp.next_seq(page), [])
                 use_copy = rng.random() < 0.5
-                req = sim.post(row, lanes, dst=list(range(len(lanes))) if use_copy else None, copy_engine=use_copy)
+                req = sim.post(row, lanes, dst=list(range(len(lanes))) if use_copy else None, captured=use_copy)
                 stats["armed"] += 1
                 stats["copy_posts"] += int(use_copy)
-                status = sim_wait(page, req.seq, 10.0)
-                if status != 1:
-                    stats["timeouts" if status == 0 else "failed"] += 1
-                    raise AssertionError(f"request {req.seq} (row {row}, lanes {lanes}) ended with sim_wait {status}")
+                if not sim.wait(req, 10.0).served:
+                    stats["timeouts"] += 1
+                    raise AssertionError(f"request {req.seq} (row {row}, lanes {lanes}) was not served")
                 for lane in range(len(req.lanes)):
                     result = sim.row_result(req, lane)
                     if result["gen"] != req.gen or result["tag"] not in LANE_TAGS:
                         raise AssertionError(f"request {req.seq} lane {lane} was served without a grant: {result}")
                     stats[LANE_TAGS[result["tag"]]] += 1
-                waited, ack_lanes = hp.accept(sim, req)
-                if rng.random() < 0.1:
-                    sim.terminal(req, (1 << len(req.lanes)) - 1)
-                    stats["terminals"] += 1
-                else:
-                    sim.ack(req, waited, lanes=ack_lanes)
-                sim.deliver()
+                sim.done(req)
         finally:
             idle.set()  # a device that left (stop, or an error) is quiet: a pauser waiting on it must not time out
             device_gone.set()
@@ -147,7 +139,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
         # each tick releases one mark, and only while a mark is outstanding (marked > released): copies complete one
         # by one, at the releaser's pace, instead of all of them from the first tick on. -1 is kept for the final drain.
         # It runs until the device has left, not until stop: the device's request in flight at stop may be deferred on
-        # a COPYING lease that only a released mark retires, and stopping first deadlocks it until sim_wait times out.
+        # a COPYING lease that only a released mark retires, and stopping first deadlocks it until sim.wait times out.
         rng = random.Random(seed + 3)
         while not device_gone.is_set():
             if host.copy_engine_marked() > stats["releases"]:
@@ -161,7 +153,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
             host.set_hot(rng.randrange(hp.LAYERS), rng.sample(HOT_ONLY, rng.randint(0, len(HOT_ONLY))))
             host.counters()
             host.mapping(rng.randrange(hp.LAYERS))
-            host.mapped_slot_generations(rng.randrange(hp.LAYERS))
+            host.lru_order(rng.randrange(hp.LAYERS))
             stats["noise"] += 1
             time.sleep(0.0002)
 
@@ -234,14 +226,14 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
         alive = [t.name for t in threads if t.is_alive()]
         assert not alive, f"parties still running after stop: {alive}; errors {stats['errors']}"
         assert not stats["errors"], f"a party failed: {stats['errors']}"
-        # Final quiesce: every ack and terminal was delivered, and the copy thread drains once its marks complete.
+        # Final quiesce: every Done was published, and the copy thread drains once its marks complete.
         stats["marked"] = host.copy_engine_marked()
         host.copy_engine_release(-1)
         assert host.copy_engine_idle(5.0), "the copy engine did not go idle"
         host.pause(5.0)
         try:
             rows = _check_tier(s, host, range(hp.LAYERS))
-            report = {"stats": stats, "fatal": page_word(page, "fatal"), "counters": host.counters(), "rows": rows}
+            report = {"stats": stats, "counters": host.counters(), "rows": rows}
         finally:
             host.resume()
     finally:
@@ -255,8 +247,8 @@ def test_every_party_against_the_service_keeps_the_tier_invariants(tmp_path):
     stats, counters = report["stats"], report["counters"]
     print("STRESS stats", {k: v for k, v in stats.items() if k != "errors"}, "counters", counters)
     assert stats["errors"] == [], stats["errors"]
-    assert stats["timeouts"] == 0 and stats["failed"] == 0
-    assert report["fatal"] == 0 and counters["read_errors"] == 0, (report["fatal"], counters)
+    assert stats["timeouts"] == 0
+    assert counters["read_errors"] == 0, counters
     # Every armed post was served exactly once: read rows (served) or found every row resident (touch_only).
     assert counters["served"] + counters["touch_only"] == stats["armed"], (counters, stats)
     # Every party ran, and every path it exists to exercise was taken.
@@ -264,7 +256,6 @@ def test_every_party_against_the_service_keeps_the_tier_invariants(tmp_path):
     assert counters["served"] > 0 and counters["touch_only"] > 0, counters
     assert stats["lanes_loading"] > 0 and stats["lanes_ready"] > 0, stats
     assert stats["copy_posts"] > 0 and stats["lanes_copying"] > 0, stats
-    assert stats["terminals"] > 0, stats
     # Copies completed one mark at a time (C: the releaser never grants credit ahead of an outstanding mark).
     assert 100 < stats["releases"] <= stats["marked"], stats
     assert stats["noise"] > 100, stats

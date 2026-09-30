@@ -175,8 +175,8 @@ The service lives in the scheduler subprocess, so the driver cannot call `servic
 `SGLANG_DSV41_EXPERT_TRACE_PATH`, each decode graph step appends the service's cumulative counters, and
 `counters.verify_lease` reads them (line-buffered, so the scheduler's SIGKILL at shutdown loses nothing).
 
-- both arms: at least one decode graph step reached the trace, the service served requests, `late_after_fatal == 0`,
-  `read_errors == 0`, and the run finished (the scheduler fail-stops on a fatal, so a completed run has none)
+- both arms: at least one decode graph step reached the trace, the service served requests, `read_errors == 0`, and
+  the run finished (every service failure aborts the process, so a completed run has none)
 - `lease_on`: `leases_granted > 0`, and `leases_granted - leases_acked` returns to 0 in one of the last 8 snapshots
 - `lease_off`: `leases_granted == leases_acked == 0` (proves the switch reached the service)
 
