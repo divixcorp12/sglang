@@ -155,6 +155,16 @@ class CpuExpertService:
         self.handles[row] = handle
         self.host.set_cpu_layer(row, int(handle))
 
+    def log_stats(self) -> dict[str, int]:
+        """Log the CPU expert thread's cumulative counters: an A/B arm reads its per-expert cost under load here."""
+        stats = self.host.cpu_stats()
+        lanes = stats["lanes"]
+        logger.info(
+            "CPU experts stats: %d jobs, %d lanes, %.3f ms per lane, split %s",
+            stats["jobs"], lanes, stats["forward_ns"] / lanes / 1e6 if lanes else 0.0, self.split,
+        )
+        return stats
+
     def retune(self) -> Optional[list[int]]:
         """P3: recompute the split from the CPU's measured per-expert cost since the last call, when it has run.
 

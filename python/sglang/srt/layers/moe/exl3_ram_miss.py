@@ -556,6 +556,8 @@ COPY_ENGINE_ARM_DECODES = 16
 # The prefill share: one eager gather chunk, the most rows gather_rows protects at once (the replay's best bound,
 # analysis/dsv41-drive/prefill-evict/ram_replay.py).
 PREFILL_SHARE_ROWS = EXL3_MAX_GATHER_ROWS
+# CPU experts log their cumulative counters every this many batches, ~2 per 128-token turn at batch 1.
+CPU_STATS_LOG_BATCHES = 64
 
 # The copy engine needs every kernel of every library loaded before it arms (LEASE_PROTOCOL.md 7.6, "Module loading").
 # Under LAZY (torch's default) a kernel loads at its first launch, and a first launch after arming can stop the copy
@@ -650,6 +652,7 @@ class Exl3RamMissService:
         self.cpu_experts = None
         self._cpu_retune_batches = 0
         self._cpu_batches = 0
+        self._cpu_log_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL (LEASE_PROTOCOL.md 7.7): the lease chain's kernels launch with PDL.
         self.lease_pdl = False
         self._copy_armed = False
@@ -1057,6 +1060,11 @@ class Exl3RamMissService:
             if self._cpu_batches >= self._cpu_retune_batches:
                 self._cpu_batches = 0
                 self.cpu_experts.retune()
+        if self.cpu_experts is not None:
+            self._cpu_log_batches += 1
+            if self._cpu_log_batches >= CPU_STATS_LOG_BATCHES:
+                self._cpu_log_batches = 0
+                self.cpu_experts.log_stats()
         if self.native_prefetch is not None:
             self.native_prefetch.poll_counters()
         self._trace_step()

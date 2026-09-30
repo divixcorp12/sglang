@@ -367,6 +367,17 @@ def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
     assert svc.retune() == [0] * 9
 
 
+def test_service_logs_the_cumulative_cost_per_lane(caplog):
+    host, trait = FakeHost(), FakeServiceTrait()
+    svc = _service(host, trait)
+    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        assert svc.log_stats() == {"jobs": 0, "lanes": 0, "forward_ns": 0}
+        host.stats = {"jobs": 3, "lanes": 8, "forward_ns": 8 * 500_000}
+        assert svc.log_stats()["lanes"] == 8
+    assert "0 jobs, 0 lanes, 0.000 ms per lane" in caplog.text
+    assert "3 jobs, 8 lanes, 0.500 ms per lane" in caplog.text
+
+
 @pytest.mark.parametrize("spec", ["0,1,1", "0,2,1,1,1,1,1,1,1", "0,-1,0,0,0,0,0,0,0"])
 def test_configured_split_refuses_a_table_the_grant_could_not_honour(spec):
     from sglang.srt.environ import envs
