@@ -1,18 +1,5 @@
 # DeepSeek V4.1 Flash — scoping reference
 
-python3 -m sglang.launch_server \
-    --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
-    --tp-size 1 \
-    --kv-cache-dtype nvfp4 \
-    --prefill-kv-cache-dequant-dtype nvfp4 \
-    --page-size 16
-
-    --reasoning-parser auto \
-    --tool-call-parser auto \
-+   --enable-hierarchical-cache \
-+   --hicache-ratio 2 \
-+   --hicache-size 0 \
-+   --hicache-write-policy write_through \
 
 ```
 Production starts through a short wrapper on divix01, which runs the real launcher from the prod checkout.
