@@ -1,7 +1,6 @@
 """The C++ slot LRU and request service, pumped by hand against a host-simulated device (CPU)."""
 
 import dataclasses
-import errno
 import faulthandler
 import re
 import subprocess
@@ -13,21 +12,18 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_stream_transport
-from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import (
     DEMAND_RECORDS,
     PAGE_BYTES,
     ExpertStreamHost,
-    new_page,
     new_hot_page,
-    hot_record_bytes,
+    new_page,
     page_word,
-    sim_post,
-    sim_wait,
 )
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
+from sglang.test.dsv41_lease_sim import LeaseSim, post_record, served
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script, same_bytes
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -48,7 +44,7 @@ def tier(tmp_path, request):
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
-    yield s, page, slot_map, host
+    yield s, page, slot_map, host, LeaseSim(host, page, s.slabs)
     host.stop()
 
 
@@ -61,99 +57,78 @@ def _until(predicate, timeout_s=5.0):
     return False
 
 
-def _serve(page, host, row, need, protect):
-    seq = sim_post(page, row, need=need, protect=protect)
+def _serve(t, row, lanes, protect=None):
+    """One chain, retired: post, pump (serves), Done, pump (retires). Returns whether it was served."""
+    s, page, slot_map, host, sim = t
+    req = sim.post(row, lanes, protect=protect)
     assert host.pump() == 1
-    return sim_wait(page, seq, timeout_s=1.0)
+    ok = served(page, req.seq)
+    sim.done(req)
+    host.pump()
+    return ok
 
 
-def _post_gpu_hot(page, host, hot_page, *, row=0, need=(), protect=(), lanes=(), hot=(), hot_seq=None):
-    """CPU simulator for the post kernel's sidecar and lease request publication."""
-    seq = sim_post(page, row, need=list(need), protect=list(protect), lanes=len(lanes), armed=True)
-    stride = hot_record_bytes(host.experts)
-    record = hot_page[(seq - 1) % DEMAND_RECORDS * stride : (seq - 1) % DEMAND_RECORDS * stride + stride]
-    record[:4].view(torch.int32)[0] = 0
-    record[4:8].view(torch.int32)[0] = host.experts
-    record[8 : 8 + (host.experts + 7) // 8].zero_()
-    for expert in hot:
-        offset = 8 + expert // 8
-        record[offset] = int(record[offset]) | (1 << (expert % 8))
-    record[:4].view(torch.int32)[0] = seq if hot_seq is None else hot_seq
-    start = host.lease_layout.d_offset + lease.LANE_REQUEST + (seq - 1) % lease.RING * lease.LANE_REQUEST_BYTES
-    request = host.lease_block[start : start + lease.LANE_REQUEST_BYTES]
-    request[:8].view(torch.int64)[0] = 0
-    request[8:12].view(torch.int32)[0] = len(lanes)
-    request[12:16].view(torch.int32)[0] = row
-    request[16:48].view(torch.int32).fill_(-1)
-    for lane, expert in enumerate(lanes):
-        request[16 + lane * 4 : 20 + lane * 4].view(torch.int32)[0] = expert
-    request[:8].view(torch.int64)[0] = lease.tagged(lease.DEMAND_TAG, seq)
-    return seq
-
-
-@pytest.mark.parametrize("two_phase", [False, True], ids=["single_phase", "two_phase"])
-def test_gpu_hot_sidecar_arms_no_read_lease_and_protects_a_victim(tmp_path, two_phase):
-    """EXL3 DIRECT runs with either lease chain; two-phase grants hit lanes before read(), after the hot set applies."""
+def test_gpu_hot_sidecar_protects_a_victim_and_a_resident_lane_reads_nothing(tmp_path):
+    """The hot set applies before the census and serve: expert 0 is the oldest resident row, but hot, so the read of
+    expert 3 takes another slot. Mutation: apply_gpu_hot after serve, or not at all."""
     s = ram_miss_setup(tmp_path, capacity=3)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, hot_page=hot_page)
+    sim = LeaseSim(host, page, s.slabs)
     try:
-        host.enable_lease_mode()
-        if two_phase:
-            host.enable_two_phase()
         host.enable_gpu_hot()
         for expert in (0, 1, 2):
             host.assign(0, expert)
-        seq = _post_gpu_hot(page, host, hot_page, protect=[0], lanes=[0], hot=[0])
-        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        req = sim.post_gpu_hot(hot_page, 0, [0], hot=[0])
+        assert host.pump() == 1 and sim.wait(req).served
         # A resident lane is a touch-only lease: it needs no host row read.
         assert host.counters()["leases_granted"] == 1
         assert host.counters()["touch_only"] == 1
         assert host.counters()["rows_read"] == 0
         assert sum(info[2] for info in host.slot_info(0)) == 1
-        # The next demand sees the posted bitmap before its victim census and serve.
-        # Expert 0 is the oldest resident, but must survive the read of expert 3.
-        slot = host.mapping(0)[0]
-        generation = host.slot_info(0)[slot][3]
-        ack = host.lease_layout.d_offset + lease.LANE_ACK + (seq - 1) % lease.RING * lease.LANES * lease.LANE_ACK_BYTES
-        host.lease_block[ack : ack + 8].view(torch.int64)[0] = lease.tagged(lease.CONSUMED, seq)
-        seq = _post_gpu_hot(page, host, hot_page, need=[3], protect=[3], hot=[0])
-        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
+        sim.done(req)
+        req = sim.post_gpu_hot(hot_page, 0, [3], hot=[0])
+        assert host.pump() == 1 and sim.wait(req).served
         assert host.counters()["leases_acked"] == 1
         assert host.contains(0, 0) and host.contains(0, 3)
-        assert host.slot_info(0)[slot][3] == generation
     finally:
         host.stop()
 
 
 @pytest.mark.parametrize("fault", ["stale", "malformed"])
-def test_gpu_hot_sidecar_fails_closed_on_stale_bitmap_and_wraps(tmp_path, fault):
-    s = ram_miss_setup(tmp_path, capacity=3)
-    page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
-    slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, hot_page=hot_page)
-    try:
-        host.enable_lease_mode()
+def test_gpu_hot_sidecar_aborts_on_a_stale_or_malformed_record_after_a_wrap(tmp_path, fault):
+    """A demand whose hot set cannot be read is not served without one: the victim choice would ignore the GPU's hot
+    experts. It fails stop, after a full lap of good records (the record index wraps)."""
+    result = run_host_script(
+        tmp_path,
+        f"""
+        from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, hot_record_bytes
         host.enable_gpu_hot()
         for _ in range(DEMAND_RECORDS + 1):
-            seq = _post_gpu_hot(page, host, hot_page, hot=[0])
-            assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 1
-        seq = _post_gpu_hot(page, host, hot_page, need=[3], protect=[3],
-                            hot_seq=1 if fault == "stale" else None)
+            req = sim.post_gpu_hot(hot_page, 0, [], hot=[0])
+            assert host.pump() == 1 and sim.wait(req).served
+        fault = "{fault}"
+        seq = page_word(page, "demand_head") + 1
         if fault == "malformed":
-            stride = hot_record_bytes(host.experts)
-            start = (seq - 1) % DEMAND_RECORDS * stride
-            hot_page[start + 4 : start + 8].view(torch.int32)[0] = host.experts + 1
-        assert host.pump() == 1 and sim_wait(page, seq, 1.0) == 2
-        assert not host.contains(0, 3)
-    finally:
-        host.stop()
+            start = (seq - 1) % DEMAND_RECORDS * hot_record_bytes(host.experts)
+            orig = sim._write_hot
+            def write_hot(*args, **kwargs):
+                orig(*args, **kwargs)
+                hot_page[start + 8] = int(hot_page[start + 8]) | 0x80  # a bit past the last expert
+            sim._write_hot = write_hot
+        sim.post_gpu_hot(hot_page, 0, [3], hot=[0], hot_seq=1 if fault == "stale" else None)
+        host.pump()
+        print("reached")
+        """,
+        host_args=", hot_page=hot_page",
+    )
+    assert_aborted(result, "no hot set for it")
 
 
 def test_a_demand_is_read_split_and_published(tier):
-    s, page, slot_map, host = tier
-    assert _serve(page, host, 1, need=[2, 5], protect=[2, 5]) == 1
+    s, page, slot_map, host, sim = tier
+    assert _serve(tier, 1, [2, 5])
     reference = s.reference(1, [2, 5])
     for i, expert in enumerate((2, 5)):
         slot = int(slot_map[1, expert])
@@ -165,72 +140,31 @@ def test_a_demand_is_read_split_and_published(tier):
 
 
 def test_protected_experts_missing_from_ram_are_read_too(tier):
-    s, page, slot_map, host = tier
+    s, page, slot_map, host, sim = tier
     # D12: the thread recomputes the missing set from protect, not only from need.
-    assert _serve(page, host, 0, need=[1], protect=[1, 4]) == 1
+    assert _serve(tier, 0, [1], protect=[1, 4])
     assert host.contains(0, 1) and host.contains(0, 4) and host.layer_rows() == [2, 0]
 
 
 def test_eviction_takes_the_lru_row_and_spares_hot_experts(tier):
-    s, page, slot_map, host = tier
-    assert _serve(page, host, 0, need=[0, 1, 2], protect=[0, 1, 2]) == 1  # stamps 0 < 1 < 2
+    s, page, slot_map, host, sim = tier
+    assert _serve(tier, 0, [0, 1, 2])  # stamps 0 < 1 < 2
     host.set_hot(0, [0])  # 0 is the oldest row but hot: never a victim
-    assert _serve(page, host, 0, need=[], protect=[1]) == 1  # touch-only: 2 becomes the LRU non-hot row
+    assert _serve(tier, 0, [], protect=[1])  # touch-only: 2 becomes the LRU non-hot row
     assert host.counters()["touch_only"] == 1
-    assert _serve(page, host, 0, need=[4], protect=[4]) == 1
+    assert _serve(tier, 0, [4])
     # The victim is 2, the LRU row; it would be 1 if the touch-only record stamped nothing.
     assert slot_map[0, 2].item() == -1 and all(slot_map[0, e].item() >= 0 for e in (0, 1, 4))
     slot = int(slot_map[0, 4])
     assert all(same_bytes(s.slabs[0][n][slot], s.reference(0, [4])[n][0]) for n in EXL3_STREAMED_NAMES)
     # 1 (touched before 4 was read) is now the LRU non-hot row.
-    assert _serve(page, host, 0, need=[5], protect=[5]) == 1
+    assert _serve(tier, 0, [5])
     assert slot_map[0, 1].item() == -1 and all(slot_map[0, e].item() >= 0 for e in (0, 4, 5))
     assert host.lru_order(0) == [0, 4, 5] and host.counters()["evictions"] == 2
     # serve() stamps a request's resident ids before it picks a victim, so the shared
     # victim rule's protect exclusion shows through assign(): 4 is the LRU row but protected.
     slot, evicted = host.assign(0, 2, protected=[4], protected_fallback=False)
     assert evicted == 5 and host.contains(0, 4) and slot_map[0, 2].item() == slot
-
-
-@pytest.mark.parametrize("tier", [2], indirect=True)
-def test_no_evictable_slot_fails_the_request_and_raises_fatal(tier):
-    s, page, slot_map, host = tier
-    assert _serve(page, host, 0, need=[0, 1], protect=[0, 1]) == 1
-    seq = sim_post(page, 0, need=[3], protect=[3, 0, 1])
-    assert host.pump() == 1
-    assert sim_wait(page, seq, 1.0) == 2
-    assert host.fatal_seq() == seq and host.counters()["no_victim"] == 1
-    assert host.counters()["late_after_fatal"] == 0
-    sim_post(page, 0, need=[], protect=[0])
-    assert host.pump() == 1
-    assert host.counters()["late_after_fatal"] == 1  # the pump saw the raised fatal word
-    assert sim_wait(page, page_word(page, "demand_head"), 1.0) == 3  # sticky
-
-
-def test_a_failed_read_frees_its_slots_and_reports_failed(tier):
-    s, page, slot_map, host = tier
-    host.inject(fail_reads=True)
-    assert _serve(page, host, 0, need=[1], protect=[1]) == 2
-    assert slot_map[0, 1].item() == -1 and not host.contains(0, 1)
-    assert host.counters()["read_errors"] == 1
-
-
-def _row_states(s, layer, experts):
-    """Per slot of ``layer``: 'whole' (a byte-exact row of one of ``experts``), 'untouched' (still the
-    0xAB sentinel) or 'torn'. Read from the slabs, so it sees a row packed but never published."""
-    reference = s.reference(layer, experts)
-    states = []
-    for slot in range(int(s.tables.capacity[layer])):
-        if all(bool((s.slabs[layer][n][slot].view(torch.uint8) == 0xAB).all()) for n in EXL3_STREAMED_NAMES):
-            states.append("untouched")
-        elif any(
-            all(same_bytes(s.slabs[layer][n][slot], reference[n][i]) for n in EXL3_STREAMED_NAMES)
-            for i in range(len(experts))
-        ):
-            states.append("whole")
-        else:
-            states.append("torn")
-    return states
 
 
 @pytest.fixture
@@ -243,59 +177,36 @@ def mirrored_tier(tmp_path):
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
-    yield s, page, slot_map, host
+    yield s, page, slot_map, host, LeaseSim(host, page, s.slabs)
     host.stop()
 
 
-def test_a_fault_injected_at_the_tier_fails_a_row_after_others_packed_and_publishes_none(mirrored_tier):
-    """The case fail_reads cannot reach: that flag returns before the reader runs, so nothing has packed and
-    'publishes none of the rows it packed' holds vacuously. inject_fault reaches the reader, so rows 0 and 1
-    pack into their slots and row 2's part then fails; the tier must publish none of them."""
-    s, page, slot_map, host = mirrored_tier
-    # hold_ordinal withholds row 2's completions until the other rows have packed, so rows 0 and 1 are
-    # packed when row 2 fails, whatever order the kernel completes the reads in.
-    host.inject_fault(part=1, part_error=errno.EIO, ordinal=2, hold_ordinal=2)
-    assert _serve(page, host, 1, need=[0, 1, 2], protect=[0, 1, 2]) == 2
-    states = _row_states(s, 1, [0, 1, 2])
-    # The reader landed rows 0 and 1 whole and touched no slot it was not given. The failed row's slot is not asserted:
-    # the drive writes a row image's slot directly, so whatever of it landed is there (an injected part error replaces
-    # the completion's result, not the bytes), and the caller releases the slot...
-    assert states.count("whole") >= 2 and states.count("untouched") == 3, states
-    # ...and the tier, which had those two rows in hand, published neither and freed every slot.
-    assert host.mapping(1) == [-1] * 6 and slot_map[1].tolist() == [-1] * 6
-    assert host.slot_to_expert(1) == [-1] * 6
-    assert not any(host.contains(1, e) for e in (0, 1, 2))
-    assert host.counters()["read_errors"] == 1 and host.counters()["rows_read"] == 0
-
-
-def test_fail_reads_never_reaches_the_reader_so_no_row_packs(mirrored_tier):
-    """The contrast that makes the test above mean something: with fail_reads no row is packed at all."""
-    s, page, slot_map, host = mirrored_tier
-    host.inject(fail_reads=True)
-    assert _serve(page, host, 1, need=[0, 1, 2], protect=[0, 1, 2]) == 2
-    assert _row_states(s, 1, [0, 1, 2]) == ["untouched"] * 6
-
-
 def test_a_pack_delay_injected_at_the_tier_slows_every_row_it_packs(mirrored_tier):
-    s, page, slot_map, host = mirrored_tier
+    s, page, slot_map, host, sim = mirrored_tier
     delay_s = 0.05
     host.inject_fault(pack_delay_ns=int(delay_s * 1e9))
     started = time.perf_counter()
-    assert _serve(page, host, 1, need=[0, 1, 2], protect=[0, 1, 2]) == 1
+    assert _serve(mirrored_tier, 1, [0, 1, 2])
     elapsed = time.perf_counter() - started
     assert elapsed >= 3 * delay_s * 0.9, elapsed  # the reader sleeps inside each of the three rows' packing
     assert all(host.contains(1, e) for e in (0, 1, 2))
 
 
-def test_a_file_cut_short_after_open_fails_the_read(tier):
-    s, page, slot_map, host = tier
-    # Open checked the size; a shard truncated afterwards reads short of the bytes the table
-    # expects, and that fails the demand (not a clamped, silently short row).
-    path = s.tables.paths[int(s.tables.extents[0, 0, 0, 0])]
-    with open(path, "r+b") as f:
-        f.truncate(int(s.tables.extents[0, 0, 0, 1]) + 100)
-    assert _serve(page, host, 0, need=[0], protect=[0]) == 2
-    assert not host.contains(0, 0) and host.counters()["read_errors"] == 1
+def test_a_file_cut_short_after_open_aborts_the_read(tmp_path):
+    """Open checked the size; a file truncated afterwards reads short of the bytes the table expects, and that fails
+    stop (not a clamped, silently short row). Mutation: a short read is accepted as landed."""
+    result = run_host_script(
+        tmp_path,
+        """
+        path = s.tables.paths[int(s.tables.extents[0, 0, 0, 0])]
+        with open(path, "r+b") as f:
+            f.truncate(int(s.tables.extents[0, 0, 0, 1]) + 100)
+        sim.post(0, [0])
+        host.pump()
+        print("reached")
+        """,
+    )
+    assert_aborted(result, "the read failed")
 
 
 def test_a_slab_table_narrower_than_the_layout_is_refused(tmp_path):
@@ -337,7 +248,7 @@ def _out_extent(host, entry):
     """The int64 words each introspection entry writes for row 0: its handle's real extent, not the caller's."""
     capacity = int(host.tables.capacity[0])
     return {
-        "slot_info": 4 * capacity,
+        "slot_info": 3 * capacity,
         "mapping": host.experts,
         "slot_to_expert": capacity,
         "lru_order": capacity,
@@ -352,15 +263,15 @@ def test_an_out_buffer_of_the_wrong_size_is_refused_before_any_write(tier, entry
     buffer one word short is written past its end. The out tensor is a view into a larger sentinel-filled backing:
     a missing refusal shows as the call succeeding, and any write, in bounds or past the view's end, as a changed
     sentinel. The exact size is required, so one word too many is refused as well."""
-    s, page, slot_map, host = tier
-    assert _serve(page, host, 0, need=[0, 1], protect=[0, 1]) == 1  # every entry has something to write
+    s, page, slot_map, host, sim = tier
+    assert _serve(tier, 0, [0, 1])  # every entry has something to write
     expected = _out_extent(host, entry)
     sentinel = -7
     backing = torch.full((expected + 2,), sentinel, dtype=torch.int64)
     out = backing[: expected + delta]
     call = getattr(host._module, f"expert_stream_{entry}")
     with pytest.raises(RuntimeError, match=rf"^out: (?s:.*)expected {expected} but got {expected + delta}"):
-        call(host.handle, 0, out)  # (handle, row, out); layer_rows takes (handle, advisory, out)
+        call(host.handle, out) if entry == "layer_rows" else call(host.handle, 0, out)
     assert backing.eq(sentinel).all(), "the refusal came after a write"
 
 
@@ -368,7 +279,7 @@ def test_an_out_buffer_of_the_wrong_size_is_refused_before_any_write(tier, entry
 def test_fill_begins_out_buffer_of_the_wrong_size_is_refused_before_any_write(tier, delta):
     """fill_begin writes the evictions word at out[len(experts)] first, then a slot per claimed expert: its extent
     comes from the input, len(experts) + 1. Mutation: out checked for dtype, rank and device only."""
-    s, page, slot_map, host = tier
+    s, page, slot_map, host, sim = tier
     experts = torch.tensor([0, 1], dtype=torch.int64)
     expected = experts.numel() + 1
     sentinel = -7
@@ -415,6 +326,13 @@ def test_a_test_only_entrys_fixed_extent_buffer_of_the_wrong_size_is_refused_bef
     assert backing.eq(sentinel).all(), "the refusal came after a write"
 
 
+def test_the_seqlock_reader_never_accepts_a_torn_record():
+    """read_record against a writer thread rewriting one record in the post kernel's seqlock order: a record read
+    while its payload changes must be refused. Mutant: drop read_record's second seq load -- torn records accepted."""
+    accepted, torn = expert_stream_transport.seqlock_stress(seconds=1.0)
+    assert accepted > 100 and torn == 0, (accepted, torn)
+
+
 _MAPPING_ROW = """
 import pathlib, sys, torch
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
@@ -440,26 +358,18 @@ def test_mapping_refuses_a_row_out_of_range(tmp_path):
 
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
-    s, page, slot_map, host = tier
-    seq = sim_post(page, 0, need=[1], protect=[1])
-    record = 64 + ((seq - 1) % DEMAND_RECORDS) * 128
-    page[record : record + 4].view(torch.int32)[0] = seq + DEMAND_RECORDS  # a lapped ring slot
+    s, page, slot_map, host, sim = tier
+    req = sim.post(0, [1])
+    record = 64 + ((req.seq - 1) % DEMAND_RECORDS) * 128
+    page[record : record + 4].view(torch.int32)[0] = req.seq + DEMAND_RECORDS  # a lapped ring slot
     assert host.pump() == 1
     assert host.counters()["overruns"] == 1 and not host.contains(0, 1)
-    assert sim_wait(page, seq, 1.0) == 2  # never served: the waiting layer fails stop
-
-
-def test_advisory_rows_are_counted_apart_from_demand_rows(tier):
-    s, page, slot_map, host = tier
-    sim_post(page, 1, need=[3], protect=[3], advisory=True, after=page_word(page, "demand_head") + 5)
-    assert host.pump() == 2
-    assert host.contains(1, 3)
-    assert host.layer_advisory_rows() == [0, 1] and host.layer_rows() == [0, 0]
-    assert host.counters()["advisory_rows"] == 1
+    # Nothing waits on an overrun record (only an unarmed one laps), and nothing of it is published: S would trap.
+    assert sim.row_result(req, 0)["gen"] != req.gen
 
 
 def test_python_assign_release(tier):
-    s, page, slot_map, host = tier
+    s, page, slot_map, host, sim = tier
     slot, evicted = host.assign(1, 3, protected=[3])
     assert evicted is None and host.contains(1, 3) and slot_map[1, 3].item() == slot
     host.assign(1, 4, protected=[4])
@@ -478,76 +388,48 @@ def test_python_assign_release(tier):
 def test_injected_delay_starts_after_n_demands_that_read(tier):
     import time
 
-    s, page, slot_map, host = tier
+    s, page, slot_map, host, sim = tier
     host.inject(delay_s=0.3, delay_after_demands=1)
     started = time.perf_counter()
-    assert _serve(page, host, 0, need=[1], protect=[1]) == 1
+    assert _serve(tier, 0, [1])
     assert time.perf_counter() - started < 0.2
     started = time.perf_counter()
-    assert _serve(page, host, 0, need=[2], protect=[2]) == 1
+    assert _serve(tier, 0, [2])
     assert time.perf_counter() - started >= 0.3
 
 
 def test_a_lapped_demand_ring_counts_every_skipped_record(tier):
-    s, page, slot_map, host = tier
+    s, page, slot_map, host, sim = tier
     for _ in range(20):
-        sim_post(page, 0, need=[], protect=[])
+        post_record(page, 0, [], armed=False)
     assert host.pump() == 1
     # The catch-up serves from head - 14 (seq 6): seqs 1-5 are skipped and each is counted.
     assert host.counters()["overruns"] == 5 and page_word(page, "demand_done") == 6
-
-
-def test_the_seqlock_reader_never_accepts_a_torn_record():
-    accepted, torn = expert_stream_transport.seqlock_stress(seconds=1.0)
-    assert accepted > 100 and torn == 0, (accepted, torn)
-
-
-def test_an_empty_need_that_reads_protected_rows_counts_as_served(tier):
-    s, page, slot_map, host = tier
-    # D12's race: the posted need is empty but a protected row is missing and is read.
-    assert _serve(page, host, 0, need=[], protect=[3]) == 1
-    assert host.counters()["served"] == 1 and host.counters()["touch_only"] == 0
-    assert host.layer_rows() == [1, 0]
 
 
 def test_an_unarmed_record_only_touches_and_never_evicts_or_reads(tier):
     """Minor 2: nobody waits on an unarmed (touch-only) record, so the GPU may already be
     gathering the next token's rows. Serving it must not evict or read, even when a
     protected id is missing from RAM; it only refreshes the recency of assigned rows."""
-    s, page, slot_map, host = tier
+    s, page, slot_map, host, sim = tier
     for expert in (0, 1, 2):  # full (capacity 3); 0 is the LRU-oldest row
-        assert _serve(page, host, 0, need=[expert], protect=[expert]) == 1
+        assert _serve(tier, 0, [expert])
     before_map, before_counters = slot_map.clone(), host.counters()
-    sim_post(page, 0, need=[], protect=[1, 5], armed=False)  # 5 is missing
+    post_record(page, 0, [1, 5], armed=False)  # 5 is missing
     assert host.pump() == 1
     assert torch.equal(slot_map, before_map) and host.layer_rows() == [3, 0]
     counters = host.counters()
     assert counters["evictions"] == before_counters["evictions"]
     assert counters["touch_only"] == before_counters["touch_only"] + 1
     # The touch still counts: 1 is now the most recent, so 0 goes first, then 2.
-    assert _serve(page, host, 0, need=[3], protect=[3]) == 1
-    assert _serve(page, host, 0, need=[4], protect=[4]) == 1
+    assert _serve(tier, 0, [3])
+    assert _serve(tier, 0, [4])
     assert [host.contains(0, e) for e in (0, 1, 2)] == [False, True, False]
 
 
-def test_a_request_that_evicts_and_then_fails_bumps_the_version(tier):
-    """The version is how Python learns the map moved (the device map refresh, the
-    cached expert_to_slot). A request whose first slot evicted a row and whose second
-    found no victim frees its slots, but the eviction stays: that is a map change."""
-    s, page, slot_map, host = tier
-    for expert in (0, 1, 2):  # full (capacity 3); 0 is the LRU-oldest row
-        assert _serve(page, host, 0, need=[expert], protect=[expert]) == 1
-    version = host.version()
-    # 3 takes 0's slot; 4 finds only protected rows (1, 2) and fails the request.
-    sim_post(page, 0, need=[3, 4], protect=[1, 2, 3, 4])
-    assert host.pump() == 1
-    assert not host.contains(0, 0) and not host.contains(0, 3)
-    assert host.version() > version
-
-
 def test_a_repeated_protect_id_takes_one_slot(tier):
-    s, page, slot_map, host = tier
-    assert _serve(page, host, 0, need=[1], protect=[1, 1, 2]) == 1
+    s, page, slot_map, host, sim = tier
+    assert _serve(tier, 0, [1], protect=[1, 1, 2])
     assert host.slot_to_expert(0).count(1) == 1 and host.layer_rows() == [2, 0]
 
 
@@ -572,13 +454,13 @@ def test_an_owned_call_waits_for_a_pump_on_another_thread(tier):
     never sees the claimed slot still LOADING. (This test used to release from a second thread mid-read, expecting the
     "loading" refusal: that second thread is the second owner the single-owner rule forbids. release()'s refusal stays
     as a backstop no legal caller reaches.)"""
-    s, page, slot_map, host = tier
+    s, page, slot_map, host, sim = tier
     host.inject(delay_s=0.5)
-    seq = sim_post(page, 0, need=[1], protect=[1])
+    req = sim.post(0, [1])
     pumper = threading.Thread(target=host.pump)
     pumper.start()
     try:
-        assert _until(lambda: page_word(page, "busy_seq") == seq)  # a lock-free word: the pump is in the request
+        assert _until(lambda: host.busy_episode() != 0)  # a lock-free word: the pump is in the request
         start = time.perf_counter()
         assert host.contains(0, 1)  # an owned call: it waits for the pump's request to end
         waited = time.perf_counter() - start
@@ -587,39 +469,31 @@ def test_an_owned_call_waits_for_a_pump_on_another_thread(tier):
         assert waited > 0.2, f"the owned call returned after {waited:.3f} s, inside the 0.5 s read"
     finally:
         pumper.join(timeout=10)
-    assert sim_wait(page, seq, 1.0) == 1 and slot_map[0, 1].item() == slot
-
-
-_CLOSE_DURING_PUMP = """
-import pathlib, sys, threading, time
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word, sim_post, sim_wait
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
-import torch
-s = ram_miss_setup(pathlib.Path(sys.argv[1]))
-page = new_page(pin=False)
-host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr")
-host.inject(delay_s=0.5)
-seq = sim_post(page, 0, need=[1], protect=[1])
-results = []
-pumper = threading.Thread(target=lambda: results.append(host.pump()))
-pumper.start()
-deadline = time.perf_counter() + 5.0
-# busy_seq, a lock-free word: a snapshot would now wait for the pump (it holds caller_mutex_), and the close below
-# must land while the pump is inside the read.
-while page_word(page, "busy_seq") != seq and time.perf_counter() < deadline:
-    time.sleep(0.005)
-assert page_word(page, "busy_seq") == seq
-host.stop()  # closes the handle while the pump is inside a read
-pumper.join(timeout=10)
-assert results == [1] and sim_wait(page, seq, 1.0) == 1, results
-print("ok")
-"""
+    assert sim.wait(req).served and slot_map[0, 1].item() == slot
 
 
 def test_closing_while_a_pump_is_in_flight_keeps_the_service_alive_until_it_returns(tmp_path):
     # In a subprocess: a regression is a use-after-free, which would kill this process.
-    result = subprocess.run(
-        [sys.executable, "-c", _CLOSE_DURING_PUMP, str(tmp_path)], capture_output=True, text=True, timeout=60
+    result = run_host_script(
+        tmp_path,
+        """
+        import threading
+        host.inject(delay_s=0.5)
+        req = sim.post(0, [1])
+        results = []
+        pumper = threading.Thread(target=lambda: results.append(host.pump()))
+        pumper.start()
+        deadline = time.perf_counter() + 5.0
+        # busy_episode, a lock-free word: a snapshot would now wait for the pump (it holds caller_mutex_), and the
+        # close below must land while the pump is inside the read.
+        while host.busy_episode() == 0 and time.perf_counter() < deadline:
+            time.sleep(0.005)
+        assert host.busy_episode() != 0
+        host.stop()  # closes the handle while the pump is inside a read
+        pumper.join(timeout=10)
+        assert results == [1] and sim.wait(req).served, results
+        print("ok")
+        """,
     )
     assert result.returncode == 0 and "ok" in result.stdout, (result.returncode, result.stderr[-2000:])
 

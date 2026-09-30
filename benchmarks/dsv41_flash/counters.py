@@ -113,9 +113,8 @@ def verify_lease(*, arm: str, cursor: TraceCursor) -> dict:
     """Whether the in-graph RAM-miss path ran and the lease ledger is what the arm requires.
 
     Both arms need graph steps and a served RAM-miss request. lease_on needs leases granted, and granted balanced
-    by acked; lease_off needs zero of both, which proves the arms differ. There is no fatal counter in the
-    snapshot (fatal_seq is a request-page word); fail-stop kills the scheduler, so a completed run has none, and
-    late_after_fatal and read_errors are checked as evidence.
+    by acked; lease_off needs zero of both, which proves the arms differ. Every service failure aborts the process,
+    so a completed run has none; read_errors is checked as evidence.
     """
     reasons = []
     snaps = cursor.snapshots
@@ -128,10 +127,8 @@ def verify_lease(*, arm: str, cursor: TraceCursor) -> dict:
     else:
         if final["served"] + final["touch_only"] == 0:
             reasons.append("the RAM-miss service served nothing")
-        if final["late_after_fatal"] or final["read_errors"]:
-            reasons.append(
-                f"late_after_fatal={final['late_after_fatal']} read_errors={final['read_errors']}"
-            )
+        if final["read_errors"]:
+            reasons.append(f"read_errors={final['read_errors']}")
         if arm == "lease_on":
             if final["leases_granted"] <= 0:
                 reasons.append(

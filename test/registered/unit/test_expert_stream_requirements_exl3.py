@@ -225,11 +225,6 @@ def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model
     # decode and refuse graph gather (the Task 16 option C Engine launch failed this way).
     raw = None
     _gate(_launch(model_dir, cuda_graph_config=raw), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
-    _gate(
-        _launch(model_dir, cuda_graph_config=raw),
-        SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
-        SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True,
-    )
 
 
 class _PipelineStopped(Exception):
@@ -309,22 +304,6 @@ def test_graph_gather_keeps_the_alt_stream_overlap_off(model_dir, multi_stream_u
     assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
 
 
-def test_prefetch_needs_graph_gather_under_breakable_decode(model_dir):
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_ENABLE_EXPERT_PREFETCH"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_ENABLE_EXPERT_PREFETCH"):
-        _gate(_launch(model_dir), SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)  # eager decode: no in-graph MoE to post from
-
-
-def test_prefetch_is_off_unless_the_env_var_is_set():
-    from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
-
-    assert prefetch_enabled() is False
-    with envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(True):
-        assert prefetch_enabled() is True
-
-
 def test_the_exl3_requirements_read_graph_gathers_from_the_pinned_tier(model_dir):
     args = _launch(model_dir)
     assert expert_stream_requirements_for(args, args).graph_gather_host_source == "pinned_tier"
@@ -338,8 +317,6 @@ if __name__ == "__main__":
 
 CPU_EXPERTS_ENV = dict(
     SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
-    SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE=True,
-    SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM=True,
     SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=True,
     SGLANG_DSV41_ENABLE_LAYER_FUSION=True,
     SGLANG_DSV41_CPU_EXPERTS_CORES="18-29",
@@ -349,8 +326,7 @@ CPU_EXPERTS_ENV = dict(
 
 @pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_DSV41_CPU_EXPERTS"])
 def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
-    """Each is load-bearing: without it the CPU lanes are never completed (copy engine, its piece-streaming chain),
-    never left out of the fused MoE (layer fusion), or run on no cores; the refusal names the one that is off."""
+    """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), never left out of the fused MoE (layer fusion), or run on no cores; the refusal names the one that is off."""
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
     off = "" if missing == "SGLANG_DSV41_CPU_EXPERTS_CORES" else False
     with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {missing}"):

@@ -1,4 +1,4 @@
-"""The lease block's layout, its allocator and its publication words (CPU); LEASE_PROTOCOL.md section 4."""
+"""The lease block's layout, its allocator and its words (CPU); analysis/dsv41-drive/LEASE_PROTOCOL.md."""
 
 import pytest
 import torch
@@ -10,62 +10,27 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def test_the_areas_are_where_the_protocol_puts_them():
-    assert lease.ROW_TABLE == 0x80 and lease.ROW_RESULT == 0x1000
-    assert lease.SLOT_GEN == 0x2000, "RowResult[16][8] at 32 bytes each fills 4096 bytes from 0x1000"
-    assert lease.LANE_REQUEST_BYTES == 128, "ABI 3: expert[8], dst_slot[8] and flags after the 16-byte head"
-    assert (lease.LANE_REQUEST, lease.LANE_ACK, lease.TERMINAL) == (0, 0x800, 0xC00)
-    assert lease.STREAM_PROBE == 0xD00, "StreamProbe[16] (piece streaming) follows Terminal[16] at 16 bytes each"
-    assert lease.SM_ACK == 0xD80, "SmAck[16] (the copy wait's SM reads) follows StreamProbe[16] at 8 bytes each"
-    assert lease.AREA_D_BYTES == 0xE00
+    assert lease.ROW_RESULT == 0 and lease.ROW_RESULT + lease.RING * lease.LANES * lease.ROW_RESULT_BYTES <= lease.PIECE_MASK
+    assert lease.PIECE_MASK == 0x1000 and lease.COPY_DONE == 0x5000, "PieceMask[16][8] at a 128-byte line each"
+    assert lease.COPY_GATE == lease.COPY_DONE + 128 and lease.COPY_GATE + 4 <= lease.LANE_REQUEST
+    assert lease.LANE_REQUEST == 0x6000 and lease.DONE == lease.LANE_REQUEST + lease.RING * lease.LANE_REQUEST_BYTES
+    assert lease.DONE + lease.RING * lease.DONE_BYTES <= lease.BLOCK_BYTES == 7 * lease.BLOCK_ALIGN
 
 
-def test_service_written_and_device_written_words_never_share_a_128_byte_line():
-    layout = lease.lease_layout([5, 7])
-    assert layout.slot_gen_offset + 4 * sum(layout.capacities) <= layout.d_offset
-    assert layout.d_offset % lease.BLOCK_ALIGN == 0 and layout.d_offset % 128 == 0
-    assert layout.total_bytes % lease.BLOCK_ALIGN == 0 and layout.d_offset + lease.AREA_D_BYTES <= layout.piece_offset
-
-
-def test_area_p_is_one_word_per_128_byte_line_after_area_d():
-    """PieceMask[kLeaseRing][kLeaseLanes] (piece-streaming plan, LEASE_PROTOCOL.md E1 amendment): each of the
-    RING*LANES words gets its own cache line rather than packing densely, so 128 lines, 16 KiB total."""
-    layout = lease.lease_layout([5, 7])
-    assert layout.piece_offset % lease.BLOCK_ALIGN == 0
-    assert layout.d_offset + lease.AREA_D_BYTES <= layout.piece_offset
-    assert lease.AREA_PIECE_MASK_BYTES == lease.RING * lease.LANES * lease.PIECE_MASK_LINE_BYTES == 16 * 1024
-    assert layout.piece_offset + lease.AREA_PIECE_MASK_BYTES <= layout.total_bytes
+def test_host_written_and_device_written_areas_never_share_a_page():
+    host_areas_end = lease.COPY_GATE + 4
+    assert host_areas_end <= lease.LANE_REQUEST and lease.LANE_REQUEST % lease.BLOCK_ALIGN == 0
 
 
 def test_the_lane_request_payload_fits_its_record_in_the_order_the_kernels_write_it():
     f = lease.LANE_REQUEST_FIELDS
-    assert f["expert"] + 4 * lease.LANES == f["dst_slot"] and f["dst_slot"] + 4 * lease.LANES == f["flags"]
-    assert f["flags"] + 4 <= lease.LANE_REQUEST_BYTES
-
-
-def test_area_c_follows_area_p_and_the_block_ends_after_it():
-    """CopyDone[kLeaseRing] (copy engine, LEASE_PROTOCOL.md 7.6): service-written, on its own page."""
-    layout = lease.lease_layout([5, 7])
-    assert layout.copy_offset % lease.BLOCK_ALIGN == 0
-    assert layout.piece_offset + lease.AREA_PIECE_MASK_BYTES <= layout.copy_offset
-    assert layout.copy_offset + lease.AREA_COPY_DONE_BYTES <= layout.total_bytes
-    assert lease.COPY_DONE_FIELDS["mask"] + 4 <= lease.COPY_DONE_FIELDS["gen"] < lease.COPY_DONE_BYTES
-    assert lease.HEADER["copy_offset"] == lease.HEADER["piece_offset"] + 4 < lease.HEADER_BYTES
-
-
-def test_area_c_holds_the_copy_wait_gate_and_arm_word_on_lines_of_their_own():
-    """ABI 4 (LEASE_PROTOCOL.md 7.6, the stream-ordered copy wait): the gate the decode stream waits on and CopyArm,
-    each on its own 128-byte line after CopyDone[], all inside area C's page."""
-    layout = lease.lease_layout([5, 7])
-    assert lease.ABI_VERSION == 4
-    assert lease.COPY_GATE >= lease.AREA_COPY_DONE_BYTES and lease.COPY_GATE % 128 == 0
-    assert lease.COPY_ARM >= lease.COPY_GATE + 128 and lease.COPY_ARM % 128 == 0
-    assert lease.AREA_C_BYTES == lease.COPY_ARM + 8 <= lease.BLOCK_ALIGN
-    assert layout.copy_offset + lease.AREA_C_BYTES <= layout.total_bytes
-    assert lease.GATE == {"closed": 0x80000001, "open": 1, "timeout": 2, "aborted": 3}
+    assert f["gen"] + 8 == f["count"] and f["count"] + 4 == f["flags"] and f["flags"] + 4 == f["expert"]
+    assert f["expert"] + 4 * lease.LANES == f["dst_slot"] and f["dst_slot"] + 4 * lease.LANES == f["weight"]
+    assert f["weight"] + 4 * lease.LANES <= lease.LANE_REQUEST_BYTES
 
 
 def test_the_gate_word_names_its_request_and_only_open_words_pass_the_cyclic_geq():
-    """cuStreamWaitValue32(gate, GATE["open"], GEQ) passes iff (int32)(gate - 1) >= 0: every open outcome of every seq
+    """cuStreamWaitValue32(gate, GATE["open"], GEQ) passes iff (int32)(gate - 1) >= 0: every open word of every seq
     passes and every closed word blocks, so the wait never wraps; the seq field tells two requests' words apart."""
 
     def passes(word):
@@ -74,82 +39,42 @@ def test_the_gate_word_names_its_request_and_only_open_words_pass_the_cyclic_geq
 
     for seq in (1, 2, 15, 16, lease.GATE_SEQ_MASK, lease.GATE_SEQ_MASK + 1, 0xFFFFFFFF):
         assert not passes(lease.gate_word(seq, "closed"))
-        for outcome in ("open", "timeout", "aborted"):
-            word = lease.gate_word(seq, outcome)
-            assert passes(word) and word & lease.GATE_OUTCOME_MASK == lease.GATE[outcome]
+        assert passes(lease.gate_word(seq, "open"))
+        assert lease.gate_word(seq, "closed") & ~0x80000000 == lease.gate_word(seq, "open")
     assert lease.gate_word(1, "open") != lease.gate_word(2, "open")
 
 
-def test_area_p_header_offset_is_a_new_header_word_beside_d_offset():
-    assert lease.HEADER["piece_offset"] == lease.HEADER["d_offset"] + 4
-    assert lease.HEADER["piece_offset"] < lease.HEADER_BYTES
-
-
-def test_a_row_table_entry_fits_before_the_row_results_and_rows_are_bounded():
-    assert lease.MAX_ROWS * lease.ROW_TABLE_ENTRY_BYTES + lease.ROW_TABLE <= lease.ROW_RESULT
-    with pytest.raises(ValueError, match="row table"):
-        lease.lease_layout([1] * (lease.MAX_ROWS + 1))
-    with pytest.raises(ValueError, match="row table"):
-        lease.lease_layout([])
-    with pytest.raises(ValueError, match="slot"):
-        lease.lease_layout([3, 0])
-
-
-def test_slot_generation_words_are_dense_per_row():
-    layout = lease.lease_layout([3, 5, 2])
-    assert layout.slot_gen_base == (0, 3, 8)
-
-
-def test_a_slot_generation_area_that_crosses_a_page_pushes_area_d_up():
-    small = lease.lease_layout([10])
-    big = lease.lease_layout([2000])
-    assert small.d_offset == lease.SLOT_GEN + lease.BLOCK_ALIGN
-    assert big.d_offset > small.d_offset
-    assert big.d_offset == (lease.SLOT_GEN + 4 * 2000 + 4095) // 4096 * 4096
-
-
-def test_the_block_is_zeroed_aligned_and_exactly_as_long_as_its_layout():
-    layout = lease.lease_layout([4, 4])
-    block = lease.new_lease_block(layout, pin=False)
-    assert block.numel() == layout.total_bytes and block.data_ptr() % lease.BLOCK_ALIGN == 0
+def test_the_block_is_zeroed_aligned_and_exactly_block_bytes_long():
+    block = lease.new_lease_block(pin=False)
+    assert block.numel() == lease.BLOCK_BYTES and block.data_ptr() % lease.BLOCK_ALIGN == 0
     assert not block.any()
 
 
 @pytest.mark.parametrize("bad", ["dtype", "size", "align", "shape"])
 def test_a_block_the_kernels_cannot_address_is_refused(bad):
-    layout = lease.lease_layout([4])
-    raw = torch.zeros(layout.total_bytes + 2 * lease.BLOCK_ALIGN, dtype=torch.uint8)
-    good = raw[(-raw.data_ptr()) % lease.BLOCK_ALIGN :][: layout.total_bytes]
+    raw = torch.zeros(lease.BLOCK_BYTES + 2 * lease.BLOCK_ALIGN, dtype=torch.uint8)
+    good = raw[(-raw.data_ptr()) % lease.BLOCK_ALIGN :][: lease.BLOCK_BYTES]
     blocks = {
         "dtype": good.view(torch.int8),
         "size": good[:-1],
-        "align": raw[((-raw.data_ptr()) % lease.BLOCK_ALIGN) + 1 :][: layout.total_bytes],
+        "align": raw[((-raw.data_ptr()) % lease.BLOCK_ALIGN) + 1 :][: lease.BLOCK_BYTES],
         "shape": good.view(1, -1),
     }
-    lease.check_lease_block(good, layout, need_pinned=False)
+    lease.check_lease_block(good, need_pinned=False)
     with pytest.raises(ValueError):
-        lease.check_lease_block(blocks[bad], layout, need_pinned=False)
+        lease.check_lease_block(blocks[bad], need_pinned=False)
 
 
 def test_a_block_that_is_not_pinned_is_refused_for_a_cuda_device():
-    layout = lease.lease_layout([4])
     with pytest.raises(ValueError, match="pinned"):
-        lease.check_lease_block(lease.new_lease_block(layout, pin=False), layout, need_pinned=True)
+        lease.check_lease_block(lease.new_lease_block(pin=False), need_pinned=True)
 
 
-def test_a_publication_word_carries_the_tag_over_a_56_bit_generation():
+def test_a_ready_word_carries_the_tag_over_a_56_bit_generation():
     generation = (3 << 32) | 0xFFFFFFFF
     word = lease.tagged(lease.READY, generation)
     assert lease.untag(word) == (lease.READY, generation) and word >> 56 == lease.READY
-    assert lease.untag(lease.tagged(lease.CONSUMED, 1)) == (lease.CONSUMED, 1)
-
-
-def test_row_result_tag_2_is_loading_not_ready():
-    """RowResult.ready tag 2 (piece-streaming plan; LEASE_PROTOCOL.md E1 amendment): a lane granted at
-    reservation, still loading. It is not READY, so a reader that only checks tag == READY must reject it."""
-    assert (lease.READY, lease.LOADING) == (1, 2)
-    word = lease.tagged(lease.LOADING, 7)
-    assert lease.untag(word) == (lease.LOADING, 7) and word >> 56 == lease.LOADING != lease.READY
+    assert (lease.READY, lease.LOADING, lease.COPYING, lease.CPU) == (1, 2, 3, 4)
 
 
 def test_generation_zero_and_generations_past_56_bits_are_refused():

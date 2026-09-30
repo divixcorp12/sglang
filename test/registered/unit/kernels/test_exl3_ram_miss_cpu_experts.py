@@ -17,10 +17,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -83,9 +83,6 @@ def _host(tmp_path, *, split, forward, copy_engine=True):
     s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False)
     host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((ROWS, 6), -1, dtype=torch.int32))
-    host.enable_lease_mode()
-    host.enable_two_phase()
-    host.enable_piece_stream()
     dst = None
     if copy_engine:
         host.enable_copy_engine(-1, spin_us=200)
@@ -106,14 +103,8 @@ def _host(tmp_path, *, split, forward, copy_engine=True):
 def _load(sim, host, experts):
     """Make ``experts`` resident in row ROW through a plain request, and retire its leases."""
     req = sim.post(ROW, experts)
-    assert host.pump() == 1
-    ctx = []
-    for lane in range(len(req.lanes)):
-        result = sim.row_result(req, lane)
-        assert result["tag"] in (lease.READY, lease.LOADING), result
-        ctx.append((result["host_slot"], result["slot_generation"]))
-    sim.ack(req, type("W", (), {"go": len(ctx), "ctx": ctx})())
-    sim.deliver()
+    assert host.pump() == 1 and sim.wait(req).served
+    sim.done(req)
     host.pump()
 
 
@@ -142,7 +133,7 @@ def test_the_grant_sends_split_n_resident_lanes_to_the_cpu_and_copydone_waits_fo
         _load(sim, host, [2, 3])
         host.set_cpu_layer(ROW, HANDLE)
         slot3, slot2 = _slot_of(host, 3), _slot_of(host, 2)
-        req = sim.post(ROW, [3, 5, 2], dst=[0, 1, 5], copy_engine=True, cpu_weights=[0.5, 0.25, 0.125])
+        req = sim.post(ROW, [3, 5, 2], dst=[0, 1, 5], captured=True, cpu_weights=[0.5, 0.25, 0.125])
         assert host.pump() == 1
         assert _tags(sim, req) == [lease.CPU, lease.LOADING, lease.COPYING]
         entry = host.lease_entry(req.idx)
@@ -153,19 +144,20 @@ def test_the_grant_sends_split_n_resident_lanes_to_the_cpu_and_copydone_waits_fo
         assert torch.equal(out_rows[ROW], torch.arange(HIDDEN, dtype=torch.float32) + 0.5 * (slot3 + 1))
         assert not out_rows[1 - ROW].any()
         time.sleep(0.05)
-        assert sim.copy_done(req)[:2] != (lease.COPIED, req.gen), "CopyDone before the lane-2 copy completed"
+        assert sim.copy_done(req) != req.gen, "CopyDone before the lane-2 copy completed"
 
         host.copy_engine_release(-1)
-        assert _wait(lambda: sim.copy_done(req)[:2] == (lease.COPIED, req.gen))
+        assert _wait(lambda: sim.copy_done(req) == req.gen)
         assert host.copy_engine_idle(5.0)
-        assert sim.copy_done(req) == (lease.COPIED, req.gen, 0b101)
+        assert sim.copy_done(req) == req.gen
         assert not any(dst[n][0].view(torch.uint8).any() for n in dst), "the CPU lane's slot was copied"
         assert all(torch.equal(dst[n][5].view(torch.uint8), s.slabs[ROW][n][slot2].view(torch.uint8)) for n in dst)
+        host.pump()  # the owner drains the completion and releases the job's leases
         entry = host.lease_entry(req.idx)
         assert entry["lane_state"][0] == 2 and entry["lane_state"][2] == 2
         assert host.slot_info(ROW)[slot3][2] == 0, "the CPU lane's lease outlived its completion"
         counters = host.counters()
-        assert counters["cpu_jobs"] == 1 and counters["cpu_lanes"] == 1 and counters["copy_errors"] == 0
+        assert counters["cpu_jobs"] == 1 and counters["cpu_lanes"] == 1
         assert host.cpu_stats()["jobs"] == 1 and host.cpu_stats()["lanes"] == 1
     finally:
         host.stop()
@@ -178,11 +170,11 @@ def test_a_job_of_cpu_lanes_only_completes_without_any_copy(tmp_path):
     try:
         _load(sim, host, [1, 3])
         host.set_cpu_layer(ROW, HANDLE)
-        req = sim.post(ROW, [3, 1], dst=[2, 4], copy_engine=True, cpu_weights=[1.0, 2.0])
+        req = sim.post(ROW, [3, 1], dst=[2, 4], captured=True, cpu_weights=[1.0, 2.0])
         assert host.pump() == 1
         assert _tags(sim, req) == [lease.CPU, lease.CPU]
-        assert _wait(lambda: sim.copy_done(req)[:2] == (lease.COPIED, req.gen))
-        assert sim.copy_done(req) == (lease.COPIED, req.gen, 0b11)
+        assert _wait(lambda: sim.copy_done(req) == req.gen)
+        assert sim.copy_done(req) == req.gen
         assert forward.calls == [(HANDLE, [_slot_of(host, 3), _slot_of(host, 1)], [1.0, 2.0], 2)]
         assert host.copy_engine_marked() == 0
         assert host.copy_engine_idle(5.0)
@@ -191,7 +183,7 @@ def test_a_job_of_cpu_lanes_only_completes_without_any_copy(tmp_path):
         host.stop()
 
 
-@pytest.mark.parametrize("case", ["no_cpu_input", "unregistered", "split_zero", "no_copy_engine_flag"])
+@pytest.mark.parametrize("case", ["unregistered", "split_zero", "uncaptured"])
 def test_a_request_the_cpu_may_not_take_is_copied_as_before(tmp_path, case):
     forward = FakeForward()
     split = NO_SPLIT if case == "split_zero" else _split(n1=1)
@@ -200,10 +192,9 @@ def test_a_request_the_cpu_may_not_take_is_copied_as_before(tmp_path, case):
         _load(sim, host, [3])
         if case != "unregistered":
             host.set_cpu_layer(ROW, HANDLE)
-        weights = None if case == "no_cpu_input" else [1.0]
-        req = sim.post(ROW, [3], dst=[1], copy_engine=case != "no_copy_engine_flag", cpu_weights=weights)
+        req = sim.post(ROW, [3], dst=[1], captured=case != "uncaptured", cpu_weights=[1.0])
         assert host.pump() == 1
-        expected = lease.READY if case == "no_copy_engine_flag" else lease.COPYING
+        expected = lease.READY if case == "uncaptured" else lease.COPYING
         assert _tags(sim, req) == [expected]
         host.copy_engine_release(-1)
         assert host.copy_engine_idle(5.0)
@@ -223,12 +214,12 @@ def test_the_cpu_lanes_prefer_slots_on_the_pools_numa_node(tmp_path):
         nodes[slot2] = 1
         host.set_cpu_slot_nodes(ROW, nodes, 1)
         host.set_cpu_layer(ROW, HANDLE)
-        req = sim.post(ROW, [3, 2], dst=[0, 1], copy_engine=True, cpu_weights=[1.0, 1.0])
+        req = sim.post(ROW, [3, 2], dst=[0, 1], captured=True, cpu_weights=[1.0, 1.0])
         assert host.pump() == 1
         assert _tags(sim, req) == [lease.COPYING, lease.CPU]
         assert _wait(lambda: len(forward.calls) == 1) and forward.calls[0][1] == [slot2]
         host.copy_engine_release(-1)
-        assert _wait(lambda: sim.copy_done(req)[:2] == (lease.COPIED, req.gen))
+        assert _wait(lambda: sim.copy_done(req) == req.gen)
         assert host.copy_engine_idle(5.0)
     finally:
         host.stop()
@@ -245,33 +236,48 @@ def test_the_split_is_retuned_at_run_time_and_checked(tmp_path):
         with pytest.raises(Exception, match="0 <= split"):
             host.set_cpu_split(_split(n1=2))
         host.set_cpu_split(_split(n1=1))
-        req = sim.post(ROW, [3], dst=[1], copy_engine=True, cpu_weights=[1.0])
+        req = sim.post(ROW, [3], dst=[1], captured=True, cpu_weights=[1.0])
         assert host.pump() == 1
         assert _tags(sim, req) == [lease.CPU]
-        assert _wait(lambda: sim.copy_done(req)[:2] == (lease.COPIED, req.gen))
+        assert _wait(lambda: sim.copy_done(req) == req.gen)
         assert host.copy_engine_idle(5.0)
     finally:
         host.stop()
 
 
-def test_a_failed_forward_fails_stop_and_keeps_its_lease(tmp_path):
-    """E5: a lane whose CPU forward failed is never completed, so its slot stays leased and the fatal word is raised."""
-    forward = FakeForward(result=-5)
-    s, page, host, sim, dst, out_rows = _host(tmp_path, split=_split(n1=1), forward=forward)
-    try:
-        _load(sim, host, [3])
-        slot = _slot_of(host, 3)
-        host.set_cpu_layer(ROW, HANDLE)
-        req = sim.post(ROW, [3], dst=[1], copy_engine=True, cpu_weights=[1.0])
+def test_a_failed_forward_aborts_the_process(tmp_path):
+    """E5: a lane whose CPU forward failed is never completed; the copy thread fails its job, which fails stop."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    result = run_host_script(
+        tmp_path,
+        f"""
+        sys.path.insert(0, {here!r})
+        from test_exl3_ram_miss_cpu_experts import FakeForward, ROW, ROWS, HIDDEN, HANDLE, DST_ROWS, _cores, _split
+        forward = FakeForward(result=-5)
+        host.enable_copy_engine(-1, spin_us=200)
+        dst = {{n: torch.zeros((DST_ROWS,) + tuple(v.shape[1:]), dtype=v.dtype) for n, v in s.slabs[ROW].items()}}
+        table = torch.tensor(
+            [[v.data_ptr(), dst[n].data_ptr(), v[0].numel() * v.element_size()] for n, v in s.slabs[ROW].items()],
+            dtype=torch.int64,
+        )
+        host.set_copy_table(ROW, table, DST_ROWS)
+        host.arm_copy_engine()
+        x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
+        out_rows = torch.zeros((ROWS, HIDDEN), dtype=torch.float32)
+        host.enable_cpu_experts(forward.address, _split(n1=1), _cores(), x_rows, out_rows, threads=2, spin_us=200)
+        req = sim.post(ROW, [3])
         assert host.pump() == 1
-        assert _wait(lambda: len(forward.calls) == 1)
-        assert _wait(lambda: page_word(page, "fatal") != 0)
-        assert sim.copy_done(req)[:2] != (lease.COPIED, req.gen)
+        sim.done(req)
         host.pump()
-        assert host.slot_info(ROW)[slot][2] == 1 and host.lease_entry(req.idx)["lane_state"][0] == 1
-        assert host.counters()["copy_errors"] >= 1
-    finally:
-        host.stop()
+        host.set_cpu_layer(ROW, HANDLE)
+        sim.post(ROW, [3], dst=[1], captured=True, cpu_weights=[1.0])
+        host.pump()
+        time.sleep(3.0)
+        print("reached")
+        """,
+        capacity=4,
+    )
+    assert_aborted(result, "RAM miss copy engine: copy of request")
 
 
 def test_cpu_experts_need_the_copy_engine(tmp_path):

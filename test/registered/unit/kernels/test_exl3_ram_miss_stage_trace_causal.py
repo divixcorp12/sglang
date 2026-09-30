@@ -12,8 +12,9 @@ import pytest
 import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ops
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, read_rows_traced, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, read_rows_traced
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 from sglang.test.expert_stream_sources import host_sources, joined_text
 
@@ -39,11 +40,14 @@ def _host(tmp_path, *, trace_capacity=None, capacity=6):
     return s, page, host
 
 
-def _serve(page, host, row, need, protect):
-    seq = sim_post(page, row, need=need, protect=protect)
+def _serve(page, host, row, lanes, protect=None):
+    """One demand for ``lanes``, served, then Done (the next pump retires its leases); returns its seq."""
+    sim = LeaseSim(host, page, None)
+    req = sim.post(row, lanes, protect=protect)
     assert host.pump() == 1
-    assert sim_wait(page, seq, timeout_s=1.0) == 1
-    return seq
+    assert sim.wait(req, timeout_s=1.0).served
+    sim.done(req)
+    return req.seq
 
 
 def _extents_by_row(record):
@@ -53,14 +57,19 @@ def _extents_by_row(record):
     return by_row
 
 
-def _assert_row_chain(record, rows=None):
+def _assert_row_chain(record, rows=None, *, pieces=False):
     """One row's own stamps, never one sorted list across rows: admit <= each of its extents' submit <=
-    that extent's cqe <= the row's pack_start <= pack_end. Every stamp of a packed row must exist."""
+    that extent's cqe <= the row's pack_start <= pack_end. Every stamp of a packed row must exist. With ``pieces``
+    (the service streams them) a row starts packing once its first sub-read landed, so only the first cqe precedes
+    pack_start, and every cqe precedes pack_end."""
     by_row = _extents_by_row(record)
     for row in record["row_pack"] if rows is None else rows:
         assert row["admit"] > 0 and row["start"] > 0 and row["end"] >= row["start"], row
-        for extent in by_row[row["row"]]:
-            assert row["admit"] <= extent["submit"] <= extent["cqe"] <= row["start"], (row, extent)
+        extents = by_row[row["row"]]
+        for extent in extents:
+            assert row["admit"] <= extent["submit"] <= extent["cqe"] <= (row["end"] if pieces else row["start"]), (
+                row, extent)
+        assert min(extent["cqe"] for extent in extents) <= row["start"], row
 
 
 @pytest.mark.parametrize("weights", [None, (1.0, 1.0)])
@@ -139,26 +148,26 @@ def test_a_failure_after_some_rows_packed_marks_exactly_the_stages_not_reached(t
 def test_a_served_request_is_reserved_before_any_row_is_admitted(tmp_path):
     s, page, host = _host(tmp_path, trace_capacity=8)
     try:
-        _serve(page, host, 1, need=[2, 5, 4], protect=[2, 5, 4])
+        _serve(page, host, 1, [2, 5, 4])
         (record,) = host.drain_trace()
     finally:
         host.stop()
     assert record["observed"] <= record["reserved"] <= min(row["admit"] for row in record["row_pack"])
     assert record["dropped_before"] == 0
-    _assert_row_chain(record)
+    _assert_row_chain(record, pieces=True)
 
 
 def test_a_full_ring_says_where_the_records_were_lost(tmp_path):
     s, page, host = _host(tmp_path, trace_capacity=2)
     try:
-        seqs = [_serve(page, host, 0, need=[], protect=[1]) for _ in range(5)]
+        seqs = [_serve(page, host, 0, [1]) for _ in range(5)]
         first = host.drain_trace()
         assert [r["seq"] for r in first] == seqs[:2] and [r["dropped_before"] for r in first] == [0, 0]
         assert host.trace_dropped() == 3
-        after_seq = _serve(page, host, 0, need=[], protect=[1])  # the ring was drained: this one gets in
+        after_seq = _serve(page, host, 0, [1])  # the ring was drained: this one gets in
         (after,) = host.drain_trace()
         assert after["seq"] == after_seq and after["dropped_before"] == 3
-        _serve(page, host, 0, need=[], protect=[1])
+        _serve(page, host, 0, [1])
         (later,) = host.drain_trace()
         assert later["dropped_before"] == 0  # reported once, not cumulatively
     finally:
@@ -171,9 +180,9 @@ def test_each_loss_episode_is_reported_at_its_own_position(tmp_path):
         seen = []
         for lost in (2, 3):
             for _ in range(1 + lost):  # the first fills the single slot, the rest are dropped
-                _serve(page, host, 0, need=[], protect=[1])
+                _serve(page, host, 0, [1])
             seen.extend(host.drain_trace())
-        _serve(page, host, 0, need=[], protect=[1])
+        _serve(page, host, 0, [1])
         seen.extend(host.drain_trace())
         assert [r["dropped_before"] for r in seen] == [0, 2, 3]
         assert sum(r["dropped_before"] for r in seen) == host.trace_dropped() == 5
@@ -182,9 +191,9 @@ def test_each_loss_episode_is_reported_at_its_own_position(tmp_path):
 
 
 def _mixed_traffic(page, host):
-    _serve(page, host, 1, need=[2, 5], protect=[2, 5])  # reads
-    _serve(page, host, 1, need=[], protect=[2])  # resident: no read
-    _serve(page, host, 1, need=[3], protect=[2, 3, 5])  # reads one row
+    _serve(page, host, 1, [2, 5])  # reads
+    _serve(page, host, 1, [2])  # resident: no read
+    _serve(page, host, 1, [3], protect=[2, 3, 5])  # reads one row
 
 
 def test_a_disabled_trace_reads_no_clock_and_builds_no_record(tmp_path):
@@ -203,13 +212,13 @@ def test_an_enabled_trace_reads_the_clock_at_every_stamp(tmp_path):
     disabled run above reads zero is only meaningful because this counter does move when tracing is on."""
     s, page, host = _host(tmp_path, trace_capacity=64)
     try:
-        _serve(page, host, 1, need=[2], protect=[2])
+        _serve(page, host, 1, [2])
         before = host.trace_clock_reads()
         for _ in range(3):
-            _serve(page, host, 1, need=[], protect=[2])
+            _serve(page, host, 1, [2])
         assert host.trace_clock_reads() - before == 3 * 4
         before = host.trace_clock_reads()
-        _serve(page, host, 1, need=[5], protect=[2, 5])
+        _serve(page, host, 1, [5], protect=[2, 5])
         assert host.trace_clock_reads() - before > 4  # a read stamps admission, submit, cqe and packing too
     finally:
         host.stop()
@@ -223,39 +232,32 @@ NON_TRACE_CLOCK_READS = {
     "clock_gettime(CLOCK_MONOTONIC, &ts);": 1,  # now_ns()'s body
     "return now_ns();": 1,  # stamp() itself
     # Deadlines of callers that wait, never the service or copy thread serving a request: RamThread::pause() (and its
-    # copy-idle wait), fill_wait (the third "deadline" line and the "return -1" line), and the test exports sim_wait
-    # (the second "if (now_ns() > deadline) {") and seqlock_stress (the duration pair).
-    "const int64_t deadline = now_ns() + timeout_ns;": 3,
-    "if (now_ns() > deadline) {": 2,
+    # copy-idle wait), and fill_wait (the second "deadline" line and the "return -1" line).
+    "const int64_t deadline = now_ns() + timeout_ns;": 2,
+    "if (now_ns() > deadline) {": 1,
     "tier_->wait_copy_idle_owned(now_ns() + timeout_ns);": 1,
     "if (now_ns() > deadline) return -1;": 1,
-    "const int64_t deadline = now_ns() + duration_ns;": 1,
-    "while (now_ns() < deadline) {": 1,
     # The spin budget (spec M8): idle_budget() times kProbe pauses once, on the thread that calls start() (RamThread and
     # CopyEngine), so neither the service nor the copy thread reads the clock to pace itself.
     "const int64_t t0 = now_ns();": 1,
     "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread.
     "const int64_t now = now_ns();": 1,
-    # The copy engine (LEASE_PROTOCOL.md 7.6): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
+    # The copy engine (LEASE_PROTOCOL.md, "Copy engine"): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
     # through it) and stop()'s drain deadline, which the copy thread reads only once a stop was asked for.
     "if (now_ns() > deadline_ns) return false;": 1,
     "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
     "drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);": 1,
-    "if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;": 1,
-    # Metrics, compiled only into InstrBuild (each inside `if constexpr (Build::kMetrics)`): copy_issue_ns, the copy
-    # latency's submit and completion reads, and native prefetch's prefetch_latency_ns pair.
+    "if (stopping && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;": 1,
+    # seqlock_stress, test only (refused on ProdBuild): its run's deadline, on the caller's thread.
+    "const int64_t deadline = now_ns() + duration_ns;": 1,
+    "while (now_ns() < deadline) {": 1,
+    # Metrics, compiled only into InstrBuild (each inside `if constexpr (Build::kMetrics)`): copy_issue_ns, and the copy
+    # latency's submit and completion reads.
     "if constexpr (Build::kMetrics) start = now_ns();  // copy_issue_ns, a metric": 1,
     "count<kCopyIssueNs>(now_ns() - start);": 1,
     "if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric": 1,
     "const int64_t latency = now_ns() - job.submit_ns;": 1,
-    "if constexpr (Build::kMetrics) read_ns = now_ns();  // prefetch_latency_ns, a metric": 1,
-    "if constexpr (Build::kMetrics) count<kPrefetchLatencyNs>(now_ns() - job.submit_ns);": 1,
-    # The hold_until_probe_ms test fault (piece streaming, G2): InstrBuild only (both under `if constexpr
-    # (Build::kFaults)`), read only when that fault is set; the second line's `c.hold_until == 0` short-circuits
-    # before the clock read otherwise.
-    "c.hold_until = now_ns() + faults_.fault.hold_until_probe_ms * 1000000;": 1,
-    "if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;": 1,
     # CpuExpertEngine (cpu_experts.h): one pair per CPU forward, a job of 0.5 ms or more on the CPU expert thread, off
     # the service thread; ProdBuild keeps it because the split's re-tune (cpu_stats' forward ns) reads it in serving.
     "const int64_t start = now_ns();": 1,

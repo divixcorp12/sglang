@@ -334,7 +334,7 @@ class ExpertPinnedHostCache:
     def quarantine(self) -> None:
         """Keep every slab registered and alive until the process ends, and never unregister it.
 
-        For when a GPU reader of unknown state may still run (LEASE_PROTOCOL.md section 14). The finalizer that
+        For when a GPU reader of unknown state may still run (LEASE_PROTOCOL.md, "Shutdown"). The finalizer that
         unregisters the slabs at exit is detached, or it would undo this; ``close`` is then a no-op.
         """
         self._release_slabs.detach()

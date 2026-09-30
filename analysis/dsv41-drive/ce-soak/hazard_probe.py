@@ -54,7 +54,11 @@ def main() -> int:
 
     if not str(Path(sglang.__file__).resolve()).startswith(str(repo)):
         raise SystemExit(f"INTERPRETER TRAP: sglang from {sglang.__file__}, not {repo}")
-    sys.path.insert(0, str(repo / "test" / "manual" / "dsv41"))
+    harness = repo / "test" / "manual" / "dsv41"
+    if not (harness / "test_exl3_piece_stream_cuda.py").exists():
+        # The minimal lease protocol deleted StreamService and the fail-closed timeout (keep 0) this probe measures.
+        raise SystemExit(f"{repo} has no StreamService: pass --repo a worktree at 62afc40d7d or older")
+    sys.path.insert(0, str(harness))
     from test_exl3_piece_stream_cuda import StreamService
 
     tmp = Path(tempfile.mkdtemp(prefix="ce-hazard-probe-", dir="/mnt/nvme1/pytest-tmp"))

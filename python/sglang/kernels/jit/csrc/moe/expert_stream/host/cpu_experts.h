@@ -4,8 +4,8 @@
 //
 // The copy thread is its only client. It submits a job when it issues the request's copy job, and treats the copy
 // job as complete only once this thread has also finished that job. So CopyDone, the lease release and the copy wait's
-// gate keep their one publisher (LEASE_PROTOCOL.md 7.6). A failed forward keeps its leases (E5): this thread never
-// marks it done and reports the error, and the copy thread fails the job, which raises the fatal word.
+// gate keep their one publisher (LEASE_PROTOCOL.md, "Copy engine"). A failed forward is never marked done: this
+// thread reports the error, and the copy thread fails the job, which fails the process stop.
 #pragma once
 
 #include <immintrin.h>

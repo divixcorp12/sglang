@@ -1,5 +1,5 @@
 """End to end on the GPU (window): a captured EXL3 in-graph MoE whose RAM misses are
-served by option C; and a forced timeout fail-stop.
+served by the lease chain.
 
 The served replay is checked as Task 9's test_exl3_graph_apply_gpu.py checks P3: every
 slot the gather names holds exactly the bytes a fresh checkpoint read of its expert
@@ -118,7 +118,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
         for _, streamer in pairs:
             streamer.format.attach_hot_cache_manager(manager, streamer)
     service = service_module.Exl3RamMissService.get()
-    assert service.lease_mode is True and service.device_side.lease_block is not None
+    assert service.device_side.lease_block is not None
     if num_layers == 1:
         return (*pairs[0], service, checks)  # the shape every single-layer test unpacks
     return pairs, service, checks
@@ -131,13 +131,7 @@ REPLAY_STEPS = 4
 
 
 @pytest.mark.parametrize("fused", [False, True], ids=["generic_routes", "fused_routes"])
-@pytest.mark.parametrize(
-    ("failure", "two_phase"),
-    # The generation-violation case drives the single-phase wait/ack kernels by hand.
-    [("timeout", False), ("generation_violation", False), ("timeout", True)],
-    ids=["timeout", "generation_violation", "two_phase_timeout"],
-)
-def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fused, failure, two_phase):
+def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fused):
     """Runs only on divix01: actual EXL3 bytes, native leases, and captured
     MoE output across a DIRECT insertion and an eager pinned-tier eviction."""
     from sglang.srt.environ import envs
@@ -161,10 +155,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             service_row_images(tmp_path),  # the service reads row images with O_DIRECT, as in production
             envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
             envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
-            envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(two_phase),
-            # Long enough for stage 1 to see the hit grant, and far shorter than the 1 s read hold below.
             envs.SGLANG_DSV41_RAM_MISS_HIT_WAIT_US.override(50_000),
-            envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(False),
             envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
             envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
         ):
@@ -246,93 +237,8 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             mapping = manager.gpu_residency.mapping[0, :experts].cpu()
             evicted = next(expert for expert in first if mapping[expert] < 0)
             replay([evicted, 30, 31, 32, 33, 34])  # refetch into GPU residency
-            if two_phase:
-                # One request split across both stages: a RAM-resident miss copied while an NVMe miss is
-                # read. replay() checks both rows' bytes in their DIRECT slots and the committed mapping.
-                device_side = streamer.row_backend.device_side
-                mapping = manager.gpu_residency.mapping[0, :experts].cpu()
-                ram_hit = next(e for e in range(experts) if e in service.host.slot_to_expert(0) and mapping[e] < 0)
-                cold = next(e for e in range(experts) if e not in service.host.slot_to_expert(0) and mapping[e] < 0)
-                # Hold the NVMe read past stage 1's poll bound so the cold lane cannot publish during stage 1.
-                service.host.inject(delay_s=1.0)
-                replay([ram_hit, cold, 30, 31, 32, 33])
-                service.host.inject(delay_s=0.0)
-                assert device_side.go_1.item() >= 1 and device_side.go_2.item() >= 1
-                assert streamer.row_backend.delivered_count.item() == (
-                    device_side.go_1.item() + device_side.go_2.item()
-                )
             assert manager.gpu_residency.insertion_truncated[0].item() == 0
-            before_failure = manager.gpu_residency.mapping[0].clone()
-            if failure == "timeout":
-                cold = next(e for e in range(experts) if e not in service.host.slot_to_expert(0)
-                            and before_failure[e].item() < 0)
-                service.host.inject(delay_s=10.0)
-                ids.copy_(torch.tensor([[cold, 30, 31, 32, 33, 34]], device="cuda", dtype=torch.int32))
-                graph.replay()
-                torch.cuda.synchronize()
-                if two_phase:
-                    # Stage 1 may already have copied a RAM hit; nothing past the timed-out read is copied.
-                    assert streamer.row_backend.device_side.go_2.item() == 0
-                else:
-                    assert streamer.row_backend.delivered_count.item() == 0
-                assert streamer.row_backend.keep.item() == 0.0
-                assert torch.equal(manager.gpu_residency.mapping[0], before_failure)
-            else:
-                # Run the real post -> lease wait -> row copy -> ack -> DIRECT
-                # commit chain with a synchronization gap after the copy. Only
-                # the test changes the mapped SlotGen word in that gap; the
-                # native service and GPU acknowledgment remain unmodified.
-                from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
-
-                updater = manager.gpu_residency
-                backend = streamer.row_backend
-                cold = next(e for e in range(experts) if e in service.host.slot_to_expert(0)
-                            and before_failure[e].item() < 0)
-                before_slots = updater.slot_to_expert[0].clone()
-                streamer._graph_source_rows[0] = cold
-                streamer._graph_miss_count.fill_(1)
-                backend.routes.fill_(-1)
-                backend.routes[0] = cold
-                route_slots = updater.mapping[0, cold : cold + 1]
-                scratch_remap = torch.tensor([manager.caches[0].capacity], device="cuda")
-                updater.gather_destinations(0, scratch_remap, route_slots, manager.caches[0].capacity)
-                plan = streamer.row_plan
-                backend._stage_planned(plan)
-                backend.device_side.post(
-                    backend.row, backend.planned, plan.count, backend.routes, backend.next_row,
-                    backend.hot_slots, backend.hot_capacity,
-                )
-                backend.device_side.wait(
-                    backend.row, backend.planned, plan.count, backend.host_rows,
-                    backend.keep, backend.ram_miss,
-                )
-                copy_expert_row_segments_gpu(
-                    backend.segments[streamer.row_tag], backend.host_rows,
-                    plan.slots, backend.delivered_count,
-                )
-                torch.cuda.synchronize()
-                assert backend.delivered_count.item() == 1
-                assert backend.keep.item() == 1.0
-                leased_row = int(backend.device_side.lane_ctx[0, 2].item())
-                leased_slot = int(backend.device_side.lane_ctx[0, 3].item())
-                layout = service.host.lease_layout
-                offset = layout.slot_gen_offset + 4 * (
-                    layout.slot_gen_base[leased_row] + leased_slot
-                )
-                slot_gen = service.host.lease_block[offset : offset + 4].view(torch.int32)
-                slot_gen[0] = int(slot_gen[0]) + 1
-                backend.device_side.ack(backend.keep)
-                updater.commit_gather()
-                torch.cuda.synchronize()
-                assert backend.delivered_count.item() == 1
-                assert backend.keep.item() == 0.0
-                assert torch.equal(updater.mapping[0, :experts], before_failure[:experts])
-                assert torch.equal(updater.slot_to_expert[0], before_slots)
-            with pytest.raises(RuntimeError, match="exl3 RAM miss"):
-                service.fail_stop_check()  # no response can be served after fatal delivery
     finally:
-        if service.host is not None:
-            service.host.inject(delay_s=0.0)
         service.shutdown()
 
 
@@ -384,45 +290,9 @@ def test_ram_misses_inside_a_replay_are_served(tmp_path):
             time.sleep(0.005)
         counters = service.host.counters()
         assert retired(), counters
-        assert counters["leases_voided"] == 0 and counters["lease_double_signal"] == 0, counters
-        assert service.host.fatal_seq() == 0
+        assert counters["overruns"] == 0, counters
         assert all(info[2] == 0 for info in service.host.slot_info(0)), "no slot is left leased"
     finally:
-        service.shutdown()
-
-
-def test_a_forced_timeout_fails_stop_without_hanging(tmp_path):
-    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
-
-    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=100)
-    try:
-        assert service.device_side.timeout_ns == 100_000_000  # the override reached attach
-        x = torch.zeros((1, HIDDEN), device="cuda", dtype=torch.bfloat16)
-        weights = torch.full((1, TOP_K), 1.0 / TOP_K, device="cuda")
-        ids = torch.tensor([[0, 1, 2, 3, 4, 5]], device="cuda", dtype=torch.int32)
-        Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
-        service.host.inject(delay_s=10.0)
-        ids.copy_(torch.tensor([[13, 14, 15, 0, 1, 2]], device="cuda", dtype=torch.int32))
-        base = streamer.row_planner.scratch_base
-        scratch_before = {name: t[base : base + TOP_K].clone() for name, t in streamer.hot_cache.tensors.items()}
-        started = time.perf_counter()
-        graph.replay()
-        torch.cuda.synchronize()
-        assert time.perf_counter() - started < 2.0
-        assert streamer.row_backend.keep.item() == 0.0
-        # A refused request commits nothing: the copy read nothing (the scratch rows are untouched) and
-        # no acknowledgement was emitted.
-        assert service.device_side.go_count.item() == 0
-        for name, t in streamer.hot_cache.tensors.items():
-            assert torch.equal(t[base : base + TOP_K].view(torch.uint8), scratch_before[name].view(torch.uint8)), name
-        with pytest.raises(RuntimeError, match="exl3 RAM miss"):
-            for check in checks:
-                check()
-    finally:
-        service.host.inject(delay_s=0.0)
         service.shutdown()
 
 
@@ -465,7 +335,8 @@ def _replay_step(pairs, service, inputs, graph, step, checks):
     """Replay every layer on routes that miss its pinned tier; each layer's misses must be read and none dropped."""
     expected = []
     for layer_id, (_, streamer) in enumerate(pairs):
-        hot, tier = streamer.hot_cache.slot_to_expert, streamer.pinned_host_cache._lru
+        # A snapshot: the running service owns the tier, and membership queries refuse unpaused.
+        hot, tier = streamer.hot_cache.slot_to_expert, service.host.slot_to_expert(service.row_of(streamer.layer_id))
         missing = [e for e in _step_route(layer_id, step) if e not in hot and e not in tier]
         # A layer with nothing to read would post an all-hit request and leave the RAM-miss path unexercised.
         assert missing, (layer_id, step)
@@ -476,7 +347,7 @@ def _replay_step(pairs, service, inputs, graph, step, checks):
     graph.replay()
     torch.cuda.synchronize()
     for layer_id, (_, streamer) in enumerate(pairs):
-        assert streamer.row_backend.keep.item() == 1.0, (layer_id, step, service.host.counters(), service.host.fatal_seq())
+        assert streamer.row_backend.keep.item() == 1.0, (layer_id, step, service.host.counters())
         assert streamer.row_backend.ram_miss.item() == 0, (layer_id, step)
     for check in checks:
         check()
@@ -493,8 +364,7 @@ def _replay_step(pairs, service, inputs, graph, step, checks):
 
 def _assert_service_healthy(service):
     counters = service.host.counters()
-    assert service.host.fatal_seq() == 0, counters
-    for name in ("overruns", "read_errors", "no_victim", "late_after_terminal", "late_after_fatal", "leases_voided", "lease_double_signal"):
+    for name in ("overruns", "read_errors", "no_victim"):
         assert counters[name] == 0, (name, counters)
 
 

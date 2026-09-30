@@ -1,8 +1,7 @@
-"""The hot path's observable behavior, pinned at ba01695c35 (plan 2026-09-29-hotpath-zero-overhead Task 2): the tier's
-slots and map, the lease entries, the row results, piece words and CopyDone the device reads, the functional
-counters, the bytes of every READY row (and their identity with the checkpoint), and the SQEs a row-image read
-prepares. Every later phase of the plan (packed-path deletion, the Build policy, allocation and lock removal) must
-leave this file green without editing the golden. Regenerate only at master's code:
+"""The hot path's observable behavior, pinned at the minimal lease protocol: the tier's slots and map, the lease
+entries, the row results, piece words, CopyDone and Done the device reads, the functional counters, the bytes of every
+READY row (and their identity with the checkpoint), and the SQEs a row-image read prepares. A refactor of the host must
+leave this file green without editing the golden. Regenerate only for a deliberate protocol change:
 ``python test/registered/unit/kernels/test_expert_stream_hotpath_golden.py --regen``."""
 
 import json
@@ -55,11 +54,11 @@ def test_the_scripted_scenario_matches_the_golden(tmp_path, variant):
         for row in snap["rows"].values():
             assert all(entry["exact"] for entry in row["ready"].values()), "a READY row differs from the checkpoint"
         assert all(copy["exact"] for copy in snap["copies"]), "a copy-engine destination row differs from the checkpoint"
-        assert snap["page"]["fatal"] == 0
     assert snaps[-1]["copies"], "the scenario completed no copy-engine copy, so no destination bytes were checked"
     records = snaps[-1]["page"]["records"]
     assert len(records) == sum(kind == "post" for kind, *_ in hp.SCRIPT)
     assert all(r["ring_seq"] == r["seq"] for r in records), "a posted record's sequence word was overwritten"
+    assert all(r["served"] for r in records), "a posted record was never served"
     # The byte and ring checks above hold whatever the golden says; then every snapshot must match it.
     assert len(snaps) == len(golden["scenario"])
     for step, (got, want) in enumerate(zip(snaps, golden["scenario"])):

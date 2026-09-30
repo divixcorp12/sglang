@@ -384,11 +384,6 @@ logger = logging.getLogger(__name__)
 _WARNED_WITHOUT_PINNED_TIER = False
 
 
-def prefetch_enabled() -> bool:
-    """Option F advisories (``SGLANG_DSV41_ENABLE_EXPERT_PREFETCH``)."""
-    return envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get()
-
-
 @functools.lru_cache(maxsize=4)
 def exl3_expert_layout_for(expert_dir: str) -> Exl3ExpertLayout:
     """The checkpoint's expert layout, read once per directory (headers only)."""

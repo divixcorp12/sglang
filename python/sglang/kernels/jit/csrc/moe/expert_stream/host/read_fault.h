@@ -58,11 +58,8 @@ struct ReadFault {
   // than its pieces need.
   int64_t publish_twice = 0;
   bool short_is_eof = false;
-  // Piece streaming, device tests. hold_until_probe_ms: pieces 1..7 of every row stay collected-but-unpublished until
-  // the request's StreamProbe word reads tagged(1, generation) -- the stream kernel copied piece 0 -- or this many ms
-  // pass (G2). last_publish_delay_ns: the read's last piece publish sleeps this long first, so it lands just before
-  // kDemandDone (G11).
-  int64_t hold_until_probe_ms = 0;
+  // Piece streaming, device tests. last_publish_delay_ns: the read's last piece publish sleeps this long first, so it
+  // lands just before kDemandDone (G11).
   int64_t last_publish_delay_ns = 0;
   // Fixed reads (Task 7): narrows part_error, part_short (and short_is_eof), cqe_error and hold_ordinal to the
   // completions of leg `leg` of a fanned-out read (-1: any leg). Default reads are one leg, leg 0.
@@ -80,7 +77,7 @@ struct ReadFault {
 // (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and words 19-20 (formerly
 // pack_workers, pack_split) are reserved and ignored (the packed path is gone); word 21 is hold_rest; word 22
 // (piece_stream, not a fault) turns the reader's piece streaming on before it opens; word 23 is sub, 24
-// publish_twice, 25 short_is_eof, 26 hold_until_probe_ms and 27 last_publish_delay_ns. Word 28 (fixed_chunk_cap, not
+// publish_twice, 25 short_is_eof, 26 reserved and 27 last_publish_delay_ns. Word 28 (fixed_chunk_cap, not
 // a fault) caps the registered-buffer chunk size before the reader opens (0: 1 GiB), word 29 is leg, word 30 the
 // ring-reset bits (bit 0 nop_flush_refused, bit 1 ring_reset_fail) and word 31 (leg_cut_cap, not a fault) cuts every
 // read at that many bytes before the reader opens (0: READ_CUTS and the device limits). Keep the layout in step with
@@ -110,7 +107,6 @@ inline ReadFault fault_from(const int64_t* f) {
   fault.sub = f[23];
   fault.publish_twice = f[24];
   fault.short_is_eof = f[25] != 0;
-  fault.hold_until_probe_ms = f[26];
   fault.last_publish_delay_ns = f[27];
   fault.leg = f[29];
   fault.nop_flush_refused = (f[30] & 1) != 0;
@@ -120,11 +116,11 @@ inline ReadFault fault_from(const int64_t* f) {
 
 // Whether fault words `f` inject a fault, i.e. set a word that arms one (the words that only narrow a fault -- the
 // call numbers, part, ordinal, sub, leg, submit_first, short_is_eof, hold_rest -- arm nothing alone, and words 17-20,
-// 22, 28 and 31 are not faults). A production host has no fault state and refuses a tensor for which this is true
+// 22, 26, 28 and 31 are not faults). A production host has no fault state and refuses a tensor for which this is true
 // (HostExports::install_fault); it needs no ReadFault to decide.
 inline bool injects_fault(const int64_t* f) {
   return f[0] != 0 || f[3] != 0 || f[6] != 0 || f[7] != 0 || f[8] != 0 || f[9] > 0 || f[10] > 0 || f[11] != 0 ||
-         f[12] > 0 || f[13] != 0 || f[14] != 0 || f[16] >= 0 || f[24] > 0 || f[26] > 0 || f[27] > 0 || f[30] != 0;
+         f[12] > 0 || f[13] != 0 || f[14] != 0 || f[16] >= 0 || f[24] > 0 || f[27] > 0 || f[30] != 0;
 }
 
 template <ExpertRowLayout Layout>

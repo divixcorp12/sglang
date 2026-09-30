@@ -1,22 +1,17 @@
-"""The copy engine (LEASE_PROTOCOL.md 7.6) against the real C++ service and the real kernel chain. GPU only.
+"""The copy engine (LEASE_PROTOCOL.md, "Copy engine") against the real C++ service and the production chain.
 
-The service copies each request's resident lanes with cuMemcpyAsync on its copy thread and publishes CopyDone once
-the stream-written completion word (cuStreamWriteValue32_v2 after the job's copies) reached the job's sequence; the
-chain post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F waits for it in CW.
-Every byte check reads a snapshot the test enqueues on the decode stream right after F, before anything synchronizes
-the device: a CopyDone published before the copies completed, or a CW that does not wait, shows as stale bytes there,
-most visibly under the ballast, which delays every copy job's completion by one large extra copy.
+Under capture, with the engine armed, the service grants resident lanes COPYING and its copy thread copies them with
+cuMemcpyAsync; CW closes the gate, the stream waits on it, and CC checks CopyDone. Every byte check reads a snapshot
+enqueued right after the gather, before anything synchronizes: a gate opened before the copies landed shows as stale
+bytes, most visibly under the ballast, which delays every copy job's completion by one large extra copy.
 
-Run on divix01 holding cc-gpu.lock, with PYTHONPATH pointing at the tree under test and SGLANG_EXL3_SRC set.
+Run on divix01 under cc-gpu.lock, with PYTHONPATH pointing at the tree under test.
 """
 
-import json
-import os
 import random
-import re
 import subprocess
 import sys
-import time
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -24,597 +19,125 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
-from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
-from test_exl3_piece_stream_cuda import (  # noqa: E402
-    CAPACITY,
-    EXPERTS,
-    TOP_K,
-    StreamService,
-    _chain,
-    _kernel_nodes,
-    cuda_drv,
-)
+from lease_chain_rig import LAYERS, TOP_K, Chain  # noqa: E402
 
-BALLAST_BYTES = 64 << 20  # ~5 ms at the copy engine's 13.5 GB/s: every job completes that much after its grant
+from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS  # noqa: E402
+
+BALLAST_BYTES = 256 << 20  # ~20 ms of H2D at the copy engine's ~13.5 GB/s, ahead of every copy job
+POOL = 10  # experts the plans draw from: a capacity of 8 keeps most lanes hits and still evicts
 
 
-def _snapshot_step(s):
-    """The chain in production order, then a copy of every destination on the decode stream, taken before any sync."""
-    s.post()
-    s.hit_wait()
-    s.copy1()
-    s.ack1()
-    s.stream()
-    s.ack2()
-    s.copy_wait()
-    s.finalize()
-    snapshot = {n: s.dest[n].clone() for n in s.names}
-    s.total()
+def _ballast(c, nbytes=BALLAST_BYTES):
+    dst = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+    src = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
+    c.host.copy_engine_ballast(dst, src)
+    return dst, src
+
+
+def _capture(c):
+    """Warm every kernel eagerly (a first launch while a copy wait holds the stream can stall the copy thread), then
+    capture both rows' gathers in one graph."""
+    for row in range(LAYERS):
+        c.plan([0, 1], row)
+        c.gather(row)
+        c.snapshot(row)
     torch.cuda.synchronize()
-    return snapshot
+    assert c.retired()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        for row in range(LAYERS):
+            c.gather(row)
+    return graph, stream
 
 
-def _check(s, experts, snapshot):
-    want = s.expected(experts)
-    for lane, expert in enumerate(experts):
-        for n in s.names:
-            got = snapshot[n][lane].cpu().view(torch.uint8)
-            assert torch.equal(got, want[expert][n].view(torch.uint8)), (lane, expert, n)
+def _replay(c, graph, stream, plans):
+    with torch.cuda.stream(stream):
+        for row in range(LAYERS):
+            c.plan(plans[row], row)
+        graph.replay()
+        snapshots = {row: c.snapshot(row) for row in range(LAYERS)}
+    stream.synchronize()
+    for row in range(LAYERS):
+        c.check(plans[row], snapshots[row], row)
 
 
-def _all_retired(s):
-    c = s.counters()
-    return c["leases_granted"] == c["leases_acked"] + c["leases_voided"] + c["leases_copied"]
+def _plans(rng):
+    return {row: [rng.randrange(POOL) for _ in range(rng.randint(1, TOP_K))] for row in range(LAYERS)}
 
 
-@pytest.fixture
-def ce(tmp_path):
-    s = StreamService(tmp_path, copy_engine=True)
+@pytest.mark.parametrize("sm_small_copies", [False, True], ids=["six_copies", "sm_small_copies"])
+@pytest.mark.parametrize("ballast", [False, True], ids=["prompt", "ballast"])
+def test_captured_hits_are_copied_by_the_engine_byte_exact_armed_and_unarmed(tmp_path, ballast, sm_small_copies):
+    """Unarmed replays copy nothing on the engine; armed ones copy their hits there while S streams the misses, three
+    times round the ring under eviction, and every destination row holds its expert's bytes when the stream moves on."""
+    c = Chain(tmp_path, copy_engine=True, sm_small_copies=sm_small_copies)
     try:
-        yield s
-    finally:
-        s.close()
-
-
-def test_every_lane_holds_its_row_under_host_slot_victim_reuse(ce):
-    """Sixteen experts through eight pinned slots: the service evicts and reuses host slots, and every step rewrites
-    the same six destination slots. Each step's snapshot must hold exactly the planned rows."""
-    s = ce
-    rng = random.Random(7)
-    for _ in range(40):
-        experts = rng.sample(range(EXPERTS), TOP_K)
-        s.plan(experts)
-        snapshot = _snapshot_step(s)
-        assert s.keep.item() == 1.0, (experts, s.counters(), s.stats())
-        _check(s, experts, snapshot)
-        assert s.until(lambda: _all_retired(s)), s.counters()
-    c = s.counters()
-    assert c["copy_jobs"] > 10 and c["leases_copied"] > 30 and c["evictions"] > 0, c
-    assert c["copy_errors"] == 0 and c["copy_generation_mismatches"] == 0 and c["lease_double_signal"] == 0, c
-    assert s.stats()["copy_waits"] == c["copy_jobs"]
-
-
-def test_the_completion_word_counts_every_copy_job_at_shutdown(tmp_path, capfd):
-    """Phase 2 Task P2: the copy stream writes each job's sequence into a host-mapped word, the only completion the copy
-    thread polls. Every job completes through it (the bytes check), and at shutdown the word equals both the jobs the
-    copy thread marked and the jobs the service handed it: one write per job, none lost, none extra."""
-    s = StreamService(tmp_path, copy_engine=True)
-    try:
+        keep = _ballast(c) if ballast else None
+        graph, stream = _capture(c)
         rng = random.Random(11)
-        for _ in range(12):
-            experts = rng.sample(range(EXPERTS), TOP_K)
-            s.plan(experts)
-            snapshot = _snapshot_step(s)
-            assert s.keep.item() == 1.0, (experts, s.counters(), s.stats())
-            _check(s, experts, snapshot)
-            assert s.until(lambda: _all_retired(s)), s.counters()
-        c = s.counters()
-        assert c["copy_jobs"] > 0 and c["copy_errors"] == 0, c
+        for _ in range(4):
+            _replay(c, graph, stream, _plans(rng))
+        assert c.retired()
+        assert c.host.counters()["copy_lanes"] == 0, "an unarmed replay copied on the engine"
+        c.host.arm_copy_engine()
+        for _ in range(3 * DEMAND_RECORDS // LAYERS):
+            _replay(c, graph, stream, _plans(rng))
+        assert c.retired()
+        counters = c.host.counters()
+        assert counters["copy_lanes"] > 0 and counters["leases_copied"] > 0
+        assert counters["overruns"] == 0 and counters["evictions"] > 0
+        assert c.host.copy_engine_idle(5.0)
+        del keep
     finally:
-        s.close()
-    err = capfd.readouterr().err
-    found = re.findall(r"RAM miss copy engine: completion word (\d+) at shutdown, (\d+) jobs marked", err)
-    assert len(found) == 1, err[-2000:]
-    word, marked = (int(v) for v in found[0])
-    assert word == marked == c["copy_jobs"], (word, marked, c["copy_jobs"])
+        c.close()
 
 
-def test_a_delayed_completion_is_waited_for_and_the_lease_holds_until_it(ce):
-    """The ballast delays every job's completion by ~5 ms: CW's stream wait must hold the decode stream for it
-    (copy_spun counts arms that found CopyDone unpublished), and the bytes after F must be right.
-    Mutants: complete a job before its completion word, publish CopyDone at the grant, or a CW that does not wait --
-    each red on the snapshot."""
-    s = ce
-    src = torch.empty(BALLAST_BYTES, dtype=torch.uint8).pin_memory()
-    dst = torch.empty(BALLAST_BYTES, dtype=torch.uint8, device="cuda")
-    s.plan(list(range(TOP_K)))
-    s.step()  # resident, all through S
-    assert s.until(lambda: _all_retired(s)), s.counters()
-    s.host.copy_engine_ballast(dst, src)
+def test_an_eager_gather_never_copies_on_the_engine(tmp_path):
+    """Only a captured post lets the service copy: an eager gather may load a kernel module while a copy wait holds the
+    stream, so it is served by C1 even with the engine armed."""
+    c = Chain(tmp_path, copy_engine=True)
     try:
-        spun = s.stats()["copy_spun"]
-        for shift in range(6):
-            experts = [(e + shift) % TOP_K for e in range(TOP_K)]  # every lane a hit, each in a new lane order
-            s.plan(experts)
-            snapshot = _snapshot_step(s)
-            assert s.keep.item() == 1.0, (s.counters(), s.stats())
-            _check(s, experts, snapshot)
-        assert s.stats()["copy_spun"] >= spun + 6, s.stats()
-    finally:
-        s.host.copy_engine_ballast(None, None)
-    assert s.until(lambda: _all_retired(s)), s.counters()
-
-
-def test_hits_go_to_the_copy_engine_while_s_streams_the_misses(ce):
-    s = ce
-    s.plan([0, 1, 2])
-    s.step()
-    assert s.until(lambda: _all_retired(s))
-    before = s.counters()
-    experts = [0, 9, 1, 10, 2, 11]
-    s.plan(experts)
-    snapshot = _snapshot_step(s)
-    assert s.keep.item() == 1.0, s.counters()
-    _check(s, experts, snapshot)
-    assert int(s.dev.go_ce.item()) == 3 and int(s.dev.go_2.item()) == 3 and int(s.dev.go_1.item()) == 0
-    assert s.until(lambda: _all_retired(s))
-    after = s.counters()
-    assert after["copy_jobs"] - before["copy_jobs"] == 1 and after["copy_lanes"] - before["copy_lanes"] == 3
-
-
-def test_s_hands_a_copying_lane_w1_did_not_claim_to_the_copy_wait(tmp_path):
-    """The service is paused while the chain is launched, so W1 (no budget) passes before any lane is published and
-    claims nothing; on resume the lanes are published COPYING and S must hand them to CW rather than copy them or
-    fail the request on them."""
-    s = StreamService(tmp_path, copy_engine=True, hit_wait_ns=0)
-    try:
-        s.plan([3, 4, 5])
-        s.step()
-        assert s.until(lambda: _all_retired(s))
-        for _ in range(5):
-            s.plan([3, 4, 5])
-            s.host.pause(5.0)
-            s.post()
-            s.hit_wait()
-            s.copy1()
-            s.ack1()
-            s.stream()
-            s.ack2()
-            s.copy_wait()
-            s.finalize()
-            snapshot = {n: s.dest[n].clone() for n in s.names}
-            s.total()
-            time.sleep(0.01)  # W1 has long finished its one pass
-            s.host.resume()
+        c.host.arm_copy_engine()
+        for experts in ([0, 1, 2], [2, 1, 0], [0, 0, 1]):
+            c.plan(experts)
+            c.gather()
+            snapshot = c.snapshot()
             torch.cuda.synchronize()
-            assert s.dev.claimed[:3].tolist() == [0, 0, 0], "W1 claimed a lane published after it ran"
-            assert s.keep.item() == 1.0, (s.counters(), s.stats())
-            _check(s, [3, 4, 5], snapshot)
-            assert int(s.dev.go_ce.item()) == 3 and int(s.dev.go_1.item()) + int(s.dev.go_2.item()) == 0
-            assert s.until(lambda: _all_retired(s))
+            c.check(experts, snapshot)
+        assert c.retired()
+        assert c.host.counters()["copy_lanes"] == 0
     finally:
-        s.close()
+        c.close()
 
 
-def test_a_copy_wait_timeout_fails_closed_and_the_terminal_does_not_release_the_copying_lease(tmp_path):
-    """A 1 GiB ballast (~80 ms) against a 10 ms copy-wait timeout: the service watchdog (20 ms polls) opens CW's gate
-    as a timeout and raises the fatal word, F fails the request and names the lane in its terminal. The lease must stay
-    held until the copy completes, then be released by its handed-back completion alone.
-    The copy-wait timeout is the host's (enable_copy_engine), so the warm-up miss below, which never arms a copy wait,
-    still runs under the device's default 2 s deadline."""
-    s = StreamService(tmp_path, copy_engine=True, copy_wait_timeout_ms=10)
-    src = torch.empty(1 << 30, dtype=torch.uint8).pin_memory()
-    dst = torch.empty(1 << 30, dtype=torch.uint8, device="cuda")
-    try:
-        s.plan([3])
-        s.step()
-        assert s.keep.item() == 1.0, (s.counters(), s.stats())  # row 3 is resident: the request below is a hit
-        assert s.until(lambda: _all_retired(s))
-        slot = s.host.mapping(0)[3]
-        voided = s.counters()["leases_voided"]
-        s.host.copy_engine_ballast(dst, src)
-        s.plan([3])
-        s.post()
-        s.hit_wait()
-        s.copy1()
-        s.ack1()
-        s.stream()
-        s.ack2()
-        s.copy_wait()
-        s.finalize()
-        torch.cuda.current_stream().synchronize()  # the decode stream only: the copy is still in flight
-        seq = s.seq()
-        idx = (seq - 1) % lease.RING
-        assert s.keep.item() == 0.0 and s.stats()["timeouts"] >= 1
-        term = s.block.terminal(idx)
-        assert term["word"] == (1 << 56) | s.generation(seq) and term["mask"] & 1, term
-        assert s.host.slot_info(0)[slot][2] == 1, "the COPYING lease was released while its copy was in flight"
-        assert s.host.lease_entry(idx)["lane_state"][0] == 1
-        assert s.host.copy_engine_idle(10.0)
-        c = s.counters()
-        assert c["leases_voided"] == voided and c["lease_double_signal"] == 0, c
-        # D7 (plan 2026-09-29-hotpath-zero-overhead Task 14): the copy thread hands the job back and the running
-        # service releases the lease at its next poll, so an idle copy engine does not yet mean a released lease.
-        assert s.until(
-            lambda: s.host.slot_info(0)[slot][2] == 0 and s.host.lease_entry(idx)["lane_state"][0] == 2
-        ), s.counters()
-    finally:
-        s.host.copy_engine_ballast(None, None)
-        s.close()
+_HELD_SCRIPT = """
+import sys
+import torch
+sys.path.insert(0, sys.argv[2])
+from lease_chain_rig import Chain
+from test_exl3_copy_engine_cuda import _ballast, _capture, _replay
+c = Chain(sys.argv[1], copy_engine=True, copy_wait_ms=2)
+keep = _ballast(c, 1 << 30)
+graph, stream = _capture(c)
+c.host.arm_copy_engine()
+for _ in range(50):
+    _replay(c, graph, stream, {0: [0, 1], 1: [0, 1]})
+print("reached", flush=True)
+"""
 
 
-@pytest.mark.parametrize("fillers", [0, 3000])
-def test_the_first_replay_of_a_copy_engine_graph_completes_armed(ce, fillers):
-    """Both smokes that failed at startup (abba1-on, diag arm1-on) failed on a decode step that ran armed early in
-    the server's life, where a graph variant may run for the first time. Here a freshly captured graph, with
-    ``fillers`` kernels on each side of the chain as a stand-in for the decode graph's size, is replayed for the
-    first time with the copy engine armed and every lane a hit: its copy must complete inside the deadline."""
-    s = ce
-    s.plan([0, 1, 2])
-    s.step()  # resident, through S
-    assert s.until(lambda: _all_retired(s))
-    backend = s.make_backend()
-    plan = s.make_plan()
-    x = torch.zeros(1, device="cuda")
-    with torch.cuda.stream(torch.cuda.Stream()):
-        backend.post(0, plan)  # eager warm-up: loads every kernel, copy engine not allowed
-    torch.cuda.synchronize()
-    assert s.until(lambda: _all_retired(s))
-    graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(graph):
-        for _ in range(fillers):
-            x.add_(1)
-        backend.post(0, plan)
-        for _ in range(fillers):
-            x.add_(1)
-    jobs = s.counters()["copy_jobs"]
-    experts = [2, 0, 1]
-    s.plan(experts)
-    t0 = time.perf_counter()
-    graph.replay()
-    torch.cuda.synchronize()
-    replay_s = time.perf_counter() - t0
-    assert s.keep.item() == 1.0, (replay_s, s.counters(), s.stats())
-    assert replay_s < 1.0, replay_s
-    assert s.counters()["copy_jobs"] == jobs + 1, s.counters()
-    assert s.delivered(experts)
-    assert s.until(lambda: _all_retired(s)), s.counters()
+def test_a_copy_wait_held_past_its_timeout_aborts_the_process(tmp_path):
+    """A 2 ms copy-wait timeout under a ~75 ms ballast: the watchdog, which samples the gate every 20 ms, sees it closed
+    too long and aborts; the decode stream is never left waiting on a copy that may not come."""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_HELD_SCRIPT), str(tmp_path), str(Path(__file__).parent)],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert "reached" not in result.stdout, result.stdout
+    assert result.returncode != 0, result.returncode
+    assert "FATAL" in result.stderr and "a copy wait held the decode stream" in result.stderr, result.stderr[-2000:]
 
 
-@pytest.mark.parametrize("mode", ["LAZY", "EAGER"])
-def test_a_kernels_first_launch_while_cw_spins_fails_stop_under_lazy_loading_only(tmp_path, mode):
-    """The soak's fail-stop (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md), reduced: a JIT kernel,
-    built and loaded but never launched, is launched for the first time while the copy thread's copies are being
-    issued and CW waits for them. Under LAZY the launch loads the kernel, which waits for the device, which waits in CW
-    for copies that cannot be issued: the request times out and the page goes fatal. Under EAGER the kernel loaded
-    with its library and the launch returns at once. The service refuses the copy engine without EAGER; this pins the
-    reason. Each mode runs in its own process: CUDA reads CUDA_MODULE_LOADING once, at initialisation."""
-    scenario = Path(__file__).resolve().parent / "ce_lazy_load_scenario.py"
-    env = dict(os.environ, CUDA_MODULE_LOADING=mode)
-    r = subprocess.run([sys.executable, str(scenario), str(tmp_path)], env=env, capture_output=True, text=True,
-                       timeout=900)
-    assert r.returncode == 0, r.stderr[-4000:]
-    row = json.loads([line for line in r.stdout.splitlines() if line.startswith("{")][-1])
-    if mode == "EAGER":
-        assert row["keep"] == 1.0 and row["timeouts"] == 0 and row["fatal"] == 0, row
-        assert row["launch_ms"] < 100, row
-    else:
-        assert row["keep"] == 0.0 and row["timeouts"] == 1 and row["fatal"] != 0, row
-        assert row["launch_ms"] > 1000, row
-    assert row["x"] == 1.0, row  # the kernel itself ran once either way
-
-
-@pytest.mark.parametrize("waiter", ["h2d", "d2h", "kernel"])
-def test_work_queued_behind_the_graph_on_other_streams_does_not_hold_the_copy_back(ce, waiter):
-    """What the overlap scheduler does around a decode graph: the graph replays on a forward stream, and before it
-    finishes the scheduler queues work behind it on other streams (schedule_stream waits on the forward for its next
-    H2D input copies; copy_stream waits on it for the result's D2H copy). The recipe with --disable-overlap-schedule
-    ran the diag that deadlocks with overlap on (diag arm1nooverlap-on). Here each kind of queued-behind work is put
-    behind the first and later armed replays of a copy-engine graph: the copy must complete inside the deadline."""
-    s = ce
-    s.plan([0, 1, 2])
-    s.step()
-    assert s.until(lambda: _all_retired(s))
-    backend = s.make_backend()
-    plan = s.make_plan()
-    forward = torch.cuda.Stream()
-    behind = torch.cuda.Stream()
-    host = torch.empty(4 << 20, dtype=torch.uint8).pin_memory()
-    dev = torch.empty(4 << 20, dtype=torch.uint8, device="cuda")
-    with torch.cuda.stream(forward):
-        backend.post(0, plan)
-    torch.cuda.synchronize()
-    assert s.until(lambda: _all_retired(s))
-    # Load the waiter's own kernels and copies now, not while CW spins: under lazy module loading the first launch of
-    # dev.add_ waits on the device, holding the copy thread's cuMemcpyAsync back until the deadline.
-    with torch.cuda.stream(behind):
-        dev.copy_(host, non_blocking=True)
-        host.copy_(dev, non_blocking=True)
-        dev.add_(1)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(graph, stream=forward):
-        backend.post(0, plan)
-    for replay in range(3):
-        experts = [(e + replay) % 3 for e in range(3)]
-        s.plan(experts)
-        torch.cuda.synchronize()
-        jobs = s.counters()["copy_jobs"]
-        t0 = time.perf_counter()
-        with torch.cuda.stream(forward):
-            graph.replay()
-        done = torch.cuda.Event()
-        done.record(forward)
-        behind.wait_event(done)
-        with torch.cuda.stream(behind):
-            if waiter == "h2d":
-                dev.copy_(host, non_blocking=True)
-            elif waiter == "d2h":
-                host.copy_(dev, non_blocking=True)
-            else:
-                dev.add_(1)
-        done.synchronize()
-        replay_s = time.perf_counter() - t0
-        torch.cuda.synchronize()
-        assert s.keep.item() == 1.0, (replay, replay_s, s.counters(), s.stats())
-        assert replay_s < 1.0, (replay, replay_s)
-        assert s.counters()["copy_jobs"] == jobs + 1, s.counters()
-        assert s.delivered(experts)
-        assert s.until(lambda: _all_retired(s)), s.counters()
-
-
-@pytest.mark.skipif(cuda_drv is None, reason="needs cuda-python (cuda.bindings.driver)")
-def test_the_captured_chain_waits_in_cw_and_replays_right_armed_and_unarmed(ce):
-    """The captured backend chain is post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F -> add -> add; its replays deliver
-    the planned rows both with the copy engine unarmed (the hits go READY through C1) and armed (COPYING)."""
-    s = ce
-    s.plan([])
-    backend = s.make_backend()
-    plan = s.make_plan()
-    with torch.cuda.stream(torch.cuda.Stream()):
-        backend.post(0, plan)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(graph):
-        backend.post(0, plan)
-    assert s.dev.copy_engine_captured
-    chain = _chain(graph.raw_cuda_graph())
-    cw = _kernel_nodes(s.copy_wait)
-    finalize = _kernel_nodes(lambda: s.dev.finalize(s.count, s.keep))
-    # The stream-ordered copy wait (LEASE_PROTOCOL.md 7.6): arm kernel, memory-op wait on the gate, commit kernel.
-    assert len(cw) == 3 and len(finalize) == 1, cw
-    assert cw[1][0] == int(cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_BATCH_MEM_OP), cw
-    position = chain.index(cw[0])
-    assert chain[position : position + 3] == cw and chain[position + 3] == finalize[0], chain
-    rng = random.Random(11)
-    for armed in (False, True, False, True):
-        s.host.arm_copy_engine(armed)
-        jobs = s.counters()["copy_jobs"]
-        for _ in range(8):
-            experts = rng.sample(range(CAPACITY), TOP_K)  # mostly resident after the first replays
-            s.plan(experts)
-            graph.replay()
-            torch.cuda.synchronize()
-            assert s.keep.item() == 1.0, (armed, s.counters(), s.stats())
-            assert s.delivered(experts), (armed, experts)
-            assert s.until(lambda: _all_retired(s))
-        grew = s.counters()["copy_jobs"] > jobs
-        assert grew == armed, (armed, s.counters())
-
-
-# ---- SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: CW reads the small tensors; the lease waits for its reads ----
-
-CW_DELAY_CYCLES = 600_000_000  # ~250 ms at the 5090's clock: CW starts long after the trellis DMA has completed
-
-
-def _victim_sequence(s, steps, seed):
-    rng = random.Random(seed)
-    snapshots = []
-    for _ in range(steps):
-        experts = rng.sample(range(EXPERTS), TOP_K)
-        s.plan(experts)
-        snapshot = _snapshot_step(s)
-        assert s.keep.item() == 1.0, (experts, s.counters(), s.stats())
-        _check(s, experts, snapshot)
-        snapshots.append({n: t.cpu() for n, t in snapshot.items()})
-        assert s.until(lambda: _all_retired(s)), s.counters()
-    return snapshots
-
-
-def test_sm_small_copies_deliver_the_same_six_tensors_as_the_six_copy_path(tmp_path):
-    """Sixty steps of sixteen experts through eight pinned slots, host slots evicted and reused, on the six-copy path
-    and on the SM path: every snapshot of every tensor must be byte-identical, and equal to the checkpoint's rows."""
-    (tmp_path / "off").mkdir()
-    (tmp_path / "on").mkdir()
-    off = StreamService(tmp_path / "off", copy_engine=True)
-    try:
-        want = _victim_sequence(off, 60, seed=11)
-    finally:
-        off.close()
-    on = StreamService(tmp_path / "on", copy_engine=True, sm_small=True)
-    try:
-        got = _victim_sequence(on, 60, seed=11)
-        c = on.counters()
-        assert c["copy_jobs"] > 20 and c["leases_copied"] > 60 and c["evictions"] > 0, c
-        assert c["copy_errors"] == 0 and c["copy_generation_mismatches"] == 0 and c["lease_double_signal"] == 0, c
-        # Only the two trellis tensors per lane went through the copy engine.
-        trellis = sum(on.dest[n][0].numel() * on.dest[n].element_size() for n in on.names if n.endswith("_trellis"))
-        assert c["copy_bytes"] == c["copy_lanes"] * trellis, (c["copy_bytes"], c["copy_lanes"], trellis)
-    finally:
-        on.close()
-    for step, (a, b) in enumerate(zip(want, got)):
-        for n in a:
-            assert torch.equal(a[n].view(torch.uint8), b[n].view(torch.uint8)), (step, n)
-
-
-def test_a_slab_row_rewritten_the_moment_its_lease_is_released_never_reaches_the_destination(tmp_path):
-    """The hazard: CW reads the small tensors from the pinned slot, so the slot must stay leased until CW has read it,
-    not merely until the DMA completed. CW is delayed ~250 ms behind a device sleep; a watcher rewrites every leased
-    slot with a sentinel the instant its lease drops. The destination must hold the checkpoint's bytes.
-    Mutant: release on the DMA's completion alone -- the sentinel lands before CW reads and the snapshot is red."""
-    s = StreamService(tmp_path, copy_engine=True, sm_small=True)
-    try:
-        experts = list(range(TOP_K))
-        s.plan(experts)
-        s.step()  # resident
-        assert s.until(lambda: _all_retired(s)), s.counters()
-        slots = [s.host.mapping(s.row)[e] for e in experts]
-        originals = {n: s.slabs[s.row][n].clone() for n in s.names}
-        before = s.counters()["leases_copied"]
-        s.plan(experts)
-        s.post()
-        s.hit_wait()
-        s.copy1()
-        s.ack1()
-        s.stream()
-        s.ack2()
-        torch.cuda._sleep(CW_DELAY_CYCLES)
-        s.copy_wait()
-        s.finalize()
-        snapshot = {n: s.dest[n].clone() for n in s.names}
-        s.total()
-        released_s = None  # when every lease had dropped, from the chain's launch
-        t0 = time.perf_counter()
-        while released_s is None and time.perf_counter() - t0 < 10:
-            info = s.host.slot_info(s.row)
-            if all(info[slot][2] == 0 for slot in slots):
-                released_s = time.perf_counter() - t0
-                for n in s.names:
-                    for slot in slots:  # an int index is a view of the slab; a list index would fill a copy
-                        s.slabs[s.row][n][slot].view(torch.uint8).fill_(0xAB)
-        rewritten = released_s is not None
-        torch.cuda.synchronize()
-        assert rewritten, s.counters()
-        assert s.keep.item() == 1.0, (s.counters(), s.stats())
-        _check(s, experts, snapshot)  # a sentinel byte here: the slot was rewritten under CW's reads
-        # The trellis DMA completes within milliseconds; CW runs only after the ~250 ms device sleep.
-        assert released_s > 0.1, f"the leases dropped {released_s:.3f} s after launch, before CW ran"
-        assert s.counters()["leases_copied"] - before == TOP_K
-    finally:
-        for n in s.names:
-            s.slabs[s.row][n].copy_(originals[n])
-        s.close()
-
-
-# ---- Review findings on the SM path: one mask for reads and commit (I1), SmAck after every read (I2), and an
-# SmAck for a failed request (I3). The test-build hooks are EXL3_RAM_MISS_TEST_* defines (device_module_with_hooks). ----
-
-SM_READ_DELAY_NS = 100_000_000
-
-
-def _resident_sm_service(tmp_path):
-    s = StreamService(tmp_path, copy_engine=True, sm_small=True)
-    s.plan(list(range(TOP_K)))
-    s.step()
-    assert s.until(lambda: _all_retired(s)), s.counters()
-    return s
-
-
-def _hook(s, *defines):
-    """Swap the chain's kernels for a hooked build and compile it on an empty request."""
-    from sglang.kernels.ops.moe.expert_stream_transport import device_module_with_hooks
-
-    s.dev._module = device_module_with_hooks(defines)
-    s.plan([])
-    s.step()
-
-
-def _launch_to_snapshot(s):
-    s.post()
-    s.hit_wait()
-    s.copy1()
-    s.ack1()
-    s.stream()
-    s.ack2()
-    s.copy_wait()
-    s.finalize()
-    snapshot = {n: s.dest[n].clone() for n in s.names}
-    s.total()
-    return snapshot
-
-
-def _rewrite_on_release(s, slots, timeout_s=10.0):
-    """The instant every lease of ``slots`` has dropped, write 0xAB over those slab slots; seconds from the call."""
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < timeout_s:
-        info = s.host.slot_info(s.row)
-        if all(info[slot][2] == 0 for slot in slots):
-            released = time.perf_counter() - t0
-            for n in s.names:
-                for slot in slots:  # an int index is a view of the slab
-                    s.slabs[s.row][n][slot].view(torch.uint8).fill_(0xAB)
-            return released
-    return None
-
-
-def test_a_lane_that_turns_copying_after_the_sm_read_fails_the_request_as_identity(tmp_path):
-    """I1. CW forms the COPYING mask for its SM reads and again for its commit. A lane in the second and not the first
-    had its small tensors never read: committing it would pair fresh trellis with stale scales. The hook makes lane 0
-    read as not COPYING at the SM read; the request must fail closed as Identity, and still acknowledge its reads."""
-    s = _resident_sm_service(tmp_path)
-    try:
-        _hook(s, "EXL3_RAM_MISS_TEST_CW_SM_SKIP_LANE=0")
-        s.plan(list(range(TOP_K)))
-        _launch_to_snapshot(s)
-        torch.cuda.synchronize()
-        assert int(s.dev.go_ce.item()) == 0 and s.keep.item() == 0.0, (s.counters(), s.stats())
-        assert s.stats()["fail_reason"] == lease.TERMINAL_REASONS["identity"], s.stats()
-        assert s.host.copy_engine_idle(5.0), "the failed request's SmAck never released its copy-engine leases"
-    finally:
-        s.close()
-
-
-def test_smack_follows_every_threads_read_of_the_slot(tmp_path):
-    """I2. The hook starts all but CW's first warp ~100 ms late on their reads. A watcher writes 0xAB over each slab slot
-    the instant its lease drops: an SmAck published before the late reads finish lets the sentinel into the
-    destination. Mutants: drop the barrier after the reads, or publish SmAck above the read loop -- each red on 0xAB."""
-    s = _resident_sm_service(tmp_path)
-    experts = list(range(TOP_K))
-    slots = [s.host.mapping(s.row)[e] for e in experts]
-    originals = {n: s.slabs[s.row][n].clone() for n in s.names}
-    try:
-        _hook(s, f"EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS={SM_READ_DELAY_NS}")
-        s.plan(experts)
-        snapshot = _launch_to_snapshot(s)
-        released_s = _rewrite_on_release(s, slots)
-        torch.cuda.synchronize()
-        assert released_s is not None, s.counters()
-        assert s.keep.item() == 1.0, (s.counters(), s.stats())
-        _check(s, experts, snapshot)  # 0xAB here: SmAck was published before a read of the slot finished
-        assert released_s > SM_READ_DELAY_NS / 2e9, f"the leases dropped {released_s:.3f} s in: the delay did not act"
-    finally:
-        for n in s.names:
-            s.slabs[s.row][n].copy_(originals[n])
-        s.close()
-
-
-def test_a_request_failed_before_cw_still_acknowledges_and_releases_its_copying_leases(tmp_path):
-    """I3. An earlier stage failed (req_failed set before CW), after the service granted every lane COPYING: CW reads
-    nothing, but its SmAck is the only thing that releases those leases, so it must still publish one.
-    Mutant: publish SmAck only when CW read something -- red on the held leases."""
-    from sglang.kernels.ops.moe.expert_stream_transport import STATE_WORDS
-
-    s = _resident_sm_service(tmp_path)
-    experts = list(range(TOP_K))
-    slots = [s.host.mapping(s.row)[e] for e in experts]
-    try:
-        lanes = s.counters()["copy_lanes"]
-        s.plan(experts)
-        s.post()
-        s.hit_wait()
-        s.copy1()
-        s.ack1()
-        s.stream()
-        s.ack2()
-        s.dev.state[STATE_WORDS["req_failed"]] = 1
-        s.dev.state[STATE_WORDS["fail_reason"]] = lease.TERMINAL_REASONS["aborted"]  # aborted: no fatal word
-        s.copy_wait()
-        s.finalize()
-        s.total()
-        torch.cuda.synchronize()
-        assert int(s.dev.go_ce.item()) == 0 and s.keep.item() == 0.0, (s.counters(), s.stats())
-        assert s.counters()["copy_lanes"] - lanes == TOP_K, "the lanes were not copy-engine lanes"
-        assert s.host.copy_engine_idle(5.0), "a copy-engine job still awaits the failed request's SmAck"
-        assert s.until(lambda: all(s.host.slot_info(s.row)[slot][2] == 0 for slot in slots)), s.counters()
-    finally:
-        s.close()
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

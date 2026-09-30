@@ -282,7 +282,7 @@ class TestPinnedSlotLRUCounters(unittest.TestCase):
 
 
 class TestQuarantine(unittest.TestCase):
-    """LEASE_PROTOCOL.md section 14: a tier whose GPU readers are uncertain is never unregistered or freed."""
+    """LEASE_PROTOCOL.md, "Shutdown": a tier whose GPU readers are uncertain is never unregistered or freed."""
 
     def _cache(self, released):
         streamer = ExpertStreamer(_host_layer(experts=4), ("host_rows",))

@@ -144,7 +144,7 @@ constexpr int kTraceExtents = 32;
 constexpr int64_t kStatusServed = 1;     // every missing row was read, packed and published
 constexpr int64_t kStatusNoRead = 2;     // served with nothing to read: every needed row was resident
 constexpr int64_t kStatusFailed = 3;     // an I/O error, a short file, an invalid request or no victim
-constexpr int64_t kStatusCancelled = 4;  // an advisory gave up (demand posted, pause or stop)
+constexpr int64_t kStatusCancelled = 4;  // the caller's abandon check gave up (the reader harness's abandon_after)
 constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed, no read possible
 
 // Byte split (all in bytes, per request, summed over its io_uring batches):
@@ -159,7 +159,7 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 //                    short read. submitted_bytes - retried_bytes is the first attempts' total.
 //   cancelled_bytes  when a batch fails: the bytes its extents were expected to return (clamped at
 //                    end of file) that never arrived, whether the extent was in flight, queued or
-//                    errored. 0 for a batch that succeeds and for an advisory abandoned between
+//                    errored. 0 for a batch that succeeds and for a read abandoned between
 //                    batches (nothing is in flight then). On a failed batch, completed + cancelled
 //                    is that batch's expected total.
 // useful_bytes <= bytes <= submitted_bytes holds for a read that succeeds.
@@ -189,10 +189,8 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // These are not in STAGE_ORDER on purpose: rows overlap, so no single order of stamps holds across
 // rows. Compare a row's own stamps: row_admit <= its extents' submit <= their cqe <= its pack_start.
 //
-// lanes (schema 4): the planned lane count the device posted with this request (kRecLanes), so a layer's
-// lanes per request can be read against its `row`. It counts RAM hits as well as the rows read: rows_asked
-// is only what was missing. Not clamped to kMaxIds, so a plan wider than the lanes the service is asked
-// for shows here.
+// lanes (schema 4): the request's lane count (its LaneRequest's), so a layer's lanes per request can be read against
+// its `row`. It counts RAM hits as well as the rows read: rows_asked is only what was missing.
 //
 // pack_workers, pack_split (schema 5): the packing mode the reader ran this request in. Since the packed path was
 // deleted (plan 2026-09-29-hotpath-zero-overhead D4) the one reader, RowReader, never packs and both are always 0;
@@ -208,7 +206,7 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // no row was read for (no_read, touch): it is a property of the reader, not of the request.
 //
 // dropped_before: records the trace ring dropped, for being full, immediately before this one was
-// pushed. A gap in `seq` cannot locate a loss on its own (a skipped advisory has no record either).
+// pushed. A gap in `seq` cannot locate a loss on its own.
 //
 // The stamps submit, first_cqe and last_cqe cover the whole read: the first submit, the first completion
 // returned and the last one returned; submit_to_first_cqe_ns and first_to_last_cqe_ns are those spans.
@@ -243,7 +241,7 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // sub-read lands.
 struct StageRecord {
   int64_t seq = 0;
-  int64_t kind = 0;  // kStageDemand, kStageAdvisory, kStageTouch
+  int64_t kind = 0;  // kStageDemand, kStageTouch
   int64_t row = 0;   // streamed row (index into the layer ids), not the layer id
   int64_t ok = 0;
   int64_t rows = 0;       // rows read
@@ -308,8 +306,7 @@ inline int64_t stage_words() {
   return sizeof(StageRecord) / sizeof(int64_t);
 }
 constexpr int64_t kStageDemand = 0;
-constexpr int64_t kStageAdvisory = 1;
-constexpr int64_t kStageTouch = 2;
+constexpr int64_t kStageTouch = 1;
 
 }  // namespace expert_stream
 }  // namespace sglang

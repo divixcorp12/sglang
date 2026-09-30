@@ -691,17 +691,14 @@ struct HostExports {
     return handle;
   }
 
-  // 1 served a demand record, 3 a native-prefetch request, 2 an advisory record, 0 nothing posted. Refused while a
-  // thread pumps. The order is the service thread's: demand, prefetch, advisory.
+  // 1 served a demand record, 0 nothing posted (or it was deferred). Refused while a thread pumps.
   // Under caller_mutex(): pump() consumes the copy-completion ring (and owns the tier), so it is serialized against
   // every other Python caller, whose owned calls and wait_copy_idle drain the same ring. Tests only; no hot-path cost.
   static int64_t pump(int64_t handle) {
     const auto tier = find(handle);
     std::lock_guard<std::mutex> caller(tier->caller_mutex());
     if (tier->threaded()) throw std::runtime_error(error_prefix<Layout>() + "pump() while the service thread runs");
-    if (tier->pump_demand()) return 1;
-    if (tier->pump_prefetch()) return 3;
-    return tier->pump_advice() ? 2 : 0;
+    return tier->pump_demand() ? 1 : 0;
   }
 
   static int64_t contains(int64_t handle, int64_t row, int64_t expert) {
@@ -762,9 +759,9 @@ struct HostExports {
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const auto tier = find(handle);
-    // Exact: RamTier::slot_info writes 4 words per slot through a raw pointer with no bound.
+    // Exact: RamTier::slot_info writes 3 words per slot through a raw pointer with no bound.
     expert_stream::verify_named(
-        "out", TensorMatcher({4 * tier->row_capacity(row)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+        "out", TensorMatcher({3 * tier->row_capacity(row)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     tier->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
   }
 
@@ -772,7 +769,7 @@ struct HostExports {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named(
-        "out", TensorMatcher({4 + 3 * expert_stream::kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+        "out", TensorMatcher({3 + 3 * expert_stream::kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     if (idx < 0 || idx >= expert_stream::kDemandRecords)
       throw std::runtime_error(error_prefix<Layout>() + "request slot out of range");
     find(handle)->lease_entry(idx, static_cast<int64_t*>(out.data_ptr()));
@@ -808,24 +805,12 @@ struct HostExports {
     find(handle)->close_admission();
   }
 
-  static void set_lease_mode(int64_t handle, int64_t on) {
-    find(handle)->set_lease_mode(on != 0);
-  }
-
   static void set_prefill_share(int64_t handle, int64_t share) {
     find(handle)->set_prefill_share(share);
   }
 
   static void set_gpu_hot(int64_t handle, int64_t on) {
     find(handle)->set_gpu_hot(on != 0);
-  }
-
-  static void set_two_phase(int64_t handle, int64_t on) {
-    find(handle)->set_two_phase(on != 0);
-  }
-
-  static void set_piece_stream(int64_t handle, int64_t on) {
-    find(handle)->set_piece_stream(on != 0);
   }
 
   static void enable_copy_engine(int64_t handle, int64_t device, int64_t spin_ns, int64_t wait_timeout_ns) {
@@ -921,29 +906,6 @@ struct HostExports {
     find(handle)->cpu_stats(static_cast<int64_t*>(out.data_ptr()));
   }
 
-  // page: pinned uint8 [kPrefetchPageBytes], the native-prefetch request and done lines.
-  static void enable_native_prefetch(int64_t handle, TensorView page) {
-    using namespace host;
-    auto host_mem = SymbolicDevice{};
-    expert_stream::verify_named(
-        "page",
-        TensorMatcher({expert_stream::kPrefetchPageBytes})
-            .with_dtype<uint8_t>()
-            .with_device<kDLCPU, kDLCUDAHost>(host_mem),
-        page);
-    if (page.dim() != 1 || page.size(0) != expert_stream::kPrefetchPageBytes)
-      throw std::runtime_error(error_prefix<Layout>() + "the native prefetch page must be uint8 [256]");
-    find(handle)->enable_native_prefetch(static_cast<uint8_t*>(page.data_ptr()));
-  }
-
-  // Test only: out int64 [3] = {active, row, slot} of the service's prefetch lease.
-  static void prefetch_lease(int64_t handle, TensorView out) {
-    using namespace host;
-    auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("out", TensorMatcher({3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    find(handle)->prefetch_lease(static_cast<int64_t*>(out.data_ptr()));
-  }
-
   static int64_t copy_engine_idle(int64_t handle, int64_t timeout_ns) {
     return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;
   }
@@ -970,16 +932,61 @@ struct HostExports {
     }
   }
 
-  static int64_t copy_engine_marked(int64_t handle) {
-    return find(handle)->host_copy_backend().marked();
+  // Test only: a writer thread rewrites one record in a loop in the post kernel's seqlock order (seq = 0, fence,
+  // payload, fence, a new seq) while this thread reads it with read_record. Every field of round r derives from r, so
+  // a torn read shows. out = {records accepted, accepted records whose payload is not their seq's}.
+  static void seqlock_stress(int64_t duration_ns, TensorView out) {
+    if constexpr (!Build::kFaults) {
+      test_only("seqlock_stress");
+    } else {
+      {
+        using namespace host;
+        auto cpu = SymbolicDevice{};
+        expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+      }
+      alignas(64) uint8_t record[kRecordBytes] = {};
+      std::atomic<bool> done{false};
+      const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
+      std::thread writer([&] {
+        for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
+          const uint16_t row = static_cast<uint16_t>(round), count = count_of(round), armed = round & 1u;
+          const int32_t id = static_cast<int32_t>(round);
+          store_release(record + kRecSeq, 0u);
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          std::memset(record + 4, 0, kRecordBytes - 4);
+          std::memcpy(record + kRecRow, &row, 2);
+          std::memcpy(record + kRecProtectCount, &count, 2);
+          std::memcpy(record + kRecArmed, &armed, 2);
+          for (int i = 0; i < count; ++i)
+            std::memcpy(record + kRecProtect + 4 * i, &id, 4);
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
+        }
+      });
+      int64_t accepted = 0, torn = 0;
+      const int64_t deadline = now_ns() + duration_ns;
+      while (now_ns() < deadline) {
+        const uint32_t seq = load_acquire(record + kRecSeq);
+        Request request;
+        if (seq == 0 || !read_record(record, seq, &request)) continue;
+        ++accepted;
+        const uint32_t round = (seq - 1u) / kDemandRecords;
+        bool whole = request.row == static_cast<uint16_t>(round) && request.armed == ((round & 1u) != 0) &&
+                     request.protect.size() == count_of(round);
+        for (int32_t id : request.protect)
+          whole = whole && id == static_cast<int32_t>(round);
+        if (!whole) ++torn;
+      }
+      done.store(true);
+      writer.join();
+      auto* result = static_cast<int64_t*>(out.data_ptr());
+      result[0] = accepted;
+      result[1] = torn;
+    }
   }
 
-  static void inject_done_stall(int64_t handle, int64_t ns) {
-    if constexpr (!Build::kFaults) {
-      test_only("inject_done_stall");
-    } else {
-      find(handle)->inject_done_stall(ns);
-    }
+  static int64_t copy_engine_marked(int64_t handle) {
+    return find(handle)->host_copy_backend().marked();
   }
 
   static void mapping(int64_t handle, int64_t row, TensorView out) {
@@ -1024,12 +1031,11 @@ struct HostExports {
   }
 
   // Test only (RamTier::inject): InstrBuild only.
-  static void
-  inject(int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands, int64_t abandon_after_batches) {
+  static void inject(int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands) {
     if constexpr (!Build::kFaults) {
       test_only("inject");
     } else {
-      find(handle)->inject(delay_ns, fail_reads != 0, after_demands, abandon_after_batches);
+      find(handle)->inject(delay_ns, fail_reads != 0, after_demands);
     }
   }
 
@@ -1065,7 +1071,7 @@ struct HostExports {
     return mask;
   }
 
-  static void layer_rows(int64_t handle, int64_t advisory, TensorView out) {
+  static void layer_rows(int64_t handle, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
@@ -1073,7 +1079,7 @@ struct HostExports {
     // Exact: RamTier::layer_rows writes one word per streamed layer through a raw pointer with no bound.
     expert_stream::verify_named(
         "out", TensorMatcher({tier->layers()}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    tier->layer_rows(static_cast<int64_t*>(out.data_ptr()), advisory != 0);
+    tier->layer_rows(static_cast<int64_t*>(out.data_ptr()));
   }
 
   static int64_t trace_words() {
@@ -1107,136 +1113,6 @@ struct HostExports {
 
   static int64_t trace_dropped(int64_t handle) {
     return find(handle)->trace_dropped();
-  }
-
-  // ---- Host-side simulated device: the post and wait kernels' protocol, for CPU tests ----
-
-  static int64_t sim_post(
-      TensorView page,
-      int64_t row,
-      TensorView need,
-      TensorView protect,
-      int64_t advisory,
-      int64_t after,
-      int64_t armed,
-      int64_t lanes) {
-    auto* base = static_cast<uint8_t*>(page.data_ptr());
-    const int64_t head_word = advisory ? kAdviseHead : kDemandHead;
-    uint32_t seq = load_acquire(base + head_word) + 1u;
-    if (seq == 0) seq = 1;
-    uint8_t* record =
-        base + record_offset(advisory ? kAdviseRing : kDemandRing, advisory ? kAdviseRecords : kDemandRecords, seq);
-    const auto need_ids = ids_of(need);
-    const auto protect_ids = ids_of(protect);
-    const uint16_t row16 = static_cast<uint16_t>(row);
-    const uint16_t need_count = static_cast<uint16_t>(std::min<size_t>(need_ids.size(), kMaxIds));
-    const uint16_t protect_count = static_cast<uint16_t>(std::min<size_t>(protect_ids.size(), kMaxIds));
-    const uint16_t pending = 0;
-    const uint32_t after32 = static_cast<uint32_t>(after);
-    const uint32_t armed32 = armed != 0 ? 1u : 0u;
-    // Seqlock writer: invalidate seq, fence, payload, fence, seq last (a lapped record
-    // still being rewritten can never carry a valid seq).
-    store_release(record + kRecSeq, 0u);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    std::memset(record + 4, 0, kRecordBytes - 4);
-    std::memcpy(record + kRecRow, &row16, 2);
-    std::memcpy(record + kRecNeedCount, &need_count, 2);
-    std::memcpy(record + kRecProtectCount, &protect_count, 2);
-    std::memcpy(record + kRecStatus, &pending, 2);
-    std::memcpy(record + kRecAfter, &after32, 4);
-    std::memcpy(record + kRecArmed, &armed32, 4);
-    const uint32_t lanes32 = static_cast<uint32_t>(std::max<int64_t>(0, lanes));
-    std::memcpy(record + kRecLanes, &lanes32, 4);
-    if (need_count) std::memcpy(record + kRecNeed, need_ids.data(), 4 * need_count);  // data() may be null when empty
-    if (protect_count) std::memcpy(record + kRecProtect, protect_ids.data(), 4 * protect_count);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    store_release(record + kRecSeq, seq);  // payload first, seq last (the seqlock order)
-    store_release(base + head_word, seq);
-    return seq;
-  }
-
-  // The wait kernel's decision rule: 1 served, 2 failed, 0 timed out (both raise fatal),
-  // 3 fatal already raised (the sticky fast path).
-  static int64_t sim_wait(TensorView page, int64_t seq, int64_t timeout_ns) {
-    auto* base = static_cast<uint8_t*>(page.data_ptr());
-    const uint32_t want = static_cast<uint32_t>(seq);
-    if (load_acquire(base + kFatal) != 0) return 3;
-    const int64_t deadline = now_ns() + timeout_ns;
-    auto raise_fatal = [&] {
-      uint32_t zero = 0;
-      __atomic_compare_exchange_n(
-          reinterpret_cast<uint32_t*>(base + kFatal), &zero, want, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
-    };
-    while (!reached(load_acquire(base + kDemandDone), want)) {
-      if (now_ns() > deadline) {
-        raise_fatal();
-        return 0;
-      }
-      std::this_thread::sleep_for(std::chrono::microseconds(20));
-    }
-    const uint8_t* record = base + record_offset(kDemandRing, kDemandRecords, want);
-    const uint16_t status = __atomic_load_n(reinterpret_cast<const uint16_t*>(record + kRecStatus), __ATOMIC_ACQUIRE);
-    if (status == kServed) return 1;
-    raise_fatal();
-    return 2;
-  }
-
-  // Test only: a writer thread rewrites one record in a loop with the post kernel's seqlock
-  // order (seq = 0, fence, payload, fence, a new seq) while this thread reads it with
-  // read_record. out = {records accepted, accepted records whose payload is not their seq's}.
-  static void seqlock_stress(int64_t duration_ns, TensorView out) {
-    if constexpr (!Build::kFaults) {
-      test_only("seqlock_stress");
-    } else {
-      {
-        using namespace host;
-        auto cpu = SymbolicDevice{};
-        expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-      }
-      alignas(64) uint8_t record[kRecordBytes] = {};
-      std::atomic<bool> done{false};
-      const auto expected_ids = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
-      std::thread writer([&] {
-        for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
-          const uint16_t row = static_cast<uint16_t>(round), count = expected_ids(round);
-          const int32_t id = static_cast<int32_t>(round);
-          store_release(record + kRecSeq, 0u);
-          std::atomic_thread_fence(std::memory_order_seq_cst);
-          std::memset(record + 4, 0, kRecordBytes - 4);
-          std::memcpy(record + kRecRow, &row, 2);
-          std::memcpy(record + kRecNeedCount, &count, 2);
-          std::memcpy(record + kRecProtectCount, &count, 2);
-          std::memcpy(record + kRecAfter, &round, 4);
-          for (int i = 0; i < count; ++i) {
-            std::memcpy(record + kRecNeed + 4 * i, &id, 4);
-            std::memcpy(record + kRecProtect + 4 * i, &id, 4);
-          }
-          std::atomic_thread_fence(std::memory_order_seq_cst);
-          store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
-        }
-      });
-      int64_t accepted = 0, torn = 0;
-      const int64_t deadline = now_ns() + duration_ns;
-      while (now_ns() < deadline) {
-        const uint32_t seq = load_acquire(record + kRecSeq);
-        Request request;
-        if (seq == 0 || !read_record(record, seq, &request)) continue;
-        ++accepted;
-        const uint32_t round = (seq - 1u) / kDemandRecords;
-        bool whole = request.after == round && request.row == static_cast<uint16_t>(round) &&
-                     request.need.size() == expected_ids(round) && request.protect.size() == expected_ids(round);
-        for (int32_t id : request.need)
-          whole = whole && id == static_cast<int32_t>(round);
-        for (int32_t id : request.protect)
-          whole = whole && id == static_cast<int32_t>(round);
-        if (!whole) ++torn;
-      }
-      done.store(true);
-      writer.join();
-      auto* result = static_cast<int64_t*>(out.data_ptr());
-      result[0] = accepted;
-      result[1] = torn;
-    }
   }
 
   static void start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns) {
@@ -1285,15 +1161,14 @@ struct HostExports {
       const auto owner = registry().find(handle);
       if (owner != registry().end()) tier = owner->second;
     }
-    // Before the join: an in-flight replay's copy wait would otherwise wait for a service that is gone.
-    if (tier) tier->abort_copy_waits();
+    // Before the join: an in-flight replay's copy wait would otherwise wait for a copy thread that is gone.
+    if (tier) tier->open_closed_gate();
     thread->stop();
-    // The final settle (LEASE_PROTOCOL.md 7.5): no demand follows the last one to settle it, so a late second signal
-    // on it is compared here, before ExpertStreamHost.stop writes its counters line. Here and not in RamThread::stop,
-    // which ~RamThread also runs and which could then read a lease page the Python side already freed; at this point
-    // the thread has joined and the page is still alive, because close() runs after this call.
-    // A fill still running (a stop mid-pause) is joined and its epilogue run first; then the COPYING leases handed back
-    // after the service's last poll, then the settle.
+    // The final settle: the leases whose Done or copy completion landed after the service's last poll are released
+    // here, before ExpertStreamHost.stop writes its counters line. Here and not in RamThread::stop, which ~RamThread
+    // also runs and which could then read a lease page the Python side already freed; at this point the thread has
+    // joined and the page is still alive, because close() runs after this call. A fill still running (a stop
+    // mid-pause) is joined and its epilogue run first.
     if (tier) tier->final_settle();
   }
 
@@ -1326,7 +1201,7 @@ struct HostExports {
       }
     }
     // A service still running also ends any armed copy wait first (its lease block is alive: the thread uses it).
-    if (thread && tier) tier->abort_copy_waits();
+    if (thread && tier) tier->open_closed_gate();
     if (thread) thread->stop();
   }
 };
@@ -1363,11 +1238,8 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_victim_census, Exports::victim_census);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_busy_episode, Exports::busy_episode);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_close_admission, Exports::close_admission);               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_lease_mode, Exports::set_lease_mode);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_gpu_hot, Exports::set_gpu_hot);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_prefill_share, Exports::set_prefill_share);           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_two_phase, Exports::set_two_phase);                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_piece_stream, Exports::set_piece_stream);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_copy_engine, Exports::enable_copy_engine);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_copy_table, Exports::set_copy_table);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_arm_copy_engine, Exports::arm_copy_engine);               \
@@ -1377,13 +1249,11 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_idle, Exports::copy_engine_idle);             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_native_prefetch, Exports::enable_native_prefetch); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_prefetch_lease, Exports::prefetch_lease);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_release, Exports::copy_engine_release);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_fail, Exports::copy_engine_fail);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_marked, Exports::copy_engine_marked);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_ballast, Exports::copy_engine_ballast);       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_done_stall, Exports::inject_done_stall);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);            \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_mapping, Exports::mapping);                               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_to_expert, Exports::slot_to_expert);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lru_order, Exports::lru_order);                           \
@@ -1398,9 +1268,6 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_drain, Exports::trace_drain);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_dropped, Exports::trace_dropped);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_sim_post, Exports::sim_post);                             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_sim_wait, Exports::sim_wait);                             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_start_thread, Exports::start_thread);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_stop_thread, Exports::stop_thread);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause, Exports::pause);                                   \
