@@ -1,6 +1,7 @@
 // The expert-stream host FFI surface, written once for every row layout and file reader. An instantiation file
-// names a layout, a reader and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS; see
-// exl3_ram_miss_host.cpp (ProdBuild) and exl3_ram_miss_host_instr.cpp (InstrBuild).
+// names a layout, a reader and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and
+// EXPERT_STREAM_HOST_TEST_EXPORTS (ffi_test_exports.h); see exl3_ram_miss_host.cpp (ProdBuild) and
+// exl3_ram_miss_host_instr.cpp (InstrBuild).
 #pragma once
 
 #include <sgl_kernel/tensor.h>
