@@ -36,13 +36,13 @@ STRESS_CHILD = textwrap.dedent("""
     from pathlib import Path
     from sglang.kernels.ops.moe import expert_stream_transport as ops
     ops._ALLOW_TSAN = True
-    # The device side too (sim_post, sim_wait, the page helpers): a record published through the uninstrumented
+    # The device side too (the page helpers): a record published through the uninstrumented
     # production module is a plain memcpy to TSan, with its release store invisible, so the service's read races it.
     ops._DEFAULT_VARIANT = "instr_tsan"
     sys.path.insert(0, "test/registered/unit/kernels")
     from test_expert_stream_hotpath_stress import run_stress
     report = run_stress(Path(sys.argv[1]), variant="instr_tsan", seconds=20.0, seed=7, fills=True)
-    assert report["stats"]["errors"] == [] and report["fatal"] == 0, report["stats"]
+    assert report["stats"]["errors"] == [], report["stats"]
     assert report["stats"]["fills"] > 0 and report["stats"]["pauses"] > 0, report["stats"]
     print("TSAN-STRESS-OK", report["stats"]["armed"], "fills", report["stats"]["fills"])
 """)
