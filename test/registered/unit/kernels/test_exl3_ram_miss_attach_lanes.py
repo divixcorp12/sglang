@@ -80,6 +80,26 @@ def test_a_gather_wider_than_the_lanes_is_refused_before_anything_is_built(tiers
     assert not hasattr(streamers[1].row_backend, "device_side")  # the layer keeps its previous backend
 
 
+
+def test_cpu_experts_refuse_a_manager_without_direct_residency(tiers):
+    """The miss order CPU experts rely on is DIRECT's victim ranking; without the updater there is none to sort by."""
+    service, streamers = tiers
+    service.ensure_started()
+    service.cpu_experts = object()
+    try:
+        with pytest.raises(RuntimeError, match="needs DIRECT residency"):
+            _attach(service, streamers[0], 1)
+    finally:
+        service.cpu_experts = None
+
+
+def test_cpu_experts_refuse_the_generic_route_plan():
+    """Only the fused plan sorts the miss lanes; refused before the host is touched."""
+    cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
+    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"), envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False):
+        with pytest.raises(RuntimeError, match="needs SGLANG_MOE_EXPERT_FUSED_PLAN"):
+            module.Exl3RamMissService._start_cpu_experts(cfg, None, None, {}, False)
+
 if __name__ == "__main__":
     import sys
 
