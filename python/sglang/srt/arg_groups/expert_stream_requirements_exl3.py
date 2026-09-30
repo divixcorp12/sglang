@@ -155,6 +155,10 @@ def _check_cpu_experts(budgets) -> None:
     missing = [name for name, ok in needs if not ok]
     if missing:
         raise ValueError("SGLANG_DSV41_CPU_EXPERTS needs " + ", ".join(missing))
+    if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
+        # The pull join rewrites a route's slot after planning; a CPU lane's route would then match no plan slot, and
+        # the fused MoE would compute it on top of the CPU's partial.
+        raise ValueError("SGLANG_DSV41_CPU_EXPERTS cannot run with SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE; set it to off")
 
 
 exl3_expert_stream_requirements = ExpertStreamRequirements(

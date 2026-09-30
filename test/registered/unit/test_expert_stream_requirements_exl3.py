@@ -361,3 +361,13 @@ def test_cpu_experts_need_the_captured_decode_graph(model_dir):
     # Graph gather off: it is refused under eager decode on its own, before the CPU-experts rule.
     with pytest.raises(ValueError, match="--cuda-graph-backend-decode breakable"):
         _gate(_launch(model_dir), **{**CPU_EXPERTS_ENV, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False})
+
+
+def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
+    """The join moves a route to the pulled slot after planning: a CPU lane's route would match no plan slot and be
+    computed on the GPU as well as on the CPU."""
+    with pytest.raises(ValueError, match="PREFETCH_PULL_MODE"):
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            **{**CPU_EXPERTS_ENV, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE": "always"},
+        )

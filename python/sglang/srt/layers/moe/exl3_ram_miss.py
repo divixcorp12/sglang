@@ -841,6 +841,8 @@ class Exl3RamMissService:
             raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE")
         if not cfg.enable_layer_fusion:
             raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_LAYER_FUSION")
+        if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
+            raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS cannot run with the prefetch pull join")
         cores, threads = cpu_expert_cores()
         # Rows in layer order, as exl3_ram_miss_tables numbers them.
         caches = {row: s.pinned_host_cache.tensors for row, (_, s) in enumerate(sorted(streamers.items()))}
