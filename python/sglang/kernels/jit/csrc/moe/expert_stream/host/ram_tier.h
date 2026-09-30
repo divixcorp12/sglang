@@ -646,9 +646,9 @@ class RamTier {
   }
 
   // CPU experts (plan 2026-09-29-dsv41-cpu-experts, "Step B"): of a copy-engine request's resident lanes, the grant
-  // publishes the last split[n] (n = those lanes, at most kLeaseLanes) with tag kLeaseTagCpu, and the copy thread hands them to
-  // the CPU expert thread instead of copying them. Needs the copy engine; before the service thread starts. Only a
-  // captured post (kLeaseLrFlagCaptured) gets CPU lanes: only it stages the layer's input row for them.
+  // publishes the last split[n] (n = those lanes, at most kLeaseLanes) with tag kLeaseTagCpu, and the copy thread
+  // hands them to the CPU expert thread instead of copying them. Needs the copy engine; before the service thread
+  // starts. Only a captured post (kLeaseLrFlagCaptured) gets CPU lanes: only it stages the layer's input row for them.
   void enable_cpu_experts(CpuExpertConfig config, std::vector<int64_t> split) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");

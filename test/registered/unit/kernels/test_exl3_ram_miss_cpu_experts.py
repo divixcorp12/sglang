@@ -1,12 +1,14 @@
-"""CPU experts' host half (CPU; plan 2026-09-29-dsv41-cpu-experts, "Step B"): the grant's CPU lanes and their completion.
+"""CPU experts' host half (CPU; plan 2026-09-29-dsv41-cpu-experts, "Step B"): the grant's CPU lanes and their
+completion.
 
 The service's grant tags the last ``split[n]`` of a copy-engine request's n resident lanes CPU (RowResult tag 4) when
-the post carried CPU input and the row is registered; the device plan sorts miss lanes highest-scored first. The copy thread hands those lanes to the CPU expert thread and copies only
-the rest; CopyDone carries the whole mask once both are done. The forward here is a ctypes fake that records its calls
+the post carried CPU input and the row is registered; the device plan sorts miss lanes highest-scored first. The copy
+thread hands those lanes to the CPU expert thread and copies only the rest; CopyDone carries the whole mask once both
+are done. The forward here is a ctypes fake that records its calls
 and writes a known partial sum.
 
-The fake runs on the CPU expert thread and needs the GIL, which the host's blocking calls hold, so every wait for the CPU
-lanes polls from Python (``_wait``) before any blocking call such as ``copy_engine_idle``.
+The fake runs on the CPU expert thread and needs the GIL, which the host's blocking calls hold, so every wait for the
+CPU lanes polls from Python (``_wait``) before any blocking call such as ``copy_engine_idle``.
 """
 
 import ctypes
@@ -204,8 +206,8 @@ def test_a_request_the_cpu_may_not_take_is_copied_as_before(tmp_path, case):
 
 
 def test_the_cpu_takes_the_last_job_lanes_past_a_loading_lane(tmp_path):
-    """Three resident lanes around a miss, split[3] = 2: the last two job lanes (1 and 3) go to the CPU, the LOADING lane
-    2 is not a job lane and does not count, and lane 0, the plan's highest-scored miss, is copied."""
+    """Three resident lanes around a miss, split[3] = 2: the last two job lanes (1 and 3) go to the CPU, the LOADING
+    lane 2 is not a job lane and does not count, and lane 0, the plan's highest-scored miss, is copied."""
     forward = FakeForward()
     s, page, host, sim, dst, out_rows = _host(tmp_path, split=_split(n3=2), forward=forward)
     try:

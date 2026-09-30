@@ -144,7 +144,8 @@ def test_the_low_scored_ram_hit_goes_to_the_cpu_and_the_high_scored_one_takes_th
         assert int(dev.cpu_lanes.item()) == 0b10
         want = c.expected([high], row)
         for n in c.names:
-            assert torch.equal(snapshot[n][3].cpu().contiguous().view(torch.uint8), want[n][0].contiguous().view(torch.uint8))
+            got = snapshot[n][3].cpu().contiguous().view(torch.uint8)
+            assert torch.equal(got, want[n][0].contiguous().view(torch.uint8))
             assert not snapshot[n][5].view(torch.uint8).any(), f"{n}: the CPU lane's victim was copied into"
 
         insertions, evictions, truncated = (torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(3))

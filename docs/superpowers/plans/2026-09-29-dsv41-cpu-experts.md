@@ -431,7 +431,7 @@ copy engine's job for the request, so the chain is unchanged: post → W1 → C1
 - `SGLANG_DSV41_CPU_EXPERTS_SPLIT`: an explicit 9-entry table.
 - Otherwise `k*(n)` from `_CPU_MS` (0.52), `_LINK_MS` (1.0) and `_HANDOFF_MS` (0.02).
 - `_THREADS`, `_RETUNE_BATCHES`.
-- NUMA preference follows `SGLANG_MOE_PINNED_HOST_NUMA_MB`.
+- No NUMA preference: the CPU takes the last `split[n]` lanes, which the device sorts lowest-scored last.
 
 **Caveat: residency under DIRECT.** A CPU-computed expert is never inserted into VRAM. Its slot is not copied, so
 the commit must not map it. Experts the CPU takes stop competing for hot slots through insert-on-miss. This changes
