@@ -932,6 +932,59 @@ struct HostExports {
     }
   }
 
+  // Test only: a writer thread rewrites one record in a loop in the post kernel's seqlock order (seq = 0, fence,
+  // payload, fence, a new seq) while this thread reads it with read_record. Every field of round r derives from r, so
+  // a torn read shows. out = {records accepted, accepted records whose payload is not their seq's}.
+  static void seqlock_stress(int64_t duration_ns, TensorView out) {
+    if constexpr (!Build::kFaults) {
+      test_only("seqlock_stress");
+    } else {
+      {
+        using namespace host;
+        auto cpu = SymbolicDevice{};
+        expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+      }
+      alignas(64) uint8_t record[kRecordBytes] = {};
+      std::atomic<bool> done{false};
+      const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
+      std::thread writer([&] {
+        for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
+          const uint16_t row = static_cast<uint16_t>(round), count = count_of(round), armed = round & 1u;
+          const int32_t id = static_cast<int32_t>(round);
+          store_release(record + kRecSeq, 0u);
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          std::memset(record + 4, 0, kRecordBytes - 4);
+          std::memcpy(record + kRecRow, &row, 2);
+          std::memcpy(record + kRecProtectCount, &count, 2);
+          std::memcpy(record + kRecArmed, &armed, 2);
+          for (int i = 0; i < count; ++i)
+            std::memcpy(record + kRecProtect + 4 * i, &id, 4);
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
+        }
+      });
+      int64_t accepted = 0, torn = 0;
+      const int64_t deadline = now_ns() + duration_ns;
+      while (now_ns() < deadline) {
+        const uint32_t seq = load_acquire(record + kRecSeq);
+        Request request;
+        if (seq == 0 || !read_record(record, seq, &request)) continue;
+        ++accepted;
+        const uint32_t round = (seq - 1u) / kDemandRecords;
+        bool whole = request.row == static_cast<uint16_t>(round) && request.armed == ((round & 1u) != 0) &&
+                     request.protect.size() == count_of(round);
+        for (int32_t id : request.protect)
+          whole = whole && id == static_cast<int32_t>(round);
+        if (!whole) ++torn;
+      }
+      done.store(true);
+      writer.join();
+      auto* result = static_cast<int64_t*>(out.data_ptr());
+      result[0] = accepted;
+      result[1] = torn;
+    }
+  }
+
   static int64_t copy_engine_marked(int64_t handle) {
     return find(handle)->host_copy_backend().marked();
   }
@@ -1200,6 +1253,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_fail, Exports::copy_engine_fail);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_marked, Exports::copy_engine_marked);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_ballast, Exports::copy_engine_ballast);       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);            \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_mapping, Exports::mapping);                               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_to_expert, Exports::slot_to_expert);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lru_order, Exports::lru_order);                           \

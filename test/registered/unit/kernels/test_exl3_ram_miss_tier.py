@@ -303,6 +303,7 @@ def _test_only_entry(case):
     module = expert_stream_transport._host_module()
     return {
         "publish_piece:word": ("word", 1, lambda b: module.expert_stream_publish_piece(b, 0, 1)),
+        "seqlock_stress:out": ("out", 2, lambda b: module.expert_stream_seqlock_stress(1_000_000, b)),
     }[case]
 
 
@@ -311,6 +312,7 @@ def _test_only_entry(case):
     "case",
     [
         "publish_piece:word",
+        "seqlock_stress:out",
     ],
 )
 def test_a_test_only_entrys_fixed_extent_buffer_of_the_wrong_size_is_refused_before_any_write(case, delta):
@@ -322,6 +324,13 @@ def test_a_test_only_entrys_fixed_extent_buffer_of_the_wrong_size_is_refused_bef
     with pytest.raises(RuntimeError, match=rf"^{name}: (?s:.*)expected {expected} but got {expected + delta}"):
         call(backing[: expected + delta])
     assert backing.eq(sentinel).all(), "the refusal came after a write"
+
+
+def test_the_seqlock_reader_never_accepts_a_torn_record():
+    """read_record against a writer thread rewriting one record in the post kernel's seqlock order: a record read
+    while its payload changes must be refused. Mutant: drop read_record's second seq load -- torn records accepted."""
+    accepted, torn = expert_stream_transport.seqlock_stress(seconds=1.0)
+    assert accepted > 100 and torn == 0, (accepted, torn)
 
 
 _MAPPING_ROW = """

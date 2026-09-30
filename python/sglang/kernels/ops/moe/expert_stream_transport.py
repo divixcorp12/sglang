@@ -79,6 +79,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "copy_engine_fail",
     "copy_engine_ballast",
     "trace_clock_reads",
+    "seqlock_stress",
 )
 
 
@@ -576,7 +577,7 @@ STAGE_FIELDS = (
     *(f"piece_publish_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
     "pieces_published", "pieces_out_of_order", "piece_publish_refused",
 )
-STAGE_KINDS = ("demand", "advisory", "touch")
+STAGE_KINDS = ("demand", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
 STAGE_STATUSES = ("none", "served", "no_read", "failed", "cancelled", "touch")
 # The order of the time stamps within a request. The non-zero ones never decrease along it EXCEPT
@@ -751,6 +752,14 @@ CORE_COUNTERS = (
     "deferred_reuse",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
+
+
+def seqlock_stress(seconds: float, *, layout: str = "exl3", variant: Optional[str] = None) -> tuple[int, int]:
+    """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted). Instrumented build only."""
+    _refuse_test_only("seqlock_stress", variant)
+    out = torch.zeros(2, dtype=torch.int64)
+    _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
+    return int(out[0]), int(out[1])
 
 
 def new_page(pin: bool) -> torch.Tensor:

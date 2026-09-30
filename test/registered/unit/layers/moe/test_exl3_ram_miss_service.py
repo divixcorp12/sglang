@@ -731,7 +731,7 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     service.routed_rows_per_step = 12  # 6 routed rows in each of the two layers
     counters = {"rows_read": 0}
     service.host = SimpleNamespace(
-        fatal_seq=lambda: 0, layer_rows=lambda: demand_rows[0], counters=lambda: dict(counters)
+        layer_rows=lambda: demand_rows[0], counters=lambda: dict(counters)
     )
 
     manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])
@@ -779,7 +779,7 @@ def test_graph_trace_defers_cuda_readback_until_a_later_check(monkeypatch):
     service.routed_rows_per_step = 12
     demand_rows = [[0, 0]]
     service.host = SimpleNamespace(
-        fatal_seq=lambda: 0, layer_rows=lambda: demand_rows[0], counters=lambda: {"rows_read": 3}
+        layer_rows=lambda: demand_rows[0], counters=lambda: {"rows_read": 3}
     )
 
     service.fail_stop_check()  # enqueue baseline; no device readback on this call
