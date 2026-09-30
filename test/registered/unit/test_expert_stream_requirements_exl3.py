@@ -358,23 +358,28 @@ FULL_BS1 = CudaGraphConfig(
 )
 
 
+# With decode graphs disabled, the generic rule "graph gather requires decode CUDA graphs" refuses first;
+# graph gather off is how a disabled launch reaches the EXL3 rules.
+_EAGER_DECODE = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": False}
+
+
 @pytest.mark.parametrize(
-    "changes",
+    "changes, env",
     [
-        {},  # both phases disabled
-        {"cuda_graph_config": FULL_BS1},
-        {"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1},
-        {"speculative_algorithm": "DSPARK"},
+        ({}, _EAGER_DECODE),  # both phases disabled
+        ({"cuda_graph_config": FULL_BS1}, {}),
+        ({"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1}, {}),
+        ({"speculative_algorithm": "DSPARK"}, _EAGER_DECODE),
     ],
     ids=["disabled", "full", "spec-breakable", "spec-disabled"],
 )
-def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(model_dir, changes):
+def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(model_dir, changes, env):
     """Refused before the speculative and backend rules, which would each send the launch to the other's backend.
 
     The refusal never suggests disabled decode graphs.
     """
     with pytest.raises(ValueError, match="breakable, without speculative decoding") as refused:
-        _gate(_launch(model_dir, **changes), **CPU_EXPERTS_ENV)
+        _gate(_launch(model_dir, **changes), **{**CPU_EXPERTS_ENV, **env})
     assert "disabled" not in str(refused.value)
 
 
