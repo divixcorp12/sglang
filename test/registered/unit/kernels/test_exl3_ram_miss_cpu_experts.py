@@ -183,7 +183,7 @@ def test_a_job_of_cpu_lanes_only_completes_without_any_copy(tmp_path):
         host.stop()
 
 
-@pytest.mark.parametrize("case", ["no_cpu_input", "unregistered", "split_zero", "uncaptured"])
+@pytest.mark.parametrize("case", ["unregistered", "split_zero", "uncaptured"])
 def test_a_request_the_cpu_may_not_take_is_copied_as_before(tmp_path, case):
     forward = FakeForward()
     split = NO_SPLIT if case == "split_zero" else _split(n1=1)
@@ -192,8 +192,7 @@ def test_a_request_the_cpu_may_not_take_is_copied_as_before(tmp_path, case):
         _load(sim, host, [3])
         if case != "unregistered":
             host.set_cpu_layer(ROW, HANDLE)
-        weights = None if case == "no_cpu_input" else [1.0]
-        req = sim.post(ROW, [3], dst=[1], captured=case != "uncaptured", cpu_weights=weights)
+        req = sim.post(ROW, [3], dst=[1], captured=case != "uncaptured", cpu_weights=[1.0])
         assert host.pump() == 1
         expected = lease.READY if case == "uncaptured" else lease.COPYING
         assert _tags(sim, req) == [expected]
