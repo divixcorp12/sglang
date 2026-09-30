@@ -381,3 +381,68 @@ $PY scripts/dsv41/cpu_expert_sim.py $O/stages.jsonl --out /mnt/nvme1/cpu-p1/nati
 - The absolute predicted level (~71 ms, 14 tok/s) is above the plan's 55-65 ms [estimate]; the P3 items and the
   swizzled layout (64 ms) are what move it there.
 - P2 should still measure the interaction the model omits: c_cpu under concurrent NVMe DMA and H2D load.
+
+---
+
+## Step B design: CPU lanes inside the lease chain (2026-09-29, `8ab995ee6b`)
+
+P2's in-graph prototype. Where this differs from §4, this section is what the code does.
+
+**Where the CPU runs.** Not a separate gate after the resident experts (§4 item 3). The CPU lanes are part of the
+copy engine's job for the request, so the chain is unchanged: post → W1 → C1 → A1 → S → A2 → CW → F → fused MoE.
+- The service's grant (`RamTier::grant_lane_group_locked`) takes `split[n]` of a copy-engine request's n resident
+  lanes and tags them `kLeaseTagCpu` (RowResult tag 4) instead of COPYING. It prefers host slots on the pool's NUMA
+  node, then lane order.
+- It does so only when the post carried CPU input (`kLeaseLrFlagCpuExperts`) and the row has a registered layer.
+- The copy thread submits the CPU lanes to the CPU expert thread (`host/cpu_experts.h`) and DMAs only the rest.
+  A job with no DMA lane has no token to query.
+- A job completes only when both halves are done. CopyDone then carries the whole mask, so the leases, E6, the
+  copy wait's gate and the fail-stop keep their one publisher.
+- A failed forward is never marked done: the leases stay held (E5), the job fails, and the fatal word is raised.
+- So the CPU overlaps S's NVMe reads and the other lanes' link copies. That is the overlap P1's
+  `max(handoff + k*c_cpu, (n-k)*c_link)` models. The GPU's resident experts run after CW, as before.
+
+**Device side.**
+- The post (all 32 threads) stages x as fp16 in the row's pinned `x_rows[row]`. Thread 0 writes each lane's routing
+  weight (the sum over routes naming its expert) at LaneRequest offset 84.
+- The copy wait's commit writes the CPU lane mask to `cpu_lanes` on success, and 0 otherwise.
+- Layer fusion's route tables rank a CPU route's slot as `columns`, past every slot, so its slot counts 0.
+  Zeroing the count alone would be wrong: `exl3_moe` indexes `weight_sorted` by a running sum of `expert_count`, so
+  a CPU route ranked at its real slot would give its neighbours shifted weights.
+- The fp32 output is seeded from the host partial (`__ldcv`) when the layer is kept, so the routed scaling that
+  follows applies to both halves.
+- DIRECT's commit leaves CPU lanes unmapped (`live &= !cpu`) and discounts them from the truncation tripwire.
+
+**Python.**
+- `CpuExpertService` (`cpu_experts/service.py`) is quant-agnostic behind `CpuExpertQuantTrait`. A format adds a
+  trait with a C ABI `native_forward` and `hidden_size`; EXL3's is the vendored `moe_mul1.cpp` export, built with
+  the residual/block flavor.
+- Layers register lazily at their first graph-path forward (a warmup, before capture), the only place that knows
+  `swiglu_limit`. The kernel's cores are set before the first registration.
+- `retune()` recomputes the split from the measured ns per CPU lane every `SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES`
+  batches (0 keeps the startup table). The link and handoff costs stay configured.
+
+**Requirements, refused at launch.**
+- Breakable BS1 decode graph, graph gather, two-phase, piece stream, copy engine, layer fusion, and
+  `SGLANG_DSV41_CPU_EXPERTS_CORES`. The CPU input is posted only while capturing.
+- Also `EXL3_MOE_CPU_PIN=0`.
+
+**Knobs.**
+- `SGLANG_DSV41_CPU_EXPERTS_SPLIT`: an explicit 9-entry table.
+- Otherwise `k*(n)` from `_CPU_MS` (0.52), `_LINK_MS` (1.0) and `_HANDOFF_MS` (0.02).
+- `_THREADS`, `_RETUNE_BATCHES`.
+- NUMA preference follows `SGLANG_MOE_PINNED_HOST_NUMA_MB`.
+
+**Caveat: residency under DIRECT.** A CPU-computed expert is never inserted into VRAM. Its slot is not copied, so
+the commit must not map it. Experts the CPU takes stop competing for hot slots through insert-on-miss. This changes
+the hot set's dynamics against the P1 replay, which assumed today's insertions. §4 item 5 (count a CPU lane as a hit
+for scoring, background promotions over the idle link) is the P3 remedy. Until then, read the hot hit rate in the A/B
+arms before reading ms/token.
+
+**Tests.**
+- CPU: `test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py` covers the grant, CPU-only jobs, the gates,
+  the NUMA preference, split checks and a failed forward, against a ctypes fake forward.
+- CPU: `test_cpu_expert_pool.py` covers the service. `test_expert_stream_requirements_exl3.py` covers the gate.
+- GPU (manual): `test_exl3_moe_split_parity_cuda.py` has a bitwise zero-partial equivalence, partial seeding, and the
+  real CPU kernel end to end over real rows. `test_exl3_lease_kernels_cuda.py` has the post staging.
+  `test_layer_fusion_launcher_checks_gpu.py` has the refusals.
