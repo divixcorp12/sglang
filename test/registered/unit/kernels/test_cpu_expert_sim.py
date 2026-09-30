@@ -7,6 +7,9 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "dsv41"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "analysis", "dsv41-drive", "prefill-evict")
+)
 
 import tier_sim  # noqa: E402
 from cpu_expert_sim import (  # noqa: E402
@@ -21,7 +24,10 @@ from cpu_expert_sim import (  # noqa: E402
     predict,
     replay_nm,
     split_costs,
+    staging_results,
 )
+
+from ram_replay import Replay  # noqa: E402
 
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
@@ -334,6 +340,62 @@ def test_device_sorted_lanes_pair_with_victims_in_the_sorted_order(policy, resid
     sim.graph_forward({0: [5, 8, 6, 7]}, cpu_lanes=choose, lane_order=_lane_sorter(policy, sim))
     assert set(chosen[0]) == {6, 7}
     assert sim.resident(0) == resident
+
+
+def test_staging_without_ram_insert_never_grows_the_tier_on_a_decode_miss():
+    loaded = _ram_hit_loaded()
+    base = replay_nm(loaded, ram_rows=4, num_experts=8)
+    out = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="none")
+    assert base["residency"]["ram_inserted_rows_per_token"] == pytest.approx(2 / 5)
+    assert out["residency"]["ram_inserted_rows_per_token"] == 0
+    assert out["n"].tolist() == [[0]] * 5  # nothing was ever admitted, so nothing is a RAM hit
+    assert out["m"].tolist() == [[1], [1], [1], [0], [0]]  # the same VRAM residency, every miss now an NVMe read
+    assert out["residency"]["hot_hit_rate"] == base["residency"]["hot_hit_rate"]
+
+
+def test_staging_arms_share_vram_residency_without_cpu_experts():
+    loaded = _ram_hit_loaded()
+    arms = ("miss", "none", "deferred", "never")
+    hits = {arm: replay_nm(loaded, 4, 8, ram_insert=arm)["residency"]["hot_hit_rate"] for arm in arms}
+    assert len(set(hits.values())) == 1
+
+
+def test_deferred_insert_lands_after_the_forward_and_matches_baseline_hits_here():
+    loaded = _ram_hit_loaded()
+    base = replay_nm(loaded, ram_rows=4, num_experts=8)
+    out = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred")
+    assert out["n"].tolist() == base["n"].tolist()
+    assert out["residency"]["ram_inserted_rows_per_token"] == pytest.approx(2 / 5)
+
+
+def test_a_late_insert_never_evicts_a_row_the_same_request_reads():
+    replay = Replay([3], "base", True)
+    for expert in (1, 2, 4):  # stamps 1 < 2 < 4: expert 1 is the LRU victim if nothing protects it
+        replay.tiers[0].admit(expert, replay._next(), set(), set())
+    routes = [1, 3, 5]
+    missing = replay.lookup(0, routes)
+    assert missing == [3, 5] and set(replay.tiers[0].where) == {1, 2, 4}  # lookup admits nothing
+    replay.insert(0, missing, set(), set(routes))
+    assert set(replay.tiers[0].where) == {1, 3, 5}
+    with pytest.raises(RuntimeError):
+        replay.insert(0, [6], set(), {1, 3, 5})  # no unwanted victim left: it refuses instead of evicting one
+
+
+def test_ram_insert_arms_report_memcpy_only_for_the_deferred_copy():
+    args = argparse.Namespace(
+        ram_rows=4, num_experts=8, no_initial_from_log=False, numa_mb="0:1", cpu_node=0, measured_c_cpu=0.63,
+        c_link=1.0, handoff=0.02, nvme_ms=[1.5], gpu_ms=14.0, row_bytes=10.0,
+    )
+    out = staging_results(_ram_hit_loaded(), args, [0, 1, 1, 2, 3, 3, 4])
+    assert out["A_baseline"]["off"]["host_memcpy_bytes_per_token"] == 0
+    assert out["B_staging_no_ram_insert"]["on"]["ram_inserted_rows_per_token"] == 0
+    assert out["C_staging_deferred_insert"]["off"]["host_memcpy_bytes_per_token"] == pytest.approx(2 / 5 * 10.0)
+    assert out["B_staging_no_ram_insert"]["off"]["ram_hit_of_lanes"] == 0
+
+
+def test_unknown_ram_insert_is_rejected():
+    with pytest.raises(ValueError):
+        replay_nm(_ram_hit_loaded(), ram_rows=4, num_experts=8, ram_insert="staging")
 
 
 if __name__ == "__main__":
