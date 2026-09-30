@@ -1916,6 +1916,13 @@ class Envs:
     # prefill fill is still reading copies its other rows first, then waits for the fill and copies the filled rows,
     # so the GPU gathers while the NVMe reads. Same bytes in the same staging rows. Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
+    # CPU experts (plan 2026-09-29-dsv41-cpu-experts): decode computes a layer's RAM-tier experts on the CPU, in place
+    # over the pinned tier, instead of copying them over the link. Batch-1 decode only. Off by default.
+    SGLANG_DSV41_CPU_EXPERTS = EnvBool(False)
+    # Cores of the CPU expert pool, as a taskset list ("36-47,50"). At least two; empty refuses the pool.
+    SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
+    # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
+    SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
