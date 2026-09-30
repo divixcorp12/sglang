@@ -117,7 +117,7 @@ inline ReadFault fault_from(const int64_t* f) {
 // Whether fault words `f` inject a fault, i.e. set a word that arms one (the words that only narrow a fault -- the
 // call numbers, part, ordinal, sub, leg, submit_first, short_is_eof, hold_rest -- arm nothing alone, and words 17-20,
 // 22, 26, 28 and 31 are not faults). A production host has no fault state and refuses a tensor for which this is true
-// (HostExports::install_fault); it needs no ReadFault to decide.
+// (HostTestExports::install_fault); it needs no ReadFault to decide.
 inline bool injects_fault(const int64_t* f) {
   return f[0] != 0 || f[3] != 0 || f[6] != 0 || f[7] != 0 || f[8] != 0 || f[9] > 0 || f[10] > 0 || f[11] != 0 ||
          f[12] > 0 || f[13] != 0 || f[14] != 0 || f[16] >= 0 || f[24] > 0 || f[27] > 0 || f[30] != 0;

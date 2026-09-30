@@ -1,7 +1,7 @@
-// The expert-stream host FFI surface, written once for every row layout and file reader. An instantiation file
-// names a layout, a reader and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and
-// EXPERT_STREAM_HOST_TEST_EXPORTS (ffi_test_exports.h); see exl3_ram_miss_host.cpp (ProdBuild) and
-// exl3_ram_miss_host_instr.cpp (InstrBuild).
+// The expert-stream host FFI surface the server uses (the test-only exports are in ffi_test_exports.h), written once
+// for every row layout and file reader. An instantiation file names a layout, a reader and a build policy
+// (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and EXPERT_STREAM_HOST_TEST_EXPORTS; see
+// exl3_ram_miss_host.cpp (ProdBuild) and exl3_ram_miss_host_instr.cpp (InstrBuild).
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -15,8 +15,9 @@ namespace sglang::expert_stream {
 
 using tvm::ffi::TensorView;
 
-/// \brief Every host export of one transport instantiation. Its function-local registries are per instantiation,
-/// and each layout is its own module, so one layout's handles can never resolve in another's.
+/// \brief The server-facing host exports of one transport instantiation; HostTestExports adds the test-only ones.
+/// The function-local registries are per instantiation, and each layout is its own module, so one layout's
+/// handles can never resolve in another's.
 template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 struct HostExports {
   static_assert(BuildPolicy<Build>);
@@ -556,7 +557,7 @@ struct HostExports {
 
 }  // namespace sglang::expert_stream
 
-// One line per export; the list is the module's whole Python-visible surface.
+// One line per export; this list and ffi_test_exports.h's are the module's whole Python-visible surface.
 #define EXPERT_STREAM_HOST_EXPORTS(Exports)                                                             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_build_name, Exports::build_name);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_names, Exports::layout_names);                     \

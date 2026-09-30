@@ -394,8 +394,9 @@ def test_the_device_side_passes_each_rows_capacity_to_the_hit_wait_launch():
 
 @pytest.mark.parametrize("name", ["exl3_ram_miss_host.cpp", "exl3_ram_miss_host_instr.cpp"])
 def test_the_exl3_host_file_is_only_bindings(name):
-    """Every export body lives once, in HostExports (expert_stream/host/ffi_exports.h); each EXL3 file (one per build)
-    only names its layout, reader and build. Red when a body grows back into one of them."""
+    """Every export body lives once, in HostExports or HostTestExports (expert_stream/host/ffi_exports.h,
+    ffi_test_exports.h); each EXL3 file (one per build) only names its layout, reader and build. Red when a body grows
+    back into one of them."""
     path = CSRC / name
     lines = path.read_text().splitlines()
     bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]
