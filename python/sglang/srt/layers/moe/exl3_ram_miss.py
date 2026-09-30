@@ -453,12 +453,16 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         captured = self.copy_engine and torch.cuda.is_current_stream_capturing()
         if captured and self.cpu_experts and self.cpu_input is None:
             raise RuntimeError(f"CPU experts: row {self.row} gathered without its input (Exl3MoEMethod._apply_graph)")
-        if captured and self.cpu_experts and getattr(self.streamer_of(), "_plan_miss_keys", None) is None:
-            # attach installs the keys; a later enable_graph_gather resets them, and an unsorted plan would send the
-            # CPU the last-routed misses instead of the lowest-scored ones.
-            raise RuntimeError(
-                f"CPU experts: row {self.row}'s route plan has no miss order (Exl3RamMissService.attach)"
-            )
+        if captured and self.cpu_experts:
+            streamer = self.streamer_of()
+            if streamer is None:
+                raise RuntimeError(f"CPU experts: row {self.row}'s streamer is gone")
+            if getattr(streamer, "_plan_miss_keys", None) is None:
+                # attach installs the keys, and a later enable_graph_gather resets them.
+                # An unsorted plan would send the CPU the last-routed misses, not the lowest-scored ones.
+                raise RuntimeError(
+                    f"CPU experts: row {self.row}'s route plan has no miss order (Exl3RamMissService.attach)"
+                )
         side = self.device_side
         side.post(
             self.row, self.planned, plan.count, self.routes, plan.slots, self.hot_slots, self.hot_capacity,

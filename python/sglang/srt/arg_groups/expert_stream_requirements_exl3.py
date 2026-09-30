@@ -74,6 +74,17 @@ def _check(cfg, budgets) -> None:
         # while this is still the raw CLI value: the decode backend is not known yet, and
         # the pass after parsing runs every check below.
         return
+    cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
+    if cpu_experts and (
+        getattr(cfg, "speculative_algorithm", None) is not None
+        or graph.decode.backend != Backend.BREAKABLE
+    ):
+        # Before the speculative and backend rules.
+        # Each would point a CPU-experts launch at the other's decode backend.
+        raise ValueError(
+            "SGLANG_DSV41_CPU_EXPERTS computes experts inside the captured decode graph's copy wait; "
+            "pass --cuda-graph-backend-decode breakable, without speculative decoding"
+        )
     if (
         getattr(cfg, "speculative_algorithm", None) is not None
         and graph.decode.backend != Backend.DISABLED
@@ -85,11 +96,6 @@ def _check(cfg, budgets) -> None:
             "--cuda-graph-backend-decode disabled (or --disable-cuda-graph)"
         )
     if graph.decode.backend == Backend.DISABLED:
-        if envs.SGLANG_DSV41_CPU_EXPERTS.get():
-            raise ValueError(
-                "SGLANG_DSV41_CPU_EXPERTS computes experts inside the captured decode graph's copy wait; "
-                "pass --cuda-graph-backend-decode breakable"
-            )
         _EAGER.check(cfg, budgets)
         return
     if graph.decode.backend != Backend.BREAKABLE:
@@ -113,8 +119,9 @@ def _check(cfg, budgets) -> None:
         )
     if budgets.graph_gather and not budgets.hot_budget_mb:
         raise ValueError("EXL3 graph gathers need SGLANG_MOE_HOT_GPU_MB")
-    # Before the shared eager checks: their residency-update rule would tell a CPU-experts launch without DIRECT to
-    # turn the update off, where CPU experts need it on at stage 2.
+    # Before the shared eager checks.
+    # Their residency-update rule would tell a CPU-experts launch without DIRECT to turn the update off;
+    # CPU experts need it on, at stage 2.
     _check_cpu_experts(budgets)
     # The shared eager check refuses graph gather; decode graphs may use it.
     _EAGER.check(_EagerGraphView(cfg), dataclasses.replace(budgets, graph_gather=False))

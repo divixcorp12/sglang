@@ -340,8 +340,11 @@ def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
 
 @pytest.mark.parametrize("update", [True, False])
 def test_cpu_experts_without_direct_residency_are_refused(model_dir, update):
-    """Stage 1 is not DIRECT. With the residency update on, the update's own EXL3 rule would say to turn it off; the
-    CPU-experts rule runs first and names what to set instead: the update on, at stage 2."""
+    """Stage 1 is not DIRECT.
+
+    With the residency update on, the update's own EXL3 rule would say to turn it off.
+    The CPU-experts rule runs first and names what to set instead: the update on, at stage 2.
+    """
     env = {**CPU_EXPERTS_ENV, "SGLANG_MOE_GPU_RESIDENCY_UPDATE": update, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}
     wanted = ("" if update else "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, ") + "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"
     with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {wanted}$") as refused:
@@ -349,10 +352,30 @@ def test_cpu_experts_without_direct_residency_are_refused(model_dir, update):
     assert "set it to 0" not in str(refused.value)
 
 
-def test_cpu_experts_need_the_captured_decode_graph(model_dir):
-    # Graph gather off: it is refused under eager decode on its own, before the CPU-experts rule.
-    with pytest.raises(ValueError, match="--cuda-graph-backend-decode breakable"):
-        _gate(_launch(model_dir), **{**CPU_EXPERTS_ENV, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False})
+FULL_BS1 = CudaGraphConfig(
+    decode=PhaseConfig(backend="full", bs=[1], max_bs=1),
+    prefill=PhaseConfig(backend="disabled"),
+)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {},  # both phases disabled
+        {"cuda_graph_config": FULL_BS1},
+        {"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1},
+        {"speculative_algorithm": "DSPARK"},
+    ],
+    ids=["disabled", "full", "spec-breakable", "spec-disabled"],
+)
+def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(model_dir, changes):
+    """Refused before the speculative and backend rules, which would each send the launch to the other's backend.
+
+    The refusal never suggests disabled decode graphs.
+    """
+    with pytest.raises(ValueError, match="breakable, without speculative decoding") as refused:
+        _gate(_launch(model_dir, **changes), **CPU_EXPERTS_ENV)
+    assert "disabled" not in str(refused.value)
 
 
 def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
