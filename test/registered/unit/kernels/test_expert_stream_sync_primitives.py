@@ -69,7 +69,10 @@ def test_only_the_smack_publish_and_the_copy_wait_arm_keep_a_seq_cst_system_fenc
     # threads' loads through __syncthreads before thread 0's release, a different argument, so it stays seq_cst.
     # The copy wait's arm orders its CopyArm store before its loads of the fatal and shutdown words (a Dekker pair
     # with the host's seq_cst fence after raising either, LEASE_PROTOCOL.md 7.6): store->load needs seq_cst.
+    # The post's CPU-input staging is SmAck's shape: every thread's stores of x to the host row, ordered through
+    # __syncthreads before thread 0 releases the LaneRequest the CPU expert thread acquires.
     assert [(name, code) for name, _, code in matches(r"__threadfence_system\(\)")] == [
+        ("lease_kernels.cuh", "__threadfence_system();"),
         ("row_copy_kernels.cuh", "__threadfence_system();"),
         ("row_copy_kernels.cuh", "__threadfence_system();"),
     ]
