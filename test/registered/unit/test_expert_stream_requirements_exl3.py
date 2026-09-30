@@ -358,5 +358,6 @@ def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
 
 
 def test_cpu_experts_need_the_captured_decode_graph(model_dir):
+    # Graph gather off: it is refused under eager decode on its own, before the CPU-experts rule.
     with pytest.raises(ValueError, match="--cuda-graph-backend-decode breakable"):
-        _gate(_launch(model_dir), **CPU_EXPERTS_ENV)
+        _gate(_launch(model_dir), **{**CPU_EXPERTS_ENV, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False})
