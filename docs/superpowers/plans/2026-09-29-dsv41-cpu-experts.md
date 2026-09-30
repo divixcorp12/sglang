@@ -309,7 +309,7 @@ $PY scripts/dsv41/cpu_expert_sim.py $O/stages.jsonl --out /mnt/nvme1/cpu-p1/nati
 - Mean n = **67.5 per token** (1.69 per layer), mean m = 11.3 per token (0.28 per layer). m histogram 0..6:
   188,602 / 47,348 / 8,530 / 1,362 / 239 / 36 / 3.
 - Per-layer means and histograms are in `native.json` (`mean_n_per_layer`, `n_hist_per_layer`).
-- 78% of layers have n ≤ 2, the range where `k*` sends everything to the CPU.
+- 76% of layers have n ≤ 2, the range where `k*` sends everything to the CPU.
 
 **Predicted ms/token** (12 threads, NVMe 1.5 ms/miss, GPU 14 ms), gain against `off` [estimate]:
 
@@ -351,8 +351,8 @@ $PY scripts/dsv41/cpu_expert_sim.py $O/stages.jsonl --out /mnt/nvme1/cpu-p1/nati
 
 **Gate (pre-registered: predicted gain ≥ 15%): PASS.**
 - `k*` predicts **35.6%** (70.6 vs 109.8 ms/token) at 12 native threads, and 32.3% at 8.
-- Every policy except cap 1 clears 15% in every column of the sweep at 1.5 ms/miss. Cap 1 does too (23.6% at 8 threads,
-  the worst case), and the 7.0 ms/miss upper bound still gives `k*` 20.6-22.7%.
+- Every policy clears 15% in every column of the sweep at 1.5 ms/miss (the worst is cap 1 at 8 threads, 23.6%),
+  and the 7.0 ms/miss upper bound still gives `k*` 20.6-22.7%.
 - The absolute predicted level (~71 ms, 14 tok/s) is above the plan's 55-65 ms [estimate]; the P3 items and the
   swizzled layout (64 ms) are what move it there.
 - P2 should still measure the interaction the model omits: c_cpu under concurrent NVMe DMA and H2D load.
