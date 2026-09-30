@@ -1265,6 +1265,13 @@ class Envs:
     # Build directory for the JIT-built EXL3 extension (torch.utils.cpp_extension
     # cache); expanded with os.path.expanduser at use.
     SGLANG_EXL3_BUILD_DIR = EnvStr("~/.cache/sglang/exl3_ext")
+    # Build-time options of the EXL3 CPU MoE kernel's int8 activation quantization
+    # (quantization/exl3_cpu/moe_mul1.cpp): a second int8 pass over each row's
+    # remainder, and one scale per SGLANG_EXL3_CPU_ACT_BLOCK inputs (a multiple of
+    # 16; 0 keeps one scale per row). Either one builds the vendored kernel into a
+    # separately cached extension; with both off the build is upstream's.
+    SGLANG_EXL3_CPU_ACT_RESIDUAL = EnvBool(False)
+    SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)
 
     # ===================================================================
     # Humming quantization

@@ -40,8 +40,15 @@ MUL1 = -2082680531  # 0x83DCD12D as int32, the codebook constant the CPU kernel 
 RESULTS = os.path.join(HERE, "p0_results.jsonl")
 
 
+def flavor():
+    """The CPU kernel build this process uses: "" is upstream's, else exl3_ext.build_flavor's suffix."""
+    from sglang.srt.layers.quantization.exl3_ext import build_flavor, cpu_act_defines
+
+    return build_flavor(cpu_act_defines()) or "upstream"
+
+
 def emit(rec):
-    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **rec}
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "flavor": flavor(), **rec}
     line = json.dumps(rec)
     print(line, flush=True)
     with open(RESULTS, "a") as f:

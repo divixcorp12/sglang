@@ -1,3 +1,21 @@
+// Vendored from exllamav3 (https://github.com/turboderp-org/exllamav3) at
+// 02aef45cd681b960a00afcd0749a4ab99e6c1bfe, exllamav3/exllamav3_ext/cpu/moe_mul1.cpp.
+// MIT License, Copyright (c) 2025 Turboderp; the full notice is in LICENSE.exllamav3 beside this file.
+//
+// Local change: two compile-time options that reduce the int8 activation quantization error of the
+// quantized tiers (AVX2 / AVX-512BW / VNNI / VBMI; the scalar tier computes in fp32 and ignores both).
+// exl3_ext.py builds this copy in place of upstream's only when one of them is on, so the default
+// build is upstream's file. Neither option touches a GEMV inner loop:
+//   EXL3_MOE_CPU_ACT_RESIDUAL=1  each token row is quantized twice: x8 = round(x / q), then the
+//                                remainder x - q * x8 with its own scale. The two int8 rows run as two
+//                                rows of the existing multi-row kernels (one weight decode, one extra
+//                                multiply per row) and are summed, so chunks hold at most MAX_M / 2
+//                                tokens.
+//   EXL3_MOE_CPU_ACT_BLOCK=B     one scale per B inputs (a multiple of 16 that divides k; 128 matches
+//                                the input Hadamard block) instead of one per row. The kernels run
+//                                once per k-block on a sub-matrix view and the partial outputs are
+//                                summed in fp32. A matrix whose k is not a multiple of B keeps one
+//                                scale per row.
 #include "moe_mul1.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
@@ -67,6 +85,27 @@ namespace {
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
 constexpr float HAD_SCALE = 0.088388347648f;
 constexpr int MAX_M = 4;
+
+#ifndef EXL3_MOE_CPU_ACT_RESIDUAL
+#define EXL3_MOE_CPU_ACT_RESIDUAL 0
+#endif
+#ifndef EXL3_MOE_CPU_ACT_BLOCK
+#define EXL3_MOE_CPU_ACT_BLOCK 0
+#endif
+static_assert(EXL3_MOE_CPU_ACT_BLOCK >= 0 && EXL3_MOE_CPU_ACT_BLOCK % 16 == 0,
+              "EXL3_MOE_CPU_ACT_BLOCK must be 0 or a multiple of 16");
+// Quantized activation rows per token row, and so the most tokens a chunk can hold
+constexpr int ACT_ROWS = EXL3_MOE_CPU_ACT_RESIDUAL ? 2 : 1;
+constexpr int CHUNK_M = MAX_M / ACT_ROWS;
+
+inline bool act_blocked(int k)
+{
+    return EXL3_MOE_CPU_ACT_BLOCK != 0 && k % EXL3_MOE_CPU_ACT_BLOCK == 0 && k > EXL3_MOE_CPU_ACT_BLOCK;
+}
+
+// k-tiles of the full matrix for the swizzled address of a k-block sub-view (0: the view is the
+// whole matrix). Set by run_tiles around its per-block calls, read once per band call.
+thread_local int tl_swz_tiles_k = 0;
 
 #if defined(__GNUC__) && defined(__linux__)
 #define M1_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
@@ -290,6 +329,9 @@ struct PreparedIn
     int32_t* splat_dup;
     float q[MAX_M];
     int32_t sum_x8[MAX_M];
+    // EXL3_MOE_CPU_ACT_BLOCK: per-block scales and sums, [k / B][MAX_M]
+    float* bq = nullptr;
+    int32_t* bsum = nullptr;
 };
 
 M1_TARGET_AVX2
@@ -331,6 +373,37 @@ void quantize_row_avx2(const float* dst, int32_t* splat, int32_t* splat_dup,
     _mm256_store_si256(reinterpret_cast<__m256i*>(sm), vsum);
     s_out = sm[0] + sm[1] + sm[2] + sm[3] + sm[4] + sm[5] + sm[6] + sm[7];
     q_out = q;
+}
+
+// Quantize token row r of m (quantized tiers) under the accuracy options. Layout:
+//   rows: ACT_ROWS per token row; the remainder row of token r is row r + m;
+//   one scale per row: row i at i * k, scales in q[i] / sum_x8[i];
+//   per block (act_blocked): block b of row i at b * rows * B + i * B, scales at bq / bsum[b * MAX_M + i].
+// The remainder is staged in tin row r + m, which the quantized tiers never read.
+void quantize_act(PreparedIn& p, int r, int m, int k, const float* src, bool dup)
+{
+    const int rows = ACT_ROWS * m;
+    const int B = act_blocked(k) ? EXL3_MOE_CPU_ACT_BLOCK : k;
+    float* res = p.tin + static_cast<size_t>(r + m) * k;
+    for (int pass = 0; pass < ACT_ROWS; ++pass)
+    {
+        const int row = r + pass * m;
+        const float* v = pass ? res : src;
+        for (int b = 0; b < k / B; ++b)
+        {
+            const size_t off = B == k ? static_cast<size_t>(row) * k
+                                      : static_cast<size_t>(b) * rows * B + static_cast<size_t>(row) * B;
+            int32_t* splat = p.splat32 + off;
+            float q;
+            int32_t s;
+            quantize_row_avx2(v + b * B, splat, dup ? p.splat_dup + off : nullptr, B, q, s);
+            if (B == k) { p.q[row] = q; p.sum_x8[row] = s; }
+            else { p.bq[b * MAX_M + row] = q; p.bsum[b * MAX_M + row] = s; }
+            if (pass + 1 < ACT_ROWS)
+                for (int i = 0; i < B; ++i)
+                    res[b * B + i] = v[b * B + i] - q * static_cast<float>(static_cast<int8_t>(splat[i] & 0xff));
+        }
+    }
 }
 
 M1_TARGET_AVX2
@@ -405,6 +478,11 @@ void prepare_rows
             ? p.splat_dup + static_cast<size_t>(r) * k : nullptr;
         float q;
         int32_t s;
+        if (g_isa != Isa::Scalar && (ACT_ROWS > 1 || act_blocked(k)))
+        {
+            quantize_act(p, r, m, k, dst, splat_dup != nullptr);
+            continue;
+        }
         if (g_isa != Isa::Scalar)
         {
             quantize_row_avx2(dst, splat, splat_dup, k, q, s);
@@ -610,7 +688,7 @@ void vnni_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
         for (int b = 0; b < band; ++b)
         {
             const uint16_t* packed = mat.swz
-                ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
+                ? mat.trellis + (static_cast<size_t>(n0 / 8) * (tl_swz_tiles_k ? tl_swz_tiles_k : tiles_k) * 8
                                  + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
                 : packed_row + b * packed_size;
             if (mat.swz && band == 8)
@@ -807,7 +885,7 @@ void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
         for (int b = 0; b < band; ++b)
         {
             const uint16_t* packed = mat.swz
-                ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
+                ? mat.trellis + (static_cast<size_t>(n0 / 8) * (tl_swz_tiles_k ? tl_swz_tiles_k : tiles_k) * 8
                                  + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
                 : packed_row + b * packed_size;
             if (mat.swz && band == 8)
@@ -1051,7 +1129,7 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
         for (int b = 0; b < band; ++b)
         {
             const uint16_t* packed = mat.swz
-                ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
+                ? mat.trellis + (static_cast<size_t>(n0 / 8) * (tl_swz_tiles_k ? tl_swz_tiles_k : tiles_k) * 8
                                  + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
                 : packed_row + b * packed_size;
             if (mat.swz && band == 8)
@@ -1461,7 +1539,7 @@ Isa detect_isa()
 
 const Isa g_isa = []{ return detect_isa(); }();
 
-void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+void run_tiles_raw(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     if (tn0 >= tn1) return;
     switch (g_isa) {
@@ -1612,6 +1690,68 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                 default: scalar_tiles<8>(mat, in, tout, m, tn0, tn1); return;
             }
         }
+    }
+}
+
+// m token rows through the quantized kernels under the accuracy options (quantize_act's layout): per
+// k-block sub-views summed in fp32, then each remainder row added onto its token row. Only this
+// worker's columns [tn0, tn1) are touched, so the sums need no synchronization.
+void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+{
+    if (tn0 >= tn1) return;
+    if (g_isa == Isa::Scalar || (ACT_ROWS == 1 && !act_blocked(mat.k)))
+    {
+        run_tiles_raw(mat, in, tout, m, tn0, tn1);
+        return;
+    }
+    const int rows = ACT_ROWS * m;
+    const int n = mat.n;
+    const int c0 = tn0 * 16, c1 = tn1 * 16;
+    if (!act_blocked(mat.k))
+    {
+        run_tiles_raw(mat, in, tout, rows, tn0, tn1);
+    }
+    else
+    {
+        const int B = EXL3_MOE_CPU_ACT_BLOCK;
+        const int block_tiles = B / 16;
+        const size_t packed_size = static_cast<size_t>(16) * mat.bits;
+        thread_local std::vector<float> part;
+        if (part.size() < static_cast<size_t>(rows) * n) part.resize(static_cast<size_t>(rows) * n);
+        tl_swz_tiles_k = mat.k / 16;
+        for (int b = 0; b < mat.k / B; ++b)
+        {
+            MoeCpuMatrix sub = mat;
+            sub.k = B;
+            // Native: k-tile rows are tiles_n tiles apart. Swizzled: consecutive k-tiles of an 8-tile
+            // group are 8 tiles apart, with the group stride from tl_swz_tiles_k
+            sub.trellis = mat.trellis + static_cast<size_t>(b) * block_tiles
+                                        * (mat.swz ? 8 : n / 16) * packed_size;
+            PreparedIn sub_in = in;
+            sub_in.splat32 = in.splat32 + static_cast<size_t>(b) * rows * B;
+            sub_in.splat_dup = in.splat_dup ? in.splat_dup + static_cast<size_t>(b) * rows * B : nullptr;
+            for (int i = 0; i < rows; ++i)
+            {
+                sub_in.q[i] = in.bq[b * MAX_M + i];
+                sub_in.sum_x8[i] = in.bsum[b * MAX_M + i];
+            }
+            float* dst = b ? part.data() : tout;
+            run_tiles_raw(sub, sub_in, dst, rows, tn0, tn1);
+            if (b)
+                for (int i = 0; i < rows; ++i)
+                {
+                    float* t = tout + static_cast<size_t>(i) * n;
+                    const float* q = part.data() + static_cast<size_t>(i) * n;
+                    for (int c = c0; c < c1; ++c) t[c] += q[c];
+                }
+        }
+        tl_swz_tiles_k = 0;
+    }
+    for (int r = m; r < rows; ++r)
+    {
+        float* t = tout + static_cast<size_t>(r - m) * n;
+        const float* q = tout + static_cast<size_t>(r) * n;
+        for (int c = c0; c < c1; ++c) t[c] += q[c];
     }
 }
 
@@ -1887,6 +2027,8 @@ struct ForwardArena
     std::vector<int32_t> splat_dup_g, splat_dup_u, splat_dup_d;
     std::vector<float> tout_g, tout_u, tout_d;
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
+    std::vector<float> bq_g, bq_u, bq_d;
+    std::vector<int32_t> bsum_g, bsum_u, bsum_d;
 
     static ForwardArena& get()
     {
@@ -2345,7 +2487,7 @@ void exl3_moe_cpu_forward_raw(
     ctx.m_total = m_total;
     std::memset(ctx.out, 0, static_cast<size_t>(m_total) * layer->hidden_size * sizeof(float));
 
-    // Group token assignments by expert, then split into chunks of MAX_M rows
+    // Group token assignments by expert, then split into chunks of CHUNK_M rows
     std::vector<std::vector<std::pair<int, float>>> per_expert(layer->num_experts);
     for (int t = 0; t < m_total; ++t)
         for (int j = 0; j < top_k; ++j)
@@ -2357,11 +2499,11 @@ void exl3_moe_cpu_forward_raw(
     for (int e = 0; e < layer->num_experts; ++e)
     {
         auto& lst = per_expert[e];
-        for (size_t i = 0; i < lst.size(); i += MAX_M)
+        for (size_t i = 0; i < lst.size(); i += CHUNK_M)
         {
             Chunk ch;
             ch.expert = e;
-            ch.m = static_cast<int>(std::min<size_t>(MAX_M, lst.size() - i));
+            ch.m = static_cast<int>(std::min<size_t>(CHUNK_M, lst.size() - i));
             for (int r = 0; r < ch.m; ++r)
             {
                 ch.token[r] = lst[i + r].first;
@@ -2406,6 +2548,19 @@ void exl3_moe_cpu_forward_raw(
         ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_M * I,
                           ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I,
                           ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_M * I, {}, {} };
+    }
+    if (EXL3_MOE_CPU_ACT_BLOCK)
+    {
+        // Sized for one block per 16 inputs, the smallest B allows; only k / B entries are used
+        const size_t sh = static_cast<size_t>(MAX_M) * (H / 16), si = static_cast<size_t>(MAX_M) * (I / 16);
+        grow(ar.bq_g, nc * sh); grow(ar.bq_u, nc * sh); grow(ar.bq_d, nc * si);
+        grow(ar.bsum_g, nc * sh); grow(ar.bsum_u, nc * sh); grow(ar.bsum_d, nc * si);
+        for (int j = 0; j < nc; ++j)
+        {
+            ctx.prep_g[j].bq = ar.bq_g.data() + j * sh; ctx.prep_g[j].bsum = ar.bsum_g.data() + j * sh;
+            ctx.prep_u[j].bq = ar.bq_u.data() + j * sh; ctx.prep_u[j].bsum = ar.bsum_u.data() + j * sh;
+            ctx.prep_d[j].bq = ar.bq_d.data() + j * si; ctx.prep_d[j].bsum = ar.bsum_d.data() + j * si;
+        }
     }
 
     std::lock_guard<std::mutex> lock(g_pool_mutex);

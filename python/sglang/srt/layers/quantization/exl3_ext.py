@@ -28,12 +28,44 @@ _EXTRA_CUDA_CFLAGS = [
 ]
 
 
-def extension_sources(ext_dir: str) -> list[str]:
+# exllamav3's CPU MoE kernel with this fork's accuracy options (see its header).
+VENDORED_CPU_KERNEL = os.path.join(os.path.dirname(__file__), "exl3_cpu", "moe_mul1.cpp")
+_UPSTREAM_CPU_KERNEL = os.path.join("cpu", "moe_mul1.cpp")
+
+
+def cpu_act_defines() -> list[str]:
+    """Compiler defines for the CPU kernel's activation quantization options; empty when both are off."""
+    defines = []
+    if envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get():
+        defines.append("-DEXL3_MOE_CPU_ACT_RESIDUAL=1")
+    block = envs.SGLANG_EXL3_CPU_ACT_BLOCK.get()
+    if block:
+        if block < 0 or block % 16:
+            raise ValueError(f"SGLANG_EXL3_CPU_ACT_BLOCK must be 0 or a positive multiple of 16, got {block}")
+        defines.append(f"-DEXL3_MOE_CPU_ACT_BLOCK={block}")
+    return defines
+
+
+def build_flavor(defines: list[str]) -> str:
+    """The empty string for upstream's kernel, else a suffix naming the options, e.g. "_resid_b128"."""
+    flavor = ""
+    if "-DEXL3_MOE_CPU_ACT_RESIDUAL=1" in defines:
+        flavor += "_resid"
+    for d in defines:
+        if d.startswith("-DEXL3_MOE_CPU_ACT_BLOCK="):
+            flavor += "_b" + d.split("=", 1)[1]
+    return flavor
+
+
+def extension_sources(ext_dir: str, cpu_kernel: str | None = None) -> list[str]:
+    """Every C/C++/CUDA source under ``ext_dir``; ``cpu_kernel`` replaces upstream's cpu/moe_mul1.cpp."""
+    upstream = os.path.join(ext_dir, _UPSTREAM_CPU_KERNEL)
     sources = []
     for root, _, files in os.walk(ext_dir):
         for name in files:
             if name.endswith((".c", ".cpp", ".cu")):
-                sources.append(os.path.join(root, name))
+                path = os.path.join(root, name)
+                sources.append(cpu_kernel if cpu_kernel and path == upstream else path)
     return sorted(sources)
 
 
@@ -58,7 +90,12 @@ def exl3_ext():
     if not src:
         raise RuntimeError("SGLANG_EXL3_SRC must point at an exllamav3 checkout")
     ext_dir = _checked_ext_dir(src)
+    defines = cpu_act_defines()
+    flavor = build_flavor(defines)
+    # One build directory per flavor: extensions sharing a directory overwrite each other's build.ninja.
     build_dir = os.path.expanduser(envs.SGLANG_EXL3_BUILD_DIR.get())
+    if flavor:
+        build_dir = os.path.join(build_dir, flavor.lstrip("_"))
     os.makedirs(build_dir, exist_ok=True)
     # sm_120 only: the RTX 5090 is the one target, and an unset list makes torch
     # probe the GPU, which a CPU-only build must not touch.
@@ -66,10 +103,11 @@ def exl3_ext():
     from torch.utils.cpp_extension import load
 
     return load(
-        name="sglang_exl3_ext",
-        sources=extension_sources(ext_dir),
-        extra_include_paths=[ext_dir],
-        extra_cflags=_EXTRA_CFLAGS,
+        name="sglang_exl3_ext" + flavor,
+        sources=extension_sources(ext_dir, VENDORED_CPU_KERNEL if flavor else None),
+        # The vendored kernel includes "moe_mul1.h" from upstream's cpu/ directory.
+        extra_include_paths=[ext_dir] + ([os.path.join(ext_dir, "cpu")] if flavor else []),
+        extra_cflags=_EXTRA_CFLAGS + defines,
         extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,
         build_directory=build_dir,
         verbose=False,
