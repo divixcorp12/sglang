@@ -290,6 +290,7 @@ def replay_nm(
                 deferred_unrouted=bool(config.get("unrouted")),
             )
             if defer:
+                # Every graph forward's commit lands the queue (a graph-served prefill too), so it restarts here.
                 pending = _queue(policy, sim, chosen)
             if decode:
                 n_tok.append(n_row)
@@ -364,7 +365,8 @@ def split_costs(
     """Mean ms/token with split[n] of each layer's n RAM hits on the CPU, and b background rows per layer.
 
     ``uncosted`` ignores b; ``worst`` adds b to the same layer's link rows; ``amortised`` spreads the b of each
-    block of ``window`` tokens over the link slack its layers leave under the CPU term, and adds the rest."""
+    block of ``window`` tokens over the link slack its layers leave under the CPU term, and adds the rest;
+    ``optimistic`` also credits the block's GPU compute and NVMe waits (NVMe DMA lands in host RAM) as idle link."""
     k = np.asarray(split)[n_arr]
     c_cpu = np.interp(k, CALIBRATED_KS, model.points)
     t_cpu = np.where(k > 0, model.h + k * c_cpu, 0.0)
@@ -377,9 +379,16 @@ def split_costs(
     t_bg = b_arr * model.c_link
     worst = (np.maximum(t_cpu, t_link + t_bg) + nvme).sum(axis=1) + model.gpu_ms
     block = np.arange(len(uncosted)) // window
-    over = np.bincount(block, t_bg.sum(axis=1)) - np.bincount(block, (core - t_link).sum(axis=1))
-    amortised = uncosted.mean() + np.maximum(over, 0.0).sum() / len(uncosted)
-    return {"uncosted": float(uncosted.mean()), "worst": float(worst.mean()), "amortised": float(amortised)}
+    bg, slack = np.bincount(block, t_bg.sum(axis=1)), np.bincount(block, (core - t_link).sum(axis=1))
+    idle = slack + np.bincount(block, nvme.sum(axis=1) + model.gpu_ms)
+    amortised = uncosted.mean() + np.maximum(bg - slack, 0.0).sum() / len(uncosted)
+    optimistic = uncosted.mean() + np.maximum(bg - idle, 0.0).sum() / len(uncosted)
+    return {
+        "uncosted": float(uncosted.mean()),
+        "worst": float(worst.mean()),
+        "amortised": float(amortised),
+        "optimistic": float(optimistic),
+    }
 
 
 def insert_policy_results(
@@ -407,9 +416,11 @@ def insert_policy_results(
                     "ms_per_token": on["uncosted"],
                     "ms_per_token_bg_worst": on["worst"],
                     "ms_per_token_bg_amortised": on["amortised"],
+                    "ms_per_token_bg_optimistic": on["optimistic"],
                     "gain_vs_off_pct": 100.0 * (off - on["uncosted"]) / off,
                     "gain_bg_worst_pct": 100.0 * (off - on["worst"]) / off,
                     "gain_bg_amortised_pct": 100.0 * (off - on["amortised"]) / off,
+                    "gain_bg_optimistic_pct": 100.0 * (off - on["optimistic"]) / off,
                 }
         out[policy] = {
             **nm["residency"],
@@ -422,7 +433,9 @@ def insert_policy_results(
             for table, by_nvme in row["costs"].items():
                 for nvme, c in by_nvme.items():
                     ref = out["cpu_by_score"]["costs"][table][nvme]["ms_per_token"]
-                    for key in ("ms_per_token", "ms_per_token_bg_worst", "ms_per_token_bg_amortised"):
+                    for key in (
+                        "ms_per_token", "ms_per_token_bg_worst", "ms_per_token_bg_amortised", "ms_per_token_bg_optimistic"
+                    ):
                         c[key.replace("ms_per_token", "gain_vs_by_score") + "_pct"] = 100.0 * (ref - c[key]) / ref
     return out
 
@@ -477,13 +490,14 @@ def summary(report: dict) -> str:
         for table in first["costs"]:
             for nvme in report["params"]["nvme_ms"]:
                 off = first["costs"][table][str(nvme)]["off_ms_per_token"]
-                lines.append(f"c_cpu {table}, nvme {nvme}: off {off:.2f} ms/token; ms/token (gain) uncosted | bg worst | bg amortised")
+                lines.append(f"c_cpu {table}, nvme {nvme}: off {off:.2f} ms/token; ms/token (gain) uncosted | bg worst | bg amortised | bg optimistic")
                 for name, row in report["insert_policies"].items():
                     c = row["costs"][table][str(nvme)]
                     lines.append(
                         f"  {name:30s} {c['ms_per_token']:7.2f} ({c['gain_vs_off_pct']:4.1f}%) | "
                         f"{c['ms_per_token_bg_worst']:7.2f} ({c['gain_bg_worst_pct']:4.1f}%) | "
-                        f"{c['ms_per_token_bg_amortised']:7.2f} ({c['gain_bg_amortised_pct']:4.1f}%)"
+                        f"{c['ms_per_token_bg_amortised']:7.2f} ({c['gain_bg_amortised_pct']:4.1f}%) | "
+                        f"{c['ms_per_token_bg_optimistic']:7.2f} ({c['gain_bg_optimistic_pct']:4.1f}%)"
                     )
     lines.append(
         f"\ngate (>= {g['threshold_pct']}% for k*, threads {g['headline']['threads']}, nvme {g['headline']['nvme_ms']}): "
@@ -553,7 +567,7 @@ def main() -> None:
             "promotion_sigmas": args.promotion_sigmas,
         },
         "c_cpu_table": table,
-        "numa": "not modeled (host-slot node is not in the trace)",
+        "numa": "cpu_numa_local approximates it from the replayed pinned slots; the other policies ignore it",
         "validation": nm["validation"],
         "n_hist_all": histogram(n_arr),
         "m_hist_all": histogram(m_arr),

@@ -230,6 +230,8 @@ def test_chosen_lanes_are_recorded_in_lane_order_and_queued_by_policy():
     assert _queue("cpu_deferred_scoreq", sim, {0: [5, 6, 7]}) == {0: [5, 7, 6]}  # highest insert score first
     chosen = {}
     assert _cpu_chooser("cpu_numa_local", sim, [0, 1], {0: [5, 6]}, chosen, {0: {6}})(0, [5, 6]) == {6}
+    # Local lanes first, then the rest in lane order (choose_cpu_lanes_locked's second pass).
+    assert _cpu_chooser("cpu_numa_local", sim, [0, 1, 1, 2], {0: [5, 6, 7]}, {}, {0: {6}})(0, [5, 6, 7]) == {5, 6}
 
 
 def test_a_deferred_row_evicted_from_the_pinned_tier_is_dropped():
@@ -301,6 +303,16 @@ def test_promoted_rows_amortise_over_their_window():
     b = np.array([[1], [0]])
     assert split_costs(n, m, model, [0, 1], b)["amortised"] == pytest.approx(0.42 + 0.58 / 2)
     assert split_costs(n, m, model, [0, 1], b, window=2)["amortised"] == pytest.approx(0.42 + 0.16 / 2)
+
+
+def test_optimistic_bound_also_credits_gpu_compute_and_nvme_waits_as_idle_link():
+    model = _model([0.4, 0.4, 0.4], nvme_ms=1.5, gpu_ms=0.3)
+    n, m = np.array([[1, 0]]), np.array([[0, 1]])  # 0.42 ms CPU slack; one NVMe miss (1.5 ms), 1 link row
+    costs = split_costs(n, m, model, [0, 1], np.array([[0, 3]]))
+    base = 0.42 + 1.0 + 1.5 + 0.3
+    assert costs["uncosted"] == pytest.approx(base)
+    assert costs["amortised"] == pytest.approx(base + 3.0 - 0.42)
+    assert costs["optimistic"] == pytest.approx(base + 3.0 - 0.42 - 1.5 - 0.3)
 
 
 if __name__ == "__main__":
