@@ -256,5 +256,52 @@ def test_background_rows_cost_nothing_in_cpu_slack_and_all_in_the_worst_case():
     assert split_costs(n, m, model, split)["worst"] == pytest.approx(0.42)
 
 
+def test_promotion_takes_the_lowest_ranked_victim_only_when_it_leads_by_the_margin():
+    """decide_residency_on_device: candidates in (-score, expert) order against victims in _rank_victims'
+    order, a swap only past margin, stopping at the first that fails; only pinned-tier rows are candidates."""
+
+    def replay():
+        sim = tier_sim.DirectInsertReplay({0: [0, 1]}, {0: 2}, 8)
+        for expert, score in ((0, 0.5), (1, 3.0), (4, 10.0), (5, 4.0), (6, 2.0), (7, 3.9)):
+            sim.scores[0, expert] = score
+        return sim
+
+    sim = replay()  # 4 is not in the pinned tier; 5 beats expert 0 (0.5 + 1); 7 does not beat expert 1 (3 + 1)
+    assert sim.promote({0: {5: 0, 6: 1, 7: 2}}, 4, margin=1.0) == {0: 1}
+    assert sim.resident(0) == {1, 5} and sim.promoted == 1
+    sim = replay()
+    assert sim.promote({0: {5: 0, 6: 1, 7: 2}}, 4, margin=0.0) == {0: 2}  # 7 now leads 1 by 0.9
+    assert sim.resident(0) == {5, 7}
+    sim = replay()
+    assert sim.promote({0: {5: 0, 6: 1, 7: 2}}, 1, margin=0.0) == {0: 1}  # at most P per layer
+    assert sim.resident(0) == {1, 5}
+    sim = replay()
+    sim.route_counts[0, 0] = 1.0  # routed in the open window: expert 0 now ranks after 1
+    assert sim.promote({0: {5: 0}}, 1, margin=0.0) == {0: 1} and sim.resident(0) == {0, 5}
+
+
+@pytest.mark.parametrize("interval, boundary", [(2, 4), (3, 6)])
+def test_promotion_fires_every_n_decode_forwards(interval, boundary):
+    # A CPU lane (expert 2) is never inserted; its score passes 3's by the margin between forwards 4 and 5, so the
+    # first boundary at or after decode index 4 promotes it.
+    loaded = {
+        "layer_ids": [0],
+        "hot_capacity": {0: 1},
+        "forwards": [_graph(seq, r, [0]) for seq, r in enumerate([[2], [3]] + [[2]] * 6, start=1)],
+    }
+    out = replay_nm(loaded, 4, 8, policy=f"cpu_by_score_promote_N{interval}_P1", split=[0, 1, 1, 2, 3, 3, 4])
+    assert out["b"][:, 0].tolist() == [int(i == boundary) for i in range(8)]
+    assert out["n"][:, 0].tolist() == [0, 0] + [1] * (boundary - 2) + [0] * (8 - boundary)
+    assert out["residency"]["promoted_rows_per_token"] == pytest.approx(1 / 8)
+
+
+def test_promoted_rows_amortise_over_their_window():
+    model = _model([0.4, 0.4, 0.4])
+    n, m = np.array([[1], [1]]), np.zeros((2, 1), dtype=np.int64)  # 0.42 ms of CPU slack per token
+    b = np.array([[1], [0]])
+    assert split_costs(n, m, model, [0, 1], b)["amortised"] == pytest.approx(0.42 + 0.58 / 2)
+    assert split_costs(n, m, model, [0, 1], b, window=2)["amortised"] == pytest.approx(0.42 + 0.16 / 2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

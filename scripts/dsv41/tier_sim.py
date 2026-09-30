@@ -35,7 +35,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Callable, Optional
+import math
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 import torch
@@ -239,6 +240,7 @@ class DirectInsertReplay:
         self.deferred_inserted = 0
         self.deferred_dropped = 0
         self.deferred_last: dict[int, int] = {}
+        self.promoted = 0
         self.shortlist = [self._rank(row) for row in range(layers)]  # reset_after_capture
 
     def _decay(self, tokens: int) -> np.float32:
@@ -336,6 +338,48 @@ class DirectInsertReplay:
             self.decode_forwards -= 1
             self.boundary_pending = self.decode_forwards >= 1
         return misses
+
+    def promote(
+        self, pinned: dict[int, Iterable[int]], limit: int, *, margin: float = 1.0, sigmas: float = 0.0
+    ) -> dict[int, int]:
+        """GpuResidencyUpdater._promote at a decode boundary, before the forward's gathers: up to ``limit``
+        promotions per layer from the experts ``pinned`` holds, as decide_residency_on_device decides them.
+
+        Candidates are nonresidents with a positive score, (-score, expert) order; free slots admit the
+        leading ones, then candidate i replaces the i-th victim of _rank_victims' order while it leads by
+        ``margin + sigmas * sqrt(candidate + victim)``, stopping at the first that does not. Scores and
+        routed flags are the ones the forward's _apply is about to set. Returns each layer's promotions."""
+        scores = self.scores * self._decay(self.tokens) + self.route_counts if self.boundary_pending else self.scores
+        routed = self.route_counts > 0
+        out = {}
+        for layer, held in pinned.items():
+            row = self.row[layer]
+            slots, where, s = self.slots[row], self.where[row], scores[row]
+            candidates = sorted((e for e in held if where[e] < 0 and s[e] > 0), key=lambda e: (-s[e], e))[:limit]
+            free = [slot for slot, e in enumerate(slots) if e < 0]
+            members = sorted(
+                (slot for slot, e in enumerate(slots) if e >= 0),
+                key=lambda slot: (routed[row, slots[slot]], s[slots[slot]], -slots[slot]),
+            )
+            done = 0
+            for i, expert in enumerate(candidates):
+                if i < len(free):
+                    slot = free[i]
+                else:
+                    j = i - len(free)
+                    if j >= len(members):
+                        break
+                    slot, victim = members[j], slots[members[j]]
+                    lead, trail = float(s[expert]), float(s[victim])
+                    if not lead > trail + margin + sigmas * math.sqrt(max(lead + trail, 0.0)):
+                        break
+                    where[victim] = -1
+                slots[slot] = expert
+                where[expert] = slot
+                done += 1
+            out[layer] = done
+        self.promoted += sum(out.values())
+        return out
 
     def eager_forward(
         self, tokens: int, counts: dict[int, tuple[list[int], list[int]]], phase: Optional[str] = None

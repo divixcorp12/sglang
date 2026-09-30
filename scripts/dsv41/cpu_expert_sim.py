@@ -32,7 +32,9 @@ then still crosses the link (tier_sim.ms_per_token does the same). Assumptions:
   choose_cpu_lanes_locked does; ``cpu_by_score`` takes the lowest by the victim ranking's key. The
   ``cpu_deferred*`` policies insert ``cpu_lane_order``'s lanes one graph forward later, into shortlist entries that
   forward left unused, if the row is still in the pinned tier after that forward's admissions; the variants
-  queue by score or spare only unrouted entries. Their background rows are costed three ways (``split_costs``).
+  queue by score or spare only unrouted entries. ``<base>_promote_N<n>_P<p>`` adds DirectInsertReplay.promote
+  (GpuResidencyUpdater._promote on DIRECT decode boundaries, off today) every n decode forwards. Background and
+  promoted rows are costed three ways (``split_costs``; promotions amortise over their n forwards).
   Scores count every route.
 - Not modeled: the real pinned slot of each row (``cpu_numa_local`` uses the replay's, which starts empty), c_cpu
   inflation under NVMe DMA or copy-engine load (P0 open item), link idle time outside the per-layer CPU slack
@@ -44,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from typing import Callable, Optional
 
@@ -130,6 +133,22 @@ INSERT_POLICIES = {
     "cpu_deferred_scoreq": {"choice": "lane", "queue": "score"},
     "cpu_deferred_unrouted": {"choice": "lane", "queue": "lane", "unrouted": True},
 }
+PROMOTE_NAME = re.compile(r"^(?P<base>\w+?)_promote_N(?P<n>\d+)_P(?P<p>\d+)$")
+
+
+def policy_config(policy: str) -> dict:
+    """INSERT_POLICIES[policy], or ``<base>_promote_N<n>_P<p>``: base, plus up to p promotions per layer every n
+    decode forwards (DirectInsertReplay.promote)."""
+    if policy in INSERT_POLICIES:
+        return INSERT_POLICIES[policy]
+    match = PROMOTE_NAME.match(policy)
+    if match is None or match["base"] not in INSERT_POLICIES or int(match["n"]) < 1 or int(match["p"]) < 1:
+        raise ValueError(
+            f"unknown insertion policy {policy!r}, want one of {sorted(INSERT_POLICIES)} or <base>_promote_N<n>_P<p>"
+        )
+    return {**INSERT_POLICIES[match["base"]], "promote_n": int(match["n"]), "promote_p": int(match["p"])}
+
+
 # arm_env.PINNED_HOST_NUMA_MB and the CPU cores 18-29 (node 1) of the P2 arms.
 DEFAULT_NUMA_MB = "0:61440,1:40960"
 DEFAULT_CPU_NODE = 1
@@ -149,7 +168,8 @@ def _cpu_chooser(
     local: Optional[dict[int, set[int]]] = None,
 ):
     """The graph_forward cpu_lanes hook: split[n] of a layer's n RAM hits, recorded into ``chosen`` in lane order."""
-    choice = INSERT_POLICIES[policy]["choice"]
+    config = policy_config(policy)
+    choice = config["choice"]
 
     def choose(layer: int, missing: list[int]) -> set[int]:
         hits = ram_hits[layer]
@@ -163,14 +183,14 @@ def _cpu_chooser(
             ranked = hits
         picked = set(ranked[:k])
         chosen[layer] = [e for e in hits if e in picked]
-        return set() if INSERT_POLICIES[policy].get("insert") else picked
+        return set() if config.get("insert") else picked
 
     return choose
 
 
 def _queue(policy: str, sim, chosen: dict[int, list[int]]) -> dict[int, list[int]]:
     """cpu_deferred's pending insertions: lane order, or the highest victim rank first."""
-    if INSERT_POLICIES[policy].get("queue") == "score":
+    if policy_config(policy).get("queue") == "score":
         return {layer: sorted(e, key=_victim_key(sim, sim.row[layer]), reverse=True) for layer, e in chosen.items() if e}
     return {layer: list(e) for layer, e in chosen.items() if e}
 
@@ -198,15 +218,16 @@ def replay_nm(
     split: Optional[list[int]] = None,
     numa_mb: str = DEFAULT_NUMA_MB,
     cpu_node: int = DEFAULT_CPU_NODE,
+    promotion_margin: float = 1.0,
+    promotion_sigmas: float = 0.0,
 ) -> dict:
     """Per decode token and layer, n (VRAM miss, RAM hit) and m (miss both), from the DIRECT + RamTier replays.
 
     ``policy`` feeds the CPU lane choice (``split[n]`` of a layer's n RAM hits) back into VRAM residency;
     ``insert_all`` inserts every miss, as the P1 replay did. ``b`` is the deferred rows each decode forward
-    inserts, per layer: rows copied in the background that land at that forward's commit."""
-    if policy not in INSERT_POLICIES:
-        raise ValueError(f"unknown insertion policy {policy!r}, want one of {sorted(INSERT_POLICIES)}")
-    config = INSERT_POLICIES[policy]
+    inserts or promotes, per layer: rows copied off the critical path. Promotions (``_promote_N<n>_P<p>``) run
+    before every n-th decode forward's gathers, from the pinned tier as that forward found it."""
+    config = policy_config(policy)
     defer = "queue" in config
     split = split if split is not None else [0] * (MAX_ROUTES + 1)
     layer_ids = loaded["layer_ids"]
@@ -223,14 +244,21 @@ def replay_nm(
     ram = Replay(ram_capacity, "base", True)
     nodes = slot_nodes_per_row(ram_capacity, numa_mb) if config["choice"] == "numa" else None
     n_tok, m_tok, b_tok, cpu_tok, sim_vram, measured_vram = [], [], [], [], 0, 0
-    hits_total, unique_total, evicted = 0, 0, 0
+    hits_total, unique_total, evicted, decodes = 0, 0, 0, 0
     pending: dict[int, list[int]] = {}
     for forward in loaded["forwards"]:
         if forward["phase"] == "capture":
             continue
         if forward["kind"] == "graph":
-            pre = {layer: sim.resident(layer) for layer in forward["routes"]}
             decode = forward["phase"] == "decode"
+            promoted: dict[int, int] = {}
+            if decode and "promote_n" in config and decodes and decodes % config["promote_n"] == 0:
+                pinned = {layer: ram.tiers[sim.row[layer]].where for layer in forward["routes"]}
+                promoted = sim.promote(
+                    pinned, config["promote_p"], margin=promotion_margin, sigmas=promotion_sigmas
+                )
+            decodes += decode
+            pre = {layer: sim.resident(layer) for layer in forward["routes"]}
             n_row, m_row, ram_hits, local = [], [], {}, {}
             for layer, experts in forward["routes"].items():
                 row = sim.row[layer]
@@ -253,7 +281,7 @@ def replay_nm(
                     pending[layer] = kept
             chosen: dict[int, list[int]] = {}
             # CPU experts run only in a captured decode graph.
-            hook = _cpu_chooser(policy, sim, split, ram_hits, chosen, local) if decode and policy != "insert_all" else None
+            hook = _cpu_chooser(policy, sim, split, ram_hits, chosen, local) if decode and not config.get("insert") else None
             simulated = sim.graph_forward(
                 forward["routes"],
                 forward["phase"],
@@ -266,7 +294,7 @@ def replay_nm(
             if decode:
                 n_tok.append(n_row)
                 m_tok.append(m_row)
-                b_tok.append([sim.deferred_last.get(layer, 0) for layer in forward["routes"]])
+                b_tok.append([sim.deferred_last.get(layer, 0) + promoted.get(layer, 0) for layer in forward["routes"]])
                 cpu_tok.append(sum(split[min(n, len(split) - 1)] for n in n_row))
                 sim_vram += sum(simulated.values())
                 measured_vram += sum(forward["misses"].values())
@@ -300,6 +328,7 @@ def replay_nm(
             "deferred_link_rows_per_token": sim.deferred_inserted / max(tokens, 1),
             "deferred_dropped_per_token": sim.deferred_dropped / max(tokens, 1),
             "deferred_evicted_per_token": evicted / max(tokens, 1),
+            "promoted_rows_per_token": sim.promoted / max(tokens, 1),
         },
     }
 
@@ -325,12 +354,17 @@ def predict(n_arr: np.ndarray, m_arr: np.ndarray, model: CostModel) -> dict[str,
 
 
 def split_costs(
-    n_arr: np.ndarray, m_arr: np.ndarray, model: CostModel, split: list[int], b_arr: Optional[np.ndarray] = None
+    n_arr: np.ndarray,
+    m_arr: np.ndarray,
+    model: CostModel,
+    split: list[int],
+    b_arr: Optional[np.ndarray] = None,
+    window: int = 1,
 ) -> dict[str, float]:
     """Mean ms/token with split[n] of each layer's n RAM hits on the CPU, and b background rows per layer.
 
-    ``uncosted`` ignores b; ``worst`` adds b to the same layer's link rows; ``amortised`` spreads a token's b
-    over the link slack its layers leave under the CPU term, and adds the rest to the token."""
+    ``uncosted`` ignores b; ``worst`` adds b to the same layer's link rows; ``amortised`` spreads the b of each
+    block of ``window`` tokens over the link slack its layers leave under the CPU term, and adds the rest."""
     k = np.asarray(split)[n_arr]
     c_cpu = np.interp(k, CALIBRATED_KS, model.points)
     t_cpu = np.where(k > 0, model.h + k * c_cpu, 0.0)
@@ -342,20 +376,24 @@ def split_costs(
         b_arr = np.zeros_like(n_arr)
     t_bg = b_arr * model.c_link
     worst = (np.maximum(t_cpu, t_link + t_bg) + nvme).sum(axis=1) + model.gpu_ms
-    amortised = uncosted + np.maximum(t_bg.sum(axis=1) - (core - t_link).sum(axis=1), 0.0)
-    return {"uncosted": float(uncosted.mean()), "worst": float(worst.mean()), "amortised": float(amortised.mean())}
+    block = np.arange(len(uncosted)) // window
+    over = np.bincount(block, t_bg.sum(axis=1)) - np.bincount(block, (core - t_link).sum(axis=1))
+    amortised = uncosted.mean() + np.maximum(over, 0.0).sum() / len(uncosted)
+    return {"uncosted": float(uncosted.mean()), "worst": float(worst.mean()), "amortised": float(amortised)}
 
 
 def insert_policy_results(
-    loaded: dict, args, split: list[int], tables: dict[str, list[float]]
+    loaded: dict, args, split: list[int], tables: dict[str, list[float]], policies: list[str]
 ) -> dict[str, dict]:
     """Per insertion policy: its own replay's residency, n/m, and ms/token against ``off`` (insert_all's n/m)."""
     out, off_nm = {}, None
-    for policy in INSERT_POLICIES:
+    for policy in policies:
         nm = replay_nm(
             loaded, args.ram_rows, args.num_experts, not args.no_initial_from_log, policy, split,
             numa_mb=args.numa_mb, cpu_node=args.cpu_node,
+            promotion_margin=args.promotion_margin, promotion_sigmas=args.promotion_sigmas,
         )
+        window = policy_config(policy).get("promote_n", 1)
         if off_nm is None:
             off_nm = (nm["n"], nm["m"])
         costs = {}
@@ -363,7 +401,7 @@ def insert_policy_results(
             for nvme in args.nvme_ms:
                 model = CostModel(points, c_link=args.c_link, handoff=args.handoff, nvme_ms=nvme, gpu_ms=args.gpu_ms)
                 off = split_costs(*off_nm, model, [0] * len(split))["uncosted"]
-                on = split_costs(nm["n"], nm["m"], model, split, nm["b"])
+                on = split_costs(nm["n"], nm["m"], model, split, nm["b"], window)
                 costs.setdefault(name, {})[str(nvme)] = {
                     "off_ms_per_token": off,
                     "ms_per_token": on["uncosted"],
@@ -379,6 +417,13 @@ def insert_policy_results(
             "m_per_token": float(nm["m"].sum(axis=1).mean()),
             "costs": costs,
         }
+    if "cpu_by_score" in out:
+        for row in out.values():
+            for table, by_nvme in row["costs"].items():
+                for nvme, c in by_nvme.items():
+                    ref = out["cpu_by_score"]["costs"][table][nvme]["ms_per_token"]
+                    for key in ("ms_per_token", "ms_per_token_bg_worst", "ms_per_token_bg_amortised"):
+                        c[key.replace("ms_per_token", "gain_vs_by_score") + "_pct"] = 100.0 * (ref - c[key]) / ref
     return out
 
 
@@ -418,14 +463,15 @@ def summary(report: dict) -> str:
             f"preference from the replayed slots, {report['params']['numa_mb']} preferring node {report['params']['cpu_node']})"
         )
         lines.append(
-            f"{'policy':22s} {'hot hit':>7s} {'VRAM miss':>9s} {'n':>6s} {'m':>6s} {'cpu':>6s} "
-            f"{'bg rows':>7s} {'bg drop':>7s} {'bg evict':>8s}"
+            f"{'policy':30s} {'hot hit':>7s} {'VRAM miss':>9s} {'n':>6s} {'m':>6s} {'cpu':>6s} "
+            f"{'bg rows':>7s} {'bg drop':>7s} {'bg evict':>8s} {'promoted':>8s}"
         )
         for name, row in report["insert_policies"].items():
             lines.append(
-                f"{name:22s} {row['hot_hit_rate']:7.3f} {row['vram_misses_per_token']:9.2f} {row['n_per_token']:6.2f} "
+                f"{name:30s} {row['hot_hit_rate']:7.3f} {row['vram_misses_per_token']:9.2f} {row['n_per_token']:6.2f} "
                 f"{row['m_per_token']:6.2f} {row['cpu_lanes_per_token']:6.2f} {row['deferred_link_rows_per_token']:7.2f} "
-                f"{row['deferred_dropped_per_token']:7.2f} {row['deferred_evicted_per_token']:8.3f}"
+                f"{row['deferred_dropped_per_token']:7.2f} {row['deferred_evicted_per_token']:8.3f} "
+                f"{row['promoted_rows_per_token']:8.2f}"
             )
         first = next(iter(report["insert_policies"].values()))
         for table in first["costs"]:
@@ -435,7 +481,7 @@ def summary(report: dict) -> str:
                 for name, row in report["insert_policies"].items():
                     c = row["costs"][table][str(nvme)]
                     lines.append(
-                        f"  {name:22s} {c['ms_per_token']:7.2f} ({c['gain_vs_off_pct']:4.1f}%) | "
+                        f"  {name:30s} {c['ms_per_token']:7.2f} ({c['gain_vs_off_pct']:4.1f}%) | "
                         f"{c['ms_per_token_bg_worst']:7.2f} ({c['gain_bg_worst_pct']:4.1f}%) | "
                         f"{c['ms_per_token_bg_amortised']:7.2f} ({c['gain_bg_amortised_pct']:4.1f}%)"
                     )
@@ -470,6 +516,13 @@ def main() -> None:
     p.add_argument("--no-insert-policies", action="store_true")
     p.add_argument("--numa-mb", default=DEFAULT_NUMA_MB, help="pinned tier placement node:MiB,... (cpu_numa_local)")
     p.add_argument("--cpu-node", type=int, default=DEFAULT_CPU_NODE, help="the CPU expert cores' node (cpu_numa_local)")
+    p.add_argument("--promote-n", type=int, nargs="*", default=[], help="promotion intervals (decode forwards) to sweep")
+    p.add_argument("--promote-p", type=int, nargs="*", default=[], help="promotions per layer and boundary to sweep")
+    p.add_argument(
+        "--promote-bases", nargs="*", default=["cpu_by_score", "insert_all"], help="policies the sweep adds promotion to"
+    )
+    p.add_argument("--promotion-margin", type=float, default=1.0, help="SGLANG_MOE_HOT_BENEFIT_RATIO (default 1.0)")
+    p.add_argument("--promotion-sigmas", type=float, default=0.0, help="SGLANG_MOE_HOT_PROMOTION_SIGMAS (default 0)")
     p.add_argument("--out")
     args = p.parse_args()
 
@@ -496,6 +549,8 @@ def main() -> None:
             "split": split,
             "numa_mb": args.numa_mb,
             "cpu_node": args.cpu_node,
+            "promotion_margin": args.promotion_margin,
+            "promotion_sigmas": args.promotion_sigmas,
         },
         "c_cpu_table": table,
         "numa": "not modeled (host-slot node is not in the trace)",
@@ -518,7 +573,10 @@ def main() -> None:
         },
     }
     if not args.no_insert_policies:
-        report["insert_policies"] = insert_policy_results(loaded, args, split, insert_tables)
+        policies = list(INSERT_POLICIES) + [
+            f"{base}_promote_N{n}_P{p}" for base in args.promote_bases for n in args.promote_n for p in args.promote_p
+        ]
+        report["insert_policies"] = insert_policy_results(loaded, args, split, insert_tables, policies)
     if args.out:
         with open(args.out, "w") as f:
             json.dump(report, f, indent=1)
