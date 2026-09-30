@@ -101,7 +101,7 @@ def test_the_device_sequence_continues_from_the_page_head():
     assert int(_device(page=page).state[STATE_WORDS["posted"]]) == 7
 
 
-_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul}
+_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.LShift: operator.lshift}
 
 
 def _evaluate(node, known):

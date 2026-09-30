@@ -6,6 +6,10 @@ import contextlib
 import os
 import pathlib
 import shutil
+import signal
+import subprocess
+import sys
+import textwrap
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
@@ -191,3 +195,35 @@ def ram_miss_setup(
     }
     tables, roots = image_tables(layout, fmt.segment_map(), slabs, tmp_path, mirror_weights)
     return RamMissSetup(layout, fmt, specs, slabs, tables, roots)
+
+
+_HOST_SCRIPT_HEAD = """
+import pathlib, sys, time
+import torch
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word
+from sglang.test.dsv41_lease_sim import LeaseSim, post_record
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=int(sys.argv[2]))
+page = new_page(pin=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr")
+sim = LeaseSim(host, page, s.slabs)
+"""
+
+
+def run_host_script(tmp_path, body: str, *, capacity: int = 3, timeout_s: float = 60) -> subprocess.CompletedProcess:
+    """Run ``body`` in a fresh interpreter over an instrumented host (``s``, ``page``, ``host``, ``sim`` in scope).
+
+    Every service failure is fail-stop (``std::abort``), so a test of one must watch a child process die."""
+    return subprocess.run(
+        [sys.executable, "-c", _HOST_SCRIPT_HEAD + textwrap.dedent(body), str(tmp_path), str(capacity)],
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+
+
+def assert_aborted(result: subprocess.CompletedProcess, message: str) -> None:
+    """The child died of SIGABRT, printing ``message`` on its FATAL line, and never reached its ``print``."""
+    assert result.returncode == -signal.SIGABRT, (result.returncode, result.stderr[-2000:])
+    assert "reached" not in result.stdout, result.stdout
+    assert "FATAL" in result.stderr and message in result.stderr, result.stderr[-2000:]
