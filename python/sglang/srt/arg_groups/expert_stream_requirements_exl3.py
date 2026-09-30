@@ -68,11 +68,6 @@ def _check(cfg, budgets) -> None:
             "updater writes missed rows into hot slots during the gather, or, without it, promotions run "
             "synchronously through the pinned host tier; unset it"
         )
-    if envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get() and not budgets.graph_gather:
-        raise ValueError(
-            "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH posts advisories from the in-graph MoE; "
-            "it needs SGLANG_MOE_EXPERT_GRAPH_GATHER=1 with breakable decode graphs"
-        )
     graph = cfg.cuda_graph_config
     if not isinstance(graph, CudaGraphConfig):
         # run_resolution_pipeline's first offload pass runs before parse_cuda_graph_config,
@@ -146,8 +141,6 @@ def _check_cpu_experts(budgets) -> None:
         return
     needs = [
         ("SGLANG_MOE_EXPERT_GRAPH_GATHER=1", budgets.graph_gather),
-        ("SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.get()),
-        ("SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.get()),
         ("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get()),
         ("SGLANG_DSV41_ENABLE_LAYER_FUSION=1", envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()),
         ("SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list)", bool(envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get())),

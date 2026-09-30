@@ -1,24 +1,73 @@
-"""The device's side of the lease protocol, in Python, for the CPU tests (LEASE_PROTOCOL.md sections 7.3 and 7.4).
+"""The device's side of the lease protocol, in Python, for the CPU tests (analysis/dsv41-drive/LEASE_PROTOCOL.md).
 
 This drives the REAL C++ service through the request page and the lease block. It is a stand-in for the CUDA
-kernels and is not evidence about them: it is written from the same specification, so a property of the device
-(for example "a skipped copy emits no acknowledgement") holds here by construction and only a GPU test can show
-it of the kernels. Device stores to the acknowledgement and terminal words go through an outbox, so a test can
-deliver them in any order across words, as the model does.
+kernels and is not evidence about them: it is written from the same specification, so a property of the device holds
+here by construction and only a GPU test can show it of the kernels.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, page_word, piece_word, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import (
+    DEMAND_RECORDS,
+    DEMAND_RING,
+    MAX_IDS,
+    RECORD_BYTES,
+    RECORD_FIELDS,
+    WORDS,
+    page_word,
+    piece_word,
+)
 
-DEMAND_TAG = 1  # the tag of a LaneRequest generation word
 ALL_PIECES = 0xFF  # a PieceMask word's bits once every piece of the row is published
+
+
+def _i32(tensor: torch.Tensor, offset: int, count: int = 1) -> torch.Tensor:
+    return tensor[offset : offset + 4 * count].view(torch.int32)
+
+
+def _u16(tensor: torch.Tensor, offset: int) -> torch.Tensor:
+    return tensor[offset : offset + 2].view(torch.int16)
+
+
+def post_record(page: torch.Tensor, row: int, protect: Sequence[int], *, armed: bool) -> int:
+    """Post a demand record as the post kernel does (seq 0, payload, seq, then demand_head); returns its seq.
+
+    Plain tensor stores in program order: x86 keeps them in order, which is the seqlock order the service relies on."""
+    seq = (page_word(page, "demand_head") + 1) & 0xFFFFFFFF
+    if seq == 0:
+        seq = 1
+    record = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
+    ids = list(dict.fromkeys(int(e) for e in protect))[:MAX_IDS]
+    _i32(page, record + RECORD_FIELDS["seq"])[0] = 0
+    _u16(page, record + RECORD_FIELDS["row"])[0] = row
+    _u16(page, record + RECORD_FIELDS["protect_count"])[0] = len(ids)
+    _u16(page, record + RECORD_FIELDS["armed"])[0] = int(armed)
+    _i32(page, record + RECORD_FIELDS["protect"], MAX_IDS)[:] = torch.tensor(ids + [-1] * (MAX_IDS - len(ids)))
+    _i32(page, record + RECORD_FIELDS["seq"])[0] = seq - (1 << 32) if seq >= (1 << 31) else seq
+    _i32(page, WORDS["demand_head"])[0] = seq - (1 << 32) if seq >= (1 << 31) else seq
+    return seq
+
+
+def served(page: torch.Tensor, seq: int) -> bool:
+    """demand_done reached ``seq`` (cyclically): the service served it. There is no failed state."""
+    return ((page_word(page, "demand_done") - seq) & 0xFFFFFFFF) < (1 << 31)
+
+
+def wait_served(page: torch.Tensor, seq: int, timeout_s: float) -> bool:
+    """Poll demand_done as S does; False at the deadline (S would trap there)."""
+    deadline = time.monotonic() + timeout_s
+    while not served(page, seq):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(20e-6)
+    return True
 
 
 @dataclass
@@ -32,29 +81,20 @@ class SimRequest:
 
 @dataclass
 class SimWait:
-    status: int  # sim_wait: 1 served, 2 failed, 0 timed out, 3 fatal already raised
-    go: int  # the copy count the wait kernel would commit; 0 fails closed
-    ctx: list = field(default_factory=list)  # per lane (slot, slot_generation) when go > 0
-    reason: str = ""
+    served: bool
+    go: int  # lanes the chain copies: every lane once served, else 0
+    ctx: list = field(default_factory=list)  # per lane its (tag, host_slot) when served
 
 
 class LeaseSim:
     def __init__(self, host, page, slabs, *, epoch: int = 0):
         self.host, self.page, self.slabs, self.epoch = host, page, slabs, epoch
         self.block = host.lease_block
-        self.layout = host.lease_layout
-        self.outbox: list[tuple[str, int, tuple]] = []
 
     # ---- words of the block ----
 
     def _u64(self, offset: int) -> torch.Tensor:
         return self.block[offset : offset + 8].view(torch.int64)
-
-    def _i32(self, offset: int, count: int = 1) -> torch.Tensor:
-        return self.block[offset : offset + 4 * count].view(torch.int32)
-
-    def _d(self, offset: int) -> int:
-        return self.layout.d_offset + offset
 
     def read_u64(self, offset: int) -> int:
         return int(self._u64(offset)[0]) & 0xFFFFFFFFFFFFFFFF
@@ -63,73 +103,55 @@ class LeaseSim:
         self._u64(offset)[0] = value - (1 << 64) if value >= (1 << 63) else value
 
     def row_result(self, req: SimRequest, lane: int) -> dict:
-        """The service's RowResult for a lane, as the wait kernel would read it after acquiring ``ready``."""
+        """The service's RowResult for a lane, as W1 or S read it after acquiring ``ready``."""
         base = lease.ROW_RESULT + (req.idx * lease.LANES + lane) * lease.ROW_RESULT_BYTES
         tag, gen = lease.untag(self.read_u64(base))
-        fields = lease.ROW_RESULT_FIELDS
-        return {
-            "tag": tag,
-            "gen": gen,
-            "slot_generation": int(self._i32(base + fields["slot_generation"])[0]) & 0xFFFFFFFF,
-            "host_slot": int(self._i32(base + fields["host_slot"])[0]),
-            "expert": int(self._i32(base + fields["expert"])[0]),
-        }
+        return {"tag": tag, "gen": gen, "host_slot": int(_i32(self.block, base + lease.ROW_RESULT_FIELDS["host_slot"])[0])}
 
     def piece_word(self, req: SimRequest, lane: int) -> int:
         """The lane's PieceMask word (area P): ``generation << 8 | bits``, written only by the service."""
-        return self.read_u64(self.layout.piece_offset + (req.idx * lease.LANES + lane) * lease.PIECE_MASK_LINE_BYTES)
+        return self.read_u64(lease.PIECE_MASK + (req.idx * lease.LANES + lane) * lease.PIECE_MASK_LINE_BYTES)
 
-    def copy_done(self, req: SimRequest) -> tuple[int, int, int]:
-        """(tag, generation, lane mask) of the request's CopyDone word (area C), as the copy wait would read it."""
-        base = self.layout.copy_offset + req.idx * lease.COPY_DONE_BYTES
-        tag, gen = lease.untag(self.read_u64(base + lease.COPY_DONE_FIELDS["gen"]))
-        return tag, gen, int(self._i32(base + lease.COPY_DONE_FIELDS["mask"])[0]) & 0xFFFFFFFF
+    def copy_done(self, req: SimRequest) -> int:
+        """The generation in the request's CopyDone word (area C), as CC reads it."""
+        return self.read_u64(lease.COPY_DONE + req.idx * lease.COPY_DONE_BYTES)
 
     def copy_gate(self) -> int:
         """Area C's copy-wait gate (lease.gate_word), the word the decode stream's cuStreamWaitValue32 waits on."""
-        return int(self._i32(self.layout.copy_offset + lease.COPY_GATE)[0]) & 0xFFFFFFFF
+        return int(_i32(self.block, lease.COPY_GATE)[0]) & 0xFFFFFFFF
 
-    def arm_copy_wait(self, req: SimRequest) -> None:
-        """The copy wait's arm kernel for a request with COPYING lanes: close the gate for G, then publish CopyArm = G.
-        (Its Dekker re-read, which opens the gate itself when CopyDone is already there, is ``open_copy_gate``.)"""
+    def close_copy_gate(self, req: SimRequest) -> None:
+        """CW's close of the gate for a request with COPYING or CPU lanes."""
         self._set_gate(lease.gate_word(req.seq, "closed"))
-        self.write_u64(self.layout.copy_offset + lease.COPY_ARM, lease.tagged(lease.COPY_ARM_TAG, req.gen))
 
-    def open_copy_gate(self, req: SimRequest, outcome: str = "open") -> None:
-        """The arm kernel's own open of G's gate (CopyDone seen at the re-read, or fatal/shutdown)."""
-        self._set_gate(lease.gate_word(req.seq, outcome))
+    def open_copy_gate(self, req: SimRequest) -> None:
+        """CW's own open of G's gate, when CopyDone was already there after its close."""
+        self._set_gate(lease.gate_word(req.seq, "open"))
 
     def _set_gate(self, word: int) -> None:
-        self._i32(self.layout.copy_offset + lease.COPY_GATE)[0] = word - (1 << 32) if word >= (1 << 31) else word
+        _i32(self.block, lease.COPY_GATE)[0] = word - (1 << 32) if word >= (1 << 31) else word
 
     def dst_slot(self, req: SimRequest, lane: int) -> int:
         """The lane's destination slot as the post kernel wrote it into the LaneRequest."""
-        base = self._d(lease.LANE_REQUEST + req.idx * lease.LANE_REQUEST_BYTES) + lease.LANE_REQUEST_FIELDS["dst_slot"]
-        return int(self._i32(base + 4 * lane)[0])
+        base = lease.LANE_REQUEST + req.idx * lease.LANE_REQUEST_BYTES + lease.LANE_REQUEST_FIELDS["dst_slot"]
+        return int(_i32(self.block, base + 4 * lane)[0])
 
-    def sm_ack_offset(self, req: SimRequest) -> int:
-        return self._d(lease.SM_ACK + req.idx * lease.SM_ACK_BYTES)
+    def done_word(self, req: SimRequest) -> int:
+        return self.read_u64(lease.DONE + req.idx * lease.DONE_BYTES)
 
-    def sm_ack(self, req: SimRequest, generation: Optional[int] = None) -> None:
-        """The copy wait's acknowledgement that it has finished reading the request's leased slots."""
-        self.write_u64(self.sm_ack_offset(req), lease.tagged(lease.SM_ACK_TAG, req.gen if generation is None else generation))
+    def done(self, req: SimRequest, generation: Optional[int] = None) -> None:
+        """CW's Done: no kernel of the request reads one of its leased slots any more."""
+        self.write_u64(lease.DONE + req.idx * lease.DONE_BYTES, req.gen if generation is None else generation)
 
     def sm_fetch(self, req: SimRequest, dst: dict, names: Sequence[str]) -> None:
-        """The copy wait's SM half (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): copy ``names`` of every COPYING lane
-        from its leased slot into its destination row, then acknowledge the reads."""
+        """CW's SM half (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES): copy ``names`` of every COPYING lane from its
+        leased slot into its destination row. The caller publishes Done after it."""
         for lane in range(len(req.lanes)):
             result = self.row_result(req, lane)
             if result["tag"] != lease.COPYING or result["gen"] != req.gen:
                 continue
             for name in names:
                 dst[name][self.dst_slot(req, lane)].copy_(self.slabs[req.row][name][result["host_slot"]])
-        self.sm_ack(req)
-
-    def ack_offset(self, req: SimRequest, lane: int) -> int:
-        return self._d(lease.LANE_ACK + (req.idx * lease.LANES + lane) * lease.LANE_ACK_BYTES)
-
-    def terminal_offset(self, req: SimRequest) -> int:
-        return self._d(lease.TERMINAL + req.idx * lease.TERMINAL_BYTES)
 
     # ---- the device's steps ----
 
@@ -138,17 +160,15 @@ class LeaseSim:
         row: int,
         lanes: Sequence[int],
         *,
-        armed: bool = True,
         write_lane_request: bool = True,
-        need: Optional[Sequence[int]] = None,
         protect: Optional[Sequence[int]] = None,
         dst: Optional[Sequence[int]] = None,
-        copy_engine: bool = False,
+        captured: bool = False,
         cpu_weights: Optional[Sequence[float]] = None,
     ) -> SimRequest:
-        """``need`` and ``protect`` override what the post kernel would put in the record (its routes, not its lanes);
-        ``dst`` are the lanes' destination slots and ``copy_engine`` the LaneRequest flag (LEASE_PROTOCOL.md 7.6).
-        ``cpu_weights``: the lanes' routing weights and the CPU-experts flag, as a post with CPU input writes them."""
+        """The post kernel: the LaneRequest, then the demand record (armed iff there are lanes) and demand_head.
+        ``protect`` overrides the record's protect ids (the post writes the routes, not the lanes); ``dst`` are the
+        lanes' destination slots, ``captured`` the LaneRequest flag, ``cpu_weights`` the lanes' routing weights."""
         head = page_word(self.page, "demand_head")
         seq = (head + 1) & 0xFFFFFFFF
         if seq == 0:
@@ -158,80 +178,41 @@ class LeaseSim:
         idx = (seq - 1) % DEMAND_RECORDS
         lanes = tuple(int(e) for e in lanes)
         if write_lane_request:
-            base = self._d(lease.LANE_REQUEST + idx * lease.LANE_REQUEST_BYTES)
+            base = lease.LANE_REQUEST + idx * lease.LANE_REQUEST_BYTES
             fields = lease.LANE_REQUEST_FIELDS
             self.write_u64(base + fields["gen"], 0)  # invalidate first, as the seqlock writer does
-            self._i32(base + fields["count"], 2)[:] = torch.tensor([len(lanes), row], dtype=torch.int32)
+            _i32(self.block, base + fields["count"])[0] = len(lanes)
+            _i32(self.block, base + fields["flags"])[0] = lease.LANE_REQUEST_FLAG_CAPTURED if captured else 0
             padded = list(lanes) + [-1] * (lease.LANES - len(lanes))
-            self._i32(base + fields["expert"], lease.LANES)[:] = torch.tensor(padded, dtype=torch.int32)
+            _i32(self.block, base + fields["expert"], lease.LANES)[:] = torch.tensor(padded, dtype=torch.int32)
             slots = list(dst or []) + [-1] * (lease.LANES - len(dst or []))
-            self._i32(base + fields["dst_slot"], lease.LANES)[:] = torch.tensor(slots, dtype=torch.int32)
-            flags = lease.LANE_REQUEST_FLAG_COPY_ENGINE if copy_engine else 0
-            if cpu_weights is not None:
-                flags |= lease.LANE_REQUEST_FLAG_CPU_EXPERTS
-                weights = list(cpu_weights) + [0.0] * (lease.LANES - len(cpu_weights))
-                self._i32(base + fields["weight"], lease.LANES)[:] = torch.tensor(weights, dtype=torch.float32).view(
-                    torch.int32
-                )
-            self._i32(base + fields["flags"])[:] = torch.tensor([flags], dtype=torch.int32)
-            self.write_u64(base + fields["gen"], lease.tagged(DEMAND_TAG, gen))
-        mapping = self.host.mapping(row)
-        distinct = list(dict.fromkeys(lanes))
-        need = [e for e in distinct if mapping[e] < 0] if need is None else list(need)
-        protect = distinct if protect is None else list(protect)
-        assert sim_post(self.page, row, need=need, protect=protect, armed=armed, lanes=len(lanes)) == seq
+            _i32(self.block, base + fields["dst_slot"], lease.LANES)[:] = torch.tensor(slots, dtype=torch.int32)
+            weights = list(cpu_weights or []) + [0.0] * (lease.LANES - len(cpu_weights or []))
+            _i32(self.block, base + fields["weight"], lease.LANES)[:] = torch.tensor(weights, dtype=torch.float32).view(
+                torch.int32
+            )
+            self.write_u64(base + fields["gen"], gen)
+        protect = list(dict.fromkeys(lanes)) if protect is None else list(protect)
+        assert post_record(self.page, row, protect, armed=bool(lanes)) == seq
         return SimRequest(seq, gen, idx, row, lanes)
 
-    def wait(self, req: SimRequest, timeout_s: float = 1.0, *, publish_terminal: bool = True) -> SimWait:
-        """The wait kernel's decisions: validate every lane's row result; commit or fail closed.
-
-        A lane granted under tag LOADING (piece streaming) is accepted as the stream kernel judges it once it has
-        acquired a served ``demand_done``: its PieceMask word, re-read now, must carry every piece under the
-        request's generation (piece-streaming plan section 5); anything less fails closed, as an identity failure."""
-        status = sim_wait(self.page, req.seq, timeout_s)
-        if status != 1:
-            return self._fail(req, status, f"status {status}", publish_terminal)
+    def wait(self, req: SimRequest, timeout_s: float = 1.0) -> SimWait:
+        """S's judgement once demand_done reached the request: every lane is published for G, a LOADING lane with
+        every piece. Raises on a published request that breaks that (S would trap); a timeout is ``served=False``."""
+        if not wait_served(self.page, req.seq, timeout_s):
+            return SimWait(False, 0, [])
         ctx = []
-        for lane, expert in enumerate(req.lanes):
+        for lane in range(len(req.lanes)):
             result = self.row_result(req, lane)
-            loaded = result["tag"] == lease.LOADING and self.piece_word(req, lane) == piece_word(req.gen, ALL_PIECES)
-            if result["gen"] != req.gen or not (result["tag"] == lease.READY or loaded) or result["expert"] != expert or result["host_slot"] < 0:
-                return self._fail(req, status, f"lane {lane}: {result}", publish_terminal)
-            ctx.append((result["host_slot"], result["slot_generation"]))
-        return SimWait(status, len(req.lanes), ctx)
-
-    def _fail(self, req: SimRequest, status: int, reason: str, publish_terminal: bool) -> SimWait:
-        if publish_terminal and req.lanes:
-            self.terminal(req, (1 << len(req.lanes)) - 1)
-        return SimWait(status, 0, [], reason)
+            if result["gen"] != req.gen or result["tag"] == 0:
+                raise AssertionError(f"lane {lane} of a served request is not published: {result}")
+            if result["tag"] == lease.LOADING and self.piece_word(req, lane) != piece_word(req.gen, ALL_PIECES):
+                raise AssertionError(f"lane {lane} of a served request is missing pieces")
+            ctx.append((result["tag"], result["host_slot"]))
+        return SimWait(True, len(req.lanes), ctx)
 
     def copy(self, req: SimRequest, waited: SimWait) -> list[dict]:
-        """What the copy kernel would deliver: the bytes of each committed lane's leased slot, read now."""
+        """What C1 and S would deliver: the bytes of each lane's leased slot, read now."""
         return [
-            {name: tensor[slot].clone() for name, tensor in self.slabs[req.row].items()} for slot, _ in waited.ctx[: waited.go]
+            {name: tensor[slot].clone() for name, tensor in self.slabs[req.row].items()} for _, slot in waited.ctx[: waited.go]
         ]
-
-    def ack(self, req: SimRequest, waited: SimWait, *, lanes: Optional[Sequence[int]] = None) -> None:
-        """The acknowledgement kernel: for each committed lane re-read SlotGen and publish CONSUMED or VIOLATED."""
-        generations = self.host.mapped_slot_generations(req.row)
-        for lane in range(waited.go) if lanes is None else lanes:
-            slot, granted = waited.ctx[lane]
-            outcome = lease.CONSUMED if generations[slot] == granted else lease.VIOLATED
-            self.outbox.append(("ack", lane, (self.ack_offset(req, lane), lease.tagged(outcome, req.gen))))
-
-    def terminal(self, req: SimRequest, mask: int, reason: int = 1) -> None:
-        self.outbox.append(("term", 0, (self.terminal_offset(req), mask, reason, lease.tagged(1, req.gen))))
-
-    def deliver(self, order: Optional[Sequence[int]] = None) -> None:
-        """Land pending device stores on the block; ``order`` picks which, in what order (default: all, FIFO)."""
-        picked = list(range(len(self.outbox))) if order is None else list(order)
-        for i in picked:
-            kind, _, payload = self.outbox[i]
-            if kind == "ack":
-                self.write_u64(payload[0], payload[1])
-            else:
-                offset, mask, reason, word = payload
-                self._i32(offset, 2)[:] = torch.tensor([mask, reason], dtype=torch.int32)
-                self.write_u64(offset + lease.TERMINAL_FIELDS["gen"], word)
-        remaining = [item for j, item in enumerate(self.outbox) if j not in set(picked)]
-        self.outbox = remaining

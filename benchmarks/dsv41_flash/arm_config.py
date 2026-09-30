@@ -114,7 +114,6 @@ def recipe_env(*, paths: Paths, res: Resources) -> dict[str, str]:
         "SGLANG_MOE_PREFETCH_MAX_CANDIDATES": "0",
         GRAPH_GATHER_ENV: "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
-        "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
     }
     if paths.mirror_dirs:
         env["SGLANG_MOE_EXPERT_MIRROR_DIRS"] = paths.mirror_dirs

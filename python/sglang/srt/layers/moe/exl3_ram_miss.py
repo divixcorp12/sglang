@@ -19,7 +19,6 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.moe import expert_lease_block
 from sglang.kernels.ops.moe.expert_stream_transport import (
     MAX_IDS,
     ExpertStreamDevice,
@@ -232,15 +231,6 @@ def check_sm_small_copies(cfg: Dsv41Config) -> None:
         )
 
 
-def check_piece_stream(cfg: Dsv41Config) -> None:
-    """Refuse SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM without two-phase: it is a mode of two-phase. The row-image
-    reader publishes each piece on its own thread, so piece streaming needs nothing else."""
-    if cfg.enable_ram_miss_piece_stream and not cfg.enable_ram_miss_two_phase:
-        raise RuntimeError(
-            "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM needs SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE"
-        )
-
-
 def open_service_row_images(layout, segments, mirrors: dict, direct: bool, streamers) -> RowImageSet:
     """The row images the service reads with: the only reader (plan 2026-09-29-hotpath-zero-overhead D4).
 
@@ -248,9 +238,8 @@ def open_service_row_images(layout, segments, mirrors: dict, direct: bool, strea
     mirrors are (``mirrors`` is ``mirror_table_args()``). Refused without mirror dirs (there is nowhere to read them
     from), without O_DIRECT reads (the point is a readv straight into the pinned slabs), and by ``open_row_images``
     unless every root holds a complete set matching this checkpoint for every streamed layer, naming the converter
-    (scripts/dsv41/build_row_images.py). The service runs in lease mode unconditionally: a direct read overwrites its
-    victim slot from submission, and only the lease check in victim selection keeps a slot a GPU copy may still be
-    reading from being chosen."""
+    (scripts/dsv41/build_row_images.py). A direct read overwrites its victim slot from submission, and only the lease
+    check in victim selection keeps a slot a GPU copy may still be reading from being chosen."""
     if not mirrors:
         raise RuntimeError(
             "exl3 RAM miss: the RAM-miss service reads row images and needs SGLANG_MOE_EXPERT_MIRROR_DIRS (roots "
@@ -381,16 +370,12 @@ class NativePinnedSlotTable:
 
 
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
-    """``PinnedTierRowBackend`` whose translation posts RAM misses to the thread and waits.
+    """``PinnedTierRowBackend`` whose gather is the lease chain (analysis/dsv41-drive/LEASE_PROTOCOL.md).
 
-    ``routes`` holds the layer's routed experts (the protect set); ``_apply_graph``
-    copies them in before each gather. ``post`` = post kernel, wait kernel (which
-    writes ``host_rows``, ``keep`` and ``ram_miss``), then the segment copy.
-    ``host_row_map`` is the pinned tier's device slot map: the wait reads the host
-    slot map instead, but the streamer checks that the tier's map never moved.
-    ``planned`` pads the plan's expert ids to at least ``MAX_IDS`` lanes (-1 past
-    the plan): the post kernel reads ``min(count, MAX_IDS)`` lanes, and ``count``
-    lives on the device, so no host check can bound it.
+    ``routes`` holds the layer's routed experts (the protect set); ``_apply_graph`` copies them in before each
+    gather. ``planned`` pads the plan's expert ids to at least ``MAX_IDS`` lanes (-1 past the plan): the post kernel
+    reads ``min(count, MAX_IDS)`` lanes, and ``count`` lives on the device, so no host check can bound it. Every lane
+    of a gather is delivered or the process stops, so ``keep`` stays 1 and the delivered count is the plan's.
     """
 
     name = "exl3_ram_miss"
@@ -401,13 +386,11 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         host_row_map: torch.Tensor,
         device_side: ExpertStreamDevice,
         row: int,
-        next_row: int,
         capacity: int,
-        two_phase: bool = False,
+        stream_maps: Mapping[int, torch.Tensor],
         hit_wait_ns: int = 100_000,
         hot_slots: Optional[torch.Tensor] = None,
         hot_capacity: int = 0,
-        stream_maps: Optional[Mapping[int, torch.Tensor]] = None,
         route_log=None,
         copy_engine: bool = False,
         copy_sm_table: Optional[torch.Tensor] = None,
@@ -416,25 +399,18 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
         self.row = row
-        self.next_row = next_row
         self.routes = torch.full((capacity,), -1, dtype=torch.int64, device=host_row_map.device)
         self.planned = torch.full((max(capacity, MAX_IDS),), -1, dtype=torch.int64, device=host_row_map.device)
-        # Task 6 V1. Off builds the Task 5 batched chain, which is the A1 arm every V1 measurement is reported
-        # against, so both chains have to exist in one build.
-        self.two_phase = two_phase
         self.hit_wait_ns = hit_wait_ns
         self.hot_slots = hot_slots
         self.hot_capacity = hot_capacity
-        # Piece streaming: per tag, the stream kernel's map of that tag's copy table (stream_segment_map).
-        self.piece_stream = two_phase and device_side.piece_stream
-        if self.piece_stream and (stream_maps is None or set(stream_maps) != set(self.segments)):
-            raise ValueError("piece streaming needs a stream segment map for every copy table")
-        self.stream_maps = dict(stream_maps) if self.piece_stream else None
+        # Per tag, S's map of that tag's copy table (stream_segment_map).
+        if set(stream_maps) != set(self.segments):
+            raise ValueError("the stream kernel needs a stream segment map for every copy table")
+        self.stream_maps = dict(stream_maps)
         # A GraphRouteLog only when the stage trace is on; None builds exactly the untraced chain.
         self.route_log = route_log
-        # LEASE_PROTOCOL.md 7.6: the chain also waits for the service's copy-engine copies before finalize.
-        if copy_engine and not self.piece_stream:
-            raise ValueError("the copy engine runs in the piece-streaming chain only")
+        # The service may copy a captured post's hits with its copy engine; CW waits for them.
         self.copy_engine = copy_engine
         # SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: the copy-table rows the copy wait reads itself.
         self.copy_sm_table = copy_sm_table
@@ -444,122 +420,61 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             raise ValueError("CPU experts are completed by the copy engine's copy wait")
         self.cpu_experts = cpu_experts
         self.cpu_input = None
+        self._delivered: Optional[torch.Tensor] = None
 
     @property
     def delivered_count(self) -> torch.Tensor:
-        if self.device_side.go_count is None:
-            raise RuntimeError("EXL3 DIRECT requires leased delivery")
-        return self.device_side.go_total if self.two_phase else self.device_side.go_count
+        if self._delivered is None:
+            raise RuntimeError("EXL3 DIRECT reads the delivered count of a gather this backend posted")
+        return self._delivered
 
     def _stage_planned(self, plan) -> None:
-        """Copy the plan's lane experts into the captured ``planned`` buffer, bounding the plan first.
-
-        Every chain needs this and none of them can skip it: the post kernel reads each lane's expert
-        out of ``planned``, which is otherwise still at the -1 fill it was allocated with, and a -1 lane
-        is rejected by the ``expert >= 0`` guard. It lives here rather than in ``translate`` because the
-        two-phase chain does not call ``translate``; when the copy lived there, two-phase posted a lane
-        array of -1 and fail-stopped on its first layer.
-
-        The bound check belongs with the copy for the same reason. Kept here, a plan wider than the
-        buffer raises at capture; left in ``translate``, two-phase degrades it to a device-side
-        ``kLeaseReasonCount`` fail-stop.
-        """
+        """Copy the plan's lane experts into the captured ``planned`` buffer, bounding the plan first: the post
+        kernel reads each lane's expert out of ``planned``, which is otherwise still at its -1 fill."""
         lanes = plan.expert_ids.numel()
         if lanes > self.planned.numel():
             raise ValueError(f"a plan of {lanes} lanes does not fit the backend's {self.planned.numel()}")
         self.planned[:lanes].copy_(plan.expert_ids)  # a device copy: captured, refreshed every replay
 
-    def translate(self, tag, plan) -> None:
-        self._stage_planned(plan)
-        self.device_side.post(
-            self.row, self.planned, plan.count, self.routes, self.next_row,
-            self.hot_slots, self.hot_capacity,
-        )
-        self.device_side.wait(self.row, self.planned, plan.count, self.host_rows, self.keep, self.ram_miss)
-
     def post(self, tag, plan) -> None:
-        """Without leases: the inherited translate then copy of ``plan.count`` rows.
-
-        With them (LEASE_PROTOCOL.md 7): the copy's active count is the wait kernel's ``go_count``, not the plan's
-        ``count`` (zero on any refusal, so a refused request reads nothing), and the acknowledgement kernel follows the
-        copy in the same stream. Whether a record is armed is decided by the post kernel and read back by the service
-        from the record, so no arming decision is made here.
-        """
+        """post -> W1 -> C1 -> S -> CW -> stream wait -> CC, one linear chain in one stream. C1 copies W1's compacted
+        plan (its own source rows, destination slots and committed count); S copies the rest piece by piece."""
         if self.route_log is not None:
             # ``routes`` was refreshed by _apply_graph and ``plan.count`` by the planner, both earlier
             # in this gather on this stream.
             self.route_log.record(self.row, self.routes, plan.count)
-        if self.device_side.lease_block is None:
-            super().post(tag, plan)
-            return
-        if not self.two_phase:
-            self.translate(tag, plan)
-            copy_expert_row_segments_gpu(self.segments[tag], self.host_rows, plan.slots, self.device_side.go_count)
-            self.device_side.ack(self.keep)
-            return
-        # V1 two-phase (D7): post -> W1 -> C1 -> A1 -> W2 -> C2 -> A2 -> F, one linear chain in one stream. Each
-        # stage copies its own compacted plan, so each copy takes that stage's source rows, destination slots and
-        # committed count rather than the plan's lane-ordered arrays.
         self._stage_planned(plan)
-        if self.copy_engine:
-            # Only a captured graph lets the service copy: an eager forward may load a kernel module while the copy
-            # wait spins, and a load blocks the copy thread's driver calls (engram-no-hostnode plan, section 10).
-            capturing = torch.cuda.is_current_stream_capturing()
-            if self.cpu_experts and self.cpu_input is None:
-                raise RuntimeError(f"CPU experts: row {self.row} gathered without its input (Exl3MoEMethod._apply_graph)")
-            self.device_side.post(
-                self.row, self.planned, plan.count, self.routes, self.next_row,
-                self.hot_slots, self.hot_capacity, dst_slots=plan.slots, copy_engine=capturing,
-                cpu_input=self.cpu_input if capturing and self.cpu_experts else None,
-            )
-            self.device_side.copy_engine_captured |= capturing
-        else:
-            self.device_side.post(
-                self.row, self.planned, plan.count, self.routes, self.next_row,
-                self.hot_slots, self.hot_capacity,
-            )
-        self.device_side.hit_wait(self.row, self.planned, plan.count, plan.slots, self.hit_wait_ns)
-        copy_expert_row_segments_gpu(
-            self.segments[tag], self.device_side.host_rows_1, self.device_side.dst_slots_1, self.device_side.go_1
+        # Only a captured graph lets the service copy: an eager forward may load a kernel module while the copy wait
+        # holds the stream, and a load blocks the copy thread's driver calls (engram-no-hostnode plan, section 10).
+        captured = self.copy_engine and torch.cuda.is_current_stream_capturing()
+        if captured and self.cpu_experts and self.cpu_input is None:
+            raise RuntimeError(f"CPU experts: row {self.row} gathered without its input (Exl3MoEMethod._apply_graph)")
+        side = self.device_side
+        side.post(
+            self.row, self.planned, plan.count, self.routes, plan.slots, self.hot_slots, self.hot_capacity,
+            captured=captured, cpu_input=self.cpu_input if captured and self.cpu_experts else None,
         )
-        self.device_side.stage_ack(1)
-        if self.piece_stream:
-            # Piece streaming (plan 5): post -> W1 -> C1 -> A1 -> S -> A2 -> F. S copies the rest piece by piece
-            # while the read runs, in place of W2 and C2, and commits go_2 only for a served request.
-            self.device_side.stream(
-                self.row, self.planned, plan.count, plan.slots, self.ram_miss, self.segments[tag], self.stream_maps[tag]
-            )
-            self.device_side.stage_ack(2)
-            if self.copy_engine:
-                # post -> W1 -> C1 -> A1 -> S -> A2 -> CW -> F: the hits' DMA copies overlap S's reads and copies.
-                self.device_side.copy_wait(plan.count, self.copy_sm_table)
-            self.device_side.finalize(plan.count, self.keep)
-            torch.add(self.device_side.go_1, self.device_side.go_2, out=self.device_side.go_total)
-            if self.copy_engine:
-                self.device_side.go_total.add_(self.device_side.go_ce)
-            return
-        self.device_side.rest_wait(self.row, self.planned, plan.count, plan.slots, self.ram_miss)
-        copy_expert_row_segments_gpu(
-            self.segments[tag], self.device_side.host_rows_2, self.device_side.dst_slots_2, self.device_side.go_2
-        )
-        self.device_side.stage_ack(2)
-        self.device_side.finalize(plan.count, self.keep)
-        # Lanes each stage copied into plan.slots; finalize keeps only a request whose stages copied every lane.
-        torch.add(self.device_side.go_1, self.device_side.go_2, out=self.device_side.go_total)
+        side.copy_engine_captured |= captured
+        side.hit_wait(self.row, self.planned, plan.count, plan.slots, self.hit_wait_ns)
+        copy_expert_row_segments_gpu(self.segments[tag], side.host_rows_1, side.dst_slots_1, side.go_1)
+        side.stream(self.row, self.planned, plan.count, plan.slots, self.segments[tag], self.stream_maps[tag])
+        side.copy_wait(plan.count, self.copy_sm_table)
+        self._delivered = plan.count
 
 
 # Decode forwards after the first copy-engine capture that run unarmed, so that the kernels a decode step launches
 # for the first time (lazily loaded under CUDA_MODULE_LOADING=LAZY, outside any hook) load while no copy wait can spin
-# (7.6). Counting batches instead armed inside the server's 8-token warm-up request, whose first decode steps then
-# deadlocked (smokes abba1-on at 4 batches, diag arm1-on at 1). 16 covers the warm-up; arbitrary beyond that.
+# (LEASE_PROTOCOL.md, "Copy engine"). Counting batches instead armed inside the server's 8-token warm-up request,
+# whose first decode steps then deadlocked (smokes abba1-on at 4 batches, diag arm1-on at 1). 16 covers the warm-up;
+# arbitrary beyond that.
 COPY_ENGINE_ARM_DECODES = 16
 # The prefill share: one eager gather chunk, the most rows gather_rows protects at once (the replay's best bound,
 # analysis/dsv41-drive/prefill-evict/ram_replay.py).
 PREFILL_SHARE_ROWS = EXL3_MAX_GATHER_ROWS
 
-# The copy engine needs every kernel of every library loaded before it arms (LEASE_PROTOCOL.md 7.6, "Module loading").
-# Under LAZY (torch's default) a kernel loads at its first launch, and a first launch after arming can stop the copy
-# thread's copies until the copy-wait timeout fail-stops the server: the soak's seeded pair of min_p requests (a 525-
+# The copy engine needs every kernel of every library loaded before it arms. Under LAZY (torch's default) a kernel loads
+# at its first launch, and a first launch after arming can stop the copy thread's copies until the copy-wait timeout
+# fail-stops the server: the soak's seeded pair of min_p requests (a 525-
 # token prompt, then a 3,314-token one) did so on the second's 14th decode step, every time, and never under EAGER
 # (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). EAGER loads a library's kernels when it is loaded, so
 # what remains is a library loaded after arming, which the module-load guard drains for.
@@ -573,17 +488,17 @@ def check_copy_engine_module_loading(environ: Mapping[str, str]) -> None:
         raise RuntimeError(
             "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE needs CUDA_MODULE_LOADING="
             f"{COPY_ENGINE_MODULE_LOADING} in the server's environment (it is {value or 'unset'}): a kernel loaded "
-            "lazily after the copy engine arms can hold its copies back until the RAM-miss deadline stops the server "
-            "(LEASE_PROTOCOL.md 7.6). EAGER costs ~1 GiB of device memory; raise --mem-fraction-static by ~0.03."
+            "lazily after the copy engine arms can hold its copies back until the RAM-miss deadline stops the server. "
+            "EAGER costs ~1 GiB of device memory; raise --mem-fraction-static by ~0.03."
         )
 
 
 def watchdog_wait_s(timeout_ms: int) -> float:
     """The C++ watchdog's abort limit for a wait timeout of ``timeout_ms``: max(30 s, 3 x timeout).
 
-    It must outlast the device wait (a slow demand fails stop cleanly at the timeout, not
-    by abort) and the eager pause bound, 2 x timeout + 1 s (``before_host_use``). Three
-    times the timeout exceeds both for any timeout over 1 s; 30 s covers the rest.
+    It must outlast S's deadline (a slow demand traps the device at the timeout) and the eager pause bound,
+    2 x timeout + 1 s (``before_host_use``). Three times the timeout exceeds both for any timeout over 1 s; 30 s
+    covers the rest.
     """
     return max(30.0, 3.0 * timeout_ms / 1000)
 
@@ -633,30 +548,20 @@ class Exl3RamMissService:
         self._shut_down = False
         self._quarantined = False
         self._completed = False
-        # Set once ensure_started has put the host in lease mode, which it always does (row images need it): the host
-        # and the device are both configured from this one field, so they cannot disagree about whether a record is
-        # leased.
-        self.lease_mode = False
-        # Task 6 V1, fixed in ensure_started beside lease_mode so the host, the device and every backend cannot
-        # disagree about which chain this process runs.
-        self.two_phase = False
-        self.piece_stream = False
-        # LEASE_PROTOCOL.md 7.6. Enabled at start, armed by fail_stop_check once COPY_ENGINE_ARM_DECODES decode
-        # forwards have run after a copy-engine graph was captured, so the first decode steps load their kernels
-        # unarmed. Once armed, an eager forward and a Triton module load first drain the device.
+        # Enabled at start, armed by fail_stop_check once COPY_ENGINE_ARM_DECODES decode forwards have run after a
+        # copy-engine graph was captured, so the first decode steps load their kernels unarmed. Once armed, an eager
+        # forward and a Triton module load first drain the device.
         self.copy_engine = False
         self.sm_small_copies = False
         # SGLANG_DSV41_CPU_EXPERTS (plan 2026-09-29-dsv41-cpu-experts, Step B): the CPU expert service; None when off.
         self.cpu_experts = None
         self._cpu_retune_batches = 0
         self._cpu_batches = 0
-        # SGLANG_DSV41_ENABLE_LEASE_PDL (LEASE_PROTOCOL.md 7.7): the lease chain's kernels launch with PDL.
+        # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
         self._copy_armed = False
         self._copy_decodes = 0
         self.copy_engine_module_loads = 0  # Triton loads that drained the device first
-        # SGLANG_DSV41_ENABLE_NATIVE_PREFETCH (exl3_native_prefetch.py): needs the copy engine; None when off.
-        self.native_prefetch = None
         self.hit_wait_ns = 100_000
         # A prefill fill's wait gives up after the watchdog's limit, which aborts a hung fill first.
         self.fill_timeout_s = watchdog_wait_s(2000) + 5.0
@@ -732,44 +637,15 @@ class Exl3RamMissService:
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
-            # Lease mode is unconditional: a row-image read overwrites its victim slot from submission, so only the
-            # lease check in victim selection keeps a slot the device may still be copying from out of reach.
-            lease_mode = True
-            two_phase = cfg.enable_ram_miss_two_phase
-            piece_stream = cfg.enable_ram_miss_piece_stream
-            check_piece_stream(cfg)
-            host.enable_lease_mode()  # before the thread starts (the host refuses it afterwards)
-            if two_phase:
-                host.enable_two_phase()
-            if piece_stream:
-                host.enable_piece_stream()
             copy_engine = cfg.enable_ram_miss_copy_engine
             check_sm_small_copies(cfg)
             if copy_engine:
                 check_copy_engine_module_loading(os.environ)
-                if not piece_stream:
-                    raise RuntimeError(
-                        "exl3 RAM miss: SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE needs "
-                        "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM"
-                    )
                 # Before the thread starts; unarmed. The watchdog bounds each copy wait by the RAM-miss timeout.
                 host.enable_copy_engine(torch.cuda.current_device(), wait_timeout_ms=cfg.ram_miss_timeout_ms)
             cpu_experts = None
             if envs.SGLANG_DSV41_CPU_EXPERTS.get():
                 cpu_experts = self._start_cpu_experts(cfg, host, fmt, streamers, pin)
-            native_prefetch = None
-            if cfg.enable_native_prefetch:
-                if not copy_engine:
-                    raise RuntimeError(
-                        "exl3 RAM miss: SGLANG_DSV41_ENABLE_NATIVE_PREFETCH needs "
-                        "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE: the prefetch copies run on the copy engine"
-                    )
-                from sglang.kernels.ops.moe.expert_stream_transport import new_prefetch_page
-                from sglang.srt.layers.moe.exl3_native_prefetch import NativePrefetch
-
-                prefetch_page = new_prefetch_page(pin=pin)
-                host.enable_native_prefetch(prefetch_page)  # before the thread starts
-                native_prefetch = NativePrefetch(prefetch_page, self)
             if get_exl3_stream_trace().enabled:
                 host.enable_trace()  # before the thread starts: without a trace file it takes no timestamps
                 self._stages_traced = True
@@ -797,14 +673,11 @@ class Exl3RamMissService:
             # before anything can release them.
             host.stop()
             raise
-        self.page, self.slot_map, self.host, self.lease_mode = page, slot_map, host, lease_mode
+        self.page, self.slot_map, self.host = page, slot_map, host
         self.hot_page = hot_page
-        self.two_phase = two_phase
-        self.piece_stream = piece_stream
         self.copy_engine = copy_engine
         self.cpu_experts = cpu_experts
         self._cpu_retune_batches = envs.SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES.get()
-        self.native_prefetch = native_prefetch
         self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
         self.lease_pdl = cfg.enable_lease_pdl
         self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
@@ -818,8 +691,8 @@ class Exl3RamMissService:
         if share_recorder is not None:
             share_recorder.register_pre_forward_observer(self._set_prefill_share)
         logger.info(
-            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases on, "
-            "row images on, copy engine %s, CPU experts %s, build %s",
+            "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, "
+            "copy engine %s, CPU experts %s, build %s",
             len(tables.layer_ids), len(tables.paths), tables.slot_bytes, cfg.ram_miss_timeout_ms,
             "on" if copy_engine else "off", "on" if cpu_experts is not None else "off", self.host.variant,
         )
@@ -898,48 +771,32 @@ class Exl3RamMissService:
             manager.register_fail_stop_check(self.fail_stop_check)
             updater = getattr(manager, "gpu_residency", None)
             if updater is None or not updater.insert_direct:
-                if self.native_prefetch is not None:
-                    raise RuntimeError("exl3 native prefetch needs the GPU residency updater at DIRECT insert-on-miss")
                 manager.add_residency_listener(self.on_residency)
             else:
                 self._enable_gpu_hot(updater)
-                if self.native_prefetch is not None:
-                    self.native_prefetch.bind(updater)
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
         if streamer.graph_gather_rows > MAX_IDS:
-            # The post kernel requests min(count, MAX_IDS) lanes, so a plan can carry lanes the service is
-            # never asked for; the wait kernel then fail-stops on the first of them that is not in RAM.
+            # The post kernel requests min(count, MAX_IDS) lanes and W1 traps on a wider plan.
             raise ValueError(
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
                 f"per call but the service requests at most {MAX_IDS} lanes"
             )
         cache = streamer.hot_cache
         if self.device_side is None:
-            from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
-
-            if self.host.lease_header()["abi_version"] != expert_lease_block.ABI_VERSION:
-                raise RuntimeError(
-                    f"exl3 RAM miss: the lease block's ABI version is {self.host.lease_header()['abi_version']}, "
-                    f"the device kernels speak {expert_lease_block.ABI_VERSION}"
-                )
             self.device_side = ExpertStreamDevice(
                 self.page,
-                self.slot_map,
+                # The host owns the block (ExpertStreamHost allocates it); the device reads the same one.
+                self.host.lease_block,
                 device=cache.device,
                 layers=len(self._rows),
+                experts=self.host.experts,
                 timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
-                advise=prefetch_enabled(),
-                # The host owns the block (ExpertStreamHost allocates it); the device reads the same one.
-                lease_block=self.host.lease_block,
-                lease_layout=self.host.lease_layout,
+                piece_runs=self.host.piece_runs(),
+                row_capacities=[int(c) for c in self.host.tables.capacity],
                 hot_page=self.hot_page if self.gpu_hot_enabled else None,
-                piece_stream=self.piece_stream,
-                piece_runs=self.host.piece_runs() if self.piece_stream else None,
                 lease_pdl=self.lease_pdl,
             )
-            # Every layer's backend reaches the prefetch hooks through its device side (Exl3MoEMethod._apply_graph).
-            self.device_side.native_prefetch = self.native_prefetch
             if self.cpu_experts is not None:
                 self.device_side.enable_cpu_experts(self.cpu_experts.x_rows, self.cpu_experts.out_rows)
             if self._stages_traced:
@@ -951,7 +808,6 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
-        next_row = row + 1 if row + 1 < len(self._rows) else -1
         if self.route_log is not None:
             self.route_log.bind(row, streamer.layer_id, cache.capacity)
         previous = streamer.row_backend
@@ -968,16 +824,12 @@ class Exl3RamMissService:
                 sm_mask = sm_copy_mask(names)
                 copy_sm = sm_copy_table(segments, sm_mask) if sm_mask else None
         streamer.row_backend = Exl3RamMissRowBackend(
-            previous.segments, previous.host_row_map, self.device_side, row, next_row, streamer.graph_gather_rows,
-            two_phase=self.two_phase, hit_wait_ns=self.hit_wait_ns,
+            previous.segments, previous.host_row_map, self.device_side, row, streamer.graph_gather_rows,
+            {tag: stream_segment_map(segments, self.host.tables, row) for tag, segments in previous.segments.items()},
+            hit_wait_ns=self.hit_wait_ns,
             hot_slots=(manager.gpu_residency.slot_to_expert[manager.gpu_residency.layer_ids.index(streamer.layer_id)]
                        if self.gpu_hot_enabled else None),
             hot_capacity=cache.capacity if self.gpu_hot_enabled else 0,
-            stream_maps=(
-                {tag: stream_segment_map(segments, self.host.tables, row) for tag, segments in previous.segments.items()}
-                if self.piece_stream
-                else None
-            ),
             route_log=self.route_log,
             copy_engine=self.copy_engine,
             copy_sm_table=copy_sm,
@@ -1035,30 +887,16 @@ class Exl3RamMissService:
             self.host.set_hot(self.row_of(layer_id), slot_to_expert)
 
     def fail_stop_check(self) -> None:
-        """Per batch (the scheduler's fail-stop hook,
-        ``run_fail_stop_checks``): raise when a wait timed out or failed.
-
-        This is also where a warmup or capture timeout surfaces: no check runs between
-        capture and the first batch, so a fatal raised during warmup stops the process
-        at the first batch's check (an eager prefill, so no dropped-layer token is
-        served), not at startup as plan D20 words it.
-        """
+        """Per batch (the scheduler's fail-stop hook, ``run_fail_stop_checks``): the service's per-batch upkeep. A
+        failed request never reaches here: the host aborts and the device traps (LEASE_PROTOCOL.md, "Fail-stop")."""
         if self.host is None or self._shut_down:
             return
-        fatal = self.host.fatal_seq()
-        if fatal:
-            raise RuntimeError(
-                f"exl3 RAM miss: request {fatal} timed out or failed "
-                f"(thread {self.host.counters()}); fail-stop"
-            )
         self._arm_copy_engine()
         if self.cpu_experts is not None and self._cpu_retune_batches > 0:
             self._cpu_batches += 1
             if self._cpu_batches >= self._cpu_retune_batches:
                 self._cpu_batches = 0
                 self.cpu_experts.retune()
-        if self.native_prefetch is not None:
-            self.native_prefetch.poll_counters()
         self._trace_step()
         self._trace_stages()
 
@@ -1071,7 +909,7 @@ class Exl3RamMissService:
 
     def _copy_engine_barrier(self, forward_pass_id: int, forward_batch) -> None:
         # An eager forward may load a kernel module, and a load blocks the copy thread's cuMemcpyAsync while a decode
-        # graph in flight spins in its copy wait, until the deadline (LEASE_PROTOCOL.md 7.6): let that step end first.
+        # graph in flight is held in its copy wait, until the deadline: let that step end first.
         if not forward_batch.forward_mode.is_decode():
             if self._copy_armed:
                 torch.cuda.synchronize()
@@ -1082,8 +920,6 @@ class Exl3RamMissService:
         if not self.copy_engine or self._copy_armed or self.device_side is None:
             return
         if self._copy_decodes >= COPY_ENGINE_ARM_DECODES:
-            if self.native_prefetch is not None:
-                self.native_prefetch.check_armable()  # its kernels are in the graph, so loaded, before arming
             self.host.arm_copy_engine()
             self._copy_armed = True
             logger.info("exl3 RAM miss copy engine armed after %d decode forwards since capture", self._copy_decodes)
@@ -1196,7 +1032,7 @@ class Exl3RamMissService:
             return
         if self.route_log is not None:
             self.route_log.poll(trace, final=final)
-        rows = self.host.layer_rows()  # demand rows only: advisory reads are not misses
+        rows = self.host.layer_rows()
         sample = self._graph_rows(rows, final=final)
         if sample is not None:
             self._record_graph_snapshot(trace, *sample)
@@ -1235,7 +1071,7 @@ class Exl3RamMissService:
         return devices or [torch.device("cuda", torch.cuda.current_device())]
 
     def _completion_deadline_s(self) -> float:
-        # A wait kernel is bounded by the wait timeout (and, once admission is closed, by the header word).
+        # S is bounded by its deadline (a trap), the copy wait by the watchdog's copy-wait timeout (an abort).
         return envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get() / 1000 + 5.0
 
     def _establish_gpu_completion(self) -> Optional[str]:
@@ -1268,13 +1104,17 @@ class Exl3RamMissService:
         return None
 
     def shutdown(self, *, at_exit: bool = False) -> None:
-        """Stop admission, establish that no GPU reader runs, then free; else quarantine (LEASE_PROTOCOL.md 14.3).
+        """Establish that no GPU reader runs while the service still serves, then close admission, stop and free;
+        else quarantine (LEASE_PROTOCOL.md, "Shutdown").
 
         Idempotent. The tiers must not be used afterwards. ``at_exit``: no device barrier is attempted in an exit
         handler, so the tiers are quarantined unconditionally. The scheduler's graceful shutdown calls the orderly path
-        through ``shutdown_exl3_ram_miss_service`` (LEASE_PROTOCOL.md 20.2i); the exit hook calls this with ``at_exit``.
-        Anything that leaves it unknown whether the service thread or a GPU reader still runs (the barrier, or
-        stopping the thread) makes the shutdown quarantine; it frees only when both are known to be finished.
+        through ``shutdown_exl3_ram_miss_service``; the exit hook calls this with ``at_exit``. Anything that leaves it
+        unknown whether the service thread or a GPU reader still runs (the barrier, or stopping the thread) makes the
+        shutdown quarantine; it frees only when both are known to be finished.
+
+        The barrier runs before admission closes: an in-flight chain waits on the service, so closing first would
+        leave it spinning until S's deadline traps. ``_shut_down`` is set first, so no new forward starts.
         """
         if self._completed or (self._shut_down and not at_exit):
             return
@@ -1285,11 +1125,11 @@ class Exl3RamMissService:
         interrupt: Optional[BaseException] = None  # a KeyboardInterrupt or SystemExit: re-raised once the slabs are safe
         try:
             if self.host is not None:
-                self.host.close_admission()
                 if uncertain is None:
                     uncertain = (
                         "process exit: no device barrier is attempted" if at_exit else self._establish_gpu_completion()
                     )
+                self.host.close_admission()
                 if uncertain is None and self._stages_traced:
                     # host.stop() closes its native handle, so freeze the reader
                     # between requests before taking its final demand counters.
@@ -1303,7 +1143,7 @@ class Exl3RamMissService:
         finally:
             try:
                 # The service thread writes into the slabs through raw addresses, so it stops before anything is freed.
-                # A service thread hung in a read ends this in the service watchdog's abort (see LEASE_PROTOCOL 20.2j).
+                # A service thread hung in a read ends this in the service watchdog's abort.
                 if self.host is not None:
                     logger.info(
                         "exl3 RAM miss: stopping the service thread; a read that hangs ends in the watchdog's abort "
@@ -1343,30 +1183,10 @@ class Exl3RamMissService:
             if self.host.hot_page is not None:
                 owned.append(self.host.hot_page)
         if self.device_side is not None:
-            owned += [self.device_side.state, self.device_side.last_routes]
-            owned += [t for t in (self.device_side.go_count, self.device_side.lane_ctx) if t is not None]
+            side = self.device_side
             owned += [
-                t
-                for t in (
-                    self.device_side.go_1,
-                    self.device_side.go_2,
-                    self.device_side.go_total,
-                    self.device_side.lane_ctx_1,
-                    self.device_side.lane_ctx_2,
-                    self.device_side.host_rows_1,
-                    self.device_side.host_rows_2,
-                    self.device_side.dst_slots_1,
-                    self.device_side.dst_slots_2,
-                    self.device_side.origin_1,
-                    self.device_side.origin_2,
-                    self.device_side.claimed,
-                    self.device_side.violated,
-                    self.device_side.piece_runs,
-                    self.device_side.stream_count,
-                    self.device_side.stream_abort,
-                    self.device_side.stream_fault,
-                )
-                if t is not None
+                side.state, side.go_1, side.host_rows_1, side.dst_slots_1, side.claimed, side.ce_mask, side.cpu_lanes,
+                side.piece_runs,
             ]
         if self._trace_snapshot is not None:
             # A copy can still be writing this pinned block when the device
@@ -1393,7 +1213,7 @@ class Exl3RamMissService:
 
 
 def shutdown_exl3_ram_miss_service() -> None:
-    """The scheduler's graceful-shutdown entry (LEASE_PROTOCOL.md 20.2i): shut the service down if one exists.
+    """The scheduler's graceful-shutdown entry: shut the service down if one exists.
 
     A no-op when no service was ever created: a run without EXL3 must not construct the singleton at shutdown.
     """

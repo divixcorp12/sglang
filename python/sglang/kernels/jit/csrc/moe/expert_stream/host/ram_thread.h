@@ -6,13 +6,11 @@
 namespace sglang {
 namespace expert_stream {
 
-// Pumps one RamTier on its own thread (plan D19): demands first, then advisories; spins
-// with _mm_pause() for spin_ns after the last request, else sleeps 50 us between polls. The spin is an idle-poll
-// budget calibrated once in start() (idle_budget), so the thread reads no clock while it serves (spec M8).
-// pause() is a handshake: it asks every advisory in flight to give up at its next row,
-// skips advisories posted so far (resume() skips those posted during the pause), and returns once the loop has
-// acknowledged the pause between two requests. While paused the loop takes no request, so an eager caller owns the
-// slots until resume().
+// Pumps one RamTier on its own thread (plan D19); spins with _mm_pause() for spin_ns after the last request, else
+// sleeps 50 us between polls. The spin is an idle-poll budget calibrated once in start() (idle_budget), so the thread
+// reads no clock while it serves (spec M8). pause() is a handshake: it returns once the loop has acknowledged the
+// pause between two requests. While paused the loop takes no request, so an eager caller owns the slots until
+// resume().
 //
 // Ownership (plan 2026-09-29-hotpath-zero-overhead Task 13, the single-owner rule): the tier has one owner at a time,
 // and pause()/resume() are the handoff. The happens-before edges:
@@ -28,13 +26,11 @@ namespace expert_stream {
 // previous pause's acknowledgement for its own while the service is already running again. pause() and resume() take
 // the tier's caller_mutex(); the service thread never does.
 //
-// The watchdog (plan D15), on its own thread so a stuck read cannot silence it, aborts the
-// process when the fatal word stays raised for fatal_wait without stop() (the process did not fail stop), or when one
-// demand, advisory or fill stays in service for fatal_wait (a hung read): it times how long one busy episode
-// (RamTier::busy_episode) persists, so the clock is read on the watchdog thread only (D6). It outlives the service
-// thread's join in stop(), so a stop during a hung read, demand or advisory, still ends in its abort.
-// It is also the copy wait's deadline (LEASE_PROTOCOL.md 7.6): a gate armed for longer than the copy-wait timeout is
-// opened as a timeout here, and every poll opens one whose CopyDone, fatal or shutdown word no other releaser acted on.
+// The watchdog (plan D15), on its own thread so a stuck read cannot silence it, aborts the process when one demand or
+// fill stays in service for fatal_wait (a hung read): it times how long one busy episode (RamTier::busy_episode)
+// persists, so the clock is read on the watchdog thread only (D6). It outlives the service thread's join in stop(), so
+// a stop during a hung read still ends in its abort. It is also the copy wait's deadline: a gate that stays closed on
+// one value for longer than the copy-wait timeout aborts the process (a copy thread stuck in a driver call).
 // pause()/resume() are not reentrant: their one owner is the slot table's depth counter
 // (Task 14), which calls pause at depth 0->1 and resume at 1->0.
 template <class Tier>
@@ -44,7 +40,6 @@ class RamThread {
 
   RamThread(std::shared_ptr<Tier> tier, int cpu_core, int64_t fatal_wait_ns, int64_t spin_ns)
       : tier_(std::move(tier)),
-        page_(tier_->page()),
         cpu_core_(cpu_core),
         fatal_wait_ns_(fatal_wait_ns),
         spin_ns_(spin_ns) {}
@@ -66,12 +61,6 @@ class RamThread {
       throw std::runtime_error(
           error_prefix<typename Tier::Layout>() +
           "start_thread with a prefill fill running (or not yet ended): call fill_end() first");
-    }
-    if (tier_->copy_waits_aborted()) {
-      throw std::runtime_error(
-          error_prefix<typename Tier::Layout>() +
-          "start_thread after the service was stopped with the copy engine on: stopping raised the lease block's "
-          "sticky shutdown word, so every copy wait would fail; build a new host");
     }
     spin_iters_ = idle_budget(spin_ns_);  // on the caller's thread: the service thread never reads the clock to pace
     tier_->set_parked(false);
@@ -97,11 +86,9 @@ class RamThread {
   // clear to drain the queue itself; the service's last act is a final drain (run()), and the join orders it first.
   void stop() {
     stop_.store(true);
-    tier_->request_stop(true);  // an advisory in flight gives up at its next row
     if (thread_.joinable()) thread_.join();
     watch_stop_.store(true);
     if (watchdog_.joinable()) watchdog_.join();
-    tier_->request_stop(false);
     tier_->set_threaded(false);  // release: after the join, a waiting caller owns the tier and drains the ring
   }
 
@@ -109,8 +96,6 @@ class RamThread {
   // have synchronized the stream, so the device's acknowledgements are visible), and the slots are not the caller's.
   int pause(int64_t timeout_ns) {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
-    tier_->request_pause(true);
-    tier_->skip_advice_posted_so_far();
     const uint64_t epoch = (pause_epoch_.load(std::memory_order_relaxed) | 1u) + 2u;  // a new odd epoch
     pause_epoch_.store(epoch);
     const int64_t deadline = now_ns() + timeout_ns;
@@ -133,7 +118,7 @@ class RamThread {
     // The caller synchronized the stream, so every copy wait has seen its CopyDone. Once the copy engine is idle every
     // job is in the completion ring, and this caller, the owner now, drains it and releases their COPYING leases (D7).
     tier_->wait_copy_idle_owned(now_ns() + timeout_ns);
-    tier_->retire_leases(true);  // a settle pass: the synchronized stream left no signal still to land
+    tier_->retire_leases();  // the synchronized stream left every Done word stored
     if (tier_->graph_leases_outstanding() > 0) {
       resume_locked();
       return 2;
@@ -141,7 +126,6 @@ class RamThread {
     return 1;
   }
 
-  // Advisories posted while paused predate the eager use: skip them too.
   void resume() {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
     resume_locked();
@@ -155,11 +139,9 @@ class RamThread {
     // A prefill fill uses the reader the service thread is about to use: join it, and run its epilogue here, on the
     // owner (the fill thread writes no tier state), before the release below hands the tier back.
     tier_->fill_join();
-    tier_->skip_advice_posted_so_far();
     tier_->set_parked(false);
     const uint64_t epoch = pause_epoch_.load(std::memory_order_relaxed);
     if (epoch & 1u) pause_epoch_.store(epoch + 1u, std::memory_order_release);
-    tier_->request_pause(false);
   }
 
   void run() {
@@ -176,12 +158,8 @@ class RamThread {
     if (error != 0) return;
     tier_->set_counter(kRunning, 1);
     uint64_t idle = 0;  // empty polls since the last request: the spin budget counts these, not elapsed time
-    uint32_t heartbeat = 0;
-    uint32_t iterations = 0;
     bool stopped_parked = false;  // stop() came while a caller owned the tier: that caller keeps it
     while (!stop_.load(std::memory_order_relaxed)) {
-      // Not every iteration: the word shares the cache line the device polls.
-      if ((++iterations & 1023u) == 1u) store_release(page_ + kHeartbeat, ++heartbeat);
       tier_->drain_commands();  // between requests: every queued Python command, in order
       const uint64_t epoch = pause_epoch_.load(std::memory_order_acquire);
       if (epoch & 1u) {
@@ -195,9 +173,8 @@ class RamThread {
         }
         continue;
       }
-      if (tier_->pump_demand() || tier_->pump_prefetch() || tier_->pump_advice()) {
+      if (tier_->pump_demand()) {
         idle = 0;
-        iterations = 0;  // one heartbeat per request served
         continue;
       }
       if (++idle < spin_iters_) {
@@ -212,54 +189,35 @@ class RamThread {
   }
 
   void watch() {
-    int64_t fatal_since = 0;
-    bool reported = false;
     uint64_t episode = 0;       // the busy episode last seen, 0: idle
     int64_t episode_since = 0;  // when the watchdog first saw it
-    uint64_t armed = 0;         // the copy wait last seen armed and not released, 0: none
-    int64_t armed_since = 0;
+    uint32_t gate = 0;          // the gate word last seen closed, 0: open
+    int64_t gate_since = 0;
     while (!watch_stop_.load()) {
-      const uint32_t fatal = load_acquire(page_ + kFatal);
       const int64_t now = now_ns();
-      if (fatal != 0) {
-        if (!reported) {
-          reported = true;
-          std::fprintf(
-              stderr,
-              "ERROR %srequest %u timed out or failed; the process must stop\n",
-              error_prefix<typename Tier::Layout>().c_str(),
-              fatal);
-          std::fflush(stderr);
-        }
-        if (fatal_since == 0) fatal_since = now;
-      }
       // D6: the clock is read here, every 20 ms, never by the service. One episode held past fatal_wait is a hung
-      // request; detection is at most 20 ms late against a 30 s deadline.
-      // The copy wait's deadline lives here, not on the copy thread or the service: a copy thread stuck in a driver
-      // call, or a service stuck in a read, must still end the device's wait (at most 20 ms late).
-      const uint64_t gate = tier_->armed_copy_wait();
-      if (gate != armed) {
-        armed = gate;
-        armed_since = now;
-      }
-      tier_->release_copy_gate(armed != 0 && now - armed_since > tier_->copy_wait_timeout_ns() ? armed : 0);
+      // request; detection is at most 20 ms late against a 30 s deadline. The copy wait's deadline lives here too,
+      // not on the copy thread: a copy thread stuck in a driver call must still end the device's wait.
       const uint64_t busy = tier_->busy_episode();
       if (busy != episode) {
         episode = busy;
         episode_since = now;
       }
-      // Once stop() began, the process is failing stop: only a hung read can still abort.
-      const bool fatal_held = !stop_.load() && fatal_since != 0 && now - fatal_since > fatal_wait_ns_;
+      const uint32_t word = tier_->copy_gate();
+      const uint32_t closed = (word & 0x80000000u) != 0 ? word : 0;
+      if (closed != gate) {
+        gate = closed;
+        gate_since = now;
+      }
       const bool stuck = episode != 0 && now - episode_since > fatal_wait_ns_;
-      if (fatal_held || stuck) {
+      const bool held = gate != 0 && now - gate_since > tier_->copy_wait_timeout_ns();
+      if (stuck || held) {
         std::fprintf(
             stderr,
-            "ERROR %s%s for %.1f s (fatal %u, busy %u); aborting instead of hanging decode\n",
+            "FATAL %s%s for %.1f s; aborting instead of hanging decode\n",
             error_prefix<typename Tier::Layout>().c_str(),
-            stuck ? "a request stayed in service" : "the fatal word stayed raised without the process stopping",
-            static_cast<double>(fatal_wait_ns_) / 1e9,
-            fatal,
-            load_acquire(page_ + kBusySeq));
+            stuck ? "a request stayed in service" : "a copy wait held the decode stream",
+            static_cast<double>(stuck ? fatal_wait_ns_ : tier_->copy_wait_timeout_ns()) / 1e9);
         std::fflush(stderr);
         prctl(PR_SET_DUMPABLE, 0);
         std::abort();
@@ -269,7 +227,6 @@ class RamThread {
   }
 
   std::shared_ptr<Tier> tier_;
-  uint8_t* page_;
   int cpu_core_;
   int64_t fatal_wait_ns_;
   int64_t spin_ns_;

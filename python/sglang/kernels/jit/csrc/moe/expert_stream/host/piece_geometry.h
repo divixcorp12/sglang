@@ -128,7 +128,6 @@ struct PieceTarget {
 struct PiecePublish {
   uint64_t generation = 0;
   const PieceTarget* rows = nullptr;
-  const uint64_t* probe = nullptr;  // the request's StreamProbe word (read only by the hold_until_probe_ms fault)
 };
 
 }  // namespace expert_stream

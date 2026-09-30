@@ -666,12 +666,6 @@ class DeepseekV2MoE(nn.Module):
         # V4.1 routes through vision_topk with or without a vision tower: it always emits the
         # standard top-k format, while self.topk bypasses under flashinfer_mxfp4 with non-FP4 experts.
         self.v41_router = is_deepseek_v4 and config.model_type == "deepseek_v41"
-        if is_deepseek_v4 and not is_nextn and envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get():
-            from sglang.srt.layers.moe.exl3_native_prefetch import register_gate
-
-            # Layer T-1 scores layer T's gate on its own router input (native next-layer prefetch).
-            register_gate(layer_id, self.gate)
-
         # scaling factor for fused shared experts on AMD-platform.
         # DeepEP/MegaMOE doesn't need this: shared expert is only computed on home rank
         # (not all-reduced), so no 1/ep_size correction is needed.

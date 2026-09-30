@@ -403,11 +403,6 @@ class ReaderCore {
       c.progress_closure = const_cast<void*>(static_cast<const void*>(std::addressof(progress)));
     }
     c.publish = piece_stream_ ? publish : nullptr;
-    if constexpr (Build::kFaults) {
-      if (c.publish != nullptr && c.publish->probe != nullptr && faults_.fault.hold_until_probe_ms > 0) {
-        c.hold_until = now_ns() + faults_.fault.hold_until_probe_ms * 1000000;
-      }
-    }
     if (packed) packed->assign(c.total, 0);
     on_trace([&](StageRecord& t) {
       t.rows_asked = static_cast<int64_t>(c.total);
@@ -456,8 +451,7 @@ class ReaderCore {
       // withheld completions of the slow-drive fault arrive only once every other row has packed.
       if (c.pending > 0 || (!ready && c.packing == 0 && !held_empty())) reap(ready || c.packing > 0);
       if (c.failed) break;
-      // (The hold_until_probe_ms fault keeps direct-mode pieces vetted but unpublished with nothing to wait on.)
-      if (!derived().advance() && (c.packing > 0 || c.hold_until != 0)) _mm_pause();
+      if (!derived().advance() && c.packing > 0) _mm_pause();
     }
     // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was
     // neither admitted nor abandoned: the loop's own bookkeeping is wrong. Fail instead of returning a
@@ -647,7 +641,6 @@ class ReaderCore {
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
     int64_t events = 0;      // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
     size_t published = 0;    // piece streaming: pieces published so far (the last_publish_delay_ns fault)
-    int64_t hold_until = 0;  // piece streaming: when the hold_until_probe_ms fault gives up (0: no hold)
   };
 
   // Runs `f` on this read's stage record, if it has one. ProdBuild compiles every call to nothing.
@@ -1572,20 +1565,6 @@ class ReaderCore {
       if (r.ordinal < static_cast<size_t>(kTraceRows)) t.piece_publish[r.ordinal][j] = seq;
     });
     r.published |= bit;
-  }
-
-  // The hold_until_probe_ms fault: true while the request's StreamProbe does not yet read tagged(1, generation) and
-  // the hold has not timed out. A failing read is never held: quiesce() must collect every piece.
-  // ProdBuild: never (the fault does not exist there).
-  bool holding_for_probe() const {
-    if constexpr (Build::kFaults) {
-      const Call& c = c_;
-      if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;
-      const uint64_t want = (uint64_t{1} << 56) | (c.publish->generation & ((uint64_t{1} << 56) - 1));
-      return __atomic_load_n(c.publish->probe, __ATOMIC_ACQUIRE) != want;
-    } else {
-      return false;
-    }
   }
 
   // The row is packed whole: account it, flag it and free its slot. Packing is the last reference the bank

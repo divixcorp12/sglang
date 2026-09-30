@@ -189,10 +189,8 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // These are not in STAGE_ORDER on purpose: rows overlap, so no single order of stamps holds across
 // rows. Compare a row's own stamps: row_admit <= its extents' submit <= their cqe <= its pack_start.
 //
-// lanes (schema 4): the planned lane count the device posted with this request (kRecLanes), so a layer's
-// lanes per request can be read against its `row`. It counts RAM hits as well as the rows read: rows_asked
-// is only what was missing. Not clamped to kMaxIds, so a plan wider than the lanes the service is asked
-// for shows here.
+// lanes (schema 4): the request's lane count (its LaneRequest's), so a layer's lanes per request can be read against
+// its `row`. It counts RAM hits as well as the rows read: rows_asked is only what was missing.
 //
 // pack_workers, pack_split (schema 5): the packing mode the reader ran this request in. Since the packed path was
 // deleted (plan 2026-09-29-hotpath-zero-overhead D4) the one reader, RowReader, never packs and both are always 0;

@@ -172,10 +172,8 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
         "SGLANG_MOE_EXPERT_FUSED_PLAN": "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
-        # Two-phase RAM-miss copies with piece streaming (DSV41_REFERENCE.md section 24).
-        "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE": "1",
+        # The lease chain's W1 budget (the chain is two-phase with piece streaming, DSV41_REFERENCE.md section 24).
         "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100",
-        "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM": "1",
         # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical
         # (docs/superpowers/plans/2026-09-25-dsv41-layer-fusion.md).
         "SGLANG_DSV41_ENABLE_LAYER_FUSION": "1",
@@ -191,7 +189,6 @@ def base_env() -> dict[str, str]:
         # copy engine arms fail-stopped the soak deterministically, never under EAGER
         # (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). Costs ~1 GiB, hence MEM_FRACTION_STATIC.
         "CUDA_MODULE_LOADING": "EAGER",
-        "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
         # Prefill's pinned-tier misses read by the RAM-miss service's reader straight into the slabs, a layer's reads
         # issued up front: TTFT 21.06/17.79 -> 12.05/11.14 s, decode unchanged, byte-identical (DSV41_REFERENCE.md 27.6).
         # Reads the row images the RAM-miss service always reads (built on every mirror root by
