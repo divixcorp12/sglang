@@ -6151,7 +6151,7 @@ One merge of `dsv41-cpu-experts` at `1ff55fb37b`. It carries three things:
 Design detail and the P0-P2 records are in `docs/superpowers/plans/2026-09-29-dsv41-cpu-experts.md`. Every figure
 below comes from that plan, a commit message, or the divix01 file cited next to it.
 
-**Changes to §29's recipe table.**
+**Changes to §29's recipe** (the table's copy-wait row, and `arm_env.py`).
 - **Copy wait:** still the stream-ordered gate wait. `CopyArm` folds into the gate, the fatal word, status words and
   lease-block header are gone, and the lease block's offsets are compile-time constants.
   `analysis/dsv41-drive/LEASE_PROTOCOL.md` describes the protocol as it now is, so §29.14's area-C and ABI-4
@@ -6175,12 +6175,13 @@ host and Python sides.
     nothing swizzles them (§30.4).
 - **Which lanes go to the CPU:** the lowest-scored ones (§30.2).
 - **Launch requirements**, refused by the gate (`expert_stream_requirements_exl3.py`) and again at startup:
-  - a breakable BS1 decode graph without speculative decoding;
+  - a breakable BS1 decode graph without speculative decoding, refused first and on its own;
   - graph gather and the fused plan (`SGLANG_MOE_EXPERT_FUSED_PLAN=1`);
   - DIRECT residency (`SGLANG_MOE_GPU_RESIDENCY_UPDATE=1`, `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2`);
   - the copy engine, layer fusion, and `SGLANG_DSV41_CPU_EXPERTS_CORES`;
-  - `EXL3_MOE_CPU_PIN=0`.
-  - The refusals list every missing prerequisite at once, and none of them suggests a disabled or full decode graph.
+  - `SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE` off.
+  - The env prerequisites are listed at once, and no refusal suggests a disabled or full decode graph.
+  - `EXL3_MOE_CPU_PIN=0` is checked at startup only (`srt/layers/moe/cpu_experts/exl3.py`), not by the gate.
 - **A failed CPU forward** calls fail_stop in the CPU expert thread (`a799c9bb5a`).
 - **Knobs:**
   - `SGLANG_DSV41_CPU_EXPERTS_SPLIT`, an explicit 9-entry table. Otherwise `k*(n)` comes from `_CPU_MS` (0.52),
@@ -6191,9 +6192,10 @@ host and Python sides.
 **P2 results, partial** (2026-09-29, `d87a3ff24f`, before the lane order of §30.2; the plan's "P2 results").
 - **Arms:** production recipe plus `SGLANG_DSV41_CPU_EXPERTS=1 SGLANG_DSV41_CPU_EXPERTS_CORES=18-29`, split
   `[0, 1, 1, 2, 3, 3, 4, 5, 5]`.
-- **Throughput:** median decode 9.51 → **13.48 tok/s (1.40x)**. The on arm won 8 of 8 paired sessions (p = 0.0039),
-  and TTFT was unchanged.
-- **Hot hit rate:** 0.644 → 0.593. CPU lanes were never inserted into VRAM.
+- **Throughput:** median decode 9.51 → 13.48 tok/s, a **median paired ratio of 1.40x** (per session 1.34-1.47x).
+  The on arm won 8 of 8 paired sessions (p = 0.0039), and TTFT was unchanged.
+- **Hot hit rate:** 0.644 → 0.593 over one traced off/on pair (~820 steps each). CPU lanes were never inserted into
+  VRAM.
 - **CPU cost:** 0.61-0.66 ms per lane under load, against the configured 0.52.
 - **Quality:**
   - Greedy match 11/16 against a noise floor of 13/16.
@@ -6249,11 +6251,11 @@ link cost is counted:
 - **Periodic promotion** every N forwards (N in {4, 8, 16, 32}, P in {1, 2, 4} per layer) gains at most 0.2%
   amortised and loses in every worst case. It is not built.
 - **Calibration:** the sim drops 0.066 of hit rate for lane order, against the 0.051 P2 served (§30.1), so it
-  overstates the loss by ~30%. Its insert-all hit rate matches the served formula (0.6719).
+  overstates the loss by ~30%. Its insert-all hit rate, 0.672, matches the served-hit formula.
 - **Outputs:** `divix01:/mnt/nvme1/cpu-p1/insert-policies{,-v2,-promote,-sorted}.{json,txt}`.
 - **Tests:** `test/registered/unit/kernels/test_cpu_expert_sim.py`, `test/manual/dsv41/test_tier_sim.py`.
 
-### 30.4 NUMA and layout (microbenchmarks, 2026-09-30)
+### 30.4 NUMA and layout (microbenchmarks: NUMA 2026-09-30, swizzle P0 2026-09-29)
 
 **NUMA matters little to the kernel.** It ran 12 threads on cores 18-29 (node 1) with the `resid_b128` flavor, in the
 native layout.
@@ -6263,9 +6265,14 @@ native layout.
 | Rows on node 1 (local), ms per expert | 0.578 | 0.525 | 0.490 |
 | Rows on node 0 (remote), ms per expert | 0.625 | 0.538 | 0.500 |
 
-- Remote costs ~2% at steady state. The kernel is dequant-bound, at an effective 21-27 GB/s.
-- **Under node-0 copy load**, remote rows slow down by 0.022, 0.044 and 0.129 ms at 11, 21 and 38 GB/s of
-  background traffic (2 experts per call).
+- Remote costs 2-2.5% at 2-6 experts per call, and 8% at 1 (p90 0.88 against 0.55 ms). The kernel reads an effective
+  21-27 GB/s, well under node 0's 62 GB/s (§28.1).
+- **Under node-0 memory load** (a numpy `copyto` hog on node 0, not PCIe or NVMe DMA; 2 experts per call), remote rows
+  slow down against remote unloaded (0.538 ms):
+  - +0.009 ms at ~11 GB/s of load, one run;
+  - +0.031 ms at ~21 GB/s, one run;
+  - +0.116 ms at ~38 GB/s, two runs.
+  - The 11 and 21 GB/s loads are per-hog rates (~10.6 GB/s) times the number of hogs.
 - The recipe's pinned tier is `PINNED_HOST_NUMA_MB="0:61440,1:40960"`, so most RAM hits are remote to the CPU-expert
   cores. Placement was left as it is. Measuring node-0 traffic under serving comes first, and needs root.
 - **Logs:** `divix01:/data/models/slang/nvfp4-work/cpu-numa/`: `matrix.log`, `gated*.log` and per-run
@@ -6295,7 +6302,8 @@ the gate → CC.
 - **Protocol reference:** `analysis/dsv41-drive/LEASE_PROTOCOL.md`.
 
 **Served smoke** (`analysis/dsv41-drive/lease-minimal/smoke.sh`; `divix01:/mnt/nvme1/lease-minimal/smoke1/`).
-- Setup: `644c3bedf4`, the production recipe with no overrides, and six greedy requests (three prompts, twice).
+- Setup: `644c3bedf4` in `wt-lease-gpu`, before the merge into this branch, so CPU experts and the lane order were not
+  exercised. The production recipe with no overrides, and six requests (three prompts, twice).
 - Repeats identical; copy engine armed.
 - Server exit 0 with an orderly service stop; 0 FATAL, quarantine or traceback lines.
 - **No decode A/B** against the previous protocol was run.
