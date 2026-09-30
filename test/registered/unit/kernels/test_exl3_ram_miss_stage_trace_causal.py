@@ -249,6 +249,9 @@ NON_TRACE_CLOCK_READS = {
     "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
     "drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);": 1,
     "if (stopping && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;": 1,
+    # seqlock_stress, test only (refused on ProdBuild): its run's deadline, on the caller's thread.
+    "const int64_t deadline = now_ns() + duration_ns;": 1,
+    "while (now_ns() < deadline) {": 1,
     # Metrics, compiled only into InstrBuild (each inside `if constexpr (Build::kMetrics)`): copy_issue_ns, and the copy
     # latency's submit and completion reads.
     "if constexpr (Build::kMetrics) start = now_ns();  // copy_issue_ns, a metric": 1,
