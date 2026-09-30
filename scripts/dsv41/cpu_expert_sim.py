@@ -217,7 +217,7 @@ def _queue(policy: str, sim, chosen: dict[int, list[int]]) -> dict[int, list[int
 
 
 def slot_nodes_per_row(capacity: list[int], numa_mb: str) -> list[list[int]]:
-    """Each replayed host slot's node, as cpu_experts.service.slot_nodes binds a row's slots."""
+    """Each replayed host slot's node, as the pinned tier's host_numa.split_rows binds a row's slots."""
     from sglang.srt.layers.moe.host_numa import split_rows
 
     placement = [(int(node), int(mb)) for node, mb in (part.split(":") for part in numa_mb.split(","))]

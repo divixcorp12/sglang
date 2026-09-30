@@ -711,14 +711,15 @@ class Exl3RamMissService:
             cpu_expert_cores,
             cpu_trait_for,
         )
-        from sglang.srt.layers.moe.host_numa import parse_placement
-
         if not cfg.enable_ram_miss_copy_engine:
             raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE")
         if not cfg.enable_layer_fusion:
             raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_LAYER_FUSION")
         if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
             raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS cannot run with the prefetch pull join")
+        if not envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get():
+            # Only the fused plan sorts the miss lanes, which is how the grant's tail lanes are the lowest-scored.
+            raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_MOE_EXPERT_FUSED_PLAN")
         cores, threads = cpu_expert_cores()
         # Rows in layer order, as exl3_ram_miss_tables numbers them.
         caches = {row: s.pinned_host_cache.tensors for row, (_, s) in enumerate(sorted(streamers.items()))}
@@ -734,7 +735,6 @@ class Exl3RamMissService:
             cores=cores,
             threads=threads,
             split=configured_split(),
-            placement=parse_placement(envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.get()),
             pin=pin,
         )
 
@@ -774,9 +774,16 @@ class Exl3RamMissService:
             manager.register_fail_stop_check(self.fail_stop_check)
             updater = getattr(manager, "gpu_residency", None)
             if updater is None or not updater.insert_direct:
+                if self.cpu_experts is not None:
+                    raise RuntimeError(
+                        "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs DIRECT residency (SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
+                        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2): its ranking orders the miss lanes the CPU takes"
+                    )
                 manager.add_residency_listener(self.on_residency)
             else:
                 self._enable_gpu_hot(updater)
+                if self.cpu_experts is not None:
+                    updater.enable_miss_order()
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
         if streamer.graph_gather_rows > MAX_IDS:
@@ -786,6 +793,11 @@ class Exl3RamMissService:
                 f"per call but the service requests at most {MAX_IDS} lanes"
             )
         cache = streamer.hot_cache
+        if self.cpu_experts is not None:
+            # The fused plan sorts this layer's miss lanes by residency key, highest first; the grant's CPU lanes are
+            # the tail, so the lanes worth inserting are the ones copied.
+            direct = manager.gpu_residency
+            streamer._plan_miss_keys = direct.miss_keys[streamer.residency_row]
         if self.device_side is None:
             self.device_side = ExpertStreamDevice(
                 self.page,

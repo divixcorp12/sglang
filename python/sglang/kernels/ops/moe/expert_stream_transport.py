@@ -1103,13 +1103,6 @@ class ExpertStreamHost:
         """CPU experts: a new split table (CPU lanes per n resident lanes, n = 0..8), at any time."""
         self._module.expert_stream_set_cpu_split(self.handle, torch.tensor(list(split), dtype=torch.int64))
 
-    def set_cpu_slot_nodes(self, row: int, nodes: Sequence[int], preferred: int) -> None:
-        """CPU experts: each host slot's NUMA node for ``row``, and the pool's node, which the CPU lanes prefer."""
-        self._check(row)
-        self._module.expert_stream_set_cpu_slot_nodes(
-            self.handle, row, torch.tensor(list(nodes), dtype=torch.int8), int(preferred)
-        )
-
     def cpu_stats(self) -> dict[str, int]:
         """CPU experts: jobs and lanes the CPU expert thread computed, and its forward time in ns."""
         out = torch.zeros(3, dtype=torch.int64)

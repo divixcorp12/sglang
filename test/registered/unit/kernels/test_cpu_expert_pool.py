@@ -306,14 +306,11 @@ class FakeServiceTrait(FakeTrait):
 
 class FakeHost:
     def __init__(self):
-        self.enabled, self.layers, self.splits, self.nodes = None, {}, [], {}
+        self.enabled, self.layers, self.splits = None, {}, []
         self.stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
 
     def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads):
         self.enabled = (forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads)
-
-    def set_cpu_slot_nodes(self, row, nodes, preferred):
-        self.nodes[row] = (list(nodes), preferred)
 
     def set_cpu_layer(self, row, handle):
         self.layers[row] = handle
@@ -387,9 +384,3 @@ def test_configured_split_refuses_a_table_the_grant_could_not_honour(spec):
         with pytest.raises(ValueError, match="0 <= split"):
             configured_split()
 
-
-def test_slot_nodes_follow_the_pinned_tiers_per_node_row_split():
-    from sglang.srt.layers.moe.cpu_experts.service import slot_nodes
-
-    assert slot_nodes(5, [(1, 3 << 20), (0, 2 << 20)]) == [1, 1, 1, 0, 0]
-    assert slot_nodes(5, ()) == []

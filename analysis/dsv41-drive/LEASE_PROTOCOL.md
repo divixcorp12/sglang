@@ -38,7 +38,9 @@ Two pinned host areas, both read by the device through UVA:
 1. **post** writes the hot sidecar record (GPU-hot mode), the LaneRequest (payload, then `gen` with a release), the
    demand record (seqlock), and `demand_head`, one release ordering them all.
 2. **Service.** Under its reservation hold, before reading anything, it grants every lane: a resident expert READY, a
-   missing one LOADING, and for a CAPTURED request with the copy engine armed, a resident one COPYING or CPU. Each
+   missing one LOADING, and for a CAPTURED request with the copy engine armed, a resident one COPYING or CPU. CPU
+   goes to the last `split[n]` of the n COPYING-eligible lanes: the plan sorts miss lanes by residency key, highest
+   first, so those are the lowest-scored RAM hits, and the rest are copied and inserted into VRAM. Each
    grant counts the lease first, writes `host_slot`, and after one `_mm_sfence` stores each ready word with a release.
    It then reads the missing rows as up to four sub-reads per part, publishing each piece's bit in PieceMask as it
    lands. Last comes `_mm_sfence` and a release store of `demand_done` (`RamTier::pump_demand`).

@@ -319,18 +319,34 @@ CPU_EXPERTS_ENV = dict(
     SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
     SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=True,
     SGLANG_DSV41_ENABLE_LAYER_FUSION=True,
+    SGLANG_MOE_GPU_RESIDENCY_UPDATE=True,
+    SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2,
+    SGLANG_MOE_EXPERT_FUSED_PLAN=True,
     SGLANG_DSV41_CPU_EXPERTS_CORES="18-29",
     SGLANG_DSV41_CPU_EXPERTS=True,
 )
+# DIRECT's own prerequisites: without either, the residency update's EXL3 rule refuses first.
+_DIRECT_PREREQUISITES = ("SGLANG_MOE_EXPERT_GRAPH_GATHER", "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE")
 
 
-@pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_DSV41_CPU_EXPERTS"])
+@pytest.mark.parametrize(
+    "missing", [name for name in CPU_EXPERTS_ENV if name not in ("SGLANG_DSV41_CPU_EXPERTS", *_DIRECT_PREREQUISITES)]
+)
 def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
-    """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), never left out of the fused MoE (layer fusion), or run on no cores; the refusal names the one that is off."""
+    """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), never left out of the fused
+    MoE (layer fusion), not the lowest-scored misses (DIRECT residency's keys, which only the fused plan sorts by), or
+    run on no cores; the refusal names the one that is off."""
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
     off = "" if missing == "SGLANG_DSV41_CPU_EXPERTS_CORES" else False
     with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {missing}"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: off})
+
+
+@pytest.mark.parametrize("missing", _DIRECT_PREREQUISITES)
+def test_cpu_experts_without_direct_residency_are_refused(model_dir, missing):
+    """The miss order is DIRECT's victim ranking: stage 1, or no graph gather, leaves the residency update refused."""
+    with pytest.raises(ValueError, match="SGLANG_MOE_GPU_RESIDENCY_UPDATE"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: 1 if "STAGE" in missing else False})
 
 
 def test_cpu_experts_need_the_captured_decode_graph(model_dir):

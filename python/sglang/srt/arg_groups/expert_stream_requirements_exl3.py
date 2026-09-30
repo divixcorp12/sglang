@@ -143,6 +143,10 @@ def _check_cpu_experts(budgets) -> None:
         ("SGLANG_MOE_EXPERT_GRAPH_GATHER=1", budgets.graph_gather),
         ("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get()),
         ("SGLANG_DSV41_ENABLE_LAYER_FUSION=1", envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()),
+        # DIRECT residency ranks the keys the fused plan sorts the miss lanes by, so the CPU takes the coldest ones.
+        # _EAGER already refuses the update on EXL3 unless it is DIRECT (stage 2 with graph gather).
+        ("SGLANG_MOE_GPU_RESIDENCY_UPDATE=1", envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()),
+        ("SGLANG_MOE_EXPERT_FUSED_PLAN=1", envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()),
         ("SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list)", bool(envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get())),
     ]
     missing = [name for name, ok in needs if not ok]

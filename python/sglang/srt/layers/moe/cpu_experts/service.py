@@ -1,7 +1,7 @@
 """CPU experts inside the EXL3 RAM-miss service (plan 2026-09-29-dsv41-cpu-experts, "Step B").
 
-The service's own threads run the kernel: the grant tags ``split[n]`` of a copy-engine request's n resident lanes
-CPU, the copy thread hands them to the CPU expert thread (expert_stream/host/cpu_experts.h), and the copy wait
+The service's own threads run the kernel: the grant tags the last ``split[n]`` of a copy-engine request's n resident
+lanes (the lowest-scored, as the device plan sorts them) CPU, the copy thread hands them to the CPU expert thread (expert_stream/host/cpu_experts.h), and the copy wait
 releases the decode stream once both the copies and the CPU are done. This module owns the Python half: the quant
 trait, the pinned rows the post kernel and the CPU exchange, the lazy per-layer registration, and the split table.
 """
@@ -9,7 +9,6 @@ trait, the pinned rows the post kernel and the CPU exchange, the lazy per-layer 
 from __future__ import annotations
 
 import logging
-import os
 from typing import Mapping, Optional, Sequence
 
 import torch
@@ -50,25 +49,6 @@ def configured_split() -> list[int]:
     ).tolist()
 
 
-def core_node(core: int, root: str = "/sys/devices/system/cpu") -> int:
-    for name in os.listdir(os.path.join(root, f"cpu{core}")):
-        if name.startswith("node") and name[4:].isdigit():
-            return int(name[4:])
-    raise RuntimeError(f"cannot find the NUMA node of CPU {core}")
-
-
-def slot_nodes(capacity: int, placement) -> list[int]:
-    """Each host slot's NUMA node as the pinned tier bound it (host_numa.split_rows per named slab); [] unplaced."""
-    if not placement:
-        return []
-    from sglang.srt.layers.moe.host_numa import split_rows
-
-    nodes = [-1] * capacity
-    for node, first, count in split_rows(capacity, placement):
-        nodes[first : first + count] = [node] * count
-    return nodes
-
-
 class CpuExpertService:
     """The Python half of CPU experts for one ``ExpertStreamHost`` (the RAM-miss service's)."""
 
@@ -82,7 +62,6 @@ class CpuExpertService:
         cores: Sequence[int],
         threads: int,
         split: Sequence[int],
-        placement=(),
         pin: bool = True,
     ):
         cores = sorted(set(cores))
@@ -111,15 +90,10 @@ class CpuExpertService:
         host.enable_cpu_experts(
             trait.native_forward(), self.split, self.cores, self.x_rows, self.out_rows, threads=self.threads
         )
-        preferred = core_node(self.cores[0]) if placement else -1
-        for row, slabs in self.slabs_by_row.items():
-            nodes = slot_nodes(self._capacity(slabs), placement)
-            if nodes:
-                host.set_cpu_slot_nodes(row, nodes, preferred)
         self._last_stats = host.cpu_stats()
         logger.info(
-            "CPU experts on: %s trait, cores %s, %d threads, split %s, NUMA preference node %s",
-            trait.name, list(self.cores), self.threads, self.split, preferred if placement else "off",
+            "CPU experts on: %s trait, cores %s, %d threads, split %s",
+            trait.name, list(self.cores), self.threads, self.split,
         )
 
     def _capacity(self, slabs: Mapping[str, torch.Tensor]) -> int:

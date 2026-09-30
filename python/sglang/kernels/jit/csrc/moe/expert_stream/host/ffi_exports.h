@@ -890,14 +890,6 @@ struct HostExports {
     find(handle)->set_cpu_split(static_cast<const int64_t*>(split.data_ptr()), split.size(0));
   }
 
-  // CPU experts: nodes int8 [capacity], each host slot's NUMA node for `row`; `preferred` the pool's node.
-  static void set_cpu_slot_nodes(int64_t handle, int64_t row, TensorView nodes, int64_t preferred) {
-    using namespace host;
-    auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("nodes", TensorMatcher({-1}).with_dtype<int8_t>().with_device<kDLCPU>(cpu), nodes);
-    find(handle)->set_cpu_slot_nodes(row, static_cast<const int8_t*>(nodes.data_ptr()), nodes.size(0), preferred);
-  }
-
   // CPU experts' metrics: out int64 [3] = {jobs, lanes, forward ns}.
   static void cpu_stats(int64_t handle, TensorView out) {
     using namespace host;
@@ -1244,7 +1236,6 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_copy_table, Exports::set_copy_table);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_arm_copy_engine, Exports::arm_copy_engine);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_cpu_experts, Exports::enable_cpu_experts);         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_slot_nodes, Exports::set_cpu_slot_nodes);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                           \

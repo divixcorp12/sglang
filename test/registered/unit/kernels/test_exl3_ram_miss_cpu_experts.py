@@ -1,7 +1,7 @@
 """CPU experts' host half (CPU; plan 2026-09-29-dsv41-cpu-experts, "Step B"): the grant's CPU lanes and their completion.
 
-The service's grant tags ``split[n]`` of a copy-engine request's n resident lanes CPU (RowResult tag 4) when the post
-carried CPU input and the row is registered. The copy thread hands those lanes to the CPU expert thread and copies only
+The service's grant tags the last ``split[n]`` of a copy-engine request's n resident lanes CPU (RowResult tag 4) when
+the post carried CPU input and the row is registered; the device plan sorts miss lanes highest-scored first. The copy thread hands those lanes to the CPU expert thread and copies only
 the rest; CopyDone carries the whole mask once both are done. The forward here is a ctypes fake that records its calls
 and writes a known partial sum.
 
@@ -124,9 +124,9 @@ def _split(**entries):
 
 
 def test_the_grant_sends_split_n_resident_lanes_to_the_cpu_and_copydone_waits_for_both(tmp_path):
-    """Two resident lanes and a miss; split[2] = 1: lane 0 goes to the CPU, lane 2 is copied. Mutants: publish CopyDone
-    after the DMA alone -- red on the CopyDone check made before the forward ran; copy a CPU lane too -- red on dst row 0;
-    drop the lane's weight -- red on the forward's weights."""
+    """Two resident lanes and a miss; split[2] = 1: the tail lane 2 goes to the CPU, lane 0 is copied. Mutants: publish
+    CopyDone after the DMA alone -- red on the CopyDone check made before the forward ran; copy a CPU lane too -- red on
+    dst row 5; drop the lane's weight -- red on the forward's weights; take the head lane -- red on the tags."""
     forward = FakeForward()
     s, page, host, sim, dst, out_rows = _host(tmp_path, split=_split(n2=1), forward=forward)
     try:
@@ -135,27 +135,27 @@ def test_the_grant_sends_split_n_resident_lanes_to_the_cpu_and_copydone_waits_fo
         slot3, slot2 = _slot_of(host, 3), _slot_of(host, 2)
         req = sim.post(ROW, [3, 5, 2], dst=[0, 1, 5], captured=True, cpu_weights=[0.5, 0.25, 0.125])
         assert host.pump() == 1
-        assert _tags(sim, req) == [lease.CPU, lease.LOADING, lease.COPYING]
+        assert _tags(sim, req) == [lease.COPYING, lease.LOADING, lease.CPU]
         entry = host.lease_entry(req.idx)
         assert entry["lane_copy_engine"][:3] == [1, 0, 1], "a CPU lane's lease is the copy engine's to release"
 
         assert _wait(lambda: len(forward.calls) == 1)
-        assert forward.calls[0] == (HANDLE, [slot3], [0.5], 2)
-        assert torch.equal(out_rows[ROW], torch.arange(HIDDEN, dtype=torch.float32) + 0.5 * (slot3 + 1))
+        assert forward.calls[0] == (HANDLE, [slot2], [0.125], 2)
+        assert torch.equal(out_rows[ROW], torch.arange(HIDDEN, dtype=torch.float32) + 0.125 * (slot2 + 1))
         assert not out_rows[1 - ROW].any()
         time.sleep(0.05)
-        assert sim.copy_done(req) != req.gen, "CopyDone before the lane-2 copy completed"
+        assert sim.copy_done(req) != req.gen, "CopyDone before the lane-0 copy completed"
 
         host.copy_engine_release(-1)
         assert _wait(lambda: sim.copy_done(req) == req.gen)
         assert host.copy_engine_idle(5.0)
         assert sim.copy_done(req) == req.gen
-        assert not any(dst[n][0].view(torch.uint8).any() for n in dst), "the CPU lane's slot was copied"
-        assert all(torch.equal(dst[n][5].view(torch.uint8), s.slabs[ROW][n][slot2].view(torch.uint8)) for n in dst)
+        assert not any(dst[n][5].view(torch.uint8).any() for n in dst), "the CPU lane's slot was copied"
+        assert all(torch.equal(dst[n][0].view(torch.uint8), s.slabs[ROW][n][slot3].view(torch.uint8)) for n in dst)
         host.pump()  # the owner drains the completion and releases the job's leases
         entry = host.lease_entry(req.idx)
         assert entry["lane_state"][0] == 2 and entry["lane_state"][2] == 2
-        assert host.slot_info(ROW)[slot3][2] == 0, "the CPU lane's lease outlived its completion"
+        assert host.slot_info(ROW)[slot2][2] == 0, "the CPU lane's lease outlived its completion"
         counters = host.counters()
         assert counters["cpu_jobs"] == 1 and counters["cpu_lanes"] == 1
         assert host.cpu_stats()["jobs"] == 1 and host.cpu_stats()["lanes"] == 1
@@ -203,24 +203,23 @@ def test_a_request_the_cpu_may_not_take_is_copied_as_before(tmp_path, case):
         host.stop()
 
 
-def test_the_cpu_lanes_prefer_slots_on_the_pools_numa_node(tmp_path):
-    """Lane order would pick lane 0; the only slot on the preferred node is lane 1's, so lane 1 goes to the CPU."""
+def test_the_cpu_takes_the_last_job_lanes_past_a_loading_lane(tmp_path):
+    """Three resident lanes around a miss, split[3] = 2: the last two job lanes (1 and 3) go to the CPU, the LOADING lane
+    2 is not a job lane and does not count, and lane 0, the plan's highest-scored miss, is copied."""
     forward = FakeForward()
-    s, page, host, sim, dst, out_rows = _host(tmp_path, split=_split(n2=1), forward=forward)
+    s, page, host, sim, dst, out_rows = _host(tmp_path, split=_split(n3=2), forward=forward)
     try:
-        _load(sim, host, [2, 3])
-        slot2 = _slot_of(host, 2)
-        nodes = [0] * 4
-        nodes[slot2] = 1
-        host.set_cpu_slot_nodes(ROW, nodes, 1)
+        _load(sim, host, [1, 2, 3])
         host.set_cpu_layer(ROW, HANDLE)
-        req = sim.post(ROW, [3, 2], dst=[0, 1], captured=True, cpu_weights=[1.0, 1.0])
+        req = sim.post(ROW, [3, 1, 5, 2], dst=[0, 1, 2, 3], captured=True, cpu_weights=[1.0, 2.0, 3.0, 4.0])
         assert host.pump() == 1
-        assert _tags(sim, req) == [lease.COPYING, lease.CPU]
-        assert _wait(lambda: len(forward.calls) == 1) and forward.calls[0][1] == [slot2]
+        assert _tags(sim, req) == [lease.COPYING, lease.CPU, lease.LOADING, lease.CPU]
+        assert _wait(lambda: len(forward.calls) == 1)
+        assert sorted(forward.calls[0][1]) == sorted([_slot_of(host, 1), _slot_of(host, 2)])
         host.copy_engine_release(-1)
         assert _wait(lambda: sim.copy_done(req) == req.gen)
         assert host.copy_engine_idle(5.0)
+        assert host.counters()["cpu_lanes"] == 2
     finally:
         host.stop()
 
