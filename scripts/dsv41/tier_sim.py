@@ -238,6 +238,7 @@ class DirectInsertReplay:
         self.truncated = 0
         self.deferred_inserted = 0
         self.deferred_dropped = 0
+        self.deferred_last: dict[int, int] = {}
         self.shortlist = [self._rank(row) for row in range(layers)]  # reset_after_capture
 
     def _decay(self, tokens: int) -> np.float32:
@@ -283,17 +284,20 @@ class DirectInsertReplay:
         *,
         cpu_lanes: Optional[Callable[[int, list[int]], set[int]]] = None,
         deferred: Optional[dict[int, list[int]]] = None,
+        deferred_unrouted: bool = False,
     ) -> dict[int, int]:
         """One forward served by the graph gather (a replay, or a one-token extend run eagerly through
         it); returns each layer's misses (its plan count).
 
         ``cpu_lanes(layer, misses)`` (CPU experts) gets a layer's misses in plan-lane order and returns
         the ones the CPU computes: they are not inserted and their victims keep their experts, as
-        direct_commit_gather_kernel does. ``deferred`` inserts experts after the forward's own misses,
-        into the shortlist entries its live lanes left unused, in shortlist order."""
+        direct_commit_gather_kernel does. ``deferred`` inserts experts, in list order, after the forward's
+        own misses, into the shortlist entries its live lanes left unused (with ``deferred_unrouted``, only
+        those whose expert the open window did not route), in shortlist order."""
         self._apply(self.boundary_pending)  # on_graph_forward: re-ranks even when no boundary is due
         self._count(1, decode=True)  # on_graph_forward counts every graph-served forward as decode
         misses = {}
+        self.deferred_last = {}
         for layer, experts in routes.items():
             row = self.row[layer]
             where, slots = self.where[row], self.slots[row]
@@ -307,10 +311,15 @@ class DirectInsertReplay:
             if deferred is not None and deferred.get(layer):
                 taken = {slot for _, slot in live}
                 inserted = {expert for expert, _ in live}
-                spare = [slot for slot in usable if slot not in taken]
+                spare = [
+                    slot
+                    for slot in usable
+                    if slot not in taken and not (deferred_unrouted and slots[slot] >= 0 and self.routed[row, slots[slot]])
+                ]
                 late = [e for e in dict.fromkeys(deferred[layer]) if where[e] < 0 and e not in inserted]
                 live += list(zip(late, spare))
-                self.deferred_inserted += min(len(late), len(spare))
+                self.deferred_last[layer] = min(len(late), len(spare))
+                self.deferred_inserted += self.deferred_last[layer]
                 self.deferred_dropped += max(len(late) - len(spare), 0)
             for expert, slot in live:
                 old = slots[slot]

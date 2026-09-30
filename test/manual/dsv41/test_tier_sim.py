@@ -297,36 +297,6 @@ def test_direct_replay_eager_prefill_inserts_nothing():
     assert sim.scores[0, 7] == 310 and sim.resident(0) == {0, 1}
 
 
-def test_direct_replay_cpu_lane_keeps_its_victim_and_a_deferred_insert_takes_a_spare_entry():
-    """direct_commit_gather_kernel maps no CPU lane: lane 0's victim keeps its expert while lane 1 still
-    lands in its own entry. A deferred insert later takes a shortlist entry its forward left unused."""
-    from tier_sim import DirectInsertReplay
-
-    plain = DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=2)
-    plain.graph_forward({0: [5, 6]})
-    assert plain.resident(0) == {0, 5, 6}
-
-    sim = DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=2)
-    assert sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]}) == {0: 2}
-    assert sim.resident(0) == {0, 2, 6}  # lane 0 (expert 5) was bound for expert 2's slot
-    # Shortlist [expert 2, expert 0]; the forward reads 0, so only expert 2's slot is spare.
-    assert sim.graph_forward({0: [0]}, deferred={0: [5]}) == {0: 0}
-    assert sim.resident(0) == {0, 5, 6} and sim.deferred_inserted == 1
-
-
-def test_direct_replay_without_cpu_lanes_is_unchanged():
-    from tier_sim import DirectInsertReplay
-
-    rng = np.random.default_rng(0)
-    plain = DirectInsertReplay({0: [0, 1, 2, 3]}, {0: 4}, 16)
-    hooked = DirectInsertReplay({0: [0, 1, 2, 3]}, {0: 4}, 16)
-    for _ in range(50):
-        routes = {0: rng.choice(16, 6, replace=False).tolist()}
-        assert plain.graph_forward(routes) == hooked.graph_forward(routes, cpu_lanes=lambda layer, misses: set())
-        assert plain.slots == hooked.slots
-    assert np.array_equal(plain.scores, hooked.scores)
-
-
 def test_direct_allocation_gives_every_layer_its_floor_then_lowest_layers_the_rest():
     from tier_sim import direct_hot_allocation
 

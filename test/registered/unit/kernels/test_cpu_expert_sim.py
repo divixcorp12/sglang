@@ -13,11 +13,13 @@ from cpu_expert_sim import (  # noqa: E402
     MAX_ROUTES,
     CostModel,
     _cpu_chooser,
+    _queue,
     c_cpu_at,
     histogram,
     load_c_cpu_table,
     predict,
     replay_nm,
+    split_costs,
 )
 
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
@@ -169,6 +171,89 @@ def test_cpu_by_score_takes_the_lowest_ranked_ram_hit():
         assert _cpu_chooser(policy, sim, [0, 1, 1], {0: [5, 6]}, chosen)(0, [5, 6]) == want
     sim.scores[0, 6] = 2.0  # a tie goes to the higher expert, as the victim ranking evicts it first
     assert _cpu_chooser("cpu_by_score", sim, [0, 1, 1], {0: [5, 6]}, {})(0, [5, 6]) == {6}
+
+
+def test_a_cpu_lane_keeps_its_victim_while_the_next_lane_lands_in_its_own_entry():
+    """direct_commit_gather_kernel maps no CPU lane and does not compact the others: with shortlist
+    [expert 2, 1, 0], lane 0 (expert 5, CPU) leaves expert 2's slot alone and lane 1 (6) still takes 1's."""
+    plain = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    plain.graph_forward({0: [5, 6]})
+    assert plain.resident(0) == {0, 5, 6}
+
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    assert sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]}) == {0: 2}
+    assert sim.resident(0) == {0, 2, 6}
+
+
+def test_deferred_inserts_take_spare_entries_in_queue_order():
+    def forward_one():
+        sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+        sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]})
+        return sim
+
+    # Shortlist now [expert 2, 0, 6]; the forward reads 0, leaving 2's and 6's slots spare.
+    sim = forward_one()
+    assert sim.graph_forward({0: [0]}, deferred={0: [5]}) == {0: 0}
+    assert sim.resident(0) == {0, 5, 6} and sim.deferred_inserted == 1
+    # 6 was routed in the open window, so an unrouted-only spare leaves one entry: the queue's first takes it.
+    sim = forward_one()
+    sim.graph_forward({0: [0]}, deferred={0: [7, 5]}, deferred_unrouted=True)
+    assert sim.resident(0) == {0, 6, 7} and sim.deferred_dropped == 1
+
+
+def test_direct_replay_without_cpu_lanes_is_unchanged():
+    rng = np.random.default_rng(0)
+    plain = tier_sim.DirectInsertReplay({0: [0, 1, 2, 3]}, {0: 4}, 16)
+    hooked = tier_sim.DirectInsertReplay({0: [0, 1, 2, 3]}, {0: 4}, 16)
+    for _ in range(50):
+        routes = {0: rng.choice(16, 6, replace=False).tolist()}
+        assert plain.graph_forward(routes) == hooked.graph_forward(routes, cpu_lanes=lambda layer, misses: set())
+        assert plain.slots == hooked.slots
+    assert np.array_equal(plain.scores, hooked.scores)
+
+
+def test_cpu_by_score_ranks_an_expert_routed_in_the_window_last_whatever_its_score():
+    sim = tier_sim.DirectInsertReplay({0: [0]}, {0: 1}, 8)
+    sim.scores[0, 5], sim.scores[0, 6] = 0.0, 2.0
+    assert _cpu_chooser("cpu_by_score", sim, [0, 1, 1], {0: [5, 6]}, {})(0, [5, 6]) == {5}
+    sim.routed[0, 5] = True
+    assert _cpu_chooser("cpu_by_score", sim, [0, 1, 1], {0: [5, 6]}, {})(0, [5, 6]) == {6}
+
+
+def test_chosen_lanes_are_recorded_in_lane_order_and_queued_by_policy():
+    sim = tier_sim.DirectInsertReplay({0: [0]}, {0: 1}, 8)
+    sim.scores[0, 5], sim.scores[0, 6], sim.scores[0, 7] = 3.0, 1.0, 2.0
+    chosen = {}
+    assert _cpu_chooser("cpu_by_score", sim, [0, 1, 1, 2], {0: [5, 6, 7]}, chosen)(0, [5, 6, 7]) == {6, 7}
+    assert chosen == {0: [6, 7]}
+    assert _queue("cpu_deferred", sim, {0: [5, 6, 7]}) == {0: [5, 6, 7]}
+    assert _queue("cpu_deferred_scoreq", sim, {0: [5, 6, 7]}) == {0: [5, 7, 6]}  # highest insert score first
+    chosen = {}
+    assert _cpu_chooser("cpu_numa_local", sim, [0, 1], {0: [5, 6]}, chosen, {0: {6}})(0, [5, 6]) == {6}
+
+
+def test_a_deferred_row_evicted_from_the_pinned_tier_is_dropped():
+    # A 3-row tier: forward 3's CPU lane (expert 2) is queued; the prefill's two admissions evict it.
+    loaded = _ram_hit_loaded()
+    loaded["forwards"] = loaded["forwards"][:3] + [
+        {"kind": "eager", "phase": "extend", "tokens": 20, "counts": {0: ([4, 5], [1, 1])}, "misses": {0: 2}},
+        _graph(4, [0], [0]),
+    ]
+    out = replay_nm(loaded, ram_rows=3, num_experts=8, policy="cpu_deferred", split=[0, 1, 1, 2, 3, 3, 4])
+    assert out["residency"]["deferred_evicted_per_token"] == pytest.approx(1 / 4)
+    assert out["residency"]["deferred_link_rows_per_token"] == 0.0
+
+
+def test_background_rows_cost_nothing_in_cpu_slack_and_all_in_the_worst_case():
+    model = _model([0.4, 0.4, 0.4])
+    split = [0, 1, 1]
+    # Layer 0: one RAM hit on the CPU (0.42 ms), no link rows: 0.42 ms of slack. Layer 1 has none.
+    n, m = np.array([[1, 0]]), np.zeros((1, 2), dtype=np.int64)
+    in_slack = split_costs(n, m, model, split, np.array([[0, 1]]))
+    assert in_slack["uncosted"] == pytest.approx(0.42)
+    assert in_slack["worst"] == pytest.approx(0.42 + 1.0)
+    assert in_slack["amortised"] == pytest.approx(0.42 + 1.0 - 0.42)
+    assert split_costs(n, m, model, split)["worst"] == pytest.approx(0.42)
 
 
 if __name__ == "__main__":
