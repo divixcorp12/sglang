@@ -35,7 +35,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Optional
+import math
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 import torch
@@ -236,6 +237,10 @@ class DirectInsertReplay:
         self.boundary_pending = False
         self.host_pending = False
         self.truncated = 0
+        self.deferred_inserted = 0
+        self.deferred_dropped = 0
+        self.deferred_last: dict[int, int] = {}
+        self.promoted = 0
         self.shortlist = [self._rank(row) for row in range(layers)]  # reset_after_capture
 
     def _decay(self, tokens: int) -> np.float32:
@@ -274,20 +279,55 @@ class DirectInsertReplay:
             self.host_pending = False
             self._apply(self.boundary_pending)
 
-    def graph_forward(self, routes: dict[int, list[int]], phase: str = "decode") -> dict[int, int]:
+    def graph_forward(
+        self,
+        routes: dict[int, list[int]],
+        phase: str = "decode",
+        *,
+        cpu_lanes: Optional[Callable[[int, list[int]], set[int]]] = None,
+        deferred: Optional[dict[int, list[int]]] = None,
+        deferred_unrouted: bool = False,
+        lane_order: Optional[Callable[[int, list[int]], list[int]]] = None,
+    ) -> dict[int, int]:
         """One forward served by the graph gather (a replay, or a one-token extend run eagerly through
-        it); returns each layer's misses (its plan count)."""
+        it); returns each layer's misses (its plan count). ``lane_order(layer, misses)`` reorders a layer's
+        plan lanes (first-appearance route order otherwise), and with them the lane j <-> usable[j] pairing.
+
+        ``cpu_lanes(layer, misses)`` (CPU experts) gets a layer's misses in plan-lane order and returns
+        the ones the CPU computes: they are not inserted and their victims keep their experts, as
+        direct_commit_gather_kernel does. ``deferred`` inserts experts, in list order, after the forward's
+        own misses, into the shortlist entries its live lanes left unused (with ``deferred_unrouted``, only
+        those whose expert the open window did not route), in shortlist order."""
         self._apply(self.boundary_pending)  # on_graph_forward: re-ranks even when no boundary is due
         self._count(1, decode=True)  # on_graph_forward counts every graph-served forward as decode
         misses = {}
+        self.deferred_last = {}
         for layer, experts in routes.items():
             row = self.row[layer]
             where, slots = self.where[row], self.slots[row]
             hits = {int(where[e]) for e in experts if where[e] >= 0}
             missing = list(dict.fromkeys(e for e in experts if where[e] < 0))
+            if lane_order is not None and missing:
+                missing = lane_order(layer, missing)
             np.add.at(self.route_counts[row], experts, np.float32(1.0))
             usable = [slot for slot in self.shortlist[row] if slot not in hits]
-            for expert, slot in zip(missing, usable):
+            on_cpu = cpu_lanes(layer, missing) if cpu_lanes is not None and missing else set()
+            # Lane j's destination is usable[j] whether or not it is live (direct_gather_destinations_kernel).
+            live = [(expert, slot) for expert, slot in zip(missing, usable) if expert not in on_cpu]
+            if deferred is not None and deferred.get(layer):
+                taken = {slot for _, slot in live}
+                inserted = {expert for expert, _ in live}
+                spare = [
+                    slot
+                    for slot in usable
+                    if slot not in taken and not (deferred_unrouted and slots[slot] >= 0 and self.routed[row, slots[slot]])
+                ]
+                late = [e for e in dict.fromkeys(deferred[layer]) if where[e] < 0 and e not in inserted]
+                live += list(zip(late, spare))
+                self.deferred_last[layer] = min(len(late), len(spare))
+                self.deferred_inserted += self.deferred_last[layer]
+                self.deferred_dropped += max(len(late) - len(spare), 0)
+            for expert, slot in live:
                 old = slots[slot]
                 if old >= 0:
                     where[old] = -1
@@ -302,6 +342,48 @@ class DirectInsertReplay:
             self.decode_forwards -= 1
             self.boundary_pending = self.decode_forwards >= 1
         return misses
+
+    def promote(
+        self, pinned: dict[int, Iterable[int]], limit: int, *, margin: float = 1.0, sigmas: float = 0.0
+    ) -> dict[int, int]:
+        """GpuResidencyUpdater._promote at a decode boundary, before the forward's gathers: up to ``limit``
+        promotions per layer from the experts ``pinned`` holds, as decide_residency_on_device decides them.
+
+        Candidates are nonresidents with a positive score, (-score, expert) order; free slots admit the
+        leading ones, then candidate i replaces the i-th victim of _rank_victims' order while it leads by
+        ``margin + sigmas * sqrt(candidate + victim)``, stopping at the first that does not. Scores and
+        routed flags are the ones the forward's _apply is about to set. Returns each layer's promotions."""
+        scores = self.scores * self._decay(self.tokens) + self.route_counts if self.boundary_pending else self.scores
+        routed = self.route_counts > 0
+        out = {}
+        for layer, held in pinned.items():
+            row = self.row[layer]
+            slots, where, s = self.slots[row], self.where[row], scores[row]
+            candidates = sorted((e for e in held if where[e] < 0 and s[e] > 0), key=lambda e: (-s[e], e))[:limit]
+            free = [slot for slot, e in enumerate(slots) if e < 0]
+            members = sorted(
+                (slot for slot, e in enumerate(slots) if e >= 0),
+                key=lambda slot: (routed[row, slots[slot]], s[slots[slot]], -slots[slot]),
+            )
+            done = 0
+            for i, expert in enumerate(candidates):
+                if i < len(free):
+                    slot = free[i]
+                else:
+                    j = i - len(free)
+                    if j >= len(members):
+                        break
+                    slot, victim = members[j], slots[members[j]]
+                    lead, trail = float(s[expert]), float(s[victim])
+                    if not lead > trail + margin + sigmas * math.sqrt(max(lead + trail, 0.0)):
+                        break
+                    where[victim] = -1
+                slots[slot] = expert
+                where[expert] = slot
+                done += 1
+            out[layer] = done
+        self.promoted += sum(out.values())
+        return out
 
     def eager_forward(
         self, tokens: int, counts: dict[int, tuple[list[int], list[int]]], phase: Optional[str] = None

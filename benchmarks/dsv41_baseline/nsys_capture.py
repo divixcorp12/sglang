@@ -5,7 +5,7 @@ node-mode report fabricates a step-tail idle gap and inflates ms/token (CLAUDE.m
 attribution only.
 
 Graph mode is refused when the arm runs the RAM-miss copy engine: graph-mode CUPTI tracing deadlocks the copy wait
-(LEASE_PROTOCOL.md 7.6; `analysis/dsv41-drive/copy-engine/smoke.sh` refuses it the same way).
+(LEASE_PROTOCOL.md, "Copy engine"; `analysis/dsv41-drive/copy-engine/smoke.sh` refuses it the same way).
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def graph_trace_mode(requested: str | None, env: dict[str, str]) -> str:
     if mode == "graph" and copy_engine_on(env):
         raise ValueError(
             f"NSYS_CUDA_GRAPH_TRACE=graph with {COPY_ENGINE_ENV}={env[COPY_ENGINE_ENV]}: graph-mode tracing deadlocks "
-            "the copy engine's copy wait (LEASE_PROTOCOL.md 7.6); use NSYS_CUDA_GRAPH_TRACE=node"
+            "the copy engine's copy wait (LEASE_PROTOCOL.md, 'Copy engine'); use NSYS_CUDA_GRAPH_TRACE=node"
         )
     return mode
 

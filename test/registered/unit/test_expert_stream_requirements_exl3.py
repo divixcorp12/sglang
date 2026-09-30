@@ -225,11 +225,6 @@ def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model
     # decode and refuse graph gather (the Task 16 option C Engine launch failed this way).
     raw = None
     _gate(_launch(model_dir, cuda_graph_config=raw), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
-    _gate(
-        _launch(model_dir, cuda_graph_config=raw),
-        SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
-        SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True,
-    )
 
 
 class _PipelineStopped(Exception):
@@ -309,22 +304,6 @@ def test_graph_gather_keeps_the_alt_stream_overlap_off(model_dir, multi_stream_u
     assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
 
 
-def test_prefetch_needs_graph_gather_under_breakable_decode(model_dir):
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_ENABLE_EXPERT_PREFETCH"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_ENABLE_EXPERT_PREFETCH"):
-        _gate(_launch(model_dir), SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=True)  # eager decode: no in-graph MoE to post from
-
-
-def test_prefetch_is_off_unless_the_env_var_is_set():
-    from sglang.srt.layers.moe.exl3_expert_format import prefetch_enabled
-
-    assert prefetch_enabled() is False
-    with envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(True):
-        assert prefetch_enabled() is True
-
-
 def test_the_exl3_requirements_read_graph_gathers_from_the_pinned_tier(model_dir):
     args = _launch(model_dir)
     assert expert_stream_requirements_for(args, args).graph_gather_host_source == "pinned_tier"
@@ -334,3 +313,81 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+CPU_EXPERTS_ENV = dict(
+    SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+    SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=True,
+    SGLANG_DSV41_ENABLE_LAYER_FUSION=True,
+    SGLANG_MOE_GPU_RESIDENCY_UPDATE=True,
+    SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2,
+    SGLANG_MOE_EXPERT_FUSED_PLAN=True,
+    SGLANG_DSV41_CPU_EXPERTS_CORES="18-29",
+    SGLANG_DSV41_CPU_EXPERTS=True,
+)
+
+
+@pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_DSV41_CPU_EXPERTS"])
+def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
+    """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), never left out of the fused
+    MoE (layer fusion), not the lowest-scored misses (DIRECT residency's keys, which only the fused plan sorts by), or
+    run on no cores; the refusal names the one that is off."""
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
+    off = {"SGLANG_DSV41_CPU_EXPERTS_CORES": "", "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}.get(missing, False)
+    with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {missing}"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: off})
+
+
+@pytest.mark.parametrize("update", [True, False])
+def test_cpu_experts_without_direct_residency_are_refused(model_dir, update):
+    """Stage 1 is not DIRECT.
+
+    With the residency update on, the update's own EXL3 rule would say to turn it off.
+    The CPU-experts rule runs first and names what to set instead: the update on, at stage 2.
+    """
+    env = {**CPU_EXPERTS_ENV, "SGLANG_MOE_GPU_RESIDENCY_UPDATE": update, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}
+    wanted = ("" if update else "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, ") + "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"
+    with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {wanted}$") as refused:
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **env)
+    assert "set it to 0" not in str(refused.value)
+
+
+FULL_BS1 = CudaGraphConfig(
+    decode=PhaseConfig(backend="full", bs=[1], max_bs=1),
+    prefill=PhaseConfig(backend="disabled"),
+)
+
+
+# With decode graphs disabled, the generic rule "graph gather requires decode CUDA graphs" refuses first;
+# graph gather off is how a disabled launch reaches the EXL3 rules.
+_EAGER_DECODE = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": False}
+
+
+@pytest.mark.parametrize(
+    "changes, env",
+    [
+        ({}, _EAGER_DECODE),  # both phases disabled
+        ({"cuda_graph_config": FULL_BS1}, {}),
+        ({"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1}, {}),
+        ({"speculative_algorithm": "DSPARK"}, _EAGER_DECODE),
+    ],
+    ids=["disabled", "full", "spec-breakable", "spec-disabled"],
+)
+def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(model_dir, changes, env):
+    """Refused before the speculative and backend rules, which would each send the launch to the other's backend.
+
+    The refusal never suggests disabled decode graphs.
+    """
+    with pytest.raises(ValueError, match="breakable, without speculative decoding") as refused:
+        _gate(_launch(model_dir, **changes), **{**CPU_EXPERTS_ENV, **env})
+    assert "disabled" not in str(refused.value)
+
+
+def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
+    """The join moves a route to the pulled slot after planning: a CPU lane's route would match no plan slot and be
+    computed on the GPU as well as on the CPU."""
+    with pytest.raises(ValueError, match="PREFETCH_PULL_MODE"):
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            **{**CPU_EXPERTS_ENV, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE": "always"},
+        )

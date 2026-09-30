@@ -1,9 +1,10 @@
-// The copy engine: CopyLane through CopyEngine (LEASE_PROTOCOL.md 7.6).
+// The copy engine: CopyLane through CopyEngine (LEASE_PROTOCOL.md, "Copy engine").
 #pragma once
 
 #include "../lease_layout.h"
 #include "build_policy.h"
 #include "completion_word.h"
+#include "cpu_experts.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
 
@@ -12,13 +13,11 @@ namespace expert_stream {
 
 using namespace ::sglang::expert_stream::wire;
 
-// ---- Copy engine (LEASE_PROTOCOL.md 7.6) ----
-
 struct CopyLane {
   int32_t lane = 0;
   int32_t host_slot = 0;
   int32_t dst_slot = 0;
-  uint32_t slot_generation = 0;
+  float weight = 0.0f;  // the lane's routing weight: read only for a CPU lane
 };
 
 // One request's COPYING lanes, handed from the grant to the copy thread.
@@ -30,13 +29,19 @@ struct CopyJob {
   int count = 0;
   CopyLane lanes[kLeaseLanes];
   int64_t submit_ns = 0;
-  int64_t token = -1;     // the backend's completion marker after the job's last copy (CUDA: the job's sequence)
-  bool prefetch = false;  // a native-prefetch job: issued only behind demand jobs, completed into PrefetchDone
-  // Its row has SM entries (set at issue): the copy wait reads them from the leased slots, so the leases are released
-  // only once it acknowledged its reads (SmAck), not on the DMA's completion. Never a prefetch job: no kernel reads
-  // a prefetched row's slot, so a prefetch copies every entry itself.
+  int64_t token = -1;  // the backend's completion marker after the job's last copy (CUDA: the job's sequence)
+  // Its row has SM entries (set at issue): CW reads them from the leased slots, so the leases are released only once
+  // CW's Done shows it finished, not on the DMA's completion alone.
   bool sm = false;
+  // CPU experts (tag kLeaseTagCpu): the lanes of `mask` the CPU expert thread computes instead of copying, and that
+  // engine's job sequence for them (set at issue, 0 without CPU lanes). The job completes when its copies AND that
+  // CPU job have; CopyDone then carries the whole mask. `token` is kNoToken when no lane was copied.
+  uint32_t cpu_mask = 0;
+  uint32_t cpu_seq = 0;
 };
+
+// CopyJob::token of a job that issued no copy (every lane on the CPU): nothing to query.
+constexpr int64_t kNoToken = -1;
 
 // One entry of a row's copy table: C1's (source slab, destination tensor, row bytes); lane rows index both.
 struct CopyEntry {
@@ -69,7 +74,7 @@ static_assert(CompletionWord::kDone == CopyBackend::kDone && CompletionWord::kPe
 //
 // No fallback: the production recipe needs the copy engine, so init() refuses (and the copy engine's start() throws)
 // when the v2 write-value op cannot be resolved, errors, or its first write does not reach the word; and when the v2
-// wait-value op, which the decode stream's copy wait needs on host-mapped memory (LEASE_PROTOCOL.md 7.6), cannot be
+// wait-value op, which the decode stream's copy wait needs on host-mapped memory (LEASE_PROTOCOL.md, "Copy engine"), cannot be
 // resolved, errors, does not hold its stream, or is not released by a host store.
 class CudaCopyBackend : public CopyBackend {
  public:
@@ -261,11 +266,11 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_wait_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 
-// The copy engine's queues (spec A7/A8): the service's job ring and the copy thread's in-flight, held and acking
-// FIFOs. At most kDemandRecords + 1 jobs are outstanding at once (one per request slot, whose lease entry stays open
-// until its COPYING leases are released, plus the one native-prefetch lease), so none of them can fill.
+// The copy engine's queues (spec A7/A8): the service's job ring and the copy thread's in-flight and acking FIFOs. At
+// most kDemandRecords jobs are outstanding at once (one per request slot, whose lease entry stays open until its
+// COPYING leases are released), so none of them can fill.
 constexpr size_t kCopyRing = 32;
-static_assert(kCopyRing > kDemandRecords + 1, "the copy engine's rings hold every job that can be outstanding");
+static_assert(kCopyRing > kDemandRecords, "the copy engine's rings hold every job that can be outstanding");
 
 // Test only (CPU): "copies" between host buffers. A mark completes only once the test has released it, and its
 // copies land then (in query(), on the copy thread, in mark order: one stream), so a CopyDone published before its
@@ -353,19 +358,19 @@ class HostCopyBackend : public CopyBackend {
 };
 
 // The copy thread: issues each job's copies on the backend's stream, records one mark after them, polls marks in
-// order and hands each completed job to its owner. A backend error hands every job it still holds to the owner's
-// copy_failed and stops issuing: nothing it issued may be assumed complete, so none of those leases is released (E5).
+// order and hands each completed job to its owner. A backend error hands the job to the owner's copy_failed, which
+// fails stop: nothing it issued may be assumed complete.
 //
 // `Build`: the tier's build policy (build_policy.h). `Owner`: the RamTier, which befriends this class. Its hooks,
 // all called on the copy thread (copy_failed also on the submitting thread, for a ring overflow):
-//   - bool copy_completed(const CopyJob&): the job's copies completed; false when it still waits for the copy wait's
-//     SmAck, which copy_acked then polls;
-//   - bool copy_acked(const CopyJob&): true once it released the job's leases;
+//   - bool copy_completed(const CopyJob&): the job's copies completed; false when it still waits for CW's Done,
+//     which copy_acked then polls;
+//   - bool copy_acked(const CopyJob&): true once it handed the job back;
 //   - void copy_failed(const CopyJob&, int error): completion cannot be established; fail stop;
 //   - owner->template copy_count<K>(n): the copy thread's counters.
 //
 // Service to copy thread (spec 6.3 item 5): an SPSC job ring. submit() takes no lock and never blocks. The copy thread
-// polls the ring; after spin_ns of idle (nothing popped, in flight, held or acking) it sleeps on a futex, and submit()
+// polls the ring; after spin_ns of idle (nothing popped, in flight or acking) it sleeps on a futex, and submit()
 // makes the wake syscall only when that thread is asleep. No wake is lost:
 //   - copy thread (idle): seen = wake_; sleeping_ = true; fence(seq_cst); if the ring is empty and no stop was asked
 //     for, futex_wait(&wake_, seen);
@@ -432,7 +437,7 @@ class CopyEngine {
   }
 
   // The tier's owner only (the service thread, or the caller of pump()). Takes no lock and never blocks: at most
-  // kDemandRecords + 1 jobs are outstanding, and the ring holds kCopyRing, so a full ring is an internal error, which
+  // kDemandRecords jobs are outstanding, and the ring holds kCopyRing, so a full ring is an internal error, which
   // fails stop. The wake is a syscall only when the copy thread has gone to sleep (idle past spin_ns).
   void submit(const CopyJob& job) {
     if (!jobs_.push(job)) {
@@ -477,6 +482,12 @@ class CopyEngine {
     return dynamic_cast<HostCopyBackend*>(backend_.get());
   }
 
+  // CPU experts: the engine a job's CPU lanes go to. Set before any grant publishes a CPU lane (the service sets it
+  // before its thread starts); the release pairs with the copy thread's acquire at issue.
+  void set_cpu(CpuExpertEngine* cpu) {
+    cpu_.store(cpu, std::memory_order_release);
+  }
+
   // Test only: one more copy of `bytes` issued ahead of every job's own, so each job completes that much later.
   // InstrBuild only.
   void set_ballast(uint64_t dst, uint64_t src, int64_t bytes)
@@ -509,50 +520,32 @@ class CopyEngine {
     ready_cv_.notify_all();
     if (!error.empty()) return;
     Queue in_flight;
-    Queue held;    // prefetch jobs not yet issued: demand goes first on the link
-    Queue acking;  // copies completed, CopyDone published; the leases wait for the copy wait's SmAck
+    Queue acking;  // copies completed, CopyDone published; the leases wait for CW's Done
     uint64_t idle = 0;  // empty polls since the last progress: the spin budget counts these (spec M8)
     while (true) {
       // Read before the ring: stop() is asked only after the last submit, so a stop seen here has every job in the
       // ring.
       const bool stopping = stop_.load(std::memory_order_acquire);
-      bool demand_fresh = false;
       bool progressed = false;
       CopyJob job;
       while (jobs_.pop(&job)) {
         progressed = true;
-        if (job.prefetch) {
-          push_or_fail(held, job);
-          continue;
-        }
-        demand_fresh = true;
         issue_or_fail(job, in_flight);
-      }
-      // Demand before prefetch: a prefetch is issued only when no demand job arrived this pass and none is in flight,
-      // so a mispredicted row never sits on the copy stream ahead of a demand row. Once issued it cannot be preempted;
-      // the device never posts a demand while its own layer's prefetch is outstanding, so none can queue behind it.
-      bool demand_in_flight = false;
-      for (size_t i = 0; i < in_flight.size(); ++i)
-        demand_in_flight = demand_in_flight || !in_flight[i].prefetch;
-      if (!held.empty() && (demand_fresh || demand_in_flight)) {
-        if (!held_counted_) count<kPrefetchHeld>();
-        held_counted_ = true;
-      }
-      while (!held.empty() && ((!demand_fresh && !demand_in_flight) || stopping)) {
-        held_counted_ = false;
-        CopyJob next = held.front();
-        held.pop_front();
-        issue_or_fail(next, in_flight);
       }
       // The head job is polled every turn, oldest first. CudaCopyBackend's poll is one acquire load of the completion
       // word, no driver call (the cuEventQuery it replaces took a libcuda mutex per call: ~2,300-3,200 per job over
       // arm CS3, results.md 9a), and one cuStreamQuery per CompletionWord budget while the head stays pending.
       while (!in_flight.empty() && broken_ == 0) {
-        const int state = backend_->query(in_flight.front().token);
+        const CopyJob& head = in_flight.front();
+        const int state = head.token == kNoToken ? CopyBackend::kDone : backend_->query(head.token);
         if (state == CopyBackend::kPending) break;
         if (state != CopyBackend::kDone) {
           broken_ = state;
           break;
+        }
+        if (head.cpu_seq != 0) {
+          const CpuExpertEngine* cpu = cpu_.load(std::memory_order_relaxed);  // set before the job was issued
+          if (!cpu->done(head.cpu_seq)) break;
         }
         const CopyJob done = in_flight.front();
         in_flight.pop_front();
@@ -578,10 +571,10 @@ class CopyEngine {
         }
       }
       // The drain deadline is read only once a stop was asked for (short-circuit): never while serving.
-      if (stopping && held.empty() && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;
+      if (stopping && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;
       if (progressed) {
         idle = 0;
-      } else if (!in_flight.empty() || !held.empty() || !acking.empty() || ++idle < spin_iters_) {
+      } else if (!in_flight.empty() || !acking.empty() || ++idle < spin_iters_) {
         _mm_pause();
       } else {
         sleep_until_submit();  // the idle path: nothing to poll, and spin_ns of nothing arriving
@@ -604,7 +597,7 @@ class CopyEngine {
     sleeping_.store(false, std::memory_order_relaxed);
   }
 
-  // A full queue is impossible under the outstanding-job bound; if it ever happens, fail stop (E5: keep the leases).
+  // A full queue is impossible under the outstanding-job bound; if it ever happens, fail stop.
   void push_or_fail(Queue& queue, const CopyJob& job) {
     if (!queue.push_back(job)) finish_failed(job, kRingOverflow);
   }
@@ -633,9 +626,30 @@ class CopyEngine {
         if (const int r = backend_->issue(ballast_.dst.load(), ballast_.src.load(), ballast)) return r;
       }
     }
-    job.sm = table.sm && !job.prefetch;
+    job.sm = table.sm;
+    if (job.cpu_mask != 0) {
+      // First, so the CPU starts while the copies below are issued.
+      CpuExpertEngine* cpu = cpu_.load(std::memory_order_acquire);
+      if (cpu == nullptr)
+        fail_stop("copy job " + std::to_string(job.gen) + " carries CPU lanes with no CPU expert engine");
+      CpuJob cpu_job;
+      cpu_job.row = job.row;
+      for (int i = 0; i < job.count; ++i) {
+        const CopyLane& lane = job.lanes[i];
+        if ((job.cpu_mask >> lane.lane & 1u) == 0) continue;
+        cpu_job.slots[cpu_job.k] = lane.host_slot;
+        cpu_job.weights[cpu_job.k] = lane.weight;
+        ++cpu_job.k;
+      }
+      job.cpu_seq = cpu->submit(cpu_job);
+      if (job.cpu_seq == 0) fail_stop("copy job " + std::to_string(job.gen) + ": the CPU expert ring is full");
+    }
+    bool copied = false;
+    if constexpr (Build::kFaults) copied = ballast_.bytes.load() > 0;
     for (int i = 0; i < job.count; ++i) {
       const CopyLane& lane = job.lanes[i];
+      if ((job.cpu_mask >> lane.lane & 1u) != 0) continue;  // computed on the CPU: nothing copies its slot
+      copied = true;
       for (const CopyEntry& entry : table.entries) {
         if (entry.sm && job.sm) continue;
         const uint64_t dst = entry.dst + static_cast<uint64_t>(lane.dst_slot) * static_cast<uint64_t>(entry.bytes);
@@ -643,6 +657,10 @@ class CopyEngine {
         if (const int r = backend_->issue(dst, src, entry.bytes)) return r;
         bytes += entry.bytes;
       }
+    }
+    if (!copied) {
+      job.token = kNoToken;
+      return 0;
     }
     const int r = backend_->mark(&job.token);
     if constexpr (Build::kMetrics) {
@@ -674,7 +692,6 @@ class CopyEngine {
   }
 
   void finish_failed(const CopyJob& job, int error_code) {
-    count<kCopyErrors>();
     owner_->copy_failed(job, error_code);
     finish();
   }
@@ -684,6 +701,7 @@ class CopyEngine {
   }
 
   std::unique_ptr<CopyBackend> backend_;
+  std::atomic<CpuExpertEngine*> cpu_{nullptr};
   std::vector<Table> tables_;
   int64_t spin_ns_;
   uint64_t spin_iters_ = 1;  // idle polls before the futex sleep: idle_budget(spin_ns_), set in start()
@@ -702,8 +720,7 @@ class CopyEngine {
   std::condition_variable ready_cv_;
   bool started_ = false;
   std::string init_error_;
-  int broken_ = 0;             // copy thread only: the first backend error
-  bool held_counted_ = false;  // copy thread only: the current hold was counted in kPrefetchHeld
+  int broken_ = 0;  // copy thread only: the first backend error
   struct Ballast {  // set_ballast: InstrBuild only
     std::atomic<uint64_t> dst{0};
     std::atomic<uint64_t> src{0};

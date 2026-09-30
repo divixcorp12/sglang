@@ -1187,14 +1187,6 @@ def test_the_numa_placement_is_in_the_env_and_sums_to_the_budget():
     assert sum(_placement().values()) == int(arm_env.PINNED_HOST_MB)
 
 
-def test_piece_streaming_defaults_carry_their_prerequisites():
-    # The server refuses piece streaming without two-phase (leases are unconditional, and row images need no
-    # pack workers).
-    env = arm_env.base_env()
-    assert env["SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM"] == "1"
-    assert env["SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE"] == "1"
-
-
 # --- run_arm.sh's Nsight options (nsys_capture.py) ---
 
 

@@ -207,9 +207,7 @@ class GpuResidencyUpdater:
         self.insert_tensors = None
         self.insert_active = None
         self.victims = None
-        # SGLANG_DSV41_ENABLE_NATIVE_PREFETCH: DIRECT's ranking continued past the shortlist, the prefetch's victims.
-        self.prefetch_victims = None
-        self.prefetch_victim_valid = None
+        self.miss_keys = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
 
@@ -384,18 +382,6 @@ class GpuResidencyUpdater:
         self.victim_valid = torch.zeros(
             (layers, width), dtype=torch.bool, device=device
         )
-        if envs.SGLANG_DSV41_ENABLE_NATIVE_PREFETCH.get():
-            from sglang.srt.layers.moe.exl3_native_prefetch import PREFETCH_VICTIMS
-
-            # The next slots in the same order, past the demand shortlist: a prefetch never takes a slot the next
-            # forward's demand may take, as in the replay (prefetch_sim.PrefetchReplay).
-            extra = min(PREFETCH_VICTIMS, self.victim_columns - width)
-            self.prefetch_victims = torch.zeros(
-                (layers, extra), dtype=torch.long, device=device
-            )
-            self.prefetch_victim_valid = torch.zeros(
-                (layers, extra), dtype=torch.bool, device=device
-            )
         self.victims_fresh = False
         self.gather_lanes = torch.arange(width, dtype=torch.long, device=device)
         self.gather_insertions = torch.zeros(layers, dtype=torch.long, device=device)
@@ -453,14 +439,8 @@ class GpuResidencyUpdater:
             )
         for streamer in self.streamers:
             if self.insert_direct and getattr(streamer.format, "key", None) == "exl3":
-                from sglang.srt.dsv41_config import Dsv41Config
                 from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissRowBackend
 
-                cfg = Dsv41Config.from_envs()
-                if cfg.enable_expert_prefetch:
-                    raise ValueError(
-                        "EXL3 DIRECT requires SGLANG_DSV41_ENABLE_EXPERT_PREFETCH=0"
-                    )
                 if not isinstance(streamer.row_backend, Exl3RamMissRowBackend):
                     raise ValueError(
                         "EXL3 DIRECT requires the native EXL3 RAM-miss backend"
@@ -857,10 +837,8 @@ class GpuResidencyUpdater:
         evictable = (
             (self.slot_state == _READY) & self.slot_valid & (self.slot_to_expert >= 0)
         )
-        rank = residency_rank_keys(self.insert_scores).gather(1, slot_experts)
-        rank = (
-            rank + routed.gather(1, slot_experts).to(torch.int64) * _ROUTED_RANK_OFFSET
-        )
+        expert_keys = self._expert_rank_keys(routed)
+        rank = expert_keys.gather(1, slot_experts)
         never = torch.iinfo(torch.int64).max
         keys = torch.full(
             (self.num_layers, self.victim_columns),
@@ -876,15 +854,37 @@ class GpuResidencyUpdater:
         ranked = torch.sort(keys, dim=1)
         self.victims.copy_(ranked.indices[:, :width].clamp(max=slot_dump))
         self.victim_valid.copy_(ranked.values[:, :width] < never)
-        if self.prefetch_victims is not None:
-            extra = self.prefetch_victims.shape[1]
-            self.prefetch_victims.copy_(
-                ranked.indices[:, width : width + extra].clamp(max=slot_dump)
-            )
-            self.prefetch_victim_valid.copy_(
-                ranked.values[:, width : width + extra] < never
-            )
         self.victims_fresh = True
+        if self.miss_keys is not None:
+            self.miss_keys.copy_(expert_keys)
+
+    def enable_miss_order(self) -> None:
+        """Keep ``miss_keys``, int64 ``[layers, experts]``, updated with each ranking.
+
+        Each entry is that expert's victim-ranking key.
+        A fused graph plan given a layer's row sorts its miss lanes by it, highest first,
+        so the lanes a CPU expert computes instead of inserting are the ones this ranking values least.
+        """
+        if not self.insert_direct:
+            raise ValueError("the miss order needs DIRECT residency, which ranks the keys")
+        if self.miss_keys is not None:
+            return
+        self.miss_keys = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
+        # Without re-ranking, so a shortlist already proposed stays as it is. These keys are provisional: the next
+        # ranking overwrites them with the ones it ranks by.
+        self.miss_keys.copy_(self._expert_rank_keys(self.route_counts > 0))
+
+    def _expert_rank_keys(self, routed: torch.Tensor) -> torch.Tensor:
+        """int64 ``[layers, experts]``: the victim ranking's key per expert.
+
+        Ascending order is (routed, insert score, -expert).
+        """
+        return (
+            residency_rank_keys(self.insert_scores)
+            + routed.to(torch.int64) * _ROUTED_RANK_OFFSET
+        )
 
     def gather_destinations(
         self,
@@ -978,6 +978,8 @@ class GpuResidencyUpdater:
         if self.layer_fusion:
             self._fused_commit_gather(row, streamer, destinations, live)
             return
+        if getattr(backend, "name", None) == "exl3_ram_miss" and backend.cpu_experts:
+            raise RuntimeError("CPU experts need SGLANG_DSV41_ENABLE_LAYER_FUSION: only its commit leaves CPU lanes out")
         if getattr(backend, "name", None) == "exl3_ram_miss":
             delivered = backend.delivered_count.long()
             live = live & (self.gather_lanes < delivered) & (backend.keep[0] > 0)
@@ -1051,6 +1053,8 @@ class GpuResidencyUpdater:
             backend.delivered_count if leased else None,
             backend.keep if leased else None,
             streamer._graph_miss_count,
+            # CPU experts: the lanes the CPU computed were never copied into their slots, so they stay unmapped.
+            cpu_lanes=backend.device_side.cpu_lanes if leased and backend.cpu_experts else None,
             ready=_READY,
             free_state=_FREE,
         )

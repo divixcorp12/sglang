@@ -334,7 +334,7 @@ class ExpertPinnedHostCache:
     def quarantine(self) -> None:
         """Keep every slab registered and alive until the process ends, and never unregister it.
 
-        For when a GPU reader of unknown state may still run (LEASE_PROTOCOL.md section 14). The finalizer that
+        For when a GPU reader of unknown state may still run (LEASE_PROTOCOL.md, "Shutdown"). The finalizer that
         unregisters the slabs at exit is detached, or it would undo this; ``close`` is then a no-op.
         """
         self._release_slabs.detach()
@@ -1247,6 +1247,8 @@ class ExpertStreamer:
         # disagree with this setup-time read and index a buffer that was
         # never allocated.
         self._fused_plan_enabled = envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()
+        # int64 [num_experts]: the fused plan sorts its miss lanes by it, highest first (CPU experts). None: off.
+        self._plan_miss_keys = None
         self._graph_fused_slots_scratch = (
             torch.empty(max_rows, dtype=torch.int32, device=device)
             if self._fused_plan_enabled
@@ -1299,6 +1301,11 @@ class ExpertStreamer:
         )
         # The JIT planner supports the router's native IDs.  Its generic
         # counterpart relies on index_select, which requires int64.
+        if self._plan_miss_keys is not None and not fused:
+            raise RuntimeError(
+                f"layer {self.layer_id}: the sorted miss order needs the fused route plan "
+                "(SGLANG_MOE_EXPERT_FUSED_PLAN, a BS1 gather)"
+            )
         flat = topk_ids.reshape(-1) if fused else topk_ids.reshape(-1).long()
         count = flat.numel()
         prefetch_puller = getattr(self, "prefetch_puller", None)
@@ -1346,6 +1353,7 @@ class ExpertStreamer:
                 prefetch_count=prefetch_count,
                 outcome_counters=prefetch_outcomes,
                 remap_out=self._graph_fused_remaps[flat.dtype][:count],
+                miss_keys=self._plan_miss_keys,
             )
             source_rows = self._graph_source_rows[:count]
             scratch = self._graph_scratch_slots[: source_rows.numel()]

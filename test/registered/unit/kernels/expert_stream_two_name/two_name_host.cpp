@@ -5,6 +5,7 @@
 #include "../../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/build_policy.h"
 #include "../../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/faulty_reader.h"
 #include "../../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h"
+#include "../../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_test_exports.h"
 #include "../../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/uring_reader.h"
 #include "two_name_layout.h"
 
@@ -16,5 +17,6 @@ using TwoNameHostExports =
                                TwoNameReader, expert_stream::InstrBuild>;
 
 EXPERT_STREAM_HOST_EXPORTS(TwoNameHostExports)
+EXPERT_STREAM_HOST_TEST_EXPORTS(TwoNameHostExports)
 
 } // namespace sglang

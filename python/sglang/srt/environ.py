@@ -1265,6 +1265,13 @@ class Envs:
     # Build directory for the JIT-built EXL3 extension (torch.utils.cpp_extension
     # cache); expanded with os.path.expanduser at use.
     SGLANG_EXL3_BUILD_DIR = EnvStr("~/.cache/sglang/exl3_ext")
+    # Build-time options of the EXL3 CPU MoE kernel's int8 activation quantization
+    # (quantization/exl3_cpu/moe_mul1.cpp): a second int8 pass over each row's
+    # remainder, and one scale per SGLANG_EXL3_CPU_ACT_BLOCK inputs (a multiple of
+    # 16; 0 keeps one scale per row). Either one builds the vendored kernel into a
+    # separately cached extension; with both off the build is upstream's.
+    SGLANG_EXL3_CPU_ACT_RESIDUAL = EnvBool(False)
+    SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)
 
     # ===================================================================
     # Humming quantization
@@ -1828,31 +1835,18 @@ class Envs:
     # thread's watchdog aborts after max(30 s, 3x this) (exl3_ram_miss.watchdog_wait_s),
     # so it always outlasts this wait and the eager pause bound (2x this + 1 s).
     # With the copy engine, the copy wait gets this again, timed by that watchdog from
-    # when it first sees the wait armed (LEASE_PROTOCOL.md 7.6): post to fail-stop can
+    # when it first sees the wait armed (LEASE_PROTOCOL.md, "Copy engine"): post to fail-stop can
     # then take about 2x this (+20 ms).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.
     SGLANG_TEST_DSV41_RAM_MISS_FAULT = EnvStr("")
-    # Option F on top of option C: during MoE layer L of a graph decode step, post
-    # the previous token's routes for layer L+1 that are not in RAM as advisory
-    # reads for the RAM-miss thread (demands always go first). Off by default.
-    SGLANG_DSV41_ENABLE_EXPERT_PREFETCH = EnvBool(False)
-    # Option C lease mode, two-phase (Task 6 V1): the service grants the lanes already resident inside its
-    # reservation critical section, before it reads the missing rows, so the device copies those rows while the
-    # read is still running instead of after it. Read once when the service starts; off leaves lease mode exactly as
-    # it shipped, which is the arm V1 is measured against.
-    SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE = EnvBool(False)
-    # Two-phase stage 1: how long, in microseconds of %globaltimer from the kernel's start, it waits for the service
-    # to publish the resident lanes before copying whatever has arrived. It never waits for the request to be
-    # served, so this trades a fuller first stage against a later one. Time, not polls: a poll pass reads each lane
+    # The lease chain's W1: how long, in microseconds of %globaltimer from the kernel's start, it waits for the
+    # service to publish the resident lanes before handing C1 whatever has arrived. It never waits for the request to
+    # be served, so this trades a fuller C1 against more work for S. Time, not polls: a poll pass reads each lane
     # across PCIe, so its cost depends on the lane count. At 8 passes the wait measured p50 13 us, p90 93 us.
     SGLANG_DSV41_RAM_MISS_HIT_WAIT_US = EnvInt(100)
-    # Per-piece streaming of NVMe-read expert rows on top of two-phase (piece-streaming plan):
-    # the read splits into pieces and the device streams each as it lands, instead of the two
-    # fixed W1/W2 stages. Needs SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE. Off by default.
-    SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM = EnvBool(False)
     # DSV4 MoE side stream (plan 2026-09-25-dsv41-copy-compute-overlap, 1a): the shared expert and the DIRECT
     # residency commit run on one side stream, joined before the shared-expert add, so they overlap the RAM-miss
     # copies and the routed MoE kernel instead of running in line. Read once per process. Off by default.
@@ -1867,28 +1861,22 @@ class Envs:
     # kernel. Bit-identical to the unfused casts. Read once when each module is built, and per BS1 call where the
     # sublayer input is combined. Off by default.
     SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION = EnvBool(False)
-    # Copy engine (plan 2026-09-25-dsv41-copy-compute-overlap 1b, LEASE_PROTOCOL.md 7.6): the RAM-miss service copies
-    # each decode layer's RAM-resident rows into their VRAM slots with the DMA engine (cuMemcpyAsync on its own
-    # thread) instead of the in-graph SM copy C1, and the graph waits for its completion word. Needs piece streaming.
-    # Captured decode graphs only, armed after 16 decode forwards. A kernel module first loaded while a step is in
-    # flight can still deadlock it into a fail-stop (7.6 "Module loading"). Read once at service start. Off by default.
+    # Copy engine (plan 2026-09-25-dsv41-copy-compute-overlap 1b, LEASE_PROTOCOL.md "Copy engine"): the RAM-miss
+    # service copies each decode layer's RAM-resident rows into their VRAM slots with the DMA engine (cuMemcpyAsync on
+    # its own thread) instead of the in-graph SM copy C1, and the graph waits for its completion word. Captured decode
+    # graphs only, armed after 16 decode forwards. A kernel module first loaded while a step is in flight can still
+    # deadlock it into a fail-stop. Read once at service start. Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE = EnvBool(False)
-    # SM small copies (LEASE_PROTOCOL.md 7.6): the copy engine copies only each RAM-hit row's two trellis tensors; the
-    # copy wait (CW) reads the four small ones (44.5 KB a row) from the pinned slot with SM loads while it waits, and
-    # the lease is released only once both the DMA completed and CW acknowledged its reads (SmAck). Needs the copy
-    # engine (refused without it). Read once at service start. Off by default.
+    # SM small copies: the copy engine copies only each RAM-hit row's two trellis tensors; the copy wait (CW) reads the
+    # four small ones (44.5 KB a row) from the pinned slot with SM loads, and the lease is released only once both the
+    # DMA completed and CW published Done. Needs the copy engine (refused without it). Read once at service start.
+    # Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES = EnvBool(False)
-    # Lease-chain PDL (LEASE_PROTOCOL.md 7.7): the six lease-chain kernels (post, W1, stage ack, S, CW, finalize) launch
-    # with programmatic dependent launch, each waiting on its predecessor as its first statement and letting the next
-    # one launch right after that wait, so a layer's kernels overlap their launch latency. Outputs unchanged; at most
-    # ~1 us per layer (analysis/dsv41-drive/chain-pdl/results.md). Read once at service start. Off by default.
+    # Lease-chain PDL (LEASE_PROTOCOL.md "PDL"): the lease-chain kernels post, W1, S and CW launch with programmatic
+    # dependent launch, each waiting on its predecessor as its first statement and letting the next one launch right
+    # after that wait, so a layer's kernels overlap their launch latency. Outputs unchanged; at most ~1 us per layer
+    # (analysis/dsv41-drive/chain-pdl/results.md). Read once at service start. Off by default.
     SGLANG_DSV41_ENABLE_LEASE_PDL = EnvBool(False)
-    # Native next-layer prefetch (plan 2026-09-25-dsv41-native-prefetch): in each captured decode layer T-1, after its
-    # gather, layer T's own router gate scores layer T-1's router input; the best top-6 expert of T that is neither in
-    # VRAM nor missing from the pinned tier is copied into one of T's hot slots by the copy engine, and layer T waits
-    # for that copy before its gather reads residency. Residency only, never the math. Needs the copy engine (refused
-    # without it). Read once at service start. Off by default.
-    SGLANG_DSV41_ENABLE_NATIVE_PREFETCH = EnvBool(False)
     # Prefill fills (plan 2026-09-25-dsv41-prefill-fills): eager pinned-tier misses are read by the RAM-miss service's
     # native reader straight into the pinned slabs (row images, every mirror drive at once) instead of the Python bounce
     # read and CPU copy. A layer's misses are all issued once its routing is known, on a helper thread, and each gather
@@ -1909,6 +1897,23 @@ class Envs:
     # prefill fill is still reading copies its other rows first, then waits for the fill and copies the filled rows,
     # so the GPU gathers while the NVMe reads. Same bytes in the same staging rows. Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
+    # CPU experts (plan 2026-09-29-dsv41-cpu-experts): decode computes a layer's RAM-tier experts on the CPU, in place
+    # over the pinned tier, instead of copying them over the link. Batch-1 decode only. Off by default.
+    SGLANG_DSV41_CPU_EXPERTS = EnvBool(False)
+    # Cores of the CPU expert pool, as a taskset list ("36-47,50"). At least two; empty refuses the pool.
+    SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
+    # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
+    SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
+    # CPU lanes per n resident lanes of a layer, n = 0..8, as 9 comma-separated counts ("0,1,1,2,3,3,4,5,5"). Empty
+    # computes k*(n) from the three costs below (policy.split_table).
+    SGLANG_DSV41_CPU_EXPERTS_SPLIT = EnvStr("")
+    # ms per expert on the CPU pool, per resident row over the link, and per layer handoff. Defaults are P0's native
+    # resid+b128 build at 12 node-1 threads and the measured link (plan 2026-09-29-dsv41-cpu-experts, P0 results).
+    SGLANG_DSV41_CPU_EXPERTS_CPU_MS = EnvFloat(0.52)
+    SGLANG_DSV41_CPU_EXPERTS_LINK_MS = EnvFloat(1.0)
+    SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS = EnvFloat(0.02)
+    # Batches between re-tunes of the split from the CPU's measured cost per expert; 0 keeps the startup table.
+    SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES = EnvInt(0)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
@@ -2295,6 +2300,11 @@ _PACKED_PATH_REMOVED_NOTE = (
     "reader. Build them with scripts/dsv41/build_row_images.py. Unset this env."
 )
 
+_LEASE_CHAIN_MINIMAL_NOTE = (
+    "The RAM-miss lease chain is two-phase and piece-streaming unconditionally since 2026-09-29, and its advisory and "
+    "native-prefetch modes are gone; a set value is ignored. Unset this env."
+)
+
 _LEASES_ALWAYS_ON_NOTE = (
     "The RAM-miss service's lease mode is always on since 2026-09-29 (row images need it); a set value is ignored. "
     "Unset this env."
@@ -2408,6 +2418,17 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # Lease mode is unconditional (2026-09-29): row images need it. Archived arms set it to 1 (and the dsv41_flash A/B
     # to 0), so a set value warns and is ignored.
     "SGLANG_DSV41_ENABLE_RAM_MISS_LEASES": _DeprecatedEnv(note=_LEASES_ALWAYS_ON_NOTE),
+    # The lease chain's modes, fixed or gone (2026-09-29). The recipe's archived arms set them, so a set value warns and
+    # is ignored.
+    **{
+        name: _DeprecatedEnv(note=_LEASE_CHAIN_MINIMAL_NOTE)
+        for name in (
+            "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE",
+            "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM",
+            "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH",
+            "SGLANG_DSV41_ENABLE_NATIVE_PREFETCH",
+        )
+    },
 }
 
 

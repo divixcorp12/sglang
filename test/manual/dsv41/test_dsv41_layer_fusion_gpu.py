@@ -126,12 +126,16 @@ def _scenario(
     )
 
 
-def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int):
+def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int, cpu_lanes=None):
     backend = (
         SimpleNamespace(
             name="exl3_ram_miss",
             delivered_count=torch.tensor([delivered], dtype=torch.int32, device="cuda"),
             keep=torch.tensor([keep], dtype=torch.float32, device="cuda"),
+            cpu_experts=cpu_lanes is not None,
+            device_side=SimpleNamespace(
+                cpu_lanes=torch.tensor([cpu_lanes or 0], dtype=torch.int32, device="cuda")
+            ),
         )
         if leased
         else SimpleNamespace(name="in_graph")
@@ -217,6 +221,46 @@ def test_gather_and_commit_match_the_torch_chain(
             assert torch.equal(getattr(fused, name), getattr(ref, name)), (
                 f"trial {trial}: {name}"
             )
+
+
+def test_the_commit_leaves_cpu_lanes_unmapped_and_out_of_the_truncation_count():
+    """CPU experts: a lane the CPU computed was delivered but never copied into its victim slot, so the slot must not
+    be mapped to it; the reference is the torch commit with those lanes masked out of ``live`` and out of the
+    delivered count the truncation tripwire compares."""
+    width, routes, experts, capacity = 6, 6, 256, 40
+    gen = torch.Generator().manual_seed(2929)
+    lanes = torch.arange(width, device="cuda")
+    checked = 0
+    for trial in range(80):
+        state, flat, remap, base, source_rows, miss_count, delivered, keep = _scenario(
+            gen, width, routes, experts, capacity
+        )
+        if delivered == 0:
+            continue
+        cpu = int(torch.randint(1, 1 << min(delivered, width), (1,), generator=gen))
+        cpu_bits = torch.tensor([bool(cpu >> i & 1) for i in range(width)], device="cuda")
+        ref_streamer = _streamer(
+            source_rows, miss_count, delivered - bin(cpu).count("1"), keep, True, width
+        )
+        fused_streamer = _streamer(
+            source_rows, miss_count, delivered, keep, True, width, cpu_lanes=cpu
+        )
+        ref = _updater(width, experts, capacity, False, state, ref_streamer)
+        fused = _updater(width, experts, capacity, True, state, fused_streamer)
+        expert_to_slot = state["mapping"][0, :experts].contiguous()
+        ref.gather_destinations(0, remap, expert_to_slot.index_select(0, flat.long()), base)
+        fused.fused_gather_destinations(0, remap, flat, expert_to_slot, base, torch.int64)
+        _, _, destinations, live = ref._pending_commit
+        ref._pending_commit = None
+        live = live & (lanes < delivered) & (keep > 0) & ~cpu_bits
+        ref._commit_gather(0, ref_streamer, destinations, live)
+        fused.commit_gather()
+        for name in STATE:
+            assert torch.equal(getattr(fused, name), getattr(ref, name)), (
+                f"trial {trial} cpu={cpu:#x}: {name}"
+            )
+        checked += 1
+    assert checked > 40
 
 
 def test_captured_gather_and_commit_replay_new_inputs():

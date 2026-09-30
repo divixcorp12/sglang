@@ -744,6 +744,11 @@ class TestInsertOnMiss(unittest.TestCase):
             self.assertEqual(resolved, InsertOnMissStage.SCRATCH)
         envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.clear()
 
+    def test_the_miss_order_needs_direct(self):
+        manager = _manager(self.model, gpu=True, **IOM)
+        with self.assertRaisesRegex(ValueError, "DIRECT"):
+            manager.gpu_residency.enable_miss_order()
+
     def test_an_unknown_stage_is_refused(self):
         with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE"):
             _manager(_model(), gpu=True, update_decode_forwards=1, insert_on_miss=3)
@@ -1469,6 +1474,128 @@ class TestInsertOnMissDirect(unittest.TestCase):
                     twin.graph_unique_counters.tolist(), streamer.graph_unique_counters.tolist(), context
                 )
         self.assertGreater(sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed")
+
+    def test_layer_fusion_with_the_miss_order_off_drives_direct_exactly_like_the_generic_planner(self):
+        """CPU experts off: the fused planner and SGLANG_DSV41_ENABLE_LAYER_FUSION's gather and commit kernels, with no
+        miss keys, must leave every mapping, slot and counter bit-identical to the generic path's."""
+        from sglang.srt.environ import envs
+
+        generic = _manager(self.model, gpu=True, **DIRECT)
+        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
+            fused = _manager(_model(), gpu=True, **DIRECT)
+        self.assertTrue(fused.gpu_residency.layer_fusion)
+        self.assertIsNone(fused.gpu_residency.miss_keys)
+        for streamer in fused.streamers.values():
+            self.assertIsNone(streamer._plan_miss_keys)
+        twins = [(manager, *self.capture(manager)) for manager in (generic, fused)]
+        generator = random.Random(16)
+        for step in range(30):
+            routes = _random_routes(generator)
+            for manager, graph, static, outputs in twins:
+                self.step(manager, graph, static, outputs, routes, f"step {step}")
+            context = f"step {step}"
+            assert_states_equal(self, device_state(fused), device_state(generic), context)
+            assert_slot_rows(self, fused, self.model, context)
+            self.assertEqual(fused.gpu_residency.snapshot(), generic.gpu_residency.snapshot(), context)
+        self.assertGreater(sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed")
+
+    def _miss_order_manager(self, model):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
+            manager = _manager(model, gpu=True, **DIRECT)
+        updater = manager.gpu_residency
+        updater.enable_miss_order()
+        for streamer in updater.streamers:
+            streamer._plan_miss_keys = updater.miss_keys[streamer.residency_row]
+        return manager
+
+    def test_miss_keys_are_the_victim_ranking_key_of_the_window_the_boundary_closed(self):
+        from sglang.srt.layers.moe.expert_residency import residency_rank_keys
+        from sglang.srt.layers.moe.expert_residency_gpu import _DECODE_PHASE, _ROUTED_RANK_OFFSET
+
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        updater = manager.gpu_residency
+        self.assertIsNone(updater.miss_keys)
+        updater.route_counts[:, 4].fill_(2.0)
+        updater.enable_miss_order()
+        expected = residency_rank_keys(updater.insert_scores) + (updater.route_counts > 0).long() * _ROUTED_RANK_OFFSET
+        self.assertTrue(torch.equal(updater.miss_keys, expected), "enable_miss_order fills the keys at once")
+        self.assertEqual(tuple(updater.miss_keys.shape), (LAYERS, EXPERTS))
+
+        updater.route_counts.zero_()
+        updater.route_counts[:, 3].fill_(1.0)
+        updater.route_counts[1, 7] = 5.0
+        routed = updater.route_counts > 0
+        updater.enabled.fill_(True)
+        updater.boundary_pending.fill_(True)
+        updater._apply(updater.boundary_pending & updater.enabled, updater.max_promotions, _DECODE_PHASE)
+        self.assertTrue(bool((updater.route_counts == 0).all()), "the boundary closed the window")
+        expected = residency_rank_keys(updater.insert_scores) + routed.long() * _ROUTED_RANK_OFFSET
+        self.assertTrue(torch.equal(updater.miss_keys, expected))
+        self.assertTrue(bool((updater.miss_keys[:, 3] >= _ROUTED_RANK_OFFSET).all()), "routed from the closed window")
+        self.assertGreaterEqual(int(updater.miss_keys[1, 7]), _ROUTED_RANK_OFFSET)
+        self.assertLess(int(updater.miss_keys[0, 7]), _ROUTED_RANK_OFFSET)
+
+    def test_the_miss_order_gives_the_higher_scored_miss_the_coldest_victim(self):
+        """Two misses of one layer, the lower-scored first in route order: sorted, the higher-scored takes the first
+        shortlist entry (the coldest resident) and the lower-scored the next. Without the order, route order decides."""
+        for ordered in (True, False):
+            model = _model()
+            manager = self._miss_order_manager(model) if ordered else _manager(model, gpu=True, **DIRECT)
+            updater = manager.gpu_residency
+            graph, static, outputs = self.capture(manager)
+            cache = manager.caches[0]
+            mapping = cache.expert_to_slot.tolist()
+            residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
+            outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+            self.assertEqual(len(residents), cache.capacity, "a free slot would take a miss first")
+            self.assertGreaterEqual(len(outsiders), 2)
+            coldest, next_coldest = residents[0], residents[1]
+            low, high = outsiders[0], outsiders[1]
+            others = [[[0, 1]] for _ in range(LAYERS - 1)]
+            self.step(manager, graph, static, outputs, [[[residents[2], residents[3]]]] + others, "warm")
+            scores = torch.full((EXPERTS,), 100.0)
+            scores[coldest], scores[next_coldest] = 1.0, 50.0
+            scores[low], scores[high] = 20.0, 80.0
+            updater.insert_scores[0].copy_(scores)
+            torch.cuda.synchronize()
+            self.step(manager, graph, static, outputs, [[[low, high]]] + others, f"ordered={ordered}")
+            first, second = (high, low) if ordered else (low, high)
+            self.assertEqual(int(cache.expert_to_slot[first]), mapping[coldest], f"ordered={ordered}")
+            self.assertEqual(int(cache.expert_to_slot[second]), mapping[next_coldest], f"ordered={ordered}")
+            assert_slot_rows(self, manager, model, f"ordered={ordered}")
+
+    def test_the_miss_order_keeps_direct_exact(self):
+        """Sorted miss lanes still land every miss in a slot the forward does not read, and every slot holds its
+        expert's rows, over random routing."""
+        model = _model()
+        manager = self._miss_order_manager(model)
+        graph, static, outputs = self.capture(manager)
+        generator = random.Random(17)
+        for step in range(30):
+            routes = _random_routes(generator)
+            before = [cache.expert_to_slot.tolist() for _, cache in sorted(manager.caches.items())]
+            self.step(manager, graph, static, outputs, routes, f"step {step}")
+            for layer, mapping in enumerate(before):
+                cache = manager.caches[sorted(manager.caches)[layer]]
+                flat = routes[layer][0]
+                read = {mapping[expert] for expert in flat if mapping[expert] >= 0}
+                landed = [int(cache.expert_to_slot[expert]) for expert in flat if mapping[expert] < 0]
+                self.assertNotIn(-1, landed, f"step {step} layer {layer}")
+                self.assertFalse(read & set(landed), f"step {step} layer {layer}")
+            assert_slot_rows(self, manager, model, f"step {step}")
+        self.assertGreater(sum(manager.gpu_residency.snapshot()["insertions"]), 0)
+        self.assertEqual(sum(manager.gpu_residency.snapshot()["insertion_truncated"]), 0)
+
+    def test_the_miss_order_refuses_the_generic_planner(self):
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        updater = manager.gpu_residency
+        updater.enable_miss_order()
+        streamer = updater.streamers[0]
+        streamer._plan_miss_keys = updater.miss_keys[0]
+        with self.assertRaisesRegex(RuntimeError, "fused route plan"):
+            streamer.gather(torch.tensor([[0, 1]], dtype=torch.int32, device="cuda"))
 
     def test_a_speculative_verify_forward_keeps_direct_exact(self):
         """NEXTN replays a TARGET_VERIFY graph whose gather serves several tokens, with repeated

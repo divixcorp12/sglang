@@ -68,17 +68,23 @@ def _check(cfg, budgets) -> None:
             "updater writes missed rows into hot slots during the gather, or, without it, promotions run "
             "synchronously through the pinned host tier; unset it"
         )
-    if envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.get() and not budgets.graph_gather:
-        raise ValueError(
-            "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH posts advisories from the in-graph MoE; "
-            "it needs SGLANG_MOE_EXPERT_GRAPH_GATHER=1 with breakable decode graphs"
-        )
     graph = cfg.cuda_graph_config
     if not isinstance(graph, CudaGraphConfig):
         # run_resolution_pipeline's first offload pass runs before parse_cuda_graph_config,
         # while this is still the raw CLI value: the decode backend is not known yet, and
         # the pass after parsing runs every check below.
         return
+    cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
+    if cpu_experts and (
+        getattr(cfg, "speculative_algorithm", None) is not None
+        or graph.decode.backend != Backend.BREAKABLE
+    ):
+        # Before the speculative and backend rules.
+        # Each would point a CPU-experts launch at the other's decode backend.
+        raise ValueError(
+            "SGLANG_DSV41_CPU_EXPERTS computes experts inside the captured decode graph's copy wait; "
+            "pass --cuda-graph-backend-decode breakable, without speculative decoding"
+        )
     if (
         getattr(cfg, "speculative_algorithm", None) is not None
         and graph.decode.backend != Backend.DISABLED
@@ -113,6 +119,10 @@ def _check(cfg, budgets) -> None:
         )
     if budgets.graph_gather and not budgets.hot_budget_mb:
         raise ValueError("EXL3 graph gathers need SGLANG_MOE_HOT_GPU_MB")
+    # Before the shared eager checks.
+    # Their residency-update rule would tell a CPU-experts launch without DIRECT to turn the update off;
+    # CPU experts need it on, at stage 2.
+    _check_cpu_experts(budgets)
     # The shared eager check refuses graph gather; decode graphs may use it.
     _EAGER.check(_EagerGraphView(cfg), dataclasses.replace(budgets, graph_gather=False))
     # DSV4's alt-stream overlap still gives wrong output when captured in the breakable
@@ -130,6 +140,31 @@ def _check(cfg, budgets) -> None:
                 "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1; unset it or set it to 0"
             )
         overlap.set(False)
+
+
+def _check_cpu_experts(budgets) -> None:
+    """SGLANG_DSV41_CPU_EXPERTS (plan 2026-09-29-dsv41-cpu-experts, Step B): the RAM-miss service's grant sends
+    resident lanes to the CPU, the copy engine's copy wait completes them, and layer fusion's route tables and DIRECT
+    commit leave them out of the fused MoE and the residency."""
+    if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        return
+    needs = [
+        ("SGLANG_MOE_EXPERT_GRAPH_GATHER=1", budgets.graph_gather),
+        ("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get()),
+        ("SGLANG_DSV41_ENABLE_LAYER_FUSION=1", envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()),
+        # DIRECT residency ranks the keys the fused plan sorts the miss lanes by, so the CPU takes the coldest ones.
+        ("SGLANG_MOE_GPU_RESIDENCY_UPDATE=1", envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()),
+        ("SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2", envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2),
+        ("SGLANG_MOE_EXPERT_FUSED_PLAN=1", envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()),
+        ("SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list)", bool(envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get())),
+    ]
+    missing = [name for name, ok in needs if not ok]
+    if missing:
+        raise ValueError("SGLANG_DSV41_CPU_EXPERTS needs " + ", ".join(missing))
+    if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
+        # The pull join rewrites a route's slot after planning; a CPU lane's route would then match no plan slot, and
+        # the fused MoE would compute it on top of the CPU's partial.
+        raise ValueError("SGLANG_DSV41_CPU_EXPERTS cannot run with SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE; set it to off")
 
 
 exl3_expert_stream_requirements = ExpertStreamRequirements(

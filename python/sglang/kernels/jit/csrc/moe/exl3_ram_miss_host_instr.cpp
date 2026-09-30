@@ -5,6 +5,7 @@
 #include "expert_stream/host/build_policy.h"
 #include "expert_stream/host/faulty_reader.h"
 #include "expert_stream/host/ffi_exports.h"
+#include "expert_stream/host/ffi_test_exports.h"
 #include "expert_stream/host/uring_reader.h"
 
 namespace sglang {
@@ -18,5 +19,6 @@ static_assert(
     "the instrumented build keeps every fault");
 
 EXPERT_STREAM_HOST_EXPORTS(Exl3HostExports)
+EXPERT_STREAM_HOST_TEST_EXPORTS(Exl3HostExports)
 
 }  // namespace sglang

@@ -44,7 +44,7 @@ struct SqeRecord {
 //                    every row of its previous batch has PACKED (and so every extent has completed and
 //                    retired): I/O and packing are the two references a bank holds, and both must be
 //                    gone before the kernel may write into it again.
-//   * reading rows   at most `max_reading_rows` rows with I/O outstanding (an advisory reads one).
+//   * reading rows   at most `max_reading_rows` rows with I/O outstanding.
 // A row is packed as soon as ITS extents have completed, while other rows are still in flight, and
 // every completed row is packed before the call returns. read() itself publishes no row: the caller
 // keeps the slots LOADING until read() returns 1, so no row is visible before the whole request is.
@@ -344,7 +344,7 @@ class ReaderCore {
   // Returns 1 when every row landed, 0 on an I/O error or short file, -1 when abandoned before every
   // batch was admitted. `packed`, when not null, is set to 1 for every row that was packed (with -1 those
   // rows are complete and the caller may keep them; with 0 the caller releases everything).
-  // `max_reading_rows` caps the rows with I/O outstanding (an advisory reads one row at a time).
+  // `max_reading_rows` caps the rows with I/O outstanding.
   // Every return leaves the ring empty: nothing in flight, nothing prepared (I1).
   //
   // `trace`, when not null, receives this read's stage stamps and per-drive bytes (StageRecord).
@@ -403,11 +403,6 @@ class ReaderCore {
       c.progress_closure = const_cast<void*>(static_cast<const void*>(std::addressof(progress)));
     }
     c.publish = piece_stream_ ? publish : nullptr;
-    if constexpr (Build::kFaults) {
-      if (c.publish != nullptr && c.publish->probe != nullptr && faults_.fault.hold_until_probe_ms > 0) {
-        c.hold_until = now_ns() + faults_.fault.hold_until_probe_ms * 1000000;
-      }
-    }
     if (packed) packed->assign(c.total, 0);
     on_trace([&](StageRecord& t) {
       t.rows_asked = static_cast<int64_t>(c.total);
@@ -456,8 +451,7 @@ class ReaderCore {
       // withheld completions of the slow-drive fault arrive only once every other row has packed.
       if (c.pending > 0 || (!ready && c.packing == 0 && !held_empty())) reap(ready || c.packing > 0);
       if (c.failed) break;
-      // (The hold_until_probe_ms fault keeps direct-mode pieces vetted but unpublished with nothing to wait on.)
-      if (!derived().advance() && (c.packing > 0 || c.hold_until != 0)) _mm_pause();
+      if (!derived().advance() && c.packing > 0) _mm_pause();
     }
     // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was
     // neither admitted nor abandoned: the loop's own bookkeeping is wrong. Fail instead of returning a
@@ -647,7 +641,6 @@ class ReaderCore {
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
     int64_t events = 0;      // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
     size_t published = 0;    // piece streaming: pieces published so far (the last_publish_delay_ns fault)
-    int64_t hold_until = 0;  // piece streaming: when the hold_until_probe_ms fault gives up (0: no hold)
   };
 
   // Runs `f` on this read's stage record, if it has one. ProdBuild compiles every call to nothing.
@@ -949,8 +942,8 @@ class ReaderCore {
         return;
       }
       // The latch clears only once this turn really admits: returning below for the reading-rows cap
-      // leaves the same busy bank to re-arm the edge next turn and count the SAME wait again. With the
-      // advisory configuration (step 1, max_reading 1) that interleaving is the normal case, so one
+      // leaves the same busy bank to re-arm the edge next turn and count the SAME wait again. With step 1
+      // and max_reading 1 that interleaving is the normal case, so one
       // wait spanning three turns would be reported as three stalls.
       if (c.reading_rows != 0 && c.reading_rows + count > c.max_reading) return;
       c.stalled = false;
@@ -1572,20 +1565,6 @@ class ReaderCore {
       if (r.ordinal < static_cast<size_t>(kTraceRows)) t.piece_publish[r.ordinal][j] = seq;
     });
     r.published |= bit;
-  }
-
-  // The hold_until_probe_ms fault: true while the request's StreamProbe does not yet read tagged(1, generation) and
-  // the hold has not timed out. A failing read is never held: quiesce() must collect every piece.
-  // ProdBuild: never (the fault does not exist there).
-  bool holding_for_probe() const {
-    if constexpr (Build::kFaults) {
-      const Call& c = c_;
-      if (c.hold_until == 0 || c.failed || now_ns() >= c.hold_until) return false;
-      const uint64_t want = (uint64_t{1} << 56) | (c.publish->generation & ((uint64_t{1} << 56) - 1));
-      return __atomic_load_n(c.publish->probe, __ATOMIC_ACQUIRE) != want;
-    } else {
-      return false;
-    }
   }
 
   // The row is packed whole: account it, flag it and free its slot. Packing is the last reference the bank

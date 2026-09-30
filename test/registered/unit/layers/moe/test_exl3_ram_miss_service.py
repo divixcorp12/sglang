@@ -69,20 +69,16 @@ def _holds(host, row, expert):
     return expert in host.slot_to_expert(row)
 
 
-def _demand(service, row, experts, *, status=1):
-    """One armed demand for ``experts`` of ``row`` as the device posts it in lease mode (its lane request with it),
-    waited for with ``status``; served, its leases are acknowledged and retired, so its rows are evictable again."""
+def _demand(service, row, experts):
+    """One armed demand for ``experts`` of ``row`` as the device posts it (its lane request with it), served, then
+    its Done, which retires its leases, so its rows are evictable again."""
     sim = LeaseSim(service.host, service.page, {})
     req = sim.post(row, experts)
-    waited = sim.wait(req, timeout_s=10.0)
-    assert waited.status == status, waited
-    if status != 1:
-        return
-    sim.ack(req, waited)
-    sim.deliver()
+    assert sim.wait(req, timeout_s=10.0).served
+    sim.done(req)
     deadline = time.perf_counter() + 10.0
     while any(info[2] for info in service.host.slot_info(row)):
-        assert time.perf_counter() < deadline, "the acknowledged leases were never retired"
+        assert time.perf_counter() < deadline, "the leases were never retired"
         time.sleep(0.002)
 
 
@@ -176,19 +172,6 @@ def test_nested_host_use_pauses_and_refreshes_only_at_the_outermost_level(tiers,
     assert len(refreshes) == 2
 
 
-def test_the_fail_stop_check_raises_once_fatal_is_set(tiers):
-    service, streamers, caches = tiers
-    service.ensure_started()
-    service.fail_stop_check()  # nothing raised yet
-    service.host.inject(fail_reads=True)
-    row = service.row_of(0)
-    _demand(service, row, [1], status=2)
-    with pytest.raises(RuntimeError, match="exl3 RAM miss"):
-        service.fail_stop_check()
-    # fatal stays raised: stop now, before the watchdog's fatal-held rule can abort pytest.
-    service.shutdown()
-
-
 def test_attach_registers_once_and_pushes_residency(tiers):
     service, streamers, caches = tiers
     checks, listeners = [], []
@@ -271,13 +254,6 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
     with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"):
         # Leases are unconditional (the RAM-miss service always runs in lease mode), so DIRECT needs no lease switch.
         updater.check_miss_plans()
-        # Two-phase copies hit lanes into the same DIRECT destinations before the NVMe rows land,
-        # and a failed request fail-stops the process, so it composes with DIRECT.
-        with envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True):
-            updater.check_miss_plans()
-        with envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH.override(True):
-            with pytest.raises(ValueError, match="ENABLE_EXPERT_PREFETCH=0"):
-                updater.check_miss_plans()
         streamer.row_backend = object()
         with pytest.raises(ValueError, match="native EXL3 RAM-miss backend"):
             updater.check_miss_plans()
@@ -343,32 +319,6 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
     assert started[0]["fatal_wait_s"] > 40.0 * 2 + 1.0
 
 
-@pytest.mark.parametrize("prefetch, advise", [(True, 1), (None, 0)], ids=["env_on", "env_unset"])
-def test_attach_builds_the_device_side_with_advise_from_the_prefetch_env(tiers, prefetch, advise):
-    """The production hop: SGLANG_DSV41_ENABLE_EXPERT_PREFETCH -> prefetch_enabled() -> attach ->
-    ExpertStreamDevice(advise=...) -> the row backend's posts. Nothing else sets ``advise``."""
-    service, streamers, caches = tiers
-    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
-    for streamer in streamers.values():
-        # The graph-gather state the pinned-tier format sets up on a real streamer.
-        streamer._graph_pinned_tier = True
-        streamer.hot_cache = SimpleNamespace(device="cpu")
-        streamer.graph_gather_rows = 6
-        streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
-    # The env is read while attaching, so it is overridden around the attach only.
-    var = envs.SGLANG_DSV41_ENABLE_EXPERT_PREFETCH
-    with var.override(bool(prefetch)):  # restores whatever was there on exit
-        if prefetch is None:
-            var.clear()  # really unset, not set to False
-        for streamer in streamers.values():
-            streamer.format.attach_hot_cache_manager(manager, streamer)
-    assert service.device_side.advise == advise
-    # One bs-1 decode step routes graph_gather_rows rows in every in-graph layer.
-    assert service.routed_rows_per_step == 6 * len(streamers)
-    for layer_id, streamer in streamers.items():
-        assert streamer.row_backend.device_side is service.device_side  # one device side, shared by every layer
-
-
 def _attach_all(service, streamers, capacity=None):
     manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
     for streamer in streamers.values():
@@ -377,6 +327,15 @@ def _attach_all(service, streamers, capacity=None):
         streamer.graph_gather_rows = 6
         streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
         streamer.format.attach_hot_cache_manager(manager, streamer)
+
+
+@pytest.fixture(autouse=True)
+def _stub_piece_maps(monkeypatch):
+    """_attach_all's copy tables are stubs, so their piece maps are too; _attach_with_copy_tables builds real ones."""
+    real = module.stream_segment_map
+    monkeypatch.setattr(
+        module, "stream_segment_map", lambda segments, tables, row: None if segments is None else real(segments, tables, row)
+    )
 
 
 @pytest.mark.parametrize("traced", [False, True], ids=["trace_off", "trace_on"])
@@ -404,7 +363,11 @@ def test_graph_routes_are_logged_only_when_the_stage_trace_is_on(tiers, monkeypa
     from sglang.srt.layers.moe import expert_row_plan
 
     monkeypatch.setattr(expert_row_plan, "copy_expert_row_segments_gpu", lambda *args: None)
-    service.device_side = SimpleNamespace(lease_block=None, post=lambda *a: None, wait=lambda *a: None)
+    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *args: None)
+    service.device_side = SimpleNamespace(
+        post=lambda *a, **kw: None, hit_wait=lambda *a: None, stream=lambda *a: None, copy_wait=lambda *a: None,
+        host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False,
+    )
     for backend in backends:
         backend.device_side = service.device_side
     for row, backend in enumerate(backends):  # one forward, as _apply_graph then the gather leave it
@@ -472,9 +435,9 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
 
     monkeypatch.setattr(exl3_fused_moe, "exl3_fused_moe_for",
                         lambda layer, streamer: SimpleNamespace(
-                            layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit: x.float()))
+                            layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit, cpu=None: x.float()))
     backend = module.Exl3RamMissRowBackend(
-        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, -1, 6, route_log=route_log
+        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, 6, {0: None}, route_log=route_log
     )
     remap = torch.zeros(6, dtype=torch.int32)
     streamer = SimpleNamespace(row_backend=backend, gather=lambda topk_ids: (remap, None))
@@ -534,60 +497,13 @@ def test_the_lease_pdl_flag_reaches_the_device_side_and_is_read_once(tiers, pdl)
     assert service.device_side.lease_pdl is pdl
 
 
-def test_the_service_always_leases_configuring_the_host_before_its_thread_and_the_device_with_the_hosts_block(
-    tiers, monkeypatch
-):
-    """Lease mode is unconditional (row images need it): the host is put in lease mode before its thread starts, and
-    the device always carries the host's lease block, so the device's arming and the service's leasing cannot
-    disagree."""
+def test_the_device_side_carries_the_hosts_lease_block_and_piece_table(tiers):
+    """The device reads the block the host writes, not a second one, and cuts rows by the host's own piece table."""
     service, streamers, caches = tiers
-    order = []
-    enable, start = module.ExpertStreamHost.enable_lease_mode, module.ExpertStreamHost.start_thread
-    monkeypatch.setattr(module.ExpertStreamHost, "enable_lease_mode", lambda self: (order.append("lease"), enable(self))[1])
-    monkeypatch.setattr(module.ExpertStreamHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
     _attach_all(service, streamers)
-    assert order == ["lease", "thread"] and service.lease_mode is True
     device = service.device_side
-    assert device.lease_block is service.host.lease_block  # the block the host writes, not a second one
-    assert device.go_count is not None and device.go_count.dtype == torch.int32 and device.go_count.shape == (1,)
-
-
-def test_piece_stream_refuses_without_two_phase(tiers):
-    """Config/env refusal (piece-streaming plan Sec 4.4): piece streaming is a mode of two-phase, its one remaining
-    need. (Converted from test_piece_stream_refuses_unless_two_phase_lease_and_pack_workers_all_hold: leases are
-    unconditional and the row-image reader publishes each piece itself, so neither of its other cases exists.)"""
-    service, streamers, caches = tiers
-    with (
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(False),
-    ):
-        with pytest.raises(RuntimeError, match="PIECE_STREAM needs"):
-            service.ensure_started()
-
-
-def test_piece_stream_is_accepted_by_the_config_refusal_with_two_phase(tiers):
-    service, streamers, caches = tiers
-    with (
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
-    ):
-        service.ensure_started()
-    assert service.piece_stream is True
-
-
-@pytest.mark.parametrize("piece_stream", [False, True])
-def test_piece_stream_reaches_the_host_reader_before_its_thread_and_only_when_on(tiers, monkeypatch, piece_stream):
-    service, streamers, caches = tiers
-    order = []
-    enable, start = module.ExpertStreamHost.enable_piece_stream, module.ExpertStreamHost.start_thread
-    monkeypatch.setattr(module.ExpertStreamHost, "enable_piece_stream", lambda self: (order.append("piece"), enable(self))[1])
-    monkeypatch.setattr(module.ExpertStreamHost, "start_thread", lambda self, **kw: (order.append("thread"), start(self, **kw))[1])
-    with (
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(piece_stream),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
-    ):
-        service.ensure_started()
-    assert order == (["piece", "thread"] if piece_stream else ["thread"])
+    assert device.lease_block is service.host.lease_block
+    assert torch.equal(device.piece_runs, service.host.piece_runs())
 
 
 def _attach_with_copy_tables(service, streamers, *, drop_name=None):
@@ -616,39 +532,25 @@ def _attach_with_copy_tables(service, streamers, *, drop_name=None):
     return tables
 
 
-def _piece_stream_env():
-    return (
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True),
-    )
-
-
-def test_piece_stream_builds_the_stream_chain_on_the_device_side_and_every_backend(tiers):
-    """Flag on, the device side carries the host's piece table and the stream kernel's words, and every layer's
-    backend streams, with a segment map per copy table naming each row segment's entry. (The chain's kernels and
-    graph shape are the GPU tests' business: test/manual/dsv41/test_exl3_piece_stream_cuda.py.)"""
+def test_every_backend_streams_with_a_segment_map_per_copy_table(tiers):
+    """The device side carries the host's piece table, and every layer's backend streams, with a segment map per copy
+    table naming each row segment's entry. (The chain's kernels and
+    graph shape are the GPU tests' business: test/manual/dsv41/test_exl3_lease_kernels_cuda.py.)"""
     service, streamers, caches = tiers
-    a, b = _piece_stream_env()
-    with a, b:
-        tables = _attach_with_copy_tables(service, streamers)
+    tables = _attach_with_copy_tables(service, streamers)
     dev = service.device_side
-    assert dev.piece_stream is True
     assert torch.equal(dev.piece_runs, service.host.piece_runs())
     assert tuple(dev.piece_runs.shape) == (LAYERS, EXPERTS, 8, int(tables.segments.shape[0]), 2)
     assert dev.piece_runs.abs().sum() > 0, "the piece table must cut the rows, not be all empty"
-    for words in (dev.stream_count, dev.stream_abort, dev.stream_fault):
-        assert int(words.abs().sum()) == 0
     names = [int(n) for n in tables.segments[:, 0].tolist()]
     for streamer in streamers.values():
         backend = streamer.row_backend
-        assert backend.piece_stream is True
         assert backend.stream_maps[0].tolist() == names + [0] * 6, "every entry is a named slab: none copied whole"
 
 
-def test_piece_stream_refuses_a_copy_table_missing_a_streamed_name(tiers):
+def test_a_copy_table_missing_a_streamed_name_is_refused(tiers):
     service, streamers, caches = tiers
-    a, b = _piece_stream_env()
-    with a, b, pytest.raises(ValueError, match="no entry for streamed names"):
+    with pytest.raises(ValueError, match="no entry for streamed names"):
         _attach_with_copy_tables(service, streamers, drop_name=2)
 
 
@@ -691,63 +593,6 @@ def test_ensure_started_refuses_a_host_module_whose_layout_disagrees_with_exl3_s
     monkeypatch.setattr(module, "host_layout", lambda: (reordered, 0))
     with pytest.raises(RuntimeError, match="the host module's layout"):
         service.ensure_started()
-
-
-def test_attach_refuses_a_lease_block_of_another_abi_version(tiers, monkeypatch):
-    """The device kernels read area D at the offsets of lease ABI 2 (StreamProbe appended); a block the host wrote
-    under any other version is refused at attach, not read at the wrong offsets."""
-    from sglang.kernels.ops.moe import expert_lease_block as lease
-
-    service, streamers, caches = tiers
-    header = module.ExpertStreamHost.lease_header
-    monkeypatch.setattr(
-        module.ExpertStreamHost, "lease_header", lambda self: {**header(self), "abi_version": lease.ABI_VERSION + 1}
-    )
-    with pytest.raises(RuntimeError, match="ABI version"):
-        _attach_with_copy_tables(service, streamers)
-
-
-def test_without_piece_stream_the_backends_do_not_stream(tiers):
-    service, streamers, caches = tiers
-    with envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.override(True):
-        _attach_with_copy_tables(service, streamers)
-    assert service.device_side.piece_stream is False and service.device_side.piece_runs is None
-    assert all(s.row_backend.piece_stream is False and s.row_backend.stream_maps is None for s in streamers.values())
-
-
-def _backend_calls(monkeypatch, *, lease):
-    calls = []
-    device_side = SimpleNamespace(
-        lease_block=object() if lease else None,
-        go_count="GO_COUNT",
-        post=lambda *a: calls.append("post"),
-        wait=lambda *a: calls.append("wait"),
-        ack=lambda keep: calls.append(("ack", keep)),
-    )
-    from sglang.srt.layers.moe import expert_row_plan
-
-    record = lambda segments, host_rows, slots, count: calls.append(("copy", count))  # noqa: E731
-    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", record)  # the lease post
-    monkeypatch.setattr(expert_row_plan, "copy_expert_row_segments_gpu", record)  # the inherited post
-    backend = module.Exl3RamMissRowBackend({0: "SEG"}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, -1, 6)
-    plan = SimpleNamespace(
-        expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]),
-        slots=torch.arange(6, dtype=torch.int32),
-        count=torch.tensor([3], dtype=torch.int32),
-    )
-    backend.post(0, plan)
-    return calls, backend, plan
-
-
-def test_without_leases_the_row_backend_copies_plan_count_and_acknowledges_nothing(monkeypatch):
-    calls, backend, plan = _backend_calls(monkeypatch, lease=False)
-    assert calls == ["post", "wait", ("copy", plan.count)]
-
-
-def test_with_leases_the_copy_takes_go_count_and_the_acknowledgement_follows_it(monkeypatch):
-    calls, backend, plan = _backend_calls(monkeypatch, lease=True)
-    assert calls == ["post", "wait", ("copy", "GO_COUNT"), ("ack", backend.keep)]
-    assert calls[2][1] is not plan.count
 
 
 def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monkeypatch):
@@ -800,7 +645,7 @@ def test_shutdown_freezes_native_reader_before_final_trace(monkeypatch):
         service, "_trace_step", lambda *, final=False: order.append(("trace", host.layer_rows(), final))
     )
     service.shutdown()
-    assert order == ["close_admission", "gpu_barrier", "pause", ("trace", [2], True), "stop"]
+    assert order == ["gpu_barrier", "close_admission", "pause", ("trace", [2], True), "stop"]
 
 
 def test_shutdown_quarantines_after_native_stop_failure(monkeypatch):
@@ -886,7 +731,7 @@ def test_the_trace_step_reads_the_manager_registers_before_they_are_lost(monkeyp
     service.routed_rows_per_step = 12  # 6 routed rows in each of the two layers
     counters = {"rows_read": 0}
     service.host = SimpleNamespace(
-        fatal_seq=lambda: 0, layer_rows=lambda: demand_rows[0], counters=lambda: dict(counters)
+        layer_rows=lambda: demand_rows[0], counters=lambda: dict(counters)
     )
 
     manager._accumulate_registers("decode", torch.zeros((2, 4)), [False, False])
@@ -934,7 +779,7 @@ def test_graph_trace_defers_cuda_readback_until_a_later_check(monkeypatch):
     service.routed_rows_per_step = 12
     demand_rows = [[0, 0]]
     service.host = SimpleNamespace(
-        fatal_seq=lambda: 0, layer_rows=lambda: demand_rows[0], counters=lambda: {"rows_read": 3}
+        layer_rows=lambda: demand_rows[0], counters=lambda: {"rows_read": 3}
     )
 
     service.fail_stop_check()  # enqueue baseline; no device readback on this call
@@ -1027,24 +872,35 @@ def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
     assert backend.routes.tolist() == [5, 2, 9, 0, -1, -1]
 
 
-def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes():
+def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes(monkeypatch):
     # The post kernel reads planned for min(count, 8) lanes and count lives on the
     # device, so a 6-lane plan (graph_gather_rows = top-6) must not be passed as is.
     from sglang.kernels.ops.moe.expert_stream_transport import MAX_IDS
 
     calls = []
     device_side = SimpleNamespace(
-        post=lambda row, planned, count, routes, next_row, hot_slots, hot_capacity: calls.append(("post", planned.clone())),
-        wait=lambda row, planned, count, host_rows, keep, ram_miss: calls.append(("wait", planned.clone())),
+        post=lambda row, planned, *a, **kw: calls.append(("post", planned.clone())),
+        hit_wait=lambda row, planned, *a: calls.append(("hit_wait", planned.clone())),
+        stream=lambda row, planned, *a: calls.append(("stream", planned.clone())),
+        copy_wait=lambda count, sm: calls.append(("copy_wait", None)),
+        host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False,
     )
-    backend = module.Exl3RamMissRowBackend({0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, -1, 6)
+    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *a: calls.append(("c1", None)))
+    backend = module.Exl3RamMissRowBackend(
+        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, 6, {0: None}
+    )
     assert backend.planned.numel() >= MAX_IDS
-    plan = SimpleNamespace(expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]), count=torch.tensor([3], dtype=torch.int32))
-    backend.translate(0, plan)
+    plan = SimpleNamespace(
+        expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]), count=torch.tensor([3], dtype=torch.int32),
+        slots=torch.arange(6, dtype=torch.int32),
+    )
+    backend.post(0, plan)
+    assert [name for name, _ in calls] == ["post", "hit_wait", "c1", "stream", "copy_wait"]
     for name, planned in calls:
-        assert planned.numel() >= MAX_IDS, name
-        assert planned.tolist() == [4, 2, 5, 0, 0, 0] + [-1] * (planned.numel() - 6), name
-    assert [name for name, _ in calls] == ["post", "wait"]
+        if planned is not None:
+            assert planned.numel() >= MAX_IDS, name
+            assert planned.tolist() == [4, 2, 5, 0, 0, 0] + [-1] * (planned.numel() - 6), name
+    assert backend.delivered_count is plan.count
 
 
 def test_a_test_fault_spec_parses():
@@ -1089,7 +945,7 @@ def test_stage_records_are_drained_into_the_trace_only_when_traced(monkeypatch):
 
 
 def _copy_engine_service(monkeypatch):
-    """A service with only what the copy engine's arming and guards read (LEASE_PROTOCOL.md 7.6)."""
+    """A service with only what the copy engine's arming and guards read (LEASE_PROTOCOL.md, "Copy engine")."""
     service = module.Exl3RamMissService()
     service.copy_engine = True
     service.device_side = SimpleNamespace(copy_engine_captured=True)
@@ -1162,8 +1018,7 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     # monkeypatch, not envs.override: override restores nothing when an exception leaves its block, so a mutant that
     # reaches enable_copy_engine here would leak the copy-engine config into every later test.
-    for name in ("COPY_ENGINE", "PIECE_STREAM", "TWO_PHASE"):
-        monkeypatch.setenv(f"SGLANG_DSV41_ENABLE_RAM_MISS_{name}", "1")
+    monkeypatch.setenv("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE", "1")
     if value == "EAGER":
         with pytest.raises(_CopyEngineReached):
             service.ensure_started()

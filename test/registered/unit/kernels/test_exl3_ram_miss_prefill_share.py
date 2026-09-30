@@ -10,8 +10,9 @@ import faulthandler
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_lease_sim import LeaseSim, post_record
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -37,16 +38,20 @@ def tier(tmp_path):
     host.stop()
 
 
-def _serve(page, host, need, protect):
-    seq = sim_post(page, 0, need=need, protect=protect)
+def _serve(page, host, lanes, protect):
+    """A decode request for ``lanes``, served and retired (Done, then the pump that retires it)."""
+    sim = LeaseSim(host, page, None)
+    req = sim.post(0, lanes, protect=protect)
     assert host.pump() == 1
-    assert sim_wait(page, seq, timeout_s=1.0) == 1
+    assert sim.wait(req, timeout_s=1.0).served
+    sim.done(req)
+    host.pump()
 
 
 def _decode_rows(page, host):
     """Decode reads 0, 1, 2, 3 in that order: the tier is full and 0 is the LRU row."""
     for expert in range(4):
-        _serve(page, host, need=[expert], protect=[expert])
+        _serve(page, host, [expert], protect=[expert])
 
 
 def _prefill(host, chunks):
@@ -90,7 +95,7 @@ def test_a_decode_hit_ends_a_rows_prefill_ownership(tier):
     _, evicted = host.assign(0, 4, protected=[4])
     assert evicted == 0
     host.set_prefill_share(0)
-    _serve(page, host, need=[], protect=[4])  # decode routes 4: it is decode's row now
+    _serve(page, host, [4], protect=[4])  # decode routes 4: it is decode's row now
     host.set_prefill_share(1)
     _, evicted = host.assign(0, 5, protected=[5])
     assert evicted == 1 and host.contains(0, 4)
@@ -108,7 +113,7 @@ def test_an_unarmed_touch_ends_ownership_but_a_prefill_touch_does_not(tier):
     _, evicted = host.assign(0, 5, protected=[5])
     assert evicted == 4
     host.set_prefill_share(0)
-    sim_post(page, 0, need=[], protect=[5], armed=False)
+    post_record(page, 0, [5], armed=False)
     assert host.pump() == 1
     host.set_prefill_share(1)
     _, evicted = host.assign(0, 6, protected=[6])
@@ -182,8 +187,8 @@ def test_a_decode_eviction_of_an_owned_row_ends_its_ownership(tier):
     host.set_prefill_share(2)
     _prefill(host, [[4, 5]])  # evicts 0 and 1; 4 and 5 owned
     host.set_prefill_share(0)
-    _serve(page, host, need=[2, 3], protect=[2, 3])  # 4 and 5 are now the LRU rows
-    _serve(page, host, need=[6, 7], protect=[6, 7])  # evicts the owned 4 and 5
+    _serve(page, host, [2, 3], protect=[2, 3])  # 4 and 5 are now the LRU rows
+    _serve(page, host, [6, 7], protect=[6, 7])  # evicts the owned 4 and 5
     assert _resident(host) == [2, 3, 6, 7]
     host.set_prefill_share(2)
     _, evicted = host.assign(0, 8, protected=[8])

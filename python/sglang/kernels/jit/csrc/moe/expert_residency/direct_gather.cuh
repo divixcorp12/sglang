@@ -88,6 +88,10 @@ __global__ __launch_bounds__(kDirectGatherWarp, 1) void direct_gather_destinatio
 // running it serially is what keeps every final value, dump columns included, identical.
 //
 // delivered is null for a backend without leased delivery; the truncation tripwire then reads miss_count instead.
+//
+// cpu_lanes (CPU experts, plan 2026-09-29-dsv41-cpu-experts; null when off): lanes the CPU expert thread computed from
+// the pinned tier. Nothing copied their destination slots, which still hold their old experts, so they are not live:
+// the mapping keeps the old expert and the expert stays in the pinned tier. They count as delivered, not truncated.
 __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
     const int64_t* __restrict__ destinations,
     const bool* __restrict__ live_in,
@@ -105,8 +109,10 @@ __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
     const int32_t* __restrict__ delivered,
     const float* __restrict__ keep,
     const int32_t* __restrict__ miss_count,
+    const int32_t* __restrict__ cpu_lanes,
     uint8_t ready,
     uint8_t free_state) {
+  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
   bool live[kDirectGatherWarp];
   bool evicted[kDirectGatherWarp];
   int64_t old_expert[kDirectGatherWarp];
@@ -114,7 +120,7 @@ __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
   int64_t live_sum = 0;
   int64_t evicted_sum = 0;
   for (int j = 0; j < width; ++j) {
-    live[j] = live_in[j] && (delivered == nullptr || (j < delivered[0] && good));
+    live[j] = live_in[j] && (delivered == nullptr || (j < delivered[0] && good)) && (cpu >> j & 1u) == 0;
     old_expert[j] = slot_to_expert[destinations[j]];
     evicted[j] = live[j] && old_expert[j] >= 0;
     live_sum += live[j];
@@ -141,7 +147,7 @@ __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
   gather_insertions[0] += live_sum;
   gather_evictions[0] += evicted_sum;
   if (delivered != nullptr) {
-    insertion_truncated[0] += (static_cast<int64_t>(delivered[0]) > live_sum) && good;
+    insertion_truncated[0] += (static_cast<int64_t>(delivered[0]) - __popc(cpu) > live_sum) && good;
   } else {
     insertion_truncated[0] += static_cast<int64_t>(miss_count[0]) > live_sum;
   }
@@ -242,6 +248,7 @@ void direct_commit_gather_gpu(
     tvm::ffi::Optional<tvm::ffi::TensorView> delivered,
     tvm::ffi::Optional<tvm::ffi::TensorView> keep,
     tvm::ffi::TensorView miss_count,
+    tvm::ffi::Optional<tvm::ffi::TensorView> cpu_lanes,
     int64_t ready,
     int64_t free_state) {
   using namespace host;
@@ -280,6 +287,11 @@ void direct_commit_gather_gpu(
   expert_stream::verify_named(
       "miss_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), miss_count);
   RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= kDirectGatherWarp, "the commit must cover 1-32 lanes");
+  if (cpu_lanes.has_value()) {
+    RuntimeCheck(delivered.has_value(), "cpu_lanes needs the leased delivery count");
+    expert_stream::verify_named(
+        "cpu_lanes", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes.value());
+  }
   RuntimeCheck(num_experts == E_.unwrap() - 1, "num_experts must be mapping's size minus the dump column");
   RuntimeCheck(slot_dump == S_.unwrap() - 1, "slot_dump must be slot_to_expert's last column");
   const auto stream = host::LaunchKernel::resolve_device(destinations.device());
@@ -301,6 +313,7 @@ void direct_commit_gather_gpu(
       delivered.has_value() ? static_cast<const int32_t*>(delivered.value().data_ptr()) : nullptr,
       keep.has_value() ? static_cast<const float*>(keep.value().data_ptr()) : nullptr,
       static_cast<const int32_t*>(miss_count.data_ptr()),
+      cpu_lanes.has_value() ? static_cast<const int32_t*>(cpu_lanes.value().data_ptr()) : nullptr,
       static_cast<uint8_t>(ready),
       static_cast<uint8_t>(free_state));
 }

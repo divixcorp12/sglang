@@ -7,7 +7,7 @@ the parity test compares against it.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -45,11 +45,18 @@ def exl3_moe_route_tables(
     inv_order: torch.Tensor,
     weight_sorted: torch.Tensor,
     det: torch.Tensor,
+    cpu_lanes: Optional[torch.Tensor] = None,
+    dst_slots: Optional[torch.Tensor] = None,
+    cpu_out: int = 0,
 ) -> None:
     """The fused MoE's route tables and input staging; see ``exl3_fused_moe.route_tables``.
 
     Writes ``remap64_out`` (``remap`` as int64), ``x16_out`` (``x`` as fp16), zeroes ``out_zero``, and fills
     ``expert_count`` [slots + 1], ``inv_order``, ``weight_sorted`` (fp16) and ``det`` [3, slots + 1].
+
+    CPU experts: ``cpu_lanes`` (int32 ``[1]``) masks the plan lanes the CPU computed, ``dst_slots`` (int32) are the plan's
+    lane slots and ``cpu_out`` the address of the CPU partial sum's host row, which seeds ``out_zero``; those routes'
+    slots count 0 and rank last, so the fused kernel and the gather skip them.
 
     The launcher checks every tensor; this refuses only a dtype that has no instantiation.
     """
@@ -72,4 +79,19 @@ def exl3_moe_route_tables(
         inv_order,
         weight_sorted,
         det,
+        cpu_lanes if cpu_lanes is not None else _empty_i32(det.device),
+        dst_slots if dst_slots is not None else _empty_i32(det.device),
+        int(cpu_out),
     )
+
+
+_EMPTY_I32: dict = {}
+
+
+def _empty_i32(device) -> torch.Tensor:
+    """A stable empty int32 tensor per device: the launcher's "off" for the CPU-expert arguments, capture-safe."""
+    key = str(device)
+    t = _EMPTY_I32.get(key)
+    if t is None:
+        t = _EMPTY_I32[key] = torch.empty(0, dtype=torch.int32, device=device)
+    return t

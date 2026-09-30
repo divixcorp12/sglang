@@ -1,5 +1,6 @@
-"""Shutdown of the option C service: stop admission, establish that no GPU reader runs, then free; else quarantine
-(CPU, fake device barrier); LEASE_PROTOCOL.md 14.3 and item 9(c) of 18.2.
+"""Shutdown of the option C service: establish that no GPU reader runs (while the service still serves the chains in
+flight), stop admission, stop the thread, then free; else quarantine (CPU, fake device barrier); LEASE_PROTOCOL.md,
+"Shutdown".
 
 Written after the code, unlike the service-side lease tests: the sequence is a list of named steps and the tests
 read it back. Each test names the mutation it must fail under. A fake CUDA barrier (``_synchronize``) stands in for
@@ -82,15 +83,16 @@ def _barrier(service, monkeypatch, order, behaviour):
     monkeypatch.setattr(service, "_barrier_devices", lambda: [torch.device("cuda", 0)])  # no CUDA here; see the F2 tests
 
 
-def test_shutdown_closes_admission_then_establishes_completion_then_stops_then_frees(world, monkeypatch):
-    """Mutation: the barrier is skipped, run before admission closes, or run after the thread stops. The header's
-    shutdown word is read from inside the barrier, so 'admission closed first' is observed, not inferred."""
+def test_shutdown_establishes_completion_then_closes_admission_then_stops_then_frees(world, monkeypatch):
+    """Mutation: the barrier is skipped, run after admission closes (an in-flight chain would then wait on a service
+    that no longer serves it, until S's deadline traps), or run after the thread stops. Admission is read from inside
+    the barrier, so 'the service still served during the barrier' is observed, not inferred."""
     service, caches, order = world
     seen = {}
-    _barrier(service, monkeypatch, order, lambda: seen.setdefault("shutdown", service.host.lease_header()["shutdown"]))
+    _barrier(service, monkeypatch, order, lambda: seen.setdefault("closed", "close_admission" in order))
     service.shutdown()
-    assert order == ["close_admission", "synchronize", "stop", "free0", "free1"]
-    assert seen["shutdown"] == 1, "the header's shutdown word was set before the device barrier ran"
+    assert order == ["synchronize", "close_admission", "stop", "free0", "free1"]
+    assert seen["closed"] is False, "admission closed before the device barrier ran"
     assert not service._quarantined and not service.host.threaded, "and the service thread is gone"
 
 
@@ -106,7 +108,7 @@ def test_a_cuda_error_at_the_barrier_quarantines_everything_and_frees_nothing(wo
     _barrier(service, monkeypatch, order, fail)
     page, block = service.host.page, service.host.lease_block
     service.shutdown()
-    assert order == ["close_admission", "synchronize", "stop", "quarantine0", "quarantine1"]
+    assert order == ["synchronize", "close_admission", "stop", "quarantine0", "quarantine1"]
     assert service._quarantined and not any(step.startswith("free") for step in order)
     assert all(not cache._release_slabs.alive for cache in caches.values()), "the exit-time unregister is detached"
     kept = expert_host_tier._QUARANTINED
@@ -124,7 +126,7 @@ def test_a_barrier_that_does_not_return_in_time_quarantines_and_does_not_hang_sh
     service.shutdown()
     elapsed = time.perf_counter() - start
     release.set()
-    assert order == ["close_admission", "synchronize", "stop", "quarantine0", "quarantine1"]
+    assert order == ["synchronize", "close_admission", "stop", "quarantine0", "quarantine1"]
     assert 0.25 < elapsed < 5.0, "it waited for the deadline, and not for the barrier"
     assert service._quarantined
 
@@ -183,7 +185,7 @@ def test_a_failed_stop_of_the_service_thread_after_a_clean_barrier_quarantines_a
     service.shutdown()
     steps = list(order)
     real_stop()  # cleanup: the fixture's wrapper records a step of its own
-    assert steps == ["close_admission", "synchronize", "stop", "quarantine0", "quarantine1"]
+    assert steps == ["synchronize", "close_admission", "stop", "quarantine0", "quarantine1"]
     assert service._quarantined and service._completed
 
 
@@ -196,7 +198,7 @@ def test_an_interrupt_during_the_stop_quarantines_first_and_then_goes_on(world, 
         service.shutdown()
     steps = list(order)
     real_stop()
-    assert steps == ["close_admission", "synchronize", "stop", "quarantine0", "quarantine1"]
+    assert steps == ["synchronize", "close_admission", "stop", "quarantine0", "quarantine1"]
 
 
 def _record_synchronize(monkeypatch, on_thread=None):
@@ -268,7 +270,7 @@ def test_an_interrupt_in_the_barrier_quarantines_first_and_then_goes_on_like_one
     monkeypatch.setattr(service, "_establish_gpu_completion", interrupted)
     with pytest.raises(KeyboardInterrupt):
         service.shutdown()
-    assert order == ["close_admission", "synchronize", "stop", "quarantine0", "quarantine1"]
+    assert order == ["synchronize", "stop", "quarantine0", "quarantine1"]  # the interrupt skips the close; stop ends it
     assert service._quarantined and service._completed
 
 
@@ -304,7 +306,7 @@ def test_a_device_shared_by_the_service_and_the_tiers_is_synced_once(world, monk
     assert seen == [torch.device("cuda", 1)]
 
 
-# ---- the scheduler's graceful shutdown reaches the service (LEASE_PROTOCOL.md 20.2i) ----
+# ---- the scheduler's graceful shutdown reaches the service (LEASE_PROTOCOL.md, "Shutdown") ----
 # These run the REAL, unbound Scheduler.release_host_resources on a stub, as the removed doorbell tests did. The
 # barrier is still the fake one above: they show the wiring and its order, not that a real device barrier orders GPU
 # work.
@@ -376,7 +378,7 @@ def test_scheduler_shutdown_drives_a_live_service_through_the_barrier_last(world
     service, caches, order = world
     _barrier(service, monkeypatch, order, lambda: None)
     _release_scheduler_host_resources(order)
-    assert order == CHEAP + ["close_admission", "synchronize", "stop", "free0", "free1"]
+    assert order == CHEAP + ["synchronize", "close_admission", "stop", "free0", "free1"]
     assert not service._quarantined
 
 
@@ -388,7 +390,7 @@ def test_scheduler_shutdown_with_a_failed_barrier_quarantines(world, monkeypatch
 
     _barrier(service, monkeypatch, order, fail)
     _release_scheduler_host_resources(order)
-    assert order == CHEAP + ["close_admission", "synchronize", "stop", "quarantine0", "quarantine1"]
+    assert order == CHEAP + ["synchronize", "close_admission", "stop", "quarantine0", "quarantine1"]
     assert service._quarantined
 
 

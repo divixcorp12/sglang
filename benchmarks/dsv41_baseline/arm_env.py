@@ -172,10 +172,8 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
         "SGLANG_MOE_EXPERT_FUSED_PLAN": "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
-        # Two-phase RAM-miss copies with piece streaming (DSV41_REFERENCE.md section 24).
-        "SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE": "1",
+        # The lease chain's W1 budget (the chain is two-phase with piece streaming, DSV41_REFERENCE.md section 24).
         "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100",
-        "SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM": "1",
         # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical
         # (docs/superpowers/plans/2026-09-25-dsv41-layer-fusion.md).
         "SGLANG_DSV41_ENABLE_LAYER_FUSION": "1",
@@ -184,14 +182,13 @@ def base_env() -> dict[str, str]:
         "SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT": "1",
         # RAM-hit rows copied by the DMA engine instead of the SM kernel C1: 112.4 vs 119.3 ms/token, byte-identical
         # (docs/superpowers/plans/2026-09-25-dsv41-final-arms.md). Needs the device wait above (no graph host nodes).
-        # A kernel module first loaded mid-step after arming can still fail-stop the server (LEASE_PROTOCOL.md 7.6),
+        # A kernel module first loaded mid-step after arming can still fail-stop the server (LEASE_PROTOCOL.md, "Copy engine"),
         # and graph-mode nsys must not be used with it on.
         "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE": "1",
         # The copy engine requires it and the server refuses to start without it: a kernel loaded lazily after the
         # copy engine arms fail-stopped the soak deterministically, never under EAGER
         # (docs/superpowers/plans/2026-09-25-dsv41-copy-engine-soak.md). Costs ~1 GiB, hence MEM_FRACTION_STATIC.
         "CUDA_MODULE_LOADING": "EAGER",
-        "SGLANG_DSV41_ENABLE_EXPERT_PREFETCH": "0",
         # Prefill's pinned-tier misses read by the RAM-miss service's reader straight into the slabs, a layer's reads
         # issued up front: TTFT 21.06/17.79 -> 12.05/11.14 s, decode unchanged, byte-identical (DSV41_REFERENCE.md 27.6).
         # Reads the row images the RAM-miss service always reads (built on every mirror root by

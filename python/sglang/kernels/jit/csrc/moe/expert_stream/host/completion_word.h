@@ -12,8 +12,7 @@ namespace sglang::expert_stream {
 // reached a job's token means that job and every earlier one completed. The copy thread reads the word with one
 // acquire load per poll: no driver call, so no libcuda mutex, per poll.
 //
-// Liveness, with no clock (the host has no in-flight timeout; the device copy wait's deadline is the timeout, and E5
-// keeps the leases held until then). A failed copy or write never writes the word, so after `check_every` consecutive
+// Liveness, with no clock (the host has no in-flight timeout; the watchdog's copy-wait deadline is the timeout). A failed copy or write never writes the word, so after `check_every` consecutive
 // pending polls the head asks the stream once (`stream_query`: 0 idle, kNotReady busy, else a sticky error):
 //   - busy: keep polling;
 //   - an error: return it, and the engine fails stop;

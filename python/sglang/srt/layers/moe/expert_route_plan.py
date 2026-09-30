@@ -31,6 +31,8 @@ class GraphRoutePlan:
     ``source_rows`` holds expert IDs for the first ``min(routes, scratch_rows)``
     plan rows, distinct misses first in order of first appearance, so the pull
     kernel's first ``miss_plan_rows`` rows are exactly the distinct misses.
+    The fused planner given ``miss_keys`` orders those miss rows by key, highest
+    first, instead; each miss route's remap still names its own expert's row.
     ``unique_hit_rows`` and ``unique_miss_rows`` count distinct experts;
     ``routed_miss_rows`` counts missed routes with multiplicity.
     """
@@ -195,6 +197,7 @@ def plan_graph_routes_fused(
     prefetch_count: Optional[torch.Tensor] = None,
     outcome_counters: Optional[torch.Tensor] = None,
     remap_out: Optional[torch.Tensor] = None,
+    miss_keys: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """`plan_graph_routes`'s BS1, unique-ID fast path: one fused kernel launch.
 
@@ -221,6 +224,9 @@ def plan_graph_routes_fused(
     ``remap_out`` can provide a graph-stable output buffer in ``remap_dtype``;
     otherwise an eager compatibility allocation is used. Returns that
     per-route remap, shaped like ``flat``.
+
+    ``miss_keys`` (int64 ``[num_experts]``, CPU experts' miss order) sorts the
+    residual rows by key, highest first; ``plan_graph_routes`` has no such mode.
     """
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
 
@@ -253,5 +259,6 @@ def plan_graph_routes_fused(
         prefetch_count,
         prefetch_slot,
         outcome_counters,
+        miss_keys,
     )
     return remap_out

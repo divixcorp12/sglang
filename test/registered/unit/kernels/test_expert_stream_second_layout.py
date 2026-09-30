@@ -8,9 +8,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_stream_transport as transport
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, TransportBuild, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, TransportBuild, new_page
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
@@ -72,9 +73,11 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     try:
         assert (host.layout_names, host.small_mask) == (("a", "b"), 0b10)
         host.enable_trace()
-        seq = sim_post(page, 1, need=[2], protect=[2], layout="two")
+        sim = LeaseSim(host, page, None)
+        req = sim.post(1, [2])
         assert host.pump() == 1
-        assert sim_wait(page, seq, timeout_s=1.0, layout="two") == 1
+        assert sim.wait(req, timeout_s=1.0).served
+        sim.done(req)
         slot = int(slot_map[1, 2])
         reference = s.reference(1, [2])
         for name in EXL3_STREAMED_NAMES[:2]:

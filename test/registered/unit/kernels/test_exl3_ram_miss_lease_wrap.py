@@ -1,8 +1,7 @@
-"""Leases across the 32-bit sequence wrap (CPU); LEASE_PROTOCOL.md 11 and items 7(b) and 7(d) of section 18.2.
+"""Leases across the 32-bit sequence wrap (CPU); analysis/dsv41-drive/LEASE_PROTOCOL.md, "Generations".
 
 The generation the service keys a lease by is the device's own 56-bit word (epoch << 32 | seq), echoed from the lane
-request, so an acknowledgement after the wrap must still retire the lease. Written from the requirement text before
-the service code; each test names the mutation it must fail under.
+request, so a Done word after the wrap must still retire the lease. Each test names the mutation it must fail under.
 """
 
 import faulthandler
@@ -34,7 +33,6 @@ def world(tmp_path):
     for name in ("demand_head", "demand_done"):
         page[WORDS[name] : WORDS[name] + 4].view(torch.int32)[0] = -BELOW_WRAP  # 2**32 - 6
     host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
-    host.enable_lease_mode()
     yield s, page, host, LeaseSim(host, page, s.slabs)
     host.stop()
 
@@ -44,18 +42,17 @@ def _leases(host, row):
 
 
 def test_leases_retire_across_the_wrap_because_the_service_echoes_the_devices_generation(world):
-    """Mutation: the service keys leases by the 32-bit sequence alone, or by an epoch it counts itself: an
-    acknowledgement carrying the device's epoch after the wrap then retires nothing and the lease is stuck."""
+    """Mutation: the service keys leases by the 32-bit sequence alone, or by an epoch it counts itself: a Done word
+    carrying the device's epoch after the wrap then retires nothing and the lease is stuck."""
     s, page, host, sim = world
     epochs = []
     for i in range(3 * BELOW_WRAP):
         req = sim.post(i % 2, [i % 6])
         assert host.pump() == 1
         waited = sim.wait(req)
-        assert waited.status == 1 and waited.go == 1, f"request {i}"
+        assert waited.served and waited.go == 1, f"request {i}"
         epochs.append(req.gen >> 32)
-        sim.ack(req, waited)
-        sim.deliver()
+        sim.done(req)
         host.pump()
     assert epochs[0] == 0 and epochs[-1] == 1, "the run did cross the wrap"
     assert _leases(host, 0) == [0, 0, 0] and _leases(host, 1) == [0, 0, 0]
@@ -67,16 +64,15 @@ def test_an_armed_request_after_a_lap_that_crosses_the_wrap_is_still_served_and_
     across the wrap (the model's counterexample). Unarmed records pile up past the ring while the service lags."""
     s, page, host, sim = world
     for _ in range(DEMAND_RECORDS + BELOW_WRAP):
-        sim.post(0, [], armed=False)  # nothing waits on these: the device does not stop, the service lags
+        sim.post(0, [])  # unarmed: nothing waits on these, the device does not stop, the service lags
     armed = sim.post(0, [3])
     assert armed.gen >> 32 == 1, "the armed request is past the wrap"
     while host.pump():
         pass
     assert host.counters()["overruns"] > 0, "precondition: the service lapped"
     waited = sim.wait(armed)
-    assert waited.status == 1 and waited.go == 1 and _leases(host, 0).count(1) == 1
-    sim.ack(armed, waited)
-    sim.deliver()
+    assert waited.served and waited.go == 1 and _leases(host, 0).count(1) == 1
+    sim.done(armed)
     host.pump()
     assert _leases(host, 0) == [0, 0, 0]
 

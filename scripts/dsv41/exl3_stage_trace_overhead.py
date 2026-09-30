@@ -24,7 +24,8 @@ from pathlib import Path
 
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, sim_post, sim_wait
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.test.dsv41_lease_sim import LeaseSim
 from sglang.kernels.ops.moe.expert_stream_transport import STAGE_FIELDS
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
@@ -100,6 +101,7 @@ class Arm:
         self.host = ExpertStreamHost(
             self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), variant="instr"
         )
+        self.sim = LeaseSim(self.host, self.page, None)
         if trace:
             self.host.enable_trace(capacity=ring)
         self.cursor = 0
@@ -115,9 +117,10 @@ class Arm:
             w = self.cursor % windows
             self.cursor += 1
             ids = [w * rows_per_request + j for j in range(rows_per_request)] if rows_per_request else [0]
-            seq = sim_post(self.page, 1, need=ids, protect=ids)
+            req = self.sim.post(1, ids)
             self.host.pump()
-            sim_wait(self.page, seq, timeout_s=5.0)
+            self.sim.wait(req, timeout_s=5.0)
+            self.sim.done(req)
         elapsed = time.perf_counter_ns() - t0
         self.run_delay_ns = _run_delay_ns() - delay0
         self.clock_reads_per_request = (self.host.trace_clock_reads() - clocks0) / requests

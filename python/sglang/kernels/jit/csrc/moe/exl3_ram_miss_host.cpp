@@ -6,6 +6,7 @@
 #include "exl3/exl3_row_layout.h"
 #include "expert_stream/host/build_policy.h"
 #include "expert_stream/host/ffi_exports.h"
+#include "expert_stream/host/ffi_test_exports.h"
 #include "expert_stream/host/uring_reader.h"
 
 namespace sglang {
@@ -20,5 +21,6 @@ static_assert(
     "the production build carries no fault state");
 
 EXPERT_STREAM_HOST_EXPORTS(Exl3HostExports)
+EXPERT_STREAM_HOST_TEST_EXPORTS(Exl3HostExports)
 
 }  // namespace sglang

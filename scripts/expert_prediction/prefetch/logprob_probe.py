@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--sessions", required=True)
     parser.add_argument("--prompts", type=int, default=6)
     parser.add_argument("--max-tokens", type=int, default=96)
+    parser.add_argument("--top-logprobs", type=int, default=2)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     results = []
@@ -19,7 +20,7 @@ def main():
     for session in sessions:
         body = json.dumps({
             "model": "default", "messages": [{"role": "user", "content": session["turns"][0][:6000]}],
-            "temperature": 0, "max_tokens": args.max_tokens, "logprobs": True, "top_logprobs": 2,
+            "temperature": 0, "max_tokens": args.max_tokens, "logprobs": True, "top_logprobs": args.top_logprobs,
             "chat_template_kwargs": {"enable_thinking": False},
         }).encode()
         request = urllib.request.Request(f"http://127.0.0.1:{args.port}/v1/chat/completions", data=body,

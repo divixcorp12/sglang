@@ -29,7 +29,6 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   using Base::faults_;
   using Base::fds_;
   using Base::finish_row;
-  using Base::holding_for_probe;
   using Base::piece_runs_;
   using Base::piece_stream_;
   using Base::publish_collected;
@@ -185,7 +184,6 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
       for (int j = 0; j < kPieces && !c.failed && todo != 0; ++j) {
         const uint8_t bit = static_cast<uint8_t>(1u << j);
         if ((todo & bit) == 0) continue;
-        if (j >= 1 && holding_for_probe()) continue;
         const PieceRun* runs = &piece_runs_[(s * kPieces + static_cast<size_t>(j)) * segments];
         bool bytes = false;
         for (size_t i = 0; i < segments && !bytes; ++i)

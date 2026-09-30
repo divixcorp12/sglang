@@ -1,4 +1,4 @@
-"""The device wrapper refuses pages and slot maps the kernels cannot address (CPU)."""
+"""The device wrapper refuses buffers the kernels cannot address, and the wire header is the Python layout (CPU)."""
 
 import ast
 import operator
@@ -9,20 +9,41 @@ import pytest
 import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
-from sglang.kernels.ops.moe import expert_lease_block
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STATE_WORDS, ExpertStreamDevice
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.expert_stream_sources import (
-    device_sources,
-    host_sources,
-    joined_text,
-    native_prefetch_source,
-    wire_header,
-)
+from sglang.test.expert_stream_sources import device_sources, host_sources, joined_text, wire_header
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 CSRC = Path(ram_miss.__file__).resolve().parents[2] / "jit" / "csrc" / "moe"
+
+
+def _runs(layers=2, experts=4):
+    return torch.zeros((layers, experts, ram_miss.STAGE_PIECES, 1, 2), dtype=torch.int32)
+
+
+def _device(layers=2, experts=4, page=None, **kwargs):
+    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8) if page is None else page
+    kwargs.setdefault("piece_runs", _runs(layers, experts))
+    kwargs.setdefault("row_capacities", [5, 7][:layers] + [3] * max(0, layers - 2))
+    kwargs.setdefault("timeout_ms", 10)
+    return ExpertStreamDevice(
+        page, lease.new_lease_block(pin=False), device="cpu", layers=layers, experts=experts, **kwargs
+    )
+
+
+def _args(lanes=8):
+    return dict(
+        planned=torch.zeros(lanes, dtype=torch.int64),
+        count=torch.zeros(1, dtype=torch.int32),
+        routes=torch.full((lanes,), -1, dtype=torch.int64),
+        dst_slots=torch.zeros(lanes, dtype=torch.int32),
+    )
+
+
+def _post(dev, a, row=0):
+    dev.post(row, a["planned"], a["count"], a["routes"], a["dst_slots"])
 
 
 def test_state_words_are_distinct_and_dense():
@@ -31,48 +52,28 @@ def test_state_words_are_distinct_and_dense():
 
 def test_a_page_of_the_wrong_size_is_refused():
     with pytest.raises(ValueError, match="page"):
-        ExpertStreamDevice(torch.zeros(10, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=10, advise=False)
-
-
-def test_a_slot_map_of_the_wrong_shape_is_refused():
-    with pytest.raises(ValueError, match="slot_map"):
-        ExpertStreamDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((3, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=10, advise=False)
+        _device(page=torch.zeros(10, dtype=torch.uint8))
 
 
 def test_the_timeout_must_be_positive():
     with pytest.raises(ValueError, match="timeout"):
-        ExpertStreamDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cpu", layers=2, timeout_ms=0, advise=False)
+        _device(timeout_ms=0)
 
 
-def _device(layers=2, experts=4, page=None):
-    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8) if page is None else page
-    slot_map = torch.full((layers, experts), -1, dtype=torch.int32)
-    return ExpertStreamDevice(page, slot_map, device="cpu", layers=layers, timeout_ms=10, advise=False)
+def test_piece_runs_of_the_wrong_shape_are_refused():
+    with pytest.raises(ValueError, match="piece_runs"):
+        _device(piece_runs=_runs(layers=3))
+    with pytest.raises(ValueError, match="piece_runs"):
+        _device(piece_runs=_runs(experts=5))
 
 
-def _args(lanes=6):
-    return dict(
-        planned=torch.zeros(lanes, dtype=torch.int64),
-        count=torch.zeros(1, dtype=torch.int32),
-        routes=torch.full((lanes,), -1, dtype=torch.int64),
-        host_rows=torch.zeros(lanes, dtype=torch.int64),
-        keep=torch.ones(1, dtype=torch.float32),
-        ram_miss=torch.zeros(1, dtype=torch.int64),
-    )
-
-
-def _post(dev, a, row=0, next_row=-1):
-    dev.post(row, a["planned"], a["count"], a["routes"], next_row)
-
-
-def _wait(dev, a, row=0):
-    dev.wait(row, a["planned"], a["count"], a["host_rows"], a["keep"], a["ram_miss"])
-
-
-def test_an_unpinned_page_or_slot_map_is_refused_for_a_cuda_device():
-    # Checked before any CUDA call: the kernels read both through UVA.
+def test_an_unpinned_page_is_refused_for_a_cuda_device():
+    # Checked before any CUDA call: the kernels read it through UVA.
     with pytest.raises(ValueError, match="pinned"):
-        ExpertStreamDevice(torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.zeros((2, 4), dtype=torch.int32), device="cuda", layers=2, timeout_ms=10, advise=False)
+        ExpertStreamDevice(
+            torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(pin=False), device="cuda", layers=2,
+            experts=4, timeout_ms=10, piece_runs=_runs(), row_capacities=[5, 7],
+        )
 
 
 def test_a_row_outside_the_streamed_layers_is_refused():
@@ -81,44 +82,26 @@ def test_a_row_outside_the_streamed_layers_is_refused():
         with pytest.raises(ValueError, match="row"):
             _post(dev, a, row=row)
         with pytest.raises(ValueError, match="row"):
-            _wait(dev, a, row=row)
-    for next_row in (-2, 2):
-        with pytest.raises(ValueError, match="next_row"):
-            _post(dev, a, next_row=next_row)
+            dev.hit_wait(row, a["planned"], a["count"], a["dst_slots"], 1000)
 
 
 def test_buffers_of_the_wrong_dtype_are_refused():
     dev = _device()
-    for name, dtype in (("planned", torch.int32), ("count", torch.int64), ("routes", torch.int32)):
+    for name, dtype in (("planned", torch.int32), ("count", torch.int64), ("routes", torch.int32), ("dst_slots", torch.int64)):
         a = _args()
         a[name] = a[name].to(dtype)
         with pytest.raises(ValueError, match=name):
             _post(dev, a)
-    for name, dtype in (("planned", torch.int32), ("count", torch.int64), ("host_rows", torch.int32), ("keep", torch.float16), ("ram_miss", torch.int32)):
-        a = _args()
-        a[name] = a[name].to(dtype)
-        with pytest.raises(ValueError, match=name):
-            _wait(dev, a)
 
 
-def test_planned_shorter_than_host_rows_is_refused():
-    dev, a = _device(), _args()
-    a["planned"] = torch.zeros(4, dtype=torch.int64)
-    with pytest.raises(ValueError, match="planned"):
-        _wait(dev, a)
-
-
-def test_the_device_sequences_continue_from_the_page_heads():
+def test_the_device_sequence_continues_from_the_page_head():
     """A device built over a used page posts the next sequence, not 1, which the thread would never serve."""
     page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
     page[ram_miss.WORDS["demand_head"] : ram_miss.WORDS["demand_head"] + 4].view(torch.int32)[0] = 7
-    page[ram_miss.WORDS["advise_head"] : ram_miss.WORDS["advise_head"] + 4].view(torch.int32)[0] = -5  # 2**32 - 5
-    dev = _device(page=page)
-    assert int(dev.state[STATE_WORDS["posted"]]) == 7
-    assert int(dev.state[STATE_WORDS["advised"]]) & 0xFFFFFFFF == 2**32 - 5
+    assert int(_device(page=page).state[STATE_WORDS["posted"]]) == 7
 
 
-_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul}
+_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.LShift: operator.lshift}
 
 
 def _evaluate(node, known):
@@ -152,91 +135,89 @@ def _wire():
 
 _NAME = re.compile(r"^\s*(?:static\s+)?constexpr\s+[\w:]+\s+(k\w+)\s*=", re.MULTILINE)
 
+# The wire header, in full: every constant it defines and the Python value it must equal.
+PYTHON_WIRE = {
+    "kDemandHead": ram_miss.WORDS["demand_head"],
+    "kDemandDone": ram_miss.WORDS["demand_done"],
+    "kDemandRing": ram_miss.DEMAND_RING,
+    "kDemandRecords": ram_miss.DEMAND_RECORDS,
+    "kRecordBytes": ram_miss.RECORD_BYTES,
+    "kMaxIds": ram_miss.MAX_IDS,
+    "kRecSeq": ram_miss.RECORD_FIELDS["seq"],
+    "kRecRow": ram_miss.RECORD_FIELDS["row"],
+    "kRecProtectCount": ram_miss.RECORD_FIELDS["protect_count"],
+    "kRecArmed": ram_miss.RECORD_FIELDS["armed"],
+    "kRecProtect": ram_miss.RECORD_FIELDS["protect"],
+    "kPageBytes": PAGE_BYTES,
+    "kHotHeaderBytes": ram_miss.HOT_HEADER_BYTES,
+    "kHotAlignment": ram_miss.HOT_ALIGNMENT,
+    "kHotRecords": ram_miss.HOT_RECORDS,
+    "kLeaseRing": lease.RING,
+    "kLeaseLanes": lease.LANES,
+    "kLeaseBlockAlign": lease.BLOCK_ALIGN,
+    "kLeaseRowResult": lease.ROW_RESULT,
+    "kLeaseRowResultBytes": lease.ROW_RESULT_BYTES,
+    "kLeaseRrReady": lease.ROW_RESULT_FIELDS["ready"],
+    "kLeaseRrHostSlot": lease.ROW_RESULT_FIELDS["host_slot"],
+    "kLeaseTagReady": lease.READY,
+    "kLeaseTagLoading": lease.LOADING,
+    "kLeaseTagCopying": lease.COPYING,
+    "kLeaseTagCpu": lease.CPU,
+    "kLeasePieceMask": lease.PIECE_MASK,
+    "kLeasePieceMaskLineBytes": lease.PIECE_MASK_LINE_BYTES,
+    "kLeaseCopyDone": lease.COPY_DONE,
+    "kLeaseCopyDoneBytes": lease.COPY_DONE_BYTES,
+    "kLeaseCopyGate": lease.COPY_GATE,
+    "kLeaseGateClosed": lease.GATE["closed"],
+    "kLeaseGateOpen": lease.GATE["open"],
+    "kLeaseGateSeqShift": lease.GATE_SEQ_SHIFT,
+    "kLeaseGateSeqMask": lease.GATE_SEQ_MASK,
+    "kLeaseLaneRequest": lease.LANE_REQUEST,
+    "kLeaseLaneRequestBytes": lease.LANE_REQUEST_BYTES,
+    "kLeaseLrGen": lease.LANE_REQUEST_FIELDS["gen"],
+    "kLeaseLrCount": lease.LANE_REQUEST_FIELDS["count"],
+    "kLeaseLrFlags": lease.LANE_REQUEST_FIELDS["flags"],
+    "kLeaseLrFlagCaptured": lease.LANE_REQUEST_FLAG_CAPTURED,
+    "kLeaseLrExpert": lease.LANE_REQUEST_FIELDS["expert"],
+    "kLeaseLrDst": lease.LANE_REQUEST_FIELDS["dst_slot"],
+    "kLeaseLrWeight": lease.LANE_REQUEST_FIELDS["weight"],
+    "kLeaseDone": lease.DONE,
+    "kLeaseDoneBytes": lease.DONE_BYTES,
+    "kLeaseBlockBytes": lease.BLOCK_BYTES,
+}
+
 
 def test_the_wire_header_is_the_python_layout():
-    """The page, lease block and prefetch page (LEASE_PROTOCOL.md section 4): one C++ home, equal to Python."""
-    wire = _wire()
-    python = {
-        "kDemandHead": ram_miss.WORDS["demand_head"], "kDemandDone": ram_miss.WORDS["demand_done"],
-        "kFatal": ram_miss.WORDS["fatal"], "kAdviseHead": ram_miss.WORDS["advise_head"],
-        "kAdviseDone": ram_miss.WORDS["advise_done"], "kBusySeq": ram_miss.WORDS["busy_seq"],
-        "kHeartbeat": ram_miss.WORDS["heartbeat"], "kRecordBytes": ram_miss.RECORD_BYTES,
-        "kDemandRing": ram_miss.DEMAND_RING, "kDemandRecords": ram_miss.DEMAND_RECORDS,
-        "kAdviseRing": ram_miss.ADVISE_RING, "kAdviseRecords": ram_miss.ADVISE_RECORDS, "kMaxIds": ram_miss.MAX_IDS,
-        "kServed": ram_miss.STATUS["served"], "kPageBytes": PAGE_BYTES,
-        "kHotHeaderBytes": ram_miss.HOT_HEADER_BYTES, "kHotAlignment": ram_miss.HOT_ALIGNMENT,
-        "kHotRecords": ram_miss.HOT_RECORDS,
-        "kPfReqGen": ram_miss.PREFETCH_FIELDS["req_gen"], "kPfReqRow": ram_miss.PREFETCH_FIELDS["req_row"],
-        "kPfReqExpert": ram_miss.PREFETCH_FIELDS["req_expert"], "kPfReqDst": ram_miss.PREFETCH_FIELDS["req_dst"],
-        "kPfDoneGen": ram_miss.PREFETCH_FIELDS["done_gen"], "kPfDoneReason": ram_miss.PREFETCH_FIELDS["done_reason"],
-        "kPrefetchPageBytes": ram_miss.PREFETCH_PAGE_BYTES, "kPfTagRequest": ram_miss.PREFETCH_TAG_REQUEST,
-        "kPfTagCopied": ram_miss.PREFETCH_TAG_COPIED, "kPfTagSkipped": ram_miss.PREFETCH_TAG_SKIPPED,
-        "kPfSkipUnarmed": ram_miss.PREFETCH_SKIP_REASONS["unarmed"],
-        "kPfSkipNotReady": ram_miss.PREFETCH_SKIP_REASONS["not_ready"],
-        "kPfSkipInvalid": ram_miss.PREFETCH_SKIP_REASONS["invalid"],
-        "kLeaseBlockAlign": expert_lease_block.BLOCK_ALIGN,
-        **_lease_python_constants(), **_lease_device_only_constants(),
-    }
-    assert {name: wire.get(name) for name in python} == python
-    assert wire["kLeaseRing"] == wire["kDemandRecords"] and wire["kLeaseLanes"] == wire["kMaxIds"]
+    """The request page and the lease block: one C++ home, equal to Python, and nothing in it Python does not mirror."""
+    assert _wire() == PYTHON_WIRE
+    assert PYTHON_WIRE["kLeaseRing"] == PYTHON_WIRE["kDemandRecords"] and PYTHON_WIRE["kLeaseLanes"] == PYTHON_WIRE["kMaxIds"]
 
 
 def test_no_other_source_defines_a_wire_constant():
     """A layout constant re-added beside its user compiles (an ambiguous name errors only where it is used) and then
     drifts; this names the file that re-added it."""
     wire = set(_wire())
-    for path in (*host_sources(), *device_sources(), native_prefetch_source()):
+    for path in (*host_sources(), *device_sources()):
         clash = wire & set(_NAME.findall(path.read_text()))
         assert not clash, f"{path.name} redefines wire constants {sorted(clash)}: define them only in lease_layout.h"
 
 
 def test_the_device_state_words_are_the_python_state_words():
-    """The two-stage device state block agrees with Python's STATE_WORDS; this is the only check of it."""
+    """The device state block agrees with Python's STATE_WORDS; this is the only check of it."""
     device = _constants(*device_sources(), known=_wire())
     state = {
         "kPosted": "posted",
         "kPending": "pending",
-        "kTimeouts": "timeouts",
-        "kFailures": "failures",
-        "kWaits": "waits",
-        "kPolls": "polls",
-        "kSticky": "sticky",
-        "kAdvised": "advised",
-        "kUnservedMisses": "unserved_misses",
         "kEpoch": "epoch",
         "kPendingEpoch": "pending_epoch",
-        # Task 6 V1 two-phase (D5, D6). This mapping is hand-maintained and asserted for EQUALITY
-        # against STATE_WORDS, so a word added on both sides of the boundary still fails here until
-        # it is added here too -- which is the point: this test is the only thing that checks the
-        # .cuh and Python agree on the state layout, and it caught D5/D6 adding four words.
         "kDeadlineLo": "deadline_lo",
         "kDeadlineHi": "deadline_hi",
-        "kReqFailed": "req_failed",
-        "kFailReason": "fail_reason",
-        "kStreamPieces": "stream_pieces",
-        "kStreamPolls": "stream_polls",
-        "kW1Passes": "w1_passes",
-        "kCopyWaits": "copy_waits",
-        "kCopySpun": "copy_spun",
     }
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
+    assert device["kStateWords"] == len(STATE_WORDS)
     # The service's counters are read positionally into COUNTERS: a counter appended on one side only shifts every name.
     counters = re.search(r"enum Counter : int \{(.*?)\bkCounterCount\b", joined_text(host_sources()), re.S)
     assert len(re.findall(r"^\s*(k\w+)", re.sub(r"//[^\n]*", "", counters.group(1)), re.M)) == len(ram_miss.COUNTERS)
-
-
-def test_the_stream_kernels_fault_words_are_the_device_sources():
-    """The stream kernel reads its test-only fault tensor by these indices; a word moved on one side only would
-    silently inject a different fault (or none) in the GPU tests that kill M13, M15 and M16."""
-    device = _constants(*device_sources())
-    names = {
-        "abort_block": "kStreamFaultAbortBlock",
-        "abort_delay_ns": "kStreamFaultAbortDelay",
-        "stall_ns": "kStreamFaultStall",
-        "count_delay_ns": "kStreamFaultCountDelay",
-    }
-    assert {word: device[name] for word, name in names.items()} == ram_miss.STREAM_FAULT_WORDS
-    assert device["kStreamFaultWords"] == len(ram_miss.STREAM_FAULT_WORDS)
 
 
 def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
@@ -272,108 +253,15 @@ def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
 
 
 def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
-    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
-    slot_map = torch.full((1, 384), -1, dtype=torch.int32)
     with pytest.raises(ValueError, match="hot_page"):
-        ExpertStreamDevice(page, slot_map, device="cpu", layers=1, timeout_ms=10,
-                          advise=False, hot_page=torch.zeros(16 * 128, dtype=torch.uint8))
+        _device(layers=1, experts=384, hot_page=torch.zeros(16 * 128, dtype=torch.uint8))
 
 
-def _lease_python_constants():
-    from sglang.kernels.ops.moe import expert_lease_block as lease
-
-    return {
-        "kLeaseRing": lease.RING,
-        "kLeaseLanes": lease.LANES,
-        "kLeaseHeaderRing": lease.HEADER["ring"],
-        "kLeaseHeaderLanes": lease.HEADER["lanes"],
-        "kLeaseHeaderShutdown": lease.HEADER["shutdown"],
-        "kLeaseHeaderSlotGenOffset": lease.HEADER["slot_gen_offset"],
-        "kLeaseHeaderDOffset": lease.HEADER["d_offset"],
-        "kLeaseHeaderPieceOffset": lease.HEADER["piece_offset"],
-        "kLeaseHeaderCopyOffset": lease.HEADER["copy_offset"],
-        "kLeaseRowTable": lease.ROW_TABLE,
-        "kLeaseRowResult": lease.ROW_RESULT,
-        "kLeaseRowResultBytes": lease.ROW_RESULT_BYTES,
-        "kLeaseRrReady": lease.ROW_RESULT_FIELDS["ready"],
-        "kLeaseRrSlotGeneration": lease.ROW_RESULT_FIELDS["slot_generation"],
-        "kLeaseRrHostSlot": lease.ROW_RESULT_FIELDS["host_slot"],
-        "kLeaseRrExpert": lease.ROW_RESULT_FIELDS["expert"],
-        "kLeaseSlotGen": lease.SLOT_GEN,
-        "kLeaseLaneRequest": lease.LANE_REQUEST,
-        "kLeaseLaneRequestBytes": lease.LANE_REQUEST_BYTES,
-        "kLeaseLrGen": lease.LANE_REQUEST_FIELDS["gen"],
-        "kLeaseLrCount": lease.LANE_REQUEST_FIELDS["count"],
-        "kLeaseLrRow": lease.LANE_REQUEST_FIELDS["row"],
-        "kLeaseLrExpert": lease.LANE_REQUEST_FIELDS["expert"],
-        "kLeaseLrDst": lease.LANE_REQUEST_FIELDS["dst_slot"],
-        "kLeaseLrFlags": lease.LANE_REQUEST_FIELDS["flags"],
-        "kLeaseLrFlagCopyEngine": lease.LANE_REQUEST_FLAG_COPY_ENGINE,
-        "kLeaseLaneAck": lease.LANE_ACK,
-        "kLeaseLaneAckBytes": lease.LANE_ACK_BYTES,
-        "kLeaseTerminal": lease.TERMINAL,
-        "kLeaseTerminalBytes": lease.TERMINAL_BYTES,
-        "kLeaseTermSkippedMask": lease.TERMINAL_FIELDS["skipped_mask"],
-        "kLeaseTermReason": lease.TERMINAL_FIELDS["reason"],
-        "kLeaseTermGen": lease.TERMINAL_FIELDS["gen"],
-        "kLeaseStreamProbe": lease.STREAM_PROBE,
-        "kLeaseStreamProbeBytes": lease.STREAM_PROBE_BYTES,
-        "kLeaseSmAck": lease.SM_ACK,
-        "kLeaseSmAckBytes": lease.SM_ACK_BYTES,
-        "kLeaseRowTableBytes": lease.ROW_TABLE_ENTRY_BYTES,
-        "kLeasePieceMaskLineBytes": lease.PIECE_MASK_LINE_BYTES,
-        "kLeasePieceMaskBytes": lease.PIECE_MASK_BYTES,
-        "kLeaseAreaPieceMaskBytes": lease.AREA_PIECE_MASK_BYTES,
-        "kLeaseCopyDoneBytes": lease.COPY_DONE_BYTES,
-        "kLeaseCdMask": lease.COPY_DONE_FIELDS["mask"],
-        "kLeaseCdGen": lease.COPY_DONE_FIELDS["gen"],
-        "kLeaseAreaCopyDoneBytes": lease.AREA_COPY_DONE_BYTES,
-        "kLeaseCopyGate": lease.COPY_GATE,
-        "kLeaseCopyArm": lease.COPY_ARM,
-        "kLeaseAreaCBytes": lease.AREA_C_BYTES,
-        "kLeaseGateClosed": lease.GATE["closed"],
-        "kLeaseGateOpen": lease.GATE["open"],
-        "kLeaseGateTimeout": lease.GATE["timeout"],
-        "kLeaseGateAborted": lease.GATE["aborted"],
-        "kLeaseGateOutcomeMask": lease.GATE_OUTCOME_MASK,
-        "kLeaseGateSeqShift": lease.GATE_SEQ_SHIFT,
-        "kLeaseGateSeqMask": lease.GATE_SEQ_MASK,
-    }
-
-
-def _lease_device_only_constants():
-    """Tags and Terminal reasons: every one is in the device source; the host may name some (the RowResult ready tags
-    it writes), and then must agree, but is not required to define any."""
-    from sglang.kernels.ops.moe import expert_lease_block as lease
-
-    return {
-        "kLeaseTagDemand": lease.DEMAND_TAG,
-        "kLeaseTagReady": lease.READY,
-        "kLeaseTagLoading": lease.LOADING,
-        "kLeaseTagCopying": lease.COPYING,
-        "kLeaseTagCopied": lease.COPIED,
-        "kLeaseTagConsumed": lease.CONSUMED,
-        "kLeaseTagViolated": lease.VIOLATED,
-        "kLeaseTagTerminal": lease.TERMINAL_TAG,
-        "kLeaseTagStreamed": lease.STREAM_PROBE_TAG,
-        "kLeaseTagSmAck": lease.SM_ACK_TAG,
-        "kLeaseTagCopyArm": lease.COPY_ARM_TAG,
-        "kLeaseReasonTimeout": lease.TERMINAL_REASONS["timeout"],
-        "kLeaseReasonAborted": lease.TERMINAL_REASONS["aborted"],
-        "kLeaseReasonFailed": lease.TERMINAL_REASONS["failed"],
-        "kLeaseReasonIdentity": lease.TERMINAL_REASONS["identity"],
-        "kLeaseReasonCount": lease.TERMINAL_REASONS["count"],
-    }
-
-
-
-# Lease-chain PDL (SGLANG_DSV41_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL on the lease chain"): the six chain kernels,
-# their source file, and the Python method that launches each.
+# Lease-chain PDL (SGLANG_DSV41_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
+# the Python method that launches each. C1 and CC are plain launches.
 PDL_KERNELS = {
     "exl3_ram_miss_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),
-    "exl3_ram_miss_lease_stream_hit_wait_kernel": ("lease_kernels.cuh", "expert_stream_lease_stream_hit_wait"),
-    "exl3_ram_miss_lease_stage_ack_kernel": ("lease_kernels.cuh", "expert_stream_lease_stage_ack"),
-    "exl3_ram_miss_lease_finalize_kernel": ("lease_kernels.cuh", "expert_stream_lease_finalize"),
+    "exl3_ram_miss_lease_hit_wait_kernel": ("lease_kernels.cuh", "expert_stream_lease_hit_wait"),
     "exl3_ram_miss_lease_stream_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_stream"),
     "exl3_ram_miss_lease_copy_wait_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_copy_wait"),
 }
@@ -416,10 +304,10 @@ def test_no_other_expert_stream_kernel_uses_pdl():
     assert len(re.findall(r"\.enable_pdl\(", text)) == len(PDL_KERNELS)
 
 
-def test_the_copy_wait_is_an_arm_kernel_a_stream_wait_on_the_gate_and_a_plain_commit_kernel():
-    """The stream-ordered copy wait (LEASE_PROTOCOL.md 7.6): the PDL arm kernel, then cuStreamWaitValue32 on area C's
-    gate (GEQ open), then the commit kernel with no launch attribute. Red when the wait moves, compares against another
-    value, or the commit kernel gains PDL (a programmatic edge would let it run before the wait node ends)."""
+def test_the_copy_wait_is_cw_a_stream_wait_on_the_gate_and_a_plain_commit_kernel():
+    """CW (PDL), then cuStreamWaitValue32 on area C's gate (GEQ open), then CC with no launch attribute. Red when the
+    wait moves, compares against another value, or CC gains PDL (a programmatic edge would let it run before the wait
+    node ends)."""
     text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
     launcher = text[text.index("static void lease_copy_wait("):]
     arm = launcher.index("exl3_ram_miss_lease_copy_wait_kernel<true>")
@@ -435,7 +323,22 @@ def test_the_copy_wait_is_an_arm_kernel_a_stream_wait_on_the_gate_and_a_plain_co
     assert '"cuStreamWaitValue32_v2"' in text
 
 
-def test_the_python_side_passes_the_pdl_flag_to_exactly_the_six_chain_launchers():
+def test_cw_publishes_done_after_its_sm_reads_and_before_it_closes_the_gate():
+    """Done tells the host no kernel of the request reads a leased slot any more, so it must follow every SM read
+    (behind the block barrier and a system fence), and precede the gate close: a request whose copy wait blocks must
+    not hold its READY leases past the wait."""
+    text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
+    body = text[text.index("void exl3_ram_miss_lease_copy_wait_kernel("):]
+    body = body[: body.index("\n}\n")]
+    reads = body.index("copy_wait_read(")
+    barrier = body.index("__syncthreads();", reads)
+    fence = body.index("__threadfence_system();", barrier)
+    done = body.index("kLeaseDone")
+    close = body.index("kLeaseGateClosed")
+    assert reads < barrier < fence < done < close
+
+
+def test_the_python_side_passes_the_pdl_flag_to_exactly_the_chain_launchers():
     tree = ast.parse(Path(ram_miss.__file__).read_text())
     last_args = {}
     for node in ast.walk(tree):
@@ -459,10 +362,8 @@ class _Recorder:
 
 @pytest.mark.parametrize("lease_pdl", [False, True])
 def test_the_device_side_passes_its_pdl_flag_to_the_post_launch(lease_pdl):
-    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
-    slot_map = torch.full((2, 4), -1, dtype=torch.int32)
     kwargs = {} if not lease_pdl else {"lease_pdl": True}
-    dev = ExpertStreamDevice(page, slot_map, device="cpu", layers=2, timeout_ms=10, advise=False, **kwargs)
+    dev = _device(**kwargs)
     assert dev.lease_pdl is lease_pdl  # off unless asked for
     recorder = _Recorder()
     dev._kernels = lambda: recorder
@@ -471,43 +372,31 @@ def test_the_device_side_passes_its_pdl_flag_to_the_post_launch(lease_pdl):
     assert name == "expert_stream_post" and args[-1] == int(lease_pdl)
 
 
-# The row-table capacity word (lease block, row table, +4): written once by the host when the service is built.
-CAPACITY_WORD = "kLeaseRowTable + row * kLeaseRowTableBytes + 4"
-
-
-def test_w1_and_s_take_the_row_capacity_as_a_kernel_argument_not_from_the_pinned_row_table():
-    """W1 (lease_hit_wait_body, shared by both hit-wait kernels) and S read the capacity from their params, frozen into
-    the captured graph, instead of a host-pinned load on the critical path. Red when either reads the word again."""
-    for name in ("lease_device.cuh", "row_copy_kernels.cuh"):
-        assert CAPACITY_WORD not in (CSRC / "expert_stream" / name).read_text(), name
-    lease = (CSRC / "expert_stream" / "lease_kernels.cuh").read_text()
+def test_w1_and_s_take_the_row_capacity_as_a_kernel_argument():
+    """W1 and S bound every host slot by the capacity in their params, frozen into the captured graph."""
+    lease_src = (CSRC / "expert_stream" / "lease_kernels.cuh").read_text()
     rows = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
-    for text, params in ((lease, "HitWaitParams"), (lease, "StreamHitWaitParams"), (rows, "StreamParams")):
+    for text, params in ((lease_src, "HitWaitParams"), (rows, "StreamParams")):
         struct = text[text.index(f"struct {params} {{"):]
         assert "uint32_t row_capacity;" in struct[:struct.index("};")], params
 
 
-def test_the_device_side_passes_the_lease_layouts_row_capacity_to_the_hit_wait_launch():
-    from sglang.kernels.ops.moe import expert_lease_block as lease
-
-    layout = lease.lease_layout([5, 7])
-    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
-    slot_map = torch.full((2, 4), -1, dtype=torch.int32)
-    dev = ExpertStreamDevice(page, slot_map, device="cpu", layers=2, timeout_ms=10, advise=False,
-                             lease_block=lease.new_lease_block(layout, pin=False), lease_layout=layout)
+def test_the_device_side_passes_each_rows_capacity_to_the_hit_wait_launch():
+    dev = _device()
     recorder = _Recorder()
     dev._kernels = lambda: recorder
     a = _args()
     for row in (0, 1):
-        dev.hit_wait(row, a["planned"], a["count"], torch.zeros(6, dtype=torch.int32), 1000)
-    assert [(name, args[-1]) for name, args in recorder.calls] == [("expert_stream_lease_hit_wait", 5),
+        dev.hit_wait(row, a["planned"], a["count"], a["dst_slots"], 1000)
+    assert [(name, args[-2]) for name, args in recorder.calls] == [("expert_stream_lease_hit_wait", 5),
                                                                   ("expert_stream_lease_hit_wait", 7)]
 
 
 @pytest.mark.parametrize("name", ["exl3_ram_miss_host.cpp", "exl3_ram_miss_host_instr.cpp"])
 def test_the_exl3_host_file_is_only_bindings(name):
-    """Every export body lives once, in HostExports (expert_stream/host/ffi_exports.h); each EXL3 file (one per build)
-    only names its layout, reader and build. Red when a body grows back into one of them."""
+    """Every export body lives once, in HostExports or HostTestExports (expert_stream/host/ffi_exports.h,
+    ffi_test_exports.h); each EXL3 file (one per build) only names its layout, reader and build. Red when a body grows
+    back into one of them."""
     path = CSRC / name
     lines = path.read_text().splitlines()
     bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]

@@ -1,28 +1,25 @@
 """Piece streaming in the C++ row reader and tier (CPU): sub-reads, piece geometry, per-piece vetting, packing
 and publishing.
 
-SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM reads each part of a row as up to 4 page-aligned sub-reads and cuts the
+Piece streaming reads each part of a row as up to 4 page-aligned sub-reads and cuts the
 row's needed bytes into 8 pieces. Each piece is vetted once the sub-reads it depends on have landed, packed by its
 own job, and published by the reader's owner into the readiness words (lease area P) of the lanes that name its row,
 with a generation-checked compare-and-swap. The tier initialises those words at reservation. U1 (geometry), U2
 (order under reordered completions), U3 (a bit implies its bytes), U6 (a double publish), U8 (the publish primitive)
-and U10 (the flag off leaves the reader as it was) are the plan's names for these tests. The tier grants every lane
-at reservation, a miss lane under tag LOADING (U4), and quarantines a leased slot whose read failed instead of
-releasing it (U5, U7, U9, and the two-phase suite's T1-T4 adapted to both).
+and U10 (a sub-read's credit) are the plan's names for these tests. The service always streams pieces: it grants every
+lane at reservation, a miss lane under tag LOADING, and a read that fails aborts the process.
 """
 
+import faulthandler
 import random
 import threading
 import time
-import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 import test_exl3_ram_miss_split as split
-import test_exl3_ram_miss_two_phase as two_phase
-import test_exl3_ram_miss_two_phase_victim as two_phase_victim
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
@@ -39,11 +36,17 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script
 
 register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
-from test_exl3_ram_miss_two_phase import hang_guard, running  # noqa: E402,F401  (the reused two-phase tests' fixtures)
+
+@pytest.fixture(autouse=True)
+def hang_guard():
+    faulthandler.dump_traceback_later(120, exit=True)
+    yield
+    faulthandler.cancel_dump_traceback_later()
+
 
 PAGE = 4096
 SUB_READS = 4  # the most sub-reads a part is cut into (the C++ kSubReads)
@@ -655,31 +658,12 @@ def test_the_reader_streams_pieces_over_three_to_eight_mirror_parts(tmp_path, we
     split._assert_rows(s, 1, experts, slots)
 
 
-def _host(
-    tmp_path, *, lease_mode=True, two_phase=True, piece_stream=True, weights=(1.0, 1.0)
-):
-    """A tier as the service builds it for piece streaming: lease mode, two-phase, the flag, on row images."""
+def _host(tmp_path, *, weights=(1.0, 1.0)):
+    """A tier over row images and ``weights`` mirror parts; the service always streams pieces."""
     s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=weights, hidden=256, inter=512)
     page = new_page(pin=False)
-    host = ExpertStreamHost(
-        s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32)
-    )
-    if lease_mode:
-        host.enable_lease_mode()
-    if two_phase:
-        host.enable_two_phase()
-    if piece_stream:
-        host.enable_piece_stream()
+    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     return s, page, host, LeaseSim(host, page, s.slabs)
-
-
-def _piece_word_of(sim, req, lane):
-    return sim.read_u64(sim.layout.piece_offset + (req.idx * lease.LANES + lane) * lease.PIECE_MASK_LINE_BYTES)
-
-
-def _area_p(host):
-    start = host.lease_layout.piece_offset
-    return host.lease_block[start : start + lease.AREA_PIECE_MASK_BYTES]
 
 
 def _assert_mapped(s, host, experts):
@@ -691,76 +675,59 @@ def _assert_mapped(s, host, experts):
 
 
 def _serve(host, sim, lanes, timeout_s=5.0):
+    """Post, pump (serves), check served, Done, pump (retires)."""
     req = sim.post(1, lanes)
     assert host.pump() == 1
-    return req, sim.wait(req, timeout_s=timeout_s)
+    waited = sim.wait(req, timeout_s=timeout_s)
+    assert waited.served
+    sim.done(req)
+    host.pump()
+    return req, waited
 
 
-def test_the_tier_publishes_every_piece_of_a_read_row_into_each_lane_that_names_it(tmp_path):
+@pytest.mark.parametrize("weights", [(1.0, 1.0), (1.0, 1.0, 1.0)], ids=["two_parts", "three_parts"])
+def test_the_tier_publishes_every_piece_of_a_read_row_into_each_lane_that_names_it(tmp_path, weights):
     """Expert 3 is resident (a hit); 4 and 5 are read, and 4 is named by two lanes. Every lane that names a row read
-    ends with all eight bits under the request's generation; the hit lane's word is never written."""
-    s, page, host, sim = _host(tmp_path)
+    ends with all eight bits under the request's generation (with three parts, six with bytes and two empty); the hit
+    lane's word is never written."""
+    s, page, host, sim = _host(tmp_path, weights=weights)
     try:
+        assert s.tables.parts == len(weights)
         _serve(host, sim, [3])
         host.enable_trace()
         req, waited = _serve(host, sim, [3, 4, 5, 4])
-        assert waited.status == 1 and waited.go == 4
-        assert [_piece_word_of(sim, req, lane) for lane in range(4)] == [0] + [piece_word(req.gen, FULL)] * 3
-        (record,) = host.drain_trace()
+        assert waited.go == 4
+        assert [sim.piece_word(req, lane) for lane in range(4)] == [0] + [piece_word(req.gen, FULL)] * 3
+        (record,) = [r for r in host.drain_trace() if r["seq"] == req.seq]
         assert record["piece_stream"] == 1 and record["pieces_vetted"] == record["pieces_published"] == 2 * PIECES
-        assert record["extents"] == 2 * 2 * SUB_READS and record["piece_publish_refused"] == 0
+        extents = 2 * 2 * SUB_READS if len(weights) == 2 else 2 * 3 * 2  # rows * parts * sub-reads per part
+        assert record["extents"] == extents and record["piece_publish_refused"] == 0
         assert host.counters()["piece_publish_refused"] == 0
         _assert_mapped(s, host, [4, 5])
-        host.start_thread()
-        with pytest.raises(RuntimeError, match="before the service thread starts"):
-            host.enable_piece_stream()
     finally:
         host.stop()
-
-
-def test_a_three_root_tier_publishes_all_eight_bits_into_each_lane_that_names_a_read_row(tmp_path):
-    """The tier over three mirror parts: the same lanes as the two-part test, and every lane naming a row read ends
-    with all eight bits (six with bytes, two empty) under the request's generation; the hit lane's word is untouched."""
-    s, page, host, sim = _host(tmp_path, weights=(1.0, 1.0, 1.0))
-    try:
-        assert s.tables.parts == 3
-        _serve(host, sim, [3])
-        host.enable_trace()
-        req, waited = _serve(host, sim, [3, 4, 5, 4])
-        assert waited.status == 1 and waited.go == 4
-        assert [_piece_word_of(sim, req, lane) for lane in range(4)] == [0] + [piece_word(req.gen, FULL)] * 3
-        (record,) = host.drain_trace()
-        assert record["pieces_published"] == 2 * PIECES and record["piece_publish_refused"] == 0
-        assert record["extents"] == 2 * 3 * 2  # two rows, three parts, two sub-reads each
-        _assert_mapped(s, host, [4, 5])
-    finally:
-        host.stop()
-
-
-def _serve_threaded(sim, lanes):
-    req = sim.post(1, lanes)
-    return req, sim.wait(req, timeout_s=5.0)
 
 
 def test_the_miss_lanes_words_carry_the_generation_from_reservation_while_the_read_runs(tmp_path):
-    """The words are initialised in the reservation hold, before the hit grant, not after the read: while the read
-    is held up, the hit lane's row result is already READY and each miss lane's word is the request's generation with
-    no bit. Without that initialisation every publish would be refused (another generation) and the request fail."""
+    """The words are initialised in the reservation hold, not after the read: while the read is held up, the hit
+    lane's row result is already READY and each miss lane's word is the request's generation with no bit. Without that
+    initialisation every publish would be refused (another generation) and the process would abort."""
     s, page, host, sim = _host(tmp_path)
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
     try:
-        _, first = _serve_threaded(sim, [3])
-        assert first.status == 1
+        first = sim.post(1, [3])
+        assert sim.wait(first, timeout_s=5.0).served
+        sim.done(first)
         host.inject(delay_s=1.0)
         req = sim.post(1, [3, 4])
         seen = {}
 
         def observe():
             deadline = time.perf_counter() + 1.0
-            while time.perf_counter() < deadline and sim.row_result(req, 0)["tag"] != lease.READY:
+            while time.perf_counter() < deadline and sim.row_result(req, 0)["gen"] != req.gen:
                 time.sleep(0.001)
             seen["hit"] = sim.row_result(req, 0)["tag"]
-            seen["miss"] = _piece_word_of(sim, req, 1)
+            seen["miss"] = sim.piece_word(req, 1)
             seen["done"] = page_word(page, "demand_done")
 
         watcher = threading.Thread(target=observe)
@@ -769,421 +736,24 @@ def test_the_miss_lanes_words_carry_the_generation_from_reservation_while_the_re
         watcher.join()
         assert seen["hit"] == lease.READY and seen["done"] != req.seq  # observed inside the read's delay
         assert seen["miss"] == piece_word(req.gen)
-        assert waited.status == 1 and _piece_word_of(sim, req, 1) == piece_word(req.gen, FULL)
+        assert waited.served and sim.piece_word(req, 1) == piece_word(req.gen, FULL)
+        sim.done(req)
     finally:
         host.stop()
 
 
-def test_a_double_publish_inside_the_tier_fails_the_request_and_is_counted(tmp_path):
-    """U6 through the service: the refused publish fails the read, so the request answers failed, and the tier's
-    counter says why."""
-    s, page, host, sim = _host(tmp_path)
-    try:
+def test_a_double_publish_inside_the_tier_aborts_the_process(tmp_path):
+    """U6 through the service: the refused publish fails the read, which fails stop before demand_done."""
+    result = run_host_script(
+        tmp_path,
+        """
         host.inject_fault(publish_twice=2)
-        req, waited = _serve(host, sim, [4, 5])
-        assert waited.status == 2
-        counters = host.counters()
-        assert counters["piece_publish_refused"] == 1 and counters["read_errors"] == 1 and counters["rows_read"] == 0
-    finally:
-        host.stop()
-
-
-@pytest.mark.parametrize("lease_mode, two_phase", [(False, False), (True, False)], ids=["no_leases", "no_two_phase"])
-def test_the_tier_refuses_piece_streaming_without_two_phase_and_leases(tmp_path, lease_mode, two_phase):
-    """The service refuses the flag unless two-phase and lease mode are on; the tier refuses too, per request and
-    before any slot is taken, so a misconfigured tier reads nothing and publishes nothing."""
-    s, page, host, sim = _host(tmp_path, lease_mode=lease_mode, two_phase=two_phase)
-    try:
-        if lease_mode:
-            req, waited = _serve(host, sim, [4])
-            status = waited.status
-        else:
-            seq = ops.sim_post(page, 1, need=[4], protect=[4])
-            assert host.pump() == 1
-            status = ops.sim_wait(page, seq, timeout_s=1.0)
-        assert status == 2
-        counters = host.counters()
-        assert counters["piece_stream_refused"] == 1 and counters["rows_read"] == 0 and counters["read_errors"] == 0
-        assert host.mapping(1)[4] == -1 and all(state == 0 for state, *_ in host.slot_info(1))
-        assert not _area_p(host).any()
-    finally:
-        host.stop()
-
-
-def test_flag_off_a_lease_two_phase_tier_never_writes_the_readiness_words(tmp_path):
-    """U10 for the tier: with the flag off, hits and misses are served as before and area P stays all zero."""
-    s, page, host, sim = _host(tmp_path, piece_stream=False)
-    try:
-        for lanes in ([3], [3, 4, 5], [4, 0]):
-            _, waited = _serve(host, sim, lanes)
-            assert waited.status == 1
-        counters = host.counters()
-        assert counters["piece_stream_refused"] == counters["piece_publish_refused"] == 0
-        assert not _area_p(host).any()
-        _assert_mapped(s, host, [3, 4, 5, 0])
-    finally:
-        host.stop()
-
-
-# ---- The loading grant (U4), quarantine (U5, U9) and a void while reading (U7) ----
-
-FREE, LOADING_SLOT, READY_SLOT, QUARANTINE = 0, 1, 2, 3
-GEN_BITS = (1 << 56) - 1
-
-
-def _slot(host, row, slot):
-    state, expert, leases, _ = host.slot_info(row)[slot]
-    return state, expert, leases
-
-
-def _accept(sim, req):
-    """The stream kernel's verdict on a request whose status is already known served, without sim_wait (which
-    returns "fatal already raised" once any request of the page has failed): every lane's row result names this
-    request and its expert, READY, or LOADING with every piece published."""
-    ctx = []
-    for lane, expert in enumerate(req.lanes):
-        result = sim.row_result(req, lane)
-        assert result["gen"] == req.gen and result["expert"] == expert, (lane, result)
-        assert result["tag"] == lease.READY or (
-            result["tag"] == lease.LOADING and sim.piece_word(req, lane) == piece_word(req.gen, FULL)
-        ), (lane, result, hex(sim.piece_word(req, lane)))
-        ctx.append((result["host_slot"], result["slot_generation"]))
-    return types.SimpleNamespace(status=1, go=len(req.lanes), ctx=ctx)
-
-
-def _pump_until_done(host, page, req):
-    assert host.pump() == 1
-    assert page_word(page, "demand_done") == req.seq
-
-
-def test_u4_miss_lanes_are_granted_loading_and_hit_lanes_ready_before_the_read(tmp_path):
-    """U4. While the read is held up, the hit lane's row result is READY and each miss lane's is LOADING with its
-    final payload (this request's generation, its expert, the slot reserved for it and that slot's generation); the
-    miss slots are leased while still kLoading, and the ring entry owes no further grant. A tight observer reads each
-    miss lane as the stream kernel will -- the ready word, then its PieceMask word -- and requires that the mask
-    carries this generation by the time the LOADING word is observed. It cannot detect an initialisation that lands
-    after the ready word but before the observer's next read; that ordering rests on inspection. After
-    the read the miss lanes are still LOADING: there is no second grant.
-
-    Mutants: grant the miss lanes after the read (today's S3) -- red on the LOADING tags; grant a miss lane READY --
-    red on the tag; drop the PieceMask init (task 3's no_mask_init) -- red on the mask check and on the result."""
-    s, page, host, sim = _host(tmp_path)
-    host.start_thread(fatal_wait_s=60.0, spin_us=200)
-    try:
-        _, first = _serve_threaded(sim, [3])
-        assert first.status == 1
-        host.inject(delay_s=1.0)
-        req = sim.post(1, [3, 4, 5, 4])
-        seen, torn, looks = {}, [], [0]
-
-        def observe():
-            deadline = time.perf_counter() + 1.0
-            while time.perf_counter() < deadline and sim.row_result(req, 0)["tag"] != lease.READY:
-                pass
-            seen["results"] = [sim.row_result(req, lane) for lane in range(4)]
-            seen["slots"] = host.slot_info(1)
-            seen["entry"] = host.lease_entry(req.idx)
-            seen["done"] = page_word(page, "demand_done")
-            while page_word(page, "demand_done") != req.seq and time.perf_counter() < deadline + 10.0:
-                for lane in (1, 2, 3):
-                    result = sim.row_result(req, lane)
-                    word = sim.piece_word(req, lane)  # read after the ready word, as the device does
-                    if result["tag"] == lease.LOADING and result["gen"] == req.gen:
-                        looks[0] += 1
-                        if word >> 8 != req.gen & GEN_BITS:
-                            torn.append((lane, hex(word)))
-
-        watcher = threading.Thread(target=observe)
-        watcher.start()
-        waited = sim.wait(req, timeout_s=10.0)
-        watcher.join()
-
-        assert seen["done"] != req.seq, "demand_done had reached the request: the read was not still running"
-        results, slots = seen["results"], seen["slots"]
-        assert results[0]["tag"] == lease.READY and results[0]["gen"] == req.gen and results[0]["expert"] == 3
-        for lane, expert in ((1, 4), (2, 5), (3, 4)):
-            result = results[lane]
-            assert result["tag"] == lease.LOADING and result["gen"] == req.gen and result["expert"] == expert, result
-            state, owner, leases, generation = slots[result["host_slot"]]
-            assert (state, owner, generation) == (LOADING_SLOT, expert, result["slot_generation"]), (lane, result)
-            assert leases == (2 if expert == 4 else 1), "the miss slot was not leased when its row result was published"
-        entry = seen["entry"]
-        assert entry["active"] and not entry["grants_pending"], "the loading grant left a second grant owed"
-        assert entry["lane_state"][:4] == [1] * 4 and entry["gen"] == req.gen
-        assert looks[0] > 0 and not torn, f"a LOADING ready word was visible over an uninitialised PieceMask: {torn}"
-
-        assert waited.status == 1 and waited.go == 4
-        assert [sim.row_result(req, lane)["tag"] for lane in range(4)] == [lease.READY] + [lease.LOADING] * 3
-        counters = host.counters()
-        assert counters["hit_leases_granted"] == 1 and counters["leases_granted"] == 1 + 4
-        assert counters["slots_quarantined"] == 0
-    finally:
-        host.stop()
-
-
-def test_u5_a_failed_read_after_a_partial_publish_quarantines_its_leased_slots(tmp_path):
-    """U5. Sub-read 3 of part 1 of row 1 (expert 1) fails. Both miss slots are leased under LOADING, so neither is
-    released: each is kQuarantine with its lease and no expert, and the map never names it. The quarantined slots
-    are neither free, evictable nor leased victims; a later request never lands on one, even when it must evict to
-    find a slot. The terminal that voids the failed request's lanes frees them.
-
-    Mutant M4: release a still-loading slot on a failed read -- red on state == kQuarantine (release_locked does not
-    touch leases, so no underflow fires)."""
-    s, page, host, sim = _host(tmp_path)
-    try:
-        host.inject_fault(part=1, sub=3, ordinal=1, part_error=5)  # EIO
-        failed = sim.post(1, [4, 1])
-        _pump_until_done(host, page, failed)
-        counters = host.counters()
-        assert counters["read_errors"] == 1 and counters["rows_read"] == 0 and counters["slots_quarantined"] == 2
-        quarantined = []
-        for lane, expert in enumerate(failed.lanes):
-            result = sim.row_result(failed, lane)
-            assert result["tag"] == lease.LOADING and result["gen"] == failed.gen
-            slot = result["host_slot"]
-            assert _slot(host, 1, slot) == (QUARANTINE, -1, 1), (lane, host.slot_info(1))
-            assert host.slot_to_expert(1)[slot] == -1 and host.mapping(1)[expert] == -1
-            assert not host.contains(1, expert)
-            quarantined.append(slot)
-        word = sim.piece_word(failed, 1)
-        assert word >> 8 == failed.gen & GEN_BITS and word & FULL != FULL, hex(word)  # the failed row: not every piece
-        assert host.victim_census(1, []) == (2, 0, 0), "a quarantined slot was counted as a victim or as leased"
-
-        host.inject_fault()
-        again = sim.post(1, [1, 5])  # the failed expert again, and another
-        _pump_until_done(host, page, again)
-        mapping = host.mapping(1)
-        assert mapping[1] not in quarantined and mapping[5] not in quarantined and -1 not in (mapping[1], mapping[5])
-        _assert_mapped(s, host, [1, 5])
-        sim.ack(again, _accept(sim, again))
-        sim.deliver()
-        host.pump()  # idle: retires the acknowledgements
-        assert all(leases == 0 for _, e, leases, _ in host.slot_info(1) if e in (1, 5))
-
-        pressed = sim.post(1, [0])  # no free slot left: it must evict, and may evict only 1 or 5
-        _pump_until_done(host, page, pressed)
-        assert host.mapping(1)[0] not in quarantined and host.counters()["evictions"] == 1
-        assert [_slot(host, 1, slot) for slot in quarantined] == [(QUARANTINE, -1, 1)] * 2
-
-        sim.terminal(failed, mask=0b11)  # the device voids the failed request's lanes
-        sim.deliver()
+        sim.post(1, [4, 5])
         host.pump()
-        assert [_slot(host, 1, slot) for slot in quarantined] == [(FREE, -1, 0)] * 2
-        assert host.counters()["leases_voided"] == 2 and host.counters()["lease_double_signal"] == 0
-        assert sim.wait(failed, publish_terminal=False).status == 2
-    finally:
-        host.stop()
-
-
-def test_u9_voiding_a_quarantined_slot_leaves_its_expert_where_it_was_read_again(tmp_path):
-    """U9. Expert 1 fails into slot s (quarantined); the next request reads it into slot t. Voiding s must free s
-    and leave expert 1 mapped at t: in the tier, in slot_to_expert and in the published slot map.
-
-    Mutant M4b: clear only expert_slot on entry, keeping slot_to_expert[s] -- the release then unmaps expert 1 from t.
-    """
-    s, page, host, sim = _host(tmp_path)
-    try:
-        host.inject_fault(part=0, sub=0, ordinal=0, part_error=5)
-        failed = sim.post(1, [1])
-        _pump_until_done(host, page, failed)
-        quarantined = sim.row_result(failed, 0)["host_slot"]
-        state, _, leases = _slot(host, 1, quarantined)  # its expert field is U5's check; this test is the consequence
-        assert (state, leases) == (QUARANTINE, 1)
-
-        host.inject_fault()
-        again = sim.post(1, [1])
-        _pump_until_done(host, page, again)
-        t = host.mapping(1)[1]
-        assert t >= 0 and t != quarantined
-        sim.ack(again, _accept(sim, again))
-
-        sim.terminal(failed, mask=1)
-        sim.deliver()
-        host.pump()
-        assert _slot(host, 1, quarantined) == (FREE, -1, 0)
-        assert host.mapping(1)[1] == t and host.slot_to_expert(1)[t] == 1 and host.contains(1, 1)
-        assert _slot(host, 1, t) == (READY_SLOT, 1, 0)
-        assert int(host.slot_map[1, 1]) == t, "the published slot map lost the expert's new slot"
-        _assert_mapped(s, host, [1])
-    finally:
-        host.stop()
-
-
-@pytest.mark.parametrize("fails", [False, True], ids=["read_succeeds", "read_fails"])
-def test_u7_a_lane_voided_while_its_row_is_read_leaves_the_slot_loading_until_the_read_ends(tmp_path, fails):
-    """U7. The device gives up on a request (its terminal voids the miss lane) while the row is still being read.
-    The lease is retired from inside read(), but the slot stays kLoading -- the workers are still writing it -- and
-    only the post-read step decides it: READY and mapped when the read succeeded, FREE (not quarantined: nothing
-    leases it) when it failed.
-
-    The read is held open by a gate, not a delay: the hold_until_probe_ms fault keeps pieces 1..7 unpublished (so the
-    read cannot end) until the request's StreamProbe word reads tagged(1, gen), which the test stores only after it
-    has seen the void retired. The read's drain loop keeps calling retire_leases() while it holds. A pack delay
-    raced instead: the owner retires only between publish passes, so a pass that found every piece already landed
-    left the void to the read's last turn, microseconds before demand_done."""
-    s, page, host, sim = _host(tmp_path)
-    host.inject_fault(hold_until_probe_ms=600_000, publish_twice=3 if fails else 0)
-    host.start_thread(fatal_wait_s=60.0, spin_us=200)
-    req = None
-
-    def release():  # the stream kernel's probe, tagged(1, gen): the reader may publish the held pieces
-        probe = sim.layout.d_offset + lease.STREAM_PROBE + req.idx * lease.STREAM_PROBE_BYTES
-        sim.write_u64(probe, lease.tagged(lease.STREAM_PROBE_TAG, req.gen))
-
-    try:
-        req = sim.post(1, [4])
-        assert two_phase._until(lambda: sim.row_result(req, 0)["tag"] == lease.LOADING)
-        slot = sim.row_result(req, 0)["host_slot"]
-        sim.terminal(req, mask=1)
-        sim.deliver()
-        seen = {}
-
-        def voided():
-            state, _, leases = _slot(host, 1, slot)
-            seen.update(state=state, leases=leases, done=page_word(page, "demand_done"))
-            return leases == 0
-
-        assert two_phase._until(voided, timeout_s=10.0)
-        assert seen["done"] != req.seq, "the read had ended before the void was retired"
-        assert seen["state"] == LOADING_SLOT, "a voided slot left kLoading while its row was still being read"
-        release()
-        assert two_phase._until(lambda: page_word(page, "demand_done") == req.seq, timeout_s=20.0)
-        counters = host.counters()
-        assert counters["leases_voided"] == 1 and counters["slots_quarantined"] == 0
-        if fails:
-            assert counters["piece_publish_refused"] == 1
-            assert _slot(host, 1, slot) == (FREE, -1, 0) and host.mapping(1)[4] == -1
-        else:
-            assert _slot(host, 1, slot) == (READY_SLOT, 4, 0) and host.mapping(1)[4] == slot
-            _assert_mapped(s, host, [4])
-    finally:
-        if req is not None:
-            release()  # a failed assertion must not leave the service thread held until the hold times out
-        host.stop()
-
-
-# ---- The two-phase suite's T1-T4, adapted to the loading grant (plan section 6) ----
-
-
-def test_t4_a_failed_request_voids_its_leases_and_quarantines_its_miss_slot(piece_streaming_hosts, running):
-    """T4 and T4b under piece streaming. The miss lane is now leased at reservation, so the failure path holds a
-    miss lease too: its slot goes to kQuarantine (never released), and the hit slot keeps its row and lease. Neither
-    slot is handed to the next request. The device's terminal retires both leases; the quarantined slot is then free.
-    """
-    s, page, host, sim = running
-    hit_slot = two_phase._make_resident(host, sim, 0, 3)
-    host.inject(fail_reads=True)
-    req = sim.post(0, [3, 4])
-    assert two_phase._until(lambda: page_word(page, "demand_done") == req.seq, timeout_s=10.0)
-    miss = sim.row_result(req, 1)
-    assert miss["tag"] == lease.LOADING and miss["gen"] == req.gen
-    miss_slot = miss["host_slot"]
-    assert two_phase._until(lambda: _slot(host, 0, miss_slot)[0] == QUARANTINE)
-    assert _slot(host, 0, hit_slot) == (READY_SLOT, 3, 1), "the failed request released or corrupted the hit slot"
-    assert _slot(host, 0, miss_slot) == (QUARANTINE, -1, 1), "the leased miss slot was released, not quarantined"
-    assert host.mapping(0)[4] == -1
-
-    host.inject(fail_reads=False)
-    sim.post(0, [5])
-    assert two_phase._until(lambda: any(st == READY_SLOT and e == 5 for st, e, _, _ in host.slot_info(0)), timeout_s=10.0)
-    assert two_phase._slot_of(host, 0, 5) not in (hit_slot, miss_slot), "a leased slot was handed to the next request"
-
-    sim.terminal(req, mask=0b11)
-    sim.deliver()
-    assert two_phase._until(lambda: _slot(host, 0, miss_slot) == (FREE, -1, 0))
-    assert _slot(host, 0, hit_slot) == (READY_SLOT, 3, 0)
-    counters = host.counters()
-    assert counters["leases_voided"] >= 2 and counters["lease_double_signal"] == 0
-    assert counters["slots_quarantined"] == 1
-
-
-def test_t4c_the_loading_grant_leaves_no_grant_pending(piece_streaming_hosts, running):
-    """T4c is not applicable under piece streaming: every lane is granted in the reservation hold, so no grant is
-    owed across the read. The entry opens with grants_pending false and every lane granted, and retirement driven
-    from the test thread during the read disturbs nothing."""
-    s, page, host, sim = running
-    two_phase._make_resident(host, sim, 0, 3)
-    host.inject(delay_s=two_phase.READ_DELAY_S)
-    req = sim.post(0, [3, 4])
-    assert two_phase._until(lambda: sim.row_result(req, 1)["tag"] == lease.LOADING, timeout_s=two_phase.READ_DELAY_S)
-    entry = host.lease_entry(req.idx)
-    for _ in range(20):
-        sim.deliver()
-        time.sleep(0.005)
-    assert page_word(page, "demand_done") != req.seq
-    assert entry["active"] and not entry["grants_pending"] and entry["lane_state"][:2] == [1, 1]
-    waited = sim.wait(req, timeout_s=two_phase.READ_DELAY_S + 10.0)
-    assert waited.status == 1 and waited.go == 2
-    assert host.counters()["leases_granted"] == 3 and host.counters()["lease_double_signal"] == 0
-
-
-def test_flag_off_the_tier_grants_miss_lanes_after_the_read_and_releases_a_failed_read(tmp_path):
-    """Flag-off identity for the grant, retire, post-read and release: the miss lane is ungranted (tag 0, lease 0,
-    grant pending) while the read runs, granted READY after it, and a failed read releases its miss slot to FREE
-    with nothing quarantined and no miss lease."""
-    s, page, host, sim = _host(tmp_path, piece_stream=False)
-    host.start_thread(fatal_wait_s=60.0, spin_us=200)
-    try:
-        _, first = _serve_threaded(sim, [3])
-        assert first.status == 1
-        host.inject(delay_s=0.5)
-        req = sim.post(1, [3, 4])
-        assert two_phase._until(lambda: sim.row_result(req, 0)["tag"] == lease.READY, timeout_s=0.5)
-        entry, miss = host.lease_entry(req.idx), sim.row_result(req, 1)
-        loading = [slot for slot, (st, e, _, _) in enumerate(host.slot_info(1)) if st == LOADING_SLOT and e == 4]
-        assert entry["grants_pending"] and entry["lane_state"][:2] == [1, 0] and miss["tag"] == 0
-        assert len(loading) == 1 and _slot(host, 1, loading[0]) == (LOADING_SLOT, 4, 0)
-        waited = sim.wait(req, timeout_s=10.0)
-        assert waited.status == 1 and sim.row_result(req, 1)["tag"] == lease.READY
-        assert not host.lease_entry(req.idx)["grants_pending"]
-
-        host.inject(delay_s=0.0, fail_reads=True)
-        failed = sim.post(1, [3, 5])
-        assert two_phase._until(lambda: page_word(page, "demand_done") == failed.seq)
-        assert sim.row_result(failed, 1)["tag"] == 0 and host.mapping(1)[5] == -1
-        assert all(state != QUARANTINE and (e != 5 or state == FREE) for state, e, _, _ in host.slot_info(1))
-        counters = host.counters()
-        assert counters["slots_quarantined"] == 0 and counters["hit_leases_granted"] == 2
-        assert not _area_p(host).any()
-    finally:
-        host.stop()
-
-
-# ---- The two-phase suite, served with the flag on ----
-# Its tests drive a lease-mode, two-phase tier through the Python device stand-in; here every host they build packs
-# streams pieces, so each grant and release rule they check is checked with publishing in the read.
-
-
-@pytest.fixture
-def piece_streaming_hosts(monkeypatch):
-    init = ExpertStreamHost.__init__
-
-    def with_pieces(self, *args, **kwargs):
-        init(self, *args, **kwargs)
-        self.enable_piece_stream()
-
-    monkeypatch.setattr(ExpertStreamHost, "__init__", with_pieces)
-
-
-# Replaced above by their adaptations to the loading grant: T1 asserts the miss lane is unpublished (tag 0) during
-# the read, where it is now LOADING (U4 is its adaptation); T4c tests a pending second grant that no longer exists.
-# T1b, T4b and T3 hold unchanged; T4 does too, and its quarantine adaptation is test_t4_... above.
-_NOT_REUSED = {
-    "test_a_resident_lane_is_published_before_read_returns",
-    "test_an_ungranted_lane_keeps_the_ring_entry_open",
-}
-
-
-def _reuse_two_phase():
-    for module in (two_phase, two_phase_victim):
-        for name, test in vars(module).items():
-            if name.startswith("test_") and callable(test) and name not in _NOT_REUSED:
-                clone = types.FunctionType(test.__code__, test.__globals__, name, test.__defaults__, test.__closure__)
-                clone.__dict__.update(test.__dict__)
-                globals()[f"{name}_with_piece_streaming"] = pytest.mark.usefixtures("piece_streaming_hosts")(clone)
-
-
-_reuse_two_phase()
+        print("reached")
+        """,
+    )
+    assert_aborted(result, "the read failed")
 
 
 if __name__ == "__main__":

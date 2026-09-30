@@ -50,6 +50,7 @@ def run_fused_case(
     prefetch_expert: int = -1,
     prefetch_count: int = 0,
     outcome_counters: torch.Tensor | None = None,
+    miss_keys: torch.Tensor | None = None,
 ) -> SimpleNamespace:
     """Allocate stable outputs/counters and run the kernel."""
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
@@ -85,6 +86,7 @@ def run_fused_case(
         prefetch_count_tensor,
         0,
         outcome_counters,
+        miss_keys,
     )
     return SimpleNamespace(
         source_rows=source_rows_out,
@@ -515,6 +517,122 @@ def test_prefetch_covered_lane_capture_replays_with_a_changed_prediction():
         torch.testing.assert_close(source_rows_out, oracle.source_rows)
         torch.testing.assert_close(remap_out, oracle.remap)
         assert int(count_out.item()) == int(oracle.miss_plan_rows)
+
+
+def _assert_sorted_plan(ids, expert_to_slot, scratch_base, keys, result, unsorted):
+    """The torch oracle of the sorted miss order: residual rows by (key descending, lane), every route's remap names
+    its own expert's row, and everything outside the residual rows is exactly the unsorted plan's."""
+    misses = [lane for lane in range(ids.numel()) if int(expert_to_slot[ids[lane]]) < 0]
+    order = sorted(misses, key=lambda lane: (-int(keys[ids[lane]]), lane))
+    count = len(misses)
+    assert int(result.count.item()) == count == int(unsorted.count.item())
+    assert result.source_rows[:count].tolist() == [int(ids[lane]) for lane in order]
+    assert result.slots[:count].tolist() == [scratch_base + p for p in range(count)]
+    assert torch.equal(result.source_rows[count:], unsorted.source_rows[count:])
+    assert torch.equal(result.slots[count:], unsorted.slots[count:])
+    for lane in range(ids.numel()):
+        remap = int(result.remap[lane])
+        if lane in misses:
+            assert int(result.source_rows[remap - scratch_base]) == int(ids[lane])
+        else:
+            assert remap == int(unsorted.remap[lane])
+    for name in ("graph_counters", "graph_unique_counters", "route_counts"):
+        assert torch.equal(getattr(result, name), getattr(unsorted, name))
+
+
+def test_miss_keys_none_is_the_unsorted_plan():
+    """Without keys, misses come in first-appearance order: the reference plan_graph_routes computes."""
+    for seed in range(50):
+        rng = random.Random(seed)
+        ids = torch.tensor(rng.sample(range(EXPERTS), rng.randint(1, 32)), device="cuda", dtype=torch.int64)
+        resident = rng.sample(range(EXPERTS), rng.randint(0, EXPERTS // 2))
+        assert_matches_reference(ids, resident, scratch_base=len(resident))
+
+
+def test_miss_keys_worked_case():
+    """Routes 5, 2 (hit), 9, 1 (hit); key(9) > key(5), so 9 takes the first scratch row."""
+    ids = torch.tensor([5, 2, 9, 1], device="cuda", dtype=torch.int64)
+    expert_to_slot = _expert_to_slot([])
+    expert_to_slot[2], expert_to_slot[1] = 7, 3
+    keys = torch.zeros(EXPERTS, dtype=torch.int64, device="cuda")
+    keys[5], keys[9] = 1, 2
+    result = run_fused_case(ids, expert_to_slot, scratch_base=10, miss_keys=keys)
+    assert result.source_rows.tolist() == [9, 5, 2, 1]
+    assert result.slots.tolist() == [10, 11, 7, 3]
+    assert result.remap.tolist() == [11, 7, 10, 3]
+    assert int(result.count.item()) == 2
+
+
+@pytest.mark.parametrize("seed", range(100))
+def test_miss_keys_sort_the_residual_rows_descending(seed):
+    rng = random.Random(seed)
+    top_k = rng.randint(1, 32)
+    ids = torch.tensor(rng.sample(range(EXPERTS), top_k), device="cuda", dtype=torch.int64)
+    resident = rng.sample(range(EXPERTS), rng.randint(0, EXPERTS // 2))
+    expert_to_slot = _expert_to_slot(resident)
+    # A narrow range on odd seeds, so ties (broken by lane) occur; the full int64 range on even ones.
+    high = 4 if seed % 2 else 1 << 62
+    keys = torch.tensor([rng.randrange(-high, high) for _ in range(EXPERTS)], dtype=torch.int64, device="cuda")
+    unsorted = run_fused_case(ids, expert_to_slot, scratch_base=len(resident))
+    for remap_dtype in (torch.int32, torch.int64):
+        result = run_fused_case(ids, expert_to_slot, len(resident), remap_dtype=remap_dtype, miss_keys=keys)
+        _assert_sorted_plan(ids, expert_to_slot, len(resident), keys, result, unsorted)
+
+
+def test_miss_keys_are_checked():
+    ids = torch.tensor([5, 2], device="cuda", dtype=torch.int64)
+    expert_to_slot = _expert_to_slot([])
+    for bad, match in (
+        (torch.zeros(EXPERTS, dtype=torch.int32, device="cuda"), "int64"),
+        (torch.zeros(EXPERTS - 1, dtype=torch.int64, device="cuda"), "one entry per expert"),
+        (torch.zeros((2, EXPERTS), dtype=torch.int64, device="cuda")[:, 0], "contiguous"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            run_fused_case(ids, expert_to_slot, scratch_base=0, miss_keys=bad)
+
+
+def test_miss_keys_capture_and_replay_after_an_in_place_key_change():
+    from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
+
+    device = "cuda"
+    ids = torch.tensor([5, 2, 9, 1, 30, 17], dtype=torch.int64, device=device)
+    expert_to_slot = _expert_to_slot([2, 17])
+    keys = torch.arange(EXPERTS, dtype=torch.int64, device=device)
+    scratch_base = 2
+    out = SimpleNamespace(
+        source_rows=torch.full((6,), -1, dtype=torch.int64, device=device),
+        slots=torch.full((6,), -1, dtype=torch.int32, device=device),
+        count=torch.full((1,), -1, dtype=torch.int32, device=device),
+        remap=torch.full((6,), -1, dtype=torch.int64, device=device),
+        graph_counters=torch.zeros(2, dtype=torch.int64, device=device),
+        graph_unique_counters=torch.zeros(2, dtype=torch.int64, device=device),
+        route_counts=torch.zeros(EXPERTS, dtype=torch.float32, device=device),
+    )
+    prefetch_expert = torch.zeros(1, dtype=torch.int64, device=device)
+    prefetch_count = torch.zeros(1, dtype=torch.int32, device=device)
+
+    def run():
+        plan_unique_routes_cuda(
+            ids, expert_to_slot, scratch_base, out.source_rows, out.slots, out.count, out.remap,
+            out.graph_counters, out.graph_unique_counters, out.route_counts, prefetch_expert, prefetch_count, 0,
+            None, keys,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    unsorted = run_fused_case(ids, expert_to_slot, scratch_base)
+    shuffled = torch.randperm(EXPERTS, generator=torch.Generator().manual_seed(3))
+    for replay_keys in (torch.arange(EXPERTS), -torch.arange(EXPERTS), shuffled):
+        keys.copy_(replay_keys.to(device))
+        for name in ("graph_counters", "graph_unique_counters", "route_counts"):
+            getattr(out, name).zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_sorted_plan(ids, expert_to_slot, scratch_base, keys, out, unsorted)
 
 
 def test_gate_refuses_multi_token_calls_even_when_shape_would_otherwise_qualify():
