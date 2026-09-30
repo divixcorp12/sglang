@@ -446,3 +446,61 @@ arms before reading ms/token.
 - GPU (manual): `test_exl3_moe_split_parity_cuda.py` has a bitwise zero-partial equivalence, partial seeding, and the
   real CPU kernel end to end over real rows. `test_exl3_lease_kernels_cuda.py` has the post staging.
   `test_layer_fusion_launcher_checks_gpu.py` has the refusals.
+
+## P2 results, partial (2026-09-29, `d87a3ff24f`, divix01)
+
+The run was cut short at the owner's request, before tuning. Every arm used the production recipe
+(`benchmarks/dsv41_baseline/arm_env.py`) with `SGLANG_DSV41_CPU_EXPERTS=1 SGLANG_DSV41_CPU_EXPERTS_CORES=18-29`
+(12 node-1 threads) and the default split `k*(n) = [0, 1, 1, 2, 3, 3, 4, 5, 5]`. Raw results are on divix01, not in
+the repo:
+
+- A/B arms: `cc-expert-prediction/dsv41-cpu-experts/kstar/`
+- Quality and trace: `/mnt/nvme1/cpu-b/p2/`
+
+**Smoke.** The launch serves with sane greedy output at ~13.2-14.0 tok/s steady (~74 ms/token). There is one CPU
+worker on each of cores 18-29, and the expert thread is pinned there, although the server runs under a node-0
+taskset. It shuts down cleanly.
+
+**Throughput, paired A/B (off vs k\*).** Four arms of each, eight paired sessions:
+- median decode goes from 9.51 to **13.48 tok/s**, a **1.40x** ratio (per session 1.34-1.47x);
+- k\* wins **8 of 8** sessions, sign test p = 0.0039;
+- TTFT is unchanged (~7.2-8.2 s in both arms).
+
+Every arm's verdict is "valid except the acknowledged step-latency gap", and the servers' `/proc` environ confirms
+the `wt-cpu-b` PYTHONPATH. Result file: `kstar/paired-off-vs-kstar.json`.
+
+**Measured CPU cost.** 0.61-0.66 ms per lane under load, across all on arms and the quality run. That is above the
+configured `SGLANG_DSV41_CPU_EXPERTS_CPU_MS=0.52` and the P0 native figure (~0.53 ms). A split rebuilt from the
+measured cost would move `k*` slightly toward the GPU. This is not tuned yet (P3 `retune`).
+
+**Hot hit rate** (one traced off/on pair, ~820 steps each):
+
+| arm | hot hit | VRAM misses/step | NVMe rows/step |
+|---|---|---|---|
+| off | 0.644 | 85.5 | 18.0 |
+| on | 0.593 | 97.8 | 17.5 |
+
+The residency caveat above shows up as predicted. CPU lanes are never inserted into VRAM, so the hot set loses
+about 5 points of hit rate. The step still gets 1.40x faster. §4 item 5 (P3) should recover part of the loss.
+
+**Quality gate** (16 prompts, greedy, top-5 logprobs; `scripts/dsv41/cpu_experts_quality.py`):
+
+| comparison | greedy match | flips | E31 | KL mean / max (shared prefix) | chosen-logprob Δ mean / max |
+|---|---|---|---|---|---|
+| off vs on | 0.6875 (11/16) | 5 | **fail** | 0.0018 / 0.182 | 0.012 / 0.541 |
+| off vs off (noise floor) | 0.8125 (13/16) | 3 | pass | 0.0012 / 0.101 | 0.008 / 0.534 |
+
+- **Four of the five flips** start at a near-tie (top-2 margin ≤ 0.375 nats) in one of the two runs.
+- **The failing flip** is prompt 3 (`cfq-train-Double_BKR/2017/page_47.pdf`) at position 31: `' /'` vs `' per'`,
+  with a margin of 0.75 nats off and 0.5 nats on.
+- **Against the noise floor:** off-vs-off already flips 3 of 16 prompts, and CPU experts add two more flips and
+  about 1.5x the mean KL. The shift is small but real, which is expected from fp16 CPU accumulation against the
+  GPU kernel's order.
+
+This is not decided. E31 as pre-registered fails on one flip; the owner judges whether KL 0.0018 mean is acceptable.
+
+**Not done:**
+- The cap-2 arms (`SPLIT` capped at 2). Four on-arm runs are in `cap2/`, killed before they were paired.
+- Split tuning from the measured cost.
+- Repeat or longer A/B runs.
+- A quality run at a second split.
