@@ -80,7 +80,6 @@ def test_a_gather_wider_than_the_lanes_is_refused_before_anything_is_built(tiers
     assert not hasattr(streamers[1].row_backend, "device_side")  # the layer keeps its previous backend
 
 
-
 def test_cpu_experts_refuse_a_manager_without_direct_residency(tiers):
     """The miss order CPU experts rely on is DIRECT's victim ranking; without the updater there is none to sort by."""
     service, streamers = tiers
@@ -99,6 +98,87 @@ def test_cpu_experts_refuse_the_generic_route_plan():
     with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"), envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False):
         with pytest.raises(RuntimeError, match="needs SGLANG_MOE_EXPERT_FUSED_PLAN"):
             module.Exl3RamMissService._start_cpu_experts(cfg, None, None, {}, False)
+
+
+class _DirectUpdater:
+    """The DIRECT updater surface attach reads; ``enable_miss_order`` allocates the keys as the real one does."""
+
+    insert_direct = True
+    device = torch.device("cpu")
+    layer_ids = list(range(LAYERS))
+
+    def __init__(self):
+        self.slot_to_expert = torch.full((LAYERS, CAPACITY + 1), -1, dtype=torch.int64)
+        self.caches = [SimpleNamespace(capacity=CAPACITY) for _ in range(LAYERS)]
+        self.miss_keys = None
+
+    def enable_miss_order(self):
+        self.miss_keys = torch.zeros((LAYERS, EXPERTS), dtype=torch.int64)
+
+
+def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(tiers, monkeypatch):
+    """Production wiring: the first attach turns the updater's miss order on, and each pinned-tier layer's fused plan
+    sorts by that layer's own row of it (a view, so each ranking's keys reach the captured plan)."""
+    service, streamers = tiers
+    service.ensure_started()
+    built = []
+    monkeypatch.setattr(
+        module, "Exl3RamMissRowBackend", lambda *args, **kwargs: built.append(kwargs) or SimpleNamespace()
+    )
+    service.cpu_experts = SimpleNamespace(
+        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32)
+    )
+    updater = _DirectUpdater()
+    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater)
+    try:
+        for layer_id, streamer in streamers.items():
+            streamer._graph_pinned_tier = True
+            streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
+            streamer.graph_gather_rows = 1
+            streamer.residency_row = LAYERS - 1 - layer_id  # not the service's row: the keys follow the updater's
+            streamer.row_backend = SimpleNamespace(
+                segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64)
+            )
+            service.attach(manager, streamer)
+    finally:
+        service.cpu_experts = None
+    assert updater.miss_keys is not None
+    for streamer in streamers.values():
+        keys = streamer._plan_miss_keys
+        assert keys.data_ptr() == updater.miss_keys[streamer.residency_row].data_ptr()
+        assert keys.shape == (EXPERTS,)
+    assert [kwargs["streamer_of"]() for kwargs in built] == list(streamers.values())
+
+
+class _CapturedPlan:
+    expert_ids = torch.tensor([2], dtype=torch.int64)
+    count = torch.ones(1, dtype=torch.int32)
+    slots = torch.zeros(1, dtype=torch.int32)
+
+
+def test_a_captured_cpu_expert_gather_without_the_miss_order_is_refused(monkeypatch):
+    """enable_graph_gather resets a layer's keys; a capture after that would sort nothing, so the post refuses it."""
+    posted = []
+    side = SimpleNamespace(post=lambda *args, **kwargs: posted.append(args))
+    streamer = SimpleNamespace(_plan_miss_keys=None)
+    backend = module.Exl3RamMissRowBackend(
+        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), side, 0, 1, {0: None},
+        copy_engine=True, cpu_experts=True, streamer_of=lambda: streamer,
+    )
+    backend.cpu_input = (torch.zeros(1, 16), torch.ones(1, 1))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="row 0's route plan has no miss order"):
+        backend.post(0, _CapturedPlan())
+    assert not posted
+
+
+def test_cpu_experts_backend_needs_its_streamer():
+    with pytest.raises(ValueError, match="pass streamer_of"):
+        module.Exl3RamMissRowBackend(
+            {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, 1, {0: None},
+            copy_engine=True, cpu_experts=True,
+        )
+
 
 if __name__ == "__main__":
     import sys

@@ -395,6 +395,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         copy_engine: bool = False,
         copy_sm_table: Optional[torch.Tensor] = None,
         cpu_experts: bool = False,
+        streamer_of: Optional[Callable[[], object]] = None,
     ) -> None:
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
@@ -418,8 +419,11 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         # (x, the routes' weights), around each gather; the post stages it for the CPU expert thread.
         if cpu_experts and not copy_engine:
             raise ValueError("CPU experts are completed by the copy engine's copy wait")
+        if cpu_experts and streamer_of is None:
+            raise ValueError("CPU experts check the layer's miss order at capture: pass streamer_of")
         self.cpu_experts = cpu_experts
         self.cpu_input = None
+        self.streamer_of = streamer_of
         self._delivered: Optional[torch.Tensor] = None
 
     @property
@@ -449,6 +453,12 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         captured = self.copy_engine and torch.cuda.is_current_stream_capturing()
         if captured and self.cpu_experts and self.cpu_input is None:
             raise RuntimeError(f"CPU experts: row {self.row} gathered without its input (Exl3MoEMethod._apply_graph)")
+        if captured and self.cpu_experts and getattr(self.streamer_of(), "_plan_miss_keys", None) is None:
+            # attach installs the keys; a later enable_graph_gather resets them, and an unsorted plan would send the
+            # CPU the last-routed misses instead of the lowest-scored ones.
+            raise RuntimeError(
+                f"CPU experts: row {self.row}'s route plan has no miss order (Exl3RamMissService.attach)"
+            )
         side = self.device_side
         side.post(
             self.row, self.planned, plan.count, self.routes, plan.slots, self.hot_slots, self.hot_capacity,
@@ -776,7 +786,8 @@ class Exl3RamMissService:
             if updater is None or not updater.insert_direct:
                 if self.cpu_experts is not None:
                     raise RuntimeError(
-                        "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs DIRECT residency (SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
+                        "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs DIRECT residency "
+                        "(SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
                         "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2): its ranking orders the miss lanes the CPU takes"
                     )
                 manager.add_residency_listener(self.on_residency)
@@ -849,6 +860,7 @@ class Exl3RamMissService:
             copy_engine=self.copy_engine,
             copy_sm_table=copy_sm,
             cpu_experts=self.cpu_experts is not None,
+            streamer_of=self.tables[streamer.layer_id].streamer_of,
         )
         if self.copy_engine:
             dst_rows = min(int(destination.shape[0]) for _, destination in segments.pairs)

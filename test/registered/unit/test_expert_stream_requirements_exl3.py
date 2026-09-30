@@ -325,28 +325,28 @@ CPU_EXPERTS_ENV = dict(
     SGLANG_DSV41_CPU_EXPERTS_CORES="18-29",
     SGLANG_DSV41_CPU_EXPERTS=True,
 )
-# DIRECT's own prerequisites: without either, the residency update's EXL3 rule refuses first.
-_DIRECT_PREREQUISITES = ("SGLANG_MOE_EXPERT_GRAPH_GATHER", "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE")
 
 
-@pytest.mark.parametrize(
-    "missing", [name for name in CPU_EXPERTS_ENV if name not in ("SGLANG_DSV41_CPU_EXPERTS", *_DIRECT_PREREQUISITES)]
-)
+@pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_DSV41_CPU_EXPERTS"])
 def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
     """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), never left out of the fused
     MoE (layer fusion), not the lowest-scored misses (DIRECT residency's keys, which only the fused plan sorts by), or
     run on no cores; the refusal names the one that is off."""
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
-    off = "" if missing == "SGLANG_DSV41_CPU_EXPERTS_CORES" else False
+    off = {"SGLANG_DSV41_CPU_EXPERTS_CORES": "", "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}.get(missing, False)
     with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {missing}"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: off})
 
 
-@pytest.mark.parametrize("missing", _DIRECT_PREREQUISITES)
-def test_cpu_experts_without_direct_residency_are_refused(model_dir, missing):
-    """The miss order is DIRECT's victim ranking: stage 1, or no graph gather, leaves the residency update refused."""
-    with pytest.raises(ValueError, match="SGLANG_MOE_GPU_RESIDENCY_UPDATE"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: 1 if "STAGE" in missing else False})
+@pytest.mark.parametrize("update", [True, False])
+def test_cpu_experts_without_direct_residency_are_refused(model_dir, update):
+    """Stage 1 is not DIRECT. With the residency update on, the update's own EXL3 rule would say to turn it off; the
+    CPU-experts rule runs first and names what to set instead: the update on, at stage 2."""
+    env = {**CPU_EXPERTS_ENV, "SGLANG_MOE_GPU_RESIDENCY_UPDATE": update, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}
+    wanted = ("" if update else "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, ") + "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"
+    with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {wanted}$") as refused:
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **env)
+    assert "set it to 0" not in str(refused.value)
 
 
 def test_cpu_experts_need_the_captured_decode_graph(model_dir):

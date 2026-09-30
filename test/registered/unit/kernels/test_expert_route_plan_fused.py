@@ -540,16 +540,13 @@ def _assert_sorted_plan(ids, expert_to_slot, scratch_base, keys, result, unsorte
         assert torch.equal(getattr(result, name), getattr(unsorted, name))
 
 
-def test_miss_keys_none_is_the_unsorted_plan_bit_for_bit():
+def test_miss_keys_none_is_the_unsorted_plan():
+    """Without keys the plan is plan_graph_routes' (misses in first-appearance order), the oracle of the plan before
+    the miss order existed."""
     for seed in range(50):
         rng = random.Random(seed)
         ids = torch.tensor(rng.sample(range(EXPERTS), rng.randint(1, 32)), device="cuda", dtype=torch.int64)
         resident = rng.sample(range(EXPERTS), rng.randint(0, EXPERTS // 2))
-        expert_to_slot = _expert_to_slot(resident)
-        default = run_fused_case(ids, expert_to_slot, scratch_base=len(resident))
-        explicit = run_fused_case(ids, expert_to_slot, scratch_base=len(resident), miss_keys=None)
-        for name in ("source_rows", "slots", "count", "remap", "graph_counters", "graph_unique_counters", "route_counts"):
-            assert torch.equal(getattr(default, name), getattr(explicit, name)), name
         assert_matches_reference(ids, resident, scratch_base=len(resident))
 
 
@@ -629,7 +626,8 @@ def test_miss_keys_capture_and_replay_after_an_in_place_key_change():
         run()
 
     unsorted = run_fused_case(ids, expert_to_slot, scratch_base)
-    for replay_keys in (torch.arange(EXPERTS), -torch.arange(EXPERTS), torch.randperm(EXPERTS, generator=torch.Generator().manual_seed(3))):
+    shuffled = torch.randperm(EXPERTS, generator=torch.Generator().manual_seed(3))
+    for replay_keys in (torch.arange(EXPERTS), -torch.arange(EXPERTS), shuffled):
         keys.copy_(replay_keys.to(device))
         for name in ("graph_counters", "graph_unique_counters", "route_counts"):
             getattr(out, name).zero_()

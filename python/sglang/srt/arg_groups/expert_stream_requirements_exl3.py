@@ -113,9 +113,11 @@ def _check(cfg, budgets) -> None:
         )
     if budgets.graph_gather and not budgets.hot_budget_mb:
         raise ValueError("EXL3 graph gathers need SGLANG_MOE_HOT_GPU_MB")
+    # Before the shared eager checks: their residency-update rule would tell a CPU-experts launch without DIRECT to
+    # turn the update off, where CPU experts need it on at stage 2.
+    _check_cpu_experts(budgets)
     # The shared eager check refuses graph gather; decode graphs may use it.
     _EAGER.check(_EagerGraphView(cfg), dataclasses.replace(budgets, graph_gather=False))
-    _check_cpu_experts(budgets)
     # DSV4's alt-stream overlap still gives wrong output when captured in the breakable
     # decode graph, and this gate turns it off. Its mHC stats side stream was one cause
     # (forked before the MoE break, launched on after it; fixed by _refork_stats_stream:
@@ -144,8 +146,8 @@ def _check_cpu_experts(budgets) -> None:
         ("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get()),
         ("SGLANG_DSV41_ENABLE_LAYER_FUSION=1", envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()),
         # DIRECT residency ranks the keys the fused plan sorts the miss lanes by, so the CPU takes the coldest ones.
-        # _EAGER already refuses the update on EXL3 unless it is DIRECT (stage 2 with graph gather).
         ("SGLANG_MOE_GPU_RESIDENCY_UPDATE=1", envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()),
+        ("SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2", envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2),
         ("SGLANG_MOE_EXPERT_FUSED_PLAN=1", envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()),
         ("SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list)", bool(envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get())),
     ]

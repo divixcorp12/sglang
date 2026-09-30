@@ -837,10 +837,8 @@ class GpuResidencyUpdater:
         evictable = (
             (self.slot_state == _READY) & self.slot_valid & (self.slot_to_expert >= 0)
         )
-        rank = residency_rank_keys(self.insert_scores).gather(1, slot_experts)
-        rank = (
-            rank + routed.gather(1, slot_experts).to(torch.int64) * _ROUTED_RANK_OFFSET
-        )
+        expert_keys = self._expert_rank_keys(routed)
+        rank = expert_keys.gather(1, slot_experts)
         never = torch.iinfo(torch.int64).max
         keys = torch.full(
             (self.num_layers, self.victim_columns),
@@ -858,10 +856,11 @@ class GpuResidencyUpdater:
         self.victim_valid.copy_(ranked.values[:, :width] < never)
         self.victims_fresh = True
         if self.miss_keys is not None:
-            self._write_miss_keys(routed)
+            self.miss_keys.copy_(expert_keys)
 
     def enable_miss_order(self) -> None:
-        """Keep ``miss_keys``, int64 ``[layers, experts]``: every expert's victim-ranking key, updated with each ranking.
+        """Keep ``miss_keys``, int64 ``[layers, experts]``: every expert's victim-ranking key, updated with each
+        ranking.
 
         A fused graph plan given a layer's row sorts its miss lanes by it, highest first, so the
         lanes a CPU expert computes instead of inserting are the ones this ranking values least.
@@ -873,12 +872,14 @@ class GpuResidencyUpdater:
         self.miss_keys = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
-        # Without re-ranking: the shortlist a ranking already proposed stays as it is.
-        self._write_miss_keys(self.route_counts > 0)
+        # Without re-ranking, so a shortlist already proposed stays as it is. These keys are provisional: the next
+        # ranking overwrites them with the ones it ranks by.
+        self.miss_keys.copy_(self._expert_rank_keys(self.route_counts > 0))
 
-    def _write_miss_keys(self, routed: torch.Tensor) -> None:
-        # The slot ranking's own key per expert: ascending is (routed, insert score, -expert).
-        self.miss_keys.copy_(
+    def _expert_rank_keys(self, routed: torch.Tensor) -> torch.Tensor:
+        """int64 ``[layers, experts]``: the victim ranking's key per expert; ascending is (routed, insert score,
+        -expert)."""
+        return (
             residency_rank_keys(self.insert_scores)
             + routed.to(torch.int64) * _ROUTED_RANK_OFFSET
         )
