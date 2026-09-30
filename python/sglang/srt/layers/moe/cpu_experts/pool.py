@@ -7,7 +7,7 @@ is that slot. Everything format-specific lives behind ``CpuExpertQuantTrait``. D
 
 import os
 import threading
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 import torch
 
@@ -17,6 +17,8 @@ class CpuExpertQuantTrait(Protocol):
 
     name: str
     slab_names: tuple[str, ...]
+    # The SwiGLU clamp the layers run with; the RAM-miss service sets it at the first registration when None.
+    act_limit: Optional[float]
     # Dtypes of the hidden state and routing weights it takes and of the output it writes.
     x_dtype: torch.dtype
     weights_dtype: torch.dtype
@@ -24,6 +26,10 @@ class CpuExpertQuantTrait(Protocol):
 
     def check_environment(self) -> None:
         """Raise if the process is set up in a way that breaks the kernel's threading."""
+        ...
+
+    def hidden_size(self, slabs: Mapping[str, torch.Tensor]) -> int:
+        """The model's hidden size, the length of x and out, as the layer's slabs encode it."""
         ...
 
     def register_layer(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> Any:
@@ -43,6 +49,18 @@ class CpuExpertQuantTrait(Protocol):
         ...
 
     def free_layer(self, handle: Any) -> None: ...
+
+    # The native half, which the RAM-miss service's CPU expert thread calls without Python
+    # (expert_stream/host/cpu_experts.h). The forward reads x as fp16 [hidden] (the post kernel stages it so)
+    # and weights as fp32, and its layer argument is register_layer's handle as an int64.
+
+    def native_forward(self) -> int:
+        """The address of the kernel's ``CpuExpertForward`` C function."""
+        ...
+
+    def native_set_cores(self, cores: Sequence[int]) -> None:
+        """Place the kernel's workers on ``cores`` before its first forward; the calling thread is worker 0."""
+        ...
 
 
 class CpuExpertPool:

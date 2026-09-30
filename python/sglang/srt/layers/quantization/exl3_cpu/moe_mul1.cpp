@@ -2,7 +2,8 @@
 // 02aef45cd681b960a00afcd0749a4ab99e6c1bfe, exllamav3/exllamav3_ext/cpu/moe_mul1.cpp.
 // MIT License, Copyright (c) 2025 Turboderp; the full notice is in LICENSE.exllamav3 beside this file.
 //
-// Local change: two compile-time options that reduce the int8 activation quantization error of the
+// Local change: a C ABI for sglang's CPU expert thread (the end of this file), and two compile-time
+// options that reduce the int8 activation quantization error of the
 // quantized tiers (AVX2 / AVX-512BW / VNNI / VBMI; the scalar tier computes in fp32 and ignores both).
 // exl3_ext.py builds this copy in place of upstream's only when one of them is on, so the default
 // build is upstream's file. Neither option touches a GEMV inner loop:
@@ -2642,4 +2643,40 @@ void exl3_moe_cpu_forward
         m_total, top_k,
         static_cast<int>(num_threads)
     );
+}
+
+// ---- sglang: the C ABI of the CPU expert thread (plan 2026-09-29-dsv41-cpu-experts, "Step B") ----
+// expert_stream/host/cpu_experts.h calls these through addresses Exl3CpuQuantTrait resolves with dlsym, so the
+// service module links nothing of this one. Neither throws across the boundary.
+
+// CpuExpertForward: one token row x (fp16 [hidden]) through experts slots[0..k) of layer `handle`, weighted by
+// weights[0..k), into out (fp32 [hidden], overwritten). The calling thread is the pool's worker 0.
+extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_forward(
+    int64_t handle, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads)
+    noexcept
+{
+    if (k < 0 || k > 32) return 2;
+    try
+    {
+        at::Half wts[32];
+        for (int32_t i = 0; i < k; ++i) wts[i] = at::Half(weights[i]);
+        exl3_moe_cpu_forward_raw(handle, static_cast<const at::Half*>(x), slots, wts, out, 1, k, threads);
+        return 0;
+    }
+    catch (...)
+    {
+        return 1;
+    }
+}
+
+// The pool's cores, worker i on cores[i % n] (worker 0 is the thread that calls the forward). Before the first
+// forward: once the pool has spawned, its workers are already placed, and this refuses (returns 1).
+extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_set_cores(const int32_t* cores, int32_t n)
+    noexcept
+{
+    if (n < 1) return 2;
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    if (g_pool.spawned > 0) return 1;
+    g_pool.core_order.assign(cores, cores + n);
+    return 0;
 }

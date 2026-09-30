@@ -343,3 +343,94 @@ def test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads(slot_rows):
     bench.one(par, L)
     torch.cuda.synchronize()
     assert torch.equal(_bits(L.fused.out), _bits(want))
+
+
+# CPU experts (plan 2026-09-29-dsv41-cpu-experts, Step B): the lanes of cpu_lanes leave the fused MoE and the CPU's
+# partial sum seeds its output. Here lane i is route i (dst_slots = remap), as the post's plan makes it for a BS1 remap.
+def _cpu_run(fused, x, weights, remap, keep, mask: int, partial: torch.Tensor) -> torch.Tensor:
+    lanes = torch.tensor([mask], dtype=torch.int32, device=x.device)
+    cpu = (lanes, remap.to(torch.int32), partial.data_ptr())
+    return fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=cpu).clone()
+
+
+def _masked(weights, mask: int, *, keep_masked: bool) -> torch.Tensor:
+    picked = torch.tensor([bool(mask >> i & 1) for i in range(TOP_K)], device=weights.device)
+    return torch.where(picked == keep_masked, weights, torch.zeros_like(weights))
+
+
+def test_cpu_lanes_with_a_zero_partial_are_the_gpu_run_without_them(slot_rows):
+    """Bitwise: a CPU route is not computed at all and the other routes keep their weights. Ranking a CPU route by its
+    real slot instead would shift the fused kernel's running weight prefix and give its neighbours wrong weights."""
+    device = slot_rows["w13_trellis"].device
+    fused = _fused(slot_rows, device, True)
+    hidden = slot_rows["w13_suh"].shape[-1]
+    zero = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
+    seed = torch.full((1, hidden), 3.0, dtype=torch.float32).pin_memory()
+    gen = torch.Generator().manual_seed(929)
+    for keep_value in (1.0, 0.0):
+        keep = torch.tensor([keep_value], device=device)
+        for trial in range(TRIALS * 4):
+            x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
+            mask = int(torch.randint(1, 1 << TOP_K, (1,), generator=gen))
+            want = fused.run(x, _masked(weights, mask, keep_masked=False), remap, keep, ACT_LIMIT).clone()
+            got = _cpu_run(fused, x, weights, remap, keep, mask, zero)
+            assert torch.equal(_bits(got), _bits(want)), f"keep={keep_value} mask={mask:#x} remap={remap.tolist()}"
+            if keep_value == 0.0:
+                # A dropped layer drops the CPU's share too.
+                assert torch.equal(_cpu_run(fused, x, weights, remap, keep, mask, seed), torch.zeros_like(want))
+
+
+def test_the_cpu_partial_seeds_the_output(slot_rows):
+    """The GPU's own partial of the CPU routes, fed back as the CPU partial, reproduces the full run up to fp32
+    reassociation."""
+    device = slot_rows["w13_trellis"].device
+    fused = _fused(slot_rows, device, True)
+    hidden = slot_rows["w13_suh"].shape[-1]
+    partial = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
+    keep = torch.ones(1, device=device)
+    gen = torch.Generator().manual_seed(930)
+    for trial in range(TRIALS * 4):
+        x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
+        mask = int(torch.randint(1, 1 << TOP_K, (1,), generator=gen))
+        want = fused.run(x, weights, remap, keep, ACT_LIMIT).clone()
+        partial.copy_(fused.run(x, _masked(weights, mask, keep_masked=True), remap, keep, ACT_LIMIT))
+        got = _cpu_run(fused, x, weights, remap, keep, mask, partial)
+        scale = float(want.abs().max())
+        assert torch.allclose(got, want, rtol=1e-5, atol=1e-5 * scale), f"mask={mask:#x}"
+
+
+def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):
+    """End to end over one layer's real rows: the CPU kernel's partial of the CPU routes, from host copies of the same
+    slots, lands the output within the kernel's own error of the full GPU run, far closer than dropping those routes."""
+    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    threads = min(4, len(os.sched_getaffinity(0)))
+    device = slot_rows["w13_trellis"].device
+    fused = _fused(slot_rows, device, True)
+    hidden = slot_rows["w13_suh"].shape[-1]
+    trait = Exl3CpuQuantTrait(exl3_ext(), act_limit=ACT_LIMIT)
+    host_rows = {name: t.cpu() for name, t in slot_rows.items()}
+    handle = trait.register_layer(host_rows, fused.slots)
+    partial = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
+    zero = torch.zeros_like(partial).pin_memory()
+    keep = torch.ones(1, device=device)
+    gen = torch.Generator().manual_seed(931)
+    try:
+        for trial in range(TRIALS * 2):
+            x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
+            mask = int(torch.randint(1, 1 << TOP_K, (1,), generator=gen))
+            routes = [i for i in range(TOP_K) if mask >> i & 1]
+            want = fused.run(x, weights, remap, keep, ACT_LIMIT).clone()
+            slots = remap[routes].cpu().reshape(1, -1)
+            w = weights[routes].cpu().half().reshape(1, -1)
+            trait.forward(handle, x.cpu().half(), slots, w, partial, threads)
+            got = _cpu_run(fused, x, weights, remap, keep, mask, partial)
+            dropped = _cpu_run(fused, x, weights, remap, keep, mask, zero)
+            err = float((got - want).norm() / want.norm())
+            drop = float((dropped - want).norm() / want.norm())
+            print(f"mask={mask:#x}: relative error {err:.2e}, dropping the CPU routes {drop:.2e}")
+            assert err < 2e-2 and err < 0.1 * drop, f"mask={mask:#x}: {err:.2e} vs dropped {drop:.2e}"
+    finally:
+        trait.free_layer(handle)

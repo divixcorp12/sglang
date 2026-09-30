@@ -411,6 +411,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         route_log=None,
         copy_engine: bool = False,
         copy_sm_table: Optional[torch.Tensor] = None,
+        cpu_experts: bool = False,
     ) -> None:
         super().__init__(segments, host_row_map, capacity)
         self.device_side = device_side
@@ -437,6 +438,12 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.copy_engine = copy_engine
         # SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: the copy-table rows the copy wait reads itself.
         self.copy_sm_table = copy_sm_table
+        # SGLANG_DSV41_CPU_EXPERTS: the service may compute resident lanes on the CPU. _apply_graph sets cpu_input,
+        # (x, the routes' weights), around each gather; the post stages it for the CPU expert thread.
+        if cpu_experts and not copy_engine:
+            raise ValueError("CPU experts are completed by the copy engine's copy wait")
+        self.cpu_experts = cpu_experts
+        self.cpu_input = None
 
     @property
     def delivered_count(self) -> torch.Tensor:
@@ -498,9 +505,12 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             # Only a captured graph lets the service copy: an eager forward may load a kernel module while the copy
             # wait spins, and a load blocks the copy thread's driver calls (engram-no-hostnode plan, section 10).
             capturing = torch.cuda.is_current_stream_capturing()
+            if self.cpu_experts and self.cpu_input is None:
+                raise RuntimeError(f"CPU experts: row {self.row} gathered without its input (Exl3MoEMethod._apply_graph)")
             self.device_side.post(
                 self.row, self.planned, plan.count, self.routes, self.next_row,
                 self.hot_slots, self.hot_capacity, dst_slots=plan.slots, copy_engine=capturing,
+                cpu_input=self.cpu_input if capturing and self.cpu_experts else None,
             )
             self.device_side.copy_engine_captured |= capturing
         else:
@@ -636,6 +646,10 @@ class Exl3RamMissService:
         # unarmed. Once armed, an eager forward and a Triton module load first drain the device.
         self.copy_engine = False
         self.sm_small_copies = False
+        # SGLANG_DSV41_CPU_EXPERTS (plan 2026-09-29-dsv41-cpu-experts, Step B): the CPU expert service; None when off.
+        self.cpu_experts = None
+        self._cpu_retune_batches = 0
+        self._cpu_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL (LEASE_PROTOCOL.md 7.7): the lease chain's kernels launch with PDL.
         self.lease_pdl = False
         self._copy_armed = False
@@ -740,6 +754,9 @@ class Exl3RamMissService:
                     )
                 # Before the thread starts; unarmed. The watchdog bounds each copy wait by the RAM-miss timeout.
                 host.enable_copy_engine(torch.cuda.current_device(), wait_timeout_ms=cfg.ram_miss_timeout_ms)
+            cpu_experts = None
+            if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+                cpu_experts = self._start_cpu_experts(cfg, host, fmt, streamers, pin)
             native_prefetch = None
             if cfg.enable_native_prefetch:
                 if not copy_engine:
@@ -785,6 +802,8 @@ class Exl3RamMissService:
         self.two_phase = two_phase
         self.piece_stream = piece_stream
         self.copy_engine = copy_engine
+        self.cpu_experts = cpu_experts
+        self._cpu_retune_batches = envs.SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES.get()
         self.native_prefetch = native_prefetch
         self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
         self.lease_pdl = cfg.enable_lease_pdl
@@ -800,9 +819,45 @@ class Exl3RamMissService:
             share_recorder.register_pre_forward_observer(self._set_prefill_share)
         logger.info(
             "exl3 RAM miss thread started: %d layers, %d files, slot bytes %d, wait timeout %d ms, leases on, "
-            "row images on, copy engine %s, build %s",
+            "row images on, copy engine %s, CPU experts %s, build %s",
             len(tables.layer_ids), len(tables.paths), tables.slot_bytes, cfg.ram_miss_timeout_ms,
-            "on" if copy_engine else "off", self.host.variant,
+            "on" if copy_engine else "off", "on" if cpu_experts is not None else "off", self.host.variant,
+        )
+
+    @staticmethod
+    def _start_cpu_experts(cfg, host, fmt, streamers, pin: bool):
+        """SGLANG_DSV41_CPU_EXPERTS: the CPU expert thread over the pinned tier; after the copy engine, before the
+        service thread. Its lanes complete in the copy wait and leave the fused MoE through layer fusion's route
+        tables, so both are required."""
+        from sglang.srt.layers.moe.cpu_experts.service import (
+            CpuExpertService,
+            configured_split,
+            cpu_expert_cores,
+            cpu_trait_for,
+        )
+        from sglang.srt.layers.moe.host_numa import parse_placement
+
+        if not cfg.enable_ram_miss_copy_engine:
+            raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE")
+        if not cfg.enable_layer_fusion:
+            raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_LAYER_FUSION")
+        cores, threads = cpu_expert_cores()
+        # Rows in layer order, as exl3_ram_miss_tables numbers them.
+        caches = {row: s.pinned_host_cache.tensors for row, (_, s) in enumerate(sorted(streamers.items()))}
+        trait = cpu_trait_for(fmt.key)
+        hidden = {trait.hidden_size(slabs) for slabs in caches.values()}
+        if len(hidden) != 1:
+            raise RuntimeError(f"exl3 RAM miss: CPU experts need one hidden size, the layers have {hidden}")
+        return CpuExpertService(
+            host,
+            trait,
+            caches,
+            hidden=hidden.pop(),
+            cores=cores,
+            threads=threads,
+            split=configured_split(),
+            placement=parse_placement(envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.get()),
+            pin=pin,
         )
 
     def before_host_use(self) -> None:
@@ -883,6 +938,8 @@ class Exl3RamMissService:
             )
             # Every layer's backend reaches the prefetch hooks through its device side (Exl3MoEMethod._apply_graph).
             self.device_side.native_prefetch = self.native_prefetch
+            if self.cpu_experts is not None:
+                self.device_side.enable_cpu_experts(self.cpu_experts.x_rows, self.cpu_experts.out_rows)
             if self._stages_traced:
                 self._start_route_log(cache.device)
             if self.copy_engine:
@@ -922,6 +979,7 @@ class Exl3RamMissService:
             route_log=self.route_log,
             copy_engine=self.copy_engine,
             copy_sm_table=copy_sm,
+            cpu_experts=self.cpu_experts is not None,
         )
         if self.copy_engine:
             dst_rows = min(int(destination.shape[0]) for _, destination in segments.pairs)
@@ -992,6 +1050,11 @@ class Exl3RamMissService:
                 f"(thread {self.host.counters()}); fail-stop"
             )
         self._arm_copy_engine()
+        if self.cpu_experts is not None and self._cpu_retune_batches > 0:
+            self._cpu_batches += 1
+            if self._cpu_batches >= self._cpu_retune_batches:
+                self._cpu_batches = 0
+                self.cpu_experts.retune()
         if self.native_prefetch is not None:
             self.native_prefetch.poll_counters()
         self._trace_step()

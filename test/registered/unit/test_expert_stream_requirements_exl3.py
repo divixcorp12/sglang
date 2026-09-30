@@ -334,3 +334,29 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+CPU_EXPERTS_ENV = dict(
+    SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+    SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE=True,
+    SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM=True,
+    SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=True,
+    SGLANG_DSV41_ENABLE_LAYER_FUSION=True,
+    SGLANG_DSV41_CPU_EXPERTS_CORES="18-29",
+    SGLANG_DSV41_CPU_EXPERTS=True,
+)
+
+
+@pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_DSV41_CPU_EXPERTS"])
+def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
+    """Each is load-bearing: without it the CPU lanes are never completed (copy engine, its piece-streaming chain),
+    never left out of the fused MoE (layer fusion), or run on no cores; the refusal names the one that is off."""
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
+    off = "" if missing == "SGLANG_DSV41_CPU_EXPERTS_CORES" else False
+    with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {missing}"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: off})
+
+
+def test_cpu_experts_need_the_captured_decode_graph(model_dir):
+    with pytest.raises(ValueError, match="--cuda-graph-backend-decode breakable"):
+        _gate(_launch(model_dir), **CPU_EXPERTS_ENV)

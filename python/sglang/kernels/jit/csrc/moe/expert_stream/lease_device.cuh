@@ -228,9 +228,12 @@ SGL_DEVICE bool lane_result_judge(
   const uint64_t tag = r.ready >> 56;
   const bool current = (r.ready & generation_mask) == generation;
   if (loading != nullptr) *loading = tag == kLeaseTagLoading && current;
-  if (copying != nullptr) *copying = tag == kLeaseTagCopying && current;
+  // A CPU lane (CPU experts) is the copy thread's to complete as well, so every stage treats it as COPYING: W1 claims
+  // it, C1 and S leave it alone, and CW waits for its CopyDone.
+  const bool copy_owned = tag == kLeaseTagCopying || tag == kLeaseTagCpu;
+  if (copying != nullptr) *copying = copy_owned && current;
   *ready_seen = (tag == kLeaseTagReady || (accept_loading && tag == kLeaseTagLoading) ||
-                 (accept_copying && tag == kLeaseTagCopying)) &&
+                 (accept_copying && copy_owned)) &&
                 current;
   const bool valid = *ready_seen && again == r.ready && static_cast<int64_t>(r.expert) == expected_expert &&
                      r.host_slot >= 0 &&

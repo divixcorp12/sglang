@@ -67,6 +67,9 @@ enum Counter : int {
   kPrefetchWasted,           // copied rows it did not route
   kPrefetchHeld,             // prefetch jobs the copy thread held back behind a demand job
   kPrefetchLatencyNs,        // request read to completion observed, summed over copied prefetches
+  // CPU experts (plan 2026-09-29-dsv41-cpu-experts): copy-engine requests some of whose lanes went to the CPU.
+  kCpuJobs,
+  kCpuLanes,  // ... and those lanes
   // The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Task 13): Python commands (set_hot, inject_lease, the
   // snapshots) the tier's owner applied, queued through the command ring or run directly. A metric: tests only (F24).
   kCommandsApplied,
@@ -154,6 +157,7 @@ struct Request {
   FixedVec<int32_t, kLeaseLanes> lane_experts;
   FixedVec<int32_t, kLeaseLanes> lane_dst;  // the plan's destination slot per lane, -1 unknown
   uint32_t lane_flags = 0;                  // kLeaseLrFlag*
+  FixedVec<float, kLeaseLanes> lane_weight;  // the lane expert's routing weight (kLeaseLrWeight), for CPU experts
 };
 
 // The service's private account of one request's leases, by request slot (LEASE_PROTOCOL.md 5.2).

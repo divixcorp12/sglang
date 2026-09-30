@@ -472,7 +472,7 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
 
     monkeypatch.setattr(exl3_fused_moe, "exl3_fused_moe_for",
                         lambda layer, streamer: SimpleNamespace(
-                            layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit: x.float()))
+                            layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit, cpu=None: x.float()))
     backend = module.Exl3RamMissRowBackend(
         {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, -1, 6, route_log=route_log
     )

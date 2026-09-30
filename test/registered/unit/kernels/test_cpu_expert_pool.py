@@ -273,3 +273,106 @@ def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch)
         trait.check_environment()
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     trait.check_environment()
+
+
+class FakeServiceTrait(FakeTrait):
+    """FakeTrait with the RAM-miss service's half: the lazily set activation limit and the native entry points."""
+
+    act_limit = None
+
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def hidden_size(self, slabs):
+        return int(slabs["alpha"].shape[-1])
+
+    def register_layer(self, slabs, capacity):
+        self.events.append(("register", self.act_limit))
+        return 100 + super().register_layer(slabs, capacity)
+
+    def native_forward(self):
+        return 0xF00D
+
+    def native_set_cores(self, cores):
+        self.events.append(("cores", list(cores)))
+
+
+class FakeHost:
+    def __init__(self):
+        self.enabled, self.layers, self.splits, self.nodes = None, {}, [], {}
+        self.stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
+
+    def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads):
+        self.enabled = (forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads)
+
+    def set_cpu_slot_nodes(self, row, nodes, preferred):
+        self.nodes[row] = (list(nodes), preferred)
+
+    def set_cpu_layer(self, row, handle):
+        self.layers[row] = handle
+
+    def set_cpu_split(self, split):
+        self.splits.append(list(split))
+
+    def cpu_stats(self):
+        return dict(self.stats)
+
+
+def _service(host, trait, **kw):
+    from sglang.srt.layers.moe.cpu_experts.service import CpuExpertService
+
+    slabs = {row: _fake_slabs() for row in range(2)}
+    return CpuExpertService(
+        host, trait, slabs, **{"hidden": 8, "cores": [4, 5, 6], "threads": 2, "split": [0] * 9, "pin": False, **kw}
+    )
+
+
+def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit():
+    """The kernel's pool spawns at its first forward, which follows the first registration, so the cores go first; the
+    activation limit is only known at the layer's first forward and must be on the trait before register_layer."""
+    host, trait = FakeHost(), FakeServiceTrait()
+    svc = _service(host, trait)
+    assert host.enabled == (0xF00D, [0] * 9, [4, 5, 6], (2, 16), (2, 8), 2)
+    assert host.layers == {}, "a row reached the grant before its registration"
+    svc.register(1, 10.0)
+    svc.register(1, 10.0)
+    svc.register(0, 10.0)
+    assert trait.events == [("cores", [4, 5, 6]), ("register", 10.0), ("register", 10.0)]
+    assert host.layers == {1: 100, 0: 101}
+    with pytest.raises(ValueError, match="activation limits"):
+        _service(FakeHost(), trait).register(0, 7.0)
+
+
+def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
+    from sglang.srt.environ import envs
+
+    host, trait = FakeHost(), FakeServiceTrait()
+    svc = _service(host, trait)
+    host.stats = {"jobs": 10, "lanes": 63, "forward_ns": 63 * 10_000_000}
+    assert svc.retune() is None and host.splits == []
+    host.stats = {"jobs": 11, "lanes": 64, "forward_ns": 64 * 100_000}  # 0.1 ms per expert since the start
+    expected = split_table(
+        8, 0.1, envs.SGLANG_DSV41_CPU_EXPERTS_LINK_MS.get(), envs.SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS.get()
+    ).tolist()
+    assert svc.retune() == expected and host.splits == [expected]
+    # The next window is measured from here: 64 more lanes at 10 ms each, a CPU slower than any link.
+    host.stats = {"jobs": 12, "lanes": 128, "forward_ns": 64 * 100_000 + 64 * 10_000_000}
+    assert svc.retune() == [0] * 9
+
+
+@pytest.mark.parametrize("spec", ["0,1,1", "0,2,1,1,1,1,1,1,1", "0,-1,0,0,0,0,0,0,0"])
+def test_configured_split_refuses_a_table_the_grant_could_not_honour(spec):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts.service import configured_split
+
+    with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.override(spec):
+        with pytest.raises(ValueError, match="0 <= split"):
+            configured_split()
+
+
+def test_slot_nodes_follow_the_pinned_tiers_per_node_row_split():
+    from sglang.srt.layers.moe.cpu_experts.service import slot_nodes
+
+    assert slot_nodes(5, [(1, 3 << 20), (0, 2 << 20)]) == [1, 1, 1, 0, 0]
+    assert slot_nodes(5, ()) == []

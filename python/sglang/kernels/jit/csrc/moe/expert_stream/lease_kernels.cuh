@@ -4,6 +4,9 @@
 
 #include <sgl_kernel/tensor.h>
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
 #include "lease_device.cuh"
 #include "tensor_checks.h"
 
@@ -32,7 +35,45 @@ struct PostParams {
   const int32_t* dst_slots;
   int64_t dst_count;
   int64_t copy_engine;
+  // CPU experts (plan 2026-09-29-dsv41-cpu-experts): with cpu_x_dst set, the block stages the layer's input row there
+  // (cpu_hidden elements of cpu_x_src, of dtype cpu_x_dtype, as fp16) and the LaneRequest carries each lane's routing
+  // weight from cpu_weights (cpu_weights_count routes aligned with `routes`, dtype cpu_weights_dtype) and
+  // kLeaseLrFlagCpuExperts. Null cpu_x_dst: none of it, the post as before.
+  const void* cpu_x_src;
+  int64_t cpu_x_dtype;
+  uint8_t* cpu_x_dst;
+  int64_t cpu_hidden;
+  const void* cpu_weights;
+  int64_t cpu_weights_dtype;
+  int64_t cpu_weights_count;
 };
+
+// Element dtypes of the CPU experts' staged input and routing weights (PostParams).
+constexpr int64_t kCpuDtypeF16 = 0;
+constexpr int64_t kCpuDtypeBf16 = 1;
+constexpr int64_t kCpuDtypeF32 = 2;
+
+SGL_DEVICE float cpu_input_value(const void* src, int64_t dtype, int64_t i) {
+  if (dtype == kCpuDtypeF16) return __half2float(static_cast<const __half*>(src)[i]);
+  if (dtype == kCpuDtypeBf16) return __bfloat162float(static_cast<const __nv_bfloat16*>(src)[i]);
+  return static_cast<const float*>(src)[i];
+}
+
+// The whole block: the layer's input row as fp16, 8 elements per 16-byte store to the host row (the launcher checks
+// hidden % 8 == 0 and the alignment). Each thread fences its own stores at system scope before the barrier, so thread
+// 0's later release of the LaneRequest and demand_head orders all of them.
+SGL_DEVICE void stage_cpu_input(const PostParams& p) {
+  const int64_t vectors = p.cpu_hidden / 8;
+  for (int64_t v = threadIdx.x; v < vectors; v += blockDim.x) {
+    __align__(16) __half h[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+      h[k] = __float2half_rn(cpu_input_value(p.cpu_x_src, p.cpu_x_dtype, 8 * v + k));
+    __stwt(reinterpret_cast<uint4*>(p.cpu_x_dst + 16 * v), *reinterpret_cast<const uint4*>(h));
+  }
+  __threadfence_system();
+  __syncthreads();
+}
 
 template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_post_kernel(
@@ -67,6 +108,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const int64_t dst_count = p.dst_count;
   const int64_t copy_engine = p.copy_engine;
   using namespace device::expert_stream;
+  const bool cpu_experts = p.cpu_x_dst != nullptr;
+  if (cpu_experts) stage_cpu_input(p);
   if (threadIdx.x != 0) return;
   if (state[kSticky] != 0 || ld_acquire_sys(page + kFatal) != 0) {
     state[kSticky] = 1;
@@ -141,7 +184,19 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           request + kLeaseLrDst + 4 * i,
           dst_slots != nullptr && i < planned_count && i < dst_count ? dst_slots[i] : -1);
     }
-    st_relaxed_sys<uint32_t>(request + kLeaseLrFlags, copy_engine != 0 ? kLeaseLrFlagCopyEngine : 0u);
+    for (int i = 0; i < kMaxIds; ++i) {
+      // The lane expert's routing weight: its route's (BS1 routes are distinct experts). 0 past the plan or when off.
+      float weight = 0.0f;
+      if (cpu_experts && i < planned_count) {
+        for (int64_t r = 0; r < route_count && r < p.cpu_weights_count; ++r) {
+          if (routes[r] == planned[i]) weight += cpu_input_value(p.cpu_weights, p.cpu_weights_dtype, r);
+        }
+      }
+      st_relaxed_sys<uint32_t>(request + kLeaseLrWeight + 4 * i, __float_as_uint(weight));
+    }
+    st_relaxed_sys<uint32_t>(
+        request + kLeaseLrFlags,
+        (copy_engine != 0 ? kLeaseLrFlagCopyEngine : 0u) | (cpu_experts ? kLeaseLrFlagCpuExperts : 0u));
     st_release_sys64(request + kLeaseLrGen, tagged_word(kLeaseTagDemand, generation));
   }
   write_record(record, seq, row, need, need_count, protect, protect_count, 0, armed ? 1u : 0u, lanes);
@@ -1005,6 +1060,9 @@ struct LeaseProtocolKernel {
       int64_t hot_capacity,
       tvm::ffi::TensorView dst_slots,
       int64_t copy_engine,
+      tvm::ffi::TensorView cpu_x,
+      int64_t cpu_x_dst,
+      tvm::ffi::TensorView cpu_weights,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -1039,6 +1097,27 @@ struct LeaseProtocolKernel {
     }
     expert_stream::verify_named(
         "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
+    // CPU experts: cpu_x is the layer's input row [1, hidden] (or empty when off), cpu_weights the routes' weights.
+    auto cpu_dtype = [](tvm::ffi::TensorView t) -> int64_t {
+      const DLDataType d = t.dtype();
+      if (d.code == kDLFloat && d.bits == 16) return kCpuDtypeF16;
+      if (d.code == kDLBfloat && d.bits == 16) return kCpuDtypeBf16;
+      if (d.code == kDLFloat && d.bits == 32) return kCpuDtypeF32;
+      return -1;
+    };
+    const bool cpu_on = cpu_x_dst != 0;
+    int64_t cpu_hidden = 0;
+    if (cpu_on) {
+      RuntimeCheck(lease_address != 0 && copy_engine != 0, "CPU experts: the post needs the lease block and the copy engine");
+      RuntimeCheck(cpu_x.device().device_type == kDLCUDA && cpu_weights.device().device_type == kDLCUDA,
+                   "CPU experts: cpu_x and cpu_weights live on the device");
+      RuntimeCheck(cpu_x.is_contiguous() && cpu_weights.is_contiguous(), "CPU experts: cpu_x and cpu_weights must be contiguous");
+      RuntimeCheck(cpu_dtype(cpu_x) >= 0 && cpu_dtype(cpu_weights) >= 0, "CPU experts: fp16, bf16 or fp32 inputs");
+      RuntimeCheck(cpu_x.dim() == 2 && cpu_x.size(0) == 1, "CPU experts: cpu_x is one row [1, hidden]");
+      cpu_hidden = cpu_x.size(1);
+      RuntimeCheck(cpu_hidden > 0 && cpu_hidden % 8 == 0, "CPU experts: the hidden size must be a multiple of 8");
+      RuntimeCheck(cpu_x_dst % 16 == 0, "CPU experts: the staged row must be 16-byte aligned");
+    }
 
     RuntimeCheck(
         lease_address == 0 || lease_address % kLeaseBlockAlign == 0,
@@ -1072,6 +1151,13 @@ struct LeaseProtocolKernel {
                                            : nullptr,  // empty: no plan slots
         .dst_count = dst_slots.size(0),
         .copy_engine = copy_engine,
+        .cpu_x_src = cpu_on ? cpu_x.data_ptr() : nullptr,
+        .cpu_x_dtype = cpu_on ? cpu_dtype(cpu_x) : 0,
+        .cpu_x_dst = reinterpret_cast<uint8_t*>(cpu_x_dst),
+        .cpu_hidden = cpu_hidden,
+        .cpu_weights = cpu_on ? cpu_weights.data_ptr() : nullptr,
+        .cpu_weights_dtype = cpu_on ? cpu_dtype(cpu_weights) : 0,
+        .cpu_weights_count = cpu_on ? cpu_weights.numel() : 0,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream).enable_pdl(use_pdl != 0)(
         use_pdl != 0 ? exl3_ram_miss_post_kernel<true> : exl3_ram_miss_post_kernel<false>, params);

@@ -876,12 +876,14 @@ def test_the_launchers_refuse_a_wrong_dtype_and_accept_every_sentinel_the_wrappe
     with pytest.raises(Exception, match="^state: "):
         dev._kernels().expert_stream_post(
             page, bad_state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
-            dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0, 0,  # copy_engine, use_pdl
+            dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,  # copy_engine
+            dev._no_cpu, 0, dev._no_cpu, 0,  # cpu_x, cpu_x_dst, cpu_weights, use_pdl
         )
     with pytest.raises(Exception, match="^page: "):
         dev._kernels().expert_stream_post(
             page.cuda(), dev.state, slot_map, planned, count, routes, 0, 0, dev.last_routes, -1, 0, 0,
-            dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0, 0,  # copy_engine, use_pdl
+            dev.timeout_ns, 0, 0, dev._no_hot_slots, 0, dev.state[:0], 0,  # copy_engine
+            dev._no_cpu, 0, dev._no_cpu, 0,  # cpu_x, cpu_x_dst, cpu_weights, use_pdl
         )
 
 
@@ -889,3 +891,58 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _cpu_rig(hidden):
+    """A Rig whose device stages CPU input. Its device has no piece-streaming chain, which ``enable_cpu_experts``
+    requires, so the pinned rows are set directly: only the post's staging is under test here."""
+    rig = Rig()
+    x_rows = torch.full((LAYERS, 2 * hidden + 16), 0xAB, dtype=torch.uint8).pin_memory()
+    rig.dev.cpu_x_rows = x_rows
+    return rig, x_rows
+
+
+@pytest.mark.parametrize("x_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(x_dtype):
+    """The CPU expert thread reads x as fp16 from the row's host row, and each lane's weight -- the sum over the routes
+    naming the lane's expert -- from the LaneRequest, which the flag marks; bytes past the row stay untouched."""
+    hidden = 64
+    rig, x_rows = _cpu_rig(hidden)
+    rig.plan([9, 5])
+    rig.routes[:4] = torch.tensor([5, 9, 7, 5])
+    weights = torch.tensor([[0.5, 0.25, 0.125, 0.0625]], device="cuda")
+    x = (torch.randn(1, hidden, device="cuda") * 30).to(x_dtype)
+    dst = torch.full((LANES,), -1, dtype=torch.int32, device="cuda")
+    dst[:2] = torch.tensor([3, 4])
+    row = 1
+    rig.dev.post(row, rig.planned, rig.count, rig.routes, -1, dst_slots=dst, copy_engine=True, cpu_input=(x, weights))
+    _cuda_ready()
+    seq = int(rig.dev.stats()["posted"]) & 0xFFFFFFFF
+    base = rig.block.d(lease.LANE_REQUEST + _idx(seq) * lease.LANE_REQUEST_BYTES)
+    f = lease.LANE_REQUEST_FIELDS
+    assert rig.block.u32(base + f["flags"]) == lease.LANE_REQUEST_FLAG_COPY_ENGINE | lease.LANE_REQUEST_FLAG_CPU_EXPERTS
+    lane_weights = rig.raw[base + f["weight"] : base + f["weight"] + 4 * LANES].view(torch.float32)
+    assert lane_weights[:2].tolist() == [0.25, 0.5 + 0.0625]
+    staged = x_rows[row, : 2 * hidden].view(torch.float16)
+    assert torch.equal(staged.view(torch.int16), x.cpu().half().reshape(-1).view(torch.int16))
+    assert (x_rows[row, 2 * hidden :] == 0xAB).all() and (x_rows[1 - row] == 0xAB).all()
+
+    # Without CPU input the same request carries no CPU flag, so the grant never sends its lanes to the CPU.
+    rig.dev.post(row, rig.planned, rig.count, rig.routes, -1, dst_slots=dst, copy_engine=True)
+    _cuda_ready()
+    seq = int(rig.dev.stats()["posted"]) & 0xFFFFFFFF
+    base = rig.block.d(lease.LANE_REQUEST + _idx(seq) * lease.LANE_REQUEST_BYTES)
+    assert rig.block.u32(base + f["flags"]) == lease.LANE_REQUEST_FLAG_COPY_ENGINE
+
+
+def test_the_post_refuses_cpu_input_it_cannot_stage_whole():
+    rig, _ = _cpu_rig(64)
+    rig.plan([9])
+    dst = torch.zeros(LANES, dtype=torch.int32, device="cuda")
+    weights = torch.ones(1, 6, device="cuda")
+    with pytest.raises(Exception, match="hidden"):
+        rig.dev.post(0, rig.planned, rig.count, rig.routes, -1, dst_slots=dst, copy_engine=True,
+                     cpu_input=(torch.zeros(1, 60, device="cuda"), weights))
+    with pytest.raises(ValueError, match="copy_engine"):
+        rig.dev.post(0, rig.planned, rig.count, rig.routes, -1, dst_slots=dst,
+                     cpu_input=(torch.zeros(1, 64, device="cuda"), weights))

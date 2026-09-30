@@ -53,10 +53,13 @@ SLOT_GEN = ROW_RESULT + RING * LANES * ROW_RESULT_BYTES
 # Area D, device-written, at d_offset: LaneRequest[RING], LaneAck[RING][LANES], Terminal[RING], StreamProbe[RING].
 LANE_REQUEST = 0
 LANE_REQUEST_BYTES = 128
-# expert[LANES] and dst_slot[LANES] are int32 per lane; flags is a u32 of LANE_REQUEST_FLAGS bits.
-LANE_REQUEST_FIELDS = {"gen": 0, "count": 8, "row": 12, "expert": 16, "dst_slot": 48, "flags": 80}
+# expert[LANES] and dst_slot[LANES] are int32 per lane; flags is a u32 of LANE_REQUEST_FLAGS bits; weight[LANES] is
+# each lane expert's fp32 routing weight (CPU experts).
+LANE_REQUEST_FIELDS = {"gen": 0, "count": 8, "row": 12, "expert": 16, "dst_slot": 48, "flags": 80, "weight": 84}
 # The service may copy this request's resident lanes with its copy engine (the device passes it only when capturing).
 LANE_REQUEST_FLAG_COPY_ENGINE = 1
+# CPU experts: the service may compute resident lanes on the CPU (tag CPU); the post staged the layer's input row.
+LANE_REQUEST_FLAG_CPU_EXPERTS = 2
 LANE_ACK = LANE_REQUEST + RING * LANE_REQUEST_BYTES
 LANE_ACK_BYTES = 8
 TERMINAL = LANE_ACK + RING * LANES * LANE_ACK_BYTES
@@ -101,6 +104,7 @@ GATE_SEQ_MASK = 0x1FFFFFFF
 READY = 1  # RowResult.ready
 LOADING = 2  # RowResult.ready: leased, still loading (piece-streaming plan; task 1)
 COPYING = 3  # RowResult.ready: leased, the service's copy engine writes the lane's destination slot
+CPU = 4  # RowResult.ready: leased, the CPU expert thread computes the lane; nothing writes its destination slot
 COPIED = 1  # CopyDone.gen
 COPY_ARM_TAG = 1  # CopyArm, written by the copy wait
 CONSUMED, VIOLATED = 1, 2  # LaneAck

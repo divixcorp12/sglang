@@ -90,6 +90,11 @@ def _check(cfg, budgets) -> None:
             "--cuda-graph-backend-decode disabled (or --disable-cuda-graph)"
         )
     if graph.decode.backend == Backend.DISABLED:
+        if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+            raise ValueError(
+                "SGLANG_DSV41_CPU_EXPERTS computes experts inside the captured decode graph's copy wait; "
+                "pass --cuda-graph-backend-decode breakable"
+            )
         _EAGER.check(cfg, budgets)
         return
     if graph.decode.backend != Backend.BREAKABLE:
@@ -115,6 +120,7 @@ def _check(cfg, budgets) -> None:
         raise ValueError("EXL3 graph gathers need SGLANG_MOE_HOT_GPU_MB")
     # The shared eager check refuses graph gather; decode graphs may use it.
     _EAGER.check(_EagerGraphView(cfg), dataclasses.replace(budgets, graph_gather=False))
+    _check_cpu_experts(budgets)
     # DSV4's alt-stream overlap still gives wrong output when captured in the breakable
     # decode graph, and this gate turns it off. Its mHC stats side stream was one cause
     # (forked before the MoE break, launched on after it; fixed by _refork_stats_stream:
@@ -130,6 +136,25 @@ def _check(cfg, budgets) -> None:
                 "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1; unset it or set it to 0"
             )
         overlap.set(False)
+
+
+def _check_cpu_experts(budgets) -> None:
+    """SGLANG_DSV41_CPU_EXPERTS (plan 2026-09-29-dsv41-cpu-experts, Step B): the RAM-miss service's grant sends
+    resident lanes to the CPU, the copy engine's copy wait completes them, and layer fusion's route tables and DIRECT
+    commit leave them out of the fused MoE and the residency."""
+    if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        return
+    needs = [
+        ("SGLANG_MOE_EXPERT_GRAPH_GATHER=1", budgets.graph_gather),
+        ("SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE.get()),
+        ("SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM.get()),
+        ("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get()),
+        ("SGLANG_DSV41_ENABLE_LAYER_FUSION=1", envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()),
+        ("SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list)", bool(envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get())),
+    ]
+    missing = [name for name, ok in needs if not ok]
+    if missing:
+        raise ValueError("SGLANG_DSV41_CPU_EXPERTS needs " + ", ".join(missing))
 
 
 exl3_expert_stream_requirements = ExpertStreamRequirements(

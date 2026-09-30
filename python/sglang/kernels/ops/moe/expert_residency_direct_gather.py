@@ -106,12 +106,14 @@ def direct_commit_gather(
     *,
     ready: int,
     free_state: int,
+    cpu_lanes: Optional[torch.Tensor] = None,
 ) -> None:
     """One layer's DIRECT residency commit; see ``GpuResidencyUpdater.commit_gather``.
 
     ``mapping`` is the layer's ``[experts + 1]`` row (last column the dump), ``slot_*`` its ``[slots + 1]`` rows (last
     column the dump). ``delivered`` and ``keep`` are the leased backend's delivered count and keep flag, both or
-    neither; without them the truncation tripwire compares ``miss_count``.
+    neither; without them the truncation tripwire compares ``miss_count``. ``cpu_lanes`` (int32 ``[1]``, CPU experts) is
+    the mask of lanes the CPU computed: never inserted, and not counted as truncated.
     """
     _commit_module().run(
         destinations,
@@ -129,6 +131,7 @@ def direct_commit_gather(
         delivered,
         keep,
         miss_count,
+        cpu_lanes,
         int(ready),
         int(free_state),
     )

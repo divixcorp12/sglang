@@ -849,6 +849,78 @@ struct HostExports {
     find(handle)->arm_copy_engine(on != 0);
   }
 
+  // CPU experts (plan 2026-09-29-dsv41-cpu-experts): `forward` is a CpuExpertForward's address (the trait's native
+  // forward), whose layers register later (set_cpu_layer); split int64 [kLeaseLanes + 1], CPU lanes
+  // per n resident lanes; cores int64 [n], the CPU expert thread's affinity (may be empty); x_rows uint8 [rows, stride]
+  // (host, the post kernel writes a row's input there) and out_rows float32 [rows, >= hidden] (host, the device reads
+  // a row's CPU partial sum there). Both must outlive the service.
+  static void enable_cpu_experts(
+      int64_t handle,
+      int64_t forward,
+      TensorView split,
+      TensorView cores,
+      TensorView x_rows,
+      TensorView out_rows,
+      int64_t hidden,
+      int64_t threads,
+      int64_t spin_ns) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    auto host_mem = SymbolicDevice{};
+    auto rows = SymbolicSize{"rows"};
+    expert_stream::verify_named(
+        "split", TensorMatcher({expert_stream::kLeaseLanes + 1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), split);
+    expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
+    expert_stream::verify_named(
+        "x_rows", TensorMatcher({rows, -1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), x_rows);
+    expert_stream::verify_named(
+        "out_rows", TensorMatcher({rows, -1}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_mem), out_rows);
+    if (forward == 0) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the trait's native forward");
+    expert_stream::CpuExpertConfig config;
+    config.forward = reinterpret_cast<expert_stream::CpuExpertForward>(static_cast<intptr_t>(forward));
+    const auto* c = static_cast<const int64_t*>(cores.data_ptr());
+    for (int64_t i = 0; i < cores.size(0); ++i)
+      config.cores.push_back(static_cast<int>(c[i]));
+    config.x_base = static_cast<const uint8_t*>(x_rows.data_ptr());
+    config.x_stride = x_rows.size(1);
+    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr());
+    config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
+    config.hidden = hidden;
+    config.threads = static_cast<int>(threads);
+    config.spin_ns = spin_ns;
+    const auto* sp = static_cast<const int64_t*>(split.data_ptr());
+    find(handle)->enable_cpu_experts(std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
+  }
+
+  // CPU experts: `row`'s layer handle (the trait's register_layer), once per row, at any time.
+  static void set_cpu_layer(int64_t handle, int64_t row, int64_t layer) {
+    find(handle)->set_cpu_layer(row, layer);
+  }
+
+  // CPU experts: split int64 [kLeaseLanes + 1], a new split table, at any time.
+  static void set_cpu_split(int64_t handle, TensorView split) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("split", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), split);
+    find(handle)->set_cpu_split(static_cast<const int64_t*>(split.data_ptr()), split.size(0));
+  }
+
+  // CPU experts: nodes int8 [capacity], each host slot's NUMA node for `row`; `preferred` the pool's node.
+  static void set_cpu_slot_nodes(int64_t handle, int64_t row, TensorView nodes, int64_t preferred) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("nodes", TensorMatcher({-1}).with_dtype<int8_t>().with_device<kDLCPU>(cpu), nodes);
+    find(handle)->set_cpu_slot_nodes(row, static_cast<const int8_t*>(nodes.data_ptr()), nodes.size(0), preferred);
+  }
+
+  // CPU experts' metrics: out int64 [3] = {jobs, lanes, forward ns}.
+  static void cpu_stats(int64_t handle, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("out", TensorMatcher({3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    find(handle)->cpu_stats(static_cast<int64_t*>(out.data_ptr()));
+  }
+
   // page: pinned uint8 [kPrefetchPageBytes], the native-prefetch request and done lines.
   static void enable_native_prefetch(int64_t handle, TensorView page) {
     using namespace host;
@@ -1299,6 +1371,11 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_copy_engine, Exports::enable_copy_engine);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_copy_table, Exports::set_copy_table);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_arm_copy_engine, Exports::arm_copy_engine);               \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_cpu_experts, Exports::enable_cpu_experts);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_slot_nodes, Exports::set_cpu_slot_nodes);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_idle, Exports::copy_engine_idle);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_native_prefetch, Exports::enable_native_prefetch); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_prefetch_lease, Exports::prefetch_lease);                 \

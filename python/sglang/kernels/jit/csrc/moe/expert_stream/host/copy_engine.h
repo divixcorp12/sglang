@@ -4,6 +4,7 @@
 #include "../lease_layout.h"
 #include "build_policy.h"
 #include "completion_word.h"
+#include "cpu_experts.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
 
@@ -19,6 +20,7 @@ struct CopyLane {
   int32_t host_slot = 0;
   int32_t dst_slot = 0;
   uint32_t slot_generation = 0;
+  float weight = 0.0f;  // the lane's routing weight: read only for a CPU lane
 };
 
 // One request's COPYING lanes, handed from the grant to the copy thread.
@@ -36,7 +38,15 @@ struct CopyJob {
   // only once it acknowledged its reads (SmAck), not on the DMA's completion. Never a prefetch job: no kernel reads
   // a prefetched row's slot, so a prefetch copies every entry itself.
   bool sm = false;
+  // CPU experts (tag kLeaseTagCpu): the lanes of `mask` the CPU expert thread computes instead of copying, and that
+  // engine's job sequence for them (set at issue, 0 without CPU lanes). The job completes when its copies AND that
+  // CPU job have; CopyDone then carries the whole mask. `token` is kNoToken when no lane was copied.
+  uint32_t cpu_mask = 0;
+  uint32_t cpu_seq = 0;
 };
+
+// CopyJob::token of a job that issued no copy (every lane on the CPU): nothing to query.
+constexpr int64_t kNoToken = -1;
 
 // One entry of a row's copy table: C1's (source slab, destination tensor, row bytes); lane rows index both.
 struct CopyEntry {
@@ -477,6 +487,12 @@ class CopyEngine {
     return dynamic_cast<HostCopyBackend*>(backend_.get());
   }
 
+  // CPU experts: the engine a job's CPU lanes go to. Set before any grant publishes a CPU lane (the service sets it
+  // before its thread starts); the release pairs with the copy thread's acquire at issue.
+  void set_cpu(CpuExpertEngine* cpu) {
+    cpu_.store(cpu, std::memory_order_release);
+  }
+
   // Test only: one more copy of `bytes` issued ahead of every job's own, so each job completes that much later.
   // InstrBuild only.
   void set_ballast(uint64_t dst, uint64_t src, int64_t bytes)
@@ -489,6 +505,9 @@ class CopyEngine {
 
  private:
   static constexpr int kRingOverflow = -1000;
+  static constexpr int kNoCpuEngine = -1001;   // a job carries CPU lanes but no CPU expert engine is set
+  static constexpr int kCpuRingOverflow = -1002;
+  static constexpr int kCpuFailed = -1003;     // the CPU expert thread's forward failed
   using Queue = FixedDeque<CopyJob, kCopyRing>;
 
   struct Table {
@@ -548,11 +567,19 @@ class CopyEngine {
       // word, no driver call (the cuEventQuery it replaces took a libcuda mutex per call: ~2,300-3,200 per job over
       // arm CS3, results.md 9a), and one cuStreamQuery per CompletionWord budget while the head stays pending.
       while (!in_flight.empty() && broken_ == 0) {
-        const int state = backend_->query(in_flight.front().token);
+        const CopyJob& head = in_flight.front();
+        const int state = head.token == kNoToken ? CopyBackend::kDone : backend_->query(head.token);
         if (state == CopyBackend::kPending) break;
         if (state != CopyBackend::kDone) {
           broken_ = state;
           break;
+        }
+        if (head.cpu_seq != 0) {
+          const CpuExpertEngine* cpu = cpu_.load(std::memory_order_relaxed);  // set before the job was issued
+          if (!cpu->done(head.cpu_seq)) {
+            if (cpu->broken() != 0) broken_ = kCpuFailed;  // never done: fail the job, its leases stay held (E5)
+            break;
+          }
         }
         const CopyJob done = in_flight.front();
         in_flight.pop_front();
@@ -634,8 +661,28 @@ class CopyEngine {
       }
     }
     job.sm = table.sm && !job.prefetch;
+    if (job.cpu_mask != 0) {
+      // First, so the CPU starts while the copies below are issued.
+      CpuExpertEngine* cpu = cpu_.load(std::memory_order_acquire);
+      if (cpu == nullptr) return kNoCpuEngine;
+      CpuJob cpu_job;
+      cpu_job.row = job.row;
+      for (int i = 0; i < job.count; ++i) {
+        const CopyLane& lane = job.lanes[i];
+        if ((job.cpu_mask >> lane.lane & 1u) == 0) continue;
+        cpu_job.slots[cpu_job.k] = lane.host_slot;
+        cpu_job.weights[cpu_job.k] = lane.weight;
+        ++cpu_job.k;
+      }
+      job.cpu_seq = cpu->submit(cpu_job);
+      if (job.cpu_seq == 0) return kCpuRingOverflow;
+    }
+    bool copied = false;
+    if constexpr (Build::kFaults) copied = ballast_.bytes.load() > 0;
     for (int i = 0; i < job.count; ++i) {
       const CopyLane& lane = job.lanes[i];
+      if ((job.cpu_mask >> lane.lane & 1u) != 0) continue;  // computed on the CPU: nothing copies its slot
+      copied = true;
       for (const CopyEntry& entry : table.entries) {
         if (entry.sm && job.sm) continue;
         const uint64_t dst = entry.dst + static_cast<uint64_t>(lane.dst_slot) * static_cast<uint64_t>(entry.bytes);
@@ -643,6 +690,10 @@ class CopyEngine {
         if (const int r = backend_->issue(dst, src, entry.bytes)) return r;
         bytes += entry.bytes;
       }
+    }
+    if (!copied) {
+      job.token = kNoToken;
+      return 0;
     }
     const int r = backend_->mark(&job.token);
     if constexpr (Build::kMetrics) {
@@ -684,6 +735,7 @@ class CopyEngine {
   }
 
   std::unique_ptr<CopyBackend> backend_;
+  std::atomic<CpuExpertEngine*> cpu_{nullptr};
   std::vector<Table> tables_;
   int64_t spin_ns_;
   uint64_t spin_iters_ = 1;  // idle polls before the futex sleep: idle_budget(spin_ns_), set in start()

@@ -978,6 +978,8 @@ class GpuResidencyUpdater:
         if self.layer_fusion:
             self._fused_commit_gather(row, streamer, destinations, live)
             return
+        if getattr(backend, "name", None) == "exl3_ram_miss" and backend.cpu_experts:
+            raise RuntimeError("CPU experts need SGLANG_DSV41_ENABLE_LAYER_FUSION: only its commit leaves CPU lanes out")
         if getattr(backend, "name", None) == "exl3_ram_miss":
             delivered = backend.delivered_count.long()
             live = live & (self.gather_lanes < delivered) & (backend.keep[0] > 0)
@@ -1051,6 +1053,8 @@ class GpuResidencyUpdater:
             backend.delivered_count if leased else None,
             backend.keep if leased else None,
             streamer._graph_miss_count,
+            # CPU experts: the lanes the CPU computed were never copied into their slots, so they stay unmapped.
+            cpu_lanes=backend.device_side.cpu_lanes if leased and backend.cpu_experts else None,
             ready=_READY,
             free_state=_FREE,
         )

@@ -1923,6 +1923,16 @@ class Envs:
     SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
     SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
+    # CPU lanes per n resident lanes of a layer, n = 0..8, as 9 comma-separated counts ("0,1,1,2,3,3,4,5,5"). Empty
+    # computes k*(n) from the three costs below (policy.split_table).
+    SGLANG_DSV41_CPU_EXPERTS_SPLIT = EnvStr("")
+    # ms per expert on the CPU pool, per resident row over the link, and per layer handoff. Defaults are P0's native
+    # resid+b128 build at 12 node-1 threads and the measured link (plan 2026-09-29-dsv41-cpu-experts, P0 results).
+    SGLANG_DSV41_CPU_EXPERTS_CPU_MS = EnvFloat(0.52)
+    SGLANG_DSV41_CPU_EXPERTS_LINK_MS = EnvFloat(1.0)
+    SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS = EnvFloat(0.02)
+    # Batches between re-tunes of the split from the CPU's measured cost per expert; 0 keeps the startup table.
+    SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES = EnvInt(0)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

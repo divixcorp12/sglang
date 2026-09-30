@@ -144,9 +144,11 @@ class LeaseSim:
         protect: Optional[Sequence[int]] = None,
         dst: Optional[Sequence[int]] = None,
         copy_engine: bool = False,
+        cpu_weights: Optional[Sequence[float]] = None,
     ) -> SimRequest:
         """``need`` and ``protect`` override what the post kernel would put in the record (its routes, not its lanes);
-        ``dst`` are the lanes' destination slots and ``copy_engine`` the LaneRequest flag (LEASE_PROTOCOL.md 7.6)."""
+        ``dst`` are the lanes' destination slots and ``copy_engine`` the LaneRequest flag (LEASE_PROTOCOL.md 7.6).
+        ``cpu_weights``: the lanes' routing weights and the CPU-experts flag, as a post with CPU input writes them."""
         head = page_word(self.page, "demand_head")
         seq = (head + 1) & 0xFFFFFFFF
         if seq == 0:
@@ -165,6 +167,12 @@ class LeaseSim:
             slots = list(dst or []) + [-1] * (lease.LANES - len(dst or []))
             self._i32(base + fields["dst_slot"], lease.LANES)[:] = torch.tensor(slots, dtype=torch.int32)
             flags = lease.LANE_REQUEST_FLAG_COPY_ENGINE if copy_engine else 0
+            if cpu_weights is not None:
+                flags |= lease.LANE_REQUEST_FLAG_CPU_EXPERTS
+                weights = list(cpu_weights) + [0.0] * (lease.LANES - len(cpu_weights))
+                self._i32(base + fields["weight"], lease.LANES)[:] = torch.tensor(weights, dtype=torch.float32).view(
+                    torch.int32
+                )
             self._i32(base + fields["flags"])[:] = torch.tensor([flags], dtype=torch.int32)
             self.write_u64(base + fields["gen"], lease.tagged(DEMAND_TAG, gen))
         mapping = self.host.mapping(row)

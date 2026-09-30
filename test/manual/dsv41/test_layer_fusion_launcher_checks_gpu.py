@@ -50,6 +50,7 @@ def _commit_args(width: int = 6, experts: int = 16, slots: int = 8) -> dict:
         "delivered": torch.zeros(1, dtype=torch.int32, device=CUDA),
         "keep": torch.ones(1, dtype=torch.float32, device=CUDA),
         "miss_count": torch.zeros(1, dtype=torch.int32, device=CUDA),
+        "cpu_lanes": None,
         "ready": 3,
         "free_state": 0,
     }
@@ -69,6 +70,9 @@ def _route_args(routes: int = 6, slots: int = 12, hidden: int = 64) -> dict:
         "inv_order": torch.zeros(routes, dtype=torch.int64, device=CUDA),
         "weight_sorted": torch.zeros(routes, dtype=torch.float16, device=CUDA),
         "det": torch.zeros(3, slots + 1, dtype=torch.int64, device=CUDA),
+        "cpu_lanes": torch.empty(0, dtype=torch.int32, device=CUDA),
+        "dst_slots": torch.empty(0, dtype=torch.int32, device=CUDA),
+        "cpu_out": 0,
     }
 
 
@@ -177,6 +181,15 @@ COMMIT_REFUSALS = {
         },
         "^delivered: ",
     ),
+    "cpu_lanes_unleased": (
+        lambda: {
+            **_commit_args(),
+            "delivered": None,
+            "keep": None,
+            "cpu_lanes": torch.zeros(1, dtype=torch.int32, device=CUDA),
+        },
+        "cpu_lanes needs the leased delivery count",
+    ),
 }
 
 ROUTE_REFUSALS = {
@@ -205,6 +218,18 @@ ROUTE_REFUSALS = {
             "x16_out": torch.zeros(1, 65, dtype=torch.float16, device=CUDA),
         },
         "^x16_out: ",
+    ),
+    "cpu_lanes_two_words": (
+        lambda: {**_route_args(), "cpu_lanes": torch.zeros(2, dtype=torch.int32, device=CUDA)},
+        "cpu_lanes: one word",
+    ),
+    "cpu_out_missing": (
+        lambda: {**_route_args(), "cpu_lanes": torch.zeros(1, dtype=torch.int32, device=CUDA)},
+        "cpu_out: the CPU partial",
+    ),
+    "cpu_lanes_on_host": (
+        lambda: {**_route_args(), "cpu_lanes": torch.zeros(1, dtype=torch.int32), "cpu_out": 16},
+        "^cpu_lanes: ",
     ),
 }
 

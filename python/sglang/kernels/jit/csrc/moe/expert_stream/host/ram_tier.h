@@ -98,6 +98,7 @@ class RamTier {
   ~RamTier() {
     fill_join();  // the fill thread reads through reader_ into the slabs; nothing else holds the tier by now
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
+    if (cpu_ != nullptr) cpu_->stop();  // after the copy thread, its only client
   }
 
   bool open() {
@@ -825,6 +826,70 @@ class RamTier {
     copy_armed_.store(on, std::memory_order_release);
   }
 
+  // CPU experts (plan 2026-09-29-dsv41-cpu-experts, "Step B"): of a copy-engine request's resident lanes, the grant
+  // publishes split[n] (n = those lanes, at most kLeaseLanes) with tag kLeaseTagCpu, and the copy thread hands them to
+  // the CPU expert thread instead of copying them. Needs the copy engine; before the service thread starts. The
+  // request must also carry kLeaseLrFlagCpuExperts, which the post kernel sets only for a captured decode post.
+  void enable_cpu_experts(CpuExpertConfig config, std::vector<int64_t> split) {
+    if (threaded_.load())
+      throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");
+    if (copy_engine_ == nullptr)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the copy engine, which completes their lanes");
+    if (cpu_ != nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are already enabled");
+    config.rows = layers_;
+    if (split.size() != static_cast<size_t>(kLeaseLanes) + 1)
+      throw std::runtime_error(error_prefix<Layout>() + "the CPU split table has one entry per n = 0..kLeaseLanes");
+    for (size_t n = 0; n < split.size(); ++n) {
+      if (split[n] < 0 || split[n] > static_cast<int64_t>(n))
+        throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
+      cpu_split_[n].store(static_cast<uint8_t>(split[n]), std::memory_order_relaxed);
+    }
+    cpu_nodes_.assign(static_cast<size_t>(layers_), {});
+    const std::string prefix = std::string(Layout::kName) + " CPU experts: ";
+    auto engine = std::make_unique<CpuExpertEngine>(std::move(config), prefix, std::string(Layout::kName) + "-cpu-exp");
+    engine->start();
+    cpu_ = std::move(engine);
+    copy_engine_->set_cpu(cpu_.get());
+  }
+
+  // CPU experts: each host slot's NUMA node for `row`, and the node the CPU lanes prefer (the pool's). Optional; before
+  // the service thread starts. Without it the grant takes the first lanes.
+  void set_cpu_slot_nodes(int64_t row, const int8_t* nodes, int64_t count, int64_t preferred) {
+    if (threaded_.load())
+      throw std::runtime_error(error_prefix<Layout>() + "set CPU slot nodes before the service thread starts");
+    if (cpu_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+    if (row < 0 || row >= layers_ || count != tiers_[row].capacity)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU slot nodes: one node per host slot of a valid row");
+    cpu_nodes_[row].assign(nodes, nodes + count);
+    cpu_preferred_node_ = static_cast<int8_t>(preferred);
+  }
+
+  // CPU experts: `row`'s layer handle, from the trait's register_layer. Any time, once per row; until then no grant
+  // sends the row to the CPU.
+  void set_cpu_layer(int64_t row, int64_t handle) {
+    if (cpu_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+    cpu_->set_layer(row, handle);
+  }
+
+  // CPU experts: replace the split table (P3's re-tuning between requests). Any time; the grant reads each entry once.
+  void set_cpu_split(const int64_t* split, int64_t count) {
+    if (cpu_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+    if (count != static_cast<int64_t>(kLeaseLanes) + 1)
+      throw std::runtime_error(error_prefix<Layout>() + "the CPU split table has one entry per n = 0..kLeaseLanes");
+    for (int64_t n = 0; n < count; ++n)
+      if (split[n] < 0 || split[n] > n)
+        throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
+    for (int64_t n = 0; n < count; ++n)
+      cpu_split_[n].store(static_cast<uint8_t>(split[n]), std::memory_order_relaxed);
+  }
+
+  // CPU experts' metrics, from the CPU expert thread: {jobs, lanes, forward ns}. Zeros when off.
+  void cpu_stats(int64_t* out) const {
+    out[0] = cpu_ != nullptr ? cpu_->jobs() : 0;
+    out[1] = cpu_ != nullptr ? cpu_->lanes() : 0;
+    out[2] = cpu_ != nullptr ? cpu_->compute_ns() : 0;
+  }
+
   // Native prefetch (plan 2026-09-25-dsv41-native-prefetch): serve the device's advisory next-layer copy requests
   // from `page` (kPrefetchPageBytes, pinned). Needs the copy engine; before the service thread starts.
   void enable_native_prefetch(uint8_t* page) {
@@ -1003,9 +1068,11 @@ class RamTier {
     int32_t experts[kLeaseLanes];
     int32_t dst[kLeaseLanes];
     uint32_t flags = 0;
+    float weights[kLeaseLanes];
     std::memcpy(experts, base + kLeaseLrExpert, sizeof(experts));
     std::memcpy(dst, base + kLeaseLrDst, sizeof(dst));
     std::memcpy(&flags, base + kLeaseLrFlags, 4);
+    std::memcpy(weights, base + kLeaseLrWeight, sizeof(weights));
     std::atomic_thread_fence(std::memory_order_acquire);
     if (load_acquire64(base + kLeaseLrGen) != word) return false;
     if (count > static_cast<uint32_t>(kLeaseLanes) || static_cast<int64_t>(row) != request->row) return false;
@@ -1013,6 +1080,7 @@ class RamTier {
     request->lane_experts.assign(experts, experts + count);
     request->lane_dst.assign(dst, dst + count);
     request->lane_flags = flags;
+    request->lane_weight.assign(weights, weights + count);
     return true;
   }
 
@@ -1169,12 +1237,17 @@ class RamTier {
         const int32_t dst = lane < request.lane_dst.size() ? request.lane_dst[lane] : -1;
         if (copy_engine_->eligible(request.row, dst)) {
           tags[lane] = kLeaseTagCopying;
-          job.lanes[job.count++] = CopyLane{static_cast<int32_t>(lane), slot, dst, tier.generation[slot]};
+          const float weight = lane < request.lane_weight.size() ? request.lane_weight[lane] : 0.0f;
+          job.lanes[job.count++] = CopyLane{static_cast<int32_t>(lane), slot, dst, tier.generation[slot], weight};
           job.mask |= 1u << lane;
         } else {
           this->template count<kCopyFallbacks>();  // `count` is also this function's lane count
         }
       }
+    }
+    if (job.count > 0 && cpu_ != nullptr && (request.lane_flags & kLeaseLrFlagCpuExperts) != 0 &&
+        cpu_->eligible(request.row)) {
+      choose_cpu_lanes_locked(request.row, &job, tags);
     }
     if (taken == 0) return true;
     uint8_t* results = lease_ + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
@@ -1189,7 +1262,9 @@ class RamTier {
       if (!take[lane]) continue;
       const int32_t slot = slots[lane];
       tier.leases[slot] += 1;
-      entry.lane[lane] = LaneLease{1, slot, tier.generation[slot], false, tags[lane] == kLeaseTagCopying};
+      // A CPU lane is completed by the copy thread too: only its observed completion releases the lease.
+      entry.lane[lane] = LaneLease{
+          1, slot, tier.generation[slot], false, tags[lane] == kLeaseTagCopying || tags[lane] == kLeaseTagCpu};
       uint8_t* result = results + lane * kLeaseRowResultBytes;
       const uint32_t generation = tier.generation[slot];
       const int32_t expert = request.lane_experts[lane];
@@ -1221,6 +1296,28 @@ class RamTier {
       copy_engine_->submit(job);
     }
     return true;
+  }
+
+  // CPU experts: split[n] of the job's n copy-engine lanes go to the CPU, the pool's NUMA node first, then lane order.
+  // They keep their place in the job (E6 and CopyDone cover them), are tagged kLeaseTagCpu, and are named in cpu_mask.
+  void choose_cpu_lanes_locked(int64_t row, CopyJob* job, uint64_t* tags) {
+    const size_t n = std::min<size_t>(static_cast<size_t>(job->count), kLeaseLanes);
+    size_t want = cpu_split_[n].load(std::memory_order_relaxed);
+    if (want == 0) return;
+    const std::vector<int8_t>& nodes = cpu_nodes_[row];
+    for (int pass = 0; pass < 2 && want > 0; ++pass) {
+      for (int i = 0; i < job->count && want > 0; ++i) {
+        const CopyLane& lane = job->lanes[i];
+        if ((job->cpu_mask >> lane.lane & 1u) != 0) continue;
+        const bool local = nodes.empty() || nodes[lane.host_slot] == cpu_preferred_node_;
+        if (pass == 0 && !local) continue;
+        job->cpu_mask |= 1u << lane.lane;
+        tags[lane.lane] = kLeaseTagCpu;
+        --want;
+      }
+    }
+    this->template count<kCpuJobs>();
+    this->template count<kCpuLanes>(__builtin_popcount(job->cpu_mask));
   }
 
   // Lease every lane's source slot and publish its row result, in one critical section, after the rows are ready
@@ -2457,6 +2554,11 @@ class RamTier {
   bool piece_stream_ = false;           // set before the service thread starts, with the reader's flag
   // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
   std::unique_ptr<Engine> copy_engine_;
+  // CPU experts, when enabled (after the copy engine, before the service thread); stopped after the copy thread.
+  std::unique_ptr<CpuExpertEngine> cpu_;
+  std::array<std::atomic<uint8_t>, kLeaseLanes + 1> cpu_split_{};
+  std::vector<std::vector<int8_t>> cpu_nodes_;  // per row, per host slot: its NUMA node; empty: no preference
+  int8_t cpu_preferred_node_ = -1;
   std::atomic<bool> copy_armed_{false};
   int64_t copy_wait_timeout_ns_ = 0;           // set with the copy engine, before any thread reads it
   std::atomic<uint64_t> gate_released_{0};

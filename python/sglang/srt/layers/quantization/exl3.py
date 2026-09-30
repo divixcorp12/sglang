@@ -589,7 +589,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if prefetch is not None:
             # Before the gather reads residency: wait for the previous layer's prefetch into this one and map it.
             prefetch.commit(layer.layer_id, backend.routes)
-        remap, _ = streamer.gather(topk_ids)
+        cpu_experts = isinstance(backend, Exl3RamMissRowBackend) and backend.cpu_experts
+        if cpu_experts:
+            from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+
+            # The first graph-path forward of the layer is a warmup, before capture: the only place that knows the
+            # layer's activation limit registers its pinned slabs with the CPU kernel.
+            Exl3RamMissService.get().cpu_experts.register(backend.row, float(swiglu_limit))
+            # The post stages x and the lanes' weights for the CPU expert thread (Exl3RamMissRowBackend.post).
+            backend.cpu_input = (x, topk_weights)
+        try:
+            remap, _ = streamer.gather(topk_ids)
+        finally:
+            if cpu_experts:
+                backend.cpu_input = None
         if isinstance(backend, Exl3RamMissRowBackend) and backend.route_log is not None:
             if backend.route_log.router is not None:
                 # After the gather: its post ran the layer's route_log.record, which row 0 used to take the slot.
@@ -605,6 +618,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             remap.reshape(-1) if fused.layer_fusion else remap.reshape(-1).long(),
             streamer.row_backend.keep,
             swiglu_limit,
+            cpu=(
+                (
+                    backend.device_side.cpu_lanes,
+                    streamer.row_plan.slots,
+                    backend.device_side.cpu_out_address(backend.row),
+                )
+                if cpu_experts
+                else None
+            ),
         )
         # cast=False hands the fp32 output to exl3_scale_to_bf16, which casts and scales in one kernel.
         return out.to(x.dtype) if cast else out

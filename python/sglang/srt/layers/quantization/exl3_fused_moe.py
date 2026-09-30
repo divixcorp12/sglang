@@ -139,9 +139,10 @@ class Exl3FusedMoE:
             self.weight_sorted = torch.zeros(top_k, **half)
             self.det = torch.zeros((3, slots + 1), dtype=torch.int64, device=device)
 
-    def _fused_route_tables(self, x, topk_weights, remap, keep):
+    def _fused_route_tables(self, x, topk_weights, remap, keep, cpu=None):
         from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
 
+        cpu_lanes, dst_slots, cpu_out = cpu if cpu is not None else (None, None, 0)
         exl3_moe_route_tables(
             remap.contiguous(),
             topk_weights.contiguous(),
@@ -154,19 +155,27 @@ class Exl3FusedMoE:
             self.inv_order,
             self.weight_sorted,
             self.det,
+            cpu_lanes=cpu_lanes,
+            dst_slots=dst_slots,
+            cpu_out=cpu_out,
         )
         return self.remap64, self.inv_order, self.weight_sorted, self.det
 
-    def run(self, x, topk_weights, remap, keep, act_limit: float) -> torch.Tensor:
+    def run(self, x, topk_weights, remap, keep, act_limit: float, cpu=None) -> torch.Tensor:
         """x [1, H] any float dtype; topk_weights [6]; remap [6] slots, int64 (int32 too with layer fusion);
-        keep fp32 [1]."""
+        keep fp32 [1].
+
+        ``cpu`` = (cpu_lanes, dst_slots, cpu_out address), CPU experts only: the routes the CPU computed are left out
+        and its partial sum seeds the output (exl3_route_tables.cuh). Layer fusion only."""
         if x.shape[0] != 1:  # a host-side shape read: capture-safe
             raise ValueError(
                 f"exl3 in-graph MoE runs one token (BS1 decode), not {x.shape[0]}"
             )
+        if cpu is not None and not self.layer_fusion:
+            raise RuntimeError("CPU experts need SGLANG_DSV41_ENABLE_LAYER_FUSION: only its route tables leave CPU routes out")
         if self.layer_fusion:
             remap, inv_order, weight_sorted, det = self._fused_route_tables(
-                x, topk_weights, remap, keep
+                x, topk_weights, remap, keep, cpu
             )
         else:
             self.x16.copy_(x)

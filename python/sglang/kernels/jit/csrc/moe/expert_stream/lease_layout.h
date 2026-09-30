@@ -71,9 +71,15 @@ constexpr int64_t kLeaseLrExpert = 16;
 constexpr int64_t kLeaseLrDst = 48;    // int32 per lane: the plan's destination slot, -1 past the plan
 constexpr int64_t kLeaseLrFlags = 80;  // u32; bit kLeaseLrFlagCopyEngine lets the service copy this request's hits
 constexpr uint32_t kLeaseLrFlagCopyEngine = 1;
+// f32 per lane (CPU experts, plan 2026-09-29-dsv41-cpu-experts): the lane expert's routing weight, 0 past the plan.
+constexpr int64_t kLeaseLrWeight = 84;
+// u32 flag: the service may compute this request's resident lanes on the CPU (tag kLeaseTagCpu); needs the copy engine
+// flag too, since the copy thread completes those lanes. The post also staged the layer's input row for it.
+constexpr uint32_t kLeaseLrFlagCpuExperts = 2;
 static_assert(kLeaseLrExpert + 4 * kLeaseLanes == kLeaseLrDst, "LaneRequest: dst_slot[] follows expert[]");
 static_assert(kLeaseLrDst + 4 * kLeaseLanes == kLeaseLrFlags, "LaneRequest: flags follow dst_slot[]");
-static_assert(kLeaseLrFlags + 4 <= kLeaseLaneRequestBytes, "LaneRequest: the payload fits one record");
+static_assert(kLeaseLrFlags + 4 == kLeaseLrWeight, "LaneRequest: weight[] follows flags");
+static_assert(kLeaseLrWeight + 4 * kLeaseLanes <= kLeaseLaneRequestBytes, "LaneRequest: the payload fits one record");
 constexpr int64_t kLeaseLaneAck = kLeaseLaneRequest + kLeaseRing * kLeaseLaneRequestBytes;
 constexpr int64_t kLeaseLaneAckBytes = 8;
 constexpr int64_t kLeaseTerminal = kLeaseLaneAck + kLeaseRing * kLeaseLanes * kLeaseLaneAckBytes;
@@ -131,6 +137,10 @@ constexpr uint64_t kLeaseTagLoading = 2;  // RowResult.ready: leased, still load
 // RowResult.ready: leased; the service's copy engine writes this lane's destination slot, so no kernel copies it
 // and nothing reads the slot before CopyDone carries the generation.
 constexpr uint64_t kLeaseTagCopying = 3;
+// RowResult.ready (CPU experts): leased; the service's CPU expert thread computes this lane's expert from its host slot
+// and nothing copies its destination slot. The device treats it as COPYING (CW waits for its CopyDone) and leaves the
+// route's slot out of the fused MoE, adding the CPU's partial sum instead.
+constexpr uint64_t kLeaseTagCpu = 4;
 constexpr uint64_t kLeaseTagCopied = 1;   // CopyDone
 constexpr uint64_t kLeaseTagCopyArm = 1;  // CopyArm
 constexpr uint64_t kLeaseTagConsumed = 1;
