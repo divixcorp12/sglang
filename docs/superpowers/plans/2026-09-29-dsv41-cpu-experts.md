@@ -199,6 +199,69 @@ These are the changes found in the current code (`exl3.py:_apply_graph`, `expert
 
 ---
 
+## P0 results (2026-09-29, `c7b6ca4ab4`, `analysis/dsv41-drive/cpu-experts/p0_real.py`)
+
+**Setup.**
+- Production was down. The fork's own `exl3_ext()` build (exllamav3 `02aef45`) ran on real DSV4.1 rows read from the
+  EXL3 shards, laid out as the pinned tier's slabs (`w13_*` `[N, 2, ...]`, gate = part 0, up = part 1).
+- Activation 0 with `act_limit` 10, as the graph path passes it.
+- Cores 18-29, `numactl --membind=1`, `EXL3_MOE_CPU_PIN=0`.
+- Raw records are in `p0_results.jsonl` beside the script on divix01 (`wt-cpu-experts`). Logs are
+  `p0_acc-r1.log` and `p0_perf-r1-{native,swizzled}.log`.
+
+**Plan corrections found on the way:**
+- **No SwiGLU work is needed.** Upstream's activation 0 with a nonzero `act_limit` computes
+  `min(silu(g), lim) · clamp(u, ±lim)`, the same as the GPU graph path's exllamav3 kernel.
+  (The eager torch reference in `exl3_ops.py` clamps before the SiLU, a negligible difference.)
+- **No w13 adapter is needed.** `w13_*[slot, part]` is contiguous per projection, and the GPU's
+  `slot_pointer_tables` uses the same views.
+- **No vendoring is needed.** `exl3_ext()` already builds `cpu/moe_mul1.cpp` and `moe_handoff.cu` and binds
+  `exl3_moe_cpu_*`, `exl3_moe_flag_*` and `moe_unswizzle_trellis`.
+- **The codebook matches.** Every loaded tensor's `mul1` is `0x83DCD12D`, the constant the CPU kernel hard-codes.
+
+**Accuracy** (`accuracy 0,19,39 12 acc-r1`, under `cc-gpu.lock`).
+- Setup: 12 random experts per layer, 8 cases each, top-1 and top-6, at input scale 1 and at 8 (scale 8 drives
+  values past the clamp).
+- Relative L2 against the fp32 reconstruct reference (`exl3_linear_reference`):
+
+| Path | p50 over groups | worst max |
+|---|---:|---:|
+| CPU, AVX-512BW tier (what would serve) | 1.38-1.86% | 2.23% (layer 39, scale 8, top-6) |
+| GPU `exl3_linear` (today's production kernel family) | 1.05-1.38% | 1.51% |
+| CPU, scalar fp32 tier | 0.16-0.44% | 1.25% |
+| CPU BW against GPU | 1.71-2.30% | 2.75% |
+
+- The CPU path is ~1.3x the GPU path's own quantization error, with every output finite. The int8 activations
+  account for the gap: the scalar tier is 4-8x closer to the reference than either.
+- The ≤2% gate passes at the median and is marginal at the worst case. The deciding gate stays the teacher-forced
+  KL of P2.
+
+**Throughput** (`perf 19 384 8,10,12 1,2,6 {native,swizzled}`). Cold, over 384 real experts (5.1 GB). ms per
+expert, p50 (p90 ≤ 1.1x p50):
+
+| Threads | native, 1 / 2 / 6 per call | swizzled, 1 / 2 / 6 per call |
+|---:|---|---|
+| 8 | 0.717 / 0.658 / 0.644 | 0.593 / 0.539 / 0.529 |
+| 10 | 0.622 / 0.594 / 0.543 | 0.514 / 0.485 / 0.455 |
+| 12 | **0.555 / 0.510 / 0.475** | **0.450 / 0.411 / 0.385** |
+
+- **Native misses the ≤0.5 ms gate at decode's 1-2 experts per layer** (0.51-0.56 ms). It is still ~1.9x
+  faster per expert than the link (~1.0 ms). Swizzled matches §28's 0.40-0.46 and is 19-23% faster.
+- **Swizzling is worth taking, and does not need a second copy.** Upstream stores the CPU arena swizzled and
+  unswizzles on the GPU when staging to VRAM (`moe_unswizzle_trellis`, bound in `exl3_ext`). Applied here, the
+  pinned tier (and the row images it reads from NVMe) would be swizzled, and every H2D row copy would gain one
+  device-side unswizzle into its VRAM slot. Price that in P1 against a ~20% smaller `c_cpu`, and measure the
+  unswizzle kernel's cost per row on the 5090.
+- **With native `c_cpu` ≈ 0.53 ms, `k*(n)` becomes ~0.65·n:** n = 1 → 1, 2 → 1-2 (a tie), 3 → 2, 4 → 3,
+  6 → 4. With swizzled (0.42), n = 2 → 2.
+
+**Still open in P0:**
+- `c_cpu` under concurrent NVMe DMA into node-1 slabs and under copy-engine H2D load.
+- Node-1 cores reading node-0 memory.
+- Both need the RAM-miss service running, and are easiest to take in P2's prototype.
+
+---
+
 ## 6. Risks and open questions
 
 - **Cores (owner decision 2026-09-29): 12 node-1 physical cores, e.g. 18-29.** They are dedicated to the CPU-expert pool;
