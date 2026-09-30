@@ -329,6 +329,15 @@ def _attach_all(service, streamers, capacity=None):
         streamer.format.attach_hot_cache_manager(manager, streamer)
 
 
+@pytest.fixture(autouse=True)
+def _stub_piece_maps(monkeypatch):
+    """_attach_all's copy tables are stubs, so their piece maps are too; _attach_with_copy_tables builds real ones."""
+    real = module.stream_segment_map
+    monkeypatch.setattr(
+        module, "stream_segment_map", lambda segments, tables, row: None if segments is None else real(segments, tables, row)
+    )
+
+
 @pytest.mark.parametrize("traced", [False, True], ids=["trace_off", "trace_on"])
 def test_graph_routes_are_logged_only_when_the_stage_trace_is_on(tiers, monkeypatch, tmp_path, traced):
     """Trace off: no route log exists, so no backend adds a copy to the captured graph, no per-batch
@@ -424,7 +433,7 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
                         lambda layer, streamer: SimpleNamespace(
                             layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit, cpu=None: x.float()))
     backend = module.Exl3RamMissRowBackend(
-        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, -1, 6, route_log=route_log
+        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, 6, {0: None}, route_log=route_log
     )
     remap = torch.zeros(6, dtype=torch.int32)
     streamer = SimpleNamespace(row_backend=backend, gather=lambda topk_ids: (remap, None))
@@ -632,7 +641,7 @@ def test_shutdown_freezes_native_reader_before_final_trace(monkeypatch):
         service, "_trace_step", lambda *, final=False: order.append(("trace", host.layer_rows(), final))
     )
     service.shutdown()
-    assert order == ["close_admission", "gpu_barrier", "pause", ("trace", [2], True), "stop"]
+    assert order == ["gpu_barrier", "close_admission", "pause", ("trace", [2], True), "stop"]
 
 
 def test_shutdown_quarantines_after_native_stop_failure(monkeypatch):
@@ -859,24 +868,35 @@ def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
     assert backend.routes.tolist() == [5, 2, 9, 0, -1, -1]
 
 
-def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes():
+def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes(monkeypatch):
     # The post kernel reads planned for min(count, 8) lanes and count lives on the
     # device, so a 6-lane plan (graph_gather_rows = top-6) must not be passed as is.
     from sglang.kernels.ops.moe.expert_stream_transport import MAX_IDS
 
     calls = []
     device_side = SimpleNamespace(
-        post=lambda row, planned, count, routes, next_row, hot_slots, hot_capacity: calls.append(("post", planned.clone())),
-        wait=lambda row, planned, count, host_rows, keep, ram_miss: calls.append(("wait", planned.clone())),
+        post=lambda row, planned, *a, **kw: calls.append(("post", planned.clone())),
+        hit_wait=lambda row, planned, *a: calls.append(("hit_wait", planned.clone())),
+        stream=lambda row, planned, *a: calls.append(("stream", planned.clone())),
+        copy_wait=lambda count, sm: calls.append(("copy_wait", None)),
+        host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False,
     )
-    backend = module.Exl3RamMissRowBackend({0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, -1, 6)
+    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *a: calls.append(("c1", None)))
+    backend = module.Exl3RamMissRowBackend(
+        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, 6, {0: None}
+    )
     assert backend.planned.numel() >= MAX_IDS
-    plan = SimpleNamespace(expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]), count=torch.tensor([3], dtype=torch.int32))
-    backend.translate(0, plan)
+    plan = SimpleNamespace(
+        expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]), count=torch.tensor([3], dtype=torch.int32),
+        slots=torch.arange(6, dtype=torch.int32),
+    )
+    backend.post(0, plan)
+    assert [name for name, _ in calls] == ["post", "hit_wait", "c1", "stream", "copy_wait"]
     for name, planned in calls:
-        assert planned.numel() >= MAX_IDS, name
-        assert planned.tolist() == [4, 2, 5, 0, 0, 0] + [-1] * (planned.numel() - 6), name
-    assert [name for name, _ in calls] == ["post", "wait"]
+        if planned is not None:
+            assert planned.numel() >= MAX_IDS, name
+            assert planned.tolist() == [4, 2, 5, 0, 0, 0] + [-1] * (planned.numel() - 6), name
+    assert backend.delivered_count is plan.count
 
 
 def test_a_test_fault_spec_parses():

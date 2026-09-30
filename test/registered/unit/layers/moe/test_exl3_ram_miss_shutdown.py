@@ -270,7 +270,7 @@ def test_an_interrupt_in_the_barrier_quarantines_first_and_then_goes_on_like_one
     monkeypatch.setattr(service, "_establish_gpu_completion", interrupted)
     with pytest.raises(KeyboardInterrupt):
         service.shutdown()
-    assert order == ["synchronize", "close_admission", "stop", "quarantine0", "quarantine1"]
+    assert order == ["synchronize", "stop", "quarantine0", "quarantine1"]  # the interrupt skips the close; stop ends it
     assert service._quarantined and service._completed
 
 
