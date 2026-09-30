@@ -1278,6 +1278,20 @@ def _device_module_cached(layout: str) -> Module:
     )
 
 
+def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Module:
+    """Test only: the device kernels built with the ``EXL3_RAM_MISS_TEST_*`` hooks ``defines`` turn on (``NAME`` or
+    ``NAME=value``), a module of its own; production builds with none, so its kernels carry no test knob."""
+    if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
+        raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
+    return load_jit(
+        f"expert_stream_{layout}",
+        "test",
+        cuda_files=[LAYOUTS[layout].device_source],
+        cuda_wrappers=_device_wrappers(layout),
+        extra_cuda_cflags=[f"-D{d}" for d in defines],
+    )
+
+
 def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
     """The stream kernel's view of a copy table (``ExpertRowSegments``) for streamed row ``row``: int32
     ``[S + n]``, first each of ``tables``' S row segments' entry in the table (the pair whose source is that

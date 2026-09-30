@@ -121,6 +121,37 @@ class Chain:
         """The production gather of ``row``'s current plan into its destination rows 0..count-1."""
         self.backends[row].post(0, self.plans[row])
 
+    def chain(self, row=0, *, captured=False, before_c1=None, before_cw=None):
+        """``backend.post``'s chain step by step, eagerly: ``captured`` sets the LaneRequest flag an eager post never
+        carries (so the service may copy), and the hooks run on the stream between the steps."""
+        from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+        backend, plan, dev = self.backends[row], self.plans[row], self.dev
+        backend._stage_planned(plan)
+        dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=captured)
+        dev.hit_wait(row, backend.planned, plan.count, plan.slots, backend.hit_wait_ns)
+        if before_c1 is not None:
+            before_c1()
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        if before_cw is not None:
+            before_cw()
+        dev.copy_wait(plan.count, backend.copy_sm_table)
+
+    def rewrite_on_release(self, slots, row=0, timeout_s=10.0):
+        """The instant every lease of ``slots`` has dropped, write 0xAB over those slab slots; seconds from the call,
+        None if they never dropped."""
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < timeout_s:
+            info = self.host.slot_info(row)
+            if all(info[slot][2] == 0 for slot in slots):
+                released = time.perf_counter() - t0
+                for n in self.names:
+                    for slot in slots:  # an int index is a view of the slab; a list index would fill a copy
+                        self.slabs[row][n][slot].view(torch.uint8).fill_(0xAB)
+                return released
+        return None
+
     def snapshot(self, row=0):
         """Every destination tensor, copied on the gather's stream before anything synchronizes the device."""
         return {n: t.clone() for n, t in self.dest[row].items()}

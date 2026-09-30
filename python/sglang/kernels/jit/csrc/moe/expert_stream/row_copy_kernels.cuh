@@ -324,6 +324,14 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   }
   __syncthreads();
   if (p.sm_count > 0) {
+#ifdef EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS
+    // Test only (device_module_with_hooks): every warp but the first reads late, so a Done ahead of any read shows.
+    if (threadIdx.x >= 32) {
+      const uint64_t start = global_ns();
+      while (global_ns() - start < static_cast<uint64_t>(EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS)) {
+      }
+    }
+#endif
     for (uint32_t lanes = copying; lanes != 0; lanes &= lanes - 1) {
       const int lane = __ffs(lanes) - 1;
       for (int64_t k = 0; k < p.sm_count; ++k) {
