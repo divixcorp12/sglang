@@ -937,8 +937,8 @@ class RamTier {
       Outstanding& entry = outstanding_[idx];
       if (!entry.active) continue;
       // The acquire pairs with CW's release of Done: every device read of this request's slots happened before it.
-      // `>=`: Done moves on to G + 16 only after this entry retired, so a later value names a later request of idx.
-      if (load_acquire64(lease_ + kLeaseDone + idx * kLeaseDoneBytes) < entry.gen) continue;
+      // Done moves on to G + 16 only after this entry retired, so while it is active Done holds G or an older value.
+      if (load_acquire64(lease_ + kLeaseDone + idx * kLeaseDoneBytes) != entry.gen) continue;
       Tier& tier = tiers_[entry.row];
       bool open = false;
       for (uint32_t lane = 0; lane < entry.count; ++lane) {

@@ -22,9 +22,5 @@ def wire_header() -> Path:
     return MOE / "expert_stream" / "lease_layout.h"
 
 
-def native_prefetch_source() -> Path:
-    return MOE / "exl3_native_prefetch.cuh"
-
-
 def joined_text(paths) -> str:
     return "\n".join(path.read_text() for path in paths)
