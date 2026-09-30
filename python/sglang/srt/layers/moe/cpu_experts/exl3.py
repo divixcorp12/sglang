@@ -8,6 +8,15 @@ import torch
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 
 
+def _one_part(slab: torch.Tensor, rank: int) -> torch.Tensor:
+    """``slab`` as ``[slot, ...]`` of ``rank`` dims, from either that or the tier's ``[slot, 1, ...]``."""
+    if slab.dim() == rank + 1 and slab.shape[1] == 1:
+        return slab[:, 0]
+    if slab.dim() != rank:
+        raise ValueError(f"an EXL3 w2 slab of shape {tuple(slab.shape)} is neither [slot, ...] nor [slot, 1, ...]")
+    return slab
+
+
 class Exl3CpuQuantTrait:
     name = "exl3"
     slab_names = EXL3_STREAMED_NAMES
@@ -33,7 +42,11 @@ class Exl3CpuQuantTrait:
         if self.act_limit is None:
             raise ValueError("the EXL3 CPU kernel needs the layers' activation limit before a layer registers")
         w13_t, w13_u, w13_v = slabs["w13_trellis"], slabs["w13_suh"], slabs["w13_svh"]
-        w2_t, w2_u, w2_v = slabs["w2_trellis"], slabs["w2_suh"], slabs["w2_svh"]
+        # The pinned tier keeps w2 with its one-part axis ([slot, 1, ...], the format's row shape); the kernel takes
+        # one matrix per expert, so that axis is dropped as a view.
+        w2_t, w2_u, w2_v = (
+            _one_part(slabs[name], rank) for name, rank in (("w2_trellis", 4), ("w2_suh", 2), ("w2_svh", 2))
+        )
         rows = range(capacity)
         # Gate is w13 part 0 and up is part 1; each [slot, part] view is contiguous. Activation 0 is
         # silu with the swiglu limit, as the GPU graph path (exl3_fused_moe.py) runs it.

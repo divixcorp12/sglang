@@ -243,9 +243,14 @@ def _exl3_slabs():
     }
 
 
-def test_exl3_trait_registers_each_slot_as_the_right_slab_views():
-    """The CPU expert id is the host slot: gate and up are w13 parts 0 and 1 of that slot's row, in place."""
+@pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
+def test_exl3_trait_registers_each_slot_as_the_right_slab_views(tier_layout):
+    """The CPU expert id is the host slot: gate and up are w13 parts 0 and 1 of that slot's row, in place. The pinned
+    tier's w2 slabs carry a one-part axis ([slot, 1, ...]); the kernel refuses a 4-D trellis or a 2-D sign vector,
+    which is what registering real tier slabs gave before that axis was dropped."""
     ext, slabs = FakeExt(), _exl3_slabs()
+    if tier_layout:
+        slabs = {n: (t.unsqueeze(1) if n.startswith("w2_") else t) for n, t in slabs.items()}
     Exl3CpuQuantTrait(ext, act_limit=10.0).register_layer(slabs, CAP)
     *lists, gb, ub, db, activation, limit, swizzled = ext.made[0]
     assert (gb, ub, db, activation, limit, swizzled) == ([], [], [], 0, 10.0, 0)
@@ -260,10 +265,11 @@ def test_exl3_trait_registers_each_slot_as_the_right_slab_views():
         lambda s: slabs["w2_suh"][s],
         lambda s: slabs["w2_svh"][s],
     ]
+    ranks = [3, 1, 1, 3, 1, 1, 3, 1, 1]
     assert len(lists) == 9
-    for got, view in zip(lists, want):
+    for got, view, rank in zip(lists, want, ranks):
         assert [t.data_ptr() for t in got] == [view(s).data_ptr() for s in range(CAP)]
-        assert all(t.is_contiguous() for t in got)
+        assert all(t.is_contiguous() and t.dim() == rank for t in got)
 
 
 def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch):
