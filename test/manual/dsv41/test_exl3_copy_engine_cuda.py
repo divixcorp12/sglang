@@ -27,9 +27,9 @@ BALLAST_BYTES = 256 << 20  # ~20 ms of H2D at the copy engine's ~13.5 GB/s, ahea
 POOL = 10  # experts the plans draw from: a capacity of 8 keeps most lanes hits and still evicts
 
 
-def _ballast(c):
-    dst = torch.empty(BALLAST_BYTES, dtype=torch.uint8, device="cuda")
-    src = torch.empty(BALLAST_BYTES, dtype=torch.uint8).pin_memory()
+def _ballast(c, nbytes=BALLAST_BYTES):
+    dst = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+    src = torch.empty(nbytes, dtype=torch.uint8).pin_memory()
     c.host.copy_engine_ballast(dst, src)
     return dst, src
 
@@ -118,7 +118,7 @@ sys.path.insert(0, sys.argv[2])
 from lease_chain_rig import Chain
 from test_exl3_copy_engine_cuda import _ballast, _capture, _replay
 c = Chain(sys.argv[1], copy_engine=True, copy_wait_ms=2)
-keep = _ballast(c)
+keep = _ballast(c, 1 << 30)
 graph, stream = _capture(c)
 c.host.arm_copy_engine()
 for _ in range(50):
@@ -128,8 +128,8 @@ print("reached", flush=True)
 
 
 def test_a_copy_wait_held_past_its_timeout_aborts_the_process(tmp_path):
-    """A 2 ms copy-wait timeout under a ~20 ms ballast: the watchdog sees the gate closed too long and aborts; the
-    decode stream is never left waiting on a copy that may not come."""
+    """A 2 ms copy-wait timeout under a ~75 ms ballast: the watchdog, which samples the gate every 20 ms, sees it closed
+    too long and aborts; the decode stream is never left waiting on a copy that may not come."""
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(_HELD_SCRIPT), str(tmp_path), str(Path(__file__).parent)],
         capture_output=True, text=True, timeout=300,
