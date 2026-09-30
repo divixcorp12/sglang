@@ -6141,6 +6141,222 @@ backend (`hicache_hook.resolve_layout_io_compatibility`).
 - **Restart only an idle server.** A SIGTERM during a request drains it and holds `cc-gpu.lock`, so the next launch
   is refused. Check the log's last `#running-req` first.
 
+## 30. CPU experts, the minimal lease protocol, and the host test exports (`4e07d261bd`, 2026-09-30)
+
+One merge of `dsv41-cpu-experts` at `1ff55fb37b`. It carries three things:
+- CPU experts, off by default (§30.1-§30.4);
+- the minimal lease protocol, which is now the default path (§30.5);
+- the move of the host test and tool exports into their own header (§30.6).
+
+Design detail and the P0-P2 records are in `docs/superpowers/plans/2026-09-29-dsv41-cpu-experts.md`. Every figure
+below comes from that plan, a commit message, or the divix01 file cited next to it.
+
+**Changes to §29's recipe table.**
+- **Copy wait:** still the stream-ordered gate wait. `CopyArm` folds into the gate, the fatal word, status words and
+  lease-block header are gone, and the lease block's offsets are compile-time constants.
+  `analysis/dsv41-drive/LEASE_PROTOCOL.md` describes the protocol as it now is, so §29.14's area-C and ABI-4
+  description is superseded.
+- **Recipe flags:** `SGLANG_DSV41_ENABLE_RAM_MISS_TWO_PHASE`, `_RAM_MISS_PIECE_STREAM` and `_EXPERT_PREFETCH`
+  (with `_NATIVE_PREFETCH`) are gone.
+  - The chain is always two-phase with piece streaming, and native prefetch is deleted.
+  - A set value warns and is ignored (`environ.py`, `_LEASE_CHAIN_MINIMAL_NOTE`), so archived arms still launch.
+  - `arm_env.py` no longer sets them.
+- **CPU experts:** `SGLANG_DSV41_CPU_EXPERTS` is not in the recipe.
+
+### 30.1 What CPU experts do
+
+A captured decode step's pinned-tier hits (RAM hits) are split: `split[n]` of a request's n copy-engine lanes are
+computed on the CPU, and the rest are copied over the link as before. The CPU lanes run inside the lease chain, so
+CopyDone, the leases, the gate and the fail-stop keep one publisher. The plan's "Step B design" section has the device,
+host and Python sides.
+- **Kernel:** exllamav3's `cpu/moe_mul1.cpp` at `02aef45`, vendored verbatim (`e371887e1e`).
+  - Built with residual and block-128 int8 activations (`SGLANG_EXL3_CPU_ACT_RESIDUAL`, `_BLOCK`; `d2b154cb13`).
+  - Rows are read in the checkpoint's native layout. The loader copies the EXL3 safetensors byte for byte, and
+    nothing swizzles them (§30.4).
+- **Which lanes go to the CPU:** the lowest-scored ones (§30.2).
+- **Launch requirements**, refused by the gate (`expert_stream_requirements_exl3.py`) and again at startup:
+  - a breakable BS1 decode graph without speculative decoding;
+  - graph gather and the fused plan (`SGLANG_MOE_EXPERT_FUSED_PLAN=1`);
+  - DIRECT residency (`SGLANG_MOE_GPU_RESIDENCY_UPDATE=1`, `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2`);
+  - the copy engine, layer fusion, and `SGLANG_DSV41_CPU_EXPERTS_CORES`;
+  - `EXL3_MOE_CPU_PIN=0`.
+  - The refusals list every missing prerequisite at once, and none of them suggests a disabled or full decode graph.
+- **A failed CPU forward** calls fail_stop in the CPU expert thread (`a799c9bb5a`).
+- **Knobs:**
+  - `SGLANG_DSV41_CPU_EXPERTS_SPLIT`, an explicit 9-entry table. Otherwise `k*(n)` comes from `_CPU_MS` (0.52),
+    `_LINK_MS` (1.0) and `_HANDOFF_MS` (0.02).
+  - `_THREADS`.
+  - `_RETUNE_BATCHES`, where 0 keeps the startup table.
+
+**P2 results, partial** (2026-09-29, `d87a3ff24f`, before the lane order of §30.2; the plan's "P2 results").
+- **Arms:** production recipe plus `SGLANG_DSV41_CPU_EXPERTS=1 SGLANG_DSV41_CPU_EXPERTS_CORES=18-29`, split
+  `[0, 1, 1, 2, 3, 3, 4, 5, 5]`.
+- **Throughput:** median decode 9.51 → **13.48 tok/s (1.40x)**. The on arm won 8 of 8 paired sessions (p = 0.0039),
+  and TTFT was unchanged.
+- **Hot hit rate:** 0.644 → 0.593. CPU lanes were never inserted into VRAM.
+- **CPU cost:** 0.61-0.66 ms per lane under load, against the configured 0.52.
+- **Quality:**
+  - Greedy match 11/16 against a noise floor of 13/16.
+  - KL mean 0.0018 against 0.0012.
+  - **E31 fails on one flip** (prompt 3, position 31). The verdict is open.
+- **Raw data:** `divix01:cc-expert-prediction/dsv41-cpu-experts/kstar/` and `/mnt/nvme1/cpu-b/p2/`.
+
+### 30.2 CPU lanes take the lowest-scored RAM hits (`c3cd6f1b19`, `35298c6a4d`)
+
+**The loss.** Under DIRECT insert-on-miss, lane j of the plan pairs with victim `usable[j]`, and the commit skips CPU
+lanes, so a CPU-computed expert never enters VRAM. That cost P2 about 5 points of hot hit (§30.1).
+
+**The fix.** The fused route plan sorts each layer's residual miss lanes by DIRECT's victim-ranking key, highest
+first, and the host gives the CPU the last `split[n]` job lanes. So the CPU computes the RAM hits the ranking values
+least, and the high-scored ones are still copied and inserted.
+- **The key** is `(routed in the closed window, insert score, -expert)`. `GpuResidencyUpdater.enable_miss_order()`
+  keeps it as `miss_keys` (int64 `[layers, E]`), rewritten by every `_rank_victims`.
+- **The sort** is a warp-uniform rank in `plan_unique_routes_kernel`, with ties broken by lane. Non-residual
+  positions and every remap consumer keep indexing by plan row.
+- **Host:** `choose_cpu_lanes_locked` takes the last `split[n]` pinned-tier hits, excluding LOADING lanes. The earlier
+  NUMA local-first pass and its slot-node plumbing are deleted.
+- **CPU experts off:** the keys pointer is null and the plan is bit-identical. This is gated because sorting changes
+  the fused MoE's fp32 summation order.
+- **Wiring:** `Exl3RamMissService.attach` enables the miss order and points each pinned-tier streamer at its row of
+  `miss_keys`. A capture with CPU experts but no miss order raises.
+
+**Chosen by replay, not measured in a server.** No decode A/B or quality run exists for the sorted order.
+
+### 30.3 Insertion policies replayed (`scripts/dsv41/cpu_expert_sim.py`, `e225a7a94b`..`1bcbde08e2`)
+
+The simulator replays a router-capture trace through `tier_sim.py`'s VRAM residency with the CPU lanes chosen per
+policy. It uses flat `c_cpu` 0.63 ms and NVMe 1.5 ms. The off baseline is 109.76 ms/token.
+
+| Policy | Hot hit | ms/token |
+|---|---:|---:|
+| Insert every lane, CPU lanes included (upper bound) | 0.672 | 73.03 |
+| Lane order (P2's behaviour) | 0.606 | 79.48 |
+| NUMA-local first | 0.601 | 80.05 |
+| By score | 0.643 | 76.00 |
+| By score, device ascending, CPU takes the head | 0.641 | 76.13 |
+| **By score, device descending, CPU takes the tail (merged)** | **0.643** | **75.94** |
+
+**Deferred inserts** push the CPU lanes' rows over the idle link afterwards. None beats the merged policy once the
+link cost is counted:
+
+| Link cost of the deferred inserts | ms/token |
+|---|---:|
+| Not costed | 75.02 |
+| Worst case | 110.08 |
+| Amortised | 107.97 |
+| Per-token, idle-optimistic | 81.64 |
+
+- **Periodic promotion** every N forwards (N in {4, 8, 16, 32}, P in {1, 2, 4} per layer) gains at most 0.2%
+  amortised and loses in every worst case. It is not built.
+- **Calibration:** the sim drops 0.066 of hit rate for lane order, against the 0.051 P2 served (§30.1), so it
+  overstates the loss by ~30%. Its insert-all hit rate matches the served formula (0.6719).
+- **Outputs:** `divix01:/mnt/nvme1/cpu-p1/insert-policies{,-v2,-promote,-sorted}.{json,txt}`.
+- **Tests:** `test/registered/unit/kernels/test_cpu_expert_sim.py`, `test/manual/dsv41/test_tier_sim.py`.
+
+### 30.4 NUMA and layout (microbenchmarks, 2026-09-30)
+
+**NUMA matters little to the kernel.** It ran 12 threads on cores 18-29 (node 1) with the `resid_b128` flavor, in the
+native layout.
+
+| Experts per call | 1 | 2 | 6 |
+|---|---:|---:|---:|
+| Rows on node 1 (local), ms per expert | 0.578 | 0.525 | 0.490 |
+| Rows on node 0 (remote), ms per expert | 0.625 | 0.538 | 0.500 |
+
+- Remote costs ~2% at steady state. The kernel is dequant-bound, at an effective 21-27 GB/s.
+- **Under node-0 copy load**, remote rows slow down by 0.022, 0.044 and 0.129 ms at 11, 21 and 38 GB/s of
+  background traffic (2 experts per call).
+- The recipe's pinned tier is `PINNED_HOST_NUMA_MB="0:61440,1:40960"`, so most RAM hits are remote to the CPU-expert
+  cores. Placement was left as it is. Measuring node-0 traffic under serving comes first, and needs root.
+- **Logs:** `divix01:/data/models/slang/nvfp4-work/cpu-numa/`: `matrix.log`, `gated*.log` and per-run
+  `numa-g-*.log`. They were gated on quiet windows, because another session's CPU work shared cores 18-29.
+
+**Swizzling does not pay with the chosen flavor.** In ms per expert at 1 / 2 / 6 per call (P0 bench, `p0_real.py`):
+
+| Flavor | Native | Swizzled |
+|---|---|---|
+| Upstream | 0.558 / 0.511 / 0.475 | 0.459 / 0.416 / 0.395 |
+| Residual + block 128 (merged) | 0.575 / 0.518 / 0.475 | 0.735 / 0.670 / 0.631 |
+
+Block-128 already gives the locality a swizzle would. Upstream exllamav3 swizzles its own CPU copy and unswizzles on
+the GPU (`moe_unswizzle_trellis`). The only swizzle here is the P0 bench's.
+
+### 30.5 The minimal lease protocol (`dsv41-lease-minimal`, merged into the branch at `4fe14b9f2b`)
+
+**What changed** (`1060a85239`). There is one fail-stop chain per layer: post → W1 → C1 → S → CW → stream wait on
+the gate → CC.
+- **Removed:**
+  - The error, diagnostic and self-description words: the fatal word, status, Terminal, LaneAck, SmAck, StreamProbe,
+    CopyArm (folded into the gate), the header, the row table and SlotGen.
+  - The advisory ring, native prefetch, the batched and non-streaming chains, and their env vars.
+- **CW** writes one Done word per request.
+- **Failures:** host failures `std::abort()` and device failures `__trap()`; S keeps its deadline as a trap.
+- **Shutdown** synchronises the device before it closes admission.
+- **Protocol reference:** `analysis/dsv41-drive/LEASE_PROTOCOL.md`.
+
+**Served smoke** (`analysis/dsv41-drive/lease-minimal/smoke.sh`; `divix01:/mnt/nvme1/lease-minimal/smoke1/`).
+- Setup: `644c3bedf4`, the production recipe with no overrides, and six greedy requests (three prompts, twice).
+- Repeats identical; copy engine armed.
+- Server exit 0 with an orderly service stop; 0 FATAL, quarantine or traceback lines.
+- **No decode A/B** against the previous protocol was run.
+
+**Test surface.** The lease rewrite deleted these test files, among others:
+- `test_exl3_ram_miss_two_phase*.py`, `test_exl3_ram_miss_advisory.py`, `test_exl3_native_prefetch*.py`;
+- the manual `test_exl3_two_phase_*_cuda.py`, `test_exl3_piece_stream*_cuda.py` and `test_exl3_ram_miss_cuda.py`.
+
+That is why the branch's diff against `567337b395` removes more lines (19,885) than it adds (12,925).
+
+### 30.6 Host test and tool exports in their own header (`1fb0743d30`..`1ff55fb37b`)
+
+`host/ffi_test_exports.h` holds `HostTestExports<HostExports<...>>`, a partial specialization that derives from
+`HostExports`. It carries 22 exports plus 2 helpers moved out of `ffi_exports.h`, byte-identical.
+- **What moved:** the exports no server path calls, which tests and analysis tools use.
+  - Only 9 of them are refused on the production build (`TEST_ONLY_EXPORTS`, `expert_stream_transport.py`).
+  - Tools call others against a live module: `copy_engine_idle` (`copy-engine/module_load_probe.py`,
+    `ce-soak/hazard_probe.py`) and `read_rows_traced` (`bench_pack_workers.py`).
+- **Every build must still expand `EXPERT_STREAM_HOST_TEST_EXPORTS`, production included.** Dropping it from prod
+  would break those tools with a missing symbol.
+- **Symbol check:** `nm -D --defined-only` on prod, instr and two_name modules built through `load_jit` gives the same
+  61 `expert_stream_*` exports before and after. instr_tsan was checked on its object with `readelf`, because divix01
+  has no gcc TSan runtime to link.
+- **Move proof:** `.omc/artifacts/ffi-test-split/verify.py` in the author's laptop tree, not in the repo.
+
+### 30.7 Verification and gaps
+
+**Suites** (divix01; `PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 CUDA_VISIBLE_DEVICES= taskset -c 0-17,30-63`;
+EXIT read from pytest):
+
+| Run | Commit | Result |
+|---|---|---|
+| `test/registered/unit/kernels test/registered/unit/scripts/test_cpu_experts_quality.py` | `1ff55fb37b` | 775 passed / 456 skipped |
+| `test/registered/unit/test_expert_stream_requirements_exl3.py` | `02d343733c` | 39 passed |
+| `test_exl3_ram_miss_attach_lanes.py` | `02d343733c` | 12 passed |
+| GPU: `test_expert_route_plan_fused.py`, `test_expert_residency_gpu.py`, `test_exl3_cpu_lane_order_cuda.py` | `fad844b678` | 382 passed / 1 failed |
+| GPU manual: split parity, lease kernels, copy engine, lease ordering (`SGLANG_EXL3_SRC` set) | `fad844b678` | 37 passed |
+
+- **The GPU failure** is `test_exl3_direct_ack_violation_cannot_publish_a_resident`. It also fails at `1bcbde08e2`,
+  before the lane-order work. Its SimpleNamespace backend lacks `cpu_experts`.
+- **Mutants caught:**
+  - The plan kernel ignoring the keys: 97 failed.
+  - The host taking the head instead of the tail: 2 failed, plus the end-to-end test.
+  - Attach skipping `enable_miss_order`, or not assigning a streamer's row: the attach test.
+  - Attach passing `cpu_experts=False`: the attach test.
+- **Commit `3937a8833a` alone is red** on two gate cases, fixed in `02d343733c`. Do not quote gate counts at it.
+
+**Not done:**
+1. **No GPU run** of `3937a8833a` (the capture-time streamer check) or `1ff55fb37b`. GPU runs were held for the merge.
+2. **No server run** of the lane order (§30.2): neither decode A/B nor quality gate. P2's figures predate it.
+3. **The E31 verdict** is open (§30.1).
+4. **The split retune** from the measured 0.61-0.66 ms per lane.
+5. **NUMA placement** of the pinned tier against the CPU-expert cores (§30.4).
+6. **Silent no-op.** With `SGLANG_MOE_HOT_GPU_MB=0`, `SGLANG_MOE_PINNED_HOST_MB=0`, prefetch off and graph gather
+   off, `memory_hook.py` returns before the launch gate, so `SGLANG_DSV41_CPU_EXPERTS=1` silently does nothing. With
+   graph gather on, the launch is refused, but the message doesn't name CPU experts.
+7. **Test gaps:**
+   - No CPU test covers a captured post with CPU experts off (`cpu_input` must stay None).
+   - The attach test uses a stand-in residency updater.
+8. **No decode A/B** of the minimal lease protocol against its predecessor (§30.5). §29.13 items 1 and 10 still stand.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
