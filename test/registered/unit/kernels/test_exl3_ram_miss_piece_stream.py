@@ -1,7 +1,7 @@
 """Piece streaming in the C++ row reader and tier (CPU): sub-reads, piece geometry, per-piece vetting, packing
 and publishing.
 
-SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM reads each part of a row as up to 4 page-aligned sub-reads and cuts the
+Piece streaming reads each part of a row as up to 4 page-aligned sub-reads and cuts the
 row's needed bytes into 8 pieces. Each piece is vetted once the sub-reads it depends on have landed, packed by its
 own job, and published by the reader's owner into the readiness words (lease area P) of the lanes that name its row,
 with a generation-checked compare-and-swap. The tier initialises those words at reservation. U1 (geometry), U2
