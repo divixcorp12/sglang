@@ -116,7 +116,6 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
                     continue
                 row = rng.randrange(hp.LAYERS)
                 lanes = rng.sample(DEVICE_EXPERTS, rng.randint(1, 3))
-                hp.write_hot_record(page, host, hp.next_seq(page), [])
                 use_copy = rng.random() < 0.5
                 req = sim.post(row, lanes, dst=list(range(len(lanes))) if use_copy else None, captured=use_copy)
                 stats["armed"] += 1

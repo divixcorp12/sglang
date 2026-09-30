@@ -155,6 +155,43 @@ def test_a_hit_lanes_slot_is_never_its_own_requests_victim(running):
     assert _until(lambda: _leases(host, 0)[hit_slot] == 0), "Done did not retire the lease"
 
 
+def test_the_leases_exist_before_the_device_can_see_demand_done(running):
+    """Both lanes miss, and the read is held open. Inside it, each lane's RowResult names its slot, that slot is
+    leased, and only then is demand_done read, still short of the request: a device that saw done had leases to find.
+
+    Mutant: count a lane's lease after the read (or after demand_done), not in the reservation hold."""
+    s, page, host, sim = running
+    host.inject(delay_s=READ_DELAY_S)
+    req = sim.post(0, [1, 2])
+    assert _until(lambda: all(sim.row_result(req, lane)["gen"] == req.gen for lane in (0, 1)), timeout_s=READ_DELAY_S)
+    slots = [sim.row_result(req, lane)["host_slot"] for lane in (0, 1)]
+    leases = _leases(host, 0)
+    done = page_word(page, "demand_done")
+    assert done != req.seq, "demand_done had already reached the request: the read was not still running"
+    assert [leases[slot] for slot in slots] == [1, 1], (slots, leases)
+    assert host.counters()["leases_granted"] == 2
+    assert sim.wait(req, timeout_s=READ_DELAY_S + 10.0).served
+    sim.done(req)
+    assert _until(lambda: not any(_leases(host, 0)))
+
+
+def test_a_lane_expert_the_record_did_not_protect_is_still_never_a_victim_of_its_own_request(running):
+    """The tier is full (3, 4, 0, with 3 the least recently used). The request's lanes are 3 (a hit) and 5 (a miss),
+    and its record protects only 5, so 5's victim must come from 4 and 0: the post protects its routes, and the
+    service must not depend on every lane being among them.
+
+    Mutant: the victim choice protects only the record's protect ids -- expert 3, the LRU row, is taken."""
+    s, page, host, sim = running
+    for expert in (3, 4, 0):
+        _make_resident(host, sim, 0, expert)
+    req = sim.post(0, [3, 5], protect=[5])
+    waited = sim.wait(req, timeout_s=10.0)
+    assert waited.served and waited.go == 2
+    resident = {e for state, e, _ in host.slot_info(0) if state == READY}
+    assert resident == {3, 5, 0}, resident
+    sim.done(req)
+
+
 if __name__ == "__main__":
     import sys
 

@@ -95,14 +95,12 @@ def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
 
 def _copy_request(s, page, host, sim):
     """A resident expert 0 of row 0, then a request whose lane 0 is COPYING; returns (req, slot)."""
-    hp.write_hot_record(page, host, hp.next_seq(page), [])
     first = sim.post(0, [0])
     while host.pump():
         pass
     sim.done(first)
     while host.pump():
         pass
-    hp.write_hot_record(page, host, hp.next_seq(page), [])
     req = sim.post(0, [0], dst=[0], captured=True)
     while host.pump():
         pass

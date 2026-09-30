@@ -166,10 +166,14 @@ class LeaseSim:
         dst: Optional[Sequence[int]] = None,
         captured: bool = False,
         cpu_weights: Optional[Sequence[float]] = None,
+        hot: Sequence[int] = (),
+        hot_seq: Optional[int] = None,
     ) -> SimRequest:
-        """The post kernel: the LaneRequest, then the demand record (armed iff there are lanes) and demand_head.
+        """The post kernel: the hot record (when the host has a hot page), the LaneRequest, then the demand record
+        (armed iff there are lanes) and demand_head, for every post, armed or not.
         ``protect`` overrides the record's protect ids (the post writes the routes, not the lanes); ``dst`` are the
-        lanes' destination slots, ``captured`` the LaneRequest flag, ``cpu_weights`` the lanes' routing weights."""
+        lanes' destination slots, ``captured`` the LaneRequest flag, ``cpu_weights`` the lanes' routing weights, ``hot``
+        the VRAM-hot experts the hot record carries; ``hot_seq`` overrides the sequence it names (a stale record)."""
         head = page_word(self.page, "demand_head")
         seq = (head + 1) & 0xFFFFFFFF
         if seq == 0:
@@ -178,6 +182,7 @@ class LeaseSim:
         gen = (self.epoch << 32) | seq
         idx = (seq - 1) % DEMAND_RECORDS
         lanes = tuple(int(e) for e in lanes)
+        self._write_hot(seq, hot, hot_seq)
         if write_lane_request:
             base = lease.LANE_REQUEST + idx * lease.LANE_REQUEST_BYTES
             fields = lease.LANE_REQUEST_FIELDS
@@ -197,25 +202,27 @@ class LeaseSim:
         assert post_record(self.page, row, protect, armed=bool(lanes)) == seq
         return SimRequest(seq, gen, idx, row, lanes)
 
-    def post_gpu_hot(
-        self, hot_page: torch.Tensor, row: int, lanes: Sequence[int], *, hot: Sequence[int], hot_seq=None, **post
-    ) -> SimRequest:
-        """The post kernel with the GPU-hot sidecar: the request's hot bitmap record first, then ``post``.
-        ``hot_seq`` overrides the sequence the record names (a stale record)."""
+    def _write_hot(self, seq: int, hot: Sequence[int], hot_seq: Optional[int]) -> None:
+        """The post kernel's hot record for ``seq``: seq 0, the bitmap, then the seq; the reserved word untouched."""
+        hot_page = self.host.hot_page
+        if hot_page is None:
+            return
         experts = self.host.experts
-        seq = (page_word(self.page, "demand_head") + 1) & 0xFFFFFFFF or 1
         stride = hot_record_bytes(experts)
         record = hot_page[(seq - 1) % DEMAND_RECORDS * stride :][:stride]
         _i32(record, 0)[0] = 0
-        _i32(record, 4)[0] = experts
         bitmap = record[8 : 8 + (experts + 7) // 8]
         bitmap.zero_()
         for expert in hot:
             bitmap[expert // 8] = int(bitmap[expert // 8]) | (1 << (expert % 8))
         _i32(record, 0)[0] = seq if hot_seq is None else hot_seq
-        req = self.post(row, lanes, **post)
-        assert req.seq == seq
-        return req
+
+    def post_gpu_hot(
+        self, hot_page: torch.Tensor, row: int, lanes: Sequence[int], *, hot: Sequence[int], hot_seq=None, **post
+    ) -> SimRequest:
+        """``post`` on a host built with ``hot_page`` (the tier tests' spelling)."""
+        assert self.host.hot_page is not None and self.host.hot_page.data_ptr() == hot_page.data_ptr()
+        return self.post(row, lanes, hot=hot, hot_seq=hot_seq, **post)
 
     def wait(self, req: SimRequest, timeout_s: float = 1.0) -> SimWait:
         """S's judgement once demand_done reached the request: every lane is published for G, a LOADING lane with

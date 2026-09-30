@@ -72,7 +72,6 @@ CHILD = textwrap.dedent(
         return [e for e in range(hp.EXPERTS) if mapping[e] < 0]
 
     def post(lanes, **kw):
-        hp.write_hot_record(page, host, hp.next_seq(page), [])
         seen["posts"] += 1
         return sim.post(0, lanes, **kw)
 

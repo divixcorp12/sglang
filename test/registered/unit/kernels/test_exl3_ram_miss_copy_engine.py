@@ -109,6 +109,33 @@ def test_a_hit_lane_is_copying_its_lease_holds_and_copydone_waits_for_the_observ
         host.stop()
 
 
+def test_the_lane_request_carries_the_destination_slots_and_the_flag(tmp_path):
+    """The service reads each lane's destination from the LaneRequest's dst_slot and its permission to copy from the
+    CAPTURED flag: two lanes posted with destinations 5 and 1 land in those rows, not in rows 0 and 1, and the same
+    request posted without the flag is published READY. Mutants: copy lane i to row i; ignore the flag."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        dst = _copy_engine(s, host)
+        _load(sim, host, [3, 4])
+        slots = [_slot_of(host, 3), _slot_of(host, 4)]
+        plain = sim.post(ROW, [3, 4], dst=[5, 1])
+        assert host.pump() == 1
+        assert [sim.row_result(plain, lane)["tag"] for lane in (0, 1)] == [lease.READY, lease.READY]
+        sim.done(plain)
+        host.pump()
+        req = sim.post(ROW, [3, 4], dst=[5, 1], captured=True)
+        assert host.pump() == 1
+        assert [sim.row_result(req, lane)["tag"] for lane in (0, 1)] == [lease.COPYING, lease.COPYING]
+        host.copy_engine_release(-1)
+        assert host.copy_engine_idle(5.0) and sim.copy_done(req) == req.gen
+        assert _rows_equal(dst, s.slabs[ROW], 5, slots[0]) and _rows_equal(dst, s.slabs[ROW], 1, slots[1])
+        assert not any(dst[n][0].view(torch.uint8).any() for n in dst), "a lane was copied to its own index"
+        sim.done(req)
+        host.pump()
+    finally:
+        host.stop()
+
+
 def test_a_copy_in_flight_keeps_its_slot_from_being_a_victim_until_it_completes(tmp_path):
     """Victim reuse: the only slot a demand could evict is under a copy-engine copy. The demand defers, and is served
     by evicting that slot only once the copy completed, after its bytes reached the destination."""

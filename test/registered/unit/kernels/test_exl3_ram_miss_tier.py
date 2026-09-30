@@ -112,11 +112,11 @@ def test_gpu_hot_sidecar_aborts_on_a_stale_or_malformed_record_after_a_wrap(tmp_
         seq = page_word(page, "demand_head") + 1
         if fault == "malformed":
             start = (seq - 1) % DEMAND_RECORDS * hot_record_bytes(host.experts)
-            orig = sim.post
-            def post(*args, **kwargs):
+            orig = sim._write_hot
+            def write_hot(*args, **kwargs):
+                orig(*args, **kwargs)
                 hot_page[start + 8] = int(hot_page[start + 8]) | 0x80  # a bit past the last expert
-                return orig(*args, **kwargs)
-            sim.post = post
+            sim._write_hot = write_hot
         sim.post_gpu_hot(hot_page, 0, [3], hot=[0], hot_seq=1 if fault == "stale" else None)
         host.pump()
         print("reached")

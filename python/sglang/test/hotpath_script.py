@@ -20,7 +20,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     page_word,
 )
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
-from sglang.test.dsv41_lease_sim import LeaseSim, post_record, served
+from sglang.test.dsv41_lease_sim import LeaseSim, served
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
 CAPACITY = 4
@@ -66,7 +66,7 @@ SCRIPT = [
     ("done", 0, None, {}),
     ("post", 0, [5, 6], {}),             # evicts two LRU rows
     ("done", 0, None, {}),
-    ("post", 1, [7], {"armed": False}),  # an unarmed touch-only record on row 1
+    ("post", 1, [7], {"armed": False}),  # an unarmed touch-only record on row 1 (7 is its protect id, not a lane)
     ("hot", 0, [5], {}),                 # from here expert 5 of row 0 is VRAM-hot: never a victim
     ("post", 0, [1, 2, 3], {}),
     ("done", 0, None, {}),
@@ -149,35 +149,14 @@ def snapshot(s, page, host, sim, reqs, dst, copies):
     return snap
 
 
-def write_hot_record(page, host, seq, hot):
-    """The post kernel's GPU-hot sidecar record for demand ``seq`` (test_exl3_ram_miss_tier._post_gpu_hot's layout):
-    written before the record is posted, as the device orders it. Every armed post needs one in GPU-hot mode, or the
-    service fails the request as a lapped sidecar."""
-    stride = hot_record_bytes(host.experts)
-    start = (seq - 1) % HOT_RECORDS * stride
-    record = host.hot_page[start : start + stride]
-    record[:4].view(torch.int32)[0] = 0
-    record[4:8].view(torch.int32)[0] = host.experts
-    record[8 : 8 + (host.experts + 7) // 8].zero_()
-    for expert in hot:
-        record[8 + expert // 8] = int(record[8 + expert // 8]) | (1 << (expert % 8))
-    record[:4].view(torch.int32)[0] = seq
-
-
-def next_seq(page) -> int:
-    seq = (page_word(page, "demand_head") + 1) & 0xFFFFFFFF
-    return seq or 1
-
-
 def run_script(s, page, host, sim, dst):
     reqs, snaps, hot, copies = [], [], {0: [], 1: []}, []
     for kind, row, lanes, extra in SCRIPT:
         if kind == "post":
             if extra.get("armed", True):
-                write_hot_record(page, host, next_seq(page), hot[row])
-                reqs.append(sim.post(row, lanes, dst=extra.get("dst"), captured=extra.get("captured", False)))
+                reqs.append(sim.post(row, lanes, dst=extra.get("dst"), captured=extra.get("captured", False), hot=hot[row]))
             else:
-                post_record(page, row, lanes, armed=False)
+                sim.post(row, [], protect=lanes, hot=hot[row])  # no lanes: an unarmed touch record
             _drain(host)
         elif kind == "done":
             sim.done(reqs[-1])

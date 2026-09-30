@@ -164,7 +164,7 @@ def test_the_device_refuses_what_its_kernels_cannot_read(tmp_path):
 @pytest.mark.parametrize("x_dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x_dtype):
     """The CPU expert thread reads x as fp16 from the row's host row, and each lane's weight -- the sum over the routes
-    naming the lane's expert -- from the captured LaneRequest; bytes past the row stay untouched. Nothing serves: only
+    naming the lane's expert -- from the captured LaneRequest, which also carries each lane's destination slot; bytes past the row stay untouched. Nothing serves: only
     the post runs."""
     hidden = 64
     c = Chain(tmp_path, start=False)
@@ -178,6 +178,7 @@ def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x
         backend.planned[:TOP_K].copy_(plan.expert_ids)
         weights = torch.tensor([[0.5, 0.25, 0.125, 0.0625]], device="cuda")
         x = (torch.randn(1, hidden, device="cuda") * 30).to(x_dtype)
+        plan.slots[:2] = torch.tensor([5, 3], dtype=torch.int32)
         c.dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True, cpu_input=(x, weights))
         torch.cuda.synchronize()
         seq = int(c.dev.stats()["posted"]) & 0xFFFFFFFF
@@ -187,6 +188,11 @@ def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x
         assert int(block[base + f["flags"] : base + f["flags"] + 4].view(torch.int32)[0]) == lease.LANE_REQUEST_FLAG_CAPTURED
         lane_weights = block[base + f["weight"] : base + f["weight"] + 4 * lease.LANES].view(torch.float32)
         assert lane_weights[:2].tolist() == [0.25, 0.5 + 0.0625]
+        # The plan's destination slots and lane experts, -1 past the plan: what the service copies to and leases.
+        dst_slots = block[base + f["dst_slot"] : base + f["dst_slot"] + 4 * lease.LANES].view(torch.int32)
+        assert dst_slots.tolist() == [5, 3] + [-1] * (lease.LANES - 2)
+        experts = block[base + f["expert"] : base + f["expert"] + 4 * lease.LANES].view(torch.int32)
+        assert experts.tolist() == [9, 5] + [-1] * (lease.LANES - 2)
         staged = x_rows[row, : 2 * hidden].view(torch.float16)
         assert torch.equal(staged.view(torch.int16), x.cpu().half().reshape(-1).view(torch.int16))
         assert (x_rows[row, 2 * hidden :] == 0xAB).all() and (x_rows[1 - row] == 0xAB).all()
