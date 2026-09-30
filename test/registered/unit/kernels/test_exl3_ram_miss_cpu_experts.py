@@ -1,14 +1,16 @@
-"""CPU experts' host half (CPU; plan 2026-09-29-dsv41-cpu-experts, "Step B"): the grant's CPU lanes and their
-completion.
+"""CPU experts' host half (CPU; plan 2026-09-29-dsv41-cpu-experts, "Step B").
 
-The service's grant tags the last ``split[n]`` of a copy-engine request's n resident lanes CPU (RowResult tag 4) when
-the post carried CPU input and the row is registered; the device plan sorts miss lanes highest-scored first. The copy
-thread hands those lanes to the CPU expert thread and copies only the rest; CopyDone carries the whole mask once both
-are done. The forward here is a ctypes fake that records its calls
-and writes a known partial sum.
+Covers the grant's CPU lanes and their completion.
+The service's grant tags the last ``split[n]`` of a copy-engine request's n resident lanes CPU (RowResult tag 4),
+when the post carried CPU input and the row is registered.
+The device plan sorts miss lanes highest-scored first.
+The copy thread hands the CPU lanes to the CPU expert thread and copies only the rest;
+CopyDone carries the whole mask once both are done.
+The forward here is a ctypes fake that records its calls and writes a known partial sum.
 
-The fake runs on the CPU expert thread and needs the GIL, which the host's blocking calls hold, so every wait for the
-CPU lanes polls from Python (``_wait``) before any blocking call such as ``copy_engine_idle``.
+The fake runs on the CPU expert thread and needs the GIL, which the host's blocking calls hold.
+So every wait for the CPU lanes polls from Python (``_wait``),
+before any blocking call such as ``copy_engine_idle``.
 """
 
 import ctypes

@@ -1,10 +1,13 @@
 """CPU experts inside the EXL3 RAM-miss service (plan 2026-09-29-dsv41-cpu-experts, "Step B").
 
-The service's own threads run the kernel: the grant tags the last ``split[n]`` of a copy-engine request's n resident
-lanes (the lowest-scored, as the device plan sorts them) CPU, the copy thread hands them to the CPU expert thread
-(expert_stream/host/cpu_experts.h), and the copy wait releases the decode stream once both the copies and the CPU are
-done. This module owns the Python half: the quant trait, the pinned rows the post kernel and the CPU exchange, the
-lazy per-layer registration, and the split table.
+The service's own threads run the kernel.
+The grant tags the last ``split[n]`` of a copy-engine request's n resident lanes CPU;
+the device plan sorts them, so those are the lowest-scored.
+The copy thread hands them to the CPU expert thread (expert_stream/host/cpu_experts.h),
+and the copy wait releases the decode stream once both the copies and the CPU are done.
+
+This module owns the Python half: the quant trait, the pinned rows the post kernel and the CPU exchange,
+the lazy per-layer registration, and the split table.
 """
 
 from __future__ import annotations

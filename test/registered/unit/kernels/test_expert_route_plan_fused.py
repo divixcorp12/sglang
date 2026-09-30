@@ -541,8 +541,7 @@ def _assert_sorted_plan(ids, expert_to_slot, scratch_base, keys, result, unsorte
 
 
 def test_miss_keys_none_is_the_unsorted_plan():
-    """Without keys the plan is plan_graph_routes' (misses in first-appearance order), the oracle of the plan before
-    the miss order existed."""
+    """Without keys, misses come in first-appearance order: the reference plan_graph_routes computes."""
     for seed in range(50):
         rng = random.Random(seed)
         ids = torch.tensor(rng.sample(range(EXPERTS), rng.randint(1, 32)), device="cuda", dtype=torch.int64)
