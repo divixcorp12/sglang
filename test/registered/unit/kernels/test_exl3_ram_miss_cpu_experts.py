@@ -246,7 +246,7 @@ def test_the_split_is_retuned_at_run_time_and_checked(tmp_path):
 
 
 def test_a_failed_forward_aborts_the_process(tmp_path):
-    """E5: a lane whose CPU forward failed is never completed; the copy thread fails its job, which fails stop."""
+    """A failed CPU forward ends the process in the CPU expert thread, before the lane could be marked done."""
     here = os.path.dirname(os.path.abspath(__file__))
     result = run_host_script(
         tmp_path,
@@ -277,7 +277,7 @@ def test_a_failed_forward_aborts_the_process(tmp_path):
         """,
         capacity=4,
     )
-    assert_aborted(result, "RAM miss copy engine: copy of request")
+    assert_aborted(result, f"CPU expert forward of row {ROW} failed (-5)")
 
 
 def test_cpu_experts_need_the_copy_engine(tmp_path):

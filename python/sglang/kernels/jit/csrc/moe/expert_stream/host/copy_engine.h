@@ -500,9 +500,6 @@ class CopyEngine {
 
  private:
   static constexpr int kRingOverflow = -1000;
-  static constexpr int kNoCpuEngine = -1001;   // a job carries CPU lanes but no CPU expert engine is set
-  static constexpr int kCpuRingOverflow = -1002;
-  static constexpr int kCpuFailed = -1003;     // the CPU expert thread's forward failed
   using Queue = FixedDeque<CopyJob, kCopyRing>;
 
   struct Table {
@@ -548,10 +545,7 @@ class CopyEngine {
         }
         if (head.cpu_seq != 0) {
           const CpuExpertEngine* cpu = cpu_.load(std::memory_order_relaxed);  // set before the job was issued
-          if (!cpu->done(head.cpu_seq)) {
-            if (cpu->broken() != 0) broken_ = kCpuFailed;  // never done: fail the job
-            break;
-          }
+          if (!cpu->done(head.cpu_seq)) break;
         }
         const CopyJob done = in_flight.front();
         in_flight.pop_front();
@@ -636,7 +630,8 @@ class CopyEngine {
     if (job.cpu_mask != 0) {
       // First, so the CPU starts while the copies below are issued.
       CpuExpertEngine* cpu = cpu_.load(std::memory_order_acquire);
-      if (cpu == nullptr) return kNoCpuEngine;
+      if (cpu == nullptr)
+        fail_stop("copy job " + std::to_string(job.gen) + " carries CPU lanes with no CPU expert engine");
       CpuJob cpu_job;
       cpu_job.row = job.row;
       for (int i = 0; i < job.count; ++i) {
@@ -647,7 +642,7 @@ class CopyEngine {
         ++cpu_job.k;
       }
       job.cpu_seq = cpu->submit(cpu_job);
-      if (job.cpu_seq == 0) return kCpuRingOverflow;
+      if (job.cpu_seq == 0) fail_stop("copy job " + std::to_string(job.gen) + ": the CPU expert ring is full");
     }
     bool copied = false;
     if constexpr (Build::kFaults) copied = ballast_.bytes.load() > 0;

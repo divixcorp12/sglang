@@ -4,8 +4,7 @@
 //
 // The copy thread is its only client. It submits a job when it issues the request's copy job, and treats the copy
 // job as complete only once this thread has also finished that job. So CopyDone, the lease release and the copy wait's
-// gate keep their one publisher (LEASE_PROTOCOL.md, "Copy engine"). A failed forward is never marked done: this
-// thread reports the error, and the copy thread fails the job, which fails the process stop.
+// gate keep their one publisher (LEASE_PROTOCOL.md, "Copy engine"). A failed forward fails stop here.
 #pragma once
 
 #include <immintrin.h>
@@ -25,6 +24,7 @@
 #include "../lease_layout.h"
 #include "reader_base.h"
 #include "spsc_ring.h"
+#include "tier_protocol.h"
 
 namespace sglang::expert_stream {
 
@@ -111,7 +111,7 @@ class CpuExpertEngine {
   }
 
   // Copy thread only. The job's sequence, or 0 when the ring is full (an internal error: at most kDemandRecords + 1
-  // copy jobs are outstanding, so the copy thread fails the job).
+  // copy jobs are outstanding, so the copy thread fails stop).
   uint32_t submit(CpuJob job) {
     uint32_t seq = submitted_ + 1;
     if (seq == 0) seq = 1;  // 0 means "no job" to the copy thread
@@ -130,11 +130,6 @@ class CpuExpertEngine {
   // the output before the device's read of it.
   bool done(uint32_t seq) const {
     return static_cast<int32_t>(done_.load(std::memory_order_acquire) - seq) >= 0;
-  }
-
-  // The first forward error, or 0. Sticky: a broken engine runs no further job.
-  int broken() const {
-    return broken_.load(std::memory_order_acquire);
   }
 
   // Metrics, for the service's counters: jobs finished, lanes computed, and forward time in ns.
@@ -187,7 +182,6 @@ class CpuExpertEngine {
         continue;
       }
       idle = 0;
-      if (broken_.load(std::memory_order_relaxed) != 0) continue;  // never marked done: its leases stay held
       const int64_t start = now_ns();
       const int result = config_.forward(
           handles_[job.row].load(std::memory_order_acquire),
@@ -197,14 +191,9 @@ class CpuExpertEngine {
           job.k,
           reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride),
           config_.threads);
-      if (result != 0) {
-        std::fprintf(
-            stderr, "ERROR %sforward of row %lld failed (%d); leases held\n", prefix_.c_str(),
-            static_cast<long long>(job.row), result);
-        std::fflush(stderr);
-        broken_.store(result, std::memory_order_release);
-        continue;
-      }
+      if (result != 0)
+        fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed (" +
+                  std::to_string(result) + ")");
       compute_ns_.fetch_add(now_ns() - start, std::memory_order_relaxed);
       jobs_done_.fetch_add(1, std::memory_order_relaxed);
       lanes_done_.fetch_add(job.k, std::memory_order_relaxed);
@@ -228,7 +217,6 @@ class CpuExpertEngine {
   SpscRing<CpuJob, kRing> jobs_;
   uint32_t submitted_ = 0;  // the copy thread's
   std::atomic<uint32_t> done_{0};
-  std::atomic<int> broken_{0};
   std::atomic<int64_t> jobs_done_{0};
   std::atomic<int64_t> lanes_done_{0};
   std::atomic<int64_t> compute_ns_{0};
