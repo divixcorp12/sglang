@@ -21,6 +21,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     RECORD_BYTES,
     RECORD_FIELDS,
     WORDS,
+    hot_record_bytes,
     page_word,
     piece_word,
 )
@@ -195,6 +196,26 @@ class LeaseSim:
         protect = list(dict.fromkeys(lanes)) if protect is None else list(protect)
         assert post_record(self.page, row, protect, armed=bool(lanes)) == seq
         return SimRequest(seq, gen, idx, row, lanes)
+
+    def post_gpu_hot(
+        self, hot_page: torch.Tensor, row: int, lanes: Sequence[int], *, hot: Sequence[int], hot_seq=None, **post
+    ) -> SimRequest:
+        """The post kernel with the GPU-hot sidecar: the request's hot bitmap record first, then ``post``.
+        ``hot_seq`` overrides the sequence the record names (a stale record)."""
+        experts = self.host.experts
+        seq = (page_word(self.page, "demand_head") + 1) & 0xFFFFFFFF or 1
+        stride = hot_record_bytes(experts)
+        record = hot_page[(seq - 1) % DEMAND_RECORDS * stride :][:stride]
+        _i32(record, 0)[0] = 0
+        _i32(record, 4)[0] = experts
+        bitmap = record[8 : 8 + (experts + 7) // 8]
+        bitmap.zero_()
+        for expert in hot:
+            bitmap[expert // 8] = int(bitmap[expert // 8]) | (1 << (expert % 8))
+        _i32(record, 0)[0] = seq if hot_seq is None else hot_seq
+        req = self.post(row, lanes, **post)
+        assert req.seq == seq
+        return req
 
     def wait(self, req: SimRequest, timeout_s: float = 1.0) -> SimWait:
         """S's judgement once demand_done reached the request: every lane is published for G, a LOADING lane with

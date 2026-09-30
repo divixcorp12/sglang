@@ -200,22 +200,25 @@ def ram_miss_setup(
 _HOST_SCRIPT_HEAD = """
 import pathlib, sys, time
 import torch
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_hot_page, new_page, page_word
 from sglang.test.dsv41_lease_sim import LeaseSim, post_record
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=int(sys.argv[2]))
-page = new_page(pin=False)
-host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr")
+page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr"%s)
 sim = LeaseSim(host, page, s.slabs)
 """
 
 
-def run_host_script(tmp_path, body: str, *, capacity: int = 3, timeout_s: float = 60) -> subprocess.CompletedProcess:
-    """Run ``body`` in a fresh interpreter over an instrumented host (``s``, ``page``, ``host``, ``sim`` in scope).
+def run_host_script(
+    tmp_path, body: str, *, capacity: int = 3, host_args: str = "", timeout_s: float = 60
+) -> subprocess.CompletedProcess:
+    """Run ``body`` in a fresh interpreter over an instrumented host (``s``, ``page``, ``host``, ``sim`` in scope);
+    ``host_args`` is extra keyword source for its constructor (", hot_page=hot_page" hands it the ``hot_page`` in scope).
 
     Every service failure is fail-stop (``std::abort``), so a test of one must watch a child process die."""
     return subprocess.run(
-        [sys.executable, "-c", _HOST_SCRIPT_HEAD + textwrap.dedent(body), str(tmp_path), str(capacity)],
+        [sys.executable, "-c", _HOST_SCRIPT_HEAD % host_args + textwrap.dedent(body), str(tmp_path), str(capacity)],
         capture_output=True,
         text=True,
         timeout=timeout_s,

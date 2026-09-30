@@ -10,7 +10,7 @@ import time
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_lease_sim import LeaseSim, post_record, served
