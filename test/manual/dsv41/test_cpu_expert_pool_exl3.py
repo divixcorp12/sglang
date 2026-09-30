@@ -1,4 +1,4 @@
-"""Exl3CpuExpertPool runs the real CPU kernel bit-identically to direct calls over the same slabs (needs the ext build).
+"""CpuExpertPool with Exl3CpuQuantTrait runs the real CPU kernel bit-identically to direct calls over the same slabs (needs the ext build).
 
 Run with EXL3_MOE_CPU_PIN=0 under taskset on at least 2 cores.
 """
@@ -71,16 +71,21 @@ def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch):
     cores = sorted(os.sched_getaffinity(0))
     if len(cores) < 2:
         pytest.skip("needs at least 2 cores in the affinity mask")
-    from sglang.srt.layers.moe.exl3_cpu_experts import Exl3CpuExpertPool
+    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertPool
     from sglang.srt.layers.quantization.exl3_ext import exl3_ext
 
     ext = exl3_ext()
     slabs = _random_slabs(20260929)
     threads = min(4, len(cores))
     direct = _direct_layer(ext, slabs)
-    pool = Exl3CpuExpertPool(
-        ext, {3: slabs}, cores=cores, threads=threads, act_limit=LIMIT
+    pool = CpuExpertPool(
+        Exl3CpuQuantTrait(ext, act_limit=LIMIT),
+        {3: slabs},
+        cores=cores,
+        threads=threads,
     )
+    pool.bind_current_thread()
     g = torch.Generator().manual_seed(1)
     try:
         for scale in (1.0, 8.0):
