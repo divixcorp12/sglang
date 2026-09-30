@@ -70,6 +70,7 @@ def _validate_route_plan_inputs(
     prefetch_expert: torch.Tensor,
     prefetch_count: torch.Tensor,
     outcome_counters: Optional[torch.Tensor],
+    miss_keys: Optional[torch.Tensor],
 ) -> None:
     if topk_ids.device.type != "cuda":
         raise ValueError("topk_ids must be a CUDA tensor.")
@@ -105,6 +106,12 @@ def _validate_route_plan_inputs(
             raise ValueError("route_counts must be float32.")
         if route_counts.numel() != expert_to_slot.numel():
             raise ValueError("route_counts must have one entry per expert.")
+    if miss_keys is not None:
+        _validate_device_tensor("miss_keys", miss_keys, device)
+        if miss_keys.dtype != torch.int64 or miss_keys.ndim != 1:
+            raise ValueError("miss_keys must be int64 [num_experts].")
+        if miss_keys.numel() != expert_to_slot.numel():
+            raise ValueError("miss_keys must have one entry per expert.")
 
 
 def plan_unique_routes_cuda(
@@ -122,6 +129,7 @@ def plan_unique_routes_cuda(
     prefetch_count: torch.Tensor,
     prefetch_slot: int,
     outcome_counters: Optional[torch.Tensor] = None,
+    miss_keys: Optional[torch.Tensor] = None,
 ) -> None:
     """Write a BS1, K<=32 plan into supplied stable CUDA buffers.
 
@@ -132,6 +140,8 @@ def plan_unique_routes_cuda(
     [covered routes, residual routes, wasted posted rows, posted rows].
     The posted prefetch metadata must be published before this call. The
     caller joins the side-stream payload before it consumes a covered remap.
+    miss_keys is an optional int64 [num_experts] key per expert: when given,
+    residual rows are ordered by key, highest first, instead of by route order.
     """
     _validate_route_plan_inputs(
         topk_ids,
@@ -146,6 +156,7 @@ def plan_unique_routes_cuda(
         prefetch_expert,
         prefetch_count,
         outcome_counters,
+        miss_keys,
     )
     module = _jit_expert_route_plan_module(topk_ids.dtype, remap_out.dtype)
     module.plan_unique_routes_gpu(
@@ -163,4 +174,5 @@ def plan_unique_routes_cuda(
         prefetch_count,
         int(prefetch_slot),
         outcome_counters,
+        miss_keys,
     )

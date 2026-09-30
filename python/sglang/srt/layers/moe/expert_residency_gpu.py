@@ -207,6 +207,7 @@ class GpuResidencyUpdater:
         self.insert_tensors = None
         self.insert_active = None
         self.victims = None
+        self.miss_keys = None
         if self.insert_on_miss:
             self._init_insert_on_miss()
 
@@ -856,6 +857,31 @@ class GpuResidencyUpdater:
         self.victims.copy_(ranked.indices[:, :width].clamp(max=slot_dump))
         self.victim_valid.copy_(ranked.values[:, :width] < never)
         self.victims_fresh = True
+        if self.miss_keys is not None:
+            self._write_miss_keys(routed)
+
+    def enable_miss_order(self) -> None:
+        """Keep ``miss_keys``, int64 ``[layers, experts]``: every expert's victim-ranking key, updated with each ranking.
+
+        A fused graph plan given a layer's row sorts its miss lanes by it, highest first, so the
+        lanes a CPU expert computes instead of inserting are the ones this ranking values least.
+        """
+        if not self.insert_direct:
+            raise ValueError("the miss order needs DIRECT residency, which ranks the keys")
+        if self.miss_keys is not None:
+            return
+        self.miss_keys = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
+        # Without re-ranking: the shortlist a ranking already proposed stays as it is.
+        self._write_miss_keys(self.route_counts > 0)
+
+    def _write_miss_keys(self, routed: torch.Tensor) -> None:
+        # The slot ranking's own key per expert: ascending is (routed, insert score, -expert).
+        self.miss_keys.copy_(
+            residency_rank_keys(self.insert_scores)
+            + routed.to(torch.int64) * _ROUTED_RANK_OFFSET
+        )
 
     def gather_destinations(
         self,

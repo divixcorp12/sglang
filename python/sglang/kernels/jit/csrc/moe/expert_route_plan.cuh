@@ -18,13 +18,19 @@ constexpr int kExpertRoutePlanWarpSize = 32;
 // collective with `hot_hit`, `prefetched` and `residual` all false, so the
 // ballot masks below only ever set bits for active routes.
 //
-// `misses` marks residual (uncovered nonresident) lanes; `rank` is the count
-// of residual lanes before this one and `total` the residual count for the
-// whole warp. A residual route's compacted position is `rank`; a hot-hit or
-// prefetch-covered route's is `total + lane - rank`, i.e. its own rank among
-// non-residual lanes. This puts residual experts first, in first-appearance
-// order, and leaves every other route in its original relative order, so the
-// compacted vector covers positions `[0, top_k)` with no gaps.
+// `misses` marks residual (uncovered nonresident) lanes; `first_rank` is the
+// count of residual lanes before this one and `total` the residual count for
+// the whole warp. A residual route's compacted position is `rank`; a hot-hit or
+// prefetch-covered route's is `total + lane - first_rank`, i.e. its own rank
+// among non-residual lanes. This puts residual experts first and leaves every
+// other route in its original relative order, so the compacted vector covers
+// positions `[0, top_k)` with no gaps.
+//
+// Without `miss_keys`, `rank == first_rank`: residual experts in
+// first-appearance order. With it (int64 [num_experts], CPU experts' miss
+// order), `rank` orders the residual lanes by `miss_keys[expert]`, highest
+// first, ties by lane. The scratch row `scratch_base + rank` follows, so every
+// consumer that indexes by plan row sees the sorted order.
 template <typename IdT, typename RemapT>
 __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_routes_kernel(
     const IdT* __restrict__ topk_ids,
@@ -41,11 +47,13 @@ __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_route
     const int64_t* __restrict__ prefetch_expert,
     const int32_t* __restrict__ prefetch_count,
     int32_t prefetch_slot,
-    int64_t* __restrict__ outcome_counters) {
+    int64_t* __restrict__ outcome_counters,
+    const int64_t* __restrict__ miss_keys) {
   const unsigned lane = threadIdx.x;
   const bool active = static_cast<int>(lane) < top_k;
   const int64_t expert = active ? static_cast<int64_t>(topk_ids[lane]) : 0;
   const int64_t slot = active ? expert_to_slot[expert] : -1;
+  const int64_t key = (miss_keys != nullptr && active) ? miss_keys[expert] : 0;
   const bool hot_hit = active && slot >= 0;
   const bool prefetched =
       active && !hot_hit && prefetch_count[0] == 1 && expert == prefetch_expert[0];
@@ -56,7 +64,17 @@ __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_route
   const unsigned miss_mask = __ballot_sync(0xffffffffu, residual);
   const unsigned prefetched_mask = __ballot_sync(0xffffffffu, prefetched);
   const unsigned earlier = (1u << lane) - 1u;
-  const unsigned rank = __popc(miss_mask & earlier);
+  const unsigned first_rank = __popc(miss_mask & earlier);
+  unsigned rank = first_rank;
+  if (miss_keys != nullptr) {
+    // Warp-uniform: every lane walks the same miss_mask, so each shuffle has all 32 lanes.
+    rank = 0;
+    for (unsigned m = miss_mask; m != 0u; m &= m - 1u) {
+      const int src = __ffs(m) - 1;
+      const int64_t other = __shfl_sync(0xffffffffu, key, src);
+      rank += (other > key || (other == key && static_cast<unsigned>(src) < lane)) ? 1u : 0u;
+    }
+  }
   // `residual_copy_rows`: nonresident routes not covered by prefetch, the
   // scratch-row count the copy backend actually reads. `demand_misses`:
   // every nonresident route, prefetch-covered ones included; it only equals
@@ -71,7 +89,7 @@ __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_route
     const int32_t destination = hot_hit
                                      ? static_cast<int32_t>(slot)
                                      : (prefetched ? prefetch_slot : scratch_base + static_cast<int32_t>(rank));
-    const unsigned dest_pos = residual ? rank : (residual_copy_rows + lane - rank);
+    const unsigned dest_pos = residual ? rank : (residual_copy_rows + lane - first_rank);
     source_rows_out[dest_pos] = expert;
     slots_out[dest_pos] = destination;
     remap_out[lane] = static_cast<RemapT>(destination);
@@ -116,7 +134,8 @@ __global__ __launch_bounds__(kExpertRoutePlanWarpSize, 1) void plan_unique_route
 // `graph_counters`, `graph_unique_counters` and `route_counts` are optional
 // accumulators: absent, they are left untouched. `prefetch_expert` is
 // int64[1] and `prefetch_count` is int32[1]; a zero `prefetch_count` means no
-// route can ever be a covered miss, whatever `prefetch_slot` is.
+// route can ever be a covered miss, whatever `prefetch_slot` is. `miss_keys`,
+// optional int64 [num_experts], sorts the residual lanes by key, descending.
 template <typename IdT, typename RemapT>
 void plan_unique_routes_gpu(
     tvm::ffi::TensorView topk_ids,
@@ -132,7 +151,8 @@ void plan_unique_routes_gpu(
     tvm::ffi::TensorView prefetch_expert,
     tvm::ffi::TensorView prefetch_count,
     int64_t prefetch_slot,
-    tvm::ffi::Optional<tvm::ffi::TensorView> outcome_counters) {
+    tvm::ffi::Optional<tvm::ffi::TensorView> outcome_counters,
+    tvm::ffi::Optional<tvm::ffi::TensorView> miss_keys) {
   const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
   int64_t* graph_counters_ptr =
       graph_counters.has_value() ? static_cast<int64_t*>(graph_counters.value().data_ptr()) : nullptr;
@@ -144,6 +164,8 @@ void plan_unique_routes_gpu(
   int64_t* outcome_counters_ptr = outcome_counters.has_value()
                                       ? static_cast<int64_t*>(outcome_counters.value().data_ptr())
                                       : nullptr;
+  const int64_t* miss_keys_ptr =
+      miss_keys.has_value() ? static_cast<const int64_t*>(miss_keys.value().data_ptr()) : nullptr;
   host::LaunchKernel(1, kExpertRoutePlanWarpSize, stream)(
       plan_unique_routes_kernel<IdT, RemapT>,
       static_cast<const IdT*>(topk_ids.data_ptr()),
@@ -160,7 +182,8 @@ void plan_unique_routes_gpu(
       static_cast<const int64_t*>(prefetch_expert.data_ptr()),
       static_cast<const int32_t*>(prefetch_count.data_ptr()),
       static_cast<int32_t>(prefetch_slot),
-      outcome_counters_ptr);
+      outcome_counters_ptr,
+      miss_keys_ptr);
 }
 
 }  // namespace sglang
