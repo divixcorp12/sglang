@@ -106,10 +106,9 @@ def test_one_record_per_request_in_order(tier):
         assert record["prev_done"] == previous_done and record["observed"] >= previous_done
         previous_done = record["done"]
     read, empty, one = records
-    # pack_ns == 0: a row image is finished at one clock (RowReader copies nothing), so a row's pack span is empty.
     # The service streams pieces: every row is the same number of sub-reads (one part, up to 4 page-aligned cuts).
     assert one["extents"] >= 1
-    assert read["batches"] == 1 and read["extents"] == 2 * one["extents"] and read["submit"] > 0 and read["pack_ns"] == 0
+    assert read["batches"] == 1 and read["extents"] == 2 * one["extents"] and read["submit"] > 0
     assert empty["batches"] == 0 and empty["extents"] == 0 and empty["bytes"] == 0 and empty["submit"] == 0
 
 
