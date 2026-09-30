@@ -89,10 +89,20 @@ def test_concurrent_eager_use_and_demands_never_share_a_slot(tmp_path):
     stop = threading.Event()
     errors = []
 
+    def pause():
+        # pause() refuses while a lease is outstanding; the chain in flight retires it at its Done.
+        deadline = time.perf_counter() + 5.0
+        while True:
+            try:
+                return host.pause(timeout_s=2.0)
+            except RuntimeError as error:
+                if "lease" not in str(error) or time.perf_counter() > deadline:
+                    raise
+
     def eager():
         for expert in range(200):
             try:
-                host.pause(timeout_s=2.0)
+                pause()
                 try:
                     e = expert % 6
                     if not host.contains(0, e):
