@@ -13,6 +13,7 @@ from cpu_expert_sim import (  # noqa: E402
     MAX_ROUTES,
     CostModel,
     _cpu_chooser,
+    _lane_sorter,
     _queue,
     c_cpu_at,
     histogram,
@@ -313,6 +314,26 @@ def test_optimistic_bound_also_credits_gpu_compute_and_nvme_waits_as_idle_link()
     assert costs["uncosted"] == pytest.approx(base)
     assert costs["amortised"] == pytest.approx(base + 3.0 - 0.42)
     assert costs["optimistic"] == pytest.approx(base + 3.0 - 0.42 - 1.5 - 0.3)
+
+
+@pytest.mark.parametrize(
+    "policy, resident",
+    [
+        # Lanes [6, 7, 5, 8]: CPU lanes 6, 7 keep experts 3 and 2; 5 and NVMe-miss 8 evict 1 and 0.
+        ("cpu_by_score_asc_head", {2, 3, 5, 8}),
+        # Lanes [8, 5, 7, 6]: 8 and 5 evict 3 and 2, the coldest; CPU lanes 7, 6 are the last job lanes.
+        ("cpu_by_score_desc_tail", {0, 1, 5, 8}),
+    ],
+)
+def test_device_sorted_lanes_pair_with_victims_in_the_sorted_order(policy, resident):
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2, 3]}, {0: 4}, 16, miss_rows=4)  # shortlist: 3, 2, 1, 0
+    for expert, score in ((5, 3.0), (6, 1.0), (7, 2.0), (8, 5.0)):
+        sim.scores[0, expert] = score
+    chosen = {}
+    choose = _cpu_chooser(policy, sim, [0, 1, 1, 2], {0: [5, 6, 7]}, chosen)  # 8 misses the pinned tier
+    sim.graph_forward({0: [5, 8, 6, 7]}, cpu_lanes=choose, lane_order=_lane_sorter(policy, sim))
+    assert set(chosen[0]) == {6, 7}
+    assert sim.resident(0) == resident
 
 
 if __name__ == "__main__":

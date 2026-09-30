@@ -28,7 +28,9 @@ then still crosses the link (tier_sim.ms_per_token does the same). Assumptions:
 - Residency (``insert_policies``): each policy replays its own residency, since a CPU lane is never inserted into
   VRAM (direct_commit_gather_kernel). ``insert_all`` is the P1 assumption (every miss inserted, the headline table
   above). ``cpu_lane_order`` puts split[n] of a layer's n RAM hits on the CPU in plan-lane order (the misses in
-  route order); ``cpu_numa_local`` takes the hits whose replayed pinned slot is on the CPU's node first, as
+  route order); ``cpu_by_score_asc_head`` / ``_desc_tail`` sort every miss lane by the victim key on the device
+  and take the first / last split[n] job lanes, so the pairing with the victims follows the sorted order;
+  ``cpu_numa_local`` takes the hits whose replayed pinned slot is on the CPU's node first, as
   choose_cpu_lanes_locked does; ``cpu_by_score`` takes the lowest by the victim ranking's key. The
   ``cpu_deferred*`` policies insert ``cpu_lane_order``'s lanes one graph forward later, into shortlist entries that
   forward left unused, if the row is still in the pinned tier after that forward's admissions; the variants
@@ -128,6 +130,10 @@ INSERT_POLICIES = {
     "insert_all": {"choice": "lane", "insert": True},
     "cpu_lane_order": {"choice": "lane"},
     "cpu_by_score": {"choice": "score"},
+    # The device sorts the plan's miss lanes by the victim key (NVMe misses included) and the host takes the first
+    # (asc) or last (desc) split[n] job lanes; lane j pairs with usable[j] in the sorted order.
+    "cpu_by_score_asc_head": {"choice": "head", "sort": "asc"},
+    "cpu_by_score_desc_tail": {"choice": "tail", "sort": "desc"},
     "cpu_numa_local": {"choice": "numa"},
     "cpu_deferred": {"choice": "lane", "queue": "lane"},
     "cpu_deferred_scoreq": {"choice": "lane", "queue": "score"},
@@ -174,6 +180,13 @@ def _cpu_chooser(
     def choose(layer: int, missing: list[int]) -> set[int]:
         hits = ram_hits[layer]
         k = split[min(len(hits), len(split) - 1)]
+        if choice in ("head", "tail"):
+            # Job lanes (pinned-tier hits) in the device's lane order; NVMe lanes stay copy lanes.
+            held = set(hits)
+            jobs = [e for e in missing if e in held]
+            picked = set(jobs[:k] if choice == "head" else jobs[len(jobs) - k :])
+            chosen[layer] = [e for e in jobs if e in picked]
+            return picked
         if choice == "score":
             ranked = sorted(hits, key=_victim_key(sim, sim.row[layer]))
         elif choice == "numa":
@@ -186,6 +199,14 @@ def _cpu_chooser(
         return set() if config.get("insert") else picked
 
     return choose
+
+
+def _lane_sorter(policy: str, sim) -> Optional[Callable[[int, list[int]], list[int]]]:
+    """The graph_forward lane_order hook of a device-sorted policy: miss lanes by the victim key."""
+    order = policy_config(policy).get("sort")
+    if order is None:
+        return None
+    return lambda layer, missing: sorted(missing, key=_victim_key(sim, sim.row[layer]), reverse=order == "desc")
 
 
 def _queue(policy: str, sim, chosen: dict[int, list[int]]) -> dict[int, list[int]]:
@@ -288,6 +309,7 @@ def replay_nm(
                 cpu_lanes=hook,
                 deferred=pending if defer else None,
                 deferred_unrouted=bool(config.get("unrouted")),
+                lane_order=_lane_sorter(policy, sim),
             )
             if defer:
                 # Every graph forward's commit lands the queue (a graph-served prefill too), so it restarts here.

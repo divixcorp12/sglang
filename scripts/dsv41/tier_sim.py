@@ -287,9 +287,11 @@ class DirectInsertReplay:
         cpu_lanes: Optional[Callable[[int, list[int]], set[int]]] = None,
         deferred: Optional[dict[int, list[int]]] = None,
         deferred_unrouted: bool = False,
+        lane_order: Optional[Callable[[int, list[int]], list[int]]] = None,
     ) -> dict[int, int]:
         """One forward served by the graph gather (a replay, or a one-token extend run eagerly through
-        it); returns each layer's misses (its plan count).
+        it); returns each layer's misses (its plan count). ``lane_order(layer, misses)`` reorders a layer's
+        plan lanes (first-appearance route order otherwise), and with them the lane j <-> usable[j] pairing.
 
         ``cpu_lanes(layer, misses)`` (CPU experts) gets a layer's misses in plan-lane order and returns
         the ones the CPU computes: they are not inserted and their victims keep their experts, as
@@ -305,6 +307,8 @@ class DirectInsertReplay:
             where, slots = self.where[row], self.slots[row]
             hits = {int(where[e]) for e in experts if where[e] >= 0}
             missing = list(dict.fromkeys(e for e in experts if where[e] < 0))
+            if lane_order is not None and missing:
+                missing = lane_order(layer, missing)
             np.add.at(self.route_counts[row], experts, np.float32(1.0))
             usable = [slot for slot in self.shortlist[row] if slot not in hits]
             on_cpu = cpu_lanes(layer, missing) if cpu_lanes is not None and missing else set()
