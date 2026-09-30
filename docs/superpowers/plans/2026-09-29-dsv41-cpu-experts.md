@@ -276,3 +276,83 @@ expert, p50 (p90 ≤ 1.1x p50):
 - **E26 lesson.** At 4 threads, CPU experts lost once the copy kernel got faster. Re-run P1 against the current
   link cost before P2, and keep the policy table data-driven so the choice flips back automatically if the link
   improves.
+
+---
+
+## P1 results (2026-09-29, `645ffdfb83`, `scripts/dsv41/cpu_expert_sim.py`)
+
+**Setup.**
+- Trace: the router-capture route log (`direct-two-phase-tests/hot-cache-policy/router-capture/stages.jsonl`), 6,153
+  decode tokens, hot cache 28-29 slots per layer as logged, pinned tier 8,063 rows (100 GiB).
+- VRAM is `tier_sim.DirectInsertReplay` (DIRECT insert-on-miss, started from the first logged hot set); the pinned
+  tier is `ram_replay.py`'s RamTier (`base` policy). Prefill forwards are replayed, decode is counted.
+- Per decode token and layer: n = misses VRAM, hits RAM; m = misses both.
+- Model checks against the run: VRAM misses/token 78.78 (replay) vs 78.78 (route log); m = 11.32 vs 11.265 measured
+  RAM misses/token.
+- Cost model as §2, with c_cpu(k) interpolated through the P0 points at 1/2/6 experts per call. Defaults:
+  `c_link` 1.0, `h` 0.02, GPU 14 ms, NVMe exposure 1.5 ms per miss (11.3 × 1.5 ≈ 17 ms, inside §27.3's 13-20 ms).
+
+```bash
+# divix01, wt-cpu-p1 at 645ffdfb83, PYTHONPATH=$PWD/python OMP_NUM_THREADS=8, taskset -c 0-17,30-63, 30 s
+O=/data/models/slang/nvfp4-work/direct-two-phase-tests/hot-cache-policy/router-capture
+$PY scripts/dsv41/cpu_expert_sim.py $O/stages.jsonl --out /mnt/nvme1/cpu-p1/native.json
+# swizzled table: --nvme-ms 1.5 --c-cpu-table '{"8":[0.593,0.539,0.529],"10":[0.514,0.485,0.455],"12":[0.450,0.411,0.385]}'
+# GPU term off:   --nvme-ms 1.5 --gpu-ms 0
+```
+
+**Where n and m fall** (over 246,120 token-layers; 0.7 mean m and up to 3.0 mean n per layer; layer 0 is the heaviest):
+
+| n | 0 | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| share of layers | 17.8% | 31.1% | 27.1% | 15.4% | 6.3% | 1.9% | 0.4% |
+
+- Mean n = **67.5 per token** (1.69 per layer), mean m = 11.3 per token (0.28 per layer). m histogram 0..6:
+  188,602 / 47,348 / 8,530 / 1,362 / 239 / 36 / 3.
+- Per-layer means and histograms are in `native.json` (`mean_n_per_layer`, `n_hist_per_layer`).
+- 78% of layers have n ≤ 2, the range where `k*` sends everything to the CPU.
+
+**Predicted ms/token** (12 threads, NVMe 1.5 ms/miss, GPU 14 ms), gain against `off` [estimate]:
+
+| Policy | native ms/token | gain | swizzled ms/token | gain |
+|---|---:|---:|---:|---:|
+| off | 109.76 | 0.0% | 109.76 | 0.0% |
+| all RAM hits to CPU | 71.35 | 35.0% | 65.05 | 40.7% |
+| **`k*(n)` (`split_table`)** | **70.63** | **35.6%** | 64.28 | 41.4% |
+| `k*` cap 1 | 82.49 | 24.8% | 81.31 | 25.9% |
+| `k*` cap 2 | 73.16 | 33.3% | 67.80 | 38.2% |
+| `k*` exact (argmin with k-dependent c_cpu and m) | 67.17 | 38.8% | 62.90 | 42.7% |
+| `k*` + NVMe-landed rows on CPU | 65.85 | 40.0% | 61.02 | 44.4% |
+
+- `split_table` uses a scalar c_cpu (the value at 2 per call), as the P3 runtime table would. `k*` exact uses the
+  k-dependent cost and counts m on the link side, so it is the ceiling for a table without an m dimension.
+- `k*` + NVMe assumes the m landed rows are computed on the CPU (rows_cpu = k + m) and their read latency stays fully
+  exposed: the two add, no overlap. A landed row therefore leaves the link.
+- NUMA preference is not modeled: the trace has no host-slot node.
+- Not modeled either: c_cpu under NVMe DMA or copy-engine load (P0 open), any swizzled-layout unswizzle cost on H2D
+  rows (the swizzled columns take P0's numbers as given), and the GPU work the CPU share overlaps with.
+
+**Thread sweep** (native P0 table, NVMe 1.5), `k*` gain and ms/token; other policies in `native.json`:
+
+| Threads | c_cpu at 1/2/6 | off | all-CPU | `k*` | `k*` exact | `k*` + NVMe |
+|---:|---|---:|---:|---:|---:|---:|
+| 8 | 0.717 / 0.658 / 0.644 | 109.76 | 80.56 (26.6%) | 74.28 (32.3%) | 72.07 (34.3%) | 72.65 (33.8%) |
+| 10 | 0.622 / 0.594 / 0.543 | 109.76 | 75.75 (31.0%) | 72.29 (34.1%) | 69.47 (36.7%) | 69.08 (37.1%) |
+| 12 | 0.575 / 0.518 / 0.475 | 109.76 | 71.35 (35.0%) | 70.63 (35.6%) | 67.17 (38.8%) | 65.85 (40.0%) |
+
+**Sensitivity.**
+- NVMe exposure at 12 threads, `k*` gain: 1.5 ms/miss 35.6%, 3.4 ms 29.8%, 7.0 ms 22.7%. The higher figures are
+  tier_sim's whole-row serial upper bounds and put `off` at 131 and 172 ms/token, well above the 97 ms measured.
+- GPU term 0 (`--gpu-ms 0`): `off` 95.76 ms, near the ~97 measured, and `k*` 56.63 ms, a 40.9% gain.
+  The 14 ms term is therefore conservative for the percentage.
+- `k*` cap 1 is the weakest policy in every column (24.8% at 12 threads): with n = 2-3 in 43% of layers, a one-expert
+  cap leaves a serial link copy next to the CPU work. The cap 2 arm is within 2.3 points of uncapped.
+- The modeled `off` ms/token (109.8) is 13% above the 97 measured, so absolute ms/token here is high by about that
+  much. The gain is the quantity to read.
+
+**Gate (pre-registered: predicted gain ≥ 15%): PASS.**
+- `k*` predicts **35.6%** (70.6 vs 109.8 ms/token) at 12 native threads, and 32.3% at 8.
+- Every policy except cap 1 clears 15% in every column of the sweep at 1.5 ms/miss. Cap 1 does too (23.6% at 8 threads,
+  the worst case), and the 7.0 ms/miss upper bound still gives `k*` 20.6-22.7%.
+- The absolute predicted level (~71 ms, 14 tok/s) is above the plan's 55-65 ms [estimate]; the P3 items and the
+  swizzled layout (64 ms) are what move it there.
+- P2 should still measure the interaction the model omits: c_cpu under concurrent NVMe DMA and H2D load.
