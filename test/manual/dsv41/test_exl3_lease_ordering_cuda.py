@@ -197,44 +197,83 @@ def test_the_captured_chain_waits_in_cw_and_replays_right_armed_and_unarmed(tmp_
         c.close()
 
 
-@pytest.mark.parametrize("fillers", [0, 3000])
-def test_the_first_replay_of_a_copy_engine_graph_completes_armed(tmp_path, fillers):
-    """Both smokes that failed at startup (abba1-on, diag arm1-on) failed on a decode step that ran armed early in the
-    server's life, where a graph variant may run for the first time. A freshly captured graph, with ``fillers`` kernels
-    on each side of the chain for the decode graph's size, is replayed for the first time armed with every lane a
-    hit: its copy must complete well inside the copy-wait timeout."""
-    c = Chain(tmp_path, copy_engine=True)
-    try:
-        _resident(c, [0, 1, 2])
-        x = torch.zeros(1, device="cuda")
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            c.gather()  # eager warm-up: loads every kernel; an eager post never copies
+def _first_armed_replay(c, *, before, after, unarmed_first):
+    """Capture ``before`` filler kernels, the gather, ``after`` fillers (the decode graph's size around one layer);
+    optionally replay once unarmed; then arm and replay with every lane a hit. Returns the armed replay's seconds."""
+    _resident(c, [0, 1, 2])
+    x = torch.zeros(1, device="cuda")
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        c.gather()  # eager warm-up: loads every kernel; an eager post never copies
+        x.add_(1)
+    torch.cuda.synchronize()
+    assert c.retired()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for _ in range(before):
             x.add_(1)
+        c.gather()
+        for _ in range(after):
+            x.add_(1)
+    if unarmed_first:
+        c.plan([1, 2, 0])
+        graph.replay()
         torch.cuda.synchronize()
         assert c.retired()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            for _ in range(fillers):
-                x.add_(1)
-            c.gather()
-            for _ in range(fillers):
-                x.add_(1)
-        c.host.arm_copy_engine()
-        jobs = c.host.counters()["copy_jobs"]
-        experts = [2, 0, 1]
-        c.plan(experts)
-        t0 = time.perf_counter()
-        graph.replay()
-        snapshot = c.snapshot()
-        torch.cuda.synchronize()
-        replay_s = time.perf_counter() - t0
+    c.host.arm_copy_engine()
+    jobs = c.host.counters()["copy_jobs"]
+    experts = [2, 0, 1]
+    c.plan(experts)
+    t0 = time.perf_counter()
+    graph.replay()
+    snapshot = c.snapshot()
+    torch.cuda.synchronize()
+    replay_s = time.perf_counter() - t0
+    assert c.host.counters()["copy_jobs"] == jobs + 1, c.host.counters()
+    c.check(experts, snapshot)
+    assert c.retired(), c.host.counters()
+    return replay_s
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "unarmed_first"), [(0, 0, False), (3000, 0, False), (3000, 3000, True)],
+    ids=["bare", "long_head", "long_tail_after_an_unarmed_replay"],
+)
+def test_the_first_armed_replay_of_a_copy_engine_graph_completes(tmp_path, before, after, unarmed_first):
+    """Both smokes that failed at startup (abba1-on, diag arm1-on) failed on a decode step that ran armed early in the
+    server's life. A graph's first armed replay completes well inside the copy-wait timeout when nothing long follows
+    the chain in its first launch, or when it has run once unarmed, which the service guarantees by arming only after
+    COPY_ENGINE_ARM_DECODES decode forwards. Mutant: the copy thread never stores CopyDone -- CC traps."""
+    c = Chain(tmp_path, copy_engine=True)
+    try:
+        replay_s = _first_armed_replay(c, before=before, after=after, unarmed_first=unarmed_first)
         assert replay_s < 1.0, replay_s
-        assert c.host.counters()["copy_jobs"] == jobs + 1, c.host.counters()
-        c.check(experts, snapshot)
-        assert c.retired(), c.host.counters()
     finally:
         c.close()
+
+
+_LONG_TAIL_SCRIPT = """
+import sys
+sys.path.insert(0, sys.argv[2])
+from lease_chain_rig import Chain
+from test_exl3_lease_ordering_cuda import _first_armed_replay
+c = Chain(sys.argv[1], copy_engine=True)
+_first_armed_replay(c, before=0, after=3000, unarmed_first=False)
+print("reached", flush=True)
+"""
+
+
+def test_a_graphs_first_launch_armed_with_a_long_tail_aborts_at_the_copy_wait_timeout(tmp_path):
+    """The hazard the arming delay exists for, pinned: a graph launched for the first time armed, with ~3000 kernels
+    after the chain, never gets its copy (the same at 62afc40d7d, where it failed closed after 2 s). 300 or 1000
+    kernels after, or 3000 before, complete; so does any graph that ran once unarmed. When this test goes red, a
+    change made the first armed launch safe: then the arming delay may be revisited."""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_LONG_TAIL_SCRIPT), str(tmp_path), str(Path(__file__).parent)],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert "reached" not in result.stdout, result.stdout
+    assert "FATAL" in result.stderr and "a copy wait held the decode stream" in result.stderr, result.stderr[-4000:]
 
 
 _LAZY_SCRIPT = """
