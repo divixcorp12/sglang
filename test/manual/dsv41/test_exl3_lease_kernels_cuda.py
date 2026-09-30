@@ -87,7 +87,9 @@ def test_the_captured_chain_replays_byte_exact_through_ring_reuse_and_eviction(t
                 c.gather(row)
         rng = random.Random(7)
         steps = 3 * DEMAND_RECORDS // LAYERS
-        served = c.host.counters()["served"]
+        # "served" counts the requests that read a row, "touch_only" the all-hit ones.
+        before = c.host.counters()
+        served = before["served"] + before["touch_only"]
         for _ in range(steps):
             plans = {row: [rng.randrange(EXPERTS) for _ in range(rng.randint(1, TOP_K))] for row in range(LAYERS)}
             with torch.cuda.stream(stream):
@@ -100,7 +102,7 @@ def test_the_captured_chain_replays_byte_exact_through_ring_reuse_and_eviction(t
                 c.check(plans[row], snapshots[row], row)
         assert c.retired()
         counters = c.host.counters()
-        assert counters["served"] - served == steps * LAYERS
+        assert counters["served"] + counters["touch_only"] - served == steps * LAYERS
         assert counters["overruns"] == 0 and counters["evictions"] > 0
     finally:
         c.close()
