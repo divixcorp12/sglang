@@ -243,7 +243,7 @@ NON_TRACE_CLOCK_READS = {
     "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread.
     "const int64_t now = now_ns();": 1,
-    # The copy engine (LEASE_PROTOCOL.md 7.6): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
+    # The copy engine (LEASE_PROTOCOL.md, "Copy engine"): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
     # through it) and stop()'s drain deadline, which the copy thread reads only once a stop was asked for.
     "if (now_ns() > deadline_ns) return false;": 1,
     "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,

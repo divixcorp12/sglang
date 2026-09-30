@@ -306,7 +306,7 @@ def test_a_device_shared_by_the_service_and_the_tiers_is_synced_once(world, monk
     assert seen == [torch.device("cuda", 1)]
 
 
-# ---- the scheduler's graceful shutdown reaches the service (LEASE_PROTOCOL.md 20.2i) ----
+# ---- the scheduler's graceful shutdown reaches the service (LEASE_PROTOCOL.md, "Shutdown") ----
 # These run the REAL, unbound Scheduler.release_host_resources on a stub, as the removed doorbell tests did. The
 # barrier is still the fake one above: they show the wiring and its order, not that a real device barrier orders GPU
 # work.

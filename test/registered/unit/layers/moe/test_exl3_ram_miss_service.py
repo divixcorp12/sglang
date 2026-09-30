@@ -945,7 +945,7 @@ def test_stage_records_are_drained_into_the_trace_only_when_traced(monkeypatch):
 
 
 def _copy_engine_service(monkeypatch):
-    """A service with only what the copy engine's arming and guards read (LEASE_PROTOCOL.md 7.6)."""
+    """A service with only what the copy engine's arming and guards read (LEASE_PROTOCOL.md, "Copy engine")."""
     service = module.Exl3RamMissService()
     service.copy_engine = True
     service.device_side = SimpleNamespace(copy_engine_captured=True)
