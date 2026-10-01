@@ -126,7 +126,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           .dst_rows = p.dst_rows[p.row],
       };
       // Before the tag spin: the host stores split relaxed at any time, ordered by nothing (ram_tier.h set_cpu_split).
-      load_split(p.lease + kSplit, policy.split);
+      // Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes never indexes it.
+      if (p.captured != 0 && policy.cpu_on && policy.cpu_ok) load_split(p.lease + kSplit, policy.split);
       const uint8_t* delta = p.lease + kDeltaBase + p.row * kDeltaStride;
       const bool pending = await_map_delta(delta, map, deadline);
       MapDelta d;
