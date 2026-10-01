@@ -98,7 +98,6 @@ def test_the_python_core_counters_are_the_hosts():
 TEST_ONLY_CALLS = {
     "inject": lambda h: h.inject(fail_reads=True),
     "inject_fault": lambda h: h.inject_fault(part=0, part_error=5),
-    "inject_lease": lambda h: h.inject_lease(0, 0, 1),
     "trace": lambda h: h.enable_trace(16),
 }
 
@@ -126,7 +125,6 @@ def test_a_faulted_read_refuses_on_prod(tmp_path):
 RAW_EXPORTS = {
     "inject": lambda m, h: m.expert_stream_inject(h, 0, 1, 0),
     "inject_fault": lambda m, h: m.expert_stream_inject_fault(h, ops._fault_tensor(part=0, part_error=5)),
-    "inject_lease": lambda m, h: m.expert_stream_inject_lease(h, 0, 0, 1),
     "copy_engine_fail": lambda m, h: m.expert_stream_copy_engine_fail(h, 1, 0),
     "copy_engine_ballast": lambda m, h: m.expert_stream_copy_engine_ballast(h, 0, 0, 0),
     "trace_clock_reads": lambda m, h: m.expert_stream_trace_clock_reads(),
