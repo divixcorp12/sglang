@@ -173,7 +173,8 @@ class ChainSim:
                 cpu_misses=cpu_misses, cpu_ok=cpu_ok, ce_ok=ce_ok,
             )
         else:
-            typed, slot_list = [LaneKind(k) for k in kinds], list(slots)
+            # Raw ints, not LaneKind: a malformed post may name a kind the device never writes.
+            typed, slot_list = [int(k) for k in kinds], list(slots)
         forged, chain = chain, 0
         if any(k in (LaneKind.MISS_GPU, LaneKind.MISS_CPU) for k in typed):
             self.replica.map_chain[row] += 1

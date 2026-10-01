@@ -230,6 +230,17 @@ def test_a_map_chain_out_of_order_aborts(tmp_path):
     assert_aborted(out, "map chain")
 
 
+def test_a_whole_record_with_a_kind_the_device_never_writes_aborts(tmp_path):
+    """A record that passes its seqlock but names kind 0 is not torn: it is malformed, and the host fail-stops instead
+    of skipping it as an overrun (the device would wait on it until S's deadline). Mutation: malformed is an overrun."""
+    out = _script(tmp_path, """
+        sim.post(0, [2], kinds=[0], slots=[0])
+        host.pump()
+        print("reached")
+    """)
+    assert_aborted(out, "malformed record")
+
+
 def test_failed_read_aborts_with_fatal(tmp_path):
     out = _script(tmp_path, """
         host.inject(0, True, 0)

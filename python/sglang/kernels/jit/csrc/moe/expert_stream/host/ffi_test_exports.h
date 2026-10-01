@@ -599,7 +599,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       while (now_ns() < deadline) {
         const uint32_t seq = load_acquire(record + kRecSeq);
         Request request;
-        if (seq == 0 || !read_record(record, seq, &request)) continue;
+        if (seq == 0 || read_record(record, seq, &request) != RecordRead::kOk) continue;
         ++accepted;
         const uint32_t round = (seq - 1u) / kDemandRecords;
         bool whole = request.row == static_cast<uint16_t>(round) && request.captured == ((round & 1u) != 0) &&

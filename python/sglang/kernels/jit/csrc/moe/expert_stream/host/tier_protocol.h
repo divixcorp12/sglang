@@ -125,9 +125,11 @@ struct Request {
 
 // Seqlock read: the writer stores the payload, fences, then the seq word last, so a record whose seq reads `expected`
 // both before and after the payload is whole. Records nothing waits for lap the ring unread, so a torn one must be
-// detectable. False also for a record whose counts or kinds are out of range: it cannot be the device's.
-inline bool read_record(const uint8_t* record, uint32_t expected, Request* request) {
-  if (load_acquire(record + kRecSeq) != expected) return false;
+// detectable. A whole record whose count or kinds are out of range is malformed: the device never writes one.
+enum class RecordRead { kOk, kTorn, kMalformed };
+
+inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request* request) {
+  if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
   uint16_t row, count, protect;
   uint32_t flags, chain_lo, chain_hi, epoch;
   std::memcpy(&row, record + kRecRow, 2);
@@ -137,7 +139,7 @@ inline bool read_record(const uint8_t* record, uint32_t expected, Request* reque
   std::memcpy(&chain_hi, record + kRecChainHi, 4);
   std::memcpy(&epoch, record + kRecEpoch, 4);
   std::memcpy(&protect, record + kRecProtectCount, 2);
-  if (count > kLeaseLanes) return false;
+  if (count > kLeaseLanes) count = kLeaseLanes + 1;  // judged once the seq re-check says the record is whole
   request->seq = expected;
   request->gen = static_cast<uint64_t>(epoch) << 32 | expected;
   request->row = row;
@@ -146,7 +148,7 @@ inline bool read_record(const uint8_t* record, uint32_t expected, Request* reque
   const auto* protect_ids = reinterpret_cast<const int32_t*>(record + kRecProtect);
   request->protect.assign(protect_ids, protect_ids + std::min<int>(protect, kMaxIds));
   request->lanes.clear();
-  for (int j = 0; j < count; ++j) {
+  for (int j = 0; j < std::min<int>(count, kLeaseLanes); ++j) {
     const uint8_t* lane = record + kRecLanes + j * kLaneBytes;
     Lane l;
     std::memcpy(&l.expert, lane + kLaneExpert, 4);
@@ -157,10 +159,11 @@ inline bool read_record(const uint8_t* record, uint32_t expected, Request* reque
     request->lanes.push_back(l);
   }
   std::atomic_thread_fence(std::memory_order_acquire);
-  if (load_acquire(record + kRecSeq) != expected) return false;
+  if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
+  if (count > kLeaseLanes) return RecordRead::kMalformed;
   for (const Lane& lane : request->lanes)
-    if (lane.kind < kKindHitCopy || lane.kind > kKindMissCpu) return false;
-  return true;
+    if (lane.kind < kKindHitCopy || lane.kind > kKindMissCpu) return RecordRead::kMalformed;
+  return RecordRead::kOk;
 }
 
 // Fail-stop: every host failure of the protocol ends the process here, with one line first. Nothing recovers, so

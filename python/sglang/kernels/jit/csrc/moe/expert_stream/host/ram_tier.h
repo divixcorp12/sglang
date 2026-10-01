@@ -247,7 +247,12 @@ class RamTier {
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
     Request request;
     // A torn record was overwritten by a later post, so nothing waits on it: skipped, and counted.
-    if (!read_record(record, next_demand_, &request)) {
+    const RecordRead read = read_record(record, next_demand_, &request);
+    if (read == RecordRead::kMalformed) {
+      fail_stop(error_prefix<Layout>() + "request " + std::to_string(next_demand_) + ": malformed record (a lane kind or "
+                "count the device never writes)");
+    }
+    if (read == RecordRead::kTorn) {
       count<kOverruns>();
     } else {
       bool skip = false;
