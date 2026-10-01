@@ -1834,33 +1834,12 @@ class ExpertHotCacheManager:
             self.fail_stop_checks = []
         self.fail_stop_checks.append(check)
 
-    def add_residency_listener(
-        self, listener: Callable[[int, list[int]], None]
-    ) -> None:
-        """Call ``listener(layer_id, slot_to_expert)`` after startup and every residency update.
-
-        The update is committed before listeners run. A listener must not raise
-        for a recoverable condition: a raise skips the remaining listeners and
-        layers and propagates out of the forward observer, stopping the process.
-        Listeners are not called by the GPU residency updater, so
-        ``_attach_formats`` refuses them when it is on.
-        """
-        if not hasattr(self, "residency_listeners"):
-            self.residency_listeners = []
-        self.residency_listeners.append(listener)
-
-    def _notify_residency_listeners(self) -> None:
-        """Push every layer's hot slots to each listener; a listener's raise propagates."""
-        for listener in getattr(self, "residency_listeners", ()):
-            for layer_id, cache in self.caches.items():
-                listener(layer_id, list(cache.slot_to_expert))
-
     def _attach_formats(self) -> None:
         """Offer the finished manager to each streamed format that asks for it
-        (``attach_hot_cache_manager(manager, streamer)``), then push residency once.
+        (``attach_hot_cache_manager(manager, streamer)``).
 
         Runs once per manager; later calls return at once, so hooks never
-        register their checks and listeners twice.
+        register their checks twice.
         """
         if getattr(self, "_formats_attached", False):
             return
@@ -1869,15 +1848,6 @@ class ExpertHotCacheManager:
             hook = getattr(streamer.format, "attach_hot_cache_manager", None)
             if hook is not None:
                 hook(self, streamer)
-        if (
-            getattr(self, "gpu_residency", None) is not None
-            and getattr(self, "residency_listeners", None)
-        ):
-            raise ValueError(
-                "a format registered a residency listener, but the GPU residency "
-                "updater changes residency without notifying listeners"
-            )
-        self._notify_residency_listeners()
 
     def run_fail_stop_checks(self) -> None:
         """Run every registered fail-stop check, in registration order.
@@ -1973,7 +1943,6 @@ class ExpertHotCacheManager:
         score_rows = list(self._async_residency_buffers["scores"].unbind(0))
         self._async_residency_pending = None
         self._apply_residency_decisions(layers, mode, boundary_forward, score_rows)
-        self._notify_residency_listeners()
         refresh = self._async_residency_refresh
         self._async_residency_refresh = None
         if refresh is not None:
@@ -2832,8 +2801,6 @@ class ExpertHotCacheManager:
             )
         elif qualifying:
             self._update_residency(boundary_tokens, mode)
-            if not getattr(self, "_async_residency_scores", False):
-                self._notify_residency_listeners()
         if clock.forwards % self.log_interval == 0:
             self._schedule_trace(mode)
 

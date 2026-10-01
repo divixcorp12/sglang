@@ -342,7 +342,7 @@ def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
 
 
 def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_hot(tiers):
-    """Minor 1: the hot cache reserves chunk 1's experts before the residency listener
+    """Minor 1: the hot cache reserves chunk 1's experts before _push_hot
     pushes them to C++. Chunk 2's admission (its own host use) must still protect them,
     exactly as ``is_pinned`` does when it sizes the chunk."""
     service, streamers, caches = tiers
@@ -351,7 +351,7 @@ def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_ho
     row = service.row_of(0)
     cache.ensure_rows(torch.tensor([0]))
     cache.ensure_rows(torch.tensor([1, 2]))  # full (capacity 3); 0 is the LRU-oldest row
-    # Chunk 1 promoted 0 into VRAM: the hot cache holds it; no listener push has run yet.
+    # Chunk 1 promoted 0 into VRAM: the hot cache holds it; no _push_hot has run yet.
     streamers[0].hot_cache = SimpleNamespace(slot_to_expert=[0, -1])
     assert cache.evictable_rows() == 3  # the tier's 4 slots, less 0, which is_pinned already protects
     cache.ensure_rows(torch.tensor([4]))  # chunk 2's admission
