@@ -84,7 +84,7 @@ def test_shutdown_ends_a_gpu_reader_waiting_on_the_service_without_waiting_out_i
     service is what shutdown is stopping. The header's shutdown word ends that wait at once (D4). With a 20 s wait
     timeout, a shutdown that did not close admission first would sit in the barrier for the whole timeout.
     Mutation: admission is never closed (or closed after the barrier)."""
-    from test_exl3_ram_miss_graph_gpu import HIDDEN, TOP_K, _layers, _step_route
+    from test_exl3_ram_miss_graph_gpu import HIDDEN, TOP_K, _handled_all, _layers, _step_route
 
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
@@ -97,14 +97,9 @@ def test_shutdown_ends_a_gpu_reader_waiting_on_the_service_without_waiting_out_i
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
-        graph.replay()  # the warm route is resident: its leases are acknowledged and retired
+        graph.replay()  # the warm route is resident: every record it posts is handled
         torch.cuda.synchronize()
-        deadline = time.perf_counter() + 10.0
-        while time.perf_counter() < deadline:
-            c = service.host.counters()
-            if c["leases_granted"] > 0 and c["leases_acked"] == c["leases_granted"]:
-                break
-            time.sleep(0.005)
+        assert _handled_all(service), service.host.counters()
         service.host.pause(2.0)  # nobody serves from here on, so the next wait kernel spins until its timeout
         ids.copy_(torch.tensor([_step_route(0, 0)], device="cuda", dtype=torch.int32))  # rows the tier lacks
         graph.replay()

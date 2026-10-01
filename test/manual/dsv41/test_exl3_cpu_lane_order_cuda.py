@@ -1,9 +1,9 @@
 """CPU experts' miss order end to end on a real GPU against the real C++ service: the fused plan sorts the miss lanes by
-residency key, the grant sends the tail lanes to the CPU, and DIRECT's commit inserts only the copied ones.
+residency key, the post types the tail lanes CPU, and DIRECT's commit inserts only the copied ones.
 
 Two RAM hits A (low key) and B (high key), routed A first, both VRAM misses, split[2] = 1. The plan puts B in lane 0
-and A in lane 1, so the grant tags A CPU; B is copied into the first shortlist victim (the coldest) and A's victim
-keeps its expert.
+and A in lane 1, so the post types A kHitCpu and B kHitCopy; B is copied into the first shortlist victim (the coldest)
+and A's victim keeps its expert.
 
 Run on divix01 under cc-gpu.lock, with PYTHONPATH pointing at the tree under test.
 """
@@ -21,6 +21,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 from lease_chain_rig import EXPERTS, LAYERS, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
 
 HIDDEN = 64
 HANDLE = 7
@@ -79,13 +80,14 @@ def test_the_low_scored_ram_hit_goes_to_the_cpu_and_the_high_scored_one_takes_th
         c.host.enable_cpu_experts(forward.address, split, cores, x_rows, out_rows, threads=2)
         c.host.start_thread(fatal_wait_s=60.0)
         c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
         backend, plan, dev = c.backends[row], c.plans[row], c.dev
 
         # Both experts into the RAM tier through an eager gather, which the service serves without the copy engine.
         c.plan([low, high], row)
         c.gather(row)
         torch.cuda.synchronize()
-        assert c.retired()
+        assert c.handled()
         assert {low, high} <= c.resident(row)
         ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
         c.host.set_cpu_layer(row, HANDLE)
@@ -131,16 +133,16 @@ def test_the_low_scored_ram_hit_goes_to_the_cpu_and_the_high_scored_one_takes_th
         weights = torch.tensor([[0.25, 0.75]], device="cuda")
         backend._stage_planned(plan)
         dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True, cpu_input=(x, weights))
-        dev.hit_wait(row, backend.planned, plan.count, plan.slots, backend.hit_wait_ns)
         copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
         dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
-        dev.copy_wait(plan.count, backend.copy_sm_table)
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
         snapshot = c.snapshot(row)
         # The fake forward takes the GIL: let it run before anything blocks in the host.
         assert _until(lambda: len(forward.calls) == 1)
         torch.cuda.synchronize()
 
         assert forward.calls == [(HANDLE, [ram_slot[low]], [0.25])], "the tail lane (the low key) is the CPU's"
+        assert c.kinds(2) == [LaneKind.HIT_COPY, LaneKind.HIT_CPU]
         assert int(dev.cpu_lanes.item()) == 0b10
         want = c.expected([high], row)
         for n in c.names:
@@ -161,7 +163,7 @@ def test_the_low_scored_ram_hit_goes_to_the_cpu_and_the_high_scored_one_takes_th
             "the CPU lane's victim keeps its expert"
         )
         assert (insertions.item(), evictions.item(), truncated.item()) == (1, 1, 0)
-        assert c.retired()
+        assert c.handled()
     finally:
         c.close()
 

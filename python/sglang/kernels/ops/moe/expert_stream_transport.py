@@ -1037,7 +1037,7 @@ class ExpertStreamHost:
     def set_copy_table(self, row: int, table: torch.Tensor, dst_rows: int, *, sm_mask: int = 0) -> None:
         """Row ``row``'s copy table: int64 ``[n, 3]`` of (source slab, destination tensor, row bytes) addresses, as
         C1's ``ExpertRowSegments.table``; every destination tensor holds ``dst_rows`` rows. Bit i of ``sm_mask`` leaves
-        entry i to the copy wait's SM reads, and its leases then wait for the request's Done word too."""
+        entry i to the copy wait's SM reads."""
         self._check(row)
         entries = table.detach().to("cpu", torch.int64).contiguous()
         if entries.dim() != 2 or entries.shape[1] != 3 or entries.shape[0] < 1:
