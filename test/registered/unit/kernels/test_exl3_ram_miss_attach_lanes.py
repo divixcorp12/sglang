@@ -54,8 +54,10 @@ def tiers(tmp_path, monkeypatch):
     module.Exl3RamMissService._instance = None
 
 
-def _attach(service, streamer, rows):
-    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
+def _attach(service, streamer, rows, updater=None):
+    manager = SimpleNamespace(
+        register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None, gpu_residency=updater
+    )
     streamer._graph_pinned_tier = True
     streamer.hot_cache = SimpleNamespace(device="cpu")
     streamer.graph_gather_rows = rows
@@ -123,16 +125,17 @@ def test_eager_use_with_no_device_side_keeps_no_bulk_delta(tiers):
         service.host.resume()
 
 
-def test_cpu_experts_refuse_a_manager_without_direct_residency(tiers):
-    """The miss order CPU experts rely on is DIRECT's victim ranking; without the updater there is none to sort by."""
+def test_attach_refuses_a_manager_without_direct_residency(tiers):
+    """Every record carries the DIRECT updater's hot set, and the CPU experts' miss order is its victim ranking: with no
+    updater (or one that is not DIRECT) there is nothing to feed either. Mutation: attach registers a residency
+    listener instead."""
     service, streamers = tiers
     service.ensure_started()
-    service.cpu_experts = object()
-    try:
-        with pytest.raises(RuntimeError, match="needs DIRECT residency"):
-            _attach(service, streamers[0], 1)
-    finally:
-        service.cpu_experts = None
+    with pytest.raises(RuntimeError, match="needs DIRECT residency"):
+        _attach(service, streamers[0], 1)
+    with pytest.raises(RuntimeError, match="needs DIRECT residency"):
+        _attach(service, streamers[0], 1, updater=SimpleNamespace(insert_direct=False))
+    assert service.device_side is None and service._manager is None
 
 
 def test_cpu_experts_refuse_the_generic_route_plan():

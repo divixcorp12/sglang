@@ -218,6 +218,28 @@ def test_only_exl3_direct_graph_gather_admits_gpu_residency_update(model_dir):
         _gate(_launch(model_dir), **direct)
 
 
+@pytest.mark.parametrize(
+    "off",
+    [
+        {"SGLANG_MOE_GPU_RESIDENCY_UPDATE": False},
+        {"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1},
+        {"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 0},
+    ],
+    ids=["no_updater", "stage_1", "stage_0"],
+)
+def test_graph_gather_needs_direct_residency(model_dir, off):
+    """The RAM-miss service reads the VRAM-hot set from the DIRECT updater's records: no other residency mode feeds it.
+    Mutation: the gate admits a graph-gather launch whose residency is not DIRECT."""
+    direct = dict(
+        SGLANG_MOE_GPU_RESIDENCY_UPDATE=True,
+        SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2,
+        SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+    )
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **direct)
+    with pytest.raises(ValueError, match="needs DIRECT residency.*GPU_RESIDENCY_UPDATE=1.*INSERT_ON_MISS_STAGE=2"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, **off})
+
+
 def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model_dir):
     # run_resolution_pipeline runs handle_offload_compatibility twice; the first pass
     # comes before parse_cuda_graph_config, while cuda_graph_config is still the raw
