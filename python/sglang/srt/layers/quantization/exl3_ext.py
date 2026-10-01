@@ -52,8 +52,23 @@ def check_cpu_compiler() -> None:
         raise RuntimeError("optimized EXL3 CPU experts require GCC 15, rather than Clang")
 
 
+OPTIMIZED_CPU_DEFINES = ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"]  # as exl3_cpu/optimized/build.py
+
+
 def cpu_act_defines() -> list[str]:
-    """Compiler defines for the CPU kernel's activation quantization options; empty when both are off."""
+    """Compiler defines for the CPU kernel's activation quantization options; empty when both are off.
+
+    With SGLANG_DSV41_CPU_EXPERTS the CPU experts run only the optimized kernel (exl3_cpu/optimized), so the
+    defines are always its residual/128 pair; a flag explicitly set to anything else is refused."""
+    if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        residual, block = envs.SGLANG_EXL3_CPU_ACT_RESIDUAL, envs.SGLANG_EXL3_CPU_ACT_BLOCK
+        if (residual.is_set() and not residual.get()) or (block.is_set() and block.get() != 128):
+            raise ValueError(
+                "SGLANG_DSV41_CPU_EXPERTS builds the optimized EXL3 CPU kernel (SGLANG_EXL3_CPU_ACT_RESIDUAL=1, "
+                f"SGLANG_EXL3_CPU_ACT_BLOCK=128), but residual={residual.get()} block={block.get()} are set: "
+                "unset them or set those values"
+            )
+        return list(OPTIMIZED_CPU_DEFINES)
     defines = []
     if envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get():
         defines.append("-DEXL3_MOE_CPU_ACT_RESIDUAL=1")
