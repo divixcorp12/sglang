@@ -579,14 +579,15 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
       std::thread writer([&] {
         for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
-          const uint16_t row = static_cast<uint16_t>(round), count = count_of(round), armed = round & 1u;
+          const uint16_t row = static_cast<uint16_t>(round), count = count_of(round);
+          const uint32_t flags = round & 1u;
           const int32_t id = static_cast<int32_t>(round);
           store_release(record + kRecSeq, 0u);
           std::atomic_thread_fence(std::memory_order_seq_cst);
           std::memset(record + 4, 0, kRecordBytes - 4);
           std::memcpy(record + kRecRow, &row, 2);
           std::memcpy(record + kRecProtectCount, &count, 2);
-          std::memcpy(record + kRecArmed, &armed, 2);
+          std::memcpy(record + kRecFlags, &flags, 4);
           for (int i = 0; i < count; ++i)
             std::memcpy(record + kRecProtect + 4 * i, &id, 4);
           std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -601,7 +602,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         if (seq == 0 || !read_record(record, seq, &request)) continue;
         ++accepted;
         const uint32_t round = (seq - 1u) / kDemandRecords;
-        bool whole = request.row == static_cast<uint16_t>(round) && request.armed == ((round & 1u) != 0) &&
+        bool whole = request.row == static_cast<uint16_t>(round) && request.captured == ((round & 1u) != 0) &&
                      request.protect.size() == count_of(round);
         for (int32_t id : request.protect)
           whole = whole && id == static_cast<int32_t>(round);
