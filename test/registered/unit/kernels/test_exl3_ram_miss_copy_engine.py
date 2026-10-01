@@ -149,6 +149,7 @@ def test_a_lane_the_copy_engine_cannot_take_is_an_sm_hit(tmp_path, case):
         dst_ok = 0 <= dst[0] < DST_ROWS
         from sglang.srt.layers.moe.ram_slot_map import type_lanes
 
+        assert sim.apply_pending(ROW)  # as the post does first
         kinds, slots = type_lanes(
             [3], sim.replica.ram_slot[ROW], sim.replica.staging[ROW], sim.split(), captured=case != "uncaptured",
             copy_armed=sim.copy_armed(), hit_copy="ce", cpu_on=False, cpu_misses=False, dst_ok=[dst_ok],
