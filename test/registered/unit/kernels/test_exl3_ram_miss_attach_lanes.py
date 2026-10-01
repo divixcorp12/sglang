@@ -48,6 +48,7 @@ def tiers(tmp_path, monkeypatch):
                 ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
+        service.staging_slots = 1
         yield service, streamers
         service.shutdown()
     module.Exl3RamMissService._instance = None
@@ -80,34 +81,27 @@ def test_a_gather_wider_than_the_lanes_is_refused_before_anything_is_built(tiers
     assert not hasattr(streamers[1].row_backend, "device_side")  # the layer keeps its previous backend
 
 
-def test_attach_unmaps_on_a_full_tier_reach_the_device_before_any_post(tiers, monkeypatch):
-    """A full tier: attach evicts rows to make its staging slots. Those unmaps must reach the device's map before the
-    service runs again -- a captured warm-up decode would otherwise type a hit on a slot the host now stages into, and
-    the host would fail-stop. The device here is CPU-resident, so its bulk apply is recorded instead of launched."""
-    service, streamers = tiers
+def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
+    """The host reserves each row's staging at start, so a fill that fills the tier evicts for its mappable slots only,
+    and no bulk-delta entry (what the device's map applies) names a staging slot. Mutation: staging is reserved after
+    the fill, from the mapped rows."""
+    service, _ = tiers
     service.ensure_started()
-    service.before_host_use()
-    for row in range(LAYERS):
-        for expert in range(CAPACITY):
-            service.host.assign(row, expert)
-    service.after_host_use()
-    applied = []
-    monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, bulk: applied.extend(bulk.tolist()))
-    _attach(service, streamers[0], 1)
-    at_attach = list(applied)  # what reached the device by the end of attach; the read below applies the rest
+    host = service.host
+    staging = {row: [s for s, (state, _, _) in enumerate(host.slot_info(row)) if state == 3] for row in range(LAYERS)}
+    assert all(len(slots) == 1 for slots in staging.values())
     service.before_host_use()
     try:
-        mapping = service.host.mapping(service.row_of(0))
+        for row in range(LAYERS):
+            for expert in range(EXPERTS):
+                host.assign(row, expert)
+        mapped = {row: {slot for slot in host.mapping(row) if slot >= 0} for row in range(LAYERS)}
+        bulk = host.take_bulk_delta().tolist()
     finally:
         service.after_host_use()
-    row = service.row_of(0)
-    replica = {}
-    for r, expert, slot in at_attach:
-        if r == row:
-            replica[expert] = slot  # a fresh device map is all -1, so only mapped rows need entries
-    evicted = [e for e in range(CAPACITY) if mapping[e] < 0]
-    assert evicted, "the full tier gave attach nothing to evict"
-    assert all(replica.get(e, -1) == -1 for e in evicted), (evicted, replica)
+    for row in range(LAYERS):
+        assert len(mapped[row]) == CAPACITY - 1 and not mapped[row] & set(staging[row])
+    assert bulk and all(slot not in staging[row] for row, _, slot in bulk if slot >= 0)
 
 
 def test_eager_use_with_no_device_side_keeps_no_bulk_delta(tiers):

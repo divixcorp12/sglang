@@ -124,12 +124,13 @@ was lapped, an all-`HIT_SM` record is counted as an overrun and skipped, and any
 ## Deltas and the bulk delta
 
 The decode chain's map changes travel only as per-row deltas, one per record with a miss, numbered by `map_chain`.
-The eager paths (prefill fills, `assign`, `release`) and attach change the tier with the service paused
+The eager paths (prefill fills, `assign`, `release`) change the tier with the service paused
 (`before_host_use`), and each change is appended to a host list. `Exl3RamMissService.after_host_use` takes it (`take_bulk_delta`, int32 `[n, 3]` rows of
 `{row, expert, slot}`; it joins a running fill first, so a failed fill's unmaps are in it) and launches
 `map_bulk_apply`. That kernel applies every row's pending decode delta first, then the bulk entries, so the device map
-ends equal to the host's. Attach publishes each row's first delta (tag 1: its K staging slots), evicting LRU rows, and
-VRAM-hot rows last, to free them; the pause around it makes those unmaps reach the device before the next record.
+ends equal to the host's. The host publishes each row's first delta (tag 1: its staging slots) when the service starts
+(`reserve_staging`: the first `min(8, capacity - 1)` slots of every row, taken before any slot is filled), so it evicts
+nothing and needs no bulk entry.
 
 ## Why it is safe without leases
 

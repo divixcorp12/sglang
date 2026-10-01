@@ -60,8 +60,7 @@ class Chain:
                 self.tables, page=self.page,
                 slot_map=torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory(), variant=variant,
             )
-            for row in range(LAYERS):
-                self.host.attach_row(row, staging)
+            self.host.reserve_staging(staging)
             self.dest = {
                 row: {n: torch.zeros((DST_ROWS,) + self.specs[n].row_shape, dtype=self.specs[n].dtype, device="cuda")
                       for n in self.names}

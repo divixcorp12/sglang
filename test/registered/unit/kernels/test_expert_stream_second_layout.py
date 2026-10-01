@@ -72,8 +72,7 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     host = ExpertStreamHost(tables, page=page, slot_map=slot_map, layout="two")
     try:
         assert (host.layout_names, host.small_mask) == (("a", "b"), 0b10)
-        for row in range(int(t.starts.shape[0])):
-            host.attach_row(row, 1)
+        host.reserve_staging(1)
         host.enable_trace()
         sim = ChainSim(host, page, None)
         req = sim.post(1, [2])

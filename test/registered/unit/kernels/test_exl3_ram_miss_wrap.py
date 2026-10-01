@@ -63,8 +63,7 @@ def _host(tmp_path, seed, used):
         # The slot a phantom seq 0 would read: (0 - 1) % records, as the service computes it.
         _set_word(page, DEMAND_RING + (DEMAND_RECORDS - 1) * RECORD_BYTES, STALE_SEQ)
     host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr")
-    for row in range(2):
-        host.attach_row(row, 1)
+    host.reserve_staging(1)
     return page, host, ChainSim(host, page, s.slabs)
 
 

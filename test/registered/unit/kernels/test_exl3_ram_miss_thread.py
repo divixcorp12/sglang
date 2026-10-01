@@ -30,8 +30,7 @@ def hang_guard():
 
 def _attached(s, page, slot_map, k):
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
-    for row in range(2):
-        host.attach_row(row, k)
+    host.reserve_staging(k)
     return host
 
 

@@ -68,6 +68,7 @@ def tiers(tmp_path, request):
     device = "cpu" if request.param == "cpu" else f"cuda:{torch.cuda.current_device()}"
     stack, layout, source, streamers, caches = _build(tmp_path, device=device)
     service = module.Exl3RamMissService.get()
+    service.staging_slots = 1
     yield service, layout, source, streamers, caches
     service.shutdown()
     module.Exl3RamMissService._instance = None

@@ -798,9 +798,9 @@ class ExpertStreamHost:
     runs, the caller between ``pause()`` and ``resume()``, and the caller of ``pump()`` when there is no thread. While
     the thread runs unpaused, ``contains``, ``touch``, ``assign``, ``release`` and ``fill_begin`` raise
     ``RuntimeError`` ("... needs the service thread paused"); ``set_hot`` is queued and applied by the service before
-    its next request (it returns before then); ``attach_row`` and the snapshots (``slot_info``, ``slot_to_expert``,
-    ``lru_order``, ``victim_census``) are answered by the service and waited for
-    (mid-read too, unless a queued ``set_hot``/``attach_row`` precedes them: then at the end of the request);
+    its next request (it returns before then); the snapshots (``slot_info``, ``slot_to_expert``, ``lru_order``,
+    ``victim_census``) are answered by the service and waited for
+    (mid-read too, unless a queued ``set_hot`` precedes them: then at the end of the request);
     ``mapping``, ``counters``, ``busy_episode`` and ``layer_rows`` read published words without waiting. Paused, or
     with no thread, every call runs at once.
     """
@@ -974,19 +974,20 @@ class ExpertStreamHost:
 
     def slot_info(self, row: int) -> list[tuple[int, int, int]]:
         """Per slot: (state, expert, stamp); state 0 FREE, 2 READY, 3 STAGING. A snapshot: with the thread
-        running, the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot``
-        or ``attach_row``, it waits for the end of the current request (the queue keeps its order): never take one on
-        the thread a read in service is gated on (a test's device release, say), or it waits until the watchdog."""
+        running, the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot``, it
+        waits for the end of the current request (the queue keeps its order): never take one on the thread a read in
+        service is gated on (a test's device release, say), or it waits until the watchdog."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 3, dtype=torch.int64)
         self._module.expert_stream_slot_info(self.handle, row, out)
         values = out.tolist()
         return [tuple(values[i : i + 3]) for i in range(0, len(values), 3)]
 
-    def attach_row(self, row: int, k: int) -> None:
-        """Row ``row``'s ``k`` staging slots and its tag-1 map delta (LEASE_PROTOCOL.md); once per row."""
-        self._check(row)
-        self._module.expert_stream_attach_row(self.handle, row, int(k))
+    def reserve_staging(self, k: int = MAX_IDS) -> None:
+        """Every row's staging slots and its tag-1 map delta (LEASE_PROTOCOL.md): the first ``min(k, capacity - 1)``
+        free slots of each row, then no slot is ever taken from them. Once, before the thread starts (or paused), with
+        every tier empty; a row with fewer than 2 slots raises."""
+        self._module.expert_stream_reserve_staging(self.handle, int(k))
 
     def take_bulk_delta(self) -> torch.Tensor:
         """The eager paths' map changes since the last call, int32 ``[n, 3]`` of (row, expert, slot); paused only."""

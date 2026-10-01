@@ -59,6 +59,7 @@ def world(tmp_path, monkeypatch):
                 caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
+        service.staging_slots = 1
         service.ensure_started()
         order = []
         # A CUDA device is pretended, so the barrier path runs; the barrier itself is a fake the test controls.

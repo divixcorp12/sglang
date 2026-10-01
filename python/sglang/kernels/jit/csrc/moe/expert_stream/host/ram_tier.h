@@ -23,7 +23,7 @@ struct Tier {
   // any thread.
   int64_t rows_demand = 0;
   // The row's staging slots (kStaging, never mapped), in the order the device assigns them to miss lanes, and the
-  // map-chain number of the last delta published. 0: attach_row has not run, so the row serves no miss.
+  // map-chain number of the last delta published. 0: reserve_staging has not run, so the row serves no miss.
   FixedVec<int32_t, kLeaseLanes> staging;
   uint64_t chain = 0;
 };
@@ -145,18 +145,17 @@ class RamTier {
   static constexpr int kMaxHotWords = 16;  // set_hot's bitmap: 1024 experts
 
   // A Python-side call for the tier's owner. A kSnapshot runs `snapshot` there and hands back its value through
-  // `result`; kAttachRow answers 0. `done` (the waiting caller's) becomes 1 once applied, 2 if the owner's body threw:
+  // `result`. `done` (the waiting caller's) becomes 1 once applied, 2 if the owner's body threw:
   // a command never throws on the service thread.
   struct Command {
-    enum Kind : uint8_t { kSetHot, kSnapshot, kAttachRow };
+    enum Kind : uint8_t { kSetHot, kSnapshot };
     Kind kind = kSetHot;
     int64_t row = 0;  // kSnapshot: the snapshot's own argument
-    int64_t arg = 0;  // kAttachRow: the staging slot count
     uint64_t hot[kMaxHotWords] = {};
     int64_t (*snapshot)(RamTier*, const Command&) = nullptr;
     int64_t* out = nullptr;
     const void* input = nullptr;  // kSnapshot: an argument the caller keeps alive (victim_census's wanted list)
-    int64_t* result = nullptr;    // kSnapshot, kAttachRow: the answer
+    int64_t* result = nullptr;    // kSnapshot: the answer
     std::string* error = nullptr;  // the owner's exception message when its body threw
     std::atomic<uint32_t>* done = nullptr;
   };
@@ -326,7 +325,7 @@ class RamTier {
   // Python caller that paused it, from the moment the service parks until resume() (RamThread::pause sets parked_);
   // the caller of pump() when there is no thread. An unpaused Python call therefore takes one of three forms:
   //   - a lock-free read of published words: mapping, counters, busy_episode, layer_rows;
-  //   - a command through run_as_owner, which the service drains between requests: set_hot, attach_row, and the
+  //   - a command through run_as_owner, which the service drains between requests: set_hot and the
   //     snapshots slot_info, slot_to_expert, lru_order, victim_census;
   //   - a refusal, "needs the service thread paused": has, touch, assign, release, fill_begin.
   // On the owner every one of them runs directly, after draining whatever an earlier caller queued.
@@ -703,20 +702,34 @@ class RamTier {
     admission_closed_.store(true);
   }
 
-  // Row `row`'s K staging slots (LEASE_PROTOCOL.md): K free slots (else LRU rows) become kStaging, and the tag-1
-  // delta names them, which the device's first post of the row applies. Once per row, before the row's first post; a
-  // command (run_as_owner), so it may come while the service runs.
-  void attach_row(int64_t row, int64_t k) {
-    row_capacity(row);
+  // Every row's staging slots (LEASE_PROTOCOL.md): the first min(k, capacity - 1) FREE slots become kStaging, and the
+  // tag-1 delta names them, which the device's first post of the row applies. Once, on the tier's owner, before any
+  // slot is filled: no row is evicted, so no unmap needs a bulk delta. A row with fewer than 2 slots could serve no
+  // miss and no hit at once: refused.
+  void reserve_staging(int64_t k) {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("reserve_staging");
     if (k < 1 || k > kLeaseLanes)
       throw std::runtime_error(error_prefix<Layout>() + "a row has 1.." + std::to_string(kLeaseLanes) + " staging slots");
-    Command c;
-    c.kind = Command::kAttachRow;
-    c.row = row;
-    c.arg = k;
-    int64_t result = 0;
-    c.result = &result;
-    run_as_owner(c);
+    for (int64_t row = 0; row < layers_; ++row) {
+      const Tier& tier = tiers_[row];
+      if (tier.chain != 0) throw std::runtime_error(error_prefix<Layout>() + "reserve_staging is once");
+      if (tier.capacity < 2)
+        throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has too few slots to stage");
+      for (int64_t slot = 0; slot < tier.capacity; ++slot)
+        if (tier.state[slot] != kFree)
+          throw std::runtime_error(error_prefix<Layout>() + "reserve_staging is before any slot is filled");
+    }
+    for (int64_t row = 0; row < layers_; ++row) {
+      Tier& tier = tiers_[row];
+      const int64_t want = std::min(k, tier.capacity - 1);
+      for (int64_t slot = 0; slot < want; ++slot) {
+        tier.state[slot] = kStaging;
+        tier.staging.push_back(static_cast<int32_t>(slot));
+      }
+      tier.chain = 1;
+      publish_delta_locked(row, 1, tier.staging, nullptr, 0);
+    }
   }
 
   // The eager paths' map changes since the last take, {row, expert, slot} each, slot -1 an unmap: the bulk delta
@@ -896,9 +909,6 @@ class RamTier {
         case Command::kSetHot:
           set_hot_owned(c.row, c.hot);
           break;
-        case Command::kAttachRow:
-          attach_row_owned(c.row, c.arg);
-          break;
         case Command::kSnapshot:
           value = c.snapshot(this, c);
           break;
@@ -921,7 +931,7 @@ class RamTier {
   }
 
   // The service thread, mid-request (the read's progress hook, inject()'s read delay): apply the queue's leading
-  // snapshots only. A mutator (set_hot, attach_row) waits for the end of the request, and every snapshot queued
+  // snapshots only. A mutator (set_hot) waits for the end of the request, and every snapshot queued
   // behind it waits too, so the queue's order is kept: a mutator is applied between requests, as a snapshot taken
   // after it sees it.
   void answer_snapshots() {
@@ -974,25 +984,6 @@ class RamTier {
       // A VRAM-hot row is decode's: kept owned it could never be a victim and would hold the share down.
       if (tier.hot[expert] && tier.expert_slot[expert] >= 0) disown_locked(tier, tier.expert_slot[expert]);
     }
-  }
-
-  void attach_row_owned(int64_t row, int64_t k) {
-    Tier& tier = tiers_[row];
-    if (tier.chain != 0) throw std::runtime_error(error_prefix<Layout>() + "attach_row is once per row");
-    if (k >= tier.capacity)
-      throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has too few slots to stage");
-    // Free slots first, then LRU rows an eager path left (their unmaps reach the device in the bulk delta), then LRU
-    // VRAM-hot rows: their bytes are in VRAM, and a row with no staging slot could serve no miss at all.
-    while (static_cast<int64_t>(tier.staging.size()) < k) {
-      int64_t evicted = -1;
-      const int64_t slot = take_slot_locked(row, {}, true, &evicted, /*take_hot=*/true);
-      if (slot < 0)
-        throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has no slot left to stage");
-      tier.state[slot] = kStaging;
-      tier.staging.push_back(static_cast<int32_t>(slot));
-    }
-    tier.chain = 1;
-    publish_delta_locked(row, 1, tier.staging, nullptr, 0);
   }
 
   // Copy thread. Completion was observed: every DMA and CPU job of the record is done. CopyDone here, so the device's
@@ -1289,8 +1280,7 @@ class RamTier {
   }
 
   // An eager admission's slot: a kFree one, or an evicted kReady one; never kStaging.
-  int64_t take_slot_locked(int64_t row, std::span<const int32_t> protect, bool fallback, int64_t* evicted,
-                           bool take_hot = false) {
+  int64_t take_slot_locked(int64_t row, std::span<const int32_t> protect, bool fallback, int64_t* evicted) {
     Tier& tier = tiers_[row];
     *evicted = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
@@ -1298,15 +1288,11 @@ class RamTier {
     }
     int64_t best = -1;
     int64_t spare = -1;
-    int64_t hot = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
       if (tier.state[slot] != kReady) continue;
       if (tier.filling[slot]) continue;  // a prefill fill is still writing it
       const int32_t expert = tier.slot_to_expert[slot];
-      if (tier.hot[expert]) {
-        if (hot < 0 || tier.stamp[slot] < tier.stamp[hot]) hot = slot;
-        continue;
-      }
+      if (tier.hot[expert]) continue;
       if (listed(protect, expert)) {
         if (spare < 0 || tier.stamp[slot] < tier.stamp[spare]) spare = slot;
         continue;
@@ -1314,7 +1300,6 @@ class RamTier {
       if (best < 0 || tier.stamp[slot] < tier.stamp[best]) best = slot;
     }
     if (best < 0 && fallback) best = spare;
-    if (best < 0 && take_hot) best = hot;
     if (best < 0) {
       count<kNoVictim>();
       return -1;

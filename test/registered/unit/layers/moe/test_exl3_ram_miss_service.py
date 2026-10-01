@@ -59,6 +59,7 @@ def tiers(tmp_path, monkeypatch, request):
                 caches[layer_id] = ExpertPinnedHostCache(streamer, capacity, device="cpu", **options)
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
+        service.staging_slots = 1
         yield service, streamers, caches
         service.shutdown()
     module.Exl3RamMissService._instance = None
@@ -71,11 +72,9 @@ def _holds(host, row, expert):
 
 
 def _sim(service):
-    """The device stand-in for this service: every row attached with one staging slot, as attach() would."""
+    """The device stand-in for this service, over the staging slots it reserved at start."""
     sim = getattr(service, "_test_sim", None)
     if sim is None:
-        for row in range(service.host.layers):
-            service.host.attach_row(row, 1)
         sim = service._test_sim = ChainSim(service.host, service.page, {})
     return sim
 

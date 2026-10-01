@@ -50,7 +50,7 @@ def build_host(tmp_path, *, variant=None, threaded=False, copy_spin_us=200):
             [[t.data_ptr(), dst[row][n].data_ptr(), t[0].numel() * t.element_size()] for n, t in s.slabs[row].items()],
             dtype=torch.int64)
         host.set_copy_table(row, table, DST_ROWS)
-        host.attach_row(row, STAGING)
+    host.reserve_staging(STAGING)
     host.arm_copy_engine()
     host.enable_gpu_hot()
     return s, page, host, ChainSim(host, page, s.slabs), dst

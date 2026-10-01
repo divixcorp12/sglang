@@ -573,7 +573,8 @@ class Exl3RamMissService:
         self._cpu_log_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
-        self._attached_rows: set[int] = set()  # rows whose staging slots attach() reserved (host.attach_row)
+        # Staging slots per row, reserved at start: one per lane a post can miss (MAX_IDS), fewer on a small tier.
+        self.staging_slots = MAX_IDS
         self._copy_armed = False
         self._copy_decodes = 0
         self.copy_engine_module_loads = 0  # Triton loads that drained the device first
@@ -651,6 +652,8 @@ class Exl3RamMissService:
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
+            # Before any slot is filled, and before graph_gather_rows is known (the hot cache fills the tiers first).
+            host.reserve_staging(self.staging_slots)
             copy_engine = cfg.enable_ram_miss_copy_engine
             check_sm_small_copies(cfg)
             if copy_engine:
@@ -858,22 +861,12 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
-        # The row's staging slots, once: one per lane a post can miss (LEASE_PROTOCOL.md).
-        if row not in self._attached_rows:
-            want = max(1, streamer.graph_gather_rows)
-            k = min(want, int(self.host.tables.capacity[row]) - 1)
-            if k < want:
-                # A small test tier; a post with more misses than k traps on the device ("no staging slot").
-                logger.warning("exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d", row, k, want,
-                               int(self.host.tables.capacity[row]))
-            # Paused, so the rows attach evicts on a full tier reach the device as a bulk delta before the service
-            # serves another record (LEASE_PROTOCOL.md, "Deltas and the bulk delta").
-            self.before_host_use()
-            try:
-                self.host.attach_row(row, k)
-            finally:
-                self.after_host_use()
-            self._attached_rows.add(row)
+        # The host staged min(staging_slots, capacity - 1) slots for the row at start; a post with more misses traps.
+        want = max(1, streamer.graph_gather_rows)
+        staged = min(self.staging_slots, int(self.host.tables.capacity[row]) - 1)
+        if staged < want:
+            logger.warning("exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d", row, staged, want,
+                           int(self.host.tables.capacity[row]))
         if self.route_log is not None:
             self.route_log.bind(row, streamer.layer_id, cache.capacity)
         previous = streamer.row_backend

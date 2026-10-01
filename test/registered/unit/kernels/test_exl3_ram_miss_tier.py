@@ -48,8 +48,7 @@ def tier(tmp_path, request):
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
-    for row in range(2):
-        host.attach_row(row, k)
+    host.reserve_staging(k)
     yield s, page, slot_map, host, ChainSim(host, page, s.slabs)
     host.stop()
 
@@ -78,7 +77,7 @@ def test_gpu_hot_sidecar_protects_a_victim_and_a_resident_lane_reads_nothing(tmp
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, hot_page=hot_page)
-    host.attach_row(0, 1)
+    host.reserve_staging(1)
     sim = ChainSim(host, page, s.slabs)
     try:
         host.enable_gpu_hot()
@@ -180,8 +179,7 @@ def mirrored_tier(tmp_path):
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
-    for row in range(2):
-        host.attach_row(row, 3)
+    host.reserve_staging(3)
     yield s, page, slot_map, host, ChainSim(host, page, s.slabs)
     host.stop()
 

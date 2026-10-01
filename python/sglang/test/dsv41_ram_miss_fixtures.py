@@ -198,16 +198,15 @@ def ram_miss_setup(
 
 
 def attached_host(setup: "RamMissSetup", page: torch.Tensor, *, k: int = 1, slot_map=None, **host_kw):
-    """An ExpertStreamHost over ``setup``'s tables with every row attached with ``k`` staging slots (the service's
-    attach does this per row), and ``slot_map`` (a fresh -1 map when None)."""
+    """An ExpertStreamHost over ``setup``'s tables with ``k`` staging slots reserved per row (the service reserves them
+    at start), and ``slot_map`` (a fresh -1 map when None)."""
     from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost
 
     layers, experts = setup.tables.starts.shape[:2]
     if slot_map is None:
         slot_map = torch.full((layers, experts), -1, dtype=torch.int32)
     host = ExpertStreamHost(setup.tables, page=page, slot_map=slot_map, **host_kw)
-    for row in range(layers):
-        host.attach_row(row, k)
+    host.reserve_staging(k)
     return host
 
 
@@ -220,8 +219,7 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=int(sys.argv[2]))
 page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
 host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr"%s)
-for row in range(2):
-    host.attach_row(row, int(sys.argv[3]))
+host.reserve_staging(int(sys.argv[3]))
 sim = ChainSim(host, page, s.slabs)
 """
 

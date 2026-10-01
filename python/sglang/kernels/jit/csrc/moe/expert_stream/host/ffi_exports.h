@@ -363,9 +363,10 @@ struct HostExports {
   }
 
   // CPU experts: split int64 [kLeaseLanes + 1], a new split table, at any time.
-  // Row `row`'s K staging slots and its tag-1 map delta (LEASE_PROTOCOL.md). Once per row.
-  static void attach_row(int64_t handle, int64_t row, int64_t k) {
-    find(handle)->attach_row(row, k);
+  // Every row's staging slots (up to k, fewer on a small tier) and its tag-1 map delta (LEASE_PROTOCOL.md). Once,
+  // paused or before the thread starts, with the tier empty.
+  static void reserve_staging(int64_t handle, int64_t k) {
+    find(handle)->reserve_staging(k);
   }
 
   // The eager paths' map changes since the last call: bulk_delta_count, then take_bulk_delta into int32 [that, 3] of
@@ -608,7 +609,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_cpu_experts, Exports::enable_cpu_experts);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_attach_row, Exports::attach_row);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_reserve_staging, Exports::reserve_staging);                \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_bulk_delta_count, Exports::bulk_delta_count);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_take_bulk_delta, Exports::take_bulk_delta);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                           \

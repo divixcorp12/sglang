@@ -103,8 +103,7 @@ class Arm:
         self.host = ExpertStreamHost(
             self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), variant="instr"
         )
-        for row in range(2):
-            self.host.attach_row(row, STAGING)
+        self.host.reserve_staging(STAGING)
         self.sim = ChainSim(self.host, self.page, None)
         if trace:
             self.host.enable_trace(capacity=ring)
