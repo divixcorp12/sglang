@@ -228,17 +228,21 @@ struct CopyWaitParams {
   const int32_t* dst_slots;
   const int64_t* sm_table;
   int64_t sm_count;
-  int32_t* ce_mask;  // the armed lanes for CC: host lanes in the low byte, CPU lanes in the next; 0: none
+  int32_t* ce_mask;  // for CC: armed lanes in bits 0-7, CPU lanes in 8-15, CPU output parts in 16-17; 0: none
 };
 
 struct CopyCommitParams {
   const int32_t* state;
   const uint8_t* lease;
   const int32_t* ce_mask;
-  int32_t* cpu_lanes;  // CPU experts: the lanes the CPU computed (a lane mask), else 0; null when off
+  // CPU experts: the lanes the CPU computed (bits 0-7) and the output parts holding their partial sums (bit 8: part 0,
+  // the CPU hits'; bit 9: part 1, the CPU misses'), else 0; null when off.
+  int32_t* cpu_lanes;
 };
 
 constexpr int kCeMaskCpuShift = 8;
+constexpr int kCeMaskPartShift = 16;
+constexpr int kCpuLanesPartShift = 8;  // cpu_lanes: parts above the lane mask
 
 template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void exl3_ram_miss_lease_copy_wait_kernel(
@@ -251,16 +255,19 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   __shared__ int32_t sm_dst[kLeaseLanes];
   __shared__ uint32_t copying;  // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
   __shared__ uint32_t cpu;      // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
+  __shared__ uint32_t cpu_parts;  // bit 0: a kHitCpu lane (output part 0); bit 1: a kMissCpu lane (part 1)
   const int64_t planned_count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
   const int64_t idx = ring_index(seq);
   uint8_t* const lease = p.lease;
   if (threadIdx.x == 0) {
-    uint32_t c = 0, u = 0;
+    uint32_t c = 0, u = 0, parts = 0;
     for (int64_t lane = 0; lane < planned_count && lane < kLeaseLanes; ++lane) {
       const uint32_t kind = static_cast<uint32_t>(p.lane_kind[lane]);
       if (is_cpu_kind(kind)) u |= 1u << lane;
+      if (kind == kKindHitCpu) parts |= 1u;
+      if (kind == kKindMissCpu) parts |= 2u;
       if (kind != kKindHitCopy) continue;
       c |= 1u << lane;
       sm_host[lane] = p.lane_slot[lane];
@@ -268,6 +275,7 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
     }
     copying = c;
     cpu = u;
+    cpu_parts = parts;
   }
   __syncthreads();
   if (p.sm_count > 0) {
@@ -298,7 +306,7 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   if (mask == 0) return;
   uint8_t* const gate = lease + kLeaseCopyGate;
   st_relaxed_sys<uint32_t>(gate, copy_gate_word(seq, kLeaseGateClosed));
-  p.ce_mask[0] = static_cast<int32_t>(mask | cpu << kCeMaskCpuShift);
+  p.ce_mask[0] = static_cast<int32_t>(mask | cpu << kCeMaskCpuShift | cpu_parts << kCeMaskPartShift);
   // Dekker with the copy thread (RamTier::copy_completed: CopyDone store, fence, gate load): this close is ordered
   // before the CopyDone load below, so one side always sees the other's store and opens the gate. Both open with the
   // same word, so opening twice is harmless.
@@ -322,7 +330,10 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const uint64_t generation = pending_generation(p.state);
   // Only a teardown opens a gate without CopyDone: the service is gone, and the copies may not have landed.
   if (ld_acquire_sys64(p.lease + kLeaseCopyDone + ring_index(seq) * kLeaseCopyDoneBytes) != generation) __trap();
-  if (p.cpu_lanes != nullptr) p.cpu_lanes[0] = static_cast<int32_t>(armed >> kCeMaskCpuShift & 0xFFu);
+  if (p.cpu_lanes != nullptr) {
+    p.cpu_lanes[0] = static_cast<int32_t>(
+        (armed >> kCeMaskCpuShift & 0xFFu) | (armed >> kCeMaskPartShift & 0x3u) << kCpuLanesPartShift);
+  }
 }
 
 namespace expert_stream {

@@ -38,8 +38,10 @@ __device__ __forceinline__ float route_tables_to_float(__nv_bfloat16 v) {
 // only when two routes share a slot, which a BS1 remap does not do: hits are distinct slots and DIRECT's miss lanes
 // take distinct victims.
 //
-// CPU experts (plan 2026-09-29-dsv41-cpu-experts; cpu_lanes non-null): the lanes of cpu_lanes[0] were computed by the
-// CPU expert thread, whose partial sum cpu_out (host memory, [hidden] fp32) seeds the output instead of zero. A route
+// CPU experts (plan 2026-09-29-dsv41-cpu-experts; cpu_lanes non-null): the lanes of cpu_lanes[0]'s bits 0-7 were
+// computed by the CPU expert thread, whose partial sums seed the output instead of zero: part 0 at cpu_out (host memory,
+// [hidden] fp32; the CPU hits') when bit 8 is set, plus part 1 at cpu_out + part_stride (the CPU misses') when bit 9
+// is. A part whose bit is clear holds an earlier record's sum and is never read. A route
 // whose slot is such a lane's dst_slots entry is ranked as if its slot were past every column: its slot's count is 0
 // (the fused kernel and the gather skip it) and every other slot's start, which the fused kernel recomputes as a
 // running sum of the counts to index weight_sorted, is unchanged by it. Its remap64_out entry keeps the real slot.
@@ -62,11 +64,16 @@ __global__ void exl3_moe_route_tables_kernel(
     const int32_t* __restrict__ cpu_lanes,
     const int32_t* __restrict__ dst_slots,
     int64_t dst_count,
-    const float* __restrict__ cpu_out) {
+    const float* __restrict__ cpu_out,
+    int64_t part_stride) {
   const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   const bool kept = keep[0] > 0.0f;
-  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
+  const uint32_t word = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
+  const uint32_t cpu = word & 0xFFu;
+  const bool part0 = (word >> 8 & 1u) != 0;
+  const bool part1 = (word >> 9 & 1u) != 0;
+  if (part1 && part_stride == 0) __trap();  // a one-part row cannot hold the CPU misses' sum
   // A route's slot as the tables rank it: past every column when the CPU computed it.
   auto ranked = [&](int i) -> int64_t {
     const int64_t r = static_cast<int64_t>(remap[i]);
@@ -76,10 +83,12 @@ __global__ void exl3_moe_route_tables_kernel(
     }
     return r;
   };
-  const bool seeded = kept && cpu != 0;
   for (int64_t i = tid; i < hidden; i += stride) {
     x16_out[i] = __float2half_rn(route_tables_to_float(x[i]));
-    out_zero[i] = seeded ? __ldcv(cpu_out + i) : 0.0f;
+    float seed = 0.0f;
+    if (kept && part0) seed += __ldcv(cpu_out + i);
+    if (kept && part1) seed += __ldcv(cpu_out + part_stride + i);
+    out_zero[i] = seed;
   }
   for (int64_t s = tid; s < columns; s += stride) {
     int64_t count = 0;
@@ -127,7 +136,8 @@ void exl3_moe_route_tables_gpu(
     tvm::ffi::TensorView det,
     tvm::ffi::TensorView cpu_lanes,
     tvm::ffi::TensorView dst_slots,
-    int64_t cpu_out) {
+    int64_t cpu_out,
+    int64_t cpu_part_stride) {
   using namespace host;
   static_assert(std::is_same_v<RemapT, int32_t> || std::is_same_v<RemapT, int64_t>, "remap is int32 or int64");
   static_assert(
@@ -167,6 +177,7 @@ void exl3_moe_route_tables_gpu(
   const bool cpu_on = cpu_lanes.size(0) == 1;
   RuntimeCheck(cpu_lanes.size(0) <= 1, "cpu_lanes: one word, or empty when CPU experts are off");
   RuntimeCheck(!cpu_on || (cpu_out != 0 && cpu_out % 16 == 0), "cpu_out: the CPU partial's host row, 16-byte aligned");
+  RuntimeCheck(cpu_part_stride >= 0 && cpu_part_stride % 4 == 0, "cpu_part_stride: floats between parts, 16-byte steps");
   const auto stream = host::LaunchKernel::resolve_device(remap.device());
   const int64_t hidden = x.numel();
   const int64_t columns = expert_count.numel();
@@ -192,7 +203,8 @@ void exl3_moe_route_tables_gpu(
       cpu_on ? static_cast<const int32_t*>(cpu_lanes.data_ptr()) : nullptr,
       static_cast<const int32_t*>(dst_slots.data_ptr()),
       dst_slots.size(0),
-      reinterpret_cast<const float*>(cpu_out));
+      reinterpret_cast<const float*>(cpu_out),
+      cpu_part_stride);
 }
 
 }  // namespace sglang::exl3

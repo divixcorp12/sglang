@@ -112,7 +112,8 @@ __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
     const int32_t* __restrict__ cpu_lanes,
     uint8_t ready,
     uint8_t free_state) {
-  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
+  // Bits 0-7 of CC's word; the parts above them are the route tables'.
+  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) & 0xFFu : 0u;
   bool live[kDirectGatherWarp];
   bool evicted[kDirectGatherWarp];
   int64_t old_expert[kDirectGatherWarp];

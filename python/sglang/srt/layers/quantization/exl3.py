@@ -612,6 +612,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     backend.device_side.cpu_lanes,
                     streamer.row_plan.slots,
                     backend.device_side.cpu_out_address(backend.row),
+                    backend.device_side.cpu_out_part_stride(),
                 )
                 if cpu_experts
                 else None

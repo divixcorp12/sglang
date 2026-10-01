@@ -1,10 +1,11 @@
 """CPU experts inside the EXL3 RAM-miss service (plan 2026-09-29-dsv41-cpu-experts, "Step B").
 
 The service's own threads run the kernel.
-The grant tags the last ``split[n]`` of a copy-engine request's n resident lanes CPU;
-the device plan sorts them, so those are the lowest-scored.
-The copy thread hands them to the CPU expert thread (expert_stream/host/cpu_experts.h),
-and the copy wait releases the decode stream once both the copies and the CPU are done.
+The post types the last ``split[n]`` of a captured post's n eligible lanes CPU (RAM hits, and NVMe misses with
+SGLANG_DSV41_CPU_EXPERTS_MISSES); the device plan sorts them, so those are the lowest-scored.
+The copy thread hands them to the CPU expert thread (expert_stream/host/cpu_experts.h): the hits at once into part 0
+of the row's output, each miss once its read landed into part 1. The copy wait releases the decode stream once the
+copies and the CPU are done.
 
 This module owns the Python half: the quant trait, the pinned rows the post kernel and the CPU exchange,
 the lazy per-layer registration, and the split table.
@@ -86,7 +87,8 @@ class CpuExpertService:
         # writes them through UVA.
         x_bytes = -(-2 * self.hidden // 16) * 16
         self.x_rows = torch.zeros((rows, x_bytes), dtype=torch.uint8)
-        self.out_rows = torch.zeros((rows, self.hidden), dtype=torch.float32)
+        # Two parts per row: the CPU hits' partial sum (part 0) and the CPU misses' (part 1), summed by the route tables.
+        self.out_rows = torch.zeros((rows, 2, self.hidden), dtype=torch.float32)
         if pin:
             self.x_rows, self.out_rows = self.x_rows.pin_memory(), self.out_rows.pin_memory()
         self.handles: dict[int, object] = {}

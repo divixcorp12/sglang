@@ -1464,9 +1464,13 @@ class ExpertStreamDevice:
         )
 
     def cpu_out_address(self, row: int) -> int:
-        """The host address of ``row``'s CPU partial sum, which the fused MoE's route tables read."""
+        """The host address of ``row``'s CPU partial sums (part 0), which the fused MoE's route tables read."""
         self._check_row(row)
         return int(self.cpu_out_rows[row].data_ptr())
+
+    def cpu_out_part_stride(self) -> int:
+        """Floats from a row's part 0 (the CPU hits' sum) to its part 1 (the CPU misses'); 0 for one-part rows."""
+        return int(self.cpu_out_rows.stride(1)) if self.cpu_out_rows.dim() == 3 else 0
 
     def _check_row(self, row: int) -> None:
         if not 0 <= row < self.layers:

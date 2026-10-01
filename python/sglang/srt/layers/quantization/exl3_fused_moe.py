@@ -142,7 +142,7 @@ class Exl3FusedMoE:
     def _fused_route_tables(self, x, topk_weights, remap, keep, cpu=None):
         from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
 
-        cpu_lanes, dst_slots, cpu_out = cpu if cpu is not None else (None, None, 0)
+        cpu_lanes, dst_slots, cpu_out, cpu_part_stride = cpu if cpu is not None else (None, None, 0, 0)
         exl3_moe_route_tables(
             remap.contiguous(),
             topk_weights.contiguous(),
@@ -158,6 +158,7 @@ class Exl3FusedMoE:
             cpu_lanes=cpu_lanes,
             dst_slots=dst_slots,
             cpu_out=cpu_out,
+            cpu_part_stride=cpu_part_stride,
         )
         return self.remap64, self.inv_order, self.weight_sorted, self.det
 
@@ -165,8 +166,8 @@ class Exl3FusedMoE:
         """x [1, H] any float dtype; topk_weights [6]; remap [6] slots, int64 (int32 too with layer fusion);
         keep fp32 [1].
 
-        ``cpu`` = (cpu_lanes, dst_slots, cpu_out address), CPU experts only: the routes the CPU computed are left out
-        and its partial sum seeds the output (exl3_route_tables.cuh). Layer fusion only."""
+        ``cpu`` = (cpu_lanes, dst_slots, cpu_out address, part stride), CPU experts only: the routes the CPU computed
+        are left out and the partial sums CC flagged seed the output (exl3_route_tables.cuh). Layer fusion only."""
         if x.shape[0] != 1:  # a host-side shape read: capture-safe
             raise ValueError(
                 f"exl3 in-graph MoE runs one token (BS1 decode), not {x.shape[0]}"
