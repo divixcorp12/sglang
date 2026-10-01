@@ -92,9 +92,14 @@ def test_the_kinds_of_unused_lanes_are_never_judged():
     assert got["status"] == "ok" and [l["kind"] for l in got["lanes"]] == [LaneKind.HIT_SM, LaneKind.MISS_GPU]
 
 
-@pytest.mark.parametrize("case", ["lane_count", "kind_zero", "kind_six"])
+@pytest.mark.parametrize("case", ["lane_count", "protect_count", "kind_zero", "kind_six"])
 def test_a_record_the_device_never_writes_is_malformed(case):
-    override = {"lane_count": {"counts": 9}, "kind_zero": {"kinds": 0}, "kind_six": {"kinds": 6}}[case]
+    override = {
+        "lane_count": {"counts": 9},
+        "protect_count": {"counts": 1 | 9 << 4},
+        "kind_zero": {"kinds": 0},
+        "kind_six": {"kinds": 6},
+    }[case]
     record = write_record(seq=5, lanes=[(1, 2, 3, 0.5, int(LaneKind.HIT_SM))], **override)
     assert read(record, 5)["status"] == "malformed"
 
