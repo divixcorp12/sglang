@@ -144,7 +144,7 @@ def test_delta_published_before_the_read(world):
     """Mutation: the delta is published after the read, so a slow read would leave the device's next post waiting."""
     _, host, sim = world
     host.start_thread()
-    host.inject(300_000_000, False, 0)  # every read sleeps 300 ms first
+    host.inject(0.3)  # every read sleeps 300 ms first
     req = sim.post(0, [3])
     deadline = time.monotonic() + 0.25
     while sim.delta(0)[0] != req.chain and time.monotonic() < deadline:
