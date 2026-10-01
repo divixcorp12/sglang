@@ -1290,7 +1290,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         delivered = torch.tensor([1], dtype=torch.int32, device="cuda")
         keep = torch.tensor([0.0], dtype=torch.float32, device="cuda")
         streamer.row_backend = SimpleNamespace(
-            name="exl3_ram_miss", delivered_count=delivered, keep=keep,
+            name="exl3_ram_miss", delivered_count=delivered, keep=keep, cpu_experts=False,
         )
         destinations = torch.zeros(updater.miss_rows, dtype=torch.long, device="cuda")
         live = torch.zeros(updater.miss_rows, dtype=torch.bool, device="cuda")
