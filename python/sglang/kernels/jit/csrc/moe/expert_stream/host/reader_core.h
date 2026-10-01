@@ -47,7 +47,7 @@ struct SqeRecord {
 //   * reading rows   at most `max_reading_rows` rows with I/O outstanding.
 // A row is packed as soon as ITS extents have completed, while other rows are still in flight, and
 // every completed row is packed before the call returns. read() itself publishes no row: the caller
-// keeps the slots LOADING until read() returns 1, so no row is visible before the whole request is.
+// keeps the slots unmapped until read() returns 1, so no row is visible before the whole request is.
 // With piece streaming each vetted piece is packed by its own job, and the owner publishes it into the
 // caller's readiness words (PiecePublish) once that job is done; the slot map is still the caller's.
 // Packing writes only into the caller's not-yet-published slots and only from a slot whose extents

@@ -12,7 +12,7 @@ struct Tier {
   std::vector<int32_t> slot_to_expert;
   std::vector<uint8_t> state;
   std::vector<uint64_t> stamp;
-  std::vector<int32_t> expert_slot;  // assigned slot (LOADING or READY) or -1
+  std::vector<int32_t> expert_slot;  // assigned slot (READY) or -1
   std::vector<uint8_t> hot;
   std::vector<uint8_t> filling;      // a prefill fill is still writing this kReady slot: never a victim, never released
   // Prefill share (plan 2026-09-25-dsv41-prefill-eviction): 1 while a row a prefill admitted has not been used by
@@ -79,7 +79,7 @@ class RamTier {
       tier.prefill_owned.assign(tier.capacity, 0);
     }
     init_lease_block(lease_bytes);
-    // The service grants every miss lane LOADING and streams it piece by piece: the reader must publish pieces.
+    // The service streams every miss lane piece by piece: the reader must publish pieces.
     reader_.set_piece_stream(true);
     // The request path's buffers, sized once (spec A2, A10): nothing on it grows after construction.
     hot_scratch_.assign(static_cast<size_t>((experts_ + 7) / 8), 0);
@@ -383,11 +383,6 @@ class RamTier {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("release");
     drain_commands();
-    if (tiers_[row].state[slot] == kLoading) {
-      // The service is filling it and will publish it; freeing it would hand it out twice.
-      throw std::runtime_error(
-          error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is loading");
-    }
     if (tiers_[row].state[slot] == kStaging) {
       throw std::runtime_error(
           error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + ": it is a staging slot");
@@ -545,7 +540,7 @@ class RamTier {
       tier.hot[expert] = (request.hot_bitmap[expert / 8] >> (expert % 8)) & 1;
   }
 
-  // Copy engine (LEASE_PROTOCOL.md, "Copy engine"): a thread that copies the reservation hold's hit lanes with the
+  // Copy engine (LEASE_PROTOCOL.md, "Copy engine"): a thread that copies a record's HIT_COPY lanes with the
   // DMA engine. `device` < 0 is the CPU test backend (HostCopyBackend). Before the service thread starts; unarmed until
   // arm(). `wait_timeout_ns`: how long a closed gate may hold the decode stream before the watchdog aborts the process
   // (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS).
@@ -654,8 +649,8 @@ class RamTier {
     copy_engine_->set_cpu(cpu_.get());
   }
 
-  // CPU experts: `row`'s layer handle, from the trait's register_layer. Any time, once per row; until then no grant
-  // sends the row to the CPU.
+  // CPU experts: `row`'s layer handle, from the trait's register_layer. Any time, once per row; until then no post
+  // types a CPU lane for the row.
   void set_cpu_layer(int64_t row, int64_t handle) {
     if (cpu_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
     cpu_->set_layer(row, handle);
@@ -794,7 +789,7 @@ class RamTier {
   }
 
   // Any thread, lock-free: the published slot map, which holds a slot for an expert exactly while that slot is READY
-  // (a slot is stored only once its bytes landed, and -1 on every unmap; a kLoading slot is never published).
+  // (a slot is stored only once its bytes landed, and -1 on every unmap).
   void mapping(int64_t row, int64_t* out) const {
     for (int64_t expert = 0; expert < experts_; ++expert)
       out[expert] = __atomic_load_n(map_ + row * experts_ + expert, __ATOMIC_ACQUIRE);
@@ -1298,7 +1293,7 @@ class RamTier {
     return slot;
   }
 
-  // An eager admission's slot: a kFree one, or an evicted kReady one; never kLoading or kStaging.
+  // An eager admission's slot: a kFree one, or an evicted kReady one; never kStaging.
   int64_t take_slot_locked(int64_t row, std::span<const int32_t> protect, bool fallback, int64_t* evicted,
                            bool take_hot = false) {
     Tier& tier = tiers_[row];
@@ -1352,16 +1347,20 @@ class RamTier {
     disown_locked(tier, slot);
   }
 
+  void stamp_routed_locked(Tier& tier, int32_t expert) {
+    const int32_t slot = tier.expert_slot[expert];
+    if (slot >= 0 && tier.state[slot] == kReady) {
+      tier.stamp[slot] = ++tick_;
+      disown_locked(tier, slot);
+    }
+  }
+
   // A record with no lanes: refresh the recency of its routed experts' RAM rows. No eviction, no read.
   void touch_request(const Request& request) {
     if (request.row < 0 || request.row >= layers_) return;
     Tier& tier = tiers_[request.row];
     for (int32_t expert : request.protect) {
-      const int32_t slot = expert >= 0 && expert < experts_ ? tier.expert_slot[expert] : -1;
-      if (slot >= 0) {
-        tier.stamp[slot] = ++tick_;
-        disown_locked(tier, slot);
-      }
+      if (expert >= 0 && expert < experts_) stamp_routed_locked(tier, expert);
     }
   }
 
@@ -1391,7 +1390,7 @@ class RamTier {
     return best;
   }
 
-  // A record with lanes (LEASE_PROTOCOL.md, "The host, per record"). The device typed every lane from its copy of
+  // A record with lanes (LEASE_PROTOCOL.md, "The host per record"). The device typed every lane from its copy of
   // the map, so the host checks each against the tier and fail-stops on any disagreement. Order: stamps, checks, the
   // copy job (hits start at once), victims and the map delta (before any read, so a served chain always has its
   // delta published), then the misses' reads.
@@ -1408,6 +1407,7 @@ class RamTier {
     for (int32_t expert : request.protect) {
       if (expert < 0 || expert >= experts_) fail("an expert is out of range");
       if (!listed(wanted, expert)) wanted.push_back(expert);
+      stamp_routed_locked(tier, expert);
     }
     FixedVec<int32_t, kLeaseLanes> lane_experts;
     for (const Lane& lane : request.lanes) {
@@ -1415,13 +1415,6 @@ class RamTier {
       if (listed(lane_experts, lane.expert)) fail("a lane names an expert twice");
       lane_experts.push_back(lane.expert);
       if (!listed(wanted, lane.expert)) wanted.push_back(lane.expert);
-    }
-    for (int32_t expert : request.protect) {
-      const int32_t slot = tier.expert_slot[expert];
-      if (slot >= 0 && tier.state[slot] == kReady) {
-        tier.stamp[slot] = ++tick_;
-        disown_locked(tier, slot);
-      }
     }
     const bool host_lanes = copy_engine_ != nullptr && copy_armed_.load(std::memory_order_acquire) && request.captured;
     const bool cpu_row = host_lanes && cpu_ != nullptr && cpu_->eligible(request.row);
@@ -1508,9 +1501,6 @@ class RamTier {
         entries[count][1] = static_cast<int32_t>(slots[i]);
         ++count;
         const int32_t slot = static_cast<int32_t>(slots[i]);
-        tier.slot_to_expert[slot] = missing[i];
-        tier.state[slot] = kLoading;
-        tier.expert_slot[missing[i]] = slot;
         tier.state[victim] = kStaging;
         for (int32_t& s : staging)
           if (s == slot) s = static_cast<int32_t>(victim);
@@ -1581,6 +1571,8 @@ class RamTier {
     }
     for (size_t i = 0; i < missing.size(); ++i) {
       if (!inserted[i]) continue;
+      tier.slot_to_expert[slots[i]] = missing[i];
+      tier.expert_slot[missing[i]] = static_cast<int32_t>(slots[i]);
       tier.state[slots[i]] = kReady;
       tier.stamp[slots[i]] = ++tick_;
       publish_mirror(request.row, missing[i], static_cast<int32_t>(slots[i]));

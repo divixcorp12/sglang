@@ -973,7 +973,7 @@ class ExpertStreamHost:
         return bool(self._module.expert_stream_fill_end(self.handle))
 
     def slot_info(self, row: int) -> list[tuple[int, int, int]]:
-        """Per slot: (state, expert, stamp); state 0 FREE, 1 LOADING, 2 READY, 3 STAGING. A snapshot: with the thread
+        """Per slot: (state, expert, stamp); state 0 FREE, 2 READY, 3 STAGING. A snapshot: with the thread
         running, the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot``
         or ``attach_row``, it waits for the end of the current request (the queue keeps its order): never take one on
         the thread a read in service is gated on (a test's device release, say), or it waits until the watchdog."""

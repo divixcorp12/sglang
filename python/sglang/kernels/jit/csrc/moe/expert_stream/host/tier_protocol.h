@@ -11,7 +11,7 @@ namespace expert_stream {
 using namespace ::sglang::expert_stream::wire;
 
 // kStaging: one of the row's K staging slots, never mapped; an NVMe miss is read into it (LEASE_PROTOCOL.md).
-enum : uint8_t { kFree = 0, kLoading = 1, kReady = 2, kStaging = 3 };
+enum : uint8_t { kFree = 0, kReady = 2, kStaging = 3 };
 
 static_assert(kPieceTargets >= kLeaseLanes, "a row's pieces are published to at most one word per lane");
 
