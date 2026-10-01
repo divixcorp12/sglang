@@ -12,7 +12,6 @@ import logging
 import os
 import threading
 import weakref
-from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
@@ -268,7 +267,7 @@ class NativePinnedSlotTable:
         self.capacity: Optional[int] = None
         self.streamer_of = streamer_of
         self._seen_version = -1
-        self._slots: "OrderedDict[int, int]" = OrderedDict()
+        self._slots: dict[int, int] = {}
         self._slots_version = -1
         # This table's host-use nesting; the service counts the process-wide pause apart.
         self._depth = 0
@@ -284,21 +283,24 @@ class NativePinnedSlotTable:
 
     @property
     def slot_to_expert(self) -> list[int]:
-        return self.service.host.slot_to_expert(self._row)
+        """The READY slots' experts, -1 elsewhere: the inverse of the published map."""
+        slots = [-1] * self.capacity
+        for expert, slot in enumerate(self.service.host.mapping(self._row)):
+            if slot >= 0:
+                slots[slot] = expert
+        return slots
 
     @property
-    def expert_to_slot(self) -> "OrderedDict[int, int]":
+    def expert_to_slot(self) -> dict[int, int]:
         """Resident experts and their slots, rebuilt only when the C++ map's version moves.
 
         Promotions read this once per promoted row. Every change of membership bumps
-        the version; a touch does not, so the order is the LRU order as of the last
-        change. Callers must not mutate the returned dict.
+        the version. Callers must not mutate the returned dict.
         """
         row = self._row
         version = self.service.host.version()
         if self._slots_version != version:
-            mapping = self.service.host.mapping(row)
-            self._slots = OrderedDict((expert, mapping[expert]) for expert in self.service.host.lru_order(row))
+            self._slots = {expert: slot for expert, slot in enumerate(self.service.host.mapping(row)) if slot >= 0}
             self._slots_version = version
         return self._slots
 
