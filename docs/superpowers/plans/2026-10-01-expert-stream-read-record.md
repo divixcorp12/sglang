@@ -1440,3 +1440,49 @@ round 1 / round 2:
 - Busy-poll and default polling are equal within noise on the span. The span starts at detection, so it cannot show
   what busy-poll removes, the PAUSE quantum before detection (38.6 ns at most, half on average).
 - The pause-free spin causes no extra memory-ordering clears.
+
+### Summary
+
+Medians of three runs, ns, with per-post counts (`--perf`, the service thread, user mode). Suite: full `unit/kernels`
+through `pair`, then the exl3 + expert files (owner's instruction).
+
+| label | commit | p10 | median | p90 | p99 | br_misp | mo clears | l3_hit | local DRAM | suite |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | e732163d16 | 389 | 416 | 466 | 600 | 16.3 | 0.05 | 2.00 | 0.03 | 1218 + 2 failed* |
+| pair | 74f0c6311c | 394 | 427 | 456 | 556 | 16.5 | - | 2.04 | 0.02 | 1233 |
+| copy | 695b18fc2e | 376 | 419 | 456 | 576 | 14.3 | - | 2.44 | 0.02 | 53 (targeted) |
+| prefetch | cc107993fd | 368 | 393 | 484 | 592 | 16.4 | - | 0.11 | 0.01 | 1190 (exl3+expert) |
+| busy | fe0e4f23e0 | 379 | 406 | 697 | 902 | 17.4 | 0.12 | 0.21 | 0.01 | 1195 (exl3+expert) |
+| final-nobusy | fe0e4f23e0 | 351 | 386 | 687 | 884 | 15.4 | 0.12 | 0.15 | 0.01 | (one run) |
+
+\* base's two failures: the clock-read census (pause_ns, fixed in e732163d16) and the seqlock stress's acceptance
+floor under load (torn 0; passes alone). PAUSE: 38.6 ns. `-` = not printed by that run's summary. The busy and
+final-nobusy tails (p90/p99) are box noise; see the interleaved reruns above.
+
+- `read_record` probe (Task 4): 267 instructions' lines, 14 conditional jumps; af5b31c5d2: 452, 53.
+
+**Root measurements** (owner, 2026-10-01 16:36-16:40, `read-record/root_measure.sh`; 20000 posts, 100 us gap)
+- IIO_LLC_WAYS (MSR 0xc8b): 0x600 on both sockets, the default two L3 ways for DDIO.
+- `unc_cha_tor_inserts.io_*`: all 0. Those aliases set CHA filter bits (config1) that this kernel's uncore driver
+  rejects ("bits 12,15 of config1 not supported"), so the DDIO hit share was not measured.
+- PCIe writes into host memory, all IIO stacks summed, run minus the idle rate over the run's length (perf
+  multiplexed them at 37-50%; the window includes the bench's setup), per post:
+
+| | write transactions | bytes (4 × data units) | bytes per transaction |
+|---|---|---|---|
+| base | 23.4 | 757 | 32 |
+| final (`--busy-poll`) | 26.4 | 1011 | 38 |
+
+  The averages fit the record's ~10 stores arriving as separate partial-line writes rather than full 64-byte lines.
+  That is the input for finding 6 (full-line record stores), outside this plan. Base vs final is within these
+  numbers' uncertainty; busy-poll does not change what the device writes.
+- Same runs' spans: base median 419, p99 929; final median 404, p99 887.
+
+**Findings**
+- Finding 1 (prefetch, Task 5): showed. The median fell about 25 ns (6%) and the demand loads stopped counting L3 hits
+  (2.0 → 0.1 per post): their lines were already in flight.
+- Finding 2 (constant copy, Task 4): no span change. The reader is much smaller (452 → 267 lines, 53 → 14 jumps); its
+  loads no longer depend on the counts byte.
+- Finding 3 (128-byte records, Task 3): no clear span change (medians within noise of base; p99 a little lower).
+- Finding 4 (busy-poll, Task 6): no span change, as expected: the span starts at detection, and busy-poll removes the
+  PAUSE quantum before it (38.6 ns at most). The stage trace cannot see that saving.
