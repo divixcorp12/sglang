@@ -991,10 +991,11 @@ class RamTier {
     if (tier.chain != 0) throw std::runtime_error(error_prefix<Layout>() + "attach_row is once per row");
     if (k >= tier.capacity)
       throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has too few slots to stage");
-    // Free slots first, then LRU rows an eager path left (their unmaps reach the device in the bulk delta).
+    // Free slots first, then LRU rows an eager path left (their unmaps reach the device in the bulk delta), then LRU
+    // VRAM-hot rows: their bytes are in VRAM, and a row with no staging slot could serve no miss at all.
     while (static_cast<int64_t>(tier.staging.size()) < k) {
       int64_t evicted = -1;
-      const int64_t slot = take_slot_locked(row, {}, true, &evicted);
+      const int64_t slot = take_slot_locked(row, {}, true, &evicted, /*take_hot=*/true);
       if (slot < 0)
         throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has no slot left to stage");
       tier.state[slot] = kStaging;
@@ -1298,7 +1299,8 @@ class RamTier {
   }
 
   // An eager admission's slot: a kFree one, or an evicted kReady one; never kLoading or kStaging.
-  int64_t take_slot_locked(int64_t row, std::span<const int32_t> protect, bool fallback, int64_t* evicted) {
+  int64_t take_slot_locked(int64_t row, std::span<const int32_t> protect, bool fallback, int64_t* evicted,
+                           bool take_hot = false) {
     Tier& tier = tiers_[row];
     *evicted = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
@@ -1306,11 +1308,15 @@ class RamTier {
     }
     int64_t best = -1;
     int64_t spare = -1;
+    int64_t hot = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
       if (tier.state[slot] != kReady) continue;
       if (tier.filling[slot]) continue;  // a prefill fill is still writing it
       const int32_t expert = tier.slot_to_expert[slot];
-      if (tier.hot[expert]) continue;
+      if (tier.hot[expert]) {
+        if (hot < 0 || tier.stamp[slot] < tier.stamp[hot]) hot = slot;
+        continue;
+      }
       if (listed(protect, expert)) {
         if (spare < 0 || tier.stamp[slot] < tier.stamp[spare]) spare = slot;
         continue;
@@ -1318,6 +1324,7 @@ class RamTier {
       if (best < 0 || tier.stamp[slot] < tier.stamp[best]) best = slot;
     }
     if (best < 0 && fallback) best = spare;
+    if (best < 0 && take_hot) best = hot;
     if (best < 0) {
       count<kNoVictim>();
       return -1;
