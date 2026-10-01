@@ -233,7 +233,7 @@ NON_TRACE_CLOCK_READS = {
     # copy-idle wait), and fill_wait (the second "deadline" line and the "return -1" line).
     "const int64_t deadline = now_ns() + timeout_ns;": 2,
     "if (now_ns() > deadline) {": 1,
-    "tier_->wait_copy_idle_owned(now_ns() + timeout_ns);": 1,
+    "if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {": 1,
     "if (now_ns() > deadline) return -1;": 1,
     # The spin budget (spec M8): idle_budget() times kProbe pauses once, on the thread that calls start() (RamThread and
     # CopyEngine), so neither the service nor the copy thread reads the clock to pace itself.
@@ -246,7 +246,7 @@ NON_TRACE_CLOCK_READS = {
     "if (now_ns() > deadline_ns) return false;": 1,
     "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
     "drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);": 1,
-    "if (stopping && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;": 1,
+    "if (stopping && (in_flight.empty() || now_ns() > drain_deadline())) break;": 1,
     # seqlock_stress, test only (refused on ProdBuild): its run's deadline, on the caller's thread.
     "const int64_t deadline = now_ns() + duration_ns;": 1,
     "while (now_ns() < deadline) {": 1,
