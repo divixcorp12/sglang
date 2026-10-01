@@ -119,6 +119,19 @@ def test_post_applies_the_pending_delta_once(idle):
     assert _post(c, [5])[1] == [6], "tag 2 was applied again over the bulk entry"
 
 
+def test_post_applies_a_full_delta(idle):
+    """Every one of DELTA_MAX_ENTRIES entries lands, and the staging slots with them: the delta's loads cover the
+    whole record, not just its first words."""
+    c = idle
+    _post(c, [5])  # applies the attach delta; the miss makes map chain 2
+    entries = [(e, e % 8) for e in range(lease.DELTA_MAX_ENTRIES)]
+    _write_delta(c, 0, 2, [8, 9, 10, 11, 12, 13], entries)
+    kinds, slots = _post(c, [5])
+    assert kinds == [LaneKind.HIT_SM] and slots == [5]
+    assert c.device_map(0) == [e % 8 for e in range(EXPERTS)]
+    assert c.device_staging(0)[:6] == [8, 9, 10, 11, 12, 13]
+
+
 _TRAP_SCRIPT = """
 import sys, time
 import torch
