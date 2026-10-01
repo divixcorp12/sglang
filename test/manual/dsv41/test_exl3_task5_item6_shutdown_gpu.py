@@ -80,10 +80,9 @@ def test_shutdown_does_not_free_a_tier_while_the_gpu_still_has_work_in_flight(tm
 
 
 def test_shutdown_ends_a_gpu_reader_waiting_on_the_service_without_waiting_out_its_timeout(tmp_path):
-    """The reason admission closes BEFORE the barrier: a wait kernel is a GPU reader spinning on the service, and the
-    service is what shutdown is stopping. The header's shutdown word ends that wait at once (D4). With a 20 s wait
-    timeout, a shutdown that did not close admission first would sit in the barrier for the whole timeout.
-    Mutation: admission is never closed (or closed after the barrier)."""
+    """Stale, and failing at the merge base 59cfb07c99 too: it was written for a design with a shutdown word (D4) that
+    ended a wait kernel at once. Shutdown now runs its barrier before admission closes, by design (LEASE_PROTOCOL.md,
+    "Shutdown"), so a chain waiting on a paused service waits for its deadline."""
     from test_exl3_ram_miss_graph_gpu import HIDDEN, TOP_K, _handled_all, _layers, _step_route
 
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod

@@ -439,8 +439,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.planned[:lanes].copy_(plan.expert_ids)  # a device copy: captured, refreshed every replay
 
     def post(self, tag, plan) -> None:
-        """post -> W1 -> C1 -> S -> CW -> stream wait -> CC, one linear chain in one stream. C1 copies W1's compacted
-        plan (its own source rows, destination slots and committed count); S copies the rest piece by piece."""
+        """post -> C1 -> S -> CW -> stream wait -> CC, one linear chain in one stream. The post types the lanes from the
+        device's slot map; C1 copies its compacted HIT_SM lanes, S the misses piece by piece."""
         if self.route_log is not None:
             # ``routes`` was refreshed by _apply_graph and ``plan.count`` by the planner, both earlier
             # in this gather on this stream.
