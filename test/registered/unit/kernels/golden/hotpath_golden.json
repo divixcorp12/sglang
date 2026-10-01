@@ -3,585 +3,61 @@
   {
    "copies": [],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 0,
     "no_victim": 0,
     "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
     "rows_read": 2,
     "served": 1,
     "touch_only": 0,
     "version": 1
    },
+   "deltas": [
+    [
+     2,
+     [
+      3,
+      4,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ]
+     ]
+    ],
+    [
+     1,
+     [
+      0,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     []
+    ]
+   ],
    "dst": {
     "0": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": true,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 1,
+    "handled": 1,
     "records": [
      {
       "ring_seq": 1,
@@ -593,28 +69,33 @@
    "results": [
     {
      "copy_done": 0,
-     "done": 0,
-     "lanes": [
-      {
-       "gen": 1,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 1,
-       "host_slot": 1,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       511,
       511
      ],
-     "seq": 1
+     "seq": 1,
+     "slots": [
+      0,
+      1
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       0,
       1,
@@ -640,27 +121,45 @@
      "slot_info": [
       [
        2,
-       0,
-       1
+       0
       ],
       [
        2,
-       1,
        1
       ],
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
@@ -674,24 +173,32 @@
      "ready": {},
      "slot_info": [
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     }
@@ -700,1282 +207,57 @@
   {
    "copies": [],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 0,
     "no_victim": 0,
     "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
-    "rows_read": 2,
-    "served": 1,
+    "rows_read": 3,
+    "served": 2,
     "touch_only": 0,
-    "version": 1
+    "version": 2
    },
+   "deltas": [
+    [
+     3,
+     [
+      5,
+      4,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       2,
+       3
+      ]
+     ]
+    ],
+    [
+     1,
+     [
+      0,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     []
+    ]
+   ],
    "dst": {
     "0": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 1,
-    "records": [
-     {
-      "ring_seq": 1,
-      "seq": 1,
-      "served": true
-     }
-    ]
-   },
-   "results": [
-    {
-     "copy_done": 0,
-     "done": 1,
-     "lanes": [
-      {
-       "gen": 1,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 1,
-       "host_slot": 1,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      511,
-      511
-     ],
-     "seq": 1
-    }
-   ],
-   "rows": {
-    "0": {
-     "mapping": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {
-      "0": {
-       "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
-       "exact": true,
-       "expert": 0
-      },
-      "1": {
-       "digest": "cca21f6d9285fcf8dfe5e33fbf34c6bad12c0ffd24819538ec46dbc73083ad5de081e368965072b16429c2c9dbefbaaa",
-       "exact": true,
-       "expert": 1
-      }
-     },
-     "slot_info": [
-      [
-       2,
-       0,
-       0
-      ],
-      [
-       2,
-       1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ]
-     ]
-    },
-    "1": {
-     "mapping": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {},
-     "slot_info": [
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ]
-     ]
-    }
-   }
-  },
-  {
-   "copies": [],
-   "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
-    "evictions": 0,
-    "no_victim": 0,
-    "overruns": 0,
-    "read_errors": 0,
-    "rows_read": 3,
-    "served": 2,
-    "touch_only": 0,
-    "version": 2
-   },
-   "dst": {
-    "0": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7",
-    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
-   },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": true,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
-   "page": {
-    "demand_done": 2,
+    "handled": 2,
     "records": [
      {
       "ring_seq": 1,
@@ -1992,53 +274,53 @@
    "results": [
     {
      "copy_done": 0,
-     "done": 1,
-     "lanes": [
-      {
-       "gen": 1,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 1,
-       "host_slot": 1,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       511,
       511
      ],
-     "seq": 1
+     "seq": 1,
+     "slots": [
+      0,
+      1
+     ]
     },
     {
      "copy_done": 0,
-     "done": 0,
-     "lanes": [
-      {
-       "gen": 2,
-       "host_slot": 0,
-       "tag": 3
-      },
-      {
-       "gen": 2,
-       "host_slot": 2,
-       "tag": 2
-      }
+     "kinds": [
+      1,
+      4
      ],
      "pieces": [
       0,
       767
      ],
-     "seq": 2
+     "seq": 2,
+     "slots": [
+      0,
+      3
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      0,
+      1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       0,
       1,
-      2,
+      3,
       -1,
       -1,
       -1,
@@ -2056,7 +338,7 @@
        "exact": true,
        "expert": 1
       },
-      "2": {
+      "3": {
        "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
        "exact": true,
        "expert": 2
@@ -2065,27 +347,45 @@
      "slot_info": [
       [
        2,
-       0,
-       1
-      ],
-      [
-       2,
-       1,
        0
       ],
       [
        2,
-       2,
        1
       ],
       [
+       3,
+       -1
+      ],
+      [
+       2,
+       2
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
        0,
-       -1,
-       0
+       -1
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
@@ -2099,24 +399,32 @@
      "ready": {},
      "slot_info": [
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     }
@@ -2135,585 +443,57 @@
     }
    ],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 0,
     "no_victim": 0,
     "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
     "rows_read": 3,
     "served": 2,
     "touch_only": 0,
     "version": 2
    },
+   "deltas": [
+    [
+     3,
+     [
+      5,
+      4,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       2,
+       3
+      ]
+     ]
+    ],
+    [
+     1,
+     [
+      0,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     []
+    ]
+   ],
    "dst": {
     "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": true,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 2,
+    "handled": 2,
     "records": [
      {
       "ring_seq": 1,
@@ -2730,53 +510,53 @@
    "results": [
     {
      "copy_done": 0,
-     "done": 1,
-     "lanes": [
-      {
-       "gen": 1,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 1,
-       "host_slot": 1,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       511,
       511
      ],
-     "seq": 1
+     "seq": 1,
+     "slots": [
+      0,
+      1
+     ]
     },
     {
      "copy_done": 2,
-     "done": 0,
-     "lanes": [
-      {
-       "gen": 2,
-       "host_slot": 0,
-       "tag": 3
-      },
-      {
-       "gen": 2,
-       "host_slot": 2,
-       "tag": 2
-      }
+     "kinds": [
+      1,
+      4
      ],
      "pieces": [
       0,
       767
      ],
-     "seq": 2
+     "seq": 2,
+     "slots": [
+      0,
+      3
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      0,
+      1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       0,
       1,
-      2,
+      3,
       -1,
       -1,
       -1,
@@ -2794,7 +574,7 @@
        "exact": true,
        "expert": 1
       },
-      "2": {
+      "3": {
        "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
        "exact": true,
        "expert": 2
@@ -2803,27 +583,45 @@
      "slot_info": [
       [
        2,
-       0,
        0
       ],
       [
-       2,
-       1,
-       0
-      ],
-      [
-       2,
        2,
        1
       ],
       [
+       3,
+       -1
+      ],
+      [
+       2,
+       2
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
        0,
-       -1,
-       0
+       -1
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
@@ -2837,24 +635,32 @@
      "ready": {},
      "slot_info": [
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     }
@@ -2873,1323 +679,65 @@
     }
    ],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
-    "evictions": 0,
-    "no_victim": 0,
-    "overruns": 0,
-    "read_errors": 0,
-    "rows_read": 3,
-    "served": 2,
-    "touch_only": 0,
-    "version": 2
-   },
-   "dst": {
-    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
-    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
-   },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
-   "page": {
-    "demand_done": 2,
-    "records": [
-     {
-      "ring_seq": 1,
-      "seq": 1,
-      "served": true
-     },
-     {
-      "ring_seq": 2,
-      "seq": 2,
-      "served": true
-     }
-    ]
-   },
-   "results": [
-    {
-     "copy_done": 0,
-     "done": 1,
-     "lanes": [
-      {
-       "gen": 1,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 1,
-       "host_slot": 1,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      511,
-      511
-     ],
-     "seq": 1
-    },
-    {
-     "copy_done": 2,
-     "done": 2,
-     "lanes": [
-      {
-       "gen": 2,
-       "host_slot": 0,
-       "tag": 3
-      },
-      {
-       "gen": 2,
-       "host_slot": 2,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      0,
-      767
-     ],
-     "seq": 2
-    }
-   ],
-   "rows": {
-    "0": {
-     "mapping": [
-      0,
-      1,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {
-      "0": {
-       "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
-       "exact": true,
-       "expert": 0
-      },
-      "1": {
-       "digest": "cca21f6d9285fcf8dfe5e33fbf34c6bad12c0ffd24819538ec46dbc73083ad5de081e368965072b16429c2c9dbefbaaa",
-       "exact": true,
-       "expert": 1
-      },
-      "2": {
-       "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
-       "exact": true,
-       "expert": 2
-      }
-     },
-     "slot_info": [
-      [
-       2,
-       0,
-       0
-      ],
-      [
-       2,
-       1,
-       0
-      ],
-      [
-       2,
-       2,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ]
-     ]
-    },
-    "1": {
-     "mapping": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {},
-     "slot_info": [
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ]
-     ]
-    }
-   }
-  },
-  {
-   "copies": [
-    {
-     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
-     "dst_slot": 0,
-     "exact": true,
-     "expert": 0,
-     "lane": 0,
-     "row": 0,
-     "seq": 2
-    }
-   ],
-   "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 1,
     "no_victim": 0,
     "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
     "rows_read": 5,
     "served": 3,
     "touch_only": 0,
     "version": 3
    },
+   "deltas": [
+    [
+     4,
+     [
+      6,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       3,
+       5
+      ],
+      [
+       1,
+       -1
+      ],
+      [
+       4,
+       4
+      ]
+     ]
+    ],
+    [
+     1,
+     [
+      0,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     []
+    ]
+   ],
    "dst": {
     "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": true,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 3,
+    "handled": 3,
     "records": [
      {
       "ring_seq": 1,
@@ -4211,55 +759,55 @@
    "results": [
     {
      "copy_done": 2,
-     "done": 2,
-     "lanes": [
-      {
-       "gen": 2,
-       "host_slot": 0,
-       "tag": 3
-      },
-      {
-       "gen": 2,
-       "host_slot": 2,
-       "tag": 2
-      }
+     "kinds": [
+      1,
+      4
      ],
      "pieces": [
       0,
       767
      ],
-     "seq": 2
+     "seq": 2,
+     "slots": [
+      0,
+      3
+     ]
     },
     {
      "copy_done": 0,
-     "done": 0,
-     "lanes": [
-      {
-       "gen": 3,
-       "host_slot": 3,
-       "tag": 2
-      },
-      {
-       "gen": 3,
-       "host_slot": 1,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       1023,
       1023
      ],
-     "seq": 3
+     "seq": 3,
+     "slots": [
+      5,
+      4
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      0,
+      1,
+      3,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       0,
       -1,
-      2,
       3,
-      1,
+      5,
+      4,
       -1,
       -1,
       -1
@@ -4270,17 +818,17 @@
        "exact": true,
        "expert": 0
       },
-      "1": {
-       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
-       "exact": true,
-       "expert": 4
-      },
-      "2": {
+      "3": {
        "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
        "exact": true,
        "expert": 2
       },
-      "3": {
+      "4": {
+       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
+       "exact": true,
+       "expert": 4
+      },
+      "5": {
        "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
        "exact": true,
        "expert": 3
@@ -4289,27 +837,45 @@
      "slot_info": [
       [
        2,
-       0,
        0
       ],
       [
-       2,
-       4,
-       1
-      ],
-      [
-       2,
-       2,
-       0
-      ],
-      [
-       2,
        3,
-       1
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       2,
+       2
+      ],
+      [
+       2,
+       4
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       3,
+       -1
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
@@ -4323,24 +889,32 @@
      "ready": {},
      "slot_info": [
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     }
@@ -4359,1333 +933,69 @@
     }
    ],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
-    "evictions": 1,
-    "no_victim": 0,
-    "overruns": 0,
-    "read_errors": 0,
-    "rows_read": 5,
-    "served": 3,
-    "touch_only": 0,
-    "version": 3
-   },
-   "dst": {
-    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
-    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
-   },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
-   "page": {
-    "demand_done": 3,
-    "records": [
-     {
-      "ring_seq": 1,
-      "seq": 1,
-      "served": true
-     },
-     {
-      "ring_seq": 2,
-      "seq": 2,
-      "served": true
-     },
-     {
-      "ring_seq": 3,
-      "seq": 3,
-      "served": true
-     }
-    ]
-   },
-   "results": [
-    {
-     "copy_done": 2,
-     "done": 2,
-     "lanes": [
-      {
-       "gen": 2,
-       "host_slot": 0,
-       "tag": 3
-      },
-      {
-       "gen": 2,
-       "host_slot": 2,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      0,
-      767
-     ],
-     "seq": 2
-    },
-    {
-     "copy_done": 0,
-     "done": 3,
-     "lanes": [
-      {
-       "gen": 3,
-       "host_slot": 3,
-       "tag": 2
-      },
-      {
-       "gen": 3,
-       "host_slot": 1,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      1023,
-      1023
-     ],
-     "seq": 3
-    }
-   ],
-   "rows": {
-    "0": {
-     "mapping": [
-      0,
-      -1,
-      2,
-      3,
-      1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {
-      "0": {
-       "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
-       "exact": true,
-       "expert": 0
-      },
-      "1": {
-       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
-       "exact": true,
-       "expert": 4
-      },
-      "2": {
-       "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
-       "exact": true,
-       "expert": 2
-      },
-      "3": {
-       "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
-       "exact": true,
-       "expert": 3
-      }
-     },
-     "slot_info": [
-      [
-       2,
-       0,
-       0
-      ],
-      [
-       2,
-       4,
-       0
-      ],
-      [
-       2,
-       2,
-       0
-      ],
-      [
-       2,
-       3,
-       0
-      ]
-     ]
-    },
-    "1": {
-     "mapping": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {},
-     "slot_info": [
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ]
-     ]
-    }
-   }
-  },
-  {
-   "copies": [
-    {
-     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
-     "dst_slot": 0,
-     "exact": true,
-     "expert": 0,
-     "lane": 0,
-     "row": 0,
-     "seq": 2
-    }
-   ],
-   "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 3,
     "no_victim": 0,
     "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
     "rows_read": 7,
     "served": 4,
     "touch_only": 0,
     "version": 4
    },
+   "deltas": [
+    [
+     5,
+     [
+      0,
+      3,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       0,
+       -1
+      ],
+      [
+       5,
+       6
+      ],
+      [
+       2,
+       -1
+      ],
+      [
+       6,
+       1
+      ]
+     ]
+    ],
+    [
+     1,
+     [
+      0,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     []
+    ]
+   ],
    "dst": {
     "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": true,
-     "count": 2,
-     "gen": 4,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 4,
+    "handled": 4,
     "records": [
      {
       "ring_seq": 1,
@@ -5712,105 +1022,123 @@
    "results": [
     {
      "copy_done": 0,
-     "done": 3,
-     "lanes": [
-      {
-       "gen": 3,
-       "host_slot": 3,
-       "tag": 2
-      },
-      {
-       "gen": 3,
-       "host_slot": 1,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       1023,
       1023
      ],
-     "seq": 3
+     "seq": 3,
+     "slots": [
+      5,
+      4
+     ]
     },
     {
      "copy_done": 0,
-     "done": 0,
-     "lanes": [
-      {
-       "gen": 4,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 4,
-       "host_slot": 2,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       1279,
       1279
      ],
-     "seq": 4
+     "seq": 4,
+     "slots": [
+      6,
+      1
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      0,
+      -1,
+      3,
+      5,
+      4,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
       -1,
-      3,
+      5,
+      4,
+      6,
       1,
-      0,
-      2,
       -1
      ],
      "ready": {
-      "0": {
-       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
-       "exact": true,
-       "expert": 5
-      },
       "1": {
-       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
-       "exact": true,
-       "expert": 4
-      },
-      "2": {
        "digest": "e1dff791cc7ab4663936e07816e5499ef63173b2173aeb3ddc91755cbb852219ed506d0b0f8949af9f32484063804ebb",
        "exact": true,
        "expert": 6
       },
-      "3": {
+      "4": {
+       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
+       "exact": true,
+       "expert": 4
+      },
+      "5": {
        "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
        "exact": true,
        "expert": 3
+      },
+      "6": {
+       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
+       "exact": true,
+       "expert": 5
       }
      },
      "slot_info": [
       [
-       2,
-       5,
-       1
-      ],
-      [
-       2,
-       4,
-       0
-      ],
-      [
-       2,
-       6,
-       1
-      ],
-      [
-       2,
        3,
-       0
+       -1
+      ],
+      [
+       2,
+       6
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       2,
+       4
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       2,
+       5
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
@@ -5824,24 +1152,32 @@
      "ready": {},
      "slot_info": [
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     }
@@ -5860,1338 +1196,69 @@
     }
    ],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 3,
     "no_victim": 0,
     "overruns": 0,
-    "read_errors": 0,
-    "rows_read": 7,
-    "served": 4,
-    "touch_only": 0,
-    "version": 4
-   },
-   "dst": {
-    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
-    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
-   },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 4,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
-   "page": {
-    "demand_done": 4,
-    "records": [
-     {
-      "ring_seq": 1,
-      "seq": 1,
-      "served": true
-     },
-     {
-      "ring_seq": 2,
-      "seq": 2,
-      "served": true
-     },
-     {
-      "ring_seq": 3,
-      "seq": 3,
-      "served": true
-     },
-     {
-      "ring_seq": 4,
-      "seq": 4,
-      "served": true
-     }
-    ]
-   },
-   "results": [
-    {
-     "copy_done": 0,
-     "done": 3,
-     "lanes": [
-      {
-       "gen": 3,
-       "host_slot": 3,
-       "tag": 2
-      },
-      {
-       "gen": 3,
-       "host_slot": 1,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      1023,
-      1023
-     ],
-     "seq": 3
-    },
-    {
-     "copy_done": 0,
-     "done": 4,
-     "lanes": [
-      {
-       "gen": 4,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 4,
-       "host_slot": 2,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      1279,
-      1279
-     ],
-     "seq": 4
-    }
-   ],
-   "rows": {
-    "0": {
-     "mapping": [
-      -1,
-      -1,
-      -1,
-      3,
-      1,
-      0,
-      2,
-      -1
-     ],
-     "ready": {
-      "0": {
-       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
-       "exact": true,
-       "expert": 5
-      },
-      "1": {
-       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
-       "exact": true,
-       "expert": 4
-      },
-      "2": {
-       "digest": "e1dff791cc7ab4663936e07816e5499ef63173b2173aeb3ddc91755cbb852219ed506d0b0f8949af9f32484063804ebb",
-       "exact": true,
-       "expert": 6
-      },
-      "3": {
-       "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
-       "exact": true,
-       "expert": 3
-      }
-     },
-     "slot_info": [
-      [
-       2,
-       5,
-       0
-      ],
-      [
-       2,
-       4,
-       0
-      ],
-      [
-       2,
-       6,
-       0
-      ],
-      [
-       2,
-       3,
-       0
-      ]
-     ]
-    },
-    "1": {
-     "mapping": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {},
-     "slot_info": [
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ]
-     ]
-    }
-   }
-  },
-  {
-   "copies": [
-    {
-     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
-     "dst_slot": 0,
-     "exact": true,
-     "expert": 0,
-     "lane": 0,
-     "row": 0,
-     "seq": 2
-    }
-   ],
-   "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
-    "evictions": 3,
-    "no_victim": 0,
-    "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
     "rows_read": 7,
     "served": 4,
     "touch_only": 1,
     "version": 4
    },
+   "deltas": [
+    [
+     5,
+     [
+      0,
+      3,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       0,
+       -1
+      ],
+      [
+       5,
+       6
+      ],
+      [
+       2,
+       -1
+      ],
+      [
+       6,
+       1
+      ]
+     ]
+    ],
+    [
+     1,
+     [
+      0,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     []
+    ]
+   ],
    "dst": {
     "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 4,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 5,
+    "handled": 5,
     "records": [
      {
       "ring_seq": 1,
@@ -7223,105 +1290,123 @@
    "results": [
     {
      "copy_done": 0,
-     "done": 3,
-     "lanes": [
-      {
-       "gen": 3,
-       "host_slot": 3,
-       "tag": 2
-      },
-      {
-       "gen": 3,
-       "host_slot": 1,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       1023,
       1023
      ],
-     "seq": 3
+     "seq": 3,
+     "slots": [
+      5,
+      4
+     ]
     },
     {
      "copy_done": 0,
-     "done": 4,
-     "lanes": [
-      {
-       "gen": 4,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 4,
-       "host_slot": 2,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       1279,
       1279
      ],
-     "seq": 4
+     "seq": 4,
+     "slots": [
+      6,
+      1
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      0,
+      -1,
+      3,
+      5,
+      4,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
       -1,
-      3,
+      5,
+      4,
+      6,
       1,
-      0,
-      2,
       -1
      ],
      "ready": {
-      "0": {
-       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
-       "exact": true,
-       "expert": 5
-      },
       "1": {
-       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
-       "exact": true,
-       "expert": 4
-      },
-      "2": {
        "digest": "e1dff791cc7ab4663936e07816e5499ef63173b2173aeb3ddc91755cbb852219ed506d0b0f8949af9f32484063804ebb",
        "exact": true,
        "expert": 6
       },
-      "3": {
+      "4": {
+       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
+       "exact": true,
+       "expert": 4
+      },
+      "5": {
        "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
        "exact": true,
        "expert": 3
+      },
+      "6": {
+       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
+       "exact": true,
+       "expert": 5
       }
      },
      "slot_info": [
       [
-       2,
-       5,
-       0
-      ],
-      [
-       2,
-       4,
-       0
-      ],
-      [
-       2,
-       6,
-       0
-      ],
-      [
-       2,
        3,
-       0
+       -1
+      ],
+      [
+       2,
+       6
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       2,
+       4
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       2,
+       5
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
@@ -7335,24 +1420,32 @@
      "ready": {},
      "slot_info": [
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     }
@@ -7371,585 +1464,69 @@
     }
    ],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 3,
     "no_victim": 0,
     "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
     "rows_read": 7,
     "served": 4,
     "touch_only": 1,
     "version": 4
    },
+   "deltas": [
+    [
+     5,
+     [
+      0,
+      3,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       0,
+       -1
+      ],
+      [
+       5,
+       6
+      ],
+      [
+       2,
+       -1
+      ],
+      [
+       6,
+       1
+      ]
+     ]
+    ],
+    [
+     1,
+     [
+      0,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     []
+    ]
+   ],
    "dst": {
     "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 4,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 5,
+    "handled": 5,
     "records": [
      {
       "ring_seq": 1,
@@ -7981,105 +1558,123 @@
    "results": [
     {
      "copy_done": 0,
-     "done": 3,
-     "lanes": [
-      {
-       "gen": 3,
-       "host_slot": 3,
-       "tag": 2
-      },
-      {
-       "gen": 3,
-       "host_slot": 1,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       1023,
       1023
      ],
-     "seq": 3
+     "seq": 3,
+     "slots": [
+      5,
+      4
+     ]
     },
     {
      "copy_done": 0,
-     "done": 4,
-     "lanes": [
-      {
-       "gen": 4,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 4,
-       "host_slot": 2,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       1279,
       1279
      ],
-     "seq": 4
+     "seq": 4,
+     "slots": [
+      6,
+      1
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      0,
+      -1,
+      3,
+      5,
+      4,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
       -1,
-      3,
+      5,
+      4,
+      6,
       1,
-      0,
-      2,
       -1
      ],
      "ready": {
-      "0": {
-       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
-       "exact": true,
-       "expert": 5
-      },
       "1": {
-       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
-       "exact": true,
-       "expert": 4
-      },
-      "2": {
        "digest": "e1dff791cc7ab4663936e07816e5499ef63173b2173aeb3ddc91755cbb852219ed506d0b0f8949af9f32484063804ebb",
        "exact": true,
        "expert": 6
       },
-      "3": {
+      "4": {
+       "digest": "031e25e88c4b54b2194e83c1034631d6977dad46d302aeae0a5e71f29d8819445a6b01678c41d69ebfd39fb50164b511",
+       "exact": true,
+       "expert": 4
+      },
+      "5": {
        "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
        "exact": true,
        "expert": 3
+      },
+      "6": {
+       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
+       "exact": true,
+       "expert": 5
       }
      },
      "slot_info": [
       [
-       2,
-       5,
-       0
-      ],
-      [
-       2,
-       4,
-       0
-      ],
-      [
-       2,
-       6,
-       0
-      ],
-      [
-       2,
        3,
-       0
+       -1
+      ],
+      [
+       2,
+       6
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       2,
+       4
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       2,
+       5
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
@@ -8093,24 +1688,32 @@
      "ready": {},
      "slot_info": [
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     }
@@ -8129,585 +1732,69 @@
     }
    ],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 5,
     "no_victim": 0,
     "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
     "rows_read": 9,
     "served": 5,
     "touch_only": 1,
     "version": 5
    },
+   "deltas": [
+    [
+     6,
+     [
+      4,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       4,
+       -1
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       6,
+       -1
+      ],
+      [
+       2,
+       3
+      ]
+     ]
+    ],
+    [
+     1,
+     [
+      0,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     []
+    ]
+   ],
    "dst": {
     "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 4,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": true,
-     "count": 3,
-     "gen": 6,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      1,
-      2,
-      3,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 6,
+    "handled": 6,
     "records": [
      {
       "ring_seq": 1,
@@ -8744,111 +1831,126 @@
    "results": [
     {
      "copy_done": 0,
-     "done": 4,
-     "lanes": [
-      {
-       "gen": 4,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 4,
-       "host_slot": 2,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4
      ],
      "pieces": [
       1279,
       1279
      ],
-     "seq": 4
+     "seq": 4,
+     "slots": [
+      6,
+      1
+     ]
     },
     {
      "copy_done": 0,
-     "done": 0,
-     "lanes": [
-      {
-       "gen": 6,
-       "host_slot": 1,
-       "tag": 2
-      },
-      {
-       "gen": 6,
-       "host_slot": 2,
-       "tag": 2
-      },
-      {
-       "gen": 6,
-       "host_slot": 3,
-       "tag": 1
-      }
+     "kinds": [
+      4,
+      4,
+      2
      ],
      "pieces": [
       1791,
       1791,
       0
      ],
-     "seq": 6
+     "seq": 6,
+     "slots": [
+      0,
+      3,
+      5
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      5,
+      4,
+      6,
+      1,
+      -1
+     ],
      "mapping": [
       -1,
-      1,
-      2,
-      3,
-      -1,
       0,
+      3,
+      5,
+      -1,
+      6,
       -1,
       -1
      ],
      "ready": {
       "0": {
-       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
-       "exact": true,
-       "expert": 5
-      },
-      "1": {
        "digest": "cca21f6d9285fcf8dfe5e33fbf34c6bad12c0ffd24819538ec46dbc73083ad5de081e368965072b16429c2c9dbefbaaa",
        "exact": true,
        "expert": 1
       },
-      "2": {
+      "3": {
        "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
        "exact": true,
        "expert": 2
       },
-      "3": {
+      "5": {
        "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
        "exact": true,
        "expert": 3
+      },
+      "6": {
+       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
+       "exact": true,
+       "expert": 5
       }
      },
      "slot_info": [
       [
        2,
-       5,
-       0
-      ],
-      [
-       2,
-       1,
        1
       ],
       [
-       2,
-       2,
-       1
-      ],
-      [
-       2,
        3,
-       1
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       2,
+       2
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       2,
+       5
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       -1,
       -1,
@@ -8862,24 +1964,32 @@
      "ready": {},
      "slot_info": [
       [
-       0,
-       -1,
-       0
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
       ],
       [
        0,
-       -1,
-       0
+       -1
+      ],
+      [
+       0,
+       -1
       ]
      ]
     }
@@ -8898,1354 +2008,82 @@
     }
    ],
    "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
     "evictions": 5,
     "no_victim": 0,
     "overruns": 0,
+    "ram_insert_skipped": 0,
     "read_errors": 0,
-    "rows_read": 9,
-    "served": 5,
-    "touch_only": 1,
-    "version": 5
-   },
-   "dst": {
-    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
-    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
-   },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 4,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 3,
-     "gen": 6,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      1,
-      2,
-      3,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
-   "page": {
-    "demand_done": 6,
-    "records": [
-     {
-      "ring_seq": 1,
-      "seq": 1,
-      "served": true
-     },
-     {
-      "ring_seq": 2,
-      "seq": 2,
-      "served": true
-     },
-     {
-      "ring_seq": 3,
-      "seq": 3,
-      "served": true
-     },
-     {
-      "ring_seq": 4,
-      "seq": 4,
-      "served": true
-     },
-     {
-      "ring_seq": 5,
-      "seq": 5,
-      "served": true
-     },
-     {
-      "ring_seq": 6,
-      "seq": 6,
-      "served": true
-     }
-    ]
-   },
-   "results": [
-    {
-     "copy_done": 0,
-     "done": 4,
-     "lanes": [
-      {
-       "gen": 4,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 4,
-       "host_slot": 2,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      1279,
-      1279
-     ],
-     "seq": 4
-    },
-    {
-     "copy_done": 0,
-     "done": 6,
-     "lanes": [
-      {
-       "gen": 6,
-       "host_slot": 1,
-       "tag": 2
-      },
-      {
-       "gen": 6,
-       "host_slot": 2,
-       "tag": 2
-      },
-      {
-       "gen": 6,
-       "host_slot": 3,
-       "tag": 1
-      }
-     ],
-     "pieces": [
-      1791,
-      1791,
-      0
-     ],
-     "seq": 6
-    }
-   ],
-   "rows": {
-    "0": {
-     "mapping": [
-      -1,
-      1,
-      2,
-      3,
-      -1,
-      0,
-      -1,
-      -1
-     ],
-     "ready": {
-      "0": {
-       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
-       "exact": true,
-       "expert": 5
-      },
-      "1": {
-       "digest": "cca21f6d9285fcf8dfe5e33fbf34c6bad12c0ffd24819538ec46dbc73083ad5de081e368965072b16429c2c9dbefbaaa",
-       "exact": true,
-       "expert": 1
-      },
-      "2": {
-       "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
-       "exact": true,
-       "expert": 2
-      },
-      "3": {
-       "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
-       "exact": true,
-       "expert": 3
-      }
-     },
-     "slot_info": [
-      [
-       2,
-       5,
-       0
-      ],
-      [
-       2,
-       1,
-       0
-      ],
-      [
-       2,
-       2,
-       0
-      ],
-      [
-       2,
-       3,
-       0
-      ]
-     ]
-    },
-    "1": {
-     "mapping": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {},
-     "slot_info": [
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ],
-      [
-       0,
-       -1,
-       0
-      ]
-     ]
-    }
-   }
-  },
-  {
-   "copies": [
-    {
-     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
-     "dst_slot": 0,
-     "exact": true,
-     "expert": 0,
-     "lane": 0,
-     "row": 0,
-     "seq": 2
-    }
-   ],
-   "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
-    "evictions": 5,
-    "no_victim": 0,
-    "overruns": 0,
-    "read_errors": 0,
-    "rows_read": 13,
+    "rows_read": 12,
     "served": 6,
     "touch_only": 1,
     "version": 6
    },
+   "deltas": [
+    [
+     6,
+     [
+      4,
+      1,
+      2,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       4,
+       -1
+      ],
+      [
+       1,
+       0
+      ],
+      [
+       6,
+       -1
+      ],
+      [
+       2,
+       3
+      ]
+     ]
+    ],
+    [
+     2,
+     [
+      3,
+      4,
+      5,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
+     [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ],
+      [
+       2,
+       2
+      ]
+     ]
+    ]
+   ],
    "dst": {
     "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
     "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
    },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 4,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 3,
-     "gen": 6,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      1,
-      2,
-      3,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": true,
-     "count": 4,
-     "gen": 7,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      2,
-      3,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
    "page": {
-    "demand_done": 7,
+    "handled": 7,
     "records": [
      {
       "ring_seq": 1,
@@ -10287,128 +2125,134 @@
    "results": [
     {
      "copy_done": 0,
-     "done": 6,
-     "lanes": [
-      {
-       "gen": 6,
-       "host_slot": 1,
-       "tag": 2
-      },
-      {
-       "gen": 6,
-       "host_slot": 2,
-       "tag": 2
-      },
-      {
-       "gen": 6,
-       "host_slot": 3,
-       "tag": 1
-      }
+     "kinds": [
+      4,
+      4,
+      2
      ],
      "pieces": [
       1791,
       1791,
       0
      ],
-     "seq": 6
+     "seq": 6,
+     "slots": [
+      0,
+      3,
+      5
+     ]
     },
     {
      "copy_done": 0,
-     "done": 0,
-     "lanes": [
-      {
-       "gen": 7,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 7,
-       "host_slot": 1,
-       "tag": 2
-      },
-      {
-       "gen": 7,
-       "host_slot": 2,
-       "tag": 2
-      },
-      {
-       "gen": 7,
-       "host_slot": 3,
-       "tag": 2
-      }
+     "kinds": [
+      4,
+      4,
+      4
      ],
      "pieces": [
       2047,
       2047,
-      2047,
       2047
      ],
-     "seq": 7
+     "seq": 7,
+     "slots": [
+      0,
+      1,
+      2
+     ]
     }
    ],
    "rows": {
     "0": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      5,
+      4,
+      6,
+      1,
+      -1
+     ],
      "mapping": [
       -1,
-      1,
-      2,
-      3,
-      -1,
       0,
+      3,
+      5,
+      -1,
+      6,
       -1,
       -1
      ],
      "ready": {
       "0": {
-       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
-       "exact": true,
-       "expert": 5
-      },
-      "1": {
        "digest": "cca21f6d9285fcf8dfe5e33fbf34c6bad12c0ffd24819538ec46dbc73083ad5de081e368965072b16429c2c9dbefbaaa",
        "exact": true,
        "expert": 1
       },
-      "2": {
+      "3": {
        "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
        "exact": true,
        "expert": 2
       },
-      "3": {
+      "5": {
        "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
        "exact": true,
        "expert": 3
+      },
+      "6": {
+       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
+       "exact": true,
+       "expert": 5
       }
      },
      "slot_info": [
       [
        2,
-       5,
-       0
+       1
       ],
       [
-       2,
-       1,
-       0
-      ],
-      [
-       2,
-       2,
-       0
-      ],
-      [
-       2,
        3,
-       0
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       2,
+       2
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       2,
+       3
+      ],
+      [
+       2,
+       5
       ]
      ]
     },
     "1": {
+     "device_map": [
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1
+     ],
      "mapping": [
       0,
       1,
       2,
-      3,
+      -1,
       -1,
       -1,
       -1,
@@ -10429,840 +2273,36 @@
        "digest": "1c71c1bbceff7e3fe8545a14e129ecc4cd8582e9a1cbff99a3e3968d85ddcf39a8891701b355fc5443ba64d38d80dd70",
        "exact": true,
        "expert": 2
-      },
-      "3": {
-       "digest": "7ae1edff0068014b3b6c416ffaaa40f62701be3360396b5192ef97a2bd526ce7a8250208cfcc0a2b69111b07c63ae590",
-       "exact": true,
-       "expert": 3
       }
      },
      "slot_info": [
       [
        2,
+       0
+      ],
+      [
+       2,
+       1
+      ],
+      [
+       2,
+       2
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
+       3,
+       -1
+      ],
+      [
        0,
-       1
-      ],
-      [
-       2,
-       1,
-       1
-      ],
-      [
-       2,
-       2,
-       1
-      ],
-      [
-       2,
-       3,
-       1
-      ]
-     ]
-    }
-   }
-  },
-  {
-   "copies": [
-    {
-     "digest": "d9cc753d2459dabda4c1b7a5464d1aa766279796b96d8c11adcf8f8b7be9fc133fdf93a991c988aa1da3264e58ae605b",
-     "dst_slot": 0,
-     "exact": true,
-     "expert": 0,
-     "lane": 0,
-     "row": 0,
-     "seq": 2
-    }
-   ],
-   "counters": {
-    "deferred": 0,
-    "deferred_reuse": 0,
-    "evictions": 5,
-    "no_victim": 0,
-    "overruns": 0,
-    "read_errors": 0,
-    "rows_read": 13,
-    "served": 6,
-    "touch_only": 1,
-    "version": 6
-   },
-   "dst": {
-    "0": "b6a5df7ce704a5c8affa0c91375b7aee0eb08ffece6a4146f6f17881a2f8ce4146dfb3cc3c06b5a431efd2cc690f84ad",
-    "1": "b9c048de34d844a2fd9243e1ba57263efd9243e1ba57263e8123c216413f82bbe80232b4d18d0bb7e80232b4d18d0bb7"
-   },
-   "entries": [
-    {
-     "active": false,
-     "count": 2,
-     "gen": 1,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 2,
-     "lane_copy_engine": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 3,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      3,
-      1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 2,
-     "gen": 4,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      2,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 3,
-     "gen": 6,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      1,
-      2,
-      3,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      2,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 4,
-     "gen": 7,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      0,
-      1,
-      2,
-      3,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      2,
-      2,
-      2,
-      2,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    },
-    {
-     "active": false,
-     "count": 0,
-     "gen": 0,
-     "lane_copy_engine": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ],
-     "lane_slot": [
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "lane_state": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-     ]
-    }
-   ],
-   "page": {
-    "demand_done": 7,
-    "records": [
-     {
-      "ring_seq": 1,
-      "seq": 1,
-      "served": true
-     },
-     {
-      "ring_seq": 2,
-      "seq": 2,
-      "served": true
-     },
-     {
-      "ring_seq": 3,
-      "seq": 3,
-      "served": true
-     },
-     {
-      "ring_seq": 4,
-      "seq": 4,
-      "served": true
-     },
-     {
-      "ring_seq": 5,
-      "seq": 5,
-      "served": true
-     },
-     {
-      "ring_seq": 6,
-      "seq": 6,
-      "served": true
-     },
-     {
-      "ring_seq": 7,
-      "seq": 7,
-      "served": true
-     }
-    ]
-   },
-   "results": [
-    {
-     "copy_done": 0,
-     "done": 6,
-     "lanes": [
-      {
-       "gen": 6,
-       "host_slot": 1,
-       "tag": 2
-      },
-      {
-       "gen": 6,
-       "host_slot": 2,
-       "tag": 2
-      },
-      {
-       "gen": 6,
-       "host_slot": 3,
-       "tag": 1
-      }
-     ],
-     "pieces": [
-      1791,
-      1791,
-      0
-     ],
-     "seq": 6
-    },
-    {
-     "copy_done": 0,
-     "done": 7,
-     "lanes": [
-      {
-       "gen": 7,
-       "host_slot": 0,
-       "tag": 2
-      },
-      {
-       "gen": 7,
-       "host_slot": 1,
-       "tag": 2
-      },
-      {
-       "gen": 7,
-       "host_slot": 2,
-       "tag": 2
-      },
-      {
-       "gen": 7,
-       "host_slot": 3,
-       "tag": 2
-      }
-     ],
-     "pieces": [
-      2047,
-      2047,
-      2047,
-      2047
-     ],
-     "seq": 7
-    }
-   ],
-   "rows": {
-    "0": {
-     "mapping": [
-      -1,
-      1,
-      2,
-      3,
-      -1,
-      0,
-      -1,
-      -1
-     ],
-     "ready": {
-      "0": {
-       "digest": "93da13300555aabf9a6787cb5ba2c44900c83aec429f214f733aa66a233e854785bd58aa933309a6232a7b2357bf81aa",
-       "exact": true,
-       "expert": 5
-      },
-      "1": {
-       "digest": "cca21f6d9285fcf8dfe5e33fbf34c6bad12c0ffd24819538ec46dbc73083ad5de081e368965072b16429c2c9dbefbaaa",
-       "exact": true,
-       "expert": 1
-      },
-      "2": {
-       "digest": "33c71a02a46b9a17df82411b76ead4235575daa2e6b5ac7868d9786d7c5a3bc98983ba03e557c5864ade56ac59aa5c14",
-       "exact": true,
-       "expert": 2
-      },
-      "3": {
-       "digest": "3694d1d0ab5634f73c09334a5741cce799e7a53239293430c6e8456aeb0c922d0675408208268c02b1c845be7f83e98a",
-       "exact": true,
-       "expert": 3
-      }
-     },
-     "slot_info": [
-      [
-       2,
-       5,
-       0
-      ],
-      [
-       2,
-       1,
-       0
-      ],
-      [
-       2,
-       2,
-       0
-      ],
-      [
-       2,
-       3,
-       0
-      ]
-     ]
-    },
-    "1": {
-     "mapping": [
-      0,
-      1,
-      2,
-      3,
-      -1,
-      -1,
-      -1,
-      -1
-     ],
-     "ready": {
-      "0": {
-       "digest": "d0318727230abf0bfa67394dd6cd71aecb3dc968f467a4b36530e3ae80154a20ef0fe16ed81a27e56154e6a402308989",
-       "exact": true,
-       "expert": 0
-      },
-      "1": {
-       "digest": "b80812ab4f96d87d171ec96a2ac3099e3e18ab3ba83ed7325dc02defec614c2d3131a1bc6a0dbba64256fadfeaec3716",
-       "exact": true,
-       "expert": 1
-      },
-      "2": {
-       "digest": "1c71c1bbceff7e3fe8545a14e129ecc4cd8582e9a1cbff99a3e3968d85ddcf39a8891701b355fc5443ba64d38d80dd70",
-       "exact": true,
-       "expert": 2
-      },
-      "3": {
-       "digest": "7ae1edff0068014b3b6c416ffaaa40f62701be3360396b5192ef97a2bd526ce7a8250208cfcc0a2b69111b07c63ae590",
-       "exact": true,
-       "expert": 3
-      }
-     },
-     "slot_info": [
-      [
-       2,
-       0,
-       0
-      ],
-      [
-       2,
-       1,
-       0
-      ],
-      [
-       2,
-       2,
-       0
-      ],
-      [
-       2,
-       3,
-       0
+       -1
       ]
      ]
     }
