@@ -94,7 +94,11 @@ MAX_TOKENS = 128
 # and no server log line after "Load weight end" until the 900s abort. Keeping every
 # server thread on node 0 keeps its memory on node 0's free ~70 GiB.
 # Driver cores 8-15 are node 0 too and are excluded here so the two never overlap.
-SERVER_CORES = "0-7,16-17,36-53"
+SERVER_CORES = "0-7,16,36-52"
+# The RAM-miss service busy-polls cpu 17; its SMT sibling 53 and 17 itself are left out of SERVER_CORES so the physical
+# core is the service's alone (plan 2026-10-01-expert-stream-read-record D4). Arms from here on have one physical core
+# fewer: not comparable to earlier cells.
+SPIN_CORE = 17
 DRIVER_CORES = "8-15"
 FREE_CORES = "64-71"  # never touched; NVMe completion interrupts are pinned there.
 
@@ -172,6 +176,7 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_GRAPH_GATHER": "1",
         "SGLANG_MOE_EXPERT_FUSED_PLAN": "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
+        "SGLANG_DSV41_RAM_MISS_SPIN_CORE": str(SPIN_CORE),
         # The lease chain's W1 budget (the chain is two-phase with piece streaming, DSV41_REFERENCE.md section 24).
         "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100",
         # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical

@@ -117,6 +117,10 @@ class CpuExpertEngine {
     return config_.out_part_stride > 0 ? 2 : 1;
   }
 
+  const std::vector<int>& cores() const {
+    return config_.cores;
+  }
+
   // A row the device may send to the CPU: registered, and inside the tables.
   bool eligible(int64_t row) const {
     return row >= 0 && row < config_.rows && handles_[row].load(std::memory_order_acquire) >= 0;

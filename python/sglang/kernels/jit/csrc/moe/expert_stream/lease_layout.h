@@ -9,9 +9,9 @@ namespace sglang::expert_stream::wire {
 
 // ---- Request page: device-written, host-read ----
 constexpr int64_t kDemandHead = 0;  // u32: the last posted seq, stored with a release
-constexpr int64_t kDemandRing = 64;
+constexpr int64_t kDemandRing = 128;  // a 128-byte block of its own: each record below is one prefetch pair
 constexpr uint32_t kDemandRecords = 16;
-constexpr int64_t kRecordBytes = 256;
+constexpr int64_t kRecordBytes = 128;  // two cache lines, one 128-byte-aligned block (the L2's adjacent-line pair)
 constexpr int kMaxIds = 8;
 constexpr int64_t kRecSeq = 0;            // u32 seqlock word: 0 while the payload is rewritten, the seq stored last
 constexpr int64_t kRecRow = 4;            // u16
@@ -78,7 +78,8 @@ static_assert(kDemandRing % 16 == 0 && kRecordBytes % 16 == 0 && kRecEpoch % 16 
                   kRecLaneExpert % 16 == 0 && kRecLaneSlot % 16 == 0 && kRecLaneDst % 16 == 0 &&
                   kRecLaneWeight % 16 == 0,
               "the record's v4 stores are 16-byte aligned");
-static_assert(kRecLaneWeight + 4 * kMaxIds <= kRecordBytes, "record");
+static_assert(kRecLaneWeight + 4 * kMaxIds == kRecordBytes, "the payload is the whole record: read_record copies it");
+static_assert(kDemandRing % 128 == 0 && kRecordBytes == 128, "a record's two lines are one 128-byte prefetch pair");
 static_assert(kSplit + 4 * (kLeaseLanes + 1) <= kLeaseBlockBytes, "completion block");
 static_assert(kLeaseBlockBytes % kLeaseBlockAlign == 0, "the block is whole pages");
 static_assert(kDeltaEntries + 4 * kDeltaMaxEntries <= kDeltaStride, "delta record");

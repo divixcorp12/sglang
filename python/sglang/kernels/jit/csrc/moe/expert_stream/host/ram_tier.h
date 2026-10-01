@@ -170,6 +170,7 @@ class RamTier {
       next_demand_ = skip_zero(head - kDemandRecords + 2u);
     }
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
+    prefetch_request(record, next_demand_);
     Request request;
     // A torn record was overwritten by a later post, so nothing waits on it: skipped, and counted.
     const RecordRead read = read_record(record, next_demand_, &request);
@@ -443,6 +444,19 @@ class RamTier {
     return true;
   }
 
+  // Starts the loads of every line the request's read will touch: the record's two lines and its hot record's. The
+  // device has just written each, so each is an L3 miss; issued together they overlap instead of queueing behind
+  // read_record's branches. Called once the head shows the post: a line prefetched earlier would be refetched.
+  void prefetch_request(const uint8_t* record, uint32_t seq) const {
+    static_assert(kRecordBytes == 128, "a record is two lines");
+    _mm_prefetch(reinterpret_cast<const char*>(record), _MM_HINT_T0);
+    _mm_prefetch(reinterpret_cast<const char*>(record + 64), _MM_HINT_T0);
+    if (hot_page_ == nullptr) return;
+    const uint8_t* hot = hot_page_ + static_cast<int64_t>((seq - 1u) % kHotRecords) * hot_stride_;
+    for (int64_t line = 0; line < hot_stride_; line += 64)
+      _mm_prefetch(reinterpret_cast<const char*>(hot + line), _MM_HINT_T0);
+  }
+
   void apply_gpu_hot(const Request& request) {
     Tier& tier = tiers_[request.row];
     for (int64_t expert = 0; expert < experts_; ++expert)
@@ -577,6 +591,11 @@ class RamTier {
     out[0] = cpu_ != nullptr ? cpu_->jobs() : 0;
     out[1] = cpu_ != nullptr ? cpu_->lanes() : 0;
     out[2] = cpu_ != nullptr ? cpu_->compute_ns() : 0;
+  }
+
+  // The CPU experts' cores, empty without CPU experts. The caller's, before the service thread starts.
+  std::vector<int> cpu_cores() const {
+    return cpu_ != nullptr ? cpu_->cores() : std::vector<int>{};
   }
 
   // The owner (RamThread::pause, once the service parked): every job handed to the copy thread has completed (or

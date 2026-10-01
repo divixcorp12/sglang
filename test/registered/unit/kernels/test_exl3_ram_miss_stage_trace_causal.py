@@ -258,8 +258,10 @@ NON_TRACE_CLOCK_READS = {
     "const int64_t latency = now_ns() - job.submit_ns;": 1,
     # CpuExpertEngine (cpu_experts.h): one pair per CPU forward, a job of 0.5 ms or more on the CPU expert thread, off
     # the service thread; ProdBuild keeps it because the split's re-tune (cpu_stats' forward ns) reads it in serving.
-    "const int64_t start = now_ns();": 1,
+    # ... and pause_ns, test only (refused on ProdBuild): one PAUSE probe on the caller's thread.
+    "const int64_t start = now_ns();": 2,
     "compute_ns_.fetch_add(now_ns() - start, std::memory_order_relaxed);": 1,
+    "return static_cast<double>(now_ns() - start) / kProbe;": 1,
     # UringReader, std::chrono directly. register_resources(): the buffer registration's duration (register_ms), at
     # open and at a ring reset, never per read.
     "const auto t0 = std::chrono::steady_clock::now();": 1,

@@ -29,6 +29,11 @@ class FixedVec {
   void clear() {
     n_ = 0;
   }
+  // Sets the size to n; the caller has already written the first n entries through operator[]. Past N throws.
+  void resize(size_t n) {
+    if (n > N) overflow();
+    n_ = n;
+  }
   size_t size() const {
     return n_;
   }

@@ -9,6 +9,7 @@
 
 #include "../tensor_checks.h"
 #include "build_policy.h"
+#include "core_topology.h"
 #include "row_reader.h"
 #include "ram_thread.h"
 
@@ -496,7 +497,7 @@ struct HostExports {
     return find(handle)->trace_dropped();
   }
 
-  static void start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns) {
+  static void start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns, int64_t busy_poll) {
     if (cpu_core >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
     if (cpu_core >= 64 && cpu_core <= 71) {
       throw std::runtime_error(
@@ -519,13 +520,15 @@ struct HostExports {
       }
     }
     std::shared_ptr<RamTier<Source>> tier = find(handle);
+    if (busy_poll != 0) check_dedicated_core(static_cast<int>(cpu_core), tier->cpu_cores(), error_prefix<Layout>());
     // Checked and registered under one lock, so a concurrent close() either sees the thread
     // (and joins it) or runs before it and leaves no handle to start it on.
     std::lock_guard<std::mutex> guard(registry_mutex());
     if (registry().count(handle) == 0) throw std::runtime_error(error_prefix<Layout>() + "unknown handle");
     if (thread_registry().count(handle))
       throw std::runtime_error(error_prefix<Layout>() + "the service thread already runs");
-    auto thread = std::make_shared<Thread>(std::move(tier), static_cast<int>(cpu_core), fatal_wait_ns, spin_ns);
+    auto thread =
+        std::make_shared<Thread>(std::move(tier), static_cast<int>(cpu_core), fatal_wait_ns, spin_ns, busy_poll != 0);
     thread->start();
     thread_registry()[handle] = std::move(thread);
   }

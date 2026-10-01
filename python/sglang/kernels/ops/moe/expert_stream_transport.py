@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import struct
 import sys
 import weakref
 from typing import TYPE_CHECKING, Iterable, Optional, Sequence
@@ -79,6 +80,8 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "copy_engine_ballast",
     "trace_clock_reads",
     "seqlock_stress",
+    "pause_ns",
+    "read_record_fields",
 )
 
 
@@ -678,9 +681,9 @@ def stage_records(words: torch.Tensor) -> list[dict]:
 # The request page (lease_layout.h): demand_head, then kDemandRecords records of RECORD_FIELDS. A record's MAX_IDS
 # lanes are one i16 array per id and an f32 weight array; "counts" holds lanes (bits 0-3) and protect ids (bits 4-7),
 # and "kinds" a ram_slot_map.LaneKind nibble per lane.
-PAGE_BYTES = 4160
-RECORD_BYTES = 256
-DEMAND_RING = 64
+PAGE_BYTES = 2176
+RECORD_BYTES = 128
+DEMAND_RING = 128
 DEMAND_RECORDS = 16
 RECORD_FIELDS = {
     "seq": 0, "row": 4, "counts": 6, "flags": 7, "chain": 8, "epoch": 16, "kinds": 20,
@@ -758,6 +761,46 @@ def seqlock_stress(seconds: float, *, layout: str = "exl3", variant: Optional[st
     out = torch.zeros(2, dtype=torch.int64)
     _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
     return int(out[0]), int(out[1])
+
+
+_RECORD_LANES = 8  # kMaxIds == kLeaseLanes
+READ_RECORD_WORDS = 6 + _RECORD_LANES + 1 + 5 * _RECORD_LANES
+
+
+def read_record_fields(record: torch.Tensor, expected: int, *, layout: str = "exl3",
+                       variant: Optional[str] = None) -> dict:
+    """Test only: the service's read_record over one RECORD_BYTES record, expecting seq ``expected``. Instrumented
+    build only."""
+    _refuse_test_only("read_record_fields", variant)
+    out = torch.zeros(READ_RECORD_WORDS, dtype=torch.int64)
+    _host_module(layout, variant).expert_stream_read_record_fields(record, int(expected), out)
+    w = out.tolist()
+    protect, lanes = w[5], w[6 + _RECORD_LANES]
+    base = 7 + _RECORD_LANES
+    return {
+        "status": ("ok", "torn", "malformed")[w[0]],
+        "row": w[1],
+        "captured": bool(w[2]),
+        "chain": w[3] & 0xFFFFFFFFFFFFFFFF,
+        "gen": w[4] & 0xFFFFFFFFFFFFFFFF,
+        "protect": w[6 : 6 + protect],
+        "lanes": [
+            {
+                "expert": w[base + 5 * j],
+                "slot": w[base + 5 * j + 1],
+                "dst": w[base + 5 * j + 2],
+                "kind": w[base + 5 * j + 3],
+                "weight": struct.unpack("<f", struct.pack("<i", w[base + 5 * j + 4]))[0],
+            }
+            for j in range(lanes)
+        ],
+    }
+
+
+def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
+    """Test only: ns per _mm_pause on this core, the RAM-miss service's idle-poll quantum. Instrumented build only."""
+    _refuse_test_only("pause_ns", variant)
+    return float(_host_module(layout, variant).expert_stream_pause_ns())
 
 
 def new_page(pin: bool) -> torch.Tensor:
@@ -871,16 +914,20 @@ class ExpertStreamHost:
         if slot is not None and not 0 <= slot < capacity:
             raise ValueError(f"slot {slot} is outside [0, {capacity})")
 
-    def start_thread(self, *, cpu_core: int = -1, fatal_wait_s: float = 30.0, spin_us: int = 5000) -> None:
+    def start_thread(self, *, cpu_core: int = -1, fatal_wait_s: float = 30.0, spin_us: int = 5000,
+                     busy_poll: bool = False) -> None:
         """Serve requests on a C++ thread (no more ``pump()``), with the fail-stop watchdog.
 
-        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved (D19).
+        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved (D19). ``busy_poll`` spins on
+        ``cpu_core`` with no PAUSE and no sleep; the C++ side refuses it unless that physical core is the service's alone.
         """
         if 64 <= cpu_core <= 71:
             raise ValueError(
                 f"cpu_core {cpu_core}: cores 64-71 are reserved (NVMe completion interrupts are pinned there)"
             )
-        self._module.expert_stream_start_thread(self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3))
+        self._module.expert_stream_start_thread(
+            self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3), int(busy_poll)
+        )
         self.threaded = True
 
     def pause(self, timeout_s: float) -> None:
