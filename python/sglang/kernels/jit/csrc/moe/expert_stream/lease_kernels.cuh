@@ -275,6 +275,11 @@ struct LeaseProtocolKernel {
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
+    // The record carries i16 ids and is written with 16-byte stores (lease_layout.h).
+    RuntimeCheck(experts <= kRecIdMax, "experts: a demand record carries expert ids up to ", kRecIdMax);
+    RuntimeCheck(row_capacity <= kRecIdMax, "row_capacity: a demand record carries slots up to ", kRecIdMax);
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(page.data_ptr()) % 16 == 0, "page: must be 16-byte aligned for the record's stores");
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
     auto on_host = SymbolicDevice{};

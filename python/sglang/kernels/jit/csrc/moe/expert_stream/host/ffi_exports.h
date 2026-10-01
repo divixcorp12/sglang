@@ -182,6 +182,15 @@ struct HostExports {
       TensorView lease,
       TensorView hot_page) {
     using namespace host;
+    // Records and map deltas carry expert ids and slots as i16 (lease_layout.h).
+    RuntimeCheck(starts.dim() == 2 && starts.size(1) <= kRecIdMax, "starts: records carry expert ids up to ", kRecIdMax);
+    auto capacity_mem = SymbolicDevice{};
+    verify_named(
+        "capacity", TensorMatcher({starts.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(capacity_mem), capacity);
+    for (int64_t row = 0; row < capacity.size(0); ++row)
+      RuntimeCheck(
+          static_cast<const int64_t*>(capacity.data_ptr())[row] <= kRecIdMax, "capacity: records carry slots up to ",
+          kRecIdMax);
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     // page, slot_map and lease are pinned (or not) together (ExpertStreamHost.__init__), so one SymbolicDevice
     // ties them to the same actual device; capacity is always a plain CPU tensor. hot_page is optional (an

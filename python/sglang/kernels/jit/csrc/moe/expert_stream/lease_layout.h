@@ -30,6 +30,7 @@ constexpr int64_t kLaneSlot = 4;          // i32: the RAM slot of a hit, the sta
 constexpr int64_t kLaneDst = 8;           // i32: the VRAM destination slot
 constexpr int64_t kLaneWeight = 12;       // f32: the lane expert's routing weight
 constexpr int64_t kRecKinds = 192;        // u8[kMaxIds]: kKind*
+constexpr int64_t kRecIdMax = 32767;      // the largest expert, slot or destination an i16 field carries
 constexpr int64_t kPageBytes = kDemandRing + kDemandRecords * kRecordBytes;
 // Lane kinds (ram_slot_map.LaneKind): what moves the bytes, and what the device waits on.
 constexpr uint32_t kKindHitCopy = 1;  // the copy thread's DMA; CopyDone

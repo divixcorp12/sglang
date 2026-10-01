@@ -173,6 +173,7 @@ PYTHON_WIRE = {
     "kLaneDst": ram_miss.LANE_FIELDS["dst"],
     "kLaneWeight": ram_miss.LANE_FIELDS["weight"],
     "kRecKinds": ram_miss.RECORD_FIELDS["kinds"],
+    "kRecIdMax": ram_miss.RECORD_ID_MAX,
     "kPageBytes": PAGE_BYTES,
     "kKindHitCopy": LaneKind.HIT_COPY,
     "kKindHitSm": LaneKind.HIT_SM,
