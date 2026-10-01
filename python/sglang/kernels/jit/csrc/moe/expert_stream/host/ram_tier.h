@@ -437,6 +437,7 @@ class RamTier {
     const size_t bytes = hot_scratch_.size();
     std::memcpy(hot_scratch_.data(), record + kHotHeaderBytes, bytes);
     std::atomic_thread_fence(std::memory_order_acquire);
+    asm volatile("" ::: "memory");  // the copy's plain loads must stay before the seq re-check
     if (load_acquire(record) != expected) return false;
     if (experts_ % 8 != 0 && (hot_scratch_[bytes - 1] & static_cast<uint8_t>(~((1u << (experts_ % 8)) - 1u))) != 0)
       return false;

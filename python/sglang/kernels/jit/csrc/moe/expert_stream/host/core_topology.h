@@ -23,8 +23,13 @@ inline std::vector<int> core_siblings(int core) {
   std::stringstream items(list);
   for (std::string item; std::getline(items, item, ',');) {
     const size_t dash = item.find('-');
-    const int first = std::stoi(item.substr(0, dash));
-    const int last = dash == std::string::npos ? first : std::stoi(item.substr(dash + 1));
+    int first, last;
+    try {
+      first = std::stoi(item.substr(0, dash));
+      last = dash == std::string::npos ? first : std::stoi(item.substr(dash + 1));
+    } catch (const std::exception&) {
+      throw std::runtime_error("cannot parse the SMT siblings of core " + std::to_string(core) + ": '" + list + "'");
+    }
     for (int c = first; c <= last; ++c)
       cores.push_back(c);
   }
