@@ -1165,6 +1165,12 @@ class ExpertHotCacheManager:
         scratch_rows = {
             layer_id: 0 if direct else rows for layer_id, rows in gather_rows.items()
         }
+        # The tiers fill in the loop below, before enable_graph_gather: a format that stages per post learns the
+        # gather width now.
+        for layer_id, rows in gather_rows.items():
+            plan = getattr(streamers[layer_id].format, "plan_graph_gather", None)
+            if rows and plan is not None:
+                plan(streamers[layer_id], rows)
         selected = {layer_id: [] for layer_id in streamers}
         pull_row_enabled = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
         allocated_layers = {layer_id for layer_id, rows in gather_rows.items() if rows and not direct}

@@ -199,6 +199,18 @@ class Exl3ExpertFormat:
             )
         return options
 
+    def plan_graph_gather(self, streamer, rows: int) -> None:
+        """The layer's graph gather misses up to ``rows`` ids per post; called before the first tier fill, when the
+        RAM-miss service reserves its staging slots."""
+        from sglang.srt.layers.moe.exl3_ram_miss import (
+            Exl3RamMissService,
+            NativePinnedSlotTable,
+        )
+
+        tier = getattr(streamer, "pinned_host_cache", None)
+        if isinstance(getattr(tier, "_lru", None), NativePinnedSlotTable):
+            Exl3RamMissService.get().plan_gather_width(rows)
+
     def attach_hot_cache_manager(self, manager, streamer) -> None:
         """Option C hooks (fail-stop check, residency pushes, the RAM-miss row backend),
         for a layer whose pinned tier runs on the native slot table."""

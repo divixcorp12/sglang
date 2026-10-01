@@ -573,8 +573,10 @@ class Exl3RamMissService:
         self._cpu_log_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
-        # Staging slots per row, reserved at start: one per lane a post can miss (MAX_IDS), fewer on a small tier.
+        # Staging slots per row, reserved at start: one per lane a post can miss, fewer on a small tier. MAX_IDS until
+        # plan_gather_width says how wide the graph gather is.
         self.staging_slots = MAX_IDS
+        self._gather_planned = None
         self._copy_armed = False
         self._copy_decodes = 0
         self.copy_engine_module_loads = 0  # Triton loads that drained the device first
@@ -590,6 +592,15 @@ class Exl3RamMissService:
         if self.host is not None:
             raise RuntimeError("exl3 RAM miss: a pinned tier was built after the service started")
         self.tables[layer_id] = table
+
+    def plan_gather_width(self, rows: int) -> None:
+        """A layer's graph gather misses up to ``rows`` ids per post: reserve that many staging slots (at most MAX_IDS,
+        the post kernel's lane count; the widest layer wins). Before the service starts."""
+        if self.host is not None:
+            raise RuntimeError("exl3 RAM miss: the graph gather width was planned after the service started")
+        planned = max(1, min(int(rows), MAX_IDS))
+        self.staging_slots = planned if self._gather_planned is None else max(self._gather_planned, planned)
+        self._gather_planned = self.staging_slots
 
     def row_of(self, layer_id: int) -> int:
         return self._rows[layer_id]
@@ -652,7 +663,7 @@ class Exl3RamMissService:
         try:
             from sglang.srt.layers.moe.exl3_stream_trace import get_exl3_stream_trace
 
-            # Before any slot is filled, and before graph_gather_rows is known (the hot cache fills the tiers first).
+            # Before any slot is filled: the hot cache fills the tiers first, after plan_gather_width.
             host.reserve_staging(self.staging_slots)
             copy_engine = cfg.enable_ram_miss_copy_engine
             check_sm_small_copies(cfg)
