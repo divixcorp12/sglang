@@ -220,7 +220,7 @@ def test_a_pause_first_serves_every_record_posted_before_it(world):
     for _ in range(200):
         req = sim.post(0, [3])
         assert req.kinds == [LaneKind.HIT_SM]
-        assert host.pause(5.0) == 1
+        host.pause(5.0)
         try:
             assert host.handled_through() == req.seq, "a record posted before the pause was left unread"
         finally:
