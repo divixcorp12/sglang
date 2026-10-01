@@ -256,6 +256,10 @@ class ChainSim:
             time.sleep(20e-6)
         return True
 
+    def close_copy_gate(self, req: SimRequest) -> None:
+        """CW's close of the gate for a request with host lanes, without waiting."""
+        self._set_gate(lease.gate_word(req.seq, "closed"))
+
     def needs_copy_wait(self, req: SimRequest) -> bool:
         return any(k in (LaneKind.HIT_COPY, LaneKind.HIT_CPU, LaneKind.MISS_CPU) for k in req.kinds)
 
