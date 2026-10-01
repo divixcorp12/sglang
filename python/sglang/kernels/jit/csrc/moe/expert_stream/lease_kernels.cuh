@@ -108,14 +108,19 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     if (count > kLeaseLanes || count > p.lanes) __trap();  // the record and the plan's buffers hold no more
     any_cpu = 0;
     if (count > 0) {
-      int32_t* ram_slot_row = p.ram_slot + p.row * p.experts;
-      int32_t* staging_row = p.staging + p.row * kLeaseLanes;
-      apply_map_delta(
-          p.lease + kDeltaBase + p.row * kDeltaStride, ram_slot_row, staging_row, p.map_chain, p.map_applied, p.row,
-          p.experts, p.row_capacity, deadline);
+      const RowMap map{
+          .ram_slot = p.ram_slot + p.row * p.experts,
+          .staging = p.staging + p.row * kLeaseLanes,
+          .map_chain = p.map_chain + p.row,
+          .map_applied = p.map_applied + p.row,
+          .experts = p.experts,
+          .row_capacity = p.row_capacity,
+      };
+      const uint8_t* delta = p.lease + kDeltaBase + p.row * kDeltaStride;
+      if (await_map_delta(delta, map, deadline)) apply_map_delta(load_map_delta(delta), map);
       const bool host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + kCopyArmed) == 1u;
       type_lanes(
-          p.planned, count, p.experts, ram_slot_row, staging_row, p.lease + kSplit, host_lanes, p.hit_copy_ce != 0,
+          p.planned, count, p.experts, map.ram_slot, map.staging, p.lease + kSplit, host_lanes, p.hit_copy_ce != 0,
           p.cpu_on != 0, p.cpu_misses != 0, p.ce_ok[p.row] != 0, p.cpu_ok[p.row] != 0, p.dst_slots, p.dst_rows[p.row],
           p.row_capacity, typed);
       for (int64_t j = 0; j < count; ++j)
@@ -230,9 +235,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     const uint8_t* delta = p.lease + kDeltaBase + row * kDeltaStride;
     // Published or not: the paused host has written every delta it owes, so nothing is waited for here.
     if (ld_acquire_sys64(delta + kDeltaTag) != static_cast<uint64_t>(p.map_chain[row])) continue;
-    apply_map_delta(
-        delta, p.ram_slot + row * p.experts, p.staging + row * kLeaseLanes, p.map_chain, p.map_applied, row,
-        p.experts, static_cast<uint32_t>(p.row_capacity[row]), global_ns());
+    const RowMap map{
+        .ram_slot = p.ram_slot + row * p.experts,
+        .staging = p.staging + row * kLeaseLanes,
+        .map_chain = p.map_chain + row,
+        .map_applied = p.map_applied + row,
+        .experts = p.experts,
+        .row_capacity = static_cast<uint32_t>(p.row_capacity[row]),
+    };
+    if (await_map_delta(delta, map, global_ns())) apply_map_delta(load_map_delta(delta), map);
   }
   for (int64_t i = 0; i < p.entry_count; ++i) {
     const int32_t row = p.entries[3 * i];

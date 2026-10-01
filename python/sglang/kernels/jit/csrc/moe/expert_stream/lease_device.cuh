@@ -62,6 +62,12 @@ SGL_DEVICE void st_relaxed_sys_v4(uint8_t* address, uint32_t x, uint32_t y, uint
   asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(address), "r"(x), "r"(y), "r"(z), "r"(w) : "memory");
 }
 
+SGL_DEVICE uint4 ld_relaxed_sys_v4(const uint8_t* address) {
+  uint4 v;
+  asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(address) : "memory");
+  return v;
+}
+
 constexpr uint64_t kGenerationMask = (1ull << 56) - 1;
 
 // The copy wait's gate word for request `seq`: `low` is kLeaseGateClosed or kLeaseGateOpen.
@@ -201,29 +207,85 @@ SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& 
   st_release_sys(record + kRecSeq, seq);
 }
 
-// The row's pending map delta (lease_layout.h, the delta block): wait, bounded by `deadline`, until the host has
-// published the delta that follows the row's last map chain, then apply it once. The host publishes a chain's delta
-// before it reads that chain's misses, so the wait is taken only when the host fell a whole token behind.
-SGL_DEVICE void apply_map_delta(
-    const uint8_t* delta, int32_t* ram_slot_row, int32_t* staging_row, int64_t* map_chain, int64_t* map_applied,
-    int64_t row, int64_t experts, uint32_t row_capacity, uint64_t deadline) {
-  const uint64_t want = static_cast<uint64_t>(map_chain[row]);
+// One row of the device's map bank (ExpertStreamDevice.map_bank), device memory.
+struct RowMap {
+  int32_t* ram_slot;     // [experts]: the expert's RAM slot, -1 when not resident
+  int32_t* staging;      // [kLeaseLanes]: the row's staging slots
+  int64_t* map_chain;    // the row's chain word
+  int64_t* map_applied;  // the chain number of the row's last applied delta
+  int64_t experts;
+  uint32_t row_capacity;
+};
+
+// A row's map delta in registers: load_map_delta issues every load before it uses any, so their round trips overlap.
+struct MapDelta {
+  uint32_t count;
+  int32_t staging[kLeaseLanes];
+  int32_t expert[kDeltaMaxEntries];
+  int32_t slot[kDeltaMaxEntries];
+};
+
+// Waits, bounded by `deadline`, until the host has published the delta that follows the row's last map chain; true
+// when it is not applied yet. The host publishes a chain's delta before it reads that chain's misses, so the wait is
+// taken only when the host fell a whole token behind.
+SGL_DEVICE bool await_map_delta(const uint8_t* delta, const RowMap& map, uint64_t deadline) {
+  const uint64_t want = static_cast<uint64_t>(*map.map_chain);
   while (ld_acquire_sys64(delta + kDeltaTag) != want) {
     if (static_cast<int64_t>(global_ns() - deadline) >= 0) __trap();  // the host never published it
     __nanosleep(256);
   }
-  if (static_cast<uint64_t>(map_applied[row]) == want) return;
-  const uint32_t n = ld_relaxed_sys<uint32_t>(delta + kDeltaCount);
-  if (n > static_cast<uint32_t>(kDeltaMaxEntries)) __trap();
-  for (uint32_t i = 0; i < n; ++i) {
-    const int32_t expert = ld_relaxed_sys<int32_t>(delta + kDeltaEntries + 8 * i);
-    const int32_t slot = ld_relaxed_sys<int32_t>(delta + kDeltaEntries + 8 * i + 4);
-    if (expert < 0 || expert >= experts || slot < -1 || slot >= static_cast<int32_t>(row_capacity)) __trap();
-    ram_slot_row[expert] = slot;
+  return static_cast<uint64_t>(*map.map_applied) != want;
+}
+
+// The delta's payload; only after await_map_delta's acquire of its tag.
+SGL_DEVICE MapDelta load_map_delta(const uint8_t* delta) {
+  static_assert(kDeltaStaging % 16 == 0 && kDeltaEntries % 16 == 0, "16-byte delta loads");
+  static_assert(kLeaseLanes % 4 == 0 && kDeltaMaxEntries % 2 == 0, "whole 16-byte loads");
+  constexpr int kStagingLoads = kLeaseLanes / 4;
+  constexpr int kEntryLoads = kDeltaMaxEntries / 2;  // {expert, slot} pairs, two a load
+  uint4 v[kStagingLoads + kEntryLoads];
+  MapDelta d;
+  d.count = ld_relaxed_sys<uint32_t>(delta + kDeltaCount);
+#pragma unroll
+  for (int i = 0; i < kStagingLoads; ++i)
+    v[i] = ld_relaxed_sys_v4(delta + kDeltaStaging + 16 * i);
+#pragma unroll
+  for (int i = 0; i < kEntryLoads; ++i)
+    v[kStagingLoads + i] = ld_relaxed_sys_v4(delta + kDeltaEntries + 16 * i);
+#pragma unroll
+  for (int i = 0; i < kStagingLoads; ++i) {
+    d.staging[4 * i] = static_cast<int32_t>(v[i].x);
+    d.staging[4 * i + 1] = static_cast<int32_t>(v[i].y);
+    d.staging[4 * i + 2] = static_cast<int32_t>(v[i].z);
+    d.staging[4 * i + 3] = static_cast<int32_t>(v[i].w);
   }
+#pragma unroll
+  for (int i = 0; i < kEntryLoads; ++i) {
+    const uint4 e = v[kStagingLoads + i];
+    d.expert[2 * i] = static_cast<int32_t>(e.x);
+    d.slot[2 * i] = static_cast<int32_t>(e.y);
+    d.expert[2 * i + 1] = static_cast<int32_t>(e.z);
+    d.slot[2 * i + 1] = static_cast<int32_t>(e.w);
+  }
+  return d;
+}
+
+// Validates a loaded delta and applies it to the row once: map_applied takes the row's chain number.
+SGL_DEVICE void apply_map_delta(const MapDelta& d, const RowMap& map) {
+  if (d.count > static_cast<uint32_t>(kDeltaMaxEntries)) __trap();
+#pragma unroll
+  for (int i = 0; i < kDeltaMaxEntries; ++i) {
+    if (static_cast<uint32_t>(i) < d.count) {
+      const int32_t expert = d.expert[i];
+      const int32_t slot = d.slot[i];
+      if (expert < 0 || expert >= map.experts || slot < -1 || slot >= static_cast<int32_t>(map.row_capacity)) __trap();
+      map.ram_slot[expert] = slot;
+    }
+  }
+#pragma unroll
   for (int k = 0; k < kLeaseLanes; ++k)
-    staging_row[k] = ld_relaxed_sys<int32_t>(delta + kDeltaStaging + 4 * k);
-  map_applied[row] = static_cast<int64_t>(want);
+    map.staging[k] = d.staging[k];
+  *map.map_applied = *map.map_chain;
 }
 
 // ram_slot_map.type_lanes, transcribed: each lane's kind and source slot. A hit takes its RAM slot, the m-th miss
