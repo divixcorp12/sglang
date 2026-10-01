@@ -122,7 +122,11 @@ def test_eager_use_with_no_device_side_keeps_no_bulk_delta(tiers):
             for expert in range(EXPERTS):
                 service.host.assign(row, expert)
         service.after_host_use()
-    assert service.host.bulk_delta_count() == 0
+    service.host.pause(5.0)
+    try:
+        assert service.host.take_bulk_delta().numel() == 0
+    finally:
+        service.host.resume()
 
 
 def test_cpu_experts_refuse_a_manager_without_direct_residency(tiers):
