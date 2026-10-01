@@ -19,12 +19,12 @@ from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_lease_sim import LeaseSim
+from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images, write_row_images
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
-LAYERS, EXPERTS, CAPACITY = 2, 6, 3
+LAYERS, EXPERTS, CAPACITY = 2, 6, 4  # one slot per row is staging once a demand attaches it (_sim)
 
 
 @pytest.fixture(autouse=True)
@@ -38,8 +38,8 @@ def hang_guard():
 
 @pytest.fixture
 def tiers(tmp_path, monkeypatch):
-    """The service reads row images with O_DIRECT (service_row_images), as in production; leases are on, which the
-    images need, so a demand is posted as the device posts it (_demand)."""
+    """The service reads row images with O_DIRECT (service_row_images), as in production; a demand is posted as the
+    device posts it (_demand)."""
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None
@@ -69,17 +69,27 @@ def _holds(host, row, expert):
     return expert in host.slot_to_expert(row)
 
 
+def _sim(service):
+    """The device stand-in for this service: every row attached with one staging slot, as attach() would."""
+    sim = getattr(service, "_test_sim", None)
+    if sim is None:
+        for row in range(service.host.layers):
+            service.host.attach_row(row, 1)
+        sim = service._test_sim = ChainSim(service.host, service.page, {})
+    return sim
+
+
 def _demand(service, row, experts):
-    """One armed demand for ``experts`` of ``row`` as the device posts it (its lane request with it), served, then
-    its Done, which retires its leases, so its rows are evictable again."""
-    sim = LeaseSim(service.host, service.page, {})
+    """One demand for ``experts`` of ``row`` as the device posts it, after the eager changes reached the device's map
+    (taken while paused, as after_host_use's bulk apply does), served."""
+    sim = _sim(service)
+    service.before_host_use()
+    try:
+        sim.sync_bulk()
+    finally:
+        service.after_host_use()
     req = sim.post(row, experts)
-    assert sim.wait(req, timeout_s=10.0).served
-    sim.done(req)
-    deadline = time.perf_counter() + 10.0
-    while any(info[2] for info in service.host.slot_info(row)):
-        assert time.perf_counter() < deadline, "the leases were never retired"
-        time.sleep(0.002)
+    assert sim.wait_served(req, timeout_s=10.0) and sim.wait_handled(req, timeout_s=10.0)
 
 
 def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
@@ -207,7 +217,7 @@ def test_gpu_hot_snapshot_handoff_keeps_seed_protection_then_uses_device_map(tie
     try:
         for expert in (0, 1, 2):
             service.host.assign(service.row_of(0), expert)
-        assert service.host.victim_census(service.row_of(0)) == (0, 2, 0)
+        assert service.host.victim_census(service.row_of(0)) == (0, 2)
     finally:
         table.after_host_use(caches[0])
 
@@ -222,7 +232,7 @@ def test_gpu_hot_snapshot_handoff_keeps_seed_protection_then_uses_device_map(tie
     table.before_host_use(caches[0])
     try:
         assert service.hot_experts(0) == [2]
-        assert service.host.victim_census(service.row_of(0)) == (0, 2, 0)
+        assert service.host.victim_census(service.row_of(0)) == (0, 2)
         slot, evicted = service.host.assign(service.row_of(0), 3, protected_fallback=False)
         assert evicted == 0 and slot >= 0 and service.host.contains(service.row_of(0), 2)
     finally:

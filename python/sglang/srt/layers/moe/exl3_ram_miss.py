@@ -838,6 +838,8 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
+        # The row's staging slots: one per lane a post can miss (LEASE_PROTOCOL.md).
+        self.host.attach_row(row, max(1, streamer.graph_gather_rows))
         if self.route_log is not None:
             self.route_log.bind(row, streamer.layer_id, cache.capacity)
         previous = streamer.row_backend
