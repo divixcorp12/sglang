@@ -6357,7 +6357,8 @@ EXIT read from pytest):
 Branch `dsv41-device-slot-map` from `59cfb07c99`. Plan: `docs/superpowers/plans/2026-09-30-dsv41-device-slot-map.md`
 (Revision 1 is binding); ledger of rulings: `.superpowers/sdd/2026-09-30-dsv41-device-slot-map/progress.md`
 (untracked; the rulings exist only there and in the branch's final summary). The protocol as built: `analysis/dsv41-drive/LEASE_PROTOCOL.md`,
-which supersedes §30.5's lease description. Not merged; nothing below has run in a server.
+which supersedes §30.5's lease description. Merged to master as `27a6195235` (2026-09-30); §31.5 covers the
+host simplifications after the merge. Nothing in §31 has run in a server.
 
 ### 31.1 What changed
 
@@ -6367,7 +6368,8 @@ which supersedes §30.5's lease description. Not merged; nothing below has run i
 - **No leases.** RowResult, W1 (the hit wait), Done, the lease counters, deferral and acknowledgements are gone. A RAM
   hit is copied the moment the post types it; the host only checks the lane. Safety comes from victims being chosen at
   record time, never among the record's routes, and from one record in flight (LEASE_PROTOCOL.md, "Why it is safe").
-- **Staging slots.** Attach reserves K = min(`graph_gather_rows`, capacity - 1) slots per row. A miss reads into a
+- **Staging slots.** Each row reserves K = min(gather width, capacity - 1) slots (at service start since §31.5;
+  the branch reserved them at attach). A miss reads into a
   staging slot, which becomes the expert's RAM slot; its victim becomes staging (a swap, not a copy). With no victim the
   RAM insert is skipped and the miss is still served.
 - **CPU experts take misses too** with `SGLANG_DSV41_CPU_EXPERTS_MISSES=1` (default off): the miss is read into
@@ -6446,6 +6448,49 @@ status read.
    the merge base: shutdown runs its barrier before admission closes, by design, so a chain waiting on a paused
    service waits for its deadline. The test predates that design.
 6. **The "Lease Chain Map" artifact** still shows the lease protocol.
+7. **The served runs are deferred on purpose** (2026-10-01): an optimized exllamav3 CPU-expert function is in progress,
+   and the A/B (master vs before, `RAM_HIT_COPY` ce/sm, `CPU_EXPERTS_MISSES` on/off, CPU experts on cores 18-29 as in
+   P2) and the E31 gate wait for it.
+8. **No ThreadSanitizer run** after §31.5's queue removal (`test_expert_stream_hotpath_tsan.py` is manual).
+
+### 31.5 After the merge: the host tier simplified (2026-10-01, `6cf91a8e17`..`d3228133a0`)
+
+Each step on master, test-first, CPU and GPU suites on divix01 before the push.
+
+- **`kLoading` is gone** (`6cf91a8e17`). A miss's slot stays `kStaging` during its read and is mapped and made `kReady`
+  when the bytes land; the service owns the tier for the whole read, so nothing else could observe the state.
+  `release()` loses its "while it is loading" refusal; the other states keep their numbers (0 FREE, 2 READY, 3 STAGING).
+  `serve_record` walks the routed experts once, and `touch_request` shares its stamping.
+- **Comments condensed** in `ram_tier.h` and `ram_thread.h` (`a53a3534fa`): plan and task citations dropped, the
+  `RamThread` preamble split so each fact sits at the function it constrains. No code change.
+- **Staging reserved by the host at start** (`70fd826fe6`, `7a77475a20`). `RamTier::reserve_staging(k)` takes the first
+  K FREE slots of every row and publishes the tag-1 delta before any slot is filled, so nothing is evicted. `from_model`
+  hands the graph-gather width to the service (`plan_gather_width`, widest layer, at most `MAX_IDS`) before the startup
+  `reassign` starts it; 8 when graph gather is off. Gone: `attach_row`, its pause, eviction at attach and the hot-slot
+  fallback (`take_hot`).
+- **DIRECT residency required** (`d833748d7c`). The RAM-miss service refuses at attach, and the launch gate refuses,
+  unless `SGLANG_MOE_GPU_RESIDENCY_UPDATE=1` and `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2` (the arm recipe sets both).
+  Gone: the `on_residency` listener, `enable_gpu_hot`/`set_gpu_hot` and the C++ hot-mode switch; a record's hot bitmap
+  is applied whenever a hot page is given. The residency-listener machinery in `expert_hot_cache.py`
+  (`add_residency_listener`, `_notify_residency_listeners`) had no other caller and is gone too (`7b444830c8`).
+- **The hot set is still pushed from Python at each pause.** Moving it into C++ was dropped: the post writes the
+  record's hot bitmap before the same gather's `commit_gather` rewrites `slot_to_expert` (`lease_kernels.cuh:144-156`,
+  `expert_residency_gpu.py:1001`), so the last record's bitmap can miss that gather's inserts, and a fresh copy needs
+  either a device read at pause or a per-step cost.
+- **`expert_to_slot` from the published map** (`2b45888b89`). `NativePinnedSlotTable.expert_to_slot` is built from the
+  lock-free `mapping()` (version-cached); no reader used `lru_order`'s order. `slot_to_expert` is its inverse.
+- **No command queue** (`d1b1ef8670`). Every Python entry point that touches the tier now needs the service paused
+  (`require_owner`): `assign`, `release`, `contains`, `touch`, `fill_begin`, `reserve_staging`, `take_bulk_delta`, `set_hot` and the snapshots
+  (`slot_info`, `victim_census`, `lru_order`, `slot_to_expert`); everything else reads lock-free (`mapping`, `version`,
+  `handled_through`, counters). Gone: the command ring, `run_as_owner`, the drains, mid-read snapshot answering and the
+  stop path's drain. The service loop serves records, parks on pause (after serving every posted record) and sleeps
+  when idle. The one-time hot seed at attach runs paused. The watchdog stays: it is the only bound on the copy wait
+  (`cuStreamWaitValue32` has no timeout) and on a stop that joins a service hung in a read.
+- **Size:** `ram_tier.h` 1738 -> 1525 lines, `ram_thread.h` 250 -> 232.
+- **Suites at the end** (`d3228133a0` and its parent; commands as in §31.3 with `-k "ram_miss or ram_slot or tier or
+  lease or copy_engine or cpu_experts or expert_stream"` for the kernels): CPU kernels 674 -> 673 passed (the queued
+  `set_hot` burst test deleted), the layers/moe RAM-miss, host-tier, format and gate files 195 -> 201, the hot-cache
+  and residency files 28 -> 25 (three listener tests deleted); GPU (the §31.3 manual files) 56 passed before and after.
 
 
 ## Sources
