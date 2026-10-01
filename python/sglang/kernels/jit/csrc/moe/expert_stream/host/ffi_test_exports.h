@@ -574,7 +574,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         auto cpu = SymbolicDevice{};
         expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
       }
-      alignas(64) uint8_t record[kRecordBytes] = {};
+      alignas(128) uint8_t record[kRecordBytes] = {};
       std::atomic<bool> done{false};
       const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
       std::thread writer([&] {

@@ -31,8 +31,9 @@ constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/ex
 
 Two pinned host areas, both read by the device through UVA.
 
-**Request page** (4160 B, `kPageBytes`): `demand_head` @0 (the last posted seq, stored with a release) and a 16-record
-ring @64, 256 B a record. A record, behind a seqlock on `seq`:
+**Request page** (2176 B, `kPageBytes`): `demand_head` @0 (the last posted seq, stored with a release) and a 16-record
+ring @128, 128 B a record. A record is one 128-byte-aligned block, so the host's L2 fetches its second line with its
+first. A record, behind a seqlock on `seq`:
 
 | Offset | Field | |
 |---|---|---|
@@ -50,7 +51,7 @@ ring @64, 256 B a record. A record, behind a seqlock on `seq`:
 | 96 | `lane_weight` f32[8] | the lane expert's routing weight |
 
 Ids are i16, so a launch with more than 32767 experts or slots per row is refused (`kRecIdMax`). The post writes the
-payload between the two seq stores as one u32, one 8-byte and seven 16-byte relaxed stores; a page off 16-byte
+payload between the two seq stores as one u32, one 8-byte and seven 16-byte relaxed stores; a page off 128-byte
 alignment is refused at the post's launch.
 
 Lane kinds: `HIT_COPY`=1 (the copy thread's DMA; CopyDone), `HIT_SM`=2 (C1; stream order), `HIT_CPU`=3 (the CPU from the

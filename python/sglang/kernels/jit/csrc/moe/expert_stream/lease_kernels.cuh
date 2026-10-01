@@ -314,8 +314,8 @@ struct LeaseProtocolKernel {
     // The record carries i16 ids and is written with 16-byte stores (lease_layout.h).
     RuntimeCheck(experts <= kRecIdMax, "experts: a demand record carries expert ids up to ", kRecIdMax);
     RuntimeCheck(row_capacity <= kRecIdMax, "row_capacity: a demand record carries slots up to ", kRecIdMax);
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(page.data_ptr()) % 16 == 0, "page: must be 16-byte aligned for the record's stores");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(page.data_ptr()) % 128 == 0,
+                 "page: must be 128-byte aligned, so each record's two cache lines are one prefetch pair (128-byte block)");
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
     auto on_host = SymbolicDevice{};

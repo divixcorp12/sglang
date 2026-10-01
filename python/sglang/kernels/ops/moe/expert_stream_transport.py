@@ -681,9 +681,9 @@ def stage_records(words: torch.Tensor) -> list[dict]:
 # The request page (lease_layout.h): demand_head, then kDemandRecords records of RECORD_FIELDS. A record's MAX_IDS
 # lanes are one i16 array per id and an f32 weight array; "counts" holds lanes (bits 0-3) and protect ids (bits 4-7),
 # and "kinds" a ram_slot_map.LaneKind nibble per lane.
-PAGE_BYTES = 4160
-RECORD_BYTES = 256
-DEMAND_RING = 64
+PAGE_BYTES = 2176
+RECORD_BYTES = 128
+DEMAND_RING = 128
 DEMAND_RECORDS = 16
 RECORD_FIELDS = {
     "seq": 0, "row": 4, "counts": 6, "flags": 7, "chain": 8, "epoch": 16, "kinds": 20,
