@@ -357,6 +357,24 @@ struct HostExports {
   }
 
   // CPU experts: split int64 [kLeaseLanes + 1], a new split table, at any time.
+  // Row `row`'s K staging slots and its tag-1 map delta (LEASE_PROTOCOL.md). Once per row.
+  static void attach_row(int64_t handle, int64_t row, int64_t k) {
+    find(handle)->attach_row(row, k);
+  }
+
+  // The eager paths' map changes since the last call: bulk_delta_count, then take_bulk_delta into int32 [that, 3] of
+  // {row, expert, slot}. A paused caller only; the count call joins a running fill first, so its unmaps are counted.
+  static int64_t bulk_delta_count(int64_t handle) {
+    return find(handle)->bulk_delta_count();
+  }
+
+  static void take_bulk_delta(int64_t handle, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("out", TensorMatcher({-1, 3}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), out);
+    find(handle)->take_bulk_delta(static_cast<int32_t*>(out.data_ptr()), out.size(0));
+  }
+
   static void set_cpu_split(int64_t handle, TensorView split) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -584,6 +602,9 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_cpu_experts, Exports::enable_cpu_experts);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_attach_row, Exports::attach_row);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_bulk_delta_count, Exports::bulk_delta_count);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_take_bulk_delta, Exports::take_bulk_delta);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_mapping, Exports::mapping);                               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_to_expert, Exports::slot_to_expert);                 \

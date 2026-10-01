@@ -14,7 +14,6 @@ struct Tier {
   std::vector<uint64_t> stamp;
   std::vector<int32_t> expert_slot;  // assigned slot (LOADING or READY) or -1
   std::vector<uint8_t> hot;
-  std::vector<uint32_t> leases;  // GPU-reader leases per slot; 0 frees a slot for eviction
   std::vector<uint8_t> filling;      // a prefill fill is still writing this kReady slot: never a victim, never released
   // Prefill share (plan 2026-09-25-dsv41-prefill-eviction): 1 while a row a prefill admitted has not been used by
   // decode. `owned` counts them. Only take_admit_slot_locked sets it, so it stays all zero with the share off.
@@ -23,13 +22,16 @@ struct Tier {
   // Written by the owner's serve() only (a relaxed store through std::atomic_ref), read relaxed by layer_rows from
   // any thread.
   int64_t rows_demand = 0;
+  // The row's staging slots (kStaging, never mapped), in the order the device assigns them to miss lanes, and the
+  // map-chain number of the last delta published. 0: attach_row has not run, so the row serves no miss.
+  FixedVec<int32_t, kLeaseLanes> staging;
+  uint64_t chain = 0;
 };
 
 // What a request could take from a tier, counted without taking anything.
 struct VictimCensus {
   int64_t free = 0;       // FREE slots
-  int64_t evictable = 0;  // READY, not hot, not requested, not leased
-  int64_t leased = 0;     // as evictable, but leased: they would be victims if the leases retired
+  int64_t evictable = 0;  // READY, not hot, not requested, not filling
 };
 
 // The pinned-slot bookkeeping of every streamed layer (plan D12) and the service of one
@@ -41,7 +43,7 @@ class RamTier {
   using Layout = typename Source::LayoutType;
   using Build = typename Source::BuildType;  // ProdBuild or InstrBuild (build_policy.h)
   using Engine = CopyEngine<Build, RamTier>;
-  // The copy engine calls copy_completed, copy_acked and copy_failed, and reads stats_ for its latency max.
+  // The copy engine calls copy_completed and copy_failed, and reads stats_ for its latency max.
   friend Engine;
 
   RamTier(
@@ -73,7 +75,6 @@ class RamTier {
       tier.stamp.assign(tier.capacity, 0);
       tier.expert_slot.assign(experts_, -1);
       tier.hot.assign(experts_, 0);
-      tier.leases.assign(tier.capacity, 0);
       tier.filling.assign(tier.capacity, 0);
       tier.prefill_owned.assign(tier.capacity, 0);
     }
@@ -90,8 +91,8 @@ class RamTier {
     fill_packed_.reserve(static_cast<size_t>(widest));
   }
 
-  // The copy thread's callbacks use the lease block, copy_done_ and the counter blocks, which are destroyed before
-  // copy_engine_ would be.
+  // The copy thread's callbacks use the lease block and the counter blocks, which are destroyed before copy_engine_
+  // would be.
   ~RamTier() {
     fill_join();  // the fill thread reads through reader_ into the slabs; nothing else holds the tier by now
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
@@ -100,8 +101,7 @@ class RamTier {
 
   bool open() {
     if (!reader_.open()) return false;
-    next_demand_ = load_acquire(page_ + kDemandDone) + 1u;
-    if (next_demand_ == 0) next_demand_ = 1;
+    next_demand_ = skip_zero(load_acquire(page_ + kDemandHead) + 1u);
     return true;
   }
 
@@ -144,14 +144,13 @@ class RamTier {
   static constexpr int kMaxHotWords = 16;  // set_hot's bitmap: 1024 experts
 
   // A Python-side call for the tier's owner. A kSnapshot runs `snapshot` there and hands back its value through
-  // `result`; kInjectLease answers 0, or -1 for an underflow. `done` (the waiting caller's) becomes 1 once applied, 2
-  // if the owner's body threw: a command never throws on the service thread.
+  // `result`; kAttachRow answers 0. `done` (the waiting caller's) becomes 1 once applied, 2 if the owner's body threw:
+  // a command never throws on the service thread.
   struct Command {
-    enum Kind : uint8_t { kSetHot, kSnapshot, kInjectLease };
+    enum Kind : uint8_t { kSetHot, kSnapshot, kAttachRow };
     Kind kind = kSetHot;
-    int64_t row = 0;    // kSnapshot: the snapshot's own argument (lease_entry: the request slot)
-    int64_t arg = 0;    // kInjectLease: the slot
-    int64_t delta = 0;  // kInjectLease
+    int64_t row = 0;  // kSnapshot: the snapshot's own argument
+    int64_t arg = 0;  // kAttachRow: the staging slot count
     uint64_t hot[kMaxHotWords] = {};
     int64_t (*snapshot)(RamTier*, const Command&) = nullptr;
     int64_t* out = nullptr;
@@ -230,66 +229,45 @@ class RamTier {
     // acquire above made the caller's earlier push visible. The loop drains between requests too (RamThread::run).
     // Pump mode queues nothing (its caller owns the tier), so only the service thread looks.
     if (posted) drain_commands_on_service();
-    drain_copy_completions();  // D7: the COPYING leases the copy thread handed back, released before the pass below
-    retire_leases();           // first, so that an idle pump still retires
     if (admission_closed_.load()) return false;
     if (!posted) return false;
-    // A deferred demand is not looked at again until a lease retires: no stage record, no clock read per poll.
-    if (deferred_seq_ == next_demand_ && lease_changes_ == deferred_stamp_) return false;
     begin_stage(kStageDemand, next_demand_, head - next_demand_);
     if (head - next_demand_ >= kDemandRecords) {
-      // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq. Only unarmed records
-      // lap: the device posts an armed one only after the previous armed one's chain ended, which needs it served.
+      // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq. Only records nothing
+      // waits for lap: the device posts one with host work only after the previous one's chain ended.
       count<kOverruns>(head - next_demand_ - (kDemandRecords - 2));
       next_demand_ = skip_zero(head - kDemandRecords + 2u);
     }
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
     Request request;
-    // A torn record or lane request was overwritten by a later post, so nothing waits on it: skipped, and counted.
-    if (!read_record(record, next_demand_, &request) || (request.armed && !read_lane_request(next_demand_, &request))) {
+    // A torn record was overwritten by a later post, so nothing waits on it: skipped, and counted.
+    if (!read_record(record, next_demand_, &request)) {
       count<kOverruns>();
     } else {
-      if (gpu_hot_mode_.load() && request.armed) {
-        if (!(request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
-              load_acquire(record + kRecSeq) == next_demand_)) {
+      bool skip = false;
+      if (gpu_hot_mode_.load() && !request.lanes.empty()) {
+        if (request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
+            load_acquire(record + kRecSeq) == next_demand_) {
+          apply_gpu_hot(request);
+        } else if (request.host_work()) {
           fail_stop(error_prefix<Layout>() + "request " + std::to_string(next_demand_) + ": no hot set for it");
-        }
-        apply_gpu_hot(request);
-      }
-      const Defer reason = request.armed ? defers(request) : Defer::kNone;
-      if (reason != Defer::kNone) {
-        // Held back, not served: return before handle_demand (so the busy episode stays untouched, or the watchdog
-        // would count the wait as a hung read) and before the tail (no demand_done, no advance). No stage record is
-        // pushed; the first observation time is kept for the one written when it is served.
-        if (deferred_seq_ != next_demand_) {
-          deferred_seq_ = next_demand_;
-          if constexpr (Build::kMetrics) deferred_observed_ns_ = trace_.cur != nullptr ? trace_.cur->observed : 0;
-          if (reason == Defer::kRequestSlot) {
-            count<kDeferredReuse>();
-          } else {
-            count<kDeferred>();
-          }
-        }
-        deferred_stamp_ = lease_changes_;
-        if constexpr (Build::kMetrics) trace_.cur = nullptr;
-        return false;
-      }
-      if constexpr (Build::kMetrics) {
-        if (trace_.cur != nullptr && deferred_seq_ == next_demand_ && deferred_observed_ns_ != 0) {
-          trace_.cur->observed = deferred_observed_ns_;
+        } else {
+          // SM hits only: the device did not wait for this record, so a later post may have lapped its hot record.
+          count<kOverruns>();
+          skip = true;
         }
       }
-      handle_demand(request);
+      if (!skip) handle_record(request);
     }
-    deferred_seq_ = 0;
-    // demand_done says served, and nothing else: every path that could not serve an armed request aborted inside
-    // handle_demand, before this store. The sfence drains the service's non-temporal and write-combining stores (the
-    // reader's slab bytes) ahead of the release, which then publishes every RowResult and PieceMask of this request.
-    _mm_sfence();
-    store_release(page_ + kDemandDone, next_demand_);
     end_stage();
+    handled_.store(next_demand_, std::memory_order_release);
     next_demand_ = skip_zero(next_demand_ + 1u);
     return true;
+  }
+
+  // Any thread, lock-free: the last seq the service finished (ChainSim.wait_handled; a test's view).
+  uint32_t handled_through() const {
+    return handled_.load(std::memory_order_acquire);
   }
 
   // ---- Stage trace: one StageRecord per served request, drained by Python ----
@@ -344,7 +322,7 @@ class RamTier {
   //
   // caller_mutex_ serializes Python-side callers against each other only; the service, copy and fill threads never
   // take it. The tier has no other lock (Task 15): single ownership is what keeps its state consistent. The copy
-  // thread touches no tier state (Task 14: it hands its completions back through copy_done_), nor does the prefill
+  // thread touches no tier state (it publishes CopyDone and the gate only), nor does the prefill
   // fill thread (Task 15: it drives the reader and publishes fill_landed_/fill_state_; its epilogue runs on the owner,
   // finish_fill_owned, after the join).
 
@@ -399,9 +377,9 @@ class RamTier {
       throw std::runtime_error(
           error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is loading");
     }
-    if (leased_locked(tiers_[row], slot)) {
+    if (tiers_[row].state[slot] == kStaging) {
       throw std::runtime_error(
-          error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + " while it is leased");
+          error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + ": it is a staging slot");
     }
     if (tiers_[row].filling[slot]) {
       throw std::runtime_error(
@@ -414,7 +392,7 @@ class RamTier {
   // ---- Prefill fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS, plan 2026-09-25-dsv41-prefill-fills) ----
   //
   // An eager caller that holds the pause (or pumps, with no thread) claims slots for `experts` of `row` in order, until
-  // one cannot be taken (take_slot_locked: never a hot, leased or filling row, and a `protect`ed one only with
+  // one cannot be taken (take_slot_locked: never a hot, staging or filling row, and a `protect`ed one only with
   // `fallback`), and one helper thread reads the claimed rows through the service's reader while the caller gathers.
   // A claimed slot is kReady and mapped at once, as assign() leaves it, and flagged filling until the read ends: no
   // admission can evict it and release() refuses it. The read's progress publishes how many rows have landed, as a
@@ -639,18 +617,17 @@ class RamTier {
     copy_engine_->set_table(row, std::move(table), dst_rows);
   }
 
+  // The device reads kCopyArmed at every post and types copy-engine and CPU lanes only while it is 1.
   void arm_copy_engine(bool on) {
     if (on && copy_engine_ == nullptr)
       throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     copy_armed_.store(on, std::memory_order_release);
+    store_release(lease_ + kCopyArmed, on ? 1u : 0u);
   }
 
-  // CPU experts (plan 2026-09-29-dsv41-cpu-experts, "Step B").
-  // Of a copy-engine request's resident lanes, the grant publishes the last split[n] with tag kLeaseTagCpu,
-  // where n is those lanes, at most kLeaseLanes.
-  // The copy thread hands them to the CPU expert thread instead of copying them.
-  // Needs the copy engine; call before the service thread starts.
-  // Only a captured post (kLeaseLrFlagCaptured) gets CPU lanes: only it stages the layer's input row for them.
+  // CPU experts (plan 2026-09-29-dsv41-cpu-experts, "Step B"). The device types a captured post's CPU lanes: the
+  // last split[n] of its n eligible lanes (kSplit, which this and set_cpu_split write). The copy thread hands them to
+  // the CPU expert thread, so CopyDone covers them. Needs the copy engine; call before the service thread starts.
   void enable_cpu_experts(CpuExpertConfig config, std::vector<int64_t> split) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");
@@ -658,13 +635,7 @@ class RamTier {
       throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the copy engine, which completes their lanes");
     if (cpu_ != nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are already enabled");
     config.rows = layers_;
-    if (split.size() != static_cast<size_t>(kLeaseLanes) + 1)
-      throw std::runtime_error(error_prefix<Layout>() + "the CPU split table has one entry per n = 0..kLeaseLanes");
-    for (size_t n = 0; n < split.size(); ++n) {
-      if (split[n] < 0 || split[n] > static_cast<int64_t>(n))
-        throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
-      cpu_split_[n].store(static_cast<uint8_t>(split[n]), std::memory_order_relaxed);
-    }
+    store_split(split.data(), static_cast<int64_t>(split.size()));
     const std::string prefix = std::string(Layout::kName) + " CPU experts: ";
     auto engine = std::make_unique<CpuExpertEngine>(std::move(config), prefix, std::string(Layout::kName) + "-cpu-exp");
     engine->start();
@@ -679,16 +650,10 @@ class RamTier {
     cpu_->set_layer(row, handle);
   }
 
-  // CPU experts: replace the split table (P3's re-tuning between requests). Any time; the grant reads each entry once.
+  // CPU experts: replace the split table (P3's re-tuning). Any time; the device reads each entry once per post.
   void set_cpu_split(const int64_t* split, int64_t count) {
     if (cpu_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
-    if (count != static_cast<int64_t>(kLeaseLanes) + 1)
-      throw std::runtime_error(error_prefix<Layout>() + "the CPU split table has one entry per n = 0..kLeaseLanes");
-    for (int64_t n = 0; n < count; ++n)
-      if (split[n] < 0 || split[n] > n)
-        throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
-    for (int64_t n = 0; n < count; ++n)
-      cpu_split_[n].store(static_cast<uint8_t>(split[n]), std::memory_order_relaxed);
+    store_split(split, count);
   }
 
   // CPU experts' metrics, from the CPU expert thread: {jobs, lanes, forward ns}. Zeros when off.
@@ -698,44 +663,23 @@ class RamTier {
     out[2] = cpu_ != nullptr ? cpu_->compute_ns() : 0;
   }
 
-  // The owner (the service thread, the pausing caller, or the caller of pump()): release every lease the copy thread
-  // handed back, in completion order. Takes no lock: the copy thread touches no tier state (it only pushes), and
-  // every other writer of what this changes is the owner itself. An empty ring costs two loads (its own tail, relaxed;
-  // the producer's head, acquire) and no store.
-  void drain_copy_completions() {
-    CopyJob job;
-    while (copy_done_.pop(&job))
-      release_copied_owned(job);
-  }
-
   // The owner (RamThread::pause, once the service parked): every job handed to the copy thread has completed (or
-  // failed), then everything handed back is released here.
+  // failed). False at the deadline.
   bool wait_copy_idle_owned(int64_t deadline_ns) {
-    const bool idle = copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
-    drain_copy_completions();
-    return idle;
+    return copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
   }
 
-  // Any thread (the FFI's copy_engine_idle): the same wait, then the drain when this caller owns the tier (pump mode,
-  // or a paused service). With the service running unpaused it is the service's own next poll that releases (D7).
+  // Any thread (the FFI's copy_engine_idle): the same wait.
   bool wait_copy_idle(int64_t deadline_ns) {
-    const bool idle = copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
-    std::lock_guard<std::mutex> caller(caller_mutex_);
-    if (caller_owns()) drain_copy_completions();
-    return idle;
+    return copy_engine_ == nullptr || copy_engine_->wait_idle(deadline_ns);
   }
 
   // stop_thread's final settle, on the caller once the service joined (RamThread::stop released threaded_ after the
   // join, so this caller owns the tier). A stop that arrives mid-pause can find a prefill fill still running: it is
-  // joined first and its epilogue runs here (fill_join), so the fill thread's last write happens-before the drain and
-  // the settle pass, and they run with no other thread touching the tier. caller_mutex_ orders this against the
-  // pausing caller, which may still be in an owned call (or its own fill_end) on another thread: no tier lock, and
-  // no deadlock with a snapshot waiter, which saw threaded_ clear and needs nothing from this thread to finish.
+  // joined first and its epilogue runs here (fill_join). caller_mutex_ orders this against the pausing caller.
   void final_settle() {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     fill_join();
-    drain_copy_completions();
-    retire_leases();
   }
 
   void copy_engine_ballast(uint64_t dst, uint64_t src, int64_t bytes)
@@ -752,204 +696,47 @@ class RamTier {
   }
 
   // Shutdown, after the device was synchronised while the service still served (LEASE_PROTOCOL.md, "Shutdown"): no
-  // request is in flight, so the service only stops taking new ones. Retirement goes on.
+  // request is in flight, so the service only stops taking new ones.
   void close_admission() {
     admission_closed_.store(true);
   }
 
-  // The seqlock read of the device's lane request for `seq`: false when a later request has already overwritten it.
-  bool read_lane_request(uint32_t seq, Request* request) const {
-    const int64_t idx = static_cast<int64_t>((seq - 1u) % kDemandRecords);
-    const uint8_t* base = lease_ + kLeaseLaneRequest + idx * kLeaseLaneRequestBytes;
-    const uint64_t word = load_acquire64(base + kLeaseLrGen);
-    if ((word & 0xFFFFFFFFull) != seq) return false;
-    uint32_t count = 0, flags = 0;
-    std::memcpy(&count, base + kLeaseLrCount, 4);
-    std::memcpy(&flags, base + kLeaseLrFlags, 4);
-    int32_t experts[kLeaseLanes];
-    int32_t dst[kLeaseLanes];
-    float weights[kLeaseLanes];
-    std::memcpy(experts, base + kLeaseLrExpert, sizeof(experts));
-    std::memcpy(dst, base + kLeaseLrDst, sizeof(dst));
-    std::memcpy(weights, base + kLeaseLrWeight, sizeof(weights));
-    std::atomic_thread_fence(std::memory_order_acquire);
-    if (load_acquire64(base + kLeaseLrGen) != word || count > static_cast<uint32_t>(kLeaseLanes)) return false;
-    request->gen = word;
-    request->lane_experts.assign(experts, experts + count);
-    request->lane_dst.assign(dst, dst + count);
-    request->captured = (flags & kLeaseLrFlagCaptured) != 0;
-    request->lane_weight.assign(weights, weights + count);
-    return true;
+  // Row `row`'s K staging slots (LEASE_PROTOCOL.md): the first K free slots become kStaging, and the tag-1 delta
+  // names them, which the device's first post of the row applies. Once per row, before its first miss; a command
+  // (run_as_owner), so it may come while the service runs.
+  void attach_row(int64_t row, int64_t k) {
+    row_capacity(row);
+    if (k < 1 || k > kLeaseLanes)
+      throw std::runtime_error(error_prefix<Layout>() + "a row has 1.." + std::to_string(kLeaseLanes) + " staging slots");
+    Command c;
+    c.kind = Command::kAttachRow;
+    c.row = row;
+    c.arg = k;
+    int64_t result = 0;
+    c.result = &result;
+    run_as_owner(c);
   }
 
-  enum class Defer { kNone, kVictims, kRequestSlot };
-
-  // Would this armed demand have to wait for a lease to retire? Counts, changes nothing. The request slot rule: the
-  // slot's previous lease row must be fully retired before it is reused, since its RowResults and PieceMask words are
-  // rewritten. The victim rule: the tier could serve the request only if leased slots were victims (a dry run, because
-  // the take loop evicts a victim per call and keeps that eviction when the request then fails).
-  Defer defers(const Request& request) {
-    if (request.row < 0 || request.row >= layers_) return Defer::kNone;
-    if (!request.lane_experts.empty() && outstanding_[static_cast<int64_t>((request.seq - 1u) % kDemandRecords)].active) {
-      return Defer::kRequestSlot;
-    }
-    FixedVec<int32_t, kWanted> wanted;
-    for (std::span<const int32_t> ids : {request.protect.span(), request.lane_experts.span()}) {
-      for (int32_t expert : ids) {
-        if (expert >= 0 && expert < experts_ && !listed(wanted, expert)) wanted.push_back(expert);
-      }
-    }
-    const Tier& tier = tiers_[request.row];
-    int64_t missing = 0;
-    for (int32_t expert : wanted) {
-      if (tier.expert_slot[expert] < 0) ++missing;
-    }
-    if (missing == 0) return Defer::kNone;
-    const VictimCensus census = census_locked(request.row, wanted);
-    if (census.free + census.evictable < missing && census.free + census.evictable + census.leased >= missing) {
-      return Defer::kVictims;
-    }
-    return Defer::kNone;
+  // The eager paths' map changes since the last take, {row, expert, slot} each, slot -1 an unmap: the bulk delta
+  // map_bulk_apply writes on the device. The owner only (a paused caller). The count joins a running fill first, so a
+  // failed fill's unmaps are in it.
+  int64_t bulk_delta_count() {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("bulk_delta_count");
+    drain_commands();
+    fill_join();
+    return static_cast<int64_t>(bulk_.size());
   }
 
-  // A `_locked` suffix, here and below, means "the owner's": the tier has no mutex (Task 15).
-  //
-  // Open the ring entry for a request with its full lane count and every lane ungranted. defers() refused an entry
-  // still active, so this cannot fail.
-  void open_lease_entry_locked(const Request& request) {
-    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
-    Outstanding& entry = outstanding_[idx];
-    entry = Outstanding();
-    entry.active = true;
-    entry.gen = request.gen;
-    entry.row = request.row;
-    entry.count = static_cast<uint32_t>(request.lane_experts.size());
-  }
-
-  // Lease the source slot of every lane and publish its RowResult, in the reservation hold: after the take loop
-  // reserved the missing rows and before read(). A hit lane is published READY (or COPYING / CPU, for the copy
-  // engine), a miss lane LOADING into the slot `loading` reserved for it, so the device copies the hits while the read
-  // runs and each miss piece by piece as the read publishes it. The caller stored and fenced every miss lane's PieceMask
-  // word before (init_piece_words_locked), so the word carries G before any ready word of G is visible.
-  void grant_lanes_locked(const Request& request, std::span<const int64_t> loading) {
-    const size_t count = request.lane_experts.size();
-    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
-    Outstanding& entry = outstanding_[idx];
-    Tier& tier = tiers_[request.row];
-    int32_t slots[kLeaseLanes];
-    uint64_t tags[kLeaseLanes] = {};
-    const bool copy_request = copy_engine_ != nullptr && copy_armed_.load(std::memory_order_acquire) && request.captured;
-    CopyJob job;
-    for (size_t lane = 0; lane < count; ++lane) {
-      const int32_t expert = request.lane_experts[lane];
-      const int32_t slot = expert >= 0 && expert < experts_ ? tier.expert_slot[expert] : -1;
-      const bool still_loading = slot >= 0 && tier.state[slot] == kLoading &&
-                                 std::find(loading.begin(), loading.end(), slot) != loading.end();
-      if (slot < 0 || tier.slot_to_expert[slot] != expert || (tier.state[slot] != kReady && !still_loading)) {
-        fail_stop(
-            error_prefix<Layout>() + "request " + std::to_string(request.seq) + ": lane " + std::to_string(lane) +
-            " has no slot to lease");
-      }
-      slots[lane] = slot;
-      tags[lane] = still_loading ? kLeaseTagLoading : kLeaseTagReady;
-      if (copy_request && !still_loading) {
-        const int32_t dst = lane < request.lane_dst.size() ? request.lane_dst[lane] : -1;
-        if (copy_engine_->eligible(request.row, dst)) {
-          tags[lane] = kLeaseTagCopying;
-          const float weight = lane < request.lane_weight.size() ? request.lane_weight[lane] : 0.0f;
-          job.lanes[job.count++] = CopyLane{static_cast<int32_t>(lane), slot, dst, weight};
-          job.mask |= 1u << lane;
-        } else {
-          this->template count<kCopyFallbacks>();  // `count` is also this function's lane count
-        }
-      }
-    }
-    if (job.count > 0 && cpu_ != nullptr && cpu_->eligible(request.row)) choose_cpu_lanes_locked(&job, tags);
-    uint8_t* results = lease_ + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
-    for (size_t lane = 0; lane < count; ++lane) {
-      const int32_t slot = slots[lane];
-      // A lease is counted before its RowResult is published, so no admission can take the slot once a reader may.
-      tier.leases[slot] += 1;
-      entry.lane[lane] = LaneLease{1, slot, tags[lane] == kLeaseTagCopying || tags[lane] == kLeaseTagCpu};
-      // The payload is written without first clearing the ready word: this index was last written for G - 16, whose
-      // lease row retired before defers() let G in, so no reader of G - 16 runs, and a reader of G reads the payload
-      // only after acquiring a ready word that carries G.
-      std::memcpy(results + lane * kLeaseRowResultBytes + kLeaseRrHostSlot, &slot, 4);
-    }
-    _mm_sfence();  // every payload before any ready word, which the device acquires
-    for (size_t lane = 0; lane < count; ++lane)
-      store_release64(results + lane * kLeaseRowResultBytes + kLeaseRrReady, tagged_word(tags[lane], request.gen));
-    // One writer (the owner): a relaxed load and store, no RMW. graph_leases_outstanding reads it lock-free.
-    lanes_outstanding_.store(
-        lanes_outstanding_.load(std::memory_order_relaxed) + static_cast<int64_t>(count), std::memory_order_relaxed);
-    this->template count<kLeasesGranted>(static_cast<int64_t>(count));
-    if (job.count > 0) {
-      // After the COPYING words are published: the copy thread may complete and publish CopyDone at once.
-      job.gen = request.gen;
-      job.idx = idx;
-      job.row = request.row;
-      if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
-      this->template count<kCopyJobs>();
-      this->template count<kCopyLanes>(job.count);
-      copy_engine_->submit(job);
-    }
-  }
-
-  // CPU experts: the last split[n] of the job's n copy-engine lanes go to the CPU. The device plan sorts miss lanes by
-  // residency score, highest first, so these are the lowest-scored RAM hits; the rest are copied and inserted.
-  // They keep their place in the job (CopyDone covers them), are tagged kLeaseTagCpu, and are named in cpu_mask.
-  void choose_cpu_lanes_locked(CopyJob* job, uint64_t* tags) {
-    const size_t n = std::min<size_t>(static_cast<size_t>(job->count), kLeaseLanes);
-    size_t want = cpu_split_[n].load(std::memory_order_relaxed);
-    if (want == 0) return;
-    for (int i = job->count - 1; i >= 0 && want > 0; --i) {
-      const CopyLane& lane = job->lanes[i];
-      job->cpu_mask |= 1u << lane.lane;
-      tags[lane.lane] = kLeaseTagCpu;
-      --want;
-    }
-    this->template count<kCpuJobs>();
-    this->template count<kCpuLanes>(__builtin_popcount(job->cpu_mask));
-  }
-
-  // Release the non-copy leases of every request whose Done word carries its generation: CW stores Done once no kernel
-  // of the request reads a leased slot any more. Cheap when nothing is outstanding; never blocks. A COPYING or CPU
-  // lease waits for its copy's completion instead (release_copied_owned). The owner only, and no lock (Task 14).
-  void retire_leases() {
-    if (lanes_outstanding_.load(std::memory_order_relaxed) == 0) return;
-    for (int64_t idx = 0; idx < kDemandRecords; ++idx) {
-      Outstanding& entry = outstanding_[idx];
-      if (!entry.active) continue;
-      // The acquire pairs with CW's release of Done: every device read of this request's slots happened before it.
-      // Done moves on to G + 16 only after this entry retired, so while it is active Done holds G or an older value.
-      if (load_acquire64(lease_ + kLeaseDone + idx * kLeaseDoneBytes) != entry.gen) continue;
-      Tier& tier = tiers_[entry.row];
-      bool open = false;
-      for (uint32_t lane = 0; lane < entry.count; ++lane) {
-        LaneLease& held = entry.lane[lane];
-        if (held.state == 1 && !held.copy_engine) this->template release_lease_locked<kLeasesAcked>(tier, held);
-        open = open || held.state == 1;
-      }
-      if (!open) entry.active = false;
-    }
-  }
-
-  // Lanes leased by the device and not yet retired. An eager pause is refused while this is non-zero.
-  int64_t graph_leases_outstanding() const {
-    return lanes_outstanding_.load(std::memory_order_relaxed);
-  }
-
-  // One lease released, exactly once. Called by the owner only (retire_leases, drain_copy_completions). K is a
-  // metric (leases_acked, _copied): kept so.
-  template <Counter K>
-  void release_lease_locked(Tier& tier, LaneLease& held) {
-    static_assert(!is_core_counter(K), "the lease release counters are metrics");
-    if (tier.leases[held.slot] == 0) fail_stop(error_prefix<Layout>() + "lease underflow on slot " + std::to_string(held.slot));
-    tier.leases[held.slot] -= 1;
-    held.state = 2;
-    lanes_outstanding_.store(lanes_outstanding_.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
-    stats_.add(K);
-    ++lease_changes_;
+  void take_bulk_delta(int32_t* out, int64_t n) {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("take_bulk_delta");
+    if (n != static_cast<int64_t>(bulk_.size()))
+      throw std::runtime_error(error_prefix<Layout>() + "take_bulk_delta: the count changed since bulk_delta_count");
+    for (int64_t i = 0; i < n; ++i)
+      for (int c = 0; c < 3; ++c)
+        out[3 * i + c] = bulk_[i][c];
+    bulk_.clear();
   }
 
   // The extents the introspection methods below write, for the FFI's exact out-buffer checks: none of those
@@ -967,7 +754,7 @@ class RamTier {
     return tiers_[row].capacity;
   }
 
-  // Test hooks and introspection. slot_info: [state, expert, leases] per slot. A snapshot.
+  // Test hooks and introspection. slot_info: [state, expert, stamp] per slot. A snapshot.
   void slot_info(int64_t row, int64_t* out) {
     row_capacity(row);  // range-checked on the caller: the owner may be the service thread, which must not throw
     snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
@@ -975,70 +762,28 @@ class RamTier {
       for (int64_t slot = 0; slot < tier.capacity; ++slot) {
         c.out[3 * slot] = tier.state[slot];
         c.out[3 * slot + 1] = tier.slot_to_expert[slot];
-        c.out[3 * slot + 2] = tier.leases[slot];
+        c.out[3 * slot + 2] = static_cast<int64_t>(tier.stamp[slot]);
       }
       return 0;
     });
   }
 
-  // Test only: the service's account of request slot `idx`: [active, count, gen, then per lane (kLeaseLanes) its
-  // state, then per lane its slot, then per lane 1 if it is a copy-engine lane]. A snapshot.
-  void lease_entry(int64_t idx, int64_t* out) {
-    if (idx < 0 || idx >= kDemandRecords)
-      throw std::runtime_error(error_prefix<Layout>() + "request slot out of range");
-    snapshot(idx, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      const Outstanding& entry = self->outstanding_[c.row];
-      c.out[0] = entry.active;
-      c.out[1] = entry.count;
-      c.out[2] = static_cast<int64_t>(entry.gen);
-      for (int64_t lane = 0; lane < kLeaseLanes; ++lane) {
-        c.out[3 + lane] = entry.lane[lane].state;
-        c.out[3 + kLeaseLanes + lane] = entry.lane[lane].slot;
-        c.out[3 + 2 * kLeaseLanes + lane] = entry.lane[lane].copy_engine ? 1 : 0;
-      }
-      return 0;
-    });
-  }
-
-  // Test only: a lease held for a test, standing in for a GPU reader's. A command (run_as_owner) that the caller waits
-  // for, so a test's next post sees the lease. InstrBuild only.
-  void inject_lease(int64_t row, int64_t slot, int64_t delta) {
-    if constexpr (!Build::kFaults) {
-      (void)row, (void)slot, (void)delta;
-      test_only("inject_lease");
-    } else {
-      if (slot < 0 || slot >= row_capacity(row))
-        throw std::runtime_error(error_prefix<Layout>() + "slot " + std::to_string(slot) + " is out of range");
-      Command c;
-      c.kind = Command::kInjectLease;
-      c.row = row;
-      c.arg = slot;
-      c.delta = delta;
-      int64_t result = 0;
-      c.result = &result;
-      run_as_owner(c);
-      if (result != 0)
-        throw std::runtime_error(error_prefix<Layout>() + "lease underflow on slot " + std::to_string(slot));
-    }
-  }
-
-  // (free, evictable, leased) of `wanted`: a snapshot. `wanted` is the caller's, alive until the answer comes back.
+  // (free, evictable) of `wanted`: a snapshot. `wanted` is the caller's, alive until the answer comes back.
   VictimCensus victim_census(int64_t row, const std::vector<int32_t>& wanted) {
     row_capacity(row);
-    int64_t out[3] = {};
+    int64_t out[2] = {};
     snapshot(row, out, &wanted, [](RamTier* self, const Command& c) -> int64_t {
       const VictimCensus census =
           self->census_locked(c.row, *static_cast<const std::vector<int32_t>*>(c.input));
       c.out[0] = census.free;
       c.out[1] = census.evictable;
-      c.out[2] = census.leased;
       return 0;
     });
-    return VictimCensus{out[0], out[1], out[2]};
+    return VictimCensus{out[0], out[1]};
   }
 
   // Any thread, lock-free: the published slot map, which holds a slot for an expert exactly while that slot is READY
-  // (publish_map stores a slot only when it becomes READY, and -1 on every unmap; a kLoading slot is never published).
+  // (a slot is stored only once its bytes landed, and -1 on every unmap; a kLoading slot is never published).
   void mapping(int64_t row, int64_t* out) const {
     for (int64_t expert = 0; expert < experts_; ++expert)
       out[expert] = __atomic_load_n(map_ + row * experts_ + expert, __ATOMIC_ACQUIRE);
@@ -1150,8 +895,8 @@ class RamTier {
         case Command::kSetHot:
           set_hot_owned(c.row, c.hot);
           break;
-        case Command::kInjectLease:
-          value = inject_lease_owned(c.row, c.arg, c.delta) ? 0 : -1;
+        case Command::kAttachRow:
+          attach_row_owned(c.row, c.arg);
           break;
         case Command::kSnapshot:
           value = c.snapshot(this, c);
@@ -1172,7 +917,7 @@ class RamTier {
   }
 
   // The service thread, mid-request (the read's progress hook, inject()'s read delay): apply the queue's leading
-  // snapshots only. A mutator (set_hot, inject_lease) waits for the end of the request, and every snapshot queued
+  // snapshots only. A mutator (set_hot, attach_row) waits for the end of the request, and every snapshot queued
   // behind it waits too, so the queue's order is kept: a mutator is applied between requests, as a snapshot taken
   // after it sees it.
   void answer_snapshots() {
@@ -1226,20 +971,23 @@ class RamTier {
     }
   }
 
-  // False on an underflow, which changes nothing.
-  bool inject_lease_owned(int64_t row, int64_t slot, int64_t delta) {
+  void attach_row_owned(int64_t row, int64_t k) {
     Tier& tier = tiers_[row];
-    if (delta < 0 && tier.leases[slot] < static_cast<uint32_t>(-delta)) return false;
-    tier.leases[slot] = static_cast<uint32_t>(static_cast<int64_t>(tier.leases[slot]) + delta);
-    if (delta < 0) ++lease_changes_;
-    return true;
+    if (tier.chain != 0) throw std::runtime_error(error_prefix<Layout>() + "attach_row is once per row");
+    for (int64_t slot = 0; slot < tier.capacity && static_cast<int64_t>(tier.staging.size()) < k; ++slot) {
+      if (tier.state[slot] != kFree) continue;
+      tier.state[slot] = kStaging;
+      tier.staging.push_back(static_cast<int32_t>(slot));
+    }
+    if (static_cast<int64_t>(tier.staging.size()) < k)
+      throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has too few free slots to stage");
+    tier.chain = 1;
+    publish_delta_locked(row, 1, tier.staging, nullptr, 0);
   }
 
-  // Copy thread. Completion was observed, so no copy of this job reads its slots any more: CopyDone here, so the
-  // device's wait ends as soon as the DMA did; the lease itself is released by the owner (drain_copy_completions), one
-  // owner poll later (D7). A job whose row has SM entries is not handed back yet (false): CW still reads those slots,
-  // and copy_acked hands it back once CW's Done shows it finished. True otherwise.
-  bool copy_completed(const CopyJob& job) {
+  // Copy thread. Completion was observed: every DMA and CPU job of the record is done. CopyDone here, so the device's
+  // wait ends as soon as the work did.
+  void copy_completed(const CopyJob& job) {
     const uint32_t seq = static_cast<uint32_t>(job.gen);
     store_release64(lease_ + kLeaseCopyDone + job.idx * kLeaseCopyDoneBytes, job.gen);
     // Dekker with CW (row_copy_kernels.cuh: gate close, fence.sc.sys, CopyDone load): CopyDone before the gate load,
@@ -1247,46 +995,10 @@ class RamTier {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const uint32_t closed = gate_word(seq, kLeaseGateClosed);
     if (copy_gate() == closed) cas_gate(closed, gate_word(seq, kLeaseGateOpen));
-    if (job.sm) return false;
-    hand_back(job);
-    return true;
   }
 
-  // Copy thread, a job copy_completed left waiting: true once Done of its ring index reached this request's
-  // generation, after which no SM read of the job's slots can be in flight, and the job is handed back to the owner.
-  bool copy_acked(const CopyJob& job) {
-    if (load_acquire64(lease_ + kLeaseDone + job.idx * kLeaseDoneBytes) < job.gen) return false;
-    hand_back(job);
-    return true;
-  }
-
-  // Copy thread: the job goes back to the owner through copy_done_, before the copy engine counts it finished (its
-  // caller finish()es after this returns), so an owner that saw the engine idle (wait_idle's acquire of finished_)
-  // pops it. At most kDemandRecords jobs are outstanding, handed-back ones included (a ring index's entry stays active
-  // until the owner drains its job), and the ring holds kCopyRing.
-  void hand_back(const CopyJob& job) {
-    if (!copy_done_.push(job)) fail_stop(error_prefix<Layout>() + "the copy completion ring overflowed");
-  }
-
-  // The owner: release a completed job's COPYING and CPU leases, the only place one is released.
-  void release_copied_owned(const CopyJob& job) {
-    Outstanding& entry = outstanding_[job.idx];
-    if (!entry.active || entry.gen != job.gen) {
-      fail_stop(error_prefix<Layout>() + "copy of request " + std::to_string(job.gen) + " completed with no lease row");
-    }
-    Tier& tier = tiers_[entry.row];
-    for (int i = 0; i < job.count; ++i) {
-      LaneLease& held = entry.lane[job.lanes[i].lane];
-      if (held.state == 1 && held.copy_engine) release_lease_locked<kLeasesCopied>(tier, held);
-    }
-    bool open = false;
-    for (uint32_t lane = 0; lane < entry.count; ++lane)
-      open = open || entry.lane[lane].state == 1;
-    if (!open) entry.active = false;
-  }
-
-  // Copy thread, or the submitter when the copy engine's job ring is full. Completion cannot be established, and a
-  // lease released without it could hand a slot under an in-flight copy to the next read: fail stop.
+  // Copy thread, or the submitter when the copy engine's job ring is full. Completion cannot be established, and the
+  // device would wait on CopyDone until the watchdog: fail stop.
   void copy_failed(const CopyJob& job, int error) {
     fail_stop(
         std::string(Layout::kName) + " RAM miss copy engine: copy of request " + std::to_string(job.gen) +
@@ -1388,25 +1100,25 @@ class RamTier {
     return (value + 4095) / 4096 * 4096;
   }
 
+  // The completion block, then one delta record per row (expert_lease_block.lease_block_bytes).
+  static int64_t lease_block_bytes(int64_t rows) {
+    return kLeaseBlockBytes + round_up_page(rows * kDeltaStride);
+  }
+
   // Before the service thread or any device exists, so plain stores and one fence suffice.
   void init_lease_block(int64_t lease_bytes) {
     if (lease_ == nullptr || reinterpret_cast<uintptr_t>(lease_) % kLeaseBlockAlign != 0) {
       throw std::runtime_error(error_prefix<Layout>() + "the lease block must be a 4096-byte aligned block");
     }
-    if (lease_bytes != kLeaseBlockBytes) {
+    if (lease_bytes != lease_block_bytes(layers_)) {
       throw std::runtime_error(
           error_prefix<Layout>() + "the lease block has " + std::to_string(lease_bytes) + " bytes, not " +
-          std::to_string(kLeaseBlockBytes));
+          std::to_string(lease_block_bytes(layers_)) + " for " + std::to_string(layers_) + " rows");
     }
     // Open with nothing armed: a copy wait that arms nothing passes its stream wait on this value (0 would block).
     const uint32_t open = gate_word(0, kLeaseGateOpen);
     std::memcpy(lease_ + kLeaseCopyGate, &open, 4);
     _mm_sfence();
-  }
-
-  // The eviction predicate's lease half. Task 8 adds host leases here as one more term.
-  bool leased_locked(const Tier& tier, int64_t slot) const {
-    return tier.leases[slot] > 0;
   }
 
   VictimCensus census_locked(int64_t row, std::span<const int32_t> wanted) const {
@@ -1418,11 +1130,7 @@ class RamTier {
       } else if (tier.state[slot] == kReady) {
         const int32_t expert = tier.slot_to_expert[slot];
         if (tier.hot[expert] || tier.filling[slot] || listed(wanted, expert)) continue;
-        if (leased_locked(tier, slot)) {
-          ++census.leased;
-        } else {
-          ++census.evictable;
-        }
+        ++census.evictable;
       }
     }
     return census;
@@ -1486,8 +1194,44 @@ class RamTier {
     }
   }
 
-  void publish_map(int64_t row, int64_t expert, int32_t slot) {
+  // The host mirror (mapping()) only: a change the device learns from a record's delta.
+  void publish_mirror(int64_t row, int64_t expert, int32_t slot) {
     __atomic_store_n(map_ + row * experts_ + expert, slot, __ATOMIC_RELEASE);
+  }
+
+  // An eager path's change: the mirror, and the bulk delta the device applies before the next forward.
+  void publish_map(int64_t row, int64_t expert, int32_t slot) {
+    publish_mirror(row, expert, slot);
+    bulk_.push_back({static_cast<int32_t>(row), static_cast<int32_t>(expert), slot});
+  }
+
+  // Row `row`'s delta record: the payload with plain stores, an sfence, then the tag with a release (the device
+  // acquires the tag before it reads the rest). The device read the previous delta in this row's last post, which
+  // came before the record now being served, so nothing reads the record while it is rewritten.
+  void publish_delta_locked(
+      int64_t row, uint64_t tag, const FixedVec<int32_t, kLeaseLanes>& staging, const int32_t (*entries)[2],
+      int count) {
+    uint8_t* d = lease_ + kDeltaBase + row * kDeltaStride;
+    const uint32_t n = static_cast<uint32_t>(count);
+    std::memcpy(d + kDeltaCount, &n, 4);
+    for (int k = 0; k < kLeaseLanes; ++k) {
+      const int32_t slot = k < static_cast<int>(staging.size()) ? staging[k] : -1;
+      std::memcpy(d + kDeltaStaging + 4 * k, &slot, 4);
+    }
+    for (int i = 0; i < count; ++i)
+      std::memcpy(d + kDeltaEntries + 8 * i, entries[i], 8);
+    _mm_sfence();
+    store_release64(d + kDeltaTag, tag);
+  }
+
+  void store_split(const int64_t* split, int64_t count) {
+    if (count != static_cast<int64_t>(kLeaseLanes) + 1)
+      throw std::runtime_error(error_prefix<Layout>() + "the CPU split table has one entry per n = 0..kLeaseLanes");
+    for (int64_t n = 0; n < count; ++n)
+      if (split[n] < 0 || split[n] > n)
+        throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
+    for (int64_t n = 0; n < count; ++n)
+      __atomic_store_n(reinterpret_cast<int32_t*>(lease_ + kSplit) + n, static_cast<int32_t>(split[n]), __ATOMIC_RELAXED);
   }
 
   void disown_locked(Tier& tier, int64_t slot) {
@@ -1511,7 +1255,7 @@ class RamTier {
         std::find(tier.state.begin(), tier.state.end(), kFree) == tier.state.end()) {
       int64_t best = -1;
       for (int64_t s = 0; s < tier.capacity; ++s) {
-        if (!tier.prefill_owned[s] || tier.state[s] != kReady || tier.filling[s] || leased_locked(tier, s)) continue;
+        if (!tier.prefill_owned[s] || tier.state[s] != kReady || tier.filling[s]) continue;
         const int32_t expert = tier.slot_to_expert[s];
         if (tier.hot[expert] || listed(protect, expert)) continue;
         if (best < 0 || tier.stamp[s] < tier.stamp[best]) best = s;
@@ -1534,7 +1278,7 @@ class RamTier {
     return slot;
   }
 
-  // Takes only a kFree slot or evicts an unleased kReady one: a kLoading slot is never taken.
+  // An eager admission's slot: a kFree one, or an evicted kReady one; never kLoading or kStaging.
   int64_t take_slot_locked(int64_t row, std::span<const int32_t> protect, bool fallback, int64_t* evicted) {
     Tier& tier = tiers_[row];
     *evicted = -1;
@@ -1545,8 +1289,7 @@ class RamTier {
     int64_t spare = -1;
     for (int64_t slot = 0; slot < tier.capacity; ++slot) {
       if (tier.state[slot] != kReady) continue;
-      if (tier.filling[slot]) continue;         // a prefill fill is still writing it
-      if (leased_locked(tier, slot)) continue;  // a GPU reader may still be reading it
+      if (tier.filling[slot]) continue;  // a prefill fill is still writing it
       const int32_t expert = tier.slot_to_expert[slot];
       if (tier.hot[expert]) continue;
       if (listed(protect, expert)) {
@@ -1583,8 +1326,7 @@ class RamTier {
     disown_locked(tier, slot);
   }
 
-  // An unarmed demand record: nobody waits on it, so the device may already be gathering any mapped slot (the next
-  // token's rows too, once the thread lags). Only refresh the recency of its assigned rows: no eviction, no read.
+  // A record with no lanes: refresh the recency of its routed experts' RAM rows. No eviction, no read.
   void touch_request(const Request& request) {
     if (request.row < 0 || request.row >= layers_) return;
     Tier& tier = tiers_[request.row];
@@ -1597,66 +1339,163 @@ class RamTier {
     }
   }
 
-  // An armed demand: touch the request's assigned rows, reserve a slot for every protected or lane expert that is not
-  // assigned (D12's recompute: the device is waiting on this record, so no gather is in flight), evicting only
-  // unprotected, non-hot, unleased READY rows; lease and publish every lane; read the missing rows; publish the map.
-  // Every failure fails stop: nothing of it is recoverable, and demand_done must never say served for it.
-  void serve(const Request& request, int64_t* rows) {
+  // A decode miss's RAM victim: a free slot first, else the least recently used READY slot that is not VRAM-hot, not
+  // routed by this record (`wanted`), and not filling. Its expert is unmapped (on the host mirror; the device by the
+  // delta) and returned in `old` (-1 for a free slot). -1 when none qualifies: the miss is not cached.
+  int64_t take_victim_locked(int64_t row, std::span<const int32_t> wanted, int32_t* old) {
+    Tier& tier = tiers_[row];
+    *old = -1;
+    for (int64_t slot = 0; slot < tier.capacity; ++slot) {
+      if (tier.state[slot] == kFree) return slot;
+    }
+    int64_t best = -1;
+    for (int64_t slot = 0; slot < tier.capacity; ++slot) {
+      if (tier.state[slot] != kReady || tier.filling[slot]) continue;
+      const int32_t expert = tier.slot_to_expert[slot];
+      if (tier.hot[expert] || listed(wanted, expert)) continue;
+      if (best < 0 || tier.stamp[slot] < tier.stamp[best]) best = slot;
+    }
+    if (best < 0) return -1;
+    *old = tier.slot_to_expert[best];
+    publish_mirror(row, *old, -1);
+    tier.expert_slot[*old] = -1;
+    tier.slot_to_expert[best] = -1;
+    disown_locked(tier, best);
+    count<kEvictions>();
+    return best;
+  }
+
+  // A record with lanes (LEASE_PROTOCOL.md, "The host, per record"). The device typed every lane from its copy of
+  // the map, so the host checks each against the tier and fail-stops on any disagreement. Order: stamps, checks, the
+  // copy job (hits start at once), victims and the map delta (before any read, so a served chain always has its
+  // delta published), then the misses' reads.
+  void serve_record(const Request& request, int64_t* rows) {
     StageRecord* const cur = stage_record();  // null in ProdBuild, so every `if (cur)` below folds away
-    if (cur) cur->lanes = static_cast<int64_t>(request.lane_experts.size());
+    if (cur) cur->lanes = static_cast<int64_t>(request.lanes.size());
     const auto fail = [&](const std::string& why) {
       fail_stop(error_prefix<Layout>() + "request " + std::to_string(request.seq) + " of row " +
                 std::to_string(request.row) + ": " + why);
     };
     if (request.row < 0 || request.row >= layers_) fail("the row is out of range");
-    // Fixed-size locals (spec A4, A5): a request names at most kWanted distinct experts, so none of these allocates.
-    // A lane's own expert must never be a victim of the request that leases it, whatever the post protected.
-    FixedVec<int32_t, kWanted> wanted;
-    for (std::span<const int32_t> ids : {request.protect.span(), request.lane_experts.span()}) {
-      for (int32_t expert : ids) {
-        if (expert < 0 || expert >= experts_) fail("an expert is out of range");
-        if (!listed(wanted, expert)) wanted.push_back(expert);  // one slot per expert (device bytes may repeat)
-      }
-    }
-    FixedVec<int32_t, kWanted> missing;
-    FixedVec<int64_t, kWanted> slots;
     Tier& tier = tiers_[request.row];
-    for (int32_t expert : wanted) {
+    FixedVec<int32_t, kWanted> wanted;
+    for (int32_t expert : request.protect) {
+      if (expert < 0 || expert >= experts_) fail("an expert is out of range");
+      if (!listed(wanted, expert)) wanted.push_back(expert);
+    }
+    FixedVec<int32_t, kLeaseLanes> lane_experts;
+    for (const Lane& lane : request.lanes) {
+      if (lane.expert < 0 || lane.expert >= experts_) fail("an expert is out of range");
+      if (listed(lane_experts, lane.expert)) fail("a lane names an expert twice");
+      lane_experts.push_back(lane.expert);
+      if (!listed(wanted, lane.expert)) wanted.push_back(lane.expert);
+    }
+    for (int32_t expert : request.protect) {
       const int32_t slot = tier.expert_slot[expert];
-      if (slot >= 0) {
+      if (slot >= 0 && tier.state[slot] == kReady) {
         tier.stamp[slot] = ++tick_;
         disown_locked(tier, slot);
-      } else {
-        missing.push_back(expert);
       }
     }
-    // defers() refused this request while leases could still free a victim, so a slot not found now never will be.
-    for (int32_t expert : missing) {
-      int64_t evicted = -1;
-      const int64_t slot = take_slot_locked(request.row, wanted, false, &evicted);
-      if (slot < 0) fail("no victim slot for a missing row");
-      tier.slot_to_expert[slot] = expert;
-      tier.state[slot] = kLoading;
-      tier.expert_slot[expert] = static_cast<int32_t>(slot);
-      slots.push_back(slot);
+    const bool host_lanes = copy_engine_ != nullptr && copy_armed_.load(std::memory_order_acquire) && request.captured;
+    const bool cpu_row = host_lanes && cpu_ != nullptr && cpu_->eligible(request.row);
+    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    CopyJob job;
+    FixedVec<int32_t, kLeaseLanes> missing;
+    FixedVec<int64_t, kLeaseLanes> slots;
+    FixedVec<int32_t, kLeaseLanes> miss_lane;  // the lane index of each read row
+    for (size_t j = 0; j < request.lanes.size(); ++j) {
+      const Lane& lane = request.lanes[j];
+      const auto at = [&] {  // built only to fail: the hot path allocates nothing
+        return "lane " + std::to_string(j) + " (expert " + std::to_string(lane.expert) + ", slot " +
+               std::to_string(lane.slot) + ")";
+      };
+      if (is_miss(lane.kind)) {
+        if (!listed(tier.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(at() + " is not a staging slot");
+        if (tier.expert_slot[lane.expert] >= 0) fail(at() + " misses an expert the tier holds");
+        if (lane.kind == kKindMissCpu) {
+          if (!cpu_row || cpu_->parts() < 2) fail(at() + ": a CPU miss on a row without CPU experts' miss part");
+          ++job.late_cpu;
+        }
+        missing.push_back(lane.expert);
+        slots.push_back(lane.slot);
+        miss_lane.push_back(static_cast<int32_t>(j));
+        continue;
+      }
+      if (lane.slot < 0 || lane.slot >= tier.capacity || tier.expert_slot[lane.expert] != lane.slot ||
+          tier.state[lane.slot] != kReady) {
+        fail(at() + ": the device maps it there, the tier does not");
+      }
+      tier.stamp[lane.slot] = ++tick_;
+      disown_locked(tier, lane.slot);
+      if (lane.kind == kKindHitCopy) {
+        if (!host_lanes || !copy_engine_->eligible(request.row, lane.dst)) fail(at() + ": a copy-engine lane on an ineligible row");
+      } else if (lane.kind == kKindHitCpu) {
+        if (!cpu_row) fail(at() + ": a CPU lane on a row without CPU experts");
+        job.cpu_mask |= 1u << j;
+      } else {
+        continue;  // kKindHitSm: C1 copies it, the host has nothing to do
+      }
+      job.lanes[job.count++] = CopyLane{static_cast<int32_t>(j), lane.slot, lane.dst, lane.weight};
+      job.mask |= 1u << j;
     }
-    // The reservation hold: from the take loop to read(), nothing else runs on the tier (no other thread writes it,
-    // and the owner's own passes run only between requests or from read()'s progress hook). Grant every lane in it:
-    // after it, a hit slot could be evicted by a later admission; before the take loop, a hit lane's lease would
-    // outlive a request that is then refused.
-    bool publishing = false;  // a miss lane has readiness words to publish into
-    if (!request.lane_experts.empty()) {
-      open_lease_entry_locked(request);
-      publishing = init_piece_words_locked(request, missing);
-      grant_lanes_locked(request, slots.span());
+    if (!missing.empty()) {
+      if (request.chain != tier.chain + 1) {
+        fail("map chain " + std::to_string(request.chain) + ", the row expects " + std::to_string(tier.chain + 1));
+      }
+    } else if (request.chain != 0) {
+      fail("map chain " + std::to_string(request.chain) + " on a record without a miss");
+    }
+    if (job.count > 0 || job.late_cpu > 0) {
+      job.gen = request.gen;
+      job.idx = idx;
+      job.row = request.row;
+      if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
+      this->template count<kCopyJobs>();
+      this->template count<kCopyLanes>(job.count + job.late_cpu);
+      copy_engine_->submit(job);
+    }
+    // Victims and the delta, before any read. A miss lands in its staging slot whatever happens here; whether it is
+    // cached is the victim's question.
+    bool inserted[kLeaseLanes] = {};
+    if (!missing.empty()) {
+      int32_t entries[kDeltaMaxEntries][2];
+      int count = 0;
+      FixedVec<int32_t, kLeaseLanes> staging = tier.staging;
+      for (size_t i = 0; i < missing.size(); ++i) {
+        int32_t old = -1;
+        const int64_t victim = take_victim_locked(request.row, wanted, &old);
+        if (victim < 0) {
+          this->template count<kRamInsertSkipped>();
+          continue;
+        }
+        if (old >= 0) {
+          entries[count][0] = old;
+          entries[count][1] = -1;
+          ++count;
+        }
+        entries[count][0] = missing[i];
+        entries[count][1] = static_cast<int32_t>(slots[i]);
+        ++count;
+        const int32_t slot = static_cast<int32_t>(slots[i]);
+        tier.slot_to_expert[slot] = missing[i];
+        tier.state[slot] = kLoading;
+        tier.expert_slot[missing[i]] = slot;
+        tier.state[victim] = kStaging;
+        for (int32_t& s : staging)
+          if (s == slot) s = static_cast<int32_t>(victim);
+        inserted[i] = true;
+      }
+      tier.staging = staging;
+      tier.chain = request.chain;
+      publish_delta_locked(request.row, request.chain, tier.staging, entries, count);
     }
     if (cur) cur->reserved = stamp(cur);
     int64_t status = kStatusNoRead;
-    // Per slot: the row was packed whole (read() sets it). A member, not a local, reserved to kWanted at construction,
-    // so read()'s assign() never allocates on the service thread.
     std::vector<uint8_t>& packed = packed_;
     packed.clear();
     if (!missing.empty()) {
+      const bool publishing = init_piece_words_locked(request, miss_lane, idx);
       bool fail_reads = false;
       if constexpr (Build::kFaults) {  // the test faults (inject, inject_fault): InstrBuild only
         apply_pending_fault();
@@ -1665,6 +1504,24 @@ class RamTier {
         fail_reads = faults_.fail_reads.load();
       }
       if (fail_reads) fail("a test fault failed the read");
+      bool late_sent = job.late_cpu == 0;
+      // The CPU misses' job, once every one of their rows landed: from read()'s progress hook, or after the read.
+      const auto send_late = [&] {
+        if (late_sent) return;
+        LateCpu late;
+        late.gen = request.gen;
+        for (size_t i = 0; i < missing.size(); ++i) {
+          const Lane& lane = request.lanes[miss_lane[i]];
+          if (lane.kind != kKindMissCpu) continue;
+          if (!(i < packed.size() && packed[i] != 0)) return;
+          late.slots[late.k] = static_cast<int32_t>(slots[i]);
+          late.weights[late.k] = lane.weight;
+          ++late.k;
+        }
+        _mm_sfence();  // the rows' bytes before the CPU thread reads them
+        copy_engine_->submit_late(late);
+        late_sent = true;
+      };
       const int result = reader_.read(
           request.row,
           missing,
@@ -1674,14 +1531,11 @@ class RamTier {
           cur,
           &packed,
           SIZE_MAX,
-          // The service stays the tier's owner for the whole read, so it releases the COPYING leases the copy thread
-          // handed back (D7), retires Done leases and answers queued snapshots here too (Task 13): none waits for a
-          // read's length. read() runs it once per drain-loop turn and once per finished row; each pass early-outs
-          // when idle, allocates nothing and takes no lock. A template argument (spec A6): no std::function.
-          [this] {
-            drain_copy_completions();
-            retire_leases();
+          // The service stays the tier's owner for the whole read, so it answers queued snapshots here too (Task 13).
+          // read() runs it once per drain-loop turn and once per finished row; it allocates nothing and takes no lock.
+          [&] {
             answer_snapshots();
+            send_late();
           },
           publishing ? &piece_publish_ : nullptr);
       stats_.store(kPiecePublishRefused, reader_.publish_refused());
@@ -1691,44 +1545,46 @@ class RamTier {
       }
       status = kStatusServed;
       ++demands_read_;
-      _mm_sfence();  // the split's memcpy stores land before the map publishes them (D11)
+      _mm_sfence();  // the split's memcpy stores land before the mirror publishes them (D11)
+      send_late();
+      if (!late_sent) fail("a CPU miss's row never landed");
     }
-    const int64_t published = static_cast<int64_t>(slots.size());
-    for (size_t i = 0; i < slots.size(); ++i) {
+    for (size_t i = 0; i < missing.size(); ++i) {
+      if (!inserted[i]) continue;
       tier.state[slots[i]] = kReady;
       tier.stamp[slots[i]] = ++tick_;
-      publish_map(request.row, missing[i], static_cast<int32_t>(slots[i]));
+      publish_mirror(request.row, missing[i], static_cast<int32_t>(slots[i]));
     }
-    if (!slots.empty()) {
+    if (!missing.empty()) {
       // One writer (the owner), read lock-free by layer_rows: a relaxed store.
-      std::atomic_ref<int64_t>(tier.rows_demand).store(tier.rows_demand + published, std::memory_order_relaxed);
+      std::atomic_ref<int64_t>(tier.rows_demand)
+          .store(tier.rows_demand + static_cast<int64_t>(missing.size()), std::memory_order_relaxed);
       count<kVersion>();
-      count<kRowsRead>(published);
+      count<kRowsRead>(static_cast<int64_t>(missing.size()));
     }
     if (cur) {
       cur->mapped = stamp(cur);
       cur->row = request.row;
       cur->ok = 1;
       cur->status = status;
-      cur->rows = published;
+      cur->rows = static_cast<int64_t>(missing.size());
     }
-    *rows = published;
+    *rows = static_cast<int64_t>(missing.size());
   }
 
-  // Store piece_word(gen) into the readiness word of every lane whose expert is read (in `missing`), then fence,
-  // and record those words as the owner's publish targets, by the row's ordinal in the read. Service thread only:
-  // it is the only writer of area P. False when no lane names a missing row (nothing to publish).
-  bool init_piece_words_locked(const Request& request, std::span<const int32_t> missing) {
-    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
-    piece_targets_.assign(missing.size(), PieceTarget{});
+  // Store piece_word(gen) into the readiness word of every kMissGpu lane, then fence, and record those words as the
+  // reader's publish targets, by the row's ordinal in the read. A kMissCpu lane has no device reader: no word. False
+  // when no lane has one.
+  bool init_piece_words_locked(const Request& request, std::span<const int32_t> miss_lane, int64_t idx) {
+    piece_targets_.assign(miss_lane.size(), PieceTarget{});
     bool any = false;
-    for (size_t lane = 0; lane < request.lane_experts.size(); ++lane) {
-      const auto found = std::find(missing.begin(), missing.end(), request.lane_experts[lane]);
-      if (found == missing.end()) continue;
+    for (size_t i = 0; i < miss_lane.size(); ++i) {
+      const int32_t lane = miss_lane[i];
+      if (request.lanes[lane].kind != kKindMissGpu) continue;
       uint8_t* word =
           lease_ + kLeasePieceMask + (idx * kLeaseLanes + static_cast<int64_t>(lane)) * kLeasePieceMaskLineBytes;
       store_release64(word, piece_word(request.gen));
-      PieceTarget& target = piece_targets_[static_cast<size_t>(found - missing.begin())];
+      PieceTarget& target = piece_targets_[i];
       target.words[target.count++] = reinterpret_cast<uint64_t*>(word);
       any = true;
     }
@@ -1737,11 +1593,11 @@ class RamTier {
     return any;
   }
 
-  void handle_demand(const Request& request) {
+  void handle_record(const Request& request) {
     begin_busy();
     int64_t rows = 0;
-    if (request.armed) {
-      serve(request, &rows);
+    if (!request.lanes.empty()) {
+      serve_record(request, &rows);
       if (rows == 0) {
         count<kTouchOnly>();
       } else {
@@ -1770,23 +1626,16 @@ class RamTier {
   std::unique_ptr<Engine> copy_engine_;
   // CPU experts, when enabled (after the copy engine, before the service thread); stopped after the copy thread.
   std::unique_ptr<CpuExpertEngine> cpu_;
-  std::array<std::atomic<uint8_t>, kLeaseLanes + 1> cpu_split_{};
   std::atomic<bool> copy_armed_{false};
   int64_t copy_wait_timeout_ns_ = 0;           // set with the copy engine, before any thread reads it
-  // Piece streaming: serve()'s readiness words per row it reads, reused every request (like packed_).
+  // Piece streaming: serve_record's readiness words per row it reads, reused every request (like packed_).
   std::vector<PieceTarget> piece_targets_;
   PiecePublish piece_publish_;
-  Outstanding outstanding_[kDemandRecords];  // by request slot; the owner's
-  // Lanes GRANTED and not yet retired: an early-out for retire_leases. Written by the owner only (a relaxed load and
-  // store), read lock-free by graph_leases_outstanding.
-  std::atomic<int64_t> lanes_outstanding_{0};
-  std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new; retirement continues
-  uint64_t lease_changes_ = 0;  // the owner's: bumped whenever a lease is released, what wakes a deferred demand
-  // The demand held back, if any (service thread only): its sequence, the changes seen when it was last refused and
-  // when it was first observed (for the stage record).
-  uint32_t deferred_seq_ = 0;
-  uint64_t deferred_stamp_ = 0;
-  int64_t deferred_observed_ns_ = 0;
+  std::atomic<bool> admission_closed_{false};  // shutdown: serve nothing new
+  std::atomic<uint32_t> handled_{0};           // the last seq the owner finished (handled_through)
+  // The eager paths' map changes, {row, expert, slot}: the owner's, taken by take_bulk_delta. Grows only on those
+  // paths (assign, prefill fills, release), never on the record path.
+  std::vector<std::array<int32_t, 3>> bulk_;
   int64_t layers_;
   int64_t experts_;
   Source reader_;
@@ -1818,10 +1667,6 @@ class RamTier {
   std::atomic<bool> parked_{false};
   std::mutex caller_mutex_;
   SpscRing<Command, 64> commands_;
-  // Copy thread -> owner (Task 14): jobs whose copies completed (and whose SM reads CW finished), CopyDone-published on
-  // the copy thread. The consumer is always the current owner (the same
-  // handoffs as commands_); drain_copy_completions releases their leases.
-  SpscRing<CopyJob, kCopyRing> copy_done_;
   // The watchdog's hung-request marker (D6), see busy_episode(): a new value per demand or fill in service, 0 when
   // none. episodes_ is the service thread's, or a fill's (they never run at once: a fill needs the pause).
   std::atomic<uint64_t> busy_{0};

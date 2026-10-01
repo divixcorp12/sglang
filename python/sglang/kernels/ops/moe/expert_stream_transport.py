@@ -75,7 +75,6 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "read_rows_sqes",
     "inject",
     "inject_fault",
-    "inject_lease",
     "copy_engine_fail",
     "copy_engine_ballast",
     "trace_clock_reads",
@@ -683,7 +682,8 @@ RECORD_BYTES = 256
 DEMAND_RING = 64
 DEMAND_RECORDS = 16
 RECORD_FIELDS = {
-    "seq": 0, "row": 4, "count": 6, "flags": 8, "chain": 12, "chain_hi": 16, "protect_count": 20, "protect": 32,
+    "seq": 0, "row": 4, "count": 6, "flags": 8, "chain": 12, "chain_hi": 16, "epoch": 24, "protect_count": 20,
+    "protect": 32,
     "lanes": 64, "kinds": 192,
 }
 RECORD_FLAG_CAPTURED = 1
@@ -719,20 +719,15 @@ COUNTERS = (
     "version",
     "running",
     "spin_cpu",
-    "deferred",
-    "leases_granted",
-    "leases_acked",
-    "deferred_reuse",
+    "ram_insert_skipped",
     "piece_publish_refused",
     # Copy engine.
-    "leases_copied",
     "copy_jobs",
     "copy_lanes",
     "copy_bytes",
     "copy_issue_ns",
     "copy_latency_ns",
     "copy_latency_max_ns",
-    "copy_fallbacks",
     # CPU experts (plan 2026-09-29-dsv41-cpu-experts).
     "cpu_jobs",
     "cpu_lanes",
@@ -755,8 +750,7 @@ CORE_COUNTERS = (
     "version",
     "running",
     "spin_cpu",
-    "deferred",
-    "deferred_reuse",
+    "ram_insert_skipped",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -804,9 +798,9 @@ class ExpertStreamHost:
     runs, the caller between ``pause()`` and ``resume()``, and the caller of ``pump()`` when there is no thread. While
     the thread runs unpaused, ``contains``, ``touch``, ``assign``, ``release`` and ``fill_begin`` raise
     ``RuntimeError`` ("... needs the service thread paused"); ``set_hot`` is queued and applied by the service before
-    its next request (it returns before then); ``inject_lease`` and the snapshots (``slot_info``, ``slot_to_expert``,
-    ``lease_entry``, ``lru_order``, ``victim_census``) are answered by the service and waited for
-    (mid-read too, unless a queued ``set_hot``/``inject_lease`` precedes them: then at the end of the request);
+    its next request (it returns before then); ``attach_row`` and the snapshots (``slot_info``, ``slot_to_expert``,
+    ``lru_order``, ``victim_census``) are answered by the service and waited for
+    (mid-read too, unless a queued ``set_hot``/``attach_row`` precedes them: then at the end of the request);
     ``mapping``, ``counters``, ``busy_episode`` and ``layer_rows`` read published words without waiting. Paused, or
     with no thread, every call runs at once.
     """
@@ -839,9 +833,9 @@ class ExpertStreamHost:
         # The lease block: the service writes it through a raw address, so this object holds it. Allocated here when
         # the caller passes none.
         if lease_block is None:
-            lease_block = expert_lease_block.new_lease_block(pin=page.is_pinned())
+            lease_block = expert_lease_block.new_lease_block(int(tables.starts.shape[0]), pin=page.is_pinned())
         else:
-            expert_lease_block.check_lease_block(lease_block, need_pinned=page.is_pinned())
+            expert_lease_block.check_lease_block(lease_block, int(tables.starts.shape[0]), need_pinned=page.is_pinned())
         self.lease_block = lease_block
         self.hot_page = hot_page
         if hot_page is not None:
@@ -979,9 +973,9 @@ class ExpertStreamHost:
         return bool(self._module.expert_stream_fill_end(self.handle))
 
     def slot_info(self, row: int) -> list[tuple[int, int, int]]:
-        """Per slot: (state, expert, leases); state 0 FREE, 1 LOADING, 2 READY. A snapshot: with the thread running,
-        the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot`` or
-        ``inject_lease``, it waits for the end of the current request (the queue keeps its order): never take one on
+        """Per slot: (state, expert, stamp); state 0 FREE, 1 LOADING, 2 READY, 3 STAGING. A snapshot: with the thread
+        running, the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot``
+        or ``attach_row``, it waits for the end of the current request (the queue keeps its order): never take one on
         the thread a read in service is gated on (a test's device release, say), or it waits until the watchdog."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 3, dtype=torch.int64)
@@ -989,31 +983,25 @@ class ExpertStreamHost:
         values = out.tolist()
         return [tuple(values[i : i + 3]) for i in range(0, len(values), 3)]
 
-    def lease_entry(self, idx: int) -> dict:
-        """Test only: the service's lease account of request slot ``idx`` (``(seq - 1) % DEMAND_RECORDS``)."""
-        lanes = expert_lease_block.LANES
-        out = torch.zeros(3 + 3 * lanes, dtype=torch.int64)
-        self._module.expert_stream_lease_entry(self.handle, idx, out)
-        values = out.tolist()
-        return {
-            "active": bool(values[0]),
-            "count": values[1],
-            "gen": values[2] & 0xFFFFFFFFFFFFFFFF,
-            "lane_state": values[3 : 3 + lanes],
-            "lane_slot": values[3 + lanes : 3 + 2 * lanes],
-            "lane_copy_engine": values[3 + 2 * lanes :],
-        }
-
-    def inject_lease(self, row: int, slot: int, delta: int) -> None:
-        """Test only: hold a lease as a GPU reader would. Instrumented build only."""
-        _refuse_test_only("inject_lease", self.variant)
-        self._check(row, slot=slot)
-        self._module.expert_stream_inject_lease(self.handle, row, slot, delta)
-
-    def victim_census(self, row: int, wanted: Iterable[int] = ()) -> tuple[int, int, int]:
-        """(free, evictable, leased) slots a request wanting ``wanted`` could take, counted without taking any."""
+    def attach_row(self, row: int, k: int) -> None:
+        """Row ``row``'s ``k`` staging slots and its tag-1 map delta (LEASE_PROTOCOL.md); once per row."""
         self._check(row)
-        out = torch.empty(3, dtype=torch.int64)
+        self._module.expert_stream_attach_row(self.handle, row, int(k))
+
+    def take_bulk_delta(self) -> torch.Tensor:
+        """The eager paths' map changes since the last call, int32 ``[n, 3]`` of (row, expert, slot); paused only."""
+        out = torch.empty((int(self._module.expert_stream_bulk_delta_count(self.handle)), 3), dtype=torch.int32)
+        self._module.expert_stream_take_bulk_delta(self.handle, out)
+        return out
+
+    def handled_through(self) -> int:
+        """Test only: the last request seq the service finished."""
+        return int(self._module.expert_stream_handled_through(self.handle)) & 0xFFFFFFFF
+
+    def victim_census(self, row: int, wanted: Iterable[int] = ()) -> tuple[int, int]:
+        """(free, evictable) slots a request wanting ``wanted`` could take, counted without taking any."""
+        self._check(row)
+        out = torch.empty(2, dtype=torch.int64)
         self._module.expert_stream_victim_census(self.handle, row, _ids(wanted), out)
         return tuple(out.tolist())
 
@@ -1107,7 +1095,7 @@ class ExpertStreamHost:
         self._module.expert_stream_set_cpu_layer(self.handle, row, int(handle))
 
     def set_cpu_split(self, split: Sequence[int]) -> None:
-        """CPU experts: a new split table (CPU lanes per n resident lanes, n = 0..8), at any time."""
+        """CPU experts: a new split table (CPU lanes per n eligible lanes, n = 0..8), at any time; the device reads it."""
         self._module.expert_stream_set_cpu_split(self.handle, torch.tensor(list(split), dtype=torch.int64))
 
     def cpu_stats(self) -> dict[str, int]:
@@ -1118,9 +1106,7 @@ class ExpertStreamHost:
         return {"jobs": jobs, "lanes": lanes, "forward_ns": ns}
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
-        """Whether every job handed to the copy thread completed (or failed) within ``timeout_s``. The copy thread hands
-        each completed job back to the tier's owner, which releases its COPYING leases (D7): here, when the caller
-        owns the tier (no thread, or paused); otherwise at the running service's next poll."""
+        """Whether every job handed to the copy thread completed (or failed) within ``timeout_s``."""
         return bool(self._module.expert_stream_copy_engine_idle(self.handle, int(timeout_s * 1e9)))
 
     def copy_engine_release(self, marks: int = -1) -> None:
@@ -1352,7 +1338,7 @@ class ExpertStreamDevice:
         # captured graph.
         if cuda and not page.is_pinned():
             raise ValueError("page must be pinned for a CUDA device")
-        expert_lease_block.check_lease_block(lease_block, need_pinned=cuda)
+        expert_lease_block.check_lease_block(lease_block, layers, need_pinned=cuda)
         if lease_pdl and cuda and not is_arch_support_pdl():
             raise ValueError("lease-chain PDL needs sm_90 or newer (griddepcontrol)")
         if len(row_capacities) != layers:

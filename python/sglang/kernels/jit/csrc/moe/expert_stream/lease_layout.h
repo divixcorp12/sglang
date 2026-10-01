@@ -20,6 +20,7 @@ constexpr int64_t kRecFlags = 8;          // u32
 constexpr uint32_t kRecFlagCaptured = 1;  // posted from a captured graph
 constexpr int64_t kRecChain = 12;         // u32: low half of the row's map-chain number, 0 when no lane misses
 constexpr int64_t kRecChainHi = 16;       // u32: high half
+constexpr int64_t kRecEpoch = 24;         // u32: the device's epoch, so G = epoch << 32 | seq
 constexpr int64_t kRecProtectCount = 20;  // u16
 constexpr int64_t kRecProtect = 32;       // i32[kMaxIds]: every routed expert of the request
 constexpr int64_t kRecLanes = 64;         // kMaxIds lanes of kLaneBytes
@@ -63,7 +64,8 @@ constexpr int64_t kCopyArmed = kLeaseCopyGate + 128;  // u32: 1 once the service
 constexpr int64_t kSplit = kCopyArmed + 128;          // i32[kLeaseLanes + 1]: CPU lanes per n eligible lanes
 constexpr int64_t kLeaseBlockBytes = 20480;
 
-// ---- Map delta block: host-written, device-read, one record per row, 4096-byte aligned ----
+// ---- Map delta block: host-written, device-read, one record per row, after the completion block in one allocation ----
+constexpr int64_t kDeltaBase = kLeaseBlockBytes;
 constexpr int64_t kDeltaStride = 256;
 constexpr int64_t kDeltaTag = 0;       // u64: the map-chain number this delta follows, stored last with a release
 constexpr int64_t kDeltaCount = 8;     // u32: entries used

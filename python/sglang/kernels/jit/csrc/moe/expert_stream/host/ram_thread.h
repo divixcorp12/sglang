@@ -92,8 +92,8 @@ class RamThread {
     tier_->set_threaded(false);  // release: after the join, a waiting caller owns the tier and drains the ring
   }
 
-  // 1 paused, 0 timed out, 2 refused: a graph lane still holds a lease after one retirement pass (the caller must
-  // have synchronized the stream, so the device's acknowledgements are visible), and the slots are not the caller's.
+  // 1 paused, 0 timed out, 2 refused: the copy thread still has a job after the wait (the caller must have
+  // synchronized the stream, so every copy wait has seen its CopyDone), and the slots are not the caller's.
   int pause(int64_t timeout_ns) {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
     const uint64_t epoch = (pause_epoch_.load(std::memory_order_relaxed) | 1u) + 2u;  // a new odd epoch
@@ -115,11 +115,8 @@ class RamThread {
     }
     // The service parked for this epoch (it drained the command ring first): this caller owns the tier until resume.
     tier_->set_parked(true);
-    // The caller synchronized the stream, so every copy wait has seen its CopyDone. Once the copy engine is idle every
-    // job is in the completion ring, and this caller, the owner now, drains it and releases their COPYING leases (D7).
-    tier_->wait_copy_idle_owned(now_ns() + timeout_ns);
-    tier_->retire_leases();  // the synchronized stream left every Done word stored
-    if (tier_->graph_leases_outstanding() > 0) {
+    // The caller synchronized the stream, so every copy wait has seen its CopyDone and the copy thread is done.
+    if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {
       resume_locked();
       return 2;
     }

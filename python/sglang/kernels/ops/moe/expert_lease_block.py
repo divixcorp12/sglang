@@ -30,8 +30,9 @@ GATE_SEQ_MASK = 0x1FFFFFFF
 COPY_ARMED = COPY_GATE + 128  # u32: 1 once the service armed its copy engine
 SPLIT = COPY_ARMED + 128  # i32[LANES + 1]: CPU lanes per n eligible lanes
 
-# The map delta block: one DELTA_STRIDE record per row, {u64 tag; u32 count; i32 staging[LANES]; {i32 expert,
+# The map delta block, at DELTA_BASE of the same allocation: one DELTA_STRIDE record per row, {u64 tag; u32 count; i32 staging[LANES]; {i32 expert,
 # i32 slot}[DELTA_MAX_ENTRIES]}. The tag is stored last with a release; a zero tag is never a written delta.
+DELTA_BASE = BLOCK_BYTES
 DELTA_STRIDE = 256
 DELTA_FIELDS = {"tag": 0, "count": 8, "staging": 16, "entries": 48}
 DELTA_MAX_ENTRIES = 16
@@ -42,38 +43,36 @@ def gate_word(seq: int, low: str) -> int:
     return ((seq & GATE_SEQ_MASK) << GATE_SEQ_SHIFT) | GATE[low]
 
 
-def new_lease_block(*, pin: bool) -> torch.Tensor:
-    """A zeroed, 4096-aligned uint8 block of BLOCK_BYTES; pinned for a real device.
+def lease_block_bytes(rows: int) -> int:
+    """The completion block and, after it at DELTA_BASE, one delta record per row, in whole pages."""
+    if rows < 1:
+        raise ValueError(f"the lease block needs at least one row, got {rows}")
+    return BLOCK_BYTES + -(-rows * DELTA_STRIDE // BLOCK_ALIGN) * BLOCK_ALIGN
+
+
+def new_lease_block(rows: int, *, pin: bool) -> torch.Tensor:
+    """A zeroed, 4096-aligned uint8 block of lease_block_bytes(rows); pinned for a real device.
 
     The allocator is asked for a page of slack and the view is sliced to the aligned start, since neither
     torch.zeros nor the pinned allocator promises 4096 alignment. The slice keeps the storage alive.
     """
-    raw = torch.zeros(BLOCK_BYTES + BLOCK_ALIGN, dtype=torch.uint8, pin_memory=pin)
+    size = lease_block_bytes(rows)
+    raw = torch.zeros(size + BLOCK_ALIGN, dtype=torch.uint8, pin_memory=pin)
     start = (-raw.data_ptr()) % BLOCK_ALIGN
-    block = raw[start : start + BLOCK_BYTES]
-    check_lease_block(block, need_pinned=pin)
+    block = raw[start : start + size]
+    check_lease_block(block, rows, need_pinned=pin)
     return block
 
 
-def check_lease_block(block: torch.Tensor, *, need_pinned: bool) -> None:
+def check_lease_block(block: torch.Tensor, rows: int, *, need_pinned: bool) -> None:
     """Refuse a block the kernels and the service cannot address."""
     if block.dtype != torch.uint8 or block.device.type != "cpu" or block.dim() != 1:
         raise ValueError("the lease block must be a 1-D CPU uint8 tensor")
-    if block.numel() != BLOCK_BYTES:
-        raise ValueError(f"the lease block has {block.numel()} bytes, not {BLOCK_BYTES}")
+    if block.numel() != lease_block_bytes(rows):
+        raise ValueError(f"the lease block has {block.numel()} bytes, not {lease_block_bytes(rows)} for {rows} rows")
     if not block.is_contiguous():
         raise ValueError("the lease block must be contiguous")
     if block.data_ptr() % BLOCK_ALIGN != 0:
         raise ValueError(f"the lease block must be {BLOCK_ALIGN}-byte aligned, its address is {block.data_ptr():#x}")
     if need_pinned and not block.is_pinned():
         raise ValueError("the lease block must be pinned for a CUDA device: the kernels read it through UVA")
-
-
-def new_delta_block(rows: int, *, pin: bool) -> torch.Tensor:
-    """A zeroed, 4096-aligned uint8 block of rows * DELTA_STRIDE (whole pages); pinned for a real device."""
-    if rows < 1:
-        raise ValueError(f"the delta block needs at least one row, got {rows}")
-    size = -(-rows * DELTA_STRIDE // BLOCK_ALIGN) * BLOCK_ALIGN
-    raw = torch.zeros(size + BLOCK_ALIGN, dtype=torch.uint8, pin_memory=pin)
-    start = (-raw.data_ptr()) % BLOCK_ALIGN
-    return raw[start : start + size]
