@@ -13,8 +13,8 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     new_page,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_lease_sim import LeaseSim, post_record
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
+from sglang.test.dsv41_chain_sim import ChainSim
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup, same_bytes
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -28,24 +28,22 @@ def hang_guard():
 
 @pytest.fixture
 def tier(tmp_path):
-    s = ram_miss_setup(tmp_path, capacity=6)
+    s = ram_miss_setup(tmp_path, capacity=7)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
-    yield s, page, host
+    host = attached_host(s, page, k=3)
+    yield s, page, host, ChainSim(host, page, None)
     host.stop()
 
 
-def _post(page, host, row, lanes, protect=None):
-    return LeaseSim(host, page, None).post(row, lanes, protect=protect)
+def _post(sim, row, lanes, protect=None):
+    return sim.post(row, lanes, protect=protect)
 
 
-def _serve(page, host, row, lanes, protect=None):
-    """One demand for ``lanes``, served, then Done (the next pump retires its leases); returns its seq."""
-    sim = LeaseSim(host, page, None)
+def _serve(sim, host, row, lanes, protect=None):
+    """One demand for ``lanes``, served; returns its seq."""
     req = sim.post(row, lanes, protect=protect)
     assert host.pump() == 1
-    assert sim.wait(req, timeout_s=1.0).served
-    sim.done(req)
+    assert sim.wait_served(req, timeout_s=1.0)
     return req.seq
 
 
@@ -79,18 +77,18 @@ def _until(predicate, timeout_s=5.0):
 
 
 def test_no_records_without_enable(tier):
-    s, page, host = tier
-    _serve(page, host, 0, [1, 2])
+    s, page, host, sim = tier
+    _serve(sim, host, 0, [1, 2])
     assert host.drain_trace() == [] and host.trace_dropped() == 0
 
 
 def test_one_record_per_request_in_order(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace()
     seqs = [
-        _serve(page, host, 1, [2, 5]),
-        _serve(page, host, 1, [2]),  # resident already: served with no read
-        _serve(page, host, 1, [3], protect=[2, 3, 5]),  # 2 and 5 are resident: one row read
+        _serve(sim, host, 1, [2, 5]),
+        _serve(sim, host, 1, [2]),  # resident already: served with no read
+        _serve(sim, host, 1, [3], protect=[2, 3, 5]),  # 2 and 5 are resident: one row read
     ]
     records = host.drain_trace()
     assert [r["seq"] for r in records] == seqs
@@ -113,41 +111,41 @@ def test_one_record_per_request_in_order(tier):
 
 
 def test_per_drive_bytes_sum_to_the_request_total(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace()
-    _serve(page, host, 1, [0, 1, 2, 3, 4, 5])
+    _serve(sim, host, 1, [0, 1, 2])  # the fixture's three staging slots
     (record,) = host.drain_trace()
-    per_row = {row: sum(e["row"] == row for e in record["extent_cqe"]) for row in range(6)}
-    assert len(set(per_row.values())) == 1 and record["extents"] == 6 * per_row[0] and record["bytes"] > 0
+    per_row = {row: sum(e["row"] == row for e in record["extent_cqe"]) for row in range(3)}
+    assert len(set(per_row.values())) == 1 and record["extents"] == 3 * per_row[0] and record["bytes"] > 0
     assert sum(d["bytes"] for d in record["drives"]) == record["bytes"]
     assert sum(d["extents"] for d in record["drives"]) == record["extents"]
     assert [d["dev"] for d in record["drives"]] == [os.stat(s.tables.paths[0]).st_dev]
 
 
 def test_an_unarmed_record_is_a_touch(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace()
-    _serve(page, host, 0, [1])
-    seq = post_record(page, 0, [1], armed=False)
+    _serve(sim, host, 0, [1])
+    seq = sim.post(0, [], protect=[1]).seq
     assert host.pump() == 1
     read, touch = host.drain_trace()
     assert (touch["kind"], touch["seq"], touch["ok"], touch["extents"]) == ("touch", seq, 1, 0)
 
 
 def test_a_full_ring_drops_and_counts(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace(capacity=2)
     for _ in range(5):
-        _serve(page, host, 0, [1])
+        _serve(sim, host, 0, [1])
     assert len(host.drain_trace()) == 2 and host.trace_dropped() == 3
-    _serve(page, host, 0, [1])  # draining frees the ring
+    _serve(sim, host, 0, [1])  # draining frees the ring
     assert len(host.drain_trace()) == 1
 
 
 def test_a_backlog_is_seen_when_records_queue_behind_a_slow_one(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace()
-    seqs = [_post(page, host, 0, [1]) for _ in range(3)]  # three posted before any is served
+    seqs = [_post(sim, 0, [], protect=[1]) for _ in range(3)]  # three posted before any is served (touch records)
     for _ in seqs:
         assert host.pump() == 1
     assert [r["backlog"] for r in host.drain_trace()] == [2, 1, 0]
@@ -165,9 +163,9 @@ def _assert_terminal(record, status, missing):
 
 
 def test_a_served_request_has_per_row_stamps_in_causal_order(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace()
-    _serve(page, host, 1, [2, 5, 4])
+    _serve(sim, host, 1, [2, 5, 4])
     (record,) = host.drain_trace()
     _assert_terminal(record, "served", [])
     assert record["rows"] == record["rows_asked"] == 3 and record["extents"] == len(record["extent_cqe"]) >= 3
@@ -188,10 +186,10 @@ def test_a_served_request_has_per_row_stamps_in_causal_order(tier):
 
 
 def test_a_zero_miss_request_marks_the_read_stages_missing(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace()
-    _serve(page, host, 1, [2])
-    _serve(page, host, 1, [2])  # resident: nothing to read
+    _serve(sim, host, 1, [2])
+    _serve(sim, host, 1, [2])  # resident: nothing to read
     _, empty = host.drain_trace()
     _assert_terminal(empty, "no_read", READ_STAGES)
     assert empty["rows"] == empty["rows_asked"] == 0 and empty["batches"] == 0
@@ -200,10 +198,10 @@ def test_a_zero_miss_request_marks_the_read_stages_missing(tier):
 
 
 def test_a_touch_is_terminal_and_reads_nothing(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace()
-    _serve(page, host, 0, [1])
-    post_record(page, 0, [1], armed=False)
+    _serve(sim, host, 0, [1])
+    sim.post(0, [], protect=[1])
     assert host.pump() == 1
     _, touch = host.drain_trace()
     _assert_terminal(touch, "touch", ["reserved", *READ_STAGES, "mapped"])
@@ -213,15 +211,16 @@ def test_disabled_tracing_serves_the_same_bytes_and_state_as_enabled(tmp_path):
     def run(name, trace):
         root = tmp_path / name
         root.mkdir()
-        s = ram_miss_setup(root, capacity=6)
+        s = ram_miss_setup(root, capacity=7)
         page = new_page(pin=False)
         slot_map = torch.full((2, 6), -1, dtype=torch.int32)
-        host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
+        host = attached_host(s, page, k=3, slot_map=slot_map)
+        sim = ChainSim(host, page, None)
         if trace:
             host.enable_trace()
         try:
             for row, need, protect in [(1, [2, 5, 4], [2, 5, 4]), (1, [0], [0, 2]), (0, [1, 3], [1, 3])]:
-                _serve(page, host, row, need, protect=protect)
+                _serve(sim, host, row, need, protect=protect)
             return s, slot_map, host.counters(), len(host.drain_trace())
         finally:
             host.stop()
@@ -238,12 +237,13 @@ def test_disabled_tracing_serves_the_same_bytes_and_state_as_enabled(tmp_path):
 
 
 def test_the_service_thread_records_every_demand(tier):
-    s, page, host = tier
+    s, page, host, sim = tier
     host.enable_trace()
     host.start_thread(fatal_wait_s=5.0)
-    sim = LeaseSim(host, page, None)
-    reqs = [sim.post(1, [e]) for e in (0, 1, 2)]
-    assert sim.wait(reqs[-1], 10).served
+    reqs = []
+    for e in (0, 1, 2):  # each a miss chain: the device posts the next once this one is served
+        reqs.append(sim.post(1, [e]))
+        assert sim.wait_served(reqs[-1], 10)
     seqs = [req.seq for req in reqs]
     records = []
     assert _until(lambda: records.extend(host.drain_trace()) or len(records) >= 3)

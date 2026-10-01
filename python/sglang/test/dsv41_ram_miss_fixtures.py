@@ -197,6 +197,20 @@ def ram_miss_setup(
     return RamMissSetup(layout, fmt, specs, slabs, tables, roots)
 
 
+def attached_host(setup: "RamMissSetup", page: torch.Tensor, *, k: int = 1, slot_map=None, **host_kw):
+    """An ExpertStreamHost over ``setup``'s tables with every row attached with ``k`` staging slots (the service's
+    attach does this per row), and ``slot_map`` (a fresh -1 map when None)."""
+    from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost
+
+    layers, experts = setup.tables.starts.shape[:2]
+    if slot_map is None:
+        slot_map = torch.full((layers, experts), -1, dtype=torch.int32)
+    host = ExpertStreamHost(setup.tables, page=page, slot_map=slot_map, **host_kw)
+    for row in range(layers):
+        host.attach_row(row, k)
+    return host
+
+
 _HOST_SCRIPT_HEAD = """
 import pathlib, sys, time
 import torch
