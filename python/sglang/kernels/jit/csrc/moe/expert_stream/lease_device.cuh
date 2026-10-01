@@ -156,7 +156,9 @@ SGL_DEVICE void write_record(
     st_relaxed_sys<int32_t>(lane + kLaneSlot, used ? lanes.slot[i] : -1);
     st_relaxed_sys<int32_t>(lane + kLaneDst, used ? dst[i] : -1);
     st_relaxed_sys<uint32_t>(lane + kLaneWeight, __float_as_uint(used ? weight[i] : 0.0f));
-    st_relaxed_sys<uint8_t>(record + kRecKinds + i, used ? lanes.kind[i] : static_cast<uint8_t>(0));
+    // Deduced, not st_relaxed_sys<uint8_t>: with T = uint8_t the byte-address overload names itself.
+    const uint8_t kind = used ? lanes.kind[i] : static_cast<uint8_t>(0);
+    st_relaxed_sys(record + kRecKinds + i, kind);
   }
   st_release_sys(record + kRecSeq, seq);
 }
