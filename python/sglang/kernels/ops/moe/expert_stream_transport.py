@@ -1015,11 +1015,6 @@ class ExpertStreamHost:
         watchdog times on its own thread (its stuck rule)."""
         return int(self._module.expert_stream_busy_episode(self.handle))
 
-    def enable_gpu_hot(self) -> None:
-        if self.hot_page is None:
-            raise ValueError("EXL3 DIRECT requires a hot bitmap sidecar")
-        self._module.expert_stream_set_gpu_hot(self.handle, 1)
-
     def set_prefill_share(self, share: int) -> None:
         """Rows a prefill may own per layer before its admissions evict its own rows instead of decode's; 0 is off."""
         self._module.expert_stream_set_prefill_share(self.handle, int(share))

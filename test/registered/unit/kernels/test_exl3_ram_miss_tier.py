@@ -80,7 +80,6 @@ def test_gpu_hot_sidecar_protects_a_victim_and_a_resident_lane_reads_nothing(tmp
     host.reserve_staging(1)
     sim = ChainSim(host, page, s.slabs)
     try:
-        host.enable_gpu_hot()
         for expert in (0, 1, 2):
             host.assign(0, expert)
         sim.sync_bulk()
@@ -104,7 +103,6 @@ def test_gpu_hot_sidecar_aborts_on_a_stale_or_malformed_record_after_a_wrap(tmp_
         tmp_path,
         f"""
         from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, hot_record_bytes
-        host.enable_gpu_hot()
         for _ in range(DEMAND_RECORDS + 1):
             req = sim.post(0, [], hot=[0])
             assert host.pump() == 1

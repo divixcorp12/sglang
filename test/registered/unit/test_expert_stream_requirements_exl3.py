@@ -41,6 +41,10 @@ WINDOW_C_ENV = {
 }
 
 
+# The residency the RAM-miss service needs: the in-graph updater at insert-on-miss stage 2.
+DIRECT = {"SGLANG_MOE_GPU_RESIDENCY_UPDATE": True, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 2}
+
+
 @pytest.fixture
 def model_dir(tmp_path):
     config = {"architectures": ["DeepseekV4ForCausalLM"], "quantization_config": {"quant_method": "exl3", "bits": 3.02}}
@@ -194,7 +198,7 @@ def test_an_explicit_alt_stream_overlap_with_breakable_decode_is_refused(model_d
 
 
 def test_graph_gather_over_the_pinned_tier_needs_breakable_decode(model_dir):
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, **DIRECT)
     with pytest.raises(ValueError, match="GRAPH_GATHER"):
         _gate(_launch(model_dir), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
     with pytest.raises(ValueError, match="PINNED_HOST_MB"):
@@ -322,7 +326,7 @@ def test_a_flag_only_full_decode_graph_launch_passes_pass_one_and_is_refused_aft
 
 def test_graph_gather_keeps_the_alt_stream_overlap_off(model_dir, multi_stream_unset):
     # The fused MoE's temp buffers are shared by every layer: sound only on one stream.
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, **DIRECT)
     assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
 
 

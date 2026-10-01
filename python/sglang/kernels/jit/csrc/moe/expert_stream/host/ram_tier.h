@@ -255,7 +255,7 @@ class RamTier {
       count<kOverruns>();
     } else {
       bool skip = false;
-      if (gpu_hot_mode_.load() && !request.lanes.empty()) {
+      if (hot_page_ != nullptr && !request.lanes.empty()) {
         if (request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
             load_acquire(record + kRecSeq) == next_demand_) {
           apply_gpu_hot(request);
@@ -506,11 +506,6 @@ class RamTier {
   void set_prefill_share(int64_t share) {
     if (share < 0) throw std::runtime_error(error_prefix<Layout>() + "a prefill share cannot be negative");
     prefill_share_.store(share, std::memory_order_relaxed);
-  }
-
-  void set_gpu_hot(bool on) {
-    if (hot_page_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "GPU hot mode needs a sidecar");
-    gpu_hot_mode_.store(on);
   }
 
   // The hot bitmap of `expected`'s record, copied into the service-owned hot_scratch_: not const, it writes
@@ -1621,9 +1616,8 @@ class RamTier {
   uint8_t* page_;
   int32_t* map_;
   uint8_t* lease_;  // the lease block (lease_layout.h)
-  uint8_t* hot_page_ = nullptr;
+  uint8_t* hot_page_ = nullptr;  // the hot bitmap sidecar: when given, each record's hot set is applied
   int64_t hot_stride_ = 0;
-  std::atomic<bool> gpu_hot_mode_{false};
   // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
   std::unique_ptr<Engine> copy_engine_;
   // CPU experts, when enabled (after the copy engine, before the service thread); stopped after the copy thread.

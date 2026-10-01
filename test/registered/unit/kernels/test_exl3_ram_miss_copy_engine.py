@@ -267,7 +267,6 @@ def test_lapped_hit_only_records_do_not_stall(tmp_path):
     hot_page = new_hot_page(6, pin=False)
     s, page, host, sim = _host(tmp_path, hot_page=hot_page)
     try:
-        host.enable_gpu_hot()
         _load(sim, host, [3])
         mapping = host.mapping(ROW)
         for _ in range(DEMAND_RECORDS + 8):  # past the ring, with no host pass in between
@@ -288,7 +287,6 @@ def test_a_stale_hot_record_on_a_hit_only_record_is_an_overrun_not_fatal(tmp_pat
     hot_page = new_hot_page(6, pin=False)
     s, page, host, sim = _host(tmp_path, hot_page=hot_page)
     try:
-        host.enable_gpu_hot()
         _load(sim, host, [3])
         before = host.counters()["overruns"]
         req = sim.post(ROW, [3], hot_seq=1)

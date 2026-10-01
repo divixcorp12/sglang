@@ -355,10 +355,10 @@ class NativePinnedSlotTable:
     def _push_hot(self) -> None:
         """Make the C++ victim choice protect what ``is_pinned`` protects right now.
 
-        The hot cache reserves a residency update's experts before the residency
-        listener pushes them, and promotes them in chunks, each in its own host use:
-        without this push, a later chunk's admission could evict an earlier chunk's
-        expert from RAM (a VRAM-hot expert with no pinned copy).
+        Until the updater is attached (startup promotions) that is the hot cache's slots, which it reserves before
+        promoting them in chunks, each in its own host use: without this push, a later chunk's admission could evict
+        an earlier chunk's expert from RAM (a VRAM-hot expert with no pinned copy). After it, the snapshot taken at
+        the pause.
         """
         streamer = self.streamer_of()
         hot = None if streamer is None else getattr(streamer, "hot_cache", None)
@@ -789,21 +789,18 @@ class Exl3RamMissService:
         """The format's ``attach_hot_cache_manager``: hooks once, a row backend per layer."""
         self.ensure_started()
         if self._manager is None:
-            self._manager = manager
-            manager.register_fail_stop_check(self.fail_stop_check)
             updater = getattr(manager, "gpu_residency", None)
             if updater is None or not updater.insert_direct:
-                if self.cpu_experts is not None:
-                    raise RuntimeError(
-                        "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs DIRECT residency "
-                        "(SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
-                        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2): its ranking orders the miss lanes the CPU takes"
-                    )
-                manager.add_residency_listener(self.on_residency)
-            else:
-                self._enable_gpu_hot(updater)
-                if self.cpu_experts is not None:
-                    updater.enable_miss_order()
+                raise RuntimeError(
+                    "exl3 RAM miss: the service needs DIRECT residency (SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
+                    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2): every record carries its hot set, and the CPU experts' "
+                    "miss lanes are ordered by its ranking"
+                )
+            self._manager = manager
+            manager.register_fail_stop_check(self.fail_stop_check)
+            self._enable_gpu_hot(updater)
+            if self.cpu_experts is not None:
+                updater.enable_miss_order()
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
         if streamer.graph_gather_rows > MAX_IDS:
@@ -829,7 +826,7 @@ class Exl3RamMissService:
                 timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
                 piece_runs=self.host.piece_runs(),
                 row_capacities=[int(c) for c in self.host.tables.capacity],
-                hot_page=self.hot_page if self.gpu_hot_enabled else None,
+                hot_page=self.hot_page,
                 lease_pdl=self.lease_pdl,
                 hit_copy=envs.SGLANG_DSV41_RAM_HIT_COPY.get(),
                 cpu_misses=envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get(),
@@ -885,9 +882,8 @@ class Exl3RamMissService:
         streamer.row_backend = Exl3RamMissRowBackend(
             previous.segments, previous.host_row_map, self.device_side, row, streamer.graph_gather_rows,
             {tag: stream_segment_map(segments, self.host.tables, row) for tag, segments in previous.segments.items()},
-            hot_slots=(manager.gpu_residency.slot_to_expert[manager.gpu_residency.layer_ids.index(streamer.layer_id)]
-                       if self.gpu_hot_enabled else None),
-            hot_capacity=cache.capacity if self.gpu_hot_enabled else 0,
+            hot_slots=manager.gpu_residency.slot_to_expert[manager.gpu_residency.layer_ids.index(streamer.layer_id)],
+            hot_capacity=cache.capacity,
             route_log=self.route_log,
             copy_engine=self.copy_engine,
             copy_sm_table=copy_sm,
@@ -935,16 +931,10 @@ class Exl3RamMissService:
         self._refresh_hot_lists()
         for layer_id, experts in self._hot_lists.items():
             self.host.set_hot(self.row_of(layer_id), experts)
-        self.host.enable_gpu_hot()
         self.gpu_hot_enabled = True
 
     def hot_experts(self, layer_id: int) -> list[int]:
         return self._hot_lists.get(layer_id, [])
-
-    def on_residency(self, layer_id: int, slot_to_expert: list[int]) -> None:
-        self._refuse_if_shut_down()
-        if layer_id in self._rows:
-            self.host.set_hot(self.row_of(layer_id), slot_to_expert)
 
     def fail_stop_check(self) -> None:
         """Per batch (the scheduler's fail-stop hook, ``run_fail_stop_checks``): the service's per-batch upkeep. A

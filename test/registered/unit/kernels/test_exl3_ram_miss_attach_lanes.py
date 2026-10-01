@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, DirectUpdaterStandIn, service_row_images
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -54,15 +54,19 @@ def tiers(tmp_path, monkeypatch):
     module.Exl3RamMissService._instance = None
 
 
-def _attach(service, streamer, rows, updater=None):
-    manager = SimpleNamespace(
-        register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None, gpu_residency=updater
+def _manager(updater=None):
+    return SimpleNamespace(
+        register_fail_stop_check=lambda check: None,
+        gpu_residency=updater if updater is not None else DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS),
     )
+
+
+def _attach(service, streamer, rows, manager=None):
     streamer._graph_pinned_tier = True
-    streamer.hot_cache = SimpleNamespace(device="cpu")
+    streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
     streamer.graph_gather_rows = rows
     streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
-    service.attach(manager, streamer)
+    service.attach(manager if manager is not None else _manager(), streamer)
 
 
 @pytest.mark.parametrize("rows", [1, 6, MAX_IDS])
@@ -131,10 +135,11 @@ def test_attach_refuses_a_manager_without_direct_residency(tiers):
     listener instead."""
     service, streamers = tiers
     service.ensure_started()
+    off = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=None)
     with pytest.raises(RuntimeError, match="needs DIRECT residency"):
-        _attach(service, streamers[0], 1)
+        _attach(service, streamers[0], 1, off)
     with pytest.raises(RuntimeError, match="needs DIRECT residency"):
-        _attach(service, streamers[0], 1, updater=SimpleNamespace(insert_direct=False))
+        _attach(service, streamers[0], 1, _manager(SimpleNamespace(insert_direct=False)))
     assert service.device_side is None and service._manager is None
 
 
@@ -144,22 +149,6 @@ def test_cpu_experts_refuse_the_generic_route_plan():
     with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"), envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False):
         with pytest.raises(RuntimeError, match="needs SGLANG_MOE_EXPERT_FUSED_PLAN"):
             module.Exl3RamMissService._start_cpu_experts(cfg, None, None, {}, False)
-
-
-class _DirectUpdater:
-    """The DIRECT updater surface attach reads; ``enable_miss_order`` allocates the keys as the real one does."""
-
-    insert_direct = True
-    device = torch.device("cpu")
-    layer_ids = list(range(LAYERS))
-
-    def __init__(self):
-        self.slot_to_expert = torch.full((LAYERS, CAPACITY + 1), -1, dtype=torch.int64)
-        self.caches = [SimpleNamespace(capacity=CAPACITY) for _ in range(LAYERS)]
-        self.miss_keys = None
-
-    def enable_miss_order(self):
-        self.miss_keys = torch.zeros((LAYERS, EXPERTS), dtype=torch.int64)
 
 
 def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(tiers, monkeypatch):
@@ -178,7 +167,7 @@ def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(ti
         x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
         attach_device=lambda device_side: None,
     )
-    updater = _DirectUpdater()
+    updater = DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
     manager = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater)
     try:
         for layer_id, streamer in streamers.items():

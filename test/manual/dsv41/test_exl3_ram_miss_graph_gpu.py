@@ -74,11 +74,13 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import DirectUpdaterStandIn, service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=num_layers, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
+    # The staging slots the service reserves at start: the graph's misses, and the rest of the tier is mappable.
+    service_module.Exl3RamMissService.get().staging_slots = TOP_K
     with (
         # The service reads row images with O_DIRECT, in lease mode (always on), as in production.
         service_row_images(tmp_path),
@@ -97,7 +99,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
             fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
             streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
             layer._nvfp4_expert_streamer = streamer
-            # Eight mappable rows plus the TOP_K staging slots attach reserves for the graph's misses.
+            # Eight mappable rows plus the TOP_K staging slots the service reserves for the graph's misses.
             ExpertPinnedHostCache(streamer, 8 + TOP_K, **fmt.pinned_tier_options(layer))
             pairs.append((layer, streamer))
         for layer, streamer in pairs:
@@ -107,14 +109,12 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
             hots.append(hot)
         checks = []
 
-        def add_residency_listener(self, listener):
-            for layer_id, hot in enumerate(hots):
-                listener(layer_id, list(hot.slot_to_expert))
-
+        # The hot sets are static here: the DIRECT updater's bank, whose rows every post writes into its record.
+        updater = DirectUpdaterStandIn(num_layers, 3, EXPERTS, device="cuda")
+        for layer_id, hot in enumerate(hots):
+            updater.slot_to_expert[layer_id, :3] = torch.tensor(hot.slot_to_expert, dtype=torch.int64, device="cuda")
         manager = type(
-            "M",
-            (),
-            {"register_fail_stop_check": lambda self, f: checks.append(f), "add_residency_listener": add_residency_listener},
+            "M", (), {"register_fail_stop_check": lambda self, f: checks.append(f), "gpu_residency": updater}
         )()
         for _, streamer in pairs:
             streamer.format.attach_hot_cache_manager(manager, streamer)
@@ -151,6 +151,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     service = service_module.Exl3RamMissService.get()
+    service.staging_slots = TOP_K
     try:
         with (
             service_row_images(tmp_path),  # the service reads row images with O_DIRECT, as in production

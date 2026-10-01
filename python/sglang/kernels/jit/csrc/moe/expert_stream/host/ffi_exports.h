@@ -283,10 +283,6 @@ struct HostExports {
     find(handle)->set_prefill_share(share);
   }
 
-  static void set_gpu_hot(int64_t handle, int64_t on) {
-    find(handle)->set_gpu_hot(on != 0);
-  }
-
   static void enable_copy_engine(int64_t handle, int64_t device, int64_t spin_ns, int64_t wait_timeout_ns) {
     find(handle)->enable_copy_engine(device, spin_ns, wait_timeout_ns);
   }
@@ -601,7 +597,6 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_landed, Exports::fill_landed);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_end, Exports::fill_end);                             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_close_admission, Exports::close_admission);               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_gpu_hot, Exports::set_gpu_hot);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_prefill_share, Exports::set_prefill_share);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_copy_engine, Exports::enable_copy_engine);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_copy_table, Exports::set_copy_table);                 \

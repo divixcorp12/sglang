@@ -83,7 +83,7 @@ unmaps. Sixteen entries are an insert and an eviction per lane.
       the row's capacity, a miss with no staging slot, or a split entry above n.
    3. With a CPU lane it stages x (fp16) into the row's pinned input row, every thread, before the record.
    4. If any lane misses it bumps `map_chain[row]` and puts the new number in the record: the host answers that
-      record with the delta under this number. It writes the hot sidecar (GPU-hot mode), the record (seqlock: seq 0,
+      record with the delta under this number. It writes the hot sidecar, the record (seqlock: seq 0,
       release fence, payload, seq with a release), and `demand_head` with a release.
 2. **C1** copies the `HIT_SM` lanes from their RAM slots into their destination slots.
 3. **S** copies the `MISS_GPU` lanes from their staging slots, piece by piece as PieceMask bits for G appear.
@@ -118,7 +118,7 @@ unmaps. Sixteen entries are an insert and an eviction per lane.
 6. The host mirror (`slot_map`, read by the eager Python paths) shows an insert only after its bytes land; a victim's
    unmap is written to it at victim choice, before any read.
 
-A record with no lanes only stamps recency. In GPU-hot mode a record with lanes reads its hot sidecar: if the sidecar
+A record with no lanes only stamps recency. A record with lanes reads its hot sidecar: if the sidecar
 was lapped, an all-`HIT_SM` record is counted as an overrun and skipped, and any other record fails stop.
 
 ## Deltas and the bulk delta
@@ -192,7 +192,7 @@ Every failure ends the process; the protocol carries no error state.
 
 - **Host:** `fail_stop` prints `FATAL ...` and calls `std::abort()`: a lane the tier does not hold, a miss outside the
   staging list, a map chain out of order, a whole record with a kind or count the device never writes (a torn record
-  is an overrun; a malformed one is not), a failed or faulted read, a GPU-hot record with no hot set, a failed
+  is an overrun; a malformed one is not), a failed or faulted read, a record with no hot set, a failed
   copy-engine issue or query, a copy-engine ring overflow, a CPU miss whose row never landed, a failed CPU forward,
   among others (`fail_stop` call sites in `host/`). **Not every abort precedes the chain's last piece:** the service
   thread aborts before it publishes the failing piece, but a copy-thread or CPU-thread failure can come after S has

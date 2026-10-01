@@ -9,6 +9,7 @@ pinned host tier (never the host arena); and a ``stat`` or ``per_pass`` recorder
 under dynamic residency. Speculative decoding (DSpark or otherwise) is refused with
 any decode CUDA graph: it must run with the decode graph disabled, since a spec verify
 step runs more than one token through scratch and RAM-miss posting sized for one.
+The graph gather needs DIRECT residency (the GPU residency update at insert-on-miss stage 2).
 Nothing else is required; ``--max-running-requests`` and the
 overlap schedule stay free. This module runs during server-args processing,
 so it imports only the gate module, ``sglang.srt.environ``, the graph-config enum
@@ -124,6 +125,7 @@ def _check(cfg, budgets) -> None:
     # CPU experts need it on, at stage 2.
     _check_slot_map()
     _check_cpu_experts(budgets)
+    _check_direct_residency(budgets)
     # The shared eager check refuses graph gather; decode graphs may use it.
     _EAGER.check(_EagerGraphView(cfg), dataclasses.replace(budgets, graph_gather=False))
     # DSV4's alt-stream overlap still gives wrong output when captured in the breakable
@@ -151,6 +153,18 @@ def _check_slot_map() -> None:
     if envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         # The device would type misses kMissCpu that no CPU thread computes.
         raise ValueError("SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1")
+
+
+def _check_direct_residency(budgets) -> None:
+    """The graph gather runs the RAM-miss service, whose VRAM-hot set is the one the DIRECT updater writes into every
+    record: no other residency mode feeds it."""
+    if budgets.graph_gather and not (
+        envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get() and envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2
+    ):
+        raise ValueError(
+            "EXL3 graph gather (the RAM-miss service) needs DIRECT residency "
+            "(SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2)"
+        )
 
 
 def _check_cpu_experts(budgets) -> None:

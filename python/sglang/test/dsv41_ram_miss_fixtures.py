@@ -197,6 +197,27 @@ def ram_miss_setup(
     return RamMissSetup(layout, fmt, specs, slabs, tables, roots)
 
 
+class DirectUpdaterStandIn:
+    """The DIRECT updater surface the RAM-miss service reads at attach: ``insert_direct``, the hot bank
+    ``slot_to_expert`` (``[layers, capacity + 1]``, the last column the dump slot), ``layer_ids``, ``caches`` and, for
+    CPU experts, ``enable_miss_order``'s keys. A test sets a layer's hot set by writing its bank row."""
+
+    insert_direct = True
+
+    def __init__(self, layers: int, capacity: int, experts: int, device="cpu"):
+        from types import SimpleNamespace
+
+        self.device = torch.device(device)
+        self.layer_ids = list(range(layers))
+        self.slot_to_expert = torch.full((layers, capacity + 1), -1, dtype=torch.int64, device=self.device)
+        self.caches = [SimpleNamespace(capacity=capacity) for _ in range(layers)]
+        self.experts = experts
+        self.miss_keys = None
+
+    def enable_miss_order(self) -> None:
+        self.miss_keys = torch.zeros((len(self.layer_ids), self.experts), dtype=torch.int64, device=self.device)
+
+
 def attached_host(setup: "RamMissSetup", page: torch.Tensor, *, k: int = 1, slot_map=None, **host_kw):
     """An ExpertStreamHost over ``setup``'s tables with ``k`` staging slots reserved per row (the service reserves them
     at start), and ``slot_map`` (a fresh -1 map when None)."""

@@ -52,7 +52,6 @@ def build_host(tmp_path, *, variant=None, threaded=False, copy_spin_us=200):
         host.set_copy_table(row, table, DST_ROWS)
     host.reserve_staging(STAGING)
     host.arm_copy_engine()
-    host.enable_gpu_hot()
     return s, page, host, ChainSim(host, page, s.slabs), dst
 
 

@@ -20,7 +20,12 @@ from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStr
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images, write_row_images
+from sglang.test.dsv41_ram_miss_fixtures import (
+    ROW_IMAGE_DIM,
+    DirectUpdaterStandIn,
+    service_row_images,
+    write_row_images,
+)
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -183,17 +188,15 @@ def test_nested_host_use_pauses_and_refreshes_only_at_the_outermost_level(tiers,
     assert len(refreshes) == 2
 
 
-def test_attach_registers_once_and_pushes_residency(tiers):
+def test_attach_registers_once_and_seeds_the_updaters_hot_set(tiers):
     service, streamers, caches = tiers
-    checks, listeners = [], []
-    manager = SimpleNamespace(
-        register_fail_stop_check=checks.append,
-        add_residency_listener=listeners.append,
-    )
+    checks = []
+    updater = DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
+    updater.slot_to_expert[1, 0] = 3  # expert 3 is hot in layer 1, and in layer 1 only
+    manager = SimpleNamespace(register_fail_stop_check=checks.append, gpu_residency=updater)
     for streamer in streamers.values():
         streamer.format.attach_hot_cache_manager(manager, streamer)
-    assert len(checks) == 1 and len(listeners) == 1
-    listeners[0](1, [3, -1])  # expert 3 is hot in layer 1, and in layer 1 only
+    assert len(checks) == 1
     for layer_id in (0, 1):
         # Capacity 3; 3 is loaded first, so plain LRU would evict it next.
         caches[layer_id].ensure_rows(torch.tensor([3]))
@@ -330,8 +333,10 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
     assert started[0]["fatal_wait_s"] > 40.0 * 2 + 1.0
 
 
-def _attach_all(service, streamers, capacity=None):
-    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
+def _attach_all(service, streamers, capacity=CAPACITY):
+    manager = SimpleNamespace(
+        register_fail_stop_check=lambda check: None, gpu_residency=DirectUpdaterStandIn(LAYERS, capacity, EXPERTS)
+    )
     for streamer in streamers.values():
         streamer._graph_pinned_tier = True
         streamer.hot_cache = SimpleNamespace(device="cpu", capacity=capacity)
@@ -524,7 +529,9 @@ def _attach_with_copy_tables(service, streamers, *, drop_name=None):
 
     service.ensure_started()
     tables = service.host.tables
-    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, add_residency_listener=lambda listener: None)
+    manager = SimpleNamespace(
+        register_fail_stop_check=lambda check: None, gpu_residency=DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
+    )
     for layer_id, streamer in streamers.items():
         row = service.row_of(layer_id)
         entries = [
@@ -533,7 +540,7 @@ def _attach_with_copy_tables(service, streamers, *, drop_name=None):
             if n != drop_name
         ]
         streamer._graph_pinned_tier = True
-        streamer.hot_cache = SimpleNamespace(device="cpu")
+        streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
         streamer.graph_gather_rows = 6
         streamer.row_backend = SimpleNamespace(
             segments={0: SimpleNamespace(table=torch.tensor(entries, dtype=torch.int64))},
@@ -624,7 +631,7 @@ def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monke
     with pytest.raises(RuntimeError, match="option C service was shut down"):
         caches[0].lookup(torch.tensor([1]))
     with pytest.raises(RuntimeError, match="option C service was shut down"):
-        service.on_residency(0, [1])
+        service.before_host_use()
     service.fail_stop_check()
 
 
