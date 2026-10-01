@@ -687,6 +687,29 @@ def test_shutdown_quarantines_after_native_stop_failure(monkeypatch):
     assert "join failed" in order[4][1]
 
 
+def test_the_quarantine_keeps_every_device_buffer_a_kernel_may_still_touch(monkeypatch):
+    """A real ExpertStreamDevice's buffers, slot-map bank included, all reach quarantine_host_slabs. Mutation: the list
+    names a buffer the device no longer has (AttributeError, so the shutdown frees nothing and reports nothing), or
+    leaves out the map bank."""
+    from sglang.kernels.ops.moe import expert_lease_block as lease
+    from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STAGE_PIECES, ExpertStreamDevice
+
+    side = ExpertStreamDevice(
+        torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(1, pin=False), device="cpu", layers=1,
+        experts=4, piece_runs=torch.zeros((1, 4, STAGE_PIECES, 1, 2), dtype=torch.int32), row_capacities=[5],
+        timeout_ms=10,
+    )
+    service = module.Exl3RamMissService()
+    service.device_side = side
+    kept = []
+    monkeypatch.setattr(module, "quarantine_host_slabs", lambda owned: kept.extend(owned))
+    service._quarantine("test")
+    ids = {id(t) for t in kept}
+    for tensor in (side.state, side.lane_kind, side.lane_slot, side.ce_mask, *side.map_bank.values()):
+        assert id(tensor) in ids
+    assert service._quarantined
+
+
 def test_graph_steps_are_traced_and_read_back_by_tier_sim(tmp_path):
     import os
     import sys
