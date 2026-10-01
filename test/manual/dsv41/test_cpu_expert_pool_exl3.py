@@ -116,6 +116,46 @@ def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch):
         ext.exl3_moe_cpu_free_layer(direct)
 
 
+
+def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
+    """The CpuExpertForward the service calls: accumulate=0 overwrites whatever out held; accumulate=1 adds, so a
+    record's CPU misses sent in two jobs sum to the two experts' outputs. Not bitwise: -Ofast may fuse the add."""
+    import ctypes
+
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+
+    ext = exl3_ext()
+    slabs = _random_slabs(20261001)
+    direct = _direct_layer(ext, slabs)
+    forward = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
+        ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+    )(Exl3CpuQuantTrait(ext, act_limit=LIMIT).native_forward())
+    x = (torch.randn(H, generator=torch.Generator().manual_seed(2))).half()
+
+    def run(slots, weights, out, accumulate):
+        s = torch.tensor(slots, dtype=torch.int32)
+        w = torch.tensor(weights, dtype=torch.float32)
+        assert forward(direct, x.data_ptr(), s.data_ptr(), w.data_ptr(), len(slots), out.data_ptr(), 1, accumulate) == 0
+
+    try:
+        first, second = torch.empty(H), torch.empty(H)
+        run([0], [0.5], first, 0)
+        run([4], [0.25], second, 0)
+        assert first.abs().max() > 0 and second.abs().max() > 0
+        overwritten = torch.full((H,), 1e6)
+        run([0], [0.5], overwritten, 0)
+        assert torch.equal(overwritten, first), "accumulate=0 kept what out held"
+        summed = torch.full((H,), 1e6)
+        run([0], [0.5], summed, 0)
+        run([4], [0.25], summed, 1)
+        torch.testing.assert_close(summed, first + second, rtol=1e-6, atol=1e-6)
+    finally:
+        ext.exl3_moe_cpu_free_layer(direct)
+
+
 if __name__ == "__main__":
     import sys
 
