@@ -51,19 +51,22 @@ FP16) and produces FP32 output. Errors return a nonzero status.
 
 SGLang integration
 ------------------
-exl3_ext.py automatically selects this source for residual=1, block=128 and
-links OpenMP. The extension flavor resid_b128_cpu_v1 prevents reuse of an old
-CPU kernel cache. Registration and the C ABI are compiled into one extension;
-the CPU service resolves the existing ABI from that extension. Other accuracy
-flavors keep their prior kernels. Before starting SGLang, set:
+exl3_ext.py selects this source for residual=1, block=128 and links OpenMP.
+With SGLANG_DSV41_CPU_EXPERTS=1 it always does: the accuracy flags can be left
+unset, and a flag set to any other value is refused. The extension flavor
+resid_b128_cpu_v1 prevents reuse of an old CPU kernel cache. Registration and
+the C ABI are compiled into one extension; the CPU service resolves the
+existing ABI from that extension. Before starting SGLang, set:
 
-  export CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++
+  export SGLANG_EXL3_CPU_CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++
   export CUDA_HOME=/usr/local/cuda-13.4
-  export SGLANG_EXL3_CPU_ACT_RESIDUAL=1
-  export SGLANG_EXL3_CPU_ACT_BLOCK=128
   export EXL3_MOE_CPU_PIN=0
   export OMP_NUM_THREADS=16 OMP_THREAD_LIMIT=16 OMP_DYNAMIC=FALSE
   export OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
+
+SGLANG_EXL3_CPU_CXX is used only for this extension's build (exl3_ext sets
+CXX around it), so the server's other JIT builds keep their compiler; a global
+CXX would move them all to GCC 15. The dsv41_baseline recipe sets it.
 
 Keep the existing EXL3 source/build and CPU-offload settings. Configure the
 service with 16 workers and cores 18 through 33 (caller 18, helpers 19..33).
