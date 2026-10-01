@@ -18,8 +18,6 @@ from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import (
     DEMAND_RECORDS,
     DEMAND_RING,
-    LANE_BYTES,
-    LANE_FIELDS,
     MAX_IDS,
     RECORD_BYTES,
     RECORD_FIELDS,
@@ -36,6 +34,10 @@ ALL_PIECES = 0xFF  # a PieceMask word's bits once every piece of the row is publ
 
 def _i32(tensor: torch.Tensor, offset: int, count: int = 1) -> torch.Tensor:
     return tensor[offset : offset + 4 * count].view(torch.int32)
+
+
+def _i16(tensor: torch.Tensor, offset: int, count: int = 1) -> torch.Tensor:
+    return tensor[offset : offset + 2 * count].view(torch.int16)
 
 
 def _u16(tensor: torch.Tensor, offset: int) -> torch.Tensor:
@@ -194,25 +196,26 @@ class ChainSim:
         self._write_hot(seq, hot, hot_seq)
         record = DEMAND_RING + idx * RECORD_BYTES
         f = RECORD_FIELDS
+        count = len(experts)
+        ids = list(dict.fromkeys(int(e) for e in protect))[:MAX_IDS]
+        assert count <= 15, "the counts byte holds 4 bits of lane count"
+
+        def padded(values, fill, dtype):
+            return torch.tensor(list(values)[:count] + [fill] * (LANES - count), dtype=dtype)
+
         _i32(self.page, record + f["seq"])[0] = 0
         _u16(self.page, record + f["row"])[0] = row
-        _u16(self.page, record + f["count"])[0] = len(experts)
-        _i32(self.page, record + f["flags"])[0] = RECORD_FLAG_CAPTURED if captured else 0
-        _i32(self.page, record + f["chain"])[0] = _signed32(chain & 0xFFFFFFFF)
-        _i32(self.page, record + f["chain_hi"])[0] = _signed32(chain >> 32)
+        self.page[record + f["counts"]] = count | len(ids) << 4
+        self.page[record + f["flags"]] = RECORD_FLAG_CAPTURED if captured else 0
+        self.page[record + f["chain"] : record + f["chain"] + 8].view(torch.int64)[0] = chain
         _i32(self.page, record + f["epoch"])[0] = _signed32(self.epoch & 0xFFFFFFFF)
-        ids = list(dict.fromkeys(int(e) for e in protect))[:MAX_IDS]
-        _u16(self.page, record + f["protect_count"])[0] = len(ids)
-        _i32(self.page, record + f["protect"], MAX_IDS)[:] = torch.tensor(ids + [-1] * (MAX_IDS - len(ids)))
-        for j in range(LANES):
-            lane = record + f["lanes"] + j * LANE_BYTES
-            used = j < len(experts)
-            _i32(self.page, lane + LANE_FIELDS["expert"])[0] = experts[j] if used else -1
-            _i32(self.page, lane + LANE_FIELDS["slot"])[0] = slot_list[j] if used else -1
-            _i32(self.page, lane + LANE_FIELDS["dst"])[0] = dst[j] if used else -1
-            weight = torch.tensor([weights[j] if used else 0.0], dtype=torch.float32).view(torch.int32)
-            _i32(self.page, lane + LANE_FIELDS["weight"])[0] = int(weight[0])
-            self.page[record + f["kinds"] + j] = int(typed[j]) if used else 0
+        _i32(self.page, record + f["kinds"])[0] = _signed32(sum((int(typed[j]) & 0xF) << 4 * j for j in range(count)))
+        _i16(self.page, record + f["protect"], MAX_IDS)[:] = torch.tensor(ids + [-1] * (MAX_IDS - len(ids)), dtype=torch.int16)
+        _i16(self.page, record + f["lane_expert"], LANES)[:] = padded(experts, -1, torch.int16)
+        _i16(self.page, record + f["lane_slot"], LANES)[:] = padded(slot_list, -1, torch.int16)
+        _i16(self.page, record + f["lane_dst"], LANES)[:] = padded(dst, -1, torch.int16)
+        lane_weight = record + f["lane_weight"]
+        self.page[lane_weight : lane_weight + 4 * LANES].view(torch.float32)[:] = padded(weights, 0.0, torch.float32)
         _i32(self.page, record + f["seq"])[0] = _signed32(seq)
         _i32(self.page, WORDS["demand_head"])[0] = _signed32(seq)
         return SimRequest(seq, gen, idx, row, experts, list(typed), slot_list, dst, chain)

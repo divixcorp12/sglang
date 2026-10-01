@@ -186,8 +186,20 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
   uint8_t* record = p.page + kDemandRing + ring_index(seq) * kRecordBytes;
   write_record(
-      record, seq, epoch, p.row, p.captured != 0 ? kRecFlagCaptured : 0u, chain, protect, protect_count, count,
-      p.planned, p.dst_slots, weight, typed);
+      record, seq,
+      RecordFields{
+          .row = p.row,
+          .flags = p.captured != 0 ? kRecFlagCaptured : 0u,
+          .chain = chain,
+          .epoch = epoch,
+          .protect = protect,
+          .protect_count = protect_count,
+          .count = count,
+          .planned = p.planned,
+          .dst = p.dst_slots,
+          .weight = weight,
+          .lanes = &typed,
+      });
   // A release orders every earlier store of this thread: the hot page and the record come first.
   st_release_sys(p.page + kDemandHead, seq);
   state[kPending] = count > 0 ? static_cast<int32_t>(seq) : 0;

@@ -54,6 +54,14 @@ SGL_DEVICE void st_release_sys64(uint8_t* address, uint64_t value) {
   asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(address), "l"(value) : "memory");
 }
 
+SGL_DEVICE void st_relaxed_sys_v2(uint8_t* address, uint32_t x, uint32_t y) {
+  asm volatile("st.relaxed.sys.global.v2.b32 [%0], {%1, %2};" ::"l"(address), "r"(x), "r"(y) : "memory");
+}
+
+SGL_DEVICE void st_relaxed_sys_v4(uint8_t* address, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+  asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(address), "r"(x), "r"(y), "r"(z), "r"(w) : "memory");
+}
+
 constexpr uint64_t kGenerationMask = (1ull << 56) - 1;
 
 // The copy wait's gate word for request `seq`: `low` is kLeaseGateClosed or kLeaseGateOpen.
@@ -123,7 +131,7 @@ SGL_DEVICE int64_t ring_index(uint32_t seq) {
   return static_cast<int64_t>((seq - 1u) % kDemandRecords);
 }
 
-// One request's typed lanes, as the post writes them into its record (lease_layout.h kRecLanes, kRecKinds).
+// One request's typed lanes, as the post writes them into its record (lease_layout.h kRecLaneSlot, kRecKinds).
 struct TypedLanes {
   int32_t slot[kMaxIds];  // the RAM slot of a hit, the staging slot of a miss
   uint8_t kind[kMaxIds];  // kKind*
@@ -133,33 +141,63 @@ SGL_DEVICE bool is_cpu_kind(uint32_t kind) {
   return kind == kKindHitCpu || kind == kKindMissCpu;
 }
 
+// One request's record as the post knows it; write_record narrows and packs it into the wire layout.
+struct RecordFields {
+  int64_t row;
+  uint32_t flags;           // kRecFlag*
+  uint64_t chain;           // the row's map-chain number, 0 when no lane misses
+  uint32_t epoch;           // so G = epoch << 32 | seq
+  const int32_t* protect;   // protect_count routed experts
+  int protect_count;
+  int64_t count;            // lanes
+  const int64_t* planned;   // count lane experts
+  const int32_t* dst;       // count VRAM destination slots
+  const float* weight;      // count routing weights
+  const TypedLanes* lanes;  // count kinds and source slots
+};
+
+// Two record ids as one i16 pair, -1 for none; traps on an id the record cannot carry rather than wrap it.
+SGL_DEVICE uint32_t pack_ids(int64_t lo, int64_t hi) {
+  if (lo < -1 || lo > kRecIdMax || hi < -1 || hi > kRecIdMax) __trap();
+  return (static_cast<uint32_t>(lo) & 0xFFFFu) | (static_cast<uint32_t>(hi) << 16);
+}
+
 // Seqlock writer: a record of SM hits only may lap the ring before the service reads it, so a half-rewritten record
 // must never pass read_record's seq re-check. seq = 0, fence, payload, then seq with a release.
-SGL_DEVICE void write_record(
-    uint8_t* record, uint32_t seq, uint32_t epoch, int64_t row, uint32_t flags, uint64_t chain, const int32_t* protect,
-    int protect_count, int64_t count, const int64_t* planned, const int32_t* dst, const float* weight,
-    const TypedLanes& lanes) {
+SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& f) {
+  if (f.count > kMaxIds || f.protect_count > kMaxIds) __trap();
+  uint32_t protect_w[kMaxIds / 2], expert_w[kMaxIds / 2], slot_w[kMaxIds / 2], dst_w[kMaxIds / 2];
+  uint32_t weight_w[kMaxIds];
+  uint32_t kinds = 0;
+#pragma unroll
+  for (int i = 0; i < kMaxIds; i += 2) {
+    const bool a = i < f.count, b = i + 1 < f.count;
+    protect_w[i / 2] =
+        pack_ids(i < f.protect_count ? f.protect[i] : -1, i + 1 < f.protect_count ? f.protect[i + 1] : -1);
+    expert_w[i / 2] = pack_ids(a ? f.planned[i] : -1, b ? f.planned[i + 1] : -1);
+    slot_w[i / 2] = pack_ids(a ? f.lanes->slot[i] : -1, b ? f.lanes->slot[i + 1] : -1);
+    dst_w[i / 2] = pack_ids(a ? f.dst[i] : -1, b ? f.dst[i + 1] : -1);
+  }
+#pragma unroll
+  for (int i = 0; i < kMaxIds; ++i) {
+    const bool used = i < f.count;
+    weight_w[i] = __float_as_uint(used ? f.weight[i] : 0.0f);
+    kinds |= (used ? static_cast<uint32_t>(f.lanes->kind[i]) : 0u) << (4 * i);
+  }
+  const uint32_t counts = static_cast<uint32_t>(f.count) | static_cast<uint32_t>(f.protect_count) << 4;
+  const uint32_t head = (static_cast<uint32_t>(f.row) & 0xFFFFu) | counts << 16 | (f.flags & 0xFFu) << 24;
   st_relaxed_sys<uint32_t>(record + kRecSeq, 0u);
   cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
-  st_relaxed_sys<uint16_t>(record + kRecRow, static_cast<uint16_t>(row));
-  st_relaxed_sys<uint16_t>(record + kRecCount, static_cast<uint16_t>(count));
-  st_relaxed_sys<uint32_t>(record + kRecFlags, flags);
-  st_relaxed_sys<uint32_t>(record + kRecChain, static_cast<uint32_t>(chain & 0xFFFFFFFFull));
-  st_relaxed_sys<uint32_t>(record + kRecChainHi, static_cast<uint32_t>(chain >> 32));
-  st_relaxed_sys<uint32_t>(record + kRecEpoch, epoch);
-  st_relaxed_sys<uint16_t>(record + kRecProtectCount, static_cast<uint16_t>(protect_count));
-  for (int i = 0; i < kMaxIds; ++i) {
-    st_relaxed_sys<int32_t>(record + kRecProtect + 4 * i, i < protect_count ? protect[i] : -1);
-    uint8_t* lane = record + kRecLanes + i * kLaneBytes;
-    const bool used = i < count;
-    st_relaxed_sys<int32_t>(lane + kLaneExpert, used ? static_cast<int32_t>(planned[i]) : -1);
-    st_relaxed_sys<int32_t>(lane + kLaneSlot, used ? lanes.slot[i] : -1);
-    st_relaxed_sys<int32_t>(lane + kLaneDst, used ? dst[i] : -1);
-    st_relaxed_sys<uint32_t>(lane + kLaneWeight, __float_as_uint(used ? weight[i] : 0.0f));
-    // Deduced, not st_relaxed_sys<uint8_t>: with T = uint8_t the byte-address overload names itself.
-    const uint8_t kind = used ? lanes.kind[i] : static_cast<uint8_t>(0);
-    st_relaxed_sys(record + kRecKinds + i, kind);
-  }
+  st_relaxed_sys<uint32_t>(record + kRecRow, head);
+  st_relaxed_sys_v2(
+      record + kRecChain, static_cast<uint32_t>(f.chain & 0xFFFFFFFFull), static_cast<uint32_t>(f.chain >> 32));
+  st_relaxed_sys_v4(record + kRecEpoch, f.epoch, kinds, 0u, 0u);
+  st_relaxed_sys_v4(record + kRecProtect, protect_w[0], protect_w[1], protect_w[2], protect_w[3]);
+  st_relaxed_sys_v4(record + kRecLaneExpert, expert_w[0], expert_w[1], expert_w[2], expert_w[3]);
+  st_relaxed_sys_v4(record + kRecLaneSlot, slot_w[0], slot_w[1], slot_w[2], slot_w[3]);
+  st_relaxed_sys_v4(record + kRecLaneDst, dst_w[0], dst_w[1], dst_w[2], dst_w[3]);
+  st_relaxed_sys_v4(record + kRecLaneWeight, weight_w[0], weight_w[1], weight_w[2], weight_w[3]);
+  st_relaxed_sys_v4(record + kRecLaneWeight + 16, weight_w[4], weight_w[5], weight_w[6], weight_w[7]);
   st_release_sys(record + kRecSeq, seq);
 }
 

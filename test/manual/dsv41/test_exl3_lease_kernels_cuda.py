@@ -24,8 +24,6 @@ from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RECORDS,
     DEMAND_RING,
-    LANE_BYTES,
-    LANE_FIELDS,
     PAGE_BYTES,
     RECORD_BYTES,
     RECORD_FIELDS,
@@ -228,15 +226,17 @@ def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x
         seq = int(c.dev.stats()["posted"]) & 0xFFFFFFFF
         record = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
         page = c.page
-        assert int(page[record + RECORD_FIELDS["flags"] : record + RECORD_FIELDS["flags"] + 4].view(torch.int32)[0]) == RECORD_FLAG_CAPTURED
+        assert int(page[record + RECORD_FIELDS["flags"]]) == RECORD_FLAG_CAPTURED
 
-        def lane_field(lane, name, dtype):
-            at = record + RECORD_FIELDS["lanes"] + lane * LANE_BYTES + LANE_FIELDS[name]
-            return page[at : at + 4].view(dtype)[0].item()
+        def field(name, dtype, n):
+            at = record + RECORD_FIELDS[name]
+            return page[at : at + n * dtype.itemsize].view(dtype).tolist()
 
-        assert [lane_field(j, "weight", torch.float32) for j in range(2)] == [0.25, 0.5 + 0.0625]
-        assert [lane_field(j, "dst", torch.int32) for j in range(2)] == [5, 3]
-        assert [lane_field(j, "expert", torch.int32) for j in range(lease.LANES)] == [9, 5] + [-1] * (lease.LANES - 2)
+        assert int(page[record + RECORD_FIELDS["counts"]]) & 0xF == 2
+        assert field("kinds", torch.int32, 1)[0] == LaneKind.HIT_CPU | LaneKind.HIT_CPU << 4
+        assert field("lane_weight", torch.float32, lease.LANES) == [0.25, 0.5 + 0.0625] + [0.0] * (lease.LANES - 2)
+        assert field("lane_dst", torch.int16, 2) == [5, 3]
+        assert field("lane_expert", torch.int16, lease.LANES) == [9, 5] + [-1] * (lease.LANES - 2)
         staged = x_rows[row, : 2 * hidden].view(torch.float16)
         assert torch.equal(staged.view(torch.int16), x.cpu().half().reshape(-1).view(torch.int16))
         assert (x_rows[row, 2 * hidden :] == 0xAB).all() and (x_rows[1 - row] == 0xAB).all()

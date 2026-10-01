@@ -580,16 +580,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       std::thread writer([&] {
         for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
           const uint16_t row = static_cast<uint16_t>(round), count = count_of(round);
-          const uint32_t flags = round & 1u;
-          const int32_t id = static_cast<int32_t>(round);
+          const uint8_t counts = static_cast<uint8_t>(count << 4);  // protect ids only, no lanes
+          const uint8_t flags = static_cast<uint8_t>(round & 1u);
+          const int16_t id = static_cast<int16_t>(round & 0x7FFFu);
           store_release(record + kRecSeq, 0u);
           std::atomic_thread_fence(std::memory_order_seq_cst);
           std::memset(record + 4, 0, kRecordBytes - 4);
           std::memcpy(record + kRecRow, &row, 2);
-          std::memcpy(record + kRecProtectCount, &count, 2);
-          std::memcpy(record + kRecFlags, &flags, 4);
+          std::memcpy(record + kRecCounts, &counts, 1);
+          std::memcpy(record + kRecFlags, &flags, 1);
           for (int i = 0; i < count; ++i)
-            std::memcpy(record + kRecProtect + 4 * i, &id, 4);
+            std::memcpy(record + kRecProtect + 2 * i, &id, 2);
           std::atomic_thread_fence(std::memory_order_seq_cst);
           store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
         }
@@ -605,7 +606,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         bool whole = request.row == static_cast<uint16_t>(round) && request.captured == ((round & 1u) != 0) &&
                      request.protect.size() == count_of(round);
         for (int32_t id : request.protect)
-          whole = whole && id == static_cast<int32_t>(round);
+          whole = whole && id == static_cast<int16_t>(round & 0x7FFFu);
         if (!whole) ++torn;
       }
       done.store(true);

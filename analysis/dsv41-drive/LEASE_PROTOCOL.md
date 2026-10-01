@@ -38,14 +38,20 @@ ring @64, 256 B a record. A record, behind a seqlock on `seq`:
 |---|---|---|
 | 0 | `seq` u32 | 0 while the payload is rewritten, the seq stored last |
 | 4 | `row` u16 | |
-| 6 | `count` u16 | lanes, at most 8 |
-| 8 | `flags` u32 | `CAPTURED` = 1 |
-| 12, 16 | `chain`, `chain_hi` u32 | the row's map-chain number; 0 when no lane misses |
-| 20 | `protect_count` u16 | |
-| 24 | `epoch` u32 | so the host forms G = epoch << 32 \| seq |
-| 32 | `protect` i32[8] | every routed expert of the request |
-| 64 | lanes, 8 x 16 B | `{expert, slot, dst, weight}`: slot is a hit's RAM slot or a miss's staging slot |
-| 192 | `kinds` u8[8] | the lane kinds below |
+| 6 | `counts` u8 | lanes (at most 8) in bits 0-3, protect ids in bits 4-7 |
+| 7 | `flags` u8 | `CAPTURED` = 1 |
+| 8 | `chain` u64 | the row's map-chain number; 0 when no lane misses |
+| 16 | `epoch` u32 | so the host forms G = epoch << 32 \| seq |
+| 20 | `kinds` u32 | lane j's kind (below) in bits 4j..4j+3 |
+| 32 | `protect` i16[8] | every routed expert of the request, -1 past the count |
+| 48 | `lane_expert` i16[8] | -1 past the lane count |
+| 64 | `lane_slot` i16[8] | a hit's RAM slot or a miss's staging slot |
+| 80 | `lane_dst` i16[8] | the VRAM destination slot |
+| 96 | `lane_weight` f32[8] | the lane expert's routing weight |
+
+Ids are i16, so a launch with more than 32767 experts or slots per row is refused (`kRecIdMax`). The post writes the
+payload between the two seq stores as one u32, one 8-byte and seven 16-byte relaxed stores; a page off 16-byte
+alignment is refused at the post's launch.
 
 Lane kinds: `HIT_COPY`=1 (the copy thread's DMA; CopyDone), `HIT_SM`=2 (C1; stream order), `HIT_CPU`=3 (the CPU from the
 RAM slot; CopyDone), `MISS_GPU`=4 (NVMe into staging, then S; PieceMask), `MISS_CPU`=5 (NVMe into staging, then the

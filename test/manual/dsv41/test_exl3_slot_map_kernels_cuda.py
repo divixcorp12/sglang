@@ -62,9 +62,8 @@ def _chain_of_last_record(c):
     seq = int(c.dev.stats()["posted"]) & 0xFFFFFFFF
     record = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
     page = c.page
-    lo = int(_i32(page, record + RECORD_FIELDS["chain"])[0]) & 0xFFFFFFFF
-    hi = int(_i32(page, record + RECORD_FIELDS["chain_hi"])[0]) & 0xFFFFFFFF
-    return hi << 32 | lo
+    at = record + RECORD_FIELDS["chain"]
+    return int(page[at : at + 8].view(torch.int64)[0])
 
 
 @pytest.fixture
