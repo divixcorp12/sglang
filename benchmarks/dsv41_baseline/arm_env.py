@@ -48,6 +48,8 @@ EXPERT_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"
 EXPERT_MIRROR_DIRS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
 EXL3_SRC = f"{NVFP4_WORK}/exllamav3"
 EXL3_BUILD_DIR = f"{CC}/exl3-build"
+# The optimized EXL3 CPU kernel is validated on GCC 15; only its build uses this (not a global CXX).
+EXL3_CPU_CXX = "/opt/rh/gcc-toolset-15/root/usr/bin/g++"
 CUDA_HOME = "/usr/local/cuda-13.2"
 PYTHON = "/data/models/slang/.venv/bin/python"
 GPU_LOCK = f"{NVFP4_WORK}/cc-gpu.lock"
@@ -140,6 +142,7 @@ def base_env() -> dict[str, str]:
         "PYTHONDONTWRITEBYTECODE": "1",
         "SGLANG_EXL3_SRC": EXL3_SRC,
         "SGLANG_EXL3_BUILD_DIR": EXL3_BUILD_DIR,
+        "SGLANG_EXL3_CPU_CXX": EXL3_CPU_CXX,
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
         "SGLANG_DSV41_ENGRAM_TABLE_DIR": ENGRAM_TABLE_DIR,
         "SGLANG_DSV41_TORCH_PREFILL_INDEXER": "1",

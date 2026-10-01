@@ -38,14 +38,19 @@ def optimized_cpu(defines: list[str]) -> bool:
     return "-DEXL3_MOE_CPU_ACT_RESIDUAL=1" in defines and "-DEXL3_MOE_CPU_ACT_BLOCK=128" in defines
 
 
+def cpu_compiler() -> str:
+    """The optimized CPU kernel's compiler: SGLANG_EXL3_CPU_CXX, else CXX, else c++."""
+    return envs.SGLANG_EXL3_CPU_CXX.get() or os.environ.get("CXX", "c++")
+
+
 def check_cpu_compiler() -> None:
     """The recorded winning arithmetic and OpenMP unrolling were validated with GCC 15."""
-    compiler = os.environ.get("CXX", "c++")
+    compiler = cpu_compiler()
     version = subprocess.check_output([compiler, "-dumpfullversion", "-dumpversion"], text=True).strip()
     if version.split(".", 1)[0] != "15":
         raise RuntimeError(
             f"optimized EXL3 CPU experts require GCC 15; {compiler} reports {version}. "
-            "Set CXX to your GCC 15 g++ before building the extension."
+            "Set SGLANG_EXL3_CPU_CXX (or CXX) to your GCC 15 g++ before building the extension."
         )
     identity = subprocess.check_output([compiler, "--version"], text=True)
     if "clang" in identity.lower():
@@ -141,14 +146,28 @@ def exl3_ext():
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
     from torch.utils.cpp_extension import load
 
-    return load(
-        name="sglang_exl3_ext" + flavor,
-        sources=extension_sources(ext_dir, OPTIMIZED_CPU_KERNEL if optimized else VENDORED_CPU_KERNEL if flavor else None),
-        # The generic vendored kernel uses the upstream CPU header; optimized has its own.
-        extra_include_paths=[ext_dir] + ([os.path.join(ext_dir, "cpu")] if flavor else []),
-        extra_cflags=_EXTRA_CFLAGS + defines + (["-march=native", "-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
-        extra_ldflags=["-fopenmp"] if optimized else [],
-        extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,
-        build_directory=build_dir,
-        verbose=False,
-    )
+    # load() reads CXX from the environment; the GCC 15 compiler is set for this build only and restored after.
+    saved_cxx = os.environ.get("CXX")
+    if optimized:
+        os.environ["CXX"] = cpu_compiler()
+    try:
+        return load(
+            name="sglang_exl3_ext" + flavor,
+            sources=extension_sources(
+                ext_dir, OPTIMIZED_CPU_KERNEL if optimized else VENDORED_CPU_KERNEL if flavor else None
+            ),
+            # The generic vendored kernel uses the upstream CPU header; optimized has its own.
+            extra_include_paths=[ext_dir] + ([os.path.join(ext_dir, "cpu")] if flavor else []),
+            extra_cflags=_EXTRA_CFLAGS
+            + defines
+            + (["-march=native", "-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
+            extra_ldflags=["-fopenmp"] if optimized else [],
+            extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,
+            build_directory=build_dir,
+            verbose=False,
+        )
+    finally:
+        if saved_cxx is None:
+            os.environ.pop("CXX", None)
+        else:
+            os.environ["CXX"] = saved_cxx
