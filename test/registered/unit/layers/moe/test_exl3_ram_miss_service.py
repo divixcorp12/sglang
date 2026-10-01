@@ -166,6 +166,51 @@ def test_rows_the_thread_loads_reach_the_eager_map_on_next_host_use(tiers):
     assert caches[0].expert_to_slot[5].item() == service.host.mapping(row)[5] >= 0
 
 
+@pytest.fixture
+def reserved(monkeypatch):
+    """The k each reserve_staging call receives."""
+    from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost
+
+    calls = []
+    original = ExpertStreamHost.reserve_staging
+
+    def recording(self, k=None):
+        calls.append(k)
+        return original(self, k) if k is not None else original(self)
+
+    monkeypatch.setattr(ExpertStreamHost, "reserve_staging", recording)
+    return calls
+
+
+def test_a_planned_gather_width_sets_the_staging_slots_reserved_at_start(tiers, reserved):
+    service, streamers, caches = tiers
+    streamers[0].format.plan_graph_gather(streamers[0], 2)
+    streamers[1].format.plan_graph_gather(streamers[1], 6)
+    caches[1].ensure_rows(torch.tensor([4]))
+    assert reserved == [6]
+    assert service.staging_slots == 6
+
+
+def test_without_a_planned_gather_width_the_service_reserves_one_slot_per_post_lane(tiers, reserved):
+    service, streamers, caches = tiers
+    service.staging_slots = module.MAX_IDS
+    caches[1].ensure_rows(torch.tensor([4]))
+    assert reserved == [module.MAX_IDS]
+
+
+def test_a_gather_wider_than_the_post_lanes_reserves_the_lanes(tiers, reserved):
+    service, streamers, caches = tiers
+    service.plan_gather_width(module.MAX_IDS + 4)
+    assert service.staging_slots == module.MAX_IDS
+
+
+def test_a_gather_width_planned_after_the_service_started_is_refused(tiers):
+    service, streamers, caches = tiers
+    caches[1].ensure_rows(torch.tensor([4]))
+    with pytest.raises(RuntimeError, match="planned after the service started"):
+        service.plan_gather_width(6)
+
+
 def test_nested_host_use_pauses_and_refreshes_only_at_the_outermost_level(tiers, monkeypatch):
     service, streamers, caches = tiers
     service.ensure_started()
