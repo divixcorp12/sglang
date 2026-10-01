@@ -97,7 +97,8 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
             fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
             streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
             layer._nvfp4_expert_streamer = streamer
-            ExpertPinnedHostCache(streamer, 8, **fmt.pinned_tier_options(layer))
+            # Eight mappable rows plus the TOP_K staging slots attach reserves for the graph's misses.
+            ExpertPinnedHostCache(streamer, 8 + TOP_K, **fmt.pinned_tier_options(layer))
             pairs.append((layer, streamer))
         for layer, streamer in pairs:
             hot = ExpertHotCache(streamer, 3, scratch_rows=TOP_K)
