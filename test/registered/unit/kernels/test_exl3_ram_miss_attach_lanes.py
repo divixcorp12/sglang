@@ -80,6 +80,55 @@ def test_a_gather_wider_than_the_lanes_is_refused_before_anything_is_built(tiers
     assert not hasattr(streamers[1].row_backend, "device_side")  # the layer keeps its previous backend
 
 
+def test_attach_unmaps_on_a_full_tier_reach_the_device_before_any_post(tiers, monkeypatch):
+    """A full tier: attach evicts rows to make its staging slots. Those unmaps must reach the device's map before the
+    service runs again -- a captured warm-up decode would otherwise type a hit on a slot the host now stages into, and
+    the host would fail-stop. The device here is CPU-resident, so its bulk apply is recorded instead of launched."""
+    service, streamers = tiers
+    service.ensure_started()
+    service.before_host_use()
+    for row in range(LAYERS):
+        for expert in range(CAPACITY):
+            service.host.assign(row, expert)
+    service.after_host_use()
+    applied = []
+    monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, bulk: applied.extend(bulk.tolist()))
+    _attach(service, streamers[0], 1)
+    at_attach = list(applied)  # what reached the device by the end of attach; the read below applies the rest
+    service.before_host_use()
+    try:
+        mapping = service.host.mapping(service.row_of(0))
+    finally:
+        service.after_host_use()
+    row = service.row_of(0)
+    replica = {}
+    for r, expert, slot in at_attach:
+        if r == row:
+            replica[expert] = slot  # a fresh device map is all -1, so only mapped rows need entries
+    evicted = [e for e in range(CAPACITY) if mapping[e] < 0]
+    assert evicted, "the full tier gave attach nothing to evict"
+    assert all(replica.get(e, -1) == -1 for e in evicted), (evicted, replica)
+
+
+def test_eager_use_with_no_device_side_keeps_no_bulk_delta(tiers):
+    """With no graph-pinned layer there is no device map, so nothing ever takes the bulk delta: kept, it would grow by
+    every eager admission for the life of the server. Mutation: after_host_use keeps the bulk when there is no device."""
+    service, _ = tiers
+    service.ensure_started()
+    assert service.device_side is None
+    for _ in range(3):
+        service.before_host_use()
+        for row in range(LAYERS):
+            for expert in range(EXPERTS):
+                service.host.assign(row, expert)
+        service.after_host_use()
+    service.host.pause(5.0)
+    try:
+        assert service.host.take_bulk_delta().numel() == 0
+    finally:
+        service.host.resume()
+
+
 def test_cpu_experts_refuse_a_manager_without_direct_residency(tiers):
     """The miss order CPU experts rely on is DIRECT's victim ranking; without the updater there is none to sort by."""
     service, streamers = tiers
@@ -129,7 +178,8 @@ def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(ti
         module, "Exl3RamMissRowBackend", lambda *args, **kwargs: built.append(kwargs) or SimpleNamespace()
     )
     service.cpu_experts = SimpleNamespace(
-        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32)
+        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
+        attach_device=lambda device_side: None,
     )
     updater = _DirectUpdater()
     manager = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater)
@@ -170,7 +220,7 @@ class _Side:
         self.copy_engine_captured = False
 
     def __getattr__(self, name):
-        if name in ("post", "hit_wait", "stream", "copy_wait"):
+        if name in ("post", "stream", "copy_wait"):
             return lambda *args, **kwargs: self.calls.append((name, kwargs))
         raise AttributeError(name)
 
@@ -192,7 +242,7 @@ def test_a_captured_cpu_expert_gather_with_the_miss_order_posts_its_input(monkey
     streamer = SimpleNamespace(_plan_miss_keys=torch.zeros(EXPERTS, dtype=torch.int64))
     backend, side = _captured_backend(monkeypatch, lambda: streamer)
     backend.post(0, _CapturedPlan())
-    assert [name for name, _ in side.calls] == ["post", "hit_wait", "copy", "stream", "copy_wait"]
+    assert [name for name, _ in side.calls] == ["post", "copy", "stream", "copy_wait"]
     assert side.calls[0][1]["captured"] and side.calls[0][1]["cpu_input"] is backend.cpu_input
     assert side.copy_engine_captured
 

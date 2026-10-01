@@ -97,7 +97,8 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
             fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
             streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
             layer._nvfp4_expert_streamer = streamer
-            ExpertPinnedHostCache(streamer, 8, **fmt.pinned_tier_options(layer))
+            # Eight mappable rows plus the TOP_K staging slots attach reserves for the graph's misses.
+            ExpertPinnedHostCache(streamer, 8 + TOP_K, **fmt.pinned_tier_options(layer))
             pairs.append((layer, streamer))
         for layer, streamer in pairs:
             hot = ExpertHotCache(streamer, 3, scratch_rows=TOP_K)
@@ -132,7 +133,7 @@ REPLAY_STEPS = 4
 
 @pytest.mark.parametrize("fused", [False, True], ids=["generic_routes", "fused_routes"])
 def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fused):
-    """Runs only on divix01: actual EXL3 bytes, native leases, and captured
+    """Runs only on divix01: actual EXL3 bytes, the native slot-map chain, and captured
     MoE output across a DIRECT insertion and an eager pinned-tier eviction."""
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import exl3_ram_miss as service_module
@@ -155,7 +156,6 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             service_row_images(tmp_path),  # the service reads row images with O_DIRECT, as in production
             envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
             envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
-            envs.SGLANG_DSV41_RAM_MISS_HIT_WAIT_US.override(50_000),
             envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
             envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused),
         ):
@@ -280,20 +280,22 @@ def test_ram_misses_inside_a_replay_are_served(tmp_path):
             assert rel <= REL_BOUND and rel <= 2 * rel_loop + 1e-3, (route, rel, rel_loop)
             assert rel_graph_loop <= LOOSE_BOUND, (route, rel_graph_loop)
         assert service.host.counters()["rows_read"] >= 6
-        # The replays' copies were leased and acknowledged, none violated, and the service retired every one.
-        def retired():
-            c = service.host.counters()
-            return c["leases_granted"] > 0 and c["leases_acked"] == c["leases_granted"]
-
-        deadline = time.perf_counter() + 10.0
-        while time.perf_counter() < deadline and not retired():
-            time.sleep(0.005)
-        counters = service.host.counters()
-        assert retired(), counters
-        assert counters["overruns"] == 0, counters
-        assert all(info[2] == 0 for info in service.host.slot_info(0)), "no slot is left leased"
+        # The service handled every record the replays posted, and none was lapped.
+        assert _handled_all(service), service.host.counters()
+        assert service.host.counters()["overruns"] == 0, service.host.counters()
     finally:
         service.shutdown()
+
+
+def _handled_all(service, timeout_s=10.0):
+    """The service has finished every record the device posted (handled_through reaches the device's posted count)."""
+    posted = int(service.device_side.stats()["posted"]) & 0xFFFFFFFF
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        if posted > 0 and service.host.handled_through() == posted:
+            return True
+        time.sleep(0.005)
+    return False
 
 
 def _step_route(layer_id, step):
@@ -362,6 +364,25 @@ def _replay_step(pairs, service, inputs, graph, step, checks):
     assert served() == expected, (step, served(), expected, service.host.counters())
 
 
+def _assert_device_map_is_hosts(service, layers):
+    """The device's replica of every row's slot map and staging list equals the host's, once the last record's delta
+    and the eager paths' bulk delta are applied (what the next post and after_host_use would do)."""
+    torch.cuda.synchronize()
+    service.host.pause(10.0)
+    try:
+        bulk = service.host.take_bulk_delta()
+        service.device_side.map_bulk_apply(bulk)  # every row's pending decode delta first, then the bulk entries
+        torch.cuda.synchronize()
+        bank = service.device_side.map_bank
+        for layer_id in range(layers):
+            row = service.row_of(layer_id)
+            assert bank["ram_slot"][row].tolist() == service.host.mapping(row), layer_id
+            staging = {slot for slot, (state, _, _) in enumerate(service.host.slot_info(row)) if state == 3}
+            assert {s for s in bank["staging"][row].tolist() if s >= 0} == staging, layer_id
+    finally:
+        service.host.resume()
+
+
 def _assert_service_healthy(service):
     counters = service.host.counters()
     for name in ("overruns", "read_errors", "no_victim"):
@@ -395,16 +416,10 @@ def test_many_layers_in_one_replay_are_served(tmp_path, layers):
                 rel, rel_loop, rel_graph_loop = _rel(got, ref), _rel(loop, ref), _rel(got, loop)
                 assert rel <= REL_BOUND and rel <= 2 * rel_loop + 1e-3, (layer_id, step, route, rel, rel_loop)
                 assert rel_graph_loop <= LOOSE_BOUND, (layer_id, step, route, rel_graph_loop)
-        def retired():
-            c = service.host.counters()
-            return c["leases_granted"] > 0 and c["leases_acked"] == c["leases_granted"]
-
-        deadline = time.perf_counter() + 10.0
-        while time.perf_counter() < deadline and not retired():
-            time.sleep(0.005)
-        assert retired(), service.host.counters()
-        for layer_id in range(layers):
-            assert all(info[2] == 0 for info in service.host.slot_info(service.row_of(layer_id))), f"layer {layer_id} has a leased slot"
+            # Replays and the eager calls above (admissions, applied as a bulk delta) leave one map on both sides.
+            assert _handled_all(service), service.host.counters()
+            _assert_device_map_is_hosts(service, layers)
+        assert _handled_all(service), service.host.counters()
         _assert_service_healthy(service)
     finally:
         service.shutdown()

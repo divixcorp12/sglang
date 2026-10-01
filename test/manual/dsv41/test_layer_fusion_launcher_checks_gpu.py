@@ -73,6 +73,7 @@ def _route_args(routes: int = 6, slots: int = 12, hidden: int = 64) -> dict:
         "cpu_lanes": torch.empty(0, dtype=torch.int32, device=CUDA),
         "dst_slots": torch.empty(0, dtype=torch.int32, device=CUDA),
         "cpu_out": 0,
+        "cpu_part_stride": 0,
     }
 
 
@@ -230,6 +231,10 @@ ROUTE_REFUSALS = {
     "cpu_lanes_on_host": (
         lambda: {**_route_args(), "cpu_lanes": torch.zeros(1, dtype=torch.int32), "cpu_out": 16},
         "^cpu_lanes: ",
+    ),
+    "cpu_part_stride_unaligned": (
+        lambda: {**_route_args(), "cpu_part_stride": 6},
+        "cpu_part_stride: floats between parts",
     ),
 }
 

@@ -514,35 +514,21 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     tier->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
   }
 
-  static void lease_entry(int64_t handle, int64_t idx, TensorView out) {
-    using namespace host;
-    auto cpu = SymbolicDevice{};
-    expert_stream::verify_named(
-        "out", TensorMatcher({3 + 3 * expert_stream::kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    if (idx < 0 || idx >= expert_stream::kDemandRecords)
-      throw std::runtime_error(error_prefix<Layout>() + "request slot out of range");
-    find(handle)->lease_entry(idx, static_cast<int64_t*>(out.data_ptr()));
+  // The last seq the service finished (ChainSim.wait_handled).
+  static int64_t handled_through(int64_t handle) {
+    return static_cast<int64_t>(find(handle)->handled_through());
   }
 
-  static void inject_lease(int64_t handle, int64_t row, int64_t slot, int64_t delta) {
-    if constexpr (!Build::kFaults) {
-      test_only("inject_lease");
-    } else {
-      find(handle)->inject_lease(row, slot, delta);
-    }
-  }
-
-  // out: free, evictable, leased.
+  // out: free, evictable.
   static void victim_census(int64_t handle, int64_t row, TensorView wanted, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("wanted", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), wanted);
-    expert_stream::verify_named("out", TensorMatcher({3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const auto census = find(handle)->victim_census(row, expert_stream::ids_of(wanted));
     auto* result = static_cast<int64_t*>(out.data_ptr());
     result[0] = census.free;
     result[1] = census.evictable;
-    result[2] = census.leased;
   }
 
   // The watchdog's busy episode (D6): nonzero while a request or fill is in service, a new value per episode.
@@ -593,14 +579,15 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
       std::thread writer([&] {
         for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
-          const uint16_t row = static_cast<uint16_t>(round), count = count_of(round), armed = round & 1u;
+          const uint16_t row = static_cast<uint16_t>(round), count = count_of(round);
+          const uint32_t flags = round & 1u;
           const int32_t id = static_cast<int32_t>(round);
           store_release(record + kRecSeq, 0u);
           std::atomic_thread_fence(std::memory_order_seq_cst);
           std::memset(record + 4, 0, kRecordBytes - 4);
           std::memcpy(record + kRecRow, &row, 2);
           std::memcpy(record + kRecProtectCount, &count, 2);
-          std::memcpy(record + kRecArmed, &armed, 2);
+          std::memcpy(record + kRecFlags, &flags, 4);
           for (int i = 0; i < count; ++i)
             std::memcpy(record + kRecProtect + 4 * i, &id, 4);
           std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -612,10 +599,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       while (now_ns() < deadline) {
         const uint32_t seq = load_acquire(record + kRecSeq);
         Request request;
-        if (seq == 0 || !read_record(record, seq, &request)) continue;
+        if (seq == 0 || read_record(record, seq, &request) != RecordRead::kOk) continue;
         ++accepted;
         const uint32_t round = (seq - 1u) / kDemandRecords;
-        bool whole = request.row == static_cast<uint16_t>(round) && request.armed == ((round & 1u) != 0) &&
+        bool whole = request.row == static_cast<uint16_t>(round) && request.captured == ((round & 1u) != 0) &&
                      request.protect.size() == count_of(round);
         for (int32_t id : request.protect)
           whole = whole && id == static_cast<int32_t>(round);
@@ -681,8 +668,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_geometry, Exports::piece_geometry);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump, Exports::pump);                                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_info, Exports::slot_info);                           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_lease, Exports::inject_lease);                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lease_entry, Exports::lease_entry);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_handled_through, Exports::handled_through);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_victim_census, Exports::victim_census);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_busy_episode, Exports::busy_episode);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_idle, Exports::copy_engine_idle);             \

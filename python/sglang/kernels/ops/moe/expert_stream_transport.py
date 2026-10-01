@@ -75,7 +75,6 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "read_rows_sqes",
     "inject",
     "inject_fault",
-    "inject_lease",
     "copy_engine_fail",
     "copy_engine_ballast",
     "trace_clock_reads",
@@ -676,12 +675,20 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     return out
 
 
-# The request page (lease_layout.h): the demand ring's two words, then kDemandRecords records of RECORD_FIELDS.
-PAGE_BYTES = 2112
-RECORD_BYTES = 128
+# The request page (lease_layout.h): demand_head, then kDemandRecords records of RECORD_FIELDS; each record carries
+# MAX_IDS lanes of LANE_FIELDS and a kind byte per lane (ram_slot_map.LaneKind).
+PAGE_BYTES = 4160
+RECORD_BYTES = 256
 DEMAND_RING = 64
 DEMAND_RECORDS = 16
-RECORD_FIELDS = {"seq": 0, "row": 4, "protect_count": 6, "armed": 8, "protect": 16}
+RECORD_FIELDS = {
+    "seq": 0, "row": 4, "count": 6, "flags": 8, "chain": 12, "chain_hi": 16, "epoch": 24, "protect_count": 20,
+    "protect": 32,
+    "lanes": 64, "kinds": 192,
+}
+RECORD_FLAG_CAPTURED = 1
+LANE_BYTES = 16
+LANE_FIELDS = {"expert": 0, "slot": 4, "dst": 8, "weight": 12}
 HOT_HEADER_BYTES = 8
 HOT_ALIGNMENT = 64
 HOT_RECORDS = DEMAND_RECORDS
@@ -698,7 +705,7 @@ def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
 
 
 MAX_IDS = 8
-WORDS = {"demand_head": 0, "demand_done": 4}
+WORDS = {"demand_head": 0}
 # Order of the C++ counters (tier_protocol.h). Demand rows per layer come only from ``ExpertStreamHost.layer_rows()``:
 # one word per layer written by the tier's owner.
 COUNTERS = (
@@ -712,20 +719,15 @@ COUNTERS = (
     "version",
     "running",
     "spin_cpu",
-    "deferred",
-    "leases_granted",
-    "leases_acked",
-    "deferred_reuse",
+    "ram_insert_skipped",
     "piece_publish_refused",
     # Copy engine.
-    "leases_copied",
     "copy_jobs",
     "copy_lanes",
     "copy_bytes",
     "copy_issue_ns",
     "copy_latency_ns",
     "copy_latency_max_ns",
-    "copy_fallbacks",
     # CPU experts (plan 2026-09-29-dsv41-cpu-experts).
     "cpu_jobs",
     "cpu_lanes",
@@ -748,8 +750,7 @@ CORE_COUNTERS = (
     "version",
     "running",
     "spin_cpu",
-    "deferred",
-    "deferred_reuse",
+    "ram_insert_skipped",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -797,9 +798,9 @@ class ExpertStreamHost:
     runs, the caller between ``pause()`` and ``resume()``, and the caller of ``pump()`` when there is no thread. While
     the thread runs unpaused, ``contains``, ``touch``, ``assign``, ``release`` and ``fill_begin`` raise
     ``RuntimeError`` ("... needs the service thread paused"); ``set_hot`` is queued and applied by the service before
-    its next request (it returns before then); ``inject_lease`` and the snapshots (``slot_info``, ``slot_to_expert``,
-    ``lease_entry``, ``lru_order``, ``victim_census``) are answered by the service and waited for
-    (mid-read too, unless a queued ``set_hot``/``inject_lease`` precedes them: then at the end of the request);
+    its next request (it returns before then); ``attach_row`` and the snapshots (``slot_info``, ``slot_to_expert``,
+    ``lru_order``, ``victim_census``) are answered by the service and waited for
+    (mid-read too, unless a queued ``set_hot``/``attach_row`` precedes them: then at the end of the request);
     ``mapping``, ``counters``, ``busy_episode`` and ``layer_rows`` read published words without waiting. Paused, or
     with no thread, every call runs at once.
     """
@@ -832,9 +833,9 @@ class ExpertStreamHost:
         # The lease block: the service writes it through a raw address, so this object holds it. Allocated here when
         # the caller passes none.
         if lease_block is None:
-            lease_block = expert_lease_block.new_lease_block(pin=page.is_pinned())
+            lease_block = expert_lease_block.new_lease_block(int(tables.starts.shape[0]), pin=page.is_pinned())
         else:
-            expert_lease_block.check_lease_block(lease_block, need_pinned=page.is_pinned())
+            expert_lease_block.check_lease_block(lease_block, int(tables.starts.shape[0]), need_pinned=page.is_pinned())
         self.lease_block = lease_block
         self.hot_page = hot_page
         if hot_page is not None:
@@ -898,7 +899,7 @@ class ExpertStreamHost:
             return
         outcome = int(self._module.expert_stream_pause(self.handle, int(timeout_s * 1e9)))
         if outcome == 2:
-            raise RuntimeError("exl3 RAM miss: not paused, a GPU reader still holds a graph-lane lease")
+            raise RuntimeError("exl3 RAM miss: not paused, the copy thread still has a job (unsynchronized stream)")
         if outcome != 1:
             raise RuntimeError(f"exl3 RAM miss thread did not pause within {timeout_s} s")
 
@@ -972,9 +973,9 @@ class ExpertStreamHost:
         return bool(self._module.expert_stream_fill_end(self.handle))
 
     def slot_info(self, row: int) -> list[tuple[int, int, int]]:
-        """Per slot: (state, expert, leases); state 0 FREE, 1 LOADING, 2 READY. A snapshot: with the thread running,
-        the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot`` or
-        ``inject_lease``, it waits for the end of the current request (the queue keeps its order): never take one on
+        """Per slot: (state, expert, stamp); state 0 FREE, 1 LOADING, 2 READY, 3 STAGING. A snapshot: with the thread
+        running, the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot``
+        or ``attach_row``, it waits for the end of the current request (the queue keeps its order): never take one on
         the thread a read in service is gated on (a test's device release, say), or it waits until the watchdog."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 3, dtype=torch.int64)
@@ -982,31 +983,25 @@ class ExpertStreamHost:
         values = out.tolist()
         return [tuple(values[i : i + 3]) for i in range(0, len(values), 3)]
 
-    def lease_entry(self, idx: int) -> dict:
-        """Test only: the service's lease account of request slot ``idx`` (``(seq - 1) % DEMAND_RECORDS``)."""
-        lanes = expert_lease_block.LANES
-        out = torch.zeros(3 + 3 * lanes, dtype=torch.int64)
-        self._module.expert_stream_lease_entry(self.handle, idx, out)
-        values = out.tolist()
-        return {
-            "active": bool(values[0]),
-            "count": values[1],
-            "gen": values[2] & 0xFFFFFFFFFFFFFFFF,
-            "lane_state": values[3 : 3 + lanes],
-            "lane_slot": values[3 + lanes : 3 + 2 * lanes],
-            "lane_copy_engine": values[3 + 2 * lanes :],
-        }
-
-    def inject_lease(self, row: int, slot: int, delta: int) -> None:
-        """Test only: hold a lease as a GPU reader would. Instrumented build only."""
-        _refuse_test_only("inject_lease", self.variant)
-        self._check(row, slot=slot)
-        self._module.expert_stream_inject_lease(self.handle, row, slot, delta)
-
-    def victim_census(self, row: int, wanted: Iterable[int] = ()) -> tuple[int, int, int]:
-        """(free, evictable, leased) slots a request wanting ``wanted`` could take, counted without taking any."""
+    def attach_row(self, row: int, k: int) -> None:
+        """Row ``row``'s ``k`` staging slots and its tag-1 map delta (LEASE_PROTOCOL.md); once per row."""
         self._check(row)
-        out = torch.empty(3, dtype=torch.int64)
+        self._module.expert_stream_attach_row(self.handle, row, int(k))
+
+    def take_bulk_delta(self) -> torch.Tensor:
+        """The eager paths' map changes since the last call, int32 ``[n, 3]`` of (row, expert, slot); paused only."""
+        out = torch.empty((int(self._module.expert_stream_bulk_delta_count(self.handle)), 3), dtype=torch.int32)
+        self._module.expert_stream_take_bulk_delta(self.handle, out)
+        return out
+
+    def handled_through(self) -> int:
+        """Test only: the last request seq the service finished."""
+        return int(self._module.expert_stream_handled_through(self.handle)) & 0xFFFFFFFF
+
+    def victim_census(self, row: int, wanted: Iterable[int] = ()) -> tuple[int, int]:
+        """(free, evictable) slots a request wanting ``wanted`` could take, counted without taking any."""
+        self._check(row)
+        out = torch.empty(2, dtype=torch.int64)
         self._module.expert_stream_victim_census(self.handle, row, _ids(wanted), out)
         return tuple(out.tolist())
 
@@ -1042,7 +1037,7 @@ class ExpertStreamHost:
     def set_copy_table(self, row: int, table: torch.Tensor, dst_rows: int, *, sm_mask: int = 0) -> None:
         """Row ``row``'s copy table: int64 ``[n, 3]`` of (source slab, destination tensor, row bytes) addresses, as
         C1's ``ExpertRowSegments.table``; every destination tensor holds ``dst_rows`` rows. Bit i of ``sm_mask`` leaves
-        entry i to the copy wait's SM reads, and its leases then wait for the request's Done word too."""
+        entry i to the copy wait's SM reads."""
         self._check(row)
         entries = table.detach().to("cpu", torch.int64).contiguous()
         if entries.dim() != 2 or entries.shape[1] != 3 or entries.shape[0] < 1:
@@ -1070,25 +1065,31 @@ class ExpertStreamHost:
         the service thread.
 
         ``forward`` is the trait's native forward (a ``CpuExpertForward`` address); each row joins once its layer
-        handle is set (:meth:`set_cpu_layer`). Of a copy-engine request's n resident lanes, ``split[n]`` are computed
-        on the CPU (n = 0..8). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows`` (float32 ``[rows, hidden]``) are
-        pinned host rows: the post kernel stages a row's input in the first, the CPU writes its partial sum to the
-        second and the device reads it. Both must outlive the host, which keeps references.
+        handle is set (:meth:`set_cpu_layer`). Of a captured post's n eligible lanes, ``split[n]`` are computed on the
+        CPU (n = 0..8; the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows`` (float32
+        ``[rows, hidden]``, or ``[rows, 2, hidden]`` for a CPU-hit and a CPU-miss partial sum each) are pinned host
+        rows: the post kernel stages a row's input in the first, the CPU writes its partial sums to the second and the
+        device reads them. Both must outlive the host, which keeps references.
         """
         lanes = expert_lease_block.LANES
         if len(split) != lanes + 1:
             raise ValueError(f"the CPU split table has {lanes + 1} entries (n = 0..{lanes}), not {len(split)}")
-        for rows, dtype, name in ((x_rows, torch.uint8, "x_rows"), (out_rows, torch.float32, "out_rows")):
-            if rows.dtype != dtype or rows.dim() != 2 or rows.device.type != "cpu" or not rows.is_contiguous():
-                raise ValueError(f"{name} must be a contiguous host {dtype} [rows, n] tensor")
+        if x_rows.dtype != torch.uint8 or x_rows.dim() != 2 or x_rows.device.type != "cpu" or not x_rows.is_contiguous():
+            raise ValueError("x_rows must be a contiguous host uint8 [rows, n] tensor")
+        if (out_rows.dtype != torch.float32 or out_rows.dim() not in (2, 3) or out_rows.device.type != "cpu"
+                or not out_rows.is_contiguous() or (out_rows.dim() == 3 and out_rows.shape[1] != 2)):
+            raise ValueError("out_rows must be a contiguous host float32 [rows, hidden] or [rows, 2, hidden] tensor")
+        parts = 1 if out_rows.dim() == 2 else 2
+        hidden = int(out_rows.shape[-1])
         self._module.expert_stream_enable_cpu_experts(
             self.handle,
             int(forward),
             torch.tensor(list(split), dtype=torch.int64),
             torch.tensor(list(cores), dtype=torch.int64),
             x_rows,
-            out_rows,
-            int(out_rows.shape[1]),
+            out_rows.view(out_rows.shape[0], parts * hidden),
+            hidden,
+            parts,
             int(threads),
             int(spin_us * 1e3),
         )
@@ -1100,7 +1101,7 @@ class ExpertStreamHost:
         self._module.expert_stream_set_cpu_layer(self.handle, row, int(handle))
 
     def set_cpu_split(self, split: Sequence[int]) -> None:
-        """CPU experts: a new split table (CPU lanes per n resident lanes, n = 0..8), at any time."""
+        """CPU experts: a new split table (CPU lanes per n eligible lanes, n = 0..8), at any time; the device reads it."""
         self._module.expert_stream_set_cpu_split(self.handle, torch.tensor(list(split), dtype=torch.int64))
 
     def cpu_stats(self) -> dict[str, int]:
@@ -1111,9 +1112,7 @@ class ExpertStreamHost:
         return {"jobs": jobs, "lanes": lanes, "forward_ns": ns}
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
-        """Whether every job handed to the copy thread completed (or failed) within ``timeout_s``. The copy thread hands
-        each completed job back to the tier's owner, which releases its COPYING leases (D7): here, when the caller
-        owns the tier (no thread, or paused); otherwise at the running service's next poll."""
+        """Whether every job handed to the copy thread completed (or failed) within ``timeout_s``."""
         return bool(self._module.expert_stream_copy_engine_idle(self.handle, int(timeout_s * 1e9)))
 
     def copy_engine_release(self, marks: int = -1) -> None:
@@ -1256,7 +1255,7 @@ class ExpertStreamHost:
 STATE_WORDS = {"posted": 0, "pending": 1, "epoch": 2, "pending_epoch": 3, "deadline_lo": 4, "deadline_hi": 5}
 
 
-_LEASE_METHODS = {"expert_stream_post": "post", "expert_stream_lease_hit_wait": "lease_hit_wait"}
+_LEASE_METHODS = {"expert_stream_post": "post", "expert_stream_map_bulk_apply": "map_bulk_apply"}
 _ROW_COPY_METHODS = {"expert_stream_lease_stream": "lease_stream", "expert_stream_lease_copy_wait": "lease_copy_wait"}
 
 
@@ -1325,16 +1324,20 @@ def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
 
 
 class ExpertStreamDevice:
-    """The lease chain's device kernels (post -> W1 -> C1 -> S -> CW -> stream wait -> CC), capturable in a graph.
+    """The chain's device kernels (post -> C1 -> S -> CW -> stream wait -> CC), capturable in a graph.
 
     ``page`` and ``lease_block`` are the host's pinned tensors (device-readable through UVA); ``state`` holds the
     device words ``STATE_WORDS``. ``piece_runs`` is ``host.piece_runs()``; ``row_capacities`` each row's pinned slot
-    count (``tables.capacity``), which W1 and S bound every host slot by. ``timeout_ms`` is S's deadline.
+    count (``tables.capacity``), which the post and S bound every host slot by. ``timeout_ms`` is the post's delta wait
+    and S's deadline. ``map_bank`` is the device's copy of the RAM tier's map (LEASE_PROTOCOL.md): ``ram_slot``
+    ``[layers, experts]`` starts at -1 and changes only by the deltas the post applies and ``map_bulk_apply``.
+    ``hit_copy`` ("ce" or "sm") and ``cpu_misses`` are SGLANG_DSV41_RAM_HIT_COPY and SGLANG_DSV41_CPU_EXPERTS_MISSES.
     """
 
     def __init__(
         self, page, lease_block, *, device, layers: int, experts: int, timeout_ms: int, piece_runs: torch.Tensor,
         row_capacities: Sequence[int], hot_page=None, layout: str = "exl3", lease_pdl: bool = False,
+        hit_copy: str = "ce", cpu_misses: bool = False,
     ) -> None:
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu" or not page.is_contiguous():
             raise ValueError("page must be a contiguous CPU uint8 tensor of PAGE_BYTES")
@@ -1345,7 +1348,7 @@ class ExpertStreamDevice:
         # captured graph.
         if cuda and not page.is_pinned():
             raise ValueError("page must be pinned for a CUDA device")
-        expert_lease_block.check_lease_block(lease_block, need_pinned=cuda)
+        expert_lease_block.check_lease_block(lease_block, layers, need_pinned=cuda)
         if lease_pdl and cuda and not is_arch_support_pdl():
             raise ValueError("lease-chain PDL needs sm_90 or newer (griddepcontrol)")
         if len(row_capacities) != layers:
@@ -1363,8 +1366,12 @@ class ExpertStreamDevice:
         self.lease_pdl = bool(lease_pdl)
         self._row_capacities = tuple(int(c) for c in row_capacities)
         self._lease_address = int(lease_block.data_ptr())
+        if hit_copy not in ("ce", "sm"):
+            raise ValueError(f"hit_copy is 'ce' or 'sm', not {hit_copy!r}")
+        self.hit_copy = hit_copy
+        self.cpu_misses = bool(cpu_misses)
         state = torch.zeros(len(STATE_WORDS), dtype=torch.int32)
-        # Continue from the page's head: the thread serves demand_done + 1 next, so a device restarting at 1 over a
+        # Continue from the page's head: the thread serves demand_head + 1 next, so a device restarting at 1 over a
         # used page would never be served.
         state[STATE_WORDS["posted"]] = page[WORDS["demand_head"] : WORDS["demand_head"] + 4].view(torch.int32)[0]
         self.state = state.to(device)
@@ -1385,12 +1392,27 @@ class ExpertStreamDevice:
             self._hot_address = int(hot_page.data_ptr())
             self._hot_stride = stride
         lanes = expert_lease_block.LANES
-        # W1's compacted plan for C1: its committed count, and per entry the source row and destination slot, in one
-        # order. `claimed` is W1's per-lane verdict and S's complement. Stable addresses: a graph captures them.
+        # The device's map bank: tag 1 is the attach delta and map_chain starts there, so a zero-filled delta record
+        # (tag 0) is never taken for a published one.
+        self.map_bank = {
+            "ram_slot": torch.full((layers, experts), -1, dtype=torch.int32, device=device),
+            "staging": torch.full((layers, lanes), -1, dtype=torch.int32, device=device),
+            "map_chain": torch.ones(layers, dtype=torch.int64, device=device),
+            "map_applied": torch.zeros(layers, dtype=torch.int64, device=device),
+            # Per row: the copy engine may take a hit (its copy table is set), its destination rows, and the CPU may
+            # (its layer is registered). Set as the service learns them, read at every post.
+            "ce_ok": torch.zeros(layers, dtype=torch.uint8, device=device),
+            "dst_rows": torch.zeros(layers, dtype=torch.int32, device=device),
+            "cpu_ok": torch.zeros(layers, dtype=torch.uint8, device=device),
+        }
+        self._row_capacity_tensor = torch.tensor(self._row_capacities, dtype=torch.int32, device=device)
+        # The post's outputs: each lane's kind and source slot (S and CW read them), and C1's compacted SM hits, in one
+        # order. Stable addresses: a graph captures them.
+        self.lane_kind = torch.zeros(lanes, dtype=torch.int32, device=device)
+        self.lane_slot = torch.full((lanes,), -1, dtype=torch.int32, device=device)
         self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
         self.host_rows_1 = torch.zeros(lanes, dtype=torch.int64, device=device)
         self.dst_slots_1 = torch.zeros(lanes, dtype=torch.int32, device=device)
-        self.claimed = torch.zeros(lanes, dtype=torch.int32, device=device)
         # The lanes CW armed the gate for, handed to CC; 0: none.
         self.ce_mask = torch.zeros(1, dtype=torch.int32, device=device)
         # CPU experts: the lanes the CPU computed, written by CC (0: none).
@@ -1419,10 +1441,36 @@ class ExpertStreamDevice:
             raise ValueError("the CPU expert rows must be 16-byte aligned")
         self.cpu_x_rows, self.cpu_out_rows = x_rows, out_rows
 
+    def set_row_copy(self, row: int, dst_rows: int) -> None:
+        """The row's copy table is registered with ``dst_rows`` destination rows: the post may type its hits kHitCopy."""
+        self._check_row(row)
+        self.map_bank["dst_rows"][row] = int(dst_rows)
+        self.map_bank["ce_ok"][row] = 1
+
+    def set_row_cpu(self, row: int) -> None:
+        """The row's CPU layer is registered: the post may type its lanes kHitCpu or kMissCpu."""
+        self._check_row(row)
+        self.map_bank["cpu_ok"][row] = 1
+
+    def map_bulk_apply(self, bulk: torch.Tensor) -> None:
+        """The eager paths' map changes (``host.take_bulk_delta()``, int32 ``[n, 3]``), after every row's pending decode
+        delta, on the current stream. The caller has synchronized the stream and paused the service."""
+        if bulk.dtype != torch.int32 or bulk.dim() != 2 or bulk.shape[1] != 3:
+            raise ValueError(f"the bulk delta is int32 [n, 3], not {bulk.dtype} {tuple(bulk.shape)}")
+        bank = self.map_bank
+        self._kernels().expert_stream_map_bulk_apply(
+            self._lease_address, bank["ram_slot"], bank["staging"], bank["map_chain"], bank["map_applied"],
+            bulk.to(self.state.device).contiguous(), self._row_capacity_tensor,
+        )
+
     def cpu_out_address(self, row: int) -> int:
-        """The host address of ``row``'s CPU partial sum, which the fused MoE's route tables read."""
+        """The host address of ``row``'s CPU partial sums (part 0), which the fused MoE's route tables read."""
         self._check_row(row)
         return int(self.cpu_out_rows[row].data_ptr())
+
+    def cpu_out_part_stride(self) -> int:
+        """Floats from a row's part 0 (the CPU hits' sum) to its part 1 (the CPU misses'); 0 for one-part rows."""
+        return int(self.cpu_out_rows.stride(1)) if self.cpu_out_rows.dim() == 3 else 0
 
     def _check_row(self, row: int) -> None:
         if not 0 <= row < self.layers:
@@ -1438,11 +1486,12 @@ class ExpertStreamDevice:
         self, row: int, planned, count, routes, dst_slots, hot_slots=None, hot_capacity: int = 0,
         captured: bool = False, cpu_input=None,
     ) -> None:
-        """Post the layer's request. ``dst_slots`` (the plan's int32 destination slots) goes into the LaneRequest;
-        ``captured`` lets the service copy this request's resident lanes itself (and compute CPU lanes).
+        """Post the layer's request: apply the row's pending map delta, type its lanes from the device map into
+        ``lane_kind``/``lane_slot`` and C1's compaction, and publish the record. ``dst_slots`` are the plan's int32
+        destination slots; ``captured`` lets the post type copy-engine and CPU lanes.
 
         ``cpu_input`` = (x ``[1, hidden]``, route weights aligned with ``routes``), CPU experts only and with
-        ``captured``: the post stages x in the row's host row and the lanes' weights in the LaneRequest."""
+        ``captured``: the post stages x in the row's host row when a lane is the CPU's, and the weights in the record."""
         self._check_row(row)
         self._check_buffers(
             planned=(planned, torch.int64), count=(count, torch.int32), routes=(routes, torch.int64),
@@ -1463,30 +1512,20 @@ class ExpertStreamDevice:
                 raise ValueError(f"a {cpu_x.shape[-1]}-wide input does not fit the {self.cpu_x_rows.shape[1]}-byte row")
             cpu_x, cpu_weights = cpu_x.reshape(1, -1), cpu_weights.reshape(-1)
             cpu_x_dst = int(self.cpu_x_rows[row].data_ptr())
+        bank = self.map_bank
+        cpu_on = self.cpu_x_rows is not None
         self._kernels().expert_stream_post(
             self.page, self.state, planned, count, routes, row, self.experts, self._lease_address, self.timeout_ns,
             self._hot_address, self._hot_stride, hot_slots if hot_slots is not None else self._no_hot_slots,
-            hot_capacity, dst_slots, int(bool(captured)), cpu_x, cpu_x_dst, cpu_weights, int(self.lease_pdl),
-        )
-
-    def hit_wait(self, row: int, planned, count, dst_slots, budget_ns: int) -> None:
-        """W1: claim and compact the lanes the service published before its read.
-
-        It never waits on ``demand_done``; ``budget_ns`` of %globaltimer from kernel entry caps how long it polls for a
-        publish that may not be coming, so an all-miss request does not pay the read wait twice.
-        """
-        self._check_row(row)
-        self._check_buffers(
-            planned=(planned, torch.int64), count=(count, torch.int32), dst_slots=(dst_slots, torch.int32)
-        )
-        self._kernels().expert_stream_lease_hit_wait(
-            self.page, self.state, planned, count, dst_slots, self.host_rows_1, self.dst_slots_1,
-            self._lease_address, self.go_1, self.claimed, budget_ns, self._row_capacities[row], int(self.lease_pdl),
+            hot_capacity, dst_slots, int(bool(captured)), bank["ram_slot"], bank["staging"], bank["map_chain"],
+            bank["map_applied"], bank["ce_ok"], bank["cpu_ok"], bank["dst_rows"], self._row_capacities[row],
+            int(self.hit_copy == "ce"), int(cpu_on), int(self.cpu_misses and cpu_on), self.lane_kind, self.lane_slot,
+            self.go_1, self.host_rows_1, self.dst_slots_1, cpu_x, cpu_x_dst, cpu_weights, int(self.lease_pdl),
         )
 
     def stream(self, row: int, planned, count, dst_slots, segments, segment_map) -> None:
-        """S: copy the lanes W1 did not claim into ``segments``' destinations, each piece as its bit is published,
-        until the request is served and every piece is copied. ``segment_map`` is ``stream_segment_map(segments, ...)``.
+        """S: copy the post's kMissGpu lanes from their staging slots into ``segments``' destinations, each piece as
+        its bit is published, until every piece is copied. ``segment_map`` is ``stream_segment_map(segments, ...)``.
         """
         self._check_row(row)
         self._check_buffers(
@@ -1500,19 +1539,20 @@ class ExpertStreamDevice:
             raise ValueError(f"segment_map has {segment_map.numel()} entries, the kernel reads "
                              f"{row_segments} + {segments.table.shape[0]}")
         self._kernels().expert_stream_lease_stream(
-            self.page, self.state, planned, count, dst_slots, row, self.experts, self._lease_address, self.claimed,
-            segments.table, segment_map, row_segments, self.piece_runs, self._row_capacities[row], int(self.lease_pdl),
+            self.state, planned, count, dst_slots, row, self.experts, self._lease_address, self.lane_kind,
+            self.lane_slot, segments.table, segment_map, row_segments, self.piece_runs, self._row_capacities[row],
+            int(self.lease_pdl),
         )
 
-    def copy_wait(self, count, sm_table: Optional[torch.Tensor] = None) -> None:
+    def copy_wait(self, count, dst_slots, sm_table: Optional[torch.Tensor] = None) -> None:
         """The chain's tail: CW, a ``cuStreamWaitValue32`` on the gate, and CC.
 
-        CW publishes Done (after reading, with ``sm_table``, the small tensors of every COPYING lane from its leased
-        slot: int64 ``[n, 3]`` on the device, the copy-table rows the service's ``sm_mask`` named) and closes the gate
-        when the service owes COPYING or CPU lanes; the stream then waits, no SM spinning, until CW or the service's copy
-        thread opens it; CC traps unless CopyDone names this request.
+        CW reads, with ``sm_table``, the small tensors of every kHitCopy lane from its RAM slot (int64 ``[n, 3]`` on the
+        device, the copy-table rows the service's ``sm_mask`` named) and closes the gate when the record has host
+        lanes; the stream then waits, no SM spinning, until CW or the service's copy thread opens it; CC traps unless
+        CopyDone names this request.
         """
-        self._check_buffers(count=(count, torch.int32))
+        self._check_buffers(count=(count, torch.int32), dst_slots=(dst_slots, torch.int32))
         sm_address, sm_count = 0, 0
         if sm_table is not None:
             if sm_table.dtype != torch.int64 or sm_table.dim() != 2 or sm_table.shape[1] != 3 or not sm_table.is_contiguous():
@@ -1521,7 +1561,8 @@ class ExpertStreamDevice:
                 raise ValueError("the copy wait's SM table must live on the device the kernel reads it from")
             sm_address, sm_count = sm_table.data_ptr(), int(sm_table.shape[0])
         self._kernels().expert_stream_lease_copy_wait(
-            self.state, count, self._lease_address, sm_address, sm_count, self.ce_mask,
+            self.state, count, self._lease_address, self.lane_kind, self.lane_slot, dst_slots, sm_address, sm_count,
+            self.ce_mask,
             self.cpu_lanes if self.cpu_x_rows is not None else self._no_cpu, int(self.lease_pdl),
         )
 

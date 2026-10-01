@@ -54,10 +54,6 @@ SGL_DEVICE void st_release_sys64(uint8_t* address, uint64_t value) {
   asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(address), "l"(value) : "memory");
 }
 
-SGL_DEVICE uint64_t tagged_word(uint64_t tag, uint64_t generation) {
-  return (tag << 56) | generation;
-}
-
 constexpr uint64_t kGenerationMask = (1ull << 56) - 1;
 
 // The copy wait's gate word for request `seq`: `low` is kLeaseGateClosed or kLeaseGateOpen.
@@ -127,40 +123,116 @@ SGL_DEVICE int64_t ring_index(uint32_t seq) {
   return static_cast<int64_t>((seq - 1u) % kDemandRecords);
 }
 
+// One request's typed lanes, as the post writes them into its record (lease_layout.h kRecLanes, kRecKinds).
+struct TypedLanes {
+  int32_t slot[kMaxIds];  // the RAM slot of a hit, the staging slot of a miss
+  uint8_t kind[kMaxIds];  // kKind*
+};
+
+SGL_DEVICE bool is_cpu_kind(uint32_t kind) {
+  return kind == kKindHitCpu || kind == kKindMissCpu;
+}
+
+// Seqlock writer: a record of SM hits only may lap the ring before the service reads it, so a half-rewritten record
+// must never pass read_record's seq re-check. seq = 0, fence, payload, then seq with a release.
 SGL_DEVICE void write_record(
-    uint8_t* record, uint32_t seq, int64_t row, const int32_t* protect, int protect_count, uint32_t armed) {
-  // Seqlock writer: an unarmed record may lap the ring before the service reads it, so a half-rewritten record must
-  // never pass read_record's seq re-check. seq = 0, fence, payload, then seq with a release.
+    uint8_t* record, uint32_t seq, uint32_t epoch, int64_t row, uint32_t flags, uint64_t chain, const int32_t* protect,
+    int protect_count, int64_t count, const int64_t* planned, const int32_t* dst, const float* weight,
+    const TypedLanes& lanes) {
   st_relaxed_sys<uint32_t>(record + kRecSeq, 0u);
   cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
   st_relaxed_sys<uint16_t>(record + kRecRow, static_cast<uint16_t>(row));
+  st_relaxed_sys<uint16_t>(record + kRecCount, static_cast<uint16_t>(count));
+  st_relaxed_sys<uint32_t>(record + kRecFlags, flags);
+  st_relaxed_sys<uint32_t>(record + kRecChain, static_cast<uint32_t>(chain & 0xFFFFFFFFull));
+  st_relaxed_sys<uint32_t>(record + kRecChainHi, static_cast<uint32_t>(chain >> 32));
+  st_relaxed_sys<uint32_t>(record + kRecEpoch, epoch);
   st_relaxed_sys<uint16_t>(record + kRecProtectCount, static_cast<uint16_t>(protect_count));
-  st_relaxed_sys<uint16_t>(record + kRecArmed, static_cast<uint16_t>(armed));
-  for (int i = 0; i < kMaxIds; ++i)
+  for (int i = 0; i < kMaxIds; ++i) {
     st_relaxed_sys<int32_t>(record + kRecProtect + 4 * i, i < protect_count ? protect[i] : -1);
+    uint8_t* lane = record + kRecLanes + i * kLaneBytes;
+    const bool used = i < count;
+    st_relaxed_sys<int32_t>(lane + kLaneExpert, used ? static_cast<int32_t>(planned[i]) : -1);
+    st_relaxed_sys<int32_t>(lane + kLaneSlot, used ? lanes.slot[i] : -1);
+    st_relaxed_sys<int32_t>(lane + kLaneDst, used ? dst[i] : -1);
+    st_relaxed_sys<uint32_t>(lane + kLaneWeight, __float_as_uint(used ? weight[i] : 0.0f));
+    // Deduced, not st_relaxed_sys<uint8_t>: with T = uint8_t the byte-address overload names itself.
+    const uint8_t kind = used ? lanes.kind[i] : static_cast<uint8_t>(0);
+    st_relaxed_sys(record + kRecKinds + i, kind);
+  }
   st_release_sys(record + kRecSeq, seq);
 }
 
-// One lane's RowResult of generation G, read with the acquire that publishes it: `host_slot` is valid only when the
-// tag is not zero. The host stores the payload before the ready word's release and rewrites a lane only for a
-// request G + 16, which cannot be granted before G's Done retired its leases (LEASE_PROTOCOL.md, "Reuse"): so one
-// acquire and a payload load after it are the whole read, with no seqlock re-check.
-struct LaneRead {
-  uint64_t tag;  // 0: not (yet) published for G
-  int32_t host_slot;
-};
-
-SGL_DEVICE LaneRead lane_read(const uint8_t* result, uint64_t generation, uint32_t capacity) {
-  const uint64_t ready = ld_acquire_sys64(result + kLeaseRrReady);
-  if ((ready & kGenerationMask) != generation) return LaneRead{0, 0};
-  const int32_t host_slot = ld_relaxed_sys<int32_t>(result + kLeaseRrHostSlot);  // ordered after the acquire
-  if (host_slot < 0 || static_cast<uint32_t>(host_slot) >= capacity) __trap();  // a slot outside the row's slabs
-  return LaneRead{ready >> 56, host_slot};
+// The row's pending map delta (lease_layout.h, the delta block): wait, bounded by `deadline`, until the host has
+// published the delta that follows the row's last map chain, then apply it once. The host publishes a chain's delta
+// before it reads that chain's misses, so the wait is taken only when the host fell a whole token behind.
+SGL_DEVICE void apply_map_delta(
+    const uint8_t* delta, int32_t* ram_slot_row, int32_t* staging_row, int64_t* map_chain, int64_t* map_applied,
+    int64_t row, int64_t experts, uint32_t row_capacity, uint64_t deadline) {
+  const uint64_t want = static_cast<uint64_t>(map_chain[row]);
+  while (ld_acquire_sys64(delta + kDeltaTag) != want) {
+    if (static_cast<int64_t>(global_ns() - deadline) >= 0) __trap();  // the host never published it
+    __nanosleep(256);
+  }
+  if (static_cast<uint64_t>(map_applied[row]) == want) return;
+  const uint32_t n = ld_relaxed_sys<uint32_t>(delta + kDeltaCount);
+  if (n > static_cast<uint32_t>(kDeltaMaxEntries)) __trap();
+  for (uint32_t i = 0; i < n; ++i) {
+    const int32_t expert = ld_relaxed_sys<int32_t>(delta + kDeltaEntries + 8 * i);
+    const int32_t slot = ld_relaxed_sys<int32_t>(delta + kDeltaEntries + 8 * i + 4);
+    if (expert < 0 || expert >= experts || slot < -1 || slot >= static_cast<int32_t>(row_capacity)) __trap();
+    ram_slot_row[expert] = slot;
+  }
+  for (int k = 0; k < kLeaseLanes; ++k)
+    staging_row[k] = ld_relaxed_sys<int32_t>(delta + kDeltaStaging + 4 * k);
+  map_applied[row] = static_cast<int64_t>(want);
 }
 
-// A CPU lane is the copy thread's to complete as well: every stage treats it as COPYING.
-SGL_DEVICE bool copy_owned(uint64_t tag) {
-  return tag == kLeaseTagCopying || tag == kLeaseTagCpu;
+// ram_slot_map.type_lanes, transcribed: each lane's kind and source slot. A hit takes its RAM slot, the m-th miss
+// the m-th staging slot; the CPU takes the last split[n] of the n eligible lanes in plan order. Traps where the
+// reference raises (a wider plan, a repeated expert, a miss with no staging slot, a split entry above n).
+SGL_DEVICE void type_lanes(
+    const int64_t* planned, int64_t count, int64_t experts, const int32_t* ram_slot_row, const int32_t* staging_row,
+    const uint8_t* split, bool host_lanes, bool hit_copy_ce, bool cpu_on, bool cpu_misses, bool ce_ok, bool cpu_ok,
+    const int32_t* dst, int32_t dst_rows, uint32_t row_capacity, TypedLanes& out) {
+  if (count > kMaxIds) __trap();
+  bool hit[kMaxIds];
+  bool eligible[kMaxIds];
+  int m = 0;
+  int n = 0;
+  for (int64_t j = 0; j < count; ++j) {
+    const int64_t expert = planned[j];
+    if (expert < 0 || expert >= experts) __trap();
+    for (int64_t i = 0; i < j; ++i)
+      if (planned[i] == expert) __trap();
+    const int32_t slot = ram_slot_row[expert];
+    hit[j] = slot >= 0;
+    if (hit[j]) {
+      if (static_cast<uint32_t>(slot) >= row_capacity) __trap();
+      out.slot[j] = slot;
+    } else {
+      if (m >= kLeaseLanes || staging_row[m] < 0) __trap();
+      out.slot[j] = staging_row[m++];
+    }
+    eligible[j] = host_lanes && cpu_on && cpu_ok && (hit[j] || cpu_misses);
+    n += eligible[j] ? 1 : 0;
+  }
+  int take = n > 0 ? ld_relaxed_sys<int32_t>(split + 4 * n) : 0;
+  if (take < 0 || take > n) __trap();
+  const bool copy_ok = host_lanes && hit_copy_ce && ce_ok;
+  for (int64_t j = count - 1; j >= 0; --j) {
+    const bool cpu = take > 0 && eligible[j];
+    if (cpu) --take;
+    uint8_t kind;
+    if (cpu) {
+      kind = hit[j] ? kKindHitCpu : kKindMissCpu;
+    } else if (hit[j]) {
+      kind = copy_ok && dst[j] >= 0 && dst[j] < dst_rows ? kKindHitCopy : kKindHitSm;
+    } else {
+      kind = kKindMissGpu;
+    }
+    out.kind[j] = kind;
+  }
 }
 
 }  // namespace device::expert_stream

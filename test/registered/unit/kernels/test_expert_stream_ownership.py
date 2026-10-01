@@ -1,7 +1,7 @@
 """The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Tasks 13-15): what an unpaused Python call does while
-the service thread runs, that queued commands are applied in order before the next request, that a copy
-completion comes back to the owner, which releases its lease (D7), that a prefill fill's epilogue runs on the owner
-after the join, and that the tier declares no mutex but the Python callers' own."""
+the service thread runs, that queued commands are applied in order before the next request, that the copy thread
+publishes a completed copy's CopyDone itself, that a prefill fill's epilogue runs on the owner after the join, and that
+the tier declares no mutex but the Python callers' own."""
 
 import faulthandler
 import re
@@ -13,9 +13,10 @@ import torch
 
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test import hotpath_script as hp
+from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_lease_sim import LeaseSim
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.dsv41_chain_sim import ChainSim
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 from sglang.test.expert_stream_sources import MOE
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -31,18 +32,20 @@ def hang_guard():
 
 @pytest.fixture
 def running(tmp_path):
-    s = ram_miss_setup(tmp_path, capacity=4, layers=2, experts=8)
+    s = ram_miss_setup(tmp_path, capacity=5, layers=2, experts=8)  # one staging slot: four mappable rows
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 8), -1, dtype=torch.int32))
+    host = attached_host(s, page)
     for expert in range(4):
         host.assign(0, expert)  # pump mode: the caller owns the tier
+    sim = ChainSim(host, page, s.slabs)
+    sim.sync_bulk()  # the device learns the eager assignments before any post
     host.start_thread(fatal_wait_s=60.0, spin_us=2000)
-    yield s, page, host
+    yield s, page, host, sim
     host.stop()
 
 
 def test_unpaused_eager_calls_refuse_or_snapshot(running):
-    s, page, host = running
+    s, page, host, sim = running
     for call in (
         lambda: host.assign(0, 5),
         lambda: host.touch(0, 1),
@@ -56,9 +59,9 @@ def test_unpaused_eager_calls_refuse_or_snapshot(running):
     mapping = host.mapping(0)
     assert sorted(e for _, e, _ in info if e >= 0) == [0, 1, 2, 3]
     assert all(mapping[e] >= 0 and info[mapping[e]][1] == e for e in range(4))
-    assert host.lease_entry(0)["active"] in (0, False)
-    assert sorted(host.lru_order(0)) == [0, 1, 2, 3] and sorted(host.slot_to_expert(0)) == [0, 1, 2, 3]
-    assert host.victim_census(0, []) == (0, 4, 0)
+    assert sorted(host.lru_order(0)) == [0, 1, 2, 3]
+    assert sorted(e for e in host.slot_to_expert(0) if e >= 0) == [0, 1, 2, 3]  # the staging slot holds none
+    assert host.victim_census(0, []) == (0, 4)
     host.pause(5.0)
     try:
         slot, _evicted = host.assign(0, 5)  # the owner may assign (it evicts an LRU row: capacity is full)
@@ -69,10 +72,9 @@ def test_unpaused_eager_calls_refuse_or_snapshot(running):
 
 
 def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
-    s, page, host = running
+    s, page, host, sim = running
     host.inject(delay_s=0.3)  # instr: every demand read sleeps 300 ms first
     applied = host.counters()["commands_applied"]  # instr: every command the owner applied, queued or direct
-    sim = LeaseSim(host, page, s.slabs)
     req = sim.post(1, [6])  # a long read on row 1 keeps the service busy
     time.sleep(0.05)
     start = time.perf_counter()
@@ -85,57 +87,49 @@ def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
     # waits for the service to drain the full ring, which it does only once the read ends, ~0.25 s from `start`.
     # Applied directly, the whole burst takes milliseconds.
     burst_s = time.perf_counter() - start
-    assert sim.wait(req, 5.0).served
-    sim.done(req)
-    free, evictable, leased = host.victim_census(0, [])  # a snapshot: queued behind the burst, answered after it
-    assert (free, evictable, leased) == (0, 1, 0)  # only expert 3 is neither hot nor wanted: the LAST set_hot won
+    assert sim.wait_served(req, 5.0)
+    free, evictable = host.victim_census(0, [])  # a snapshot: queued behind the burst, answered after it
+    assert (free, evictable) == (0, 1)  # only expert 3 is neither hot nor wanted: the LAST set_hot won
     assert host.counters()["commands_applied"] - applied == 201 + 1, "a command was dropped (the +1 is the census)"
     assert burst_s > 0.1, f"the burst returned in {burst_s:.3f} s, while the read ran: nothing was queued"
 
 
 def _copy_request(s, page, host, sim):
-    """A resident expert 0 of row 0, then a request whose lane 0 is COPYING; returns (req, slot)."""
+    """A resident expert 0 of row 0, then a request whose lane 0 the copy engine copies; returns the request."""
     first = sim.post(0, [0])
     while host.pump():
         pass
-    sim.done(first)
-    while host.pump():
-        pass
+    assert sim.served(first)
     req = sim.post(0, [0], dst=[0], captured=True)
     while host.pump():
         pass
-    return req, host.mapping(0)[0]
+    assert req.kinds == [LaneKind.HIT_COPY]
+    return req
 
 
-def test_a_copying_lease_is_released_at_the_owners_next_poll_not_by_the_copy_thread(tmp_path):
-    """D7: the copy thread publishes CopyDone and hands the job back; the owner releases the lease when it next runs."""
+def test_the_copy_thread_publishes_copy_done_once_its_mark_completes(tmp_path):
+    """The copy thread itself publishes CopyDone (and opens the gate) when the job's copies complete; nothing waits for
+    the owner's next poll."""
     s, page, host, sim, dst = hp.build_host(tmp_path)
     try:
-        req, slot = _copy_request(s, page, host, sim)
+        req = _copy_request(s, page, host, sim)
+        assert sim.copy_done(req) != req.gen  # the mark is held
         host.copy_engine_release(-1)
-        deadline = time.time() + 5
-        while sim.copy_done(req) != req.gen:
-            assert time.time() < deadline
-            time.sleep(0.001)
-        assert host.slot_info(0)[slot][2] == 1, "the copy thread released the lease itself"
-        host.pump()
-        assert host.slot_info(0)[slot][2] == 0, "the owner's poll did not release it"
+        assert sim.copy_wait(req, 5.0)
     finally:
         host.stop()
 
 
-def test_a_pause_retires_a_copy_that_completed_while_parked(tmp_path):
-    """Review Focus 3: pause() waits for the copy engine to go idle, then the pausing caller (the owner) drains the
-    completion ring and retires the COPYING lease itself, so the pause is not refused. A pause with nothing
-    outstanding is not refused either."""
+def test_a_pause_waits_for_an_outstanding_copy(tmp_path):
+    """Review Focus 3: pause() waits for the copy engine to go idle, so a copy that completes while the caller waits is
+    not a refusal. A pause with nothing outstanding is not refused either."""
     s, page, host, sim, dst = hp.build_host(tmp_path)
     try:
-        req, slot = _copy_request(s, page, host, sim)
+        req = _copy_request(s, page, host, sim)
         host.start_thread(fatal_wait_s=60.0, spin_us=2000)
         threading.Timer(0.2, lambda: host.copy_engine_release(-1)).start()
-        host.pause(5.0)  # waits for the copy engine to go idle, then the pausing caller drains and retires
+        host.pause(5.0)  # waits for the copy engine to go idle
         try:
-            assert host.slot_info(0)[slot][2] == 0
             assert sim.copy_done(req) == req.gen
         finally:
             host.resume()

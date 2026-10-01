@@ -310,9 +310,10 @@ struct HostExports {
 
   // CPU experts (plan 2026-09-29-dsv41-cpu-experts): `forward` is a CpuExpertForward's address (the trait's native
   // forward), whose layers register later (set_cpu_layer); split int64 [kLeaseLanes + 1], CPU lanes
-  // per n resident lanes; cores int64 [n], the CPU expert thread's affinity (may be empty); x_rows uint8 [rows, stride]
-  // (host, the post kernel writes a row's input there) and out_rows float32 [rows, >= hidden] (host, the device reads
-  // a row's CPU partial sum there). Both must outlive the service.
+  // per n eligible lanes; cores int64 [n], the CPU expert thread's affinity (may be empty); x_rows uint8 [rows, stride]
+  // (host, the post kernel writes a row's input there) and out_rows float32 [rows, >= parts * hidden] (host, the
+  // device reads a row's CPU partial sums there: part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both
+  // must outlive the service.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t forward,
@@ -321,6 +322,7 @@ struct HostExports {
       TensorView x_rows,
       TensorView out_rows,
       int64_t hidden,
+      int64_t parts,
       int64_t threads,
       int64_t spin_ns) {
     using namespace host;
@@ -344,6 +346,10 @@ struct HostExports {
     config.x_stride = x_rows.size(1);
     config.out_base = static_cast<uint8_t*>(out_rows.data_ptr());
     config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
+    if (parts != 1 && parts != 2) throw std::runtime_error(error_prefix<Layout>() + "CPU experts write 1 or 2 output parts");
+    if (out_rows.size(1) < parts * hidden)
+      throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than its parts");
+    config.out_part_stride = parts == 2 ? hidden * static_cast<int64_t>(sizeof(float)) : 0;
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
     config.spin_ns = spin_ns;
@@ -357,6 +363,24 @@ struct HostExports {
   }
 
   // CPU experts: split int64 [kLeaseLanes + 1], a new split table, at any time.
+  // Row `row`'s K staging slots and its tag-1 map delta (LEASE_PROTOCOL.md). Once per row.
+  static void attach_row(int64_t handle, int64_t row, int64_t k) {
+    find(handle)->attach_row(row, k);
+  }
+
+  // The eager paths' map changes since the last call: bulk_delta_count, then take_bulk_delta into int32 [that, 3] of
+  // {row, expert, slot}. A paused caller only; the count call joins a running fill first, so its unmaps are counted.
+  static int64_t bulk_delta_count(int64_t handle) {
+    return find(handle)->bulk_delta_count();
+  }
+
+  static void take_bulk_delta(int64_t handle, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("out", TensorMatcher({-1, 3}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), out);
+    find(handle)->take_bulk_delta(static_cast<int32_t*>(out.data_ptr()), out.size(0));
+  }
+
   static void set_cpu_split(int64_t handle, TensorView split) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -584,6 +608,9 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_cpu_experts, Exports::enable_cpu_experts);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_attach_row, Exports::attach_row);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_bulk_delta_count, Exports::bulk_delta_count);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_take_bulk_delta, Exports::take_bulk_delta);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_mapping, Exports::mapping);                               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_to_expert, Exports::slot_to_expert);                 \

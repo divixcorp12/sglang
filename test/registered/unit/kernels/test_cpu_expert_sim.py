@@ -1,5 +1,6 @@
 """The CPU-expert offline model: c_cpu interpolation, per-layer cost, policy ordering, n/m counting (CPU only)."""
 
+import argparse
 import os
 import sys
 
@@ -7,6 +8,9 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "dsv41"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "analysis", "dsv41-drive", "prefill-evict")
+)
 
 import tier_sim  # noqa: E402
 from cpu_expert_sim import (  # noqa: E402
@@ -20,8 +24,12 @@ from cpu_expert_sim import (  # noqa: E402
     load_c_cpu_table,
     predict,
     replay_nm,
+    slot_map_costs,
     split_costs,
+    staging_results,
 )
+
+from ram_replay import Replay  # noqa: E402
 
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
@@ -336,5 +344,119 @@ def test_device_sorted_lanes_pair_with_victims_in_the_sorted_order(policy, resid
     assert sim.resident(0) == resident
 
 
+def test_staging_without_ram_insert_never_grows_the_tier_on_a_decode_miss():
+    loaded = _ram_hit_loaded()
+    base = replay_nm(loaded, ram_rows=4, num_experts=8)
+    out = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="none")
+    assert base["residency"]["ram_inserted_rows_per_token"] == pytest.approx(2 / 5)
+    assert out["residency"]["ram_inserted_rows_per_token"] == 0
+    assert out["n"].tolist() == [[0]] * 5  # nothing was ever admitted, so nothing is a RAM hit
+    assert out["m"].tolist() == [[1], [1], [1], [0], [0]]  # the same VRAM residency, every miss now an NVMe read
+    assert out["residency"]["hot_hit_rate"] == base["residency"]["hot_hit_rate"]
+
+
+def test_staging_arms_share_vram_residency_without_cpu_experts():
+    loaded = _ram_hit_loaded()
+    arms = ("miss", "none", "deferred", "never")
+    hits = {arm: replay_nm(loaded, 4, 8, ram_insert=arm)["residency"]["hot_hit_rate"] for arm in arms}
+    assert len(set(hits.values())) == 1
+
+
+def test_deferred_insert_lands_after_the_forward_and_matches_baseline_hits_here():
+    loaded = _ram_hit_loaded()
+    base = replay_nm(loaded, ram_rows=4, num_experts=8)
+    out = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred")
+    assert out["n"].tolist() == base["n"].tolist()
+    assert out["residency"]["ram_inserted_rows_per_token"] == pytest.approx(2 / 5)
+
+
+def test_a_late_insert_never_evicts_a_row_the_same_request_reads():
+    replay = Replay([3], "base", True)
+    for expert in (1, 2, 4):  # stamps 1 < 2 < 4: expert 1 is the LRU victim if nothing protects it
+        replay.tiers[0].admit(expert, replay._next(), set(), set())
+    routes = [1, 3, 5]
+    missing = replay.lookup(0, routes)
+    assert missing == [3, 5] and set(replay.tiers[0].where) == {1, 2, 4}  # lookup admits nothing
+    replay.insert(0, missing, set(), set(routes))
+    assert set(replay.tiers[0].where) == {1, 3, 5}
+    with pytest.raises(RuntimeError):
+        replay.insert(0, [6], set(), {1, 3, 5})  # no unwanted victim left: it refuses instead of evicting one
+
+
+def test_ram_insert_arms_report_memcpy_only_for_the_deferred_copy():
+    args = argparse.Namespace(
+        ram_rows=4, num_experts=8, no_initial_from_log=False, numa_mb="0:1", cpu_node=0, measured_c_cpu=0.63,
+        c_link=1.0, handoff=0.02, nvme_ms=[1.5], gpu_ms=14.0, row_bytes=10.0,
+    )
+    out = staging_results(_ram_hit_loaded(), args, [0, 1, 1, 2, 3, 3, 4])
+    assert out["A_baseline"]["off"]["host_memcpy_bytes_per_token"] == 0
+    assert out["B_staging_no_ram_insert"]["on"]["ram_inserted_rows_per_token"] == 0
+    assert out["C_staging_deferred_insert"]["off"]["host_memcpy_bytes_per_token"] == pytest.approx(2 / 5 * 10.0)
+    assert out["B_staging_no_ram_insert"]["off"]["ram_hit_of_lanes"] == 0
+
+
+def test_unknown_ram_insert_is_rejected():
+    with pytest.raises(ValueError):
+        replay_nm(_ram_hit_loaded(), ram_rows=4, num_experts=8, ram_insert="staging")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+SPLIT9 = [0, 1, 1, 2, 3, 3, 4, 5, 5]
+
+
+def test_staging_reserve_takes_k_rows_out_of_every_layer():
+    loaded = _ram_hit_loaded()
+    full = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred")
+    reserved = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred", staging_reserve=3)
+    assert full["residency"]["ram_capacity_per_row"] == [4]
+    assert reserved["residency"]["ram_capacity_per_row"] == [1]
+    # One mappable row: 2 then 3 take it in turn, so forward 3's 2 is no longer a RAM hit.
+    assert full["n"].tolist() == [[0], [0], [1], [0], [0]]
+    assert reserved["n"].tolist() == [[0], [0], [0], [0], [0]]
+
+
+def test_cpu_misses_take_the_tail_of_every_residual_lane():
+    sim = tier_sim.DirectInsertReplay({0: [0]}, {0: 1}, 8)
+    chosen = {}
+    choose = _cpu_chooser("cpu_by_score_desc_tail", sim, SPLIT9, {0: [5, 6]}, chosen, cpu_misses=True)
+    assert choose(0, [5, 8, 6, 7]) == {8, 6, 7}  # n = 4 lanes, split[4] = 3: the last three, hits or not
+    assert chosen[0] == [8, 6, 7]
+    chosen = {}
+    choose = _cpu_chooser("cpu_by_score_desc_tail", sim, SPLIT9, {0: [5, 6]}, chosen)
+    assert choose(0, [5, 8, 6, 7]) == {6}  # hits only: n = 2, split[2] = 1
+
+
+def test_cpu_misses_are_counted_per_layer_and_enter_ram_not_vram():
+    loaded = _ram_hit_loaded()
+    out = replay_nm(loaded, ram_rows=4, num_experts=8, policy="cpu_by_score_desc_tail", split=SPLIT9,
+                    ram_insert="deferred", cpu_misses=True)
+    assert out["km"].tolist() == [[1], [1], [0], [0], [0]]  # 2 and 3 miss both tiers, computed on the CPU
+    assert out["kh"].tolist() == [[0], [0], [1], [1], [1]]  # 2 is then a RAM hit, again on the CPU
+    assert out["residency"]["hot_hit_rate"] == 0.0  # no CPU lane enters VRAM
+    assert out["residency"]["ram_inserted_rows_per_token"] == pytest.approx(2 / 5)
+
+
+def test_slot_map_cost_adds_the_cpu_miss_after_its_read_or_overlaps_it():
+    model = _model([0.4, 0.4, 0.4], nvme_ms=1.5)
+    one = np.array([[1]])
+    zero = np.array([[0]])
+    gpu = slot_map_costs(zero, one, zero, zero, model)
+    cpu = slot_map_costs(zero, one, zero, one, model)
+    assert gpu["pessimistic"] == gpu["optimistic"] == pytest.approx(1.0 + 1.5)  # the landed row crosses the link
+    assert cpu["pessimistic"] == pytest.approx(1.5 + 0.02 + 0.4)  # read, then the CPU computes it
+    assert cpu["optimistic"] == pytest.approx(1.5 + 0.42)
+    # A hit on the link next to a CPU miss: serial in the pessimistic bound, overlapped in the optimistic one.
+    both = slot_map_costs(one, one, zero, one, model)
+    assert both["pessimistic"] == pytest.approx(1.0 + 1.5 + 0.42)
+    assert both["optimistic"] == pytest.approx(1.5 + max(1.0, 0.42))
+
+
+def test_without_protect_reads_a_vram_hot_route_is_not_read_into_ram():
+    loaded = {"layer_ids": [0], "hot_capacity": {0: 1}, "forwards": [_graph(1, [0, 2], [0])]}
+    on = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred")
+    off = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred", protect_reads=False)
+    assert on["residency"]["ram_inserted_rows_per_token"] == 2  # 0 (VRAM-hot, routed) and 2
+    assert off["residency"]["ram_inserted_rows_per_token"] == 1  # only the VRAM miss 2

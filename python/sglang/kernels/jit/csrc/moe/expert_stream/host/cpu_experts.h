@@ -39,6 +39,8 @@ using CpuExpertForward =
 
 struct CpuJob {
   int64_t row = 0;
+  int32_t part = 0;   // the output part: 0 the CPU hits' partial sum, 1 the CPU misses'
+
   uint32_t seq = 0;  // the engine's job sequence, from 1; done() compares against it
   int32_t k = 0;
   int32_t slots[wire::kLeaseLanes] = {};
@@ -50,8 +52,9 @@ struct CpuExpertConfig {
   int64_t rows = 0;  // streamed rows; each gets its layer handle later (set_layer), until then the CPU skips it
   const uint8_t* x_base = nullptr;  // row r's input at x_base + r * x_stride, written by the post kernel
   int64_t x_stride = 0;
-  uint8_t* out_base = nullptr;  // row r's fp32 output at out_base + r * out_stride, read by the device
+  uint8_t* out_base = nullptr;  // row r's part p fp32 output at out_base + r * out_stride + p * out_part_stride
   int64_t out_stride = 0;
+  int64_t out_part_stride = 0;  // 0: one part, so CPU misses are refused (RamTier::serve_record)
   int64_t hidden = 0;
   int threads = 1;
   std::vector<int> cores;  // this thread's affinity, which the kernel's own workers may inherit
@@ -105,7 +108,12 @@ class CpuExpertEngine {
     }
   }
 
-  // A row the grant may send to the CPU: registered, and inside the tables.
+  // Output parts per row: 2 when the rows hold a CPU-hit and a CPU-miss partial sum each.
+  int parts() const {
+    return config_.out_part_stride > 0 ? 2 : 1;
+  }
+
+  // A row the device may send to the CPU: registered, and inside the tables.
   bool eligible(int64_t row) const {
     return row >= 0 && row < config_.rows && handles_[row].load(std::memory_order_acquire) >= 0;
   }
@@ -189,7 +197,7 @@ class CpuExpertEngine {
           job.slots,
           job.weights,
           job.k,
-          reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride),
+          reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride),
           config_.threads);
       if (result != 0)
         fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed (" +

@@ -6352,6 +6352,102 @@ EXIT read from pytest):
    - The attach test uses a stand-in residency updater.
 8. **No decode A/B** of the minimal lease protocol against its predecessor (§30.5). §29.13 items 1 and 10 still stand.
 
+## 31. The slot-map protocol: device-held expert map, staging slots, CPU-computed misses (`dsv41-device-slot-map`, 2026-09-30)
+
+Branch `dsv41-device-slot-map` from `59cfb07c99`. Plan: `docs/superpowers/plans/2026-09-30-dsv41-device-slot-map.md`
+(Revision 1 is binding); ledger of rulings: `.superpowers/sdd/2026-09-30-dsv41-device-slot-map/progress.md`
+(untracked; the rulings exist only there and in the branch's final summary). The protocol as built: `analysis/dsv41-drive/LEASE_PROTOCOL.md`,
+which supersedes §30.5's lease description. Not merged; nothing below has run in a server.
+
+### 31.1 What changed
+
+- **The device holds the map.** Each layer's expert -> pinned-slot map lives on the GPU (`map_bank`) and is updated
+  only by deltas: one per decode record with a miss, numbered by a per-row map chain, and one bulk delta after each
+  eager host use. The post types every lane from it: `HIT_COPY`, `HIT_SM`, `HIT_CPU`, `MISS_GPU`, `MISS_CPU`.
+- **No leases.** RowResult, W1 (the hit wait), Done, the lease counters, deferral and acknowledgements are gone. A RAM
+  hit is copied the moment the post types it; the host only checks the lane. Safety comes from victims being chosen at
+  record time, never among the record's routes, and from one record in flight (LEASE_PROTOCOL.md, "Why it is safe").
+- **Staging slots.** Attach reserves K = min(`graph_gather_rows`, capacity - 1) slots per row. A miss reads into a
+  staging slot, which becomes the expert's RAM slot; its victim becomes staging (a swap, not a copy). With no victim the
+  RAM insert is skipped and the miss is still served.
+- **CPU experts take misses too** with `SGLANG_DSV41_CPU_EXPERTS_MISSES=1` (default off): the miss is read into
+  staging, then computed by the CPU. The CPU output is two parts per row (hits' and misses'), and CC flags which parts
+  hold this record's partial; the route tables sum the flagged parts.
+- **The hit copy is switchable:** `SGLANG_DSV41_RAM_HIT_COPY=ce` (default, the copy engine) or `sm` (C1).
+- **Env:** `SGLANG_DSV41_RAM_MISS_HIT_WAIT_US` is deprecated and ignored. The gate refuses `CPU_EXPERTS_MISSES`
+  without `SGLANG_DSV41_CPU_EXPERTS=1` and an unknown `RAM_HIT_COPY`.
+- **Wire v2:** request page 4160 B (256-byte records with chain, epoch, per-lane slot, dst, weight and kind), completion
+  block 20480 B plus a 256-byte delta per row.
+
+Found on the way, fixed on the branch: the post stored every lane-kind byte as 0 (an `st_relaxed_sys<uint8_t>` call
+resolved to a self-recursive overload), and the host counted that malformed record as an overrun instead of failing;
+it now fails stop. Attach could find no slot to stage when every slot held a VRAM-hot expert; it now evicts those last.
+Attach also ran unpaused, so on a full tier its evictions reached the device only at the next eager host use; it now
+runs inside the pause. Two failures predate the branch: `test_exl3_direct_ack_violation_cannot_publish_a_resident`
+(its stub backend lacked `cpu_experts` since the CPU-experts merge; stub fixed) and the shutdown test in item 5.
+
+### 31.2 The replay (Task 0)
+
+`scripts/dsv41/cpu_expert_sim.py --slot-map` on the router capture
+`direct-two-phase-tests/hot-cache-policy/router-capture/stages.jsonl` (6153 decode tokens; 11.32 NVMe misses/token
+at K = 0), deferred RAM inserts, flat CPU cost 0.63 ms/lane, NVMe 1.5 ms/miss, split [0, 1, 1, 2, 3, 3, 4]. Output:
+`divix01:/mnt/nvme1/cpu-p1/slot-map-policies.{json,txt}`. ms/token; "pess" runs a CPU miss after the layer's link and
+hit work, "opt" overlaps them:
+
+| K (staging) | CPU off | CPU hits | CPU hits + misses (pess / opt) |
+|---|---|---|---|
+| 0 | 109.76 | 75.94 | 76.29 / 70.15 |
+| 6 | 110.73 | 77.18 | 77.52 / 71.05 |
+| 8 | 111.05 | 77.58 | 77.92 / 71.34 |
+
+- Staging costs +1.24 ms/token at K = 6 and +1.64 at K = 8 (CPU hits), from the slots it takes out of the tier
+  (NVMe misses/token 11.32 -> 11.97 -> 12.18).
+- Protect reads off against on: at most 0.01 ms/token at every K and CPU setting.
+- **Decision:** `CPU_EXPERTS_MISSES` defaults off. On the pessimistic bound it costs 0.35 ms/token at K = 0 (75.94 ->
+  76.29); only the optimistic bound gains (5.8 ms/token). A served A/B decides.
+
+### 31.3 Suites
+
+All on divix01 in private worktrees at the pushed branch head, `PYTHONPATH` at the tree under test, pytest's own
+status read.
+
+- **CPU:** `test/registered/unit/kernels`, `test/registered/unit/scripts/test_cpu_experts_quality.py` and
+  `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py`, with `-q -p no:randomly`, `-n 2`,
+  `taskset -c 0-17,30-63`, `OMP_NUM_THREADS=8`, `CUDA_VISIBLE_DEVICES=`:
+  - merge base `59cfb07c99`: 826 passed, 458 skipped (1284 collected);
+  - branch, at `1db383e34b` (the run's `HEAD=`): 830 passed, 458 skipped (1288 collected, before the attach test
+    below).
+  - The +4: the seven deleted lease test files held 37 tests (`lease_defer` 7, `lease_publication` 5,
+    `lease_service` 9, `leases` 8, `lease_thread` 4, `lease_wrap` 2, `task5_item5_ack_independence` 2); the two new
+    ones hold 27 (`test_exl3_ram_miss_slot_map.py` 19, `test_ram_slot_map.py` 8); modified files net +14
+    (`cpu_expert_sim` +11, `cpu_experts` +3, `lease_block` +1, `copy_engine` +1, `ram_miss_service` +1,
+    `prefill_share` -1, `build_variants` -2).
+  - Re-run at `0dc3ecd672`: 830 passed, 458 skipped. One later commit adds a test
+    (`test_attach_unmaps_on_a_full_tier_reach_the_device_before_any_post`).
+- **GPU** (RTX 5090, `flock cc-gpu.lock taskset -c 32-63`, `CUDA_MODULE_LOADING=EAGER`, `SGLANG_EXL3_SRC` set, from
+  `test/manual/dsv41`, `-k 'not ends_a_gpu_reader'`): every `*_cuda.py` and `*_gpu.py` the branch touched
+  (`copy_engine`, `cpu_lane_order`, `lease_kernels`, `lease_ordering`, `moe_split_parity`, `ram_miss_graph`,
+  `slot_map_kernels`, `task5_item6_shutdown`, `layer_fusion_launcher_checks`), plus `test_dsv41_layer_fusion_gpu.py`,
+  `test/registered/unit/kernels/test_expert_route_plan_fused.py` and
+  `test/registered/unit/layers/moe/test_expert_residency_gpu.py`, at `cc19d4a8d2`: **585 passed, 1 deselected**.
+  The deselected test is item 5 below.
+
+### 31.4 Not done
+
+1. **No server run** of any kind: no smoke, no decode A/B against master, no quality gate (E31) for CPU-computed
+   misses.
+2. **`SGLANG_DSV41_RAM_HIT_COPY=sm` has never been measured**, nor `CPU_EXPERTS_MISSES=1` beyond the replay.
+3. **No mutation runs.** The plan listed five mutants in Task 7, plus a delta-ordering one; they were not run, at the
+   user's direction ("no mutants needed for tests"). The tests' sensitivity is shown only by the self-recursive store
+   the GPU rig caught, and by the red tests written for the attach fixes.
+4. **Duplicate experts in a plan trap.** The fused planner emits unique experts; the non-fused `route_plan` path is
+   not exercised by graph gather, and was not checked to be duplicate-free.
+5. **`test_shutdown_ends_a_gpu_reader_waiting_on_the_service_without_waiting_out_its_timeout` fails**, identically at
+   the merge base: shutdown runs its barrier before admission closes, by design, so a chain waiting on a paused
+   service waits for its deadline. The test predates that design.
+6. **The "Lease Chain Map" artifact** still shows the lease protocol.
+
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

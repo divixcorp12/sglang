@@ -25,7 +25,6 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     router_capture_path: str
     ram_miss_timeout_ms: int
     ram_miss_fault: str
-    ram_miss_hit_wait_us: int
     enable_ram_miss_copy_engine: bool
     enable_ram_miss_sm_small_copies: bool
     enable_lease_pdl: bool
@@ -56,7 +55,6 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             router_capture_path=envs.SGLANG_DSV41_ROUTER_CAPTURE_PATH.get(),
             ram_miss_timeout_ms=envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get(),
             ram_miss_fault=envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get(),
-            ram_miss_hit_wait_us=envs.SGLANG_DSV41_RAM_MISS_HIT_WAIT_US.get(),
             enable_ram_miss_copy_engine=envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get(),
             enable_ram_miss_sm_small_copies=envs.SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES.get(),
             enable_lease_pdl=envs.SGLANG_DSV41_ENABLE_LEASE_PDL.get(),

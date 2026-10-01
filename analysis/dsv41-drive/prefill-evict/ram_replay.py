@@ -96,8 +96,9 @@ class Replay:
         self.tick += 1
         return self.tick
 
-    def decode(self, layer: int, routes: list[int], hot: set) -> int:
-        tier, wanted = self.tiers[layer], set(routes)
+    def lookup(self, layer: int, routes: list[int]) -> list[int]:
+        """Stamp the tier's hits among ``routes`` and return the misses, in route order, without admitting them."""
+        tier = self.tiers[layer]
         missing = []
         for expert in dict.fromkeys(routes):
             slot = tier.where.get(expert)
@@ -106,8 +107,16 @@ class Replay:
             else:
                 tier.stamp[slot] = self._next()
                 tier.owned.discard(slot)
+        return missing
+
+    def insert(self, layer: int, missing: list[int], hot: set, wanted: set) -> None:
+        """Admit ``missing``; a victim is never in ``hot`` or ``wanted`` (the request's own routes)."""
         for expert in missing:
-            tier.admit(expert, self._next(), hot, wanted)
+            self.tiers[layer].admit(expert, self._next(), hot, wanted)
+
+    def decode(self, layer: int, routes: list[int], hot: set) -> int:
+        missing = self.lookup(layer, routes)
+        self.insert(layer, missing, hot, set(routes))
         return len(missing)
 
     def prefill(self, layer: int, experts: list[int], hot: set) -> int:

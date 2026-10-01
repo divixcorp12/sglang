@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.exl3_read_split import StaticSplitPolicy
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_lease_sim import LeaseSim
+from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, service_row_images, write_row_images
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
@@ -37,9 +37,9 @@ def hang_guard():
 
 
 @pytest.fixture
-def tiers(tmp_path, monkeypatch):
-    """The service reads row images with O_DIRECT (service_row_images), as in production; leases are on, which the
-    images need, so a demand is posted as the device posts it (_demand)."""
+def tiers(tmp_path, monkeypatch, request):
+    """The service reads row images with O_DIRECT (service_row_images), as in production; a demand is posted as the
+    device posts it (_demand)."""
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None
@@ -55,7 +55,8 @@ def tiers(tmp_path, monkeypatch):
                 streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
                 layer._nvfp4_expert_streamer = streamer
                 options = fmt.pinned_tier_options(layer)
-                caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **options)
+                capacity = getattr(request, "param", CAPACITY)  # a test that stages a slot asks for one more
+                caches[layer_id] = ExpertPinnedHostCache(streamer, capacity, device="cpu", **options)
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
         yield service, streamers, caches
@@ -69,17 +70,28 @@ def _holds(host, row, expert):
     return expert in host.slot_to_expert(row)
 
 
+def _sim(service):
+    """The device stand-in for this service: every row attached with one staging slot, as attach() would."""
+    sim = getattr(service, "_test_sim", None)
+    if sim is None:
+        for row in range(service.host.layers):
+            service.host.attach_row(row, 1)
+        sim = service._test_sim = ChainSim(service.host, service.page, {})
+    return sim
+
+
 def _demand(service, row, experts):
-    """One armed demand for ``experts`` of ``row`` as the device posts it (its lane request with it), served, then
-    its Done, which retires its leases, so its rows are evictable again."""
-    sim = LeaseSim(service.host, service.page, {})
+    """One demand for ``experts`` of ``row`` as the device posts it, after the eager changes reached the device's map
+    (taken while paused, as after_host_use's bulk apply does), served."""
+    sim = _sim(service)
+    # The class's own pause, not an instance attribute a test may have wrapped to count the service's pauses.
+    type(service.host).pause(service.host, 10.0)
+    try:
+        sim.sync_bulk()
+    finally:
+        type(service.host).resume(service.host)
     req = sim.post(row, experts)
-    assert sim.wait(req, timeout_s=10.0).served
-    sim.done(req)
-    deadline = time.perf_counter() + 10.0
-    while any(info[2] for info in service.host.slot_info(row)):
-        assert time.perf_counter() < deadline, "the leases were never retired"
-        time.sleep(0.002)
+    assert sim.wait_served(req, timeout_s=10.0) and sim.wait_handled(req, timeout_s=10.0)
 
 
 def test_the_pinned_tier_runs_on_the_native_slot_table(tiers):
@@ -207,7 +219,7 @@ def test_gpu_hot_snapshot_handoff_keeps_seed_protection_then_uses_device_map(tie
     try:
         for expert in (0, 1, 2):
             service.host.assign(service.row_of(0), expert)
-        assert service.host.victim_census(service.row_of(0)) == (0, 2, 0)
+        assert service.host.victim_census(service.row_of(0)) == (0, 2)
     finally:
         table.after_host_use(caches[0])
 
@@ -222,7 +234,7 @@ def test_gpu_hot_snapshot_handoff_keeps_seed_protection_then_uses_device_map(tie
     table.before_host_use(caches[0])
     try:
         assert service.hot_experts(0) == [2]
-        assert service.host.victim_census(service.row_of(0)) == (0, 2, 0)
+        assert service.host.victim_census(service.row_of(0)) == (0, 2)
         slot, evicted = service.host.assign(service.row_of(0), 3, protected_fallback=False)
         assert evicted == 0 and slot >= 0 and service.host.contains(service.row_of(0), 2)
     finally:
@@ -675,6 +687,29 @@ def test_shutdown_quarantines_after_native_stop_failure(monkeypatch):
     assert "join failed" in order[4][1]
 
 
+def test_the_quarantine_keeps_every_device_buffer_a_kernel_may_still_touch(monkeypatch):
+    """A real ExpertStreamDevice's buffers, slot-map bank included, all reach quarantine_host_slabs. Mutation: the list
+    names a buffer the device no longer has (AttributeError, so the shutdown frees nothing and reports nothing), or
+    leaves out the map bank."""
+    from sglang.kernels.ops.moe import expert_lease_block as lease
+    from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STAGE_PIECES, ExpertStreamDevice
+
+    side = ExpertStreamDevice(
+        torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(1, pin=False), device="cpu", layers=1,
+        experts=4, piece_runs=torch.zeros((1, 4, STAGE_PIECES, 1, 2), dtype=torch.int32), row_capacities=[5],
+        timeout_ms=10,
+    )
+    service = module.Exl3RamMissService()
+    service.device_side = side
+    kept = []
+    monkeypatch.setattr(module, "quarantine_host_slabs", lambda owned: kept.extend(owned))
+    service._quarantine("test")
+    ids = {id(t) for t in kept}
+    for tensor in (side.state, side.lane_kind, side.lane_slot, side.ce_mask, *side.map_bank.values()):
+        assert id(tensor) in ids
+    assert service._quarantined
+
+
 def test_graph_steps_are_traced_and_read_back_by_tier_sim(tmp_path):
     import os
     import sys
@@ -880,9 +915,8 @@ def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes(monkeypa
     calls = []
     device_side = SimpleNamespace(
         post=lambda row, planned, *a, **kw: calls.append(("post", planned.clone())),
-        hit_wait=lambda row, planned, *a: calls.append(("hit_wait", planned.clone())),
         stream=lambda row, planned, *a: calls.append(("stream", planned.clone())),
-        copy_wait=lambda count, sm: calls.append(("copy_wait", None)),
+        copy_wait=lambda count, dst_slots, sm: calls.append(("copy_wait", None)),
         host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False,
     )
     monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *a: calls.append(("c1", None)))
@@ -895,7 +929,7 @@ def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes(monkeypa
         slots=torch.arange(6, dtype=torch.int32),
     )
     backend.post(0, plan)
-    assert [name for name, _ in calls] == ["post", "hit_wait", "c1", "stream", "copy_wait"]
+    assert [name for name, _ in calls] == ["post", "c1", "stream", "copy_wait"]
     for name, planned in calls:
         if planned is not None:
             assert planned.numel() >= MAX_IDS, name
@@ -1100,6 +1134,7 @@ def _gather(cache, expert):
     cache.gather_rows(torch.tensor([expert]), outputs)
 
 
+@pytest.mark.parametrize("tiers", [CAPACITY + 1], indirect=True)  # one slot is staging: three mappable rows
 @pytest.mark.parametrize("on, survivors", [(False, [3, 4, 5]), (True, [1, 2, 5])], ids=["flag_off", "flag_on"])
 def test_decode_rows_survive_a_prefills_admissions_under_the_prefill_share(tiers, monkeypatch, on, survivors):
     """The flag's purpose, through the real eager path: decode's rows (read by the thread) survive a prefill's

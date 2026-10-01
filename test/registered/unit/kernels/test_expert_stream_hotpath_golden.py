@@ -1,6 +1,6 @@
-"""The hot path's observable behavior, pinned at the minimal lease protocol: the tier's slots and map, the lease
-entries, the row results, piece words, CopyDone and Done the device reads, the functional counters, the bytes of every
-READY row (and their identity with the checkpoint), and the SQEs a row-image read prepares. A refactor of the host must
+"""The hot path's observable behavior, pinned at the slot-map protocol: the tier's slots and map, the map deltas and the
+device's map they build, the lane kinds, piece words and CopyDone the device reads, the functional counters, the bytes
+of every READY row (and their identity with the checkpoint), and the SQEs a row-image read prepares. A refactor of the host must
 leave this file green without editing the golden. Regenerate only for a deliberate protocol change:
 ``python test/registered/unit/kernels/test_expert_stream_hotpath_golden.py --regen``."""
 
@@ -32,7 +32,7 @@ def scenario(tmp_path, variant=None):
 
 
 def sqe_golden(tmp_path):
-    s = ram_miss_setup(tmp_path, capacity=4, layers=2, experts=8, row_images=True, mirror_weights=(1.0, 1.0))
+    s = ram_miss_setup(tmp_path, capacity=hp.CAPACITY, layers=2, experts=8, row_images=True, mirror_weights=(1.0, 1.0))
     out = []
     for row, experts, slots in SQE_REQUESTS:
         result, sqes, info, _record = read_rows_sqes(s.tables, row, experts, slots)

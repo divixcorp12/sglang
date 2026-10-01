@@ -122,6 +122,7 @@ def _check(cfg, budgets) -> None:
     # Before the shared eager checks.
     # Their residency-update rule would tell a CPU-experts launch without DIRECT to turn the update off;
     # CPU experts need it on, at stage 2.
+    _check_slot_map()
     _check_cpu_experts(budgets)
     # The shared eager check refuses graph gather; decode graphs may use it.
     _EAGER.check(_EagerGraphView(cfg), dataclasses.replace(budgets, graph_gather=False))
@@ -140,6 +141,16 @@ def _check(cfg, budgets) -> None:
                 "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1; unset it or set it to 0"
             )
         overlap.set(False)
+
+
+def _check_slot_map() -> None:
+    """The slot-map chain's switches: how the post types RAM hits, and whether the CPU may take NVMe misses."""
+    hit_copy = envs.SGLANG_DSV41_RAM_HIT_COPY.get()
+    if hit_copy not in ("ce", "sm"):
+        raise ValueError(f"SGLANG_DSV41_RAM_HIT_COPY must be ce or sm, got {hit_copy!r}")
+    if envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        # The device would type misses kMissCpu that no CPU thread computes.
+        raise ValueError("SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1")
 
 
 def _check_cpu_experts(budgets) -> None:

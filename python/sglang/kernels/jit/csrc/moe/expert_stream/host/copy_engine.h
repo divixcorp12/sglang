@@ -20,7 +20,8 @@ struct CopyLane {
   float weight = 0.0f;  // the lane's routing weight: read only for a CPU lane
 };
 
-// One request's COPYING lanes, handed from the grant to the copy thread.
+// One record's host lanes, handed from the service to the copy thread at record time: copy-engine hits (DMA) and CPU
+// hits (part 0), plus a count of CPU misses whose job (part 1) arrives later as a LateCpu, once their rows landed.
 struct CopyJob {
   uint64_t gen = 0;
   int64_t idx = 0;
@@ -30,14 +31,24 @@ struct CopyJob {
   CopyLane lanes[kLeaseLanes];
   int64_t submit_ns = 0;
   int64_t token = -1;  // the backend's completion marker after the job's last copy (CUDA: the job's sequence)
-  // Its row has SM entries (set at issue): CW reads them from the leased slots, so the leases are released only once
-  // CW's Done shows it finished, not on the DMA's completion alone.
+  // Its row has SM entries (set at issue): CW copies those tensors itself, so the DMA skips them.
   bool sm = false;
-  // CPU experts (tag kLeaseTagCpu): the lanes of `mask` the CPU expert thread computes instead of copying, and that
-  // engine's job sequence for them (set at issue, 0 without CPU lanes). The job completes when its copies AND that
-  // CPU job have; CopyDone then carries the whole mask. `token` is kNoToken when no lane was copied.
+  // CPU experts (kKindHitCpu): the lanes of `mask` the CPU expert thread computes instead of copying, and that
+  // engine's job sequence for them (set at issue, 0 without CPU hits). `token` is kNoToken when no lane was copied.
   uint32_t cpu_mask = 0;
   uint32_t cpu_seq = 0;
+  // kKindMissCpu lanes: how many, and the CPU job sequence of their LateCpu (0 until it arrived). The job completes
+  // when its copies, its part-0 CPU job and its part-1 CPU job all have; CopyDone then covers every host lane.
+  int late_cpu = 0;
+  uint32_t late_seq = 0;
+};
+
+// A record's CPU misses, from the service once every one of their rows landed in its staging slot.
+struct LateCpu {
+  uint64_t gen = 0;
+  int k = 0;
+  int32_t slots[kLeaseLanes] = {};
+  float weights[kLeaseLanes] = {};
 };
 
 // CopyJob::token of a job that issued no copy (every lane on the CPU): nothing to query.
@@ -266,9 +277,8 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_wait_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 
-// The copy engine's queues (spec A7/A8): the service's job ring and the copy thread's in-flight and acking FIFOs. At
-// most kDemandRecords jobs are outstanding at once (one per request slot, whose lease entry stays open until its
-// COPYING leases are released), so none of them can fill.
+// The copy engine's queues (spec A7/A8): the service's job and late-CPU rings and the copy thread's in-flight FIFO. A
+// record with host lanes is waited on by the device, so at most one job is outstanding per armed chain and none fills.
 constexpr size_t kCopyRing = 32;
 static_assert(kCopyRing > kDemandRecords, "the copy engine's rings hold every job that can be outstanding");
 
@@ -363,14 +373,12 @@ class HostCopyBackend : public CopyBackend {
 //
 // `Build`: the tier's build policy (build_policy.h). `Owner`: the RamTier, which befriends this class. Its hooks,
 // all called on the copy thread (copy_failed also on the submitting thread, for a ring overflow):
-//   - bool copy_completed(const CopyJob&): the job's copies completed; false when it still waits for CW's Done,
-//     which copy_acked then polls;
-//   - bool copy_acked(const CopyJob&): true once it handed the job back;
+//   - void copy_completed(const CopyJob&): the job's copies and CPU jobs completed: CopyDone and the gate;
 //   - void copy_failed(const CopyJob&, int error): completion cannot be established; fail stop;
 //   - owner->template copy_count<K>(n): the copy thread's counters.
 //
 // Service to copy thread (spec 6.3 item 5): an SPSC job ring. submit() takes no lock and never blocks. The copy thread
-// polls the ring; after spin_ns of idle (nothing popped, in flight or acking) it sleeps on a futex, and submit()
+// polls the ring; after spin_ns of idle (nothing popped or in flight) it sleeps on a futex, and submit()
 // makes the wake syscall only when that thread is asleep. No wake is lost:
 //   - copy thread (idle): seen = wake_; sleeping_ = true; fence(seq_cst); if the ring is empty and no stop was asked
 //     for, futex_wait(&wake_, seen);
@@ -452,8 +460,21 @@ class CopyEngine {
     }
   }
 
-  // Every submitted job has completed (or failed) and been handed back: submitted_ is the submitter's, finished_ the
-  // copy thread's, each written by one thread.
+  // The owner: a record's CPU misses, after its job. Same ring discipline as submit.
+  void submit_late(const LateCpu& late) {
+    if (!late_.push(late)) {
+      fail_stop(prefix_ + "the late CPU job ring is full");
+      return;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);  // Dekker with run()'s sleeping_ store and ring re-check
+    if (sleeping_.load(std::memory_order_relaxed)) {
+      wake_.fetch_add(1, std::memory_order_relaxed);
+      futex_wake(&wake_);
+    }
+  }
+
+  // Every submitted job has completed (or failed): submitted_ is the submitter's, finished_ the copy thread's, each
+  // written by one thread.
   bool idle() const {
     return finished_.load(std::memory_order_acquire) == submitted_.load(std::memory_order_acquire);
   }
@@ -520,7 +541,7 @@ class CopyEngine {
     ready_cv_.notify_all();
     if (!error.empty()) return;
     Queue in_flight;
-    Queue acking;  // copies completed, CopyDone published; the leases wait for CW's Done
+    FixedDeque<LateCpu, kCopyRing> pending_late;  // a LateCpu popped before its job: matched once the job is in flight
     uint64_t idle = 0;  // empty polls since the last progress: the spin budget counts these (spec M8)
     while (true) {
       // Read before the ring: stop() is asked only after the last submit, so a stop seen here has every job in the
@@ -532,6 +553,12 @@ class CopyEngine {
         progressed = true;
         issue_or_fail(job, in_flight);
       }
+      LateCpu late;
+      while (late_.pop(&late)) {
+        progressed = true;
+        if (!pending_late.push_back(late)) fail_stop(prefix_ + "the late CPU jobs outnumber the outstanding jobs");
+      }
+      pending_late.erase_if([&](LateCpu& waiting) { return issue_late(waiting, in_flight); });
       // The head job is polled every turn, oldest first. CudaCopyBackend's poll is one acquire load of the completion
       // word, no driver call (the cuEventQuery it replaces took a libcuda mutex per call: ~2,300-3,200 per job over
       // arm CS3, results.md 9a), and one cuStreamQuery per CompletionWord budget while the head stays pending.
@@ -543,27 +570,16 @@ class CopyEngine {
           broken_ = state;
           break;
         }
-        if (head.cpu_seq != 0) {
-          const CpuExpertEngine* cpu = cpu_.load(std::memory_order_relaxed);  // set before the job was issued
-          if (!cpu->done(head.cpu_seq)) break;
-        }
+        const CpuExpertEngine* cpu = cpu_.load(std::memory_order_relaxed);  // set before a CPU job was issued
+        if (head.cpu_seq != 0 && !cpu->done(head.cpu_seq)) break;
+        if (head.late_cpu > 0 && (head.late_seq == 0 || !cpu->done(head.late_seq))) break;
         const CopyJob done = in_flight.front();
         in_flight.pop_front();
         record_latency(done);
-        if (owner_->copy_completed(done)) {
-          finish();
-        } else {
-          push_or_fail(acking, done);
-        }
+        owner_->copy_completed(done);
+        finish();
         progressed = true;
       }
-      const size_t acking_before = acking.size();
-      acking.erase_if([this](CopyJob& waiting) {
-        if (!owner_->copy_acked(waiting)) return false;
-        finish();
-        return true;
-      });
-      progressed = progressed || acking.size() != acking_before;
       if (broken_ != 0) {
         while (!in_flight.empty()) {
           finish_failed(in_flight.front(), broken_);
@@ -571,10 +587,10 @@ class CopyEngine {
         }
       }
       // The drain deadline is read only once a stop was asked for (short-circuit): never while serving.
-      if (stopping && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;
+      if (stopping && (in_flight.empty() || now_ns() > drain_deadline())) break;
       if (progressed) {
         idle = 0;
-      } else if (!in_flight.empty() || !acking.empty() || ++idle < spin_iters_) {
+      } else if (!in_flight.empty() || ++idle < spin_iters_) {
         _mm_pause();
       } else {
         sleep_until_submit();  // the idle path: nothing to poll, and spin_ns of nothing arriving
@@ -593,7 +609,7 @@ class CopyEngine {
     const uint32_t seen = wake_.load(std::memory_order_acquire);
     sleeping_.store(true, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_seq_cst);  // Dekker with submit()'s push and sleeping_ load
-    if (jobs_.empty() && !stop_.load(std::memory_order_acquire)) futex_wait(&wake_, seen, 1'000'000);  // 1 ms cap
+    if (jobs_.empty() && late_.empty() && !stop_.load(std::memory_order_acquire)) futex_wait(&wake_, seen, 1'000'000);
     sleeping_.store(false, std::memory_order_relaxed);
   }
 
@@ -634,6 +650,7 @@ class CopyEngine {
         fail_stop("copy job " + std::to_string(job.gen) + " carries CPU lanes with no CPU expert engine");
       CpuJob cpu_job;
       cpu_job.row = job.row;
+      cpu_job.part = 0;
       for (int i = 0; i < job.count; ++i) {
         const CopyLane& lane = job.lanes[i];
         if ((job.cpu_mask >> lane.lane & 1u) == 0) continue;
@@ -668,6 +685,31 @@ class CopyEngine {
       count<kCopyBytes>(bytes);
     }
     return r;
+  }
+
+  // A LateCpu whose job is in flight: its CPU misses go to the CPU expert thread as part 1. False while the job is not
+  // in flight yet (submit_late follows submit, but the two rings are popped separately).
+  bool issue_late(const LateCpu& late, Queue& in_flight) {
+    for (size_t i = 0; i < in_flight.size(); ++i) {
+      CopyJob& job = in_flight[i];
+      if (job.gen != late.gen) continue;
+      if (job.late_cpu != late.k || job.late_seq != 0)
+        fail_stop(prefix_ + "the late CPU job of request " + std::to_string(late.gen) + " does not match its job");
+      CpuExpertEngine* cpu = cpu_.load(std::memory_order_acquire);
+      if (cpu == nullptr) fail_stop(prefix_ + "a late CPU job with no CPU expert engine");
+      CpuJob cpu_job;
+      cpu_job.row = job.row;
+      cpu_job.part = 1;
+      cpu_job.k = late.k;
+      for (int j = 0; j < late.k; ++j) {
+        cpu_job.slots[j] = late.slots[j];
+        cpu_job.weights[j] = late.weights[j];
+      }
+      job.late_seq = cpu->submit(cpu_job);
+      if (job.late_seq == 0) fail_stop(prefix_ + "request " + std::to_string(late.gen) + ": the CPU expert ring is full");
+      return true;
+    }
+    return false;
   }
 
   // copy_latency_ns and its max: metrics, so ProdBuild reads no clock here.
@@ -710,6 +752,7 @@ class CopyEngine {
   std::string thread_name_;
   std::thread thread_;
   SpscRing<CopyJob, kCopyRing> jobs_;   // the submitter pushes, the copy thread pops
+  SpscRing<LateCpu, kCopyRing> late_;   // the same
   std::atomic<uint64_t> submitted_{0};  // written by the submitter only
   std::atomic<uint64_t> finished_{0};   // written by the copy thread only
   std::atomic<bool> sleeping_{false};   // the copy thread is (about to be) in futex_wait

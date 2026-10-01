@@ -346,10 +346,16 @@ def test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads(slot_rows):
 
 
 # CPU experts (plan 2026-09-29-dsv41-cpu-experts, Step B): the lanes of cpu_lanes leave the fused MoE and the CPU's
-# partial sum seeds its output. Here lane i is route i (dst_slots = remap), as the post's plan makes it for a BS1 remap.
-def _cpu_run(fused, x, weights, remap, keep, mask: int, partial: torch.Tensor) -> torch.Tensor:
-    lanes = torch.tensor([mask], dtype=torch.int32, device=x.device)
-    cpu = (lanes, remap.to(torch.int32), partial.data_ptr())
+# partial sums seed its output. Here lane i is route i (dst_slots = remap), as the post's plan makes it for a BS1 remap.
+# cpu_lanes is CC's word: the lane mask in bits 0-7, then which parts hold a partial (bit 8 the CPU hits', part 0;
+# bit 9 the CPU misses', part 1, part_stride floats on).
+PART_HITS, PART_MISSES = 1 << 8, 1 << 9
+
+
+def _cpu_run(fused, x, weights, remap, keep, mask: int, partial: torch.Tensor, parts: int = PART_HITS) -> torch.Tensor:
+    lanes = torch.tensor([mask | parts], dtype=torch.int32, device=x.device)
+    stride = partial.stride(1) if partial.dim() == 3 else 0
+    cpu = (lanes, remap.to(torch.int32), partial.data_ptr(), stride)
     return fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=cpu).clone()
 
 
@@ -397,6 +403,28 @@ def test_the_cpu_partial_seeds_the_output(slot_rows):
         got = _cpu_run(fused, x, weights, remap, keep, mask, partial)
         scale = float(want.abs().max())
         assert torch.allclose(got, want, rtol=1e-5, atol=1e-5 * scale), f"mask={mask:#x}"
+
+
+def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
+    """Part 0 (3.0) and part 1 (5.0) of a two-part row: the seed is the sum of the parts CC flagged, so a record whose
+    only CPU lanes are misses never adds part 0's stale sum. Mutations: seed part 0 whenever any lane is CPU; read part
+    1 at part 0's address; ignore bit 9."""
+    device = slot_rows["w13_trellis"].device
+    fused = _fused(slot_rows, device, True)
+    hidden = slot_rows["w13_suh"].shape[-1]
+    two = torch.empty((1, 2, hidden), dtype=torch.float32).pin_memory()
+    two[:, 0], two[:, 1] = 3.0, 5.0
+    zero = torch.zeros((1, 2, hidden), dtype=torch.float32).pin_memory()
+    keep = torch.ones(1, device=device)
+    gen = torch.Generator().manual_seed(931)
+    for trial in range(TRIALS):
+        x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
+        mask = int(torch.randint(1, 1 << TOP_K, (1,), generator=gen))
+        base = _cpu_run(fused, x, weights, remap, keep, mask, zero, PART_HITS | PART_MISSES)
+        for parts, seed in ((PART_HITS, 3.0), (PART_MISSES, 5.0), (PART_HITS | PART_MISSES, 8.0)):
+            got = _cpu_run(fused, x, weights, remap, keep, mask, two, parts)
+            scale = float(base.abs().max()) + seed
+            assert torch.allclose(got - base, torch.full_like(base, seed), atol=1e-5 * scale), (mask, parts)
 
 
 def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):

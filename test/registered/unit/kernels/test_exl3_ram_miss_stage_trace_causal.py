@@ -14,8 +14,8 @@ import torch
 import sglang.kernels.ops.moe.expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, read_rows_traced
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_lease_sim import LeaseSim
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.dsv41_chain_sim import ChainSim
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 from sglang.test.expert_stream_sources import host_sources, joined_text
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -34,19 +34,17 @@ def _host(tmp_path, *, trace_capacity=None, capacity=6):
     """A tier and its host; ``trace_capacity`` None leaves the trace off."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, capacity), -1, dtype=torch.int32))
+    host = attached_host(s, page, k=3)
     if trace_capacity is not None:
         host.enable_trace(capacity=trace_capacity)
-    return s, page, host
+    return s, page, host, ChainSim(host, page, None)
 
 
-def _serve(page, host, row, lanes, protect=None):
-    """One demand for ``lanes``, served, then Done (the next pump retires its leases); returns its seq."""
-    sim = LeaseSim(host, page, None)
+def _serve(sim, host, row, lanes, protect=None):
+    """One demand for ``lanes``, served; returns its seq."""
     req = sim.post(row, lanes, protect=protect)
     assert host.pump() == 1
-    assert sim.wait(req, timeout_s=1.0).served
-    sim.done(req)
+    assert sim.wait_served(req, timeout_s=1.0)
     return req.seq
 
 
@@ -146,9 +144,9 @@ def test_a_failure_after_some_rows_packed_marks_exactly_the_stages_not_reached(t
 
 
 def test_a_served_request_is_reserved_before_any_row_is_admitted(tmp_path):
-    s, page, host = _host(tmp_path, trace_capacity=8)
+    s, page, host, sim = _host(tmp_path, trace_capacity=8)
     try:
-        _serve(page, host, 1, [2, 5, 4])
+        _serve(sim, host, 1, [2, 5, 4])
         (record,) = host.drain_trace()
     finally:
         host.stop()
@@ -158,16 +156,16 @@ def test_a_served_request_is_reserved_before_any_row_is_admitted(tmp_path):
 
 
 def test_a_full_ring_says_where_the_records_were_lost(tmp_path):
-    s, page, host = _host(tmp_path, trace_capacity=2)
+    s, page, host, sim = _host(tmp_path, trace_capacity=2)
     try:
-        seqs = [_serve(page, host, 0, [1]) for _ in range(5)]
+        seqs = [_serve(sim, host, 0, [1]) for _ in range(5)]
         first = host.drain_trace()
         assert [r["seq"] for r in first] == seqs[:2] and [r["dropped_before"] for r in first] == [0, 0]
         assert host.trace_dropped() == 3
-        after_seq = _serve(page, host, 0, [1])  # the ring was drained: this one gets in
+        after_seq = _serve(sim, host, 0, [1])  # the ring was drained: this one gets in
         (after,) = host.drain_trace()
         assert after["seq"] == after_seq and after["dropped_before"] == 3
-        _serve(page, host, 0, [1])
+        _serve(sim, host, 0, [1])
         (later,) = host.drain_trace()
         assert later["dropped_before"] == 0  # reported once, not cumulatively
     finally:
@@ -175,14 +173,14 @@ def test_a_full_ring_says_where_the_records_were_lost(tmp_path):
 
 
 def test_each_loss_episode_is_reported_at_its_own_position(tmp_path):
-    s, page, host = _host(tmp_path, trace_capacity=1)
+    s, page, host, sim = _host(tmp_path, trace_capacity=1)
     try:
         seen = []
         for lost in (2, 3):
             for _ in range(1 + lost):  # the first fills the single slot, the rest are dropped
-                _serve(page, host, 0, [1])
+                _serve(sim, host, 0, [1])
             seen.extend(host.drain_trace())
-        _serve(page, host, 0, [1])
+        _serve(sim, host, 0, [1])
         seen.extend(host.drain_trace())
         assert [r["dropped_before"] for r in seen] == [0, 2, 3]
         assert sum(r["dropped_before"] for r in seen) == host.trace_dropped() == 5
@@ -190,17 +188,17 @@ def test_each_loss_episode_is_reported_at_its_own_position(tmp_path):
         host.stop()
 
 
-def _mixed_traffic(page, host):
-    _serve(page, host, 1, [2, 5])  # reads
-    _serve(page, host, 1, [2])  # resident: no read
-    _serve(page, host, 1, [3], protect=[2, 3, 5])  # reads one row
+def _mixed_traffic(sim, host):
+    _serve(sim, host, 1, [2, 5])  # reads
+    _serve(sim, host, 1, [2])  # resident: no read
+    _serve(sim, host, 1, [3], protect=[2, 3, 5])  # reads one row
 
 
 def test_a_disabled_trace_reads_no_clock_and_builds_no_record(tmp_path):
-    s, page, host = _host(tmp_path)
+    s, page, host, sim = _host(tmp_path)
     try:
         before = host.trace_clock_reads()
-        _mixed_traffic(page, host)
+        _mixed_traffic(sim, host)
         assert host.trace_clock_reads() == before
         assert host.drain_trace() == [] and host.trace_dropped() == 0
     finally:
@@ -210,15 +208,15 @@ def test_a_disabled_trace_reads_no_clock_and_builds_no_record(tmp_path):
 def test_an_enabled_trace_reads_the_clock_at_every_stamp(tmp_path):
     """A request with nothing to read has exactly four stamps: observed, reserved, mapped, done. That the
     disabled run above reads zero is only meaningful because this counter does move when tracing is on."""
-    s, page, host = _host(tmp_path, trace_capacity=64)
+    s, page, host, sim = _host(tmp_path, trace_capacity=64)
     try:
-        _serve(page, host, 1, [2])
+        _serve(sim, host, 1, [2])
         before = host.trace_clock_reads()
         for _ in range(3):
-            _serve(page, host, 1, [2])
+            _serve(sim, host, 1, [2])
         assert host.trace_clock_reads() - before == 3 * 4
         before = host.trace_clock_reads()
-        _serve(page, host, 1, [5], protect=[2, 5])
+        _serve(sim, host, 1, [5], protect=[2, 5])
         assert host.trace_clock_reads() - before > 4  # a read stamps admission, submit, cqe and packing too
     finally:
         host.stop()
@@ -235,7 +233,7 @@ NON_TRACE_CLOCK_READS = {
     # copy-idle wait), and fill_wait (the second "deadline" line and the "return -1" line).
     "const int64_t deadline = now_ns() + timeout_ns;": 2,
     "if (now_ns() > deadline) {": 1,
-    "tier_->wait_copy_idle_owned(now_ns() + timeout_ns);": 1,
+    "if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {": 1,
     "if (now_ns() > deadline) return -1;": 1,
     # The spin budget (spec M8): idle_budget() times kProbe pauses once, on the thread that calls start() (RamThread and
     # CopyEngine), so neither the service nor the copy thread reads the clock to pace itself.
@@ -248,7 +246,7 @@ NON_TRACE_CLOCK_READS = {
     "if (now_ns() > deadline_ns) return false;": 1,
     "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
     "drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);": 1,
-    "if (stopping && ((in_flight.empty() && acking.empty()) || now_ns() > drain_deadline())) break;": 1,
+    "if (stopping && (in_flight.empty() || now_ns() > drain_deadline())) break;": 1,
     # seqlock_stress, test only (refused on ProdBuild): its run's deadline, on the caller's thread.
     "const int64_t deadline = now_ns() + duration_ns;": 1,
     "while (now_ns() < deadline) {": 1,

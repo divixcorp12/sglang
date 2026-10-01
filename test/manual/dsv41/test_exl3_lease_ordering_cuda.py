@@ -1,6 +1,7 @@
-"""The orderings the minimal protocol rests on, on a real GPU against the real service (LEASE_PROTOCOL.md, "Done" and
-"Copy engine"): Done covers every read of a leased slot, S hands W1's unclaimed COPYING lanes to CW, the captured chain
-waits in CW armed and unarmed, a first armed replay completes, and a kernel's first load under an armed copy wait.
+"""The orderings the slot-map protocol rests on, on a real GPU against the real service (LEASE_PROTOCOL.md, "Victims"
+and "Copy engine"): a record's victims are never slots its own delayed readers use, copy-engine hits typed while the
+service is paused are waited for in CW, the captured chain waits in CW armed and unarmed, a first armed replay
+completes, and a kernel's first load under an armed copy wait.
 
 Each ordering test names the mutant it must fail under. Run on divix01 under cc-gpu.lock, with PYTHONPATH pointing at
 the tree under test.
@@ -12,6 +13,7 @@ import random
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -25,83 +27,111 @@ try:
 except ImportError:  # pragma: no cover - only when cuda-python is missing
     cuda_drv = None
 
-from lease_chain_rig import CAPACITY, TOP_K, Chain  # noqa: E402
+from lease_chain_rig import CAPACITY, STAGING, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe.expert_stream_transport import device_module_with_hooks  # noqa: E402
+from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
 
 CW_DELAY_CYCLES = 600_000_000  # ~250 ms at the 5090's clock: long after the DMA of a copied lane has completed
 SM_READ_DELAY_NS = 100_000_000
+MAPPABLE = CAPACITY - STAGING
 
 
 def _resident(c, experts, row=0):
     c.plan(experts, row)
     c.gather(row)
     torch.cuda.synchronize()
-    assert c.retired(), c.host.counters()
+    assert c.handled(), c.host.counters()
+
+
+class _RewriteOnUnmap:
+    """A watcher thread: the instant the host's map drops one of ``experts``, write 0xAB over the slot it held. The
+    host forgetting a slot is the earliest moment anything may rewrite it."""
+
+    def __init__(self, c, experts, row=0):
+        self.c, self.row = c, row
+        self.slots = {e: c.host.mapping(row)[e] for e in experts}
+        assert all(slot >= 0 for slot in self.slots.values()), self.slots
+        self.unmapped, self.at_s = None, None
+        self.t0 = time.perf_counter()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while time.perf_counter() - self.t0 < 10.0:
+            mapping = self.c.host.mapping(self.row)
+            gone = [e for e, slot in self.slots.items() if mapping[e] != slot]
+            if gone:
+                self.at_s = time.perf_counter() - self.t0
+                self.unmapped = gone
+                for e in gone:
+                    for n in self.c.names:  # an int index is a view of the slab; a list index would fill a copy
+                        self.c.slabs[self.row][n][self.slots[e]].view(torch.uint8).fill_(0xAB)
+                return
+
+    def join(self):
+        self.thread.join()
+        return self.unmapped, self.at_s
+
+
+def _victim_under_a_delayed_reader(c, armed, **hooks):
+    """Fill every mappable slot (0..5 the oldest, 6 and 7 the newest), then post five hits and one miss with the hits'
+    reader delayed: the miss evicts the oldest slot the record does not route, 5, while the readers still wait."""
+    _resident(c, list(range(TOP_K)))
+    _resident(c, list(range(TOP_K, MAPPABLE)))
+    if armed:
+        c.host.arm_copy_engine()
+    experts = [0, 1, 2, 3, 4, 9]
+    watcher = _RewriteOnUnmap(c, range(MAPPABLE))
+    c.plan(experts)
+    c.chain(captured=armed, **hooks)
+    snapshot = c.snapshot()
+    torch.cuda.synchronize()
+    unmapped, at_s = watcher.join()
+    assert unmapped == [5], (unmapped, c.host.counters())
+    c.check(experts, snapshot)  # 0xAB here: the victim was a slot a delayed reader of this record used
+    want = [LaneKind.HIT_COPY if armed else LaneKind.HIT_SM] * 5 + [LaneKind.MISS_GPU]
+    assert c.kinds(len(experts)) == want
+    assert c.handled()
+    return at_s
 
 
 @pytest.mark.parametrize("where", ["before_c1", "before_cw"])
-def test_a_slab_row_rewritten_the_moment_its_lease_is_released_never_reaches_the_destination(tmp_path, where):
-    """A ~250 ms device sleep delays the chain's reader of the leased slots: C1 (hits READY, engine unarmed), or CW's
-    SM reads of the small tensors (hits COPYING, their trellis already DMA'd). A watcher writes 0xAB over every leased
-    slot the instant its lease drops; the destination must hold the checkpoint's bytes, so no lease dropped before
-    Done. Mutants: retire a lease without Done == G (before_c1 red); hand a copied job back on its DMA alone, ignoring
-    its SM entries (before_cw red)."""
+def test_a_records_victim_is_never_a_slot_its_own_delayed_readers_use(tmp_path, where):
+    """A ~250 ms device sleep delays the record's reader of its hit slots: C1 (HIT_SM, engine unarmed), or CW's SM
+    reads of the small tensors (HIT_COPY, their trellis already DMA'd). The watcher writes 0xAB over the record's victim
+    the instant the host unmaps it, long before the reader runs; every destination row must still hold its checkpoint
+    bytes. Mutant: take_victim_locked ignores the record's routes (it then evicts expert 0, a delayed hit)."""
     armed = where == "before_cw"
     c = Chain(tmp_path, copy_engine=armed, sm_small_copies=armed)
     try:
-        experts = list(range(TOP_K))
-        _resident(c, experts)
-        if armed:
-            c.host.arm_copy_engine()
-        slots = [c.host.mapping(0)[e] for e in experts]
-        copied = c.host.counters()["leases_copied"]
-        c.plan(experts)
-        c.chain(captured=armed, **{where: lambda: torch.cuda._sleep(CW_DELAY_CYCLES)})
-        snapshot = c.snapshot()
-        released_s = c.rewrite_on_release(slots)
-        torch.cuda.synchronize()
-        assert released_s is not None, c.host.counters()
-        c.check(experts, snapshot)  # 0xAB here: a slot was rewritten under a read of it
-        assert released_s > 0.1, f"the leases dropped {released_s:.3f} s after launch, before the delayed reader ran"
-        assert (c.host.counters()["leases_copied"] - copied == TOP_K) == armed, c.host.counters()
+        at_s = _victim_under_a_delayed_reader(c, armed, **{where: lambda: torch.cuda._sleep(CW_DELAY_CYCLES)})
+        assert at_s < 0.1, f"the victim was unmapped {at_s:.3f} s in: after the delayed reader, so it proved nothing"
     finally:
         c.close()
 
 
-def test_every_sm_read_of_a_slot_happens_before_cws_done(tmp_path):
+def test_a_records_victim_is_never_a_slot_cws_late_sm_reads_use(tmp_path):
     """The hook starts every CW warp but the first ~100 ms late on its small-tensor reads (warp 1 reads the 1024-byte
-    rows' upper half). A watcher writes 0xAB over each slot the instant its lease drops: a Done published before the
-    late reads finish lets the sentinel into the destination. Mutants: store Done above the barrier that follows the
-    reads, or above the reads -- each red on 0xAB."""
+    rows' upper half), so the record's victim is unmapped and rewritten while its hits' SM reads are still pending.
+    Mutant: as above, the victim ignores the routes -- red on 0xAB."""
     c = Chain(tmp_path, copy_engine=True, sm_small_copies=True)
     try:
-        experts = list(range(TOP_K))
-        _resident(c, experts)
-        c.host.arm_copy_engine()
-        slots = [c.host.mapping(0)[e] for e in experts]
         c.dev._module = device_module_with_hooks([f"EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS={SM_READ_DELAY_NS}"])
         c.plan([])
         c.chain(captured=True)  # compile and load the hooked build before the timed request
         torch.cuda.synchronize()
-        c.plan(experts)
-        c.chain(captured=True)
-        snapshot = c.snapshot()
-        released_s = c.rewrite_on_release(slots)
-        torch.cuda.synchronize()
-        assert released_s is not None, c.host.counters()
-        c.check(experts, snapshot)  # 0xAB here: Done was published before a read of the slot finished
-        assert released_s > SM_READ_DELAY_NS / 2e9, f"the leases dropped {released_s:.3f} s in: the delay did not act"
+        at_s = _victim_under_a_delayed_reader(c, True)
+        assert at_s < SM_READ_DELAY_NS / 2e9, f"the victim was unmapped {at_s:.3f} s in: the delay did not cover it"
     finally:
         c.close()
 
 
-def test_s_hands_a_copying_lane_w1_did_not_claim_to_the_copy_wait(tmp_path):
-    """The service is paused while the chain launches, so W1 (no budget) passes before any lane is published and
-    claims nothing; on resume the lanes are published COPYING, and S must leave them to CW (copy_owned), which waits
-    for the engine. Mutant: S treats a COPYING lane as not yet published -- it never admits it, and traps at its
-    deadline once served."""
-    c = Chain(tmp_path, copy_engine=True, hit_wait_ns=0)
+def test_copy_engine_hits_typed_while_the_service_is_paused_are_waited_for_in_cw(tmp_path):
+    """The post types HIT_COPY from the device map alone, so lanes posted while the service is paused are typed before
+    any copy job exists. C1 must leave them alone and CW must wait for the engine, which copies them on resume.
+    Mutant: CW builds its mask from anything but lane_kind -- it waits for nothing and reads stale destination rows."""
+    c = Chain(tmp_path, copy_engine=True)
     try:
         experts = [3, 4, 5]
         _resident(c, experts)
@@ -111,14 +141,14 @@ def test_s_hands_a_copying_lane_w1_did_not_claim_to_the_copy_wait(tmp_path):
             c.host.pause(5.0)
             c.chain(captured=True)
             snapshot = c.snapshot()
-            time.sleep(0.01)  # W1 has long finished its one pass
+            time.sleep(0.01)
             c.host.resume()
             torch.cuda.synchronize()
-            assert c.dev.claimed[:3].tolist() == [0, 0, 0], "W1 claimed a lane published after it ran"
+            assert c.kinds(3) == [LaneKind.HIT_COPY] * 3
             assert int(c.dev.go_1.item()) == 0
-            assert int(c.dev.ce_mask.item()) & 0xFF == 0b111, "CW did not wait for the three COPYING lanes"
+            assert int(c.dev.ce_mask.item()) & 0xFF == 0b111, "CW did not wait for the three HIT_COPY lanes"
             c.check(experts, snapshot)
-            assert c.retired(), c.host.counters()
+            assert c.handled(), c.host.counters()
     finally:
         c.close()
 
@@ -169,15 +199,15 @@ def _captured_nodes(fn):
 @pytest.mark.skipif(cuda_drv is None, reason="needs cuda-python (cuda.bindings.driver)")
 def test_the_captured_chain_waits_in_cw_and_replays_right_armed_and_unarmed(tmp_path):
     """The captured gather ends CW -> stream wait on the gate (a memory-op node, no kernel spinning) -> CC; its replays
-    deliver the planned rows unarmed (hits READY through C1) and armed (COPYING through the engine), and the engine
+    deliver the planned rows unarmed (HIT_SM through C1) and armed (HIT_COPY through the engine), and the engine
     copies exactly when armed."""
     c = Chain(tmp_path, copy_engine=True)
     try:
         c.plan([0, 1])
         graph, chain = _captured_nodes(c.gather)
         torch.cuda.synchronize()
-        assert c.retired()
-        _, tail = _captured_nodes(lambda: c.dev.copy_wait(c.plans[0].count))
+        assert c.handled()
+        _, tail = _captured_nodes(lambda: c.dev.copy_wait(c.plans[0].count, c.plans[0].slots))
         assert len(tail) == 3 and tail[1][0] == int(cuda_drv.CUgraphNodeType.CU_GRAPH_NODE_TYPE_BATCH_MEM_OP), tail
         assert chain[-3:] == tail, chain
         rng = random.Random(11)
@@ -185,13 +215,13 @@ def test_the_captured_chain_waits_in_cw_and_replays_right_armed_and_unarmed(tmp_
             c.host.arm_copy_engine(armed)
             jobs = c.host.counters()["copy_jobs"]
             for _ in range(8):
-                experts = rng.sample(range(CAPACITY), TOP_K)  # mostly resident after the first replays
+                experts = rng.sample(range(MAPPABLE + 2), TOP_K)  # mostly resident after the first replays
                 c.plan(experts)
                 graph.replay()
                 snapshot = c.snapshot()
                 torch.cuda.synchronize()
                 c.check(experts, snapshot)
-                assert c.retired(), (armed, c.host.counters())
+                assert c.handled(), (armed, c.host.counters())
             assert (c.host.counters()["copy_jobs"] > jobs) == armed, (armed, c.host.counters())
     finally:
         c.close()
@@ -207,7 +237,7 @@ def _first_armed_replay(c, *, before, after, unarmed_first):
         c.gather()  # eager warm-up: loads every kernel; an eager post never copies
         x.add_(1)
     torch.cuda.synchronize()
-    assert c.retired()
+    assert c.handled()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         for _ in range(before):
@@ -219,7 +249,7 @@ def _first_armed_replay(c, *, before, after, unarmed_first):
         c.plan([1, 2, 0])
         graph.replay()
         torch.cuda.synchronize()
-        assert c.retired()
+        assert c.handled()
     c.host.arm_copy_engine()
     jobs = c.host.counters()["copy_jobs"]
     experts = [2, 0, 1]
@@ -231,7 +261,7 @@ def _first_armed_replay(c, *, before, after, unarmed_first):
     replay_s = time.perf_counter() - t0
     assert c.host.counters()["copy_jobs"] == jobs + 1, c.host.counters()
     c.check(experts, snapshot)
-    assert c.retired(), c.host.counters()
+    assert c.handled(), c.host.counters()
     return replay_s
 
 
@@ -309,7 +339,7 @@ c.plan([0, 1, 2])
 c.gather()
 c.snapshot()
 torch.cuda.synchronize()
-assert c.retired()
+assert c.handled()
 c.host.copy_engine_ballast(dst, src)
 c.host.arm_copy_engine()
 c.host.pause(5.0)

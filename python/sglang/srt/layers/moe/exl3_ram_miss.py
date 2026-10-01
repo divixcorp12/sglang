@@ -388,7 +388,6 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         row: int,
         capacity: int,
         stream_maps: Mapping[int, torch.Tensor],
-        hit_wait_ns: int = 100_000,
         hot_slots: Optional[torch.Tensor] = None,
         hot_capacity: int = 0,
         route_log=None,
@@ -402,7 +401,6 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.row = row
         self.routes = torch.full((capacity,), -1, dtype=torch.int64, device=host_row_map.device)
         self.planned = torch.full((max(capacity, MAX_IDS),), -1, dtype=torch.int64, device=host_row_map.device)
-        self.hit_wait_ns = hit_wait_ns
         self.hot_slots = hot_slots
         self.hot_capacity = hot_capacity
         # Per tag, S's map of that tag's copy table (stream_segment_map).
@@ -441,8 +439,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
         self.planned[:lanes].copy_(plan.expert_ids)  # a device copy: captured, refreshed every replay
 
     def post(self, tag, plan) -> None:
-        """post -> W1 -> C1 -> S -> CW -> stream wait -> CC, one linear chain in one stream. C1 copies W1's compacted
-        plan (its own source rows, destination slots and committed count); S copies the rest piece by piece."""
+        """post -> C1 -> S -> CW -> stream wait -> CC, one linear chain in one stream. The post types the lanes from the
+        device's slot map; C1 copies its compacted HIT_SM lanes, S the misses piece by piece."""
         if self.route_log is not None:
             # ``routes`` was refreshed by _apply_graph and ``plan.count`` by the planner, both earlier
             # in this gather on this stream.
@@ -469,10 +467,9 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             captured=captured, cpu_input=self.cpu_input if captured and self.cpu_experts else None,
         )
         side.copy_engine_captured |= captured
-        side.hit_wait(self.row, self.planned, plan.count, plan.slots, self.hit_wait_ns)
         copy_expert_row_segments_gpu(self.segments[tag], side.host_rows_1, side.dst_slots_1, side.go_1)
         side.stream(self.row, self.planned, plan.count, plan.slots, self.segments[tag], self.stream_maps[tag])
-        side.copy_wait(plan.count, self.copy_sm_table)
+        side.copy_wait(plan.count, plan.slots, self.copy_sm_table)
         self._delivered = plan.count
 
 
@@ -576,10 +573,10 @@ class Exl3RamMissService:
         self._cpu_log_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
+        self._attached_rows: set[int] = set()  # rows whose staging slots attach() reserved (host.attach_row)
         self._copy_armed = False
         self._copy_decodes = 0
         self.copy_engine_module_loads = 0  # Triton loads that drained the device first
-        self.hit_wait_ns = 100_000
         # A prefill fill's wait gives up after the watchdog's limit, which aborts a hung fill first.
         self.fill_timeout_s = watchdog_wait_s(2000) + 5.0
         self.hot_page = None
@@ -697,7 +694,6 @@ class Exl3RamMissService:
         self._cpu_retune_batches = envs.SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES.get()
         self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
         self.lease_pdl = cfg.enable_lease_pdl
-        self.hit_wait_ns = cfg.ram_miss_hit_wait_us * 1000
         self.fill_timeout_s = watchdog_wait_s(cfg.ram_miss_timeout_ms) + 5.0
         # Order matters: atexit runs last-registered first, and weakref.finalize installs its single exit hook when the
         # first finalizer (any tier's slab unregister) is created. Registering HERE, after every tier exists (a tier built
@@ -778,6 +774,12 @@ class Exl3RamMissService:
     def after_host_use(self) -> None:
         self._pause_depth -= 1
         if self._pause_depth == 0:
+            # The eager paths' map changes reach the device before the service runs again, on the stream every later
+            # post follows (LEASE_PROTOCOL.md, "Eager host use").
+            bulk = self.host.take_bulk_delta()
+            # With no device map yet, the list is dropped: a new device side starts from a snapshot (attach).
+            if self.device_side is not None and bulk.numel():
+                self.device_side.map_bulk_apply(bulk)
             self.host.resume()
 
     def attach(self, manager, streamer) -> None:
@@ -802,7 +804,7 @@ class Exl3RamMissService:
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
         if streamer.graph_gather_rows > MAX_IDS:
-            # The post kernel requests min(count, MAX_IDS) lanes and W1 traps on a wider plan.
+            # The post kernel requests min(count, MAX_IDS) lanes and traps on a wider plan.
             raise ValueError(
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
                 f"per call but the service requests at most {MAX_IDS} lanes"
@@ -826,9 +828,27 @@ class Exl3RamMissService:
                 row_capacities=[int(c) for c in self.host.tables.capacity],
                 hot_page=self.hot_page if self.gpu_hot_enabled else None,
                 lease_pdl=self.lease_pdl,
+                hit_copy=envs.SGLANG_DSV41_RAM_HIT_COPY.get(),
+                cpu_misses=envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get(),
             )
             if self.cpu_experts is not None:
                 self.device_side.enable_cpu_experts(self.cpu_experts.x_rows, self.cpu_experts.out_rows)
+                self.cpu_experts.attach_device(self.device_side)
+            # The device's map starts empty: every row the tier maps now reaches it as one bulk of entries, taken
+            # paused. The bulk list before this point was dropped (after_host_use), so the snapshot is the source.
+            self.before_host_use()
+            try:
+                self.host.take_bulk_delta()
+                snapshot = [
+                    (row, expert, slot)
+                    for row in range(len(self._rows))
+                    for expert, slot in enumerate(self.host.mapping(row))
+                    if slot >= 0
+                ]
+                if snapshot:
+                    self.device_side.map_bulk_apply(torch.tensor(snapshot, dtype=torch.int32))
+            finally:
+                self.after_host_use()
             if self._stages_traced:
                 self._start_route_log(cache.device)
             if self.copy_engine:
@@ -838,6 +858,22 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
+        # The row's staging slots, once: one per lane a post can miss (LEASE_PROTOCOL.md).
+        if row not in self._attached_rows:
+            want = max(1, streamer.graph_gather_rows)
+            k = min(want, int(self.host.tables.capacity[row]) - 1)
+            if k < want:
+                # A small test tier; a post with more misses than k traps on the device ("no staging slot").
+                logger.warning("exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d", row, k, want,
+                               int(self.host.tables.capacity[row]))
+            # Paused, so the rows attach evicts on a full tier reach the device as a bulk delta before the service
+            # serves another record (LEASE_PROTOCOL.md, "Deltas and the bulk delta").
+            self.before_host_use()
+            try:
+                self.host.attach_row(row, k)
+            finally:
+                self.after_host_use()
+            self._attached_rows.add(row)
         if self.route_log is not None:
             self.route_log.bind(row, streamer.layer_id, cache.capacity)
         previous = streamer.row_backend
@@ -856,7 +892,6 @@ class Exl3RamMissService:
         streamer.row_backend = Exl3RamMissRowBackend(
             previous.segments, previous.host_row_map, self.device_side, row, streamer.graph_gather_rows,
             {tag: stream_segment_map(segments, self.host.tables, row) for tag, segments in previous.segments.items()},
-            hit_wait_ns=self.hit_wait_ns,
             hot_slots=(manager.gpu_residency.slot_to_expert[manager.gpu_residency.layer_ids.index(streamer.layer_id)]
                        if self.gpu_hot_enabled else None),
             hot_capacity=cache.capacity if self.gpu_hot_enabled else 0,
@@ -869,6 +904,7 @@ class Exl3RamMissService:
         if self.copy_engine:
             dst_rows = min(int(destination.shape[0]) for _, destination in segments.pairs)
             self.host.set_copy_table(row, segments.table, dst_rows, sm_mask=sm_mask)
+            self.device_side.set_row_copy(row, dst_rows)
 
     def _start_route_log(self, device) -> None:
         """Trace runs only: log every graph forward's routes (GraphRouteLog), stamped with the scheduler's
@@ -1221,8 +1257,8 @@ class Exl3RamMissService:
         if self.device_side is not None:
             side = self.device_side
             owned += [
-                side.state, side.go_1, side.host_rows_1, side.dst_slots_1, side.claimed, side.ce_mask, side.cpu_lanes,
-                side.piece_runs,
+                side.state, side.go_1, side.host_rows_1, side.dst_slots_1, side.lane_kind, side.lane_slot, side.ce_mask,
+                side.cpu_lanes, side.piece_runs, *side.map_bank.values(),
             ]
         if self._trace_snapshot is not None:
             # A copy can still be writing this pinned block when the device

@@ -9,8 +9,8 @@ import sglang.kernels.ops.moe.expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.layers.moe.exl3_stream_trace import RAM_MISS_TRACE_SCHEMA, Exl3StreamTrace
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_lease_sim import LeaseSim
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.dsv41_chain_sim import ChainSim
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -35,16 +35,15 @@ def _lines(path):
 def test_a_request_line_carries_the_causal_stamps_and_the_drop_position(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
+    host = attached_host(s, page)
     host.enable_trace(capacity=2)
     trace_path = tmp_path / "trace.jsonl"
     trace = Exl3StreamTrace(str(trace_path))
-    sim = LeaseSim(host, page, s.slabs)
+    sim = ChainSim(host, page, s.slabs)
 
     def serve(expert):
         req = sim.post(1, [expert])
-        assert host.pump() == 1 and sim.wait(req, timeout_s=1.0).served
-        sim.done(req)
+        assert host.pump() == 1 and sim.wait_served(req, timeout_s=1.0)
 
     try:
         for expert in (2, 5, 4, 3):  # four requests through a two-slot ring: two are lost

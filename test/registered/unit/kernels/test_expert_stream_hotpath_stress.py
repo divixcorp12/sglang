@@ -8,36 +8,35 @@ import random
 import threading
 import time
 
-from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test import hotpath_script as hp
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import same_bytes
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
-READY, FREE = 2, 0  # slot_info states
+READY, FREE, STAGING = 2, 0, 3  # slot_info states
 # The device routes only to these experts; the noise party marks only the others VRAM-hot. apply_gpu_hot rewrites a
-# row's hot set from the (empty) sidecar record at every armed demand, so a set_hot landing between that and the take
-# loop would otherwise shrink the victims the demand's census counted and fail it (no_victim), a legal outcome that
-# is not what this test is about. Hot experts that are never resident keep set_hot's concurrent writes and remove that.
+# row's hot set from the (empty) sidecar record at every demand with lanes, so a set_hot landing between that and the
+# victim choice would otherwise shrink its victims (a skipped insert), a legal outcome that is not what this test is
+# about. Hot experts that are never resident keep set_hot's concurrent writes and remove that.
 DEVICE_EXPERTS = tuple(range(hp.EXPERTS - 2))
 HOT_ONLY = tuple(range(hp.EXPERTS - 2, hp.EXPERTS))
-# The grants a served request's lane may carry: a resident hit, a miss streamed in pieces, a hit the copy engine copies.
-LANE_TAGS = {lease.READY: "lanes_ready", lease.LOADING: "lanes_loading", lease.COPYING: "lanes_copying"}
+# The kinds a lane may carry here: a resident hit C1 copies, a miss streamed in pieces, a hit the copy engine copies.
+LANE_KINDS = {LaneKind.HIT_SM: "lanes_ready", LaneKind.MISS_GPU: "lanes_loading", LaneKind.HIT_COPY: "lanes_copying"}
 
 
 def _check_tier(s, host, rows):
-    """The tier invariants for an owner that holds the service parked: no lease, no LOADING slot, mapping and
-    slot_info agree both ways, and every READY slot holds its expert's checkpoint bytes. Returns the rows' (slot_info,
-    mapping)."""
+    """The tier invariants for an owner that holds the service parked: no LOADING slot, mapping and slot_info agree
+    both ways, every READY slot holds its expert's checkpoint bytes, and each row keeps its STAGING slots. Returns the
+    rows' (slot_info, mapping)."""
     out = {}
     for row in rows:
         info, mapping = host.slot_info(row), host.mapping(row)
-        for slot, (state, expert, leases) in enumerate(info):
-            assert leases == 0, f"row {row} slot {slot} still leased: {info}"
-            assert state in (FREE, READY), f"row {row} slot {slot} in state {state} with the service parked: {info}"
+        assert sum(state == STAGING for state, _, _ in info) == hp.STAGING, f"row {row} lost a staging slot: {info}"
+        for slot, (state, expert, _stamp) in enumerate(info):
+            assert state in (FREE, READY, STAGING), f"row {row} slot {slot} in state {state} with the service parked: {info}"
             if state == READY:
                 assert mapping[expert] == slot, f"row {row}: READY slot {slot} of expert {expert}, mapping {mapping}"
                 oracle = s.reference(s.tables.layer_ids[row], [expert])
@@ -46,8 +45,7 @@ def _check_tier(s, host, rows):
         for expert, slot in enumerate(mapping):
             assert slot < 0 or (info[slot][0] == READY and info[slot][1] == expert), (
                 f"row {row}: expert {expert} maps to slot {slot} = {info[slot] if slot >= 0 else None}")
-        out[row] = {"info": info, "mapping": mapping}
-    assert all(not host.lease_entry(i)["active"] for i in range(DEMAND_RECORDS)), "a lease entry is still active"
+        out[row] = {"info": [i[:2] for i in info], "mapping": mapping}
     return out
 
 
@@ -120,15 +118,12 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
                 req = sim.post(row, lanes, dst=list(range(len(lanes))) if use_copy else None, captured=use_copy)
                 stats["armed"] += 1
                 stats["copy_posts"] += int(use_copy)
-                if not sim.wait(req, 10.0).served:
+                # S's wait for the misses, then CW's wait for the copies: the chain ends only after both.
+                if not (sim.wait_served(req, 10.0) and sim.copy_wait(req, 10.0) and sim.wait_handled(req, 10.0)):
                     stats["timeouts"] += 1
                     raise AssertionError(f"request {req.seq} (row {row}, lanes {lanes}) was not served")
-                for lane in range(len(req.lanes)):
-                    result = sim.row_result(req, lane)
-                    if result["gen"] != req.gen or result["tag"] not in LANE_TAGS:
-                        raise AssertionError(f"request {req.seq} lane {lane} was served without a grant: {result}")
-                    stats[LANE_TAGS[result["tag"]]] += 1
-                sim.done(req)
+                for kind in req.kinds:
+                    stats[LANE_KINDS[kind]] += 1
         finally:
             idle.set()  # a device that left (stop, or an error) is quiet: a pauser waiting on it must not time out
             device_gone.set()
@@ -137,8 +132,8 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
         # HostCopyBackend::release(n) adds n marks of credit and release(-1) is sticky ("every mark, from now on"), so
         # each tick releases one mark, and only while a mark is outstanding (marked > released): copies complete one
         # by one, at the releaser's pace, instead of all of them from the first tick on. -1 is kept for the final drain.
-        # It runs until the device has left, not until stop: the device's request in flight at stop may be deferred on
-        # a COPYING lease that only a released mark retires, and stopping first deadlocks it until sim.wait times out.
+        # It runs until the device has left, not until stop: the device's request in flight at stop may wait on a copy
+        # that only a released mark completes, and stopping first deadlocks it until copy_wait times out.
         rng = random.Random(seed + 3)
         while not device_gone.is_set():
             if host.copy_engine_marked() > stats["releases"]:
@@ -175,13 +170,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
             try:
                 if not quiesce_device():
                     return
-                try:
-                    host.pause(5.0)
-                except RuntimeError as error:
-                    if "graph-lane lease" not in str(error):
-                        raise  # a pause that timed out is a hang, not a legal refusal
-                    stats["refused"] += 1
-                    continue
+                host.pause(5.0)  # the device is quiet and its copies completed: a refusal is a bug
                 left_running = False
                 try:
                     stats["pauses"] += 1
@@ -203,6 +192,10 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
                     if fills:
                         left_running = _fill_while_owned(s, host, rng)
                         stats["fills"] += 1
+                    # after_host_use: the eager changes reach the device before the service runs again. The count
+                    # joins a fill left running, so it is ended here, not by resume().
+                    sim.sync_bulk()
+                    left_running = False
                 finally:
                     if left_running:
                         # The device may post while the fill still runs: resume() must join the fill and run its
@@ -225,7 +218,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
         alive = [t.name for t in threads if t.is_alive()]
         assert not alive, f"parties still running after stop: {alive}; errors {stats['errors']}"
         assert not stats["errors"], f"a party failed: {stats['errors']}"
-        # Final quiesce: every Done was published, and the copy thread drains once its marks complete.
+        # Final quiesce: the copy thread drains once its marks complete.
         stats["marked"] = host.copy_engine_marked()
         host.copy_engine_release(-1)
         assert host.copy_engine_idle(5.0), "the copy engine did not go idle"

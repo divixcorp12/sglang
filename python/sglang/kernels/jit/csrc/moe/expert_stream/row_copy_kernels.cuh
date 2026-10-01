@@ -19,7 +19,7 @@ constexpr int kStreamThreads = 256;
 constexpr int kRowPieces = 8;  // the host's kPieces: one readiness bit per piece of a row
 constexpr uint32_t kAllPieces = 255u;
 
-// ld.global.cv, never .nc: a LOADING lane's host bytes are written while the kernel runs, and .nc may serve a line
+// ld.global.cv, never .nc: a miss lane's host bytes are written while the kernel runs, and .nc may serve a line
 // cached before its piece was published. __ldcv/__stcg emit ld.global.cv/st.global.cg with a "memory" clobber, so
 // they stay ordered after the acquire that admitted the lane.
 SGL_DEVICE void stream_copy16(const uint8_t* src, uint8_t* dst) {
@@ -89,28 +89,12 @@ SGL_DEVICE void stream_copy_piece(
 }
 
 struct StreamLanes {
-  int32_t mine[kLeaseLanes];      // planned and not claimed by W1: this kernel's lane
-  int32_t admitted[kLeaseLanes];  // its RowResult was read for G
-  int32_t loading[kLeaseLanes];   // admitted under tag LOADING (else READY: every piece is there)
-  int32_t slot[kLeaseLanes];
+  int32_t mine[kLeaseLanes];   // a kMissGpu lane: this kernel's
+  int32_t slot[kLeaseLanes];   // its staging slot
   uint32_t done[kLeaseLanes];  // pieces this block has copied its slice of
   uint32_t todo[kLeaseLanes];  // pieces to copy this pass
-  int served;                  // demand_done >= seq, and the re-read after it found every mask full
-  int finished;                // served and every piece of every lane copied
+  int finished;                // every piece of every lane copied
 };
-
-// One lane's admission: READY or LOADING makes it this kernel's, COPYING or CPU hands it to CW (W1's budget ran out
-// before it was published), unpublished leaves it for a later pass.
-SGL_DEVICE void stream_admit(StreamLanes& sh, int lane, const uint8_t* results, uint64_t generation, uint32_t capacity) {
-  const LaneRead r = lane_read(results + lane * kLeaseRowResultBytes, generation, capacity);
-  if (copy_owned(r.tag)) {
-    sh.mine[lane] = 0;
-  } else if (r.tag == kLeaseTagReady || r.tag == kLeaseTagLoading) {
-    sh.slot[lane] = r.host_slot;
-    sh.loading[lane] = r.tag == kLeaseTagLoading ? 1 : 0;
-    sh.admitted[lane] = 1;
-  }
-}
 
 SGL_DEVICE uint32_t piece_bits(uint64_t word, uint64_t generation) {
   return (word >> 8) == (generation & kGenerationMask) ? static_cast<uint32_t>(word & 0xFFu) : 0u;
@@ -118,20 +102,21 @@ SGL_DEVICE uint32_t piece_bits(uint64_t word, uint64_t generation) {
 
 }  // namespace device::expert_stream
 
-// S, the stream kernel. It covers every planned lane W1 did not claim, admits each once its RowResult is published
-// (READY or LOADING), and copies each piece as its bit appears in the lane's PieceMask word, so the copy overlaps the
-// read. Every block runs the same leader loop on its own and copies its own slice of every piece; there is no
-// inter-block barrier, so no co-residency is assumed, and a block that finds the request broken traps the grid.
+// S, the stream kernel. It owns the request's kMissGpu lanes, and copies each piece from the lane's staging slot as its
+// bit appears in the lane's PieceMask word, so the copy overlaps the read. Every block runs the same leader loop on its
+// own and copies its own slice of every piece; there is no inter-block barrier, so no co-residency is assumed, and a
+// block that finds the request broken traps the grid. Each mask's acquire orders the piece bytes the host published
+// before it: no served word is needed.
 struct StreamParams {
-  uint8_t* page;
-  int32_t* state;
+  const int32_t* state;
   const int64_t* planned;
   const int32_t* count;
   const int32_t* dst_slots;
   int64_t row;
   int64_t experts;
   const uint8_t* lease;
-  const int32_t* claimed;
+  const int32_t* lane_kind;
+  const int32_t* lane_slot;
   const int64_t* segments;
   int64_t segment_count;
   const int32_t* segment_map;
@@ -143,47 +128,36 @@ struct StreamParams {
 template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3_ram_miss_lease_stream_kernel(
     const __grid_constant__ StreamParams p) {
-  // PDL as the post kernel (lease_kernels.cuh): its primary is C1, a plain launch, whose primary is W1.
+  // PDL as the post kernel (lease_kernels.cuh): its primary is C1, a plain launch, whose primary is the post.
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
   using namespace device::expert_stream;
   __shared__ StreamLanes sh;
   const int tid = threadIdx.x;
-  // W1 trapped on a count past kLeaseLanes or the plan's buffers, and returned for an unarmed post.
   const int64_t planned_count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   if (planned_count == 0) return;
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
   const int64_t idx = ring_index(seq);
   if (tid < kLeaseLanes) {
-    sh.mine[tid] = tid < planned_count && p.claimed[tid] == 0 ? 1 : 0;
-    sh.admitted[tid] = 0;
-    sh.loading[tid] = 0;
-    sh.slot[tid] = 0;
+    const bool mine = tid < planned_count && p.lane_kind[tid] == static_cast<int32_t>(kKindMissGpu);
+    sh.mine[tid] = mine ? 1 : 0;
+    sh.slot[tid] = mine ? p.lane_slot[tid] : 0;
+    if (mine && (sh.slot[tid] < 0 || static_cast<uint32_t>(sh.slot[tid]) >= p.row_capacity)) __trap();
     sh.done[tid] = 0;
     sh.todo[tid] = 0;
   }
-  if (tid == 0) {
-    sh.served = 0;
-    sh.finished = 0;
-  }
+  if (tid == 0) sh.finished = 0;
   __syncthreads();
 
-  const uint8_t* results = p.lease + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
   const uint8_t* masks = p.lease + kLeasePieceMask + idx * kLeaseLanes * kLeasePieceMaskLineBytes;
   const uint64_t deadline = load_deadline(p.state);
   const int64_t piece_stride = static_cast<int64_t>(kRowPieces) * p.row_segments * 2;
 
   while (sh.finished == 0) {
-    // Admission and masks: one leader-warp lane per request lane. A READY lane (a hit W1 missed) has every piece.
     if (tid < kLeaseLanes && sh.mine[tid] != 0) {
-      if (sh.admitted[tid] == 0) stream_admit(sh, tid, results, generation, p.row_capacity);
-      if (sh.admitted[tid] != 0) {
-        const uint32_t bits = sh.loading[tid] != 0
-                                  ? piece_bits(ld_acquire_sys64(masks + tid * kLeasePieceMaskLineBytes), generation)
-                                  : kAllPieces;
-        sh.todo[tid] = bits & ~sh.done[tid];
-      }
+      const uint32_t bits = piece_bits(ld_acquire_sys64(masks + tid * kLeasePieceMaskLineBytes), generation);
+      sh.todo[tid] = bits & ~sh.done[tid];
     }
     __syncthreads();
     bool copied = false;
@@ -200,42 +174,19 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
     }
     __syncthreads();
     if (tid == 0) {
+      bool all = true;
       for (int lane = 0; lane < kLeaseLanes; ++lane) {
         sh.done[lane] |= sh.todo[lane];
         sh.todo[lane] = 0;
+        if (sh.mine[lane] != 0 && sh.done[lane] != kAllPieces) all = false;
       }
-      if (sh.served == 0) {
-        // The one device spin nothing else bounds (a service that died, an admission that stopped): trap, so the
+      if (all) {
+        sh.finished = 1;
+      } else {
+        // The one device spin nothing else bounds (a service that died, a read that never lands): trap, so the
         // process fails instead of hanging decode.
         if (static_cast<int64_t>(global_ns() - deadline) >= 0) __trap();
-        if (reached(ld_acquire_sys(p.page + kDemandDone), seq)) {
-          // demand_done is stored after serve() returned, so after every grant and every PieceMask publish of G; its
-          // acquire orders this thread's re-reads below after them. A mask read earlier in the pass may predate the
-          // last publish, so the judgement is on these re-reads. The other threads' copies of what they admit follow
-          // through the block barrier at the end of the pass.
-          for (int lane = 0; lane < kLeaseLanes; ++lane) {
-            if (sh.mine[lane] == 0) continue;
-            if (sh.admitted[lane] == 0) stream_admit(sh, lane, results, generation, p.row_capacity);
-            if (sh.mine[lane] == 0) continue;  // admitted as a COPYING or CPU lane just now
-            if (sh.admitted[lane] == 0) __trap();  // served, and the lane was never granted: a lapped request
-            const uint32_t bits = sh.loading[lane] != 0
-                                      ? piece_bits(ld_acquire_sys64(masks + lane * kLeasePieceMaskLineBytes), generation)
-                                      : kAllPieces;
-            if (bits != kAllPieces) __trap();  // served with a piece never published
-          }
-          sh.served = 1;
-        } else if (!copied) {
-          __nanosleep(256);
-        }
-      }
-      // Once served there is no deadline: the masks stay final until the ring slot's reuse re-initialises them,
-      // 16 requests later, which cannot happen while this request is still in the chain.
-      if (sh.served != 0) {
-        bool all = true;
-        for (int lane = 0; lane < kLeaseLanes; ++lane) {
-          if (sh.mine[lane] != 0 && sh.done[lane] != kAllPieces) all = false;
-        }
-        if (all) sh.finished = 1;
+        if (!copied) __nanosleep(256);
       }
     }
     __syncthreads();
@@ -265,26 +216,33 @@ SGL_DEVICE void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) 
 }
 
 // The copy wait, the chain's tail: CW, then cuStreamWaitValue32 on the gate, then CC. Nothing spins on an SM.
-// CW reads the lanes' tags once; with `sm_count` > 0 the whole block reads the `sm_count` entries of `sm_table`
-// ({source slab, destination tensor, row bytes}) of every COPYING lane from its leased slot. Then it publishes
-// Done = G, and, when the request has COPYING or CPU lanes, closes the gate for G and leaves them in `ce_mask`.
+// CW takes the lanes' kinds from the post; with `sm_count` > 0 the whole block reads the `sm_count` entries of
+// `sm_table` ({source slab, destination tensor, row bytes}) of every kHitCopy lane from its RAM slot. When the request
+// has copy-engine or CPU lanes it closes the gate for G and leaves them in `ce_mask`.
 struct CopyWaitParams {
-  int32_t* state;
+  const int32_t* state;
   const int32_t* count;
   uint8_t* lease;
+  const int32_t* lane_kind;
+  const int32_t* lane_slot;
+  const int32_t* dst_slots;
   const int64_t* sm_table;
   int64_t sm_count;
-  int32_t* ce_mask;  // the armed lanes for CC: COPYING and CPU in the low byte, CPU again in the next; 0: none
+  int32_t* ce_mask;  // for CC: armed lanes in bits 0-7, CPU lanes in 8-15, CPU output parts in 16-17; 0: none
 };
 
 struct CopyCommitParams {
   const int32_t* state;
   const uint8_t* lease;
   const int32_t* ce_mask;
-  int32_t* cpu_lanes;  // CPU experts: the lanes the CPU computed (a lane mask), else 0; null when off
+  // CPU experts: the lanes the CPU computed (bits 0-7) and the output parts holding their partial sums (bit 8: part 0,
+  // the CPU hits'; bit 9: part 1, the CPU misses'), else 0; null when off.
+  int32_t* cpu_lanes;
 };
 
 constexpr int kCeMaskCpuShift = 8;
+constexpr int kCeMaskPartShift = 16;
+constexpr int kCpuLanesPartShift = 8;  // cpu_lanes: parts above the lane mask
 
 template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void exl3_ram_miss_lease_copy_wait_kernel(
@@ -295,32 +253,29 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   using namespace device::expert_stream;
   __shared__ int32_t sm_host[kLeaseLanes];
   __shared__ int32_t sm_dst[kLeaseLanes];
-  __shared__ uint32_t copying;  // COPYING lanes: their DMA and, with sm_count, these reads fill the slot
-  __shared__ uint32_t cpu;      // CPU lanes: the CPU expert thread computes them
+  __shared__ uint32_t copying;  // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
+  __shared__ uint32_t cpu;      // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
+  __shared__ uint32_t cpu_parts;  // bit 0: a kHitCpu lane (output part 0); bit 1: a kMissCpu lane (part 1)
   const int64_t planned_count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
   const int64_t idx = ring_index(seq);
   uint8_t* const lease = p.lease;
   if (threadIdx.x == 0) {
-    uint32_t c = 0, u = 0;
-    if (planned_count > 0) {
-      // Every lane of G was granted before demand_done, which S acquired: these tags are final.
-      const uint8_t* results = lease + kLeaseRowResult + idx * kLeaseLanes * kLeaseRowResultBytes;
-      const uint8_t* request = lease + kLeaseLaneRequest + idx * kLeaseLaneRequestBytes;
-      for (int64_t lane = 0; lane < planned_count; ++lane) {
-        const uint64_t word = ld_acquire_sys64(results + lane * kLeaseRowResultBytes + kLeaseRrReady);
-        if ((word & kGenerationMask) != generation) continue;
-        if ((word >> 56) == kLeaseTagCpu) u |= 1u << lane;
-        if ((word >> 56) != kLeaseTagCopying) continue;
-        c |= 1u << lane;
-        // After the acquire of the ready word; a COPYING lane's payload is fixed until its lease is released.
-        sm_host[lane] = ld_relaxed_sys<int32_t>(results + lane * kLeaseRowResultBytes + kLeaseRrHostSlot);
-        sm_dst[lane] = ld_relaxed_sys<int32_t>(request + kLeaseLrDst + 4 * lane);
-      }
+    uint32_t c = 0, u = 0, parts = 0;
+    for (int64_t lane = 0; lane < planned_count && lane < kLeaseLanes; ++lane) {
+      const uint32_t kind = static_cast<uint32_t>(p.lane_kind[lane]);
+      if (is_cpu_kind(kind)) u |= 1u << lane;
+      if (kind == kKindHitCpu) parts |= 1u;
+      if (kind == kKindMissCpu) parts |= 2u;
+      if (kind != kKindHitCopy) continue;
+      c |= 1u << lane;
+      sm_host[lane] = p.lane_slot[lane];
+      sm_dst[lane] = p.dst_slots[lane];
     }
     copying = c;
     cpu = u;
+    cpu_parts = parts;
   }
   __syncthreads();
   if (p.sm_count > 0) {
@@ -343,20 +298,15 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
       }
     }
   }
-  __syncthreads();  // every thread's SM reads before thread 0's Done
+  __syncthreads();  // every thread's SM reads before the gate below
   if (threadIdx.x != 0) return;
   p.ce_mask[0] = 0;
   if (planned_count == 0) return;
-  // Done: C1's and S's reads of G's leased slots finished with their kernels, before this one started (the stream
-  // order, or PDL's wait, which is transitive), and this block's SM reads before the barrier above. The fence makes
-  // them performed at system scope before the host can see Done and release a slot for rewriting.
-  __threadfence_system();
-  st_release_sys64(lease + kLeaseDone + idx * kLeaseDoneBytes, generation);
   const uint32_t mask = copying | cpu;
   if (mask == 0) return;
   uint8_t* const gate = lease + kLeaseCopyGate;
   st_relaxed_sys<uint32_t>(gate, copy_gate_word(seq, kLeaseGateClosed));
-  p.ce_mask[0] = static_cast<int32_t>(mask | cpu << kCeMaskCpuShift);
+  p.ce_mask[0] = static_cast<int32_t>(mask | cpu << kCeMaskCpuShift | cpu_parts << kCeMaskPartShift);
   // Dekker with the copy thread (RamTier::copy_completed: CopyDone store, fence, gate load): this close is ordered
   // before the CopyDone load below, so one side always sees the other's store and opens the gate. Both open with the
   // same word, so opening twice is harmless.
@@ -380,7 +330,10 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const uint64_t generation = pending_generation(p.state);
   // Only a teardown opens a gate without CopyDone: the service is gone, and the copies may not have landed.
   if (ld_acquire_sys64(p.lease + kLeaseCopyDone + ring_index(seq) * kLeaseCopyDoneBytes) != generation) __trap();
-  if (p.cpu_lanes != nullptr) p.cpu_lanes[0] = static_cast<int32_t>(armed >> kCeMaskCpuShift & 0xFFu);
+  if (p.cpu_lanes != nullptr) {
+    p.cpu_lanes[0] = static_cast<int32_t>(
+        (armed >> kCeMaskCpuShift & 0xFFu) | (armed >> kCeMaskPartShift & 0x3u) << kCpuLanesPartShift);
+  }
 }
 
 namespace expert_stream {
@@ -406,7 +359,6 @@ constexpr unsigned kStreamWaitValueGeq = 0;  // CU_STREAM_WAIT_VALUE_GEQ: (int32
 template <expert_stream::ExpertRowLayout L>
 struct RowCopyKernel {
   static void lease_stream(
-      tvm::ffi::TensorView page,
       tvm::ffi::TensorView state,
       tvm::ffi::TensorView planned,
       tvm::ffi::TensorView count,
@@ -414,7 +366,8 @@ struct RowCopyKernel {
       int64_t row,
       int64_t experts,
       int64_t lease_address,
-      tvm::ffi::TensorView claimed,
+      tvm::ffi::TensorView lane_kind,
+      tvm::ffi::TensorView lane_slot,
       tvm::ffi::TensorView segments,
       tvm::ffi::TensorView segment_map,
       int64_t row_segments,
@@ -425,15 +378,11 @@ struct RowCopyKernel {
     using namespace expert_stream::wire;
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    auto on_host = SymbolicDevice{};
-    on_host.set_options<kDLCPU, kDLCUDAHost>();
     auto P_ = SymbolicSize{"planned"};
     // The copy table's row count is runtime data (a test may build one with far fewer entries than the layout's
     // name count): bind it from `segments` itself and cross-check segment_map against that.
     auto S_ = SymbolicSize{"segments"};
 
-    expert_stream::verify_named(
-        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
     expert_stream::verify_named(
         "state",
         TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
@@ -443,12 +392,14 @@ struct RowCopyKernel {
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named(
         "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
-    // S reads planned and dst_slots at every lane W1 bounded by min(host_rows_1, dst_slots): kLeaseLanes at most.
+    // S reads planned and dst_slots at every lane the post bounded by the plan's buffers: kLeaseLanes at most.
     RuntimeCheck(
         P_.unwrap() >= std::min<int64_t>(kLeaseLanes, dst_slots.size(0)),
         "planned: must have at least as many lanes as dst_slots, up to kLeaseLanes");
     expert_stream::verify_named(
-        "claimed", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), claimed);
+        "lane_kind", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_kind);
+    expert_stream::verify_named(
+        "lane_slot", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_slot);
     expert_stream::verify_named(
         "segments", TensorMatcher({S_, 3}).with_dtype<int64_t>().with_device<kDLCUDA>(device), segments);
     expert_stream::verify_named(
@@ -468,15 +419,15 @@ struct RowCopyKernel {
 
     const auto stream = LaunchKernel::resolve_device(state.device());
     const auto params = StreamParams{
-        .page = static_cast<uint8_t*>(page.data_ptr()),
-        .state = static_cast<int32_t*>(state.data_ptr()),
+        .state = static_cast<const int32_t*>(state.data_ptr()),
         .planned = static_cast<const int64_t*>(planned.data_ptr()),
         .count = static_cast<const int32_t*>(count.data_ptr()),
         .dst_slots = static_cast<const int32_t*>(dst_slots.data_ptr()),
         .row = row,
         .experts = experts,
         .lease = reinterpret_cast<const uint8_t*>(lease_address),
-        .claimed = static_cast<const int32_t*>(claimed.data_ptr()),
+        .lane_kind = static_cast<const int32_t*>(lane_kind.data_ptr()),
+        .lane_slot = static_cast<const int32_t*>(lane_slot.data_ptr()),
         .segments = static_cast<const int64_t*>(segments.data_ptr()),
         .segment_count = segments.size(0),
         .segment_map = static_cast<const int32_t*>(segment_map.data_ptr()),
@@ -492,6 +443,9 @@ struct RowCopyKernel {
       tvm::ffi::TensorView state,
       tvm::ffi::TensorView count,
       int64_t lease_address,
+      tvm::ffi::TensorView lane_kind,
+      tvm::ffi::TensorView lane_slot,
+      tvm::ffi::TensorView dst_slots,
       int64_t sm_table_address,
       int64_t sm_count,
       tvm::ffi::TensorView ce_mask,
@@ -507,6 +461,12 @@ struct RowCopyKernel {
         TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
         state);
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
+    expert_stream::verify_named(
+        "lane_kind", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_kind);
+    expert_stream::verify_named(
+        "lane_slot", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_slot);
+    expert_stream::verify_named(
+        "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
         "ce_mask", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ce_mask);
     // CPU experts off: an empty tensor, and CC writes no CPU lanes.
@@ -527,9 +487,12 @@ struct RowCopyKernel {
     const auto stream = LaunchKernel::resolve_device(state.device());
     const int threads = sm_count > 0 ? device::expert_stream::kCopyWaitThreads : device::expert_stream::kBlock;
     const auto params = CopyWaitParams{
-        .state = static_cast<int32_t*>(state.data_ptr()),
+        .state = static_cast<const int32_t*>(state.data_ptr()),
         .count = static_cast<const int32_t*>(count.data_ptr()),
         .lease = reinterpret_cast<uint8_t*>(lease_address),
+        .lane_kind = static_cast<const int32_t*>(lane_kind.data_ptr()),
+        .lane_slot = static_cast<const int32_t*>(lane_slot.data_ptr()),
+        .dst_slots = static_cast<const int32_t*>(dst_slots.data_ptr()),
         .sm_table = reinterpret_cast<const int64_t*>(sm_table_address),
         .sm_count = sm_count,
         .ce_mask = static_cast<int32_t*>(ce_mask.data_ptr()),

@@ -35,8 +35,8 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     read_rows_traced,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_lease_sim import LeaseSim
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script
+from sglang.test.dsv41_chain_sim import ChainSim
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, assert_aborted, ram_miss_setup, run_host_script
 
 register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
@@ -660,10 +660,10 @@ def test_the_reader_streams_pieces_over_three_to_eight_mirror_parts(tmp_path, we
 
 def _host(tmp_path, *, weights=(1.0, 1.0)):
     """A tier over row images and ``weights`` mirror parts; the service always streams pieces."""
-    s = ram_miss_setup(tmp_path, capacity=4, mirror_weights=weights, hidden=256, inter=512)
+    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=weights, hidden=256, inter=512)
     page = new_page(pin=False)
-    host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32))
-    return s, page, host, LeaseSim(host, page, s.slabs)
+    host = attached_host(s, page, k=2)
+    return s, page, host, ChainSim(host, page, s.slabs)
 
 
 def _assert_mapped(s, host, experts):
@@ -675,29 +675,24 @@ def _assert_mapped(s, host, experts):
 
 
 def _serve(host, sim, lanes, timeout_s=5.0):
-    """Post, pump (serves), check served, Done, pump (retires)."""
+    """Post, pump (serves), check every miss's pieces landed."""
     req = sim.post(1, lanes)
     assert host.pump() == 1
-    waited = sim.wait(req, timeout_s=timeout_s)
-    assert waited.served
-    sim.done(req)
-    host.pump()
-    return req, waited
+    assert sim.wait_served(req, timeout_s=timeout_s)
+    return req
 
 
 @pytest.mark.parametrize("weights", [(1.0, 1.0), (1.0, 1.0, 1.0)], ids=["two_parts", "three_parts"])
 def test_the_tier_publishes_every_piece_of_a_read_row_into_each_lane_that_names_it(tmp_path, weights):
-    """Expert 3 is resident (a hit); 4 and 5 are read, and 4 is named by two lanes. Every lane that names a row read
-    ends with all eight bits under the request's generation (with three parts, six with bytes and two empty); the hit
-    lane's word is never written."""
+    """Expert 3 is resident (a hit); 4 and 5 are read. Every lane that names a row read ends with all eight bits under
+    the request's generation (with three parts, six with bytes and two empty); the hit lane's word is never written."""
     s, page, host, sim = _host(tmp_path, weights=weights)
     try:
         assert s.tables.parts == len(weights)
         _serve(host, sim, [3])
         host.enable_trace()
-        req, waited = _serve(host, sim, [3, 4, 5, 4])
-        assert waited.go == 4
-        assert [sim.piece_word(req, lane) for lane in range(4)] == [0] + [piece_word(req.gen, FULL)] * 3
+        req = _serve(host, sim, [3, 4, 5])
+        assert [sim.piece_word(req, lane) for lane in range(3)] == [0] + [piece_word(req.gen, FULL)] * 2
         (record,) = [r for r in host.drain_trace() if r["seq"] == req.seq]
         assert record["piece_stream"] == 1 and record["pieces_vetted"] == record["pieces_published"] == 2 * PIECES
         extents = 2 * 2 * SUB_READS if len(weights) == 2 else 2 * 3 * 2  # rows * parts * sub-reads per part
@@ -708,42 +703,40 @@ def test_the_tier_publishes_every_piece_of_a_read_row_into_each_lane_that_names_
         host.stop()
 
 
-def test_the_miss_lanes_words_carry_the_generation_from_reservation_while_the_read_runs(tmp_path):
-    """The words are initialised in the reservation hold, not after the read: while the read is held up, the hit
-    lane's row result is already READY and each miss lane's word is the request's generation with no bit. Without that
-    initialisation every publish would be refused (another generation) and the process would abort."""
+def test_the_miss_lanes_words_carry_the_generation_before_the_read_lands(tmp_path):
+    """The words are initialised before the read, not after it: while the read is held up, each miss lane's word is the
+    request's generation with no bit, and the row's delta is already published. Without that initialisation every
+    publish would be refused (another generation) and the process would abort."""
     s, page, host, sim = _host(tmp_path)
     host.start_thread(fatal_wait_s=60.0, spin_us=200)
     try:
         first = sim.post(1, [3])
-        assert sim.wait(first, timeout_s=5.0).served
-        sim.done(first)
+        assert sim.wait_served(first, timeout_s=5.0) and sim.wait_handled(first)
         host.inject(delay_s=1.0)
         req = sim.post(1, [3, 4])
         seen = {}
 
         def observe():
             deadline = time.perf_counter() + 1.0
-            while time.perf_counter() < deadline and sim.row_result(req, 0)["gen"] != req.gen:
+            while time.perf_counter() < deadline and sim.piece_word(req, 1) != piece_word(req.gen):
                 time.sleep(0.001)
-            seen["hit"] = sim.row_result(req, 0)["tag"]
             seen["miss"] = sim.piece_word(req, 1)
-            seen["done"] = page_word(page, "demand_done")
+            seen["served"] = sim.served(req)
+            seen["delta"] = sim.delta(1)[0]
 
         watcher = threading.Thread(target=observe)
         watcher.start()
-        waited = sim.wait(req, timeout_s=10.0)
+        served = sim.wait_served(req, timeout_s=10.0)
         watcher.join()
-        assert seen["hit"] == lease.READY and seen["done"] != req.seq  # observed inside the read's delay
-        assert seen["miss"] == piece_word(req.gen)
-        assert waited.served and sim.piece_word(req, 1) == piece_word(req.gen, FULL)
-        sim.done(req)
+        assert seen["miss"] == piece_word(req.gen) and not seen["served"]  # observed inside the read's delay
+        assert seen["delta"] == req.chain
+        assert served and sim.piece_word(req, 1) == piece_word(req.gen, FULL)
     finally:
         host.stop()
 
 
 def test_a_double_publish_inside_the_tier_aborts_the_process(tmp_path):
-    """U6 through the service: the refused publish fails the read, which fails stop before demand_done."""
+    """U6 through the service: the refused publish fails the read, which fails stop before the pieces say landed."""
     result = run_host_script(
         tmp_path,
         """
@@ -752,6 +745,7 @@ def test_a_double_publish_inside_the_tier_aborts_the_process(tmp_path):
         host.pump()
         print("reached")
         """,
+        staging=2,
     )
     assert_aborted(result, "the read failed")
 
