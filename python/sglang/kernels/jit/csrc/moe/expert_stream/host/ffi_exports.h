@@ -310,9 +310,10 @@ struct HostExports {
 
   // CPU experts (plan 2026-09-29-dsv41-cpu-experts): `forward` is a CpuExpertForward's address (the trait's native
   // forward), whose layers register later (set_cpu_layer); split int64 [kLeaseLanes + 1], CPU lanes
-  // per n resident lanes; cores int64 [n], the CPU expert thread's affinity (may be empty); x_rows uint8 [rows, stride]
-  // (host, the post kernel writes a row's input there) and out_rows float32 [rows, >= hidden] (host, the device reads
-  // a row's CPU partial sum there). Both must outlive the service.
+  // per n eligible lanes; cores int64 [n], the CPU expert thread's affinity (may be empty); x_rows uint8 [rows, stride]
+  // (host, the post kernel writes a row's input there) and out_rows float32 [rows, >= parts * hidden] (host, the
+  // device reads a row's CPU partial sums there: part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both
+  // must outlive the service.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t forward,
@@ -321,6 +322,7 @@ struct HostExports {
       TensorView x_rows,
       TensorView out_rows,
       int64_t hidden,
+      int64_t parts,
       int64_t threads,
       int64_t spin_ns) {
     using namespace host;
@@ -344,6 +346,10 @@ struct HostExports {
     config.x_stride = x_rows.size(1);
     config.out_base = static_cast<uint8_t*>(out_rows.data_ptr());
     config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
+    if (parts != 1 && parts != 2) throw std::runtime_error(error_prefix<Layout>() + "CPU experts write 1 or 2 output parts");
+    if (out_rows.size(1) < parts * hidden)
+      throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than its parts");
+    config.out_part_stride = parts == 2 ? hidden * static_cast<int64_t>(sizeof(float)) : 0;
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
     config.spin_ns = spin_ns;

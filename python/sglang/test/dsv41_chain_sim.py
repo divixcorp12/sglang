@@ -151,6 +151,8 @@ class ChainSim:
         hit_copy: str = "ce",
         cpu_on: bool = False,
         cpu_misses: bool = False,
+        cpu_ok: bool = True,
+        ce_ok: bool = True,
         weights: Optional[Sequence[float]] = None,
         hot: Sequence[int] = (),
         hot_seq: Optional[int] = None,
@@ -168,7 +170,7 @@ class ChainSim:
             typed, slot_list = type_lanes(
                 experts, self.replica.ram_slot[row], self.replica.staging[row], self.split(),
                 captured=captured, copy_armed=self.copy_armed(), hit_copy=hit_copy, cpu_on=cpu_on,
-                cpu_misses=cpu_misses,
+                cpu_misses=cpu_misses, cpu_ok=cpu_ok, ce_ok=ce_ok,
             )
         else:
             typed, slot_list = [LaneKind(k) for k in kinds], list(slots)

@@ -1065,25 +1065,31 @@ class ExpertStreamHost:
         the service thread.
 
         ``forward`` is the trait's native forward (a ``CpuExpertForward`` address); each row joins once its layer
-        handle is set (:meth:`set_cpu_layer`). Of a copy-engine request's n resident lanes, ``split[n]`` are computed
-        on the CPU (n = 0..8). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows`` (float32 ``[rows, hidden]``) are
-        pinned host rows: the post kernel stages a row's input in the first, the CPU writes its partial sum to the
-        second and the device reads it. Both must outlive the host, which keeps references.
+        handle is set (:meth:`set_cpu_layer`). Of a captured post's n eligible lanes, ``split[n]`` are computed on the
+        CPU (n = 0..8; the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows`` (float32
+        ``[rows, hidden]``, or ``[rows, 2, hidden]`` for a CPU-hit and a CPU-miss partial sum each) are pinned host
+        rows: the post kernel stages a row's input in the first, the CPU writes its partial sums to the second and the
+        device reads them. Both must outlive the host, which keeps references.
         """
         lanes = expert_lease_block.LANES
         if len(split) != lanes + 1:
             raise ValueError(f"the CPU split table has {lanes + 1} entries (n = 0..{lanes}), not {len(split)}")
-        for rows, dtype, name in ((x_rows, torch.uint8, "x_rows"), (out_rows, torch.float32, "out_rows")):
-            if rows.dtype != dtype or rows.dim() != 2 or rows.device.type != "cpu" or not rows.is_contiguous():
-                raise ValueError(f"{name} must be a contiguous host {dtype} [rows, n] tensor")
+        if x_rows.dtype != torch.uint8 or x_rows.dim() != 2 or x_rows.device.type != "cpu" or not x_rows.is_contiguous():
+            raise ValueError("x_rows must be a contiguous host uint8 [rows, n] tensor")
+        if (out_rows.dtype != torch.float32 or out_rows.dim() not in (2, 3) or out_rows.device.type != "cpu"
+                or not out_rows.is_contiguous() or (out_rows.dim() == 3 and out_rows.shape[1] != 2)):
+            raise ValueError("out_rows must be a contiguous host float32 [rows, hidden] or [rows, 2, hidden] tensor")
+        parts = 1 if out_rows.dim() == 2 else 2
+        hidden = int(out_rows.shape[-1])
         self._module.expert_stream_enable_cpu_experts(
             self.handle,
             int(forward),
             torch.tensor(list(split), dtype=torch.int64),
             torch.tensor(list(cores), dtype=torch.int64),
             x_rows,
-            out_rows,
-            int(out_rows.shape[1]),
+            out_rows.view(out_rows.shape[0], parts * hidden),
+            hidden,
+            parts,
             int(threads),
             int(spin_us * 1e3),
         )
