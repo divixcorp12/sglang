@@ -364,6 +364,25 @@ def _replay_step(pairs, service, inputs, graph, step, checks):
     assert served() == expected, (step, served(), expected, service.host.counters())
 
 
+def _assert_device_map_is_hosts(service, layers):
+    """The device's replica of every row's slot map and staging list equals the host's, once the last record's delta
+    and the eager paths' bulk delta are applied (what the next post and after_host_use would do)."""
+    torch.cuda.synchronize()
+    service.host.pause(10.0)
+    try:
+        bulk = service.host.take_bulk_delta()
+        service.device_side.map_bulk_apply(bulk)  # every row's pending decode delta first, then the bulk entries
+        torch.cuda.synchronize()
+        bank = service.device_side.map_bank
+        for layer_id in range(layers):
+            row = service.row_of(layer_id)
+            assert bank["ram_slot"][row].tolist() == service.host.mapping(row), layer_id
+            staging = {slot for slot, (state, _, _) in enumerate(service.host.slot_info(row)) if state == 3}
+            assert {s for s in bank["staging"][row].tolist() if s >= 0} == staging, layer_id
+    finally:
+        service.host.resume()
+
+
 def _assert_service_healthy(service):
     counters = service.host.counters()
     for name in ("overruns", "read_errors", "no_victim"):
@@ -397,6 +416,9 @@ def test_many_layers_in_one_replay_are_served(tmp_path, layers):
                 rel, rel_loop, rel_graph_loop = _rel(got, ref), _rel(loop, ref), _rel(got, loop)
                 assert rel <= REL_BOUND and rel <= 2 * rel_loop + 1e-3, (layer_id, step, route, rel, rel_loop)
                 assert rel_graph_loop <= LOOSE_BOUND, (layer_id, step, route, rel_graph_loop)
+            # Replays and the eager calls above (admissions, applied as a bulk delta) leave one map on both sides.
+            assert _handled_all(service), service.host.counters()
+            _assert_device_map_is_hosts(service, layers)
         assert _handled_all(service), service.host.counters()
         _assert_service_healthy(service)
     finally:
