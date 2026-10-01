@@ -59,7 +59,8 @@ def test_unpaused_eager_calls_refuse_or_snapshot(running):
     mapping = host.mapping(0)
     assert sorted(e for _, e, _ in info if e >= 0) == [0, 1, 2, 3]
     assert all(mapping[e] >= 0 and info[mapping[e]][1] == e for e in range(4))
-    assert sorted(host.lru_order(0)) == [0, 1, 2, 3] and sorted(host.slot_to_expert(0)) == [0, 1, 2, 3]
+    assert sorted(host.lru_order(0)) == [0, 1, 2, 3]
+    assert sorted(e for e in host.slot_to_expert(0) if e >= 0) == [0, 1, 2, 3]  # the staging slot holds none
     assert host.victim_census(0, []) == (0, 4)
     host.pause(5.0)
     try:
