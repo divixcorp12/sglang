@@ -2339,7 +2339,8 @@ struct Pool
 
 Pool g_pool;
 std::mutex g_pool_mutex;
-bool g_compute_started=false;
+std::atomic<bool> g_compute_started{false};
+std::vector<int> g_compute_cores; // Immutable after release publication at first forward.
 
 // -------------------------------------------------------------------------------------------
 //   Pool self-test hook (tests/test_moe_cpu_pool_.py)
@@ -3111,11 +3112,17 @@ void exl3_moe_cpu_forward_raw(
         }
     }
 
-    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    // Freeze the configured cores once. Steady-state forwards acquire no pool mutex.
+    if (!g_compute_started.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_pool_mutex);
+        if (!g_compute_started.load(std::memory_order_relaxed)) {
+            g_compute_cores = g_pool.core_order;
+            g_compute_started.store(true, std::memory_order_release);
+        }
+    }
     const int count=threads>0?threads:1;
-    TORCH_CHECK(g_pool.core_order.empty() || size_t(count)<=g_pool.core_order.size(),
+    TORCH_CHECK(g_compute_cores.empty() || size_t(count)<=g_compute_cores.size(),
                 "CPU expert worker count exceeds configured cores");
-    g_compute_started=true;
     const bool grouped=compact_forward && nc==1;
     const bool prof=g_prof_enabled.load(std::memory_order_relaxed);
     double phase_us[6]{};
@@ -3126,8 +3133,8 @@ void exl3_moe_cpu_forward_raw(
         const int worker=omp_get_thread_num(),n=omp_get_num_threads();
         if(worker==0)actual_workers.store(n,std::memory_order_relaxed);
         grouped_traversal=grouped;
-        if(!g_pool.core_order.empty()) {
-            const int core=g_pool.core_order[worker];
+        if(!g_compute_cores.empty()) {
+            const int core=g_compute_cores[worker];
             static thread_local int pinned_core=-1;
             if(pinned_core!=core || sched_getcpu()!=core) {
                 cpu_set_t set;CPU_ZERO(&set);CPU_SET(core,&set);
@@ -3231,7 +3238,7 @@ extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_se
     }
     try {
         std::lock_guard<std::mutex> lock(g_pool_mutex);
-        if (g_pool.spawned > 0 || g_compute_started) return 1;
+        if (g_pool.spawned > 0 || g_compute_started.load(std::memory_order_relaxed)) return 1;
         g_pool.core_order.assign(cores, cores + n);
         return 0;
     } catch (...) {

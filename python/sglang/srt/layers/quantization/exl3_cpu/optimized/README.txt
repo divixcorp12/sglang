@@ -22,7 +22,9 @@ transform, cache-line output ownership, compact activation scratch, decoder
 unrolling and T0 prefetching. Experiment selectors, alternate persistent weight
 layouts and benchmark instrumentation have been removed. Scratch is reused
 per calling thread. Workers are individually pinned; a stable assignment avoids
-repeating affinity syscalls on every forward. The caller is worker zero.
+repeating affinity syscalls on every forward. The caller is worker zero. Core configuration is frozen at the first forward;
+steady-state forwards acquire no pool mutex. Concurrent callers are responsible
+for avoiding overlapping OpenMP teams on the configured cores.
 
 Build and link
 --------------
