@@ -776,10 +776,10 @@ class Exl3RamMissService:
         if self._pause_depth == 0:
             # The eager paths' map changes reach the device before the service runs again, on the stream every later
             # post follows (LEASE_PROTOCOL.md, "Eager host use").
-            if self.device_side is not None:
-                bulk = self.host.take_bulk_delta()
-                if bulk.numel():
-                    self.device_side.map_bulk_apply(bulk)
+            bulk = self.host.take_bulk_delta()
+            # With no device map yet, the list is dropped: a new device side starts from a snapshot (attach).
+            if self.device_side is not None and bulk.numel():
+                self.device_side.map_bulk_apply(bulk)
             self.host.resume()
 
     def attach(self, manager, streamer) -> None:
@@ -834,9 +834,21 @@ class Exl3RamMissService:
             if self.cpu_experts is not None:
                 self.device_side.enable_cpu_experts(self.cpu_experts.x_rows, self.cpu_experts.out_rows)
                 self.cpu_experts.attach_device(self.device_side)
-            # The device's map starts empty: whatever eager paths mapped before now reaches it as one bulk delta.
+            # The device's map starts empty: every row the tier maps now reaches it as one bulk of entries, taken
+            # paused. The bulk list before this point was dropped (after_host_use), so the snapshot is the source.
             self.before_host_use()
-            self.after_host_use()
+            try:
+                self.host.take_bulk_delta()
+                snapshot = [
+                    (row, expert, slot)
+                    for row in range(len(self._rows))
+                    for expert, slot in enumerate(self.host.mapping(row))
+                    if slot >= 0
+                ]
+                if snapshot:
+                    self.device_side.map_bulk_apply(torch.tensor(snapshot, dtype=torch.int32))
+            finally:
+                self.after_host_use()
             if self._stages_traced:
                 self._start_route_log(cache.device)
             if self.copy_engine:
