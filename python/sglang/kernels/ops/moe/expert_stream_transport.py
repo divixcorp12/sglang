@@ -899,7 +899,7 @@ class ExpertStreamHost:
             return
         outcome = int(self._module.expert_stream_pause(self.handle, int(timeout_s * 1e9)))
         if outcome == 2:
-            raise RuntimeError("exl3 RAM miss: not paused, a GPU reader still holds a graph-lane lease")
+            raise RuntimeError("exl3 RAM miss: not paused, the copy thread still has a job (unsynchronized stream)")
         if outcome != 1:
             raise RuntimeError(f"exl3 RAM miss thread did not pause within {timeout_s} s")
 

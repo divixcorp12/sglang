@@ -196,18 +196,17 @@ def test_the_service_thread_allocates_nothing_from_its_first_request(shim, tmp_p
 
 
 def _measured(counts):
-    """The window covered what the zeros below are about: every step served, copy jobs on the copy thread and a
-    completed CopyDone for each, and a deferral (a request held back by a slot under a copy lease)."""
+    """The window covered what the zeros below are about: every step served, and copy jobs on the copy thread with a
+    completed CopyDone for each."""
     assert counts["requests"] == REQUESTS and counts["threads"] == {"service": 1, "copy": 1}, counts
     assert counts["copy_jobs"] > 0 and counts["copies_done"] == counts["copy_jobs"], counts
-    assert counts["deferrals"] >= 1, counts
 
 
 @pytest.mark.parametrize("variant", ["prod", "instr"])
 def test_the_copy_thread_allocates_nothing_and_waits_on_no_condvar(shim, tmp_path, variant):
     """Spec A7, A8, L8, L9 and 6.3 item 4: no per-pass deque, no queue node, no condition variable, a submit that nests
-    no lock, and no lock at all on the copy thread: it hands each completed job back to the owner through an SPSC ring
-    (Task 14), and the owner releases the COPYING lease. The service thread takes no lock either (Task 15: the tier
+    no lock, and no lock at all on the copy thread: it publishes each completed job's CopyDone itself. The service
+    thread takes no lock either (Task 15: the tier
     has no mutex). With the tests' 200 us copy spin the copy thread goes to sleep between the
     Python-paced steps, so this run also covers the futex idle path: a wait on the copy thread each time it sleeps, and
     at most one wake per submitted job on the service thread (submit wakes only a thread that is asleep)."""
@@ -239,8 +238,8 @@ def test_a_spinning_copy_thread_costs_the_service_no_syscall(shim, tmp_path):
 
 @pytest.mark.parametrize("variant", ["prod", "instr"])
 def test_the_service_and_copy_threads_take_no_lock_and_never_wait_on_a_condvar(shim, tmp_path, variant):
-    """Spec L1-L10 and 6.3 (Task 15): over the measured requests -- copy jobs on the copy thread and deferrals among
-    them -- neither thread takes a mutex, touches a condition variable or allocates, and the service thread never
+    """Spec L1-L10 and 6.3 (Task 15): over the measured requests -- copy jobs on the copy thread, and misses with their
+    victims and deltas -- neither thread takes a mutex, touches a condition variable or allocates, and the service thread never
     sleeps. The request path's only kernel wait is the io_uring completion (D5), which is not a lock, and the only
     futex calls are the copy engine's documented idle protocol: the copy thread's wait when it sleeps, and the service's
     wake in submit, at most one per job, only for a sleeping copy thread. The shim counts pthread mutexes and condvars

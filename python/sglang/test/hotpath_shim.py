@@ -5,13 +5,11 @@ threads the shim recognized per role (``threads``), so that a count of zero can 
 saw the thread.
 
 Each step posts one request on row 0 whose first lane is the previous step's miss, now resident (a hit the copy engine
-takes: a COPYING lane and a copy job) and whose second lane is a new miss (read, LOADING). The copy job's mark is
-released by that step, one mark at a time, after the request was served; the step then waits until the copy thread
-retired it. Every ``DEFER_EVERY``-th step also holds its copy while it posts a request for all four non-resident
-experts: with one slot under the copy lease that request must defer, and it is served only once the step releases the
-mark. The window therefore covers hits, copy jobs, the copy thread's completions and lease releases, and deferrals;
-the child reports how many of each it saw (``copy_jobs`` = marks the copy thread recorded, ``copies_done`` = requests
-whose CopyDone the service published, ``deferrals`` = the core counter's delta, ``posts``).
+takes: a kHitCopy lane and a copy job) and whose second lane is a new miss (read into a staging slot, kMissGpu). The
+copy job's mark is released by that step, one mark at a time, after the request was served; the step then waits until
+the copy thread retired it and CopyDone is published. The window therefore covers hits, misses with their victims and
+map deltas, copy jobs and the copy thread's completions; the child reports how many of each it saw (``copy_jobs`` =
+marks the copy thread recorded, ``copies_done`` = requests whose CopyDone the service published, ``posts``).
 
 The service thread's ``sleep`` count is 0 only because the child starts the thread with ``spin_us=50_000``: the
 measured window never idles for 50 ms, so ``RamThread`` never reaches its idle ``nanosleep``. A smaller ``spin_us``
@@ -54,17 +52,15 @@ CHILD = textwrap.dedent(
     shim.hotpath_shim_count.restype = ctypes.c_long
     shim.hotpath_shim_threads.restype = ctypes.c_long
 
-    from sglang.kernels.ops.moe import expert_lease_block as lease
-    from sglang.kernels.ops.moe.expert_stream_transport import page_word
+    from sglang.srt.layers.moe.ram_slot_map import LaneKind
     from sglang.test import hotpath_script as hp
 
     variant, requests, warmup, tmp = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
     copy_spin_us = int(sys.argv[5])
-    DEFER_EVERY = 25
     s, page, host, sim, dst = hp.build_host(Path(tmp), variant=None if variant == "default" else variant,
                                             copy_spin_us=copy_spin_us)
     host.start_thread(fatal_wait_s=60.0, spin_us=50_000)  # 50 ms of spin: the measured window never idles into sleep
-    seen = {"posts": 0, "copies_done": 0, "deferrals": 0}
+    seen = {"posts": 0, "copies_done": 0}
     last = [None]
 
     def cold():
@@ -76,10 +72,8 @@ CHILD = textwrap.dedent(
         return sim.post(0, lanes, **kw)
 
     def serve(req):
-        assert sim.wait(req, 10.0).served, "request not served"
-        copying = any(sim.row_result(req, lane)["tag"] == lease.COPYING for lane in range(len(req.lanes)))
-        sim.done(req)
-        return copying
+        assert sim.wait_served(req, 10.0), "request not served"
+        return any(kind == LaneKind.HIT_COPY for kind in req.kinds)
 
     def step(i):
         free = cold()
@@ -87,26 +81,13 @@ CHILD = textwrap.dedent(
         lanes = [miss] if last[0] is None else [last[0], miss]
         req = post(lanes, dst=[0, 1][: len(lanes)], captured=True)
         copying = serve(req)
-        defer = i %% DEFER_EVERY == DEFER_EVERY - 1
-        if defer:
-            assert copying, "the deferral step needs a copy in flight"
-            wanted = cold()
-            before = host.counters()["deferred"]
-            held = post(wanted)  # every non-resident expert, while the copy holds one of the four slots
-            deadline = time.monotonic() + 10.0
-            while host.counters()["deferred"] == before:
-                assert time.monotonic() < deadline, "the request did not defer"
-            assert page_word(page, "demand_done") == req.seq, "a slot under a copy lease was evicted"
-            seen["deferrals"] += host.counters()["deferred"] - before
         if copying:
             host.copy_engine_release(1)  # this step's mark, and only it
             assert host.copy_engine_idle(5.0), "the copy thread did not retire the job"
+            assert sim.copy_wait(req, 5.0), "CopyDone was not published"
             seen["copies_done"] += sim.copy_done(req) == req.gen
-        if defer:
-            serve(held)
-            last[0] = wanted[-1]
-        else:
-            last[0] = miss
+        assert sim.wait_handled(req, 10.0)
+        last[0] = miss
 
     for i in range(warmup):
         step(i)
