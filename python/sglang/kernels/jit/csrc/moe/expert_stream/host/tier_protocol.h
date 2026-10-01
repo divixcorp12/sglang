@@ -37,9 +37,6 @@ enum Counter : int {
   // CPU experts (plan 2026-09-29-dsv41-cpu-experts): CPU jobs (one per part of a record) and their lanes.
   kCpuJobs,
   kCpuLanes,
-  // The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Task 13): Python commands (set_hot, the
-  // snapshots) the tier's owner applied, queued through the command ring or run directly. A metric: tests only (F24).
-  kCommandsApplied,
   kCounterCount,
 };
 

@@ -942,8 +942,12 @@ class Exl3RamMissService:
         if updater.device.type == "cuda":
             torch.cuda.current_stream(updater.device).synchronize()
         self._refresh_hot_lists()
-        for layer_id, experts in self._hot_lists.items():
-            self.host.set_hot(self.row_of(layer_id), experts)
+        self.before_host_use()
+        try:
+            for layer_id, experts in self._hot_lists.items():
+                self.host.set_hot(self.row_of(layer_id), experts)
+        finally:
+            self.after_host_use()
         self.gpu_hot_enabled = True
 
     def hot_experts(self, layer_id: int) -> list[int]:

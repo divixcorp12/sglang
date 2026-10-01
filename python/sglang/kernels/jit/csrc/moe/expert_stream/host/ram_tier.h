@@ -142,24 +142,6 @@ class RamTier {
 
   // ---- The single owner (see "Python-facing bookkeeping") ----
 
-  static constexpr int kMaxHotWords = 16;  // set_hot's bitmap: 1024 experts
-
-  // A Python-side call for the tier's owner. A kSnapshot runs `snapshot` there and hands back its value through
-  // `result`. `done` (the waiting caller's) becomes 1 once applied, 2 if the owner's body threw:
-  // a command never throws on the service thread.
-  struct Command {
-    enum Kind : uint8_t { kSetHot, kSnapshot };
-    Kind kind = kSetHot;
-    int64_t row = 0;  // kSnapshot: the snapshot's own argument
-    uint64_t hot[kMaxHotWords] = {};
-    int64_t (*snapshot)(RamTier*, const Command&) = nullptr;
-    int64_t* out = nullptr;
-    const void* input = nullptr;  // kSnapshot: an argument the caller keeps alive (victim_census's wanted list)
-    int64_t* result = nullptr;    // kSnapshot: the answer
-    std::string* error = nullptr;  // the owner's exception message when its body threw
-    std::atomic<uint32_t>* done = nullptr;
-  };
-
   // The tier's owner is the service thread while it runs, else the caller: a paused service (parked_, set by the
   // pausing caller once the service has parked) or no thread at all (pump mode, or after stop()'s join).
   bool caller_owns() const {
@@ -174,66 +156,10 @@ class RamTier {
     return caller_mutex_;
   }
 
-  // The owner, between requests: apply every queued Python command, in order. The ring's one consumer is always the
-  // current owner: the service thread, or a caller once the service has parked or joined, each handoff ordered by
-  // the pause handshake's release/acquire or the join (RamThread). An empty ring costs one relaxed load and a compare.
-  void drain_commands() {
-    Command command;
-    while (commands_.pop(&command))
-      apply_command(command);
-  }
-
-  // A Python-side call that needs the tier. It runs here when this caller owns the tier (after anything queued before
-  // the handoff); otherwise it is queued for the service (drain_commands), and every kind but kSetHot waits for its
-  // answer. If the service stops before it drains the queue, the caller then owns the tier and drains it itself (stop()
-  // clears threaded_ after the join, without caller_mutex_), so nothing queued is left unanswered; a service hung in a
-  // read is aborted by the watchdog. The service cannot park meanwhile: a pause takes caller_mutex_, which this caller
-  // holds.
-  void run_as_owner(Command command) {
-    std::atomic<uint32_t> done{0};
-    std::string error;
-    std::lock_guard<std::mutex> caller(caller_mutex_);
-    if (!caller_owns()) {
-      const bool wait = command.kind != Command::kSetHot;
-      if (wait) {
-        command.done = &done;
-        command.error = &error;
-      }
-      bool queued = false;
-      while (!caller_owns()) {
-        if (commands_.push(command)) {
-          queued = true;
-          break;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(20));  // a full ring: wait for room, never drop
-      }
-      if (queued) {
-        if (!wait) return;
-        while (done.load(std::memory_order_acquire) == 0) {
-          if (caller_owns()) {
-            drain_commands();
-          } else {
-            std::this_thread::sleep_for(std::chrono::microseconds(20));
-          }
-        }
-        command_outcome(done.load(std::memory_order_acquire), error);
-        return;
-      }
-    }
-    drain_commands();  // anything queued before the handoff comes first
-    command.done = &done;
-    command.error = &error;
-    apply_command(command);
-    command_outcome(done.load(std::memory_order_acquire), error);
-  }
-
   // Serve the next posted demand record, if any. True when it handled one.
   bool pump_demand() {
     const uint32_t head = load_acquire(page_ + kDemandHead);
     const bool posted = head != 0 && reached(head, next_demand_);
-    // Commands a caller queued before posting this demand are applied first (the demand head's acquire above made the
-    // push visible); pump mode queues nothing, so only the service thread looks.
-    if (posted) drain_commands_on_service();
     if (admission_closed_.load()) return false;
     if (!posted) return false;
     begin_stage(kStageDemand, next_demand_, head - next_demand_);
@@ -323,12 +249,10 @@ class RamTier {
   //
   // Everything in the tier but its atomics has exactly one owner at a time: the service thread while it runs; the
   // Python caller that paused it, from the moment the service parks until resume() (RamThread::pause sets parked_);
-  // the caller of pump() when there is no thread. An unpaused Python call therefore takes one of three forms:
+  // the caller of pump() when there is no thread. An unpaused Python call therefore takes one of two forms:
   //   - a lock-free read of published words: mapping, counters, busy_episode, layer_rows;
-  //   - a command through run_as_owner, which the service drains between requests: set_hot and the
-  //     snapshots slot_info, slot_to_expert, lru_order, victim_census;
-  //   - a refusal, "needs the service thread paused": has, touch, assign, release, fill_begin.
-  // On the owner every one of them runs directly, after draining whatever an earlier caller queued.
+  //   - a refusal, "needs the service thread paused": every other call (has, touch, assign, release, fill_begin,
+  //     set_hot, slot_info, slot_to_expert, lru_order, victim_census, ...).
   //
   // caller_mutex_ serializes Python-side callers against each other only; the service, copy and fill threads never
   // take it, and the tier has no other lock. The copy thread touches no tier state (it publishes CopyDone and the gate
@@ -338,14 +262,12 @@ class RamTier {
   bool has(int64_t row, int64_t expert) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("contains");
-    drain_commands();
     return tiers_[row].expert_slot[expert] >= 0;
   }
 
   void touch(int64_t row, int64_t expert) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("touch");
-    drain_commands();
     Tier& tier = tiers_[row];
     const int32_t slot = tier.expert_slot[expert];
     if (slot >= 0) {
@@ -360,7 +282,6 @@ class RamTier {
   int64_t assign(int64_t row, int64_t expert, const std::vector<int32_t>& protect, bool fallback, int64_t* evicted) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("assign");
-    drain_commands();
     Tier& tier = tiers_[row];
     if (tier.expert_slot[expert] >= 0) {
       *evicted = -2;
@@ -380,7 +301,6 @@ class RamTier {
   void release(int64_t row, int64_t slot) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("release");
-    drain_commands();
     if (tiers_[row].state[slot] == kStaging) {
       throw std::runtime_error(
           error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + ": it is a staging slot");
@@ -413,7 +333,6 @@ class RamTier {
       int64_t* evictions) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("a prefill fill");
-    drain_commands();
     if (fill_thread_.joinable()) throw std::runtime_error(error_prefix<Layout>() + "a prefill fill is already running");
     std::vector<int32_t> claimed;
     std::vector<int64_t> taken;
@@ -733,7 +652,6 @@ class RamTier {
   int64_t bulk_delta_count() {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("bulk_delta_count");
-    drain_commands();
     fill_join();
     return static_cast<int64_t>(bulk_.size());
   }
@@ -764,32 +682,26 @@ class RamTier {
     return tiers_[row].capacity;
   }
 
-  // Test hooks and introspection. slot_info: [state, expert, stamp] per slot. A snapshot.
+  // Test hooks and introspection, for the tier's owner (a paused or pumping caller; "needs the service thread paused"
+  // otherwise). slot_info: [state, expert, stamp] per slot.
   void slot_info(int64_t row, int64_t* out) {
-    row_capacity(row);  // range-checked on the caller: the owner may be the service thread, which must not throw
-    snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      const Tier& tier = self->tiers_[c.row];
-      for (int64_t slot = 0; slot < tier.capacity; ++slot) {
-        c.out[3 * slot] = tier.state[slot];
-        c.out[3 * slot + 1] = tier.slot_to_expert[slot];
-        c.out[3 * slot + 2] = static_cast<int64_t>(tier.stamp[slot]);
-      }
-      return 0;
-    });
+    row_capacity(row);
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("slot_info");
+    const Tier& tier = tiers_[row];
+    for (int64_t slot = 0; slot < tier.capacity; ++slot) {
+      out[3 * slot] = tier.state[slot];
+      out[3 * slot + 1] = tier.slot_to_expert[slot];
+      out[3 * slot + 2] = static_cast<int64_t>(tier.stamp[slot]);
+    }
   }
 
-  // (free, evictable) of `wanted`: a snapshot. `wanted` is the caller's, alive until the answer comes back.
+  // (free, evictable) of `wanted`.
   VictimCensus victim_census(int64_t row, const std::vector<int32_t>& wanted) {
     row_capacity(row);
-    int64_t out[2] = {};
-    snapshot(row, out, &wanted, [](RamTier* self, const Command& c) -> int64_t {
-      const VictimCensus census =
-          self->census_locked(c.row, *static_cast<const std::vector<int32_t>*>(c.input));
-      c.out[0] = census.free;
-      c.out[1] = census.evictable;
-      return 0;
-    });
-    return VictimCensus{out[0], out[1]};
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("victim_census");
+    return census_locked(row, wanted);
   }
 
   // Any thread, lock-free: the published slot map, which holds a slot for an expert exactly while that slot is READY
@@ -799,52 +711,46 @@ class RamTier {
       out[expert] = __atomic_load_n(map_ + row * experts_ + expert, __ATOMIC_ACQUIRE);
   }
 
-  // A snapshot.
+  // The owner's: every slot's expert.
   void slot_to_expert(int64_t row, int64_t* out) {
     row_capacity(row);
-    snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      const Tier& tier = self->tiers_[c.row];
-      for (int64_t slot = 0; slot < tier.capacity; ++slot)
-        c.out[slot] = tier.slot_to_expert[slot];
-      return 0;
-    });
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("slot_to_expert");
+    const Tier& tier = tiers_[row];
+    for (int64_t slot = 0; slot < tier.capacity; ++slot)
+      out[slot] = tier.slot_to_expert[slot];
   }
 
-  // A snapshot: the READY slots' experts, least recently used first; returns how many. Production calls it only while
-  // paused (NativePinnedSlotTable, inside host_use()), where the caller is the owner and nothing is being served. An
-  // unpaused call is test-only; its vector then allocates mid-read on the service, from read()'s progress hook
-  // (answer_snapshots).
+  // The owner's: the READY slots' experts, least recently used first; returns how many.
   int64_t lru_order(int64_t row, int64_t* out) {
     row_capacity(row);
-    return snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
-      const Tier& tier = self->tiers_[c.row];
-      std::vector<int64_t> slots;
-      for (int64_t slot = 0; slot < tier.capacity; ++slot) {
-        if (tier.state[slot] == kReady) slots.push_back(slot);
-      }
-      std::sort(slots.begin(), slots.end(), [&](int64_t a, int64_t b) { return tier.stamp[a] < tier.stamp[b]; });
-      for (size_t i = 0; i < slots.size(); ++i)
-        c.out[i] = tier.slot_to_expert[slots[i]];
-      return static_cast<int64_t>(slots.size());
-    });
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("lru_order");
+    const Tier& tier = tiers_[row];
+    std::vector<int64_t> slots;
+    for (int64_t slot = 0; slot < tier.capacity; ++slot) {
+      if (tier.state[slot] == kReady) slots.push_back(slot);
+    }
+    std::sort(slots.begin(), slots.end(), [&](int64_t a, int64_t b) { return tier.stamp[a] < tier.stamp[b]; });
+    for (size_t i = 0; i < slots.size(); ++i)
+      out[i] = tier.slot_to_expert[slots[i]];
+    return static_cast<int64_t>(slots.size());
   }
 
-  // A command carrying the row's hot set as a bitmap (kMaxHotWords words: at most 1024 experts). Unpaused, it is
-  // queued and applied by the service before its next request, in order with every other command; the caller does
-  // not wait for it. A full ring makes the caller wait for room, never drops the command.
+  // The owner's: replace the row's hot set. A VRAM-hot row is decode's: kept owned it could never be a victim and
+  // would hold the share down.
   void set_hot(int64_t row, const int64_t* experts, int64_t count) {
     row_capacity(row);
-    if (experts_ > kMaxHotWords * 64) {
-      throw std::runtime_error(
-          error_prefix<Layout>() + "set_hot takes at most " + std::to_string(kMaxHotWords * 64) + " experts per row");
-    }
-    Command c;
-    c.kind = Command::kSetHot;
-    c.row = row;
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("set_hot");
+    Tier& tier = tiers_[row];
+    tier.hot.assign(experts_, 0);
     for (int64_t i = 0; i < count; ++i) {
-      if (experts[i] >= 0 && experts[i] < experts_) c.hot[experts[i] / 64] |= uint64_t{1} << (experts[i] % 64);
+      const int64_t expert = experts[i];
+      if (expert < 0 || expert >= experts_) continue;
+      tier.hot[expert] = 1;
+      if (tier.expert_slot[expert] >= 0) disown_locked(tier, tier.expert_slot[expert]);
     }
-    run_as_owner(c);
   }
 
   // Any thread, lock-free: relaxed reads of words only the owner's serve() writes (a relaxed store, one writer).
@@ -894,91 +800,13 @@ class RamTier {
   }
 
  private:
-  // The owner. Counted (kCommandsApplied, a metric) before `done` is stored, so a caller that saw its answer sees the
-  // count too. Nothing escapes: on the service thread an exception would terminate the process.
-  void apply_command(const Command& c) {
-    int64_t value = 0;
-    uint32_t outcome = 1;
-    try {
-      switch (c.kind) {
-        case Command::kSetHot:
-          set_hot_owned(c.row, c.hot);
-          break;
-        case Command::kSnapshot:
-          value = c.snapshot(this, c);
-          break;
-      }
-    } catch (const std::exception& e) {
-      outcome = 2;
-      if (c.error != nullptr) *c.error = e.what();  // the waiting caller reads it after its acquire of `done`
-    } catch (...) {
-      outcome = 2;
-    }
-    count<kCommandsApplied>();
-    if (c.result != nullptr) *c.result = value;
-    if (c.done != nullptr) c.done->store(outcome, std::memory_order_release);
-  }
-
-  // The service thread's drains inside pump_demand. pump() mode queues nothing (its caller owns the tier), and there
-  // the ring's consumer must stay the one Python caller: so only when threaded.
-  void drain_commands_on_service() {
-    if (threaded_.load(std::memory_order_relaxed)) drain_commands();
-  }
-
-  // The service thread, mid-request (the read's progress hook, inject()'s read delay): apply the queue's leading
-  // snapshots only. A mutator (set_hot) waits for the end of the request, and every snapshot queued
-  // behind it waits too, so the queue's order is kept: a mutator is applied between requests, as a snapshot taken
-  // after it sees it.
-  void answer_snapshots() {
-    if (!threaded_.load(std::memory_order_relaxed)) return;
-    Command command;
-    for (const Command* next = commands_.front(); next != nullptr && next->kind == Command::kSnapshot;
-         next = commands_.front()) {
-      commands_.pop(&command);
-      apply_command(command);
-    }
-  }
-
-  // Test only (InstrBuild): inject()'s read delay. It stands in for a slow read, so it answers snapshots as a read's
-  // progress hook does, a slice at a time (no clock: the slices are counted).
+  // Test only (InstrBuild): inject()'s read delay, standing in for a slow read.
   void fault_delay(int64_t ns) {
-    constexpr int64_t kSliceNs = 1'000'000;
-    for (int64_t left = ns; left > 0; left -= kSliceNs) {
-      std::this_thread::sleep_for(std::chrono::nanoseconds(std::min(left, kSliceNs)));
-      answer_snapshots();
-    }
-  }
-
-  void command_outcome(uint32_t outcome, const std::string& error) const {
-    if (outcome == 2)
-      throw std::runtime_error(error_prefix<Layout>() + "a Python command failed on the tier's owner: " + error);
+    std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
   }
 
   void require_owner(const char* what) const {
     if (!caller_owns()) throw std::runtime_error(error_prefix<Layout>() + what + " needs the service thread paused");
-  }
-
-  // A snapshot: `read` runs on the owner (run_as_owner) and its value comes back.
-  int64_t snapshot(int64_t row, int64_t* out, const void* input, int64_t (*read)(RamTier*, const Command&)) {
-    Command c;
-    c.kind = Command::kSnapshot;
-    c.row = row;
-    c.out = out;
-    c.input = input;
-    c.snapshot = read;
-    int64_t result = 0;
-    c.result = &result;
-    run_as_owner(c);
-    return result;
-  }
-
-  void set_hot_owned(int64_t row, const uint64_t* hot) {
-    Tier& tier = tiers_[row];
-    for (int64_t expert = 0; expert < experts_; ++expert) {
-      tier.hot[expert] = (hot[expert / 64] >> (expert % 64)) & 1u;
-      // A VRAM-hot row is decode's: kept owned it could never be a victim and would hold the share down.
-      if (tier.hot[expert] && tier.expert_slot[expert] >= 0) disown_locked(tier, tier.expert_slot[expert]);
-    }
   }
 
   // Copy thread. Completion was observed: every DMA and CPU job of the record is done. CopyDone here, so the device's
@@ -1526,12 +1354,8 @@ class RamTier {
           cur,
           &packed,
           SIZE_MAX,
-          // The service stays the tier's owner for the whole read, so it answers queued snapshots here too.
-          // read() runs it once per drain-loop turn and once per finished row; it allocates nothing and takes no lock.
-          [&] {
-            answer_snapshots();
-            send_late();
-          },
+          // read() runs this once per drain-loop turn and once per finished row.
+          [&] { send_late(); },
           publishing ? &piece_publish_ : nullptr);
       stats_.store(kPiecePublishRefused, reader_.publish_refused());
       if (result != 1) {
@@ -1658,11 +1482,8 @@ class RamTier {
   int64_t demands_read_ = 0;
   std::atomic<bool> threaded_{false};
   // The pausing caller owns the tier while parked_ (see caller_owns). caller_mutex_ serializes Python-side callers only.
-  // commands_ carries the unpaused callers' commands to the service (producer: the caller_mutex_ holder; consumer: the
-  // owner).
   std::atomic<bool> parked_{false};
   std::mutex caller_mutex_;
-  SpscRing<Command, 64> commands_;
   // The watchdog's hung-request marker, see busy_episode(): a new value per demand or fill in service, 0 when none.
   // episodes_ is the service thread's, or a fill's (they never run at once: a fill needs the pause).
   std::atomic<uint64_t> busy_{0};

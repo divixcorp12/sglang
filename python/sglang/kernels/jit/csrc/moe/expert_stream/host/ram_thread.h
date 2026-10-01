@@ -59,23 +59,21 @@ class RamThread {
   // The watchdog is stopped only after the service thread has joined: a join that blocks
   // on a hung read is then aborted by its stuck rule instead of hanging the process.
   //
-  // No caller_mutex() here: a caller waiting for a snapshot holds it, and that caller must see threaded_ clear to drain
-  // the queue itself; the service's last act is a final drain (run()), and the join orders every service write before
-  // stop()'s release of threaded_. A prefill fill a pausing caller left running is joined by stop_thread's final settle
-  // (RamTier::final_settle), under caller_mutex(), before it drains and settles; the fill thread writes no tier state,
-  // so that join is the only edge it needs.
+  // The join orders every service write before stop()'s release of threaded_. A prefill fill a pausing caller left
+  // running is joined by stop_thread's final settle (RamTier::final_settle), under caller_mutex(), before it settles;
+  // the fill thread writes no tier state, so that join is the only edge it needs.
   void stop() {
     stop_.store(true);
     if (thread_.joinable()) thread_.join();
     watch_stop_.store(true);
     if (watchdog_.joinable()) watchdog_.join();
-    tier_->set_threaded(false);  // release: after the join, a waiting caller owns the tier and drains the ring
+    tier_->set_threaded(false);  // release: after the join, a caller owns the tier
   }
 
   // 1 paused, 0 timed out, 2 refused: the copy thread still has a job after the wait (the caller must have
   // synchronized the stream, so every copy wait has seen its CopyDone), and the slots are not the caller's.
   // While paused the loop takes no request, so the caller owns the tier until resume(). Edge service -> caller: the loop
-  // drains the command ring, then stores parked_epoch_ (release); pause() loads it (acquire), then sets the tier's
+  // serves every posted record, then stores parked_epoch_ (release); pause() loads it (acquire), then sets the tier's
   // parked_ (release), which later Python callers acquire in caller_owns(). Each pause has its own epoch (odd while
   // requested), so a pause right after a resume cannot take the previous pause's acknowledgement for its own. pause()
   // and resume() take caller_mutex(); the service thread never does. Not reentrant: their one owner is the slot
@@ -99,7 +97,7 @@ class RamThread {
       }
       std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
-    // The service parked for this epoch (it drained the command ring first): this caller owns the tier until resume.
+    // The service parked for this epoch: this caller owns the tier until resume.
     tier_->set_parked(true);
     // The caller synchronized the stream, so every copy wait has seen its CopyDone and the copy thread is done.
     if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {
@@ -117,7 +115,7 @@ class RamThread {
  private:
   // The owner hands the tier back: its writes happen-before the service's next request through the release of
   // pause_epoch_ (the parked loop acquires it). parked_ is cleared first, so a caller that then takes caller_mutex()
-  // sees the service as the owner and queues instead of touching the tier. A timed-out pause never set parked_.
+  // sees the service as the owner and is refused instead of touching the tier. A timed-out pause never set parked_.
   void resume_locked() {
     // A prefill fill uses the reader the service thread is about to use: join it, and run its epilogue here, on the
     // owner (the fill thread writes no tier state), before the release below hands the tier back.
@@ -141,9 +139,7 @@ class RamThread {
     if (error != 0) return;
     tier_->set_counter(kRunning, 1);
     uint64_t idle = 0;  // empty polls since the last request: the spin budget counts these, not elapsed time
-    bool stopped_parked = false;  // stop() came while a caller owned the tier: that caller keeps it
     while (!stop_.load(std::memory_order_relaxed)) {
-      tier_->drain_commands();  // between requests: every queued Python command, in order
       const uint64_t epoch = pause_epoch_.load(std::memory_order_acquire);
       if (epoch & 1u) {
         // Every record posted before the pause, first: an all-HIT_SM chain never waits on the service, so its record
@@ -151,13 +147,11 @@ class RamThread {
         // The caller synchronized the stream, so demand_head is final and this ends.
         while (tier_->pump_demand()) {
         }
-        tier_->drain_commands();  // nothing queued before the pause is left behind
         parked_epoch_.store(epoch, std::memory_order_release);  // the handoff: the pausing caller owns the tier
         while (pause_epoch_.load(std::memory_order_acquire) == epoch && !stop_.load())
           std::this_thread::sleep_for(std::chrono::microseconds(20));
         if (pause_epoch_.load(std::memory_order_acquire) == epoch) {
-          stopped_parked = true;  // stopped while parked: touch nothing of the tier the caller owns
-          break;
+          break;  // stopped while parked: touch nothing of the tier the caller owns
         }
         continue;
       }
@@ -171,8 +165,6 @@ class RamThread {
         std::this_thread::sleep_for(std::chrono::microseconds(50));  // the idle path (spec L12): kept
       }
     }
-    // A command queued after the last iteration's drain is answered here, not left to a waiting caller.
-    if (!stopped_parked) tier_->drain_commands();
     tier_->set_counter(kRunning, 0);
   }
 

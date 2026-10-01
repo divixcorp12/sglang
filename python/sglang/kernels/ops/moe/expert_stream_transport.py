@@ -731,8 +731,6 @@ COUNTERS = (
     # CPU experts (plan 2026-09-29-dsv41-cpu-experts).
     "cpu_jobs",
     "cpu_lanes",
-    # The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Task 13): Python commands the owner applied.
-    "commands_applied",
 )
 
 # The counters a production host keeps (plan 2026-09-29-hotpath-zero-overhead D1; tier_protocol.h is_core_counter,
@@ -794,15 +792,12 @@ class ExpertStreamHost:
     ``start_thread()``, then by the C++ service thread until ``stop()``. ``variant``: the host build to load
     (``VARIANTS``), by default ``host_variant()``'s choice; kept as ``self.variant``.
 
-    The tier has one owner at a time (plan 2026-09-29-hotpath-zero-overhead Task 13): the service thread while it
-    runs, the caller between ``pause()`` and ``resume()``, and the caller of ``pump()`` when there is no thread. While
-    the thread runs unpaused, ``contains``, ``touch``, ``assign``, ``release`` and ``fill_begin`` raise
-    ``RuntimeError`` ("... needs the service thread paused"); ``set_hot`` is queued and applied by the service before
-    its next request (it returns before then); the snapshots (``slot_info``, ``slot_to_expert``, ``lru_order``,
-    ``victim_census``) are answered by the service and waited for
-    (mid-read too, unless a queued ``set_hot`` precedes them: then at the end of the request);
-    ``mapping``, ``counters``, ``busy_episode`` and ``layer_rows`` read published words without waiting. Paused, or
-    with no thread, every call runs at once.
+    The tier has one owner at a time: the service thread while it runs, the caller between ``pause()`` and
+    ``resume()``, and the caller of ``pump()`` when there is no thread. While the thread runs unpaused, every call
+    that reads or writes tier state (``contains``, ``touch``, ``assign``, ``release``, ``fill_begin``, ``set_hot``,
+    ``slot_info``, ``slot_to_expert``, ``lru_order``, ``victim_census``) raises ``RuntimeError`` ("... needs the
+    service thread paused"); ``mapping``, ``counters``, ``busy_episode`` and ``layer_rows`` read published words
+    without waiting. Paused, or with no thread, every call runs at once.
     """
 
     def __init__(
@@ -913,8 +908,7 @@ class ExpertStreamHost:
     def contains(self, row: int, expert: int) -> bool:
         """True once the expert holds a slot in ``row``: from the moment the thread claims the
         slot, before its read has finished. It does not mean the bytes are in RAM; the read is
-        done when ``layer_rows()`` counts the row. Needs the thread paused (or no
-        thread); ``slot_to_expert`` answers the same question as a snapshot while it runs."""
+        done when ``layer_rows()`` counts the row. Needs the thread paused (or no thread)."""
         self._check(row, expert)
         return bool(self._module.expert_stream_contains(self.handle, row, expert))
 
@@ -973,10 +967,7 @@ class ExpertStreamHost:
         return bool(self._module.expert_stream_fill_end(self.handle))
 
     def slot_info(self, row: int) -> list[tuple[int, int, int]]:
-        """Per slot: (state, expert, stamp); state 0 FREE, 2 READY, 3 STAGING. A snapshot: with the thread
-        running, the service answers it between requests or from inside a read. Queued behind an unpaused ``set_hot``, it
-        waits for the end of the current request (the queue keeps its order): never take one on the thread a read in
-        service is gated on (a test's device release, say), or it waits until the watchdog."""
+        """Per slot: (state, expert, stamp); state 0 FREE, 2 READY, 3 STAGING. Paused or pumping only."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 3, dtype=torch.int64)
         self._module.expert_stream_slot_info(self.handle, row, out)
@@ -1000,7 +991,8 @@ class ExpertStreamHost:
         return int(self._module.expert_stream_handled_through(self.handle)) & 0xFFFFFFFF
 
     def victim_census(self, row: int, wanted: Iterable[int] = ()) -> tuple[int, int]:
-        """(free, evictable) slots a request wanting ``wanted`` could take, counted without taking any."""
+        """(free, evictable) slots a request wanting ``wanted`` could take, counted without taking any. Paused or
+        pumping only."""
         self._check(row)
         out = torch.empty(2, dtype=torch.int64)
         self._module.expert_stream_victim_census(self.handle, row, _ids(wanted), out)
@@ -1157,10 +1149,7 @@ class ExpertStreamHost:
         return out[:count].tolist()
 
     def set_hot(self, row: int, experts: Iterable[int]) -> None:
-        """The row's hot set (never evicted). With the thread running unpaused it is queued and applied, in order,
-        before the service's next request; the call does not wait for that. At most 1024 experts per row. A snapshot
-        (``slot_info`` and the others) queued after it waits for the end of the current request, since a mutator is
-        applied only between requests: so a thread that a read in service is gated on must not take one then."""
+        """The row's hot set (never evicted). Paused or pumping only."""
         self._check(row)
         self._module.expert_stream_set_hot(self.handle, row, _ids(e for e in experts if e >= 0))
 
