@@ -6355,8 +6355,8 @@ EXIT read from pytest):
 ## 31. The slot-map protocol: device-held expert map, staging slots, CPU-computed misses (`dsv41-device-slot-map`, 2026-09-30)
 
 Branch `dsv41-device-slot-map` from `59cfb07c99`. Plan: `docs/superpowers/plans/2026-09-30-dsv41-device-slot-map.md`
-(Revision 1 is binding); ledger of rulings: `.superpowers/sdd/2026-09-30-dsv41-device-slot-map/progress.md` (not
-committed; the rulings are in the plan's final review). The protocol as built: `analysis/dsv41-drive/LEASE_PROTOCOL.md`,
+(Revision 1 is binding); ledger of rulings: `.superpowers/sdd/2026-09-30-dsv41-device-slot-map/progress.md`
+(untracked; the rulings exist only there and in the branch's final summary). The protocol as built: `analysis/dsv41-drive/LEASE_PROTOCOL.md`,
 which supersedes §30.5's lease description. Not merged; nothing below has run in a server.
 
 ### 31.1 What changed
@@ -6415,13 +6415,14 @@ status read.
   `test/registered/unit/layers/moe/test_exl3_ram_miss_service.py`, with `-q -p no:randomly`, `-n 2`,
   `taskset -c 0-17,30-63`, `OMP_NUM_THREADS=8`, `CUDA_VISIBLE_DEVICES=`:
   - merge base `59cfb07c99`: 826 passed, 458 skipped (1284 collected);
-  - branch `2329a64840`: 830 passed, 458 skipped (1288 collected).
+  - branch, at `1db383e34b` (the run's `HEAD=`): 830 passed, 458 skipped (1288 collected, before the attach test
+    below).
   - The +4: the seven deleted lease test files held 37 tests (`lease_defer` 7, `lease_publication` 5,
     `lease_service` 9, `leases` 8, `lease_thread` 4, `lease_wrap` 2, `task5_item5_ack_independence` 2); the two new
     ones hold 27 (`test_exl3_ram_miss_slot_map.py` 19, `test_ram_slot_map.py` 8); modified files net +14
     (`cpu_expert_sim` +11, `cpu_experts` +3, `lease_block` +1, `copy_engine` +1, `ram_miss_service` +1,
     `prefill_share` -1, `build_variants` -2).
-  - Re-run at `5eb63ba343` (Task 4's record): 830 passed, 458 skipped. One later commit adds a test
+  - Re-run at `0dc3ecd672`: 830 passed, 458 skipped. One later commit adds a test
     (`test_attach_unmaps_on_a_full_tier_reach_the_device_before_any_post`).
 - **GPU** (RTX 5090, `flock cc-gpu.lock taskset -c 32-63`, `CUDA_MODULE_LOADING=EAGER`, `SGLANG_EXL3_SRC` set, from
   `test/manual/dsv41`, `-k 'not ends_a_gpu_reader'`): every `*_cuda.py` and `*_gpu.py` the branch touched
@@ -6436,8 +6437,9 @@ status read.
 1. **No server run** of any kind: no smoke, no decode A/B against master, no quality gate (E31) for CPU-computed
    misses.
 2. **`SGLANG_DSV41_RAM_HIT_COPY=sm` has never been measured**, nor `CPU_EXPERTS_MISSES=1` beyond the replay.
-3. **No mutation runs.** The plan listed eight mutants; they were dropped to save time, so the tests' sensitivity is
-   shown only by the two bugs above, which the GPU tests caught.
+3. **No mutation runs.** The plan listed five mutants in Task 7, plus a delta-ordering one; they were not run, at the
+   user's direction ("no mutants needed for tests"). The tests' sensitivity is shown only by the self-recursive store
+   the GPU rig caught, and by the red tests written for the attach fixes.
 4. **Duplicate experts in a plan trap.** The fused planner emits unique experts; the non-fused `route_plan` path is
    not exercised by graph gather, and was not checked to be duplicate-free.
 5. **`test_shutdown_ends_a_gpu_reader_waiting_on_the_service_without_waiting_out_its_timeout` fails**, identically at
