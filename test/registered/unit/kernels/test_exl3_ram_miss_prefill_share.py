@@ -12,8 +12,8 @@ import torch
 
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_lease_sim import LeaseSim, post_record
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+from sglang.test.dsv41_chain_sim import ChainSim
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -29,29 +29,26 @@ def hang_guard():
 
 @pytest.fixture
 def tier(tmp_path):
-    s = ram_miss_setup(tmp_path, capacity=4, experts=EXPERTS)
+    # Six slots, two of them staging: four mappable rows, as the tests' arithmetic assumes.
+    s = ram_miss_setup(tmp_path, capacity=6, experts=EXPERTS)
     page = new_page(pin=False)
-    host = ExpertStreamHost(
-        s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32)
-    )
-    yield page, host
+    host = attached_host(s, page, k=2)
+    yield ChainSim(host, page, None), host
     host.stop()
 
 
-def _serve(page, host, lanes, protect):
-    """A decode request for ``lanes``, served and retired (Done, then the pump that retires it)."""
-    sim = LeaseSim(host, page, None)
+def _serve(sim, host, lanes, protect):
+    """A decode request for ``lanes``, served, after the eager admissions reached the device (after_host_use)."""
+    sim.sync_bulk()
     req = sim.post(0, lanes, protect=protect)
     assert host.pump() == 1
-    assert sim.wait(req, timeout_s=1.0).served
-    sim.done(req)
-    host.pump()
+    assert sim.wait_served(req, timeout_s=1.0)
 
 
-def _decode_rows(page, host):
+def _decode_rows(sim, host):
     """Decode reads 0, 1, 2, 3 in that order: the tier is full and 0 is the LRU row."""
     for expert in range(4):
-        _serve(page, host, [expert], protect=[expert])
+        _serve(sim, host, [expert], protect=[expert])
 
 
 def _prefill(host, chunks):
@@ -68,8 +65,8 @@ def _resident(host):
 @pytest.mark.parametrize("share, resident", [(0, [6, 7, 8, 9]), (2, [2, 3, 8, 9])])
 def test_decode_rows_survive_a_prefill_that_holds_its_share(tier, share, resident):
     """Mutation: the share is ignored (then the prefill evicts all four decode rows, as with share 0)."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(share)
     _prefill(host, [[4, 5], [6, 7], [8, 9]])
     assert _resident(host) == resident
@@ -77,8 +74,8 @@ def test_decode_rows_survive_a_prefill_that_holds_its_share(tier, share, residen
 
 def test_without_a_share_the_victim_order_is_unchanged(tier):
     """Mutation: share 0 still marks or prefers owned rows."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(0)
     _, evicted = host.assign(0, 4, protected=[4])
     assert evicted == 0
@@ -89,13 +86,13 @@ def test_without_a_share_the_victim_order_is_unchanged(tier):
 
 def test_a_decode_hit_ends_a_rows_prefill_ownership(tier):
     """Mutation: a served demand's hit does not clear ownership (then 5's admission evicts 4, not decode's 1)."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(1)
     _, evicted = host.assign(0, 4, protected=[4])
     assert evicted == 0
     host.set_prefill_share(0)
-    _serve(page, host, [4], protect=[4])  # decode routes 4: it is decode's row now
+    _serve(sim, host, [4], protect=[4])  # decode routes 4: it is decode's row now
     host.set_prefill_share(1)
     _, evicted = host.assign(0, 5, protected=[5])
     assert evicted == 1 and host.contains(0, 4)
@@ -105,15 +102,16 @@ def test_a_decode_hit_ends_a_rows_prefill_ownership(tier):
 
 def test_an_unarmed_touch_ends_ownership_but_a_prefill_touch_does_not(tier):
     """Mutations: the unarmed record keeps ownership; a Python touch under a share clears it."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(1)
     host.assign(0, 4, protected=[4])
     host.touch(0, 4)  # the prefill's own lookup hit
     _, evicted = host.assign(0, 5, protected=[5])
     assert evicted == 4
     host.set_prefill_share(0)
-    post_record(page, 0, [5], armed=False)
+    sim.sync_bulk()
+    sim.post(0, [], protect=[5])
     assert host.pump() == 1
     host.set_prefill_share(1)
     _, evicted = host.assign(0, 6, protected=[6])
@@ -122,8 +120,8 @@ def test_an_unarmed_touch_ends_ownership_but_a_prefill_touch_does_not(tier):
 
 def test_a_python_touch_without_a_share_ends_ownership(tier):
     """Mutation: touch() never clears ownership (then 5 evicts 4)."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(1)
     host.assign(0, 4, protected=[4])
     host.set_prefill_share(0)
@@ -133,31 +131,27 @@ def test_a_python_touch_without_a_share_ends_ownership(tier):
     assert evicted == 1 and host.contains(0, 4)
 
 
-@pytest.mark.parametrize("exclude", ["protected", "hot", "leased"])
-def test_an_owned_row_that_is_protected_hot_or_leased_is_never_the_victim(tier, exclude):
+@pytest.mark.parametrize("exclude", ["protected", "hot"])
+def test_an_owned_row_that_is_protected_or_hot_is_never_the_victim(tier, exclude):
     """Mutation: the owned-row branch skips an exclusion of take_slot_locked (then 4 is evicted)."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(1)
     slot4, evicted = host.assign(0, 4, protected=[4])
     assert evicted == 0
     protected = [5]
     if exclude == "protected":
         protected = [4, 5]
-    elif exclude == "hot":
-        host.set_hot(0, [4])
     else:
-        host.inject_lease(0, slot4, +1)
+        host.set_hot(0, [4])
     _, evicted = host.assign(0, 5, protected=protected)
     assert evicted == 1 and host.contains(0, 4)
-    if exclude == "leased":
-        host.inject_lease(0, slot4, -1)
 
 
 def test_a_freed_owned_slot_is_no_longer_counted(tier):
     """Mutation: release() leaves the slot owned (then the stale count sends 6 to evict the owned 5, not a decode row)."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(1)
     slot4, _ = host.assign(0, 4, protected=[4])
     host.release(0, slot4)
@@ -171,7 +165,7 @@ def test_a_freed_owned_slot_is_no_longer_counted(tier):
 
 def test_a_prefill_takes_free_slots_before_its_own_rows(tier):
     """Mutation: the owned branch runs while a slot is free (then 5 evicts 4 on a cold tier)."""
-    page, host = tier
+    sim, host = tier
     host.set_prefill_share(1)
     for expert in (4, 5, 6):
         _, evicted = host.assign(0, expert, protected=[expert])
@@ -182,13 +176,13 @@ def test_a_prefill_takes_free_slots_before_its_own_rows(tier):
 def test_a_decode_eviction_of_an_owned_row_ends_its_ownership(tier):
     """Mutation: the eviction in take_slot_locked leaves the slot owned (then 8 evicts decode's 6, whose slot
     still reads as prefill-owned, instead of the LRU decode row 2)."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(2)
     _prefill(host, [[4, 5]])  # evicts 0 and 1; 4 and 5 owned
     host.set_prefill_share(0)
-    _serve(page, host, [2, 3], protect=[2, 3])  # 4 and 5 are now the LRU rows
-    _serve(page, host, [6, 7], protect=[6, 7])  # evicts the owned 4 and 5
+    _serve(sim, host, [2, 3], protect=[2, 3])  # 4 and 5 are now the LRU rows
+    _serve(sim, host, [6, 7], protect=[6, 7])  # evicts the owned 4 and 5
     assert _resident(host) == [2, 3, 6, 7]
     host.set_prefill_share(2)
     _, evicted = host.assign(0, 8, protected=[8])
@@ -197,8 +191,8 @@ def test_a_decode_eviction_of_an_owned_row_ends_its_ownership(tier):
 
 def test_a_row_decode_makes_hot_ends_its_ownership(tier):
     """Mutation: set_hot leaves the row owned (then the share reads full and 6 evicts the owned 5, not decode's 1)."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(2)
     _prefill(host, [[4, 5]])  # evicts 0 and 1
     host.set_hot(0, [4])
@@ -207,7 +201,7 @@ def test_a_row_decode_makes_hot_ends_its_ownership(tier):
 
 
 def test_a_negative_share_is_refused(tier):
-    page, host = tier
+    sim, host = tier
     with pytest.raises(RuntimeError, match="negative"):
         host.set_prefill_share(-1)
 
@@ -220,8 +214,8 @@ def test_a_prefetch_fill_stops_at_the_share_and_an_ensure_fill_evicts_the_prefil
     chunk admissions after it (with fallback) evict the prefill's gathered rows, not decode's.
     Mutations: fill_begin claims through take_slot_locked (then the prefetch claims 3 and evicts 0, 1, 2); the stop
     applies to ensure fills too (then 6 is not claimed)."""
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     host.set_prefill_share(2)
     slots, evictions = host.fill_begin(0, [4, 5, 6], protected=[4, 5, 6])
     assert host.fill_end()
@@ -232,8 +226,8 @@ def test_a_prefetch_fill_stops_at_the_share_and_an_ensure_fill_evicts_the_prefil
 
 
 def test_without_a_share_a_prefetch_fill_claims_as_before(tier):
-    page, host = tier
-    _decode_rows(page, host)
+    sim, host = tier
+    _decode_rows(sim, host)
     slots, evictions = host.fill_begin(0, [4, 5, 6], protected=[4, 5, 6])
     assert host.fill_end()
     assert len(slots) == 3 and evictions == 3 and _resident(host) == [3, 4, 5, 6]
