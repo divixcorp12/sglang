@@ -1,5 +1,5 @@
 [Unit]
-Description=Isolated DSV4.1 native CPU expert benchmarks
+Description=Benchmarks on an isolated CPU partition (CPUs 18-33 and siblings 54-69)
 StartLimitIntervalSec=0
 
 [Service]
@@ -14,10 +14,8 @@ ExecStartPre=+/usr/local/libexec/exl3bench-isolation start
 ExecStart=/usr/local/libexec/exl3bench-run
 ExecStopPost=+/usr/local/libexec/exl3bench-isolation stop
 Environment=PATH=/usr/bin:/bin
-Environment=OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE
-Environment=OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
-Environment=EXL3_MOE_CPU_PIN=0 EXL3_MOE_CPU_MAX_ISA=bw EXL3_MOE_CPU_SMALL_WORKERS=0
-Environment=MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+# No benchmark-specific environment here: run.sh exports its own OMP/EXL3 settings, and any other job sets its own
+# (service-env.txt or its script).
 WorkingDirectory=/data/models/exl3_exp/google_benchmark
 NoNewPrivileges=yes
 UMask=0022

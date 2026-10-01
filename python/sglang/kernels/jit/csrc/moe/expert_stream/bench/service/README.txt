@@ -83,7 +83,37 @@ Example short first run, create these as your normal user:
     > /data/models/exl3_exp/google_benchmark/service-args.txt
 
 Start the service, then verify individual worker CPU lists in each process log.
-Remove the two settings files to return to full defaults. Rebuild the benchmark
+Remove the two settings files to return to full defaults.
+
+Any other job
+-------------
+The partition is not tied to this benchmark. To run something else on it, put
+the command in a user-owned file, one literal argument per line (program first;
+blank lines and # comments skipped; no shell parsing, so name a script's
+interpreter explicitly):
+
+  /data/models/exl3_exp/google_benchmark/service-command.txt
+
+  printf '%s\n' /bin/bash /path/to/my_bench.sh --some-flag \
+    > /data/models/exl3_exp/google_benchmark/service-command.txt
+
+While that file exists, the service runs it instead of run.sh; service-args.txt
+and service-rounds.txt are ignored. Remove it to return to the native benchmark.
+The job runs as dnikolaidis in the isolated partition (CPUs 18-33 and siblings
+54-69, NUMA node 1; memory nodes 0-1), with PATH=/usr/bin:/bin and working
+directory /data/models/exl3_exp/google_benchmark. It gets a fresh directory in
+EXL3BENCH_RESULTS (the journal prints it) and the CPU list in EXL3BENCH_CPUS.
+Pin its threads inside that list itself.
+
+Optional environment for any job, one NAME=VALUE per line, exported literally:
+
+  /data/models/exl3_exp/google_benchmark/service-env.txt
+
+  printf '%s\n' PYTHONPATH=/data/models/slang/sglang/python OMP_NUM_THREADS=16 \
+    > /data/models/exl3_exp/google_benchmark/service-env.txt
+
+The unit sets no OMP/EXL3 variables of its own; run.sh exports the native
+benchmark's. Rebuild the benchmark
 with CMake before starting if source changed; the service does not compile.
 The installed launcher points to this checkout's bench/run.sh. If moving that
 checkout, rerun the installer while the service is stopped to update its path.

@@ -11,7 +11,11 @@ runner=$(realpath "$source_dir/../run.sh")
 root=/data/models/exl3_exp/google_benchmark
 legacy=/sys/fs/cgroup/exl3bench.scope
 release_legacy=false
-[[ -f $runner && -x $root/build/exl3_cpu_baseline && -x $root/build/exl3_cpu_optimized ]]
+[[ -f $runner ]]
+# Only the default job (run.sh, no service-command.txt) needs these; any other job brings its own program.
+if [[ ! -x $root/build/exl3_cpu_baseline || ! -x $root/build/exl3_cpu_optimized ]]; then
+    echo "Note: $root/build has no exl3_cpu_{baseline,optimized}; the default benchmark fails until built." >&2
+fi
 id dnikolaidis >/dev/null
 if systemctl is-active --quiet exl3bench.service; then
     echo 'Stop exl3bench.service before updating its installed files.' >&2; exit 1;
@@ -63,7 +67,8 @@ if $release_legacy; then
     trap - EXIT
     echo 'Released the old scope reservation; its shell was not killed.'
 fi
-echo 'Installed. Open a new login or use newgrp exl3bench, then:'
+echo "Installed. The job is $root/service-command.txt (one argument per line), else the native CPU benchmark."
+echo 'Open a new login or use newgrp exl3bench, then:'
 echo '  systemctl --no-ask-password start exl3bench.service'
 echo '  journalctl -fu exl3bench.service'
 echo '  systemctl --no-ask-password stop exl3bench.service'

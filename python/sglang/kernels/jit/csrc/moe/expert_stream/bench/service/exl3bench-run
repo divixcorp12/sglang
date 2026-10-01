@@ -1,30 +1,59 @@
 #!/bin/bash
-# This launcher is installed root-owned but always executes as dnikolaidis.
+# This launcher is installed root-owned but always executes as dnikolaidis, inside the isolated partition.
+# It runs the job named in service-command.txt, or without that file the native CPU expert benchmark (run.sh).
 set -euo pipefail
 [[ $EUID != 0 ]] || { echo 'Refusing to run the benchmark as root.' >&2; exit 1; }
 [[ $(< /proc/self/cgroup) == '0::/exl3bench.service' ]] || {
     echo 'Launcher must run within exl3bench.service.' >&2; exit 1;
 }
 cg=/sys/fs/cgroup/exl3bench.service
+cpus=18-33,54-69
 [[ $(< "$cg/cpuset.cpus.partition") == isolated ]]
-[[ $(< "$cg/cpuset.cpus.effective") == 18-33,54-69 ]]
+[[ $(< "$cg/cpuset.cpus.effective") == "$cpus" ]]
 [[ $(< "$cg/cpuset.mems.effective") == 0-1 ]]
 [[ ${INVOCATION_ID:-} =~ ^[0-9a-f]{32}$ ]] || { echo 'Missing systemd invocation ID.' >&2; exit 1; }
 root=/data/models/exl3_exp/google_benchmark
 runner=@BENCH_RUNNER@
-args=()
-if [[ -f $root/service-args.txt ]]; then
-    # One literal argument per line. Never source or eval the user-owned file.
-    while IFS= read -r arg || [[ -n $arg ]]; do
-        [[ -z $arg || $arg == \#* ]] || args+=("$arg")
-    done < "$root/service-args.txt"
+results="$root/service-$(date +%Y%m%d-%H%M%S)-$INVOCATION_ID"
+
+# One literal entry per line; blank lines and # comments skipped. Never source or eval the user-owned files.
+read_lines() {
+    local file=$1 line
+    lines=()
+    [[ -f $file ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line || $line == \#* ]] || lines+=("$line")
+    done < "$file"
+}
+
+read_lines "$root/service-env.txt"
+for assignment in "${lines[@]}"; do
+    [[ $assignment =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || {
+        echo "service-env.txt: not a NAME=VALUE line: $assignment" >&2; exit 1;
+    }
+    export "$assignment"
+done
+
+if [[ -f $root/service-command.txt ]]; then
+    read_lines "$root/service-command.txt"
+    command=("${lines[@]}")
+    [[ ${#command[@]} -gt 0 ]] || { echo 'service-command.txt names no program.' >&2; exit 1; }
+    mkdir "$results"
+    export EXL3BENCH_RESULTS=$results EXL3BENCH_CPUS=$cpus
+    printf 'Job:'
+    printf ' %q' "${command[@]}"
+    printf '\n'
+    echo "Benchmark output: $results"
+    exec "${command[@]}"
 fi
+
+read_lines "$root/service-args.txt"
+args=("${lines[@]}")
 rounds=8
 if [[ -f $root/service-rounds.txt ]]; then
     read -r rounds < "$root/service-rounds.txt" || [[ -n $rounds ]]
 fi
 [[ $rounds =~ ^[1-9][0-9]*$ ]] || { echo 'service-rounds.txt must contain a positive integer.' >&2; exit 1; }
 export EXL3_BENCH_ROUNDS=$rounds
-results="$root/service-$(date +%Y%m%d-%H%M%S)-$INVOCATION_ID"
 echo "Benchmark output: $results"
 exec /bin/bash "$runner" "$root/build" "$results" "${args[@]}"
