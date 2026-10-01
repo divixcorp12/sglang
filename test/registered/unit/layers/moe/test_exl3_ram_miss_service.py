@@ -290,7 +290,7 @@ def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_ho
     cache.ensure_rows(torch.tensor([1, 2]))  # full (capacity 3); 0 is the LRU-oldest row
     # Chunk 1 promoted 0 into VRAM: the hot cache holds it; no listener push has run yet.
     streamers[0].hot_cache = SimpleNamespace(slot_to_expert=[0, -1])
-    assert cache.evictable_rows() == 2  # is_pinned already protects 0
+    assert cache.evictable_rows() == 3  # the tier's 4 slots, less 0, which is_pinned already protects
     cache.ensure_rows(torch.tensor([4]))  # chunk 2's admission
     assert [_holds(service.host, row, e) for e in (0, 1, 2, 4)] == [True, False, True, True]
 
@@ -427,7 +427,7 @@ def test_router_capture_rides_the_route_log_only_when_its_path_is_set(tiers, mon
     log = service.route_log
     assert all(streamer.row_backend.route_log is log for streamer in streamers.values())
     if not router:
-        assert log.router is None and log.depth == 64 and len(log._ring()) == 4
+        assert log.router is None and log.depth == 64 and len(log._ring()) == 5  # the ring, and the updater's hot bank
         return
     assert log.router.prefix == prefix and log.depth == 32
     assert log.router_x is None  # sized by the first warmup forward's record_router
