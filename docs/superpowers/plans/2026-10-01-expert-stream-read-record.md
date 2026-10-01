@@ -1384,3 +1384,17 @@ git push origin expert-stream-read-record
 ## Results
 
 (Filled in by Tasks 1, 3, 4, 5, 6 and 7: command, then number.)
+
+Bench: `bench_exl3_service_read.py --cpu-core 17 --perf` from `test/manual/dsv41`, under `cc-gpu.lock` and
+`taskset -c 36-52`, nothing else on the box. Span = the stage trace's `done - observed`. Perf counts are the service
+thread's user-mode events per post, and include its idle polling between posts (100 us gap).
+
+**base** (e732163d16; service path as 6166309231)
+- PAUSE: 38.6 ns.
+- Span (ns), three runs: median 419 / 416 / 414; p10 393 / 389 / 380; p90 467 / 466 / 462; p99 600 / 673 / 598.
+- Overruns in the window: 0, 0, 0.
+- Per post: instructions 200726 / 197660 / 197897 (mostly the idle poll); branch misses 16.4 / 15.2 / 16.3;
+  memory-ordering clears 0.04 / 0.07 / 0.05; L3 hits 1.97 / 2.00 / 2.07 (all xsnp_none); local DRAM 0.03; remote
+  DRAM 0.00. The record's lines arrive in the L3 (DDIO), not DRAM.
+- Suite at 6166309231: 1218 passed, 2 failed, 22 skipped. The census (fixed in e732163d16) and the seqlock stress's
+  acceptance floor (87 < 100, torn 0; 3/3 pass alone). GPU tests: 24 passed.
