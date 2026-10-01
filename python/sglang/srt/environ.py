@@ -1272,6 +1272,9 @@ class Envs:
     # separately cached extension; with both off the build is upstream's.
     SGLANG_EXL3_CPU_ACT_RESIDUAL = EnvBool(False)
     SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)
+    # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
+    # (exl3_ext.check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
+    SGLANG_EXL3_CPU_CXX = EnvStr("")
 
     # ===================================================================
     # Humming quantization

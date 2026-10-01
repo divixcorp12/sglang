@@ -38,22 +38,42 @@ def optimized_cpu(defines: list[str]) -> bool:
     return "-DEXL3_MOE_CPU_ACT_RESIDUAL=1" in defines and "-DEXL3_MOE_CPU_ACT_BLOCK=128" in defines
 
 
+def cpu_compiler() -> str:
+    """The optimized CPU kernel's compiler: SGLANG_EXL3_CPU_CXX, else CXX, else c++."""
+    return envs.SGLANG_EXL3_CPU_CXX.get() or os.environ.get("CXX", "c++")
+
+
 def check_cpu_compiler() -> None:
     """The recorded winning arithmetic and OpenMP unrolling were validated with GCC 15."""
-    compiler = os.environ.get("CXX", "c++")
+    compiler = cpu_compiler()
     version = subprocess.check_output([compiler, "-dumpfullversion", "-dumpversion"], text=True).strip()
     if version.split(".", 1)[0] != "15":
         raise RuntimeError(
             f"optimized EXL3 CPU experts require GCC 15; {compiler} reports {version}. "
-            "Set CXX to your GCC 15 g++ before building the extension."
+            "Set SGLANG_EXL3_CPU_CXX (or CXX) to your GCC 15 g++ before building the extension."
         )
     identity = subprocess.check_output([compiler, "--version"], text=True)
     if "clang" in identity.lower():
         raise RuntimeError("optimized EXL3 CPU experts require GCC 15, rather than Clang")
 
 
+OPTIMIZED_CPU_DEFINES = ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"]  # as exl3_cpu/optimized/build.py
+
+
 def cpu_act_defines() -> list[str]:
-    """Compiler defines for the CPU kernel's activation quantization options; empty when both are off."""
+    """Compiler defines for the CPU kernel's activation quantization options; empty when both are off.
+
+    With SGLANG_DSV41_CPU_EXPERTS the CPU experts run only the optimized kernel (exl3_cpu/optimized), so the
+    defines are always its residual/128 pair; a flag explicitly set to anything else is refused."""
+    if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        residual, block = envs.SGLANG_EXL3_CPU_ACT_RESIDUAL, envs.SGLANG_EXL3_CPU_ACT_BLOCK
+        if (residual.is_set() and not residual.get()) or (block.is_set() and block.get() != 128):
+            raise ValueError(
+                "SGLANG_DSV41_CPU_EXPERTS builds the optimized EXL3 CPU kernel (SGLANG_EXL3_CPU_ACT_RESIDUAL=1, "
+                f"SGLANG_EXL3_CPU_ACT_BLOCK=128), but residual={residual.get()} block={block.get()} are set: "
+                "unset them or set those values"
+            )
+        return list(OPTIMIZED_CPU_DEFINES)
     defines = []
     if envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get():
         defines.append("-DEXL3_MOE_CPU_ACT_RESIDUAL=1")
@@ -126,14 +146,28 @@ def exl3_ext():
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
     from torch.utils.cpp_extension import load
 
-    return load(
-        name="sglang_exl3_ext" + flavor,
-        sources=extension_sources(ext_dir, OPTIMIZED_CPU_KERNEL if optimized else VENDORED_CPU_KERNEL if flavor else None),
-        # The generic vendored kernel uses the upstream CPU header; optimized has its own.
-        extra_include_paths=[ext_dir] + ([os.path.join(ext_dir, "cpu")] if flavor else []),
-        extra_cflags=_EXTRA_CFLAGS + defines + (["-march=native", "-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
-        extra_ldflags=["-fopenmp"] if optimized else [],
-        extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,
-        build_directory=build_dir,
-        verbose=False,
-    )
+    # load() reads CXX from the environment; the GCC 15 compiler is set for this build only and restored after.
+    saved_cxx = os.environ.get("CXX")
+    if optimized:
+        os.environ["CXX"] = cpu_compiler()
+    try:
+        return load(
+            name="sglang_exl3_ext" + flavor,
+            sources=extension_sources(
+                ext_dir, OPTIMIZED_CPU_KERNEL if optimized else VENDORED_CPU_KERNEL if flavor else None
+            ),
+            # The generic vendored kernel uses the upstream CPU header; optimized has its own.
+            extra_include_paths=[ext_dir] + ([os.path.join(ext_dir, "cpu")] if flavor else []),
+            extra_cflags=_EXTRA_CFLAGS
+            + defines
+            + (["-march=native", "-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
+            extra_ldflags=["-fopenmp"] if optimized else [],
+            extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,
+            build_directory=build_dir,
+            verbose=False,
+        )
+    finally:
+        if saved_cxx is None:
+            os.environ.pop("CXX", None)
+        else:
+            os.environ["CXX"] = saved_cxx
