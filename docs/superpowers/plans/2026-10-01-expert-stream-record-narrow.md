@@ -1480,3 +1480,26 @@ EOF
 ## Results
 
 (Filled in by Tasks 1, 4, 5, 6, 7 and 8: command, then number.)
+
+Command: `divix01:/data/models/slang/nvfp4-work/record-narrow/gpu_check.sh <wt> <label>`. SASS counts are static, over
+the post kernel's non-PDL function section. Kernel medians come from nsys `cuda_gpu_kern_sum` with `--iters 5000`.
+us/post is eager wall time, so it includes launch overhead.
+
+Registered suite: `PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 python -m pytest
+test/registered/unit/kernels -q -p no:randomly`.
+
+**base** (7e9d1ccbfa)
+- Hits: median 7776 ns, 15.25 us/post.
+- Delta: median 36416 ns, 57.64 us/post.
+- SASS: 41 LDG.E.STRONG.SYS, 2 LDG.E.64, 1 STG.E.128, 4 STG.E.STRONG.SYS, 16 STG.E.U8, 5 MEMBAR.ALL.SYS,
+  1 MEMBAR.SC.SYS, 6 CCTL.IVALL.
+- GPU tests: 19 passed.
+- Suite: 1216 passed, 22 skipped, EXIT=0.
+
+**record** (af5b31c5d2)
+- Hits: median 7264 ns, 13.57 us/post.
+- Delta: median 34240 ns, 54.45 us/post.
+- SASS: 41 LDG.E.STRONG.SYS, 2 LDG.E.64, 8 STG.E.128, 1 STG.E.64, 4 STG.E.STRONG.SYS, 16 STG.E.U8,
+  5 MEMBAR.ALL.SYS, 1 MEMBAR.SC.SYS, 6 CCTL.IVALL. No ATOM or CAS.
+- GPU tests: 22 passed (19 + the three Task 2 refusals).
+- Suite: 1218 passed, 22 skipped, EXIT=0.
