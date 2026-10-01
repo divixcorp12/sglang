@@ -6,33 +6,10 @@
 namespace sglang {
 namespace expert_stream {
 
-// Pumps one RamTier on its own thread (plan D19); spins with _mm_pause() for spin_ns after the last request, else
-// sleeps 50 us between polls. The spin is an idle-poll budget calibrated once in start() (idle_budget), so the thread
-// reads no clock while it serves (spec M8). pause() is a handshake: it returns once the loop has acknowledged the
-// pause between two requests. While paused the loop takes no request, so an eager caller owns the slots until
-// resume().
-//
-// Ownership (plan 2026-09-29-hotpath-zero-overhead Task 13, the single-owner rule): the tier has one owner at a time,
-// and pause()/resume() are the handoff. The happens-before edges:
-//   - service -> caller: the loop drains the command ring, then stores parked_epoch_ (release); pause() loads it
-//     (acquire), then sets the tier's parked_ (release), which later Python callers acquire in caller_owns().
-//   - caller -> service: resume() clears parked_, then stores pause_epoch_ (release); the parked loop loads it
-//     (acquire) before it touches the tier again.
-//   - stop(): the join orders every service write before stop()'s release of threaded_ (plan F14). A prefill fill a
-//     pausing caller left running is joined by stop_thread's final settle (RamTier::final_settle), under
-//     caller_mutex(), before it drains and settles: the fill thread writes no tier state, so that join is the only
-//     edge it needs.
-// Each pause has its own epoch (odd while requested), so a pause that follows a resume at once can never take the
-// previous pause's acknowledgement for its own while the service is already running again. pause() and resume() take
-// the tier's caller_mutex(); the service thread never does.
-//
-// The watchdog (plan D15), on its own thread so a stuck read cannot silence it, aborts the process when one demand or
-// fill stays in service for fatal_wait (a hung read): it times how long one busy episode (RamTier::busy_episode)
-// persists, so the clock is read on the watchdog thread only (D6). It outlives the service thread's join in stop(), so
-// a stop during a hung read still ends in its abort. It is also the copy wait's deadline: a gate that stays closed on
-// one value for longer than the copy-wait timeout aborts the process (a copy thread stuck in a driver call).
-// pause()/resume() are not reentrant: their one owner is the slot table's depth counter
-// (Task 14), which calls pause at depth 0->1 and resume at 1->0.
+// Pumps one RamTier on its own thread: spins with _mm_pause() for spin_ns after the last request, else sleeps 50 us
+// between polls. The spin is an idle-poll budget calibrated once in start() (idle_budget), so the thread reads no
+// clock while it serves. The tier has one owner at a time (this thread, or a caller that paused it); pause()/resume()
+// are the handoff, and the edges are documented at each.
 template <class Tier>
 class RamThread {
  public:
@@ -50,11 +27,11 @@ class RamThread {
 
   // Throws when the thread cannot be pinned to cpu_core (it is then joined, never left floating), and refuses a tier
   // whose prefill fill (begun in pump mode) still owes its epilogue: the service would then share the reader with the
-  // fill thread (the serialized issuers, spec 6.2/D8), and the epilogue would run off the owner. It refuses rather than
-  // joins: the FFI's start_thread holds the registry lock, and a join there would stall every handle's calls behind a
-  // slow or hung fill read; fill_end() first is the caller's to do. Under caller_mutex(), which also orders the
-  // set_parked/set_threaded writes below against every Python caller. The service thread never takes it, so holding
-  // it across the thread's start and pin handshake cannot deadlock.
+  // fill thread, and the epilogue would run off the owner. It refuses rather than joins: the FFI's start_thread holds
+  // the registry lock, and a join there would stall every handle's calls behind a slow or hung fill read; fill_end()
+  // first is the caller's to do. Runs under caller_mutex(), which orders the set_parked/set_threaded writes below
+  // against every Python caller; the service thread never takes it, so holding it across the pin handshake cannot
+  // deadlock.
   void start() {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
     if (tier_->fill_owed()) {
@@ -82,8 +59,11 @@ class RamThread {
   // The watchdog is stopped only after the service thread has joined: a join that blocks
   // on a hung read is then aborted by its stuck rule instead of hanging the process.
   //
-  // Plan F14: no caller_mutex() here. A caller waiting for a snapshot holds it, and that caller must see threaded_
-  // clear to drain the queue itself; the service's last act is a final drain (run()), and the join orders it first.
+  // No caller_mutex() here: a caller waiting for a snapshot holds it, and that caller must see threaded_ clear to drain
+  // the queue itself; the service's last act is a final drain (run()), and the join orders every service write before
+  // stop()'s release of threaded_. A prefill fill a pausing caller left running is joined by stop_thread's final settle
+  // (RamTier::final_settle), under caller_mutex(), before it drains and settles; the fill thread writes no tier state,
+  // so that join is the only edge it needs.
   void stop() {
     stop_.store(true);
     if (thread_.joinable()) thread_.join();
@@ -94,6 +74,12 @@ class RamThread {
 
   // 1 paused, 0 timed out, 2 refused: the copy thread still has a job after the wait (the caller must have
   // synchronized the stream, so every copy wait has seen its CopyDone), and the slots are not the caller's.
+  // While paused the loop takes no request, so the caller owns the tier until resume(). Edge service -> caller: the loop
+  // drains the command ring, then stores parked_epoch_ (release); pause() loads it (acquire), then sets the tier's
+  // parked_ (release), which later Python callers acquire in caller_owns(). Each pause has its own epoch (odd while
+  // requested), so a pause right after a resume cannot take the previous pause's acknowledgement for its own. pause()
+  // and resume() take caller_mutex(); the service thread never does. Not reentrant: their one owner is the slot
+  // table's depth counter (pause at depth 0->1, resume at 1->0).
   int pause(int64_t timeout_ns) {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
     const uint64_t epoch = (pause_epoch_.load(std::memory_order_relaxed) | 1u) + 2u;  // a new odd epoch
@@ -185,11 +171,16 @@ class RamThread {
         std::this_thread::sleep_for(std::chrono::microseconds(50));  // the idle path (spec L12): kept
       }
     }
-    // Plan F14: a command queued after the last iteration's drain is answered here, not left to a waiting caller.
+    // A command queued after the last iteration's drain is answered here, not left to a waiting caller.
     if (!stopped_parked) tier_->drain_commands();
     tier_->set_counter(kRunning, 0);
   }
 
+  // Aborts the process when one demand or fill stays in service for fatal_wait (a hung read), timed as one busy episode
+  // (RamTier::busy_episode). It is also the copy wait's deadline: a gate that stays closed on one value for longer than
+  // the copy-wait timeout means a copy thread stuck in a driver call, and the device's wait must still end. It runs on
+  // its own thread so a stuck read cannot silence it, and stop() joins it after the service thread, so a stop during a
+  // hung read still ends in its abort.
   void watch() {
     uint64_t episode = 0;       // the busy episode last seen, 0: idle
     int64_t episode_since = 0;  // when the watchdog first saw it
@@ -197,9 +188,8 @@ class RamThread {
     int64_t gate_since = 0;
     while (!watch_stop_.load()) {
       const int64_t now = now_ns();
-      // D6: the clock is read here, every 20 ms, never by the service. One episode held past fatal_wait is a hung
-      // request; detection is at most 20 ms late against a 30 s deadline. The copy wait's deadline lives here too,
-      // not on the copy thread: a copy thread stuck in a driver call must still end the device's wait.
+      // The clock is read here, every 20 ms, never by the service. One episode held past fatal_wait is a hung
+      // request; detection is at most 20 ms late against a 30 s deadline.
       const uint64_t busy = tier_->busy_episode();
       if (busy != episode) {
         episode = busy;

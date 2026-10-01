@@ -15,7 +15,7 @@ struct Tier {
   std::vector<int32_t> expert_slot;  // assigned slot (READY) or -1
   std::vector<uint8_t> hot;
   std::vector<uint8_t> filling;      // a prefill fill is still writing this kReady slot: never a victim, never released
-  // Prefill share (plan 2026-09-25-dsv41-prefill-eviction): 1 while a row a prefill admitted has not been used by
+  // Prefill share: 1 while a row a prefill admitted has not been used by
   // decode. `owned` counts them. Only take_admit_slot_locked sets it, so it stays all zero with the share off.
   std::vector<uint8_t> prefill_owned;
   int64_t owned = 0;
@@ -34,9 +34,9 @@ struct VictimCensus {
   int64_t evictable = 0;  // READY, not hot, not requested, not filling
 };
 
-// The pinned-slot bookkeeping of every streamed layer (plan D12) and the service of one
-// request at a time. pump_demand is called by one caller at a time: a test's pump(), or the Task 12 thread. The Python-facing methods follow the single-owner rule (plan
-// 2026-09-29-hotpath-zero-overhead Task 13), stated at "Python-facing bookkeeping" below.
+// The pinned-slot bookkeeping of every streamed layer and the service of one request at a time. pump_demand is called
+// by one caller at a time: a test's pump(), or the service thread. The Python-facing methods follow the single-owner
+// rule, stated at "Python-facing bookkeeping" below.
 template <class Source>
 class RamTier {
  public:
@@ -81,7 +81,7 @@ class RamTier {
     init_lease_block(lease_bytes);
     // The service streams every miss lane piece by piece: the reader must publish pieces.
     reader_.set_piece_stream(true);
-    // The request path's buffers, sized once (spec A2, A10): nothing on it grows after construction.
+    // The request path's buffers, sized once: nothing on it grows after construction.
     hot_scratch_.assign(static_cast<size_t>((experts_ + 7) / 8), 0);
     packed_.reserve(kWanted);
     piece_targets_.reserve(kWanted);
@@ -108,7 +108,8 @@ class RamTier {
   uint8_t* page() const {
     return page_;
   }
-  // The watchdog's hung-request marker (D6): nonzero while a demand or a fill is in service, a new value per episode. The watchdog thread times how long one value persists; the service reads no clock for it.
+  // The watchdog's hung-request marker: nonzero while a demand or a fill is in service, a new value per episode. The
+  // watchdog thread times how long one value persists; the service reads no clock for it.
   uint64_t busy_episode() const {
     return busy_.load(std::memory_order_acquire);
   }
@@ -117,11 +118,11 @@ class RamTier {
     core_.set(index, value);
   }
 
-  // Counters (plan 2026-09-29-hotpath-zero-overhead D1). A core counter (is_core_counter) lives in the writing thread's
-  // own line-private block: count() is the tier's owner's (the service thread, or the caller owning the tier while it
-  // is paused or pumped: one writer at a time, handed over by the same edges as the tier), copy_count() the copy
-  // thread's. The prefill fill thread counts nothing: its epilogue runs on the owner (finish_fill_owned, Task 15).
-  // Every other counter is a metric: InstrBuild keeps it as a shared relaxed atomic, ProdBuild has none.
+  // Counters. A core counter (is_core_counter) lives in the writing thread's own line-private block: count() is the
+  // tier's owner's (the service thread, or the caller owning the tier while it is paused or pumped: one writer at a
+  // time, handed over by the same edges as the tier), copy_count() the copy thread's. The prefill fill thread counts
+  // nothing: its epilogue runs on the owner (finish_fill_owned). Every other counter is a metric: InstrBuild keeps it
+  // as a shared relaxed atomic, ProdBuild has none.
   template <Counter K>
   void count(int64_t n = 1) {
     count_into<K>(core_, n);
@@ -133,13 +134,13 @@ class RamTier {
   bool threaded() const {
     return threaded_.load();
   }
-  // RamThread::start before the thread exists, and RamThread::stop after its join (plan F14): the join is what makes
+  // RamThread::start before the thread exists, and RamThread::stop after its join: the join is what makes
   // every tier write of the service thread visible, and this release hands that on to a caller's caller_owns().
   void set_threaded(bool threaded) {
     threaded_.store(threaded, std::memory_order_release);
   }
 
-  // ---- The single owner (plan 2026-09-29-hotpath-zero-overhead Task 13; see "Python-facing bookkeeping") ----
+  // ---- The single owner (see "Python-facing bookkeeping") ----
 
   static constexpr int kMaxHotWords = 16;  // set_hot's bitmap: 1024 experts
 
@@ -185,10 +186,10 @@ class RamTier {
 
   // A Python-side call that needs the tier. It runs here when this caller owns the tier (after anything queued before
   // the handoff); otherwise it is queued for the service (drain_commands), and every kind but kSetHot waits for its
-  // answer. The ring's producer is whoever holds caller_mutex_. If the service stops before it drains the queue, the
-  // caller then owns the tier and drains it itself (stop() clears threaded_ after the join without caller_mutex_, plan
-  // F14): nothing queued is left unanswered. A service alive but hung in a read is aborted by the watchdog (D6).
-  // The service cannot park meanwhile: a pause takes caller_mutex_, which this caller holds.
+  // answer. If the service stops before it drains the queue, the caller then owns the tier and drains it itself (stop()
+  // clears threaded_ after the join, without caller_mutex_), so nothing queued is left unanswered; a service hung in a
+  // read is aborted by the watchdog. The service cannot park meanwhile: a pause takes caller_mutex_, which this caller
+  // holds.
   void run_as_owner(Command command) {
     std::atomic<uint32_t> done{0};
     std::string error;
@@ -231,9 +232,8 @@ class RamTier {
   bool pump_demand() {
     const uint32_t head = load_acquire(page_ + kDemandHead);
     const bool posted = head != 0 && reached(head, next_demand_);
-    // Commands a caller queued before it posted this demand are applied before it is served: the demand head's
-    // acquire above made the caller's earlier push visible. The loop drains between requests too (RamThread::run).
-    // Pump mode queues nothing (its caller owns the tier), so only the service thread looks.
+    // Commands a caller queued before posting this demand are applied first (the demand head's acquire above made the
+    // push visible); pump mode queues nothing, so only the service thread looks.
     if (posted) drain_commands_on_service();
     if (admission_closed_.load()) return false;
     if (!posted) return false;
@@ -284,7 +284,7 @@ class RamTier {
   // ---- Stage trace: one StageRecord per served request, drained by Python ----
 
   // Allocates the ring, then turns the trace on. Before the service thread starts, so the flag
-  // never flips under a request being served. The instrumented build only (spec M9).
+  // never flips under a request being served. The instrumented build only.
   void enable_trace(size_t capacity) {
     if constexpr (!Build::kMetrics) {
       (void)capacity;
@@ -320,7 +320,7 @@ class RamTier {
     }
   }
 
-  // ---- Python-facing bookkeeping: the single-owner rule (plan 2026-09-29-hotpath-zero-overhead Task 13) ----
+  // ---- Python-facing bookkeeping: the single-owner rule ----
   //
   // Everything in the tier but its atomics has exactly one owner at a time: the service thread while it runs; the
   // Python caller that paused it, from the moment the service parks until resume() (RamThread::pause sets parked_);
@@ -332,10 +332,9 @@ class RamTier {
   // On the owner every one of them runs directly, after draining whatever an earlier caller queued.
   //
   // caller_mutex_ serializes Python-side callers against each other only; the service, copy and fill threads never
-  // take it. The tier has no other lock (Task 15): single ownership is what keeps its state consistent. The copy
-  // thread touches no tier state (it publishes CopyDone and the gate only), nor does the prefill
-  // fill thread (Task 15: it drives the reader and publishes fill_landed_/fill_state_; its epilogue runs on the owner,
-  // finish_fill_owned, after the join).
+  // take it, and the tier has no other lock. The copy thread touches no tier state (it publishes CopyDone and the gate
+  // only), nor does the prefill fill thread (it drives the reader and publishes fill_landed_/fill_state_; its epilogue
+  // runs on the owner, finish_fill_owned, after the join).
 
   bool has(int64_t row, int64_t expert) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
@@ -395,17 +394,16 @@ class RamTier {
     count<kVersion>();
   }
 
-  // ---- Prefill fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS, plan 2026-09-25-dsv41-prefill-fills) ----
+  // ---- Prefill fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS) ----
   //
-  // An eager caller that holds the pause (or pumps, with no thread) claims slots for `experts` of `row` in order, until
-  // one cannot be taken (take_slot_locked: never a hot, staging or filling row, and a `protect`ed one only with
-  // `fallback`), and one helper thread reads the claimed rows through the service's reader while the caller gathers.
-  // A claimed slot is kReady and mapped at once, as assign() leaves it, and flagged filling until the read ends: no
-  // admission can evict it and release() refuses it. The read's progress publishes how many rows have landed, as a
-  // prefix of the claim order (fill_wait). The helper holds a busy episode, so the watchdog aborts a hung fill the way
-  // it aborts a hung demand. fill_end() joins it; the service thread's resume() joins it first too, so the service
-  // thread and a fill never use the reader at once. The helper touches no tier state (ownership rule 3): the claimed
-  // slots stay filling, and a failed fill's unlanded rows stay mapped, until the owner joins it and runs the epilogue
+  // fill_begin: an eager caller that holds the pause (or pumps, with no thread) claims slots for `experts` of `row` in
+  // order, until one cannot be taken (take_slot_locked), and one helper thread reads the claimed rows through the
+  // service's reader while the caller gathers. A claimed slot is kReady and mapped at once, as assign() leaves it, and
+  // flagged filling until the read ends: no admission can evict it and release() refuses it. The read's progress
+  // publishes how many rows have landed, as a prefix of the claim order (fill_wait). The helper holds a busy episode,
+  // so the watchdog aborts a hung fill the way it aborts a hung demand. fill_end() joins it, and so does resume(), so
+  // the service thread and a fill never use the reader at once. The helper touches no tier state: the claimed slots
+  // stay filling, and a failed fill's unlanded rows stay mapped, until the owner joins it and runs the epilogue
   // (fill_join, finish_fill_owned). Returns the count claimed; slots[i] is expert i's slot.
   int64_t fill_begin(
       int64_t row,
@@ -477,13 +475,11 @@ class RamTier {
   }
 
   // Joins the fill: 1 when every claimed row landed (or nothing was claimed), 0 when it failed; a failed fill has
-  // released its rows that did not land (here, on the caller: finish_fill_owned). Under caller_mutex_, like every
-  // other join of fill_thread_ (resume, stop_thread's final_settle), so no two threads join it at once. The caller
-  // owns the tier whenever an epilogue is owed: a fill starts only on the owner (fill_begin), and resume() joins it
-  // before it hands the tier back.
-  //
-  // An owed epilogue writes the tier (finish_fill_owned), so a caller that does not own it is refused, not let race the
-  // service. RamThread::start refuses a tier with a fill owed, so this is the backstop, not the gate.
+  // released its rows that did not land (here, on the caller: finish_fill_owned). Under caller_mutex_, like every other
+  // join of fill_thread_ (resume, stop_thread's final_settle), so no two threads join it at once. An owed epilogue
+  // writes the tier, so a caller that does not own it is refused, not let race the service (a fill starts only on the
+  // owner, and resume() joins it before handing the tier back). RamThread::start refuses a tier with a fill owed, so
+  // this is the backstop, not the gate.
   int64_t fill_end() {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     if (fill_unfinished_) require_owner("fill_end with a prefill fill's epilogue owed");
@@ -518,7 +514,7 @@ class RamTier {
     gpu_hot_mode_.store(on);
   }
 
-  // The hot bitmap of `expected`'s record, copied into the service-owned hot_scratch_ (spec A2): not const, it writes
+  // The hot bitmap of `expected`'s record, copied into the service-owned hot_scratch_: not const, it writes
   // that scratch. request->hot_bitmap points into it until the next call.
   bool read_gpu_hot(uint32_t expected, Request* request) {
     if (hot_page_ == nullptr) return false;
@@ -631,7 +627,7 @@ class RamTier {
     store_release(lease_ + kCopyArmed, on ? 1u : 0u);
   }
 
-  // CPU experts (plan 2026-09-29-dsv41-cpu-experts, "Step B"). The device types a captured post's CPU lanes: the
+  // CPU experts. The device types a captured post's CPU lanes: the
   // last split[n] of its n eligible lanes (kSplit, which this and set_cpu_split write). The copy thread hands them to
   // the CPU expert thread, so CopyDone covers them. Needs the copy engine; call before the service thread starts.
   void enable_cpu_experts(CpuExpertConfig config, std::vector<int64_t> split) {
@@ -806,10 +802,10 @@ class RamTier {
     });
   }
 
-  // A snapshot: the READY slots' experts, least recently used first; returns how many. Its vector allocates on the
-  // owner: between requests, or -- when it is queued while the service runs unpaused -- mid-read, from read()'s
-  // progress hook (answer_snapshots). Production calls it only while paused (NativePinnedSlotTable, inside
-  // host_use()), where the caller is the owner and nothing is being served; an unpaused call is test-only.
+  // A snapshot: the READY slots' experts, least recently used first; returns how many. Production calls it only while
+  // paused (NativePinnedSlotTable, inside host_use()), where the caller is the owner and nothing is being served. An
+  // unpaused call is test-only; its vector then allocates mid-read on the service, from read()'s progress hook
+  // (answer_snapshots).
   int64_t lru_order(int64_t row, int64_t* out) {
     row_capacity(row);
     return snapshot(row, out, nullptr, [](RamTier* self, const Command& c) -> int64_t {
@@ -862,16 +858,15 @@ class RamTier {
     }
   }
 
-  // Test only: carry a whole ReadFault down to this tier's reader, where inject() reaches it only as a
-  // delay or a blanket failure. `words` is the reader tests' fault tensor (kFaultWords
-  // int64; see fault_from). Unlike fail_reads the fault does NOT short-circuit ahead of the reader: the read
-  // runs, so the fault's part errors, pack delay and the rest act on rows that have already packed. The
-  // service thread applies it just before its next read (the reader is that thread's alone), and it then
-  // stays until replaced; an all-default tensor clears it. Words 17-18 (abandon_after, step) and 22
-  // (piece_stream) are not faults and are ignored, and words 19-20 (formerly pack_workers, pack_split) are reserved:
-  // the tier's reader always streams pieces. The reader's counters (submit and
-  // completion calls) run over the reader's whole life, so a call-numbered fault (submit_call, cqe_call) is relative to
-  // a fresh tier. InstrBuild only: ProdBuild refuses rather than store a fault it would never apply.
+  // Test only: carry a whole ReadFault down to this tier's reader, where inject() reaches it only as a delay or a
+  // blanket failure. `words` is the reader tests' fault tensor (kFaultWords int64; see fault_from). Unlike fail_reads
+  // the fault does NOT short-circuit ahead of the reader: the read runs, so the fault's part errors, pack delay and the
+  // rest act on rows that have already packed. The service thread applies it just before its next read (the reader is
+  // that thread's alone), and it then stays until replaced; an all-default tensor clears it. Words 17-18
+  // (abandon_after, step) and 22 (piece_stream) are not faults and are ignored, and words 19-20 are reserved: the
+  // tier's reader always streams pieces. The reader's counters (submit and completion calls) run over its whole life,
+  // so a call-numbered fault (submit_call, cqe_call) is relative to a fresh tier. InstrBuild only: ProdBuild refuses
+  // rather than store a fault it would never apply.
   void inject_fault(const int64_t* words) {
     if constexpr (!Build::kFaults) {
       (void)words;
@@ -1055,7 +1050,7 @@ class RamTier {
   }
 
   // Service thread, before a read: install the fault inject_fault() left, on the reader only this thread drives.
-  // ProdBuild: nothing (its faults are the instrumented build's, plan Task 10).
+  // ProdBuild: nothing (its faults are the instrumented build's).
   void apply_pending_fault() {
     if constexpr (Build::kFaults) {
       if (!faults_.fault_pending.load(std::memory_order_acquire)) return;
@@ -1180,7 +1175,7 @@ class RamTier {
       result = 0;
     }
     _mm_sfence();  // the rows' bytes land before the caller is told (fill_landed_)
-    // No tier state here (ownership rule 3): the owner runs the epilogue after the join (finish_fill_owned). Until
+    // No tier state here: the owner runs the epilogue after the join (finish_fill_owned). Until
     // then the claimed slots stay filling, so no admission takes one and release() refuses it.
     fill_result_ = result;
     if (result == 1) {
@@ -1192,8 +1187,8 @@ class RamTier {
     fill_state_.store(result == 1 ? kFillOk : kFillFailed, std::memory_order_release);
   }
 
-  // The fill's epilogue, on the owner after the join (fill_join): a fill thread never writes the tier (ownership rule
-  // 3). Clears every claimed slot's filling flag; a failed fill releases (unmaps) its rows that did not land, and
+  // The fill's epilogue, on the owner after the join (fill_join): a fill thread never writes the tier.
+  // Clears every claimed slot's filling flag; a failed fill releases (unmaps) its rows that did not land, and
   // counts the read error and the map's change on the owner's counters.
   void finish_fill_owned() {
     fill_unfinished_ = false;
@@ -1390,10 +1385,10 @@ class RamTier {
     return best;
   }
 
-  // A record with lanes (LEASE_PROTOCOL.md, "The host per record"). The device typed every lane from its copy of
-  // the map, so the host checks each against the tier and fail-stops on any disagreement. Order: stamps, checks, the
-  // copy job (hits start at once), victims and the map delta (before any read, so a served chain always has its
-  // delta published), then the misses' reads.
+  // A record with lanes (LEASE_PROTOCOL.md, "The host per record"). The device typed every lane from its copy of the
+  // map, so the host checks each against the tier and fail-stops on any disagreement. Order: stamps, checks, the copy
+  // job (hits start at once), victims and the map delta (before any read, so a served chain always has its delta
+  // published), then the misses' reads.
   void serve_record(const Request& request, int64_t* rows) {
     StageRecord* const cur = stage_record();  // null in ProdBuild, so every `if (cur)` below folds away
     if (cur) cur->lanes = static_cast<int64_t>(request.lanes.size());
@@ -1551,7 +1546,7 @@ class RamTier {
           cur,
           &packed,
           SIZE_MAX,
-          // The service stays the tier's owner for the whole read, so it answers queued snapshots here too (Task 13).
+          // The service stays the tier's owner for the whole read, so it answers queued snapshots here too.
           // read() runs it once per drain-loop turn and once per finished row; it allocates nothing and takes no lock.
           [&] {
             answer_snapshots();
@@ -1683,17 +1678,17 @@ class RamTier {
   uint32_t next_demand_ = 1;
   int64_t demands_read_ = 0;
   std::atomic<bool> threaded_{false};
-  // The single owner (Task 13): the pausing caller owns the tier while parked_ (see caller_owns). caller_mutex_
-  // serializes Python-side callers only; the service, copy and fill threads never take it. commands_ carries the
-  // unpaused callers' commands to the service (producer: the caller_mutex_ holder; consumer: the owner).
+  // The pausing caller owns the tier while parked_ (see caller_owns). caller_mutex_ serializes Python-side callers only.
+  // commands_ carries the unpaused callers' commands to the service (producer: the caller_mutex_ holder; consumer: the
+  // owner).
   std::atomic<bool> parked_{false};
   std::mutex caller_mutex_;
   SpscRing<Command, 64> commands_;
-  // The watchdog's hung-request marker (D6), see busy_episode(): a new value per demand or fill in service, 0 when
-  // none. episodes_ is the service thread's, or a fill's (they never run at once: a fill needs the pause).
+  // The watchdog's hung-request marker, see busy_episode(): a new value per demand or fill in service, 0 when none.
+  // episodes_ is the service thread's, or a fill's (they never run at once: a fill needs the pause).
   std::atomic<uint64_t> busy_{0};
   uint64_t episodes_ = 0;
-  // Test-only faults (inject, inject_fault): InstrBuild only (plan Task 10).
+  // Test-only faults (inject, inject_fault): InstrBuild only.
   struct TierFaults {
     std::atomic<int64_t> delay_ns{0};
     std::atomic<int64_t> delay_after{0};
@@ -1708,7 +1703,7 @@ class RamTier {
   LineCounters<kCounterCount> core_;       // the tier's owner: the service thread, or the caller while it owns it
   LineCounters<kCounterCount> copy_core_;  // copy thread only
   [[no_unique_address]] Stats<Build::kMetrics, kCounterCount> stats_;  // InstrBuild: any thread, relaxed RMW
-  // Stage trace (spec M9), InstrBuild only. cur points at stage while a traced request is in service, else null.
+  // Stage trace, InstrBuild only. cur points at stage while a traced request is in service, else null.
   struct TraceState {
     std::atomic<bool> on{false};
     std::mutex mutex;  // guards ring against a drain racing enable_trace (Python only)
