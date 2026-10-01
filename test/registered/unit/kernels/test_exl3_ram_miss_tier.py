@@ -269,7 +269,7 @@ def test_an_out_buffer_of_the_wrong_size_is_refused_before_any_write(tier, entry
     a missing refusal shows as the call succeeding, and any write, in bounds or past the view's end, as a changed
     sentinel. The exact size is required, so one word too many is refused as well."""
     s, page, slot_map, host, sim = tier
-    assert _serve(tier, 0, [0, 1])  # every entry has something to write
+    assert _serve(tier, 0, [0]) and _serve(tier, 0, [1])  # every entry has something to write
     expected = _out_extent(host, entry)
     sentinel = -7
     backing = torch.full((expected + 2,), sentinel, dtype=torch.int64)
