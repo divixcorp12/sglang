@@ -321,8 +321,8 @@ class RamTier {
   // Python caller that paused it, from the moment the service parks until resume() (RamThread::pause sets parked_);
   // the caller of pump() when there is no thread. An unpaused Python call therefore takes one of three forms:
   //   - a lock-free read of published words: mapping, counters, busy_episode, layer_rows;
-  //   - a command through run_as_owner, which the service drains between requests: set_hot, inject_lease, and the
-  //     snapshots slot_info, slot_to_expert, lease_entry, lru_order, victim_census;
+  //   - a command through run_as_owner, which the service drains between requests: set_hot, attach_row, and the
+  //     snapshots slot_info, slot_to_expert, lru_order, victim_census;
   //   - a refusal, "needs the service thread paused": has, touch, assign, release, fill_begin.
   // On the owner every one of them runs directly, after draining whatever an earlier caller queued.
   //

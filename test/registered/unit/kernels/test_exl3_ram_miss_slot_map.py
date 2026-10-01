@@ -153,6 +153,50 @@ def test_delta_published_before_the_read(world):
     assert sim.wait_served(req, timeout_s=5.0)
 
 
+def test_admission_never_takes_staging(world):
+    """Mutation: take_admit_slot_locked or assign may take a kStaging slot (then a later miss reads over a mapped row)."""
+    _, host, sim = world
+    staging = {s for s in sim.staging(0) if s >= 0}
+    for e in range(10):  # eager admissions past the tier's size
+        host.assign(0, e)
+    assert not staging & {s for s in host.mapping(0) if s >= 0}
+    assert sum(state == 3 for state, _, _ in host.slot_info(0)) == K
+
+
+def test_bulk_after_pending_decode_delta(world):
+    """The device applies the row's pending decode delta before the bulk entries, and then holds the host's map.
+    Mutation: the bulk is taken before a decode delta's mirror updates (then the replica and the host disagree)."""
+    _, host, sim = world
+    _serve(host, sim, [3])  # decode delta tag 2 is published, not yet applied by the device
+    host.assign(0, 5)
+    bulk = host.take_bulk_delta().tolist()
+    assert [0, 5, host.mapping(0)[5]] in bulk
+    sim.apply_bulk_like_device(bulk)
+    assert sim.replica.ram_slot[0] == host.mapping(0)
+    assert host.take_bulk_delta().numel() == 0, "a bulk delta is taken once"
+
+
+def test_a_failed_fills_unmaps_are_in_the_bulk_delta(world):
+    """R1-5: take_bulk_delta joins a running fill first, so a failed fill's unmaps of its unlanded rows reach the
+    device. Mutation: the bulk is taken before the fill's epilogue."""
+    s, host, sim = world
+    path = s.tables.paths[int(s.tables.extents[0, 6, 0, 0])]
+    with open(path, "r+b") as f:
+        f.truncate(int(s.tables.extents[0, 6, 0, 1]) + 100)
+    slots, _ = host.fill_begin(0, [6])
+    bulk = host.take_bulk_delta().tolist()
+    assert [0, 6, slots[0]] in bulk and [0, 6, -1] in bulk  # mapped by the claim, unmapped by the failed epilogue
+    sim.apply_bulk_like_device(bulk)
+    assert sim.replica.ram_slot[0][6] == -1 == host.mapping(0)[6]
+
+
+def test_closing_admission_stops_new_service(world):
+    _, host, sim = world
+    host.close_admission()
+    sim.post(0, [3])
+    assert host.pump() == 0
+
+
 def _script(tmp_path, body):
     return run_host_script(tmp_path, body, capacity=4)
 
