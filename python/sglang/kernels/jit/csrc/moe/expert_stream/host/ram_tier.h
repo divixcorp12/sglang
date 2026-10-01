@@ -593,6 +593,11 @@ class RamTier {
     out[2] = cpu_ != nullptr ? cpu_->compute_ns() : 0;
   }
 
+  // The CPU experts' cores, empty without CPU experts. The caller's, before the service thread starts.
+  std::vector<int> cpu_cores() const {
+    return cpu_ != nullptr ? cpu_->cores() : std::vector<int>{};
+  }
+
   // The owner (RamThread::pause, once the service parked): every job handed to the copy thread has completed (or
   // failed). False at the deadline.
   bool wait_copy_idle_owned(int64_t deadline_ns) {

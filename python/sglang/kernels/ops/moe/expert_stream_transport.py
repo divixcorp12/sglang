@@ -914,16 +914,20 @@ class ExpertStreamHost:
         if slot is not None and not 0 <= slot < capacity:
             raise ValueError(f"slot {slot} is outside [0, {capacity})")
 
-    def start_thread(self, *, cpu_core: int = -1, fatal_wait_s: float = 30.0, spin_us: int = 5000) -> None:
+    def start_thread(self, *, cpu_core: int = -1, fatal_wait_s: float = 30.0, spin_us: int = 5000,
+                     busy_poll: bool = False) -> None:
         """Serve requests on a C++ thread (no more ``pump()``), with the fail-stop watchdog.
 
-        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved (D19).
+        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved (D19). ``busy_poll`` spins on
+        ``cpu_core`` with no PAUSE and no sleep; the C++ side refuses it unless that physical core is the service's alone.
         """
         if 64 <= cpu_core <= 71:
             raise ValueError(
                 f"cpu_core {cpu_core}: cores 64-71 are reserved (NVMe completion interrupts are pinned there)"
             )
-        self._module.expert_stream_start_thread(self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3))
+        self._module.expert_stream_start_thread(
+            self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3), int(busy_poll)
+        )
         self.threaded = True
 
     def pause(self, timeout_s: float) -> None:

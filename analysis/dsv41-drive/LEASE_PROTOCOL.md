@@ -20,7 +20,9 @@ constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/ex
   `dst_rows` (set at attach by `set_row_copy`, copy engine on) and `cpu_ok` (set when the layer registers with the
   CPU expert service, `set_row_cpu`).
 - **Service thread** (`host/ram_tier.h`, `host/ram_thread.h`). The tier's single owner. It handles records in
-  sequence, chooses victims, publishes deltas and reads misses.
+  sequence, chooses victims, publishes deltas and reads misses. With `SGLANG_DSV41_RAM_MISS_SPIN_CORE`, the service
+  busy-polls that core with no PAUSE and never sleeps; `start_thread` refuses unless no SMT sibling of the core is in
+  the server's affinity or among the CPU experts' cores.
 - **Copy thread** (`host/copy_engine.h`). Copies a record's copy-engine hits with `cuMemcpyAsync`, runs its CPU jobs
   through the CPU expert thread, and publishes CopyDone.
 - **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row.

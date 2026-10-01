@@ -1126,6 +1126,14 @@ def test_server_cores_touch_no_node_1_core():
     assert not (_cores(arm_env.SERVER_CORES) & NODE1_CPUS)
 
 
+def test_the_ram_miss_spin_core_has_its_physical_core_to_itself():
+    # divix01: cpu n and n + 36 are one physical core (thread_siblings_list).
+    siblings = {arm_env.SPIN_CORE, arm_env.SPIN_CORE + 36}
+    taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES) | _cores(arm_env.FREE_CORES)
+    assert arm_env.SPIN_CORE in NODE0_CPUS and not (siblings & taken), sorted(siblings & taken)
+    assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
+
+
 def test_server_cores_do_not_overlap_the_driver_or_the_reserved_cores():
     server = _cores(arm_env.SERVER_CORES)
     assert not (server & _cores(arm_env.DRIVER_CORES)), "server and driver share cores"

@@ -693,7 +693,13 @@ class Exl3RamMissService:
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_SHARE needs the expert distribution recorder "
                         "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
                     )
-            host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+            spin_core = envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.get()
+            if spin_core is None:
+                host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+            else:
+                host.start_thread(
+                    cpu_core=spin_core, busy_poll=True, fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms)
+                )
             if fault is not None:
                 demands, seconds = fault
                 host.inject(delay_s=seconds, delay_after_demands=demands)

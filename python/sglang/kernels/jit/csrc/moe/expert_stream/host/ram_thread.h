@@ -7,7 +7,7 @@ namespace sglang {
 namespace expert_stream {
 
 // Pumps one RamTier on its own thread: spins with _mm_pause() for spin_ns after the last request, else sleeps 50 us
-// between polls. The spin is an idle-poll budget calibrated once in start() (idle_budget), so the thread reads no
+// between polls; or, with busy_poll, on a core of its own (start_thread checked), spins with no PAUSE and never sleeps. The spin is an idle-poll budget calibrated once in start() (idle_budget), so the thread reads no
 // clock while it serves. The tier has one owner at a time (this thread, or a caller that paused it); pause()/resume()
 // are the handoff, and the edges are documented at each.
 template <class Tier>
@@ -15,11 +15,12 @@ class RamThread {
  public:
   using Build = typename Tier::Build;
 
-  RamThread(std::shared_ptr<Tier> tier, int cpu_core, int64_t fatal_wait_ns, int64_t spin_ns)
+  RamThread(std::shared_ptr<Tier> tier, int cpu_core, int64_t fatal_wait_ns, int64_t spin_ns, bool busy_poll)
       : tier_(std::move(tier)),
         cpu_core_(cpu_core),
         fatal_wait_ns_(fatal_wait_ns),
-        spin_ns_(spin_ns) {}
+        spin_ns_(spin_ns),
+        busy_poll_(busy_poll) {}
 
   ~RamThread() {
     stop();
@@ -159,6 +160,7 @@ class RamThread {
         idle = 0;
         continue;
       }
+      if (busy_poll_) continue;  // a physical core of its own: no PAUSE quantum on detection, no sleep
       if (++idle < spin_iters_) {
         _mm_pause();
       } else {
@@ -214,6 +216,7 @@ class RamThread {
   int cpu_core_;
   int64_t fatal_wait_ns_;
   int64_t spin_ns_;
+  bool busy_poll_;
   uint64_t spin_iters_ = 1;  // idle polls before the idle sleep: idle_budget(spin_ns_), set in start()
   std::thread thread_;
   std::thread watchdog_;
