@@ -60,6 +60,26 @@ def test_attach_reserves_k_staging_slots_and_publishes_tag_one(world):
     assert host.mapping(0) == [-1] * EXPERTS
 
 
+def test_attach_takes_vram_hot_slots_when_nothing_else_is_left(tmp_path):
+    """The service attaches after the tier is filled and the VRAM-hot set is published: every slot may hold a hot
+    expert. A hot expert's bytes are in VRAM, so attach evicts its RAM copy (LRU first) rather than leave the row with
+    no staging. Mutation: attach skips hot slots as decode's victims do -- it raises "no slot left to stage"."""
+    s = ram_miss_setup(tmp_path, capacity=CAPACITY, layers=1, experts=EXPERTS)
+    host = ExpertStreamHost(
+        s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
+    )
+    try:
+        for e in range(CAPACITY):
+            host.assign(0, e)
+        host.set_hot(0, list(range(CAPACITY)))
+        host.attach_row(0, K)
+        assert [host.mapping(0)[e] for e in range(K)] == [-1] * K, "the two oldest hot rows were not the ones evicted"
+        assert all(host.mapping(0)[e] >= 0 for e in range(K, CAPACITY))
+        assert sum(state == 3 for state, _, _ in host.slot_info(0)) == K
+    finally:
+        host.stop()
+
+
 def test_attach_row_is_once_per_row(world):
     _, host, _ = world
     with pytest.raises(RuntimeError, match="command failed"):
