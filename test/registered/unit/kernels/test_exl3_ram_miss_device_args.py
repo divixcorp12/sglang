@@ -115,7 +115,19 @@ def test_the_device_sequence_continues_from_the_page_head():
     assert int(_device(page=page).state[STATE_WORDS["posted"]]) == 7
 
 
-_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.LShift: operator.lshift}
+def _cpp_div(a, b):
+    """C++ integer division truncates toward zero; Python's // floors."""
+    q = abs(a) // abs(b)
+    return q if (a < 0) == (b < 0) else -q
+
+
+_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: _cpp_div,
+    ast.LShift: operator.lshift,
+}
 
 
 def _evaluate(node, known):
