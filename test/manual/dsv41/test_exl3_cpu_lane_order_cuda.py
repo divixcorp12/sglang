@@ -22,6 +22,7 @@ from lease_chain_rig import EXPERTS, LAYERS, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
+from sglang.test.dsv41_ram_miss_fixtures import paused  # noqa: E402
 
 HIDDEN = 64
 HANDLE = 7
@@ -98,7 +99,8 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         torch.cuda.synchronize()
         assert c.handled()
         assert ({high} if miss else {low, high}) <= c.resident(row) and (low in c.resident(row)) != miss
-        ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
+        with paused(c.host):
+            ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
         c.host.set_cpu_layer(row, HANDLE)
         c.host.arm_copy_engine()
 

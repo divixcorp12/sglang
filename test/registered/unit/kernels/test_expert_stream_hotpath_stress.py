@@ -1,5 +1,5 @@
 """Every party that touches the RAM-miss service concurrently -- the device, the copy thread's completions, unpaused
-Python calls, and an eager caller's pause/resume -- against the running service thread, with the invariants that the
+lock-free Python reads, and an eager caller's pause/resume -- against the running service thread, with the invariants that the
 tier mutex protected at ba01695c35 checked at every pause and at the end (plan 2026-09-29-hotpath-zero-overhead
 Task 4). Green at ba01695c35; the lock-free single-owner tier (Tasks 13-15) must keep it green, and Task 16 runs
 ``run_stress`` under ThreadSanitizer."""
@@ -17,10 +17,10 @@ from sglang.test.dsv41_ram_miss_fixtures import same_bytes
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 READY, FREE, STAGING = 2, 0, 3  # slot_info states
-# The device routes only to these experts; the noise party marks only the others VRAM-hot. apply_gpu_hot rewrites a
-# row's hot set from the (empty) sidecar record at every demand with lanes, so a set_hot landing between that and the
-# victim choice would otherwise shrink its victims (a skipped insert), a legal outcome that is not what this test is
-# about. Hot experts that are never resident keep set_hot's concurrent writes and remove that.
+# The device routes only to these experts; the pauser marks only the others VRAM-hot. apply_gpu_hot rewrites a row's
+# hot set from the (empty) sidecar record at every demand with lanes, so a hot resident expert would shrink the
+# victims (a skipped insert), a legal outcome that is not what this test is about. Hot experts that are never resident
+# keep the set_hot writes and remove that.
 DEVICE_EXPERTS = tuple(range(hp.EXPERTS - 2))
 HOT_ONLY = tuple(range(hp.EXPERTS - 2, hp.EXPERTS))
 # The kinds a lane may carry here: a resident hit C1 copies, a miss streamed in pieces, a hit the copy engine copies.
@@ -144,10 +144,10 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
     def noise():
         rng = random.Random(seed + 1)
         while not stop.is_set():
-            host.set_hot(rng.randrange(hp.LAYERS), rng.sample(HOT_ONLY, rng.randint(0, len(HOT_ONLY))))
             host.counters()
             host.mapping(rng.randrange(hp.LAYERS))
-            host.lru_order(rng.randrange(hp.LAYERS))
+            host.layer_rows()
+            host.busy_episode()
             stats["noise"] += 1
             time.sleep(0.0002)
 
@@ -176,6 +176,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
                     stats["pauses"] += 1
                     _check_tier(s, host, range(hp.LAYERS))
                     host.lru_order(0)
+                    host.set_hot(rng.randrange(hp.LAYERS), rng.sample(HOT_ONLY, rng.randint(0, len(HOT_ONLY))))
                     host.counters()
                     # The eager caller's one write: an expert that is not resident, assigned and filled by the owner.
                     row = rng.randrange(hp.LAYERS)

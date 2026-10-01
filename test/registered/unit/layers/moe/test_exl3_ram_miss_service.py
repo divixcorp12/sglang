@@ -23,6 +23,7 @@ from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import (
     ROW_IMAGE_DIM,
     DirectUpdaterStandIn,
+    paused,
     service_row_images,
     write_row_images,
 )
@@ -71,9 +72,10 @@ def tiers(tmp_path, monkeypatch):
 
 
 def _holds(host, row, expert):
-    """True once ``expert`` holds a slot of ``row`` (LOADING or READY), as ``contains`` says, but through a snapshot:
-    ``contains`` refuses while the service thread runs unpaused (plan 2026-09-29-hotpath-zero-overhead Task 13)."""
-    return expert in host.slot_to_expert(row)
+    """True once ``expert`` holds a slot of ``row`` (LOADING or READY), as ``contains`` says, read paused: ``contains``
+    refuses while the service thread runs unpaused."""
+    with paused(host):
+        return expert in host.slot_to_expert(row)
 
 
 def _sim(service):
@@ -286,6 +288,22 @@ def test_gpu_hot_snapshot_handoff_keeps_seed_protection_then_uses_device_map(tie
         assert evicted == 0 and slot >= 0 and service.host.contains(service.row_of(0), 2)
     finally:
         table.after_host_use(caches[0])
+
+
+def test_the_hot_seed_is_set_while_the_service_is_paused(tiers, monkeypatch):
+    service, streamers, caches = tiers
+    service.ensure_started()
+    depths = []
+    set_hot = service.host.set_hot
+    monkeypatch.setattr(service.host, "set_hot", lambda row, experts: (depths.append(service._pause_depth), set_hot(row, experts))[1])
+    bank = torch.tensor([[4, -1, -1], [-1, -1, -1]], dtype=torch.int64)
+    updater = SimpleNamespace(
+        device=torch.device("cpu"), slot_to_expert=bank,
+        layer_ids=[0, 1], caches=[SimpleNamespace(capacity=3), SimpleNamespace(capacity=3)],
+    )
+    service._enable_gpu_hot(updater)
+    assert len(depths) == 2 and all(depth > 0 for depth in depths)
+    assert service._pause_depth == 0
 
 
 def test_exl3_direct_startup_refuses_unsupported_modes_before_capture():
@@ -1217,7 +1235,8 @@ def test_decode_rows_survive_a_prefills_admissions_under_the_prefill_share(tiers
         observer(7, _mode(prefill=True))
     for expert in (3, 4, 5):
         _gather(caches[1], expert)
-    assert sorted(e for e in service.host.slot_to_expert(row) if e >= 0) == survivors
+    with paused(service.host):
+        assert sorted(e for e in service.host.slot_to_expert(row) if e >= 0) == survivors
 
 
 def test_only_a_prefill_forward_sets_the_share(tiers, monkeypatch):

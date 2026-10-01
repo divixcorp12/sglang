@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, DirectUpdaterStandIn, service_row_images
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, DirectUpdaterStandIn, paused, service_row_images
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -94,7 +94,10 @@ def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
     service, _ = tiers
     service.ensure_started()
     host = service.host
-    staging = {row: [s for s, (state, _, _) in enumerate(host.slot_info(row)) if state == 3] for row in range(LAYERS)}
+    with paused(host):
+        staging = {
+            row: [s for s, (state, _, _) in enumerate(host.slot_info(row)) if state == 3] for row in range(LAYERS)
+        }
     assert all(len(slots) == 1 for slots in staging.values())
     service.before_host_use()
     try:

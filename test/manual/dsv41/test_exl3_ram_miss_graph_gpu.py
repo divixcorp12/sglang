@@ -74,7 +74,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import DirectUpdaterStandIn, service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import DirectUpdaterStandIn, paused, service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=num_layers, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
@@ -229,7 +229,8 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
             # admits cold rows before another same-layer graph post.
             protected = 19
             streamer.pinned_host_cache.ensure_rows(torch.tensor([30, 31, 32, 33, 34, 35]))
-            assert protected in service.host.slot_to_expert(0)
+            with paused(service.host):
+                assert protected in service.host.slot_to_expert(0)
             replay(
                 list(range(24, 30)) if fused else [24, 24, 25, 25, 26, 26]
             )  # generic duplicate misses copy once per unique expert

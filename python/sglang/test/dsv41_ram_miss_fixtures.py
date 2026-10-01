@@ -148,6 +148,17 @@ def image_tables(layout, segments, slabs_by_layer, source_root, mirror_weights=N
     return tables, roots
 
 
+@contextlib.contextmanager
+def paused(host, timeout_s: float = 10.0):
+    """The tier's owner for a block: the service thread paused (the class's own pause, not an instance attribute a
+    test may have wrapped to count pauses). Not reentrant, like the pause."""
+    type(host).pause(host, timeout_s)
+    try:
+        yield host
+    finally:
+        type(host).resume(host)
+
+
 def same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
 

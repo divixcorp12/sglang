@@ -26,7 +26,7 @@ from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
 from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab, release_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import ExpertRowPlan
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, image_tables
+from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, image_tables, paused
 
 # Fourteen slots per row, six of them staging (one per lane a post can miss): eight mappable rows.
 LAYERS, EXPERTS, CAPACITY, TOP_K = 2, 16, 14, 6
@@ -187,7 +187,8 @@ class Chain:
                 assert torch.equal(got, want[n][lane].contiguous().view(torch.uint8)), (lane, expert, n)
 
     def resident(self, row=0):
-        return {e for state, e, _ in self.host.slot_info(row) if state == READY and e >= 0}
+        with paused(self.host):
+            return {e for state, e, _ in self.host.slot_info(row) if state == READY and e >= 0}
 
     def handled(self, timeout_s=10.0):
         """The service has finished every record the device posted."""

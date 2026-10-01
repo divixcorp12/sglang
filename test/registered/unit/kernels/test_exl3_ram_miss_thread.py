@@ -14,7 +14,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script, same_bytes
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, paused, ram_miss_setup, run_host_script, same_bytes
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -44,9 +44,10 @@ def _host(tmp_path, capacity=3, fatal_wait_s=5.0, k=1):
 
 
 def _holds(host, row, expert):
-    """True once ``expert`` holds a slot of ``row`` (LOADING or READY), through a snapshot: ``contains`` refuses
-    while the service thread runs unpaused."""
-    return expert in host.slot_to_expert(row)
+    """True once ``expert`` holds a slot of ``row`` (LOADING or READY), read paused: ``contains`` and the snapshots
+    refuse while the service thread runs unpaused."""
+    with paused(host):
+        return expert in host.slot_to_expert(row)
 
 
 def _ready_map(host, row, experts=6):

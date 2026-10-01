@@ -1,6 +1,5 @@
 """The single-owner tier (plan 2026-09-29-hotpath-zero-overhead Tasks 13-15): what an unpaused Python call does while
-the service thread runs, that queued commands are applied in order before the next request, that the copy thread
-publishes a completed copy's CopyDone itself, that a prefill fill's epilogue runs on the owner after the join, and that
+the service thread runs, that the copy thread publishes a completed copy's CopyDone itself, that a prefill fill's epilogue runs on the owner after the join, and that
 the tier declares no mutex but the Python callers' own."""
 
 import faulthandler
@@ -24,7 +23,7 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 @pytest.fixture(autouse=True)
 def hang_guard():
-    # A broken ownership handoff hangs in C++ (a snapshot nobody answers): dump every stack and exit instead.
+    # A broken ownership handoff hangs in C++: dump every stack and exit instead.
     faulthandler.dump_traceback_later(120, exit=True)
     yield
     faulthandler.cancel_dump_traceback_later()
@@ -44,7 +43,7 @@ def running(tmp_path):
     host.stop()
 
 
-def test_unpaused_eager_calls_refuse_or_snapshot(running):
+def test_unpaused_calls_that_need_the_tier_refuse_and_the_published_map_reads(running):
     s, page, host, sim = running
     for call in (
         lambda: host.assign(0, 5),
@@ -52,46 +51,31 @@ def test_unpaused_eager_calls_refuse_or_snapshot(running):
         lambda: host.contains(0, 1),
         lambda: host.release(0, 0),
         lambda: host.fill_begin(0, [5]),
+        lambda: host.set_hot(0, [0]),
+        lambda: host.slot_info(0),
+        lambda: host.slot_to_expert(0),
+        lambda: host.lru_order(0),
+        lambda: host.victim_census(0, []),
     ):
-        with pytest.raises(RuntimeError, match="paused"):
+        with pytest.raises(RuntimeError, match="needs the service thread paused"):
             call()
-    info = host.slot_info(0)
     mapping = host.mapping(0)
-    assert sorted(e for _, e, _ in info if e >= 0) == [0, 1, 2, 3]
-    assert all(mapping[e] >= 0 and info[mapping[e]][1] == e for e in range(4))
-    assert sorted(host.lru_order(0)) == [0, 1, 2, 3]
-    assert sorted(e for e in host.slot_to_expert(0) if e >= 0) == [0, 1, 2, 3]  # the staging slot holds none
-    assert host.victim_census(0, []) == (0, 4)
+    assert sorted(e for e, slot in enumerate(mapping) if slot >= 0) == [0, 1, 2, 3]
     host.pause(5.0)
     try:
+        info = host.slot_info(0)
+        assert sorted(e for _, e, _ in info if e >= 0) == [0, 1, 2, 3]
+        assert all(info[mapping[e]][1] == e for e in range(4))
+        assert sorted(host.lru_order(0)) == [0, 1, 2, 3]
+        assert sorted(e for e in host.slot_to_expert(0) if e >= 0) == [0, 1, 2, 3]  # the staging slot holds none
+        assert host.victim_census(0, []) == (0, 4)
+        host.set_hot(0, [0, 1, 2])
+        assert host.victim_census(0, []) == (0, 1)  # only expert 3 is not hot
         slot, _evicted = host.assign(0, 5)  # the owner may assign (it evicts an LRU row: capacity is full)
         assert slot >= 0 and host.mapping(0)[5] == slot
         assert host.contains(0, 5)
     finally:
         host.resume()
-
-
-def test_a_set_hot_burst_past_the_ring_is_applied_in_order(running):
-    s, page, host, sim = running
-    host.inject(delay_s=0.3)  # instr: every demand read sleeps 300 ms first
-    applied = host.counters()["commands_applied"]  # instr: every command the owner applied, queued or direct
-    req = sim.post(1, [6])  # a long read on row 1 keeps the service busy
-    time.sleep(0.05)
-    start = time.perf_counter()
-    for i in range(200):  # the command ring holds 64: the producer must wait, never drop
-        # Every command carries its own payload (the bits of i over the row's 8 experts), so none can stand in for
-        # another: a dropped or reordered one changes the count below or the last writer.
-        host.set_hot(0, [e for e in range(8) if i >> e & 1])
-    host.set_hot(0, [0, 1, 2])
-    # Taken before the wait (Task 16's M3 passed the old check, taken after the 300 ms read): queued, the 65th set_hot
-    # waits for the service to drain the full ring, which it does only once the read ends, ~0.25 s from `start`.
-    # Applied directly, the whole burst takes milliseconds.
-    burst_s = time.perf_counter() - start
-    assert sim.wait_served(req, 5.0)
-    free, evictable = host.victim_census(0, [])  # a snapshot: queued behind the burst, answered after it
-    assert (free, evictable) == (0, 1)  # only expert 3 is neither hot nor wanted: the LAST set_hot won
-    assert host.counters()["commands_applied"] - applied == 201 + 1, "a command was dropped (the +1 is the census)"
-    assert burst_s > 0.1, f"the burst returned in {burst_s:.3f} s, while the read ran: nothing was queued"
 
 
 def _copy_request(s, page, host, sim):
@@ -238,8 +222,8 @@ def test_a_failed_fill_is_released_and_counted_by_the_owner_at_fill_end(tmp_path
 
 def test_a_stop_mid_pause_joins_the_running_fill_before_its_final_settle(tmp_path):
     """Controller ruling (Task 15): stop_thread can arrive while the pausing caller's fill still runs. Its final settle,
-    on the stopping caller once the service joined, joins the fill and runs the epilogue there before it drains and
-    settles, with no tier lock: when stop_thread returns the fill's slots are no longer filling."""
+    on the stopping caller once the service joined, joins the fill and runs the epilogue there before it settles,
+    with no tier lock: when stop_thread returns the fill's slots are no longer filling."""
     s, host = _fill_host(tmp_path)
     try:
         host.start_thread(fatal_wait_s=30.0)
