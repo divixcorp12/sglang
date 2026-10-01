@@ -1,0 +1,33 @@
+[Unit]
+Description=Isolated DSV4.1 native CPU expert benchmarks
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=dnikolaidis
+Group=dnikolaidis
+Slice=-.slice
+AllowedCPUs=18-33 54-69
+AllowedMemoryNodes=0-1
+CPUAccounting=yes
+ExecStartPre=+/usr/local/libexec/exl3bench-isolation start
+ExecStart=/usr/local/libexec/exl3bench-run
+ExecStopPost=+/usr/local/libexec/exl3bench-isolation stop
+Environment=PATH=/usr/bin:/bin
+Environment=OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16 OMP_PROC_BIND=FALSE
+Environment=OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE
+Environment=EXL3_MOE_CPU_PIN=0 EXL3_MOE_CPU_MAX_ISA=bw EXL3_MOE_CPU_SMALL_WORKERS=0
+Environment=MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+WorkingDirectory=/data/models/exl3_exp/google_benchmark
+NoNewPrivileges=yes
+UMask=0022
+KillMode=control-group
+TimeoutStartSec=30
+TimeoutStopSec=30
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+# Deliberately no [Install]: the service is available after reboot, but does not
+# reserve cores until explicitly started. All benchmark descendants are killed
+# before ExecStopPost returns the partition to member.

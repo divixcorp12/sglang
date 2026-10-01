@@ -1,0 +1,30 @@
+#!/bin/bash
+# This launcher is installed root-owned but always executes as dnikolaidis.
+set -euo pipefail
+[[ $EUID != 0 ]] || { echo 'Refusing to run the benchmark as root.' >&2; exit 1; }
+[[ $(< /proc/self/cgroup) == '0::/exl3bench.service' ]] || {
+    echo 'Launcher must run within exl3bench.service.' >&2; exit 1;
+}
+cg=/sys/fs/cgroup/exl3bench.service
+[[ $(< "$cg/cpuset.cpus.partition") == isolated ]]
+[[ $(< "$cg/cpuset.cpus.effective") == 18-33,54-69 ]]
+[[ $(< "$cg/cpuset.mems.effective") == 0-1 ]]
+[[ ${INVOCATION_ID:-} =~ ^[0-9a-f]{32}$ ]] || { echo 'Missing systemd invocation ID.' >&2; exit 1; }
+root=/data/models/exl3_exp/google_benchmark
+runner=@BENCH_RUNNER@
+args=()
+if [[ -f $root/service-args.txt ]]; then
+    # One literal argument per line. Never source or eval the user-owned file.
+    while IFS= read -r arg || [[ -n $arg ]]; do
+        [[ -z $arg || $arg == \#* ]] || args+=("$arg")
+    done < "$root/service-args.txt"
+fi
+rounds=8
+if [[ -f $root/service-rounds.txt ]]; then
+    read -r rounds < "$root/service-rounds.txt" || [[ -n $rounds ]]
+fi
+[[ $rounds =~ ^[1-9][0-9]*$ ]] || { echo 'service-rounds.txt must contain a positive integer.' >&2; exit 1; }
+export EXL3_BENCH_ROUNDS=$rounds
+results="$root/service-$(date +%Y%m%d-%H%M%S)-$INVOCATION_ID"
+echo "Benchmark output: $results"
+exec /bin/bash "$runner" "$root/build" "$results" "${args[@]}"

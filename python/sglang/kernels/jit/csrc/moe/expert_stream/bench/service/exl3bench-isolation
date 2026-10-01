@@ -1,0 +1,53 @@
+#!/bin/bash
+# Installed root:root, 0755. No user-provided paths, CPU sets or shell commands.
+set -euo pipefail
+export PATH=/usr/bin:/bin
+[[ $EUID == 0 ]] || { echo 'Isolation helper requires root.' >&2; exit 1; }
+cg=/sys/fs/cgroup/exl3bench.service
+legacy=/sys/fs/cgroup/exl3bench.scope
+target=18-33,54-69
+[[ $(< /proc/self/cgroup) == '0::/exl3bench.service' ]] || {
+    echo 'Isolation helper must run within exl3bench.service.' >&2; exit 1;
+}
+
+release() {
+    [[ -d $cg ]] || return 0
+    # Transition out of the partition before clearing its exclusive CPU list.
+    if [[ -f $cg/cpuset.cpus.partition ]]; then
+        printf '%s\n' member > "$cg/cpuset.cpus.partition" || return 1
+        [[ $(< "$cg/cpuset.cpus.partition") == member ]] || return 1
+    fi
+    if [[ -f $cg/cpuset.cpus.exclusive ]]; then
+        printf '\n' > "$cg/cpuset.cpus.exclusive" || return 1
+    fi
+    echo 'Benchmark service CPU reservation released.'
+}
+
+case ${1:-} in
+  start)
+    # A failure after partially reserving CPUs must roll back, including SIGTERM.
+    committed=false
+    trap 'if ! $committed; then release; fi' EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    if [[ -f $legacy/cpuset.cpus.partition && $(< "$legacy/cpuset.cpus.partition") != member ]]; then
+        echo 'Legacy exl3bench.scope still reserves CPUs; run the one-time installer transition.' >&2
+        exit 1
+    fi
+    [[ -f $cg/cpuset.cpus.partition && -f $cg/cpuset.cpus.exclusive ]] || {
+        echo 'Required kernel cpuset partition controls are missing.' >&2; exit 1;
+    }
+    [[ $(< "$cg/cpuset.cpus.partition") == member ]]
+    [[ $(< "$cg/cpuset.cpus") == "$target" ]]
+    [[ $(< "$cg/cpuset.mems.effective") == 0-1 ]]
+    printf '%s\n' "$target" > "$cg/cpuset.cpus.exclusive"
+    printf '%s\n' isolated > "$cg/cpuset.cpus.partition"
+    [[ $(< "$cg/cpuset.cpus.partition") == isolated ]]
+    [[ $(< "$cg/cpuset.cpus.effective") == "$target" ]]
+    [[ $(< "$cg/cpuset.cpus.exclusive.effective") == "$target" ]]
+    committed=true
+    echo "Benchmark partition isolated: CPUs $target; memory nodes 0-1."
+    ;;
+  stop) release ;;
+  *) echo 'Usage: exl3bench-isolation start|stop' >&2; exit 2 ;;
+esac
