@@ -617,6 +617,48 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only: read_record over one record (record: CPU uint8 [kRecordBytes]) as the service reads seq `expected`.
+  // out int64 [6 + kMaxIds + 1 + 5 * kMaxIds] = {status (RecordRead: 0 ok, 1 torn, 2 malformed), row, captured,
+  // chain, gen, protect count, protect ids, lane count, then per lane: expert, slot, dst, kind, the weight's bits}.
+  static void read_record_fields(TensorView record, int64_t expected, TensorView out) {
+    if constexpr (!Build::kFaults) {
+      test_only("read_record_fields");
+    } else {
+      {
+        using namespace host;
+        auto cpu = SymbolicDevice{};
+        expert_stream::verify_named(
+            "record", TensorMatcher({kRecordBytes}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), record);
+        expert_stream::verify_named(
+            "out", TensorMatcher({6 + kMaxIds + 1 + 5 * kMaxIds}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+      }
+      Request request;
+      const RecordRead read =
+          read_record(static_cast<const uint8_t*>(record.data_ptr()), static_cast<uint32_t>(expected), &request);
+      auto* w = static_cast<int64_t*>(out.data_ptr());
+      w[0] = static_cast<int64_t>(read);
+      w[1] = request.row;
+      w[2] = request.captured ? 1 : 0;
+      w[3] = static_cast<int64_t>(request.chain);
+      w[4] = static_cast<int64_t>(request.gen);
+      w[5] = static_cast<int64_t>(request.protect.size());
+      for (size_t i = 0; i < request.protect.size(); ++i)
+        w[6 + i] = request.protect[i];
+      w[6 + kMaxIds] = static_cast<int64_t>(request.lanes.size());
+      for (size_t j = 0; j < request.lanes.size(); ++j) {
+        const Lane& lane = request.lanes[j];
+        int32_t bits;
+        std::memcpy(&bits, &lane.weight, 4);
+        int64_t* l = w + 7 + kMaxIds + 5 * j;
+        l[0] = lane.expert;
+        l[1] = lane.slot;
+        l[2] = lane.dst;
+        l[3] = lane.kind;
+        l[4] = bits;
+      }
+    }
+  }
+
   static int64_t copy_engine_marked(int64_t handle) {
     return find(handle)->host_copy_backend().marked();
   }
@@ -691,6 +733,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_marked, Exports::copy_engine_marked);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_ballast, Exports::copy_engine_ballast);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);            \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_record_fields, Exports::read_record_fields);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);           \

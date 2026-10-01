@@ -130,6 +130,9 @@ RAW_EXPORTS = {
     "trace_clock_reads": lambda m, h: m.expert_stream_trace_clock_reads(),
     "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "pause_ns": lambda m, h: m.expert_stream_pause_ns(),
+    "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
+        torch.zeros(ops.RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.READ_RECORD_WORDS, dtype=torch.int64)
+    ),
 }
 
 
@@ -153,7 +156,9 @@ def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
         host.stop()
 
 
-@pytest.mark.parametrize("helper", ("read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns"))
+@pytest.mark.parametrize(
+    "helper", ("read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields")
+)
 def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
     s = ram_miss_setup(tmp_path)
     calls = {
@@ -161,6 +166,9 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
         "read_rows_sqes": lambda: ops.read_rows_sqes(s.tables, 0, [1], [0], variant="prod"),
         "seqlock_stress": lambda: ops.seqlock_stress(0.001, variant="prod"),
         "pause_ns": lambda: ops.pause_ns(variant="prod"),
+        "read_record_fields": lambda: ops.read_record_fields(
+            torch.zeros(ops.RECORD_BYTES, dtype=torch.uint8), 1, variant="prod"
+        ),
     }
     export = {"read_rows_with_fault": "read_rows_faulted"}.get(helper, helper)  # the name the error carries
     with pytest.raises(RuntimeError, match=f"{export} is test-only"):

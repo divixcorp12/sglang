@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import struct
 import sys
 import weakref
 from typing import TYPE_CHECKING, Iterable, Optional, Sequence
@@ -80,6 +81,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "trace_clock_reads",
     "seqlock_stress",
     "pause_ns",
+    "read_record_fields",
 )
 
 
@@ -759,6 +761,40 @@ def seqlock_stress(seconds: float, *, layout: str = "exl3", variant: Optional[st
     out = torch.zeros(2, dtype=torch.int64)
     _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
     return int(out[0]), int(out[1])
+
+
+_RECORD_LANES = 8  # kMaxIds == kLeaseLanes
+READ_RECORD_WORDS = 6 + _RECORD_LANES + 1 + 5 * _RECORD_LANES
+
+
+def read_record_fields(record: torch.Tensor, expected: int, *, layout: str = "exl3",
+                       variant: Optional[str] = None) -> dict:
+    """Test only: the service's read_record over one RECORD_BYTES record, expecting seq ``expected``. Instrumented
+    build only."""
+    _refuse_test_only("read_record_fields", variant)
+    out = torch.zeros(READ_RECORD_WORDS, dtype=torch.int64)
+    _host_module(layout, variant).expert_stream_read_record_fields(record, int(expected), out)
+    w = out.tolist()
+    protect, lanes = w[5], w[6 + _RECORD_LANES]
+    base = 7 + _RECORD_LANES
+    return {
+        "status": ("ok", "torn", "malformed")[w[0]],
+        "row": w[1],
+        "captured": bool(w[2]),
+        "chain": w[3] & 0xFFFFFFFFFFFFFFFF,
+        "gen": w[4] & 0xFFFFFFFFFFFFFFFF,
+        "protect": w[6 : 6 + protect],
+        "lanes": [
+            {
+                "expert": w[base + 5 * j],
+                "slot": w[base + 5 * j + 1],
+                "dst": w[base + 5 * j + 2],
+                "kind": w[base + 5 * j + 3],
+                "weight": struct.unpack("<f", struct.pack("<i", w[base + 5 * j + 4]))[0],
+            }
+            for j in range(lanes)
+        ],
+    }
 
 
 def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
