@@ -160,6 +160,11 @@ class RamThread {
       tier_->drain_commands();  // between requests: every queued Python command, in order
       const uint64_t epoch = pause_epoch_.load(std::memory_order_acquire);
       if (epoch & 1u) {
+        // Every record posted before the pause, first: an all-HIT_SM chain never waits on the service, so its record
+        // can still be unread, and checked after the caller moved its expert it would fail-stop a correct device.
+        // The caller synchronized the stream, so demand_head is final and this ends.
+        while (tier_->pump_demand()) {
+        }
         tier_->drain_commands();  // nothing queued before the pause is left behind
         parked_epoch_.store(epoch, std::memory_order_release);  // the handoff: the pausing caller owns the tier
         while (pause_epoch_.load(std::memory_order_acquire) == epoch && !stop_.load())
