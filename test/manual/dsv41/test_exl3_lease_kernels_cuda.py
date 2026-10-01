@@ -179,7 +179,7 @@ def test_the_device_refuses_what_its_kernels_cannot_read(tmp_path):
 @pytest.mark.parametrize("case", ["experts", "row_capacity", "page"])
 def test_the_post_launch_refuses_what_a_narrow_record_cannot_carry(tmp_path, case):
     """The post writes i16 ids with 16-byte stores: its launcher refuses more experts or slots than an i16 carries,
-    and a page off 16-byte alignment, before anything is launched."""
+    and a page off 128-byte alignment (each record one prefetch pair), before anything is launched."""
     c = Chain(tmp_path, start=False)
     try:
         c.plan([1], 0)
@@ -190,8 +190,8 @@ def test_the_post_launch_refuses_what_a_narrow_record_cannot_carry(tmp_path, cas
         elif case == "row_capacity":
             c.dev._row_capacities = (RECORD_ID_MAX + 1,) * len(c.dev._row_capacities)
         else:
-            c.dev.page = torch.zeros(PAGE_BYTES + 16, dtype=torch.uint8).pin_memory()[1 : 1 + PAGE_BYTES]
-        with pytest.raises(RuntimeError, match="16-byte" if case == "page" else "32767"):
+            c.dev.page = torch.zeros(PAGE_BYTES + 128, dtype=torch.uint8).pin_memory()[64 : 64 + PAGE_BYTES]
+        with pytest.raises(RuntimeError, match="128-byte" if case == "page" else "32767"):
             c.dev.post(0, backend.planned, plan.count, backend.routes, plan.slots)
     finally:
         c.close()

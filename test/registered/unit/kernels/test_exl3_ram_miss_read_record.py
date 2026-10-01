@@ -10,6 +10,9 @@ import torch
 
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import (
+    DEMAND_RECORDS,
+    DEMAND_RING,
+    PAGE_BYTES,
     RECORD_BYTES,
     RECORD_FIELDS,
     RECORD_FLAG_CAPTURED,
@@ -99,6 +102,14 @@ def test_a_record_the_device_never_writes_is_malformed(case):
 def test_a_record_whose_seq_is_not_the_expected_one_is_torn():
     record = write_record(seq=5 + 16, lanes=[(1, 2, 3, 0.5, int(LaneKind.HIT_SM))])
     assert read(record, 5)["status"] == "torn"
+
+
+def test_a_record_is_one_128_byte_prefetch_pair():
+    """The record's two cache lines are one 128-byte-aligned block, so an L2 miss on the first makes the adjacent-line
+    prefetcher fetch the second; the ring starts on such a block."""
+    assert RECORD_BYTES == 128 and DEMAND_RING % 128 == 0
+    assert RECORD_FIELDS["lane_weight"] + 4 * LANES == RECORD_BYTES
+    assert PAGE_BYTES == DEMAND_RING + DEMAND_RECORDS * RECORD_BYTES
 
 
 if __name__ == "__main__":
