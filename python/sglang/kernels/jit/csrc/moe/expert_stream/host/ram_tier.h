@@ -1454,6 +1454,9 @@ class RamTier {
       if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
       this->template count<kCopyJobs>();
       this->template count<kCopyLanes>(job.count + job.late_cpu);
+      const int cpu_hits = __builtin_popcount(job.cpu_mask);
+      this->template count<kCpuJobs>((cpu_hits > 0 ? 1 : 0) + (job.late_cpu > 0 ? 1 : 0));  // one job per part
+      this->template count<kCpuLanes>(cpu_hits + job.late_cpu);
       copy_engine_->submit(job);
     }
     // Victims and the delta, before any read. A miss lands in its staging slot whatever happens here; whether it is
