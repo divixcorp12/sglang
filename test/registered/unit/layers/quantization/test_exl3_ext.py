@@ -1,5 +1,6 @@
 """Pure helpers of the exllamav3 extension loader (no build, no GPU)."""
 
+import contextlib
 import os
 
 import pytest
@@ -52,6 +53,38 @@ def test_cpu_act_options_map_to_defines_and_flavor():
     assert exl3_ext.build_flavor(_defines(True, 0)) == "_resid"
 
 
+def _cpu_experts_defines(**flags):
+    """cpu_act_defines with SGLANG_DSV41_CPU_EXPERTS on and only the given SGLANG_EXL3_CPU_ACT_* flags set."""
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(True))
+        for name in ("SGLANG_EXL3_CPU_ACT_RESIDUAL", "SGLANG_EXL3_CPU_ACT_BLOCK"):
+            field = getattr(exl3_ext.envs, name)
+            if name in flags:
+                stack.enter_context(field.override(flags[name]))
+            elif field.is_set():
+                stack.callback(os.environ.__setitem__, name, os.environ[name])
+                field.clear()
+        return exl3_ext.cpu_act_defines()
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [{}, {"SGLANG_EXL3_CPU_ACT_RESIDUAL": True}, {"SGLANG_EXL3_CPU_ACT_RESIDUAL": True, "SGLANG_EXL3_CPU_ACT_BLOCK": 128}],
+)
+def test_cpu_experts_always_build_the_optimized_kernel(flags):
+    defines = _cpu_experts_defines(**flags)
+    assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"]
+    assert exl3_ext.optimized_cpu(defines) and exl3_ext.build_flavor(defines) == "_resid_b128_cpu_v1"
+
+
+@pytest.mark.parametrize(
+    "flags", [{"SGLANG_EXL3_CPU_ACT_RESIDUAL": False}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 64}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 0}]
+)
+def test_cpu_experts_refuse_another_accuracy_flavor(flags):
+    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_EXPERTS"):
+        _cpu_experts_defines(**flags)
+
+
 @pytest.mark.parametrize("block", [8, 100, -16])
 def test_cpu_act_block_must_be_a_multiple_of_16(block):
     with pytest.raises(ValueError, match="multiple of 16"):
@@ -87,11 +120,14 @@ def _load_args(tmp_path, monkeypatch, residual, block):
     monkeypatch.setattr(cpp_extension, "load", lambda **kw: calls.append(kw) or kw)
     exl3_ext.exl3_ext.cache_clear()
     try:
-        with exl3_ext.envs.SGLANG_EXL3_SRC.override(str(tmp_path)), exl3_ext.envs.SGLANG_EXL3_BUILD_DIR.override(
-            str(tmp_path / "build")
-        ), exl3_ext.envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.override(residual), exl3_ext.envs.SGLANG_EXL3_CPU_ACT_BLOCK.override(
-            block
-        ):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(exl3_ext.envs.SGLANG_EXL3_SRC.override(str(tmp_path)))
+            stack.enter_context(exl3_ext.envs.SGLANG_EXL3_BUILD_DIR.override(str(tmp_path / "build")))
+            # None leaves the flag unset (the caller cleared it).
+            if residual is not None:
+                stack.enter_context(exl3_ext.envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.override(residual))
+            if block is not None:
+                stack.enter_context(exl3_ext.envs.SGLANG_EXL3_CPU_ACT_BLOCK.override(block))
             exl3_ext.exl3_ext()
     finally:
         exl3_ext.exl3_ext.cache_clear()
@@ -122,6 +158,16 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_cpu_experts_build_the_optimized_extension(tmp_path, monkeypatch):
+    """With CPU experts on, the build is the optimized flavor even with both accuracy flags left unset."""
+    monkeypatch.delenv("SGLANG_EXL3_CPU_ACT_RESIDUAL", raising=False)
+    monkeypatch.delenv("SGLANG_EXL3_CPU_ACT_BLOCK", raising=False)
+    with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+        kw, _ = _load_args(tmp_path, monkeypatch, None, None)
+    assert kw["name"] == "sglang_exl3_ext_resid_b128_cpu_v1"
+    assert kw["sources"] == [exl3_ext.OPTIMIZED_CPU_KERNEL]
 
 
 def test_other_accuracy_flavors_keep_the_generic_kernel(tmp_path, monkeypatch):
