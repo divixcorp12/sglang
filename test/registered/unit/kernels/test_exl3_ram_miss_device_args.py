@@ -30,7 +30,7 @@ def _device(layers=2, experts=4, page=None, **kwargs):
     kwargs.setdefault("row_capacities", [5, 7][:layers] + [3] * max(0, layers - 2))
     kwargs.setdefault("timeout_ms", 10)
     return ExpertStreamDevice(
-        page, lease.new_lease_block(pin=False), device="cpu", layers=layers, experts=experts, **kwargs
+        page, lease.new_lease_block(layers, pin=False), device="cpu", layers=layers, experts=experts, **kwargs
     )
 
 
@@ -72,7 +72,7 @@ def test_an_unpinned_page_is_refused_for_a_cuda_device():
     # Checked before any CUDA call: the kernels read it through UVA.
     with pytest.raises(ValueError, match="pinned"):
         ExpertStreamDevice(
-            torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(pin=False), device="cuda", layers=2,
+            torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(2, pin=False), device="cuda", layers=2,
             experts=4, timeout_ms=10, piece_runs=_runs(), row_capacities=[5, 7],
         )
 
@@ -150,6 +150,7 @@ PYTHON_WIRE = {
     "kRecFlagCaptured": ram_miss.RECORD_FLAG_CAPTURED,
     "kRecChain": ram_miss.RECORD_FIELDS["chain"],
     "kRecChainHi": ram_miss.RECORD_FIELDS["chain_hi"],
+    "kRecEpoch": ram_miss.RECORD_FIELDS["epoch"],
     "kRecProtectCount": ram_miss.RECORD_FIELDS["protect_count"],
     "kRecProtect": ram_miss.RECORD_FIELDS["protect"],
     "kRecLanes": ram_miss.RECORD_FIELDS["lanes"],
@@ -183,6 +184,7 @@ PYTHON_WIRE = {
     "kCopyArmed": lease.COPY_ARMED,
     "kSplit": lease.SPLIT,
     "kLeaseBlockBytes": lease.BLOCK_BYTES,
+    "kDeltaBase": lease.DELTA_BASE,
     "kDeltaStride": lease.DELTA_STRIDE,
     "kDeltaTag": lease.DELTA_FIELDS["tag"],
     "kDeltaCount": lease.DELTA_FIELDS["count"],

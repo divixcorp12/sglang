@@ -62,7 +62,7 @@ def test_attach_reserves_k_staging_slots_and_publishes_tag_one(world):
 
 def test_attach_row_is_once_per_row(world):
     _, host, _ = world
-    with pytest.raises(RuntimeError, match="once"):
+    with pytest.raises(RuntimeError, match="command failed"):
         host.attach_row(0, K)
 
 
