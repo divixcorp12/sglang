@@ -8,6 +8,7 @@ kernel, S and CW do. It is a stand-in for the CUDA kernels and is not evidence a
 from __future__ import annotations
 
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -60,9 +61,19 @@ class SimRequest:
 
 class ChainSim:
     def __init__(self, host, page, slabs, *, epoch: int = 0):
-        self.host, self.page, self.slabs, self.epoch = host, page, slabs, epoch
-        self.block = host.lease_block
+        # A weak reference: a test may collect the host and keep posting into its page, as a device would.
+        self._host = weakref.ref(host)
+        self.page, self.slabs, self.epoch = page, slabs, epoch
+        self.block, self.hot_page = host.lease_block, host.hot_page
+        self.layers, self.experts = host.layers, host.experts
         self.replica = MapReplica(host.layers, host.experts)
+
+    @property
+    def host(self):
+        host = self._host()
+        if host is None:
+            raise RuntimeError("the host was collected")
+        return host
 
     # ---- words of the blocks ----
 
@@ -120,7 +131,7 @@ class ChainSim:
 
     def apply_bulk_like_device(self, bulk) -> None:
         """map_bulk_apply: every row's pending decode delta first, then the bulk entries."""
-        for row in range(self.host.layers):
+        for row in range(self.layers):
             self.apply_pending(row)
         self.replica.apply_bulk([tuple(int(v) for v in entry) for entry in bulk])
 
@@ -199,10 +210,10 @@ class ChainSim:
         return SimRequest(seq, gen, idx, row, experts, list(typed), slot_list, dst, chain)
 
     def _write_hot(self, seq: int, hot: Sequence[int], hot_seq: Optional[int]) -> None:
-        hot_page = self.host.hot_page
+        hot_page = self.hot_page
         if hot_page is None:
             return
-        experts = self.host.experts
+        experts = self.experts
         stride = hot_record_bytes(experts)
         record = hot_page[(seq - 1) % DEMAND_RECORDS * stride :][:stride]
         _i32(record, 0)[0] = 0

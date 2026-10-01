@@ -1412,6 +1412,7 @@ class RamTier {
       };
       if (is_miss(lane.kind)) {
         if (!listed(tier.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(at() + " is not a staging slot");
+        if (listed(slots, static_cast<int64_t>(lane.slot))) fail(at() + " shares its staging slot with another miss");
         if (tier.expert_slot[lane.expert] >= 0) fail(at() + " misses an expert the tier holds");
         if (lane.kind == kKindMissCpu) {
           if (!cpu_row || cpu_->parts() < 2) fail(at() + ": a CPU miss on a row without CPU experts' miss part");
