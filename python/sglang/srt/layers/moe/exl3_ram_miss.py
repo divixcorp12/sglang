@@ -1239,8 +1239,8 @@ class Exl3RamMissService:
         if self.device_side is not None:
             side = self.device_side
             owned += [
-                side.state, side.go_1, side.host_rows_1, side.dst_slots_1, side.claimed, side.ce_mask, side.cpu_lanes,
-                side.piece_runs,
+                side.state, side.go_1, side.host_rows_1, side.dst_slots_1, side.lane_kind, side.lane_slot, side.ce_mask,
+                side.cpu_lanes, side.piece_runs, *side.map_bank.values(),
             ]
         if self._trace_snapshot is not None:
             # A copy can still be writing this pinned block when the device
