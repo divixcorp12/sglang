@@ -113,8 +113,11 @@ unmaps. Sixteen entries are an insert and an eviction per lane.
    inserted, and is counted in `ram_insert_skipped`; the delta is still published, with whatever entries the record
    has, possibly none.
 4. **Read the misses** into their staging slots, publishing each piece's PieceMask bit as it lands.
-5. **A `MISS_CPU` lane** becomes a late part-1 CPU job (the `LateCpu` ring) once its read landed. The copy job's
-   completion waits for the DMA, part 0 and part 1 before it stores CopyDone.
+5. **CPU lanes go straight from the service to the CPU expert thread.** The service claims one job sequence per job
+   the record can need (the hits', one per `MISS_CPU` lane) and submits the hits as part 0 before the copy job. Each
+   `MISS_CPU` lane goes into part 1 as soon as its read landed; rows landing together share a job, and every job after
+   the record's first adds into the part, so its fp32 sum order follows landing order. The last miss job takes the last
+   claimed sequence. The copy job's completion waits for the DMA and for that sequence before it stores CopyDone.
 6. The host mirror (`slot_map`, read by the eager Python paths) shows an insert only after its bytes land; a victim's
    unmap is written to it at victim choice, before any read.
 

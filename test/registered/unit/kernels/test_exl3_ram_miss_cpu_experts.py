@@ -3,8 +3,9 @@
 Covers the CPU lanes the device typed and their completion.
 The device types the last ``split[n]`` of a captured post's n eligible lanes CPU: RAM hits, and NVMe misses with
 CPU-computed misses on (ram_slot_map.type_lanes; ChainSim plays it here).
-The copy thread hands the CPU hits to the CPU expert thread as part 0 and copies only the copy-engine hits; the
-service sends a record's CPU misses as one part-1 job once their rows landed.
+The service hands the CPU hits to the CPU expert thread as part 0 before the copy job, and the copy thread copies only
+the copy-engine hits; the service sends each CPU miss into part 1 once its row landed, adding into the part after the
+record's first miss job.
 CopyDone covers every host lane of the record once all of them are done.
 The forward here is a ctypes fake that records its calls and writes a known partial sum.
 
@@ -45,27 +46,31 @@ _FORWARD = ctypes.CFUNCTYPE(
     ctypes.c_int32,
     ctypes.POINTER(ctypes.c_float),
     ctypes.c_int32,
+    ctypes.c_int32,
 )
 
 
 class FakeForward:
-    """out[j] = sum_i weights[i] * (slots[i] + 1) + j; returns ``result``."""
+    """out[j] = sum_i weights[i] * (slots[i] + 1) + j, or that sum added to out[j] when accumulating; returns
+    ``result``."""
 
     def __init__(self, result: int = 0):
         self.result = result
         self.calls = []
+        self.accumulates = []
         self.affinities = []
         self.c = _FORWARD(self._run)  # kept alive for as long as the host may call it
 
-    def _run(self, layer, x, slots, weights, k, out, threads):
+    def _run(self, layer, x, slots, weights, k, out, threads, accumulate):
         self.affinities.append(os.sched_getaffinity(0))
         s = [slots[i] for i in range(k)]
         w = [weights[i] for i in range(k)]
         self.calls.append((layer, s, w, threads))
+        self.accumulates.append(bool(accumulate))
         if self.result == 0:
             total = sum(wi * (si + 1) for si, wi in zip(s, w))
             for j in range(HIDDEN):
-                out[j] = total + j
+                out[j] = (out[j] if accumulate else j) + total
         return self.result
 
     @property
@@ -255,6 +260,66 @@ def test_a_cpu_miss_runs_as_part_one_after_its_row_lands_and_copydone_waits_for_
         reference = s.reference(ROW, [5])
         assert all(torch.equal(landed[n].view(torch.uint8), reference[n][0].view(torch.uint8)) for n in landed)
         assert host.copy_engine_marked() == 0 and host.copy_engine_idle(5.0)
+    finally:
+        host.stop()
+
+
+
+# One row's pack takes this long under the pack_delay fault, so a record's two miss rows land well apart.
+SLOW_PACK_NS = 200_000_000
+
+
+def _two_cpu_misses(tmp_path, forward, **fault):
+    s, page, host, sim, dst, out_rows = _host(tmp_path, split=_split(n2=2), forward=forward)
+    host.set_cpu_layer(ROW, HANDLE)
+    if fault:
+        host.inject_fault(**fault)
+    req = _post(sim, [5, 6], dst=[0, 1], weights=[0.5, 0.25], cpu_misses=True)
+    assert req.kinds == [LaneKind.MISS_CPU, LaneKind.MISS_CPU]
+    return host, sim, req, out_rows
+
+
+def test_each_cpu_miss_runs_as_its_row_lands_and_later_jobs_add_into_part_one(tmp_path):
+    """Two CPU misses whose rows land apart go to the CPU as two part-1 jobs, the second adding into the part, and
+    CopyDone covers both. The fake needs the GIL that pump() holds, so it runs once pump() returns; the jobs' split
+    still shows the dispatch. Mutants: batch the misses until all land -- red on the one-slot calls; the second job
+    overwrites -- red on out_rows[ROW, 1]; the first job adds -- red on the accumulate flags."""
+    forward = FakeForward()
+    host, sim, req, out_rows = _two_cpu_misses(tmp_path, forward, pack_delay_ns=SLOW_PACK_NS)
+    try:
+        assert host.pump() == 1
+        assert _wait(lambda: len(forward.calls) == 2)
+        assert forward.accumulates == [False, True]
+        first, second = forward.calls
+        assert len(first[1]) == 1 and len(second[1]) == 1, "the misses were batched, not sent as each landed"
+        assert sorted(first[1] + second[1]) == sorted(req.slots)
+        assert _wait(lambda: sim.copy_done(req) == req.gen)
+        weights = dict(zip(req.slots, [0.5, 0.25]))
+        assert sorted(first[2] + second[2]) == [0.25, 0.5] and all(weights[c[1][0]] == c[2][0] for c in forward.calls)
+        expected = torch.arange(HIDDEN, dtype=torch.float32) + _sum(req.slots, [0.5, 0.25])
+        assert torch.equal(out_rows[ROW, 1], expected)
+        assert not out_rows[ROW, 0].any(), "a CPU miss wrote the hits' part"
+        counters = host.counters()
+        assert counters["cpu_jobs"] == 2 and counters["cpu_lanes"] == 2
+        assert host.copy_engine_idle(5.0)
+    finally:
+        host.inject_fault()
+        host.stop()
+
+
+def test_cpu_misses_landing_together_or_apart_sum_once_each_into_part_one(tmp_path):
+    """Whatever batching the reader's landing order gives, every CPU miss is computed exactly once, only the record's
+    first part-1 job overwrites, and CopyDone follows the last job."""
+    forward = FakeForward()
+    host, sim, req, out_rows = _two_cpu_misses(tmp_path, forward)
+    try:
+        assert host.pump() == 1
+        assert _wait(lambda: sim.copy_done(req) == req.gen)
+        assert sorted(slot for call in forward.calls for slot in call[1]) == sorted(req.slots)
+        assert forward.accumulates == [False] + [True] * (len(forward.calls) - 1)
+        expected = torch.arange(HIDDEN, dtype=torch.float32) + _sum(req.slots, [0.5, 0.25])
+        assert torch.equal(out_rows[ROW, 1], expected)
+        assert host.copy_engine_idle(5.0)
     finally:
         host.stop()
 

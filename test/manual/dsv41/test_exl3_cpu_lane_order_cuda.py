@@ -30,7 +30,7 @@ READY_STATE, FREE_STATE = 3, 0  # expert_residency_gpu's _READY and _FREE
 
 _FORWARD = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_int64, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int32, ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+    ctypes.c_int32, ctypes.POINTER(ctypes.c_float), ctypes.c_int32, ctypes.c_int32,
 )
 
 
@@ -41,10 +41,11 @@ class _Forward:
         self.calls = []
         self.c = _FORWARD(self._run)
 
-    def _run(self, layer, x, slots, weights, k, out, threads):
+    def _run(self, layer, x, slots, weights, k, out, threads, accumulate):
         self.calls.append((layer, [slots[i] for i in range(k)], [weights[i] for i in range(k)]))
-        for j in range(HIDDEN):
-            out[j] = 0.0
+        if not accumulate:
+            for j in range(HIDDEN):
+                out[j] = 0.0
         return 0
 
     @property
