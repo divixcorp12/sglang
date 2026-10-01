@@ -140,7 +140,7 @@ struct Workload {
 
   void forward(size_t layer) {
     if (sglang_exl3_cpu_experts_forward(handles[layer], fixture.layers[layer].input.data_ptr(),
-        slots.data(), weights.data(), experts, output.data(), options.workers))
+        slots.data(), weights.data(), experts, output.data(), options.workers, /*accumulate=*/0))
       throw std::runtime_error("Native CPU forward failed");
   }
 
