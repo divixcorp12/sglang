@@ -676,12 +676,19 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     return out
 
 
-# The request page (lease_layout.h): the demand ring's two words, then kDemandRecords records of RECORD_FIELDS.
-PAGE_BYTES = 2112
-RECORD_BYTES = 128
+# The request page (lease_layout.h): demand_head, then kDemandRecords records of RECORD_FIELDS; each record carries
+# MAX_IDS lanes of LANE_FIELDS and a kind byte per lane (ram_slot_map.LaneKind).
+PAGE_BYTES = 4160
+RECORD_BYTES = 256
 DEMAND_RING = 64
 DEMAND_RECORDS = 16
-RECORD_FIELDS = {"seq": 0, "row": 4, "protect_count": 6, "armed": 8, "protect": 16}
+RECORD_FIELDS = {
+    "seq": 0, "row": 4, "count": 6, "flags": 8, "chain": 12, "chain_hi": 16, "protect_count": 20, "protect": 32,
+    "lanes": 64, "kinds": 192,
+}
+RECORD_FLAG_CAPTURED = 1
+LANE_BYTES = 16
+LANE_FIELDS = {"expert": 0, "slot": 4, "dst": 8, "weight": 12}
 HOT_HEADER_BYTES = 8
 HOT_ALIGNMENT = 64
 HOT_RECORDS = DEMAND_RECORDS
@@ -698,7 +705,7 @@ def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
 
 
 MAX_IDS = 8
-WORDS = {"demand_head": 0, "demand_done": 4}
+WORDS = {"demand_head": 0}
 # Order of the C++ counters (tier_protocol.h). Demand rows per layer come only from ``ExpertStreamHost.layer_rows()``:
 # one word per layer written by the tier's owner.
 COUNTERS = (
