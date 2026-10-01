@@ -140,9 +140,10 @@ class ChainSim:
         hot_seq: Optional[int] = None,
         kinds: Optional[Sequence[int]] = None,
         slots: Optional[Sequence[int]] = None,
+        chain: Optional[int] = None,
     ) -> SimRequest:
         """The post kernel: apply the row's pending delta, type the lanes from the replica, then the hot record, the
-        record and demand_head. ``kinds``/``slots`` override the typing (a malformed post); ``hot`` is the VRAM hot
+        record and demand_head. ``kinds``/``slots`` override the typing and ``chain`` the map-chain number (a malformed post); ``hot`` is the VRAM hot
         set the hot record carries, ``hot_seq`` the seq it names (a stale record)."""
         experts = tuple(int(e) for e in experts)
         if experts and not self.apply_pending(row):
@@ -155,10 +156,12 @@ class ChainSim:
             )
         else:
             typed, slot_list = [LaneKind(k) for k in kinds], list(slots)
-        chain = 0
+        forged, chain = chain, 0
         if any(k in (LaneKind.MISS_GPU, LaneKind.MISS_CPU) for k in typed):
             self.replica.map_chain[row] += 1
             chain = self.replica.map_chain[row]
+        if forged is not None:
+            chain = forged
         head = page_word(self.page, "demand_head")
         seq = (head + 1) & 0xFFFFFFFF
         if seq == 0:

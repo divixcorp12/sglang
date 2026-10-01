@@ -179,9 +179,7 @@ def test_a_miss_outside_the_staging_list_aborts(tmp_path):
 def test_a_map_chain_out_of_order_aborts(tmp_path):
     """Mutation: the host accepts a record whose chain skips one, so its deltas and the device's map diverge."""
     out = _script(tmp_path, """
-        sim.replica.map_chain[0] += 1
-        sim.replica.map_applied[0] = sim.replica.map_chain[0]
-        req = sim.post(0, [2])
+        req = sim.post(0, [2], chain=3)
         host.pump()
         print("reached")
     """)
