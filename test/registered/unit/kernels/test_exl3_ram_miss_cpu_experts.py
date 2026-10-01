@@ -274,7 +274,7 @@ def _two_cpu_misses(tmp_path, forward, **fault):
     host.set_cpu_layer(ROW, HANDLE)
     if fault:
         host.inject_fault(**fault)
-    req = _post(sim, [5, 6], dst=[0, 1], weights=[0.5, 0.25], cpu_misses=True)
+    req = _post(sim, [5, 4], dst=[0, 1], weights=[0.5, 0.25], cpu_misses=True)
     assert req.kinds == [LaneKind.MISS_CPU, LaneKind.MISS_CPU]
     return host, sim, req, out_rows
 
