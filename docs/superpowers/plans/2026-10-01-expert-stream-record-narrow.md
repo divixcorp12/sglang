@@ -254,6 +254,16 @@ Record the passed/skipped/failed counts and EXIT in "Results".
 
 ### Task 2: Refuse what the narrow record cannot carry
 
+> **Revised during execution (owner's call):** the refusals live in C++, where the ids are narrowed, not in the
+> Python constructors below. `expert_stream_open` (`host/ffi_exports.h`) refuses `starts.size(1)` or any `capacity`
+> above `kRecIdMax`, before its table checks. The post launcher (`LeaseProtocolKernel::post`) refuses `experts` or
+> `row_capacity` above `kRecIdMax`, and a page off 16-byte alignment, before any matcher. `kRecIdMax` lands in
+> `lease_layout.h` in this task, mapped in `PYTHON_WIRE`, so Task 3 does not add it again. Tests:
+> `test_the_host_module_refuses_tables_its_records_cannot_carry` (registered, CPU) calls `expert_stream_open`
+> directly, and `test_the_post_launch_refuses_what_a_narrow_record_cannot_carry` (manual GPU) covers the device
+> launcher. Commits `7f51f0060e` (RED) and `67567732ba` (GREEN). The steps below are the original Python version,
+> superseded.
+
 **Files:**
 - Modify: `python/sglang/kernels/ops/moe/expert_stream_transport.py` (`ExpertStreamDevice.__init__`, ~line 1327;
   `ExpertStreamHost.__init__`, ~line 803; the `RECORD_FIELDS` block ~line 684)
