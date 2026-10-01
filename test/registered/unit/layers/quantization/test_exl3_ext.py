@@ -47,7 +47,7 @@ def test_cpu_act_options_default_to_upstream():
 def test_cpu_act_options_map_to_defines_and_flavor():
     defines = _defines(True, 128)
     assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"]
-    assert exl3_ext.build_flavor(defines) == "_resid_b128"
+    assert exl3_ext.build_flavor(defines) == "_resid_b128_cpu_v1"
     assert exl3_ext.build_flavor(_defines(False, 64)) == "_b64"
     assert exl3_ext.build_flavor(_defines(True, 0)) == "_resid"
 
@@ -72,6 +72,7 @@ def test_vendored_kernel_replaces_upstreams_only(tmp_path):
 
 def test_vendored_kernel_is_in_the_tree():
     assert os.path.isfile(exl3_ext.VENDORED_CPU_KERNEL)
+    assert os.path.isfile(exl3_ext.OPTIMIZED_CPU_KERNEL)
 
 
 def _load_args(tmp_path, monkeypatch, residual, block):
@@ -82,6 +83,7 @@ def _load_args(tmp_path, monkeypatch, residual, block):
     (ext_dir / "cpu" / "moe_mul1.cpp").write_text("")
     calls = []
     monkeypatch.setattr(exl3_ext, "_checked_ext_dir", lambda src: str(ext_dir))
+    monkeypatch.setattr(exl3_ext, "check_cpu_compiler", lambda: None)
     monkeypatch.setattr(cpp_extension, "load", lambda **kw: calls.append(kw) or kw)
     exl3_ext.exl3_ext.cache_clear()
     try:
@@ -108,10 +110,11 @@ def test_default_build_is_upstreams(tmp_path, monkeypatch):
 
 def test_flavored_build_has_its_own_name_directory_and_kernel(tmp_path, monkeypatch):
     kw, ext_dir = _load_args(tmp_path, monkeypatch, True, 128)
-    assert kw["name"] == "sglang_exl3_ext_resid_b128"
-    assert kw["build_directory"] == str(tmp_path / "build" / "resid_b128")
-    assert kw["sources"] == [exl3_ext.VENDORED_CPU_KERNEL]
-    assert kw["extra_cflags"] == ["-Ofast", "-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"]
+    assert kw["name"] == "sglang_exl3_ext_resid_b128_cpu_v1"
+    assert kw["build_directory"] == str(tmp_path / "build" / "resid_b128_cpu_v1")
+    assert kw["sources"] == [exl3_ext.OPTIMIZED_CPU_KERNEL]
+    assert kw["extra_cflags"] == ["-Ofast", "-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128", "-march=native", "-std=c++20", "-fopenmp", "-pthread"]
+    assert kw["extra_ldflags"] == ["-fopenmp"]
     assert kw["extra_include_paths"] == [str(ext_dir), str(ext_dir / "cpu")]
 
 
@@ -119,3 +122,17 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_other_accuracy_flavors_keep_the_generic_kernel(tmp_path, monkeypatch):
+    kw, _ = _load_args(tmp_path, monkeypatch, False, 64)
+    assert kw["sources"] == [exl3_ext.VENDORED_CPU_KERNEL]
+    assert "-fopenmp" not in kw["extra_cflags"]
+    assert kw["extra_ldflags"] == []
+
+
+def test_optimized_compiler_rejects_known_rounding_change(monkeypatch):
+    monkeypatch.setenv("CXX", "/new/g++")
+    monkeypatch.setattr(exl3_ext.subprocess, "check_output", lambda *args, **kw: "17.0.0\n")
+    with pytest.raises(RuntimeError, match="require GCC 15"):
+        exl3_ext.check_cpu_compiler()

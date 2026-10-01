@@ -30,7 +30,26 @@ _EXTRA_CUDA_CFLAGS = [
 
 # exllamav3's CPU MoE kernel with this fork's accuracy options (see its header).
 VENDORED_CPU_KERNEL = os.path.join(os.path.dirname(__file__), "exl3_cpu", "moe_mul1.cpp")
+OPTIMIZED_CPU_KERNEL = os.path.join(os.path.dirname(__file__), "exl3_cpu", "optimized", "moe_mul1.cpp")
 _UPSTREAM_CPU_KERNEL = os.path.join("cpu", "moe_mul1.cpp")
+
+
+def optimized_cpu(defines: list[str]) -> bool:
+    return "-DEXL3_MOE_CPU_ACT_RESIDUAL=1" in defines and "-DEXL3_MOE_CPU_ACT_BLOCK=128" in defines
+
+
+def check_cpu_compiler() -> None:
+    """The recorded winning arithmetic and OpenMP unrolling were validated with GCC 15."""
+    compiler = os.environ.get("CXX", "c++")
+    version = subprocess.check_output([compiler, "-dumpfullversion", "-dumpversion"], text=True).strip()
+    if version.split(".", 1)[0] != "15":
+        raise RuntimeError(
+            f"optimized EXL3 CPU experts require GCC 15; {compiler} reports {version}. "
+            "Set CXX to your GCC 15 g++ before building the extension."
+        )
+    identity = subprocess.check_output([compiler, "--version"], text=True)
+    if "clang" in identity.lower():
+        raise RuntimeError("optimized EXL3 CPU experts require GCC 15, rather than Clang")
 
 
 def cpu_act_defines() -> list[str]:
@@ -54,6 +73,8 @@ def build_flavor(defines: list[str]) -> str:
     for d in defines:
         if d.startswith("-DEXL3_MOE_CPU_ACT_BLOCK="):
             flavor += "_b" + d.split("=", 1)[1]
+    if optimized_cpu(defines):
+        flavor += "_cpu_v1"
     return flavor
 
 
@@ -92,6 +113,9 @@ def exl3_ext():
     ext_dir = _checked_ext_dir(src)
     defines = cpu_act_defines()
     flavor = build_flavor(defines)
+    optimized = optimized_cpu(defines)
+    if optimized:
+        check_cpu_compiler()
     # One build directory per flavor: extensions sharing a directory overwrite each other's build.ninja.
     build_dir = os.path.expanduser(envs.SGLANG_EXL3_BUILD_DIR.get())
     if flavor:
@@ -104,10 +128,11 @@ def exl3_ext():
 
     return load(
         name="sglang_exl3_ext" + flavor,
-        sources=extension_sources(ext_dir, VENDORED_CPU_KERNEL if flavor else None),
-        # The vendored kernel includes "moe_mul1.h" from upstream's cpu/ directory.
+        sources=extension_sources(ext_dir, OPTIMIZED_CPU_KERNEL if optimized else VENDORED_CPU_KERNEL if flavor else None),
+        # The generic vendored kernel uses the upstream CPU header; optimized has its own.
         extra_include_paths=[ext_dir] + ([os.path.join(ext_dir, "cpu")] if flavor else []),
-        extra_cflags=_EXTRA_CFLAGS + defines,
+        extra_cflags=_EXTRA_CFLAGS + defines + (["-march=native", "-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
+        extra_ldflags=["-fopenmp"] if optimized else [],
         extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,
         build_directory=build_dir,
         verbose=False,

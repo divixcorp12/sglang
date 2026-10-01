@@ -54,9 +54,11 @@ class FakeForward:
     def __init__(self, result: int = 0):
         self.result = result
         self.calls = []
+        self.affinities = []
         self.c = _FORWARD(self._run)  # kept alive for as long as the host may call it
 
     def _run(self, layer, x, slots, weights, k, out, threads):
+        self.affinities.append(os.sched_getaffinity(0))
         s = [slots[i] for i in range(k)]
         w = [weights[i] for i in range(k)]
         self.calls.append((layer, s, w, threads))
@@ -177,6 +179,7 @@ def test_a_job_of_cpu_lanes_only_completes_without_any_copy(tmp_path):
         assert host.pump() == 1
         assert _wait(lambda: sim.copy_done(req) == req.gen)
         assert forward.calls == [(HANDLE, [_slot_of(host, 3), _slot_of(host, 1)], [1.0, 2.0], 2)]
+        assert forward.affinities == [{_cores()[0]}]
         assert host.copy_engine_marked() == 0
         assert host.copy_engine_idle(5.0)
         assert all(not dst[n].view(torch.uint8).any() for n in dst)

@@ -57,7 +57,7 @@ struct CpuExpertConfig {
   int64_t out_part_stride = 0;  // 0: one part, so CPU misses are refused (RamTier::serve_record)
   int64_t hidden = 0;
   int threads = 1;
-  std::vector<int> cores;  // this thread's affinity, which the kernel's own workers may inherit
+  std::vector<int> cores;  // worker 0 uses the first CPU; the kernel pins each helper to its assigned CPU
   int64_t spin_ns = 50'000'000;
 };
 
@@ -166,9 +166,8 @@ class CpuExpertEngine {
     if (!config_.cores.empty()) {
       cpu_set_t set;
       CPU_ZERO(&set);
-      for (int core : config_.cores)
-        CPU_SET(core, &set);
-      if (sched_setaffinity(0, sizeof(set), &set) != 0) error = "cannot pin the CPU expert thread to its cores";
+      CPU_SET(config_.cores.front(), &set);
+      if (sched_setaffinity(0, sizeof(set), &set) != 0) error = "cannot pin the CPU expert thread to its caller core";
     }
     {
       std::lock_guard<std::mutex> guard(start_mutex_);
