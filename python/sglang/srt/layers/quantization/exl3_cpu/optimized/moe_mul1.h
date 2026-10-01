@@ -93,8 +93,7 @@ void exl3_moe_cpu_forward_raw
     float* out,
     int rows,
     int topk,
-    int threads,
-    bool accumulate = false     // add into out instead of overwriting it
+    int threads
 );
 
 // Copy `count` experts' packed trellis tensors (gate, up, down order; gate absent when

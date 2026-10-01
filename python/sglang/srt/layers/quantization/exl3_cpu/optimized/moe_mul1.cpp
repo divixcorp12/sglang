@@ -2998,7 +2998,9 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
     return anomalies;
 }
 
-void exl3_moe_cpu_forward_raw(
+// exl3_moe_cpu_forward_raw, adding into out when `accumulate`: the sglang C ABI's forward. Other units of the
+// extension are built against upstream's header, so the public signature stays as upstream declares it.
+static void forward_raw(
     int64_t handle,
     const at::Half* x,
     const int32_t* sel,
@@ -3167,6 +3169,20 @@ void exl3_moe_cpu_forward_raw(
     give_back();
 }
 
+void exl3_moe_cpu_forward_raw(
+    int64_t handle,
+    const at::Half* x,
+    const int32_t* sel,
+    const at::Half* wts,
+    float* out,
+    int rows,
+    int topk,
+    int threads
+)
+{
+    forward_raw(handle, x, sel, wts, out, rows, topk, threads, false);
+}
+
 void exl3_moe_cpu_forward
 (
     int64_t handle,
@@ -3224,7 +3240,7 @@ extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_fo
     {
         at::Half wts[32];
         for (int32_t i = 0; i < k; ++i) wts[i] = at::Half(weights[i]);
-        exl3_moe_cpu_forward_raw(handle, static_cast<const at::Half*>(x), slots, wts, out, 1, k, threads, accumulate != 0);
+        forward_raw(handle, static_cast<const at::Half*>(x), slots, wts, out, 1, k, threads, accumulate != 0);
         return 0;
     }
     catch (...)
