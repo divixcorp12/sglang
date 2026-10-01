@@ -841,7 +841,13 @@ class Exl3RamMissService:
         row = self.row_of(streamer.layer_id)
         # The row's staging slots, once: one per lane a post can miss (LEASE_PROTOCOL.md).
         if row not in self._attached_rows:
-            self.host.attach_row(row, max(1, streamer.graph_gather_rows))
+            want = max(1, streamer.graph_gather_rows)
+            k = min(want, int(self.host.tables.capacity[row]) - 1)
+            if k < want:
+                # A small test tier; a post with more misses than k traps on the device ("no staging slot").
+                logger.warning("exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d", row, k, want,
+                               int(self.host.tables.capacity[row]))
+            self.host.attach_row(row, k)
             self._attached_rows.add(row)
         if self.route_log is not None:
             self.route_log.bind(row, streamer.layer_id, cache.capacity)

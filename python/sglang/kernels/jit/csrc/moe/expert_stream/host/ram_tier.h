@@ -155,7 +155,8 @@ class RamTier {
     int64_t (*snapshot)(RamTier*, const Command&) = nullptr;
     int64_t* out = nullptr;
     const void* input = nullptr;  // kSnapshot: an argument the caller keeps alive (victim_census's wanted list)
-    int64_t* result = nullptr;    // kSnapshot, kInjectLease: the answer
+    int64_t* result = nullptr;    // kSnapshot, kAttachRow: the answer
+    std::string* error = nullptr;  // the owner's exception message when its body threw
     std::atomic<uint32_t>* done = nullptr;
   };
 
@@ -190,10 +191,14 @@ class RamTier {
   // The service cannot park meanwhile: a pause takes caller_mutex_, which this caller holds.
   void run_as_owner(Command command) {
     std::atomic<uint32_t> done{0};
+    std::string error;
     std::lock_guard<std::mutex> caller(caller_mutex_);
     if (!caller_owns()) {
       const bool wait = command.kind != Command::kSetHot;
-      if (wait) command.done = &done;
+      if (wait) {
+        command.done = &done;
+        command.error = &error;
+      }
       bool queued = false;
       while (!caller_owns()) {
         if (commands_.push(command)) {
@@ -211,14 +216,15 @@ class RamTier {
             std::this_thread::sleep_for(std::chrono::microseconds(20));
           }
         }
-        command_outcome(done.load(std::memory_order_acquire));
+        command_outcome(done.load(std::memory_order_acquire), error);
         return;
       }
     }
     drain_commands();  // anything queued before the handoff comes first
     command.done = &done;
+    command.error = &error;
     apply_command(command);
-    command_outcome(done.load(std::memory_order_acquire));
+    command_outcome(done.load(std::memory_order_acquire), error);
   }
 
   // Serve the next posted demand record, if any. True when it handled one.
@@ -902,6 +908,9 @@ class RamTier {
           value = c.snapshot(this, c);
           break;
       }
+    } catch (const std::exception& e) {
+      outcome = 2;
+      if (c.error != nullptr) *c.error = e.what();  // the waiting caller reads it after its acquire of `done`
     } catch (...) {
       outcome = 2;
     }
@@ -940,8 +949,9 @@ class RamTier {
     }
   }
 
-  void command_outcome(uint32_t outcome) const {
-    if (outcome == 2) throw std::runtime_error(error_prefix<Layout>() + "a Python command failed on the tier's owner");
+  void command_outcome(uint32_t outcome, const std::string& error) const {
+    if (outcome == 2)
+      throw std::runtime_error(error_prefix<Layout>() + "a Python command failed on the tier's owner: " + error);
   }
 
   void require_owner(const char* what) const {
