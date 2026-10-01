@@ -80,6 +80,35 @@ def test_a_gather_wider_than_the_lanes_is_refused_before_anything_is_built(tiers
     assert not hasattr(streamers[1].row_backend, "device_side")  # the layer keeps its previous backend
 
 
+def test_attach_unmaps_on_a_full_tier_reach_the_device_before_any_post(tiers, monkeypatch):
+    """A full tier: attach evicts rows to make its staging slots. Those unmaps must reach the device's map before the
+    service runs again -- a captured warm-up decode would otherwise type a hit on a slot the host now stages into, and
+    the host would fail-stop. The device here is CPU-resident, so its bulk apply is recorded instead of launched."""
+    service, streamers = tiers
+    service.ensure_started()
+    service.before_host_use()
+    for row in range(LAYERS):
+        for expert in range(CAPACITY):
+            service.host.assign(row, expert)
+    service.after_host_use()
+    applied = []
+    monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, bulk: applied.extend(bulk.tolist()))
+    _attach(service, streamers[0], 1)
+    service.before_host_use()
+    try:
+        mapping = service.host.mapping(service.row_of(0))
+    finally:
+        service.after_host_use()
+    row = service.row_of(0)
+    replica = {}
+    for r, expert, slot in applied:
+        if r == row:
+            replica[expert] = slot
+    evicted = [e for e in range(CAPACITY) if mapping[e] < 0]
+    assert evicted, "the full tier gave attach nothing to evict"
+    assert all(replica.get(e) == -1 for e in evicted), (evicted, replica)
+
+
 def test_cpu_experts_refuse_a_manager_without_direct_residency(tiers):
     """The miss order CPU experts rely on is DIRECT's victim ranking; without the updater there is none to sort by."""
     service, streamers = tiers
