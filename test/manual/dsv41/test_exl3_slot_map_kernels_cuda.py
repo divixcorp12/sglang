@@ -170,6 +170,39 @@ def test_post_waits_for_delta_then_traps_at_deadline(tmp_path):
     assert 0.3 <= float(line.split()[1]) < 10.0, line
 
 
+_REPEATED_EXPERT_SCRIPT = """
+import sys
+import torch
+sys.path.insert(0, sys.argv[2])
+from lease_chain_rig import Chain
+c = Chain(sys.argv[1], start=False)
+c.plan([5, 6])
+b, p = c.backends[0], c.plans[0]
+b._stage_planned(p)
+b.planned[1] = 5  # a repeated expert: the reference raises, so the post must trap
+c.dev.post(0, b.planned, p.count, b.routes, p.slots)
+try:
+    torch.cuda.synchronize()
+    print("reached", flush=True)
+except RuntimeError as error:
+    print(f"trapped {error}", flush=True)
+import os
+os._exit(0)
+"""
+
+
+def test_post_traps_on_a_repeated_expert(tmp_path):
+    """Review Focus 5: once type_lanes loads every lane before deciding, a plan the reference rejects still traps
+    instead of being typed."""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_REPEATED_EXPERT_SCRIPT), str(tmp_path), str(Path(__file__).parent)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert "reached" not in result.stdout, result.stdout
+    assert any(line.startswith("trapped") for line in result.stdout.splitlines()), (
+        result.returncode, result.stdout[-2000:], result.stderr[-2000:])
+
+
 def test_miss_streams_from_the_staging_slot_byte_exact(tmp_path):
     c = Chain(tmp_path)
     try:
