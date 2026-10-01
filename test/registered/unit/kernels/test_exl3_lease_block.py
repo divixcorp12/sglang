@@ -19,8 +19,9 @@ def test_the_areas_are_where_the_protocol_puts_them():
 def test_a_delta_record_fits_its_stride_and_each_starts_a_new_line():
     f = lease.DELTA_FIELDS
     assert f["tag"] + 8 == f["count"] and f["staging"] >= f["count"] + 4
-    assert f["entries"] == f["staging"] + 4 * lease.LANES
-    assert f["entries"] + 8 * lease.DELTA_MAX_ENTRIES <= lease.DELTA_STRIDE and lease.DELTA_STRIDE % 128 == 0
+    assert f["staging"] % 16 == 0 and f["entries"] % 16 == 0, "the post reads both with 16-byte loads"
+    assert f["entries"] == f["staging"] + 2 * lease.LANES, "i16 staging slots"
+    assert f["entries"] + 4 * lease.DELTA_MAX_ENTRIES <= lease.DELTA_STRIDE and lease.DELTA_STRIDE % 128 == 0
     assert lease.DELTA_MAX_ENTRIES == 2 * lease.LANES, "an insert and an eviction per lane"
 
 
