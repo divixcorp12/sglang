@@ -37,7 +37,7 @@ def hang_guard():
 
 
 @pytest.fixture
-def tiers(tmp_path, monkeypatch, request):
+def tiers(tmp_path, monkeypatch):
     """The service reads row images with O_DIRECT (service_row_images), as in production; a demand is posted as the
     device posts it (_demand)."""
     write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
@@ -55,8 +55,8 @@ def tiers(tmp_path, monkeypatch, request):
                 streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
                 layer._nvfp4_expert_streamer = streamer
                 options = fmt.pinned_tier_options(layer)
-                capacity = getattr(request, "param", CAPACITY)  # a test that stages a slot asks for one more
-                caches[layer_id] = ExpertPinnedHostCache(streamer, capacity, device="cpu", **options)
+                # One more than the mappable rows: the service stages one slot per row (staging_slots).
+                caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY + 1, device="cpu", **options)
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
         service.staging_slots = 1
@@ -1133,7 +1133,6 @@ def _gather(cache, expert):
     cache.gather_rows(torch.tensor([expert]), outputs)
 
 
-@pytest.mark.parametrize("tiers", [CAPACITY + 1], indirect=True)  # one slot is staging: three mappable rows
 @pytest.mark.parametrize("on, survivors", [(False, [3, 4, 5]), (True, [1, 2, 5])], ids=["flag_off", "flag_on"])
 def test_decode_rows_survive_a_prefills_admissions_under_the_prefill_share(tiers, monkeypatch, on, survivors):
     """The flag's purpose, through the real eager path: decode's rows (read by the thread) survive a prefill's
