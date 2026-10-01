@@ -116,13 +116,25 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           .experts = p.experts,
           .row_capacity = p.row_capacity,
       };
+      LanePolicy policy{
+          .host_lanes = false,
+          .hit_copy_ce = p.hit_copy_ce != 0,
+          .cpu_on = p.cpu_on != 0,
+          .cpu_misses = p.cpu_misses != 0,
+          .ce_ok = p.ce_ok[p.row] != 0,
+          .cpu_ok = p.cpu_ok[p.row] != 0,
+          .dst_rows = p.dst_rows[p.row],
+      };
+      // Before the tag spin: the host stores split relaxed at any time, ordered by nothing (ram_tier.h set_cpu_split).
+      load_split(p.lease + kSplit, policy.split);
       const uint8_t* delta = p.lease + kDeltaBase + p.row * kDeltaStride;
-      if (await_map_delta(delta, map, deadline)) apply_map_delta(load_map_delta(delta), map);
-      const bool host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + kCopyArmed) == 1u;
-      type_lanes(
-          p.planned, count, p.experts, map.ram_slot, map.staging, p.lease + kSplit, host_lanes, p.hit_copy_ce != 0,
-          p.cpu_on != 0, p.cpu_misses != 0, p.ce_ok[p.row] != 0, p.cpu_ok[p.row] != 0, p.dst_slots, p.dst_rows[p.row],
-          p.row_capacity, typed);
+      const bool pending = await_map_delta(delta, map, deadline);
+      MapDelta d;
+      if (pending) d = load_map_delta(delta);
+      // After the tag's acquire, as before, and issued while the delta's loads are in flight.
+      policy.host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + kCopyArmed) == 1u;
+      if (pending) apply_map_delta(d, map);
+      type_lanes(LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count}, map, policy, typed);
       for (int64_t j = 0; j < count; ++j)
         any_cpu |= is_cpu_kind(typed.kind[j]) ? 1 : 0;
     }

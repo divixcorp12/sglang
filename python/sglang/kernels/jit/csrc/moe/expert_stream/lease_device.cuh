@@ -288,46 +288,94 @@ SGL_DEVICE void apply_map_delta(const MapDelta& d, const RowMap& map) {
   *map.map_applied = *map.map_chain;
 }
 
+// The plan as the post reads it: count planned experts and their VRAM destination slots, device memory.
+struct LanePlan {
+  const int64_t* planned;
+  const int32_t* dst;
+  int64_t count;
+};
+
+// Everything besides the map that decides a lane's kind, loaded before type_lanes runs.
+struct LanePolicy {
+  bool host_lanes;   // a captured post while the copy engine is armed (kCopyArmed)
+  bool hit_copy_ce;  // SGLANG_DSV41_RAM_HIT_COPY=ce
+  bool cpu_on;
+  bool cpu_misses;
+  bool ce_ok;   // the row's copy table is set
+  bool cpu_ok;  // the row's CPU layer is registered
+  int32_t dst_rows;
+  int32_t split[kLeaseLanes + 1];  // kSplit: CPU lanes per n eligible lanes
+};
+
+// kSplit's table in three 16-byte loads; the last three words loaded lie past the table and are dropped.
+SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[kLeaseLanes + 1]) {
+  static_assert(kSplit % 16 == 0 && kSplit + 48 <= kLeaseBlockBytes && kLeaseLanes + 1 <= 12, "three loads");
+  uint4 v[3];
+#pragma unroll
+  for (int i = 0; i < 3; ++i)
+    v[i] = ld_relaxed_sys_v4(split + 16 * i);
+  const uint32_t words[12] = {v[0].x, v[0].y, v[0].z, v[0].w, v[1].x, v[1].y, v[1].z, v[1].w,
+                              v[2].x, v[2].y, v[2].z, v[2].w};
+#pragma unroll
+  for (int n = 0; n <= kLeaseLanes; ++n)
+    out[n] = static_cast<int32_t>(words[n]);
+}
+
 // ram_slot_map.type_lanes, transcribed: each lane's kind and source slot. A hit takes its RAM slot, the m-th miss
 // the m-th staging slot; the CPU takes the last split[n] of the n eligible lanes in plan order. Traps where the
-// reference raises (a wider plan, a repeated expert, a miss with no staging slot, a split entry above n).
-SGL_DEVICE void type_lanes(
-    const int64_t* planned, int64_t count, int64_t experts, const int32_t* ram_slot_row, const int32_t* staging_row,
-    const uint8_t* split, bool host_lanes, bool hit_copy_ce, bool cpu_on, bool cpu_misses, bool ce_ok, bool cpu_ok,
-    const int32_t* dst, int32_t dst_rows, uint32_t row_capacity, TypedLanes& out) {
-  if (count > kMaxIds) __trap();
+// reference raises (a wider plan, a repeated expert, a miss with no staging slot, a split entry above n). It reads no
+// host memory: the caller loads the split table into the policy.
+SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
+  if (plan.count > kMaxIds) __trap();
+  int64_t expert[kMaxIds];
+  int32_t dst[kMaxIds];
+  int32_t ram[kMaxIds];
+  int32_t staging[kLeaseLanes];
+#pragma unroll
+  for (int j = 0; j < kMaxIds; ++j) {
+    expert[j] = j < plan.count ? plan.planned[j] : 0;
+    dst[j] = j < plan.count ? plan.dst[j] : -1;
+  }
+#pragma unroll
+  for (int k = 0; k < kLeaseLanes; ++k)
+    staging[k] = map.staging[k];
+#pragma unroll
+  for (int j = 0; j < kMaxIds; ++j)
+    if (j < plan.count && (expert[j] < 0 || expert[j] >= map.experts)) __trap();
+#pragma unroll
+  for (int j = 0; j < kMaxIds; ++j)
+    ram[j] = j < plan.count ? map.ram_slot[expert[j]] : -1;
   bool hit[kMaxIds];
   bool eligible[kMaxIds];
   int m = 0;
   int n = 0;
-  for (int64_t j = 0; j < count; ++j) {
-    const int64_t expert = planned[j];
-    if (expert < 0 || expert >= experts) __trap();
-    for (int64_t i = 0; i < j; ++i)
-      if (planned[i] == expert) __trap();
-    const int32_t slot = ram_slot_row[expert];
-    hit[j] = slot >= 0;
+#pragma unroll
+  for (int j = 0; j < kMaxIds; ++j) {
+    if (j >= plan.count) break;
+    for (int i = 0; i < j; ++i)
+      if (expert[i] == expert[j]) __trap();
+    hit[j] = ram[j] >= 0;
     if (hit[j]) {
-      if (static_cast<uint32_t>(slot) >= row_capacity) __trap();
-      out.slot[j] = slot;
+      if (static_cast<uint32_t>(ram[j]) >= map.row_capacity) __trap();
+      out.slot[j] = ram[j];
     } else {
-      if (m >= kLeaseLanes || staging_row[m] < 0) __trap();
-      out.slot[j] = staging_row[m++];
+      if (m >= kLeaseLanes || staging[m] < 0) __trap();
+      out.slot[j] = staging[m++];
     }
-    eligible[j] = host_lanes && cpu_on && cpu_ok && (hit[j] || cpu_misses);
+    eligible[j] = policy.host_lanes && policy.cpu_on && policy.cpu_ok && (hit[j] || policy.cpu_misses);
     n += eligible[j] ? 1 : 0;
   }
-  int take = n > 0 ? ld_relaxed_sys<int32_t>(split + 4 * n) : 0;
+  int take = n > 0 ? policy.split[n] : 0;
   if (take < 0 || take > n) __trap();
-  const bool copy_ok = host_lanes && hit_copy_ce && ce_ok;
-  for (int64_t j = count - 1; j >= 0; --j) {
+  const bool copy_ok = policy.host_lanes && policy.hit_copy_ce && policy.ce_ok;
+  for (int64_t j = plan.count - 1; j >= 0; --j) {
     const bool cpu = take > 0 && eligible[j];
     if (cpu) --take;
     uint8_t kind;
     if (cpu) {
       kind = hit[j] ? kKindHitCpu : kKindMissCpu;
     } else if (hit[j]) {
-      kind = copy_ok && dst[j] >= 0 && dst[j] < dst_rows ? kKindHitCopy : kKindHitSm;
+      kind = copy_ok && dst[j] >= 0 && dst[j] < policy.dst_rows ? kKindHitCopy : kKindHitSm;
     } else {
       kind = kKindMissGpu;
     }
