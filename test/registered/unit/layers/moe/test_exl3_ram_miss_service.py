@@ -359,6 +359,25 @@ def test_expert_to_slot_is_rebuilt_only_when_the_slot_map_changes(tiers, monkeyp
     assert dict(table.expert_to_slot) == {e: s for e, s in enumerate(mapping(service.row_of(0))) if s >= 0}
 
 
+def test_expert_to_slot_and_slot_to_expert_read_the_published_map_not_a_snapshot(tiers, monkeypatch):
+    service, streamers, caches = tiers
+    cache = caches[0]
+    cache.ensure_rows(torch.tensor([1, 2]))
+    table = cache._lru
+    host = service.host
+    snapshots = []
+    for name in ("lru_order", "slot_to_expert", "slot_info", "victim_census"):
+        monkeypatch.setattr(host, name, lambda *a, _n=name, **k: snapshots.append(_n))
+    row = service.row_of(0)
+    mapping = host.mapping(row)
+    assert table.expert_to_slot == {e: s for e, s in enumerate(mapping) if s >= 0}
+    inverse = table.slot_to_expert
+    assert len(inverse) == table.capacity
+    assert all(inverse[s] == e for e, s in enumerate(mapping) if s >= 0)
+    assert sum(1 for e in inverse if e >= 0) == sum(1 for s in mapping if s >= 0)
+    assert snapshots == []
+
+
 def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, monkeypatch):
     """Minor 5: the watchdog's limit follows SGLANG_DSV41_RAM_MISS_TIMEOUT_MS, so a slow drive's
     demand fails stop through the device wait, not the watchdog's abort."""
