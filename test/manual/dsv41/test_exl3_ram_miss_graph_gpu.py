@@ -74,7 +74,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import DirectUpdaterStandIn, paused, service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import DirectUpdaterStandIn, service_row_images
 
     write_fake_exl3(str(tmp_path), num_layers=num_layers, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     layout = build_exl3_expert_layout(str(tmp_path))
@@ -143,7 +143,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-    from sglang.test.dsv41_ram_miss_fixtures import service_row_images
+    from sglang.test.dsv41_ram_miss_fixtures import paused, service_row_images
 
     experts = 36
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=experts, hidden=HIDDEN, inter=INTER, finite=True)
@@ -339,8 +339,9 @@ def _replay_step(pairs, service, inputs, graph, step, checks):
     """Replay every layer on routes that miss its pinned tier; each layer's misses must be read and none dropped."""
     expected = []
     for layer_id, (_, streamer) in enumerate(pairs):
-        # A snapshot: the running service owns the tier, and membership queries refuse unpaused.
-        hot, tier = streamer.hot_cache.slot_to_expert, service.host.slot_to_expert(service.row_of(streamer.layer_id))
+        # The published map, read without pausing: between replays every row the tier holds is READY.
+        mapping = service.host.mapping(service.row_of(streamer.layer_id))
+        hot, tier = streamer.hot_cache.slot_to_expert, [e for e, slot in enumerate(mapping) if slot >= 0]
         missing = [e for e in _step_route(layer_id, step) if e not in hot and e not in tier]
         # A layer with nothing to read would post an all-hit request and leave the RAM-miss path unexercised.
         assert missing, (layer_id, step)

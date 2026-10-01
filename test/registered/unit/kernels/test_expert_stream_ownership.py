@@ -5,7 +5,6 @@ the tier declares no mutex but the Python callers' own."""
 import faulthandler
 import re
 import threading
-import time
 
 import pytest
 import torch
