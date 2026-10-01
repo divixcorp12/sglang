@@ -1398,3 +1398,45 @@ thread's user-mode events per post, and include its idle polling between posts (
   DRAM 0.00. The record's lines arrive in the L3 (DDIO), not DRAM.
 - Suite at 6166309231: 1218 passed, 2 failed, 22 skipped. The census (fixed in e732163d16) and the seqlock stress's
   acceptance floor (87 < 100, torn 0; 3/3 pass alone). GPU tests: 24 passed.
+
+From Task 5 on, the per-task suite is the exl3 and expert test files of `unit/kernels` only (owner's instruction):
+`pytest test/registered/unit/kernels/test_*exl3*.py test/registered/unit/kernels/test_*expert*.py -q -p no:randomly`.
+
+**pair** (74f0c6311c, Task 3: 128-byte records)
+- Span (ns): median 427 / 411 / 427; p99 564 / 532 / 556. Overruns 0.
+- Per post: L3 hits 2.02 / 2.04 / 2.12; local DRAM 0.02; branch misses 16.5 / 14.6 / 16.9.
+- Full `unit/kernels` suite: 1233 passed, 22 skipped. GPU tests: 24 passed.
+
+**copy** (695b18fc2e, Task 4: one constant 128-byte copy)
+- Span (ns): median 419 / 424 / 404; p99 578 / 576 / 532. Overruns 0.
+- Per post: L3 hits 2.37 / 2.54 / 2.44; local DRAM 0.00-0.02; branch misses 14.3 / 15.3 / 13.3.
+- `read_record` probe (g++ 14.3 -O3): 267 lines, 14 conditional jumps; af5b31c5d2's was 452 lines, 53 jumps.
+- `test_exl3_ram_miss_read_record.py` + `test_exl3_ram_miss_tier.py`: 53 passed.
+
+**prefetch** (cc107993fd, Task 5: prefetch the record's and the hot record's lines)
+- Span (ns): median 391 / 393 / 395; p90 459 / 500 / 484; p99 565 / 606 / 592. Overruns 0.
+- Per post: L3 hits 0.11 / 0.16 / 0.09 (the demand loads find their lines prefetched); local DRAM 0.01-0.02.
+- exl3 + expert suite: 1190 passed, 22 skipped. GPU tests: 24 passed.
+
+**busy** (fe0e4f23e0, Task 6: `--busy-poll` on cpu 17)
+- Span (ns): median 406 / 406 / 405; p90 697 / 702 / 697; p99 902 / 904 / 892. Overruns 0. `service core: 17
+  busy_poll: True`.
+- Per post: instructions about 2.9M (the pause-free idle spin over the 100 us gap); L3 hits 0.21 / 0.23 / 0.20;
+  branch misses 17.4 / 17.2 / 17.5.
+- exl3 + expert suite: 1195 passed, 22 skipped. GPU tests: 24 passed. Thread tests: 22 passed. Arm recipe tests
+  (`-k "cores or spin_core"`): 5 passed.
+
+**final-nobusy** (fe0e4f23e0, no `--busy-poll`): median 386, p90 687, p99 884.
+
+The p90/p99 of that window are box noise, not the change. Interleaved reruns (16:31, load average about 2), as
+round 1 / round 2:
+
+| run | median (ns) | p90 (ns) | p99 (ns) | memory-ordering clears per post |
+|---|---|---|---|---|
+| prefetch | 412 / 399 | 687 / 462 | 908 / 596 | 0.23 / 0.05 |
+| final, default polling | 390 / 389 | 422 / 455 | 572 / 579 | 0.11 / 0.12 |
+| final, busy-poll | 392 / 400 | 461 / 523 | 594 / 616 | 0.12 / 0.13 |
+
+- Busy-poll and default polling are equal within noise on the span. The span starts at detection, so it cannot show
+  what busy-poll removes, the PAUSE quantum before detection (38.6 ns at most, half on average).
+- The pause-free spin causes no extra memory-ordering clears.
