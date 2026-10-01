@@ -675,21 +675,19 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     return out
 
 
-# The request page (lease_layout.h): demand_head, then kDemandRecords records of RECORD_FIELDS; each record carries
-# MAX_IDS lanes of LANE_FIELDS and a kind byte per lane (ram_slot_map.LaneKind).
+# The request page (lease_layout.h): demand_head, then kDemandRecords records of RECORD_FIELDS. A record's MAX_IDS
+# lanes are one i16 array per id and an f32 weight array; "counts" holds lanes (bits 0-3) and protect ids (bits 4-7),
+# and "kinds" a ram_slot_map.LaneKind nibble per lane.
 PAGE_BYTES = 4160
 RECORD_BYTES = 256
 DEMAND_RING = 64
 DEMAND_RECORDS = 16
 RECORD_FIELDS = {
-    "seq": 0, "row": 4, "count": 6, "flags": 8, "chain": 12, "chain_hi": 16, "epoch": 24, "protect_count": 20,
-    "protect": 32,
-    "lanes": 64, "kinds": 192,
+    "seq": 0, "row": 4, "counts": 6, "flags": 7, "chain": 8, "epoch": 16, "kinds": 20,
+    "protect": 32, "lane_expert": 48, "lane_slot": 64, "lane_dst": 80, "lane_weight": 96,
 }
 RECORD_FLAG_CAPTURED = 1
 RECORD_ID_MAX = 32767  # experts, slots and destinations are i16 in the record and the map delta
-LANE_BYTES = 16
-LANE_FIELDS = {"expert": 0, "slot": 4, "dst": 8, "weight": 12}
 HOT_HEADER_BYTES = 8
 HOT_ALIGNMENT = 64
 HOT_RECORDS = DEMAND_RECORDS
