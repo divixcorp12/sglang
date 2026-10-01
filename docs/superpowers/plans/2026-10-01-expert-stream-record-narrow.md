@@ -1503,3 +1503,38 @@ test/registered/unit/kernels -q -p no:randomly`.
   5 MEMBAR.ALL.SYS, 1 MEMBAR.SC.SYS, 6 CCTL.IVALL. No ATOM or CAS.
 - GPU tests: 22 passed (19 + the three Task 2 refusals).
 - Suite: 1218 passed, 22 skipped, EXIT=0.
+
+**delta-wide** (15dc001d0c, Task 5)
+- Hits: median 7264 ns, 14.16 us/post. Delta: median 11424 ns, 32.25 us/post.
+- SASS: 10 LDG.E.128, 3 LDG.E.STRONG.SYS (was 41), 8 STG.E.128. GPU tests 23 passed; suite 1218 passed, 22 skipped.
+
+**typing** (92d82a481d, Task 6)
+- Hits: median 7648 ns, 14.77 us/post. Delta: median 11488 ns, 31.90 us/post.
+- SASS: 12 LDG.E.128 (the split table's three loads, the third narrowed to 32 bits), 3 LDG.E.STRONG.SYS, 8 STG.E.128.
+- GPU tests 24 passed; suite 1218 passed, 22 skipped. The hits regression is the split table loaded on every post.
+
+**final** (94203ea5be, Task 7)
+- Hits: median 7776 ns, 14.39 us/post. Delta: median 10240 ns, 30.15 us/post.
+- SASS: 7 LDG.E.128 (5 delta, 2 split), 3 LDG.E.STRONG.SYS, 8 STG.E.128. GPU tests 24 passed; suite 1218 passed, 22 skipped.
+
+**split** (f9a6b0ace4, Task 6 ruling: the split table is read only when a lane can be CPU-eligible)
+- Hits: median 6464 ns, 13.74 us/post. Delta: median 8960 ns, 30.60 us/post.
+- SASS: 7 LDG.E.128 (static count; the split loads are now predicated), 3 LDG.E.STRONG.SYS, 8 STG.E.128.
+- GPU tests 24 passed; suite 1218 passed, 22 skipped, EXIT=0.
+
+| label | hits median | delta median | hits us/post | STG.E.128 / LDG.E.128 |
+|---|---|---|---|---|
+| base | 7776 ns | 36416 ns | 15.25 | 1 / 0 |
+| record | 7264 ns | 34240 ns | 13.57 | 8 / 0 |
+| delta-wide | 7264 ns | 11424 ns | 14.16 | 8 / 10 |
+| typing | 7648 ns | 11488 ns | 14.77 | 8 / 12 |
+| final | 7776 ns | 10240 ns | 14.39 | 8 / 7 |
+| split | 6464 ns | 8960 ns | 13.74 | 8 / 7 |
+
+- Task 4 (record in v4 stores): hits -512 ns, delta -2176 ns.
+- Task 5 (wide delta loads): delta -22816 ns; the 41 scalar host loads become 10 wide ones.
+- Task 6 (typing restructure): neutral on delta; it cost hits +384 ns until the split gate, which took hits to 6464 ns
+  (-800 ns against delta-wide). That gain is measured, not attributed: no profile separates it.
+- Task 7 (i16 delta): delta -1248 ns, five 16-byte loads instead of ten.
+- Base to split: hits -1312 ns (-17%), delta -27456 ns (-75%).
+
