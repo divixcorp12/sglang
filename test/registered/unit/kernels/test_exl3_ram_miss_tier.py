@@ -14,15 +14,18 @@ import torch
 from sglang.kernels.ops.moe import expert_stream_transport
 from sglang.kernels.ops.moe.expert_stream_transport import (
     DEMAND_RECORDS,
+    DEMAND_RING,
     PAGE_BYTES,
+    RECORD_BYTES,
     ExpertStreamHost,
     new_hot_page,
     new_page,
     page_word,
 )
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_lease_sim import LeaseSim, post_record, served
+from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script, same_bytes
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -39,12 +42,15 @@ def hang_guard():
 
 @pytest.fixture
 def tier(tmp_path, request):
-    capacity = getattr(request, "param", 3)
+    """(capacity, staging slots per row): 4 and 1 by default, so three rows are mappable."""
+    capacity, k = getattr(request, "param", (4, 1))
     s = ram_miss_setup(tmp_path, capacity=capacity)
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
-    yield s, page, slot_map, host, LeaseSim(host, page, s.slabs)
+    for row in range(2):
+        host.attach_row(row, k)
+    yield s, page, slot_map, host, ChainSim(host, page, s.slabs)
     host.stop()
 
 
@@ -58,40 +64,35 @@ def _until(predicate, timeout_s=5.0):
 
 
 def _serve(t, row, lanes, protect=None):
-    """One chain, retired: post, pump (serves), Done, pump (retires). Returns whether it was served."""
+    """One chain: post, pump (serves). Returns whether every miss's pieces landed, as S judges it."""
     s, page, slot_map, host, sim = t
     req = sim.post(row, lanes, protect=protect)
     assert host.pump() == 1
-    ok = served(page, req.seq)
-    sim.done(req)
-    host.pump()
-    return ok
+    return sim.served(req)
 
 
 def test_gpu_hot_sidecar_protects_a_victim_and_a_resident_lane_reads_nothing(tmp_path):
     """The hot set applies before the census and serve: expert 0 is the oldest resident row, but hot, so the read of
     expert 3 takes another slot. Mutation: apply_gpu_hot after serve, or not at all."""
-    s = ram_miss_setup(tmp_path, capacity=3)
+    s = ram_miss_setup(tmp_path, capacity=4)
     page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, hot_page=hot_page)
-    sim = LeaseSim(host, page, s.slabs)
+    host.attach_row(0, 1)
+    sim = ChainSim(host, page, s.slabs)
     try:
         host.enable_gpu_hot()
         for expert in (0, 1, 2):
             host.assign(0, expert)
-        req = sim.post_gpu_hot(hot_page, 0, [0], hot=[0])
-        assert host.pump() == 1 and sim.wait(req).served
-        # A resident lane is a touch-only lease: it needs no host row read.
-        assert host.counters()["leases_granted"] == 1
+        sim.sync_bulk()
+        req = sim.post(0, [0], hot=[0])
+        assert host.pump() == 1 and req.kinds == [LaneKind.HIT_SM]
+        # A RAM-hit lane needs no host row read.
         assert host.counters()["touch_only"] == 1
         assert host.counters()["rows_read"] == 0
-        assert sum(info[2] for info in host.slot_info(0)) == 1
-        sim.done(req)
-        req = sim.post_gpu_hot(hot_page, 0, [3], hot=[0])
-        assert host.pump() == 1 and sim.wait(req).served
-        assert host.counters()["leases_acked"] == 1
-        assert host.contains(0, 0) and host.contains(0, 3)
+        req = sim.post(0, [3], hot=[0])
+        assert host.pump() == 1 and sim.served(req)
+        assert host.contains(0, 0) and host.contains(0, 3) and not host.contains(0, 1)
     finally:
         host.stop()
 
@@ -106,8 +107,8 @@ def test_gpu_hot_sidecar_aborts_on_a_stale_or_malformed_record_after_a_wrap(tmp_
         from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, hot_record_bytes
         host.enable_gpu_hot()
         for _ in range(DEMAND_RECORDS + 1):
-            req = sim.post_gpu_hot(hot_page, 0, [], hot=[0])
-            assert host.pump() == 1 and sim.wait(req).served
+            req = sim.post(0, [], hot=[0])
+            assert host.pump() == 1
         fault = "{fault}"
         seq = page_word(page, "demand_head") + 1
         if fault == "malformed":
@@ -117,7 +118,7 @@ def test_gpu_hot_sidecar_aborts_on_a_stale_or_malformed_record_after_a_wrap(tmp_
                 orig(*args, **kwargs)
                 hot_page[start + 8] = int(hot_page[start + 8]) | 0x80  # a bit past the last expert
             sim._write_hot = write_hot
-        sim.post_gpu_hot(hot_page, 0, [3], hot=[0], hot_seq=1 if fault == "stale" else None)
+        sim.post(0, [3], hot=[0], hot_seq=1 if fault == "stale" else None)
         host.pump()
         print("reached")
         """,
@@ -126,6 +127,7 @@ def test_gpu_hot_sidecar_aborts_on_a_stale_or_malformed_record_after_a_wrap(tmp_
     assert_aborted(result, "no hot set for it")
 
 
+@pytest.mark.parametrize("tier", [(4, 2)], indirect=True)
 def test_a_demand_is_read_split_and_published(tier):
     s, page, slot_map, host, sim = tier
     assert _serve(tier, 1, [2, 5])
@@ -139,13 +141,14 @@ def test_a_demand_is_read_split_and_published(tier):
     assert host.layer_rows() == [0, 2] and host.counters()["served"] == 1
 
 
-def test_protected_experts_missing_from_ram_are_read_too(tier):
+def test_protected_experts_missing_from_ram_are_not_read(tier):
     s, page, slot_map, host, sim = tier
-    # D12: the thread recomputes the missing set from protect, not only from need.
+    # Only the record's miss lanes are read: a routed expert that is VRAM-hot (protect only) is not.
     assert _serve(tier, 0, [1], protect=[1, 4])
-    assert host.contains(0, 1) and host.contains(0, 4) and host.layer_rows() == [2, 0]
+    assert host.contains(0, 1) and not host.contains(0, 4) and host.layer_rows() == [1, 0]
 
 
+@pytest.mark.parametrize("tier", [(6, 3)], indirect=True)
 def test_eviction_takes_the_lru_row_and_spares_hot_experts(tier):
     s, page, slot_map, host, sim = tier
     assert _serve(tier, 0, [0, 1, 2])  # stamps 0 < 1 < 2
@@ -161,8 +164,8 @@ def test_eviction_takes_the_lru_row_and_spares_hot_experts(tier):
     assert _serve(tier, 0, [5])
     assert slot_map[0, 1].item() == -1 and all(slot_map[0, e].item() >= 0 for e in (0, 4, 5))
     assert host.lru_order(0) == [0, 4, 5] and host.counters()["evictions"] == 2
-    # serve() stamps a request's resident ids before it picks a victim, so the shared
-    # victim rule's protect exclusion shows through assign(): 4 is the LRU row but protected.
+    # serve_record stamps a request's resident ids before it picks a victim, so the
+    # protect exclusion shows through assign(): 4 is the LRU row but protected.
     slot, evicted = host.assign(0, 2, protected=[4], protected_fallback=False)
     assert evicted == 5 and host.contains(0, 4) and slot_map[0, 2].item() == slot
 
@@ -177,7 +180,9 @@ def mirrored_tier(tmp_path):
     page = new_page(pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
-    yield s, page, slot_map, host, LeaseSim(host, page, s.slabs)
+    for row in range(2):
+        host.attach_row(row, 3)
+    yield s, page, slot_map, host, ChainSim(host, page, s.slabs)
     host.stop()
 
 
@@ -359,13 +364,11 @@ def test_mapping_refuses_a_row_out_of_range(tmp_path):
 
 def test_a_record_whose_seq_does_not_match_is_an_overrun(tier):
     s, page, slot_map, host, sim = tier
-    req = sim.post(0, [1])
-    record = 64 + ((req.seq - 1) % DEMAND_RECORDS) * 128
+    req = sim.post(0, [1], hit_copy="sm", kinds=[LaneKind.HIT_SM], slots=[0])
+    record = DEMAND_RING + ((req.seq - 1) % DEMAND_RECORDS) * RECORD_BYTES
     page[record : record + 4].view(torch.int32)[0] = req.seq + DEMAND_RECORDS  # a lapped ring slot
     assert host.pump() == 1
-    assert host.counters()["overruns"] == 1 and not host.contains(0, 1)
-    # Nothing waits on an overrun record (only an unarmed one laps), and nothing of it is published: S would trap.
-    assert sim.row_result(req, 0)["gen"] != req.gen
+    assert host.counters()["overruns"] == 1 and host.counters()["touch_only"] == 0
 
 
 def test_python_assign_release(tier):
@@ -401,10 +404,10 @@ def test_injected_delay_starts_after_n_demands_that_read(tier):
 def test_a_lapped_demand_ring_counts_every_skipped_record(tier):
     s, page, slot_map, host, sim = tier
     for _ in range(20):
-        post_record(page, 0, [], armed=False)
+        sim.post(0, [], protect=[])
     assert host.pump() == 1
     # The catch-up serves from head - 14 (seq 6): seqs 1-5 are skipped and each is counted.
-    assert host.counters()["overruns"] == 5 and page_word(page, "demand_done") == 6
+    assert host.counters()["overruns"] == 5 and host.handled_through() == 6
 
 
 def test_an_unarmed_record_only_touches_and_never_evicts_or_reads(tier):
@@ -412,10 +415,10 @@ def test_an_unarmed_record_only_touches_and_never_evicts_or_reads(tier):
     gathering the next token's rows. Serving it must not evict or read, even when a
     protected id is missing from RAM; it only refreshes the recency of assigned rows."""
     s, page, slot_map, host, sim = tier
-    for expert in (0, 1, 2):  # full (capacity 3); 0 is the LRU-oldest row
+    for expert in (0, 1, 2):  # full (three mappable rows); 0 is the LRU-oldest row
         assert _serve(tier, 0, [expert])
     before_map, before_counters = slot_map.clone(), host.counters()
-    post_record(page, 0, [1, 5], armed=False)  # 5 is missing
+    sim.post(0, [], protect=[1, 5])  # 5 is missing
     assert host.pump() == 1
     assert torch.equal(slot_map, before_map) and host.layer_rows() == [3, 0]
     counters = host.counters()
@@ -430,7 +433,7 @@ def test_an_unarmed_record_only_touches_and_never_evicts_or_reads(tier):
 def test_a_repeated_protect_id_takes_one_slot(tier):
     s, page, slot_map, host, sim = tier
     assert _serve(tier, 0, [1], protect=[1, 1, 2])
-    assert host.slot_to_expert(0).count(1) == 1 and host.layer_rows() == [2, 0]
+    assert host.slot_to_expert(0).count(1) == 1 and host.layer_rows() == [1, 0]
 
 
 @pytest.mark.parametrize(
@@ -469,7 +472,7 @@ def test_an_owned_call_waits_for_a_pump_on_another_thread(tier):
         assert waited > 0.2, f"the owned call returned after {waited:.3f} s, inside the 0.5 s read"
     finally:
         pumper.join(timeout=10)
-    assert sim.wait(req).served and slot_map[0, 1].item() == slot
+    assert sim.served(req) and slot_map[0, 1].item() == slot
 
 
 def test_closing_while_a_pump_is_in_flight_keeps_the_service_alive_until_it_returns(tmp_path):
@@ -491,7 +494,7 @@ def test_closing_while_a_pump_is_in_flight_keeps_the_service_alive_until_it_retu
         assert host.busy_episode() != 0
         host.stop()  # closes the handle while the pump is inside a read
         pumper.join(timeout=10)
-        assert results == [1] and sim.wait(req).served, results
+        assert results == [1] and sim.served(req), results
         print("ok")
         """,
     )
