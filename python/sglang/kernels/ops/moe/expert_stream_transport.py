@@ -687,6 +687,7 @@ RECORD_FIELDS = {
     "lanes": 64, "kinds": 192,
 }
 RECORD_FLAG_CAPTURED = 1
+RECORD_ID_MAX = 32767  # experts, slots and destinations are i16 in the record and the map delta
 LANE_BYTES = 16
 LANE_FIELDS = {"expert": 0, "slot": 4, "dst": 8, "weight": 12}
 HOT_HEADER_BYTES = 8
@@ -811,6 +812,11 @@ class ExpertStreamHost:
         layout: str = "exl3",
         variant: Optional[str] = None,
     ) -> None:
+        experts, capacity = int(tables.starts.shape[1]), int(tables.capacity.max())
+        if experts > RECORD_ID_MAX or capacity > RECORD_ID_MAX:
+            raise ValueError(
+                f"{experts} experts, row capacity {capacity}: records and map deltas carry ids up to {RECORD_ID_MAX}"
+            )
         if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
             raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
         if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(tables.starts.shape):
@@ -1328,6 +1334,12 @@ class ExpertStreamDevice:
             raise ValueError("page must be a contiguous CPU uint8 tensor of PAGE_BYTES")
         if timeout_ms <= 0:
             raise ValueError("the RAM-miss wait timeout must be positive")
+        if page.data_ptr() % 16:
+            raise ValueError("page must be 16-byte aligned: the post writes the record with 16-byte stores")
+        if experts > RECORD_ID_MAX:
+            raise ValueError(f"{experts} experts: a demand record carries expert ids up to {RECORD_ID_MAX}")
+        if any(int(c) > RECORD_ID_MAX for c in row_capacities):
+            raise ValueError(f"row capacities {list(row_capacities)}: a demand record carries slots up to {RECORD_ID_MAX}")
         cuda = torch.device(device).type == "cuda"
         # Checked before any CUDA call: the kernels read both through UVA, and an unpinned address faults inside the
         # captured graph.
