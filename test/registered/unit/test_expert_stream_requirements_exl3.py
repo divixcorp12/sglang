@@ -383,6 +383,25 @@ def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(model_d
     assert "disabled" not in str(refused.value)
 
 
+def test_cpu_misses_need_cpu_experts(model_dir):
+    """SGLANG_DSV41_CPU_EXPERTS_MISSES only widens which lanes the CPU may take; without CPU experts no CPU thread
+    exists to compute them, and the device would type misses CPU that nothing completes. With CPU experts it passes."""
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, SGLANG_DSV41_CPU_EXPERTS_MISSES=True)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_CPU_EXPERTS_MISSES=True)
+
+
+@pytest.mark.parametrize("value", ["ce", "sm"])
+def test_either_hit_copy_passes_with_cpu_experts(model_dir, value):
+    """CPU completion uses the copy thread and the gate whichever way the hits are copied."""
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_HIT_COPY=value)
+
+
+def test_an_unknown_hit_copy_is_refused(model_dir):
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_HIT_COPY must be ce or sm"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_RAM_HIT_COPY="dma")
+
+
 def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
     """The join moves a route to the pulled slot after planning: a CPU lane's route would match no plan slot and be
     computed on the GPU as well as on the CPU."""

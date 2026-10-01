@@ -164,6 +164,15 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         self.assertIn(new_name, str(caught[0].message))
         self.assertEqual(os.environ[new_name], "abc")
 
+    def test_the_removed_ram_miss_hit_wait_warns_that_it_is_ignored(self):
+        old_name = "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US"
+        os.environ[old_name] = "50"
+        self.addCleanup(os.environ.pop, old_name, None)
+
+        caught = self._apply(old_name, _DEPRECATED_ENVS[old_name])
+        self.assertIn("ignored", str(caught[0].message))
+        self.assertIsNone(_DEPRECATED_ENVS[old_name].replacement)
+
     def test_unset_env_is_a_no_op(self):
         caught = self._apply("SGLANG_TEST_UNSET_ENV", _DeprecatedEnv())
         self.assertEqual(len(caught), 0)

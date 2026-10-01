@@ -60,7 +60,16 @@ def _until(predicate, timeout_s=10.0):
     return predicate()
 
 
-def test_the_low_scored_ram_hit_goes_to_the_cpu_and_the_high_scored_one_takes_the_coldest_victim(tmp_path):
+PART_HITS, PART_MISSES = 1 << 8, 1 << 9  # CC's cpu_lanes bits: which CPU output part holds a partial
+
+
+@pytest.mark.parametrize("miss", [False, True], ids=["ram_hit", "nvme_miss"])
+def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_coldest_victim(tmp_path, miss):
+    """``miss``: the low-key expert is not in the RAM tier either, and SGLANG_DSV41_CPU_EXPERTS_MISSES is on. It is
+    typed kMissCpu, read into its staging slot, computed there by the CPU into part 1, inserted in the RAM tier by the
+    record's delta, and still left out of VRAM by DIRECT's commit. Mutations: the miss is computed before its read
+    landed (the forward sees the wrong slot's bytes -- here: the late job never runs, and the forward count is 0); CC
+    flags part 0 for a miss-only record."""
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
     from sglang.kernels.ops.moe.expert_residency_direct_gather import (
         direct_commit_gather,
@@ -72,10 +81,10 @@ def test_the_low_scored_ram_hit_goes_to_the_cpu_and_the_high_scored_one_takes_th
     forward = _Forward()
     split = [0] * (lease.LANES + 1)
     split[2] = 1
-    c = Chain(tmp_path, copy_engine=True, start=False)
+    c = Chain(tmp_path, copy_engine=True, start=False, cpu_misses=miss)
     try:
         x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
-        out_rows = torch.zeros((LAYERS, HIDDEN), dtype=torch.float32).pin_memory()
+        out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
         c.host.enable_cpu_experts(forward.address, split, cores, x_rows, out_rows, threads=2)
         c.host.start_thread(fatal_wait_s=60.0)
@@ -83,12 +92,12 @@ def test_the_low_scored_ram_hit_goes_to_the_cpu_and_the_high_scored_one_takes_th
         c.dev.set_row_cpu(row)
         backend, plan, dev = c.backends[row], c.plans[row], c.dev
 
-        # Both experts into the RAM tier through an eager gather, which the service serves without the copy engine.
-        c.plan([low, high], row)
+        # The RAM tier's experts through an eager gather, which the service serves without the copy engine.
+        c.plan([high] if miss else [low, high], row)
         c.gather(row)
         torch.cuda.synchronize()
         assert c.handled()
-        assert {low, high} <= c.resident(row)
+        assert ({high} if miss else {low, high}) <= c.resident(row) and (low in c.resident(row)) != miss
         ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
         c.host.set_cpu_layer(row, HANDLE)
         c.host.arm_copy_engine()
@@ -141,9 +150,12 @@ def test_the_low_scored_ram_hit_goes_to_the_cpu_and_the_high_scored_one_takes_th
         assert _until(lambda: len(forward.calls) == 1)
         torch.cuda.synchronize()
 
-        assert forward.calls == [(HANDLE, [ram_slot[low]], [0.25])], "the tail lane (the low key) is the CPU's"
-        assert c.kinds(2) == [LaneKind.HIT_COPY, LaneKind.HIT_CPU]
-        assert int(dev.cpu_lanes.item()) == 0b10
+        low_slot = int(dev.lane_slot[1]) if miss else ram_slot[low]
+        assert forward.calls == [(HANDLE, [low_slot], [0.25])], "the tail lane (the low key) is the CPU's"
+        assert c.kinds(2) == [LaneKind.HIT_COPY, LaneKind.MISS_CPU if miss else LaneKind.HIT_CPU]
+        assert int(dev.cpu_lanes.item()) == 0b10 | (PART_MISSES if miss else PART_HITS)
+        if miss:
+            assert c.handled() and c.host.mapping(row)[low] == low_slot, "the CPU miss was not inserted in RAM"
         want = c.expected([high], row)
         for n in c.names:
             got = snapshot[n][3].cpu().contiguous().view(torch.uint8)

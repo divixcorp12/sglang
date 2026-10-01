@@ -336,7 +336,8 @@ def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit()
     activation limit is only known at the layer's first forward and must be on the trait before register_layer."""
     host, trait = FakeHost(), FakeServiceTrait()
     svc = _service(host, trait)
-    assert host.enabled == (0xF00D, [0] * 9, [4, 5, 6], (2, 16), (2, 8), 2)
+    # out_rows is two parts per row: the CPU hits' partial sum and the CPU misses'.
+    assert host.enabled == (0xF00D, [0] * 9, [4, 5, 6], (2, 16), (2, 2, 8), 2)
     assert host.layers == {}, "a row reached the grant before its registration"
     svc.register(1, 10.0)
     svc.register(1, 10.0)
