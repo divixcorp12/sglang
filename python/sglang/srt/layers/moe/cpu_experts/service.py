@@ -3,9 +3,9 @@
 The service's own threads run the kernel.
 The post types the last ``split[n]`` of a captured post's n eligible lanes CPU (RAM hits, and NVMe misses with
 SGLANG_DSV41_CPU_EXPERTS_MISSES); the device plan sorts them, so those are the lowest-scored.
-The copy thread hands them to the CPU expert thread (expert_stream/host/cpu_experts.h): the hits at once into part 0
-of the row's output, each miss once its read landed into part 1. The copy wait releases the decode stream once the
-copies and the CPU are done.
+The service thread hands them to the CPU expert thread (expert_stream/host/cpu_experts.h): the hits at once into part 0
+of the row's output, each miss into part 1 as soon as its read landed. The copy wait releases the decode stream once
+the copies and the CPU are done.
 
 This module owns the Python half: the quant trait, the pinned rows the post kernel and the CPU exchange,
 the lazy per-layer registration, and the split table.

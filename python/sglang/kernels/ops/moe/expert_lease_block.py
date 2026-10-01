@@ -30,11 +30,12 @@ GATE_SEQ_MASK = 0x1FFFFFFF
 COPY_ARMED = COPY_GATE + 128  # u32: 1 once the service armed its copy engine
 SPLIT = COPY_ARMED + 128  # i32[LANES + 1]: CPU lanes per n eligible lanes
 
-# The map delta block, at DELTA_BASE of the same allocation: one DELTA_STRIDE record per row, {u64 tag; u32 count; i32 staging[LANES]; {i32 expert,
-# i32 slot}[DELTA_MAX_ENTRIES]}. The tag is stored last with a release; a zero tag is never a written delta.
+# The map delta block, at DELTA_BASE of the same allocation: one DELTA_STRIDE record per row, {u64 tag; u32 count;
+# i16 staging[LANES] @16; {i16 expert, i16 slot}[DELTA_MAX_ENTRIES] @32}. The tag is stored last with a release; a
+# zero tag is never a written delta.
 DELTA_BASE = BLOCK_BYTES
 DELTA_STRIDE = 256
-DELTA_FIELDS = {"tag": 0, "count": 8, "staging": 16, "entries": 48}
+DELTA_FIELDS = {"tag": 0, "count": 8, "staging": 16, "entries": 32}
 DELTA_MAX_ENTRIES = 16
 
 

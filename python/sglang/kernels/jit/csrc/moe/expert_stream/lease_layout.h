@@ -9,27 +9,24 @@ namespace sglang::expert_stream::wire {
 
 // ---- Request page: device-written, host-read ----
 constexpr int64_t kDemandHead = 0;  // u32: the last posted seq, stored with a release
-constexpr int64_t kDemandRing = 64;
+constexpr int64_t kDemandRing = 128;  // a 128-byte block of its own: each record below is one prefetch pair
 constexpr uint32_t kDemandRecords = 16;
-constexpr int64_t kRecordBytes = 256;
+constexpr int64_t kRecordBytes = 128;  // two cache lines, one 128-byte-aligned block (the L2's adjacent-line pair)
 constexpr int kMaxIds = 8;
 constexpr int64_t kRecSeq = 0;            // u32 seqlock word: 0 while the payload is rewritten, the seq stored last
 constexpr int64_t kRecRow = 4;            // u16
-constexpr int64_t kRecCount = 6;          // u16: lanes
-constexpr int64_t kRecFlags = 8;          // u32
+constexpr int64_t kRecCounts = 6;         // u8: lanes in bits 0-3, protect ids in bits 4-7
+constexpr int64_t kRecFlags = 7;          // u8
 constexpr uint32_t kRecFlagCaptured = 1;  // posted from a captured graph
-constexpr int64_t kRecChain = 12;         // u32: low half of the row's map-chain number, 0 when no lane misses
-constexpr int64_t kRecChainHi = 16;       // u32: high half
-constexpr int64_t kRecEpoch = 24;         // u32: the device's epoch, so G = epoch << 32 | seq
-constexpr int64_t kRecProtectCount = 20;  // u16
-constexpr int64_t kRecProtect = 32;       // i32[kMaxIds]: every routed expert of the request
-constexpr int64_t kRecLanes = 64;         // kMaxIds lanes of kLaneBytes
-constexpr int64_t kLaneBytes = 16;
-constexpr int64_t kLaneExpert = 0;        // i32
-constexpr int64_t kLaneSlot = 4;          // i32: the RAM slot of a hit, the staging slot of a miss
-constexpr int64_t kLaneDst = 8;           // i32: the VRAM destination slot
-constexpr int64_t kLaneWeight = 12;       // f32: the lane expert's routing weight
-constexpr int64_t kRecKinds = 192;        // u8[kMaxIds]: kKind*
+constexpr int64_t kRecChain = 8;          // u64: the row's map-chain number, 0 when no lane misses
+constexpr int64_t kRecEpoch = 16;         // u32: the device's epoch, so G = epoch << 32 | seq
+constexpr int64_t kRecKinds = 20;         // u32: lane j's kKind in bits 4j..4j+3
+constexpr int64_t kRecProtect = 32;       // i16[kMaxIds]: every routed expert of the request, -1 past the count
+constexpr int64_t kRecLaneExpert = 48;    // i16[kMaxIds], -1 past the count
+constexpr int64_t kRecLaneSlot = 64;      // i16[kMaxIds]: the RAM slot of a hit, the staging slot of a miss
+constexpr int64_t kRecLaneDst = 80;       // i16[kMaxIds]: the VRAM destination slot
+constexpr int64_t kRecLaneWeight = 96;    // f32[kMaxIds]: the lane expert's routing weight
+constexpr int64_t kRecIdMax = 32767;      // the largest expert, slot or destination an i16 field carries
 constexpr int64_t kPageBytes = kDemandRing + kDemandRecords * kRecordBytes;
 // Lane kinds (ram_slot_map.LaneKind): what moves the bytes, and what the device waits on.
 constexpr uint32_t kKindHitCopy = 1;  // the copy thread's DMA; CopyDone
@@ -69,15 +66,22 @@ constexpr int64_t kDeltaBase = kLeaseBlockBytes;
 constexpr int64_t kDeltaStride = 256;
 constexpr int64_t kDeltaTag = 0;       // u64: the map-chain number this delta follows, stored last with a release
 constexpr int64_t kDeltaCount = 8;     // u32: entries used
-constexpr int64_t kDeltaStaging = 16;  // i32[kLeaseLanes]: the row's staging slots after this delta, -1 past K
-constexpr int64_t kDeltaEntries = 48;  // {i32 expert, i32 slot}[kDeltaMaxEntries]: ram_slot[expert] = slot, -1 unmaps
+constexpr int64_t kDeltaStaging = 16;  // i16[kLeaseLanes]: the row's staging slots after this delta, -1 past K
+constexpr int64_t kDeltaEntries = 32;  // {i16 expert, i16 slot}[kDeltaMaxEntries]: ram_slot[expert] = slot, -1 unmaps
 constexpr int64_t kDeltaMaxEntries = 16;
 
 static_assert(kLeaseRing == kDemandRecords && kLeaseLanes == kMaxIds, "the completion block follows the ring");
-static_assert(kRecLanes + kMaxIds * kLaneBytes <= kRecKinds, "record lanes");
-static_assert(kRecKinds + kMaxIds <= kRecordBytes, "record");
+static_assert(kMaxIds == 8, "the record's 16-byte stores and its kinds word hold 8 lanes");
+static_assert(kRecCounts == kRecRow + 2 && kRecFlags == kRecRow + 3, "row, counts and flags are one u32 store");
+static_assert(kRecChain % 8 == 0 && kRecKinds == kRecEpoch + 4, "chain is one v2 store; epoch and kinds one v4");
+static_assert(kDemandRing % 16 == 0 && kRecordBytes % 16 == 0 && kRecEpoch % 16 == 0 && kRecProtect % 16 == 0 &&
+                  kRecLaneExpert % 16 == 0 && kRecLaneSlot % 16 == 0 && kRecLaneDst % 16 == 0 &&
+                  kRecLaneWeight % 16 == 0,
+              "the record's v4 stores are 16-byte aligned");
+static_assert(kRecLaneWeight + 4 * kMaxIds == kRecordBytes, "the payload is the whole record: read_record copies it");
+static_assert(kDemandRing % 128 == 0 && kRecordBytes == 128, "a record's two lines are one 128-byte prefetch pair");
 static_assert(kSplit + 4 * (kLeaseLanes + 1) <= kLeaseBlockBytes, "completion block");
 static_assert(kLeaseBlockBytes % kLeaseBlockAlign == 0, "the block is whole pages");
-static_assert(kDeltaEntries + 8 * kDeltaMaxEntries <= kDeltaStride, "delta record");
+static_assert(kDeltaEntries + 4 * kDeltaMaxEntries <= kDeltaStride, "delta record");
 
 }  // namespace sglang::expert_stream::wire

@@ -2466,7 +2466,9 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
     return anomalies;
 }
 
-void exl3_moe_cpu_forward_raw(
+// exl3_moe_cpu_forward_raw, adding into out when `accumulate`: the sglang C ABI's forward. Upstream's header fixes
+// the public signature, so the flag lives here.
+static void forward_raw(
     int64_t handle,
     const at::Half* x,
     const int32_t* sel,
@@ -2474,7 +2476,8 @@ void exl3_moe_cpu_forward_raw(
     float* out,
     int rows,
     int topk,
-    int threads
+    int threads,
+    bool accumulate
 )
 {
     const MoeCpuLayer* layer = get_layer(handle);
@@ -2486,7 +2489,7 @@ void exl3_moe_cpu_forward_raw(
     ctx.x = x;
     ctx.out = out;
     ctx.m_total = m_total;
-    std::memset(ctx.out, 0, static_cast<size_t>(m_total) * layer->hidden_size * sizeof(float));
+    if (!accumulate) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * layer->hidden_size * sizeof(float));
 
     // Group token assignments by expert, then split into chunks of CHUNK_M rows
     std::vector<std::vector<std::pair<int, float>>> per_expert(layer->num_experts);
@@ -2604,6 +2607,20 @@ void exl3_moe_cpu_forward_raw(
     }
 }
 
+void exl3_moe_cpu_forward_raw(
+    int64_t handle,
+    const at::Half* x,
+    const int32_t* sel,
+    const at::Half* wts,
+    float* out,
+    int rows,
+    int topk,
+    int threads
+)
+{
+    forward_raw(handle, x, sel, wts, out, rows, topk, threads, false);
+}
+
 void exl3_moe_cpu_forward
 (
     int64_t handle,
@@ -2650,17 +2667,18 @@ void exl3_moe_cpu_forward
 // service module links nothing of this one. Neither throws across the boundary.
 
 // CpuExpertForward: one token row x (fp16 [hidden]) through experts slots[0..k) of layer `handle`, weighted by
-// weights[0..k), into out (fp32 [hidden], overwritten). The calling thread is the pool's worker 0.
+// weights[0..k), into out (fp32 [hidden]): overwritten, or added to when `accumulate` is nonzero. The calling thread
+// is the pool's worker 0.
 extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_forward(
-    int64_t handle, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads)
-    noexcept
+    int64_t handle, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads,
+    int32_t accumulate) noexcept
 {
     if (k < 0 || k > 32) return 2;
     try
     {
         at::Half wts[32];
         for (int32_t i = 0; i < k; ++i) wts[i] = at::Half(weights[i]);
-        exl3_moe_cpu_forward_raw(handle, static_cast<const at::Half*>(x), slots, wts, out, 1, k, threads);
+        forward_raw(handle, static_cast<const at::Half*>(x), slots, wts, out, 1, k, threads, accumulate != 0);
         return 0;
     }
     catch (...)

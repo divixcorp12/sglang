@@ -122,44 +122,58 @@ struct Request {
 
 // Seqlock read: the writer stores the payload, fences, then the seq word last, so a record whose seq reads `expected`
 // both before and after the payload is whole. Records nothing waits for lap the ring unread, so a torn one must be
-// detectable. A whole record whose count or kinds are out of range is malformed: the device never writes one.
+// detectable. A whole record whose counts or kinds are out of range is malformed: the device never writes one.
+// The payload is copied once, at a constant size, between the two seq loads: both cache lines' loads issue together,
+// before anything depends on the counts, and nothing after the second seq load reads the shared record.
 enum class RecordRead { kOk, kTorn, kMalformed };
+
+static_assert(kRecLaneWeight + sizeof(float) * kMaxIds == kRecordBytes, "read_record copies the whole record");
 
 inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request* request) {
   if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
-  uint16_t row, count, protect;
-  uint32_t flags, chain_lo, chain_hi, epoch;
-  std::memcpy(&row, record + kRecRow, 2);
-  std::memcpy(&count, record + kRecCount, 2);
-  std::memcpy(&flags, record + kRecFlags, 4);
-  std::memcpy(&chain_lo, record + kRecChain, 4);
-  std::memcpy(&chain_hi, record + kRecChainHi, 4);
-  std::memcpy(&epoch, record + kRecEpoch, 4);
-  std::memcpy(&protect, record + kRecProtectCount, 2);
-  if (count > kLeaseLanes) count = kLeaseLanes + 1;  // judged once the seq re-check says the record is whole
+  alignas(64) uint8_t raw[kRecordBytes];
+  std::memcpy(raw, record, kRecordBytes);
+  std::atomic_thread_fence(std::memory_order_acquire);
+  asm volatile("" ::: "memory");  // the copy's plain loads must stay before the seq re-check
+  if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
+  uint16_t row;
+  uint8_t counts, flags;
+  uint64_t chain;
+  uint32_t epoch, kinds;
+  int16_t protect_ids[kMaxIds], expert[kMaxIds], slot[kMaxIds], dst[kMaxIds];
+  float weight[kMaxIds];
+  std::memcpy(&row, raw + kRecRow, 2);
+  std::memcpy(&counts, raw + kRecCounts, 1);
+  std::memcpy(&flags, raw + kRecFlags, 1);
+  std::memcpy(&chain, raw + kRecChain, 8);
+  std::memcpy(&epoch, raw + kRecEpoch, 4);
+  std::memcpy(&kinds, raw + kRecKinds, 4);
+  std::memcpy(protect_ids, raw + kRecProtect, sizeof(protect_ids));
+  std::memcpy(expert, raw + kRecLaneExpert, sizeof(expert));
+  std::memcpy(slot, raw + kRecLaneSlot, sizeof(slot));
+  std::memcpy(dst, raw + kRecLaneDst, sizeof(dst));
+  std::memcpy(weight, raw + kRecLaneWeight, sizeof(weight));
+  const int count = counts & 0xF;
+  const int protect = counts >> 4;
+  if (count > kLeaseLanes || protect > kMaxIds) return RecordRead::kMalformed;
+  bool bad_kind = false;
+  for (int j = 0; j < kLeaseLanes; ++j) {
+    const uint32_t kind = (kinds >> (4 * j)) & 0xFu;
+    bad_kind |= j < count && (kind < kKindHitCopy || kind > kKindMissCpu);
+  }
+  if (bad_kind) return RecordRead::kMalformed;
   request->seq = expected;
   request->gen = static_cast<uint64_t>(epoch) << 32 | expected;
   request->row = row;
   request->captured = (flags & kRecFlagCaptured) != 0;
-  request->chain = static_cast<uint64_t>(chain_hi) << 32 | chain_lo;
-  const auto* protect_ids = reinterpret_cast<const int32_t*>(record + kRecProtect);
-  request->protect.assign(protect_ids, protect_ids + std::min<int>(protect, kMaxIds));
-  request->lanes.clear();
-  for (int j = 0; j < std::min<int>(count, kLeaseLanes); ++j) {
-    const uint8_t* lane = record + kRecLanes + j * kLaneBytes;
-    Lane l;
-    std::memcpy(&l.expert, lane + kLaneExpert, 4);
-    std::memcpy(&l.slot, lane + kLaneSlot, 4);
-    std::memcpy(&l.dst, lane + kLaneDst, 4);
-    std::memcpy(&l.weight, lane + kLaneWeight, 4);
-    l.kind = record[kRecKinds + j];
-    request->lanes.push_back(l);
+  request->chain = chain;
+  for (int i = 0; i < kMaxIds; ++i)
+    request->protect[i] = protect_ids[i];
+  request->protect.resize(protect);
+  for (int j = 0; j < kLeaseLanes; ++j) {
+    request->lanes[j] = Lane{expert[j], slot[j], dst[j], weight[j], static_cast<uint8_t>((kinds >> (4 * j)) & 0xFu)};
   }
-  std::atomic_thread_fence(std::memory_order_acquire);
-  if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
-  if (count > kLeaseLanes) return RecordRead::kMalformed;
-  for (const Lane& lane : request->lanes)
-    if (lane.kind < kKindHitCopy || lane.kind > kKindMissCpu) return RecordRead::kMalformed;
+  request->lanes.resize(count);
   return RecordRead::kOk;
 }
 

@@ -108,16 +108,34 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     if (count > kLeaseLanes || count > p.lanes) __trap();  // the record and the plan's buffers hold no more
     any_cpu = 0;
     if (count > 0) {
-      int32_t* ram_slot_row = p.ram_slot + p.row * p.experts;
-      int32_t* staging_row = p.staging + p.row * kLeaseLanes;
-      apply_map_delta(
-          p.lease + kDeltaBase + p.row * kDeltaStride, ram_slot_row, staging_row, p.map_chain, p.map_applied, p.row,
-          p.experts, p.row_capacity, deadline);
-      const bool host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + kCopyArmed) == 1u;
-      type_lanes(
-          p.planned, count, p.experts, ram_slot_row, staging_row, p.lease + kSplit, host_lanes, p.hit_copy_ce != 0,
-          p.cpu_on != 0, p.cpu_misses != 0, p.ce_ok[p.row] != 0, p.cpu_ok[p.row] != 0, p.dst_slots, p.dst_rows[p.row],
-          p.row_capacity, typed);
+      const RowMap map{
+          .ram_slot = p.ram_slot + p.row * p.experts,
+          .staging = p.staging + p.row * kLeaseLanes,
+          .map_chain = p.map_chain + p.row,
+          .map_applied = p.map_applied + p.row,
+          .experts = p.experts,
+          .row_capacity = p.row_capacity,
+      };
+      LanePolicy policy{
+          .host_lanes = false,
+          .hit_copy_ce = p.hit_copy_ce != 0,
+          .cpu_on = p.cpu_on != 0,
+          .cpu_misses = p.cpu_misses != 0,
+          .ce_ok = p.ce_ok[p.row] != 0,
+          .cpu_ok = p.cpu_ok[p.row] != 0,
+          .dst_rows = p.dst_rows[p.row],
+      };
+      // Before the tag spin: the host stores split relaxed at any time, ordered by nothing (ram_tier.h set_cpu_split).
+      // Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes never indexes it.
+      if (p.captured != 0 && policy.cpu_on && policy.cpu_ok) load_split(p.lease + kSplit, policy.split);
+      const uint8_t* delta = p.lease + kDeltaBase + p.row * kDeltaStride;
+      const bool pending = await_map_delta(delta, map, deadline);
+      MapDelta d;
+      if (pending) d = load_map_delta(delta);
+      // After the tag's acquire, as before, and issued while the delta's loads are in flight.
+      policy.host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + kCopyArmed) == 1u;
+      if (pending) apply_map_delta(d, map);
+      type_lanes(LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count}, map, policy, typed);
       for (int64_t j = 0; j < count; ++j)
         any_cpu |= is_cpu_kind(typed.kind[j]) ? 1 : 0;
     }
@@ -186,8 +204,20 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
   uint8_t* record = p.page + kDemandRing + ring_index(seq) * kRecordBytes;
   write_record(
-      record, seq, epoch, p.row, p.captured != 0 ? kRecFlagCaptured : 0u, chain, protect, protect_count, count,
-      p.planned, p.dst_slots, weight, typed);
+      record, seq,
+      RecordFields{
+          .row = p.row,
+          .flags = p.captured != 0 ? kRecFlagCaptured : 0u,
+          .chain = chain,
+          .epoch = epoch,
+          .protect = protect,
+          .protect_count = protect_count,
+          .count = count,
+          .planned = p.planned,
+          .dst = p.dst_slots,
+          .weight = weight,
+          .lanes = &typed,
+      });
   // A release orders every earlier store of this thread: the hot page and the record come first.
   st_release_sys(p.page + kDemandHead, seq);
   state[kPending] = count > 0 ? static_cast<int32_t>(seq) : 0;
@@ -218,9 +248,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     const uint8_t* delta = p.lease + kDeltaBase + row * kDeltaStride;
     // Published or not: the paused host has written every delta it owes, so nothing is waited for here.
     if (ld_acquire_sys64(delta + kDeltaTag) != static_cast<uint64_t>(p.map_chain[row])) continue;
-    apply_map_delta(
-        delta, p.ram_slot + row * p.experts, p.staging + row * kLeaseLanes, p.map_chain, p.map_applied, row,
-        p.experts, static_cast<uint32_t>(p.row_capacity[row]), global_ns());
+    const RowMap map{
+        .ram_slot = p.ram_slot + row * p.experts,
+        .staging = p.staging + row * kLeaseLanes,
+        .map_chain = p.map_chain + row,
+        .map_applied = p.map_applied + row,
+        .experts = p.experts,
+        .row_capacity = static_cast<uint32_t>(p.row_capacity[row]),
+    };
+    if (await_map_delta(delta, map, global_ns())) apply_map_delta(load_map_delta(delta), map);
   }
   for (int64_t i = 0; i < p.entry_count; ++i) {
     const int32_t row = p.entries[3 * i];
@@ -275,6 +311,11 @@ struct LeaseProtocolKernel {
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
+    // The record carries i16 ids and is written with 16-byte stores (lease_layout.h).
+    RuntimeCheck(experts <= kRecIdMax, "experts: a demand record carries expert ids up to ", kRecIdMax);
+    RuntimeCheck(row_capacity <= kRecIdMax, "row_capacity: a demand record carries slots up to ", kRecIdMax);
+    RuntimeCheck(reinterpret_cast<uintptr_t>(page.data_ptr()) % 128 == 0,
+                 "page: must be 128-byte aligned, so each record's two cache lines are one prefetch pair (128-byte block)");
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
     auto on_host = SymbolicDevice{};

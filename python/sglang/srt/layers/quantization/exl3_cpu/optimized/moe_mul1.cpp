@@ -2423,6 +2423,9 @@ struct ForwardArena
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
     std::vector<float> bq_g, bq_u, bq_d;
     std::vector<int32_t> bsum_g, bsum_u, bsum_d;
+    // Moved into the call's ForwardCtx and back, so a forward allocates nothing once warm
+    std::vector<std::vector<std::pair<int, float>>> per_expert;
+    std::vector<Chunk> chunks;
 
     static ForwardArena& get()
     {
@@ -2996,7 +2999,9 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
     return anomalies;
 }
 
-void exl3_moe_cpu_forward_raw(
+// exl3_moe_cpu_forward_raw, adding into out when `accumulate`: the sglang C ABI's forward. Other units of the
+// extension are built against upstream's header, so the public signature stays as upstream declares it.
+static void forward_raw(
     int64_t handle,
     const at::Half* x,
     const int32_t* sel,
@@ -3004,7 +3009,8 @@ void exl3_moe_cpu_forward_raw(
     float* out,
     int rows,
     int topk,
-    int threads
+    int threads,
+    bool accumulate
 )
 {
     const MoeCpuLayer* layer = get_layer(handle);
@@ -3016,10 +3022,20 @@ void exl3_moe_cpu_forward_raw(
     ctx.x = x;
     ctx.out = out;
     ctx.m_total = m_total;
-    std::memset(ctx.out, 0, static_cast<size_t>(m_total) * layer->hidden_size * sizeof(float));
+    if (!accumulate) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * layer->hidden_size * sizeof(float));
+
+    ForwardArena& ar = ForwardArena::get();
+    ctx.chunks = std::move(ar.chunks);
+    ctx.chunks.clear();
+    ctx.prep_g = std::move(ar.prep_g); ctx.prep_u = std::move(ar.prep_u); ctx.prep_d = std::move(ar.prep_d);
+    const auto give_back = [&] {
+        ar.chunks = std::move(ctx.chunks);
+        ar.prep_g = std::move(ctx.prep_g); ar.prep_u = std::move(ctx.prep_u); ar.prep_d = std::move(ctx.prep_d);
+    };
 
     // Group token assignments by expert, then split into chunks of CHUNK_M rows
-    std::vector<std::vector<std::pair<int, float>>> per_expert(layer->num_experts);
+    auto& per_expert = ar.per_expert;
+    if (per_expert.size() < static_cast<size_t>(layer->num_experts)) per_expert.resize(layer->num_experts);
     for (int t = 0; t < m_total; ++t)
         for (int j = 0; j < top_k; ++j)
         {
@@ -3042,9 +3058,10 @@ void exl3_moe_cpu_forward_raw(
             }
             ctx.chunks.push_back(ch);
         }
+        lst.clear();
     }
     const int nc = static_cast<int>(ctx.chunks.size());
-    if (!nc) return;
+    if (!nc) { give_back(); return; }
 
     // Workspace: persistent per-thread arena, grown but never shrunk
     const int H = layer->hidden_size;
@@ -3055,7 +3072,6 @@ void exl3_moe_cpu_forward_raw(
         const auto& g=layer->gates[ch.expert];const auto& u=layer->ups[ch.expert];const auto& d=layer->downs[ch.expert];
         if(ch.m!=1 || g.bits!=3 || u.bits!=3 || d.bits!=3 || g.swz || u.swz || d.swz) {compact_forward=false;break;}
     }
-    ForwardArena& ar = ForwardArena::get();
     auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
     grow(ar.tin_g, static_cast<size_t>(nc) * MAX_M * H);
     grow(ar.tin_u, static_cast<size_t>(nc) * MAX_M * H);
@@ -3076,11 +3092,10 @@ void exl3_moe_cpu_forward_raw(
     grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I);
     grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I);
     grow(ar.tout_d, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.prep_g, nc); grow(ar.prep_u, nc); grow(ar.prep_d, nc);
+    grow(ctx.prep_g, nc); grow(ctx.prep_u, nc); grow(ctx.prep_d, nc);
     ctx.tout_g = ar.tout_g.data();
     ctx.tout_u = ar.tout_u.data();
     ctx.tout_d = ar.tout_d.data();
-    ctx.prep_g = ar.prep_g; ctx.prep_u = ar.prep_u; ctx.prep_d = ar.prep_d;
     for (int j = 0; j < nc; ++j)
     {
         ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_M * H,
@@ -3158,7 +3173,21 @@ void exl3_moe_cpu_forward_raw(
     TORCH_CHECK(!pin_error.load(),"cannot pin CPU expert worker to its configured core");
     TORCH_CHECK(actual_workers.load()==count,"OpenMP returned fewer CPU expert workers than requested");
     if(prof)printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",phase_us[0],phase_us[1],phase_us[2],phase_us[3],phase_us[4],phase_us[5]);
+    give_back();
+}
 
+void exl3_moe_cpu_forward_raw(
+    int64_t handle,
+    const at::Half* x,
+    const int32_t* sel,
+    const at::Half* wts,
+    float* out,
+    int rows,
+    int topk,
+    int threads
+)
+{
+    forward_raw(handle, x, sel, wts, out, rows, topk, threads, false);
 }
 
 void exl3_moe_cpu_forward
@@ -3207,17 +3236,18 @@ void exl3_moe_cpu_forward
 // service module links nothing of this one. Neither throws across the boundary.
 
 // CpuExpertForward: one token row x (fp16 [hidden]) through experts slots[0..k) of layer `handle`, weighted by
-// weights[0..k), into out (fp32 [hidden], overwritten). The calling thread is the pool's worker 0.
+// weights[0..k), into out (fp32 [hidden]): overwritten, or added to when `accumulate` is nonzero. The calling thread
+// is the pool's worker 0.
 extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_forward(
-    int64_t handle, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads)
-    noexcept
+    int64_t handle, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads,
+    int32_t accumulate) noexcept
 {
     if (k < 0 || k > 32 || !x || !out || threads<1 || (k && (!slots || !weights))) return 2;
     try
     {
         at::Half wts[32];
         for (int32_t i = 0; i < k; ++i) wts[i] = at::Half(weights[i]);
-        exl3_moe_cpu_forward_raw(handle, static_cast<const at::Half*>(x), slots, wts, out, 1, k, threads);
+        forward_raw(handle, static_cast<const at::Half*>(x), slots, wts, out, 1, k, threads, accumulate != 0);
         return 0;
     }
     catch (...)

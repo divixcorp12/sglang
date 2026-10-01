@@ -34,9 +34,11 @@ def _write_delta(c, row, tag, staging, entries=()):
     f = lease.DELTA_FIELDS
     block = c.host.lease_block
     _i32(block, base + f["count"])[0] = len(entries)
-    _i32(block, base + f["staging"], lease.LANES)[:] = torch.tensor(list(staging) + [-1] * (lease.LANES - len(staging)))
+    block[base + f["staging"] : base + f["staging"] + 2 * lease.LANES].view(torch.int16)[:] = torch.tensor(
+        list(staging) + [-1] * (lease.LANES - len(staging)), dtype=torch.int16)
     for i, (expert, slot) in enumerate(entries):
-        _i32(block, base + f["entries"] + 8 * i, 2)[:] = torch.tensor([expert, slot])
+        block[base + f["entries"] + 4 * i : base + f["entries"] + 4 * i + 4].view(torch.int16)[:] = torch.tensor(
+            [expert, slot], dtype=torch.int16)
     block[base + f["tag"] : base + f["tag"] + 8].view(torch.int64)[0] = tag
 
 
@@ -62,9 +64,8 @@ def _chain_of_last_record(c):
     seq = int(c.dev.stats()["posted"]) & 0xFFFFFFFF
     record = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
     page = c.page
-    lo = int(_i32(page, record + RECORD_FIELDS["chain"])[0]) & 0xFFFFFFFF
-    hi = int(_i32(page, record + RECORD_FIELDS["chain_hi"])[0]) & 0xFFFFFFFF
-    return hi << 32 | lo
+    at = record + RECORD_FIELDS["chain"]
+    return int(page[at : at + 8].view(torch.int64)[0])
 
 
 @pytest.fixture
@@ -120,6 +121,19 @@ def test_post_applies_the_pending_delta_once(idle):
     assert _post(c, [5])[1] == [6], "tag 2 was applied again over the bulk entry"
 
 
+def test_post_applies_a_full_delta(idle):
+    """Every one of DELTA_MAX_ENTRIES entries lands, and the staging slots with them: the delta's loads cover the
+    whole record, not just its first words."""
+    c = idle
+    _post(c, [5])  # applies the attach delta; the miss makes map chain 2
+    entries = [(e, e % 8) for e in range(lease.DELTA_MAX_ENTRIES)]
+    _write_delta(c, 0, 2, [8, 9, 10, 11, 12, 13], entries)
+    kinds, slots = _post(c, [5])
+    assert kinds == [LaneKind.HIT_SM] and slots == [5]
+    assert c.device_map(0) == [e % 8 for e in range(EXPERTS)]
+    assert c.device_staging(0)[:6] == [8, 9, 10, 11, 12, 13]
+
+
 _TRAP_SCRIPT = """
 import sys, time
 import torch
@@ -156,6 +170,39 @@ def test_post_waits_for_delta_then_traps_at_deadline(tmp_path):
     line = next((line for line in result.stdout.splitlines() if line.startswith("trapped")), None)
     assert line is not None, (result.returncode, result.stdout[-2000:], result.stderr[-2000:])
     assert 0.3 <= float(line.split()[1]) < 10.0, line
+
+
+_REPEATED_EXPERT_SCRIPT = """
+import sys
+import torch
+sys.path.insert(0, sys.argv[2])
+from lease_chain_rig import Chain
+c = Chain(sys.argv[1], start=False)
+c.plan([5, 6])
+b, p = c.backends[0], c.plans[0]
+b._stage_planned(p)
+b.planned[1] = 5  # a repeated expert: the reference raises, so the post must trap
+c.dev.post(0, b.planned, p.count, b.routes, p.slots)
+try:
+    torch.cuda.synchronize()
+    print("reached", flush=True)
+except RuntimeError as error:
+    print(f"trapped {error}", flush=True)
+import os
+os._exit(0)
+"""
+
+
+def test_post_traps_on_a_repeated_expert(tmp_path):
+    """Review Focus 5: once type_lanes loads every lane before deciding, a plan the reference rejects still traps
+    instead of being typed."""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_REPEATED_EXPERT_SCRIPT), str(tmp_path), str(Path(__file__).parent)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert "reached" not in result.stdout, result.stdout
+    assert any(line.startswith("trapped") for line in result.stdout.splitlines()), (
+        result.returncode, result.stdout[-2000:], result.stderr[-2000:])
 
 
 def test_miss_streams_from_the_staging_slot_byte_exact(tmp_path):

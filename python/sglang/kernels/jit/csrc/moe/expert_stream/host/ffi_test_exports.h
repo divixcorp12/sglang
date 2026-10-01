@@ -574,22 +574,23 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         auto cpu = SymbolicDevice{};
         expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
       }
-      alignas(64) uint8_t record[kRecordBytes] = {};
+      alignas(128) uint8_t record[kRecordBytes] = {};
       std::atomic<bool> done{false};
       const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
       std::thread writer([&] {
         for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
           const uint16_t row = static_cast<uint16_t>(round), count = count_of(round);
-          const uint32_t flags = round & 1u;
-          const int32_t id = static_cast<int32_t>(round);
+          const uint8_t counts = static_cast<uint8_t>(count << 4);  // protect ids only, no lanes
+          const uint8_t flags = static_cast<uint8_t>(round & 1u);
+          const int16_t id = static_cast<int16_t>(round & 0x7FFFu);
           store_release(record + kRecSeq, 0u);
           std::atomic_thread_fence(std::memory_order_seq_cst);
           std::memset(record + 4, 0, kRecordBytes - 4);
           std::memcpy(record + kRecRow, &row, 2);
-          std::memcpy(record + kRecProtectCount, &count, 2);
-          std::memcpy(record + kRecFlags, &flags, 4);
+          std::memcpy(record + kRecCounts, &counts, 1);
+          std::memcpy(record + kRecFlags, &flags, 1);
           for (int i = 0; i < count; ++i)
-            std::memcpy(record + kRecProtect + 4 * i, &id, 4);
+            std::memcpy(record + kRecProtect + 2 * i, &id, 2);
           std::atomic_thread_fence(std::memory_order_seq_cst);
           store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
         }
@@ -605,7 +606,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         bool whole = request.row == static_cast<uint16_t>(round) && request.captured == ((round & 1u) != 0) &&
                      request.protect.size() == count_of(round);
         for (int32_t id : request.protect)
-          whole = whole && id == static_cast<int32_t>(round);
+          whole = whole && id == static_cast<int16_t>(round & 0x7FFFu);
         if (!whole) ++torn;
       }
       done.store(true);
@@ -613,6 +614,48 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       auto* result = static_cast<int64_t*>(out.data_ptr());
       result[0] = accepted;
       result[1] = torn;
+    }
+  }
+
+  // Test only: read_record over one record (record: CPU uint8 [kRecordBytes]) as the service reads seq `expected`.
+  // out int64 [6 + kMaxIds + 1 + 5 * kMaxIds] = {status (RecordRead: 0 ok, 1 torn, 2 malformed), row, captured,
+  // chain, gen, protect count, protect ids, lane count, then per lane: expert, slot, dst, kind, the weight's bits}.
+  static void read_record_fields(TensorView record, int64_t expected, TensorView out) {
+    if constexpr (!Build::kFaults) {
+      test_only("read_record_fields");
+    } else {
+      {
+        using namespace host;
+        auto cpu = SymbolicDevice{};
+        expert_stream::verify_named(
+            "record", TensorMatcher({kRecordBytes}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), record);
+        expert_stream::verify_named(
+            "out", TensorMatcher({6 + kMaxIds + 1 + 5 * kMaxIds}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+      }
+      Request request;
+      const RecordRead read =
+          read_record(static_cast<const uint8_t*>(record.data_ptr()), static_cast<uint32_t>(expected), &request);
+      auto* w = static_cast<int64_t*>(out.data_ptr());
+      w[0] = static_cast<int64_t>(read);
+      w[1] = request.row;
+      w[2] = request.captured ? 1 : 0;
+      w[3] = static_cast<int64_t>(request.chain);
+      w[4] = static_cast<int64_t>(request.gen);
+      w[5] = static_cast<int64_t>(request.protect.size());
+      for (size_t i = 0; i < request.protect.size(); ++i)
+        w[6 + i] = request.protect[i];
+      w[6 + kMaxIds] = static_cast<int64_t>(request.lanes.size());
+      for (size_t j = 0; j < request.lanes.size(); ++j) {
+        const Lane& lane = request.lanes[j];
+        int32_t bits;
+        std::memcpy(&bits, &lane.weight, 4);
+        int64_t* l = w + 7 + kMaxIds + 5 * j;
+        l[0] = lane.expert;
+        l[1] = lane.slot;
+        l[2] = lane.dst;
+        l[3] = lane.kind;
+        l[4] = bits;
+      }
     }
   }
 
@@ -651,6 +694,19 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       return expert_stream::traced_clock_reads().load(std::memory_order_relaxed);
     }
   }
+
+  // Test only: the measured cost of one _mm_pause in ns, the service's idle-poll quantum (RamThread::run).
+  static double pause_ns() {
+    if constexpr (!Build::kFaults) {
+      test_only("pause_ns");
+    } else {
+      constexpr int kProbe = 1 << 16;
+      const int64_t start = now_ns();
+      for (int i = 0; i < kProbe; ++i)
+        _mm_pause();
+      return static_cast<double>(now_ns() - start) / kProbe;
+    }
+  }
 };
 
 }  // namespace sglang::expert_stream
@@ -677,6 +733,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_marked, Exports::copy_engine_marked);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_ballast, Exports::copy_engine_ballast);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);            \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_record_fields, Exports::read_record_fields);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);

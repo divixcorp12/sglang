@@ -96,7 +96,7 @@ class RamTier {
   ~RamTier() {
     fill_join();  // the fill thread reads through reader_ into the slabs; nothing else holds the tier by now
     if (copy_engine_ != nullptr) copy_engine_->stop(5'000'000'000LL);
-    if (cpu_ != nullptr) cpu_->stop();  // after the copy thread, its only client
+    if (cpu_ != nullptr) cpu_->stop();  // after the copy thread, which reads its done()
   }
 
   bool open() {
@@ -170,6 +170,7 @@ class RamTier {
       next_demand_ = skip_zero(head - kDemandRecords + 2u);
     }
     uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
+    prefetch_request(record, next_demand_);
     Request request;
     // A torn record was overwritten by a later post, so nothing waits on it: skipped, and counted.
     const RecordRead read = read_record(record, next_demand_, &request);
@@ -436,11 +437,25 @@ class RamTier {
     const size_t bytes = hot_scratch_.size();
     std::memcpy(hot_scratch_.data(), record + kHotHeaderBytes, bytes);
     std::atomic_thread_fence(std::memory_order_acquire);
+    asm volatile("" ::: "memory");  // the copy's plain loads must stay before the seq re-check
     if (load_acquire(record) != expected) return false;
     if (experts_ % 8 != 0 && (hot_scratch_[bytes - 1] & static_cast<uint8_t>(~((1u << (experts_ % 8)) - 1u))) != 0)
       return false;
     request->hot_bitmap = hot_scratch_.data();
     return true;
+  }
+
+  // Starts the loads of every line the request's read will touch: the record's two lines and its hot record's. The
+  // device has just written each, so each is an L3 miss; issued together they overlap instead of queueing behind
+  // read_record's branches. Called once the head shows the post: a line prefetched earlier would be refetched.
+  void prefetch_request(const uint8_t* record, uint32_t seq) const {
+    static_assert(kRecordBytes == 128, "a record is two lines");
+    _mm_prefetch(reinterpret_cast<const char*>(record), _MM_HINT_T0);
+    _mm_prefetch(reinterpret_cast<const char*>(record + 64), _MM_HINT_T0);
+    if (hot_page_ == nullptr) return;
+    const uint8_t* hot = hot_page_ + static_cast<int64_t>((seq - 1u) % kHotRecords) * hot_stride_;
+    for (int64_t line = 0; line < hot_stride_; line += 64)
+      _mm_prefetch(reinterpret_cast<const char*>(hot + line), _MM_HINT_T0);
   }
 
   void apply_gpu_hot(const Request& request) {
@@ -541,8 +556,9 @@ class RamTier {
   }
 
   // CPU experts. The device types a captured post's CPU lanes: the
-  // last split[n] of its n eligible lanes (kSplit, which this and set_cpu_split write). The copy thread hands them to
-  // the CPU expert thread, so CopyDone covers them. Needs the copy engine; call before the service thread starts.
+  // last split[n] of its n eligible lanes (kSplit, which this and set_cpu_split write). The service hands them to the
+  // CPU expert thread and the copy thread waits for them, so CopyDone covers them. Needs the copy engine; call before
+  // the service thread starts.
   void enable_cpu_experts(CpuExpertConfig config, std::vector<int64_t> split) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");
@@ -576,6 +592,11 @@ class RamTier {
     out[0] = cpu_ != nullptr ? cpu_->jobs() : 0;
     out[1] = cpu_ != nullptr ? cpu_->lanes() : 0;
     out[2] = cpu_ != nullptr ? cpu_->compute_ns() : 0;
+  }
+
+  // The CPU experts' cores, empty without CPU experts. The caller's, before the service thread starts.
+  std::vector<int> cpu_cores() const {
+    return cpu_ != nullptr ? cpu_->cores() : std::vector<int>{};
   }
 
   // The owner (RamThread::pause, once the service parked): every job handed to the copy thread has completed (or
@@ -1039,11 +1060,13 @@ class RamTier {
     const uint32_t n = static_cast<uint32_t>(count);
     std::memcpy(d + kDeltaCount, &n, 4);
     for (int k = 0; k < kLeaseLanes; ++k) {
-      const int32_t slot = k < static_cast<int>(staging.size()) ? staging[k] : -1;
-      std::memcpy(d + kDeltaStaging + 4 * k, &slot, 4);
+      const int16_t slot = static_cast<int16_t>(k < static_cast<int>(staging.size()) ? staging[k] : -1);
+      std::memcpy(d + kDeltaStaging + 2 * k, &slot, 2);
     }
-    for (int i = 0; i < count; ++i)
-      std::memcpy(d + kDeltaEntries + 8 * i, entries[i], 8);
+    for (int i = 0; i < count; ++i) {
+      const int16_t entry[2] = {static_cast<int16_t>(entries[i][0]), static_cast<int16_t>(entries[i][1])};
+      std::memcpy(d + kDeltaEntries + 4 * i, entry, 4);
+    }
     _mm_sfence();
     store_release64(d + kDeltaTag, tag);
   }
@@ -1269,6 +1292,11 @@ class RamTier {
     } else if (request.chain != 0) {
       fail("map chain " + std::to_string(request.chain) + " on a record without a miss");
     }
+    const auto submit_cpu = [&](const CpuJob& cpu_job) {
+      if (!cpu_->submit(cpu_job)) fail("the CPU expert ring is full");
+      this->template count<kCpuJobs>();
+    };
+    uint32_t late_next = 0;  // the next CPU-miss job's sequence, short of the last (job.late_seq)
     if (job.count > 0 || job.late_cpu > 0) {
       job.gen = request.gen;
       job.idx = idx;
@@ -1277,8 +1305,29 @@ class RamTier {
       this->template count<kCopyJobs>();
       this->template count<kCopyLanes>(job.count + job.late_cpu);
       const int cpu_hits = __builtin_popcount(job.cpu_mask);
-      this->template count<kCpuJobs>((cpu_hits > 0 ? 1 : 0) + (job.late_cpu > 0 ? 1 : 0));  // one job per part
       this->template count<kCpuLanes>(cpu_hits + job.late_cpu);
+      if (cpu_hits > 0 || job.late_cpu > 0) {
+        // One sequence per job the record can need: the hits' and one per CPU miss. The last miss job takes the last,
+        // so the copy thread's done(late_seq) covers however the misses were batched.
+        const uint32_t first = cpu_->claim((cpu_hits > 0 ? 1 : 0) + job.late_cpu);
+        job.cpu_seq = first;
+        late_next = first + (cpu_hits > 0 ? 1u : 0u);
+        job.late_seq = late_next + static_cast<uint32_t>(job.late_cpu) - 1u;
+        if (cpu_hits > 0) {  // before the copy job, so the CPU starts first
+          CpuJob cpu_job;
+          cpu_job.row = request.row;
+          cpu_job.part = 0;
+          cpu_job.seq = first;
+          for (int i = 0; i < job.count; ++i) {
+            const CopyLane& lane = job.lanes[i];
+            if ((job.cpu_mask >> lane.lane & 1u) == 0) continue;
+            cpu_job.slots[cpu_job.k] = lane.host_slot;
+            cpu_job.weights[cpu_job.k] = lane.weight;
+            ++cpu_job.k;
+          }
+          submit_cpu(cpu_job);
+        }
+      }
       copy_engine_->submit(job);
     }
     // Victims and the delta, before any read. A miss lands in its staging slot whatever happens here; whether it is
@@ -1327,23 +1376,30 @@ class RamTier {
         fail_reads = faults_.fail_reads.load();
       }
       if (fail_reads) fail("a test fault failed the read");
-      bool late_sent = job.late_cpu == 0;
-      // The CPU misses' job, once every one of their rows landed: from read()'s progress hook, or after the read.
-      const auto send_late = [&] {
-        if (late_sent) return;
-        LateCpu late;
-        late.gen = request.gen;
+      uint32_t cpu_sent = 0;  // bit i: miss i went to the CPU
+      int cpu_left = job.late_cpu;
+      // The CPU misses whose rows landed since the last call, as one part-1 job: from read()'s progress hook, and
+      // after the read. Every job after the record's first adds into the part.
+      const auto send_landed = [&] {
+        if (cpu_left == 0) return;
+        CpuJob cpu_job;
+        cpu_job.row = request.row;
+        cpu_job.part = 1;
+        cpu_job.accumulate = cpu_left < job.late_cpu;
         for (size_t i = 0; i < missing.size(); ++i) {
           const Lane& lane = request.lanes[miss_lane[i]];
-          if (lane.kind != kKindMissCpu) continue;
-          if (!(i < packed.size() && packed[i] != 0)) return;
-          late.slots[late.k] = static_cast<int32_t>(slots[i]);
-          late.weights[late.k] = lane.weight;
-          ++late.k;
+          if (lane.kind != kKindMissCpu || (cpu_sent >> i & 1u) != 0) continue;
+          if (!(i < packed.size() && packed[i] != 0)) continue;
+          cpu_job.slots[cpu_job.k] = static_cast<int32_t>(slots[i]);
+          cpu_job.weights[cpu_job.k] = lane.weight;
+          ++cpu_job.k;
+          cpu_sent |= 1u << i;
         }
+        if (cpu_job.k == 0) return;
+        cpu_left -= cpu_job.k;
+        cpu_job.seq = cpu_left == 0 ? job.late_seq : late_next++;
         _mm_sfence();  // the rows' bytes before the CPU thread reads them
-        copy_engine_->submit_late(late);
-        late_sent = true;
+        submit_cpu(cpu_job);
       };
       const int result = reader_.read(
           request.row,
@@ -1355,7 +1411,7 @@ class RamTier {
           &packed,
           SIZE_MAX,
           // read() runs this once per drain-loop turn and once per finished row.
-          [&] { send_late(); },
+          [&] { send_landed(); },
           publishing ? &piece_publish_ : nullptr);
       stats_.store(kPiecePublishRefused, reader_.publish_refused());
       if (result != 1) {
@@ -1365,8 +1421,8 @@ class RamTier {
       status = kStatusServed;
       ++demands_read_;
       _mm_sfence();  // the split's memcpy stores land before the mirror publishes them (D11)
-      send_late();
-      if (!late_sent) fail("a CPU miss's row never landed");
+      send_landed();
+      if (cpu_left != 0) fail("a CPU miss's row never landed");
     }
     for (size_t i = 0; i < missing.size(); ++i) {
       if (!inserted[i]) continue;

@@ -61,6 +61,19 @@ def test_the_timeout_must_be_positive():
         _device(timeout_ms=0)
 
 
+@pytest.mark.parametrize("experts, capacity", [(ram_miss.RECORD_ID_MAX + 1, 5), (4, ram_miss.RECORD_ID_MAX + 1)])
+def test_the_host_module_refuses_tables_its_records_cannot_carry(experts, capacity):
+    # expert_stream_open checks this first, so no other argument needs to be a real table.
+    empty = torch.empty(0, dtype=torch.int64)
+    no_bytes = torch.empty(0, dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="32767"):
+        ram_miss._host_module().expert_stream_open(
+            torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.full((1, experts), -1, dtype=torch.int32), empty,
+            torch.zeros((1, experts), dtype=torch.int64), empty, empty, empty, empty, empty,
+            torch.tensor([capacity], dtype=torch.int64), "", "", 0, 0, 0, no_bytes, no_bytes,
+        )
+
+
 def test_piece_runs_of_the_wrong_shape_are_refused():
     with pytest.raises(ValueError, match="piece_runs"):
         _device(piece_runs=_runs(layers=3))
@@ -102,7 +115,19 @@ def test_the_device_sequence_continues_from_the_page_head():
     assert int(_device(page=page).state[STATE_WORDS["posted"]]) == 7
 
 
-_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.LShift: operator.lshift}
+def _cpp_div(a, b):
+    """C++ integer division truncates toward zero; Python's // floors."""
+    q = abs(a) // abs(b)
+    return q if (a < 0) == (b < 0) else -q
+
+
+_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: _cpp_div,
+    ast.LShift: operator.lshift,
+}
 
 
 def _evaluate(node, known):
@@ -145,21 +170,18 @@ PYTHON_WIRE = {
     "kMaxIds": ram_miss.MAX_IDS,
     "kRecSeq": ram_miss.RECORD_FIELDS["seq"],
     "kRecRow": ram_miss.RECORD_FIELDS["row"],
-    "kRecCount": ram_miss.RECORD_FIELDS["count"],
+    "kRecCounts": ram_miss.RECORD_FIELDS["counts"],
     "kRecFlags": ram_miss.RECORD_FIELDS["flags"],
     "kRecFlagCaptured": ram_miss.RECORD_FLAG_CAPTURED,
     "kRecChain": ram_miss.RECORD_FIELDS["chain"],
-    "kRecChainHi": ram_miss.RECORD_FIELDS["chain_hi"],
     "kRecEpoch": ram_miss.RECORD_FIELDS["epoch"],
-    "kRecProtectCount": ram_miss.RECORD_FIELDS["protect_count"],
-    "kRecProtect": ram_miss.RECORD_FIELDS["protect"],
-    "kRecLanes": ram_miss.RECORD_FIELDS["lanes"],
-    "kLaneBytes": ram_miss.LANE_BYTES,
-    "kLaneExpert": ram_miss.LANE_FIELDS["expert"],
-    "kLaneSlot": ram_miss.LANE_FIELDS["slot"],
-    "kLaneDst": ram_miss.LANE_FIELDS["dst"],
-    "kLaneWeight": ram_miss.LANE_FIELDS["weight"],
     "kRecKinds": ram_miss.RECORD_FIELDS["kinds"],
+    "kRecProtect": ram_miss.RECORD_FIELDS["protect"],
+    "kRecLaneExpert": ram_miss.RECORD_FIELDS["lane_expert"],
+    "kRecLaneSlot": ram_miss.RECORD_FIELDS["lane_slot"],
+    "kRecLaneDst": ram_miss.RECORD_FIELDS["lane_dst"],
+    "kRecLaneWeight": ram_miss.RECORD_FIELDS["lane_weight"],
+    "kRecIdMax": ram_miss.RECORD_ID_MAX,
     "kPageBytes": PAGE_BYTES,
     "kKindHitCopy": LaneKind.HIT_COPY,
     "kKindHitSm": LaneKind.HIT_SM,

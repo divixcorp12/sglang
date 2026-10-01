@@ -2,9 +2,10 @@
 // computes a request's CPU lanes, RAM-tier experts the grant published with tag kLeaseTagCpu, from their leased host
 // slots through a format's C ABI forward, into the row's pinned output that the device folds into its fused MoE.
 //
-// The copy thread is its only client. It submits a job when it issues the request's copy job, and treats the copy
-// job as complete only once this thread has also finished that job. So CopyDone, the lease release and the copy wait's
-// gate keep their one publisher (LEASE_PROTOCOL.md, "Copy engine"). A failed forward fails stop here.
+// The tier's owner (the service thread) is its only client: it submits a record's CPU hits before the record's copy
+// job, and each CPU miss once its row landed. The copy thread only reads done() and treats the copy job as complete
+// once every CPU job of the record is. So CopyDone and the copy wait's gate keep their one publisher
+// (LEASE_PROTOCOL.md, "Copy engine"). A failed forward fails stop here.
 #pragma once
 
 #include <immintrin.h>
@@ -29,19 +30,21 @@
 namespace sglang::expert_stream {
 
 // A format's CPU expert kernel as a C ABI, the native half of CpuExpertQuantTrait (python/sglang/srt/layers/moe/
-// cpu_experts/pool.py): overwrite out[0, hidden) with sum over i < k of weights[i] * expert(slots[i])(x), where
-// slots[i] indexes the layer's pinned host tier and x is one input row in the trait's x format. `layer` is the handle
-// the trait registered for that layer. Returns 0 on success. Called from the CPU expert thread only, with `threads`
-// the kernel's worker count, the calling thread counted as one of them.
+// cpu_experts/pool.py): overwrite out[0, hidden) with sum over i < k of weights[i] * expert(slots[i])(x), or add that
+// sum to it when `accumulate` is nonzero, where slots[i] indexes the layer's pinned host tier and x is one input row in
+// the trait's x format. `layer` is the handle the trait registered for that layer. Returns 0 on success. Called from
+// the CPU expert thread only, with `threads` the kernel's worker count, the calling thread counted as one of them.
 using CpuExpertForward =
     int (*)(int64_t layer, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out,
-            int32_t threads);
+            int32_t threads, int32_t accumulate);
 
 struct CpuJob {
   int64_t row = 0;
   int32_t part = 0;   // the output part: 0 the CPU hits' partial sum, 1 the CPU misses'
-
-  uint32_t seq = 0;  // the engine's job sequence, from 1; done() compares against it
+  // Add into the part rather than overwrite it: a record's later CPU-miss jobs, in landing order, so the part's fp32
+  // sum order varies from run to run.
+  bool accumulate = false;
+  uint32_t seq = 0;  // from claim(); done() compares against it
   int32_t k = 0;
   int32_t slots[wire::kLeaseLanes] = {};
   float weights[wire::kLeaseLanes] = {};
@@ -61,13 +64,14 @@ struct CpuExpertConfig {
   int64_t spin_ns = 50'000'000;
 };
 
-// One thread, a lock-free SPSC job ring from the copy thread, and a monotonically increasing done word. Jobs run in
-// order, so done() is a single compare. The idle protocol is the copy engine's (copy_engine.h): spin for spin_ns,
-// then a futex sleep whose wake the submitter makes only when this thread has gone to sleep.
+// One thread, a lock-free SPSC job ring from the tier's owner, and a monotonically increasing done word. Jobs run in
+// sequence order, so done() is a single compare. The idle protocol is the copy engine's (copy_engine.h): spin for
+// spin_ns, then a futex sleep whose wake the submitter makes only when this thread has gone to sleep.
 class CpuExpertEngine {
  public:
-  static constexpr size_t kRing = 32;
-  static_assert(kRing > wire::kDemandRecords + 1, "the ring holds every job that can be outstanding");
+  static constexpr size_t kRing = 256;
+  // A record has at most one CPU-hit job and one job per CPU miss.
+  static_assert(kRing >= wire::kDemandRecords * (wire::kLeaseLanes + 1), "the ring holds every job that can be outstanding");
 
   CpuExpertEngine(CpuExpertConfig config, std::string prefix, std::string thread_name)
       : config_(std::move(config)), prefix_(std::move(prefix)), thread_name_(thread_name.substr(0, 15)) {
@@ -113,25 +117,33 @@ class CpuExpertEngine {
     return config_.out_part_stride > 0 ? 2 : 1;
   }
 
+  const std::vector<int>& cores() const {
+    return config_.cores;
+  }
+
   // A row the device may send to the CPU: registered, and inside the tables.
   bool eligible(int64_t row) const {
     return row >= 0 && row < config_.rows && handles_[row].load(std::memory_order_acquire) >= 0;
   }
 
-  // Copy thread only. The job's sequence, or 0 when the ring is full (an internal error: at most kDemandRecords + 1
-  // copy jobs are outstanding, so the copy thread fails stop).
-  uint32_t submit(CpuJob job) {
-    uint32_t seq = submitted_ + 1;
-    if (seq == 0) seq = 1;  // 0 means "no job" to the copy thread
-    job.seq = seq;
-    if (!jobs_.push(job)) return 0;
-    submitted_ = seq;
+  // The tier's owner only. The first of `n` consecutive sequences for jobs it will submit, in order. A sequence left
+  // unsubmitted is skipped: done() of a later one covers it, so a record can claim one per possible job.
+  uint32_t claim(int n) {
+    const uint32_t first = claimed_ + 1;
+    claimed_ += static_cast<uint32_t>(n);
+    return first;
+  }
+
+  // The tier's owner only, with job.seq claimed and above every earlier submit's. False when the ring is full (an
+  // internal error under kRing's bound: the caller fails stop).
+  bool submit(const CpuJob& job) {
+    if (!jobs_.push(job)) return false;
     std::atomic_thread_fence(std::memory_order_seq_cst);  // Dekker with run()'s sleeping_ store and ring re-check
     if (sleeping_.load(std::memory_order_relaxed)) {
       wake_.fetch_add(1, std::memory_order_relaxed);
       futex_wake(&wake_);
     }
-    return seq;
+    return true;
   }
 
   // Any thread. Acquire: a job seen done has its output written, so a CopyDone published after this observation orders
@@ -197,7 +209,8 @@ class CpuExpertEngine {
           job.weights,
           job.k,
           reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride),
-          config_.threads);
+          config_.threads,
+          job.accumulate ? 1 : 0);
       if (result != 0)
         fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed (" +
                   std::to_string(result) + ")");
@@ -222,7 +235,7 @@ class CpuExpertEngine {
   std::string thread_name_;
   std::thread thread_;
   SpscRing<CpuJob, kRing> jobs_;
-  uint32_t submitted_ = 0;  // the copy thread's
+  uint32_t claimed_ = 0;  // the tier owner's
   std::atomic<uint32_t> done_{0};
   std::atomic<int64_t> jobs_done_{0};
   std::atomic<int64_t> lanes_done_{0};

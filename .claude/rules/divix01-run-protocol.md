@@ -60,6 +60,14 @@ a long run's output readable, so this is not a rare shape -- assume any suite
 result that came through a pipe is unverified until its `PIPESTATUS` is read.
 The same applies to `| grep`, which exits non-zero when it matches nothing.
 
+## Run only the tests your change affects
+
+Run only the test files that exercise the code you changed, and name them as narrowly as you can (files, then `-k`).
+Do not run a whole suite to check a change it mostly does not touch: it costs minutes per run and adds load-sensitive
+noise. A change to the expert-stream / RAM-miss host or device code, for example, runs
+`test/registered/unit/kernels/test_*exl3*.py test/registered/unit/kernels/test_*expert*.py` plus the GPU files in
+`test/manual/dsv41`, not all of `unit/kernels`. Record the exact selection next to the result.
+
 ## Point the registered suite at `unit/kernels`, not the whole tree
 
 ```bash

@@ -1,0 +1,31 @@
+[Unit]
+Description=Benchmarks on an isolated CPU partition (CPUs 18-33 and siblings 54-69)
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=dnikolaidis
+Group=dnikolaidis
+Slice=-.slice
+AllowedCPUs=18-33 54-69
+AllowedMemoryNodes=0-1
+CPUAccounting=yes
+ExecStartPre=+/usr/local/libexec/exl3bench-isolation start
+ExecStart=/usr/local/libexec/exl3bench-run
+ExecStopPost=+/usr/local/libexec/exl3bench-isolation stop
+Environment=PATH=/usr/bin:/bin
+# No benchmark-specific environment here: run.sh exports its own OMP/EXL3 settings, and any other job sets its own
+# (service-env.txt or its script).
+WorkingDirectory=/data/models/exl3_exp/google_benchmark
+NoNewPrivileges=yes
+UMask=0022
+KillMode=control-group
+TimeoutStartSec=30
+TimeoutStopSec=30
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+# Deliberately no [Install]: the service is available after reboot, but does not
+# reserve cores until explicitly started. All benchmark descendants are killed
+# before ExecStopPost returns the partition to member.

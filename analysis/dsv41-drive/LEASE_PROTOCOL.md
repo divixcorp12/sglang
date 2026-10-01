@@ -20,7 +20,9 @@ constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/ex
   `dst_rows` (set at attach by `set_row_copy`, copy engine on) and `cpu_ok` (set when the layer registers with the
   CPU expert service, `set_row_cpu`).
 - **Service thread** (`host/ram_tier.h`, `host/ram_thread.h`). The tier's single owner. It handles records in
-  sequence, chooses victims, publishes deltas and reads misses.
+  sequence, chooses victims, publishes deltas and reads misses. With `SGLANG_DSV41_RAM_MISS_SPIN_CORE`, the service
+  busy-polls that core with no PAUSE and never sleeps; `start_thread` refuses unless no SMT sibling of the core is in
+  the server's affinity or among the CPU experts' cores.
 - **Copy thread** (`host/copy_engine.h`). Copies a record's copy-engine hits with `cuMemcpyAsync`, runs its CPU jobs
   through the CPU expert thread, and publishes CopyDone.
 - **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row.
@@ -31,21 +33,28 @@ constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/ex
 
 Two pinned host areas, both read by the device through UVA.
 
-**Request page** (4160 B, `kPageBytes`): `demand_head` @0 (the last posted seq, stored with a release) and a 16-record
-ring @64, 256 B a record. A record, behind a seqlock on `seq`:
+**Request page** (2176 B, `kPageBytes`): `demand_head` @0 (the last posted seq, stored with a release) and a 16-record
+ring @128, 128 B a record. A record is one 128-byte-aligned block, so the host's L2 fetches its second line with its
+first. A record, behind a seqlock on `seq`:
 
 | Offset | Field | |
 |---|---|---|
 | 0 | `seq` u32 | 0 while the payload is rewritten, the seq stored last |
 | 4 | `row` u16 | |
-| 6 | `count` u16 | lanes, at most 8 |
-| 8 | `flags` u32 | `CAPTURED` = 1 |
-| 12, 16 | `chain`, `chain_hi` u32 | the row's map-chain number; 0 when no lane misses |
-| 20 | `protect_count` u16 | |
-| 24 | `epoch` u32 | so the host forms G = epoch << 32 \| seq |
-| 32 | `protect` i32[8] | every routed expert of the request |
-| 64 | lanes, 8 x 16 B | `{expert, slot, dst, weight}`: slot is a hit's RAM slot or a miss's staging slot |
-| 192 | `kinds` u8[8] | the lane kinds below |
+| 6 | `counts` u8 | lanes (at most 8) in bits 0-3, protect ids in bits 4-7 |
+| 7 | `flags` u8 | `CAPTURED` = 1 |
+| 8 | `chain` u64 | the row's map-chain number; 0 when no lane misses |
+| 16 | `epoch` u32 | so the host forms G = epoch << 32 \| seq |
+| 20 | `kinds` u32 | lane j's kind (below) in bits 4j..4j+3 |
+| 32 | `protect` i16[8] | every routed expert of the request, -1 past the count |
+| 48 | `lane_expert` i16[8] | -1 past the lane count |
+| 64 | `lane_slot` i16[8] | a hit's RAM slot or a miss's staging slot |
+| 80 | `lane_dst` i16[8] | the VRAM destination slot |
+| 96 | `lane_weight` f32[8] | the lane expert's routing weight |
+
+Ids are i16, so a launch with more than 32767 experts or slots per row is refused (`kRecIdMax`). The post writes the
+payload between the two seq stores as one u32, one 8-byte and seven 16-byte relaxed stores; a page off 128-byte
+alignment is refused at the post's launch.
 
 Lane kinds: `HIT_COPY`=1 (the copy thread's DMA; CopyDone), `HIT_SM`=2 (C1; stream order), `HIT_CPU`=3 (the CPU from the
 RAM slot; CopyDone), `MISS_GPU`=4 (NVMe into staging, then S; PieceMask), `MISS_CPU`=5 (NVMe into staging, then the
@@ -60,10 +69,11 @@ CPU; CopyDone).
 | 16512 | the gate | CW closes, copy thread or CW opens |
 | 16640 | `kCopyArmed` u32: 1 once the service armed its copy engine | host |
 | 16768 | `kSplit` i32[9]: CPU lanes per n eligible lanes | host (`store_split`, at start and on retune) |
-| 20480 + 256 row | the row's delta: `tag` u64 @0, `count` u32 @8, `staging` i32[8] @16, 16 `{expert, slot}` entries @48 | host |
+| 20480 + 256 row | the row's delta: `tag` u64 @0, `count` u32 @8, `staging` i16[8] @16, 16 `{i16 expert, i16 slot}` entries @32 | host |
 
 `lease_block_bytes(rows) = 20480 + round_up(rows * 256, 4096)`. A delta entry maps `ram_slot[expert] = slot`; slot -1
-unmaps. Sixteen entries are an insert and an eviction per lane.
+unmaps. Sixteen entries are an insert and an eviction per lane. The post reads the payload with one u32 load and five
+16-byte loads, all issued together after the tag's acquire.
 
 ## The chain
 
@@ -113,8 +123,11 @@ unmaps. Sixteen entries are an insert and an eviction per lane.
    inserted, and is counted in `ram_insert_skipped`; the delta is still published, with whatever entries the record
    has, possibly none.
 4. **Read the misses** into their staging slots, publishing each piece's PieceMask bit as it lands.
-5. **A `MISS_CPU` lane** becomes a late part-1 CPU job (the `LateCpu` ring) once its read landed. The copy job's
-   completion waits for the DMA, part 0 and part 1 before it stores CopyDone.
+5. **CPU lanes go straight from the service to the CPU expert thread.** The service claims one job sequence per job
+   the record can need (the hits', one per `MISS_CPU` lane) and submits the hits as part 0 before the copy job. Each
+   `MISS_CPU` lane goes into part 1 as soon as its read landed; rows landing together share a job, and every job after
+   the record's first adds into the part, so its fp32 sum order follows landing order. The last miss job takes the last
+   claimed sequence. The copy job's completion waits for the DMA and for that sequence before it stores CopyDone.
 6. The host mirror (`slot_map`, read by the eager Python paths) shows an insert only after its bytes land; a victim's
    unmap is written to it at victim choice, before any read.
 

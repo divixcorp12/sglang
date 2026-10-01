@@ -1,11 +1,13 @@
 """The service thread, its pause handshake, its watchdog, and what a demand may evict (CPU, simulated device)."""
 
+import contextlib
 import faulthandler
 import gc
 import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -370,6 +372,95 @@ def test_when_every_resident_expert_is_protected_the_miss_is_served_and_not_cach
         _pump_serve(host, sim, 1, [4], protect=[0, 1, 2, 4])
         assert _resident(host) == [0, 1, 2]
         assert host.counters()["ram_insert_skipped"] == 1 and host.counters()["evictions"] == 0
+    finally:
+        host.stop()
+
+
+def _plain_host(tmp_path):
+    s = ram_miss_setup(tmp_path)
+    return ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
+
+
+def _cpu_list(text: str) -> set[int]:
+    cores = set()
+    for item in text.strip().split(","):
+        first, _, last = item.partition("-")
+        cores.update(range(int(first), int(last or first) + 1))
+    return cores
+
+
+def _physical_core_pair() -> tuple[int, int]:
+    """A core of this process's affinity with exactly one SMT sibling, both in the affinity and below 64; or skip."""
+    mask = os.sched_getaffinity(0)
+    for core in sorted(mask):
+        path = Path(f"/sys/devices/system/cpu/cpu{core}/topology/thread_siblings_list")
+        if not path.exists():
+            continue
+        siblings = _cpu_list(path.read_text())
+        if len(siblings) == 2 and all(c < 64 and c in mask for c in siblings):
+            return core, next(c for c in siblings if c != core)
+    pytest.skip("no SMT core pair in this process's affinity")
+
+
+@contextlib.contextmanager
+def _affinity(cores):
+    before = os.sched_getaffinity(0)
+    os.sched_setaffinity(0, cores)
+    try:
+        yield
+    finally:
+        os.sched_setaffinity(0, before)
+
+
+def _service_cpu_s() -> float:
+    for task in Path("/proc/self/task").iterdir():
+        if (task / "comm").read_text().strip().endswith("ram-miss"):
+            fields = (task / "stat").read_text().rsplit(")", 1)[1].split()
+            return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")  # utime + stime
+    raise AssertionError("no RAM-miss service thread")
+
+
+def test_a_busy_polling_service_needs_a_core(tmp_path):
+    host = _plain_host(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="busy_poll needs cpu_core"):
+            host.start_thread(busy_poll=True)
+        assert not host.threaded
+    finally:
+        host.stop()
+
+
+@pytest.mark.parametrize("shared", ["core", "sibling"])
+def test_a_busy_polling_service_refuses_a_physical_core_it_would_share(tmp_path, shared):
+    """The caller's affinity (which the process's other threads inherit) holds the core itself, or only its sibling."""
+    core, sibling = _physical_core_pair()
+    kept = core if shared == "core" else sibling
+    host = _plain_host(tmp_path)
+    try:
+        with _affinity(os.sched_getaffinity(0) - ({core, sibling} - {kept})):
+            with pytest.raises(RuntimeError, match=f"core {kept} shares"):
+                host.start_thread(cpu_core=core, busy_poll=True)
+        assert not host.threaded
+    finally:
+        host.stop()
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_a_busy_polling_service_spins_where_a_default_one_sleeps(tmp_path, busy):
+    """Idle for half a second: a busy-polling service uses its core the whole time, a default one (1 ms of spin) sleeps.
+    Both still park for a pause and stop."""
+    core, sibling = _physical_core_pair()
+    host = _plain_host(tmp_path)
+    try:
+        with _affinity(os.sched_getaffinity(0) - {core, sibling}):
+            host.start_thread(cpu_core=core, busy_poll=busy, spin_us=1000)
+        assert host.counters()["spin_cpu"] == core
+        before = _service_cpu_s()
+        time.sleep(0.5)
+        used = _service_cpu_s() - before
+        assert (used > 0.3) if busy else (used < 0.1), (busy, used)
+        host.pause(5.0)
+        host.resume()
     finally:
         host.stop()
 
