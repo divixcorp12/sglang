@@ -26,9 +26,11 @@ from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RING,
     LANE_BYTES,
     LANE_FIELDS,
+    PAGE_BYTES,
     RECORD_BYTES,
     RECORD_FIELDS,
     RECORD_FLAG_CAPTURED,
+    RECORD_ID_MAX,
     ExpertStreamDevice,
     new_page,
 )
@@ -172,6 +174,27 @@ def test_the_device_refuses_what_its_kernels_cannot_read(tmp_path):
             c.dev.stream(0, backend.planned, plan.count, plan.slots, c.segments[0], backend.stream_maps[0][:-1])
         with pytest.raises(ValueError, match="count"):
             c.dev.post(0, backend.planned, plan.count.long(), backend.routes, plan.slots)
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("case", ["experts", "row_capacity", "page"])
+def test_the_post_launch_refuses_what_a_narrow_record_cannot_carry(tmp_path, case):
+    """The post writes i16 ids with 16-byte stores: its launcher refuses more experts or slots than an i16 carries,
+    and a page off 16-byte alignment, before anything is launched."""
+    c = Chain(tmp_path, start=False)
+    try:
+        c.plan([1], 0)
+        backend, plan = c.backends[0], c.plans[0]
+        backend._stage_planned(plan)
+        if case == "experts":
+            c.dev.experts = RECORD_ID_MAX + 1
+        elif case == "row_capacity":
+            c.dev._row_capacities = (RECORD_ID_MAX + 1,) * len(c.dev._row_capacities)
+        else:
+            c.dev.page = torch.zeros(PAGE_BYTES + 16, dtype=torch.uint8).pin_memory()[1 : 1 + PAGE_BYTES]
+        with pytest.raises(RuntimeError, match="16-byte" if case == "page" else "32767"):
+            c.dev.post(0, backend.planned, plan.count, backend.routes, plan.slots)
     finally:
         c.close()
 

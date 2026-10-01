@@ -3,7 +3,6 @@
 import ast
 import operator
 import re
-import types
 from pathlib import Path
 
 import pytest
@@ -62,31 +61,17 @@ def test_the_timeout_must_be_positive():
         _device(timeout_ms=0)
 
 
-def test_more_experts_than_a_record_id_carries_are_refused():
-    with pytest.raises(ValueError, match="32767"):
-        _device(experts=ram_miss.RECORD_ID_MAX + 1)
-
-
-def test_a_row_capacity_a_record_slot_cannot_carry_is_refused():
-    with pytest.raises(ValueError, match="32767"):
-        _device(row_capacities=[5, ram_miss.RECORD_ID_MAX + 1])
-
-
-def test_a_page_off_16_byte_alignment_is_refused():
-    # The post writes the record with 16-byte stores; a misaligned one faults inside the captured graph.
-    with pytest.raises(ValueError, match="16-byte"):
-        _device(page=torch.zeros(PAGE_BYTES + 1, dtype=torch.uint8)[1:])
-
-
 @pytest.mark.parametrize("experts, capacity", [(ram_miss.RECORD_ID_MAX + 1, 5), (4, ram_miss.RECORD_ID_MAX + 1)])
-def test_the_host_refuses_tables_its_deltas_cannot_carry(experts, capacity):
-    # The host writes expert ids and slots into the i16 map delta; checked before anything else is read.
-    tables = types.SimpleNamespace(
-        starts=torch.zeros((1, experts), dtype=torch.int64), capacity=torch.tensor([capacity], dtype=torch.int64)
-    )
-    with pytest.raises(ValueError, match="32767"):
-        ram_miss.ExpertStreamHost(tables, page=torch.zeros(PAGE_BYTES, dtype=torch.uint8),
-                                  slot_map=torch.full((1, experts), -1, dtype=torch.int32))
+def test_the_host_module_refuses_tables_its_records_cannot_carry(experts, capacity):
+    # expert_stream_open checks this first, so no other argument needs to be a real table.
+    empty = torch.empty(0, dtype=torch.int64)
+    no_bytes = torch.empty(0, dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="32767"):
+        ram_miss._host_module().expert_stream_open(
+            torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.full((1, experts), -1, dtype=torch.int32), empty,
+            torch.zeros((1, experts), dtype=torch.int64), empty, empty, empty, empty, empty,
+            torch.tensor([capacity], dtype=torch.int64), "", "", 0, 0, 0, no_bytes, no_bytes,
+        )
 
 
 def test_piece_runs_of_the_wrong_shape_are_refused():
