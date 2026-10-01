@@ -64,25 +64,21 @@ def test_volatile_lives_only_in_the_relaxed_helpers():
     ]
 
 
-def test_only_the_post_staging_and_cws_done_and_gate_close_keep_a_seq_cst_system_fence():
+def test_only_the_post_staging_and_cws_gate_close_keep_a_seq_cst_system_fence():
     # The post's CPU-input staging: every thread's stores of x to the host row, ordered through __syncthreads before
-    # thread 0 publishes the request. CW's Done: its block's SM reads, ordered through __syncthreads, performed at
-    # system scope before the host can see Done and rewrite a slot. CW's gate close orders its store before its
-    # CopyDone load (a Dekker pair with the copy thread's seq_cst fence, LEASE_PROTOCOL.md "Copy engine"):
-    # store->load needs seq_cst.
+    # thread 0 publishes the record. CW's gate close orders its store before its CopyDone load (a Dekker pair with the
+    # copy thread's seq_cst fence, LEASE_PROTOCOL.md "Copy engine"): store->load needs seq_cst. CW publishes no Done.
     assert [(name, code) for name, _, code in matches(r"__threadfence_system\(\)")] == [
         ("lease_kernels.cuh", "__threadfence_system();"),
-        ("row_copy_kernels.cuh", "__threadfence_system();"),
         ("row_copy_kernels.cuh", "__threadfence_system();"),
     ]
 
 
-def test_the_seqlock_writers_fences_are_three_releases():
-    # write_record, the hot bitmap record and the LaneRequest: seq (or gen) 0, a release fence, the payload, then the
-    # word with a release store. The device reads no seqlock, so it has no acquire fence.
+def test_the_seqlock_writers_fences_are_two_releases():
+    # write_record and the hot bitmap record: seq 0, a release fence, the payload, then the seq with a release store.
+    # The device reads no seqlock (the delta block's tag is one acquire), so it has no acquire fence.
     assert [(name, code) for name, _, code in matches(r"atomic_thread_fence")] == [
         ("lease_device.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
-        ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
     ]
 

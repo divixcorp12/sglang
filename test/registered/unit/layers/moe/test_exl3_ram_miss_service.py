@@ -892,9 +892,8 @@ def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes(monkeypa
     calls = []
     device_side = SimpleNamespace(
         post=lambda row, planned, *a, **kw: calls.append(("post", planned.clone())),
-        hit_wait=lambda row, planned, *a: calls.append(("hit_wait", planned.clone())),
         stream=lambda row, planned, *a: calls.append(("stream", planned.clone())),
-        copy_wait=lambda count, sm: calls.append(("copy_wait", None)),
+        copy_wait=lambda count, dst_slots, sm: calls.append(("copy_wait", None)),
         host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False,
     )
     monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *a: calls.append(("c1", None)))
@@ -907,7 +906,7 @@ def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes(monkeypa
         slots=torch.arange(6, dtype=torch.int32),
     )
     backend.post(0, plan)
-    assert [name for name, _ in calls] == ["post", "hit_wait", "c1", "stream", "copy_wait"]
+    assert [name for name, _ in calls] == ["post", "c1", "stream", "copy_wait"]
     for name, planned in calls:
         if planned is not None:
             assert planned.numel() >= MAX_IDS, name

@@ -129,7 +129,8 @@ def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(ti
         module, "Exl3RamMissRowBackend", lambda *args, **kwargs: built.append(kwargs) or SimpleNamespace()
     )
     service.cpu_experts = SimpleNamespace(
-        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32)
+        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
+        attach_device=lambda device_side: None,
     )
     updater = _DirectUpdater()
     manager = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater)
@@ -170,7 +171,7 @@ class _Side:
         self.copy_engine_captured = False
 
     def __getattr__(self, name):
-        if name in ("post", "hit_wait", "stream", "copy_wait"):
+        if name in ("post", "stream", "copy_wait"):
             return lambda *args, **kwargs: self.calls.append((name, kwargs))
         raise AttributeError(name)
 
@@ -192,7 +193,7 @@ def test_a_captured_cpu_expert_gather_with_the_miss_order_posts_its_input(monkey
     streamer = SimpleNamespace(_plan_miss_keys=torch.zeros(EXPERTS, dtype=torch.int64))
     backend, side = _captured_backend(monkeypatch, lambda: streamer)
     backend.post(0, _CapturedPlan())
-    assert [name for name, _ in side.calls] == ["post", "hit_wait", "copy", "stream", "copy_wait"]
+    assert [name for name, _ in side.calls] == ["post", "copy", "stream", "copy_wait"]
     assert side.calls[0][1]["captured"] and side.calls[0][1]["cpu_input"] is backend.cpu_input
     assert side.copy_engine_captured
 
