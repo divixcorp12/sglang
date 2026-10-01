@@ -39,7 +39,7 @@ def world(tmp_path):
     host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
     )
-    host.attach_row(0, K)
+    host.reserve_staging(K)
     yield s, host, ChainSim(host, page, s.slabs)
     host.stop()
 
@@ -51,39 +51,78 @@ def _serve(host, sim, experts, **kw):
     return req
 
 
-def test_attach_reserves_k_staging_slots_and_publishes_tag_one(world):
-    """Mutation: attach maps the staging slots, reserves the wrong count, or publishes no tag-1 delta."""
+def test_reserve_staging_takes_free_slots_and_publishes_tag_one_before_any_post(world):
+    """Mutation: the reservation maps the staging slots, reserves the wrong count, evicts, or publishes no tag-1 delta."""
     _, host, sim = world
     tag, staging, entries = sim.delta(0)
     assert tag == 1 and entries == []
     assert sorted(s for s in staging if s >= 0) == [0, 1] and staging[K:] == [-1] * (8 - K)
     assert host.mapping(0) == [-1] * EXPERTS
+    assert host.counters()["evictions"] == 0
+    assert host.take_bulk_delta().numel() == 0  # nothing was evicted or mapped: no bulk delta
+    assert [state for state, _, _ in host.slot_info(0)] == [3] * K + [0] * (CAPACITY - K)
 
 
-def test_attach_takes_vram_hot_slots_when_nothing_else_is_left(tmp_path):
-    """The service attaches after the tier is filled and the VRAM-hot set is published: every slot may hold a hot
-    expert. A hot expert's bytes are in VRAM, so attach evicts its RAM copy (LRU first) rather than leave the row with
-    no staging. Mutation: attach skips hot slots as decode's victims do -- it raises "no slot left to stage"."""
+def test_a_full_fill_after_the_reservation_never_takes_a_staging_slot(world):
+    """Mutation: take_slot_locked treats a kStaging slot as free or as a victim."""
+    _, host, sim = world
+    staging = [s for s in sim.staging(0) if s >= 0]
+    taken = set()
+    for expert in range(EXPERTS):  # far more than the CAPACITY - K mappable slots: admissions evict
+        slot, _ = host.assign(0, expert)
+        assert slot not in staging
+        taken.add(slot)
+    assert taken == set(range(CAPACITY)) - set(staging)
+    assert [state for state, _, _ in host.slot_info(0)][:K] == [3] * K
+    assert sim.delta(0)[:2] == (1, sim.staging(0))  # a fill publishes no delta of its own
+
+
+@pytest.mark.parametrize("capacity, want, staged", [(6, 8, 5), (6, 2, 2), (2, 8, 1)])
+def test_reserve_staging_clamps_to_the_rows_capacity_minus_one(tmp_path, capacity, want, staged):
+    s = ram_miss_setup(tmp_path, capacity=capacity, layers=1, experts=EXPERTS)
+    host = ExpertStreamHost(
+        s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
+    )
+    try:
+        host.reserve_staging(want)
+        assert sum(state == 3 for state, _, _ in host.slot_info(0)) == staged
+    finally:
+        host.stop()
+
+
+def test_reserve_staging_refuses_a_row_with_one_slot(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=1, layers=1, experts=EXPERTS)
+    host = ExpertStreamHost(
+        s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
+    )
+    try:
+        with pytest.raises(RuntimeError, match="row 0 has too few slots to stage"):
+            host.reserve_staging(K)
+    finally:
+        host.stop()
+
+
+def test_reserve_staging_is_once_and_before_any_slot_is_filled(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=CAPACITY, layers=1, experts=EXPERTS)
     host = ExpertStreamHost(
         s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
     )
     try:
-        for e in range(CAPACITY):
-            host.assign(0, e)
-        host.set_hot(0, list(range(CAPACITY)))
-        host.attach_row(0, K)
-        assert [host.mapping(0)[e] for e in range(K)] == [-1] * K, "the two oldest hot rows were not the ones evicted"
-        assert all(host.mapping(0)[e] >= 0 for e in range(K, CAPACITY))
-        assert sum(state == 3 for state, _, _ in host.slot_info(0)) == K
+        host.assign(0, 3)
+        with pytest.raises(RuntimeError, match="before any slot is filled"):
+            host.reserve_staging(K)
+        fresh = ExpertStreamHost(
+            s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32),
+            variant="instr",
+        )
+        try:
+            fresh.reserve_staging(K)
+            with pytest.raises(RuntimeError, match="once"):
+                fresh.reserve_staging(K)
+        finally:
+            fresh.stop()
     finally:
         host.stop()
-
-
-def test_attach_row_is_once_per_row(world):
-    _, host, _ = world
-    with pytest.raises(RuntimeError, match="command failed"):
-        host.attach_row(0, K)
 
 
 def test_miss_reads_into_staging_and_the_delta_maps_it(world):
