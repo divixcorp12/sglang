@@ -217,7 +217,8 @@ def test_a_pause_first_serves_every_record_posted_before_it(world):
     _, host, sim = world
     _serve(host, sim, [3])
     host.start_thread()
-    for _ in range(200):
+    for _ in range(40):
+        time.sleep(0.05)  # past the spin budget: the service polls from its idle sleep, so the pause can land first
         req = sim.post(0, [3])
         assert req.kinds == [LaneKind.HIT_SM]
         host.pause(5.0)
