@@ -7,9 +7,10 @@ namespace sglang {
 namespace expert_stream {
 
 // Pumps one RamTier on its own thread: spins with _mm_pause() for spin_ns after the last request, else sleeps 50 us
-// between polls; or, with busy_poll, on a core of its own (start_thread checked), spins with no PAUSE and never sleeps. The spin is an idle-poll budget calibrated once in start() (idle_budget), so the thread reads no
-// clock while it serves. The tier has one owner at a time (this thread, or a caller that paused it); pause()/resume()
-// are the handoff, and the edges are documented at each.
+// between polls; or, with busy_poll, on a core of its own (start_thread checked), spins with no PAUSE and never
+// sleeps. The spin is an idle-poll budget calibrated once in start() (idle_budget), so the thread reads no clock while
+// it serves. The tier has one owner at a time (this thread, or a caller that paused it); pause()/resume() are the
+// handoff, and the edges are documented at each.
 template <class Tier>
 class RamThread {
  public:

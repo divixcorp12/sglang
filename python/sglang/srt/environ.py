@@ -1841,6 +1841,7 @@ class Envs:
     # The core the RAM-miss service thread busy-polls the request page on, with no PAUSE and no sleep; unset, it
     # inherits the server's affinity and spins with PAUSE, then sleeps. Set, the service refuses to start unless the
     # core's whole physical core is its own: no SMT sibling in the server's affinity or SGLANG_DSV41_CPU_EXPERTS_CORES.
+    # That check runs once, when the service starts; a thread pinned onto that physical core later is not caught.
     SGLANG_DSV41_RAM_MISS_SPIN_CORE = EnvInt(None)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level

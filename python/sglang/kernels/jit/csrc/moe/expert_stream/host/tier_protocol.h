@@ -134,6 +134,7 @@ inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request*
   alignas(64) uint8_t raw[kRecordBytes];
   std::memcpy(raw, record, kRecordBytes);
   std::atomic_thread_fence(std::memory_order_acquire);
+  asm volatile("" ::: "memory");  // the copy's plain loads must stay before the seq re-check
   if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
   uint16_t row;
   uint8_t counts, flags;
