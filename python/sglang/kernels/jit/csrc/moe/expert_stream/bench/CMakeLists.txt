@@ -62,7 +62,7 @@ foreach(BACKEND baseline optimized)
     set(KERNEL "${QUANT}/optimized/moe_mul1.cpp")
     set(DEFAULT_WORKERS 16)
   endif()
-  add_executable(exl3_cpu_${BACKEND} cpu_forward.cpp fixture.cpp "${KERNEL}")
+  add_executable(exl3_cpu_${BACKEND} src/cpu_forward.cpp src/fixture.cpp "${KERNEL}")
   target_include_directories(exl3_cpu_${BACKEND} PRIVATE "${QUANT}/optimized")
   target_include_directories(exl3_cpu_${BACKEND} SYSTEM PRIVATE "${ATEN_INCLUDE}" "${ATEN_INCLUDE}/torch/csrc/api/include")
   target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE
