@@ -25,11 +25,13 @@ from pathlib import Path
 import torch
 
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
-from sglang.test.dsv41_lease_sim import LeaseSim
+from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.kernels.ops.moe.expert_stream_transport import STAGE_FIELDS
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 EXPERTS, CAPACITY = 64, 32
+# One staging slot per lane a request may miss: the largest --rows below.
+STAGING = 8
 
 
 def _busy_foreign(limit=6):
@@ -101,7 +103,9 @@ class Arm:
         self.host = ExpertStreamHost(
             self.s.tables, page=self.page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), variant="instr"
         )
-        self.sim = LeaseSim(self.host, self.page, None)
+        for row in range(2):
+            self.host.attach_row(row, STAGING)
+        self.sim = ChainSim(self.host, self.page, None)
         if trace:
             self.host.enable_trace(capacity=ring)
         self.cursor = 0
@@ -119,8 +123,7 @@ class Arm:
             ids = [w * rows_per_request + j for j in range(rows_per_request)] if rows_per_request else [0]
             req = self.sim.post(1, ids)
             self.host.pump()
-            self.sim.wait(req, timeout_s=5.0)
-            self.sim.done(req)
+            self.sim.wait_served(req, timeout_s=5.0)
         elapsed = time.perf_counter_ns() - t0
         self.run_delay_ns = _run_delay_ns() - delay0
         self.clock_reads_per_request = (self.host.trace_clock_reads() - clocks0) / requests
