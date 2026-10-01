@@ -804,7 +804,7 @@ class Exl3RamMissService:
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
         if streamer.graph_gather_rows > MAX_IDS:
-            # The post kernel requests min(count, MAX_IDS) lanes and W1 traps on a wider plan.
+            # The post kernel requests min(count, MAX_IDS) lanes and traps on a wider plan.
             raise ValueError(
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
                 f"per call but the service requests at most {MAX_IDS} lanes"
@@ -854,7 +854,13 @@ class Exl3RamMissService:
                 # A small test tier; a post with more misses than k traps on the device ("no staging slot").
                 logger.warning("exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d", row, k, want,
                                int(self.host.tables.capacity[row]))
-            self.host.attach_row(row, k)
+            # Paused, so the rows attach evicts on a full tier reach the device as a bulk delta before the service
+            # serves another record (LEASE_PROTOCOL.md, "Deltas and the bulk delta").
+            self.before_host_use()
+            try:
+                self.host.attach_row(row, k)
+            finally:
+                self.after_host_use()
             self._attached_rows.add(row)
         if self.route_log is not None:
             self.route_log.bind(row, streamer.layer_id, cache.capacity)
