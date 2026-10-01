@@ -124,8 +124,10 @@ def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3_ext import build_flavor, cpu_act_defines, exl3_ext
 
+    if not build_flavor(cpu_act_defines()):
+        pytest.skip("upstream's unflavored kernel has no C ABI: set SGLANG_EXL3_CPU_ACT_RESIDUAL/_BLOCK")
     ext = exl3_ext()
     slabs = _random_slabs(20261001)
     direct = _direct_layer(ext, slabs)
