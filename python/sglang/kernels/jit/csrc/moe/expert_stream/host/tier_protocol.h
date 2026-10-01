@@ -139,14 +139,16 @@ inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request*
   std::memcpy(&chain, record + kRecChain, 8);
   std::memcpy(&epoch, record + kRecEpoch, 4);
   std::memcpy(&kinds, record + kRecKinds, 4);
-  std::memcpy(protect_ids, record + kRecProtect, sizeof(protect_ids));
-  std::memcpy(expert, record + kRecLaneExpert, sizeof(expert));
-  std::memcpy(slot, record + kRecLaneSlot, sizeof(slot));
-  std::memcpy(dst, record + kRecLaneDst, sizeof(dst));
-  std::memcpy(weight, record + kRecLaneWeight, sizeof(weight));
   int count = counts & 0xF;
   const int protect = counts >> 4;
   if (count > kLeaseLanes) count = kLeaseLanes + 1;  // judged once the seq re-check says the record is whole
+  // Only the used entries: a record with no lanes never reads the lane arrays' cache line.
+  const int lanes = std::min<int>(count, kLeaseLanes);
+  std::memcpy(protect_ids, record + kRecProtect, sizeof(int16_t) * std::min<int>(protect, kMaxIds));
+  std::memcpy(expert, record + kRecLaneExpert, sizeof(int16_t) * lanes);
+  std::memcpy(slot, record + kRecLaneSlot, sizeof(int16_t) * lanes);
+  std::memcpy(dst, record + kRecLaneDst, sizeof(int16_t) * lanes);
+  std::memcpy(weight, record + kRecLaneWeight, sizeof(float) * lanes);
   request->seq = expected;
   request->gen = static_cast<uint64_t>(epoch) << 32 | expected;
   request->row = row;
