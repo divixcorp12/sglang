@@ -94,6 +94,7 @@ def test_attach_unmaps_on_a_full_tier_reach_the_device_before_any_post(tiers, mo
     applied = []
     monkeypatch.setattr(module.ExpertStreamDevice, "map_bulk_apply", lambda self, bulk: applied.extend(bulk.tolist()))
     _attach(service, streamers[0], 1)
+    at_attach = list(applied)  # what reached the device by the end of attach; the read below applies the rest
     service.before_host_use()
     try:
         mapping = service.host.mapping(service.row_of(0))
@@ -101,7 +102,7 @@ def test_attach_unmaps_on_a_full_tier_reach_the_device_before_any_post(tiers, mo
         service.after_host_use()
     row = service.row_of(0)
     replica = {}
-    for r, expert, slot in applied:
+    for r, expert, slot in at_attach:
         if r == row:
             replica[expert] = slot
     evicted = [e for e in range(CAPACITY) if mapping[e] < 0]
