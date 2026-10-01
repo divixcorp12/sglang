@@ -576,6 +576,7 @@ class Exl3RamMissService:
         self._cpu_log_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
+        self._attached_rows: set[int] = set()  # rows whose staging slots attach() reserved (host.attach_row)
         self._copy_armed = False
         self._copy_decodes = 0
         self.copy_engine_module_loads = 0  # Triton loads that drained the device first
@@ -838,8 +839,10 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
-        # The row's staging slots: one per lane a post can miss (LEASE_PROTOCOL.md).
-        self.host.attach_row(row, max(1, streamer.graph_gather_rows))
+        # The row's staging slots, once: one per lane a post can miss (LEASE_PROTOCOL.md).
+        if row not in self._attached_rows:
+            self.host.attach_row(row, max(1, streamer.graph_gather_rows))
+            self._attached_rows.add(row)
         if self.route_log is not None:
             self.route_log.bind(row, streamer.layer_id, cache.capacity)
         previous = streamer.row_backend

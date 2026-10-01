@@ -83,11 +83,12 @@ def _demand(service, row, experts):
     """One demand for ``experts`` of ``row`` as the device posts it, after the eager changes reached the device's map
     (taken while paused, as after_host_use's bulk apply does), served."""
     sim = _sim(service)
-    service.before_host_use()
+    # The class's own pause, not an instance attribute a test may have wrapped to count the service's pauses.
+    type(service.host).pause(service.host, 10.0)
     try:
         sim.sync_bulk()
     finally:
-        service.after_host_use()
+        type(service.host).resume(service.host)
     req = sim.post(row, experts)
     assert sim.wait_served(req, timeout_s=10.0) and sim.wait_handled(req, timeout_s=10.0)
 

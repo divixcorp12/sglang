@@ -701,9 +701,9 @@ class RamTier {
     admission_closed_.store(true);
   }
 
-  // Row `row`'s K staging slots (LEASE_PROTOCOL.md): the first K free slots become kStaging, and the tag-1 delta
-  // names them, which the device's first post of the row applies. Once per row, before its first miss; a command
-  // (run_as_owner), so it may come while the service runs.
+  // Row `row`'s K staging slots (LEASE_PROTOCOL.md): K free slots (else LRU rows) become kStaging, and the tag-1
+  // delta names them, which the device's first post of the row applies. Once per row, before the row's first post; a
+  // command (run_as_owner), so it may come while the service runs.
   void attach_row(int64_t row, int64_t k) {
     row_capacity(row);
     if (k < 1 || k > kLeaseLanes)
@@ -974,13 +974,17 @@ class RamTier {
   void attach_row_owned(int64_t row, int64_t k) {
     Tier& tier = tiers_[row];
     if (tier.chain != 0) throw std::runtime_error(error_prefix<Layout>() + "attach_row is once per row");
-    for (int64_t slot = 0; slot < tier.capacity && static_cast<int64_t>(tier.staging.size()) < k; ++slot) {
-      if (tier.state[slot] != kFree) continue;
+    if (k >= tier.capacity)
+      throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has too few slots to stage");
+    // Free slots first, then LRU rows an eager path left (their unmaps reach the device in the bulk delta).
+    while (static_cast<int64_t>(tier.staging.size()) < k) {
+      int64_t evicted = -1;
+      const int64_t slot = take_slot_locked(row, {}, true, &evicted);
+      if (slot < 0)
+        throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has no slot left to stage");
       tier.state[slot] = kStaging;
       tier.staging.push_back(static_cast<int32_t>(slot));
     }
-    if (static_cast<int64_t>(tier.staging.size()) < k)
-      throw std::runtime_error(error_prefix<Layout>() + "row " + std::to_string(row) + " has too few free slots to stage");
     tier.chain = 1;
     publish_delta_locked(row, 1, tier.staging, nullptr, 0);
   }
