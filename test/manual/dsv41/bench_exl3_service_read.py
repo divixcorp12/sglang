@@ -67,15 +67,20 @@ def main() -> None:
         try:
             row = 0
             experts = list(range(TOP_K))
-            c.dev.map_bulk_apply(torch.tensor([[row, e, e] for e in experts], dtype=torch.int32))
             c.host.enable_trace(capacity=args.posts + args.warmup + 64)
             busy = {"busy_poll": True} if args.busy_poll else {}
             c.host.start_thread(cpu_core=args.cpu_core, fatal_wait_s=60.0, **busy)
             print("service core:", c.host.counters()["spin_cpu"], "busy_poll:", args.busy_poll)
             c.plan(experts, row)
             backend, plan = c.backends[row], c.plans[row]
-            backend._stage_planned(plan)
             hot_slots = torch.arange(TOP_K, dtype=torch.int64, device="cuda")
+            backend.hot_slots, backend.hot_capacity = hot_slots, TOP_K
+            # One production gather of all misses: the tier reads the experts into RAM and its delta maps them on the
+            # device, so every post below is SM hits the host and the device agree on.
+            c.gather(row)
+            torch.cuda.synchronize()
+            assert c.handled(timeout_s=10.0), "the service did not serve the warming gather"
+            backend._stage_planned(plan)
 
             def post_and_wait() -> None:
                 c.dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, hot_slots=hot_slots,
