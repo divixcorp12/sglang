@@ -117,7 +117,8 @@ def _load_args(tmp_path, monkeypatch, residual, block):
     calls = []
     monkeypatch.setattr(exl3_ext, "_checked_ext_dir", lambda src: str(ext_dir))
     monkeypatch.setattr(exl3_ext, "check_cpu_compiler", lambda: None)
-    monkeypatch.setattr(cpp_extension, "load", lambda **kw: calls.append(kw) or kw)
+    # _cxx: the CXX the build saw, which load() reads from the environment.
+    monkeypatch.setattr(cpp_extension, "load", lambda **kw: calls.append(dict(kw, _cxx=os.environ.get("CXX"))) or kw)
     exl3_ext.exl3_ext.cache_clear()
     try:
         with contextlib.ExitStack() as stack:
@@ -175,6 +176,26 @@ def test_other_accuracy_flavors_keep_the_generic_kernel(tmp_path, monkeypatch):
     assert kw["sources"] == [exl3_ext.VENDORED_CPU_KERNEL]
     assert "-fopenmp" not in kw["extra_cflags"]
     assert kw["extra_ldflags"] == []
+
+
+def test_the_cpu_compiler_is_sglang_exl3_cpu_cxx_over_cxx(monkeypatch):
+    monkeypatch.setenv("CXX", "/system/g++")
+    asked = []
+    monkeypatch.setattr(exl3_ext.subprocess, "check_output", lambda cmd, **kw: asked.append(cmd[0]) or "15.2.1\n")
+    with exl3_ext.envs.SGLANG_EXL3_CPU_CXX.override("/gcc15/g++"):
+        exl3_ext.check_cpu_compiler()
+    assert asked and set(asked) == {"/gcc15/g++"}
+
+
+def test_only_the_optimized_build_sees_sglang_exl3_cpu_cxx_as_cxx(tmp_path, monkeypatch):
+    """The CPU compiler is scoped to the extension's own build: CXX is that compiler during load() and restored after,
+    so the server's other JIT builds keep theirs."""
+    monkeypatch.setenv("CXX", "/system/g++")
+    with exl3_ext.envs.SGLANG_EXL3_CPU_CXX.override("/gcc15/g++"):
+        optimized, _ = _load_args(tmp_path / "optimized", monkeypatch, True, 128)
+        upstream, _ = _load_args(tmp_path / "upstream", monkeypatch, False, 0)
+    assert optimized["_cxx"] == "/gcc15/g++" and upstream["_cxx"] == "/system/g++"
+    assert os.environ["CXX"] == "/system/g++"
 
 
 def test_optimized_compiler_rejects_known_rounding_change(monkeypatch):
