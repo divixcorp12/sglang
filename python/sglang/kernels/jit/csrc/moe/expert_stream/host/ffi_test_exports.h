@@ -652,6 +652,19 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       return expert_stream::traced_clock_reads().load(std::memory_order_relaxed);
     }
   }
+
+  // Test only: the measured cost of one _mm_pause in ns, the service's idle-poll quantum (RamThread::run).
+  static double pause_ns() {
+    if constexpr (!Build::kFaults) {
+      test_only("pause_ns");
+    } else {
+      constexpr int kProbe = 1 << 16;
+      const int64_t start = now_ns();
+      for (int i = 0; i < kProbe; ++i)
+        _mm_pause();
+      return static_cast<double>(now_ns() - start) / kProbe;
+    }
+  }
 };
 
 }  // namespace sglang::expert_stream
@@ -680,4 +693,5 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);            \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);

@@ -16,6 +16,7 @@ from sglang.kernels.ops.moe.expert_cache_transfer import expert_row_segments
 from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamDevice,
     ExpertStreamHost,
+    new_hot_page,
     new_page,
     stream_segment_map,
 )
@@ -39,7 +40,7 @@ class Chain:
     def __init__(
         self, tmp_path, *, capacity=CAPACITY, staging=STAGING, mirror_weights=None, timeout_ms=2000, lease_pdl=False,
         copy_engine=False, sm_small_copies=False, copy_wait_ms=2000, start=True, variant="instr", hit_copy="ce",
-        cpu_misses=False,
+        cpu_misses=False, gpu_hot=False,
     ):
         write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM,
                         inter=ROW_IMAGE_DIM, finite=True)
@@ -56,9 +57,11 @@ class Chain:
                     self.slabs[row][n] = allocate_host_slab(capacity, spec.row_shape, spec.dtype, register=True)
             self.tables, _ = image_tables(self.layout, self.fmt.segment_map(), self.slabs, tmp_path, mirror_weights)
             self.page = new_page(pin=True)
+            self.hot_page = new_hot_page(EXPERTS, pin=True) if gpu_hot else None
             self.host = ExpertStreamHost(
                 self.tables, page=self.page,
                 slot_map=torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32).pin_memory(), variant=variant,
+                hot_page=self.hot_page,
             )
             self.host.reserve_staging(staging)
             self.dest = {
@@ -81,7 +84,7 @@ class Chain:
                 self.page, self.host.lease_block, device="cuda", layers=LAYERS, experts=EXPERTS,
                 timeout_ms=timeout_ms, piece_runs=self.host.piece_runs(),
                 row_capacities=[int(c) for c in self.tables.capacity], lease_pdl=lease_pdl,
-                hit_copy=hit_copy, cpu_misses=cpu_misses,
+                hit_copy=hit_copy, cpu_misses=cpu_misses, hot_page=self.hot_page,
             )
             if copy_engine:
                 for row in range(LAYERS):

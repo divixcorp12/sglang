@@ -79,6 +79,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "copy_engine_ballast",
     "trace_clock_reads",
     "seqlock_stress",
+    "pause_ns",
 )
 
 
@@ -758,6 +759,12 @@ def seqlock_stress(seconds: float, *, layout: str = "exl3", variant: Optional[st
     out = torch.zeros(2, dtype=torch.int64)
     _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
     return int(out[0]), int(out[1])
+
+
+def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
+    """Test only: ns per _mm_pause on this core, the RAM-miss service's idle-poll quantum. Instrumented build only."""
+    _refuse_test_only("pause_ns", variant)
+    return float(_host_module(layout, variant).expert_stream_pause_ns())
 
 
 def new_page(pin: bool) -> torch.Tensor:
