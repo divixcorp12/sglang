@@ -66,8 +66,8 @@ constexpr int64_t kDeltaBase = kLeaseBlockBytes;
 constexpr int64_t kDeltaStride = 256;
 constexpr int64_t kDeltaTag = 0;       // u64: the map-chain number this delta follows, stored last with a release
 constexpr int64_t kDeltaCount = 8;     // u32: entries used
-constexpr int64_t kDeltaStaging = 16;  // i32[kLeaseLanes]: the row's staging slots after this delta, -1 past K
-constexpr int64_t kDeltaEntries = 48;  // {i32 expert, i32 slot}[kDeltaMaxEntries]: ram_slot[expert] = slot, -1 unmaps
+constexpr int64_t kDeltaStaging = 16;  // i16[kLeaseLanes]: the row's staging slots after this delta, -1 past K
+constexpr int64_t kDeltaEntries = 32;  // {i16 expert, i16 slot}[kDeltaMaxEntries]: ram_slot[expert] = slot, -1 unmaps
 constexpr int64_t kDeltaMaxEntries = 16;
 
 static_assert(kLeaseRing == kDemandRecords && kLeaseLanes == kMaxIds, "the completion block follows the ring");
@@ -81,6 +81,6 @@ static_assert(kDemandRing % 16 == 0 && kRecordBytes % 16 == 0 && kRecEpoch % 16 
 static_assert(kRecLaneWeight + 4 * kMaxIds <= kRecordBytes, "record");
 static_assert(kSplit + 4 * (kLeaseLanes + 1) <= kLeaseBlockBytes, "completion block");
 static_assert(kLeaseBlockBytes % kLeaseBlockAlign == 0, "the block is whole pages");
-static_assert(kDeltaEntries + 8 * kDeltaMaxEntries <= kDeltaStride, "delta record");
+static_assert(kDeltaEntries + 4 * kDeltaMaxEntries <= kDeltaStride, "delta record");
 
 }  // namespace sglang::expert_stream::wire

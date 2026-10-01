@@ -34,9 +34,11 @@ def _write_delta(c, row, tag, staging, entries=()):
     f = lease.DELTA_FIELDS
     block = c.host.lease_block
     _i32(block, base + f["count"])[0] = len(entries)
-    _i32(block, base + f["staging"], lease.LANES)[:] = torch.tensor(list(staging) + [-1] * (lease.LANES - len(staging)))
+    block[base + f["staging"] : base + f["staging"] + 2 * lease.LANES].view(torch.int16)[:] = torch.tensor(
+        list(staging) + [-1] * (lease.LANES - len(staging)), dtype=torch.int16)
     for i, (expert, slot) in enumerate(entries):
-        _i32(block, base + f["entries"] + 8 * i, 2)[:] = torch.tensor([expert, slot])
+        block[base + f["entries"] + 4 * i : base + f["entries"] + 4 * i + 4].view(torch.int16)[:] = torch.tensor(
+            [expert, slot], dtype=torch.int16)
     block[base + f["tag"] : base + f["tag"] + 8].view(torch.int64)[0] = tag
 
 

@@ -1040,11 +1040,13 @@ class RamTier {
     const uint32_t n = static_cast<uint32_t>(count);
     std::memcpy(d + kDeltaCount, &n, 4);
     for (int k = 0; k < kLeaseLanes; ++k) {
-      const int32_t slot = k < static_cast<int>(staging.size()) ? staging[k] : -1;
-      std::memcpy(d + kDeltaStaging + 4 * k, &slot, 4);
+      const int16_t slot = static_cast<int16_t>(k < static_cast<int>(staging.size()) ? staging[k] : -1);
+      std::memcpy(d + kDeltaStaging + 2 * k, &slot, 2);
     }
-    for (int i = 0; i < count; ++i)
-      std::memcpy(d + kDeltaEntries + 8 * i, entries[i], 8);
+    for (int i = 0; i < count; ++i) {
+      const int16_t entry[2] = {static_cast<int16_t>(entries[i][0]), static_cast<int16_t>(entries[i][1])};
+      std::memcpy(d + kDeltaEntries + 4 * i, entry, 4);
+    }
     _mm_sfence();
     store_release64(d + kDeltaTag, tag);
   }

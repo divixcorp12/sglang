@@ -239,33 +239,32 @@ SGL_DEVICE bool await_map_delta(const uint8_t* delta, const RowMap& map, uint64_
 
 // The delta's payload; only after await_map_delta's acquire of its tag.
 SGL_DEVICE MapDelta load_map_delta(const uint8_t* delta) {
-  static_assert(kDeltaStaging % 16 == 0 && kDeltaEntries % 16 == 0, "16-byte delta loads");
-  static_assert(kLeaseLanes % 4 == 0 && kDeltaMaxEntries % 2 == 0, "whole 16-byte loads");
-  constexpr int kStagingLoads = kLeaseLanes / 4;
-  constexpr int kEntryLoads = kDeltaMaxEntries / 2;  // {expert, slot} pairs, two a load
-  uint4 v[kStagingLoads + kEntryLoads];
   MapDelta d;
   d.count = ld_relaxed_sys<uint32_t>(delta + kDeltaCount);
-#pragma unroll
-  for (int i = 0; i < kStagingLoads; ++i)
-    v[i] = ld_relaxed_sys_v4(delta + kDeltaStaging + 16 * i);
+  static_assert(kDeltaStaging % 16 == 0 && kDeltaEntries % 16 == 0, "16-byte delta loads");
+  static_assert(kLeaseLanes == 8 && kDeltaMaxEntries % 4 == 0, "staging is one load; entries four to a load");
+  constexpr int kEntryLoads = kDeltaMaxEntries / 4;
+  uint4 v[1 + kEntryLoads];
+  v[0] = ld_relaxed_sys_v4(delta + kDeltaStaging);
 #pragma unroll
   for (int i = 0; i < kEntryLoads; ++i)
-    v[kStagingLoads + i] = ld_relaxed_sys_v4(delta + kDeltaEntries + 16 * i);
+    v[1 + i] = ld_relaxed_sys_v4(delta + kDeltaEntries + 16 * i);
+  const auto lo = [](uint32_t w) { return static_cast<int32_t>(static_cast<int16_t>(w & 0xFFFFu)); };
+  const auto hi = [](uint32_t w) { return static_cast<int32_t>(static_cast<int16_t>(w >> 16)); };
+  const uint32_t staging_words[4] = {v[0].x, v[0].y, v[0].z, v[0].w};
 #pragma unroll
-  for (int i = 0; i < kStagingLoads; ++i) {
-    d.staging[4 * i] = static_cast<int32_t>(v[i].x);
-    d.staging[4 * i + 1] = static_cast<int32_t>(v[i].y);
-    d.staging[4 * i + 2] = static_cast<int32_t>(v[i].z);
-    d.staging[4 * i + 3] = static_cast<int32_t>(v[i].w);
+  for (int k = 0; k < 4; ++k) {
+    d.staging[2 * k] = lo(staging_words[k]);
+    d.staging[2 * k + 1] = hi(staging_words[k]);
   }
 #pragma unroll
   for (int i = 0; i < kEntryLoads; ++i) {
-    const uint4 e = v[kStagingLoads + i];
-    d.expert[2 * i] = static_cast<int32_t>(e.x);
-    d.slot[2 * i] = static_cast<int32_t>(e.y);
-    d.expert[2 * i + 1] = static_cast<int32_t>(e.z);
-    d.slot[2 * i + 1] = static_cast<int32_t>(e.w);
+    const uint32_t words[4] = {v[1 + i].x, v[1 + i].y, v[1 + i].z, v[1 + i].w};
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+      d.expert[4 * i + w] = lo(words[w]);
+      d.slot[4 * i + w] = hi(words[w]);
+    }
   }
   return d;
 }

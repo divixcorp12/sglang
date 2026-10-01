@@ -88,10 +88,12 @@ class ChainSim:
     def delta(self, row: int) -> tuple[int, list[int], list[tuple[int, int]]]:
         """Row ``row``'s map delta record: (tag, staging[LANES], entries), as the post reads it."""
         base = lease.DELTA_BASE + row * lease.DELTA_STRIDE
-        tag = self.read_u64(base + lease.DELTA_FIELDS["tag"])
-        count = int(_i32(self.block, base + lease.DELTA_FIELDS["count"])[0])
-        staging = _i32(self.block, base + lease.DELTA_FIELDS["staging"], LANES).tolist()
-        flat = _i32(self.block, base + lease.DELTA_FIELDS["entries"], 2 * lease.DELTA_MAX_ENTRIES).tolist()
+        f = lease.DELTA_FIELDS
+        tag = self.read_u64(base + f["tag"])
+        count = int(_i32(self.block, base + f["count"])[0])
+        staging = self.block[base + f["staging"] : base + f["staging"] + 2 * LANES].view(torch.int16).tolist()
+        entries = base + f["entries"]
+        flat = self.block[entries : entries + 4 * lease.DELTA_MAX_ENTRIES].view(torch.int16).tolist()
         return tag, staging, [(flat[2 * i], flat[2 * i + 1]) for i in range(count)]
 
     def staging(self, row: int) -> list[int]:

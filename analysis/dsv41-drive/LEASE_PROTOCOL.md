@@ -66,10 +66,11 @@ CPU; CopyDone).
 | 16512 | the gate | CW closes, copy thread or CW opens |
 | 16640 | `kCopyArmed` u32: 1 once the service armed its copy engine | host |
 | 16768 | `kSplit` i32[9]: CPU lanes per n eligible lanes | host (`store_split`, at start and on retune) |
-| 20480 + 256 row | the row's delta: `tag` u64 @0, `count` u32 @8, `staging` i32[8] @16, 16 `{expert, slot}` entries @48 | host |
+| 20480 + 256 row | the row's delta: `tag` u64 @0, `count` u32 @8, `staging` i16[8] @16, 16 `{i16 expert, i16 slot}` entries @32 | host |
 
 `lease_block_bytes(rows) = 20480 + round_up(rows * 256, 4096)`. A delta entry maps `ram_slot[expert] = slot`; slot -1
-unmaps. Sixteen entries are an insert and an eviction per lane.
+unmaps. Sixteen entries are an insert and an eviction per lane. The post reads the payload with one u32 load and five
+16-byte loads, all issued together after the tag's acquire.
 
 ## The chain
 

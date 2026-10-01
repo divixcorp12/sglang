@@ -30,10 +30,10 @@ def write_delta(block: torch.Tensor, row: int, tag: int, staging, entries) -> No
     f = lease.DELTA_FIELDS
     flat = [v for pair in entries for v in pair]
     block[base + f["count"] : base + f["count"] + 4].view(torch.int32)[0] = len(entries)
-    block[base + f["staging"] : base + f["staging"] + 4 * lease.LANES].view(torch.int32)[:] = torch.tensor(
-        staging, dtype=torch.int32)
-    block[base + f["entries"] : base + f["entries"] + 4 * len(flat)].view(torch.int32)[:] = torch.tensor(
-        flat, dtype=torch.int32)
+    block[base + f["staging"] : base + f["staging"] + 2 * lease.LANES].view(torch.int16)[:] = torch.tensor(
+        staging, dtype=torch.int16)
+    block[base + f["entries"] : base + f["entries"] + 2 * len(flat)].view(torch.int16)[:] = torch.tensor(
+        flat, dtype=torch.int16)
     block[base + f["tag"] : base + f["tag"] + 8].view(torch.int64)[0] = tag
 
 
