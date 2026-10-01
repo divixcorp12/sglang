@@ -1842,11 +1842,6 @@ class Envs:
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.
     SGLANG_TEST_DSV41_RAM_MISS_FAULT = EnvStr("")
-    # The lease chain's W1: how long, in microseconds of %globaltimer from the kernel's start, it waits for the
-    # service to publish the resident lanes before handing C1 whatever has arrived. It never waits for the request to
-    # be served, so this trades a fuller C1 against more work for S. Time, not polls: a poll pass reads each lane
-    # across PCIe, so its cost depends on the lane count. At 8 passes the wait measured p50 13 us, p90 93 us.
-    SGLANG_DSV41_RAM_MISS_HIT_WAIT_US = EnvInt(100)
     # DSV4 MoE side stream (plan 2026-09-25-dsv41-copy-compute-overlap, 1a): the shared expert and the DIRECT
     # residency commit run on one side stream, joined before the shared-expert add, so they overlap the RAM-miss
     # copies and the routed MoE kernel instead of running in line. Read once per process. Off by default.
@@ -1867,6 +1862,10 @@ class Envs:
     # graphs only, armed after 16 decode forwards. A kernel module first loaded while a step is in flight can still
     # deadlock it into a fail-stop. Read once at service start. Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE = EnvBool(False)
+    # What moves a captured decode post's RAM hits once the copy engine is armed (LEASE_PROTOCOL.md, lane kinds): "ce",
+    # the copy engine's DMA (kHitCopy), or "sm", the in-graph SM copy C1 (kHitSm), with no host thread on the hit path.
+    # CPU lanes still complete through the copy thread either way. Read once at service start. Default "ce".
+    SGLANG_DSV41_RAM_HIT_COPY = EnvStr("ce")
     # SM small copies: the copy engine copies only each RAM-hit row's two trellis tensors; the copy wait (CW) reads the
     # four small ones (44.5 KB a row) from the pinned slot with SM loads, and the lease is released only once both the
     # DMA completed and CW published Done. Needs the copy engine (refused without it). Read once at service start.
@@ -1914,6 +1913,11 @@ class Envs:
     SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS = EnvFloat(0.02)
     # Batches between re-tunes of the split from the CPU's measured cost per expert; 0 keeps the startup table.
     SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES = EnvInt(0)
+    # CPU-computed NVMe misses: the CPU's split[n] tail counts every missing lane, not only RAM hits, and a miss on the
+    # CPU is computed from its staging slot once its read lands (it still enters the RAM tier, never VRAM). Needs
+    # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
+    # (slot-map plan, Task 0), so a served A/B decides.
+    SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
@@ -2305,6 +2309,11 @@ _LEASE_CHAIN_MINIMAL_NOTE = (
     "native-prefetch modes are gone; a set value is ignored. Unset this env."
 )
 
+_HIT_WAIT_GONE_NOTE = (
+    "The RAM-miss chain has no hit wait since the slot-map protocol (2026-09-30): the device types its RAM hits from its "
+    "own copy of the map, so a set value is ignored. Unset this env."
+)
+
 _LEASES_ALWAYS_ON_NOTE = (
     "The RAM-miss service's lease mode is always on since 2026-09-29 (row images need it); a set value is ignored. "
     "Unset this env."
@@ -2429,6 +2438,7 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
             "SGLANG_DSV41_ENABLE_NATIVE_PREFETCH",
         )
     },
+    "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": _DeprecatedEnv(note=_HIT_WAIT_GONE_NOTE),
 }
 
 

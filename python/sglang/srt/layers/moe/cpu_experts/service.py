@@ -109,6 +109,12 @@ class CpuExpertService:
     def registered(self, row: int) -> bool:
         return row in self.handles
 
+    def attach_device(self, device_side) -> None:
+        """The chain's device side, which types CPU lanes only for registered rows: told of every row, now and later."""
+        self.device_side = device_side
+        for row in self.handles:
+            device_side.set_row_cpu(row)
+
     def register(self, row: int, act_limit: Optional[float]) -> None:
         """Register ``row``'s pinned slabs with the trait and let the grant send its lanes to the CPU.
 
@@ -132,6 +138,8 @@ class CpuExpertService:
         handle = self.trait.register_layer({name: slabs[name] for name in self.trait.slab_names}, capacity)
         self.handles[row] = handle
         self.host.set_cpu_layer(row, int(handle))
+        if getattr(self, "device_side", None) is not None:
+            self.device_side.set_row_cpu(row)
 
     def log_stats(self) -> dict[str, int]:
         """Log the CPU expert thread's cumulative counters: an A/B arm reads its per-expert cost under load here."""

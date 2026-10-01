@@ -26,7 +26,6 @@ def test_defaults_match_the_env_declarations():
         router_capture_path="",
         ram_miss_timeout_ms=2000,
         ram_miss_fault="",
-        ram_miss_hit_wait_us=100,
         enable_ram_miss_copy_engine=False,
         enable_ram_miss_sm_small_copies=False,
         enable_lease_pdl=False,
