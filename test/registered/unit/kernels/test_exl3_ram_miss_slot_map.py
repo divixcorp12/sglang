@@ -210,6 +210,23 @@ def test_a_failed_fills_unmaps_are_in_the_bulk_delta(world):
     assert sim.replica.ram_slot[0][6] == -1 == host.mapping(0)[6]
 
 
+def test_a_pause_first_serves_every_record_posted_before_it(world):
+    """An all-HIT_SM chain never waits on the host, so its record may still be unread when an eager path pauses the
+    service. Parked unread, it would be checked after the eager path moved its expert, and the host would fail-stop on
+    a correct device. The service drains the ring before it parks. Mutation: park without draining."""
+    _, host, sim = world
+    _serve(host, sim, [3])
+    host.start_thread()
+    for _ in range(200):
+        req = sim.post(0, [3])
+        assert req.kinds == [LaneKind.HIT_SM]
+        assert host.pause(5.0) == 1
+        try:
+            assert host.handled_through() == req.seq, "a record posted before the pause was left unread"
+        finally:
+            host.resume()
+
+
 def test_closing_admission_stops_new_service(world):
     _, host, sim = world
     host.close_admission()
