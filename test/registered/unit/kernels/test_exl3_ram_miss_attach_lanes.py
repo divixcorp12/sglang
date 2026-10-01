@@ -104,10 +104,25 @@ def test_attach_unmaps_on_a_full_tier_reach_the_device_before_any_post(tiers, mo
     replica = {}
     for r, expert, slot in at_attach:
         if r == row:
-            replica[expert] = slot
+            replica[expert] = slot  # a fresh device map is all -1, so only mapped rows need entries
     evicted = [e for e in range(CAPACITY) if mapping[e] < 0]
     assert evicted, "the full tier gave attach nothing to evict"
-    assert all(replica.get(e) == -1 for e in evicted), (evicted, replica)
+    assert all(replica.get(e, -1) == -1 for e in evicted), (evicted, replica)
+
+
+def test_eager_use_with_no_device_side_keeps_no_bulk_delta(tiers):
+    """With no graph-pinned layer there is no device map, so nothing ever takes the bulk delta: kept, it would grow by
+    every eager admission for the life of the server. Mutation: after_host_use keeps the bulk when there is no device."""
+    service, _ = tiers
+    service.ensure_started()
+    assert service.device_side is None
+    for _ in range(3):
+        service.before_host_use()
+        for row in range(LAYERS):
+            for expert in range(EXPERTS):
+                service.host.assign(row, expert)
+        service.after_host_use()
+    assert service.host.bulk_delta_count() == 0
 
 
 def test_cpu_experts_refuse_a_manager_without_direct_residency(tiers):
