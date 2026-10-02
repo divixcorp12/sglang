@@ -310,6 +310,18 @@ class FakeHost:
     def __init__(self):
         self.enabled, self.layers, self.splits = None, {}, []
         self.stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
+        self.grid = None  # calibrate_cpu_split's answer; an Exception instance is raised instead
+        self.calibrations = []
+
+    def copy_expert_bytes(self, row):
+        return 1024
+
+    def calibrate_cpu_split(self, row, *, device, reps, scratch, timeout_s=1.0):
+        self.calibrations.append((row, device, reps, scratch.numel(), str(scratch.device)))
+        if isinstance(self.grid, Exception):
+            raise self.grid
+        self.stats = {"jobs": 999, "lanes": 999, "forward_ns": 999}  # calibration's own jobs show in the stats
+        return torch.tensor(self.grid, dtype=torch.float64)
 
     def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads):
         self.enabled = (forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads)
@@ -438,3 +450,65 @@ def test_format_calibration_prints_the_tables_and_the_split():
     assert lines[2] == "  link ms m=1..8: 1.00 2.00 3.00 4.00 5.00 6.00 7.00 8.00"
     assert lines[3].startswith("  layer ms n=1..8 at chosen k: ")
     assert lines[4] == "  split n=0..8: " + " ".join(str(k) for k in split)
+
+
+def _calibrating_service(host, capacity=9):
+    from sglang.srt.layers.moe.cpu_experts.service import CpuExpertService
+
+    trait = FakeServiceTrait()
+    slabs = {row: _fake_slabs(capacity) for row in range(2)}
+    svc = CpuExpertService(host, trait, slabs, hidden=8, cores=[4, 5, 6], threads=2, split=[0] * 9, pin=False)
+    svc.register(0, 10.0)
+    svc.register(1, 10.0)
+    return svc
+
+
+def test_calibration_pushes_the_measured_split_once_and_stops_retuning(capsys):
+    from sglang.srt.environ import envs
+
+    host = FakeHost()
+    host.grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)))
+    svc = _calibrating_service(host)
+    with envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.override(3):
+        split = svc.calibrate(-1)
+    assert split == split_from_grid(host.grid)
+    assert host.splits == [split] and svc.split == split and svc.calibrated
+    assert host.calibrations == [(0, -1, 3, 8 * 1024, "cpu")]
+    assert "CPU experts calibration: row 0" in capsys.readouterr().out
+    # The stats baseline is re-taken after calibration's own jobs, and retune no longer changes the split.
+    assert svc._last_stats == host.stats
+    host.stats = {"jobs": 2000, "lanes": 2000, "forward_ns": 2000 * 10_000_000}
+    assert svc.retune() is None and host.splits == [split]
+
+
+def test_calibration_is_skipped_when_off_or_when_the_split_is_fixed():
+    from sglang.srt.environ import envs
+
+    host = FakeHost()
+    host.grid = _grid(lambda n, k: 1.0)
+    svc = _calibrating_service(host)
+    with envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.override(False):
+        assert svc.calibrate(-1) is None
+    with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.override("0,1,1,2,3,3,4,5,5"):
+        assert svc.calibrate(-1) is None
+    assert host.calibrations == [] and host.splits == [] and not svc.calibrated
+
+
+def test_calibration_needs_a_registered_row_with_eight_slots(caplog):
+    host = FakeHost()
+    host.grid = _grid(lambda n, k: 1.0)
+    svc = _calibrating_service(host, capacity=7)
+    with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        assert svc.calibrate(-1) is None
+    assert "no registered row has 8 RAM slots" in caplog.text
+    assert host.calibrations == [] and svc.split == [0] * 9
+
+
+def test_failed_calibration_warns_and_keeps_the_split(caplog):
+    host = FakeHost()
+    host.grid = RuntimeError("calibration: a measurement did not finish within 1000 ms")
+    svc = _calibrating_service(host)
+    with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        assert svc.calibrate(-1) is None
+    assert "did not finish" in caplog.text
+    assert host.splits == [] and svc.split == [0] * 9 and not svc.calibrated
