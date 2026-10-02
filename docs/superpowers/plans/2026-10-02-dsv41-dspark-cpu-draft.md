@@ -1584,3 +1584,31 @@ git push origin dsv41-dspark-cpu-draft
 ## Results
 
 (Filled in by Tasks 1, 6 and 7.)
+
+### Task 1: draft-shaped experts through the CPU kernel (2026-10-02, divix01, `node1-r1`)
+
+Command: `EXL3_MOE_CPU_PIN=0 flock cc-gpu.lock numactl --membind=1 taskset -c 18-29 python
+analysis/dsv41-drive/cpu-experts/draft_bench.py 3,4 8,12 1,2,3,6 independent,shared node1-r1` at `1f92bc4367`;
+EXIT=0, 32 cells, raw lines in `wt-dspark-cpu/analysis/dsv41-drive/cpu-experts/draft_bench_results.jsonl`.
+
+Sanity: `bits=3, rows=1, independent` is 0.505 ms per pass at 12 threads (0.677 at 8), inside §28.1/§30.4's
+0.49-0.58 ms. `make_layer` takes 4-bit slabs.
+
+`draft_step_ms` (3 stages x median stage call), union = mean distinct experts per stage call:
+
+| bits | threads | rows | independent (union) | shared (union 3) |
+|---|---|---|---|---|
+| 4 | 12 | 1 | 4.94 (3) | 5.02 |
+| 4 | 12 | 2 | 9.76 (6.0) | 6.31 |
+| 4 | 12 | 3 | 13.86 (8.8) | 7.85 |
+| 4 | 12 | 6 | **26.53** (17.1) | 14.46 |
+| 4 | 8 | 6 | 35.03 (17.0) | 25.66 |
+| 3 | 12 | 6 | 31.08 (17.1) | 15.87 |
+| 3 | 8 | 6 | 39.43 (17.2) | 24.19 |
+
+- 12 threads beats 8 in every 6-row cell. 4-bit is no slower than 3-bit per pass (0.52 vs 0.61 ms at 12 threads,
+  6 rows), so the 17.7 MB size did not cost the ~0.85 ms per pass the estimate assumed.
+- Shared routing confirms the `CHUNK_M = 2` grouping: 9 passes for 3 experts x 6 rows, at 0.54 ms per pass.
+- **P = 26.53 ms** (bits 4, rows 6, independent, 12 threads). `18 < P <= 30`: **ask the owner.** The bracket is
+  14.5 ms (shared) to 26.5 ms (independent) against the ~13-18 ms the freed 6.75 GiB is worth per target forward,
+  so the sign of the win depends on the draft's real per-stage union, which this bench cannot see.
