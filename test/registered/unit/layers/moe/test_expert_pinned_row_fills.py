@@ -1,4 +1,4 @@
-"""The pinned tier's native fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS) as ExpertPinnedHostCache drives them (CPU).
+"""The pinned tier's native fills (the prefill fills, with the split gather) as ExpertPinnedHostCache drives them (CPU).
 
 A fake PinnedRowFills stands in for the RAM-miss service: its rows land only when waited for or joined (or, to stand
 in for the reader running ahead, ``progress`` rows per ``fill_landed`` poll), so a copy that ran before its row landed
@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_host_tier import PinnedSlotLRU
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -144,10 +143,8 @@ def test_gather_rows_waits_for_each_chunks_own_prefetched_rows_before_copying():
     _check(second, reference, [2, 6])
 
 
-@pytest.mark.parametrize("split", [False, True])
-def test_a_chunk_miss_outside_the_prefetch_joins_it_before_admitting(split):
-    with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(split):
-        streamer, cache, fills, reference = _setup()
+def test_a_chunk_miss_outside_the_prefetch_joins_it_before_admitting():
+    streamer, cache, fills, reference = _setup()
     with cache.host_use():
         cache.prefetch_rows([1, 2], protected=[1, 2])
         outputs = _outputs(reference, 2)
@@ -205,9 +202,11 @@ def test_copy_rows_copies_only_the_named_rows_and_leaves_the_rest():
         assert (outputs[name][1] == SENTINEL).all()
 
 
-def _split_setup(**kwargs):
-    with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(True):
-        return _setup(**kwargs)
+def _unsplit_setup(**kwargs):
+    """``_setup`` with the split gather taken out: every chunk waits for its own rows, then copies them all at once."""
+    streamer, cache, fills, reference = _setup(**kwargs)
+    cache._filling_positions = lambda chunk_ids: []
+    return streamer, cache, fills, reference
 
 
 def _sentinel_outputs(reference, rows):
@@ -216,7 +215,7 @@ def _sentinel_outputs(reference, rows):
 
 def test_split_gather_copies_resident_rows_before_waiting_for_the_fills():
     """A chunk's resident rows must already be copied when the host starts waiting for its fills."""
-    streamer, cache, fills, reference = _split_setup()
+    streamer, cache, fills, reference = _setup()
     cache.ensure_rows(torch.tensor([4]))
     seen = []
     wait = fills.fill_wait
@@ -233,11 +232,10 @@ def test_split_gather_copies_resident_rows_before_waiting_for_the_fills():
 
 
 def test_split_gather_places_every_chunks_rows_like_the_unsplit_gather():
-    """Two chunks with filling rows at different positions: byte-identical to the flag-off gather."""
+    """Two chunks with filling rows at different positions: byte-identical to the unsplit gather."""
     got = None
-    for split in (False, True):
-        with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(split):
-            streamer, cache, fills, reference = _setup(capacity=6, experts=8)
+    for setup in (_unsplit_setup, _setup):
+        streamer, cache, fills, reference = setup(capacity=6, experts=8)
         cache.ensure_rows(torch.tensor([0, 5]))
         with cache.host_use():
             cache.prefetch_rows([0, 2, 3, 5, 7], protected=[0, 2, 3, 5, 7])
@@ -256,7 +254,7 @@ def test_split_gather_places_every_chunks_rows_like_the_unsplit_gather():
 
 
 def test_a_chunk_of_only_filling_rows_waits_then_copies_once():
-    streamer, cache, fills, reference = _split_setup()
+    streamer, cache, fills, reference = _setup()
     copies = []
     copy = cache.copy_rows
     cache.copy_rows = lambda ids, outputs, rows=None: copies.append(rows) or copy(ids, outputs, rows=rows)
@@ -270,7 +268,7 @@ def test_a_chunk_of_only_filling_rows_waits_then_copies_once():
 
 
 def test_a_failed_fill_still_raises_with_the_split():
-    streamer, cache, fills, reference = _split_setup()
+    streamer, cache, fills, reference = _setup()
     cache.ensure_rows(torch.tensor([4]))
 
     def failing_wait(rows):
@@ -301,7 +299,7 @@ def _untouched(snapshot, row):
 
 
 def test_a_row_that_landed_in_an_earlier_chunks_wait_is_copied_before_the_next_wait():
-    streamer, cache, fills, reference = _split_setup()
+    streamer, cache, fills, reference = _setup()
     with cache.host_use():
         cache.prefetch_rows([1, 2, 5, 6], protected=[1, 2, 5, 6])
         cache.gather_rows(torch.tensor([1, 5]), _sentinel_outputs(reference, 2))  # waits for 1, 2 and 5
@@ -315,7 +313,7 @@ def test_a_row_that_landed_in_an_earlier_chunks_wait_is_copied_before_the_next_w
 
 
 def test_rows_the_reader_landed_before_the_chunk_are_copied_before_its_wait():
-    streamer, cache, fills, reference = _split_setup()
+    streamer, cache, fills, reference = _setup()
     with cache.host_use():
         cache.prefetch_rows([1, 2, 3, 6], protected=[1, 2, 3, 6])
         fills._land(2)  # the fill thread landed 1 and 2 while the host was elsewhere
@@ -332,7 +330,7 @@ def test_rows_the_reader_landed_before_the_chunk_are_copied_before_its_wait():
 
 def test_a_chunks_filling_rows_are_copied_batch_by_batch_as_they_land():
     """Twenty filling rows: the host waits for eight at a time and copies each batch before waiting for the next."""
-    streamer, cache, fills, reference = _split_setup(capacity=24, experts=24)
+    streamer, cache, fills, reference = _setup(capacity=24, experts=24)
     experts = list(range(20))
     with cache.host_use():
         assert cache.prefetch_rows(experts, protected=experts) == 20
@@ -351,9 +349,8 @@ def test_a_chunks_filling_rows_are_copied_batch_by_batch_as_they_land():
 def test_three_chunks_with_resident_landed_and_filling_rows_place_like_the_unsplit_gather(progress):
     got = None
     chunks = ([9, 0, 2, 11], [3, 5, 12, 4], [13, 7, 1, 10])
-    for split in (False, True):
-        with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(split):
-            streamer, cache, fills, reference = _setup(capacity=14, experts=14)
+    for setup in (_unsplit_setup, _setup):
+        streamer, cache, fills, reference = setup(capacity=14, experts=14)
         cache.ensure_rows(torch.tensor([0, 5, 7]))
         fills.progress = progress
         with cache.host_use():

@@ -87,7 +87,7 @@ class PinnedSlotTable(Protocol):
 class PinnedRowFills(Protocol):
     """Asynchronous reads of a layer's missing rows into its pinned slots.
 
-    Enabled by ``SGLANG_DSV41_ENABLE_PREFILL_FILLS``. Driven by
+    Attached to the native slot table (the RAM-miss service). Driven by
     ``ExpertPinnedHostCache`` inside one host use.
 
     * ``fill_begin`` claims slots for ``experts`` in order, until one has no victim

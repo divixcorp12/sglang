@@ -233,7 +233,6 @@ class TestPinnedTierCuda(unittest.TestCase):
 
     def test_a_split_chunk_copies_its_row_index_to_the_device_once(self):
         """A resident row and three batches of filling rows: every copy slices one host-to-device row index."""
-        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
 
         experts = 24
@@ -244,8 +243,7 @@ class TestPinnedTierCuda(unittest.TestCase):
         layer.gpu_rows = torch.nn.Parameter(torch.rand(experts, 5, device="cuda"), requires_grad=False)
         layer._nvfp4_file_source_bytes_per_expert = 3000
         streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
-        with envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.override(True):
-            cache = ExpertPinnedHostCache(streamer, experts)
+        cache = ExpertPinnedHostCache(streamer, experts)
         cache.row_fills = _LazyFills(cache, layer.host_rows.data)
         cache.ensure_rows(torch.tensor([20], device="cuda"))
         filling = list(range(18))

@@ -22,7 +22,8 @@ namespace sglang::expert_residency {
 
 constexpr int kDirectGatherWarp = 32;
 
-// GpuResidencyUpdater.gather_destinations, for one layer. One warp; lane j owns shortlist entry j (width <= 32).
+// the former torch chain GpuResidencyUpdater.gather_destinations, for one layer. One warp; lane j owns shortlist entry
+// j (width <= 32).
 //
 // A shortlist entry is usable when it is valid and no route of this forward reads its slot. Usable entries move to
 // the front in shortlist order, the others follow in shortlist order (the stable argsort of the torch chain). Lane k
@@ -83,9 +84,9 @@ __global__ __launch_bounds__(kDirectGatherWarp, 1) void direct_gather_destinatio
   }
 }
 
-// GpuResidencyUpdater.commit_gather + _commit_gather, for one layer. One thread, in the torch chain's order: the
-// chain is a sequence of scatters whose later writes overwrite earlier ones on shared indices (the dump columns), so
-// running it serially is what keeps every final value, dump columns included, identical.
+// the former torch chain GpuResidencyUpdater.commit_gather + _commit_gather, for one layer. One thread, in the torch
+// chain's order: the chain is a sequence of scatters whose later writes overwrite earlier ones on shared indices (the
+// dump columns), so running it serially is what keeps every final value, dump columns included, identical.
 //
 // delivered is null for a backend without leased delivery; the truncation tripwire then reads miss_count instead.
 //

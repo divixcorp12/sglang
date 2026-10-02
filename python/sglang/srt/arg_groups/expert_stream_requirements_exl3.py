@@ -198,8 +198,8 @@ def _check_cpu_experts(budgets) -> None:
 
     The RAM-miss service's grant sends resident lanes to the CPU, the copy engine's
     copy wait completes them, and layer fusion's route tables and the DIRECT commit
-    leave them out of the fused MoE and the residency. Each piece must be on, so this
-    names every missing switch at once.
+    leave them out of the fused MoE and the residency. Each switch must be on, so this
+    names every missing one at once.
     """
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         return
@@ -208,10 +208,6 @@ def _check_cpu_experts(budgets) -> None:
         (
             "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1",
             envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get(),
-        ),
-        (
-            "SGLANG_DSV41_ENABLE_LAYER_FUSION=1",
-            envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
         ),
         # DIRECT residency ranks the keys the fused plan sorts the miss lanes by,
         # so the CPU takes the coldest ones.

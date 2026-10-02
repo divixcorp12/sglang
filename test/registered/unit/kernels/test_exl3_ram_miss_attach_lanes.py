@@ -148,7 +148,7 @@ def test_attach_refuses_a_manager_without_direct_residency(tiers):
 
 def test_cpu_experts_refuse_the_generic_route_plan():
     """Only the fused plan sorts the miss lanes; refused before the host is touched."""
-    cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
+    cfg = SimpleNamespace(enable_ram_miss_copy_engine=True)
     with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"), envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False):
         with pytest.raises(RuntimeError, match="needs SGLANG_MOE_EXPERT_FUSED_PLAN"):
             module.Exl3RamMissService._start_cpu_experts(cfg, None, None, {}, False)

@@ -37,14 +37,8 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     ram_miss_fault: str
     enable_ram_miss_copy_engine: bool
     enable_ram_miss_sm_small_copies: bool
-    enable_lease_pdl: bool
-    enable_prefill_fills: bool
     enable_prefill_share: bool
-    enable_prefill_route_plan: bool
-    enable_prefill_split_gather: bool
     enable_moe_side_stream: bool
-    enable_layer_fusion: bool
-    enable_exl3_cast_fusion: bool
     torch_prefill_indexer: bool
     fused_wo_a: bool
 
@@ -68,14 +62,8 @@ class Dsv41Config(msgspec.Struct, frozen=True):
             ram_miss_fault=envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get(),
             enable_ram_miss_copy_engine=envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get(),
             enable_ram_miss_sm_small_copies=envs.SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES.get(),
-            enable_lease_pdl=envs.SGLANG_DSV41_ENABLE_LEASE_PDL.get(),
-            enable_prefill_fills=envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get(),
             enable_prefill_share=envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.get(),
-            enable_prefill_route_plan=envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.get(),
-            enable_prefill_split_gather=envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.get(),
             enable_moe_side_stream=envs.SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM.get(),
-            enable_layer_fusion=envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
-            enable_exl3_cast_fusion=envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get(),
             torch_prefill_indexer=envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
             fused_wo_a=envs.SGLANG_DSV41_FUSED_WO_A.get(),
         )

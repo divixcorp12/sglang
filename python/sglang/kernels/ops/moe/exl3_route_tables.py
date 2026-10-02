@@ -1,8 +1,7 @@
-"""JIT wrapper for the EXL3 fused MoE's route tables (SGLANG_DSV41_ENABLE_LAYER_FUSION).
+"""JIT wrapper for the EXL3 fused MoE's route tables (the layer fusion).
 
 ``exl3_moe_route_tables`` launches one kernel in place of ``exl3_fused_moe.route_tables`` and the copies around it in
-``Exl3FusedMoE.run`` (22 kernels per layer), with bit-identical results; the flag-off path runs the torch chain, and
-the parity test compares against it.
+``Exl3FusedMoE.run`` (22 kernels per layer), with bit-identical results; the parity test compares against the torch chain.
 """
 
 from __future__ import annotations

@@ -1854,16 +1854,6 @@ class Envs:
     # residency commit run on one side stream, joined before the shared-expert add, so they overlap the RAM-miss
     # copies and the routed MoE kernel instead of running in line. Read once per process. Off by default.
     SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM = EnvBool(False)
-    # DSV4 EXL3 decode layer fusion (plan 2026-09-25-dsv41-layer-fusion): one JIT kernel each for DIRECT's
-    # gather_destinations and commit_gather and for the fused MoE's route tables, in place of their ~89 small torch
-    # kernels per layer. Bit-identical to the torch chains. Read once when each layer's buffers are built. Off by default.
-    SGLANG_DSV41_ENABLE_LAYER_FUSION = EnvBool(False)
-    # DSV4 EXL3 decode cast fusion (plan 2026-09-25-dsv41-decode-fusion-2): at BS1, the sublayer input's fp16 copy is
-    # written by hc_combine_norm and shared by the EXL3 linears that read it, merged linears cast once into one buffer,
-    # the shared expert keeps its gate/up/down activations in fp16, and the routed output is cast and scaled in one
-    # kernel. Bit-identical to the unfused casts. Read once when each module is built, and per BS1 call where the
-    # sublayer input is combined. Off by default.
-    SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION = EnvBool(False)
     # Copy engine (plan 2026-09-25-dsv41-copy-compute-overlap 1b, LEASE_PROTOCOL.md "Copy engine"): the RAM-miss
     # service copies each decode layer's RAM-resident rows into their VRAM slots with the DMA engine (cuMemcpyAsync on
     # its own thread) instead of the in-graph SM copy C1, and the graph waits for its completion word. Captured decode
@@ -1879,31 +1869,11 @@ class Envs:
     # DMA completed and CW published Done. Needs the copy engine (refused without it). Read once at service start.
     # Off by default.
     SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES = EnvBool(False)
-    # Lease-chain PDL (LEASE_PROTOCOL.md "PDL"): the lease-chain kernels post, W1, S and CW launch with programmatic
-    # dependent launch, each waiting on its predecessor as its first statement and letting the next one launch right
-    # after that wait, so a layer's kernels overlap their launch latency. Outputs unchanged; at most ~1 us per layer
-    # (analysis/dsv41-drive/chain-pdl/results.md). Read once at service start. Off by default.
-    SGLANG_DSV41_ENABLE_LEASE_PDL = EnvBool(False)
-    # Prefill fills (plan 2026-09-25-dsv41-prefill-fills): eager pinned-tier misses are read by the RAM-miss service's
-    # native reader straight into the pinned slabs (row images, every mirror drive at once) instead of the Python bounce
-    # read and CPU copy. A layer's misses are all issued once its routing is known, on a helper thread, and each gather
-    # chunk waits only for its own rows. Needs the native slot table (SGLANG_MOE_EXPERT_GRAPH_GATHER). Read once when
-    # the service starts. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_FILLS = EnvBool(False)
     # Prefill share (plan 2026-09-25-dsv41-prefill-eviction): during a prefill forward, a layer's pinned-tier
     # admissions own at most one gather chunk (EXL3_MAX_GATHER_ROWS) of rows; past that they evict the prefill's own
     # LRU row, not one of decode's. A row stops being prefill-owned when decode uses it. Read once at service start.
     # Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_SHARE = EnvBool(False)
-    # Prefill route plan (plan 2026-09-25-dsv41-prefill-route-plan): the eager streamed MoE reads a layer's topk_ids
-    # to the host once, before any of its gathers, groups the routes by expert, and takes each chunk's expert ids and
-    # row_of_source as host lists, so no readback sits between a chunk's gather and its compute and the host runs
-    # ahead of the gather. Outputs are bitwise those of the per-expert torch.where loop. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN = EnvBool(False)
-    # Split fill gather (plan 2026-09-26-dsv41-split-fill-gather): a prefill gather chunk holding rows the layer's
-    # prefill fill is still reading copies its other rows first, then waits for the fill and copies the filled rows,
-    # so the GPU gathers while the NVMe reads. Same bytes in the same staging rows. Off by default.
-    SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER = EnvBool(False)
     # CPU experts (plan 2026-09-29-dsv41-cpu-experts): decode computes a layer's RAM-tier experts on the CPU, in place
     # over the pinned tier, instead of copying them over the link. Batch-1 decode only. Off by default.
     SGLANG_DSV41_CPU_EXPERTS = EnvBool(False)
@@ -2373,6 +2343,13 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
     "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),
     "SGLANG_MASKED_GEMM_FAST_ACT": _DeprecatedEnv(),
+    # Always on now (lease PDL: on when the GPU supports it).
+    "SGLANG_DSV41_ENABLE_LAYER_FUSION": _DeprecatedEnv(),
+    "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION": _DeprecatedEnv(),
+    "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN": _DeprecatedEnv(),
+    "SGLANG_DSV41_ENABLE_PREFILL_FILLS": _DeprecatedEnv(),
+    "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER": _DeprecatedEnv(),
+    "SGLANG_DSV41_ENABLE_LEASE_PDL": _DeprecatedEnv(),
     # The unified free list is kept unsorted between flushes by design; the
     # sort-after-merge A/B knob never left its off default and is gone.
     "SGLANG_SORT_FREE_LIST_AFTER_MERGE": _DeprecatedEnv(),

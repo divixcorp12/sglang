@@ -1,4 +1,4 @@
-"""SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION against the unfused chains it replaces, bit for bit.
+"""The EXL3 cast fusion against the unfused chains it replaces, bit for bit.
 
 Every comparison is of raw bits (``.view(torch.int16)``), never a tolerance: the fusion only moves where each
 rounding happens, so any difference is a bug.
@@ -19,13 +19,16 @@ from sglang.kernels.ops.moe.exl3_cast_fusion import (
     exl3_scale_to_bf16,
     exl3_silu_mul_clamp_half,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.exl3 import (
     Exl3Config,
     Exl3LinearMethod,
     exl3_swiglu_mlp,
 )
-from sglang.srt.layers.quantization.exl3_ops import EXL3_HALF_INPUT, random_exl3_tensors
+from sglang.srt.layers.quantization.exl3_ops import (
+    EXL3_HALF_INPUT,
+    exl3_linear,
+    random_exl3_tensors,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     capturing_host_node_count,
 )
@@ -59,9 +62,17 @@ def assert_bits_equal(a: torch.Tensor, b: torch.Tensor) -> None:
     assert diff == 0, f"{diff} of {a.numel()} elements differ"
 
 
-def _method(fusion: bool) -> Exl3LinearMethod:
-    with envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.override(fusion):
-        return Exl3LinearMethod(Exl3Config.from_config(CFG))
+def _method() -> Exl3LinearMethod:
+    return Exl3LinearMethod(Exl3Config.from_config(CFG))
+
+
+def _unfused_apply(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """The reference: ``Exl3LinearMethod.apply`` without the BS1 fused gemv, one ``exl3_linear`` per part.
+
+    Copied from ``Exl3LinearMethod.apply`` as it ran with the cast fusion off (no bias).
+    """
+    outs = [exl3_linear(x, t) for t in layer.exl3_tensors]
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
 
 
 def _linear(
@@ -71,7 +82,7 @@ def _linear(
     with torch.device(
         "cuda"
     ):  # the weight loader materializes the parameters on the default device
-        _method(False).create_weights(
+        _method().create_weights(
             layer,
             in_features,
             [out_features] * parts,
@@ -90,7 +101,7 @@ def _linear(
             layer.mul1.weight_loader(
                 layer.mul1, torch.tensor(1, dtype=torch.int32, device="cuda"), part
             )
-        _method(False).process_weights_after_loading(layer)
+        _method().process_weights_after_loading(layer)
     assert all(t.trellis.is_cuda for t in layer.exl3_tensors)
     return layer
 
@@ -170,7 +181,7 @@ def test_a_published_input_serves_only_the_same_unmodified_tensor_on_the_same_st
     assert EXL3_HALF_INPUT.take(x) is None
 
 
-# ---- EXL3 linears, flag on against flag off
+# ---- EXL3 linears, fused against unfused
 
 
 @pytest.mark.parametrize(
@@ -185,11 +196,11 @@ def test_a_published_input_serves_only_the_same_unmodified_tensor_on_the_same_st
     ],
 )
 @pytest.mark.parametrize("published", [False, True])
-def test_linear_apply_is_bit_identical_with_the_flag_on(
+def test_linear_apply_is_bit_identical_to_the_unfused_chain(
     in_features, out_features, parts, published
 ):
     layer = _linear(in_features, out_features, parts, seed=in_features + out_features)
-    fused, unfused = _method(True), _method(False)
+    fused = _method()
     for trial in range(4):
         gen = torch.Generator(device="cuda").manual_seed(trial)
         x = (torch.randn(1, in_features, device="cuda", generator=gen) * 2).to(
@@ -197,14 +208,14 @@ def test_linear_apply_is_bit_identical_with_the_flag_on(
         )
         if published:
             EXL3_HALF_INPUT.publish(x, x.to(torch.float16))
-        assert_bits_equal(fused.apply(layer, x), unfused.apply(layer, x))
+        assert_bits_equal(fused.apply(layer, x), _unfused_apply(layer, x))
 
 
 @pytest.mark.parametrize("rows", [2, 300])
 def test_linear_apply_leaves_more_than_one_row_to_the_unfused_path(rows):
     layer = _linear(5120, 2304, 2, seed=5)
     x = torch.randn(rows, 5120, device="cuda").to(torch.bfloat16)
-    assert_bits_equal(_method(True).apply(layer, x), _method(False).apply(layer, x))
+    assert_bits_equal(_method().apply(layer, x), _unfused_apply(layer, x))
 
 
 # ---- the shared expert
@@ -215,11 +226,10 @@ def _shared_expert(seed: int):
 
 
 def _unfused_shared_expert(gate_up, down, x):
-    method = _method(False)
-    h = method.apply(gate_up, x)
+    h = _unfused_apply(gate_up, x)
     act = h.new_empty(h.shape[0], h.shape[1] // 2)
     silu_and_mul_clamp(h, act, LIMIT)
-    return method.apply(down, act)
+    return _unfused_apply(down, act)
 
 
 @pytest.mark.parametrize("published", [False, True])
@@ -246,7 +256,7 @@ def test_the_fused_chain_captures_without_host_nodes_and_replays_bit_identically
     gate_up, down = _shared_expert(seed=21)
     wq_a = _linear(5120, 1280, 1, seed=31)
     wkv = _linear(5120, 512, 1, seed=41)
-    fused = _method(True)
+    fused = _method()
     residual = torch.zeros(1, 20480, device="cuda", dtype=torch.bfloat16)
     pre = torch.zeros(1, 4, device="cuda")
     weight = (torch.randn(5120, device="cuda") * 2).to(torch.bfloat16)
@@ -273,7 +283,6 @@ def test_the_fused_chain_captures_without_host_nodes_and_replays_bit_identically
         host_nodes = capturing_host_node_count(torch.cuda.current_stream().cuda_stream)
     assert host_nodes == 0
 
-    unfused = _method(False)
     for trial in range(8):
         gen = torch.Generator(device="cuda").manual_seed(100 + trial)
         residual.copy_(
@@ -284,8 +293,8 @@ def test_the_fused_chain_captures_without_host_nodes_and_replays_bit_identically
         graph.replay()
         EXL3_HALF_INPUT.clear()
         x = hc_combine_norm(residual, pre, weight, 1e-6)
-        assert_bits_equal(outs[0], unfused.apply(wq_a, x))
-        assert_bits_equal(outs[1], unfused.apply(wkv, x))
+        assert_bits_equal(outs[0], _unfused_apply(wq_a, x))
+        assert_bits_equal(outs[1], _unfused_apply(wkv, x))
         assert_bits_equal(outs[2], _unfused_shared_expert(gate_up, down, x))
         assert_bits_equal(outs[3], routed.to(torch.bfloat16) * 1.5)
 

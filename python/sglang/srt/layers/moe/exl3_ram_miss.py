@@ -30,6 +30,7 @@ from typing import Callable, Mapping, Optional, Sequence
 
 import torch
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 from sglang.kernels.ops.moe.expert_stream_transport import (
     MAX_IDS,
@@ -450,7 +451,7 @@ class NativePinnedSlotTable:
     def mapping(self, num_experts: int) -> list[int]:
         return self.service.host.mapping(self._row)
 
-    # PinnedRowFills (SGLANG_DSV41_ENABLE_PREFILL_FILLS): the service's reader fills
+    # PinnedRowFills (the prefill fills): the service's reader fills
     # this layer's slots while the tier's host use holds the thread paused.
     def fill_begin(self, experts, protected, fallback: bool) -> tuple[list[int], int]:
         return self.service.host.fill_begin(self._row, experts, protected, fallback)
@@ -786,7 +787,7 @@ class Exl3RamMissService:
         self._cpu_retune_batches = 0
         self._cpu_batches = 0
         self._cpu_log_batches = 0
-        # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
+        # The lease chain's kernels launch with PDL when the GPU supports it.
         self.lease_pdl = False
         # Staging slots per row, reserved at start: one per lane a post can miss, fewer
         # on a small tier. MAX_IDS until plan_gather_width says how wide the gather is.
@@ -982,7 +983,7 @@ class Exl3RamMissService:
         self.cpu_experts = cpu_experts
         self._cpu_retune_batches = envs.SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES.get()
         self.sm_small_copies = cfg.enable_ram_miss_sm_small_copies
-        self.lease_pdl = cfg.enable_lease_pdl
+        self.lease_pdl = pin and is_arch_support_pdl()
         self.fill_timeout_s = watchdog_wait_s(cfg.ram_miss_timeout_ms) + 5.0
         # Order matters. atexit runs last-registered first, and weakref.finalize
         # installs its single exit hook when the first finalizer (any tier's slab
@@ -1012,8 +1013,8 @@ class Exl3RamMissService:
 
         Runs after the copy engine is enabled and before the service thread starts. CPU
         lanes complete in the copy wait and leave the fused MoE through layer fusion's
-        route tables, so the copy engine and layer fusion are both required; so is the
-        fused plan, and the prefetch pull join must be off.
+        route tables, so the copy engine is required; so is the fused plan, and the
+        prefetch pull join must be off.
         """
         from sglang.srt.layers.moe.cpu_experts.service import (
             CpuExpertService,
@@ -1025,10 +1026,6 @@ class Exl3RamMissService:
         if not cfg.enable_ram_miss_copy_engine:
             raise RuntimeError(
                 "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"
-            )
-        if not cfg.enable_layer_fusion:
-            raise RuntimeError(
-                "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_ENABLE_LAYER_FUSION"
             )
         if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
             raise RuntimeError(

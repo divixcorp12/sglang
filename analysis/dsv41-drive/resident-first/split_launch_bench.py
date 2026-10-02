@@ -74,7 +74,6 @@ class Layer(msgspec.Struct):
 
 
 def build_layers(par, real: dict, device, gen) -> list[Layer]:
-    from sglang.srt.environ import envs
     from sglang.srt.layers.quantization.exl3_fused_moe import Exl3FusedMoE
 
     n_real = real["w13_trellis"].shape[0]
@@ -84,8 +83,7 @@ def build_layers(par, real: dict, device, gen) -> list[Layer]:
     for layer in range(LAYERS):
         pick = [(layer * PHYS + i) % n_real for i in range(PHYS)]
         rows = {name: t[pick].clone() for name, t in real.items()}
-        with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
-            fused = Exl3FusedMoE(rows, PHYS, hidden=hidden, inter=inter, top_k=TOP_K, device=device)
+        fused = Exl3FusedMoE(rows, PHYS, hidden=hidden, inter=inter, top_k=TOP_K, device=device)
         # Widen to SLOTS table entries: entry s holds row s % PHYS, so a route's slot scan covers production's width.
         for name, table in fused.tables.items():
             fused.tables[name] = table[torch.arange(SLOTS, device=device) % PHYS].contiguous()

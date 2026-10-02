@@ -101,7 +101,7 @@ SGL_DEVICE void stage_cpu_input(const PostParams& p) {
 // The post kernel, one block of kBlock threads. Thread 0 applies the row's pending map delta, types the lanes from
 // the device's map and publishes the demand record; the whole block stages the CPU input when a lane is the CPU's.
 //
-// Programmatic dependent launch (kUsePDL = SGLANG_DSV41_ENABLE_LEASE_PDL, used by every chain kernel but C1 and CC):
+// Programmatic dependent launch (kUsePDL, on when the GPU supports it, used by every chain kernel but C1 and CC):
 // the wait is the kernel's first statement and the trigger its second, so every word is read and written after the
 // primary grid completed and flushed, as without PDL. The ordering is transitive down the chain
 // (analysis/dsv41-drive/LEASE_PROTOCOL.md, "PDL").

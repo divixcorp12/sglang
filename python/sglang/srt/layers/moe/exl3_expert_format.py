@@ -191,8 +191,7 @@ class Exl3ExpertFormat:
         it, or is loading it, into a slot. The callable looks the hot cache up at
         eviction time, because the pinned tier is built before the hot cache and
         residency changes. With ``SGLANG_MOE_EXPERT_GRAPH_GATHER`` it also returns
-        ``slot_table`` (and ``row_fills`` under
-        ``SGLANG_DSV41_ENABLE_PREFILL_FILLS``).
+        ``slot_table`` and ``row_fills`` (the prefill fills).
         """
 
         def is_pinned(expert_id: int) -> bool:
@@ -223,13 +222,7 @@ class Exl3ExpertFormat:
                 self.layer_id,
                 lambda: expert_streamer_of(layer),
             )
-            if envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get():
-                options["row_fills"] = options["slot_table"]
-        elif envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get():
-            raise RuntimeError(
-                "exl3: SGLANG_DSV41_ENABLE_PREFILL_FILLS needs SGLANG_MOE_EXPERT_GRAPH_GATHER: the fills are the "
-                "RAM-miss service's reads, and only option C runs that service"
-            )
+            options["row_fills"] = options["slot_table"]
         return options
 
     def plan_graph_gather(self, streamer, rows: int) -> None:

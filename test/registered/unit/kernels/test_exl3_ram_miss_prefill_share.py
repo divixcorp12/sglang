@@ -206,7 +206,7 @@ def test_a_negative_share_is_refused(tier):
         host.set_prefill_share(-1)
 
 
-# ---- with SGLANG_DSV41_ENABLE_PREFILL_FILLS: the native fill claims through the same rule ----
+# ---- with the prefill fills: the native fill claims through the same rule ----
 
 
 def test_a_prefetch_fill_stops_at_the_share_and_an_ensure_fill_evicts_the_prefills_own_rows(tier):

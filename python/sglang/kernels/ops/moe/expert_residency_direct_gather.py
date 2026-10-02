@@ -1,12 +1,12 @@
-"""JIT wrappers for the DIRECT residency kernels of ``GpuResidencyUpdater`` (SGLANG_DSV41_ENABLE_LAYER_FUSION).
+"""JIT wrappers for the DIRECT residency kernels of ``GpuResidencyUpdater`` (the layer fusion).
 
 Each wrapper launches one kernel in place of a per-layer chain of small torch ops, with bit-identical results:
 
-* ``direct_gather_destinations`` -- ``GpuResidencyUpdater.gather_destinations`` (26 kernels per layer), with the
-  route-slot lookup ``expert_to_slot.index_select(0, flat.long())`` folded in;
-* ``direct_commit_gather`` -- ``GpuResidencyUpdater.commit_gather`` (41 kernels per layer).
+* ``direct_gather_destinations`` -- the former torch chain ``GpuResidencyUpdater.gather_destinations`` (26 kernels
+  per layer), with the route-slot lookup ``expert_to_slot.index_select(0, flat.long())`` folded in;
+* ``direct_commit_gather`` -- the former torch chain ``GpuResidencyUpdater.commit_gather`` (41 kernels per layer).
 
-The torch chains stay the reference: the flag-off path runs them, and the parity tests compare against them.
+The torch chains are the parity tests' reference.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def direct_gather_destinations(
     live_out: torch.Tensor,
     remap_out: torch.Tensor,
 ) -> None:
-    """One layer's DIRECT gather destinations; see ``GpuResidencyUpdater.gather_destinations``.
+    """One layer's DIRECT gather destinations; the former torch chain ``GpuResidencyUpdater.gather_destinations``.
 
     ``topk_ids`` and ``remap`` are this forward's flat routes and the planner's remap (int32 or int64);
     ``remap_out`` may be either dtype. ``victims``/``victim_valid`` are the layer's shortlist row.
@@ -108,7 +108,7 @@ def direct_commit_gather(
     free_state: int,
     cpu_lanes: Optional[torch.Tensor] = None,
 ) -> None:
-    """One layer's DIRECT residency commit; see ``GpuResidencyUpdater.commit_gather``.
+    """One layer's DIRECT residency commit; the former torch chain ``GpuResidencyUpdater.commit_gather``.
 
     ``mapping`` is the layer's ``[experts + 1]`` row (last column the dump), ``slot_*`` its ``[slots + 1]`` rows (last
     column the dump). ``delivered`` and ``keep`` are the leased backend's delivered count and keep flag, both or

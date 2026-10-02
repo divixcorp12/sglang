@@ -2072,8 +2072,8 @@ class ExpertStreamDevice:
     ``timeout_ms`` is the post's delta wait and S's deadline. ``hit_copy`` ("ce" or
     "sm") and ``cpu_misses`` carry ``SGLANG_DSV41_RAM_HIT_COPY`` and
     ``SGLANG_DSV41_CPU_EXPERTS_MISSES``; ``lease_pdl``
-    (``SGLANG_DSV41_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
-    PDL.
+    launches every chain kernel but C1 and CC with PDL; the RAM-miss service sets it
+    when the GPU supports PDL.
 
     ``map_bank`` is the device's copy of the RAM tier's map: ``ram_slot``
     ``[layers, experts]`` starts at -1 and changes only through the deltas the post

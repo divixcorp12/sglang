@@ -16,7 +16,6 @@ from typing import Mapping
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.exl3_ext import exl3_ext
 
 ACT_SILU = 0
@@ -72,27 +71,6 @@ def slot_pointer_tables(
     }
 
 
-def route_tables(remap, expert_count, ones, weights, keep):
-    """Fill ``expert_count`` from ``remap``; return (inv_order, weight_sorted fp16, det tables).
-
-    ``keep`` (fp32 [1]) scales every route weight and, when 0, empties ``expert_count``,
-    so a dropped layer runs no expert.
-    ``det`` is exllamav3's device-built deterministic table stack
-    ``[expert_start, expert_start, count > 0]``.
-    """
-    expert_count.zero_().index_add_(0, remap, ones)
-    order = torch.argsort(remap)
-    inv_order = torch.empty_like(order).scatter_(
-        0, order, torch.arange(order.numel(), device=order.device)
-    )
-    weight_sorted = (weights[order].float() * keep).to(torch.float16)
-    # A dropped layer runs no expert: nothing reads rows that may be half written.
-    expert_count.mul_((keep > 0).to(torch.int64))
-    expert_start = torch.cumsum(expert_count, 0) - expert_count
-    det = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
-    return inv_order, weight_sorted, det
-
-
 class Exl3FusedMoE:
     """Static buffers and pointer tables of one streamed layer's in-graph fused MoE."""
 
@@ -120,7 +98,6 @@ class Exl3FusedMoE:
         }
         half = dict(dtype=torch.float16, device=device)
         self.expert_count = torch.zeros(slots + 1, dtype=torch.int64, device=device)
-        self.ones = torch.ones(top_k, dtype=torch.int64, device=device)
         self.token_sorted = torch.zeros(top_k, dtype=torch.int64, device=device)
         self.scratch = torch.empty((top_k, hidden), dtype=torch.float32, device=device)
         self.out = torch.empty((1, hidden), dtype=torch.float32, device=device)
@@ -131,13 +108,11 @@ class Exl3FusedMoE:
             self.temp_intermediate_g,
             self.temp_intermediate_u,
         ) = shared_temps(device, hidden, inter)
-        # SGLANG_DSV41_ENABLE_LAYER_FUSION: route_tables and the copies around it as one kernel, into these buffers.
-        self.layer_fusion = envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()
-        if self.layer_fusion:
-            self.remap64 = torch.zeros(top_k, dtype=torch.int64, device=device)
-            self.inv_order = torch.zeros(top_k, dtype=torch.int64, device=device)
-            self.weight_sorted = torch.zeros(top_k, **half)
-            self.det = torch.zeros((3, slots + 1), dtype=torch.int64, device=device)
+        # The route tables and the copies around them run as one kernel, into these buffers.
+        self.remap64 = torch.zeros(top_k, dtype=torch.int64, device=device)
+        self.inv_order = torch.zeros(top_k, dtype=torch.int64, device=device)
+        self.weight_sorted = torch.zeros(top_k, **half)
+        self.det = torch.zeros((3, slots + 1), dtype=torch.int64, device=device)
 
     def _fused_route_tables(self, x, topk_weights, remap, keep, cpu=None):
         from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
@@ -163,27 +138,17 @@ class Exl3FusedMoE:
         return self.remap64, self.inv_order, self.weight_sorted, self.det
 
     def run(self, x, topk_weights, remap, keep, act_limit: float, cpu=None) -> torch.Tensor:
-        """x [1, H] any float dtype; topk_weights [6]; remap [6] slots, int64 (int32 too with layer fusion);
-        keep fp32 [1].
+        """x [1, H] any float dtype; topk_weights [6]; remap [6] slots, int32 or int64; keep fp32 [1].
 
         ``cpu`` = (cpu_lanes, dst_slots, cpu_out address, part stride), CPU experts only: the routes the CPU computed
-        are left out and the partial sums CC flagged seed the output (exl3_route_tables.cuh). Layer fusion only."""
+        are left out and the partial sums CC flagged seed the output (exl3_route_tables.cuh)."""
         if x.shape[0] != 1:  # a host-side shape read: capture-safe
             raise ValueError(
                 f"exl3 in-graph MoE runs one token (BS1 decode), not {x.shape[0]}"
             )
-        if cpu is not None and not self.layer_fusion:
-            raise RuntimeError("CPU experts need SGLANG_DSV41_ENABLE_LAYER_FUSION: only its route tables leave CPU routes out")
-        if self.layer_fusion:
-            remap, inv_order, weight_sorted, det = self._fused_route_tables(
-                x, topk_weights, remap, keep, cpu
-            )
-        else:
-            self.x16.copy_(x)
-            inv_order, weight_sorted, det = route_tables(
-                remap, self.expert_count, self.ones, topk_weights, keep
-            )
-            self.out.zero_()
+        remap, inv_order, weight_sorted, det = self._fused_route_tables(
+            x, topk_weights, remap, keep, cpu
+        )
         t = self.tables
         self.ext.exl3_moe(
             self.x16,

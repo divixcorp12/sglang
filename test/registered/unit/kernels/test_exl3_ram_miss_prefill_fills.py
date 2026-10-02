@@ -1,4 +1,4 @@
-"""Prefill fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS, plan 2026-09-25-dsv41-prefill-fills): the C++ tier claims pinned
+"""Prefill fills (plan 2026-09-25-dsv41-prefill-fills): the C++ tier claims pinned
 slots for an eager caller and reads them through the service's reader on a helper thread (CPU)."""
 
 import faulthandler

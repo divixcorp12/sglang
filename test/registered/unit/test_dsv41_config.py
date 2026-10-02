@@ -28,14 +28,8 @@ def test_defaults_match_the_env_declarations():
         ram_miss_fault="",
         enable_ram_miss_copy_engine=False,
         enable_ram_miss_sm_small_copies=False,
-        enable_lease_pdl=False,
-        enable_prefill_fills=False,
         enable_prefill_share=False,
-        enable_prefill_route_plan=False,
-        enable_prefill_split_gather=False,
         enable_moe_side_stream=False,
-        enable_layer_fusion=False,
-        enable_exl3_cast_fusion=False,
         torch_prefill_indexer=False,
         fused_wo_a=True,
     )
@@ -118,12 +112,47 @@ def test_removed_ram_miss_knobs_warn(monkeypatch):
     Dsv41Config.from_envs()  # the set values do not break the config a service starts from
 
 
-def test_the_lease_pdl_flag_is_off_by_default_and_observed_when_overridden():
-    assert envs.SGLANG_DSV41_ENABLE_LEASE_PDL.get() is False
-    assert Dsv41Config.from_envs().enable_lease_pdl is False
-    with envs.SGLANG_DSV41_ENABLE_LEASE_PDL.override(True):
-        assert Dsv41Config.from_envs().enable_lease_pdl is True
-    assert Dsv41Config.from_envs().enable_lease_pdl is False
+ALWAYS_ON_KNOBS = (
+    "SGLANG_DSV41_ENABLE_LAYER_FUSION",
+    "SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION",
+    "SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN",
+    "SGLANG_DSV41_ENABLE_PREFILL_FILLS",
+    "SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER",
+    "SGLANG_DSV41_ENABLE_LEASE_PDL",
+)
+
+
+def test_always_on_knobs_are_deprecated_without_replacement(monkeypatch):
+    """The layer fusion, cast fusion, prefill route plan, fills and split gather are always on, and the lease chain's PDL
+    follows the GPU: a launch that still sets one warns, starts, and the value is ignored."""
+    import warnings
+
+    from sglang.srt import environ
+
+    for name in ALWAYS_ON_KNOBS:
+        monkeypatch.setenv(name, "0")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        environ._handle_deprecated_envs()
+    text = " ".join(str(w.message) for w in caught)
+    fields = {f.name for f in msgspec.structs.fields(Dsv41Config)}
+    for name in ALWAYS_ON_KNOBS:
+        assert name in environ._DEPRECATED_ENVS, name
+        assert environ._DEPRECATED_ENVS[name].replacement is None, name
+        assert not hasattr(environ.envs, name), name
+        assert f"{name} is deprecated" in text, name
+    assert (
+        not {
+            "enable_layer_fusion",
+            "enable_exl3_cast_fusion",
+            "enable_prefill_route_plan",
+            "enable_prefill_fills",
+            "enable_prefill_split_gather",
+            "enable_lease_pdl",
+        }
+        & fields
+    )
+    Dsv41Config.from_envs()  # the set values do not break the config a service starts from
 
 
 if __name__ == "__main__":

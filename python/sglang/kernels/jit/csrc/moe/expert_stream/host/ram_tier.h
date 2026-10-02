@@ -350,7 +350,7 @@ class RamTier {
     count<kVersion>();
   }
 
-  // ---- Prefill fills (SGLANG_DSV41_ENABLE_PREFILL_FILLS) ----
+  // ---- Prefill fills ----
   //
   // A prefill fill reads the rows of many experts into RAM slots on a helper thread while the caller gathers.
   //   - fill_begin: a caller that owns the tier claims slots for `experts` of `row`, in order, until one cannot be

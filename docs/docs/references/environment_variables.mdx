@@ -1330,43 +1330,13 @@ These variables configure DeepSeek V4.1: streaming EXL3 routed experts from disk
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_PREFILL_FILLS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Read eager pinned-tier misses with the service's native reader straight into the pinned slabs, issued once a layer's routing is known. Needs the native slot table (graph gather).</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_PREFILL_SHARE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>During prefill, limit a layer's pinned-tier admissions to one gather chunk of rows; beyond that they evict the prefill's own LRU row rather than one of decode's.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Read a layer's <code>topk_ids</code> to the host once, group routes by expert and take each chunk's ids as host lists, so the host runs ahead of the gather. Output is bitwise identical.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A prefill gather chunk copies its already-resident rows first, then waits for the layer's fill and copies the filled rows, so the GPU gathers while NVMe reads.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_LEASE_PDL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Launch the lease-chain kernels with programmatic dependent launch to overlap launch latency. Outputs are unchanged.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run the shared expert and the direct residency commit on one side stream, joined before the shared-expert add. Read once per process.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_LAYER_FUSION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>One JIT kernel each for the direct gather destinations, the commit gather and the fused MoE route tables, replacing about 89 small torch kernels per layer. Bit-identical.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Batch-size-1 decode cast fusion: a shared fp16 copy of the sublayer input, merged linears cast once, fp16 shared-expert activations, and the routed output cast and scaled in one kernel. Bit-identical.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -1723,6 +1693,11 @@ Setting any of these only logs a warning and is ignored. Unset them.
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_RAM_MISS_HIT_WAIT_US</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Removed: the chain has no hit wait since the slot-map protocol.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>unset</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_ENABLE_LAYER_FUSION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Removed: the layer fusion is always on. So are the cast fusion, prefill route plan, prefill fills and prefill split gather (<code>SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION</code>, <code>_PREFILL_ROUTE_PLAN</code>, <code>_PREFILL_FILLS</code>, <code>_PREFILL_SPLIT_GATHER</code>); lease-chain PDL (<code>SGLANG_DSV41_ENABLE_LEASE_PDL</code>) is on whenever the GPU supports it (sm_90 or newer). A set value only warns.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>unset</code></td>
     </tr>
   </tbody>

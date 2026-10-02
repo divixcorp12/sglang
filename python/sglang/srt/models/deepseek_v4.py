@@ -2644,6 +2644,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        # EXL3 linears take a shared fp16 copy of the BS1 sublayer input (the cast fusion).
+        self.exl3_half_input = (
+            quant_config is not None and quant_config.get_name() == "exl3"
+        )
         self.self_attn = self._build_self_attn(
             config=config,
             layer_id=layer_id,
@@ -3287,7 +3291,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                     quantized.append(Mxfp8SwizzledInput(y_q, y_sf))
                     return y
-                if x.shape[0] == 1 and envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get():
+                if x.shape[0] == 1 and self.exl3_half_input:
                     from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_half,
                     )

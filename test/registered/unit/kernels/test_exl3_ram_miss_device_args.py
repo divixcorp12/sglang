@@ -286,7 +286,7 @@ def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
         _device(layers=1, experts=384, hot_page=torch.zeros(16 * 128, dtype=torch.uint8))
 
 
-# Lease-chain PDL (SGLANG_DSV41_ENABLE_LEASE_PDL, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
+# Lease-chain PDL (on when the GPU supports it, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
 # the Python method that launches each. C1 and CC are plain launches.
 PDL_KERNELS = {
     "exl3_ram_miss_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),

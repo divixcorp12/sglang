@@ -211,7 +211,7 @@ class ExpertPinnedHostCache:
     ``is_pinned`` then only sizes requests (``evictable_rows``) and the table must
     protect the same experts itself.
 
-    Reads: ``row_fills`` (SGLANG_DSV41_ENABLE_PREFILL_FILLS) reads missing rows in
+    Reads: ``row_fills`` (the prefill fills) reads missing rows in
     place of the streamer's row source. ``ensure_rows`` reads through it, and
     ``prefetch_rows`` starts a layer's reads ahead of its chunked gather, which then
     waits per chunk for only its own rows. None keeps every read synchronous.
@@ -319,7 +319,6 @@ class ExpertPinnedHostCache:
         )
         self.stats = PinnedHostCacheStats()
         self.row_fills = row_fills
-        self.split_fill_gather = envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.get()
         # The running prefetch's claim order by expert (fill_wait counts rows in that
         # order); None when none runs.
         self._fill_order: dict[int, int] | None = None
@@ -550,10 +549,10 @@ class ExpertPinnedHostCache:
     def _filling_positions(self, chunk_ids: list[int]) -> list[int]:
         """Positions in ``chunk_ids`` of prefetched rows not landed yet, in claim order.
 
-        Empty unless split gathers are enabled.
+        Empty when no prefetch runs.
         """
         order = self._fill_order
-        if not self.split_fill_gather or order is None:
+        if order is None:
             return []
         landed = self.row_fills.fill_landed()
         filling = [
@@ -1525,10 +1524,12 @@ class ExpertStreamer:
             remap = plan.remap
             source_rows = plan.source_rows
         direct = getattr(self, "residency_direct", None)
-        if direct is not None and direct.layer_fusion:
-            # One kernel for the branch below. Without a prefetch join it writes the
-            # router's own dtype, so the cast on return is a no-op; with one it keeps
-            # the int64 the branch returns.
+        if direct is not None:
+            # Send the miss lanes into victim slots instead of scratch rows, in one
+            # kernel. `expert_to_slot` is still this forward's pre-gather mapping, so
+            # its slots are exactly the rows the gather is about to read. Without a
+            # prefetch join it writes the router's own dtype, so the cast on return is
+            # a no-op; with one it keeps the int64 the branch returns.
             remap = direct.fused_gather_destinations(
                 self.residency_row,
                 remap,
@@ -1536,16 +1537,6 @@ class ExpertStreamer:
                 expert_to_slot,
                 self.row_planner.scratch_base,
                 topk_ids.dtype if prefetch_puller is None else torch.int64,
-            )
-        elif direct is not None:
-            # Send the miss lanes into victim slots instead of scratch rows.
-            # `expert_to_slot` is still this forward's pre-gather mapping, so its slots
-            # are exactly the rows the gather is about to read.
-            remap = direct.gather_destinations(
-                self.residency_row,
-                remap,
-                expert_to_slot.index_select(0, flat.long()),
-                self.row_planner.scratch_base,
             )
         if prefetch_puller is not None:
             # Join after the actual routing: `remap` and `expert_to_slot` are this
@@ -1975,7 +1966,7 @@ class ExpertStreamer:
 
     @contextlib.contextmanager
     def prefill_fills(self, source_ids: torch.Tensor) -> Iterator[None]:
-        """SGLANG_DSV41_ENABLE_PREFILL_FILLS: read tier misses while chunks gather.
+        """Prefill fills: read tier misses while chunks gather.
 
         ``source_ids`` are the layer's distinct routed experts, gathered inside this
         context. The pinned tier is held in one host use for the whole layer (one

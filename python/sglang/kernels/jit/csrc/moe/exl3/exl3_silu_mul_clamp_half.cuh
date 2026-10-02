@@ -1,7 +1,7 @@
 // REQUIRED BUILD FLAG: -use_fast_math. silu_and_mul (deepseek_v4/silu_and_mul_masked_post_quant.cuh) must compile
 // to the same instructions as in silu_and_mul_clamp's module, which builds with it; bit parity depends on that.
-// Part of the EXL3 decode cast fusion (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION): it keeps each rounding of the unfused
-// chain, in the same order, and only drops the round trips through memory.
+// Part of the EXL3 decode cast fusion: it keeps each rounding of the unfused chain, in the same order, and only
+// drops the round trips through memory.
 #pragma once
 
 #include <sgl_kernel/tensor.h>

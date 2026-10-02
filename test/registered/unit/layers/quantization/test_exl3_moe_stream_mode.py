@@ -196,26 +196,18 @@ def test_a_launch_without_a_pinned_tier_warns_once(ckpt, monkeypatch, caplog):
 
 def _fake_accumulates(monkeypatch):
     monkeypatch.setattr(
-        exl3_mod, "exl3_moe_accumulate",
-        functools.partial(exl3_ops.exl3_moe_accumulate, linear=_fake_linear),
-    )
-    monkeypatch.setattr(
         exl3_mod, "exl3_moe_accumulate_planned",
         functools.partial(exl3_ops.exl3_moe_accumulate_planned, linear=_fake_linear),
     )
 
 
-@pytest.mark.parametrize("route_plan", [False, True])
 @pytest.mark.parametrize("chunk_rows", [2, 64])
-def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows, route_plan):
+def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows):
     reference, w13, w2 = _reference(ckpt, 1)
     _fake_accumulates(monkeypatch)
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
-    with (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
-    ):
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     streamer = FakeStreamer(reference, chunk_rows)
@@ -238,7 +230,7 @@ def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows,
     assert [e for chunk in streamer.chunks for e in chunk] == [0, 1, 3, 4, 5]
     assert all(len(chunk) <= chunk_rows for chunk in streamer.chunks)
     assert trace.stats()["vram_misses"] == 5
-    assert streamer.used_host_iterator is route_plan
+    assert streamer.used_host_iterator
 
 
 def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
@@ -339,9 +331,8 @@ def _routed_inputs(topk_ids, seed=0):
     return x, topk_weights, types.SimpleNamespace(hidden_states=x, topk_output=topk)
 
 
-@pytest.mark.parametrize("route_plan", [False, True])
 @pytest.mark.parametrize("pinned_rows", [3, 6])  # evicting, and holding every expert
-def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeypatch, pinned_rows, route_plan):
+def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeypatch, pinned_rows):
     """Three chunks of at most 2 experts reuse one staging set, and a 3-row pinned
     tier evicts between them: each chunk's rows must be read through row_of_source.
     (No uncached case: that path pins host memory, which needs CUDA. The hot cache
@@ -351,7 +342,7 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
     _, w13, w2 = _reference(ckpt, 1)
     _fake_accumulates(monkeypatch)
     a, b, c, d = _streaming_env(ckpt)
-    with a, b, c, d, envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan):
+    with a, b, c, d:
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
         method.process_weights_after_loading(layer)
@@ -383,8 +374,7 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
 
     got = method.apply(layer, dispatch).hidden_states
     want = exl3_ops.exl3_moe_loop(x, topk_weights, topk_ids, w13, w2, 10.0, linear=_fake_linear)
-    path = "host" if route_plan else "device"
-    assert chunks == [(path, [0, 1]), (path, [3, 4]), (path, [5])]
+    assert chunks == [("host", [0, 1]), ("host", [3, 4]), ("host", [5])]
     assert torch.equal(got, want)
 
 
@@ -394,8 +384,7 @@ def _constant_linear(x, t, out_dtype=None):
     return torch.full((x.shape[0], t.svh.numel()), value, dtype=out_dtype or x.dtype)
 
 
-@pytest.mark.parametrize("route_plan", [False, True])
-def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch, route_plan):
+def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch):
     """Experts 0, 1, 2 add 2**24, 1 and -2**24 in fp32: ascending order gives 0, any other order gives 1 or more,
     which survives the bf16 cast. Every other parity test is blind to the order at bf16."""
     reference, w13, w2 = _reference(ckpt, 1)
@@ -403,19 +392,12 @@ def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch,
         reference["w2_svh"][expert, 0, 0] = svh0
         w2[expert].svh[0] = svh0
     monkeypatch.setattr(
-        exl3_mod, "exl3_moe_accumulate",
-        functools.partial(exl3_ops.exl3_moe_accumulate, linear=_constant_linear),
-    )
-    monkeypatch.setattr(
         exl3_mod, "exl3_moe_accumulate_planned",
         functools.partial(exl3_ops.exl3_moe_accumulate_planned, linear=_constant_linear),
     )
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
-    with (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
-    ):
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     streamer = FakeStreamer(reference, 64)
@@ -433,15 +415,12 @@ def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch,
 
 
 def test_route_plan_all_dropped_routes_give_zeros(ckpt, monkeypatch):
-    """Every route -1: no chunk is gathered and the output is zeros, as with the flag off."""
+    """Every route -1: no chunk is gathered and the output is zeros, as the per-expert loop gives."""
     reference, _, _ = _reference(ckpt, 1)
     _fake_accumulates(monkeypatch)
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
-    with (
-        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(True),
-    ):
+    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
     streamer = FakeStreamer(reference, 2)
@@ -478,8 +457,7 @@ def test_row_views_are_cached_per_buffer_and_row():
     assert tuple(EXL3_STREAMED_NAMES) == tuple(shapes)
 
 
-@pytest.mark.parametrize("route_plan", [False, True])
-def test_streamed_apply_skips_route_recording_while_capturing(monkeypatch, route_plan):
+def test_streamed_apply_skips_route_recording_while_capturing(monkeypatch):
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
     from sglang.srt.model_executor.runner_utils import capture_mode
 
@@ -506,10 +484,10 @@ def test_streamed_apply_skips_route_recording_while_capturing(monkeypatch, route
     weights = torch.ones((1, 2), dtype=torch.float32)
     ids = torch.tensor([[1, 2]])
     monkeypatch.setattr(capture_mode, "is_capture_mode", True)
-    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None, route_plan=route_plan)
+    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None)
     assert recorded == []
     monkeypatch.setattr(capture_mode, "is_capture_mode", False)
-    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None, route_plan=route_plan)
+    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None)
     assert recorded == [[1, 2]]
 
 

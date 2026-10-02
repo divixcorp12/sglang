@@ -6592,14 +6592,8 @@ the recipe leaves the variable alone. Most `SGLANG_DSV41_*` flags are parsed onc
 | `CUDA_MODULE_LOADING` | torch's `LAZY` | `EAGER` | Startup raises unless `EAGER` when the copy engine is on (~1 GiB of device memory). |
 | `SGLANG_DSV41_RAM_HIT_COPY` | `ce` | - | `ce` (DMA) or `sm` (in-graph SM copy). |
 | `SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES` | `False` | `1` | Copy engine moves only the two trellis tensors; the wait reads the four small ones. |
-| `SGLANG_DSV41_ENABLE_LAYER_FUSION` | `False` | `1` | JIT kernels replace about 89 small torch kernels per layer. |
-| `SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION` | `False` | `1` | BS1 decode cast fusion. |
-| `SGLANG_DSV41_ENABLE_LEASE_PDL` | `False` | `1` | Programmatic dependent launch for the chain kernels. |
 | `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM` | `False` | - | Shared expert and DIRECT commit on a side stream. |
-| `SGLANG_DSV41_ENABLE_PREFILL_FILLS` | `False` | `1` | Eager pinned-tier misses read by the native reader into the slabs. |
 | `SGLANG_DSV41_ENABLE_PREFILL_SHARE` | `False` | - | Bounds a prefill's pinned-tier admissions per layer. |
-| `SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN` | `False` | `1` | Eager MoE plans routes on the host. |
-| `SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER` | `False` | `1` | Prefill chunk copies resident rows before the filled ones. |
 
 ### 32.4 CPU experts (off in the recipe)
 
@@ -6664,6 +6658,12 @@ production logs the warning), and the `SGLANG_MOE_EXPERT_DOORBELL*` family. `SGL
 is retired with no deprecation entry and no read site: a launch script that sets it is ignored and gets no RAM tier,
 with only the generic one-time warning about a missing `SGLANG_MOE_PINNED_HOST_MB` (which does not name the old
 variable); use `SGLANG_MOE_PINNED_HOST_MB`.
+
+Removed 2026-10-02, now always on: `SGLANG_DSV41_ENABLE_LAYER_FUSION`, `_EXL3_CAST_FUSION` (for EXL3 layers),
+`_PREFILL_ROUTE_PLAN`, `_PREFILL_FILLS` (wherever the native slot table exists) and `_PREFILL_SPLIT_GATHER`.
+`SGLANG_DSV41_ENABLE_LEASE_PDL` is replaced by the GPU check: the lease chain uses PDL on sm_90 or newer. Production
+set all six to `1`, so its behavior is unchanged. A set value only warns. The dated sections above that name these
+flags describe them as they were.
 
 ## Sources
 

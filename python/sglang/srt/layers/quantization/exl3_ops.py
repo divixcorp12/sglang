@@ -120,7 +120,7 @@ def _exl3_dense_matmul(x2: torch.Tensor, t: Exl3Tensors) -> torch.Tensor:
 class Exl3HalfInput:
     """The fp16 copy of the latest BS1 sublayer input, published by the kernel that wrote it.
 
-    SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION: hc_combine_norm writes the sublayer input and its fp16 copy, and every
+    The EXL3 cast fusion: hc_combine_norm writes the sublayer input and its fp16 copy, and every
     EXL3 linear reading that input takes the copy instead of casting again. A consumer gets the copy only for the
     same tensor object, unmodified since the publish, on the same stream. The slot holds the object, so its memory
     cannot be reused while it is published; the next publish replaces it.

@@ -1,7 +1,8 @@
-"""SGLANG_DSV41_ENABLE_LAYER_FUSION's three kernels against the torch chains they replace, bit for bit.
+"""The layer fusion's three kernels against the torch chains they replace, bit for bit.
 
-The references are the production methods themselves (``GpuResidencyUpdater.gather_destinations`` and
-``commit_gather``, ``exl3_fused_moe.route_tables``), run on a clone of the same state. Every op in those chains is
+The references are the torch chains the fusion replaced (``GpuResidencyUpdater.gather_destinations`` and
+``commit_gather``, ``exl3_fused_moe.route_tables``), kept below as private helpers copied verbatim from the commit
+that removed them from production, run on a clone of the same state. Every op in those chains is
 integer bookkeeping or an exact conversion, so the comparison is exact equality of every output and every piece of
 residency state, dump columns included. Shapes cover the production one (six routes, six lanes) and odd ones.
 """
@@ -16,9 +17,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 READY, FREE = 3, 0
 
 
-def _updater(
-    width: int, experts: int, capacity: int, fused: bool, state: dict, streamer
-):
+def _updater(width: int, experts: int, capacity: int, state: dict, streamer):
     from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
 
     u = object.__new__(GpuResidencyUpdater)
@@ -34,10 +33,98 @@ def _updater(
     u._pending_commit = None
     for name, value in state.items():
         setattr(u, name, value.clone())
-    u.layer_fusion = fused
-    if fused:
-        u._init_layer_fusion()
+    u._init_layer_fusion()
     return u
+
+
+def _ref_gather_destinations(
+    u,
+    row: int,
+    remap: torch.Tensor,
+    route_slots: torch.Tensor,
+    scratch_base: int,
+) -> torch.Tensor:
+    """``GpuResidencyUpdater.gather_destinations`` as it ran with the layer fusion off (``self`` is ``u``)."""
+    streamer = u.streamers[row]
+    victims, valid = u.victims[row], u.victim_valid[row]
+    # A miss lane's slot is -1 and a padded column is clamped to the dump index, so
+    # only genuine hits disqualify an entry.
+    hazard = (route_slots.unsqueeze(1) == victims.unsqueeze(0)).any(dim=0)
+    order = torch.argsort((hazard | ~valid).to(torch.uint8), stable=True)
+    usable = victims.index_select(0, order)
+    usable_valid = (valid & ~hazard).index_select(0, order)
+    live = (u.gather_lanes < streamer._graph_miss_count.long()) & usable_valid
+    # Lanes past the miss count are never copied (the copy reads the same count) or
+    # remapped to. A counted lane that is not live would copy to slot 0; the full
+    # shortlist rules that out and _commit_gather counts it if it happens.
+    destinations = torch.where(live, usable, torch.zeros_like(usable))
+    streamer._graph_destination_slots.copy_(destinations.to(torch.int32))
+    u._pending_commit = (row, streamer, destinations, live)
+    # The fused planner keeps the router's native ids, so remap may be int32, but
+    # index_select takes int64 only. The caller casts the result back.
+    rank = (remap - scratch_base).clamp(min=0, max=u.miss_rows - 1).long()
+    return torch.where(remap >= scratch_base, destinations.index_select(0, rank), remap)
+
+
+def _ref_commit_gather(u) -> None:
+    """``GpuResidencyUpdater.commit_gather`` as it ran with the layer fusion off (``self`` is ``u``)."""
+    row, streamer, destinations, live = u._pending_commit
+    u._pending_commit = None
+    backend = streamer.row_backend
+    if getattr(backend, "name", None) == "exl3_ram_miss":
+        delivered = backend.delivered_count.long()
+        live = live & (u.gather_lanes < delivered) & (backend.keep[0] > 0)
+    _ref_commit_residency(u, row, streamer, destinations, live)
+
+
+def _ref_commit_residency(
+    u, row: int, streamer, destinations: torch.Tensor, live: torch.Tensor
+) -> None:
+    """``GpuResidencyUpdater._commit_gather`` as it ran with the layer fusion off (``self`` is ``u``)."""
+    experts, slot_dump = u.num_experts, u.max_capacity
+    new_experts = streamer._graph_source_rows[: u.miss_rows]
+    slots = u.slot_to_expert[row]
+    targets = torch.where(live, destinations, slot_dump)
+    evicted = live & (slots.gather(0, destinations) >= 0)
+    mapping = u.mapping[row]
+    mapping.scatter_(
+        0, torch.where(evicted, slots.gather(0, destinations), experts), -1
+    )
+    mapping.scatter_(0, torch.where(live, new_experts, experts), targets)
+    slots.scatter_(0, targets, torch.where(live, new_experts, -1))
+    u.slot_state[row].scatter_(0, targets, READY)
+    u.slot_generations[row].scatter_add_(0, targets, live.to(torch.long))
+    # ``tensor[i, j] = scalar`` stages through a pageable CPU tensor, which graph
+    # capture refuses. Fill a one-element view, which stays on the device.
+    u.slot_state[row, slot_dump : slot_dump + 1].fill_(FREE)
+    slots[slot_dump : slot_dump + 1].fill_(-1)
+    u.slot_generations[row, slot_dump : slot_dump + 1].fill_(0)
+    u.gather_insertions[row].add_(live.sum())
+    u.gather_evictions[row].add_(evicted.sum())
+    backend = streamer.row_backend
+    if getattr(backend, "name", None) == "exl3_ram_miss":
+        delivered = backend.delivered_count.long()
+        good = backend.keep[0] > 0
+        u.insertion_truncated[row].add_(((delivered > live.sum()) & good).long().sum())
+    else:
+        u.insertion_truncated[row].add_(
+            (streamer._graph_miss_count.long() > live.sum()).long().sum()
+        )
+
+
+def _ref_route_tables(remap, expert_count, ones, weights, keep):
+    """``exl3_fused_moe.route_tables``, the torch chain the fused route-tables kernel replaced."""
+    expert_count.zero_().index_add_(0, remap, ones)
+    order = torch.argsort(remap)
+    inv_order = torch.empty_like(order).scatter_(
+        0, order, torch.arange(order.numel(), device=order.device)
+    )
+    weight_sorted = (weights[order].float() * keep).to(torch.float16)
+    # A dropped layer runs no expert: nothing reads rows that may be half written.
+    expert_count.mul_((keep > 0).to(torch.int64))
+    expert_start = torch.cumsum(expert_count, 0) - expert_count
+    det = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
+    return inv_order, weight_sorted, det
 
 
 def _scenario(
@@ -193,12 +280,12 @@ def test_gather_and_commit_match_the_torch_chain(
         fused_streamer = _streamer(
             source_rows, miss_count, delivered, keep, leased, width
         )
-        ref = _updater(width, experts, capacity, False, state, ref_streamer)
-        fused = _updater(width, experts, capacity, True, state, fused_streamer)
+        ref = _updater(width, experts, capacity, state, ref_streamer)
+        fused = _updater(width, experts, capacity, state, fused_streamer)
         expert_to_slot = state["mapping"][0, :experts].contiguous()
 
-        want = ref.gather_destinations(
-            0, remap, expert_to_slot.index_select(0, flat.long()), base
+        want = _ref_gather_destinations(
+            ref, 0, remap, expert_to_slot.index_select(0, flat.long()), base
         )
         _, _, want_dest, want_live = ref._pending_commit
         for out_dtype in (id_dtype, torch.int64):
@@ -215,7 +302,7 @@ def test_gather_and_commit_match_the_torch_chain(
             ref_streamer._graph_destination_slots,
         )
 
-        ref.commit_gather()
+        _ref_commit_gather(ref)
         fused.commit_gather()
         for name in STATE:
             assert torch.equal(getattr(fused, name), getattr(ref, name)), (
@@ -245,15 +332,19 @@ def test_the_commit_leaves_cpu_lanes_unmapped_and_out_of_the_truncation_count():
         fused_streamer = _streamer(
             source_rows, miss_count, delivered, keep, True, width, cpu_lanes=cpu
         )
-        ref = _updater(width, experts, capacity, False, state, ref_streamer)
-        fused = _updater(width, experts, capacity, True, state, fused_streamer)
+        ref = _updater(width, experts, capacity, state, ref_streamer)
+        fused = _updater(width, experts, capacity, state, fused_streamer)
         expert_to_slot = state["mapping"][0, :experts].contiguous()
-        ref.gather_destinations(0, remap, expert_to_slot.index_select(0, flat.long()), base)
-        fused.fused_gather_destinations(0, remap, flat, expert_to_slot, base, torch.int64)
+        _ref_gather_destinations(
+            ref, 0, remap, expert_to_slot.index_select(0, flat.long()), base
+        )
+        fused.fused_gather_destinations(
+            0, remap, flat, expert_to_slot, base, torch.int64
+        )
         _, _, destinations, live = ref._pending_commit
         ref._pending_commit = None
         live = live & (lanes < delivered) & (keep > 0) & ~cpu_bits
-        ref._commit_gather(0, ref_streamer, destinations, live)
+        _ref_commit_residency(ref, 0, ref_streamer, destinations, live)
         fused.commit_gather()
         for name in STATE:
             assert torch.equal(getattr(fused, name), getattr(ref, name)), (
@@ -272,7 +363,7 @@ def test_captured_gather_and_commit_replay_new_inputs():
         gen, width, routes, experts, capacity
     )
     streamer = _streamer(source_rows, miss_count, delivered, keep, True, width)
-    fused = _updater(width, experts, capacity, True, state, streamer)
+    fused = _updater(width, experts, capacity, state, streamer)
     flat, remap = flat.to(torch.int32).clone(), remap.to(torch.int32).clone()
     expert_to_slot = fused.mapping[0, :experts]
 
@@ -295,11 +386,11 @@ def test_captured_gather_and_commit_replay_new_inputs():
             _scenario(gen, width, routes, experts, capacity)
         )
         ref_streamer = _streamer(new_rows, miss_count, delivered, keep, True, width)
-        ref = _updater(width, experts, capacity, False, state, ref_streamer)
-        want = ref.gather_destinations(
-            0, new_remap, state["mapping"][0, new_flat], base
+        ref = _updater(width, experts, capacity, state, ref_streamer)
+        want = _ref_gather_destinations(
+            ref, 0, new_remap, state["mapping"][0, new_flat], base
         )
-        ref.commit_gather()
+        _ref_commit_gather(ref)
         for name in (*STATE, "victims", "victim_valid"):
             getattr(fused, name).copy_(state[name])
         flat.copy_(new_flat)
@@ -337,7 +428,6 @@ def test_route_tables_match_the_torch_chain(
     routes, slots, hidden, remap_dtype, weight_dtype, x_dtype
 ):
     from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
-    from sglang.srt.layers.quantization.exl3_fused_moe import route_tables
 
     gen = torch.Generator().manual_seed(routes * 31 + slots + hidden)
     dev = "cuda"
@@ -349,7 +439,7 @@ def test_route_tables_match_the_torch_chain(
 
         count_ref = torch.full((slots + 1,), 99, dtype=torch.int64, device=dev)
         ones = torch.ones(routes, dtype=torch.int64, device=dev)
-        inv_ref, ws_ref, det_ref = route_tables(
+        inv_ref, ws_ref, det_ref = _ref_route_tables(
             remap.long(), count_ref, ones, weights, keep
         )
         x16_ref = torch.empty(1, hidden, dtype=torch.float16, device=dev).copy_(x)

@@ -96,12 +96,12 @@ def _rel(y, ref):
 
 
 @pytest.mark.parametrize("fused_in_topk", [False, True])
-def test_apply_casts_and_scales_bit_identically_with_the_cast_fusion_flag(tmp_path, fused_in_topk):
-    """Exl3MoEMethod.apply, SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION on against off: the routed output after the cast
-    to bf16 and the routed_scaling_factor, which the flag moves into one kernel."""
+def test_apply_casts_and_scales_bit_identically_to_the_unfused_chain(tmp_path, fused_in_topk):
+    """Exl3MoEMethod.apply against the unfused chain it replaced: the routed output after the cast to bf16 and the
+    routed_scaling_factor, which the cast fusion moves into one kernel. The reference is ``_apply_graph``'s own
+    bf16 output, multiplied by the factor unless it is already fused into the top-k weights."""
     from types import SimpleNamespace
 
-    from sglang.srt.environ import envs
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
 
@@ -110,25 +110,21 @@ def test_apply_casts_and_scales_bit_identically_with_the_cast_fusion_flag(tmp_pa
     config = Exl3Config.from_config(
         {"quant_method": "exl3", "version": "1.4.2", "bits": 3.02, "head_bits": 6, "codebook": "mul1"}
     )
-    methods = {}
-    for flag in (False, True):
-        with envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.override(flag):
-            methods[flag] = Exl3MoEMethod(config, streamed=True)
-        methods[flag].moe_runner_config = SimpleNamespace(
-            apply_router_weight_on_input=False, swiglu_limit=ACT_LIMIT, routed_scaling_factor=1.5
-        )
+    method = Exl3MoEMethod(config, streamed=True)
+    method.moe_runner_config = SimpleNamespace(
+        apply_router_weight_on_input=False, swiglu_limit=ACT_LIMIT, routed_scaling_factor=1.5
+    )
     gen = torch.Generator(device="cpu").manual_seed(3)
     for route in ([0, 3, 5, 1, 7, 6], [2, 4, 6, 0, 1, 3]):
         x = (torch.randn((1, HIDDEN), generator=gen) * 4).to("cuda", torch.bfloat16)
         weights = torch.softmax(torch.randn((1, TOP_K), generator=gen), -1).cuda()
         ids = torch.tensor([route], device="cuda", dtype=torch.int32)
         dispatch = SimpleNamespace(hidden_states=x, topk_output=StandardTopKOutput(weights, ids, None))
-        off = methods[False].apply(layer, dispatch).hidden_states
-        on = methods[True].apply(layer, dispatch).hidden_states
-        assert on.dtype == off.dtype == torch.bfloat16
-        assert torch.equal(on.view(torch.int16), off.view(torch.int16)), route
+        got = method.apply(layer, dispatch).hidden_states
         unscaled = Exl3MoEMethod._apply_graph(layer, layer._nvfp4_expert_streamer, x, weights, ids, ACT_LIMIT)
-        assert torch.equal(off, unscaled if fused_in_topk else unscaled * 1.5)
+        want = unscaled if fused_in_topk else unscaled * 1.5
+        assert got.dtype == want.dtype == torch.bfloat16
+        assert torch.equal(got.view(torch.int16), want.view(torch.int16)), route
 
 
 def test_captured_in_graph_moe_matches_the_eager_streamed_apply(tmp_path):

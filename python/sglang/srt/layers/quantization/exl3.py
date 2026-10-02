@@ -37,7 +37,6 @@ from sglang.srt.layers.quantization.exl3_ops import (
     exl3_gemm_bs1,
     exl3_half_input,
     exl3_linear,
-    exl3_moe_accumulate,
     exl3_moe_accumulate_planned,
     exl3_moe_loop,
 )
@@ -160,7 +159,6 @@ class Exl3LinearMethod(LinearMethodBase):
 
     def __init__(self, config: Exl3Config):
         self.config = config
-        self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
 
     def create_weights(
         self,
@@ -225,12 +223,7 @@ class Exl3LinearMethod(LinearMethodBase):
     def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        if (
-            self.cast_fusion
-            and bias is None
-            and x.dtype == torch.bfloat16
-            and x.numel() == layer.exl3_in
-        ):
+        if bias is None and x.dtype == torch.bfloat16 and x.numel() == layer.exl3_in:
             y = exl3_gemm_bs1(exl3_half_input(x), layer.exl3_tensors).to(x.dtype)
             return y.reshape(*x.shape[:-1], y.shape[-1])
         outs = [exl3_linear(x, t) for t in layer.exl3_tensors]
@@ -239,11 +232,9 @@ class Exl3LinearMethod(LinearMethodBase):
 
 
 def exl3_cast_fusion_mlp(gate_up: nn.Module, down: nn.Module) -> bool:
-    """Whether a gate_up/down MLP runs as ``exl3_swiglu_mlp`` at BS1 (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION)."""
+    """Whether a gate_up/down MLP runs as ``exl3_swiglu_mlp`` at BS1."""
     return all(
-        isinstance(linear.quant_method, Exl3LinearMethod)
-        and linear.quant_method.cast_fusion
-        for linear in (gate_up, down)
+        isinstance(linear.quant_method, Exl3LinearMethod) for linear in (gate_up, down)
     )
 
 
@@ -344,8 +335,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         self.config = config
         self.streamed = streamed
         self.moe_runner_config = None
-        self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
-        self.route_plan = envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.get()
 
     def create_weights(
         self,
@@ -489,7 +478,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         )
         x = dispatch_output.hidden_states
         if streamer is not None and streamer.serves_graph_gather(topk):
-            if self.cast_fusion and scale is not None and x.dtype == torch.bfloat16:
+            if scale is not None and x.dtype == torch.bfloat16:
                 from sglang.kernels.ops.moe.exl3_cast_fusion import exl3_scale_to_bf16
 
                 out = self._apply_graph(
@@ -516,7 +505,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 cfg.swiglu_limit,
-                route_plan=self.route_plan,
             )
         else:
             assert_not_capturing("Exl3MoEMethod.apply")
@@ -604,7 +592,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             x,
             topk_weights.reshape(-1),
             # Layer fusion takes the router's int32 remap and writes the int64 copy inside its one kernel.
-            remap.reshape(-1) if fused.layer_fusion else remap.reshape(-1).long(),
+            remap.reshape(-1),
             streamer.row_backend.keep,
             swiglu_limit,
             cpu=(
@@ -622,9 +610,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         return out.to(x.dtype) if cast else out
 
     @staticmethod
-    def _apply_streamed(
-        layer, streamer, x, topk_weights, topk_ids, swiglu_limit, route_plan=False
-    ):
+    def _apply_streamed(layer, streamer, x, topk_weights, topk_ids, swiglu_limit):
         """Routed experts gathered in chunks of distinct experts by the streamer.
 
         Routes are recorded once for the whole call; every chunk's experts run
@@ -638,45 +624,29 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if not capturing_graphs():
             # Warmup and capture forwards route dummy tokens; they must not move residency.
             streamer.record_routes(routed)
-        if route_plan:
-            # SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN: one readback before any gather of this layer, then none
-            # between a chunk's gather and its compute, so the host queues the compute behind the gather.
-            plan = Exl3RoutePlan.from_topk(topk_ids)
-            source_ids = plan.source_ids
-        else:
-            source_ids = torch.unique(routed)
+        # The route plan: one readback before any gather of this layer, then none between a chunk's gather
+        # and its compute, so the host queues the compute behind the gather.
+        plan = Exl3RoutePlan.from_topk(topk_ids)
+        source_ids = plan.source_ids
         out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         gathered = False
-        # A no-op unless SGLANG_DSV41_ENABLE_PREFILL_FILLS gave the pinned tier native fills.
+        # A no-op unless the pinned tier has native fills (prefill fills).
         with streamer.prefill_fills(source_ids):
-            if route_plan:
-                for experts, row_of_source, rows in streamer.iter_gather_experts_host(
-                    source_ids, plan.experts
-                ):
-                    gathered = True
-                    copied = torch.cuda.Event() if x.is_cuda else None
-                    if copied is not None:
-                        copied.record()
-                    w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source)
-                    exl3_moe_accumulate_planned(
-                        out, x, topk_weights, plan, w13, w2, swiglu_limit, experts
-                    )
-                    if copied is not None:
-                        # The gather reads pinned slabs the RAM-miss thread may reuse once the host use ends: wait
-                        # for it (not for the compute just queued) before the next chunk or the host use can end.
-                        copied.synchronize()
-            else:
-                for chunk, row_of_source, rows in streamer.iter_gather_experts(
-                    source_ids
-                ):
-                    gathered = True
-                    experts = chunk.tolist()
-                    w13, w2 = EXL3_ROW_VIEWS.select(
-                        rows, experts, row_of_source.tolist()
-                    )
-                    exl3_moe_accumulate(
-                        out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts
-                    )
+            for experts, row_of_source, rows in streamer.iter_gather_experts_host(
+                source_ids, plan.experts
+            ):
+                gathered = True
+                copied = torch.cuda.Event() if x.is_cuda else None
+                if copied is not None:
+                    copied.record()
+                w13, w2 = EXL3_ROW_VIEWS.select(rows, experts, row_of_source)
+                exl3_moe_accumulate_planned(
+                    out, x, topk_weights, plan, w13, w2, swiglu_limit, experts
+                )
+                if copied is not None:
+                    # The gather reads pinned slabs the RAM-miss thread may reuse once the host use ends: wait
+                    # for it (not for the compute just queued) before the next chunk or the host use can end.
+                    copied.synchronize()
         get_exl3_stream_trace().record(
             layer.layer_id,
             topk_ids,

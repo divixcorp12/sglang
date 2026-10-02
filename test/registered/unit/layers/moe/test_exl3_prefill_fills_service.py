@@ -1,6 +1,5 @@
-"""SGLANG_DSV41_ENABLE_PREFILL_FILLS wired through option C (CPU): the native slot table is the pinned tier's
-row_fills, eager reads land from the row images through the service's reader, and the flag is refused where the
-service cannot serve it."""
+"""The prefill fills wired through option C (CPU): the native slot table is the pinned tier's row_fills, eager reads
+land from the row images through the service's reader, and a layer without the native slot table gets no fills."""
 
 import contextlib
 import faulthandler
@@ -30,7 +29,7 @@ def hang_guard():
     faulthandler.cancel_dump_traceback_later()
 
 
-def _build(tmp_path, *, fills=True, device="cpu"):
+def _build(tmp_path, *, device="cpu"):
     source = tmp_path / "ckpt"
     source.mkdir()
     write_fake_exl3(str(source), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
@@ -44,7 +43,6 @@ def _build(tmp_path, *, fills=True, device="cpu"):
         (envs.SGLANG_MOE_EXPERT_ROW_SOURCE, "shards"),
         (envs.SGLANG_MOE_EXPERT_GRAPH_GATHER, True),
         (envs.SGLANG_MOE_EXPERT_MIRROR_DIRS, str(root)),
-        (envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS, fills),
     ):
         stack.enter_context(env.override(value))
     module.Exl3RamMissService._instance = None
@@ -129,24 +127,17 @@ def test_a_layers_prefetch_serves_its_chunks_and_ends_with_the_host_use(tiers, m
     assert cache.stats.populated_rows == 4  # 5 by ensure_rows, then 0, 1, 3 by the prefetch
 
 
-def test_the_flag_is_refused_without_the_native_slot_table(tmp_path):
+def test_without_graph_gather_the_tier_has_no_slot_table_and_no_row_fills(tmp_path):
+    """Only option C runs the service that reads the fills, so a layer without graph gather attaches none and
+    raises nothing."""
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS)
     layout = build_exl3_expert_layout(str(tmp_path))
     layer = torch.nn.Module()
     layer.layer_id = 0
     fmt = Exl3ExpertFormat(layout, 0, direct=False, source_root=str(tmp_path))
-    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(False), envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.override(True):
-        with pytest.raises(RuntimeError, match="GRAPH_GATHER"):
-            fmt.pinned_tier_options(layer)
-
-
-def test_without_the_flag_the_tier_has_no_row_fills(tmp_path):
-    stack, layout, source, streamers, caches = _build(tmp_path, fills=False)
-    try:
-        assert all(cache.row_fills is None for cache in caches.values())
-    finally:
-        module.Exl3RamMissService._instance = None
-        stack.close()
+    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(False):
+        options = fmt.pinned_tier_options(layer)
+    assert "slot_table" not in options and "row_fills" not in options
 
 
 if __name__ == "__main__":

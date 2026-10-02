@@ -1444,7 +1444,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
         assert_slot_rows(self, manager, self.model, "routed victim")
 
     def test_the_fused_route_planner_drives_direct_exactly_like_the_generic_one(self):
-        """`gather_destinations` takes a miss lane's rank from ``remap - scratch_base``, its expert
+        """`fused_gather_destinations` takes a miss lane's rank from ``remap - scratch_base``, its expert
         from ``_graph_source_rows[rank]`` and its liveness from ``_graph_miss_count``. Under
         SGLANG_MOE_EXPERT_FUSED_PLAN one kernel writes all three, so a drift in that layout would
         copy misses into the wrong slots. Twins, one per planner, must stay identical."""
@@ -1475,15 +1475,14 @@ class TestInsertOnMissDirect(unittest.TestCase):
                 )
         self.assertGreater(sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed")
 
-    def test_layer_fusion_with_the_miss_order_off_drives_direct_exactly_like_the_generic_planner(self):
-        """CPU experts off: the fused planner and SGLANG_DSV41_ENABLE_LAYER_FUSION's gather and commit kernels, with no
-        miss keys, must leave every mapping, slot and counter bit-identical to the generic path's."""
+    def test_fused_planner_with_the_miss_order_off_drives_direct_like_the_generic_planner(self):
+        """CPU experts off: the fused planner with the layer fusion's gather and commit kernels, with no miss keys,
+        must leave every mapping, slot and counter bit-identical to the generic planner's."""
         from sglang.srt.environ import envs
 
         generic = _manager(self.model, gpu=True, **DIRECT)
-        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
+        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
             fused = _manager(_model(), gpu=True, **DIRECT)
-        self.assertTrue(fused.gpu_residency.layer_fusion)
         self.assertIsNone(fused.gpu_residency.miss_keys)
         for streamer in fused.streamers.values():
             self.assertIsNone(streamer._plan_miss_keys)

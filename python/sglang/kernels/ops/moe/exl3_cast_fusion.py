@@ -1,4 +1,4 @@
-"""JIT wrappers for the EXL3 decode cast fusion (SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION).
+"""JIT wrappers for the EXL3 decode cast fusion.
 
 * ``exl3_silu_mul_clamp_half`` -- the shared expert's ``gate_up.to(bf16)``, ``silu_and_mul_clamp`` and the down
   projection's ``.to(fp16)`` as one kernel on exl3_gemm's fp16 output;

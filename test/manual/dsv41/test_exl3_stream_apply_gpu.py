@@ -30,8 +30,7 @@ LAYER = 1
         (1, None, [2, 0, 1]),  # all hot, slots [2,0,1]: row_of_source is [1,2,0]
     ],
 )
-@pytest.mark.parametrize("route_plan", [False, True])
-def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_experts, route_plan):
+def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_experts):
     from sglang.srt.layers.moe.exl3_expert_format import exl3_expert_layout_for
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
@@ -45,7 +44,6 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
         envs.SGLANG_DSV41_EXPERT_DIR.override(str(tmp_path)),
         envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
         envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = torch.nn.Module()
@@ -97,7 +95,7 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
     got = method.apply(layer, dispatch).hidden_states
     if max_gather_rows == 2:
         assert len(chunks) == 3
-    assert {path for path, _ in chunks} == {"host" if route_plan else "device"}
+    assert {path for path, _ in chunks} == {"host"}
 
     with open(tmp_path / "model.safetensors.index.json") as f:
         weight_map = json.load(f)["weight_map"]
@@ -117,9 +115,7 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
     assert torch.equal(got, want)
 
 
-
-@pytest.mark.parametrize("route_plan", [False, True])
-def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
+def test_many_experts_route_plan_equals_resident(tmp_path):
     """80 experts, 40 tokens x 6 routes with dropped routes: two 64-expert chunks, through
     an 8-expert hot cache and a pinned tier that holds them all. No token routes an expert twice: CUDA index_add_
     adds repeated rows atomically, in no fixed order; the CPU tests pin that case bitwise."""
@@ -137,7 +133,6 @@ def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
         envs.SGLANG_DSV41_EXPERT_DIR.override(str(tmp_path)),
         envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
         envs.SGLANG_MOE_EXPERT_FILE_READER.override("uring"),
-        envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.override(route_plan),
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = torch.nn.Module()
@@ -186,7 +181,7 @@ def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
 
 def test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands(monkeypatch):
     """The layer's host use (prefill_fills) must not end, resuming the RAM-miss service thread, while a chunk's
-    pinned-tier copy may still be reading the slabs; the flag-off path's chunk.tolist() used to guarantee that."""
+    pinned-tier copy may still be reading the slabs; the per-expert loop's chunk.tolist() used to guarantee that."""
     import contextlib
 
     from sglang.srt.layers.moe.exl3_stream_trace import Exl3StreamTrace
@@ -224,7 +219,7 @@ def test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands(monkeyp
     weights = torch.ones((2, 3), dtype=torch.float32, device="cuda")
     ids = torch.tensor([[0, 1, 2], [3, 1, 0]], dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
-    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None, route_plan=True)
+    Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None)
     assert len(gather_done) == 2 and exit_saw == [[True, True]]
 
 def _planned_inputs(experts=8, hidden=5120, inter=2304, tokens=40):

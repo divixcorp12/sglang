@@ -303,7 +303,7 @@ class DeepseekV2MLP(nn.Module):
         self.use_fused_clamp_act_mul = _is_hip
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
-        # SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION: a BS1 row runs exl3_swiglu_mlp, fp16 between the EXL3 gemvs.
+        # The EXL3 cast fusion: a BS1 row runs exl3_swiglu_mlp, fp16 between the EXL3 gemvs.
         self.exl3_cast_fusion = False
         if swiglu_limit is not None:
             from sglang.srt.layers.quantization.exl3 import exl3_cast_fusion_mlp
