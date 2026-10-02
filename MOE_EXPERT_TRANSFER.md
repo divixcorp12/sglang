@@ -80,7 +80,10 @@ The expert-streaming variables that matter for a launch. The full list, with eve
 default and the deprecated names, is in
 [`docs/docs/references/environment_variables.mdx`](docs/docs/references/environment_variables.mdx)
 ("MoE Expert Streaming" and "DeepSeek V4.1"). An explicitly set variable always wins over
-`--moe-offload-preset graph-gather`, which fills 22 of them when unset.
+`--moe-offload-preset graph-gather`, which fills 22 variables when unset (the env-var
+reference lists the 18 expert-offload ones; the other four are Qwen4 PLE and
+draft-model options). The variables
+earlier work on this path added are in "Env vars this work added" below.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -1284,7 +1287,7 @@ with `hot-cache.metrics.jsonl` (**cumulative — read the last record**).
 This document's measurements are the NVFP4 path. The EXL3 path
 (`SGLANG_DSV41_EXPERT_STREAM`) streams from NVMe through a pinned RAM tier that a
 RAM-miss service thread serves (`python/sglang/srt/layers/moe/exl3_ram_miss.py`,
-native side under `python/sglang/kernels/jit/csrc/moe/expert_stream/host/`). Two
+native side under `python/sglang/kernels/jit/csrc/moe/expert_stream/host/`). Three
 mechanisms there postdate the paths below:
 
 - **Copy engine** (`copy_engine.h`, `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE`). The
@@ -1299,7 +1302,7 @@ mechanisms there postdate the paths below:
   tier instead of being copied; with `SGLANG_DSV41_CPU_EXPERTS_MISSES` that includes
   NVMe misses once their rows land. The copy engine's job completes when its copies and
   every CPU job of the record are done.
-- **Split calibration** (`split_calibration.h`, `CpuExpertsService.calibrate`). The
+- **Split calibration** (`split_calibration.h`, `CpuExpertService.calibrate`). The
   split table comes from a measurement taken once, just before the copy engine arms: the
   device drains and the RAM thread pauses, then k CPU lanes alone, m DMA'd experts alone
   and both together are timed on one row (`SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS`

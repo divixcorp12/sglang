@@ -6661,8 +6661,9 @@ Set values warn and are ignored: `SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES`, `SGL
 `SGLANG_DSV41_ENABLE_NATIVE_PREFETCH`, `SGLANG_DSV41_RAM_MISS_HIT_WAIT_US` (`arm_env.py` still sets it to `100`, so
 production logs the warning), and the `SGLANG_MOE_EXPERT_DOORBELL*` family. `SGLANG_MOE_EXPERT_PREFETCH_PULL` and
 `SGLANG_MOE_HOT_INSERT_ON_MISS` are legacy aliases of their `_MODE` and `_STAGE` replacements. `SGLANG_DSV41_EXPERT_RAM_GIB`
-is retired with no deprecation entry and no read site: a launch script that sets it silently gets no RAM tier; use
-`SGLANG_MOE_PINNED_HOST_MB`.
+is retired with no deprecation entry and no read site: a launch script that sets it is ignored and gets no RAM tier,
+with only the generic one-time warning about a missing `SGLANG_MOE_PINNED_HOST_MB` (which does not name the old
+variable); use `SGLANG_MOE_PINNED_HOST_MB`.
 
 ## Sources
 

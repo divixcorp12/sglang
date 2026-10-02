@@ -612,11 +612,10 @@ struct HostExports {
     // Before the join: an in-flight replay's copy wait would otherwise wait for a copy thread that is gone.
     if (tier) tier->open_closed_gate();
     thread->stop();
-    // The final settle: the leases whose Done or copy completion landed after the service's last poll are released
-    // here, before ExpertStreamHost.stop writes its counters line. Here and not in RamThread::stop, which ~RamThread
-    // also runs and which could then read a lease page the Python side already freed; at this point the thread has
-    // joined and the page is still alive, because close() runs after this call. A fill still running (a stop
-    // mid-pause) is joined and its epilogue run first.
+    // The final settle: joins a prefill fill still running after a stop mid-pause and runs its epilogue, before
+    // ExpertStreamHost.stop writes its counters line. Here and not in RamThread::stop, which ~RamThread also runs and
+    // which could then touch a page the Python side already freed; at this point the thread has joined and the page
+    // is still alive, because close() runs after this call.
     if (tier) tier->final_settle();
   }
 

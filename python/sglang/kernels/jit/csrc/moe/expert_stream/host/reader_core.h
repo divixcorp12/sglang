@@ -65,9 +65,9 @@ struct SqeRecord {
 // completed, so a failure leaves at most fully packed rows in unpublished slots, never a half-packed one, and the
 // caller releases them. With piece streaming the unit is the piece: a piece is packed only once the sub-reads it
 // depends on have landed and is published only once its job is done, so a failure leaves whole published pieces, never
-// a torn one, in slots whose map the caller has not published. The caller quarantines each such slot a lane still
-// leases (its lanes may be copying those pieces) and releases the rest. Every return of read() leaves the ring empty:
-// nothing in flight, nothing prepared.
+// a torn one, in slots whose map the caller has not published. The RAM tier fail-stops on a failed demand read
+// (RamTier::fail_record), and a failed prefill fill releases the slots it did not finish packing. Every return of
+// read() leaves the ring empty: nothing in flight, nothing prepared.
 //
 // Threading. All members are used by one owner thread (the RAM-miss service thread, or the test's caller).
 //

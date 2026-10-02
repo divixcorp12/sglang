@@ -1585,7 +1585,7 @@ class ExpertStreamHost:
         )
 
     def arm_copy_engine(self, on: bool = True) -> None:
-        """Let the service publish resident lanes COPYING and copy them itself.
+        """Let the service type resident hits as copy-engine lanes and copy them itself.
 
         Applies to requests whose post allows it.
         """

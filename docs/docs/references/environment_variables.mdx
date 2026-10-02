@@ -770,7 +770,7 @@ SGLang supports various environment variables that can be used to configure its 
 
 ## MoE Expert Streaming
 
-These variables control streaming routed-expert weights from host memory or NVMe, the GPU hot-expert cache, and expert prefetch. They apply to ModelOpt NVFP4 checkpoints (`SGLANG_MOE_EXPERT_STREAM`) and to the EXL3 DeepSeek V4.1 path (`SGLANG_DSV41_EXPERT_STREAM`, see [DeepSeek V4.1](#deepseek-v41)). `--moe-offload-preset graph-gather` fills 22 of them when unset, and an explicitly set variable always wins. Most are validated at startup, and an invalid combination is refused with an error that names the variable.
+These variables control streaming routed-expert weights from host memory or NVMe, the GPU hot-expert cache, and expert prefetch. They apply to ModelOpt NVFP4 checkpoints (`SGLANG_MOE_EXPERT_STREAM`) and to the EXL3 DeepSeek V4.1 path (`SGLANG_DSV41_EXPERT_STREAM`, see [DeepSeek V4.1](#deepseek-v41)). `--moe-offload-preset graph-gather` fills 22 variables when unset (the 18 listed here plus four Qwen4 PLE and draft-model options), and an explicitly set variable always wins. Most are validated at startup, and an invalid combination is refused with an error that names the variable.
 
 ### Core streaming and expert reads
 
@@ -1428,7 +1428,7 @@ The copy engine moves RAM-resident rows to VRAM with DMA on its own thread inste
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>CUDA_MODULE_LOADING</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Must be <code>EAGER</code> when the copy engine is on; startup raises otherwise, because a kernel loaded lazily after arming can stall copies until fail-stop. Costs about 1 GiB of device memory.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>unset (torch picks </code>LAZY<code>)</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>unset (torch picks <code>LAZY</code>)</td>
     </tr>
   </tbody>
 </table>

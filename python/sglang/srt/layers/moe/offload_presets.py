@@ -6,8 +6,8 @@ settings force, and ``check_offload_config`` refuses invalid combinations at
 argument resolution, before the weight load. Everything here is pure; the
 ``arg_groups`` hook reads and writes the process state.
 
-The comments cite measurements as ``#N``, the row numbers of the table in
-MOE_EXPERT_TRANSFER.md, "Experiment results — consolidated".
+The comments cite measurements as "result #N", the row numbers of the table in
+MOE_EXPERT_TRANSFER.md, "Experiment results — consolidated" (not issue numbers).
 """
 
 from __future__ import annotations
@@ -35,10 +35,11 @@ class MoeOffloadPreset(msgspec.Struct, frozen=True, kw_only=True):
     ple_file_reader: str | None = None
     # Stage PLE rows before decode graph replay instead of breaking the graph.
     ple_stage_before_replay: bool | None = None
-    # Token embedding in pinned host memory, shared with the draft: frees 1.18 GB (#33).
+    # Token embedding in pinned host memory, shared with the draft: frees 1.18 GB (result #33).
     host_token_embedding: bool | None = None
-    # Tuned for a 32 GB RTX 5090 with Qwen3.8-Flash-Next-NVFP4 at chunk 4096 (#34);
-    # 16,384 OOMs and 15,872 leaves 66 MiB (#36). Override on any other GPU or model.
+    # Tuned for a 32 GB RTX 5090 with Qwen3.8-Flash-Next-NVFP4 at chunk 4096 (result
+    # #34); 16,384 OOMs and 15,872 leaves 66 MiB (result #36). Override on any other
+    # GPU or model.
     hot_gpu_mb: int | None = None
     # 0: the host arena replaces the pinned LRU.
     pinned_host_mb: int | None = None
@@ -60,13 +61,13 @@ class MoeOffloadPreset(msgspec.Struct, frozen=True, kw_only=True):
     gpu_residency_max_promotions: int | None = None
     # Insert-on-miss needs a boundary every decode forward.
     hot_update_decode_forwards: int | None = None
-    # 0: prefetch was rejected, -4.3% (#5).
+    # 0: prefetch was rejected, -4.3% (result #5).
     prefetch_max_candidates: int | None = None
     # JIT route planner: about 65 fewer bookkeeping kernels per layer, +6.4%.
     expert_fused_plan: bool | None = None
     # 2 (DIRECT) copies misses straight into victim slots, +4.4% over 1.
     insert_on_miss_stage: int | None = None
-    # MTP draft experts FP8 to NVFP4 at load: draft 2.46 to 1.45 GB (#30).
+    # MTP draft experts FP8 to NVFP4 at load: draft 2.46 to 1.45 GB (result #30).
     # No effect without such a draft.
     draft_moe_nvfp4_requant: bool | None = None
 
@@ -122,7 +123,7 @@ _SHARED = dict(
 
 # The best measured and the production configuration: in-graph gather, insert-on-miss
 # stage 2 and the fused planner, with overlap scheduling on. 29.30 / 29.88 tok/s median
-# at NEXTN-3 on the reference machine (RTX 5090, PCIe Gen3 x16) (#34). Needs decode
+# at NEXTN-3 on the reference machine (RTX 5090, PCIe Gen3 x16) (result #34). Needs decode
 # CUDA graphs at batch size 1; pair it with --speculative-algorithm NEXTN, which it
 # does not set.
 GRAPH_GATHER_PRESET = MoeOffloadPreset(

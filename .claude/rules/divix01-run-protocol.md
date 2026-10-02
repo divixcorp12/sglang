@@ -147,15 +147,16 @@ Every committed script under `analysis/dsv41-drive/` follows this order.
 
 ## The launch gate can validate the wrong format and pass
 
-`expert_stream_requirements_for` (`python/sglang/srt/arg_groups/expert_stream_requirements.py:160`) asks
-`expert_quant_method` for the launch's format. That returns `None` when `model_path` is not a local directory
-(`:134-136`), and `None` falls back to `NVFP4_EXPERT_STREAM_REQUIREMENTS` **silently** (`:164-166`). So a gate run
+`expert_stream_requirements_for` (`python/sglang/srt/arg_groups/expert_stream_requirements.py`) asks
+`expert_quant_method` for the launch's format. That returns `None` when `model_path` is not a local directory, and
+`None` falls back to `NVFP4_EXPERT_STREAM_REQUIREMENTS` **silently** (the first `return` in
+`expert_stream_requirements_for`). So a gate run
 against a mistyped or nonexistent model directory checks the NVFP4 rules, reports that it accepted the launch, and
 never applies any EXL3 rule -- not the breakable decode graph, not batch size 1, not the refusals of
 `SGLANG_OPT_USE_MULTI_STREAM_OVERLAP` and `SGLANG_MOE_HOT_ASYNC_PROMOTIONS`.
 
 Note the asymmetry that makes it easy to miss: an *unsupported* method raises a clear `ValueError` naming the
-supported methods (`:171-177`), so the one branch that is silent is the one that looks like success.
+supported methods (the registry miss in `expert_stream_requirements_for`), so the one branch that is silent is the one that looks like success.
 
 **This is not a bug to fix in the gate.** Returning `None` for a non-directory is deliberate: `model_path` may be a
 remote HuggingFace repo id, and raising there would refuse legitimate launches. The defect is that "could not
