@@ -235,3 +235,11 @@ def test_apply_adds_the_gpu_and_cpu_shares(monkeypatch, tmp_path):
 def test_without_the_flag_a_draft_layer_stays_on_the_default_device():
     method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=False)
     assert method.cpu_draft is False
+
+
+def test_cpu_draft_parameters_are_not_staged_to_the_gpu_for_post_load(monkeypatch, tmp_path):
+    # The loader stages CPU parameters onto the GPU around process_weights_after_loading; views taken then would
+    # keep GPU copies of every draft expert alive.
+    layer, _, _ = _cpu_draft_moe(monkeypatch, tmp_path, resident=[2])
+    for name, param in layer.named_parameters():
+        assert getattr(param, "_sglang_skip_device_loading", False), name
