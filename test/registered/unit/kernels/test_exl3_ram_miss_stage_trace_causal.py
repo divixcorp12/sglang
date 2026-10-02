@@ -259,9 +259,16 @@ NON_TRACE_CLOCK_READS = {
     # CpuExpertEngine (cpu_experts.h): one pair per CPU forward, a job of 0.5 ms or more on the CPU expert thread, off
     # the service thread; ProdBuild keeps it because the split's re-tune (cpu_stats' forward ns) reads it in serving.
     # ... and pause_ns, test only (refused on ProdBuild): one PAUSE probe on the caller's thread.
-    "const int64_t start = now_ns();": 2,
+    # ... and the startup split calibration (split_calibration.h): once, on the calibrating caller's thread with the
+    # service paused and the copy engine not armed, each run's start, its two completion stamps and its timeout.
+    "const int64_t start = now_ns();": 3,
     "compute_ns_.fetch_add(now_ns() - start, std::memory_order_relaxed);": 1,
     "return static_cast<double>(now_ns() - start) / kProbe;": 1,
+    "end = std::max(end, now_ns());": 2,
+    "if (now_ns() - start > s.timeout_ns)": 1,
+    # The native test forward (ffi_test_exports.h, test only, refused on ProdBuild): its spin, on the CPU expert thread.
+    "const int64_t until = expert_stream::now_ns() + k * test_forward_ns().load(std::memory_order_relaxed);": 1,
+    "while (expert_stream::now_ns() < until)": 1,
     # UringReader, std::chrono directly. register_resources(): the buffer registration's duration (register_ms), at
     # open and at a ring reset, never per read.
     "const auto t0 = std::chrono::steady_clock::now();": 1,
