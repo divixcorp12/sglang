@@ -339,6 +339,20 @@ class Exl3RowViews:
 EXL3_ROW_VIEWS = Exl3RowViews()
 
 
+_DRAFT_ROUTES_LOCK = threading.Lock()
+
+
+def record_draft_routes(layer_id: int, topk_ids: torch.Tensor) -> None:
+    path = envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.get()
+    if not path:
+        return
+    import json
+
+    line = json.dumps({"layer": int(layer_id), "ids": topk_ids.tolist()})
+    with _DRAFT_ROUTES_LOCK, open(path, "a") as f:
+        f.write(line + "\n")
+
+
 class Exl3MoEMethod(FusedMoEMethodBase):
     def __init__(self, config: Exl3Config, *, streamed: bool):
         self.config = config
@@ -520,6 +534,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         else:
             assert_not_capturing("Exl3MoEMethod.apply")
+            if not self.streamed:
+                record_draft_routes(layer.layer_id, topk_ids)
             out = exl3_moe_loop(
                 dispatch_output.hidden_states,
                 topk_weights,
