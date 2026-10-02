@@ -62,7 +62,7 @@ foreach(BACKEND baseline optimized)
     set(KERNEL "${QUANT}/optimized/moe_mul1.cpp")
     set(DEFAULT_WORKERS 16)
   endif()
-  add_executable(exl3_cpu_${BACKEND} cpu_forward.cpp fixture.cpp "${KERNEL}")
+  add_executable(exl3_cpu_${BACKEND} src/cpu_forward.cpp src/fixture.cpp "${KERNEL}")
   target_include_directories(exl3_cpu_${BACKEND} PRIVATE "${QUANT}/optimized")
   target_include_directories(exl3_cpu_${BACKEND} SYSTEM PRIVATE "${ATEN_INCLUDE}" "${ATEN_INCLUDE}/torch/csrc/api/include")
   target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE
@@ -75,3 +75,42 @@ foreach(BACKEND baseline optimized)
   target_link_libraries(exl3_cpu_${BACKEND} PRIVATE benchmark::benchmark OpenMP::OpenMP_CXX Threads::Threads "${TORCH_CPU}" "${C10}")
   set_target_properties(exl3_cpu_${BACKEND} PROPERTIES BUILD_RPATH "${EXL3_TORCH_ROOT}/lib")
 endforeach()
+
+# The full-stack bench (docs/superpowers/specs/2026-10-01-expert-stream-full-stack-bench-design.md). The expert-stream
+# host headers need tvm-ffi's headers (reader_base.h) and liburing; nothing loads CUDA (the copy engine's host
+# backend). Built only when EXL3_TVM_FFI_ROOT names the tvm_ffi package, so the CPU-forward bench configures as before.
+set(EXL3_TVM_FFI_ROOT "" CACHE PATH "The tvm_ffi Python package directory (include/ and lib/), for the full-stack bench")
+if(EXL3_TVM_FFI_ROOT)
+  find_path(TVM_FFI_INCLUDE tvm/ffi/function.h PATHS "${EXL3_TVM_FFI_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
+  find_path(DLPACK_INCLUDE dlpack/dlpack.h PATHS "${EXL3_TVM_FFI_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
+  find_library(TVM_FFI tvm_ffi PATHS "${EXL3_TVM_FFI_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
+  find_library(URING uring REQUIRED)
+  get_filename_component(MOE_CSRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+  if(NOT EXISTS "${MOE_CSRC}/expert_stream/host/ram_thread.h")
+    message(FATAL_ERROR "Cannot locate the expert-stream host headers: ${MOE_CSRC}")
+  endif()
+  set(FULL_STACK_SOURCES src/full_stack.cpp src/self_test.cpp src/placement.cpp src/device_sim.cpp src/row_images.cpp
+    src/stack_fixture.cpp src/fixture.cpp "${QUANT}/optimized/moe_mul1.cpp")
+  foreach(VARIANT prod instr)
+    set(TARGET exl3_full_stack_${VARIANT})
+    if(VARIANT STREQUAL "instr")
+      set(INSTR 1)
+    else()
+      set(INSTR 0)
+    endif()
+    add_executable(${TARGET} ${FULL_STACK_SOURCES})
+    target_include_directories(${TARGET} PRIVATE "${QUANT}/optimized" "${MOE_CSRC}")
+    # tvm-ffi's dlpack first: the host headers need its DLPack, not any copy under the torch include tree.
+    target_include_directories(${TARGET} SYSTEM PRIVATE "${TVM_FFI_INCLUDE}" "${DLPACK_INCLUDE}"
+      "${ATEN_INCLUDE}" "${ATEN_INCLUDE}/torch/csrc/api/include")
+    target_compile_definitions(${TARGET} PRIVATE
+      EXL3_MOE_CPU_ACT_RESIDUAL=1 EXL3_MOE_CPU_ACT_BLOCK=128
+      EXL3_FULL_STACK_INSTR=${INSTR} EXL3_BENCH_BACKEND="full-stack-${VARIANT}")
+    target_compile_options(${TARGET} PRIVATE -O3 -g)
+    target_link_libraries(${TARGET} PRIVATE benchmark::benchmark OpenMP::OpenMP_CXX Threads::Threads
+      "${TORCH_CPU}" "${C10}" "${TVM_FFI}" "${URING}")
+    set_target_properties(${TARGET} PROPERTIES BUILD_RPATH "${EXL3_TORCH_ROOT}/lib;${EXL3_TVM_FFI_ROOT}/lib")
+  endforeach()
+else()
+  message(STATUS "Full-stack bench skipped: set EXL3_TVM_FFI_ROOT to build exl3_full_stack_{prod,instr}")
+endif()

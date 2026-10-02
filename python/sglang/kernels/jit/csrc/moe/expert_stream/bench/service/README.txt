@@ -99,8 +99,8 @@ interpreter explicitly):
 
 While that file exists, the service runs it instead of run.sh; service-args.txt
 and service-rounds.txt are ignored. Remove it to return to the native benchmark.
-The job runs as dnikolaidis in the isolated partition (CPUs 18-33 and siblings
-54-69, NUMA node 1; memory nodes 0-1), with PATH=/usr/bin:/bin and working
+The job runs as dnikolaidis in the isolated partition (CPUs 16-33 and siblings
+52-69; 16-17 on NUMA node 0, 18-33 on node 1; memory nodes 0-1), with PATH=/usr/bin:/bin and working
 directory /data/models/exl3_exp/google_benchmark. It gets a fresh directory in
 EXL3BENCH_RESULTS (the journal prints it) and the CPU list in EXL3BENCH_CPUS.
 Pin its threads inside that list itself.
@@ -122,10 +122,17 @@ Verify live isolation while the benchmark runs:
   cat /sys/fs/cgroup/exl3bench.service/cpuset.cpus.partition
   cat /sys/fs/cgroup/exl3bench.service/cpuset.cpus.effective
   cat /sys/fs/cgroup/exl3bench.service/cpuset.mems.effective
-Expected: isolated, 18-33,54-69, 0-1. The cgroup may disappear after completion.
+Expected: isolated, 16-33,52-69, 0-1. The cgroup may disappear after completion.
 The benchmark checks worker affinity and saved outputs. Unit parsing and helper
 rollback/cleanup were checked before installation; actual kernel transitions and
 polkit authorization need the administrator installation/first service run.
+
+The partition holds CPUs 16-17 (and siblings 52-53) since the full-stack bench: its writer and RamThread service run
+there, on node 0, as production's service does. Starting the service moves every other thread off 16-17 and 52-53,
+including a production server's service thread pinned to 17: do not start it while the server runs. run.sh's
+benchmark still pins its workers to 18-33 (--cpus default). A changed partition needs one reinstall, with the service
+stopped:
+  sudo bash service/install.sh
 
 Administrator removal
 ---------------------
