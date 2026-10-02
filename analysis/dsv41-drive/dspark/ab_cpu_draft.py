@@ -3,7 +3,7 @@
 Eager (the EXL3 gate refuses speculation under a decode graph), one Engine per arm through trace_corpus.py, the same
 sessions. Run on divix01 from a worktree at the pushed branch, holding rowimg-disk.lock then cc-gpu.lock:
   python analysis/dsv41-drive/dspark/ab_cpu_draft.py OUTDIR [ARM ...]
-ARM is resident, cpu or routes (resident plus the draft route probe).
+ARM is resident, hybrid or routes (resident plus the draft route probe).
 """
 
 import os
@@ -18,6 +18,7 @@ import arm_env  # noqa: E402
 PYTHON = "/data/models/slang/.venv/bin/python"
 DRAFT = "/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-dspark-draft"
 SESSIONS = "/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl"
+RESIDENT = "/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-dspark/cpu-draft-routes/resident-top32.json"
 # The 2026-09-24 DSpark launch's eager overrides, less the variables §32.7 retired.
 COMMON = {
     "SGLANG_MOE_EXPERT_GRAPH_GATHER": "0",
@@ -35,10 +36,13 @@ COMMON = {
 }
 ARMS = {
     "resident": {"SGLANG_MOE_HOT_GPU_MB": "7168"},
-    "cpu": {
-        "SGLANG_MOE_HOT_GPU_MB": "14080",
+    # Each stage's top-32 experts stay on the GPU (resident-top32.json, from the routes arm's sessions 0-7); the
+    # other 288 free 4,872 MiB for the target's hot cache.
+    "hybrid": {
+        "SGLANG_MOE_HOT_GPU_MB": "12040",
         "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": "1",
         "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "18-29",
+        "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": RESIDENT,
         "EXL3_MOE_CPU_PIN": "0",
     },
     # The resident arm with the draft's topk ids logged to OUTDIR/routes.jsonl (draft_routes_report.py reads it).
@@ -59,6 +63,7 @@ def run(arm: str, outdir: str, n: int, new_tokens: int) -> int:
         "--model", arm_env.MODEL_PATH,
         "--sessions", SESSIONS,
         "--n", str(n),
+        "--skip", os.environ.get("AB_SKIP", "0"),
         "--prompt-tokens", "256",
         "--new-tokens", str(new_tokens),
         "--stop-at-eos",
