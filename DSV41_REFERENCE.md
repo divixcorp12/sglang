@@ -6548,8 +6548,8 @@ the recipe leaves the variable alone. Most `SGLANG_DSV41_*` flags are parsed onc
 | `SGLANG_MOE_EXPERT_FILE_READER` | `mmap` | `uring_direct` | `mmap`, `uring` or `uring_direct`. |
 | `SGLANG_MOE_EXPERT_MIRROR_DIRS` | `""` | three roots (nvme0, nvme4, nvme2) | `os.pathsep`-separated byte-identical checkpoint copies; non-empty reads every row from all roots at once. |
 | `SGLANG_MOE_EXPERT_MIRROR_WEIGHTS` | `""` | - | Colon-separated read shares per root (`0` drops one); empty is equal. |
-| `SGLANG_MOE_PINNED_HOST_MB` | `0` | `102400` | Pinned host tier of expert rows, in MiB. Mutually exclusive with `SGLANG_MOE_EXPERT_HOST_ARENA`. |
-| `SGLANG_MOE_PINNED_HOST_NUMA_MB` | `""` | `0:61440,1:40960` | Per-NUMA-node split of the pinned tier; must sum to `SGLANG_MOE_PINNED_HOST_MB`. |
+| `SGLANG_MOE_PINNED_HOST_MB` | `0` | `81920` | Pinned host tier of expert rows, in MiB. Mutually exclusive with `SGLANG_MOE_EXPERT_HOST_ARENA`. |
+| `SGLANG_MOE_PINNED_HOST_NUMA_MB` | `""` | `0:40960,1:40960` | Per-NUMA-node split of the pinned tier; must sum to `SGLANG_MOE_PINNED_HOST_MB`. |
 | `SGLANG_MOE_HOT_GPU_MB` | `0` | `16080` | GPU hot expert cache in MiB; counts against `--mem-fraction-static`. |
 | `SGLANG_MOE_EXPERT_GRAPH_GATHER` | `False` | `1` | Decode-sized gathers without host syncs, so CUDA graphs capture them. |
 | `SGLANG_MOE_EXPERT_FUSED_PLAN` | `False` | `1` | One fused kernel plans BS1 graph-gather routes. |
