@@ -1,4 +1,21 @@
-"""Fixed CUDA slots for frequently selected host-resident expert rows."""
+"""Fixed CUDA slots that hold the hottest expert rows of host-resident layers.
+
+An expert-streamed layer keeps its experts in host memory (or on disk) and copies the
+rows a forward routes to into CUDA scratch. This module keeps the most frequently
+selected rows resident in fixed device slots so those routes need no host copy.
+
+- ``ExpertHotCache`` owns one layer's slot tensors and the slot lifecycle
+  (FREE, RESERVED, LOADING, READY), published to the device as a slot table.
+- ``HotCachePromotion`` and ``submit_hot_cache_promotions`` stage and submit the row
+  copies that fill reserved slots, batched across layers behind one transfer ticket.
+- ``ExpertHotCacheManager`` splits one byte budget across layers, observes the
+  expert-distribution recorder after every forward, decides promotions and evictions
+  at residency boundaries, and collects the per-phase, per-layer telemetry written to
+  the metrics file.
+
+All slot updates and gathers of a cache must run on one serialized CUDA stream.
+Counters are device registers read lazily, so a forward never waits for them.
+"""
 
 from __future__ import annotations
 
@@ -58,6 +75,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+# Diagnostic switches read once at import; they only add NVTX ranges or readiness
+# samples and never change what is copied.
 _SYNC_WAIT_NVTX = os.environ.get("SGLANG_DSV41_SYNC_WAIT_NVTX") == "1"
 _PREFORWARD_READINESS_DIAGNOSTIC = (
     os.environ.get("SGLANG_MOE_PREFORWARD_READINESS_DIAGNOSTIC") == "1"
@@ -81,13 +100,19 @@ def graph_gather_scratch_rows(tokens: int, top_k: int, max_rows: int = 0) -> int
 
 @dataclass(frozen=True)
 class HotCacheUpdateStats:
+    """Experts promoted into and evicted from one cache by one update, and the bytes."""
+
     promoted_experts: int
     evicted_experts: int
     migration_bytes: int
 
 
 class HotCacheSlotState(IntEnum):
-    """Lifecycle states for a fixed expert-cache destination slot."""
+    """Lifecycle states for a fixed expert-cache destination slot.
+
+    A slot moves FREE -> RESERVED -> LOADING -> READY and returns to FREE when it is
+    cancelled or retired. Only READY slots are visible to gathers.
+    """
 
     FREE = 0
     RESERVED = 1
@@ -97,7 +122,11 @@ class HotCacheSlotState(IntEnum):
 
 @dataclass(frozen=True)
 class HotCacheSlotTicket:
-    """Generation-qualified authority to load or retire one cache slot."""
+    """Generation-qualified authority to load or retire one cache slot.
+
+    Every reservation bumps the slot's generation, so a ticket held across a retire
+    and re-reserve no longer matches and its operations are refused.
+    """
 
     slot: int
     expert_id: int
@@ -105,23 +134,30 @@ class HotCacheSlotTicket:
 
 
 class ExpertHotCache:
-    """Own stable slot tensors; reassign only between serialized gather calls.
+    """One layer's fixed expert slots, their lifecycle and their device lookup tables.
 
-    Slots and lookups live on the streamer's CUDA source device, or the current
-    CUDA device when all backing sources are on the host. Like ExpertStreamer,
-    updates and gathers must run on the same CUDA stream. Sources must remain
-    unchanged while their rows are resident in the cache.
+    Slots and lookups live on the streamer's CUDA source device, or the current CUDA
+    device when all backing sources are on the host. Like ``ExpertStreamer``, updates
+    and gathers must run on the same CUDA stream, and slots are reassigned only
+    between serialized gather calls. Sources must remain unchanged while their rows
+    are resident.
+
+    Each tensor has ``capacity`` slot rows, then ``scratch_rows`` rows that receive
+    graph-gather misses. With a non-off ``SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE`` one
+    more trailing row, at index ``capacity + scratch_rows``, is the dedicated side-pull
+    slot of ``PrefetchPuller``; its setup-time ``assert_within_allocation`` accepts
+    the row only when the allocation is exactly one row larger than the flag-off
+    shape.
+
+    The host lists ``slot_to_expert`` and ``slot_states`` are authoritative. Changes
+    are batched and mirrored to the device (``slot_state``, ``slot_generations``,
+    ``expert_to_slot``) by one pinned upload, rewritten only after the previous
+    upload has run. Copies into slots go through a transfer executor and become
+    visible only when the promotion completes.
     """
 
     def __init__(self, streamer: ExpertStreamer, capacity: int, scratch_rows: int = 0):
-        """``scratch_rows`` extra rows after the slots receive graph-gather misses.
-
-        With a non-off ``SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE``, one further trailing row is
-        appended for ``DedicatedPrefetchSlot`` (plan section 7.1): its index is
-        ``capacity + scratch_rows``, so the allocation must be exactly one row
-        larger than the flag-off shape for ``PrefetchPuller``'s setup-time
-        ``assert_within_allocation`` to accept it.
-        """
+        """Allocate ``capacity`` slots plus ``scratch_rows`` graph-gather rows."""
         capacity = index(capacity)
         scratch_rows = index(scratch_rows)
         if not 0 <= capacity <= streamer.num_experts:
@@ -222,14 +258,13 @@ class ExpertHotCache:
         return min(streamer.num_experts, budget_bytes // streamer.bytes_per_expert)
 
     def _publish_slots(self) -> None:
-        """Push host slot states, generations and the expert-to-slot mapping to the device.
+        """Push slot states, generations and the expert-to-slot map to the device.
 
-        The host lists are authoritative. One non-blocking copy of a pinned
-        ``[3, capacity]`` buffer carries each slot's state, generation and
-        mapping target: its expert when READY, otherwise a dump index past the
-        experts unique to the slot. The mapping is rebuilt on the device with
-        ``index_copy_`` and copied into ``expert_to_slot`` in place. The pinned
-        buffer is rewritten only after its previous upload has run.
+        One non-blocking copy of a pinned ``[3, capacity]`` buffer carries each
+        slot's state, generation and mapping target: its expert when READY, else a
+        dump index past the experts, unique to the slot. The map is rebuilt on the
+        device with ``index_copy_`` and copied into ``expert_to_slot`` in place. The
+        pinned buffer is rewritten only after its previous upload has run.
         """
         self._slots_dirty = False
         if getattr(self, "device_residency", None) is not None:
@@ -264,10 +299,10 @@ class ExpertHotCache:
 
     @contextmanager
     def _slot_batch(self, publish: bool = True) -> Iterator[None]:
-        """Collect lifecycle changes and publish them once as the outermost batch exits.
+        """Collect lifecycle changes; publish once when the outermost batch exits.
 
-        ``publish=False`` leaves the collected changes for an explicit
-        :meth:`_publish_slots`, including when the batch exits by an exception.
+        ``publish=False`` leaves the changes for an explicit :meth:`_publish_slots`,
+        including when the batch exits by an exception.
         """
         self._slot_batch_depth += 1
         try:
@@ -278,6 +313,7 @@ class ExpertHotCache:
                 self._publish_slots()
 
     def _set_slot_state(self, slot: int, state: HotCacheSlotState) -> None:
+        """Set a slot's host state and mark the device table stale."""
         self.slot_states[slot] = state
         self._slots_dirty = True
 
@@ -294,6 +330,7 @@ class ExpertHotCache:
     def _ticket_matches(
         self, ticket: HotCacheSlotTicket, *states: HotCacheSlotState
     ) -> bool:
+        """Whether ``ticket`` still matches its slot's generation, expert and state."""
         return (
             0 <= ticket.slot < self.capacity
             and self._slot_generations[ticket.slot] == ticket.generation
@@ -307,12 +344,11 @@ class ExpertHotCache:
         *,
         consumer_complete: bool = False,
     ) -> tuple[HotCacheSlotTicket, ...]:
-        """Reserve slots without making their destinations visible to gathers.
+        """Reserve ``(expert, slot)`` placements without exposing them to gathers.
 
-        A transfer executor may call this before issuing its six row copies, then
-        use ``begin_loading`` and ``publish_ready`` after its completion event.
-        A READY victim can only be reused when the caller confirms its last
-        consumer has completed.
+        A transfer executor may call this before issuing its six row copies, then use
+        ``begin_loading`` and ``publish_ready`` after its completion event. A READY
+        victim is reused only when the caller confirms its last consumer completed.
         """
         with self._slot_batch():
             return self._reserve(placements, consumer_complete)
@@ -320,6 +356,7 @@ class ExpertHotCache:
     def _reserve(
         self, placements: Sequence[tuple[int, int]], consumer_complete: bool
     ) -> tuple[HotCacheSlotTicket, ...]:
+        """Validate placements, retire READY victims and issue one ticket per slot."""
         assignments = tuple((index(expert), index(slot)) for expert, slot in placements)
         if len({expert for expert, _ in assignments}) != len(assignments):
             raise ValueError("hot cache expert IDs must be unique")
@@ -416,9 +453,9 @@ class ExpertHotCache:
     def _load_reserved(self, tickets: Sequence[HotCacheSlotTicket]) -> None:
         """Copy one reserved placement bundle before publishing any slot mapping.
 
-        Tensors without a dense source are read by the streamer's row source:
-        through the pinned host tier in chunks of its capacity when the layer
-        has six tensors and a pinned tier, else one row at a time into staging.
+        Tensors without a dense source are read by the streamer's row source: through
+        the pinned host tier in chunks of its capacity when the layer has six tensors
+        and a pinned tier, else one row at a time into staging.
         """
         if not tickets:
             return
@@ -463,29 +500,27 @@ class ExpertHotCache:
     ) -> None:
         """Promote tickets through the pinned tier, one chunk per transfer.
 
-        Each chunk holds at most ``pinned_cache.evictable_rows()`` tickets,
-        read when the chunk starts: an inclusive ``is_pinned`` protects the
-        rows the hot cache has reserved, so every admitted chunk can shrink the
-        room for the next. Each chunk's rows are admitted to the pinned tier,
-        copied from its slabs, and waited for on the host before the next chunk
-        may evict them. When no slot is evictable, the remaining tickets are
-        cancelled and the call raises.
+        Each chunk holds at most ``pinned_cache.evictable_rows()`` tickets, read when
+        the chunk starts: an inclusive ``is_pinned`` protects the rows the hot cache
+        has reserved, so every admitted chunk can shrink the room for the next. A
+        chunk's rows are admitted to the pinned tier, copied from its slabs, and
+        waited for on the host before the next chunk may evict them. When no slot is
+        evictable, the remaining tickets are cancelled and the call raises.
 
         If a chunk fails, the tickets after it are cancelled, and so is its own
-        promotion if it is still in flight. A failed ``_prepare_promotion`` or
-        submission has already cancelled its own tickets. Once copies were
-        submitted, their slots are freed only after the device has drained
-        them. If the device cannot drain (a sticky CUDA error), the promotion
-        stays in flight with its slots LOADING. ``stage_reassign`` then refuses
-        further updates, so no later reservation can reuse a slot a copy may
-        still write.
+        promotion if still in flight (a failed ``_prepare_promotion`` or submission
+        has already cancelled its own). Slots of submitted copies are freed only
+        after the device has drained them. If it cannot drain (a sticky CUDA error),
+        the promotion stays in flight with its slots LOADING and ``stage_reassign``
+        refuses further updates, so no reservation can reuse a slot a copy may still
+        write.
         """
         tickets = tuple(tickets)
         start = 0
         while start < len(tickets):
-            # One host use from sizing the chunk to its completed copy: a slot
-            # table with an owner (a native reader thread) must not move the
-            # chunk's pinned rows while the promotion reads them.
+            # Hold one host use from sizing the chunk to its completed copy: a slot
+            # table with an owner (a native reader thread) must not move the chunk's
+            # pinned rows while the promotion reads them.
             with (
                 (
                     torch.cuda.nvtx.range("dsv41.hot_cache.host_use")
@@ -531,7 +566,7 @@ class ExpertHotCache:
         self.wait_for_slot_publication()
 
     def _drain_device(self) -> bool:
-        """Wait until every queued copy on the cache's device has run; False if it cannot."""
+        """Wait for every queued copy on the cache's device; False if it cannot."""
         try:
             torch.cuda.synchronize(self.device)
         except Exception:
@@ -545,7 +580,10 @@ class ExpertHotCache:
     def _copy_routes_for(
         self, sources: Mapping[str, torch.Tensor], use_secondary: Sequence[bool]
     ) -> ExpertRowCopyRoutes:
-        """Routes validated once per backend, secondary selection and source storage."""
+        """Copy routes, validated once per backend, secondary selection and sources.
+
+        The memo holds at most four entries and is cleared when full.
+        """
         key = (
             self.copy_backend,
             tuple(use_secondary),
@@ -588,8 +626,8 @@ class ExpertHotCache:
             use_secondary_source_rows = [False] * len(self.streamer.tensor_names)
             pinned_cache = self.streamer.pinned_host_cache
             if pinned_cache is not None and pinned_cache.cached_names:
-                # Admission and the slot read share one host use, so the slots
-                # read are the ones ensure_rows filled.
+                # One host use covers admission and the slot read, so the slots read
+                # are the ones ensure_rows filled.
                 with pinned_cache.host_use():
                     pinned_cache.ensure_rows(
                         torch.tensor(expert_rows, device=self.device)
@@ -635,12 +673,13 @@ class ExpertHotCache:
         return promotion
 
     def _cancel_tickets(self, tickets: Sequence[HotCacheSlotTicket]) -> None:
+        """Cancel every ticket and publish the freed slots once."""
         with self._slot_batch():
             for ticket in tickets:
                 self.cancel(ticket)
 
     def abort_promotion(self, promotion: HotCachePromotion) -> None:
-        """Cancel a promotion whose copies were never submitted and publish the slots."""
+        """Cancel a promotion whose copies were never submitted; publish the slots."""
         if self.promotion_in_flight is promotion:
             self.promotion_in_flight = None
         self._cancel_tickets(promotion.tickets)
@@ -823,7 +862,13 @@ class ExpertHotCache:
 
 @dataclass(eq=False)
 class HotCachePromotion:
-    """One cache's reserved slots whose rows are staged but not yet published."""
+    """One cache's reserved slots whose rows are staged but not yet published.
+
+    ``source_rows`` and ``destination_slots`` are parallel lists of the rows to copy
+    and the slots receiving them. ``secondary_source_rows`` is set when some tensors
+    are read from the pinned host tier instead of their backing source.
+    ``submission`` is filled in by :func:`submit_hot_cache_promotions`.
+    """
 
     cache: ExpertHotCache
     tickets: tuple[HotCacheSlotTicket, ...]
@@ -896,15 +941,15 @@ def normalize_expert_frequency_seed(data: Mapping[str, Any]) -> torch.Tensor:
 
 @dataclass
 class _OperationalCounters:
-    """One phase/layer's cumulative telemetry.
+    """One phase/layer's cumulative telemetry, in rows, bytes and nanoseconds.
 
-    ``miss_rows`` is the total count of physical host-copy rows: every row
-    actually copied to serve this layer, whether through the ordinary demand
-    path (``unique_missed`` routes with no resident slot) or delivered ahead
-    of routing by the one-row side-stream pull (``side_pull_rows``), useful or
-    wasted. ``unique_miss_rows`` and ``routed_miss_rows`` stay logical counts
-    of distinct and routed actual misses and never include a side-pull row
-    that a miss did not itself require crossing the demand path for.
+    ``miss_rows`` counts physical host-copy rows: every row actually copied to serve
+    this layer, whether through the ordinary demand path (routes with no resident
+    slot) or delivered ahead of routing by the one-row side-stream pull
+    (``side_pull_rows``), useful or wasted. ``unique_miss_rows`` and
+    ``routed_miss_rows`` stay logical counts of distinct and routed actual misses;
+    they never include a side-pull row that a miss did not itself require.
+    Fields typed ``int | None`` are ``None`` when the source cannot attribute them.
     """
 
     requested_rows: int = 0
@@ -962,6 +1007,7 @@ def _add_host_read_counters(counters: _OperationalCounters, stats: Any) -> None:
     counters.host_split_ns += getattr(stats, "host_split_ns", 0)
 
 
+# Telemetry phase of each forward kind; idle forwards count as decode.
 _PHASES = {
     ForwardKind.PREFILL: "prefill",
     ForwardKind.DECODE: "decode",
@@ -970,6 +1016,7 @@ _PHASES = {
 }
 
 
+# Device trace registers that carry insert-on-miss counts.
 _INSERTION_TRACE_NAMES = (
     "gpu_residency:insertions",
     "gpu_residency:insertion_evictions",
@@ -980,7 +1027,10 @@ _INSERTION_TRACE_NAMES = (
 def _add_insertions(
     entry: dict[str, Any], device: Mapping[str, list], row: int
 ) -> None:
-    """Report a layer's insert-on-miss copies with its decode counters; they are device rows, not migrations."""
+    """Add a layer's insert-on-miss copies to its decode counters.
+
+    They are device-side row copies, not host-to-device migrations.
+    """
     entry["insertions"] = entry.get("insertions", 0) + device["insertions"][row]
     entry["insertion_evictions"] = (
         entry.get("insertion_evictions", 0) + device["insertion_evictions"][row]
@@ -988,12 +1038,22 @@ def _add_insertions(
 
 
 class ExpertHotCacheManager:
-    """Allocate a global slot budget and observe the recorder after each forward.
+    """Split a global slot budget across layers; observe the recorder every forward.
+
+    Built once per model by :meth:`from_model`, which picks each layer's resident
+    experts from a frequency seed and creates one ``ExpertHotCache`` per layer.
+    ``on_expert_distribution`` then runs after every forward: it folds fresh gather
+    statistics into per-phase, per-layer counters and, at residency boundaries,
+    advances scores and promotes or evicts experts, optionally asynchronously.
 
     Routing counts are borrowed synchronously, never retained or counted again.
-    Placement and gathers must share the streamer's serialized CUDA stream.
-    Startup may set each layer's `_nvfp4_file_source_bytes_per_expert` to enable
-    exact file attribution; absent metadata is reported as unknown, not guessed.
+    Placement and gathers must share the streamer's serialized CUDA stream. Startup
+    may set each layer's ``_nvfp4_file_source_bytes_per_expert`` to enable exact
+    file attribution; absent metadata is reported as unknown, not guessed.
+
+    Trace output is bounded: telemetry pools have a fixed number of slots, one
+    background thread writes records in sequence order, and optional records are
+    dropped rather than queued behind a delayed D2H copy or a slow disk.
     """
 
     @classmethod
@@ -1030,11 +1090,10 @@ class ExpertHotCacheManager:
         forward after the copies complete, and a layer with copies in flight
         skips later boundaries until they land.
 
-        ``graph_gather_batch_size`` > 0 is the tokens of the largest graph
-        forward; it reserves ``graph_gather_scratch_rows(tokens, top_k,
-        graph_gather_max_rows)`` scratch rows per layer from the budget and
-        enables each streamer's sync-free graph gather for routes of at most
-        that many rows.
+        ``graph_gather_batch_size`` > 0 is the tokens of the largest graph forward;
+        it reserves ``graph_gather_scratch_rows(tokens, top_k,
+        graph_gather_max_rows)`` scratch rows per layer from the budget and enables
+        each streamer's sync-free graph gather for routes of at most that many rows.
         ``update_decode_forwards`` > 0 also updates dynamic residency after every
         that many decode or speculative verify forwards, so a long decode is not
         served by the set the last long prefill chose.
@@ -1042,10 +1101,10 @@ class ExpertHotCacheManager:
         instead of once per boundary, and ``promotion_sigmas`` adds that many
         standard deviations of count noise to the lead a promotion needs; see
         :class:`ExpertResidencyPolicy`.
-        ``insert_on_miss`` is an :class:`InsertOnMissStage` and defaults with
-        ``insert_on_miss_decay`` to ``SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE`` and its
-        decay; see :class:`GpuResidencyUpdater`. Stage DIRECT reserves no
-        graph-gather scratch at all, because its gathers copy into victim slots.
+        ``insert_on_miss`` is an :class:`InsertOnMissStage` and, with
+        ``insert_on_miss_decay``, defaults to ``SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE``
+        and its decay; see :class:`GpuResidencyUpdater`. Stage DIRECT reserves no
+        graph-gather scratch, because its gathers copy into victim slots.
         ``fused_insert`` defaults to ``SGLANG_MOE_HOT_FUSED_INSERT`` and runs
         stage SCRATCH's boundary copies through the fused masked kernel; it is
         byte-identical to the index copy it replaces and only changes its cost.
@@ -1077,10 +1136,10 @@ class ExpertHotCacheManager:
                     "insert-on-miss decay (SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY) must be in (0, 1]"
                 )
         if fused_insert and insert_on_miss != InsertOnMissStage.SCRATCH:
-            # The fused kernel replaces stage SCRATCH's boundary copy loop and nothing else:
-            # stage OFF has no such loop, and stage DIRECT lands its copies in the gather. A
-            # run that sets this flag anywhere else would report a fused arm having measured
-            # the unfused path, so refuse instead of accepting it as a no-op.
+            # The fused kernel replaces only stage SCRATCH's boundary copy loop: stage
+            # OFF has no such loop and stage DIRECT copies inside the gather. Elsewhere
+            # the flag would be a silent no-op, and a "fused" run would have measured
+            # the unfused path, so refuse it.
             raise ValueError(
                 "SGLANG_MOE_HOT_FUSED_INSERT only applies to "
                 f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE={int(InsertOnMissStage.SCRATCH)} "
@@ -1174,14 +1233,14 @@ class ExpertHotCacheManager:
                 if graph_gather_batch_size
                 else 0
             )
-        # A DIRECT gather lands its misses in victim slots, so it needs the same route width
-        # but none of the rows: those rows go back to the budget as residency.
+        # A DIRECT gather lands its misses in victim slots: it needs the same route
+        # width but none of the scratch rows, which go back to the budget as residency.
         direct = insert_on_miss == InsertOnMissStage.DIRECT
         scratch_rows = {
             layer_id: 0 if direct else rows for layer_id, rows in gather_rows.items()
         }
-        # The tiers fill in the loop below, before enable_graph_gather: a format that stages per post learns the
-        # gather width now.
+        # Runs before enable_graph_gather so a format that stages per post learns the
+        # gather width first.
         for layer_id, rows in gather_rows.items():
             plan = getattr(streamers[layer_id].format, "plan_graph_gather", None)
             if rows and plan is not None:
@@ -1195,11 +1254,10 @@ class ExpertHotCacheManager:
             rows * streamers[layer_id].bytes_per_expert
             for layer_id, rows in scratch_rows.items()
         )
-        # Graph-gather scratch makes a cache allocation unconditional. Reserve its
-        # dedicated side-pull row before considering any resident slots. For a
-        # layer without scratch, its first resident slot pays for the same row
-        # atomically below, so a selection can never overcommit the physical
-        # cache allocation by one expert row.
+        # Graph-gather scratch makes a cache allocation unconditional, so reserve the
+        # side-pull row before any resident slot. A layer without scratch pays for
+        # that row with its first resident slot below, so a selection never
+        # overcommits the physical allocation by one expert row.
         if pull_row_enabled:
             remaining -= sum(
                 streamers[layer_id].bytes_per_expert for layer_id in allocated_layers
@@ -1208,11 +1266,11 @@ class ExpertHotCacheManager:
             raise ValueError(
                 "expert hot cache budget cannot hold the graph-gather scratch and pull rows"
             )
-        # DIRECT refuses any layer holding fewer than twice its gather rows (see
+        # DIRECT refuses a layer holding fewer than twice its gather rows (see
         # `_init_insert_direct`), so a seed that scores one layer low would refuse the
-        # whole budget. Give every layer that floor from its own best experts first; the
-        # scores then spend the rest. When every layer clears the floor anyway, the
-        # selection is unchanged: each layer's picks are its top-scored experts either way.
+        # whole budget. Give every layer that floor from its own best experts first and
+        # let the scores spend the rest; if every layer clears the floor anyway, the
+        # selection is unchanged.
         floors = {
             layer_id: 2 * rows if direct else 0
             for layer_id, rows in gather_rows.items()
@@ -1225,8 +1283,8 @@ class ExpertHotCacheManager:
                     f"required capacity {floor}"
                 )
         chosen = {layer_id: set() for layer_id in streamers}
-        # A format with an inclusive pinned tier keeps every hot expert in host memory
-        # too, so its layers hold at most `inclusive_hot_slot_limit` slots and the
+        # A format with an inclusive pinned tier also keeps every hot expert in host
+        # memory, so its layers hold at most `inclusive_hot_slot_limit` slots and the
         # budget they cannot use goes to other layers. Other formats have no limit.
         slot_limits = {
             layer_id: inclusive_hot_slot_limit(streamer)
@@ -1354,9 +1412,9 @@ class ExpertHotCacheManager:
         }
         manager._layer_index = {}
         manager._registers = {}
-        # Route history and its dense affinity matrix are observer work, not
-        # residency input.  Start them only when an on-disk trace consumes
-        # them; next-layer prefetch enables both before its first forward.
+        # Route history and the dense affinity matrix are observer work, not residency
+        # input: collected only when a trace file consumes them, or when next-layer
+        # prefetch enables both before its first forward.
         manager._collect_route_history = manager.metrics_path is not None
         manager._collect_affinity = manager.metrics_path is not None
         manager._gathered_zero_masks = {}
@@ -1365,30 +1423,30 @@ class ExpertHotCacheManager:
         manager._side_pull_snapshots = {}
         manager._last_side_pull_totals = {}
         manager._last_observer_mode = None
-        # Unlike `residency_policies`, a `PrefetchPuller` cannot be populated here:
-        # it is built from this manager's own `caches` by `PrefetchScoring`, which
-        # runs after `from_model` returns. See `register_prefetch_puller`.
+        # Unlike `residency_policies`, the `PrefetchPuller` cannot be built here: it
+        # is built from this manager's `caches` by `PrefetchScoring` after `from_model`
+        # returns. See `register_prefetch_puller`.
         manager._prefetch_puller = None
-        # The profiling-only calibration observer is also constructed after the
-        # caches. It deliberately has a separate registration: profiling runs
-        # use pull mode off and therefore have no PrefetchPuller to piggyback on.
+        # The profiling-only calibration observer is also built after the caches and
+        # registered separately: profiling runs use pull mode off, so there is no
+        # PrefetchPuller to piggyback on.
         manager._prefetch_calibration = None
-        # Trace schemas grow only when a new serving phase first creates its
-        # device registers.  Keep an independent fixed-slot pool per schema so
-        # adding that optional phase never waits for an older trace to drain.
+        # A trace schema grows when a new serving phase first creates its device
+        # registers. One independent fixed-slot pool per schema keeps that optional
+        # phase from waiting for an older trace to drain.
         manager._trace_telemetry: dict[
             tuple[tuple[str, tuple[int, ...], str], ...], AsyncTelemetry
         ] = {}
         manager._trace_write_condition = threading.Condition()
         manager._trace_sequence = 0
         manager._trace_next_write = 0
-        # Inclusive sorted ranges keep a stalled earliest write from retaining
-        # one Python object per later dropped trace.
+        # Inclusive sorted ranges: a stalled earliest write must not retain one
+        # Python object per later dropped trace.
         manager._trace_skipped: list[tuple[int, int]] = []
         manager._trace_ready: dict[int, tuple[Path, str]] = {}
-        # Completed snapshots may arrive out of order across the fixed telemetry
-        # pools.  Bound their host staging too: optional records drop rather
-        # than accumulating behind one delayed D2H event or a slow disk.
+        # Completed snapshots can arrive out of order across the telemetry pools.
+        # Host staging is bounded too: optional records drop rather than pile up
+        # behind one delayed D2H event or a slow disk.
         manager._trace_reorder_limit = 4
         manager._trace_flush_active = False
         manager._trace_drain_thread: threading.Thread | None = None
@@ -1444,9 +1502,9 @@ class ExpertHotCacheManager:
             "Expert hot cache startup %s",
             json.dumps(
                 {
-                    # The stage the process actually resolved, not the one a launcher meant to
-                    # ask for: a matrix verifies this line, so an intent/behaviour mismatch
-                    # (a retired alias, a typo) fails verification instead of a later number.
+                    # Log the stage the process resolved, not the one a launcher meant to
+                    # ask for, so a mismatch (a retired alias, a typo) fails verification
+                    # of this line instead of skewing a later number.
                     "insert_on_miss_stage": InsertOnMissStage(insert_on_miss).name,
                     "fused_insert": fused_insert,
                     "requested_bytes": budget_bytes,
@@ -1553,8 +1611,8 @@ class ExpertHotCacheManager:
                 return
             ready = bool(torch.cuda.current_stream(cache.device).query())
         except Exception:
-            # Diagnostics must not change serving behavior when the query is
-            # unavailable (for example during stream teardown).
+            # Diagnostics must not change serving when the query is unavailable (for
+            # example during stream teardown).
             values["query_errors"] += 1
             return
         values["samples"] += 1
@@ -1589,8 +1647,8 @@ class ExpertHotCacheManager:
                         event_ready and ready
                     )
             except Exception:
-                # An event query is diagnostic only; retain the actual serving
-                # stream sample and leave async-residency state untouched.
+                # The query is diagnostic only: keep the serving-stream sample and
+                # leave async-residency state untouched.
                 values["pending_event_query_errors"] += 1
             if event_ready and ready and not self._pre_forward_pending_first_ready:
                 polls = self._pre_forward_pending_polls
@@ -1663,7 +1721,7 @@ class ExpertHotCacheManager:
             logger.exception("Failed to write pre-forward readiness diagnostic")
 
     def _periodic_pre_forward_readiness_flush(self) -> None:
-        """Persist aggregates off the forward path in case engine children are SIGKILLed."""
+        """Persist aggregates off the forward path in case children are SIGKILLed."""
         while not self._pre_forward_readiness_stop.wait(1.0):
             self.write_pre_forward_readiness()
 
@@ -1673,8 +1731,8 @@ class ExpertHotCacheManager:
         if max_candidates <= 0:
             return
         # The prefetch policy consumes the route tables, including the dense
-        # adjacent-layer affinity relation.  This happens during setup, before
-        # any observer forward can allocate registers.
+        # adjacent-layer affinity relation. Enable collection during setup, before
+        # any observer forward allocates registers.
         self._collect_route_history = True
         self._collect_affinity = True
         policy = SparseNextLayerPolicy(max_candidates)
@@ -1746,6 +1804,7 @@ class ExpertHotCacheManager:
     def _record_update(
         self, layer_id: int, update: HotCacheUpdateStats, phase: str = "prefill"
     ) -> None:
+        """Add an update's promotions, evictions and copy submission to the counters."""
         counters = self._counters[phase][layer_id]
         counters.promotions += update.promoted_experts
         counters.evictions += update.evicted_experts
@@ -1792,10 +1851,9 @@ class ExpertHotCacheManager:
     def register_prefetch_puller(self, puller: Any) -> None:
         """Register the side-stream ``PrefetchPuller`` built from this manager's caches.
 
-        Built later than this manager (``PrefetchScoring`` needs ``self.caches``
-        first), so it cannot be populated internally at construction the way
-        ``residency_policies`` is; call this once it exists, before the first
-        ``discard_graph_capture_routes`` or metrics read that should see it.
+        The puller is built after this manager, so call this once it exists and
+        before the first ``discard_graph_capture_routes`` or metrics read that
+        should see it.
         """
         self._prefetch_puller = puller
 
@@ -1813,9 +1871,9 @@ class ExpertHotCacheManager:
         exactly like a real forward's, so it is purged here too.
         """
         if getattr(self, "_async_residency_pending", None) is not None:
-            # Capture reset is outside serving. Keep the pinned buffer alive
-            # until its queued D2H copy finishes, then discard both the captured
-            # score decision and any newer boundary waiting to be resampled.
+            # Capture reset is outside serving: keep the pinned buffer alive until its
+            # queued D2H copy finishes, then drop both the captured score decision and
+            # any newer boundary waiting to be resampled.
             self._async_residency_backend.synchronize(self._async_residency_event)
             self._async_residency_pending = None
         self._async_residency_refresh = None
@@ -1842,9 +1900,9 @@ class ExpertHotCacheManager:
         self.finish_promotions()
         if getattr(self, "gpu_residency", None) is not None:
             self.gpu_residency.reset_after_capture(self._boundary_clock)
-        # Warmup and capture forwards replaced each layer's last gather stats and
-        # admitted pinned rows. Start the eager counters from here, so the first
-        # real forward counts only its own.
+        # Warmup and capture replaced each layer's last gather stats and admitted
+        # pinned rows. Restart the eager counters here so the first real forward
+        # counts only its own.
         for layer_id, streamer in self.streamers.items():
             self._last_gather[layer_id] = streamer.last_gather_stats
             self._last_pinned_cache_stats[layer_id] = self._pinned_cache_stats(streamer)
@@ -1859,11 +1917,10 @@ class ExpertHotCacheManager:
         self.fail_stop_checks.append(check)
 
     def _attach_formats(self) -> None:
-        """Offer the finished manager to each streamed format that asks for it
-        (``attach_hot_cache_manager(manager, streamer)``).
+        """Offer the finished manager to each streamed format that asks for it.
 
-        Runs once per manager; later calls return at once, so hooks never
-        register their checks twice.
+        A format opts in with ``attach_hot_cache_manager(manager, streamer)``. Runs
+        once per manager, so hooks never register their checks twice.
         """
         if getattr(self, "_formats_attached", False):
             return
@@ -1884,7 +1941,7 @@ class ExpertHotCacheManager:
             check()
 
     def finish_promotions(self) -> None:
-        """Publish every in-flight promotion, ordering the current stream behind its copies.
+        """Publish every in-flight promotion, ordering the stream behind its copies.
 
         The host does not block; slots are published on the device after the
         copies. Call before shutdown or anything that must see a settled cache.
@@ -1892,7 +1949,7 @@ class ExpertHotCacheManager:
         self._publish_completed_promotions(wait=True)
 
     def _publish_completed_promotions(self, wait: bool) -> None:
-        """Publish in-flight promotions whose copies landed, or all of them with ``wait``."""
+        """Publish promotions whose copies landed, or all of them with ``wait``."""
         pending = []
         for ticket, promotions in self._inflight_promotions:
             cache = promotions[0].cache
@@ -1907,7 +1964,7 @@ class ExpertHotCacheManager:
         self._inflight_promotions = pending
 
     def _update_residency(self, boundary_tokens: int | None, mode: str) -> None:
-        """Advance every layer's scores, decide together and copy all promotions at once.
+        """Advance every layer's scores, decide together, copy all promotions at once.
 
         Scores advance by fused launches. The ordinary path reads them on the
         host at this boundary; the async path queues a pinned snapshot and
@@ -1925,14 +1982,15 @@ class ExpertHotCacheManager:
             if self._async_residency_pending is None:
                 self._enqueue_residency_scores(mode, clock.forwards)
             else:
-                # Every boundary still advances device scores. A single owned
-                # pinned buffer stays with the earlier copy until it is used;
-                # the later boundary is then resampled from the latest scores.
+                # Every boundary advances device scores, but the single pinned buffer
+                # stays with the earlier copy until it is used; the later boundary
+                # is then resampled from the latest scores.
                 self._async_residency_refresh = (mode, clock.forwards)
             return
         self._apply_residency_decisions(layers, mode, clock.forwards)
 
     def _enqueue_residency_scores(self, mode: str, boundary_forward: int) -> None:
+        """Queue a pinned D2H snapshot of every layer's scores for a later decision."""
         policies = [
             self.residency_policies[layer_id]
             for layer_id in self._layer_ids
@@ -1955,6 +2013,10 @@ class ExpertHotCacheManager:
         self._async_residency_pending = (mode, boundary_forward)
 
     def _poll_async_residency_scores(self) -> None:
+        """Apply the queued score snapshot once its copy has landed.
+
+        Never blocks. A boundary that arrived meanwhile is then resampled.
+        """
         pending = self._async_residency_pending
         if pending is None or not self._async_residency_backend.ready(
             self._async_residency_event
@@ -1981,6 +2043,12 @@ class ExpertHotCacheManager:
         boundary_forward: int,
         score_rows: list[torch.Tensor] | None = None,
     ) -> None:
+        """Decide, stage and submit promotions for layers past their residence floor.
+
+        Layers with a promotion in flight are deferred. Decisions read ``score_rows``
+        (a host snapshot) when given, else the device scores. Synchronous mode waits
+        for the copies; async mode records them as in flight.
+        """
         deciding = []
         deciding_scores = []
         for position, layer in enumerate(layers):
@@ -2124,15 +2192,15 @@ class ExpertHotCacheManager:
                 routed[:-1].unsqueeze(2), routed[1:].unsqueeze(1)
             )
         if any(eager_gathered):
-            # Eager fallback owns a host list, so retain its one-shot pinned
-            # transfer. Reusing that host storage without an ownership event
-            # would race the preceding asynchronous H2D copy.
+            # The eager fallback owns a host list, so keep its one-shot pinned transfer:
+            # reusing that storage without an ownership event would race the
+            # preceding asynchronous H2D copy.
             gathered = torch.tensor(eager_gathered, dtype=torch.bool)
             if device.type == "cuda":
                 gathered = gathered.pin_memory().to(device, non_blocking=True)
         elif self._graph_counters is not None:
-            # Graph replay already maintains this device-visible truth. This
-            # common path avoids the per-forward pinned mask and device temp.
+            # Graph replay already maintains this device-visible state; skipping the
+            # mask avoids a per-forward pinned buffer and device temporary.
             gathered = self._gathered_zero_masks.get(device)
             if gathered is None:
                 gathered = torch.empty(
@@ -2242,8 +2310,8 @@ class ExpertHotCacheManager:
                     "gpu_residency:truncated_layers": updater.truncated,
                 }
             )
-            # Through the same accessor snapshot() uses: this is the path that fills
-            # hot-cache.metrics.jsonl, and the stages hold these counters in different tensors.
+            # Use the accessor snapshot() uses: it feeds hot-cache.metrics.jsonl, and
+            # the insert-on-miss stages hold these counters in different tensors.
             sources.update(
                 {
                     f"gpu_residency:{name}": counter
@@ -2411,8 +2479,8 @@ class ExpertHotCacheManager:
             }
             encoded = json.dumps(trace, sort_keys=True) + "\n"
         except Exception:
-            # Formatting is optional work too.  Release this sequence so a
-            # later completed snapshot never waits behind a bad record.
+            # Formatting is optional work too: release this sequence so a later
+            # snapshot never waits behind a bad record.
             logger.exception("Could not format optional telemetry trace")
             self._skip_trace_sequence(sequence)
             return
@@ -2425,8 +2493,8 @@ class ExpertHotCacheManager:
                     self._advance_trace_sequence()
                     self._trace_write_condition.notify_all()
                     return
-                # Prefer the earliest sequence needed to make progress over
-                # the farthest completed record when the reorder buffer fills.
+                # When the reorder buffer fills, evict the earliest sequence needed to
+                # make progress rather than the farthest completed record.
                 evicted = max(self._trace_ready)
                 del self._trace_ready[evicted]
                 self._mark_trace_sequence_skipped(evicted)
@@ -2435,9 +2503,9 @@ class ExpertHotCacheManager:
                 return
             self._trace_flush_active = True
 
-        # Exactly one background worker drains ready records.  The condition
-        # protects only sequence state; JSON construction and file I/O happen
-        # outside it, so an inference-thread drop never waits on a slow disk.
+        # One background worker drains ready records. The condition guards only
+        # sequence state; JSON building and file I/O run outside it, so an
+        # inference-thread drop never waits on a slow disk.
         self._drain_trace_records()
 
     def _drain_trace_records(self) -> None:
@@ -2674,12 +2742,10 @@ class ExpertHotCacheManager:
                 if side_pull is not None:
                     covered, residual, wasted, posted = side_pull
                     delivered = posted
-                    # One useful capacity-one post replaces one distinct
-                    # demand expert, regardless of how many logical routes
-                    # covered that expert. The planner's unique-miss counter
-                    # intentionally retains the logical demand total, so
-                    # remove that one would-be demand copy before adding the
-                    # side-stream's actual physical copy.
+                    # A useful capacity-one post replaces one distinct demand expert,
+                    # however many routes it covered. The planner's unique-miss counter
+                    # keeps the logical demand total, so subtract that one would-be
+                    # demand copy before adding the side stream's physical copy.
                     useful_posts = posted - wasted
                     covered_demand_rows = min(useful_posts, graph_logical_unique_misses)
                     streamer = self.streamers[layer_id]
@@ -2794,8 +2860,8 @@ class ExpertHotCacheManager:
         boundary; ``min_residence_forwards`` only holds back that layer's slot
         changes.
         """
-        # A query-only poll gives completed trace buffers to their writer while
-        # every later forward continues without waiting for a D2H copy.
+        # A query-only poll hands completed trace buffers to their writer so later
+        # forwards never wait for a D2H copy.
         for telemetry in tuple(self._trace_telemetry.values()):
             telemetry.poll()
         kind, tokens = classify_forward(forward_batch)
@@ -2901,27 +2967,23 @@ class ExpertHotCacheManager:
     ) -> None:
         """Attribute new rows from one cumulative side-pull delivery snapshot.
 
-        ``covered``/``residual``/``wasted``/``posted`` are the FULL cumulative
-        totals a producer's ``PullDeliveryStats.snapshot()`` returns at this
-        call. The manager differences them from the prior producer read, then
-        adds only the delta to this ``(mode, layer_id)`` ledger. This prevents
-        a decode snapshot from relabeling prefill's already-reported pulls.
-        ``posted`` is the
-        producer's PHYSICAL row count (1 per forward a real prediction was
-        posted, regardless of how many routes it covered or none), and is
-        what this class adds to ``miss_rows``/``side_pull_rows``. ``covered``
-        sums matched ROUTES rather than delivered rows, so it can exceed 1 on
-        a multi-token forward with overlap on the predicted expert; ``covered
-        + wasted`` would overcount physical rows in that case, which is why
-        ``posted`` -- not that sum -- is the delivered-row count used here.
-        Never touches ``unique_miss_rows`` or ``routed_miss_rows``, which stay
-        logical counts of distinct and routed actual misses read from the
-        ordinary routing path.
+        ``covered``, ``residual``, ``wasted`` and ``posted`` are the full cumulative
+        totals of a producer's ``PullDeliveryStats.snapshot()`` at this call. The
+        manager differences them from the previous read and adds only the delta to
+        this ``(mode, layer_id)`` ledger, so a decode snapshot never relabels
+        prefill's already-reported pulls.
 
-        ``discard_graph_capture_routes`` clears both producer and manager
-        baselines after graph warmup. A smaller source total also defensively
-        starts a fresh telemetry epoch, so a reset cannot produce a negative
-        phase delta or retain warmup rows.
+        ``posted`` is the producer's physical row count (one per forward in which a
+        real prediction was posted) and is what this class adds to
+        ``miss_rows`` and ``side_pull_rows``. ``covered`` counts matched routes, not
+        delivered rows, so it can exceed one on a multi-token forward that overlaps
+        the predicted expert; ``covered + wasted`` would overcount physical rows.
+        ``unique_miss_rows`` and ``routed_miss_rows`` are never touched: they stay
+        logical counts read from the ordinary routing path.
+
+        ``discard_graph_capture_routes`` clears the producer and manager baselines
+        after graph warmup. A smaller source total also starts a fresh telemetry
+        epoch, so a reset cannot yield a negative phase delta or keep warmup rows.
         """
         current = tuple(index(value) for value in (covered, residual, wasted, posted))
         previous = self._last_side_pull_totals.get(layer_id)

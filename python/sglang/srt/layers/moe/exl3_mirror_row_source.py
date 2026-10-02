@@ -1,12 +1,12 @@
 """Expert rows for the streaming framework, read from K mirrored EXL3 checkpoints.
 
-Every root holds a byte-identical copy of the checkpoint, each on its own
-drive. One expert row is still one page-aligned superset read into the shared
-bounce ring, but ``Exl3RowReader.read_split`` serves it from all the roots at
-once: one page-aligned sub-range per root, in a single submit, as the split
-policy plans. Everything after the read -- the bounce ring, the per-name split
-into destination rows, the byte accounting -- is ``Exl3ShardRowSource``'s, so
-``ExpertStreamer`` cannot tell the two sources apart.
+Every root holds a byte-identical copy of the checkpoint, each on its own drive. One
+expert row is still one page-aligned superset read into the shared bounce ring, but
+``Exl3RowReader.read_split`` serves it from all the roots at once: one page-aligned
+sub-range per root, in a single submit, as the split policy plans. Everything after
+the read (the bounce ring, the per-name split into destination rows, the byte
+accounting) is ``Exl3ShardRowSource``'s, so ``ExpertStreamer`` cannot tell the two
+sources apart.
 """
 
 from __future__ import annotations
@@ -31,8 +31,10 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
     rows, each read from ``roots`` at once.
 
     ``reader.source_root`` must be the directory the layout was built from: a
-    record's path relative to it picks the file inside each root, so the roots
-    may have different absolute prefixes.
+    record's path relative to it picks the file inside each root, so the roots may
+    have different absolute prefixes. ``policy`` must plan one part per root. The
+    constructor stats every root's copy of the layer's shards, so a missing or
+    wrong-sized copy fails at startup naming the root and the file, not mid-serve.
     """
 
     def __init__(
@@ -61,9 +63,8 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
         super().__init__(reader, layer_id, segments, bounce_rows=bounce_rows)
         self.roots = roots
         self.policy = policy
-        # Fail here, naming the root and the file, rather than mid-serve. A copy
-        # of the wrong size is a half-finished or stale one. This is checked
-        # again by the reader when it first opens each file.
+        # A copy of the wrong size is half-finished or stale. The reader checks
+        # again when it first opens each file.
         layer_paths = {
             record.path
             for (layer, _expert), record in reader.layout.records.items()
@@ -81,8 +82,8 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
                         "does not exist"
                     ) from error
                 except OSError as error:
-                    # OSError(errno, ...) picks the matching subclass and keeps
-                    # errno and filename, so callers can still tell EACCES from EIO.
+                    # OSError(errno, ...) picks the matching subclass and keeps errno
+                    # and filename, so callers can still tell EACCES from EIO.
                     raise OSError(
                         error.errno,
                         f"mirror root {root}: cannot stat its copy of {path}: "
@@ -109,9 +110,11 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
         source_root: str,
         bounce_rows: int = BOUNCE_ROWS,
     ) -> Exl3MirrorRowSource:
-        """The mirror counterpart of ``Exl3ShardRowSource.for_layer``, named
-        apart because it needs arguments that one does not take (so it does
-        not override it: the inherited ``for_layer`` cannot build this class)."""
+        """The mirror counterpart of ``Exl3ShardRowSource.for_layer``.
+
+        It has its own name because it takes arguments ``for_layer`` does not, and
+        the inherited ``for_layer`` cannot build this class.
+        """
         return cls(
             shared_row_reader(layout, direct, source_root),
             layer_id,
@@ -122,6 +125,7 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
         )
 
     def _read_rows(self, experts: Sequence[int], addresses: Sequence[int]) -> list[int]:
+        """One split read: each row's sub-ranges come from all the roots at once."""
         return self.reader.read_split(
             [(self.layer_id, expert) for expert in experts],
             addresses,

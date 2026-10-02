@@ -1,10 +1,14 @@
 """Expert rows for the streaming framework, read straight from the EXL3 shards.
 
 Each expert is one page-aligned superset read (``Exl3RowReader``) into a
-page-aligned bounce ring. The format's segment map then splits it into the
-per-name destination rows: nine copies per row, with ``mul1`` dropped. There
-is no re-layout on disk. The reader and the bounce ring are shared by every
-layer, because all reads run synchronously on the model thread.
+page-aligned bounce ring. The format's segment map then splits it into the per-name
+destination rows: nine copies per row, with ``mul1`` dropped. There is no re-layout
+on disk. The reader and the bounce ring are shared by every layer, because all reads
+run synchronously on the model thread.
+
+This file holds the shared reader and bounce-ring caches and
+:class:`Exl3ShardRowSource`, the per-layer source. The mirrored variant is
+``exl3_mirror_row_source.py``.
 """
 
 from __future__ import annotations
@@ -35,10 +39,12 @@ _SHARED_BOUNCE: dict[tuple[int, int], torch.Tensor] = {}
 def shared_row_reader(
     layout: Exl3ExpertLayout, direct: bool, source_root: Optional[str] = None
 ) -> Exl3RowReader:
-    """One ``Exl3RowReader`` per layout, read mode and source root, so shard
-    files open once. ``Exl3RowReader.read_split`` (mirrored reads) needs
-    ``source_root``, the directory the layout's paths live under; the
-    single-root ``read`` does not."""
+    """One ``Exl3RowReader`` per layout, read mode and source root, so shard files
+    open once.
+
+    ``Exl3RowReader.read_split`` (mirrored reads) needs ``source_root``, the
+    directory the layout's paths live under; the single-root ``read`` does not.
+    """
     key = (id(layout), bool(direct), source_root)
     reader = _SHARED_READERS.get(key)
     if reader is None or reader.layout is not layout:
@@ -61,7 +67,15 @@ def shared_bounce(rows: int, row_bytes: int) -> torch.Tensor:
 
 
 class Exl3ShardRowSource(SynchronousSubmit):
-    """An ``ExpertRowSource`` (``PER_NAME`` host layout) over one layer's shard rows."""
+    """An ``ExpertRowSource`` (``PER_NAME`` host layout) over one layer's shard rows.
+
+    Reads are synchronous (``SynchronousSubmit``) on the caller's thread. Rows reach
+    their destinations by CPU copies out of the shared bounce ring, so no
+    destination is registered with io_uring. ``file_bytes_per_expert`` counts the
+    bytes a row's superset read transfers, page-alignment waste included; a shard's
+    last superset runs past end of file, and only bytes that exist are read, as
+    ``Exl3RowReader`` counts them.
+    """
 
     host_layouts = frozenset({HostSlotLayout.PER_NAME})
     requires_page_aligned_destinations = False
@@ -98,9 +112,6 @@ class Exl3ShardRowSource(SynchronousSubmit):
         self.slot_bytes = -(-reader.buffer_bytes // PAGE_BYTES) * PAGE_BYTES
         self.bounce = shared_bounce(bounce_rows, self.slot_bytes)
         self.preferred_batch_rows = bounce_rows
-        # Bytes each row's superset read transfers, page-alignment waste included.
-        # A shard's last superset runs past end of file; only bytes that exist
-        # are read, as Exl3RowReader counts them.
         file_sizes: dict[str, int] = {}
         self._read_bytes = []
         for expert in range(self.num_experts):
@@ -120,23 +131,26 @@ class Exl3ShardRowSource(SynchronousSubmit):
         *,
         direct: bool,
     ) -> Exl3ShardRowSource:
+        """A source over ``layer_id`` using the shared reader for ``layout``."""
         return cls(shared_row_reader(layout, direct), layer_id, segments)
 
     def covers(self, name: str) -> bool:
+        """Whether this source fills the streamed tensor ``name``."""
         return name in self.row_bytes
 
     def register_destinations(self, tensors: Iterable[torch.Tensor]) -> int:
-        # Rows reach their destinations by CPU copies out of the bounce ring,
-        # so no destination is handed to io_uring.
+        """Registers nothing: rows are copied out of the bounce ring by the CPU."""
         return 0
 
     def close(self) -> None:
-        # The reader and the bounce ring are shared by every layer's source.
+        """Releases nothing: the reader and bounce ring are shared by every layer."""
         return None
 
     def _read_rows(self, experts: Sequence[int], addresses: Sequence[int]) -> list[int]:
-        """One reader call: ``experts`` of this layer into page-aligned
-        ``addresses``; returns where each row starts inside its buffer."""
+        """One reader call: ``experts`` of this layer into page-aligned ``addresses``.
+
+        Returns where each row starts inside its buffer.
+        """
         return self.reader.read(
             [(self.layer_id, expert) for expert in experts], addresses
         )
@@ -147,6 +161,12 @@ class Exl3ShardRowSource(SynchronousSubmit):
         destinations: Mapping[str, torch.Tensor],
         destination_rows: Optional[torch.Tensor] = None,
     ) -> RowReadStats:
+        """Fill ``destinations`` rows (``destination_rows`` slots, default in order).
+
+        Reads ``rows`` in bounce-ring batches, then splits each row into the named
+        destinations by the segment map. Destinations must be contiguous CPU tensors
+        whose rows hold exactly the name's bytes. Returns the read and split timings.
+        """
         unknown = [name for name in destinations if name not in self.row_bytes]
         if unknown:
             raise ValueError(f"exl3 shard row source does not cover {unknown}")

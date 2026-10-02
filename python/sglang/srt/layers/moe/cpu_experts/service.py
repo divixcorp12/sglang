@@ -1,14 +1,17 @@
-"""CPU experts inside the EXL3 RAM-miss service (plan 2026-09-29-dsv41-cpu-experts, "Step B").
+"""CPU experts inside the EXL3 RAM-miss service: the Python half.
 
-The service's own threads run the kernel.
-The post types the last ``split[n]`` of a captured post's n eligible lanes CPU (RAM hits, and NVMe misses with
-SGLANG_DSV41_CPU_EXPERTS_MISSES); the device plan sorts them, so those are the lowest-scored.
-The service thread hands them to the CPU expert thread (expert_stream/host/cpu_experts.h): the hits at once into part 0
-of the row's output, each miss into part 1 as soon as its read landed. The copy wait releases the decode stream once
-the copies and the CPU are done.
+The service's own threads run the kernel. For each captured post, the post kernel types
+the last ``split[n]`` of its ``n`` eligible lanes as CPU lanes: RAM hits, and NVMe
+misses when ``SGLANG_DSV41_CPU_EXPERTS_MISSES`` is set. The device plan sorts the
+lanes, so those are the lowest-scored. The service thread hands them to the CPU expert
+thread (``expert_stream/host/cpu_experts.h``): hits at once into part 0 of the row's
+output, each miss into part 1 as soon as its read lands. The copy wait releases the
+decode stream once the copies and the CPU are both done.
 
-This module owns the Python half: the quant trait, the pinned rows the post kernel and the CPU exchange,
-the lazy per-layer registration, and the split table.
+This module owns the quant trait lookup, the pinned rows the post kernel and the CPU
+exchange, the lazy per-layer registration, the split table (configured, re-derived from
+measured CPU cost, or calibrated at startup), and the CPU stats logging. The split
+arithmetic is in ``cpu_experts/policy.py``.
 """
 
 from __future__ import annotations
@@ -28,9 +31,8 @@ from sglang.srt.layers.moe.cpu_experts.policy import (
 
 logger = logging.getLogger(__name__)
 
-LANES = (
-    8  # expert_lease_block.LANES: the split table covers n = 0..LANES resident lanes
-)
+# expert_lease_block.LANES: the split table covers n = 0..LANES resident lanes.
+LANES = 8
 
 
 def cpu_trait_for(format_key: str, ext=None):
@@ -44,7 +46,11 @@ def cpu_trait_for(format_key: str, ext=None):
 
 
 def configured_split() -> list[int]:
-    """SGLANG_DSV41_CPU_EXPERTS_SPLIT when set, else k*(n) from the configured per-expert costs."""
+    """The split table: ``SGLANG_DSV41_CPU_EXPERTS_SPLIT`` when set, else ``k_star(n)``.
+
+    The fallback uses the configured per-expert CPU, link and handoff costs. Raises
+    ``ValueError`` for a malformed explicit split.
+    """
     spec = envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.get()
     if spec:
         split = [int(v) for v in spec.split(",")]
@@ -62,7 +68,23 @@ def configured_split() -> list[int]:
 
 
 class CpuExpertService:
-    """The Python half of CPU experts for one ``ExpertStreamHost`` (the RAM-miss service's)."""
+    """The Python half of CPU experts for one ``ExpertStreamHost``.
+
+    Created by the RAM-miss service at start-up, after the copy engine is enabled and
+    before the service thread starts. It owns the pinned input and output rows that the
+    post kernel and the native CPU expert thread exchange: fp16 inputs padded to 16
+    bytes (the post's vector stores) and fp32 outputs, both read and written by the
+    device through UVA. Each output row has two parts, the CPU hits' partial sum
+    (part 0) and the CPU misses' (part 1), which the route tables sum.
+
+    Layers register lazily with ``register``, on a layer's first graph-path forward (a
+    warm-up before capture); the device side learns of each registered row through
+    ``attach_device``. ``split[n]`` is the number of CPU lanes for ``n`` eligible lanes.
+    It starts as configured and can be replaced by ``retune`` (measured CPU cost) or
+    ``calibrate`` (startup measurement); a calibrated split is final, so ``retune`` then
+    does nothing. Calibration's own CPU jobs are subtracted from ``log_stats`` and from
+    ``retune``'s baseline.
+    """
 
     def __init__(
         self,
@@ -78,7 +100,8 @@ class CpuExpertService:
     ):
         cores = sorted(set(cores))
         if len(cores) < 2:
-            # Many spinning workers on one core livelocked the box (DSV41_REFERENCE section 28).
+            # Spinning workers sharing one core livelock
+            # (DSV41_REFERENCE.md section 28.2).
             raise ValueError(f"CPU experts need at least 2 cores, got {cores}")
         if not 1 <= threads <= len(cores):
             raise ValueError(f"{threads} CPU expert threads on {len(cores)} cores")
@@ -95,11 +118,9 @@ class CpuExpertService:
             raise ValueError(
                 "CPU experts need the slabs of every service row 0..rows-1"
             )
-        # fp16 input rows padded to 16 bytes (the post's vector stores), fp32 output rows. Pinned: the device reads and
-        # writes them through UVA.
+        # Row layout is in the class doc; pinned so the device reaches them by UVA.
         x_bytes = -(-2 * self.hidden // 16) * 16
         self.x_rows = torch.zeros((rows, x_bytes), dtype=torch.uint8)
-        # Two parts per row: the CPU hits' partial sum (part 0) and the CPU misses' (part 1), summed by the route tables.
         self.out_rows = torch.zeros((rows, 2, self.hidden), dtype=torch.float32)
         if pin:
             self.x_rows, self.out_rows = (
@@ -126,25 +147,31 @@ class CpuExpertService:
         )
 
     def _capacity(self, slabs: Mapping[str, torch.Tensor]) -> int:
+        """The slab row count of one layer, which every slab must agree on."""
         rows = {int(slabs[name].shape[0]) for name in self.trait.slab_names}
         if len(rows) != 1:
             raise ValueError(f"the pinned slabs disagree on their row count {rows}")
         return rows.pop()
 
     def registered(self, row: int) -> bool:
+        """Whether ``row`` has been registered with the kernel."""
         return row in self.handles
 
     def attach_device(self, device_side) -> None:
-        """The chain's device side, which types CPU lanes only for registered rows: told of every row, now and later."""
+        """Attach the device side, which types CPU lanes for registered rows only.
+
+        It is told of every row registered now and of each registered later.
+        """
         self.device_side = device_side
         for row in self.handles:
             device_side.set_row_cpu(row)
 
     def register(self, row: int, act_limit: Optional[float]) -> None:
-        """Register ``row``'s pinned slabs with the trait and let the grant send its lanes to the CPU.
+        """Register ``row``'s pinned slabs with the trait and enable its CPU lanes.
 
-        On a layer's first graph-path forward, a warmup before capture: the activation limit is the layer's
-        MoE runner config, which the service does not see at startup. Every layer must use the same limit.
+        Called on a layer's first graph-path forward, a warm-up before capture: the
+        activation limit is the layer's MoE runner config, which the service does not
+        see at start-up. Every layer must use the same limit. A no-op once registered.
         """
         if row in self.handles:
             return
@@ -155,7 +182,7 @@ class CpuExpertService:
                 f"CPU experts: layer rows use activation limits {self.trait.act_limit} and {act_limit}"
             )
         if not self._cores_set:
-            # Before the kernel's first forward, which the CPU expert thread runs once a row is registered.
+            # Must precede the kernel's first forward, which runs once a row registers.
             self.trait.native_set_cores(self.cores)
             self._cores_set = True
         slabs = self.slabs_by_row[row]
@@ -171,7 +198,10 @@ class CpuExpertService:
             self.device_side.set_row_cpu(row)
 
     def log_stats(self) -> dict[str, int]:
-        """Log the CPU expert thread's cumulative counters: an A/B arm reads its per-expert cost under load here."""
+        """Log the CPU expert thread's cumulative counters, minus calibration's jobs.
+
+        This is where per-expert CPU cost under load is read. Returns the counters.
+        """
         stats = {
             key: value - self._calibration_stats[key]
             for key, value in self.host.cpu_stats().items()
@@ -187,9 +217,11 @@ class CpuExpertService:
         return stats
 
     def retune(self) -> Optional[list[int]]:
-        """P3: recompute the split from the CPU's measured per-expert cost since the last call, when it has run.
+        """Recompute the split from the CPU's measured per-expert cost since last call.
 
-        The link and handoff costs stay as configured. Returns the new table when it changed.
+        Needs at least 64 CPU lanes since the last call, and does nothing after a
+        calibration. The link and handoff costs stay as configured. Returns the new
+        table when it changed, else ``None``.
         """
         if self.calibrated:
             return None
@@ -216,11 +248,13 @@ class CpuExpertService:
         return split
 
     def calibrate(self, device: int) -> Optional[list[int]]:
-        """Measure the split once on the loaded model and keep it (spec 2026-10-01-cpu-split-calibration).
+        """Measure the split once on the loaded model and keep it.
 
-        The caller owns the tier (the RAM thread paused) and has not armed the copy engine. Returns the new split, or
-        None when calibration is off, the split is fixed by SGLANG_DSV41_CPU_EXPERTS_SPLIT, or it could not run (a
-        warning says why, and the split stays as it was).
+        The caller owns the tier (the RAM thread paused) and has not armed the copy
+        engine. Returns the new split, or ``None`` when calibration is off, the split
+        is fixed by ``SGLANG_DSV41_CPU_EXPERTS_SPLIT``, or it could not run (a warning
+        says why and the split stays as it was). The native measurement is
+        ``expert_stream/host/split_calibration.h``.
         """
         if (
             envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.get()
@@ -256,7 +290,8 @@ class CpuExpertService:
                 row, device=device, reps=reps, scratch=scratch
             ).tolist()
         except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
-            # A timed-out DMA may still write into the scratch: never hand its block back to the allocator.
+            # A timed-out DMA may still write into the scratch: keep its block out of
+            # the allocator.
             self._calibration_scratch = scratch
             self._exclude_calibration_stats(before)
             logger.warning(
@@ -280,14 +315,21 @@ class CpuExpertService:
         return split
 
     def _exclude_calibration_stats(self, before: dict[str, int]) -> None:
-        """Calibration's own CPU jobs are not decode's: log_stats subtracts them and retune starts after them."""
+        """Account calibration's own CPU jobs apart from decode's.
+
+        ``log_stats`` subtracts them and ``retune`` starts counting after them.
+        """
         after = self.host.cpu_stats()
         self._calibration_stats = {key: after[key] - before[key] for key in after}
         self._last_stats = after
 
 
 def cpu_expert_cores() -> tuple[list[int], int]:
-    """SGLANG_DSV41_CPU_EXPERTS_CORES and _THREADS, checked."""
+    """The CPU expert cores and thread count from the environment.
+
+    Reads ``SGLANG_DSV41_CPU_EXPERTS_CORES`` (a taskset list, required) and
+    ``SGLANG_DSV41_CPU_EXPERTS_THREADS`` (default: one per core).
+    """
     spec = envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get()
     if not spec:
         raise ValueError(

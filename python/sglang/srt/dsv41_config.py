@@ -1,4 +1,10 @@
-"""The DeepSeek-V4.1 runtime knobs, resolved from the environment into one value."""
+"""The DeepSeek-V4.1 runtime knobs, resolved from the environment into one value.
+
+``Dsv41Config.from_envs`` reads every ``SGLANG_*DSV41*`` environment variable once
+and returns a frozen struct, so a component reads a field instead of the process
+environment. The variables are documented where they are declared, in
+``sglang.srt.environ``.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +16,11 @@ from sglang.srt.environ import envs
 
 
 class Dsv41Config(msgspec.Struct, frozen=True):
-    """Every SGLANG_*DSV41* knob, de-prefixed; see the matching EnvField for its meaning."""
+    """Every ``SGLANG_*DSV41*`` knob, de-prefixed.
+
+    The meaning of a field is documented on the matching ``EnvField`` in
+    ``sglang.srt.environ``.
+    """
 
     reasoning_effort: Optional[str]
     engram_host_table: bool
@@ -40,7 +50,8 @@ class Dsv41Config(msgspec.Struct, frozen=True):
 
     @classmethod
     def from_envs(cls) -> Dsv41Config:
-        # Never cached: envs.X.override(...) in tests and late launcher edits must be observed.
+        """Read the environment now. Never cached, so ``envs.X.override(...)`` in tests
+        and late launcher edits are observed."""
         return cls(
             reasoning_effort=envs.SGLANG_DSV41_REASONING_EFFORT.get(),
             engram_host_table=envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get(),

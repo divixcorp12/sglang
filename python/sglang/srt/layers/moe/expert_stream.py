@@ -1,4 +1,21 @@
-"""Selected-expert staging for host-resident MoE weight rows."""
+"""Selected-expert streaming: stage only the routed experts' rows for the fused MoE.
+
+A streamed MoE layer keeps its expert weights off the GPU (pageable or registered
+host memory, or a file) and, per forward, gathers just the rows the router selected
+into compact CUDA buffers that the fused-MoE kernel then reads.
+
+  ExpertStreamer                 one layer's gather: eager (staging buffers, host
+                                 syncs allowed) and graph (device-only, capturable)
+  ExpertPinnedHostCache          bounded tier of pinned host rows that backs misses
+  ExpertPinnedHostCacheManager   splits one global pinned-host budget across layers
+  ExpertGatherStats              per-gather row and byte accounting
+
+The hot cache (VRAM-resident rows) lives in ``expert_hot_cache.py``; row sources and
+the host tier's slot tables live in ``expert_row_source.py`` and
+``expert_host_tier.py``.
+
+See MOE_EXPERT_TRANSFER.md, "Prefill staging and VRAM 2026-09-18".
+"""
 
 from __future__ import annotations
 
@@ -71,8 +88,9 @@ _PINNED_STAGING: Dict[Tuple, torch.Tensor] = {}
 _PINNED_INDEX: Dict[Tuple, torch.Tensor] = {}
 _ARANGE_CACHE: Dict[Tuple, torch.Tensor] = {}
 _LOGGED_SOURCE_SIGNATURES: set[Tuple] = set()
-# The prefill fill reader lands rows in batches of this many (exl3_ram_miss_host.cpp kBounceRows); a split gather
-# copies a chunk's filling rows at that grain.
+# The prefill fill reader lands rows in batches of this many (kBounceRows in
+# kernels/jit/csrc/moe/expert_stream/host/reader_base.h); a split gather copies a
+# chunk's filling rows at that grain.
 _FILL_COPY_ROWS = 8
 
 NVFP4_STREAM_TENSORS = (
@@ -83,18 +101,24 @@ NVFP4_STREAM_TENSORS = (
     "g1_alphas",
     "g2_alphas",
 )
-# ExpertStreamer's row_source default: resolve it from SGLANG_MOE_EXPERT_ROW_SOURCE.
+# Sentinel for ExpertStreamer's row_source default: resolve it from
+# SGLANG_MOE_EXPERT_ROW_SOURCE.
 _DEFAULT_ROW_SOURCE = object()
 
 
 @dataclass(frozen=True)
 class ExpertGatherStats:
-    """Actual source rows and transfer bytes after the gather's deduplication.
+    """Rows and bytes one gather actually moved, after deduplication.
 
-    All-hot slot remapping has no transfer bytes. source_bytes counts misses
-    read from backing tensors, whether their source device is CPU or CUDA.
-    routed_rows and routed_miss_rows count routes with multiplicity;
-    unique_miss_rows counts the distinct missed experts actually gathered.
+    ``ExpertStreamer.last_gather_stats`` holds the latest one. An all-hot gather only
+    remaps slots and has no transfer bytes. ``source_bytes`` counts misses read from
+    backing tensors, whether their source device is CPU or CUDA. ``routed_rows`` and
+    ``routed_miss_rows`` count routes with multiplicity; ``unique_miss_rows`` counts
+    the distinct missed experts actually gathered. The ``host_read_*`` fields sum the
+    row sources' ``RowReadStats`` for the gather.
+
+    The stats are constructed positionally, so new fields must be trailing and
+    defaulted.
     """
 
     requested_rows: int = 0
@@ -113,8 +137,6 @@ class ExpertGatherStats:
     routed_rows: int = 0
     routed_miss_rows: int = 0
     unique_miss_rows: int = 0
-    # Host rows the row sources read during this gather (summed RowReadStats).
-    # Trailing and defaulted: the stats are constructed positionally.
     host_read_rows: int = 0
     host_read_file_bytes: int = 0
     host_read_split_bytes: int = 0
@@ -132,8 +154,12 @@ def _sum_gather_stats(stats: Sequence[ExpertGatherStats]) -> ExpertGatherStats:
 
 
 def host_row_of_source(slots: list[int], hits: list[bool]) -> list[int]:
-    """The staging row ``_gather_cached`` gives each source, from its hot-cache lookup read to the host: the hot slot
-    itself when every source hits, else misses first and then hits, each in source order."""
+    """The staging row ``_gather_cached`` gives each source.
+
+    ``slots`` and ``hits`` are its hot-cache lookup, read to the host. Returns the hot
+    slot itself when every source hits, else misses first and then hits, each in
+    source order.
+    """
     if all(hits):
         return list(slots)
     order = [i for i, hit in enumerate(hits) if not hit] + [
@@ -147,7 +173,7 @@ def host_row_of_source(slots: list[int], hits: list[bool]) -> list[int]:
 
 @dataclass
 class PinnedHostCacheStats:
-    """Cumulative counters for the bounded pinned-host expert cache."""
+    """Cumulative counters of one ``ExpertPinnedHostCache``."""
 
     lookup_hits: int = 0
     lookup_misses: int = 0
@@ -168,27 +194,30 @@ def _host_use(method):
 
 
 class ExpertPinnedHostCache:
-    """Bounded, on-demand pinned host rows shared by one expert layer.
+    """Bounded, on-demand pinned host rows of one streamed expert layer.
 
-    Each host tensor gets one page-aligned slab registered with CUDA and sized
-    to exactly ``capacity`` rows; PyTorch's pinned allocator would round each
-    slab up to a power of two. ``device`` holds the slot lookup. It defaults
-    to the layer's CUDA source device, else the current CUDA device; a CPU
-    ``device`` keeps the tier on the host with unregistered slabs, so it runs
-    without a GPU. ``is_pinned(expert_id)`` protects experts from eviction.
+    Each host tensor gets one page-aligned slab, registered with CUDA and sized to
+    exactly ``capacity`` rows (PyTorch's pinned allocator would round each slab up to
+    a power of two). ``SGLANG_EXPERT_STREAM_URING_SLAB_ARENA=1`` places all slabs in
+    one registered allocation instead, keeping page-aligned starts and the same
+    tensor layouts for fixed-buffer vectored I/O.
 
-    ``SGLANG_EXPERT_STREAM_URING_SLAB_ARENA=1`` places all named slabs in one
-    registered allocation, retaining page-aligned starts and the same tensor
-    layouts for fixed-buffer vectored I/O experiments.
+    ``device`` holds the expert-to-slot lookup. It defaults to the layer's CUDA
+    source device, else the current CUDA device; a CPU ``device`` keeps the tier on
+    the host with unregistered slabs, so it runs without a GPU.
 
-    ``slot_table`` replaces the default ``PinnedSlotLRU``. Such a table chooses
-    its own victims: ``is_pinned`` is then used only to size requests
-    (``evictable_rows``), so the table must protect the same experts itself.
+    Eviction: ``is_pinned(expert_id)`` protects experts from eviction. ``slot_table``
+    replaces the default ``PinnedSlotLRU``; such a table chooses its own victims, so
+    ``is_pinned`` then only sizes requests (``evictable_rows``) and the table must
+    protect the same experts itself.
 
-    ``row_fills`` (SGLANG_DSV41_ENABLE_PREFILL_FILLS) reads missing rows in place
-    of the streamer's row source: ``ensure_rows`` reads through it, and
-    ``prefetch_rows`` starts a layer's reads ahead of its chunked gather, which
-    then waits per chunk for only its own rows. None keeps every read as it was.
+    Reads: ``row_fills`` (SGLANG_DSV41_ENABLE_PREFILL_FILLS) reads missing rows in
+    place of the streamer's row source. ``ensure_rows`` reads through it, and
+    ``prefetch_rows`` starts a layer's reads ahead of its chunked gather, which then
+    waits per chunk for only its own rows. None keeps every read synchronous.
+
+    Threading: every access to the slot map or the slabs from the host runs inside
+    ``host_use()``, which lets the slot table's owner pause around it.
     """
 
     def __init__(
@@ -291,13 +320,14 @@ class ExpertPinnedHostCache:
         self.stats = PinnedHostCacheStats()
         self.row_fills = row_fills
         self.split_fill_gather = envs.SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER.get()
-        # The running prefetch's claim order by expert (fill_wait counts rows in that order); None when none runs.
+        # The running prefetch's claim order by expert (fill_wait counts rows in that
+        # order); None when none runs.
         self._fill_order: dict[int, int] | None = None
         streamer.pinned_host_cache = self
 
     @staticmethod
     def capacity_for_budget(streamer: ExpertStreamer, budget_bytes: int) -> int:
-        """Round a pinned-host byte budget down to complete expert rows."""
+        """Round a byte budget down to the number of complete expert rows."""
         budget_bytes = index(budget_bytes)
         if budget_bytes < 0:
             raise ValueError("pinned host cache byte budget cannot be negative")
@@ -316,13 +346,13 @@ class ExpertPinnedHostCache:
 
     @contextlib.contextmanager
     def host_use(self) -> Iterator[None]:
-        """Hold the slot table's host use: ``before_host_use`` now, ``after_host_use`` on exit.
+        """Hold the slot table's use: ``before_host_use``, then ``after_host_use``.
 
-        Every read of the slot map or the slabs from the host, and every copy
-        that reads slots chosen here, belongs inside one. Nested host uses call
-        both hooks again (``lookup``, ``ensure_rows``, ``copy_rows`` and
-        ``gather_rows`` each open one), so a table whose owner must pause
-        counts depth and acts only on the outermost pair.
+        Every host read of the slot map or the slabs, and every copy that reads slots
+        chosen here, belongs inside one. Host uses nest (``lookup``, ``ensure_rows``,
+        ``copy_rows`` and ``gather_rows`` each open one) and both hooks run again per
+        level, so a table whose owner must pause counts depth and acts only on the
+        outermost pair.
         """
         self._lru.before_host_use(self)
         try:
@@ -335,16 +365,18 @@ class ExpertPinnedHostCache:
         self._release_slabs()
 
     def quarantine(self) -> None:
-        """Keep every slab registered and alive until the process ends, and never unregister it.
+        """Keep every slab registered and alive until the process ends.
 
-        For when a GPU reader of unknown state may still run (LEASE_PROTOCOL.md, "Shutdown"). The finalizer that
-        unregisters the slabs at exit is detached, or it would undo this; ``close`` is then a no-op.
+        For when a GPU reader of unknown state may still run
+        (analysis/dsv41-drive/LEASE_PROTOCOL.md, "Shutdown"). The finalizer that
+        unregisters the slabs is detached, or it would undo this; ``close`` is then a
+        no-op.
         """
         self._release_slabs.detach()
         quarantine_host_slabs(self.tensors.values())
 
     def evictable_rows(self) -> int:
-        """Slots a request can use: the capacity minus residents ``is_pinned`` protects."""
+        """Slots a request can use: capacity minus residents ``is_pinned`` protects."""
         if self.is_pinned is None:
             return self.capacity
         return self.capacity - sum(
@@ -352,6 +384,7 @@ class ExpertPinnedHostCache:
         )
 
     def _refresh_mapping(self) -> None:
+        """Push the slot table's expert-to-slot map to ``self.expert_to_slot``."""
         self.expert_to_slot.copy_(
             torch.tensor(
                 self._lru.mapping(self.streamer.num_experts),
@@ -362,7 +395,10 @@ class ExpertPinnedHostCache:
 
     @_host_use
     def lookup(self, source_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return slots and record row-level hit/miss counters."""
+        """Return each expert's slot (-1 on a miss) and its hit mask.
+
+        Touches the hits in the slot table and counts hit and miss rows.
+        """
         if source_ids.device != self.device:
             raise ValueError(
                 "selected expert IDs must use the pinned cache CUDA device"
@@ -380,10 +416,10 @@ class ExpertPinnedHostCache:
     def ensure_rows(
         self, source_ids: torch.Tensor, protected: Iterable[int] = ()
     ) -> None:
-        """Read missing source rows into pinned slots, evicting least-recently-used rows.
+        """Read missing source rows into pinned slots, evicting the least recently used.
 
-        The requested experts, and any others in ``protected`` (a caller's
-        whole chunk), are evicted only when nothing else can be.
+        The requested experts, and any others in ``protected`` (a caller's whole
+        chunk), are evicted only when nothing else can be.
         """
         if not self.cached_names or self.capacity == 0 or source_ids.numel() == 0:
             return
@@ -397,8 +433,8 @@ class ExpertPinnedHostCache:
             return
         assignments = []
         evictions = 0
-        # Assignment and read are one transaction: on any failure every slot this
-        # call assigned is freed, so no expert stays mapped to a slot never read.
+        # Assignment and read are one transaction: on failure every slot assigned here
+        # is freed, so no expert stays mapped to a slot that was never read.
         try:
             for expert_id in missing:
                 slot, evicted = self._lru.assign(expert_id, protected)
@@ -425,12 +461,15 @@ class ExpertPinnedHostCache:
         self.stats.populated_bytes += len(final_slots) * self.bytes_per_expert
 
     def _fill_rows(self, missing: list[int], protected: frozenset[int]) -> None:
-        """``ensure_rows`` through ``row_fills``: claim and read ``missing`` now, after any prefetch has ended."""
+        """``ensure_rows`` through ``row_fills``: claim and read ``missing`` now.
+
+        Ends any running prefetch first.
+        """
         self.finish_fills()
         began = time.perf_counter_ns()
         slots, evictions = self.row_fills.fill_begin(missing, protected, True)
         landed = self.row_fills.fill_end()
-        # The trace's read_ms: the time this thread was blocked reading. There is no split (split_ms stays 0).
+        # Counts as read time (the thread blocked reading); there is no split time.
         self.streamer._record_read(
             RowReadStats(rows=len(slots), read_ns=time.perf_counter_ns() - began)
         )
@@ -449,11 +488,12 @@ class ExpertPinnedHostCache:
 
     @_host_use
     def prefetch_rows(self, expert_ids: Sequence[int], protected: Iterable[int]) -> int:
-        """Start reading the experts of ``expert_ids`` that are not resident, in that order; returns how many.
+        """Start reading the non-resident experts of ``expert_ids``, in that order.
 
-        ``row_fills`` only, inside a host use the caller holds until ``finish_fills``: the reads run while the
-        caller gathers, and ``gather_rows`` waits per chunk for only its own rows. Slots are claimed until one has
-        no victim outside ``protected``; the rest are left to ``gather_rows``' own admission.
+        Returns how many were claimed. ``row_fills`` only, inside a host use the caller
+        holds until ``finish_fills``: the reads run while the caller gathers, and
+        ``gather_rows`` waits per chunk for only its own rows. Slots are claimed until
+        one has no victim outside ``protected``; ``gather_rows`` admits the rest.
         """
         self.finish_fills()
         missing = [
@@ -477,7 +517,10 @@ class ExpertPinnedHostCache:
         return len(slots)
 
     def finish_fills(self) -> None:
-        """Join the running prefetch, if any; raise if it failed (its rows that did not land were released)."""
+        """Join the running prefetch, if any; raise if it failed.
+
+        Rows that did not land were released.
+        """
         if self._fill_order is None:
             return
         self._fill_order = None
@@ -495,17 +538,20 @@ class ExpertPinnedHostCache:
         )
 
     def _wait_fill(self, rows: int) -> None:
-        """Wait until the first ``rows`` rows of the prefetch's claim order are in their slabs."""
+        """Wait until the first ``rows`` rows of the prefetch's claim order landed."""
         if rows:
             began = time.perf_counter_ns()
             self.row_fills.fill_wait(rows)
-            # Only the wait is on this thread: the prefetched rows are read while it gathers.
+            # Only the wait is on this thread; the reads overlap the gather.
             self.streamer._record_read(
                 RowReadStats(read_ns=time.perf_counter_ns() - began)
             )
 
     def _filling_positions(self, chunk_ids: list[int]) -> list[int]:
-        """Positions in ``chunk_ids`` of the prefetch's rows not landed yet, in claim order; [] unless splitting."""
+        """Positions in ``chunk_ids`` of prefetched rows not landed yet, in claim order.
+
+        Empty unless split gathers are enabled.
+        """
         order = self._fill_order
         if not self.split_fill_gather or order is None:
             return []
@@ -524,10 +570,11 @@ class ExpertPinnedHostCache:
         outputs: dict[str, torch.Tensor],
         filling: list[int],
     ) -> None:
-        """Copy the chunk's landed rows now, then its ``filling`` rows a batch at a time as the fill lands them.
+        """Copy the chunk's landed rows now, then its ``filling`` rows as they land.
 
-        The same bytes go to the same rows as one unsplit copy. The stream is idle here (gather_rows' .item()), so
-        the one row-index copy for the chunk costs no wait; each copy takes a slice of it.
+        Copies a batch at a time; the same bytes go to the same rows as one unsplit
+        copy. The stream is idle here (``gather_rows``' ``.item()``), so the one
+        row-index copy for the chunk costs no wait; each copy takes a slice of it.
         """
         filling_set = set(filling)
         ready = [i for i in range(len(chunk_ids)) if i not in filling_set]
@@ -537,8 +584,8 @@ class ExpertPinnedHostCache:
         claims = [self._fill_order[chunk_ids[i]] for i in filling]
         done = 0
         while done < len(filling):
-            # The reader lands rows in claim order, _FILL_COPY_ROWS per batch: wait for the next batch, then copy
-            # every row landed by then.
+            # The reader lands rows in claim order, _FILL_COPY_ROWS per batch: wait for
+            # the next batch, then copy every row landed by then.
             self._wait_fill(claims[min(done + _FILL_COPY_ROWS, len(filling)) - 1] + 1)
             upto = bisect.bisect_left(claims, self.row_fills.fill_landed())
             if not ready and done == 0 and upto == len(filling):
@@ -550,7 +597,10 @@ class ExpertPinnedHostCache:
             done = upto
 
     def _splits(self, outputs: dict[str, torch.Tensor]) -> bool:
-        """Whether copy_rows can copy named rows into ``outputs``: never through the non-contiguous fallback."""
+        """Whether ``copy_rows`` can copy named rows into ``outputs``.
+
+        The non-contiguous fallback cannot.
+        """
         return all(
             outputs[name].device.type == "cpu"
             or (self.tensors[name].is_contiguous() and outputs[name].is_contiguous())
@@ -564,10 +614,12 @@ class ExpertPinnedHostCache:
         outputs: dict[str, torch.Tensor],
         rows: torch.Tensor | None = None,
     ) -> bool:
-        """Gather resident pinned rows directly into CUDA (or, on a CPU tier, CPU) outputs.
+        """Gather resident pinned rows into CUDA (on a CPU tier, CPU) ``outputs``.
 
-        ``rows`` limits the copy to those output rows (int64, on ``source_ids``' device), each from ``source_ids`` at
-        the same position; other rows are left as they are, and the non-contiguous fallback refuses it.
+        ``rows`` limits the copy to those output rows (int64, on ``source_ids``'
+        device), each from ``source_ids`` at the same position; other rows are left
+        as they are, and the non-contiguous fallback refuses it. Returns whether the
+        fallback ran.
         """
         if source_ids.numel() == 0:
             return False
@@ -627,21 +679,20 @@ class ExpertPinnedHostCache:
     def gather_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
     ) -> PinnedGatherResult:
-        """Copy the rows of ``source_ids`` into the leading rows of ``outputs``, admitting misses.
+        """Copy the rows of ``source_ids`` into the leading rows of ``outputs``.
 
-        Rows are admitted and copied chunk by chunk. Each chunk is sized when
-        it starts, from ``evictable_rows()``: residents that ``is_pinned``
-        protects never make room, and an admitted row may itself become
-        protected (an inclusive hierarchy pins rows the hot cache reserves), so
-        the room shrinks during a call. A chunk holds at most that many
-        distinct experts, all of them protected while it is admitted, and its
-        rows are checked resident before its copy, so no copy reads slot -1.
-        A call that fits in one chunk is the pre-chunking sequence ``lookup``,
-        ``ensure_rows``, ``copy_rows``, plus that host-side check. With no
-        evictable slot, a chunk with misses raises; an all-hit chunk is still
-        copied. Each chunk's hit count (``.item()``) syncs the stream on the
-        host, so the previous chunk's copy has run before its slots can be
-        refilled.
+        Misses are admitted and copied chunk by chunk. Each chunk is sized when it
+        starts, from ``evictable_rows()``: residents ``is_pinned`` protects never make
+        room, and an admitted row may itself become protected (an inclusive hierarchy
+        pins rows the hot cache reserves), so the room shrinks during a call. A chunk
+        holds at most that many distinct experts, all protected while it is admitted,
+        and its rows are checked resident before its copy, so no copy reads slot -1.
+
+        A call that fits in one chunk is ``lookup``, ``ensure_rows``, ``copy_rows``,
+        plus that residency check. With no evictable slot, a chunk with misses raises;
+        an all-hit chunk is still copied. Each chunk's hit count (``.item()``) syncs
+        the stream on the host, so the previous chunk's copy has run before its slots
+        can be refilled.
         """
         if self.capacity == 0:
             raise ValueError("pinned host cache has no rows")
@@ -699,7 +750,10 @@ class ExpertPinnedHostCache:
 
 
 def pinned_host_placement(budget_bytes: int) -> Placement:
-    """SGLANG_MOE_PINNED_HOST_NUMA_MB, checked against the budget and the nodes; () when unset."""
+    """Parse SGLANG_MOE_PINNED_HOST_NUMA_MB and check it against the budget and nodes.
+
+    Returns () when unset.
+    """
     from sglang.srt.layers.moe.host_numa import check_capacity, parse_placement
 
     placement = parse_placement(envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.get())
@@ -716,8 +770,12 @@ def pinned_host_placement(budget_bytes: int) -> Placement:
 
 
 def _placement_report(placement: Placement, caches) -> dict | None:
-    """The requested MiB per node, the bytes actually bound per node (node changes round to 2 MiB, host_numa) and,
-    per node, how many sampled tier pages it holds (-2: not yet resident)."""
+    """Report the tier's NUMA placement for the startup log.
+
+    Returns the requested MiB per node, the bytes actually bound per node (node
+    changes round to 2 MiB, see ``host_numa``) and how many sampled tier pages each
+    node holds (-2: not yet resident). None when no placement was requested.
+    """
     if not placement:
         return None
     from collections import Counter
@@ -736,7 +794,7 @@ def _placement_report(placement: Placement, caches) -> dict | None:
         for cache in caches:
             for slab in cache.tensors.values():
                 sampled.update(page_nodes(slab, samples=16))
-    except OSError as error:  # a diagnostic; the tier is already bound and registered
+    except OSError as error:  # diagnostic only; the tier is already bound
         sampled = Counter({f"unavailable: {error.strerror}": 0})
     return {
         "bound_bytes": {str(node): nbytes for node, nbytes in sorted(bound.items())},
@@ -746,12 +804,21 @@ def _placement_report(placement: Placement, caches) -> dict | None:
 
 
 class ExpertPinnedHostCacheManager:
-    """Allocate a global complete-row budget across streamed expert layers."""
+    """Splits one global pinned-host byte budget across a model's streamed layers.
+
+    Capacity is handed out one complete expert row at a time, round-robin over the
+    layers in ascending layer id, so every layer's tier grows evenly until the budget
+    or the layer's expert count runs out.
+    """
 
     @classmethod
     def from_model(
         cls, model: torch.nn.Module, budget_bytes: int
     ) -> ExpertPinnedHostCacheManager | None:
+        """Build one cache per streamed layer from ``budget_bytes``.
+
+        Returns None when the budget is zero or buys no complete row.
+        """
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
@@ -788,12 +855,12 @@ class ExpertPinnedHostCacheManager:
             return None
         manager = cls()
         # The format supplies tier options such as an is_pinned filter; the dense
-        # format supplies none, so NVFP4 tiers are built exactly as before.
+        # format supplies none.
         manager.caches = {
             layer_id: ExpertPinnedHostCache(
                 streamers[layer_id],
                 capacity,
-                # Only when set: an unplaced tier is built with the same arguments as before.
+                # Only when set, so an unplaced tier takes the constructor default.
                 **({"placement": placement} if placement else {}),
                 **pinned_tier_options_of(
                     streamers[layer_id].format, streamers[layer_id].layer
@@ -821,10 +888,11 @@ class ExpertPinnedHostCacheManager:
 
     @property
     def residency_bytes(self) -> int:
+        """Bytes of pinned host rows across all layers."""
         return sum(cache.residency_bytes for cache in self.caches.values())
 
     def snapshot_stats(self) -> dict[str, dict[str, int]]:
-        """Return cumulative row and byte counters grouped by layer."""
+        """Cumulative row and byte counters, keyed by layer id."""
         return {
             str(layer_id): {
                 "capacity_rows": cache.capacity,
@@ -836,6 +904,7 @@ class ExpertPinnedHostCacheManager:
 
 
 def expert_streaming_enabled() -> bool:
+    """Whether SGLANG_MOE_EXPERT_STREAM is on."""
     return envs.SGLANG_MOE_EXPERT_STREAM.get()
 
 
@@ -868,7 +937,10 @@ def _gather_host_rows_to_kernel(
     row_bytes,
     BLOCK: tl.constexpr,
 ):
-    """``_gather_host_rows_kernel`` into chosen output rows: program i copies source row index[i] to row rows[i]."""
+    """``_gather_host_rows_kernel`` into chosen rows.
+
+    Program i copies source row ``index[i]`` to output row ``rows[i]``.
+    """
     source_row = tl.load(index_ptr + tl.program_id(0)).to(tl.int64)
     output_row = tl.load(rows_ptr + tl.program_id(0)).to(tl.int64)
     offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -878,6 +950,7 @@ def _gather_host_rows_to_kernel(
 
 
 def _tensor_data(value: torch.Tensor) -> torch.Tensor:
+    """The tensor behind a ``Parameter``, else ``value`` itself."""
     return value.data if isinstance(value, torch.nn.Parameter) else value
 
 
@@ -890,6 +963,7 @@ def _scatter_hot_rows_kernel(
     row_bytes,
     BLOCK: tl.constexpr,
 ):
+    """Program i copies source row ``source_ids[i]`` to row ``destination_ids[i]``."""
     source_row = tl.load(source_ids + tl.program_id(0)).to(tl.int64)
     destination_row = tl.load(destination_ids + tl.program_id(0)).to(tl.int64)
     offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -904,6 +978,7 @@ def _scatter_hot_rows_kernel(
 
 
 def _cached_arange(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """A shared ``arange(size)``; callers must not write to it."""
     key = (size, str(device), dtype)
     value = _ARANGE_CACHE.get(key)
     if value is None:
@@ -920,11 +995,11 @@ def _staging_buffer(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Return the first ``rows`` rows of a reused buffer of at least ``max_rows``.
+    """Return the first ``rows`` rows of a reused CUDA buffer of >= ``max_rows``.
 
-    Allocated zeroed: deduplicated eager gathers hand the fused-MoE kernel rows
-    past the gathered ones, which no route selects and the CUTLASS kernel skips
-    as token-less experts (flashinfer 0.6.18 ``cutlass_fused_moe_kernels.cuh:1452-1457``);
+    Allocated zeroed: deduplicated eager gathers hand the fused-MoE kernel rows past
+    the gathered ones, which no route selects and the CUTLASS kernel skips as
+    token-less experts (flashinfer 0.6.18 ``cutlass_fused_moe_kernels.cuh:1452-1457``);
     zeros only keep it from reading uninitialised memory on first use.
     """
     key = (name, dtype, str(device), row_shape)
@@ -952,6 +1027,7 @@ def _pinned_staging_buffer(
     row_shape: Tuple[int, ...],
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Return the first ``rows`` rows of a reused pinned buffer of >= ``capacity``."""
     key = (name, dtype, row_shape)
     buffer = _PINNED_STAGING.get(key)
     if buffer is None or buffer.shape[0] < capacity:
@@ -972,6 +1048,7 @@ def _pinned_staging_buffer(
 
 
 def _copy_indices_to_cpu(source_ids: torch.Tensor, capacity: int) -> torch.Tensor:
+    """Copy ``source_ids`` to a reused pinned buffer, syncing the current stream."""
     key = (str(source_ids.device),)
     buffer = _PINNED_INDEX.get(key)
     if buffer is None or buffer.numel() < capacity:
@@ -994,18 +1071,36 @@ def _read_rows(
     destinations: dict[str, torch.Tensor],
     destination_rows: torch.Tensor | None,
 ) -> RowReadStats:
-    # Without destination rows, call read with two arguments, as the pageable
-    # gather path always called the file reader.
+    """Call ``source.read``, passing ``destination_rows`` only when given."""
+    # Row sources written for the pageable gather path take two arguments.
     if destination_rows is None:
         return source.read(rows_cpu, destinations)
     return source.read(rows_cpu, destinations, destination_rows)
 
 
 class ExpertStreamer:
-    """Gather aligned expert rows into compact, reusable CUDA buffers.
+    """Gathers one layer's selected expert rows into compact, reusable CUDA buffers.
 
-    Residency-policy recording is skipped during CUDA stream capture in phase one.
+    The layer's ``ExpertFormat`` owns the row schema (names, shapes, dtypes and
+    whether each tensor is host- or device-resident). Dense ``[experts, ...]`` sources
+    are looked up dynamically through the format, because the host arena rebinds
+    layer tensors after the streamer exists; names a row source covers are read by it.
 
+    Two gather modes, chosen per call by ``gather``:
+
+    - Graph (``enable_graph_gather``): at most ``graph_gather_rows`` routes, device
+      only. Misses are pulled into the hot cache's scratch (or victim) slots by
+      kernels that read the miss count on the device, so a CUDA graph can capture the
+      gather and replay it for any routes.
+    - Eager: the host reads the routes, deduplicates them, and fills staging buffers,
+      through the hot cache, the pinned host cache, or straight from the sources.
+      The staging buffers are shared by every layer, so a result is valid only until
+      the next eager gather.
+
+    Eager gathers record every route in the residency policy once per forward; the
+    recording is skipped during CUDA stream capture. The attributes set to None in
+    ``__init__`` are wired later by the hot cache, the residency policy, the pinned
+    host cache and the expert-prediction runtime.
     """
 
     def __init__(
@@ -1024,8 +1119,6 @@ class ExpertStreamer:
         self.tensor_names = tuple(tensor_names)
         if not self.tensor_names:
             raise ValueError("expert streamer requires at least one tensor")
-        # The format owns the row schema. Sources stay dynamic lookups because
-        # the host arena rebinds layer tensors after this streamer exists.
         self.format = DenseLayerFormat(self.tensor_names) if format is None else format
         self.num_experts = self._validate_sources()
         if row_source is _DEFAULT_ROW_SOURCE:
@@ -1050,8 +1143,9 @@ class ExpertStreamer:
         self._graph_pinned_tier = False
         self.row_tag = 0
         self.before_eager_gather = None
-        # Set by ExpertPredictionRuntime when SGLANG_MOE_EXPERT_PREFETCH_PULL is on and this
-        # layer is a scored prefetch target; see PrefetchPuller.join_target in serving/runtime.py.
+        # Set by ExpertPredictionRuntime when SGLANG_MOE_EXPERT_PREFETCH_PULL is on and
+        # this layer is a scored prefetch target; see PrefetchPuller.join_target in
+        # expert_prediction/serving/runtime.py.
         self.prefetch_puller = None
         self.graph_gather_rows = 0
         self.graph_counters: torch.Tensor | None = None
@@ -1086,27 +1180,29 @@ class ExpertStreamer:
         return tuple(self._specs.values())
 
     def spec(self, name: str) -> ExpertTensorSpec:
+        """The format's row spec of tensor ``name``."""
         return self._specs[name]
 
     def source(self, name: str) -> torch.Tensor | None:
-        """The dense ``[experts, ...]`` source of ``name`` now, or None when it has none."""
+        """The dense ``[experts, ...]`` source of ``name`` now, or None."""
         return self.format.source(self.layer, name)
 
     @property
     def has_spec_only_tensors(self) -> bool:
-        """Whether a streamed tensor has no dense source, so only the row source reads it."""
+        """Whether any streamed tensor lacks a dense source (a row source reads it)."""
         return any(self.source(name) is None for name in self.tensor_names)
 
     @property
     def row_source(self) -> ExpertRowSource | None:
+        """Reads the rows of the names it covers; None when the layer has none."""
         return self._row_source
 
     @row_source.setter
     def row_source(self, value: ExpertRowSource | None) -> None:
         """Assign the row source; a non-None value must hold ``num_experts`` rows.
 
-        None is always accepted without a check, so the host arena can drop
-        the source (``file_row_reader = None``) at no extra cost.
+        None is always accepted, so the host arena can drop the source
+        (``file_row_reader = None``).
         """
         if value is not None and value.num_experts != self.num_experts:
             raise ValueError(
@@ -1126,7 +1222,10 @@ class ExpertStreamer:
 
     @property
     def file_source_bytes_per_expert(self) -> int | None:
-        """File bytes one expert row reads; None keeps eager gathers out of the pinned tier."""
+        """File bytes one expert row reads.
+
+        None keeps eager gathers out of the pinned tier.
+        """
         return self.format.file_source_bytes_per_expert(self.layer, self.row_source)
 
     def read_host_rows(
@@ -1137,10 +1236,10 @@ class ExpertStreamer:
     ) -> RowReadStats:
         """Fill host ``destinations`` with expert ``rows_cpu``.
 
-        Every name the row source covers is read in one call, so a source that
-        reads a whole on-disk expert row per request pays for it once. The other
-        names are read from their dense sources. Rows land in
-        ``destination_rows`` of each destination, or in its leading rows.
+        Every name the row source covers is read in one call, so a source that reads
+        a whole on-disk expert row per request pays for it once. The other names are
+        read from their dense sources. Rows land in ``destination_rows`` of each
+        destination, or in its leading rows. Records the read in the stats.
         """
         row_source = self.row_source
         covered = {
@@ -1172,6 +1271,7 @@ class ExpertStreamer:
         return stats
 
     def _record_read(self, stats: RowReadStats) -> None:
+        """Add ``stats`` to the running gather's reads, else to the background reads."""
         if self._gather_read_stats is not None:
             self._gather_read_stats = self._gather_read_stats + stats
         else:
@@ -1191,14 +1291,18 @@ class ExpertStreamer:
     ) -> None:
         """Serve gathers of at most ``max_rows`` routes with device-only operations.
 
-        Misses are pulled from registered host rows into the hot cache's scratch
-        rows by a kernel that reads its row count on the device, and routes are
-        remapped with ``torch.where``. Nothing reads a CUDA value on the host, so
-        a CUDA graph can capture the gather and replay it for any routes.
-        All host-backed tensors of the layer are pulled in one kernel launch.
-        Its plan holds the tensors it addresses. Capture and eager gathers
-        raise if a layer tensor was rebound after this call; replays cannot
-        check, and keep reading the tensors frozen here.
+        Misses are pulled from registered host rows into the hot cache's scratch rows
+        by a kernel that reads its row count on the device, and routes are remapped
+        with ``torch.where``. Nothing reads a CUDA value on the host, so a CUDA graph
+        can capture the gather and replay it for any routes. All host-backed tensors
+        of the layer are pulled in one kernel launch.
+
+        The plan holds the tensors it addresses. Capture and eager gathers raise if a
+        layer tensor was rebound after this call; replays cannot check, and keep
+        reading the tensors frozen here.
+
+        ``scratch_destinations=False`` sends miss lanes to victim slots chosen by the
+        residency policy instead of scratch rows.
         """
         pinned_tier = graph_source_kind_of(self.format) == "pinned_tier"
         require_graph_gather_support((self,), pinned_tier_ok=True)
@@ -1225,8 +1329,8 @@ class ExpertStreamer:
         ):
             raise ValueError("graph gather cannot run with expert prefetch")
         if pinned_tier:
-            # Missed rows are read from the pinned tier's registered slabs by pinned
-            # slot (PinnedTierRowBackend), never from layer attributes.
+            # PinnedTierRowBackend reads misses from the tier's registered slabs by
+            # pinned slot, never from layer attributes.
             sources = dict(self.pinned_host_cache.tensors)
         else:
             sources = {
@@ -1253,21 +1357,23 @@ class ExpertStreamer:
         ]
         self._copy_row_segments_gpu = copy_expert_row_segments_gpu
         if scratch_destinations:
-            # Device-source tensors take a separate fixed-shape index copy of every route row.
-            # Its padding lanes past the miss count land in spare scratch rows, harmlessly.
+            # Device-source tensors take a separate fixed-shape index copy of every
+            # route row; its padding lanes past the miss count land in spare scratch
+            # rows, harmlessly.
             self._graph_device_pairs = device_pairs
             segment_pairs = host_pairs
         else:
-            # Without scratch there is no harmless landing place for a padding lane, so every
-            # pair goes through the segment kernel, which copies exactly ``count`` rows.
-            # ``_validate_row_pair`` accepts CUDA sources, and one launch replaces two.
+            # Without scratch there is no harmless landing place for a padding lane, so
+            # every pair goes through the segment kernel, which copies exactly
+            # ``count`` rows (``_validate_row_pair`` accepts CUDA sources). One launch
+            # replaces two.
             self._graph_device_pairs = ()
             segment_pairs = host_pairs + list(device_pairs)
         self._graph_row_segments = (
             expert_row_segments(segment_pairs) if segment_pairs else None
         )
-        # Stage 2 merges the device pairs into the segment table, so the table's existence no
-        # longer says whether anything is host-backed. Record that separately.
+        # Without scratch the device pairs are merged into the segment table, so the
+        # table's existence no longer says whether anything is host-backed.
         self._graph_host_pair_count = len(host_pairs)
         self._graph_scratch_slots = (
             torch.arange(
@@ -1277,7 +1383,8 @@ class ExpertStreamer:
                 device=device,
             )
             if scratch_destinations
-            # Overwritten with victim slots by every gather; zero is a valid row until then.
+            # Overwritten with victim slots by every gather; zero is a valid row until
+            # then.
             else torch.zeros(max_rows, dtype=torch.long, device=device)
         )
         self._graph_source_rows = torch.zeros(
@@ -1285,21 +1392,21 @@ class ExpertStreamer:
         )
         self._graph_destination_slots = self._graph_scratch_slots.to(torch.int32)
         self._graph_miss_count = torch.zeros(1, dtype=torch.int32, device=device)
-        # Read once here rather than in `_gather_graph`: `EnvBool.get()` is an
-        # uncached `os.getenv` read, and reading it again per call could
-        # disagree with this setup-time read and index a buffer that was
-        # never allocated.
+        # Read once here, not in `_gather_graph`: `EnvBool.get()` is an uncached
+        # `os.getenv`, and a later read could disagree with this one and index a buffer
+        # that was never allocated.
         self._fused_plan_enabled = envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()
-        # int64 [num_experts]: the fused plan sorts its miss lanes by it, highest first (CPU experts). None: off.
+        # int64 [num_experts]: the fused plan sorts its miss lanes by it, highest
+        # first (CPU experts). None: off.
         self._plan_miss_keys = None
         self._graph_fused_slots_scratch = (
             torch.empty(max_rows, dtype=torch.int32, device=device)
             if self._fused_plan_enabled
             else None
         )
-        # The fused planner preserves a router's native int32 ids (or int64
-        # where a model uses them) and writes directly into a stable remap.
-        # Separate buffers avoid a dtype conversion/allocation during replay.
+        # The fused planner keeps the router's native id dtype (int32, or int64 for
+        # some models) and writes into a stable remap; one buffer per dtype avoids a
+        # conversion or allocation during replay.
         self._graph_fused_remaps = (
             {
                 dtype: torch.empty(max_rows, dtype=dtype, device=device)
@@ -1334,6 +1441,10 @@ class ExpertStreamer:
     def _gather_graph(
         self, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Capturable gather: plan the routes, issue the miss copies, remap the routes.
+
+        Returns the remapped ``topk_ids`` and the hot cache's fixed slot tensors.
+        """
         self._check_graph_sources()
         if self.residency_update is not None:
             self.residency_update.on_graph_forward(topk_ids.shape[0])
@@ -1342,8 +1453,8 @@ class ExpertStreamer:
         fused = self._fused_plan_enabled and supports_fused_graph_routes(
             topk_ids, expert_to_slot, self.graph_gather_rows
         )
-        # The JIT planner supports the router's native IDs.  Its generic
-        # counterpart relies on index_select, which requires int64.
+        # The JIT planner takes the router's native ids; the generic planner uses
+        # index_select, which needs int64.
         if self._plan_miss_keys is not None and not fused:
             raise RuntimeError(
                 f"layer {self.layer_id}: the sorted miss order needs the fused route plan "
@@ -1352,10 +1463,9 @@ class ExpertStreamer:
         flat = topk_ids.reshape(-1) if fused else topk_ids.reshape(-1).long()
         count = flat.numel()
         prefetch_puller = getattr(self, "prefetch_puller", None)
-        # Read before planning, not after: the planner needs the posted prediction to
-        # exclude its covered row from the demand-scratch plan (the row-skip this
-        # dispatch exists for). Safe without the pull's stream join -- see
-        # `PrefetchPuller.predicted_expert_for`.
+        # Read before planning: the planner needs the posted prediction to exclude
+        # its covered row from the demand-scratch plan. Safe without the pull's
+        # stream join; see `PrefetchPuller.predicted_expert_for`.
         prefetch_expert = (
             prefetch_puller.predicted_expert_for(self.layer_id)
             if prefetch_puller is not None
@@ -1415,8 +1525,9 @@ class ExpertStreamer:
             source_rows = plan.source_rows
         direct = getattr(self, "residency_direct", None)
         if direct is not None and direct.layer_fusion:
-            # One kernel for the branch below. Without a prefetch join it writes the router's own
-            # dtype, so the cast on return is a no-op; the join keeps the int64 the branch returns.
+            # One kernel for the branch below. Without a prefetch join it writes the
+            # router's own dtype, so the cast on return is a no-op; with one it keeps
+            # the int64 the branch returns.
             remap = direct.fused_gather_destinations(
                 self.residency_row,
                 remap,
@@ -1426,8 +1537,8 @@ class ExpertStreamer:
                 topk_ids.dtype if prefetch_puller is None else torch.int64,
             )
         elif direct is not None:
-            # Stage DIRECT: send the miss lanes into victim slots instead of scratch rows.
-            # `expert_to_slot` is still this forward's pre-gather mapping here, so its slots
+            # Send the miss lanes into victim slots instead of scratch rows.
+            # `expert_to_slot` is still this forward's pre-gather mapping, so its slots
             # are exactly the rows the gather is about to read.
             remap = direct.gather_destinations(
                 self.residency_row,
@@ -1436,10 +1547,10 @@ class ExpertStreamer:
                 self.row_planner.scratch_base,
             )
         if prefetch_puller is not None:
-            # Join after actual routing: `remap`/`expert_to_slot` above are this
-            # forward's real routing decision, not the prediction that posted the
-            # pull. The dedicated slot the pull wrote is never in `scratch`
-            # (plan section 7.1), so the ordinary demand copy below cannot race it.
+            # Join after the actual routing: `remap` and `expert_to_slot` are this
+            # forward's real decision, not the prediction that posted the pull. The
+            # pull's dedicated slot is never in `scratch`, so the demand copy below
+            # cannot race it.
             remap = prefetch_puller.join_target(
                 self.layer_id,
                 flat_ids=flat,
@@ -1470,10 +1581,10 @@ class ExpertStreamer:
             delivery = self.row_backend.resolve(self.row_tag, self.row_plan)
             self.row_backend.copy_residual(self.row_tag, delivery)
         if direct is not None:
-            # Strictly after the copies, on this same stream: residency only claims a row
-            # once the copy that fills it has been issued ahead of it.
+            # Strictly after the copies, on this stream: residency claims a row only
+            # once the copy that fills it has been issued.
             if moe_side_stream.active():
-                # The side stream forks after the copies; the MoE layer joins it before the next layer's gather.
+                # The MoE layer joins the side stream before the next layer's gather.
                 moe_side_stream.fork(
                     direct.commit_gather, inputs=direct.pending_commit_tensors()
                 )
@@ -1491,7 +1602,7 @@ class ExpertStreamer:
         return remap.reshape(topk_ids.shape).to(topk_ids.dtype), cache.tensors
 
     def _check_graph_sources(self) -> None:
-        """Raise if a layer tensor was rebound after its graph gather plan froze it."""
+        """Raise if a layer tensor was rebound after the graph gather plan froze it."""
         for name, source in self._graph_sources.items():
             current = (
                 self.pinned_host_cache.tensors[name]
@@ -1520,7 +1631,8 @@ class ExpertStreamer:
         row_count: int,
         capacity: int,
     ) -> None:
-        """Read ``outputs``' rows on the host in one batch into pinned staging, then copy them up."""
+        """Read ``outputs``' rows on the host in one batch into pinned staging, then
+        copy them to the device."""
         assert cpu_ids is not None
         host_outputs = {
             name: _pinned_staging_buffer(
@@ -1574,14 +1686,13 @@ class ExpertStreamer:
     def _copy_source_rows(
         self, source_ids: torch.Tensor, outputs: dict[str, torch.Tensor]
     ) -> int:
-        """Fill supplied CUDA rows through the existing bounded host buffers.
+        """Fill CUDA ``outputs`` with the rows ``source_ids`` from each tensor's source.
 
-        With the ``dma`` copy backend, rows of registered or pinned host tensors
-        go through the CUDA copy engine, merged into runs of consecutive rows.
-        Graph capture keeps the pull kernel. Rows of pageable host tensors, and
-        of tensors without a dense source, are read by the row sources in one
-        batch into pinned staging. Returns the bytes the copy engine moved, so
-        a build without it shows up as zero.
+        With the ``dma`` copy backend, rows of registered or pinned host tensors go
+        through the CUDA copy engine, merged into runs of consecutive rows; graph
+        capture keeps the pull kernel. Rows of pageable host tensors, and of tensors
+        without a dense source, are read by the row sources in one batch into pinned
+        staging. Returns the bytes the copy engine moved (zero without it).
         """
         row_count = source_ids.numel()
         use_dma = (
@@ -1650,13 +1761,20 @@ class ExpertStreamer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Gather routed rows through the hot cache for the fused-MoE kernel.
 
-        When ``should_dedup`` applies, returned tensors keep a leading dimension
-        of ``max(row_count, NO_DEDUP_LIMIT)``: rows are assembled into the first
-        ``row_count`` rows of each staging buffer and the padded view is
-        returned. Deduplicated gathers give a different expert count on almost
-        every call, which made the fused-MoE kernel 4x slower (experiment E10).
-        A forward without dedup already has a constant count and returns
-        ``row_count`` rows.
+        Hits are scattered out of the hot cache and misses are copied from their
+        sources (through the pinned host cache when it applies). Misses take the
+        staging buffer's first rows so their copies land in place, with no second
+        buffer as large as a layer's experts.
+
+        Leading-dimension rule, shared by every eager gather: when ``should_dedup``
+        applies, rows are assembled into the first ``row_count`` rows of each staging
+        buffer and the padded view of ``max(row_count, NO_DEDUP_LIMIT)`` rows is
+        returned, because a deduplicated gather has a different expert count on
+        almost every call and that made the fused-MoE kernel 4x slower. A forward
+        without dedup has a constant count and returns ``row_count`` rows.
+
+        ``hot_out``, when given, receives the host lists (hot slots, hit flags) read
+        with the chunk's one sync, for ``host_row_of_source``.
         """
         cache = self.hot_cache
         slots, hit_mask = cache.lookup(source_ids)
@@ -1667,7 +1785,8 @@ class ExpertStreamer:
                 raise ValueError(
                     "hot_out needs one route per source, as _gather_experts_host gives"
                 )
-            # The chunk's one sync, as below, also hands the host every row's place: no readback after its gather.
+            # The chunk's one sync also hands the host every row's place, so no
+            # readback is needed after the gather.
             slots_host, hits_host = torch.stack(
                 (slots.long(), hit_mask.long())
             ).tolist()
@@ -1689,10 +1808,12 @@ class ExpertStreamer:
             ), cache.tensors
         capacity = max(row_count, _NO_DEDUP_LIMIT)
         kernel_rows = capacity if should_dedup(topk_ids) else row_count
-        # Allocated at a whole layer's experts from the first gather: prefill chunks climb to
-        # nearly all of them, and growing one step at a time left every outgrown buffer in
-        # the allocator's cache at the prefill peak. A format with large rows caps that
-        # floor at its max_gather_rows and gathers in chunks (iter_gather_experts).
+        # Allocated at a whole layer's experts from the first gather: prefill chunks
+        # climb to nearly all of them, and growing one step at a time left every
+        # outgrown buffer in the allocator's cache at the prefill peak (see
+        # MOE_EXPERT_TRANSFER.md, "Prefill staging and VRAM 2026-09-18"). A format
+        # with large rows caps that floor at its max_gather_rows and gathers in
+        # chunks (iter_gather_experts).
         padded = {
             name: _staging_buffer(
                 name,
@@ -1706,8 +1827,7 @@ class ExpertStreamer:
         }
         gathered = {name: buffer[:row_count] for name, buffer in padded.items()}
         miss_source_ids = source_ids[~hit_mask]
-        # Misses take the first rows so their copies land in place, with no second
-        # staging buffer as large as a layer's experts; hits fill the rows after them.
+        # Hits fill the rows after the misses.
         misses = {name: output[:miss_rows] for name, output in gathered.items()}
         assembly_bytes = hit_rows * self.bytes_per_expert
         if hit_rows:
@@ -1737,7 +1857,7 @@ class ExpertStreamer:
                 for name, output in misses.items()
                 if name in pinned_cache.cached_names
             }
-            # Chunked so misses beyond the pinned capacity are never copied from slot -1.
+            # Chunked, so misses beyond the pinned capacity are never copied from -1.
             pinned = pinned_cache.gather_rows(miss_source_ids, pinned_outputs)
             pinned_hit_rows = pinned.hit_rows
             pinned_miss_rows = pinned.miss_rows
@@ -1794,13 +1914,13 @@ class ExpertStreamer:
         compact_ids: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Gather routed rows through the pinned host cache.
+        """Gather routed rows through the pinned host cache, with no hot cache.
 
         Returned tensors follow the leading-dimension rule of ``_gather_cached``.
         Pinned rows are copied straight into the one staging set of
-        ``max(rows, NO_DEDUP_LIMIT)`` rows by ``gather_rows``, which admits
-        misses in chunks the tier can hold, so a format's ``max_gather_rows``
-        bounds this path's VRAM as it bounds ``_gather_cached``'s.
+        ``max(rows, NO_DEDUP_LIMIT)`` rows by ``gather_rows``, which admits misses in
+        chunks the tier can hold, so a format's ``max_gather_rows`` bounds this path's
+        VRAM as it bounds ``_gather_cached``'s.
         """
         cache = self.pinned_host_cache
         assert cache is not None
@@ -1854,19 +1974,22 @@ class ExpertStreamer:
 
     @contextlib.contextmanager
     def prefill_fills(self, source_ids: torch.Tensor) -> Iterator[None]:
-        """SGLANG_DSV41_ENABLE_PREFILL_FILLS: read a layer's pinned-tier misses while its chunks gather.
+        """SGLANG_DSV41_ENABLE_PREFILL_FILLS: read tier misses while chunks gather.
 
-        ``source_ids`` are the layer's distinct routed experts, gathered inside this context. The pinned tier is
-        held in one host use for the whole layer (one stream sync, one pause of its owner), the experts that miss
-        VRAM and RAM are claimed in ascending order (the chunks' order) and read on the tier's fill thread, and each
-        chunk's ``gather_rows`` waits only for its own rows. Nothing happens without the tier's ``row_fills``.
+        ``source_ids`` are the layer's distinct routed experts, gathered inside this
+        context. The pinned tier is held in one host use for the whole layer (one
+        stream sync, one pause of its owner), the experts that miss VRAM and RAM are
+        claimed in ascending order (the chunks' order) and read on the tier's fill
+        thread, and each chunk's ``gather_rows`` waits only for its own rows. A no-op
+        without the tier's ``row_fills``.
         """
         cache = self.pinned_host_cache
         if cache is None or cache.row_fills is None or source_ids.numel() == 0:
             yield
             return
         if self.before_eager_gather is not None:
-            # The first gather would apply a pending residency boundary; apply it before reading the hot set.
+            # The first gather would apply a pending residency boundary; apply it
+            # before reading the hot set.
             self.before_eager_gather()
         ids = source_ids.long()
         with cache.host_use():
@@ -1892,8 +2015,8 @@ class ExpertStreamer:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the source IDs to gather and each route's index into them.
 
-        Multi-token forwards gather one row per distinct expert; the residency
-        policy still records every route, keeping routed multiplicity.
+        Multi-token forwards gather one row per distinct expert; the residency policy
+        still records every route (when ``record``), keeping routed multiplicity.
         """
         flat_ids = topk_ids.reshape(-1)
         if should_dedup(topk_ids):
@@ -1910,21 +2033,17 @@ class ExpertStreamer:
         return source_ids, compact_ids
 
     def record_routes(self, topk_ids: torch.Tensor) -> None:
-        """Count every route of a forward in the residency policy; call once per forward.
+        """Count every route of a forward in the residency policy, once per forward.
 
-        Contract: every id in ``topk_ids`` must be in ``[0, num_experts)``,
-        on the residency policy's device, with the forward's full
-        multiplicity. A caller whose ``topk_ids`` can carry negative or
-        sentinel ids (padding, masked routes) must filter them out itself
-        before calling this; ``record_routes`` does not filter, so that
-        NVFP4 prefill, which never has such ids, pays no extra masked-select.
-        ``ExpertResidencyPolicy.record_routes`` runs ``torch.bincount`` on
-        the ids and raises on a negative id or a device mismatch.
+        Every id in ``topk_ids`` must be in ``[0, num_experts)``, on the residency
+        policy's device, with the forward's full multiplicity. A caller whose ids can
+        be negative or sentinels (padding, masked routes) must filter them first:
+        this does not, so NVFP4 prefill, which never has such ids, pays no extra
+        masked select. ``ExpertResidencyPolicy.record_routes`` runs ``torch.bincount``
+        and raises on a negative id or a device mismatch.
 
-        Skipped during CUDA stream capture. ``gather`` calls it itself with
-        ids it has already range-checked; a consumer of ``gather_experts``
-        calls it separately with the forward's full ``topk_ids``, filtered
-        to satisfy this contract.
+        Skipped during CUDA stream capture. ``gather`` calls it itself with ids it has
+        already range-checked; a consumer of ``gather_experts`` calls it separately.
         """
         residency_policy = self.residency_policy
         flat_ids = topk_ids.reshape(-1)
@@ -1938,16 +2057,17 @@ class ExpertStreamer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return compact route IDs and the expert rows they index.
 
-        Eager results follow the leading-dimension rule of ``_gather_cached``;
-        graph gathers return the fixed hot-cache tensors.
+        Routes of at most ``graph_gather_rows`` take the capturable graph gather.
+        Eager results follow the leading-dimension rule of ``_gather_cached``; graph
+        gathers return the fixed hot-cache tensors.
         """
         if topk_ids.device.type != "cuda":
             raise ValueError("selected expert IDs must be on CUDA")
         if 0 < topk_ids.numel() <= self.graph_gather_rows:
             return self._gather_graph(topk_ids)
-        # A source score can still have forked this target's side pull when an
-        # eager/tail shape falls outside graph-gather support. It is not usable
-        # there, but must join before this state can be reused.
+        # A source score may have forked a side pull for this target even though this
+        # eager shape is outside graph-gather support. The pull is unusable here but
+        # must join before its state is reused.
         prefetch_puller = getattr(self, "prefetch_puller", None)
         if prefetch_puller is not None:
             prefetch_puller.join_unsupported_target(self.layer_id)
@@ -1984,22 +2104,18 @@ class ExpertStreamer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Gather the rows of the distinct experts ``source_ids`` for an eager consumer.
 
-        Returns ``(row_of_source, rows)``, where ``rows[name][row_of_source[i]]``
-        holds expert ``source_ids[i]``. ``rows`` are the hot cache's slot
-        tensors when every expert is resident, else staging buffers that the
-        next eager gather of any layer reuses: enqueue any consuming work on
-        the current stream before calling into this streamer again (``next()``
-        on an ``iter_gather_experts`` iterator included), and clone any row
-        you need to keep past that point. An all-hit chunk returns the hot
-        cache's own slot tensors, not a staging copy. Routes are not
-        recorded: call ``record_routes`` once with the forward's full
-        ``topk_ids``. At most the format's ``max_gather_rows`` experts per
-        call; see ``iter_gather_experts``.
+        Returns ``(row_of_source, rows)``, where ``rows[name][row_of_source[i]]`` holds
+        expert ``source_ids[i]``. ``rows`` are the hot cache's own slot tensors when
+        every expert is resident, else staging buffers that the next eager gather of
+        any layer reuses: enqueue the consuming work on the current stream before
+        calling into this streamer again (``next()`` on an ``iter_gather_experts``
+        iterator included), and clone any row to keep past that point.
 
-        Validates ``source_ids`` itself (1-D, in range, distinct). A caller
-        that already validated a larger id set once, such as
-        ``iter_gather_experts``, should not call this method per chunk;
-        use the unvalidated ``_gather_experts`` instead.
+        Routes are not recorded: call ``record_routes`` once with the forward's full
+        ``topk_ids``. At most the format's ``max_gather_rows`` experts per call; see
+        ``iter_gather_experts``. Validates ``source_ids`` itself (1-D, in range,
+        distinct); a caller that already validated a larger id set should use the
+        unvalidated ``_gather_experts`` per chunk.
         """
         if source_ids.ndim != 1:
             raise ValueError("gather_experts needs a 1-D tensor of expert IDs")
@@ -2019,12 +2135,10 @@ class ExpertStreamer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """The unvalidated core of ``gather_experts``.
 
-        Callers must have already checked that ``source_ids`` is a 1-D,
-        in-range, distinct tensor of expert IDs; ``gather_experts`` and
-        ``iter_gather_experts`` are the only callers, and each validates
-        once before any chunk reaches here. This still enforces the
-        format's ``max_gather_rows`` cap and the prefetch refusal per call,
-        since both can vary by chunk.
+        ``source_ids`` must already be a 1-D, in-range, distinct tensor of expert IDs;
+        ``gather_experts`` and ``iter_gather_experts`` validate once before any chunk
+        reaches here. Still enforces the format's ``max_gather_rows`` cap and the
+        prefetch refusal per call, since the cap can vary by chunk.
         """
         count = source_ids.numel()
         self._begin_eager_chunk(count)
@@ -2035,7 +2149,10 @@ class ExpertStreamer:
         return row_of_source.reshape(-1), rows
 
     def _begin_eager_chunk(self, count: int) -> None:
-        """Per chunk: the format's ``max_gather_rows`` cap, the prefetch refusal, and a pending residency boundary."""
+        """Per-chunk checks: the ``max_gather_rows`` cap and the prefetch refusal.
+
+        Also applies a pending residency boundary.
+        """
         cap = self.format.max_gather_rows
         if cap is not None and count > cap:
             raise ValueError(
@@ -2052,7 +2169,10 @@ class ExpertStreamer:
     def _gather_experts_host(
         self, source_ids: torch.Tensor
     ) -> tuple[list[int], dict[str, torch.Tensor]]:
-        """``_gather_experts`` returning ``row_of_source`` as a host list, read with the chunk's pre-gather sync."""
+        """``_gather_experts`` returning ``row_of_source`` as a host list.
+
+        The list is read with the chunk's pre-gather sync.
+        """
         count = source_ids.numel()
         self._begin_eager_chunk(count)
         compact_ids = _cached_arange(count, source_ids.device, source_ids.dtype)
@@ -2060,7 +2180,7 @@ class ExpertStreamer:
         _, rows = self._gather_eager_rows(
             source_ids, compact_ids, source_ids.reshape(1, -1), hot_out=hot
         )
-        # Without a hot cache the pinned and uncached paths return compact_ids: source i is row i.
+        # Without a hot cache the other paths return compact_ids: source i is row i.
         return (host_row_of_source(*hot) if hot else list(range(count))), rows
 
     def iter_gather_experts(
@@ -2068,18 +2188,16 @@ class ExpertStreamer:
     ) -> Iterator[tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]]:
         """Yield ``(chunk_ids, row_of_source, rows)`` over chunks of distinct experts.
 
-        Each chunk is one gather of at most ``chunk_rows`` experts (default:
-        the format's ``max_gather_rows``, else all at once). A chunk's rows
-        share staging with the next chunk, so consume them (see
-        ``gather_experts``'s docstring for the staging-reuse contract) before
-        advancing to the next chunk. When the iteration ends,
-        ``last_gather_stats`` holds the sum over its chunks, so observers
-        count the forward once.
+        Each chunk is one gather of at most ``chunk_rows`` experts (default: the
+        format's ``max_gather_rows``, else all at once). A chunk's rows share staging
+        with the next chunk, so consume them (see ``gather_experts`` for the
+        staging-reuse contract) before advancing. When the iteration ends,
+        ``last_gather_stats`` holds the sum over its chunks, so observers count the
+        forward once.
 
-        Validates ``source_ids`` once, up front (1-D, in range, distinct),
-        then dispatches every chunk through the unvalidated
-        ``_gather_experts`` so a multi-chunk gather does not repeat the
-        range and distinctness syncs per chunk.
+        Validates ``source_ids`` once, up front (1-D, in range, distinct), then
+        dispatches every chunk through the unvalidated ``_gather_experts``, so a
+        multi-chunk gather does not repeat the range and distinctness syncs.
         """
         if source_ids.ndim != 1:
             raise ValueError("iter_gather_experts needs a 1-D tensor of expert IDs")
@@ -2120,11 +2238,13 @@ class ExpertStreamer:
         experts: list[int],
         chunk_rows: int | None = None,
     ) -> Iterator[tuple[list[int], list[int], dict[str, torch.Tensor]]]:
-        """``iter_gather_experts`` for a caller holding ``source_ids`` on the host as ``experts``.
+        """``iter_gather_experts`` for a caller holding ``source_ids`` on the host.
 
-        Yields each chunk's expert ids and ``row_of_source`` as lists, read with the chunk's own pre-gather sync,
-        so consuming a chunk needs no readback and the host can run ahead of its gather. Validated on the host.
-        The staging-reuse contract and ``last_gather_stats`` are ``iter_gather_experts``'s.
+        ``experts`` is the host copy of ``source_ids``. Yields each chunk's expert ids
+        and ``row_of_source`` as lists, read with the chunk's own pre-gather sync, so
+        consuming a chunk needs no readback and the host can run ahead of its gather.
+        Validated on the host. The staging-reuse contract and ``last_gather_stats``
+        are ``iter_gather_experts``'s.
         """
         count = len(experts)
         if source_ids.ndim != 1 or source_ids.numel() != count:
@@ -2169,7 +2289,7 @@ class ExpertStreamer:
         topk_ids: torch.Tensor,
         hot_out: list | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Run one eager gather and add the host reads it caused to its stats."""
+        """Run one eager gather and add the host row reads it caused to its stats."""
         self._gather_read_stats = RowReadStats()
         try:
             result = self._dispatch_eager_rows(
@@ -2196,6 +2316,7 @@ class ExpertStreamer:
         topk_ids: torch.Tensor,
         hot_out: list | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Pick the eager path: hot cache, else pinned host cache, else uncached."""
         if self.hot_cache is not None and self.hot_cache.capacity:
             return self._gather_cached(
                 source_ids, compact_ids, topk_ids, hot_out=hot_out

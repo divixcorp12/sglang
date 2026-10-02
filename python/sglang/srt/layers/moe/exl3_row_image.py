@@ -1,20 +1,29 @@
-"""Row images: EXL3 expert rows re-laid so an O_DIRECT readv lands them straight in the pinned slabs.
+"""Row images: EXL3 expert rows re-laid so an O_DIRECT readv lands them in the slabs.
 
-A checkpoint row packs its tensors with no padding at odd file offsets, so its bytes can only reach the per-name
-slabs through a bounce buffer and a copy. A row image is the same row with every byte already where the slabs hold
-it: the six streamed names' slab rows back to back, in ``EXL3_STREAMED_NAMES`` order. Every slab row is a multiple
-of 512 bytes, so every name starts on a 512-byte boundary of the image, and a readv whose file offset and segment
-lengths are 512-aligned scatters an image range into the slab rows (probe: analysis/dsv41-drive/direct-read-probe).
+A checkpoint row packs its tensors with no padding at odd file offsets, so its bytes
+can only reach the per-name pinned slabs through a bounce buffer and a copy. A row
+image is the same row with every byte already where the slabs hold it: the six
+streamed names' slab rows back to back, in ``EXL3_STREAMED_NAMES`` order. Every slab
+row is a multiple of 512 bytes, so every name starts on a 512-byte boundary of the
+image, and a readv whose file offset and segment lengths are 512-aligned scatters an
+image range into the slab rows (probe: analysis/dsv41-drive/direct-read-probe).
+
+The byte mapping is ``image[image_offset(s) : + s.nbytes] = row[s.src_offset : +
+s.nbytes]`` for each :class:`RowSegment` ``s`` of the format's segment map, the same
+copies the packing path makes into the slabs.
 
 On disk, under ``<mirror root>/exl3_row_images/``:
 
-* ``layer-LLL.rows`` per layer: expert ``e``'s image at byte ``e * row_stride``, zero-padded to ``row_stride``
-  (``image_bytes`` rounded up to a page). A reader reads exactly ``image_bytes``; the padding is never read.
-* ``manifest.json``, written last (by rename): the format, the image layout, the source it was built from, and a
-  digest per row. A root without a complete manifest that matches the live layout is refused, never read.
+* ``layer-LLL.rows`` per layer: expert ``e``'s image at byte ``e * row_stride``,
+  zero-padded to ``row_stride`` (``image_bytes`` rounded up to a page). A reader
+  reads exactly ``image_bytes``; the padding is never read.
+* ``manifest.json``, written last (by rename): the format, the image layout, the
+  source it was built from, and a digest per row. A root without a complete
+  manifest that matches the live layout is refused, never read.
 
-The byte mapping is ``image[image_offset(s) : + s.nbytes] = row[s.src_offset : + s.nbytes]`` for each RowSegment
-``s`` of the format's segment map, the same copies the packing path makes into the slabs.
+This file holds the layout (:class:`RowImageLayout`), the packing and digest helpers,
+the manifest read/write, and :func:`open_row_images`, which validates a set of roots.
+The images are built by ``scripts/dsv41/build_row_images.py``.
 """
 
 from __future__ import annotations
@@ -33,21 +42,30 @@ ROW_IMAGE_SUBDIR = "exl3_row_images"
 FORMAT = "exl3-row-images"
 VERSION = 1
 MANIFEST = "manifest.json"
-# O_DIRECT on the mirror drives (XFS and ext4, 512 B logical blocks): file offsets and segment lengths.
+# O_DIRECT alignment on the mirror drives (XFS and ext4, 512 B logical blocks), for
+# file offsets and segment lengths.
 IO_ALIGN = 512
 PAGE = 4096
 
 
 def layer_file_name(layer_id: int) -> str:
+    """The image file name of ``layer_id`` inside a root's image directory."""
     return f"layer-{layer_id:03d}.rows"
 
 
 def row_image_dir(root: str) -> str:
+    """The directory holding ``root``'s row images and manifest."""
     return os.path.join(root, ROW_IMAGE_SUBDIR)
 
 
 class RowImageLayout(msgspec.Struct, frozen=True, kw_only=True):
-    """Where each streamed name's slab row sits in a row image; indexed in ``EXL3_STREAMED_NAMES`` order."""
+    """Where each streamed name's slab row sits in a row image.
+
+    ``row_bytes`` and ``name_offsets`` are indexed in ``EXL3_STREAMED_NAMES`` order;
+    ``segments`` is the format's segment map the image was derived from. Immutable,
+    and serialized by ``to_json`` into the manifest, where a reader compares it
+    against the live layout.
+    """
 
     row_bytes: tuple[int, ...]
     name_offsets: tuple[int, ...]
@@ -56,12 +74,14 @@ class RowImageLayout(msgspec.Struct, frozen=True, kw_only=True):
     segments: tuple[RowSegment, ...]
 
     def image_offset(self, segment: RowSegment) -> int:
+        """Byte offset in the image where ``segment`` lands."""
         return (
             self.name_offsets[EXL3_STREAMED_NAMES.index(segment.name)]
             + segment.dst_offset
         )
 
     def to_json(self) -> dict:
+        """The manifest form of the layout."""
         return {
             "names": list(EXL3_STREAMED_NAMES),
             "row_bytes": list(self.row_bytes),
@@ -76,7 +96,12 @@ class RowImageLayout(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def row_image_layout(segments: Sequence[RowSegment]) -> RowImageLayout:
-    """The image layout of a format's segment map; refuses a map a readv could not land directly."""
+    """The image layout of a format's segment map.
+
+    Raises ``ValueError`` for a map a readv could not land directly: a name with no
+    segment, gaps or overlaps within a name, a slab row that is not a multiple of
+    512 bytes, or segments naming a tensor that is not streamed.
+    """
     row_bytes = []
     for name in EXL3_STREAMED_NAMES:
         spans = sorted(
@@ -115,7 +140,10 @@ def row_image_layout(segments: Sequence[RowSegment]) -> RowImageLayout:
 def image_of_row(
     layout: RowImageLayout, row: bytes | bytearray | memoryview
 ) -> bytearray:
-    """The image (``image_bytes``, no padding) of one on-disk row (the record's ``nbytes`` from its file offset)."""
+    """The image (``image_bytes``, no padding) of one on-disk row.
+
+    ``row`` is the record's ``nbytes`` from its file offset.
+    """
     raw = memoryview(row)
     image = bytearray(layout.image_bytes)
     for s in layout.segments:
@@ -127,12 +155,17 @@ def image_of_row(
 
 
 def row_digest(image: bytes | bytearray | memoryview) -> str:
+    """A short digest of one row image, recorded per row in the manifest."""
     return hashlib.blake2b(image, digest_size=8).hexdigest()
 
 
 def source_fingerprint(layout: Exl3ExpertLayout, source_root: str) -> dict:
-    """What an image set was built from: every shard the layout reads (relative path, size) and a digest of the
-    row records and tensor spans. Two layouts with equal fingerprints read the same bytes into the same places."""
+    """What an image set was built from.
+
+    Every shard the layout reads (relative path, size) and a digest of the row
+    records and tensor spans. Two layouts with equal fingerprints read the same
+    bytes into the same places.
+    """
     shards = sorted({r.path for r in layout.records.values()})
     records = hashlib.sha256()
     for key in sorted(layout.records):
@@ -160,7 +193,10 @@ def manifest_json(
     fingerprint: dict,
     digests: Mapping[int, Sequence[str]],
 ) -> dict:
-    """The manifest of a complete image set; ``digests[layer_id][expert]`` is ``row_digest`` of that image."""
+    """The manifest of a complete image set.
+
+    ``digests[layer_id][expert]`` is ``row_digest`` of that expert's image.
+    """
     return {
         "format": FORMAT,
         "version": VERSION,
@@ -175,8 +211,12 @@ def manifest_json(
 
 
 def write_manifest(root: str, manifest: dict) -> None:
-    """Write ``manifest`` into ``root``'s image dir atomically (tmp, fsync, rename, fsync dir). Call it only after
-    every layer file is written and fsynced: the manifest is what makes the set readable."""
+    """Write ``manifest`` into ``root``'s image dir atomically.
+
+    Atomic means tmp file, fsync, rename, fsync of the directory. Call it only after
+    every layer file is written and fsynced: the manifest is what makes the set
+    readable.
+    """
     directory = row_image_dir(root)
     tmp = os.path.join(directory, MANIFEST + ".tmp")
     with open(tmp, "w") as f:
@@ -192,6 +232,7 @@ def write_manifest(root: str, manifest: dict) -> None:
 
 
 def read_manifest(root: str) -> dict:
+    """Load ``root``'s manifest; raises ``ValueError`` if it does not exist."""
     path = os.path.join(row_image_dir(root), MANIFEST)
     try:
         with open(path) as f:
@@ -203,7 +244,11 @@ def read_manifest(root: str) -> dict:
 
 
 class RowImageSet(msgspec.Struct, frozen=True, kw_only=True):
-    """Validated row images on one or more roots. ``paths[layer_id][p]`` is root ``p``'s file for that layer."""
+    """Validated row images on one or more roots.
+
+    ``paths[layer_id][p]`` is root ``p``'s file for that layer. Only
+    :func:`open_row_images` builds one.
+    """
 
     roots: tuple[str, ...]
     layout: RowImageLayout
@@ -218,8 +263,12 @@ def open_row_images(
     source_root: str,
     layer_ids: Iterable[int],
 ) -> RowImageSet:
-    """The images of ``layer_ids`` on every root, refused unless each root's manifest is complete, describes this
-    exact layout and source, carries the same row digests as the others, and its files have their full size."""
+    """The images of ``layer_ids`` on every root.
+
+    Raises ``ValueError`` unless each root's manifest is complete, describes this
+    exact layout and source, carries the same row digests as the others, and its
+    files have their full size.
+    """
     if not roots:
         raise ValueError("row images need at least one root")
     image_layout = row_image_layout(segments)

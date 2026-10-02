@@ -1,7 +1,21 @@
-"""Option C RAM-miss service for EXL3 streamed experts: the C++ host module's and the device kernels' wrappers.
+"""Python wrappers for the RAM-miss expert-stream transport of EXL3 streamed experts.
 
-The request page and lease block are ``csrc/moe/expert_stream/lease_layout.h``; the protocol is
-analysis/dsv41-drive/LEASE_PROTOCOL.md.
+Streamed experts live in files and in pinned host RAM; the device kernels fetch the
+ones a layer needs through a request/response protocol with a C++ service thread.
+This module wraps both halves:
+
+  * the C++ host module: ``ExpertStreamHost`` (the service handle: slot bookkeeping,
+    the service, copy and CPU-expert threads), the row reader's test entry points
+    (``read_rows_*``) and the stage-trace decoder (``stage_records``);
+  * the device kernels: ``ExpertStreamDevice``, one capturable chain per layer,
+    ``post -> C1 (row copy) -> S (stream) -> CW (copy wait) -> stream wait -> CC
+    (commit)``;
+  * the byte layouts the two halves share: the request page, the lease block
+    (``expert_lease_block``) and the counters.
+
+The layout constants mirror ``csrc/moe/expert_stream/lease_layout.h`` (under
+``python/sglang/kernels/jit/``). See ``analysis/dsv41-drive/LEASE_PROTOCOL.md`` for
+the protocol.
 """
 
 from __future__ import annotations
@@ -20,8 +34,9 @@ from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
 from sglang.srt.environ import envs
 
-# Rows per io_uring batch, and per bounce bank: the C++ reader has kBanks = 2 banks of kBounceRows = 8
-# row slots each. A bank is reused only after every row read into it has packed.
+# Rows per io_uring batch and per bounce bank. The C++ reader has kBanks = 2 banks of
+# kBounceRows = 8 row slots each; a bank is reused only after every row read into it
+# has packed.
 BOUNCE_ROWS = 8
 
 if TYPE_CHECKING:
@@ -29,17 +44,22 @@ if TYPE_CHECKING:
 
 
 class TransportBuild(msgspec.Struct, frozen=True):
-    """One instantiation of the transport: the host translation units that bind its C++ layout and file reader, one
-    per build variant (``VARIANTS``), the device translation unit RowCopyKernel is compiled in, and the device layout
-    type it is instantiated with."""
+    """One instantiation of the transport for a row format.
+
+    ``host_sources`` maps each build variant (``VARIANTS``) to the host translation
+    unit that binds the format's C++ layout and file reader. ``device_source`` is the
+    translation unit ``RowCopyKernel`` is compiled in, and ``device_layout`` the
+    layout type it is instantiated with.
+    """
 
     host_sources: dict[str, str]
     device_source: str
     device_layout: str
 
 
-# One row per format the transport is built for; adding a format adds a row, its instantiation files
-# (host_sources, device_source) and the layout type they define.
+# One entry per format the transport is built for. Adding a format adds an entry, its
+# instantiation files (``host_sources``, ``device_source``) and the layout type they
+# define.
 LAYOUTS = {
     "exl3": TransportBuild(
         host_sources={
@@ -51,18 +71,24 @@ LAYOUTS = {
     )
 }
 
-# The host builds (plan 2026-09-29-hotpath-zero-overhead D2, build_policy.h): production (ProdBuild) and instrumented
-# (InstrBuild). Each is its own module exporting the same entry points.
+# The two host builds: production (ProdBuild) and instrumented (InstrBuild), selected
+# by ``csrc/moe/expert_stream/host/build_policy.h``. Each is its own module exporting
+# the same entry points.
 VARIANTS = ("prod", "instr")
-# Tests set this (sglang.test.expert_stream_variant, through test/registered/unit/{kernels,layers/moe}/conftest.py)
-# to load the instrumented build, whose test-only entry points (faults, the stage trace) most of them use. None:
-# host_variant() decides.
+# Tests set this (``sglang.test.expert_stream_variant``, through the conftest.py of
+# test/registered/unit/{kernels,layers/moe}) to load the instrumented build, whose
+# test-only entry points (faults, the stage trace) most of them use. None:
+# ``host_variant()`` decides.
 _DEFAULT_VARIANT: Optional[str] = None
 
 
 def host_variant() -> str:
-    """The host build a new service loads (spec D3): the instrumented one when this process writes a stream trace
-    (SGLANG_DSV41_EXPERT_TRACE_PATH) or injects a RAM-miss fault (SGLANG_TEST_DSV41_RAM_MISS_FAULT), else production."""
+    """Return the host build a new service loads.
+
+    The instrumented build when this process writes a stream trace
+    (``SGLANG_DSV41_EXPERT_TRACE_PATH``) or injects a RAM-miss fault
+    (``SGLANG_TEST_DSV41_RAM_MISS_FAULT``); production otherwise.
+    """
     if _DEFAULT_VARIANT is not None:
         return _DEFAULT_VARIANT
     if (
@@ -73,10 +99,11 @@ def host_variant() -> str:
     return "prod"
 
 
-# The test-only entry points (plan 2026-09-29-hotpath-zero-overhead Task 10): each exists only in the instrumented
-# build, so on production both its Python wrapper (before building any tensor) and its C++ export raise
-# RuntimeError("<name> is test-only: it exists in the instrumented host build"). The stage trace (enable_trace,
-# drain_trace, trace_dropped) refuses on production too, from C++, naming the same build. For documentation.
+# The test-only entry points. Each exists only in the instrumented build, so on
+# production both its Python wrapper (before building any tensor) and its C++ export
+# raise RuntimeError("<name> is test-only: it exists in the instrumented host build").
+# The stage trace (enable_trace, drain_trace, trace_dropped) also refuses on
+# production, from C++, naming the same build. This tuple is documentation only.
 TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "read_rows_faulted",
     "read_rows_sqes",
@@ -92,16 +119,19 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
 
 
 def _refuse_test_only(name: str, variant: Optional[str]) -> None:
-    """Raise, as the C++ export would, when ``name`` (a ``TEST_ONLY_EXPORTS`` entry) is called on production."""
+    """Raise, as the C++ export would, if ``name`` (a ``TEST_ONLY_EXPORTS`` entry) is
+    called on the production build."""
     if (host_variant() if variant is None else variant) == "prod":
         raise RuntimeError(
             f"{name} is test-only: it exists in the instrumented host build"
         )
 
 
-# cache_once keys f(), f("exl3") and f(layout="exl3") apart; each cached loader below is called only positionally,
-# through a wrapper, so a layout and variant have exactly one module whatever the call form.
+# cache_once keys f(), f("exl3") and f(layout="exl3") apart, so each cached loader
+# below is called only positionally, through a wrapper: a layout and variant then have
+# exactly one module whatever the call form.
 def _host_module(layout: str = "exl3", variant: Optional[str] = None) -> Module:
+    """Return the cached host module for ``layout`` and ``variant`` (default build)."""
     variant = host_variant() if variant is None else variant
     if variant == "instr_tsan" and _ALLOW_TSAN:
         return _host_module_tsan(layout)
@@ -116,8 +146,8 @@ def _host_module(layout: str = "exl3", variant: Optional[str] = None) -> Module:
 
 @cache_once
 def _host_module_cached(layout: str, variant: str) -> Module:
-    # Hidden by default: HostExports' registries and members stay private to each module's .so; only the
-    # TVM_FFI_DLL_EXPORT entry points (visibility "default") are exported.
+    # Hidden visibility keeps HostExports' registries and members private to each
+    # module's .so; only the TVM_FFI_DLL_EXPORT entry points are exported.
     return load_jit(
         f"expert_stream_host_{layout}_{variant}",
         cpp_files=[LAYOUTS[layout].host_sources[variant]],
@@ -127,9 +157,11 @@ def _host_module_cached(layout: str, variant: str) -> Module:
     )
 
 
-# The instrumented build under ThreadSanitizer (plan 2026-09-29-hotpath-zero-overhead Task 16), for the manual test
-# test/manual/dsv41/test_expert_stream_hotpath_tsan.py only: ExpertStreamHost(..., variant="instr_tsan") loads it when
-# that test sets _ALLOW_TSAN, and is an unknown variant otherwise. The process must preload the compiler's TSan runtime.
+# The instrumented build under ThreadSanitizer, for the manual test
+# test/manual/dsv41/test_expert_stream_hotpath_tsan.py only:
+# ``ExpertStreamHost(..., variant="instr_tsan")`` loads it when that test sets
+# ``_ALLOW_TSAN`` and is an unknown variant otherwise. The process must preload the
+# compiler's TSan runtime.
 _ALLOW_TSAN = False
 
 
@@ -151,15 +183,18 @@ def _host_module_tsan(layout: str = "exl3") -> Module:
 
 
 def host_layout(layout: str = "exl3") -> tuple[tuple[str, ...], int]:
-    """The host module's row layout: its tensor names in copy-table order and the SM-readable ones as a bit mask."""
+    """Return the host module's row layout.
+
+    That is its tensor names in copy-table order and a bit mask of the ones the SMs
+    can read.
+    """
     return _host_layout_cached(layout)
 
 
 @cache_once
 def _host_layout_cached(layout: str) -> tuple[tuple[str, ...], int]:
-    module = _host_module(
-        layout
-    )  # the default variant: every variant of a layout has the same layout
+    # The default variant is enough: every variant of a layout has the same layout.
+    module = _host_module(layout)
     return tuple(str(module.expert_stream_layout_names()).split("\n")), int(
         module.expert_stream_layout_small_mask()
     )
@@ -172,7 +207,8 @@ def _ids(values: Iterable[int]) -> torch.Tensor:
 def _checked_rows(
     tables, row: int, experts, slots
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``experts`` and ``slots`` as int64 tensors, after the bounds checks the C++ hot path skips."""
+    """Return ``experts`` and ``slots`` as int64 tensors, after the bounds checks the
+    C++ hot path skips."""
     expert_ids, slot_ids = _ids(experts), _ids(slots)
     if expert_ids.numel() != slot_ids.numel():
         raise ValueError(f"{expert_ids.numel()} experts but {slot_ids.numel()} slots")
@@ -194,9 +230,13 @@ def _checked_rows(
 
 
 def _table_buffer_regions(tables) -> torch.Tensor:
-    """One registration region per slab tensor, with its row size: the reader cuts registration on row boundaries
-    (plan_chunks), so the slab allocation itself stays one contiguous tensor. Arena owners are not registered whole: a
-    2.69 GB arena is past io_uring's 1 GiB per-buffer limit (the 2026-09-28 S3 refusal)."""
+    """Return one registration region per slab tensor, with its row size.
+
+    The reader cuts registration on row boundaries (``plan_chunks``), so the slab
+    allocation itself stays one contiguous tensor. Arena owners are not registered
+    whole: a 2.69 GB arena is past io_uring's 1 GiB per-buffer limit, and the
+    registration is refused.
+    """
     regions: dict[int, tuple[int, int, int]] = {}
     for slab in getattr(tables, "keepalive", ()):
         if not isinstance(slab, torch.Tensor):
@@ -214,9 +254,12 @@ def _table_buffer_regions(tables) -> torch.Tensor:
 
 
 def _table_args(tables, direct: bool = True) -> tuple:
-    """The table arguments of every C++ reader entry. ``direct`` stays internal: the public helpers always pass 1,
-    since the reader reads row images with O_DIRECT only (plan 2026-09-29-hotpath-zero-overhead D4); a test hands
-    C++ ``direct=False`` to check that it refuses a buffered read."""
+    """Return the table arguments shared by every C++ reader entry.
+
+    ``direct`` stays internal: the public helpers always pass 1, because the reader
+    reads row images with O_DIRECT only. A test hands C++ ``direct=False`` to check
+    that it refuses a buffered read.
+    """
     return (
         tables.extents,
         tables.starts,
@@ -228,9 +271,8 @@ def _table_args(tables, direct: bool = True) -> tuple:
         "\n".join(tables.paths),
         "\n".join(tables.source_paths),
         tables.slot_bytes,
-        int(
-            getattr(tables, "row_images", False)
-        ),  # duck-typed test tables predate the field
+        # getattr: duck-typed test tables predate the field.
+        int(getattr(tables, "row_images", False)),
         int(direct),
     )
 
@@ -245,9 +287,10 @@ def read_rows_once(
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> int:
-    """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++: 1 ok, 0 failed.
+    """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++.
 
-    ``step`` rows go to io_uring per batch (at most ``BOUNCE_ROWS``).
+    Returns 1 if every row landed, 0 on failure. ``step`` rows go to io_uring per
+    batch (at most ``BOUNCE_ROWS``).
     """
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     return int(
@@ -257,7 +300,6 @@ def read_rows_once(
     )
 
 
-# The C++ fault tensor (kFaultWords int64): keep in step with fault_from() in exl3_ram_miss_host.cpp.
 def _fault_tensor(
     *,
     submit_error: int = 0,
@@ -291,6 +333,12 @@ def _fault_tensor(
     leg_cut_cap: int = 0,
     nop_flush_refused: bool = False,
 ) -> torch.Tensor:
+    """Pack fault keywords into the C++ fault tensor (``kFaultWords`` int64 words).
+
+    The word order must stay in step with ``fault_from()`` in
+    ``exl3_ram_miss_host.cpp``; words 19, 20 and 26 are reserved. The keywords are
+    documented at ``read_rows_with_fault``.
+    """
     return torch.tensor(
         [
             submit_error,
@@ -312,8 +360,8 @@ def _fault_tensor(
             hold_ordinal,
             abandon_after,
             step,
-            0,  # word 19: reserved (formerly pack_workers; the packed path is gone)
-            0,  # word 20: reserved (formerly pack_split)
+            0,  # word 19: reserved (was pack_workers; the packed path is gone)
+            0,  # word 20: reserved (was pack_split)
             int(hold_rest),
             int(piece_stream),
             sub,
@@ -343,21 +391,27 @@ def read_rows_traced(
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, dict]:
-    """Test only: ``read_rows_once`` (with the fault arguments of ``read_rows_with_fault``) that also
-    returns the reader's stage record, decoded by ``stage_records``. The reader-side stages only:
-    the request-side ones (observed, reserved, mapped, done) are the tier's and stay 0.
+    """Test only: ``read_rows_once`` that also returns the reader's stage record.
 
-    ``owner_core`` (test-only owner-pinning scaffold, PACK_WORKERS.md): -1, the default, leaves the
-    reader byte-for-byte what it is without this argument. >= 0 pins the calling/owner thread to that
-    core before open(). Production is untouched: nothing wires this argument to the real service.
+    Takes the fault arguments of ``read_rows_with_fault``; the record is decoded by
+    ``stage_records``. Only the reader-side stages are filled: the request-side ones
+    (observed, reserved, mapped, done) belong to the tier and stay 0.
 
-    The result is 1 (every row landed), 0 (failed) or -1 (abandoned: ``abandon_after`` batches were
-    admitted, the rows admitted were still read and packed, the rest never read).
+    ``owner_core`` is a test-only owner-pinning scaffold (see
+    ``analysis/dsv41-drive/PACK_WORKERS.md``). -1, the default, leaves the reader
+    byte-for-byte what it is without this argument; >= 0 pins the calling thread to
+    that core before ``open()``. Nothing wires it to the real service.
 
-    Available in both builds. On production (``variant="prod"``) the record's stages stay 0 (it has no trace; only
-    ``ok`` and ``status`` are set), and a fault argument that injects a fault is refused with a RuntimeError naming the
-    instrumented build (``piece_stream``, ``abandon_after``, ``step``, ``fixed_chunk_cap`` and ``leg_cut_cap`` are not
-    faults and work in both)."""
+    The result is 1 (every row landed), 0 (failed) or -1 (abandoned: ``abandon_after``
+    batches were admitted, the rows admitted were still read and packed, the rest
+    never read).
+
+    Available in both builds. On production (``variant="prod"``) the record's stages
+    stay 0 (it has no trace; only ``ok`` and ``status`` are set), and a fault
+    argument that injects a fault is refused with a RuntimeError naming the
+    instrumented build. ``piece_stream``, ``abandon_after``, ``step``,
+    ``fixed_chunk_cap`` and ``leg_cut_cap`` are not faults and work in both.
+    """
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
     record = torch.zeros(_stage_words(layout, variant), dtype=torch.int64)
@@ -392,49 +446,72 @@ def read_rows_with_fault(
 ) -> tuple[int, int]:
     """Test only: on one C++ reader, read with an injected fault, then read cleanly.
 
-    ``submit_error`` (an errno) replaces the result of the ``submit_call``-th submit
-    (after submitting the prepared reads when ``submit_first``); ``cqe_error`` replaces the
-    ``cqe_call``-th completion's result. ``part`` (a part index) targets the first completion of a
-    part-``part`` extent (of row ``ordinal`` of the request, when given): ``part_error`` (an errno)
-    replaces its result, ``part_short`` (a block multiple) caps the bytes it reports, so only that
-    extent is resubmitted. ``reverse_cqes`` processes each reaped batch of completions back to front,
-    which must not change any result: the reader keys every extent by its own descriptor and
-    generation and the kernel orders nothing. ``max_outstanding`` caps outstanding reads below the
-    ring's depth, so a batch needs several refill rounds; production constants keep a batch inside the
-    ring, so credit never binds there.
+    Instrumented build only (``TEST_ONLY_EXPORTS``): production raises before building
+    anything. Every fault keyword defaults to off.
 
-    Pipeline faults: ``pack_delay_ns`` sleeps inside every row's packing; ``poison`` fills bounce slots
-    and scribbles retired descriptors; ``stale_cqe_call`` redelivers the k-th retired extent's
-    completion after its descriptor is recycled (the read must fail and publish nothing);
-    ``generation_start`` seeds the generation counter (near 2**32 it wraps); ``hold_ordinal`` withholds
-    the completions of that row of the request from the reader until every other row is done (a slow
-    drive: buffered reads of cached data complete inside submit, so nothing else can hold an extent
-    outstanding while other rows pack; with ``hold_rest``, every row from that ordinal on, released
-    together, so they become ready in one reap); ``submit_short_call``
-    makes that submit consume nothing and report success; ``abandon_after`` stops admitting batches
-    after that many; ``step`` is the faulted read's rows per batch (default ``BOUNCE_ROWS``).
-    ``piece_stream`` reads each part as
-    sub-reads and vets rows piece by piece; ``sub`` then narrows the ``part``
-    faults, and ``hold_ordinal``, to that sub-read of the part. ``publish_twice`` publishes the k-th piece the
-    reader publishes a second time (the readiness word must refuse it); ``short_is_eof`` makes the ``part_short``
-    completion the end of its sub-read, as a file ending there would. ``fixed_chunk_cap`` (bytes, 0: 1 GiB) caps the
-    registered-buffer chunks of a fixed read mode, so small slabs register as many chunks; ``leg`` narrows the
-    ``part``, ``cqe_error`` and ``hold_ordinal`` faults to that leg of a fanned-out fixed read (-1: any).
-    ``nop_flush_refused`` (with a ``submit_error`` that leaves SQEs unconsumed) refuses the drain's NOP submission of
-    those SQEs: a fixed read mode then raises "refused the NOP drain" and closes the reader, any other mode resets
-    its ring. ``ring_reset_fail`` also makes that reset fail: the first read then raises "io_uring ring reset failed"
-    (in a fixed read mode the NOP-drain error) and no second read runs. ``leg_cut_cap`` (bytes, 0: READ_CUTS
-    and the device limits) cuts every read into legs of at most that many bytes on a 4 KiB boundary, whatever
-    READ_CUTS says (plan 2026-09-28-iopoll-read-cuts); ``leg`` then narrows the faults to a cut leg as well.
+    Submit and completion faults:
 
-    Returns both reads' results (1 ok, 0 failed, -1 abandoned); ``cqes``, if given, receives the
-    completions reaped after each read, ``stats`` the reader's ``stale_cqes``, ``generation_wraps``,
-    ``unfinished_jobs`` and ``pack_workers`` (both always 0: the packed path is gone), and after the first read
-    ``fixed_cuts`` (reads fanned out to more than one leg) and
-    ``fanout_sqes`` (their SQEs), ``cut_reads`` (reads cut into more than one device-sized run) and ``gap_cuts`` (runs
-    a boundary gap opened).
+    - ``submit_error`` (an errno) replaces the result of the ``submit_call``-th
+      submit, after submitting the prepared reads when ``submit_first``.
+    - ``cqe_error`` replaces the ``cqe_call``-th completion's result.
+    - ``part`` (a part index) targets the first completion of a part-``part`` extent
+      (of row ``ordinal`` of the request, when given). ``part_error`` (an errno)
+      replaces its result; ``part_short`` (a block multiple) caps the bytes it
+      reports, so only that extent is resubmitted.
+    - ``reverse_cqes`` processes each reaped batch of completions back to front. It
+      must not change any result: the reader keys every extent by its own descriptor
+      and generation, and the kernel orders nothing.
+    - ``max_outstanding`` caps outstanding reads below the ring's depth, so a batch
+      needs several refill rounds. Production constants keep a batch inside the
+      ring, so credit never binds there.
+    - ``nop_flush_refused`` (with a ``submit_error`` that leaves SQEs unconsumed)
+      refuses the drain's NOP submission of those SQEs: a fixed read mode then raises
+      "refused the NOP drain" and closes the reader, any other mode resets its ring.
+      ``ring_reset_fail`` also makes that reset fail: the first read then raises
+      "io_uring ring reset failed" (in a fixed read mode, the NOP-drain error) and no
+      second read runs.
 
-    Instrumented build only (``TEST_ONLY_EXPORTS``): production raises before building anything.
+    Pipeline faults:
+
+    - ``pack_delay_ns`` sleeps inside every row's packing.
+    - ``poison`` fills bounce slots and scribbles retired descriptors.
+    - ``stale_cqe_call`` redelivers the k-th retired extent's completion after its
+      descriptor is recycled; the read must fail and publish nothing.
+    - ``generation_start`` seeds the generation counter (near 2**32 it wraps).
+    - ``hold_ordinal`` withholds the completions of that row of the request from the
+      reader until every other row is done. This models a slow drive: buffered reads
+      of cached data complete inside submit, so nothing else can hold an extent
+      outstanding while other rows pack. With ``hold_rest``, every row from that
+      ordinal on is withheld and released together, so they become ready in one reap.
+    - ``submit_short_call`` makes that submit consume nothing and report success.
+    - ``abandon_after`` stops admitting batches after that many.
+    - ``step`` is the faulted read's rows per batch (default ``BOUNCE_ROWS``).
+
+    Piece streaming and read cuts:
+
+    - ``piece_stream`` reads each part as sub-reads and vets rows piece by piece;
+      ``sub`` then narrows the ``part`` faults, and ``hold_ordinal``, to that sub-read
+      of the part.
+    - ``publish_twice`` publishes the k-th piece the reader publishes a second time;
+      the readiness word must refuse it.
+    - ``short_is_eof`` makes the ``part_short`` completion the end of its sub-read, as
+      a file ending there would.
+    - ``fixed_chunk_cap`` (bytes, 0: 1 GiB) caps the registered-buffer chunks of a
+      fixed read mode, so small slabs register as many chunks. ``leg`` narrows the
+      ``part``, ``cqe_error`` and ``hold_ordinal`` faults to that leg of a fanned-out
+      fixed read (-1: any).
+    - ``leg_cut_cap`` (bytes, 0: ``READ_CUTS`` and the device limits) cuts every read
+      into legs of at most that many bytes on a 4 KiB boundary, whatever
+      ``READ_CUTS`` says (see ``analysis/dsv41-drive/iopoll-cuts/results.md``);
+      ``leg`` then narrows the faults to a cut leg as well.
+
+    Returns both reads' results (1 ok, 0 failed, -1 abandoned). ``cqes``, if given,
+    receives the completions reaped after each read. ``stats``, if given, receives
+    the reader's ``stale_cqes``, ``generation_wraps``, ``unfinished_jobs`` and
+    ``pack_workers`` (always 0: the packed path is gone), and after the first read
+    ``fixed_cuts`` (reads fanned out to more than one leg), ``fanout_sqes`` (their
+    SQEs), ``cut_reads`` (reads cut into more than one device-sized run) and
+    ``gap_cuts`` (runs a boundary gap opened).
     """
     _refuse_test_only("read_rows_faulted", variant)
     first = _checked_rows(tables, row, experts, slots)
@@ -472,12 +549,17 @@ def read_rows_sqes(
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, list[tuple[int, int, int, int]], dict, dict]:
-    """Test only: ``read_rows_traced``'s read, also returning every SQE the reader prepared, in order, as
-    ``(file, offset, length, bounce_offset)``, and ``info``: ``sqes`` (the count), ``descriptors``, ``credit``
-    (the ring's), ``cqes``, ``fixed_cuts`` (reads fanned out to more than one leg), ``fanout_sqes`` (their SQEs,
-    first attempts), ``cut_reads``, ``gap_cuts``, ``min_cut_bytes`` (the smallest cut in force, 0: cuts off) and
-    ``leg_stride`` (the legs a read may have). Faults and ``piece_stream`` as ``read_rows_with_fault``. Instrumented
-    build only (``TEST_ONLY_EXPORTS``)."""
+    """Test only: ``read_rows_traced``'s read, also returning every SQE it prepared.
+
+    Returns ``(result, sqes, info, record)``. ``sqes`` lists the SQEs in order as
+    ``(file, offset, length, bounce_offset)``. ``info`` holds ``sqes`` (the count),
+    ``descriptors``, ``credit`` (the ring's), ``cqes``, ``fixed_cuts`` (reads fanned
+    out to more than one leg), ``fanout_sqes`` (their SQEs, first attempts),
+    ``cut_reads``, ``gap_cuts``, ``min_cut_bytes`` (the smallest cut in force, 0: cuts
+    off) and ``leg_stride`` (the legs a read may have). Faults and ``piece_stream``
+    are as in ``read_rows_with_fault``. Instrumented build only
+    (``TEST_ONLY_EXPORTS``).
+    """
     _refuse_test_only("read_rows_sqes", variant)
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     fault = _fault_tensor(**faults)
@@ -534,8 +616,11 @@ def publish_piece(
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> tuple[bool, int]:
-    """Test only: the reader owner's publish primitive on one readiness word holding ``word`` (``generation << 8 |
-    bits``): whether it set ``bit``, and the word afterwards."""
+    """Test only: the reader owner's publish primitive on one readiness word.
+
+    ``word`` is ``generation << 8 | bits``. Returns whether the primitive set ``bit``
+    and the word afterwards.
+    """
     cell = torch.tensor(
         [word - (1 << 64) if word >= 1 << 63 else word], dtype=torch.int64
     )
@@ -548,7 +633,10 @@ def publish_piece(
 
 
 def piece_word(generation: int, bits: int = 0) -> int:
-    """A readiness word (lease area P): the request generation's low 56 bits over an 8-bit piece mask."""
+    """Return a readiness word: the generation's low 56 bits over an 8-bit piece mask.
+
+    This is the layout of one ``PieceMask`` word of the lease block.
+    """
     return ((generation & ((1 << 56) - 1)) << 8) | bits
 
 
@@ -567,16 +655,23 @@ def read_rows_pieces(
     variant: Optional[str] = None,
     **faults,
 ) -> tuple[int, dict, torch.Tensor, dict]:
-    """Test only: ``read_rows_traced``'s read with piece streaming's publishing: row ordinal o's pieces are published
-    into ``masks[o]`` (int64 ``[rows, lanes]``; default one word per row, initialised to ``piece_word(generation)``).
-    With ``reference`` (a slab pointer table like ``tables.slabs``, holding row o at ``ref_slots[o]``) a C++ thread
-    checks, while the read runs, the destination bytes behind every bit it sees set on each row's first word.
-    Returns the result, the stage record, ``masks`` and ``info``: ``refused`` (the reader's refused publishes),
-    ``checked`` / ``differed`` (pieces the checker compared, and those whose bytes were not the reference's) and
-    ``early`` (bits it saw before the read returned).
+    """Test only: ``read_rows_traced``'s read, with piece streaming's publishing.
 
-    Available in both builds, as ``read_rows_traced``: on production the record's stages stay 0, ``refused`` is 0
-    (a metric), and a fault argument that injects a fault is refused."""
+    Row ordinal o's pieces are published into ``masks[o]`` (int64 ``[rows, lanes]``;
+    default one word per row, initialised to ``piece_word(generation)``). With
+    ``reference`` (a slab pointer table like ``tables.slabs``, holding row o at
+    ``ref_slots[o]``) a C++ thread checks, while the read runs, the destination bytes
+    behind every bit it sees set on each row's first word.
+
+    Returns ``(result, record, masks, info)``. ``info`` holds ``refused`` (the
+    reader's refused publishes), ``checked`` and ``differed`` (pieces the checker
+    compared, and those whose bytes were not the reference's) and ``early`` (bits it
+    saw before the read returned).
+
+    Available in both builds, as ``read_rows_traced``: on production the record's
+    stages stay 0, ``refused`` is 0 (a metric), and a fault argument that injects a
+    fault is refused.
+    """
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     if masks is None:
         masks = torch.full(
@@ -620,10 +715,15 @@ def piece_geometry(
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> Optional[tuple[list[dict], list[dict]]]:
-    """Test only: the sub-reads and pieces the C++ reader cuts expert ``expert`` of streamed row ``row`` into
-    under piece streaming, or None when it refuses the row. Sub-reads, in file order: ``{file, offset, length,
-    dest, part, k}``. Pieces (``STAGE_PIECES``): ``{deps, runs}``, ``deps`` the bitmask of sub-reads the piece
-    depends on and ``runs`` one ``(dst_lo, dst_hi)`` per segment in segment destination coordinates."""
+    """Test only: how the C++ reader cuts one expert under piece streaming.
+
+    Returns ``(sub_reads, pieces)`` for expert ``expert`` of streamed row ``row``, or
+    None when the reader refuses the row. Sub-reads, in file order, are
+    ``{file, offset, length, dest, part, k}``. Pieces (``STAGE_PIECES``) are
+    ``{deps, runs}``: ``deps`` is the bitmask of sub-reads the piece depends on and
+    ``runs`` holds one ``(dst_lo, dst_hi)`` per segment, in segment destination
+    coordinates.
+    """
     segments = int(tables.segments.shape[0])
     subs = torch.zeros((STAGE_PIECES, 6), dtype=torch.int64)
     pieces = torch.zeros((STAGE_PIECES, 1 + 2 * segments), dtype=torch.int64)
@@ -647,21 +747,28 @@ def piece_geometry(
     return sub_reads, out
 
 
-# One request's stage record: the C++ StageRecord's int64 words, in order. Every time is the host's
-# CLOCK_MONOTONIC in ns (time.monotonic() reads the same clock); a stage never reached is 0.
-# submit/first_cqe/last_cqe span the whole read and pack_start..pack_end run from the first row's packing
-# to the last row's, which overlaps the reads (see StageRecord).
-# The byte split, terminal status, per-row packing and per-extent CQE stamps are defined at StageRecord.
-# STAGE_TRACE_ROWS / STAGE_TRACE_EXTENTS are its kTraceRows / kTraceExtents.
-# Row images (the only reader since 2026-09-29, its direct mode) copy nothing: the drive writes the
-# slab rows. The pack stamps then mean publish time: with piece streaming row_pack_start/end are the clocks of the
-# row's first and last piece publish, without it both are the clock the row's reads were vetted and it was finished;
-# pack_start/pack_end/pack_ns are built from them as for packing. pack_workers and pack_split are 0 and useful_bytes still
-# counts the segment bytes that landed in the slabs. The schema is unchanged.
+# One request's stage record: the C++ ``StageRecord``'s int64 words, in order.
+#
+# Every time is the host's CLOCK_MONOTONIC in ns (``time.monotonic()`` reads the same
+# clock); a stage never reached is 0. ``submit``/``first_cqe``/``last_cqe`` span the
+# whole read, while ``pack_start``..``pack_end`` run from the first row's packing to
+# the last row's and overlap the reads. The byte split, terminal status, per-row
+# packing and per-extent CQE stamps are defined at ``StageRecord``;
+# ``STAGE_TRACE_ROWS`` and ``STAGE_TRACE_EXTENTS`` are its ``kTraceRows`` and
+# ``kTraceExtents``.
+#
+# Row images, the only reader since the direct mode became the sole mode, copy
+# nothing: the drive writes the slab rows. The pack stamps then mean publish time.
+# With piece streaming ``row_pack_start``/``row_pack_end`` are the clocks of the
+# row's first and last piece publish; without it both are the clock at which the
+# row's reads were vetted and the row finished. ``pack_start``, ``pack_end`` and
+# ``pack_ns`` are built from them as for packing. ``pack_workers`` and ``pack_split``
+# are 0, and ``useful_bytes`` still counts the segment bytes that landed in the slabs.
 STAGE_DRIVES = 4
 STAGE_TRACE_ROWS = 16
 STAGE_TRACE_EXTENTS = 32
-# The C++ kPieces: pieces per row, and the most sub-reads a row issues under piece streaming.
+# The C++ ``kPieces``: pieces per row, and the most sub-reads a row issues under piece
+# streaming.
 STAGE_PIECES = 8
 STAGE_FIELDS = (
     "seq",
@@ -740,10 +847,11 @@ STAGE_FIELDS = (
 STAGE_KINDS = ("demand", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
 STAGE_STATUSES = ("none", "served", "no_read", "failed", "cancelled", "touch")
-# The order of the time stamps within a request. The non-zero ones never decrease along it EXCEPT
-# last_cqe against pack_start: a row packs as soon as its own extents landed, so packing starts before the
-# last completion when reads and packing overlap. What holds instead: first_cqe <= pack_start, last_cqe <=
-# pack_end (see StageRecord).
+# The order of the time stamps within a request. The non-zero ones never decrease
+# along it except ``last_cqe`` against ``pack_start``: a row packs as soon as its own
+# extents landed, so packing starts before the last completion when reads and packing
+# overlap. What holds instead is ``first_cqe <= pack_start`` and
+# ``last_cqe <= pack_end`` (see ``StageRecord``).
 STAGE_ORDER = (
     "observed",
     "reserved",
@@ -758,6 +866,7 @@ STAGE_ORDER = (
 
 
 def _stage_words(layout: str = "exl3", variant: Optional[str] = None) -> int:
+    """Return the C++ ``StageRecord`` word count, checked against ``STAGE_FIELDS``."""
     words = int(_host_module(layout, variant).expert_stream_trace_words())
     if words != len(STAGE_FIELDS):
         raise RuntimeError(
@@ -767,26 +876,39 @@ def _stage_words(layout: str = "exl3", variant: Optional[str] = None) -> int:
 
 
 def stage_records(words: torch.Tensor) -> list[dict]:
-    """Decode int64 ``[n, len(STAGE_FIELDS)]`` rows into dicts, with a ``drives`` list of the
-    drives that served an extent: ``{"dev", "bytes", "extents"}`` (``dev`` -1: several folded).
+    """Decode int64 ``[n, len(STAGE_FIELDS)]`` stage-record rows into dicts.
 
-    ``status`` names how the request ended and ``missing_stages`` the STAGE_ORDER stamps it never
-    reached. ``row_pack`` has one ``{"row", "admit", "start", "end"}`` per row asked for (first
-    ``STAGE_TRACE_ROWS``), 0/0 for a row that never packed and ``admit`` 0 for one never admitted;
-    ``extent_cqe`` one ``{"row", "part", "submit", "attempts", "cqe"}`` per extent issued (first
-    ``STAGE_TRACE_EXTENTS``), ``cqe`` 0 for one that never completed, ``attempts`` its resubmissions.
-    ``cqe`` is when the wait that reaped the extent returned: io_uring gives no per-completion time.
-    ``sub`` is the extent's sub-read within its part (always 0 unless ``piece_stream``).
-    ``pieces`` (schema 6, empty unless ``piece_stream``) has one ``{"row", "sub_seq", "seq", "cqe"}`` per row asked
-    for (first ``STAGE_TRACE_ROWS``), each a list over ``STAGE_PIECES``: when sub-read j (row file order) landed and
-    when piece j was vetted, as sequence numbers shared by both (1-based, 0 never), and the vetting's clock.
-    Schema 7 adds ``publish``, when piece j was published on the same sequence, and the read's ``pieces_published``,
-    ``pieces_out_of_order`` (published after a higher-numbered piece of their row) and ``piece_publish_refused``.
-    ``dropped_before`` counts the records the ring dropped just before this one. ``lanes`` is the planned
-    lane count the device posted with the request (schema 4). ``pack_workers`` / ``pack_split`` are the
-    packing mode the reader ran the request in (schema 5): 0 workers is the inline reader, and a worker-mode
-    record's pack stamps are not comparable with an inline one's (see StageRecord).
-    ``bytes`` is the completed total; the rest of the split is ``useful/submitted/retried/cancelled_bytes``.
+    Beyond the ``STAGE_FIELDS`` scalars, each dict has:
+
+    - ``status``: how the request ended; ``missing_stages``: the ``STAGE_ORDER``
+      stamps it never reached.
+    - ``drives``: the drives that served an extent, as ``{"dev", "bytes", "extents"}``
+      (``dev`` -1: several folded).
+    - ``row_pack``: one ``{"row", "admit", "start", "end"}`` per row asked for (first
+      ``STAGE_TRACE_ROWS``); 0/0 for a row that never packed, ``admit`` 0 for one
+      never admitted.
+    - ``extent_cqe``: one ``{"row", "part", "sub", "submit", "attempts", "cqe"}`` per
+      extent issued (first ``STAGE_TRACE_EXTENTS``). ``cqe`` is 0 for an extent that
+      never completed, and otherwise the time the wait that reaped it returned:
+      io_uring gives no per-completion time. ``attempts`` counts resubmissions and
+      ``sub`` is the extent's sub-read within its part (0 unless ``piece_stream``).
+    - ``pieces``: empty unless ``piece_stream``; otherwise one
+      ``{"row", "sub_seq", "seq", "cqe", "publish"}`` per row asked for (first
+      ``STAGE_TRACE_ROWS``), each field a list over ``STAGE_PIECES``. ``sub_seq`` is
+      when sub-read j (row file order) landed, ``seq`` when piece j was vetted, and
+      ``publish`` when it was published, as sequence numbers shared by all three
+      (1-based, 0 never). ``cqe`` is the vetting's clock.
+
+    Scalars worth knowing: ``bytes`` is the completed total and the rest of the split
+    is ``useful_bytes``, ``submitted_bytes``, ``retried_bytes`` and
+    ``cancelled_bytes``; ``dropped_before`` counts the records the ring dropped just
+    before this one; ``lanes`` is the planned lane count the device posted with the
+    request; ``pieces_published``, ``pieces_out_of_order`` (published after a
+    higher-numbered piece of their row) and ``piece_publish_refused`` describe the
+    read's publishing. ``pack_workers`` and ``pack_split`` are the packing mode the
+    reader ran the request in: 0 workers is the inline reader, and a worker-mode
+    record's pack stamps are not comparable with an inline one's (see
+    ``StageRecord``).
     """
     out = []
     for row in words.tolist():
@@ -862,9 +984,10 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     return out
 
 
-# The request page (lease_layout.h): demand_head, then kDemandRecords records of RECORD_FIELDS. A record's MAX_IDS
-# lanes are one i16 array per id and an f32 weight array; "counts" holds lanes (bits 0-3) and protect ids (bits 4-7),
-# and "kinds" a ram_slot_map.LaneKind nibble per lane.
+# The request page (``lease_layout.h``): ``demand_head``, then kDemandRecords records
+# of ``RECORD_FIELDS``. A record's ``MAX_IDS`` lanes are one i16 array per id and an
+# f32 weight array; "counts" holds the lane count (bits 0-3) and the protect-id count
+# (bits 4-7), and "kinds" a ``ram_slot_map.LaneKind`` nibble per lane.
 PAGE_BYTES = 2176
 RECORD_BYTES = 128
 DEMAND_RING = 128
@@ -884,15 +1007,15 @@ RECORD_FIELDS = {
     "lane_weight": 96,
 }
 RECORD_FLAG_CAPTURED = 1
-RECORD_ID_MAX = (
-    32767  # experts, slots and destinations are i16 in the record and the map delta
-)
+# Experts, slots and destinations are i16 in the record and the map delta.
+RECORD_ID_MAX = 32767
 HOT_HEADER_BYTES = 8
 HOT_ALIGNMENT = 64
 HOT_RECORDS = DEMAND_RECORDS
 
 
 def hot_record_bytes(experts: int) -> int:
+    """Return the size of one hot-bitmap record: header plus one bit per expert."""
     if experts <= 0 or experts > 65535:
         raise ValueError(
             f"EXL3 hot bitmap expert count {experts} is outside [1, 65535]"
@@ -903,6 +1026,7 @@ def hot_record_bytes(experts: int) -> int:
 
 
 def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
+    """Allocate a zeroed hot page: ``HOT_RECORDS`` hot-bitmap records."""
     return torch.zeros(
         HOT_RECORDS * hot_record_bytes(experts), dtype=torch.uint8, pin_memory=pin
     )
@@ -910,8 +1034,9 @@ def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
 
 MAX_IDS = 8
 WORDS = {"demand_head": 0}
-# Order of the C++ counters (tier_protocol.h). Demand rows per layer come only from ``ExpertStreamHost.layer_rows()``:
-# one word per layer written by the tier's owner.
+# Order of the C++ counters (``host/tier_protocol.h``). Demand rows per layer come only
+# from ``ExpertStreamHost.layer_rows()``: one word per layer written by the tier's
+# owner.
 COUNTERS = (
     "served",
     "touch_only",
@@ -932,15 +1057,16 @@ COUNTERS = (
     "copy_issue_ns",
     "copy_latency_ns",
     "copy_latency_max_ns",
-    # CPU experts (plan 2026-09-29-dsv41-cpu-experts).
+    # CPU experts.
     "cpu_jobs",
     "cpu_lanes",
 )
 
-# The counters a production host keeps (plan 2026-09-29-hotpath-zero-overhead D1; tier_protocol.h is_core_counter,
-# checked against expert_stream_core_counter_mask): the shutdown line's served, rows and errors, the admission policy's
-# outcomes, and the functional version. In COUNTERS order. Every other counter is a metric the production build does
-# not compile: its ``counters()`` has no such key.
+# The counters a production host keeps: the shutdown line's served, rows and errors,
+# the admission policy's outcomes, and the functional version, in ``COUNTERS`` order.
+# ``is_core_counter`` in ``host/tier_protocol.h`` defines the set and
+# ``expert_stream_core_counter_mask`` checks it. Every other counter is a metric the
+# production build does not compile: its ``counters()`` has no such key.
 CORE_COUNTERS = (
     "served",
     "touch_only",
@@ -960,7 +1086,10 @@ assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 def seqlock_stress(
     seconds: float, *, layout: str = "exl3", variant: Optional[str] = None
 ) -> tuple[int, int]:
-    """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted). Instrumented build only."""
+    """Test only: read one record while a C++ thread rewrites it for ``seconds``.
+
+    Returns ``(accepted, torn_accepted)``. Instrumented build only.
+    """
     _refuse_test_only("seqlock_stress", variant)
     out = torch.zeros(2, dtype=torch.int64)
     _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
@@ -968,6 +1097,8 @@ def seqlock_stress(
 
 
 _RECORD_LANES = 8  # kMaxIds == kLeaseLanes
+# Words of the C++ read_record result: 6 scalars, the protect ids, the lane count and
+# 5 words per lane.
 READ_RECORD_WORDS = 6 + _RECORD_LANES + 1 + 5 * _RECORD_LANES
 
 
@@ -978,8 +1109,10 @@ def read_record_fields(
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> dict:
-    """Test only: the service's read_record over one RECORD_BYTES record, expecting seq ``expected``. Instrumented
-    build only."""
+    """Test only: the service's ``read_record`` over one ``RECORD_BYTES`` record.
+
+    ``expected`` is the sequence number the record must carry. Instrumented build only.
+    """
     _refuse_test_only("read_record_fields", variant)
     out = torch.zeros(READ_RECORD_WORDS, dtype=torch.int64)
     _host_module(layout, variant).expert_stream_read_record_fields(
@@ -1011,7 +1144,10 @@ def read_record_fields(
 
 
 def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
-    """Test only: ns per _mm_pause on this core, the RAM-miss service's idle-poll quantum. Instrumented build only."""
+    """Test only: ns per ``_mm_pause`` on this core.
+
+    That is the RAM-miss service's idle-poll quantum. Instrumented build only.
+    """
     _refuse_test_only("pause_ns", variant)
     return float(_host_module(layout, variant).expert_stream_pause_ns())
 
@@ -1022,6 +1158,7 @@ def new_page(pin: bool) -> torch.Tensor:
 
 
 def page_word(page: torch.Tensor, name: str) -> int:
+    """Return the u32 request-page word ``name`` (a ``WORDS`` key)."""
     offset = WORDS[name]
     return int(page[offset : offset + 4].view(torch.int32)[0]) & 0xFFFFFFFF
 
@@ -1031,28 +1168,40 @@ _LIVE: weakref.WeakSet[ExpertStreamHost] = weakref.WeakSet()
 
 @atexit.register
 def _stop_live() -> None:
+    """Stop every live host at exit, logging its counters first."""
     for host in list(_LIVE):
         try:
             host.stop()
-        except Exception as error:  # noqa: BLE001 - one host's failure must not leave the rest open
+        except Exception as error:  # noqa: BLE001 - keep stopping the other hosts
             sys.stderr.write(f"exl3 RAM miss: stopping a host failed: {error!r}\n")
 
 
 class ExpertStreamHost:
-    """The C++-owned pinned-slot bookkeeping of every streamed layer and its request service.
+    """The C++-owned pinned-slot bookkeeping of every streamed layer and its request
+    service.
 
-    ``tables``: ``Exl3RamMissTables``; ``page``: a ``new_page`` tensor; ``slot_map``:
-    int32 ``[layers, experts]`` filled with -1 (pinned for a real device). Row ``r`` is
-    streamed layer ``tables.layer_ids[r]``. Requests are served by ``pump()`` until
-    ``start_thread()``, then by the C++ service thread until ``stop()``. ``variant``: the host build to load
-    (``VARIANTS``), by default ``host_variant()``'s choice; kept as ``self.variant``.
+    ``tables`` is an ``Exl3RamMissTables``; ``page`` a ``new_page`` tensor; ``slot_map``
+    an int32 ``[layers, experts]`` tensor filled with -1 (pinned for a real device).
+    Row ``r`` is streamed layer ``tables.layer_ids[r]``. ``variant`` is the host build
+    to load (``VARIANTS``), by default ``host_variant()``'s choice, and is kept as
+    ``self.variant``.
 
-    The tier has one owner at a time: the service thread while it runs, the caller between ``pause()`` and
-    ``resume()``, and the caller of ``pump()`` when there is no thread. While the thread runs unpaused, every call
-    that reads or writes tier state (``contains``, ``touch``, ``assign``, ``release``, ``fill_begin``, ``set_hot``,
-    ``slot_info``, ``slot_to_expert``, ``lru_order``, ``victim_census``) raises ``RuntimeError`` ("... needs the
-    service thread paused"); ``mapping``, ``counters``, ``busy_episode`` and ``layer_rows`` read published words
-    without waiting. Paused, or with no thread, every call runs at once.
+    Threads and ownership. Requests are served by ``pump()`` until ``start_thread()``,
+    then by the C++ service thread until ``stop()``. The tier has one owner at a time:
+    the service thread while it runs, the caller between ``pause()`` and ``resume()``,
+    and the caller of ``pump()`` when there is no thread. While the thread runs
+    unpaused, every call that reads or writes tier state (``contains``, ``touch``,
+    ``assign``, ``release``, ``fill_begin``, ``set_hot``, ``slot_info``,
+    ``slot_to_expert``, ``lru_order``, ``victim_census``) raises ``RuntimeError``
+    ("... needs the service thread paused"). ``mapping``, ``counters``,
+    ``busy_episode`` and ``layer_rows`` read published words without waiting. Paused,
+    or with no thread, every call runs at once.
+
+    Lifetime. The C++ service reads and writes through the raw addresses of the page,
+    the slot map, the lease block and the slabs (``tables.keepalive``); this object
+    holds all of them, and a finalizer closes the service (stopping and joining its
+    thread) before they can be released. Live hosts are also stopped at interpreter
+    exit by ``_stop_live``, which logs their counters first.
     """
 
     def __init__(
@@ -1088,12 +1237,11 @@ class ExpertStreamHost:
                 "slot_map must start filled with -1 (the C++ tiers start empty)"
             )
         self._layout = layout
-        # The host build (VARIANTS), chosen once here: every later call goes to this module.
+        # The host build is chosen once here: every later call goes to this module.
         self.variant = host_variant() if variant is None else variant
         self._module = _host_module(self._layout, self.variant)
         self.threaded = False
-        # The lease block: the service writes it through a raw address, so this object holds it. Allocated here when
-        # the caller passes none.
+        # Allocated here when the caller passes none.
         if lease_block is None:
             lease_block = expert_lease_block.new_lease_block(
                 int(tables.starts.shape[0]), pin=page.is_pinned()
@@ -1116,9 +1264,6 @@ class ExpertStreamHost:
                 raise ValueError(
                     f"hot_page must be a contiguous pinned CPU uint8 tensor of {HOT_RECORDS * stride} bytes"
                 )
-        # The C++ service writes through raw addresses of the page, the slot map and the
-        # slabs (``tables.keepalive``): this object holds all three, and the finalizer
-        # below closes the service before they can be released.
         self.tables = tables
         self.page = page
         self.slot_map = slot_map
@@ -1151,19 +1296,18 @@ class ExpertStreamHost:
                 "exl3 RAM miss service failed to open (files, io_uring or bounce)"
             )
         self.layout_names, self.small_mask = host_layout(self._layout)
-        # expert_stream_close also stops and joins the service thread, if one runs.
         self._close = weakref.finalize(
             self, self._module.expert_stream_close, self.handle
         )
-        self._close.atexit = (
-            False  # _stop_live closes live hosts at exit, logging counters first
-        )
+        # _stop_live closes live hosts at exit, logging counters first.
+        self._close.atexit = False
         _LIVE.add(self)
 
     def _check(
         self, row: int, expert: Optional[int] = None, slot: Optional[int] = None
     ) -> None:
-        """The bounds the C++ bookkeeping does not check."""
+        """Raise ValueError for a row, expert or slot outside the bounds the C++
+        bookkeeping does not check."""
         if not 0 <= row < self.layers:
             raise ValueError(f"streamed row {row} is outside [0, {self.layers})")
         if expert is not None and not 0 <= expert < self.experts:
@@ -1180,10 +1324,12 @@ class ExpertStreamHost:
         spin_us: int = 5000,
         busy_poll: bool = False,
     ) -> None:
-        """Serve requests on a C++ thread (no more ``pump()``), with the fail-stop watchdog.
+        """Serve requests on a C++ thread (no more ``pump()``), with the watchdog.
 
-        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved (D19). ``busy_poll`` spins on
-        ``cpu_core`` with no PAUSE and no sleep; the C++ side refuses it unless that physical core is the service's alone.
+        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved for
+        NVMe completion interrupts. ``busy_poll`` spins on ``cpu_core`` with no PAUSE
+        and no sleep; the C++ side refuses it unless that physical core is the
+        service's alone.
         """
         if 64 <= cpu_core <= 71:
             raise ValueError(
@@ -1199,10 +1345,12 @@ class ExpertStreamHost:
         self.threaded = True
 
     def pause(self, timeout_s: float) -> None:
-        """Hand the slots to the caller: returns once the thread is between two requests.
+        """Hand the slots to the caller: return once the thread is between two requests.
 
-        The caller must have synchronized the device stream, so no demand is pending (D12).
+        The caller must have synchronized the device stream, so no demand is pending.
         Not reentrant: one owner (the slot table's depth counter) pauses and resumes.
+        Raises RuntimeError if the copy thread still has a job or the thread does not
+        pause within ``timeout_s``.
         """
         if not self.threaded:
             return
@@ -1219,20 +1367,26 @@ class ExpertStreamHost:
             )
 
     def resume(self) -> None:
+        """Give the slots back to the service thread."""
         if self.threaded:
             self._module.expert_stream_resume(self.handle)
 
     def pump(self) -> int:
+        """Serve the pending requests on the calling thread (no service thread)."""
         return int(self._module.expert_stream_pump(self.handle))
 
     def contains(self, row: int, expert: int) -> bool:
-        """True once the expert holds a slot in ``row``: from the moment the thread claims the
-        slot, before its read has finished. It does not mean the bytes are in RAM; the read is
-        done when ``layer_rows()`` counts the row. Needs the thread paused (or no thread)."""
+        """Return True once the expert holds a slot in ``row``.
+
+        That is from the moment the thread claims the slot, before its read has
+        finished: it does not mean the bytes are in RAM. The read is done when
+        ``layer_rows()`` counts the row. Needs the thread paused (or no thread).
+        """
         self._check(row, expert)
         return bool(self._module.expert_stream_contains(self.handle, row, expert))
 
     def touch(self, row: int, expert: int) -> None:
+        """Refresh the recency stamp of a resident expert of ``row`` (a hit)."""
         self._check(row, expert)
         self._module.expert_stream_touch(self.handle, row, expert)
 
@@ -1243,6 +1397,14 @@ class ExpertStreamHost:
         protected: Iterable[int] = (),
         protected_fallback: bool = True,
     ) -> tuple[int, Optional[int]]:
+        """Claim a pinned slot for ``expert`` in ``row``.
+
+        Returns ``(slot, evicted_expert_or_None)``. A free slot is taken first; else
+        the least recently used victim that is not hot or ``protected``, and with
+        ``protected_fallback`` the least recently used protected one when no other
+        victim exists. Raises ValueError if the expert already holds a slot and
+        RuntimeError if every slot is protected or leased.
+        """
         self._check(row, expert)
         out = torch.zeros(2, dtype=torch.int64)
         self._module.expert_stream_assign(
@@ -1258,6 +1420,7 @@ class ExpertStreamHost:
         return slot, (None if evicted < 0 else evicted)
 
     def release(self, row: int, slot: int) -> None:
+        """Free ``slot`` of ``row``."""
         self._check(row, slot=slot)
         self._module.expert_stream_release(self.handle, row, slot)
 
@@ -1268,10 +1431,11 @@ class ExpertStreamHost:
         protected: Iterable[int] = (),
         fallback: bool = False,
     ) -> tuple[list[int], int]:
-        """Prefill fills: claim slots for ``experts`` of ``row`` in order and read them on a helper thread.
+        """Claim slots for ``experts`` of ``row`` and read them on a helper thread.
 
-        Needs the service thread paused (or no thread). Claiming stops at the first expert with no victim;
-        returns the claimed prefix's slots and the rows evicted for them. Every expert must hold no slot.
+        Used by prefill fills. Needs the service thread paused (or no thread), and every
+        expert must hold no slot. Claiming stops at the first expert with no victim.
+        Returns the claimed prefix's slots and the rows evicted for them.
         """
         self._check(row)
         experts = [int(expert) for expert in experts]
@@ -1287,7 +1451,10 @@ class ExpertStreamHost:
         return values[:claimed], values[len(experts)]
 
     def fill_wait(self, rows: int, timeout_s: float) -> None:
-        """Return once the first ``rows`` claimed rows of the running fill have landed in their slabs."""
+        """Return once the first ``rows`` claimed rows of the running fill have landed.
+
+        Raises RuntimeError if the fill failed first or ``timeout_s`` passes.
+        """
         outcome = int(
             self._module.expert_stream_fill_wait(
                 self.handle, int(rows), int(timeout_s * 1e9)
@@ -1303,15 +1470,21 @@ class ExpertStreamHost:
             )
 
     def fill_landed(self) -> int:
-        """How many claimed rows of the fill have landed so far, a prefix of the claim order; never blocks."""
+        """Return how many claimed rows have landed so far (a claim-order prefix).
+
+        Never blocks.
+        """
         return int(self._module.expert_stream_fill_landed(self.handle))
 
     def fill_end(self) -> bool:
-        """Join the fill; False when it failed (its rows that did not land were released)."""
+        """Join the fill; False if it failed (rows that did not land are released)."""
         return bool(self._module.expert_stream_fill_end(self.handle))
 
     def slot_info(self, row: int) -> list[tuple[int, int, int]]:
-        """Per slot: (state, expert, stamp); state 0 FREE, 2 READY, 3 STAGING. Paused or pumping only."""
+        """Return ``(state, expert, stamp)`` per slot; state 0 FREE, 2 READY, 3 STAGING.
+
+        Paused or pumping only.
+        """
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]) * 3, dtype=torch.int64)
         self._module.expert_stream_slot_info(self.handle, row, out)
@@ -1319,13 +1492,20 @@ class ExpertStreamHost:
         return [tuple(values[i : i + 3]) for i in range(0, len(values), 3)]
 
     def reserve_staging(self, k: int = MAX_IDS) -> None:
-        """Every row's staging slots and its tag-1 map delta (LEASE_PROTOCOL.md): the first ``min(k, capacity - 1)``
-        free slots of each row, then no slot is ever taken from them. Once, before the thread starts (or paused), with
-        every tier empty; a row with fewer than 2 slots raises."""
+        """Reserve every row's staging slots and publish its tag-1 map delta.
+
+        The staging slots are the first ``min(k, capacity - 1)`` free slots of each row;
+        no slot is ever taken from them afterwards. Call once, before the thread starts
+        (or paused), with every tier empty. A row with fewer than 2 slots raises. See
+        ``analysis/dsv41-drive/LEASE_PROTOCOL.md``, "Deltas and the bulk delta".
+        """
         self._module.expert_stream_reserve_staging(self.handle, int(k))
 
     def take_bulk_delta(self) -> torch.Tensor:
-        """The eager paths' map changes since the last call, int32 ``[n, 3]`` of (row, expert, slot); paused only."""
+        """Return the eager paths' map changes since the last call.
+
+        The result is int32 ``[n, 3]`` of (row, expert, slot). Paused only.
+        """
         out = torch.empty(
             (int(self._module.expert_stream_bulk_delta_count(self.handle)), 3),
             dtype=torch.int32,
@@ -1334,38 +1514,49 @@ class ExpertStreamHost:
         return out
 
     def handled_through(self) -> int:
-        """Test only: the last request seq the service finished."""
+        """Test only: return the last request seq the service finished."""
         return int(self._module.expert_stream_handled_through(self.handle)) & 0xFFFFFFFF
 
     def victim_census(self, row: int, wanted: Iterable[int] = ()) -> tuple[int, int]:
-        """(free, evictable) slots a request wanting ``wanted`` could take, counted without taking any. Paused or
-        pumping only."""
+        """Return ``(free, evictable)`` slots a request wanting ``wanted`` could take.
+
+        Counted without taking any. Paused or pumping only.
+        """
         self._check(row)
         out = torch.empty(2, dtype=torch.int64)
         self._module.expert_stream_victim_census(self.handle, row, _ids(wanted), out)
         return tuple(out.tolist())
 
     def close_admission(self) -> None:
-        """Shutdown, once the device is synchronised: the service serves nothing new."""
+        """Shutdown step, once the device is synchronized: serve nothing new."""
         self._module.expert_stream_close_admission(self.handle)
 
     def busy_episode(self) -> int:
-        """The busy episode of the request (or fill) now in service, 0 when none: a new value per episode, which the
-        watchdog times on its own thread (its stuck rule)."""
+        """Return the busy episode of the request (or fill) now in service, 0 when none.
+
+        Each episode gets a new value; the watchdog times it on its own thread (its
+        stuck rule).
+        """
         return int(self._module.expert_stream_busy_episode(self.handle))
 
     def set_prefill_share(self, share: int) -> None:
-        """Rows a prefill may own per layer before its admissions evict its own rows instead of decode's; 0 is off."""
+        """Set the rows a prefill may own per layer before it evicts its own rows.
+
+        Past this share, a prefill's admissions evict its own rows instead of decode's;
+        0 is off.
+        """
         self._module.expert_stream_set_prefill_share(self.handle, int(share))
 
     def enable_copy_engine(
         self, device: int, *, spin_us: int = 5000, wait_timeout_ms: int = 2000
     ) -> None:
-        """Start the copy-engine thread on CUDA device ``device`` (-1: the CPU test backend); before the thread starts.
+        """Start the copy-engine thread on CUDA ``device`` (-1: the CPU test backend).
 
-        It copies nothing until :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
-        ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the process once a closed gate has
-        held the decode stream that long (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS in a server).
+        Call before the service thread starts. It copies nothing until
+        :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
+        ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the
+        process once a closed gate has held the decode stream that long
+        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server).
         """
         self._module.expert_stream_enable_copy_engine(
             self.handle, int(device), int(spin_us * 1e3), int(wait_timeout_ms * 1e6)
@@ -1374,9 +1565,13 @@ class ExpertStreamHost:
     def set_copy_table(
         self, row: int, table: torch.Tensor, dst_rows: int, *, sm_mask: int = 0
     ) -> None:
-        """Row ``row``'s copy table: int64 ``[n, 3]`` of (source slab, destination tensor, row bytes) addresses, as
-        C1's ``ExpertRowSegments.table``; every destination tensor holds ``dst_rows`` rows. Bit i of ``sm_mask`` leaves
-        entry i to the copy wait's SM reads."""
+        """Register row ``row``'s copy table.
+
+        ``table`` is int64 ``[n, 3]`` of (source slab, destination tensor, row bytes)
+        addresses, as in ``ExpertRowSegments.table``; every destination tensor holds
+        ``dst_rows`` rows. Bit i of ``sm_mask`` leaves entry i to the copy wait's SM
+        reads.
+        """
         self._check(row)
         entries = table.detach().to("cpu", torch.int64).contiguous()
         if entries.dim() != 2 or entries.shape[1] != 3 or entries.shape[0] < 1:
@@ -1390,7 +1585,10 @@ class ExpertStreamHost:
         )
 
     def arm_copy_engine(self, on: bool = True) -> None:
-        """Let the service publish resident lanes COPYING and copy them itself, for requests whose post allows it."""
+        """Let the service publish resident lanes COPYING and copy them itself.
+
+        Applies to requests whose post allows it.
+        """
         self._module.expert_stream_arm_copy_engine(self.handle, int(bool(on)))
 
     def enable_cpu_experts(
@@ -1404,15 +1602,16 @@ class ExpertStreamHost:
         threads: int,
         spin_us: int = 50_000,
     ) -> None:
-        """CPU experts (plan 2026-09-29-dsv41-cpu-experts): start the CPU expert thread; after the copy engine, before
-        the service thread.
+        """Start the CPU expert thread (after the copy engine, before the service).
 
-        ``forward`` is the trait's native forward (a ``CpuExpertForward`` address); each row joins once its layer
-        handle is set (:meth:`set_cpu_layer`). Of a captured post's n eligible lanes, ``split[n]`` are computed on the
-        CPU (n = 0..8; the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows`` (float32
-        ``[rows, hidden]``, or ``[rows, 2, hidden]`` for a CPU-hit and a CPU-miss partial sum each) are pinned host
-        rows: the post kernel stages a row's input in the first, the CPU writes its partial sums to the second and the
-        device reads them. Both must outlive the host, which keeps references.
+        ``forward`` is the trait's native forward (a ``CpuExpertForward`` address); each
+        row joins once its layer handle is set (:meth:`set_cpu_layer`). Of a captured
+        post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..8; the
+        device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
+        (float32 ``[rows, hidden]``, or ``[rows, 2, hidden]`` for a CPU-hit and a
+        CPU-miss partial sum each) are pinned host rows: the post kernel stages a row's
+        input in the first, the CPU writes its partial sums to the second and the device
+        reads them. The host keeps references to both.
         """
         lanes = expert_lease_block.LANES
         if len(split) != lanes + 1:
@@ -1453,25 +1652,34 @@ class ExpertStreamHost:
         self.cpu_rows = (x_rows, out_rows)
 
     def set_cpu_layer(self, row: int, handle: int) -> None:
-        """CPU experts: ``row``'s layer handle from the trait's ``register_layer``; once per row, at any time."""
+        """Set ``row``'s layer handle from the trait's ``register_layer``.
+
+        Once per row, at any time.
+        """
         self._check(row)
         self._module.expert_stream_set_cpu_layer(self.handle, row, int(handle))
 
     def set_cpu_split(self, split: Sequence[int]) -> None:
-        """CPU experts: a new split table (CPU lanes per n eligible lanes, n = 0..8), at any time; the device reads it."""
+        """Set a new split table (CPU lanes per n eligible lanes, n = 0..8).
+
+        Allowed at any time; the device reads it.
+        """
         self._module.expert_stream_set_cpu_split(
             self.handle, torch.tensor(list(split), dtype=torch.int64)
         )
 
     def cpu_stats(self) -> dict[str, int]:
-        """CPU experts: jobs and lanes the CPU expert thread computed, and its forward time in ns."""
+        """Return the jobs and lanes the CPU expert thread computed, and its forward ns."""
         out = torch.zeros(3, dtype=torch.int64)
         self._module.expert_stream_cpu_stats(self.handle, out)
         jobs, lanes, ns = out.tolist()
         return {"jobs": jobs, "lanes": lanes, "forward_ns": ns}
 
     def copy_expert_bytes(self, row: int) -> int:
-        """CPU experts' calibration: the bytes the DMA moves per expert of ``row`` (its copy table less SM entries)."""
+        """Return the bytes the DMA moves per expert of ``row``, for CPU calibration.
+
+        That is the row's copy table less its SM entries.
+        """
         return int(self._module.expert_stream_copy_expert_bytes(self.handle, int(row)))
 
     def calibrate_cpu_split(
@@ -1483,9 +1691,13 @@ class ExpertStreamHost:
         scratch: torch.Tensor,
         timeout_s: float = 1.0,
     ) -> torch.Tensor:
-        """CPU experts' startup calibration on ``row``: float64 ``[10, 9]`` mean ms; row 0 ``cpu[k]``, row 1
-        ``link[m]``, row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no thread). ``device``
-        -1 copies with the test backend; ``scratch`` holds 8 experts on that device. Raises RuntimeError on failure."""
+        """Run the CPU split's startup calibration on ``row``.
+
+        Returns float64 ``[10, 9]`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
+        row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no
+        thread). ``device`` -1 copies with the test backend; ``scratch`` holds 8
+        experts on that device. Raises RuntimeError on failure.
+        """
         out = torch.zeros((10, 9), dtype=torch.float64)
         self._module.expert_stream_calibrate_cpu_split(
             self.handle,
@@ -1500,13 +1712,19 @@ class ExpertStreamHost:
         return out
 
     def test_forward_address(self, ns_per_expert: int) -> int:
-        """Test only: a native fake CPU expert forward that spins ``ns_per_expert`` per expert and writes out[0] = k.
-        Instrumented build only."""
+        """Test only: return a native fake CPU expert forward.
+
+        It spins ``ns_per_expert`` per expert and writes ``out[0] = k``. Instrumented
+        build only.
+        """
         _refuse_test_only("test_forward_address", self.variant)
         return int(self._module.expert_stream_test_forward_address(int(ns_per_expert)))
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
-        """Whether every job handed to the copy thread completed (or failed) within ``timeout_s``."""
+        """Return whether every job given to the copy thread finished in ``timeout_s``.
+
+        A job that failed counts as finished.
+        """
         return bool(
             self._module.expert_stream_copy_engine_idle(
                 self.handle, int(timeout_s * 1e9)
@@ -1514,20 +1732,28 @@ class ExpertStreamHost:
         )
 
     def copy_engine_release(self, marks: int = -1) -> None:
-        """Test only (CPU backend): let ``marks`` more copy marks complete; negative lets every one complete."""
+        """Test only (CPU backend): let ``marks`` more copy marks complete.
+
+        A negative value lets every mark complete.
+        """
         self._module.expert_stream_copy_engine_release(self.handle, int(marks))
 
     def copy_engine_fail(self, *, issue: bool = False, query: bool = False) -> None:
-        """Test only (CPU backend): make issuing a copy, or asking whether a mark completed, return an error.
-        Instrumented build only."""
+        """Test only (CPU backend): make issuing a copy, or querying a mark, fail.
+
+        Instrumented build only.
+        """
         _refuse_test_only("copy_engine_fail", self.variant)
         self._module.expert_stream_copy_engine_fail(self.handle, int(issue), int(query))
 
     def copy_engine_ballast(
         self, dst: Optional[torch.Tensor], src: Optional[torch.Tensor]
     ) -> None:
-        """Test only: copy ``src`` into ``dst`` (same byte size) ahead of every copy job, delaying its completion;
-        ``None`` turns it off. The caller keeps both tensors alive while it is on. Instrumented build only."""
+        """Test only: copy ``src`` into ``dst`` (same size) ahead of every copy job.
+
+        This delays each job's completion; ``None`` turns it off. The caller keeps both
+        tensors alive while it is on. Instrumented build only.
+        """
         _refuse_test_only("copy_engine_ballast", self.variant)
         if dst is None or src is None:
             self._module.expert_stream_copy_engine_ballast(self.handle, 0, 0, 0)
@@ -1542,36 +1768,48 @@ class ExpertStreamHost:
         )
 
     def copy_engine_marked(self) -> int:
-        """Test only (CPU backend): copy marks recorded so far, one per job issued."""
+        """Test only (CPU backend): return the copy marks recorded so far.
+
+        There is one per job issued.
+        """
         return int(self._module.expert_stream_copy_engine_marked(self.handle))
 
     def mapping(self, row: int) -> list[int]:
-        """Each expert's READY slot, else -1: the published slot map (``slot_map``), read without waiting."""
+        """Return each expert's READY slot, else -1.
+
+        This is the published slot map (``slot_map``), read without waiting.
+        """
         self._check(row)
         out = torch.empty(self.experts, dtype=torch.int64)
         self._module.expert_stream_mapping(self.handle, row, out)
         return out.tolist()
 
     def slot_to_expert(self, row: int) -> list[int]:
+        """Return the expert held by each slot of ``row``. Paused or pumping only."""
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]), dtype=torch.int64)
         self._module.expert_stream_slot_to_expert(self.handle, row, out)
         return out.tolist()
 
     def lru_order(self, row: int) -> list[int]:
+        """Return the READY slots' experts, least recently used first.
+
+        Paused or pumping only.
+        """
         self._check(row)
         out = torch.empty(int(self.tables.capacity[row]), dtype=torch.int64)
         count = int(self._module.expert_stream_lru_order(self.handle, row, out))
         return out[:count].tolist()
 
     def set_hot(self, row: int, experts: Iterable[int]) -> None:
-        """The row's hot set (never evicted). Paused or pumping only."""
+        """Set the row's hot set (never evicted). Paused or pumping only."""
         self._check(row)
         self._module.expert_stream_set_hot(
             self.handle, row, _ids(e for e in experts if e >= 0)
         )
 
     def version(self) -> int:
+        """Return the functional version counter."""
         return self.counters()["version"]
 
     def inject(
@@ -1580,15 +1818,22 @@ class ExpertStreamHost:
         fail_reads: bool = False,
         delay_after_demands: int = 0,
     ) -> None:
-        """Test-only faults (see RamTier::inject); a failed read aborts the process. Instrumented build only."""
+        """Test only: inject faults (see ``RamTier::inject``).
+
+        A failed read aborts the process. Instrumented build only.
+        """
         _refuse_test_only("inject", self.variant)
         self._module.expert_stream_inject(
             self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands
         )
 
     def piece_runs(self) -> torch.Tensor:
-        """The stream kernel's piece table: int32 ``[layers, experts, STAGE_PIECES, segments, 2]``, each run a
-        ``(lo, hi)`` byte range of its segment's name row, cut by the reader's own row geometry."""
+        """Return the stream kernel's piece table.
+
+        The table is int32 ``[layers, experts, STAGE_PIECES, segments, 2]``; each run is
+        a ``(lo, hi)`` byte range of its segment's name row, cut by the reader's own row
+        geometry. Raises RuntimeError if a (row, expert) cannot be cut into pieces.
+        """
         tables = self.tables
         runs = torch.zeros(
             (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[0]), 2),
@@ -1598,30 +1843,41 @@ class ExpertStreamHost:
             self._module.expert_stream_piece_runs(*_table_args(tables)[:-1], runs)
         )
         if refused:
-            # A refused row's runs are empty: S would admit a READY hit of it, copy nothing and commit.
+            # A refused row's runs are empty: the stream kernel would admit a READY hit
+            # of it, copy nothing and commit.
             raise RuntimeError(
                 f"exl3 RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces"
             )
         return runs
 
     def inject_fault(self, **faults) -> None:
-        """Test only: hand the tier's reader a whole ``ReadFault`` (the keywords of ``_fault_tensor``, the same
-        vocabulary ``read_rows_faulted`` takes). Unlike ``inject(fail_reads=True)`` the read still runs, so
-        the fault acts on rows that already packed. It is installed before the next read, stays until
-        replaced, and ``inject_fault()`` with no keywords clears it. ``abandon_after`` and ``step``
-        are not faults and are ignored. Call-numbered faults (``submit_call``, ``cqe_call``) count from the reader's creation. Instrumented
-        build only: production refuses rather than store a fault it has no code to apply."""
+        """Test only: hand the tier's reader a whole ``ReadFault``.
+
+        The keywords are those of ``_fault_tensor``, the vocabulary
+        ``read_rows_with_fault`` documents. Unlike ``inject(fail_reads=True)`` the read
+        still runs, so the fault acts on rows that already packed. It is installed
+        before the next read and stays until replaced; ``inject_fault()`` with no
+        keywords clears it. ``abandon_after`` and ``step`` are not faults and are
+        ignored. Call-numbered faults (``submit_call``, ``cqe_call``) count from the
+        reader's creation. Instrumented build only: production refuses rather than
+        store a fault it has no code to apply.
+        """
         _refuse_test_only("inject_fault", self.variant)
         self._module.expert_stream_inject_fault(self.handle, _fault_tensor(**faults))
 
     def enable_trace(self, capacity: int = 8192) -> None:
-        """Record one stage record per served request, up to ``capacity`` undrained (more are dropped
-        and counted). Before ``start_thread``; with it off the service takes no timestamps."""
+        """Record one stage record per served request.
+
+        Up to ``capacity`` records are kept undrained; more are dropped and counted.
+        Call before ``start_thread``. With the trace off the service takes no
+        timestamps.
+        """
         _stage_words(self._layout, self.variant)
         self._module.expert_stream_trace_enable(self.handle, int(capacity))
 
     def drain_trace(self, limit: int = 4096) -> list[dict]:
-        """The stage records not yet drained, oldest first, as ``stage_records`` decodes them."""
+        """Return the stage records not yet drained, oldest first, decoded by
+        ``stage_records``."""
         out = []
         while True:
             words = torch.empty((limit, len(STAGE_FIELDS)), dtype=torch.int64)
@@ -1631,38 +1887,50 @@ class ExpertStreamHost:
                 return out
 
     def trace_dropped(self) -> int:
+        """Return the stage records dropped because the trace ring was full."""
         return int(self._module.expert_stream_trace_dropped(self.handle))
 
     def trace_clock_reads(self) -> int:
-        """Clock reads taken for trace records, process-wide and cumulative: zero growth while the
-        trace is off is what shows a disabled trace does no timing work. Instrumented build only."""
+        """Test only: return the clock reads taken for trace records.
+
+        The count is process-wide and cumulative; zero growth while the trace is off
+        shows that a disabled trace does no timing work. Instrumented build only.
+        """
         _refuse_test_only("trace_clock_reads", self.variant)
         return int(self._module.expert_stream_trace_clock_reads())
 
     def counters(self) -> dict[str, int]:
-        """Every counter on the instrumented build; only ``CORE_COUNTERS`` on production, which has no metrics."""
+        """Return every counter on the instrumented build.
+
+        Production has no metrics and returns only ``CORE_COUNTERS``.
+        """
         out = torch.zeros(len(COUNTERS), dtype=torch.int64)
         self._module.expert_stream_counters(self.handle, out)
         values = dict(zip(COUNTERS, out.tolist()))
-        # Every instrumented variant ("instr", "instr_tsan") compiles the metrics; only "prod" drops them.
+        # Every instrumented variant ("instr", "instr_tsan") compiles the metrics; only
+        # "prod" drops them.
         return (
             values if self.variant != "prod" else {k: values[k] for k in CORE_COUNTERS}
         )
 
     def layer_rows(self) -> list[int]:
-        """Rows read for demands, per streamed layer: the RAM misses behind ``f``."""
+        """Return the rows read for demands, per streamed layer (the RAM misses)."""
         out = torch.zeros(self.layers, dtype=torch.int64)
         self._module.expert_stream_layer_rows(self.handle, out)
         return out.tolist()
 
     def stop(self) -> None:
+        """Stop the service thread, log the counters and close the service.
+
+        Idempotent.
+        """
         close = getattr(self, "_close", None)
         if close is not None and close.alive:
             try:
                 if self.threaded:
                     self._module.expert_stream_stop_thread(self.handle)
                     self.threaded = False
-                # One line for the window's records (the corpus arms grep it).
+                # One line per window; benchmark arms grep it, so keep its shape.
                 sys.stderr.write(
                     "exl3 RAM miss thread counters "
                     + json.dumps(self.counters())
@@ -1672,7 +1940,8 @@ class ExpertStreamHost:
                 close()
 
 
-# The device's own words (lease_device.cuh kPosted..kDeadlineHi), in device memory: never on the wire.
+# The device's own words (``lease_device.cuh``, ``kPosted``..``kDeadlineHi``): they live
+# in device memory and are never on the wire.
 STATE_WORDS = {
     "posted": 0,
     "pending": 1,
@@ -1694,6 +1963,7 @@ _ROW_COPY_METHODS = {
 
 
 def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
+    """Return the (FFI name, C++ symbol) pairs the device module exports."""
     device_layout = LAYOUTS[layout].device_layout
     return [
         (name, f"LeaseProtocolKernel::{method}")
@@ -1705,6 +1975,7 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
 
 
 def _device_module(layout: str = "exl3") -> Module:
+    """Return the cached device module for ``layout``."""
     return _device_module_cached(layout)
 
 
@@ -1718,8 +1989,11 @@ def _device_module_cached(layout: str) -> Module:
 
 
 def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Module:
-    """Test only: the device kernels built with the ``EXL3_RAM_MISS_TEST_*`` hooks ``defines`` turn on (``NAME`` or
-    ``NAME=value``), a module of its own; production builds with none, so its kernels carry no test knob."""
+    """Test only: build the device kernels with the ``EXL3_RAM_MISS_TEST_*`` hooks on.
+
+    ``defines`` are ``NAME`` or ``NAME=value`` entries. The result is a module of its
+    own; production builds with none, so its kernels carry no test knob.
+    """
     if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
         raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
     return load_jit(
@@ -1732,13 +2006,17 @@ def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Mo
 
 
 def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
-    """The stream kernel's view of a copy table (``ExpertRowSegments``) for streamed row ``row``: int32
-    ``[S + n]``, first each of ``tables``' S row segments' entry in the table (the pair whose source is that
-    segment's name slab), then one flag per table entry, 1 for an entry no row segment names. Such an entry holds
-    no host-read bytes and is copied whole with piece 0, as the two-phase copy kernel copied every entry."""
+    """Return the stream kernel's view of a copy table (``ExpertRowSegments``).
+
+    The result is int32 ``[S + n]``. The first S entries give, for each of ``tables``'
+    S row segments, its entry in the table (the pair whose source is that segment's
+    name slab). Then comes one flag per table entry, 1 for an entry no row segment
+    names: such an entry holds no host-read bytes and is copied whole with piece 0.
+    """
     table = segments.table.cpu().tolist()
     for source, destination, row_bytes in table:
-        # stream_copy_slice falls back to 1-byte copies off 16-byte alignment (plan 4.2 refuses it instead).
+        # stream_copy_slice would fall back to 1-byte copies off 16-byte alignment;
+        # refuse instead.
         if destination % 16 or row_bytes % 16:
             raise ValueError(
                 f"the stream kernel copies 16-byte units: destination {destination:#x} with rows of "
@@ -1774,14 +2052,37 @@ def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
 
 
 class ExpertStreamDevice:
-    """The chain's device kernels (post -> C1 -> S -> CW -> stream wait -> CC), capturable in a graph.
+    """The chain's device kernels, capturable in a CUDA graph.
 
-    ``page`` and ``lease_block`` are the host's pinned tensors (device-readable through UVA); ``state`` holds the
-    device words ``STATE_WORDS``. ``piece_runs`` is ``host.piece_runs()``; ``row_capacities`` each row's pinned slot
-    count (``tables.capacity``), which the post and S bound every host slot by. ``timeout_ms`` is the post's delta wait
-    and S's deadline. ``map_bank`` is the device's copy of the RAM tier's map (LEASE_PROTOCOL.md): ``ram_slot``
-    ``[layers, experts]`` starts at -1 and changes only by the deltas the post applies and ``map_bulk_apply``.
-    ``hit_copy`` ("ce" or "sm") and ``cpu_misses`` are SGLANG_DSV41_RAM_HIT_COPY and SGLANG_DSV41_CPU_EXPERTS_MISSES.
+    One chain runs per layer, in one stream: ``post -> C1 -> S -> CW -> stream wait ->
+    CC`` (``analysis/dsv41-drive/LEASE_PROTOCOL.md``, "The chain"):
+
+      * ``post`` applies the row's pending map delta, types each lane (hit, miss, copy
+        engine, CPU) from the device map and publishes the request record;
+      * C1 (row copy, outside this class) copies the lanes the SMs read from RAM;
+      * ``stream`` (S) copies the miss lanes from their staging slots, piece by piece
+        as the reader publishes them;
+      * ``copy_wait`` runs CW (close the gate), the ``cuStreamWaitValue32`` wait and
+        CC (commit), which traps unless ``CopyDone`` names this request.
+
+    ``page`` and ``lease_block`` are the host's pinned tensors (device-readable through
+    UVA); ``state`` holds the device words ``STATE_WORDS``. ``piece_runs`` is
+    ``host.piece_runs()``; ``row_capacities`` is each row's pinned slot count
+    (``tables.capacity``), which the post and S bound every host slot by.
+    ``timeout_ms`` is the post's delta wait and S's deadline. ``hit_copy`` ("ce" or
+    "sm") and ``cpu_misses`` carry ``SGLANG_DSV41_RAM_HIT_COPY`` and
+    ``SGLANG_DSV41_CPU_EXPERTS_MISSES``; ``lease_pdl``
+    (``SGLANG_DSV41_ENABLE_LEASE_PDL``) launches every chain kernel but C1 and CC with
+    PDL.
+
+    ``map_bank`` is the device's copy of the RAM tier's map: ``ram_slot``
+    ``[layers, experts]`` starts at -1 and changes only through the deltas the post
+    applies and ``map_bulk_apply``. ``map_chain`` starts at 1, because tag 1 is the
+    attach delta, so a zero-filled delta record (tag 0) is never taken for a published
+    one. Per row, ``ce_ok``/``dst_rows`` say the copy engine may take a hit and
+    ``cpu_ok`` that the CPU may; the service sets them as it learns them and the post
+    reads them. The tensors the kernels exchange (``lane_kind``, ``lane_slot``, ...)
+    are allocated once: a graph captures their addresses like any other argument.
     """
 
     def __init__(
@@ -1811,8 +2112,8 @@ class ExpertStreamDevice:
         if timeout_ms <= 0:
             raise ValueError("the RAM-miss wait timeout must be positive")
         cuda = torch.device(device).type == "cuda"
-        # Checked before any CUDA call: the kernels read both through UVA, and an unpinned address faults inside the
-        # captured graph.
+        # Checked before any CUDA call: the kernels read both through UVA, and an
+        # unpinned address faults inside the captured graph.
         if cuda and not page.is_pinned():
             raise ValueError("page must be pinned for a CUDA device")
         expert_lease_block.check_lease_block(lease_block, layers, need_pinned=cuda)
@@ -1843,7 +2144,6 @@ class ExpertStreamDevice:
         self.layers = layers
         self.experts = experts
         self.timeout_ns = int(timeout_ms * 1_000_000)
-        # SGLANG_DSV41_ENABLE_LEASE_PDL: every chain launcher but C1 and CC launches with PDL.
         self.lease_pdl = bool(lease_pdl)
         self._row_capacities = tuple(int(c) for c in row_capacities)
         self._lease_address = int(lease_block.data_ptr())
@@ -1852,13 +2152,13 @@ class ExpertStreamDevice:
         self.hit_copy = hit_copy
         self.cpu_misses = bool(cpu_misses)
         state = torch.zeros(len(STATE_WORDS), dtype=torch.int32)
-        # Continue from the page's head: the thread serves demand_head + 1 next, so a device restarting at 1 over a
-        # used page would never be served.
+        # Continue from the page's head: the thread serves demand_head + 1 next, so a
+        # device restarting at 1 over a used page would never be served.
         state[STATE_WORDS["posted"]] = page[
             WORDS["demand_head"] : WORDS["demand_head"] + 4
         ].view(torch.int32)[0]
         self.state = state.to(device)
-        # Stable sentinels for absent tensors: a graph captures their addresses like every other argument.
+        # Stable sentinels for absent tensors (see the class doc on graph capture).
         self._no_hot_slots = torch.empty(0, dtype=torch.int64, device=device)
         self._no_cpu = torch.empty(0, dtype=torch.int32, device=device)
         self._module = None
@@ -1881,8 +2181,6 @@ class ExpertStreamDevice:
             self._hot_address = int(hot_page.data_ptr())
             self._hot_stride = stride
         lanes = expert_lease_block.LANES
-        # The device's map bank: tag 1 is the attach delta and map_chain starts there, so a zero-filled delta record
-        # (tag 0) is never taken for a published one.
         self.map_bank = {
             "ram_slot": torch.full(
                 (layers, experts), -1, dtype=torch.int32, device=device
@@ -1892,8 +2190,8 @@ class ExpertStreamDevice:
             ),
             "map_chain": torch.ones(layers, dtype=torch.int64, device=device),
             "map_applied": torch.zeros(layers, dtype=torch.int64, device=device),
-            # Per row: the copy engine may take a hit (its copy table is set), its destination rows, and the CPU may
-            # (its layer is registered). Set as the service learns them, read at every post.
+            # Per row: the copy engine may take a hit (its copy table is set), its
+            # destination rows, and the CPU may (its layer is registered).
             "ce_ok": torch.zeros(layers, dtype=torch.uint8, device=device),
             "dst_rows": torch.zeros(layers, dtype=torch.int32, device=device),
             "cpu_ok": torch.zeros(layers, dtype=torch.uint8, device=device),
@@ -1901,8 +2199,8 @@ class ExpertStreamDevice:
         self._row_capacity_tensor = torch.tensor(
             self._row_capacities, dtype=torch.int32, device=device
         )
-        # The post's outputs: each lane's kind and source slot (S and CW read them), and C1's compacted SM hits, in one
-        # order. Stable addresses: a graph captures them.
+        # The post's outputs: each lane's kind and source slot (S and CW read them), and
+        # C1's compacted SM hits, in one order.
         self.lane_kind = torch.zeros(lanes, dtype=torch.int32, device=device)
         self.lane_slot = torch.full((lanes,), -1, dtype=torch.int32, device=device)
         self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1912,21 +2210,27 @@ class ExpertStreamDevice:
         self.ce_mask = torch.zeros(1, dtype=torch.int32, device=device)
         # CPU experts: the lanes the CPU computed, written by CC (0: none).
         self.cpu_lanes = torch.zeros(1, dtype=torch.int32, device=device)
-        # CPU experts (enable_cpu_experts): the host rows the post stages each layer's input into, and those the CPU
-        # expert thread writes each layer's partial sum to; None when off.
+        # CPU experts (``enable_cpu_experts``): the host rows the post stages each
+        # layer's input into, and those the CPU expert thread writes each layer's
+        # partial sum to; None when off.
         self.cpu_x_rows = None
         self.cpu_out_rows = None
-        # Set by the row backend when it captures a post that lets the service copy (the service arms on it).
+        # Set by the row backend when it captures a post that lets the service copy; the
+        # service arms its copy engine on it.
         self.copy_engine_captured = False
         self.piece_runs = piece_runs.to(device).contiguous()
 
     def _kernels(self):
+        """Return the device module, loading it on first use."""
         if self._module is None:
             self._module = _device_module(self._layout)
         return self._module
 
     def enable_cpu_experts(self, x_rows: torch.Tensor, out_rows: torch.Tensor) -> None:
-        """CPU experts: the same pinned rows the host's ``enable_cpu_experts`` took, one per layer (UVA-readable)."""
+        """Take the same pinned rows the host's ``enable_cpu_experts`` took.
+
+        There is one row per layer, readable through UVA.
+        """
         for rows, name in ((x_rows, "x_rows"), (out_rows, "out_rows")):
             if (
                 rows.shape[0] != self.layers
@@ -1950,19 +2254,29 @@ class ExpertStreamDevice:
         self.cpu_x_rows, self.cpu_out_rows = x_rows, out_rows
 
     def set_row_copy(self, row: int, dst_rows: int) -> None:
-        """The row's copy table is registered with ``dst_rows`` destination rows: the post may type its hits kHitCopy."""
+        """Record that the row's copy table is registered with ``dst_rows`` rows.
+
+        The post may then type the row's hits kHitCopy.
+        """
         self._check_row(row)
         self.map_bank["dst_rows"][row] = int(dst_rows)
         self.map_bank["ce_ok"][row] = 1
 
     def set_row_cpu(self, row: int) -> None:
-        """The row's CPU layer is registered: the post may type its lanes kHitCpu or kMissCpu."""
+        """Record that the row's CPU layer is registered.
+
+        The post may then type its lanes kHitCpu or kMissCpu.
+        """
         self._check_row(row)
         self.map_bank["cpu_ok"][row] = 1
 
     def map_bulk_apply(self, bulk: torch.Tensor) -> None:
-        """The eager paths' map changes (``host.take_bulk_delta()``, int32 ``[n, 3]``), after every row's pending decode
-        delta, on the current stream. The caller has synchronized the stream and paused the service."""
+        """Apply the eager paths' map changes on the current stream.
+
+        ``bulk`` is ``host.take_bulk_delta()``, int32 ``[n, 3]``; it applies after every
+        row's pending decode delta. The caller has synchronized the stream and paused
+        the service.
+        """
         if bulk.dtype != torch.int32 or bulk.dim() != 2 or bulk.shape[1] != 3:
             raise ValueError(
                 f"the bulk delta is int32 [n, 3], not {bulk.dtype} {tuple(bulk.shape)}"
@@ -1979,20 +2293,31 @@ class ExpertStreamDevice:
         )
 
     def cpu_out_address(self, row: int) -> int:
-        """The host address of ``row``'s CPU partial sums (part 0), which the fused MoE's route tables read."""
+        """Return the host address of ``row``'s CPU partial sums (part 0).
+
+        The fused MoE's route tables read it.
+        """
         self._check_row(row)
         return int(self.cpu_out_rows[row].data_ptr())
 
     def cpu_out_part_stride(self) -> int:
-        """Floats from a row's part 0 (the CPU hits' sum) to its part 1 (the CPU misses'); 0 for one-part rows."""
+        """Return the floats from a row's part 0 (CPU hits) to its part 1 (CPU misses).
+
+        0 for one-part rows.
+        """
         return int(self.cpu_out_rows.stride(1)) if self.cpu_out_rows.dim() == 3 else 0
 
     def _check_row(self, row: int) -> None:
+        """Raise ValueError for a row outside ``[0, layers)``."""
         if not 0 <= row < self.layers:
             raise ValueError(f"row {row} is outside [0, {self.layers})")
 
     def _check_buffers(self, **buffers) -> None:
-        """The kernels cast each buffer's data pointer to one fixed type and read ``[0, lanes)``."""
+        """Raise ValueError unless each ``(tensor, dtype)`` buffer suits a kernel.
+
+        The kernels cast each buffer's data pointer to one fixed type and read
+        ``[0, lanes)``.
+        """
         for name, (tensor, dtype) in buffers.items():
             if (
                 tensor.dtype != dtype
@@ -2016,12 +2341,17 @@ class ExpertStreamDevice:
         captured: bool = False,
         cpu_input=None,
     ) -> None:
-        """Post the layer's request: apply the row's pending map delta, type its lanes from the device map into
-        ``lane_kind``/``lane_slot`` and C1's compaction, and publish the record. ``dst_slots`` are the plan's int32
-        destination slots; ``captured`` lets the post type copy-engine and CPU lanes.
+        """Post the layer's request.
 
-        ``cpu_input`` = (x ``[1, hidden]``, route weights aligned with ``routes``), CPU experts only and with
-        ``captured``: the post stages x in the row's host row when a lane is the CPU's, and the weights in the record."""
+        Applies the row's pending map delta, types its lanes from the device map into
+        ``lane_kind``/``lane_slot`` and C1's compaction, and publishes the record.
+        ``dst_slots`` are the plan's int32 destination slots; ``captured`` lets the post
+        type copy-engine and CPU lanes.
+
+        ``cpu_input`` is ``(x [1, hidden], route weights aligned with routes)``, for CPU
+        experts and only with ``captured``: the post stages x in the row's host row when
+        a lane is the CPU's, and the weights in the record.
+        """
         self._check_row(row)
         self._check_buffers(
             planned=(planned, torch.int64),
@@ -2091,8 +2421,10 @@ class ExpertStreamDevice:
     def stream(
         self, row: int, planned, count, dst_slots, segments, segment_map
     ) -> None:
-        """S: copy the post's kMissGpu lanes from their staging slots into ``segments``' destinations, each piece as
-        its bit is published, until every piece is copied. ``segment_map`` is ``stream_segment_map(segments, ...)``.
+        """Copy the post's kMissGpu lanes from their staging slots (kernel S).
+
+        Each piece goes to ``segments``' destinations as its bit is published, until
+        every piece is copied. ``segment_map`` is ``stream_segment_map(segments, ...)``.
         """
         self._check_row(row)
         self._check_buffers(
@@ -2128,12 +2460,13 @@ class ExpertStreamDevice:
     def copy_wait(
         self, count, dst_slots, sm_table: Optional[torch.Tensor] = None
     ) -> None:
-        """The chain's tail: CW, a ``cuStreamWaitValue32`` on the gate, and CC.
+        """Run the chain's tail: CW, a ``cuStreamWaitValue32`` on the gate, and CC.
 
-        CW reads, with ``sm_table``, the small tensors of every kHitCopy lane from its RAM slot (int64 ``[n, 3]`` on the
-        device, the copy-table rows the service's ``sm_mask`` named) and closes the gate when the record has host
-        lanes; the stream then waits, no SM spinning, until CW or the service's copy thread opens it; CC traps unless
-        CopyDone names this request.
+        With ``sm_table`` (int64 ``[n, 3]`` on the device: the copy-table rows the
+        service's ``sm_mask`` named), CW reads the small tensors of every kHitCopy lane
+        from its RAM slot. It closes the gate when the record has host lanes; the
+        stream then waits, with no SM spinning, until CW or the service's copy thread
+        opens it. CC traps unless ``CopyDone`` names this request.
         """
         self._check_buffers(
             count=(count, torch.int32), dst_slots=(dst_slots, torch.int32)
@@ -2169,5 +2502,6 @@ class ExpertStreamDevice:
         )
 
     def stats(self) -> dict[str, int]:
+        """Return the device words ``STATE_WORDS`` (a device-to-host copy)."""
         values = self.state.cpu().tolist()
         return {name: values[index] for name, index in STATE_WORDS.items()}

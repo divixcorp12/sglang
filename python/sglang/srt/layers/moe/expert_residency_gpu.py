@@ -1,9 +1,18 @@
-"""In-graph residency update for dynamic expert hot caches.
+"""In-graph residency update for the dynamic expert hot cache.
 
-The decode forward's residency boundary runs as fixed-shape device operations
-inside the first streamed layer's graph gather, so a captured decode graph
-decays scores, decides promotions, rewrites every layer's expert-to-slot
-mapping and slot state, and copies promoted rows without the host.
+``GpuResidencyUpdater`` moves the hot cache's residency bookkeeping onto the device.
+The decode forward's residency boundary runs as fixed-shape device operations inside
+the first streamed layer's graph gather, so a captured decode graph decays scores,
+decides promotions, rewrites every layer's expert-to-slot mapping and slot state, and
+copies promoted rows without the host.
+
+Two boundary modes exist. Promotion decides from the decayed scores which experts
+enter the cache and copies their host rows. Insert-on-miss (stage 1 SCRATCH, stage 2
+DIRECT) instead admits the experts a forward just missed. Stage 2 is described on
+``GpuResidencyUpdater``; its measured gain is in MOE_EXPERT_TRANSFER.md.
+
+The host-side counterpart is ``ResidencyBoundaryClock`` in
+``expert_residency_clock.py``; the device clock here mirrors it.
 """
 
 from __future__ import annotations
@@ -24,44 +33,62 @@ from sglang.srt.layers.moe.expert_residency_clock import ForwardKind
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
 
+# Slot states, as in the hot cache's ``slot_state``.
 _FREE = 0
 _READY = 3
+# Index into the [2, layers] promotion and eviction counters.
 _DECODE_PHASE = 0
 _PREFILL_PHASE = 1
+# SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE values.
 _STAGE_OFF = 0
 _STAGE_SCRATCH = 1
 _STAGE_DIRECT = 2
-# Above every residency_rank_keys key of a nonnegative score (sign-bit-0 float32 bits << 16 < 2**47).
+# Above every residency_rank_keys key of a nonnegative score: sign-bit-0 float32 bits
+# shifted left by 16 stay below 2**47. Adding it ranks a routed expert after all others.
 _ROUTED_RANK_OFFSET = 1 << 48
 
 
 class GpuResidencyUpdater:
     """Device-owned residency state and the boundary update over all streamed layers.
 
-    Construction moves every layer's scores, route counts, expert-to-slot
-    mapping, slot states and generations into ``[layers, ...]`` device banks
-    and rebinds the caches and policies to row views, so graph gathers and
-    route recording keep their addresses. A dump column past each row absorbs
-    the writes of unused fixed-shape entries.
+    Construction moves every layer's scores, route counts, expert-to-slot mapping,
+    slot states and generations into ``[layers, ...]`` device banks and rebinds the
+    caches and policies to row views, so graph gathers and route recording keep their
+    addresses. A dump column past each row absorbs the writes of unused fixed-shape
+    entries. The first streamer's ``residency_update`` and ``before_eager_gather``
+    hooks are bound to this object.
 
-    Boundary timing mirrors :class:`ResidencyBoundaryClock`. A decode or
-    verify forward that completes ``update_decode_forwards`` sets a device
-    pending flag; the first streamed layer's gather of the next forward
-    applies it before any gather reads a mapping, which is when the host path
-    would have applied it after the forward. An eager forward applies a
-    pending boundary before its first gather through :meth:`flush`, and a
-    qualifying prefill applies its boundary eagerly at the end of the forward.
-    Decode boundaries promote at most ``max_promotions`` experts per layer,
-    the best in rank order; prefill boundaries are uncapped. Promotions are
-    copied from the registered host rows straight into the evicted or free
-    slots on the current stream, ahead of the gathers that read them.
+    Boundary timing mirrors :class:`ResidencyBoundaryClock`. A decode or verify
+    forward that completes ``update_decode_forwards`` sets a device pending flag. The
+    first streamed layer's gather of the next forward applies it before any gather
+    reads a mapping, which is when the host path would have applied it after the
+    forward. An eager forward applies a pending boundary before its first gather
+    through :meth:`flush`, and a qualifying prefill applies its boundary eagerly at
+    the end of the forward.
 
-    With ``insert_on_miss`` (every decode forward is a boundary), a decode
-    boundary promotes no host rows. Instead each layer's missed experts of the
-    previous forward, still in its scratch rows, are copied device to device
-    into free slots, then into the slots of the residents with the lowest
-    per-token decayed route score among residents that forward did not route.
-    Prefill boundaries keep the promotion decision above.
+    Promotion boundary: decode boundaries promote at most ``max_promotions`` experts
+    per layer, the best in rank order; prefill boundaries are uncapped. Promotions are
+    copied from the registered host rows straight into the evicted or free slots on
+    the current stream, ahead of the gathers that read them.
+
+    Insert-on-miss (every decode forward is a boundary) promotes no host rows at a
+    decode boundary. Prefill boundaries keep the promotion decision above.
+
+    * Stage 1 (SCRATCH): each layer's missed experts of the previous forward, still
+      in its scratch rows, are copied device to device into free slots, then into
+      the slots of the residents with the lowest per-token decayed route score among
+      residents that forward did not route.
+    * Stage 2 (DIRECT): the boundary only ranks a victim shortlist. The next
+      forward's gather sends its miss copies straight into the shortlisted slots and
+      commits residency in the same graph (:meth:`_init_insert_direct` states the
+      capacity guarantee).
+
+    Device-to-device row copies were measured on the RTX 5090 over a 4.9 GiB working
+    set, which is the size the production loop runs in (48 layers x 6 tensors per
+    boundary). Per row, an index copy costs 0.0105 ms, the segment kernel 0.125 ms
+    and the fused masked kernel 0.0037 ms. A benchmark that reuses one tensor stays
+    resident in the 96 MiB L2 and reports 0.007 and 0.054 ms for the first two, which
+    understates their production cost by 1.5x and 2.3x.
     """
 
     def __init__(
@@ -220,11 +247,11 @@ class GpuResidencyUpdater:
 
     @staticmethod
     def _decay_values(policy, limit: int) -> list[float]:
-        """Boundary decays by token count until they reach float32 zero, which every longer window keeps.
+        """Tabulate the boundary decay by token count, up to the first float32 zero.
 
-        Clamping the token index to the last entry is then exact. A decay that
-        stays nonzero through ``limit`` tokens would be approximated past it, so
-        it is refused.
+        Every longer window decays to zero as well, so clamping the token index to
+        the last entry is exact. A decay still nonzero at ``limit`` tokens would be
+        approximated past it, so it is refused.
         """
         if policy.decay_tokens is None or policy.decay >= 1.0:
             return [policy.boundary_decay(None)] * 2
@@ -240,6 +267,7 @@ class GpuResidencyUpdater:
         )
 
     def _init_insert_on_miss(self) -> None:
+        """Allocate the insert-on-miss state and, for stage 1, the row-copy tensors."""
         if self.update_decode_forwards != 1:
             raise ValueError(
                 "insert-on-miss needs a residency boundary after every decode forward"
@@ -253,7 +281,7 @@ class GpuResidencyUpdater:
             )
         device, layers = self.device, self.num_layers
         self.miss_rows = rows.pop()
-        # Victims are ranked over every slot column, padded to at least one column per miss row.
+        # Victims rank over every slot column, padded to one column per miss row.
         self.victim_columns = max(self.max_capacity + 1, self.miss_rows)
         self.miss_columns = torch.arange(
             self.miss_rows, dtype=torch.long, device=device
@@ -285,25 +313,9 @@ class GpuResidencyUpdater:
         if self.insert_direct:
             self._init_insert_direct()
             return
-        # Scratch rows and slots of every tensor, host-backed or not, live in the cache's own tensors.
-        #
-        # Byte-row views, D2D on an RTX 5090. Two regimes, because this card has ~128 MB of L2
-        # and the answer depends on whether the rows are in it:
-        #
-        #   cached      ~0.007 ms/row index copy, ~0.054 for copy_expert_row_segments_gpu
-        #   production  ~0.0105 ms/row index copy, ~0.125 for the segment kernel,
-        #               ~0.0037 for the fused masked kernel below
-        #
-        # The cached pair is what `iom-cuda-tests.sh` reports: it copies 20 rows back and forth
-        # inside a single 221 MB tensor, so ~55 MB stays resident in L2 across every rep and
-        # nothing goes to HBM. Quote it only as a cached number. The production pair was measured
-        # over 48 separate layer tensors -- a 4.9 GiB working set with no L2 reuse between layers,
-        # which is the shape this loop actually runs in, 48 layers x 6 tensors per boundary.
-        #
-        # The design decision rests on the production regime, and the cached numbers understate
-        # the margin rather than inventing it: the index copy beats the segment kernel by 7.7x
-        # cached and by 11.9x on a real working set. What the cached numbers *do* hide is the
-        # absolute cost of this loop, by 1.5x, and the segment kernel's by 2.3x.
+        # Scratch rows and slots of every tensor, host-backed or not, live in the
+        # cache's own tensors, so one byte-row index copy moves a row. It beats the
+        # segment kernel by 11.9x per row on the production working set (class doc).
         self.insert_tensors = [
             tuple(
                 tensor.view(torch.uint8).reshape(tensor.shape[0], -1)
@@ -312,15 +324,14 @@ class GpuResidencyUpdater:
             for cache in self.caches
         ]
         if self.fused_insert:
-            # One active flag per lane, read on the device inside the kernel, so an idle lane
-            # moves no bytes while the launch shape stays fixed and no count reaches the host.
+            # One active flag per lane, read on the device: an idle lane moves no
+            # bytes, the launch shape stays fixed and no count reaches the host.
             self.insert_active = torch.zeros(
                 (layers, self.miss_rows), dtype=torch.int32, device=device
             )
-            # Compile every specialisation now, with no lane active so not a byte moves. Triton
-            # JITs on first call and specialises on the row length, and the boundary's first call
-            # can land inside graph capture, which would have to compile mid-capture. Warming it
-            # here costs 48 x 6 no-op launches once at startup and removes that from the path.
+            # Warm every row-length specialisation with no lane active. Triton
+            # compiles on first call, and the boundary's first call can land inside
+            # graph capture.
             for row, tensors in enumerate(self.insert_tensors):
                 for rows_view in tensors:
                     insert_expert_rows(
@@ -331,36 +342,30 @@ class GpuResidencyUpdater:
                     )
 
     def _init_insert_direct(self) -> None:
-        """Stage DIRECT: a victim shortlist per layer, and the guarantee that every miss finds one.
+        """Stage DIRECT: a victim shortlist per layer and the guarantee that misses find one.
 
         Each boundary ranks ``miss_rows`` candidate slots per layer. A gather
-        disqualifies the shortlist entries its own forward routes to and sends
-        its miss copies straight into the survivors, so no scratch row is read
-        or written and the cache keeps those rows as residency.
+        disqualifies the shortlist entries its own forward routes to and sends its
+        miss copies straight into the survivors, so no scratch row is read or written
+        and the cache keeps those rows as residency.
 
-        Capacity guarantee. A graph gather serves at most ``miss_rows`` routes,
-        so its distinct hits ``H`` and distinct misses ``M`` satisfy
-        ``H + M <= miss_rows``. Each hit route disqualifies at most one entry,
-        leaving at least ``miss_rows - H >= M`` survivors whenever the shortlist
-        is full. It is full whenever a layer holds ``miss_rows`` slots, because
-        :meth:`_rank_victims` ranks routed residents last instead of dropping
-        them; ``capacity >= 2 * miss_rows`` is required on top of that. Without
-        a full shortlist a miss could find no slot, and with no scratch row to
-        fall back on its routes would read another expert, so a smaller layer
-        is refused rather than allowed to truncate.
+        Capacity guarantee. A graph gather serves at most ``miss_rows`` routes, so its
+        distinct hits ``H`` and distinct misses ``M`` satisfy ``H + M <= miss_rows``.
+        Each hit route disqualifies at most one entry, leaving at least
+        ``miss_rows - H >= M`` survivors whenever the shortlist is full. It is full
+        whenever a layer holds ``miss_rows`` slots, because :meth:`_rank_victims`
+        ranks routed residents last instead of dropping them; ``capacity >= 2 *
+        miss_rows`` is required on top of that. Without a full shortlist a miss could
+        find no slot, and with no scratch row to fall back on its routes would read
+        another expert, so a smaller layer is refused rather than allowed to truncate.
         """
         width = self.miss_rows
         for layer_id, streamer in zip(self.layer_ids, self.streamers):
-            # Without a host-source tensor the merged segment table would carry this layer's
-            # full expert rows, and the segment kernel reads its count on the device, so it
-            # cannot size its grid to them: ~0.125 ms/row against ~0.0105 for the index copy
-            # it replaces, on a production-shaped working set (see `_init_insert_on_miss` for
-            # both regimes; the cached 0.054/0.007 pair understates this gap). That trade is
-            # only free because the rows it actually
-            # takes over here are the per-expert scalars (8 B/row in production), while the
-            # megabyte rows were already on this kernel. A layer with nothing on the host has
-            # nothing to stream and no reason to insert on miss, so refuse rather than
-            # silently move its rows onto the slower path.
+            # A layer with no host-source tensor would put its full expert rows on the
+            # segment kernel, which cannot size its grid to a device-side count: 0.125
+            # ms/row against 0.0105 for the index copy it replaces. Such a layer has
+            # nothing to stream, so refuse rather than move it onto the slower path. Only
+            # per-expert scalars (8 B/row in production) are on that kernel otherwise.
             if (
                 not streamer._graph_host_pair_count
                 and getattr(streamer.format, "key", None) != "exl3"
@@ -387,13 +392,15 @@ class GpuResidencyUpdater:
         self.gather_insertions = torch.zeros(layers, dtype=torch.long, device=device)
         self.gather_evictions = torch.zeros(layers, dtype=torch.long, device=device)
         self._pending_commit = None
-        # SGLANG_DSV41_ENABLE_LAYER_FUSION: one kernel each for gather_destinations and commit_gather. Their per-layer
-        # outputs live in these rows, so a commit forked onto the side stream reads buffers nothing else reuses.
+        # SGLANG_DSV41_ENABLE_LAYER_FUSION fuses gather_destinations and commit_gather
+        # into one kernel each. Their per-layer outputs live in per-layer rows, so a
+        # commit forked onto the side stream reads buffers nothing else reuses.
         self.layer_fusion = envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()
         if self.layer_fusion:
             self._init_layer_fusion()
 
     def _init_layer_fusion(self) -> None:
+        """Allocate the per-layer output rows of the fused gather and commit kernels."""
         shape, device = (self.num_layers, self.miss_rows), self.device
         self.fused_destinations = torch.zeros(shape, dtype=torch.long, device=device)
         self.fused_live = torch.zeros(shape, dtype=torch.bool, device=device)
@@ -405,22 +412,20 @@ class GpuResidencyUpdater:
     def check_miss_plans(self) -> None:
         """Refuse every backend that could write a cache row this mode does not control.
 
-        One guard, not three, because these three refusals are the whole safety
-        argument and separated ones get dropped piecemeal in a later refactor.
+        The refusals are one guard because together they are the whole safety
+        argument, and separate ones get dropped piecemeal in a later refactor.
 
-        * The plan must be the gather's own miss buffers. SCRATCH reads each
-          missed expert's scratch row from them; DIRECT drives both the copy and
-          the residency commit from that one ``count``, which is what makes them
-          unable to disagree.
-        * A backend that posts its own plan buffers can write slots from its
-          own stream at any time between post and completion, and can report a
-          timed-out request undelivered while its copy may still land. Under
-          DIRECT that would overwrite a slot the mapping has already committed.
-        * A prefetch pull owns a dedicated row and covers routes that then never
-          enter residency, and it reads cache rows from a side stream.
+        * The plan must be the gather's own miss buffers. SCRATCH reads each missed
+          expert's scratch row from them; DIRECT drives both the copy and the
+          residency commit from that one ``count``, which is what makes them unable to
+          disagree.
+        * A backend that posts its own plan buffers can write slots from its own
+          stream at any time between post and completion, and can report a timed-out
+          request undelivered while its copy may still land. Under DIRECT that would
+          overwrite a slot the mapping has already committed.
+        * A prefetch pull owns a dedicated row, covers routes that then never enter
+          residency, and reads cache rows from a side stream.
         """
-        from sglang.srt.environ import envs
-
         if self.insert_direct:
             exl3 = [getattr(s.format, "key", None) == "exl3" for s in self.streamers]
             if any(exl3) and not all(exl3):
@@ -466,6 +471,7 @@ class GpuResidencyUpdater:
 
     @staticmethod
     def _tabulate_decay(decay_of_tokens, limit: int) -> list[float]:
+        """Tabulate ``decay_of_tokens`` up to the first float32 zero (see above)."""
         values = []
         for tokens in range(limit + 1):
             value = decay_of_tokens(tokens)
@@ -475,9 +481,10 @@ class GpuResidencyUpdater:
         raise ValueError("insert-on-miss decay is too close to one to tabulate exactly")
 
     def on_graph_forward(self, tokens: int) -> None:
-        """At the first streamed layer's graph gather: apply a pending boundary, then count this forward.
+        """Apply a pending boundary, then count this forward.
 
-        Without decode boundaries the forward is only counted.
+        Called at the first streamed layer's graph gather. Without decode boundaries
+        the forward is only counted.
         """
         if self.update_decode_forwards > 0:
             self._apply(
@@ -500,13 +507,12 @@ class GpuResidencyUpdater:
     ) -> None:
         """Mirror one forward the host clock observed onto the device counters.
 
-        A forward whose first gather ran on the graph path already counted
-        itself as a decode forward, and a prefill that did so is corrected.
-        Any other forward first applies a boundary still pending, as its
-        first eager gather would have, so a forward without gathers never
-        lands in the window it closes, and is then counted here. A qualifying
-        prefill applies its boundary now; a decode boundary stays pending for
-        the next forward.
+        A forward whose first gather ran on the graph path already counted itself as a
+        decode forward, and a prefill that did so is corrected. Any other forward
+        first applies a boundary still pending, as its first eager gather would have,
+        so a forward without gathers never lands in the window it closes, and is then
+        counted here. A qualifying prefill applies its boundary now; a decode boundary
+        stays pending for the next forward.
         """
         if kind is ForwardKind.DRAFT:
             return
@@ -536,18 +542,16 @@ class GpuResidencyUpdater:
         if self.insert_on_miss and not self.insert_direct:
             self.plans_fresh.fill_(False)
         if self.insert_direct:
-            # Warm-up and capture gathers insert for real, unlike stage 1's, whose boundary is
-            # gated by ``enabled`` and so stays inert until here. They cannot be gated the same
-            # way: the redirect has to be inside the captured graph, so it has to run during the
-            # capture. What they leave behind is consistent -- each row holds the expert the
-            # mapping names -- but the experts are the capture's dummy routes rather than the
-            # seed's, for at most one gather width per layer, which demand traffic replaces
-            # within a few forwards. Drop their counts, as this call does for every other
-            # capture-recorded counter, so the trace measures serving and not the warm-up.
+            # Warm-up and capture gathers insert for real: unlike stage 1's boundary
+            # they cannot be gated by ``enabled``, because the redirect must run during
+            # capture to be inside the graph. They leave consistent rows holding the
+            # capture's dummy routes (at most one gather width per layer), which demand
+            # traffic replaces within a few forwards. Drop their counts so the trace
+            # measures serving, not the warm-up.
             self.gather_insertions.zero_()
             self.gather_evictions.zero_()
-            # Rank a shortlist now, eagerly: the first replay's gather reads it before any
-            # boundary has run, and a capture-time shortlist would name pre-warm-up slots.
+            # Rank a shortlist eagerly: the first replay reads it before any boundary
+            # runs, and a capture-time shortlist would name pre-warm-up slots.
             self._rank_victims(self.route_counts > 0)
 
     def snapshot(self) -> dict[str, list]:
@@ -563,18 +567,16 @@ class GpuResidencyUpdater:
         return snapshot
 
     def insertion_counters(self) -> dict[str, torch.Tensor]:
-        """The active stage's insertion counters, keyed by the name both readers publish them under.
+        """The active stage's insertion counters, keyed by their published names.
 
-        One accessor for the metrics trace and for :meth:`snapshot`, because
-        they count the same events and the stages keep them in different
-        tensors: SCRATCH increments at the boundary, DIRECT in the gathers. A
-        second copy of that choice is a counter that silently reads zero on
-        whichever path nobody updated -- and a Stage 2 arm reporting zero
-        insertions reads as the feature being off rather than as a bug.
+        The one accessor for the metrics trace and :meth:`snapshot`. The stages keep
+        the same events in different tensors (SCRATCH increments at the boundary,
+        DIRECT in the gathers), and a second copy of that choice would read zero on
+        whichever path nobody updated, which looks like the feature being off.
 
-        ``insertion_truncated`` stays a shared tripwire. Under DIRECT it counts
-        gathers with a miss that found no victim; those copies land in slot 0,
-        so its staying zero is the invariant, not an absence of instrumentation.
+        ``insertion_truncated`` is shared by both stages as a tripwire. Under DIRECT
+        it counts gathers with a miss that found no victim; those copies land in slot
+        0, so it must stay zero.
         """
         if not self.insert_on_miss:
             return {}
@@ -588,11 +590,13 @@ class GpuResidencyUpdater:
         }
 
     def _decode_boundary_reached(self) -> torch.Tensor:
+        """Per layer: whether the decode forwards reach the boundary period."""
         if self.update_decode_forwards < 1:
             return torch.zeros_like(self.boundary_pending)
         return self.decode_forwards >= self.update_decode_forwards
 
     def _count(self, tokens: int, decode: bool) -> None:
+        """Advance the device clock by one forward; a decode forward may set a boundary."""
         self.forwards.add_(1)
         self.tokens.add_(tokens)
         if decode:
@@ -625,16 +629,15 @@ class GpuResidencyUpdater:
             self.forwards - self.last_update >= self.min_residence_forwards
         )
         if inserting:
-            # DIRECT inserted during the gathers themselves; the boundary only proposes the next
-            # forward's victims. SCRATCH still copies the previous forward's misses out of scratch.
+            # DIRECT inserted during the gathers; its boundary only ranks the next victims.
             if self.insert_direct:
                 self._rank_victims(routed)
             else:
                 self._insert_misses(gate, routed)
             self.boundary_updates.add_(eligible.to(torch.long))
         else:
-            # EXL3's sources are pinned-slot rows, not dense expert-ID rows. A
-            # prefill still updates scores and the next DIRECT victim ranking.
+            # EXL3 sources are pinned-slot rows, not dense expert-id rows, so its
+            # prefill boundary only updates scores and the DIRECT victim ranking.
             if not (
                 self.insert_direct
                 and phase == _PREFILL_PHASE
@@ -645,7 +648,7 @@ class GpuResidencyUpdater:
             ):
                 self._promote(eligible, width, phase)
             if self.insert_direct:
-                # A prefill boundary rewrote the mapping, so the shortlist it ranked is stale.
+                # The boundary rewrote the mapping, so the old shortlist is stale.
                 self._rank_victims(routed)
         self.tokens.masked_fill_(gate, 0)
         self.decode_forwards.masked_fill_(gate, 0)
@@ -713,12 +716,12 @@ class GpuResidencyUpdater:
         self.last_update.copy_(torch.where(changed, self.forwards, self.last_update))
 
     def _insert_misses(self, gate: torch.Tensor, routed: torch.Tensor) -> None:
-        """Copy the last forward's fresh, still nonresident misses from scratch rows into slots.
+        """Stage 1: copy the last forward's fresh, nonresident misses into slots.
 
         Plan row ``r`` of a layer names the expert in scratch row ``capacity + r``
-        (``plan_graph_routes``). Targets are free slots in slot order, then
-        residents with no route since the previous boundary, lowest
-        ``(insert score, -expert)`` first; misses beyond them are not inserted.
+        (``plan_graph_routes``). Targets are free slots in slot order, then residents
+        with no route since the previous boundary, lowest ``(insert score, -expert)``
+        first; misses beyond them are not inserted.
         """
         experts, width, slot_dump = self.num_experts, self.miss_rows, self.max_capacity
         columns = self.miss_columns.unsqueeze(0)
@@ -784,9 +787,8 @@ class GpuResidencyUpdater:
         self.slot_state[:, slot_dump] = _FREE
         self.slot_to_expert[:, slot_dump] = -1
         self.slot_generations[:, slot_dump] = 0
-        # Unused columns copy their own scratch row onto itself, so every column's destination is
-        # distinct. The fused kernel skips them outright and does not need that, but both paths
-        # read the same two buffers and the self-copy keeps them meaningful either way.
+        # Unused columns copy their scratch row onto itself, keeping every destination
+        # distinct. The fused kernel skips them, but both paths read these buffers.
         self.insert_sources.copy_(
             torch.where(insert, source_rows, self.scratch_columns)
         )
@@ -820,15 +822,16 @@ class GpuResidencyUpdater:
         self.plans_fresh.masked_fill_(gate, False)
 
     def _rank_victims(self, routed: torch.Tensor) -> None:
-        """Propose each layer's next ``miss_rows`` victim slots: free slots first, then the
-        lowest-scored residents, those this window did not route ahead of those it did.
+        """Propose each layer's next ``miss_rows`` victim slots.
 
-        This is only a proposal. It is ranked before the next forward's routing
-        is known, so it may name a slot that forward reads; the gather that
-        commits removes those itself (:meth:`gather_destinations`). Ranking
-        routed residents last keeps warm rows out of the shortlist's front
-        without dropping them: a short prefill routes every resident, and an
-        emptied shortlist sends every miss of the next forward to slot 0.
+        Free slots come first, then the lowest-scored residents, those this window did
+        not route ahead of those it did.
+
+        This is only a proposal. It is ranked before the next forward's routing is
+        known, so it may name a slot that forward reads; the gather that commits
+        removes those itself (:meth:`gather_destinations`). Routed residents are
+        ranked last, not dropped: a short prefill routes every resident, and an emptied
+        shortlist would send every miss of the next forward to slot 0.
         """
         slot_dump = self.max_capacity
         width = self.miss_rows
@@ -861,9 +864,9 @@ class GpuResidencyUpdater:
     def enable_miss_order(self) -> None:
         """Keep ``miss_keys``, int64 ``[layers, experts]``, updated with each ranking.
 
-        Each entry is that expert's victim-ranking key.
-        A fused graph plan given a layer's row sorts its miss lanes by it, highest first,
-        so the lanes a CPU expert computes instead of inserting are the ones this ranking values least.
+        Each entry is that expert's victim-ranking key. A fused graph plan given a
+        layer's row sorts its miss lanes by it, highest first, so the lanes a CPU
+        expert computes instead of inserting are the ones this ranking values least.
         """
         if not self.insert_direct:
             raise ValueError(
@@ -874,8 +877,8 @@ class GpuResidencyUpdater:
         self.miss_keys = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
-        # Without re-ranking, so a shortlist already proposed stays as it is. These keys are provisional: the next
-        # ranking overwrites them with the ones it ranks by.
+        # No re-ranking: a shortlist already proposed stays. These keys are provisional
+        # until the next ranking overwrites them.
         self.miss_keys.copy_(self._expert_rank_keys(self.route_counts > 0))
 
     def _expert_rank_keys(self, routed: torch.Tensor) -> torch.Tensor:
@@ -897,35 +900,34 @@ class GpuResidencyUpdater:
     ) -> torch.Tensor:
         """Point one layer's gather at victim slots instead of scratch rows.
 
-        ``route_slots`` is the gather's own ``expert_to_slot`` lookup of every
-        route: a slot for a hit, ``-1`` for a miss. A shortlist entry equal to
-        one of those slots is a row this forward reads, so it is dropped here,
-        which is the whole safety argument -- the choice is made with the
-        forward's routing in hand even though the shortlist was ranked before
-        it. The surviving entries take the miss lanes in rank order, and
-        ``_init_insert_direct`` proves there are always enough of them.
+        ``route_slots`` is the gather's own ``expert_to_slot`` lookup of every route:
+        a slot for a hit, ``-1`` for a miss. A shortlist entry equal to one of those
+        slots is a row this forward reads, so it is dropped here. That is the whole
+        safety argument: the choice is made with the forward's routing in hand even
+        though the shortlist was ranked before it. The surviving entries take the miss
+        lanes in rank order, and ``_init_insert_direct`` proves there are always
+        enough of them.
 
-        Writes the destinations into the gather's own plan slots and returns
-        the remap with every miss lane translated. Fixed shape, device only.
+        Writes the destinations into the gather's own plan slots and returns the remap
+        with every miss lane translated. Fixed shape, device only.
         """
         streamer = self.streamers[row]
         victims, valid = self.victims[row], self.victim_valid[row]
         # A miss lane's slot is -1 and a padded column is clamped to the dump index, so
-        # neither can equal a real routed slot; only genuine hits disqualify an entry.
+        # only genuine hits disqualify an entry.
         hazard = (route_slots.unsqueeze(1) == victims.unsqueeze(0)).any(dim=0)
         order = torch.argsort((hazard | ~valid).to(torch.uint8), stable=True)
         usable = victims.index_select(0, order)
         usable_valid = (valid & ~hazard).index_select(0, order)
         live = (self.gather_lanes < streamer._graph_miss_count.long()) & usable_valid
-        # Lanes past the miss count are never copied (the copy reads the same count) and
-        # never remapped to. A lane inside the count that is not live is still copied to
-        # slot 0; the full shortlist rules that out and _commit_gather counts it if not.
+        # Lanes past the miss count are never copied (the copy reads the same count) or
+        # remapped to. A counted lane that is not live would copy to slot 0; the full
+        # shortlist rules that out and _commit_gather counts it if it happens.
         destinations = torch.where(live, usable, torch.zeros_like(usable))
         streamer._graph_destination_slots.copy_(destinations.to(torch.int32))
         self._pending_commit = (row, streamer, destinations, live)
-        # The fused planner keeps the router's native ids, so remap may be int32; index_select
-        # takes int64 only, and the result carries the destinations' dtype back to the caller,
-        # which casts to the router's dtype as it always has.
+        # The fused planner keeps the router's native ids, so remap may be int32, but
+        # index_select takes int64 only. The caller casts the result back.
         rank = (remap - scratch_base).clamp(min=0, max=self.miss_rows - 1).long()
         return torch.where(
             remap >= scratch_base, destinations.index_select(0, rank), remap
@@ -940,8 +942,9 @@ class GpuResidencyUpdater:
         scratch_base: int,
         remap_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """:meth:`gather_destinations` as one kernel, which also looks up ``expert_to_slot`` of ``flat`` itself.
+        """:meth:`gather_destinations` as one kernel that also looks up ``flat`` itself.
 
+        ``flat`` is the gather's routes; the kernel reads ``expert_to_slot`` for them.
         Returns the translated remap in ``remap_dtype``, a view of a per-layer buffer.
         """
         from sglang.kernels.ops.moe.expert_residency_direct_gather import (
@@ -968,12 +971,20 @@ class GpuResidencyUpdater:
         return remap_out
 
     def pending_commit_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """The per-gather tensors ``commit_gather`` reads, for a caller that runs it on another stream."""
+        """The ``(destinations, live)`` tensors ``commit_gather`` reads.
+
+        For a caller that runs the commit on another stream.
+        """
         _, _, destinations, live = self._pending_commit
         return destinations, live
 
     def commit_gather(self) -> None:
-        """Commit the residency of the gather whose copies were just issued."""
+        """Commit the residency of the gather whose copies were just issued.
+
+        Consumes the commit that ``gather_destinations`` or its fused form recorded.
+        Raises when CPU experts run without the fused commit, which alone leaves CPU
+        lanes unmapped.
+        """
         row, streamer, destinations, live = self._pending_commit
         self._pending_commit = None
         backend = streamer.row_backend
@@ -995,10 +1006,10 @@ class GpuResidencyUpdater:
         """Move residency onto the rows this gather is about to copy.
 
         The mask is the same ``_graph_miss_count`` the copy kernel reads, so the
-        mapping can never claim a row the copy did not write: there is one count,
-        not two that could disagree. The writes are issued after the copy on the
-        gather's own stream, and every backend that could write a slot from
-        another stream is refused at startup (:meth:`check_miss_plans`).
+        mapping can never claim a row the copy did not write: there is one count, not
+        two that could disagree. The writes are issued after the copy on the gather's
+        own stream, and every backend that could write a slot from another stream is
+        refused at startup (:meth:`check_miss_plans`).
         """
         experts, slot_dump = self.num_experts, self.max_capacity
         new_experts = streamer._graph_source_rows[: self.miss_rows]
@@ -1013,9 +1024,8 @@ class GpuResidencyUpdater:
         slots.scatter_(0, targets, torch.where(live, new_experts, -1))
         self.slot_state[row].scatter_(0, targets, _READY)
         self.slot_generations[row].scatter_add_(0, targets, live.to(torch.long))
-        # ``tensor[i, j] = scalar`` stages the value through a pageable CPU tensor, which a graph
-        # capture refuses; the batched boundary gets away with a whole-column slice, a per-layer
-        # commit does not. Fill a one-element view instead, which stays on the device.
+        # ``tensor[i, j] = scalar`` stages through a pageable CPU tensor, which graph
+        # capture refuses. Fill a one-element view, which stays on the device.
         self.slot_state[row, slot_dump : slot_dump + 1].fill_(_FREE)
         slots[slot_dump : slot_dump + 1].fill_(-1)
         self.slot_generations[row, slot_dump : slot_dump + 1].fill_(0)
@@ -1057,7 +1067,7 @@ class GpuResidencyUpdater:
             backend.delivered_count if leased else None,
             backend.keep if leased else None,
             streamer._graph_miss_count,
-            # CPU experts: the lanes the CPU computed were never copied into their slots, so they stay unmapped.
+            # Lanes a CPU expert computed were never copied into slots: leave unmapped.
             cpu_lanes=backend.device_side.cpu_lanes
             if leased and backend.cpu_experts
             else None,

@@ -3,9 +3,11 @@
 A preset fills the offload variables the user left unset; an explicitly set
 variable always wins. ``resolve_offload_env`` then derives the settings other
 settings force, and ``check_offload_config`` refuses invalid combinations at
-argument resolution, before the weight load. ``#N`` refers to a row of
-"Experiment results" in MOE_EXPERT_TRANSFER.md. Everything here is pure; the
+argument resolution, before the weight load. Everything here is pure; the
 ``arg_groups`` hook reads and writes the process state.
+
+The comments cite measurements as ``#N``, the row numbers of the table in
+MOE_EXPERT_TRANSFER.md, "Experiment results — consolidated".
 """
 
 from __future__ import annotations
@@ -19,7 +21,11 @@ from sglang.srt.environ import envs
 
 
 class MoeOffloadPreset(msgspec.Struct, frozen=True, kw_only=True):
-    """One offload configuration; a ``None`` field leaves that variable to its ``Envs`` default."""
+    """One offload configuration.
+
+    Each field maps to one environment variable (``ENV_NAMES``). A ``None`` field
+    leaves that variable to its ``Envs`` default.
+    """
 
     # Stream ModelOpt NVFP4 routed experts from host memory; required for hot caching.
     expert_stream: bool | None = None
@@ -44,7 +50,7 @@ class MoeOffloadPreset(msgspec.Struct, frozen=True, kw_only=True):
     expert_graph_gather: bool | None = None
     # Scores decide residency at run time instead of the seed alone.
     hot_dynamic: bool | None = None
-    # Residency policy tuned in the E16c/E19 arms.
+    # Residency policy, tuned on paired decode arms.
     hot_decay_tokens: int | None = None
     hot_promotion_sigmas: float | None = None
     hot_benefit_ratio: float | None = None
@@ -60,7 +66,8 @@ class MoeOffloadPreset(msgspec.Struct, frozen=True, kw_only=True):
     expert_fused_plan: bool | None = None
     # 2 (DIRECT) copies misses straight into victim slots, +4.4% over 1.
     insert_on_miss_stage: int | None = None
-    # MTP draft experts FP8 to NVFP4 at load: draft 2.46 to 1.45 GB (#30). No effect without such a draft.
+    # MTP draft experts FP8 to NVFP4 at load: draft 2.46 to 1.45 GB (#30).
+    # No effect without such a draft.
     draft_moe_nvfp4_requant: bool | None = None
 
 
@@ -113,10 +120,11 @@ _SHARED = dict(
     expert_fused_plan=True,
 )
 
-# The current best, and prod's config since 2026-09-19: in-graph gather, insert-on-miss
-# stage 2 and the fused planner, with overlap scheduling on. 29.30 / 29.88 tok/s median at
-# NEXTN-3 on divix01 (#34). Needs decode CUDA graphs at batch size 1; pair it with
-# --speculative-algorithm NEXTN, which it does not set.
+# The best measured and the production configuration: in-graph gather, insert-on-miss
+# stage 2 and the fused planner, with overlap scheduling on. 29.30 / 29.88 tok/s median
+# at NEXTN-3 on the reference machine (RTX 5090, PCIe Gen3 x16) (#34). Needs decode
+# CUDA graphs at batch size 1; pair it with --speculative-algorithm NEXTN, which it
+# does not set.
 GRAPH_GATHER_PRESET = MoeOffloadPreset(
     **_SHARED,
     insert_on_miss_stage=2,
@@ -141,12 +149,14 @@ class ResolvedOffloadEnv(msgspec.Struct, frozen=True):
 
 
 def _env_string(value: Any) -> str:
+    """Render a preset value the way an environment variable carries it."""
     if isinstance(value, bool):
         return "1" if value else "0"
     return str(value)
 
 
 def _value(values: Mapping[str, str], name: str) -> Any:
+    """The parsed value of ``name`` in ``values``, or its ``Envs`` default."""
     descriptor = getattr(envs, name)
     return descriptor.parse(values[name]) if name in values else descriptor.default
 
@@ -166,14 +176,17 @@ def explicit_offload_env(environ: Mapping[str, str]) -> dict[str, str]:
 
 
 def _insert_on_miss(values: Mapping[str, str]) -> bool:
+    """Whether the insert-on-miss stage is 1 or higher."""
     return _value(values, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE") >= 1
 
 
 def _residency_update(values: Mapping[str, str]) -> bool:
+    """Whether the in-graph residency update is on."""
     return _value(values, "SGLANG_MOE_GPU_RESIDENCY_UPDATE")
 
 
-# (condition, variable, value, why). Ordered: a later rule reads what an earlier one derived.
+# (condition, variable, value, why). Ordered: a later rule reads what an earlier one
+# derived.
 _DERIVATIONS = (
     (
         _insert_on_miss,
@@ -199,7 +212,10 @@ _DERIVATIONS = (
 def resolve_offload_env(
     preset: MoeOffloadPreset | None, explicit: Mapping[str, str]
 ) -> ResolvedOffloadEnv:
-    """Merge explicit variables over ``preset``, then fill what the derivations force."""
+    """Merge explicit variables over ``preset``, then fill what the derivations force.
+
+    Raises ``ValueError`` when an explicitly set variable contradicts a derivation.
+    """
     wanted = {} if preset is None else preset_env(preset)
     filled = {name: value for name, value in wanted.items() if name not in explicit}
     overridden = {
@@ -229,7 +245,7 @@ def needs_overlap_off(values: Mapping[str, str], *, nvfp4_hot_cache: bool) -> bo
     known yet); other formats declare their own hot-cache rules in
     ``expert_stream_requirements``.
     """
-    # The NVFP4 requirements (expert_stream_requirements._check_nvfp4) enforce the same rule.
+    # expert_stream_requirements._check_nvfp4 enforces the same rule.
     return (
         nvfp4_hot_cache
         and _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0

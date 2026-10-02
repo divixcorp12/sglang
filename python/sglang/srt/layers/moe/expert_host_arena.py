@@ -1,4 +1,10 @@
-"""Registered host memory holding every streamed NVFP4 expert row."""
+"""Registered host memory holding every streamed NVFP4 expert row.
+
+``ExpertHostArena`` copies each streamed layer's host expert tensors into
+page-aligned, CUDA-registered memory once at load, so captured graphs and copy
+kernels can read host rows in place. It replaces the pinned LRU tier
+(``SGLANG_MOE_EXPERT_HOST_ARENA``, with ``SGLANG_MOE_PINNED_HOST_MB=0``).
+"""
 
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ PAGE_BYTES = 4096
 
 
 def _page_aligned_like(source: torch.Tensor) -> torch.Tensor:
+    """An uninitialized CPU tensor of ``source``'s shape and dtype, page aligned."""
     nbytes = source.numel() * source.element_size()
     storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8, device="cpu")
     start = (-storage.data_ptr()) % PAGE_BYTES
@@ -28,6 +35,7 @@ def _page_aligned_like(source: torch.Tensor) -> torch.Tensor:
 
 
 def _drop_page_cache(path: str) -> None:
+    """Drop ``path`` from the page cache; the arena now holds its bytes."""
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except OSError:
@@ -50,6 +58,9 @@ class ExpertHostArena:
     fill it with ``O_DIRECT``, and registration lets GPU kernels read it in
     place. Streamers bound to it drop their file reader and file attribution,
     which also keeps the pinned LRU tier out of their gathers.
+
+    One arena serves one model. ``from_model`` registers ``close`` with ``atexit``;
+    after ``close`` the layers hold unregistered memory and must not be used.
     """
 
     def __init__(self) -> None:
@@ -59,7 +70,10 @@ class ExpertHostArena:
 
     @classmethod
     def from_model(cls, model: torch.nn.Module) -> ExpertHostArena | None:
-        """Bind every streamed expert layer of ``model``; None when there are none."""
+        """Bind every streamed expert layer of ``model``; None when there are none.
+
+        Raises ``ValueError`` when a layer's expert format cannot live in an arena.
+        """
         streamers = list(iter_expert_streamers(model))
         if not streamers:
             return None
@@ -95,7 +109,11 @@ class ExpertHostArena:
         return arena
 
     def bind(self, streamer) -> None:
-        """Copy one streamer's host tensors into the arena and rebind its layer."""
+        """Copy one streamer's host tensors into the arena and rebind its layer.
+
+        Rows come from the file reader where it covers the tensor, otherwise from
+        the existing host tensor. The file page cache is dropped afterwards.
+        """
         layer = streamer.layer
         sources = {}
         for name in streamer.tensor_names:

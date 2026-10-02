@@ -1,19 +1,24 @@
 """Server-argument requirements of EXL3 expert streaming (DeepSeek V4.1).
 
 The MoE expert-caching gate imports this module the first time a launch's
-quantization method resolves to ``exl3`` (the checkpoint's ``config.json``
-names it). EXL3 experts stream with prefill eager and decode eager or a
-breakable CUDA graph at max batch size 1 (a ``full`` decode graph is refused);
-graph gather only with that breakable decode graph, reading missed rows from the
-pinned host tier (never the host arena); and a ``stat`` or ``per_pass`` recorder
-under dynamic residency. Speculative decoding (DSpark or otherwise) is refused with
-any decode CUDA graph: it must run with the decode graph disabled, since a spec verify
-step runs more than one token through scratch and RAM-miss posting sized for one.
-The graph gather needs DIRECT residency (the GPU residency update at insert-on-miss stage 2).
-Nothing else is required; ``--max-running-requests`` and the
-overlap schedule stay free. This module runs during server-args processing,
-so it imports only the gate module, ``sglang.srt.environ``, the graph-config enum
-and the standard library.
+quantization method resolves to ``exl3`` (the checkpoint's ``config.json`` names it).
+It registers :data:`exl3_expert_stream_requirements`, which requires:
+
+* Prefill eager; decode eager or a breakable CUDA graph at max batch size 1. A
+  ``full`` decode graph is refused, because the Engram file-table lookup reads its
+  ids on the host.
+* Graph gather only with that breakable decode graph, reading missed rows from the
+  pinned host tier (never the host arena). It needs DIRECT residency: the GPU
+  residency update with ``SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2``.
+* A ``stat`` or ``per_pass`` recorder under dynamic residency.
+* Speculative decoding (DSpark or otherwise) only with the decode graph disabled: a
+  speculative verify step runs more than one token through scratch and RAM-miss
+  posting sized for one.
+
+Nothing else is required; ``--max-running-requests`` and the overlap schedule stay
+free. The shared eager checks come from ``eager_expert_stream_requirements``. This
+module runs during server-args processing, so it imports only the gate module,
+``sglang.srt.environ``, the graph-config enum and the standard library.
 """
 
 import dataclasses
@@ -40,7 +45,11 @@ _EAGER = eager_expert_stream_requirements(
 
 
 class _EagerGraphView:
-    """``cfg`` with no graph config, so the shared eager checks skip their graph rule."""
+    """``cfg`` with no graph config, so the shared eager checks skip their graph rule.
+
+    Used when a breakable decode graph is allowed: every other attribute passes
+    through to the wrapped ``cfg``.
+    """
 
     def __init__(self, cfg) -> None:
         self._cfg = cfg
@@ -55,15 +64,17 @@ def _check(cfg, budgets) -> None:
     """The eager checks, with decode allowed as a breakable CUDA graph at max batch size 1.
 
     Everything that still needs the host (the eager MoE fallback, the Engram
-    file-table lookup) runs as an eager break; prefill stays eager. Decode
-    ``full`` cannot work: the Engram lookup reads its ids on the host. A breakable decode
-    graph also turns DSV4's alt-stream overlap off (below).
+    file-table lookup) runs as an eager break; prefill stays eager. Decode ``full``
+    cannot work: the Engram lookup reads its ids on the host. A breakable decode graph
+    also turns DSV4's alt-stream overlap off (see the comment at the end).
     """
     if envs.SGLANG_MOE_HOT_ASYNC_PROMOTIONS.get():
-        # With SGLANG_MOE_GPU_RESIDENCY_UPDATE the in-graph updater owns the hot slots: a boundary only ranks victims
-        # and the gather writes missed rows straight into them, so there is no promotion copy to defer. Without it,
-        # EXL3 rows come only from the row source and promote through the pinned tier synchronously
-        # (ExpertHotCache._load_reserved_in_chunks). Either way the flag would be ignored.
+        # With SGLANG_MOE_GPU_RESIDENCY_UPDATE the in-graph updater owns the hot
+        # slots: a boundary only ranks victims and the gather writes missed rows
+        # straight into them, so there is no promotion copy to defer. Without it,
+        # EXL3 rows come only from the row source and promote through the pinned
+        # tier synchronously (ExpertHotCache._load_reserved_in_chunks). Either way
+        # the flag would be ignored.
         raise ValueError(
             "SGLANG_MOE_HOT_ASYNC_PROMOTIONS has no effect on EXL3 experts: the in-graph GPU residency "
             "updater writes missed rows into hot slots during the gather, or, without it, promotions run "
@@ -71,17 +82,17 @@ def _check(cfg, budgets) -> None:
         )
     graph = cfg.cuda_graph_config
     if not isinstance(graph, CudaGraphConfig):
-        # run_resolution_pipeline's first offload pass runs before parse_cuda_graph_config,
-        # while this is still the raw CLI value: the decode backend is not known yet, and
-        # the pass after parsing runs every check below.
+        # run_resolution_pipeline's first offload pass runs before
+        # parse_cuda_graph_config, while this is still the raw CLI value: the decode
+        # backend is not known yet, and the pass after parsing runs every check below.
         return
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
     if cpu_experts and (
         getattr(cfg, "speculative_algorithm", None) is not None
         or graph.decode.backend != Backend.BREAKABLE
     ):
-        # Before the speculative and backend rules.
-        # Each would point a CPU-experts launch at the other's decode backend.
+        # Checked before the speculative and backend rules: each would point a
+        # CPU-experts launch at the other's decode backend.
         raise ValueError(
             "SGLANG_DSV41_CPU_EXPERTS computes experts inside the captured decode graph's copy wait; "
             "pass --cuda-graph-backend-decode breakable, without speculative decoding"
@@ -90,8 +101,8 @@ def _check(cfg, budgets) -> None:
         getattr(cfg, "speculative_algorithm", None) is not None
         and graph.decode.backend != Backend.DISABLED
     ):
-        # Option C's graph-gather scratch and RAM-miss posting are sized for one token per
-        # step; a DSpark verify runs up to block_size + 1 tokens (Phase D2).
+        # The graph-gather scratch and RAM-miss posting are sized for one token per
+        # step; a DSpark verify runs up to block_size + 1 tokens.
         raise ValueError(
             "EXL3 expert caching runs DSpark verify eagerly only; pass "
             "--cuda-graph-backend-decode disabled (or --disable-cuda-graph)"
@@ -120,21 +131,21 @@ def _check(cfg, budgets) -> None:
         )
     if budgets.graph_gather and not budgets.hot_budget_mb:
         raise ValueError("EXL3 graph gathers need SGLANG_MOE_HOT_GPU_MB")
-    # Before the shared eager checks.
-    # Their residency-update rule would tell a CPU-experts launch without DIRECT to turn the update off;
-    # CPU experts need it on, at stage 2.
+    # Before the shared eager checks: their residency-update rule would tell a
+    # CPU-experts launch without DIRECT to turn the update off, but CPU experts need
+    # it on, at insert-on-miss stage 2.
     _check_slot_map()
     _check_cpu_experts(budgets)
     _check_direct_residency(budgets)
     # The shared eager check refuses graph gather; decode graphs may use it.
     _EAGER.check(_EagerGraphView(cfg), dataclasses.replace(budgets, graph_gather=False))
-    # DSV4's alt-stream overlap still gives wrong output when captured in the breakable
-    # decode graph, and this gate turns it off. Its mHC stats side stream was one cause
-    # (forked before the MoE break, launched on after it; fixed by _refork_stats_stream:
-    # the NaNs went away). A second defect remains in the first segment: the MQA alt-stream
-    # prepare (MQALayer, capture-only) leaves layer 0's MoE input different from eager's,
-    # cause unknown. The stats stream also runs in eager decode, so eager decode of this
-    # launch loses that overlap too.
+    # DSV4's alt-stream overlap still gives wrong output when captured in the
+    # breakable decode graph, so this gate turns it off. One cause, the mHC stats side
+    # stream (forked before the MoE break, launched on after it), is fixed by
+    # _refork_stats_stream. A second defect remains in the first segment: the MQA
+    # alt-stream prepare (MQALayer, capture-only) leaves layer 0's MoE input different
+    # from eager's, cause unknown. The stats stream also runs in eager decode, so
+    # eager decode of this launch loses that overlap too.
     overlap = envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP
     if overlap.get():
         if overlap.is_set():
@@ -146,7 +157,11 @@ def _check(cfg, budgets) -> None:
 
 
 def _check_slot_map() -> None:
-    """The slot-map chain's switches: how the post types RAM hits, and whether the CPU may take NVMe misses."""
+    """The slot-map chain's switches.
+
+    ``SGLANG_DSV41_RAM_HIT_COPY`` types how the post copies RAM hits;
+    ``SGLANG_DSV41_CPU_EXPERTS_MISSES`` lets the CPU take NVMe misses.
+    """
     hit_copy = envs.SGLANG_DSV41_RAM_HIT_COPY.get()
     if hit_copy not in ("ce", "sm"):
         raise ValueError(
@@ -163,8 +178,11 @@ def _check_slot_map() -> None:
 
 
 def _check_direct_residency(budgets) -> None:
-    """The graph gather runs the RAM-miss service, whose VRAM-hot set is the one the DIRECT updater writes into every
-    record: no other residency mode feeds it."""
+    """Require DIRECT residency for a graph gather.
+
+    The graph gather runs the RAM-miss service, whose VRAM-hot set is the one the
+    DIRECT updater writes into every record: no other residency mode feeds it.
+    """
     if budgets.graph_gather and not (
         envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
         and envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2
@@ -176,9 +194,13 @@ def _check_direct_residency(budgets) -> None:
 
 
 def _check_cpu_experts(budgets) -> None:
-    """SGLANG_DSV41_CPU_EXPERTS (plan 2026-09-29-dsv41-cpu-experts, Step B): the RAM-miss service's grant sends
-    resident lanes to the CPU, the copy engine's copy wait completes them, and layer fusion's route tables and DIRECT
-    commit leave them out of the fused MoE and the residency."""
+    """Check the prerequisites of ``SGLANG_DSV41_CPU_EXPERTS``.
+
+    The RAM-miss service's grant sends resident lanes to the CPU, the copy engine's
+    copy wait completes them, and layer fusion's route tables and the DIRECT commit
+    leave them out of the fused MoE and the residency. Each piece must be on, so this
+    names every missing switch at once.
+    """
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         return
     needs = [
@@ -191,7 +213,8 @@ def _check_cpu_experts(budgets) -> None:
             "SGLANG_DSV41_ENABLE_LAYER_FUSION=1",
             envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
         ),
-        # DIRECT residency ranks the keys the fused plan sorts the miss lanes by, so the CPU takes the coldest ones.
+        # DIRECT residency ranks the keys the fused plan sorts the miss lanes by,
+        # so the CPU takes the coldest ones.
         (
             "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1",
             envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get(),
@@ -210,8 +233,9 @@ def _check_cpu_experts(budgets) -> None:
     if missing:
         raise ValueError("SGLANG_DSV41_CPU_EXPERTS needs " + ", ".join(missing))
     if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
-        # The pull join rewrites a route's slot after planning; a CPU lane's route would then match no plan slot, and
-        # the fused MoE would compute it on top of the CPU's partial.
+        # The pull join rewrites a route's slot after planning; a CPU lane's route
+        # would then match no plan slot, and the fused MoE would compute it on top of
+        # the CPU's partial.
         raise ValueError(
             "SGLANG_DSV41_CPU_EXPERTS cannot run with SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE; set it to off"
         )

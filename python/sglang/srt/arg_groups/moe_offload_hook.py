@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Server-argument resolution for ``--moe-offload-preset``."""
+"""Server-argument resolution for ``--moe-offload-preset``.
+
+``handle_moe_offload_preset`` fills the offload environment variables the preset
+leaves unset and forces overlap scheduling off where the preset needs it.
+``check_moe_offload_config`` validates the resulting combination once the fields it
+reads are final. The preset tables and the checks themselves live in
+``sglang.srt.layers.moe.offload_presets``.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 def _nvfp4_hot_cache(server_args: Any, cfg: Any) -> bool:
-    """Whether NVFP4's hot-cache rules apply; an unknown format counts as NVFP4, as in memory_hook."""
+    """Whether NVFP4's hot-cache rules apply.
+
+    A launch whose format is not yet known counts as NVFP4, as in ``memory_hook``.
+    """
     method = expert_quant_method(server_args, cfg)
     return method is None or method in NVFP4_QUANT_METHODS
 
@@ -29,10 +39,10 @@ def handle_moe_offload_preset(server_args: Any) -> None:
     """Fill unset offload variables from the preset, derive forced ones.
 
     Runs in the launcher before the scheduler and workers are spawned, so they
-    inherit every variable set here. Validation is separate (see
-    ``check_moe_offload_config``): cuda_graph_config, speculative_algorithm,
-    and the parallelism fields the checks need are not final yet at this
-    point in the pipeline.
+    inherit every variable set here. Variables the user set explicitly win and are
+    logged. Validation is separate (see ``check_moe_offload_config``):
+    cuda_graph_config, speculative_algorithm, and the parallelism fields the checks
+    need are not final yet at this point in the pipeline.
     """
     cfg = resolving_view(server_args)
     name = cfg.moe_offload_preset
@@ -65,13 +75,13 @@ def handle_moe_offload_preset(server_args: Any) -> None:
 def check_moe_offload_config(server_args: Any) -> None:
     """Refuse invalid offload combinations once the fields it reads are final.
 
-    Runs last in the resolution pipeline. cuda_graph_config keeps changing
-    through handle_speculative_decoding, handle_dllm_inference and
-    handle_other_validations; speculative_algorithm only settles at
-    handle_speculative_decoding. dp_size/enable_dp_attention are forced by
-    handle_dwdp, earlier, but handle_data_parallelism still resets
-    enable_dp_attention when dp_size==1. By this point every offload
-    variable the preset fills is already in os.environ.
+    Runs last in the resolution pipeline, because the fields it reads settle late:
+    cuda_graph_config keeps changing through handle_speculative_decoding,
+    handle_dllm_inference and handle_other_validations; speculative_algorithm only
+    settles at handle_speculative_decoding; dp_size/enable_dp_attention are forced by
+    handle_dwdp, but handle_data_parallelism still resets enable_dp_attention when
+    dp_size==1. By this point every offload variable the preset fills is already in
+    os.environ.
     """
     cfg = resolving_view(server_args)
     name = cfg.moe_offload_preset

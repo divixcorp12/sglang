@@ -85,14 +85,21 @@ class PinnedSlotTable(Protocol):
 
 
 class PinnedRowFills(Protocol):
-    """Asynchronous reads of a layer's missing rows into its pinned slots (SGLANG_DSV41_ENABLE_PREFILL_FILLS).
+    """Asynchronous reads of a layer's missing rows into its pinned slots.
 
-    Driven by ``ExpertPinnedHostCache`` inside one host use. ``fill_begin`` claims slots for ``experts`` in order,
-    until one has no victim (a ``protected`` row goes only with ``fallback``), maps them at once and starts reading;
-    it returns the claimed prefix's slots and the evictions. A claimed slot is never a victim until ``fill_end``.
-    ``fill_wait(rows)`` returns once the first ``rows`` claimed rows are in their slabs, and raises if the fill failed
-    first. ``fill_landed`` returns how many claimed rows have landed so far, a prefix of the claim order, without
-    blocking. ``fill_end`` joins the reads; False means the fill failed and released its rows that did not land.
+    Enabled by ``SGLANG_DSV41_ENABLE_PREFILL_FILLS``. Driven by
+    ``ExpertPinnedHostCache`` inside one host use.
+
+    * ``fill_begin`` claims slots for ``experts`` in order, until one has no victim
+      (a ``protected`` row goes only with ``fallback``), maps them at once and starts
+      reading. It returns the claimed prefix's slots and the evictions. A claimed
+      slot is never a victim until ``fill_end``.
+    * ``fill_wait(rows)`` returns once the first ``rows`` claimed rows are in their
+      slabs, and raises if the fill failed first.
+    * ``fill_landed`` returns how many claimed rows have landed so far, a prefix of
+      the claim order, without blocking.
+    * ``fill_end`` joins the reads. False means the fill failed and released its
+      rows that did not land.
     """
 
     def fill_begin(
@@ -108,6 +115,8 @@ class PinnedRowFills(Protocol):
 
 class PinnedSlotLRU:
     """Slot bookkeeping of a bounded host row cache.
+
+    The default ``PinnedSlotTable``.
 
     Free slots are handed out lowest index first. A full cache evicts the
     least recently used expert that neither ``is_pinned`` nor the caller's
@@ -146,6 +155,7 @@ class PinnedSlotLRU:
         self._sink = cache_stats_sink()
 
     def stats(self) -> dict:
+        """This table's cumulative counters, keyed as in ``tier_snapshot``."""
         return {
             "capacity": self.capacity,
             "occupancy": len(self.expert_to_slot),
@@ -160,6 +170,7 @@ class PinnedSlotLRU:
         return expert_id in self.expert_to_slot
 
     def touch(self, expert_id: int) -> None:
+        """Mark ``expert_id`` most recently used; it must hold a slot."""
         self.expert_to_slot.move_to_end(expert_id)
         self.hits += 1
         if self._sink is not None:
@@ -191,6 +202,7 @@ class PinnedSlotLRU:
         return slot, evicted
 
     def _victim(self, protected: Collection[int]) -> int:
+        """The least recently used expert that is not pinned, preferring unprotected."""
         fallback = None
         for expert_id in self.expert_to_slot:
             if self.is_pinned is not None and self.is_pinned(expert_id):
@@ -292,8 +304,9 @@ def allocate_host_slab(
         storage = allocate_bound(nbytes, split_rows(shape[0], placement), row_bytes)
         start = 0
     else:
-        # Page-aligned only, not 2 MiB: the slab's first and last huge pages can mix folio sizes, so io_uring fixed
-        # buffers over it can meet uncoalesced registration (host_numa's docstring). Every recipe sets a placement.
+        # Page-aligned only, not 2 MiB: the first and last huge pages of the slab can
+        # mix folio sizes, so io_uring fixed buffers over it can meet uncoalesced
+        # registration (see host_numa.py). Every recipe sets a placement.
         storage = torch.empty(nbytes + PAGE_BYTES, dtype=torch.uint8, device="cpu")
         start = (-storage.data_ptr()) % PAGE_BYTES
     slab = storage[start : start + nbytes].view(dtype).view(shape)
@@ -378,17 +391,18 @@ def release_host_slabs(slabs: Sequence[torch.Tensor]) -> None:
         _cuda_host_unregister(owner)
 
 
-# The list only makes the quarantine countable. The protection is the extra reference taken below: interpreter
-# finalization clears module globals, which would free the slabs of a list that were the only owner.
+# The list only makes the quarantine countable. The protection is the extra reference
+# taken below: interpreter finalization clears module globals, which would free the
+# slabs of a list that were the only owner.
 _QUARANTINED: list[torch.Tensor] = []
 
 
 def quarantine_host_slabs(slabs: Iterable[torch.Tensor]) -> None:
     """Keep slabs alive, and registered, until the process ends.
 
-    For a tier whose GPU readers cannot be shown to have finished (a CUDA error, or a synchronize that did not
-    return): recycling that storage could feed a reader another expert's bytes. Each slab gets a reference that
-    is never released.
+    For a tier whose GPU readers cannot be shown to have finished (a CUDA error, or a
+    synchronize that did not return): recycling that storage could feed a reader
+    another expert's bytes. Each slab gets a reference that is never released.
     """
     for slab in slabs:
         ctypes.pythonapi.Py_IncRef(ctypes.py_object(slab))
@@ -396,4 +410,5 @@ def quarantine_host_slabs(slabs: Iterable[torch.Tensor]) -> None:
 
 
 def quarantined_slab_count() -> int:
+    """The number of slabs quarantined so far."""
     return len(_QUARANTINED)

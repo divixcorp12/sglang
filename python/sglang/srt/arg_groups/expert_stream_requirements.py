@@ -1,23 +1,27 @@
 """Server-argument requirements of MoE expert caching, per expert format.
 
-``handle_offload_compatibility`` runs while server arguments are processed,
-before any model is loaded. Once ``SGLANG_MOE_HOT_GPU_MB`` or
+``handle_offload_compatibility`` runs while server arguments are processed, before
+any model is loaded. Once ``SGLANG_MOE_HOT_GPU_MB`` or
 ``SGLANG_MOE_PINNED_HOST_MB`` is nonzero, it looks up the requirements of the
 launch's expert format here and runs their check.
 
-The format is identified by its quantization method (``expert_quant_method``).
-Each method that can stream experts maps to one ``ExpertStreamRequirements``;
+The format is identified by its quantization method (:func:`expert_quant_method`).
+Each method that can stream experts maps to one :class:`ExpertStreamRequirements`;
 this module registers NVFP4's. Another format registers its own by calling
-``register_expert_stream_requirements`` at import time of a module named
-``sglang.srt.arg_groups.expert_stream_requirements_<method>``. The gate imports
-that module on the method's first use. Such a module runs during server-args
-processing, so it must import only this module, ``sglang.srt.environ`` and
-the standard library: no quantization, model or torch-heavy code.
+:func:`register_expert_stream_requirements` at import time of a module named
+``sglang.srt.arg_groups.expert_stream_requirements_<method>``. The gate imports that
+module on the method's first use. Such a module runs during server-args processing,
+so it must import only this module, ``sglang.srt.environ`` and the standard library:
+no quantization, model or torch-heavy code.
 
-A launch whose method cannot be determined yet (no ``--quantization``, no
-model configuration built, no local ``config.json`` naming a method) keeps the
-NVFP4 requirements every expert-caching launch had before formats existed. A
-determined method that no format registers is rejected.
+A launch whose method cannot be determined yet (no ``--quantization``, no model
+configuration built, no local ``config.json`` naming a method) keeps the NVFP4
+requirements every expert-caching launch had before formats existed. A determined
+method that no format registers is rejected.
+
+This file also holds :func:`eager_expert_stream_requirements`, the shared checks of
+a format that streams experts eagerly only, and :func:`validate_hot_cache_policy`.
+See ``expert_stream_requirements_exl3.py`` for the EXL3 plugin.
 """
 
 from __future__ import annotations
@@ -51,7 +55,12 @@ NVFP4_QUANT_METHODS = (
 
 @dataclass(frozen=True)
 class ExpertCacheBudgets:
-    """The expert cache settings the gate has already read and range-checked."""
+    """The expert cache settings the gate has already read and range-checked.
+
+    ``hot_budget_mb`` and ``pinned_budget_mb`` are ``SGLANG_MOE_HOT_GPU_MB`` and
+    ``SGLANG_MOE_PINNED_HOST_MB``; ``graph_gather`` is
+    ``SGLANG_MOE_EXPERT_GRAPH_GATHER``.
+    """
 
     hot_budget_mb: int
     pinned_budget_mb: int
@@ -62,14 +71,15 @@ class ExpertCacheBudgets:
 class ExpertStreamRequirements:
     """How one expert format validates a launch that sets expert cache budgets.
 
-    ``check(cfg, budgets)`` raises ``ValueError`` for an unsupported launch;
-    ``cfg`` is the resolving view of the server arguments.
+    ``label`` names the format in error messages. ``check(cfg, budgets)`` raises
+    ``ValueError`` for an unsupported launch; ``cfg`` is the resolving view of the
+    server arguments. ``graph_gather_host_source`` is where graph gathers read host
+    rows: ``"arena"`` (``SGLANG_MOE_EXPERT_HOST_ARENA``, indexed by expert id) or
+    ``"pinned_tier"`` (the format's pinned host tier).
     """
 
     label: str
     check: Callable[[Any, ExpertCacheBudgets], None]
-    # Where graph gathers read host rows: "arena" (SGLANG_MOE_EXPERT_HOST_ARENA,
-    # indexed by expert id) or "pinned_tier" (the format's pinned host tier).
     graph_gather_host_source: Literal["arena", "pinned_tier"] = "arena"
 
     def __post_init__(self) -> None:
@@ -84,6 +94,7 @@ _REGISTRY: dict[str, ExpertStreamRequirements] = {}
 
 
 def _normalize(method: Any) -> str:
+    """The registry key of a quantization method: stripped and lower-cased."""
     key = str(method).strip().lower()
     if not key:
         raise ValueError("quantization method must not be empty")
@@ -93,7 +104,11 @@ def _normalize(method: Any) -> str:
 def register_expert_stream_requirements(
     quant_methods: Iterable[str], requirements: ExpertStreamRequirements
 ) -> None:
-    """Map each quantization method to ``requirements``; re-registering the same object is a no-op."""
+    """Map each quantization method to ``requirements``.
+
+    Re-registering the same object is a no-op; a different object for a registered
+    method raises.
+    """
     for method in quant_methods:
         key = _normalize(method)
         existing = _REGISTRY.get(key)
@@ -151,6 +166,7 @@ def expert_quant_method(server_args: Any, cfg: Any) -> Optional[str]:
 
 
 def _import_plugin(method: str) -> None:
+    """Import the plugin module of ``method`` if one exists, so it registers itself."""
     name = PLUGIN_MODULE_PREFIX + re.sub(r"[^0-9a-z_]", "_", method)
     try:
         importlib.import_module(name)
@@ -164,7 +180,11 @@ def _import_plugin(method: str) -> None:
 def expert_stream_requirements_for(
     server_args: Any, cfg: Any
 ) -> ExpertStreamRequirements:
-    """The requirements of the launch's expert format; raises for an unsupported method."""
+    """The requirements of the launch's expert format.
+
+    Falls back to NVFP4's when the method is not yet known. Raises for a known method
+    no format registers.
+    """
     method = expert_quant_method(server_args, cfg)
     if method is None:
         return NVFP4_EXPERT_STREAM_REQUIREMENTS
@@ -183,7 +203,11 @@ def expert_stream_requirements_for(
 
 
 def validate_hot_cache_policy() -> None:
-    """Check the hot cache's residency-policy knobs; any format with a hot budget runs this."""
+    """Check the hot cache's residency-policy knobs.
+
+    Any format with a hot budget runs this. Raises ``ValueError`` for an
+    out-of-range ``SGLANG_MOE_HOT_*`` value.
+    """
     if envs.SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS.get() < 1:
         raise ValueError("SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS must be positive")
     if envs.SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS.get() < 0:
@@ -205,8 +229,10 @@ def validate_hot_cache_policy() -> None:
 
 
 def _check_nvfp4(cfg: Any, budgets: ExpertCacheBudgets) -> None:
-    # Moved verbatim from handle_offload_compatibility, which read these three
-    # values the same way; the stream knob has always been a raw environment read.
+    """The NVFP4 launch requirements: one request at a time, no parallelism or overlap.
+
+    ``SGLANG_MOE_EXPERT_STREAM`` is read raw from the environment, as it always was.
+    """
     hot_budget_mb = budgets.hot_budget_mb
     pinned_budget_mb = budgets.pinned_budget_mb
     graph_gather = budgets.graph_gather
@@ -306,12 +332,12 @@ def eager_expert_stream_requirements(
     """Requirements of a format that streams experts eagerly only.
 
     The launch must enable the format's streaming (``enabled()``, described by
-    ``enable_hint``), capture no CUDA graphs, use neither the graph gather nor
-    the host arena, and, for dynamic residency, record routes with the
-    ``stat`` or ``per_pass`` recorder. Nothing else is required: not
-    ``--max-running-requests 1``, not the overlap schedule setting, not a MoE
-    runner backend. A format wanting more composes its own ``check`` around
-    this one's.
+    ``enable_hint``), capture no CUDA graphs, use neither the graph gather, the host
+    arena, nor expert prefetch, and, for dynamic residency, record routes with the
+    ``stat`` or ``per_pass`` recorder. The GPU residency update is refused unless
+    ``allow_gpu_residency_update()``. Nothing else is required: not
+    ``--max-running-requests 1``, not the overlap schedule setting, not a MoE runner
+    backend. A format wanting more composes its own ``check`` around this one's.
     """
 
     def check(cfg: Any, budgets: ExpertCacheBudgets) -> None:
