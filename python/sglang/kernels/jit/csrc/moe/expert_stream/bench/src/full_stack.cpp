@@ -245,6 +245,125 @@ class Bench {
   std::map<int, std::vector<std::vector<int32_t>>> slots_;  // [k][row]
 };
 
+bool benchmark_failed = false;
+
+double quantile_us(std::vector<double> seconds, double fraction) {
+  const size_t index = static_cast<size_t>(fraction * static_cast<double>(seconds.size() - 1));
+  std::nth_element(seconds.begin(), seconds.begin() + static_cast<std::ptrdiff_t>(index), seconds.end());
+  return seconds[index] * 1e6;
+}
+
+void gap(const Options& options) {
+  if (options.gap_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(options.gap_us));
+}
+
+void bm_bare(benchmark::State& state, Bench& bench, int k) {
+  try {
+    PinScope caller(bench.placement().workers.front());  // the kernel's caller is worker 0 (spec ruling 2)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // the CPU expert thread on this core goes to sleep
+    bench.validate(k, false);
+    for (int i = 0; i < bench.options().warmup; ++i) bench.bare_call(i % bench.rows(), k);
+    std::vector<double> samples;
+    int64_t row = 0;
+    for (auto _ : state) {
+      gap(bench.options());
+      const int64_t t0 = monotonic_ns();
+      bench.bare_call(row, k);
+      const int64_t t1 = monotonic_ns();
+      const double seconds = static_cast<double>(t1 - t0) * 1e-9;
+      state.SetIterationTime(seconds);
+      samples.push_back(seconds);  // sample storage and layer selection are outside the timed interval
+      row = (row + 1) % bench.rows();
+    }
+    bench.validate(k, false);
+    if (!samples.empty()) {
+      const double p50 = quantile_us(samples, 0.50);
+      state.counters["p50_us"] = p50;
+      state.counters["p95_us"] = quantile_us(samples, 0.95);
+      state.counters["p99_us"] = quantile_us(samples, 0.99);
+      bench.bare_p50_us[k] = p50;
+    }
+    state.counters["experts"] = k;
+    state.counters["workers"] = static_cast<double>(bench.placement().workers.size());
+    state.counters["layers"] = static_cast<double>(bench.rows());
+  } catch (const std::exception& error) {
+    benchmark_failed = true;
+    state.SkipWithError(error.what());
+  }
+}
+
+void bm_stack(benchmark::State& state, Bench& bench, int k) {
+  try {
+    Stack<BenchBuild>& stack = bench.stack();
+    bench.validate(k, true);
+    for (int i = 0; i < bench.options().warmup; ++i) bench.stack_call(i % bench.rows(), k);
+    std::vector<double> total, pickup, service, forward, handoff;
+    [[maybe_unused]] auto stage = std::make_unique<es::StageRecord>();
+    if constexpr (BenchBuild::kMetrics) stack.drain_all();
+    const auto counters0 = stack.counters();
+    const auto cpu0 = stack.cpu_stats();
+    int64_t calls = 0;
+    int64_t row = 0;
+    for (auto _ : state) {
+      gap(bench.options());
+      const auto cpu_before = stack.cpu_stats();
+      const StackCall call = bench.stack_call(row, k);
+      const double seconds = static_cast<double>(call.t1 - call.t0) * 1e-9;
+      state.SetIterationTime(seconds);
+      total.push_back(seconds);
+      if constexpr (BenchBuild::kMetrics) {
+        // The breakdown, from the stage trace and the CPU expert thread's forward time (exact: one request in flight).
+        if (!stack.drain_stage(*stage, call.request.seq, call.t1 + 1'000'000'000))
+          throw std::runtime_error("no stage record for request " + std::to_string(call.request.seq));
+        const auto cpu_after = stack.cpu_stats();
+        const double forward_s = static_cast<double>(cpu_after[2] - cpu_before[2]) * 1e-9;
+        pickup.push_back(static_cast<double>(stage->observed - call.t0) * 1e-9);
+        service.push_back(static_cast<double>(stage->done - stage->observed) * 1e-9);
+        forward.push_back(forward_s);
+        handoff.push_back(static_cast<double>(call.t1 - stage->done) * 1e-9 - forward_s);
+      }
+      ++calls;
+      row = (row + 1) % bench.rows();
+    }
+    // Reconcile: one CPU job of k lanes per call, no read, no overrun.
+    const auto counters1 = stack.counters();
+    const auto cpu1 = stack.cpu_stats();
+    if (cpu1[0] - cpu0[0] != calls || cpu1[1] - cpu0[1] != calls * k)
+      throw std::runtime_error("CPU jobs/lanes " + std::to_string(cpu1[0] - cpu0[0]) + "/" +
+                               std::to_string(cpu1[1] - cpu0[1]) + " for " + std::to_string(calls) + " calls of " +
+                               std::to_string(k) + " lanes");
+    if (counters1[es::kRowsRead] != counters0[es::kRowsRead] || counters1[es::kOverruns] != counters0[es::kOverruns])
+      throw std::runtime_error("a row read or an overrun during timing");
+    if constexpr (BenchBuild::kMetrics) {
+      if (stack.tier().trace_dropped() != 0) throw std::runtime_error("the stage trace dropped records");
+    }
+    bench.validate(k, true);
+    if (!total.empty()) {
+      const double p50 = quantile_us(total, 0.50);
+      state.counters["p50_us"] = p50;
+      state.counters["p95_us"] = quantile_us(total, 0.95);
+      state.counters["p99_us"] = quantile_us(total, 0.99);
+      if (bench.bare_p50_us.contains(k)) state.counters["overhead_p50_us"] = p50 - bench.bare_p50_us[k];
+      if constexpr (BenchBuild::kMetrics) {
+        state.counters["pickup_p50_us"] = quantile_us(pickup, 0.50);
+        state.counters["pickup_p95_us"] = quantile_us(pickup, 0.95);
+        state.counters["service_p50_us"] = quantile_us(service, 0.50);
+        state.counters["service_p95_us"] = quantile_us(service, 0.95);
+        state.counters["forward_p50_us"] = quantile_us(forward, 0.50);
+        state.counters["forward_p95_us"] = quantile_us(forward, 0.95);
+        state.counters["handoff_p50_us"] = quantile_us(handoff, 0.50);
+        state.counters["handoff_p95_us"] = quantile_us(handoff, 0.95);
+      }
+    }
+    state.counters["experts"] = k;
+    state.counters["workers"] = static_cast<double>(bench.placement().workers.size());
+    state.counters["layers"] = static_cast<double>(bench.rows());
+  } catch (const std::exception& error) {
+    benchmark_failed = true;
+    state.SkipWithError(error.what());
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -281,18 +400,48 @@ int main(int argc, char** argv) {
       sim.set_row_cpu(row);
     }
     Bench bench(options, placement, *fixture, stack, sim, layers.handles);
-    {
-      PinScope caller(placement.workers.front());  // the kernel's caller is worker 0, as on the CPU expert thread
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));  // that thread's 50 ms idle spin ends first
-      for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/false);
-    }
-    for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/true);
     const std::vector<int> expected = expected_threads(placement);
+    if (options.validate_only) {
+      {
+        PinScope caller(placement.workers.front());  // the kernel's caller is worker 0, as on the CPU expert thread
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // that thread's 50 ms idle spin ends first
+        for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/false);
+      }
+      for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/true);
+      verify_threads(before, expected);
+      std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
+                << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName
+                << " build)\n";
+      return 0;
+    }
+    benchmark::AddCustomContext("backend", EXL3_BENCH_BACKEND);
+    benchmark::AddCustomContext("host_build", std::string(BenchBuild::kName));
+    benchmark::AddCustomContext("fixture", options.fixture.string());
+    benchmark::AddCustomContext("image_dir", options.image_dir.string());
+    benchmark::AddCustomContext("writer_cpu", std::to_string(placement.writer));
+    benchmark::AddCustomContext("service_cpu", std::to_string(placement.service));
+    benchmark::AddCustomContext("copy_cpu", std::to_string(placement.copy));
+    benchmark::AddCustomContext("worker_cpus", cpu_list(std::vector<int>(placement.workers.begin(), placement.workers.end())));
+    std::ifstream cgroup_file("/proc/self/cgroup");
+    benchmark::AddCustomContext("cgroup", std::string((std::istreambuf_iterator<char>(cgroup_file)), {}));
+    benchmark::AddCustomContext("gap_us", std::to_string(options.gap_us));
+    benchmark::AddCustomContext("compiler", __VERSION__);
+    // Every BM_bare before any BM_stack: one OpenMP team at a time (Bench::enter_stack_phase). Each benchmark checks
+    // its path's 8 outputs bit-exactly before and after it is timed.
+    for (int k : {1, 3, 5})
+      benchmark::RegisterBenchmark("BM_bare/experts:" + std::to_string(k),
+                                   [&bench, k](benchmark::State& state) { bm_bare(state, bench, k); })
+          ->UseManualTime()
+          ->Unit(benchmark::kMicrosecond);
+    for (int k : {1, 3, 5})
+      benchmark::RegisterBenchmark("BM_stack/experts:" + std::to_string(k),
+                                   [&bench, k](benchmark::State& state) { bm_stack(state, bench, k); })
+          ->UseManualTime()
+          ->Unit(benchmark::kMicrosecond);
+    benchmark::RunSpecifiedBenchmarks();
+    benchmark::Shutdown();
     verify_threads(before, expected);
-    std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
-              << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName << " build)\n";
-    if (!options.validate_only) throw std::runtime_error("timing is not built yet: run with --validate-only");
-    return 0;
+    return benchmark_failed ? 1 : 0;
   } catch (const std::exception& error) {
     std::cerr << "Error: " << error.what() << '\n';
     return 1;
