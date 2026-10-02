@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.utils import cuda_host_registry as registry
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
@@ -41,7 +40,7 @@ def _lock_is_free() -> bool:
     return True
 
 
-class TestCudaHostRegistry(CustomTestCase):
+class TestCudaHostRegistry(unittest.TestCase):
     def setUp(self):
         if not _lock_is_free():
             self.skipTest("the registry lock is held by a deadlocked thread")
