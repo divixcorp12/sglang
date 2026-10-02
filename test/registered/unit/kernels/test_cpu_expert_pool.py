@@ -9,8 +9,10 @@ import torch
 
 from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
 from sglang.srt.layers.moe.cpu_experts.policy import (
+    format_calibration,
     k_star,
     parse_core_list,
+    split_from_grid,
     split_table,
 )
 from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertPool
@@ -385,3 +387,54 @@ def test_configured_split_refuses_a_table_the_grant_could_not_honour(spec):
         with pytest.raises(ValueError, match="0 <= split"):
             configured_split()
 
+
+
+def _grid(both, lanes=8):
+    """A calibration grid whose concurrent rows come from both(n, k); cpu and link rows from the n == k and k == 0 cells."""
+    grid = [[0.0] * (lanes + 1) for _ in range(lanes + 2)]
+    for n in range(1, lanes + 1):
+        for k in range(n + 1):
+            grid[1 + n][k] = both(n, k)
+        grid[0][n] = both(n, n)
+        grid[1][n] = both(n, 0)
+    return grid
+
+
+def test_split_from_grid_takes_the_fastest_k_per_n():
+    # A CPU twice as fast as the link per expert, both paths in parallel; exact ties go to the larger k.
+    grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)))
+    expected = [0] + [min(range(n + 1), key=lambda k: (max(0.5 * k, 1.0 * (n - k)), -k)) for n in range(1, 9)]
+    assert split_from_grid(grid) == expected
+
+
+def test_split_from_grid_breaks_a_near_tie_toward_the_cpu():
+    # k = 1 is 1% slower than k = 0 for every n: inside the 2% tie, so the larger k wins; at 3% it does not.
+    near = _grid(lambda n, k: 1.0 + 0.01 * k if k <= 1 else 9.0)
+    far = _grid(lambda n, k: 1.0 + 0.03 * k if k <= 1 else 9.0)
+    assert split_from_grid(near) == [0] + [1] * 8
+    assert split_from_grid(far) == [0] * 9
+
+
+def test_split_from_grid_never_exceeds_n_and_ignores_cells_past_n():
+    # Cells k > n are unused (0.0 in the C++ grid); a 0.0 there must not win.
+    grid = _grid(lambda n, k: 5.0 - k)  # more CPU is always faster
+    assert split_from_grid(grid) == list(range(9))
+    assert all(0 <= k <= n for n, k in enumerate(split_from_grid(grid)))
+
+
+def test_split_from_grid_handles_a_non_monotonic_grid():
+    # A contention dip at k = 2 of n = 4.
+    grid = _grid(lambda n, k: 1.0 if (n, k) == (4, 2) else 3.0 + k)
+    assert split_from_grid(grid)[4] == 2
+
+
+def test_format_calibration_prints_the_tables_and_the_split():
+    grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)))
+    split = split_from_grid(grid)
+    block = format_calibration(grid, split, row=3, expert_bytes=12 * 2**20 + 2**19, reps=10)
+    lines = block.splitlines()
+    assert lines[0] == "CPU experts calibration: row 3, expert 12.5 MiB, 10 reps"
+    assert lines[1] == "  cpu  ms k=1..8: 0.50 1.00 1.50 2.00 2.50 3.00 3.50 4.00"
+    assert lines[2] == "  link ms m=1..8: 1.00 2.00 3.00 4.00 5.00 6.00 7.00 8.00"
+    assert lines[3].startswith("  layer ms n=1..8 at chosen k: ")
+    assert lines[4] == "  split n=0..8: " + " ".join(str(k) for k in split)
