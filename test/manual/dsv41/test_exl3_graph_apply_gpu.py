@@ -41,10 +41,20 @@ def _layer(tmp_path):
     from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
     from sglang.srt.layers.moe.exl3_shard_row_source import Exl3ShardRowSource
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
-    from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
+    from sglang.srt.layers.moe.expert_stream import (
+        ExpertPinnedHostCache,
+        ExpertStreamer,
+    )
     from sglang.test.dsv41_fake_exl3 import write_fake_exl3
 
-    write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
+    write_fake_exl3(
+        str(tmp_path),
+        num_layers=1,
+        num_experts=EXPERTS,
+        hidden=HIDDEN,
+        inter=INTER,
+        finite=True,
+    )
     layer = torch.nn.Module()
     layer.layer_id = 0
     layer.top_k = TOP_K
@@ -58,9 +68,14 @@ def _layer(tmp_path):
     pinned.ensure_rows(torch.arange(PINNED_EXPERTS, device="cuda"))
     streamer.enable_graph_gather(TOP_K)
     layer._nvfp4_expert_streamer = streamer
-    layer._exl3_allow_p3_only = True  # test configuration: P3's backend without option C (Task 14)
+    layer._exl3_allow_p3_only = (
+        True  # test configuration: P3's backend without option C (Task 14)
+    )
     specs = {spec.name: spec for spec in fmt.tensor_specs(None)}
-    source = {name: torch.empty((EXPERTS,) + spec.row_shape, dtype=spec.dtype) for name, spec in specs.items()}
+    source = {
+        name: torch.empty((EXPERTS,) + spec.row_shape, dtype=spec.dtype)
+        for name, spec in specs.items()
+    }
     Exl3ShardRowSource.for_layer(layout, 0, fmt.segment_map(), direct=False).read(
         torch.arange(EXPERTS, dtype=torch.long), source
     )
@@ -71,7 +86,10 @@ def _reference(x, weights, slots, tensors):
     """fp32 routed output over the hot-cache rows at ``slots`` (the probe's reference)."""
     import torch.nn.functional as F
 
-    from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_linear_reference
+    from sglang.srt.layers.quantization.exl3_ops import (
+        Exl3Tensors,
+        exl3_linear_reference,
+    )
 
     def view(prefix, slot, part):
         return Exl3Tensors(
@@ -85,7 +103,9 @@ def _reference(x, weights, slots, tensors):
     out = torch.zeros((1, x.shape[1]), dtype=torch.float32, device=x.device)
     for k, slot in enumerate(slots.tolist()):
         gate = exl3_linear_reference(x16, view("w13", slot, 0)).clamp(max=ACT_LIMIT)
-        up = exl3_linear_reference(x16, view("w13", slot, 1)).clamp(-ACT_LIMIT, ACT_LIMIT)
+        up = exl3_linear_reference(x16, view("w13", slot, 1)).clamp(
+            -ACT_LIMIT, ACT_LIMIT
+        )
         h = F.silu(gate) * up * weights[k].float()
         out += exl3_linear_reference(h.to(torch.float16), view("w2", slot, 0))
     return out
@@ -96,7 +116,9 @@ def _rel(y, ref):
 
 
 @pytest.mark.parametrize("fused_in_topk", [False, True])
-def test_apply_casts_and_scales_bit_identically_to_the_unfused_chain(tmp_path, fused_in_topk):
+def test_apply_casts_and_scales_bit_identically_to_the_unfused_chain(
+    tmp_path, fused_in_topk
+):
     """Exl3MoEMethod.apply against the unfused chain it replaced: the routed output after the cast to bf16 and the
     routed_scaling_factor, which the cast fusion moves into one kernel. The reference is ``_apply_graph``'s own
     bf16 output, multiplied by the factor unless it is already fused into the top-k weights."""
@@ -108,20 +130,32 @@ def test_apply_casts_and_scales_bit_identically_to_the_unfused_chain(tmp_path, f
     layer, _, _ = _layer(tmp_path)
     layer.should_fuse_routed_scaling_factor_in_topk = fused_in_topk
     config = Exl3Config.from_config(
-        {"quant_method": "exl3", "version": "1.4.2", "bits": 3.02, "head_bits": 6, "codebook": "mul1"}
+        {
+            "quant_method": "exl3",
+            "version": "1.4.2",
+            "bits": 3.02,
+            "head_bits": 6,
+            "codebook": "mul1",
+        }
     )
     method = Exl3MoEMethod(config, streamed=True)
     method.moe_runner_config = SimpleNamespace(
-        apply_router_weight_on_input=False, swiglu_limit=ACT_LIMIT, routed_scaling_factor=1.5
+        apply_router_weight_on_input=False,
+        swiglu_limit=ACT_LIMIT,
+        routed_scaling_factor=1.5,
     )
     gen = torch.Generator(device="cpu").manual_seed(3)
     for route in ([0, 3, 5, 1, 7, 6], [2, 4, 6, 0, 1, 3]):
         x = (torch.randn((1, HIDDEN), generator=gen) * 4).to("cuda", torch.bfloat16)
         weights = torch.softmax(torch.randn((1, TOP_K), generator=gen), -1).cuda()
         ids = torch.tensor([route], device="cuda", dtype=torch.int32)
-        dispatch = SimpleNamespace(hidden_states=x, topk_output=StandardTopKOutput(weights, ids, None))
+        dispatch = SimpleNamespace(
+            hidden_states=x, topk_output=StandardTopKOutput(weights, ids, None)
+        )
         got = method.apply(layer, dispatch).hidden_states
-        unscaled = Exl3MoEMethod._apply_graph(layer, layer._nvfp4_expert_streamer, x, weights, ids, ACT_LIMIT)
+        unscaled = Exl3MoEMethod._apply_graph(
+            layer, layer._nvfp4_expert_streamer, x, weights, ids, ACT_LIMIT
+        )
         want = unscaled if fused_in_topk else unscaled * 1.5
         assert got.dtype == want.dtype == torch.bfloat16
         assert torch.equal(got.view(torch.int16), want.view(torch.int16)), route
@@ -136,7 +170,9 @@ def test_captured_in_graph_moe_matches_the_eager_streamed_apply(tmp_path):
     x = (torch.randn((1, HIDDEN), generator=gen) * 0.5).to("cuda", torch.bfloat16)
     weights = torch.softmax(torch.randn((1, TOP_K), generator=gen), -1).cuda()
     ids = torch.tensor([[0, 3, 5, 1, 7, 6]], device="cuda", dtype=torch.int32)
-    Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT)  # warm up, allocate
+    Exl3MoEMethod._apply_graph(
+        layer, streamer, x, weights, ids, ACT_LIMIT
+    )  # warm up, allocate
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT)
@@ -153,14 +189,23 @@ def test_captured_in_graph_moe_matches_the_eager_streamed_apply(tmp_path):
         outputs[tuple(route)] = got
         assert backend.keep.item() == 1.0
         # An eager gather of the same routes remaps them to the same slots (the replay's).
-        assert torch.equal(Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT), got)
+        assert torch.equal(
+            Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT), got
+        )
         remap, tensors = streamer.gather(ids)
         slots = remap.reshape(-1).tolist()
         for k, expert in enumerate(route):
             for name, rows in tensors.items():
-                assert torch.equal(rows[slots[k]].cpu(), source[name][expert]), (route, k, expert, name)
+                assert torch.equal(rows[slots[k]].cpu(), source[name][expert]), (
+                    route,
+                    k,
+                    expert,
+                    name,
+                )
         ref = _reference(x, weights.reshape(-1), remap.reshape(-1), tensors)
-        loop = Exl3MoEMethod._apply_streamed(layer, streamer, x, weights, ids.long(), ACT_LIMIT)
+        loop = Exl3MoEMethod._apply_streamed(
+            layer, streamer, x, weights, ids.long(), ACT_LIMIT
+        )
         rel, rel_loop = _rel(got, ref), _rel(loop, ref)
         assert rel <= REL_BOUND and rel <= 2 * rel_loop + 1e-3, (route, rel, rel_loop)
         assert rel <= REL_TIGHT, (route, rel)

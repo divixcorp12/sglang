@@ -24,7 +24,11 @@ def _nvfp4_layer(seed=21, pinned=True, experts=EXPERTS):
     layer = torch.nn.Module()
     for name in NVFP4_STREAM_TENSORS[:4]:
         rows = torch.randint(
-            0, 256, (experts,) + _HOST_SHAPES[name], dtype=torch.uint8, generator=generator
+            0,
+            256,
+            (experts,) + _HOST_SHAPES[name],
+            dtype=torch.uint8,
+            generator=generator,
         )
         if "blockscale" in name:
             rows = rows.view(torch.float8_e4m3fn)
@@ -56,7 +60,9 @@ class TestFormatSeamCuda(unittest.TestCase):
         self.assertEqual(hot.device, layer.g1_alphas.device)
         for name in NVFP4_STREAM_TENSORS:
             source = getattr(layer, name).data
-            self.assertEqual(tuple(hot.tensors[name].shape[1:]), tuple(source.shape[1:]))
+            self.assertEqual(
+                tuple(hot.tensors[name].shape[1:]), tuple(source.shape[1:])
+            )
             self.assertEqual(hot.tensors[name].dtype, source.dtype)
         self.assertEqual(pinned.cached_names, NVFP4_STREAM_TENSORS[:4])
         for name in pinned.cached_names:
@@ -173,11 +179,16 @@ class TestPinnedTierCuda(unittest.TestCase):
         streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
         ExpertHotCache(streamer, 1).reassign([3])
         pinned = ExpertPinnedHostCache(streamer, 2)
-        ids = torch.tensor([[3, 0, 5, 7], [9, 11, 3, 13]], device="cuda", dtype=torch.int32)
+        ids = torch.tensor(
+            [[3, 0, 5, 7], [9, 11, 3, 13]], device="cuda", dtype=torch.int32
+        )
         compact, tensors = streamer.gather(ids)
         cpu_ids = ids.long().cpu()
         self.assertTrue(
-            torch.equal(tensors["host_rows"][compact.long()].cpu(), layer.host_rows.data[cpu_ids])
+            torch.equal(
+                tensors["host_rows"][compact.long()].cpu(),
+                layer.host_rows.data[cpu_ids],
+            )
         )
         self.assertTrue(
             torch.equal(
@@ -189,23 +200,27 @@ class TestPinnedTierCuda(unittest.TestCase):
         self.assertEqual((stats.hot_hit_rows, stats.pinned_host_miss_rows), (1, 6))
         self.assertEqual(pinned.stats.evictions, 4)
 
-
     def test_copy_rows_to_named_rows_on_cuda_leaves_the_rest(self):
         from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
 
         experts = 8
         layer = torch.nn.Module()
         layer.host_rows = torch.nn.Parameter(
-            torch.randint(0, 256, (experts, 3000), dtype=torch.uint8), requires_grad=False
+            torch.randint(0, 256, (experts, 3000), dtype=torch.uint8),
+            requires_grad=False,
         )
-        layer.gpu_rows = torch.nn.Parameter(torch.rand(experts, 5, device="cuda"), requires_grad=False)
+        layer.gpu_rows = torch.nn.Parameter(
+            torch.rand(experts, 5, device="cuda"), requires_grad=False
+        )
         layer._nvfp4_file_source_bytes_per_expert = 3000
         streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
         cache = ExpertPinnedHostCache(streamer, 4)
         ids = torch.tensor([6, 2, 5], device="cuda")
         cache.ensure_rows(ids)
         out = torch.full((3, 3000), 7, dtype=torch.uint8, device="cuda")
-        cache.copy_rows(ids, {"host_rows": out}, rows=torch.tensor([1, 2], device="cuda"))
+        cache.copy_rows(
+            ids, {"host_rows": out}, rows=torch.tensor([1, 2], device="cuda")
+        )
         got = out.cpu()
         self.assertTrue(torch.equal(got[1], layer.host_rows.data[2]))
         self.assertTrue(torch.equal(got[2], layer.host_rows.data[5]))
@@ -217,14 +232,26 @@ class TestPinnedTierCuda(unittest.TestCase):
         from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
 
         layer = torch.nn.Module()
-        layer.host_rows = torch.nn.Parameter(torch.randint(0, 256, (8, 3000), dtype=torch.uint8), requires_grad=False)
-        layer.gpu_rows = torch.nn.Parameter(torch.rand(8, 5, device="cuda"), requires_grad=False)
+        layer.host_rows = torch.nn.Parameter(
+            torch.randint(0, 256, (8, 3000), dtype=torch.uint8), requires_grad=False
+        )
+        layer.gpu_rows = torch.nn.Parameter(
+            torch.rand(8, 5, device="cuda"), requires_grad=False
+        )
         layer._nvfp4_file_source_bytes_per_expert = 3000
-        cache = ExpertPinnedHostCache(ExpertStreamer(layer, ("host_rows", "gpu_rows")), 4)
+        cache = ExpertPinnedHostCache(
+            ExpertStreamer(layer, ("host_rows", "gpu_rows")), 4
+        )
         ids = torch.tensor([6, 2, 5], device="cuda")
         cache.ensure_rows(ids)
-        contiguous = {"host_rows": torch.empty((3, 3000), dtype=torch.uint8, device="cuda")}
-        strided = {"host_rows": torch.empty((3, 6000), dtype=torch.uint8, device="cuda")[:, ::2]}
+        contiguous = {
+            "host_rows": torch.empty((3, 3000), dtype=torch.uint8, device="cuda")
+        }
+        strided = {
+            "host_rows": torch.empty((3, 6000), dtype=torch.uint8, device="cuda")[
+                :, ::2
+            ]
+        }
         self.assertTrue(cache._splits(contiguous))
         self.assertFalse(cache._splits(strided))
         with self.assertRaisesRegex(ValueError, "contiguous"):
@@ -238,9 +265,12 @@ class TestPinnedTierCuda(unittest.TestCase):
         experts = 24
         layer = torch.nn.Module()
         layer.host_rows = torch.nn.Parameter(
-            torch.randint(0, 256, (experts, 3000), dtype=torch.uint8), requires_grad=False
+            torch.randint(0, 256, (experts, 3000), dtype=torch.uint8),
+            requires_grad=False,
         )
-        layer.gpu_rows = torch.nn.Parameter(torch.rand(experts, 5, device="cuda"), requires_grad=False)
+        layer.gpu_rows = torch.nn.Parameter(
+            torch.rand(experts, 5, device="cuda"), requires_grad=False
+        )
         layer._nvfp4_file_source_bytes_per_expert = 3000
         streamer = ExpertStreamer(layer, ("host_rows", "gpu_rows"))
         cache = ExpertPinnedHostCache(streamer, experts)
@@ -252,13 +282,17 @@ class TestPinnedTierCuda(unittest.TestCase):
         with cache.host_use():
             cache.prefetch_rows(filling, protected=filling + [20])
             torch.cuda.synchronize()
-            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA]
+            ) as profile:
                 cache.gather_rows(ids, {"host_rows": out})
                 torch.cuda.synchronize()
             cache.finish_fills()
         self.assertEqual(cache.row_fills.waits, [8, 16, 18])
         host_to_device = [event for event in profile.events() if "HtoD" in event.name]
-        self.assertEqual(len(host_to_device), 1, [event.name for event in profile.events()])
+        self.assertEqual(
+            len(host_to_device), 1, [event.name for event in profile.events()]
+        )
         self.assertTrue(torch.equal(out.cpu(), layer.host_rows.data[ids.cpu()]))
         cache.close()
 
@@ -267,10 +301,19 @@ class _LazyFills:
     """A PinnedRowFills whose claimed rows land in the tier's slabs only when waited for or joined."""
 
     def __init__(self, cache, rows):
-        self.cache, self.rows, self.claimed, self.landed, self.waits = cache, rows, [], 0, []
+        self.cache, self.rows, self.claimed, self.landed, self.waits = (
+            cache,
+            rows,
+            [],
+            0,
+            [],
+        )
 
     def fill_begin(self, experts, protected, fallback):
-        self.claimed = [(expert, self.cache._lru.assign(expert, frozenset(protected))[0]) for expert in experts]
+        self.claimed = [
+            (expert, self.cache._lru.assign(expert, frozenset(protected))[0])
+            for expert in experts
+        ]
         self.landed = 0
         return [slot for _, slot in self.claimed], 0
 
@@ -304,9 +347,14 @@ def _spec_only_reference(names=None, experts=EXPERTS, seed=5):
     names = tuple(shapes) if names is None else names
     return {
         name: torch.randint(
-            0, 256, (experts,) + shapes[name][0] + (shapes[name][1].itemsize,),
-            dtype=torch.uint8, generator=generator,
-        ).view(shapes[name][1]).reshape((experts,) + shapes[name][0])
+            0,
+            256,
+            (experts,) + shapes[name][0] + (shapes[name][1].itemsize,),
+            dtype=torch.uint8,
+            generator=generator,
+        )
+        .view(shapes[name][1])
+        .reshape((experts,) + shapes[name][0])
         for name in names
     }
 
@@ -346,7 +394,9 @@ class TestSpecOnlyCuda(unittest.TestCase):
         self._assert_rows(reference, ids, compact, tensors)
         stats = streamer.last_gather_stats
         self.assertEqual(stats.hot_hit_rows, 2)
-        self.assertEqual((stats.pinned_host_hit_rows, stats.pinned_host_miss_rows), (1, 2))
+        self.assertEqual(
+            (stats.pinned_host_hit_rows, stats.pinned_host_miss_rows), (1, 2)
+        )
         self.assertEqual(stats.host_read_rows, 2)
 
     def test_promotions_go_through_the_pinned_tier_in_chunks(self):
@@ -356,7 +406,9 @@ class TestSpecOnlyCuda(unittest.TestCase):
         reference = _spec_only_reference()
         streamer = _spec_only_streamer(reference)
         # Expert 2 is protected, so every promotion chunk holds at most 2 rows.
-        pinned = ExpertPinnedHostCache(streamer, 3, is_pinned=lambda expert: expert == 2)
+        pinned = ExpertPinnedHostCache(
+            streamer, 3, is_pinned=lambda expert: expert == 2
+        )
         pinned.ensure_rows(torch.tensor([2], device="cuda"))
         self.assertEqual(pinned.evictable_rows(), 2)
         hot = ExpertHotCache(streamer, 5)
@@ -409,11 +461,15 @@ class TestGatherExpertsCuda(unittest.TestCase):
         ):
             for name in NVFP4_STREAM_TENSORS:
                 pieces[name].append(
-                    chunk_rows[name][chunk_rows_of_source.long()].view(torch.uint8).cpu()
+                    chunk_rows[name][chunk_rows_of_source.long()]
+                    .view(torch.uint8)
+                    .cpu()
                 )
         for name in NVFP4_STREAM_TENSORS:
             self.assertTrue(torch.equal(torch.cat(pieces[name]), whole[name]), name)
-            self.assertTrue(torch.equal(whole[name], _source_bytes(layer, name, ids)), name)
+            self.assertTrue(
+                torch.equal(whole[name], _source_bytes(layer, name, ids)), name
+            )
         stats = streamer.last_gather_stats
         self.assertEqual((stats.requested_rows, stats.hot_hit_rows), (5, 2))
 
@@ -421,7 +477,11 @@ class TestGatherExpertsCuda(unittest.TestCase):
         from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
 
         ids = [6, 1, 3, 4, 0]
-        for hot in ([1, 4], [6, 1, 3, 4, 0], [7]):  # mixed, all hit, all miss (7 never routes)
+        for hot in (
+            [1, 4],
+            [6, 1, 3, 4, 0],
+            [7],
+        ):  # mixed, all hit, all miss (7 never routes)
             layer = _nvfp4_layer(pinned=False)
             streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
             ExpertHotCache(streamer, len(hot)).reassign(hot)
@@ -429,7 +489,10 @@ class TestGatherExpertsCuda(unittest.TestCase):
 
             def picked(rows, row_of_source):
                 index = torch.as_tensor(row_of_source, device="cuda").long()
-                return {n: rows[n][index].view(torch.uint8).cpu() for n in NVFP4_STREAM_TENSORS}
+                return {
+                    n: rows[n][index].view(torch.uint8).cpu()
+                    for n in NVFP4_STREAM_TENSORS
+                }
 
             got = [
                 (chunk, row_of_source, picked(rows, row_of_source))
@@ -444,7 +507,9 @@ class TestGatherExpertsCuda(unittest.TestCase):
                 )
             ]
             self.assertEqual(len(got), len(want))
-            for (g_chunk, g_rows_of, g_rows), (w_chunk, w_rows_of, w_rows) in zip(got, want):
+            for (g_chunk, g_rows_of, g_rows), (w_chunk, w_rows_of, w_rows) in zip(
+                got, want
+            ):
                 self.assertEqual((g_chunk, g_rows_of), (w_chunk, w_rows_of), hot)
                 for n in NVFP4_STREAM_TENSORS:
                     self.assertTrue(torch.equal(g_rows[n], w_rows[n]), (hot, n))

@@ -39,10 +39,19 @@ def _model():
         layer.top_k = TOP_K
         layer._nvfp4_file_source_bytes_per_expert = 0
         for position, name in enumerate(NVFP4_STREAM_TENSORS[:4]):
-            values = (torch.arange(EXPERTS * 12, dtype=torch.int64) * (position + 5) + layer_id * 17).remainder(251)
-            setattr(layer, name, values.to(torch.uint8).reshape(EXPERTS, 3, 4).pin_memory())
-        layer.g1_alphas = (torch.arange(EXPERTS, dtype=torch.float32) + 0.5 + layer_id).cuda()
-        layer.g2_alphas = (torch.arange(EXPERTS, dtype=torch.float32) * 3 + layer_id).cuda()
+            values = (
+                torch.arange(EXPERTS * 12, dtype=torch.int64) * (position + 5)
+                + layer_id * 17
+            ).remainder(251)
+            setattr(
+                layer, name, values.to(torch.uint8).reshape(EXPERTS, 3, 4).pin_memory()
+            )
+        layer.g1_alphas = (
+            torch.arange(EXPERTS, dtype=torch.float32) + 0.5 + layer_id
+        ).cuda()
+        layer.g2_alphas = (
+            torch.arange(EXPERTS, dtype=torch.float32) * 3 + layer_id
+        ).cuda()
         layer._nvfp4_expert_streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
         model.add_module(str(layer_id), layer)
     return model
@@ -52,7 +61,10 @@ def _manager(model, gpu, max_promotions=EXPERTS, seed_scale=(1, 1, 1), **overrid
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCacheManager
 
     seed = [
-        [float((expert * 7 + layer) % 5) * seed_scale[layer] for expert in range(EXPERTS)]
+        [
+            float((expert * 7 + layer) % 5) * seed_scale[layer]
+            for expert in range(EXPERTS)
+        ]
         for layer in range(LAYERS)
     ]
     options = dict(
@@ -93,7 +105,11 @@ def assert_states_equal(test, actual, expected, context=""):
     """Fail unless two ``device_state`` snapshots are identical."""
     for layer_id in expected:
         for field in expected[layer_id]:
-            test.assertEqual(actual[layer_id][field], expected[layer_id][field], f"{context} layer {layer_id} {field}")
+            test.assertEqual(
+                actual[layer_id][field],
+                expected[layer_id][field],
+                f"{context} layer {layer_id} {field}",
+            )
 
 
 def assert_slot_rows(test, manager, model, context=""):
@@ -105,12 +121,17 @@ def assert_slot_rows(test, manager, model, context=""):
         for expert, slot in enumerate(mapping):
             if slot < 0:
                 continue
-            test.assertEqual(states[slot], READY, f"{context} layer {layer_id} slot {slot} state")
+            test.assertEqual(
+                states[slot], READY, f"{context} layer {layer_id} slot {slot} state"
+            )
             for name in NVFP4_STREAM_TENSORS:
                 actual = cache.tensors[name][slot].cpu()
                 expected = getattr(layer, name)[expert].cpu()
                 test.assertTrue(
-                    torch.equal(actual.reshape(-1).view(torch.uint8), expected.reshape(-1).view(torch.uint8)),
+                    torch.equal(
+                        actual.reshape(-1).view(torch.uint8),
+                        expected.reshape(-1).view(torch.uint8),
+                    ),
                     f"{context} layer {layer_id} expert {expert} slot {slot} {name}",
                 )
 
@@ -118,19 +139,25 @@ def assert_slot_rows(test, manager, model, context=""):
 def _decode_batch():
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-    return SimpleNamespace(forward_mode=ForwardMode.DECODE, extend_num_tokens=1, batch_size=1)
+    return SimpleNamespace(
+        forward_mode=ForwardMode.DECODE, extend_num_tokens=1, batch_size=1
+    )
 
 
 def _idle_batch():
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-    return SimpleNamespace(forward_mode=ForwardMode.IDLE, extend_num_tokens=0, batch_size=1)
+    return SimpleNamespace(
+        forward_mode=ForwardMode.IDLE, extend_num_tokens=0, batch_size=1
+    )
 
 
 def _prefill_batch(tokens):
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-    return SimpleNamespace(forward_mode=ForwardMode.EXTEND, extend_num_tokens=tokens, batch_size=1)
+    return SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND, extend_num_tokens=tokens, batch_size=1
+    )
 
 
 def _counts(routes):
@@ -146,7 +173,9 @@ def _decode_routes(generator, step):
     routes = []
     for layer in range(LAYERS):
         first = hot[layer] if generator.random() < 0.7 else generator.randrange(EXPERTS)
-        second = generator.choice([expert for expert in range(EXPERTS) if expert != first])
+        second = generator.choice(
+            [expert for expert in range(EXPERTS) if expert != first]
+        )
         routes.append([[first, second]])
     return routes
 
@@ -218,7 +247,11 @@ def _gather_harness(manager, tokens=1):
     static[:, :, 1] = 1
     outputs = [
         {
-            name: torch.zeros((tokens * TOP_K,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device="cuda")
+            name: torch.zeros(
+                (tokens * TOP_K,) + tuple(tensor.shape[1:]),
+                dtype=tensor.dtype,
+                device="cuda",
+            )
             for name, tensor in streamer.hot_cache.tensors.items()
         }
         for streamer in streamers
@@ -268,7 +301,9 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
     def _run_mode(self, gpu, insert_on_miss=False):
         current_model, reference_model = _model(), _model()
         mode = (
-            dict(update_decode_forwards=1, insert_on_miss=True, insert_on_miss_decay=0.98)
+            dict(
+                update_decode_forwards=1, insert_on_miss=True, insert_on_miss_decay=0.98
+            )
             if insert_on_miss
             else {}
         )
@@ -301,12 +336,20 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
                 for name in NVFP4_STREAM_TENSORS:
                     actual = current_outputs[layer][name].view(torch.uint8).cpu()
                     self.assertTrue(
-                        torch.equal(actual, reference_outputs[layer][name].view(torch.uint8).cpu()),
+                        torch.equal(
+                            actual,
+                            reference_outputs[layer][name].view(torch.uint8).cpu(),
+                        ),
                         f"{context} layer {layer} {name} differs from the reference path",
                     )
-                    expected = getattr(source_layer, name)[experts.to(getattr(source_layer, name).device)]
+                    expected = getattr(source_layer, name)[
+                        experts.to(getattr(source_layer, name).device)
+                    ]
                     self.assertTrue(
-                        torch.equal(actual.reshape(-1), expected.reshape(-1).view(torch.uint8).cpu()),
+                        torch.equal(
+                            actual.reshape(-1),
+                            expected.reshape(-1).view(torch.uint8).cpu(),
+                        ),
                         f"{context} layer {layer} {name} differs from the source rows",
                     )
             current_counters = current.snapshot_counters()["decode"]
@@ -321,12 +364,19 @@ class TestGatherAcrossResidencyUpdates(unittest.TestCase):
                         reference_counters[str(layer)][field],
                         f"{context} layer {layer} {field}",
                     )
-            assert_states_equal(self, device_state(current), device_state(reference), context)
+            assert_states_equal(
+                self, device_state(current), device_state(reference), context
+            )
             changed = "insertions" if insert_on_miss else "promotions"
-            promotions = sum(current_counters[str(layer)][changed] for layer in range(LAYERS))
+            promotions = sum(
+                current_counters[str(layer)][changed] for layer in range(LAYERS)
+            )
             if insert_on_miss:
                 self.assertEqual(
-                    sum(current_counters[str(layer)]["promotions"] for layer in range(LAYERS)),
+                    sum(
+                        current_counters[str(layer)]["promotions"]
+                        for layer in range(LAYERS)
+                    ),
                     0,
                     f"{context}: insert-on-miss decode boundaries must not promote host rows",
                 )
@@ -343,7 +393,9 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         self.gpu_model = _model()
 
     def capture(self, manager):
-        streamers = [manager.streamers[layer_id] for layer_id in sorted(manager.streamers)]
+        streamers = [
+            manager.streamers[layer_id] for layer_id in sorted(manager.streamers)
+        ]
         static = torch.zeros((LAYERS, 1, TOP_K), dtype=torch.int32, device="cuda")
         static[:, 0, 1] = 1
 
@@ -364,7 +416,9 @@ class TestGpuResidencyUpdate(unittest.TestCase):
 
     def host_forward(self, manager, routes, batch):
         for layer, streamer in sorted(manager.streamers.items()):
-            streamer.gather(torch.tensor(routes[layer], dtype=torch.int32, device="cuda"))
+            streamer.gather(
+                torch.tensor(routes[layer], dtype=torch.int32, device="cuda")
+            )
 
     def run_decode(self, host, gpu, graph, static, generator, steps, start=0):
         for step in range(start, start + steps):
@@ -385,11 +439,19 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         self.assertIsNone(host.gpu_residency)
         assert_states_equal(self, device_state(gpu), device_state(host), "startup")
         graph, static = self.capture(gpu)
-        assert_states_equal(self, device_state(gpu), device_state(host), "after capture")
+        assert_states_equal(
+            self, device_state(gpu), device_state(host), "after capture"
+        )
         generator = random.Random(1)
         self.run_decode(host, gpu, graph, static, generator, steps=17)
-        promotions = sum(gpu.snapshot_counters()["decode"][str(layer)]["promotions"] for layer in range(LAYERS))
-        host_promotions = sum(host.snapshot_counters()["decode"][str(layer)]["promotions"] for layer in range(LAYERS))
+        promotions = sum(
+            gpu.snapshot_counters()["decode"][str(layer)]["promotions"]
+            for layer in range(LAYERS)
+        )
+        host_promotions = sum(
+            host.snapshot_counters()["decode"][str(layer)]["promotions"]
+            for layer in range(LAYERS)
+        )
         self.assertGreater(promotions, 0)
         self.assertEqual(sum(gpu.gpu_residency.snapshot()["truncated_layers"]), 0)
         routes = _decode_routes(generator, 17)
@@ -397,7 +459,10 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
         graph.replay()
         self.assertEqual(
-            sum(gpu.snapshot_counters()["decode"][str(layer)]["promotions"] for layer in range(LAYERS)),
+            sum(
+                gpu.snapshot_counters()["decode"][str(layer)]["promotions"]
+                for layer in range(LAYERS)
+            ),
             host_promotions,
         )
 
@@ -410,22 +475,35 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         self.assertTrue(gpu.gpu_residency.host_pending)
         for tokens in (24, 6):
             routes = [
-                [[generator.randrange(EXPERTS), generator.randrange(EXPERTS)] for _ in range(tokens)]
+                [
+                    [generator.randrange(EXPERTS), generator.randrange(EXPERTS)]
+                    for _ in range(tokens)
+                ]
                 for _ in range(LAYERS)
             ]
-            routes = [[[a, b if b != a else (a + 1) % EXPERTS] for a, b in layer] for layer in routes]
+            routes = [
+                [[a, b if b != a else (a + 1) % EXPERTS] for a, b in layer]
+                for layer in routes
+            ]
             self.host_forward(host, routes, _prefill_batch(tokens))
             self.host_forward(gpu, routes, _prefill_batch(tokens))
             counts = {"global_physical_count": _counts(routes)}
             host.on_expert_distribution(_prefill_batch(tokens), counts)
             gpu.on_expert_distribution(_prefill_batch(tokens), counts)
-            assert_states_equal(self, device_state(gpu), device_state(host), f"prefill {tokens}")
+            assert_states_equal(
+                self, device_state(gpu), device_state(host), f"prefill {tokens}"
+            )
             assert_slot_rows(self, gpu, self.gpu_model, f"prefill {tokens}")
         self.assertFalse(gpu.gpu_residency.host_pending)
         self.run_decode(host, gpu, graph, static, generator, steps=9, start=20)
 
     def test_residence_margins_and_uneven_capacities_match_host_path(self):
-        options = dict(min_residence_forwards=6, benefit_ratio=0.25, promotion_sigmas=0.5, seed_scale=(1, 3, 9))
+        options = dict(
+            min_residence_forwards=6,
+            benefit_ratio=0.25,
+            promotion_sigmas=0.5,
+            seed_scale=(1, 3, 9),
+        )
         host = _manager(self.host_model, gpu=False, **options)
         gpu = _manager(self.gpu_model, gpu=True, **options)
         capacities = [cache.capacity for _, cache in sorted(gpu.caches.items())]
@@ -443,7 +521,9 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         generator = random.Random(7)
         self.run_decode(host, gpu, graph, static, generator, steps=4)
         self.assertTrue(gpu.gpu_residency.host_pending)
-        idle_counts = {"global_physical_count": torch.zeros(LAYERS, EXPERTS, dtype=torch.int64)}
+        idle_counts = {
+            "global_physical_count": torch.zeros(LAYERS, EXPERTS, dtype=torch.int64)
+        }
         host.on_expert_distribution(_idle_batch(), idle_counts)
         gpu.on_expert_distribution(_idle_batch(), idle_counts)
         self.assertFalse(gpu.gpu_residency.host_pending)
@@ -454,13 +534,19 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         counts = {"global_physical_count": _counts(routes)}
         host.on_expert_distribution(_prefill_batch(1), counts)
         gpu.on_expert_distribution(_prefill_batch(1), counts)
-        assert_states_equal(self, device_state(gpu), device_state(host), "after graph-served prefill")
+        assert_states_equal(
+            self, device_state(gpu), device_state(host), "after graph-served prefill"
+        )
         self.run_decode(host, gpu, graph, static, generator, steps=11, start=40)
         clock = host._boundary_clock
         updater = gpu.gpu_residency
         self.assertEqual(
             (int(updater.forwards), int(updater.tokens), int(updater.decode_forwards)),
-            (clock.forwards, clock.tokens_since_boundary, clock.decode_forwards_since_boundary),
+            (
+                clock.forwards,
+                clock.tokens_since_boundary,
+                clock.decode_forwards_since_boundary,
+            ),
         )
 
     def test_gpu_owned_slots_refuse_host_publication(self):
@@ -474,7 +560,11 @@ class TestGpuResidencyUpdate(unittest.TestCase):
     def test_decode_forward_hook_is_sync_free(self):
         gpu = _manager(self.gpu_model, gpu=True)
         graph, static = self.capture(gpu)
-        counts = {"global_physical_count": torch.zeros(LAYERS, EXPERTS, dtype=torch.int64, device="cuda")}
+        counts = {
+            "global_physical_count": torch.zeros(
+                LAYERS, EXPERTS, dtype=torch.int64, device="cuda"
+            )
+        }
         graph.replay()
         gpu.on_expert_distribution(_decode_batch(), counts)
         torch.cuda.synchronize()
@@ -501,7 +591,9 @@ class TestGpuResidencyUpdate(unittest.TestCase):
             host.on_expert_distribution(_decode_batch(), counts)
             gpu.on_expert_distribution(_decode_batch(), counts)
             after = _decode_promotions(host)
-            host_most_promotions = max(host_most_promotions, *(a - b for a, b in zip(after, before)))
+            host_most_promotions = max(
+                host_most_promotions, *(a - b for a, b in zip(after, before))
+            )
             before = after
             assert_slot_rows(self, gpu, self.gpu_model, f"capped step {step}")
             updater = gpu.gpu_residency
@@ -511,9 +603,14 @@ class TestGpuResidencyUpdate(unittest.TestCase):
                 for expert, slot in enumerate(mapping):
                     if slot >= 0:
                         self.assertEqual(slots[slot], expert)
-                self.assertEqual(sum(slot >= 0 for slot in mapping), sum(expert >= 0 for expert in slots))
+                self.assertEqual(
+                    sum(slot >= 0 for slot in mapping),
+                    sum(expert >= 0 for expert in slots),
+                )
         self.assertGreaterEqual(
-            host_most_promotions, 2, "the uncapped host path never promoted two experts into one layer"
+            host_most_promotions,
+            2,
+            "the uncapped host path never promoted two experts into one layer",
         )
         self.assertGreater(sum(gpu.gpu_residency.snapshot()["truncated_layers"]), 0)
 
@@ -524,11 +621,27 @@ class TestGpuResidencyUpdate(unittest.TestCase):
         assert_states_equal(self, device_state(gpu), expected)
         assert_slot_rows(self, gpu, self.gpu_model)
         cache = gpu.caches[0]
-        slot = cache.expert_to_slot.tolist().index(next(s for s in cache.expert_to_slot.tolist() if s >= 0))
+        slot = cache.expert_to_slot.tolist().index(
+            next(s for s in cache.expert_to_slot.tolist() if s >= 0)
+        )
         for field, perturb, restore in (
-            ("expert_to_slot", lambda: cache.expert_to_slot.__setitem__(slot, -1), lambda: cache.expert_to_slot.__setitem__(slot, expected[0]["expert_to_slot"][slot])),
-            ("slot_generations", lambda: cache.slot_generations.add_(1), lambda: cache.slot_generations.sub_(1)),
-            ("scores", lambda: gpu.residency_policies[0]._scores.add_(0.5), lambda: gpu.residency_policies[0]._scores.sub_(0.5)),
+            (
+                "expert_to_slot",
+                lambda: cache.expert_to_slot.__setitem__(slot, -1),
+                lambda: cache.expert_to_slot.__setitem__(
+                    slot, expected[0]["expert_to_slot"][slot]
+                ),
+            ),
+            (
+                "slot_generations",
+                lambda: cache.slot_generations.add_(1),
+                lambda: cache.slot_generations.sub_(1),
+            ),
+            (
+                "scores",
+                lambda: gpu.residency_policies[0]._scores.add_(0.5),
+                lambda: gpu.residency_policies[0]._scores.sub_(0.5),
+            ),
         ):
             perturb()
             with self.subTest(field=field), self.assertRaises(AssertionError):
@@ -541,7 +654,9 @@ class TestGpuResidencyUpdate(unittest.TestCase):
 
 
 IOM_DECAY = 0.98
-IOM = dict(update_decode_forwards=1, insert_on_miss=True, insert_on_miss_decay=IOM_DECAY)
+IOM = dict(
+    update_decode_forwards=1, insert_on_miss=True, insert_on_miss_decay=IOM_DECAY
+)
 
 
 class _InsertOnMissReference:
@@ -569,7 +684,10 @@ class _InsertOnMissReference:
             self.slots.append(slots)
         self.generations = [cache.slot_generations.tolist() for cache in self.caches]
         self.scores = torch.stack(
-            [manager.residency_policies[layer_id]._scores.detach().cpu() for layer_id in sorted(manager.caches)]
+            [
+                manager.residency_policies[layer_id]._scores.detach().cpu()
+                for layer_id in sorted(manager.caches)
+            ]
         ).to(torch.float32)
         self.pending = torch.zeros_like(self.scores)
         self.tokens = 0
@@ -594,7 +712,11 @@ class _InsertOnMissReference:
             want = [expert for expert in plan if mapping[expert] < 0]
             free = [slot for slot, expert in enumerate(slots) if expert < 0]
             victims = sorted(
-                (slot for slot, expert in enumerate(slots) if expert >= 0 and not routed[row, expert]),
+                (
+                    slot
+                    for slot, expert in enumerate(slots)
+                    if expert >= 0 and not routed[row, expert]
+                ),
                 key=lambda slot: (float(self.scores[row, slots[slot]]), -slots[slot]),
             )
             targets = free + victims
@@ -639,28 +761,72 @@ class _InsertOnMissReference:
     def assert_matches(self, test, manager, context):
         updater = manager.gpu_residency
         for row, cache in enumerate(self.caches):
-            test.assertEqual(cache.expert_to_slot.tolist(), self.mapping[row], f"{context} layer {row} mapping")
+            test.assertEqual(
+                cache.expert_to_slot.tolist(),
+                self.mapping[row],
+                f"{context} layer {row} mapping",
+            )
             test.assertEqual(
                 cache.slot_state.tolist(),
                 [READY if expert >= 0 else 0 for expert in self.slots[row]],
                 f"{context} layer {row} slot state",
             )
-            test.assertEqual(cache.slot_generations.tolist(), self.generations[row], f"{context} layer {row} generations")
             test.assertEqual(
-                updater.slot_to_expert[row, : cache.capacity].tolist(), self.slots[row], f"{context} layer {row} slots"
+                cache.slot_generations.tolist(),
+                self.generations[row],
+                f"{context} layer {row} generations",
             )
-        test.assertEqual(updater.insert_scores.cpu().tolist(), self.scores.tolist(), f"{context} scores")
-        test.assertEqual(updater.route_counts.cpu().tolist(), self.pending.tolist(), f"{context} route counts")
+            test.assertEqual(
+                updater.slot_to_expert[row, : cache.capacity].tolist(),
+                self.slots[row],
+                f"{context} layer {row} slots",
+            )
+        test.assertEqual(
+            updater.insert_scores.cpu().tolist(),
+            self.scores.tolist(),
+            f"{context} scores",
+        )
+        test.assertEqual(
+            updater.route_counts.cpu().tolist(),
+            self.pending.tolist(),
+            f"{context} route counts",
+        )
         snapshot = updater.snapshot()
-        test.assertEqual(snapshot["insertions"], self.insertions, f"{context} insertions")
-        test.assertEqual(snapshot["insertion_evictions"], self.evictions, f"{context} insertion evictions")
-        test.assertEqual(snapshot["insertion_truncated"], self.truncated, f"{context} insertion truncated")
+        test.assertEqual(
+            snapshot["insertions"], self.insertions, f"{context} insertions"
+        )
+        test.assertEqual(
+            snapshot["insertion_evictions"],
+            self.evictions,
+            f"{context} insertion evictions",
+        )
+        test.assertEqual(
+            snapshot["insertion_truncated"],
+            self.truncated,
+            f"{context} insertion truncated",
+        )
         decode = manager.snapshot_counters()["decode"]
         for row in range(LAYERS):
-            test.assertEqual(decode[str(row)]["hot_hits"], self.hits[row], f"{context} layer {row} hot hits")
-            test.assertEqual(decode[str(row)]["miss_rows"], self.misses[row], f"{context} layer {row} misses")
-            test.assertEqual(decode[str(row)]["promotions"], 0, f"{context} layer {row} decode promotions")
-            test.assertEqual(decode[str(row)]["insertions"], self.insertions[row], f"{context} layer {row} insertions")
+            test.assertEqual(
+                decode[str(row)]["hot_hits"],
+                self.hits[row],
+                f"{context} layer {row} hot hits",
+            )
+            test.assertEqual(
+                decode[str(row)]["miss_rows"],
+                self.misses[row],
+                f"{context} layer {row} misses",
+            )
+            test.assertEqual(
+                decode[str(row)]["promotions"],
+                0,
+                f"{context} layer {row} decode promotions",
+            )
+            test.assertEqual(
+                decode[str(row)]["insertions"],
+                self.insertions[row],
+                f"{context} layer {row} insertions",
+            )
 
 
 def _random_routes(generator):
@@ -693,9 +859,17 @@ class TestInsertOnMiss(unittest.TestCase):
             experts = torch.tensor(routes[layer][0])
             for name in NVFP4_STREAM_TENSORS:
                 source = getattr(source_layer, name)
-                expected = source[experts.to(source.device)].reshape(-1).view(torch.uint8).cpu()
+                expected = (
+                    source[experts.to(source.device)]
+                    .reshape(-1)
+                    .view(torch.uint8)
+                    .cpu()
+                )
                 actual = outputs[layer][name].view(torch.uint8).reshape(-1).cpu()
-                self.assertTrue(torch.equal(actual, expected), f"{context} layer {layer} {name} gathered rows")
+                self.assertTrue(
+                    torch.equal(actual, expected),
+                    f"{context} layer {layer} {name} gathered rows",
+                )
 
     def replay(self, manager, reference, graph, static, outputs, routes, context):
         reference.decode_forward(routes)
@@ -703,7 +877,9 @@ class TestInsertOnMiss(unittest.TestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assert_outputs(routes, outputs, context)
-        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+        manager.on_expert_distribution(
+            _decode_batch(), {"global_physical_count": _counts(routes)}
+        )
         reference.assert_matches(self, manager, context)
         assert_slot_rows(self, manager, self.model, context)
 
@@ -720,8 +896,12 @@ class TestInsertOnMiss(unittest.TestCase):
                 self.assertFalse(updater.insert_on_miss)
                 self.assertIsNone(updater.insert_tensors)
                 self.assertNotIn("insertions", updater.snapshot())
-                self.assertFalse(any("insertion" in name for name in manager._trace_sources()))
-                self.assertNotIn("insertions", manager.snapshot_counters()["decode"]["0"])
+                self.assertFalse(
+                    any("insertion" in name for name in manager._trace_sources())
+                )
+                self.assertNotIn(
+                    "insertions", manager.snapshot_counters()["decode"]["0"]
+                )
         stage = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE
         with stage.override(1), envs.SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY.override(0.99):
             manager = _manager(_model(), gpu=True, update_decode_forwards=1)
@@ -737,7 +917,9 @@ class TestInsertOnMiss(unittest.TestCase):
 
         self.assertEqual(int(InsertOnMissStage.OFF), 0)
         self.assertEqual(int(InsertOnMissStage.SCRATCH), 1)
-        with unittest.mock.patch.dict(os.environ, {"SGLANG_MOE_HOT_INSERT_ON_MISS": "1"}):
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_MOE_HOT_INSERT_ON_MISS": "1"}
+        ):
             envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.clear()
             with self.assertWarns(DeprecationWarning):
                 resolved = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get()
@@ -756,7 +938,9 @@ class TestInsertOnMiss(unittest.TestCase):
     def test_mode_requires_the_gpu_update_and_a_boundary_every_decode_forward(self):
         with self.assertRaisesRegex(ValueError, "SGLANG_MOE_GPU_RESIDENCY_UPDATE"):
             _manager(_model(), gpu=False, **IOM)
-        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1"):
+        with self.assertRaisesRegex(
+            ValueError, "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS=1"
+        ):
             _manager(_model(), gpu=True, **dict(IOM, update_decode_forwards=4))
         with self.assertRaisesRegex(ValueError, "decay"):
             _manager(_model(), gpu=True, **dict(IOM, insert_on_miss_decay=1.5))
@@ -773,7 +957,15 @@ class TestInsertOnMiss(unittest.TestCase):
         reference.assert_matches(self, manager, "after capture")
         generator = random.Random(3)
         for step in range(40):
-            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"step {step}")
+            self.replay(
+                manager,
+                reference,
+                graph,
+                static,
+                outputs,
+                _random_routes(generator),
+                f"step {step}",
+            )
         self.assertGreater(sum(reference.insertions), 0)
         self.assertGreater(sum(reference.evictions), 0)
 
@@ -784,11 +976,23 @@ class TestInsertOnMiss(unittest.TestCase):
         generator = random.Random(4)
         previous = None
         for step in range(12):
-            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"step {step}")
+            self.replay(
+                manager,
+                reference,
+                graph,
+                static,
+                outputs,
+                _random_routes(generator),
+                f"step {step}",
+            )
             if previous is not None:
                 for row, cache in enumerate(reference.caches):
                     for expert in previous[row]:
-                        self.assertGreaterEqual(int(cache.expert_to_slot[expert]), 0, f"step {step} layer {row} expert {expert}")
+                        self.assertGreaterEqual(
+                            int(cache.expert_to_slot[expert]),
+                            0,
+                            f"step {step} layer {row} expert {expert}",
+                        )
             previous = [list(plan) for plan in reference.plans]
         self.assertGreater(sum(reference.insertions), 0)
         self.assertEqual(sum(reference.truncated), 0)
@@ -803,7 +1007,11 @@ class TestInsertOnMiss(unittest.TestCase):
         outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
         self.assertGreaterEqual(len(residents), 3)
         self.assertTrue(outsiders)
-        self.assertEqual(len(residents), cache.capacity, "a free slot would take the miss before any victim")
+        self.assertEqual(
+            len(residents),
+            cache.capacity,
+            "a free slot would take the miss before any victim",
+        )
         lowest, second, miss = residents[0], residents[1], outsiders[0]
         scores = torch.full((EXPERTS,), 100.0)
         scores[lowest], scores[second] = 1.0, 2.0
@@ -812,16 +1020,26 @@ class TestInsertOnMiss(unittest.TestCase):
         routes = [[[lowest, miss]]] + others
         static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
         graph.replay()
-        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+        manager.on_expert_distribution(
+            _decode_batch(), {"global_physical_count": _counts(routes)}
+        )
         torch.cuda.synchronize()
         self.assertEqual(int(cache.expert_to_slot[miss]), -1)
         routes = [[[lowest, residents[2]]]] + others
         static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
         graph.replay()
         torch.cuda.synchronize()
-        self.assertEqual(int(cache.expert_to_slot[miss]), mapping[second], "the miss takes the lowest unrouted resident's slot")
+        self.assertEqual(
+            int(cache.expert_to_slot[miss]),
+            mapping[second],
+            "the miss takes the lowest unrouted resident's slot",
+        )
         self.assertEqual(int(cache.expert_to_slot[second]), -1)
-        self.assertEqual(int(cache.expert_to_slot[lowest]), mapping[lowest], "a routed resident is never evicted")
+        self.assertEqual(
+            int(cache.expert_to_slot[lowest]),
+            mapping[lowest],
+            "a routed resident is never evicted",
+        )
         assert_slot_rows(self, manager, self.model, "victim")
         self.assert_outputs(routes, outputs, "victim")
 
@@ -832,7 +1050,15 @@ class TestInsertOnMiss(unittest.TestCase):
         graph, static, outputs = self.capture(manager)
         generator = random.Random(5)
         for step in range(10):
-            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"step {step}")
+            self.replay(
+                manager,
+                reference,
+                graph,
+                static,
+                outputs,
+                _random_routes(generator),
+                f"step {step}",
+            )
         self.assertGreater(reference.truncated[0], 0)
         self.assertEqual(reference.insertions[0], 0)
         self.assertGreater(sum(reference.insertions[1:]), 0)
@@ -848,23 +1074,48 @@ class TestInsertOnMiss(unittest.TestCase):
         generator = random.Random(6)
 
         def prefill(tokens):
-            routes = [[generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)] for _ in range(LAYERS)]
+            routes = [
+                [generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)]
+                for _ in range(LAYERS)
+            ]
             for layer, streamer in sorted(manager.streamers.items()):
-                streamer.gather(torch.tensor(routes[layer], dtype=torch.int32, device="cuda"))
-            manager.on_expert_distribution(_prefill_batch(tokens), {"global_physical_count": _counts(routes)})
+                streamer.gather(
+                    torch.tensor(routes[layer], dtype=torch.int32, device="cuda")
+                )
+            manager.on_expert_distribution(
+                _prefill_batch(tokens), {"global_physical_count": _counts(routes)}
+            )
             torch.cuda.synchronize()
             return routes
 
         for step in range(4):
-            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"decode {step}")
+            self.replay(
+                manager,
+                reference,
+                graph,
+                static,
+                outputs,
+                _random_routes(generator),
+                f"decode {step}",
+            )
         self.assertTrue(updater.host_pending)
         pending_plans = [list(plan) for plan in reference.plans]
         reference.eager_prefill(prefill(6), 6)
         reference.assert_matches(self, manager, "short prefill")
         assert_slot_rows(self, manager, self.model, "short prefill")
-        self.assertTrue(any(pending_plans), "the flushed boundary had no misses to insert")
+        self.assertTrue(
+            any(pending_plans), "the flushed boundary had no misses to insert"
+        )
         for step in range(4, 8):
-            self.replay(manager, reference, graph, static, outputs, _random_routes(generator), f"decode {step}")
+            self.replay(
+                manager,
+                reference,
+                graph,
+                static,
+                outputs,
+                _random_routes(generator),
+                f"decode {step}",
+            )
         prefill(24)
         assert_slot_rows(self, manager, self.model, "boundary prefill")
         self.assertEqual(sum(updater.snapshot()["promotions"][0]), 0)
@@ -882,15 +1133,24 @@ class TestInsertOnMiss(unittest.TestCase):
                 for expert, slot in enumerate(mapping):
                     if slot >= 0:
                         self.assertEqual(slots[slot], expert)
-                self.assertEqual(sum(slot >= 0 for slot in mapping), sum(expert >= 0 for expert in slots))
-            manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+                self.assertEqual(
+                    sum(slot >= 0 for slot in mapping),
+                    sum(expert >= 0 for expert in slots),
+                )
+            manager.on_expert_distribution(
+                _decode_batch(), {"global_physical_count": _counts(routes)}
+            )
         self.assertGreater(sum(updater.snapshot()["insertions"]), inserted)
         self.assertEqual(sum(updater.snapshot()["promotions"][0]), 0)
 
     def test_decode_forward_hook_is_sync_free(self):
         manager = _manager(self.model, gpu=True, **IOM)
         graph, static, _ = self.capture(manager)
-        counts = {"global_physical_count": torch.zeros(LAYERS, EXPERTS, dtype=torch.int64, device="cuda")}
+        counts = {
+            "global_physical_count": torch.zeros(
+                LAYERS, EXPERTS, dtype=torch.int64, device="cuda"
+            )
+        }
         graph.replay()
         manager.on_expert_distribution(_decode_batch(), counts)
         torch.cuda.synchronize()
@@ -909,49 +1169,76 @@ class TestInsertOnMiss(unittest.TestCase):
         """A route served from the dedicated pull row is not a demand miss, so it is not inserted,
         and insertion never reads or writes the pull row (``capacity + scratch_rows``)."""
         from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.expert_prediction.serving.candidates import PrefetchCandidateBank
-        from sglang.srt.layers.moe.expert_prediction.serving.runtime import PrefetchPuller
+        from sglang.srt.layers.moe.expert_prediction.serving.candidates import (
+            PrefetchCandidateBank,
+        )
+        from sglang.srt.layers.moe.expert_prediction.serving.runtime import (
+            PrefetchPuller,
+        )
 
         with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL.override("true"):
             manager = _manager(self.model, gpu=True, **IOM)
         cache, streamer = manager.caches[0], manager.streamers[0]
         self.assertTrue(cache.reserves_prefetch_pull_row)
         bank = PrefetchCandidateBank(layer_ids=[0], width=1, device="cuda")
-        puller = PrefetchPuller(bank=bank, layer_ids=[0], hot_caches={0: cache}, device="cuda")
+        puller = PrefetchPuller(
+            bank=bank, layer_ids=[0], hot_caches={0: cache}, device="cuda"
+        )
         streamer.prefetch_puller = puller
         pull_row = puller.slot_for(0)
         self.assertEqual(pull_row, cache.capacity + cache.scratch_rows)
         manager.discard_graph_capture_routes()
         mapping = cache.expert_to_slot.tolist()
-        covered, missed = [expert for expert, slot in enumerate(mapping) if slot < 0][:2]
+        covered, missed = [expert for expert, slot in enumerate(mapping) if slot < 0][
+            :2
+        ]
         residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
         others = [[[0, 1]] for _ in range(LAYERS - 1)]
 
         def forward(routes):
             for layer, layer_streamer in sorted(manager.streamers.items()):
-                layer_streamer.gather(torch.tensor(routes[layer], dtype=torch.int32, device="cuda"))
+                layer_streamer.gather(
+                    torch.tensor(routes[layer], dtype=torch.int32, device="cuda")
+                )
             torch.cuda.synchronize()
-            manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+            manager.on_expert_distribution(
+                _decode_batch(), {"global_physical_count": _counts(routes)}
+            )
 
         scores = torch.zeros(1, EXPERTS, device="cuda")
         scores[0, covered] = 1.0
         bank.write(0, scores, expert_to_slot=cache.expert_to_slot)
         puller.post_target(0)
         forward([[[covered, missed]]] + others)
-        self.assertEqual(puller.stats[0].snapshot()[0], 1, "the covered route was not served from the pull row")
         self.assertEqual(
-            int(streamer.row_plan.count.item()), 1, "the covered route still took a demand scratch row"
+            puller.stats[0].snapshot()[0],
+            1,
+            "the covered route was not served from the pull row",
         )
-        pull_bytes = {name: tensor[pull_row].clone() for name, tensor in cache.tensors.items()}
+        self.assertEqual(
+            int(streamer.row_plan.count.item()),
+            1,
+            "the covered route still took a demand scratch row",
+        )
+        pull_bytes = {
+            name: tensor[pull_row].clone() for name, tensor in cache.tensors.items()
+        }
         # The next forward's first gather applies that forward's boundary; a later forward would be
         # free to evict the insertion again, which is ordinary victim churn, not this invariant.
         forward([[residents[:2]]] + others)
-        self.assertGreaterEqual(int(cache.expert_to_slot[missed]), 0, "the demand miss was not inserted")
-        self.assertEqual(int(cache.expert_to_slot[covered]), -1, "a pull-covered route was inserted")
+        self.assertGreaterEqual(
+            int(cache.expert_to_slot[missed]), 0, "the demand miss was not inserted"
+        )
+        self.assertEqual(
+            int(cache.expert_to_slot[covered]), -1, "a pull-covered route was inserted"
+        )
         self.assertTrue((cache.expert_to_slot < cache.capacity).all())
         self.assertEqual(manager.gpu_residency.snapshot()["insertions"][0], 1)
         for name, tensor in cache.tensors.items():
-            self.assertTrue(torch.equal(tensor[pull_row], pull_bytes[name]), f"pull row {name} was written")
+            self.assertTrue(
+                torch.equal(tensor[pull_row], pull_bytes[name]),
+                f"pull row {name} was written",
+            )
         assert_slot_rows(self, manager, self.model, "pull row")
 
     def test_reference_helper_fails_on_a_wrong_victim(self):
@@ -959,7 +1246,9 @@ class TestInsertOnMiss(unittest.TestCase):
         reference = _InsertOnMissReference(manager)
         reference.assert_matches(self, manager, "startup")
         row = 1
-        slot = next(slot for slot, expert in enumerate(reference.slots[row]) if expert >= 0)
+        slot = next(
+            slot for slot, expert in enumerate(reference.slots[row]) if expert >= 0
+        )
         reference.mapping[row][reference.slots[row][slot]] = -1
         reference.slots[row][slot] = -1
         with self.assertRaises(AssertionError):
@@ -1001,7 +1290,9 @@ class TestFusedInsert(unittest.TestCase):
             static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
             graph.replay()
             torch.cuda.synchronize()
-            manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+            manager.on_expert_distribution(
+                _decode_batch(), {"global_physical_count": _counts(routes)}
+            )
         return (
             manager,
             model,
@@ -1014,11 +1305,15 @@ class TestFusedInsert(unittest.TestCase):
         """Same routes, same seed, both paths: every byte of every cache tensor agrees, including
         the scratch rows and the slots this run never inserted into, and so does every piece of
         residency state and every insertion counter."""
-        eager_manager, eager_model, eager_bytes, eager_state, eager_counts = self._run(False)
+        eager_manager, eager_model, eager_bytes, eager_state, eager_counts = self._run(
+            False
+        )
         fused_manager, _, fused_bytes, fused_state, fused_counts = self._run(True)
         self.assertEqual(fused_state, eager_state)
         self.assertEqual(fused_counts, eager_counts)
-        self.assertGreater(sum(eager_counts["insertions"]), 0, "the run must actually insert")
+        self.assertGreater(
+            sum(eager_counts["insertions"]), 0, "the run must actually insert"
+        )
         for row, (eager_rows, fused_rows) in enumerate(zip(eager_bytes, fused_bytes)):
             self.assertEqual(sorted(fused_rows), sorted(eager_rows))
             for name, expected in eager_rows.items():
@@ -1043,7 +1338,13 @@ class TestFusedInsert(unittest.TestCase):
         generator = random.Random(3)
         for step in range(20):
             harness.replay(
-                manager, reference, graph, static, outputs, _random_routes(generator), f"step {step}"
+                manager,
+                reference,
+                graph,
+                static,
+                outputs,
+                _random_routes(generator),
+                f"step {step}",
             )
 
     def test_an_idle_lane_moves_no_bytes_and_a_masked_lane_is_not_read(self):
@@ -1052,7 +1353,9 @@ class TestFusedInsert(unittest.TestCase):
         deliberately poisoned source for every inactive lane: a kernel that loaded an idle lane
         would copy poison into a live slot."""
         lanes, slots, row_bytes = 6, 10, 777
-        rows = torch.randint(0, 256, (slots + lanes, row_bytes), dtype=torch.uint8, device="cuda")
+        rows = torch.randint(
+            0, 256, (slots + lanes, row_bytes), dtype=torch.uint8, device="cuda"
+        )
         before = rows.clone()
         sources = torch.full((lanes,), slots, dtype=torch.int64, device="cuda")
         sources[0] = slots + 1
@@ -1062,7 +1365,9 @@ class TestFusedInsert(unittest.TestCase):
         active[0] = 1
         insert_expert_rows(rows, sources, destinations, active)
         torch.cuda.synchronize()
-        self.assertTrue(torch.equal(rows[4], before[slots + 1]), "the active lane must copy its row")
+        self.assertTrue(
+            torch.equal(rows[4], before[slots + 1]), "the active lane must copy its row"
+        )
         untouched = [row for row in range(slots + lanes) if row != 4]
         self.assertTrue(
             torch.equal(rows[untouched], before[untouched]),
@@ -1110,7 +1415,9 @@ class TestFusedInsert(unittest.TestCase):
         model = _model()
         manager = _manager(model, gpu=True, **FUSED)
         updater = manager.gpu_residency
-        self.assertTrue(torch.equal(updater.insert_active, torch.zeros_like(updater.insert_active)))
+        self.assertTrue(
+            torch.equal(updater.insert_active, torch.zeros_like(updater.insert_active))
+        )
         before = [_cache_bytes(cache) for _, cache in sorted(manager.caches.items())]
         for row, tensors in enumerate(updater.insert_tensors):
             for rows_view in tensors:
@@ -1121,10 +1428,15 @@ class TestFusedInsert(unittest.TestCase):
                     updater.insert_active[row],
                 )
         torch.cuda.synchronize()
-        for row, (cache, expected) in enumerate(zip([c for _, c in sorted(manager.caches.items())], before)):
+        for row, (cache, expected) in enumerate(
+            zip([c for _, c in sorted(manager.caches.items())], before)
+        ):
             actual = _cache_bytes(cache)
             for name, rows in expected.items():
-                self.assertTrue(torch.equal(actual[name], rows), f"layer {row} {name} moved during warm-up")
+                self.assertTrue(
+                    torch.equal(actual[name], rows),
+                    f"layer {row} {name} moved during warm-up",
+                )
         assert_slot_rows(self, manager, model, "after warm-up")
 
     def test_a_malformed_plan_is_refused_instead_of_corrupting_a_row(self):
@@ -1141,7 +1453,9 @@ class TestFusedInsert(unittest.TestCase):
             insert_expert_rows(rows, lane, lane, active.cpu())
 
 
-DIRECT = dict(update_decode_forwards=1, insert_on_miss=2, insert_on_miss_decay=IOM_DECAY)
+DIRECT = dict(
+    update_decode_forwards=1, insert_on_miss=2, insert_on_miss_decay=IOM_DECAY
+)
 
 
 def _cache_bytes(cache):
@@ -1186,10 +1500,19 @@ class TestInsertOnMissDirect(unittest.TestCase):
             experts = torch.tensor(routes[layer][0])
             for name in NVFP4_STREAM_TENSORS:
                 source = getattr(source_layer, name)
-                expected = source[experts.to(source.device)].reshape(-1).view(torch.uint8).cpu()
+                expected = (
+                    source[experts.to(source.device)]
+                    .reshape(-1)
+                    .view(torch.uint8)
+                    .cpu()
+                )
                 actual = outputs[layer][name].view(torch.uint8).reshape(-1).cpu()
-                self.assertTrue(torch.equal(actual, expected), f"{context} layer {layer} {name}")
-        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+                self.assertTrue(
+                    torch.equal(actual, expected), f"{context} layer {layer} {name}"
+                )
+        manager.on_expert_distribution(
+            _decode_batch(), {"global_physical_count": _counts(routes)}
+        )
         torch.cuda.synchronize()
 
     # ----- shape of the allocation -----
@@ -1261,7 +1584,9 @@ class TestInsertOnMissDirect(unittest.TestCase):
             manager.gpu_residency.check_miss_plans()
 
         manager = _manager(_model(), gpu=True, **DIRECT)
-        next(iter(manager.streamers.values())).pinned_host_cache = SimpleNamespace(capacity=1)
+        next(iter(manager.streamers.values())).pinned_host_cache = SimpleNamespace(
+            capacity=1
+        )
         with self.assertRaisesRegex(ValueError, "pinned host cache"):
             manager.gpu_residency.check_miss_plans()
 
@@ -1290,7 +1615,10 @@ class TestInsertOnMissDirect(unittest.TestCase):
         delivered = torch.tensor([1], dtype=torch.int32, device="cuda")
         keep = torch.tensor([0.0], dtype=torch.float32, device="cuda")
         streamer.row_backend = SimpleNamespace(
-            name="exl3_ram_miss", delivered_count=delivered, keep=keep, cpu_experts=False,
+            name="exl3_ram_miss",
+            delivered_count=delivered,
+            keep=keep,
+            cpu_experts=False,
         )
         destinations = torch.zeros(updater.miss_rows, dtype=torch.long, device="cuda")
         live = torch.zeros(updater.miss_rows, dtype=torch.bool, device="cuda")
@@ -1300,7 +1628,9 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertTrue(torch.equal(updater.slot_to_expert[row], before))
         # The sentinel column is scratch space for masked scatter; real expert
         # columns must remain unchanged when the ack refuses the commit.
-        self.assertTrue(torch.equal(updater.mapping[row, :EXPERTS], mapping_before[:EXPERTS]))
+        self.assertTrue(
+            torch.equal(updater.mapping[row, :EXPERTS], mapping_before[:EXPERTS])
+        )
         self.assertEqual(updater.insertion_truncated[row].item(), 0)
         keep.fill_(1.0)
         updater._pending_commit = (row, streamer, destinations, live)
@@ -1318,8 +1648,12 @@ class TestInsertOnMissDirect(unittest.TestCase):
         updater.enabled.fill_(True)
         updater.route_counts[:, 3].fill_(4.0)
         before = updater.scores[:, 3].clone()
-        updater._promote = lambda *args: self.fail("EXL3 prefill cannot index dense host rows")
-        updater._apply(updater.enabled.clone(), updater.prefill_promotions, _PREFILL_PHASE)
+        updater._promote = lambda *args: self.fail(
+            "EXL3 prefill cannot index dense host rows"
+        )
+        updater._apply(
+            updater.enabled.clone(), updater.prefill_promotions, _PREFILL_PHASE
+        )
         self.assertTrue(bool((updater.scores[:, 3] > before).all()))
         self.assertTrue(bool((updater.route_counts == 0).all()))
         self.assertTrue(updater.victims_fresh)
@@ -1342,19 +1676,28 @@ class TestInsertOnMissDirect(unittest.TestCase):
         inserted_total = 0
         for step in range(30):
             routes = _random_routes(generator)
-            before = [cache.expert_to_slot.tolist() for _, cache in sorted(manager.caches.items())]
+            before = [
+                cache.expert_to_slot.tolist()
+                for _, cache in sorted(manager.caches.items())
+            ]
             self.step(manager, graph, static, outputs, routes, f"step {step}")
             for row, mapping in enumerate(before):
                 cache = manager.caches[sorted(manager.caches)[row]]
-                read = {mapping[expert] for expert in routes[row][0] if mapping[expert] >= 0}
+                read = {
+                    mapping[expert] for expert in routes[row][0] if mapping[expert] >= 0
+                }
                 wanted = [expert for expert in routes[row][0] if mapping[expert] < 0]
                 landed = [int(cache.expert_to_slot[expert]) for expert in wanted]
-                self.assertNotIn(-1, landed, f"step {step} layer {row}: a miss found no slot")
+                self.assertNotIn(
+                    -1, landed, f"step {step} layer {row}: a miss found no slot"
+                )
                 self.assertFalse(
                     read & set(landed),
                     f"step {step} layer {row}: copied into a row this forward reads",
                 )
-                self.assertEqual(len(set(landed)), len(landed), f"step {step} destinations collide")
+                self.assertEqual(
+                    len(set(landed)), len(landed), f"step {step} destinations collide"
+                )
                 for expert in routes[row][0]:
                     if mapping[expert] >= 0:
                         self.assertEqual(
@@ -1374,7 +1717,14 @@ class TestInsertOnMissDirect(unittest.TestCase):
         graph, static, outputs = self.capture(manager)
         generator = random.Random(12)
         for step in range(20):
-            self.step(manager, graph, static, outputs, _random_routes(generator), f"step {step}")
+            self.step(
+                manager,
+                graph,
+                static,
+                outputs,
+                _random_routes(generator),
+                f"step {step}",
+            )
             assert_slot_rows(self, manager, self.model, f"step {step}")
 
     def test_a_forward_changes_only_the_rows_it_inserts_into(self):
@@ -1386,7 +1736,8 @@ class TestInsertOnMissDirect(unittest.TestCase):
         for step in range(8):
             routes = _random_routes(generator)
             before = {
-                layer_id: _cache_bytes(cache) for layer_id, cache in sorted(manager.caches.items())
+                layer_id: _cache_bytes(cache)
+                for layer_id, cache in sorted(manager.caches.items())
             }
             mappings = {
                 layer_id: cache.expert_to_slot.tolist()
@@ -1422,11 +1773,20 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertGreaterEqual(len(residents), 4)
         self.assertTrue(outsiders)
         lowest, second, miss = residents[0], residents[1], outsiders[0]
-        self.assertEqual(len(residents), cache.capacity, "a free slot would take the miss first")
+        self.assertEqual(
+            len(residents), cache.capacity, "a free slot would take the miss first"
+        )
         others = [[[0, 1]] for _ in range(LAYERS - 1)]
         # Neutral step first, so neither candidate carries a route count into the ranking that
         # the boundary at the top of the scored step folds into its score.
-        self.step(manager, graph, static, outputs, [[[residents[2], residents[3]]]] + others, "warm")
+        self.step(
+            manager,
+            graph,
+            static,
+            outputs,
+            [[[residents[2], residents[3]]]] + others,
+            "warm",
+        )
         scores = torch.full((EXPERTS,), 100.0)
         # Far enough apart that the boundary's decay and route counts cannot reorder them.
         scores[lowest], scores[second] = 1.0, 50.0
@@ -1439,7 +1799,9 @@ class TestInsertOnMissDirect(unittest.TestCase):
             mapping[second],
             "routing the top-ranked victim must push the miss to the next entry",
         )
-        self.assertEqual(int(cache.expert_to_slot[lowest]), mapping[lowest], "a routed row survives")
+        self.assertEqual(
+            int(cache.expert_to_slot[lowest]), mapping[lowest], "a routed row survives"
+        )
         self.assertEqual(int(cache.expert_to_slot[second]), -1)
         assert_slot_rows(self, manager, self.model, "routed victim")
 
@@ -1455,7 +1817,9 @@ class TestInsertOnMissDirect(unittest.TestCase):
             fused = _manager(_model(), gpu=True, **DIRECT)
         for streamer in fused.streamers.values():
             streamer.row_planner.route_plan = unittest.mock.Mock(
-                side_effect=AssertionError("the fused manager fell back to the generic planner")
+                side_effect=AssertionError(
+                    "the fused manager fell back to the generic planner"
+                )
             )
         twins = [(manager, *self.capture(manager)) for manager in (generic, fused)]
         generator = random.Random(14)
@@ -1464,18 +1828,34 @@ class TestInsertOnMissDirect(unittest.TestCase):
             for manager, graph, static, outputs in twins:
                 self.step(manager, graph, static, outputs, routes, f"step {step}")
             context = f"step {step}"
-            assert_states_equal(self, device_state(fused), device_state(generic), context)
+            assert_states_equal(
+                self, device_state(fused), device_state(generic), context
+            )
             assert_slot_rows(self, fused, self.model, context)
-            self.assertEqual(fused.gpu_residency.snapshot(), generic.gpu_residency.snapshot(), context)
+            self.assertEqual(
+                fused.gpu_residency.snapshot(),
+                generic.gpu_residency.snapshot(),
+                context,
+            )
             for layer_id, streamer in generic.streamers.items():
                 twin = fused.streamers[layer_id]
-                self.assertEqual(twin.graph_counters.tolist(), streamer.graph_counters.tolist(), context)
                 self.assertEqual(
-                    twin.graph_unique_counters.tolist(), streamer.graph_unique_counters.tolist(), context
+                    twin.graph_counters.tolist(),
+                    streamer.graph_counters.tolist(),
+                    context,
                 )
-        self.assertGreater(sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed")
+                self.assertEqual(
+                    twin.graph_unique_counters.tolist(),
+                    streamer.graph_unique_counters.tolist(),
+                    context,
+                )
+        self.assertGreater(
+            sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed"
+        )
 
-    def test_fused_planner_with_the_miss_order_off_drives_direct_like_the_generic_planner(self):
+    def test_fused_planner_with_the_miss_order_off_drives_direct_like_the_generic_planner(
+        self,
+    ):
         """CPU experts off: the fused planner with the layer fusion's gather and commit kernels, with no miss keys,
         must leave every mapping, slot and counter bit-identical to the generic planner's."""
         from sglang.srt.environ import envs
@@ -1493,10 +1873,18 @@ class TestInsertOnMissDirect(unittest.TestCase):
             for manager, graph, static, outputs in twins:
                 self.step(manager, graph, static, outputs, routes, f"step {step}")
             context = f"step {step}"
-            assert_states_equal(self, device_state(fused), device_state(generic), context)
+            assert_states_equal(
+                self, device_state(fused), device_state(generic), context
+            )
             assert_slot_rows(self, fused, self.model, context)
-            self.assertEqual(fused.gpu_residency.snapshot(), generic.gpu_residency.snapshot(), context)
-        self.assertGreater(sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed")
+            self.assertEqual(
+                fused.gpu_residency.snapshot(),
+                generic.gpu_residency.snapshot(),
+                context,
+            )
+        self.assertGreater(
+            sum(fused.gpu_residency.snapshot()["insertions"]), 0, "no forward missed"
+        )
 
     def _miss_order_manager(self, model):
         from sglang.srt.environ import envs
@@ -1509,17 +1897,28 @@ class TestInsertOnMissDirect(unittest.TestCase):
             streamer._plan_miss_keys = updater.miss_keys[streamer.residency_row]
         return manager
 
-    def test_miss_keys_are_the_victim_ranking_key_of_the_window_the_boundary_closed(self):
+    def test_miss_keys_are_the_victim_ranking_key_of_the_window_the_boundary_closed(
+        self,
+    ):
         from sglang.srt.layers.moe.expert_residency import residency_rank_keys
-        from sglang.srt.layers.moe.expert_residency_gpu import _DECODE_PHASE, _ROUTED_RANK_OFFSET
+        from sglang.srt.layers.moe.expert_residency_gpu import (
+            _DECODE_PHASE,
+            _ROUTED_RANK_OFFSET,
+        )
 
         manager = _manager(self.model, gpu=True, **DIRECT)
         updater = manager.gpu_residency
         self.assertIsNone(updater.miss_keys)
         updater.route_counts[:, 4].fill_(2.0)
         updater.enable_miss_order()
-        expected = residency_rank_keys(updater.insert_scores) + (updater.route_counts > 0).long() * _ROUTED_RANK_OFFSET
-        self.assertTrue(torch.equal(updater.miss_keys, expected), "enable_miss_order fills the keys at once")
+        expected = (
+            residency_rank_keys(updater.insert_scores)
+            + (updater.route_counts > 0).long() * _ROUTED_RANK_OFFSET
+        )
+        self.assertTrue(
+            torch.equal(updater.miss_keys, expected),
+            "enable_miss_order fills the keys at once",
+        )
         self.assertEqual(tuple(updater.miss_keys.shape), (LAYERS, EXPERTS))
 
         updater.route_counts.zero_()
@@ -1528,11 +1927,23 @@ class TestInsertOnMissDirect(unittest.TestCase):
         routed = updater.route_counts > 0
         updater.enabled.fill_(True)
         updater.boundary_pending.fill_(True)
-        updater._apply(updater.boundary_pending & updater.enabled, updater.max_promotions, _DECODE_PHASE)
-        self.assertTrue(bool((updater.route_counts == 0).all()), "the boundary closed the window")
-        expected = residency_rank_keys(updater.insert_scores) + routed.long() * _ROUTED_RANK_OFFSET
+        updater._apply(
+            updater.boundary_pending & updater.enabled,
+            updater.max_promotions,
+            _DECODE_PHASE,
+        )
+        self.assertTrue(
+            bool((updater.route_counts == 0).all()), "the boundary closed the window"
+        )
+        expected = (
+            residency_rank_keys(updater.insert_scores)
+            + routed.long() * _ROUTED_RANK_OFFSET
+        )
         self.assertTrue(torch.equal(updater.miss_keys, expected))
-        self.assertTrue(bool((updater.miss_keys[:, 3] >= _ROUTED_RANK_OFFSET).all()), "routed from the closed window")
+        self.assertTrue(
+            bool((updater.miss_keys[:, 3] >= _ROUTED_RANK_OFFSET).all()),
+            "routed from the closed window",
+        )
         self.assertGreaterEqual(int(updater.miss_keys[1, 7]), _ROUTED_RANK_OFFSET)
         self.assertLess(int(updater.miss_keys[0, 7]), _ROUTED_RANK_OFFSET)
 
@@ -1541,28 +1952,54 @@ class TestInsertOnMissDirect(unittest.TestCase):
         shortlist entry (the coldest resident) and the lower-scored the next. Without the order, route order decides."""
         for ordered in (True, False):
             model = _model()
-            manager = self._miss_order_manager(model) if ordered else _manager(model, gpu=True, **DIRECT)
+            manager = (
+                self._miss_order_manager(model)
+                if ordered
+                else _manager(model, gpu=True, **DIRECT)
+            )
             updater = manager.gpu_residency
             graph, static, outputs = self.capture(manager)
             cache = manager.caches[0]
             mapping = cache.expert_to_slot.tolist()
             residents = [expert for expert, slot in enumerate(mapping) if slot >= 0]
             outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
-            self.assertEqual(len(residents), cache.capacity, "a free slot would take a miss first")
+            self.assertEqual(
+                len(residents), cache.capacity, "a free slot would take a miss first"
+            )
             self.assertGreaterEqual(len(outsiders), 2)
             coldest, next_coldest = residents[0], residents[1]
             low, high = outsiders[0], outsiders[1]
             others = [[[0, 1]] for _ in range(LAYERS - 1)]
-            self.step(manager, graph, static, outputs, [[[residents[2], residents[3]]]] + others, "warm")
+            self.step(
+                manager,
+                graph,
+                static,
+                outputs,
+                [[[residents[2], residents[3]]]] + others,
+                "warm",
+            )
             scores = torch.full((EXPERTS,), 100.0)
             scores[coldest], scores[next_coldest] = 1.0, 50.0
             scores[low], scores[high] = 20.0, 80.0
             updater.insert_scores[0].copy_(scores)
             torch.cuda.synchronize()
-            self.step(manager, graph, static, outputs, [[[low, high]]] + others, f"ordered={ordered}")
+            self.step(
+                manager,
+                graph,
+                static,
+                outputs,
+                [[[low, high]]] + others,
+                f"ordered={ordered}",
+            )
             first, second = (high, low) if ordered else (low, high)
-            self.assertEqual(int(cache.expert_to_slot[first]), mapping[coldest], f"ordered={ordered}")
-            self.assertEqual(int(cache.expert_to_slot[second]), mapping[next_coldest], f"ordered={ordered}")
+            self.assertEqual(
+                int(cache.expert_to_slot[first]), mapping[coldest], f"ordered={ordered}"
+            )
+            self.assertEqual(
+                int(cache.expert_to_slot[second]),
+                mapping[next_coldest],
+                f"ordered={ordered}",
+            )
             assert_slot_rows(self, manager, model, f"ordered={ordered}")
 
     def test_the_miss_order_keeps_direct_exact(self):
@@ -1574,18 +2011,27 @@ class TestInsertOnMissDirect(unittest.TestCase):
         generator = random.Random(17)
         for step in range(30):
             routes = _random_routes(generator)
-            before = [cache.expert_to_slot.tolist() for _, cache in sorted(manager.caches.items())]
+            before = [
+                cache.expert_to_slot.tolist()
+                for _, cache in sorted(manager.caches.items())
+            ]
             self.step(manager, graph, static, outputs, routes, f"step {step}")
             for layer, mapping in enumerate(before):
                 cache = manager.caches[sorted(manager.caches)[layer]]
                 flat = routes[layer][0]
                 read = {mapping[expert] for expert in flat if mapping[expert] >= 0}
-                landed = [int(cache.expert_to_slot[expert]) for expert in flat if mapping[expert] < 0]
+                landed = [
+                    int(cache.expert_to_slot[expert])
+                    for expert in flat
+                    if mapping[expert] < 0
+                ]
                 self.assertNotIn(-1, landed, f"step {step} layer {layer}")
                 self.assertFalse(read & set(landed), f"step {step} layer {layer}")
             assert_slot_rows(self, manager, model, f"step {step}")
         self.assertGreater(sum(manager.gpu_residency.snapshot()["insertions"]), 0)
-        self.assertEqual(sum(manager.gpu_residency.snapshot()["insertion_truncated"]), 0)
+        self.assertEqual(
+            sum(manager.gpu_residency.snapshot()["insertion_truncated"]), 0
+        )
 
     def test_the_miss_order_refuses_the_generic_planner(self):
         manager = _manager(self.model, gpu=True, **DIRECT)
@@ -1609,13 +2055,18 @@ class TestInsertOnMissDirect(unittest.TestCase):
         tokens = 2
         with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
             manager = _manager(
-                self.model, gpu=True, graph_gather_batch_size=tokens,
-                budget_bytes=56 * LAYERS * (EXPERTS - 2), **DIRECT,
+                self.model,
+                gpu=True,
+                graph_gather_batch_size=tokens,
+                budget_bytes=56 * LAYERS * (EXPERTS - 2),
+                **DIRECT,
             )
         updater = manager.gpu_residency
         verify = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
-            spec_info=SimpleNamespace(draft_token_num=tokens, is_draft_input=lambda: False),
+            spec_info=SimpleNamespace(
+                draft_token_num=tokens, is_draft_input=lambda: False
+            ),
             extend_num_tokens=tokens,
             batch_size=1,
         )
@@ -1628,7 +2079,10 @@ class TestInsertOnMissDirect(unittest.TestCase):
                 [generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)]
                 for _ in range(LAYERS)
             ]
-            before = [cache.expert_to_slot.tolist() for _, cache in sorted(manager.caches.items())]
+            before = [
+                cache.expert_to_slot.tolist()
+                for _, cache in sorted(manager.caches.items())
+            ]
             static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
             graph.replay()
             torch.cuda.synchronize()
@@ -1637,27 +2091,46 @@ class TestInsertOnMissDirect(unittest.TestCase):
                 flat = [expert for token in routes[layer] for expert in token]
                 for name in NVFP4_STREAM_TENSORS:
                     source = getattr(source_layer, name)
-                    expected = source[torch.tensor(flat).to(source.device)].reshape(-1).view(torch.uint8).cpu()
+                    expected = (
+                        source[torch.tensor(flat).to(source.device)]
+                        .reshape(-1)
+                        .view(torch.uint8)
+                        .cpu()
+                    )
                     actual = outputs[layer][name].view(torch.uint8).reshape(-1).cpu()
-                    self.assertTrue(torch.equal(actual, expected), f"{context} layer {layer} {name}")
+                    self.assertTrue(
+                        torch.equal(actual, expected), f"{context} layer {layer} {name}"
+                    )
                 cache = manager.caches[sorted(manager.caches)[layer]]
                 read = {mapping[expert] for expert in flat if mapping[expert] >= 0}
                 wanted = sorted({expert for expert in flat if mapping[expert] < 0})
                 landed = [int(cache.expert_to_slot[expert]) for expert in wanted]
-                self.assertNotIn(-1, landed, f"{context} layer {layer}: a miss found no slot")
-                self.assertFalse(read & set(landed), f"{context} layer {layer}: copied into a row it reads")
-                self.assertEqual(len(set(landed)), len(landed), f"{context} destinations collide")
+                self.assertNotIn(
+                    -1, landed, f"{context} layer {layer}: a miss found no slot"
+                )
+                self.assertFalse(
+                    read & set(landed),
+                    f"{context} layer {layer}: copied into a row it reads",
+                )
+                self.assertEqual(
+                    len(set(landed)), len(landed), f"{context} destinations collide"
+                )
                 for expert in set(flat) - set(wanted):
                     self.assertEqual(
-                        int(cache.expert_to_slot[expert]), mapping[expert],
+                        int(cache.expert_to_slot[expert]),
+                        mapping[expert],
                         f"{context} layer {layer}: a routed resident was evicted",
                     )
                 inserted_total += len(wanted)
-            manager.on_expert_distribution(verify, {"global_physical_count": _counts(routes)})
+            manager.on_expert_distribution(
+                verify, {"global_physical_count": _counts(routes)}
+            )
             manager.on_speculative_commit(generator.randint(1, tokens))
             torch.cuda.synchronize()
             assert_slot_rows(self, manager, self.model, context)
-            self.assertEqual(int(updater.forwards.item()), manager._boundary_clock.forwards, context)
+            self.assertEqual(
+                int(updater.forwards.item()), manager._boundary_clock.forwards, context
+            )
         self.assertGreater(inserted_total, 0, "no forward ever missed")
         self.assertEqual(sum(updater.snapshot()["insertion_truncated"]), 0)
         self.assertEqual(sum(updater.snapshot()["insertions"]), inserted_total)
@@ -1671,27 +2144,48 @@ class TestInsertOnMissDirect(unittest.TestCase):
         tokens, scale = 2, (0.01, 1, 1)
         floor = 2 * tokens * TOP_K
         manager = _manager(
-            self.model, gpu=True, seed_scale=scale, graph_gather_batch_size=tokens,
-            budget_bytes=56 * LAYERS * floor, **DIRECT,
+            self.model,
+            gpu=True,
+            seed_scale=scale,
+            graph_gather_batch_size=tokens,
+            budget_bytes=56 * LAYERS * floor,
+            **DIRECT,
         )
         capacities = [manager.caches[layer].capacity for layer in range(LAYERS)]
         self.assertEqual(capacities, [floor] * LAYERS)
-        best = sorted(range(EXPERTS), key=lambda expert: (-((expert * 7) % 5), expert))[:floor]
-        resident = {expert for expert, slot in enumerate(manager.caches[0].expert_to_slot.tolist()) if slot >= 0}
+        best = sorted(range(EXPERTS), key=lambda expert: (-((expert * 7) % 5), expert))[
+            :floor
+        ]
+        resident = {
+            expert
+            for expert, slot in enumerate(manager.caches[0].expert_to_slot.tolist())
+            if slot >= 0
+        }
         self.assertEqual(resident, set(best))
 
-    def test_misses_after_a_short_prefill_that_routed_every_resident_land_in_their_own_slots(self):
+    def test_misses_after_a_short_prefill_that_routed_every_resident_land_in_their_own_slots(
+        self,
+    ):
         """A replay after a boundary-less prefill that routed every resident must still copy each
         miss into its own slot, never all of them into slot 0."""
         manager = _manager(self.model, gpu=True, **DIRECT)
         graph, static, outputs = self.capture(manager)
 
         def eager_prefill(tokens, experts):
-            routes = [[[experts[(token * TOP_K + k) % len(experts)] for k in range(TOP_K)] for token in range(tokens)]
-                      for _ in range(LAYERS)]
+            routes = [
+                [
+                    [experts[(token * TOP_K + k) % len(experts)] for k in range(TOP_K)]
+                    for token in range(tokens)
+                ]
+                for _ in range(LAYERS)
+            ]
             for layer, streamer in sorted(manager.streamers.items()):
-                streamer.gather(torch.tensor(routes[layer], dtype=torch.int32, device="cuda"))
-            manager.on_expert_distribution(_prefill_batch(tokens), {"global_physical_count": _counts(routes)})
+                streamer.gather(
+                    torch.tensor(routes[layer], dtype=torch.int32, device="cuda")
+                )
+            manager.on_expert_distribution(
+                _prefill_batch(tokens), {"global_physical_count": _counts(routes)}
+            )
             torch.cuda.synchronize()
 
         eager_prefill(24, list(range(EXPERTS)))
@@ -1700,12 +2194,20 @@ class TestInsertOnMissDirect(unittest.TestCase):
         for step in range(3):
             routes = []
             for _, cache in sorted(manager.caches.items()):
-                absent = [expert for expert, slot in enumerate(cache.expert_to_slot.tolist()) if slot < 0]
-                self.assertGreaterEqual(len(absent), TOP_K, "the cache holds every expert; nothing can miss")
+                absent = [
+                    expert
+                    for expert, slot in enumerate(cache.expert_to_slot.tolist())
+                    if slot < 0
+                ]
+                self.assertGreaterEqual(
+                    len(absent), TOP_K, "the cache holds every expert; nothing can miss"
+                )
                 routes.append([absent[:TOP_K]])
             self.step(manager, graph, static, outputs, routes, f"verify {step}")
             assert_slot_rows(self, manager, self.model, f"verify {step}")
-        self.assertEqual(sum(manager.gpu_residency.snapshot()["insertion_truncated"]), 0)
+        self.assertEqual(
+            sum(manager.gpu_residency.snapshot()["insertion_truncated"]), 0
+        )
 
     def test_the_shortlist_is_ranked_before_the_first_replay(self):
         """`reset_after_capture` must leave a usable shortlist: the first replay's gather reads it
@@ -1719,7 +2221,11 @@ class TestInsertOnMissDirect(unittest.TestCase):
     def test_decode_forward_is_sync_free(self):
         manager = _manager(self.model, gpu=True, **DIRECT)
         graph, static, _ = self.capture(manager)
-        counts = {"global_physical_count": torch.zeros(LAYERS, EXPERTS, dtype=torch.int64, device="cuda")}
+        counts = {
+            "global_physical_count": torch.zeros(
+                LAYERS, EXPERTS, dtype=torch.int64, device="cuda"
+            )
+        }
         graph.replay()
         manager.on_expert_distribution(_decode_batch(), counts)
         torch.cuda.synchronize()
@@ -1751,22 +2257,41 @@ class TestInsertOnMissDirect(unittest.TestCase):
                 graph, static, outputs = self.capture(manager)
                 generator = random.Random(20 + stage)
                 for step in range(6):
-                    self.step(manager, graph, static, outputs, _random_routes(generator), f"s{step}")
+                    self.step(
+                        manager,
+                        graph,
+                        static,
+                        outputs,
+                        _random_routes(generator),
+                        f"s{step}",
+                    )
 
                 sources = manager._trace_sources()
                 snapshot = updater.snapshot()
-                for name in ("insertions", "insertion_evictions", "insertion_truncated"):
+                for name in (
+                    "insertions",
+                    "insertion_evictions",
+                    "insertion_truncated",
+                ):
                     published = sources[f"gpu_residency:{name}"]
                     self.assertIs(
                         published,
                         updater.insertion_counters()[name],
                         f"stage {stage}: the trace publishes a different tensor than snapshot reads",
                     )
-                    self.assertEqual(published.cpu().tolist(), snapshot[name], f"stage {stage} {name}")
+                    self.assertEqual(
+                        published.cpu().tolist(),
+                        snapshot[name],
+                        f"stage {stage} {name}",
+                    )
                 self.assertGreater(
-                    sum(snapshot["insertions"]), 0, f"stage {stage} inserted nothing to report"
+                    sum(snapshot["insertions"]),
+                    0,
+                    f"stage {stage} inserted nothing to report",
                 )
-                self.assertGreater(sum(sources["gpu_residency:insertions"].cpu().tolist()), 0)
+                self.assertGreater(
+                    sum(sources["gpu_residency:insertions"].cpu().tolist()), 0
+                )
                 # The per-layer decode counters are folded from the same device values.
                 decode = manager.snapshot_counters()["decode"]
                 self.assertEqual(

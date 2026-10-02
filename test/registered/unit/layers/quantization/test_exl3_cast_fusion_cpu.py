@@ -10,13 +10,23 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.quantization import exl3
-from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3LinearMethod, exl3_cast_fusion_mlp
+from sglang.srt.layers.quantization.exl3 import (
+    Exl3Config,
+    Exl3LinearMethod,
+    exl3_cast_fusion_mlp,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-CFG = {"quant_method": "exl3", "version": "1.4.2", "bits": 3.02, "head_bits": 6, "codebook": "mul1"}
+CFG = {
+    "quant_method": "exl3",
+    "version": "1.4.2",
+    "bits": 3.02,
+    "head_bits": 6,
+    "codebook": "mul1",
+}
 IN, OUT = 32, 16
 
 
@@ -44,7 +54,9 @@ def calls(monkeypatch):
         return torch.zeros(*x.shape[:-1], OUT, dtype=x.dtype)
 
     monkeypatch.setattr(exl3, "exl3_gemm_bs1", fused)
-    monkeypatch.setattr(exl3, "exl3_half_input", lambda x: x.reshape(1, -1).to(torch.float16))
+    monkeypatch.setattr(
+        exl3, "exl3_half_input", lambda x: x.reshape(1, -1).to(torch.float16)
+    )
     monkeypatch.setattr(exl3, "exl3_linear", unfused)
     return seen
 

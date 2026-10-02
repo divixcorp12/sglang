@@ -36,7 +36,9 @@ pytestmark = pytest.mark.skipif(
     reason="needs a GPU and SGLANG_EXL3_SRC (an exllamav3 checkout)",
 )
 
-EXL3_DIR = os.environ.get("DSV41_EXL3_DIR", "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw")
+EXL3_DIR = os.environ.get(
+    "DSV41_EXL3_DIR", "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"
+)
 LAYER = int(os.environ.get("DSV41_PROBE_LAYER", "3"))
 EXPERTS = list(range(0, 384, 32))  # 12 real experts -> 12 slots
 TOP_K = 6
@@ -53,7 +55,10 @@ def load_slot_rows(device, layer: int = LAYER, experts=EXPERTS) -> dict:
     layout = build_exl3_expert_layout(EXL3_DIR)
     fmt = Exl3ExpertFormat(layout, layer, direct=True)
     specs = {spec.name: spec for spec in fmt.tensor_specs(None)}
-    host = {name: torch.empty((len(experts),) + spec.row_shape, dtype=spec.dtype) for name, spec in specs.items()}
+    host = {
+        name: torch.empty((len(experts),) + spec.row_shape, dtype=spec.dtype)
+        for name, spec in specs.items()
+    }
     source = Exl3ShardRowSource.for_layer(layout, layer, fmt.segment_map(), direct=True)
     source.read(torch.tensor(experts, dtype=torch.long), host)
     return {name: tensor.to(device) for name, tensor in host.items()}
@@ -64,7 +69,9 @@ class SplitBuffers(msgspec.Struct):
 
     count: torch.Tensor  # int64 [slots + 1]
     weights: torch.Tensor  # fp16 [TOP_K]; index j = the j-th masked route in slot order
-    spill: torch.Tensor  # fp16 [TOP_K + 1]; scatter target, the last element absorbs unmasked routes
+    spill: (
+        torch.Tensor
+    )  # fp16 [TOP_K + 1]; scatter target, the last element absorbs unmasked routes
 
     @classmethod
     def empty(cls, slots: int, device) -> "SplitBuffers":
@@ -95,14 +102,41 @@ def launch(fused, x16, out, count, weight_sorted, det0, num_active: int = 6) -> 
 
     t = fused.tables
     fused.ext.exl3_moe(
-        x16, out, count, fused.token_sorted, weight_sorted,
-        fused.temp_state_g, fused.temp_state_u, fused.temp_intermediate_g, fused.temp_intermediate_u,
-        ACT_SILU, fused.bits["gate"], fused.bits["up"], fused.bits["down"],
-        t["gate_trellis"], t["gate_suh"], t["gate_svh"],
-        t["up_trellis"], t["up_suh"], t["up_svh"],
-        t["down_trellis"], t["down_suh"], t["down_svh"],
-        False, True, False, True, False, True,
-        ACT_LIMIT, num_active, fused.scratch, det0, 1, ROW_TILE, 16,
+        x16,
+        out,
+        count,
+        fused.token_sorted,
+        weight_sorted,
+        fused.temp_state_g,
+        fused.temp_state_u,
+        fused.temp_intermediate_g,
+        fused.temp_intermediate_u,
+        ACT_SILU,
+        fused.bits["gate"],
+        fused.bits["up"],
+        fused.bits["down"],
+        t["gate_trellis"],
+        t["gate_suh"],
+        t["gate_svh"],
+        t["up_trellis"],
+        t["up_suh"],
+        t["up_svh"],
+        t["down_trellis"],
+        t["down_suh"],
+        t["down_svh"],
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+        ACT_LIMIT,
+        num_active,
+        fused.scratch,
+        det0,
+        1,
+        ROW_TILE,
+        16,
     )
 
 
@@ -126,29 +160,67 @@ class SplitState(msgspec.Struct):
         )
 
 
-def split_run(fused, state: SplitState, x, weights, remap, hit, keep, *, between=None, num_active: int = 6):
+def split_run(
+    fused,
+    state: SplitState,
+    x,
+    weights,
+    remap,
+    hit,
+    keep,
+    *,
+    between=None,
+    num_active: int = 6,
+):
     """Resident launch, then missed launch, then one gather; ``between(stage)`` observes the buffers between steps."""
     fused.x16.copy_(x)
     # Placement from every route. keep = 1 here: the resident launch cannot know keep.
     ones = torch.ones(TOP_K, dtype=torch.int64, device=remap.device)
-    inv_order, weight_full, det = _ref_route_tables(remap, state.full_count, ones, weights, state.ones_keep)
+    inv_order, weight_full, det = _ref_route_tables(
+        remap, state.full_count, ones, weights, state.ones_keep
+    )
     split_route_tables(remap, weights, hit, state.resident)
     split_route_tables(remap, weights, ~hit, state.missed)
     fused.out.zero_()
     if between:
         between("tables", det=det)
-    launch(fused, fused.x16, fused.out, state.resident.count, state.resident.weights, det[0], num_active)
+    launch(
+        fused,
+        fused.x16,
+        fused.out,
+        state.resident.count,
+        state.resident.weights,
+        det[0],
+        num_active,
+    )
     if between:
         between("resident", det=det)
     # F has run by now: a dropped layer runs no missed expert (its rows may be half written).
     kept = (keep > 0).long()
     state.missed.count.mul_(kept)
-    launch(fused, fused.x16, fused.out, state.missed.count, state.missed.weights, det[0], num_active)
+    launch(
+        fused,
+        fused.x16,
+        fused.out,
+        state.missed.count,
+        state.missed.weights,
+        det[0],
+        num_active,
+    )
     if between:
         between("missed", det=det)
     torch.mul(det[2], kept, out=state.kind)
     s = fused.slots
-    fused.ext.exl3_moe_gather(fused.out, fused.scratch, remap, inv_order, det[1, :s], det[0, :s], state.kind[:s], weight_full)
+    fused.ext.exl3_moe_gather(
+        fused.out,
+        fused.scratch,
+        remap,
+        inv_order,
+        det[1, :s],
+        det[0, :s],
+        state.kind[:s],
+        weight_full,
+    )
     return fused.out
 
 
@@ -156,7 +228,9 @@ def _ref_route_tables(remap, expert_count, ones, weights, keep):
     """``exl3_fused_moe.route_tables``, the torch chain the fused route-tables kernel replaced (copied verbatim)."""
     expert_count.zero_().index_add_(0, remap, ones)
     order = torch.argsort(remap)
-    inv_order = torch.empty_like(order).scatter_(0, order, torch.arange(order.numel(), device=order.device))
+    inv_order = torch.empty_like(order).scatter_(
+        0, order, torch.arange(order.numel(), device=order.device)
+    )
     weight_sorted = (weights[order].float() * keep).to(torch.float16)
     # A dropped layer runs no expert: nothing reads rows that may be half written.
     expert_count.mul_((keep > 0).to(torch.int64))
@@ -176,7 +250,9 @@ def _unfused_run(fused, x, topk_weights, remap, keep, act_limit: float) -> torch
 
     fused.x16.copy_(x)
     ones = torch.ones(topk_weights.numel(), dtype=torch.int64, device=remap.device)
-    inv_order, weight_sorted, det = _ref_route_tables(remap, fused.expert_count, ones, topk_weights, keep)
+    inv_order, weight_sorted, det = _ref_route_tables(
+        remap, fused.expert_count, ones, topk_weights, keep
+    )
     fused.out.zero_()
     t = fused.tables
     fused.ext.exl3_moe(
@@ -248,7 +324,11 @@ def slot_rows():
     from sglang.srt.layers.quantization.exl3_ext import exl3_ext
 
     ext = exl3_ext()
-    missing = [n for n in ("exl3_moe", "exl3_moe_gather", "exl3_moe_max_concurrency") if not hasattr(ext, n)]
+    missing = [
+        n
+        for n in ("exl3_moe", "exl3_moe_gather", "exl3_moe_max_concurrency")
+        if not hasattr(ext, n)
+    ]
     assert not missing, f"extension lacks {missing}"
     return load_slot_rows(torch.device("cuda", torch.cuda.current_device()))
 
@@ -270,14 +350,27 @@ def _bench_module():
     import importlib.util
 
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "..", "..", "..", "analysis", "dsv41-drive", "resident-first", "split_launch_bench.py")
-    spec = importlib.util.spec_from_file_location("split_launch_bench", os.path.normpath(path))
+    path = os.path.join(
+        here,
+        "..",
+        "..",
+        "..",
+        "analysis",
+        "dsv41-drive",
+        "resident-first",
+        "split_launch_bench.py",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "split_launch_bench", os.path.normpath(path)
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-@pytest.mark.parametrize("layer_fusion", [False, True], ids=["torch_chain", "layer_fusion"])
+@pytest.mark.parametrize(
+    "layer_fusion", [False, True], ids=["torch_chain", "layer_fusion"]
+)
 def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
     device = slot_rows["w13_trellis"].device
     ref = _fused(slot_rows, device)
@@ -286,7 +379,9 @@ def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
     state = SplitState.empty(split.slots, device)
     hidden = slot_rows["w13_suh"].shape[-1]
     gen = torch.Generator().manual_seed(4242 + layer_fusion)
-    nan_bits = torch.full((), float("nan"), dtype=torch.float32).view(torch.int32).item()
+    nan_bits = (
+        torch.full((), float("nan"), dtype=torch.float32).view(torch.int32).item()
+    )
     cases = 0
     for keep_value in (1.0, 0.0):
         keep = torch.tensor([keep_value], device=device)
@@ -299,17 +394,23 @@ def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
 
                 # Poison every row the split must write, so a row it skips cannot pass on stale bytes.
                 split.scratch.fill_(float("nan"))
-                rank = torch.argsort(torch.argsort(remap))  # route -> its scratch row (slot order)
+                rank = torch.argsort(
+                    torch.argsort(remap)
+                )  # route -> its scratch row (slot order)
                 seen = {}
 
                 def between(stage, det):
                     torch.cuda.synchronize()
-                    assert torch.equal(split.out, torch.zeros_like(split.out)), f"{label}: exl3_moe wrote out ({stage})"
+                    assert torch.equal(split.out, torch.zeros_like(split.out)), (
+                        f"{label}: exl3_moe wrote out ({stage})"
+                    )
                     rows = _bits(split.scratch)
                     for route in range(TOP_K):
                         r = int(rank[route])
                         # ranks are the full-route placement, whatever the mask
-                        assert int(det[0, int(remap[route])]) == r, f"{label}: placement moved"
+                        assert int(det[0, int(remap[route])]) == r, (
+                            f"{label}: placement moved"
+                        )
                         written = not bool((rows[r] == nan_bits).all())
                         resident = bool(hit[route])
                         expect = {
@@ -317,12 +418,18 @@ def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
                             "resident": resident,
                             "missed": resident or keep_value > 0,
                         }[stage]
-                        assert written == expect, f"{label}: route {route} row {r} written={written} after {stage}"
+                        assert written == expect, (
+                            f"{label}: route {route} row {r} written={written} after {stage}"
+                        )
                         if written and keep_value > 0:
-                            assert torch.equal(rows[r], _bits(want_scratch)[r]), f"{label}: route {route} row differs"
+                            assert torch.equal(rows[r], _bits(want_scratch)[r]), (
+                                f"{label}: route {route} row differs"
+                            )
                     seen[stage] = True
 
-                got = split_run(split, state, x, weights, remap, hit, keep, between=between)
+                got = split_run(
+                    split, state, x, weights, remap, hit, keep, between=between
+                )
                 torch.cuda.synchronize()
                 assert seen.keys() == {"tables", "resident", "missed"}
                 assert torch.equal(_bits(got), _bits(want)), (
@@ -345,21 +452,38 @@ def test_full_weight_table_misplaces_masked_weights(slot_rows):
     x, _, remap, _ = _inputs(gen, split.slots, hidden, device, 0)
     weights = torch.tensor([0.30, 0.25, 0.20, 0.12, 0.08, 0.05], device=device)
     rank = torch.argsort(torch.argsort(remap))
-    hit = (rank % 2 == 1)  # routes in slot-order positions 1, 3, 5: each has an unmasked route before it
+    hit = (
+        rank % 2 == 1
+    )  # routes in slot-order positions 1, 3, 5: each has an unmasked route before it
     want = _unfused_run(ref, x, weights, remap, keep, ACT_LIMIT).clone()
 
     split.x16.copy_(x)
     ones = torch.ones(TOP_K, dtype=torch.int64, device=device)
-    inv_order, weight_full, det = _ref_route_tables(remap, state.full_count, ones, weights, keep)
+    inv_order, weight_full, det = _ref_route_tables(
+        remap, state.full_count, ones, weights, keep
+    )
     split_route_tables(remap, weights, hit, state.resident)
     split_route_tables(remap, weights, ~hit, state.missed)
     split.out.zero_()
     for bufs in (state.resident, state.missed):
-        launch(split, split.x16, split.out, bufs.count, weight_full, det[0])  # full table: the wrong one
+        launch(
+            split, split.x16, split.out, bufs.count, weight_full, det[0]
+        )  # full table: the wrong one
     s = split.slots
-    split.ext.exl3_moe_gather(split.out, split.scratch, remap, inv_order, det[1, :s], det[0, :s], det[2, :s], weight_full)
+    split.ext.exl3_moe_gather(
+        split.out,
+        split.scratch,
+        remap,
+        inv_order,
+        det[1, :s],
+        det[0, :s],
+        det[2, :s],
+        weight_full,
+    )
     torch.cuda.synchronize()
-    assert not torch.equal(split.out, want), "masked launches read their weights through the full-route start"
+    assert not torch.equal(split.out, want), (
+        "masked launches read their weights through the full-route start"
+    )
 
 
 def test_num_active_must_stay_six(slot_rows):
@@ -381,10 +505,14 @@ def test_num_active_must_stay_six(slot_rows):
     for _ in range(4):
         x, weights, remap, hit = _inputs(gen, split.slots, hidden, device, 4)
         want = _unfused_run(ref, x, weights, remap, keep, ACT_LIMIT).clone()
-        got = split_run(split, state, x, weights, remap, hit, keep, num_active=4).clone()
+        got = split_run(
+            split, state, x, weights, remap, hit, keep, num_active=4
+        ).clone()
         torch.cuda.synchronize()
         differs += not torch.equal(got, want)
-    print(f"num_active=4 on a 4+2 split: {differs}/4 route sets differ from the single launch")
+    print(
+        f"num_active=4 on a 4+2 split: {differs}/4 route sets differ from the single launch"
+    )
 
 
 if __name__ == "__main__":
@@ -411,7 +539,9 @@ def test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads(slot_rows):
     bench.copy_missed(L)
     bench.one(par, L)
     torch.cuda.synchronize()
-    assert not torch.equal(_bits(L.fused.out), _bits(want)), "poisoned rows did not reach the launch"
+    assert not torch.equal(_bits(L.fused.out), _bits(want)), (
+        "poisoned rows did not reach the launch"
+    )
     for n, t in L.pinned.items():
         t.copy_(true_bytes[n])
     bench.copy_missed(L)
@@ -427,7 +557,16 @@ def test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads(slot_rows):
 PART_HITS, PART_MISSES = 1 << 8, 1 << 9
 
 
-def _cpu_run(fused, x, weights, remap, keep, mask: int, partial: torch.Tensor, parts: int = PART_HITS) -> torch.Tensor:
+def _cpu_run(
+    fused,
+    x,
+    weights,
+    remap,
+    keep,
+    mask: int,
+    partial: torch.Tensor,
+    parts: int = PART_HITS,
+) -> torch.Tensor:
     lanes = torch.tensor([mask | parts], dtype=torch.int32, device=x.device)
     stride = partial.stride(1) if partial.dim() == 3 else 0
     cpu = (lanes, remap.to(torch.int32), partial.data_ptr(), stride)
@@ -435,7 +574,9 @@ def _cpu_run(fused, x, weights, remap, keep, mask: int, partial: torch.Tensor, p
 
 
 def _masked(weights, mask: int, *, keep_masked: bool) -> torch.Tensor:
-    picked = torch.tensor([bool(mask >> i & 1) for i in range(TOP_K)], device=weights.device)
+    picked = torch.tensor(
+        [bool(mask >> i & 1) for i in range(TOP_K)], device=weights.device
+    )
     return torch.where(picked == keep_masked, weights, torch.zeros_like(weights))
 
 
@@ -453,12 +594,19 @@ def test_cpu_lanes_with_a_zero_partial_are_the_gpu_run_without_them(slot_rows):
         for trial in range(TRIALS * 4):
             x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
             mask = int(torch.randint(1, 1 << TOP_K, (1,), generator=gen))
-            want = fused.run(x, _masked(weights, mask, keep_masked=False), remap, keep, ACT_LIMIT).clone()
+            want = fused.run(
+                x, _masked(weights, mask, keep_masked=False), remap, keep, ACT_LIMIT
+            ).clone()
             got = _cpu_run(fused, x, weights, remap, keep, mask, zero)
-            assert torch.equal(_bits(got), _bits(want)), f"keep={keep_value} mask={mask:#x} remap={remap.tolist()}"
+            assert torch.equal(_bits(got), _bits(want)), (
+                f"keep={keep_value} mask={mask:#x} remap={remap.tolist()}"
+            )
             if keep_value == 0.0:
                 # A dropped layer drops the CPU's share too.
-                assert torch.equal(_cpu_run(fused, x, weights, remap, keep, mask, seed), torch.zeros_like(want))
+                assert torch.equal(
+                    _cpu_run(fused, x, weights, remap, keep, mask, seed),
+                    torch.zeros_like(want),
+                )
 
 
 def test_the_cpu_partial_seeds_the_output(slot_rows):
@@ -474,10 +622,16 @@ def test_the_cpu_partial_seeds_the_output(slot_rows):
         x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
         mask = int(torch.randint(1, 1 << TOP_K, (1,), generator=gen))
         want = fused.run(x, weights, remap, keep, ACT_LIMIT).clone()
-        partial.copy_(fused.run(x, _masked(weights, mask, keep_masked=True), remap, keep, ACT_LIMIT))
+        partial.copy_(
+            fused.run(
+                x, _masked(weights, mask, keep_masked=True), remap, keep, ACT_LIMIT
+            )
+        )
         got = _cpu_run(fused, x, weights, remap, keep, mask, partial)
         scale = float(want.abs().max())
-        assert torch.allclose(got, want, rtol=1e-5, atol=1e-5 * scale), f"mask={mask:#x}"
+        assert torch.allclose(got, want, rtol=1e-5, atol=1e-5 * scale), (
+            f"mask={mask:#x}"
+        )
 
 
 def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
@@ -495,11 +649,19 @@ def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
     for trial in range(TRIALS):
         x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
         mask = int(torch.randint(1, 1 << TOP_K, (1,), generator=gen))
-        base = _cpu_run(fused, x, weights, remap, keep, mask, zero, PART_HITS | PART_MISSES)
-        for parts, seed in ((PART_HITS, 3.0), (PART_MISSES, 5.0), (PART_HITS | PART_MISSES, 8.0)):
+        base = _cpu_run(
+            fused, x, weights, remap, keep, mask, zero, PART_HITS | PART_MISSES
+        )
+        for parts, seed in (
+            (PART_HITS, 3.0),
+            (PART_MISSES, 5.0),
+            (PART_HITS | PART_MISSES, 8.0),
+        ):
             got = _cpu_run(fused, x, weights, remap, keep, mask, two, parts)
             scale = float(base.abs().max()) + seed
-            assert torch.allclose(got - base, torch.full_like(base, seed), atol=1e-5 * scale), (mask, parts)
+            assert torch.allclose(
+                got - base, torch.full_like(base, seed), atol=1e-5 * scale
+            ), (mask, parts)
 
 
 def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):
@@ -533,7 +695,11 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
             dropped = _cpu_run(fused, x, weights, remap, keep, mask, zero)
             err = float((got - want).norm() / want.norm())
             drop = float((dropped - want).norm() / want.norm())
-            print(f"mask={mask:#x}: relative error {err:.2e}, dropping the CPU routes {drop:.2e}")
-            assert err < 2e-2 and err < 0.1 * drop, f"mask={mask:#x}: {err:.2e} vs dropped {drop:.2e}"
+            print(
+                f"mask={mask:#x}: relative error {err:.2e}, dropping the CPU routes {drop:.2e}"
+            )
+            assert err < 2e-2 and err < 0.1 * drop, (
+                f"mask={mask:#x}: {err:.2e} vs dropped {drop:.2e}"
+            )
     finally:
         trait.free_layer(handle)

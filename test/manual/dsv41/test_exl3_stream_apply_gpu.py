@@ -16,7 +16,13 @@ pytestmark = pytest.mark.skipif(
     reason="needs a GPU and SGLANG_EXL3_SRC",
 )
 
-CFG = {"quant_method": "exl3", "version": "1.4.2", "bits": 3.02, "head_bits": 6, "codebook": "mul1"}
+CFG = {
+    "quant_method": "exl3",
+    "version": "1.4.2",
+    "bits": 3.02,
+    "head_bits": 6,
+    "codebook": "mul1",
+}
 NUM_EXPERTS = 6
 LAYER = 1
 
@@ -57,20 +63,36 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
     ExpertPinnedHostCache(streamer, max(2, len(hot_experts)))
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
-        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+        apply_router_weight_on_input=False,
+        swiglu_limit=10.0,
+        routed_scaling_factor=None,
     )
     generator = torch.Generator().manual_seed(tokens)
-    x = (torch.randn(tokens, HIDDEN, generator=generator) * 0.05).to(torch.bfloat16).cuda()
+    x = (
+        (torch.randn(tokens, HIDDEN, generator=generator) * 0.05)
+        .to(torch.bfloat16)
+        .cuda()
+    )
     if sorted(hot_experts) == [0, 1, 2]:
-        topk_ids = torch.tensor([sorted(hot_experts)] * tokens, dtype=torch.int32).cuda()
+        topk_ids = torch.tensor(
+            [sorted(hot_experts)] * tokens, dtype=torch.int32
+        ).cuda()
     elif max_gather_rows is not None:  # all six experts route: three chunks of two
         topk_ids = torch.tensor(
-            [[0, 1, 2], [3, 4, 5], [0, 3, 5], [1, 4, 2], [5, 0, 4]][:tokens], dtype=torch.int32
+            [[0, 1, 2], [3, 4, 5], [0, 3, 5], [1, 4, 2], [5, 0, 4]][:tokens],
+            dtype=torch.int32,
         ).cuda()
     else:
-        topk_ids = torch.stack(
-            [torch.randperm(NUM_EXPERTS, generator=generator)[:3] for _ in range(tokens)]
-        ).to(torch.int32).cuda()
+        topk_ids = (
+            torch.stack(
+                [
+                    torch.randperm(NUM_EXPERTS, generator=generator)[:3]
+                    for _ in range(tokens)
+                ]
+            )
+            .to(torch.int32)
+            .cuda()
+        )
     topk_weights = torch.rand(tokens, 3, generator=generator).cuda()
     dispatch = types.SimpleNamespace(
         hidden_states=x,
@@ -145,14 +167,22 @@ def test_many_experts_route_plan_equals_resident(tmp_path):
     ExpertPinnedHostCache(streamer, num_experts)
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
-        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+        apply_router_weight_on_input=False,
+        swiglu_limit=10.0,
+        routed_scaling_factor=None,
     )
     generator = torch.Generator().manual_seed(7)
-    topk_ids = torch.stack([torch.randperm(num_experts, generator=generator)[:topk] for _ in range(tokens)])
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, generator=generator)[:topk] for _ in range(tokens)]
+    )
     topk_ids = topk_ids.to(torch.int32)
     topk_ids[5, 3] = -1
     assert len(set(topk_ids[topk_ids >= 0].tolist())) > 64
-    x = (torch.randn(tokens, HIDDEN, generator=generator) * 0.05).to(torch.bfloat16).cuda()
+    x = (
+        (torch.randn(tokens, HIDDEN, generator=generator) * 0.05)
+        .to(torch.bfloat16)
+        .cuda()
+    )
     topk_ids = topk_ids.cuda()
     topk_weights = torch.rand(tokens, topk, generator=generator).cuda()
     dispatch = types.SimpleNamespace(
@@ -193,7 +223,9 @@ def test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands(monkeyp
 
     class _Streamer:
         background_read_stats = type("S", (), {"rows": 0})()
-        last_gather_stats = types.SimpleNamespace(miss_rows=0, host_read_rows=0, host_read_ns=0, host_split_ns=0)
+        last_gather_stats = types.SimpleNamespace(
+            miss_rows=0, host_read_rows=0, host_read_ns=0, host_split_ns=0
+        )
 
         def record_routes(self, routed):
             pass
@@ -205,14 +237,24 @@ def test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands(monkeyp
 
         def iter_gather_experts_host(self, source_ids, experts):
             for start in range(0, len(experts), 2):
-                torch.cuda._sleep(200_000_000)  # the chunk's gather: a long copy still running when yielded
+                torch.cuda._sleep(
+                    200_000_000
+                )  # the chunk's gather: a long copy still running when yielded
                 event = torch.cuda.Event()
                 event.record()
                 gather_done.append(event)
-                yield experts[start : start + 2], [0, 1][: len(experts[start : start + 2])], {}
+                yield (
+                    experts[start : start + 2],
+                    [0, 1][: len(experts[start : start + 2])],
+                    {},
+                )
 
-    monkeypatch.setattr(exl3_mod.EXL3_ROW_VIEWS, "select", lambda rows, experts, row_of_source: ({}, {}))
-    monkeypatch.setattr(exl3_mod, "exl3_moe_accumulate_planned", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        exl3_mod.EXL3_ROW_VIEWS, "select", lambda rows, experts, row_of_source: ({}, {})
+    )
+    monkeypatch.setattr(
+        exl3_mod, "exl3_moe_accumulate_planned", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: Exl3StreamTrace())
     layer = type("L", (), {"layer_id": 0})()
     x = torch.zeros((2, 8), dtype=torch.bfloat16, device="cuda")
@@ -222,8 +264,12 @@ def test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands(monkeyp
     Exl3MoEMethod._apply_streamed(layer, _Streamer(), x, weights, ids, None)
     assert len(gather_done) == 2 and exit_saw == [[True, True]]
 
+
 def _planned_inputs(experts=8, hidden=5120, inter=2304, tokens=40):
-    from sglang.srt.layers.quantization.exl3_ops import Exl3RoutePlan, random_exl3_tensors
+    from sglang.srt.layers.quantization.exl3_ops import (
+        Exl3RoutePlan,
+        random_exl3_tensors,
+    )
 
     w13 = [
         (
@@ -232,9 +278,14 @@ def _planned_inputs(experts=8, hidden=5120, inter=2304, tokens=40):
         )
         for e in range(experts)
     ]
-    w2 = [random_exl3_tensors(inter, hidden, 3, device="cuda", seed=3 * e + 2) for e in range(experts)]
+    w2 = [
+        random_exl3_tensors(inter, hidden, 3, device="cuda", seed=3 * e + 2)
+        for e in range(experts)
+    ]
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.05
-    topk_ids = torch.stack([torch.randperm(experts, device="cuda")[:6] for _ in range(tokens)]).to(torch.int32)
+    topk_ids = torch.stack(
+        [torch.randperm(experts, device="cuda")[:6] for _ in range(tokens)]
+    ).to(torch.int32)
     topk_weights = torch.rand(tokens, 6, device="cuda")
     return x, topk_ids, topk_weights, w13, w2, Exl3RoutePlan.from_topk(topk_ids)
 
@@ -245,11 +296,15 @@ def test_planned_chunk_body_never_syncs():
 
     x, _, topk_weights, w13, w2, plan = _planned_inputs()
     out = torch.zeros(x.shape[0], x.shape[1], device="cuda")
-    exl3_moe_accumulate_planned(out, x, topk_weights, plan, w13, w2, 10.0, plan.experts)  # warm the kernels
+    exl3_moe_accumulate_planned(
+        out, x, topk_weights, plan, w13, w2, 10.0, plan.experts
+    )  # warm the kernels
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        exl3_moe_accumulate_planned(out, x, topk_weights, plan, w13, w2, 10.0, plan.experts)
+        exl3_moe_accumulate_planned(
+            out, x, topk_weights, plan, w13, w2, 10.0, plan.experts
+        )
     finally:
         torch.cuda.set_sync_debug_mode("default")
 
@@ -264,7 +319,9 @@ def test_the_where_loop_does_sync():
     torch.cuda.set_sync_debug_mode("error")
     try:
         with pytest.raises(RuntimeError, match="synchroniz"):
-            exl3_moe_accumulate(out, x, topk_weights, topk_ids, w13, w2, 10.0, plan.experts)
+            exl3_moe_accumulate(
+                out, x, topk_weights, topk_ids, w13, w2, 10.0, plan.experts
+            )
     finally:
         torch.cuda.set_sync_debug_mode("default")
 

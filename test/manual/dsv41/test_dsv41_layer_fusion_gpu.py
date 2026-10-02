@@ -213,7 +213,9 @@ def _scenario(
     )
 
 
-def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int, cpu_lanes=None):
+def _streamer(
+    source_rows, miss_count, delivered, keep, leased: bool, width: int, cpu_lanes=None
+):
     backend = (
         SimpleNamespace(
             name="exl3_ram_miss",
@@ -221,7 +223,9 @@ def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int
             keep=torch.tensor([keep], dtype=torch.float32, device="cuda"),
             cpu_experts=cpu_lanes is not None,
             device_side=SimpleNamespace(
-                cpu_lanes=torch.tensor([cpu_lanes or 0], dtype=torch.int32, device="cuda")
+                cpu_lanes=torch.tensor(
+                    [cpu_lanes or 0], dtype=torch.int32, device="cuda"
+                )
             ),
         )
         if leased
@@ -325,7 +329,9 @@ def test_the_commit_leaves_cpu_lanes_unmapped_and_out_of_the_truncation_count():
         if delivered == 0:
             continue
         cpu = int(torch.randint(1, 1 << min(delivered, width), (1,), generator=gen))
-        cpu_bits = torch.tensor([bool(cpu >> i & 1) for i in range(width)], device="cuda")
+        cpu_bits = torch.tensor(
+            [bool(cpu >> i & 1) for i in range(width)], device="cuda"
+        )
         ref_streamer = _streamer(
             source_rows, miss_count, delivered - bin(cpu).count("1"), keep, True, width
         )

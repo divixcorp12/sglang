@@ -117,7 +117,9 @@ class Exl3FusedMoE:
     def _fused_route_tables(self, x, topk_weights, remap, keep, cpu=None):
         from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
 
-        cpu_lanes, dst_slots, cpu_out, cpu_part_stride = cpu if cpu is not None else (None, None, 0, 0)
+        cpu_lanes, dst_slots, cpu_out, cpu_part_stride = (
+            cpu if cpu is not None else (None, None, 0, 0)
+        )
         exl3_moe_route_tables(
             remap.contiguous(),
             topk_weights.contiguous(),
@@ -137,7 +139,9 @@ class Exl3FusedMoE:
         )
         return self.remap64, self.inv_order, self.weight_sorted, self.det
 
-    def run(self, x, topk_weights, remap, keep, act_limit: float, cpu=None) -> torch.Tensor:
+    def run(
+        self, x, topk_weights, remap, keep, act_limit: float, cpu=None
+    ) -> torch.Tensor:
         """x [1, H] any float dtype; topk_weights [6]; remap [6] slots, int32 or int64; keep fp32 [1].
 
         ``cpu`` = (cpu_lanes, dst_slots, cpu_out address, part stride), CPU experts only: the routes the CPU computed

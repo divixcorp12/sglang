@@ -45,7 +45,9 @@ EXPERT_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"
 # nobody runs. Override to the empty string to measure the unmirrored drive.
 # Three roots since 2026-09-28 (/mnt/nvme2 now x4): 101.7 vs 109.9 ms/token for two,
 # byte-identical, reads split ~33% per drive (analysis/dsv41-drive/mirror3/).
-EXPERT_MIRROR_DIRS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
+EXPERT_MIRROR_DIRS = (
+    "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
+)
 EXL3_SRC = f"{NVFP4_WORK}/exllamav3"
 EXL3_BUILD_DIR = f"{CC}/exl3-build"
 # The optimized EXL3 CPU kernel is validated on GCC 15; only its build uses this (not a global CXX).

@@ -26,7 +26,13 @@ from sglang.test.dsv41_fake_exl3 import HIDDEN, INTER, write_fake_exl3
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-CFG = {"quant_method": "exl3", "version": "1.4.2", "bits": 3.02, "head_bits": 6, "codebook": "mul1"}
+CFG = {
+    "quant_method": "exl3",
+    "version": "1.4.2",
+    "bits": 3.02,
+    "head_bits": 6,
+    "codebook": "mul1",
+}
 NUM_EXPERTS = 6
 
 
@@ -51,11 +57,19 @@ def _reference(ckpt, layer):
     for prefix, linears in (("w13", ("w1", "w3")), ("w2", ("w2",))):
         for kind in ("trellis", "suh", "svh"):
             rows[f"{prefix}_{kind}"] = torch.stack(
-                [torch.stack([get(e, w, kind) for w in linears]) for e in range(NUM_EXPERTS)]
+                [
+                    torch.stack([get(e, w, kind) for w in linears])
+                    for e in range(NUM_EXPERTS)
+                ]
             )
 
     def tensors(e, w):
-        return Exl3Tensors(trellis=get(e, w, "trellis"), suh=get(e, w, "suh"), svh=get(e, w, "svh"), mul1=True)
+        return Exl3Tensors(
+            trellis=get(e, w, "trellis"),
+            suh=get(e, w, "suh"),
+            svh=get(e, w, "svh"),
+            mul1=True,
+        )
 
     w13 = [(tensors(e, "w1"), tensors(e, "w3")) for e in range(NUM_EXPERTS)]
     w2 = [tensors(e, "w2") for e in range(NUM_EXPERTS)]
@@ -109,7 +123,9 @@ class FakeStreamer:
     def iter_gather_experts_host(self, source_ids, experts, chunk_rows=None):
         assert experts == source_ids.tolist()
         self.used_host_iterator = True
-        for chunk, row_of_source, rows in self.iter_gather_experts(source_ids, chunk_rows):
+        for chunk, row_of_source, rows in self.iter_gather_experts(
+            source_ids, chunk_rows
+        ):
             yield chunk.tolist(), row_of_source.tolist(), rows
 
 
@@ -168,8 +184,9 @@ def test_process_attaches_an_exl3_streamer(ckpt):
     ],
 )
 def test_process_rejects_a_mismatched_layer(ckpt, kwargs, env_dir, match):
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
-        str(ckpt) if env_dir else ""
+    with (
+        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
+        envs.SGLANG_DSV41_EXPERT_DIR.override(str(ckpt) if env_dir else ""),
     ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method, **kwargs)
@@ -181,22 +198,29 @@ def test_a_launch_without_a_pinned_tier_warns_once(ckpt, monkeypatch, caplog):
     from sglang.srt.layers.moe import exl3_expert_format
 
     monkeypatch.setattr(exl3_expert_format, "_WARNED_WITHOUT_PINNED_TIER", False)
-    with envs.SGLANG_DSV41_EXPERT_STREAM.override(True), envs.SGLANG_DSV41_EXPERT_DIR.override(
-        str(ckpt)
-    ), envs.SGLANG_MOE_PINNED_HOST_MB.override(0):
+    with (
+        envs.SGLANG_DSV41_EXPERT_STREAM.override(True),
+        envs.SGLANG_DSV41_EXPERT_DIR.override(str(ckpt)),
+        envs.SGLANG_MOE_PINNED_HOST_MB.override(0),
+    ):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
-        with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.exl3_expert_format"):
+        with caplog.at_level(
+            "WARNING", logger="sglang.srt.layers.moe.exl3_expert_format"
+        ):
             for _ in range(2):
                 layer = _layer(method, hidden=2 * HIDDEN)  # fails after the warning
                 with pytest.raises(ValueError, match="do not match the layer"):
                     method.process_weights_after_loading(layer)
-    warnings = [r for r in caplog.records if "SGLANG_MOE_PINNED_HOST_MB" in r.getMessage()]
+    warnings = [
+        r for r in caplog.records if "SGLANG_MOE_PINNED_HOST_MB" in r.getMessage()
+    ]
     assert len(warnings) == 1
 
 
 def _fake_accumulates(monkeypatch):
     monkeypatch.setattr(
-        exl3_mod, "exl3_moe_accumulate_planned",
+        exl3_mod,
+        "exl3_moe_accumulate_planned",
         functools.partial(exl3_ops.exl3_moe_accumulate_planned, linear=_fake_linear),
     )
 
@@ -214,19 +238,27 @@ def test_streamed_apply_matches_the_resident_loop(ckpt, monkeypatch, chunk_rows)
     layer._nvfp4_expert_streamer = streamer
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
-        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+        apply_router_weight_on_input=False,
+        swiglu_limit=10.0,
+        routed_scaling_factor=None,
     )
     generator = torch.Generator().manual_seed(0)
     x = torch.randn(4, HIDDEN, generator=generator).to(torch.bfloat16)
-    topk_ids = torch.tensor([[5, 0, 3], [3, 1, 5], [0, 4, 1], [5, 3, 4]], dtype=torch.int32)
+    topk_ids = torch.tensor(
+        [[5, 0, 3], [3, 1, 5], [0, 4, 1], [5, 3, 4]], dtype=torch.int32
+    )
     topk_weights = torch.rand(4, 3, generator=generator)
     topk = types.SimpleNamespace(topk_weights=topk_weights, topk_ids=topk_ids)
     dispatch = types.SimpleNamespace(hidden_states=x, topk_output=topk)
 
     got = method.apply(layer, dispatch).hidden_states
-    want = exl3_ops.exl3_moe_loop(x, topk_weights, topk_ids, w13, w2, 10.0, linear=_fake_linear)
+    want = exl3_ops.exl3_moe_loop(
+        x, topk_weights, topk_ids, w13, w2, 10.0, linear=_fake_linear
+    )
     assert torch.equal(got, want)
-    assert len(streamer.recorded) == 1 and torch.equal(streamer.recorded[0], topk_ids.reshape(-1))
+    assert len(streamer.recorded) == 1 and torch.equal(
+        streamer.recorded[0], topk_ids.reshape(-1)
+    )
     assert [e for chunk in streamer.chunks for e in chunk] == [0, 1, 3, 4, 5]
     assert all(len(chunk) <= chunk_rows for chunk in streamer.chunks)
     assert trace.stats()["vram_misses"] == 5
@@ -249,7 +281,9 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
     with envs.SGLANG_DSV41_EXPERT_STREAM.override(True):
         method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=True)
         layer = _layer(method)
-    streamer = types.SimpleNamespace(serves_graph_gather=lambda topk: topk.topk_ids.numel() <= 6)
+    streamer = types.SimpleNamespace(
+        serves_graph_gather=lambda topk: topk.topk_ids.numel() <= 6
+    )
     layer._nvfp4_expert_streamer = streamer
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
@@ -260,7 +294,10 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
 
     got = method.apply(layer, dispatch).hidden_states
     assert len(calls) == 1
-    assert all(got_arg is want for got_arg, want in zip(calls[0], (layer, streamer, x, topk_weights, topk_ids)))
+    assert all(
+        got_arg is want
+        for got_arg, want in zip(calls[0], (layer, streamer, x, topk_weights, topk_ids))
+    )
     assert calls[0][5] == 10.0
     assert torch.equal(got, torch.full_like(x, 1.5))  # the routed scale still applies
 
@@ -268,7 +305,9 @@ def test_apply_runs_graph_gathered_routes_in_graph(monkeypatch):
 def _select(x, logits, cfg):
     from sglang.srt.layers.moe.topk import select_experts
 
-    return select_experts(hidden_states=x, router_logits=logits, topk_config=cfg, layer_id=1)
+    return select_experts(
+        hidden_states=x, router_logits=logits, topk_config=cfg, layer_id=1
+    )
 
 
 @pytest.mark.parametrize("kind", ["standard", "packed", "bypassed"])
@@ -295,20 +334,30 @@ def test_apply_routes_every_topk_format_alike(monkeypatch, kind):
 
     def serves_graph_gather(topk):
         inspected.append(topk)
-        return isinstance(getattr(topk, "topk_ids", None), torch.Tensor)  # a bypassed output has no ids
+        return isinstance(
+            getattr(topk, "topk_ids", None), torch.Tensor
+        )  # a bypassed output has no ids
 
-    layer._nvfp4_expert_streamer = types.SimpleNamespace(serves_graph_gather=serves_graph_gather)
+    layer._nvfp4_expert_streamer = types.SimpleNamespace(
+        serves_graph_gather=serves_graph_gather
+    )
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
-        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+        apply_router_weight_on_input=False,
+        swiglu_limit=10.0,
+        routed_scaling_factor=None,
     )
     generator = torch.Generator().manual_seed(0)
     x = torch.randn(1, HIDDEN, generator=generator).to(torch.bfloat16)
     logits = torch.randn(1, NUM_EXPERTS, generator=generator)
-    cfg = TopKConfig(top_k=3, renormalize=True, torch_native=True)  # the fused router needs CUDA
+    cfg = TopKConfig(
+        top_k=3, renormalize=True, torch_native=True
+    )  # the fused router needs CUDA
     want = _select(x, logits, cfg)
     if kind == "bypassed":
-        topk = BypassedTopKOutput(hidden_states=x, router_logits=logits, topk_config=cfg)
+        topk = BypassedTopKOutput(
+            hidden_states=x, router_logits=logits, topk_config=cfg
+        )
     elif kind == "packed":
         topk = StandardTopKOutputPacked(*want, want.topk_ids)
     else:
@@ -316,9 +365,15 @@ def test_apply_routes_every_topk_format_alike(monkeypatch, kind):
 
     method.apply(layer, types.SimpleNamespace(hidden_states=x, topk_output=topk))
 
-    assert len(calls) == 1, "a bypassed output must reach the in-graph path, not fail before it"
-    assert torch.equal(calls[0][0], want.topk_weights) and torch.equal(calls[0][1], want.topk_ids)
-    assert len(inspected) == 1 and hasattr(inspected[0], "topk_ids")  # the converted value, once
+    assert len(calls) == 1, (
+        "a bypassed output must reach the in-graph path, not fail before it"
+    )
+    assert torch.equal(calls[0][0], want.topk_weights) and torch.equal(
+        calls[0][1], want.topk_ids
+    )
+    assert len(inspected) == 1 and hasattr(
+        inspected[0], "topk_ids"
+    )  # the converted value, once
     if kind != "bypassed":
         assert inspected[0] is topk  # standard formats are passed through untouched
 
@@ -332,7 +387,9 @@ def _routed_inputs(topk_ids, seed=0):
 
 
 @pytest.mark.parametrize("pinned_rows", [3, 6])  # evicting, and holding every expert
-def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeypatch, pinned_rows):
+def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(
+    ckpt, monkeypatch, pinned_rows
+):
     """Three chunks of at most 2 experts reuse one staging set, and a 3-row pinned
     tier evicts between them: each chunk's rows must be read through row_of_source.
     (No uncached case: that path pins host memory, which needs CUDA. The hot cache
@@ -348,12 +405,21 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
         method.process_weights_after_loading(layer)
     streamer = layer._nvfp4_expert_streamer
     streamer.format.max_gather_rows = 2
-    ExpertPinnedHostCache(streamer, pinned_rows, device="cpu", **streamer.format.pinned_tier_options(layer))
+    ExpertPinnedHostCache(
+        streamer,
+        pinned_rows,
+        device="cpu",
+        **streamer.format.pinned_tier_options(layer),
+    )
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
-        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+        apply_router_weight_on_input=False,
+        swiglu_limit=10.0,
+        routed_scaling_factor=None,
     )
-    topk_ids = torch.tensor([[5, 0, 3], [3, 1, 5], [0, 4, 1], [5, 3, 4]], dtype=torch.int32)
+    topk_ids = torch.tensor(
+        [[5, 0, 3], [3, 1, 5], [0, 4, 1], [5, 3, 4]], dtype=torch.int32
+    )
     x, topk_weights, dispatch = _routed_inputs(topk_ids)
     chunks = []
     iterate = streamer.iter_gather_experts
@@ -373,7 +439,9 @@ def test_a_real_streamer_spanning_chunks_matches_the_resident_loop(ckpt, monkeyp
     streamer.iter_gather_experts_host = recording_host
 
     got = method.apply(layer, dispatch).hidden_states
-    want = exl3_ops.exl3_moe_loop(x, topk_weights, topk_ids, w13, w2, 10.0, linear=_fake_linear)
+    want = exl3_ops.exl3_moe_loop(
+        x, topk_weights, topk_ids, w13, w2, 10.0, linear=_fake_linear
+    )
     assert chunks == [("host", [0, 1]), ("host", [3, 4]), ("host", [5])]
     assert torch.equal(got, want)
 
@@ -392,8 +460,11 @@ def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch)
         reference["w2_svh"][expert, 0, 0] = svh0
         w2[expert].svh[0] = svh0
     monkeypatch.setattr(
-        exl3_mod, "exl3_moe_accumulate_planned",
-        functools.partial(exl3_ops.exl3_moe_accumulate_planned, linear=_constant_linear),
+        exl3_mod,
+        "exl3_moe_accumulate_planned",
+        functools.partial(
+            exl3_ops.exl3_moe_accumulate_planned, linear=_constant_linear
+        ),
     )
     trace = Exl3StreamTrace()
     monkeypatch.setattr(exl3_mod, "get_exl3_stream_trace", lambda: trace)
@@ -404,12 +475,16 @@ def test_streamed_apply_accumulates_in_ascending_expert_order(ckpt, monkeypatch)
     layer._nvfp4_expert_streamer = streamer
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
-        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+        apply_router_weight_on_input=False,
+        swiglu_limit=10.0,
+        routed_scaling_factor=None,
     )
     topk_ids = torch.tensor([[2, 0, 1]], dtype=torch.int32)
     x, topk_weights, dispatch = _routed_inputs(topk_ids)
     got = method.apply(layer, dispatch).hidden_states
-    want = exl3_ops.exl3_moe_loop(x, topk_weights, topk_ids, w13, w2, 10.0, linear=_constant_linear)
+    want = exl3_ops.exl3_moe_loop(
+        x, topk_weights, topk_ids, w13, w2, 10.0, linear=_constant_linear
+    )
     assert float(got[0, 0]) == 0.0
     assert torch.equal(got, want)
 
@@ -427,7 +502,9 @@ def test_route_plan_all_dropped_routes_give_zeros(ckpt, monkeypatch):
     layer._nvfp4_expert_streamer = streamer
     layer.should_fuse_routed_scaling_factor_in_topk = False
     method.moe_runner_config = types.SimpleNamespace(
-        apply_router_weight_on_input=False, swiglu_limit=10.0, routed_scaling_factor=None
+        apply_router_weight_on_input=False,
+        swiglu_limit=10.0,
+        routed_scaling_factor=None,
     )
     topk_ids = torch.full((3, 3), -1, dtype=torch.int32)
     x, _, dispatch = _routed_inputs(topk_ids)
@@ -444,7 +521,10 @@ def test_row_views_are_cached_per_buffer_and_row():
         "w2_suh": ((1, 16), torch.float16),
         "w2_svh": ((1, 16), torch.float16),
     }
-    rows = {name: torch.zeros((3,) + shape, dtype=dtype) for name, (shape, dtype) in shapes.items()}
+    rows = {
+        name: torch.zeros((3,) + shape, dtype=dtype)
+        for name, (shape, dtype) in shapes.items()
+    }
     views = Exl3RowViews(max_buffers=1)
     w13, w2 = views.select(rows, [7, 2], [2, 0])
     again, _ = views.select(rows, [2], [0])

@@ -8,9 +8,8 @@ rows through served demands. Each test names the mutation it must fail under.
 import faulthandler
 
 import pytest
-import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
@@ -209,7 +208,9 @@ def test_a_negative_share_is_refused(tier):
 # ---- with the prefill fills: the native fill claims through the same rule ----
 
 
-def test_a_prefetch_fill_stops_at_the_share_and_an_ensure_fill_evicts_the_prefills_own_rows(tier):
+def test_a_prefetch_fill_stops_at_the_share_and_an_ensure_fill_evicts_the_prefills_own_rows(
+    tier,
+):
     """A layer's prefetch (fill_begin without fallback) claims until the share is full and no owned row can go; the
     chunk admissions after it (with fallback) evict the prefill's gathered rows, not decode's.
     Mutations: fill_begin claims through take_slot_locked (then the prefetch claims 3 and evicts 0, 1, 2); the stop

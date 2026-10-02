@@ -52,8 +52,19 @@ SPLITS = ((6, 0), (5, 1), (4, 2), (3, 3))
 
 def _parity_module():
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "..", "..", "..", "test", "manual", "dsv41", "test_exl3_moe_split_parity_cuda.py")
-    spec = importlib.util.spec_from_file_location("split_parity", os.path.normpath(path))
+    path = os.path.join(
+        here,
+        "..",
+        "..",
+        "..",
+        "test",
+        "manual",
+        "dsv41",
+        "test_exl3_moe_split_parity_cuda.py",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "split_parity", os.path.normpath(path)
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -83,17 +94,28 @@ def build_layers(par, real: dict, device, gen) -> list[Layer]:
     for layer in range(LAYERS):
         pick = [(layer * PHYS + i) % n_real for i in range(PHYS)]
         rows = {name: t[pick].clone() for name, t in real.items()}
-        fused = Exl3FusedMoE(rows, PHYS, hidden=hidden, inter=inter, top_k=TOP_K, device=device)
+        fused = Exl3FusedMoE(
+            rows, PHYS, hidden=hidden, inter=inter, top_k=TOP_K, device=device
+        )
         # Widen to SLOTS table entries: entry s holds row s % PHYS, so a route's slot scan covers production's width.
         for name, table in fused.tables.items():
-            fused.tables[name] = table[torch.arange(SLOTS, device=device) % PHYS].contiguous()
+            fused.tables[name] = table[
+                torch.arange(SLOTS, device=device) % PHYS
+            ].contiguous()
         fused.slots = SLOTS
         fused.expert_count = torch.zeros(SLOTS + 1, dtype=torch.int64, device=device)
         fused.det = torch.zeros((3, SLOTS + 1), dtype=torch.int64, device=device)
         # Six routes on distinct physical rows, spread over the table.
         residues = torch.randperm(PHYS, generator=gen)[:TOP_K].tolist()
         remap = torch.tensor(
-            [r + PHYS * int(torch.randint(0, (SLOTS - 1 - r) // PHYS + 1, (1,), generator=gen)) for r in residues]
+            [
+                r
+                + PHYS
+                * int(
+                    torch.randint(0, (SLOTS - 1 - r) // PHYS + 1, (1,), generator=gen)
+                )
+                for r in residues
+            ]
         )
         hits = {}
         for r, m in SPLITS:
@@ -105,7 +127,9 @@ def build_layers(par, real: dict, device, gen) -> list[Layer]:
                 fused=fused,
                 state=par.SplitState.empty(SLOTS, device),
                 rows=rows,
-                x=(torch.randn((1, hidden), generator=gen) * 0.5).to(device, torch.bfloat16),
+                x=(torch.randn((1, hidden), generator=gen) * 0.5).to(
+                    device, torch.bfloat16
+                ),
                 weights=torch.softmax(torch.randn(TOP_K, generator=gen), 0).to(device),
                 remap=remap.to(device, torch.int32),
                 keep=torch.ones(1, dtype=torch.float32, device=device),
@@ -127,7 +151,9 @@ def prepare_static(par, L: Layer, split):
     par.split_route_tables(remap, L.weights, ~hit, L.state.missed)
     L.state.missed.count.mul_((L.keep > 0).long())
     ones = torch.ones(TOP_K, dtype=torch.int64, device=L.x.device)
-    count = torch.zeros(SLOTS + 1, dtype=torch.int64, device=L.x.device).index_add_(0, remap, ones)
+    count = torch.zeros(SLOTS + 1, dtype=torch.int64, device=L.x.device).index_add_(
+        0, remap, ones
+    )
     L.state.kind.copy_((count > 0).long() * (L.keep > 0).long())
 
 
@@ -137,7 +163,9 @@ def add_pinned_sources(layers: list[Layer], split) -> None:
         if split not in L.sources:
             missed = (~L.hits[split]).nonzero().flatten()
             phys = sorted({int(p) for p in (L.remap[missed].long() % PHYS).tolist()})
-            pinned = {name: t[phys].to("cpu").pin_memory() for name, t in L.rows.items()}
+            pinned = {
+                name: t[phys].to("cpu").pin_memory() for name, t in L.rows.items()
+            }
             L.sources[split] = (phys, pinned)
         L.missed_phys, L.pinned = L.sources[split]
 
@@ -156,10 +184,21 @@ def overlap(par, L: Layer, split, side) -> None:
     two(par, L, split, torch_tables=False, between=lambda: main.wait_stream(side))
 
 
-def two(par, L: Layer, split, *, torch_tables: bool, launches=("res", "miss"), miss_active: int = 6, between=None):
+def two(
+    par,
+    L: Layer,
+    split,
+    *,
+    torch_tables: bool,
+    launches=("res", "miss"),
+    miss_active: int = 6,
+    between=None,
+):
     f, st = L.fused, L.state
     # Full-route placement: the fused route-tables kernel with keep = 1 (the resident launch precedes F).
-    remap64, inv_order, weight_full, det = f._fused_route_tables(L.x, L.weights, L.remap, st.ones_keep)
+    remap64, inv_order, weight_full, det = f._fused_route_tables(
+        L.x, L.weights, L.remap, st.ones_keep
+    )
     if torch_tables:
         hit = L.hits[split]
         par.split_route_tables(remap64, L.weights, hit, st.resident)
@@ -173,9 +212,20 @@ def two(par, L: Layer, split, *, torch_tables: bool, launches=("res", "miss"), m
         st.missed.count.mul_(kept)
         torch.mul(det[2], kept, out=st.kind)
     if "miss" in launches:
-        par.launch(f, f.x16, f.out, st.missed.count, st.missed.weights, det[0], miss_active)
+        par.launch(
+            f, f.x16, f.out, st.missed.count, st.missed.weights, det[0], miss_active
+        )
     s = f.slots
-    f.ext.exl3_moe_gather(f.out, f.scratch, remap64, inv_order, det[1, :s], det[0, :s], st.kind[:s], weight_full)
+    f.ext.exl3_moe_gather(
+        f.out,
+        f.scratch,
+        remap64,
+        inv_order,
+        det[1, :s],
+        det[0, :s],
+        st.kind[:s],
+        weight_full,
+    )
 
 
 def capture(fn, layers):
@@ -211,38 +261,71 @@ def main():
     layers = build_layers(par, real, device, gen)
     del real
     touched = LAYERS * TOP_K * row_bytes
-    print(f"row {row_bytes / 1e6:.2f} MB; per token {touched / 1e9:.2f} GB over {LAYERS} layers; "
-          f"allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
+    print(
+        f"row {row_bytes / 1e6:.2f} MB; per token {touched / 1e9:.2f} GB over {LAYERS} layers; "
+        f"allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB",
+        flush=True,
+    )
 
     side = torch.cuda.Stream()
     arms = {"one": capture(lambda L: one(par, L), layers)}
     for L in layers:
         prepare_static(par, L, SPLITS[1])
-    arms["tables_only"] = capture(lambda L: two(par, L, SPLITS[1], torch_tables=False, launches=()), layers)
+    arms["tables_only"] = capture(
+        lambda L: two(par, L, SPLITS[1], torch_tables=False, launches=()), layers
+    )
     for split in SPLITS[1:]:
         tag = f"{split[0]}+{split[1]}"
         for L in layers:
             prepare_static(par, L, split)
         # Static buffers are per layer and shared by every split's graph: capture each split's static graphs
         # only after its buffers are filled, and refill before timing (see the timed loop).
-        arms[f"two_static/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=False), layers)
-        arms[f"res_only/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=False, launches=("res",)), layers)
-        arms[f"miss_only/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=False, launches=("miss",)), layers)
-        arms[f"miss_wide/{tag}"] = capture(
-            lambda L, s=split: two(par, L, s, torch_tables=False, launches=("miss",), miss_active=s[1]), layers
+        arms[f"two_static/{tag}"] = capture(
+            lambda L, s=split: two(par, L, s, torch_tables=False), layers
         )
-        arms[f"two_torch/{tag}"] = capture(lambda L, s=split: two(par, L, s, torch_tables=True), layers)
+        arms[f"res_only/{tag}"] = capture(
+            lambda L, s=split: two(par, L, s, torch_tables=False, launches=("res",)),
+            layers,
+        )
+        arms[f"miss_only/{tag}"] = capture(
+            lambda L, s=split: two(par, L, s, torch_tables=False, launches=("miss",)),
+            layers,
+        )
+        arms[f"miss_wide/{tag}"] = capture(
+            lambda L, s=split: two(
+                par, L, s, torch_tables=False, launches=("miss",), miss_active=s[1]
+            ),
+            layers,
+        )
+        arms[f"two_torch/{tag}"] = capture(
+            lambda L, s=split: two(par, L, s, torch_tables=True), layers
+        )
         add_pinned_sources(layers, split)
         arms[f"copy_only/{tag}"] = capture(lambda L: copy_missed(L), layers)
-        arms[f"copy_then_one/{tag}"] = capture(lambda L: (copy_missed(L), one(par, L)), layers)
-        arms[f"copy_then_miss/{tag}"] = capture(
-            lambda L, s=split: (copy_missed(L), two(par, L, s, torch_tables=False, launches=("miss",))), layers
+        arms[f"copy_then_one/{tag}"] = capture(
+            lambda L: (copy_missed(L), one(par, L)), layers
         )
-        arms[f"overlap/{tag}"] = capture(lambda L, s=split: overlap(par, L, s, side), layers)
-    split_of = {name: tuple(int(v) for v in name.split("/")[1].split("+")) for name in arms if "/" in name}
+        arms[f"copy_then_miss/{tag}"] = capture(
+            lambda L, s=split: (
+                copy_missed(L),
+                two(par, L, s, torch_tables=False, launches=("miss",)),
+            ),
+            layers,
+        )
+        arms[f"overlap/{tag}"] = capture(
+            lambda L, s=split: overlap(par, L, s, side), layers
+        )
+    split_of = {
+        name: tuple(int(v) for v in name.split("/")[1].split("+"))
+        for name in arms
+        if "/" in name
+    }
 
     times = {name: [] for name in arms}
-    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start, stop = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
     names = list(arms)
     current = None
     for rep in range(args.replays + 10):
@@ -260,8 +343,14 @@ def main():
             if rep >= 10:
                 times[name].append(start.elapsed_time(stop) * 1e3)  # us per token
 
-    report = {"layers": LAYERS, "slots": SLOTS, "phys_rows_per_layer": PHYS, "row_bytes": row_bytes,
-              "replays": args.replays, "arms": {}}
+    report = {
+        "layers": LAYERS,
+        "slots": SLOTS,
+        "phys_rows_per_layer": PHYS,
+        "row_bytes": row_bytes,
+        "replays": args.replays,
+        "arms": {},
+    }
     base = statistics.median(times["one"])
     for name, ts in times.items():
         ts = sorted(ts)
@@ -276,9 +365,11 @@ def main():
         }
     report["implied_hbm_gbs_one"] = touched / (base * 1e-6) / 1e9
     for name, r in report["arms"].items():
-        print(f"{name:18s} {r['median_us_token']:9.1f} us/token  {r['median_us_layer']:7.2f} us/layer  "
-              f"extra {r['extra_us_layer_vs_one']:+7.2f} us/layer {r['extra_us_token_vs_one']:+8.1f} us/token  "
-              f"(p10 {r['p10_us_token']:.1f}, p90 {r['p90_us_token']:.1f})")
+        print(
+            f"{name:18s} {r['median_us_token']:9.1f} us/token  {r['median_us_layer']:7.2f} us/layer  "
+            f"extra {r['extra_us_layer_vs_one']:+7.2f} us/layer {r['extra_us_token_vs_one']:+8.1f} us/token  "
+            f"(p10 {r['p10_us_token']:.1f}, p90 {r['p90_us_token']:.1f})"
+        )
     print(f"implied bandwidth, one: {report['implied_hbm_gbs_one']:.0f} GB/s")
     if args.out:
         with open(args.out, "w") as f:

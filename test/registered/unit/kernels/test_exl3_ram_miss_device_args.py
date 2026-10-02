@@ -10,10 +10,19 @@ import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STATE_WORDS, ExpertStreamDevice
+from sglang.kernels.ops.moe.expert_stream_transport import (
+    PAGE_BYTES,
+    STATE_WORDS,
+    ExpertStreamDevice,
+)
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.expert_stream_sources import device_sources, host_sources, joined_text, wire_header
+from sglang.test.expert_stream_sources import (
+    device_sources,
+    host_sources,
+    joined_text,
+    wire_header,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -21,7 +30,9 @@ CSRC = Path(ram_miss.__file__).resolve().parents[2] / "jit" / "csrc" / "moe"
 
 
 def _runs(layers=2, experts=4):
-    return torch.zeros((layers, experts, ram_miss.STAGE_PIECES, 1, 2), dtype=torch.int32)
+    return torch.zeros(
+        (layers, experts, ram_miss.STAGE_PIECES, 1, 2), dtype=torch.int32
+    )
 
 
 def _device(layers=2, experts=4, page=None, **kwargs):
@@ -30,7 +41,12 @@ def _device(layers=2, experts=4, page=None, **kwargs):
     kwargs.setdefault("row_capacities", [5, 7][:layers] + [3] * max(0, layers - 2))
     kwargs.setdefault("timeout_ms", 10)
     return ExpertStreamDevice(
-        page, lease.new_lease_block(layers, pin=False), device="cpu", layers=layers, experts=experts, **kwargs
+        page,
+        lease.new_lease_block(layers, pin=False),
+        device="cpu",
+        layers=layers,
+        experts=experts,
+        **kwargs,
     )
 
 
@@ -61,16 +77,33 @@ def test_the_timeout_must_be_positive():
         _device(timeout_ms=0)
 
 
-@pytest.mark.parametrize("experts, capacity", [(ram_miss.RECORD_ID_MAX + 1, 5), (4, ram_miss.RECORD_ID_MAX + 1)])
+@pytest.mark.parametrize(
+    "experts, capacity",
+    [(ram_miss.RECORD_ID_MAX + 1, 5), (4, ram_miss.RECORD_ID_MAX + 1)],
+)
 def test_the_host_module_refuses_tables_its_records_cannot_carry(experts, capacity):
     # expert_stream_open checks this first, so no other argument needs to be a real table.
     empty = torch.empty(0, dtype=torch.int64)
     no_bytes = torch.empty(0, dtype=torch.uint8)
     with pytest.raises(RuntimeError, match="32767"):
         ram_miss._host_module().expert_stream_open(
-            torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.full((1, experts), -1, dtype=torch.int32), empty,
-            torch.zeros((1, experts), dtype=torch.int64), empty, empty, empty, empty, empty,
-            torch.tensor([capacity], dtype=torch.int64), "", "", 0, 0, 0, no_bytes, no_bytes,
+            torch.zeros(PAGE_BYTES, dtype=torch.uint8),
+            torch.full((1, experts), -1, dtype=torch.int32),
+            empty,
+            torch.zeros((1, experts), dtype=torch.int64),
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            torch.tensor([capacity], dtype=torch.int64),
+            "",
+            "",
+            0,
+            0,
+            0,
+            no_bytes,
+            no_bytes,
         )
 
 
@@ -85,8 +118,14 @@ def test_an_unpinned_page_is_refused_for_a_cuda_device():
     # Checked before any CUDA call: the kernels read it through UVA.
     with pytest.raises(ValueError, match="pinned"):
         ExpertStreamDevice(
-            torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(2, pin=False), device="cuda", layers=2,
-            experts=4, timeout_ms=10, piece_runs=_runs(), row_capacities=[5, 7],
+            torch.zeros(PAGE_BYTES, dtype=torch.uint8),
+            lease.new_lease_block(2, pin=False),
+            device="cuda",
+            layers=2,
+            experts=4,
+            timeout_ms=10,
+            piece_runs=_runs(),
+            row_capacities=[5, 7],
         )
 
 
@@ -101,7 +140,12 @@ def test_a_row_outside_the_streamed_layers_is_refused():
 
 def test_buffers_of_the_wrong_dtype_are_refused():
     dev = _device()
-    for name, dtype in (("planned", torch.int32), ("count", torch.int64), ("routes", torch.int32), ("dst_slots", torch.int64)):
+    for name, dtype in (
+        ("planned", torch.int32),
+        ("count", torch.int64),
+        ("routes", torch.int32),
+        ("dst_slots", torch.int64),
+    ):
         a = _args()
         a[name] = a[name].to(dtype)
         with pytest.raises(ValueError, match=name):
@@ -111,7 +155,9 @@ def test_buffers_of_the_wrong_dtype_are_refused():
 def test_the_device_sequence_continues_from_the_page_head():
     """A device built over a used page posts the next sequence, not 1, which the thread would never serve."""
     page = torch.zeros(PAGE_BYTES, dtype=torch.uint8)
-    page[ram_miss.WORDS["demand_head"] : ram_miss.WORDS["demand_head"] + 4].view(torch.int32)[0] = 7
+    page[ram_miss.WORDS["demand_head"] : ram_miss.WORDS["demand_head"] + 4].view(
+        torch.int32
+    )[0] = 7
     assert int(_device(page=page).state[STATE_WORDS["posted"]]) == 7
 
 
@@ -138,7 +184,9 @@ def _evaluate(node, known):
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         return -_evaluate(node.operand, known)
     if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
-        return _OPS[type(node.op)](_evaluate(node.left, known), _evaluate(node.right, known))
+        return _OPS[type(node.op)](
+            _evaluate(node.left, known), _evaluate(node.right, known)
+        )
     raise ValueError(f"unsupported constant expression {ast.dump(node)}")
 
 
@@ -149,9 +197,13 @@ def _constants(*paths: Path, known: dict[str, int] | None = None) -> dict[str, i
     found: dict[str, int] = {}
     pattern = r"^\s*(?:static\s+)?constexpr\s+[\w:]+\s+(k\w+)\s*=\s*([^;]+);"
     for name, expression in re.findall(pattern, joined_text(paths), re.MULTILINE):
-        assert name not in found, f"{name} is defined twice: the layout check cannot tell which one applies"
+        assert name not in found, (
+            f"{name} is defined twice: the layout check cannot tell which one applies"
+        )
         expression = re.sub(r"(?<=\d)[uU][lL]*\b", "", expression.strip())
-        found[name] = seeded[name] = _evaluate(ast.parse(expression, mode="eval").body, seeded)
+        found[name] = seeded[name] = _evaluate(
+            ast.parse(expression, mode="eval").body, seeded
+        )
     return found
 
 
@@ -219,7 +271,10 @@ PYTHON_WIRE = {
 def test_the_wire_header_is_the_python_layout():
     """The request page and the lease block: one C++ home, equal to Python, and nothing in it Python does not mirror."""
     assert _wire() == PYTHON_WIRE
-    assert PYTHON_WIRE["kLeaseRing"] == PYTHON_WIRE["kDemandRecords"] and PYTHON_WIRE["kLeaseLanes"] == PYTHON_WIRE["kMaxIds"]
+    assert (
+        PYTHON_WIRE["kLeaseRing"] == PYTHON_WIRE["kDemandRecords"]
+        and PYTHON_WIRE["kLeaseLanes"] == PYTHON_WIRE["kMaxIds"]
+    )
 
 
 def test_no_other_source_defines_a_wire_constant():
@@ -228,7 +283,9 @@ def test_no_other_source_defines_a_wire_constant():
     wire = set(_wire())
     for path in (*host_sources(), *device_sources()):
         clash = wire & set(_NAME.findall(path.read_text()))
-        assert not clash, f"{path.name} redefines wire constants {sorted(clash)}: define them only in lease_layout.h"
+        assert not clash, (
+            f"{path.name} redefines wire constants {sorted(clash)}: define them only in lease_layout.h"
+        )
 
 
 def test_the_device_state_words_are_the_python_state_words():
@@ -245,8 +302,14 @@ def test_the_device_state_words_are_the_python_state_words():
     assert {word: device[name] for name, word in state.items()} == STATE_WORDS
     assert device["kStateWords"] == len(STATE_WORDS)
     # The service's counters are read positionally into COUNTERS: a counter appended on one side only shifts every name.
-    counters = re.search(r"enum Counter : int \{(.*?)\bkCounterCount\b", joined_text(host_sources()), re.S)
-    assert len(re.findall(r"^\s*(k\w+)", re.sub(r"//[^\n]*", "", counters.group(1)), re.M)) == len(ram_miss.COUNTERS)
+    counters = re.search(
+        r"enum Counter : int \{(.*?)\bkCounterCount\b",
+        joined_text(host_sources()),
+        re.S,
+    )
+    assert len(
+        re.findall(r"^\s*(k\w+)", re.sub(r"//[^\n]*", "", counters.group(1)), re.M)
+    ) == len(ram_miss.COUNTERS)
 
 
 def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
@@ -263,13 +326,19 @@ def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
     def table(*rows):
         return SimpleNamespace(table=torch.tensor(rows, dtype=torch.int64))
 
-    good = ram_miss.stream_segment_map(table([0x10000, 0x40000, 32], [0x20000, 0x80000, 64]), tables, 0)
+    good = ram_miss.stream_segment_map(
+        table([0x10000, 0x40000, 32], [0x20000, 0x80000, 64]), tables, 0
+    )
     assert good.tolist() == [0, 1, 0, 0]
     with pytest.raises(ValueError, match="16-byte"):
-        ram_miss.stream_segment_map(table([0x10000, 0x40008, 32], [0x20000, 0x80000, 64]), tables, 0)
+        ram_miss.stream_segment_map(
+            table([0x10000, 0x40008, 32], [0x20000, 0x80000, 64]), tables, 0
+        )
     tables.row_bytes = torch.tensor([40, 64])
     with pytest.raises(ValueError, match="16-byte"):
-        ram_miss.stream_segment_map(table([0x10000, 0x40000, 40], [0x20000, 0x80000, 64]), tables, 0)
+        ram_miss.stream_segment_map(
+            table([0x10000, 0x40000, 40], [0x20000, 0x80000, 64]), tables, 0
+        )
 
 
 def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
@@ -283,23 +352,34 @@ def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
 
 def test_hot_sidecar_rejects_wrong_stride_before_kernel_launch():
     with pytest.raises(ValueError, match="hot_page"):
-        _device(layers=1, experts=384, hot_page=torch.zeros(16 * 128, dtype=torch.uint8))
+        _device(
+            layers=1, experts=384, hot_page=torch.zeros(16 * 128, dtype=torch.uint8)
+        )
 
 
 # Lease-chain PDL (on when the GPU supports it, LEASE_PROTOCOL.md "PDL"): the chain kernels, their source file, and
 # the Python method that launches each. C1 and CC are plain launches.
 PDL_KERNELS = {
     "exl3_ram_miss_post_kernel": ("lease_kernels.cuh", "expert_stream_post"),
-    "exl3_ram_miss_lease_stream_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_stream"),
-    "exl3_ram_miss_lease_copy_wait_kernel": ("row_copy_kernels.cuh", "expert_stream_lease_copy_wait"),
+    "exl3_ram_miss_lease_stream_kernel": (
+        "row_copy_kernels.cuh",
+        "expert_stream_lease_stream",
+    ),
+    "exl3_ram_miss_lease_copy_wait_kernel": (
+        "row_copy_kernels.cuh",
+        "expert_stream_lease_copy_wait",
+    ),
 }
 
 
 def _body_statements(text: str, kernel: str) -> list[str]:
     """The first statements of `kernel`'s body, comments dropped; asserts it is templated on `bool kUsePDL`."""
-    match = re.search(r"template <bool kUsePDL>\s*__global__[^{;]*?\b" + kernel + r"\([^)]*\)\s*\{", text)
+    match = re.search(
+        r"template <bool kUsePDL>\s*__global__[^{;]*?\b" + kernel + r"\([^)]*\)\s*\{",
+        text,
+    )
     assert match, f"{kernel} is not a template <bool kUsePDL> kernel"
-    body = text[match.end():]
+    body = text[match.end() :]
     lines = [re.sub(r"//.*", "", line).strip() for line in body.splitlines()]
     return [line for line in lines if line][:2]
 
@@ -317,11 +397,21 @@ def test_each_chain_kernel_waits_first_and_triggers_right_after_the_wait(kernel)
 
 
 @pytest.mark.parametrize("kernel", sorted(PDL_KERNELS))
-def test_each_chain_launcher_picks_the_instantiation_and_the_launch_attribute_from_one_flag(kernel):
+def test_each_chain_launcher_picks_the_instantiation_and_the_launch_attribute_from_one_flag(
+    kernel,
+):
     text = (CSRC / "expert_stream" / PDL_KERNELS[kernel][0]).read_text()
-    launch = re.search(r"\.enable_pdl\(use_pdl != 0\)\(\s*use_pdl != 0 \? " + kernel + r"<true> : " + kernel
-                       + r"<false>", text)
-    assert launch, f"{kernel}'s launcher does not launch {kernel}<use_pdl> with .enable_pdl(use_pdl)"
+    launch = re.search(
+        r"\.enable_pdl\(use_pdl != 0\)\(\s*use_pdl != 0 \? "
+        + kernel
+        + r"<true> : "
+        + kernel
+        + r"<false>",
+        text,
+    )
+    assert launch, (
+        f"{kernel}'s launcher does not launch {kernel}<use_pdl> with .enable_pdl(use_pdl)"
+    )
 
 
 def test_no_other_expert_stream_kernel_uses_pdl():
@@ -337,17 +427,26 @@ def test_the_copy_wait_is_cw_a_stream_wait_on_the_gate_and_a_plain_commit_kernel
     wait moves, compares against another value, or CC gains PDL (a programmatic edge would let it run before the wait
     node ends)."""
     text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
-    launcher = text[text.index("static void lease_copy_wait("):]
+    launcher = text[text.index("static void lease_copy_wait(") :]
     arm = launcher.index("exl3_ram_miss_lease_copy_wait_kernel<true>")
     wait = launcher.index("stream_wait_value32()(")
     commit = launcher.index("(exl3_ram_miss_lease_copy_commit_kernel, commit)")
     assert arm < wait < commit
-    call = launcher[wait:launcher.index(";", wait)]
-    assert "kLeaseCopyGate" in call and "kLeaseGateOpen" in call and "kStreamWaitValueGeq" in call, call
-    assert re.search(r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(exl3_ram_miss_lease_copy_commit_kernel", launcher)
-    body = text[text.index("void exl3_ram_miss_lease_copy_commit_kernel("):]
+    call = launcher[wait : launcher.index(";", wait)]
+    assert (
+        "kLeaseCopyGate" in call
+        and "kLeaseGateOpen" in call
+        and "kStreamWaitValueGeq" in call
+    ), call
+    assert re.search(
+        r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(exl3_ram_miss_lease_copy_commit_kernel",
+        launcher,
+    )
+    body = text[text.index("void exl3_ram_miss_lease_copy_commit_kernel(") :]
     body = body[: body.index("\n}\n")]
-    assert "PDL" not in body and "while" not in body and "__nanosleep" not in body, "the commit kernel must not wait"
+    assert "PDL" not in body and "while" not in body and "__nanosleep" not in body, (
+        "the commit kernel must not wait"
+    )
     assert '"cuStreamWaitValue32_v2"' in text
 
 
@@ -355,7 +454,7 @@ def test_cw_closes_the_gate_after_its_sm_reads_and_fences_before_the_copydone_lo
     """CW's SM reads of the kHitCopy lanes come before the gate close (behind the block barrier), and the Dekker fence
     separates the close from the CopyDone load. No Done word is left: nothing on the host waits for one."""
     text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
-    body = text[text.index("void exl3_ram_miss_lease_copy_wait_kernel("):]
+    body = text[text.index("void exl3_ram_miss_lease_copy_wait_kernel(") :]
     body = body[: body.index("\n}\n")]
     reads = body.index("copy_wait_read(")
     barrier = body.index("__syncthreads();", reads)
@@ -370,11 +469,19 @@ def test_the_python_side_passes_the_pdl_flag_to_exactly_the_chain_launchers():
     tree = ast.parse(Path(ram_miss.__file__).read_text())
     last_args = {}
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr.startswith("expert_stream_") and isinstance(node.func.value, ast.Call)
-                and getattr(node.func.value.func, "attr", None) == "_kernels"):
-            last_args.setdefault(node.func.attr, []).append(ast.unparse(node.args[-1]) if node.args else "")
-    pdl = {name for name, args in last_args.items() if any("lease_pdl" in a for a in args)}
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr.startswith("expert_stream_")
+            and isinstance(node.func.value, ast.Call)
+            and getattr(node.func.value.func, "attr", None) == "_kernels"
+        ):
+            last_args.setdefault(node.func.attr, []).append(
+                ast.unparse(node.args[-1]) if node.args else ""
+            )
+    pdl = {
+        name for name, args in last_args.items() if any("lease_pdl" in a for a in args)
+    }
     assert pdl == {launcher for _, launcher in PDL_KERNELS.values()}
     for name in pdl:
         assert last_args[name] == ["int(self.lease_pdl)"] * len(last_args[name]), name
@@ -405,8 +512,8 @@ def test_the_post_and_s_take_the_row_capacity_as_a_kernel_argument():
     lease_src = (CSRC / "expert_stream" / "lease_kernels.cuh").read_text()
     rows = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
     for text, params in ((lease_src, "PostParams"), (rows, "StreamParams")):
-        struct = text[text.index(f"struct {params} {{"):]
-        assert "uint32_t row_capacity;" in struct[:struct.index("};")], params
+        struct = text[text.index(f"struct {params} {{") :]
+        assert "uint32_t row_capacity;" in struct[: struct.index("};")], params
 
 
 def test_the_device_side_passes_each_rows_capacity_to_the_post_launch():
@@ -416,7 +523,10 @@ def test_the_device_side_passes_each_rows_capacity_to_the_post_launch():
     a = _args()
     for row in (0, 1):
         _post(dev, a, row=row)
-    assert [(name, args[22]) for name, args in recorder.calls] == [("expert_stream_post", 5), ("expert_stream_post", 7)]
+    assert [(name, args[22]) for name, args in recorder.calls] == [
+        ("expert_stream_post", 5),
+        ("expert_stream_post", 7),
+    ]
 
 
 def test_the_chain_has_no_hit_wait_and_the_post_fills_c1s_compaction():
@@ -424,7 +534,9 @@ def test_the_chain_has_no_hit_wait_and_the_post_fills_c1s_compaction():
     dev = _device()
     assert not hasattr(dev, "hit_wait") and not hasattr(dev, "claimed")
     text = (CSRC / "expert_stream" / "lease_kernels.cuh").read_text()
-    assert "hit_wait" not in text and "p.host_rows_1[go]" in text and "p.go_1[0]" in text
+    assert (
+        "hit_wait" not in text and "p.host_rows_1[go]" in text and "p.go_1[0]" in text
+    )
 
 
 def test_the_device_map_starts_empty_with_chain_one():
@@ -432,20 +544,31 @@ def test_the_device_map_starts_empty_with_chain_one():
     dev = _device()
     bank = dev.map_bank
     assert bool((bank["ram_slot"] == -1).all()) and bool((bank["staging"] == -1).all())
-    assert bank["map_chain"].tolist() == [1, 1] and bank["map_applied"].tolist() == [0, 0]
+    assert bank["map_chain"].tolist() == [1, 1] and bank["map_applied"].tolist() == [
+        0,
+        0,
+    ]
     assert bank["ce_ok"].tolist() == [0, 0] and bank["cpu_ok"].tolist() == [0, 0]
 
 
-@pytest.mark.parametrize("name", ["exl3_ram_miss_host.cpp", "exl3_ram_miss_host_instr.cpp"])
+@pytest.mark.parametrize(
+    "name", ["exl3_ram_miss_host.cpp", "exl3_ram_miss_host_instr.cpp"]
+)
 def test_the_exl3_host_file_is_only_bindings(name):
     """Every export body lives once, in HostExports or HostTestExports (expert_stream/host/ffi_exports.h,
     ffi_test_exports.h); each EXL3 file (one per build) only names its layout, reader and build. Red when a body grows
     back into one of them."""
     path = CSRC / name
     lines = path.read_text().splitlines()
-    bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]
+    bodies = [
+        line
+        for line in lines
+        if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")
+    ]
     assert not bodies, f"{path.name} defines functions: {bodies}"
-    assert len(lines) < 40, f"{path.name} has {len(lines)} lines; it should hold only bindings"
+    assert len(lines) < 40, (
+        f"{path.name} has {len(lines)} lines; it should hold only bindings"
+    )
 
 
 if __name__ == "__main__":

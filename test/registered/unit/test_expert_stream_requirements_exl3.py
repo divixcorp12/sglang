@@ -42,12 +42,18 @@ WINDOW_C_ENV = {
 
 
 # The residency the RAM-miss service needs: the in-graph updater at insert-on-miss stage 2.
-DIRECT = {"SGLANG_MOE_GPU_RESIDENCY_UPDATE": True, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 2}
+DIRECT = {
+    "SGLANG_MOE_GPU_RESIDENCY_UPDATE": True,
+    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 2,
+}
 
 
 @pytest.fixture
 def model_dir(tmp_path):
-    config = {"architectures": ["DeepseekV4ForCausalLM"], "quantization_config": {"quant_method": "exl3", "bits": 3.02}}
+    config = {
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "quantization_config": {"quant_method": "exl3", "bits": 3.02},
+    }
     (tmp_path / "config.json").write_text(json.dumps(config))
     return str(tmp_path)
 
@@ -101,7 +107,9 @@ def _under_window_c_env(env_changes, run):
 
 
 def _gate(args, **env_changes):
-    _under_window_c_env(env_changes, lambda: memory_hook.handle_offload_compatibility(args))
+    _under_window_c_env(
+        env_changes, lambda: memory_hook.handle_offload_compatibility(args)
+    )
 
 
 def test_the_exl3_method_selects_the_exl3_requirements(model_dir):
@@ -109,7 +117,9 @@ def test_the_exl3_method_selects_the_exl3_requirements(model_dir):
     assert expert_stream_requirements_for(args, args).label == "EXL3"
 
 
-def test_the_removed_doorbell_variable_does_not_gate_an_exl3_launch(model_dir, monkeypatch):
+def test_the_removed_doorbell_variable_does_not_gate_an_exl3_launch(
+    model_dir, monkeypatch
+):
     # Assert the resolved format first: a gate that silently fell back to NVFP4 proves nothing (divix01-run-protocol).
     monkeypatch.setenv("SGLANG_MOE_EXPERT_DOORBELL", "1")
     args = _launch(model_dir)
@@ -119,25 +129,82 @@ def test_the_removed_doorbell_variable_does_not_gate_an_exl3_launch(model_dir, m
 
 def test_window_c_launches_pass(model_dir):
     _gate(_launch(model_dir))  # dynamic residency, per-pass recorder
-    _gate(_launch(model_dir, expert_distribution_recorder_mode=None), SGLANG_MOE_HOT_DYNAMIC=False)  # static seeded arm
+    _gate(
+        _launch(model_dir, expert_distribution_recorder_mode=None),
+        SGLANG_MOE_HOT_DYNAMIC=False,
+    )  # static seeded arm
     _gate(_launch(model_dir), SGLANG_MOE_HOT_GPU_MB=0)  # pinned tier only
 
 
 @pytest.mark.parametrize(
     "launch_changes, env_changes, match",
     [
-        ({}, {"SGLANG_DSV41_EXPERT_STREAM": False}, "requires SGLANG_DSV41_EXPERT_STREAM=1"),
-        ({}, {"SGLANG_MOE_PINNED_HOST_MB": 0, "SGLANG_MOE_EXPERT_HOST_ARENA": True}, "SGLANG_MOE_EXPERT_HOST_ARENA"),
+        (
+            {},
+            {"SGLANG_DSV41_EXPERT_STREAM": False},
+            "requires SGLANG_DSV41_EXPERT_STREAM=1",
+        ),
+        (
+            {},
+            {"SGLANG_MOE_PINNED_HOST_MB": 0, "SGLANG_MOE_EXPERT_HOST_ARENA": True},
+            "SGLANG_MOE_EXPERT_HOST_ARENA",
+        ),
         ({"expert_distribution_recorder_mode": None}, {}, "stat or per_pass"),
-        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="full", bs=[1], max_bs=1), prefill=PhaseConfig(backend="disabled"))}, {}, "cannot run the Engram"),
-        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1, 2], max_bs=2), prefill=PhaseConfig(backend="disabled"))}, {}, "max batch size 1"),
-        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1), prefill=PhaseConfig(backend="breakable"))}, {}, "runs prefill eagerly"),
-        ({}, {"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": True}, "SGLANG_MOE_HOT_ASYNC_PROMOTIONS"),
-        ({"cuda_graph_config": CudaGraphConfig(decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1), prefill=PhaseConfig(backend="disabled"))}, {"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": True}, "SGLANG_MOE_HOT_ASYNC_PROMOTIONS"),
-        ({"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1}, {}, "DSpark"),
+        (
+            {
+                "cuda_graph_config": CudaGraphConfig(
+                    decode=PhaseConfig(backend="full", bs=[1], max_bs=1),
+                    prefill=PhaseConfig(backend="disabled"),
+                )
+            },
+            {},
+            "cannot run the Engram",
+        ),
+        (
+            {
+                "cuda_graph_config": CudaGraphConfig(
+                    decode=PhaseConfig(backend="breakable", bs=[1, 2], max_bs=2),
+                    prefill=PhaseConfig(backend="disabled"),
+                )
+            },
+            {},
+            "max batch size 1",
+        ),
+        (
+            {
+                "cuda_graph_config": CudaGraphConfig(
+                    decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1),
+                    prefill=PhaseConfig(backend="breakable"),
+                )
+            },
+            {},
+            "runs prefill eagerly",
+        ),
+        (
+            {},
+            {"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": True},
+            "SGLANG_MOE_HOT_ASYNC_PROMOTIONS",
+        ),
+        (
+            {
+                "cuda_graph_config": CudaGraphConfig(
+                    decode=PhaseConfig(backend="breakable", bs=[1], max_bs=1),
+                    prefill=PhaseConfig(backend="disabled"),
+                )
+            },
+            {"SGLANG_MOE_HOT_ASYNC_PROMOTIONS": True},
+            "SGLANG_MOE_HOT_ASYNC_PROMOTIONS",
+        ),
+        (
+            {"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1},
+            {},
+            "DSpark",
+        ),
     ],
 )
-def test_unsupported_launches_are_refused(model_dir, launch_changes, env_changes, match):
+def test_unsupported_launches_are_refused(
+    model_dir, launch_changes, env_changes, match
+):
     with pytest.raises(ValueError, match=match):
         _gate(_launch(model_dir, **launch_changes), **env_changes)
 
@@ -146,7 +213,13 @@ def test_dspark_with_a_decode_graph_names_the_remedy(model_dir):
     # The refusal message must name both the algorithm and the remedy so a launch
     # operator knows what to change, not just that something is wrong.
     with pytest.raises(ValueError) as exc_info:
-        _gate(_launch(model_dir, speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1))
+        _gate(
+            _launch(
+                model_dir,
+                speculative_algorithm="DSPARK",
+                cuda_graph_config=BREAKABLE_BS1,
+            )
+        )
     message = str(exc_info.value)
     assert "DSpark" in message
     assert "--cuda-graph-backend-decode disabled" in message
@@ -161,7 +234,11 @@ def test_dspark_speculation_passes_with_decode_disabled(model_dir):
 
 def test_breakable_decode_at_batch_size_one_passes(model_dir):
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1, disable_overlap_schedule=True))
+    _gate(
+        _launch(
+            model_dir, cuda_graph_config=BREAKABLE_BS1, disable_overlap_schedule=True
+        )
+    )
 
 
 MULTI_STREAM = "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP"
@@ -174,7 +251,9 @@ def multi_stream_unset(monkeypatch):
     monkeypatch.delenv(MULTI_STREAM)
 
 
-def test_breakable_decode_turns_the_alt_stream_overlap_off(model_dir, multi_stream_unset):
+def test_breakable_decode_turns_the_alt_stream_overlap_off(
+    model_dir, multi_stream_unset
+):
     # Captured in a breakable decode graph, DSV4's alt-stream overlap still yields wrong
     # output after the stats-stream re-fork (graph_parity on the truncated model: the
     # layer-0 MoE input differs at the first decode step); with it off, graph and eager
@@ -184,12 +263,16 @@ def test_breakable_decode_turns_the_alt_stream_overlap_off(model_dir, multi_stre
     assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
 
 
-def test_eager_launches_leave_the_alt_stream_overlap_alone(model_dir, multi_stream_unset):
+def test_eager_launches_leave_the_alt_stream_overlap_alone(
+    model_dir, multi_stream_unset
+):
     _gate(_launch(model_dir))
     assert not envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.is_set()
 
 
-def test_an_explicit_alt_stream_overlap_with_breakable_decode_is_refused(model_dir, monkeypatch):
+def test_an_explicit_alt_stream_overlap_with_breakable_decode_is_refused(
+    model_dir, monkeypatch
+):
     monkeypatch.setenv(MULTI_STREAM, "1")
     with pytest.raises(ValueError, match=MULTI_STREAM):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1))
@@ -198,13 +281,25 @@ def test_an_explicit_alt_stream_overlap_with_breakable_decode_is_refused(model_d
 
 
 def test_graph_gather_over_the_pinned_tier_needs_breakable_decode(model_dir):
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, **DIRECT)
+    _gate(
+        _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+        SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+        **DIRECT,
+    )
     with pytest.raises(ValueError, match="GRAPH_GATHER"):
         _gate(_launch(model_dir), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
     with pytest.raises(ValueError, match="PINNED_HOST_MB"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_PINNED_HOST_MB=0)
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+            SGLANG_MOE_PINNED_HOST_MB=0,
+        )
     with pytest.raises(ValueError, match="HOT_GPU_MB"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, SGLANG_MOE_HOT_GPU_MB=0)
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+            SGLANG_MOE_HOT_GPU_MB=0,
+        )
 
 
 def test_only_exl3_direct_graph_gather_admits_gpu_residency_update(model_dir):
@@ -215,9 +310,15 @@ def test_only_exl3_direct_graph_gather_admits_gpu_residency_update(model_dir):
     )
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **direct)
     with pytest.raises(ValueError, match="GPU_RESIDENCY_UPDATE"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1})
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            **{**direct, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1},
+        )
     with pytest.raises(ValueError, match="GPU_RESIDENCY_UPDATE"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False})
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            **{**direct, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False},
+        )
     with pytest.raises(ValueError, match="GRAPH_GATHER"):
         _gate(_launch(model_dir), **direct)
 
@@ -240,7 +341,10 @@ def test_graph_gather_needs_direct_residency(model_dir, off):
         SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
     )
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **direct)
-    with pytest.raises(ValueError, match="needs DIRECT residency.*GPU_RESIDENCY_UPDATE=1.*INSERT_ON_MISS_STAGE=2"):
+    with pytest.raises(
+        ValueError,
+        match="needs DIRECT residency.*GPU_RESIDENCY_UPDATE=1.*INSERT_ON_MISS_STAGE=2",
+    ):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**direct, **off})
 
 
@@ -250,7 +354,9 @@ def test_the_pre_parse_offload_pass_leaves_graph_checks_to_the_second_pass(model
     # CLI value (None for flag-only launches). That pass must not read it as eager
     # decode and refuse graph gather (the Task 16 option C Engine launch failed this way).
     raw = None
-    _gate(_launch(model_dir, cuda_graph_config=raw), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+    _gate(
+        _launch(model_dir, cuda_graph_config=raw), SGLANG_MOE_EXPERT_GRAPH_GATHER=True
+    )
 
 
 class _PipelineStopped(Exception):
@@ -271,7 +377,10 @@ def _resolution_pipeline_hooks(args, hook_for=None):
         names.append(name)
         if hook_for is not None and hook_for(name) is not None:
             hook_for(name)(server_args)
-        if name == "handle_offload_compatibility" and "handle_cuda_graph_config" in names:
+        if (
+            name == "handle_offload_compatibility"
+            and "handle_cuda_graph_config" in names
+        ):
             raise _PipelineStopped
 
     with patch.object(pipeline, "run_hook", record):
@@ -282,19 +391,25 @@ def _resolution_pipeline_hooks(args, hook_for=None):
     return names
 
 
-def test_the_resolution_pipeline_checks_offload_after_the_cuda_graph_config_is_parsed(model_dir):
+def test_the_resolution_pipeline_checks_offload_after_the_cuda_graph_config_is_parsed(
+    model_dir,
+):
     # The gate's graph checks run only once cuda_graph_config is parsed (they are skipped on
     # the raw CLI value), so they depend on the offload pass that follows handle_cuda_graph_config.
     # If a merge moved that pass before it, or dropped it, every EXL3 graph rule would go unchecked.
     names = _resolution_pipeline_hooks(_launch(model_dir))
-    offload = [i for i, name in enumerate(names) if name == "handle_offload_compatibility"]
+    offload = [
+        i for i, name in enumerate(names) if name == "handle_offload_compatibility"
+    ]
     assert names.count("handle_cuda_graph_config") == 1
     assert len(offload) == 2, names
     parsed_at = names.index("handle_cuda_graph_config")
     assert offload[0] < parsed_at < offload[1]
 
 
-def test_a_flag_only_full_decode_graph_launch_passes_pass_one_and_is_refused_after_parsing(model_dir):
+def test_a_flag_only_full_decode_graph_launch_passes_pass_one_and_is_refused_after_parsing(
+    model_dir,
+):
     # Flag-only launch: cuda_graph_config is None until handle_cuda_graph_config parses it. The
     # first offload pass must accept it; the second, on the parsed decode `full` config, must refuse it.
     parsed = CudaGraphConfig(
@@ -318,21 +433,34 @@ def test_a_flag_only_full_decode_graph_launch_passes_pass_one_and_is_refused_aft
             {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True},
             lambda: _resolution_pipeline_hooks(args, hooks.get),
         )
-    assert seen == ["offload passed", "parsed"]  # pass 1 accepted; pass 2 raised inside its own call
+    assert seen == [
+        "offload passed",
+        "parsed",
+    ]  # pass 1 accepted; pass 2 raised inside its own call
     # The parsed config alone is what refuses it: the same launch with the config already parsed.
     with pytest.raises(ValueError, match="cannot run the Engram"):
-        _gate(_launch(model_dir, cuda_graph_config=parsed), SGLANG_MOE_EXPERT_GRAPH_GATHER=True)
+        _gate(
+            _launch(model_dir, cuda_graph_config=parsed),
+            SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+        )
 
 
 def test_graph_gather_keeps_the_alt_stream_overlap_off(model_dir, multi_stream_unset):
     # The fused MoE's temp buffers are shared by every layer: sound only on one stream.
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_MOE_EXPERT_GRAPH_GATHER=True, **DIRECT)
+    _gate(
+        _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+        SGLANG_MOE_EXPERT_GRAPH_GATHER=True,
+        **DIRECT,
+    )
     assert envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() is False
 
 
 def test_the_exl3_requirements_read_graph_gathers_from_the_pinned_tier(model_dir):
     args = _launch(model_dir)
-    assert expert_stream_requirements_for(args, args).graph_gather_host_source == "pinned_tier"
+    assert (
+        expert_stream_requirements_for(args, args).graph_gather_host_source
+        == "pinned_tier"
+    )
 
 
 if __name__ == "__main__":
@@ -352,15 +480,23 @@ CPU_EXPERTS_ENV = dict(
 )
 
 
-@pytest.mark.parametrize("missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_DSV41_CPU_EXPERTS"])
+@pytest.mark.parametrize(
+    "missing", [name for name in CPU_EXPERTS_ENV if name != "SGLANG_DSV41_CPU_EXPERTS"]
+)
 def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
     """Each is load-bearing: without it the CPU lanes are never completed (the copy engine), not the lowest-scored
     misses (DIRECT residency's keys, which only the fused plan sorts by), or run on no cores; the refusal names the one
     that is off."""
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
-    off = {"SGLANG_DSV41_CPU_EXPERTS_CORES": "", "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}.get(missing, False)
+    off = {
+        "SGLANG_DSV41_CPU_EXPERTS_CORES": "",
+        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1,
+    }.get(missing, False)
     with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {missing}"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: off})
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            **{**CPU_EXPERTS_ENV, missing: off},
+        )
 
 
 @pytest.mark.parametrize("update", [True, False])
@@ -370,9 +506,17 @@ def test_cpu_experts_without_direct_residency_are_refused(model_dir, update):
     With the residency update on, the update's own EXL3 rule would say to turn it off.
     The CPU-experts rule runs first and names what to set instead: the update on, at stage 2.
     """
-    env = {**CPU_EXPERTS_ENV, "SGLANG_MOE_GPU_RESIDENCY_UPDATE": update, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}
-    wanted = ("" if update else "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, ") + "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"
-    with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {wanted}$") as refused:
+    env = {
+        **CPU_EXPERTS_ENV,
+        "SGLANG_MOE_GPU_RESIDENCY_UPDATE": update,
+        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1,
+    }
+    wanted = (
+        "" if update else "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, "
+    ) + "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"
+    with pytest.raises(
+        ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {wanted}$"
+    ) as refused:
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **env)
     assert "set it to 0" not in str(refused.value)
 
@@ -398,12 +542,16 @@ _EAGER_DECODE = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": False}
     ],
     ids=["disabled", "full", "spec-breakable", "spec-disabled"],
 )
-def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(model_dir, changes, env):
+def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(
+    model_dir, changes, env
+):
     """Refused before the speculative and backend rules, which would each send the launch to the other's backend.
 
     The refusal never suggests disabled decode graphs.
     """
-    with pytest.raises(ValueError, match="breakable, without speculative decoding") as refused:
+    with pytest.raises(
+        ValueError, match="breakable, without speculative decoding"
+    ) as refused:
         _gate(_launch(model_dir, **changes), **{**CPU_EXPERTS_ENV, **env})
     assert "disabled" not in str(refused.value)
 
@@ -411,20 +559,37 @@ def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(model_d
 def test_cpu_misses_need_cpu_experts(model_dir):
     """SGLANG_DSV41_CPU_EXPERTS_MISSES only widens which lanes the CPU may take; without CPU experts no CPU thread
     exists to compute them, and the device would type misses CPU that nothing completes. With CPU experts it passes."""
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, SGLANG_DSV41_CPU_EXPERTS_MISSES=True)
-    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_CPU_EXPERTS_MISSES=True)
+    _gate(
+        _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+        **CPU_EXPERTS_ENV,
+        SGLANG_DSV41_CPU_EXPERTS_MISSES=True,
+    )
+    with pytest.raises(
+        ValueError,
+        match="SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1",
+    ):
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            SGLANG_DSV41_CPU_EXPERTS_MISSES=True,
+        )
 
 
 @pytest.mark.parametrize("value", ["ce", "sm"])
 def test_either_hit_copy_passes_with_cpu_experts(model_dir, value):
     """CPU completion uses the copy thread and the gate whichever way the hits are copied."""
-    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_HIT_COPY=value)
+    _gate(
+        _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+        **CPU_EXPERTS_ENV,
+        SGLANG_DSV41_RAM_HIT_COPY=value,
+    )
 
 
 def test_an_unknown_hit_copy_is_refused(model_dir):
     with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_HIT_COPY must be ce or sm"):
-        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_RAM_HIT_COPY="dma")
+        _gate(
+            _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
+            SGLANG_DSV41_RAM_HIT_COPY="dma",
+        )
 
 
 def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):

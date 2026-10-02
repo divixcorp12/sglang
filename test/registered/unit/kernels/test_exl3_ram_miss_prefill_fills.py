@@ -85,7 +85,12 @@ def test_claiming_stops_at_the_first_expert_with_no_unprotected_victim(tier):
     slots, evictions = host.fill_begin(0, [4, 5], protected=[0, 1, 4, 5])
     assert len(slots) == 2 and evictions == 2
     assert host.fill_end()
-    assert host.contains(0, 0) and host.contains(0, 1) and not host.contains(0, 2) and not host.contains(0, 3)
+    assert (
+        host.contains(0, 0)
+        and host.contains(0, 1)
+        and not host.contains(0, 2)
+        and not host.contains(0, 3)
+    )
     host.release(0, host.mapping(0)[4])
     host.release(0, host.mapping(0)[5])
     host.assign(0, 2)
@@ -118,7 +123,9 @@ def test_a_slot_being_filled_is_never_a_victim_and_cannot_be_released(slow_tier)
     finally:
         assert host.fill_end()
     host.inject_fault()
-    assert host.assign(0, 5)[1] is not None  # the fill ended, so its rows are victims again
+    assert (
+        host.assign(0, 5)[1] is not None
+    )  # the fill ended, so its rows are victims again
     assert _landed(s, host, 0, [1, 2, 3])
 
 

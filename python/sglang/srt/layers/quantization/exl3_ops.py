@@ -53,7 +53,9 @@ class Exl3Tensors:
             )
         if self.suh.dtype != torch.float16 or self.svh.dtype != torch.float16:
             raise ValueError("suh/svh must be fp16")
-        if self.suh.shape != (self.in_features,) or self.svh.shape != (self.out_features,):
+        if self.suh.shape != (self.in_features,) or self.svh.shape != (
+            self.out_features,
+        ):
             raise ValueError(
                 f"suh {tuple(self.suh.shape)} / svh {tuple(self.svh.shape)} do not match trellis {tuple(self.trellis.shape)}"
             )
@@ -74,10 +76,14 @@ class Exl3Tensors:
 def exl3_dense_weight(t: Exl3Tensors) -> torch.Tensor:
     """The original-basis weight, fp16 [in, out], so that y = x @ W."""
     ext = exl3_ext()
-    w = torch.empty((t.in_features, t.out_features), dtype=torch.float16, device=t.trellis.device)
+    w = torch.empty(
+        (t.in_features, t.out_features), dtype=torch.float16, device=t.trellis.device
+    )
     for start in range(0, t.out_features, MAX_RECONSTRUCT_SLICE_N):
         end = min(start + MAX_RECONSTRUCT_SLICE_N, t.out_features)
-        piece = torch.empty((t.in_features, end - start), dtype=torch.float16, device=w.device)
+        piece = torch.empty(
+            (t.in_features, end - start), dtype=torch.float16, device=w.device
+        )
         ext.reconstruct_had_slice(
             piece, t.trellis, t.suh, t.svh[start:], t.bits, False, t.mul1, start
         )
@@ -97,7 +103,18 @@ def exl3_linear(
         c_dtype = torch.float32 if out_dtype == torch.float32 else torch.float16
         y = torch.empty((rows, t.out_features), dtype=c_dtype, device=x2.device)
         if rows:
-            ext.exl3_gemm(x2, t.trellis, y, t.suh, torch.empty_like(x2), t.svh, -1, False, t.mul1, 0)
+            ext.exl3_gemm(
+                x2,
+                t.trellis,
+                y,
+                t.suh,
+                torch.empty_like(x2),
+                t.svh,
+                -1,
+                False,
+                t.mul1,
+                0,
+            )
     else:
         y = _exl3_dense_matmul(x2, t)
     return y.to(out_dtype).reshape(*lead, t.out_features)
@@ -106,13 +123,19 @@ def exl3_linear(
 def _exl3_dense_matmul(x2: torch.Tensor, t: Exl3Tensors) -> torch.Tensor:
     """x2 @ W one reconstructed column slice at a time, so the whole fp16 weight is never held."""
     ext = exl3_ext()
-    y = torch.empty((x2.shape[0], t.out_features), dtype=torch.float16, device=x2.device)
+    y = torch.empty(
+        (x2.shape[0], t.out_features), dtype=torch.float16, device=x2.device
+    )
     piece = None
     for start in range(0, t.out_features, DENSE_MATMUL_SLICE_N):
         end = min(start + DENSE_MATMUL_SLICE_N, t.out_features)
         if piece is None or piece.shape[1] != end - start:
-            piece = torch.empty((t.in_features, end - start), dtype=torch.float16, device=x2.device)
-        ext.reconstruct_had_slice(piece, t.trellis, t.suh, t.svh[start:], t.bits, False, t.mul1, start)
+            piece = torch.empty(
+                (t.in_features, end - start), dtype=torch.float16, device=x2.device
+            )
+        ext.reconstruct_had_slice(
+            piece, t.trellis, t.suh, t.svh[start:], t.bits, False, t.mul1, start
+        )
         y[:, start:end] = torch.matmul(x2, piece)
     return y
 
@@ -170,7 +193,16 @@ def exl3_gemm_bs1(x16: torch.Tensor, parts: Sequence[Exl3Tensors]) -> torch.Tens
     y = torch.empty((1, len(parts) * out), dtype=torch.float16, device=x16.device)
     for i, t in enumerate(parts):
         ext.exl3_gemm(
-            x16, t.trellis, y[:, i * out : (i + 1) * out], t.suh, torch.empty_like(x16), t.svh, -1, False, t.mul1, 0
+            x16,
+            t.trellis,
+            y[:, i * out : (i + 1) * out],
+            t.suh,
+            torch.empty_like(x16),
+            t.svh,
+            -1,
+            False,
+            t.mul1,
+            0,
         )
     return y
 
@@ -181,7 +213,9 @@ def exl3_linear_reference(x: torch.Tensor, t: Exl3Tensors) -> torch.Tensor:
     x2 = x.reshape(-1, t.in_features).to(torch.float16).contiguous()
     xh = torch.empty_like(x2)
     ext.had_r_128(x2, xh, t.suh, None, 1.0)
-    w = torch.empty((t.in_features, t.out_features), dtype=torch.float16, device=x2.device)
+    w = torch.empty(
+        (t.in_features, t.out_features), dtype=torch.float16, device=x2.device
+    )
     ext.reconstruct(w, t.trellis, t.bits, False, t.mul1)
     y = (xh.float() @ w.float()).to(torch.float16).contiguous()
     ext.had_r_128(y, y, None, t.svh, 1.0)
@@ -207,7 +241,9 @@ def exl3_moe_loop(
     flat = topk_ids.reshape(-1)
     counts = torch.bincount(flat[flat >= 0], minlength=len(w2)).tolist()
     experts = [expert for expert, count in enumerate(counts) if count]
-    exl3_moe_accumulate(out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts, linear)
+    exl3_moe_accumulate(
+        out, x, topk_weights, topk_ids, w13, w2, swiglu_limit, experts, linear
+    )
     return out.to(x.dtype)
 
 
@@ -232,7 +268,17 @@ def exl3_moe_accumulate(
         token, slot = torch.where(topk_ids == expert)
         if token.numel() == 0:
             continue
-        _accumulate_expert(out, x, topk_weights, token, slot, w13[expert], w2[expert], swiglu_limit, linear)
+        _accumulate_expert(
+            out,
+            x,
+            topk_weights,
+            token,
+            slot,
+            w13[expert],
+            w2[expert],
+            swiglu_limit,
+            linear,
+        )
 
 
 def _accumulate_expert(
@@ -272,7 +318,7 @@ class Exl3RoutePlan(msgspec.Struct, frozen=True):
     source_ids: torch.Tensor
 
     @classmethod
-    def from_topk(cls, topk_ids: torch.Tensor) -> "Exl3RoutePlan":
+    def from_topk(cls, topk_ids: torch.Tensor) -> Exl3RoutePlan:
         width = topk_ids.shape[-1]
         # One readback per layer, then two small pageable copies back; the caller builds the plan before queuing
         # any of the layer's gathers, so neither waits on one.
@@ -311,7 +357,17 @@ def exl3_moe_accumulate_planned(
     """``exl3_moe_accumulate`` over ``plan``'s routes: the same math and order, with no per-expert readback."""
     for expert in experts:
         token, slot = plan.routes_of(expert)
-        _accumulate_expert(out, x, topk_weights, token, slot, w13[expert], w2[expert], swiglu_limit, linear)
+        _accumulate_expert(
+            out,
+            x,
+            topk_weights,
+            token,
+            slot,
+            w13[expert],
+            w2[expert],
+            swiglu_limit,
+            linear,
+        )
 
 
 def random_exl3_tensors(
@@ -328,8 +384,12 @@ def random_exl3_tensors(
         dtype=torch.int32,
         device=cpu,
     ).to(torch.int16)
-    sign = lambda n: (torch.randint(0, 2, (n,), generator=g, device=cpu) * 2 - 1).to(torch.float16)
-    svh = sign(out_features) * (0.5 + torch.rand(out_features, generator=g, device=cpu)).to(torch.float16)
+    sign = lambda n: (torch.randint(0, 2, (n,), generator=g, device=cpu) * 2 - 1).to(
+        torch.float16
+    )
+    svh = sign(out_features) * (
+        0.5 + torch.rand(out_features, generator=g, device=cpu)
+    ).to(torch.float16)
     return Exl3Tensors(
         trellis=trellis.to(device),
         suh=sign(in_features).to(device),

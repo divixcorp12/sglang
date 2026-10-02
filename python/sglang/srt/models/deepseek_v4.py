@@ -4487,7 +4487,11 @@ class DeepseekV4Model(nn.Module):
         precomputed_attn = None
         combined_attn = None
         normalized_attn = None
-        for i in (layer_ids if layer_ids is not None else range(self.start_layer, self.end_layer)):
+        for i in (
+            layer_ids
+            if layer_ids is not None
+            else range(self.start_layer, self.end_layer)
+        ):
             if tail is not None and i == self.late_layer_start:
                 combined_attn = None
                 normalized_attn = None
@@ -5222,21 +5226,31 @@ class DeepseekV4ForCausalLM(nn.Module):
             hash_ids_in=hash_ids,
         )
         pre_hc_head = hidden_states.flatten(1)
-        hidden_states = model.norm(hc_combine(pre_hc_head.float(), last_pre, model.hc_mult, hidden_states.dtype))
+        hidden_states = model.norm(
+            hc_combine(
+                pre_hc_head.float(), last_pre, model.hc_mult, hidden_states.dtype
+            )
+        )
         # Tail rows only: scattering back to the full extend would allocate [T, 5120] and [T, 20480] tensors.
         logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
         logits_metadata.extend_seq_lens = tail.extend_seq_lens
         logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
         output = self.logits_processor(
-            tail.rows(input_ids), hidden_states, self.lm_head, logits_metadata, None,
+            tail.rows(input_ids),
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            None,
             hidden_states_before_norm=pre_hc_head,
         )
         output.hidden_states_token_indices = tail.token_indices
         return output
 
     def make_layer_major_adapter(self, model_runner):
-        from sglang.srt.models.deepseek_v4_layer_major import DeepseekV4LayerMajorAdapter
+        from sglang.srt.models.deepseek_v4_layer_major import (
+            DeepseekV4LayerMajorAdapter,
+        )
 
         return DeepseekV4LayerMajorAdapter(model_runner)
 

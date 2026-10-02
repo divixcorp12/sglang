@@ -2412,7 +2412,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # both, so a set value warns rather than refuses; a checkpoint without row images refuses at startup instead.
     **{
         name: _DeprecatedEnv(note=_PACKED_PATH_REMOVED_NOTE)
-        for name in ("SGLANG_DSV41_RAM_MISS_PACK_WORKERS", "SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES")
+        for name in (
+            "SGLANG_DSV41_RAM_MISS_PACK_WORKERS",
+            "SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES",
+        )
     },
     # Lease mode is unconditional (2026-09-29): row images need it. Archived arms set it to 1 (and the dsv41_flash A/B
     # to 0), so a set value warns and is ignored.

@@ -7,7 +7,9 @@ import sys
 import pytest
 
 # provenance.py lives in scripts/dsv41/, shared with (and identical to) Task 1's harness.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "dsv41"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "dsv41")
+)
 
 import arm_env
 import client_latency
@@ -27,21 +29,32 @@ import task1_verdict
 import tenancy
 import verdict
 
-
 # --- tok/s computation (rule 1) ---
 
 
 def test_decode_tokens_per_second_matches_the_driver_formula():
-    assert metrics.decode_tokens_per_second(completion_tokens=5, ttft=1.0, total=3.0) == 2.0
+    assert (
+        metrics.decode_tokens_per_second(completion_tokens=5, ttft=1.0, total=3.0)
+        == 2.0
+    )
 
 
 def test_decode_tokens_per_second_none_below_two_completion_tokens():
-    assert metrics.decode_tokens_per_second(completion_tokens=1, ttft=0.1, total=0.5) is None
-    assert metrics.decode_tokens_per_second(completion_tokens=0, ttft=0.1, total=0.5) is None
+    assert (
+        metrics.decode_tokens_per_second(completion_tokens=1, ttft=0.1, total=0.5)
+        is None
+    )
+    assert (
+        metrics.decode_tokens_per_second(completion_tokens=0, ttft=0.1, total=0.5)
+        is None
+    )
 
 
 def test_decode_tokens_per_second_none_for_nonpositive_decode_interval():
-    assert metrics.decode_tokens_per_second(completion_tokens=5, ttft=3.0, total=3.0) is None
+    assert (
+        metrics.decode_tokens_per_second(completion_tokens=5, ttft=3.0, total=3.0)
+        is None
+    )
 
 
 # --- median aggregation (descriptive only, never the arm-comparison statistic) ---
@@ -79,11 +92,15 @@ def test_sign_test_rejects_out_of_range_wins():
 
 def test_expected_session_ids_match_n_sessions():
     assert len(session_subset.EXPECTED_SESSION_IDS) == session_subset.N_SESSIONS == 2
-    assert session_subset.EXPECTED_SESSION_IDS == session_subset.CORPUS_8_SESSION_IDS[:2]
+    assert (
+        session_subset.EXPECTED_SESSION_IDS == session_subset.CORPUS_8_SESSION_IDS[:2]
+    )
 
 
 def test_baseline_4_session_subset_is_the_first_4_and_unchanged():
-    assert session_subset.BASELINE_4_SESSION_IDS == session_subset.CORPUS_8_SESSION_IDS[:4]
+    assert (
+        session_subset.BASELINE_4_SESSION_IDS == session_subset.CORPUS_8_SESSION_IDS[:4]
+    )
 
 
 def test_warmup_session_is_not_one_of_the_timed_sessions():
@@ -96,7 +113,11 @@ def test_load_expected_sessions_matches_pinned_order(tmp_path):
     with open(corpus, "w") as f:
         for sid in ids:
             f.write(json.dumps({"session_id": sid, "turns": ["x"]}) + "\n")
-    assert session_subset.load_expected_sessions(str(corpus), n=3, skip=1) == ["s1", "s2", "s3"]
+    assert session_subset.load_expected_sessions(str(corpus), n=3, skip=1) == [
+        "s1",
+        "s2",
+        "s3",
+    ]
 
 
 def test_verify_corpus_checksum_rejects_a_mismatch(tmp_path):
@@ -112,7 +133,10 @@ def test_verify_corpus_checksum_accepts_a_match(tmp_path):
     import hashlib
 
     expected = hashlib.sha256(b"hello\n").hexdigest()
-    assert session_subset.verify_corpus_checksum(str(corpus), expected=expected) == expected
+    assert (
+        session_subset.verify_corpus_checksum(str(corpus), expected=expected)
+        == expected
+    )
 
 
 # --- synthetic corpus (real text, truncated, context-budget asserted) ---
@@ -129,7 +153,12 @@ def _word_detokenize(tokens):
 def test_build_synthetic_session_truncates_to_prompt_tokens():
     session = {"session_id": "s0", "split": "val", "turns": ["one two three four five"]}
     out = synthetic_corpus.build_synthetic_session(
-        session, tokenize=_word_tokenize, detokenize=_word_detokenize, prompt_tokens=3, new_tokens=2, context_length=100
+        session,
+        tokenize=_word_tokenize,
+        detokenize=_word_detokenize,
+        prompt_tokens=3,
+        new_tokens=2,
+        context_length=100,
     )
     assert out["turns"] == ["one two three"]
     assert out["session_id"] == "s0"
@@ -150,13 +179,20 @@ def test_build_synthetic_session_raises_before_sending_when_over_budget():
     session = {"session_id": "s0", "turns": ["one two three four five"]}
     with pytest.raises(synthetic_corpus.ContextBudgetError):
         synthetic_corpus.build_synthetic_session(
-            session, tokenize=_word_tokenize, detokenize=_word_detokenize,
-            prompt_tokens=5, new_tokens=10, context_length=10,
+            session,
+            tokenize=_word_tokenize,
+            detokenize=_word_detokenize,
+            prompt_tokens=5,
+            new_tokens=10,
+            context_length=10,
         )
 
 
 def test_write_jsonl_round_trips(tmp_path):
-    sessions = [{"session_id": "a", "turns": ["x"]}, {"session_id": "b", "turns": ["y"]}]
+    sessions = [
+        {"session_id": "a", "turns": ["x"]},
+        {"session_id": "b", "turns": ["y"]},
+    ]
     path = tmp_path / "out.jsonl"
     synthetic_corpus.write_jsonl(str(path), sessions)
     lines = [json.loads(l) for l in path.read_text().splitlines()]
@@ -214,7 +250,12 @@ def test_result_gate_rejects_any_error_record(tmp_path):
 
 
 def _tenancy(**overrides):
-    base = dict(memory_used_mib=1000, production_running=False, sm_clock_mhz=2900, sm_clock_limit_mhz=3135)
+    base = dict(
+        memory_used_mib=1000,
+        production_running=False,
+        sm_clock_mhz=2900,
+        sm_clock_limit_mhz=3135,
+    )
     base.update(overrides)
     return tenancy.parse_tenancy(base)
 
@@ -224,7 +265,9 @@ def test_tenancy_compatible_when_identical():
 
 
 def test_tenancy_incompatible_on_production_state_change():
-    assert not tenancy.tenancy_compatible(_tenancy(production_running=False), _tenancy(production_running=True))
+    assert not tenancy.tenancy_compatible(
+        _tenancy(production_running=False), _tenancy(production_running=True)
+    )
 
 
 def test_tenancy_incompatible_on_large_memory_delta():
@@ -234,7 +277,9 @@ def test_tenancy_incompatible_on_large_memory_delta():
 
 
 def test_tenancy_tolerates_small_memory_noise():
-    assert tenancy.tenancy_compatible(_tenancy(memory_used_mib=1000), _tenancy(memory_used_mib=1200))
+    assert tenancy.tenancy_compatible(
+        _tenancy(memory_used_mib=1000), _tenancy(memory_used_mib=1200)
+    )
 
 
 # --- SM clock stability gate and cross-arm clock-profile refusal ---
@@ -303,47 +348,93 @@ def test_compile_events_in_range_only_counts_the_window(tmp_path):
     end = compile_watch.log_size(str(log))
     with open(log, "a") as f:
         f.write("after: took 3.0 s to compile after serving started\n")
-    assert compile_watch.compile_events_in_range(str(log), start_byte=start, end_byte=end) == 1
+    assert (
+        compile_watch.compile_events_in_range(str(log), start_byte=start, end_byte=end)
+        == 1
+    )
     assert compile_watch.compile_events_in_range(str(log), start_byte=0) == 3
-    assert compile_watch.compile_events_in_range(str(log), start_byte=0, end_byte=start) == 1
+    assert (
+        compile_watch.compile_events_in_range(str(log), start_byte=0, end_byte=start)
+        == 1
+    )
 
 
 # --- paired comparison: per-session only, refuses tenancy, clock, or compile mismatch ---
 
 
 def _write_arm(
-    tmp_path, name, *, tok_s_by_session, tenancy_fields, clock_mhz=2955, session_ids=None, contaminated_ids=()
+    tmp_path,
+    name,
+    *,
+    tok_s_by_session,
+    tenancy_fields,
+    clock_mhz=2955,
+    session_ids=None,
+    contaminated_ids=(),
 ):
     arm_dir = tmp_path / name
     arm_dir.mkdir()
-    ids = session_ids or list(session_subset.CORPUS_8_SESSION_IDS[: len(tok_s_by_session)])
+    ids = session_ids or list(
+        session_subset.CORPUS_8_SESSION_IDS[: len(tok_s_by_session)]
+    )
     with open(arm_dir / "results.jsonl", "w") as f:
         for sid, tok_s in zip(ids, tok_s_by_session):
-            f.write(json.dumps({"session_id": sid, "decode_tokens_per_sec": tok_s, "ttft": 60.0}) + "\n")
+            f.write(
+                json.dumps(
+                    {"session_id": sid, "decode_tokens_per_sec": tok_s, "ttft": 60.0}
+                )
+                + "\n"
+            )
     with open(arm_dir / "clocks.jsonl", "w") as f:
         for sid in ids:
-            f.write(json.dumps({"session_id": sid, "clock_sm_start_mhz": clock_mhz, "clock_sm_end_mhz": clock_mhz}) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "session_id": sid,
+                        "clock_sm_start_mhz": clock_mhz,
+                        "clock_sm_end_mhz": clock_mhz,
+                    }
+                )
+                + "\n"
+            )
     with open(arm_dir / "compile.jsonl", "w") as f:
         for sid in ids:
             f.write(
                 json.dumps(
-                    {"session_id": sid, "compiled_during_session": sid in contaminated_ids, "compile_events": 0}
+                    {
+                        "session_id": sid,
+                        "compiled_during_session": sid in contaminated_ids,
+                        "compile_events": 0,
+                    }
                 )
                 + "\n"
             )
-    manifest = {"tenancy_start": tenancy_fields, "tenancy_end": tenancy_fields, "session_ids": ids}
+    manifest = {
+        "tenancy_start": tenancy_fields,
+        "tenancy_end": tenancy_fields,
+        "session_ids": ids,
+    }
     (arm_dir / "run-manifest.json").write_text(json.dumps(manifest))
     return str(arm_dir)
 
 
-_TENANCY_FIELDS = {"memory_used_mib": 1000, "production_running": False, "sm_clock_mhz": 2900, "sm_clock_limit_mhz": 3135}
+_TENANCY_FIELDS = {
+    "memory_used_mib": 1000,
+    "production_running": False,
+    "sm_clock_mhz": 2900,
+    "sm_clock_limit_mhz": 3135,
+}
 
 
 def test_paired_compare_refuses_mismatched_tenancy(tmp_path):
     tok_s = [2.0] * 8
-    a = _write_arm(tmp_path, "a", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS)
+    a = _write_arm(
+        tmp_path, "a", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS
+    )
     b = _write_arm(
-        tmp_path, "b", tok_s_by_session=tok_s,
+        tmp_path,
+        "b",
+        tok_s_by_session=tok_s,
         tenancy_fields={**_TENANCY_FIELDS, "production_running": True},
     )
     with pytest.raises(paired.TenancyMismatchError):
@@ -352,15 +443,31 @@ def test_paired_compare_refuses_mismatched_tenancy(tmp_path):
 
 def test_paired_compare_refuses_mismatched_clock_profile(tmp_path):
     tok_s = [2.0] * 8
-    a = _write_arm(tmp_path, "a", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS, clock_mhz=2570)
-    b = _write_arm(tmp_path, "b", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS, clock_mhz=2955)
+    a = _write_arm(
+        tmp_path,
+        "a",
+        tok_s_by_session=tok_s,
+        tenancy_fields=_TENANCY_FIELDS,
+        clock_mhz=2570,
+    )
+    b = _write_arm(
+        tmp_path,
+        "b",
+        tok_s_by_session=tok_s,
+        tenancy_fields=_TENANCY_FIELDS,
+        clock_mhz=2955,
+    )
     with pytest.raises(paired.ClockProfileMismatchError):
         paired.compare(a, b)
 
 
 def test_paired_compare_reports_the_headline_statistics(tmp_path):
-    a = _write_arm(tmp_path, "a", tok_s_by_session=[2.0] * 8, tenancy_fields=_TENANCY_FIELDS)
-    b = _write_arm(tmp_path, "b", tok_s_by_session=[3.0] * 8, tenancy_fields=_TENANCY_FIELDS)
+    a = _write_arm(
+        tmp_path, "a", tok_s_by_session=[2.0] * 8, tenancy_fields=_TENANCY_FIELDS
+    )
+    b = _write_arm(
+        tmp_path, "b", tok_s_by_session=[3.0] * 8, tenancy_fields=_TENANCY_FIELDS
+    )
     result = paired.compare(a, b, a_name="A", b_name="B")
     assert result["paired_sessions"] == 8
     assert result["b_wins"] == 8
@@ -370,14 +477,20 @@ def test_paired_compare_reports_the_headline_statistics(tmp_path):
 
 
 def test_paired_compare_refuses_two_vs_eight_session_arms(tmp_path):
-    a = _write_arm(tmp_path, "a", tok_s_by_session=[2.0] * 2, tenancy_fields=_TENANCY_FIELDS)
-    b = _write_arm(tmp_path, "b", tok_s_by_session=[3.0] * 8, tenancy_fields=_TENANCY_FIELDS)
+    a = _write_arm(
+        tmp_path, "a", tok_s_by_session=[2.0] * 2, tenancy_fields=_TENANCY_FIELDS
+    )
+    b = _write_arm(
+        tmp_path, "b", tok_s_by_session=[3.0] * 8, tenancy_fields=_TENANCY_FIELDS
+    )
     with pytest.raises(ValueError, match="different timed session sets"):
         paired.compare(a, b)
 
 
 def test_paired_load_refuses_results_not_matching_manifest(tmp_path):
-    arm = _write_arm(tmp_path, "a", tok_s_by_session=[2.0] * 2, tenancy_fields=_TENANCY_FIELDS)
+    arm = _write_arm(
+        tmp_path, "a", tok_s_by_session=[2.0] * 2, tenancy_fields=_TENANCY_FIELDS
+    )
     manifest_path = os.path.join(arm, "run-manifest.json")
     with open(manifest_path) as f:
         manifest = json.load(f)
@@ -393,11 +506,26 @@ def test_paired_compare_raises_on_missing_clock_samples(tmp_path):
     a_dir.mkdir()
     with open(a_dir / "results.jsonl", "w") as f:
         for i in range(8):
-            f.write(json.dumps({"session_id": f"s{i}", "decode_tokens_per_sec": 2.0}) + "\n")
+            f.write(
+                json.dumps({"session_id": f"s{i}", "decode_tokens_per_sec": 2.0}) + "\n"
+            )
     (a_dir / "clocks.jsonl").write_text("")
     (a_dir / "compile.jsonl").write_text("")
-    (a_dir / "run-manifest.json").write_text(json.dumps({"tenancy_start": _TENANCY_FIELDS, "session_ids": [f"s{i}" for i in range(8)]}))
-    b = _write_arm(tmp_path, "b", tok_s_by_session=[2.0] * 8, tenancy_fields=_TENANCY_FIELDS, session_ids=[f"s{i}" for i in range(8)])
+    (a_dir / "run-manifest.json").write_text(
+        json.dumps(
+            {
+                "tenancy_start": _TENANCY_FIELDS,
+                "session_ids": [f"s{i}" for i in range(8)],
+            }
+        )
+    )
+    b = _write_arm(
+        tmp_path,
+        "b",
+        tok_s_by_session=[2.0] * 8,
+        tenancy_fields=_TENANCY_FIELDS,
+        session_ids=[f"s{i}" for i in range(8)],
+    )
     with pytest.raises(ValueError):
         paired.compare(str(a_dir), b)
 
@@ -405,8 +533,16 @@ def test_paired_compare_raises_on_missing_clock_samples(tmp_path):
 def test_paired_compare_refuses_a_compile_contaminated_session(tmp_path):
     tok_s = [2.0] * 8
     ids = list(session_subset.CORPUS_8_SESSION_IDS)
-    a = _write_arm(tmp_path, "a", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS, contaminated_ids=[ids[3]])
-    b = _write_arm(tmp_path, "b", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS)
+    a = _write_arm(
+        tmp_path,
+        "a",
+        tok_s_by_session=tok_s,
+        tenancy_fields=_TENANCY_FIELDS,
+        contaminated_ids=[ids[3]],
+    )
+    b = _write_arm(
+        tmp_path, "b", tok_s_by_session=tok_s, tenancy_fields=_TENANCY_FIELDS
+    )
     with pytest.raises(paired.CompileContaminationError):
         paired.compare(a, b)
 
@@ -417,13 +553,18 @@ def test_paired_compare_refuses_a_compile_contaminated_session(tmp_path):
 def test_timed_session_indices_default_is_the_shared_n_sessions():
     assert session_subset.timed_session_indices(None) == (0, 1)
     assert session_subset.timed_session_indices("") == (0, 1)
-    assert session_subset.timed_session_ids((0, 1)) == session_subset.EXPECTED_SESSION_IDS
+    assert (
+        session_subset.timed_session_ids((0, 1)) == session_subset.EXPECTED_SESSION_IDS
+    )
 
 
 def test_timed_session_indices_override_picks_those_corpus_sessions():
     indices = session_subset.timed_session_indices("6,7")
     assert indices == (6, 7)
-    assert session_subset.timed_session_ids(indices) == session_subset.CORPUS_8_SESSION_IDS[6:8]
+    assert (
+        session_subset.timed_session_ids(indices)
+        == session_subset.CORPUS_8_SESSION_IDS[6:8]
+    )
     assert session_subset.N_SESSIONS == 2  # the override never touches the shared count
 
 
@@ -438,23 +579,40 @@ def test_run_arm_times_and_records_the_resolved_override():
     assert "ss.timed_session_indices(os.environ.get(ss.SESSION_INDICES_ENV))" in script
     assert "ss.EXPECTED_SESSION_IDS" not in script
     assert "'session_indices': timed['indices']" in script
-    assert "check_result_gate(load_results('$run_dir/results.jsonl'), expected_count=n)" in script
+    assert (
+        "check_result_gate(load_results('$run_dir/results.jsonl'), expected_count=n)"
+        in script
+    )
 
 
 def _write_member(tmp_path, name, *, indices, tok_s, env=None, commit="c0"):
     ids = [session_subset.CORPUS_8_SESSION_IDS[i] for i in indices]
-    arm = _write_arm(tmp_path, name, tok_s_by_session=[tok_s] * len(ids), tenancy_fields=_TENANCY_FIELDS, session_ids=ids)
+    arm = _write_arm(
+        tmp_path,
+        name,
+        tok_s_by_session=[tok_s] * len(ids),
+        tenancy_fields=_TENANCY_FIELDS,
+        session_ids=ids,
+    )
     path = os.path.join(arm, "run-manifest.json")
     manifest = json.load(open(path))
-    manifest.update(commit=commit, env=env or {"SGLANG_X": "1"}, session_indices=list(indices))
+    manifest.update(
+        commit=commit, env=env or {"SGLANG_X": "1"}, session_indices=list(indices)
+    )
     json.dump(manifest, open(path, "w"))
     return arm
 
 
 def test_concat_arms_feeds_paired_the_interleaved_eight_sessions(tmp_path):
     pairs = [(0, 1), (2, 3), (4, 5), (6, 7)]
-    a_runs = [_write_member(tmp_path, f"a{k}", indices=p, tok_s=2.0) for k, p in enumerate(pairs)]
-    b_runs = [_write_member(tmp_path, f"b{k}", indices=p, tok_s=3.0, env={"SGLANG_X": "2"}) for k, p in enumerate(pairs)]
+    a_runs = [
+        _write_member(tmp_path, f"a{k}", indices=p, tok_s=2.0)
+        for k, p in enumerate(pairs)
+    ]
+    b_runs = [
+        _write_member(tmp_path, f"b{k}", indices=p, tok_s=3.0, env={"SGLANG_X": "2"})
+        for k, p in enumerate(pairs)
+    ]
     concat_arms.concat_arms(str(tmp_path / "A"), a_runs)
     manifest = concat_arms.concat_arms(str(tmp_path / "B"), b_runs)
     assert manifest["session_ids"] == list(session_subset.CORPUS_8_SESSION_IDS)
@@ -510,7 +668,9 @@ def test_sha256_file_matches_known_content(tmp_path):
     path.write_bytes(b"hello\n")
     import hashlib
 
-    assert task1_verdict._sha256_file(str(path)) == hashlib.sha256(b"hello\n").hexdigest()
+    assert (
+        task1_verdict._sha256_file(str(path)) == hashlib.sha256(b"hello\n").hexdigest()
+    )
 
 
 def test_load_task1_verdict_refuses_a_hash_mismatch(tmp_path):
@@ -562,7 +722,10 @@ def test_merge_sessions_joins_by_session_id():
     compile_by_id = {"s0": {"compiled_during_session": False, "compile_events": 0}}
     cpu_s_by_id = {"s0": 12.3}
     [merged] = report_builder.merge_sessions(
-        results=results, clocks_by_id=clocks_by_id, compile_by_id=compile_by_id, cpu_s_by_id=cpu_s_by_id
+        results=results,
+        clocks_by_id=clocks_by_id,
+        compile_by_id=compile_by_id,
+        cpu_s_by_id=cpu_s_by_id,
     )
     assert merged["session_id"] == "s0"
     assert merged["decode_tok_s"] == 2.5
@@ -622,18 +785,30 @@ def test_build_report_puts_the_servers_env_where_check_arm_reads_it():
             "sglang_env_resolved": {"SGLANG_MOE_EXPERT_FILE_READER": "mmap"},
             "sglang_file": "/harness/python/sglang/__init__.py",
         },
-        server_env_actual={**SERVER_ENV, "SGLANG_MOE_EXPERT_MIRROR_DIRS": "/mnt/nvme0/x:/mnt/nvme4/x"},
+        server_env_actual={
+            **SERVER_ENV,
+            "SGLANG_MOE_EXPERT_MIRROR_DIRS": "/mnt/nvme0/x:/mnt/nvme4/x",
+        },
     )
     prov = report["provenance"]
     assert prov["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] == "uring_direct"
-    assert prov["sglang_env"]["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == "/mnt/nvme0/x:/mnt/nvme4/x"
+    assert (
+        prov["sglang_env"]["SGLANG_MOE_EXPERT_MIRROR_DIRS"]
+        == "/mnt/nvme0/x:/mnt/nvme4/x"
+    )
     # the harness's own values are kept, but not where they can be mistaken for the server's
-    assert prov["harness_process"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] == "mmap"
-    assert prov["harness_process"]["sglang_file"] == "/harness/python/sglang/__init__.py"
+    assert (
+        prov["harness_process"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] == "mmap"
+    )
+    assert (
+        prov["harness_process"]["sglang_file"] == "/harness/python/sglang/__init__.py"
+    )
 
 
 def test_build_report_reports_resolved_values_as_unavailable_not_as_the_harnesss():
-    report = _build(harness_provenance={"git": {"head": "abc"}, "sglang_env_resolved": {"X": "y"}})
+    report = _build(
+        harness_provenance={"git": {"head": "abc"}, "sglang_env_resolved": {"X": "y"}}
+    )
     prov = report["provenance"]
     assert prov["sglang_env_resolved"] is None
     assert prov["sglang_file"] is None
@@ -642,19 +817,26 @@ def test_build_report_reports_resolved_values_as_unavailable_not_as_the_harnesss
 
 
 def test_build_report_keeps_an_earlier_unavailable_entry():
-    report = _build(harness_provenance={"git": None, "unavailable": {"git": "sglang did not import"}})
+    report = _build(
+        harness_provenance={
+            "git": None,
+            "unavailable": {"git": "sglang did not import"},
+        }
+    )
     assert report["provenance"]["unavailable"]["git"] == "sglang did not import"
     assert "sglang_env_resolved" in report["provenance"]["unavailable"]
 
 
 def test_build_report_does_not_store_the_raw_environ():
     """/proc/<pid>/environ carries whatever the launching shell held; a report gets copied."""
-    report = _build(server_env_actual={
-        **SERVER_ENV,
-        "HF_TOKEN": "hunter2",          # not a steering knob: dropped outright
-        "HOME": "/home/x",              # not a steering knob either
-        "SGLANG_REMOTE_API_KEY": "sk-1",  # a knob whose name says secret: kept, redacted
-    })
+    report = _build(
+        server_env_actual={
+            **SERVER_ENV,
+            "HF_TOKEN": "hunter2",  # not a steering knob: dropped outright
+            "HOME": "/home/x",  # not a steering knob either
+            "SGLANG_REMOTE_API_KEY": "sk-1",  # a knob whose name says secret: kept, redacted
+        }
+    )
     for table in ("sglang_env", "server_env_actual"):
         stored = report["provenance"][table]
         assert "HF_TOKEN" not in stored
@@ -669,7 +851,15 @@ class _FakeTask1Verdict:
     """A stand-in with task1_arm_verdict's exact call shape, so these tests exercise this
     campaign's glue code without needing the real (uncommitted, divix01-only) file."""
 
-    def __init__(self, *, problems=None, notes=None, contended=("not contended", []), outliers=None, gen=("gen1", "tree123")):
+    def __init__(
+        self,
+        *,
+        problems=None,
+        notes=None,
+        contended=("not contended", []),
+        outliers=None,
+        gen=("gen1", "tree123"),
+    ):
         self._problems = problems or []
         self._notes = notes or []
         self._contended = contended
@@ -695,24 +885,39 @@ class _FakeTask1Verdict:
         return self._gen
 
     def cross_arm_outliers(self, report, arm_path, references):
-        return ["CROSS-ARM session_0: decode 2.0 tok/s is 10% below the 2-arm clean median 2.2"]
+        return [
+            "CROSS-ARM session_0: decode 2.0 tok/s is 10% below the 2-arm clean median 2.2"
+        ]
 
 
 def _sample_report(*, compiled_during_session=(False, False)):
     return {
         "provenance": {"git": {"head": "abc"}, "sglang_env": dict(SERVER_ENV)},
-        "residency": {"dir": "/d", "before_server": 1, "server_ready": 1,
-                      "after_timed_set": 1},
+        "residency": {
+            "dir": "/d",
+            "before_server": 1,
+            "server_ready": 1,
+            "after_timed_set": 1,
+        },
         "per_session": [
-            {"session_id": f"s{i}", "clock_sm_start_mhz": 2570, "compiled_during_session": c, "compile_events": int(c)}
+            {
+                "session_id": f"s{i}",
+                "clock_sm_start_mhz": 2570,
+                "compiled_during_session": c,
+                "compile_events": int(c),
+            }
             for i, c in enumerate(compiled_during_session)
         ],
     }
 
 
 def test_is_acknowledged_step_latency_problem():
-    assert verdict.is_acknowledged_step_latency_problem("session 0: no step latency (fewer than two chunks)")
-    assert not verdict.is_acknowledged_step_latency_problem("git head 'abc' is not the expected 'def'")
+    assert verdict.is_acknowledged_step_latency_problem(
+        "session 0: no step latency (fewer than two chunks)"
+    )
+    assert not verdict.is_acknowledged_step_latency_problem(
+        "git head 'abc' is not the expected 'def'"
+    )
 
 
 def test_server_env_problems_is_silent_on_a_correctly_configured_server():
@@ -768,13 +973,17 @@ def test_judge_acknowledges_only_the_unknowable_form_of_each_server_check():
     are not, so a genuinely misconfigured server still reads unacknowledged-INVALID."""
     report = _sample_report()
     report["provenance"]["sglang_env"]["SGLANG_MOE_EXPERT_FILE_READER"] = "mmap"
-    fake = _FakeTask1Verdict(problems=[
-        "imported sglang from None, not /x/python/sglang",
-        "provenance fields unavailable: ['sglang_env_resolved', 'sglang_file']",
-        "SGLANG_MOE_EXPERT_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
-        "SGLANG_MOE_EXPERT_GRAPH_GATHER did not resolve to true: this is not the in-graph reader",
-    ])
-    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake)
+    fake = _FakeTask1Verdict(
+        problems=[
+            "imported sglang from None, not /x/python/sglang",
+            "provenance fields unavailable: ['sglang_env_resolved', 'sglang_file']",
+            "SGLANG_MOE_EXPERT_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
+            "SGLANG_MOE_EXPERT_GRAPH_GATHER did not resolve to true: this is not the in-graph reader",
+        ]
+    )
+    result = verdict.judge(
+        report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake
+    )
     assert len(result["acknowledged_problems"]) == 4
     [unacknowledged] = result["unacknowledged_problems"]
     assert "mmap" in unacknowledged
@@ -782,10 +991,19 @@ def test_judge_acknowledges_only_the_unknowable_form_of_each_server_check():
 
 
 def test_judge_is_clean_when_the_server_env_answers_the_acknowledged_checks():
-    fake = _FakeTask1Verdict(problems=[
-        "SGLANG_MOE_EXPERT_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
-    ])
-    result = verdict.judge(_sample_report(), root="/x", head="abc", mirror=False, traced=False, task1_module=fake)
+    fake = _FakeTask1Verdict(
+        problems=[
+            "SGLANG_MOE_EXPERT_FILE_READER resolved to None, not 'uring_direct': reads may fill the page cache",
+        ]
+    )
+    result = verdict.judge(
+        _sample_report(),
+        root="/x",
+        head="abc",
+        mirror=False,
+        traced=False,
+        task1_module=fake,
+    )
     assert result["unacknowledged_problems"] == []
     assert result["valid_except_acknowledged_gaps"] is True
 
@@ -801,9 +1019,18 @@ def test_judge_reports_step_latency_as_acknowledged_not_blocking_silently():
     report = _sample_report()
     for row in report["per_session"]:
         row["step_latency"] = {"unavailable": "no per-step timing: ..."}
-    fake = _FakeTask1Verdict(problems=["session 0: no step latency (...)", "session 1: no step latency (...)"])
-    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake)
-    assert result["valid"] is False  # Task 1's own definition: any problem means INVALID
+    fake = _FakeTask1Verdict(
+        problems=[
+            "session 0: no step latency (...)",
+            "session 1: no step latency (...)",
+        ]
+    )
+    result = verdict.judge(
+        report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake
+    )
+    assert (
+        result["valid"] is False
+    )  # Task 1's own definition: any problem means INVALID
     assert result["valid_except_acknowledged_gaps"] is True  # nothing unacknowledged
     assert len(result["acknowledged_problems"]) == 2
     assert result["unacknowledged_problems"] == []
@@ -812,16 +1039,22 @@ def test_judge_reports_step_latency_as_acknowledged_not_blocking_silently():
 def test_judge_surfaces_a_real_problem_as_unacknowledged():
     report = _sample_report()
     fake = _FakeTask1Verdict(problems=["git head 'abc' is not the expected 'def'"])
-    result = verdict.judge(report, root="/x", head="def", mirror=False, traced=False, task1_module=fake)
+    result = verdict.judge(
+        report, root="/x", head="def", mirror=False, traced=False, task1_module=fake
+    )
     assert result["valid"] is False
     assert result["valid_except_acknowledged_gaps"] is False
-    assert result["unacknowledged_problems"] == ["git head 'abc' is not the expected 'def'"]
+    assert result["unacknowledged_problems"] == [
+        "git head 'abc' is not the expected 'def'"
+    ]
 
 
 def test_judge_adds_compile_contamination_to_problems():
     report = _sample_report(compiled_during_session=(False, True))
     fake = _FakeTask1Verdict()
-    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake)
+    result = verdict.judge(
+        report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake
+    )
     assert any("JIT compilation" in p for p in result["unacknowledged_problems"])
 
 
@@ -829,7 +1062,13 @@ def test_judge_includes_generation_and_contention_notes():
     report = _sample_report()
     fake = _FakeTask1Verdict()
     result = verdict.judge(
-        report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake, manifest={"generations": {}}
+        report,
+        root="/x",
+        head="abc",
+        mirror=False,
+        traced=False,
+        task1_module=fake,
+        manifest={"generations": {}},
     )
     assert any(n.startswith("GENERATION gen1") for n in result["notes"])
     assert any(n.startswith("CONTENDED not contended") for n in result["notes"])
@@ -839,8 +1078,14 @@ def test_judge_includes_cross_arm_notes_when_references_given():
     report = _sample_report()
     fake = _FakeTask1Verdict()
     result = verdict.judge(
-        report, root="/x", head="abc", mirror=False, traced=False, task1_module=fake,
-        reference_arms=["/other/arm.json"], arm_json_path="/this/arm.json",
+        report,
+        root="/x",
+        head="abc",
+        mirror=False,
+        traced=False,
+        task1_module=fake,
+        reference_arms=["/other/arm.json"],
+        arm_json_path="/this/arm.json",
     )
     assert any(n.startswith("CROSS-ARM") for n in result["notes"])
 
@@ -903,23 +1148,41 @@ def test_merge_sessions_tolerates_missing_chunk_times():
 
 
 def test_residency_cache_dict_reshapes_this_campaigns_residency_section():
-    report = {"residency": {"dir": "/mnt/nvme2/x", "before_server": 100, "server_ready": 100, "after_timed_set": 105}}
+    report = {
+        "residency": {
+            "dir": "/mnt/nvme2/x",
+            "before_server": 100,
+            "server_ready": 100,
+            "after_timed_set": 105,
+        }
+    }
     cache = verdict.residency_cache_dict(report)
-    assert cache == {"before": {"/mnt/nvme2/x": 100},
-                     "ready": {"/mnt/nvme2/x": 100},
-                     "last": {"/mnt/nvme2/x": 105}}
+    assert cache == {
+        "before": {"/mnt/nvme2/x": 100},
+        "ready": {"/mnt/nvme2/x": 100},
+        "last": {"/mnt/nvme2/x": 105},
+    }
 
 
 def test_residency_cache_dict_none_when_no_residency_section():
     assert verdict.residency_cache_dict({}) is None
     assert verdict.residency_cache_dict({"residency": {"dir": None}}) is None
-    assert verdict.residency_cache_dict({"residency": {"dir": "/d", "before_server": 1,
-                                                       "after_timed_set": 2}}) is None
+    assert (
+        verdict.residency_cache_dict(
+            {"residency": {"dir": "/d", "before_server": 1, "after_timed_set": 2}}
+        )
+        is None
+    )
 
 
 def test_judge_calls_task1_timed_phase_with_ready_and_last():
     report = _sample_report()
-    report["residency"] = {"dir": "/d", "before_server": 1, "server_ready": 2, "after_timed_set": 2}
+    report["residency"] = {
+        "dir": "/d",
+        "before_server": 1,
+        "server_ready": 2,
+        "after_timed_set": 2,
+    }
     calls = []
 
     class FakeWithCache(_FakeTask1Verdict):
@@ -927,7 +1190,14 @@ def test_judge_calls_task1_timed_phase_with_ready_and_last():
             calls.append(phases)
             return []
 
-    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=FakeWithCache())
+    result = verdict.judge(
+        report,
+        root="/x",
+        head="abc",
+        mirror=False,
+        traced=False,
+        task1_module=FakeWithCache(),
+    )
     assert calls == [{"before": {"/d": 1}, "ready": {"/d": 2}, "last": {"/d": 2}}]
     assert not result["unacknowledged_problems"]
     assert any("startup" in note for note in result["notes"])
@@ -935,40 +1205,76 @@ def test_judge_calls_task1_timed_phase_with_ready_and_last():
 
 def test_judge_gates_timed_growth_not_startup_growth():
     report = _sample_report()
-    report["residency"] = {"dir": "/d", "before_server": 1, "server_ready": 3 << 30,
-                            "after_timed_set": 3 << 30}
+    report["residency"] = {
+        "dir": "/d",
+        "before_server": 1,
+        "server_ready": 3 << 30,
+        "after_timed_set": 3 << 30,
+    }
     task1 = task1_verdict.load_task1_verdict(
-        path=os.path.join(os.path.dirname(__file__), "..", "..", "analysis", "dsv41-drive",
-                          "task1_arm_verdict.py")
+        path=os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "analysis",
+            "dsv41-drive",
+            "task1_arm_verdict.py",
+        )
     )
 
     class TimedGate(_FakeTask1Verdict):
         def check_timed_phase(self, phases):
             return task1.check_timed_phase(phases)
 
-    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=TimedGate())
+    result = verdict.judge(
+        report,
+        root="/x",
+        head="abc",
+        mirror=False,
+        traced=False,
+        task1_module=TimedGate(),
+    )
     assert not result["unacknowledged_problems"]
 
     report["residency"]["after_timed_set"] += 2 << 30
-    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False, task1_module=TimedGate())
-    assert any("during the timed sessions" in problem for problem in result["unacknowledged_problems"])
+    result = verdict.judge(
+        report,
+        root="/x",
+        head="abc",
+        mirror=False,
+        traced=False,
+        task1_module=TimedGate(),
+    )
+    assert any(
+        "during the timed sessions" in problem
+        for problem in result["unacknowledged_problems"]
+    )
 
 
-@pytest.mark.parametrize("residency", [
-    None,
-    {"before_server": 1, "server_ready": 2, "after_timed_set": 2},
-    {"dir": "/d", "server_ready": 2, "after_timed_set": 2},
-    {"dir": "/d", "before_server": 1, "after_timed_set": 2},
-    {"dir": "/d", "before_server": 1, "server_ready": 2, "after_timed_set": None},
-])
+@pytest.mark.parametrize(
+    "residency",
+    [
+        None,
+        {"before_server": 1, "server_ready": 2, "after_timed_set": 2},
+        {"dir": "/d", "server_ready": 2, "after_timed_set": 2},
+        {"dir": "/d", "before_server": 1, "after_timed_set": 2},
+        {"dir": "/d", "before_server": 1, "server_ready": 2, "after_timed_set": None},
+    ],
+)
 def test_judge_missing_residency_sample_is_unacknowledged_problem(residency):
     report = _sample_report()
     if residency is None:
         del report["residency"]
     else:
         report["residency"] = residency
-    result = verdict.judge(report, root="/x", head="abc", mirror=False, traced=False,
-                           task1_module=_FakeTask1Verdict())
+    result = verdict.judge(
+        report,
+        root="/x",
+        head="abc",
+        mirror=False,
+        traced=False,
+        task1_module=_FakeTask1Verdict(),
+    )
     assert any("residency" in problem for problem in result["unacknowledged_problems"])
     assert not result["valid_except_acknowledged_gaps"]
 
@@ -1024,7 +1330,7 @@ def test_launch_prod_uses_the_base_recipe_without_overrides():
     assert "overrides" not in script
     assert "flock --nonblock 9" in script
     # The dry run must exit before the lock is taken or anything is exec'd.
-    assert script.index('DRY_RUN:-0') < script.index("flock --nonblock 9")
+    assert script.index("DRY_RUN:-0") < script.index("flock --nonblock 9")
 
 
 def test_server_args_omits_decode_log_interval_by_default():
@@ -1054,16 +1360,22 @@ def test_base_env_sets_no_removed_ram_miss_knob():
 
 
 def test_base_env_mirrors_expert_rows_by_default():
-    assert arm_env.base_env()["SGLANG_MOE_EXPERT_MIRROR_DIRS"] == arm_env.EXPERT_MIRROR_DIRS
+    assert (
+        arm_env.base_env()["SGLANG_MOE_EXPERT_MIRROR_DIRS"]
+        == arm_env.EXPERT_MIRROR_DIRS
+    )
 
 
 def test_base_env_enables_fused_expert_plan_with_direct_insertion():
     defaults = arm_env.base_env()
     assert defaults["SGLANG_MOE_EXPERT_FUSED_PLAN"] == "1"
     assert defaults["SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE"] == "2"
-    assert arm_env.arm_env({"SGLANG_MOE_EXPERT_FUSED_PLAN": "0"})[
-        "SGLANG_MOE_EXPERT_FUSED_PLAN"
-    ] == "0"
+    assert (
+        arm_env.arm_env({"SGLANG_MOE_EXPERT_FUSED_PLAN": "0"})[
+            "SGLANG_MOE_EXPERT_FUSED_PLAN"
+        ]
+        == "0"
+    )
 
 
 def test_default_mirror_roots_are_three_absolute_paths_on_distinct_drives():
@@ -1126,16 +1438,26 @@ def test_server_cores_touch_no_node_1_core():
 
 
 def test_the_ram_miss_spin_core_has_its_physical_core_to_itself():
-    path = f"/sys/devices/system/cpu/cpu{arm_env.SPIN_CORE}/topology/thread_siblings_list"
+    path = (
+        f"/sys/devices/system/cpu/cpu{arm_env.SPIN_CORE}/topology/thread_siblings_list"
+    )
     if os.path.exists(path):
         with open(path) as f:
             siblings = _cores(f.read().strip())
     else:
         # No sysfs (the laptop): divix01's rule, cpu n and n + 36 are one physical core.
         siblings = {arm_env.SPIN_CORE, arm_env.SPIN_CORE + 36}
-    taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES) | _cores(arm_env.FREE_CORES)
-    assert arm_env.SPIN_CORE in NODE0_CPUS and not (siblings & taken), sorted(siblings & taken)
-    assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
+    taken = (
+        _cores(arm_env.SERVER_CORES)
+        | _cores(arm_env.DRIVER_CORES)
+        | _cores(arm_env.FREE_CORES)
+    )
+    assert arm_env.SPIN_CORE in NODE0_CPUS and not (siblings & taken), sorted(
+        siblings & taken
+    )
+    assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(
+        arm_env.SPIN_CORE
+    )
 
 
 def test_the_exl3_cpu_kernel_builds_with_gcc_15_and_nothing_else_does():
@@ -1150,7 +1472,9 @@ def test_server_cores_do_not_overlap_the_driver_or_the_reserved_cores():
     server = _cores(arm_env.SERVER_CORES)
     assert not (server & _cores(arm_env.DRIVER_CORES)), "server and driver share cores"
     # NVMe completion interrupts are pinned to 64-71; they stay free for every CPU job.
-    assert not (server & _cores(arm_env.FREE_CORES)), "server touches the reserved cores"
+    assert not (server & _cores(arm_env.FREE_CORES)), (
+        "server touches the reserved cores"
+    )
 
 
 def test_run_arm_pins_the_server_with_arm_envs_core_list_not_a_literal():
@@ -1174,9 +1498,7 @@ def test_engram_host_node_defaults_on_while_async_scores_stay_off_in_gpu_residen
     defaults = arm_env.base_env()
     assert defaults["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
     assert defaults["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] == "1"
-    off_arm = arm_env.arm_env(
-        {"SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "0"}
-    )
+    off_arm = arm_env.arm_env({"SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "0"})
     assert off_arm["SGLANG_MOE_ASYNC_RESIDENCY_SCORES"] == "0"
     assert off_arm["SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING"] == "0"
     assert off_arm["SGLANG_MOE_GPU_RESIDENCY_UPDATE"] == "1"
@@ -1186,7 +1508,9 @@ def test_engram_host_node_defaults_on_while_async_scores_stay_off_in_gpu_residen
 def _placement():
     return {
         int(node): int(mib)
-        for node, mib in (entry.split(":") for entry in arm_env.PINNED_HOST_NUMA_MB.split(","))
+        for node, mib in (
+            entry.split(":") for entry in arm_env.PINNED_HOST_NUMA_MB.split(",")
+        )
     }
 
 
@@ -1197,13 +1521,18 @@ def test_pinned_buffer_share_and_weights_fit_in_node_0s_free_memory():
     # With the tier placed, node 0 must hold its share plus the weights and the
     # loader's 4 GiB headroom.
     need = _placement()[0] + arm_env.WEIGHTS_AND_OVERHEAD_MIB + 4096
-    assert need <= arm_env.NODE0_FREE_MIB, f"needs {need} MiB, node 0 has {arm_env.NODE0_FREE_MIB}"
+    assert need <= arm_env.NODE0_FREE_MIB, (
+        f"needs {need} MiB, node 0 has {arm_env.NODE0_FREE_MIB}"
+    )
 
 
 def test_the_numa_placement_is_in_the_env_and_sums_to_the_budget():
     # The loader refuses a placement that disagrees with the budget, so a recipe
     # edit that changes one without the other could not start.
-    assert arm_env.base_env()["SGLANG_MOE_PINNED_HOST_NUMA_MB"] == arm_env.PINNED_HOST_NUMA_MB
+    assert (
+        arm_env.base_env()["SGLANG_MOE_PINNED_HOST_NUMA_MB"]
+        == arm_env.PINNED_HOST_NUMA_MB
+    )
     assert sum(_placement().values()) == int(arm_env.PINNED_HOST_MB)
 
 
@@ -1238,7 +1567,9 @@ def test_nsys_graph_trace_refuses_graph_with_the_copy_engine_on(value):
     with pytest.raises(ValueError, match="deadlocks"):
         nsys_capture.graph_trace_mode("graph", env)
     with pytest.raises(ValueError, match="deadlocks"):
-        nsys_capture.graph_trace_mode(None, env)  # the default is graph, so it is refused too
+        nsys_capture.graph_trace_mode(
+            None, env
+        )  # the default is graph, so it is refused too
 
 
 def test_nsys_graph_trace_allows_graph_with_the_copy_engine_off():
@@ -1253,8 +1584,17 @@ def test_nsys_graph_trace_refuses_an_unknown_mode(value):
 
 
 def test_nsys_report_dir_must_stay_on_nvme1():
-    assert nsys_capture.check_report_dir("/mnt/nvme1/dsv41-nsys") == "/mnt/nvme1/dsv41-nsys"
-    for bad in ["/tmp/nsys", "dsv41-nsys", "/mnt/nvme1", "/mnt/nvme1/../tmp", "/data/models/x"]:
+    assert (
+        nsys_capture.check_report_dir("/mnt/nvme1/dsv41-nsys")
+        == "/mnt/nvme1/dsv41-nsys"
+    )
+    for bad in [
+        "/tmp/nsys",
+        "dsv41-nsys",
+        "/mnt/nvme1",
+        "/mnt/nvme1/../tmp",
+        "/data/models/x",
+    ]:
         with pytest.raises(ValueError):
             nsys_capture.check_report_dir(bad)
 
@@ -1268,15 +1608,24 @@ def test_run_arm_passes_the_chosen_graph_trace_mode_to_nsys():
     assert "--cuda-graph-trace=graph" not in script, "the mode is hard-wired again"
     assert '--cuda-graph-trace="$nsys_graph_trace"' in script
     # The check reads the arm's full resolved env, not just the KEY=VAL overrides.
-    assert "nsys_capture.graph_trace_mode(sys.argv[1], json.load(open('$expected_env_path')))" in script
+    assert (
+        "nsys_capture.graph_trace_mode(sys.argv[1], json.load(open('$expected_env_path')))"
+        in script
+    )
     assert "export NSYS_TMPDIR" in script
     assert "nsys_capture.check_report_dir" in script
 
 
 def test_run_arm_writes_the_nsys_report_before_it_stops_the_server():
     lines = _run_arm_script().splitlines()
-    stop = next(i for i, l in enumerate(lines) if l.strip().startswith('nsys stop --session="$nsys_session"'))
-    wait = next(i for i, l in enumerate(lines) if 'stat -c %s "$nsys_report.nsys-rep"' in l)
+    stop = next(
+        i
+        for i, l in enumerate(lines)
+        if l.strip().startswith('nsys stop --session="$nsys_session"')
+    )
+    wait = next(
+        i for i, l in enumerate(lines) if 'stat -c %s "$nsys_report.nsys-rep"' in l
+    )
     # The unindented stop_server that ends a successful arm (abort paths call it inside `{ ...; }` or a block).
     final_stop = next(i for i, l in enumerate(lines) if l == "stop_server")
     assert stop < wait < final_stop
@@ -1298,7 +1647,9 @@ _DIVIX01_ROOT_DEVICES = (
 
 def test_nsys_gpu_metrics_default_to_on_with_the_gb20x_set_on_every_gpu():
     args = nsys_capture.gpu_metrics_args(None)
-    assert args == nsys_capture.gpu_metrics_args("") == nsys_capture.gpu_metrics_args("1")
+    assert (
+        args == nsys_capture.gpu_metrics_args("") == nsys_capture.gpu_metrics_args("1")
+    )
     assert "--gpu-metrics-set=gb20x" in args
     # sudo resets the environment, so cuda-visible would not see CUDA_VISIBLE_DEVICES.
     assert "--gpu-metrics-devices=all" in args
@@ -1342,15 +1693,22 @@ def _line(lines, needle, start=0):
 def test_run_arm_checks_gpu_metrics_through_sudo_before_the_server_starts():
     lines = _run_arm_script().splitlines()
     check = _line(lines, '"${nsys_sudo[@]}" profile --gpu-metrics-devices=help')
-    launch = next(i for i, l in enumerate(lines) if l.startswith('taskset -c "$server_cores"'))
+    launch = next(
+        i for i, l in enumerate(lines) if l.startswith('taskset -c "$server_cores"')
+    )
     assert check < launch
     assert any("sudo -n" in l and "NSYS_SUDO_WRAPPER" in l for l in lines)
 
 
 def test_run_arm_starts_the_pcie_session_before_the_trace_and_stops_it_after():
     lines = _run_arm_script().splitlines()
-    pcie_launch = _line(lines, '"${nsys_sudo[@]}" launch --session-new="$pcie_session" --trace=none')
-    pcie_start = _line(lines, '"${nsys_sudo[@]}" start --session="$pcie_session" --output="$nsys_report-pcie"')
+    pcie_launch = _line(
+        lines, '"${nsys_sudo[@]}" launch --session-new="$pcie_session" --trace=none'
+    )
+    pcie_start = _line(
+        lines,
+        '"${nsys_sudo[@]}" start --session="$pcie_session" --output="$nsys_report-pcie"',
+    )
     trace_start = _line(lines, 'nsys start --session="$nsys_session"')
     trace_stop = _line(lines, 'nsys stop --session="$nsys_session"')
     pcie_stop = _line(lines, "stop_pcie_session stop", trace_stop)

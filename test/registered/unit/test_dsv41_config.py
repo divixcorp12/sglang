@@ -39,7 +39,9 @@ def test_one_field_per_knob():
     declared = {
         name
         for name in vars(type(envs))
-        if name.startswith(("SGLANG_DSV41_", "SGLANG_ENABLE_DSV41_", "SGLANG_TEST_DSV41_"))
+        if name.startswith(
+            ("SGLANG_DSV41_", "SGLANG_ENABLE_DSV41_", "SGLANG_TEST_DSV41_")
+        )
     }
     assert len(declared) == len(msgspec.structs.fields(Dsv41Config))
 
@@ -56,7 +58,10 @@ def test_from_envs_observes_an_override_and_reverts_after():
         assert Dsv41Config.from_envs().enable_ram_miss_copy_engine is True
         with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
             inner = Dsv41Config.from_envs()
-            assert inner.ram_miss_timeout_ms == 40_000 and inner.enable_ram_miss_copy_engine is True
+            assert (
+                inner.ram_miss_timeout_ms == 40_000
+                and inner.enable_ram_miss_copy_engine is True
+            )
         assert Dsv41Config.from_envs().ram_miss_timeout_ms == 2000
     assert Dsv41Config.from_envs().enable_ram_miss_copy_engine is False
 
@@ -105,10 +110,18 @@ def test_removed_ram_miss_knobs_warn(monkeypatch):
         assert environ._DEPRECATED_ENVS[name].replacement is None, name
     assert "build_row_images.py" in text and "lease mode is always on" in text
     fields = {f.name for f in msgspec.structs.fields(Dsv41Config)}
-    assert not {
-        "ram_miss_pack_workers", "enable_ram_miss_row_images", "enable_ram_miss_leases", "enable_ram_miss_two_phase",
-        "enable_ram_miss_piece_stream", "enable_expert_prefetch", "enable_native_prefetch",
-    } & fields
+    assert (
+        not {
+            "ram_miss_pack_workers",
+            "enable_ram_miss_row_images",
+            "enable_ram_miss_leases",
+            "enable_ram_miss_two_phase",
+            "enable_ram_miss_piece_stream",
+            "enable_expert_prefetch",
+            "enable_native_prefetch",
+        }
+        & fields
+    )
     Dsv41Config.from_envs()  # the set values do not break the config a service starts from
 
 
@@ -159,4 +172,3 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
-

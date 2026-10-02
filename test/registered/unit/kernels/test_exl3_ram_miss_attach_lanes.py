@@ -14,7 +14,12 @@ from sglang.srt.layers.moe.exl3_expert_layout import build_exl3_expert_layout
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache, ExpertStreamer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import write_fake_exl3
-from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, DirectUpdaterStandIn, paused, service_row_images
+from sglang.test.dsv41_ram_miss_fixtures import (
+    ROW_IMAGE_DIM,
+    DirectUpdaterStandIn,
+    paused,
+    service_row_images,
+)
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -32,20 +37,35 @@ def hang_guard():
 def tiers(tmp_path, monkeypatch):
     """The service reads row images (service_row_images) with O_DIRECT, as in production. The attached layers' copy
     tables are stubs, so their piece maps are too: what is under test is the gather width."""
-    monkeypatch.setattr(module, "stream_segment_map", lambda segments, tables, row: None)
-    write_fake_exl3(str(tmp_path), num_layers=LAYERS, num_experts=EXPERTS, hidden=ROW_IMAGE_DIM, inter=ROW_IMAGE_DIM)
+    monkeypatch.setattr(
+        module, "stream_segment_map", lambda segments, tables, row: None
+    )
+    write_fake_exl3(
+        str(tmp_path),
+        num_layers=LAYERS,
+        num_experts=EXPERTS,
+        hidden=ROW_IMAGE_DIM,
+        inter=ROW_IMAGE_DIM,
+    )
     layout = build_exl3_expert_layout(str(tmp_path))
     module.Exl3RamMissService._instance = None
     streamers = {}
     with service_row_images(tmp_path):
-        with envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True):
+        with (
+            envs.SGLANG_MOE_EXPERT_ROW_SOURCE.override("shards"),
+            envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.override(True),
+        ):
             for layer_id in range(LAYERS):
                 layer = torch.nn.Module()
                 layer.layer_id = layer_id
                 fmt = Exl3ExpertFormat(layout, layer_id, source_root=str(tmp_path))
-                streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
+                streamer = ExpertStreamer(
+                    layer, fmt.names, layer_id=layer_id, format=fmt
+                )
                 layer._nvfp4_expert_streamer = streamer
-                ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
+                ExpertPinnedHostCache(
+                    streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer)
+                )
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
         service.staging_slots = 1
@@ -57,7 +77,9 @@ def tiers(tmp_path, monkeypatch):
 def _manager(updater=None):
     return SimpleNamespace(
         register_fail_stop_check=lambda check: None,
-        gpu_residency=updater if updater is not None else DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS),
+        gpu_residency=updater
+        if updater is not None
+        else DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS),
     )
 
 
@@ -65,7 +87,9 @@ def _attach(service, streamer, rows, manager=None):
     streamer._graph_pinned_tier = True
     streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
     streamer.graph_gather_rows = rows
-    streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
+    streamer.row_backend = SimpleNamespace(
+        segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64)
+    )
     service.attach(manager if manager is not None else _manager(), streamer)
 
 
@@ -77,14 +101,20 @@ def test_a_gather_within_the_lanes_attaches(tiers, rows):
     assert streamers[0].row_backend.device_side is service.device_side
 
 
-@pytest.mark.parametrize("rows", [MAX_IDS + 1, 2 * 6])  # 12: two tokens of a top-6 model
+@pytest.mark.parametrize(
+    "rows", [MAX_IDS + 1, 2 * 6]
+)  # 12: two tokens of a top-6 model
 def test_a_gather_wider_than_the_lanes_is_refused_before_anything_is_built(tiers, rows):
     service, streamers = tiers
-    with pytest.raises(ValueError, match=rf"gathers up to {rows} rows .* at most {MAX_IDS} lanes"):
+    with pytest.raises(
+        ValueError, match=rf"gathers up to {rows} rows .* at most {MAX_IDS} lanes"
+    ):
         _attach(service, streamers[1], rows)
     assert service.device_side is None  # no device words were allocated for it
     assert service.routed_rows_per_step == 0
-    assert not hasattr(streamers[1].row_backend, "device_side")  # the layer keeps its previous backend
+    assert not hasattr(
+        streamers[1].row_backend, "device_side"
+    )  # the layer keeps its previous backend
 
 
 def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
@@ -96,7 +126,10 @@ def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
     host = service.host
     with paused(host):
         staging = {
-            row: [s for s, (state, _, _) in enumerate(host.slot_info(row)) if state == 3] for row in range(LAYERS)
+            row: [
+                s for s, (state, _, _) in enumerate(host.slot_info(row)) if state == 3
+            ]
+            for row in range(LAYERS)
         }
     assert all(len(slots) == 1 for slots in staging.values())
     service.before_host_use()
@@ -104,7 +137,10 @@ def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
         for row in range(LAYERS):
             for expert in range(EXPERTS):
                 host.assign(row, expert)
-        mapped = {row: {slot for slot in host.mapping(row) if slot >= 0} for row in range(LAYERS)}
+        mapped = {
+            row: {slot for slot in host.mapping(row) if slot >= 0}
+            for row in range(LAYERS)
+        }
         bulk = host.take_bulk_delta().tolist()
     finally:
         service.after_host_use()
@@ -138,23 +174,32 @@ def test_attach_refuses_a_manager_without_direct_residency(tiers):
     listener instead."""
     service, streamers = tiers
     service.ensure_started()
-    off = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=None)
+    off = SimpleNamespace(
+        register_fail_stop_check=lambda check: None, gpu_residency=None
+    )
     with pytest.raises(RuntimeError, match="needs DIRECT residency"):
         _attach(service, streamers[0], 1, off)
     with pytest.raises(RuntimeError, match="needs DIRECT residency"):
-        _attach(service, streamers[0], 1, _manager(SimpleNamespace(insert_direct=False)))
+        _attach(
+            service, streamers[0], 1, _manager(SimpleNamespace(insert_direct=False))
+        )
     assert service.device_side is None and service._manager is None
 
 
 def test_cpu_experts_refuse_the_generic_route_plan():
     """Only the fused plan sorts the miss lanes; refused before the host is touched."""
     cfg = SimpleNamespace(enable_ram_miss_copy_engine=True)
-    with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"), envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False):
+    with (
+        envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"),
+        envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False),
+    ):
         with pytest.raises(RuntimeError, match="needs SGLANG_MOE_EXPERT_FUSED_PLAN"):
             module.Exl3RamMissService._start_cpu_experts(cfg, None, None, {}, False)
 
 
-def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(tiers, monkeypatch):
+def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(
+    tiers, monkeypatch
+):
     """Production wiring: the first attach turns the updater's miss order on.
 
     Each pinned-tier layer's fused plan sorts by that layer's own row of the keys.
@@ -164,22 +209,30 @@ def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(ti
     service.ensure_started()
     built = []
     monkeypatch.setattr(
-        module, "Exl3RamMissRowBackend", lambda *args, **kwargs: built.append(kwargs) or SimpleNamespace()
+        module,
+        "Exl3RamMissRowBackend",
+        lambda *args, **kwargs: built.append(kwargs) or SimpleNamespace(),
     )
     service.cpu_experts = SimpleNamespace(
-        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
+        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8),
+        out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
         attach_device=lambda device_side: None,
     )
     updater = DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
-    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater)
+    manager = SimpleNamespace(
+        register_fail_stop_check=lambda check: None, gpu_residency=updater
+    )
     try:
         for layer_id, streamer in streamers.items():
             streamer._graph_pinned_tier = True
             streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
             streamer.graph_gather_rows = 1
-            streamer.residency_row = LAYERS - 1 - layer_id  # not the service's row: the keys follow the updater's
+            streamer.residency_row = (
+                LAYERS - 1 - layer_id
+            )  # not the service's row: the keys follow the updater's
             streamer.row_backend = SimpleNamespace(
-                segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64)
+                segments={0: None},
+                host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64),
             )
             service.attach(manager, streamer)
     finally:
@@ -217,12 +270,23 @@ class _Side:
 def _captured_backend(monkeypatch, streamer_of):
     side = _Side()
     backend = module.Exl3RamMissRowBackend(
-        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), side, 0, 1, {0: None},
-        copy_engine=True, cpu_experts=True, streamer_of=streamer_of,
+        {0: None},
+        torch.full((EXPERTS,), -1, dtype=torch.int64),
+        side,
+        0,
+        1,
+        {0: None},
+        copy_engine=True,
+        cpu_experts=True,
+        streamer_of=streamer_of,
     )
     backend.cpu_input = (torch.zeros(1, 16), torch.ones(1, 1))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *args: side.calls.append(("copy", {})))
+    monkeypatch.setattr(
+        module,
+        "copy_expert_row_segments_gpu",
+        lambda *args: side.calls.append(("copy", {})),
+    )
     return backend, side
 
 
@@ -232,7 +296,10 @@ def test_a_captured_cpu_expert_gather_with_the_miss_order_posts_its_input(monkey
     backend, side = _captured_backend(monkeypatch, lambda: streamer)
     backend.post(0, _CapturedPlan())
     assert [name for name, _ in side.calls] == ["post", "copy", "stream", "copy_wait"]
-    assert side.calls[0][1]["captured"] and side.calls[0][1]["cpu_input"] is backend.cpu_input
+    assert (
+        side.calls[0][1]["captured"]
+        and side.calls[0][1]["cpu_input"] is backend.cpu_input
+    )
     assert side.copy_engine_captured
 
 
@@ -255,8 +322,14 @@ def test_a_captured_cpu_expert_gather_whose_streamer_is_gone_is_refused(monkeypa
 def test_cpu_experts_backend_needs_its_streamer():
     with pytest.raises(ValueError, match="pass streamer_of"):
         module.Exl3RamMissRowBackend(
-            {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, 1, {0: None},
-            copy_engine=True, cpu_experts=True,
+            {0: None},
+            torch.full((EXPERTS,), -1, dtype=torch.int64),
+            SimpleNamespace(),
+            0,
+            1,
+            {0: None},
+            copy_engine=True,
+            cpu_experts=True,
         )
 
 

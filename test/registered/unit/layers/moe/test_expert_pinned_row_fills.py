@@ -79,14 +79,21 @@ def _setup(capacity=6, experts=8):
     streamer = ExpertStreamer(layer, NAMES, format=SpecOnlyFormat(reference))
     table = PinnedSlotLRU(capacity)
     fills = FakeFills(table, reference)
-    cache = ExpertPinnedHostCache(streamer, capacity, device="cpu", slot_table=table, row_fills=fills)
+    cache = ExpertPinnedHostCache(
+        streamer, capacity, device="cpu", slot_table=table, row_fills=fills
+    )
     fills.cache = cache
-    streamer.read_host_rows = lambda *args, **kwargs: pytest.fail("the row source read a row")
+    streamer.read_host_rows = lambda *args, **kwargs: pytest.fail(
+        "the row source read a row"
+    )
     return streamer, cache, fills, reference
 
 
 def _outputs(reference, rows):
-    return {n: torch.empty((rows,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in reference.items()}
+    return {
+        n: torch.empty((rows,) + tuple(t.shape[1:]), dtype=t.dtype)
+        for n, t in reference.items()
+    }
 
 
 def _check(outputs, reference, experts):
@@ -98,9 +105,10 @@ def test_without_row_fills_the_row_source_reads_as_before():
     streamer, cache, fills, reference = _setup()
     cache.row_fills = None
     calls = []
-    streamer.read_host_rows = lambda ids, destinations, slots: calls.append(ids.tolist()) or [
-        destinations[n][slots].copy_(reference[n][ids]) for n in NAMES
-    ]
+    streamer.read_host_rows = lambda ids, destinations, slots: (
+        calls.append(ids.tolist())
+        or [destinations[n][slots].copy_(reference[n][ids]) for n in NAMES]
+    )
     cache.ensure_rows(torch.tensor([3, 1]))
     assert calls == [[3, 1]] and fills.events == []
 
@@ -114,7 +122,10 @@ def test_ensure_rows_reads_through_the_fills_and_joins_them():
     _check(outputs, reference, [3, 1])
     assert cache.stats.populated_rows == 2
     # Counted as reads in the stream trace (rows and blocked time), with no split.
-    assert streamer.background_read_stats.rows == 2 and streamer.background_read_stats.split_ns == 0
+    assert (
+        streamer.background_read_stats.rows == 2
+        and streamer.background_read_stats.split_ns == 0
+    )
 
 
 def test_a_failed_fill_raises_from_ensure_rows():
@@ -133,12 +144,20 @@ def test_gather_rows_waits_for_each_chunks_own_prefetched_rows_before_copying():
         assert cache.prefetch_rows([1, 2, 4, 6], protected=[1, 2, 4, 6]) == 3
         first = _outputs(reference, 2)
         cache.gather_rows(torch.tensor([1, 4]), first)
-        assert fills.events[-1] == ("wait", 1)  # expert 1 is the first claimed; 4 was resident
+        assert fills.events[-1] == (
+            "wait",
+            1,
+        )  # expert 1 is the first claimed; 4 was resident
         second = _outputs(reference, 2)
         cache.gather_rows(torch.tensor([2, 6]), second)
         assert fills.events[-1] == ("wait", 3)
         cache.finish_fills()
-    assert fills.events[0] == ("begin", [1, 2, 6], [1, 2, 4, 6], False) and fills.events[-1] == ("end",)
+    assert fills.events[0] == (
+        "begin",
+        [1, 2, 6],
+        [1, 2, 4, 6],
+        False,
+    ) and fills.events[-1] == ("end",)
     _check(first, reference, [1, 4])
     _check(second, reference, [2, 6])
 
@@ -194,7 +213,9 @@ if __name__ == "__main__":
 def test_copy_rows_copies_only_the_named_rows_and_leaves_the_rest():
     streamer, cache, fills, reference = _setup()
     cache.ensure_rows(torch.tensor([3, 1, 5]))
-    outputs = {n: torch.full_like(t, SENTINEL) for n, t in _outputs(reference, 3).items()}
+    outputs = {
+        n: torch.full_like(t, SENTINEL) for n, t in _outputs(reference, 3).items()
+    }
     cache.copy_rows(torch.tensor([3, 1, 5]), outputs, rows=torch.tensor([2, 0]))
     for name in NAMES:
         assert torch.equal(outputs[name][0], reference[name][3])
@@ -210,7 +231,9 @@ def _unsplit_setup(**kwargs):
 
 
 def _sentinel_outputs(reference, rows):
-    return {n: torch.full_like(t, SENTINEL) for n, t in _outputs(reference, rows).items()}
+    return {
+        n: torch.full_like(t, SENTINEL) for n, t in _outputs(reference, rows).items()
+    }
 
 
 def test_split_gather_copies_resident_rows_before_waiting_for_the_fills():
@@ -220,14 +243,23 @@ def test_split_gather_copies_resident_rows_before_waiting_for_the_fills():
     seen = []
     wait = fills.fill_wait
     with cache.host_use():
-        assert cache.prefetch_rows([1, 4, 6], protected=[1, 4, 6]) == 2  # claims 1 and 6; 4 is resident
+        assert (
+            cache.prefetch_rows([1, 4, 6], protected=[1, 4, 6]) == 2
+        )  # claims 1 and 6; 4 is resident
         outputs = _sentinel_outputs(reference, 3)
-        fills.fill_wait = lambda rows: (seen.append({n: o.clone() for n, o in outputs.items()}), wait(rows))
+        fills.fill_wait = lambda rows: (
+            seen.append({n: o.clone() for n, o in outputs.items()}),
+            wait(rows),
+        )
         cache.gather_rows(torch.tensor([1, 4, 6]), outputs)
         cache.finish_fills()
     for name in NAMES:
-        assert torch.equal(seen[0][name][1], reference[name][4])  # the resident row, copied before the wait
-        assert (seen[0][name][0] == SENTINEL).all() and (seen[0][name][2] == SENTINEL).all()
+        assert torch.equal(
+            seen[0][name][1], reference[name][4]
+        )  # the resident row, copied before the wait
+        assert (seen[0][name][0] == SENTINEL).all() and (
+            seen[0][name][2] == SENTINEL
+        ).all()
     _check(outputs, reference, [1, 4, 6])
 
 
@@ -239,9 +271,14 @@ def test_split_gather_places_every_chunks_rows_like_the_unsplit_gather():
         cache.ensure_rows(torch.tensor([0, 5]))
         with cache.host_use():
             cache.prefetch_rows([0, 2, 3, 5, 7], protected=[0, 2, 3, 5, 7])
-            first, second = _sentinel_outputs(reference, 3), _sentinel_outputs(reference, 3)
+            first, second = (
+                _sentinel_outputs(reference, 3),
+                _sentinel_outputs(reference, 3),
+            )
             cache.gather_rows(torch.tensor([0, 2, 5]), first)
-            cache.gather_rows(torch.tensor([7, 5, 3]), second)  # filling at 0 and 2, resident 5 between
+            cache.gather_rows(
+                torch.tensor([7, 5, 3]), second
+            )  # filling at 0 and 2, resident 5 between
             cache.finish_fills()
         _check(first, reference, [0, 2, 5])
         _check(second, reference, [7, 5, 3])
@@ -257,7 +294,9 @@ def test_a_chunk_of_only_filling_rows_waits_then_copies_once():
     streamer, cache, fills, reference = _setup()
     copies = []
     copy = cache.copy_rows
-    cache.copy_rows = lambda ids, outputs, rows=None: copies.append(rows) or copy(ids, outputs, rows=rows)
+    cache.copy_rows = lambda ids, outputs, rows=None: (
+        copies.append(rows) or copy(ids, outputs, rows=rows)
+    )
     with cache.host_use():
         cache.prefetch_rows([1, 6], protected=[1, 6])
         outputs = _sentinel_outputs(reference, 2)
@@ -286,12 +325,17 @@ def _snapshot_at_waits(fills, outputs):
     """Record the outputs as they are each time the host starts waiting for a fill."""
     seen = []
     wait = fills.fill_wait
-    fills.fill_wait = lambda rows: (seen.append((rows, {n: o.clone() for n, o in outputs.items()})), wait(rows))
+    fills.fill_wait = lambda rows: (
+        seen.append((rows, {n: o.clone() for n, o in outputs.items()})),
+        wait(rows),
+    )
     return seen
 
 
 def _copied(snapshot, row, reference, expert):
-    return all(torch.equal(snapshot[name][row], reference[name][expert]) for name in NAMES)
+    return all(
+        torch.equal(snapshot[name][row], reference[name][expert]) for name in NAMES
+    )
 
 
 def _untouched(snapshot, row):
@@ -302,7 +346,9 @@ def test_a_row_that_landed_in_an_earlier_chunks_wait_is_copied_before_the_next_w
     streamer, cache, fills, reference = _setup()
     with cache.host_use():
         cache.prefetch_rows([1, 2, 5, 6], protected=[1, 2, 5, 6])
-        cache.gather_rows(torch.tensor([1, 5]), _sentinel_outputs(reference, 2))  # waits for 1, 2 and 5
+        cache.gather_rows(
+            torch.tensor([1, 5]), _sentinel_outputs(reference, 2)
+        )  # waits for 1, 2 and 5
         outputs = _sentinel_outputs(reference, 2)
         seen = _snapshot_at_waits(fills, outputs)
         cache.gather_rows(torch.tensor([2, 6]), outputs)
@@ -346,7 +392,9 @@ def test_a_chunks_filling_rows_are_copied_batch_by_batch_as_they_land():
 
 
 @pytest.mark.parametrize("progress", [0, 3])
-def test_three_chunks_with_resident_landed_and_filling_rows_place_like_the_unsplit_gather(progress):
+def test_three_chunks_with_resident_landed_and_filling_rows_place_like_the_unsplit_gather(
+    progress,
+):
     got = None
     chunks = ([9, 0, 2, 11], [3, 5, 12, 4], [13, 7, 1, 10])
     for setup in (_unsplit_setup, _setup):

@@ -575,7 +575,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
             # The first graph-path forward of the layer is a warmup, before capture: the only place that knows the
             # layer's activation limit registers its pinned slabs with the CPU kernel.
-            Exl3RamMissService.get().cpu_experts.register(backend.row, float(swiglu_limit))
+            Exl3RamMissService.get().cpu_experts.register(
+                backend.row, float(swiglu_limit)
+            )
             # The post stages x and the lanes' weights for the CPU expert thread (Exl3RamMissRowBackend.post).
             backend.cpu_input = (x, topk_weights)
         try:
