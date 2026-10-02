@@ -86,6 +86,8 @@ class CpuExpertService:
         self.hidden, self.cores, self.threads = int(hidden), tuple(cores), int(threads)
         self.split = list(split)
         self.calibrated = False
+        self._calibration_stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
+        self._calibration_scratch: Optional[torch.Tensor] = None
         rows = len(self.slabs_by_row)
         if sorted(self.slabs_by_row) != list(range(rows)):
             raise ValueError("CPU experts need the slabs of every service row 0..rows-1")
@@ -151,7 +153,7 @@ class CpuExpertService:
 
     def log_stats(self) -> dict[str, int]:
         """Log the CPU expert thread's cumulative counters: an A/B arm reads its per-expert cost under load here."""
-        stats = self.host.cpu_stats()
+        stats = {key: value - self._calibration_stats[key] for key, value in self.host.cpu_stats().items()}
         lanes = stats["lanes"]
         logger.info(
             "CPU experts stats: %d jobs, %d lanes, %.3f ms per lane, split %s",
@@ -201,6 +203,8 @@ class CpuExpertService:
             )
             return None
         reps = envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.get()
+        before = self.host.cpu_stats()
+        scratch = None
         try:
             expert_bytes = self.host.copy_expert_bytes(row)
             scratch = torch.empty(
@@ -208,17 +212,26 @@ class CpuExpertService:
             )
             grid = self.host.calibrate_cpu_split(row, device=device, reps=reps, scratch=scratch).tolist()
         except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
+            # A timed-out DMA may still write into the scratch: never hand its block back to the allocator.
+            self._calibration_scratch = scratch
+            self._exclude_calibration_stats(before)
             logger.warning("CPU experts calibration failed (%s); keeping split %s", error, self.split)
             return None
+        self._exclude_calibration_stats(before)
         split = split_from_grid(grid)
         self.split, self.calibrated = split, True
         self.host.set_cpu_split(split)
-        self._last_stats = self.host.cpu_stats()  # calibration's own jobs are not decode's
         report = format_calibration(grid, split, row=row, expert_bytes=expert_bytes, reps=reps)
         print(report, flush=True)
         logger.info("%s", report)
         logger.debug("CPU experts calibration grid, ms (row 1 + n is both[n][k]): %s", grid)
         return split
+
+    def _exclude_calibration_stats(self, before: dict[str, int]) -> None:
+        """Calibration's own CPU jobs are not decode's: log_stats subtracts them and retune starts after them."""
+        after = self.host.cpu_stats()
+        self._calibration_stats = {key: after[key] - before[key] for key in after}
+        self._last_stats = after
 
 
 def cpu_expert_cores() -> tuple[list[int], int]:

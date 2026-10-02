@@ -32,6 +32,10 @@ before `host.arm_copy_engine()`. By then:
 It runs on the Python thread at a batch boundary, with the RAM thread paused (`pause()`/`resume()`), so the caller
 owns the tier and may submit CPU jobs. Expected cost: about 2-3 s, once.
 
+The copy engine arms after 16 decode forwards since capture, and the server's warm-up runs fewer, so this stall lands
+inside the first real request's decode. A benchmark comparing splits must discard its first session (or warm up past
+16 decode steps) before measuring.
+
 ## What it measures
 
 All three passes use one calibration row: the first registered CPU row whose RAM tier has at least 8 slots, and its
@@ -93,9 +97,9 @@ The full `both[n][k]` grid goes to the log at DEBUG.
 ## Configuration
 
 - `SGLANG_DSV41_CPU_EXPERTS_SPLIT` (existing): an explicit table still wins, and calibration is skipped.
-- `SGLANG_DSV41_CPU_EXPERTS_CALIBRATE` (new, bool, default on): off restores today's behavior, the constants model
-  plus `retune()`.
-- `SGLANG_DSV41_CPU_EXPERTS_CALIBRATE_REPS` (new, int, default 10).
+- `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION` (new, bool, default on): off restores today's behavior, the
+  constants model plus `retune()`.
+- `SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS` (new, int, default 10).
 - The constants (`_CPU_MS`, `_LINK_MS`, `_HANDOFF_MS`) remain the initial split until calibration replaces it, and
   the whole split when calibration is off.
 

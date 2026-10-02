@@ -978,4 +978,4 @@ CPU experts calibration: row 0, expert <size> MiB, 10 reps
 
 Check `link[1]` against the expert size over the Gen3 x16 link (about 12-13 GB/s effective) and `cpu[1]` against the 0.52 ms constant.
 
-- [ ] **Step 3: A/B decode ms/token** on the same prompt set: once as launched (calibrated), once with `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION=0` (the constants' split). Success per the spec: the calibrated split is no slower.
+- [ ] **Step 3: A/B decode ms/token** on the same prompt set: once as launched (calibrated), once with `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION=0` (the constants' split). Success per the spec: the calibrated split is no slower. Discard each arm's first session: the calibrated arm's 2-3 s calibration lands inside the first request's decode (the copy engine arms at the 16th decode forward).
