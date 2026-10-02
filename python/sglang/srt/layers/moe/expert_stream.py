@@ -1301,8 +1301,9 @@ class ExpertStreamer:
         layer tensor was rebound after this call; replays cannot check, and keep
         reading the tensors frozen here.
 
-        ``scratch_destinations=False`` sends miss lanes to victim slots chosen by the
-        residency policy instead of scratch rows.
+        ``scratch_destinations=False`` sends miss lanes to victim slots instead of
+        scratch rows: the direct residency insert (``expert_residency_gpu.py``) writes
+        them into ``_graph_destination_slots`` before each gather.
         """
         pinned_tier = graph_source_kind_of(self.format) == "pinned_tier"
         require_graph_gather_support((self,), pinned_tier_ok=True)
