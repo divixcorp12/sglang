@@ -25,6 +25,8 @@ COMMON = {
     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "0",
     "SGLANG_MOE_EXPERT_FUSED_PLAN": "0",
     "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "0",
+    # Device wait serves from the uring store, which the 2026-09-24 DSpark launch kept off.
+    "SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT": "0",
     "SGLANG_SM120_FLASHMLA_BACKEND": "triton",
     # Layer-major prefill needs --max-running-requests 1; trace_corpus launches with 4.
     "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "0",
