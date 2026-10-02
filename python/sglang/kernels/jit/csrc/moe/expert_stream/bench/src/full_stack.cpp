@@ -136,11 +136,13 @@ class Bench {
  public:
   // The bare phase first: the slots hold expert e in slot e (StackFixture::preload_slots), and no stack exists, so no
   // CPU expert thread spins on worker 0's core, where the kernel puts every caller.
-  Bench(const Options& options, Placement placement, StackFixture& fixture, std::vector<int64_t> handles)
+  Bench(const Options& options, Placement placement, StackFixture& fixture, std::vector<int64_t> handles,
+        std::set<int> before)
       : options_(options),
         placement_(std::move(placement)),
         fixture_(fixture),
         handles_(std::move(handles)),
+        before_(std::move(before)),
         deadline_ns_(int64_t{options.wait_timeout_ms} * 1'000'000 / 2) {
     for (int k : {1, 3, 5}) {
       for (int i = 0; i < k; ++i) {
@@ -158,6 +160,21 @@ class Bench {
   Stack<BenchBuild>& stack() {
     enter_stack_phase();
     return *stack_;
+  }
+
+  // The thread census, once per phase and before that phase is timed (the spec refuses a failed affinity check before
+  // any timing). The bare phase has only the kernel's helpers (this thread is worker 0, and predates `before`); the
+  // stack phase has every thread setup created. Call after a forward of the phase, which builds its OpenMP team.
+  void check_threads() {
+    if (stack_) {
+      if (stack_census_) return;
+      verify_threads(before_, expected_threads(placement_));
+      stack_census_ = true;
+    } else {
+      if (bare_census_) return;
+      verify_threads(before_, std::vector<int>(placement_.workers.begin() + 1, placement_.workers.end()));
+      bare_census_ = true;
+    }
   }
 
   // Ends the bare phase, on the writer's thread: release the bare caller's OpenMP team (one team at a time), build the
@@ -251,6 +268,9 @@ class Bench {
   Placement placement_;
   StackFixture& fixture_;
   std::vector<int64_t> handles_;  // owned by main's LayerHandles, which outlives this
+  std::set<int> before_;          // the process's threads before setup
+  bool bare_census_ = false;
+  bool stack_census_ = false;
   int64_t deadline_ns_;
   std::map<int, std::vector<int32_t>> experts_;
   std::map<int, std::vector<float>> weights_;
@@ -270,10 +290,19 @@ void gap(const Options& options) {
   if (options.gap_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(options.gap_us));
 }
 
+// No timing from a failed process: once one benchmark has failed, the rest report nothing.
+bool skip_after_failure(benchmark::State& state) {
+  if (!benchmark_failed) return false;
+  state.SkipWithError("skipped: an earlier benchmark in this process failed");
+  return true;
+}
+
 void bm_bare(benchmark::State& state, Bench& bench, int k) {
+  if (skip_after_failure(state)) return;
   try {
     PinScope caller(bench.placement().workers.front());  // the kernel runs its caller as worker 0, on that core
     bench.validate(k, false);
+    bench.check_threads();
     for (int i = 0; i < bench.options().warmup; ++i) bench.bare_call(i % bench.rows(), k);
     std::vector<double> samples;
     int64_t row = 0;
@@ -305,9 +334,11 @@ void bm_bare(benchmark::State& state, Bench& bench, int k) {
 }
 
 void bm_stack(benchmark::State& state, Bench& bench, int k) {
+  if (skip_after_failure(state)) return;
   try {
     Stack<BenchBuild>& stack = bench.stack();
     bench.validate(k, true);
+    bench.check_threads();
     for (int i = 0; i < bench.options().warmup; ++i) bench.stack_call(i % bench.rows(), k);
     std::vector<double> total, pickup, service, forward, handoff;
     [[maybe_unused]] auto stage = std::make_unique<es::StageRecord>();
@@ -361,8 +392,13 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
         state.counters["pickup_p95_us"] = quantile_us(pickup, 0.95);
         state.counters["service_p50_us"] = quantile_us(service, 0.50);
         state.counters["service_p95_us"] = quantile_us(service, 0.95);
-        state.counters["forward_p50_us"] = quantile_us(forward, 0.50);
+        const double forward_p50 = quantile_us(forward, 0.50);
+        state.counters["forward_p50_us"] = forward_p50;
         state.counters["forward_p95_us"] = quantile_us(forward, 0.95);
+        // The bare baseline runs before the stack exists, with no service, writer or copy thread spinning: these
+        // show how far the in-stack kernel time moved from it, and the overhead against the in-stack kernel itself.
+        state.counters["overhead_vs_forward_p50_us"] = p50 - forward_p50;
+        if (bench.bare_p50_us.contains(k)) state.counters["forward_vs_bare_p50_us"] = forward_p50 - bench.bare_p50_us[k];
         state.counters["handoff_p50_us"] = quantile_us(handoff, 0.50);
         state.counters["handoff_p95_us"] = quantile_us(handoff, 0.95);
       }
@@ -404,15 +440,16 @@ int main(int argc, char** argv) {
       fixture->preload_slots(row);
       layers.handles.push_back(fixture->register_layer(row));
     }
-    Bench bench(options, placement, *fixture, layers.handles);
+    Bench bench(options, placement, *fixture, layers.handles, before);
     const std::vector<int> expected = expected_threads(placement);
     if (options.validate_only) {
       {
         PinScope caller(placement.workers.front());  // the kernel runs its caller as worker 0, on that core
         for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/false);
+        bench.check_threads();
       }
       for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/true);  // the first builds the stack
-      verify_threads(before, expected);
+      bench.check_threads();
       std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
                 << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName
                 << " build)\n";

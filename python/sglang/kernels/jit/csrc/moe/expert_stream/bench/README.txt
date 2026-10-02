@@ -158,7 +158,8 @@ registered before BM_stack; under --benchmark_enable_random_interleaving, a BM_b
 Checks: --validate-only compares all 24 layer outputs bare, then all 24 through the stack, bit-exactly with
 reference-e{1,3,5}.bin, and requires every thread created during setup to be pinned to its CPU. In a timed run, each
 benchmark compares its 8 outputs before and after it is timed; BM_stack also requires one CPU job of k lanes per call,
-no row read and no overrun; the thread check runs at the end. --self-test (no fixture; run under taskset -c 0-15,
+no row read and no overrun. Each phase's thread check runs before that phase is timed (and once more at the end); once
+any benchmark fails, the later ones are skipped, so a failed process reports no further timings. --self-test (no fixture; run under taskset -c 0-15,
 defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 --cpus=3) checks the writer's records and lane typing against
 ram_slot_map.type_lanes and drives the real stack with a fake forward.
 
@@ -171,6 +172,9 @@ same k). The instr build adds, as p50/p95:
   service_us  done - observed         (the service handling the record and submitting the CPU job)
   forward_us  the CPU expert thread's forward time for the call
   handoff_us  (t1 - done) - forward   (CPU job queue, done word, copy thread, CopyDone, the writer's poll)
+and, at p50, overhead_vs_forward_p50_us = BM_stack p50 - forward p50 (the overhead against the in-stack kernel) and
+forward_vs_bare_p50_us = forward p50 - BM_bare p50. BM_bare runs before the stack exists, with no service, writer or
+copy thread spinning; a forward_vs_bare far from 0 means overhead_p50_us carries a kernel-speed difference.
 Fidelity: the writer's stores reach the service by coherence between two node-0 cores, not by PCIe/DDIO; pickup is a
 lower bound on the GPU path's. The prod build's numbers are the headline; instr's carry the trace's cost.
 
