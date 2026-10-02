@@ -1627,3 +1627,30 @@ Sanity: `bits=3, rows=1, independent` is 0.505 ms per pass at 12 threads (0.677 
   with speculation.
 - **Owner's call (2026-10-02):** measure the draft's real per-stage union before Tasks 2-7. Probe:
   `SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH` and `ab_cpu_draft.py ... routes`, read by `draft_routes_report.py`.
+
+### Draft routes probe (2026-10-02, divix01, `11dd634a6b` + `d40d781771`)
+
+Command: `AB_SESSIONS=8 AB_NEW_TOKENS=128 flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-17,30-63 python
+analysis/dsv41-drive/dspark/ab_cpu_draft.py $OUT routes` (resident draft, HOT_GPU_MB 7168, eager), then
+`draft_routes_report.py $OUT/routes.jsonl`. `OUT=cc-expert-prediction/analysis/dsv41-dspark/cpu-draft-routes`.
+EXIT=0; 352 draft steps x 3 stages; 1,057 tokens in 344 verifies (accept length 3.07); 1.9-3.4 tok/s per session.
+
+- **Every draft call is 5 rows, not 6** (block size 5); no prefill-sized draft calls reached the MoE.
+- Per stage (mean union / p90 / distinct experts over all 8 sessions / pooled top-16 and top-32 coverage):
+  stage 0: 9.25 / 11 / 98 / 0.615 / 0.828; stage 1: 7.59 / 10 / 60 / 0.839 / 0.961; stage 2: 5.61 / 8 / 40 /
+  0.964 / 0.998.
+- **Predicted all-CPU draft step: 15.7 ms mean, 17.1 ms p90** (passes x 0.518 ms). That is inside the ~13-18 ms the
+  freed 6.75 GiB is worth: break-even at best, before any loss to the CPU draft's own overheads.
+- **Hybrid (resident top-N per stage, CPU for the rest)**, top-N chosen on steps 1-176 and scored on steps 177-352:
+
+| N per stage | VRAM kept | VRAM freed | held-out pair coverage | CPU ms per draft step (mean / p90) |
+|---|---|---|---|---|
+| 16 | 0.83 GiB | 5.9 GiB | 0.802 | 3.58 / 5.70 |
+| 32 | 1.66 GiB | 5.1 GiB | 0.927 | 1.43 / 3.11 |
+| 48 | 2.49 GiB | 4.3 GiB | 0.964 | 0.67 / 1.55 |
+
+- **Verdict:** the all-CPU draft (Tasks 2-7 as written) is break-even, not a win. The hybrid frees most of the VRAM
+  for a few ms of CPU work that can run beside the GPU's resident experts. Owner decides whether to re-plan.
+- Bug found and fixed on the way (affects master): `ExpertPinnedHostCacheManager.from_model` ran the NUMA capacity
+  check before returning None for a model with no streamed experts, so any DSpark launch with
+  `SGLANG_MOE_PINNED_HOST_NUMA_MB` refused itself (`d40d781771`).
