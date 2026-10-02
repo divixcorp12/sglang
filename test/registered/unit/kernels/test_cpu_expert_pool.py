@@ -537,3 +537,106 @@ def test_log_stats_leaves_out_calibrations_jobs(caplog, fails):
     with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
         assert svc.log_stats() == {"jobs": 3, "lanes": 8, "forward_ns": 8 * 500_000}
     assert "3 jobs, 8 lanes, 0.500 ms per lane" in caplog.text
+
+
+class _RowsTrait:
+    """A fake EXL3-shaped trait: out[r] = x[r] * sum of row r's weights over valid slots, recorded per call."""
+
+    name = "fake-rows"
+    slab_names = ("w13_trellis",)
+    act_limit = 10.0
+    x_dtype = torch.float16
+    weights_dtype = torch.float16
+    out_dtype = torch.float32
+
+    def __init__(self):
+        self.calls = []
+
+    def check_environment(self):
+        pass
+
+    def register_layer(self, slabs, capacity):
+        return capacity
+
+    def forward(self, handle, x, slots, weights, out, threads):
+        self.calls.append((handle, slots.clone(), threading.get_native_id()))
+        valid = (slots >= 0).to(torch.float32)
+        out.copy_(x.float() * (weights.float() * valid).sum(-1, keepdim=True))
+
+    def free_layer(self, handle):
+        pass
+
+
+def _rows_pool(trait, capacity=4):
+    cores = sorted(os.sched_getaffinity(0))[:2]
+    if len(cores) < 2:
+        pytest.skip("needs at least 2 cores in the affinity mask")
+    slabs = {7: {"w13_trellis": torch.zeros(capacity, 2, dtype=torch.int16)}}
+    return CpuExpertPool(trait, slabs, cores=cores, threads=2)
+
+
+def _on_bound_thread(pool, fn):
+    result = {}
+
+    def run():
+        pool.bind_current_thread()
+        try:
+            result["value"] = fn()
+        except BaseException as error:  # re-raised on the caller
+            result["error"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def test_compute_rows_runs_every_row_and_skips_minus_one():
+    trait = _RowsTrait()
+    pool = _rows_pool(trait)
+    x = torch.arange(6 * 4, dtype=torch.float16).reshape(6, 4)
+    slots = torch.tensor([[0, 1, -1]] * 6, dtype=torch.int64)
+    weights = torch.full((6, 3), 0.5, dtype=torch.float16)
+    out = torch.empty(6, 4, dtype=torch.float32)
+    _on_bound_thread(pool, lambda: pool.compute_rows(7, slots, weights, x, out))
+    assert torch.equal(out, x.float() * 1.0)  # two valid slots of 0.5 per row
+    assert trait.calls[0][1].shape == (6, 3)
+
+
+@pytest.mark.parametrize(
+    "slots_shape,weights_shape,out_rows",
+    [((6, 3), (6, 2), 6), ((5, 3), (5, 3), 6), ((6, 3), (6, 3), 5)],
+)
+def test_compute_rows_refuses_mismatched_shapes(slots_shape, weights_shape, out_rows):
+    pool = _rows_pool(_RowsTrait())
+    x = torch.zeros(6, 4, dtype=torch.float16)
+    slots = torch.zeros(slots_shape, dtype=torch.int64)
+    weights = torch.zeros(weights_shape, dtype=torch.float16)
+    out = torch.empty(out_rows, 4, dtype=torch.float32)
+    with pytest.raises(ValueError):
+        _on_bound_thread(pool, lambda: pool.compute_rows(7, slots, weights, x, out))
+
+
+def test_compute_rows_refuses_a_slot_outside_the_layer():
+    pool = _rows_pool(_RowsTrait(), capacity=4)
+    x = torch.zeros(2, 4, dtype=torch.float16)
+    slots = torch.tensor([[0, 4], [1, 2]], dtype=torch.int64)
+    weights = torch.zeros(2, 2, dtype=torch.float16)
+    out = torch.empty(2, 4, dtype=torch.float32)
+    with pytest.raises(ValueError, match="host slot 4"):
+        _on_bound_thread(pool, lambda: pool.compute_rows(7, slots, weights, x, out))
+
+
+def test_compute_rows_refuses_an_unbound_thread():
+    pool = _rows_pool(_RowsTrait())
+    x = torch.zeros(1, 4, dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="bind_current_thread"):
+        pool.compute_rows(
+            7,
+            torch.zeros(1, 1, dtype=torch.int64),
+            torch.zeros(1, 1, dtype=torch.float16),
+            x,
+            torch.empty(1, 4, dtype=torch.float32),
+        )
