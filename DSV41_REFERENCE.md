@@ -40,6 +40,9 @@ merge, the copy thread's completion word (§29.9), went in without review or a d
 serves `--language-model-only` without the empty vision tower (§29.18), and backs HiCache with a ~9 GB host pool on
 the direct IO backend (§29.19). A grammar request no longer crashes the single-GPU server (§29.17).
 
+**Environment variables:** §32 lists the DeepSeek V4.1 and expert-streaming variables, their defaults and the
+production values.
+
 Sections 1 to 15 preserve the original September 18 scoping. Sections 16 to 22 record
 dated experiments; **§23 is the current recipe and progress ledger**, with §24 its
 2026-09-24 addendum. Together they supersede earlier present-tense plans or defaults
@@ -2895,7 +2898,7 @@ result.
 Link state confirmed from PCI sysfs on 2026-09-20 (`lspci -vv` shows no LnkSta
 without root): 0000:88:00.0 (nvme2) `current_link_width` 2 against
 `max_link_width` 4, the other three at 4; its root port 0000:85:02.0 likewise
-negotiated x2 of 4. AER correctable counters 0. One snapshot, so a transient
+negotiated x2 of 4. PCIe Advanced Error Reporting correctable counters 0. One snapshot, so a transient
 downtrain is not excluded. The 1.9 GB/s figure is the Gen3 x2 spec ceiling;
 nvme2's throughput was not measured here.
 
@@ -3806,6 +3809,16 @@ Both are on in `arm_env`, and both are byte-identical to the unfused recipe.
     its own thread and top-priority stream, then writes a completion word.
   - The graph's W1 and C1 become one wait kernel on that word (CW).
   - The service holds each lease until an event after its copies completes.
+- **Current state (2026-10-02):**
+  - With `SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES=1`, in the recipe, the engine copies only each RAM-hit row's two
+    trellis tensors and the copy wait reads the four small ones (§27.14, `analysis/dsv41-drive/LEASE_PROTOCOL.md`), so a row is
+    not six DMA copies.
+  - The "lease held until an event" and the W1 wait described above are gone: the slot-map protocol (§31) has no
+    leases, and the copy wait is one stream-ordered gate on the completion word that the copy thread's
+    `cuStreamWriteValue32_v2` writes after each job's copies (`host/copy_engine.h`).
+  - `SGLANG_DSV41_RAM_HIT_COPY=sm` replaces the engine with the in-graph SM copy (§31.1).
+  - The engine arms after `COPY_ENGINE_ARM_DECODES` = 16 captured decode forwards. With CPU experts on, the CPU/DMA
+    split is calibrated at that moment (§30.1).
 - **Why it's faster:** at the bench, the DMA engine gets 13.5–13.7 GB/s against the SM copy's
   12.1–12.3, and it doesn't slow concurrent compute. In practice the gain came from overlapping
   the copy with S.
@@ -4372,7 +4385,7 @@ captures (`analysis/dsv41-drive/prefill-evict/ram_replay.py`; its base arm gives
   steps 0–4 at 16.9 misses per token, against 9.3 at steps 70+.
 - **(b) A 64-row share** (one gather chunk, `EXL3_MAX_GATHER_ROWS`) was never worse than base for decode, and on
   the long-prompt soaks it cut decode RAM misses by 6–7%. The cost is 28–32% more prefill row reads, because a long
-  prompt's chunks re-use each other's experts. Cold admission (stamp 0) saved slightly more decode misses but cost
+  prompt's chunks reuse each other's experts. Cold admission (stamp 0) saved slightly more decode misses but cost
   ~40% more prefill reads.
 
 **How it works.**
@@ -6175,6 +6188,28 @@ host and Python sides.
     `_LINK_MS` (1.0) and `_HANDOFF_MS` (0.02).
   - `_THREADS`.
   - `_RETUNE_BATCHES`, where 0 keeps the startup table.
+  - `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION` (default on) and `_CALIBRATION_REPS` (default 10): the startup
+    calibration below. `SGLANG_DSV41_CPU_EXPERTS_MISSES` is §31.1.
+
+**Startup split calibration (2026-10-02; `cpu_experts/service.py`, `cpu_experts/policy.py`,
+`expert_stream/host/split_calibration.h`).** The configured costs are only the starting table. When the copy engine
+arms (after 16 captured decode forwards, §25.3), the service measures the split on the loaded model:
+- **When:** once, after `torch.cuda.synchronize()`, with the RAM thread paused and the copy engine not yet armed, so no
+  CPU or copy lane is typed and nothing competes. The drain matters under the overlap scheduler: a replaying decode
+  would otherwise be left with an unserved miss lane while the thread is paused.
+- **What:** on one registered row with at least 8 RAM slots, with one discarded warm-up and `_CALIBRATION_REPS` timed
+  runs per cell, it times k CPU lanes alone (`cpu`), m DMA'd experts alone (`link`) and k CPU lanes with n - k DMA'd
+  experts started together (`both[n][k]`, for n and k up to 8). The combined cell decides the split, since it includes
+  the CPU kernel and the DMA contending for host memory bandwidth.
+- **Choice:** `split[n]` is the `k` with the lowest `both[n][k]`; a larger `k` within 2% of the best wins, because the
+  layer time is equal and the link stays free for the GPU's own misses (`split_from_grid`).
+- **Output:** a `CPU experts calibration:` report on stdout and in the log: the `cpu` and `link` times, the layer time
+  at the chosen `k` and the split.
+- **Afterwards:** the calibrated split is final, so `retune` returns without changing it, and calibration's own CPU jobs
+  are left out of `log_stats` and out of `retune`'s baseline.
+- **Skipped, keeping the previous split:** `SGLANG_DSV41_CPU_EXPERTS_SPLIT` is set, calibration is off, no row has 8
+  slots, or a measurement fails or times out (a warning says which). After a failed run the scratch block stays
+  allocated, because a timed-out DMA may still write into it.
 
 **P2 results, partial** (2026-09-29, `d87a3ff24f`, before the lane order of §30.2; the plan's "P2 results").
 - **Arms:** production recipe plus `SGLANG_DSV41_CPU_EXPERTS=1 SGLANG_DSV41_CPU_EXPERTS_CORES=18-29`, split
@@ -6342,7 +6377,8 @@ EXIT read from pytest):
 1. **No GPU run** of `3937a8833a` (the capture-time streamer check) or `1ff55fb37b`. GPU runs were held for the merge.
 2. **No server run** of the lane order (§30.2): neither decode A/B nor quality gate. P2's figures predate it.
 3. **The E31 verdict** is open (§30.1).
-4. **The split retune** from the measured 0.61-0.66 ms per lane.
+4. **The split retune** from the measured 0.61-0.66 ms per lane. (2026-10-02: the startup calibration, §30.1, now
+   measures the split by default; no served run of it is recorded here.)
 5. **NUMA placement** of the pinned tier against the CPU-expert cores (§30.4).
 6. **Silent no-op.** With `SGLANG_MOE_HOT_GPU_MB=0`, `SGLANG_MOE_PINNED_HOST_MB=0`, prefetch off and graph gather
    off, `memory_hook.py` returns before the launch gate, so `SGLANG_DSV41_CPU_EXPERTS=1` silently does nothing. With
@@ -6492,6 +6528,141 @@ Each step on master, test-first, CPU and GPU suites on divix01 before the push.
   `set_hot` burst test deleted), the layers/moe RAM-miss, host-tier, format and gate files 195 -> 201, the hot-cache
   and residency files 28 -> 25 (three listener tests deleted); GPU (the §31.3 manual files) 56 passed before and after.
 
+
+## 32. Environment variables (2026-10-02)
+
+The variables a DeepSeek V4.1 EXL3 deployment reads, grouped by what they control. Defaults are the code's;
+"Production" is the value `benchmarks/dsv41_baseline/arm_env.py` (`base_env()`) sets when it differs from the default, and `-` means
+the recipe leaves the variable alone. Most `SGLANG_DSV41_*` flags are parsed once by `Dsv41Config.from_envs`
+(`python/sglang/srt/dsv41_config.py`). The full descriptions are in
+[`docs/docs/references/environment_variables.mdx`](docs/docs/references/environment_variables.mdx); declarations are in
+`python/sglang/srt/environ.py`. An explicitly set variable always wins over a `--moe-offload-preset` fill.
+
+### 32.1 Streaming and tiers
+
+| Variable | Default | Production | What it does |
+|---|---|---|---|
+| `SGLANG_DSV41_EXPERT_STREAM` | `False` | `1` | Streams the EXL3 routed experts from disk; the loader skips them. Eager or breakable graph only. |
+| `SGLANG_DSV41_EXPERT_DIR` | `""` | the EXL3 shard dir | Shards the experts are read from; required when streaming. |
+| `SGLANG_MOE_EXPERT_ROW_SOURCE` | `auto` | `shards` | Where host rows are read from (`auto`, `files`, `tensor`, or a format kind). |
+| `SGLANG_MOE_EXPERT_FILE_READER` | `mmap` | `uring_direct` | `mmap`, `uring` or `uring_direct`. |
+| `SGLANG_MOE_EXPERT_MIRROR_DIRS` | `""` | three roots (nvme0, nvme4, nvme2) | `os.pathsep`-separated byte-identical checkpoint copies; non-empty reads every row from all roots at once. |
+| `SGLANG_MOE_EXPERT_MIRROR_WEIGHTS` | `""` | - | Colon-separated read shares per root (`0` drops one); empty is equal. |
+| `SGLANG_MOE_PINNED_HOST_MB` | `0` | `102400` | Pinned host tier of expert rows, in MiB. Mutually exclusive with `SGLANG_MOE_EXPERT_HOST_ARENA`. |
+| `SGLANG_MOE_PINNED_HOST_NUMA_MB` | `""` | `0:61440,1:40960` | Per-NUMA-node split of the pinned tier; must sum to `SGLANG_MOE_PINNED_HOST_MB`. |
+| `SGLANG_MOE_HOT_GPU_MB` | `0` | `16080` | GPU hot expert cache in MiB; counts against `--mem-fraction-static`. |
+| `SGLANG_MOE_EXPERT_GRAPH_GATHER` | `False` | `1` | Decode-sized gathers without host syncs, so CUDA graphs capture them. |
+| `SGLANG_MOE_EXPERT_FUSED_PLAN` | `False` | `1` | One fused kernel plans BS1 graph-gather routes. |
+| `SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS` | `0` | - | Speculative decoding only: caps graph-gather scratch rows. |
+| `SGLANG_MOE_PREFETCH_MAX_CANDIDATES` | `0` | `0` | NVFP4 prefetch candidates; nonzero is refused with graph gather and the EXL3 gate. |
+| `SGLANG_URING_FILE_READER_QUEUE_DEPTH` | `128` | - | Queue depth of the shared io_uring file reader. |
+| `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS` | `0` | `8192` | Uncached suffixes this long prefill layer-major; `0` disables. |
+| `SGLANG_LAYER_MAJOR_STATE_NUMA_NODE` | `1` | - | NUMA node of the layer-major host state store. |
+| `SGLANG_FILE_CACHE_MODEL_PATH` | `""` | - | Model path recorded in file-cache identities after a checkpoint move. |
+
+### 32.2 GPU hot cache and residency
+
+| Variable | Default | Production | What it does |
+|---|---|---|---|
+| `SGLANG_MOE_GPU_RESIDENCY_UPDATE` | `False` | `1` | Decode residency update as device ops inside the captured graph. Required by the RAM-miss service. |
+| `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | `0` | `2` | `1` SCRATCH, `2` DIRECT (copies misses into victim slots). The RAM-miss service requires `2`. Deprecated alias: `SGLANG_MOE_HOT_INSERT_ON_MISS`. |
+| `SGLANG_MOE_HOT_INSERT_ON_MISS_DECAY` | `0.98` | - | Per-token decay of the victim scores. |
+| `SGLANG_MOE_HOT_FUSED_INSERT` | `False` | - | Stage 1 boundary inserts through a fused Triton kernel. |
+| `SGLANG_MOE_HOT_DYNAMIC` | `False` | `1` | Updates residency while serving. |
+| `SGLANG_MOE_HOT_UPDATE_PREFILL_TOKENS` | `1024` | `256` | Minimum prefill tokens that trigger an update. |
+| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `0` | `1` | Update every N decode forwards; insert-on-miss needs `1`. |
+| `SGLANG_MOE_HOT_MIN_RESIDENCE_FORWARDS` | `8` | `8` | Forwards a promoted expert stays resident. |
+| `SGLANG_MOE_HOT_BENEFIT_RATIO` | `1.0` | - | Score ratio a candidate must exceed to replace an expert. |
+| `SGLANG_MOE_HOT_DECAY_TOKENS` | `0` | - | Decay scores per N routed tokens; `0` is per boundary. |
+| `SGLANG_MOE_HOT_PROMOTION_SIGMAS` | `0.0` | - | Extra noise margin a candidate must lead by. |
+| `SGLANG_MOE_GPU_RESIDENCY_MAX_PROMOTIONS` | `64` | - | Promotions per layer per decode boundary. |
+| `SGLANG_MOE_HOT_ASYNC_PROMOTIONS` | `False` | `0` | Refused by the EXL3 gate. |
+| `SGLANG_MOE_ASYNC_RESIDENCY_SCORES` | `False` | `0` | Asynchronous score copies at boundaries. |
+| `SGLANG_MOE_HOT_SEED` | `""` | - | Startup residency seed JSON. |
+| `SGLANG_MOE_HOT_LOG_INTERVAL` | `100` | `64` | Residency log interval, in boundaries. |
+| `SGLANG_MOE_HOT_METRICS_FILE` | `""` | - | Residency metrics file; empty disables. |
+
+### 32.3 RAM-miss service, copy engine and fusion
+
+| Variable | Default | Production | What it does |
+|---|---|---|---|
+| `SGLANG_DSV41_RAM_MISS_TIMEOUT_MS` | `2000` | `2000` | Per-layer in-graph wait bound before fail-stop; the thread watchdog aborts after `max(30 s, 3x)`. |
+| `SGLANG_DSV41_RAM_MISS_SPIN_CORE` | unset | `17` | Core the service thread busy-polls on; its physical core must be its own. |
+| `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE` | `False` | `1` | DMA copies of RAM hits on their own thread (§25.3). Requires `CUDA_MODULE_LOADING=EAGER`. |
+| `CUDA_MODULE_LOADING` | torch's `LAZY` | `EAGER` | Startup raises unless `EAGER` when the copy engine is on (~1 GiB of device memory). |
+| `SGLANG_DSV41_RAM_HIT_COPY` | `ce` | - | `ce` (DMA) or `sm` (in-graph SM copy). |
+| `SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES` | `False` | `1` | Copy engine moves only the two trellis tensors; the wait reads the four small ones. |
+| `SGLANG_DSV41_ENABLE_LAYER_FUSION` | `False` | `1` | JIT kernels replace about 89 small torch kernels per layer. |
+| `SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION` | `False` | `1` | BS1 decode cast fusion. |
+| `SGLANG_DSV41_ENABLE_LEASE_PDL` | `False` | `1` | Programmatic dependent launch for the chain kernels. |
+| `SGLANG_DSV41_ENABLE_MOE_SIDE_STREAM` | `False` | - | Shared expert and DIRECT commit on a side stream. |
+| `SGLANG_DSV41_ENABLE_PREFILL_FILLS` | `False` | `1` | Eager pinned-tier misses read by the native reader into the slabs. |
+| `SGLANG_DSV41_ENABLE_PREFILL_SHARE` | `False` | - | Bounds a prefill's pinned-tier admissions per layer. |
+| `SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN` | `False` | `1` | Eager MoE plans routes on the host. |
+| `SGLANG_DSV41_ENABLE_PREFILL_SPLIT_GATHER` | `False` | `1` | Prefill chunk copies resident rows before the filled ones. |
+
+### 32.4 CPU experts (off in the recipe)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SGLANG_DSV41_CPU_EXPERTS` | `False` | Computes a layer's RAM-tier experts on the CPU. Batch-1 decode only. |
+| `SGLANG_DSV41_CPU_EXPERTS_CORES` | `""` | Cores of the pool as a taskset list; at least two, required. |
+| `SGLANG_DSV41_CPU_EXPERTS_THREADS` | `0` | Worker threads, at most one per core; `0` is one per core. |
+| `SGLANG_DSV41_CPU_EXPERTS_SPLIT` | `""` | Nine counts, CPU lanes per n lanes; set, it disables calibration. |
+| `SGLANG_DSV41_CPU_EXPERTS_CPU_MS` / `_LINK_MS` / `_HANDOFF_MS` | `0.52` / `1.0` / `0.02` | Cost model that builds the starting split. |
+| `SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES` | `0` | Batches between re-tunes from measured CPU cost; `0` keeps the table. |
+| `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION` | `True` | Measures the split once when the copy engine arms (§30.1). |
+| `SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS` | `10` | Timed runs per calibration cell. |
+| `SGLANG_DSV41_CPU_EXPERTS_MISSES` | `False` | CPU also computes NVMe misses; needs `SGLANG_DSV41_CPU_EXPERTS`. |
+| `EXL3_MOE_CPU_PIN` | unset | Must be `0` or startup raises. |
+| `SGLANG_EXL3_CPU_ACT_RESIDUAL` / `_ACT_BLOCK` | `False` / `0` | Build-time options of the CPU kernel's int8 activations. |
+| `SGLANG_EXL3_CPU_CXX` | `""` | GCC 15 `g++` for the kernel build (the recipe sets the gcc-toolset-15 one). |
+
+### 32.5 EXL3 build, Engram and DeepSeek V4.1 model options
+
+| Variable | Default | Production | What it does |
+|---|---|---|---|
+| `SGLANG_EXL3_SRC` | `""` | set | Pinned exllamav3 checkout JIT-built into the quant method; required for EXL3. |
+| `SGLANG_EXL3_BUILD_DIR` | `~/.cache/sglang/exl3_ext` | set | Build directory of that extension. |
+| `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE` | `False` | - | Engram tables in host memory. |
+| `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` | `shared` | - | `shared` or `per_rank`. |
+| `SGLANG_DSV41_ENGRAM_TABLE_DIR` | `""` | Flash checkpoint dir | Serve Engram rows from safetensors shards via `np.memmap`. |
+| `SGLANG_DSV41_ENGRAM_RAM_GIB` | `0.0` | `5` | Engram RAM row cache in GiB; misses use O_DIRECT. |
+| `SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING` | `False` | `1` | Layer-1 lookup as a CUDA host node with an io_uring worker. |
+| `SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT` | `False` | `1` | Device post and wait kernels, no host nodes in the graph. |
+| `SGLANG_DSV41_TORCH_PREFILL_INDEXER` | `False` | `1` | Torch prefill indexer instead of the DeepGEMM kernel. |
+| `SGLANG_DSV41_TORCH_PREFILL_INDEXER_SCORE_BUDGET_MB` | `0` | `128` | Cap on one bf16 score chunk; `0` is 1 GiB. |
+| `SGLANG_DSV41_FUSED_WO_A` | `True` | - | SM100/SM103 `wo_a` verify megakernel. |
+| `SGLANG_DSV41_REASONING_EFFORT` / `SGLANG_DSV4_REASONING_EFFORT` | unset / `""` | - | Default reasoning effort for requests that carry none. |
+| `SGLANG_DSV4_KV_LAYOUT` | `v4` | - | `v4`, `v41` or `auto`. |
+| `SGLANG_DSV4_COMPRESSED_KV_LAYOUT` | `auto` | - | Compressed-cache layout under `v41`. |
+| `SGLANG_DSV4_FP4_EXPERTS` / `SGLANG_DSV4_FP4_DEQUANT` | `True` / `False` | - | FP4 checkpoint handling. |
+| `SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE` | `False` | - | SWA KV quantized from bf16-rounded values. |
+| `SGLANG_DSV4_UNIFIED_KV_FP8` | `False` | - | `unified_kv` only: fp8 nope pool plus bf16 rope pool. |
+| `SGLANG_DSV4_COMPRESS_STATE_DTYPE` | `float32` | - | Compressor state dtype. |
+| `SGLANG_OPT_DSV4_NONPAGED_INDEXER` / `_MIN_QUERY_TOKENS` | `True` / `8192` | - | Non-paged indexer and its minimum per-rank query rows. |
+
+### 32.6 Debug, trace and test
+
+| Variable | What it does |
+|---|---|
+| `SGLANG_DSV41_EXPERT_TRACE_PATH` | One JSON line per streamed MoE layer call, for `scripts/dsv41/tier_sim.py`. |
+| `SGLANG_DSV41_ROUTER_CAPTURE_PATH` | Per-layer router inputs and top-k weights of every graph forward; requires the trace. |
+| `SGLANG_DSV41_SYNC_WAIT_NVTX` | NVTX ranges around host synchronous waits (raw `== "1"`). |
+| `SGLANG_TEST_DSV41_RAM_MISS_FAULT` | Test only: `<demands>:<seconds>` delay before demand reads. |
+| `SGLANG_MOE_ROUTE_TRACE_DIR` / `_MAX_TOKENS` / `_SPECULATIVE` | Debug only: eager decode routing tensors. |
+| `SGLANG_MOE_EXPERT_PREFETCH_*`, `SGLANG_MOE_EXPERT_PREDICTOR*` | Shadow prefetch and predictor studies; the EXL3 gate refuses any pull mode. |
+| `SGLANG_EXPERT_STREAM_URING_*` | io_uring reader options (`QUEUE_DEPTH`, `MODE`, `FIXED_FILES`, `READ_MODE`, `WAIT_MODE`, `SQ_THREAD_IDLE_MS`, `SQ_THREAD_CPU`, `DIAGNOSTICS`, `READ_CUTS`, `SLAB_ARENA`), read by `UringOptions::from_env`, not declared in `environ.py`. |
+
+### 32.7 Deprecated and removed
+
+Set values warn and are ignored: `SGLANG_DSV41_ENABLE_RAM_MISS_ROW_IMAGES`, `SGLANG_DSV41_RAM_MISS_PACK_WORKERS`,
+`SGLANG_DSV41_ENABLE_RAM_MISS_LEASES`, `_TWO_PHASE`, `_PIECE_STREAM`, `SGLANG_DSV41_ENABLE_EXPERT_PREFETCH`,
+`SGLANG_DSV41_ENABLE_NATIVE_PREFETCH`, `SGLANG_DSV41_RAM_MISS_HIT_WAIT_US` (`arm_env.py` still sets it to `100`, so
+production logs the warning), and the `SGLANG_MOE_EXPERT_DOORBELL*` family. `SGLANG_MOE_EXPERT_PREFETCH_PULL` and
+`SGLANG_MOE_HOT_INSERT_ON_MISS` are legacy aliases of their `_MODE` and `_STAGE` replacements. `SGLANG_DSV41_EXPERT_RAM_GIB`
+is retired with no deprecation entry and no read site: a launch script that sets it silently gets no RAM tier; use
+`SGLANG_MOE_PINNED_HOST_MB`.
 
 ## Sources
 

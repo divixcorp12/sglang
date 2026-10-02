@@ -74,6 +74,35 @@ the day before's 19.360 within drift. See
 
 ---
 
+## Environment variables
+
+The expert-streaming variables that matter for a launch. The full list, with every
+default and the deprecated names, is in
+[`docs/docs/references/environment_variables.mdx`](docs/docs/references/environment_variables.mdx)
+("MoE Expert Streaming" and "DeepSeek V4.1"). An explicitly set variable always wins over
+`--moe-offload-preset graph-gather`, which fills 22 of them when unset.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SGLANG_MOE_EXPERT_STREAM` | `False` | Streams ModelOpt NVFP4 routed experts from host memory; required for the hot cache. |
+| `SGLANG_DSV41_EXPERT_STREAM` | `False` | Streams DeepSeek V4.1 EXL3 routed experts from disk (eager or breakable graph only). |
+| `SGLANG_MOE_EXPERT_FILE_READER` | `mmap` | Row reads from files: `mmap`, `uring` or `uring_direct`. |
+| `SGLANG_MOE_EXPERT_HOST_ARENA` | `False` | Registered host copy of all rows; replaces the pinned tier. Exclusive with `SGLANG_MOE_PINNED_HOST_MB`. |
+| `SGLANG_MOE_PINNED_HOST_MB` | `0` | Size in MiB of the pinned host (RAM) tier. |
+| `SGLANG_MOE_EXPERT_GRAPH_GATHER` | `False` | Decode-sized gathers without host syncs, so CUDA graphs capture them. |
+| `SGLANG_MOE_EXPERT_FUSED_PLAN` | `False` | One fused kernel plans a BS1 graph gather. |
+| `SGLANG_MOE_EXPERT_COPY_BACKEND` | `gpu` | Host-to-device copy backend: `gpu` or `dma`. |
+| `SGLANG_MOE_HOT_GPU_MB` | `0` | Size in MiB of the GPU hot expert cache. |
+| `SGLANG_MOE_HOT_DYNAMIC` | `False` | Updates residency while serving. |
+| `SGLANG_MOE_GPU_RESIDENCY_UPDATE` | `False` | Runs the decode residency update inside the captured graph. |
+| `SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE` | `0` | Insert-on-miss: `0` off, `1` scratch, `2` direct. |
+| `SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS` | `0` | Decode forwards between residency updates; insert-on-miss needs `1`. |
+| `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR` | `""` | Prefetch candidate scoring; shadow-only unless a pull mode is set. |
+| `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE` | `False` | DMA copy engine for RAM-resident rows; needs `CUDA_MODULE_LOADING=EAGER`. |
+| `SGLANG_DSV41_CPU_EXPERTS` | `False` | Computes RAM-tier experts on the CPU instead of copying them (BS1 decode). |
+| `SGLANG_DSV41_CPU_EXPERTS_CORES` | `""` | Taskset list of the CPU expert pool (at least two cores). |
+| `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION` | `True` | Measures the CPU/DMA split once when the copy engine arms. |
+
 ## Prod server run
 
 ### Env vars this work added
@@ -1250,9 +1279,37 @@ with `hot-cache.metrics.jsonl` (**cumulative — read the last record**).
 
 ---
 
+## DeepSeek V4.1 (EXL3) streaming: copy engine and CPU experts
+
+This document's measurements are the NVFP4 path. The EXL3 path
+(`SGLANG_DSV41_EXPERT_STREAM`) streams from NVMe through a pinned RAM tier that a
+RAM-miss service thread serves (`python/sglang/srt/layers/moe/exl3_ram_miss.py`,
+native side under `python/sglang/kernels/jit/csrc/moe/expert_stream/host/`). Two
+mechanisms there postdate the paths below:
+
+- **Copy engine** (`copy_engine.h`, `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE`). The
+  service turns each lease record's host lanes into one `CopyJob`; a copy thread
+  issues the DMA copies (`cuMemcpyAsync`) off the decode stream and reports completion,
+  which opens the copy gate the decode graph waits on. It arms after 16 captured
+  decode forwards and needs `CUDA_MODULE_LOADING=EAGER`. See
+  `analysis/dsv41-drive/LEASE_PROTOCOL.md`, "Copy engine".
+- **CPU experts** (`cpu_experts.h`, `python/sglang/srt/layers/moe/cpu_experts/`,
+  `SGLANG_DSV41_CPU_EXPERTS`). For a captured BS1 post, the last `split[n]` of its `n`
+  eligible lanes are typed as CPU lanes and computed on a host thread over the pinned
+  tier instead of being copied; with `SGLANG_DSV41_CPU_EXPERTS_MISSES` that includes
+  NVMe misses once their rows land. The copy engine's job completes when its copies and
+  every CPU job of the record are done.
+- **Split calibration** (`split_calibration.h`, `CpuExpertsService.calibrate`). The
+  split table comes from a measurement taken once, just before the copy engine arms: the
+  device drains and the RAM thread pauses, then k CPU lanes alone, m DMA'd experts alone
+  and both together are timed on one row (`SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS`
+  runs per cell). The grid and the chosen split are printed and logged. A fixed
+  `SGLANG_DSV41_CPU_EXPERTS_SPLIT` or `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION=0`
+  skips it, and a failed run keeps the previous split with a warning.
+
 ## The shared primitive
 
-All five paths bottom out in one header: `python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh`.
+The NVFP4 copy paths below bottom out in one header (the doorbell, path 2, is removed): `python/sglang/kernels/jit/csrc/moe/expert_cache_transfer.cuh`.
 
 | Entry point | Line | Shape |
 |---|---|---|
