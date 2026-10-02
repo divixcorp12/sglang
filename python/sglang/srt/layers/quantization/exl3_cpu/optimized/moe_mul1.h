@@ -96,25 +96,12 @@ void exl3_moe_cpu_forward_raw
     int threads
 );
 
-// Copy `count` experts' packed trellis tensors (gate, up, down order; gate absent when
-// gateless) of a registered layer into a staging buffer, expert-major, parallelized over the
-// worker pool. Offsets are deterministic from the layer's matrix dims so the parent can compute
-// the same layout for the VRAM-side views.
-void exl3_moe_cpu_stage_experts
-(
-    int64_t handle,
-    const uint32_t* expert_ids,
-    int count,
-    uint8_t* dst,
-    int threads
-);
-
-// Per-phase profiling of the compute pool, reported to stdout every 512 jobs. Set once at
-// worker startup from MoeCpuTuning.cpu_prof (EXL3_MOE_CPU_PROF env).
+// Per-phase profiling of the forward, printed to stdout per call.
 void exl3_moe_cpu_set_prof(bool enabled);
-// Wake helpers before the GPU payload arrives; no work or completion barrier.
-void exl3_moe_cpu_pool_prime(int threads);
-int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);   // test hook
+
+// Upstream link compatibility only (bindings.cpp, cpu/moe_handoff.cu): both fail if called.
+void exl3_moe_cpu_stage_experts(int64_t handle, const uint32_t* expert_ids, int count, uint8_t* dst, int threads);
+int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);
 
 // Kernel availability (dispatch happens internally; these are informational, post-env-cap).
 // has_avx512_vbmi and has_avx512_bw additionally gate the swizzled weight layout in the child
