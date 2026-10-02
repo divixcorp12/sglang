@@ -16,9 +16,9 @@ struct HostTestExports;
 template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout, Reader, Build> {
   using Base = HostExports<Layout, Reader, Build>;
-  using typename Base::Source;
   using Base::check_table_tensors;
   using Base::find;
+  using typename Base::Source;
 
   static std::vector<int64_t> slots_of(TensorView slots) {
     const auto* data = static_cast<const int64_t*>(slots.data_ptr());
@@ -51,7 +51,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     verify_named("slots", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slots);
     Source reader(
         tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
+            extents,
+            starts,
+            file_sizes,
+            segments,
+            slabs,
+            row_bytes,
+            buffer_regions,
+            paths,
+            source_paths,
+            slot_bytes,
+            row_images),
         direct != 0);
     if (!reader.open()) return 0;
     return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
@@ -109,7 +119,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     const auto* f = static_cast<const int64_t*>(fault.data_ptr());
     Source reader(
         tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
+            extents,
+            starts,
+            file_sizes,
+            segments,
+            slabs,
+            row_bytes,
+            buffer_regions,
+            paths,
+            source_paths,
+            slot_bytes,
+            row_images),
         direct != 0);
     reader.set_owner_core(owner_core);
     if (f[22] != 0) reader.set_piece_stream(true);
@@ -170,7 +190,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       const auto* f = static_cast<const int64_t*>(fault.data_ptr());
       Source reader(
           tables_from<Layout>(
-              extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
+              extents,
+              starts,
+              file_sizes,
+              segments,
+              slabs,
+              row_bytes,
+              buffer_regions,
+              paths,
+              source_paths,
+              slot_bytes,
+              row_images),
           direct != 0);
       if (f[22] != 0) reader.set_piece_stream(true);
       reader.set_fixed_chunk_cap(f[28]);
@@ -201,7 +231,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // Test only (U10): expert_stream_read_rows_traced's read, recording every SQE the reader prepared. `sqes` receives
   // up to sqes.size(0) rows of 4 int64 (file, offset, length, bounce byte offset), in preparation order; `info` 11
   // int64: the result, the SQE count, the descriptor count, the ring credit, the completions reaped, fixed_cuts,
-  // fanout_sqes, cut_reads, gap_cuts, min_cut_bytes and leg_stride. `fault` as the faulted call's (word 22 turns piece streaming on, word 28 caps registered chunks).
+  // fanout_sqes, cut_reads, gap_cuts, min_cut_bytes and leg_stride. `fault` as the faulted call's (word 22 turns piece
+  // streaming on, word 28 caps registered chunks).
   static void read_rows_sqes(
       TensorView extents,
       TensorView starts,
@@ -241,7 +272,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       std::fill(out, out + 7, 0);
       Source reader(
           tables_from<Layout>(
-              extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
+              extents,
+              starts,
+              file_sizes,
+              segments,
+              slabs,
+              row_bytes,
+              buffer_regions,
+              paths,
+              source_paths,
+              slot_bytes,
+              row_images),
           direct != 0);
       if (f[22] != 0) reader.set_piece_stream(true);
       reader.set_fixed_chunk_cap(f[28]);
@@ -334,7 +375,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     auto* out = static_cast<int64_t*>(info.data_ptr());
     std::fill(out, out + 5, 0);
     const Tables t = tables_from<Layout>(
-        extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images);
+        extents,
+        starts,
+        file_sizes,
+        segments,
+        slabs,
+        row_bytes,
+        buffer_regions,
+        paths,
+        source_paths,
+        slot_bytes,
+        row_images);
     const std::vector<int32_t> ids = ids_of(experts);
     const std::vector<int64_t> dest = slots_of(slots);
     const size_t lanes = static_cast<size_t>(masks.size(1));
@@ -465,7 +516,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     auto cpu = SymbolicDevice{};
     verify_named("subs", TensorMatcher({kPieces, 6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), subs);
     const Tables t = tables_from<Layout>(
-        extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images);
+        extents,
+        starts,
+        file_sizes,
+        segments,
+        slabs,
+        row_bytes,
+        buffer_regions,
+        paths,
+        source_paths,
+        slot_bytes,
+        row_images);
     const size_t count = t.segments.size();
     verify_named(
         "pieces",
@@ -546,8 +607,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     static std::atomic<int64_t> ns{0};
     return ns;
   }
-  static int test_forward(int64_t, const void*, const int32_t*, const float*, int32_t k, float* out, int32_t,
-                          int32_t accumulate) {
+  static int
+  test_forward(int64_t, const void*, const int32_t*, const float*, int32_t k, float* out, int32_t, int32_t accumulate) {
     const int64_t until = expert_stream::now_ns() + k * test_forward_ns().load(std::memory_order_relaxed);
     while (expert_stream::now_ns() < until)
       _mm_pause();
@@ -737,28 +798,28 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
 // The inner macro takes the HostTestExports type, so each line reads Exports::name like EXPERT_STREAM_HOST_EXPORTS'.
 #define EXPERT_STREAM_HOST_TEST_EXPORTS(Exports) \
   EXPERT_STREAM_HOST_TEST_EXPORTS_OF(::sglang::expert_stream::HostTestExports<Exports>)
-#define EXPERT_STREAM_HOST_TEST_EXPORTS_OF(Exports)                                                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_forward_address, Exports::test_forward_address);     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_traced, Exports::read_rows_traced);             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_faulted, Exports::read_rows_faulted);           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_sqes, Exports::read_rows_sqes);                 \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_publish_piece, Exports::publish_piece);                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_pieces, Exports::read_rows_pieces);             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_geometry, Exports::piece_geometry);                 \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump, Exports::pump);                                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_info, Exports::slot_info);                           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_handled_through, Exports::handled_through);               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_victim_census, Exports::victim_census);                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_busy_episode, Exports::busy_episode);                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_idle, Exports::copy_engine_idle);             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_release, Exports::copy_engine_release);       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_fail, Exports::copy_engine_fail);             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_marked, Exports::copy_engine_marked);         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_ballast, Exports::copy_engine_ballast);       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);            \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_record_fields, Exports::read_record_fields);         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                                 \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);           \
+#define EXPERT_STREAM_HOST_TEST_EXPORTS_OF(Exports)                                                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_forward_address, Exports::test_forward_address); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_traced, Exports::read_rows_traced);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_faulted, Exports::read_rows_faulted);       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_sqes, Exports::read_rows_sqes);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_publish_piece, Exports::publish_piece);               \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_pieces, Exports::read_rows_pieces);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_geometry, Exports::piece_geometry);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump, Exports::pump);                                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_info, Exports::slot_info);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_handled_through, Exports::handled_through);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_victim_census, Exports::victim_census);               \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_busy_episode, Exports::busy_episode);                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_idle, Exports::copy_engine_idle);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_release, Exports::copy_engine_release);   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_fail, Exports::copy_engine_fail);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_marked, Exports::copy_engine_marked);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_engine_ballast, Exports::copy_engine_ballast);   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_seqlock_stress, Exports::seqlock_stress);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_record_fields, Exports::read_record_fields);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);

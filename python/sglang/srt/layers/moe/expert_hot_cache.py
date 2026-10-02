@@ -22,6 +22,11 @@ import torch
 
 from sglang.srt.environ import InsertOnMissStage, envs
 from sglang.srt.layers.moe.async_telemetry import AsyncTelemetry, TorchTelemetryBackend
+from sglang.srt.layers.moe.expert_format import (
+    inclusive_hot_slot_limit,
+    iter_expert_streamers,
+    require_graph_gather_support,
+)
 from sglang.srt.layers.moe.expert_prefetch import (
     ExpertPrefetchCoordinator,
     SparseNextLayerPolicy,
@@ -37,13 +42,7 @@ from sglang.srt.layers.moe.expert_residency_clock import (
     ResidencyBoundaryClock,
     classify_forward,
 )
-from sglang.srt.layers.moe.expert_format import (
-    inclusive_hot_slot_limit,
-    iter_expert_streamers,
-    require_graph_gather_support,
-)
 from sglang.srt.layers.moe.expert_stream import ExpertStreamer
-
 from sglang.srt.layers.moe.expert_transfer import (
     NVFP4_TRANSFER_TENSOR_COUNT,
     AsyncExpertTransferExecutor,
@@ -54,6 +53,7 @@ from sglang.srt.layers.moe.expert_transfer import (
     FixedRowTransferPlan,
     submit_expert_row_copy_batch,
 )
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -243,7 +243,9 @@ class ExpertHotCache:
         rows[1] = self._slot_generations
         ready = rows[0] == int(HotCacheSlotState.READY)
         rows[2] = np.where(
-            ready, np.asarray(self.slot_to_expert, dtype=np.int64), self._slot_dump_targets
+            ready,
+            np.asarray(self.slot_to_expert, dtype=np.int64),
+            self._slot_dump_targets,
         )
         upload = self._slot_upload_device
         upload.copy_(self._slot_upload_host, non_blocking=True)
@@ -424,7 +426,12 @@ class ExpertHotCache:
         spec_only = self.streamer.has_spec_only_tensors
         six_tensors = len(self.streamer.tensor_names) == NVFP4_TRANSFER_TENSOR_COUNT
         pinned_cache = self.streamer.pinned_host_cache
-        if spec_only and six_tensors and pinned_cache is not None and pinned_cache.capacity:
+        if (
+            spec_only
+            and six_tensors
+            and pinned_cache is not None
+            and pinned_cache.capacity
+        ):
             self._load_reserved_in_chunks(tickets, pinned_cache)
             return
         if not six_tensors or spec_only:
@@ -444,7 +451,9 @@ class ExpertHotCache:
             return
         promotion = self._prepare_promotion(tickets)
         current_stream = torch.cuda.current_stream(self.device)
-        ticket = submit_hot_cache_promotions([promotion], producer_stream=current_stream)
+        ticket = submit_hot_cache_promotions(
+            [promotion], producer_stream=current_stream
+        )
         self._transfer_executor.wait(ticket, current_stream)
         self.complete_promotion(promotion)
         self.wait_for_slot_publication()
@@ -478,10 +487,13 @@ class ExpertHotCache:
             # table with an owner (a native reader thread) must not move the
             # chunk's pinned rows while the promotion reads them.
             with (
-                torch.cuda.nvtx.range("dsv41.hot_cache.host_use")
-                if _SYNC_WAIT_NVTX
-                else nullcontext()
-            ), pinned_cache.host_use():
+                (
+                    torch.cuda.nvtx.range("dsv41.hot_cache.host_use")
+                    if _SYNC_WAIT_NVTX
+                    else nullcontext()
+                ),
+                pinned_cache.host_use(),
+            ):
                 chunk_rows = pinned_cache.evictable_rows()
                 if chunk_rows < 1:
                     self._cancel_tickets(tickets[start:])
@@ -545,7 +557,10 @@ class ExpertHotCache:
         routes = self._copy_routes.get(key)
         if routes is None:
             routes = ExpertRowCopyRoutes(
-                [(sources[name], self.tensors[name]) for name in self.streamer.tensor_names],
+                [
+                    (sources[name], self.tensors[name])
+                    for name in self.streamer.tensor_names
+                ],
                 backend=self.copy_backend,
                 use_secondary_source_rows=use_secondary,
             )
@@ -567,8 +582,7 @@ class ExpertHotCache:
             expert_rows = [ticket.expert_id for ticket in tickets]
             destination_slots = [ticket.slot for ticket in tickets]
             sources = {
-                name: self.streamer.source(name)
-                for name in self.streamer.tensor_names
+                name: self.streamer.source(name) for name in self.streamer.tensor_names
             }
             secondary_source_rows = None
             use_secondary_source_rows = [False] * len(self.streamer.tensor_names)
@@ -963,7 +977,9 @@ _INSERTION_TRACE_NAMES = (
 )
 
 
-def _add_insertions(entry: dict[str, Any], device: Mapping[str, list], row: int) -> None:
+def _add_insertions(
+    entry: dict[str, Any], device: Mapping[str, list], row: int
+) -> None:
     """Report a layer's insert-on-miss copies with its decode counters; they are device rows, not migrations."""
     entry["insertions"] = entry.get("insertions", 0) + device["insertions"][row]
     entry["insertion_evictions"] = (
@@ -1114,8 +1130,7 @@ class ExpertHotCacheManager:
                 streamers.values(),
                 pinned_tier_ok=not gpu_residency_update,
                 exl3_direct_ok=(
-                    gpu_residency_update
-                    and insert_on_miss == InsertOnMissStage.DIRECT
+                    gpu_residency_update and insert_on_miss == InsertOnMissStage.DIRECT
                 ),
             )
         seed = None
@@ -1173,7 +1188,9 @@ class ExpertHotCacheManager:
                 plan(streamers[layer_id], rows)
         selected = {layer_id: [] for layer_id in streamers}
         pull_row_enabled = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
-        allocated_layers = {layer_id for layer_id, rows in gather_rows.items() if rows and not direct}
+        allocated_layers = {
+            layer_id for layer_id, rows in gather_rows.items() if rows and not direct
+        }
         remaining = budget_bytes - sum(
             rows * streamers[layer_id].bytes_per_expert
             for layer_id, rows in scratch_rows.items()
@@ -1234,7 +1251,9 @@ class ExpertHotCacheManager:
                     continue
                 slot_bytes = streamers[layer_id].bytes_per_expert
                 pull_row_bytes = (
-                    slot_bytes if pull_row_enabled and layer_id not in allocated_layers else 0
+                    slot_bytes
+                    if pull_row_enabled and layer_id not in allocated_layers
+                    else 0
                 )
                 if slot_bytes + pull_row_bytes <= remaining:
                     chosen[layer_id].add(expert_id)
@@ -1295,7 +1314,10 @@ class ExpertHotCacheManager:
         manager._pre_forward_pending_polls = 0
         manager._pre_forward_pending_first_ready = False
         manager._pre_forward_diagnostic_error_logged = False
-        if manager._pre_forward_readiness_enabled and manager._pre_forward_readiness_path:
+        if (
+            manager._pre_forward_readiness_enabled
+            and manager._pre_forward_readiness_path
+        ):
             atexit.register(manager.write_pre_forward_readiness)
             manager._pre_forward_readiness_stop = threading.Event()
             manager._pre_forward_readiness_writer = threading.Thread(
@@ -1354,7 +1376,9 @@ class ExpertHotCacheManager:
         # Trace schemas grow only when a new serving phase first creates its
         # device registers.  Keep an independent fixed-slot pool per schema so
         # adding that optional phase never waits for an older trace to drain.
-        manager._trace_telemetry: dict[tuple[tuple[str, tuple[int, ...], str], ...], AsyncTelemetry] = {}
+        manager._trace_telemetry: dict[
+            tuple[tuple[str, tuple[int, ...], str], ...], AsyncTelemetry
+        ] = {}
         manager._trace_write_condition = threading.Condition()
         manager._trace_sequence = 0
         manager._trace_next_write = 0
@@ -1388,9 +1412,7 @@ class ExpertHotCacheManager:
                         promotion_margin=benefit_ratio,
                         decay_tokens=decay_tokens or None,
                         promotion_sigmas=promotion_sigmas,
-                        initial_scores=(
-                            seed[layer_id] if seed is not None else None
-                        ),
+                        initial_scores=(seed[layer_id] if seed is not None else None),
                     )
                     layer_streamer.residency_policy = policy
                     manager.residency_policies[layer_id] = policy
@@ -1451,7 +1473,7 @@ class ExpertHotCacheManager:
             manager.gpu_residency.check_miss_plans()
         return manager
 
-    def on_pre_forward(self, forward_pass_id: int, forward_batch: "ForwardBatch") -> None:
+    def on_pre_forward(self, forward_pass_id: int, forward_batch: ForwardBatch) -> None:
         """Run the opt-in diagnostic without allowing it to affect serving."""
         if not getattr(self, "_pre_forward_readiness_enabled", False):
             return
@@ -1463,7 +1485,7 @@ class ExpertHotCacheManager:
                 logger.exception("Pre-forward readiness diagnostic failed; continuing")
 
     def _sample_pre_forward_readiness(
-        self, forward_pass_id: int, forward_batch: "ForwardBatch"
+        self, forward_pass_id: int, forward_batch: ForwardBatch
     ) -> None:
         """Sample serving-stream readiness without waiting or changing policy state.
 
@@ -1512,7 +1534,10 @@ class ExpertHotCacheManager:
                 "refresh_ready": 0,
             }
             self._pre_forward_readiness_bins[bucket] = values
-            if len(self._pre_forward_readiness_bins) > self._pre_forward_readiness_bucket_limit:
+            if (
+                len(self._pre_forward_readiness_bins)
+                > self._pre_forward_readiness_bucket_limit
+            ):
                 del self._pre_forward_readiness_bins[
                     min(self._pre_forward_readiness_bins)
                 ]
@@ -1557,9 +1582,7 @@ class ExpertHotCacheManager:
             try:
                 backend = self._async_residency_backend
                 if backend is not None and self._async_residency_event is not None:
-                    event_ready = bool(
-                        backend.ready(self._async_residency_event)
-                    )
+                    event_ready = bool(backend.ready(self._async_residency_event))
                     values["pending_event_ready_samples"] += 1
                     values["pending_event_ready"] += int(event_ready)
                     values["pending_event_and_stream_ready"] += int(
@@ -1585,20 +1608,19 @@ class ExpertHotCacheManager:
             values[f"{phase_prefix}_samples"] = (
                 values.get(f"{phase_prefix}_samples", 0) + 1
             )
-            values[f"{phase_prefix}_stream_ready"] = (
-                values.get(f"{phase_prefix}_stream_ready", 0) + int(ready)
-            )
+            values[f"{phase_prefix}_stream_ready"] = values.get(
+                f"{phase_prefix}_stream_ready", 0
+            ) + int(ready)
             if event_ready is not None:
                 values[f"{phase_prefix}_event_ready_samples"] = (
                     values.get(f"{phase_prefix}_event_ready_samples", 0) + 1
                 )
-                values[f"{phase_prefix}_event_ready"] = (
-                    values.get(f"{phase_prefix}_event_ready", 0) + int(event_ready)
-                )
-                values[f"{phase_prefix}_event_and_stream_ready"] = (
-                    values.get(f"{phase_prefix}_event_and_stream_ready", 0)
-                    + int(event_ready and ready)
-                )
+                values[f"{phase_prefix}_event_ready"] = values.get(
+                    f"{phase_prefix}_event_ready", 0
+                ) + int(event_ready)
+                values[f"{phase_prefix}_event_and_stream_ready"] = values.get(
+                    f"{phase_prefix}_event_and_stream_ready", 0
+                ) + int(event_ready and ready)
         else:
             self._pre_forward_pending_key = None
             self._pre_forward_pending_polls = 0
@@ -1616,7 +1638,9 @@ class ExpertHotCacheManager:
             snapshot_started_monotonic_ns = time.monotonic_ns()
             buckets = [
                 {"monotonic_100ms": bucket, **values.copy()}
-                for bucket, values in sorted(list(self._pre_forward_readiness_bins.items()))
+                for bucket, values in sorted(
+                    list(self._pre_forward_readiness_bins.items())
+                )
             ]
             payload = {
                 "schema": 1,
@@ -1924,7 +1948,9 @@ class ExpertHotCacheManager:
             self._async_residency_buffers = backend.allocate({"scores": scores})
             self._async_residency_event = backend.event()
         backend.enqueue(
-            self._async_residency_buffers, {"scores": scores}, self._async_residency_event
+            self._async_residency_buffers,
+            {"scores": scores},
+            self._async_residency_event,
         )
         self._async_residency_pending = (mode, boundary_forward)
 
@@ -1959,7 +1985,10 @@ class ExpertHotCacheManager:
         deciding_scores = []
         for position, layer in enumerate(layers):
             layer_id, cache, _ = layer
-            if boundary_forward - self._last_update[layer_id] < self.min_residence_forwards:
+            if (
+                boundary_forward - self._last_update[layer_id]
+                < self.min_residence_forwards
+            ):
                 continue
             if cache.promotion_in_flight is not None:
                 self.deferred_residency_updates += 1
@@ -2028,12 +2057,18 @@ class ExpertHotCacheManager:
                     device=device,
                 ),
                 "affinity": torch.zeros(
-                    (max(layers - 1, 0) if self._collect_affinity else 0, experts, experts),
+                    (
+                        max(layers - 1, 0) if self._collect_affinity else 0,
+                        experts,
+                        experts,
+                    ),
                     dtype=torch.float32,
                     device=device,
                 ),
                 "unique_experts": torch.zeros(layers, dtype=torch.int64, device=device),
-                "graph_rows": torch.zeros((layers, 2), dtype=torch.int64, device=device),
+                "graph_rows": torch.zeros(
+                    (layers, 2), dtype=torch.int64, device=device
+                ),
                 "graph_unique_rows": torch.zeros(
                     (layers, 2), dtype=torch.int64, device=device
                 ),
@@ -2054,7 +2089,9 @@ class ExpertHotCacheManager:
         elif self._collect_affinity and not registers["affinity"].shape[0]:
             layers = len(self._layer_ids)
             registers["affinity"] = torch.zeros(
-                (max(layers - 1, 0), experts, experts), dtype=torch.float32, device=device
+                (max(layers - 1, 0), experts, experts),
+                dtype=torch.float32,
+                device=device,
             )
         return registers
 
@@ -2076,7 +2113,9 @@ class ExpertHotCacheManager:
         if index is None:
             index = torch.tensor(self._layer_ids, dtype=torch.long, device=device)
             self._layer_index[device] = index
-        rows = counts.detach().to(device=device, non_blocking=True).index_select(0, index)
+        rows = (
+            counts.detach().to(device=device, non_blocking=True).index_select(0, index)
+        )
         if self._collect_route_history:
             registers["popularity"].add_(rows)
         if self._collect_affinity and registers["affinity"].shape[0]:
@@ -2096,13 +2135,17 @@ class ExpertHotCacheManager:
             # common path avoids the per-forward pinned mask and device temp.
             gathered = self._gathered_zero_masks.get(device)
             if gathered is None:
-                gathered = torch.empty(len(self._layer_ids), dtype=torch.bool, device=device)
+                gathered = torch.empty(
+                    len(self._layer_ids), dtype=torch.bool, device=device
+                )
                 self._gathered_zero_masks[device] = gathered
             torch.gt(self._graph_counters[:, 0], 0, out=gathered)
         else:
             gathered = self._gathered_zero_masks.get(device)
             if gathered is None:
-                gathered = torch.zeros(len(self._layer_ids), dtype=torch.bool, device=device)
+                gathered = torch.zeros(
+                    len(self._layer_ids), dtype=torch.bool, device=device
+                )
                 self._gathered_zero_masks[device] = gathered
             else:
                 gathered.zero_()
@@ -2122,7 +2165,9 @@ class ExpertHotCacheManager:
             return [[] for _ in range(matrix.shape[0])]
         values, indices = matrix.topk(min(self.route_history_limit, matrix.shape[1]))
         entries = []
-        for row_values, row_indices in zip(values.cpu().tolist(), indices.cpu().tolist()):
+        for row_values, row_indices in zip(
+            values.cpu().tolist(), indices.cpu().tolist()
+        ):
             row = [
                 (index, value)
                 for index, value in zip(row_indices, row_values)
@@ -2212,10 +2257,7 @@ class ExpertHotCacheManager:
     ) -> dict[str, Any]:
         """Immutable host state paired with a trace's immutable device buffers."""
         counters = {
-            mode: {
-                str(layer_id): asdict(values)
-                for layer_id, values in layers.items()
-            }
+            mode: {str(layer_id): asdict(values) for layer_id, values in layers.items()}
             for mode, layers in self._counters.items()
         }
         coordinators = getattr(self, "prefetch_coordinators", {})
@@ -2274,7 +2316,9 @@ class ExpertHotCacheManager:
         sequence = self._reserve_trace_sequence()
         if sequence is None:
             return
-        if not telemetry.schedule(sources, self._trace_metadata(phase, telemetry, sequence)):
+        if not telemetry.schedule(
+            sources, self._trace_metadata(phase, telemetry, sequence)
+        ):
             self._skip_trace_sequence(sequence)
 
     def close_telemetry(self) -> None:
@@ -2324,8 +2368,7 @@ class ExpertHotCacheManager:
 
     def _advance_trace_sequence(self) -> None:
         while (
-            self._trace_skipped
-            and self._trace_skipped[0][0] <= self._trace_next_write
+            self._trace_skipped and self._trace_skipped[0][0] <= self._trace_next_write
         ):
             _start, end = self._trace_skipped.pop(0)
             if end >= self._trace_next_write:
@@ -2438,7 +2481,9 @@ class ExpertHotCacheManager:
                 if graph_rows is not None
                 else None
             )
-            gathers = buffers[prefix + "gathers"].tolist() if graph_rows is not None else None
+            gathers = (
+                buffers[prefix + "gathers"].tolist() if graph_rows is not None else None
+            )
             rows = graph_rows.tolist() if graph_rows is not None else None
             for position, layer_id in enumerate(self._layer_ids):
                 row = layers[str(layer_id)]
@@ -2457,7 +2502,9 @@ class ExpertHotCacheManager:
                         streamer.bytes_per_expert - streamer.host_bytes_per_expert
                     )
                     row["h2d_bytes"] += unique_missed * streamer.host_bytes_per_expert
-                    row["backing_source_bytes"] += unique_missed * streamer.bytes_per_expert
+                    row["backing_source_bytes"] += (
+                        unique_missed * streamer.bytes_per_expert
+                    )
                     row["requested_unique_experts"] += requested_unique[position]
                     side_pull = metadata["side_pull_snapshots"].get((mode, layer_id))
                     if side_pull is not None:
@@ -2465,16 +2512,24 @@ class ExpertHotCacheManager:
                         useful_posts = posted - wasted
                         covered_demand_rows = min(useful_posts, unique_missed)
                         row["miss_rows"] -= covered_demand_rows
-                        row["h2d_bytes"] -= covered_demand_rows * streamer.host_bytes_per_expert
-                        row["backing_source_bytes"] -= covered_demand_rows * streamer.bytes_per_expert
+                        row["h2d_bytes"] -= (
+                            covered_demand_rows * streamer.host_bytes_per_expert
+                        )
+                        row["backing_source_bytes"] -= (
+                            covered_demand_rows * streamer.bytes_per_expert
+                        )
                         row["miss_rows"] += posted
                         row["side_pull_rows"] += posted
                         row["side_pull_bytes"] += posted * streamer.bytes_per_expert
-                        row["side_pull_h2d_bytes"] = posted * streamer.host_bytes_per_expert
+                        row["side_pull_h2d_bytes"] = (
+                            posted * streamer.host_bytes_per_expert
+                        )
                         row["side_pull_d2d_bytes"] = posted * (
                             streamer.bytes_per_expert - streamer.host_bytes_per_expert
                         )
-                        row["residual_demand_rows"] = unique_missed - covered_demand_rows
+                        row["residual_demand_rows"] = (
+                            unique_missed - covered_demand_rows
+                        )
                         row["residual_demand_h2d_bytes"] = (
                             row["residual_demand_rows"] * streamer.host_bytes_per_expert
                         )
@@ -2504,7 +2559,11 @@ class ExpertHotCacheManager:
                 "gpu_residency:evictions",
                 "gpu_residency:boundary_updates",
                 "gpu_residency:truncated_layers",
-            ) + (_INSERTION_TRACE_NAMES if metadata["gpu_residency_insert_on_miss"] else ()):
+            ) + (
+                _INSERTION_TRACE_NAMES
+                if metadata["gpu_residency_insert_on_miss"]
+                else ()
+            ):
                 device[name.rsplit(":", 1)[-1]] = buffers[name].tolist()
             result["residency_gpu"] = device
             for row, layer_id in enumerate(metadata["gpu_residency_layers"]):
@@ -2513,17 +2572,25 @@ class ExpertHotCacheManager:
                     entry = result[mode][str(layer_id)]
                     entry["promotions"] += device["promotions"][phase][row]
                     entry["evictions"] += device["evictions"][phase][row]
-                    entry["migration_bytes"] += device["promotions"][phase][row] * bytes_per_expert
+                    entry["migration_bytes"] += (
+                        device["promotions"][phase][row] * bytes_per_expert
+                    )
                 if "insertions" in device:
                     _add_insertions(result["decode"][str(layer_id)], device, row)
                 policy = result.get("residency_policy", {}).get(str(layer_id))
                 if policy is not None:
                     policy["boundary_updates"] += device["boundary_updates"][row]
-                    policy["promotions"] += device["promotions"][0][row] + device["promotions"][1][row]
-                    policy["evictions"] += device["evictions"][0][row] + device["evictions"][1][row]
+                    policy["promotions"] += (
+                        device["promotions"][0][row] + device["promotions"][1][row]
+                    )
+                    policy["evictions"] += (
+                        device["evictions"][0][row] + device["evictions"][1][row]
+                    )
         return result
 
-    def _trace_routes_from_host(self, buffers: Mapping[str, torch.Tensor]) -> dict[str, Any]:
+    def _trace_routes_from_host(
+        self, buffers: Mapping[str, torch.Tensor]
+    ) -> dict[str, Any]:
         result = {}
         pairs = list(zip(self._layer_ids, self._layer_ids[1:]))
         for phase in self._counters:
@@ -2545,7 +2612,8 @@ class ExpertHotCacheManager:
                 },
                 "affinity": {
                     f"{source}->{target}": [
-                        [flat // experts, flat % experts, value] for flat, value in entries
+                        [flat // experts, flat % experts, value]
+                        for flat, value in entries
                     ]
                     for (source, target), entries in zip(pairs, affinity_entries)
                 },
@@ -2616,14 +2684,18 @@ class ExpertHotCacheManager:
                     covered_demand_rows = min(useful_posts, graph_logical_unique_misses)
                     streamer = self.streamers[layer_id]
                     row["miss_rows"] -= covered_demand_rows
-                    row["h2d_bytes"] -= covered_demand_rows * streamer.host_bytes_per_expert
-                    row["backing_source_bytes"] -= covered_demand_rows * streamer.bytes_per_expert
+                    row["h2d_bytes"] -= (
+                        covered_demand_rows * streamer.host_bytes_per_expert
+                    )
+                    row["backing_source_bytes"] -= (
+                        covered_demand_rows * streamer.bytes_per_expert
+                    )
                     row["miss_rows"] += delivered
                     row["side_pull_rows"] += delivered
-                    row["side_pull_bytes"] += (
-                        delivered * streamer.bytes_per_expert
+                    row["side_pull_bytes"] += delivered * streamer.bytes_per_expert
+                    row["side_pull_h2d_bytes"] = (
+                        delivered * streamer.host_bytes_per_expert
                     )
-                    row["side_pull_h2d_bytes"] = delivered * streamer.host_bytes_per_expert
                     row["side_pull_d2d_bytes"] = delivered * (
                         streamer.bytes_per_expert - streamer.host_bytes_per_expert
                     )
@@ -2638,14 +2710,14 @@ class ExpertHotCacheManager:
                     row["side_pull_wasted_rows"] = wasted
                     row["side_pull_covered_routes"] = covered
                     row["side_pull_residual_routes"] = residual
-                    row["side_pull_useful_precision"] = (posted - wasted) / posted if posted else 0.0
+                    row["side_pull_useful_precision"] = (
+                        (posted - wasted) / posted if posted else 0.0
+                    )
                 cache = self.caches.get(layer_id)
                 row["residency_bytes"] = cache.capacity_bytes if cache else 0
                 row["allocation_bytes"] = cache.allocation_bytes if cache else 0
                 row["scratch_bytes"] = cache.scratch_bytes if cache else 0
-                row["prefetch_pull_bytes"] = (
-                    cache.prefetch_pull_bytes if cache else 0
-                )
+                row["prefetch_pull_bytes"] = cache.prefetch_pull_bytes if cache else 0
                 result[mode][str(layer_id)] = row
         coordinators = getattr(self, "prefetch_coordinators", {})
         if coordinators:
@@ -2674,14 +2746,20 @@ class ExpertHotCacheManager:
                     entry = result[mode][str(layer_id)]
                     entry["promotions"] += device["promotions"][phase][row]
                     entry["evictions"] += device["evictions"][phase][row]
-                    entry["migration_bytes"] += device["promotions"][phase][row] * bytes_per_expert
+                    entry["migration_bytes"] += (
+                        device["promotions"][phase][row] * bytes_per_expert
+                    )
                 if "insertions" in device:
                     _add_insertions(result["decode"][str(layer_id)], device, row)
                 metrics = result.get("residency_policy", {}).get(str(layer_id))
                 if metrics is not None:
                     metrics["boundary_updates"] += device["boundary_updates"][row]
-                    metrics["promotions"] += device["promotions"][0][row] + device["promotions"][1][row]
-                    metrics["evictions"] += device["evictions"][0][row] + device["evictions"][1][row]
+                    metrics["promotions"] += (
+                        device["promotions"][0][row] + device["promotions"][1][row]
+                    )
+                    metrics["evictions"] += (
+                        device["evictions"][0][row] + device["evictions"][1][row]
+                    )
         return result
 
     def _refresh_side_pull_delivery(self) -> None:
@@ -2813,7 +2891,13 @@ class ExpertHotCacheManager:
         self._boundary_clock.commit(accepted_tokens)
 
     def record_side_pull_delivery(
-        self, layer_id: int, mode: str, covered: int, residual: int, wasted: int, posted: int
+        self,
+        layer_id: int,
+        mode: str,
+        covered: int,
+        residual: int,
+        wasted: int,
+        posted: int,
     ) -> None:
         """Attribute new rows from one cumulative side-pull delivery snapshot.
 

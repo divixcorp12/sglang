@@ -12,8 +12,9 @@ namespace sglang::expert_stream {
 // reached a job's token means that job and every earlier one completed. The copy thread reads the word with one
 // acquire load per poll: no driver call, so no libcuda mutex, per poll.
 //
-// Liveness, with no clock (the host has no in-flight timeout; the watchdog's copy-wait deadline is the timeout). A failed copy or write never writes the word, so after `check_every` consecutive
-// pending polls the head asks the stream once (`stream_query`: 0 idle, kNotReady busy, else a sticky error):
+// Liveness, with no clock (the host has no in-flight timeout; the watchdog's copy-wait deadline is the timeout). A
+// failed copy or write never writes the word, so after `check_every` consecutive pending polls the head asks the stream
+// once (`stream_query`: 0 idle, kNotReady busy, else a sticky error):
 //   - busy: keep polling;
 //   - an error: return it, and the engine fails stop;
 //   - idle: re-load the word (acquire) and fail stop as a lost write only if it is still short. The first load came
@@ -25,9 +26,9 @@ namespace sglang::expert_stream {
 // stream queries per ~2.2 ms copy job.
 class CompletionWord {
  public:
-  static constexpr int kDone = 0;         // CopyBackend::kDone
-  static constexpr int kPending = 1;      // CopyBackend::kPending
-  static constexpr int kNotReady = 600;   // CUDA_ERROR_NOT_READY
+  static constexpr int kDone = 0;           // CopyBackend::kDone
+  static constexpr int kPending = 1;        // CopyBackend::kPending
+  static constexpr int kNotReady = 600;     // CUDA_ERROR_NOT_READY
   static constexpr int kLostWrite = -1001;  // the stream went idle and the word never reached the token
   static constexpr uint32_t kCheckEvery = 1u << 16;
 

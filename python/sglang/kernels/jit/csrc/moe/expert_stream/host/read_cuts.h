@@ -3,13 +3,11 @@
 // bio (-EAGAIN) and io_uring punts the read to an io-wq worker. A read needs a split when it is larger than the
 // queue's max_sectors_kb / max_segments, or when two of its iovecs meet off the NVMe PRP boundary (virt_boundary_mask).
 // Cutting at both keeps every leg one request (analysis/dsv41-drive/iopoll/diagnosis.md).
-// Out of scope (none applies to the NVMe mirror drives this serves): chunk_sectors (a RAID/zoned boundary a request must
-// not cross: a nonzero value is named in the drive's `read cuts:` line, not modeled), max_segment_size below a page
-// (NVMe reports 4 GiB), and max_segments == 1 (then only max_sectors_kb bounds a leg).
+// Out of scope (none applies to the NVMe mirror drives this serves): chunk_sectors (a RAID/zoned boundary a request
+// must not cross: a nonzero value is named in the drive's `read cuts:` line, not modeled), max_segment_size below a
+// page (NVMe reports 4 GiB), and max_segments == 1 (then only max_sectors_kb bounds a leg).
 #pragma once
 
-#include <limits.h>
-#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
@@ -17,6 +15,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <limits.h>
+#include <stdlib.h>
 #include <string>
 
 namespace sglang::expert_stream {
@@ -116,7 +116,12 @@ struct CutLeg {
 // lim.cut_bytes (splitting that iovec in two). `out` receives the legs' iovecs in order (at most count + legs - 1),
 // `legs` the legs over them. Returns the leg count, or max_legs + 1 when `legs` or `out` is too small.
 inline unsigned cut_legs(
-    const iovec* in, unsigned count, const DeviceLimits& lim, iovec* out, unsigned max_out, CutLeg* legs,
+    const iovec* in,
+    unsigned count,
+    const DeviceLimits& lim,
+    iovec* out,
+    unsigned max_out,
+    CutLeg* legs,
     unsigned max_legs) {
   const auto on_boundary = [&](uintptr_t at) { return lim.virt_mask == 0 || (at & lim.virt_mask) == 0; };
   unsigned n = 0, k = 0;

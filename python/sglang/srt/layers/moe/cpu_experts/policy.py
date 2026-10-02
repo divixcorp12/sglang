@@ -57,7 +57,12 @@ def split_from_grid(grid: Sequence[Sequence[float]], tie: float = 0.02) -> list[
 
 
 def format_calibration(
-    grid: Sequence[Sequence[float]], split: Sequence[int], *, row: int, expert_bytes: int, reps: int
+    grid: Sequence[Sequence[float]],
+    split: Sequence[int],
+    *,
+    row: int,
+    expert_bytes: int,
+    reps: int,
 ) -> str:
     """The calibration's report: the CPU and link tables, each n's layer time at its chosen k, and the split."""
     lanes = len(grid) - 2

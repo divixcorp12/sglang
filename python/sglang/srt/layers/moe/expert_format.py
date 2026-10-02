@@ -65,9 +65,13 @@ class ExpertTensorSpec:
         if not self.name:
             raise ValueError("expert tensor spec needs a name")
         if any(dimension < 0 for dimension in self.row_shape):
-            raise ValueError(f"expert tensor spec {self.name!r} has a negative dimension")
+            raise ValueError(
+                f"expert tensor spec {self.name!r} has a negative dimension"
+            )
         if not isinstance(self.dtype, torch.dtype):
-            raise TypeError(f"expert tensor spec {self.name!r} dtype must be a torch.dtype")
+            raise TypeError(
+                f"expert tensor spec {self.name!r} dtype must be a torch.dtype"
+            )
         if self.residence not in ("host", "device"):
             raise ValueError(
                 f"expert tensor spec {self.name!r} residence must be 'host' or 'device'"
@@ -111,10 +115,10 @@ class ExpertFormat(Protocol):
         layer: torch.nn.Module,
         specs: Sequence[ExpertTensorSpec],
         kind: str,
-    ) -> Optional["ExpertRowSource"]: ...
+    ) -> Optional[ExpertRowSource]: ...
 
     def file_source_bytes_per_expert(
-        self, layer: torch.nn.Module, row_source: Optional["ExpertRowSource"]
+        self, layer: torch.nn.Module, row_source: Optional[ExpertRowSource]
     ) -> Optional[int]: ...
 
     def pinned_tier_options(self, layer: torch.nn.Module) -> Mapping[str, Any]:
@@ -195,7 +199,7 @@ class DenseLayerFormat:
         layer: torch.nn.Module,
         specs: Sequence[ExpertTensorSpec],
         kind: str,
-    ) -> Optional["ExpertRowSource"]:
+    ) -> Optional[ExpertRowSource]:
         # Imported here: the reader pulls in sglang.srt.model_loader, whose
         # package import reaches modelopt_quant, which imports expert_stream.
         from sglang.srt.layers.moe.expert_file_reader import ExpertFileRowReader
@@ -220,7 +224,7 @@ class DenseLayerFormat:
         )
 
     def file_source_bytes_per_expert(
-        self, layer: torch.nn.Module, row_source: Optional["ExpertRowSource"]
+        self, layer: torch.nn.Module, row_source: Optional[ExpertRowSource]
     ) -> Optional[int]:
         # Exactly the pre-format gate: only the NVFP4 method's verified
         # attribute enables file attribution and the eager pinned tier.
@@ -231,12 +235,12 @@ class DenseLayerFormat:
         return {}
 
 
-def expert_streamer_of(module: torch.nn.Module) -> Optional["ExpertStreamer"]:
+def expert_streamer_of(module: torch.nn.Module) -> Optional[ExpertStreamer]:
     """The expert streamer attached to ``module``, or None."""
     return getattr(module, STREAMER_ATTRIBUTE, None)
 
 
-def iter_expert_streamers(model: torch.nn.Module) -> Iterator["ExpertStreamer"]:
+def iter_expert_streamers(model: torch.nn.Module) -> Iterator[ExpertStreamer]:
     """Every attached expert streamer of ``model``, in module order."""
     for module in model.modules():
         streamer = expert_streamer_of(module)
@@ -269,7 +273,9 @@ def graph_gather_needs_host_arena(model: torch.nn.Module) -> bool:
 
 
 def require_graph_gather_support(
-    streamers: Iterable["ExpertStreamer"], *, pinned_tier_ok: bool = False,
+    streamers: Iterable[ExpertStreamer],
+    *,
+    pinned_tier_ok: bool = False,
     exl3_direct_ok: bool = False,
 ) -> None:
     """Raise unless every streamer's format can serve sync-free graph gathers.
@@ -283,7 +289,9 @@ def require_graph_gather_support(
     for streamer in streamers:
         expert_format = streamer.format
         key = expert_format.key
-        if (pinned_tier_ok or (exl3_direct_ok and key == "exl3")) and graph_source_kind_of(expert_format) == "pinned_tier":
+        if (
+            pinned_tier_ok or (exl3_direct_ok and key == "exl3")
+        ) and graph_source_kind_of(expert_format) == "pinned_tier":
             if streamer.pinned_host_cache is None:
                 raise ValueError(
                     f"expert format {key!r} of layer {streamer.layer_id} serves graph "
@@ -301,7 +309,9 @@ def require_graph_gather_support(
             )
 
 
-def pinned_tier_options_of(expert_format: Any, layer: torch.nn.Module) -> Mapping[str, Any]:
+def pinned_tier_options_of(
+    expert_format: Any, layer: torch.nn.Module
+) -> Mapping[str, Any]:
     """``expert_format.pinned_tier_options(layer)``, or no options for a format without the hook.
 
     The protocol requires the hook; a format missing it gets a default pinned
@@ -321,7 +331,7 @@ def pinned_tier_options_of(expert_format: Any, layer: torch.nn.Module) -> Mappin
     return hook(layer)
 
 
-def inclusive_hot_slot_limit(streamer: "ExpertStreamer") -> Optional[int]:
+def inclusive_hot_slot_limit(streamer: ExpertStreamer) -> Optional[int]:
     """The most hot-cache slots a layer may hold when its pinned tier is inclusive.
 
     An inclusive pinned tier keeps every hot expert in host memory too,

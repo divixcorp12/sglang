@@ -8,24 +8,22 @@
 // (LEASE_PROTOCOL.md, "Copy engine"). A failed forward fails stop here.
 #pragma once
 
-#include <immintrin.h>
-#include <pthread.h>
-#include <sched.h>
-
-#include <atomic>
-#include <condition_variable>
-#include <cstdint>
-#include <cstring>
-#include <memory>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
-
 #include "../lease_layout.h"
 #include "reader_base.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <immintrin.h>
+#include <memory>
+#include <mutex>
+#include <pthread.h>
+#include <sched.h>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace sglang::expert_stream {
 
@@ -34,13 +32,19 @@ namespace sglang::expert_stream {
 // sum to it when `accumulate` is nonzero, where slots[i] indexes the layer's pinned host tier and x is one input row in
 // the trait's x format. `layer` is the handle the trait registered for that layer. Returns 0 on success. Called from
 // the CPU expert thread only, with `threads` the kernel's worker count, the calling thread counted as one of them.
-using CpuExpertForward =
-    int (*)(int64_t layer, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out,
-            int32_t threads, int32_t accumulate);
+using CpuExpertForward = int (*)(
+    int64_t layer,
+    const void* x,
+    const int32_t* slots,
+    const float* weights,
+    int32_t k,
+    float* out,
+    int32_t threads,
+    int32_t accumulate);
 
 struct CpuJob {
   int64_t row = 0;
-  int32_t part = 0;   // the output part: 0 the CPU hits' partial sum, 1 the CPU misses'
+  int32_t part = 0;  // the output part: 0 the CPU hits' partial sum, 1 the CPU misses'
   // Add into the part rather than overwrite it: a record's later CPU-miss jobs, in landing order, so the part's fp32
   // sum order varies from run to run.
   bool accumulate = false;
@@ -71,7 +75,8 @@ class CpuExpertEngine {
  public:
   static constexpr size_t kRing = 256;
   // A record has at most one CPU-hit job and one job per CPU miss.
-  static_assert(kRing >= wire::kDemandRecords * (wire::kLeaseLanes + 1), "the ring holds every job that can be outstanding");
+  static_assert(
+      kRing >= wire::kDemandRecords * (wire::kLeaseLanes + 1), "the ring holds every job that can be outstanding");
 
   CpuExpertEngine(CpuExpertConfig config, std::string prefix, std::string thread_name)
       : config_(std::move(config)), prefix_(std::move(prefix)), thread_name_(thread_name.substr(0, 15)) {
@@ -208,12 +213,14 @@ class CpuExpertEngine {
           job.slots,
           job.weights,
           job.k,
-          reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride),
+          reinterpret_cast<float*>(
+              config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride),
           config_.threads,
           job.accumulate ? 1 : 0);
       if (result != 0)
-        fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed (" +
-                  std::to_string(result) + ")");
+        fail_stop(
+            prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed (" + std::to_string(result) +
+            ")");
       compute_ns_.fetch_add(now_ns() - start, std::memory_order_relaxed);
       jobs_done_.fetch_add(1, std::memory_order_relaxed);
       lanes_done_.fetch_add(job.k, std::memory_order_relaxed);

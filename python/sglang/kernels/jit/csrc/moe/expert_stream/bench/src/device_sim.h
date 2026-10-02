@@ -41,8 +41,13 @@ class DeviceSim {
   // The post kernel: apply the row's pending delta (waiting for it until deadline_ns, then throwing), type the lanes,
   // write the record (seq = 0, payload, seq with a release) and demand_head (release). Protect ids are the experts;
   // destinations are 0..count-1.
-  SimRequest post(int64_t row, std::span<const int32_t> experts, std::span<const float> weights, bool captured,
-                  int64_t deadline_ns, const PostHook& before_publish = {});
+  SimRequest post(
+      int64_t row,
+      std::span<const int32_t> experts,
+      std::span<const float> weights,
+      bool captured,
+      int64_t deadline_ns,
+      const PostHook& before_publish = {});
 
   // Apply the row's delta now, waiting for the host to publish it; throws at deadline_ns.
   void sync_row(int64_t row, int64_t deadline_ns);
@@ -72,9 +77,9 @@ class DeviceSim {
   int64_t rows_;
   int64_t experts_;
   uint32_t epoch_;
-  std::vector<int32_t> ram_slot_;                    // [rows][experts]
+  std::vector<int32_t> ram_slot_;                     // [rows][experts]
   std::vector<std::array<int32_t, kLanes>> staging_;  // [rows]
-  std::vector<uint64_t> map_chain_;                  // starts at 1: the attach delta's tag
+  std::vector<uint64_t> map_chain_;                   // starts at 1: the attach delta's tag
   std::vector<uint64_t> map_applied_;
   std::vector<uint8_t> row_cpu_;
 };

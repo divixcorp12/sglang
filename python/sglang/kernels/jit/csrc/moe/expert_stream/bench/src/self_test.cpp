@@ -1,22 +1,18 @@
 #include "self_test.h"
 
-#include <array>
-#include <cstring>
-#include <utility>
-
 #include "aligned.h"
 #include "device_sim.h"
 #include "expert_stream/host/tier_protocol.h"
-
-#include <filesystem>
-#include <mutex>
-
 #include "row_images.h"
 #include "stack.h"
-
+#include <array>
 #include <cstdio>
+#include <cstring>
 #include <exception>
+#include <filesystem>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fullstack {
@@ -119,7 +115,8 @@ void test_placement() {
 
   std::vector<int> expected = expected_threads(production_placement());
   std::vector<int> want = {17};  // sorted: service, workers 18-33, then the copy CPU twice (copy thread, watchdog)
-  for (int cpu = 18; cpu <= 33; ++cpu) want.push_back(cpu);
+  for (int cpu = 18; cpu <= 33; ++cpu)
+    want.push_back(cpu);
   want.push_back(52);
   want.push_back(52);
   CHECK(expected == want);
@@ -146,7 +143,8 @@ struct Blocks {
         lease(aligned_zeroed(lease_bytes)) {}
 
   // The host's delta record for `row`: payload, then the tag with a release (RamTier::publish_delta_locked).
-  void delta(int64_t row, uint64_t tag, std::array<int16_t, 8> staging, std::vector<std::pair<int16_t, int16_t>> entries) {
+  void
+  delta(int64_t row, uint64_t tag, std::array<int16_t, 8> staging, std::vector<std::pair<int16_t, int16_t>> entries) {
     uint8_t* d = lease.get() + w::kDeltaBase + row * w::kDeltaStride;
     const auto count = static_cast<uint32_t>(entries.size());
     std::memcpy(d + w::kDeltaCount, &count, 4);
@@ -213,8 +211,9 @@ void test_record_bytes() {
   CHECK(es::read_record(b.page.get() + rec, 1, &req) == es::RecordRead::kOk);
   CHECK(req.gen == 1 && req.row == 0 && req.captured && req.chain == 2);
   CHECK(req.lanes.size() == 2 && req.protect.size() == 2);
-  CHECK(req.lanes[0].expert == 3 && req.lanes[0].slot == 4 && req.lanes[0].dst == 0 && req.lanes[0].weight == 0.5f &&
-        req.lanes[0].kind == w::kKindHitCpu);
+  CHECK(
+      req.lanes[0].expert == 3 && req.lanes[0].slot == 4 && req.lanes[0].dst == 0 && req.lanes[0].weight == 0.5f &&
+      req.lanes[0].kind == w::kKindHitCpu);
   CHECK(req.lanes[1].expert == 5 && req.lanes[1].slot == 0 && req.lanes[1].kind == w::kKindMissGpu);
 }
 
@@ -243,7 +242,8 @@ void test_seqlock_order() {
   CHECK(hooked);
   CHECK(b.at<uint32_t>(w::kDemandRing + w::kRecSeq) == 1 && b.at<uint32_t>(w::kDemandHead) == 1);
   // A rewrite of a ring slot that held an earlier record also zeroes its seq first: seq 17 reuses slot 0.
-  for (int i = 0; i < 15; ++i) sim.post(0, e, wt, true, soon());
+  for (int i = 0; i < 15; ++i)
+    sim.post(0, e, wt, true, soon());
   bool rehooked = false;
   sim.post(0, e, wt, true, soon(), [&](const uint8_t* record) {
     rehooked = true;
@@ -343,8 +343,10 @@ void test_copy_wait_gate() {
   CHECK(!sim.copy_wait(r, monotonic_ns() + 2'000'000));
   CHECK(sim.copy_gate() == gate_word(r.seq, w::kLeaseGateClosed));
   // CopyDone stored before the close (the host's open found nothing closed): CW opens the gate itself.
-  __atomic_store_n(reinterpret_cast<uint64_t*>(b.lease.get() + w::kLeaseCopyDone + r.idx * w::kLeaseCopyDoneBytes),
-                   r.gen, __ATOMIC_RELEASE);
+  __atomic_store_n(
+      reinterpret_cast<uint64_t*>(b.lease.get() + w::kLeaseCopyDone + r.idx * w::kLeaseCopyDoneBytes),
+      r.gen,
+      __ATOMIC_RELEASE);
   CHECK(sim.copy_wait(r, soon()));
   CHECK(sim.copy_gate() == gate_word(r.seq, w::kLeaseGateOpen));
   CHECK(sim.copy_done(r) == r.gen);
@@ -389,17 +391,25 @@ std::vector<FakeCall> fake_calls;
 
 // The kernel's stand-in: out[h] = h + x[0] + sum_i weights[i] * (slots[i] + 1), x[0] read as an integer, so the output
 // proves the row's x, the slots and the weights reached it.
-int fake_forward(int64_t layer, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out,
-                 int32_t threads, int32_t accumulate) {
+int fake_forward(
+    int64_t layer,
+    const void* x,
+    const int32_t* slots,
+    const float* weights,
+    int32_t k,
+    float* out,
+    int32_t threads,
+    int32_t accumulate) {
   uint16_t x0;
   std::memcpy(&x0, x, 2);
   float sum = 0.0f;
-  for (int32_t i = 0; i < k; ++i) sum += weights[i] * static_cast<float>(slots[i] + 1);
+  for (int32_t i = 0; i < k; ++i)
+    sum += weights[i] * static_cast<float>(slots[i] + 1);
   for (int64_t h = 0; h < kSelfHidden; ++h)
     out[h] = (accumulate != 0 ? out[h] : 0.0f) + static_cast<float>(h) + static_cast<float>(x0) + sum;
   std::lock_guard<std::mutex> guard(fake_mutex);
-  fake_calls.push_back({layer, std::vector<int32_t>(slots, slots + k), std::vector<float>(weights, weights + k), threads,
-                        accumulate});
+  fake_calls.push_back(
+      {layer, std::vector<int32_t>(slots, slots + k), std::vector<float>(weights, weights + k), threads, accumulate});
   return 0;
 }
 
@@ -428,9 +438,15 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
     }
     set.slabs.push_back(bases);
     const auto path = dir / ("selftest-layer-" + std::to_string(row) + ".rows");
-    write_row_image(path, layout, kSelfExperts, [&](int64_t e, uint8_t* image) {
-      for (int n = 0; n < kNames; ++n) std::memset(image + layout.name_offsets[n], pattern(row, e, n), 512);
-    }, "");
+    write_row_image(
+        path,
+        layout,
+        kSelfExperts,
+        [&](int64_t e, uint8_t* image) {
+          for (int n = 0; n < kNames; ++n)
+            std::memset(image + layout.name_offsets[n], pattern(row, e, n), 512);
+        },
+        "");
     set.paths.push_back(path.string());
   }
   AlignedBuffer x = aligned_zeroed(kSelfRows * 2 * kSelfHidden);
@@ -490,8 +506,9 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
     const float weights[] = {0.5f, 0.25f, 0.125f};
     if constexpr (BenchBuild::kMetrics) stack.drain_all();
     r = sim.post(0, order, weights, true, monotonic_ns() + timeout);
-    CHECK(r.kinds[0] == int32_t(w::kKindHitCpu) && r.kinds[1] == int32_t(w::kKindHitCpu) &&
-          r.kinds[2] == int32_t(w::kKindHitCpu));
+    CHECK(
+        r.kinds[0] == int32_t(w::kKindHitCpu) && r.kinds[1] == int32_t(w::kKindHitCpu) &&
+        r.kinds[2] == int32_t(w::kKindHitCpu));
     CHECK(sim.copy_wait(r, monotonic_ns() + timeout));
     {
       std::lock_guard<std::mutex> guard(fake_mutex);
@@ -533,7 +550,8 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
     CHECK(sim.wait_pieces(r, 1, monotonic_ns() + timeout));
     CHECK(part0_is(part0, 101.0f + 0.75f));
     landed = true;
-    for (int n = 0; n < kNames; ++n) landed = landed && slabs[0][n][3 * 512] == pattern(0, 6, n);
+    for (int n = 0; n < kNames; ++n)
+      landed = landed && slabs[0][n][3 * 512] == pattern(0, 6, n);
     CHECK(landed);
     cpu = stack.cpu_stats();
     CHECK(cpu[0] == 2 && cpu[1] == 4);
@@ -541,7 +559,8 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
     CHECK(sim.ram_slot(0, 6) == 3 && sim.staging(0)[0] == 6);
     const float* row1 = part0 + 2 * kSelfHidden;
     bool untouched = true;
-    for (int64_t i = 0; i < 2 * kSelfHidden; ++i) untouched = untouched && row1[i] == 0.0f;
+    for (int64_t i = 0; i < 2 * kSelfHidden; ++i)
+      untouched = untouched && row1[i] == 0.0f;
     CHECK(untouched);
   }  // teardown: open the gate, stop the service, settle, stop the copy and CPU threads
   CHECK(fake_calls.size() == 2);
@@ -560,8 +579,8 @@ int run_self_test(const Placement& placement, const std::filesystem::path& image
   require_o_direct(image_dir);
   test_image_stamp(image_dir);
   test_stack(placement, image_dir);
-  std::fprintf(stderr, "self-test (%s): %d checks, %d failed\n", std::string(BenchBuild::kName).c_str(), checks,
-               failures);
+  std::fprintf(
+      stderr, "self-test (%s): %d checks, %d failed\n", std::string(BenchBuild::kName).c_str(), checks, failures);
   return failures;
 }
 

@@ -1,5 +1,7 @@
 #include "fixture.h"
+
 #include <ATen/ATen.h>
+
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -7,8 +9,7 @@
 namespace {
 uint32_t read_u32(std::ifstream& input) {
   uint32_t value;
-  if (!input.read(reinterpret_cast<char*>(&value), sizeof(value)))
-    throw std::runtime_error("Truncated fixture header");
+  if (!input.read(reinterpret_cast<char*>(&value), sizeof(value))) throw std::runtime_error("Truncated fixture header");
   return value;
 }
 
@@ -18,7 +19,7 @@ at::Tensor read_tensor(std::ifstream& input, at::IntArrayRef shape, at::ScalarTy
     throw std::runtime_error("Truncated fixture tensor");
   return tensor;
 }
-} // namespace
+}  // namespace
 
 Fixture::Fixture(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
@@ -35,8 +36,7 @@ Fixture::Fixture(const std::filesystem::path& path) {
   // Reject malformed lengths before allocating the ~550 MB fixture.
   constexpr uint64_t matrix_bytes = uint64_t(5120) * 2304 * 3 / 8 + (5120 + 2304) * 2;
   constexpr uint64_t expected = 24 + 8 * (5120 * 2 + 3 * 5 * (matrix_bytes + 16));
-  if (std::filesystem::file_size(path) != expected)
-    throw std::runtime_error("Unexpected fixture length");
+  if (std::filesystem::file_size(path) != expected) throw std::runtime_error("Unexpected fixture length");
   layers.reserve(count);
   for (uint32_t layer = 0; layer < count; ++layer) {
     LayerFixture data;

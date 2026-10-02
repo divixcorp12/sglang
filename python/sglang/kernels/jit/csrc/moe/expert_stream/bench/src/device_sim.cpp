@@ -1,14 +1,12 @@
 #include "device_sim.h"
 
-#include <immintrin.h>
-#include <time.h>
-
+#include "expert_stream/lease_layout.h"
 #include <algorithm>
 #include <cstring>
+#include <immintrin.h>
 #include <stdexcept>
 #include <string>
-
-#include "expert_stream/lease_layout.h"
+#include <time.h>
 
 namespace fullstack {
 namespace w = ::sglang::expert_stream::wire;
@@ -54,7 +52,8 @@ DeviceSim::DeviceSim(uint8_t* page, uint8_t* lease, int64_t rows, int64_t expert
       map_chain_(static_cast<size_t>(rows), 1),
       map_applied_(static_cast<size_t>(rows), 0),
       row_cpu_(static_cast<size_t>(rows), 0) {
-  for (auto& s : staging_) s.fill(-1);
+  for (auto& s : staging_)
+    s.fill(-1);
 }
 
 void DeviceSim::set_row_cpu(int64_t row) {
@@ -70,12 +69,13 @@ bool DeviceSim::apply_pending(int64_t row) {
   uint32_t count;
   std::memcpy(&count, d + w::kDeltaCount, 4);
   if (count > static_cast<uint32_t>(w::kDeltaMaxEntries))
-    throw std::runtime_error("row " + std::to_string(row) + ": delta " + std::to_string(tag) + " has " +
-                             std::to_string(count) + " entries");
+    throw std::runtime_error(
+        "row " + std::to_string(row) + ": delta " + std::to_string(tag) + " has " + std::to_string(count) + " entries");
   for (uint32_t i = 0; i < count; ++i) {
     int16_t entry[2];
     std::memcpy(entry, d + w::kDeltaEntries + 4 * i, 4);
-    if (entry[0] < 0 || entry[0] >= experts_) throw std::runtime_error("a delta entry names expert " + std::to_string(entry[0]));
+    if (entry[0] < 0 || entry[0] >= experts_)
+      throw std::runtime_error("a delta entry names expert " + std::to_string(entry[0]));
     ram_slot_[row * experts_ + entry[0]] = entry[1];
   }
   for (int k = 0; k < kLanes; ++k) {
@@ -91,22 +91,29 @@ void DeviceSim::sync_row(int64_t row, int64_t deadline_ns) {
   if (row < 0 || row >= rows_) throw std::runtime_error("row " + std::to_string(row) + " is out of range");
   for (uint32_t spin = 0; !apply_pending(row); ++spin) {
     if ((spin & 1023) == 1023 && monotonic_ns() > deadline_ns)
-      throw std::runtime_error("row " + std::to_string(row) + ": the host has not published delta " +
-                               std::to_string(map_chain_[row]));
+      throw std::runtime_error(
+          "row " + std::to_string(row) + ": the host has not published delta " + std::to_string(map_chain_[row]));
     _mm_pause();
   }
 }
 
-SimRequest DeviceSim::post(int64_t row, std::span<const int32_t> experts, std::span<const float> weights, bool captured,
-                           int64_t deadline_ns, const PostHook& before_publish) {
+SimRequest DeviceSim::post(
+    int64_t row,
+    std::span<const int32_t> experts,
+    std::span<const float> weights,
+    bool captured,
+    int64_t deadline_ns,
+    const PostHook& before_publish) {
   const int count = static_cast<int>(experts.size());
   if (row < 0 || row >= rows_) throw std::runtime_error("row " + std::to_string(row) + " is out of range");
   if (count < 1 || count > kLanes) throw std::runtime_error("a post has 1.." + std::to_string(kLanes) + " lanes");
   if (weights.size() != experts.size()) throw std::runtime_error("a post needs one of its weights per lane");
   for (int j = 0; j < count; ++j) {
-    if (experts[j] < 0 || experts[j] >= experts_) throw std::runtime_error("expert " + std::to_string(experts[j]) + " is out of range");
+    if (experts[j] < 0 || experts[j] >= experts_)
+      throw std::runtime_error("expert " + std::to_string(experts[j]) + " is out of range");
     for (int i = 0; i < j; ++i)
-      if (experts[i] == experts[j]) throw std::runtime_error("a post names expert " + std::to_string(experts[j]) + " twice");
+      if (experts[i] == experts[j])
+        throw std::runtime_error("a post names expert " + std::to_string(experts[j]) + " twice");
   }
   sync_row(row, deadline_ns);
 
@@ -169,7 +176,8 @@ SimRequest DeviceSim::post(int64_t row, std::span<const int32_t> experts, std::s
   put<uint64_t>(rec + w::kRecChain, r.chain);
   put<uint32_t>(rec + w::kRecEpoch, epoch_);
   uint32_t kinds = 0;
-  for (int j = 0; j < count; ++j) kinds |= (static_cast<uint32_t>(r.kinds[j]) & 0xFu) << (4 * j);
+  for (int j = 0; j < count; ++j)
+    kinds |= (static_cast<uint32_t>(r.kinds[j]) & 0xFu) << (4 * j);
   put<uint32_t>(rec + w::kRecKinds, kinds);
   for (int j = 0; j < kLanes; ++j) {
     const bool lane = j < count;
@@ -205,8 +213,8 @@ bool DeviceSim::copy_wait(const SimRequest& r, int64_t deadline_ns) {
   }
   // CW's own open, from G's closed word only (the host's CAS rule): nothing else opens a gate closed after CopyDone.
   uint32_t expected = closed;
-  __atomic_compare_exchange_n(gate, &expected, gate_word(r.seq, w::kLeaseGateOpen), false, __ATOMIC_SEQ_CST,
-                              __ATOMIC_ACQUIRE);
+  __atomic_compare_exchange_n(
+      gate, &expected, gate_word(r.seq, w::kLeaseGateOpen), false, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE);
   return true;
 }
 
@@ -254,18 +262,21 @@ uint32_t load_experts(DeviceSim& sim, int64_t row, std::span<const int32_t> expe
     const SimRequest r = sim.post(row, group, weights, /*captured=*/false, deadline);
     for (int j = 0; j < r.count; ++j) {
       if (r.kinds[j] != static_cast<int32_t>(w::kKindMissGpu))
-        throw std::runtime_error("row " + std::to_string(row) + ": loading expert " + std::to_string(group[j]) +
-                                 ", which is already resident");
+        throw std::runtime_error(
+            "row " + std::to_string(row) + ": loading expert " + std::to_string(group[j]) +
+            ", which is already resident");
       if (!sim.wait_pieces(r, j, deadline))
-        throw std::runtime_error("row " + std::to_string(row) + ": expert " + std::to_string(group[j]) +
-                                 "'s pieces did not land in time (gen " + std::to_string(r.gen) + ")");
+        throw std::runtime_error(
+            "row " + std::to_string(row) + ": expert " + std::to_string(group[j]) +
+            "'s pieces did not land in time (gen " + std::to_string(r.gen) + ")");
     }
     last = r.seq;
   }
   sim.sync_row(row, monotonic_ns() + timeout_ns);
   for (int32_t e : experts)
     if (sim.ram_slot(row, e) < 0)
-      throw std::runtime_error("row " + std::to_string(row) + ": expert " + std::to_string(e) + " is not resident after its load");
+      throw std::runtime_error(
+          "row " + std::to_string(row) + ": expert " + std::to_string(e) + " is not resident after its load");
   return last;
 }
 

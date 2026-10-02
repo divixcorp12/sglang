@@ -7,25 +7,23 @@
 #error "EXL3_FULL_STACK_INSTR selects the host build: 0 ProdBuild, 1 InstrBuild"
 #endif
 
-#include <immintrin.h>
-
-#include <array>
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <type_traits>
-#include <vector>
-
 #include "aligned.h"
 #include "device_sim.h"
 #include "exl3/exl3_row_layout.h"
 #include "expert_stream/host/build_policy.h"
 #include "expert_stream/host/core_topology.h"
-#include "expert_stream/host/row_reader.h"
 #include "expert_stream/host/ram_thread.h"
+#include "expert_stream/host/row_reader.h"
 #include "expert_stream/host/uring_reader.h"
 #include "placement.h"
 #include "row_images.h"
+#include <array>
+#include <immintrin.h>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <vector>
 
 namespace fullstack {
 
@@ -59,16 +57,20 @@ inline es::Tables image_tables(const RowSet& set) {
   t.source_paths = set.paths;
   t.file_sizes.assign(static_cast<size_t>(rows), set.experts * layout.row_stride);
   for (int64_t row = 0; row < rows; ++row)
-    for (int64_t e = 0; e < set.experts; ++e) t.extents.push_back(es::Read{row, e * layout.row_stride, layout.image_bytes, 0});
+    for (int64_t e = 0; e < set.experts; ++e)
+      t.extents.push_back(es::Read{row, e * layout.row_stride, layout.image_bytes, 0});
   t.starts.assign(static_cast<size_t>(rows * set.experts), 0);
-  for (int n = 0; n < kNames; ++n) t.segments.push_back(es::Segment{n, 0, layout.name_offsets[n], layout.row_bytes[n]});
+  for (int n = 0; n < kNames; ++n)
+    t.segments.push_back(es::Segment{n, 0, layout.name_offsets[n], layout.row_bytes[n]});
   t.need_end = layout.image_bytes;
   for (int64_t row = 0; row < rows; ++row) {
     t.slabs.emplace_back(set.slabs[row].begin(), set.slabs[row].end());
     for (int n = 0; n < kNames; ++n)
-      t.buffer_regions.push_back(es::RegisteredRegion{set.slabs[row][n],
-                                                      static_cast<size_t>(set.capacity * layout.row_bytes[n]),
-                                                      static_cast<size_t>(layout.row_bytes[n])});
+      t.buffer_regions.push_back(
+          es::RegisteredRegion{
+              set.slabs[row][n],
+              static_cast<size_t>(set.capacity * layout.row_bytes[n]),
+              static_cast<size_t>(layout.row_bytes[n])});
   }
   t.row_bytes.assign(layout.row_bytes.begin(), layout.row_bytes.end());
   t.images = true;
@@ -89,8 +91,8 @@ struct StackConfig {
   int64_t hidden = 0;
   int service_cpu = -1;
   int copy_cpu = -1;
-  int64_t wait_timeout_ns = 2'000'000'000;   // the watchdog's copy-wait deadline (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS)
-  int64_t fatal_wait_ns = 30'000'000'000;    // the watchdog's hung-request deadline
+  int64_t wait_timeout_ns = 2'000'000'000;  // the watchdog's copy-wait deadline (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS)
+  int64_t fatal_wait_ns = 30'000'000'000;   // the watchdog's hung-request deadline
   std::array<int64_t, es::kLeaseLanes + 1> split{};
   size_t trace_capacity = 0;  // InstrBuild: the stage trace's ring, 0 off
 };
@@ -112,9 +114,16 @@ class Stack {
     lease_bytes_ = es::kLeaseBlockBytes + round_up(rows_ * es::kDeltaStride, 4096);
     lease_ = aligned_zeroed(lease_bytes_);
     slot_map_.assign(static_cast<size_t>(rows_ * experts_), -1);
-    tier_ = std::make_shared<Tier>(page_.get(), slot_map_.data(), lease_.get(), lease_bytes_, image_tables(config_.rows),
-                                   std::vector<int64_t>(static_cast<size_t>(rows_), config_.rows.capacity),
-                                   /*direct=*/true, /*hot_page=*/nullptr, 0);
+    tier_ = std::make_shared<Tier>(
+        page_.get(),
+        slot_map_.data(),
+        lease_.get(),
+        lease_bytes_,
+        image_tables(config_.rows),
+        std::vector<int64_t>(static_cast<size_t>(rows_), config_.rows.capacity),
+        /*direct=*/true,
+        /*hot_page=*/nullptr,
+        0);
     if (!tier_->open()) throw std::runtime_error("the tier's reader did not open (its error is on stderr)");
     tier_->reserve_staging(config_.staging);
     // The copy engine's thread and RamThread's watchdog inherit this thread's affinity: the copy CPU.
@@ -137,7 +146,8 @@ class Stack {
       if (config_.trace_capacity > 0) tier_->enable_trace(config_.trace_capacity);
     }
     es::check_dedicated_core(config_.service_cpu, tier_->cpu_cores(), "full-stack bench: ");
-    thread_ = std::make_unique<Thread>(tier_, config_.service_cpu, config_.fatal_wait_ns, /*spin_ns=*/0, /*busy_poll=*/true);
+    thread_ =
+        std::make_unique<Thread>(tier_, config_.service_cpu, config_.fatal_wait_ns, /*spin_ns=*/0, /*busy_poll=*/true);
     thread_->start();
   }
 

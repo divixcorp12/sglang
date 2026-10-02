@@ -149,17 +149,25 @@ def _check_slot_map() -> None:
     """The slot-map chain's switches: how the post types RAM hits, and whether the CPU may take NVMe misses."""
     hit_copy = envs.SGLANG_DSV41_RAM_HIT_COPY.get()
     if hit_copy not in ("ce", "sm"):
-        raise ValueError(f"SGLANG_DSV41_RAM_HIT_COPY must be ce or sm, got {hit_copy!r}")
-    if envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get() and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        raise ValueError(
+            f"SGLANG_DSV41_RAM_HIT_COPY must be ce or sm, got {hit_copy!r}"
+        )
+    if (
+        envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get()
+        and not envs.SGLANG_DSV41_CPU_EXPERTS.get()
+    ):
         # The device would type misses kMissCpu that no CPU thread computes.
-        raise ValueError("SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1")
+        raise ValueError(
+            "SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1"
+        )
 
 
 def _check_direct_residency(budgets) -> None:
     """The graph gather runs the RAM-miss service, whose VRAM-hot set is the one the DIRECT updater writes into every
     record: no other residency mode feeds it."""
     if budgets.graph_gather and not (
-        envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get() and envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2
+        envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
+        and envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2
     ):
         raise ValueError(
             "EXL3 graph gather (the RAM-miss service) needs DIRECT residency "
@@ -175,13 +183,28 @@ def _check_cpu_experts(budgets) -> None:
         return
     needs = [
         ("SGLANG_MOE_EXPERT_GRAPH_GATHER=1", budgets.graph_gather),
-        ("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1", envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get()),
-        ("SGLANG_DSV41_ENABLE_LAYER_FUSION=1", envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get()),
+        (
+            "SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE=1",
+            envs.SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE.get(),
+        ),
+        (
+            "SGLANG_DSV41_ENABLE_LAYER_FUSION=1",
+            envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.get(),
+        ),
         # DIRECT residency ranks the keys the fused plan sorts the miss lanes by, so the CPU takes the coldest ones.
-        ("SGLANG_MOE_GPU_RESIDENCY_UPDATE=1", envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()),
-        ("SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2", envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2),
+        (
+            "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1",
+            envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get(),
+        ),
+        (
+            "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2",
+            envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2,
+        ),
         ("SGLANG_MOE_EXPERT_FUSED_PLAN=1", envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()),
-        ("SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list)", bool(envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get())),
+        (
+            "SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list)",
+            bool(envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get()),
+        ),
     ]
     missing = [name for name, ok in needs if not ok]
     if missing:
@@ -189,7 +212,9 @@ def _check_cpu_experts(budgets) -> None:
     if envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off":
         # The pull join rewrites a route's slot after planning; a CPU lane's route would then match no plan slot, and
         # the fused MoE would compute it on top of the CPU's partial.
-        raise ValueError("SGLANG_DSV41_CPU_EXPERTS cannot run with SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE; set it to off")
+        raise ValueError(
+            "SGLANG_DSV41_CPU_EXPERTS cannot run with SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE; set it to off"
+        )
 
 
 exl3_expert_stream_requirements = ExpertStreamRequirements(

@@ -79,8 +79,8 @@ static_assert(CompletionWord::kDone == CopyBackend::kDone && CompletionWord::kPe
 //
 // No fallback: the production recipe needs the copy engine, so init() refuses (and the copy engine's start() throws)
 // when the v2 write-value op cannot be resolved, errors, or its first write does not reach the word; and when the v2
-// wait-value op, which the decode stream's copy wait needs on host-mapped memory (LEASE_PROTOCOL.md, "Copy engine"), cannot be
-// resolved, errors, does not hold its stream, or is not released by a host store.
+// wait-value op, which the decode stream's copy wait needs on host-mapped memory (LEASE_PROTOCOL.md, "Copy engine"),
+// cannot be resolved, errors, does not hold its stream, or is not released by a host store.
 class CudaCopyBackend : public CopyBackend {
  public:
   CudaCopyBackend(int device, std::string prefix) : device_(device), prefix_(std::move(prefix)) {}
@@ -230,7 +230,8 @@ class CudaCopyBackend : public CopyBackend {
       } else if (q != CompletionWord::kNotReady) {
         error = "the stream-wait probe failed: cuStreamQuery " + std::to_string(q);
       }
-      __atomic_store_n(word, open_word, __ATOMIC_RELEASE);  // releases the wait; also on an error, so nothing stays queued
+      __atomic_store_n(
+          word, open_word, __ATOMIC_RELEASE);  // releases the wait; also on an error, so nothing stays queued
       for (int i = 0; error.empty(); ++i) {
         q = cu_stream_query_(stream_);
         if (q == 0) break;
@@ -464,7 +465,6 @@ class CopyEngine {
       futex_wake(&wake_);
     }
   }
-
 
   // Every submitted job has completed (or failed): submitted_ is the submitter's, finished_ the copy thread's, each
   // written by one thread.

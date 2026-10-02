@@ -4,12 +4,11 @@
 // thread: the slabs, x and output rows are first-touched there.
 #pragma once
 
+#include "row_images.h"
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <vector>
-
-#include "row_images.h"
 
 namespace fullstack {
 

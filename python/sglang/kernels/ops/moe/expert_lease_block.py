@@ -70,10 +70,16 @@ def check_lease_block(block: torch.Tensor, rows: int, *, need_pinned: bool) -> N
     if block.dtype != torch.uint8 or block.device.type != "cpu" or block.dim() != 1:
         raise ValueError("the lease block must be a 1-D CPU uint8 tensor")
     if block.numel() != lease_block_bytes(rows):
-        raise ValueError(f"the lease block has {block.numel()} bytes, not {lease_block_bytes(rows)} for {rows} rows")
+        raise ValueError(
+            f"the lease block has {block.numel()} bytes, not {lease_block_bytes(rows)} for {rows} rows"
+        )
     if not block.is_contiguous():
         raise ValueError("the lease block must be contiguous")
     if block.data_ptr() % BLOCK_ALIGN != 0:
-        raise ValueError(f"the lease block must be {BLOCK_ALIGN}-byte aligned, its address is {block.data_ptr():#x}")
+        raise ValueError(
+            f"the lease block must be {BLOCK_ALIGN}-byte aligned, its address is {block.data_ptr():#x}"
+        )
     if need_pinned and not block.is_pinned():
-        raise ValueError("the lease block must be pinned for a CUDA device: the kernels read it through UVA")
+        raise ValueError(
+            "the lease block must be pinned for a CUDA device: the kernels read it through UVA"
+        )

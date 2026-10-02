@@ -119,7 +119,7 @@ class Exl3ShardRowSource(SynchronousSubmit):
         segments: Sequence[RowSegment],
         *,
         direct: bool,
-    ) -> "Exl3ShardRowSource":
+    ) -> Exl3ShardRowSource:
         return cls(shared_row_reader(layout, direct), layer_id, segments)
 
     def covers(self, name: str) -> bool:
@@ -161,9 +161,7 @@ class Exl3ShardRowSource(SynchronousSubmit):
         if len(slots) != len(experts):
             raise ValueError("expert rows and destination rows must match in length")
         if any(not 0 <= expert < self.num_experts for expert in experts):
-            raise ValueError(
-                f"expert row is outside [0, {self.num_experts - 1}]"
-            )
+            raise ValueError(f"expert row is outside [0, {self.num_experts - 1}]")
         targets = {}
         for name, destination in destinations.items():
             if destination.device.type != "cpu" or not destination.is_contiguous():

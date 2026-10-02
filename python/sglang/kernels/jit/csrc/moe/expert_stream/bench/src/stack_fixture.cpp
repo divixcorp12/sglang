@@ -2,18 +2,17 @@
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
-#include <omp.h>
-
-#include <array>
-#include <cstdio>
-#include <cstring>
-#include <fstream>
-#include <stdexcept>
-#include <string>
 
 #include "aligned.h"
 #include "fixture.h"
 #include "moe_mul1.h"
+#include <array>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <omp.h>
+#include <stdexcept>
+#include <string>
 
 namespace fullstack {
 namespace fs = std::filesystem;
@@ -60,8 +59,8 @@ StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_d
   f.hidden = fixture.hidden;
   const auto& m = fixture.layers[0].matrices;
   f.intermediate = m[2][0].size(0);  // gate svh: [n] = I
-  const std::array<int64_t, kNames> row_bytes = {2 * nbytes(m[0][0]), 2 * nbytes(m[1][0]), 2 * nbytes(m[2][0]),
-                                                 nbytes(m[6][0]),     nbytes(m[7][0]),     nbytes(m[8][0])};
+  const std::array<int64_t, kNames> row_bytes = {
+      2 * nbytes(m[0][0]), 2 * nbytes(m[1][0]), 2 * nbytes(m[2][0]), nbytes(m[6][0]), nbytes(m[7][0]), nbytes(m[8][0])};
   f.set.layout = image_layout(row_bytes);
   f.set.experts = f.experts;
   f.set.capacity = kCapacity;
@@ -79,17 +78,22 @@ StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_d
     std::snprintf(name, sizeof(name), "fixture-layer-%03lld.rows", static_cast<long long>(row));
     const fs::path path = image_dir / name;
     const auto& matrices = fixture.layers[row].matrices;
-    write_row_image(path, layout, f.experts, [&](int64_t e, uint8_t* image) {
-      for (int n = 0; n < kNames; ++n) {
-        uint8_t* cursor = image + layout.name_offsets[n];
-        for (int source : kSources[n]) {
-          if (source < 0) continue;
-          const at::Tensor& t = matrices[source][e];
-          std::memcpy(cursor, t.data_ptr(), t.nbytes());
-          cursor += t.nbytes();
-        }
-      }
-    }, stamp);
+    write_row_image(
+        path,
+        layout,
+        f.experts,
+        [&](int64_t e, uint8_t* image) {
+          for (int n = 0; n < kNames; ++n) {
+            uint8_t* cursor = image + layout.name_offsets[n];
+            for (int source : kSources[n]) {
+              if (source < 0) continue;
+              const at::Tensor& t = matrices[source][e];
+              std::memcpy(cursor, t.data_ptr(), t.nbytes());
+              cursor += t.nbytes();
+            }
+          }
+        },
+        stamp);
     f.set.paths.push_back(path.string());
   }
   f.x_stride = round_up(2 * f.hidden, 16);  // cpu_experts/service.py: FP16 rows padded to 16 bytes
@@ -105,16 +109,30 @@ StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_d
 
 StackFixture::~StackFixture() = default;
 
-int64_t StackFixture::rows() const { return impl_->rows; }
-int64_t StackFixture::experts() const { return impl_->experts; }
-int64_t StackFixture::hidden() const { return impl_->hidden; }
-const RowSet& StackFixture::row_set() const { return impl_->set; }
-uint8_t* StackFixture::x_row(int64_t row) const { return impl_->x.get() + row * impl_->x_stride; }
-int64_t StackFixture::x_stride() const { return impl_->x_stride; }
+int64_t StackFixture::rows() const {
+  return impl_->rows;
+}
+int64_t StackFixture::experts() const {
+  return impl_->experts;
+}
+int64_t StackFixture::hidden() const {
+  return impl_->hidden;
+}
+const RowSet& StackFixture::row_set() const {
+  return impl_->set;
+}
+uint8_t* StackFixture::x_row(int64_t row) const {
+  return impl_->x.get() + row * impl_->x_stride;
+}
+int64_t StackFixture::x_stride() const {
+  return impl_->x_stride;
+}
 float* StackFixture::out_row(int64_t row) const {
   return reinterpret_cast<float*>(impl_->out.get() + row * impl_->out_stride);
 }
-int64_t StackFixture::out_stride() const { return impl_->out_stride; }
+int64_t StackFixture::out_stride() const {
+  return impl_->out_stride;
+}
 
 void StackFixture::write_x(int64_t row) const {
   std::memcpy(x_row(row), impl_->inputs.data() + row * 2 * impl_->hidden, 2 * impl_->hidden);
@@ -155,8 +173,10 @@ void StackFixture::preload_slots(int64_t row) const {
     if (!in.read(image.data(), static_cast<std::streamsize>(image.size())))
       throw std::runtime_error("cannot read expert " + std::to_string(e) + "'s image from " + path);
     for (int n = 0; n < kNames; ++n)
-      std::memcpy(f.set.slabs[row][n] + e * layout.row_bytes[n], image.data() + layout.name_offsets[n],
-                  static_cast<size_t>(layout.row_bytes[n]));
+      std::memcpy(
+          f.set.slabs[row][n] + e * layout.row_bytes[n],
+          image.data() + layout.name_offsets[n],
+          static_cast<size_t>(layout.row_bytes[n]));
   }
 }
 
@@ -174,7 +194,8 @@ void configure_cpu_kernel_runtime() {
 }
 
 void release_kernel_team() {
-  if (omp_pause_resource_all(omp_pause_soft) != 0) throw std::runtime_error("Cannot release the bare caller's OpenMP team");
+  if (omp_pause_resource_all(omp_pause_soft) != 0)
+    throw std::runtime_error("Cannot release the bare caller's OpenMP team");
 }
 
 void check_reference(const fs::path& path, const std::vector<float>& actual) {

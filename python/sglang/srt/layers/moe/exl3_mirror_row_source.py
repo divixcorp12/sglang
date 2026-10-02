@@ -108,7 +108,7 @@ class Exl3MirrorRowSource(Exl3ShardRowSource):
         policy: SplitPolicy,
         source_root: str,
         bounce_rows: int = BOUNCE_ROWS,
-    ) -> "Exl3MirrorRowSource":
+    ) -> Exl3MirrorRowSource:
         """The mirror counterpart of ``Exl3ShardRowSource.for_layer``, named
         apart because it needs arguments that one does not take (so it does
         not override it: the inherited ``for_layer`` cannot build this class)."""

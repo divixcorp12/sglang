@@ -1,10 +1,9 @@
 // Where the bench's threads run (spec, "Placement"), the refusals before setup, and the affinity check after it.
 #pragma once
 
-#include <sched.h>
-
 #include <cstdint>
 #include <functional>
+#include <sched.h>
 #include <set>
 #include <string>
 #include <vector>
@@ -19,14 +18,14 @@ struct Placement {
   int service = -1;  // RamThread, busy-polling: a physical core of its own
   int copy = -1;     // the copy engine thread and RamThread's watchdog (both inherit the enabling thread's affinity)
   std::vector<int32_t> workers;  // CPU experts: worker 0 (the CPU expert thread, the kernel's caller), then helpers
-  int host_node = 0;    // writer, service and copy
-  int worker_node = 1;  // every worker
+  int host_node = 0;             // writer, service and copy
+  int worker_node = 1;           // every worker
 };
 
 struct Topology {
-  std::function<int(int)> node_of;                  // a CPU's NUMA node, -1 when unknown
-  std::function<std::vector<int>(int)> siblings_of; // a CPU's SMT siblings, itself included
-  cpu_set_t allowed;                                // the process's CPUs
+  std::function<int(int)> node_of;                   // a CPU's NUMA node, -1 when unknown
+  std::function<std::vector<int>(int)> siblings_of;  // a CPU's SMT siblings, itself included
+  cpu_set_t allowed;                                 // the process's CPUs
 };
 
 Topology system_topology();  // sysfs and sched_getaffinity

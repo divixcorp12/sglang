@@ -74,11 +74,11 @@ class RamThread {
 
   // 1 paused, 0 timed out, 2 refused: the copy thread still has a job after the wait (the caller must have
   // synchronized the stream, so every copy wait has seen its CopyDone), and the slots are not the caller's.
-  // While paused the loop takes no request, so the caller owns the tier until resume(). Edge service -> caller: the loop
-  // serves every posted record, then stores parked_epoch_ (release); pause() loads it (acquire), then sets the tier's
-  // parked_ (release), which later Python callers acquire in caller_owns(). Each pause has its own epoch (odd while
-  // requested), so a pause right after a resume cannot take the previous pause's acknowledgement for its own. pause()
-  // and resume() take caller_mutex(); the service thread never does. Not reentrant: their one owner is the slot
+  // While paused the loop takes no request, so the caller owns the tier until resume(). Edge service -> caller: the
+  // loop serves every posted record, then stores parked_epoch_ (release); pause() loads it (acquire), then sets the
+  // tier's parked_ (release), which later Python callers acquire in caller_owns(). Each pause has its own epoch (odd
+  // while requested), so a pause right after a resume cannot take the previous pause's acknowledgement for its own.
+  // pause() and resume() take caller_mutex(); the service thread never does. Not reentrant: their one owner is the slot
   // table's depth counter (pause at depth 0->1, resume at 1->0).
   int pause(int64_t timeout_ns) {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());

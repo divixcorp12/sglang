@@ -4,10 +4,9 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include "lease_layout.h"
-
 #include <tvm/ffi/container/tensor.h>
 
+#include "lease_layout.h"
 #include <cstdint>
 #include <string>
 #include <string_view>

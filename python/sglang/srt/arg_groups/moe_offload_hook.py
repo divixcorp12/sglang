@@ -56,7 +56,9 @@ def handle_moe_offload_preset(server_args: Any) -> None:
         )
         and not cfg.disable_overlap_schedule
     ):
-        declare_resolution(server_args, "handle_moe_offload_preset", disable_overlap_schedule=True)
+        declare_resolution(
+            server_args, "handle_moe_offload_preset", disable_overlap_schedule=True
+        )
         logger.info("MoE offload preset %s turns overlap scheduling off", name)
 
 

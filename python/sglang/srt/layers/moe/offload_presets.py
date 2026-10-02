@@ -175,9 +175,24 @@ def _residency_update(values: Mapping[str, str]) -> bool:
 
 # (condition, variable, value, why). Ordered: a later rule reads what an earlier one derived.
 _DERIVATIONS = (
-    (_insert_on_miss, "SGLANG_MOE_GPU_RESIDENCY_UPDATE", "1", "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE>=1"),
-    (_insert_on_miss, "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS", "1", "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE>=1"),
-    (_residency_update, "SGLANG_MOE_HOT_DYNAMIC", "1", "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1"),
+    (
+        _insert_on_miss,
+        "SGLANG_MOE_GPU_RESIDENCY_UPDATE",
+        "1",
+        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE>=1",
+    ),
+    (
+        _insert_on_miss,
+        "SGLANG_MOE_HOT_UPDATE_DECODE_FORWARDS",
+        "1",
+        "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE>=1",
+    ),
+    (
+        _residency_update,
+        "SGLANG_MOE_HOT_DYNAMIC",
+        "1",
+        "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1",
+    ),
 )
 
 
@@ -198,7 +213,9 @@ def resolve_offload_env(
             continue
         if name in explicit:
             if _value(explicit, name) != _value({name: value}, name):
-                raise ValueError(f"{why} requires {name}={value}, but it is set to {explicit[name]}")
+                raise ValueError(
+                    f"{why} requires {name}={value}, but it is set to {explicit[name]}"
+                )
             continue
         effective[name] = value
         filled[name] = value
@@ -213,8 +230,13 @@ def needs_overlap_off(values: Mapping[str, str], *, nvfp4_hot_cache: bool) -> bo
     ``expert_stream_requirements``.
     """
     # The NVFP4 requirements (expert_stream_requirements._check_nvfp4) enforce the same rule.
-    return nvfp4_hot_cache and _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0 and not (
-        _value(values, "SGLANG_MOE_EXPERT_GRAPH_GATHER") and _residency_update(values)
+    return (
+        nvfp4_hot_cache
+        and _value(values, "SGLANG_MOE_HOT_GPU_MB") > 0
+        and not (
+            _value(values, "SGLANG_MOE_EXPERT_GRAPH_GATHER")
+            and _residency_update(values)
+        )
     )
 
 
@@ -246,4 +268,6 @@ def check_offload_config(
             "drop --cuda-graph-backend-decode disabled"
         )
     if _residency_update(values) and (decode_max_bs or 0) > 1:
-        raise ValueError("SGLANG_MOE_GPU_RESIDENCY_UPDATE=1 requires --cuda-graph-max-bs-decode 1")
+        raise ValueError(
+            "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1 requires --cuda-graph-max-bs-decode 1"
+        )

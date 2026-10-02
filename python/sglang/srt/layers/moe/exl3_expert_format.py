@@ -71,7 +71,9 @@ def _row_schema(
     for w in _PARTS:
         mul1 = spans[f"{w}.mul1"]
         if mul1.dtype != "I32" or tuple(mul1.shape) != ():
-            raise ValueError(f"exl3 {mul1.name} is {mul1.dtype} {mul1.shape}, expected I32 []")
+            raise ValueError(
+                f"exl3 {mul1.name} is {mul1.dtype} {mul1.shape}, expected I32 []"
+            )
     specs: dict[str, ExpertTensorSpec] = {}
     segments = []
     for w, (prefix, part) in _PARTS.items():
@@ -188,7 +190,9 @@ class Exl3ExpertFormat:
             )
 
             options["slot_table"] = NativePinnedSlotTable(
-                Exl3RamMissService.get(), self.layer_id, lambda: expert_streamer_of(layer)
+                Exl3RamMissService.get(),
+                self.layer_id,
+                lambda: expert_streamer_of(layer),
             )
             if envs.SGLANG_DSV41_ENABLE_PREFILL_FILLS.get():
                 options["row_fills"] = options["slot_table"]
@@ -229,7 +233,7 @@ class Exl3ExpertFormat:
         layer: torch.nn.Module,
         specs: Sequence[ExpertTensorSpec],
         kind: str,
-    ) -> Optional["ExpertRowSource"]:
+    ) -> Optional[ExpertRowSource]:
         """``auto`` and ``shards`` read the original EXL3 shards, or, when
         ``SGLANG_MOE_EXPERT_MIRROR_DIRS`` is set, the mirrored copies of them."""
         if kind in ("auto", "shards"):
@@ -243,7 +247,10 @@ class Exl3ExpertFormat:
             )
 
             return Exl3ShardRowSource.for_layer(
-                self.layout, self.layer_id, self._segments, direct=self._resolve_direct()
+                self.layout,
+                self.layer_id,
+                self._segments,
+                direct=self._resolve_direct(),
             )
         raise ValueError(
             f"expert format {self.key!r} has no row source kind {kind!r}; "
@@ -252,7 +259,7 @@ class Exl3ExpertFormat:
 
     def _mirror_row_source(
         self, roots: tuple[str, ...], weights: tuple[float, ...]
-    ) -> "ExpertRowSource":
+    ) -> ExpertRowSource:
         self._check_mirror_roots(roots)
         from sglang.srt.layers.moe.exl3_mirror_row_source import Exl3MirrorRowSource
 
@@ -290,10 +297,12 @@ class Exl3ExpertFormat:
             return {}
         roots, weights = mirror
         self._check_mirror_roots(roots)
-        return dict(roots=roots, policy=StaticSplitPolicy(weights), source_root=self.source_root)
+        return dict(
+            roots=roots, policy=StaticSplitPolicy(weights), source_root=self.source_root
+        )
 
     def file_source_bytes_per_expert(
-        self, layer: torch.nn.Module, row_source: Optional["ExpertRowSource"]
+        self, layer: torch.nn.Module, row_source: Optional[ExpertRowSource]
     ) -> Optional[int]:
         # Non-None turns on the eager pinned host tier and the file counters.
         return None if row_source is None else row_source.file_bytes_per_expert
@@ -402,7 +411,9 @@ def exl3_expert_layout_for(expert_dir: str) -> Exl3ExpertLayout:
     return build_exl3_expert_layout(expert_dir)
 
 
-def build_exl3_expert_streamer(layer: torch.nn.Module, expert_dir: Optional[str] = None):
+def build_exl3_expert_streamer(
+    layer: torch.nn.Module, expert_dir: Optional[str] = None
+):
     """An ``ExpertStreamer`` for an EXL3 MoE layer whose routed experts stay on disk.
 
     ``expert_dir`` defaults to ``SGLANG_DSV41_EXPERT_DIR``. The row source comes
@@ -434,7 +445,11 @@ def build_exl3_expert_streamer(layer: torch.nn.Module, expert_dir: Optional[str]
     )
     specs = {spec.name: spec.row_shape for spec in fmt.tensor_specs(layer)}
     hidden, inter = layer.exl3_hidden // 16, layer.exl3_inter // 16
-    if specs["w13_trellis"][:3] != (2, hidden, inter) or specs["w2_trellis"][:3] != (1, inter, hidden):
+    if specs["w13_trellis"][:3] != (2, hidden, inter) or specs["w2_trellis"][:3] != (
+        1,
+        inter,
+        hidden,
+    ):
         raise ValueError(
             f"exl3 streaming: expert trellis rows {specs['w13_trellis']} / "
             f"{specs['w2_trellis']} do not match the layer "

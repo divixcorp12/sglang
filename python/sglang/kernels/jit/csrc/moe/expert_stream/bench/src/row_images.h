@@ -39,7 +39,11 @@ void require_o_direct(const std::filesystem::path& dir);
 // Writes `path` as a row-image layer file: expert e's image (fill(e, image) writes image_bytes bytes into a zeroed
 // row) at e * row_stride, zero padded, through "<path>.tmp", fsync and rename. A non-empty `stamp` lets an existing
 // file of the right size be kept when "<path>.stamp" holds the same stamp. Returns true when the file was written.
-bool write_row_image(const std::filesystem::path& path, const ImageLayout& layout, int64_t experts,
-                     const std::function<void(int64_t expert, uint8_t* image)>& fill, const std::string& stamp);
+bool write_row_image(
+    const std::filesystem::path& path,
+    const ImageLayout& layout,
+    int64_t experts,
+    const std::function<void(int64_t expert, uint8_t* image)>& fill,
+    const std::string& stamp);
 
 }  // namespace fullstack

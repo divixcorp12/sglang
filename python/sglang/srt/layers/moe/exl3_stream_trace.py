@@ -86,7 +86,14 @@ class RouterCapture:
         self.records = 0
         self._files: Optional[list] = None
 
-    def write(self, log: "GraphRouteLog", seq: int, pass_id: int, x: torch.Tensor, weights: torch.Tensor) -> int:
+    def write(
+        self,
+        log: GraphRouteLog,
+        seq: int,
+        pass_id: int,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> int:
         if self._files is None:
             header = {
                 "schema": ROUTER_CAPTURE_SCHEMA,
@@ -100,11 +107,16 @@ class RouterCapture:
             }
             with open(self.prefix + ".json", "w") as f:
                 json.dump(header, f)
-            self._files = [open(self.prefix + suffix, "ab") for suffix in (".x.bin", ".w.bin", ".seq.bin")]
+            self._files = [
+                open(self.prefix + suffix, "ab")
+                for suffix in (".x.bin", ".w.bin", ".seq.bin")
+            ]
         x_file, w_file, seq_file = self._files
         x_file.write(x.contiguous().view(torch.int16).numpy().tobytes())
         w_file.write(weights.contiguous().numpy().tobytes())
-        seq_file.write(torch.tensor([seq, pass_id], dtype=torch.int64).numpy().tobytes())
+        seq_file.write(
+            torch.tensor([seq, pass_id], dtype=torch.int64).numpy().tobytes()
+        )
         self.records += 1
         return self.records - 1
 
@@ -144,14 +156,20 @@ class GraphRouteLog:
     and no entry below it is written.
     """
 
-    def __init__(self, layers: int, width: int, device, depth: int = 64, margin: int = 4) -> None:
+    def __init__(
+        self, layers: int, width: int, device, depth: int = 64, margin: int = 4
+    ) -> None:
         if depth <= margin + 1:
             raise ValueError("the route ring must be deeper than its safety margin")
         self.layers, self.width, self.depth, self.margin = layers, width, depth, margin
         self.run = f"{socket.gethostname()}-{os.getpid()}-{time.time_ns()}"
         self.layer_ids: list[int] = [-1] * layers
-        self.capacities: list[int] = [0] * layers  # hot slots per row, for the replay's allocation
-        self.routes = torch.full((depth, layers, width), -1, dtype=torch.int64, device=device)
+        self.capacities: list[int] = [
+            0
+        ] * layers  # hot slots per row, for the replay's allocation
+        self.routes = torch.full(
+            (depth, layers, width), -1, dtype=torch.int64, device=device
+        )
         self.misses = torch.full((depth, layers), -1, dtype=torch.int32, device=device)
         self.pass_ids = torch.full((depth,), -1, dtype=torch.int64, device=device)
         self.pass_id = torch.full((1,), -1, dtype=torch.int64, device=device)
@@ -181,7 +199,9 @@ class GraphRouteLog:
         """Snapshot ``bank`` (GpuResidencyUpdater.slot_to_expert, one row per ``layer_ids``) per forward."""
         self.hot_bank = bank
         self.hot_layer_ids = [int(layer) for layer in layer_ids]
-        self.hot = torch.full((self.depth, *bank.shape), -1, dtype=bank.dtype, device=bank.device)
+        self.hot = torch.full(
+            (self.depth, *bank.shape), -1, dtype=bank.dtype, device=bank.device
+        )
 
     def enable_router(self, prefix: str) -> None:
         """Also capture each layer's router input and top-k weights, into side files at ``prefix``. The
@@ -195,7 +215,11 @@ class GraphRouteLog:
         """The expert distribution recorder's pre-forward observer: the forward's identity, on the host and
         the device. Runs before the forward is queued, on its stream, outside any capture."""
         mode = forward_batch.forward_mode
-        tokens = forward_batch.extend_num_tokens if mode.is_extend() else forward_batch.batch_size
+        tokens = (
+            forward_batch.extend_num_tokens
+            if mode.is_extend()
+            else forward_batch.batch_size
+        )
         meta = {
             "forward_pass_id": int(forward_pass_id),
             "phase": mode.name.lower(),
@@ -226,24 +250,36 @@ class GraphRouteLog:
         self.routes[:, row, :n].index_copy_(0, self.slot, routes[:n].view(1, n))
         self.misses[:, row].index_copy_(0, self.slot, count.reshape(-1)[:1])
 
-    def record_router(self, row: int, x: torch.Tensor, topk_weights: torch.Tensor) -> None:
+    def record_router(
+        self, row: int, x: torch.Tensor, topk_weights: torch.Tensor
+    ) -> None:
         """Log one layer's router input and top-k weights (one token) into this forward's slot; captured in
         the graph. Must follow the layer's ``record``: row 0's takes the slot."""
         if self.router_x is None:
             if _stream_capturing() or self._host is not None:
-                raise RuntimeError("the router rings must be allocated by a warmup forward, before capture and reads")
+                raise RuntimeError(
+                    "the router rings must be allocated by a warmup forward, before capture and reads"
+                )
             device = self.routes.device
             shape = (self.depth, self.layers)
-            self.router_x = torch.zeros((*shape, x.shape[-1]), dtype=torch.bfloat16, device=device)
-            self.router_w = torch.zeros((*shape, topk_weights.shape[-1]), dtype=torch.float32, device=device)
+            self.router_x = torch.zeros(
+                (*shape, x.shape[-1]), dtype=torch.bfloat16, device=device
+            )
+            self.router_w = torch.zeros(
+                (*shape, topk_weights.shape[-1]), dtype=torch.float32, device=device
+            )
         hidden, topk = self.router_x.shape[-1], self.router_w.shape[-1]
         if x.numel() != hidden or topk_weights.numel() != topk:
             raise ValueError(
                 f"router capture holds one token of [{hidden}] and [{topk}], got {tuple(x.shape)} and "
                 f"{tuple(topk_weights.shape)}"
             )
-        self.router_x[:, row].index_copy_(0, self.slot, x.reshape(1, hidden).to(torch.bfloat16))
-        self.router_w[:, row].index_copy_(0, self.slot, topk_weights.reshape(1, topk).float())
+        self.router_x[:, row].index_copy_(
+            0, self.slot, x.reshape(1, hidden).to(torch.bfloat16)
+        )
+        self.router_w[:, row].index_copy_(
+            0, self.slot, topk_weights.reshape(1, topk).float()
+        )
 
     def read_seq(self) -> int:
         """Graph forwards run so far. Called by eager forwards only, which already wait for the stream."""
@@ -259,7 +295,7 @@ class GraphRouteLog:
         """Every buffer a copy may still be writing, for the service's quarantine."""
         return self._ring() + [self.slot, self.pass_id] + (self._host or [])
 
-    def poll(self, trace: "Exl3StreamTrace", *, final: bool = False) -> None:
+    def poll(self, trace: Exl3StreamTrace, *, final: bool = False) -> None:
         if self.seq.device.type != "cuda":
             self._emit(trace, self._ring(), complete=True)
             return
@@ -276,14 +312,20 @@ class GraphRouteLog:
             self._emit(trace, [tensor.cpu() for tensor in self._ring()], complete=True)
             return
         if self._host is None:
-            self._host = [torch.empty_like(t, device="cpu").pin_memory() for t in self._ring()]
+            self._host = [
+                torch.empty_like(t, device="cpu").pin_memory() for t in self._ring()
+            ]
             self._event = torch.cuda.Event(enable_timing=False)
         for host, device in zip(self._host, self._ring()):
-            host.copy_(device, non_blocking=True)  # seq first: the stream runs these in order
+            host.copy_(
+                device, non_blocking=True
+            )  # seq first: the stream runs these in order
         self._event.record(torch.cuda.current_stream(self.seq.device))
         self._pending = True
 
-    def _emit(self, trace: "Exl3StreamTrace", ring: list[torch.Tensor], *, complete: bool) -> None:
+    def _emit(
+        self, trace: Exl3StreamTrace, ring: list[torch.Tensor], *, complete: bool
+    ) -> None:
         if not self._header_written:
             trace.record_graph_routes_header(self)
             self._header_written = True
@@ -305,14 +347,23 @@ class GraphRouteLog:
                 del self._meta[stale]  # eager forwards: they never log here
             record = None
             if router_x is not None:
-                record = self.router.write(self, s, pass_id, router_x[slot], router_w[slot])
+                record = self.router.write(
+                    self, s, pass_id, router_x[slot], router_w[slot]
+                )
             trace.record_graph_route_step(
                 s,
                 [[int(e) for e in row if e >= 0] for row in routes[slot].tolist()],
                 [int(m) for m in misses[slot].tolist()],
                 dropped_before=lost if s == start else 0,
-                meta={"run": self.run, **(meta if meta is not None else {"forward_pass_id": pass_id})},
-                hot=None if hot is None else [sorted(int(e) for e in row if e >= 0) for row in hot[slot].tolist()],
+                meta={
+                    "run": self.run,
+                    **(meta if meta is not None else {"forward_pass_id": pass_id}),
+                },
+                hot=None
+                if hot is None
+                else [
+                    sorted(int(e) for e in row if e >= 0) for row in hot[slot].tolist()
+                ],
                 router=record,
             )
         self.next_seq = max(self.next_seq, end)
@@ -402,7 +453,12 @@ class Exl3StreamTrace:
             if self._graph_seq is not None:
                 line["graph_seq"] = self._graph_seq
             if self._meta is not None:
-                line.update({key: self._meta[key] for key in ("forward_pass_id", "phase", "rids")})
+                line.update(
+                    {
+                        key: self._meta[key]
+                        for key in ("forward_pass_id", "phase", "rids")
+                    }
+                )
             self._file.write(json.dumps(line) + "\n")
 
     @property
@@ -496,9 +552,13 @@ class Exl3StreamTrace:
             return
         line = {"kind": "graph_routes", "schema": ROUTE_LOG_SCHEMA, "seq": seq}
         line.update(meta or {})
-        line.update({"routes": routes, "misses": misses, "t": round(time.monotonic(), 6)})
+        line.update(
+            {"routes": routes, "misses": misses, "t": round(time.monotonic(), 6)}
+        )
         if meta is not None and "tokens" in meta:
-            line["forward_tokens"] = line.pop("tokens")  # keeps load_trace's "tokens means a call" rule
+            line["forward_tokens"] = line.pop(
+                "tokens"
+            )  # keeps load_trace's "tokens means a call" rule
         if hot is not None:
             line["hot"] = hot
         if router is not None:
@@ -507,7 +567,9 @@ class Exl3StreamTrace:
             line["dropped_before"] = dropped_before
         self._file.write(json.dumps(line) + "\n")
 
-    def record_ram_miss_requests(self, records: list[dict], layer_ids: list[int]) -> None:
+    def record_ram_miss_requests(
+        self, records: list[dict], layer_ids: list[int]
+    ) -> None:
         """One line per RAM-miss request the native service served, from ``ExpertStreamHost.drain_trace``.
 
         ``layer_ids[row]`` names each record's streamed row. The line is not a forward call: it has
@@ -593,7 +655,10 @@ class Exl3StreamTrace:
                     "out_of_order": record["pieces_out_of_order"],
                     "refused": record["piece_publish_refused"],
                 },
-                "untraced": {"rows": record["rows_untraced"], "extents": record["extents_untraced"]},
+                "untraced": {
+                    "rows": record["rows_untraced"],
+                    "extents": record["extents_untraced"],
+                },
                 "dropped_before": record["dropped_before"],
                 "extents": record["extents"],
                 "drives": record["drives"],
@@ -607,7 +672,9 @@ class Exl3StreamTrace:
             "decode_tokens": self.decode_tokens,
             "decode_vram_misses": self.decode_vram_misses,
             "decode_ram_misses": self.decode_ram_misses,
-            "G": self.decode_vram_misses / self.decode_tokens if self.decode_tokens else 0.0,
+            "G": self.decode_vram_misses / self.decode_tokens
+            if self.decode_tokens
+            else 0.0,
             "f": (
                 self.decode_ram_misses / self.decode_vram_misses
                 if self.decode_vram_misses

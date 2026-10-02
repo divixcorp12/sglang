@@ -3,32 +3,29 @@
 // them with the optimized EXL3 kernel; the writer times post -> CopyDone against the bare kernel call.
 #include <benchmark/benchmark.h>
 
+#include "cpu_experts_cabi.h"
+#include "device_sim.h"
+#include "placement.h"
+#include "self_test.h"
+#include "stack.h"
+#include "stack_fixture.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
-#include <sstream>
-#include <thread>
-#include <vector>
-
-#include "cpu_experts_cabi.h"
-#include "device_sim.h"
-#include "stack.h"
-#include "stack_fixture.h"
-
-#include <filesystem>
-#include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
-
-#include "placement.h"
-#include "self_test.h"
+#include <thread>
+#include <vector>
 
 namespace {
 namespace fs = std::filesystem;
@@ -56,29 +53,47 @@ Options parse_options(int& argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg(argv[i]);
     auto value = [&](const std::string& prefix) { return arg.substr(prefix.size()); };
-    if (arg.starts_with("--fixture=")) opt.fixture = value("--fixture=");
-    else if (arg.starts_with("--reference-dir=")) opt.references = value("--reference-dir=");
-    else if (arg.starts_with("--image-dir=")) opt.image_dir = value("--image-dir=");
-    else if (arg.starts_with("--writer-cpu=")) opt.writer_cpu = number(value("--writer-cpu="));
-    else if (arg.starts_with("--service-cpu=")) opt.service_cpu = number(value("--service-cpu="));
-    else if (arg.starts_with("--copy-cpu=")) opt.copy_cpu = number(value("--copy-cpu="));
-    else if (arg.starts_with("--cpus=")) opt.cpus = value("--cpus=");
-    else if (arg.starts_with("--host-node=")) opt.host_node = number(value("--host-node="));
-    else if (arg.starts_with("--worker-node=")) opt.worker_node = number(value("--worker-node="));
-    else if (arg.starts_with("--warmup-forwards=")) opt.warmup = number(value("--warmup-forwards="));
-    else if (arg.starts_with("--gap-us=")) opt.gap_us = number(value("--gap-us="));
-    else if (arg.starts_with("--wait-timeout-ms=")) opt.wait_timeout_ms = number(value("--wait-timeout-ms="));
-    else if (arg == "--validate-only") opt.validate_only = true;
-    else if (arg == "--self-test") opt.self_test = true;
+    if (arg.starts_with("--fixture="))
+      opt.fixture = value("--fixture=");
+    else if (arg.starts_with("--reference-dir="))
+      opt.references = value("--reference-dir=");
+    else if (arg.starts_with("--image-dir="))
+      opt.image_dir = value("--image-dir=");
+    else if (arg.starts_with("--writer-cpu="))
+      opt.writer_cpu = number(value("--writer-cpu="));
+    else if (arg.starts_with("--service-cpu="))
+      opt.service_cpu = number(value("--service-cpu="));
+    else if (arg.starts_with("--copy-cpu="))
+      opt.copy_cpu = number(value("--copy-cpu="));
+    else if (arg.starts_with("--cpus="))
+      opt.cpus = value("--cpus=");
+    else if (arg.starts_with("--host-node="))
+      opt.host_node = number(value("--host-node="));
+    else if (arg.starts_with("--worker-node="))
+      opt.worker_node = number(value("--worker-node="));
+    else if (arg.starts_with("--warmup-forwards="))
+      opt.warmup = number(value("--warmup-forwards="));
+    else if (arg.starts_with("--gap-us="))
+      opt.gap_us = number(value("--gap-us="));
+    else if (arg.starts_with("--wait-timeout-ms="))
+      opt.wait_timeout_ms = number(value("--wait-timeout-ms="));
+    else if (arg == "--validate-only")
+      opt.validate_only = true;
+    else if (arg == "--self-test")
+      opt.self_test = true;
     else if (arg == "--help") {
-      std::cout << "Full-stack CPU-expert benchmark (" EXL3_BENCH_BACKEND ")\n"
-        "--fixture=FILE --reference-dir=DIR --image-dir=DIR (O_DIRECT-capable; row images are written there)\n"
-        "--writer-cpu=16 --service-cpu=17 --copy-cpu=52 --cpus=18-33 --host-node=0 --worker-node=1\n"
-        "--warmup-forwards=128 --gap-us=0 --wait-timeout-ms=2000 --validate-only\n"
-        "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 --cpus=3\n"
-        "Google Benchmark flags are also accepted.\n";
+      std::cout
+          << "Full-stack CPU-expert benchmark (" EXL3_BENCH_BACKEND
+             ")\n"
+             "--fixture=FILE --reference-dir=DIR --image-dir=DIR (O_DIRECT-capable; row images are written there)\n"
+             "--writer-cpu=16 --service-cpu=17 --copy-cpu=52 --cpus=18-33 --host-node=0 --worker-node=1\n"
+             "--warmup-forwards=128 --gap-us=0 --wait-timeout-ms=2000 --validate-only\n"
+             "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 "
+             "--cpus=3\n"
+             "Google Benchmark flags are also accepted.\n";
       argv[remaining++] = argv[i];
-    } else argv[remaining++] = argv[i];
+    } else
+      argv[remaining++] = argv[i];
   }
   argc = remaining;
   argv[remaining] = nullptr;
@@ -113,7 +128,8 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
   c.service_cpu = p.service;
   c.copy_cpu = p.copy;
   c.wait_timeout_ns = int64_t{o.wait_timeout_ms} * 1'000'000;
-  for (int n = 0; n <= es::kLeaseLanes; ++n) c.split[n] = n;  // every eligible lane is the CPU's
+  for (int n = 0; n <= es::kLeaseLanes; ++n)
+    c.split[n] = n;  // every eligible lane is the CPU's
   if constexpr (BenchBuild::kMetrics) c.trace_capacity = 4096;
   return c;
 }
@@ -122,7 +138,8 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
 struct LayerHandles {
   std::vector<int64_t> handles;
   ~LayerHandles() {
-    for (int64_t handle : handles) StackFixture::free_layer(handle);
+    for (int64_t handle : handles)
+      StackFixture::free_layer(handle);
   }
 };
 
@@ -136,8 +153,12 @@ class Bench {
  public:
   // The bare phase first: the slots hold expert e in slot e (StackFixture::preload_slots), and no stack exists, so no
   // CPU expert thread spins on worker 0's core, where the kernel puts every caller.
-  Bench(const Options& options, Placement placement, StackFixture& fixture, std::vector<int64_t> handles,
-        std::set<int> before)
+  Bench(
+      const Options& options,
+      Placement placement,
+      StackFixture& fixture,
+      std::vector<int64_t> handles,
+      std::set<int> before)
       : options_(options),
         placement_(std::move(placement)),
         fixture_(fixture),
@@ -153,9 +174,15 @@ class Bench {
     }
   }
 
-  const Options& options() const { return options_; }
-  const Placement& placement() const { return placement_; }
-  int64_t rows() const { return fixture_.rows(); }
+  const Options& options() const {
+    return options_;
+  }
+  const Placement& placement() const {
+    return placement_;
+  }
+  int64_t rows() const {
+    return fixture_.rows();
+  }
 
   Stack<BenchBuild>& stack() {
     enter_stack_phase();
@@ -191,9 +218,9 @@ class Bench {
       load_experts(*sim_, row, all, static_cast<int>(StackFixture::kStaging), timeout_ns);
       for (int32_t e : all)
         if (sim_->ram_slot(row, e) != e)
-          throw std::runtime_error("row " + std::to_string(row) + ": the tier put expert " + std::to_string(e) +
-                                   " in slot " + std::to_string(sim_->ram_slot(row, e)) +
-                                   ", not the slot the bare forwards used");
+          throw std::runtime_error(
+              "row " + std::to_string(row) + ": the tier put expert " + std::to_string(e) + " in slot " +
+              std::to_string(sim_->ram_slot(row, e)) + ", not the slot the bare forwards used");
       stack_->set_cpu_layer(row, handles_[row]);
       sim_->set_row_cpu(row);
     }
@@ -220,11 +247,19 @@ class Bench {
   // expert e, so the experts are the slots.
   void bare_call(int64_t row, int k) {
     if (stack_)
-      throw std::runtime_error("a bare forward once the stack exists would share worker 0's core with the CPU expert "
-                               "thread and run a second OpenMP team: BM_bare runs first "
-                               "(no --benchmark_enable_random_interleaving)");
-    if (sglang_exl3_cpu_experts_forward(handles_[row], fixture_.x_row(row), experts_[k].data(), weights_[k].data(), k,
-                                        fixture_.out_row(row), static_cast<int32_t>(placement_.workers.size()), 0) != 0)
+      throw std::runtime_error(
+          "a bare forward once the stack exists would share worker 0's core with the CPU expert "
+          "thread and run a second OpenMP team: BM_bare runs first "
+          "(no --benchmark_enable_random_interleaving)");
+    if (sglang_exl3_cpu_experts_forward(
+            handles_[row],
+            fixture_.x_row(row),
+            experts_[k].data(),
+            weights_[k].data(),
+            k,
+            fixture_.out_row(row),
+            static_cast<int32_t>(placement_.workers.size()),
+            0) != 0)
       throw std::runtime_error("the bare CPU forward failed");
   }
 
@@ -251,7 +286,8 @@ class Bench {
   std::string describe(const SimRequest& r) {
     std::ostringstream s;
     s << "gen " << r.gen << " (seq " << r.seq << ") row " << r.row << ", " << r.count << " lanes, kinds";
-    for (int j = 0; j < r.count; ++j) s << ' ' << r.kinds[j];
+    for (int j = 0; j < r.count; ++j)
+      s << ' ' << r.kinds[j];
     const auto c = stack_->counters();
     const auto cpu = stack_->cpu_stats();
     s << "; served " << c[es::kServedRequests] << " touch_only " << c[es::kTouchOnly] << " rows_read "
@@ -303,7 +339,8 @@ void bm_bare(benchmark::State& state, Bench& bench, int k) {
     PinScope caller(bench.placement().workers.front());  // the kernel runs its caller as worker 0, on that core
     bench.validate(k, false);
     bench.check_threads();
-    for (int i = 0; i < bench.options().warmup; ++i) bench.bare_call(i % bench.rows(), k);
+    for (int i = 0; i < bench.options().warmup; ++i)
+      bench.bare_call(i % bench.rows(), k);
     std::vector<double> samples;
     int64_t row = 0;
     for (auto _ : state) {
@@ -339,7 +376,8 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
     Stack<BenchBuild>& stack = bench.stack();
     bench.validate(k, true);
     bench.check_threads();
-    for (int i = 0; i < bench.options().warmup; ++i) bench.stack_call(i % bench.rows(), k);
+    for (int i = 0; i < bench.options().warmup; ++i)
+      bench.stack_call(i % bench.rows(), k);
     std::vector<double> total, pickup, service, forward, handoff;
     [[maybe_unused]] auto stage = std::make_unique<es::StageRecord>();
     if constexpr (BenchBuild::kMetrics) stack.drain_all();
@@ -372,9 +410,9 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
     const auto counters1 = stack.counters();
     const auto cpu1 = stack.cpu_stats();
     if (cpu1[0] - cpu0[0] != calls || cpu1[1] - cpu0[1] != calls * k)
-      throw std::runtime_error("CPU jobs/lanes " + std::to_string(cpu1[0] - cpu0[0]) + "/" +
-                               std::to_string(cpu1[1] - cpu0[1]) + " for " + std::to_string(calls) + " calls of " +
-                               std::to_string(k) + " lanes");
+      throw std::runtime_error(
+          "CPU jobs/lanes " + std::to_string(cpu1[0] - cpu0[0]) + "/" + std::to_string(cpu1[1] - cpu0[1]) + " for " +
+          std::to_string(calls) + " calls of " + std::to_string(k) + " lanes");
     if (counters1[es::kRowsRead] != counters0[es::kRowsRead] || counters1[es::kOverruns] != counters0[es::kOverruns])
       throw std::runtime_error("a row read or an overrun during timing");
     if constexpr (BenchBuild::kMetrics) {
@@ -398,7 +436,8 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
         // The bare baseline runs before the stack exists, with no service, writer or copy thread spinning: these
         // show how far the in-stack kernel time moved from it, and the overhead against the in-stack kernel itself.
         state.counters["overhead_vs_forward_p50_us"] = p50 - forward_p50;
-        if (bench.bare_p50_us.contains(k)) state.counters["forward_vs_bare_p50_us"] = forward_p50 - bench.bare_p50_us[k];
+        if (bench.bare_p50_us.contains(k))
+          state.counters["forward_vs_bare_p50_us"] = forward_p50 - bench.bare_p50_us[k];
         state.counters["handoff_p50_us"] = quantile_us(handoff, 0.50);
         state.counters["handoff_p95_us"] = quantile_us(handoff, 0.95);
       }
@@ -426,7 +465,8 @@ int main(int argc, char** argv) {
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
     configure_cpu_kernel_runtime();
-    if (sglang_exl3_cpu_experts_set_cores(placement.workers.data(), static_cast<int32_t>(placement.workers.size())) != 0)
+    if (sglang_exl3_cpu_experts_set_cores(placement.workers.data(), static_cast<int32_t>(placement.workers.size())) !=
+        0)
       throw std::runtime_error("Cannot configure kernel cores");
     const auto before = task_ids();
     std::unique_ptr<StackFixture> fixture;
@@ -435,7 +475,7 @@ int main(int argc, char** argv) {
       fixture = std::make_unique<StackFixture>(options.fixture, options.image_dir);
     }
     pin_self(placement.writer);  // the writer's stores and clock; the stack's page and lease are first-touched here
-    LayerHandles layers;  // outlives the Bench, whose stack's CPU expert thread uses them
+    LayerHandles layers;         // outlives the Bench, whose stack's CPU expert thread uses them
     for (int64_t row = 0; row < fixture->rows(); ++row) {
       fixture->preload_slots(row);
       layers.handles.push_back(fixture->register_layer(row));
@@ -445,10 +485,12 @@ int main(int argc, char** argv) {
     if (options.validate_only) {
       {
         PinScope caller(placement.workers.front());  // the kernel runs its caller as worker 0, on that core
-        for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/false);
+        for (int k : {1, 3, 5})
+          bench.validate(k, /*via_stack=*/false);
         bench.check_threads();
       }
-      for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/true);  // the first builds the stack
+      for (int k : {1, 3, 5})
+        bench.validate(k, /*via_stack=*/true);  // the first builds the stack
       bench.check_threads();
       std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
                 << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName
@@ -462,7 +504,8 @@ int main(int argc, char** argv) {
     benchmark::AddCustomContext("writer_cpu", std::to_string(placement.writer));
     benchmark::AddCustomContext("service_cpu", std::to_string(placement.service));
     benchmark::AddCustomContext("copy_cpu", std::to_string(placement.copy));
-    benchmark::AddCustomContext("worker_cpus", cpu_list(std::vector<int>(placement.workers.begin(), placement.workers.end())));
+    benchmark::AddCustomContext(
+        "worker_cpus", cpu_list(std::vector<int>(placement.workers.begin(), placement.workers.end())));
     std::ifstream cgroup_file("/proc/self/cgroup");
     benchmark::AddCustomContext("cgroup", std::string((std::istreambuf_iterator<char>(cgroup_file)), {}));
     benchmark::AddCustomContext("gap_us", std::to_string(options.gap_us));
@@ -470,13 +513,13 @@ int main(int argc, char** argv) {
     // Every BM_bare before any BM_stack: one OpenMP team at a time (Bench::enter_stack_phase). Each benchmark checks
     // its path's 8 outputs bit-exactly before and after it is timed.
     for (int k : {1, 3, 5})
-      benchmark::RegisterBenchmark("BM_bare/experts:" + std::to_string(k),
-                                   [&bench, k](benchmark::State& state) { bm_bare(state, bench, k); })
+      benchmark::RegisterBenchmark(
+          "BM_bare/experts:" + std::to_string(k), [&bench, k](benchmark::State& state) { bm_bare(state, bench, k); })
           ->UseManualTime()
           ->Unit(benchmark::kMicrosecond);
     for (int k : {1, 3, 5})
-      benchmark::RegisterBenchmark("BM_stack/experts:" + std::to_string(k),
-                                   [&bench, k](benchmark::State& state) { bm_stack(state, bench, k); })
+      benchmark::RegisterBenchmark(
+          "BM_stack/experts:" + std::to_string(k), [&bench, k](benchmark::State& state) { bm_stack(state, bench, k); })
           ->UseManualTime()
           ->Unit(benchmark::kMicrosecond);
     benchmark::RunSpecifiedBenchmarks();

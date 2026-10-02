@@ -1,10 +1,11 @@
 // Row tables: the per-expert segment map and the tables_from build of it.
 #pragma once
 
+#include <sys/uio.h>
+
 #include "../row_layout.h"
 #include "file_reader.h"  // RegisteredRegion
 #include "reader_base.h"
-#include <sys/uio.h>
 
 namespace sglang {
 namespace expert_stream {

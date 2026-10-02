@@ -1,16 +1,14 @@
 // The physical-core check a busy-polling service thread needs (RamThread, busy_poll).
 #pragma once
 
+#include "fixed_vec.h"
+#include <fstream>
 #include <pthread.h>
 #include <sched.h>
-
-#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#include "fixed_vec.h"
 
 namespace sglang::expert_stream {
 
@@ -41,7 +39,8 @@ inline std::vector<int> core_siblings(int core) {
 // experts' cores, which their threads pin themselves to.
 inline void check_dedicated_core(int core, const std::vector<int>& cpu_expert_cores, const std::string& prefix) {
   if (core < 0) {
-    throw std::runtime_error(prefix + "busy_poll needs cpu_core: a busy-polling service is pinned to a core of its own");
+    throw std::runtime_error(
+        prefix + "busy_poll needs cpu_core: a busy-polling service is pinned to a core of its own");
   }
   cpu_set_t caller;
   CPU_ZERO(&caller);

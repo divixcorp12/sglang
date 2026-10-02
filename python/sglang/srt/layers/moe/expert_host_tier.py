@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 PAGE_BYTES = 4096
 _LRU_INDEX = itertools.count()
-_LIVE_LRUS: "weakref.WeakSet[PinnedSlotLRU]" = weakref.WeakSet()
+_LIVE_LRUS: weakref.WeakSet[PinnedSlotLRU] = weakref.WeakSet()
 
 
 class PinnedGatherResult(NamedTuple):
@@ -130,7 +130,7 @@ class PinnedSlotLRU:
         self.is_pinned = is_pinned
         self.slot_to_expert = [-1] * self.capacity
         # Oldest first: iteration order is the eviction order.
-        self.expert_to_slot: "OrderedDict[int, int]" = OrderedDict()
+        self.expert_to_slot: OrderedDict[int, int] = OrderedDict()
         self._free = list(range(self.capacity))
         heapq.heapify(self._free)
         self.hits = 0
@@ -241,13 +241,22 @@ def tier_snapshot() -> dict:
     layers = [table.stats() for table in tables]
     snapshot = {
         key: sum(layer[key] for layer in layers)
-        for key in ("capacity", "occupancy", "hits", "admissions", "evictions", "protected_evictions", "releases")
+        for key in (
+            "capacity",
+            "occupancy",
+            "hits",
+            "admissions",
+            "evictions",
+            "protected_evictions",
+            "releases",
+        )
     }
     tier = [table._tier_stats for table in tables if table._tier_stats is not None]
     for key in ("lookup_hits", "lookup_misses", "populated_rows", "populated_bytes"):
         snapshot[key] = sum(getattr(stats, key) for stats in tier)
     snapshot["layers"] = {
-        key: [layer[key] for layer in layers] for key in ("occupancy", "hits", "admissions", "evictions")
+        key: [layer[key] for layer in layers]
+        for key in ("occupancy", "hits", "admissions", "evictions")
     }
     return snapshot
 
@@ -258,7 +267,7 @@ def allocate_host_slab(
     dtype: torch.dtype,
     *,
     register: bool,
-    placement: "Placement" = (),
+    placement: Placement = (),
 ) -> torch.Tensor:
     """A page-aligned ``[rows, *row_shape]`` host tensor of exactly its size.
 
@@ -305,7 +314,7 @@ def allocate_host_slab_arena(
     specs: Mapping[str, tuple[tuple[int, ...], torch.dtype]],
     *,
     register: bool,
-    placement: "Placement" = (),
+    placement: Placement = (),
 ) -> dict[str, torch.Tensor]:
     """Page-aligned named slabs sharing one allocation and CUDA registration.
 

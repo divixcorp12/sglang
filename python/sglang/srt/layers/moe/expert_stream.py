@@ -5,8 +5,8 @@ from __future__ import annotations
 import bisect
 import contextlib
 import functools
-import logging
 import json
+import logging
 import os
 import time
 import weakref
@@ -41,14 +41,8 @@ from sglang.srt.layers.moe.expert_host_tier import (
     quarantine_host_slabs,
     release_host_slabs,
 )
-from sglang.srt.layers.moe.expert_row_source import (
-    ExpertRowSource,
-    RowReadStats,
-    TensorRowSource,
-)
 from sglang.srt.layers.moe.expert_route_plan import NO_DEDUP_LIMIT as _NO_DEDUP_LIMIT
 from sglang.srt.layers.moe.expert_route_plan import (
-    plan_graph_routes,
     plan_graph_routes_fused,
     should_dedup,
     supports_fused_graph_routes,
@@ -58,6 +52,11 @@ from sglang.srt.layers.moe.expert_row_plan import (
     ExpertRowPlanner,
     InGraphRowBackend,
     PinnedTierRowBackend,
+)
+from sglang.srt.layers.moe.expert_row_source import (
+    ExpertRowSource,
+    RowReadStats,
+    TensorRowSource,
 )
 from sglang.srt.utils.cuda_host_registry import is_gpu_readable_host_tensor
 
@@ -137,7 +136,9 @@ def host_row_of_source(slots: list[int], hits: list[bool]) -> list[int]:
     itself when every source hits, else misses first and then hits, each in source order."""
     if all(hits):
         return list(slots)
-    order = [i for i, hit in enumerate(hits) if not hit] + [i for i, hit in enumerate(hits) if hit]
+    order = [i for i, hit in enumerate(hits) if not hit] + [
+        i for i, hit in enumerate(hits) if hit
+    ]
     row_of_source = [0] * len(slots)
     for row, source in enumerate(order):
         row_of_source[source] = row
@@ -192,13 +193,13 @@ class ExpertPinnedHostCache:
 
     def __init__(
         self,
-        streamer: "ExpertStreamer",
+        streamer: ExpertStreamer,
         capacity: int,
         *,
         device: torch.device | str | None = None,
         is_pinned: Callable[[int], bool] | None = None,
         slot_table: PinnedSlotTable | None = None,
-        placement: "Placement" = (),
+        placement: Placement = (),
         row_fills: PinnedRowFills | None = None,
     ):
         capacity = index(capacity)
@@ -245,7 +246,9 @@ class ExpertPinnedHostCache:
                     placement=placement,
                 )
                 if register:
-                    registered.extend(slab for slab in self.tensors.values() if slab.numel())
+                    registered.extend(
+                        slab for slab in self.tensors.values() if slab.numel()
+                    )
             else:
                 for name in self.cached_names:
                     spec = streamer.spec(name)
@@ -293,7 +296,7 @@ class ExpertPinnedHostCache:
         streamer.pinned_host_cache = self
 
     @staticmethod
-    def capacity_for_budget(streamer: "ExpertStreamer", budget_bytes: int) -> int:
+    def capacity_for_budget(streamer: ExpertStreamer, budget_bytes: int) -> int:
         """Round a pinned-host byte budget down to complete expert rows."""
         budget_bytes = index(budget_bytes)
         if budget_bytes < 0:
@@ -428,12 +431,18 @@ class ExpertPinnedHostCache:
         slots, evictions = self.row_fills.fill_begin(missing, protected, True)
         landed = self.row_fills.fill_end()
         # The trace's read_ms: the time this thread was blocked reading. There is no split (split_ms stays 0).
-        self.streamer._record_read(RowReadStats(rows=len(slots), read_ns=time.perf_counter_ns() - began))
+        self.streamer._record_read(
+            RowReadStats(rows=len(slots), read_ns=time.perf_counter_ns() - began)
+        )
         self._refresh_mapping()
         if not landed:
-            raise RuntimeError(f"reading pinned host rows of experts {missing[: len(slots)]} failed")
+            raise RuntimeError(
+                f"reading pinned host rows of experts {missing[: len(slots)]} failed"
+            )
         if len(slots) < len(missing):
-            raise RuntimeError("every pinned host slot holds a protected or leased expert")
+            raise RuntimeError(
+                "every pinned host slot holds a protected or leased expert"
+            )
         self.stats.evictions += evictions
         self.stats.populated_rows += len(slots)
         self.stats.populated_bytes += len(slots) * self.bytes_per_expert
@@ -447,11 +456,20 @@ class ExpertPinnedHostCache:
         no victim outside ``protected``; the rest are left to ``gather_rows``' own admission.
         """
         self.finish_fills()
-        missing = [expert_id for expert_id in dict.fromkeys(int(e) for e in expert_ids) if expert_id not in self._lru]
+        missing = [
+            expert_id
+            for expert_id in dict.fromkeys(int(e) for e in expert_ids)
+            if expert_id not in self._lru
+        ]
         if not missing:
             return 0
-        slots, evictions = self.row_fills.fill_begin(missing, [int(e) for e in protected], False)
-        self._fill_order = {expert_id: position for position, expert_id in enumerate(missing[: len(slots)])}
+        slots, evictions = self.row_fills.fill_begin(
+            missing, [int(e) for e in protected], False
+        )
+        self._fill_order = {
+            expert_id: position
+            for position, expert_id in enumerate(missing[: len(slots)])
+        }
         self._refresh_mapping()
         self.stats.evictions += evictions
         self.stats.populated_rows += len(slots)
@@ -472,7 +490,9 @@ class ExpertPinnedHostCache:
         order = self._fill_order
         if order is None:
             return
-        self._wait_fill(max((order.get(expert_id, -1) for expert_id in expert_ids), default=-1) + 1)
+        self._wait_fill(
+            max((order.get(expert_id, -1) for expert_id in expert_ids), default=-1) + 1
+        )
 
     def _wait_fill(self, rows: int) -> None:
         """Wait until the first ``rows`` rows of the prefetch's claim order are in their slabs."""
@@ -480,7 +500,9 @@ class ExpertPinnedHostCache:
             began = time.perf_counter_ns()
             self.row_fills.fill_wait(rows)
             # Only the wait is on this thread: the prefetched rows are read while it gathers.
-            self.streamer._record_read(RowReadStats(read_ns=time.perf_counter_ns() - began))
+            self.streamer._record_read(
+                RowReadStats(read_ns=time.perf_counter_ns() - began)
+            )
 
     def _filling_positions(self, chunk_ids: list[int]) -> list[int]:
         """Positions in ``chunk_ids`` of the prefetch's rows not landed yet, in claim order; [] unless splitting."""
@@ -488,11 +510,19 @@ class ExpertPinnedHostCache:
         if not self.split_fill_gather or order is None:
             return []
         landed = self.row_fills.fill_landed()
-        filling = [i for i, expert_id in enumerate(chunk_ids) if order.get(expert_id, -1) >= landed]
+        filling = [
+            i
+            for i, expert_id in enumerate(chunk_ids)
+            if order.get(expert_id, -1) >= landed
+        ]
         return sorted(filling, key=lambda i: order[chunk_ids[i]])
 
     def _copy_as_filled(
-        self, chunk: torch.Tensor, chunk_ids: list[int], outputs: dict[str, torch.Tensor], filling: list[int]
+        self,
+        chunk: torch.Tensor,
+        chunk_ids: list[int],
+        outputs: dict[str, torch.Tensor],
+        filling: list[int],
     ) -> None:
         """Copy the chunk's landed rows now, then its ``filling`` rows a batch at a time as the fill lands them.
 
@@ -514,7 +544,9 @@ class ExpertPinnedHostCache:
             if not ready and done == 0 and upto == len(filling):
                 self.copy_rows(chunk, outputs)
             else:
-                self.copy_rows(chunk, outputs, rows=rows[len(ready) + done : len(ready) + upto])
+                self.copy_rows(
+                    chunk, outputs, rows=rows[len(ready) + done : len(ready) + upto]
+                )
             done = upto
 
     def _splits(self, outputs: dict[str, torch.Tensor]) -> bool:
@@ -563,7 +595,9 @@ class ExpertPinnedHostCache:
                         BLOCK=1024,
                     )
                 else:
-                    _gather_host_rows_to_kernel[(rows.numel(), triton.cdiv(row_bytes, 1024))](
+                    _gather_host_rows_to_kernel[
+                        (rows.numel(), triton.cdiv(row_bytes, 1024))
+                    ](
                         source.view(torch.uint8),
                         row_slots,
                         rows,
@@ -573,7 +607,9 @@ class ExpertPinnedHostCache:
                     )
             else:
                 if rows is not None:
-                    raise ValueError("a copy to named rows needs contiguous pinned rows and outputs")
+                    raise ValueError(
+                        "a copy to named rows needs contiguous pinned rows and outputs"
+                    )
                 fallback_used = True
                 slots_cpu = _copy_indices_to_cpu(slots, source_ids.numel())
                 host_output = _pinned_staging_buffer(
@@ -632,9 +668,13 @@ class ExpertPinnedHostCache:
             chunk_ids = [int(value) for value in chunk.tolist()]
             if chunk_hits < chunk.numel():
                 if evictable < 1:
-                    raise RuntimeError("every pinned host slot holds a protected expert")
+                    raise RuntimeError(
+                        "every pinned host slot holds a protected expert"
+                    )
                 self.ensure_rows(chunk[~hit_mask], protected=chunk_ids)
-            lost = sorted({expert_id for expert_id in chunk_ids if expert_id not in self._lru})
+            lost = sorted(
+                {expert_id for expert_id in chunk_ids if expert_id not in self._lru}
+            )
             if lost:
                 raise RuntimeError(
                     f"pinned host rows of experts {lost} were evicted before their copy"
@@ -658,7 +698,7 @@ class ExpertPinnedHostCache:
         )
 
 
-def pinned_host_placement(budget_bytes: int) -> "Placement":
+def pinned_host_placement(budget_bytes: int) -> Placement:
     """SGLANG_MOE_PINNED_HOST_NUMA_MB, checked against the budget and the nodes; () when unset."""
     from sglang.srt.layers.moe.host_numa import check_capacity, parse_placement
 
@@ -675,7 +715,7 @@ def pinned_host_placement(budget_bytes: int) -> "Placement":
     return placement
 
 
-def _placement_report(placement: "Placement", caches) -> dict | None:
+def _placement_report(placement: Placement, caches) -> dict | None:
     """The requested MiB per node, the bytes actually bound per node (node changes round to 2 MiB, host_numa) and,
     per node, how many sampled tier pages it holds (-2: not yet resident)."""
     if not placement:
@@ -711,7 +751,7 @@ class ExpertPinnedHostCacheManager:
     @classmethod
     def from_model(
         cls, model: torch.nn.Module, budget_bytes: int
-    ) -> "ExpertPinnedHostCacheManager | None":
+    ) -> ExpertPinnedHostCacheManager | None:
         budget_bytes = index(budget_bytes)
         if budget_bytes == 0:
             return None
@@ -986,9 +1026,7 @@ class ExpertStreamer:
             raise ValueError("expert streamer requires at least one tensor")
         # The format owns the row schema. Sources stay dynamic lookups because
         # the host arena rebinds layer tensors after this streamer exists.
-        self.format = (
-            DenseLayerFormat(self.tensor_names) if format is None else format
-        )
+        self.format = DenseLayerFormat(self.tensor_names) if format is None else format
         self.num_experts = self._validate_sources()
         if row_source is _DEFAULT_ROW_SOURCE:
             row_source = self.format.default_row_source(
@@ -1148,7 +1186,9 @@ class ExpertStreamer:
             and 0 < topk_ids.numel() <= self.graph_gather_rows
         )
 
-    def enable_graph_gather(self, max_rows: int, scratch_destinations: bool = True) -> None:
+    def enable_graph_gather(
+        self, max_rows: int, scratch_destinations: bool = True
+    ) -> None:
         """Serve gathers of at most ``max_rows`` routes with device-only operations.
 
         Misses are pulled from registered host rows into the hot cache's scratch
@@ -1231,7 +1271,10 @@ class ExpertStreamer:
         self._graph_host_pair_count = len(host_pairs)
         self._graph_scratch_slots = (
             torch.arange(
-                cache.capacity, cache.capacity + max_rows, dtype=torch.long, device=device
+                cache.capacity,
+                cache.capacity + max_rows,
+                dtype=torch.long,
+                device=device,
             )
             if scratch_destinations
             # Overwritten with victim slots by every gather; zero is a valid row until then.
@@ -1319,7 +1362,9 @@ class ExpertStreamer:
             else None
         )
         prefetch_slot = (
-            prefetch_puller.slot_for(self.layer_id) if prefetch_expert is not None else -1
+            prefetch_puller.slot_for(self.layer_id)
+            if prefetch_expert is not None
+            else -1
         )
         prefetch_count = (
             prefetch_puller.posted_count_for(self.layer_id)
@@ -1429,7 +1474,9 @@ class ExpertStreamer:
             # once the copy that fills it has been issued ahead of it.
             if moe_side_stream.active():
                 # The side stream forks after the copies; the MoE layer joins it before the next layer's gather.
-                moe_side_stream.fork(direct.commit_gather, inputs=direct.pending_commit_tensors())
+                moe_side_stream.fork(
+                    direct.commit_gather, inputs=direct.pending_commit_tensors()
+                )
             else:
                 direct.commit_gather()
         if not fused:
@@ -1451,7 +1498,10 @@ class ExpertStreamer:
                 if self._graph_pinned_tier
                 else _tensor_data(getattr(self.layer, name))
             )
-            if current.data_ptr() != source.data_ptr() or current.device != source.device:
+            if (
+                current.data_ptr() != source.data_ptr()
+                or current.device != source.device
+            ):
                 raise RuntimeError(
                     f"expert tensor {name!r} moved after graph gather was enabled"
                 )
@@ -1566,7 +1616,10 @@ class ExpertStreamer:
                     dma_rows = source_ids.tolist()
                 self._dma_backend.copy_rows(source, output, dma_rows, range(row_count))
                 copy_engine_bytes += (
-                    row_count * source.numel() * source.element_size() // self.num_experts
+                    row_count
+                    * source.numel()
+                    * source.element_size()
+                    // self.num_experts
                 )
             elif readable[name]:
                 row_bytes = source.numel() * source.element_size() // self.num_experts
@@ -1611,9 +1664,13 @@ class ExpertStreamer:
         routed_rows = compact_ids.numel()
         if hot_out is not None:
             if routed_rows != row_count:
-                raise ValueError("hot_out needs one route per source, as _gather_experts_host gives")
+                raise ValueError(
+                    "hot_out needs one route per source, as _gather_experts_host gives"
+                )
             # The chunk's one sync, as below, also hands the host every row's place: no readback after its gather.
-            slots_host, hits_host = torch.stack((slots.long(), hit_mask.long())).tolist()
+            slots_host, hits_host = torch.stack(
+                (slots.long(), hit_mask.long())
+            ).tolist()
             hot_out.extend((slots_host, [bool(hit) for hit in hits_host]))
             hit_rows = routed_hit_rows = sum(hot_out[1])
         elif routed_rows == row_count:
@@ -1655,7 +1712,9 @@ class ExpertStreamer:
         assembly_bytes = hit_rows * self.bytes_per_expert
         if hit_rows:
             hot_slots = slots[hit_mask]
-            order = torch.cat(((~hit_mask).nonzero().flatten(), hit_mask.nonzero().flatten()))
+            order = torch.cat(
+                ((~hit_mask).nonzero().flatten(), hit_mask.nonzero().flatten())
+            )
             rows = _cached_arange(row_count, order.device, order.dtype)
             row_of_source = torch.empty_like(order)
             row_of_source[order] = rows
@@ -1813,12 +1872,15 @@ class ExpertStreamer:
         with cache.host_use():
             hot = self.hot_cache
             if hot is not None and hot.capacity:
-                experts, hot_slots = torch.stack((ids, hot.expert_to_slot[ids].long())).tolist()
+                experts, hot_slots = torch.stack(
+                    (ids, hot.expert_to_slot[ids].long())
+                ).tolist()
             else:
                 experts = ids.tolist()
                 hot_slots = [-1] * len(experts)
             cache.prefetch_rows(
-                sorted(expert for expert, slot in zip(experts, hot_slots) if slot < 0), protected=experts
+                sorted(expert for expert, slot in zip(experts, hot_slots) if slot < 0),
+                protected=experts,
             )
             try:
                 yield
@@ -2135,7 +2197,9 @@ class ExpertStreamer:
         hot_out: list | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.hot_cache is not None and self.hot_cache.capacity:
-            return self._gather_cached(source_ids, compact_ids, topk_ids, hot_out=hot_out)
+            return self._gather_cached(
+                source_ids, compact_ids, topk_ids, hot_out=hot_out
+            )
         if (
             self.pinned_host_cache is not None
             and self.pinned_host_cache.capacity

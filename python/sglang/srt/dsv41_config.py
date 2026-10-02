@@ -39,7 +39,7 @@ class Dsv41Config(msgspec.Struct, frozen=True):
     fused_wo_a: bool
 
     @classmethod
-    def from_envs(cls) -> "Dsv41Config":
+    def from_envs(cls) -> Dsv41Config:
         # Never cached: envs.X.override(...) in tests and late launcher edits must be observed.
         return cls(
             reasoning_effort=envs.SGLANG_DSV41_REASONING_EFFORT.get(),

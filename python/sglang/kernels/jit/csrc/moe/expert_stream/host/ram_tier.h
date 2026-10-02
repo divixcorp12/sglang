@@ -15,7 +15,7 @@ struct Tier {
   std::vector<uint64_t> stamp;
   std::vector<int32_t> expert_slot;  // assigned slot (READY) or -1
   std::vector<uint8_t> hot;
-  std::vector<uint8_t> filling;      // a prefill fill is still writing this kReady slot: never a victim, never released
+  std::vector<uint8_t> filling;  // a prefill fill is still writing this kReady slot: never a victim, never released
   // Prefill share: 1 while a row a prefill admitted has not been used by
   // decode. `owned` counts them. Only take_admit_slot_locked sets it, so it stays all zero with the share off.
   std::vector<uint8_t> prefill_owned;
@@ -176,8 +176,10 @@ class RamTier {
     // A torn record was overwritten by a later post, so nothing waits on it: skipped, and counted.
     const RecordRead read = read_record(record, next_demand_, &request);
     if (read == RecordRead::kMalformed) {
-      fail_stop(error_prefix<Layout>() + "request " + std::to_string(next_demand_) + ": malformed record (a lane kind or "
-                "count the device never writes)");
+      fail_stop(
+          error_prefix<Layout>() + "request " + std::to_string(next_demand_) +
+          ": malformed record (a lane kind or "
+          "count the device never writes)");
     }
     if (read == RecordRead::kTorn) {
       count<kOverruns>();
@@ -482,13 +484,9 @@ class RamTier {
       backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device), copy_prefix);
     }
     auto engine = std::make_unique<Engine>(
-        std::move(backend),
-        layers_,
-        spin_ns,
-        this,
-        copy_prefix,
-        std::string(Layout::kName) + "-copy-eng");
-    if (wait_timeout_ns <= 0) throw std::runtime_error(error_prefix<Layout>() + "the copy-wait timeout must be positive");
+        std::move(backend), layers_, spin_ns, this, copy_prefix, std::string(Layout::kName) + "-copy-eng");
+    if (wait_timeout_ns <= 0)
+      throw std::runtime_error(error_prefix<Layout>() + "the copy-wait timeout must be positive");
     copy_wait_timeout_ns_ = wait_timeout_ns;
     engine->start();
     copy_engine_ = std::move(engine);
@@ -564,7 +562,8 @@ class RamTier {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");
     if (copy_engine_ == nullptr)
-      throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the copy engine, which completes their lanes");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "CPU experts need the copy engine, which completes their lanes");
     if (cpu_ != nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are already enabled");
     config.rows = layers_;
     store_split(split.data(), static_cast<int64_t>(split.size()));
@@ -609,8 +608,14 @@ class RamTier {
   // Startup calibration (split_calibration.h): fills out, float64 [kCalibRows][kCalibCols] ms. The caller owns the
   // tier: it claims CPU job sequences, the owner's. device -1 copies with the test backend; scratch holds
   // kCalibLanes experts on that device.
-  void calibrate_cpu_split(int64_t row, int64_t device, int64_t reps, uint64_t scratch, int64_t scratch_bytes,
-                           int64_t timeout_ns, double* out) {
+  void calibrate_cpu_split(
+      int64_t row,
+      int64_t device,
+      int64_t reps,
+      uint64_t scratch,
+      int64_t scratch_bytes,
+      int64_t timeout_ns,
+      double* out) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("calibrate_cpu_split");
     const std::string prefix = error_prefix<Layout>() + "calibration: ";
@@ -620,8 +625,9 @@ class RamTier {
     if (!cpu_->eligible(row))
       throw std::runtime_error(prefix + "row " + std::to_string(row) + " has no registered CPU layer");
     if (tiers_[row].capacity < kCalibLanes)
-      throw std::runtime_error(prefix + "it needs 8 RAM slots in row " + std::to_string(row) + ", the row has " +
-                               std::to_string(tiers_[row].capacity));
+      throw std::runtime_error(
+          prefix + "it needs 8 RAM slots in row " + std::to_string(row) + ", the row has " +
+          std::to_string(tiers_[row].capacity));
     if (reps < 1 || timeout_ns <= 0) throw std::runtime_error(prefix + "reps and the timeout must be positive");
     CalibrationSetup s;
     s.cpu = cpu_.get();
@@ -630,8 +636,8 @@ class RamTier {
     const int64_t need = kCalibLanes * calibration_expert_bytes(s.entries);
     if (need == 0) throw std::runtime_error(prefix + "row " + std::to_string(row) + " copies no bytes");
     if (scratch == 0 || scratch_bytes < need)
-      throw std::runtime_error(prefix + "the scratch holds " + std::to_string(scratch_bytes) + " bytes, it needs " +
-                               std::to_string(need));
+      throw std::runtime_error(
+          prefix + "the scratch holds " + std::to_string(scratch_bytes) + " bytes, it needs " + std::to_string(need));
     std::unique_ptr<CopyBackend> backend;
     if (device < 0) {
       auto host = std::make_unique<HostCopyBackend>();
@@ -703,7 +709,8 @@ class RamTier {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("reserve_staging");
     if (k < 1 || k > kLeaseLanes)
-      throw std::runtime_error(error_prefix<Layout>() + "a row has 1.." + std::to_string(kLeaseLanes) + " staging slots");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "a row has 1.." + std::to_string(kLeaseLanes) + " staging slots");
     for (int64_t row = 0; row < layers_; ++row) {
       const Tier& tier = tiers_[row];
       if (tier.chain != 0) throw std::runtime_error(error_prefix<Layout>() + "reserve_staging is once");
@@ -904,14 +911,18 @@ class RamTier {
   // device would wait on CopyDone until the watchdog: fail stop.
   void copy_failed(const CopyJob& job, int error) {
     fail_stop(
-        std::string(Layout::kName) + " RAM miss copy engine: copy of request " + std::to_string(job.gen) +
-        " failed (" + std::to_string(error) + ")");
+        std::string(Layout::kName) + " RAM miss copy engine: copy of request " + std::to_string(job.gen) + " failed (" +
+        std::to_string(error) + ")");
   }
 
   // A locked cmpxchg on the host line is atomic against the device's posted stores to it.
   void cas_gate(uint32_t expected, uint32_t desired) {
     __atomic_compare_exchange_n(
-        reinterpret_cast<uint32_t*>(lease_ + kLeaseCopyGate), &expected, desired, false, __ATOMIC_SEQ_CST,
+        reinterpret_cast<uint32_t*>(lease_ + kLeaseCopyGate),
+        &expected,
+        desired,
+        false,
+        __ATOMIC_SEQ_CST,
         __ATOMIC_ACQUIRE);
   }
 
@@ -979,7 +990,8 @@ class RamTier {
 
   [[noreturn]] static void throw_no_trace() {
     throw std::runtime_error(
-        error_prefix<Layout>() + "the stage trace is in the instrumented host build only "
+        error_prefix<Layout>() +
+        "the stage trace is in the instrumented host build only "
         "(set SGLANG_DSV41_EXPERT_TRACE_PATH so the service loads it)");
   }
 
@@ -1041,7 +1053,7 @@ class RamTier {
 
   void run_fill() {
     begin_busy();
-    apply_pending_fault();  // test only: inject_fault() acts on a fill's read as on a demand's
+    apply_pending_fault();                        // test only: inject_fault() acts on a fill's read as on a demand's
     std::vector<uint8_t>& packed = fill_packed_;  // reserved to the widest row at construction (spec A10)
     size_t landed = 0;
     auto advance = [&] {
@@ -1112,7 +1124,10 @@ class RamTier {
   // acquires the tag before it reads the rest). The device read the previous delta in this row's last post, which
   // came before the record now being served, so nothing reads the record while it is rewritten.
   void publish_delta_locked(
-      int64_t row, uint64_t tag, const FixedVec<int32_t, kLeaseLanes>& staging, const int32_t (*entries)[2],
+      int64_t row,
+      uint64_t tag,
+      const FixedVec<int32_t, kLeaseLanes>& staging,
+      const int32_t (*entries)[2],
       int count) {
     uint8_t* d = lease_ + kDeltaBase + row * kDeltaStride;
     const uint32_t n = static_cast<uint32_t>(count);
@@ -1136,7 +1151,8 @@ class RamTier {
       if (split[n] < 0 || split[n] > n)
         throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
     for (int64_t n = 0; n < count; ++n)
-      __atomic_store_n(reinterpret_cast<int32_t*>(lease_ + kSplit) + n, static_cast<int32_t>(split[n]), __ATOMIC_RELAXED);
+      __atomic_store_n(
+          reinterpret_cast<int32_t*>(lease_ + kSplit) + n, static_cast<int32_t>(split[n]), __ATOMIC_RELAXED);
   }
 
   void disown_locked(Tier& tier, int64_t slot) {
@@ -1292,8 +1308,9 @@ class RamTier {
   };
 
   [[noreturn]] void fail_record(const Request& request, const std::string& why) {
-    fail_stop(error_prefix<Layout>() + "request " + std::to_string(request.seq) + " of row " +
-              std::to_string(request.row) + ": " + why);
+    fail_stop(
+        error_prefix<Layout>() + "request " + std::to_string(request.seq) + " of row " + std::to_string(request.row) +
+        ": " + why);
   }
 
   // The record's routed experts, each once: protect's, stamped as routed, then the lanes'.
@@ -1321,8 +1338,10 @@ class RamTier {
     for (size_t j = 0; j < request.lanes.size(); ++j) {
       const Lane& lane = request.lanes[j];
       const auto fail = [&](const char* why) {  // the message is built only to fail: the hot path allocates nothing
-        fail_record(request, "lane " + std::to_string(j) + " (expert " + std::to_string(lane.expert) + ", slot " +
-                                 std::to_string(lane.slot) + ")" + why);
+        fail_record(
+            request,
+            "lane " + std::to_string(j) + " (expert " + std::to_string(lane.expert) + ", slot " +
+                std::to_string(lane.slot) + ")" + why);
       };
       if (is_miss(lane.kind)) {
         if (!listed(tier.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
@@ -1344,7 +1363,8 @@ class RamTier {
       tier.stamp[lane.slot] = ++tick_;
       disown_locked(tier, lane.slot);
       if (lane.kind == kKindHitCopy) {
-        if (!host_lanes || !copy_engine_->eligible(request.row, lane.dst)) fail(": a copy-engine lane on an ineligible row");
+        if (!host_lanes || !copy_engine_->eligible(request.row, lane.dst))
+          fail(": a copy-engine lane on an ineligible row");
       } else if (lane.kind == kKindHitCpu) {
         if (!cpu_row) fail(": a CPU lane on a row without CPU experts");
         job.cpu_mask |= 1u << j;
@@ -1356,8 +1376,9 @@ class RamTier {
     }
     if (!plan->missing.empty()) {
       if (request.chain != tier.chain + 1) {
-        fail_record(request, "map chain " + std::to_string(request.chain) + ", the row expects " +
-                                 std::to_string(tier.chain + 1));
+        fail_record(
+            request,
+            "map chain " + std::to_string(request.chain) + ", the row expects " + std::to_string(tier.chain + 1));
       }
     } else if (request.chain != 0) {
       fail_record(request, "map chain " + std::to_string(request.chain) + " on a record without a miss");
@@ -1597,7 +1618,7 @@ class RamTier {
 
   uint8_t* page_;
   int32_t* map_;
-  uint8_t* lease_;  // the lease block (lease_layout.h)
+  uint8_t* lease_;               // the lease block (lease_layout.h)
   uint8_t* hot_page_ = nullptr;  // the hot bitmap sidecar: when given, each record's hot set is applied
   int64_t hot_stride_ = 0;
   // The copy engine, when enabled (before the service thread starts); armed separately, and only then used.
@@ -1605,7 +1626,7 @@ class RamTier {
   // CPU experts, when enabled (after the copy engine, before the service thread); stopped after the copy thread.
   std::unique_ptr<CpuExpertEngine> cpu_;
   std::atomic<bool> copy_armed_{false};
-  int64_t copy_wait_timeout_ns_ = 0;           // set with the copy engine, before any thread reads it
+  int64_t copy_wait_timeout_ns_ = 0;  // set with the copy engine, before any thread reads it
   // Piece streaming: serve_record's readiness words per row it reads, reused every request (like packed_).
   std::vector<PieceTarget> piece_targets_;
   PiecePublish piece_publish_;
@@ -1617,7 +1638,7 @@ class RamTier {
   int64_t layers_;
   int64_t experts_;
   Source reader_;
-  std::vector<uint8_t> packed_;  // serve()'s per-row packed flags, reserved to kWanted, reused every request
+  std::vector<uint8_t> packed_;       // serve()'s per-row packed flags, reserved to kWanted, reused every request
   std::vector<uint8_t> hot_scratch_;  // (experts_+7)/8 bytes, sized at construction: the hot bitmap of the record read
   std::vector<uint8_t> fill_packed_;  // run_fill's per-row packed flags, reserved to the largest row capacity
   // Prefill fills: written by fill_begin before the thread starts and read by it; the caller reads only the atomics
@@ -1633,13 +1654,14 @@ class RamTier {
   std::atomic<int> fill_state_{kFillOk};
   int fill_result_ = 0;           // run_fill's read result: the fill thread's, read by the owner after the join
   bool fill_unfinished_ = false;  // an epilogue is owed (fill_begin started a thread); caller_mutex_ / the owner's
-  std::vector<Tier> tiers_;  // the owner's, with every other non-atomic member: the tier has no mutex (Task 15)
+  std::vector<Tier> tiers_;       // the owner's, with every other non-atomic member: the tier has no mutex (Task 15)
   uint64_t tick_ = 0;
   std::atomic<int64_t> prefill_share_{0};  // any thread stores it, relaxed; see set_prefill_share
   uint32_t next_demand_ = 1;
   int64_t demands_read_ = 0;
   std::atomic<bool> threaded_{false};
-  // The pausing caller owns the tier while parked_ (see caller_owns). caller_mutex_ serializes Python-side callers only.
+  // The pausing caller owns the tier while parked_ (see caller_owns). caller_mutex_ serializes Python-side callers
+  // only.
   std::atomic<bool> parked_{false};
   std::mutex caller_mutex_;
   // The watchdog's hung-request marker, see busy_episode(): a new value per demand or fill in service, 0 when none.
@@ -1651,7 +1673,7 @@ class RamTier {
     std::atomic<int64_t> delay_ns{0};
     std::atomic<int64_t> delay_after{0};
     std::atomic<bool> fail_reads{false};
-    std::mutex fault_mutex;                 // guards pending_fault between inject_fault() and the service thread
+    std::mutex fault_mutex;  // guards pending_fault between inject_fault() and the service thread
     ReadFault pending_fault{};
     std::atomic<bool> fault_pending{false};
   };

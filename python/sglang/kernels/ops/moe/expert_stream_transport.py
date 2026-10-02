@@ -42,7 +42,10 @@ class TransportBuild(msgspec.Struct, frozen=True):
 # (host_sources, device_source) and the layout type they define.
 LAYOUTS = {
     "exl3": TransportBuild(
-        host_sources={"prod": "moe/exl3_ram_miss_host.cpp", "instr": "moe/exl3_ram_miss_host_instr.cpp"},
+        host_sources={
+            "prod": "moe/exl3_ram_miss_host.cpp",
+            "instr": "moe/exl3_ram_miss_host_instr.cpp",
+        },
         device_source="moe/exl3_ram_miss.cuh",
         device_layout="sglang::exl3::Exl3RowLayout",
     )
@@ -62,7 +65,10 @@ def host_variant() -> str:
     (SGLANG_DSV41_EXPERT_TRACE_PATH) or injects a RAM-miss fault (SGLANG_TEST_DSV41_RAM_MISS_FAULT), else production."""
     if _DEFAULT_VARIANT is not None:
         return _DEFAULT_VARIANT
-    if envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get() or envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get():
+    if (
+        envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get()
+        or envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get()
+    ):
         return "instr"
     return "prod"
 
@@ -88,7 +94,9 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
 def _refuse_test_only(name: str, variant: Optional[str]) -> None:
     """Raise, as the C++ export would, when ``name`` (a ``TEST_ONLY_EXPORTS`` entry) is called on production."""
     if (host_variant() if variant is None else variant) == "prod":
-        raise RuntimeError(f"{name} is test-only: it exists in the instrumented host build")
+        raise RuntimeError(
+            f"{name} is test-only: it exists in the instrumented host build"
+        )
 
 
 # cache_once keys f(), f("exl3") and f(layout="exl3") apart; each cached loader below is called only positionally,
@@ -98,7 +106,9 @@ def _host_module(layout: str = "exl3", variant: Optional[str] = None) -> Module:
     if variant == "instr_tsan" and _ALLOW_TSAN:
         return _host_module_tsan(layout)
     if variant not in VARIANTS:
-        raise ValueError(f"unknown host build variant {variant!r}; expected one of {VARIANTS}")
+        raise ValueError(
+            f"unknown host build variant {variant!r}; expected one of {VARIANTS}"
+        )
     if variant not in LAYOUTS[layout].host_sources:
         raise ValueError(f"layout {layout!r} has no {variant!r} host build variant")
     return _host_module_cached(layout, variant)
@@ -128,7 +138,13 @@ def _host_module_tsan(layout: str = "exl3") -> Module:
     return load_jit(
         f"expert_stream_host_{layout}_instr_tsan",
         cpp_files=[LAYOUTS[layout].host_sources["instr"]],
-        extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden", "-fsanitize=thread", "-O1", "-g"],
+        extra_cflags=[
+            "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden",
+            "-fsanitize=thread",
+            "-O1",
+            "-g",
+        ],
         extra_ldflags=["-luring", "-lpthread", "-ldl", "-fsanitize=thread"],
         header_only=False,
     )
@@ -141,15 +157,21 @@ def host_layout(layout: str = "exl3") -> tuple[tuple[str, ...], int]:
 
 @cache_once
 def _host_layout_cached(layout: str) -> tuple[tuple[str, ...], int]:
-    module = _host_module(layout)  # the default variant: every variant of a layout has the same layout
-    return tuple(str(module.expert_stream_layout_names()).split("\n")), int(module.expert_stream_layout_small_mask())
+    module = _host_module(
+        layout
+    )  # the default variant: every variant of a layout has the same layout
+    return tuple(str(module.expert_stream_layout_names()).split("\n")), int(
+        module.expert_stream_layout_small_mask()
+    )
 
 
 def _ids(values: Iterable[int]) -> torch.Tensor:
     return torch.tensor(list(values), dtype=torch.int64)
 
 
-def _checked_rows(tables, row: int, experts, slots) -> tuple[torch.Tensor, torch.Tensor]:
+def _checked_rows(
+    tables, row: int, experts, slots
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``experts`` and ``slots`` as int64 tensors, after the bounds checks the C++ hot path skips."""
     expert_ids, slot_ids = _ids(experts), _ids(slots)
     if expert_ids.numel() != slot_ids.numel():
@@ -157,10 +179,16 @@ def _checked_rows(tables, row: int, experts, slots) -> tuple[torch.Tensor, torch
     if not 0 <= row < len(tables.layer_ids):
         raise ValueError(f"streamed row {row} is outside [0, {len(tables.layer_ids)})")
     num_experts = int(tables.starts.shape[1])
-    if expert_ids.numel() and not (0 <= int(expert_ids.min()) and int(expert_ids.max()) < num_experts):
-        raise ValueError(f"expert ids {expert_ids.tolist()} are outside [0, {num_experts})")
+    if expert_ids.numel() and not (
+        0 <= int(expert_ids.min()) and int(expert_ids.max()) < num_experts
+    ):
+        raise ValueError(
+            f"expert ids {expert_ids.tolist()} are outside [0, {num_experts})"
+        )
     capacity = int(tables.capacity[row])
-    if slot_ids.numel() and not (0 <= int(slot_ids.min()) and int(slot_ids.max()) < capacity):
+    if slot_ids.numel() and not (
+        0 <= int(slot_ids.min()) and int(slot_ids.max()) < capacity
+    ):
         raise ValueError(f"slots {slot_ids.tolist()} are outside [0, {capacity})")
     return expert_ids, slot_ids
 
@@ -177,8 +205,12 @@ def _table_buffer_regions(tables) -> torch.Tensor:
             raise ValueError("I/O buffer slabs must be contiguous CPU tensors")
         nbytes = slab.numel() * slab.element_size()
         if nbytes and slab.dim() >= 1 and slab.shape[0] > 0:
-            regions.setdefault(slab.data_ptr(), (slab.data_ptr(), nbytes, nbytes // slab.shape[0]))
-    return torch.tensor(list(regions.values()), dtype=torch.int64, device="cpu").reshape(-1, 3)
+            regions.setdefault(
+                slab.data_ptr(), (slab.data_ptr(), nbytes, nbytes // slab.shape[0])
+            )
+    return torch.tensor(
+        list(regions.values()), dtype=torch.int64, device="cpu"
+    ).reshape(-1, 3)
 
 
 def _table_args(tables, direct: bool = True) -> tuple:
@@ -196,13 +228,22 @@ def _table_args(tables, direct: bool = True) -> tuple:
         "\n".join(tables.paths),
         "\n".join(tables.source_paths),
         tables.slot_bytes,
-        int(getattr(tables, "row_images", False)),  # duck-typed test tables predate the field
+        int(
+            getattr(tables, "row_images", False)
+        ),  # duck-typed test tables predate the field
         int(direct),
     )
 
 
 def read_rows_once(
-    tables, row: int, experts, slots, *, step: int = BOUNCE_ROWS, layout: str = "exl3", variant: Optional[str] = None
+    tables,
+    row: int,
+    experts,
+    slots,
+    *,
+    step: int = BOUNCE_ROWS,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
 ) -> int:
     """Read ``experts`` of streamed row ``row`` into pinned ``slots`` in C++: 1 ok, 0 failed.
 
@@ -282,7 +323,8 @@ def _fault_tensor(
             last_publish_delay_ns,
             fixed_chunk_cap,
             leg,
-            (1 if (nop_flush_refused or ring_reset_fail) else 0) | (2 if ring_reset_fail else 0),
+            (1 if (nop_flush_refused or ring_reset_fail) else 0)
+            | (2 if ring_reset_fail else 0),
             leg_cut_cap,
         ],
         dtype=torch.int64,
@@ -406,9 +448,14 @@ def read_rows_with_fault(
         cqes[:] = [int(results[2]), int(results[3])]
     if stats is not None:
         stats.update(
-            stale_cqes=int(results[4]), generation_wraps=int(results[5]), unfinished_jobs=int(results[6]),
-            pack_workers=int(results[7]), fixed_cuts=int(results[8]), fanout_sqes=int(results[9]),
-            cut_reads=int(results[10]), gap_cuts=int(results[11]),
+            stale_cqes=int(results[4]),
+            generation_wraps=int(results[5]),
+            unfinished_jobs=int(results[6]),
+            pack_workers=int(results[7]),
+            fixed_cuts=int(results[8]),
+            fanout_sqes=int(results[9]),
+            cut_reads=int(results[10]),
+            gap_cuts=int(results[11]),
         )
     return int(results[0]), int(results[1])
 
@@ -438,29 +485,65 @@ def read_rows_sqes(
     sqes = torch.zeros((max_sqes, 4), dtype=torch.int64)
     info = torch.zeros(11, dtype=torch.int64)
     _host_module(layout, variant).expert_stream_read_rows_sqes(
-        *_table_args(tables), row, expert_ids, slot_ids, int(step), fault, record, sqes, info
+        *_table_args(tables),
+        row,
+        expert_ids,
+        slot_ids,
+        int(step),
+        fault,
+        record,
+        sqes,
+        info,
     )
-    (result, count, descriptors, credit, cqes, fixed_cuts, fanout_sqes, cut_reads, gap_cuts, min_cut_bytes,
-     leg_stride) = info.tolist()
+    (
+        result,
+        count,
+        descriptors,
+        credit,
+        cqes,
+        fixed_cuts,
+        fanout_sqes,
+        cut_reads,
+        gap_cuts,
+        min_cut_bytes,
+        leg_stride,
+    ) = info.tolist()
     if count > max_sqes:
         raise RuntimeError(f"{count} SQEs, more than max_sqes {max_sqes}")
     log = [tuple(entry) for entry in sqes[:count].tolist()]
     info = dict(
-        sqes=count, descriptors=descriptors, credit=credit, cqes=cqes, fixed_cuts=fixed_cuts, fanout_sqes=fanout_sqes,
-        cut_reads=cut_reads, gap_cuts=gap_cuts, min_cut_bytes=min_cut_bytes, leg_stride=leg_stride,
+        sqes=count,
+        descriptors=descriptors,
+        credit=credit,
+        cqes=cqes,
+        fixed_cuts=fixed_cuts,
+        fanout_sqes=fanout_sqes,
+        cut_reads=cut_reads,
+        gap_cuts=gap_cuts,
+        min_cut_bytes=min_cut_bytes,
+        leg_stride=leg_stride,
     )
-    return result, log, info, stage_records(
-        record.unsqueeze(0)
-    )[0]
+    return result, log, info, stage_records(record.unsqueeze(0))[0]
 
 
 def publish_piece(
-    word: int, generation: int, bit: int, *, layout: str = "exl3", variant: Optional[str] = None
+    word: int,
+    generation: int,
+    bit: int,
+    *,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
 ) -> tuple[bool, int]:
     """Test only: the reader owner's publish primitive on one readiness word holding ``word`` (``generation << 8 |
     bits``): whether it set ``bit``, and the word afterwards."""
-    cell = torch.tensor([word - (1 << 64) if word >= 1 << 63 else word], dtype=torch.int64)
-    done = int(_host_module(layout, variant).expert_stream_publish_piece(cell, int(generation), int(bit)))
+    cell = torch.tensor(
+        [word - (1 << 64) if word >= 1 << 63 else word], dtype=torch.int64
+    )
+    done = int(
+        _host_module(layout, variant).expert_stream_publish_piece(
+            cell, int(generation), int(bit)
+        )
+    )
     return bool(done), int(cell[0]) & 0xFFFFFFFFFFFFFFFF
 
 
@@ -496,24 +579,46 @@ def read_rows_pieces(
     (a metric), and a fault argument that injects a fault is refused."""
     expert_ids, slot_ids = _checked_rows(tables, row, experts, slots)
     if masks is None:
-        masks = torch.full((len(expert_ids), 1), piece_word(generation), dtype=torch.int64)
+        masks = torch.full(
+            (len(expert_ids), 1), piece_word(generation), dtype=torch.int64
+        )
     fault = _fault_tensor(**faults)
     record = torch.zeros(_stage_words(layout, variant), dtype=torch.int64)
     info = torch.zeros(5, dtype=torch.int64)
     ref = reference if reference is not None else torch.zeros(0, dtype=torch.int64)
-    ref_ids = _ids(ref_slots) if ref_slots is not None else torch.zeros(0, dtype=torch.int64)
+    ref_ids = (
+        _ids(ref_slots) if ref_slots is not None else torch.zeros(0, dtype=torch.int64)
+    )
     _host_module(layout, variant).expert_stream_read_rows_pieces(
-        *_table_args(tables), row, expert_ids, slot_ids, int(step), fault, record, masks, int(generation), ref,
-        ref_ids, info,
+        *_table_args(tables),
+        row,
+        expert_ids,
+        slot_ids,
+        int(step),
+        fault,
+        record,
+        masks,
+        int(generation),
+        ref,
+        ref_ids,
+        info,
     )
     result, refused, checked, differed, early = info.tolist()
-    return result, stage_records(record.unsqueeze(0))[0], masks, dict(
-        refused=refused, checked=checked, differed=differed, early=early
+    return (
+        result,
+        stage_records(record.unsqueeze(0))[0],
+        masks,
+        dict(refused=refused, checked=checked, differed=differed, early=early),
     )
 
 
 def piece_geometry(
-    tables, row: int, expert: int, *, layout: str = "exl3", variant: Optional[str] = None
+    tables,
+    row: int,
+    expert: int,
+    *,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
 ) -> Optional[tuple[list[dict], list[dict]]]:
     """Test only: the sub-reads and pieces the C++ reader cuts expert ``expert`` of streamed row ``row`` into
     under piece streaming, or None when it refuses the row. Sub-reads, in file order: ``{file, offset, length,
@@ -533,7 +638,12 @@ def piece_geometry(
     sub_reads = [dict(zip(keys, line)) for line in subs[:count].tolist()]
     out = []
     for line in pieces.tolist():
-        out.append({"deps": line[0], "runs": [(line[1 + 2 * i], line[2 + 2 * i]) for i in range(segments)]})
+        out.append(
+            {
+                "deps": line[0],
+                "runs": [(line[1 + 2 * i], line[2 + 2 * i]) for i in range(segments)],
+            }
+        )
     return sub_reads, out
 
 
@@ -554,14 +664,42 @@ STAGE_TRACE_EXTENTS = 32
 # The C++ kPieces: pieces per row, and the most sub-reads a row issues under piece streaming.
 STAGE_PIECES = 8
 STAGE_FIELDS = (
-    "seq", "kind", "row", "ok", "rows", "batches", "backlog", "prev_done",
-    "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done",
-    "submit_to_first_cqe_ns", "first_to_last_cqe_ns", "pack_ns", "bytes", "extents",
+    "seq",
+    "kind",
+    "row",
+    "ok",
+    "rows",
+    "batches",
+    "backlog",
+    "prev_done",
+    "observed",
+    "reserved",
+    "submit",
+    "first_cqe",
+    "last_cqe",
+    "pack_start",
+    "pack_end",
+    "mapped",
+    "done",
+    "submit_to_first_cqe_ns",
+    "first_to_last_cqe_ns",
+    "pack_ns",
+    "bytes",
+    "extents",
     *(f"drive_dev_{d}" for d in range(STAGE_DRIVES)),
     *(f"drive_bytes_{d}" for d in range(STAGE_DRIVES)),
     *(f"drive_extents_{d}" for d in range(STAGE_DRIVES)),
-    "status", "rows_asked", "useful_bytes", "submitted_bytes", "retried_bytes", "cancelled_bytes",
-    "rows_untraced", "extents_untraced", "rows_reading_max", "pending_max", "bank_stalls",
+    "status",
+    "rows_asked",
+    "useful_bytes",
+    "submitted_bytes",
+    "retried_bytes",
+    "cancelled_bytes",
+    "rows_untraced",
+    "extents_untraced",
+    "rows_reading_max",
+    "pending_max",
+    "bank_stalls",
     *(f"row_pack_start_{k}" for k in range(STAGE_TRACE_ROWS)),
     *(f"row_pack_end_{k}" for k in range(STAGE_TRACE_ROWS)),
     *(f"extent_id_{k}" for k in range(STAGE_TRACE_EXTENTS)),
@@ -571,13 +709,33 @@ STAGE_FIELDS = (
     *(f"extent_submit_{k}" for k in range(STAGE_TRACE_EXTENTS)),
     *(f"extent_attempts_{k}" for k in range(STAGE_TRACE_EXTENTS)),
     "lanes",
-    "pack_workers", "pack_split",
-    "piece_stream", "pieces_vetted",
-    *(f"sub_land_seq_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
-    *(f"piece_cqe_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
-    *(f"piece_seq_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
-    *(f"piece_publish_{k}_{j}" for k in range(STAGE_TRACE_ROWS) for j in range(STAGE_PIECES)),
-    "pieces_published", "pieces_out_of_order", "piece_publish_refused",
+    "pack_workers",
+    "pack_split",
+    "piece_stream",
+    "pieces_vetted",
+    *(
+        f"sub_land_seq_{k}_{j}"
+        for k in range(STAGE_TRACE_ROWS)
+        for j in range(STAGE_PIECES)
+    ),
+    *(
+        f"piece_cqe_{k}_{j}"
+        for k in range(STAGE_TRACE_ROWS)
+        for j in range(STAGE_PIECES)
+    ),
+    *(
+        f"piece_seq_{k}_{j}"
+        for k in range(STAGE_TRACE_ROWS)
+        for j in range(STAGE_PIECES)
+    ),
+    *(
+        f"piece_publish_{k}_{j}"
+        for k in range(STAGE_TRACE_ROWS)
+        for j in range(STAGE_PIECES)
+    ),
+    "pieces_published",
+    "pieces_out_of_order",
+    "piece_publish_refused",
 )
 STAGE_KINDS = ("demand", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
@@ -587,14 +745,24 @@ STAGE_STATUSES = ("none", "served", "no_read", "failed", "cancelled", "touch")
 # last completion when reads and packing overlap. What holds instead: first_cqe <= pack_start, last_cqe <=
 # pack_end (see StageRecord).
 STAGE_ORDER = (
-    "observed", "reserved", "submit", "first_cqe", "last_cqe", "pack_start", "pack_end", "mapped", "done",
+    "observed",
+    "reserved",
+    "submit",
+    "first_cqe",
+    "last_cqe",
+    "pack_start",
+    "pack_end",
+    "mapped",
+    "done",
 )
 
 
 def _stage_words(layout: str = "exl3", variant: Optional[str] = None) -> int:
     words = int(_host_module(layout, variant).expert_stream_trace_words())
     if words != len(STAGE_FIELDS):
-        raise RuntimeError(f"C++ StageRecord has {words} words, STAGE_FIELDS {len(STAGE_FIELDS)}")
+        raise RuntimeError(
+            f"C++ StageRecord has {words} words, STAGE_FIELDS {len(STAGE_FIELDS)}"
+        )
     return words
 
 
@@ -647,23 +815,39 @@ def stage_records(words: torch.Tensor) -> list[dict]:
             for k in range(min(record["extents"], STAGE_TRACE_EXTENTS))
         ]
         for k in range(STAGE_TRACE_ROWS):
-            del record[f"row_pack_start_{k}"], record[f"row_pack_end_{k}"], record[f"row_admit_{k}"]
-        record["pieces"] = [
-            {
-                "row": k,
-                "sub_seq": [record[f"sub_land_seq_{k}_{j}"] for j in range(STAGE_PIECES)],
-                "seq": [record[f"piece_seq_{k}_{j}"] for j in range(STAGE_PIECES)],
-                "cqe": [record[f"piece_cqe_{k}_{j}"] for j in range(STAGE_PIECES)],
-                "publish": [record[f"piece_publish_{k}_{j}"] for j in range(STAGE_PIECES)],
-            }
-            for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
-        ] if record["piece_stream"] else []
+            del (
+                record[f"row_pack_start_{k}"],
+                record[f"row_pack_end_{k}"],
+                record[f"row_admit_{k}"],
+            )
+        record["pieces"] = (
+            [
+                {
+                    "row": k,
+                    "sub_seq": [
+                        record[f"sub_land_seq_{k}_{j}"] for j in range(STAGE_PIECES)
+                    ],
+                    "seq": [record[f"piece_seq_{k}_{j}"] for j in range(STAGE_PIECES)],
+                    "cqe": [record[f"piece_cqe_{k}_{j}"] for j in range(STAGE_PIECES)],
+                    "publish": [
+                        record[f"piece_publish_{k}_{j}"] for j in range(STAGE_PIECES)
+                    ],
+                }
+                for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
+            ]
+            if record["piece_stream"]
+            else []
+        )
         for k in range(STAGE_TRACE_EXTENTS):
             del record[f"extent_id_{k}"], record[f"extent_cqe_{k}"]
             del record[f"extent_submit_{k}"], record[f"extent_attempts_{k}"]
         for k in range(STAGE_TRACE_ROWS):
             for j in range(STAGE_PIECES):
-                del record[f"sub_land_seq_{k}_{j}"], record[f"piece_seq_{k}_{j}"], record[f"piece_cqe_{k}_{j}"]
+                del (
+                    record[f"sub_land_seq_{k}_{j}"],
+                    record[f"piece_seq_{k}_{j}"],
+                    record[f"piece_cqe_{k}_{j}"],
+                )
                 del record[f"piece_publish_{k}_{j}"]
         record["drives"] = [
             {
@@ -686,11 +870,23 @@ RECORD_BYTES = 128
 DEMAND_RING = 128
 DEMAND_RECORDS = 16
 RECORD_FIELDS = {
-    "seq": 0, "row": 4, "counts": 6, "flags": 7, "chain": 8, "epoch": 16, "kinds": 20,
-    "protect": 32, "lane_expert": 48, "lane_slot": 64, "lane_dst": 80, "lane_weight": 96,
+    "seq": 0,
+    "row": 4,
+    "counts": 6,
+    "flags": 7,
+    "chain": 8,
+    "epoch": 16,
+    "kinds": 20,
+    "protect": 32,
+    "lane_expert": 48,
+    "lane_slot": 64,
+    "lane_dst": 80,
+    "lane_weight": 96,
 }
 RECORD_FLAG_CAPTURED = 1
-RECORD_ID_MAX = 32767  # experts, slots and destinations are i16 in the record and the map delta
+RECORD_ID_MAX = (
+    32767  # experts, slots and destinations are i16 in the record and the map delta
+)
 HOT_HEADER_BYTES = 8
 HOT_ALIGNMENT = 64
 HOT_RECORDS = DEMAND_RECORDS
@@ -698,12 +894,18 @@ HOT_RECORDS = DEMAND_RECORDS
 
 def hot_record_bytes(experts: int) -> int:
     if experts <= 0 or experts > 65535:
-        raise ValueError(f"EXL3 hot bitmap expert count {experts} is outside [1, 65535]")
-    return ((HOT_HEADER_BYTES + (experts + 7) // 8 + HOT_ALIGNMENT - 1) // HOT_ALIGNMENT) * HOT_ALIGNMENT
+        raise ValueError(
+            f"EXL3 hot bitmap expert count {experts} is outside [1, 65535]"
+        )
+    return (
+        (HOT_HEADER_BYTES + (experts + 7) // 8 + HOT_ALIGNMENT - 1) // HOT_ALIGNMENT
+    ) * HOT_ALIGNMENT
 
 
 def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
-    return torch.zeros(HOT_RECORDS * hot_record_bytes(experts), dtype=torch.uint8, pin_memory=pin)
+    return torch.zeros(
+        HOT_RECORDS * hot_record_bytes(experts), dtype=torch.uint8, pin_memory=pin
+    )
 
 
 MAX_IDS = 8
@@ -755,7 +957,9 @@ CORE_COUNTERS = (
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
 
-def seqlock_stress(seconds: float, *, layout: str = "exl3", variant: Optional[str] = None) -> tuple[int, int]:
+def seqlock_stress(
+    seconds: float, *, layout: str = "exl3", variant: Optional[str] = None
+) -> tuple[int, int]:
     """Test only: read one record while a C++ thread rewrites it; (accepted, torn accepted). Instrumented build only."""
     _refuse_test_only("seqlock_stress", variant)
     out = torch.zeros(2, dtype=torch.int64)
@@ -767,13 +971,20 @@ _RECORD_LANES = 8  # kMaxIds == kLeaseLanes
 READ_RECORD_WORDS = 6 + _RECORD_LANES + 1 + 5 * _RECORD_LANES
 
 
-def read_record_fields(record: torch.Tensor, expected: int, *, layout: str = "exl3",
-                       variant: Optional[str] = None) -> dict:
+def read_record_fields(
+    record: torch.Tensor,
+    expected: int,
+    *,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+) -> dict:
     """Test only: the service's read_record over one RECORD_BYTES record, expecting seq ``expected``. Instrumented
     build only."""
     _refuse_test_only("read_record_fields", variant)
     out = torch.zeros(READ_RECORD_WORDS, dtype=torch.int64)
-    _host_module(layout, variant).expert_stream_read_record_fields(record, int(expected), out)
+    _host_module(layout, variant).expert_stream_read_record_fields(
+        record, int(expected), out
+    )
     w = out.tolist()
     protect, lanes = w[5], w[6 + _RECORD_LANES]
     base = 7 + _RECORD_LANES
@@ -790,7 +1001,9 @@ def read_record_fields(record: torch.Tensor, expected: int, *, layout: str = "ex
                 "slot": w[base + 5 * j + 1],
                 "dst": w[base + 5 * j + 2],
                 "kind": w[base + 5 * j + 3],
-                "weight": struct.unpack("<f", struct.pack("<i", w[base + 5 * j + 4]))[0],
+                "weight": struct.unpack("<f", struct.pack("<i", w[base + 5 * j + 4]))[
+                    0
+                ],
             }
             for j in range(lanes)
         ],
@@ -853,15 +1066,27 @@ class ExpertStreamHost:
         layout: str = "exl3",
         variant: Optional[str] = None,
     ) -> None:
-        if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu":
+        if (
+            page.numel() != PAGE_BYTES
+            or page.dtype != torch.uint8
+            or page.device.type != "cpu"
+        ):
             raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
-        if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(tables.starts.shape):
+        if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(
+            tables.starts.shape
+        ):
             raise ValueError("slot_map must be int32 [layers, experts]")
         # C++ indexes both through raw addresses and starts with every slot FREE.
-        if not page.is_contiguous() or not slot_map.is_contiguous() or slot_map.device.type != "cpu":
+        if (
+            not page.is_contiguous()
+            or not slot_map.is_contiguous()
+            or slot_map.device.type != "cpu"
+        ):
             raise ValueError("page and slot_map must be contiguous CPU tensors")
         if not bool((slot_map == -1).all()):
-            raise ValueError("slot_map must start filled with -1 (the C++ tiers start empty)")
+            raise ValueError(
+                "slot_map must start filled with -1 (the C++ tiers start empty)"
+            )
         self._layout = layout
         # The host build (VARIANTS), chosen once here: every later call goes to this module.
         self.variant = host_variant() if variant is None else variant
@@ -870,17 +1095,27 @@ class ExpertStreamHost:
         # The lease block: the service writes it through a raw address, so this object holds it. Allocated here when
         # the caller passes none.
         if lease_block is None:
-            lease_block = expert_lease_block.new_lease_block(int(tables.starts.shape[0]), pin=page.is_pinned())
+            lease_block = expert_lease_block.new_lease_block(
+                int(tables.starts.shape[0]), pin=page.is_pinned()
+            )
         else:
-            expert_lease_block.check_lease_block(lease_block, int(tables.starts.shape[0]), need_pinned=page.is_pinned())
+            expert_lease_block.check_lease_block(
+                lease_block, int(tables.starts.shape[0]), need_pinned=page.is_pinned()
+            )
         self.lease_block = lease_block
         self.hot_page = hot_page
         if hot_page is not None:
             stride = hot_record_bytes(tables.starts.shape[1])
-            if (hot_page.dtype != torch.uint8 or hot_page.device.type != "cpu"
-                    or not hot_page.is_contiguous() or hot_page.numel() != HOT_RECORDS * stride
-                    or (page.is_pinned() and not hot_page.is_pinned())):
-                raise ValueError(f"hot_page must be a contiguous pinned CPU uint8 tensor of {HOT_RECORDS * stride} bytes")
+            if (
+                hot_page.dtype != torch.uint8
+                or hot_page.device.type != "cpu"
+                or not hot_page.is_contiguous()
+                or hot_page.numel() != HOT_RECORDS * stride
+                or (page.is_pinned() and not hot_page.is_pinned())
+            ):
+                raise ValueError(
+                    f"hot_page must be a contiguous pinned CPU uint8 tensor of {HOT_RECORDS * stride} bytes"
+                )
         # The C++ service writes through raw addresses of the page, the slot map and the
         # slabs (``tables.keepalive``): this object holds all three, and the finalizer
         # below closes the service before they can be released.
@@ -890,21 +1125,44 @@ class ExpertStreamHost:
         self.layers, self.experts = tables.starts.shape
         self.handle = int(
             self._module.expert_stream_open(
-                page, slot_map, tables.extents, tables.starts, tables.file_sizes, tables.segments,
-                tables.slabs, tables.row_bytes, _table_buffer_regions(tables), tables.capacity, "\n".join(tables.paths),
-                "\n".join(tables.source_paths), tables.slot_bytes, int(tables.row_images), 1, self.lease_block,
-                self.hot_page if self.hot_page is not None else torch.empty(0, dtype=torch.uint8),
+                page,
+                slot_map,
+                tables.extents,
+                tables.starts,
+                tables.file_sizes,
+                tables.segments,
+                tables.slabs,
+                tables.row_bytes,
+                _table_buffer_regions(tables),
+                tables.capacity,
+                "\n".join(tables.paths),
+                "\n".join(tables.source_paths),
+                tables.slot_bytes,
+                int(tables.row_images),
+                1,
+                self.lease_block,
+                self.hot_page
+                if self.hot_page is not None
+                else torch.empty(0, dtype=torch.uint8),
             )
         )
         if self.handle < 0:
-            raise RuntimeError("exl3 RAM miss service failed to open (files, io_uring or bounce)")
+            raise RuntimeError(
+                "exl3 RAM miss service failed to open (files, io_uring or bounce)"
+            )
         self.layout_names, self.small_mask = host_layout(self._layout)
         # expert_stream_close also stops and joins the service thread, if one runs.
-        self._close = weakref.finalize(self, self._module.expert_stream_close, self.handle)
-        self._close.atexit = False  # _stop_live closes live hosts at exit, logging counters first
+        self._close = weakref.finalize(
+            self, self._module.expert_stream_close, self.handle
+        )
+        self._close.atexit = (
+            False  # _stop_live closes live hosts at exit, logging counters first
+        )
         _LIVE.add(self)
 
-    def _check(self, row: int, expert: Optional[int] = None, slot: Optional[int] = None) -> None:
+    def _check(
+        self, row: int, expert: Optional[int] = None, slot: Optional[int] = None
+    ) -> None:
         """The bounds the C++ bookkeeping does not check."""
         if not 0 <= row < self.layers:
             raise ValueError(f"streamed row {row} is outside [0, {self.layers})")
@@ -914,8 +1172,14 @@ class ExpertStreamHost:
         if slot is not None and not 0 <= slot < capacity:
             raise ValueError(f"slot {slot} is outside [0, {capacity})")
 
-    def start_thread(self, *, cpu_core: int = -1, fatal_wait_s: float = 30.0, spin_us: int = 5000,
-                     busy_poll: bool = False) -> None:
+    def start_thread(
+        self,
+        *,
+        cpu_core: int = -1,
+        fatal_wait_s: float = 30.0,
+        spin_us: int = 5000,
+        busy_poll: bool = False,
+    ) -> None:
         """Serve requests on a C++ thread (no more ``pump()``), with the fail-stop watchdog.
 
         ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved (D19). ``busy_poll`` spins on
@@ -926,7 +1190,11 @@ class ExpertStreamHost:
                 f"cpu_core {cpu_core}: cores 64-71 are reserved (NVMe completion interrupts are pinned there)"
             )
         self._module.expert_stream_start_thread(
-            self.handle, cpu_core, int(fatal_wait_s * 1e9), int(spin_us * 1e3), int(busy_poll)
+            self.handle,
+            cpu_core,
+            int(fatal_wait_s * 1e9),
+            int(spin_us * 1e3),
+            int(busy_poll),
         )
         self.threaded = True
 
@@ -938,11 +1206,17 @@ class ExpertStreamHost:
         """
         if not self.threaded:
             return
-        outcome = int(self._module.expert_stream_pause(self.handle, int(timeout_s * 1e9)))
+        outcome = int(
+            self._module.expert_stream_pause(self.handle, int(timeout_s * 1e9))
+        )
         if outcome == 2:
-            raise RuntimeError("exl3 RAM miss: not paused, the copy thread still has a job (unsynchronized stream)")
+            raise RuntimeError(
+                "exl3 RAM miss: not paused, the copy thread still has a job (unsynchronized stream)"
+            )
         if outcome != 1:
-            raise RuntimeError(f"exl3 RAM miss thread did not pause within {timeout_s} s")
+            raise RuntimeError(
+                f"exl3 RAM miss thread did not pause within {timeout_s} s"
+            )
 
     def resume(self) -> None:
         if self.threaded:
@@ -962,15 +1236,25 @@ class ExpertStreamHost:
         self._check(row, expert)
         self._module.expert_stream_touch(self.handle, row, expert)
 
-    def assign(self, row: int, expert: int, protected: Iterable[int] = (), protected_fallback: bool = True) -> tuple[int, Optional[int]]:
+    def assign(
+        self,
+        row: int,
+        expert: int,
+        protected: Iterable[int] = (),
+        protected_fallback: bool = True,
+    ) -> tuple[int, Optional[int]]:
         self._check(row, expert)
         out = torch.zeros(2, dtype=torch.int64)
-        self._module.expert_stream_assign(self.handle, row, expert, _ids(protected), int(protected_fallback), out)
+        self._module.expert_stream_assign(
+            self.handle, row, expert, _ids(protected), int(protected_fallback), out
+        )
         slot, evicted = int(out[0]), int(out[1])
         if evicted == -2:
             raise ValueError(f"expert {expert} already holds a pinned slot")
         if slot < 0:
-            raise RuntimeError("every pinned host slot holds a protected or leased expert")
+            raise RuntimeError(
+                "every pinned host slot holds a protected or leased expert"
+            )
         return slot, (None if evicted < 0 else evicted)
 
     def release(self, row: int, slot: int) -> None:
@@ -978,7 +1262,11 @@ class ExpertStreamHost:
         self._module.expert_stream_release(self.handle, row, slot)
 
     def fill_begin(
-        self, row: int, experts: Sequence[int], protected: Iterable[int] = (), fallback: bool = False
+        self,
+        row: int,
+        experts: Sequence[int],
+        protected: Iterable[int] = (),
+        fallback: bool = False,
     ) -> tuple[list[int], int]:
         """Prefill fills: claim slots for ``experts`` of ``row`` in order and read them on a helper thread.
 
@@ -991,18 +1279,28 @@ class ExpertStreamHost:
             self._check(row, expert)
         out = torch.zeros(len(experts) + 1, dtype=torch.int64)
         claimed = int(
-            self._module.expert_stream_fill_begin(self.handle, row, _ids(experts), _ids(protected), int(fallback), out)
+            self._module.expert_stream_fill_begin(
+                self.handle, row, _ids(experts), _ids(protected), int(fallback), out
+            )
         )
         values = out.tolist()
         return values[:claimed], values[len(experts)]
 
     def fill_wait(self, rows: int, timeout_s: float) -> None:
         """Return once the first ``rows`` claimed rows of the running fill have landed in their slabs."""
-        outcome = int(self._module.expert_stream_fill_wait(self.handle, int(rows), int(timeout_s * 1e9)))
+        outcome = int(
+            self._module.expert_stream_fill_wait(
+                self.handle, int(rows), int(timeout_s * 1e9)
+            )
+        )
         if outcome == 0:
-            raise RuntimeError(f"exl3 RAM miss: a prefill fill failed before its first {rows} rows landed")
+            raise RuntimeError(
+                f"exl3 RAM miss: a prefill fill failed before its first {rows} rows landed"
+            )
         if outcome != 1:
-            raise RuntimeError(f"exl3 RAM miss: a prefill fill did not land {rows} rows within {timeout_s} s")
+            raise RuntimeError(
+                f"exl3 RAM miss: a prefill fill did not land {rows} rows within {timeout_s} s"
+            )
 
     def fill_landed(self) -> int:
         """How many claimed rows of the fill have landed so far, a prefix of the claim order; never blocks."""
@@ -1028,7 +1326,10 @@ class ExpertStreamHost:
 
     def take_bulk_delta(self) -> torch.Tensor:
         """The eager paths' map changes since the last call, int32 ``[n, 3]`` of (row, expert, slot); paused only."""
-        out = torch.empty((int(self._module.expert_stream_bulk_delta_count(self.handle)), 3), dtype=torch.int32)
+        out = torch.empty(
+            (int(self._module.expert_stream_bulk_delta_count(self.handle)), 3),
+            dtype=torch.int32,
+        )
         self._module.expert_stream_take_bulk_delta(self.handle, out)
         return out
 
@@ -1057,7 +1358,9 @@ class ExpertStreamHost:
         """Rows a prefill may own per layer before its admissions evict its own rows instead of decode's; 0 is off."""
         self._module.expert_stream_set_prefill_share(self.handle, int(share))
 
-    def enable_copy_engine(self, device: int, *, spin_us: int = 5000, wait_timeout_ms: int = 2000) -> None:
+    def enable_copy_engine(
+        self, device: int, *, spin_us: int = 5000, wait_timeout_ms: int = 2000
+    ) -> None:
         """Start the copy-engine thread on CUDA device ``device`` (-1: the CPU test backend); before the thread starts.
 
         It copies nothing until :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
@@ -1068,17 +1371,23 @@ class ExpertStreamHost:
             self.handle, int(device), int(spin_us * 1e3), int(wait_timeout_ms * 1e6)
         )
 
-    def set_copy_table(self, row: int, table: torch.Tensor, dst_rows: int, *, sm_mask: int = 0) -> None:
+    def set_copy_table(
+        self, row: int, table: torch.Tensor, dst_rows: int, *, sm_mask: int = 0
+    ) -> None:
         """Row ``row``'s copy table: int64 ``[n, 3]`` of (source slab, destination tensor, row bytes) addresses, as
         C1's ``ExpertRowSegments.table``; every destination tensor holds ``dst_rows`` rows. Bit i of ``sm_mask`` leaves
         entry i to the copy wait's SM reads."""
         self._check(row)
         entries = table.detach().to("cpu", torch.int64).contiguous()
         if entries.dim() != 2 or entries.shape[1] != 3 or entries.shape[0] < 1:
-            raise ValueError(f"a copy table is int64 [n, 3], not {tuple(entries.shape)}")
+            raise ValueError(
+                f"a copy table is int64 [n, 3], not {tuple(entries.shape)}"
+            )
         if dst_rows < 1:
             raise ValueError("a copy table needs at least one destination row")
-        self._module.expert_stream_set_copy_table(self.handle, row, entries, int(dst_rows), int(sm_mask))
+        self._module.expert_stream_set_copy_table(
+            self.handle, row, entries, int(dst_rows), int(sm_mask)
+        )
 
     def arm_copy_engine(self, on: bool = True) -> None:
         """Let the service publish resident lanes COPYING and copy them itself, for requests whose post allows it."""
@@ -1107,12 +1416,26 @@ class ExpertStreamHost:
         """
         lanes = expert_lease_block.LANES
         if len(split) != lanes + 1:
-            raise ValueError(f"the CPU split table has {lanes + 1} entries (n = 0..{lanes}), not {len(split)}")
-        if x_rows.dtype != torch.uint8 or x_rows.dim() != 2 or x_rows.device.type != "cpu" or not x_rows.is_contiguous():
+            raise ValueError(
+                f"the CPU split table has {lanes + 1} entries (n = 0..{lanes}), not {len(split)}"
+            )
+        if (
+            x_rows.dtype != torch.uint8
+            or x_rows.dim() != 2
+            or x_rows.device.type != "cpu"
+            or not x_rows.is_contiguous()
+        ):
             raise ValueError("x_rows must be a contiguous host uint8 [rows, n] tensor")
-        if (out_rows.dtype != torch.float32 or out_rows.dim() not in (2, 3) or out_rows.device.type != "cpu"
-                or not out_rows.is_contiguous() or (out_rows.dim() == 3 and out_rows.shape[1] != 2)):
-            raise ValueError("out_rows must be a contiguous host float32 [rows, hidden] or [rows, 2, hidden] tensor")
+        if (
+            out_rows.dtype != torch.float32
+            or out_rows.dim() not in (2, 3)
+            or out_rows.device.type != "cpu"
+            or not out_rows.is_contiguous()
+            or (out_rows.dim() == 3 and out_rows.shape[1] != 2)
+        ):
+            raise ValueError(
+                "out_rows must be a contiguous host float32 [rows, hidden] or [rows, 2, hidden] tensor"
+            )
         parts = 1 if out_rows.dim() == 2 else 2
         hidden = int(out_rows.shape[-1])
         self._module.expert_stream_enable_cpu_experts(
@@ -1136,7 +1459,9 @@ class ExpertStreamHost:
 
     def set_cpu_split(self, split: Sequence[int]) -> None:
         """CPU experts: a new split table (CPU lanes per n eligible lanes, n = 0..8), at any time; the device reads it."""
-        self._module.expert_stream_set_cpu_split(self.handle, torch.tensor(list(split), dtype=torch.int64))
+        self._module.expert_stream_set_cpu_split(
+            self.handle, torch.tensor(list(split), dtype=torch.int64)
+        )
 
     def cpu_stats(self) -> dict[str, int]:
         """CPU experts: jobs and lanes the CPU expert thread computed, and its forward time in ns."""
@@ -1150,7 +1475,13 @@ class ExpertStreamHost:
         return int(self._module.expert_stream_copy_expert_bytes(self.handle, int(row)))
 
     def calibrate_cpu_split(
-        self, row: int, *, device: int, reps: int, scratch: torch.Tensor, timeout_s: float = 1.0
+        self,
+        row: int,
+        *,
+        device: int,
+        reps: int,
+        scratch: torch.Tensor,
+        timeout_s: float = 1.0,
     ) -> torch.Tensor:
         """CPU experts' startup calibration on ``row``: float64 ``[10, 9]`` mean ms; row 0 ``cpu[k]``, row 1
         ``link[m]``, row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no thread). ``device``
@@ -1176,7 +1507,11 @@ class ExpertStreamHost:
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
         """Whether every job handed to the copy thread completed (or failed) within ``timeout_s``."""
-        return bool(self._module.expert_stream_copy_engine_idle(self.handle, int(timeout_s * 1e9)))
+        return bool(
+            self._module.expert_stream_copy_engine_idle(
+                self.handle, int(timeout_s * 1e9)
+            )
+        )
 
     def copy_engine_release(self, marks: int = -1) -> None:
         """Test only (CPU backend): let ``marks`` more copy marks complete; negative lets every one complete."""
@@ -1188,7 +1523,9 @@ class ExpertStreamHost:
         _refuse_test_only("copy_engine_fail", self.variant)
         self._module.expert_stream_copy_engine_fail(self.handle, int(issue), int(query))
 
-    def copy_engine_ballast(self, dst: Optional[torch.Tensor], src: Optional[torch.Tensor]) -> None:
+    def copy_engine_ballast(
+        self, dst: Optional[torch.Tensor], src: Optional[torch.Tensor]
+    ) -> None:
         """Test only: copy ``src`` into ``dst`` (same byte size) ahead of every copy job, delaying its completion;
         ``None`` turns it off. The caller keeps both tensors alive while it is on. Instrumented build only."""
         _refuse_test_only("copy_engine_ballast", self.variant)
@@ -1196,9 +1533,13 @@ class ExpertStreamHost:
             self._module.expert_stream_copy_engine_ballast(self.handle, 0, 0, 0)
             return
         nbytes = dst.numel() * dst.element_size()
-        if nbytes != src.numel() * src.element_size() or not (dst.is_contiguous() and src.is_contiguous()):
+        if nbytes != src.numel() * src.element_size() or not (
+            dst.is_contiguous() and src.is_contiguous()
+        ):
             raise ValueError("ballast tensors must be contiguous and of one byte size")
-        self._module.expert_stream_copy_engine_ballast(self.handle, dst.data_ptr(), src.data_ptr(), nbytes)
+        self._module.expert_stream_copy_engine_ballast(
+            self.handle, dst.data_ptr(), src.data_ptr(), nbytes
+        )
 
     def copy_engine_marked(self) -> int:
         """Test only (CPU backend): copy marks recorded so far, one per job issued."""
@@ -1226,27 +1567,41 @@ class ExpertStreamHost:
     def set_hot(self, row: int, experts: Iterable[int]) -> None:
         """The row's hot set (never evicted). Paused or pumping only."""
         self._check(row)
-        self._module.expert_stream_set_hot(self.handle, row, _ids(e for e in experts if e >= 0))
+        self._module.expert_stream_set_hot(
+            self.handle, row, _ids(e for e in experts if e >= 0)
+        )
 
     def version(self) -> int:
         return self.counters()["version"]
 
-    def inject(self, delay_s: float = 0.0, fail_reads: bool = False, delay_after_demands: int = 0) -> None:
+    def inject(
+        self,
+        delay_s: float = 0.0,
+        fail_reads: bool = False,
+        delay_after_demands: int = 0,
+    ) -> None:
         """Test-only faults (see RamTier::inject); a failed read aborts the process. Instrumented build only."""
         _refuse_test_only("inject", self.variant)
-        self._module.expert_stream_inject(self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands)
+        self._module.expert_stream_inject(
+            self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands
+        )
 
     def piece_runs(self) -> torch.Tensor:
         """The stream kernel's piece table: int32 ``[layers, experts, STAGE_PIECES, segments, 2]``, each run a
         ``(lo, hi)`` byte range of its segment's name row, cut by the reader's own row geometry."""
         tables = self.tables
         runs = torch.zeros(
-            (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[0]), 2), dtype=torch.int32
+            (self.layers, self.experts, STAGE_PIECES, int(tables.segments.shape[0]), 2),
+            dtype=torch.int32,
         )
-        refused = int(self._module.expert_stream_piece_runs(*_table_args(tables)[:-1], runs))
+        refused = int(
+            self._module.expert_stream_piece_runs(*_table_args(tables)[:-1], runs)
+        )
         if refused:
             # A refused row's runs are empty: S would admit a READY hit of it, copy nothing and commit.
-            raise RuntimeError(f"exl3 RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces")
+            raise RuntimeError(
+                f"exl3 RAM miss: piece streaming cannot cut {refused} (row, expert) rows into pieces"
+            )
         return runs
 
     def inject_fault(self, **faults) -> None:
@@ -1290,7 +1645,9 @@ class ExpertStreamHost:
         self._module.expert_stream_counters(self.handle, out)
         values = dict(zip(COUNTERS, out.tolist()))
         # Every instrumented variant ("instr", "instr_tsan") compiles the metrics; only "prod" drops them.
-        return values if self.variant != "prod" else {k: values[k] for k in CORE_COUNTERS}
+        return (
+            values if self.variant != "prod" else {k: values[k] for k in CORE_COUNTERS}
+        )
 
     def layer_rows(self) -> list[int]:
         """Rows read for demands, per streamed layer: the RAM misses behind ``f``."""
@@ -1306,23 +1663,44 @@ class ExpertStreamHost:
                     self._module.expert_stream_stop_thread(self.handle)
                     self.threaded = False
                 # One line for the window's records (the corpus arms grep it).
-                sys.stderr.write("exl3 RAM miss thread counters " + json.dumps(self.counters()) + "\n")
+                sys.stderr.write(
+                    "exl3 RAM miss thread counters "
+                    + json.dumps(self.counters())
+                    + "\n"
+                )
             finally:
                 close()
 
 
 # The device's own words (lease_device.cuh kPosted..kDeadlineHi), in device memory: never on the wire.
-STATE_WORDS = {"posted": 0, "pending": 1, "epoch": 2, "pending_epoch": 3, "deadline_lo": 4, "deadline_hi": 5}
+STATE_WORDS = {
+    "posted": 0,
+    "pending": 1,
+    "epoch": 2,
+    "pending_epoch": 3,
+    "deadline_lo": 4,
+    "deadline_hi": 5,
+}
 
 
-_LEASE_METHODS = {"expert_stream_post": "post", "expert_stream_map_bulk_apply": "map_bulk_apply"}
-_ROW_COPY_METHODS = {"expert_stream_lease_stream": "lease_stream", "expert_stream_lease_copy_wait": "lease_copy_wait"}
+_LEASE_METHODS = {
+    "expert_stream_post": "post",
+    "expert_stream_map_bulk_apply": "map_bulk_apply",
+}
+_ROW_COPY_METHODS = {
+    "expert_stream_lease_stream": "lease_stream",
+    "expert_stream_lease_copy_wait": "lease_copy_wait",
+}
 
 
 def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     device_layout = LAYOUTS[layout].device_layout
-    return [(name, f"LeaseProtocolKernel::{method}") for name, method in _LEASE_METHODS.items()] + [
-        (name, f"RowCopyKernel<{device_layout}>::{method}") for name, method in _ROW_COPY_METHODS.items()
+    return [
+        (name, f"LeaseProtocolKernel::{method}")
+        for name, method in _LEASE_METHODS.items()
+    ] + [
+        (name, f"RowCopyKernel<{device_layout}>::{method}")
+        for name, method in _ROW_COPY_METHODS.items()
     ]
 
 
@@ -1362,25 +1740,37 @@ def stream_segment_map(segments, tables, row: int) -> torch.Tensor:
     for source, destination, row_bytes in table:
         # stream_copy_slice falls back to 1-byte copies off 16-byte alignment (plan 4.2 refuses it instead).
         if destination % 16 or row_bytes % 16:
-            raise ValueError(f"the stream kernel copies 16-byte units: destination {destination:#x} with rows of "
-                             f"{row_bytes} B is not 16-byte aligned")
+            raise ValueError(
+                f"the stream kernel copies 16-byte units: destination {destination:#x} with rows of "
+                f"{row_bytes} B is not 16-byte aligned"
+            )
     slabs = [int(address) for address in tables.slabs[row].tolist()]
     entry_of: dict[int, int] = {}
     for name, address in enumerate(slabs):
         hits = [k for k, entry in enumerate(table) if entry[0] == address]
         if len(hits) > 1:
-            raise ValueError(f"streamed name {name}'s slab is the source of {len(hits)} copy-table entries")
+            raise ValueError(
+                f"streamed name {name}'s slab is the source of {len(hits)} copy-table entries"
+            )
         if hits:
             if table[hits[0]][2] != int(tables.row_bytes[name]):
-                raise ValueError(f"streamed name {name}: the copy table's rows hold {table[hits[0]][2]} B, "
-                                 f"the slab's {int(tables.row_bytes[name])} B")
+                raise ValueError(
+                    f"streamed name {name}: the copy table's rows hold {table[hits[0]][2]} B, "
+                    f"the slab's {int(tables.row_bytes[name])} B"
+                )
             entry_of[name] = hits[0]
     names = [int(name) for name in tables.segments[:, 0].tolist()]
     missing = sorted(set(names) - set(entry_of))
     if missing:
-        raise ValueError(f"the copy table has no entry for streamed names {missing} of row {row}")
+        raise ValueError(
+            f"the copy table has no entry for streamed names {missing} of row {row}"
+        )
     whole = [0 if k in entry_of.values() else 1 for k in range(len(table))]
-    return torch.tensor([entry_of[name] for name in names] + whole, dtype=torch.int32, device=segments.table.device)
+    return torch.tensor(
+        [entry_of[name] for name in names] + whole,
+        dtype=torch.int32,
+        device=segments.table.device,
+    )
 
 
 class ExpertStreamDevice:
@@ -1395,11 +1785,28 @@ class ExpertStreamDevice:
     """
 
     def __init__(
-        self, page, lease_block, *, device, layers: int, experts: int, timeout_ms: int, piece_runs: torch.Tensor,
-        row_capacities: Sequence[int], hot_page=None, layout: str = "exl3", lease_pdl: bool = False,
-        hit_copy: str = "ce", cpu_misses: bool = False,
+        self,
+        page,
+        lease_block,
+        *,
+        device,
+        layers: int,
+        experts: int,
+        timeout_ms: int,
+        piece_runs: torch.Tensor,
+        row_capacities: Sequence[int],
+        hot_page=None,
+        layout: str = "exl3",
+        lease_pdl: bool = False,
+        hit_copy: str = "ce",
+        cpu_misses: bool = False,
     ) -> None:
-        if page.numel() != PAGE_BYTES or page.dtype != torch.uint8 or page.device.type != "cpu" or not page.is_contiguous():
+        if (
+            page.numel() != PAGE_BYTES
+            or page.dtype != torch.uint8
+            or page.device.type != "cpu"
+            or not page.is_contiguous()
+        ):
             raise ValueError("page must be a contiguous CPU uint8 tensor of PAGE_BYTES")
         if timeout_ms <= 0:
             raise ValueError("the RAM-miss wait timeout must be positive")
@@ -1412,11 +1819,25 @@ class ExpertStreamDevice:
         if lease_pdl and cuda and not is_arch_support_pdl():
             raise ValueError("lease-chain PDL needs sm_90 or newer (griddepcontrol)")
         if len(row_capacities) != layers:
-            raise ValueError(f"{len(row_capacities)} row capacities for {layers} layers")
-        if piece_runs.dtype != torch.int32 or piece_runs.dim() != 5 or piece_runs.shape[0] != layers:
-            raise ValueError("piece_runs must be int32 [layers, experts, pieces, segments, 2] (host.piece_runs())")
-        if piece_runs.shape[1] != experts or piece_runs.shape[2] != STAGE_PIECES or piece_runs.shape[4] != 2:
-            raise ValueError(f"piece_runs has shape {tuple(piece_runs.shape)} for {experts} experts")
+            raise ValueError(
+                f"{len(row_capacities)} row capacities for {layers} layers"
+            )
+        if (
+            piece_runs.dtype != torch.int32
+            or piece_runs.dim() != 5
+            or piece_runs.shape[0] != layers
+        ):
+            raise ValueError(
+                "piece_runs must be int32 [layers, experts, pieces, segments, 2] (host.piece_runs())"
+            )
+        if (
+            piece_runs.shape[1] != experts
+            or piece_runs.shape[2] != STAGE_PIECES
+            or piece_runs.shape[4] != 2
+        ):
+            raise ValueError(
+                f"piece_runs has shape {tuple(piece_runs.shape)} for {experts} experts"
+            )
         self.page = page
         self.lease_block = lease_block
         self.layers = layers
@@ -1433,7 +1854,9 @@ class ExpertStreamDevice:
         state = torch.zeros(len(STATE_WORDS), dtype=torch.int32)
         # Continue from the page's head: the thread serves demand_head + 1 next, so a device restarting at 1 over a
         # used page would never be served.
-        state[STATE_WORDS["posted"]] = page[WORDS["demand_head"] : WORDS["demand_head"] + 4].view(torch.int32)[0]
+        state[STATE_WORDS["posted"]] = page[
+            WORDS["demand_head"] : WORDS["demand_head"] + 4
+        ].view(torch.int32)[0]
         self.state = state.to(device)
         # Stable sentinels for absent tensors: a graph captures their addresses like every other argument.
         self._no_hot_slots = torch.empty(0, dtype=torch.int64, device=device)
@@ -1445,18 +1868,28 @@ class ExpertStreamDevice:
         self._hot_stride = 0
         if hot_page is not None:
             stride = hot_record_bytes(experts)
-            if (hot_page.dtype != torch.uint8 or hot_page.device.type != "cpu"
-                    or not hot_page.is_contiguous() or hot_page.numel() != HOT_RECORDS * stride
-                    or (cuda and not hot_page.is_pinned())):
-                raise ValueError(f"hot_page must be a contiguous pinned CPU uint8 tensor of {HOT_RECORDS * stride} bytes")
+            if (
+                hot_page.dtype != torch.uint8
+                or hot_page.device.type != "cpu"
+                or not hot_page.is_contiguous()
+                or hot_page.numel() != HOT_RECORDS * stride
+                or (cuda and not hot_page.is_pinned())
+            ):
+                raise ValueError(
+                    f"hot_page must be a contiguous pinned CPU uint8 tensor of {HOT_RECORDS * stride} bytes"
+                )
             self._hot_address = int(hot_page.data_ptr())
             self._hot_stride = stride
         lanes = expert_lease_block.LANES
         # The device's map bank: tag 1 is the attach delta and map_chain starts there, so a zero-filled delta record
         # (tag 0) is never taken for a published one.
         self.map_bank = {
-            "ram_slot": torch.full((layers, experts), -1, dtype=torch.int32, device=device),
-            "staging": torch.full((layers, lanes), -1, dtype=torch.int32, device=device),
+            "ram_slot": torch.full(
+                (layers, experts), -1, dtype=torch.int32, device=device
+            ),
+            "staging": torch.full(
+                (layers, lanes), -1, dtype=torch.int32, device=device
+            ),
             "map_chain": torch.ones(layers, dtype=torch.int64, device=device),
             "map_applied": torch.zeros(layers, dtype=torch.int64, device=device),
             # Per row: the copy engine may take a hit (its copy table is set), its destination rows, and the CPU may
@@ -1465,7 +1898,9 @@ class ExpertStreamDevice:
             "dst_rows": torch.zeros(layers, dtype=torch.int32, device=device),
             "cpu_ok": torch.zeros(layers, dtype=torch.uint8, device=device),
         }
-        self._row_capacity_tensor = torch.tensor(self._row_capacities, dtype=torch.int32, device=device)
+        self._row_capacity_tensor = torch.tensor(
+            self._row_capacities, dtype=torch.int32, device=device
+        )
         # The post's outputs: each lane's kind and source slot (S and CW read them), and C1's compacted SM hits, in one
         # order. Stable addresses: a graph captures them.
         self.lane_kind = torch.zeros(lanes, dtype=torch.int32, device=device)
@@ -1493,11 +1928,24 @@ class ExpertStreamDevice:
     def enable_cpu_experts(self, x_rows: torch.Tensor, out_rows: torch.Tensor) -> None:
         """CPU experts: the same pinned rows the host's ``enable_cpu_experts`` took, one per layer (UVA-readable)."""
         for rows, name in ((x_rows, "x_rows"), (out_rows, "out_rows")):
-            if rows.shape[0] != self.layers or rows.device.type != "cpu" or not rows.is_contiguous():
-                raise ValueError(f"{name} must be a contiguous host tensor with one row per layer")
+            if (
+                rows.shape[0] != self.layers
+                or rows.device.type != "cpu"
+                or not rows.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous host tensor with one row per layer"
+                )
             if torch.device(self.state.device).type == "cuda" and not rows.is_pinned():
-                raise ValueError(f"{name} must be pinned: the kernels read and write it through UVA")
-        if x_rows.stride(0) % 16 or out_rows.data_ptr() % 16 or x_rows.data_ptr() % 16 or (out_rows.stride(0) * 4) % 16:
+                raise ValueError(
+                    f"{name} must be pinned: the kernels read and write it through UVA"
+                )
+        if (
+            x_rows.stride(0) % 16
+            or out_rows.data_ptr() % 16
+            or x_rows.data_ptr() % 16
+            or (out_rows.stride(0) * 4) % 16
+        ):
             raise ValueError("the CPU expert rows must be 16-byte aligned")
         self.cpu_x_rows, self.cpu_out_rows = x_rows, out_rows
 
@@ -1516,11 +1964,18 @@ class ExpertStreamDevice:
         """The eager paths' map changes (``host.take_bulk_delta()``, int32 ``[n, 3]``), after every row's pending decode
         delta, on the current stream. The caller has synchronized the stream and paused the service."""
         if bulk.dtype != torch.int32 or bulk.dim() != 2 or bulk.shape[1] != 3:
-            raise ValueError(f"the bulk delta is int32 [n, 3], not {bulk.dtype} {tuple(bulk.shape)}")
+            raise ValueError(
+                f"the bulk delta is int32 [n, 3], not {bulk.dtype} {tuple(bulk.shape)}"
+            )
         bank = self.map_bank
         self._kernels().expert_stream_map_bulk_apply(
-            self._lease_address, bank["ram_slot"], bank["staging"], bank["map_chain"], bank["map_applied"],
-            bulk.to(self.state.device).contiguous(), self._row_capacity_tensor,
+            self._lease_address,
+            bank["ram_slot"],
+            bank["staging"],
+            bank["map_chain"],
+            bank["map_applied"],
+            bulk.to(self.state.device).contiguous(),
+            self._row_capacity_tensor,
         )
 
     def cpu_out_address(self, row: int) -> int:
@@ -1539,12 +1994,27 @@ class ExpertStreamDevice:
     def _check_buffers(self, **buffers) -> None:
         """The kernels cast each buffer's data pointer to one fixed type and read ``[0, lanes)``."""
         for name, (tensor, dtype) in buffers.items():
-            if tensor.dtype != dtype or tensor.device != self.state.device or not tensor.is_contiguous() or tensor.numel() < 1:
-                raise ValueError(f"{name} must be a non-empty contiguous {dtype} tensor on {self.state.device}")
+            if (
+                tensor.dtype != dtype
+                or tensor.device != self.state.device
+                or not tensor.is_contiguous()
+                or tensor.numel() < 1
+            ):
+                raise ValueError(
+                    f"{name} must be a non-empty contiguous {dtype} tensor on {self.state.device}"
+                )
 
     def post(
-        self, row: int, planned, count, routes, dst_slots, hot_slots=None, hot_capacity: int = 0,
-        captured: bool = False, cpu_input=None,
+        self,
+        row: int,
+        planned,
+        count,
+        routes,
+        dst_slots,
+        hot_slots=None,
+        hot_capacity: int = 0,
+        captured: bool = False,
+        cpu_input=None,
     ) -> None:
         """Post the layer's request: apply the row's pending map delta, type its lanes from the device map into
         ``lane_kind``/``lane_slot`` and C1's compaction, and publish the record. ``dst_slots`` are the plan's int32
@@ -1554,13 +2024,17 @@ class ExpertStreamDevice:
         ``captured``: the post stages x in the row's host row when a lane is the CPU's, and the weights in the record."""
         self._check_row(row)
         self._check_buffers(
-            planned=(planned, torch.int64), count=(count, torch.int32), routes=(routes, torch.int64),
+            planned=(planned, torch.int64),
+            count=(count, torch.int32),
+            routes=(routes, torch.int64),
             dst_slots=(dst_slots, torch.int32),
         )
         if hot_slots is not None:
             self._check_buffers(hot_slots=(hot_slots, torch.int64))
             if self._hot_address == 0 or not 0 < hot_capacity <= hot_slots.numel():
-                raise ValueError("EXL3 DIRECT needs a hot sidecar and a valid slot capacity")
+                raise ValueError(
+                    "EXL3 DIRECT needs a hot sidecar and a valid slot capacity"
+                )
         cpu_x, cpu_weights, cpu_x_dst = self._no_cpu, self._no_cpu, 0
         if cpu_input is not None:
             if self.cpu_x_rows is None:
@@ -1569,21 +2043,54 @@ class ExpertStreamDevice:
                 raise ValueError("only a captured post stages the CPU experts' input")
             cpu_x, cpu_weights = cpu_input
             if cpu_x.shape[-1] * 2 > self.cpu_x_rows.shape[1]:
-                raise ValueError(f"a {cpu_x.shape[-1]}-wide input does not fit the {self.cpu_x_rows.shape[1]}-byte row")
+                raise ValueError(
+                    f"a {cpu_x.shape[-1]}-wide input does not fit the {self.cpu_x_rows.shape[1]}-byte row"
+                )
             cpu_x, cpu_weights = cpu_x.reshape(1, -1), cpu_weights.reshape(-1)
             cpu_x_dst = int(self.cpu_x_rows[row].data_ptr())
         bank = self.map_bank
         cpu_on = self.cpu_x_rows is not None
         self._kernels().expert_stream_post(
-            self.page, self.state, planned, count, routes, row, self.experts, self._lease_address, self.timeout_ns,
-            self._hot_address, self._hot_stride, hot_slots if hot_slots is not None else self._no_hot_slots,
-            hot_capacity, dst_slots, int(bool(captured)), bank["ram_slot"], bank["staging"], bank["map_chain"],
-            bank["map_applied"], bank["ce_ok"], bank["cpu_ok"], bank["dst_rows"], self._row_capacities[row],
-            int(self.hit_copy == "ce"), int(cpu_on), int(self.cpu_misses and cpu_on), self.lane_kind, self.lane_slot,
-            self.go_1, self.host_rows_1, self.dst_slots_1, cpu_x, cpu_x_dst, cpu_weights, int(self.lease_pdl),
+            self.page,
+            self.state,
+            planned,
+            count,
+            routes,
+            row,
+            self.experts,
+            self._lease_address,
+            self.timeout_ns,
+            self._hot_address,
+            self._hot_stride,
+            hot_slots if hot_slots is not None else self._no_hot_slots,
+            hot_capacity,
+            dst_slots,
+            int(bool(captured)),
+            bank["ram_slot"],
+            bank["staging"],
+            bank["map_chain"],
+            bank["map_applied"],
+            bank["ce_ok"],
+            bank["cpu_ok"],
+            bank["dst_rows"],
+            self._row_capacities[row],
+            int(self.hit_copy == "ce"),
+            int(cpu_on),
+            int(self.cpu_misses and cpu_on),
+            self.lane_kind,
+            self.lane_slot,
+            self.go_1,
+            self.host_rows_1,
+            self.dst_slots_1,
+            cpu_x,
+            cpu_x_dst,
+            cpu_weights,
+            int(self.lease_pdl),
         )
 
-    def stream(self, row: int, planned, count, dst_slots, segments, segment_map) -> None:
+    def stream(
+        self, row: int, planned, count, dst_slots, segments, segment_map
+    ) -> None:
         """S: copy the post's kMissGpu lanes from their staging slots into ``segments``' destinations, each piece as
         its bit is published, until every piece is copied. ``segment_map`` is ``stream_segment_map(segments, ...)``.
         """
@@ -1596,15 +2103,31 @@ class ExpertStreamDevice:
         )
         row_segments = int(self.piece_runs.shape[3])
         if segment_map.numel() != row_segments + segments.table.shape[0]:
-            raise ValueError(f"segment_map has {segment_map.numel()} entries, the kernel reads "
-                             f"{row_segments} + {segments.table.shape[0]}")
+            raise ValueError(
+                f"segment_map has {segment_map.numel()} entries, the kernel reads "
+                f"{row_segments} + {segments.table.shape[0]}"
+            )
         self._kernels().expert_stream_lease_stream(
-            self.state, planned, count, dst_slots, row, self.experts, self._lease_address, self.lane_kind,
-            self.lane_slot, segments.table, segment_map, row_segments, self.piece_runs, self._row_capacities[row],
+            self.state,
+            planned,
+            count,
+            dst_slots,
+            row,
+            self.experts,
+            self._lease_address,
+            self.lane_kind,
+            self.lane_slot,
+            segments.table,
+            segment_map,
+            row_segments,
+            self.piece_runs,
+            self._row_capacities[row],
             int(self.lease_pdl),
         )
 
-    def copy_wait(self, count, dst_slots, sm_table: Optional[torch.Tensor] = None) -> None:
+    def copy_wait(
+        self, count, dst_slots, sm_table: Optional[torch.Tensor] = None
+    ) -> None:
         """The chain's tail: CW, a ``cuStreamWaitValue32`` on the gate, and CC.
 
         CW reads, with ``sm_table``, the small tensors of every kHitCopy lane from its RAM slot (int64 ``[n, 3]`` on the
@@ -1612,18 +2135,37 @@ class ExpertStreamDevice:
         lanes; the stream then waits, no SM spinning, until CW or the service's copy thread opens it; CC traps unless
         CopyDone names this request.
         """
-        self._check_buffers(count=(count, torch.int32), dst_slots=(dst_slots, torch.int32))
+        self._check_buffers(
+            count=(count, torch.int32), dst_slots=(dst_slots, torch.int32)
+        )
         sm_address, sm_count = 0, 0
         if sm_table is not None:
-            if sm_table.dtype != torch.int64 or sm_table.dim() != 2 or sm_table.shape[1] != 3 or not sm_table.is_contiguous():
-                raise ValueError(f"the copy wait's SM table is a contiguous int64 [n, 3], not {tuple(sm_table.shape)}")
+            if (
+                sm_table.dtype != torch.int64
+                or sm_table.dim() != 2
+                or sm_table.shape[1] != 3
+                or not sm_table.is_contiguous()
+            ):
+                raise ValueError(
+                    f"the copy wait's SM table is a contiguous int64 [n, 3], not {tuple(sm_table.shape)}"
+                )
             if sm_table.device != self.state.device:
-                raise ValueError("the copy wait's SM table must live on the device the kernel reads it from")
+                raise ValueError(
+                    "the copy wait's SM table must live on the device the kernel reads it from"
+                )
             sm_address, sm_count = sm_table.data_ptr(), int(sm_table.shape[0])
         self._kernels().expert_stream_lease_copy_wait(
-            self.state, count, self._lease_address, self.lane_kind, self.lane_slot, dst_slots, sm_address, sm_count,
+            self.state,
+            count,
+            self._lease_address,
+            self.lane_kind,
+            self.lane_slot,
+            dst_slots,
+            sm_address,
+            sm_count,
             self.ce_mask,
-            self.cpu_lanes if self.cpu_x_rows is not None else self._no_cpu, int(self.lease_pdl),
+            self.cpu_lanes if self.cpu_x_rows is not None else self._no_cpu,
+            int(self.lease_pdl),
         )
 
     def stats(self) -> dict[str, int]:

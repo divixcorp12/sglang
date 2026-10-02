@@ -1,11 +1,9 @@
-#include "fixture.h"
-#include "moe_mul1.h"
-#include "cpu_experts_cabi.h"
 #include <ATen/Parallel.h>
 #include <benchmark/benchmark.h>
-#include <omp.h>
-#include <sched.h>
-#include <unistd.h>
+
+#include "cpu_experts_cabi.h"
+#include "fixture.h"
+#include "moe_mul1.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -13,10 +11,13 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <omp.h>
+#include <sched.h>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unistd.h>
 
 namespace {
 namespace fs = std::filesystem;
@@ -63,22 +64,32 @@ Options parse_options(int& argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg(argv[i]);
     auto value = [&](const std::string& prefix) { return arg.substr(prefix.size()); };
-    if (arg.starts_with("--fixture=")) opt.fixture = value("--fixture=");
-    else if (arg.starts_with("--reference-dir=")) opt.references = value("--reference-dir=");
-    else if (arg.starts_with("--cpus=")) opt.cpus = value("--cpus=");
-    else if (arg.starts_with("--workers=")) opt.workers = number(value("--workers="));
-    else if (arg.starts_with("--numa-node=")) opt.node = number(value("--numa-node="));
-    else if (arg.starts_with("--warmup-forwards=")) opt.warmup = number(value("--warmup-forwards="));
-    else if (arg.starts_with("--gap-us=")) opt.gap_us = number(value("--gap-us="));
-    else if (arg == "--validate-only") opt.validate_only = true;
+    if (arg.starts_with("--fixture="))
+      opt.fixture = value("--fixture=");
+    else if (arg.starts_with("--reference-dir="))
+      opt.references = value("--reference-dir=");
+    else if (arg.starts_with("--cpus="))
+      opt.cpus = value("--cpus=");
+    else if (arg.starts_with("--workers="))
+      opt.workers = number(value("--workers="));
+    else if (arg.starts_with("--numa-node="))
+      opt.node = number(value("--numa-node="));
+    else if (arg.starts_with("--warmup-forwards="))
+      opt.warmup = number(value("--warmup-forwards="));
+    else if (arg.starts_with("--gap-us="))
+      opt.gap_us = number(value("--gap-us="));
+    else if (arg == "--validate-only")
+      opt.validate_only = true;
     else if (arg == "--help") {
-      std::cout << "Native DSV4.1 full-forward benchmark (" EXL3_BENCH_BACKEND ")\n"
-        "--fixture=FILE --reference-dir=DIR --cpus=18-33 --workers=N\n"
-        "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
-        "--warmup-forwards=128 --gap-us=0 --validate-only\n"
-        "Google Benchmark flags are also accepted.\n";
+      std::cout << "Native DSV4.1 full-forward benchmark (" EXL3_BENCH_BACKEND
+                   ")\n"
+                   "--fixture=FILE --reference-dir=DIR --cpus=18-33 --workers=N\n"
+                   "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
+                   "--warmup-forwards=128 --gap-us=0 --validate-only\n"
+                   "Google Benchmark flags are also accepted.\n";
       argv[remaining++] = argv[i];
-    } else argv[remaining++] = argv[i];
+    } else
+      argv[remaining++] = argv[i];
   }
   argc = remaining;
   argv[remaining] = nullptr;
@@ -101,7 +112,8 @@ void verify_workers(const std::set<int>& before, const std::vector<int32_t>& cor
     CPU_ZERO(&mask);
     if (sched_getaffinity(tid, sizeof(mask), &mask) || CPU_COUNT(&mask) != 1)
       throw std::runtime_error("Worker is not individually pinned");
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &mask)) assigned.push_back(cpu);
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+      if (CPU_ISSET(cpu, &mask)) assigned.push_back(cpu);
   }
   auto expected = cores;
   std::sort(expected.begin(), expected.end());
@@ -124,11 +136,26 @@ struct Workload {
         std::array<std::vector<at::Tensor>, 9> matrices;
         for (int m = 0; m < 9; ++m)
           matrices[m].assign(layer.matrices[m].begin(), layer.matrices[m].begin() + e);
-        handles.push_back(exl3_moe_cpu_make_layer(matrices[0], matrices[1], matrices[2],
-          matrices[3], matrices[4], matrices[5], matrices[6], matrices[7], matrices[8], {}, {}, {}, 0, 10.0, 0));
+        handles.push_back(exl3_moe_cpu_make_layer(
+            matrices[0],
+            matrices[1],
+            matrices[2],
+            matrices[3],
+            matrices[4],
+            matrices[5],
+            matrices[6],
+            matrices[7],
+            matrices[8],
+            {},
+            {},
+            {},
+            0,
+            10.0,
+            0));
       }
     } catch (...) {
-      for (auto handle : handles) exl3_moe_cpu_free_layer(handle);
+      for (auto handle : handles)
+        exl3_moe_cpu_free_layer(handle);
       throw;
     }
     for (int i = 0; i < experts; ++i) {
@@ -136,11 +163,21 @@ struct Workload {
       weights.push_back(0.071234f + (experts == 1 ? 0.0f : 0.23f * i / (experts - 1)));
     }
   }
-  ~Workload() { for (auto handle : handles) exl3_moe_cpu_free_layer(handle); }
+  ~Workload() {
+    for (auto handle : handles)
+      exl3_moe_cpu_free_layer(handle);
+  }
 
   void forward(size_t layer) {
-    if (sglang_exl3_cpu_experts_forward(handles[layer], fixture.layers[layer].input.data_ptr(),
-        slots.data(), weights.data(), experts, output.data(), options.workers, /*accumulate=*/0))
+    if (sglang_exl3_cpu_experts_forward(
+            handles[layer],
+            fixture.layers[layer].input.data_ptr(),
+            slots.data(),
+            weights.data(),
+            experts,
+            output.data(),
+            options.workers,
+            /*accumulate=*/0))
       throw std::runtime_error("Native CPU forward failed");
   }
 
@@ -148,7 +185,8 @@ struct Workload {
     std::vector<float> results(fixture.layers.size() * fixture.hidden);
     for (size_t layer = 0; layer < fixture.layers.size(); ++layer) {
       forward(layer);
-      for (float value : output) if (!std::isfinite(value)) throw std::runtime_error("Non-finite output");
+      for (float value : output)
+        if (!std::isfinite(value)) throw std::runtime_error("Non-finite output");
       std::copy(output.begin(), output.end(), results.begin() + layer * fixture.hidden);
     }
     compare_reference(options.references / ("reference-e" + std::to_string(experts) + ".bin"), results);
@@ -164,12 +202,12 @@ double quantile(std::vector<double>& samples, double fraction) {
 void full_forward(benchmark::State& state, Workload& workload) {
   try {
     workload.validate();
-    for (int i = 0; i < workload.options.warmup; ++i) workload.forward(i % workload.handles.size());
+    for (int i = 0; i < workload.options.warmup; ++i)
+      workload.forward(i % workload.handles.size());
     std::vector<double> samples;
     size_t layer = 0;
     for (auto _ : state) {
-      if (workload.options.gap_us)
-        std::this_thread::sleep_for(std::chrono::microseconds(workload.options.gap_us));
+      if (workload.options.gap_us) std::this_thread::sleep_for(std::chrono::microseconds(workload.options.gap_us));
       const auto start = std::chrono::steady_clock::now();
       workload.forward(layer);
       const auto end = std::chrono::steady_clock::now();
@@ -194,7 +232,7 @@ void full_forward(benchmark::State& state, Workload& workload) {
     state.SkipWithError(error.what());
   }
 }
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
   try {
@@ -207,7 +245,8 @@ int main(int argc, char** argv) {
     cpu_set_t allowed;
     if (sched_getaffinity(0, sizeof(allowed), &allowed)) throw std::runtime_error("Cannot read caller affinity");
     for (int cpu : cores) {
-      if (!CPU_ISSET(cpu, &allowed)) throw std::runtime_error("Requested CPU excluded by affinity/cgroup: " + std::to_string(cpu));
+      if (!CPU_ISSET(cpu, &allowed))
+        throw std::runtime_error("Requested CPU excluded by affinity/cgroup: " + std::to_string(cpu));
       if (!fs::exists("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/node" + std::to_string(options.node)))
         throw std::runtime_error("Requested CPU is not on the expected NUMA node: " + std::to_string(cpu));
     }
@@ -223,7 +262,8 @@ int main(int argc, char** argv) {
     CPU_ZERO(&caller);
     CPU_SET(cores.front(), &caller);
     if (sched_setaffinity(0, sizeof(caller), &caller)) throw std::runtime_error("Cannot pin caller");
-    if (sglang_exl3_cpu_experts_set_cores(cores.data(), cores.size())) throw std::runtime_error("Cannot configure kernel cores");
+    if (sglang_exl3_cpu_experts_set_cores(cores.data(), cores.size()))
+      throw std::runtime_error("Cannot configure kernel cores");
     const auto before = task_ids();
     const Fixture fixture(options.fixture);
     std::vector<std::unique_ptr<Workload>> workloads;
@@ -234,13 +274,15 @@ int main(int argc, char** argv) {
     }
     verify_workers(before, cores);
     std::cerr << "Verified 24 bit-exact layer outputs; individually pinned worker CPUs: ";
-    for (int cpu : cores) std::cerr << cpu << ' ';
+    for (int cpu : cores)
+      std::cerr << cpu << ' ';
     std::cerr << "(NUMA " << options.node << "; memory policy inherited)\n";
     if (!options.validate_only) {
       benchmark::AddCustomContext("backend", EXL3_BENCH_BACKEND);
       benchmark::AddCustomContext("fixture", options.fixture.string());
       std::string assigned_cpus;
-      for (int cpu : cores) assigned_cpus += (assigned_cpus.empty() ? "" : ",") + std::to_string(cpu);
+      for (int cpu : cores)
+        assigned_cpus += (assigned_cpus.empty() ? "" : ",") + std::to_string(cpu);
       benchmark::AddCustomContext("cpu_list", assigned_cpus);
       std::ifstream cgroup_file("/proc/self/cgroup");
       const std::string cgroup((std::istreambuf_iterator<char>(cgroup_file)), {});
@@ -251,9 +293,11 @@ int main(int argc, char** argv) {
       benchmark::AddCustomContext("compiler", __VERSION__);
       for (auto& workload : workloads) {
         auto* w = workload.get();
-        benchmark::RegisterBenchmark((std::string(EXL3_BENCH_BACKEND) + "/experts:" + std::to_string(w->experts)).c_str(),
-          [w](benchmark::State& state) { full_forward(state, *w); })
-          ->UseManualTime()->Unit(benchmark::kMicrosecond);
+        benchmark::RegisterBenchmark(
+            (std::string(EXL3_BENCH_BACKEND) + "/experts:" + std::to_string(w->experts)).c_str(),
+            [w](benchmark::State& state) { full_forward(state, *w); })
+            ->UseManualTime()
+            ->Unit(benchmark::kMicrosecond);
       }
       benchmark::RunSpecifiedBenchmarks();
       benchmark::Shutdown();

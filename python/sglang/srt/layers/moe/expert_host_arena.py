@@ -10,7 +10,6 @@ import os
 import torch
 
 from sglang.srt.layers.moe.expert_format import iter_expert_streamers
-
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_register,
     _cuda_host_unregister,
@@ -65,7 +64,10 @@ class ExpertHostArena:
         if not streamers:
             return None
         for streamer in streamers:
-            if not streamer.format.supports_host_arena or streamer.has_spec_only_tensors:
+            if (
+                not streamer.format.supports_host_arena
+                or streamer.has_spec_only_tensors
+            ):
                 raise ValueError(
                     f"expert format {streamer.format.key!r} of layer "
                     f"{streamer.layer_id} does not support the host arena; unset "

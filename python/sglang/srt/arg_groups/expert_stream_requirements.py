@@ -139,8 +139,12 @@ def expert_quant_method(server_args: Any, cfg: Any) -> Optional[str]:
             config = json.load(stream)
     except (OSError, ValueError):
         return None
-    quantization = config.get("quantization_config") if isinstance(config, dict) else None
-    method = quantization.get("quant_method") if isinstance(quantization, dict) else None
+    quantization = (
+        config.get("quantization_config") if isinstance(config, dict) else None
+    )
+    method = (
+        quantization.get("quant_method") if isinstance(quantization, dict) else None
+    )
     if isinstance(method, str) and method.strip():
         return _normalize(method)
     return None
@@ -272,9 +276,13 @@ def _check_nvfp4(cfg: Any, budgets: ExpertCacheBudgets) -> None:
             f"{' or '.join(decode_backends)}, and prefill CUDA graph capture to be "
             "disabled"
         )
-    if pinned_budget_mb and graph_config is not None and (
-        graph_config.decode.backend not in (Backend.DISABLED, Backend.BREAKABLE)
-        or graph_config.prefill.backend != Backend.DISABLED
+    if (
+        pinned_budget_mb
+        and graph_config is not None
+        and (
+            graph_config.decode.backend not in (Backend.DISABLED, Backend.BREAKABLE)
+            or graph_config.prefill.backend != Backend.DISABLED
+        )
     ):
         raise ValueError(
             "NVFP4 pinned host caching requires decode CUDA graph capture to be disabled "
@@ -283,11 +291,16 @@ def _check_nvfp4(cfg: Any, budgets: ExpertCacheBudgets) -> None:
 
 
 NVFP4_EXPERT_STREAM_REQUIREMENTS = ExpertStreamRequirements("NVFP4", _check_nvfp4)
-register_expert_stream_requirements(NVFP4_QUANT_METHODS, NVFP4_EXPERT_STREAM_REQUIREMENTS)
+register_expert_stream_requirements(
+    NVFP4_QUANT_METHODS, NVFP4_EXPERT_STREAM_REQUIREMENTS
+)
 
 
 def eager_expert_stream_requirements(
-    label: str, *, enabled: Callable[[], bool], enable_hint: str,
+    label: str,
+    *,
+    enabled: Callable[[], bool],
+    enable_hint: str,
     allow_gpu_residency_update: Callable[[], bool] = lambda: False,
 ) -> ExpertStreamRequirements:
     """Requirements of a format that streams experts eagerly only.
@@ -319,7 +332,10 @@ def eager_expert_stream_requirements(
                 f"{label} expert caching does not support expert prefetch; "
                 "set SGLANG_MOE_PREFETCH_MAX_CANDIDATES to 0"
             )
-        if envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get() and not allow_gpu_residency_update():
+        if (
+            envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
+            and not allow_gpu_residency_update()
+        ):
             raise ValueError(
                 f"{label} expert caching does not support "
                 "SGLANG_MOE_GPU_RESIDENCY_UPDATE; set it to 0"
@@ -336,7 +352,10 @@ def eager_expert_stream_requirements(
             )
         if budgets.hot_budget_mb:
             recorder = cfg.expert_distribution_recorder_mode
-            if envs.SGLANG_MOE_HOT_DYNAMIC.get() and recorder not in ("stat", "per_pass"):
+            if envs.SGLANG_MOE_HOT_DYNAMIC.get() and recorder not in (
+                "stat",
+                "per_pass",
+            ):
                 raise ValueError(
                     f"Dynamic {label} hot caching requires "
                     "--expert-distribution-recorder-mode stat or per_pass"

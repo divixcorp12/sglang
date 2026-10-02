@@ -1,17 +1,15 @@
 #include "placement.h"
 
-#include <pthread.h>
-#include <unistd.h>
-
+#include "expert_stream/host/core_topology.h"
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <pthread.h>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
-
-#include "expert_stream/host/core_topology.h"
+#include <unistd.h>
 
 namespace fullstack {
 namespace fs = std::filesystem;
@@ -69,30 +67,35 @@ void validate_placement(const Placement& p, const Topology& t, bool check_nodes)
     int cpu;
   };
   std::vector<Role> roles = {{"writer", p.writer}, {"service", p.service}, {"copy", p.copy}};
-  for (int32_t cpu : p.workers) roles.push_back({"worker", cpu});
+  for (int32_t cpu : p.workers)
+    roles.push_back({"worker", cpu});
   std::set<int> seen;
   for (const Role& role : roles) {
     if (role.cpu < 0 || role.cpu >= CPU_SETSIZE)
-      throw std::runtime_error(std::string("placement: the ") + role.name + " CPU " + std::to_string(role.cpu) + " is out of range");
+      throw std::runtime_error(
+          std::string("placement: the ") + role.name + " CPU " + std::to_string(role.cpu) + " is out of range");
     if (!seen.insert(role.cpu).second)
       throw std::runtime_error("placement: CPU " + std::to_string(role.cpu) + " has two roles");
     if (!CPU_ISSET(role.cpu, &t.allowed))
-      throw std::runtime_error(std::string("placement: the ") + role.name + " CPU " + std::to_string(role.cpu) +
-                               " is outside the process's allowed CPUs");
+      throw std::runtime_error(
+          std::string("placement: the ") + role.name + " CPU " + std::to_string(role.cpu) +
+          " is outside the process's allowed CPUs");
   }
   // A busy-polling service never yields: no other role may share its physical core (check_dedicated_core's rule).
   for (int sibling : t.siblings_of(p.service)) {
     if (sibling != p.service && seen.contains(sibling))
-      throw std::runtime_error("placement: CPU " + std::to_string(sibling) + " shares the physical core of the service CPU " +
-                               std::to_string(p.service));
+      throw std::runtime_error(
+          "placement: CPU " + std::to_string(sibling) + " shares the physical core of the service CPU " +
+          std::to_string(p.service));
   }
   if (!check_nodes) return;
   for (const Role& role : roles) {
     const int want = std::string(role.name) == "worker" ? p.worker_node : p.host_node;
     const int node = t.node_of(role.cpu);
     if (node != want)
-      throw std::runtime_error(std::string("placement: the ") + role.name + " CPU " + std::to_string(role.cpu) +
-                               " is on NUMA node " + std::to_string(node) + ", not node " + std::to_string(want));
+      throw std::runtime_error(
+          std::string("placement: the ") + role.name + " CPU " + std::to_string(role.cpu) + " is on NUMA node " +
+          std::to_string(node) + ", not node " + std::to_string(want));
   }
 }
 
@@ -131,7 +134,8 @@ std::vector<int> expected_threads(const Placement& p) {
 std::string cpu_list(std::vector<int> cpus) {
   std::sort(cpus.begin(), cpus.end());
   std::string text;
-  for (int cpu : cpus) text += (text.empty() ? "" : ",") + std::to_string(cpu);
+  for (int cpu : cpus)
+    text += (text.empty() ? "" : ",") + std::to_string(cpu);
   return text;
 }
 

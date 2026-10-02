@@ -13,7 +13,9 @@ def _one_part(slab: torch.Tensor, rank: int) -> torch.Tensor:
     if slab.dim() == rank + 1 and slab.shape[1] == 1:
         return slab[:, 0]
     if slab.dim() != rank:
-        raise ValueError(f"an EXL3 w2 slab of shape {tuple(slab.shape)} is neither [slot, ...] nor [slot, 1, ...]")
+        raise ValueError(
+            f"an EXL3 w2 slab of shape {tuple(slab.shape)} is neither [slot, ...] nor [slot, 1, ...]"
+        )
     return slab
 
 
@@ -40,12 +42,15 @@ class Exl3CpuQuantTrait:
 
     def register_layer(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> int:
         if self.act_limit is None:
-            raise ValueError("the EXL3 CPU kernel needs the layers' activation limit before a layer registers")
+            raise ValueError(
+                "the EXL3 CPU kernel needs the layers' activation limit before a layer registers"
+            )
         w13_t, w13_u, w13_v = slabs["w13_trellis"], slabs["w13_suh"], slabs["w13_svh"]
         # The pinned tier keeps w2 with its one-part axis ([slot, 1, ...], the format's row shape); the kernel takes
         # one matrix per expert, so that axis is dropped as a view.
         w2_t, w2_u, w2_v = (
-            _one_part(slabs[name], rank) for name, rank in (("w2_trellis", 4), ("w2_suh", 2), ("w2_svh", 2))
+            _one_part(slabs[name], rank)
+            for name, rank in (("w2_trellis", 4), ("w2_suh", 2), ("w2_svh", 2))
         )
         rows = range(capacity)
         # Gate is w13 part 0 and up is part 1; each [slot, part] view is contiguous. Activation 0 is
@@ -89,13 +94,18 @@ class Exl3CpuQuantTrait:
     def native_forward(self) -> int:
         import ctypes
 
-        return ctypes.cast(self._native("sglang_exl3_cpu_experts_forward"), ctypes.c_void_p).value
+        return ctypes.cast(
+            self._native("sglang_exl3_cpu_experts_forward"), ctypes.c_void_p
+        ).value
 
     def native_set_cores(self, cores) -> None:
         import ctypes
 
         fn = self._native("sglang_exl3_cpu_experts_set_cores")
-        fn.argtypes, fn.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
+        fn.argtypes, fn.restype = (
+            [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32],
+            ctypes.c_int,
+        )
         array = (ctypes.c_int32 * len(cores))(*cores)
         result = fn(array, len(cores))
         if result != 0:

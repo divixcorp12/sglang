@@ -4,13 +4,13 @@
 
 #include <linux/futex.h>
 #include <sys/syscall.h>
-#include <time.h>
-#include <unistd.h>
 
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <time.h>
+#include <unistd.h>
 
 namespace sglang::expert_stream {
 

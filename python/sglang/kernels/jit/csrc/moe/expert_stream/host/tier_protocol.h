@@ -44,8 +44,17 @@ enum Counter : int {
 // errors, the admission policy's outcomes, and the functional version.
 constexpr bool is_core_counter(int k) {
   switch (k) {
-    case kServedRequests: case kTouchOnly: case kRowsRead: case kReadErrors: case kEvictions: case kOverruns:
-    case kNoVictim: case kVersion: case kRunning: case kSpinCpu: case kRamInsertSkipped:
+    case kServedRequests:
+    case kTouchOnly:
+    case kRowsRead:
+    case kReadErrors:
+    case kEvictions:
+    case kOverruns:
+    case kNoVictim:
+    case kVersion:
+    case kRunning:
+    case kSpinCpu:
+    case kRamInsertSkipped:
       return true;
     default:
       return false;
@@ -94,7 +103,7 @@ struct Lane {
   int32_t slot = -1;  // the RAM slot of a hit, the staging slot of a miss
   int32_t dst = -1;   // the VRAM destination slot
   float weight = 0.0f;
-  uint8_t kind = 0;   // kKind*
+  uint8_t kind = 0;  // kKind*
 };
 
 inline bool is_miss(uint8_t kind) {

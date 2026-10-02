@@ -3,11 +3,10 @@
 
 #include <sgl_kernel/tensor.h>
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-
 #include "lease_device.cuh"
 #include "tensor_checks.h"
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 namespace sglang {
 
@@ -204,7 +203,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
   uint8_t* record = p.page + kDemandRing + ring_index(seq) * kRecordBytes;
   write_record(
-      record, seq,
+      record,
+      seq,
       RecordFields{
           .row = p.row,
           .flags = p.captured != 0 ? kRecFlagCaptured : 0u,
@@ -314,8 +314,9 @@ struct LeaseProtocolKernel {
     // The record carries i16 ids and is written with 16-byte stores (lease_layout.h).
     RuntimeCheck(experts <= kRecIdMax, "experts: a demand record carries expert ids up to ", kRecIdMax);
     RuntimeCheck(row_capacity <= kRecIdMax, "row_capacity: a demand record carries slots up to ", kRecIdMax);
-    RuntimeCheck(reinterpret_cast<uintptr_t>(page.data_ptr()) % 128 == 0,
-                 "page: must be 128-byte aligned, so each record's two cache lines are one prefetch pair (128-byte block)");
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(page.data_ptr()) % 128 == 0,
+        "page: must be 128-byte aligned, so each record's two cache lines are one prefetch pair (128-byte block)");
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
     auto on_host = SymbolicDevice{};
@@ -349,15 +350,19 @@ struct LeaseProtocolKernel {
         "map_chain", TensorMatcher({Rows_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), map_chain);
     expert_stream::verify_named(
         "map_applied", TensorMatcher({Rows_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), map_applied);
-    expert_stream::verify_named("ce_ok", TensorMatcher({Rows_}).with_dtype<uint8_t>().with_device<kDLCUDA>(device), ce_ok);
+    expert_stream::verify_named(
+        "ce_ok", TensorMatcher({Rows_}).with_dtype<uint8_t>().with_device<kDLCUDA>(device), ce_ok);
     expert_stream::verify_named(
         "cpu_ok", TensorMatcher({Rows_}).with_dtype<uint8_t>().with_device<kDLCUDA>(device), cpu_ok);
     expert_stream::verify_named(
         "dst_rows", TensorMatcher({Rows_}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_rows);
     RuntimeCheck(row >= 0 && row < Rows_.unwrap(), "row: outside the map bank");
-    for (auto [name, t] : {std::pair{"lane_kind", lane_kind}, std::pair{"lane_slot", lane_slot},
-                           std::pair{"dst_slots_1", dst_slots_1}}) {
-      expert_stream::verify_named(name, TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), t);
+    for (auto [name, t] :
+         {std::pair{"lane_kind", lane_kind},
+          std::pair{"lane_slot", lane_slot},
+          std::pair{"dst_slots_1", dst_slots_1}}) {
+      expert_stream::verify_named(
+          name, TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), t);
     }
     expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
     expert_stream::verify_named(
@@ -375,9 +380,12 @@ struct LeaseProtocolKernel {
     int64_t cpu_hidden = 0;
     if (cpu_input) {
       RuntimeCheck(captured != 0, "CPU experts: only a captured post stages the input");
-      RuntimeCheck(cpu_x.device().device_type == kDLCUDA && cpu_weights.device().device_type == kDLCUDA,
-                   "CPU experts: cpu_x and cpu_weights live on the device");
-      RuntimeCheck(cpu_x.is_contiguous() && cpu_weights.is_contiguous(), "CPU experts: cpu_x and cpu_weights must be contiguous");
+      RuntimeCheck(
+          cpu_x.device().device_type == kDLCUDA && cpu_weights.device().device_type == kDLCUDA,
+          "CPU experts: cpu_x and cpu_weights live on the device");
+      RuntimeCheck(
+          cpu_x.is_contiguous() && cpu_weights.is_contiguous(),
+          "CPU experts: cpu_x and cpu_weights must be contiguous");
       RuntimeCheck(cpu_dtype(cpu_x) >= 0 && cpu_dtype(cpu_weights) >= 0, "CPU experts: fp16, bf16 or fp32 inputs");
       RuntimeCheck(cpu_x.dim() == 2 && cpu_x.size(0) == 1, "CPU experts: cpu_x is one row [1, hidden]");
       cpu_hidden = cpu_x.size(1);
@@ -432,8 +440,9 @@ struct LeaseProtocolKernel {
         .cpu_weights_dtype = cpu_input ? cpu_dtype(cpu_weights) : 0,
         .cpu_weights_count = cpu_input ? cpu_weights.numel() : 0,
     };
-    LaunchKernel(1, device::expert_stream::kBlock, stream).enable_pdl(use_pdl != 0)(
-        use_pdl != 0 ? exl3_ram_miss_post_kernel<true> : exl3_ram_miss_post_kernel<false>, params);
+    LaunchKernel(1, device::expert_stream::kBlock, stream)
+        .enable_pdl(use_pdl != 0)(
+            use_pdl != 0 ? exl3_ram_miss_post_kernel<true> : exl3_ram_miss_post_kernel<false>, params);
   }
 
   static void map_bulk_apply(

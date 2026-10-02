@@ -2,9 +2,8 @@
 // no packing.
 #pragma once
 
-#include <stdexcept>
-
 #include "reader_core.h"
+#include <stdexcept>
 
 namespace sglang {
 namespace expert_stream {
@@ -47,7 +46,8 @@ class RowReader : public ReaderCore<RowReader<Layout, Reader, Build>, Layout, Re
   RowReader(Tables tables, bool direct) : Base(std::move(tables), direct) {
     if (!t_.images) {
       throw std::invalid_argument(
-          error_prefix<Layout>() + "the reader reads row image tables only (build them with "
+          error_prefix<Layout>() +
+          "the reader reads row image tables only (build them with "
           "scripts/dsv41/build_row_images.py); shard tables were refused");
     }
     if (!direct) throw std::invalid_argument(error_prefix<Layout>() + "row images are read with O_DIRECT only");

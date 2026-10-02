@@ -3,18 +3,16 @@
 // the copy engine is not armed, so no device lane competes. Nothing here runs on the decode path.
 #pragma once
 
-#include <immintrin.h>
-
+#include "copy_engine.h"
+#include "cpu_experts.h"
+#include "reader_base.h"
 #include <algorithm>
 #include <cstdint>
+#include <immintrin.h>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#include "copy_engine.h"
-#include "cpu_experts.h"
-#include "reader_base.h"
 
 namespace sglang::expert_stream {
 
@@ -93,8 +91,8 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
       }
     }
     if (now_ns() - start > s.timeout_ns)
-      throw std::runtime_error("calibration: a measurement did not finish within " +
-                               std::to_string(s.timeout_ns / 1'000'000) + " ms");
+      throw std::runtime_error(
+          "calibration: a measurement did not finish within " + std::to_string(s.timeout_ns / 1'000'000) + " ms");
     _mm_pause();
   }
   return end - start;

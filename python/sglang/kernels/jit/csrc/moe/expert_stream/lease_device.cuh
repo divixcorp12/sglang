@@ -59,12 +59,16 @@ SGL_DEVICE void st_relaxed_sys_v2(uint8_t* address, uint32_t x, uint32_t y) {
 }
 
 SGL_DEVICE void st_relaxed_sys_v4(uint8_t* address, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
-  asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(address), "r"(x), "r"(y), "r"(z), "r"(w) : "memory");
+  asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(address), "r"(x), "r"(y), "r"(z), "r"(w)
+               : "memory");
 }
 
 SGL_DEVICE uint4 ld_relaxed_sys_v4(const uint8_t* address) {
   uint4 v;
-  asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(address) : "memory");
+  asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(address)
+               : "memory");
   return v;
 }
 
@@ -150,10 +154,10 @@ SGL_DEVICE bool is_cpu_kind(uint32_t kind) {
 // One request's record as the post knows it; write_record narrows and packs it into the wire layout.
 struct RecordFields {
   int64_t row;
-  uint32_t flags;           // kRecFlag*
-  uint64_t chain;           // the row's map-chain number, 0 when no lane misses
-  uint32_t epoch;           // so G = epoch << 32 | seq
-  const int32_t* protect;   // protect_count routed experts
+  uint32_t flags;          // kRecFlag*
+  uint64_t chain;          // the row's map-chain number, 0 when no lane misses
+  uint32_t epoch;          // so G = epoch << 32 | seq
+  const int32_t* protect;  // protect_count routed experts
   int protect_count;
   int64_t count;            // lanes
   const int64_t* planned;   // count lane experts
@@ -313,8 +317,8 @@ SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[kLeaseLanes + 1]
 #pragma unroll
   for (int i = 0; i < 3; ++i)
     v[i] = ld_relaxed_sys_v4(split + 16 * i);
-  const uint32_t words[12] = {v[0].x, v[0].y, v[0].z, v[0].w, v[1].x, v[1].y, v[1].z, v[1].w,
-                              v[2].x, v[2].y, v[2].z, v[2].w};
+  const uint32_t words[12] = {
+      v[0].x, v[0].y, v[0].z, v[0].w, v[1].x, v[1].y, v[1].z, v[1].w, v[2].x, v[2].y, v[2].z, v[2].w};
 #pragma unroll
   for (int n = 0; n <= kLeaseLanes; ++n)
     out[n] = static_cast<int32_t>(words[n]);

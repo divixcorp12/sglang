@@ -56,7 +56,10 @@ class RowImageLayout(msgspec.Struct, frozen=True, kw_only=True):
     segments: tuple[RowSegment, ...]
 
     def image_offset(self, segment: RowSegment) -> int:
-        return self.name_offsets[EXL3_STREAMED_NAMES.index(segment.name)] + segment.dst_offset
+        return (
+            self.name_offsets[EXL3_STREAMED_NAMES.index(segment.name)]
+            + segment.dst_offset
+        )
 
     def to_json(self) -> dict:
         return {
@@ -65,7 +68,10 @@ class RowImageLayout(msgspec.Struct, frozen=True, kw_only=True):
             "name_offsets": list(self.name_offsets),
             "image_bytes": self.image_bytes,
             "row_stride": self.row_stride,
-            "segments": [[s.name, s.part, s.dst_offset, s.src_offset, s.nbytes] for s in self.segments],
+            "segments": [
+                [s.name, s.part, s.dst_offset, s.src_offset, s.nbytes]
+                for s in self.segments
+            ],
         }
 
 
@@ -73,16 +79,22 @@ def row_image_layout(segments: Sequence[RowSegment]) -> RowImageLayout:
     """The image layout of a format's segment map; refuses a map a readv could not land directly."""
     row_bytes = []
     for name in EXL3_STREAMED_NAMES:
-        spans = sorted((s.dst_offset, s.dst_offset + s.nbytes) for s in segments if s.name == name)
+        spans = sorted(
+            (s.dst_offset, s.dst_offset + s.nbytes) for s in segments if s.name == name
+        )
         if not spans:
             raise ValueError(f"row images: no segment fills streamed name {name}")
         cursor = 0
         for lo, hi in spans:
             if lo != cursor:
-                raise ValueError(f"row images: {name}'s segments leave a gap or overlap at byte {cursor}")
+                raise ValueError(
+                    f"row images: {name}'s segments leave a gap or overlap at byte {cursor}"
+                )
             cursor = hi
         if cursor % IO_ALIGN:
-            raise ValueError(f"row images: {name}'s slab row is {cursor} B, not a multiple of {IO_ALIGN}")
+            raise ValueError(
+                f"row images: {name}'s slab row is {cursor} B, not a multiple of {IO_ALIGN}"
+            )
         row_bytes.append(cursor)
     unknown = sorted({s.name for s in segments} - set(EXL3_STREAMED_NAMES))
     if unknown:
@@ -100,7 +112,9 @@ def row_image_layout(segments: Sequence[RowSegment]) -> RowImageLayout:
     )
 
 
-def image_of_row(layout: RowImageLayout, row: bytes | bytearray | memoryview) -> bytearray:
+def image_of_row(
+    layout: RowImageLayout, row: bytes | bytearray | memoryview
+) -> bytearray:
     """The image (``image_bytes``, no padding) of one on-disk row (the record's ``nbytes`` from its file offset)."""
     raw = memoryview(row)
     image = bytearray(layout.image_bytes)
@@ -123,11 +137,17 @@ def source_fingerprint(layout: Exl3ExpertLayout, source_root: str) -> dict:
     records = hashlib.sha256()
     for key in sorted(layout.records):
         r = layout.records[key]
-        records.update(f"{r.layer},{r.expert},{os.path.relpath(r.path, source_root)},{r.file_offset},{r.nbytes};".encode())
+        records.update(
+            f"{r.layer},{r.expert},{os.path.relpath(r.path, source_root)},{r.file_offset},{r.nbytes};".encode()
+        )
     for t in layout.tensors:
-        records.update(f"{t.name},{t.rel_offset},{t.nbytes},{t.dtype},{tuple(t.shape)};".encode())
+        records.update(
+            f"{t.name},{t.rel_offset},{t.nbytes},{t.dtype},{tuple(t.shape)};".encode()
+        )
     return {
-        "shards": [[os.path.relpath(p, source_root), os.path.getsize(p)] for p in shards],
+        "shards": [
+            [os.path.relpath(p, source_root), os.path.getsize(p)] for p in shards
+        ],
         "num_layers": layout.num_layers,
         "num_experts": layout.num_experts,
         "row_bytes": layout.row_bytes,
@@ -147,7 +167,10 @@ def manifest_json(
         "complete": True,
         "layout": image_layout.to_json(),
         "source": fingerprint,
-        "layers": {str(layer): {"file": layer_file_name(layer), "digests": list(d)} for layer, d in sorted(digests.items())},
+        "layers": {
+            str(layer): {"file": layer_file_name(layer), "digests": list(d)}
+            for layer, d in sorted(digests.items())
+        },
     }
 
 
@@ -174,7 +197,9 @@ def read_manifest(root: str) -> dict:
         with open(path) as f:
             return json.load(f)
     except FileNotFoundError:
-        raise ValueError(f"row images: {path} is missing; build the images with scripts/dsv41/build_row_images.py") from None
+        raise ValueError(
+            f"row images: {path} is missing; build the images with scripts/dsv41/build_row_images.py"
+        ) from None
 
 
 class RowImageSet(msgspec.Struct, frozen=True, kw_only=True):
@@ -207,13 +232,21 @@ def open_row_images(
         m = read_manifest(root)
         where = row_image_dir(root)
         if m.get("format") != FORMAT or m.get("version") != VERSION:
-            raise ValueError(f"row images at {where}: format {m.get('format')!r} v{m.get('version')!r}, expected {FORMAT!r} v{VERSION}")
+            raise ValueError(
+                f"row images at {where}: format {m.get('format')!r} v{m.get('version')!r}, expected {FORMAT!r} v{VERSION}"
+            )
         if m.get("complete") is not True:
-            raise ValueError(f"row images at {where}: the manifest is not marked complete")
+            raise ValueError(
+                f"row images at {where}: the manifest is not marked complete"
+            )
         if m.get("layout") != want_layout:
-            raise ValueError(f"row images at {where}: built for a different image layout than this checkpoint's")
+            raise ValueError(
+                f"row images at {where}: built for a different image layout than this checkpoint's"
+            )
         if m.get("source") != want_source:
-            raise ValueError(f"row images at {where}: built from a different source than {source_root}")
+            raise ValueError(
+                f"row images at {where}: built from a different source than {source_root}"
+            )
         layers = m.get("layers", {})
         missing = [layer for layer in layer_ids if str(layer) not in layers]
         if missing:
@@ -221,16 +254,22 @@ def open_row_images(
         digests = {layer: layers[str(layer)]["digests"] for layer in layer_ids}
         for layer in layer_ids:
             if len(digests[layer]) != layout.num_experts:
-                raise ValueError(f"row images at {where}: layer {layer} has {len(digests[layer])} digests for {layout.num_experts} experts")
+                raise ValueError(
+                    f"row images at {where}: layer {layer} has {len(digests[layer])} digests for {layout.num_experts} experts"
+                )
             path = os.path.join(where, layers[str(layer)]["file"])
             size = os.path.getsize(path) if os.path.exists(path) else -1
             if size != layout.num_experts * image_layout.row_stride:
-                raise ValueError(f"row images: {path} is {size} B, expected {layout.num_experts * image_layout.row_stride}")
+                raise ValueError(
+                    f"row images: {path} is {size} B, expected {layout.num_experts * image_layout.row_stride}"
+                )
             paths[layer].append(path)
         if first_digests is None:
             first_digests = digests
         elif digests != first_digests:
-            raise ValueError(f"row images at {where}: row digests differ from {row_image_dir(roots[0])}'s")
+            raise ValueError(
+                f"row images at {where}: row digests differ from {row_image_dir(roots[0])}'s"
+            )
     return RowImageSet(
         roots=tuple(roots),
         layout=image_layout,

@@ -253,8 +253,8 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   using namespace device::expert_stream;
   __shared__ int32_t sm_host[kLeaseLanes];
   __shared__ int32_t sm_dst[kLeaseLanes];
-  __shared__ uint32_t copying;  // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
-  __shared__ uint32_t cpu;      // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
+  __shared__ uint32_t copying;    // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
+  __shared__ uint32_t cpu;        // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
   __shared__ uint32_t cpu_parts;  // bit 0: a kHitCpu lane (output part 0); bit 1: a kMissCpu lane (part 1)
   const int64_t planned_count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
@@ -435,8 +435,9 @@ struct RowCopyKernel {
         .piece_runs = static_cast<const int32_t*>(piece_runs.data_ptr()),
         .row_capacity = expert_stream::checked_row_capacity(row_capacity),
     };
-    LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream).enable_pdl(use_pdl != 0)(
-        use_pdl != 0 ? exl3_ram_miss_lease_stream_kernel<true> : exl3_ram_miss_lease_stream_kernel<false>, params);
+    LaunchKernel(device::expert_stream::kStreamBlocks, device::expert_stream::kStreamThreads, stream)
+        .enable_pdl(use_pdl != 0)(
+            use_pdl != 0 ? exl3_ram_miss_lease_stream_kernel<true> : exl3_ram_miss_lease_stream_kernel<false>, params);
   }
 
   static void lease_copy_wait(
@@ -497,8 +498,10 @@ struct RowCopyKernel {
         .sm_count = sm_count,
         .ce_mask = static_cast<int32_t*>(ce_mask.data_ptr()),
     };
-    LaunchKernel(1, threads, stream).enable_pdl(use_pdl != 0)(
-        use_pdl != 0 ? exl3_ram_miss_lease_copy_wait_kernel<true> : exl3_ram_miss_lease_copy_wait_kernel<false>, params);
+    LaunchKernel(1, threads, stream)
+        .enable_pdl(use_pdl != 0)(
+            use_pdl != 0 ? exl3_ram_miss_lease_copy_wait_kernel<true> : exl3_ram_miss_lease_copy_wait_kernel<false>,
+            params);
     // The gate is not a counter, so the cyclic GEQ never wraps: an open word (29-bit seq << 2 | 1) is in [1, 2^31)
     // and passes, a closed word has bit 31 set and blocks. Captured as a memory-op node of the graph.
     const int r = expert_stream::stream_wait_value32()(

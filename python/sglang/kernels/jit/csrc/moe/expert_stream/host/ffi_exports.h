@@ -10,8 +10,8 @@
 #include "../tensor_checks.h"
 #include "build_policy.h"
 #include "core_topology.h"
-#include "row_reader.h"
 #include "ram_thread.h"
+#include "row_reader.h"
 
 namespace sglang::expert_stream {
 
@@ -57,7 +57,8 @@ struct HostExports {
     verify_named("slabs", TensorMatcher({L_, kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slabs);
     verify_named(
         "row_bytes", TensorMatcher({kNumNames<Layout>}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), row_bytes);
-    verify_named("buffer_regions", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), buffer_regions);
+    verify_named(
+        "buffer_regions", TensorMatcher({-1, 3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), buffer_regions);
   }
 
   static std::mutex& registry_mutex() {
@@ -133,7 +134,17 @@ struct HostExports {
     auto cpu = SymbolicDevice{};
     verify_named("runs", TensorMatcher({-1, -1, -1, -1, -1}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), runs);
     const Tables t = tables_from<Layout>(
-        extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images);
+        extents,
+        starts,
+        file_sizes,
+        segments,
+        slabs,
+        row_bytes,
+        buffer_regions,
+        paths,
+        source_paths,
+        slot_bytes,
+        row_images);
     const size_t count = t.segments.size();
     const size_t rows = static_cast<size_t>(t.layers * t.experts);
     if (runs.size(0) != t.layers || runs.size(1) != t.experts || runs.size(2) != kPieces ||
@@ -184,13 +195,15 @@ struct HostExports {
       TensorView hot_page) {
     using namespace host;
     // Records and map deltas carry expert ids and slots as i16 (lease_layout.h).
-    RuntimeCheck(starts.dim() == 2 && starts.size(1) <= kRecIdMax, "starts: records carry expert ids up to ", kRecIdMax);
+    RuntimeCheck(
+        starts.dim() == 2 && starts.size(1) <= kRecIdMax, "starts: records carry expert ids up to ", kRecIdMax);
     auto capacity_mem = SymbolicDevice{};
     verify_named(
         "capacity", TensorMatcher({starts.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(capacity_mem), capacity);
     for (int64_t row = 0; row < capacity.size(0); ++row)
       RuntimeCheck(
-          static_cast<const int64_t*>(capacity.data_ptr())[row] <= kRecIdMax, "capacity: records carry slots up to ",
+          static_cast<const int64_t*>(capacity.data_ptr())[row] <= kRecIdMax,
+          "capacity: records carry slots up to ",
           kRecIdMax);
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     // page, slot_map and lease are pinned (or not) together (ExpertStreamHost.__init__), so one SymbolicDevice
@@ -219,7 +232,17 @@ struct HostExports {
         static_cast<uint8_t*>(lease.data_ptr()),
         lease.size(0),
         tables_from<Layout>(
-            extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions, paths, source_paths, slot_bytes, row_images),
+            extents,
+            starts,
+            file_sizes,
+            segments,
+            slabs,
+            row_bytes,
+            buffer_regions,
+            paths,
+            source_paths,
+            slot_bytes,
+            row_images),
         std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
         direct != 0,
         hot_page.size(0) ? static_cast<uint8_t*>(hot_page.data_ptr()) : nullptr,
@@ -352,7 +375,8 @@ struct HostExports {
     config.x_stride = x_rows.size(1);
     config.out_base = static_cast<uint8_t*>(out_rows.data_ptr());
     config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
-    if (parts != 1 && parts != 2) throw std::runtime_error(error_prefix<Layout>() + "CPU experts write 1 or 2 output parts");
+    if (parts != 1 && parts != 2)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU experts write 1 or 2 output parts");
     if (out_rows.size(1) < parts * hidden)
       throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than its parts");
     config.out_part_stride = parts == 2 ? hidden * static_cast<int64_t>(sizeof(float)) : 0;
@@ -410,16 +434,30 @@ struct HostExports {
 
   // CPU experts' startup calibration (split_calibration.h): out float64 [10, 9] ms. The caller owns the tier.
   static void calibrate_cpu_split(
-      int64_t handle, int64_t row, int64_t device, int64_t reps, int64_t scratch, int64_t scratch_bytes,
-      int64_t timeout_ns, TensorView out) {
+      int64_t handle,
+      int64_t row,
+      int64_t device,
+      int64_t reps,
+      int64_t scratch,
+      int64_t scratch_bytes,
+      int64_t timeout_ns,
+      TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named(
         "out",
-        TensorMatcher({expert_stream::kCalibRows, expert_stream::kCalibCols}).with_dtype<double>().with_device<kDLCPU>(cpu),
+        TensorMatcher({expert_stream::kCalibRows, expert_stream::kCalibCols})
+            .with_dtype<double>()
+            .with_device<kDLCPU>(cpu),
         out);
     find(handle)->calibrate_cpu_split(
-        row, device, reps, static_cast<uint64_t>(scratch), scratch_bytes, timeout_ns, static_cast<double*>(out.data_ptr()));
+        row,
+        device,
+        reps,
+        static_cast<uint64_t>(scratch),
+        scratch_bytes,
+        timeout_ns,
+        static_cast<double*>(out.data_ptr()));
   }
 
   static void mapping(int64_t handle, int64_t row, TensorView out) {
@@ -516,7 +554,8 @@ struct HostExports {
     return find(handle)->trace_dropped();
   }
 
-  static void start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns, int64_t busy_poll) {
+  static void
+  start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns, int64_t busy_poll) {
     if (cpu_core >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
     if (cpu_core >= 64 && cpu_core <= 71) {
       throw std::runtime_error(
@@ -612,47 +651,47 @@ struct HostExports {
 }  // namespace sglang::expert_stream
 
 // One line per export; this list and ffi_test_exports.h's are the module's whole Python-visible surface.
-#define EXPERT_STREAM_HOST_EXPORTS(Exports)                                                             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_build_name, Exports::build_name);                         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_names, Exports::layout_names);                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_small_mask, Exports::layout_small_mask);           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_runs, Exports::piece_runs);                         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_open, Exports::open);                                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_close, Exports::close);                                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_contains, Exports::contains);                             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_touch, Exports::touch);                                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_assign, Exports::assign);                                 \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_release, Exports::release);                               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_begin, Exports::fill_begin);                         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_wait, Exports::fill_wait);                           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_landed, Exports::fill_landed);                       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_end, Exports::fill_end);                             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_close_admission, Exports::close_admission);               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_prefill_share, Exports::set_prefill_share);           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_copy_engine, Exports::enable_copy_engine);         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_copy_table, Exports::set_copy_table);                 \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_arm_copy_engine, Exports::arm_copy_engine);               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_cpu_experts, Exports::enable_cpu_experts);         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_reserve_staging, Exports::reserve_staging);                \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_bulk_delta_count, Exports::bulk_delta_count);             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_take_bulk_delta, Exports::take_bulk_delta);               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_expert_bytes, Exports::copy_expert_bytes);           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_calibrate_cpu_split, Exports::calibrate_cpu_split);       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_mapping, Exports::mapping);                               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_to_expert, Exports::slot_to_expert);                 \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lru_order, Exports::lru_order);                           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_hot, Exports::set_hot);                               \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_counters, Exports::counters);                             \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_core_counter_mask, Exports::core_counter_mask);           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layer_rows, Exports::layer_rows);                         \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_words, Exports::trace_words);                       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_enable, Exports::trace_enable);                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_drain, Exports::trace_drain);                       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_dropped, Exports::trace_dropped);                   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_start_thread, Exports::start_thread);                     \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_stop_thread, Exports::stop_thread);                       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause, Exports::pause);                                   \
+#define EXPERT_STREAM_HOST_EXPORTS(Exports)                                                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_build_name, Exports::build_name);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_names, Exports::layout_names);               \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_small_mask, Exports::layout_small_mask);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_runs, Exports::piece_runs);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_open, Exports::open);                               \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_close, Exports::close);                             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_contains, Exports::contains);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_touch, Exports::touch);                             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_assign, Exports::assign);                           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_release, Exports::release);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_begin, Exports::fill_begin);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_wait, Exports::fill_wait);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_landed, Exports::fill_landed);                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_fill_end, Exports::fill_end);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_close_admission, Exports::close_admission);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_prefill_share, Exports::set_prefill_share);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_copy_engine, Exports::enable_copy_engine);   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_copy_table, Exports::set_copy_table);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_arm_copy_engine, Exports::arm_copy_engine);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_enable_cpu_experts, Exports::enable_cpu_experts);   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_reserve_staging, Exports::reserve_staging);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_bulk_delta_count, Exports::bulk_delta_count);       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_take_bulk_delta, Exports::take_bulk_delta);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_expert_bytes, Exports::copy_expert_bytes);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_calibrate_cpu_split, Exports::calibrate_cpu_split); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_mapping, Exports::mapping);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_to_expert, Exports::slot_to_expert);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lru_order, Exports::lru_order);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_hot, Exports::set_hot);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_counters, Exports::counters);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_core_counter_mask, Exports::core_counter_mask);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layer_rows, Exports::layer_rows);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_words, Exports::trace_words);                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_enable, Exports::trace_enable);               \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_drain, Exports::trace_drain);                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_dropped, Exports::trace_dropped);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_start_thread, Exports::start_thread);               \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_stop_thread, Exports::stop_thread);                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause, Exports::pause);                             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_resume, Exports::resume);

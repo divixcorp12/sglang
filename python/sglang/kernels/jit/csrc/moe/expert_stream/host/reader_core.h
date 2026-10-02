@@ -3,17 +3,16 @@
 // descriptors, ring credit and banks.
 #pragma once
 
-#include <cstdio>
-#include <memory>
-#include <span>
-#include <type_traits>
-
 #include "../row_layout.h"
 #include "build_policy.h"
 #include "file_reader.h"
 #include "piece_geometry.h"
 #include "read_cuts.h"
 #include "uring_options.h"
+#include <cstdio>
+#include <memory>
+#include <span>
+#include <type_traits>
 
 namespace sglang {
 namespace expert_stream {
@@ -88,7 +87,8 @@ class ReaderCore {
   // Piece streaming (sub_reads_per_part(reading) sub-reads per reading part, per-piece vetting, packing and
   // publishing); off by default. Before open(), or on an idle reader after it (the tier sets it before its service
   // thread starts), since it resizes the descriptor arrays. Refused with more mirror parts than pieces (a reading part
-  // needs a piece of its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the row).
+  // needs a piece of its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the
+  // row).
   void set_piece_stream(bool on) {
     if (on) {
       derived().check_piece_stream_support();
@@ -159,9 +159,14 @@ class ReaderCore {
     faults_.stale_waiting = false;
     if (fault.generation_start != 0) generation_ = static_cast<uint32_t>(fault.generation_start);
     if constexpr (requires { io_.set_submit_fault(SubmitFault{}); }) {
-      io_.set_submit_fault(SubmitFault{
-          fault.submit_error, fault.submit_call, fault.submit_first, fault.submit_short_call, fault.ring_reset_fail,
-          fault.nop_flush_refused});
+      io_.set_submit_fault(
+          SubmitFault{
+              fault.submit_error,
+              fault.submit_call,
+              fault.submit_first,
+              fault.submit_short_call,
+              fault.ring_reset_fail,
+              fault.nop_flush_refused});
     } else if (
         fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0 ||
         fault.ring_reset_fail || fault.nop_flush_refused) {
@@ -299,22 +304,26 @@ class ReaderCore {
     if (fixed_reads() && leg_stride_ < std::max<size_t>(1, derived().max_iovecs()))
       throw std::logic_error(error_prefix<Layout>() + "a fixed read mode opened with one-leg storage");
     if (cuts_ && configured_queue_depth_ != 0) {
-      const unsigned scaled = static_cast<unsigned>(std::min<size_t>(
-          32768, static_cast<size_t>(kQueueDepth) * static_cast<size_t>(t_.parts) * leg_stride_));
+      const unsigned scaled = static_cast<unsigned>(
+          std::min<size_t>(32768, static_cast<size_t>(kQueueDepth) * static_cast<size_t>(t_.parts) * leg_stride_));
       if (configured_queue_depth_ < scaled)
         std::fprintf(
             stderr,
             "expert stream io_uring: read cuts: SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=%u is below the cut default %u "
             "(16 x %zu parts x %u legs): fewer reads fit in flight than uncut\n",
-            configured_queue_depth_, scaled, static_cast<size_t>(t_.parts), leg_stride_);
+            configured_queue_depth_,
+            scaled,
+            static_cast<size_t>(t_.parts),
+            leg_stride_);
     }
     if ((fixed_reads() || cuts_) && queue_depth() < leg_stride_) {
       throw std::runtime_error(
           error_prefix<Layout>() + "reads fanned out or cut into legs need a queue depth of at least " +
-          std::to_string(leg_stride_) + " (the widest read's legs); SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=" +
-          std::to_string(queue_depth()));
+          std::to_string(leg_stride_) +
+          " (the widest read's legs); SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH=" + std::to_string(queue_depth()));
     }
-    if constexpr (requires(Reader& reader, const std::vector<int>& files, const std::vector<RegisteredRegion>& buffers) {
+    if constexpr (requires(
+                      Reader& reader, const std::vector<int>& files, const std::vector<RegisteredRegion>& buffers) {
                     reader.configure_resources(files, buffers, true);
                   }) {
       io_.configure_resources(fds_, derived().registered_regions(), direct_);
@@ -530,9 +539,9 @@ class ReaderCore {
     int64_t expected = 0;
     uint32_t generation = 0;  // 0: retired, no completion may name it
     int32_t retries = 0;
-    int32_t slot = -1;        // bounce slot: bank * kBounceRows + row within the bank
-    int32_t trace_slot = -1;  // index into the record's extent arrays, -1 when not stamped
-    int32_t sub = 0;          // piece streaming: the sub-read's ordinal in its row's file order
+    int32_t slot = -1;          // bounce slot: bank * kBounceRows + row within the bank
+    int32_t trace_slot = -1;    // index into the record's extent arrays, -1 when not stamped
+    int32_t sub = 0;            // piece streaming: the sub-read's ordinal in its row's file order
     uint8_t legs = 0;           // planned legs (legs_[index * leg_stride_ ...]); 0: not yet prepared
     uint8_t legs_inflight = 0;  // legs prepared and not yet reaped
     bool queued = false;        // in queue_ (or about to be, through again_): a descriptor is queued at most once
@@ -597,14 +606,14 @@ class ReaderCore {
   struct FaultState {
     ReadFault fault{};
     bool part_fired = false;
-    int64_t retired = 0;          // extents retired (the stale_cqe_call fault counts them)
+    int64_t retired = 0;  // extents retired (the stale_cqe_call fault counts them)
     Completion stale{0, 0};
     uint32_t stale_index = 0;
-    bool stale_waiting = false;   // a retired completion is held until its descriptor is recycled
-    bool stale_armed = false;     // ... and has been: deliver it with the next reap
-    int64_t publishes = 0;        // pieces published over the reader's life (the publish_twice fault counts them)
+    bool stale_waiting = false;  // a retired completion is held until its descriptor is recycled
+    bool stale_armed = false;    // ... and has been: deliver it with the next reap
+    int64_t publishes = 0;       // pieces published over the reader's life (the publish_twice fault counts them)
     std::vector<SqeRecord>* sqe_log = nullptr;  // set_sqe_log
-    std::vector<Completion> held;  // completions withheld from the reader (hold_ordinal)
+    std::vector<Completion> held;               // completions withheld from the reader (hold_ordinal)
   };
   struct NoFaultState {};
 
@@ -639,8 +648,8 @@ class ReaderCore {
     const PiecePublish* publish = nullptr;  // piece streaming: where the owner publishes (null: nowhere)
     int soft_errors = 0;
     int64_t submitted = 0, first_seen = 0, last_seen = 0;
-    int64_t events = 0;      // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
-    size_t published = 0;    // piece streaming: pieces published so far (the last_publish_delay_ns fault)
+    int64_t events = 0;    // piece streaming: sub-read landings and piece vettings so far (the trace's sequence)
+    size_t published = 0;  // piece streaming: pieces published so far (the last_publish_delay_ns fault)
   };
 
   // Runs `f` on this read's stage record, if it has one. ProdBuild compiles every call to nothing.
@@ -661,7 +670,7 @@ class ReaderCore {
   }
 
   // A diagnostic counter's value: 0 in ProdBuild, which keeps none.
-  int64_t metric(int64_t ReaderMetrics::*field) const {
+  int64_t metric(int64_t ReaderMetrics::* field) const {
     if constexpr (Build::kMetrics) {
       return metrics_.*field;
     } else {
@@ -671,7 +680,7 @@ class ReaderCore {
   }
 
   // Adds to a diagnostic counter; ProdBuild compiles it to nothing.
-  void add_metric(int64_t ReaderMetrics::*field, int64_t n = 1) {
+  void add_metric(int64_t ReaderMetrics::* field, int64_t n = 1) {
     if constexpr (Build::kMetrics) {
       metrics_.*field += n;
     } else {
@@ -735,8 +744,8 @@ class ReaderCore {
     if (want > kMaxLegs) {
       throw std::runtime_error(
           error_prefix<Layout>() + "reads cut at " + std::to_string(min_cut_bytes()) + " B need up to " +
-          std::to_string(want) + " legs, more than " + std::to_string(kMaxLegs) + "; the cut is too small for reads of " +
-          std::to_string(longest_read()) + " B");
+          std::to_string(want) + " legs, more than " + std::to_string(kMaxLegs) +
+          "; the cut is too small for reads of " + std::to_string(longest_read()) + " B");
     }
     leg_stride_ = static_cast<unsigned>(want);
     iov_stride_ = iovecs + (cuts_ ? leg_stride_ : 0);
@@ -859,7 +868,13 @@ class ReaderCore {
     runs[0] = CutLeg{0, count, d.read->length, false};
     if (cuts_) {
       run_count = cut_legs(
-          iov, count, limits_[d.read->file], iov_scratch_.data(), static_cast<unsigned>(iov_stride_), runs, leg_stride_);
+          iov,
+          count,
+          limits_[d.read->file],
+          iov_scratch_.data(),
+          static_cast<unsigned>(iov_stride_),
+          runs,
+          leg_stride_);
       if (run_count > leg_stride_)
         throw std::logic_error(error_prefix<Layout>() + "a read needs more legs than open() sized");
       count = runs[run_count - 1].first + runs[run_count - 1].count;
@@ -882,10 +897,18 @@ class ReaderCore {
         if (fixed_reads()) k = io_.fixed_legs(iov + runs[r].first, runs[r].count, parts);
       }
       for (unsigned l = 0; l < k; ++l) {
-        if (n == leg_stride_) throw std::logic_error(error_prefix<Layout>() + "a read needs more legs than open() sized");
+        if (n == leg_stride_)
+          throw std::logic_error(error_prefix<Layout>() + "a read needs more legs than open() sized");
         const int64_t bytes = static_cast<int64_t>(parts[l].bytes);
-        legs[n++] = Leg{start, bytes, std::clamp<int64_t>(d.expected - start, 0, bytes), 0,
-                        runs[r].first + parts[l].first, parts[l].count, parts[l].buffer, LegState::Idle};
+        legs[n++] =
+            Leg{start,
+                bytes,
+                std::clamp<int64_t>(d.expected - start, 0, bytes),
+                0,
+                runs[r].first + parts[l].first,
+                parts[l].count,
+                parts[l].buffer,
+                LegState::Idle};
         start += bytes;
       }
     }
@@ -1106,7 +1129,7 @@ class ReaderCore {
         const int64_t trace_slot = t.extents++;
         if (trace_slot < kTraceExtents) {
           t.extent_id[trace_slot] = (static_cast<int64_t>(ordinal) << 16) | (static_cast<int64_t>(g.k[s]) << 8) |
-                                           static_cast<int64_t>(g.part[s]);
+                                    static_cast<int64_t>(g.part[s]);
           d.trace_slot = static_cast<int32_t>(trace_slot);
         } else {
           ++t.extents_untraced;
@@ -1262,9 +1285,8 @@ class ReaderCore {
   // The default opcodes: the bounce path IORING_OP_READ (prep_read; one leg, one iovec), the direct path
   // IORING_OP_READV (prep_readv).
   bool prep_default(int fd, const iovec* iov, unsigned count, uint64_t offset, uint64_t tag) {
-    return Derived::kScatter
-               ? io_.prep_readv(fd, iov, count, offset, tag)
-               : io_.prep_read(fd, iov[0].iov_base, static_cast<unsigned>(iov[0].iov_len), offset, tag);
+    return Derived::kScatter ? io_.prep_readv(fd, iov, count, offset, tag)
+                             : io_.prep_read(fd, iov[0].iov_base, static_cast<unsigned>(iov[0].iov_len), offset, tag);
   }
 
   // Submit, wait for a completion only when `ready` is false, then drain the CQ before processing
@@ -1277,7 +1299,9 @@ class ReaderCore {
         return;
       }
     }
-    on_trace([&](StageRecord& t) { if (c.submitted == 0) c.submitted = trace_stamp(); });
+    on_trace([&](StageRecord& t) {
+      if (c.submitted == 0) c.submitted = trace_stamp();
+    });
     unsigned wait_nr = ready ? 0u : 1u;
     if constexpr (Build::kFaults) {
       // Fault: reversing only reorders one reaped batch, so wait for every read in flight; otherwise whether

@@ -1,12 +1,12 @@
 // AsyncFileReader over one io_uring ring shared by every model file.
 #pragma once
 
+#include <sys/resource.h>
+
 #include "../../../io/registered_buffers.h"  // relative: the JIT build does not put jit/csrc on the include path
 #include "build_policy.h"
 #include "file_reader.h"
 #include "uring_options.h"
-#include <sys/resource.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -308,7 +308,8 @@ class BasicUringReader {
     if (fixed_reads())
       throw std::runtime_error(
           std::string("expert stream io_uring: the kernel refused the NOP drain of unconsumed reads (") +
-          std::strerror(-refused) + "); re-registering the fixed buffers would exceed the watchdog's fatal_wait, so "
+          std::strerror(-refused) +
+          "); re-registering the fixed buffers would exceed the watchdog's fatal_wait, so "
           "the reader is closed instead of resetting its ring");
     // Without registered buffers the reset is cheap (at most the fixed file table).
     // A failed reset leaves the reader closed (ready() false, so a later read() returns 0 and close() has nothing
@@ -393,8 +394,8 @@ class BasicUringReader {
       // Explicit registration options refuse too, never quietly: the ring's own memory can be charged to the memlock
       // limit (RLIMIT_MEMLOCK=0 refuses it with ENOMEM on 6.12), the same limit registration is charged to.
       if (fixed_reads() || options_.fixed_files) {
-        const std::string operation = "creating the ring for registered buffers or files (RLIMIT_MEMLOCK=" +
-                                      memlock_limit() + ")";
+        const std::string operation =
+            "creating the ring for registered buffers or files (RLIMIT_MEMLOCK=" + memlock_limit() + ")";
         error(operation.c_str(), rc);
       }
       return false;
@@ -468,9 +469,9 @@ class BasicUringReader {
       bytes += r.bytes;
     const std::string memlock = memlock_limit();
     throw std::runtime_error(
-        "expert stream registering fixed buffers (regions=" + std::to_string(regions_.size()) +
-        ", chunks=" + std::to_string(chunks) + ", bytes=" + std::to_string(bytes) + ", largest=" +
-        std::to_string(largest) + ", cap=" + std::to_string(chunk_cap_) + ", RLIMIT_MEMLOCK=" + memlock + "): " + why);
+        "expert stream registering fixed buffers (regions=" + std::to_string(regions_.size()) + ", chunks=" +
+        std::to_string(chunks) + ", bytes=" + std::to_string(bytes) + ", largest=" + std::to_string(largest) +
+        ", cap=" + std::to_string(chunk_cap_) + ", RLIMIT_MEMLOCK=" + memlock + "): " + why);
   }
   static std::string memlock_limit() {
     rlimit limit{};
