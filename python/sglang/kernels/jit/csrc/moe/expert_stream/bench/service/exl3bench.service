@@ -1,5 +1,5 @@
 [Unit]
-Description=Benchmarks on an isolated CPU partition (CPUs 18-33 and siblings 54-69)
+Description=Benchmarks on an isolated CPU partition (CPUs 16-33 and siblings 52-69)
 StartLimitIntervalSec=0
 
 [Service]
@@ -7,7 +7,7 @@ Type=exec
 User=dnikolaidis
 Group=dnikolaidis
 Slice=-.slice
-AllowedCPUs=18-33 54-69
+AllowedCPUs=16-33 52-69
 AllowedMemoryNodes=0-1
 CPUAccounting=yes
 ExecStartPre=+/usr/local/libexec/exl3bench-isolation start

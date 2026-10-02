@@ -119,3 +119,66 @@ as in the previous experiments. This migration does not establish a new speedup.
 
 Google Benchmark reference:
 https://github.com/google/benchmark/blob/v1.9.4/docs/user_guide.md
+
+Full-stack bench
+----------------
+exl3_full_stack_prod and exl3_full_stack_instr time the CPU-expert path above the kernel: a writer thread (the GPU's
+stand-in) posts CPU-hit requests into the lease lanes; the real RamTier, RamThread (busy-polling), copy engine (host
+backend) and CPU expert engine serve them with the optimized kernel; the writer spins on CopyDone. Design:
+docs/superpowers/specs/2026-10-01-expert-stream-full-stack-bench-design.md.
+
+Build (needs the tvm_ffi package's headers and liburing; the targets exist only with EXL3_TVM_FFI_ROOT):
+  cmake -S "$bench" -B "$build" -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-15/root/usr/bin/g++ \
+    -DEXL3_TORCH_ROOT=/data/models/slang/.venv/lib/python3.13/site-packages/torch \
+    -DEXL3_TVM_FFI_ROOT=/data/models/slang/.venv/lib/python3.13/site-packages/tvm_ffi
+  cmake --build "$build" -j16 --target exl3_full_stack_prod exl3_full_stack_instr
+
+Placement (defaults; all options):
+  --writer-cpu=16    the writer, node 0; the request page and lease block are first-touched there
+  --service-cpu=17   RamThread, busy-polling, its physical core to itself
+  --copy-cpu=52      the copy thread and the watchdog (the writer's SMT sibling)
+  --cpus=18-33       CPU expert worker 0 (the CPU expert thread) and the kernel's 15 helpers, node 1; slabs, x and
+                     outputs are first-touched there
+  --host-node=0 --worker-node=1   the nodes the runner requires; anything else is refused before setup
+Run inside exl3bench.service (partition 16-33,52-69, service/README.txt). Off the partition, use another placement,
+for example --writer-cpu=0 --service-cpu=1 --copy-cpu=36 --cpus=2-15 --host-node=0 --worker-node=0 under
+taskset -c 0-15,36: correct, but not a measurement.
+
+Row images: --image-dir (default /data/models/exl3_exp/google_benchmark/full-stack-images) must accept O_DIRECT.
+The first run writes eight layer files (~533 MB) and a .stamp each; later runs reuse files whose stamp names the same
+fixture (path, size, mtime) and image size.
+
+Order: every bare forward runs before the stack exists. The CPU expert thread polls worker 0's core almost
+continuously and the kernel runs every caller on that core, and the kernel's OpenMP team is per calling thread, so
+the bare phase fills the slots from the row images (expert e in slot e), then frees its team; the stack is built
+after it and loads every expert through the tier's reader, refusing unless the tier picks the same slots. BM_bare is
+registered before BM_stack; under --benchmark_enable_random_interleaving, a BM_bare run once the stack exists fails.
+
+Checks: --validate-only compares all 24 layer outputs bare, then all 24 through the stack, bit-exactly with
+reference-e{1,3,5}.bin, and requires every thread created during setup to be pinned to its CPU. In a timed run, each
+benchmark compares its 8 outputs before and after it is timed; BM_stack also requires one CPU job of k lanes per call,
+no row read and no overrun; the thread check runs at the end. --self-test (no fixture; run under taskset -c 0-15,
+defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 --cpus=3) checks the writer's records and lane typing against
+ram_slot_map.type_lanes and drives the real stack with a fake forward.
+
+Benchmarks, per k in 1, 3, 5 (experts 0..k-1, cpu_forward.cpp's weights, 8 layers rotated):
+  BM_bare/experts:k   the C ABI forward, called from worker 0's CPU, on the stack's handles, slots, x and output
+  BM_stack/experts:k  x store, record, gate close, spin until CopyDone == G; t0 before the x store, t1 at CopyDone
+Counters: p50_us, p95_us, p99_us per call; BM_stack adds overhead_p50_us = its p50 - BM_bare's p50 (same process,
+same k). The instr build adds, as p50/p95:
+  pickup_us   observed - t0           (the record reaching the service)
+  service_us  done - observed         (the service handling the record and submitting the CPU job)
+  forward_us  the CPU expert thread's forward time for the call
+  handoff_us  (t1 - done) - forward   (CPU job queue, done word, copy thread, CopyDone, the writer's poll)
+Fidelity: the writer's stores reach the service by coherence between two node-0 cores, not by PCIe/DDIO; pickup is a
+lower bound on the GPU path's. The prod build's numbers are the headline; instr's carry the trace's cost.
+
+Run (from the service: write the job, then start the service):
+  printf '%s\n' /bin/bash "$bench/run_full_stack.sh" \
+    /data/models/exl3_exp/google_benchmark/full-stack-build \
+    > /data/models/exl3_exp/google_benchmark/service-command.txt
+run_full_stack.sh BUILD_DIR [NEW_RESULTS_DIR] [options...] alternates prod/instr processes over EXL3_BENCH_ROUNDS
+rounds (default 8), 512 calls per benchmark, writes environment.txt, logs, Google JSON and status.txt, and exits 1
+when any process failed. Without NEW_RESULTS_DIR it writes to EXL3BENCH_RESULTS (the service's directory).
+Do not run it while a production server uses CPUs 16-33.

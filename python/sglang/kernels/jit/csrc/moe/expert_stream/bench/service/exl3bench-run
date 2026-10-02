@@ -7,7 +7,7 @@ set -euo pipefail
     echo 'Launcher must run within exl3bench.service.' >&2; exit 1;
 }
 cg=/sys/fs/cgroup/exl3bench.service
-cpus=18-33,54-69
+cpus=16-33,52-69
 [[ $(< "$cg/cpuset.cpus.partition") == isolated ]]
 [[ $(< "$cg/cpuset.cpus.effective") == "$cpus" ]]
 [[ $(< "$cg/cpuset.mems.effective") == 0-1 ]]
