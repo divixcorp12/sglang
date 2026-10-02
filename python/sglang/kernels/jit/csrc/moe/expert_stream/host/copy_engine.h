@@ -1,4 +1,16 @@
-// The copy engine: CopyLane through CopyEngine (LEASE_PROTOCOL.md, "Copy engine").
+// The copy engine: moves host-resident expert rows into device slots with DMA, off the decode stream.
+//
+// The RAM-miss service turns each lease record's host lanes into one CopyJob and submits it to CopyEngine, whose copy
+// thread issues the job's copies through a CopyBackend, marks the point after them, and reports completion back to
+// the service (which publishes CopyDone and opens the decode stream's copy gate). Lanes computed by the CPU expert
+// engine instead of copied ride in the same job, so one completion covers every host lane of a record.
+//
+//   CopyLane / CopyJob   one record's host lanes, service -> copy thread
+//   CopyEntry            one (source slab, destination tensor, bytes) entry of a row's copy table
+//   CopyBackend          the copy primitive: CudaCopyBackend in production, HostCopyBackend in CPU tests
+//   CopyEngine           the copy thread, its job ring and its in-flight FIFO
+//
+// See analysis/dsv41-drive/LEASE_PROTOCOL.md, "Copy engine".
 #pragma once
 
 #include "../lease_layout.h"
@@ -13,15 +25,22 @@ namespace expert_stream {
 
 using namespace ::sglang::expert_stream::wire;
 
+// One host lane of a record: copy host slot `host_slot` into device slot `dst_slot`, or, for a CPU lane, compute it.
 struct CopyLane {
   int32_t lane = 0;
   int32_t host_slot = 0;
   int32_t dst_slot = 0;
-  float weight = 0.0f;  // the lane's routing weight: read only for a CPU lane
+  float weight = 0.0f;  // routing weight; read only for a CPU lane
 };
 
-// One record's host lanes, handed from the service to the copy thread at record time: copy-engine hits (DMA) and CPU
-// hits (part 0), plus a count of CPU misses (part 1), which the service submits to the CPU expert thread as they land.
+// One record's host lanes, submitted by the service to the copy thread when the record is served.
+//
+// A job carries three kinds of lane:
+//   - copy-engine hits: copied by DMA;
+//   - CPU hits (`cpu_mask`, kKindHitCpu): computed by the CPU expert engine as one job, sequence `cpu_seq`;
+//   - CPU misses (`late_cpu`, kKindMissCpu): computed as their rows land; `late_seq` is the last such CPU job.
+// The job completes when its copies and every CPU job of the record are done, so a single CopyDone covers every host
+// lane. `cpu_seq` is read only when `cpu_mask` is set, `late_seq` only when `late_cpu` is.
 struct CopyJob {
   uint64_t gen = 0;
   int64_t idx = 0;
@@ -30,57 +49,68 @@ struct CopyJob {
   int count = 0;
   CopyLane lanes[kLeaseLanes];
   int64_t submit_ns = 0;
-  int64_t token = -1;  // the backend's completion marker after the job's last copy (CUDA: the job's sequence)
-  // Its row has SM entries (set at issue): CW copies those tensors itself, so the DMA skips them.
-  bool sm = false;
-  // CPU experts (kKindHitCpu): the lanes of `mask` the CPU expert thread computes instead of copying, and that
-  // engine's job sequence for them (claimed by the service; read only with cpu_mask). `token` is kNoToken when no lane
-  // was copied.
+  int64_t token = -1;  // backend marker after the last copy; kNoToken if none
+  bool sm = false;     // the row has SM entries: the copy wait copies those, so the DMA skips them
   uint32_t cpu_mask = 0;
   uint32_t cpu_seq = 0;
-  // kKindMissCpu lanes: how many, and the sequence the service claimed for the last of their CPU jobs (read only with
-  // late_cpu). The job completes when its copies and every CPU job of the record have; CopyDone then covers every
-  // host lane.
   int late_cpu = 0;
   uint32_t late_seq = 0;
 };
 
-// CopyJob::token of a job that issued no copy (every lane on the CPU): nothing to query.
+// CopyJob::token of a job that issued no copy (every lane on the CPU): there is nothing to query.
 constexpr int64_t kNoToken = -1;
 
-// One entry of a row's copy table: C1's (source slab, destination tensor, row bytes); lane rows index both.
+// One entry of a row's copy table: a source slab, a destination tensor and the bytes of one expert row in each.
+// A lane's host slot indexes the source and its device slot the destination.
 struct CopyEntry {
   uint64_t src = 0;
   uint64_t dst = 0;
   int64_t bytes = 0;
-  bool sm = false;  // SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES: the copy wait reads it, not the DMA
+  bool sm = false;  // copied by the copy wait's SM reads, not the DMA (SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES)
 };
 
-// What the copy thread drives: issue copies in order, mark the point after them, and ask whether a mark is complete.
-// Every call is made on the copy thread only.
+// The copy primitive the copy thread drives: issue copies in order, mark the point after them, and ask whether a
+// mark has completed. Every call is made on the copy thread.
 class CopyBackend {
  public:
   static constexpr int kDone = 0;
   static constexpr int kPending = 1;
   virtual ~CopyBackend() = default;
-  virtual std::string init() = 0;                                    // empty on success
-  virtual int issue(uint64_t dst, uint64_t src, int64_t bytes) = 0;  // 0 or an error code
+  // Prepares the backend on the copy thread. Returns an empty string on success, else the reason it refused.
+  virtual std::string init() = 0;
+  // Queues one copy after every earlier one. Returns 0 or an error code.
+  virtual int issue(uint64_t dst, uint64_t src, int64_t bytes) = 0;
+  // Marks the point after every copy issued so far and stores its token. Returns 0 or an error code.
   virtual int mark(int64_t* token) = 0;
-  virtual int query(int64_t token) = 0;  // kDone, kPending, or an error code (negative for the host backend)
+  // Returns kDone, kPending, or an error code (negative for the host backend).
+  virtual int query(int64_t token) = 0;
+  // Releases the backend's resources if `idle`; otherwise keeps them, since a copy may still be in flight.
   virtual void shutdown(bool idle) = 0;
 };
 static_assert(CompletionWord::kDone == CopyBackend::kDone && CompletionWord::kPending == CopyBackend::kPending);
 
-// The CUDA driver, resolved from libcuda.so.1 when the copy engine is enabled, so this module still builds and loads
-// without a CUDA toolkit. Per job it calls cuMemcpyAsync per copy and one cuStreamWriteValue32_v2 of the job's
-// sequence number into the completion word (completion_word.h) on its own non-blocking stream; it polls with plain
-// acquire loads of that word, plus one cuStreamQuery per CompletionWord budget while a job is pending. Nothing waits
-// on another stream, a graph launch or the device (no synchronize, no module load, no allocation per job).
+// The production backend: CUDA driver copies on a private stream, completion tracked by a host-mapped word.
 //
-// No fallback: the production recipe needs the copy engine, so init() refuses (and the copy engine's start() throws)
-// when the v2 write-value op cannot be resolved, errors, or its first write does not reach the word; and when the v2
-// wait-value op, which the decode stream's copy wait needs on host-mapped memory (LEASE_PROTOCOL.md, "Copy engine"),
-// cannot be resolved, errors, does not hold its stream, or is not released by a host store.
+// Per job it issues one cuMemcpyAsync per copy, then one cuStreamWriteValue32_v2 of the job's sequence number into
+// the completion word (completion_word.h). query() is a plain acquire load of that word, plus one cuStreamQuery per
+// CompletionWord budget while a job stays pending. Nothing waits on another stream, a graph launch or the device: no
+// synchronize, no module load and no allocation per job.
+//
+// Design choices:
+//   - The driver is resolved from libcuda.so.1 at init(), so the module builds and loads without a CUDA toolkit.
+//   - The v2 stream memory ops, never the plain names: the plain names are the v1 API, gated by
+//     NVreg_EnableStreamMemOPs (its device attribute reads 0 on the reference machine while the v2 ops work;
+//     analysis/dsv41-drive/hotpath/results.md section 9b).
+//   - The stream has the greatest priority, for a hardware queue of its own. Streams share
+//     CUDA_DEVICE_MAX_CONNECTIONS queues (the server sets 8) and a queue runs in order, so a copy queued behind a
+//     stream whose head waits on the decode graph could not start until the copy wait gave up: a deadlock only its
+//     timeout breaks. Measured with analysis/dsv41-drive/copy-engine/hol_probe.py: a fresh default-priority stream
+//     waited 596 ms behind 8 blocked ones; greatest-priority copies never waited, with up to 64 blocked.
+//   - No fallback. The production recipe needs the copy engine, so init() refuses when the write-value op is missing,
+//     errors or never reaches the word, and when the wait-value op (which the decode stream's copy wait uses on
+//     host-mapped memory) is missing, errors, does not hold its stream, or is not released by a host store.
+//
+// The class is used only on the copy thread.
 class CudaCopyBackend : public CopyBackend {
  public:
   CudaCopyBackend(int device, std::string prefix) : device_(device), prefix_(std::move(prefix)) {}
@@ -107,24 +137,18 @@ class CudaCopyBackend : public CopyBackend {
     get(cu_mem_host_alloc_, "cuMemHostAlloc");
     get(cu_mem_host_device_ptr_, "cuMemHostGetDevicePointer_v2");
     get(cu_mem_free_host_, "cuMemFreeHost");
-    // The v2 stream memory op, never the plain name: that is the v1 API, gated by NVreg_EnableStreamMemOPs (its _V1
-    // device attribute reads 0 on divix01, while the v2 ops work; results.md 9b).
-    get(cu_write_value32_, "cuStreamWriteValue32_v2");
+    get(cu_write_value32_, "cuStreamWriteValue32_v2");  // v2 only: see the class comment
     get(cu_wait_value32_, "cuStreamWaitValue32_v2");
     if (!missing.empty()) return "libcuda.so.1 lacks " + missing + ", which the copy engine needs";
     if (int r = cu_init_(0)) return "cuInit failed: " + std::to_string(r);
     if (int r = cu_device_get_(&cu_device_, device_)) return "cuDeviceGet failed: " + std::to_string(r);
-    // The primary context: the one PyTorch uses, so the slabs' registrations and the destinations are valid here.
+    // PyTorch's primary context, so the slabs' registrations and the destination tensors are valid here.
     if (int r = cu_primary_retain_(&context_, cu_device_))
       return "cuDevicePrimaryCtxRetain failed: " + std::to_string(r);
     retained_ = true;
     if (int r = cu_ctx_set_current_(context_)) return "cuCtxSetCurrent failed: " + std::to_string(r);
     constexpr unsigned kNonBlocking = 1;  // CU_STREAM_NON_BLOCKING: no implicit sync with the legacy stream
-    // The greatest priority, for a hardware queue of its own. Streams share CUDA_DEVICE_MAX_CONNECTIONS queues (the
-    // server sets 8) and a queue runs in order, so a copy queued behind a stream whose head waits on the decode graph
-    // cannot start until CW gives up: a deadlock only the copy-wait timeout breaks. hol_probe.py (raw streams): a fresh
-    // default-priority stream waited 596 ms behind 8 blocked ones; greatest-priority kernels and copies never waited,
-    // with up to 64 blocked. sglang creates no other greatest-priority stream.
+    // Greatest priority, for a hardware queue of its own: see the class comment.
     int least = 0;
     int greatest = 0;
     if (int r = cu_priority_range_(&least, &greatest))
@@ -140,7 +164,7 @@ class CudaCopyBackend : public CopyBackend {
     return cu_memcpy_async_(dst, src, static_cast<size_t>(bytes), stream_);
   }
 
-  // The job's token is its sequence number, written into the word after the job's copies (stream order).
+  // The token is the job's sequence number, written into the completion word after the job's copies.
   int mark(int64_t* token) override {
     const uint32_t seq = ++marked_;
     *token = seq;
@@ -151,9 +175,9 @@ class CudaCopyBackend : public CopyBackend {
     return word_.poll(static_cast<uint32_t>(token), [this] { return cu_stream_query_(stream_); });
   }
 
-  // The word's final value is the exact number of jobs the stream completed (the Task P2 job count). After an error,
-  // or with copies in flight, keep the stream, word and context: a copy may still read a slab, the stream may still
-  // write the word.
+  // Logs the completion word's final value, which is the exact number of jobs the stream completed. Frees the stream,
+  // word and context only if `idle`: after an error, or with copies in flight, a copy may still read a slab and the
+  // stream may still write the word.
   void shutdown(bool idle) override {
     if (word_host_ != nullptr) {
       std::fprintf(
@@ -171,8 +195,8 @@ class CudaCopyBackend : public CopyBackend {
   }
 
  private:
-  // One host-mapped pinned word, then a first write through the stream, waited for here (start-up only; a bounded
-  // poll with a sleep, no clock): an op the driver rejects, or a write that never lands, refuses the start.
+  // Allocates the host-mapped completion word and waits (up to about a second) for a first write through the stream
+  // to land in it. Returns the reason if the driver rejects the op or the write never arrives. Start-up only.
   std::string init_word() {
     constexpr unsigned kDeviceMap = 2;  // CU_MEMHOSTALLOC_DEVICEMAP
     void* host = nullptr;
@@ -200,10 +224,9 @@ class CudaCopyBackend : public CopyBackend {
     return "";
   }
 
-  // The copy wait's primitive, tried once on this stream at start-up (a bounded poll, as init_word): a wait on a
-  // host-mapped word must hold the stream until a host store satisfies it, then complete. The decode stream's gate
-  // is the same kind of memory and the same op, so a device or driver without it is refused here, not found by a
-  // decode that never ends.
+  // Tries the copy wait's primitive once on this stream: a wait on a host-mapped word must hold the stream until a
+  // host store satisfies it, then complete. The decode stream's gate uses the same op on the same kind of memory, so
+  // a driver without it is refused here instead of hanging the first decode. Start-up only.
   std::string probe_stream_wait() {
     constexpr unsigned kDeviceMap = 2;  // CU_MEMHOSTALLOC_DEVICEMAP
     constexpr unsigned kGeq = 0;        // CU_STREAM_WAIT_VALUE_GEQ
@@ -272,15 +295,18 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_wait_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 
-// The copy engine's queues (spec A7/A8): the service's job ring and the copy thread's in-flight FIFO. A
-// record with host lanes is waited on by the device, so at most one job is outstanding per armed chain and none fills.
+// Capacity of the copy engine's two queues: the service's job ring and the copy thread's in-flight FIFO. The device
+// waits on every record with host lanes, so at most one job per demand record is outstanding and neither queue fills.
 constexpr size_t kCopyRing = 32;
 static_assert(kCopyRing > kDemandRecords, "the copy engine's queues hold every job that can be outstanding");
 
-// Test only (CPU): "copies" between host buffers. A mark completes only once the test has released it, and its
-// copies land then (in query(), on the copy thread, in mark order: one stream), so a CopyDone published before its
-// release is visible as bytes that are not there yet. issue, mark and query run on the copy thread; release, fail and
-// marked on a test thread, through atomics only: no lock, and no allocation after construction (plan Task 12, F13).
+// A CPU-only test backend: "copies" between host buffers, completed only when the test releases them.
+//
+// A mark's copies land when it is released, in query(), in mark order (one stream). A CopyDone published before its
+// release therefore shows up as bytes that are not there yet, which is what the ordering tests look for.
+//
+// issue, mark and query run on the copy thread; release, fail and marked on a test thread. The two sides share only
+// atomics: no lock, and no allocation after construction, so the backend cannot hide a race the CUDA one would show.
 class HostCopyBackend : public CopyBackend {
  public:
   // A mark's slot is reused kMarks marks later. A mark is open or in flight only while its job is (kCopyRing at most),
@@ -328,8 +354,8 @@ class HostCopyBackend : public CopyBackend {
 
   void shutdown(bool) override {}
 
-  // Lets `marks` more marks complete; negative: every mark, from now on (a standing budget, so a release made before
-  // the copy thread has marked still counts).
+  // Lets `marks` more marks complete, or every mark from now on if negative. The budget is standing, so a release
+  // made before the copy thread marks still counts.
   void release(int64_t marks) {
     int64_t seen = released_.load(std::memory_order_relaxed);
     int64_t next = 0;
@@ -362,27 +388,30 @@ class HostCopyBackend : public CopyBackend {
   std::atomic<bool> fail_query_{false};
 };
 
-// The copy thread: issues each job's copies on the backend's stream, records one mark after them, polls marks in
-// order and hands each completed job to its owner. A backend error hands the job to the owner's copy_failed, which
-// fails stop: nothing it issued may be assumed complete.
+// The copy thread: issues each job's copies, marks the point after them, polls marks oldest first and hands each
+// completed job back to its owner.
 //
-// `Build`: the tier's build policy (build_policy.h). `Owner`: the RamTier, which befriends this class. Its hooks,
-// all called on the copy thread (copy_failed also on the submitting thread, for a ring overflow):
-//   - void copy_completed(const CopyJob&): the job's copies and CPU jobs completed: CopyDone and the gate;
-//   - void copy_failed(const CopyJob&, int error): completion cannot be established; fail stop;
-//   - owner->template copy_count<K>(n): the copy thread's counters.
+// Template parameters:
+//   - `Build`: the tier's build policy (build_policy.h); metrics and fault injection compile in only where it says.
+//   - `Owner`: the RamTier, which befriends this class and provides, all called on the copy thread:
+//       void copy_completed(const CopyJob&)   copies and CPU jobs done: publish CopyDone and open the gate;
+//       void copy_failed(const CopyJob&, int)  completion cannot be established: fail stop (also called on the
+//                                              submitting thread for a ring overflow);
+//       owner->template copy_count<K>(n)       the copy thread's counters.
 //
-// Service to copy thread (spec 6.3 item 5): an SPSC job ring. submit() takes no lock and never blocks. The copy thread
-// polls the ring; after spin_ns of idle (nothing popped or in flight) it sleeps on a futex, and submit()
-// makes the wake syscall only when that thread is asleep. No wake is lost:
-//   - copy thread (idle): seen = wake_; sleeping_ = true; fence(seq_cst); if the ring is empty and no stop was asked
-//     for, futex_wait(&wake_, seen);
-//   - submit: push (release); fence(seq_cst); if sleeping_, ++wake_ and futex_wake.
-// The two seq_cst fences are totally ordered. If submit's fence comes first, the copy thread's ring check after its
-// fence sees the push and it does not wait. If the copy thread's fence comes first, submit's load after its fence
-// sees sleeping_ and it wakes: either before futex_wait (then wake_ != seen, and the kernel returns at once, since it
-// compares the word under its own lock) or after it (then the wake ends the wait). The wait's 1 ms cap is a backstop
-// only, not part of the argument.
+// Errors: after the first backend error nothing the backend issued can be assumed complete, so that job and every job
+// behind it go to copy_failed.
+//
+// Service to copy thread: an SPSC job ring. submit() takes no lock and never blocks. The copy thread polls the ring
+// and, after spin_ns with nothing popped or in flight, sleeps on a futex; submit() makes the wake syscall only when
+// the copy thread is asleep. No wake is lost:
+//   - copy thread (idle): seen = wake_; sleeping_ = true; fence(seq_cst);
+//                         if the ring is empty and no stop was asked for, futex_wait(&wake_, seen).
+//   - submit:             push (release); fence(seq_cst); if sleeping_, ++wake_ and futex_wake.
+// The two seq_cst fences are totally ordered. If submit's fence is first, the copy thread's ring check after its own
+// fence sees the push and it does not wait. If the copy thread's fence is first, submit sees sleeping_ and wakes it:
+// before futex_wait (wake_ != seen, so the kernel returns at once; it compares the word under its own lock) or after
+// (the wake ends the wait). The wait's 1 ms cap is a backstop, not part of the argument.
 template <class Build, class Owner>
 class CopyEngine {
   static_assert(BuildPolicy<Build>);
@@ -439,8 +468,8 @@ class CopyEngine {
            dst_slot < table.dst_rows;
   }
 
-  // Row `row`'s entries that its DMA copies: an SM entry is the copy wait's, never the DMA's (issue()). For the
-  // startup calibration, which must time the bytes decode moves.
+  // The entries of row `row` that the DMA copies (SM entries belong to the copy wait). Used by the split calibration,
+  // which must time exactly the bytes a decode moves. Throws if the row has no table.
   std::vector<CopyEntry> dma_entries(int64_t row) const {
     if (row < 0 || row >= static_cast<int64_t>(tables_.size()) || !tables_[row].ready.load(std::memory_order_acquire))
       throw std::runtime_error("no copy table for row " + std::to_string(row));
@@ -450,9 +479,9 @@ class CopyEngine {
     return entries;
   }
 
-  // The tier's owner only (the service thread, or the caller of pump()). Takes no lock and never blocks: at most
-  // kDemandRecords jobs are outstanding, and the ring holds kCopyRing, so a full ring is an internal error, which
-  // fails stop. The wake is a syscall only when the copy thread has gone to sleep (idle past spin_ns).
+  // Hands a job to the copy thread. Called only by the tier's owner (the service thread, or the caller of pump()).
+  // Takes no lock and never blocks; makes a syscall only to wake a sleeping copy thread. At most kDemandRecords jobs
+  // are outstanding and the ring holds kCopyRing, so a full ring is an internal error and fails stop.
   void submit(const CopyJob& job) {
     if (!jobs_.push(job)) {
       owner_->copy_failed(job, kRingOverflow);
@@ -466,13 +495,14 @@ class CopyEngine {
     }
   }
 
-  // Every submitted job has completed (or failed): submitted_ is the submitter's, finished_ the copy thread's, each
-  // written by one thread.
+  // True when every submitted job has completed or failed.
   bool idle() const {
     return finished_.load(std::memory_order_acquire) == submitted_.load(std::memory_order_acquire);
   }
 
-  bool wait_idle(int64_t deadline_ns) {  // a paused caller or a test: not the hot path
+  // Polls until idle() or `deadline_ns` (now_ns() clock); returns whether it went idle. For a paused caller or a
+  // test, not the hot path.
+  bool wait_idle(int64_t deadline_ns) {
     while (!idle()) {
       if (now_ns() > deadline_ns) return false;
       std::this_thread::sleep_for(std::chrono::microseconds(20));
@@ -496,14 +526,14 @@ class CopyEngine {
     return dynamic_cast<HostCopyBackend*>(backend_.get());
   }
 
-  // CPU experts: the engine whose done() completes a job's CPU lanes. Set before any record carries a CPU lane (the
-  // service sets it before its thread starts).
+  // Sets the CPU expert engine whose done() completes a job's CPU lanes. The service sets it before its thread
+  // starts, so before any record carries a CPU lane.
   void set_cpu(CpuExpertEngine* cpu) {
     cpu_.store(cpu, std::memory_order_release);
   }
 
-  // Test only: one more copy of `bytes` issued ahead of every job's own, so each job completes that much later.
-  // InstrBuild only.
+  // Test only (InstrBuild): issues one extra copy of `bytes` ahead of every job's own, so each job completes that much
+  // later.
   void set_ballast(uint64_t dst, uint64_t src, int64_t bytes)
     requires(Build::kFaults)
   {
@@ -534,10 +564,9 @@ class CopyEngine {
     ready_cv_.notify_all();
     if (!error.empty()) return;
     Queue in_flight;
-    uint64_t idle = 0;  // empty polls since the last progress: the spin budget counts these (spec M8)
+    uint64_t idle = 0;  // empty polls since the last progress, counted against spin_iters_
     while (true) {
-      // Read before the ring: stop() is asked only after the last submit, so a stop seen here has every job in the
-      // ring.
+      // Read before the ring: stop() comes after the last submit, so a stop seen here has every job in the ring.
       const bool stopping = stop_.load(std::memory_order_acquire);
       bool progressed = false;
       CopyJob job;
@@ -545,9 +574,9 @@ class CopyEngine {
         progressed = true;
         issue_or_fail(job, in_flight);
       }
-      // The head job is polled every turn, oldest first. CudaCopyBackend's poll is one acquire load of the completion
-      // word, no driver call (the cuEventQuery it replaces took a libcuda mutex per call: ~2,300-3,200 per job over
-      // arm CS3, results.md 9a), and one cuStreamQuery per CompletionWord budget while the head stays pending.
+      // Poll the head job every turn. For CudaCopyBackend that is one acquire load, not a driver call: the
+      // cuEventQuery it replaced took a libcuda mutex per call, ~2,300-3,200 times per job
+      // (analysis/dsv41-drive/hotpath/results.md section 9a).
       while (!in_flight.empty() && broken_ == 0) {
         const CopyJob& head = in_flight.front();
         const int state = head.token == kNoToken ? CopyBackend::kDone : backend_->query(head.token);
@@ -657,7 +686,7 @@ class CopyEngine {
     return r;
   }
 
-  // copy_latency_ns and its max: metrics, so ProdBuild reads no clock here.
+  // Records copy_latency_ns and its max. Metrics only, so ProdBuild reads no clock here.
   void record_latency(const CopyJob& job) {
     if constexpr (Build::kMetrics) {
       const int64_t latency = now_ns() - job.submit_ns;
@@ -671,7 +700,7 @@ class CopyEngine {
     }
   }
 
-  // The copy thread's counters: the owner's copy_count, a core counter into its copy-thread block, a metric into the
+  // Adds to a copy-thread counter through the owner: a core counter goes to its copy-thread block, a metric to the
   // shared stats (InstrBuild only).
   template <Counter K>
   void count(int64_t n = 1) {
