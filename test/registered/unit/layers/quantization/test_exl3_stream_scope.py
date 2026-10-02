@@ -58,3 +58,19 @@ def test_draft_routes_are_not_written_when_the_path_is_unset(tmp_path):
     with envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.override(""):
         record_draft_routes(1, torch.zeros(1, 3, dtype=torch.int32))
     assert list(tmp_path.iterdir()) == []
+
+
+from sglang.srt.models.deepseek_v4_exl3_weights import is_dspark_draft_expert_module
+
+
+@pytest.mark.parametrize(
+    "prefix,expected",
+    [
+        ("stages.0.mlp.experts", True),
+        ("model.stages.2.mlp.experts", True),
+        ("model.layers.0.mlp.experts", False),
+        ("stages.0.mlp.shared_experts", False),
+    ],
+)
+def test_only_draft_stage_experts_are_draft_modules(prefix, expected):
+    assert is_dspark_draft_expert_module(prefix) is expected
