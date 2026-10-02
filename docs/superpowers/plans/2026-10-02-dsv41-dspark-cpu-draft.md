@@ -1619,3 +1619,11 @@ Sanity: `bits=3, rows=1, independent` is 0.505 ms per pass at 12 threads (0.677 
 - **P = 26.53 ms** (bits 4, rows 6, independent, 12 threads). `18 < P <= 30`: **ask the owner.** The bracket is
   14.5 ms (shared) to 26.5 ms (independent) against the ~13-18 ms the freed 6.75 GiB is worth per target forward,
   so the sign of the win depends on the draft's real per-stage union, which this bench cannot see.
+- **Kernel flavor.** The cells above ran the plain `sglang_exl3_ext` build (no `SGLANG_DSV41_CPU_EXPERTS`), i.e.
+  upstream's CPU kernel. Rerun on the optimized `_resid_b128_cpu_v1` build (tag `node1-opt`, 12 threads, private
+  build dir): faster at 1 row (3-bit 0.343 vs 0.505 ms per pass) but slower at 6 rows: bits 4 independent 30.92 vs
+  26.53 ms, shared 20.75 vs 14.46 ms (~0.77 ms per pass when rows share an expert, vs 0.54). The draft should keep
+  the plain build, which is what `exl3_ext()` loads under DSpark, since `SGLANG_DSV41_CPU_EXPERTS` is refused
+  with speculation.
+- **Owner's call (2026-10-02):** measure the draft's real per-stage union before Tasks 2-7. Probe:
+  `SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH` and `ab_cpu_draft.py ... routes`, read by `draft_routes_report.py`.
