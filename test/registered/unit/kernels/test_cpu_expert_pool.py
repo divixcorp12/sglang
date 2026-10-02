@@ -417,7 +417,7 @@ def test_split_from_grid_breaks_a_near_tie_toward_the_cpu():
 
 def test_split_from_grid_never_exceeds_n_and_ignores_cells_past_n():
     # Cells k > n are unused (0.0 in the C++ grid); a 0.0 there must not win.
-    grid = _grid(lambda n, k: 5.0 - k)  # more CPU is always faster
+    grid = _grid(lambda n, k: 10.0 - k)  # more CPU is always faster
     assert split_from_grid(grid) == list(range(9))
     assert all(0 <= k <= n for n, k in enumerate(split_from_grid(grid)))
 
