@@ -6805,7 +6805,13 @@ target's hot cache could use. Can the CPU expert kernel compute some of them ins
 - The other experts stay in host memory. A one-thread worker computes them on the CPU pool
   (`cpu_experts/draft.py`, `CpuExpertPool.compute_rows`), bound to `SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES`. The
   resident experts run on the GPU at the same time, and the two results are summed.
-- `SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS` turns it on. The launch gate requires DSpark and at least 2 cores.
+- `SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS` turns it on. At launch, the gate requires DSpark, at least 2 cores,
+  `SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS` no larger than the core count, `EXL3_MOE_CPU_PIN=0`, and a well-formed
+  resident file (no stage longer than its `n`).
+- The file's stages are checked against the draft's at the first draft step. A stage the draft lacks, or a draft
+  stage the file lacks, is refused, as is an expert id outside the stage's routed experts.
+- A file calibrated on another checkpoint with the same shape is not detected. The only sign is a low share of
+  stage calls without CPU work in the `DSpark CPU experts:` log line.
 - Eager only, like the rest of DSpark (§33.3): routes are copied to the host, and `exl3_moe_accumulate`
   synchronizes per expert.
 

@@ -22,6 +22,7 @@ module runs during server-args processing, so it imports only the gate module,
 """
 
 import dataclasses
+import os
 
 from sglang.srt.arg_groups.expert_stream_requirements import (
     ExpertStreamRequirements,
@@ -94,10 +95,22 @@ def _check(cfg, budgets) -> None:
                 "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS computes the DSpark draft's routed experts on the CPU; "
                 "pass --speculative-algorithm DSPARK or unset it"
             )
-        if len(parse_core_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())) < 2:
+        cores = parse_core_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())
+        if len(cores) < 2:
             raise ValueError(
                 "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES with at "
                 "least two cores (one spinning worker per core)"
+            )
+        threads = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get()
+        if not 0 <= threads <= len(cores):
+            raise ValueError(
+                f"SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS={threads} on {len(cores)} cores: use 0 (one per core) "
+                f"up to {len(cores)}"
+            )
+        if os.environ.get("EXL3_MOE_CPU_PIN") != "0":
+            raise ValueError(
+                "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs EXL3_MOE_CPU_PIN=0: the kernel would otherwise pin "
+                "its workers to the first cores"
             )
         resident = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
         if resident:

@@ -513,7 +513,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         on_cpu[sorted(gpu)] = False
         slabs = {name: getattr(layer, name).data for name in EXL3_STREAMED_NAMES}
         layer.exl3_cpu_draft_key = draft.DRAFT_CPU_EXPERTS.register(
-            slabs, on_cpu, layer.moe_runner_config.swiglu_limit
+            slabs, on_cpu, layer.moe_runner_config.swiglu_limit, layer_id=layer.layer_id
         )
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 

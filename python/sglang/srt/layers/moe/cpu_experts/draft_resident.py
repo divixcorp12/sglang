@@ -49,12 +49,17 @@ def load_resident_set(path: str) -> dict[int, frozenset[int]]:
         raise ValueError(f"DSpark draft resident set {path}: {error}") from error
     if not isinstance(body, dict) or body.get("version") != VERSION or not isinstance(body.get("stages"), dict):
         raise ValueError(f"DSpark draft resident set {path}: expected version {VERSION} with a 'stages' map")
+    n = body.get("n")
+    if not isinstance(n, int) or n < 0:
+        raise ValueError(f"DSpark draft resident set {path}: 'n' must be an int >= 0")
     stages = {}
     for key, ids in body["stages"].items():
         if not key.isdigit() or not isinstance(ids, list):
             raise ValueError(f"DSpark draft resident set {path}: stage {key!r} is not a layer id with a list")
         if any(not isinstance(e, int) or e < 0 for e in ids) or len(set(ids)) != len(ids):
             raise ValueError(f"DSpark draft resident set {path}: stage {key} ids must be distinct ints >= 0")
+        if len(ids) > n:
+            raise ValueError(f"DSpark draft resident set {path}: stage {key} lists {len(ids)} ids, more than n = {n}")
         stages[int(key)] = frozenset(ids)
     return stages
 

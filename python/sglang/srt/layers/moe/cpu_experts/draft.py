@@ -19,6 +19,7 @@ from typing import Mapping, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.cpu_experts.draft_resident import load_resident_set
 from sglang.srt.layers.moe.cpu_experts.policy import parse_core_list
 from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertPool
 from sglang.srt.layers.moe.cpu_experts.service import cpu_trait_for
@@ -140,11 +141,17 @@ class DraftCpuExpertsRegistry:
 
     def __init__(self):
         self._layers: dict[int, DraftLayer] = {}
+        self._stages: set[int] = set()
         self._runtime: Optional[DraftCpuExperts] = None
         self._lock = threading.Lock()
 
     def register(
-        self, slabs: Mapping[str, torch.Tensor], on_cpu: torch.Tensor, act_limit: Optional[float]
+        self,
+        slabs: Mapping[str, torch.Tensor],
+        on_cpu: torch.Tensor,
+        act_limit: Optional[float],
+        *,
+        layer_id: int,
     ) -> int:
         """Add one stage; returns its key. Every stage must share one activation limit (one kernel trait)."""
         with self._lock:
@@ -156,6 +163,7 @@ class DraftCpuExpertsRegistry:
                     f"DSpark draft stages disagree on the activation limit: {sorted(limits)} and {act_limit}"
                 )
             key = len(self._layers)
+            self._stages.add(layer_id)
             self._layers[key] = DraftLayer(slabs, on_cpu, act_limit)
             return key
 
@@ -164,6 +172,13 @@ class DraftCpuExpertsRegistry:
             if self._runtime is None:
                 if not self._layers:
                     raise RuntimeError("no DSpark draft stage registered for CPU experts")
+                path = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
+                extra = sorted(set(load_resident_set(path)) - self._stages) if path else []
+                if extra:
+                    raise ValueError(
+                        f"DSpark draft resident set {path} lists stages {extra} that this draft does not have "
+                        f"(it has {sorted(self._stages)}); recalibrate it from this draft's routes"
+                    )
                 cores = parse_core_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())
                 threads = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get() or len(cores)
                 trait = cpu_trait_for("exl3")
