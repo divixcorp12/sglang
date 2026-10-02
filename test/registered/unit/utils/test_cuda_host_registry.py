@@ -23,7 +23,7 @@ def _run_holding_the_lock(body) -> threading.Thread:
     does when a garbage collection runs a finalizer inside it."""
 
     def target():
-        with registry._LOCK:
+        with registry._locked():
             body()
 
     thread = threading.Thread(target=target, daemon=True)
