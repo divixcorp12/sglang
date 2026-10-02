@@ -1005,7 +1005,12 @@ class Exl3RamMissService:
             logger.info("exl3 RAM miss copy engine armed after %d decode forwards since capture", self._copy_decodes)
 
     def _calibrate_cpu_split(self) -> None:
-        """Before arming, while the device types no CPU or copy-engine lane: the split from measured costs."""
+        """Before arming, while the device types no CPU or copy-engine lane: the split from measured costs.
+
+        The device drains first. Under the overlap scheduler this runs while the next decode still replays on the
+        forward stream, which ``before_host_use``'s current-stream sync does not cover; a paused RAM thread under it
+        leaves a miss lane unserved until its device deadline traps."""
+        torch.cuda.synchronize()
         self.before_host_use()
         try:
             self.cpu_experts.calibrate(torch.cuda.current_device())

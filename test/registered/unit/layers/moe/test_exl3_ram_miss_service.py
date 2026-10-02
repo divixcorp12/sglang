@@ -1112,9 +1112,14 @@ def test_the_copy_engine_arms_only_after_enough_decode_forwards_not_batches(monk
 @pytest.mark.parametrize("raises", [False, True])
 def test_the_split_is_calibrated_once_paused_and_before_the_copy_engine_arms(monkeypatch, raises):
     """Calibration needs the tier (paused) and an unarmed copy engine: once armed, the device types CPU and copy lanes
-    that would compete with its measurements. The pause is released even if calibration raises."""
+    that would compete with its measurements. The pause is released even if calibration raises.
+
+    The device drains before the pause: under the overlap scheduler the arm check runs while the next decode is still
+    replaying on the forward stream, which the pause's current-stream sync does not cover. Parking the RAM thread under
+    it left a miss lane unserved until its 2 s device deadline trapped (Xid 43)."""
     service, armed, _ = _copy_engine_service(monkeypatch)
     events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: events.append("device-sync"))
 
     def calibrate(device):
         events.append(("calibrate", device))
@@ -1130,11 +1135,11 @@ def test_the_split_is_calibrated_once_paused_and_before_the_copy_engine_arms(mon
     if raises:
         with pytest.raises(ValueError):
             service._arm_copy_engine()
-        assert events == ["pause", ("calibrate", 3), "resume"]
+        assert events == ["device-sync", "pause", ("calibrate", 3), "resume"]
         return
     service._arm_copy_engine()
     service._arm_copy_engine()
-    assert events == ["pause", ("calibrate", 3), "resume", "arm"]
+    assert events == ["device-sync", "pause", ("calibrate", 3), "resume", "arm"]
 
 
 @pytest.mark.parametrize("value", [None, "", "LAZY", "eager", "DEFAULT"])
