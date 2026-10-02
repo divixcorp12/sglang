@@ -162,8 +162,16 @@ class Bench {
   Stack<BenchBuild>& stack() { return stack_; }
   int64_t rows() const { return fixture_.rows(); }
 
+  // One OpenMP team at a time (release_kernel_team): every bare call comes first, from this thread, then the stack's.
+  void enter_stack_phase() {
+    if (stack_phase_) return;
+    release_kernel_team();
+    stack_phase_ = true;
+  }
+
   // The device's part of one request: x, the record, the copy wait. t0..t1 is the timed interval.
   StackCall stack_call(int64_t row, int k) {
+    enter_stack_phase();
     StackCall call;
     call.t0 = monotonic_ns();
     fixture_.write_x(row);
@@ -180,6 +188,9 @@ class Bench {
 
   // The C ABI forward on the same layer handle, slots, x and output memory, from the calling thread.
   void bare_call(int64_t row, int k) {
+    if (stack_phase_)
+      throw std::runtime_error("a bare forward after the stack's first one would run a second OpenMP team on the "
+                               "workers' cores: BM_bare runs first (no --benchmark_enable_random_interleaving)");
     if (sglang_exl3_cpu_experts_forward(handles_[row], fixture_.x_row(row), slots_[k][row].data(), weights_[k].data(), k,
                                         fixture_.out_row(row), static_cast<int32_t>(placement_.workers.size()), 0) != 0)
       throw std::runtime_error("the bare CPU forward failed");
@@ -228,6 +239,7 @@ class Bench {
   DeviceSim& sim_;
   std::vector<int64_t> handles_;
   int64_t deadline_ns_;
+  bool stack_phase_ = false;
   std::map<int, std::vector<int32_t>> experts_;
   std::map<int, std::vector<float>> weights_;
   std::map<int, std::vector<std::vector<int32_t>>> slots_;  // [k][row]
@@ -269,12 +281,12 @@ int main(int argc, char** argv) {
       sim.set_row_cpu(row);
     }
     Bench bench(options, placement, *fixture, stack, sim, layers.handles);
-    for (int k : {1, 3, 5}) {
-      bench.validate(k, /*via_stack=*/true);
+    {
       PinScope caller(placement.workers.front());  // the kernel's caller is worker 0, as on the CPU expert thread
       std::this_thread::sleep_for(std::chrono::milliseconds(100));  // that thread's 50 ms idle spin ends first
-      bench.validate(k, /*via_stack=*/false);
+      for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/false);
     }
+    for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/true);
     const std::vector<int> expected = expected_threads(placement);
     verify_threads(before, expected);
     std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"

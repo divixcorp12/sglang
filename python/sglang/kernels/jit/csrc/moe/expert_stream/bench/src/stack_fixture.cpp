@@ -155,6 +155,10 @@ void configure_cpu_kernel_runtime() {
   omp_set_dynamic(0);
 }
 
+void release_kernel_team() {
+  if (omp_pause_resource_all(omp_pause_soft) != 0) throw std::runtime_error("Cannot release the bare caller's OpenMP team");
+}
+
 void check_reference(const fs::path& path, const std::vector<float>& actual) {
   compare_reference(path, actual);
 }

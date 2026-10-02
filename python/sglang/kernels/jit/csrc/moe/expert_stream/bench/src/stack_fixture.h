@@ -44,6 +44,11 @@ class StackFixture {
 // no dynamic OpenMP. Throws.
 void configure_cpu_kernel_runtime();
 
+// The kernel forks an OpenMP team per calling thread (libgomp keeps a helper pool per master), and with
+// GOMP_SPINCOUNT=INFINITE an idle team spins forever on its cores. Frees the calling thread's team, so the bare
+// caller's helpers stop competing with the CPU expert thread's. Throws.
+void release_kernel_team();
+
 // fixture.cpp's compare_reference: bit-exact, or throws naming the file.
 void check_reference(const std::filesystem::path& path, const std::vector<float>& actual);
 

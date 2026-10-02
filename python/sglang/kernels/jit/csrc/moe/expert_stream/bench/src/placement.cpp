@@ -4,10 +4,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #include "expert_stream/host/core_topology.h"
 
@@ -133,7 +135,9 @@ std::string cpu_list(std::vector<int> cpus) {
   return text;
 }
 
-void verify_threads(const std::set<int>& before, std::vector<int> expected) {
+namespace {
+
+void census(const std::set<int>& before, const std::vector<int>& expected) {
   std::vector<int> pinned;
   for (int tid : task_ids()) {
     if (before.contains(tid)) continue;
@@ -149,9 +153,25 @@ void verify_threads(const std::set<int>& before, std::vector<int> expected) {
       if (CPU_ISSET(cpu, &mask)) pinned.push_back(cpu);
   }
   std::sort(pinned.begin(), pinned.end());
-  std::sort(expected.begin(), expected.end());
   if (pinned != expected)
     throw std::runtime_error("threads are pinned to {" + cpu_list(pinned) + "}, expected {" + cpu_list(expected) + "}");
+}
+
+}  // namespace
+
+void verify_threads(const std::set<int>& before, std::vector<int> expected) {
+  std::sort(expected.begin(), expected.end());
+  // A released OpenMP team's helpers exit asynchronously: give them up to 2 s to leave /proc/self/task.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  for (;;) {
+    try {
+      census(before, expected);
+      return;
+    } catch (const std::exception&) {
+      if (std::chrono::steady_clock::now() > deadline) throw;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
 }
 
 }  // namespace fullstack

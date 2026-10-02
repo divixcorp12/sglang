@@ -55,7 +55,7 @@ std::set<int> task_ids();
 // watchdog (both on `copy`), the CPU expert thread (workers[0]) and the kernel's helpers (workers[1..]).
 std::vector<int> expected_threads(const Placement& placement);
 // Every thread not in `before`, except io_uring's kernel workers ("iou-*"), must be pinned to exactly one CPU, and
-// those CPUs, sorted, must equal `expected` sorted. Throws otherwise.
+// those CPUs, sorted, must equal `expected` sorted. Retried for up to 2 s (exiting threads); throws otherwise.
 void verify_threads(const std::set<int>& before, std::vector<int> expected);
 std::string cpu_list(std::vector<int> cpus);  // "16,17,52"
 
