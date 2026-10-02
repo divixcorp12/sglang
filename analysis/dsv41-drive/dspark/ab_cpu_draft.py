@@ -67,6 +67,7 @@ def run(arm: str, outdir: str, n: int, new_tokens: int) -> int:
         "--prompt-tokens", "256",
         "--new-tokens", str(new_tokens),
         "--stop-at-eos",
+        "--log-level", "info",
         "--dspark", DRAFT,
         "--out", os.path.join(outdir, f"{arm}.json"),
     ]
