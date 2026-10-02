@@ -29,6 +29,8 @@ from sglang.srt.arg_groups.expert_stream_requirements import (
     register_expert_stream_requirements,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.cpu_experts.draft_resident import load_resident_set
+from sglang.srt.layers.moe.cpu_experts.policy import parse_core_list
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 
 _EAGER = eager_expert_stream_requirements(
@@ -86,6 +88,20 @@ def _check(cfg, budgets) -> None:
         # parse_cuda_graph_config, while this is still the raw CLI value: the decode
         # backend is not known yet, and the pass after parsing runs every check below.
         return
+    if envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get():
+        if getattr(cfg, "speculative_algorithm", None) != "DSPARK":
+            raise ValueError(
+                "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS computes the DSpark draft's routed experts on the CPU; "
+                "pass --speculative-algorithm DSPARK or unset it"
+            )
+        if len(parse_core_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())) < 2:
+            raise ValueError(
+                "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES with at "
+                "least two cores (one spinning worker per core)"
+            )
+        resident = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
+        if resident:
+            load_resident_set(resident)
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
     if cpu_experts and (
         getattr(cfg, "speculative_algorithm", None) is not None

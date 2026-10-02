@@ -1933,6 +1933,17 @@ class Envs:
     # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
     # (slot-map plan, Task 0), so a served A/B decides.
     SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
+    # DSpark draft experts on the CPU (plan 2026-10-02-dsv41-dspark-hybrid-draft): each draft stage keeps the experts
+    # its resident set lists on the GPU and computes the rest with the CPU expert kernel, eagerly, so their VRAM goes
+    # to the target's hot cache. A fused shared expert stays on the GPU. Needs --speculative-algorithm DSPARK.
+    SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS = EnvBool(False)
+    # Cores of the draft's CPU expert pool, as a taskset list ("18-29"). At least two.
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES = EnvStr("")
+    # Worker threads of the draft's CPU expert pool, at most one per core. 0 takes one per core.
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS = EnvInt(0)
+    # The draft experts kept on the GPU, per stage (analysis/dsv41-drive/dspark/draft_resident_set.py).
+    # Empty keeps none: every routed draft expert runs on the CPU.
+    SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH = EnvStr("")
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
