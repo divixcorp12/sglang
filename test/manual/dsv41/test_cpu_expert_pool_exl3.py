@@ -16,7 +16,7 @@ CAP, H, INTER = 6, 512, 256
 LIMIT = 10.0
 
 
-def _random_slabs(seed):
+def _random_slabs(seed, hidden=H, inter=INTER):
     g = torch.Generator().manual_seed(seed)
 
     def signs(*shape):
@@ -26,21 +26,21 @@ def _random_slabs(seed):
         "w13_trellis": torch.randint(
             -32768,
             32767,
-            (CAP, 2, H // 16, INTER // 16, 48),
+            (CAP, 2, hidden // 16, inter // 16, 48),
             generator=g,
             dtype=torch.int16,
         ),
-        "w13_suh": signs(CAP, 2, H),
-        "w13_svh": signs(CAP, 2, INTER),
+        "w13_suh": signs(CAP, 2, hidden),
+        "w13_svh": signs(CAP, 2, inter),
         "w2_trellis": torch.randint(
             -32768,
             32767,
-            (CAP, INTER // 16, H // 16, 48),
+            (CAP, inter // 16, hidden // 16, 48),
             generator=g,
             dtype=torch.int16,
         ),
-        "w2_suh": signs(CAP, INTER),
-        "w2_svh": signs(CAP, H),
+        "w2_suh": signs(CAP, inter),
+        "w2_svh": signs(CAP, hidden),
     }
 
 
@@ -66,17 +66,22 @@ def _direct_layer(ext, s):
     )
 
 
-def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch):
+@pytest.mark.parametrize("hidden, inter", [(H, INTER), (5120, 2304)], ids=["generic", "dsv41"])
+def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch, hidden, inter):
+    """The pool's slab registration runs bit-identically to make_layer's per-expert registration over the same slabs,
+    at a generic shape and at DeepSeek V4.1's, where both take the DSV4.1 plan on AVX-512BW."""
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     cores = sorted(os.sched_getaffinity(0))
     if len(cores) < 2:
         pytest.skip("needs at least 2 cores in the affinity mask")
     from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
     from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertPool
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
 
+    if not optimized_cpu(cpu_act_defines()):
+        pytest.skip("the slab ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
     ext = exl3_ext()
-    slabs = _random_slabs(20260929)
+    slabs = _random_slabs(20260929, hidden, inter)
     threads = min(4, len(cores))
     direct = _direct_layer(ext, slabs)
     pool = CpuExpertPool(
@@ -89,13 +94,13 @@ def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch):
     g = torch.Generator().manual_seed(1)
     try:
         for scale in (1.0, 8.0):
-            x = (torch.randn(1, H, generator=g) * scale).half()
+            x = (torch.randn(1, hidden, generator=g) * scale).half()
             slots = torch.tensor([[4, 0, 5]])
             w = torch.tensor([[0.5, 0.3, 0.2]]).half()
-            want = torch.zeros(1, H)
+            want = torch.zeros(1, hidden)
             ext.exl3_moe_cpu_forward(direct, x, slots, w, want, threads)
             assert want.abs().max() > 0
-            got = torch.zeros(1, H)
+            got = torch.zeros(1, hidden)
             pool.compute(
                 3,
                 torch.cat([slots, torch.tensor([[-1]])], 1),
@@ -106,7 +111,7 @@ def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch):
             assert torch.equal(got, want)
         # Row contents change under the registered views: the tier's refill must reach the kernel with no re-register.
         slabs["w2_suh"][4].neg_()
-        changed = torch.zeros(1, H)
+        changed = torch.zeros(1, hidden)
         pool.compute(3, slots, w, x, changed)
         assert not torch.equal(changed, want)
         ext.exl3_moe_cpu_forward(direct, x, slots, w, want, threads)
@@ -124,10 +129,10 @@ def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-    from sglang.srt.layers.quantization.exl3_ext import build_flavor, cpu_act_defines, exl3_ext
+    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
 
-    if not build_flavor(cpu_act_defines()):
-        pytest.skip("upstream's unflavored kernel has no C ABI: set SGLANG_EXL3_CPU_ACT_RESIDUAL/_BLOCK")
+    if not optimized_cpu(cpu_act_defines()):
+        pytest.skip("the slab ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
     ext = exl3_ext()
     slabs = _random_slabs(20261001)
     direct = _direct_layer(ext, slabs)

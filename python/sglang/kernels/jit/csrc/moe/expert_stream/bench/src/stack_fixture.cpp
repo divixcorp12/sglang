@@ -4,6 +4,7 @@
 #include <ATen/Parallel.h>
 
 #include "aligned.h"
+#include "cpu_experts_cabi.h"
 #include "fixture.h"
 #include "moe_mul1.h"
 #include <array>
@@ -142,27 +143,20 @@ void StackFixture::write_x(int64_t row) const {
   std::memcpy(x_row(row), impl_->inputs.data() + row * 2 * impl_->hidden, 2 * impl_->hidden);
 }
 
-// Mirrors cpu_experts/exl3.py::register_layer over the row's slots: gate is w13 part 0, up part 1, down w2's one part;
-// each view is contiguous. Activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled.
+// Mirrors cpu_experts/exl3.py::register_layer: the row's six slabs by base pointer (kNames is EXL3_STREAMED_NAMES
+// order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit.
 int64_t StackFixture::register_layer(int64_t row) const {
   const Impl& f = *impl_;
-  const int64_t H = f.hidden, I = f.intermediate;
-  const auto& rb = f.set.layout.row_bytes;
-  auto view = [&](int name, int64_t slot, int64_t offset, at::IntArrayRef shape, at::ScalarType dtype) {
-    return at::from_blob(f.set.slabs[row][name] + slot * rb[name] + offset, shape, at::TensorOptions().dtype(dtype));
-  };
-  std::array<std::vector<at::Tensor>, 9> m;
-  for (int64_t s = 0; s < kCapacity; ++s) {
-    for (int part = 0; part < 2; ++part) {
-      m[3 * part + 0].push_back(view(0, s, part * rb[0] / 2, {H / 16, I / 16, 48}, at::kShort));
-      m[3 * part + 1].push_back(view(1, s, part * rb[1] / 2, {H}, at::kHalf));
-      m[3 * part + 2].push_back(view(2, s, part * rb[2] / 2, {I}, at::kHalf));
-    }
-    m[6].push_back(view(3, s, 0, {I / 16, H / 16, 48}, at::kShort));
-    m[7].push_back(view(4, s, 0, {I}, at::kHalf));
-    m[8].push_back(view(5, s, 0, {H}, at::kHalf));
-  }
-  return exl3_moe_cpu_make_layer(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], {}, {}, {}, 0, 10.0, 0);
+  const void* slabs[kNames];
+  for (int n = 0; n < kNames; ++n) slabs[n] = f.set.slabs[row][n];
+  int64_t handle = -1;
+  const int status = sglang_exl3_cpu_experts_register_slabs(
+      slabs, static_cast<int32_t>(kCapacity), static_cast<int32_t>(f.hidden), static_cast<int32_t>(f.intermediate), 3,
+      0, 10.0f, &handle);
+  if (status != 0)
+    throw std::runtime_error("the kernel refused row " + std::to_string(row) + "'s slabs: status " +
+                             std::to_string(status));
+  return handle;
 }
 
 void StackFixture::preload_slots(int64_t row) const {
