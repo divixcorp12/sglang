@@ -403,6 +403,25 @@ struct HostExports {
     find(handle)->cpu_stats(static_cast<int64_t*>(out.data_ptr()));
   }
 
+  // CPU experts' calibration: the bytes the DMA moves per expert of `row`.
+  static int64_t copy_expert_bytes(int64_t handle, int64_t row) {
+    return find(handle)->copy_expert_bytes(row);
+  }
+
+  // CPU experts' startup calibration (split_calibration.h): out float64 [10, 9] ms. The caller owns the tier.
+  static void calibrate_cpu_split(
+      int64_t handle, int64_t row, int64_t device, int64_t reps, int64_t scratch, int64_t scratch_bytes,
+      int64_t timeout_ns, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named(
+        "out",
+        TensorMatcher({expert_stream::kCalibRows, expert_stream::kCalibCols}).with_dtype<double>().with_device<kDLCPU>(cpu),
+        out);
+    find(handle)->calibrate_cpu_split(
+        row, device, reps, static_cast<uint64_t>(scratch), scratch_bytes, timeout_ns, static_cast<double*>(out.data_ptr()));
+  }
+
   static void mapping(int64_t handle, int64_t row, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -620,6 +639,8 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_bulk_delta_count, Exports::bulk_delta_count);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_take_bulk_delta, Exports::take_bulk_delta);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_copy_expert_bytes, Exports::copy_expert_bytes);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_calibrate_cpu_split, Exports::calibrate_cpu_split);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_mapping, Exports::mapping);                               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_to_expert, Exports::slot_to_expert);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lru_order, Exports::lru_order);                           \

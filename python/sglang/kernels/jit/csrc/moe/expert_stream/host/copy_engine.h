@@ -438,6 +438,17 @@ class CopyEngine {
            dst_slot < table.dst_rows;
   }
 
+  // Row `row`'s entries that its DMA copies: an SM entry is the copy wait's, never the DMA's (issue()). For the
+  // startup calibration, which must time the bytes decode moves.
+  std::vector<CopyEntry> dma_entries(int64_t row) const {
+    if (row < 0 || row >= static_cast<int64_t>(tables_.size()) || !tables_[row].ready.load(std::memory_order_acquire))
+      throw std::runtime_error("no copy table for row " + std::to_string(row));
+    std::vector<CopyEntry> entries;
+    for (const CopyEntry& entry : tables_[row].entries)
+      if (!entry.sm) entries.push_back(entry);
+    return entries;
+  }
+
   // The tier's owner only (the service thread, or the caller of pump()). Takes no lock and never blocks: at most
   // kDemandRecords jobs are outstanding, and the ring holds kCopyRing, so a full ring is an internal error, which
   // fails stop. The wake is a syscall only when the copy thread has gone to sleep (idle past spin_ns).

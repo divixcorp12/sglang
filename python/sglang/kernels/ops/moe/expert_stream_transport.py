@@ -1145,6 +1145,35 @@ class ExpertStreamHost:
         jobs, lanes, ns = out.tolist()
         return {"jobs": jobs, "lanes": lanes, "forward_ns": ns}
 
+    def copy_expert_bytes(self, row: int) -> int:
+        """CPU experts' calibration: the bytes the DMA moves per expert of ``row`` (its copy table less SM entries)."""
+        return int(self._module.expert_stream_copy_expert_bytes(self.handle, int(row)))
+
+    def calibrate_cpu_split(
+        self, row: int, *, device: int, reps: int, scratch: torch.Tensor, timeout_s: float = 1.0
+    ) -> torch.Tensor:
+        """CPU experts' startup calibration on ``row``: float64 ``[10, 9]`` mean ms; row 0 ``cpu[k]``, row 1
+        ``link[m]``, row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no thread). ``device``
+        -1 copies with the test backend; ``scratch`` holds 8 experts on that device. Raises RuntimeError on failure."""
+        out = torch.zeros((10, 9), dtype=torch.float64)
+        self._module.expert_stream_calibrate_cpu_split(
+            self.handle,
+            int(row),
+            int(device),
+            int(reps),
+            scratch.data_ptr(),
+            scratch.numel() * scratch.element_size(),
+            int(timeout_s * 1e9),
+            out,
+        )
+        return out
+
+    def test_forward_address(self, ns_per_expert: int) -> int:
+        """Test only: a native fake CPU expert forward that spins ``ns_per_expert`` per expert and writes out[0] = k.
+        Instrumented build only."""
+        _refuse_test_only("test_forward_address", self.variant)
+        return int(self._module.expert_stream_test_forward_address(int(ns_per_expert)))
+
     def copy_engine_idle(self, timeout_s: float) -> bool:
         """Whether every job handed to the copy thread completed (or failed) within ``timeout_s``."""
         return bool(self._module.expert_stream_copy_engine_idle(self.handle, int(timeout_s * 1e9)))

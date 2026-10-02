@@ -277,8 +277,9 @@ def test_copy_expert_bytes_is_the_dma_entries_sum(tmp_path):
 
 def test_copy_expert_bytes_leaves_out_sm_entries(tmp_path):
     # Production's DMA skips an SM entry (the copy wait reads it); calibration must time the same bytes.
-    _, host, row_bytes, _keep = _host(tmp_path, sm_mask=1)
-    assert host.copy_expert_bytes(ROW) == sum(row_bytes[1:])
+    sm_mask = 0b110110  # the layout's small tensors (scale vectors); the trellises stay on the DMA
+    _, host, row_bytes, _keep = _host(tmp_path, sm_mask=sm_mask)
+    assert host.copy_expert_bytes(ROW) == sum(b for i, b in enumerate(row_bytes) if not sm_mask >> i & 1)
 
 
 def test_calibration_times_every_cell_and_runs_each_cpu_job(tmp_path):

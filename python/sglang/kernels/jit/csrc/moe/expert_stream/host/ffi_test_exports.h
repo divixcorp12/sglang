@@ -540,6 +540,29 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;
   }
 
+  // Test only: a native CPU expert forward, for tests whose waits hold the GIL (a ctypes forward needs it on the CPU
+  // expert thread). It spins k * the configured ns, then writes out[0] = k (adds it when accumulating).
+  static std::atomic<int64_t>& test_forward_ns() {
+    static std::atomic<int64_t> ns{0};
+    return ns;
+  }
+  static int test_forward(int64_t, const void*, const int32_t*, const float*, int32_t k, float* out, int32_t,
+                          int32_t accumulate) {
+    const int64_t until = expert_stream::now_ns() + k * test_forward_ns().load(std::memory_order_relaxed);
+    while (expert_stream::now_ns() < until)
+      _mm_pause();
+    out[0] = accumulate != 0 ? out[0] + static_cast<float>(k) : static_cast<float>(k);
+    return 0;
+  }
+  static int64_t test_forward_address(int64_t ns_per_expert) {
+    if constexpr (!Build::kFaults) {
+      test_only("test_forward_address");
+    } else {
+      test_forward_ns().store(ns_per_expert, std::memory_order_relaxed);
+      return static_cast<int64_t>(reinterpret_cast<intptr_t>(&test_forward));
+    }
+  }
+
   // Test only (HostCopyBackend): let `marks` more copy marks complete (negative: all), fail the calls, count marks.
   static void copy_engine_release(int64_t handle, int64_t marks) {
     find(handle)->host_copy_backend().release(marks);
@@ -715,6 +738,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
 #define EXPERT_STREAM_HOST_TEST_EXPORTS(Exports) \
   EXPERT_STREAM_HOST_TEST_EXPORTS_OF(::sglang::expert_stream::HostTestExports<Exports>)
 #define EXPERT_STREAM_HOST_TEST_EXPORTS_OF(Exports)                                                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_forward_address, Exports::test_forward_address);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_traced, Exports::read_rows_traced);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_faulted, Exports::read_rows_faulted);           \

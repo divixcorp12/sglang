@@ -3,6 +3,7 @@
 
 #include "../row_layout.h"
 #include "copy_engine.h"
+#include "split_calibration.h"
 
 namespace sglang {
 namespace expert_stream {
@@ -597,6 +598,63 @@ class RamTier {
   // The CPU experts' cores, empty without CPU experts. The caller's, before the service thread starts.
   std::vector<int> cpu_cores() const {
     return cpu_ != nullptr ? cpu_->cores() : std::vector<int>{};
+  }
+
+  // The bytes the DMA moves per expert of `row` (its copy table less SM entries).
+  int64_t copy_expert_bytes(int64_t row) const {
+    if (copy_engine_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
+    return calibration_expert_bytes(copy_engine_->dma_entries(row));
+  }
+
+  // Startup calibration (split_calibration.h): fills out, float64 [kCalibRows][kCalibCols] ms. The caller owns the
+  // tier: it claims CPU job sequences, the owner's. device -1 copies with the test backend; scratch holds
+  // kCalibLanes experts on that device.
+  void calibrate_cpu_split(int64_t row, int64_t device, int64_t reps, uint64_t scratch, int64_t scratch_bytes,
+                           int64_t timeout_ns, double* out) {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("calibrate_cpu_split");
+    const std::string prefix = error_prefix<Layout>() + "calibration: ";
+    if (cpu_ == nullptr) throw std::runtime_error(prefix + "CPU experts are not enabled");
+    if (copy_engine_ == nullptr) throw std::runtime_error(prefix + "the copy engine is not enabled");
+    if (row < 0 || row >= layers_) throw std::runtime_error(prefix + "row out of range");
+    if (!cpu_->eligible(row))
+      throw std::runtime_error(prefix + "row " + std::to_string(row) + " has no registered CPU layer");
+    if (tiers_[row].capacity < kCalibLanes)
+      throw std::runtime_error(prefix + "it needs 8 RAM slots in row " + std::to_string(row) + ", the row has " +
+                               std::to_string(tiers_[row].capacity));
+    if (reps < 1 || timeout_ns <= 0) throw std::runtime_error(prefix + "reps and the timeout must be positive");
+    CalibrationSetup s;
+    s.cpu = cpu_.get();
+    s.row = row;
+    s.entries = copy_engine_->dma_entries(row);
+    const int64_t need = kCalibLanes * calibration_expert_bytes(s.entries);
+    if (need == 0) throw std::runtime_error(prefix + "row " + std::to_string(row) + " copies no bytes");
+    if (scratch == 0 || scratch_bytes < need)
+      throw std::runtime_error(prefix + "the scratch holds " + std::to_string(scratch_bytes) + " bytes, it needs " +
+                               std::to_string(need));
+    std::unique_ptr<CopyBackend> backend;
+    if (device < 0) {
+      auto host = std::make_unique<HostCopyBackend>();
+      s.host_backend = host.get();
+      backend = std::move(host);
+    } else {
+      backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device), prefix + "copy: ");
+    }
+    if (const std::string error = backend->init(); !error.empty()) throw std::runtime_error(prefix + error);
+    // Freed only when idle: after a failure a copy may still be in flight into the scratch.
+    struct Shutdown {
+      CopyBackend* backend;
+      bool idle = false;
+      ~Shutdown() {
+        backend->shutdown(idle);
+      }
+    } shutdown{backend.get()};
+    s.backend = backend.get();
+    s.scratch = scratch;
+    s.reps = static_cast<int>(reps);
+    s.timeout_ns = timeout_ns;
+    calibrate_split(s, out);
+    shutdown.idle = true;
   }
 
   // The owner (RamThread::pause, once the service parked): every job handed to the copy thread has completed (or
