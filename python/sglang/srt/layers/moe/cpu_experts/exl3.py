@@ -100,7 +100,7 @@ class Exl3CpuQuantTrait:
         )
 
     def forward(self, handle, x, slots, weights, out, threads) -> None:
-        """Overwrite ``out`` with the routed sum of ``slots`` over layer ``handle``."""
+        """Overwrite ``out`` ``[m, H]`` with the routed sums of ``slots`` ``[m, k]`` over layer ``handle``."""
         self.ext.exl3_moe_cpu_forward(handle, x, slots, weights, out, threads)
 
     def free_layer(self, handle) -> None:

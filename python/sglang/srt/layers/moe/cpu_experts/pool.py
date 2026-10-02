@@ -60,7 +60,7 @@ class CpuExpertQuantTrait(Protocol):
         out: torch.Tensor,
         threads: int,
     ) -> None:
-        """Overwrite ``out`` with the routed sum over ``slots`` (int64 ``[1, k]``).
+        """Overwrite ``out`` with the routed sum over ``slots`` (int64 ``[m, k]``; ``compute`` passes one row).
 
         A slot of -1 is skipped.
         """
@@ -191,6 +191,61 @@ class CpuExpertPool:
         top = int(host_slots.max())
         if top >= capacity:
             # The kernel would skip an out-of-range slot silently.
+            raise ValueError(
+                f"layer {layer}: host slot {top} is outside the tier's {capacity} rows"
+            )
+        if capacity == 0:
+            out.zero_()
+            return
+        trait.forward(self._handles[layer], x, host_slots, weights, out, self.threads)
+
+
+    def compute_rows(
+        self,
+        layer: int,
+        host_slots: torch.Tensor,
+        weights: torch.Tensor,
+        x: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Overwrite ``out`` ``[m, H]`` with the routed sums of ``m`` rows.
+
+        ``x`` is ``[m, H]``, ``host_slots`` int64 ``[m, k]`` (-1 skips) and ``weights`` ``[m, k]``. The DSpark
+        draft's path (``cpu_experts/draft.py``): the kernel groups the rows' routes by expert, so it reads an expert
+        once per two rows that route to it. Must run on a thread that called ``bind_current_thread``.
+        """
+        if threading.get_native_id() not in self._bound_threads:
+            raise RuntimeError(
+                "compute_rows() from a thread that has not called bind_current_thread()"
+            )
+        trait = self.trait
+        rows = x.shape[0]
+        if (
+            x.dim() != 2
+            or host_slots.dtype != torch.int64
+            or host_slots.dim() != 2
+            or host_slots.shape[0] != rows
+            or weights.shape != host_slots.shape
+            or out.shape != x.shape
+        ):
+            raise ValueError(
+                "x and out must be [m, H] and host_slots int64 [m, k] with weights of the same shape, "
+                f"got x {tuple(x.shape)}, host_slots {tuple(host_slots.shape)}, weights {tuple(weights.shape)}, "
+                f"out {tuple(out.shape)}"
+            )
+        if (
+            x.dtype != trait.x_dtype
+            or weights.dtype != trait.weights_dtype
+            or out.dtype != trait.out_dtype
+        ):
+            raise ValueError(
+                f"{trait.name} takes x {trait.x_dtype}, weights {trait.weights_dtype}, out {trait.out_dtype}"
+            )
+        if layer not in self.capacity:
+            raise ValueError(f"layer {layer} is not in the CPU expert pool")
+        capacity = self.capacity[layer]
+        top = int(host_slots.max()) if host_slots.numel() else -1
+        if top >= capacity:
             raise ValueError(
                 f"layer {layer}: host slot {top} is outside the tier's {capacity} rows"
             )
