@@ -1,8 +1,9 @@
 """EXL3 binding of the CPU expert kernel, as a ``CpuExpertQuantTrait``.
 
-The kernel is exllamav3's CPU MoE kernel, vendored in
-``python/sglang/srt/layers/quantization/exl3_cpu/moe_mul1.cpp``. ``Exl3CpuQuantTrait``
-registers each streamed layer's pinned slab rows with it as views, and exposes the
+The kernel is the optimized build of exllamav3's CPU MoE kernel,
+``python/sglang/srt/layers/quantization/exl3_cpu/optimized/moe_mul1.cpp`` (built by
+SGLANG_DSV41_CPU_EXPERTS=1; only it has the slab registration ABI). ``Exl3CpuQuantTrait``
+registers each streamed layer's pinned slabs with it by base pointer, and exposes the
 kernel's C entry points (forward and core placement) that the native CPU expert thread
 calls without Python.
 """
@@ -13,21 +14,6 @@ from typing import Any, Mapping, Optional
 import torch
 
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
-
-
-def _one_part(slab: torch.Tensor, rank: int) -> torch.Tensor:
-    """``slab`` as ``[slot, ...]`` of ``rank`` dims.
-
-    Accepts that shape or the pinned tier's ``[slot, 1, ...]`` (the one-part axis of
-    the format's row shape), which it returns as a view without the part axis.
-    """
-    if slab.dim() == rank + 1 and slab.shape[1] == 1:
-        return slab[:, 0]
-    if slab.dim() != rank:
-        raise ValueError(
-            f"an EXL3 w2 slab of shape {tuple(slab.shape)} is neither [slot, ...] nor [slot, 1, ...]"
-        )
-    return slab
 
 
 class Exl3CpuQuantTrait:
@@ -49,6 +35,7 @@ class Exl3CpuQuantTrait:
         self.ext = ext
         self.act_limit = act_limit
         self.swizzled = swizzled
+        self._slabs: dict[int, list[torch.Tensor]] = {}
 
     def check_environment(self) -> None:
         """Require ``EXL3_MOE_CPU_PIN=0``; else the kernel pins to the first cores."""
@@ -62,50 +49,77 @@ class Exl3CpuQuantTrait:
         return int(slabs["w13_suh"].shape[-1])  # the gate's input sign vector
 
     def register_layer(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> int:
-        """Register one layer's ``capacity`` slab rows with the kernel as views.
+        """Register one layer's first ``capacity`` slab rows with the kernel, by base pointer.
 
-        Returns the kernel's layer handle. Raises if the activation limit is not known
-        yet.
+        The kernel addresses slot ``s`` of each slab at its base plus ``s`` rows, so each slab must be a contiguous
+        CPU tensor of at least ``capacity`` rows of the format's row size; the trait keeps the tensors alive until
+        ``free_layer``. Returns the kernel's layer handle. Raises if the activation limit is not known yet, if a slab
+        would be misaddressed, or if the kernel refuses the registration.
         """
         if self.act_limit is None:
             raise ValueError(
                 "the EXL3 CPU kernel needs the layers' activation limit before a layer registers"
             )
-        w13_t, w13_u, w13_v = slabs["w13_trellis"], slabs["w13_suh"], slabs["w13_svh"]
-        # The kernel takes one w2 matrix per expert: drop the tier's one-part axis.
-        w2_t, w2_u, w2_v = (
-            _one_part(slabs[name], rank)
-            for name, rank in (("w2_trellis", 4), ("w2_suh", 2), ("w2_svh", 2))
+        hidden = int(slabs["w13_suh"].shape[-1])
+        intermediate = int(slabs["w13_svh"].shape[-1])
+        bits = int(slabs["w13_trellis"].shape[-1]) // 16
+        trellis = hidden * intermediate * bits // 16  # int16 elements of one [k/16, n/16, 16 * bits] trellis
+        row = {  # elements per slot row: w13 rows hold gate then up, w2 rows hold down
+            "w13_trellis": 2 * trellis,
+            "w13_suh": 2 * hidden,
+            "w13_svh": 2 * intermediate,
+            "w2_trellis": trellis,
+            "w2_suh": intermediate,
+            "w2_svh": hidden,
+        }
+        for name in self.slab_names:
+            slab = slabs[name]
+            dtype = torch.int16 if name.endswith("_trellis") else torch.float16
+            if (
+                slab.device.type != "cpu"
+                or not slab.is_contiguous()
+                or slab.dtype != dtype
+                or slab.shape[0] < capacity
+                or slab[0].numel() != row[name]
+            ):
+                raise ValueError(
+                    f"EXL3 slab {name} {tuple(slab.shape)} {slab.dtype} is not {capacity} contiguous CPU rows of "
+                    f"{row[name]} {dtype} elements"
+                )
+        import ctypes
+
+        fn = self._native("sglang_exl3_cpu_experts_register_slabs")
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_float,
+            ctypes.POINTER(ctypes.c_int64),
+        ]
+        bases = (ctypes.c_void_p * len(self.slab_names))(
+            *(slabs[name].data_ptr() for name in self.slab_names)
         )
-        rows = range(capacity)
-        # Gate is w13 part 0 and up is part 1; each [slot, part] view is contiguous.
-        # Activation 0 is silu with the swiglu limit, as the GPU graph path runs it
-        # (python/sglang/srt/layers/quantization/exl3_fused_moe.py).
-        return self.ext.exl3_moe_cpu_make_layer(
-            [w13_t[s, 0] for s in rows],
-            [w13_u[s, 0] for s in rows],
-            [w13_v[s, 0] for s in rows],
-            [w13_t[s, 1] for s in rows],
-            [w13_u[s, 1] for s in rows],
-            [w13_v[s, 1] for s in rows],
-            [w2_t[s] for s in rows],
-            [w2_u[s] for s in rows],
-            [w2_v[s] for s in rows],
-            [],
-            [],
-            [],
-            0,
-            self.act_limit,
-            1 if self.swizzled else 0,
+        handle = ctypes.c_int64(-1)
+        status = fn(
+            bases, capacity, hidden, intermediate, bits, int(self.swizzled), self.act_limit, ctypes.byref(handle)
         )
+        if status != 0:
+            raise RuntimeError(f"the EXL3 CPU kernel refused the layer's slabs: status {status}")
+        self._slabs[handle.value] = [slabs[name] for name in self.slab_names]
+        return handle.value
 
     def forward(self, handle, x, slots, weights, out, threads) -> None:
         """Overwrite ``out`` with the routed sum of ``slots`` over layer ``handle``."""
         self.ext.exl3_moe_cpu_forward(handle, x, slots, weights, out, threads)
 
     def free_layer(self, handle) -> None:
-        """Release the kernel's layer ``handle``."""
+        """Release the kernel's layer ``handle`` and the slabs it addressed."""
         self.ext.exl3_moe_cpu_free_layer(handle)
+        self._slabs.pop(handle, None)
 
     def _native(self, name: str):
         """The C function ``name`` of the extension's vendored-kernel ABI.
@@ -120,7 +134,7 @@ class Exl3CpuQuantTrait:
         except AttributeError as error:
             raise RuntimeError(
                 f"the EXL3 extension {self.ext.__file__} has no {name}: CPU experts need the vendored CPU kernel, "
-                "which a build flavor selects (SGLANG_EXL3_CPU_ACT_RESIDUAL=1 SGLANG_EXL3_CPU_ACT_BLOCK=128)"
+                "which SGLANG_DSV41_CPU_EXPERTS=1 builds (exl3_cpu/optimized)"
             ) from error
 
     def native_forward(self) -> int:
