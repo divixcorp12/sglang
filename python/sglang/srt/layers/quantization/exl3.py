@@ -417,6 +417,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 param = nn.Parameter(
                     torch.empty(0, dtype=torch.int8, device=device), requires_grad=False
                 )
+                if self.cpu_draft:
+                    # The loader stages CPU parameters onto the GPU around post-load; the views and CPU-pool slabs
+                    # taken there would keep a GPU copy of every draft expert alive.
+                    param._sglang_skip_device_loading = True
                 set_weight_attrs(
                     param,
                     {
