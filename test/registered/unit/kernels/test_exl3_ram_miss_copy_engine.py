@@ -12,11 +12,20 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, new_hot_page, new_page
+from sglang.kernels.ops.moe.expert_stream_transport import (
+    DEMAND_RECORDS,
+    new_hot_page,
+    new_page,
+)
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, attached_host, ram_miss_setup, run_host_script
+from sglang.test.dsv41_ram_miss_fixtures import (
+    assert_aborted,
+    attached_host,
+    ram_miss_setup,
+    run_host_script,
+)
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -26,7 +35,9 @@ DST_ROWS = 6
 
 def _host(tmp_path, **host_kw):
     # Six slots, two staging: four mappable rows.
-    s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    s = ram_miss_setup(
+        tmp_path, capacity=6, mirror_weights=(1.0, 1.0), hidden=256, inter=512
+    )
     page = new_page(pin=False)
     host = attached_host(s, page, k=2, **host_kw)
     return s, page, host, ChainSim(host, page, s.slabs)
@@ -34,7 +45,14 @@ def _host(tmp_path, **host_kw):
 
 def _copy_table(s, dst):
     return torch.tensor(
-        [[slab.data_ptr(), dst[name].data_ptr(), slab[0].numel() * slab.element_size()] for name, slab in s.slabs[ROW].items()],
+        [
+            [
+                slab.data_ptr(),
+                dst[name].data_ptr(),
+                slab[0].numel() * slab.element_size(),
+            ]
+            for name, slab in s.slabs[ROW].items()
+        ],
         dtype=torch.int64,
     )
 
@@ -42,7 +60,10 @@ def _copy_table(s, dst):
 def _copy_engine(s, host, *, arm=True, wait_timeout_ms=2000):
     """The CPU backend, a copy table from the row's slabs to host "destination" tensors, and (by default) armed."""
     host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=wait_timeout_ms)
-    dst = {name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype) for name, slab in s.slabs[ROW].items()}
+    dst = {
+        name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype)
+        for name, slab in s.slabs[ROW].items()
+    }
     host.set_copy_table(ROW, _copy_table(s, dst), DST_ROWS)
     if arm:
         host.arm_copy_engine()
@@ -61,7 +82,12 @@ def _slot_of(host, expert):
 
 
 def _rows_equal(dst, slabs, dst_row, host_slot):
-    return all(torch.equal(dst[n][dst_row].view(torch.uint8), slabs[n][host_slot].view(torch.uint8)) for n in dst)
+    return all(
+        torch.equal(
+            dst[n][dst_row].view(torch.uint8), slabs[n][host_slot].view(torch.uint8)
+        )
+        for n in dst
+    )
 
 
 def _until(predicate, timeout_s=5.0):
@@ -86,8 +112,12 @@ def test_a_copy_lane_completes_only_on_the_observed_completion(tmp_path):
         assert req.kinds == [LaneKind.HIT_COPY] and req.slots == [slot]
         assert host.pump() == 1
         time.sleep(0.05)  # the copy thread has had every chance to publish early
-        assert sim.copy_done(req) != req.gen, "CopyDone published before the copy completed"
-        assert not any(dst[n][2].view(torch.uint8).any() for n in dst), "bytes landed before the release"
+        assert sim.copy_done(req) != req.gen, (
+            "CopyDone published before the copy completed"
+        )
+        assert not any(dst[n][2].view(torch.uint8).any() for n in dst), (
+            "bytes landed before the release"
+        )
         host.copy_engine_release(1)
         assert host.copy_engine_idle(5.0)
         assert sim.copy_done(req) == req.gen
@@ -114,8 +144,12 @@ def test_the_record_carries_the_destination_slots_and_the_flag(tmp_path):
         assert req.kinds == [LaneKind.HIT_COPY, LaneKind.HIT_COPY] and host.pump() == 1
         host.copy_engine_release(-1)
         assert host.copy_engine_idle(5.0) and sim.copy_done(req) == req.gen
-        assert _rows_equal(dst, s.slabs[ROW], 5, slots[0]) and _rows_equal(dst, s.slabs[ROW], 1, slots[1])
-        assert not any(dst[n][0].view(torch.uint8).any() for n in dst), "a lane was copied to its own index"
+        assert _rows_equal(dst, s.slabs[ROW], 5, slots[0]) and _rows_equal(
+            dst, s.slabs[ROW], 1, slots[1]
+        )
+        assert not any(dst[n][0].view(torch.uint8).any() for n in dst), (
+            "a lane was copied to its own index"
+        )
     finally:
         host.stop()
 
@@ -131,13 +165,19 @@ def test_only_hit_lanes_are_copied(tmp_path):
         host.copy_engine_release(-1)
         assert host.copy_engine_idle(5.0)
         assert sim.copy_done(req) == req.gen
-        assert _rows_equal(dst, s.slabs[ROW], 0, _slot_of(host, 3)) and _rows_equal(dst, s.slabs[ROW], 5, _slot_of(host, 2))
-        assert not any(dst[n][1].view(torch.uint8).any() for n in dst), "the miss lane was copied by the copy engine"
+        assert _rows_equal(dst, s.slabs[ROW], 0, _slot_of(host, 3)) and _rows_equal(
+            dst, s.slabs[ROW], 5, _slot_of(host, 2)
+        )
+        assert not any(dst[n][1].view(torch.uint8).any() for n in dst), (
+            "the miss lane was copied by the copy engine"
+        )
     finally:
         host.stop()
 
 
-@pytest.mark.parametrize("case", ["uncaptured", "unarmed", "no_slot", "slot_past_table"])
+@pytest.mark.parametrize(
+    "case", ["uncaptured", "unarmed", "no_slot", "slot_past_table"]
+)
 def test_a_lane_the_copy_engine_cannot_take_is_an_sm_hit(tmp_path, case):
     """The device types no copy lane for an eager post, an unarmed engine, or a destination outside the table (R1-4's
     dst_ok); the service then copies nothing."""
@@ -151,11 +191,21 @@ def test_a_lane_the_copy_engine_cannot_take_is_an_sm_hit(tmp_path, case):
 
         assert sim.apply_pending(ROW)  # as the post does first
         kinds, slots = type_lanes(
-            [3], sim.replica.ram_slot[ROW], sim.replica.staging[ROW], sim.split(), captured=case != "uncaptured",
-            copy_armed=sim.copy_armed(), hit_copy="ce", cpu_on=False, cpu_misses=False, dst_ok=[dst_ok],
+            [3],
+            sim.replica.ram_slot[ROW],
+            sim.replica.staging[ROW],
+            sim.split(),
+            captured=case != "uncaptured",
+            copy_armed=sim.copy_armed(),
+            hit_copy="ce",
+            cpu_on=False,
+            cpu_misses=False,
+            dst_ok=[dst_ok],
         )
         assert kinds == [LaneKind.HIT_SM]
-        sim.post(ROW, [3], dst=dst, captured=case != "uncaptured", kinds=kinds, slots=slots)
+        sim.post(
+            ROW, [3], dst=dst, captured=case != "uncaptured", kinds=kinds, slots=slots
+        )
         assert host.pump() == 1
         assert host.counters()["copy_jobs"] == 0 and host.copy_engine_marked() == 0
     finally:
@@ -194,7 +244,9 @@ assert host.pump() == 1
 
 
 @pytest.mark.parametrize("fault", ["issue", "query"])
-def test_a_copy_whose_completion_cannot_be_established_aborts_the_process(tmp_path, fault):
+def test_a_copy_whose_completion_cannot_be_established_aborts_the_process(
+    tmp_path, fault
+):
     """CopyDone without an observed completion would let the device read a destination the copy has not filled."""
     result = run_host_script(
         tmp_path,
@@ -269,7 +321,9 @@ def test_lapped_hit_only_records_do_not_stall(tmp_path):
     try:
         _load(sim, host, [3])
         mapping = host.mapping(ROW)
-        for _ in range(DEMAND_RECORDS + 8):  # past the ring, with no host pass in between
+        for _ in range(
+            DEMAND_RECORDS + 8
+        ):  # past the ring, with no host pass in between
             sim.post(ROW, [3])
         assert host.pump() == 1
         while host.pump():
@@ -305,7 +359,10 @@ def _sm_copy_engine(s, host):
 
     host.enable_copy_engine(-1, spin_us=200)
     names = list(s.slabs[ROW])
-    dst = {name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype) for name, slab in s.slabs[ROW].items()}
+    dst = {
+        name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype)
+        for name, slab in s.slabs[ROW].items()
+    }
     mask = sm_copy_mask(names)
     host.set_copy_table(ROW, _copy_table(s, dst), DST_ROWS, sm_mask=mask)
     host.arm_copy_engine()
@@ -317,7 +374,14 @@ def test_the_sm_mask_leaves_exactly_the_trellis_tensors_on_the_copy_engine():
     from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
     from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_mask
 
-    assert list(EXL3_STREAMED_NAMES) == ["w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh"]
+    assert list(EXL3_STREAMED_NAMES) == [
+        "w13_trellis",
+        "w13_suh",
+        "w13_svh",
+        "w2_trellis",
+        "w2_suh",
+        "w2_svh",
+    ]
     assert sm_copy_mask(EXL3_STREAMED_NAMES) == 0b110110
 
 
@@ -358,8 +422,15 @@ def test_sm_entries_skip_the_dma(tmp_path):
         assert req.kinds == [LaneKind.HIT_COPY] and host.pump() == 1
         host.copy_engine_release(-1)
         assert _until(lambda: sim.copy_done(req) == req.gen), "CopyDone never published"
-        assert all(torch.equal(dst[n][2].view(torch.uint8), s.slabs[ROW][n][slot].view(torch.uint8)) for n in dma_names)
-        assert not any(dst[n][2].view(torch.uint8).any() for n in sm_names), "the copy engine copied an SM entry"
+        assert all(
+            torch.equal(
+                dst[n][2].view(torch.uint8), s.slabs[ROW][n][slot].view(torch.uint8)
+            )
+            for n in dma_names
+        )
+        assert not any(dst[n][2].view(torch.uint8).any() for n in sm_names), (
+            "the copy engine copied an SM entry"
+        )
         assert host.copy_engine_idle(5.0)
     finally:
         host.stop()
@@ -374,9 +445,13 @@ def test_sm_small_copies_are_refused_without_the_copy_engine():
     base = Dsv41Config.from_envs()
     check_sm_small_copies(base)  # off: nothing to check
     with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE"):
-        check_sm_small_copies(msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True))
+        check_sm_small_copies(
+            msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True)
+        )
     check_sm_small_copies(
-        msgspec.structs.replace(base, enable_ram_miss_sm_small_copies=True, enable_ram_miss_copy_engine=True)
+        msgspec.structs.replace(
+            base, enable_ram_miss_sm_small_copies=True, enable_ram_miss_copy_engine=True
+        )
     )
 
 
@@ -388,7 +463,12 @@ def test_the_sm_table_refuses_a_small_tensor_off_16_byte_alignment():
     from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_table
 
     table = torch.tensor(
-        [[1 << 20, 2 << 20, 1 << 16], [(1 << 20) + 8, 2 << 20, 64], [1 << 20, (2 << 20) + 4, 64], [1 << 20, 2 << 20, 40]],
+        [
+            [1 << 20, 2 << 20, 1 << 16],
+            [(1 << 20) + 8, 2 << 20, 64],
+            [1 << 20, (2 << 20) + 4, 64],
+            [1 << 20, 2 << 20, 40],
+        ],
         dtype=torch.int64,
     )
     segments = SimpleNamespace(table=table)
@@ -423,9 +503,13 @@ def test_the_copy_thread_opens_a_closed_gate_once_copydone_is_published(tmp_path
         sim.close_copy_gate(req)
         host.pump()
         time.sleep(0.05)  # every releaser has had its chance to open early
-        assert sim.copy_gate() == lease.gate_word(req.seq, "closed"), "the gate opened before CopyDone"
+        assert sim.copy_gate() == lease.gate_word(req.seq, "closed"), (
+            "the gate opened before CopyDone"
+        )
         host.copy_engine_release(1)
-        assert _until(lambda: sim.copy_gate() == lease.gate_word(req.seq, "open")), sim.copy_gate()
+        assert _until(lambda: sim.copy_gate() == lease.gate_word(req.seq, "open")), (
+            sim.copy_gate()
+        )
         assert sim.copy_done(req) == req.gen
     finally:
         host.stop()
@@ -461,7 +545,9 @@ def test_stopping_the_service_thread_opens_a_closed_gate(tmp_path):
         req = sim.post(ROW, [3], dst=[2], captured=True)
         assert host.pump() == 1
         host.start_thread()
-        sim.close_copy_gate(req)  # the mark is held: no CopyDone, nothing else would open it
+        sim.close_copy_gate(
+            req
+        )  # the mark is held: no CopyDone, nothing else would open it
         host._module.expert_stream_stop_thread(host.handle)
         host.threaded = False
         assert sim.copy_gate() == lease.gate_word(req.seq, "open")
@@ -476,7 +562,14 @@ def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
 
     import sglang.kernels.ops.moe.expert_stream_transport as transport
 
-    tier = (Path(transport.__file__).resolve().parents[2] / "jit/csrc/moe/expert_stream/host/ram_tier.h").read_text()
+    source = (
+        Path(transport.__file__).resolve().parents[2]
+        / "jit/csrc/moe/expert_stream/host/ram_tier.h"
+    ).read_text()
+    # Whitespace-normalized, so clang-format may wrap a call's arguments without breaking the pin.
+    tier = " ".join(source.split())
     assert "store_release(lease_ + kLeaseCopyGate" not in tier
-    assert tier.count("std::memcpy(lease_ + kLeaseCopyGate") == 1  # init_lease_block, before any thread
+    assert (
+        tier.count("std::memcpy(lease_ + kLeaseCopyGate") == 1
+    )  # init_lease_block, before any thread
     assert "reinterpret_cast<uint32_t*>(lease_ + kLeaseCopyGate), &expected" in tier
