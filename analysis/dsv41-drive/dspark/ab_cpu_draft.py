@@ -48,7 +48,8 @@ def run(arm: str, outdir: str, n: int, new_tokens: int) -> int:
     overrides = {**COMMON, **ARMS[arm]}
     if arm == "routes":
         overrides["SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH"] = os.path.join(outdir, "routes.jsonl")
-    env = arm_env.arm_env(overrides)
+    # arm_env holds only the recipe; without the inherited PATH the extension build cannot find cc1plus.
+    env = os.environ | arm_env.arm_env(overrides)
     env["PYTHONPATH"] = os.path.join(REPO, "python")
     env.setdefault("OMP_NUM_THREADS", "16")
     cmd = [

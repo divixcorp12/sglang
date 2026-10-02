@@ -1451,7 +1451,8 @@ ARMS = {
 
 
 def run(arm: str, outdir: str, n: int, new_tokens: int) -> int:
-    env = arm_env.arm_env({**COMMON, **ARMS[arm]})
+    # arm_env holds only the recipe; without the inherited PATH the extension build cannot find cc1plus.
+    env = os.environ | arm_env.arm_env({**COMMON, **ARMS[arm]})
     env["PYTHONPATH"] = os.path.join(REPO, "python")
     env.setdefault("OMP_NUM_THREADS", "16")
     cmd = [
