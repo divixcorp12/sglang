@@ -896,7 +896,8 @@ rows).** These replace the proxy's `G` ≈ 107 and `f` ≈ 34% above:
   `_dynamic_graph_tier` at `:135`) picks each request's verify length. It uses
   confidence-based survival (`kernels/ops/speculative/dspark/dspark_schedule.py`) and a
   profiled steps/s table (`dspark_components/dspark_sps.py`). So k is dynamic.
-- The tech report gives **no acceptance-rate numbers**.
+- The tech report gives **no acceptance-rate numbers**. Measured eager on the EXL3 stack (§33.2): mean accept
+  length 2.88 (α ≈ 0.69) at 128 tokens, ~3.4 at 64k context.
 
 **Byte model.** On the Qwen stand-in (`analysis/cross-token/spec_window_summary.txt`):
 - The union of experts grows sublinearly (1.68x reuse at N=8), but miss rows grow faster
@@ -2346,6 +2347,9 @@ predictions already in RAM or VRAM cost no drive time.
   predictor.
 
 ### 18.5 DSpark does not run on the EXL3 stack yet
+
+**Superseded (2026-10-02):** every blocker below was closed on 2026-09-19 and DSpark runs eager; results and
+the graphed-verify analysis are in §33.
 
 Asked to try `--speculative-algorithm DSPARK --speculative-dspark-block-size 5`. Found by
 reading code and checkpoints, not by a launch:
@@ -3976,8 +3980,9 @@ stopped (`run_server.md` D7).
      no idle link or compute to hide under. Revisit only if items 3–4 leave the link well under
      70% busy.
    - **Resident-first MoE split:** each extra `exl3_moe` launch costs ~90 µs per layer.
-   - **DSpark:** blocked on four items (§18.5), and a 6-token verify routes more experts per step,
-     which means more link bytes.
+   - **DSpark:** runs eager at 1.4-2.2 tok/s (§33.2). A graphed verify needs the record, route plan and in-graph
+     MoE widened past one token, and a capped width with an overflow path (§33.3); the offline union curve
+     decides whether that is worth building.
 
 ### 26.3 Plan files and progress
 
@@ -3992,7 +3997,7 @@ sections cited and the merged code.
 | `2026-09-18-dsv41-phase3a-r2.md` | 3a on the MoE expert framework | Done | §16 |
 | `2026-09-19-dsv41-phase3b-optionC.md` | MoE inside the decode graph, io_uring RAM-miss thread, device wait | Done; the base of today's path | §17 |
 | `2026-09-19-dsv41-phase3b1.md` | "Graphs first": breakable graphs, one readback per layer | Superseded by option C, which met its goals | §17, §18 |
-| `2026-09-19-dsv41-dspark.md` | DSpark on the EXL3 stack, phase D1 | Parked by the owner 2026-09-19; not started | §18.5 |
+| `2026-09-19-dsv41-dspark.md` | DSpark on the EXL3 stack, phase D1 | D1 Tasks 1-7 done; Task 8 partial (parity, α; no rows/token or break-even). D2 not started | §33 |
 | `2026-09-19-dsv41-session-aware-ram-cache.md` | Session-aware RAM admission and replacement | Not started (route-log tooling only) | item 6 |
 | `2026-09-24-dsv41-piece-streaming.md` | Stream NVMe rows to the GPU piece by piece | Done; in the recipe | §24 |
 | `2026-09-24-dsv41-row-images.md` | Read rows straight into the pinned slabs | Done; in the recipe | §24.9 |
@@ -6414,7 +6419,7 @@ host simplifications after the merge. Nothing in §31 has run in a server.
 - **The hit copy is switchable:** `SGLANG_DSV41_RAM_HIT_COPY=ce` (default, the copy engine) or `sm` (C1).
 - **Env:** `SGLANG_DSV41_RAM_MISS_HIT_WAIT_US` is deprecated and ignored. The gate refuses `CPU_EXPERTS_MISSES`
   without `SGLANG_DSV41_CPU_EXPERTS=1` and an unknown `RAM_HIT_COPY`.
-- **Wire v2:** request page 4160 B (256-byte records with chain, epoch, per-lane slot, dst, weight and kind), completion
+- **Wire v2:** request page 4160 B (128-byte records, `kRecordBytes` in `lease_layout.h`, with chain, epoch, per-lane slot, dst, weight and kind), completion
   block 20480 B plus a 256-byte delta per row.
 
 Found on the way, fixed on the branch: the post stored every lane-kind byte as 0 (an `st_relaxed_sys<uint8_t>` call
@@ -6664,6 +6669,128 @@ production logs the warning), and the `SGLANG_MOE_EXPERT_DOORBELL*` family. `SGL
 is retired with no deprecation entry and no read site: a launch script that sets it is ignored and gets no RAM tier,
 with only the generic one-time warning about a missing `SGLANG_MOE_PINNED_HOST_MB` (which does not name the old
 variable); use `SGLANG_MOE_PINNED_HOST_MB`.
+
+## 33. DSpark: the Phase D1 results, and what a graphed verify needs (2026-10-02)
+
+Phase D1 (`docs/superpowers/plans/2026-09-19-dsv41-dspark.md`) was built and run on 2026-09-19..24, after §18.5 was
+written; none of it reached this doc until now. DSpark runs eager only. Run files are in
+`divix01:cc-expert-prediction/analysis/dsv41-dspark/`; the draft dir is `cc-expert-prediction/dsv41-dspark-draft`.
+
+### 33.1 What was built (all on `master`, 2026-09-19)
+
+§18.5's blockers, each closed by a commit:
+- **Draft dir:** `scripts/dsv41/make_dspark_draft_dir.py` (`8f1755193f`). A truncated checkpoint with
+  `num_nextn_predict_layers: 0` no longer counts as bundling a draft (`474640ac70`).
+- **Streamer:** EXL3 streams only the target's routed experts, not DSpark's stages (`519a903754`).
+- **Loader:** the DSpark loader reads EXL3 drafts (`b2b30b592e`, `01db7a2886`). Weightless (EXL3) `wkv` linears and
+  `lm_head` fall back correctly, and a quantized target `lm_head` is accepted (`2b35dd4560`, `2c1e3e0442`).
+- **Residency clock:** accepted tokens reach `on_speculative_commit` (`c6daeb9eb1`). The draft-block forward is no
+  longer counted as a verify (`f6beec8bc7`).
+- **Gate:** speculation is refused with any EXL3 decode graph (`57578836f1`), so DSpark is eager-only. CPU experts
+  are refused with speculation too (§30.1).
+- **Harness:** `trace_corpus.py --dspark` captures `spec_verify_ct` (`2d25b78087`).
+
+### 33.2 Results (eager, not traced)
+
+| Run | Files | Result |
+|---|---|---|
+| Smoke, 1 session, 32 tokens | `d1-smoke.json`, `run-d1.log` | Runs; 12 verifies for 32 tokens (accept length 2.67); 0.94 tok/s; TTFT 109 s |
+| Greedy parity, sessions 0-7, 128 tokens | `parity-{base,dspark}.json`, `parity-run.log` | **7 of 8 differ.** Mean accept length 2.884 (α ≈ 0.69 from 1 + α + ... + α^5) |
+| Determinism control | `parity-base2.json`, `determinism-run.log` | Base vs base: 8 of 8 byte-identical |
+| Margin probe, sessions 1-2, 32 tokens | `MARGIN_PROBE_FINDINGS.md` | First divergence is an exact bf16 tie (margin 0 in both arms); DSpark's token is in base's own tied-max set |
+| Production checkout, 64k context, one long session (2026-09-24) | `current-prod-64k.log`, `launch-current-smoke.sh` | Accept length 2.73-4.22 per logged interval (mean of 11 ≈ 3.4; accept rate 0.34-0.65); **1.4-2.2 tok/s** |
+
+**Parity verdict (margin probe): not an acceptance defect.** Both argmaxes break ties to the lowest index. A tie can
+only reject a legitimate draft, so α is not inflated. But the 6-token verify forward and the 1-token decode forward
+disagree by up to 1.4 logprob on near-top tokens (top-5 set differs at ~28% of positions). That is what moves ties.
+The source is not isolated. Candidates: the sm120 sparse attention at 6 query rows, M-dependent GEMM kernels, or the
+Engram verify context. Exact-text parity is the wrong test here. The probe proposes a teacher-forced tolerance test
+(eps two bf16 quanta), not yet built.
+
+**Not done:** Task 8's rows per accepted token, the union curve, and the break-even. The 2026-09-24 launch script
+sets flags that §30-§32 have since removed (`SGLANG_DSV41_ENABLE_RAM_MISS_LEASES`, `_RAM_MISS_PACK_WORKERS`; §32.7),
+so it needs updating before a relaunch.
+
+### 33.3 Running verify in the breakable decode graph: what blocks it
+
+Read-only code audit, 2026-10-02, at `master` `7f22a6bcbb`. Target: DSpark verify (M ≤ 6 tokens, bs 1) under
+`--cuda-graph-backend-decode breakable` with option C.
+
+**Already works for M tokens at bs 1:**
+- **Capture.** The breakable backend uses the same runner as the full graph. Under speculation it captures
+  `TARGET_VERIFY`, sized `max_bs × verify width` (`decode_cuda_graph_runner.py:291-348`). Max bs 1 gives one 6-token
+  graph. A shorter verify replays eager unless ragged mode is on (`:660-668`).
+- **Scratch and accounting.** Gather scratch is multiplied by the verify width (`model_runner.py:747-752`). The host
+  clock counts `bs × draft_token_num` (`expert_residency_clock.py:45-47`), and the device counter counts
+  `topk_ids.shape[0]` (`expert_stream.py:1451`). §10's `is_speculative()` guards are gone.
+- **Attention.** Verify is `is_extend()`, so attention runs as an eager break (`deepseek_v4.py:2063-2068`).
+- **One record per layer for the union of the M tokens' experts, on the GPU side.** Since §31 the pinned RAM map
+  changes only at record time. Victims are never among the record's routes, and one record is in flight, so the RAM
+  set is fixed for the layer. A lane is one distinct expert (`lease_device.cuh:379-380` traps on a repeat).
+  `slot`/`dst`/`kind` are per expert. Per-token weights are applied only in the GPU combine
+  (`exl3_route_tables.cuh:108-118`).
+
+**Single-token assumptions, hardest first:**
+1. **Width against VRAM capacity (redesign).** M = 6 at top-6 is up to 36 distinct experts per layer.
+   - DIRECT insert-on-miss needs `capacity ≥ 2 × width` (`expert_residency_gpu.py:378-383`): 72 slots/layer at full
+     width, against ≈30/layer with the draft resident (§4).
+   - Staging at width 36 is up to 1,440 rows ≈ 17.9 GiB of pinned RAM (§10, Stage A).
+   - So the gather width W must be capped below 36. A device-side overflow check must then send larger unions to an
+     eager or second-pass verify; `model_runner.py:759-764` already names the missing "overflow re-verify".
+   - W comes from the union curve (§10 gate 1).
+2. **The record is 8 lanes** (`kMaxIds = 8`, static-asserted, `lease_layout.h:24,84`; `MAX_IDS` at
+   `expert_stream_transport.py:1035`). Attach refuses `graph_gather_rows > MAX_IDS` (`exl3_ram_miss.py:1134-1140`),
+   so a lifted gate still fails at startup. Two ways out:
+   - a wider wire (W lanes, 64-bit kind/CE/CPU masks, PieceMask and delta blocks resized; `row_copy_kernels.cuh`
+     packs 8-bit masks);
+   - ⌈U/8⌉ records per layer, which keeps the wire but lengthens each layer's miss wait.
+3. **Fused route plan:** one warp, ≤32 routes, unique ids only, and `topk_ids.shape[0] == 1` is required
+   (`expert_route_plan.py:126-134`). It needs cross-token dedup; `plan_graph_routes` already has the logic.
+4. **In-graph EXL3 MoE:** raises on `x.shape[0] != 1` (`exl3_fused_moe.py:171-174`), with buffers sized for one
+   token's top-k. It needs `[M, H]` in and out and a token index per route.
+   - Unverified: whether exllamav3's `exl3_moe` takes several rows per slot under deterministic mode. The P2 probe
+     (`test/manual/dsv41/test_exl3_moe_probe_gpu.py`) can check.
+5. **CPU experts are one token end to end.**
+   - The C ABI calls `forward_raw(..., 1, k, ...)` (`moe_mul1.cpp:3250`).
+   - The pool needs `x.shape[0] == 1`. Input is one row, output is one `[hidden]` per part.
+   - The record's lane `weight` sums the matching routes into one scalar (`lease_kernels.cuh:204-211`).
+   - The tuned path turns off for chunks with more than one token (`moe_mul1.cpp:3073`).
+   - Cost: link cost is flat per expert, while CPU cost grows with the tokens routed to it (≈ ⌈t/2⌉ weight passes,
+     inferred). So verify favours the link anyway.
+   - **v1 runs CPU experts off for verify.** Every DSpark target step is a verify, so that gives up §30.1's 1.40×.
+6. **Small items:**
+   - The copy-engine barrier tests `is_decode()`, which excludes `TARGET_VERIFY` (`exl3_ram_miss.py:1364-1367`).
+     So an armed engine forces `torch.cuda.synchronize()` on every captured verify, and verifies never count toward
+     arming.
+   - The Engram native lookup needs one token in decode mode (`engram.py:130-137`): two eager breaks per verify.
+   - The protect list truncates silently at 8 (`lease_kernels.cuh:164`). Only recency stamps are lost.
+7. **DSpark side:**
+   - The resident draft MoE runs `exl3_moe_loop`, which asserts it is not capturing and reads `bincount().tolist()`
+     (`exl3_ops.py:191-211`). So draft capture must be skipped for an EXL3 draft (`dspark_worker_v2.py:531-566`)
+     while the target keeps its graph.
+   - Use static verify mode: compact mode adds host syncs (`dspark_planner.py:347-352`, `:501`).
+   - Folding accept/commit into the verify graph currently also requires a folded draft proposal
+     (`dspark_worker_v2.py:886-895`).
+   - Graphing the draft needs a capturable multi-token EXL3 MoE for its 128 resident experts. None exists.
+8. **The gate** (`expert_stream_requirements_exl3.py:100-109`) is lifted last. Its "scratch sized for one token"
+   comment is stale; the record width and the MoE are the real limits.
+
+**Why it may not pay [estimate].**
+- The link (~1 ms per RAM-hit row) is the bottleneck. A verify moves the union for up to 6 tokens and yields ~2.9-3.4
+  accepted tokens.
+- At the Qwen stand-in's reuse (§10), a 6-token union near 4× one token's rows moves ~1.3× more bytes per accepted
+  token than plain decode, before draft time.
+- The baseline is now ~13.5 tok/s with CPU experts (§30.1), which v1 must give up for verify.
+- The resident draft's 6.75 GiB comes out of the hot cache.
+
+**Next step if resumed:** measure the union offline before any D2 code. Replay the router capture
+(`direct-two-phase-tests/hot-cache-policy/router-capture/stages.jsonl`, 6,153 consecutive decode tokens) in windows of
+N = 2/4/6. That gives:
+- per-layer union size and its p95/p99, which sets W;
+- RAM-hit and miss rows per accepted token at accept length ~3, through `cpu_expert_sim.py --slot-map`;
+- a projected tok/s against 13.5.
+
+Build items 1-5 only if the projection beats it.
 
 ## Sources
 
