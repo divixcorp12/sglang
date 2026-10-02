@@ -38,6 +38,15 @@ def is_streamed_expert_module(prefix: str) -> bool:
     return ROUTED_EXPERT_MODULE_RE.match(prefix) is not None
 
 
+# The DSpark draft's stage MoEs: "stages.<S>.mlp.experts" (empty root prefix) or "model.stages.<S>.mlp.experts".
+DSPARK_DRAFT_EXPERT_MODULE_RE = re.compile(r"^(?:model\.)?stages\.\d+\.mlp\.experts$")
+
+
+def is_dspark_draft_expert_module(prefix: str) -> bool:
+    """True for a DSpark draft stage's routed-expert FusedMoE."""
+    return DSPARK_DRAFT_EXPERT_MODULE_RE.match(prefix) is not None
+
+
 def is_streamed_expert_weight(name: str, quant_method: str | None, streaming: bool) -> bool:
     """True for a routed-expert tensor that EXL3 expert streaming reads from disk itself."""
     return (
