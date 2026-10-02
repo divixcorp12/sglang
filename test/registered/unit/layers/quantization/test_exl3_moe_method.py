@@ -163,7 +163,7 @@ def _cpu_draft_moe(monkeypatch, tmp_path, resident, fused_shared=0):
     from sglang.srt.layers.moe.cpu_experts import draft, draft_resident
 
     registered = []
-    registry = SimpleNamespace(register=lambda slabs, on_cpu, limit: registered.append((slabs, on_cpu, limit)) or 0)
+    registry = SimpleNamespace(register=lambda slabs, on_cpu, limit, *, layer_id: registered.append((slabs, on_cpu, limit)) or 0)
     monkeypatch.setattr(draft, "DRAFT_CPU_EXPERTS", registry)
     path = tmp_path / "resident.json"
     draft_resident.write_resident_set(str(path), {0: resident}, n=len(resident), source="")
