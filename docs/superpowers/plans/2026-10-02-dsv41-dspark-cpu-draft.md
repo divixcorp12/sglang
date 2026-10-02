@@ -306,6 +306,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
+> **Superseded (2026-10-02):** Tasks 2-7 below are replaced by
+> `docs/superpowers/plans/2026-10-02-dsv41-dspark-hybrid-draft.md` (owner's call after the routes probe in
+> Results: all-CPU is break-even, a GPU resident set plus CPU is not). Task 1 and Results stand as its evidence.
+
 ### Task 2: `CpuExpertPool.compute_rows`: the pool for more than one row
 
 **Files:**
