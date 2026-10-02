@@ -110,11 +110,11 @@ M1_TARGET_BW void register_band(const MoeCpuMatrix& mat,const PreparedIn& in,flo
 
 #include "traversal.hpp"
 
-M1_TARGET_BW void register_tiles(const MoeCpuMatrix& mat,const PreparedIn& in,float* tout,int t0,int t1) {
+M1_TARGET_BW void register_tiles(const MoeCpuMatrix& mat,const PreparedIn& in,float* tout,int t0,int t1,bool grouped) {
     if(in.compact) {
         // The prepared compact path is private to whole 128-output groups.
         TORCH_CHECK(t0%8==0 && t1%8==0,"compact input requires whole output blocks");
-        if(!mat.swz)traversal_tiles(mat,in,tout,t0,t1);
+        if(!mat.swz)traversal_tiles(mat,in,tout,t0,t1,grouped);
         else for(int t=t0;t<t1;t+=8)register_band<4,0,0,true>(mat,in,tout,t);
         return;
     }

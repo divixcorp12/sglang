@@ -63,8 +63,6 @@
 // target), hence the recursive-template row unrolling.
 
 
-// Worker-local traversal choice: grouped only for the guarded single-expert path.
-thread_local bool grouped_traversal = false;
 
 namespace { std::atomic<bool> g_prof_enabled { false }; }
 
@@ -2039,14 +2037,14 @@ M1_TARGET_BW M1_ALWAYS_INLINE __m512i register_bytesum(__m512i state) {
 // k-block sub-views summed in fp32, then each remainder row added onto its token row. Only this
 // worker's columns [tn0, tn1) are touched, so the sums need no synchronization.
 template <Isa I>
-void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped = false)
 {
     if (tn0 >= tn1) return;
     if constexpr (I == Isa::Bw && ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128)
     {
         if (m == 1 && mat.bits == 3 && act_blocked(mat.k))
         {
-            register_tiles(mat,in,tout,tn0,tn1);
+            register_tiles(mat,in,tout,tn0,tn1,grouped);
             return;
         }
     }
@@ -2126,6 +2124,7 @@ struct Chunk
 };
 
 #include "experts.hpp"
+#include "shapes.hpp"
 
 // -------------------------------------------------------------------------------------------
 //   MoE Layer registry
@@ -2157,13 +2156,6 @@ struct ForwardCtx
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
 
 };
-
-// Compact scratch already guarantees the DSV4.1 shape, unswizzled 3-bit
-// weights and one row per chunk. Count routed work, not experts in the layer cache.
-inline bool single_expert_quant512(const ForwardCtx& c) {
-    return c.m_total == 1 && c.chunks.size() == 1
-        && c.prep_d[0].compact != nullptr;
-}
 
 struct ForwardArena
 {
@@ -2377,228 +2369,13 @@ void transform_owned_blocks(const MoeCpuMatrix& mat,float* out,int m,int t0,int 
 
 // Coarse readiness is per expert: all gate/up outputs must exist before middle,
 // and all middle blocks must be prepared before any down output band can run.
-template <Isa I, class Experts>
-void forward_phase_index(ForwardCtx& c, const Experts& E, int worker, int num_workers, int phase)
-{
-    const int nc = static_cast<int>(c.chunks.size());
-    const int H = c.info.hidden;
-    const int I_ = c.info.intermediate;
-
-    if(phase==0 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(H) && I==Isa::Bw) {
-        if (single_expert_quant512(c)) prepare_gu_blocks<I, true>(c,E,worker,num_workers);
-        else prepare_gu_blocks<I, false>(c,E,worker,num_workers);
-        return;
-    }
-    if (phase==2 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(I_) && I!=Isa::Scalar) {
-        if (single_expert_quant512(c)) middle_blocks<I, true>(c,E,worker,num_workers);
-        else middle_blocks<I, false>(c,E,worker,num_workers);
-        return;
-    }
-    switch (phase) {
-
-        case 0:
-        {
-            // Prepare gate and up inputs, distributed over (chunk, gate/up)
-            const int gu = !c.info.gated ? 1 : 2;
-            for (int j = worker; j < nc * gu; j += num_workers)
-            {
-                const Chunk& ch = c.chunks[j / gu];
-                const bool up = gu == 1 || (j % gu);
-                const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
-                PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                prepare_rows<I>(mat, c.x, nullptr, H, ch.token, ch.m, p);
-            }
-            break;
-        }
-
-        case 1:
-        {
-            // Gate + up GEMVs (see assign_gemvs)
-            const int gu = !c.info.gated ? 1 : 2;
-            assign_gemvs(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
-            {
-                const Chunk& ch = c.chunks[j / gu];
-                const bool up = gu == 1 || (j % gu);
-                const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
-                const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
-                run_tiles<I>(mat, p, tout, ch.m, t0, t1);
-            });
-            break;
-        }
-
-        case 2:
-        {
-            // Output transform for gate/up, activation, prepare down input; per chunk. Gated: act(g)
-            // * u accumulated into g; gateless: relu2 applied to u in place
-            const bool gated = c.info.gated;
-            for (int j = worker; j < nc; j += num_workers) {
-                const Chunk& ch = c.chunks[j];
-                float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I_;
-                float* u = c.tout_u + static_cast<size_t>(j) * MAX_M * I_;
-                if (gated) transform_out<I>(E.gate(ch.expert), g, ch.m);
-                transform_out<I>(E.up(ch.expert), u, ch.m);
-                const size_t count = static_cast<size_t>(ch.m) * I_;
-                float* a = gated ? g : u;
-                // Nonzero act_limit clamps the up path symmetrically and the activated gate
-                // from above, BEFORE the multiply (matching the GPU act_mul kernels). DS4
-                // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
-                // context push |u| into the thousands, and skipping the clamp here made
-                // offloaded experts diverge arbitrarily far from their GPU-resident twins
-                const float lim = c.info.act_limit != 0.0f
-                    ? c.info.act_limit : std::numeric_limits<float>::infinity();
-                switch (c.info.activation) {
-                    case 0:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = g[i];
-                            const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
-                            g[i] = av * std::clamp(u[i], -lim, lim);
-                        }
-                        break;
-                    case 1:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = g[i];
-                            const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
-                            const float av = std::min(gv * cdf, lim);
-                            g[i] = av * std::clamp(u[i], -lim, lim);
-                        }
-                        break;
-                    case 3: {
-                        // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
-                        // sigmoid(1.702 * g)
-                        const float lim = c.info.act_limit;
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = std::min(g[i], lim);
-                            const float uv = std::clamp(u[i], -lim, lim);
-                            g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(-1.702f * gv));
-                        }
-                        break;
-                    }
-                    default:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float uv = u[i] > 0.0f ? u[i] : 0.0f;
-                            u[i] = uv * uv;
-                        }
-                        break;
-                }
-                static const int idx4[MAX_M] = {0, 1, 2, 3};
-                prepare_rows<I>(E.down(ch.expert), nullptr, a, I_, idx4, ch.m, c.prep_d[j]);
-            }
-            break;
-        }
-
-        case 3:
-        {
-            // Down GEMVs
-            assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
-            {
-                const Chunk& ch = c.chunks[j];
-                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                run_tiles<I>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1);
-                transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);
-            });
-            break;
-        }
-
-        case 4:
-        {
-            // Down output transform (per chunk), then weighted accumulate into out, partitioned
-            // over hidden columns so overlapping token rows are race-free
-            for (int j = worker; j < nc; j += num_workers) {
-                const Chunk& ch = c.chunks[j];
-                transform_out<I>(E.down(ch.expert), c.tout_d + static_cast<size_t>(j) * MAX_M * H, ch.m);
-            }
-            break;
-        }
-
-        case 5:
-        {
-            const int c0 = ((H/16) * worker / num_workers)*16;
-            const int c1 = ((H/16) * (worker+1) / num_workers)*16;
-            for (int j = 0; j < nc; ++j) {
-                const Chunk& ch = c.chunks[j];
-                const float* d = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                for (int r = 0; r < ch.m; ++r) {
-                    float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
-                    const float* src = d + static_cast<size_t>(r) * H;
-                    const float w = ch.weight[r];
-                    for (int col = c0; col < c1; ++col)
-                        dst[col] += w * src[col];
-                }
-            }
-            break;
-        }
-    }
-}
+#include "forward_plan.hpp"
 
 
 
 // The forward's OpenMP team for tier I: pins worker i to the configured core i, runs the phases with a barrier after
 // each, and checks the team. Phase 4 (the whole-row down transform) is folded into phase 3's owned blocks.
-template <Isa I, class Experts>
-void run_team(ForwardCtx& ctx, const Experts& E, int count, bool grouped)
-{
-    // Freeze the configured cores once. Steady-state forwards acquire no pool mutex.
-    if (!g_compute_started.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(g_cores_mutex);
-        if (!g_compute_started.load(std::memory_order_relaxed)) {
-            g_compute_cores = g_configured_cores;
-            g_compute_started.store(true, std::memory_order_release);
-        }
-    }
-    TORCH_CHECK(g_compute_cores.empty() || size_t(count)<=g_compute_cores.size(),
-                "CPU expert worker count exceeds configured cores");
-    const bool prof=g_prof_enabled.load(std::memory_order_relaxed);
-    double phase_us[6]{};
-    std::atomic<int> pin_error{0};
-    std::atomic<int> actual_workers{0};
-    #pragma omp parallel num_threads(count) shared(ctx,pin_error,actual_workers,phase_us)
-    {
-        const int worker=omp_get_thread_num(),n=omp_get_num_threads();
-        if(worker==0)actual_workers.store(n,std::memory_order_relaxed);
-        grouped_traversal=grouped;
-        if(!g_compute_cores.empty()) {
-            const int core=g_compute_cores[worker];
-            static thread_local int pinned_core=-1;
-            if(pinned_core!=core || sched_getcpu()!=core) {
-                cpu_set_t set;CPU_ZERO(&set);CPU_SET(core,&set);
-                if(pthread_setaffinity_np(pthread_self(),sizeof(set),&set))
-                    pin_error.store(1,std::memory_order_relaxed);
-                else pinned_core=core;
-            }
-        }
-        if(n==count) {
-            for(int phase=0;phase<6;++phase) {
-                if(phase==4)continue; // Complete down blocks already include their output transform.
-                const auto begin=prof?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-                forward_phase_index<I>(ctx,E,worker,n,phase);
-                if(phase<5) {
-                    #pragma omp barrier
-                }
-                if(prof && worker==0)phase_us[phase]=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count();
-            }
-        }
-    }
-    TORCH_CHECK(!pin_error.load(),"cannot pin CPU expert worker to its configured core");
-    TORCH_CHECK(actual_workers.load()==count,"OpenMP returned fewer CPU expert workers than requested");
-    if(prof)printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",phase_us[0],phase_us[1],phase_us[2],phase_us[3],phase_us[4],phase_us[5]);
-}
 
-template <class Experts>
-using TeamFn = void (*)(ForwardCtx&, const Experts&, int, bool);
-
-template <class Experts>
-TeamFn<Experts> team_for(Isa isa)
-{
-    switch (isa) {
-        case Isa::Scalar: return run_team<Isa::Scalar, Experts>;
-        case Isa::Avx2:   return run_team<Isa::Avx2, Experts>;
-        case Isa::Bw:     return run_team<Isa::Bw, Experts>;
-        case Isa::Vnni:   return run_team<Isa::Vnni, Experts>;
-        case Isa::Vbmi:   return run_team<Isa::Vbmi, Experts>;
-    }
-    return run_team<Isa::Scalar, Experts>;
-}
 
 } // namespace
 
@@ -2800,73 +2577,16 @@ static void forward_raw(
     const int nc = static_cast<int>(ctx.chunks.size());
     if (!nc) { give_back(); return; }
 
-    // Workspace: persistent per-thread arena, grown but never shrunk
-    const int H = info.hidden;
-    const int I = info.intermediate;
-    bool compact_forward=g_isa==Isa::Bw && ACT_ROWS==2 && EXL3_MOE_CPU_ACT_BLOCK==128
-        && H==5120 && I==2304 && info.gated;
-    if(compact_forward) for(const auto& ch:ctx.chunks) {
-        const auto& g=E.gate(ch.expert);const auto& u=E.up(ch.expert);const auto& d=E.down(ch.expert);
-        if(ch.m!=1 || g.bits!=3 || u.bits!=3 || d.bits!=3 || g.swz || u.swz || d.swz) {compact_forward=false;break;}
-    }
-    auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
-    grow(ar.tin_g, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.tin_u, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.tin_d, static_cast<size_t>(nc) * MAX_M * I);
-    if(!compact_forward) {
-    grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I);
-    grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I);
-    } else {
-
-        grow(ar.compact_g,size_t(nc)*ACT_ROWS*H);
-        grow(ar.compact_u,size_t(nc)*ACT_ROWS*H);
-        grow(ar.compact_d,size_t(nc)*ACT_ROWS*I);
-    }
-    grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I);
-    grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I);
-    grow(ar.tout_d, static_cast<size_t>(nc) * MAX_M * H);
-    grow(ctx.prep_g, nc); grow(ctx.prep_u, nc); grow(ctx.prep_d, nc);
-    ctx.tout_g = ar.tout_g.data();
-    ctx.tout_u = ar.tout_u.data();
-    ctx.tout_d = ar.tout_d.data();
-    for (int j = 0; j < nc; ++j)
-    {
-        ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_M * H,
-                          compact_forward?nullptr:(ar.splat_g.data() + static_cast<size_t>(j) * MAX_M * H),
-                          compact_forward?nullptr:(ar.splat_dup_g.data() + static_cast<size_t>(j) * MAX_M * H), {}, {} };
-        ctx.prep_u[j] = { ar.tin_u.data() + static_cast<size_t>(j) * MAX_M * H,
-                          compact_forward?nullptr:(ar.splat_u.data() + static_cast<size_t>(j) * MAX_M * H),
-                          compact_forward?nullptr:(ar.splat_dup_u.data() + static_cast<size_t>(j) * MAX_M * H), {}, {} };
-        ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_M * I,
-                          compact_forward?nullptr:(ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I),
-                          compact_forward?nullptr:(ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_M * I), {}, {} };
-        if(compact_forward) {
-            ctx.prep_g[j].compact=ar.compact_g.data()+size_t(j)*ACT_ROWS*H;
-            ctx.prep_u[j].compact=ar.compact_u.data()+size_t(j)*ACT_ROWS*H;
-            ctx.prep_d[j].compact=ar.compact_d.data()+size_t(j)*ACT_ROWS*I;
+    if (g_isa == Isa::Bw && Dsv41Shape::accepts(info, E, ctx.chunks))
+        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, E, ar, threads);
+    else
+        switch (g_isa) {
+            case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, threads); break;
+            case Isa::Avx2:   ForwardPlan<GenericShape, Isa::Avx2>::run(ctx, E, ar, threads); break;
+            case Isa::Bw:     ForwardPlan<GenericShape, Isa::Bw>::run(ctx, E, ar, threads); break;
+            case Isa::Vnni:   ForwardPlan<GenericShape, Isa::Vnni>::run(ctx, E, ar, threads); break;
+            case Isa::Vbmi:   ForwardPlan<GenericShape, Isa::Vbmi>::run(ctx, E, ar, threads); break;
         }
-    }
-    if (EXL3_MOE_CPU_ACT_BLOCK)
-    {
-        // Sized for one block per 16 inputs, the smallest B allows; only k / B entries are used
-        const size_t sh = static_cast<size_t>(MAX_M) * (H / 16), si = static_cast<size_t>(MAX_M) * (I / 16);
-        grow(ar.bq_g, nc * sh); grow(ar.bq_u, nc * sh); grow(ar.bq_d, nc * si);
-        grow(ar.bsum_g, nc * sh); grow(ar.bsum_u, nc * sh); grow(ar.bsum_d, nc * si);
-        for (int j = 0; j < nc; ++j)
-        {
-            ctx.prep_g[j].bq = ar.bq_g.data() + j * sh; ctx.prep_g[j].bsum = ar.bsum_g.data() + j * sh;
-            ctx.prep_u[j].bq = ar.bq_u.data() + j * sh; ctx.prep_u[j].bsum = ar.bsum_u.data() + j * sh;
-            ctx.prep_d[j].bq = ar.bq_d.data() + j * si; ctx.prep_d[j].bsum = ar.bsum_d.data() + j * si;
-        }
-    }
-
-    const int count=threads>0?threads:1;
-    const bool grouped=compact_forward && nc==1;
-    team_for<TableExperts>(g_isa)(ctx, E, count, grouped);
     give_back();
 }
 

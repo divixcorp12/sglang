@@ -76,11 +76,11 @@ M1_TARGET_BW void traversal_group(const MoeCpuMatrix& mat, const PreparedIn& in,
 }
 
 M1_TARGET_BW void traversal_tiles(const MoeCpuMatrix& mat,const PreparedIn& in,
-                                 float* tout,int t0,int t1) {
+                                 float* tout,int t0,int t1,bool grouped) {
     for(int t=t0;t<t1;) {
         const int remaining=(t1-t)/8;
         // Range-aware: preserve three-band E1 ranges, 9=3+3+3 and 10=3+3+4.
-        const int cap=grouped_traversal ? (remaining>4 ? 3 : 4) : 1;
+        const int cap=grouped ? (remaining>4 ? 3 : 4) : 1;
         const int groups=std::min(cap,remaining);
         switch(groups) {
             case 4: traversal_group<4>(mat,in,tout,t);break;
