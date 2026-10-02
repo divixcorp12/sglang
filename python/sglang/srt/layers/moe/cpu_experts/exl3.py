@@ -60,9 +60,10 @@ class Exl3CpuQuantTrait:
             raise ValueError(
                 "the EXL3 CPU kernel needs the layers' activation limit before a layer registers"
             )
-        hidden = int(slabs["w13_suh"].shape[-1])
-        intermediate = int(slabs["w13_svh"].shape[-1])
-        bits = int(slabs["w13_trellis"].shape[-1]) // 16
+        # The w13 trellis ([slot, 2, k/16, n/16, 16 * bits]) fixes every dimension, so each other slab is checked
+        # against it rather than against itself.
+        w13 = slabs["w13_trellis"]
+        hidden, intermediate, bits = int(w13.shape[-3]) * 16, int(w13.shape[-2]) * 16, int(w13.shape[-1]) // 16
         trellis = hidden * intermediate * bits // 16  # int16 elements of one [k/16, n/16, 16 * bits] trellis
         row = {  # elements per slot row: w13 rows hold gate then up, w2 rows hold down
             "w13_trellis": 2 * trellis,
