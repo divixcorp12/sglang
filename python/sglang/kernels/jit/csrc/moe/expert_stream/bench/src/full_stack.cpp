@@ -3,6 +3,24 @@
 // them with the optimized EXL3 kernel; the writer times post -> CopyDone against the bare kernel call.
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <sstream>
+#include <thread>
+#include <vector>
+
+#include "cpu_experts_cabi.h"
+#include "device_sim.h"
+#include "stack.h"
+#include "stack_fixture.h"
+
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -14,6 +32,7 @@
 
 namespace {
 namespace fs = std::filesystem;
+namespace es = ::sglang::expert_stream;
 using namespace fullstack;
 
 struct Options {
@@ -79,6 +98,141 @@ Placement resolve_placement(const Options& o) {
   return p;
 }
 
+StackConfig stack_config(const StackFixture& f, const Placement& p, const Options& o) {
+  StackConfig c;
+  c.rows = f.row_set();
+  c.staging = StackFixture::kStaging;
+  c.forward = &sglang_exl3_cpu_experts_forward;
+  c.threads = static_cast<int>(p.workers.size());
+  c.cores.assign(p.workers.begin(), p.workers.end());
+  c.x_base = f.x_row(0);
+  c.x_stride = f.x_stride();
+  c.out_base = reinterpret_cast<uint8_t*>(f.out_row(0));
+  c.out_stride = f.out_stride();
+  c.hidden = f.hidden();
+  c.service_cpu = p.service;
+  c.copy_cpu = p.copy;
+  c.wait_timeout_ns = int64_t{o.wait_timeout_ms} * 1'000'000;
+  for (int n = 0; n <= es::kLeaseLanes; ++n) c.split[n] = n;  // every eligible lane is the CPU's
+  if constexpr (BenchBuild::kMetrics) c.trace_capacity = 4096;
+  return c;
+}
+
+// Freed after the stack, whose CPU expert thread uses them: declare before the Stack.
+struct LayerHandles {
+  std::vector<int64_t> handles;
+  ~LayerHandles() {
+    for (int64_t handle : handles) StackFixture::free_layer(handle);
+  }
+};
+
+struct StackCall {
+  int64_t t0 = 0;  // before the x store
+  int64_t t1 = 0;  // CopyDone seen
+  SimRequest request;
+};
+
+class Bench {
+ public:
+  Bench(const Options& options, Placement placement, StackFixture& fixture, Stack<BenchBuild>& stack, DeviceSim& sim,
+        std::vector<int64_t> handles)
+      : options_(options),
+        placement_(std::move(placement)),
+        fixture_(fixture),
+        stack_(stack),
+        sim_(sim),
+        handles_(std::move(handles)),
+        deadline_ns_(int64_t{options.wait_timeout_ms} * 1'000'000 / 2) {
+    for (int k : {1, 3, 5}) {
+      for (int i = 0; i < k; ++i) {
+        experts_[k].push_back(i);
+        // cpu_forward.cpp's routing coefficients, which the frozen references were computed with
+        weights_[k].push_back(0.071234f + (k == 1 ? 0.0f : 0.23f * i / (k - 1)));
+      }
+      for (int64_t row = 0; row < fixture.rows(); ++row) {
+        std::vector<int32_t> slots;
+        for (int32_t e : experts_[k]) slots.push_back(sim.ram_slot(row, e));
+        slots_[k].push_back(std::move(slots));
+      }
+    }
+  }
+
+  const Options& options() const { return options_; }
+  const Placement& placement() const { return placement_; }
+  Stack<BenchBuild>& stack() { return stack_; }
+  int64_t rows() const { return fixture_.rows(); }
+
+  // The device's part of one request: x, the record, the copy wait. t0..t1 is the timed interval.
+  StackCall stack_call(int64_t row, int k) {
+    StackCall call;
+    call.t0 = monotonic_ns();
+    fixture_.write_x(row);
+    call.request = sim_.post(row, experts_[k], weights_[k], /*captured=*/true, call.t0 + deadline_ns_);
+    const bool done = sim_.copy_wait(call.request, call.t0 + deadline_ns_);
+    call.t1 = monotonic_ns();
+    if (!done) throw std::runtime_error("the copy wait passed its deadline: " + describe(call.request));
+    for (int j = 0; j < k; ++j) {
+      if (call.request.kinds[j] != static_cast<int32_t>(es::kKindHitCpu))
+        throw std::runtime_error("lane " + std::to_string(j) + " was not typed HIT_CPU: " + describe(call.request));
+    }
+    return call;
+  }
+
+  // The C ABI forward on the same layer handle, slots, x and output memory, from the calling thread.
+  void bare_call(int64_t row, int k) {
+    if (sglang_exl3_cpu_experts_forward(handles_[row], fixture_.x_row(row), slots_[k][row].data(), weights_[k].data(), k,
+                                        fixture_.out_row(row), static_cast<int32_t>(placement_.workers.size()), 0) != 0)
+      throw std::runtime_error("the bare CPU forward failed");
+  }
+
+  // Every layer's output for k experts, through the stack or bare, against reference-e{k}.bin, bit-exact. Each output
+  // is NaN-poisoned first, so a forward that did not run fails.
+  void validate(int k, bool via_stack) {
+    const int64_t hidden = fixture_.hidden();
+    std::vector<float> results(static_cast<size_t>(rows() * hidden));
+    for (int64_t row = 0; row < rows(); ++row) {
+      float* out = fixture_.out_row(row);
+      std::fill(out, out + hidden, std::numeric_limits<float>::quiet_NaN());
+      if (via_stack) {
+        stack_call(row, k);
+      } else {
+        bare_call(row, k);
+      }
+      for (int64_t h = 0; h < hidden; ++h)
+        if (!std::isfinite(out[h])) throw std::runtime_error("non-finite output in layer " + std::to_string(row));
+      std::copy(out, out + hidden, results.begin() + row * hidden);
+    }
+    check_reference(options_.references / ("reference-e" + std::to_string(k) + ".bin"), results);
+  }
+
+  std::string describe(const SimRequest& r) {
+    std::ostringstream s;
+    s << "gen " << r.gen << " (seq " << r.seq << ") row " << r.row << ", " << r.count << " lanes, kinds";
+    for (int j = 0; j < r.count; ++j) s << ' ' << r.kinds[j];
+    const auto c = stack_.counters();
+    const auto cpu = stack_.cpu_stats();
+    s << "; served " << c[es::kServedRequests] << " touch_only " << c[es::kTouchOnly] << " rows_read "
+      << c[es::kRowsRead] << " overruns " << c[es::kOverruns] << "; cpu jobs " << cpu[0] << " lanes " << cpu[1]
+      << "; CopyDone " << sim_.copy_done(r) << ", gate 0x" << std::hex << sim_.copy_gate() << std::dec
+      << ", handled through " << stack_.tier().handled_through();
+    return s.str();
+  }
+
+  std::map<int, double> bare_p50_us;  // BM_bare's p50 per k, for BM_stack's overhead counter
+
+ private:
+  const Options& options_;
+  Placement placement_;
+  StackFixture& fixture_;
+  Stack<BenchBuild>& stack_;
+  DeviceSim& sim_;
+  std::vector<int64_t> handles_;
+  int64_t deadline_ns_;
+  std::map<int, std::vector<int32_t>> experts_;
+  std::map<int, std::vector<float>> weights_;
+  std::map<int, std::vector<std::vector<int32_t>>> slots_;  // [k][row]
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -89,7 +243,44 @@ int main(int argc, char** argv) {
     const Placement placement = resolve_placement(options);
     validate_placement(placement, system_topology(), !options.self_test);
     if (options.self_test) return run_self_test(placement, options.image_dir) == 0 ? 0 : 1;
-    throw std::runtime_error("only --self-test is built yet");
+
+    setenv("EXL3_MOE_CPU_PIN", "0", 1);
+    setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
+    configure_cpu_kernel_runtime();
+    if (sglang_exl3_cpu_experts_set_cores(placement.workers.data(), static_cast<int32_t>(placement.workers.size())) != 0)
+      throw std::runtime_error("Cannot configure kernel cores");
+    const auto before = task_ids();
+    std::unique_ptr<StackFixture> fixture;
+    {
+      PinScope first_touch(placement.workers.front());  // slabs, x and outputs on the workers' node
+      fixture = std::make_unique<StackFixture>(options.fixture, options.image_dir);
+    }
+    pin_self(placement.writer);  // the writer's stores and clock; the page and lease are first-touched here
+    LayerHandles layers;
+    Stack<BenchBuild> stack(stack_config(*fixture, placement, options));
+    DeviceSim sim(stack.page(), stack.lease(), fixture->rows(), fixture->experts());
+    const int64_t timeout_ns = int64_t{options.wait_timeout_ms} * 1'000'000;
+    std::vector<int32_t> all(static_cast<size_t>(fixture->experts()));
+    std::iota(all.begin(), all.end(), 0);
+    for (int64_t row = 0; row < fixture->rows(); ++row) {
+      load_experts(sim, row, all, static_cast<int>(StackFixture::kStaging), timeout_ns);
+      layers.handles.push_back(fixture->register_layer(row));
+      stack.set_cpu_layer(row, layers.handles.back());
+      sim.set_row_cpu(row);
+    }
+    Bench bench(options, placement, *fixture, stack, sim, layers.handles);
+    for (int k : {1, 3, 5}) {
+      bench.validate(k, /*via_stack=*/true);
+      PinScope caller(placement.workers.front());  // the kernel's caller is worker 0, as on the CPU expert thread
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));  // that thread's 50 ms idle spin ends first
+      bench.validate(k, /*via_stack=*/false);
+    }
+    const std::vector<int> expected = expected_threads(placement);
+    verify_threads(before, expected);
+    std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
+              << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName << " build)\n";
+    if (!options.validate_only) throw std::runtime_error("timing is not built yet: run with --validate-only");
+    return 0;
   } catch (const std::exception& error) {
     std::cerr << "Error: " << error.what() << '\n';
     return 1;
