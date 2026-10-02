@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -140,6 +141,23 @@ int64_t StackFixture::register_layer(int64_t row) const {
     m[8].push_back(view(5, s, 0, {H}, at::kHalf));
   }
   return exl3_moe_cpu_make_layer(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], {}, {}, {}, 0, 10.0, 0);
+}
+
+void StackFixture::preload_slots(int64_t row) const {
+  const Impl& f = *impl_;
+  const ImageLayout& layout = f.set.layout;
+  if (f.experts > kCapacity - kStaging) throw std::runtime_error("more experts than mappable slots");
+  const std::string& path = f.set.paths[static_cast<size_t>(row)];
+  std::ifstream in(path, std::ios::binary);
+  std::vector<char> image(static_cast<size_t>(layout.image_bytes));
+  for (int64_t e = 0; e < f.experts; ++e) {
+    in.seekg(e * layout.row_stride);
+    if (!in.read(image.data(), static_cast<std::streamsize>(image.size())))
+      throw std::runtime_error("cannot read expert " + std::to_string(e) + "'s image from " + path);
+    for (int n = 0; n < kNames; ++n)
+      std::memcpy(f.set.slabs[row][n] + e * layout.row_bytes[n], image.data() + layout.name_offsets[n],
+                  static_cast<size_t>(layout.row_bytes[n]));
+  }
 }
 
 void StackFixture::free_layer(int64_t handle) {

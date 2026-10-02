@@ -134,13 +134,12 @@ struct StackCall {
 
 class Bench {
  public:
-  Bench(const Options& options, Placement placement, StackFixture& fixture, Stack<BenchBuild>& stack, DeviceSim& sim,
-        std::vector<int64_t> handles)
+  // The bare phase first: the slots hold expert e in slot e (StackFixture::preload_slots), and no stack exists, so no
+  // CPU expert thread spins on worker 0's core, where the kernel puts every caller.
+  Bench(const Options& options, Placement placement, StackFixture& fixture, std::vector<int64_t> handles)
       : options_(options),
         placement_(std::move(placement)),
         fixture_(fixture),
-        stack_(stack),
-        sim_(sim),
         handles_(std::move(handles)),
         deadline_ns_(int64_t{options.wait_timeout_ms} * 1'000'000 / 2) {
     for (int k : {1, 3, 5}) {
@@ -149,24 +148,38 @@ class Bench {
         // cpu_forward.cpp's routing coefficients, which the frozen references were computed with
         weights_[k].push_back(0.071234f + (k == 1 ? 0.0f : 0.23f * i / (k - 1)));
       }
-      for (int64_t row = 0; row < fixture.rows(); ++row) {
-        std::vector<int32_t> slots;
-        for (int32_t e : experts_[k]) slots.push_back(sim.ram_slot(row, e));
-        slots_[k].push_back(std::move(slots));
-      }
     }
   }
 
   const Options& options() const { return options_; }
   const Placement& placement() const { return placement_; }
-  Stack<BenchBuild>& stack() { return stack_; }
   int64_t rows() const { return fixture_.rows(); }
 
-  // One OpenMP team at a time (release_kernel_team): every bare call comes first, from this thread, then the stack's.
+  Stack<BenchBuild>& stack() {
+    enter_stack_phase();
+    return *stack_;
+  }
+
+  // Ends the bare phase, on the writer's thread: release the bare caller's OpenMP team (one team at a time), build the
+  // stack, load every expert through the tier's reader (into the slots the bare forwards used), register the layers.
   void enter_stack_phase() {
-    if (stack_phase_) return;
+    if (stack_) return;
     release_kernel_team();
-    stack_phase_ = true;
+    stack_ = std::make_unique<Stack<BenchBuild>>(stack_config(fixture_, placement_, options_));
+    sim_ = std::make_unique<DeviceSim>(stack_->page(), stack_->lease(), rows(), fixture_.experts());
+    const int64_t timeout_ns = int64_t{options_.wait_timeout_ms} * 1'000'000;
+    std::vector<int32_t> all(static_cast<size_t>(fixture_.experts()));
+    std::iota(all.begin(), all.end(), 0);
+    for (int64_t row = 0; row < rows(); ++row) {
+      load_experts(*sim_, row, all, static_cast<int>(StackFixture::kStaging), timeout_ns);
+      for (int32_t e : all)
+        if (sim_->ram_slot(row, e) != e)
+          throw std::runtime_error("row " + std::to_string(row) + ": the tier put expert " + std::to_string(e) +
+                                   " in slot " + std::to_string(sim_->ram_slot(row, e)) +
+                                   ", not the slot the bare forwards used");
+      stack_->set_cpu_layer(row, handles_[row]);
+      sim_->set_row_cpu(row);
+    }
   }
 
   // The device's part of one request: x, the record, the copy wait. t0..t1 is the timed interval.
@@ -175,8 +188,8 @@ class Bench {
     StackCall call;
     call.t0 = monotonic_ns();
     fixture_.write_x(row);
-    call.request = sim_.post(row, experts_[k], weights_[k], /*captured=*/true, call.t0 + deadline_ns_);
-    const bool done = sim_.copy_wait(call.request, call.t0 + deadline_ns_);
+    call.request = sim_->post(row, experts_[k], weights_[k], /*captured=*/true, call.t0 + deadline_ns_);
+    const bool done = sim_->copy_wait(call.request, call.t0 + deadline_ns_);
     call.t1 = monotonic_ns();
     if (!done) throw std::runtime_error("the copy wait passed its deadline: " + describe(call.request));
     for (int j = 0; j < k; ++j) {
@@ -186,12 +199,14 @@ class Bench {
     return call;
   }
 
-  // The C ABI forward on the same layer handle, slots, x and output memory, from the calling thread.
+  // The C ABI forward on the same layer handle, slots, x and output memory, from the calling thread. Slot e holds
+  // expert e, so the experts are the slots.
   void bare_call(int64_t row, int k) {
-    if (stack_phase_)
-      throw std::runtime_error("a bare forward after the stack's first one would run a second OpenMP team on the "
-                               "workers' cores: BM_bare runs first (no --benchmark_enable_random_interleaving)");
-    if (sglang_exl3_cpu_experts_forward(handles_[row], fixture_.x_row(row), slots_[k][row].data(), weights_[k].data(), k,
+    if (stack_)
+      throw std::runtime_error("a bare forward once the stack exists would share worker 0's core with the CPU expert "
+                               "thread and run a second OpenMP team: BM_bare runs first "
+                               "(no --benchmark_enable_random_interleaving)");
+    if (sglang_exl3_cpu_experts_forward(handles_[row], fixture_.x_row(row), experts_[k].data(), weights_[k].data(), k,
                                         fixture_.out_row(row), static_cast<int32_t>(placement_.workers.size()), 0) != 0)
       throw std::runtime_error("the bare CPU forward failed");
   }
@@ -220,12 +235,12 @@ class Bench {
     std::ostringstream s;
     s << "gen " << r.gen << " (seq " << r.seq << ") row " << r.row << ", " << r.count << " lanes, kinds";
     for (int j = 0; j < r.count; ++j) s << ' ' << r.kinds[j];
-    const auto c = stack_.counters();
-    const auto cpu = stack_.cpu_stats();
+    const auto c = stack_->counters();
+    const auto cpu = stack_->cpu_stats();
     s << "; served " << c[es::kServedRequests] << " touch_only " << c[es::kTouchOnly] << " rows_read "
       << c[es::kRowsRead] << " overruns " << c[es::kOverruns] << "; cpu jobs " << cpu[0] << " lanes " << cpu[1]
-      << "; CopyDone " << sim_.copy_done(r) << ", gate 0x" << std::hex << sim_.copy_gate() << std::dec
-      << ", handled through " << stack_.tier().handled_through();
+      << "; CopyDone " << sim_->copy_done(r) << ", gate 0x" << std::hex << sim_->copy_gate() << std::dec
+      << ", handled through " << stack_->tier().handled_through();
     return s.str();
   }
 
@@ -235,14 +250,12 @@ class Bench {
   const Options& options_;
   Placement placement_;
   StackFixture& fixture_;
-  Stack<BenchBuild>& stack_;
-  DeviceSim& sim_;
-  std::vector<int64_t> handles_;
+  std::vector<int64_t> handles_;  // owned by main's LayerHandles, which outlives this
   int64_t deadline_ns_;
-  bool stack_phase_ = false;
   std::map<int, std::vector<int32_t>> experts_;
   std::map<int, std::vector<float>> weights_;
-  std::map<int, std::vector<std::vector<int32_t>>> slots_;  // [k][row]
+  std::unique_ptr<Stack<BenchBuild>> stack_;  // built by enter_stack_phase; null during the bare phase
+  std::unique_ptr<DeviceSim> sim_;
 };
 
 bool benchmark_failed = false;
@@ -259,8 +272,7 @@ void gap(const Options& options) {
 
 void bm_bare(benchmark::State& state, Bench& bench, int k) {
   try {
-    PinScope caller(bench.placement().workers.front());  // the kernel's caller is worker 0 (spec ruling 2)
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // the CPU expert thread on this core goes to sleep
+    PinScope caller(bench.placement().workers.front());  // the kernel runs its caller as worker 0, on that core
     bench.validate(k, false);
     for (int i = 0; i < bench.options().warmup; ++i) bench.bare_call(i % bench.rows(), k);
     std::vector<double> samples;
@@ -386,28 +398,20 @@ int main(int argc, char** argv) {
       PinScope first_touch(placement.workers.front());  // slabs, x and outputs on the workers' node
       fixture = std::make_unique<StackFixture>(options.fixture, options.image_dir);
     }
-    pin_self(placement.writer);  // the writer's stores and clock; the page and lease are first-touched here
-    LayerHandles layers;
-    Stack<BenchBuild> stack(stack_config(*fixture, placement, options));
-    DeviceSim sim(stack.page(), stack.lease(), fixture->rows(), fixture->experts());
-    const int64_t timeout_ns = int64_t{options.wait_timeout_ms} * 1'000'000;
-    std::vector<int32_t> all(static_cast<size_t>(fixture->experts()));
-    std::iota(all.begin(), all.end(), 0);
+    pin_self(placement.writer);  // the writer's stores and clock; the stack's page and lease are first-touched here
+    LayerHandles layers;  // outlives the Bench, whose stack's CPU expert thread uses them
     for (int64_t row = 0; row < fixture->rows(); ++row) {
-      load_experts(sim, row, all, static_cast<int>(StackFixture::kStaging), timeout_ns);
+      fixture->preload_slots(row);
       layers.handles.push_back(fixture->register_layer(row));
-      stack.set_cpu_layer(row, layers.handles.back());
-      sim.set_row_cpu(row);
     }
-    Bench bench(options, placement, *fixture, stack, sim, layers.handles);
+    Bench bench(options, placement, *fixture, layers.handles);
     const std::vector<int> expected = expected_threads(placement);
     if (options.validate_only) {
       {
-        PinScope caller(placement.workers.front());  // the kernel's caller is worker 0, as on the CPU expert thread
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // that thread's 50 ms idle spin ends first
+        PinScope caller(placement.workers.front());  // the kernel runs its caller as worker 0, on that core
         for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/false);
       }
-      for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/true);
+      for (int k : {1, 3, 5}) bench.validate(k, /*via_stack=*/true);  // the first builds the stack
       verify_threads(before, expected);
       std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
                 << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName
@@ -440,6 +444,7 @@ int main(int argc, char** argv) {
           ->Unit(benchmark::kMicrosecond);
     benchmark::RunSpecifiedBenchmarks();
     benchmark::Shutdown();
+    bench.validate(1, /*via_stack=*/true);  // the census counts the stack's threads, even after a BM_bare-only filter
     verify_threads(before, expected);
     return benchmark_failed ? 1 : 0;
   } catch (const std::exception& error) {
