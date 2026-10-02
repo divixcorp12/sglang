@@ -178,7 +178,13 @@ copy thread spinning; a forward_vs_bare far from 0 means overhead_p50_us carries
 Fidelity: the writer's stores reach the service by coherence between two node-0 cores, not by PCIe/DDIO; pickup is a
 lower bound on the GPU path's. The prod build's numbers are the headline; instr's carry the trace's cost.
 
-Run (from the service: write the job, then start the service):
+Run, from a login shell on divix01 (no production server running; service installed):
+  bash "$bench/run_full_stack.sh" --launch [BUILD_DIR] [benchmark options...]
+It configures BUILD_DIR once (default /data/models/exl3_exp/google_benchmark/full-stack-build) and builds both
+binaries, writes service-command.txt naming this script as the service's job, and starts exl3bench.service (through
+sg exl3bench when the shell predates the install's group membership); follow it with journalctl -u exl3bench.service
+-f. It refuses while the service is active or a production server runs. Remove service-command.txt to return the
+service to run.sh. By hand, the job file is:
   printf '%s\n' /bin/bash "$bench/run_full_stack.sh" \
     /data/models/exl3_exp/google_benchmark/full-stack-build \
     > /data/models/exl3_exp/google_benchmark/service-command.txt
