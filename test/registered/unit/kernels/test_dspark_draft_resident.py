@@ -44,6 +44,8 @@ def test_a_written_file_loads_back_as_frozensets(tmp_path):
         json.dumps({"version": 1, "n": 1, "source": "", "stages": {"0": [-1]}}),
         json.dumps({"version": 1, "n": 2, "source": "", "stages": {"0": [1, 1]}}),
         json.dumps({"version": 1, "n": 1, "source": "", "stages": {"x": [1]}}),
+        json.dumps({"version": 1, "n": 1, "source": "", "stages": {"0": [1, 2]}}),
+        json.dumps({"version": 1, "source": "", "stages": {"0": [1]}}),
     ],
 )
 def test_a_malformed_file_is_refused_naming_the_path(tmp_path, content):

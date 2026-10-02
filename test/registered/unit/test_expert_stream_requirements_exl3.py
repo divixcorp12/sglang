@@ -444,7 +444,12 @@ DSPARK_CPU_ENV = dict(
 )
 
 
-def test_dspark_cpu_experts_pass_with_dspark_and_cores(model_dir):
+@pytest.fixture
+def cpu_pin_off(monkeypatch):
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+
+
+def test_dspark_cpu_experts_pass_with_dspark_and_cores(model_dir, cpu_pin_off):
     _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **DSPARK_CPU_ENV)
 
 
@@ -462,11 +467,25 @@ def test_dspark_cpu_experts_need_two_cores(model_dir, cores):
         )
 
 
-def test_a_bad_resident_file_is_refused_at_launch(model_dir, tmp_path):
+def test_a_bad_resident_file_is_refused_at_launch(model_dir, tmp_path, cpu_pin_off):
     bad = tmp_path / "resident.json"
     bad.write_text("{}")
     with pytest.raises(ValueError, match="resident.json"):
         _gate(
             _launch(model_dir, speculative_algorithm="DSPARK"),
             **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": str(bad)},
+        )
+
+
+def test_dspark_cpu_experts_need_the_kernel_pin_off(model_dir, monkeypatch):
+    monkeypatch.delenv("EXL3_MOE_CPU_PIN", raising=False)
+    with pytest.raises(ValueError, match="EXL3_MOE_CPU_PIN=0"):
+        _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **DSPARK_CPU_ENV)
+
+
+def test_dspark_cpu_experts_refuse_more_threads_than_cores(model_dir, cpu_pin_off):
+    with pytest.raises(ValueError, match="SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"):
+        _gate(
+            _launch(model_dir, speculative_algorithm="DSPARK"),
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS": 13},
         )

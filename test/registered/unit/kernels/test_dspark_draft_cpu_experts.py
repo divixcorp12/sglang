@@ -119,10 +119,10 @@ def test_the_registry_builds_once_from_the_envs_and_refuses_mixed_limits(monkeyp
     monkeypatch.setattr(draft, "cpu_trait_for", lambda key: built.append(key) or _Trait())
     registry = DraftCpuExpertsRegistry()
     slabs = {"w13_trellis": torch.zeros(E, 2, dtype=torch.int16)}
-    assert registry.register(slabs, _on_cpu(), 10.0) == 0
-    assert registry.register(slabs, _on_cpu(), 10.0) == 1
+    assert registry.register(slabs, _on_cpu(), 10.0, layer_id=0) == 0
+    assert registry.register(slabs, _on_cpu(), 10.0, layer_id=1) == 1
     with pytest.raises(ValueError, match="activation limit"):
-        registry.register(slabs, _on_cpu(), 7.0)
+        registry.register(slabs, _on_cpu(), 7.0, layer_id=2)
     cores = ",".join(str(c) for c in _cores())
     with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(cores):
         try:
@@ -130,5 +130,24 @@ def test_the_registry_builds_once_from_the_envs_and_refuses_mixed_limits(monkeyp
             assert registry.runtime() is runtime and built == ["exl3"]
             assert runtime.pool.trait.act_limit == 10.0
             assert sorted(runtime.pool.capacity) == [0, 1]
+        finally:
+            registry.close()
+
+
+def test_the_registry_refuses_a_resident_file_with_a_stage_the_draft_lacks(monkeypatch, tmp_path):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts import draft
+    from sglang.srt.layers.moe.cpu_experts.draft_resident import write_resident_set
+
+    monkeypatch.setattr(draft, "cpu_trait_for", lambda key: _Trait())
+    path = tmp_path / "resident.json"
+    write_resident_set(str(path), {0: [1], 1: [5]}, n=1, source="")
+    registry = DraftCpuExpertsRegistry()
+    registry.register({"w13_trellis": torch.zeros(E, 2, dtype=torch.int16)}, _on_cpu(), 10.0, layer_id=0)
+    cores = ",".join(str(c) for c in _cores())
+    with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(cores), envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.override(str(path)):
+        try:
+            with pytest.raises(ValueError, match=r"stages \[1\]"):
+                registry.runtime()
         finally:
             registry.close()
