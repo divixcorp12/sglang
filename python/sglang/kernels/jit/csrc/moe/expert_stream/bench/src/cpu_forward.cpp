@@ -1,3 +1,15 @@
+// The bare CPU-expert forward benchmark: one full forward through the native service C ABI, per backend.
+//
+// Built twice (EXL3_BENCH_BACKEND): the baseline kernel and the optimized one run as separate processes, so one
+// backend's idle workers cannot disturb the other's timings. A forward is timed from the C ABI call alone; sample
+// storage and layer rotation are outside the interval. Before and after each timed run, all eight layers' outputs are
+// compared bit-exactly with the frozen references; setup, warmup and checks are excluded from the reported latency.
+//
+//   Options / parse_options   the command line
+//   Workload                  one expert count's layers, slots and routing weights
+//   full_forward              the Google Benchmark body and its p50/p95/p99 counters
+//
+// See python/sglang/kernels/jit/csrc/moe/expert_stream/bench/README.txt.
 #include <ATen/Parallel.h>
 #include <benchmark/benchmark.h>
 
@@ -22,6 +34,7 @@
 namespace {
 namespace fs = std::filesystem;
 bool benchmark_failed = false;
+// The command line; the defaults are the reference machine's.
 struct Options {
   fs::path fixture = "/data/models/exl3_exp/selected_followup/dsv41-eight-layers-unswizzled.bin";
   fs::path references = "/data/models/exl3_exp/threading";
@@ -33,6 +46,7 @@ struct Options {
   bool validate_only = false;
 };
 
+// Parses a non-negative decimal integer; throws on anything else.
 int number(const std::string& text) {
   size_t end;
   const int n = std::stoi(text, &end);
@@ -40,6 +54,7 @@ int number(const std::string& text) {
   return n;
 }
 
+// Parses a CPU list such as "18-33,52": ranges and singles, no duplicates. Throws on an invalid list.
 std::vector<int32_t> parse_cpus(const std::string& text) {
   std::vector<int32_t> cores;
   std::stringstream list(text);
@@ -58,6 +73,7 @@ std::vector<int32_t> parse_cpus(const std::string& text) {
   return cores;
 }
 
+// Consumes this bench's flags and leaves the rest (Google Benchmark's) in argv. Throws on an invalid value.
 Options parse_options(int& argc, char** argv) {
   Options opt;
   int remaining = 1;
@@ -97,6 +113,7 @@ Options parse_options(int& argc, char** argv) {
   return opt;
 }
 
+// The ids of this process's threads.
 std::set<int> task_ids() {
   std::set<int> result;
   for (const auto& entry : fs::directory_iterator("/proc/self/task"))
@@ -104,6 +121,8 @@ std::set<int> task_ids() {
   return result;
 }
 
+// Throws unless every thread created since `before` (plus the caller) is pinned to exactly one CPU and those CPUs equal
+// `cores`.
 void verify_workers(const std::set<int>& before, const std::vector<int32_t>& cores) {
   std::vector<int> assigned;
   for (int tid : task_ids()) {
@@ -121,6 +140,8 @@ void verify_workers(const std::set<int>& before, const std::vector<int32_t>& cor
   if (assigned != expected) throw std::runtime_error("Worker count/CPU assignment mismatch");
 }
 
+// One expert count k: every layer registered with the first k experts, expert e in slot e, and fixed routing weights
+// (the coefficients the frozen references were computed with). Owns the layer handles.
 struct Workload {
   const Fixture& fixture;
   const Options& options;
@@ -168,6 +189,7 @@ struct Workload {
       exl3_moe_cpu_free_layer(handle);
   }
 
+  // One full C ABI forward on `layer`, writing `output`. Throws if the call fails.
   void forward(size_t layer) {
     if (sglang_exl3_cpu_experts_forward(
             handles[layer],
@@ -181,6 +203,8 @@ struct Workload {
       throw std::runtime_error("Native CPU forward failed");
   }
 
+  // Runs every layer once and compares the outputs bit-exactly with the reference for this expert count. Throws on a
+  // non-finite value or a mismatch.
   void validate() {
     std::vector<float> results(fixture.layers.size() * fixture.hidden);
     for (size_t layer = 0; layer < fixture.layers.size(); ++layer) {
@@ -193,12 +217,15 @@ struct Workload {
   }
 };
 
+// The `fraction` quantile of `samples` in microseconds (nearest rank); reorders `samples`.
 double quantile(std::vector<double>& samples, double fraction) {
   const size_t index = size_t(fraction * (samples.size() - 1));
   std::nth_element(samples.begin(), samples.begin() + index, samples.end());
   return samples[index] * 1e6;
 }
 
+// The benchmark body: validate, warm up, time `forward` per iteration, validate again. A failure marks the benchmark
+// skipped with the error and fails the process.
 void full_forward(benchmark::State& state, Workload& workload) {
   try {
     workload.validate();
@@ -213,7 +240,7 @@ void full_forward(benchmark::State& state, Workload& workload) {
       const auto end = std::chrono::steady_clock::now();
       const double seconds = std::chrono::duration<double>(end - start).count();
       state.SetIterationTime(seconds);
-      // Framework bookkeeping, sample storage and layer selection are excluded.
+      // Sample storage and layer selection stay outside the timed interval.
       samples.push_back(seconds);
       layer = (layer + 1) % workload.handles.size();
       benchmark::DoNotOptimize(workload.output.data());

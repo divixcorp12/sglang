@@ -1,4 +1,8 @@
 // The physical-core check a busy-polling service thread needs (RamThread, busy_poll).
+//
+// A busy-polling thread never yields its core, so another thread on an SMT sibling of that core would be slowed by
+// it. core_siblings() reads the sibling set from sysfs and check_dedicated_core() refuses a core whose siblings are
+// in use.
 #pragma once
 
 #include "fixed_vec.h"
@@ -12,7 +16,8 @@
 
 namespace sglang::expert_stream {
 
-// The SMT siblings of `core`, the core included, from sysfs ("17,53" or "16-17").
+// The SMT siblings of `core`, the core included, read from sysfs ("17,53" or "16-17"). Throws if the list cannot be
+// read or parsed.
 inline std::vector<int> core_siblings(int core) {
   std::ifstream in("/sys/devices/system/cpu/cpu" + std::to_string(core) + "/topology/thread_siblings_list");
   std::string list;
@@ -34,9 +39,9 @@ inline std::vector<int> core_siblings(int core) {
   return cores;
 }
 
-// A busy-polling service never yields its core, so it needs the physical core to itself: no SMT sibling of `core`
-// (the core included) may be in the caller's affinity, which the process's other threads inherit, or among the CPU
-// experts' cores, which their threads pin themselves to.
+// Throws unless a busy-polling service can own the physical core of `core`: no SMT sibling of `core` (the core
+// included) may be in the caller's affinity, which the process's other threads inherit, or among the CPU experts'
+// cores, which their threads pin themselves to. `prefix` starts every message.
 inline void check_dedicated_core(int core, const std::vector<int>& cpu_expert_cores, const std::string& prefix) {
   if (core < 0) {
     throw std::runtime_error(

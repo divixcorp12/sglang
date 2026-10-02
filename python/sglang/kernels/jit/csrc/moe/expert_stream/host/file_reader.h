@@ -1,4 +1,10 @@
 // The asynchronous positional reader a RowReader drives: prepare, submit, reap, and settle what is in flight.
+//
+//   ReadCompletion       one reaped read
+//   AsyncFileReader      the concept every reader (UringReader, FaultyReader<...>) satisfies
+//   RegisteredRegion     memory a reader registers with its ring
+//   FixedLeg             one registered-buffer leg of a fixed read
+//   SubmitFault          the test-only submit fault FaultyReader injects
 #pragma once
 
 #include <sys/uio.h>
@@ -11,15 +17,18 @@
 namespace sglang {
 namespace expert_stream {
 
-// One reaped read: the tag it was prepared with (RowReader: generation << 32 | descriptor) and bytes or -errno.
+// One reaped read: the tag it was prepared with (RowReader: generation << 32 | descriptor) and the bytes read, or
+// -errno.
 struct ReadCompletion {
   uint64_t data;
   int res;
 };
 
+// What a reader must provide: prepare reads, submit them, reap completions, and drain what is in flight.
+//
 // One thread drives a reader at a time, but not always the thread that built it (the service opens on the Python
-// thread and reads on its own), so an implementation must not bind itself to its creating thread.
-// Buffers and iovec arrays passed to prep_* stay the caller's and must outlive the read's completion.
+// thread and reads on its own), so an implementation must not bind itself to its creating thread. Buffers and iovec
+// arrays passed to prep_* stay the caller's and must outlive the read's completion.
 template <typename R>
 concept AsyncFileReader = requires(
     R& r,
@@ -40,10 +49,11 @@ concept AsyncFileReader = requires(
   { r.drain(n) } -> std::same_as<void>;       // n prepared-or-in-flight reads: settle all
 };
 
-// Memory a reader registers with its ring: one named slab (or the bounce), `bytes` long, made of `row_bytes` rows. The
-// registration is cut on row boundaries into chunks of at most 1 GiB (io::plan_chunks), so no read's iovec, which lies
-// inside one row, ever straddles two registered buffers. Defined here, not in row_tables.h, so uring_reader.h stays
-// free of the TVM headers the tables need.
+// Memory a reader registers with its ring: one named slab (or the bounce), `bytes` long, made of `row_bytes` rows.
+//
+// The registration is cut on row boundaries into chunks of at most 1 GiB (io::plan_chunks), so no read's iovec, which
+// lies inside one row, ever straddles two registered buffers. Defined here, not in row_tables.h, so uring_reader.h
+// stays free of the TVM headers the tables need.
 struct RegisteredRegion {
   void* base;
   size_t bytes;
@@ -57,7 +67,7 @@ struct FixedLeg {
   size_t bytes;
 };
 
-// Test-only description of a submit fault, shared by every AsyncFileReader decorator that injects one.
+// Test-only description of a submit fault, shared by every AsyncFileReader decorator that injects one (FaultyReader).
 struct SubmitFault {
   int error = 0;              // errno the `call`-th submit returns (0: none)
   int64_t call = 0;           // 1-based count of submits over the reader's life

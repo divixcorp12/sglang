@@ -1,4 +1,14 @@
 // AsyncFileReader over one io_uring ring shared by every model file.
+//
+// BasicUringReader owns the ring and everything registered with it (fixed files, fixed buffers), prepares and submits
+// reads, reaps completions, and settles in-flight reads before any memory is released. Its behavior is selected by
+// UringOptions (uring_options.h): ring setup mode, fixed reads, wait strategy. The reader is a template on the
+// build policy so ProdBuild compiles none of the test hooks and diagnostics counters.
+//
+//   UringReader        the production reader
+//   InstrUringReader   the instrumented build's reader, wrapped by FaultyReader and driven by the ring-reset harness
+//
+// See analysis/dsv41-drive/uring-reg/results.md and analysis/dsv41-drive/ringreset/results.md.
 #pragma once
 
 #include <sys/resource.h>
@@ -28,10 +38,25 @@
 
 namespace sglang::expert_stream {
 
-// `Build` (build_policy.h) gates the reader's own test hooks (the ring-reset faults FaultyReader forwards, and
-// publish_sq_without_enter): ProdBuild has neither the hooks nor their state (plan 2026-09-29-hotpath-zero-overhead
-// Task 10). UringReader is the production reader; InstrUringReader is the one the instrumented build wraps in
-// FaultyReader and the ring-reset harness drives.
+// An AsyncFileReader on one io_uring ring.
+//
+// One thread drives the reader at a time (see AsyncFileReader). Reads are prepared with prep_*, sent with submit(),
+// and reaped with reap(); `outstanding_` counts reads prepared and not yet reaped. Memory that reads land in must stay
+// alive until close(), which settles everything in flight first, because closing an fd or the ring alone does not
+// prove DMA has stopped.
+//
+// Registration: with fixed files and fixed read modes, configure_resources() registers the file table and the
+// buffer regions once. Each region is registered as row-aligned chunks of at most 1 GiB in a sparse buffer table,
+// independent of CUDA pinning. Any registration failure is an explicit error, never a fallback to unregistered
+// reads.
+//
+// drain() discards unsubmitted SQEs as NOPs on the same ring, so the registered tables survive: re-creating the ring
+// re-registered the whole tier, which took 59 s for 107 GB on the reference machine
+// (analysis/dsv41-drive/uring-reg/results.md), past RamThread's 30 s fatal_wait, which aborts a request held in
+// service that long.
+//
+// `Build` (build_policy.h) gates the reader's test hooks (the ring-reset faults FaultyReader forwards, and
+// publish_sq_without_enter) and its fixed-read diagnostics: ProdBuild has neither the hooks nor their state.
 template <class Build>
 class BasicUringReader {
   static_assert(BuildPolicy<Build>);
@@ -44,6 +69,9 @@ class BasicUringReader {
     close();
   }
 
+  // Creates the ring with room for `depth` reads, from the SGLANG_EXPERT_STREAM_URING_* options. Returns false if
+  // the kernel refuses a plain ring. Throws for an invalid depth, an unsupported explicit option, or when a ring
+  // with registered resources cannot be created.
   bool init(unsigned depth) {
     close();
     options_ = UringOptions::from_env();
@@ -59,9 +87,10 @@ class BasicUringReader {
     return ready_;
   }
 
-  // Buffers describe their complete live allocations (one per named slab, or the bounce), never a guessed interval
-  // between unrelated slabs. Each is registered as row-aligned chunks of at most 1 GiB (io::RegisteredBufferTable).
-  // Registration is independent of CUDA pinning. The owner must retain these allocations through close().
+  // Registers the fixed files and buffer regions the options call for. Call once on a ready, idle reader.
+  //
+  // `buffers` describe their complete live allocations (one per named slab, or the bounce), never a guessed interval
+  // between unrelated slabs. The owner must retain these allocations through close().
   void configure_resources(const std::vector<int>& fds, const std::vector<RegisteredRegion>& buffers, bool direct) {
     if (!ready_ || configured_ || outstanding_ != 0)
       throw std::logic_error("io_uring resources must be configured once on a ready, idle reader");
@@ -93,14 +122,14 @@ class BasicUringReader {
     diagnostics();
   }
 
-  // Settles writes before unregistering resources. Closing an fd/ring alone does not prove DMA has stopped.
+  // Settles every in-flight read, then unregisters the resources and closes the ring. Never throws.
   void close() noexcept {
     if (ready_) {
       try {
         if (outstanding_ != 0) drain(outstanding_);
       } catch (...) {
-        // A refused NOP drain throws after closing the ring with nothing left in the kernel: safe to go on. Anything
-        // else might leave memory the kernel still owns, so never let the caller free it.
+        // A refused NOP drain throws after closing the ring with nothing left in the kernel, so it is safe to go on.
+        // Anything else might leave memory the kernel still owns, so the caller must never free it.
         if (ready_ || outstanding_ != 0) std::terminate();
       }
       close_ring();
@@ -114,6 +143,7 @@ class BasicUringReader {
     configured_ = false;
   }
 
+  // Prepares a read of `len` bytes at `off` into `buf`. Returns false when the SQ is full: submit or reap first.
   bool prep_read(int fd, void* buf, unsigned len, uint64_t off, uint64_t tag) {
     require_ready();
     if (fixed_reads()) throw std::logic_error("fixed read modes prepare through prep_readv_fixed");
@@ -125,6 +155,7 @@ class BasicUringReader {
     return true;
   }
 
+  // Prepares a scattered read at `off` into `count` iovecs. Returns false when the SQ is full.
   bool prep_readv(int fd, const iovec* iov, unsigned count, uint64_t off, uint64_t tag) {
     require_ready();
     if (fixed_reads()) throw std::logic_error("fixed read modes prepare through prep_readv_fixed");
@@ -137,26 +168,29 @@ class BasicUringReader {
     return true;
   }
 
-  // Fixed reads (READ_MODE fixed or readv_fixed). A read's iovecs are grouped into legs (fixed_legs) and each leg is
-  // prepared by prep_readv_fixed with its registered buffer; the caller keeps `iov` alive until the leg is reaped.
+  // True in a fixed read mode (READ_MODE fixed or readv_fixed). A read's iovecs are grouped into legs (fixed_legs)
+  // and each leg is prepared by prep_readv_fixed with its registered buffer; the caller keeps `iov` alive until the
+  // leg is reaped.
   bool fixed_reads() const {
     return options_.read_mode != UringReadMode::Normal;
   }
-  // Cut reads into device-sized legs (READ_CUTS; ReaderCore plans them): the resolved option, for diagnostics.
+  // The resolved READ_CUTS option: whether reads are cut into device-sized legs, which ReaderCore plans.
   bool read_cuts() const {
     return options_.read_cuts_on();
   }
+  // Free SQ entries.
   unsigned sq_space() const {
     return io_uring_sq_space_left(&ring_);
   }
-  // Test only (fault word fixed_chunk_cap): a registration chunk cap below 1 GiB, so small slabs register as many
-  // chunks. 0 restores the default.
+  // Test only (fault word fixed_chunk_cap): sets a registration chunk cap below 1 GiB, so small slabs register as
+  // many chunks. 0 restores the default. Call before configure_resources().
   void set_fixed_chunk_cap(size_t cap) {
     if (configured_) throw std::logic_error("the fixed-buffer chunk cap is set before resources are configured");
     chunk_cap_ = cap == 0 ? sglang::io::kMaxRegisteredBufferBytes : cap;
   }
-  // Consecutive iovecs sharing one registered buffer form a leg (READ_FIXED: one iovec per leg). Rows never straddle
-  // buffers (plan_chunks), so every iovec lies in exactly one buffer and nothing is clipped.
+  // Groups `iov` into legs and writes them to `out`. Returns how many. Consecutive iovecs sharing one registered
+  // buffer form a leg (READ_MODE=fixed: one iovec per leg). Rows never straddle buffers (plan_chunks), so every iovec
+  // lies in exactly one buffer and nothing is clipped. Throws if an iovec lies in no registered buffer.
   unsigned fixed_legs(const iovec* iov, unsigned count, FixedLeg* out) const {
     unsigned legs = 0;
     for (unsigned i = 0; i < count; ++i) {
@@ -171,8 +205,8 @@ class BasicUringReader {
     }
     return legs;
   }
-  // Counts a fixed read's legs (diagnostics only, spec M10): reads prepared, those cut into more than one leg, and
-  // their SQEs. InstrBuild only; on ProdBuild the call is empty and the counters and their accessors do not exist.
+  // Counts a fixed read's legs for diagnostics: reads prepared, those cut into more than one leg, and their SQEs.
+  // InstrBuild only; on ProdBuild the call is empty and the counters and their accessors do not exist.
   void note_fanout([[maybe_unused]] unsigned legs) {
     if constexpr (Build::kMetrics) {
       ++fanout_.reads;
@@ -197,10 +231,11 @@ class BasicUringReader {
     return fanout_.sqes;
   }
   // How many times the ring's resources were registered: 1 per configure_resources, +1 per ring reset. Cold path
-  // only (tests read it to prove a drain kept the registered tier).
+  // only; tests read it to prove a drain kept the registered tier.
   uint64_t registrations() const {
     return registrations_;
   }
+  // Prepares one leg of a fixed read into registered buffer `buffer`. Returns false when the SQ is full.
   bool prep_readv_fixed(int fd, const iovec* iov, unsigned count, uint64_t off, int buffer, uint64_t tag) {
     require_ready();
     if (!fixed_reads()) throw std::logic_error("prep_readv_fixed needs a fixed read mode");
@@ -227,6 +262,8 @@ class BasicUringReader {
     return true;
   }
 
+  // Sends the prepared reads and, if `wait_nr` is nonzero, waits for that many completions. Returns the kernel's
+  // result: the number submitted, or -errno. A blocking-wait ring sleeps in the kernel; any other polls the CQ.
   int submit(unsigned wait_nr) {
     if (options_.blocking_wait())
       return wait_nr != 0 ? io_uring_submit_and_wait(&ring_, wait_nr) : io_uring_submit(&ring_);
@@ -249,6 +286,7 @@ class BasicUringReader {
     return submitted;
   }
 
+  // Appends every ready completion to `out` without blocking. Returns how many.
   unsigned reap(std::vector<ReadCompletion>& out) {
     io_uring_cqe* cqe;
     unsigned head;
@@ -263,16 +301,21 @@ class BasicUringReader {
     return seen;
   }
 
+  // Settles all `pending` prepared-or-in-flight reads, which must equal the reader's own count (any mismatch
+  // terminates: memory the kernel may still own could be freed). Reads the kernel consumed are retired; unsubmitted
+  // SQEs are discarded as NOPs on the same ring. If the kernel refuses that, a fixed read mode throws and leaves the
+  // reader closed, and any other resets the ring. A failed reset also leaves the reader closed (ready() false, so a
+  // later read returns 0 and close() has nothing to settle) and throws its reason.
   void drain(unsigned pending) {
     if (pending != outstanding_) std::terminate();
-    // A failed ring reset closed the ring (outstanding_ 0): nothing it held can still be in flight.
+    // A failed ring reset closed the ring: nothing it held can still be in flight.
     if (!ready_) {
       if (outstanding_ != 0) std::terminate();
       return;
     }
     if (options_.sqpoll()) {
-      // SQPOLL consumes concurrently: no snapshot may classify SQEs as safe to abandon.
-      // Publish/retry EVERY prepared read, then retire EVERY completion before releasing buffers.
+      // The SQ thread consumes concurrently, so no snapshot can classify an SQE as safe to abandon: publish every
+      // prepared read and retire every completion before releasing buffers.
       while (outstanding_ > 0) {
         const int submitted = io_uring_submit(&ring_);
         if (submitted < 0 && !soft_error(submitted)) std::terminate();
@@ -289,22 +332,19 @@ class BasicUringReader {
       }
       return;
     }
-    // No asynchronous SQ consumer: remaining SQEs can be discarded only AFTER all consumed reads retire.
+    // No asynchronous SQ consumer: unconsumed SQEs may be discarded only after every consumed read retires.
     const unsigned unsubmitted = std::min(pending, io_uring_sq_ready(&ring_));
     while (outstanding_ > unsubmitted)
       wait_one();
     if (unsubmitted == 0) return;
-    // Discard them on the same ring, as NOPs, so the registered buffer table and file table survive. Re-creating the
-    // ring re-registered the whole tier: 59 s for 107 GB on divix01 (analysis/dsv41-drive/uring-reg/results.md),
-    // past RamThread's 30 s fatal_wait, which aborts a request held in service that long.
+    // NOPs keep the registered buffer and file tables alive (see the class comment).
     const int refused = flush_as_nops(unsubmitted);
     if (refused == 0) return;
     // The kernel refused the NOP submission. What is left never entered the kernel, so the ring can close now.
     close_ring();
     outstanding_ = 0;
     // A fixed read mode never resets: re-registering its buffers would outlast fatal_wait, so the watchdog would abort
-    // with a misleading "request stayed in service". Fail stop now, naming the cause. The reader is closed (ready()
-    // false), as after a failed reset below.
+    // with a misleading "request stayed in service". Fail stop now, naming the cause.
     if (fixed_reads())
       throw std::runtime_error(
           std::string("expert stream io_uring: the kernel refused the NOP drain of unconsumed reads (") +
@@ -312,9 +352,6 @@ class BasicUringReader {
           "); re-registering the fixed buffers would exceed the watchdog's fatal_wait, so "
           "the reader is closed instead of resetting its ring");
     // Without registered buffers the reset is cheap (at most the fixed file table).
-    // A failed reset leaves the reader closed (ready() false, so a later read() returns 0 and close() has nothing
-    // to settle) and throws its reason to the caller: "io_uring ring reset failed", create_ring's own error, or
-    // register_resources' refusal.
     bool injected = false;
     if constexpr (Build::kFaults) {
       injected = hooks_.reset_fail;
@@ -356,9 +393,11 @@ class BasicUringReader {
   }
 
  private:
+  // True for errors worth retrying: interrupted, would block, or busy.
   static bool soft_error(int rc) {
     return rc == -EINTR || rc == -EAGAIN || rc == -EBUSY;
   }
+  // Throws std::runtime_error naming `operation` and the errno `-rc`.
   [[noreturn]] static void error(const char* operation, int rc) {
     throw std::runtime_error(
         std::string("expert stream ") + operation + ": " + std::strerror(-rc) + " (" + std::to_string(rc) + ")");
@@ -370,11 +409,14 @@ class BasicUringReader {
     asm volatile("yield");
 #endif
   }
+  // Throws unless the ring is ready and, when the options need registered resources, they are configured.
   void require_ready() const {
     if (!ready_) throw std::logic_error("io_uring reader is not ready");
     if ((options_.fixed_files || options_.read_mode != UringReadMode::Normal || options_.iopoll()) && !configured_)
       throw std::logic_error("io_uring resources must be configured before reading with these options");
   }
+  // Creates the ring. Returns false if the kernel refuses a plain ring; throws for a refused explicit option (a setup
+  // mode, registration) or an unsupported READV_FIXED.
   bool create_ring() {
     io_uring_params p{};
     if (options_.sqpoll()) {
@@ -386,13 +428,13 @@ class BasicUringReader {
       }
     }
     if (options_.iopoll()) p.flags |= IORING_SETUP_IOPOLL;
-    // No SINGLE_ISSUER/DEFER_TASKRUN: opening, service, and temporary fill threads may take turns.
+    // No SINGLE_ISSUER or DEFER_TASKRUN: the opening, service and temporary fill threads take turns on the ring.
     requested_flags_ = p.flags;
     const int rc = io_uring_queue_init_params(depth_, &ring_, &p);
     if (rc < 0) {
       if (requested_flags_ != 0) error("requested io_uring setup mode is unsupported or unavailable", rc);
-      // Explicit registration options refuse too, never quietly: the ring's own memory can be charged to the memlock
-      // limit (RLIMIT_MEMLOCK=0 refuses it with ENOMEM on 6.12), the same limit registration is charged to.
+      // Explicit registration options refuse too, never quietly: the ring's own memory is charged to the memlock limit
+      // (RLIMIT_MEMLOCK=0 refuses it with ENOMEM on 6.12), the same limit registration is charged to.
       if (fixed_reads() || options_.fixed_files) {
         const std::string operation =
             "creating the ring for registered buffers or files (RLIMIT_MEMLOCK=" + memlock_limit() + ")";
@@ -420,9 +462,8 @@ class BasicUringReader {
 #endif
     return true;
   }
-  // Registers the fixed files, then every region as row-aligned chunks in a sparse buffer table (also on drain()'s
-  // fallback ring reset, taken only outside the fixed read modes when the kernel refuses the NOP drain). Any failure
-  // is an explicit error (refuse), never a fallback to unregistered reads.
+  // Registers the fixed files, then every region as row-aligned chunks in a sparse buffer table. Also runs on
+  // drain()'s fallback ring reset. Any failure tears the registration down and throws (refuse).
   void register_resources() {
     ++registrations_;
     if (!files_.empty()) {
@@ -473,14 +514,16 @@ class BasicUringReader {
         std::to_string(chunks) + ", bytes=" + std::to_string(bytes) + ", largest=" + std::to_string(largest) +
         ", cap=" + std::to_string(chunk_cap_) + ", RLIMIT_MEMLOCK=" + memlock + "): " + why);
   }
+  // RLIMIT_MEMLOCK as text, for error messages.
   static std::string memlock_limit() {
     rlimit limit{};
     if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0) return "unknown";
     return limit.rlim_cur == RLIM_INFINITY ? std::string("unlimited") : std::to_string(limit.rlim_cur);
   }
+  // Unregisters and closes the ring. The caller guarantees every request has retired or, without SQPOLL, never
+  // entered the kernel.
   void close_ring() noexcept {
     if (!ready_) return;
-    // Every request has retired (or, without SQPOLL, never entered the kernel).
     if (buffers_registered_) {
       io_uring_unregister_buffers(&ring_);
       table_.clear();
@@ -489,6 +532,7 @@ class BasicUringReader {
     io_uring_queue_exit(&ring_);
     buffers_registered_ = files_registered_ = ready_ = false;
   }
+  // The fd to put in an SQE: the registered index with fixed files, else `fd`. Throws for an unregistered fd.
   int mapped_fd(int fd) const {
     if (!options_.fixed_files) return fd;
     if (fd < 0 || static_cast<size_t>(fd) >= fd_index_.size() || fd_index_[static_cast<size_t>(fd)] < 0)
@@ -514,10 +558,11 @@ class BasicUringReader {
     io_uring_cqe_seen(&ring_, cqe);
     --outstanding_;
   }
+  // Waits for one completion and retires it. A polling ring never sleeps in the kernel. Terminates on a hard error.
   void wait_one() {
     io_uring_cqe* cqe = nullptr;
     if (options_.polls_in_wait()) {
-      // Never io_uring_wait_cqe here: see UringOptions::polls_in_wait.
+      // Never io_uring_wait_cqe here (UringOptions::polls_in_wait).
       for (;;) {
         const int rc = io_uring_peek_cqe(&ring_, &cqe);
         if (rc == 0) break;
@@ -536,12 +581,14 @@ class BasicUringReader {
     if (rc < 0) std::terminate();
     retire(cqe);
   }
-  // Rewrites the last `n` prepared SQEs, none consumed by the kernel, as NOPs, then submits and retires them. Without
-  // SQPOLL the kernel reads an SQE only inside io_uring_enter, so positions [sqe_tail - n, sqe_tail) still belong to
-  // this thread, whether or not an earlier submit flushed them to the kernel's tail. create_ring never sets SQE128,
-  // so an SQE's slot is its position. The whole SQE is zeroed: liburing's prep_* helpers leave flags
-  // (IOSQE_FIXED_FILE) and buf_index to get_sqe. Returns 0, or the refusing submit's negative errno: every NOP the
-  // kernel consumed has then retired, and the rest stay unconsumed and counted in outstanding_.
+  // Rewrites the last `n` prepared SQEs, none consumed by the kernel, as NOPs, then submits and retires them.
+  // Returns 0, or the refusing submit's negative errno: every NOP the kernel consumed has then retired, and the rest
+  // stay unconsumed and counted in outstanding_.
+  //
+  // Without SQPOLL the kernel reads an SQE only inside io_uring_enter, so positions [sqe_tail - n, sqe_tail) still
+  // belong to this thread, whether or not an earlier submit flushed them to the kernel's tail. create_ring never sets
+  // SQE128, so an SQE's slot is its position. The whole SQE is zeroed because liburing's prep_* helpers leave flags
+  // (IOSQE_FIXED_FILE) and buf_index to get_sqe.
   int flush_as_nops(unsigned n) {
     const unsigned tail = ring_.sq.sqe_tail;
     for (unsigned i = tail - n; i != tail; ++i) {
@@ -574,6 +621,7 @@ class BasicUringReader {
       wait_one();  // a NOP completes at issue; IOPOLL rings retire it through the same reap loop
     return refused;
   }
+  // Prints the ring's effective configuration to stderr when DIAGNOSTICS is set.
   void diagnostics() const {
     if (!options_.diagnostics) return;
     std::fprintf(
@@ -621,7 +669,7 @@ class BasicUringReader {
   sglang::io::RegisteredBufferTable table_;
   std::vector<RegisteredRegion> regions_;  // fixed read modes only
   size_t chunk_cap_ = sglang::io::kMaxRegisteredBufferBytes;
-  // note_fanout()'s counters (spec M10): InstrBuild only.
+  // note_fanout()'s counters: InstrBuild only.
   struct FanoutStats {
     uint64_t reads = 0, cuts = 0, sqes = 0, next_report = uint64_t{1} << 16;
   };
@@ -643,6 +691,7 @@ class BasicUringReader {
   static constexpr std::chrono::milliseconds kNopRetryWindow{2000};  // soft errors on the NOP submit, then refuse
 };
 
+// The production reader and the instrumented build's reader; the asserts keep the fault hooks out of production.
 using UringReader = BasicUringReader<ProdBuild>;
 using InstrUringReader = BasicUringReader<InstrBuild>;
 static_assert(AsyncFileReader<UringReader>);

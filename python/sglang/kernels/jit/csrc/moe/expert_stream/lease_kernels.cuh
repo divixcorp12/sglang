@@ -1,4 +1,12 @@
-// Slot-map protocol kernels: the post and the bulk map apply (analysis/dsv41-drive/LEASE_PROTOCOL.md). Format-free.
+// Slot-map protocol kernels, independent of the streamed row's format.
+//
+//   PostParams / exl3_ram_miss_post_kernel   the post: applies the row's pending map delta, types the lanes and
+//                                            publishes the demand record
+//   BulkApplyParams / ..._map_bulk_apply_kernel  applies every row's pending delta and the eager paths' map entries
+//                                            while the service is paused
+//   LeaseProtocolKernel                      the checked host launchers for both
+//
+// See analysis/dsv41-drive/LEASE_PROTOCOL.md, "The chain".
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -10,6 +18,8 @@
 
 namespace sglang {
 
+// Arguments of the post kernel, passed as a __grid_constant__ so a captured graph freezes them. Pointers address
+// device memory unless noted; the launcher verifies each one.
 struct PostParams {
   uint8_t* page;
   int32_t* state;
@@ -29,7 +39,7 @@ struct PostParams {
   const int32_t* dst_slots;
   int64_t captured;
   // The device's map bank (ExpertStreamDevice.map_bank): row-major [rows, experts] and [rows, kLeaseLanes] int32,
-  // int64 [rows] chain words, per-row eligibility. Device memory: replays read what the deltas left there.
+  // int64 [rows] chain words, per-row eligibility. A graph replay reads what the previous deltas left here.
   int32_t* ram_slot;
   int32_t* staging;
   int64_t* map_chain;
@@ -41,14 +51,15 @@ struct PostParams {
   int64_t hit_copy_ce;  // SGLANG_DSV41_RAM_HIT_COPY=ce: an armed captured hit goes to the copy engine
   int64_t cpu_on;
   int64_t cpu_misses;
-  // The post's outputs for C1, S and CW: each lane's kind and source slot, and C1's compacted SM hits.
+  // The post's outputs for the later kernels of the chain (C1 copies SM hits, S streams misses, CW waits for the copy
+  // engine): each lane's kind and source slot, and C1's compacted list of SM hits.
   int32_t* lane_kind;
   int32_t* lane_slot;
   int32_t* go_1;
   int64_t* host_rows_1;
   int32_t* dst_slots_1;
-  // CPU experts: with cpu_x_dst set, the block stages the layer's input row there (cpu_hidden elements of cpu_x_src,
-  // of dtype cpu_x_dtype, as fp16) when a lane is a CPU lane, and the record carries each lane's routing weight from
+  // CPU experts. With cpu_x_dst set, the block stages the layer's input row there as fp16 (cpu_hidden elements of
+  // cpu_x_src, of dtype cpu_x_dtype) when a lane is a CPU lane, and the record carries each lane's routing weight from
   // cpu_weights (cpu_weights_count routes aligned with `routes`, dtype cpu_weights_dtype). Null cpu_x_dst: none of it.
   const void* cpu_x_src;
   int64_t cpu_x_dtype;
@@ -64,15 +75,16 @@ constexpr int64_t kCpuDtypeF16 = 0;
 constexpr int64_t kCpuDtypeBf16 = 1;
 constexpr int64_t kCpuDtypeF32 = 2;
 
+// Element `i` of a CPU-experts input or weight array of dtype `dtype` (kCpuDtype*), as fp32.
 SGL_DEVICE float cpu_input_value(const void* src, int64_t dtype, int64_t i) {
   if (dtype == kCpuDtypeF16) return __half2float(static_cast<const __half*>(src)[i]);
   if (dtype == kCpuDtypeBf16) return __bfloat162float(static_cast<const __nv_bfloat16*>(src)[i]);
   return static_cast<const float*>(src)[i];
 }
 
-// The whole block: the layer's input row as fp16, 8 elements per 16-byte store to the host row (the launcher checks
-// hidden % 8 == 0 and the alignment). Each thread fences its own stores at system scope before the barrier, so thread
-// 0's later release of the record and demand_head orders all of them.
+// Stages the layer's input row as fp16 into the host row, 8 elements per 16-byte store, using the whole block. The
+// launcher checks hidden % 8 == 0 and the alignment. Each thread fences its own stores at system scope before the
+// barrier, so thread 0's later release of the record and demand_head orders all of them.
 SGL_DEVICE void stage_cpu_input(const PostParams& p) {
   const int64_t vectors = p.cpu_hidden / 8;
   for (int64_t v = threadIdx.x; v < vectors; v += blockDim.x) {
@@ -86,12 +98,13 @@ SGL_DEVICE void stage_cpu_input(const PostParams& p) {
   __syncthreads();
 }
 
-// Lease-chain PDL (kUsePDL = SGLANG_DSV41_ENABLE_LEASE_PDL, every chain kernel but C1 and CC): the wait is the
-// kernel's first statement and the trigger its second, so every word is read and written after the primary grid
-// completed and flushed, as without PDL; the ordering is transitive down the chain (LEASE_PROTOCOL.md, "PDL").
+// The post kernel, one block of kBlock threads. Thread 0 applies the row's pending map delta, types the lanes from
+// the device's map and publishes the demand record; the whole block stages the CPU input when a lane is the CPU's.
 //
-// The post: thread 0 applies the row's pending map delta, types the lanes from the device's map and publishes the
-// record; the whole block stages the CPU input when a lane is the CPU's.
+// Programmatic dependent launch (kUsePDL = SGLANG_DSV41_ENABLE_LEASE_PDL, used by every chain kernel but C1 and CC):
+// the wait is the kernel's first statement and the trigger its second, so every word is read and written after the
+// primary grid completed and flushed, as without PDL. The ordering is transitive down the chain
+// (analysis/dsv41-drive/LEASE_PROTOCOL.md, "PDL").
 template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_post_kernel(
     const __grid_constant__ PostParams p) {
@@ -124,14 +137,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           .cpu_ok = p.cpu_ok[p.row] != 0,
           .dst_rows = p.dst_rows[p.row],
       };
-      // Before the tag spin: the host stores split relaxed at any time, ordered by nothing (ram_tier.h set_cpu_split).
-      // Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes never indexes it.
+      // Loaded before the tag spin: the host stores split relaxed at any time, ordered by nothing (set_cpu_split in
+      // host/ram_tier.h). Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes
+      // never indexes it.
       if (p.captured != 0 && policy.cpu_on && policy.cpu_ok) load_split(p.lease + kSplit, policy.split);
       const uint8_t* delta = p.lease + kDeltaBase + p.row * kDeltaStride;
       const bool pending = await_map_delta(delta, map, deadline);
       MapDelta d;
       if (pending) d = load_map_delta(delta);
-      // After the tag's acquire, as before, and issued while the delta's loads are in flight.
+      // Ordered after the tag's acquire; issued while the delta's loads are in flight.
       policy.host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + kCopyArmed) == 1u;
       if (pending) apply_map_delta(d, map);
       type_lanes(LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count}, map, policy, typed);
@@ -187,7 +201,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       p.dst_slots_1[go] = p.dst_slots[j];
       ++go;
     }
-    // The lane expert's routing weight: its route's (BS1 routes are distinct experts). 0 when CPU experts are off.
+    // The lane expert's routing weight: its route's (batch-size-1 routes are distinct experts). 0 when CPU experts
+    // are off.
     weight[j] = 0.0f;
     if (p.cpu_x_dst != nullptr) {
       for (int64_t r = 0; r < p.route_count && r < p.cpu_weights_count; ++r) {
@@ -225,8 +240,11 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   store_deadline(state, global_ns() + static_cast<uint64_t>(p.timeout_ns));
 }
 
-// The bulk map apply (Exl3RamMissService.after_host_use): with the service paused and the stream synchronized, every
-// row's pending decode delta first, then the eager paths' entries {row, expert, slot}. One thread: a few dozen words.
+// Arguments of the bulk map apply kernel.
+//
+// Run by Exl3RamMissService.after_host_use with the service paused and the stream synchronized: first every row's
+// pending decode delta, then the eager paths' entries {row, expert, slot} (`entries`, int32 [entry_count, 3]). One
+// thread does it all, since the work is a few dozen words.
 struct BulkApplyParams {
   const uint8_t* lease;
   int32_t* ram_slot;
@@ -240,13 +258,14 @@ struct BulkApplyParams {
   const int32_t* row_capacity;
 };
 
+// The bulk map apply: see BulkApplyParams. Traps on an entry outside the map bank.
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_map_bulk_apply_kernel(
     const __grid_constant__ BulkApplyParams p) {
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   for (int64_t row = 0; row < p.rows; ++row) {
     const uint8_t* delta = p.lease + kDeltaBase + row * kDeltaStride;
-    // Published or not: the paused host has written every delta it owes, so nothing is waited for here.
+    // The paused host has already published every delta it owes, so nothing is waited for here.
     if (ld_acquire_sys64(delta + kDeltaTag) != static_cast<uint64_t>(p.map_chain[row])) continue;
     const RowMap map{
         .ram_slot = p.ram_slot + row * p.experts,
@@ -271,8 +290,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 /// \brief Checked host launchers for the slot-map kernels above: post and map_bulk_apply.
 ///
 /// Every tensor argument is verified with `TensorMatcher` (named via `verify_named`) and every address with
-/// `RuntimeCheck` before the params struct is built and the kernel launched.
+/// `RuntimeCheck` before the params struct is built and the kernel launched. Both launch on the stream of the
+/// tensors' device.
 struct LeaseProtocolKernel {
+  /// Launches the post kernel with `use_pdl` selecting the PDL instantiation. Argument meanings follow PostParams;
+  /// `lease_address` and `cpu_x_dst` are raw addresses of the pinned completion block and the staged input row, and
+  /// `hot_address` of the optional hot page (0: none).
   static void post(
       tvm::ffi::TensorView page,
       tvm::ffi::TensorView state,
@@ -368,7 +391,7 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "host_rows_1", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
     RuntimeCheck(experts > 0, "experts: must be positive");
-    // CPU experts: cpu_x is the layer's input row [1, hidden] (or empty when off), cpu_weights the routes' weights.
+    // CPU experts: cpu_x is the layer's input row [1, hidden] (empty when off), cpu_weights the routes' weights.
     auto cpu_dtype = [](tvm::ffi::TensorView t) -> int64_t {
       const DLDataType d = t.dtype();
       if (d.code == kDLFloat && d.bits == 16) return kCpuDtypeF16;
@@ -445,6 +468,7 @@ struct LeaseProtocolKernel {
             use_pdl != 0 ? exl3_ram_miss_post_kernel<true> : exl3_ram_miss_post_kernel<false>, params);
   }
 
+  /// Launches the bulk map apply kernel; see BulkApplyParams. `lease_address` is the completion block's address.
   static void map_bulk_apply(
       int64_t lease_address,
       tvm::ffi::TensorView ram_slot,

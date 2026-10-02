@@ -1,4 +1,8 @@
-// Host-compilable (no CUDA needed): both device launchers and a host .cpp instantiation can include this.
+// Argument checks shared by the device launchers and the host exports.
+//
+// Host-compilable without CUDA, so both the .cuh launchers and a host .cpp instantiation include it:
+//   verify_named          TensorMatcher::verify with the tensor's name in the error
+//   checked_row_capacity  a row's slot count as a range-checked kernel argument
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -31,8 +35,10 @@ inline void verify_named(std::string_view name, host::TensorMatcher&& matcher, t
 
 /// \brief `row_capacity` as a kernel argument, range-checked.
 ///
-/// W1 and S bound every host slot they read by it, and a captured graph freezes it: sound because a row's slab
-/// capacity is fixed when the service's tables are built and never changes for the process.
+/// The row-copy kernels bound every host slot they read by it, and a captured graph freezes it: sound because a
+/// row's slab capacity is fixed when the service's tables are built and never changes for the process.
+/// \param row_capacity The row's pinned slot count.
+/// \return `row_capacity` as uint32_t; throws `host::PanicError` outside (0, 2^32).
 inline uint32_t checked_row_capacity(int64_t row_capacity) {
   host::RuntimeCheck(
       row_capacity > 0 && row_capacity <= 0xffffffffLL, "row_capacity: ", row_capacity, " is not a slot count");

@@ -1,6 +1,15 @@
-// The full-stack CPU-expert benchmark (docs/superpowers/specs/2026-10-01-expert-stream-full-stack-bench-design.md):
-// a writer thread posts CPU-hit requests into the lease lanes; the real RamTier, RamThread and CpuExpertEngine serve
-// them with the optimized EXL3 kernel; the writer times post -> CopyDone against the bare kernel call.
+// The full-stack CPU-expert benchmark: times the CPU-expert path above the kernel.
+//
+// A writer thread (the GPU's stand-in, DeviceSim) posts CPU-hit requests into the lease lanes. The real RamTier,
+// RamThread and CpuExpertEngine serve them with the optimized EXL3 kernel, and the writer times post -> CopyDone
+// against the bare kernel call on the same layer, slots, x and output memory. The difference is the stack's overhead.
+//
+//   Options / resolve_placement   the command line and where each thread runs
+//   Bench                         the two phases: the bare forwards first, then the stack (see its doc)
+//   bm_bare / bm_stack            the Google Benchmark bodies and their counters
+//   main                          setup, --validate-only and --self-test, benchmark registration
+//
+// See python/sglang/kernels/jit/csrc/moe/expert_stream/bench/README.txt, "Full-stack bench".
 #include <benchmark/benchmark.h>
 
 #include "cpu_experts_cabi.h"
@@ -32,6 +41,7 @@ namespace fs = std::filesystem;
 namespace es = ::sglang::expert_stream;
 using namespace fullstack;
 
+// The command line. Defaults match the reference machine's partition (README "Placement"); --self-test has its own.
 struct Options {
   fs::path fixture = "/data/models/exl3_exp/selected_followup/dsv41-eight-layers-unswizzled.bin";
   fs::path references = "/data/models/exl3_exp/threading";
@@ -47,6 +57,7 @@ struct Options {
   bool self_test = false;
 };
 
+// Consumes this bench's flags and leaves the rest (Google Benchmark's) in argv. Throws on an invalid value.
 Options parse_options(int& argc, char** argv) {
   Options opt;
   int remaining = 1;
@@ -101,7 +112,8 @@ Options parse_options(int& argc, char** argv) {
   return opt;
 }
 
-// The bench's defaults are production's placement; the self-test's fit any four CPUs (run it under taskset -c 0-15).
+// Resolves the CPUs: the defaults are production's placement; the self-test's fit any four CPUs (run it under
+// taskset -c 0-15).
 Placement resolve_placement(const Options& o) {
   Placement p;
   p.writer = o.writer_cpu.value_or(o.self_test ? 0 : 16);
@@ -113,6 +125,8 @@ Placement resolve_placement(const Options& o) {
   return p;
 }
 
+// The Stack's configuration for this fixture and placement: every eligible lane goes to the CPU, and the instrumented
+// build gets a stage trace ring.
 StackConfig stack_config(const StackFixture& f, const Placement& p, const Options& o) {
   StackConfig c;
   c.rows = f.row_set();
@@ -129,12 +143,13 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
   c.copy_cpu = p.copy;
   c.wait_timeout_ns = int64_t{o.wait_timeout_ms} * 1'000'000;
   for (int n = 0; n <= es::kLeaseLanes; ++n)
-    c.split[n] = n;  // every eligible lane is the CPU's
+    c.split[n] = n;
   if constexpr (BenchBuild::kMetrics) c.trace_capacity = 4096;
   return c;
 }
 
-// Freed after the stack, whose CPU expert thread uses them: declare before the Stack.
+// Owns the registered CPU layer handles. Freed after the stack, whose CPU expert thread uses them, so declare it
+// before the Bench that builds the Stack.
 struct LayerHandles {
   std::vector<int64_t> handles;
   ~LayerHandles() {
@@ -143,16 +158,25 @@ struct LayerHandles {
   }
 };
 
+// One timed request: t0 is taken before the x store, t1 when CopyDone is seen.
 struct StackCall {
-  int64_t t0 = 0;  // before the x store
-  int64_t t1 = 0;  // CopyDone seen
+  int64_t t0 = 0;
+  int64_t t1 = 0;
   SimRequest request;
 };
 
+// The benchmark state, in two phases that must run in this order.
+//
+// Bare phase: the slots hold expert e in slot e (StackFixture::preload_slots) and no stack exists, so no CPU expert
+// thread spins on worker 0's core, where the kernel puts every caller, and the kernel's per-caller OpenMP team is the
+// only one. Stack phase (enter_stack_phase): the bare caller's team is released, the Stack is built, every expert is
+// loaded through the tier's reader, and the layers are registered. A bare forward after that fails: it would share
+// worker 0's core with the CPU expert thread and run a second OpenMP team.
+//
+// Runs on the writer's thread. Every path is checked bit-exactly against the frozen references (validate), and the
+// thread census (check_threads) runs once per phase, before that phase is timed.
 class Bench {
  public:
-  // The bare phase first: the slots hold expert e in slot e (StackFixture::preload_slots), and no stack exists, so no
-  // CPU expert thread spins on worker 0's core, where the kernel puts every caller.
   Bench(
       const Options& options,
       Placement placement,
@@ -189,9 +213,9 @@ class Bench {
     return *stack_;
   }
 
-  // The thread census, once per phase and before that phase is timed (the spec refuses a failed affinity check before
-  // any timing). The bare phase has only the kernel's helpers (this thread is worker 0, and predates `before`); the
-  // stack phase has every thread setup created. Call after a forward of the phase, which builds its OpenMP team.
+  // Checks thread affinity once per phase, before the phase is timed: a failed check must stop the run before any
+  // timing. The bare phase has only the kernel's helpers (this thread is worker 0 and predates `before`); the stack
+  // phase has every thread setup created. Call after a forward of the phase, which builds its OpenMP team.
   void check_threads() {
     if (stack_) {
       if (stack_census_) return;
@@ -204,8 +228,8 @@ class Bench {
     }
   }
 
-  // Ends the bare phase, on the writer's thread: release the bare caller's OpenMP team (one team at a time), build the
-  // stack, load every expert through the tier's reader (into the slots the bare forwards used), register the layers.
+  // Ends the bare phase: builds the stack and loads every expert into the slots the bare forwards used. Throws if the
+  // tier picks different slots. Idempotent.
   void enter_stack_phase() {
     if (stack_) return;
     release_kernel_team();
@@ -226,7 +250,8 @@ class Bench {
     }
   }
 
-  // The device's part of one request: x, the record, the copy wait. t0..t1 is the timed interval.
+  // The device's part of one request: x store, record, copy wait. [t0, t1] is the timed interval. Throws if the wait
+  // passes its deadline or a lane is not typed HIT_CPU.
   StackCall stack_call(int64_t row, int k) {
     enter_stack_phase();
     StackCall call;
@@ -244,7 +269,7 @@ class Bench {
   }
 
   // The C ABI forward on the same layer handle, slots, x and output memory, from the calling thread. Slot e holds
-  // expert e, so the experts are the slots.
+  // expert e, so the experts are the slots. Throws once the stack exists (see the class doc).
   void bare_call(int64_t row, int k) {
     if (stack_)
       throw std::runtime_error(
@@ -283,6 +308,7 @@ class Bench {
     check_reference(options_.references / ("reference-e" + std::to_string(k) + ".bin"), results);
   }
 
+  // A one-line account of a request and the stack's state, for error messages.
   std::string describe(const SimRequest& r) {
     std::ostringstream s;
     s << "gen " << r.gen << " (seq " << r.seq << ") row " << r.row << ", " << r.count << " lanes, kinds";
@@ -316,23 +342,26 @@ class Bench {
 
 bool benchmark_failed = false;
 
+// The `fraction` quantile of `seconds`, in microseconds (nearest rank, no interpolation).
 double quantile_us(std::vector<double> seconds, double fraction) {
   const size_t index = static_cast<size_t>(fraction * static_cast<double>(seconds.size() - 1));
   std::nth_element(seconds.begin(), seconds.begin() + static_cast<std::ptrdiff_t>(index), seconds.end());
   return seconds[index] * 1e6;
 }
 
+// Sleeps before a timed call when --gap-us is set, to test wakeup behaviour; outside the timed interval.
 void gap(const Options& options) {
   if (options.gap_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(options.gap_us));
 }
 
-// No timing from a failed process: once one benchmark has failed, the rest report nothing.
+// Once one benchmark has failed, the rest report nothing: a failed process yields no timings.
 bool skip_after_failure(benchmark::State& state) {
   if (!benchmark_failed) return false;
   state.SkipWithError("skipped: an earlier benchmark in this process failed");
   return true;
 }
 
+// BM_bare/experts:k: the C ABI forward called from worker 0's CPU. Counters: p50/p95/p99 per call.
 void bm_bare(benchmark::State& state, Bench& bench, int k) {
   if (skip_after_failure(state)) return;
   try {
@@ -370,6 +399,8 @@ void bm_bare(benchmark::State& state, Bench& bench, int k) {
   }
 }
 
+// BM_stack/experts:k: x store, record, gate close, spin until CopyDone. Counters: p50/p95/p99 per call and
+// overhead_p50_us against BM_bare; the instrumented build adds the stage breakdown (see README "Full-stack bench").
 void bm_stack(benchmark::State& state, Bench& bench, int k) {
   if (skip_after_failure(state)) return;
   try {
@@ -406,7 +437,7 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
       ++calls;
       row = (row + 1) % bench.rows();
     }
-    // Reconcile: one CPU job of k lanes per call, no read, no overrun.
+    // The timed calls must be exactly the CPU jobs: one job of k lanes per call, no row read, no overrun.
     const auto counters1 = stack.counters();
     const auto cpu1 = stack.cpu_stats();
     if (cpu1[0] - cpu0[0] != calls || cpu1[1] - cpu0[1] != calls * k)
@@ -510,8 +541,8 @@ int main(int argc, char** argv) {
     benchmark::AddCustomContext("cgroup", std::string((std::istreambuf_iterator<char>(cgroup_file)), {}));
     benchmark::AddCustomContext("gap_us", std::to_string(options.gap_us));
     benchmark::AddCustomContext("compiler", __VERSION__);
-    // Every BM_bare before any BM_stack: one OpenMP team at a time (Bench::enter_stack_phase). Each benchmark checks
-    // its path's 8 outputs bit-exactly before and after it is timed.
+    // Every BM_bare before any BM_stack: one OpenMP team at a time (see Bench). Each benchmark checks its path's 8
+    // outputs bit-exactly before and after it is timed.
     for (int k : {1, 3, 5})
       benchmark::RegisterBenchmark(
           "BM_bare/experts:" + std::to_string(k), [&bench, k](benchmark::State& state) { bm_bare(state, bench, k); })

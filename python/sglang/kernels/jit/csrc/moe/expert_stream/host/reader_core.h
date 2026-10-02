@@ -1,6 +1,16 @@
-// ReaderCore: the pipeline of the expert-stream host reader, RowReader (direct row images; the packed path was deleted
-// by plan 2026-09-29-hotpath-zero-overhead D4): io_uring superset reads of whole expert rows through per-extent
-// descriptors, ring credit and banks.
+// ReaderCore: the io_uring read pipeline of the expert-stream host reader.
+//
+// ReaderCore reads whole expert rows (aligned supersets of the bytes a row needs) from the mirror files into the slab
+// rows, through per-extent descriptors, ring credit and banks. RowReader is the one derived reader: it reads row
+// images with O_DIRECT straight into the slab rows. The pipeline is written once here; the derived reader supplies
+// the destination and publishing hooks.
+//
+//   NoProgress    read()'s default progress callback (compiled out)
+//   SqeRecord     test-only log entry of one prepared SQE
+//   ReaderCore    the pipeline: admit batches, prepare SQEs under credit, reap, retire, vet and publish
+//
+// Build policy (build_policy.h): ProdBuild has no metrics, no fault state and no trace record, so the request path
+// tests none of them; InstrBuild adds them for tests (read_fault.h, StageRecord in reader_base.h).
 #pragma once
 
 #include "../row_layout.h"
@@ -17,50 +27,54 @@
 namespace sglang {
 namespace expert_stream {
 
-// read()'s default progress callback: none. A distinct type, so read() compiles the call out rather than testing it.
+// read()'s default progress callback: does nothing. A distinct type, so read() compiles the call out rather than
+// testing it.
 struct NoProgress {
   void operator()() const {}
 };
 
-// Test only (U10): one prepared SQE, as ReaderCore::set_sqe_log records it.
+// Test only: one prepared SQE, as ReaderCore::set_sqe_log records it.
 struct SqeRecord {
   int64_t file, offset, length, bounce;  // bounce: byte offset of the destination from the bounce's start
 };
 
-// io_uring superset reads of whole expert rows through per-extent descriptors, for the one derived reader: RowReader
-// reads the row images with O_DIRECT straight into the slab rows. "Bank", "bounce slot" and "packing" below name
-// pipeline state (a row's descriptors, its bank's references, its finish), not memory: no bounce buffer is allocated
-// and nothing is copied. The base/derived split separates this pipeline from the destination and publishing hooks.
+// The read pipeline shared by the derived readers.
 //
-// Pipeline (plan Task 4). A read() call is split into batches of `step` rows; batch b fills bank
-// b % kBanks. Every bounce slot is one row's aligned superset, and every extent has its own
-// preallocated descriptor: descriptor (slot, part) is the SQE's user_data together with a generation,
-// so a completion can only be attributed to the extent that is live in that descriptor NOW. The three
-// resources are independent of each other:
-//   * ring credit    `pending <= capacity` (queue_depth()): how many SQEs may be prepared and not yet
-//                    reaped. It knows nothing about banks; a bank can hold more extents than the ring.
-//   * banks          memory: kBanks * kBounceRows slots. A bank is handed to a new batch only once
-//                    every row of its previous batch has PACKED (and so every extent has completed and
-//                    retired): I/O and packing are the two references a bank holds, and both must be
-//                    gone before the kernel may write into it again.
+// Terms. "Bank", "bounce slot" and "packing" name pipeline state (a row's descriptors, its bank's references, its
+// finish), not memory: RowReader allocates no bounce buffer and copies nothing, because O_DIRECT reads land in the slab
+// rows themselves. The base/derived split separates this pipeline from the destination and publishing hooks.
+//
+// Pipeline. A read() call is split into batches of `step` rows; batch b fills bank b % kBanks. Every bounce slot is
+// one row's aligned superset, and every extent has its own preallocated descriptor. Descriptor (slot, part) is the
+// SQE's user_data together with a generation, so a completion can only be attributed to the extent that is live in
+// that descriptor NOW. Three resources are independent of each other:
+//   * ring credit    `pending <= capacity` (queue_depth()): how many SQEs may be prepared and not yet reaped. It knows
+//                    nothing about banks; a bank can hold more extents than the ring.
+//   * banks          kBanks * kBounceRows slots. A bank is handed to a new batch only once every row of its previous
+//                    batch has PACKED (and so every extent has completed and retired). I/O and packing are the two
+//                    references a bank holds, and both must be gone before the kernel may write into it again.
 //   * reading rows   at most `max_reading_rows` rows with I/O outstanding.
-// A row is packed as soon as ITS extents have completed, while other rows are still in flight, and
-// every completed row is packed before the call returns. read() itself publishes no row: the caller
-// keeps the slots unmapped until read() returns 1, so no row is visible before the whole request is.
-// With piece streaming each vetted piece is packed by its own job, and the owner publishes it into the
-// caller's readiness words (PiecePublish) once that job is done; the slot map is still the caller's.
-// Packing writes only into the caller's not-yet-published slots and only from a slot whose extents
-// have all completed, so a failure leaves at most fully packed rows in unpublished slots, never a
-// half-packed one, and the caller releases them. With piece streaming the unit is the piece: a piece is
-// packed only once the sub-reads it depends on have landed and is published only once its job is done,
-// so a failure leaves whole published pieces, never a torn one, in slots whose map the caller has not published. The
-// caller quarantines each such slot a lane still leases (its lanes may be copying those pieces) and
-// releases the rest.
 //
-// The pipeline is written once here. Where the two paths differ, it calls a hook on `Derived` (derived().X()):
+// Packing and publishing. A row is packed as soon as ITS extents have completed, while other rows are still in
+// flight, and every completed row is packed before read() returns. read() itself publishes no row: the caller keeps
+// the slots unmapped until read() returns 1, so no row is visible before the whole request is. With piece streaming
+// each vetted piece is packed by its own job, and the owner publishes it into the caller's readiness words
+// (PiecePublish) once that job is done; the slot map is still the caller's.
+//
+// Failure. Packing writes only into the caller's not-yet-published slots and only from a slot whose extents have all
+// completed, so a failure leaves at most fully packed rows in unpublished slots, never a half-packed one, and the
+// caller releases them. With piece streaming the unit is the piece: a piece is packed only once the sub-reads it
+// depends on have landed and is published only once its job is done, so a failure leaves whole published pieces, never
+// a torn one, in slots whose map the caller has not published. The caller quarantines each such slot a lane still
+// leases (its lanes may be copying those pieces) and releases the rest. Every return of read() leaves the ring empty:
+// nothing in flight, nothing prepared.
+//
+// Threading. All members are used by one owner thread (the RAM-miss service thread, or the test's caller).
+//
+// Derived hooks. Where the readers differ, the pipeline calls a hook on `Derived` (derived().X()):
 // check_piece_stream_support, on_piece_stream_set, open_memory, open_workers, registered_regions, max_iovecs,
 // destination, advance, collect, quiesce, poison_slot and after_finish, each private to the derived reader, which
-// befriends this class; `Derived::kScatter` picks the read opcode. Derived readers are never deleted through this
+// befriends this class. `Derived::kScatter` picks the read opcode. Derived readers are never deleted through this
 // class, so its destructor is protected and not virtual.
 //
 // `Build` (ProdBuild or InstrBuild, build_policy.h) is explicit, never read from `Derived`: `Derived` is incomplete
@@ -68,8 +82,8 @@ struct SqeRecord {
 template <class Derived, ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 class ReaderCore {
   static_assert(BuildPolicy<Build>);
-  // Faults lean on metrics (the cqe_call fault counts through metric(&ReaderMetrics::cqes)): a build with faults and
-  // no metrics would inject at the wrong completion, silently.
+  // Faults lean on metrics (the cqe_call fault counts through metric(&ReaderMetrics::cqes)): a build with faults and no
+  // metrics would inject at the wrong completion, silently.
   static_assert(!Build::kFaults || Build::kMetrics, "a build with faults needs metrics");
 
  public:
@@ -84,11 +98,11 @@ class ReaderCore {
     return t_;
   }
 
-  // Piece streaming (sub_reads_per_part(reading) sub-reads per reading part, per-piece vetting, packing and
-  // publishing); off by default. Before open(), or on an idle reader after it (the tier sets it before its service
-  // thread starts), since it resizes the descriptor arrays. Refused with more mirror parts than pieces (a reading part
-  // needs a piece of its own), or when a slab row base is not kPieceAlign-aligned (a piece's cuts are aligned in the
-  // row).
+  // Turns piece streaming on or off (sub_reads_per_part(reading) sub-reads per reading part, per-piece vetting,
+  // packing and publishing); off by default. Call it before open(), or on an idle reader after it (the tier sets it
+  // before its service thread starts), since it resizes the descriptor arrays. Throws with more mirror parts than
+  // pieces (a reading part needs a piece of its own), or when a slab row base is not kPieceAlign-aligned (a piece's
+  // cuts are aligned in the row).
   void set_piece_stream(bool on) {
     if (on) {
       derived().check_piece_stream_support();
@@ -124,7 +138,7 @@ class ReaderCore {
     return metric(&ReaderMetrics::publish_refused);
   }
 
-  // Test only (U10): the descriptor count and the ring credit this reader runs with.
+  // Test only: the descriptor count and the ring credit this reader runs with.
   size_t descriptors() const {
     return descs_.size();
   }
@@ -133,22 +147,22 @@ class ReaderCore {
     return queue_depth();
   }
 
-  // Test only (U10): every SQE prepared is appended here, while set (null: nothing recorded, one branch per SQE).
-  // InstrBuild only.
+  // Test only, InstrBuild only: appends every SQE prepared to `log` while set (null: nothing recorded, one branch per
+  // SQE).
   void set_sqe_log(std::vector<SqeRecord>* log)
     requires(Build::kFaults)
   {
     faults_.sqe_log = log;
   }
 
-  // Test-only scaffold (PACK_WORKERS.md owner-pinning measurement): pin the owner thread to `core`
-  // at open(). -1 (the default) leaves open() unpinned. The packing pool this once kept the owner off is
-  // gone with the packed path, so only the pin remains.
+  // Test-only scaffold: pins the owner thread to `core` at open() (-1, the default, leaves it unpinned). Kept from the
+  // owner-pinning measurement in analysis/dsv41-drive/PACK_WORKERS.md, where it kept the owner off a packing pool.
   void set_owner_core(int64_t core) {
     owner_core_ = core;
   }
 
-  // Test only (ReadFault, read_fault.h): InstrBuild only. ProdBuild has no fault state at all (plan Task 10).
+  // Test only, InstrBuild only: arms `fault` (read_fault.h) and resets its per-fault state. ProdBuild has no fault
+  // state at all.
   void set_fault(const ReadFault& fault)
     requires(Build::kFaults)
   {
@@ -170,9 +184,9 @@ class ReaderCore {
     } else if (
         fault.submit_error != 0 || fault.submit_call != 0 || fault.submit_first || fault.submit_short_call != 0 ||
         fault.ring_reset_fail || fault.nop_flush_refused) {
-      // No test reaches this today: the instrumented instantiation (exl3_ram_miss_host_instr.cpp) pairs the reader
-      // (RowReader) with FaultyReader<InstrUringReader>, which has set_submit_fault, so the `if constexpr` branch above
-      // always fires there. This is the fallback for a Reader that cannot inject submit faults at all.
+      // Fallback for a Reader that cannot inject submit faults. The instrumented instantiation
+      // (exl3_ram_miss_host_instr.cpp) pairs RowReader with FaultyReader<InstrUringReader>, which can, so no test
+      // reaches this.
       throw std::runtime_error(error_prefix<Layout>() + "this reader cannot inject submit faults");
     }
   }
@@ -192,13 +206,13 @@ class ReaderCore {
     return metric(&ReaderMetrics::generation_wraps);
   }
 
-  // A fixed read (READ_MODE fixed/readv_fixed) whose iovecs lie in k registered buffers is prepared as k legs, one SQE
-  // each, submitted together (plan 2026-09-28-reader-crtp-uring-registration Task 7); with read cuts a read is also
-  // cut into device-sized legs (read_cuts.h). Legs per read are sized at open() (leg_stride_); kMaxLegs is the tag's
-  // 8-bit leg field.
+  // Most legs a read may have: the width of the completion tag's leg field (make_tag). A fixed read (READ_MODE
+  // fixed/readv_fixed) whose iovecs lie in k registered buffers is prepared as k legs, one SQE each, submitted
+  // together; with read cuts a read is also cut into device-sized legs (read_cuts.h). Legs per read are sized at open()
+  // (leg_stride_).
   static constexpr unsigned kMaxLegs = 255;
 
-  // Test only (fault word fixed_chunk_cap): the registration chunk cap, before open() (0: the 1 GiB default).
+  // Test only (fault word fixed_chunk_cap): sets the registration chunk cap before open() (0: the 1 GiB default).
   void set_fixed_chunk_cap(int64_t cap) {
     if constexpr (requires(Reader& reader) { reader.set_fixed_chunk_cap(size_t{0}); }) {
       io_.set_fixed_chunk_cap(static_cast<size_t>(std::max<int64_t>(0, cap)));
@@ -216,8 +230,8 @@ class ReaderCore {
     return metric(&ReaderMetrics::fanout_sqes);
   }
 
-  // Test only (fault word leg_cut_cap): cut every read at `cap` bytes (whole pages) on a 4 KiB boundary, whatever
-  // READ_CUTS says, before open(). 0 restores READ_CUTS and the device limits.
+  // Test only (fault word leg_cut_cap): cuts every read at `cap` bytes (whole pages) on a 4 KiB boundary, whatever
+  // READ_CUTS says. Call it before open(). 0 restores READ_CUTS and the device limits.
   void set_leg_cut_cap(int64_t cap) {
     leg_cut_cap_ = std::max<int64_t>(0, cap);
   }
@@ -229,7 +243,7 @@ class ReaderCore {
     return metric(&ReaderMetrics::gap_cuts);
   }
 
-  // Legs a read may have (storage stride) and the smallest cut in force (0: cuts off).
+  // Legs a read may have (the storage stride) and the smallest cut in force (0: cuts off).
   int64_t leg_stride() const {
     return leg_stride_;
   }
@@ -241,6 +255,8 @@ class ReaderCore {
     return least;
   }
 
+  // Opens the files, sizes every buffer and initializes the ring. Returns false (after logging) on an open or init
+  // failure; throws on a file whose size differs from its source. Allocates; call once, on the owner thread.
   bool open() {
     for (const auto& path : t_.paths) {
       const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (direct_ ? O_DIRECT : 0));
@@ -253,10 +269,9 @@ class ReaderCore {
       struct stat st;
       const bool statted = fstat(fd, &st) == 0;
       const size_t file = fds_.size() - 1;
-      // The table clamps every read at end of file against the SOURCE size (file_sizes), so a
-      // copy of another size would otherwise be clamped, or over-read, into a short or stale row
-      // that looks complete. Fail here, naming both files: with dozens of shards a bare
-      // "size mismatch" does not say which copy is bad.
+      // The table clamps every read at end of file against the SOURCE size (file_sizes), so a copy of another size
+      // would otherwise be clamped, or over-read, into a short or stale row that looks complete. Name both files:
+      // with dozens of shards a bare "size mismatch" does not say which copy is bad.
       if (statted && static_cast<int64_t>(st.st_size) != t_.file_sizes[file]) {
         throw std::runtime_error(
             error_prefix<Layout>() + path + " has size " + std::to_string(st.st_size) + " bytes but its source " +
@@ -296,11 +311,11 @@ class ReaderCore {
     }
     if (!size_extents()) return false;
     if (!io_.init(queue_depth())) return false;
-    // One reap returns at most a queue depth of CQEs (plus a withheld stale one): reserved here, so the widest reap
-    // never grows the list on the service thread (spec A9). Supersedes size_extents' smaller extents + 1.
+    // One reap returns at most a queue depth of CQEs (plus a withheld stale one): reserve that here, so the widest reap
+    // never grows the list on the service thread. This supersedes size_extents' smaller `extents + 1`.
     completions_.reserve(queue_depth() + 1);
-    // A read's legs are reserved all at once, so the ring must hold the widest read's legs: a fixed read has a leg per
-    // registered buffer its iovecs meet, a cut read its device-sized legs as well (leg_stride_ bounds both).
+    // A read's legs are reserved all at once, so the ring must hold the widest read's legs (leg_stride_ bounds both a
+    // fixed read's leg per registered buffer and a cut read's device-sized legs).
     if (fixed_reads() && leg_stride_ < std::max<size_t>(1, derived().max_iovecs()))
       throw std::logic_error(error_prefix<Layout>() + "a fixed read mode opened with one-leg storage");
     if (cuts_ && configured_queue_depth_ != 0) {
@@ -346,34 +361,35 @@ class ReaderCore {
     return true;
   }
 
-  // Read `experts` of streamed row `layer` into `slots`, `step` rows per io_uring batch (at most
-  // kBounceRows, one bank). `abandon(batches admitted so far)` runs before each batch is admitted and
-  // whenever the loop comes back to it; true stops admitting new batches. Rows already admitted are
-  // reaped and packed, so nothing is in flight when read() returns.
-  // Returns 1 when every row landed, 0 on an I/O error or short file, -1 when abandoned before every
-  // batch was admitted. `packed`, when not null, is set to 1 for every row that was packed (with -1 those
-  // rows are complete and the caller may keep them; with 0 the caller releases everything).
-  // `max_reading_rows` caps the rows with I/O outstanding.
-  // Every return leaves the ring empty: nothing in flight, nothing prepared (I1).
+  // Reads `experts` of streamed row `layer` into `slots`, `step` rows per io_uring batch (at most kBounceRows, one
+  // bank), on the owner thread. Allocates nothing.
   //
-  // `trace`, when not null, receives this read's stage stamps and per-drive bytes (StageRecord).
-  // Null costs a branch per event and no clock read; the stamps only read the clock and add to
-  // `trace`, so they cannot change what is submitted, reaped, drained or copied.
+  // Returns 1 when every row landed, 0 on an I/O error or short file, -1 when abandoned before every batch was
+  // admitted. Every return leaves the ring empty: nothing in flight, nothing prepared.
   //
-  // `progress`, unless it is NoProgress, is invoked once per turn of the drain loop (never behind a clock: spec M4),
-  // and again as each row finishes (finish_row), so a caller that publishes the landed prefix (run_fill's advance)
-  // sees every row as it lands, not once per turn: one reap can return every row of a read at once.
-  // The reader has no lease vocabulary and never will: this callback is how the caller (serve()) runs
-  // its own periodic work (retire_leases()) while a read is in flight, exactly as `abandon` is how the
-  // caller decides when to stop admitting. NoProgress compiles to nothing.
+  //   abandon           `abandon(batches admitted so far)` runs before each batch is admitted and whenever the loop
+  //                     comes back to it; true stops admitting new batches. Rows already admitted are reaped and
+  //                     packed.
+  //   trace             when not null, receives this read's stage stamps and per-drive bytes (StageRecord). Null costs
+  //                     a branch per event and no clock read; stamps only read the clock and add to `trace`, so they
+  //                     cannot change what is submitted, reaped, drained or copied.
+  //   packed            when not null, set to 1 for every row that was packed. With -1 those rows are complete and the
+  //                     caller may keep them; with 0 the caller releases everything.
+  //   max_reading_rows  caps the rows with I/O outstanding.
+  //   progress          unless it is NoProgress, invoked once per turn of the drain loop and again as each row finishes
+  //                     (finish_row), so a caller that publishes the landed prefix (run_fill's advance) sees every row
+  //                     as it lands, not once per turn: one reap can return every row of a read at once. The reader has
+  //                     no lease vocabulary; this callback is how the caller (serve()) runs its own periodic work
+  //                     (retire_leases()) while a read is in flight, as `abandon` is how it decides when to stop
+  //                     admitting. NoProgress compiles to nothing.
+  //   publish           piece streaming only: where the owner publishes each piece (PiecePublish).
   //
-  // `abandon` and `progress` are template parameters, not std::function (spec A6): a closure past std::function's
-  // local storage would be heap-allocated per read. `experts` and `slots` are spans, so the service passes its
-  // fixed-size lists without copying them into vectors.
+  // `abandon` and `progress` are template parameters, not std::function: a closure past std::function's local storage
+  // would be heap-allocated per read. `experts` and `slots` are spans, so the service passes its fixed-size lists
+  // without copying them into vectors.
   //
-  // This is the hot path and checks nothing: `layer`, `experts` and `slots` must be in
-  // range and `experts.size() == slots.size()`. The service (Task 11) and
-  // read_rows_once (Python) validate at their boundaries.
+  // This is the hot path and checks nothing: `layer`, `experts` and `slots` must be in range and
+  // `experts.size() == slots.size()`. The service and read_rows_once (Python) validate at their boundaries.
   template <class Abandon, class Progress = NoProgress>
   int read(
       int64_t layer,
@@ -406,8 +422,8 @@ class ReaderCore {
     if constexpr (Build::kMetrics) c.trace = trace;  // ProdBuild: no record, whatever the caller passed
     c.packed = packed;
     if constexpr (!std::is_same_v<std::decay_t<Progress>, NoProgress>) {
-      // Type-erased as a function pointer and the closure's address: no std::function, nothing allocated (spec A6).
-      // The closure outlives the call (it is read()'s own parameter), and finish_row runs only inside the loop below.
+      // Type-erased as a function pointer and the closure's address: nothing allocated. The closure outlives the call
+      // (it is read()'s own parameter), and finish_row runs only inside the loop below.
       c.progress = [](void* closure) { (*static_cast<std::remove_reference_t<Progress>*>(closure))(); };
       c.progress_closure = const_cast<void*>(static_cast<const void*>(std::addressof(progress)));
     }
@@ -421,13 +437,12 @@ class ReaderCore {
     });
     reset_pipeline();
     if constexpr (Build::kFaults) faults_.held.clear();
-    // Whatever way this call ends, no packing worker may still be copying when it does: the caller
-    // releases the slots on return and the next read reuses the bounce. Runs on exceptions too.
-    // An exception (one of the accounting guards) leaves reads in flight: drain them too before unwinding past the
-    // caller, which releases the slots. In direct mode those reads write the slab rows themselves.
-    // "Unwinding" is every exit but the two returns below, which set `returned` just before returning. Not
+    // However this call ends, nothing may still be reading or copying: the caller releases the slots on return and
+    // the next read reuses them. An exception (one of the accounting guards) leaves reads in flight, and in direct mode
+    // those reads write the slab rows themselves, so they are drained before unwinding past the caller.
+    // "Unwinding" is every exit but the two returns below, which set `returned` just before returning. This is not
     // std::uncaught_exceptions(): its first call on a thread makes __tls_get_addr allocate libstdc++'s exception
-    // globals (dynamic TLS), which was the production service thread's one malloc (final-fix round, item 5).
+    // globals (dynamic TLS), which was the production service thread's one malloc.
     struct Quiesce {
       ReaderCore* reader;
       bool returned = false;
@@ -445,8 +460,8 @@ class ReaderCore {
     } quiesce_on_exit{this};
     while (true) {
       // Progress runs every turn: the caller's hook (retire_leases) returns at once when no lane is outstanding, and
-      // gating it on a clock put a clock read on every turn of the hot path (spec M4). Not gated on a completion being
-      // reaped either: those are this reader's own I/O, uncorrelated with the device acknowledging a lease.
+      // gating it on a clock would put a clock read on every turn of the hot path. It is not gated on a completion
+      // being reaped either: those are this reader's own I/O, uncorrelated with the device acknowledging a lease.
       if constexpr (!std::is_same_v<std::decay_t<Progress>, NoProgress>) progress();
       derived().collect();  // before admit: a bank whose last copy just finished is free for the next batch
       if (!c.failed) admit(abandon);
@@ -454,17 +469,16 @@ class ReaderCore {
       if (c.failed) break;
       const bool ready = has_ready();
       if (c.pending == 0 && !ready && held_empty() && c.packing == 0) break;
-      // Submit what was prepared before packing, so storage stays busy while the CPU copies; only
-      // block for a completion when there is no complete row to pack. With rows packing on workers the
-      // owner cannot be woken from a blocking wait when one finishes, so it polls instead. The
-      // withheld completions of the slow-drive fault arrive only once every other row has packed.
+      // Submit what was prepared before packing, so storage stays busy while the CPU copies; block for a completion
+      // only when there is no complete row to pack. With jobs packing on workers the owner cannot be woken from a
+      // blocking wait when one finishes, so it polls instead. The slow-drive fault's withheld completions arrive only
+      // once every other row has packed.
       if (c.pending > 0 || (!ready && c.packing == 0 && !held_empty())) reap(ready || c.packing > 0);
       if (c.failed) break;
       if (!derived().advance() && c.packing > 0) _mm_pause();
     }
-    // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was
-    // neither admitted nor abandoned: the loop's own bookkeeping is wrong. Fail instead of returning a
-    // row that was never read.
+    // Nothing in flight and nothing to pack, yet a row was left unread or unpacked, or a batch was neither admitted nor
+    // abandoned: the loop's own bookkeeping is wrong. Fail rather than return a row that was never read.
     if (!c.failed) {
       bool clean = c.reading_rows == 0 && c.queue_count == 0;
       for (int b = 0; b < kBanks; ++b)
@@ -491,6 +505,8 @@ class ReaderCore {
   }
 
  protected:
+  // `direct` opens the files with O_DIRECT. Queue depth, read cuts and the read mode come from
+  // UringOptions::from_env().
   ReaderCore(Tables tables, bool direct) : t_(std::move(tables)), direct_(direct) {
     configured_queue_depth_ = UringOptions::from_env().queue_depth;
     cuts_requested_ = UringOptions::from_env().read_cuts_on();
@@ -502,9 +518,9 @@ class ReaderCore {
     close_io();
     for (int fd : fds_)
       ::close(fd);
-    // Undo the owner-pin scaffold's affinity change: the pin targets the calling thread, which a caller
-    // (e.g. the benchmark) may reuse across many readers, so a later open() must see the original mask,
-    // not the single core this reader pinned itself to.
+    // Undo the owner-pin scaffold's affinity change: the pin targets the calling thread, which a caller (e.g. the
+    // benchmark) may reuse across many readers, so a later open() must see the original mask, not the single core this
+    // reader pinned itself to.
     if (owner_pinned_) pthread_setaffinity_np(pthread_self(), sizeof(unpinned_affinity_), &unpinned_affinity_);
   }
 
@@ -521,18 +537,17 @@ class ReaderCore {
     return static_cast<const Derived&>(*this);
   }
 
-  static constexpr int kMaxSoftErrors = 1000;
+  static constexpr int kMaxSoftErrors = 1000;         // consecutive -EINTR/-EAGAIN/-EBUSY submits before the read fails
+  static constexpr int kMaxRetries = 8;               // resubmissions of one descriptor before the read fails
+  static constexpr uint8_t kPoisonFill = 0xA5;        // the `poison` fault's bounce-slot fill
+  static constexpr int32_t kPoisonSlot = 0x7EADBEEF;  // the `poison` fault's scribble over a retired descriptor's slot
 
-  static constexpr int kMaxRetries = 8;
-
-  static constexpr uint8_t kPoisonFill = 0xA5;
-
-  static constexpr int32_t kPoisonSlot = 0x7EADBEEF;
-
-  // Packing: handed to a packing worker, which owns the copy until the owner sees its job done.
+  // A bounce row's life: Free, then Reading until its last extent retires, then Ready to pack. Packing means handed to
+  // a packing worker, which owns the copy until the owner sees its job done.
   enum class RowState : uint8_t { Free, Reading, Ready, Packing };
 
-  // One extent's read, live from admission until its last completion retires it (generation != 0).
+  // One extent's read, live from admission until its last completion retires it (generation != 0). The descriptor's
+  // index is (slot * parts + part) * subs_ + sub, and rides in the SQE's user_data (make_tag).
   struct ExtentDesc {
     const Read* read = nullptr;
     int64_t done = 0;
@@ -547,9 +562,12 @@ class ReaderCore {
     bool queued = false;        // in queue_ (or about to be, through again_): a descriptor is queued at most once
   };
 
-  // One leg of a descriptor's read: the SQE unit. Default reads are one leg covering the whole read; a fixed read
-  // has a leg per registered buffer its iovecs meet (UringReader::fixed_legs).
+  // The state of one leg: Idle (to be prepared, or to be resubmitted after a short or retried read), Inflight (an SQE
+  // is prepared and not reaped) or Done.
   enum class LegState : uint8_t { Idle, Inflight, Done };
+
+  // One leg of a descriptor's read: the SQE unit. Default reads are one leg covering the whole read; a fixed read has
+  // a leg per registered buffer its iovecs meet (UringReader::fixed_legs), and a cut read a leg per device-sized run.
   struct Leg {
     int64_t start = 0;     // the leg's first byte, from the read's start (d.read->offset / dest)
     int64_t bytes = 0;     // what the leg covers
@@ -560,17 +578,19 @@ class ReaderCore {
     LegState state = LegState::Idle;
   };
 
+  // One row's slot in a bank: its state, its coverage accounting and, with piece streaming, its sub-read and piece
+  // bookkeeping.
   struct BounceRow {
     RowState state = RowState::Free;
     size_t ordinal = 0;  // the row's index in the request
     unsigned extents_left = 0;
-    // Coverage, checked before the row is packed. `needed` is the last byte of the slot the segments
-    // can read; `filled` is what the drives actually delivered into it. See take_ready_row().
+    // Coverage, checked before the row is packed. `needed` is the last byte of the slot the segments can read; `filled`
+    // is what the drives actually delivered into it. See take_ready_row().
     int64_t needed = 0;
     int64_t filled = 0;
     // Piece streaming only (zero otherwise): the row's sub-reads by ordinal and its pieces. A piece is vetted once
-    // every sub-read in its dependency mask has landed and its bytes lie inside what they delivered; with the flag
-    // on this, not `filled`, is what take_ready_row checks.
+    // every sub-read in its dependency mask has landed and its bytes lie inside what they delivered; with the flag on
+    // this, not `filled`, is what coverage rests on.
     int64_t start = 0;  // where the needed bytes begin in the slot
     uint8_t subs = 0;
     uint8_t landed = 0;  // bit s: sub-read s retired
@@ -578,8 +598,8 @@ class ReaderCore {
     uint8_t deps[kPieces] = {};
     int64_t sub_dest[kPieces] = {};
     int64_t sub_done[kPieces] = {};
-    // Bit j: piece j handed to a packing job (or, with no bytes, published at once), and collected and published by
-    // the owner. The row is finished once every piece is published and every sub-read retired.
+    // Bit j: piece j handed to a packing job (or, with no bytes, published at once) / collected and published by the
+    // owner. The row is finished once every piece is published and every sub-read retired.
     uint8_t dispatched = 0;
     uint8_t published = 0;
     int64_t pack_first = INT64_MAX;  // the earliest start and latest end of its pieces' jobs (traced reads only)
@@ -588,9 +608,8 @@ class ReaderCore {
 
   using Completion = ReadCompletion;
 
-  // The reader's diagnostic counters, over its life: metrics (InstrBuild only). The `c.first_seen`, `c.last_seen`
-  // and `c.submitted` Call fields stay plain in both builds: only the trace sets them, and they cost a store, not a
-  // branch.
+  // The reader's diagnostic counters over its life (InstrBuild only). The Call fields `first_seen`, `last_seen` and
+  // `submitted` stay plain in both builds: only the trace sets them, and they cost a store, not a branch.
   struct ReaderMetrics {
     int64_t cqes = 0;              // completions reaped
     int64_t stale_cqes = 0;        // completions that named no live descriptor
@@ -602,7 +621,7 @@ class ReaderCore {
     int64_t publish_refused = 0;   // publish attempts a readiness word refused
   };
   struct NoReaderMetrics {};
-  // Test-only fault state (set_fault, set_sqe_log): InstrBuild only, so ProdBuild's request path tests none of it.
+  // Test-only fault state (set_fault, set_sqe_log), InstrBuild only, so ProdBuild's request path tests none of it.
   struct FaultState {
     ReadFault fault{};
     bool part_fired = false;
@@ -617,12 +636,12 @@ class ReaderCore {
   };
   struct NoFaultState {};
 
-  // The stage trace (spec M9): ProdBuild's Call carries no record pointer at all, so no site can test or stamp one.
+  // The stage trace: ProdBuild's Call carries no record pointer at all, so no site can test or stamp one.
   struct NoTrace {};
   using TracePtr = std::conditional_t<Build::kMetrics, StageRecord*, NoTrace>;
 
-  // One read() call's state. Everything the pipeline mutates lives here or in the members below, all
-  // sized at open(); read() allocates nothing.
+  // One read() call's state. Everything the pipeline mutates lives here or in the members below, all sized at open();
+  // read() allocates nothing.
   struct Call {
     int64_t layer = 0;
     std::span<const int32_t> experts;
@@ -660,7 +679,7 @@ class ReaderCore {
     }
   }
 
-  // A trace stamp of this read (0 without a record); ProdBuild's is the constant 0, no branch and no clock.
+  // A trace stamp for this read (0 without a record). ProdBuild's is the constant 0: no branch and no clock.
   int64_t trace_stamp() {
     if constexpr (Build::kMetrics) {
       return stamp(c_.trace);  // trace_stamp: the one stamp of the record
@@ -698,29 +717,30 @@ class ReaderCore {
     }
   }
 
-  // How many reads may be outstanding at once. Credit-based preparation in refill() means
-  // this bounds concurrency, not batch size: a batch larger than the ring waits for credit
-  // rather than overrunning it. Scaled by parts so splitting a row across roots does not
-  // halve the number of rows in flight.
+  // The ring's depth, which is also its credit: how many SQEs may be outstanding at once. Credit-based preparation in
+  // refill() means this bounds concurrency, not batch size: a batch larger than the ring waits for credit rather than
+  // overrunning it. The default scales with the mirror parts, so splitting a row across roots does not halve the rows
+  // in flight, and with the legs per read when reads are cut (credit counts SQEs), so the rows in flight stay what
+  // they were uncut. SGLANG_EXPERT_STREAM_URING_QUEUE_DEPTH overrides it.
   unsigned queue_depth() const {
     if (configured_queue_depth_ != 0) return configured_queue_depth_;
-    // Credit counts SQEs: with read cuts a read issues up to leg_stride_ of them, so the default grows with it and the
-    // rows in flight stay what they were uncut.
     const size_t per_read = cuts_ ? leg_stride_ : 1;
     return static_cast<unsigned>(
         std::min<size_t>(32768, static_cast<size_t>(kQueueDepth) * static_cast<size_t>(t_.parts) * per_read));
   }
 
+  // The next descriptor generation. 0 is reserved for "retired", so the counter skips it when it wraps.
   uint32_t next_generation() {
-    if (++generation_ == 0) {  // 0 means retired: skip it when the counter wraps
+    if (++generation_ == 0) {
       ++generation_;
       add_metric(&ReaderMetrics::generation_wraps);
     }
     return generation_;
   }
 
-  // Per-file limits (read cuts) and the leg/iovec strides every descriptor's storage uses. With cuts off a read has
-  // one leg, or (fixed modes) one per registered buffer its iovecs meet: at most max_iovecs(), today's bound.
+  // Sizes the per-file limits (read cuts) and the leg and iovec strides every descriptor's storage uses. With cuts off
+  // a read has one leg, or (fixed modes) one per registered buffer its iovecs meet: at most max_iovecs(). Throws when
+  // the cut would need more than kMaxLegs legs.
   void size_legs() {
     cuts_ = cuts_requested_ || leg_cut_cap_ > 0;
     limits_.clear();
@@ -732,7 +752,7 @@ class ReaderCore {
         limits_.push_back(device_limits(fds_[f]));
       }
     }
-    // io_ is not initialized yet, so the fixed read mode comes from the options (fixed_reads() reads them after init).
+    // io_ is not initialized yet, so the fixed read mode comes from the options (fixed_reads() reads io_ after init).
     bool fixed = false;
     if constexpr (requires(const Reader& reader, const iovec* v, unsigned c, FixedLeg* out) {
                     reader.fixed_legs(v, c, out);
@@ -751,6 +771,7 @@ class ReaderCore {
     iov_stride_ = iovecs + (cuts_ ? leg_stride_ : 0);
   }
 
+  // The length of the longest extent in the table.
   int64_t longest_read() const {
     int64_t longest = 0;
     for (const auto& e : t_.extents)
@@ -758,16 +779,15 @@ class ReaderCore {
     return longest;
   }
 
-  // Every buffer the pipeline uses is sized here, once: a descriptor per (bounce slot, part, sub-read), a queue
-  // that can hold each descriptor once (an extent waits in it at most once at a time), and completion
-  // and resubmission lists bounded by the same count. With piece streaming off there is one sub-read per part,
-  // so this is a descriptor per (bounce slot, part) and nothing piece-related is allocated.
+  // Sizes every buffer the pipeline uses: a descriptor per (bounce slot, part, sub-read), a queue that can hold each
+  // descriptor once (an extent waits in it at most once at a time), and completion and resubmission lists bounded by
+  // the same count. With piece streaming off there is one sub-read per part, so this is a descriptor per (bounce slot,
+  // part) and nothing piece-related is allocated. Returns false when the count does not fit the tag's index field.
   bool size_extents() {
     const size_t extents = static_cast<size_t>(kBounceSlots) * static_cast<size_t>(t_.parts) * subs_;
-    // A completion carries its descriptor index in the low 24 bits of user_data, its leg in the next 8 and its
-    // generation in the high 32 (make_tag). process() rejects an index past descs_.size(), but a count that does not
-    // fit in 24 bits would truncate on the way OUT, so a completion would name a different live descriptor and pass
-    // that check: bytes would be credited to the wrong extent.
+    // A completion carries its descriptor index in the low 24 bits of user_data (make_tag). process() rejects an index
+    // past descs_.size(), but a count that does not fit in 24 bits would truncate on the way OUT, so a completion would
+    // name a different live descriptor and pass that check: bytes would be credited to the wrong extent.
     if (extents > 0xFFFFFFull) return false;
     descs_.assign(extents, ExtentDesc{});
     legs_.assign(extents * leg_stride_, Leg{});
@@ -776,9 +796,8 @@ class ReaderCore {
     if constexpr (Build::kFaults) faults_.held.reserve(extents);
     again_.reserve(extents);
     sub_reads_.assign(piece_stream_ ? extents : 0, Read{});
-    // Each descriptor's iovecs (max_iovecs), rebuilt from its `done` whenever it is prepared (destination). Direct
-    // mode: a read lies inside the image and the segments tile it, so it touches at most one run per segment
-    // (image_iovecs). The bounce path: one, the read's span of its bounce slot.
+    // Each descriptor's iovecs (max_iovecs), built when its legs are planned (destination). A read lies inside the
+    // row image and the segments tile it, so it touches at most one run per segment (image_iovecs).
     iovecs_.assign(extents * iov_stride_, iovec{});
     iov_scratch_.assign(iov_stride_, iovec{});
     cut_scratch_.assign(leg_stride_, CutLeg{});
@@ -788,8 +807,8 @@ class ReaderCore {
     return true;
   }
 
-  // A new read() starts with every descriptor retired and every bank free. This is also what makes a
-  // failed call safe to follow: drain() has already retired the kernel's side of everything.
+  // Starts a read() with every descriptor retired and every bank free. This is also what makes a failed call safe to
+  // follow: drain() has already retired the kernel's side of everything.
   void reset_pipeline() {
     for (auto& d : descs_)
       d = ExtentDesc{};
@@ -799,7 +818,8 @@ class ReaderCore {
       rows_busy_[b] = bank_live_[b] = 0;
   }
 
-  // A row to pack; with piece streaming, a vetted piece not yet handed to a job, whatever its row's state.
+  // Whether there is a row to pack; with piece streaming, a vetted piece not yet handed to a job, whatever its row's
+  // state.
   bool has_ready() const {
     for (const auto& r : rows_) {
       if (piece_stream_ ? (r.vetted & static_cast<uint8_t>(~r.dispatched)) != 0 : r.state == RowState::Ready)
@@ -808,13 +828,13 @@ class ReaderCore {
     return false;
   }
 
+  // Appends descriptor `index` to the credit queue. Throws if the queue is full.
   void queue_push(uint32_t index) {
     Call& c = c_;
-    // queue_ holds each descriptor at most once, so queue_count + pending <= descs_.size() == queue_.size():
-    // a descriptor leaves the queue before it is prepared and only re-enters (through again_) after its
-    // completion was reaped. If that ever broke, the modulo below would overwrite the queue's head and
-    // silently drop an extent's read while its row still packed and published - the old native-bypass
-    // bug's signature. Cheap enough to check on every push, and there is no safe way to continue.
+    // queue_ holds each descriptor at most once, so queue_count + pending <= descs_.size() == queue_.size(): a
+    // descriptor leaves the queue before it is prepared and only re-enters (through again_) after its completion was
+    // reaped. If that ever broke, the modulo below would overwrite the queue's head and silently drop an extent's read
+    // while its row still packed and published. The check is cheap, and there is no safe way to continue.
     if (c.queue_count >= queue_.size()) {
       throw std::runtime_error(error_prefix<Layout>() + "the extent queue overflowed its descriptor count");
     }
@@ -832,7 +852,8 @@ class ReaderCore {
     again_.push_back(index);
   }
 
-  // A completion's tag: generation << 32 | leg << 24 | descriptor index (index < 2^24: size_extents).
+  // A completion's tag, the SQE's user_data: generation << 32 | leg << 24 | descriptor index (index < 2^24, checked by
+  // size_extents).
   static uint64_t make_tag(uint32_t generation, uint32_t index, unsigned leg) {
     return (static_cast<uint64_t>(generation) << 32) | (static_cast<uint64_t>(leg) << 24) | index;
   }
@@ -846,6 +867,7 @@ class ReaderCore {
     return static_cast<uint32_t>(tag >> 32);
   }
 
+  // Whether the ring reads into registered buffers (a fixed read mode).
   bool fixed_reads() const {
     if constexpr (requires(const Reader& reader) { reader.fixed_reads(); }) {
       return io_.fixed_reads();
@@ -854,10 +876,10 @@ class ReaderCore {
     }
   }
 
-  // A descriptor's legs, on its first preparation: its iovecs from `done` 0 (destination); with read cuts, rewritten
-  // into runs within its file's device limits (cut_legs); in a fixed read mode each run cut again at registered-
-  // buffer changes (fixed_legs). Without either it is one leg, today's read. Each leg's `start` is the prefix sum of
-  // the earlier legs' bytes; a leg wholly past the read's end-of-file expectation is Done at once.
+  // Plans a descriptor's legs on its first preparation: its iovecs from `done` 0 (destination); with read cuts,
+  // rewritten into runs within its file's device limits (cut_legs); in a fixed read mode each run cut again at
+  // registered-buffer changes (fixed_legs). Without either it is one leg covering the read. Each leg's `start` is the
+  // prefix sum of the earlier legs' bytes; a leg wholly past the read's end-of-file expectation is Done at once.
   void plan_legs(uint32_t index) {
     ExtentDesc& d = descs_[index];
     iovec* iov = &iovecs_[static_cast<size_t>(index) * iov_stride_];
@@ -927,8 +949,8 @@ class ReaderCore {
     d.legs = static_cast<uint8_t>(n);
   }
 
-  // Drop from the front of leg `g`'s iovec slice what already landed (g.done), in place: the kernel is not holding
-  // these iovecs now (the leg was reaped). The slice then describes exactly the leg's remaining bytes.
+  // Drops from the front of leg `g`'s iovec slice what already landed (g.done), in place. The kernel is not holding
+  // these iovecs (the leg was reaped), and the slice then describes exactly the leg's remaining bytes.
   void advance_leg(iovec* iov, Leg& g) {
     size_t have = 0;
     for (unsigned i = 0; i < g.iov_count; ++i)
@@ -945,8 +967,8 @@ class ReaderCore {
     }
   }
 
-  // Admit batches while a bank is free. The abandon check comes first: once it says stop, no further
-  // work is submitted, but what was already submitted is reaped by the loop.
+  // Admits batches while a bank is free. The abandon check comes first: once it says stop, no further work is
+  // submitted, but what was already submitted is reaped by the loop.
   template <class Abandon>
   void admit(Abandon& abandon) {
     Call& c = c_;
@@ -964,10 +986,9 @@ class ReaderCore {
         c.stalled = true;
         return;
       }
-      // The latch clears only once this turn really admits: returning below for the reading-rows cap
-      // leaves the same busy bank to re-arm the edge next turn and count the SAME wait again. With step 1
-      // and max_reading 1 that interleaving is the normal case, so one
-      // wait spanning three turns would be reported as three stalls.
+      // The latch clears only once this turn really admits: returning below for the reading-rows cap leaves the same
+      // busy bank to re-arm the edge next turn and count the SAME wait again. With step 1 and max_reading 1 that
+      // interleaving is the normal case, so one wait spanning three turns would be reported as three stalls.
       if (c.reading_rows != 0 && c.reading_rows + count > c.max_reading) return;
       c.stalled = false;
       if (!admit_batch(bank, first, count)) {
@@ -978,12 +999,15 @@ class ReaderCore {
     }
   }
 
+  // Validates rows [first, first + count) of the call, then takes `bank` for them: marks their slots Reading and queues
+  // their extents (or sub-reads). Returns false, with nothing changed, if the bank is not free or a row cannot be read
+  // whole (see the checks below).
   bool admit_batch(size_t bank, size_t first, size_t count) {
     Call& c = c_;
     const size_t parts = static_cast<size_t>(t_.parts);
     if (bank_live_[bank] != 0) return false;  // an extent still names this bank: never reuse it
-    // Nor may a row still be packing (a worker holds its copy) or ready in one of its slots: rows_busy_ says so,
-    // and this refuses if the two ever disagree instead of overwriting a row a worker is reading.
+    // Nor may a row still be packing (a worker holds its copy) or ready in one of its slots: rows_busy_ says so, and
+    // this refuses if the two ever disagree instead of overwriting a row a worker is reading.
     for (size_t i = 0; i < count; ++i) {
       if (rows_[bank * kBounceRows + i].state != RowState::Free) return false;
     }
@@ -991,30 +1015,27 @@ class ReaderCore {
     for (size_t i = 0; i < count; ++i) {
       const size_t row_index = static_cast<size_t>(c.layer * t_.experts + c.experts[first + i]);
       const size_t base = row_index * parts;
-      // The bytes the expert needs are [start, start + need_end) of its aligned superset; they
-      // must all lie inside the file. What an extent's page-aligned tail overruns past end of
-      // file is padding no one needs, so the expectation below is shortened for it, but a row that
-      // needs bytes the file does not have is corrupt and must fail, not publish the bounce's stale
-      // bytes.
-      // The head is the row's FIRST READING part, not part 0. A root whose split weight is 0 gives a
-      // zero-length part 0 (SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=0:1 is a supported setting), and reading
-      // the base and the file size out of an extent that is never submitted makes the guard depend on
-      // fields nothing else uses: the eager reader already skips zero-length parts before computing
-      // offsets (exl3_row_reader.py), so a builder that borrowed that idiom would leave them zeroed and
-      // silently aim this check at the wrong file. Every part the head can be is one the reader submits.
+      // The bytes the expert needs are [start, start + need_end) of its aligned superset and must all lie inside the
+      // file. An extent's page-aligned tail may overrun end of file: that is padding no one needs, so the expectation
+      // below is shortened for it. A row that needs bytes the file does not have is corrupt and must fail, not publish
+      // stale bytes.
+      // The head is the row's FIRST READING part, not part 0. A root whose split weight is 0 gives a zero-length part 0
+      // (SGLANG_MOE_EXPERT_MIRROR_WEIGHTS=0:1 is a supported setting), and the eager reader (exl3_row_reader.py) skips
+      // zero-length parts before computing offsets, so a table builder may leave them zeroed. Reading the base and
+      // the file size from such an extent would silently aim this check at the wrong file; every part the head can be
+      // is one the reader submits.
       const Read* head = nullptr;
       for (size_t p = 0; p < parts && head == nullptr; ++p) {
         if (t_.extents[base + p].length > 0) head = &t_.extents[base + p];
       }
-      // A row with no extent reads nothing, so packing it would publish the bounce's stale bytes.
+      // A row with no extent reads nothing, so packing it would publish stale bytes.
       if (head == nullptr) return false;
       if (head->offset - head->dest + t_.starts[row_index] + t_.need_end > t_.file_sizes[head->file]) return false;
-      // Every reading part must have at least one byte in its own file. This cannot happen with a
-      // builder table - a part spans whole pages, a superset overruns end of file by less than one
-      // page, so a reading part always starts strictly inside the file - which is exactly why it must
-      // fail loudly here instead of being clamped to an expectation of zero below. An extent that
-      // expects nothing retires having read nothing while its row still packs and publishes, which is
-      // the corruption mode this reader exists to prevent.
+      // Every reading part must have at least one byte in its own file. A builder table never violates this (a part
+      // spans whole pages and a superset overruns end of file by less than one page, so a reading part always starts
+      // strictly inside the file), which is why it must fail loudly here instead of being clamped to an expectation
+      // of zero below: an extent that expects nothing retires having read nothing while its row still packs and
+      // publishes, the corruption mode this reader exists to prevent.
       for (size_t p = 0; p < parts; ++p) {
         const Read& e = t_.extents[base + p];
         if (e.length > 0 && t_.file_sizes[e.file] - e.offset <= 0) return false;
@@ -1051,9 +1072,8 @@ class ReaderCore {
         ExtentDesc& d = descs_[index];
         d = ExtentDesc{};
         d.read = extent;
-        // Per extent, against the file that extent reads: a page-aligned tail overrunning end of file
-        // is padding no one needs, so this expectation is shorter than the extent. At least 1 byte -
-        // the validation loop above refused the batch if any reading extent started at or past EOF.
+        // Per extent, against the file that extent reads. At least 1 byte: the validation loop above refused the
+        // batch if any reading extent started at or past end of file.
         d.expected = std::min(extent->length, t_.file_sizes[extent->file] - extent->offset);
         d.generation = next_generation();
         d.slot = static_cast<int32_t>(slot);
@@ -1081,9 +1101,9 @@ class ReaderCore {
     return true;
   }
 
-  // Piece streaming: the row's sub-reads and pieces, into `g` and slot `slot`'s piece runs. False refuses the batch:
-  // the row cannot be cut, or a sub-read would start at or past end of file (the per-part check above, per sub-read;
-  // a builder table never gives one, so it fails loudly rather than expecting nothing).
+  // Piece streaming: cuts the row into sub-reads and pieces, into `g` and slot `slot`'s piece runs. Returns false to
+  // refuse the batch: the row cannot be cut, or a sub-read would start at or past end of file (the per-part check in
+  // admit_batch, per sub-read).
   bool plan_pieces(size_t slot, size_t row_index, RowGeometry& g) {
     const size_t segments = t_.segments.size();
     if (!row_geometry(t_, row_index, g, &piece_runs_[slot * kPieces * segments])) return false;
@@ -1093,8 +1113,8 @@ class ReaderCore {
     return true;
   }
 
-  // Piece streaming: queue the row's sub-reads, one descriptor each, (slot, part, k) -> (slot * parts + part) *
-  // kSubReads + k: the stride is the most sub-reads a part can have, and k < sub_reads_per_part <= kSubReads, so the
+  // Piece streaming: queues the row's sub-reads, one descriptor each, (slot, part, k) -> (slot * parts + part) *
+  // kSubReads + k. The stride is the most sub-reads a part can have, and k < sub_reads_per_part <= kSubReads, so the
   // index is unique whatever the row's cut. Credit is untouched: refill() takes it per SQE, so a sub-read costs one
   // like a part did. Pieces with no bytes (past the row's sub-reads) are vetted here, at admission.
   void queue_sub_reads(size_t slot, size_t ordinal, const RowGeometry& g, int64_t admitted) {
@@ -1112,7 +1132,7 @@ class ReaderCore {
       ExtentDesc& d = descs_[index];
       d = ExtentDesc{};
       d.read = extent;
-      // Clamped at end of file per sub-read, as a part is; at least 1 byte (plan_pieces).
+      // Clamped at end of file per sub-read; at least 1 byte (plan_pieces).
       d.expected = std::min(extent->length, t_.file_sizes[extent->file] - extent->offset);
       d.generation = next_generation();
       d.slot = static_cast<int32_t>(slot);
@@ -1139,7 +1159,7 @@ class ReaderCore {
     vet_pieces(slot, admitted);
   }
 
-  // Piece streaming: sub-read `sub` of the row in `slot` retired with `done` bytes. Vet every piece it completes.
+  // Piece streaming: sub-read `sub` of the row in `slot` retired with `done` bytes. Vets every piece it completes.
   void land_sub_read(size_t slot, int32_t sub, int64_t done, int64_t returned) {
     Call& c = c_;
     BounceRow& r = rows_[slot];
@@ -1152,7 +1172,7 @@ class ReaderCore {
     vet_pieces(slot, returned);
   }
 
-  // Vet each piece of `slot` whose dependencies have all landed and that is not vetted yet. A piece whose bytes the
+  // Vets each piece of `slot` whose dependencies have all landed and that is not vetted yet. A piece whose bytes the
   // landed sub-reads do not cover fails the call: its dependencies are final, so it can never be packed.
   void vet_pieces(size_t slot, int64_t when) {
     Call& c = c_;
@@ -1176,9 +1196,9 @@ class ReaderCore {
     }
   }
 
-  // Every byte of piece j lies inside a landed sub-read's [dest, dest + done). Sub-reads are in dest order, so one
-  // pass per run suffices. This replaces the row's `filled >= needed`: a sub-read short at end of file is covered
-  // only up to what it returned.
+  // Whether every byte of piece j lies inside a landed sub-read's [dest, dest + done). Sub-reads are in dest order, so
+  // one pass per run suffices. This replaces the whole-row `filled >= needed` check: a sub-read short at end of file
+  // covers only what it returned.
   bool piece_delivered(size_t slot, int j) const {
     const BounceRow& r = rows_[slot];
     const size_t segments = t_.segments.size();
@@ -1197,13 +1217,12 @@ class ReaderCore {
     return true;
   }
 
-  // Prepare as many queued extents as credit and SQ room allow. `pending` counts SQEs prepared and not
-  // yet reaped (in the SQ ring or in the kernel) and never exceeds `capacity`. Credits are counted by
-  // SQEs, not by rows or logical reads, because rows do not all issue the same number of reads: a root
-  // serving none of a row issues nothing, and a fanned-out fixed read issues one SQE per leg. A descriptor's Idle
-  // legs are reserved all-or-nothing: prepared together only if they fit the credit (or nothing is pending, so a
-  // read wider than a lowered credit still progresses) and the SQ; otherwise it stays at the queue head. Retries
-  // re-enter through the queue, so they take credit like any other read.
+  // Prepares as many queued extents as credit and SQ room allow. `pending` counts SQEs prepared and not yet reaped (in
+  // the SQ ring or in the kernel) and never exceeds `capacity`. Credit counts SQEs, not rows or logical reads, because
+  // rows do not all issue the same number of reads: a root serving none of a row issues nothing, and a fanned-out
+  // fixed read issues one SQE per leg. A descriptor's Idle legs are reserved all-or-nothing: prepared together only if
+  // they fit the credit (or nothing is pending, so a read wider than a lowered credit still progresses) and the SQ;
+  // otherwise it stays at the queue head. Retries re-enter through the queue, so they take credit like any other read.
   void refill() {
     Call& c = c_;
     int64_t prepared = 0;  // one clock read per refill turn, taken on the first SQE
@@ -1225,7 +1244,7 @@ class ReaderCore {
       --c.queue_count;
       d.queued = false;
       // A resubmission (short read, -EINTR/-EAGAIN) starts past what already landed: advance_leg trims the leg's
-      // iovecs, which a mid-file O_DIRECT short read leaves on a block boundary.
+      // iovecs, and a mid-file O_DIRECT short read ends on a block boundary, so the remainder is a legal direct read.
       iovec* iov = &iovecs_[static_cast<size_t>(index) * iov_stride_];
       const int fd = fds_[d.read->file];
       for (unsigned l = 0; l < d.legs; ++l) {
@@ -1282,15 +1301,15 @@ class ReaderCore {
     }
   }
 
-  // The default opcodes: the bounce path IORING_OP_READ (prep_read; one leg, one iovec), the direct path
-  // IORING_OP_READV (prep_readv).
+  // Prepares an SQE with the default opcode: IORING_OP_READV for a scattering reader (Derived::kScatter), else
+  // IORING_OP_READ (one leg, one iovec).
   bool prep_default(int fd, const iovec* iov, unsigned count, uint64_t offset, uint64_t tag) {
     return Derived::kScatter ? io_.prep_readv(fd, iov, count, offset, tag)
                              : io_.prep_read(fd, iov[0].iov_base, static_cast<unsigned>(iov[0].iov_len), offset, tag);
   }
 
-  // Submit, wait for a completion only when `ready` is false, then drain the CQ before processing
-  // it so the CQ frees early and a fault can reorder the completions. The fault branches exist in InstrBuild only.
+  // Submits, waits for a completion only when `ready` is false, then drains the CQ before processing it, so the CQ
+  // frees early and a fault can reorder the completions. The fault branches exist in InstrBuild only.
   void reap(bool ready) {
     Call& c = c_;
     if constexpr (Build::kFaults) {
@@ -1304,14 +1323,14 @@ class ReaderCore {
     });
     unsigned wait_nr = ready ? 0u : 1u;
     if constexpr (Build::kFaults) {
-      // Fault: reversing only reorders one reaped batch, so wait for every read in flight; otherwise whether
-      // anything is reversed depends on how the device happened to batch its completions.
+      // reverse_cqes reorders only one reaped batch, so wait for every read in flight; otherwise whether anything is
+      // reversed depends on how the device happened to batch its completions.
       if (faults_.fault.reverse_cqes && c.pending > 0) wait_nr = c.pending;
     }
     const int rc = submit(wait_nr);
     if (rc < 0) {
-      // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again
-      // (uring_file_reader.cpp). Anything else, or a soft error that never clears, fails.
+      // -EINTR/-EAGAIN/-EBUSY: reap what has completed and submit again (as uring_file_reader.cpp does). Anything
+      // else, or a soft error that never clears, fails.
       const bool soft = rc == -EINTR || rc == -EAGAIN || rc == -EBUSY;
       if (!soft || ++c.soft_errors > kMaxSoftErrors) {
         c.failed = true;
@@ -1339,7 +1358,7 @@ class ReaderCore {
       queue_push(index);
   }
 
-  // Fault (hold_ordinal): every other row is done, so the withheld completions arrive now. InstrBuild only.
+  // Fault (hold_ordinal), InstrBuild only: every other row is done, so the withheld completions arrive now.
   void release_held()
     requires(Build::kFaults)
   {
@@ -1360,7 +1379,7 @@ class ReaderCore {
     }
   }
 
-  // The reap faults on one reaped batch, before it is processed: reverse_cqes, hold_ordinal and the stale
+  // Applies the reap faults to one reaped batch before it is processed: reverse_cqes, hold_ordinal and the stale
   // redelivery. InstrBuild only.
   void apply_reap_faults()
     requires(Build::kFaults)
@@ -1385,9 +1404,9 @@ class ReaderCore {
       }
       completions_.resize(kept);
     }
-    // Fault: a completion of an extent that retired earlier arrives after its descriptor was recycled.
-    // It names a dead generation, so it must fail the read and touch nothing; without the generation
-    // it would complete whichever extent now lives in that descriptor, publishing bytes never read.
+    // A completion of an extent that retired earlier arrives after its descriptor was recycled. It names a dead
+    // generation, so it must fail the read and touch nothing; without the generation it would complete whichever
+    // extent now lives in that descriptor, publishing bytes never read.
     if (faults_.stale_armed) {
       completions_.push_back(faults_.stale);
       faults_.stale_armed = faults_.stale_waiting = false;
@@ -1395,7 +1414,7 @@ class ReaderCore {
   }
 
   // Fault (stale_cqe_call): descriptor `index` was just recycled; if the held completion named it, deliver it with
-  // the next reap. ProdBuild: nothing.
+  // the next reap. Does nothing in ProdBuild.
   void arm_stale(uint32_t index) {
     if constexpr (Build::kFaults) {
       if (faults_.stale_waiting && index == faults_.stale_index) faults_.stale_armed = true;
@@ -1404,6 +1423,8 @@ class ReaderCore {
     }
   }
 
+  // Applies one completion to its leg: retries a transient error, fails the read on a hard one or a stale tag, and
+  // retires the extent when its last leg is done. A short read resubmits just the rest of that leg.
   void process(const Completion& completion, int64_t returned) {
     Call& c = c_;
     const uint32_t index = tag_index(completion.data);
@@ -1443,12 +1464,12 @@ class ReaderCore {
         }
       }
     }
-    // The leg, not the row: two parts of one row, and two legs of one read, complete independently.
+    // Two parts of one row, and two legs of one read, complete independently, so a retry resubmits one leg.
     if (res == -EINTR || res == -EAGAIN) {
       if (++d.retries > kMaxRetries) {  // the retry budget is the descriptor's
         c.failed = true;
       } else {
-        requeue(index);  // resubmit the same range (M3)
+        requeue(index);  // resubmit the same range
       }
       return;
     }
@@ -1462,10 +1483,9 @@ class ReaderCore {
       d.expected -= g.expected - g.done;
       g.expected = g.done;
     }
-    // A mid-file O_DIRECT read ends short only on a logical-block boundary, so
-    // offset + done, bounce + dest + done and length - done stay block-aligned (an
-    // extent's offset, dest and length are whole pages) and the resubmit is a legal
-    // direct read of just this leg. At EOF, done == expected: no resubmit.
+    // A mid-file O_DIRECT read ends short only on a logical-block boundary, so offset + done, dest + done and
+    // length - done stay block-aligned (an extent's offset, dest and length are whole pages) and the resubmit is a
+    // legal direct read of just this leg. At end of file done == expected: no resubmit.
     if (g.done < g.expected) {
       requeue(index);
       return;
@@ -1478,7 +1498,8 @@ class ReaderCore {
     retire(index, completion, returned);
   }
 
-  // Fault (hold_ordinal with sub): the completion is of sub-read fault.sub of part fault.part (any part at -1).
+  // Fault (hold_ordinal with sub): whether descriptor `index` is sub-read fault.sub of part fault.part (any part at
+  // -1).
   bool fault_matches_sub(uint32_t index) const
     requires(Build::kFaults)
   {
@@ -1487,14 +1508,14 @@ class ReaderCore {
     return static_cast<int64_t>(index % subs_) == fault.sub && (fault.part < 0 || part == fault.part);
   }
 
-  // The extent's last completion: account it, retire the descriptor, and when it was its row's last
-  // extent mark the row ready to pack. Nothing reads the descriptor afterwards.
+  // Handles an extent's last completion: accounts it, retires the descriptor, and marks the row ready to pack when it
+  // was the row's last extent. Nothing reads the descriptor afterwards.
   void retire(uint32_t index, const Completion& completion, int64_t returned) {
     Call& c = c_;
     ExtentDesc& d = descs_[index];
     if (d.legs_inflight != 0) throw std::logic_error(error_prefix<Layout>() + "an extent retired with a leg in flight");
     // What the read delivered contiguously from its start: the legs in order, up to the first that ended short (only
-    // the end of file, or the short_is_eof fault, ends a leg short). With one leg this is d.done.
+    // end of file, or the short_is_eof fault, ends a leg short). With one leg this is d.done.
     int64_t delivered = 0;
     const Leg* legs = &legs_[static_cast<size_t>(index) * leg_stride_];
     for (unsigned k = 0; k < d.legs; ++k) {
@@ -1530,8 +1551,8 @@ class ReaderCore {
     }
   }
 
-  // The earliest row in request order among those ready, vetted for packing; kBounceSlots when there is
-  // none or the vetting failed the call. Runs on the owner, before any copy, however the copy is done.
+  // The earliest row in request order among those ready, vetted for packing; kBounceSlots when there is none or the
+  // vetting failed the call. Runs on the owner, before any copy, however the copy is done.
   size_t take_ready_row() {
     Call& c = c_;
     size_t best = kBounceSlots;
@@ -1540,15 +1561,14 @@ class ReaderCore {
       if (best == static_cast<size_t>(kBounceSlots) || rows_[s].ordinal < rows_[best].ordinal) best = s;
     }
     if (best == static_cast<size_t>(kBounceSlots)) return best;
-    // Defence in depth for the one failure this reader must never have: packing bytes no drive
-    // delivered. admit_batch's EOF guard already refuses a row the file cannot satisfy, but it decides
-    // the row from part 0's file size alone, so it is only as good as the table's row consistency
-    // (checked in tables_from). This compares what the drives actually returned for THIS row against
-    // what its segments will read, costs one compare per row, and unlike the byte-split counters it is
-    // not behind the trace flag. Extents fill the slot contiguously from dest 0 and only a tail extent
-    // can stop short without being resubmitted (a short read retries; only the EOF clamp shortens an
-    // expectation), so a total at least `needed` means the needed prefix is whole.
-    // Piece streaming never takes a whole row: vet_pieces makes the same check per piece (dispatch_ready_pieces).
+    // Defence in depth for the one failure this reader must never have: packing bytes no drive delivered.
+    // admit_batch's end-of-file guard already refuses a row the file cannot satisfy, but it decides from the head
+    // part's file size alone, so it is only as good as the table's row consistency (checked in tables_from). This
+    // compares what the drives actually returned for THIS row against what its segments will read. It costs one
+    // compare per row and, unlike the byte-split counters, is not behind the trace flag. Extents fill the slot
+    // contiguously from dest 0 and only a tail extent can stop short without being resubmitted (a short read retries;
+    // only the end-of-file clamp shortens an expectation), so a total of at least `needed` means the needed prefix is
+    // whole. With piece streaming vet_pieces makes the same check per piece instead.
     if (rows_[best].filled < rows_[best].needed) {
       c.failed = true;
       return static_cast<size_t>(kBounceSlots);
@@ -1556,10 +1576,10 @@ class ReaderCore {
     return best;
   }
 
-  // Piece streaming, the owner's publish (plan §3.4 H1): piece j of the row in `slot` is stored and fenced (its job
-  // read done, or it had no bytes), so set its bit on every readiness word naming the row. A word that refuses
-  // (another generation, or the bit already set) fails the call. The bit is marked published either way: the piece
-  // was collected, and nothing else may wait on it.
+  // Piece streaming, the owner's publish: piece j of the row in `slot` is stored and fenced (its job is done, or it
+  // had no bytes), so sets its bit on every readiness word naming the row. A word that refuses (another generation, or
+  // the bit already set) fails the call. The bit is marked published either way: the piece was collected, and nothing
+  // else may wait on it.
   void publish_collected(size_t slot, int j) {
     Call& c = c_;
     BounceRow& r = rows_[slot];
@@ -1591,8 +1611,8 @@ class ReaderCore {
     r.published |= bit;
   }
 
-  // The row is packed whole: account it, flag it and free its slot. Packing is the last reference the bank
-  // held on this slot: only now may it be reused.
+  // The row is packed whole: accounts it, flags it and frees its slot. Packing is the last reference the bank held on
+  // this slot, so only now may it be reused.
   void finish_row(size_t best, int64_t start, int64_t end) {
     Call& c = c_;
     const size_t ordinal = rows_[best].ordinal;
@@ -1615,11 +1635,11 @@ class ReaderCore {
     rows_[best] = BounceRow{};
     --rows_busy_[best / kBounceRows];
     // Last, with the reader's bookkeeping settled: a fill publishes this row's landing now, not after the turn's last
-    // row (the landed-prefix defect, flake-bisect.md).
+    // row, which would leave the landed prefix stale.
     if (c.progress != nullptr) c.progress(c.progress_closure);
   }
 
-  // A failed call: what every extent still live was owed but never returned is cancelled. Extents that
+  // Accounts a failed call: what every still-live extent was owed but never returned is cancelled. Extents that
   // retired were accounted when they did.
   void account_unfinished() {
     on_trace([&](StageRecord& t) {
@@ -1633,15 +1653,15 @@ class ReaderCore {
     });
   }
 
-  // Submit the prepared SQEs, waiting for `wait_nr` completions (0: do not block).
+  // Submits the prepared SQEs, waiting for `wait_nr` completions (0: do not block).
   int submit(unsigned wait_nr) {
     return io_.submit(wait_nr);
   }
 
-  // After a failure, empty the ring before the bounce is reused or freed: settle every read prepared or
-  // in flight so nothing can still write the bounce once the caller reuses or frees it.
-  // The count is zeroed before io_.drain: a failed ring reset throws out of it, and Quiesce's drain on the way out
-  // must then see nothing pending, not the stale count, which no longer matches the ring's (0) and would terminate.
+  // Empties the ring after a failure: settles every read prepared or in flight, so nothing can still write the slots
+  // once the caller reuses or frees them. The count is zeroed before io_.drain: a failed ring reset throws out of it,
+  // and Quiesce's drain on the way out must then see nothing pending, not the stale count, which no longer matches the
+  // ring's (0) and would terminate.
   void drain(unsigned pending) {
     c_.pending = 0;
     io_.drain(pending);
@@ -1661,15 +1681,14 @@ class ReaderCore {
   std::vector<Leg> legs_;  // leg_stride_ per descriptor (size_extents)
   std::vector<uint32_t> again_;
   BounceRow rows_[kBounceSlots];
-  // Test-only owner-pinning scaffold (set_owner_core; -1 by default, meaning "no pin"). `unpinned_affinity_`
-  // is the mask open() found before pinning, restored by the destructor.
+  // Test-only owner-pinning scaffold (set_owner_core; -1: no pin). `unpinned_affinity_` is the mask open() found
+  // before pinning, restored by the destructor.
   int64_t owner_core_ = -1;
   bool owner_pinned_ = false;
   cpu_set_t unpinned_affinity_{};
-  // The ring. A derived reader that owns memory registered with it closes it (close_io()) before freeing that
-  // memory; ~ReaderCore closes it again (a no-op then) before closing the files it registered. It is safe only
-  // because read() always drains the ring (quiesce()) before returning, so nothing is ever in flight when a
-  // reader is destroyed.
+  // The ring. A derived reader that owns memory registered with it closes it (close_io()) before freeing that memory;
+  // ~ReaderCore closes it again (a no-op then) before closing the files it registered. This is safe only because
+  // read() always drains the ring (quiesce()) before returning, so nothing is in flight when a reader is destroyed.
   Reader io_;
   unsigned configured_queue_depth_ = 0;
   bool cuts_requested_ = false;       // READ_CUTS resolved (UringOptions::read_cuts_on)
@@ -1683,10 +1702,10 @@ class ReaderCore {
   std::vector<CutLeg> cut_scratch_;
   std::vector<FixedLeg> fixed_scratch_;
   // Piece streaming (set_piece_stream; off by default). subs_ is the most sub-reads per part: 1 with the flag off,
-  // which makes descriptor (slot, part, sub) the old (slot, part), and kSubReads with it on whatever a row's cut
+  // which makes descriptor (slot, part, sub) just (slot, part), and kSubReads with it on whatever a row's cut
   // (row_geometry cuts each reading part into sub_reads_per_part <= kSubReads). sub_reads_ holds each live sub-read's
   // Read (a descriptor points into it), piece_runs_ each slot's piece runs, geometry_ a batch's rows between
-  // validation and admission. All sized at open() or set_piece_stream(), and empty with the flag off.
+  // validation and admission. All are sized at open() or set_piece_stream(), and empty with the flag off.
   bool piece_stream_ = false;
   size_t subs_ = 1;
   std::vector<Read> sub_reads_;
@@ -1699,8 +1718,9 @@ class ReaderCore {
   // The diagnostic counters (ReaderMetrics) and the test-only fault state (FaultState): see their types above.
   [[no_unique_address]] std::conditional_t<Build::kMetrics, ReaderMetrics, NoReaderMetrics> metrics_;
   [[no_unique_address]] std::conditional_t<Build::kFaults, FaultState, NoFaultState> faults_;
-  // The type-system half of the prod proof: nm cannot see state whose names are inlined away, so ProdBuild's metric
-  // and fault members are asserted empty types (with [[no_unique_address]], they take no storage).
+  // ProdBuild's metric and fault members are asserted empty types (with [[no_unique_address]] they take no storage).
+  // This is the type-system half of the proof that ProdBuild carries no instrumentation; nm cannot see state whose
+  // names are inlined away.
   static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(metrics_)>, "ProdBuild has no metrics");
   static_assert(!std::is_same_v<Build, ProdBuild> || std::is_empty_v<decltype(faults_)>, "ProdBuild has no faults");
 };

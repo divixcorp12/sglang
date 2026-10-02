@@ -1,4 +1,13 @@
-// Device-side constants and helpers shared by the lease-protocol and row-copy kernels.
+// Device-side constants and helpers shared by the slot-map protocol kernels and the row-copy kernels.
+//
+// The pieces, in file order:
+//   state words        the device's own per-layer state (kPosted ... kDeadlineHi), never on the wire
+//   memory accessors   ld/st wrappers that make each access's ordering explicit at its call site
+//   record writer      write_record: the seqlock writer for a demand record (lease_layout.h)
+//   map delta          RowMap, MapDelta and the await/load/apply steps that mirror the host's slot map on the device
+//   lane typing        type_lanes: classifies each planned lane as a hit, a miss or a CPU lane
+//
+// See analysis/dsv41-drive/LEASE_PROTOCOL.md, "The chain".
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -27,11 +36,12 @@ constexpr int kBlock = 32;
 constexpr int kCopyWaitThreads = 256;  // the copy wait's block when it also reads the small tensors
 
 // The device's own words (`state`, int32, device memory): never on the wire.
-constexpr int kPosted = 0;
+constexpr int kPosted = 0;        // the last posted seq
 constexpr int kPending = 1;       // the seq of the request this layer's chain serves, 0 for an unarmed post
 constexpr int kEpoch = 2;         // times seq32 wrapped; G = epoch << 32 | seq
 constexpr int kPendingEpoch = 3;  // the epoch of the request kPending names
-// S's absolute deadline, written by the post (two int32 halves): the one device spin with no other bound.
+// The stream kernel's absolute deadline, written by the post as two int32 halves. It bounds the one device spin that
+// nothing else bounds.
 constexpr int kDeadlineLo = 4;
 constexpr int kDeadlineHi = 5;
 constexpr int kStateWords = 6;
@@ -79,11 +89,13 @@ SGL_DEVICE uint32_t copy_gate_word(uint32_t seq, uint32_t low) {
   return ((seq & kLeaseGateSeqMask) << kLeaseGateSeqShift) | low;
 }
 
-// Every word the host or another kernel accesses concurrently goes through one of these, so each call site states
-// its ordering. Relaxed is a volatile access: the PTX memory model treats ld/st.volatile as relaxed at system scope,
-// and nvcc emits LDG/STG.E.STRONG.SYS for it. Not cuda::atomic_ref: with CUDA 13.4's libcu++, an access through a
+// Relaxed system-scope accessors. Every word the host or another kernel accesses concurrently goes through these or
+// the acquire/release forms above, so each call site states its ordering.
+//
+// A relaxed access is a volatile access: the PTX memory model treats ld/st.volatile as relaxed at system scope, and
+// nvcc emits LDG/STG.E.STRONG.SYS for it. cuda::atomic_ref is avoided: with CUDA 13.4's libcu++, an access through a
 // __grid_constant__ parameter gains a run-time local-pointer check with a byte-copy fallback, and adjacent relaxed
-// accesses are merged and reordered (plan 2026-09-27-expert-stream-native-sync, Task 2).
+// accesses are merged and reordered.
 template <typename T>
 SGL_DEVICE T ld_relaxed_sys(const T* word) {
   return *reinterpret_cast<const volatile T*>(word);
@@ -105,6 +117,7 @@ SGL_DEVICE void st_relaxed_sys(uint8_t* address, std::type_identity_t<T> value) 
   st_relaxed_sys<T>(reinterpret_cast<T*>(address), value);
 }
 
+// The device's global timer in nanoseconds, the clock every deadline is measured on.
 SGL_DEVICE uint64_t global_ns() {
   return cuda::ptx::get_sreg_globaltimer();
 }
@@ -119,6 +132,7 @@ SGL_DEVICE uint64_t load_deadline(const int32_t* state) {
          static_cast<uint64_t>(static_cast<uint32_t>(state[kDeadlineLo]));
 }
 
+// Whether `observed` has reached `seq`, comparing cyclically so a wrapped 32-bit seq still orders correctly.
 SGL_DEVICE bool reached(uint32_t observed, uint32_t seq) {
   return static_cast<int32_t>(observed - seq) >= 0;
 }
@@ -130,8 +144,8 @@ SGL_DEVICE bool listed(const int32_t* ids, int count, int32_t id) {
   return false;
 }
 
-// The request the chain serves: kPending and kPendingEpoch change only at the next post, stream-ordered after the
-// chain's last kernel.
+// The generation G of the request the chain serves. kPending and kPendingEpoch change only at the next post,
+// stream-ordered after the chain's last kernel, so every kernel of the chain reads the same value.
 SGL_DEVICE uint64_t pending_generation(const int32_t* state) {
   const uint32_t seq = static_cast<uint32_t>(state[kPending]);
   return (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq;
@@ -141,7 +155,8 @@ SGL_DEVICE int64_t ring_index(uint32_t seq) {
   return static_cast<int64_t>((seq - 1u) % kDemandRecords);
 }
 
-// One request's typed lanes, as the post writes them into its record (lease_layout.h kRecLaneSlot, kRecKinds).
+// One request's typed lanes, as type_lanes produces them and the post writes them into its record (lease_layout.h
+// kRecLaneSlot, kRecKinds).
 struct TypedLanes {
   int32_t slot[kMaxIds];  // the RAM slot of a hit, the staging slot of a miss
   uint8_t kind[kMaxIds];  // kKind*
@@ -151,7 +166,8 @@ SGL_DEVICE bool is_cpu_kind(uint32_t kind) {
   return kind == kKindHitCpu || kind == kKindMissCpu;
 }
 
-// One request's record as the post knows it; write_record narrows and packs it into the wire layout.
+// One request's record as the post knows it, in registers and device memory; write_record narrows and packs it into
+// the wire layout. The pointers address `count` (or `protect_count`) entries.
 struct RecordFields {
   int64_t row;
   uint32_t flags;          // kRecFlag*
@@ -160,10 +176,10 @@ struct RecordFields {
   const int32_t* protect;  // protect_count routed experts
   int protect_count;
   int64_t count;            // lanes
-  const int64_t* planned;   // count lane experts
-  const int32_t* dst;       // count VRAM destination slots
-  const float* weight;      // count routing weights
-  const TypedLanes* lanes;  // count kinds and source slots
+  const int64_t* planned;   // lane experts
+  const int32_t* dst;       // VRAM destination slots
+  const float* weight;      // routing weights
+  const TypedLanes* lanes;  // kinds and source slots
 };
 
 // Two record ids as one i16 pair, -1 for none; traps on an id the record cannot carry rather than wrap it.
@@ -172,8 +188,9 @@ SGL_DEVICE uint32_t pack_ids(int64_t lo, int64_t hi) {
   return (static_cast<uint32_t>(lo) & 0xFFFFu) | (static_cast<uint32_t>(hi) << 16);
 }
 
-// Seqlock writer: a record of SM hits only may lap the ring before the service reads it, so a half-rewritten record
-// must never pass read_record's seq re-check. seq = 0, fence, payload, then seq with a release.
+// Writes one demand record as a seqlock: seq = 0, a release fence, the payload, then `seq` with a release store.
+// A record of SM hits only may lap the ring before the service reads it, so a half-rewritten record must never pass
+// the reader's seq re-check (read_record). Traps when the lane or protect count exceeds kMaxIds.
 SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& f) {
   if (f.count > kMaxIds || f.protect_count > kMaxIds) __trap();
   uint32_t protect_w[kMaxIds / 2], expert_w[kMaxIds / 2], slot_w[kMaxIds / 2], dst_w[kMaxIds / 2];
@@ -211,7 +228,8 @@ SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& 
   st_release_sys(record + kRecSeq, seq);
 }
 
-// One row of the device's map bank (ExpertStreamDevice.map_bank), device memory.
+// One row of the device's map bank (ExpertStreamDevice.map_bank), in device memory: the device's copy of the row's
+// RAM-tier map. The post applies the host's deltas to it and types lanes from it.
 struct RowMap {
   int32_t* ram_slot;     // [experts]: the expert's RAM slot, -1 when not resident
   int32_t* staging;      // [kLeaseLanes]: the row's staging slots
@@ -221,7 +239,7 @@ struct RowMap {
   uint32_t row_capacity;
 };
 
-// A row's map delta in registers: load_map_delta issues every load before it uses any, so their round trips overlap.
+// A row's map delta in registers. load_map_delta issues every load before it uses any, so their round trips overlap.
 struct MapDelta {
   uint32_t count;
   int32_t staging[kLeaseLanes];
@@ -229,9 +247,9 @@ struct MapDelta {
   int32_t slot[kDeltaMaxEntries];
 };
 
-// Waits, bounded by `deadline`, until the host has published the delta that follows the row's last map chain; true
-// when it is not applied yet. The host publishes a chain's delta before it reads that chain's misses, so the wait is
-// taken only when the host fell a whole token behind.
+// Spins until the host has published the delta that follows the row's last map chain, and returns true when that delta
+// is not applied yet. Traps at `deadline` if the host never publishes it. The host publishes a chain's delta before it
+// reads that chain's misses, so the spin runs only when the host fell a whole token behind.
 SGL_DEVICE bool await_map_delta(const uint8_t* delta, const RowMap& map, uint64_t deadline) {
   const uint64_t want = static_cast<uint64_t>(*map.map_chain);
   while (ld_acquire_sys64(delta + kDeltaTag) != want) {
@@ -241,7 +259,7 @@ SGL_DEVICE bool await_map_delta(const uint8_t* delta, const RowMap& map, uint64_
   return static_cast<uint64_t>(*map.map_applied) != want;
 }
 
-// The delta's payload; only after await_map_delta's acquire of its tag.
+// Loads the delta's payload. Call only after await_map_delta's acquire of the tag.
 SGL_DEVICE MapDelta load_map_delta(const uint8_t* delta) {
   MapDelta d;
   d.count = ld_relaxed_sys<uint32_t>(delta + kDeltaCount);
@@ -273,7 +291,8 @@ SGL_DEVICE MapDelta load_map_delta(const uint8_t* delta) {
   return d;
 }
 
-// Validates a loaded delta and applies it to the row once: map_applied takes the row's chain number.
+// Validates a loaded delta and applies it to the row, then sets map_applied to the row's chain number so the delta is
+// applied exactly once. Traps on an entry the row cannot hold.
 SGL_DEVICE void apply_map_delta(const MapDelta& d, const RowMap& map) {
   if (d.count > static_cast<uint32_t>(kDeltaMaxEntries)) __trap();
 #pragma unroll
@@ -291,7 +310,7 @@ SGL_DEVICE void apply_map_delta(const MapDelta& d, const RowMap& map) {
   *map.map_applied = *map.map_chain;
 }
 
-// The plan as the post reads it: count planned experts and their VRAM destination slots, device memory.
+// The plan as the post reads it, in device memory: `count` planned experts and their VRAM destination slots.
 struct LanePlan {
   const int64_t* planned;
   const int32_t* dst;
@@ -302,15 +321,15 @@ struct LanePlan {
 struct LanePolicy {
   bool host_lanes;   // a captured post while the copy engine is armed (kCopyArmed)
   bool hit_copy_ce;  // SGLANG_DSV41_RAM_HIT_COPY=ce
-  bool cpu_on;
-  bool cpu_misses;
-  bool ce_ok;   // the row's copy table is set
-  bool cpu_ok;  // the row's CPU layer is registered
+  bool cpu_on;       // CPU experts are enabled
+  bool cpu_misses;   // a miss may also be a CPU lane (SGLANG_DSV41_CPU_EXPERTS_MISSES)
+  bool ce_ok;        // the row's copy table is set
+  bool cpu_ok;       // the row's CPU layer is registered
   int32_t dst_rows;
   int32_t split[kLeaseLanes + 1];  // kSplit: CPU lanes per n eligible lanes
 };
 
-// kSplit's table in three 16-byte loads; the last three words loaded lie past the table and are dropped.
+// Loads kSplit's table in three 16-byte loads. The last three words loaded lie past the table and are dropped.
 SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[kLeaseLanes + 1]) {
   static_assert(kSplit % 16 == 0 && kSplit + 48 <= kLeaseBlockBytes && kLeaseLanes + 1 <= 12, "three loads");
   uint4 v[3];
@@ -324,10 +343,12 @@ SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[kLeaseLanes + 1]
     out[n] = static_cast<int32_t>(words[n]);
 }
 
-// ram_slot_map.type_lanes, transcribed: each lane's kind and source slot. A hit takes its RAM slot, the m-th miss
-// the m-th staging slot; the CPU takes the last split[n] of the n eligible lanes in plan order. Traps where the
-// reference raises (a wider plan, a repeated expert, a miss with no staging slot, a split entry above n). It reads no
-// host memory: the caller loads the split table into the policy.
+// Types each lane of the plan: its kind and source slot. Transcribes ram_slot_map.type_lanes, the host reference.
+//
+// A hit takes its RAM slot and the m-th miss the m-th staging slot. The CPU takes the last split[n] of the n eligible
+// lanes in plan order. Traps where the reference raises: a plan wider than kMaxIds, an expert out of range or repeated,
+// a hit slot past the row's capacity, a miss with no staging slot, a split entry above n. Reads no host memory; the
+// caller loads the split table into the policy.
 SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
   if (plan.count > kMaxIds) __trap();
   int64_t expert[kMaxIds];

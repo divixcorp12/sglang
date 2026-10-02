@@ -1,3 +1,12 @@
+// The bench's --self-test: checks the harness itself, so a bench result is never the harness's fault.
+//
+// Needs no fixture file and no GPU. In order:
+//   test_placement          the placement rules, against a fake topology of the reference machine
+//   test_record_bytes ...   DeviceSim's records, seqlock order, delta handling, lane typing, epoch wrap and copy-wait
+//                           gate, on a standalone page and lease block with the host's words written by hand
+//   test_image_stamp        row-image layout and stamp reuse
+//   test_stack              the real stack (this binary's build) on synthetic rows with a fake forward
+// Each failed check prints "FAIL file:line" and counts toward run_self_test's return value.
 #include "self_test.h"
 
 #include "aligned.h"
@@ -23,6 +32,7 @@ int failures = 0;
 namespace w = ::sglang::expert_stream::wire;
 namespace es = ::sglang::expert_stream;
 
+// Records one check and reports it on stderr when it fails.
 void check(bool ok, const char* what, const char* file, int line) {
   ++checks;
   if (!ok) {
@@ -31,6 +41,7 @@ void check(bool ok, const char* what, const char* file, int line) {
   }
 }
 
+// Passes when `f` throws an exception whose message contains `needle`.
 template <class F>
 void check_throws(F&& f, const std::string& needle, const char* what, const char* file, int line) {
   try {
@@ -49,7 +60,8 @@ void check_throws(F&& f, const std::string& needle, const char* what, const char
 
 // ---- placement ----
 
-// divix01: node 0 = 0-17,36-53; node 1 = 18-35,54-71; c and c + 36 are SMT siblings. Allowed: the partition.
+// The reference machine (72 CPUs, two NUMA nodes): node 0 = 0-17,36-53; node 1 = 18-35,54-71; c and c + 36 are SMT
+// siblings. Allowed: the bench's partition, 16-33 and 52-69.
 Topology fake_topology() {
   Topology t;
   t.node_of = [](int cpu) { return cpu % 36 < 18 ? 0 : 1; };
@@ -62,6 +74,7 @@ Topology fake_topology() {
   return t;
 }
 
+// The bench's default placement, which the fake topology accepts.
 Placement production_placement() {
   Placement p;
   p.writer = 16;
@@ -71,6 +84,7 @@ Placement production_placement() {
   return p;
 }
 
+// True when validate_placement accepts the placement; prints the refusal otherwise.
 bool passes(const Placement& p, const Topology& t, bool check_nodes) {
   try {
     validate_placement(p, t, check_nodes);
@@ -136,6 +150,8 @@ int64_t soon() {
 constexpr std::array<int16_t, 8> kStaging012 = {0, 1, 2, -1, -1, -1, -1, -1};
 constexpr std::array<int32_t, 9> kAllToCpu = {0, 1, 2, 3, 4, 5, 6, 7, 8};
 
+// A standalone request page and lease block, with helpers that write the host's words (deltas, the split table, the
+// armed flag) the way the host does, and read the device's words back.
 struct Blocks {
   explicit Blocks(int64_t rows)
       : page(aligned_zeroed(w::kPageBytes)),
@@ -379,6 +395,7 @@ constexpr int64_t kSelfCapacity = 7;  // 3 staging slots, 4 mappable
 constexpr int64_t kSelfHidden = 64;
 constexpr int64_t kFakeHandle = 7;
 
+// One call of the fake forward, recorded for the test to inspect.
 struct FakeCall {
   int64_t layer;
   std::vector<int32_t> slots;
@@ -413,16 +430,20 @@ int fake_forward(
   return 0;
 }
 
+// The byte filling expert `expert`'s `name` slab row in row `row`'s image, so a landed slot identifies its source.
 uint8_t pattern(int64_t row, int64_t expert, int name) {
   return static_cast<uint8_t>(1 + row * 64 + expert * 6 + name);
 }
 
+// True when part 0 of an output row is fake_forward's result for the given x and weight sum.
 bool part0_is(const float* part0, float offset) {
   for (int64_t h = 0; h < kSelfHidden; ++h)
     if (part0[h] != static_cast<float>(h) + offset) return false;
   return true;
 }
 
+// Drives the real RamTier, RamThread, copy engine and CPU expert engine through DeviceSim: loading, SM hits, CPU hits,
+// split 0, and a hit with a miss in one post; checks the fake forward's inputs and outputs and the staging slots.
 void test_stack(const Placement& placement, const std::filesystem::path& dir) {
   const ImageLayout layout = image_layout({512, 512, 512, 512, 512, 512});
   std::vector<std::array<AlignedBuffer, kNames>> slabs(kSelfRows);

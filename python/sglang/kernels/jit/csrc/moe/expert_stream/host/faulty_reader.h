@@ -1,4 +1,8 @@
-// Test-only submit faults (ReadFault's submit_* words) around any reader; zero faults forward every call unchanged.
+// Test-only submit faults (ReadFault's submit_* words) around any reader.
+//
+// FaultyReader wraps an AsyncFileReader and forwards every call to it. With a default SubmitFault it is transparent;
+// otherwise it fails or truncates the selected submit() call, and forwards the ring-reset faults to readers that have
+// them. The optional reader methods (fixed-read and ring accessors) are forwarded only when `Inner` provides them.
 #pragma once
 
 #include "file_reader.h"
@@ -6,9 +10,12 @@
 namespace sglang {
 namespace expert_stream {
 
+// The wrapper is used from the thread that drives the reader, like `Inner`. Instantiated only in the instrumented
+// build; the production reader is never wrapped.
 template <AsyncFileReader Inner>
 class FaultyReader {
  public:
+  // Arms `fault` and forwards its ring-reset flags to `Inner` when it supports them.
   void set_submit_fault(const SubmitFault& fault) {
     fault_ = fault;
     if constexpr (requires(Inner& reader) { reader.set_ring_reset_fail(true); }) {
@@ -80,14 +87,15 @@ class FaultyReader {
   bool prep_readv(int fd, const iovec* iov, unsigned count, uint64_t off, uint64_t tag) {
     return inner_.prep_readv(fd, iov, count, off, tag);
   }
+  // Counts the call, then fails it (`error`), sends it short (`short_call`), or forwards it.
   int submit(unsigned wait_nr) {
     ++submits_;
     if (fault_.error != 0 && submits_ == fault_.call) {
       if (fault_.submit_first) inner_.submit(0);
       return -fault_.error;
     }
-    // Fault: the kernel consumed none of the prepared SQEs and reported success. They stay prepared and
-    // are counted in `pending`, so the next submit must send them; nothing may wait on them meanwhile.
+    // The kernel consumed none of the prepared SQEs and reported success. They stay prepared and counted in
+    // `pending`, so the next submit must send them; nothing may wait on them meanwhile.
     if (fault_.short_call != 0 && submits_ == fault_.short_call) return 0;
     return inner_.submit(wait_nr);
   }

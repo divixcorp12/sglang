@@ -17,6 +17,8 @@
 namespace fullstack {
 namespace fs = std::filesystem;
 
+// The slabs are aligned zeroed buffers; `inputs` keeps each layer's FP16 input so write_x can restore it after a
+// forward.
 struct StackFixture::Impl {
   int64_t rows = 0;
   int64_t experts = 0;
@@ -33,14 +35,16 @@ struct StackFixture::Impl {
 
 namespace {
 
+// Byte size of a tensor as int64_t.
 int64_t nbytes(const at::Tensor& t) {
   return static_cast<int64_t>(t.nbytes());
 }
 
-// Each name's slab row from the fixture's nine matrices per expert (gate, up, down x trellis, suh, svh), in the pinned
-// tier's row shape: w13_* hold gate then up ([slot, 2, ...]), w2_* hold down ([slot, 1, ...]).
+// For each name, the fixture matrices (indexes into a layer's nine, see LayerFixture) its slab row concatenates, in the
+// pinned tier's row shape: w13_* hold gate then up ([slot, 2, ...]), w2_* hold down ([slot, 1, ...]); -1 is unused.
 constexpr std::array<std::array<int, 2>, kNames> kSources = {{{0, 3}, {1, 4}, {2, 5}, {6, -1}, {7, -1}, {8, -1}}};
 
+// The stamp that lets a later run reuse the row-image files: the fixture's path, size and mtime plus the image size.
 std::string fixture_stamp(const fs::path& fixture, const ImageLayout& layout) {
   const fs::path absolute = fs::absolute(fixture);
   return absolute.string() + "\n" + std::to_string(fs::file_size(absolute)) + "\n" +
@@ -96,7 +100,7 @@ StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_d
         stamp);
     f.set.paths.push_back(path.string());
   }
-  f.x_stride = round_up(2 * f.hidden, 16);  // cpu_experts/service.py: FP16 rows padded to 16 bytes
+  f.x_stride = round_up(2 * f.hidden, 16);  // as cpu_experts/service.py pads: FP16 rows to 16 bytes
   f.x = aligned_zeroed(f.rows * f.x_stride);
   f.inputs.resize(static_cast<size_t>(f.rows * 2 * f.hidden));
   for (int64_t row = 0; row < f.rows; ++row) {
@@ -138,8 +142,8 @@ void StackFixture::write_x(int64_t row) const {
   std::memcpy(x_row(row), impl_->inputs.data() + row * 2 * impl_->hidden, 2 * impl_->hidden);
 }
 
-// cpu_experts/exl3.py::register_layer over the row's slots: gate is w13 part 0, up part 1, down w2's one part; each
-// view is contiguous. Activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled.
+// Mirrors cpu_experts/exl3.py::register_layer over the row's slots: gate is w13 part 0, up part 1, down w2's one part;
+// each view is contiguous. Activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled.
 int64_t StackFixture::register_layer(int64_t row) const {
   const Impl& f = *impl_;
   const int64_t H = f.hidden, I = f.intermediate;

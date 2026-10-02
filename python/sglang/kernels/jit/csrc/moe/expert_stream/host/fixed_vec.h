@@ -1,6 +1,7 @@
-// A fixed-capacity vector for the service's per-request state (plan 2026-09-29-hotpath-zero-overhead Task 11): the
-// wire format bounds every per-request list (kMaxIds need and protect ids, kLeaseLanes lanes), so nothing on the
-// request path needs the heap. Overflow throws: it means a caller broke that bound, never a valid request.
+// A fixed-capacity vector, and the id-membership helper used with it.
+//
+// The service's per-request lists live in FixedVec: the wire format bounds every one of them (kMaxIds need and protect
+// ids, kLeaseLanes lanes), so nothing on the request path needs the heap.
 #pragma once
 
 #include <algorithm>
@@ -11,6 +12,9 @@
 
 namespace sglang::expert_stream {
 
+// An inline array of up to N elements with a vector-like surface. Elements are default-constructed up front and
+// overwritten, so T must be cheap to default-construct. Overflow throws std::logic_error: it means a caller broke the
+// wire-format bound, never that a valid request was too large. Single-threaded: the owner is the service thread.
 template <class T, size_t N>
 class FixedVec {
  public:
@@ -29,7 +33,7 @@ class FixedVec {
   void clear() {
     n_ = 0;
   }
-  // Sets the size to n; the caller has already written the first n entries through operator[]. Past N throws.
+  // Sets the size to n; the caller has already written the first n entries through operator[]. n > N throws.
   void resize(size_t n) {
     if (n > N) overflow();
     n_ = n;
@@ -76,7 +80,7 @@ class FixedVec {
   size_t n_ = 0;
 };
 
-// Membership in any contiguous id list (FixedVec, std::vector, std::span).
+// True when `id` is in `ids`, any contiguous id list (FixedVec, std::vector, std::span).
 template <class Ids, class Id>
 bool listed(const Ids& ids, Id id) {
   return std::find(std::begin(ids), std::end(ids), id) != std::end(ids);

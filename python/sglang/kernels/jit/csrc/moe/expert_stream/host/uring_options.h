@@ -1,4 +1,10 @@
-// Explicit io_uring experiments. Unset variables retain the production defaults.
+// The io_uring options of the expert-stream reader, read from SGLANG_EXPERT_STREAM_URING_* environment variables.
+//
+// Every variable is optional: unset ones keep the production defaults, and an invalid value throws
+// std::invalid_argument naming the variable. UringOptions also derives the behaviors that follow from the
+// combination of options (polling, wait strategy, read cuts), so the reader asks it rather than re-deriving them.
+//
+//   QUEUE_DEPTH, MODE, FIXED_FILES, READ_MODE, WAIT_MODE, SQ_THREAD_IDLE_MS, SQ_THREAD_CPU, DIAGNOSTICS, READ_CUTS
 #pragma once
 
 #include <charconv>
@@ -10,13 +16,22 @@
 
 namespace sglang::expert_stream {
 
+// Ring setup mode (MODE): plain, completion polling (IOPOLL), kernel submission thread (SQPOLL), or both.
 enum class UringMode { Default, IoPoll, SqPoll, SqPollIoPoll };
+
+// How reads are issued (READ_MODE): ordinary reads, or fixed reads into registered buffers, with one iovec per SQE
+// (Fixed) or a scattered iovec array per SQE (ReadvFixed, which needs liburing 2.10).
 enum class UringReadMode { Normal, Fixed, ReadvFixed };
+
+// How the reader waits for completions (WAIT_MODE): sleeping in the kernel, or polling the completion queue.
 enum class UringWaitMode { Block, Spin };
+
+// Whether reads are cut into legs the block device takes whole (READ_CUTS): Auto follows IOPOLL.
 enum class UringReadCuts { Auto, Off, On };
 
+// The parsed options. Build one with from_env(); the const members derive the behavior the options imply.
 struct UringOptions {
-  unsigned queue_depth = 0;  // 0 keeps RowReader's 16 * parts credit limit.
+  unsigned queue_depth = 0;  // 0 keeps RowReader's 16 * parts credit limit
   UringMode mode = UringMode::Default;
   bool fixed_files = false;
   UringReadMode read_mode = UringReadMode::Normal;
@@ -24,9 +39,10 @@ struct UringOptions {
   unsigned sq_thread_idle_ms = 10000;
   int sq_thread_cpu = -1;
   bool diagnostics = false;
-  // Cut every read into legs the block device takes whole (read_cuts.h; plan 2026-09-28-iopoll-read-cuts). auto: on
-  // exactly when IOPOLL is, where an uncut read is punted to io-wq (analysis/dsv41-drive/iopoll/diagnosis.md).
+  // Cut every read into legs the block device takes whole (read_cuts.h). Auto: on exactly when IOPOLL is, where an
+  // uncut read is punted to io-wq (analysis/dsv41-drive/iopoll/diagnosis.md).
   UringReadCuts read_cuts = UringReadCuts::Auto;
+  // True when reads are cut, after resolving Auto.
   bool read_cuts_on() const {
     return read_cuts == UringReadCuts::On || (read_cuts == UringReadCuts::Auto && iopoll());
   }
@@ -34,19 +50,23 @@ struct UringOptions {
     return read_cuts == UringReadCuts::Auto ? "auto" : read_cuts == UringReadCuts::On ? "on" : "off";
   }
 
+  // True when the ring has a kernel submission thread.
   bool sqpoll() const {
     return mode == UringMode::SqPoll || mode == UringMode::SqPollIoPoll;
   }
+  // True when completions are polled from the device instead of interrupt-driven.
   bool iopoll() const {
     return mode == UringMode::IoPoll || mode == UringMode::SqPollIoPoll;
   }
-  // IOPOLL without SQPOLL: io_uring_enter(GETEVENTS, min_complete>0) polls the device inside the kernel holding the
-  // ring's uring_lock, and a read punted to io-wq cannot queue itself on the poll list until the waiter lets go: the
-  // punted reads then issue one after another behind completions (+1.5 ms per row; diagnosis.md table 3). Such a
-  // ring therefore always waits with min_complete=0 passes.
+  // True for IOPOLL without SQPOLL. io_uring_enter(GETEVENTS, min_complete>0) polls the device inside the kernel
+  // holding the ring's uring_lock, and a read punted to io-wq cannot queue itself on the poll list until the waiter
+  // lets go: the punted reads then issue one after another behind completions (+1.5 ms per row;
+  // analysis/dsv41-drive/iopoll/diagnosis.md table 3). Such a ring therefore always waits with min_complete=0
+  // passes.
   bool polls_in_wait() const {
     return iopoll() && !sqpoll();
   }
+  // True when submit() may sleep in the kernel until completions arrive.
   bool blocking_wait() const {
     return wait_mode == UringWaitMode::Block && !polls_in_wait();
   }
@@ -78,6 +98,7 @@ struct UringOptions {
     return "invalid";
   }
 
+  // Reads and validates every SGLANG_EXPERT_STREAM_URING_* variable. Throws std::invalid_argument on a bad value.
   static UringOptions from_env() {
     UringOptions o;
     o.queue_depth = number<unsigned>("QUEUE_DEPTH", 0, 0, 32768);

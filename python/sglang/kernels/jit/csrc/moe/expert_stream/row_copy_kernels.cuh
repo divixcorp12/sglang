@@ -1,4 +1,12 @@
-// Row-copy kernels: S, the stream kernel, and the copy wait CW / CC (analysis/dsv41-drive/LEASE_PROTOCOL.md).
+// Row-copy kernels: the stream kernel (S) and the copy wait (CW, then CC), which move expert rows into device slots.
+//
+//   S   StreamParams    streams a miss lane's rows from its staging slot as the host publishes each piece
+//   CW  CopyWaitParams  reads small tensors with SMs when asked, closes the copy gate for the copy engine's lanes
+//   CC  CopyCommitParams  after the stream waits on the gate, checks CopyDone and reports the CPU lanes
+//   RowCopyKernel<L>    the checked host launchers for the chain's tail (S, CW, the gate wait, CC)
+//
+// The post (lease_kernels.cuh) and C1 precede S in the chain; see analysis/dsv41-drive/LEASE_PROTOCOL.md,
+// "The chain".
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -13,25 +21,27 @@ namespace sglang {
 
 namespace device::expert_stream {
 
-// S: kStreamBlocks blocks of kStreamThreads.
+// S runs kStreamBlocks blocks of kStreamThreads threads.
 constexpr int kStreamBlocks = 8;
 constexpr int kStreamThreads = 256;
 constexpr int kRowPieces = 8;  // the host's kPieces: one readiness bit per piece of a row
 constexpr uint32_t kAllPieces = 255u;
 
-// ld.global.cv, never .nc: a miss lane's host bytes are written while the kernel runs, and .nc may serve a line
-// cached before its piece was published. __ldcv/__stcg emit ld.global.cv/st.global.cg with a "memory" clobber, so
-// they stay ordered after the acquire that admitted the lane.
+// Copies 16 bytes with ld.global.cv, never .nc: a miss lane's host bytes are written while the kernel runs, and .nc
+// may serve a line cached before its piece was published. __ldcv/__stcg emit ld.global.cv/st.global.cg with a
+// "memory" clobber, so they stay ordered after the acquire that admitted the lane.
 SGL_DEVICE void stream_copy16(const uint8_t* src, uint8_t* dst) {
   __stcg(reinterpret_cast<longlong2*>(dst), __ldcv(reinterpret_cast<const longlong2*>(src)));
 }
 
+// Copies one byte, with the same cache operators as stream_copy16.
 SGL_DEVICE void stream_copy1(const uint8_t* src, uint8_t* dst) {
   *dst = __ldcv(src);
 }
 
-// This block's share of `bytes` bytes: units (16 B when both ends allow it) in chunks of kStreamThreads, the chunks
-// dealt round-robin over the grid, so every block copies about 1/gridDim of a range and no two blocks write one byte.
+// Copies this block's share of `bytes` bytes: units (16 B when both ends allow it) in chunks of kStreamThreads, the
+// chunks dealt round-robin over the grid. Every block copies about 1/gridDim of a range and no two blocks write one
+// byte.
 SGL_DEVICE void stream_copy_slice(const uint8_t* src, uint8_t* dst, int64_t bytes) {
   const int64_t tid = threadIdx.x;
   const bool aligned = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0;
@@ -51,9 +61,9 @@ SGL_DEVICE void stream_copy_slice(const uint8_t* src, uint8_t* dst, int64_t byte
   }
 }
 
-// This block's slice of piece `piece` of one lane. `runs` is the lane's [kRowPieces][row_segments][2] table of
-// name-row byte ranges; `segment_map` gives each row segment's copy-table entry (-1: none), then a flag per entry
-// that no row segment names, which is copied whole with piece 0.
+// Copies this block's slice of piece `piece` of one lane. `runs` is the lane's [kRowPieces][row_segments][2] table of
+// name-row byte ranges. `segment_map` gives each row segment's copy-table entry (-1: none), followed by a flag per
+// entry that no row segment names; those entries are copied whole with piece 0.
 SGL_DEVICE void stream_copy_piece(
     const int64_t* segments,
     int64_t segment_count,
@@ -88,6 +98,7 @@ SGL_DEVICE void stream_copy_piece(
   }
 }
 
+// S's per-block shared state, one slot per lane. Only thread 0 of the leader loop updates `done` and `finished`.
 struct StreamLanes {
   int32_t mine[kLeaseLanes];   // a kMissGpu lane: this kernel's
   int32_t slot[kLeaseLanes];   // its staging slot
@@ -96,17 +107,20 @@ struct StreamLanes {
   int finished;                // every piece of every lane copied
 };
 
+// The ready-piece bits of a PieceMask word, or 0 when the word still belongs to an earlier generation.
 SGL_DEVICE uint32_t piece_bits(uint64_t word, uint64_t generation) {
   return (word >> 8) == (generation & kGenerationMask) ? static_cast<uint32_t>(word & 0xFFu) : 0u;
 }
 
 }  // namespace device::expert_stream
 
-// S, the stream kernel. It owns the request's kMissGpu lanes, and copies each piece from the lane's staging slot as its
-// bit appears in the lane's PieceMask word, so the copy overlaps the read. Every block runs the same leader loop on its
-// own and copies its own slice of every piece; there is no inter-block barrier, so no co-residency is assumed, and a
-// block that finds the request broken traps the grid. Each mask's acquire orders the piece bytes the host published
-// before it: no served word is needed.
+// Arguments of S, the stream kernel (kStreamBlocks blocks of kStreamThreads threads).
+//
+// S owns the request's kMissGpu lanes and copies each piece from the lane's staging slot as its bit appears in the
+// lane's PieceMask word, so the copy overlaps the NVMe read. Every block runs the same leader loop on its own and
+// copies its own slice of every piece. There is no inter-block barrier, so no co-residency is assumed, and a block
+// that finds the request broken traps the grid. Each mask's acquire orders the piece bytes the host published before
+// it, so no separate "served" word is needed.
 struct StreamParams {
   const int32_t* state;
   const int64_t* planned;
@@ -125,10 +139,12 @@ struct StreamParams {
   uint32_t row_capacity;  // the row's pinned slots: fixed for the process, so a captured argument is sound
 };
 
+// S: copies every kMissGpu lane's pieces, then returns. Traps at the post's deadline (see kDeadlineLo) or on a staging
+// slot outside the row.
 template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3_ram_miss_lease_stream_kernel(
     const __grid_constant__ StreamParams p) {
-  // PDL as the post kernel (lease_kernels.cuh): its primary is C1, a plain launch, whose primary is the post.
+  // PDL as in the post kernel (lease_kernels.cuh). S's primary is C1, a plain launch, whose primary is the post.
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
   using namespace device::expert_stream;
@@ -183,8 +199,8 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
       if (all) {
         sh.finished = 1;
       } else {
-        // The one device spin nothing else bounds (a service that died, a read that never lands): trap, so the
-        // process fails instead of hanging decode.
+        // The one device spin nothing else bounds (a dead service, a read that never lands): trap, so the process
+        // fails instead of hanging decode.
         if (static_cast<int64_t>(global_ns() - deadline) >= 0) __trap();
         if (!copied) __nanosleep(256);
       }
@@ -193,8 +209,8 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
   }
 }
 
-// CW's SM reads: `bytes` of the pinned slot into the destination, four 16-byte units in flight per thread
-// (ld.global.cv, as S: never .nc on host bytes). Every load has returned once its store is issued.
+// CW's SM read: copies `bytes` of the pinned slot into the destination with the whole block, four 16-byte units in
+// flight per thread. Uses ld.global.cv as S does, never .nc on host bytes.
 SGL_DEVICE void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) {
   const bool aligned = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0;
   const int64_t units = aligned ? bytes / 16 : 0;
@@ -215,8 +231,10 @@ SGL_DEVICE void copy_wait_read(const uint8_t* src, uint8_t* dst, int64_t bytes) 
     device::expert_stream::stream_copy1(src + b, dst + b);
 }
 
-// The copy wait, the chain's tail: CW, then cuStreamWaitValue32 on the gate, then CC. Nothing spins on an SM.
-// CW takes the lanes' kinds from the post; with `sm_count` > 0 the whole block reads the `sm_count` entries of
+// Arguments of CW, the copy wait kernel. CW, then cuStreamWaitValue32 on the gate, then CC form the chain's tail;
+// nothing spins on an SM.
+//
+// CW takes the lanes' kinds from the post. With `sm_count` > 0 the whole block reads the `sm_count` entries of
 // `sm_table` ({source slab, destination tensor, row bytes}) of every kHitCopy lane from its RAM slot. When the request
 // has copy-engine or CPU lanes it closes the gate for G and leaves them in `ce_mask`.
 struct CopyWaitParams {
@@ -231,6 +249,7 @@ struct CopyWaitParams {
   int32_t* ce_mask;  // for CC: armed lanes in bits 0-7, CPU lanes in 8-15, CPU output parts in 16-17; 0: none
 };
 
+// Arguments of CC, the commit kernel that follows the stream's wait on the gate.
 struct CopyCommitParams {
   const int32_t* state;
   const uint8_t* lease;
@@ -240,14 +259,18 @@ struct CopyCommitParams {
   int32_t* cpu_lanes;
 };
 
+// ce_mask layout (CW writes, CC reads): copy-engine and CPU lanes in bits 0-7, CPU lanes again from kCeMaskCpuShift,
+// CPU output parts from kCeMaskPartShift.
 constexpr int kCeMaskCpuShift = 8;
 constexpr int kCeMaskPartShift = 16;
 constexpr int kCpuLanesPartShift = 8;  // cpu_lanes: parts above the lane mask
 
+// CW: see CopyWaitParams. Closes the gate only when a copy-engine or CPU lane exists, and opens it itself when
+// CopyDone already holds G.
 template <bool kUsePDL>
 __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void exl3_ram_miss_lease_copy_wait_kernel(
     const __grid_constant__ CopyWaitParams p) {
-  // PDL as the post kernel (lease_kernels.cuh). Its primary is S, so C1 and S have completed before any read below.
+  // PDL as in the post kernel (lease_kernels.cuh). CW's primary is S, so C1 and S have completed before any read.
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
   using namespace device::expert_stream;
@@ -280,7 +303,7 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   __syncthreads();
   if (p.sm_count > 0) {
 #ifdef EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS
-    // Test only (device_module_with_hooks): every warp but the first reads late, so a Done ahead of any read shows.
+    // Test hook (device_module_with_hooks): every warp but the first reads late, so a CopyDone ahead of any read shows.
     if (threadIdx.x >= 32) {
       const uint64_t start = global_ns();
       while (global_ns() - start < static_cast<uint64_t>(EXL3_RAM_MISS_TEST_CW_SM_READ_DELAY_NS)) {
@@ -316,9 +339,10 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   }
 }
 
-// CC, after the stream wait on the gate: a plain launch (the wait node before it is not a kernel). The gate is only
-// the wake-up; CopyDone == G is what commits. The copy thread stored it after the DMA and the CPU forward completed,
-// and its acquire here orders the CPU's partial sums, which the fused MoE reads next, after them.
+// CC, launched after the stream wait on the gate. It is a plain launch because the wait node before it is not a kernel.
+// The gate is only the wake-up; CopyDone == G is what commits. The copy thread stores it after the DMA and the CPU
+// forward complete, and the acquire here orders the CPU's partial sums, which the fused MoE reads next, after them.
+// Traps if the gate opened without CopyDone.
 __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_miss_lease_copy_commit_kernel(
     const __grid_constant__ CopyCommitParams p) {
   using namespace device::expert_stream;
@@ -338,8 +362,9 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 
 namespace expert_stream {
 
-// cuStreamWaitValue32_v2 from libcuda.so.1, resolved once. The v2 name, never the plain one: that is the v1 API,
-// gated by NVreg_EnableStreamMemOPs (copy_engine.h). Null when the driver lacks it; the launcher then refuses.
+// cuStreamWaitValue32_v2 from libcuda.so.1, resolved once. Uses the v2 name, never the plain one: that is the v1 API,
+// gated by NVreg_EnableStreamMemOPs (host/copy_engine.h). Returns null when the driver lacks it; the launcher then
+// refuses.
 using StreamWaitValue32 = int (*)(void*, uint64_t, uint32_t, unsigned);
 inline StreamWaitValue32 stream_wait_value32() {
   static const StreamWaitValue32 fn = [] {
@@ -355,9 +380,13 @@ constexpr unsigned kStreamWaitValueGeq = 0;  // CU_STREAM_WAIT_VALUE_GEQ: (int32
 
 /// \brief Checked host launchers for the row-copy kernels above (lease_stream, lease_copy_wait), templated on the
 /// streamed row's compile-time layout facts (name count, small-tensor mask).
+///
+/// Every tensor argument is verified before launch, like LeaseProtocolKernel's.
 /// \tparam L The streamed row's compile-time layout (`expert_stream::ExpertRowLayout`).
 template <expert_stream::ExpertRowLayout L>
 struct RowCopyKernel {
+  /// Launches S. Argument meanings follow StreamParams; `segments` is the copy table ({src, dst, row bytes} per
+  /// entry), `segment_map` and `piece_runs` the reader's piece geometry (host/ffi_exports.h, piece_runs).
   static void lease_stream(
       tvm::ffi::TensorView state,
       tvm::ffi::TensorView planned,
@@ -440,6 +469,9 @@ struct RowCopyKernel {
             use_pdl != 0 ? exl3_ram_miss_lease_stream_kernel<true> : exl3_ram_miss_lease_stream_kernel<false>, params);
   }
 
+  /// Launches CW, the stream's wait on the copy gate, then CC, in that order on one stream. `sm_table_address` is the
+  /// raw address of the {source, destination, row bytes} table CW reads when `sm_count` > 0; `cpu_lanes` is empty when
+  /// CPU experts are off. Throws if the driver lacks cuStreamWaitValue32_v2 or the wait cannot be queued.
   static void lease_copy_wait(
       tvm::ffi::TensorView state,
       tvm::ffi::TensorView count,

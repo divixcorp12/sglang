@@ -1,7 +1,19 @@
 // The expert-stream host exports the server does not call: tests use them, and analysis tools call some of them on a
-// live module. Every site that expands EXPERT_STREAM_HOST_EXPORTS(Exports) also expands
-// EXPERT_STREAM_HOST_TEST_EXPORTS(Exports), the production build included: only some of these refuse there
-// (test_only()), and tools use others.
+// live module.
+//
+// Every site that expands EXPERT_STREAM_HOST_EXPORTS(Exports) also expands EXPERT_STREAM_HOST_TEST_EXPORTS(Exports),
+// the production build included. Exports that need the fault or trace state refuse in the production build
+// (test_only()); the rest (reading, geometry, counters) work in both, and tools use some of them on a live module.
+//
+//   reader     read_rows, read_rows_traced, read_rows_faulted, read_rows_sqes, read_rows_pieces, piece_geometry,
+//              publish_piece: one synchronous read through the reader, with traces and injected faults
+//   tier       pump, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
+//   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
+//   protocol   seqlock_stress, read_record_fields
+//   misc       test_forward_address, pause_ns
+//
+// Arguments are validated by the Python wrappers in
+// python/sglang/kernels/ops/moe/expert_stream_transport.py.
 #pragma once
 
 #include "ffi_exports.h"
@@ -11,8 +23,10 @@ namespace sglang::expert_stream {
 template <class Exports>
 struct HostTestExports;
 
-/// \brief The test and tool host exports of one HostExports instantiation. Derived from it, so a handle its open()
-/// returned resolves here: both use the same function-local registries.
+/// \brief The test and tool host exports of one HostExports instantiation.
+///
+/// Derived from HostExports, so a handle its open() returned resolves here: both use the same function-local
+/// registries.
 template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout, Reader, Build> {
   using Base = HostExports<Layout, Reader, Build>;
@@ -20,6 +34,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   using Base::find;
   using typename Base::Source;
 
+  // Copies a slots tensor into a vector.
   static std::vector<int64_t> slots_of(TensorView slots) {
     const auto* data = static_cast<const int64_t*>(slots.data_ptr());
     return std::vector<int64_t>(data, data + slots.size(0));
@@ -67,9 +82,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return reader.read(row, ids_of(experts), slots_of(slots), static_cast<size_t>(step), [](size_t) { return false; });
   }
 
-  // The fault words `f` for a read available in both builds (read_rows_traced, read_rows_pieces): installed on
-  // InstrBuild; on ProdBuild, which has no fault state, a tensor that injects one is refused (`what` names it) and an
-  // inert one (only the non-fault words: abandon_after, step, piece_stream, the chunk and cut caps) is accepted.
+  // Applies the fault words `f` for a read that exists in both builds (read_rows_traced, read_rows_pieces). InstrBuild
+  // installs them. ProdBuild has no fault state, so it refuses a tensor that injects a fault (`what` names the export)
+  // and accepts an inert one (only the non-fault words: abandon_after, step, piece_stream, the chunk and cut caps).
   static void install_fault(Source& reader, const int64_t* f, const char* what) {
     if constexpr (Build::kFaults) {
       (void)what;
@@ -80,14 +95,14 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
-  // Test only: expert_stream_read_rows with the reader's StageRecord copied to `record`
-  // (stage_words() int64), with `ok` and `status` set from the result. `fault` is the faulted call's
-  // tensor, laid out as expert_stream_read_rows_faulted's (kFaultWords words); a _fault_tensor() with no fault kwargs
-  // injects nothing. (An all-zero tensor is not that: 0 in word 15 selects row 0 and in word 16 arms a hold; the
-  // Python wrapper sends -1 in both.)
-  // `owner_core` (test-only owner-pinning scaffold, PACK_WORKERS.md): -1 (the Python wrapper's default)
-  // leaves the reader byte-for-byte what it is without this parameter; >= 0 pins the calling/owner thread
-  // to that core and excludes it from the packing pool's mask (ReaderCore::set_owner_core).
+  // Test only: expert_stream_read_rows with the reader's StageRecord copied to `record` (stage_words() int64), with
+  // `ok` and `status` set from the result. `fault` is laid out as expert_stream_read_rows_faulted's (kFaultWords
+  // words); a _fault_tensor() with no fault kwargs injects nothing. (An all-zero tensor is not that: 0 in word 15
+  // selects row 0 and in word 16 arms a hold; the Python wrapper sends -1 in both.)
+  //
+  // `owner_core` is a test-only owner-pinning scaffold (analysis/dsv41-drive/PACK_WORKERS.md): -1 (the Python
+  // wrapper's default) leaves the reader unchanged; >= 0 pins the calling/owner thread to that core and excludes it
+  // from the packing pool's mask (ReaderCore::set_owner_core).
   static int64_t read_rows_traced(
       TensorView extents,
       TensorView starts,
@@ -228,7 +243,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
-  // Test only (U10): expert_stream_read_rows_traced's read, recording every SQE the reader prepared. `sqes` receives
+  // Test only: expert_stream_read_rows_traced's read, recording every SQE the reader prepared. `sqes` receives
   // up to sqes.size(0) rows of 4 int64 (file, offset, length, bounce byte offset), in preparation order; `info` 11
   // int64: the result, the SQE count, the descriptor count, the ring credit, the completions reaped, fixed_cuts,
   // fanout_sqes, cut_reads, gap_cuts, min_cut_bytes and leg_stride. `fault` as the faulted call's (word 22 turns piece
@@ -319,7 +334,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
-  // Test only (U8): the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
+  // Test only: the owner's publish primitive on one readiness word (`word`, one int64): 1 when it set `bit`.
   static int64_t publish_piece(TensorView word, int64_t generation, int64_t bit) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -330,7 +345,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
                : 0;
   }
 
-  // Test only (U2, U3, U6): expert_stream_read_rows_traced's read, publishing each row's pieces into its readiness
+  // Test only: expert_stream_read_rows_traced's read, publishing each row's pieces into its readiness
   // words: row ordinal o's are masks[o][0 .. masks.size(1)), under `generation` (the caller initialises them). When
   // `reference` is not empty (a slab pointer table shaped like `slabs`, holding row o at ref_slots[o]), a checker
   // thread polls the first word of every row while the read runs and, for each bit it sees set, compares the piece's
@@ -491,7 +506,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     out[4] = early;
   }
 
-  // Test only (U1): the sub-reads and pieces the reader computes when it admits expert `expert` of streamed row `row`
+  // Test only: the sub-reads and pieces the reader computes when it admits expert `expert` of streamed row `row`
   // (row_geometry). `subs`: kPieces rows of 6 int64 (file, offset, length, dest, part, k), in file order; `pieces`:
   // kPieces rows of 1 + 2 * segments int64: the dependency mask, then (dst_lo, dst_hi) per segment in segment
   // destination coordinates (dst + the run's bounds). Returns the sub-read count, or -1 when the row cannot be cut.
@@ -554,9 +569,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return g.subs;
   }
 
-  // 1 served a demand record, 0 nothing posted (or it was deferred). Refused while a thread pumps.
-  // Under caller_mutex(): pump() consumes the copy-completion ring (and owns the tier), so it is serialized against
-  // every other Python caller, whose owned calls and wait_copy_idle drain the same ring. Tests only; no hot-path cost.
+  // Serves one demand record on the calling thread: 1 if it served one, 0 if nothing was posted (or it was deferred).
+  // Throws while the service thread runs. Held under caller_mutex(): pump() consumes the copy-completion ring (and owns
+  // the tier), so it is serialized against every other Python caller, whose owned calls and wait_copy_idle drain the
+  // same ring. Tests only; no hot-path cost.
   static int64_t pump(int64_t handle) {
     const auto tier = find(handle);
     std::lock_guard<std::mutex> caller(tier->caller_mutex());
@@ -564,6 +580,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return tier->pump_demand() ? 1 : 0;
   }
 
+  // Fills `out` with RamTier::slot_info's three words per slot of `row`.
   static void slot_info(int64_t handle, int64_t row, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -575,12 +592,12 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     tier->slot_info(row, static_cast<int64_t*>(out.data_ptr()));
   }
 
-  // The last seq the service finished (ChainSim.wait_handled).
+  // The last seq the service finished (what ChainSim.wait_handled waits on).
   static int64_t handled_through(int64_t handle) {
     return static_cast<int64_t>(find(handle)->handled_through());
   }
 
-  // out: free, evictable.
+  // Counts the free and evictable slots of `row` for a request that routes `wanted`: out = {free, evictable}.
   static void victim_census(int64_t handle, int64_t row, TensorView wanted, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -592,11 +609,12 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     result[1] = census.evictable;
   }
 
-  // The watchdog's busy episode (D6): nonzero while a request or fill is in service, a new value per episode.
+  // The watchdog's busy episode: nonzero while a request or fill is in service, a new value per episode.
   static int64_t busy_episode(int64_t handle) {
     return static_cast<int64_t>(find(handle)->busy_episode());
   }
 
+  // 1 when every job handed to the copy thread completed or failed within `timeout_ns`, else 0.
   static int64_t copy_engine_idle(int64_t handle, int64_t timeout_ns) {
     return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;
   }
@@ -624,11 +642,12 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
-  // Test only (HostCopyBackend): let `marks` more copy marks complete (negative: all), fail the calls, count marks.
+  // Test only (HostCopyBackend): lets `marks` more copy marks complete (negative: all).
   static void copy_engine_release(int64_t handle, int64_t marks) {
     find(handle)->host_copy_backend().release(marks);
   }
 
+  // Test only (HostCopyBackend): makes the issue and/or query calls fail.
   static void copy_engine_fail(int64_t handle, int64_t issue, int64_t query) {
     if constexpr (!Build::kFaults) {
       test_only("copy_engine_fail");
@@ -743,11 +762,13 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only (HostCopyBackend): the marks closed so far, one per job issued.
   static int64_t copy_engine_marked(int64_t handle) {
     return find(handle)->host_copy_backend().marked();
   }
 
-  // Test only (RamTier::inject): InstrBuild only.
+  // Test only (RamTier::inject): sleeps `delay_ns` before each demand read once `after_demands` demands have read
+  // rows, and with `fail_reads` reports the reads as failed. InstrBuild only.
   static void inject(int64_t handle, int64_t delay_ns, int64_t fail_reads, int64_t after_demands) {
     if constexpr (!Build::kFaults) {
       test_only("inject");

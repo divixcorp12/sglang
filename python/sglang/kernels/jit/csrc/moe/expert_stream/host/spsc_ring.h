@@ -1,5 +1,10 @@
-// Lock-free single-producer single-consumer ring, a fixed-capacity deque for one thread, and futex wait/wake (plan
-// 2026-09-29-hotpath-zero-overhead Tasks 12-14). Nothing here allocates after construction or takes a lock.
+// Thread-handoff primitives for the service path: a lock-free SPSC ring, a one-thread deque, and futex wait/wake.
+//
+// Nothing here allocates after construction or takes a lock.
+//
+//   SpscRing     single-producer single-consumer ring between two threads
+//   FixedDeque   circular FIFO owned by one thread (the copy thread's in-flight jobs)
+//   futex_wait / futex_wake   sleep and wake on a 32-bit word
 #pragma once
 
 #include <linux/futex.h>
@@ -14,14 +19,17 @@
 
 namespace sglang::expert_stream {
 
-// One producer thread, one consumer thread. Each index lives on its owner's cache line beside that owner's cached
-// copy of the other index, so a push or pop that finds room touches no line the other side writes.
+// A bounded lock-free queue for exactly one producer thread and one consumer thread; N is a power of two.
+//
+// Each index lives on its owner's cache line beside that owner's cached copy of the other index, so a push or pop
+// that finds room touches no line the other side writes. push() returns false when full and pop() false when empty.
 template <class T, size_t N>
 class SpscRing {
   static_assert(N >= 2 && (N & (N - 1)) == 0, "SpscRing capacity is a power of two");
 
  public:
-  bool push(const T& value) {  // producer
+  // Producer: appends `value`, or returns false when the ring is full.
+  bool push(const T& value) {
     const uint64_t head = head_.load(std::memory_order_relaxed);
     if (head - tail_seen_ == N) {
       tail_seen_ = tail_.load(std::memory_order_acquire);
@@ -31,7 +39,8 @@ class SpscRing {
     head_.store(head + 1, std::memory_order_release);
     return true;
   }
-  bool pop(T* out) {  // consumer
+  // Consumer: moves the oldest item into `*out`, or returns false when empty.
+  bool pop(T* out) {
     const uint64_t tail = tail_.load(std::memory_order_relaxed);
     if (tail == head_seen_) {
       head_seen_ = head_.load(std::memory_order_acquire);
@@ -41,8 +50,8 @@ class SpscRing {
     tail_.store(tail + 1, std::memory_order_release);
     return true;
   }
-  // Consumer: the oldest item without removing it (pop() does), or null when empty. The pointer is valid until the
-  // consumer's next pop: the producer never writes a slot the consumer has not released.
+  // Consumer: the oldest item without removing it, or null when empty. The pointer is valid until the consumer's next
+  // pop(), because the producer never writes a slot the consumer has not released.
   const T* front() {
     const uint64_t tail = tail_.load(std::memory_order_relaxed);
     if (tail == head_seen_) {
@@ -51,7 +60,8 @@ class SpscRing {
     }
     return &slots_[tail & (N - 1)];
   }
-  bool empty() const {  // either side; exact only on the consumer
+  // True when no item is queued. Callable from either side; exact only on the consumer.
+  bool empty() const {
     return head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_acquire);
   }
 
@@ -63,8 +73,8 @@ class SpscRing {
   alignas(64) std::array<T, N> slots_{};
 };
 
-// A circular FIFO for one thread (the copy thread's in-flight, held and acking jobs). push_back returns false when
-// full; the caller decides what that means (the copy engine fails stop).
+// A circular FIFO owned by a single thread: the copy thread's in-flight, held and acking jobs. Not thread-safe.
+// push_back() returns false when full; the caller decides what that means (the copy engine fails stop).
 template <class T, size_t N>
 class FixedDeque {
  public:
@@ -106,13 +116,14 @@ class FixedDeque {
   size_t n_ = 0;
 };
 
-// Sleeps while *word == expected, for at most timeout_ns; returns at once if *word already differs (the kernel
-// compares under its own lock, so a wake that changed the word before the call is never lost).
+// Sleeps while *word == expected, for at most timeout_ns. Returns at once if *word already differs: the kernel
+// compares under its own lock, so a wake that changed the word before the call is never lost.
 inline void futex_wait(std::atomic<uint32_t>* word, uint32_t expected, int64_t timeout_ns) {
   timespec timeout{static_cast<time_t>(timeout_ns / 1000000000), static_cast<long>(timeout_ns % 1000000000)};
   syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAIT_PRIVATE, expected, &timeout, nullptr, 0);
 }
 
+// Wakes at most one thread sleeping in futex_wait on `word`.
 inline void futex_wake(std::atomic<uint32_t>* word) {
   syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
 }

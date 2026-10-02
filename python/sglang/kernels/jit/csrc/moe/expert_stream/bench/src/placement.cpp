@@ -81,7 +81,7 @@ void validate_placement(const Placement& p, const Topology& t, bool check_nodes)
           std::string("placement: the ") + role.name + " CPU " + std::to_string(role.cpu) +
           " is outside the process's allowed CPUs");
   }
-  // A busy-polling service never yields: no other role may share its physical core (check_dedicated_core's rule).
+  // A busy-polling service never yields: no other role may share its physical core.
   for (int sibling : t.siblings_of(p.service)) {
     if (sibling != p.service && seen.contains(sibling))
       throw std::runtime_error(
@@ -141,6 +141,7 @@ std::string cpu_list(std::vector<int> cpus) {
 
 namespace {
 
+// Throws unless every thread created since `before` is pinned to exactly one CPU and those CPUs equal `expected`.
 void census(const std::set<int>& before, const std::vector<int>& expected) {
   std::vector<int> pinned;
   for (int tid : task_ids()) {

@@ -44,6 +44,7 @@ void require_o_direct(const fs::path& dir) {
 
 namespace {
 
+// The file's contents, or an empty string when it cannot be read.
 std::string read_text(const fs::path& path) {
   std::ifstream in(path);
   std::stringstream text;
@@ -51,6 +52,7 @@ std::string read_text(const fs::path& path) {
   return text.str();
 }
 
+// Writes all `bytes`, retrying on EINTR and short writes.
 void write_all(int fd, const uint8_t* data, size_t bytes, const fs::path& path) {
   while (bytes > 0) {
     const ssize_t n = ::write(fd, data, bytes);
@@ -77,7 +79,7 @@ bool write_row_image(
   const uintmax_t size = fs::file_size(path, size_error);
   if (!stamp.empty() && !size_error && size == file_bytes && read_text(stamp_path) == stamp) return false;
   std::error_code ignored;
-  fs::remove(stamp_path, ignored);  // a file without its stamp is never reused
+  fs::remove(stamp_path, ignored);  // a file without its stamp is never reused, so drop the stamp first
   const fs::path tmp = path.string() + ".tmp";
   const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) throw std::runtime_error("open " + tmp.string() + ": " + std::strerror(errno));

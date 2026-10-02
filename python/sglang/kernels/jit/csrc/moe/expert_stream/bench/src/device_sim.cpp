@@ -60,7 +60,7 @@ void DeviceSim::set_row_cpu(int64_t row) {
   row_cpu_.at(static_cast<size_t>(row)) = 1;
 }
 
-// The post's delta apply (ChainSim.apply_pending): the tag is acquired, then the payload read.
+// As ChainSim.apply_pending: the tag is acquired (pairing with the host's release), then the payload is read.
 bool DeviceSim::apply_pending(int64_t row) {
   const uint8_t* d = lease_ + w::kDeltaBase + row * w::kDeltaStride;
   const uint64_t tag = load_acquire<uint64_t>(d + w::kDeltaTag);
@@ -117,7 +117,7 @@ SimRequest DeviceSim::post(
   }
   sync_row(row, deadline_ns);
 
-  // ram_slot_map.type_lanes, hit_copy="sm", cpu_misses=false, cpu_ok=ce_ok=true.
+  // Lane typing as ram_slot_map.type_lanes with hit_copy="sm", cpu_misses=false, cpu_ok=ce_ok=true.
   SimRequest r;
   r.row = row;
   r.count = count;
@@ -167,7 +167,7 @@ SimRequest DeviceSim::post(
   r.idx = static_cast<int64_t>((seq - 1) % w::kDemandRecords);
   uint8_t* rec = page_ + w::kDemandRing + r.idx * w::kRecordBytes;
 
-  // The seqlock: seq = 0 first. x86 keeps stores in order; the barrier keeps the compiler from hoisting the payload.
+  // Seqlock write: seq = 0 first. x86 keeps stores in order; the barrier keeps the compiler from hoisting the payload.
   __atomic_store_n(reinterpret_cast<uint32_t*>(rec + w::kRecSeq), 0u, __ATOMIC_RELAXED);
   asm volatile("" ::: "memory");
   put<uint16_t>(rec + w::kRecRow, static_cast<uint16_t>(row));
@@ -205,13 +205,13 @@ bool DeviceSim::copy_wait(const SimRequest& r, int64_t deadline_ns) {
   if (!needs_copy_wait(r)) return true;
   auto* gate = reinterpret_cast<uint32_t*>(lease_ + w::kLeaseCopyGate);
   const uint32_t closed = gate_word(r.seq, w::kLeaseGateClosed);
-  __atomic_store_n(gate, closed, __ATOMIC_SEQ_CST);  // CW: close, then (fence.sc) read CopyDone
+  __atomic_store_n(gate, closed, __ATOMIC_SEQ_CST);  // close, then (seq_cst) read CopyDone
   const uint8_t* done = lease_ + w::kLeaseCopyDone + r.idx * w::kLeaseCopyDoneBytes;
   for (uint32_t spin = 0; load_acquire<uint64_t>(done) != r.gen; ++spin) {
     if ((spin & 1023) == 1023 && monotonic_ns() > deadline_ns) return false;
     _mm_pause();
   }
-  // CW's own open, from G's closed word only (the host's CAS rule): nothing else opens a gate closed after CopyDone.
+  // Open from G's closed word only (the host's CAS rule): nothing else opens a gate closed after CopyDone.
   uint32_t expected = closed;
   __atomic_compare_exchange_n(
       gate, &expected, gate_word(r.seq, w::kLeaseGateOpen), false, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE);

@@ -1,4 +1,13 @@
-// Page and block constants, the service's request records, and the stage trace ring (StageRing).
+// The service's side of the lease protocol: lane kinds and slot states, counters, request records and the stage ring.
+//
+//   kFree / kReady / kStaging   slot states of a RAM-tier row
+//   Counter / is_core_counter   the service's counters, and the subset ProdBuild keeps
+//   load_acquire / store_release   word access to the lease blocks shared with the device
+//   Lane / Request / read_record   one demand record as the service thread reads it, with a torn-read check
+//   fail_stop                   the one way a host protocol failure ends the process
+//   StageRing                   the SPSC queue of stage trace records
+//
+// See analysis/dsv41-drive/LEASE_PROTOCOL.md.
 #pragma once
 
 #include "../lease_layout.h"
@@ -10,11 +19,14 @@ namespace expert_stream {
 
 using namespace ::sglang::expert_stream::wire;
 
-// kStaging: one of the row's K staging slots, never mapped; an NVMe miss is read into it (LEASE_PROTOCOL.md).
+// Slot states. kStaging is one of the row's K staging slots, never mapped; an NVMe miss is read into it
+// (analysis/dsv41-drive/LEASE_PROTOCOL.md).
 enum : uint8_t { kFree = 0, kReady = 2, kStaging = 3 };
 
 static_assert(kPieceTargets >= kLeaseLanes, "a row's pieces are published to at most one word per lane");
 
+// Indices into the service's counter array. Only the is_core_counter subset is kept by ProdBuild; the rest are
+// metrics.
 enum Counter : int {
   kServedRequests = 0,
   kTouchOnly,
@@ -34,14 +46,14 @@ enum Counter : int {
   kCopyIssueNs,          // host ns in the copy thread's CUDA calls that issue copies and record events, summed
   kCopyLatencyNs,        // submit (record time) to completion observed, summed over jobs
   kCopyLatencyMaxNs,
-  // CPU experts (plan 2026-09-29-dsv41-cpu-experts): CPU jobs (one per part of a record) and their lanes.
+  // CPU experts: CPU jobs (one per part of a record) and their lanes.
   kCpuJobs,
   kCpuLanes,
   kCounterCount,
 };
 
-// Counters the production build keeps (plan 2026-09-29-hotpath-zero-overhead D1): the shutdown line's served, rows and
-// errors, the admission policy's outcomes, and the functional version.
+// True for the counters the production build keeps: the shutdown line's served, rows and errors, the admission
+// policy's outcomes, and the functional version.
 constexpr bool is_core_counter(int k) {
   switch (k) {
     case kServedRequests:
@@ -62,39 +74,44 @@ constexpr bool is_core_counter(int k) {
 }
 static_assert(is_core_counter(kVersion), "version is functional (Python's LRU view invalidates on it): never a metric");
 
+// Acquire load of the 32-bit word at `address` in a lease block shared with the device.
 inline uint32_t load_acquire(const uint8_t* address) {
   return __atomic_load_n(reinterpret_cast<const uint32_t*>(address), __ATOMIC_ACQUIRE);
 }
 
+// Release store of the 32-bit word at `address` in a lease block shared with the device.
 inline void store_release(uint8_t* address, uint32_t value) {
   __atomic_store_n(reinterpret_cast<uint32_t*>(address), value, __ATOMIC_RELEASE);
 }
 
-// The completion and delta blocks' 64-bit words: a 56-bit request generation G, a map-chain tag.
+// Acquire load of a 64-bit word of the completion and delta blocks: a 56-bit request generation, a map-chain tag.
 inline uint64_t load_acquire64(const uint8_t* address) {
   return __atomic_load_n(reinterpret_cast<const uint64_t*>(address), __ATOMIC_ACQUIRE);
 }
 
+// Release store of a 64-bit word of the completion and delta blocks.
 inline void store_release64(uint8_t* address, uint64_t value) {
   __atomic_store_n(reinterpret_cast<uint64_t*>(address), value, __ATOMIC_RELEASE);
 }
 
-// The device never posts sequence 0 (the post kernel wraps 0xFFFFFFFF to 1), so a service that reaches 0 would spend
-// an iteration on a record nobody posted and store a done word of 0.
+// Maps sequence 0 to 1. The device never posts sequence 0 (the post kernel wraps 0xFFFFFFFF to 1), so a service that
+// reached 0 would spend an iteration on a record nobody posted and store a done word of 0.
 inline uint32_t skip_zero(uint32_t seq) {
   return seq == 0 ? 1u : seq;
 }
 
+// True when `observed` has reached `seq`, correct across the 2^32 wrap.
 inline bool reached(uint32_t observed, uint32_t seq) {
   return static_cast<int32_t>(observed - seq) >= 0;
 }
 
+// Byte offset of the record for sequence `seq` in a ring of `records` records starting at `ring`.
 inline int64_t record_offset(int64_t ring, uint32_t records, uint32_t seq) {
   return ring + static_cast<int64_t>((seq - 1u) % records) * kRecordBytes;
 }
 
-// A request's distinct experts: its protect ids and its lanes' experts (plan 2026-09-29-hotpath-zero-overhead Task 11).
-// Every per-request list of the service is bounded by it, so none needs the heap.
+// The bound on a request's distinct experts: its protect ids and its lanes' experts. Every per-request list of the
+// service is bounded by it, so none needs the heap.
 constexpr size_t kWanted = kMaxIds + kLeaseLanes;
 
 // One lane of a record: the device typed it from its slot map (ram_slot_map.type_lanes).
@@ -110,7 +127,7 @@ inline bool is_miss(uint8_t kind) {
   return kind == kKindMissGpu || kind == kKindMissCpu;
 }
 
-// One demand record, as the service thread reads it: fixed-size, so reading one allocates nothing (spec A1-A3, A11).
+// One demand record, as the service thread reads it. Fixed-size, so reading one allocates nothing.
 struct Request {
   uint32_t seq = 0;
   uint64_t gen = 0;  // epoch << 32 | seq
@@ -120,8 +137,8 @@ struct Request {
   FixedVec<int32_t, kMaxIds> protect;
   FixedVec<Lane, kLeaseLanes> lanes;
   const uint8_t* hot_bitmap = nullptr;  // GPU hot mode: RamTier::hot_scratch_, valid until the next record read
-  // A lane the service itself works on, or that the device waits for: anything but an SM hit. A record with one is
-  // waited on by the device, so it cannot lap the ring.
+  // True when a lane needs the service itself or is one the device waits for: anything but an SM hit. The device
+  // waits on such a record, so it cannot lap the ring.
   bool host_work() const {
     for (const Lane& lane : lanes)
       if (lane.kind != kKindHitSm) return true;
@@ -129,15 +146,19 @@ struct Request {
   }
 };
 
-// Seqlock read: the writer stores the payload, fences, then the seq word last, so a record whose seq reads `expected`
-// both before and after the payload is whole. Records nothing waits for lap the ring unread, so a torn one must be
-// detectable. A whole record whose counts or kinds are out of range is malformed: the device never writes one.
-// The payload is copied once, at a constant size, between the two seq loads: both cache lines' loads issue together,
-// before anything depends on the counts, and nothing after the second seq load reads the shared record.
+// The outcome of read_record: a whole record, a torn one, or one the device never writes.
 enum class RecordRead { kOk, kTorn, kMalformed };
 
 static_assert(kRecLaneWeight + sizeof(float) * kMaxIds == kRecordBytes, "read_record copies the whole record");
 
+// Reads the record at `record` into `request` if its seq word is `expected`. Returns kTorn when the writer
+// overwrote it during the read, and kMalformed for a whole record whose counts or kinds are out of range.
+//
+// A seqlock: the writer stores the payload, fences, then the seq word last, so a record whose seq reads `expected`
+// both before and after the payload is whole. Records nothing waits for lap the ring unread, so a torn one must be
+// detectable. The payload is copied once, at a constant size, between the two seq loads: both cache lines' loads
+// issue together, before anything depends on the counts, and nothing after the second seq load reads the shared
+// record.
 inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request* request) {
   if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
   alignas(64) uint8_t raw[kRecordBytes];
@@ -186,21 +207,23 @@ inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request*
   return RecordRead::kOk;
 }
 
-// Fail-stop: every host failure of the protocol ends the process here, with one line first. Nothing recovers, so
-// nothing signals: a device waiting on the request traps at its deadline, or dies with the process.
+// Ends the process with one line on stderr. Every host failure of the protocol comes here: nothing recovers, so
+// nothing signals, and a device waiting on the request traps at its deadline or dies with the process.
 [[noreturn]] inline void fail_stop(const std::string& message) {
   std::fprintf(stderr, "FATAL %s\n", message.c_str());
   std::fflush(stderr);
   std::abort();
 }
 
-// Fixed-capacity single-producer single-consumer queue of stage records: the service thread
-// pushes and drops (counted) when full, one Python caller at a time drains. Allocated once, when
-// the trace is enabled; a push copies a record into a preallocated slot and allocates nothing.
+// A fixed-capacity single-producer single-consumer queue of stage trace records.
+//
+// The service thread pushes and drops (counted) when full; one Python caller at a time drains. Allocated once, when
+// the trace is enabled: a push copies a record into a preallocated slot and allocates nothing.
 class StageRing {
  public:
   explicit StageRing(size_t capacity) : slots_(capacity) {}
 
+  // Producer: appends `record`, or counts a drop when full. A record that gets in carries the drops before it.
   void push(const StageRecord& record) {
     const uint64_t head = head_.load(std::memory_order_relaxed);
     if (head - tail_.load(std::memory_order_acquire) >= slots_.size()) {
@@ -215,6 +238,7 @@ class StageRing {
     head_.store(head + 1, std::memory_order_release);
   }
 
+  // Consumer: copies up to `max` records into `out`, oldest first. Returns how many.
   int64_t drain(StageRecord* out, int64_t max) {
     const uint64_t head = head_.load(std::memory_order_acquire);
     uint64_t tail = tail_.load(std::memory_order_relaxed);
@@ -225,6 +249,7 @@ class StageRing {
     return count;
   }
 
+  // Records dropped over the ring's life.
   int64_t dropped() const {
     return dropped_.load(std::memory_order_relaxed);
   }

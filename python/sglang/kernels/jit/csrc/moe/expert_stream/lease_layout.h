@@ -1,7 +1,15 @@
-// Wire layout of the expert-stream request page, completion block and map delta block
-// (analysis/dsv41-drive/LEASE_PROTOCOL.md). Mirrored by ops/moe/expert_stream_transport.py and
-// ops/moe/expert_lease_block.py; test_exl3_ram_miss_device_args checks both. Only `constexpr <type> kName = <integer
-// expression>;` lines: that test parses them.
+// Wire layout shared by the device kernels and the host service: the request page, the completion block and the map
+// delta block.
+//
+//   Request page      device-written, host-read: a ring of demand records, one per posted request
+//   Completion block  host-written, device-read: PieceMask, CopyDone, the copy gate, the CPU split table
+//   Map delta block   host-written, device-read: one delta record per row, after the completion block
+//
+// Every offset is a byte offset. This file holds only `constexpr <type> kName = <integer expression>;` lines (plus
+// static_asserts): test_exl3_ram_miss_device_args parses them to check the Python mirrors,
+// python/sglang/kernels/ops/moe/expert_stream_transport.py and python/sglang/kernels/ops/moe/expert_lease_block.py.
+//
+// See analysis/dsv41-drive/LEASE_PROTOCOL.md, "Wire (v2)".
 #pragma once
 
 #include <cstdint>
@@ -31,9 +39,9 @@ constexpr int64_t kRecIdMax = 32767;      // the largest expert, slot or destina
 constexpr int64_t kPageBytes = kDemandRing + kDemandRecords * kRecordBytes;
 // Lane kinds (ram_slot_map.LaneKind): what moves the bytes, and what the device waits on.
 constexpr uint32_t kKindHitCopy = 1;  // the copy thread's DMA; CopyDone
-constexpr uint32_t kKindHitSm = 2;    // C1; stream order
+constexpr uint32_t kKindHitSm = 2;    // the SM-copy kernel (C1); stream order
 constexpr uint32_t kKindHitCpu = 3;   // the CPU, from the RAM slot; CopyDone
-constexpr uint32_t kKindMissGpu = 4;  // NVMe into the staging slot, then S; PieceMask
+constexpr uint32_t kKindMissGpu = 4;  // NVMe into the staging slot, then the stream kernel (S); PieceMask
 constexpr uint32_t kKindMissCpu = 5;  // NVMe into the staging slot, then the CPU; CopyDone
 // The hot page (GPU hot mode), a separate pinned page: per record {u32 seq; u32 reserved}, then the hot bitmap.
 constexpr int64_t kHotHeaderBytes = 8;
@@ -44,13 +52,14 @@ constexpr uint32_t kHotRecords = kDemandRecords;
 constexpr int64_t kLeaseRing = 16;  // == kDemandRecords
 constexpr int64_t kLeaseLanes = 8;  // == kMaxIds
 constexpr int64_t kLeaseBlockAlign = 4096;
-// PieceMask[kLeaseRing][kLeaseLanes]: u64 G << 8 | 8 piece bits, one 128-byte line each so a lane's poll never shares
-// a line with another lane.
+// PieceMask[kLeaseRing][kLeaseLanes]: u64 G << 8 | 8 piece bits (G is the request's generation, epoch << 32 | seq).
+// One 128-byte line each, so a lane's poll never shares a line with another lane.
 constexpr int64_t kLeasePieceMask = 0;
 constexpr int64_t kLeasePieceMaskLineBytes = 128;
-// CopyDone[kLeaseRing] (u64 G: every kHitCopy, kHitCpu and kMissCpu lane of G completed), then the copy wait's gate on
-// its own line: (seq & kLeaseGateSeqMask) << kLeaseGateSeqShift | 1, with bit 31 set while closed. CW closes it; CW or
-// the copy thread opens it; the decode stream waits on it with cuStreamWaitValue32 GEQ open.
+// CopyDone[kLeaseRing]: u64 G once every kHitCopy, kHitCpu and kMissCpu lane of G has completed.
+// The copy gate follows on its own line: (seq & kLeaseGateSeqMask) << kLeaseGateSeqShift | 1, with bit 31 set while
+// closed. The copy wait kernel (CW) closes it; CW or the copy thread opens it; the decode stream waits on it with
+// cuStreamWaitValue32 GEQ kLeaseGateOpen.
 constexpr int64_t kLeaseCopyDone = kLeasePieceMask + kLeaseRing * kLeaseLanes * kLeasePieceMaskLineBytes;
 constexpr int64_t kLeaseCopyDoneBytes = 8;
 constexpr int64_t kLeaseCopyGate = kLeaseCopyDone + 128;
@@ -62,8 +71,7 @@ constexpr int64_t kCopyArmed = kLeaseCopyGate + 128;  // u32: 1 once the service
 constexpr int64_t kSplit = kCopyArmed + 128;          // i32[kLeaseLanes + 1]: CPU lanes per n eligible lanes
 constexpr int64_t kLeaseBlockBytes = 20480;
 
-// ---- Map delta block: host-written, device-read, one record per row, after the completion block in one allocation
-// ----
+// ---- Map delta block: host-written, device-read; one record per row, in the completion block's allocation ----
 constexpr int64_t kDeltaBase = kLeaseBlockBytes;
 constexpr int64_t kDeltaStride = 256;
 constexpr int64_t kDeltaTag = 0;       // u64: the map-chain number this delta follows, stored last with a release

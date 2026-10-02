@@ -1,6 +1,17 @@
-// Startup calibration of the CPU expert split (spec docs/superpowers/specs/2026-10-01-cpu-split-calibration-design.md):
-// mean ms of k CPU lanes, of m DMA'd experts, and of both started together, on one row. Run by the tier's owner while
-// the copy engine is not armed, so no device lane competes. Nothing here runs on the decode path.
+// Startup calibration of the CPU expert split: times the CPU lanes and the DMA of one row, alone and together.
+//
+// The CPU split table (RamTier::set_cpu_split) says how many of a layer's n eligible lanes the CPU computes while the
+// rest cross PCIe. This file measures, on the loaded model and this machine, the mean time of k CPU lanes, of m DMA'd
+// experts, and of both started together, so the split can be chosen from measured costs instead of constants. The
+// combined measurement is the one that decides the split: it includes the CPU kernel and the DMA contending for host
+// memory bandwidth, which the two single measurements cannot show.
+//
+// It runs once, on the tier's owner (a caller that paused the service thread), while the copy engine is not armed, so
+// the device types no CPU or copy-engine lanes and nothing competes with the measurement. Nothing here runs on the
+// decode path.
+//
+// The functions are free of tier state: RamTier::calibrate_cpu_split validates the row, builds a CalibrationSetup and
+// calls calibrate_split().
 #pragma once
 
 #include "copy_engine.h"
@@ -16,12 +27,21 @@
 
 namespace sglang::expert_stream {
 
+// The most lanes measured: one expert per lease lane.
 constexpr int kCalibLanes = static_cast<int>(wire::kLeaseLanes);
-// The grid, float64 row-major [kCalibRows][kCalibCols] in ms: row 0 cpu[k], row 1 link[m], row 1 + n both[n][k] for
-// k <= n. Column 0 of rows 0 and 1, and cells k > n, stay 0.
+// The result grid is float64, row-major [kCalibRows][kCalibCols], in ms:
+//   row 0       cpu[k]      k CPU lanes alone
+//   row 1       link[m]     m DMA'd experts alone
+//   row 1 + n   both[n][k]  k CPU lanes and n - k DMA'd experts together, for k <= n
+// Column 0 of rows 0 and 1, and the cells with k > n, stay 0.
 constexpr int kCalibCols = kCalibLanes + 1;
 constexpr int kCalibRows = kCalibLanes + 2;
 
+// Everything one calibration needs, built by RamTier::calibrate_cpu_split.
+//
+// All measurements use one row and its host slots 0..kCalibLanes-1. Slot contents do not matter for timing; the bytes
+// are real pinned memory of the real size and format. The DMA goes through `backend`, a private CopyBackend with its
+// own stream and completion word, and lands in `scratch`, so calibration touches no destination tensor and no CopyJob.
 struct CalibrationSetup {
   CpuExpertEngine* cpu = nullptr;
   int64_t row = 0;
@@ -29,10 +49,11 @@ struct CalibrationSetup {
   CopyBackend* backend = nullptr;
   HostCopyBackend* host_backend = nullptr;  // set: release each mark (the test backend completes only released ones)
   uint64_t scratch = 0;                     // kCalibLanes experts: entry e's rows at its own offset
-  int reps = 1;
-  int64_t timeout_ns = 0;
+  int reps = 1;                             // timed repetitions per cell, after one discarded warm-up
+  int64_t timeout_ns = 0;                   // per measurement
 };
 
+// The bytes of one expert that the DMA moves: the sum over the copy-table entries.
 inline int64_t calibration_expert_bytes(std::span<const CopyEntry> entries) {
   int64_t bytes = 0;
   for (const CopyEntry& entry : entries)
@@ -40,8 +61,9 @@ inline int64_t calibration_expert_bytes(std::span<const CopyEntry> entries) {
   return bytes;
 }
 
-// k CPU lanes on host slots 0..k-1 and the DMA of m experts from slots k..k+m-1, started together. Returns the ns from
-// the start until both are observed done. Throws on a failed copy or past the timeout.
+// Runs k CPU lanes on host slots 0..k-1 and the DMA of m experts from slots k..k+m-1, started together, and returns the
+// ns from the start until both are observed done (queueing and wake-up included). Either side may be empty. Throws on a
+// failed copy, a full CPU ring, or past the timeout.
 inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
   const int64_t start = now_ns();
   uint32_t seq = 0;
@@ -98,6 +120,7 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
   return end - start;
 }
 
+// The mean of s.reps runs of calibration_run, in ms.
 inline double calibration_mean_ms(const CalibrationSetup& s, int k, int m) {
   calibration_run(s, k, m);  // warm-up: page faults, the engine's wake from its futex sleep
   int64_t sum = 0;
@@ -106,6 +129,7 @@ inline double calibration_mean_ms(const CalibrationSetup& s, int k, int m) {
   return static_cast<double>(sum) / 1e6 / s.reps;
 }
 
+// Fills `out` (kCalibRows x kCalibCols doubles, layout above) with the mean ms of every cell.
 inline void calibrate_split(const CalibrationSetup& s, double* out) {
   std::fill(out, out + kCalibRows * kCalibCols, 0.0);
   for (int k = 1; k <= kCalibLanes; ++k)

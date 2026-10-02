@@ -1,6 +1,13 @@
-// The real host stack the bench drives: RamTier (its RowReader, the copy engine on its host backend, the CPU expert
-// engine) and its RamThread, set up and torn down in the CPU-experts test's order
-// (test_exl3_ram_miss_cpu_experts.py::_host). Production headers, unmodified.
+// The real host stack the bench drives, built from the production headers unmodified.
+//
+//   image_tables(RowSet)  the reader's image tables over the bench's row-image files
+//   StackConfig           everything a Stack needs: rows, CPU placement, CPU expert buffers, deadlines
+//   Stack<Build>          RamTier (its RowReader, the copy engine on its host backend, the CPU expert engine) and its
+//                         RamThread, set up and torn down in the CPU-experts test's order
+//                         (test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py, `_host`)
+//
+// BenchBuild selects the host build (EXL3_FULL_STACK_INSTR: 0 ProdBuild, 1 InstrBuild), so the same bench source times
+// either the production path or the one with the stage trace compiled in.
 #pragma once
 
 #ifndef EXL3_FULL_STACK_INSTR
@@ -31,7 +38,8 @@ namespace es = ::sglang::expert_stream;
 using BenchBuild = std::conditional_t<EXL3_FULL_STACK_INSTR != 0, es::InstrBuild, es::ProdBuild>;
 static_assert(kNames == static_cast<int>(::sglang::exl3::Exl3RowLayout::kNames.size()));
 
-// exl3_ram_miss_host.cpp / exl3_ram_miss_host_instr.cpp's readers, minus the instrumented build's FaultyReader.
+// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/exl3_ram_miss_host.cpp and
+// exl3_ram_miss_host_instr.cpp, minus the instrumented build's FaultyReader.
 template <class Build>
 struct ReaderFor;
 template <>
@@ -43,8 +51,9 @@ struct ReaderFor<es::InstrBuild> {
   using type = es::InstrUringReader;
 };
 
-// exl3_ram_miss.py::_row_image_tables for one root: file `row` is the row's image, expert e's at e * row_stride,
-// identity segments; then the reader's own image-table check.
+// Builds the reader's tables as python/sglang/srt/layers/moe/exl3_ram_miss.py `_row_image_tables` does for one root:
+// file `row` is the row's image, expert e's at e * row_stride, with identity segments. Runs the reader's own
+// image-table check before returning.
 inline es::Tables image_tables(const RowSet& set) {
   const ImageLayout& layout = set.layout;
   const auto rows = static_cast<int64_t>(set.paths.size());
@@ -78,6 +87,7 @@ inline es::Tables image_tables(const RowSet& set) {
   return t;
 }
 
+// The Stack's inputs. The buffers (slabs, x, output) are owned by the caller and must outlive the Stack.
 struct StackConfig {
   RowSet rows;
   int64_t staging = 3;
@@ -97,6 +107,12 @@ struct StackConfig {
   size_t trace_capacity = 0;  // InstrBuild: the stage trace's ring, 0 off
 };
 
+// The host stack: the request page and lease block, the tier with its copy engine and CPU expert engine, and the
+// busy-polling RamThread serving the writer's records.
+//
+// Construct and destroy it on the writer's thread. Member order matters: the page and lease are declared before the
+// tier and the thread, so they outlive both. After construction the service runs on its own thread; every accessor
+// below reads state it publishes with acquire loads or its own synchronisation.
 template <class Build>
 class Stack {
  public:
@@ -106,7 +122,9 @@ class Stack {
   static constexpr int64_t kCopySpinNs = 5'000'000;  // the transport's enable_copy_engine default (spin_us=5000)
   static constexpr int64_t kCpuSpinNs = 50'000'000;  // enable_cpu_experts' default (spin_us=50_000)
 
-  // Construct on the writer's thread: the request page and lease block are first-touched here.
+  // Opens the tier, starts the copy engine, the CPU expert engine and the service, in that order. Throws if the
+  // reader cannot open or the service CPU's physical core is shared. The request page and lease block are first-touched
+  // on the calling thread.
   explicit Stack(StackConfig config) : config_(std::move(config)) {
     rows_ = static_cast<int64_t>(config_.rows.paths.size());
     experts_ = config_.rows.experts;
@@ -151,8 +169,8 @@ class Stack {
     thread_->start();
   }
 
-  // The FFI's stop_thread order: open a gate left closed, stop the service, settle; the tier's destructor then stops
-  // the copy and CPU expert threads.
+  // Stops in the FFI's stop_thread order: open a gate left closed, stop the service, settle. The tier's destructor then
+  // stops the copy and CPU expert threads.
   ~Stack() {
     if (tier_) tier_->open_closed_gate();
     if (thread_) thread_->stop();
@@ -177,11 +195,12 @@ class Stack {
     return *tier_;
   }
 
-  // The host's slot-map mirror (published after each read).
+  // The host's slot-map mirror, published after each row read: the slot holding `expert` in `row`, or -1.
   int32_t mirror(int64_t row, int32_t expert) const {
     return __atomic_load_n(&slot_map_[static_cast<size_t>(row * experts_ + expert)], __ATOMIC_ACQUIRE);
   }
 
+  // Spins until the service has handled request `seq`; false at deadline_ns.
   bool wait_handled(uint32_t seq, int64_t deadline_ns) const {
     for (uint32_t spin = 0; !es::reached(tier_->handled_through(), seq); ++spin) {
       if ((spin & 1023) == 1023 && monotonic_ns() > deadline_ns) return false;
@@ -190,29 +209,33 @@ class Stack {
     return true;
   }
 
+  // Binds the row to a registered CPU layer handle (StackFixture::register_layer).
   void set_cpu_layer(int64_t row, int64_t handle) {
     tier_->set_cpu_layer(row, handle);
   }
 
+  // Replaces the split table: of a post's n eligible hit lanes, the CPU takes the last split[n].
   void set_split(const std::array<int64_t, es::kLeaseLanes + 1>& split) {
     tier_->set_cpu_split(split.data(), static_cast<int64_t>(split.size()));
   }
 
-  std::array<int64_t, 3> cpu_stats() const {  // {jobs, lanes, forward ns}
+  // The CPU expert engine's totals: {jobs, lanes, forward ns}.
+  std::array<int64_t, 3> cpu_stats() const {
     std::array<int64_t, 3> out{};
     tier_->cpu_stats(out.data());
     return out;
   }
 
+  // The tier's counters, in the tier's counter order.
   std::array<int64_t, es::kCounterCount> counters() const {
     std::array<int64_t, es::kCounterCount> out{};
     tier_->counters(out.data());
     return out;
   }
 
-  // InstrBuild only (ProdBuild's drain_trace throws): discard every stage record so far. Unconstrained on purpose: the
-  // callers' `if constexpr (BenchBuild::kMetrics)` sits in non-template functions, whose discarded branches are still
-  // checked, so a constrained member would not compile in the prod build.
+  // InstrBuild only (ProdBuild's drain_trace throws): discards every stage record so far. Deliberately unconstrained:
+  // the callers' `if constexpr (BenchBuild::kMetrics)` sits in non-template functions, whose discarded branches are
+  // still checked, so a constrained member would not compile in the prod build.
   void drain_all() {
     while (tier_->drain_trace(scratch_.get(), 1) == 1) {
     }

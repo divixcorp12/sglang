@@ -1,4 +1,12 @@
-// Row tables: the per-expert segment map and the tables_from build of it.
+// Row tables: where each expert row lives in the layer files and where it lands in the slabs.
+//
+// Python builds the tables (extents, starts, segments, slabs, row sizes) and tables_from() validates and copies them
+// into a Tables, which the reader holds for its lifetime.
+//
+//   Segment / Read   one slab-destination segment of a row; one part of a row's aligned read
+//   Tables           every table a RowReader needs
+//   check_image_tables   the invariants direct reads depend on
+//   tables_from      the validating build from Python's tensors
 #pragma once
 
 #include <sys/uio.h>
@@ -10,6 +18,7 @@
 namespace sglang {
 namespace expert_stream {
 
+// One contiguous piece of a row: `bytes` bytes at `src` in the row image, landing at `dst` in the row of slab `name`.
 struct Segment {
   int64_t name;
   int64_t dst;
@@ -26,6 +35,13 @@ struct Read {
   int64_t dest;
 };
 
+// The reader's immutable view of the layer files and slabs.
+//
+// Row images: the files are exl3_row_image layer files, not checkpoint shards. A row's needed bytes are its image,
+// [0, need_end) of the extents' destination coordinates, and the segments tile it in source order, so every image
+// byte has exactly one slab destination. The reader reads straight into the slab rows (RowReader): no bounce.
+// RowReader is the only reader and refuses tables without `images`. "Bounce slot" in the checks below names a row's
+// pipeline slot, not memory.
 struct Tables {
   int64_t layers = 0;
   int64_t experts = 0;
@@ -33,7 +49,7 @@ struct Tables {
   int64_t slot_bytes = 0;
   std::vector<std::string> paths;
   std::vector<std::string> source_paths;  // paths[f]'s source shard: a mirror is a copy of it
-  std::vector<int64_t> file_sizes;        // the SOURCE size of every file, mirrors included
+  std::vector<int64_t> file_sizes;        // the source size of every file, mirrors included
   std::vector<Read> extents;              // [layers][experts][parts]
   std::vector<int64_t> starts;            // [layers][experts]: where the row starts in its aligned superset
   std::vector<Segment> segments;
@@ -42,25 +58,22 @@ struct Tables {
   std::vector<int64_t> row_bytes;
   // One per named slab tensor retained by Python tables.keepalive, with its row size: registered as row-aligned chunks.
   std::vector<RegisteredRegion> buffer_regions;
-  // Row images (plan 2026-09-24-dsv41-row-images; always on since the packed path's removal): the files are
-  // exl3_row_image layer files, not checkpoint shards. A row's needed bytes are then its image, [0, need_end) of
-  // the extents' destination coordinates, and the segments tile it in source order, so every image byte has
-  // exactly one slab destination. The reader reads straight into the slab rows (RowReader, direct mode): no bounce.
-  // RowReader is the only reader and refuses tables without it (plan 2026-09-29-hotpath-zero-overhead D4); "bounce
-  // slot" in the checks below names a row's pipeline slot, not memory.
-  bool images = false;
+  bool images = false;  // always on: the files are row images
 };
 
+// Copies a 1-D int64 tensor into a vector of expert ids.
 inline std::vector<int32_t> ids_of(TensorView tensor) {
   const auto* data = static_cast<const int64_t*>(tensor.data_ptr());
   return std::vector<int32_t>(data, data + tensor.size(0));
 }
 
-// Row images: the reader scatters each read straight into slab rows (RowReader::image_iovecs), which is only right
-// when every byte a read returns has exactly one destination and the row's reads return exactly its image. So: the
-// row starts at 0 of its reads, the segments tile [0, need_end) in source order inside their names' slab rows, and
-// each row's reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is
-// RowReader::check_image_alignment's, at open.
+// Throws unless the tables satisfy the row-image invariants.
+//
+// The reader scatters each read straight into slab rows (RowReader::image_iovecs), which is only right when every
+// byte a read returns has exactly one destination and the row's reads return exactly its image. So: each row starts
+// at 0 of its reads, the segments tile [0, need_end) in source order inside their names' slab rows, and each row's
+// reading parts tile [0, need_end) in part order. The 512-byte alignment O_DIRECT needs is checked at open, by
+// RowReader::check_image_alignment.
 template <ExpertRowLayout Layout>
 inline void check_image_tables(const Tables& t) {
   const std::string prefix = error_prefix<Layout>();
@@ -76,7 +89,7 @@ inline void check_image_tables(const Tables& t) {
     }
     cursor += s.bytes;
   }
-  // ... and on the destination side, each name's segments tile its slab row: two segments landing on the same slab
+  // On the destination side each name's segments must also tile its slab row: two segments landing on the same slab
   // bytes would pass the source check and silently keep whichever read landed last.
   for (int64_t name = 0; name < static_cast<int64_t>(t.row_bytes.size()); ++name) {
     std::vector<std::pair<int64_t, int64_t>> spans;
@@ -106,6 +119,9 @@ inline void check_image_tables(const Tables& t) {
   }
 }
 
+// Builds Tables from Python's tensors, refusing any table the reader would otherwise trust blindly (extents outside
+// their slot, parts that disagree on base or file size, segments naming no tensor). `paths` and `source_paths` are
+// newline-separated, one entry per file. Throws std::runtime_error on a bad table.
 template <ExpertRowLayout Layout>
 inline Tables tables_from(
     TensorView extents,
@@ -162,8 +178,7 @@ inline Tables tables_from(
   t.extents.resize(static_cast<size_t>(t.layers * t.experts * t.parts));
   for (size_t i = 0; i < t.extents.size(); ++i) {
     t.extents[i] = Read{extent_data[4 * i], extent_data[4 * i + 1], extent_data[4 * i + 2], extent_data[4 * i + 3]};
-    // The reader writes each extent into its row's bounce slot and reads its file without
-    // checking again, so a table that would write outside the slot or name no file is refused here.
+    // The reader does not re-check an extent, so one that would write outside its slot or name no file is refused here.
     const Read& e = t.extents[i];
     if (e.file < 0 || e.file >= static_cast<int64_t>(t.paths.size()) ||
         e.file >= static_cast<int64_t>(t.file_sizes.size()) || e.offset < 0 || e.length < 0 || e.dest < 0 ||
@@ -171,13 +186,11 @@ inline Tables tables_from(
       throw std::runtime_error(prefix + "an extent names no file or falls outside its bounce slot");
     }
   }
-  // The EOF guard (ReaderCore::admit_batch) decides a whole row from ONE of its parts: it reads that
-  // part's `offset - dest` as the row's aligned base and its file size as the row's file size. Both are
-  // true by construction of today's builder - exl3_ram_miss.py repeats one source size across all the
-  // parts of a shard, and the mirror layout puts two files under a row only as two copies of the SAME
-  // shard - but nothing in this file pinned either, and a builder that ever gave a row parts from
-  // genuinely different files would arm the guard to clear a row against the wrong size. Checked here,
-  // once per table, rather than per read.
+  // The EOF guard (ReaderCore::admit_batch) decides a whole row from one of its parts: it reads that part's
+  // `offset - dest` as the row's aligned base and its file size as the row's file size. The builder satisfies both
+  // today (exl3_ram_miss.py repeats one source size across all the parts of a shard, and the mirror layout puts two
+  // files under a row only as two copies of the same shard), but a builder that gave a row parts from different
+  // files would make the guard clear a row against the wrong size. Checked once per table rather than per read.
   for (size_t base = 0; base + static_cast<size_t>(t.parts) <= t.extents.size(); base += static_cast<size_t>(t.parts)) {
     const Read* head = nullptr;
     for (int64_t p = 0; p < t.parts && head == nullptr; ++p) {
@@ -186,8 +199,7 @@ inline Tables tables_from(
     if (head == nullptr) continue;  // a row nothing reads never reaches the guard
     for (int64_t p = 0; p < t.parts; ++p) {
       const Read& e = t.extents[base + static_cast<size_t>(p)];
-      // Only the reading parts: a zero-length part is never submitted and its fields are unused, so
-      // requiring anything of them would over-constrain the builder for no gain.
+      // A zero-length part is never submitted and its fields are unused, so it is not constrained.
       if (e.length <= 0) continue;
       if (t.file_sizes[e.file] != t.file_sizes[head->file] || e.offset - e.dest != head->offset - head->dest) {
         throw std::runtime_error(

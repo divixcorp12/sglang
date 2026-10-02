@@ -1,4 +1,14 @@
-// Piece streaming geometry: sub-read splitting and the piece publish record.
+// Piece streaming geometry: how a row's reads are cut into sub-reads and pieces, and how a piece is published.
+//
+// With piece streaming a row is not published whole. Each part is read as up to kSubReads sub-reads, the row's bytes
+// are cut into kPieces pieces along the sub-read boundaries, and a piece is published (one bit in the lease's
+// readiness word) as soon as the sub-reads it depends on have landed, so the device can start on the first bytes
+// of a row before the last has arrived.
+//
+//   split_part       one part's sub-reads
+//   RowGeometry      a row's sub-reads, pieces and their dependencies, from row_geometry()
+//   piece_word / publish_piece   the readiness word's format and its publish rule
+//   PieceTarget / PiecePublish   where the owner publishes a row's pieces
 #pragma once
 
 #include "read_fault.h"
@@ -6,11 +16,12 @@
 namespace sglang {
 namespace expert_stream {
 
-// Piece streaming, sub-reads (plan §4.1): part `e` as its sub-reads, in file order, into `out` (at most `per_part`
-// entries, per_part <= kSubReads); returns how many. Each is len_k = round_up(ceil(length / per_part), kPage) bytes and
-// the last takes what is left, so a part tiles exactly, a small part gives fewer than per_part and no sub-read is
-// empty. A zero-length part gives none. The part's offset, dest and length are whole pages (the builder's), so every
-// sub-read's are too.
+// Splits part `e` into its sub-reads, in file order, into `out` (at most `per_part` entries, per_part <= kSubReads).
+// Returns how many.
+//
+// Each sub-read is len_k = round_up(ceil(length / per_part), kPage) bytes and the last takes what is left, so a
+// part tiles exactly, a small part gives fewer than per_part and no sub-read is empty. A zero-length part gives
+// none. The part's offset, dest and length are whole pages (the builder's), so every sub-read's are too.
 inline int split_part(const Read& e, int per_part, Read* out) {
   if (e.length <= 0) return 0;
   const int64_t len_k = ((e.length + per_part - 1) / per_part + kPage - 1) / kPage * kPage;
@@ -28,9 +39,10 @@ struct PieceRun {
   int64_t hi = 0;
 };
 
-// A row's sub-reads and pieces (plan §4.2), computed at admission from the row's start. Sub-read s (its ordinal in
-// the row's file order) is part part[s]'s sub-read k[s]; piece j covers, in each segment i, the run
-// runs[j * segments + i] of the caller's array, and depends on the sub-reads in deps[j].
+// A row's sub-reads and pieces, computed at admission from the row's start.
+//
+// Sub-read s (its ordinal in the row's file order) is part part[s]'s sub-read k[s]. Piece j covers, in each segment
+// i, the run runs[j * segments + i] of the caller's array, and depends on the sub-reads in deps[j] (a bitmask).
 struct RowGeometry {
   int subs = 0;
   int64_t start = 0;  // where the row's needed bytes begin in its bounce slot
@@ -40,21 +52,23 @@ struct RowGeometry {
   uint8_t deps[kPieces] = {};
 };
 
-// Fill `g` and `runs` (kPieces * segments entries) for the row at `row_index` of the tables. Piece j's cuts are the
-// row's sub-read boundaries: in every segment, piece j starts where sub-read j starts, mapped into the segment's
-// destination coordinates and rounded down to kPieceAlign there (clamped to the segment), and ends where piece j + 1
-// starts. Piece 0 starts at every segment's first byte and the last sub-read's piece ends at every segment's last,
-// so the pieces partition the needed bytes; pieces past the row's sub-read count are empty. Segments are sorted by
-// source offset (exl3_expert_format.py) and file order is dest order within a row (tables_from), so the cuts are
-// monotone. deps[j] is exactly the set of sub-reads whose file bytes the piece's bytes touch. Returns false for a
+// Fills `g` and `runs` (kPieces * segments entries) for the row at `row_index` of the tables. Returns false for a
 // row that cannot be cut: more reading parts than pieces, or a piece with bytes that no sub-read reads.
+//
+// Piece j's cuts are the row's sub-read boundaries. In every segment, piece j starts where sub-read j starts, mapped
+// into the segment's destination coordinates and rounded down to kPieceAlign there (clamped to the segment), and
+// ends where piece j + 1 starts. Piece 0 starts at every segment's first byte and the last sub-read's piece ends at
+// every segment's last, so the pieces partition the needed bytes; pieces past the row's sub-read count are empty.
+// Segments are sorted by source offset (exl3_expert_format.py) and file order is dest order within a row
+// (tables_from), so the cuts are monotone. deps[j] is exactly the set of sub-reads whose file bytes the piece's
+// bytes touch.
 inline bool row_geometry(const Tables& t, size_t row_index, RowGeometry& g, PieceRun* runs) {
   const size_t parts = static_cast<size_t>(t.parts);
   const size_t base = row_index * parts;
   g = RowGeometry{};
   g.start = t.starts[row_index];
-  // The row's reading parts share the pieces (sub_reads_per_part); a zero-length part (a 0 mirror weight) reads nothing
-  // and takes none, so 1:0:1 cuts like a 2-part row.
+  // The reading parts share the pieces (sub_reads_per_part). A zero-length part (a 0 mirror weight) reads nothing and
+  // takes none, so 1:0:1 cuts like a 2-part row.
   int reading = 0;
   for (size_t p = 0; p < parts; ++p)
     reading += t.extents[base + p].length > 0 ? 1 : 0;
@@ -99,16 +113,18 @@ inline bool row_geometry(const Tables& t, size_t row_index, RowGeometry& g, Piec
   return true;
 }
 
-// Piece streaming, publishing (plan §3.4). A readiness word (lease area P) is generation56 << 8 | bits8. The service
-// initialises it to piece_word(generation) at reservation; the reader's owner then sets one bit per packed piece.
+// The initial readiness word of a lease row's piece area: generation56 << 8 | bits8, with no bit set. The service
+// writes it at reservation and the reader's owner then sets one bit per published piece.
 inline uint64_t piece_word(uint64_t generation) {
   return (generation & ((uint64_t{1} << 56) - 1)) << 8;
 }
 
-// Set `bit` in `word` only while the word still carries `generation` and does not have the bit: false (the word
-// untouched) otherwise. A late publish from an older request fails the generation check instead of setting a bit
-// under the new one, and a piece published twice fails the bit check. Release: the caller acquired the piece's
-// packing (PackJob::done) before calling, so the device that acquires the bit sees the bytes.
+// Sets `bit` in `word` only while the word still carries `generation` and does not have the bit; otherwise returns
+// false and leaves the word untouched. A late publish from an older request fails the generation check instead of
+// setting a bit under the new one, and a piece published twice fails the bit check.
+//
+// Release ordering: the caller has already acquired the piece's bytes (the reap's acquire of the completion queue
+// tail), so the device that acquires the bit sees them.
 inline bool publish_piece(uint64_t* word, uint64_t generation, uint8_t bit) {
   const uint64_t expected = generation & ((uint64_t{1} << 56) - 1);
   uint64_t old = __atomic_load_n(word, __ATOMIC_RELAXED);
@@ -118,13 +134,16 @@ inline bool publish_piece(uint64_t* word, uint64_t generation, uint8_t bit) {
   }
 }
 
-// Where the owner publishes a row's pieces: every readiness word naming the row, one per lane (at most kLeaseLanes,
-// checked where the lease block is laid out). `rows` is indexed by the row's ordinal in the read.
+// The most readiness words one row is published to: one per lane, at most kLeaseLanes (checked in tier_protocol.h).
 constexpr int kPieceTargets = 8;
+
+// Where the owner publishes a row's pieces: every readiness word naming the row, one per lane.
 struct PieceTarget {
   uint64_t* words[kPieceTargets] = {};
   int count = 0;
 };
+// The publish destinations of one read: the request's generation and, per row, its targets. `rows` is indexed by the
+// row's ordinal in the read.
 struct PiecePublish {
   uint64_t generation = 0;
   const PieceTarget* rows = nullptr;

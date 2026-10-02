@@ -1,4 +1,15 @@
-// Test-only fault injection for the expert-stream readers (ReaderCore; expert_stream_read_rows_faulted).
+// Test-only fault injection for the expert-stream readers (ReaderCore, expert_stream_read_rows_faulted).
+//
+// The test entry points take a fault as an int64 tensor of kFaultWords words, whose layout mirrors _fault_tensor in
+// ops/moe/expert_stream_transport.py. This file holds the decoded form and the decoding.
+//
+//   ReadFault        the faults one reader can inject, and the knobs that narrow them
+//   kFaultWords      the wire layout of the fault tensor
+//   fault_from       tensor words -> ReadFault
+//   injects_fault    whether a tensor arms any fault (a production host refuses those)
+//   abandon_after    the entry points' abandon callback
+//
+// Only InstrBuild readers carry a ReadFault; ProdBuild has no fault state at all.
 #pragma once
 
 #include "row_tables.h"
@@ -6,84 +17,110 @@
 namespace sglang {
 namespace expert_stream {
 
-// Test-only fault injection for the expert-stream readers (ReaderCore; expert_stream_read_rows_faulted).
+// The faults a ReaderCore can inject, and the fields that narrow where they land.
+//
+// Call numbers (`submit_call`, `cqe_call`, `stale_cqe_call`, `publish_twice`, `submit_short_call`) are 1-based and
+// count over the reader's life. "Armed" fields start a fault; "narrowing" fields (part, ordinal, sub, leg, ...) only
+// choose which completion it hits and arm nothing alone.
+//
+// Submit and completion faults:
+//   - submit_error / submit_call / submit_first: the submit_call-th submit returns errno submit_error. With
+//     submit_first the prepared SQEs are submitted before failing, so reads are in flight.
+//   - submit_short_call: that submit consumes nothing and reports success.
+//   - cqe_error / cqe_call: replaces the cqe_call-th reaped completion's result with -errno.
+//   - ring_reset_fail, nop_flush_refused: with a submit fault that leaves SQEs unconsumed and a refused NOP drain
+//     (nop_flush_refused, implied by ring_reset_fail), the failure-path drain's ring reset throws "io_uring ring reset
+//     failed" and read() must rethrow it, not abort.
+//
+// Per-extent faults hit the first completion of an extent of part `part` (-1: none), whichever row it is in and however
+// the kernel orders completions. part_error replaces its result with -errno; part_short makes it report at most that
+// many bytes (a block multiple). They are narrowed by:
+//   - ordinal: the row with that index in the request (-1: any);
+//   - sub: the sub-read with that index within its part, piece streaming only (-1: any; without piece streaming every
+//     extent is sub 0);
+//   - leg: the leg of a fanned-out fixed read (-1: any; default reads are one leg, leg 0). It also narrows cqe_error
+//   and
+//     hold_ordinal.
+//   - short_is_eof: the part_short completion also ends its sub-read, as a file ending there would, so the sub-read
+//     retires with fewer bytes than its pieces need (piece streaming only).
+//
+// Ordering and credit:
+//   - reverse_cqes: process each reaped batch back to front. Nothing in the reader may depend on delivery order and the
+//     kernel guarantees none across drives, so this makes that requirement testable.
+//   - max_outstanding: cap outstanding reads below the ring's depth. Production constants keep a batch (kBounceRows
+//     rows) inside the ring, so credit never binds there; this reaches the refill path without resizing the ring.
+//   - hold_ordinal / hold_rest: simulate a slow drive. The completions of the row with that index are reaped from the
+//     CQ (the kernel is done with them) but withheld from the reader until nothing else is in flight or waiting to
+//     pack. Cached buffered reads complete inside submit, so without this no test can hold an extent outstanding while
+//     other rows pack. hold_rest withholds every row from that ordinal on and releases them together, so they become
+//     ready in one reap. With `sub` set, the hold narrows to that sub-read (of part `part`, or of any part when part is
+//     -1), so one sub-read of a row lands last while the row's others land.
+//
+// Pipeline faults:
+//   - pack_delay_ns: sleep inside every row's packing, so the other bank's completions pile up meanwhile.
+//   - poison: fill a bounce slot with one pattern when a row takes it and another when the row has packed, and scribble
+//     every retired descriptor. A row packed before its reads landed, a bank reused early or a retired descriptor used
+//     again then shows in the bytes or crashes.
+//   - stale_cqe_call: the k-th extent to retire has its completion delivered again once its descriptor is recycled for
+//     another extent.
+//   - generation_start: seeds the generation counter (near 2^32 it wraps within a test).
+//
+// Piece streaming faults:
+//   - publish_twice: the k-th piece published is published a second time, as a re-dispatch would; the readiness word
+//     must refuse it.
+//   - last_publish_delay_ns: the read's last piece publish sleeps this long first, so it lands just before kDemandDone
+//     (device tests).
 struct ReadFault {
-  int submit_error = 0;       // errno the `submit_call`-th submit returns (0: no fault)
-  int64_t submit_call = 0;    // 1-based count of submit-and-wait calls over the reader's life
-  bool submit_first = false;  // submit the prepared SQEs before failing (reads are in flight)
-  int cqe_error = 0;          // errno that replaces the `cqe_call`-th completion's result
-  int64_t cqe_call = 0;       // 1-based count of reaped completions over the reader's life
-  // Per-extent faults, keyed by the extent's part index (-1: none). They hit the FIRST completion
-  // of a part-`part` extent, whichever row it is in and however the kernel orders completions.
+  int submit_error = 0;
+  int64_t submit_call = 0;
+  bool submit_first = false;
+  int cqe_error = 0;
+  int64_t cqe_call = 0;
   int64_t part = -1;
-  int part_error = 0;      // errno that replaces that completion's result
-  int64_t part_short = 0;  // >0: that completion reports at most this many bytes (block multiple)
-  // Process each reaped batch of completions back to front. Nothing in the reader may
-  // depend on delivery order, and the kernel gives no ordering guarantee across drives,
-  // so this makes that requirement testable rather than assumed.
+  int part_error = 0;
+  int64_t part_short = 0;  // >0: that completion reports at most this many bytes
   bool reverse_cqes = false;
-  // >0: cap outstanding reads to this many, below the ring's own depth. Production
-  // constants keep a batch (kBounceRows rows) inside the ring, so credit never binds
-  // there; this makes the refill path reachable from a test without resizing the ring.
-  int64_t max_outstanding = 0;
-  // Pipeline faults. pack_delay_ns sleeps inside every row's packing (a slow copy: the other bank's
-  // completions pile up meanwhile). poison fills a bounce slot with a pattern when a row takes it and
-  // with another when the row has packed, and scribbles every retired descriptor, so a row packed
-  // before its reads landed, a bank reused early or a retired descriptor used again shows in the bytes
-  // or crashes. stale_cqe_call: the k-th extent to retire (1-based) has its completion delivered AGAIN
-  // once its descriptor is recycled for another extent. generation_start seeds the generation counter
-  // (near 2^32 the counter wraps within a test). submit_short_call: that submit consumes nothing and
-  // reports success. ordinal narrows the per-part faults to the row with that index in the request (-1: any).
+  int64_t max_outstanding = 0;  // >0: cap outstanding reads to this many
   int64_t pack_delay_ns = 0;
   bool poison = false;
   int64_t stale_cqe_call = 0;
   int64_t generation_start = 0;
   int64_t submit_short_call = 0;
   int64_t ordinal = -1;
-  // A slow drive, simulated: the completions of the row with this index in the request are withheld
-  // from the reader (they were reaped from the CQ, so the kernel is done with them) until nothing else
-  // is in flight or waiting to pack, then delivered. Cached buffered reads complete inside submit, so
-  // without this no test can hold an extent outstanding while other rows pack (-1: none).
   int64_t hold_ordinal = -1;
-  // With hold_ordinal set: withhold every row from that ordinal on, not only that row. They are released
-  // together, so they become ready in one reap (a burst of rows the packer meets at once).
   bool hold_rest = false;
-  // Piece streaming only: narrows the per-part faults to the sub-read with this index within its part (-1: any).
-  // With hold_ordinal set it also narrows the hold to that sub-read (of part `part`, or of any part when part is
-  // -1), so one sub-read of a row lands last while the row's others land. With the flag off every extent is sub 0.
   int64_t sub = -1;
-  // Piece streaming only. publish_twice: the k-th piece the reader publishes (1-based, over its life) is published a
-  // second time, as a re-dispatch would; the readiness word must refuse it. short_is_eof: the part_short completion
-  // is also the end of its sub-read, as a file ending there would make it, so the sub-read retires with fewer bytes
-  // than its pieces need.
   int64_t publish_twice = 0;
   bool short_is_eof = false;
-  // Piece streaming, device tests. last_publish_delay_ns: the read's last piece publish sleeps this long first, so it
-  // lands just before kDemandDone (G11).
   int64_t last_publish_delay_ns = 0;
-  // Fixed reads (Task 7): narrows part_error, part_short (and short_is_eof), cqe_error and hold_ordinal to the
-  // completions of leg `leg` of a fanned-out read (-1: any leg). Default reads are one leg, leg 0.
   int64_t leg = -1;
-  // Word 30 bit 1: the next ring reset fails (SubmitFault::ring_reset_fail). With a submit fault that leaves SQEs
-  // unconsumed and a refused NOP drain (bit 0, implied), the failure-path drain's reset throws "io_uring ring reset
-  // failed" and read() must rethrow it, not abort.
   bool ring_reset_fail = false;
-  // Word 30 bit 0: the drain's NOP submission of unconsumed SQEs is refused (SubmitFault::nop_flush_refused).
   bool nop_flush_refused = false;
 };
 
-// The fault tensor of the test entry points: kFaultWords int64 words. Five of them are not reader faults:
-// abandon_after makes the entry point's abandon callback say stop once that many batches were admitted
-// (0: never), step (0: kBounceRows) is the faulted call's rows per batch, and words 19-20 (formerly
-// pack_workers, pack_split) are reserved and ignored (the packed path is gone); word 21 is hold_rest; word 22
-// (piece_stream, not a fault) turns the reader's piece streaming on before it opens; word 23 is sub, 24
-// publish_twice, 25 short_is_eof, 26 reserved and 27 last_publish_delay_ns. Word 28 (fixed_chunk_cap, not
-// a fault) caps the registered-buffer chunk size before the reader opens (0: 1 GiB), word 29 is leg, word 30 the
-// ring-reset bits (bit 0 nop_flush_refused, bit 1 ring_reset_fail) and word 31 (leg_cut_cap, not a fault) cuts every
-// read at that many bytes before the reader opens (0: READ_CUTS and the device limits). Keep the layout in step with
-// _fault_tensor in ops/moe/expert_stream_transport.py.
+// The fault tensor of the test entry points: kFaultWords int64 words, in the order of _fault_tensor in
+// ops/moe/expert_stream_transport.py (keep the two in step).
+//
+//   0-16   submit_error, submit_call, submit_first, cqe_error, cqe_call, part, part_error, part_short, reverse_cqes,
+//          max_outstanding, pack_delay_ns, poison, stale_cqe_call, generation_start, submit_short_call, ordinal,
+//          hold_ordinal
+//   17     abandon_after (not a reader fault): the entry point's abandon callback says stop once that many batches were
+//          admitted (0: never)
+//   18     step (not a fault): rows per batch of the faulted call (0: kBounceRows)
+//   19-20  reserved, ignored
+//   21     hold_rest
+//   22     piece_stream (not a fault): turns piece streaming on before the reader opens
+//   23-25  sub, publish_twice, short_is_eof
+//   26     reserved
+//   27     last_publish_delay_ns
+//   28     fixed_chunk_cap (not a fault): caps the registered-buffer chunk size before the reader opens (0: 1 GiB)
+//   29     leg
+//   30     ring-reset bits: bit 0 nop_flush_refused, bit 1 ring_reset_fail
+//   31     leg_cut_cap (not a fault): cuts every read at that many bytes before the reader opens (0: READ_CUTS and the
+//          device limits)
 constexpr int64_t kFaultWords = 32;
 
+// Decodes the fault words of a tensor of kFaultWords entries.
 inline ReadFault fault_from(const int64_t* f) {
   ReadFault fault;
   fault.submit_error = static_cast<int>(f[0]);
@@ -114,22 +151,23 @@ inline ReadFault fault_from(const int64_t* f) {
   return fault;
 }
 
-// Whether fault words `f` inject a fault, i.e. set a word that arms one (the words that only narrow a fault -- the
-// call numbers, part, ordinal, sub, leg, submit_first, short_is_eof, hold_rest -- arm nothing alone, and words 17-20,
-// 22, 26, 28 and 31 are not faults). A production host has no fault state and refuses a tensor for which this is true
+// Whether fault words `f` inject a fault, i.e. set a word that arms one. Words that only narrow a fault (the call
+// numbers, part, ordinal, sub, leg, submit_first, short_is_eof, hold_rest) arm nothing alone, and words 17-20, 22, 26,
+// 28 and 31 are not faults. A production host has no fault state and refuses a tensor for which this is true
 // (HostTestExports::install_fault); it needs no ReadFault to decide.
 inline bool injects_fault(const int64_t* f) {
   return f[0] != 0 || f[3] != 0 || f[6] != 0 || f[7] != 0 || f[8] != 0 || f[9] > 0 || f[10] > 0 || f[11] != 0 ||
          f[12] > 0 || f[13] != 0 || f[14] != 0 || f[16] >= 0 || f[24] > 0 || f[27] > 0 || f[30] != 0;
 }
 
+// Throws if `fault` is not kFaultWords long.
 template <ExpertRowLayout Layout>
 inline void check_fault_words(TensorView fault) {
   if (fault.size(0) != kFaultWords)
     throw std::runtime_error(error_prefix<Layout>() + "the fault tensor has the wrong length");
 }
 
-// Entry points' abandon callback: stop once `after` batches were admitted (0: never).
+// The entry points' abandon callback: stops once `after` batches were admitted (0: never).
 inline auto abandon_after(int64_t after) {
   return [after](size_t admitted) { return after > 0 && admitted >= static_cast<size_t>(after); };
 }

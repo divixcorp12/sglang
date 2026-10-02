@@ -1,8 +1,12 @@
-// The expert-stream host exports the server's path reaches, through expert_stream_transport.py (the test and tool
-// exports are in ffi_test_exports.h), written once for every row layout and file reader. An instantiation file
-// names a layout, a reader and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and
-// EXPERT_STREAM_HOST_TEST_EXPORTS; see exl3_ram_miss_host.cpp (ProdBuild) and
+// The expert-stream host exports: the FFI surface the server's path reaches, through expert_stream_transport.py.
+//
+// HostExports is written once for every row layout and file reader. An instantiation file names a layout, a reader
+// and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and EXPERT_STREAM_HOST_TEST_EXPORTS (the
+// test and tool exports live in ffi_test_exports.h). See exl3_ram_miss_host.cpp (ProdBuild) and
 // exl3_ram_miss_host_instr.cpp (InstrBuild).
+//
+// Every export takes an opaque `handle` naming a service in a per-instantiation registry; each call holds its own
+// reference, so close() from another thread frees the service only after calls in flight return.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -19,8 +23,9 @@ using tvm::ffi::TensorView;
 
 /// \brief The host exports of one transport instantiation that the server's path reaches; HostTestExports adds the
 /// test and tool exports the server does not call.
-/// The function-local registries are per instantiation, and each layout is its own module, so one layout's
-/// handles can never resolve in another's.
+///
+/// The function-local registries are per instantiation, and each layout is its own module, so one layout's handles can
+/// never resolve in another's.
 template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 struct HostExports {
   static_assert(BuildPolicy<Build>);
@@ -28,15 +33,15 @@ struct HostExports {
   using Tier = RamTier<Source>;
   using Thread = RamThread<Tier>;
 
-  // What the fault machinery compiles to in this build (plan Task 10): the instantiation files static_assert these,
-  // so a ProdBuild module that regained a fault entry, an SQE log or the ballast fails to compile.
+  // What the fault machinery compiles to in this build. The instantiation files static_assert these, so a ProdBuild
+  // module that regained a fault entry, an SQE log or the ballast fails to compile.
   static constexpr bool kReaderFaults = requires(Source& reader, const ReadFault& fault) { reader.set_fault(fault); };
   static constexpr bool kSqeLog = requires(Source& reader) { reader.set_sqe_log(nullptr); };
   static constexpr bool kBallast = requires(Tier& tier) { tier.copy_engine_ballast(0, 0, 0); };
 
-  // The table tensors every reader entry takes, checked once here rather than per read: tables_from
-  // dereferences these tensors through raw pointers with no dtype or device check of its own. Run before
-  // tables_from so a wrong-dtype or too-narrow table raises here, naming the tensor, not there.
+  // Checks the table tensors every reader entry takes, once here rather than per read. tables_from dereferences them
+  // through raw pointers with no dtype or device check of its own, so this runs before it: a wrong-dtype or too-narrow
+  // table raises here, naming the tensor.
   static void check_table_tensors(
       TensorView extents,
       TensorView starts,
@@ -112,10 +117,10 @@ struct HostExports {
     return Layout::kSmallMask;
   }
 
-  // The stream kernel's piece table (piece-streaming plan 4.2, open question 6: one entry per (row, expert), computed
-  // by the reader's own row_geometry so the device cannot disagree with it). `runs`: int32 [layers, experts, kPieces,
-  // segments, 2], each run as (dst_lo, dst_hi) byte offsets into the segment's name row. A row the reader refuses to
-  // cut gets empty runs; its read fails, so no device copy ever uses them. Returns how many rows were refused.
+  // Fills the stream kernel's piece table: one entry per (row, expert), computed by the reader's own row_geometry so
+  // the device cannot disagree with it. `runs`: int32 [layers, experts, kPieces, segments, 2], each run as
+  // (dst_lo, dst_hi) byte offsets into the segment's name row. A row the reader refuses to cut gets empty runs; its
+  // read fails, so no device copy ever uses them. Returns how many rows were refused.
   static int64_t piece_runs(
       TensorView extents,
       TensorView starts,
@@ -337,11 +342,11 @@ struct HostExports {
     find(handle)->arm_copy_engine(on != 0);
   }
 
-  // CPU experts (plan 2026-09-29-dsv41-cpu-experts): `forward` is a CpuExpertForward's address (the trait's native
-  // forward), whose layers register later (set_cpu_layer); split int64 [kLeaseLanes + 1], CPU lanes
-  // per n eligible lanes; cores int64 [n], the CPU expert thread's affinity (may be empty); x_rows uint8 [rows, stride]
-  // (host, the post kernel writes a row's input there) and out_rows float32 [rows, >= parts * hidden] (host, the
-  // device reads a row's CPU partial sums there: part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both
+  // Enables CPU experts. `forward` is a CpuExpertForward's address (the trait's native forward), whose layers
+  // register later (set_cpu_layer). `split` is int64 [kLeaseLanes + 1], CPU lanes per n eligible lanes; `cores` is
+  // int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host memory, where
+  // the post kernel writes a row's input; `out_rows` is float32 [rows, >= parts * hidden] in host memory, where the
+  // device reads a row's CPU partial sums (part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both tensors
   // must outlive the service.
   static void enable_cpu_experts(
       int64_t handle,
@@ -392,9 +397,9 @@ struct HostExports {
     find(handle)->set_cpu_layer(row, layer);
   }
 
-  // CPU experts: split int64 [kLeaseLanes + 1], a new split table, at any time.
-  // Every row's staging slots (up to k, fewer on a small tier) and its tag-1 map delta (LEASE_PROTOCOL.md). Once,
-  // paused or before the thread starts, with the tier empty.
+  // Reserves every row's staging slots (up to k, fewer on a small tier) and publishes its first map delta
+  // (analysis/dsv41-drive/LEASE_PROTOCOL.md, "Deltas and the bulk delta"). Call once, paused or before the thread
+  // starts, with the tier empty.
   static void reserve_staging(int64_t handle, int64_t k) {
     find(handle)->reserve_staging(k);
   }
@@ -412,6 +417,7 @@ struct HostExports {
     find(handle)->take_bulk_delta(static_cast<int32_t*>(out.data_ptr()), out.size(0));
   }
 
+  // CPU experts: installs a new split table (int64 [kLeaseLanes + 1]), at any time.
   static void set_cpu_split(int64_t handle, TensorView split) {
     using namespace host;
     auto cpu = SymbolicDevice{};
