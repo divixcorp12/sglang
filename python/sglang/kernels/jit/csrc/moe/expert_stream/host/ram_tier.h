@@ -1216,68 +1216,79 @@ class RamTier {
     return best;
   }
 
-  // A record with lanes (LEASE_PROTOCOL.md, "The host per record"). The device typed every lane from its copy of the
-  // map, so the host checks each against the tier and fail-stops on any disagreement. Order: stamps, checks, the copy
-  // job (hits start at once), victims and the map delta (before any read, so a served chain always has its delta
-  // published), then the misses' reads.
-  void serve_record(const Request& request, int64_t* rows) {
-    StageRecord* const cur = stage_record();  // null in ProdBuild, so every `if (cur)` below folds away
-    if (cur) cur->lanes = static_cast<int64_t>(request.lanes.size());
-    const auto fail = [&](const std::string& why) {
-      fail_stop(error_prefix<Layout>() + "request " + std::to_string(request.seq) + " of row " +
-                std::to_string(request.row) + ": " + why);
-    };
-    if (request.row < 0 || request.row >= layers_) fail("the row is out of range");
-    Tier& tier = tiers_[request.row];
+  // What serve_record's phases hand on: the copy job, the misses in lane order, and every expert the record routes.
+  struct RecordPlan {
+    int64_t idx = 0;  // the record's index in the demand ring
+    CopyJob job;
     FixedVec<int32_t, kWanted> wanted;
+    FixedVec<int32_t, kLeaseLanes> missing;
+    FixedVec<int64_t, kLeaseLanes> slots;
+    FixedVec<int32_t, kLeaseLanes> miss_lane;  // the lane index of each read row
+  };
+
+  // The record's CPU-miss jobs still to submit.
+  struct CpuMissBatch {
+    uint32_t sent = 0;  // bit i: miss i went to the CPU
+    int left = 0;
+    uint32_t next = 0;  // the next CPU-miss job's sequence, short of the last (job.late_seq)
+  };
+
+  [[noreturn]] void fail_record(const Request& request, const std::string& why) {
+    fail_stop(error_prefix<Layout>() + "request " + std::to_string(request.seq) + " of row " +
+              std::to_string(request.row) + ": " + why);
+  }
+
+  // The record's routed experts, each once: protect's, stamped as routed, then the lanes'.
+  void collect_wanted_locked(Tier& tier, const Request& request, RecordPlan* plan) {
     for (int32_t expert : request.protect) {
-      if (expert < 0 || expert >= experts_) fail("an expert is out of range");
-      if (!listed(wanted, expert)) wanted.push_back(expert);
+      if (expert < 0 || expert >= experts_) fail_record(request, "an expert is out of range");
+      if (!listed(plan->wanted, expert)) plan->wanted.push_back(expert);
       stamp_routed_locked(tier, expert);
     }
     FixedVec<int32_t, kLeaseLanes> lane_experts;
     for (const Lane& lane : request.lanes) {
-      if (lane.expert < 0 || lane.expert >= experts_) fail("an expert is out of range");
-      if (listed(lane_experts, lane.expert)) fail("a lane names an expert twice");
+      if (lane.expert < 0 || lane.expert >= experts_) fail_record(request, "an expert is out of range");
+      if (listed(lane_experts, lane.expert)) fail_record(request, "a lane names an expert twice");
       lane_experts.push_back(lane.expert);
-      if (!listed(wanted, lane.expert)) wanted.push_back(lane.expert);
+      if (!listed(plan->wanted, lane.expert)) plan->wanted.push_back(lane.expert);
     }
+  }
+
+  // Checks every lane against the tier: a miss goes to the read lists, a copy-engine or CPU hit (stamped) to the copy
+  // job, an SM hit nowhere. Then the map chain: the row's next one when the record misses, else 0.
+  void classify_lanes_locked(Tier& tier, const Request& request, RecordPlan* plan) {
     const bool host_lanes = copy_engine_ != nullptr && copy_armed_.load(std::memory_order_acquire) && request.captured;
     const bool cpu_row = host_lanes && cpu_ != nullptr && cpu_->eligible(request.row);
-    const int64_t idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
-    CopyJob job;
-    FixedVec<int32_t, kLeaseLanes> missing;
-    FixedVec<int64_t, kLeaseLanes> slots;
-    FixedVec<int32_t, kLeaseLanes> miss_lane;  // the lane index of each read row
+    CopyJob& job = plan->job;
     for (size_t j = 0; j < request.lanes.size(); ++j) {
       const Lane& lane = request.lanes[j];
-      const auto at = [&] {  // built only to fail: the hot path allocates nothing
-        return "lane " + std::to_string(j) + " (expert " + std::to_string(lane.expert) + ", slot " +
-               std::to_string(lane.slot) + ")";
+      const auto fail = [&](const char* why) {  // the message is built only to fail: the hot path allocates nothing
+        fail_record(request, "lane " + std::to_string(j) + " (expert " + std::to_string(lane.expert) + ", slot " +
+                                 std::to_string(lane.slot) + ")" + why);
       };
       if (is_miss(lane.kind)) {
-        if (!listed(tier.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(at() + " is not a staging slot");
-        if (listed(slots, static_cast<int64_t>(lane.slot))) fail(at() + " shares its staging slot with another miss");
-        if (tier.expert_slot[lane.expert] >= 0) fail(at() + " misses an expert the tier holds");
+        if (!listed(tier.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
+        if (listed(plan->slots, static_cast<int64_t>(lane.slot))) fail(" shares its staging slot with another miss");
+        if (tier.expert_slot[lane.expert] >= 0) fail(" misses an expert the tier holds");
         if (lane.kind == kKindMissCpu) {
-          if (!cpu_row || cpu_->parts() < 2) fail(at() + ": a CPU miss on a row without CPU experts' miss part");
+          if (!cpu_row || cpu_->parts() < 2) fail(": a CPU miss on a row without CPU experts' miss part");
           ++job.late_cpu;
         }
-        missing.push_back(lane.expert);
-        slots.push_back(lane.slot);
-        miss_lane.push_back(static_cast<int32_t>(j));
+        plan->missing.push_back(lane.expert);
+        plan->slots.push_back(lane.slot);
+        plan->miss_lane.push_back(static_cast<int32_t>(j));
         continue;
       }
       if (lane.slot < 0 || lane.slot >= tier.capacity || tier.expert_slot[lane.expert] != lane.slot ||
           tier.state[lane.slot] != kReady) {
-        fail(at() + ": the device maps it there, the tier does not");
+        fail(": the device maps it there, the tier does not");
       }
       tier.stamp[lane.slot] = ++tick_;
       disown_locked(tier, lane.slot);
       if (lane.kind == kKindHitCopy) {
-        if (!host_lanes || !copy_engine_->eligible(request.row, lane.dst)) fail(at() + ": a copy-engine lane on an ineligible row");
+        if (!host_lanes || !copy_engine_->eligible(request.row, lane.dst)) fail(": a copy-engine lane on an ineligible row");
       } else if (lane.kind == kKindHitCpu) {
-        if (!cpu_row) fail(at() + ": a CPU lane on a row without CPU experts");
+        if (!cpu_row) fail(": a CPU lane on a row without CPU experts");
         job.cpu_mask |= 1u << j;
       } else {
         continue;  // kKindHitSm: C1 copies it, the host has nothing to do
@@ -1285,168 +1296,201 @@ class RamTier {
       job.lanes[job.count++] = CopyLane{static_cast<int32_t>(j), lane.slot, lane.dst, lane.weight};
       job.mask |= 1u << j;
     }
-    if (!missing.empty()) {
+    if (!plan->missing.empty()) {
       if (request.chain != tier.chain + 1) {
-        fail("map chain " + std::to_string(request.chain) + ", the row expects " + std::to_string(tier.chain + 1));
+        fail_record(request, "map chain " + std::to_string(request.chain) + ", the row expects " +
+                                 std::to_string(tier.chain + 1));
       }
     } else if (request.chain != 0) {
-      fail("map chain " + std::to_string(request.chain) + " on a record without a miss");
+      fail_record(request, "map chain " + std::to_string(request.chain) + " on a record without a miss");
     }
-    const auto submit_cpu = [&](const CpuJob& cpu_job) {
-      if (!cpu_->submit(cpu_job)) fail("the CPU expert ring is full");
-      this->template count<kCpuJobs>();
-    };
-    uint32_t late_next = 0;  // the next CPU-miss job's sequence, short of the last (job.late_seq)
-    if (job.count > 0 || job.late_cpu > 0) {
-      job.gen = request.gen;
-      job.idx = idx;
-      job.row = request.row;
-      if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
-      this->template count<kCopyJobs>();
-      this->template count<kCopyLanes>(job.count + job.late_cpu);
-      const int cpu_hits = __builtin_popcount(job.cpu_mask);
-      this->template count<kCpuLanes>(cpu_hits + job.late_cpu);
-      if (cpu_hits > 0 || job.late_cpu > 0) {
-        // One sequence per job the record can need: the hits' and one per CPU miss. The last miss job takes the last,
-        // so the copy thread's done(late_seq) covers however the misses were batched.
-        const uint32_t first = cpu_->claim((cpu_hits > 0 ? 1 : 0) + job.late_cpu);
-        job.cpu_seq = first;
-        late_next = first + (cpu_hits > 0 ? 1u : 0u);
-        job.late_seq = late_next + static_cast<uint32_t>(job.late_cpu) - 1u;
-        if (cpu_hits > 0) {  // before the copy job, so the CPU starts first
-          CpuJob cpu_job;
-          cpu_job.row = request.row;
-          cpu_job.part = 0;
-          cpu_job.seq = first;
-          for (int i = 0; i < job.count; ++i) {
-            const CopyLane& lane = job.lanes[i];
-            if ((job.cpu_mask >> lane.lane & 1u) == 0) continue;
-            cpu_job.slots[cpu_job.k] = lane.host_slot;
-            cpu_job.weights[cpu_job.k] = lane.weight;
-            ++cpu_job.k;
-          }
-          submit_cpu(cpu_job);
-        }
-      }
-      copy_engine_->submit(job);
-    }
-    // Victims and the delta, before any read. A miss lands in its staging slot whatever happens here; whether it is
-    // cached is the victim's question.
-    bool inserted[kLeaseLanes] = {};
-    if (!missing.empty()) {
-      int32_t entries[kDeltaMaxEntries][2];
-      int count = 0;
-      FixedVec<int32_t, kLeaseLanes> staging = tier.staging;
-      for (size_t i = 0; i < missing.size(); ++i) {
-        int32_t old = -1;
-        const int64_t victim = take_victim_locked(request.row, wanted, &old);
-        if (victim < 0) {
-          this->template count<kRamInsertSkipped>();
-          continue;
-        }
-        if (old >= 0) {
-          entries[count][0] = old;
-          entries[count][1] = -1;
-          ++count;
-        }
-        entries[count][0] = missing[i];
-        entries[count][1] = static_cast<int32_t>(slots[i]);
-        ++count;
-        const int32_t slot = static_cast<int32_t>(slots[i]);
-        tier.state[victim] = kStaging;
-        for (int32_t& s : staging)
-          if (s == slot) s = static_cast<int32_t>(victim);
-        inserted[i] = true;
-      }
-      tier.staging = staging;
-      tier.chain = request.chain;
-      publish_delta_locked(request.row, request.chain, tier.staging, entries, count);
-    }
-    if (cur) cur->reserved = stamp(cur);
-    int64_t status = kStatusNoRead;
-    std::vector<uint8_t>& packed = packed_;
-    packed.clear();
-    if (!missing.empty()) {
-      const bool publishing = init_piece_words_locked(request, miss_lane, idx);
-      bool fail_reads = false;
-      if constexpr (Build::kFaults) {  // the test faults (inject, inject_fault): InstrBuild only
-        apply_pending_fault();
-        const int64_t delay = faults_.delay_ns.load();
-        if (delay > 0 && demands_read_ >= faults_.delay_after.load()) fault_delay(delay);
-        fail_reads = faults_.fail_reads.load();
-      }
-      if (fail_reads) fail("a test fault failed the read");
-      uint32_t cpu_sent = 0;  // bit i: miss i went to the CPU
-      int cpu_left = job.late_cpu;
-      // The CPU misses whose rows landed since the last call, as one part-1 job: from read()'s progress hook, and
-      // after the read. Every job after the record's first adds into the part.
-      const auto send_landed = [&] {
-        if (cpu_left == 0) return;
+  }
+
+  void submit_cpu_job(const Request& request, const CpuJob& cpu_job) {
+    if (!cpu_->submit(cpu_job)) fail_record(request, "the CPU expert ring is full");
+    this->template count<kCpuJobs>();
+  }
+
+  // The record's CPU-hit job, then its copy job, so the CPU starts first. Returns the CPU misses' batch, whose jobs
+  // read_misses submits as their rows land.
+  CpuMissBatch submit_host_lanes(const Request& request, RecordPlan* plan) {
+    CopyJob& job = plan->job;
+    CpuMissBatch misses;
+    misses.left = job.late_cpu;
+    if (job.count == 0 && job.late_cpu == 0) return misses;
+    job.gen = request.gen;
+    job.idx = plan->idx;
+    job.row = request.row;
+    if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
+    this->template count<kCopyJobs>();
+    this->template count<kCopyLanes>(job.count + job.late_cpu);
+    const int cpu_hits = __builtin_popcount(job.cpu_mask);
+    this->template count<kCpuLanes>(cpu_hits + job.late_cpu);
+    if (cpu_hits > 0 || job.late_cpu > 0) {
+      // One sequence per job the record can need: the hits' and one per CPU miss. The last miss job takes the last,
+      // so the copy thread's done(late_seq) covers however the misses were batched.
+      const uint32_t first = cpu_->claim((cpu_hits > 0 ? 1 : 0) + job.late_cpu);
+      job.cpu_seq = first;
+      misses.next = first + (cpu_hits > 0 ? 1u : 0u);
+      job.late_seq = misses.next + static_cast<uint32_t>(job.late_cpu) - 1u;
+      if (cpu_hits > 0) {
         CpuJob cpu_job;
         cpu_job.row = request.row;
-        cpu_job.part = 1;
-        cpu_job.accumulate = cpu_left < job.late_cpu;
-        for (size_t i = 0; i < missing.size(); ++i) {
-          const Lane& lane = request.lanes[miss_lane[i]];
-          if (lane.kind != kKindMissCpu || (cpu_sent >> i & 1u) != 0) continue;
-          if (!(i < packed.size() && packed[i] != 0)) continue;
-          cpu_job.slots[cpu_job.k] = static_cast<int32_t>(slots[i]);
+        cpu_job.part = 0;
+        cpu_job.seq = first;
+        for (int i = 0; i < job.count; ++i) {
+          const CopyLane& lane = job.lanes[i];
+          if ((job.cpu_mask >> lane.lane & 1u) == 0) continue;
+          cpu_job.slots[cpu_job.k] = lane.host_slot;
           cpu_job.weights[cpu_job.k] = lane.weight;
           ++cpu_job.k;
-          cpu_sent |= 1u << i;
         }
-        if (cpu_job.k == 0) return;
-        cpu_left -= cpu_job.k;
-        cpu_job.seq = cpu_left == 0 ? job.late_seq : late_next++;
-        _mm_sfence();  // the rows' bytes before the CPU thread reads them
-        submit_cpu(cpu_job);
-      };
-      const int result = reader_.read(
-          request.row,
-          missing,
-          slots,
-          kBounceRows,
-          [](size_t) { return false; },
-          cur,
-          &packed,
-          SIZE_MAX,
-          // read() runs this once per drain-loop turn and once per finished row.
-          [&] { send_landed(); },
-          publishing ? &piece_publish_ : nullptr);
-      stats_.store(kPiecePublishRefused, reader_.publish_refused());
-      if (result != 1) {
-        count<kReadErrors>();
-        fail("the read failed");
+        submit_cpu_job(request, cpu_job);
       }
-      status = kStatusServed;
-      ++demands_read_;
-      _mm_sfence();  // the split's memcpy stores land before the mirror publishes them (D11)
-      send_landed();
-      if (cpu_left != 0) fail("a CPU miss's row never landed");
     }
-    for (size_t i = 0; i < missing.size(); ++i) {
+    copy_engine_->submit(job);
+    return misses;
+  }
+
+  // Victims and the delta, before any read. A miss lands in its staging slot whatever happens here; whether it is
+  // cached is the victim's question. inserted[i]: miss i took a victim and is cached once read.
+  void reserve_victims_locked(Tier& tier, const Request& request, const RecordPlan& plan, bool* inserted) {
+    int32_t entries[kDeltaMaxEntries][2];
+    int count = 0;
+    FixedVec<int32_t, kLeaseLanes> staging = tier.staging;
+    for (size_t i = 0; i < plan.missing.size(); ++i) {
+      int32_t old = -1;
+      const int64_t victim = take_victim_locked(request.row, plan.wanted, &old);
+      if (victim < 0) {
+        this->template count<kRamInsertSkipped>();
+        continue;
+      }
+      if (old >= 0) {
+        entries[count][0] = old;
+        entries[count][1] = -1;
+        ++count;
+      }
+      entries[count][0] = plan.missing[i];
+      entries[count][1] = static_cast<int32_t>(plan.slots[i]);
+      ++count;
+      const int32_t slot = static_cast<int32_t>(plan.slots[i]);
+      tier.state[victim] = kStaging;
+      for (int32_t& s : staging)
+        if (s == slot) s = static_cast<int32_t>(victim);
+      inserted[i] = true;
+    }
+    tier.staging = staging;
+    tier.chain = request.chain;
+    publish_delta_locked(request.row, request.chain, tier.staging, entries, count);
+  }
+
+  // The CPU misses whose rows landed since the last call, as one part-1 job: from read()'s progress hook, and after
+  // the read. Every job after the record's first adds into the part.
+  void submit_landed_cpu_misses(const Request& request, const RecordPlan& plan, CpuMissBatch* misses) {
+    if (misses->left == 0) return;
+    const CopyJob& job = plan.job;
+    CpuJob cpu_job;
+    cpu_job.row = request.row;
+    cpu_job.part = 1;
+    cpu_job.accumulate = misses->left < job.late_cpu;
+    for (size_t i = 0; i < plan.missing.size(); ++i) {
+      const Lane& lane = request.lanes[plan.miss_lane[i]];
+      if (lane.kind != kKindMissCpu || (misses->sent >> i & 1u) != 0) continue;
+      if (!(i < packed_.size() && packed_[i] != 0)) continue;
+      cpu_job.slots[cpu_job.k] = static_cast<int32_t>(plan.slots[i]);
+      cpu_job.weights[cpu_job.k] = lane.weight;
+      ++cpu_job.k;
+      misses->sent |= 1u << i;
+    }
+    if (cpu_job.k == 0) return;
+    misses->left -= cpu_job.k;
+    cpu_job.seq = misses->left == 0 ? job.late_seq : misses->next++;
+    _mm_sfence();  // the rows' bytes before the CPU thread reads them
+    submit_cpu_job(request, cpu_job);
+  }
+
+  // Reads the misses into their staging slots, each CPU miss going to the CPU as its row lands. Returns the stage
+  // status.
+  int64_t read_misses(const Request& request, const RecordPlan& plan, CpuMissBatch* misses, StageRecord* cur) {
+    packed_.clear();
+    const bool publishing = init_piece_words_locked(request, plan.miss_lane, plan.idx);
+    bool fail_reads = false;
+    if constexpr (Build::kFaults) {  // the test faults (inject, inject_fault): InstrBuild only
+      apply_pending_fault();
+      const int64_t delay = faults_.delay_ns.load();
+      if (delay > 0 && demands_read_ >= faults_.delay_after.load()) fault_delay(delay);
+      fail_reads = faults_.fail_reads.load();
+    }
+    if (fail_reads) fail_record(request, "a test fault failed the read");
+    const int result = reader_.read(
+        request.row,
+        plan.missing,
+        plan.slots,
+        kBounceRows,
+        [](size_t) { return false; },
+        cur,
+        &packed_,
+        SIZE_MAX,
+        // read() runs this once per drain-loop turn and once per finished row.
+        [&] { submit_landed_cpu_misses(request, plan, misses); },
+        publishing ? &piece_publish_ : nullptr);
+    stats_.store(kPiecePublishRefused, reader_.publish_refused());
+    if (result != 1) {
+      count<kReadErrors>();
+      fail_record(request, "the read failed");
+    }
+    ++demands_read_;
+    _mm_sfence();  // the split's memcpy stores land before the mirror publishes them (D11)
+    submit_landed_cpu_misses(request, plan, misses);
+    if (misses->left != 0) fail_record(request, "a CPU miss's row never landed");
+    return kStatusServed;
+  }
+
+  // Maps each read miss that took a victim into the tier and the host mirror.
+  void commit_inserted_locked(Tier& tier, const Request& request, const RecordPlan& plan, const bool* inserted) {
+    for (size_t i = 0; i < plan.missing.size(); ++i) {
       if (!inserted[i]) continue;
-      tier.slot_to_expert[slots[i]] = missing[i];
-      tier.expert_slot[missing[i]] = static_cast<int32_t>(slots[i]);
-      tier.state[slots[i]] = kReady;
-      tier.stamp[slots[i]] = ++tick_;
-      publish_mirror(request.row, missing[i], static_cast<int32_t>(slots[i]));
+      tier.slot_to_expert[plan.slots[i]] = plan.missing[i];
+      tier.expert_slot[plan.missing[i]] = static_cast<int32_t>(plan.slots[i]);
+      tier.state[plan.slots[i]] = kReady;
+      tier.stamp[plan.slots[i]] = ++tick_;
+      publish_mirror(request.row, plan.missing[i], static_cast<int32_t>(plan.slots[i]));
     }
-    if (!missing.empty()) {
-      // One writer (the owner), read lock-free by layer_rows: a relaxed store.
-      std::atomic_ref<int64_t>(tier.rows_demand)
-          .store(tier.rows_demand + static_cast<int64_t>(missing.size()), std::memory_order_relaxed);
-      count<kVersion>();
-      count<kRowsRead>(static_cast<int64_t>(missing.size()));
-    }
+    // One writer (the owner), read lock-free by layer_rows: a relaxed store.
+    std::atomic_ref<int64_t>(tier.rows_demand)
+        .store(tier.rows_demand + static_cast<int64_t>(plan.missing.size()), std::memory_order_relaxed);
+    count<kVersion>();
+    count<kRowsRead>(static_cast<int64_t>(plan.missing.size()));
+  }
+
+  // A record with lanes (LEASE_PROTOCOL.md, "The host per record"). The device typed every lane from its copy of the
+  // map, so the host checks each against the tier and fail-stops on any disagreement. Order: stamps, checks, the copy
+  // job (hits start at once), victims and the map delta (before any read, so a served chain always has its delta
+  // published), then the misses' reads.
+  void serve_record(const Request& request, int64_t* rows) {
+    StageRecord* const cur = stage_record();  // null in ProdBuild, so every `if (cur)` below folds away
+    if (cur) cur->lanes = static_cast<int64_t>(request.lanes.size());
+    if (request.row < 0 || request.row >= layers_) fail_record(request, "the row is out of range");
+    Tier& tier = tiers_[request.row];
+    RecordPlan plan;
+    plan.idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    collect_wanted_locked(tier, request, &plan);
+    classify_lanes_locked(tier, request, &plan);
+    CpuMissBatch misses = submit_host_lanes(request, &plan);
+    const bool reads = !plan.missing.empty();
+    bool inserted[kLeaseLanes] = {};
+    if (reads) reserve_victims_locked(tier, request, plan, inserted);
+    if (cur) cur->reserved = stamp(cur);
+    const int64_t status = reads ? read_misses(request, plan, &misses, cur) : kStatusNoRead;
+    if (reads) commit_inserted_locked(tier, request, plan, inserted);
     if (cur) {
       cur->mapped = stamp(cur);
       cur->row = request.row;
       cur->ok = 1;
       cur->status = status;
-      cur->rows = static_cast<int64_t>(missing.size());
+      cur->rows = static_cast<int64_t>(plan.missing.size());
     }
-    *rows = static_cast<int64_t>(missing.size());
+    *rows = static_cast<int64_t>(plan.missing.size());
   }
 
   // Store piece_word(gen) into the readiness word of every kMissGpu lane, then fence, and record those words as the
