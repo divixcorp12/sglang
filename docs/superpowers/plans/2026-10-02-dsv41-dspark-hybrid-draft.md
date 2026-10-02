@@ -1670,3 +1670,23 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 4-bit is the same order as 3-bit, so the kernel handles the draft's bitrate; the residual is the CPU kernel's
 activation quantization.
+
+### Task 7: served A/B (2026-10-02, divix01, `1f766ed58f`)
+
+Commands are as in Step 4, into `cc-expert-prediction/analysis/dsv41-dspark/cpu-draft-ab/r{1,2}`. EXIT1=0 and EXIT2=0.
+
+- **Smoke.** `[96, 96, 96] experts on the CPU`. The hybrid draft loads at 2.34 GB against 6.82 GB, and TTFT is 63.7 s
+  against 68.8 s. Two gate refusals and one staging defect were fixed on the way: the `COMMON` overrides and
+  `1f766ed58f`.
+- **Throughput.** Median decode tok/s:
+  - r1: resident 2.10, hybrid 2.22.
+  - r2: resident 2.14, hybrid 2.23.
+- **Paired ratio:** median 1.117. The hybrid wins 12/16 pairs.
+  - r1: 0.94 1.18 1.13 0.82 1.13 1.12 1.15 1.12.
+  - r2: 1.00 1.16 1.12 0.76 1.11 1.06 1.18 1.11.
+- **Accept length (tokens / verifies):** resident 2.26, hybrid 2.22. TTFT median: 20.9 s vs 20.3 s.
+- **CPU.** 505 of 900 stage calls did no CPU work. A CPU call averaged 2.77 / 2.31 ms (r1 / r2), p90 3.83 / 2.87,
+  union 1.8. That is ≈3.0-3.7 ms per draft step against the estimated 1.43. The ~1.4-1.8 ms fixed cost per call is
+  above the kernel's 0.94 ms.
+- **Verdict: win**, at the threshold (ratio > 1, 12/16). Both arms are far below the non-spec ~13.5 tok/s (§30.1).
+  Recorded in DSV41_REFERENCE §33.4.
