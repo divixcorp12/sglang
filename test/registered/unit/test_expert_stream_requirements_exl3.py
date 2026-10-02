@@ -436,3 +436,37 @@ def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
             _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
             **{**CPU_EXPERTS_ENV, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE": "always"},
         )
+
+
+DSPARK_CPU_ENV = dict(
+    SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS=True,
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES="18-29",
+)
+
+
+def test_dspark_cpu_experts_pass_with_dspark_and_cores(model_dir):
+    _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **DSPARK_CPU_ENV)
+
+
+def test_dspark_cpu_experts_without_dspark_are_refused(model_dir):
+    with pytest.raises(ValueError, match="--speculative-algorithm DSPARK"):
+        _gate(_launch(model_dir), **DSPARK_CPU_ENV)
+
+
+@pytest.mark.parametrize("cores", ["", "18"])
+def test_dspark_cpu_experts_need_two_cores(model_dir, cores):
+    with pytest.raises(ValueError, match="SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES"):
+        _gate(
+            _launch(model_dir, speculative_algorithm="DSPARK"),
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": cores},
+        )
+
+
+def test_a_bad_resident_file_is_refused_at_launch(model_dir, tmp_path):
+    bad = tmp_path / "resident.json"
+    bad.write_text("{}")
+    with pytest.raises(ValueError, match="resident.json"):
+        _gate(
+            _launch(model_dir, speculative_algorithm="DSPARK"),
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": str(bad)},
+        )
