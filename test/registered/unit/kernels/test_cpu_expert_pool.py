@@ -318,9 +318,11 @@ class FakeHost:
 
     def calibrate_cpu_split(self, row, *, device, reps, scratch, timeout_s=1.0):
         self.calibrations.append((row, device, reps, scratch.numel(), str(scratch.device)))
+        self.scratch = scratch
+        # Calibration's own jobs show in the stats, also those of a calibration that then fails.
+        self.stats = {"jobs": 999, "lanes": 999, "forward_ns": 999}
         if isinstance(self.grid, Exception):
             raise self.grid
-        self.stats = {"jobs": 999, "lanes": 999, "forward_ns": 999}  # calibration's own jobs show in the stats
         return torch.tensor(self.grid, dtype=torch.float64)
 
     def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads):
@@ -512,3 +514,26 @@ def test_failed_calibration_warns_and_keeps_the_split(caplog):
         assert svc.calibrate(-1) is None
     assert "did not finish" in caplog.text
     assert host.splits == [] and svc.split == [0] * 9 and not svc.calibrated
+
+
+def test_failed_calibration_keeps_its_scratch_alive_and_rebaselines_the_stats():
+    """A timed-out DMA may still be writing into the scratch: freeing it would let the allocator hand the block to
+    other work under a late copy."""
+    host = FakeHost()
+    host.grid = RuntimeError("calibration: a measurement did not finish within 1000 ms")
+    svc = _calibrating_service(host)
+    assert svc.calibrate(-1) is None
+    assert svc._calibration_scratch is host.scratch
+    assert svc._last_stats == host.stats
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_log_stats_leaves_out_calibrations_jobs(caplog, fails):
+    host = FakeHost()
+    host.grid = RuntimeError("calibration failed") if fails else _grid(lambda n, k: 1.0)
+    svc = _calibrating_service(host)
+    svc.calibrate(-1)
+    host.stats = {"jobs": 999 + 3, "lanes": 999 + 8, "forward_ns": 999 + 8 * 500_000}  # three decode jobs since
+    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        assert svc.log_stats() == {"jobs": 3, "lanes": 8, "forward_ns": 8 * 500_000}
+    assert "3 jobs, 8 lanes, 0.500 ms per lane" in caplog.text

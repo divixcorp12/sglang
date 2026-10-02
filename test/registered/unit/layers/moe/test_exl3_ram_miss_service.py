@@ -1109,6 +1109,34 @@ def test_the_copy_engine_arms_only_after_enough_decode_forwards_not_batches(monk
     assert syncs == [True], "an eager forward did not drain the device once armed"
 
 
+@pytest.mark.parametrize("raises", [False, True])
+def test_the_split_is_calibrated_once_paused_and_before_the_copy_engine_arms(monkeypatch, raises):
+    """Calibration needs the tier (paused) and an unarmed copy engine: once armed, the device types CPU and copy lanes
+    that would compete with its measurements. The pause is released even if calibration raises."""
+    service, armed, _ = _copy_engine_service(monkeypatch)
+    events = []
+
+    def calibrate(device):
+        events.append(("calibrate", device))
+        if raises:
+            raise ValueError("unexpected")
+
+    service.cpu_experts = SimpleNamespace(calibrate=calibrate)
+    service.host = SimpleNamespace(arm_copy_engine=lambda: events.append("arm"))
+    monkeypatch.setattr(service, "before_host_use", lambda: events.append("pause"))
+    monkeypatch.setattr(service, "after_host_use", lambda: events.append("resume"))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    service._copy_decodes = module.COPY_ENGINE_ARM_DECODES
+    if raises:
+        with pytest.raises(ValueError):
+            service._arm_copy_engine()
+        assert events == ["pause", ("calibrate", 3), "resume"]
+        return
+    service._arm_copy_engine()
+    service._arm_copy_engine()
+    assert events == ["pause", ("calibrate", 3), "resume", "arm"]
+
+
 @pytest.mark.parametrize("value", [None, "", "LAZY", "eager", "DEFAULT"])
 def test_the_copy_engine_refuses_any_module_loading_but_eager(value):
     """A kernel loaded lazily after arming fail-stopped the copy-engine soak on the same decode step every time, and
