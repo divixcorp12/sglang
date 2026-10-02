@@ -18,17 +18,14 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <immintrin.h>
 #include <chrono>
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
-#include <map>
 #include <mutex>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #ifdef __linux__
@@ -39,7 +36,6 @@
 // std::min/max/clamp throughout
 #include <intrin.h>
 #include <windows.h>
-#pragma comment(lib, "Synchronization.lib")   // WaitOnAddress / WakeByAddressAll (Pool)
 #endif
 
 // CPU MoE expert GEMM for mul1 EXL3 tensors.
@@ -118,14 +114,6 @@ thread_local int tl_swz_tiles_k = 0;
 #define M1_ALWAYS_INLINE __forceinline
 #endif
 
-inline void cpu_pause()
-{
-#ifdef __linux__
-    __builtin_ia32_pause();
-#else
-    _mm_pause();
-#endif
-}
 
 inline float half_to_float(at::Half h) { return static_cast<float>(h); }
 
@@ -2110,263 +2098,11 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
     }
 }
 
-// -------------------------------------------------------------------------------------------
-//   Thread pool (persistent, spin-parked; master participates as worker 0)
-// -------------------------------------------------------------------------------------------
-
-typedef void (*PoolFn)(void* ctx, int worker, int num_workers);
-
-// Physical-core-first CPU ordering: one logical CPU per distinct physical core, SMT siblings
-// appended after. Without this, spawned std::thread workers are placed wherever the scheduler
-// puts them, which on an SMT host can silently collide two workers onto one physical core.
-// EXL3_MOE_CPU_PIN=0 disables.
-//
-// Linux: entries are plain logical CPU indices (as taken by CPU_SET). Windows: entries encode
-// (processor group << 16) | bit-within-group, decoded by Pool::pin_self -- SetThreadAffinityMask
-// only addresses the calling thread's current group, so systems with more than 64 logical
-// processors (multiple processor groups) need the group-aware SetThreadGroupAffinity instead.
-// UNVERIFIED: no Windows toolchain was available to compile-test this branch; check it (e.g. via
-// EXL3_MOE_CPU_PROF timing before/after, or Task Manager's per-core view during a CPU-offloaded
-// pass) before relying on it on a real system, particularly one with multiple processor groups.
-#ifdef __linux__
-inline std::vector<int> physical_core_order()
-{
-    std::vector<int> order;
-    std::map<std::pair<int, int>, int> seen;
-    std::vector<int> smt_siblings;
-    const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
-    for (int cpu = 0; cpu < ncpu; ++cpu)
-    {
-        auto read_int = [&](const char* file) -> int {
-            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + file);
-            int v = -1;
-            f >> v;
-            return v;
-        };
-        const int core_id = read_int("topology/core_id");
-        const int pkg_id = read_int("topology/physical_package_id");
-        if (core_id < 0) { order.push_back(cpu); continue; }   // topology unreadable: fall back
-        auto key = std::make_pair(pkg_id, core_id);
-        if (seen.find(key) == seen.end()) { seen[key] = cpu; order.push_back(cpu); }
-        else smt_siblings.push_back(cpu);
-    }
-    order.insert(order.end(), smt_siblings.begin(), smt_siblings.end());
-    return order;
-}
-#else
-inline std::vector<int> physical_core_order()
-{
-    std::vector<int> order, smt_siblings;
-    DWORD len = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-    if (len == 0) return order;
-    std::vector<char> buf(len);
-    auto* first_rec = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data());
-    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, first_rec, &len)) return order;
-    size_t off = 0;
-    while (off < len)
-    {
-        auto* rec = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
-        if (rec->Relationship == RelationProcessorCore)
-        {
-            bool first = true;
-            for (WORD g = 0; g < rec->Processor.GroupCount; ++g)
-            {
-                const GROUP_AFFINITY& ga = rec->Processor.GroupMask[g];
-                for (int bit = 0; bit < 64; ++bit)
-                {
-                    if (ga.Mask & (KAFFINITY(1) << bit))
-                    {
-                        const int enc = (static_cast<int>(ga.Group) << 16) | bit;
-                        if (first) { order.push_back(enc); first = false; }
-                        else smt_siblings.push_back(enc);
-                    }
-                }
-            }
-        }
-        off += rec->Size;
-    }
-    order.insert(order.end(), smt_siblings.begin(), smt_siblings.end());
-    return order;
-}
-#endif
-
-inline bool pin_threads_enabled()
-{
-    static const bool v = [] {
-        const char* e = std::getenv("EXL3_MOE_CPU_PIN");
-        return !(e && *e == '0');
-    }();
-    return v;
-}
-
-// Each helper writes only its own completion line. The caller reads it at the barrier.
-struct alignas(64) PoolCompletion
-{
-    std::atomic<uint64_t> dispatch{0};
-};
-
-struct Pool
-{
-    int spawned = 0;
-    uint64_t generation = 0;
-    // Only the caller accesses the vector. Workers retain stable pointees when it grows.
-    std::vector<std::unique_ptr<PoolCompletion>> completions;
-    // Opt-in for dedicated serving cores: avoids sleep/wakeup latency between forwards,
-    // but keeps every helper busy even while the caller has no work.
-    const bool spin_wait = []() {
-        const char* e = std::getenv("EXL3_MOE_CPU_SPIN_WAIT");
-        return e && std::atoi(e) != 0;
-    }();
-    // One word per dispatch: generation in the high bits, participant count in the low 16. A
-    // worker reads both in a single load, so a worker that was preempted between observing a
-    // new generation and reading its participant count can never pair a stale generation with
-    // the next dispatch's count
-    alignas(64) std::atomic<uint64_t> dispatch{0};
-    alignas(64) std::atomic<PoolFn> fn{nullptr};
-    void* ctx = nullptr;
-    int num_workers = 1;
-    static constexpr int DISPATCH_NW_BITS = 16;
-    static int dispatch_nw(uint64_t d) { return (int) (d & ((1ull << DISPATCH_NW_BITS) - 1)); }
-    std::vector<int> core_order;
-
-    void pin_self(int idx)
-    {
-        if (core_order.empty()) return;
-        const int enc = core_order[idx % core_order.size()];
-#ifdef __linux__
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(enc, &set);
-        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-#else
-        GROUP_AFFINITY ga{};
-        ga.Group = static_cast<WORD>(enc >> 16);
-        ga.Mask = KAFFINITY(1) << (enc & 0xffff);
-        SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr);
-#endif
-    }
-
-    void worker_loop(int idx, PoolCompletion* completion)
-    {
-        pin_self(idx);
-        uint64_t seen = 0;
-        int idle = 0;
-        while (true) {
-            const uint64_t g = dispatch.load(std::memory_order_acquire);
-            if (g == seen)
-            {
-                // Matches the outer job-ring poll's threshold (moe_handoff.cu)
-                if (spin_wait || ++idle < 65536) { cpu_pause(); continue; }
-#ifdef __linux__
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-#else
-                // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
-                // (default 15.6 ms), and the run() barrier turns one late waker into everyone
-                // oversleeping the next phase dispatc
-                uint64_t cmp = seen;
-                WaitOnAddress(&dispatch, &cmp, sizeof(uint64_t), INFINITE);
-#endif
-                continue;
-            }
-            idle = 0;
-            seen = g;
-
-            // The participant count may sit below this worker's index (pool shrink, or a
-            // small-job dispatch cap): surplus workers must not run the function (their
-            // (idx, nw) pair indexes out of range) and must not ack, or run() returns before
-            // the participating workers have finished. The count travels in the dispatch word
-            // itself, so it always belongs to the generation just observed
-            const int nw = dispatch_nw(g);
-            if (idx < nw)
-            {
-                fn.load(std::memory_order_relaxed)(ctx, idx, nw);
-                completion->dispatch.store(g, std::memory_order_release);
-            }
-        }
-    }
-
-    void ensure(int n)
-    {
-        if (pin_threads_enabled() && core_order.empty()) core_order = physical_core_order();
-        while (spawned < n - 1)
-        {
-            auto completion = std::make_unique<PoolCompletion>();
-            PoolCompletion* state = completion.get();
-            completions.push_back(std::move(completion));
-            try
-            {
-                std::thread(&Pool::worker_loop, this, spawned + 1, state).detach();
-            }
-            catch (...)
-            {
-                completions.pop_back();
-                throw;
-            }
-            ++spawned;
-        }
-        num_workers = n;
-        pin_self(0);   // worker 0 is the calling thread itself, never goes through worker_loop
-    }
-
-    // Run fn on workers 0..n-1; returns when all are done (implicit barrier). n_req > 0
-    // caps the worker count for this run: small jobs (one or two experts) saturate RAM
-    // bandwidth on a fraction of the pool, and every surplus worker is another straggler
-    // candidate at the six per-phase barriers
-    void run(PoolFn f, void* c, int n_req = 0)
-    {
-        int n = num_workers;
-        if (n_req > 0 && n_req < n) n = n_req;
-        if (n <= 1) { f(c, 0, 1); return; }
-        ctx = c;
-        fn.store(f, std::memory_order_relaxed);
-        ++generation;
-        const uint64_t job = (generation << DISPATCH_NW_BITS) | (uint64_t) n;
-        dispatch.store(job, std::memory_order_release);
-#ifndef __linux__
-        WakeByAddressAll(&dispatch);
-#endif
-        f(c, 0, n);
-        // One writer per completion line: no shared locked increment, and no reset that
-        // could race a delayed worker. Acquiring every participant publishes all outputs.
-        for (int i = 0; i < n - 1; ++i)
-        {
-            const PoolCompletion* state = completions[i].get();
-            while (state->dispatch.load(std::memory_order_acquire) != job) cpu_pause();
-        }
-    }
-};
-
-Pool g_pool;
-std::mutex g_pool_mutex;
+// Worker cores set by sglang_exl3_cpu_experts_set_cores; copied into g_compute_cores at the first forward.
+std::mutex g_cores_mutex;
+std::vector<int> g_configured_cores;
 std::atomic<bool> g_compute_started{false};
 std::vector<int> g_compute_cores; // Immutable after release publication at first forward.
-
-// -------------------------------------------------------------------------------------------
-//   Pool self-test hook (tests/test_moe_cpu_pool_.py)
-// -------------------------------------------------------------------------------------------
-
-// Drives the pool with a participant count alternating between `small` and the full pool, with
-// `threads` workers (oversubscribe to force preemption inside the dispatch handshake). Every
-// dispatch must run each participant exactly once, no non-participant at all, and run() must not
-// return while a participant is still inside the function. Returns the number of anomalies.
-struct PoolStressCtx
-{
-    std::atomic<int>* runs;
-    std::atomic<int>* active;
-    int spin;
-};
-
-static void pool_stress_fn(void* c, int idx, int nw)
-{
-    auto* s = (PoolStressCtx*) c;
-    s->active->fetch_add(1, std::memory_order_acq_rel);
-    s->runs[idx].fetch_add(1, std::memory_order_acq_rel);
-    volatile uint64_t x = (uint64_t) idx;
-    for (int i = 0; i < s->spin * (1 + (idx % 7)); ++i)
-        x = x * 6364136223846793005ull + 1442695040888963407ull;
-    s->active->fetch_sub(1, std::memory_order_acq_rel);
-}
 
 
 // -------------------------------------------------------------------------------------------
@@ -2403,7 +2139,6 @@ struct ForwardCtx
     float* tout_d;       // chunks x m x H
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
 
-    int phase = 0;
 };
 
 // Compact scratch already guarantees the DSV4.1 shape, unswizzled 3-bit
@@ -2782,87 +2517,26 @@ void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
 
 
 
-void forward_phase(void* ctx,int worker,int n) { forward_phase_index(ctx,worker,n,static_cast<ForwardCtx*>(ctx)->phase); }
-
 } // namespace
 
-static const MoeCpuLayer* get_layer(int64_t handle);
+// -------------------------------------------------------------------------------------------
+//   Upstream link compatibility
+// -------------------------------------------------------------------------------------------
 
-namespace {
+// This file replaces upstream's cpu/moe_mul1.cpp inside the exllamav3 extension, whose
+// bindings.cpp and cpu/moe_handoff.cu still reference these symbols. sglang never calls them:
+// the staging copy belongs to upstream's handoff worker, and the pool they exercised was
+// replaced by the OpenMP forward. They exist only so the extension links, and fail if called.
 
-struct StageCtx
+void exl3_moe_cpu_stage_experts(int64_t, const uint32_t*, int, uint8_t*, int)
 {
-    const MoeCpuLayer* layer;
-    const uint32_t* ids;
-    int count;
-    uint8_t* dst;
-};
-
-inline size_t trellis_bytes(const MoeCpuMatrix& m)
-{
-    return static_cast<size_t>(m.k / 16) * (m.n / 16) * 16 * m.bits * 2;
+    TORCH_CHECK(false, "exl3_moe_cpu_stage_experts is not supported by the optimized CPU expert kernel");
 }
 
-// Staged bytes are copied verbatim, swizzled or not: the GPU restores the native tile order
-// after the DMA (moe_unswizzle_trellis), which is one read + one write at VRAM bandwidth instead
-// of tiles_k * groups scattered memcpys here. Un-swizzling on the stager thread measured as the
-// whole VBMI-vs-VNNI prefill gap on a fully streamed 119B model (~17% at 32K).
-inline void stage_copy_trellis(uint8_t* dst, const MoeCpuMatrix& m)
+int64_t exl3_moe_cpu_pool_stress(int, int, int, int)
 {
-    std::memcpy(dst, m.trellis, trellis_bytes(m));
-}
-
-void stage_phase(void* vctx, int worker, int num_workers)
-{
-    StageCtx& c = *static_cast<StageCtx*>(vctx);
-    const bool gated = !c.layer->gates.empty();
-    const int nmat = gated ? 3 : 2;
-    // Each (expert, matrix) is one unit; offsets accumulate expert-major in g, u, d order
-    const size_t gb = gated ? trellis_bytes(c.layer->gates[0]) : 0;
-    const size_t ub = trellis_bytes(c.layer->ups[0]);
-    const size_t db = trellis_bytes(c.layer->downs[0]);
-    const size_t per_expert = gb + ub + db;
-    for (int u = worker; u < c.count * nmat; u += num_workers)
-    {
-        const int e = c.ids[u / nmat];
-        const int mi = u % nmat;
-        size_t off = static_cast<size_t>(u / nmat) * per_expert;
-        const MoeCpuMatrix* m;
-        if (gated && mi == 0)      { m = &c.layer->gates[e]; }
-        else if (mi == (gated ? 1 : 0)) { m = &c.layer->ups[e]; off += gb; }
-        else                       { m = &c.layer->downs[e]; off += gb + ub; }
-        stage_copy_trellis(c.dst + off, *m);
-    }
-}
-
-} // namespace
-
-void exl3_moe_cpu_stage_experts
-(
-    int64_t handle,
-    const uint32_t* expert_ids,
-    int count,
-    uint8_t* dst,
-    int threads
-)
-{
-    // Runs on the worker's stager thread, concurrently with compute jobs on the pool: use
-    // scratch threads, never the shared pool. A few threads saturate memcpy DRAM bandwidth.
-    StageCtx ctx { get_layer(handle), expert_ids, count, dst };
-    const bool gated = !ctx.layer->gates.empty();
-    int units = count * (gated ? 3 : 2);
-    int nt = std::min(threads > 0 ? threads : 1, units);
-    if (nt <= 1)
-    {
-        stage_phase(&ctx, 0, 1);
-        return;
-    }
-    std::vector<std::thread> ts;
-    ts.reserve(nt);
-    for (int i = 0; i < nt; ++i)
-        ts.emplace_back(stage_phase, &ctx, i, nt);
-    for (auto& t : ts)
-        t.join();
+    TORCH_CHECK(false, "exl3_moe_cpu_pool_stress is not supported by the optimized CPU expert kernel");
+    return 0;
 }
 
 bool exl3_moe_cpu_has_avx2() { return g_isa != Isa::Scalar; }
@@ -2972,31 +2646,6 @@ static const MoeCpuLayer* get_layer(int64_t handle)
     std::lock_guard<std::mutex> lock(g_layers_mutex);
     TORCH_CHECK(handle >= 0 && handle < static_cast<int64_t>(g_layers.size()) && g_layers[handle], "invalid CPU MoE layer handle");
     return g_layers[handle];
-}
-
-// Exported pool self-test (helpers above live in the anonymous namespace of this TU)
-int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
-{
-    std::lock_guard<std::mutex> lock(g_pool_mutex);
-    g_pool.ensure(threads);
-    std::vector<std::atomic<int>> runs(threads);
-    std::atomic<int> active{0};
-    int64_t anomalies = 0;
-    for (int it = 0; it < iters; ++it)
-    {
-        const int n_req = (it & 1) ? small : 0;
-        const int n = (n_req > 0 && n_req < threads) ? n_req : threads;
-        for (auto& r : runs) r.store(0, std::memory_order_relaxed);
-        PoolStressCtx c{runs.data(), &active, spin};
-        g_pool.run(&pool_stress_fn, &c, n_req);
-        if (active.load(std::memory_order_acquire) != 0) ++anomalies;          // returned early
-        for (int i = 0; i < threads; ++i)
-        {
-            const int r = runs[i].load(std::memory_order_acquire);
-            if (i < n ? r != 1 : r != 0) ++anomalies;                           // double / missing / surplus run
-        }
-    }
-    return anomalies;
 }
 
 // exl3_moe_cpu_forward_raw, adding into out when `accumulate`: the sglang C ABI's forward. Other units of the
@@ -3129,9 +2778,9 @@ static void forward_raw(
 
     // Freeze the configured cores once. Steady-state forwards acquire no pool mutex.
     if (!g_compute_started.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(g_pool_mutex);
+        std::lock_guard<std::mutex> lock(g_cores_mutex);
         if (!g_compute_started.load(std::memory_order_relaxed)) {
-            g_compute_cores = g_pool.core_order;
+            g_compute_cores = g_configured_cores;
             g_compute_started.store(true, std::memory_order_release);
         }
     }
@@ -3237,7 +2886,7 @@ void exl3_moe_cpu_forward
 
 // CpuExpertForward: one token row x (fp16 [hidden]) through experts slots[0..k) of layer `handle`, weighted by
 // weights[0..k), into out (fp32 [hidden]): overwritten, or added to when `accumulate` is nonzero. The calling thread
-// is the pool's worker 0.
+// is worker 0.
 extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_forward(
     int64_t handle, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads,
     int32_t accumulate) noexcept
@@ -3257,7 +2906,7 @@ extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_fo
 }
 
 // Configure worker i on cores[i], with the calling thread as worker 0. Refuse
-// reconfiguration after the first compute or staging-pool startup.
+// reconfiguration after the first forward.
 extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_set_cores(const int32_t* cores, int32_t n)
     noexcept
 {
@@ -3267,9 +2916,9 @@ extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_se
         for(int j=0;j<i;++j)if(cores[i]==cores[j])return 2;
     }
     try {
-        std::lock_guard<std::mutex> lock(g_pool_mutex);
-        if (g_pool.spawned > 0 || g_compute_started.load(std::memory_order_relaxed)) return 1;
-        g_pool.core_order.assign(cores, cores + n);
+        std::lock_guard<std::mutex> lock(g_cores_mutex);
+        if (g_compute_started.load(std::memory_order_relaxed)) return 1;
+        g_configured_cores.assign(cores, cores + n);
         return 0;
     } catch (...) {
         return 1;
