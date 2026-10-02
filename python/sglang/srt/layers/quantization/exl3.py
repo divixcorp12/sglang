@@ -534,7 +534,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         else:
             assert_not_capturing("Exl3MoEMethod.apply")
-            if not self.streamed:
+            if not self.streamed and envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.get():
                 record_draft_routes(layer.layer_id, topk_ids)
             out = exl3_moe_loop(
                 dispatch_output.hidden_states,
