@@ -125,3 +125,9 @@ def test_time_stream_without_meta_info_omits_the_spec_fields():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def test_log_level_passes_through_for_an_eager_dspark_run():
+    base = dict(model="/m", mem_fraction_static=0.85, chunked_prefill_size=512, new_tokens=128, dspark="/draft")
+    assert trace_corpus.engine_kwargs(SimpleNamespace(**base, log_level="info"))["log_level"] == "info"
+    assert "log_level" not in trace_corpus.engine_kwargs(SimpleNamespace(**base, log_level=None))
