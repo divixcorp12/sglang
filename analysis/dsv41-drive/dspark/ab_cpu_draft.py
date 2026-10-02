@@ -1,0 +1,80 @@
+"""DSpark A/B (plan 2026-10-02-dsv41-dspark-cpu-draft, Task 7): the draft's experts resident in VRAM vs on the CPU.
+
+Eager (the EXL3 gate refuses speculation under a decode graph), one Engine per arm through trace_corpus.py, the same
+sessions. Run on divix01 from a worktree at the pushed branch, holding rowimg-disk.lock then cc-gpu.lock:
+  python analysis/dsv41-drive/dspark/ab_cpu_draft.py OUTDIR [ARM ...]
+ARM is resident, cpu or routes (resident plus the draft route probe).
+"""
+
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(REPO, "benchmarks", "dsv41_baseline"))
+import arm_env  # noqa: E402
+
+PYTHON = "/data/models/slang/.venv/bin/python"
+DRAFT = "/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-dspark-draft"
+SESSIONS = "/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl"
+# The 2026-09-24 DSpark launch's eager overrides, less the variables §32.7 retired.
+COMMON = {
+    "SGLANG_MOE_EXPERT_GRAPH_GATHER": "0",
+    "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "0",
+    "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "0",
+    "SGLANG_MOE_EXPERT_FUSED_PLAN": "0",
+    "SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING": "0",
+    "SGLANG_SM120_FLASHMLA_BACKEND": "triton",
+}
+ARMS = {
+    "resident": {"SGLANG_MOE_HOT_GPU_MB": "7168"},
+    "cpu": {
+        "SGLANG_MOE_HOT_GPU_MB": "14080",
+        "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": "1",
+        "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "18-29",
+        "EXL3_MOE_CPU_PIN": "0",
+    },
+    # The resident arm with the draft's topk ids logged to OUTDIR/routes.jsonl (draft_routes_report.py reads it).
+    "routes": {"SGLANG_MOE_HOT_GPU_MB": "7168"},
+}
+
+
+def run(arm: str, outdir: str, n: int, new_tokens: int) -> int:
+    overrides = {**COMMON, **ARMS[arm]}
+    if arm == "routes":
+        overrides["SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH"] = os.path.join(outdir, "routes.jsonl")
+    env = arm_env.arm_env(overrides)
+    env["PYTHONPATH"] = os.path.join(REPO, "python")
+    env.setdefault("OMP_NUM_THREADS", "16")
+    cmd = [
+        PYTHON, os.path.join(REPO, "scripts", "dsv41", "trace_corpus.py"),
+        "--model", arm_env.MODEL_PATH,
+        "--sessions", SESSIONS,
+        "--n", str(n),
+        "--prompt-tokens", "256",
+        "--new-tokens", str(new_tokens),
+        "--stop-at-eos",
+        "--dspark", DRAFT,
+        "--out", os.path.join(outdir, f"{arm}.json"),
+    ]
+    print(f"=== {arm}: {' '.join(cmd)}", flush=True)
+    with open(os.path.join(outdir, f"{arm}.log"), "w") as log:
+        return subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, cwd=REPO).returncode
+
+
+def main():
+    outdir = sys.argv[1]
+    arms = sys.argv[2:] or list(ARMS)
+    n = int(os.environ.get("AB_SESSIONS", "8"))
+    new_tokens = int(os.environ.get("AB_NEW_TOKENS", "128"))
+    os.makedirs(outdir, exist_ok=True)
+    for arm in arms:
+        rc = run(arm, outdir, n, new_tokens)
+        print(f"{arm}: rc={rc}", flush=True)
+        if rc:
+            sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()
