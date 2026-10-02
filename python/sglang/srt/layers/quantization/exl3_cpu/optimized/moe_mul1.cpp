@@ -2130,11 +2130,12 @@ struct Chunk
 //   MoE Layer registry
 // -------------------------------------------------------------------------------------------
 
-// A registered layer: make_layer's per-expert tables (table), or, from Task 5, the slab registration's view.
+// A registered layer: make_layer's per-expert tables, or the slab registration's view (table == nullptr).
 struct RegisteredLayer
 {
     LayerInfo info;
     std::unique_ptr<MoeCpuLayer> table;
+    StridedExperts<GenericShape> strided{};
 };
 
 std::vector<std::unique_ptr<RegisteredLayer>> g_layers;
@@ -2371,6 +2372,24 @@ void transform_owned_blocks(const MoeCpuMatrix& mat,float* out,int m,int t0,int 
 // and all middle blocks must be prepared before any down output band can run.
 #include "forward_plan.hpp"
 
+// Runs the call's plan. E reads the layer's experts under the generic plan; D reads the same experts under the
+// DSV4.1 plan's assumptions (for a strided layer, the compile-time-shaped view of the same slabs).
+template <class Experts, class Dsv41Experts>
+void run_plan(ForwardCtx& ctx, const Experts& E, const Dsv41Experts& D, ForwardArena& ar, int threads)
+{
+    if (g_isa == Isa::Bw && Dsv41Shape::accepts(ctx.info, E, ctx.chunks)) {
+        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, D, ar, threads);
+        return;
+    }
+    switch (g_isa) {
+        case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, threads); return;
+        case Isa::Avx2:   ForwardPlan<GenericShape, Isa::Avx2>::run(ctx, E, ar, threads); return;
+        case Isa::Bw:     ForwardPlan<GenericShape, Isa::Bw>::run(ctx, E, ar, threads); return;
+        case Isa::Vnni:   ForwardPlan<GenericShape, Isa::Vnni>::run(ctx, E, ar, threads); return;
+        case Isa::Vbmi:   ForwardPlan<GenericShape, Isa::Vbmi>::run(ctx, E, ar, threads); return;
+    }
+}
+
 
 
 // The forward's OpenMP team for tier I: pins worker i to the configured core i, runs the phases with a barrier after
@@ -2527,7 +2546,6 @@ static void forward_raw(
 {
     const RegisteredLayer& layer = get_layer(handle);
     const LayerInfo& info = layer.info;
-    const TableExperts E{layer.table.get()};
     const int m_total = rows;
     const int top_k = topk;
 
@@ -2577,16 +2595,12 @@ static void forward_raw(
     const int nc = static_cast<int>(ctx.chunks.size());
     if (!nc) { give_back(); return; }
 
-    if (g_isa == Isa::Bw && Dsv41Shape::accepts(info, E, ctx.chunks))
-        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, E, ar, threads);
-    else
-        switch (g_isa) {
-            case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, threads); break;
-            case Isa::Avx2:   ForwardPlan<GenericShape, Isa::Avx2>::run(ctx, E, ar, threads); break;
-            case Isa::Bw:     ForwardPlan<GenericShape, Isa::Bw>::run(ctx, E, ar, threads); break;
-            case Isa::Vnni:   ForwardPlan<GenericShape, Isa::Vnni>::run(ctx, E, ar, threads); break;
-            case Isa::Vbmi:   ForwardPlan<GenericShape, Isa::Vbmi>::run(ctx, E, ar, threads); break;
-        }
+    if (layer.table) {
+        const TableExperts t{layer.table.get()};
+        run_plan(ctx, t, t, ar, threads);
+    } else {
+        run_plan(ctx, layer.strided, layer.strided.as<Dsv41Shape>(), ar, threads);
+    }
     give_back();
 }
 
@@ -2684,6 +2698,36 @@ extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_se
         std::lock_guard<std::mutex> lock(g_cores_mutex);
         if (g_compute_started.load(std::memory_order_relaxed)) return 1;
         g_configured_cores.assign(cores, cores + n);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_register_slabs(
+    const void* const* slabs, int32_t capacity, int32_t hidden, int32_t intermediate, int32_t bits, int32_t swizzled,
+    float act_limit, int64_t* handle) noexcept
+{
+    if (!slabs || !handle || capacity < 1 || bits < 1 || bits > 8 || (swizzled != 0 && swizzled != 1)) return 2;
+    // make_matrix's limits: 128-element blocks, and k (hidden for gate/up, intermediate for down) <= 8192 for the
+    // int32 accumulators.
+    if (hidden < 128 || intermediate < 128 || hidden % 128 || intermediate % 128 || hidden > 8192 || intermediate > 8192)
+        return 2;
+    if (!std::isfinite(act_limit) || act_limit < 0.0f) return 2;
+    for (int i = 0; i < kSlabNames; ++i)
+        if (!slabs[i]) return 2;
+    try {
+        auto entry = std::make_unique<RegisteredLayer>();
+        entry->info = {capacity, hidden, intermediate, true, 0, act_limit};
+        for (int i = 0; i < kSlabNames; ++i)
+            entry->strided.base[i] = static_cast<const uint8_t*>(slabs[i]);
+        entry->strided.hidden = hidden;
+        entry->strided.intermediate = intermediate;
+        entry->strided.bits = bits;
+        entry->strided.swz = swizzled && bits != 8 ? 1 : 0;  // make_matrix's rule: K8 is never swizzled
+        std::lock_guard<std::mutex> lock(g_layers_mutex);
+        g_layers.push_back(std::move(entry));
+        *handle = static_cast<int64_t>(g_layers.size() - 1);
         return 0;
     } catch (...) {
         return 1;

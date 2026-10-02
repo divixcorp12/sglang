@@ -40,9 +40,11 @@ Standalone CPU library on divix01 (no CUDA compilation):
     --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ \
     --output /data/models/exl3_exp/clean_integration/sglang/libexl3_cpu.so
 
-Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP. Use
-moe_mul1.h for the ATen layer-registration API and cpu_experts_cabi.h for the
-service forward/core configuration API. Register and forward through the same
+Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP.
+Use moe_mul1.h for the ATen layer-registration API (exl3_moe_cpu_make_layer, one tensor per expert and projection)
+and cpu_experts_cabi.h for the service API: forward, core configuration, and
+sglang_exl3_cpu_experts_register_slabs, which registers a layer as the pinned tier's six slab base pointers (the
+kernel keeps no reference: the caller keeps the slabs alive until exl3_moe_cpu_free_layer). Register and forward through the same
 library instance: layer handles belong to that instance's registry. Packed
 matrix tensors must remain alive for the registered layer's lifetime.
 Configure distinct worker core IDs before the first forward or staging use.
