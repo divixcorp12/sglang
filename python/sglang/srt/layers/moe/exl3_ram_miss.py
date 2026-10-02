@@ -998,9 +998,19 @@ class Exl3RamMissService:
         if not self.copy_engine or self._copy_armed or self.device_side is None:
             return
         if self._copy_decodes >= COPY_ENGINE_ARM_DECODES:
+            if self.cpu_experts is not None:
+                self._calibrate_cpu_split()
             self.host.arm_copy_engine()
             self._copy_armed = True
             logger.info("exl3 RAM miss copy engine armed after %d decode forwards since capture", self._copy_decodes)
+
+    def _calibrate_cpu_split(self) -> None:
+        """Before arming, while the device types no CPU or copy-engine lane: the split from measured costs."""
+        self.before_host_use()
+        try:
+            self.cpu_experts.calibrate(torch.cuda.current_device())
+        finally:
+            self.after_host_use()
 
     def _copy_engine_module_load_guard(self, load):
         """Wraps a module loader (Triton's ``load_binary``, tvm-ffi's ``load_module``): once armed, the device drains

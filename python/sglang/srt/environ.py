@@ -1921,6 +1921,11 @@ class Envs:
     SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS = EnvFloat(0.02)
     # Batches between re-tunes of the split from the CPU's measured cost per expert; 0 keeps the startup table.
     SGLANG_DSV41_CPU_EXPERTS_RETUNE_BATCHES = EnvInt(0)
+    # Measure the split once when the copy engine arms (spec 2026-10-01-cpu-split-calibration): the CPU, the link and
+    # both together on the loaded model, then keep it. Off: the three costs above, and the retune.
+    SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION = EnvBool(True)
+    # Timed runs per calibration cell, after one discarded warm-up.
+    SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS = EnvInt(10)
     # CPU-computed NVMe misses: the CPU's split[n] tail counts every missing lane, not only RAM hits, and a miss on the
     # CPU is computed from its staging slot once its read lands (it still enters the RAM tier, never VRAM). Needs
     # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
