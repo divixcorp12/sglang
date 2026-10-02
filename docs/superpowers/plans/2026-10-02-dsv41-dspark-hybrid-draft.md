@@ -1655,3 +1655,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ## Results
 
 (Filled in by Tasks 6 and 7.)
+
+### Task 6: GPU parity (2026-10-02, divix01, `af2414b762`)
+
+`flock cc-gpu.lock taskset -c 18-29,32-63 python -m pytest test/manual/dsv41/test_dspark_hybrid_draft_gpu.py -q -s`
+→ 12 passed (137 s). rel_l2 against `exl3_moe_loop` (resident = experts of 8 kept on the GPU):
+
+| bits | pattern | resident 0 | resident 2 | resident 8 (CPU skipped) |
+|---|---|---|---|---|
+| 3 | independent | 0.0135 | 0.0124 | 0.0000 |
+| 3 | shared | 0.0129 | 0.0129 | 0.0000 |
+| 4 | independent | 0.0142 | 0.0119 | 0.0000 |
+| 4 | shared | 0.0117 | 0.0103 | 0.0000 |
+
+4-bit is the same order as 3-bit, so the kernel handles the draft's bitrate; the residual is the CPU kernel's
+activation quantization.
