@@ -222,6 +222,8 @@ inline float decode_mul1_scalar(uint16_t state)
 // AVX-512F/BW/VL without VNNI (Skylake-SP/X): the dword kernel with the AVX2-style accumulate.
 enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
 extern const Isa g_isa;
+// The forward is instantiated per tier; g_isa picks the instantiation once per call (forward_raw).
+template <Isa I> constexpr bool kAvx512 = I == Isa::Bw || I == Isa::Vnni || I == Isa::Vbmi;
 
 // -------------------------------------------------------------------------------------------
 //   Transforms
@@ -325,16 +327,18 @@ M1_TARGET_BW __attribute__((noipa,optimize("no-associative-math"))) void hadamar
     for (int i=0; i<8; ++i) _mm512_storeu_ps(v+16*i,r[i]);
 }
 
+template <Isa I>
 M1_TARGET_AVX2 void hadamard_128_avx2(float* v) {
-    if (g_isa == Isa::Bw || g_isa == Isa::Vnni || g_isa == Isa::Vbmi) hadamard_512(v);
+    if constexpr (kAvx512<I>) hadamard_512(v);
     else hadamard_128_current(v);
 }
 
 
+template <Isa I>
 inline void hadamard_128(float* v)
 {
-    if (g_isa != Isa::Scalar) hadamard_128_avx2(v);
-    else                      hadamard_128_scalar(v);
+    if constexpr (I != Isa::Scalar) hadamard_128_avx2<I>(v);
+    else                            hadamard_128_scalar(v);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -432,6 +436,7 @@ void quantize_act(PreparedIn& p, int r, int m, int k, const float* src, bool dup
     }
 }
 
+template <Isa I>
 M1_TARGET_AVX2
 void prepare_block_avx2(const void* srcv, bool f16, const at::Half* suh, float* dst, int k)
 {
@@ -451,7 +456,7 @@ void prepare_block_avx2(const void* srcv, bool f16, const at::Half* suh, float* 
                 reinterpret_cast<const uint16_t*>(suh) + block + i)));
             _mm256_storeu_ps(dst + block + i, _mm256_mul_ps(x, s));
         }
-        hadamard_128_avx2(dst + block);
+        hadamard_128_avx2<I>(dst + block);
 
         #pragma unroll
         for (int i = 0; i < 128; i += 8)
@@ -570,6 +575,7 @@ void compact_quantize_block(PreparedIn& p,int r,int m,int k,int block,const floa
 }
 
 // src_f16 / src_f32: one of them non-null; rows gathered by token index
+template <Isa I>
 void prepare_rows
 (
     const MoeCpuMatrix& mat,
@@ -583,8 +589,8 @@ void prepare_rows
         for(int r=0;r<m;++r)for(int b=0;b<k/128;++b) {
             const size_t off=size_t(token_idx[r])*src_stride+b*128;
             float* dst=p.tin+size_t(r)*k+b*128;
-            prepare_block_avx2(src_f16?static_cast<const void*>(src_f16+off):static_cast<const void*>(src_f32+off),
-                               src_f16!=nullptr,mat.suh+b*128,dst,128);
+            prepare_block_avx2<I>(src_f16?static_cast<const void*>(src_f16+off):static_cast<const void*>(src_f32+off),
+                                  src_f16!=nullptr,mat.suh+b*128,dst,128);
             compact_quantize_block(p,r,m,k,b,dst);
         }
         return;
@@ -593,11 +599,11 @@ void prepare_rows
     {
         float* dst = p.tin + static_cast<size_t>(r) * k;
         const size_t src_off = static_cast<size_t>(token_idx[r]) * src_stride;
-        if (g_isa != Isa::Scalar)
+        if constexpr (I != Isa::Scalar)
         {
-            prepare_block_avx2(src_f16 ? reinterpret_cast<const void*>(src_f16 + src_off)
-                                       : reinterpret_cast<const void*>(src_f32 + src_off),
-                               src_f16 != nullptr, mat.suh, dst, k);
+            prepare_block_avx2<I>(src_f16 ? reinterpret_cast<const void*>(src_f16 + src_off)
+                                          : reinterpret_cast<const void*>(src_f32 + src_off),
+                                  src_f16 != nullptr, mat.suh, dst, k);
         }
         else
         {
@@ -610,7 +616,7 @@ void prepare_rows
                                              : src_f32[src_off + block + i];
                     vals[i] = xv * half_to_float(mat.suh[block + i]);
                 }
-                hadamard_128(vals);
+                hadamard_128<I>(vals);
                 for (int i = 0; i < 128; ++i)
                     dst[block + i] = vals[i] * HAD_SCALE;
             }
@@ -619,17 +625,17 @@ void prepare_rows
         // int8 quantization, one scale per row
         int32_t* splat = p.splat32 + static_cast<size_t>(r) * k;
         // dup is only read by the AVX2/BW maddubs kernels; skip the stores on the VNNI/VBMI tiers
-        int32_t* splat_dup = (p.splat_dup && (g_isa == Isa::Avx2 || g_isa == Isa::Bw))
+        int32_t* splat_dup = (p.splat_dup && (I == Isa::Avx2 || I == Isa::Bw))
             ? p.splat_dup + static_cast<size_t>(r) * k : nullptr;
         float q;
         int32_t s;
-        if (g_isa != Isa::Scalar && (ACT_ROWS > 1 || act_blocked(k)))
+        if constexpr (I != Isa::Scalar)
         {
-            quantize_act(p, r, m, k, dst, splat_dup != nullptr);
-            continue;
-        }
-        if (g_isa != Isa::Scalar)
-        {
+            if (ACT_ROWS > 1 || act_blocked(k))
+            {
+                quantize_act(p, r, m, k, dst, splat_dup != nullptr);
+                continue;
+            }
             quantize_row_avx2(dst, splat, splat_dup, k, q, s);
         }
         else
@@ -1782,156 +1788,155 @@ Isa detect_isa()
 
 const Isa g_isa = []{ return detect_isa(); }();
 
+template <Isa I>
 void run_tiles_raw(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     if (tn0 >= tn1) return;
-    switch (g_isa) {
-        case Isa::Vbmi:
+    if constexpr (I == Isa::Vbmi)
+    {
+        switch (mat.bits * 4 + m - 1)
         {
-            switch (mat.bits * 4 + m - 1)
-            {
-                case 1 * 4 + 0: vbmi_tiles<1, 1>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 1: vbmi_tiles<1, 2>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 2: vbmi_tiles<1, 3>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 3: vbmi_tiles<1, 4>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 0: vbmi_tiles<2, 1>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 1: vbmi_tiles<2, 2>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 2: vbmi_tiles<2, 3>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 3: vbmi_tiles<2, 4>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 0: vbmi_tiles<3, 1>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 1: vbmi_tiles<3, 2>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 2: vbmi_tiles<3, 3>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 3: vbmi_tiles<3, 4>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 0: vbmi_tiles<4, 1>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 1: vbmi_tiles<4, 2>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 2: vbmi_tiles<4, 3>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 3: vbmi_tiles<4, 4>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 0: vbmi_tiles<5, 1>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 1: vbmi_tiles<5, 2>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 2: vbmi_tiles<5, 3>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 3: vbmi_tiles<5, 4>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 0: vbmi_tiles<6, 1>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 1: vbmi_tiles<6, 2>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 2: vbmi_tiles<6, 3>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 3: vbmi_tiles<6, 4>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 0: vbmi_tiles<7, 1>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 1: vbmi_tiles<7, 2>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 2: vbmi_tiles<7, 3>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 3: vbmi_tiles<7, 4>(mat, in, tout, tn0, tn1); return;
-                // K8: byte pairing impossible (shift % 8 == 0) and the byte windows straddle
-                // the register pairs -- measured slower than the dword scheme, so route there
-                case 8 * 4 + 0: vnni_tiles<8, 1>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 1: vnni_tiles<8, 2>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 2: vnni_tiles<8, 3>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 3: vnni_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
-            }
-            return;
+            case 1 * 4 + 0: vbmi_tiles<1, 1>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 1: vbmi_tiles<1, 2>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 2: vbmi_tiles<1, 3>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 3: vbmi_tiles<1, 4>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 0: vbmi_tiles<2, 1>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 1: vbmi_tiles<2, 2>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 2: vbmi_tiles<2, 3>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 3: vbmi_tiles<2, 4>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 0: vbmi_tiles<3, 1>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 1: vbmi_tiles<3, 2>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 2: vbmi_tiles<3, 3>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 3: vbmi_tiles<3, 4>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 0: vbmi_tiles<4, 1>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 1: vbmi_tiles<4, 2>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 2: vbmi_tiles<4, 3>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 3: vbmi_tiles<4, 4>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 0: vbmi_tiles<5, 1>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 1: vbmi_tiles<5, 2>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 2: vbmi_tiles<5, 3>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 3: vbmi_tiles<5, 4>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 0: vbmi_tiles<6, 1>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 1: vbmi_tiles<6, 2>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 2: vbmi_tiles<6, 3>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 3: vbmi_tiles<6, 4>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 0: vbmi_tiles<7, 1>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 1: vbmi_tiles<7, 2>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 2: vbmi_tiles<7, 3>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 3: vbmi_tiles<7, 4>(mat, in, tout, tn0, tn1); return;
+            // K8: byte pairing impossible (shift % 8 == 0) and the byte windows straddle
+            // the register pairs -- measured slower than the dword scheme, so route there
+            case 8 * 4 + 0: vnni_tiles<8, 1>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 1: vnni_tiles<8, 2>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 2: vnni_tiles<8, 3>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 3: vnni_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
         }
-        case Isa::Vnni:
+        return;
+    }
+    else if constexpr (I == Isa::Vnni)
+    {
+        switch (mat.bits * 4 + m - 1)
         {
-            switch (mat.bits * 4 + m - 1)
-            {
-                case 1 * 4 + 0: vnni_tiles<1, 1>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 1: vnni_tiles<1, 2>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 2: vnni_tiles<1, 3>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 3: vnni_tiles<1, 4>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 0: vnni_tiles<2, 1>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 1: vnni_tiles<2, 2>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 2: vnni_tiles<2, 3>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 3: vnni_tiles<2, 4>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 0: vnni_tiles<3, 1>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 1: vnni_tiles<3, 2>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 2: vnni_tiles<3, 3>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 3: vnni_tiles<3, 4>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 0: vnni_tiles<4, 1>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 1: vnni_tiles<4, 2>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 2: vnni_tiles<4, 3>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 3: vnni_tiles<4, 4>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 0: vnni_tiles<5, 1>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 1: vnni_tiles<5, 2>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 2: vnni_tiles<5, 3>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 3: vnni_tiles<5, 4>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 0: vnni_tiles<6, 1>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 1: vnni_tiles<6, 2>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 2: vnni_tiles<6, 3>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 3: vnni_tiles<6, 4>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 0: vnni_tiles<7, 1>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 1: vnni_tiles<7, 2>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 2: vnni_tiles<7, 3>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 3: vnni_tiles<7, 4>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 0: vnni_tiles<8, 1>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 1: vnni_tiles<8, 2>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 2: vnni_tiles<8, 3>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 3: vnni_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
-            }
-            return;
+            case 1 * 4 + 0: vnni_tiles<1, 1>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 1: vnni_tiles<1, 2>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 2: vnni_tiles<1, 3>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 3: vnni_tiles<1, 4>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 0: vnni_tiles<2, 1>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 1: vnni_tiles<2, 2>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 2: vnni_tiles<2, 3>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 3: vnni_tiles<2, 4>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 0: vnni_tiles<3, 1>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 1: vnni_tiles<3, 2>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 2: vnni_tiles<3, 3>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 3: vnni_tiles<3, 4>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 0: vnni_tiles<4, 1>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 1: vnni_tiles<4, 2>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 2: vnni_tiles<4, 3>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 3: vnni_tiles<4, 4>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 0: vnni_tiles<5, 1>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 1: vnni_tiles<5, 2>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 2: vnni_tiles<5, 3>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 3: vnni_tiles<5, 4>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 0: vnni_tiles<6, 1>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 1: vnni_tiles<6, 2>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 2: vnni_tiles<6, 3>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 3: vnni_tiles<6, 4>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 0: vnni_tiles<7, 1>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 1: vnni_tiles<7, 2>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 2: vnni_tiles<7, 3>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 3: vnni_tiles<7, 4>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 0: vnni_tiles<8, 1>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 1: vnni_tiles<8, 2>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 2: vnni_tiles<8, 3>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 3: vnni_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
         }
-        case Isa::Bw:
+        return;
+    }
+    else if constexpr (I == Isa::Bw)
+    {
+        switch (mat.bits * 4 + m - 1)
         {
-            switch (mat.bits * 4 + m - 1)
-            {
-                case 1 * 4 + 0: bw_tiles<1, 1>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 1: bw_tiles<1, 2>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 2: bw_tiles<1, 3>(mat, in, tout, tn0, tn1); return;
-                case 1 * 4 + 3: bw_tiles<1, 4>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 0: bw_tiles<2, 1>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 1: bw_tiles<2, 2>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 2: bw_tiles<2, 3>(mat, in, tout, tn0, tn1); return;
-                case 2 * 4 + 3: bw_tiles<2, 4>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 0: bw_tiles<3, 1>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 1: bw_tiles<3, 2>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 2: bw_tiles<3, 3>(mat, in, tout, tn0, tn1); return;
-                case 3 * 4 + 3: bw_tiles<3, 4>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 0: bw_tiles<4, 1>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 1: bw_tiles<4, 2>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 2: bw_tiles<4, 3>(mat, in, tout, tn0, tn1); return;
-                case 4 * 4 + 3: bw_tiles<4, 4>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 0: bw_tiles<5, 1>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 1: bw_tiles<5, 2>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 2: bw_tiles<5, 3>(mat, in, tout, tn0, tn1); return;
-                case 5 * 4 + 3: bw_tiles<5, 4>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 0: bw_tiles<6, 1>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 1: bw_tiles<6, 2>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 2: bw_tiles<6, 3>(mat, in, tout, tn0, tn1); return;
-                case 6 * 4 + 3: bw_tiles<6, 4>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 0: bw_tiles<7, 1>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 1: bw_tiles<7, 2>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 2: bw_tiles<7, 3>(mat, in, tout, tn0, tn1); return;
-                case 7 * 4 + 3: bw_tiles<7, 4>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 0: bw_tiles<8, 1>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 1: bw_tiles<8, 2>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 2: bw_tiles<8, 3>(mat, in, tout, tn0, tn1); return;
-                case 8 * 4 + 3: bw_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
-            }
-            return;
+            case 1 * 4 + 0: bw_tiles<1, 1>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 1: bw_tiles<1, 2>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 2: bw_tiles<1, 3>(mat, in, tout, tn0, tn1); return;
+            case 1 * 4 + 3: bw_tiles<1, 4>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 0: bw_tiles<2, 1>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 1: bw_tiles<2, 2>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 2: bw_tiles<2, 3>(mat, in, tout, tn0, tn1); return;
+            case 2 * 4 + 3: bw_tiles<2, 4>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 0: bw_tiles<3, 1>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 1: bw_tiles<3, 2>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 2: bw_tiles<3, 3>(mat, in, tout, tn0, tn1); return;
+            case 3 * 4 + 3: bw_tiles<3, 4>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 0: bw_tiles<4, 1>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 1: bw_tiles<4, 2>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 2: bw_tiles<4, 3>(mat, in, tout, tn0, tn1); return;
+            case 4 * 4 + 3: bw_tiles<4, 4>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 0: bw_tiles<5, 1>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 1: bw_tiles<5, 2>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 2: bw_tiles<5, 3>(mat, in, tout, tn0, tn1); return;
+            case 5 * 4 + 3: bw_tiles<5, 4>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 0: bw_tiles<6, 1>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 1: bw_tiles<6, 2>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 2: bw_tiles<6, 3>(mat, in, tout, tn0, tn1); return;
+            case 6 * 4 + 3: bw_tiles<6, 4>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 0: bw_tiles<7, 1>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 1: bw_tiles<7, 2>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 2: bw_tiles<7, 3>(mat, in, tout, tn0, tn1); return;
+            case 7 * 4 + 3: bw_tiles<7, 4>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 0: bw_tiles<8, 1>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 1: bw_tiles<8, 2>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 2: bw_tiles<8, 3>(mat, in, tout, tn0, tn1); return;
+            case 8 * 4 + 3: bw_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
         }
-        case Isa::Avx2:
+        return;
+    }
+    else if constexpr (I == Isa::Avx2)
+    {
+        switch (mat.bits)
         {
-            switch (mat.bits)
-            {
-                case 1: avx2_tiles<1>(mat, in, tout, m, tn0, tn1); return;
-                case 2: avx2_tiles<2>(mat, in, tout, m, tn0, tn1); return;
-                case 3: avx2_tiles<3>(mat, in, tout, m, tn0, tn1); return;
-                case 4: avx2_tiles<4>(mat, in, tout, m, tn0, tn1); return;
-                case 5: avx2_tiles<5>(mat, in, tout, m, tn0, tn1); return;
-                case 6: avx2_tiles<6>(mat, in, tout, m, tn0, tn1); return;
-                case 7: avx2_tiles<7>(mat, in, tout, m, tn0, tn1); return;
-                default: avx2_tiles<8>(mat, in, tout, m, tn0, tn1); return;
-            }
+            case 1: avx2_tiles<1>(mat, in, tout, m, tn0, tn1); return;
+            case 2: avx2_tiles<2>(mat, in, tout, m, tn0, tn1); return;
+            case 3: avx2_tiles<3>(mat, in, tout, m, tn0, tn1); return;
+            case 4: avx2_tiles<4>(mat, in, tout, m, tn0, tn1); return;
+            case 5: avx2_tiles<5>(mat, in, tout, m, tn0, tn1); return;
+            case 6: avx2_tiles<6>(mat, in, tout, m, tn0, tn1); return;
+            case 7: avx2_tiles<7>(mat, in, tout, m, tn0, tn1); return;
+            default: avx2_tiles<8>(mat, in, tout, m, tn0, tn1); return;
         }
-        case Isa::Scalar:
+    }
+    else
+    {
+        switch (mat.bits)
         {
-            switch (mat.bits)
-            {
-                case 1: scalar_tiles<1>(mat, in, tout, m, tn0, tn1); return;
-                case 2: scalar_tiles<2>(mat, in, tout, m, tn0, tn1); return;
-                case 3: scalar_tiles<3>(mat, in, tout, m, tn0, tn1); return;
-                case 4: scalar_tiles<4>(mat, in, tout, m, tn0, tn1); return;
-                case 5: scalar_tiles<5>(mat, in, tout, m, tn0, tn1); return;
-                case 6: scalar_tiles<6>(mat, in, tout, m, tn0, tn1); return;
-                case 7: scalar_tiles<7>(mat, in, tout, m, tn0, tn1); return;
-                default: scalar_tiles<8>(mat, in, tout, m, tn0, tn1); return;
-            }
+            case 1: scalar_tiles<1>(mat, in, tout, m, tn0, tn1); return;
+            case 2: scalar_tiles<2>(mat, in, tout, m, tn0, tn1); return;
+            case 3: scalar_tiles<3>(mat, in, tout, m, tn0, tn1); return;
+            case 4: scalar_tiles<4>(mat, in, tout, m, tn0, tn1); return;
+            case 5: scalar_tiles<5>(mat, in, tout, m, tn0, tn1); return;
+            case 6: scalar_tiles<6>(mat, in, tout, m, tn0, tn1); return;
+            case 7: scalar_tiles<7>(mat, in, tout, m, tn0, tn1); return;
+            default: scalar_tiles<8>(mat, in, tout, m, tn0, tn1); return;
         }
     }
 }
@@ -2033,18 +2038,21 @@ M1_TARGET_BW M1_ALWAYS_INLINE __m512i register_bytesum(__m512i state) {
 // m token rows through the quantized kernels under the accuracy options (quantize_act's layout): per
 // k-block sub-views summed in fp32, then each remainder row added onto its token row. Only this
 // worker's columns [tn0, tn1) are touched, so the sums need no synchronization.
+template <Isa I>
 void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     if (tn0 >= tn1) return;
-    if (g_isa == Isa::Bw && ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128
-        && m == 1 && mat.bits == 3 && act_blocked(mat.k))
+    if constexpr (I == Isa::Bw && ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128)
     {
-        register_tiles(mat,in,tout,tn0,tn1);
-        return;
+        if (m == 1 && mat.bits == 3 && act_blocked(mat.k))
+        {
+            register_tiles(mat,in,tout,tn0,tn1);
+            return;
+        }
     }
-    if (g_isa == Isa::Scalar || (ACT_ROWS == 1 && !act_blocked(mat.k)))
+    if (I == Isa::Scalar || (ACT_ROWS == 1 && !act_blocked(mat.k)))
     {
-        run_tiles_raw(mat, in, tout, m, tn0, tn1);
+        run_tiles_raw<I>(mat, in, tout, m, tn0, tn1);
         return;
     }
     const int rows = ACT_ROWS * m;
@@ -2052,7 +2060,7 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
     const int c0 = tn0 * 16, c1 = tn1 * 16;
     if (!act_blocked(mat.k))
     {
-        run_tiles_raw(mat, in, tout, rows, tn0, tn1);
+        run_tiles_raw<I>(mat, in, tout, rows, tn0, tn1);
     }
     else
     {
@@ -2079,7 +2087,7 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                 sub_in.sum_x8[i] = in.bsum[b * MAX_M + i];
             }
             float* dst = b ? part.data() : tout;
-            run_tiles_raw(sub, sub_in, dst, rows, tn0, tn1);
+            run_tiles_raw<I>(sub, sub_in, dst, rows, tn0, tn1);
             if (b)
                 for (int i = 0; i < rows; ++i)
                 {
@@ -2169,6 +2177,7 @@ struct ForwardArena
     }
 };
 
+template <Isa I>
 M1_TARGET_AVX2
 void transform_out_avx2(const MoeCpuMatrix& mat, float* tout, int m)
 {
@@ -2177,7 +2186,7 @@ void transform_out_avx2(const MoeCpuMatrix& mat, float* tout, int m)
         for (int block = 0; block < mat.n; block += 128)
         {
             float* v = tout + static_cast<size_t>(r) * mat.n + block;
-            hadamard_128_avx2(v);
+            hadamard_128_avx2<I>(v);
             for (int i = 0; i < 128; i += 8)
             {
                 const __m256 s = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(
@@ -2192,23 +2201,26 @@ void transform_out_avx2(const MoeCpuMatrix& mat, float* tout, int m)
         }
 }
 
+template <Isa I>
 __attribute__((noipa)) void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
 {
-    if (g_isa != Isa::Scalar) { transform_out_avx2(mat, tout, m); return; }
-
-    for (int r = 0; r < m; ++r)
-        for (int block = 0; block < mat.n; block += 128)
-        {
-            float* v = tout + static_cast<size_t>(r) * mat.n + block;
-            hadamard_128(v);
-            if (mat.bias)
-                for (int i = 0; i < 128; ++i)
-                    v[i] = v[i] * HAD_SCALE * half_to_float(mat.svh[block + i])
-                           + half_to_float(mat.bias[block + i]);
-            else
-                for (int i = 0; i < 128; ++i)
-                    v[i] *= HAD_SCALE * half_to_float(mat.svh[block + i]);
-        }
+    if constexpr (I != Isa::Scalar) { transform_out_avx2<I>(mat, tout, m); return; }
+    else
+    {
+        for (int r = 0; r < m; ++r)
+            for (int block = 0; block < mat.n; block += 128)
+            {
+                float* v = tout + static_cast<size_t>(r) * mat.n + block;
+                hadamard_128<I>(v);
+                if (mat.bias)
+                    for (int i = 0; i < 128; ++i)
+                        v[i] = v[i] * HAD_SCALE * half_to_float(mat.svh[block + i])
+                               + half_to_float(mat.bias[block + i]);
+                else
+                    for (int i = 0; i < 128; ++i)
+                        v[i] *= HAD_SCALE * half_to_float(mat.svh[block + i]);
+            }
+    }
 }
 
 
@@ -2240,24 +2252,24 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
 
 // Same scalar/vector operations and block scale ordering as the original phase 2.
 // Blocks are independent: only their own gate/up outputs and prepared input slices are written.
-template<bool Wide = false>
+template<Isa I, bool Wide = false>
 void middle_blocks(ForwardCtx& c,int worker,int num_workers) {
     const auto& L=*c.layer;
-    const int I=L.interm_size, nb=I/128, nc=int(c.chunks.size());
+    const int I_=L.interm_size, nb=I_/128, nc=int(c.chunks.size());
     const bool gated=!L.gates.empty();
     const int first=nc*nb*worker/num_workers,last=nc*nb*(worker+1)/num_workers;
     for (int task=first;task<last;++task) {
         const int j=task/nb,b=task%nb,block=b*128;
         const auto& ch=c.chunks[j];
         for (int r=0;r<ch.m;++r) {
-            float* g=c.tout_g+size_t(j)*MAX_M*I+size_t(r)*I+block;
-            float* u=c.tout_u+size_t(j)*MAX_M*I+size_t(r)*I+block;
+            float* g=c.tout_g+size_t(j)*MAX_M*I_+size_t(r)*I_+block;
+            float* u=c.tout_u+size_t(j)*MAX_M*I_+size_t(r)*I_+block;
             if (gated) {
                 auto mat=L.gates[ch.expert];mat.n=128;mat.svh+=block;if(mat.bias)mat.bias+=block;
-                transform_out(mat,g,1);
+                transform_out<I>(mat,g,1);
             }
             auto up=L.ups[ch.expert];up.n=128;up.svh+=block;if(up.bias)up.bias+=block;
-            transform_out(up,u,1);
+            transform_out<I>(up,u,1);
             const size_t count=128;
             float* a=gated?g:u;
             const float lim=L.act_limit!=0.0f?L.act_limit:std::numeric_limits<float>::infinity();
@@ -2297,10 +2309,10 @@ void middle_blocks(ForwardCtx& c,int worker,int num_workers) {
                 }
 
             auto& p=c.prep_d[j];
-            float* dst=p.tin+size_t(r)*I+block;
-            prepare_block_avx2(a,false,L.downs[ch.expert].suh+block,dst,128);
-            if(p.compact){compact_quantize_block<Wide>(p,r,ch.m,I,b,dst);continue;}
-            float* residual=p.tin+size_t(r+ch.m)*I+block;
+            float* dst=p.tin+size_t(r)*I_+block;
+            prepare_block_avx2<I>(a,false,L.downs[ch.expert].suh+block,dst,128);
+            if(p.compact){compact_quantize_block<Wide>(p,r,ch.m,I_,b,dst);continue;}
+            float* residual=p.tin+size_t(r+ch.m)*I_+block;
             for (int pass=0;pass<ACT_ROWS;++pass) {
                 const int row=r+pass*ch.m;
                 const size_t offset=size_t(b)*ACT_ROWS*ch.m*128+row*128;
@@ -2317,7 +2329,7 @@ void middle_blocks(ForwardCtx& c,int worker,int num_workers) {
 }
 
 
-template<bool Wide = false>
+template<Isa I, bool Wide = false>
 void prepare_gu_blocks(ForwardCtx& c,int worker,int num_workers) {
     const auto& L=*c.layer;
     const int K=L.hidden_size,nb=K/128,nc=int(c.chunks.size()),gu=L.gates.empty()?1:2;
@@ -2330,7 +2342,7 @@ void prepare_gu_blocks(ForwardCtx& c,int worker,int num_workers) {
         auto& p=(up?c.prep_u:c.prep_g)[j/gu];
         for(int r=0;r<ch.m;++r) {
             float* dst=p.tin+size_t(r)*K+b*128;
-            prepare_block_avx2(c.x+size_t(ch.token[r])*K+b*128,true,mat.suh+b*128,dst,128);
+            prepare_block_avx2<I>(c.x+size_t(ch.token[r])*K+b*128,true,mat.suh+b*128,dst,128);
             if(p.compact){compact_quantize_block<Wide>(p,r,ch.m,K,b,dst);continue;}
             float* residual=p.tin+size_t(r+ch.m)*K+b*128;
             for(int pass=0;pass<ACT_ROWS;++pass) {
@@ -2348,34 +2360,33 @@ void prepare_gu_blocks(ForwardCtx& c,int worker,int num_workers) {
 }
 
 
+template <Isa I>
 void transform_owned_blocks(const MoeCpuMatrix& mat,float* out,int m,int t0,int t1) {
     for(int r=0;r<m;++r) for(int block=t0*16;block<t1*16;block+=128) {
         auto sub=mat;sub.n=128;sub.svh+=block;if(sub.bias)sub.bias+=block;
-        transform_out(sub,out+size_t(r)*mat.n+block,1);
+        transform_out<I>(sub,out+size_t(r)*mat.n+block,1);
     }
 }
 
 // Coarse readiness is per expert: all gate/up outputs must exist before middle,
 // and all middle blocks must be prepared before any down output band can run.
-inline
-
-
+template <Isa I>
 void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
 {
     ForwardCtx& c = *static_cast<ForwardCtx*>(vctx);
     const MoeCpuLayer& L = *c.layer;
     const int nc = static_cast<int>(c.chunks.size());
     const int H = L.hidden_size;
-    const int I = L.interm_size;
+    const int I_ = L.interm_size;
 
-    if(phase==0 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(H) && g_isa==Isa::Bw) {
-        if (single_expert_quant512(c)) prepare_gu_blocks<true>(c,worker,num_workers);
-        else prepare_gu_blocks<false>(c,worker,num_workers);
+    if(phase==0 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(H) && I==Isa::Bw) {
+        if (single_expert_quant512(c)) prepare_gu_blocks<I, true>(c,worker,num_workers);
+        else prepare_gu_blocks<I, false>(c,worker,num_workers);
         return;
     }
-    if (phase==2 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(I) && g_isa!=Isa::Scalar) {
-        if (single_expert_quant512(c)) middle_blocks<true>(c,worker,num_workers);
-        else middle_blocks<false>(c,worker,num_workers);
+    if (phase==2 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(I_) && I!=Isa::Scalar) {
+        if (single_expert_quant512(c)) middle_blocks<I, true>(c,worker,num_workers);
+        else middle_blocks<I, false>(c,worker,num_workers);
         return;
     }
     switch (phase) {
@@ -2390,7 +2401,7 @@ void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
                 const bool up = gu == 1 || (j % gu);
                 const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
                 PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                prepare_rows(mat, c.x, nullptr, H, ch.token, ch.m, p);
+                prepare_rows<I>(mat, c.x, nullptr, H, ch.token, ch.m, p);
             }
             break;
         }
@@ -2399,14 +2410,14 @@ void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
         {
             // Gate + up GEMVs (see assign_gemvs)
             const int gu = L.gates.empty() ? 1 : 2;
-            assign_gemvs(worker, num_workers, nc * gu, I / 16, [&](int j, int t0, int t1)
+            assign_gemvs(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = gu == 1 || (j % gu);
                 const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I;
-                run_tiles(mat, p, tout, ch.m, t0, t1);
+                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
+                run_tiles<I>(mat, p, tout, ch.m, t0, t1);
             });
             break;
         }
@@ -2418,11 +2429,11 @@ void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
             const bool gated = !L.gates.empty();
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
-                float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I;
-                float* u = c.tout_u + static_cast<size_t>(j) * MAX_M * I;
-                if (gated) transform_out(L.gates[ch.expert], g, ch.m);
-                transform_out(L.ups[ch.expert], u, ch.m);
-                const size_t count = static_cast<size_t>(ch.m) * I;
+                float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I_;
+                float* u = c.tout_u + static_cast<size_t>(j) * MAX_M * I_;
+                if (gated) transform_out<I>(L.gates[ch.expert], g, ch.m);
+                transform_out<I>(L.ups[ch.expert], u, ch.m);
+                const size_t count = static_cast<size_t>(ch.m) * I_;
                 float* a = gated ? g : u;
                 // Nonzero act_limit clamps the up path symmetrically and the activated gate
                 // from above, BEFORE the multiply (matching the GPU act_mul kernels). DS4
@@ -2466,7 +2477,7 @@ void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
                         break;
                 }
                 static const int idx4[MAX_M] = {0, 1, 2, 3};
-                prepare_rows(L.downs[ch.expert], nullptr, a, I, idx4, ch.m, c.prep_d[j]);
+                prepare_rows<I>(L.downs[ch.expert], nullptr, a, I_, idx4, ch.m, c.prep_d[j]);
             }
             break;
         }
@@ -2478,8 +2489,8 @@ void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                run_tiles(L.downs[ch.expert], c.prep_d[j], tout, ch.m, t0, t1);
-                transform_owned_blocks(L.downs[ch.expert],tout,ch.m,t0,t1);
+                run_tiles<I>(L.downs[ch.expert], c.prep_d[j], tout, ch.m, t0, t1);
+                transform_owned_blocks<I>(L.downs[ch.expert],tout,ch.m,t0,t1);
             });
             break;
         }
@@ -2490,7 +2501,7 @@ void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
             // over hidden columns so overlapping token rows are race-free
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
-                transform_out(L.downs[ch.expert], c.tout_d + static_cast<size_t>(j) * MAX_M * H, ch.m);
+                transform_out<I>(L.downs[ch.expert], c.tout_d + static_cast<size_t>(j) * MAX_M * H, ch.m);
             }
             break;
         }
@@ -2516,6 +2527,71 @@ void forward_phase_index(void* vctx, int worker, int num_workers, int phase)
 }
 
 
+
+// The forward's OpenMP team for tier I: pins worker i to the configured core i, runs the phases with a barrier after
+// each, and checks the team. Phase 4 (the whole-row down transform) is folded into phase 3's owned blocks.
+template <Isa I>
+void run_team(ForwardCtx& ctx, int count, bool grouped)
+{
+    // Freeze the configured cores once. Steady-state forwards acquire no pool mutex.
+    if (!g_compute_started.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_cores_mutex);
+        if (!g_compute_started.load(std::memory_order_relaxed)) {
+            g_compute_cores = g_configured_cores;
+            g_compute_started.store(true, std::memory_order_release);
+        }
+    }
+    TORCH_CHECK(g_compute_cores.empty() || size_t(count)<=g_compute_cores.size(),
+                "CPU expert worker count exceeds configured cores");
+    const bool prof=g_prof_enabled.load(std::memory_order_relaxed);
+    double phase_us[6]{};
+    std::atomic<int> pin_error{0};
+    std::atomic<int> actual_workers{0};
+    #pragma omp parallel num_threads(count) shared(ctx,pin_error,actual_workers,phase_us)
+    {
+        const int worker=omp_get_thread_num(),n=omp_get_num_threads();
+        if(worker==0)actual_workers.store(n,std::memory_order_relaxed);
+        grouped_traversal=grouped;
+        if(!g_compute_cores.empty()) {
+            const int core=g_compute_cores[worker];
+            static thread_local int pinned_core=-1;
+            if(pinned_core!=core || sched_getcpu()!=core) {
+                cpu_set_t set;CPU_ZERO(&set);CPU_SET(core,&set);
+                if(pthread_setaffinity_np(pthread_self(),sizeof(set),&set))
+                    pin_error.store(1,std::memory_order_relaxed);
+                else pinned_core=core;
+            }
+        }
+        if(n==count) {
+            for(int phase=0;phase<6;++phase) {
+                if(phase==4)continue; // Complete down blocks already include their output transform.
+                const auto begin=prof?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+                forward_phase_index<I>(&ctx,worker,n,phase);
+                if(phase<5) {
+                    #pragma omp barrier
+                }
+                if(prof && worker==0)phase_us[phase]=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count();
+            }
+        }
+    }
+    TORCH_CHECK(!pin_error.load(),"cannot pin CPU expert worker to its configured core");
+    TORCH_CHECK(actual_workers.load()==count,"OpenMP returned fewer CPU expert workers than requested");
+    if(prof)printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",phase_us[0],phase_us[1],phase_us[2],phase_us[3],phase_us[4],phase_us[5]);
+}
+
+using TeamFn = void (*)(ForwardCtx&, int, bool);
+
+TeamFn team_for(Isa isa)
+{
+    switch (isa) {
+        case Isa::Scalar: return run_team<Isa::Scalar>;
+        case Isa::Avx2:   return run_team<Isa::Avx2>;
+        case Isa::Bw:     return run_team<Isa::Bw>;
+        case Isa::Vnni:   return run_team<Isa::Vnni>;
+        case Isa::Vbmi:   return run_team<Isa::Vbmi>;
+    }
+    return run_team<Isa::Scalar>;
+}
 
 } // namespace
 
@@ -2776,52 +2852,9 @@ static void forward_raw(
         }
     }
 
-    // Freeze the configured cores once. Steady-state forwards acquire no pool mutex.
-    if (!g_compute_started.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(g_cores_mutex);
-        if (!g_compute_started.load(std::memory_order_relaxed)) {
-            g_compute_cores = g_configured_cores;
-            g_compute_started.store(true, std::memory_order_release);
-        }
-    }
     const int count=threads>0?threads:1;
-    TORCH_CHECK(g_compute_cores.empty() || size_t(count)<=g_compute_cores.size(),
-                "CPU expert worker count exceeds configured cores");
     const bool grouped=compact_forward && nc==1;
-    const bool prof=g_prof_enabled.load(std::memory_order_relaxed);
-    double phase_us[6]{};
-    std::atomic<int> pin_error{0};
-    std::atomic<int> actual_workers{0};
-    #pragma omp parallel num_threads(count) shared(ctx,pin_error,actual_workers,phase_us)
-    {
-        const int worker=omp_get_thread_num(),n=omp_get_num_threads();
-        if(worker==0)actual_workers.store(n,std::memory_order_relaxed);
-        grouped_traversal=grouped;
-        if(!g_compute_cores.empty()) {
-            const int core=g_compute_cores[worker];
-            static thread_local int pinned_core=-1;
-            if(pinned_core!=core || sched_getcpu()!=core) {
-                cpu_set_t set;CPU_ZERO(&set);CPU_SET(core,&set);
-                if(pthread_setaffinity_np(pthread_self(),sizeof(set),&set))
-                    pin_error.store(1,std::memory_order_relaxed);
-                else pinned_core=core;
-            }
-        }
-        if(n==count) {
-            for(int phase=0;phase<6;++phase) {
-                if(phase==4)continue; // Complete down blocks already include their output transform.
-                const auto begin=prof?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-                forward_phase_index(&ctx,worker,n,phase);
-                if(phase<5) {
-                    #pragma omp barrier
-                }
-                if(prof && worker==0)phase_us[phase]=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count();
-            }
-        }
-    }
-    TORCH_CHECK(!pin_error.load(),"cannot pin CPU expert worker to its configured core");
-    TORCH_CHECK(actual_workers.load()==count,"OpenMP returned fewer CPU expert workers than requested");
-    if(prof)printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",phase_us[0],phase_us[1],phase_us[2],phase_us[3],phase_us[4],phase_us[5]);
+    team_for(g_isa)(ctx, count, grouped);
     give_back();
 }
 
