@@ -3,6 +3,7 @@
 import itertools
 import os
 import threading
+import weakref
 
 import pytest
 import torch
@@ -223,20 +224,17 @@ def test_close_frees_each_layer_once(affinity):
 
 class FakeExt:
     def __init__(self):
-        self.made = []
+        self.freed = []
 
-    def exl3_moe_cpu_make_layer(self, *args):
-        self.made.append(args)
-        return len(self.made) - 1
+    def exl3_moe_cpu_free_layer(self, handle):
+        self.freed.append(handle)
 
 
 def _exl3_slabs():
     i16, f16 = torch.int16, torch.float16
     n = CAP * 2 * (H // 16) * (INTER // 16) * 48
     return {
-        "w13_trellis": torch.arange(n, dtype=i16).view(
-            CAP, 2, H // 16, INTER // 16, 48
-        ),
+        "w13_trellis": torch.arange(n, dtype=i16).view(CAP, 2, H // 16, INTER // 16, 48),
         "w13_suh": torch.zeros(CAP, 2, H, dtype=f16),
         "w13_svh": torch.zeros(CAP, 2, INTER, dtype=f16),
         "w2_trellis": torch.zeros(CAP, INTER // 16, H // 16, 48, dtype=i16),
@@ -245,33 +243,75 @@ def _exl3_slabs():
     }
 
 
+class FakeRegisterSlabs:
+    """Stands in for the kernel's sglang_exl3_cpu_experts_register_slabs; records each call's values."""
+
+    def __init__(self, status=0):
+        self.status, self.calls = status, []
+
+    def __call__(self, bases, capacity, hidden, intermediate, bits, swizzled, act_limit, handle):
+        self.calls.append(([bases[i] for i in range(6)], capacity, hidden, intermediate, bits, swizzled, act_limit))
+        handle._obj.value = 40 + len(self.calls)
+        return self.status
+
+
+def _trait_with(monkeypatch, fake, **kw):
+    trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0, **kw)
+    monkeypatch.setattr(trait, "_native", lambda name: fake if name == "sglang_exl3_cpu_experts_register_slabs" else None)
+    return trait
+
+
 @pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
-def test_exl3_trait_registers_each_slot_as_the_right_slab_views(tier_layout):
-    """The CPU expert id is the host slot: gate and up are w13 parts 0 and 1 of that slot's row, in place. The pinned
-    tier's w2 slabs carry a one-part axis ([slot, 1, ...]); the kernel refuses a 4-D trellis or a 2-D sign vector,
-    which is what registering real tier slabs gave before that axis was dropped."""
-    ext, slabs = FakeExt(), _exl3_slabs()
+def test_exl3_trait_registers_the_six_slab_bases(monkeypatch, tier_layout):
+    """The CPU expert id is the host slot: the kernel addresses slot s at each slab's base plus s rows, gate and up as
+    w13 parts 0 and 1. The pinned tier's w2 slabs carry a one-part axis ([slot, 1, ...]), which changes no row."""
+    slabs = _exl3_slabs()
     if tier_layout:
         slabs = {n: (t.unsqueeze(1) if n.startswith("w2_") else t) for n, t in slabs.items()}
-    Exl3CpuQuantTrait(ext, act_limit=10.0).register_layer(slabs, CAP)
-    *lists, gb, ub, db, activation, limit, swizzled = ext.made[0]
-    assert (gb, ub, db, activation, limit, swizzled) == ([], [], [], 0, 10.0, 0)
-    want = [
-        lambda s: slabs["w13_trellis"][s, 0],
-        lambda s: slabs["w13_suh"][s, 0],
-        lambda s: slabs["w13_svh"][s, 0],
-        lambda s: slabs["w13_trellis"][s, 1],
-        lambda s: slabs["w13_suh"][s, 1],
-        lambda s: slabs["w13_svh"][s, 1],
-        lambda s: slabs["w2_trellis"][s],
-        lambda s: slabs["w2_suh"][s],
-        lambda s: slabs["w2_svh"][s],
-    ]
-    ranks = [3, 1, 1, 3, 1, 1, 3, 1, 1]
-    assert len(lists) == 9
-    for got, view, rank in zip(lists, want, ranks):
-        assert [t.data_ptr() for t in got] == [view(s).data_ptr() for s in range(CAP)]
-        assert all(t.is_contiguous() and t.dim() == rank for t in got)
+    fake = FakeRegisterSlabs()
+    trait = _trait_with(monkeypatch, fake, swizzled=True)
+    handle = trait.register_layer(slabs, CAP)
+    names = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
+    assert handle == 41
+    assert fake.calls == [([slabs[n].data_ptr() for n in names], CAP, H, INTER, 3, 1, 10.0)]
+
+
+def test_exl3_trait_keeps_the_slabs_alive_until_free(monkeypatch):
+    """The kernel keeps only pointers: the trait holds the tensors until the layer is freed."""
+    slabs = _exl3_slabs()
+    trait = _trait_with(monkeypatch, FakeRegisterSlabs())
+    handle = trait.register_layer(slabs, CAP)
+    probe = weakref.ref(slabs["w2_svh"])
+    del slabs
+    assert probe() is not None
+    trait.free_layer(handle)
+    assert trait.ext.freed == [handle]
+    assert probe() is None
+
+
+@pytest.mark.parametrize(
+    "name, bad",
+    [
+        ("w13_suh", lambda t: t.transpose(1, 2).contiguous().transpose(1, 2)),  # not contiguous
+        ("w2_svh", lambda t: t.float()),  # wrong dtype
+        ("w13_svh", lambda t: t[:, :, : INTER // 2]),  # wrong row size (and not contiguous)
+        ("w2_trellis", lambda t: t[: CAP - 1]),  # fewer rows than the capacity
+    ],
+    ids=["noncontiguous", "dtype", "row_size", "rows"],
+)
+def test_exl3_trait_refuses_slabs_the_kernel_would_misaddress(monkeypatch, name, bad):
+    slabs = _exl3_slabs()
+    slabs[name] = bad(slabs[name])
+    fake = FakeRegisterSlabs()
+    with pytest.raises(ValueError, match=name):
+        _trait_with(monkeypatch, fake).register_layer(slabs, CAP)
+    assert fake.calls == []
+
+
+def test_exl3_trait_reports_a_refused_registration(monkeypatch):
+    trait = _trait_with(monkeypatch, FakeRegisterSlabs(status=2))
+    with pytest.raises(RuntimeError, match="status 2"):
+        trait.register_layer(_exl3_slabs(), CAP)
 
 
 def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch):
