@@ -23,7 +23,7 @@ using namespace ::sglang::expert_stream::wire;
 // (analysis/dsv41-drive/LEASE_PROTOCOL.md).
 enum : uint8_t { kFree = 0, kReady = 2, kStaging = 3 };
 
-static_assert(kPieceTargets >= kLeaseLanes, "a row's pieces are published to at most one word per lane");
+static_assert(kPieceTargets >= Wire::kLanes, "a row's pieces are published to at most one word per lane");
 
 // Indices into the service's counter array. Only the is_core_counter subset is kept by ProdBuild; the rest are
 // metrics.
@@ -107,12 +107,12 @@ inline bool reached(uint32_t observed, uint32_t seq) {
 
 // Byte offset of the record for sequence `seq` in a ring of `records` records starting at `ring`.
 inline int64_t record_offset(int64_t ring, uint32_t records, uint32_t seq) {
-  return ring + static_cast<int64_t>((seq - 1u) % records) * kRecordBytes;
+  return ring + static_cast<int64_t>((seq - 1u) % records) * Wire::kRecordBytes;
 }
 
 // The bound on a request's distinct experts: its protect ids and its lanes' experts. Every per-request list of the
 // service is bounded by it, so none needs the heap.
-constexpr size_t kWanted = kMaxIds + kLeaseLanes;
+constexpr size_t kWanted = Wire::kLanes + Wire::kLanes;
 
 // One lane of a record: the device typed it from its slot map (ram_slot_map.type_lanes).
 struct Lane {
@@ -124,7 +124,7 @@ struct Lane {
 };
 
 inline bool is_miss(uint8_t kind) {
-  return kind == kKindMissGpu || kind == kKindMissCpu;
+  return kind == Wire::kKindMissGpu || kind == Wire::kKindMissCpu;
 }
 
 // One demand record, as the service thread reads it. Fixed-size, so reading one allocates nothing.
@@ -134,14 +134,14 @@ struct Request {
   int64_t row = 0;
   bool captured = false;
   uint64_t chain = 0;  // the row's map-chain number when a lane misses, else 0
-  FixedVec<int32_t, kMaxIds> protect;
-  FixedVec<Lane, kLeaseLanes> lanes;
+  FixedVec<int32_t, Wire::kLanes> protect;
+  FixedVec<Lane, Wire::kLanes> lanes;
   const uint8_t* hot_bitmap = nullptr;  // GPU hot mode: RamTier::hot_scratch_, valid until the next record read
   // True when a lane needs the service itself or is one the device waits for: anything but an SM hit. The device
   // waits on such a record, so it cannot lap the ring.
   bool host_work() const {
     for (const Lane& lane : lanes)
-      if (lane.kind != kKindHitSm) return true;
+      if (lane.kind != Wire::kKindHitSm) return true;
     return false;
   }
 };
@@ -149,7 +149,7 @@ struct Request {
 // The outcome of read_record: a whole record, a torn one, or one the device never writes.
 enum class RecordRead { kOk, kTorn, kMalformed };
 
-static_assert(kRecLaneWeight + sizeof(float) * kMaxIds == kRecordBytes, "read_record copies the whole record");
+static_assert(Wire::kRecLaneWeight + sizeof(float) * Wire::kLanes == Wire::kRecordBytes, "read_record copies the whole record");
 
 // Reads the record at `record` into `request` if its seq word is `expected`. Returns kTorn when the writer
 // overwrote it during the read, and kMalformed for a whole record whose counts or kinds are out of range.
@@ -160,47 +160,47 @@ static_assert(kRecLaneWeight + sizeof(float) * kMaxIds == kRecordBytes, "read_re
 // issue together, before anything depends on the counts, and nothing after the second seq load reads the shared
 // record.
 inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request* request) {
-  if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
-  alignas(64) uint8_t raw[kRecordBytes];
-  std::memcpy(raw, record, kRecordBytes);
+  if (load_acquire(record + Wire::kRecSeq) != expected) return RecordRead::kTorn;
+  alignas(64) uint8_t raw[Wire::kRecordBytes];
+  std::memcpy(raw, record, Wire::kRecordBytes);
   std::atomic_thread_fence(std::memory_order_acquire);
   asm volatile("" ::: "memory");  // the copy's plain loads must stay before the seq re-check
-  if (load_acquire(record + kRecSeq) != expected) return RecordRead::kTorn;
+  if (load_acquire(record + Wire::kRecSeq) != expected) return RecordRead::kTorn;
   uint16_t row;
   uint8_t counts, flags;
   uint64_t chain;
   uint32_t epoch, kinds;
-  int16_t protect_ids[kMaxIds], expert[kMaxIds], slot[kMaxIds], dst[kMaxIds];
-  float weight[kMaxIds];
-  std::memcpy(&row, raw + kRecRow, 2);
-  std::memcpy(&counts, raw + kRecCounts, 1);
-  std::memcpy(&flags, raw + kRecFlags, 1);
-  std::memcpy(&chain, raw + kRecChain, 8);
-  std::memcpy(&epoch, raw + kRecEpoch, 4);
-  std::memcpy(&kinds, raw + kRecKinds, 4);
-  std::memcpy(protect_ids, raw + kRecProtect, sizeof(protect_ids));
-  std::memcpy(expert, raw + kRecLaneExpert, sizeof(expert));
-  std::memcpy(slot, raw + kRecLaneSlot, sizeof(slot));
-  std::memcpy(dst, raw + kRecLaneDst, sizeof(dst));
-  std::memcpy(weight, raw + kRecLaneWeight, sizeof(weight));
+  int16_t protect_ids[Wire::kLanes], expert[Wire::kLanes], slot[Wire::kLanes], dst[Wire::kLanes];
+  float weight[Wire::kLanes];
+  std::memcpy(&row, raw + Wire::kRecRow, 2);
+  std::memcpy(&counts, raw + Wire::kRecCounts, 1);
+  std::memcpy(&flags, raw + Wire::kRecFlags, 1);
+  std::memcpy(&chain, raw + Wire::kRecChain, 8);
+  std::memcpy(&epoch, raw + Wire::kRecEpoch, 4);
+  std::memcpy(&kinds, raw + Wire::kRecKinds, 4);
+  std::memcpy(protect_ids, raw + Wire::kRecProtect, sizeof(protect_ids));
+  std::memcpy(expert, raw + Wire::kRecLaneExpert, sizeof(expert));
+  std::memcpy(slot, raw + Wire::kRecLaneSlot, sizeof(slot));
+  std::memcpy(dst, raw + Wire::kRecLaneDst, sizeof(dst));
+  std::memcpy(weight, raw + Wire::kRecLaneWeight, sizeof(weight));
   const int count = counts & 0xF;
   const int protect = counts >> 4;
-  if (count > kLeaseLanes || protect > kMaxIds) return RecordRead::kMalformed;
+  if (count > Wire::kLanes || protect > Wire::kLanes) return RecordRead::kMalformed;
   bool bad_kind = false;
-  for (int j = 0; j < kLeaseLanes; ++j) {
+  for (int j = 0; j < Wire::kLanes; ++j) {
     const uint32_t kind = (kinds >> (4 * j)) & 0xFu;
-    bad_kind |= j < count && (kind < kKindHitCopy || kind > kKindMissCpu);
+    bad_kind |= j < count && (kind < Wire::kKindHitCopy || kind > Wire::kKindMissCpu);
   }
   if (bad_kind) return RecordRead::kMalformed;
   request->seq = expected;
   request->gen = static_cast<uint64_t>(epoch) << 32 | expected;
   request->row = row;
-  request->captured = (flags & kRecFlagCaptured) != 0;
+  request->captured = (flags & Wire::kRecFlagCaptured) != 0;
   request->chain = chain;
-  for (int i = 0; i < kMaxIds; ++i)
+  for (int i = 0; i < Wire::kLanes; ++i)
     request->protect[i] = protect_ids[i];
   request->protect.resize(protect);
-  for (int j = 0; j < kLeaseLanes; ++j) {
+  for (int j = 0; j < Wire::kLanes; ++j) {
     request->lanes[j] = Lane{expert[j], slot[j], dst[j], weight[j], static_cast<uint8_t>((kinds >> (4 * j)) & 0xFu)};
   }
   request->lanes.resize(count);

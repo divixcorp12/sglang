@@ -3,7 +3,7 @@
 // A C++ port of ChainSim in python/sglang/test/dsv41_chain_sim.py. DeviceSim stands in for the post kernel, the
 // staging read (S) and the copy wait (CW) of the decode stream; it is not evidence about them. Lanes are typed as
 // python/sglang/srt/layers/moe/ram_slot_map.py `type_lanes` types them, with no copy table (hit_copy="sm": a hit the
-// CPU does not take is kKindHitSm) and CPU hits only (cpu_misses=false).
+// CPU does not take is Wire::kKindHitSm) and CPU hits only (cpu_misses=false).
 //
 //   SimRequest   one posted record's identity and lane typing
 //   DeviceSim    the post / sync_row / copy_wait / wait_pieces operations over a request page and lease block
@@ -20,7 +20,7 @@
 
 namespace fullstack {
 
-constexpr int kLanes = 8;  // wire::kLeaseLanes
+constexpr int kLanes = ::sglang::expert_stream::wire::Wire::kLanes;
 
 // CLOCK_MONOTONIC in ns: the host's now_ns() and its stage trace read the same clock, so timestamps are comparable.
 int64_t monotonic_ns();
@@ -33,7 +33,7 @@ struct SimRequest {
   int64_t row = 0;
   int count = 0;
   std::array<int32_t, kLanes> experts{};
-  std::array<int32_t, kLanes> kinds{};  // wire::kKind*
+  std::array<int32_t, kLanes> kinds{};  // Wire::kKind*
   std::array<int32_t, kLanes> slots{};  // a hit's RAM slot, a miss's staging slot
   uint64_t chain = 0;                   // the row's map-chain number when a lane misses, else 0
 };
@@ -75,7 +75,7 @@ class DeviceSim {
   // S: spins until lane `lane`'s PieceMask word reads piece_word(G) with all 8 piece bits. False at deadline_ns.
   bool wait_pieces(const SimRequest& request, int lane, int64_t deadline_ns) const;
 
-  // True when the request has a host lane: a kKindHitCopy, kKindHitCpu or kKindMissCpu lane.
+  // True when the request has a host lane: a Wire::kKindHitCopy, Wire::kKindHitCpu or Wire::kKindMissCpu lane.
   static bool needs_copy_wait(const SimRequest& request);
 
   int32_t ram_slot(int64_t row, int32_t expert) const;

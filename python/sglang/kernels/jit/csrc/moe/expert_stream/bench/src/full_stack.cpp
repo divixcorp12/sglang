@@ -148,7 +148,7 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
   c.service_cpu = p.service;
   c.copy_cpu = p.copy;
   c.wait_timeout_ns = int64_t{o.wait_timeout_ms} * 1'000'000;
-  for (int n = 0; n <= es::kLeaseLanes; ++n)
+  for (int n = 0; n <= es::Wire::kLanes; ++n)
     c.split[n] = n;
   if constexpr (BenchBuild::kMetrics) c.trace_capacity = 4096;
   return c;
@@ -268,7 +268,7 @@ class Bench {
     call.t1 = monotonic_ns();
     if (!done) throw std::runtime_error("the copy wait passed its deadline: " + describe(call.request));
     for (int j = 0; j < k; ++j) {
-      if (call.request.kinds[j] != static_cast<int32_t>(es::kKindHitCpu))
+      if (call.request.kinds[j] != static_cast<int32_t>(es::Wire::kKindHitCpu))
         throw std::runtime_error("lane " + std::to_string(j) + " was not typed HIT_CPU: " + describe(call.request));
     }
     return call;

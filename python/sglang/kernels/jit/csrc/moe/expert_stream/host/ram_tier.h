@@ -45,7 +45,7 @@ struct Tier {
   int64_t rows_demand = 0;
   // The row's staging slots (kStaging, never mapped), in the order the device assigns them to miss lanes, and the
   // map-chain number of the last delta published. 0: reserve_staging has not run, so the row serves no miss.
-  FixedVec<int32_t, kLeaseLanes> staging;
+  FixedVec<int32_t, Wire::kLanes> staging;
   uint64_t chain = 0;
 };
 
@@ -105,8 +105,8 @@ class RamTier {
         experts_(tables.experts),
         reader_(std::move(tables), direct),
         tiers_(static_cast<size_t>(layers_)) {
-    hot_stride_ = ((kHotHeaderBytes + (experts_ + 7) / 8 + kHotAlignment - 1) / kHotAlignment) * kHotAlignment;
-    if (hot_page_ != nullptr && hot_bytes != kHotRecords * hot_stride_)
+    hot_stride_ = ((Wire::kHotHeaderBytes + (experts_ + 7) / 8 + Wire::kHotAlignment - 1) / Wire::kHotAlignment) * Wire::kHotAlignment;
+    if (hot_page_ != nullptr && hot_bytes != Wire::kHotRecords * hot_stride_)
       throw std::runtime_error(error_prefix<Layout>() + "hot bitmap sidecar size disagrees with expert count");
     for (int64_t row = 0; row < layers_; ++row) {
       Tier& tier = tiers_[row];
@@ -144,7 +144,7 @@ class RamTier {
   // Opens the reader and positions the demand cursor after the ring's current head. False if the reader cannot open.
   bool open() {
     if (!reader_.open()) return false;
-    next_demand_ = skip_zero(load_acquire(page_ + kDemandHead) + 1u);
+    next_demand_ = skip_zero(load_acquire(page_ + Wire::kDemandHead) + 1u);
     return true;
   }
 
@@ -202,18 +202,18 @@ class RamTier {
   // Serves the next posted demand record, if any, and returns whether it handled one. One caller at a time: the service
   // thread, or a test's pump().
   bool pump_demand() {
-    const uint32_t head = load_acquire(page_ + kDemandHead);
+    const uint32_t head = load_acquire(page_ + Wire::kDemandHead);
     const bool posted = head != 0 && reached(head, next_demand_);
     if (admission_closed_.load()) return false;
     if (!posted) return false;
     begin_stage(kStageDemand, next_demand_, head - next_demand_);
-    if (head - next_demand_ >= kDemandRecords) {
+    if (head - next_demand_ >= Wire::kDemandRecords) {
       // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq. Only records nothing
       // waits for lap, since the device posts a record with host work only after the previous one's chain ended.
-      count<kOverruns>(head - next_demand_ - (kDemandRecords - 2));
-      next_demand_ = skip_zero(head - kDemandRecords + 2u);
+      count<kOverruns>(head - next_demand_ - (Wire::kDemandRecords - 2));
+      next_demand_ = skip_zero(head - Wire::kDemandRecords + 2u);
     }
-    uint8_t* record = page_ + record_offset(kDemandRing, kDemandRecords, next_demand_);
+    uint8_t* record = page_ + record_offset(Wire::kDemandRing, Wire::kDemandRecords, next_demand_);
     prefetch_request(record, next_demand_);
     Request request;
     // A torn record was overwritten by a later post, so nothing waits on it: skip and count it.
@@ -230,7 +230,7 @@ class RamTier {
       bool skip = false;
       if (hot_page_ != nullptr && !request.lanes.empty()) {
         if (request.row >= 0 && request.row < layers_ && read_gpu_hot(next_demand_, &request) &&
-            load_acquire(record + kRecSeq) == next_demand_) {
+            load_acquire(record + Wire::kRecSeq) == next_demand_) {
           apply_gpu_hot(request);
         } else if (request.host_work()) {
           fail_stop(error_prefix<Layout>() + "request " + std::to_string(next_demand_) + ": no hot set for it");
@@ -476,10 +476,10 @@ class RamTier {
   // request->hot_bitmap at it until the next call. Returns false for a missing, overwritten, or malformed record.
   bool read_gpu_hot(uint32_t expected, Request* request) {
     if (hot_page_ == nullptr) return false;
-    const uint8_t* record = hot_page_ + static_cast<int64_t>((expected - 1u) % kHotRecords) * hot_stride_;
+    const uint8_t* record = hot_page_ + static_cast<int64_t>((expected - 1u) % Wire::kHotRecords) * hot_stride_;
     if (load_acquire(record) != expected) return false;
     const size_t bytes = hot_scratch_.size();
-    std::memcpy(hot_scratch_.data(), record + kHotHeaderBytes, bytes);
+    std::memcpy(hot_scratch_.data(), record + Wire::kHotHeaderBytes, bytes);
     std::atomic_thread_fence(std::memory_order_acquire);
     asm volatile("" ::: "memory");  // the copy's plain loads must stay before the seq re-check
     if (load_acquire(record) != expected) return false;
@@ -493,11 +493,11 @@ class RamTier {
   // device has just written each, so each is an L3 miss; issued together they overlap instead of queueing behind
   // read_record's branches. Called once the head shows the post, since a line prefetched earlier would be refetched.
   void prefetch_request(const uint8_t* record, uint32_t seq) const {
-    static_assert(kRecordBytes == 128, "a record is two lines");
+    static_assert(Wire::kRecordBytes == 128, "a record is two lines");
     _mm_prefetch(reinterpret_cast<const char*>(record), _MM_HINT_T0);
     _mm_prefetch(reinterpret_cast<const char*>(record + 64), _MM_HINT_T0);
     if (hot_page_ == nullptr) return;
-    const uint8_t* hot = hot_page_ + static_cast<int64_t>((seq - 1u) % kHotRecords) * hot_stride_;
+    const uint8_t* hot = hot_page_ + static_cast<int64_t>((seq - 1u) % Wire::kHotRecords) * hot_stride_;
     for (int64_t line = 0; line < hot_stride_; line += 64)
       _mm_prefetch(reinterpret_cast<const char*>(hot + line), _MM_HINT_T0);
   }
@@ -546,12 +546,12 @@ class RamTier {
 
   // The gate word for record `seq`: its sequence number in the high bits, the closed/open state in the low bits.
   static uint32_t gate_word(uint32_t seq, uint32_t low) {
-    return ((seq & kLeaseGateSeqMask) << kLeaseGateSeqShift) | low;
+    return ((seq & Wire::kLeaseGateSeqMask) << Wire::kLeaseGateSeqShift) | low;
   }
 
   // The watchdog's view: the gate word, whose closed bit is set while a copy wait holds the decode stream.
   uint32_t copy_gate() const {
-    return load_acquire(lease_ + kLeaseCopyGate);
+    return load_acquire(lease_ + Wire::kLeaseCopyGate);
   }
 
   int64_t copy_wait_timeout_ns() const {
@@ -592,19 +592,19 @@ class RamTier {
     copy_engine_->set_table(row, std::move(table), dst_rows);
   }
 
-  // Arms or disarms the copy engine. The device reads kCopyArmed at every post and types copy-engine and CPU lanes only
+  // Arms or disarms the copy engine. The device reads Wire::kCopyArmed at every post and types copy-engine and CPU lanes only
   // while it is 1.
   void arm_copy_engine(bool on) {
     if (on && copy_engine_ == nullptr)
       throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
     copy_armed_.store(on, std::memory_order_release);
-    store_release(lease_ + kCopyArmed, on ? 1u : 0u);
+    store_release(lease_ + Wire::kCopyArmed, on ? 1u : 0u);
   }
 
   // ---- CPU experts ----
 
   // Creates the CPU expert engine. The device types a captured post's CPU lanes as the last split[n] of its n eligible
-  // lanes (kSplit, written here and by set_cpu_split). The service hands them to the CPU expert thread and the copy
+  // lanes (Wire::kSplit, written here and by set_cpu_split). The service hands them to the CPU expert thread and the copy
   // thread waits for them, so CopyDone covers them. Needs the copy engine; call before the service thread starts.
   void enable_cpu_experts(CpuExpertConfig config, std::vector<int64_t> split) {
     if (threaded_.load())
@@ -759,9 +759,9 @@ class RamTier {
   void reserve_staging(int64_t k) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("reserve_staging");
-    if (k < 1 || k > kLeaseLanes)
+    if (k < 1 || k > Wire::kLanes)
       throw std::runtime_error(
-          error_prefix<Layout>() + "a row has 1.." + std::to_string(kLeaseLanes) + " staging slots");
+          error_prefix<Layout>() + "a row has 1.." + std::to_string(Wire::kLanes) + " staging slots");
     for (int64_t row = 0; row < layers_; ++row) {
       const Tier& tier = tiers_[row];
       if (tier.chain != 0) throw std::runtime_error(error_prefix<Layout>() + "reserve_staging is once");
@@ -955,13 +955,13 @@ class RamTier {
   // as soon as the work did, and opens the gate if the copy wait closed it.
   void copy_completed(const CopyJob& job) {
     const uint32_t seq = static_cast<uint32_t>(job.gen);
-    store_release64(lease_ + kLeaseCopyDone + job.idx * kLeaseCopyDoneBytes, job.gen);
+    store_release64(lease_ + Wire::kLeaseCopyDone + job.idx * Wire::kLeaseCopyDoneBytes, job.gen);
     // Dekker with the copy wait kernel (row_copy_kernels.cuh: gate close, fence.sc.sys, CopyDone load): CopyDone is
     // stored before the gate load, so if the kernel missed this store it closed the gate before this load, which then
     // sees closed(G) and opens it.
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const uint32_t closed = gate_word(seq, kLeaseGateClosed);
-    if (copy_gate() == closed) cas_gate(closed, gate_word(seq, kLeaseGateOpen));
+    const uint32_t closed = gate_word(seq, Wire::kLeaseGateClosed);
+    if (copy_gate() == closed) cas_gate(closed, gate_word(seq, Wire::kLeaseGateOpen));
   }
 
   // Copy thread, or the submitter when the copy engine's job ring is full. Completion cannot be established and the
@@ -976,7 +976,7 @@ class RamTier {
   // device's posted stores to it.
   void cas_gate(uint32_t expected, uint32_t desired) {
     __atomic_compare_exchange_n(
-        reinterpret_cast<uint32_t*>(lease_ + kLeaseCopyGate),
+        reinterpret_cast<uint32_t*>(lease_ + Wire::kLeaseCopyGate),
         &expected,
         desired,
         false,
@@ -1079,13 +1079,13 @@ class RamTier {
   // The size of the lease block: the completion block, then one delta record per row
   // (expert_lease_block.lease_block_bytes).
   static int64_t lease_block_bytes(int64_t rows) {
-    return kLeaseBlockBytes + round_up_page(rows * kDeltaStride);
+    return Wire::kLeaseBlockBytes + round_up_page(rows * Wire::kDeltaStride);
   }
 
   // Validates the lease block and opens its gate. Runs before the service thread or any device exists, so plain stores
   // and one fence suffice.
   void init_lease_block(int64_t lease_bytes) {
-    if (lease_ == nullptr || reinterpret_cast<uintptr_t>(lease_) % kLeaseBlockAlign != 0) {
+    if (lease_ == nullptr || reinterpret_cast<uintptr_t>(lease_) % Wire::kLeaseBlockAlign != 0) {
       throw std::runtime_error(error_prefix<Layout>() + "the lease block must be a 4096-byte aligned block");
     }
     if (lease_bytes != lease_block_bytes(layers_)) {
@@ -1094,8 +1094,8 @@ class RamTier {
           std::to_string(lease_block_bytes(layers_)) + " for " + std::to_string(layers_) + " rows");
     }
     // Open with nothing armed: a copy wait that closes nothing passes its stream wait on this value (0 would block).
-    const uint32_t open = gate_word(0, kLeaseGateOpen);
-    std::memcpy(lease_ + kLeaseCopyGate, &open, 4);
+    const uint32_t open = gate_word(0, Wire::kLeaseGateOpen);
+    std::memcpy(lease_ + Wire::kLeaseCopyGate, &open, 4);
     _mm_sfence();
   }
 
@@ -1192,35 +1192,35 @@ class RamTier {
   void publish_delta_locked(
       int64_t row,
       uint64_t tag,
-      const FixedVec<int32_t, kLeaseLanes>& staging,
+      const FixedVec<int32_t, Wire::kLanes>& staging,
       const int32_t (*entries)[2],
       int count) {
-    uint8_t* d = lease_ + kDeltaBase + row * kDeltaStride;
+    uint8_t* d = lease_ + Wire::kDeltaBase + row * Wire::kDeltaStride;
     const uint32_t n = static_cast<uint32_t>(count);
-    std::memcpy(d + kDeltaCount, &n, 4);
-    for (int k = 0; k < kLeaseLanes; ++k) {
+    std::memcpy(d + Wire::kDeltaCount, &n, 4);
+    for (int k = 0; k < Wire::kLanes; ++k) {
       const int16_t slot = static_cast<int16_t>(k < static_cast<int>(staging.size()) ? staging[k] : -1);
-      std::memcpy(d + kDeltaStaging + 2 * k, &slot, 2);
+      std::memcpy(d + Wire::kDeltaStaging + 2 * k, &slot, 2);
     }
     for (int i = 0; i < count; ++i) {
       const int16_t entry[2] = {static_cast<int16_t>(entries[i][0]), static_cast<int16_t>(entries[i][1])};
-      std::memcpy(d + kDeltaEntries + 4 * i, entry, 4);
+      std::memcpy(d + Wire::kDeltaEntries + 4 * i, entry, 4);
     }
     _mm_sfence();
-    store_release64(d + kDeltaTag, tag);
+    store_release64(d + Wire::kDeltaTag, tag);
   }
 
-  // Validates the split table (one entry per n = 0..kLeaseLanes, 0 <= split[n] <= n) and publishes it to the device
+  // Validates the split table (one entry per n = 0..Wire::kLanes, 0 <= split[n] <= n) and publishes it to the device
   // with relaxed stores; the device reads each entry once per post.
   void store_split(const int64_t* split, int64_t count) {
-    if (count != static_cast<int64_t>(kLeaseLanes) + 1)
-      throw std::runtime_error(error_prefix<Layout>() + "the CPU split table has one entry per n = 0..kLeaseLanes");
+    if (count != static_cast<int64_t>(Wire::kLanes) + 1)
+      throw std::runtime_error(error_prefix<Layout>() + "the CPU split table has one entry per n = 0..Wire::kLanes");
     for (int64_t n = 0; n < count; ++n)
       if (split[n] < 0 || split[n] > n)
         throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
     for (int64_t n = 0; n < count; ++n)
       __atomic_store_n(
-          reinterpret_cast<int32_t*>(lease_ + kSplit) + n, static_cast<int32_t>(split[n]), __ATOMIC_RELAXED);
+          reinterpret_cast<int32_t*>(lease_ + Wire::kSplit) + n, static_cast<int32_t>(split[n]), __ATOMIC_RELAXED);
   }
 
   // Ends the slot's prefill ownership: decode used it, or it is gone.
@@ -1372,9 +1372,9 @@ class RamTier {
     int64_t idx = 0;  // the record's index in the demand ring
     CopyJob job;
     FixedVec<int32_t, kWanted> wanted;
-    FixedVec<int32_t, kLeaseLanes> missing;
-    FixedVec<int64_t, kLeaseLanes> slots;
-    FixedVec<int32_t, kLeaseLanes> miss_lane;  // the lane index of each read row
+    FixedVec<int32_t, Wire::kLanes> missing;
+    FixedVec<int64_t, Wire::kLanes> slots;
+    FixedVec<int32_t, Wire::kLanes> miss_lane;  // the lane index of each read row
   };
 
   // The record's CPU-miss jobs still to submit, advanced as rows land.
@@ -1399,7 +1399,7 @@ class RamTier {
       if (!listed(plan->wanted, expert)) plan->wanted.push_back(expert);
       stamp_routed_locked(tier, expert);
     }
-    FixedVec<int32_t, kLeaseLanes> lane_experts;
+    FixedVec<int32_t, Wire::kLanes> lane_experts;
     for (const Lane& lane : request.lanes) {
       if (lane.expert < 0 || lane.expert >= experts_) fail_record(request, "an expert is out of range");
       if (listed(lane_experts, lane.expert)) fail_record(request, "a lane names an expert twice");
@@ -1427,7 +1427,7 @@ class RamTier {
         if (!listed(tier.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
         if (listed(plan->slots, static_cast<int64_t>(lane.slot))) fail(" shares its staging slot with another miss");
         if (tier.expert_slot[lane.expert] >= 0) fail(" misses an expert the tier holds");
-        if (lane.kind == kKindMissCpu) {
+        if (lane.kind == Wire::kKindMissCpu) {
           if (!cpu_row || cpu_->parts() < 2) fail(": a CPU miss on a row without CPU experts' miss part");
           ++job.late_cpu;
         }
@@ -1442,14 +1442,14 @@ class RamTier {
       }
       tier.stamp[lane.slot] = ++tick_;
       disown_locked(tier, lane.slot);
-      if (lane.kind == kKindHitCopy) {
+      if (lane.kind == Wire::kKindHitCopy) {
         if (!host_lanes || !copy_engine_->eligible(request.row, lane.dst))
           fail(": a copy-engine lane on an ineligible row");
-      } else if (lane.kind == kKindHitCpu) {
+      } else if (lane.kind == Wire::kKindHitCpu) {
         if (!cpu_row) fail(": a CPU lane on a row without CPU experts");
         job.cpu_mask |= 1u << j;
       } else {
-        continue;  // kKindHitSm: the device's SM kernel copies it, the host has nothing to do
+        continue;  // Wire::kKindHitSm: the device's SM kernel copies it, the host has nothing to do
       }
       job.lanes[job.count++] = CopyLane{static_cast<int32_t>(j), lane.slot, lane.dst, lane.weight};
       job.mask |= 1u << j;
@@ -1516,9 +1516,9 @@ class RamTier {
   // miss lands in its staging slot whatever happens here; whether it is cached is the victim's question. inserted[i] is
   // set when miss i took a victim and is cached once read.
   void reserve_victims_locked(Tier& tier, const Request& request, const RecordPlan& plan, bool* inserted) {
-    int32_t entries[kDeltaMaxEntries][2];
+    int32_t entries[Wire::kDeltaMaxEntries][2];
     int count = 0;
-    FixedVec<int32_t, kLeaseLanes> staging = tier.staging;
+    FixedVec<int32_t, Wire::kLanes> staging = tier.staging;
     for (size_t i = 0; i < plan.missing.size(); ++i) {
       int32_t old = -1;
       const int64_t victim = take_victim_locked(request.row, plan.wanted, &old);
@@ -1556,7 +1556,7 @@ class RamTier {
     cpu_job.accumulate = misses->left < job.late_cpu;
     for (size_t i = 0; i < plan.missing.size(); ++i) {
       const Lane& lane = request.lanes[plan.miss_lane[i]];
-      if (lane.kind != kKindMissCpu || (misses->sent >> i & 1u) != 0) continue;
+      if (lane.kind != Wire::kKindMissCpu || (misses->sent >> i & 1u) != 0) continue;
       if (!(i < packed_.size() && packed_[i] != 0)) continue;
       cpu_job.slots[cpu_job.k] = static_cast<int32_t>(plan.slots[i]);
       cpu_job.weights[cpu_job.k] = lane.weight;
@@ -1635,12 +1635,12 @@ class RamTier {
     if (request.row < 0 || request.row >= layers_) fail_record(request, "the row is out of range");
     Tier& tier = tiers_[request.row];
     RecordPlan plan;
-    plan.idx = static_cast<int64_t>((request.seq - 1u) % kDemandRecords);
+    plan.idx = static_cast<int64_t>((request.seq - 1u) % Wire::kDemandRecords);
     collect_wanted_locked(tier, request, &plan);
     classify_lanes_locked(tier, request, &plan);
     CpuMissBatch misses = submit_host_lanes(request, &plan);
     const bool reads = !plan.missing.empty();
-    bool inserted[kLeaseLanes] = {};
+    bool inserted[Wire::kLanes] = {};
     if (reads) reserve_victims_locked(tier, request, plan, inserted);
     if (cur) cur->reserved = stamp(cur);
     const int64_t status = reads ? read_misses(request, plan, &misses, cur) : kStatusNoRead;
@@ -1663,9 +1663,9 @@ class RamTier {
     bool any = false;
     for (size_t i = 0; i < miss_lane.size(); ++i) {
       const int32_t lane = miss_lane[i];
-      if (request.lanes[lane].kind != kKindMissGpu) continue;
+      if (request.lanes[lane].kind != Wire::kKindMissGpu) continue;
       uint8_t* word =
-          lease_ + kLeasePieceMask + (idx * kLeaseLanes + static_cast<int64_t>(lane)) * kLeasePieceMaskLineBytes;
+          lease_ + Wire::kLeasePieceMask + (idx * Wire::kLanes + static_cast<int64_t>(lane)) * Wire::kLeasePieceMaskLineBytes;
       store_release64(word, piece_word(request.gen));
       PieceTarget& target = piece_targets_[i];
       target.words[target.count++] = reinterpret_cast<uint64_t*>(word);

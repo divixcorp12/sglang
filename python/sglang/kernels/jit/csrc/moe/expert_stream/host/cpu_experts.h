@@ -6,7 +6,7 @@
 //
 //   CpuExpertForward   the format's kernel, as a C ABI
 //   CpuExpertKeepWarm  the format's idle loop, as a C ABI
-//   CpuJob             one forward: up to kLeaseLanes lanes of one row, writing one output part
+//   CpuJob             one forward: up to Wire::kLanes lanes of one row, writing one output part
 //   CpuExpertConfig    the pinned input/output tables, the thread count and the cores
 //   CpuExpertEngine    the thread, its job ring and its done word
 //
@@ -63,7 +63,7 @@ using CpuExpertForward = int (*)(
 // Called from the CPU expert thread only, between forwards.
 using CpuExpertKeepWarm = int (*)(int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns);
 
-// One forward over up to kLeaseLanes lanes of one row.
+// One forward over up to Wire::kLanes lanes of one row.
 //
 // A record produces at most one job for its CPU hits (output part 0) and one job per batch of CPU misses that landed
 // together (part 1). Every miss job after the first adds into the part, in landing order, so the part's fp32 sum order
@@ -74,8 +74,8 @@ struct CpuJob {
   bool accumulate = false;  // add into the part rather than overwrite it
   uint32_t seq = 0;         // from claim(); done() compares against it
   int32_t k = 0;
-  int32_t slots[wire::kLeaseLanes] = {};
-  float weights[wire::kLeaseLanes] = {};
+  int32_t slots[wire::Wire::kLanes] = {};
+  float weights[wire::Wire::kLanes] = {};
 };
 
 // The pinned tables the engine reads and writes, and how it runs. Validated by the CpuExpertEngine constructor.
@@ -111,7 +111,7 @@ class CpuExpertEngine {
   static constexpr size_t kRing = 256;
   // A record has at most one CPU-hit job and one job per CPU miss, so the ring holds every job that can be outstanding.
   static_assert(
-      kRing >= wire::kDemandRecords * (wire::kLeaseLanes + 1), "the ring holds every job that can be outstanding");
+      kRing >= wire::Wire::kDemandRecords * (wire::Wire::kLanes + 1), "the ring holds every job that can be outstanding");
 
   CpuExpertEngine(CpuExpertConfig config, std::string prefix, std::string thread_name)
       : config_(std::move(config)), prefix_(std::move(prefix)), thread_name_(thread_name.substr(0, 15)) {

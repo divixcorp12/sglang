@@ -28,7 +28,7 @@
 namespace sglang::expert_stream {
 
 // The most lanes measured: one expert per lease lane.
-constexpr int kCalibLanes = static_cast<int>(wire::kLeaseLanes);
+constexpr int kCalibLanes = static_cast<int>(wire::Wire::kLanes);
 // The result grid is float64, row-major [kCalibRows][kCalibCols], in ms:
 //   row 0       cpu[k]      k CPU lanes alone
 //   row 1       link[m]     m DMA'd experts alone

@@ -100,10 +100,10 @@ SGL_DEVICE void stream_copy_piece(
 
 // S's per-block shared state, one slot per lane. Only thread 0 of the leader loop updates `done` and `finished`.
 struct StreamLanes {
-  int32_t mine[kLeaseLanes];   // a kMissGpu lane: this kernel's
-  int32_t slot[kLeaseLanes];   // its staging slot
-  uint32_t done[kLeaseLanes];  // pieces this block has copied its slice of
-  uint32_t todo[kLeaseLanes];  // pieces to copy this pass
+  int32_t mine[Wire::kLanes];   // a kMissGpu lane: this kernel's
+  int32_t slot[Wire::kLanes];   // its staging slot
+  uint32_t done[Wire::kLanes];  // pieces this block has copied its slice of
+  uint32_t todo[Wire::kLanes];  // pieces to copy this pass
   int finished;                // every piece of every lane copied
 };
 
@@ -155,8 +155,8 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
   const int64_t idx = ring_index(seq);
-  if (tid < kLeaseLanes) {
-    const bool mine = tid < planned_count && p.lane_kind[tid] == static_cast<int32_t>(kKindMissGpu);
+  if (tid < Wire::kLanes) {
+    const bool mine = tid < planned_count && p.lane_kind[tid] == static_cast<int32_t>(Wire::kKindMissGpu);
     sh.mine[tid] = mine ? 1 : 0;
     sh.slot[tid] = mine ? p.lane_slot[tid] : 0;
     if (mine && (sh.slot[tid] < 0 || static_cast<uint32_t>(sh.slot[tid]) >= p.row_capacity)) __trap();
@@ -166,18 +166,18 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
   if (tid == 0) sh.finished = 0;
   __syncthreads();
 
-  const uint8_t* masks = p.lease + kLeasePieceMask + idx * kLeaseLanes * kLeasePieceMaskLineBytes;
+  const uint8_t* masks = p.lease + Wire::kLeasePieceMask + idx * Wire::kLanes * Wire::kLeasePieceMaskLineBytes;
   const uint64_t deadline = load_deadline(p.state);
   const int64_t piece_stride = static_cast<int64_t>(kRowPieces) * p.row_segments * 2;
 
   while (sh.finished == 0) {
-    if (tid < kLeaseLanes && sh.mine[tid] != 0) {
-      const uint32_t bits = piece_bits(ld_acquire_sys64(masks + tid * kLeasePieceMaskLineBytes), generation);
+    if (tid < Wire::kLanes && sh.mine[tid] != 0) {
+      const uint32_t bits = piece_bits(ld_acquire_sys64(masks + tid * Wire::kLeasePieceMaskLineBytes), generation);
       sh.todo[tid] = bits & ~sh.done[tid];
     }
     __syncthreads();
     bool copied = false;
-    for (int lane = 0; lane < kLeaseLanes; ++lane) {
+    for (int lane = 0; lane < Wire::kLanes; ++lane) {
       const uint32_t todo = sh.todo[lane];
       if (todo == 0) continue;
       copied = true;
@@ -191,7 +191,7 @@ __global__ __launch_bounds__(device::expert_stream::kStreamThreads, 1) void exl3
     __syncthreads();
     if (tid == 0) {
       bool all = true;
-      for (int lane = 0; lane < kLeaseLanes; ++lane) {
+      for (int lane = 0; lane < Wire::kLanes; ++lane) {
         sh.done[lane] |= sh.todo[lane];
         sh.todo[lane] = 0;
         if (sh.mine[lane] != 0 && sh.done[lane] != kAllPieces) all = false;
@@ -274,8 +274,8 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
   using namespace device::expert_stream;
-  __shared__ int32_t sm_host[kLeaseLanes];
-  __shared__ int32_t sm_dst[kLeaseLanes];
+  __shared__ int32_t sm_host[Wire::kLanes];
+  __shared__ int32_t sm_dst[Wire::kLanes];
   __shared__ uint32_t copying;    // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
   __shared__ uint32_t cpu;        // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
   __shared__ uint32_t cpu_parts;  // bit 0: a kHitCpu lane (output part 0); bit 1: a kMissCpu lane (part 1)
@@ -286,12 +286,12 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   uint8_t* const lease = p.lease;
   if (threadIdx.x == 0) {
     uint32_t c = 0, u = 0, parts = 0;
-    for (int64_t lane = 0; lane < planned_count && lane < kLeaseLanes; ++lane) {
+    for (int64_t lane = 0; lane < planned_count && lane < Wire::kLanes; ++lane) {
       const uint32_t kind = static_cast<uint32_t>(p.lane_kind[lane]);
       if (is_cpu_kind(kind)) u |= 1u << lane;
-      if (kind == kKindHitCpu) parts |= 1u;
-      if (kind == kKindMissCpu) parts |= 2u;
-      if (kind != kKindHitCopy) continue;
+      if (kind == Wire::kKindHitCpu) parts |= 1u;
+      if (kind == Wire::kKindMissCpu) parts |= 2u;
+      if (kind != Wire::kKindHitCopy) continue;
       c |= 1u << lane;
       sm_host[lane] = p.lane_slot[lane];
       sm_dst[lane] = p.dst_slots[lane];
@@ -327,15 +327,15 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   if (planned_count == 0) return;
   const uint32_t mask = copying | cpu;
   if (mask == 0) return;
-  uint8_t* const gate = lease + kLeaseCopyGate;
-  st_relaxed_sys<uint32_t>(gate, copy_gate_word(seq, kLeaseGateClosed));
+  uint8_t* const gate = lease + Wire::kLeaseCopyGate;
+  st_relaxed_sys<uint32_t>(gate, copy_gate_word(seq, Wire::kLeaseGateClosed));
   p.ce_mask[0] = static_cast<int32_t>(mask | cpu << kCeMaskCpuShift | cpu_parts << kCeMaskPartShift);
   // Dekker with the copy thread (RamTier::copy_completed: CopyDone store, fence, gate load): this close is ordered
   // before the CopyDone load below, so one side always sees the other's store and opens the gate. Both open with the
   // same word, so opening twice is harmless.
   __threadfence_system();
-  if (ld_acquire_sys64(lease + kLeaseCopyDone + idx * kLeaseCopyDoneBytes) == generation) {
-    st_release_sys(gate, copy_gate_word(seq, kLeaseGateOpen));
+  if (ld_acquire_sys64(lease + Wire::kLeaseCopyDone + idx * Wire::kLeaseCopyDoneBytes) == generation) {
+    st_release_sys(gate, copy_gate_word(seq, Wire::kLeaseGateOpen));
   }
 }
 
@@ -353,7 +353,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
   // Only a teardown opens a gate without CopyDone: the service is gone, and the copies may not have landed.
-  if (ld_acquire_sys64(p.lease + kLeaseCopyDone + ring_index(seq) * kLeaseCopyDoneBytes) != generation) __trap();
+  if (ld_acquire_sys64(p.lease + Wire::kLeaseCopyDone + ring_index(seq) * Wire::kLeaseCopyDoneBytes) != generation) __trap();
   if (p.cpu_lanes != nullptr) {
     p.cpu_lanes[0] = static_cast<int32_t>(
         (armed >> kCeMaskCpuShift & 0xFFu) | (armed >> kCeMaskPartShift & 0x3u) << kCpuLanesPartShift);
@@ -421,14 +421,14 @@ struct RowCopyKernel {
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named(
         "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
-    // S reads planned and dst_slots at every lane the post bounded by the plan's buffers: kLeaseLanes at most.
+    // S reads planned and dst_slots at every lane the post bounded by the plan's buffers: Wire::kLanes at most.
     RuntimeCheck(
-        P_.unwrap() >= std::min<int64_t>(kLeaseLanes, dst_slots.size(0)),
-        "planned: must have at least as many lanes as dst_slots, up to kLeaseLanes");
+        P_.unwrap() >= std::min<int64_t>(Wire::kLanes, dst_slots.size(0)),
+        "planned: must have at least as many lanes as dst_slots, up to Wire::kLanes");
     expert_stream::verify_named(
-        "lane_kind", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_kind);
+        "lane_kind", TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_kind);
     expert_stream::verify_named(
-        "lane_slot", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_slot);
+        "lane_slot", TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_slot);
     expert_stream::verify_named(
         "segments", TensorMatcher({S_, 3}).with_dtype<int64_t>().with_device<kDLCUDA>(device), segments);
     expert_stream::verify_named(
@@ -443,8 +443,8 @@ struct RowCopyKernel {
             .with_device<kDLCUDA>(device),
         piece_runs);
     RuntimeCheck(
-        lease_address != 0 && lease_address % kLeaseBlockAlign == 0,
-        "lease_address: must be a nonzero multiple of kLeaseBlockAlign");
+        lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
+        "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
 
     const auto stream = LaunchKernel::resolve_device(state.device());
     const auto params = StreamParams{
@@ -495,9 +495,9 @@ struct RowCopyKernel {
         state);
     expert_stream::verify_named("count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), count);
     expert_stream::verify_named(
-        "lane_kind", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_kind);
+        "lane_kind", TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_kind);
     expert_stream::verify_named(
-        "lane_slot", TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_slot);
+        "lane_slot", TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_slot);
     expert_stream::verify_named(
         "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
@@ -507,8 +507,8 @@ struct RowCopyKernel {
         "cpu_lanes", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes);
     RuntimeCheck(cpu_lanes.size(0) <= 1, "cpu_lanes: one word, or empty when CPU experts are off");
     RuntimeCheck(
-        lease_address != 0 && lease_address % kLeaseBlockAlign == 0,
-        "lease_address: must be a nonzero multiple of kLeaseBlockAlign");
+        lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
+        "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
     RuntimeCheck(
         expert_stream::stream_wait_value32() != nullptr,
         "the copy wait needs cuStreamWaitValue32_v2, which libcuda.so.1 does not provide");
@@ -538,8 +538,8 @@ struct RowCopyKernel {
     // and passes, a closed word has bit 31 set and blocks. Captured as a memory-op node of the graph.
     const int r = expert_stream::stream_wait_value32()(
         static_cast<void*>(stream),
-        static_cast<uint64_t>(lease_address + kLeaseCopyGate),
-        kLeaseGateOpen,
+        static_cast<uint64_t>(lease_address + Wire::kLeaseCopyGate),
+        Wire::kLeaseGateOpen,
         expert_stream::kStreamWaitValueGeq);
     RuntimeCheck(r == 0, "the copy wait's cuStreamWaitValue32_v2 on the gate failed: CUresult ", r);
     const auto commit = CopyCommitParams{

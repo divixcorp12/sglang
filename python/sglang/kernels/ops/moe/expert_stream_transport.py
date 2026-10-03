@@ -130,28 +130,35 @@ def _refuse_test_only(name: str, variant: Optional[str]) -> None:
 # cache_once keys f(), f("exl3") and f(layout="exl3") apart, so each cached loader
 # below is called only positionally, through a wrapper: a layout and variant then have
 # exactly one module whatever the call form.
-def _host_module(layout: str = "exl3", variant: Optional[str] = None) -> Module:
-    """Return the cached host module for ``layout`` and ``variant`` (default build)."""
+def _host_module(
+    layout: str = "exl3", variant: Optional[str] = None, lanes: int = 8
+) -> Module:
+    """Return the cached host module for ``layout``, ``variant`` (default build) and ``lanes``."""
     variant = host_variant() if variant is None else variant
+    lanes = expert_lease_block.wire_layout(lanes).lanes
     if variant == "instr_tsan" and _ALLOW_TSAN:
-        return _host_module_tsan(layout)
+        return _host_module_tsan(layout, lanes)
     if variant not in VARIANTS:
         raise ValueError(
             f"unknown host build variant {variant!r}; expected one of {VARIANTS}"
         )
     if variant not in LAYOUTS[layout].host_sources:
         raise ValueError(f"layout {layout!r} has no {variant!r} host build variant")
-    return _host_module_cached(layout, variant)
+    return _host_module_cached(layout, variant, lanes)
 
 
 @cache_once
-def _host_module_cached(layout: str, variant: str) -> Module:
+def _host_module_cached(layout: str, variant: str, lanes: int) -> Module:
     # Hidden visibility keeps HostExports' registries and members private to each
     # module's .so; only the TVM_FFI_DLL_EXPORT entry points are exported.
     return load_jit(
-        f"expert_stream_host_{layout}_{variant}",
+        f"expert_stream_host_{layout}_{variant}_l{lanes}",
         cpp_files=[LAYOUTS[layout].host_sources[variant]],
-        extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden"],
+        extra_cflags=[
+            "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden",
+            f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+        ],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
     )
@@ -166,9 +173,9 @@ _ALLOW_TSAN = False
 
 
 @cache_once
-def _host_module_tsan(layout: str = "exl3") -> Module:
+def _host_module_tsan(layout: str = "exl3", lanes: int = 8) -> Module:
     return load_jit(
-        f"expert_stream_host_{layout}_instr_tsan",
+        f"expert_stream_host_{layout}_instr_tsan_l{lanes}",
         cpp_files=[LAYOUTS[layout].host_sources["instr"]],
         extra_cflags=[
             "-fvisibility=hidden",
@@ -176,6 +183,7 @@ def _host_module_tsan(layout: str = "exl3") -> Module:
             "-fsanitize=thread",
             "-O1",
             "-g",
+            f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
         ],
         extra_ldflags=["-luring", "-lpthread", "-ldl", "-fsanitize=thread"],
         header_only=False,
@@ -1096,7 +1104,7 @@ def seqlock_stress(
     return int(out[0]), int(out[1])
 
 
-_RECORD_LANES = 8  # kMaxIds == kLeaseLanes
+_RECORD_LANES = 8  # Wire::kLanes at the default build
 # Words of the C++ read_record result: 6 scalars, the protect ids, the lane count and
 # 5 words per lane.
 READ_RECORD_WORDS = 6 + _RECORD_LANES + 1 + 5 * _RECORD_LANES
@@ -1994,21 +2002,24 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     ]
 
 
-def _device_module(layout: str = "exl3") -> Module:
-    """Return the cached device module for ``layout``."""
-    return _device_module_cached(layout)
+def _device_module(layout: str = "exl3", lanes: int = 8) -> Module:
+    """Return the cached device module for ``layout`` and ``lanes``."""
+    return _device_module_cached(layout, expert_lease_block.wire_layout(lanes).lanes)
 
 
 @cache_once
-def _device_module_cached(layout: str) -> Module:
+def _device_module_cached(layout: str, lanes: int) -> Module:
     return load_jit(
-        f"expert_stream_{layout}",
+        f"expert_stream_{layout}_l{lanes}",
         cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
+        extra_cuda_cflags=[f"-DSGLANG_EXPERT_STREAM_LANES={lanes}"],
     )
 
 
-def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Module:
+def device_module_with_hooks(
+    defines: Sequence[str], layout: str = "exl3", lanes: int = 8
+) -> Module:
     """Test only: build the device kernels with the ``EXL3_RAM_MISS_TEST_*`` hooks on.
 
     ``defines`` are ``NAME`` or ``NAME=value`` entries. The result is a module of its
@@ -2016,12 +2027,16 @@ def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Mo
     """
     if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
         raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
+    lanes = expert_lease_block.wire_layout(lanes).lanes
     return load_jit(
-        f"expert_stream_{layout}",
+        f"expert_stream_{layout}_l{lanes}",
         "test",
         cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
-        extra_cuda_cflags=[f"-D{d}" for d in defines],
+        extra_cuda_cflags=[
+            *(f"-D{d}" for d in defines),
+            f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+        ],
     )
 
 

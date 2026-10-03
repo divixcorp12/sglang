@@ -705,35 +705,35 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         auto cpu = SymbolicDevice{};
         expert_stream::verify_named("out", TensorMatcher({2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
       }
-      alignas(128) uint8_t record[kRecordBytes] = {};
+      alignas(128) uint8_t record[Wire::kRecordBytes] = {};
       std::atomic<bool> done{false};
-      const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % kMaxIds + 1); };
+      const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % Wire::kLanes + 1); };
       std::thread writer([&] {
         for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
           const uint16_t row = static_cast<uint16_t>(round), count = count_of(round);
           const uint8_t counts = static_cast<uint8_t>(count << 4);  // protect ids only, no lanes
           const uint8_t flags = static_cast<uint8_t>(round & 1u);
           const int16_t id = static_cast<int16_t>(round & 0x7FFFu);
-          store_release(record + kRecSeq, 0u);
+          store_release(record + Wire::kRecSeq, 0u);
           std::atomic_thread_fence(std::memory_order_seq_cst);
-          std::memset(record + 4, 0, kRecordBytes - 4);
-          std::memcpy(record + kRecRow, &row, 2);
-          std::memcpy(record + kRecCounts, &counts, 1);
-          std::memcpy(record + kRecFlags, &flags, 1);
+          std::memset(record + 4, 0, Wire::kRecordBytes - 4);
+          std::memcpy(record + Wire::kRecRow, &row, 2);
+          std::memcpy(record + Wire::kRecCounts, &counts, 1);
+          std::memcpy(record + Wire::kRecFlags, &flags, 1);
           for (int i = 0; i < count; ++i)
-            std::memcpy(record + kRecProtect + 2 * i, &id, 2);
+            std::memcpy(record + Wire::kRecProtect + 2 * i, &id, 2);
           std::atomic_thread_fence(std::memory_order_seq_cst);
-          store_release(record + kRecSeq, round * kDemandRecords + 1u);  // seqs of one ring slot
+          store_release(record + Wire::kRecSeq, round * Wire::kDemandRecords + 1u);  // seqs of one ring slot
         }
       });
       int64_t accepted = 0, torn = 0;
       const int64_t deadline = now_ns() + duration_ns;
       while (now_ns() < deadline) {
-        const uint32_t seq = load_acquire(record + kRecSeq);
+        const uint32_t seq = load_acquire(record + Wire::kRecSeq);
         Request request;
         if (seq == 0 || read_record(record, seq, &request) != RecordRead::kOk) continue;
         ++accepted;
-        const uint32_t round = (seq - 1u) / kDemandRecords;
+        const uint32_t round = (seq - 1u) / Wire::kDemandRecords;
         bool whole = request.row == static_cast<uint16_t>(round) && request.captured == ((round & 1u) != 0) &&
                      request.protect.size() == count_of(round);
         for (int32_t id : request.protect)
@@ -748,8 +748,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
-  // Test only: read_record over one record (record: CPU uint8 [kRecordBytes]) as the service reads seq `expected`.
-  // out int64 [6 + kMaxIds + 1 + 5 * kMaxIds] = {status (RecordRead: 0 ok, 1 torn, 2 malformed), row, captured,
+  // Test only: read_record over one record (record: CPU uint8 [Wire::kRecordBytes]) as the service reads seq `expected`.
+  // out int64 [6 + Wire::kLanes + 1 + 5 * Wire::kLanes] = {status (RecordRead: 0 ok, 1 torn, 2 malformed), row, captured,
   // chain, gen, protect count, protect ids, lane count, then per lane: expert, slot, dst, kind, the weight's bits}.
   static void read_record_fields(TensorView record, int64_t expected, TensorView out) {
     if constexpr (!Build::kFaults) {
@@ -759,9 +759,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         using namespace host;
         auto cpu = SymbolicDevice{};
         expert_stream::verify_named(
-            "record", TensorMatcher({kRecordBytes}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), record);
+            "record", TensorMatcher({Wire::kRecordBytes}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), record);
         expert_stream::verify_named(
-            "out", TensorMatcher({6 + kMaxIds + 1 + 5 * kMaxIds}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+            "out", TensorMatcher({6 + Wire::kLanes + 1 + 5 * Wire::kLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
       }
       Request request;
       const RecordRead read =
@@ -775,12 +775,12 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       w[5] = static_cast<int64_t>(request.protect.size());
       for (size_t i = 0; i < request.protect.size(); ++i)
         w[6 + i] = request.protect[i];
-      w[6 + kMaxIds] = static_cast<int64_t>(request.lanes.size());
+      w[6 + Wire::kLanes] = static_cast<int64_t>(request.lanes.size());
       for (size_t j = 0; j < request.lanes.size(); ++j) {
         const Lane& lane = request.lanes[j];
         int32_t bits;
         std::memcpy(&bits, &lane.weight, 4);
-        int64_t* l = w + 7 + kMaxIds + 5 * j;
+        int64_t* l = w + 7 + Wire::kLanes + 5 * j;
         l[0] = lane.expert;
         l[1] = lane.slot;
         l[2] = lane.dst;

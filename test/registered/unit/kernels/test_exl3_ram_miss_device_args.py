@@ -170,7 +170,7 @@ def test_no_other_source_defines_a_wire_constant():
 
 def test_the_device_state_words_are_the_python_state_words():
     """The device state block agrees with Python's STATE_WORDS; this is the only check of it."""
-    device = _constants(*device_sources(), known={**lease.wire_probe(8, 1), "kMaxIds": 8, "kLeaseLanes": 8, "kLeaseRing": 16})
+    device = _constants(*device_sources(), known=lease.wire_probe(8, 1))
     state = {
         "kPosted": "posted",
         "kPending": "pending",

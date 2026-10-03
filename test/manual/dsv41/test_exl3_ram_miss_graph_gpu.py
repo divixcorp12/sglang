@@ -125,7 +125,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     return pairs, service, checks
 
 
-# The demand ring and the lease lanes are 16 deep (kDemandRecords, kLeaseRing): 4 layers fit, and 20 wrap them
+# The demand ring and the lease lanes are 16 deep (Wire::kDemandRecords): 4 layers fit, and 20 wrap them
 # inside one replay, as the 40+ streamed layers of a real decode step do.
 LAYER_COUNTS = pytest.mark.parametrize("layers", [4, 20], ids=["layers_4", "layers_20"])
 REPLAY_STEPS = 4

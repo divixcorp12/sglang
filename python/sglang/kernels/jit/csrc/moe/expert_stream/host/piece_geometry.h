@@ -134,7 +134,7 @@ inline bool publish_piece(uint64_t* word, uint64_t generation, uint8_t bit) {
   }
 }
 
-// The most readiness words one row is published to: one per lane, at most kLeaseLanes (checked in tier_protocol.h).
+// The most readiness words one row is published to: one per lane, at most Wire::kLanes (checked in tier_protocol.h).
 constexpr int kPieceTargets = 8;
 
 // Where the owner publishes a row's pieces: every readiness word naming the row, one per lane.

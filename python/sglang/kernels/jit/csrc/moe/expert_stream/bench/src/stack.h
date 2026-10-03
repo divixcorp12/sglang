@@ -105,7 +105,7 @@ struct StackConfig {
   int copy_cpu = -1;
   int64_t wait_timeout_ns = 2'000'000'000;  // the watchdog's copy-wait deadline (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS)
   int64_t fatal_wait_ns = 30'000'000'000;   // the watchdog's hung-request deadline
-  std::array<int64_t, es::kLeaseLanes + 1> split{};
+  std::array<int64_t, es::Wire::kLanes + 1> split{};
   size_t trace_capacity = 0;  // InstrBuild: the stage trace's ring, 0 off
 };
 
@@ -130,8 +130,8 @@ class Stack {
   explicit Stack(StackConfig config) : config_(std::move(config)) {
     rows_ = static_cast<int64_t>(config_.rows.paths.size());
     experts_ = config_.rows.experts;
-    page_ = aligned_zeroed(es::kPageBytes);
-    lease_bytes_ = es::kLeaseBlockBytes + round_up(rows_ * es::kDeltaStride, 4096);
+    page_ = aligned_zeroed(es::Wire::kPageBytes);
+    lease_bytes_ = es::Wire::kLeaseBlockBytes + round_up(rows_ * es::Wire::kDeltaStride, 4096);
     lease_ = aligned_zeroed(lease_bytes_);
     slot_map_.assign(static_cast<size_t>(rows_ * experts_), -1);
     tier_ = std::make_shared<Tier>(
@@ -219,7 +219,7 @@ class Stack {
   }
 
   // Replaces the split table: of a post's n eligible hit lanes, the CPU takes the last split[n].
-  void set_split(const std::array<int64_t, es::kLeaseLanes + 1>& split) {
+  void set_split(const std::array<int64_t, es::Wire::kLanes + 1>& split) {
     tier_->set_cpu_split(split.data(), static_cast<int64_t>(split.size()));
   }
 

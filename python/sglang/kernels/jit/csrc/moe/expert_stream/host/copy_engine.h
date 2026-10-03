@@ -37,8 +37,8 @@ struct CopyLane {
 //
 // A job carries three kinds of lane:
 //   - copy-engine hits: copied by DMA;
-//   - CPU hits (`cpu_mask`, kKindHitCpu): computed by the CPU expert engine as one job, sequence `cpu_seq`;
-//   - CPU misses (`late_cpu`, kKindMissCpu): computed as their rows land; `late_seq` is the last such CPU job.
+//   - CPU hits (`cpu_mask`, Wire::kKindHitCpu): computed by the CPU expert engine as one job, sequence `cpu_seq`;
+//   - CPU misses (`late_cpu`, Wire::kKindMissCpu): computed as their rows land; `late_seq` is the last such CPU job.
 // The job completes when its copies and every CPU job of the record are done, so a single CopyDone covers every host
 // lane. `cpu_seq` is read only when `cpu_mask` is set, `late_seq` only when `late_cpu` is.
 struct CopyJob {
@@ -47,7 +47,7 @@ struct CopyJob {
   int64_t row = 0;
   uint32_t mask = 0;
   int count = 0;
-  CopyLane lanes[kLeaseLanes];
+  CopyLane lanes[Wire::kLanes];
   int64_t submit_ns = 0;
   int64_t token = -1;  // backend marker after the last copy; kNoToken if none
   bool sm = false;     // the row has SM entries: the copy wait copies those, so the DMA skips them
@@ -235,14 +235,14 @@ class CudaCopyBackend : public CopyBackend {
       return "cuMemHostAlloc of the stream-wait probe word failed: " + std::to_string(r);
     auto* word = static_cast<uint32_t*>(host);
     // The production encoding (lease_layout.h): a closed gate word (bit 31 set) that an open word releases.
-    const uint32_t closed = kLeaseGateClosed;
-    const uint32_t open_word = kLeaseGateOpen;
+    const uint32_t closed = Wire::kLeaseGateClosed;
+    const uint32_t open_word = Wire::kLeaseGateOpen;
     __atomic_store_n(word, closed, __ATOMIC_RELEASE);
     uint64_t device_word = 0;
     std::string error;
     if (int r = cu_mem_host_device_ptr_(&device_word, host, 0)) {
       error = "cuMemHostGetDevicePointer of the stream-wait probe word failed: " + std::to_string(r);
-    } else if (int r = cu_wait_value32_(stream_, device_word, kLeaseGateOpen, kGeq)) {
+    } else if (int r = cu_wait_value32_(stream_, device_word, Wire::kLeaseGateOpen, kGeq)) {
       error = "cuStreamWaitValue32_v2 failed (" + std::to_string(r) +
               "): the copy wait needs the v2 stream wait on host-mapped memory";
     } else {
@@ -298,7 +298,7 @@ class CudaCopyBackend : public CopyBackend {
 // Capacity of the copy engine's two queues: the service's job ring and the copy thread's in-flight FIFO. The device
 // waits on every record with host lanes, so at most one job per demand record is outstanding and neither queue fills.
 constexpr size_t kCopyRing = 32;
-static_assert(kCopyRing > kDemandRecords, "the copy engine's queues hold every job that can be outstanding");
+static_assert(kCopyRing > Wire::kDemandRecords, "the copy engine's queues hold every job that can be outstanding");
 
 // A CPU-only test backend: "copies" between host buffers, completed only when the test releases them.
 //
@@ -313,7 +313,7 @@ class HostCopyBackend : public CopyBackend {
   // so the slot's earlier mark completed long before.
   static constexpr int kMarks = 2 * static_cast<int>(kCopyRing);
   // One mark's copies: every lane's copy of every layout name (row_layout.h caps a layout at 32), plus a ballast copy.
-  static constexpr int kEntries = kLeaseLanes * 32 + 1;
+  static constexpr int kEntries = Wire::kLanes * 32 + 1;
   static constexpr int kIssueFailed = -1;  // fail(issue = true)
   static constexpr int kQueryFailed = -2;  // fail(query = true)
   static constexpr int kMarkFull = -3;     // more copies in one mark than kEntries: impossible under the layout cap
@@ -480,7 +480,7 @@ class CopyEngine {
   }
 
   // Hands a job to the copy thread. Called only by the tier's owner (the service thread, or the caller of pump()).
-  // Takes no lock and never blocks; makes a syscall only to wake a sleeping copy thread. At most kDemandRecords jobs
+  // Takes no lock and never blocks; makes a syscall only to wake a sleeping copy thread. At most Wire::kDemandRecords jobs
   // are outstanding and the ring holds kCopyRing, so a full ring is an internal error and fails stop.
   void submit(const CopyJob& job) {
     if (!jobs_.push(job)) {

@@ -150,7 +150,7 @@ def main():
     if args.smoke:
         args.reps, args.requests, args.rows = 2, 20, [1, 3]
     if max(args.rows) > 8:
-        raise SystemExit("a request carries at most 8 ids (kMaxIds); more would silently read fewer rows")
+        raise SystemExit("a request carries at most 8 ids (Wire::kLanes); more would silently read fewer rows")
 
     base = Path(tempfile.mkdtemp(prefix="stage_trace_overhead_", dir="/dev/shm"))
     arms = {"off": Arm(base / "off", "off", False, args.ring), "on": Arm(base / "on", "on", True, args.ring)}

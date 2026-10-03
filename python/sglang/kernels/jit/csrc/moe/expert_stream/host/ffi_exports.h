@@ -201,15 +201,15 @@ struct HostExports {
     using namespace host;
     // Records and map deltas carry expert ids and slots as i16 (lease_layout.h).
     RuntimeCheck(
-        starts.dim() == 2 && starts.size(1) <= kRecIdMax, "starts: records carry expert ids up to ", kRecIdMax);
+        starts.dim() == 2 && starts.size(1) <= Wire::kRecIdMax, "starts: records carry expert ids up to ", Wire::kRecIdMax);
     auto capacity_mem = SymbolicDevice{};
     verify_named(
         "capacity", TensorMatcher({starts.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(capacity_mem), capacity);
     for (int64_t row = 0; row < capacity.size(0); ++row)
       RuntimeCheck(
-          static_cast<const int64_t*>(capacity.data_ptr())[row] <= kRecIdMax,
+          static_cast<const int64_t*>(capacity.data_ptr())[row] <= Wire::kRecIdMax,
           "capacity: records carry slots up to ",
-          kRecIdMax);
+          Wire::kRecIdMax);
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     // page, slot_map and lease are pinned (or not) together (ExpertStreamHost.__init__), so one SymbolicDevice
     // ties them to the same actual device; capacity is always a plain CPU tensor. hot_page is optional (an
@@ -217,7 +217,7 @@ struct HostExports {
     // page's device when it is not given.
     auto host_mem = SymbolicDevice{};
     verify_named(
-        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);
+        "page", TensorMatcher({Wire::kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);
     verify_named(
         "slot_map",
         TensorMatcher({extents.size(0), extents.size(1)})
@@ -343,7 +343,7 @@ struct HostExports {
   }
 
   // Enables CPU experts. `forward` is a CpuExpertForward's address (the trait's native forward), whose layers
-  // register later (set_cpu_layer). `split` is int64 [kLeaseLanes + 1], CPU lanes per n eligible lanes; `cores` is
+  // register later (set_cpu_layer). `split` is int64 [Wire::kLanes + 1], CPU lanes per n eligible lanes; `cores` is
   // int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host memory, where
   // the post kernel writes a row's input; `out_rows` is float32 [rows, >= parts * hidden] in host memory, where the
   // device reads a row's CPU partial sums (part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both tensors
@@ -367,7 +367,7 @@ struct HostExports {
     auto host_mem = SymbolicDevice{};
     auto rows = SymbolicSize{"rows"};
     expert_stream::verify_named(
-        "split", TensorMatcher({expert_stream::kLeaseLanes + 1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), split);
+        "split", TensorMatcher({expert_stream::Wire::kLanes + 1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), split);
     expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
     expert_stream::verify_named(
         "x_rows", TensorMatcher({rows, -1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), x_rows);
@@ -423,7 +423,7 @@ struct HostExports {
     find(handle)->take_bulk_delta(static_cast<int32_t*>(out.data_ptr()), out.size(0));
   }
 
-  // CPU experts: installs a new split table (int64 [kLeaseLanes + 1]), at any time.
+  // CPU experts: installs a new split table (int64 [Wire::kLanes + 1]), at any time.
   static void set_cpu_split(int64_t handle, TensorView split) {
     using namespace host;
     auto cpu = SymbolicDevice{};
