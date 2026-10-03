@@ -124,21 +124,28 @@ def test_calibration_needs_the_tier_owner(tmp_path):
 
 
 @pytest.mark.parametrize("lanes", [8, 16])
-def test_the_calibration_grid_follows_the_lane_count(lanes):
-    from sglang.kernels.ops.moe.expert_stream_transport import _host_module
-
+def test_the_shape_helpers_follow_the_lane_count(lanes):
+    # A real 16-lane calibration needs a 16-lane host (ExpertStreamHost(lanes), Task 6); until then this checks the
+    # helpers and that the 16-lane host module builds with the lane-scaled capacities.
     width = lease.wire_layout(lanes).lanes
     assert ram_miss.calibration_shape(lanes) == (width + 2, width + 1)
     assert ram_miss.stage_trace_rows(lanes) == 2 * width
-    module = _host_module("exl3", None, lanes)
-    assert module.expert_stream_trace_words is not None
+    module = ram_miss._host_module("exl3", None, lanes)
+    assert hasattr(module, "expert_stream_calibrate_cpu_split")
 
 
-def test_a_tier_smaller_than_the_lane_width_skips_calibration(monkeypatch):
-    """Calibration needs one RAM slot and one expert of scratch per lane; a smaller tier keeps the configured split."""
-    from sglang.srt.layers.moe.cpu_experts import service
+def test_the_host_calibration_grid_has_the_shape_helper_size(tmp_path):
+    _, host, _, _keep = _host(tmp_path)
+    grid = host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host))
+    assert tuple(grid.shape) == ram_miss.calibration_shape()
 
-    calls = []
-    monkeypatch.setattr(service, "_calibrate_native", lambda *a, **k: calls.append(a))
-    split = service.calibrated_or_configured(capacity=12, lanes=16, configured=[0] * 17)
-    assert split == [0] * 17 and calls == []
+
+@pytest.mark.parametrize(
+    "capacities, lanes, row",
+    [({0: 12, 1: 20}, 16, 1), ({0: 16, 1: 20}, 16, 0), ({0: 12, 1: 15}, 16, None), ({0: 7}, 8, None), ({0: 8}, 8, 0)],
+)
+def test_calibration_runs_on_the_first_row_with_a_slot_per_lane(capacities, lanes, row):
+    """Calibration needs one RAM slot per lane; a tier with no such row keeps the configured split."""
+    from sglang.srt.layers.moe.cpu_experts.service import calibration_row
+
+    assert calibration_row(capacities, lanes) == row

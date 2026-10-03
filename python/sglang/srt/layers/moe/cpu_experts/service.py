@@ -264,13 +264,8 @@ class CpuExpertService:
             or not envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.get()
         ):
             return None
-        row = next(
-            (
-                r
-                for r in sorted(self.handles)
-                if self._capacity(self.slabs_by_row[r]) >= LANES
-            ),
-            None,
+        row = calibration_row(
+            {r: self._capacity(self.slabs_by_row[r]) for r in self.handles}, LANES
         )
         if row is None:
             logger.warning(
@@ -289,9 +284,9 @@ class CpuExpertService:
                 dtype=torch.uint8,
                 device="cpu" if device < 0 else torch.device("cuda", device),
             )
-            grid = _calibrate_native(
-                self.host, row, device=device, reps=reps, scratch=scratch
-            )
+            grid = self.host.calibrate_cpu_split(
+                row, device=device, reps=reps, scratch=scratch
+            ).tolist()
         except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
             # A timed-out DMA may still write into the scratch: keep its block out of
             # the allocator.
@@ -327,26 +322,14 @@ class CpuExpertService:
         self._last_stats = after
 
 
-def _calibrate_native(host, row: int, *, device: int, reps: int, scratch) -> list:
-    """Run the host's calibration on ``row`` and return its grid as lists."""
-    return host.calibrate_cpu_split(
-        row, device=device, reps=reps, scratch=scratch
-    ).tolist()
+def calibration_row(capacities: Mapping[int, int], lanes: int) -> Optional[int]:
+    """The first row calibration can run on, or ``None`` to keep the configured split.
 
-
-def calibrated_or_configured(
-    *, capacity: int, lanes: int, configured: list[int], **native
-) -> list[int]:
-    """The split calibration picks, or ``configured`` when the tier is too small to run it.
-
-    Calibration needs one RAM slot and one expert of scratch per lane, and its grid
-    grows with the lane count; a row with fewer than ``lanes`` slots keeps the
-    configured split instead of failing the launch. ``native`` goes to
-    ``_calibrate_native``.
+    Calibration needs ``lanes`` RAM slots in one row and one expert of scratch per
+    lane, and its grid grows with ``lanes``; a tier whose rows all hold fewer slots
+    skips it rather than failing the launch.
     """
-    if capacity < lanes:
-        return configured
-    return split_from_grid(_calibrate_native(**native))
+    return next((r for r in sorted(capacities) if capacities[r] >= lanes), None)
 
 
 def cpu_expert_cores() -> tuple[list[int], int]:

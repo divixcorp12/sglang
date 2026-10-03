@@ -762,8 +762,8 @@ def piece_geometry(
 # whole read, while ``pack_start``..``pack_end`` run from the first row's packing to
 # the last row's and overlap the reads. The byte split, terminal status, per-row
 # packing and per-extent CQE stamps are defined at ``StageRecord``;
-# ``STAGE_TRACE_ROWS`` and ``STAGE_TRACE_EXTENTS`` are its ``kTraceRows`` and
-# ``kTraceExtents``.
+# ``STAGE_TRACE_ROWS`` and ``STAGE_TRACE_EXTENTS`` are the 8-lane build's ``kTraceRows``
+# and ``kTraceExtents`` (``stage_trace_rows`` gives them for a lane count).
 #
 # Row images, the only reader since the direct mode became the sole mode, copy
 # nothing: the drive writes the slab rows. The pack stamps then mean publish time.
@@ -1724,17 +1724,16 @@ class ExpertStreamHost:
         reps: int,
         scratch: torch.Tensor,
         timeout_s: float = 1.0,
-        lanes: int = 8,
     ) -> torch.Tensor:
         """Run the CPU split's startup calibration on ``row``.
 
-        Returns float64 ``calibration_shape(lanes)`` (``[10, 9]`` at 8 lanes) mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
+        Returns float64 ``calibration_shape()`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
         row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no
         thread). ``device`` -1 copies with the test backend; ``scratch`` holds 8
-        lanes experts on that device. Raises RuntimeError on failure.
+        one expert per lane on that device. Raises RuntimeError on failure.
         """
-        out = torch.zeros(calibration_shape(lanes), dtype=torch.float64)
-        _host_module(self._layout, self.variant, lanes).expert_stream_calibrate_cpu_split(
+        out = torch.zeros(calibration_shape(), dtype=torch.float64)
+        self._module.expert_stream_calibrate_cpu_split(
             self.handle,
             int(row),
             int(device),
