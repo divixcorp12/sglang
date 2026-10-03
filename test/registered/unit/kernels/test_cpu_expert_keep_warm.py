@@ -52,9 +52,9 @@ def _host(tmp_path, request, keep_warm_us):
 
 
 def _run_jobs(host):
-    """Run the calibration's CPU jobs (one per cell, no repeats); returns its grid in ms."""
+    """Run the calibration's CPU jobs (a warm-up and one timed run per cell); returns its grid in ms."""
     scratch = torch.zeros(LANES * host.copy_expert_bytes(ROW), dtype=torch.uint8)
-    return host.calibrate_cpu_split(ROW, device=-1, reps=0, scratch=scratch)
+    return host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=scratch)
 
 
 def test_keep_warm_waits_for_the_first_job(tmp_path, request):
