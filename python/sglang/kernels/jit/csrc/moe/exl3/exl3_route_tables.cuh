@@ -38,10 +38,10 @@ __device__ __forceinline__ float route_tables_to_float(__nv_bfloat16 v) {
 // only when two routes share a slot, which a BS1 remap does not do: hits are distinct slots and DIRECT's miss lanes
 // take distinct victims.
 //
-// CPU experts (plan 2026-09-29-dsv41-cpu-experts; cpu_lanes non-null): the lanes of cpu_lanes[0]'s bits 0-7 were
+// CPU experts (plan 2026-09-29-dsv41-cpu-experts; cpu_lanes non-null): the lanes of cpu_lanes[0] were
 // computed by the CPU expert thread, whose partial sums seed the output instead of zero: part 0 at cpu_out (host memory,
-// [hidden] fp32; the CPU hits') when bit 8 is set, plus part 1 at cpu_out + part_stride (the CPU misses') when bit 9
-// is. A part whose bit is clear holds an earlier record's sum and is never read. A route
+// [hidden] fp32; the CPU hits') when cpu_lanes[1]'s bit 0 is set, plus part 1 at cpu_out + part_stride (the CPU
+// misses') when its bit 1 is. A part whose bit is clear holds an earlier record's sum and is never read. A route
 // whose slot is such a lane's dst_slots entry is ranked as if its slot were past every column: its slot's count is 0
 // (the fused kernel and the gather skip it) and every other slot's start, which the fused kernel recomputes as a
 // running sum of the counts to index weight_sorted, is unchanged by it. Its remap64_out entry keeps the real slot.
@@ -69,10 +69,10 @@ __global__ void exl3_moe_route_tables_kernel(
   const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   const bool kept = keep[0] > 0.0f;
-  const uint32_t word = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
-  const uint32_t cpu = word & 0xFFu;
-  const bool part0 = (word >> 8 & 1u) != 0;
-  const bool part1 = (word >> 9 & 1u) != 0;
+  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
+  const uint32_t parts = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[1]) : 0u;
+  const bool part0 = (parts & 1u) != 0;
+  const bool part1 = (parts >> 1 & 1u) != 0;
   if (part1 && part_stride == 0) __trap();  // a one-part row cannot hold the CPU misses' sum
   // A route's slot as the tables rank it: past every column when the CPU computed it.
   auto ranked = [&](int i) -> int64_t {
@@ -169,13 +169,14 @@ void exl3_moe_route_tables_gpu(
       "weight_sorted", TensorMatcher({K_}).with_dtype<fp16_t>().with_device<kDLCUDA>(device), weight_sorted);
   expert_stream::verify_named("det", TensorMatcher({3, C_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), det);
   RuntimeCheck(0 < K_.unwrap() && K_.unwrap() <= kMaxRoutes, "remap must hold 1-32 routes");
-  // CPU experts: cpu_lanes is one word (empty when off), dst_slots the plan's lane slots, cpu_out the host row.
+  // CPU experts: cpu_lanes is two words (empty when off), dst_slots the plan's lane slots, cpu_out the host row.
   expert_stream::verify_named(
       "cpu_lanes", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes);
   expert_stream::verify_named(
       "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
-  const bool cpu_on = cpu_lanes.size(0) == 1;
-  RuntimeCheck(cpu_lanes.size(0) <= 1, "cpu_lanes: one word, or empty when CPU experts are off");
+  const bool cpu_on = cpu_lanes.size(0) == 2;
+  RuntimeCheck(
+      cpu_lanes.size(0) == 0 || cpu_lanes.size(0) == 2, "cpu_lanes: two words, or empty when CPU experts are off");
   RuntimeCheck(!cpu_on || (cpu_out != 0 && cpu_out % 16 == 0), "cpu_out: the CPU partial's host row, 16-byte aligned");
   RuntimeCheck(cpu_part_stride >= 0 && cpu_part_stride % 4 == 0, "cpu_part_stride: floats between parts, 16-byte steps");
   const auto stream = host::LaunchKernel::resolve_device(remap.device());

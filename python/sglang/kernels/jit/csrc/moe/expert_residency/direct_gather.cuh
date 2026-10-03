@@ -112,8 +112,8 @@ __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
     const int32_t* __restrict__ cpu_lanes,
     uint8_t ready,
     uint8_t free_state) {
-  // Bits 0-7 of CC's word; the parts above them are the route tables'.
-  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) & 0xFFu : 0u;
+  // Word 0 of CC's pair: the CPU lanes.
+  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
   bool live[kDirectGatherWarp];
   bool evicted[kDirectGatherWarp];
   int64_t old_expert[kDirectGatherWarp];
@@ -291,7 +291,7 @@ void direct_commit_gather_gpu(
   if (cpu_lanes.has_value()) {
     RuntimeCheck(delivered.has_value(), "cpu_lanes needs the leased delivery count");
     expert_stream::verify_named(
-        "cpu_lanes", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes.value());
+        "cpu_lanes", TensorMatcher({2}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes.value());
   }
   RuntimeCheck(num_experts == E_.unwrap() - 1, "num_experts must be mapping's size minus the dump column");
   RuntimeCheck(slot_dump == S_.unwrap() - 1, "slot_dump must be slot_to_expert's last column");

@@ -134,7 +134,7 @@ def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int
             keep=torch.tensor([keep], dtype=torch.float32, device="cuda"),
             cpu_experts=cpu_lanes is not None,
             device_side=SimpleNamespace(
-                cpu_lanes=torch.tensor([cpu_lanes or 0], dtype=torch.int32, device="cuda")
+                cpu_lanes=torch.tensor([cpu_lanes or 0, 0], dtype=torch.int32, device="cuda")
             ),
         )
         if leased

@@ -347,13 +347,13 @@ def test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads(slot_rows):
 
 # CPU experts (plan 2026-09-29-dsv41-cpu-experts, Step B): the lanes of cpu_lanes leave the fused MoE and the CPU's
 # partial sums seed its output. Here lane i is route i (dst_slots = remap), as the post's plan makes it for a BS1 remap.
-# cpu_lanes is CC's word: the lane mask in bits 0-7, then which parts hold a partial (bit 8 the CPU hits', part 0;
-# bit 9 the CPU misses', part 1, part_stride floats on).
-PART_HITS, PART_MISSES = 1 << 8, 1 << 9
+# cpu_lanes is CC's pair: the lane mask, then which parts hold a partial (bit 0 the CPU hits', part 0; bit 1 the CPU
+# misses', part 1, part_stride floats on).
+PART_HITS, PART_MISSES = 1, 2
 
 
 def _cpu_run(fused, x, weights, remap, keep, mask: int, partial: torch.Tensor, parts: int = PART_HITS) -> torch.Tensor:
-    lanes = torch.tensor([mask | parts], dtype=torch.int32, device=x.device)
+    lanes = torch.tensor([mask, parts], dtype=torch.int32, device=x.device)
     stride = partial.stride(1) if partial.dim() == 3 else 0
     cpu = (lanes, remap.to(torch.int32), partial.data_ptr(), stride)
     return fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=cpu).clone()
