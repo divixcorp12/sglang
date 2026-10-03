@@ -4,7 +4,7 @@
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is
 // the ISA tier. The primary template is the generic plan. PlanTraits<Dsv41Shape, Isa::Bw> turns on the fast path that
 // was measured and validated bit-exact on AVX-512BW (exl3_cpu/optimized/README.txt); every other (Shape, I) pair runs
-// the generic plan.
+// the generic plan. ForwardPlan<Shape, I, true> also times each phase and prints one line per forward.
 
 // The forward's phases, in team order; a barrier separates each from the next. The values index the profiling line
 // ("moe_cpu phases(us)"): 4, the old whole-row down transform, is gone (Down's owned blocks include it) and prints 0.
@@ -37,7 +37,9 @@ struct PlanTraits<Dsv41Shape, Isa::Bw>
     static constexpr int kSplitTiles = 2;  // compact unswizzled kernels take any tile pair (register_tiles)
 };
 
-template <class Shape, Isa I>
+// Profile: time each phase (its barrier included) on worker 0 and print "moe_cpu phases(us)" after the forward. Off,
+// the plan holds no timing code at all.
+template <class Shape, Isa I, bool Profile = false>
 struct ForwardPlan
 {
     using Traits = PlanTraits<Shape, I>;
@@ -64,15 +66,15 @@ private:
         grow(ar.tin_g, static_cast<size_t>(nc) * MAX_M * H);
         grow(ar.tin_u, static_cast<size_t>(nc) * MAX_M * H);
         grow(ar.tin_d, static_cast<size_t>(nc) * MAX_M * I_);
-        if(!compact) {
-        grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H);
-        grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H);
-        grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I_);
-        grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H);
-        grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H);
-        grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I_);
-        } else {
 
+        if(!compact) {
+            grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H);
+            grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H);
+            grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I_);
+            grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H);
+            grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H);
+            grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I_);
+        } else {
             grow(ar.compact_g,size_t(nc)*ACT_ROWS*H);
             grow(ar.compact_u,size_t(nc)*ACT_ROWS*H);
             grow(ar.compact_d,size_t(nc)*ACT_ROWS*I_);
@@ -129,40 +131,47 @@ private:
         freeze_compute_cores();
         TORCH_CHECK(g_compute_cores.empty() || size_t(count)<=g_compute_cores.size(),
                     "CPU expert worker count exceeds configured cores");
-        const bool prof=g_prof_enabled.load(std::memory_order_relaxed);
-        double phase_us[6]{};
+        [[maybe_unused]] double phase_us[6]{};
         std::atomic<int> pin_error{0};
         std::atomic<int> actual_workers{0};
-        #pragma omp parallel num_threads(count) shared(ctx,pin_error,actual_workers,phase_us)
+        #pragma omp parallel num_threads(count) shared(ctx, pin_error, actual_workers, phase_us)
         {
-            const int worker=omp_get_thread_num(),n=omp_get_num_threads();
-            if(worker==0)actual_workers.store(n,std::memory_order_relaxed);
-            pin_compute_worker(worker,pin_error);
-            if(n==count) {
-                step<Phase::PrepareGateUp>(ctx,E,worker,n,grouped,wide,prof,phase_us);
-                step<Phase::GateUp>(ctx,E,worker,n,grouped,wide,prof,phase_us);
-                step<Phase::Middle>(ctx,E,worker,n,grouped,wide,prof,phase_us);
-                step<Phase::Down>(ctx,E,worker,n,grouped,wide,prof,phase_us);
-                step<Phase::Accumulate>(ctx,E,worker,n,grouped,wide,prof,phase_us);
+            const int worker = omp_get_thread_num(), n = omp_get_num_threads();
+            if (worker == 0) actual_workers.store(n, std::memory_order_relaxed);
+            pin_compute_worker(worker, pin_error);
+            if (n == count) {
+                step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us);
+                step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us);
+                step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us);
+                step<Phase::Down>(ctx, E, worker, n, grouped, wide, phase_us);
+                step<Phase::Accumulate>(ctx, E, worker, n, grouped, wide, phase_us);
             }
         }
-        TORCH_CHECK(!pin_error.load(),"cannot pin CPU expert worker to its configured core");
-        TORCH_CHECK(actual_workers.load()==count,"OpenMP returned fewer CPU expert workers than requested");
-        if(prof)printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",phase_us[0],phase_us[1],phase_us[2],phase_us[3],phase_us[4],phase_us[5]);
+        TORCH_CHECK(!pin_error.load(), "cannot pin CPU expert worker to its configured core");
+        TORCH_CHECK(actual_workers.load() == count, "OpenMP returned fewer CPU expert workers than requested");
+        if constexpr (Profile)
+            printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",
+                   phase_us[0], phase_us[1], phase_us[2], phase_us[3], phase_us[4], phase_us[5]);
     }
 
     // One phase of the team's sequence: run it, then wait for the whole team unless it is the last. Called inside
-    // run_team's parallel region (an orphaned barrier binds to that team). phase_us is indexed by the phase's value.
+    // run_team's parallel region (an orphaned barrier binds to that team). Profile: phase_us is indexed by the
+    // phase's value; otherwise it is untouched.
     template <Phase P, class Experts>
-    static void step(ForwardCtx& ctx, const Experts& E, int worker, int n, bool grouped, bool wide, bool prof,
-                     double* phase_us)
+    static void step(ForwardCtx& ctx, const Experts& E, int worker, int n, bool grouped, bool wide,
+                     [[maybe_unused]] double* phase_us)
     {
-        const auto begin=prof?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-        phase<P>(ctx,E,worker,n,grouped,wide);
+        using Clock = std::chrono::steady_clock;
+        [[maybe_unused]] Clock::time_point begin;
+        if constexpr (Profile) begin = Clock::now();
+        phase<P>(ctx, E, worker, n, grouped, wide);
         if constexpr (P != Phase::Accumulate) {
             #pragma omp barrier
         }
-        if(prof && worker==0)phase_us[static_cast<int>(P)]=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count();
+        if constexpr (Profile) {
+            if (worker == 0)
+                phase_us[static_cast<int>(P)] = std::chrono::duration<double, std::micro>(Clock::now() - begin).count();
+        }
     }
 
     // One phase for this worker; P picks the phase at compile time, so each instantiation holds one phase's code.

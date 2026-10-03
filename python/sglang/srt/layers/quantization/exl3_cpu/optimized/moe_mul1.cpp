@@ -64,12 +64,8 @@
 
 
 
-namespace { std::atomic<bool> g_prof_enabled { false }; }
-
-void exl3_moe_cpu_set_prof(bool enabled)
-{
-    g_prof_enabled.store(enabled, std::memory_order_relaxed);
-}
+// Kept for upstream's bindings. Phase timing is compile-time here (ForwardPlan's Profile, forward_plan.hpp).
+void exl3_moe_cpu_set_prof(bool) {}
 
 namespace {
 
