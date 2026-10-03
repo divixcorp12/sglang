@@ -21,6 +21,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 from lease_chain_rig import EXPERTS, LAYERS, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe import expert_stream_transport as ops  # noqa: E402
 from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
 from sglang.test.dsv41_ram_miss_fixtures import paused  # noqa: E402
 
@@ -62,7 +63,7 @@ def _until(predicate, timeout_s=10.0):
     return predicate()
 
 
-PART_HITS, PART_MISSES = 1 << 8, 1 << 9  # CC's cpu_lanes bits: which CPU output part holds a partial
+PART_HITS, PART_MISSES = 1, 2  # CC's cpu_lanes[1] bits: which CPU output part holds a partial
 
 
 @pytest.mark.parametrize("miss", [False, True], ids=["ram_hit", "nvme_miss"])
@@ -156,7 +157,7 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         low_slot = int(dev.lane_slot[1]) if miss else ram_slot[low]
         assert forward.calls == [(HANDLE, [low_slot], [0.25])], "the tail lane (the low key) is the CPU's"
         assert c.kinds(2) == [LaneKind.HIT_COPY, LaneKind.MISS_CPU if miss else LaneKind.HIT_CPU]
-        assert int(dev.cpu_lanes.item()) == 0b10 | (PART_MISSES if miss else PART_HITS)
+        assert dev.cpu_lanes.tolist() == [0b10, PART_MISSES if miss else PART_HITS]
         if miss:
             assert c.handled() and c.host.mapping(row)[low] == low_slot, "the CPU miss was not inserted in RAM"
         want = c.expected([high], row)
@@ -181,6 +182,85 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         assert c.handled()
     finally:
         c.close()
+
+
+@pytest.mark.parametrize("miss_lane", [None, 11], ids=["hits", "last_lane_is_a_miss"])
+def test_cpu_lanes_past_bit_7_reach_the_route_tables_and_the_direct_gather(miss_lane):
+    """At 16 lanes the split sends the last 4 of 12 eligible lanes (8-11) to the CPU. CW and CC carry them in
+    ce_mask and cpu_lanes[0], the route tables rank their routes past every column, and DIRECT's commit leaves their
+    victims alone. Mutation: a mask narrowed to bits 0-7 drops all four lanes at each of the three."""
+    from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
+    from sglang.kernels.ops.moe.expert_residency_direct_gather import direct_commit_gather
+
+    lanes, count, slots, hidden = 16, 12, 14, 64
+    w = lease.wire_layout(lanes)
+    raw = torch.zeros(w.lease_block_bytes + w.block_align, dtype=torch.uint8, pin_memory=True)
+    block = raw[(-raw.data_ptr()) % w.block_align :]
+    block[w.copy_done : w.copy_done + 8].view(torch.int64)[0] = 1  # request 1's CopyDone: CW opens the gate itself
+
+    kinds = [LaneKind.HIT_COPY] * 8 + [LaneKind.HIT_CPU] * 4
+    parts = PART_HITS
+    if miss_lane is not None:
+        kinds[miss_lane] = LaneKind.MISS_CPU
+        parts |= PART_MISSES
+    lane_kind = torch.zeros(w.lanes, dtype=torch.int32, device="cuda")
+    lane_kind[:count] = torch.tensor([int(k) for k in kinds], dtype=torch.int32)
+    lane_slot = torch.arange(w.lanes, dtype=torch.int32, device="cuda")
+    dst_slots = torch.arange(100, 100 + w.lanes, dtype=torch.int32, device="cuda")
+    state = torch.zeros(len(ops.STATE_WORDS), dtype=torch.int32, device="cuda")
+    state[ops.STATE_WORDS["pending"]] = 1
+    ce_mask = torch.full((3,), -1, dtype=torch.int32, device="cuda")
+    cpu_lanes = torch.full((2,), -1, dtype=torch.int32, device="cuda")
+    ops._device_module("exl3", lanes).expert_stream_lease_copy_wait(
+        state, torch.tensor([count], dtype=torch.int32, device="cuda"), int(block.data_ptr()), lane_kind, lane_slot,
+        dst_slots, 0, 0, ce_mask, cpu_lanes, 0,
+    )
+    torch.cuda.synchronize()
+    assert ce_mask.tolist() == [0xFFF, 0xF00, parts]
+    assert cpu_lanes.tolist() == [0xF00, parts]
+
+    # Lane i is route i, routed to slot i, as the post's plan makes it for a BS1 remap.
+    remap = torch.arange(count, dtype=torch.int64, device="cuda")
+    weights = torch.ones(count, dtype=torch.float32, device="cuda")
+    keep = torch.ones(1, dtype=torch.float32, device="cuda")
+    x = torch.ones(1, hidden, dtype=torch.float32, device="cuda")
+    partial = torch.full((2, hidden), 3.0, dtype=torch.float32).pin_memory()
+    out = torch.full((1, hidden), 5.0, dtype=torch.float32, device="cuda")
+    count_out = torch.full((slots + 1,), 99, dtype=torch.int64, device="cuda")
+    inv = torch.full((count,), -3, dtype=torch.int64, device="cuda")
+    ws = torch.zeros(count, dtype=torch.float16, device="cuda")
+    det = torch.zeros(3, slots + 1, dtype=torch.int64, device="cuda")
+    exl3_moe_route_tables(
+        remap, weights, keep, x, torch.zeros_like(remap), torch.zeros(1, hidden, dtype=torch.float16, device="cuda"),
+        out, count_out, inv, ws, det, cpu_lanes=cpu_lanes, dst_slots=remap.to(torch.int32),
+        cpu_out=partial.data_ptr(), cpu_part_stride=hidden,
+    )
+    torch.cuda.synchronize()
+    assert count_out.tolist() == [1] * 8 + [0] * (slots + 1 - 8), "lanes 8-11 must count 0 in every slot"
+    assert inv.tolist() == list(range(count)), "lanes 8-11 rank past every column, after lanes 0-7"
+    assert out.eq(3.0 * bin(parts).count("1")).all(), "the flagged parts' partial sums seed the output"
+
+    # DIRECT's commit: the four CPU lanes keep their victims' experts; only lanes 0-7 are inserted.
+    experts = 2 * count
+    mapping = torch.full((experts + 1,), -1, dtype=torch.int64, device="cuda")
+    slot_to_expert = torch.full((count + 1,), -1, dtype=torch.int64, device="cuda")
+    for slot in range(count):
+        mapping[experts - 1 - slot] = slot
+        slot_to_expert[slot] = experts - 1 - slot
+    slot_state = torch.full((count + 1,), READY_STATE, dtype=torch.uint8, device="cuda")
+    slot_state[count] = FREE_STATE
+    insertions, evictions, truncated = (torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(3))
+    delivered = torch.tensor([count], dtype=torch.int32, device="cuda")
+    direct_commit_gather(
+        torch.arange(count, dtype=torch.int64, device="cuda"), torch.ones(count, dtype=torch.bool, device="cuda"),
+        torch.arange(count, dtype=torch.int64, device="cuda"), mapping, slot_to_expert, slot_state,
+        torch.zeros(count + 1, dtype=torch.int64, device="cuda"), insertions, evictions, truncated, delivered,
+        torch.ones(1, dtype=torch.float32, device="cuda"), delivered, ready=READY_STATE, free_state=FREE_STATE,
+        cpu_lanes=cpu_lanes,
+    )
+    torch.cuda.synchronize()
+    assert slot_to_expert[:count].tolist() == list(range(8)) + [experts - 1 - s for s in range(8, count)]
+    assert (insertions.item(), truncated.item()) == (8, 0)
 
 
 if __name__ == "__main__":

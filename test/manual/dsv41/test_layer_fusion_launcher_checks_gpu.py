@@ -187,7 +187,7 @@ COMMIT_REFUSALS = {
             **_commit_args(),
             "delivered": None,
             "keep": None,
-            "cpu_lanes": torch.zeros(1, dtype=torch.int32, device=CUDA),
+            "cpu_lanes": torch.zeros(2, dtype=torch.int32, device=CUDA),
         },
         "cpu_lanes needs the leased delivery count",
     ),
@@ -220,16 +220,16 @@ ROUTE_REFUSALS = {
         },
         "^x16_out: ",
     ),
-    "cpu_lanes_two_words": (
-        lambda: {**_route_args(), "cpu_lanes": torch.zeros(2, dtype=torch.int32, device=CUDA)},
-        "cpu_lanes: one word",
+    "cpu_lanes_three_words": (
+        lambda: {**_route_args(), "cpu_lanes": torch.zeros(3, dtype=torch.int32, device=CUDA)},
+        "cpu_lanes: two words",
     ),
     "cpu_out_missing": (
-        lambda: {**_route_args(), "cpu_lanes": torch.zeros(1, dtype=torch.int32, device=CUDA)},
+        lambda: {**_route_args(), "cpu_lanes": torch.zeros(2, dtype=torch.int32, device=CUDA)},
         "cpu_out: the CPU partial",
     ),
     "cpu_lanes_on_host": (
-        lambda: {**_route_args(), "cpu_lanes": torch.zeros(1, dtype=torch.int32), "cpu_out": 16},
+        lambda: {**_route_args(), "cpu_lanes": torch.zeros(2, dtype=torch.int32), "cpu_out": 16},
         "^cpu_lanes: ",
     ),
     "cpu_part_stride_unaligned": (

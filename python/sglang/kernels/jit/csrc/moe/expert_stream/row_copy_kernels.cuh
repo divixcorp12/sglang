@@ -246,7 +246,7 @@ struct CopyWaitParams {
   const int32_t* dst_slots;
   const int64_t* sm_table;
   int64_t sm_count;
-  int32_t* ce_mask;  // for CC: armed lanes in bits 0-7, CPU lanes in 8-15, CPU output parts in 16-17; 0: none
+  int32_t* ce_mask;  // for CC, three u32 words: {copy-engine and CPU lanes, CPU lanes, CPU output parts}; all 0: none
 };
 
 // Arguments of CC, the commit kernel that follows the stream's wait on the gate.
@@ -254,16 +254,12 @@ struct CopyCommitParams {
   const int32_t* state;
   const uint8_t* lease;
   const int32_t* ce_mask;
-  // CPU experts: the lanes the CPU computed (bits 0-7) and the output parts holding their partial sums (bit 8: part 0,
-  // the CPU hits'; bit 9: part 1, the CPU misses'), else 0; null when off.
+  // CPU experts, two words: {the lanes the CPU computed, the output parts holding their partial sums (bit 0: part 0,
+  // the CPU hits'; bit 1: part 1, the CPU misses')}, else 0; null when off.
   int32_t* cpu_lanes;
 };
 
-// ce_mask layout (CW writes, CC reads): copy-engine and CPU lanes in bits 0-7, CPU lanes again from kCeMaskCpuShift,
-// CPU output parts from kCeMaskPartShift.
-constexpr int kCeMaskCpuShift = 8;
-constexpr int kCeMaskPartShift = 16;
-constexpr int kCpuLanesPartShift = 8;  // cpu_lanes: parts above the lane mask
+static_assert(device::expert_stream::Wire::kLanes <= 32, "a lane mask is one u32");
 
 // CW: see CopyWaitParams. Closes the gate only when a copy-engine or CPU lane exists, and opens it itself when
 // CopyDone already holds G.
@@ -323,13 +319,15 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   }
   __syncthreads();  // every thread's SM reads before the gate below
   if (threadIdx.x != 0) return;
-  p.ce_mask[0] = 0;
+  p.ce_mask[0] = p.ce_mask[1] = p.ce_mask[2] = 0;
   if (planned_count == 0) return;
   const uint32_t mask = copying | cpu;
   if (mask == 0) return;
   uint8_t* const gate = lease + Wire::kLeaseCopyGate;
   st_relaxed_sys<uint32_t>(gate, copy_gate_word(seq, Wire::kLeaseGateClosed));
-  p.ce_mask[0] = static_cast<int32_t>(mask | cpu << kCeMaskCpuShift | cpu_parts << kCeMaskPartShift);
+  p.ce_mask[0] = static_cast<int32_t>(mask);
+  p.ce_mask[1] = static_cast<int32_t>(cpu);
+  p.ce_mask[2] = static_cast<int32_t>(cpu_parts);
   // Dekker with the copy thread (RamTier::copy_completed: CopyDone store, fence, gate load): this close is ordered
   // before the CopyDone load below, so one side always sees the other's store and opens the gate. Both open with the
   // same word, so opening twice is harmless.
@@ -348,15 +346,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   const uint32_t armed = static_cast<uint32_t>(p.ce_mask[0]);
-  if (p.cpu_lanes != nullptr) p.cpu_lanes[0] = 0;
-  if ((armed & 0xFFu) == 0) return;
+  if (p.cpu_lanes != nullptr) p.cpu_lanes[0] = p.cpu_lanes[1] = 0;
+  if (armed == 0) return;
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
   // Only a teardown opens a gate without CopyDone: the service is gone, and the copies may not have landed.
   if (ld_acquire_sys64(p.lease + Wire::kLeaseCopyDone + ring_index(seq) * Wire::kLeaseCopyDoneBytes) != generation) __trap();
   if (p.cpu_lanes != nullptr) {
-    p.cpu_lanes[0] = static_cast<int32_t>(
-        (armed >> kCeMaskCpuShift & 0xFFu) | (armed >> kCeMaskPartShift & 0x3u) << kCpuLanesPartShift);
+    p.cpu_lanes[0] = p.ce_mask[1];
+    p.cpu_lanes[1] = p.ce_mask[2] & 0x3;
   }
 }
 
@@ -501,11 +499,12 @@ struct RowCopyKernel {
     expert_stream::verify_named(
         "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
-        "ce_mask", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ce_mask);
+        "ce_mask", TensorMatcher({3}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ce_mask);
     // CPU experts off: an empty tensor, and CC writes no CPU lanes.
     expert_stream::verify_named(
         "cpu_lanes", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes);
-    RuntimeCheck(cpu_lanes.size(0) <= 1, "cpu_lanes: one word, or empty when CPU experts are off");
+    RuntimeCheck(
+        cpu_lanes.size(0) == 0 || cpu_lanes.size(0) == 2, "cpu_lanes: two words, or empty when CPU experts are off");
     RuntimeCheck(
         lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
         "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
@@ -546,7 +545,7 @@ struct RowCopyKernel {
         .state = static_cast<const int32_t*>(state.data_ptr()),
         .lease = reinterpret_cast<const uint8_t*>(lease_address),
         .ce_mask = static_cast<const int32_t*>(ce_mask.data_ptr()),
-        .cpu_lanes = cpu_lanes.size(0) == 1 ? static_cast<int32_t*>(cpu_lanes.data_ptr()) : nullptr,
+        .cpu_lanes = cpu_lanes.size(0) == 2 ? static_cast<int32_t*>(cpu_lanes.data_ptr()) : nullptr,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_copy_commit_kernel, commit);
   }

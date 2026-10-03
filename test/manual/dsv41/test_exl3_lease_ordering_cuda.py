@@ -146,7 +146,7 @@ def test_copy_engine_hits_typed_while_the_service_is_paused_are_waited_for_in_cw
             torch.cuda.synchronize()
             assert c.kinds(3) == [LaneKind.HIT_COPY] * 3
             assert int(c.dev.go_1.item()) == 0
-            assert int(c.dev.ce_mask.item()) & 0xFF == 0b111, "CW did not wait for the three HIT_COPY lanes"
+            assert int(c.dev.ce_mask[0]) == 0b111, "CW did not wait for the three HIT_COPY lanes"
             c.check(experts, snapshot)
             assert c.handled(), c.host.counters()
     finally:
