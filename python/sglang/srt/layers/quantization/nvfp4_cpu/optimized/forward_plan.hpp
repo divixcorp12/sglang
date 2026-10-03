@@ -112,8 +112,9 @@ private:
             pin_compute_worker(worker, pin_error);
             if (n == count) {
                 step<Phase::PrepareInput>(ctx, worker, n);
-                // `invalid` is read only after a barrier, so every worker takes the same branch.
-                if (!ctx.invalid.load(std::memory_order_relaxed)) {
+                // `invalid` and `pin_error` are read only after a barrier (every pin precedes PrepareInput's), so every
+                // worker takes the same branch; a failed pin computes nothing into out.
+                if (!ctx.invalid.load(std::memory_order_relaxed) && !pin_error.load(std::memory_order_relaxed)) {
                     step<Phase::GateUp>(ctx, worker, n);
                     step<Phase::Middle>(ctx, worker, n);
                     if (!ctx.invalid.load(std::memory_order_relaxed)) phase<Phase::Down>(ctx, worker, n);
