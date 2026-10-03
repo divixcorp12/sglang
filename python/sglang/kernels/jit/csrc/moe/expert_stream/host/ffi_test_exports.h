@@ -708,12 +708,22 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       alignas(128) uint8_t record[Wire::kRecordBytes] = {};
       std::atomic<bool> done{false};
       const auto count_of = [](uint32_t round) { return static_cast<uint16_t>(round % Wire::kLanes + 1); };
+      // Every lane field of every cache line carries a value of the round, so a copy that mixes two rounds fails
+      // `whole` whichever line it took from the other round.
+      const auto id_of = [](uint32_t round, int j, int salt) {
+        return static_cast<int16_t>((round * 7u + static_cast<uint32_t>(j) * 131u + static_cast<uint32_t>(salt)) & 0x7FFFu);
+      };
+      const auto kind_of = [](uint32_t round, int j) { return static_cast<uint8_t>(1 + (round + j) % 5); };
+      const auto weight_of = [](uint32_t round, int j) { return static_cast<float>((round & 0xFFFFu) + j); };
       std::thread writer([&] {
         for (uint32_t round = 1; !done.load(std::memory_order_relaxed); ++round) {
-          const uint16_t row = static_cast<uint16_t>(round), count = count_of(round);
-          // Protect ids only, no lanes.
-          const uint8_t counts = Wire::kPackedCounts ? static_cast<uint8_t>(count << 4) : uint8_t{0};
+          const uint16_t row = static_cast<uint16_t>(round), protect = count_of(round);
+          // All kLanes lanes are live; the protect ids vary in number.
+          const uint8_t counts = Wire::kPackedCounts ? static_cast<uint8_t>(Wire::kLanes | protect << 4)
+                                                     : static_cast<uint8_t>(Wire::kLanes);
           const uint8_t flags = static_cast<uint8_t>(round & 1u);
+          const uint64_t chain = round;
+          const uint32_t epoch = round * 3u;
           const int16_t id = static_cast<int16_t>(round & 0x7FFFu);
           store_release(record + Wire::kRecSeq, 0u);
           std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -721,9 +731,24 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
           std::memcpy(record + Wire::kRecRow, &row, 2);
           std::memcpy(record + Wire::kRecCounts, &counts, 1);
           std::memcpy(record + Wire::kRecFlags, &flags, 1);
-          if (!Wire::kPackedCounts) record[Wire::kRecProtectCount] = static_cast<uint8_t>(count);
-          for (int i = 0; i < count; ++i)
+          std::memcpy(record + Wire::kRecChain, &chain, 8);
+          std::memcpy(record + Wire::kRecEpoch, &epoch, 4);
+          if (!Wire::kPackedCounts) record[Wire::kRecProtectCount] = static_cast<uint8_t>(protect);
+          for (int i = 0; i < protect; ++i)
             std::memcpy(record + Wire::kRecProtect + 2 * i, &id, 2);
+          for (int j = 0; j < Wire::kLanes; ++j) {
+            const int16_t expert = id_of(round, j, 1), slot = id_of(round, j, 2), dst = id_of(round, j, 3);
+            const float weight = weight_of(round, j);
+            const uint32_t kind_bits = static_cast<uint32_t>(kind_of(round, j)) << (4 * (j % 8));
+            uint32_t word;
+            std::memcpy(&word, record + Wire::kRecKinds + 4 * (j / 8), 4);
+            word |= kind_bits;
+            std::memcpy(record + Wire::kRecKinds + 4 * (j / 8), &word, 4);
+            std::memcpy(record + Wire::kRecLaneExpert + 2 * j, &expert, 2);
+            std::memcpy(record + Wire::kRecLaneSlot + 2 * j, &slot, 2);
+            std::memcpy(record + Wire::kRecLaneDst + 2 * j, &dst, 2);
+            std::memcpy(record + Wire::kRecLaneWeight + 4 * j, &weight, 4);
+          }
           std::atomic_thread_fence(std::memory_order_seq_cst);
           store_release(record + Wire::kRecSeq, round * Wire::kDemandRecords + 1u);  // seqs of one ring slot
         }
@@ -737,9 +762,18 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         ++accepted;
         const uint32_t round = (seq - 1u) / Wire::kDemandRecords;
         bool whole = request.row == static_cast<uint16_t>(round) && request.captured == ((round & 1u) != 0) &&
-                     request.protect.size() == count_of(round);
+                     request.protect.size() == count_of(round) && request.chain == round &&
+                     request.gen == (static_cast<uint64_t>(round * 3u) << 32 | seq) &&
+                     request.lanes.size() == static_cast<size_t>(Wire::kLanes);
         for (int32_t id : request.protect)
           whole = whole && id == static_cast<int16_t>(round & 0x7FFFu);
+        for (size_t j = 0; whole && j < request.lanes.size(); ++j) {
+          const Lane& lane = request.lanes[j];
+          const int jj = static_cast<int>(j);
+          whole = lane.expert == id_of(round, jj, 1) && lane.slot == id_of(round, jj, 2) &&
+                  lane.dst == id_of(round, jj, 3) && lane.weight == weight_of(round, jj) &&
+                  lane.kind == kind_of(round, jj);
+        }
         if (!whole) ++torn;
       }
       done.store(true);
