@@ -22,6 +22,7 @@ from lease_chain_rig import EXPERTS, LAYERS, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.kernels.ops.moe import expert_stream_transport as ops  # noqa: E402
+from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertForward  # noqa: E402
 from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
 from sglang.test.dsv41_ram_miss_fixtures import paused  # noqa: E402
 
@@ -29,22 +30,19 @@ HIDDEN = 64
 HANDLE = 7
 READY_STATE, FREE_STATE = 3, 0  # expert_residency_gpu's _READY and _FREE
 
-_FORWARD = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_int64, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int32, ctypes.POINTER(ctypes.c_float), ctypes.c_int32, ctypes.c_int32,
-)
-
 
 class _Forward:
     """Records (layer, slots, weights) and writes a zero partial."""
 
     def __init__(self):
         self.calls = []
-        self.c = _FORWARD(self._run)
+        self.c = CpuExpertForward(self._run)
 
-    def _run(self, layer, x, slots, weights, k, out, threads, accumulate):
-        self.calls.append((layer, [slots[i] for i in range(k)], [weights[i] for i in range(k)]))
-        if not accumulate:
+    def _run(self, call):
+        c = call.contents
+        k, out = c.k, c.out
+        self.calls.append((c.layer, [c.slots[i] for i in range(k)], [c.weights[i] for i in range(k)]))
+        if not c.accumulate:
             for j in range(HIDDEN):
                 out[j] = 0.0
         return 0

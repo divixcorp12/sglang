@@ -625,12 +625,13 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     static std::atomic<int64_t> ns{0};
     return ns;
   }
-  static int
-  test_forward(int64_t, const void*, const int32_t*, const float*, int32_t k, float* out, int32_t, int32_t accumulate) {
+  static int test_forward(const SglangCpuExpertsForward* call) {
+    const int32_t k = call->k;
     const int64_t until = expert_stream::now_ns() + k * test_forward_ns().load(std::memory_order_relaxed);
     while (expert_stream::now_ns() < until)
       _mm_pause();
-    out[0] = accumulate != 0 ? out[0] + static_cast<float>(k) : static_cast<float>(k);
+    float* out = call->out;
+    out[0] = call->accumulate != 0 ? out[0] + static_cast<float>(k) : static_cast<float>(k);
     return 0;
   }
   static int64_t test_forward_address(int64_t ns_per_expert) {

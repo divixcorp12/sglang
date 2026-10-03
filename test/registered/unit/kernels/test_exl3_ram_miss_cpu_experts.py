@@ -23,6 +23,7 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
+from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertForward
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
@@ -37,18 +38,6 @@ HIDDEN = 8
 HANDLE = 7
 NO_SPLIT = [0] * (lease.LANES + 1)
 
-_FORWARD = ctypes.CFUNCTYPE(
-    ctypes.c_int,
-    ctypes.c_int64,
-    ctypes.c_void_p,
-    ctypes.POINTER(ctypes.c_int32),
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int32,
-    ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int32,
-    ctypes.c_int32,
-)
-
 
 class FakeForward:
     """out[j] = sum_i weights[i] * (slots[i] + 1) + j, or that sum added to out[j] when accumulating; returns
@@ -59,13 +48,15 @@ class FakeForward:
         self.calls = []
         self.accumulates = []
         self.affinities = []
-        self.c = _FORWARD(self._run)  # kept alive for as long as the host may call it
+        self.c = CpuExpertForward(self._run)  # kept alive for as long as the host may call it
 
-    def _run(self, layer, x, slots, weights, k, out, threads, accumulate):
+    def _run(self, call):
+        c = call.contents
+        slots, weights, k, out, accumulate = c.slots, c.weights, c.k, c.out, c.accumulate
         self.affinities.append(os.sched_getaffinity(0))
         s = [slots[i] for i in range(k)]
         w = [weights[i] for i in range(k)]
-        self.calls.append((layer, s, w, threads))
+        self.calls.append((c.layer, s, w, c.threads))
         self.accumulates.append(bool(accumulate))
         if self.result == 0:
             total = sum(wi * (si + 1) for si, wi in zip(s, w))

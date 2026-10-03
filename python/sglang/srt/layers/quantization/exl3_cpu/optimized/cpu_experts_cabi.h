@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../../../../kernels/jit/csrc/moe/expert_stream/host/cpu_expert_forward_abi.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -8,13 +9,10 @@ extern "C" {
 #define EXL3_CPU_NOEXCEPT
 #endif
 
-// FP16 x[hidden], FP32 output[hidden], overwritten, or added to when accumulate
-// is nonzero; routing weights are converted to FP16, preserving the registered
-// EXL3 kernel's convention. Caller counts as worker 0.
+// SglangCpuExpertsForward's rows through layer `call->layer`: x FP16, out FP32; k at most 32. Routing weights are
+// converted to FP16, preserving the registered EXL3 kernel's convention. Caller counts as worker 0.
 // Returns 0 on success, 1 on a kernel error, 2 on invalid arguments.
-int sglang_exl3_cpu_experts_forward(int64_t layer, const void* x,
-    const int32_t* slots, const float* weights, int32_t k, float* out,
-    int32_t threads, int32_t accumulate) EXL3_CPU_NOEXCEPT;
+int sglang_exl3_cpu_experts_forward(const SglangCpuExpertsForward* call) EXL3_CPU_NOEXCEPT;
 
 // Holds `threads` workers in register-only work of the forward's vector width until *word != seen or
 // CLOCK_MONOTONIC reaches deadline_ns, so they keep the forward's frequency license through an idle gap. Caller

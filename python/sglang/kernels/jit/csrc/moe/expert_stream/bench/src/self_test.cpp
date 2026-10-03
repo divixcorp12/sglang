@@ -470,25 +470,22 @@ std::vector<FakeCall> fake_calls;
 
 // The kernel's stand-in: out[h] = h + x[0] + sum_i weights[i] * (slots[i] + 1), x[0] read as an integer, so the output
 // proves the row's x, the slots and the weights reached it.
-int fake_forward(
-    int64_t layer,
-    const void* x,
-    const int32_t* slots,
-    const float* weights,
-    int32_t k,
-    float* out,
-    int32_t threads,
-    int32_t accumulate) {
+int fake_forward(const SglangCpuExpertsForward* call) {
+  const int32_t k = call->k;
+  const int32_t* slots = call->slots;
+  const float* weights = call->weights;
+  float* out = call->out;
   uint16_t x0;
-  std::memcpy(&x0, x, 2);
+  std::memcpy(&x0, call->x, 2);
   float sum = 0.0f;
   for (int32_t i = 0; i < k; ++i)
     sum += weights[i] * static_cast<float>(slots[i] + 1);
   for (int64_t h = 0; h < kSelfHidden; ++h)
-    out[h] = (accumulate != 0 ? out[h] : 0.0f) + static_cast<float>(h) + static_cast<float>(x0) + sum;
+    out[h] = (call->accumulate != 0 ? out[h] : 0.0f) + static_cast<float>(h) + static_cast<float>(x0) + sum;
   std::lock_guard<std::mutex> guard(fake_mutex);
   fake_calls.push_back(
-      {layer, std::vector<int32_t>(slots, slots + k), std::vector<float>(weights, weights + k), threads, accumulate});
+      {call->layer, std::vector<int32_t>(slots, slots + k), std::vector<float>(weights, weights + k), call->threads,
+       call->accumulate});
   return 0;
 }
 

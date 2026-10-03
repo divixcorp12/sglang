@@ -10,11 +10,36 @@ The Python half of the RAM-miss integration is ``cpu_experts/service.py``; the n
 CPU expert thread is ``expert_stream/host/cpu_experts.h``.
 """
 
+import ctypes
 import os
 import threading
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
 import torch
+
+
+CPU_EXPERTS_FORWARD_ABI_VERSION = 1
+
+
+class CpuExpertsForwardCall(ctypes.Structure):
+    """``SglangCpuExpertsForward`` (``expert_stream/host/cpu_expert_forward_abi.h``); the field order is the C struct's."""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("rows", ctypes.c_int32),
+        ("layer", ctypes.c_int64),
+        ("x", ctypes.c_void_p),
+        ("slots", ctypes.POINTER(ctypes.c_int32)),
+        ("weights", ctypes.POINTER(ctypes.c_float)),
+        ("out", ctypes.POINTER(ctypes.c_float)),
+        ("k", ctypes.c_int32),
+        ("threads", ctypes.c_int32),
+        ("accumulate", ctypes.c_int32),
+    ]
+
+
+# A CpuExpertForward as ctypes: a native forward's address cast to it, or a Python fake the engine can call.
+CpuExpertForward = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(CpuExpertsForwardCall))
 
 
 class CpuExpertQuantTrait(Protocol):

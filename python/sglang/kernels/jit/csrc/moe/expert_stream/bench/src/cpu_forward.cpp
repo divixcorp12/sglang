@@ -191,15 +191,17 @@ struct Workload {
 
   // One full C ABI forward on `layer`, writing `output`. Throws if the call fails.
   void forward(size_t layer) {
-    if (sglang_exl3_cpu_experts_forward(
-            handles[layer],
-            fixture.layers[layer].input.data_ptr(),
-            slots.data(),
-            weights.data(),
-            experts,
-            output.data(),
-            options.workers,
-            /*accumulate=*/0))
+    SglangCpuExpertsForward call{};
+    call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
+    call.rows = 1;
+    call.layer = handles[layer];
+    call.x = fixture.layers[layer].input.data_ptr();
+    call.slots = slots.data();
+    call.weights = weights.data();
+    call.out = output.data();
+    call.k = experts;
+    call.threads = options.workers;
+    if (sglang_exl3_cpu_experts_forward(&call))
       throw std::runtime_error("Native CPU forward failed");
   }
 

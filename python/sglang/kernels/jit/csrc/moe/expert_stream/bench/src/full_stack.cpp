@@ -282,15 +282,17 @@ class Bench {
           "a bare forward once the stack exists would share worker 0's core with the CPU expert "
           "thread and run a second OpenMP team: BM_bare runs first "
           "(no --benchmark_enable_random_interleaving)");
-    if (sglang_exl3_cpu_experts_forward(
-            handles_[row],
-            fixture_.x_row(row),
-            experts_[k].data(),
-            weights_[k].data(),
-            k,
-            fixture_.out_row(row),
-            static_cast<int32_t>(placement_.workers.size()),
-            0) != 0)
+    SglangCpuExpertsForward call{};
+    call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
+    call.rows = 1;
+    call.layer = handles_[row];
+    call.x = fixture_.x_row(row);
+    call.slots = experts_[k].data();
+    call.weights = weights_[k].data();
+    call.out = fixture_.out_row(row);
+    call.k = k;
+    call.threads = static_cast<int32_t>(placement_.workers.size());
+    if (sglang_exl3_cpu_experts_forward(&call) != 0)
       throw std::runtime_error("the bare CPU forward failed");
   }
 

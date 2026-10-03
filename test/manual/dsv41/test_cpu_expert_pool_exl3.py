@@ -129,6 +129,11 @@ def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.moe.cpu_experts.pool import (
+        CPU_EXPERTS_FORWARD_ABI_VERSION,
+        CpuExpertForward,
+        CpuExpertsForwardCall,
+    )
     from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
 
     if not optimized_cpu(cpu_act_defines()):
@@ -136,16 +141,19 @@ def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
     ext = exl3_ext()
     slabs = _random_slabs(20261001)
     direct = _direct_layer(ext, slabs)
-    forward = ctypes.CFUNCTYPE(
-        ctypes.c_int, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
-        ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
-    )(Exl3CpuQuantTrait(ext, act_limit=LIMIT).native_forward())
+    forward = CpuExpertForward(Exl3CpuQuantTrait(ext, act_limit=LIMIT).native_forward())
     x = (torch.randn(H, generator=torch.Generator().manual_seed(2))).half()
 
     def run(slots, weights, out, accumulate):
         s = torch.tensor(slots, dtype=torch.int32)
         w = torch.tensor(weights, dtype=torch.float32)
-        assert forward(direct, x.data_ptr(), s.data_ptr(), w.data_ptr(), len(slots), out.data_ptr(), 1, accumulate) == 0
+        call = CpuExpertsForwardCall(
+            abi_version=CPU_EXPERTS_FORWARD_ABI_VERSION, rows=1, layer=direct, x=x.data_ptr(),
+            slots=ctypes.cast(s.data_ptr(), ctypes.POINTER(ctypes.c_int32)),
+            weights=ctypes.cast(w.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            out=ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_float)), k=len(slots), threads=1, accumulate=accumulate,
+        )
+        assert forward(ctypes.byref(call)) == 0
 
     try:
         first, second = torch.empty(H), torch.empty(H)

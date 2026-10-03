@@ -2693,19 +2693,23 @@ void exl3_moe_cpu_forward
 // expert_stream/host/cpu_experts.h calls these through addresses Exl3CpuQuantTrait resolves with dlsym, so the
 // service module links nothing of this one. Neither throws across the boundary.
 
-// CpuExpertForward: one token row x (fp16 [hidden]) through experts slots[0..k) of layer `handle`, weighted by
-// weights[0..k), into out (fp32 [hidden]): overwritten, or added to when `accumulate` is nonzero. The calling thread
-// is worker 0.
+// CpuExpertForward: call->rows token rows (x fp16 [rows][hidden]) through each row's experts, into out
+// (fp32 [rows][hidden]): overwritten, or added to when `accumulate` is nonzero. The calling thread is worker 0.
 extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_forward(
-    int64_t handle, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads,
-    int32_t accumulate) noexcept
+    const SglangCpuExpertsForward* call) noexcept
 {
-    if (k < 0 || k > 32 || !x || !out || threads<1 || (k && (!slots || !weights))) return 2;
+    if (!call || call->abi_version != SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION) return 2;
+    const SglangCpuExpertsForward& c = *call;
+    if (c.rows < 1 || c.k < 0 || c.k > 32 || !c.x || !c.out || c.threads < 1 || (c.k && (!c.slots || !c.weights)))
+        return 2;
     try
     {
-        at::Half wts[32];
-        for (int32_t i = 0; i < k; ++i) wts[i] = at::Half(weights[i]);
-        forward_raw(handle, static_cast<const at::Half*>(x), slots, wts, out, 1, k, threads, accumulate != 0);
+        static thread_local std::vector<at::Half> wts;
+        const size_t n = static_cast<size_t>(c.rows) * c.k;
+        wts.resize(n);
+        for (size_t i = 0; i < n; ++i) wts[i] = at::Half(c.weights[i]);
+        forward_raw(c.layer, static_cast<const at::Half*>(c.x), c.slots, wts.data(), c.out, c.rows, c.k, c.threads,
+                    c.accumulate != 0);
         return 0;
     }
     catch (...)

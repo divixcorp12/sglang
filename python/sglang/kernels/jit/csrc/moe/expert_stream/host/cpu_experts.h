@@ -19,6 +19,7 @@
 #pragma once
 
 #include "../lease_layout.h"
+#include "cpu_expert_forward_abi.h"
 #include "reader_base.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
@@ -42,21 +43,10 @@ static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<u
               "the keep-warm reads kick_ as a plain uint32_t");
 
 // A format's CPU expert kernel as a C ABI: the native half of CpuExpertQuantTrait
-// (python/sglang/srt/layers/moe/cpu_experts/pool.py).
-//
-// Overwrites out[0, hidden) with the sum over i < k of weights[i] * expert(slots[i])(x), or adds that sum to it when
-// `accumulate` is nonzero. slots[i] indexes the layer's pinned host tier and x is one input row in the trait's x
-// format. `layer` is the handle the trait registered for that layer. Returns 0 on success. Called from the CPU expert
-// thread only; `threads` is the kernel's worker count, the calling thread counted as one of them.
-using CpuExpertForward = int (*)(
-    int64_t layer,
-    const void* x,
-    const int32_t* slots,
-    const float* weights,
-    int32_t k,
-    float* out,
-    int32_t threads,
-    int32_t accumulate);
+// (python/sglang/srt/layers/moe/cpu_experts/pool.py). `call` is cpu_expert_forward_abi.h's contract; the engine passes
+// one row (rows 1) whose slots index the layer's pinned host tier. Returns 0 on success. Called from the CPU expert
+// thread only.
+using CpuExpertForward = int (*)(const SglangCpuExpertsForward* call);
 
 // A format's keep-warm, as a C ABI: runs register-only work of the kernel's vector width on `threads` workers, the
 // calling thread counted as one, until *word != seen or CLOCK_MONOTONIC reaches deadline_ns, so the cores keep the
@@ -258,16 +248,19 @@ class CpuExpertEngine {
       }
       idle = 0;
       const int64_t start = now_ns();
-      const int result = config_.forward(
-          handles_[job.row].load(std::memory_order_acquire),
-          config_.x_base + job.row * config_.x_stride,
-          job.slots,
-          job.weights,
-          job.k,
-          reinterpret_cast<float*>(
-              config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride),
-          config_.threads,
-          job.accumulate ? 1 : 0);
+      SglangCpuExpertsForward call{};
+      call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
+      call.rows = 1;
+      call.layer = handles_[job.row].load(std::memory_order_acquire);
+      call.x = config_.x_base + job.row * config_.x_stride;
+      call.slots = job.slots;
+      call.weights = job.weights;
+      call.out =
+          reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride);
+      call.k = job.k;
+      call.threads = config_.threads;
+      call.accumulate = job.accumulate ? 1 : 0;
+      const int result = config_.forward(&call);
       if (result != 0)
         fail_stop(
             prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed (" + std::to_string(result) +
