@@ -10,13 +10,16 @@ import os
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe import expert_stream_transport as ram_miss
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
-ROW, ROWS, DST_ROWS, HIDDEN, LANES = 1, 2, 6, 8, 8
+ROW, ROWS, DST_ROWS, HIDDEN = 1, 2, 6, 8
+LANES = lease.wire_layout(8).lanes
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
@@ -33,7 +36,7 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_forward_address(forward_ns), [0] * 9, cores, x_rows, out_rows, threads=2, spin_us=200)
+    host.enable_cpu_experts(host.test_forward_address(forward_ns), [0] * (LANES + 1), cores, x_rows, out_rows, threads=2, spin_us=200)
     if register:
         host.set_cpu_layer(ROW, 7)
     row_bytes = [t[0].numel() * t.element_size() for t in s.slabs[ROW].values()]
@@ -118,3 +121,24 @@ def test_calibration_needs_the_tier_owner(tmp_path):
             host.resume()
     finally:
         host.stop()
+
+
+@pytest.mark.parametrize("lanes", [8, 16])
+def test_the_calibration_grid_follows_the_lane_count(lanes):
+    from sglang.kernels.ops.moe.expert_stream_transport import _host_module
+
+    width = lease.wire_layout(lanes).lanes
+    assert ram_miss.calibration_shape(lanes) == (width + 2, width + 1)
+    assert ram_miss.stage_trace_rows(lanes) == 2 * width
+    module = _host_module("exl3", None, lanes)
+    assert module.expert_stream_trace_words is not None
+
+
+def test_a_tier_smaller_than_the_lane_width_skips_calibration(monkeypatch):
+    """Calibration needs one RAM slot and one expert of scratch per lane; a smaller tier keeps the configured split."""
+    from sglang.srt.layers.moe.cpu_experts import service
+
+    calls = []
+    monkeypatch.setattr(service, "_calibrate_native", lambda *a, **k: calls.append(a))
+    split = service.calibrated_or_configured(capacity=12, lanes=16, configured=[0] * 17)
+    assert split == [0] * 17 and calls == []

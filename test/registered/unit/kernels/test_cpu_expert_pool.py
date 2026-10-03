@@ -8,6 +8,7 @@ import weakref
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
 from sglang.srt.layers.moe.cpu_experts.policy import (
     format_calibration,
@@ -387,7 +388,7 @@ def _service(host, trait, **kw):
 
     slabs = {row: _fake_slabs() for row in range(2)}
     return CpuExpertService(
-        host, trait, slabs, **{"hidden": 8, "cores": [4, 5, 6], "threads": 2, "split": [0] * 9, "pin": False, **kw}
+        host, trait, slabs, **{"hidden": 8, "cores": [4, 5, 6], "threads": 2, "split": [0] * (lease.LANES + 1), "pin": False, **kw}
     )
 
 
@@ -397,7 +398,7 @@ def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit()
     host, trait = FakeHost(), FakeServiceTrait()
     svc = _service(host, trait)
     # out_rows is two parts per row: the CPU hits' partial sum and the CPU misses'.
-    assert host.enabled == (0xF00D, [0] * 9, [4, 5, 6], (2, 16), (2, 2, 8), 2)
+    assert host.enabled == (0xF00D, [0] * (lease.LANES + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2)
     assert host.layers == {}, "a row reached the grant before its registration"
     svc.register(1, 10.0)
     svc.register(1, 10.0)
@@ -434,7 +435,7 @@ def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
     assert svc.retune() == expected and host.splits == [expected]
     # The next window is measured from here: 64 more lanes at 10 ms each, a CPU slower than any link.
     host.stats = {"jobs": 12, "lanes": 128, "forward_ns": 64 * 100_000 + 64 * 10_000_000}
-    assert svc.retune() == [0] * 9
+    assert svc.retune() == [0] * (lease.LANES + 1)
 
 
 def test_service_logs_the_cumulative_cost_per_lane(caplog):
@@ -482,13 +483,13 @@ def test_split_from_grid_breaks_a_near_tie_toward_the_cpu():
     near = _grid(lambda n, k: 1.0 + 0.01 * k if k <= 1 else 9.0)
     far = _grid(lambda n, k: 1.0 + 0.03 * k if k <= 1 else 9.0)
     assert split_from_grid(near) == [0] + [1] * 8
-    assert split_from_grid(far) == [0] * 9
+    assert split_from_grid(far) == [0] * (lease.LANES + 1)
 
 
 def test_split_from_grid_never_exceeds_n_and_ignores_cells_past_n():
     # Cells k > n are unused (0.0 in the C++ grid); a 0.0 there must not win.
     grid = _grid(lambda n, k: 10.0 - k)  # more CPU is always faster
-    assert split_from_grid(grid) == list(range(9))
+    assert split_from_grid(grid) == list(range(lease.LANES + 1))
     assert all(0 <= k <= n for n, k in enumerate(split_from_grid(grid)))
 
 
@@ -515,7 +516,7 @@ def _calibrating_service(host, capacity=9):
 
     trait = FakeServiceTrait()
     slabs = {row: _fake_slabs(capacity) for row in range(2)}
-    svc = CpuExpertService(host, trait, slabs, hidden=8, cores=[4, 5, 6], threads=2, split=[0] * 9, pin=False)
+    svc = CpuExpertService(host, trait, slabs, hidden=8, cores=[4, 5, 6], threads=2, split=[0] * (lease.LANES + 1), pin=False)
     svc.register(0, 10.0)
     svc.register(1, 10.0)
     return svc
@@ -559,7 +560,7 @@ def test_calibration_needs_a_registered_row_with_eight_slots(caplog):
     with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.cpu_experts.service"):
         assert svc.calibrate(-1) is None
     assert "no registered row has 8 RAM slots" in caplog.text
-    assert host.calibrations == [] and svc.split == [0] * 9
+    assert host.calibrations == [] and svc.split == [0] * (lease.LANES + 1)
 
 
 def test_failed_calibration_warns_and_keeps_the_split(caplog):
@@ -569,7 +570,7 @@ def test_failed_calibration_warns_and_keeps_the_split(caplog):
     with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.cpu_experts.service"):
         assert svc.calibrate(-1) is None
     assert "did not finish" in caplog.text
-    assert host.splits == [] and svc.split == [0] * 9 and not svc.calibrated
+    assert host.splits == [] and svc.split == [0] * (lease.LANES + 1) and not svc.calibrated
 
 
 def test_failed_calibration_keeps_its_scratch_alive_and_rebaselines_the_stats():
