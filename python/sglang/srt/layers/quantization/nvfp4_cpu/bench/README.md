@@ -3,14 +3,15 @@
 Follows `kernels/jit/csrc/moe/expert_stream/bench/run.sh`: two separate
 executables with fixed worker teams, alternating backend order each round,
 Google Benchmark manual wall timing, fresh JSON/log files and environment
-records. No Python, PyTorch, CUDA or OpenMP is required.
+records. No Python, PyTorch or CUDA is required; the kernel needs OpenMP, and `run.sh` sets its wait policy
+(`OMP_WAIT_POLICY=ACTIVE`, `GOMP_SPINCOUNT=INFINITE`, `OMP_DYNAMIC=FALSE`) unless the caller already did.
 
 `nvfp4_cpu_baseline` converts each GPU-layout row into worker-local GGML
 scratch and calls the unchanged pinned `ggml_vec_dot_nvfp4_q8_0` kernel.
 `nvfp4_cpu_optimized` adapts that kernel to read the packed GPU weight bytes
 and 128x4-swizzled scales directly. Both compile with `-march=native` and
 use identical Q8_0 activation quantization, FP32 projections, SiLU, routing,
-thread pool and `CpuExpertForward` ABI. Baseline row conversion is timed;
+OpenMP team and `CpuExpertForward` ABI. Baseline row conversion is timed;
 scratch allocation is performed during warmup. Neither retains a repacked
 weight cache. See [source provenance](../upstream/README.md).
 
@@ -21,19 +22,14 @@ From the checkout root, on the Linux machine where timing will run:
 ```sh
 src=python/sglang/srt/layers/quantization/nvfp4_cpu
 build=/absolute/path/nvfp4-cpu-build
-cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release \
-  -DNVFP4_CPU_NATIVE=ON -DNVFP4_BUILD_BENCHMARK=ON
+cmake -S "$src/bench" -B "$build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$build" -j4
-ctest --test-dir "$build" --output-on-failure
 ```
 
-This builds the shared plugin, a native correctness harness and both benchmark
-executables in BUILD_DIR. Google Benchmark v1.9.4 uses the same pinned commit
-as the EXL3 benchmark; it is fetched if not installed. For offline builds,
-install its CMake package and set `NVFP4_FETCH_BENCHMARK=OFF`, or point
-`FETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK` to a local checkout of that version.
-The `bench` directory can also be configured directly to build only the two
-benchmark executables.
+This builds both benchmark executables in BUILD_DIR. Google Benchmark v1.9.4 uses the same pinned commit as the EXL3
+benchmark; it is fetched if not installed. For offline builds, install its CMake package and set
+`NVFP4_FETCH_BENCHMARK=OFF`, or point `FETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK` to a local checkout of that version.
+The library itself and the correctness harnesses build from Python (`../optimized/README.md`).
 
 ## Run and worker sweep
 

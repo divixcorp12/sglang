@@ -1,141 +1,121 @@
 // CPU experts derived from pinned GGML NVFP4 x Q8 kernels.
 // GPU weight slabs stay unchanged; see ../upstream/README.md for provenance.
+// A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp) on one OpenMP team per call; layers are read through
+// LayerInfo and StridedExperts (experts.hpp) under a Shape (shapes.hpp).
+#if !defined(__linux__) || !defined(_OPENMP)
+#error The NVFP4 CPU expert kernel requires Linux and OpenMP.
+#endif
 #include "cpu_experts_cabi.h"
 #include "../upstream/kernels.h"
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <condition_variable>
-#include <cstring>
-#include <memory>
-#include <mutex>
-#include <stdexcept>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-#if defined(__linux__)
+#include <omp.h>
 #include <pthread.h>
 #include <sched.h>
-#endif
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #if defined(__AVX2__) && !defined(NVFP4_CPU_FORCE_SCALAR)
 #include <immintrin.h>
 #endif
 
 namespace {
 #include "dot_nvfp4.h"
-struct Layer {
-    SglangNvfp4CpuLayer d;
-    // Activations only. Sized once; mutable slab contents are read each job.
-    std::vector<float> x, intermediate, result;
-    std::vector<block_q8_0> qx, qi;
-    std::vector<std::vector<block_nvfp4>> row_scratch;
-    explicit Layer(const SglangNvfp4CpuLayer& desc) : d(desc), x(d.hidden),
-        intermediate(d.intermediate), result(d.hidden),
-        qx(rounded(d.hidden,64)/32), qi(rounded(d.intermediate,64)/32) {
-        x.resize(rounded(d.hidden,64)); intermediate.resize(rounded(d.intermediate,64));
+
+// The dot product's tier is fixed when the library is compiled (dot_nvfp4.h's #if chain): AVX2 under -march=native
+// on an AVX2 host, else the scalar loop.
+enum class Isa { Scalar, Avx2 };
+#if defined(__AVX2__)
+constexpr Isa kBuildIsa = Isa::Avx2;
+#else
+constexpr Isa kBuildIsa = Isa::Scalar;
+#endif
+
+#include "experts.hpp"
+#include "shapes.hpp"
+
+// -------------------------------------------------------------------------------------------
+//   Layer registry
+// -------------------------------------------------------------------------------------------
+
+LayerInfo info_of(const SglangNvfp4CpuLayer& d)
+{
+    return {d.capacity, d.hidden, d.intermediate, d.w13_layout, d.act_limit, d.inv_input_scale13,
+            d.inv_input_scale2, d.slabs[kUpAlpha] != nullptr};
+}
+
+StridedExperts<GenericShape> strided_of(const SglangNvfp4CpuLayer& d)
+{
+    StridedExperts<GenericShape> e{};
+    for (int i = 0; i < kSlabNames; ++i) {
+        e.base[i] = static_cast<const uint8_t*>(d.slabs[i]);
+        e.stride[i] = d.slot_bytes[i];
     }
-    const uint8_t* slab(int i, int slot) const {
-        return static_cast<const uint8_t*>(d.slabs[i]) + size_t(slot) * d.slot_bytes[i];
-    }
-    float alpha(int i, int slot) const {
-        float v; std::memcpy(&v, slab(i, slot), sizeof(v)); return v;
-    }
+    return e;
+}
+
+struct RegisteredLayer
+{
+    LayerInfo info;
+    StridedExperts<GenericShape> strided;
 };
 std::mutex registry_mutex;
-std::unordered_map<int64_t, std::shared_ptr<Layer>> layers;
+std::unordered_map<int64_t, std::shared_ptr<const RegisteredLayer>> layers;
 int64_t next_handle = 1;
-std::shared_ptr<Layer> lookup(int64_t h) {
+std::shared_ptr<const RegisteredLayer> lookup(int64_t h) {
     std::lock_guard<std::mutex> lock(registry_mutex);
     auto it = layers.find(h); return it == layers.end() ? nullptr : it->second;
 }
 
-// Persistent helpers. One engine owns the process-wide pool; overlapping
-// forwards are rejected, rather than racing activation scratch or task state.
-class Workers {
-    std::mutex mutex;
-    std::condition_variable wake, done;
-    std::vector<std::thread> helpers;
-    std::vector<int32_t> cores;
-    uint64_t generation = 0;
-    int remaining = 0, count = 0, active = 0;
-    bool stop = false, pin_failed = false;
-    void (*task)(void*, int, int) = nullptr;
-    void* context = nullptr;
-    bool pin(int rank) {
-        if (cores.empty()) return true;
-#if defined(__linux__)
-        cpu_set_t set; CPU_ZERO(&set); CPU_SET(cores[rank], &set);
-        return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
-#else
-        (void)rank;
-        return false;
-#endif
+// One forward, core configuration or free at a time: the others return 3 rather than race the forward's scratch.
+std::mutex forward_mutex;
+
+// -------------------------------------------------------------------------------------------
+//   Worker cores
+// -------------------------------------------------------------------------------------------
+
+// Worker cores set by sglang_nvfp4_cpu_experts_set_cores; copied into g_compute_cores at the first forward.
+std::mutex g_cores_mutex;
+std::vector<int> g_configured_cores;
+std::atomic<bool> g_compute_started{false};
+std::vector<int> g_compute_cores;  // Immutable after release publication at first forward.
+
+// Freezes the configured cores into g_compute_cores once, at the first forward. Steady-state calls acquire no mutex.
+inline void freeze_compute_cores()
+{
+    if (g_compute_started.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_cores_mutex);
+    if (!g_compute_started.load(std::memory_order_relaxed)) {
+        g_compute_cores = g_configured_cores;
+        g_compute_started.store(true, std::memory_order_release);
     }
-    void helper(int rank) {
-        std::unique_lock<std::mutex> lock(mutex);
-        if (!pin(rank)) pin_failed = true;
-        --remaining; done.notify_one();
-        uint64_t seen = 0;
-        while (true) {
-            wake.wait(lock, [&] { return stop || generation != seen; });
-            if (stop) return;
-            seen = generation;
-            auto fn = task; auto ctx = context; const int n = active;
-            lock.unlock();
-            if (rank < n) fn(ctx, rank, n);
-            lock.lock(); --remaining; if (!remaining) done.notify_one();
-        }
+}
+
+// Inside a parallel region: pins OpenMP worker `worker` to its compute core (none configured: no-op), setting
+// pin_error if it cannot.
+inline void pin_compute_worker(int worker, std::atomic<int>& pin_error)
+{
+    if (g_compute_cores.empty()) return;
+    const int core = g_compute_cores[worker];
+    static thread_local int pinned_core = -1;
+    if (pinned_core != core || sched_getcpu() != core) {
+        cpu_set_t set; CPU_ZERO(&set); CPU_SET(core, &set);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set))
+            pin_error.store(1, std::memory_order_relaxed);
+        else pinned_core = core;
     }
-public:
-    std::mutex forward_mutex;
-    ~Workers() {
-        { std::lock_guard<std::mutex> lock(mutex); stop = true; }
-        wake.notify_all(); for (auto& t : helpers) t.join();
-    }
-    int configure(const int32_t* c, int n) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (count || !c || n < 1 || n > 4096) return 2;
-#if defined(__linux__)
-        cpu_set_t allowed; CPU_ZERO(&allowed);
-        if (sched_getaffinity(0, sizeof(allowed), &allowed)) return 2;
-        for (int i = 0; i < n; ++i) {
-            if (c[i] < 0 || c[i] >= CPU_SETSIZE || !CPU_ISSET(c[i], &allowed)) return 2;
-            for (int j = 0; j < i; ++j) if (c[j] == c[i]) return 2;
-        }
-        cores.assign(c, c + n); return 0;
-#else
-        return 2; // Standalone unpinned tests work on other hosts.
-#endif
-    }
-    void initialize(int n) {
-        std::unique_lock<std::mutex> lock(mutex);
-        if (count) {
-            if (n > count || pin_failed) throw std::runtime_error("pool size or affinity");
-            return;
-        }
-        if (!cores.empty() && size_t(n) > cores.size()) throw std::runtime_error("insufficient cores");
-        if (!pin(0)) throw std::runtime_error("caller affinity");
-        count = n;
-        // Increment only for helpers actually launched: thread creation failure
-        // leaves the pool marked unusable, with joinable helpers retained.
-        try {
-            for (int i = 1; i < n; ++i) {
-                ++remaining;
-                try { helpers.emplace_back([this, i] { helper(i); }); }
-                catch (...) { --remaining; throw; }
-            }
-        } catch (...) { pin_failed = true; throw; }
-        done.wait(lock, [&] { return remaining == 0; });
-        if (pin_failed) throw std::runtime_error("worker affinity");
-    }
-    void run(void (*fn)(void*, int, int), void* ctx, int n) {
-        { std::lock_guard<std::mutex> lock(mutex);
-          task = fn; context = ctx; active = n; remaining = int(helpers.size()); ++generation; }
-        wake.notify_all(); fn(ctx, 0, n);
-        std::unique_lock<std::mutex> lock(mutex);
-        done.wait(lock, [&] { return remaining == 0; });
-    }
-} workers;
+}
+
+// -------------------------------------------------------------------------------------------
+//   Arithmetic (unchanged from the pre-OpenMP kernel)
+// -------------------------------------------------------------------------------------------
 
 float dot(const uint8_t* w, const uint8_t* sf, int row, int k,
           const block_q8_0* x, block_nvfp4* scratch) {
@@ -167,43 +147,109 @@ float dot(const uint8_t* w, const uint8_t* sf, int row, int k,
     return dot_gpu(padded,view,x);
 #endif
 }
-bool quantize(const std::vector<float>& input, std::vector<block_q8_0>& output) {
-    for (float v:input) if (!std::isfinite(v) || std::abs(v)>65504.f*127.f) return false;
-    for (size_t b=0;b<output.size();++b) {
-        float amax=0;
-        for (int j=0;j<32;++j) amax=std::max(amax,std::abs(input[b*32+j]));
-        // A zero FP16 delta contributes zero. Avoid overflowing the reciprocal
-        // for subnormal FP32 amax in the upstream reference quantizer.
-        if (!ggml_compute_fp32_to_fp16(amax/127.f)) output[b]=block_q8_0{};
-        else quantize_row_q8_0_ref(input.data()+b*32,output.data()+b,32);
-    }
+
+// Whether Q8_0 represents the 32 values of a block: finite, with a delta within FP16 range.
+bool q8_representable(const float* v)
+{
+    for (int j = 0; j < 32; ++j)
+        if (!std::isfinite(v[j]) || std::abs(v[j]) > 65504.f * 127.f) return false;
     return true;
 }
-struct Work { Layer* layer; int slot; float route; int stage; };
-void calculate(void* p, int rank, int n) {
-    auto& c = *static_cast<Work*>(p); auto& l = *c.layer; auto& d = l.d;
-    if (c.stage == 0) {
-        const auto w = l.slab(0, c.slot), sf = l.slab(2, c.slot);
-        const float gate_alpha = l.alpha(4, c.slot) * d.inv_input_scale13;
-        const float up_alpha = l.alpha(d.slabs[6] ? 6 : 4, c.slot) * d.inv_input_scale13;
-        for (int i = rank; i < d.intermediate; i += n) {
-            int gate = i, up = i + d.intermediate;
-            if (d.w13_layout == 1) std::swap(gate, up);
-            if (d.w13_layout == 2) { up = (i / 64) * 128 + i % 64; gate = up + 64; }
-            float g = dot(w, sf, gate, d.hidden, l.qx.data(), l.row_scratch[rank].data()) * gate_alpha;
-            float u = dot(w, sf, up, d.hidden, l.qx.data(), l.row_scratch[rank].data()) * up_alpha;
-            if (d.act_limit > 0) { g = std::min(g, d.act_limit); u = std::clamp(u, -d.act_limit, d.act_limit); }
-            // Stable SiLU, including large negative gates.
-            const float silu = g >= 0 ? g / (1 + std::exp(-g)) : g * std::exp(g) / (1 + std::exp(g));
-            l.intermediate[i] = silu * u;
-        }
-    } else {
-        const auto w = l.slab(1, c.slot), sf = l.slab(3, c.slot);
-        const float alpha = l.alpha(5, c.slot) * d.inv_input_scale2 * c.route;
-        for (int i = rank; i < d.hidden; i += n)
-            l.result[i] += dot(w, sf, i, d.intermediate, l.qi.data(), l.row_scratch[rank].data()) * alpha;
-    }
+
+// One Q8_0 block. A zero FP16 delta contributes zero; this also avoids overflowing the reciprocal for a subnormal
+// FP32 amax in the upstream reference quantizer.
+void quantize_block(const float* v, block_q8_0& out)
+{
+    float amax = 0;
+    for (int j = 0; j < 32; ++j) amax = std::max(amax, std::abs(v[j]));
+    if (!ggml_compute_fp32_to_fp16(amax / 127.f)) out = block_q8_0{};
+    else quantize_row_q8_0_ref(v, &out, 32);
 }
+
+// Gate/up output of the gated SiLU: optional pre-SiLU clamp (gate from above, up both ways), stable SiLU including
+// large negative gates, times up.
+inline float swiglu(float g, float u, float limit)
+{
+    if (limit > 0) { g = std::min(g, limit); u = std::clamp(u, -limit, limit); }
+    const float silu = g >= 0 ? g / (1 + std::exp(-g)) : g * std::exp(g) / (1 + std::exp(g));
+    return silu * u;
+}
+
+// -------------------------------------------------------------------------------------------
+//   Forward context and scratch
+// -------------------------------------------------------------------------------------------
+
+constexpr int kMaxRoutes = 8;  // the C ABI's k limit
+
+// 64-byte-aligned storage, so each kRowUnit share of fp32 outputs owns whole cache lines.
+template <class T>
+struct CacheAligned
+{
+    using value_type = T;
+    CacheAligned() = default;
+    template <class U> CacheAligned(const CacheAligned<U>&) {}
+    T* allocate(size_t n) { return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t{64})); }
+    void deallocate(T* p, size_t) { ::operator delete(p, std::align_val_t{64}); }
+    template <class U> bool operator==(const CacheAligned<U>&) const { return true; }
+};
+
+struct Route
+{
+    int slot;
+    float weight;
+};
+
+struct ForwardCtx
+{
+    LayerInfo info;
+    const uint8_t* x;  // fp16 [hidden], possibly unaligned
+    float* out;        // fp32 [hidden]
+    bool accumulate;
+    Route route[kMaxRoutes];  // live routes (no -1 slot, no zero weight), in routing order
+    int routes = 0;
+    // Bound by the plan from the layer's experts, per route.
+    Projection gate[kMaxRoutes], up[kMaxRoutes], down[kMaxRoutes];
+    float gate_alpha[kMaxRoutes], up_alpha[kMaxRoutes], down_alpha[kMaxRoutes];
+    // Scratch from the calling thread's ForwardArena.
+    float* xf;                  // [rounded(hidden, 64)]
+    block_q8_0* qx;             // [rounded(hidden, 64) / 32]
+    float* inter;               // [routes][rounded(intermediate, 64)]
+    block_q8_0* qi;             // [routes][rounded(intermediate, 64) / 32]
+    block_nvfp4* row_scratch;   // [workers][row_scratch_stride], upstream-baseline builds only
+    size_t row_scratch_stride;
+    // Q8_0 cannot represent the input or an intermediate: the forward returns 2 and leaves out untouched.
+    std::atomic<bool> invalid{false};
+};
+
+struct ForwardArena
+{
+    std::vector<float, CacheAligned<float>> xf, inter;
+    std::vector<block_q8_0> qx, qi;
+    std::vector<block_nvfp4> row_scratch;
+
+    static ForwardArena& get()
+    {
+        static thread_local ForwardArena arena;
+        return arena;
+    }
+};
+
+#include "forward_plan.hpp"
+
+// Runs the call's plan: the MiMo V2.6 Pro plan when the layer is that model's routed expert on an AVX2 build, else the
+// generic plan for this build's tier. Both read the same slabs; the MiMo plan through the view checked for it. A template
+// so a scalar build discards, and never instantiates, the AVX2 plan.
+template <Isa I = kBuildIsa>
+int run_plan(ForwardCtx& ctx, const RegisteredLayer& layer, int threads)
+{
+    if constexpr (I == Isa::Avx2) {
+        if (MimoV26ProShape::accepts(ctx.info))
+            return ForwardPlan<MimoV26ProShape, Isa::Avx2>::run(ctx, layer.strided.as<MimoV26ProShape>(),
+                                                                ForwardArena::get(), threads);
+    }
+    return ForwardPlan<GenericShape, I>::run(ctx, layer.strided, ForwardArena::get(), threads);
+}
+
 bool valid(const SglangNvfp4CpuLayer& d) {
     if (d.abi_version != 1 || d.capacity < 1 || d.hidden < 16 || d.intermediate < 16
         || d.hidden > (1 << 20) || d.intermediate > (1 << 20)
@@ -212,13 +258,10 @@ bool valid(const SglangNvfp4CpuLayer& d) {
         || !std::isfinite(d.act_limit) || d.act_limit < 0
         || !std::isfinite(d.inv_input_scale13) || d.inv_input_scale13 <= 0
         || !std::isfinite(d.inv_input_scale2) || d.inv_input_scale2 <= 0) return false;
-    const uint64_t minimum[7] = {uint64_t(d.intermediate) * d.hidden,
-        uint64_t(d.hidden) * d.intermediate / 2,
-        rounded(2 * d.intermediate, 128) * rounded(d.hidden / 16, 4),
-        rounded(d.hidden, 128) * rounded(d.intermediate / 16, 4), 4, 4, 4};
-    for (int i = 0; i < 7; ++i) {
-        if (i == 6 && !d.slabs[i]) continue;
-        if (!d.slabs[i] || d.slot_bytes[i] < minimum[i]
+    const SlabRowBytes minimum = SlabRowBytes::of(d.hidden, d.intermediate);
+    for (int i = 0; i < kSlabNames; ++i) {
+        if (i == kUpAlpha && !d.slabs[i]) continue;
+        if (!d.slabs[i] || d.slot_bytes[i] < minimum.bytes[i]
             || d.slot_bytes[i] > SIZE_MAX / uint64_t(d.capacity)) return false;
     }
     return true;
@@ -228,59 +271,66 @@ bool valid(const SglangNvfp4CpuLayer& d) {
 extern "C" int sglang_nvfp4_cpu_experts_register_slabs(const SglangNvfp4CpuLayer* d, int64_t* h) noexcept {
     if (!d || !h || !valid(*d)) return 2;
     try {
-        auto l = std::make_shared<Layer>(*d);
+        auto l = std::make_shared<const RegisteredLayer>(RegisteredLayer{info_of(*d), strided_of(*d)});
         std::lock_guard<std::mutex> lock(registry_mutex);
         if (next_handle == INT64_MAX) return 1;
         const auto id = next_handle++; layers.emplace(id, std::move(l)); *h = id; return 0;
     } catch (...) { return 1; }
 }
+
 extern "C" int sglang_nvfp4_cpu_experts_free_layer(int64_t h) noexcept {
     try {
-        std::unique_lock<std::mutex> forward_lock(workers.forward_mutex, std::try_to_lock);
+        std::unique_lock<std::mutex> forward_lock(forward_mutex, std::try_to_lock);
         if (!forward_lock.owns_lock()) return 3;
         std::lock_guard<std::mutex> lock(registry_mutex); return layers.erase(h) ? 0 : 2;
     }
     catch (...) { return 1; }
 }
+
+// Worker i on cores[i], the caller as worker 0. Cores must be distinct and allowed by this thread's affinity; refused
+// (2) once the first forward has frozen them.
 extern "C" int sglang_nvfp4_cpu_experts_set_cores(const int32_t* c, int32_t n) noexcept {
     try {
-        std::unique_lock<std::mutex> lock(workers.forward_mutex, std::try_to_lock);
-        return lock.owns_lock() ? workers.configure(c, n) : 3;
+        std::unique_lock<std::mutex> forward_lock(forward_mutex, std::try_to_lock);
+        if (!forward_lock.owns_lock()) return 3;
+        if (!c || n < 1 || n > 4096) return 2;
+        cpu_set_t allowed; CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof(allowed), &allowed)) return 2;
+        for (int i = 0; i < n; ++i) {
+            if (c[i] < 0 || c[i] >= CPU_SETSIZE || !CPU_ISSET(c[i], &allowed)) return 2;
+            for (int j = 0; j < i; ++j) if (c[j] == c[i]) return 2;
+        }
+        std::lock_guard<std::mutex> lock(g_cores_mutex);
+        if (g_compute_started.load(std::memory_order_relaxed)) return 2;
+        g_configured_cores.assign(c, c + n);
+        return 0;
     } catch (...) { return 1; }
 }
+
 extern "C" int sglang_nvfp4_cpu_experts_forward(int64_t h, const void* x,
     const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads, int32_t accumulate) noexcept {
     try {
-        if (!x || !out || k < 0 || k > 8 || threads < 1 || threads > 4096
+        if (!x || !out || k < 0 || k > kMaxRoutes || threads < 1 || threads > 4096
             || (k && (!slots || !weights)) || (accumulate != 0 && accumulate != 1)) return 2;
-        std::unique_lock<std::mutex> lock(workers.forward_mutex, std::try_to_lock);
+        std::unique_lock<std::mutex> lock(forward_mutex, std::try_to_lock);
         if (!lock.owns_lock()) return 3;
-        auto l = lookup(h); if (!l) return 2;
+        const auto l = lookup(h); if (!l) return 2;
+        const auto& E = l->strided;
         for (int j = 0; j < k; ++j) {
-            if (slots[j] < -1 || slots[j] >= l->d.capacity || !std::isfinite(weights[j])) return 2;
-            if (slots[j] >= 0 && (!std::isfinite(l->alpha(4, slots[j])) || !std::isfinite(l->alpha(5, slots[j]))
-                || (l->d.slabs[6] && !std::isfinite(l->alpha(6, slots[j]))))) return 2;
+            if (slots[j] < -1 || slots[j] >= l->info.capacity || !std::isfinite(weights[j])) return 2;
+            if (slots[j] >= 0 && (!std::isfinite(E.alpha(kGateAlpha, slots[j]))
+                || !std::isfinite(E.alpha(kDownAlpha, slots[j]))
+                || (l->info.up_alpha && !std::isfinite(E.alpha(kUpAlpha, slots[j]))))) return 2;
         }
-        workers.initialize(threads);
-        for (int i = 0; i < l->d.hidden; ++i) {
-            uint16_t v; std::memcpy(&v, static_cast<const uint8_t*>(x) + 2 * i, 2); l->x[i] = ggml_compute_fp16_to_fp32(v);
-        }
-        if (l->row_scratch.size()<size_t(threads)) {
-            l->row_scratch.resize(threads);
-            for (auto& row:l->row_scratch) row.resize(rounded(std::max(l->d.hidden,l->d.intermediate),64)/64);
-        }
-        if (!quantize(l->x,l->qx)) return 2;
-        std::fill(l->result.begin(), l->result.end(), 0.f);
+        ForwardCtx ctx;
+        ctx.info = l->info;
+        ctx.x = static_cast<const uint8_t*>(x);
+        ctx.out = out;
+        ctx.accumulate = accumulate != 0;
         for (int j = 0; j < k; ++j) {
             if (slots[j] == -1 || weights[j] == 0) continue;
-            Work c{l.get(), slots[j], weights[j], 0};
-            workers.run(calculate, &c, threads);
-            if (!quantize(l->intermediate,l->qi)) return 2;
-            c.stage = 1; workers.run(calculate, &c, threads);
+            ctx.route[ctx.routes++] = {slots[j], weights[j]};
         }
-        for (int i = 0; i < l->d.hidden; ++i) {
-            if (accumulate) out[i] += l->result[i]; else out[i] = l->result[i];
-        }
-        return 0;
+        return run_plan(ctx, *l, threads);
     } catch (...) { return 1; }
 }
