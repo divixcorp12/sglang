@@ -625,12 +625,13 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     static std::atomic<int64_t> ns{0};
     return ns;
   }
-  static int
-  test_forward(int64_t, const void*, const int32_t*, const float*, int32_t k, float* out, int32_t, int32_t accumulate) {
+  static int test_forward(const SglangCpuExpertsForward* call) {
+    const int32_t k = call->k;
     const int64_t until = expert_stream::now_ns() + k * test_forward_ns().load(std::memory_order_relaxed);
     while (expert_stream::now_ns() < until)
       _mm_pause();
-    out[0] = accumulate != 0 ? out[0] + static_cast<float>(k) : static_cast<float>(k);
+    float* out = call->out;
+    out[0] = call->accumulate != 0 ? out[0] + static_cast<float>(k) : static_cast<float>(k);
     return 0;
   }
   static int64_t test_forward_address(int64_t ns_per_expert) {
@@ -751,6 +752,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
           }
           std::atomic_thread_fence(std::memory_order_seq_cst);
           store_release(record + Wire::kRecSeq, round * Wire::kDemandRecords + 1u);  // seqs of one ring slot
+          // Hold every 64th record stable for 20 us so a starved reader still gets a whole copy under CPU load.
+          if (round % 64u == 0) {
+            for (const int64_t until = now_ns() + 20'000; now_ns() < until;) {
+            }
+          }
         }
       });
       int64_t accepted = 0, torn = 0;

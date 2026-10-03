@@ -159,7 +159,8 @@ def test_a_protect_count_past_the_lane_width_is_malformed(lanes):
 @pytest.mark.parametrize("lanes", [8, 32])
 def test_no_torn_record_is_accepted(lanes):
     accepted, torn = ops.seqlock_stress(2.0, variant="instr", lanes=lanes)
-    assert accepted > 0 and torn == 0
+    assert accepted > 0, (accepted, torn)
+    assert torn == 0, (accepted, torn)
 
 
 if __name__ == "__main__":
