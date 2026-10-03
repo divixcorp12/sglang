@@ -19,16 +19,18 @@ struct Config {
     float limit, inv13, inv2;
     bool up_alpha;
 };
-// Ordered so each small layer reuses scratch a 5120-wide layer dirtied: the 80/144-wide layers' 64-column tails
-// must still read zeros. dsv41* are DeepSeek V4.1's routed expert (the DSV4.1 plan); dsv41_nolimit is its shape
-// without the clamp (the generic plan).
+// Ordered so each small layer reuses scratch a 5120/6144-wide layer dirtied: the 80/144-wide layers' 64-column tails
+// must still read zeros. mimo_v26_pro* are MiMo V2.6 Pro's routed expert (6144/2048, no clamp: the specialized plan);
+// mimo_v26_pro_limit10 is its shape with a clamp, and h5120_n2304_* another large shape (both the generic plan).
 const Config kConfigs[] = {
-    {"dsv41", 5120, 2304, 0, 10.f, 1.f, 1.f, false},
+    {"mimo_v26_pro", 6144, 2048, 0, 0.f, 1.f, 1.f, false},
     {"h80_n80_l0", 80, 80, 0, 0.f, 1.f, 1.f, false},
-    {"dsv41_l2_up_scaled", 5120, 2304, 2, 10.f, .5f, .25f, true},
+    {"mimo_v26_pro_l2_up_scaled", 6144, 2048, 2, 0.f, .5f, .25f, true},
     {"h80_n80_l1_lim", 80, 80, 1, 2.5f, .5f, .25f, true},
-    {"dsv41_nolimit", 5120, 2304, 0, 0.f, 1.f, 1.f, false},
+    {"mimo_v26_pro_limit10", 6144, 2048, 0, 10.f, 1.f, 1.f, false},
+    {"h5120_n2304_lim10", 5120, 2304, 0, 10.f, 1.f, 1.f, false},
     {"h256_n192_l2", 256, 192, 2, 0.f, 1.f, 1.f, true},
+    {"h5120_n2304_l2_up_scaled", 5120, 2304, 2, 0.f, .5f, .25f, true},
     {"h144_n128_l0_lim", 144, 128, 0, 10.f, .75f, 1.f, false},
 };
 struct Routing {

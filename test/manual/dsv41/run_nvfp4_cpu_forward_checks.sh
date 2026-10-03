@@ -4,13 +4,14 @@
 #   run_nvfp4_cpu_forward_checks.sh WORKTREE OUT BASE_OUT     ... then compare each dump bitwise with BASE_OUT's
 # Variants: native (-march=native, the AVX2 dot), baseline (GGML conversion, the bench's baseline backend),
 # portable (no -march=native, the scalar dot). CXX defaults to GCC 15; NVFP4_AB_CORES to 0-7 (NUMA node 0).
+# NVFP4_AB_HARNESS runs another revision's harness source against WORKTREE's kernel (to re-baseline a harness change).
 set -uo pipefail
 wt=$(realpath "$1"); out=$2; base=${3:-}
 cxx=${CXX:-/opt/rh/gcc-toolset-15/root/usr/bin/g++}
 py=/data/models/slang/.venv/bin/python
 cores=${NVFP4_AB_CORES:-0,1,2,3,4,5,6,7}
 build=$wt/python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py
-harness=$wt/test/manual/dsv41/nvfp4_cpu_forward_ab.cpp
+harness=${NVFP4_AB_HARNESS:-$wt/test/manual/dsv41/nvfp4_cpu_forward_ab.cpp}
 mkdir -p "$out"
 fail=0
 for variant in native baseline portable; do
