@@ -345,6 +345,9 @@ class FakeServiceTrait(FakeTrait):
     def native_set_cores(self, cores):
         self.events.append(("cores", list(cores)))
 
+    def native_keep_warm(self):
+        return 0xBEEF
+
 
 class FakeHost:
     def __init__(self):
@@ -365,8 +368,9 @@ class FakeHost:
             raise self.grid
         return torch.tensor(self.grid, dtype=torch.float64)
 
-    def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads):
+    def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads, keep_warm=0, keep_warm_us=0):
         self.enabled = (forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads)
+        self.keep_warm = (keep_warm, keep_warm_us)
 
     def set_cpu_layer(self, row, handle):
         self.layers[row] = handle
@@ -402,6 +406,18 @@ def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit()
     assert host.layers == {1: 100, 0: 101}
     with pytest.raises(ValueError, match="activation limits"):
         _service(FakeHost(), trait).register(0, 7.0)
+
+
+def test_service_keeps_the_cpu_warm_only_when_given_a_window():
+    from sglang.srt.environ import envs
+
+    host = FakeHost()
+    _service(host, FakeServiceTrait())
+    assert host.keep_warm == (0, 0)
+    with envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.override(3000):
+        host = FakeHost()
+        _service(host, FakeServiceTrait())
+    assert host.keep_warm == (0xBEEF, 3000)
 
 
 def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
