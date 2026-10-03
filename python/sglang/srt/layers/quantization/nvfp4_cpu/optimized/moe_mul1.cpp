@@ -16,7 +16,7 @@
 #include <pthread.h>
 #include <sched.h>
 #endif
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(NVFP4_CPU_FORCE_SCALAR)
 #include <immintrin.h>
 #endif
 
@@ -162,7 +162,7 @@ float dot(const uint8_t* w, const uint8_t* sf, int row, int k, const float* x) {
         const float scale = scale_values[sf[sf_index(row, g, k / 16)]];
         const uint8_t* q = w + g * 8;
         float block = 0;
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(NVFP4_CPU_FORCE_SCALAR)
         const __m256 lut = _mm256_setr_ps(0,.5f,1,1.5f,2,3,4,6);
         // Expand sixteen nibbles in registers; no full-row unpack buffer.
         const __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q));

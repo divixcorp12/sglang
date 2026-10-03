@@ -1,168 +1,131 @@
-# NVFP4 CPU expert plugin
+# Native NVFP4 CPU expert plugin
 
-This library implements `CpuExpertForward` from
-`kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h`. It is a CPU-only,
-batch-one decode kernel behind `Nvfp4CpuQuantTrait`, parallel to the existing
-`exl3_cpu/optimized` implementation. The expert engine, lease protocol, job
-ring, pinned output buffers and copy completion gate are reused without edits.
+Implements the `CpuExpertForward` callback from
+`kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h`, parallel to
+`exl3_cpu/optimized`. The plugin and build are C++ only. The engine's job ring,
+leases, pinned activation/output rows and completion signaling are reused.
 
-## Storage and calculations
+Build from the checkout root:
 
-Registration takes views of the pinned host tier. A host slot indexes all
-slabs; no expert weights are converted or cached at registration. The same
-weight and block-scale bytes can be copied to a compatible GPU kernel.
+```sh
+src=python/sglang/srt/layers/quantization/nvfp4_cpu
+cmake -S "$src" -B /absolute/path/build -DCMAKE_BUILD_TYPE=Release \
+  -DNVFP4_CPU_NATIVE=ON
+cmake --build /absolute/path/build -j4
+ctest --test-dir /absolute/path/build --output-on-failure
+```
 
-| Slab | Per-slot representation |
+C++17 and pthreads suffice. No Python, PyTorch, GGML, CUDA, OpenMP or specific
+GCC release is required. The shared library is `libsglang_nvfp4_cpu.so` on
+Linux. Omit `NVFP4_CPU_NATIVE=ON` for the portable scalar path. Native builds
+select AVX2 on supported x86 CPUs; rebuild before moving to a different ISA.
+
+See [the benchmark guide](../bench/README.md) for native baseline/optimized
+executables, fixed-team process rounds, fixture format and timing protocol.
+
+## Attach to the existing engine
+
+Include `cpu_experts_cabi.h` and link the shared library or compile
+`moe_mul1.cpp` into the same native module, as with EXL3. Register each layer
+using a `SglangNvfp4CpuLayer` descriptor. Registration stores views and allocates
+only activation/result scratch; it never repacks or expands weights.
+
+```cpp
+int64_t handle = -1;
+// Populate descriptor with this layer's verified layout/scales/slab pointers.
+if (sglang_nvfp4_cpu_experts_register_slabs(&descriptor, &handle) != 0)
+    throw std::runtime_error("NVFP4 CPU slab registration failed");
+
+CpuExpertConfig config;
+config.forward = &sglang_nvfp4_cpu_experts_forward;
+// Fill config's existing x/out row tables, dimensions, threads and core list.
+// Before start/first forward, set the kernel's helper cores:
+sglang_nvfp4_cpu_experts_set_cores(cores.data(), cores.size());
+CpuExpertEngine engine(config, prefix, thread_name);
+engine.set_layer(row, handle);
+engine.start();
+// Submit existing CpuJob records through the tier's owner.
+// During teardown: engine.stop(), then free every registered layer.
+```
+
+Check every native return status in actual integration code. The kernel's core
+list must match the engine's list and contain at least `config.threads` cores.
+Registration supports different descriptors per layer. This change supplies
+the native kernel and benchmark; automatic runtime selection is not wired.
+
+## Weight layout and scale contract
+
+| Descriptor slab | Per-host-slot representation |
 | --- | --- |
-| `w13_weight` | `uint8[2*N,H/2]`, row-major packed E2M1, low nibble first |
-| `w2_weight` | `uint8[H,N/2]`, row-major packed E2M1, low nibble first |
-| `w13_blockscale_swizzled` | E4M3 bytes, logical `[2*N,H/16]`, padded to 128 rows and 4 columns then swizzled |
-| `w2_blockscale_swizzled` | E4M3 bytes, logical `[H,N/16]`, same swizzle |
-| `g1_alphas`, `g2_alphas` | One FP32 GPU GEMM alpha per slot |
-| `g1_alphas_up` (optional) | One FP32 alpha per slot if gate/up global scales differ |
+| 0: W13 | packed E2M1 `uint8[2*N,H/2]`, low nibble first |
+| 1: W2 | packed E2M1 `uint8[H,N/2]`, low nibble first |
+| 2: SF13 | E4M3 logical `[2*N,H/16]`, GPU 128x4 padded/swizzled bytes |
+| 3: SF2 | E4M3 logical `[H,N/16]`, same GPU scale layout |
+| 4: gate alpha | one FP32 GPU GEMM alpha |
+| 5: down alpha | one FP32 GPU GEMM alpha |
+| 6: up alpha | optional FP32 alpha; null shares the gate alpha |
 
-For a logical block-scale row `r`, column `g`, and padded column count `G`,
-the byte address inside one scale slab row is:
+Each slab has its own byte stride per host slot. Slab contents may change when
+slots are reused; every forward reads the current bytes. Keep all pointers
+alive and lease-stable until the job completes. The weight/scale bytes can be
+copied unchanged to a compatible GPU kernel.
+
+For a logical scale row r, block column g, and padded column count G, the byte
+address is:
 
 ```text
-((((r // 128) * (G // 4) + g // 4) * 32 + r % 32) * 4
-  + (r % 128) // 32) * 4 + g % 4
+((((r / 128) * (G / 4) + g / 4) * 32 + r % 32) * 4
+  + (r % 128) / 32) * 4 + g % 4
 ```
 
-This matches the checkout's `swizzle_blockscale` reshape/permute. The native
-descriptor accepts separate byte strides for each slab so padded host slots
-remain supported. The Python adapter requires contiguous tensors with their
-exact expected shapes.
+This is the inverse address of the checkout's `swizzle_blockscale` reshape/
+permute. W13 row order is explicit: 0 = gate/up halves, 1 = up/gate halves,
+2 = alternating 64-row up/gate chunks (N divisible by 64). Read the existing
+128x4 scale slab, not the CuTe DSL path's additional MMA scale layout.
+TRTLLM shuffled weights/scales and Marlin packing are unsupported. Shapes
+cannot identify layout; the registering caller must verify the GPU prep path.
 
-W13 row order is explicit: `gate_up`, `up_gate`, or
-`up_gate_interleaved64`. The latter reads alternating 64-row up/gate chunks
-directly, as used by the packed W13 portion of the CuTe DSL standard path.
-It requires N divisible by 64. That path's additional MMA-layout scale tensor
-is not read: register the existing 128x4-swizzled scale slab instead.
-TRTLLM shuffled weights/scales and Marlin layouts are unsupported even if
-their tensors have superficially matching shapes. The caller must identify
-the actual preparation path; shapes alone cannot identify a layout.
+GPU alphas may be `weight_scale * activation_scale`. Register the reciprocal
+activation factors as `inv_input_scale13` and `inv_input_scale2` to cancel them
+for full FP16 CPU input. Use 1.0 for weight-only alphas. Factors may differ
+between layer descriptors, but each factor is scalar within one layer. A
+per-expert factor must travel with its mutable host slot in a future ABI
+extension. Omitting slab6 asserts gate/up share the same global weight scale.
 
-The CPU calculation is W4A16: FP16 input is decoded to FP32 scratch, followed
-by gate/up matvec, ordinary `SiLU(gate) * up`, and down matvec. Results are
-weighted and summed in FP32. It avoids activation requantization. This is
-not bit-identical to GPU W4A4 inference and requires model-level quality
-validation before deployment. There is a portable scalar path and an AVX2
-path that expands sixteen FP4 values in registers; both keep weights packed.
-Performance has not been benchmarked.
+The kernel computes W4A16: FP16 input, FP32 gate/up projections, ordinary
+`SiLU(gate)*up`, down projection, routing and reduction. Positive `act_limit`
+applies `gate=min(gate,L)` and `up=clamp(up,-L,L)` before SiLU; 0 disables it.
+Other activation conventions (Bailing post-SiLU clamps, GPT-OSS shifted/scaled
+SwiGLU, SiTU, GELU, ReLU2, non-gated experts) must not use this descriptor.
+It is not bit-identical to GPU W4A4 activation quantization.
 
-GPU alphas may equal `weight_global_scale * activation_global_scale`.
-Pass `inv_input_scale13` and `inv_input_scale2` explicitly to cancel those
-activation factors when multiplying full FP16 activations. For weight-only
-alphas pass 1.0. These must be layer-wide scalars. A trait currently uses the
-same reciprocals and W13 row order for every layer it registers; do not share
-one trait across layers with different metadata. The native registration
-descriptor itself is per-layer, so a runtime adapter can extend registration
-to supply different verified metadata per layer. Per-expert activation
-factors would need extra slot-resident scale slabs, because a host slot may
-be reused for a different expert; capturing a per-expert array at registration
-would be incorrect. Separate gate/up weight scales are supported through
-`g1_alphas_up`; omitting it asserts that both halves share the gate alpha.
+## Threading and lifetime
 
-Only ordinary SiLU is implemented. `act_limit=0` disables clamping; positive
-values apply `gate=min(gate,L)` and `up=clamp(up,-L,L)` before SiLU. This is
-not an implementation of Bailing's post-SiLU clamp, GPT-OSS's shifted/scaled
-SwiGLU, SiTU, GELU, ReLU2 or non-gated experts. The caller must not register
-those activation conventions with this descriptor.
+One process-wide persistent helper pool is owned by the calling engine thread
+(worker zero). Configure distinct allowed Linux cores before the first forward.
+The first call fixes maximum workers; later calls may use fewer. Concurrent
+forward/free/configuration is rejected. Stop/join the engine before freeing
+handles or slab storage; do not unload the library while callbacks/workers are
+in use. Standalone unpinned arithmetic tests also build on macOS; explicit
+production worker placement requires Linux.
 
-## Build and attach
+The callback accepts up to eight lanes, skips -1 slots, preserves routing order
+including duplicate slots, and supports overwrite or accumulation. Caller
+pointer extents and finite activation/block-scale values are required. Raw
+pointers cannot prove allocation size. Status: 0 success, 1 internal error,
+2 invalid arguments, 3 concurrent use. The engine's nonzero-status fail-stop
+behavior is unchanged.
 
-Run from the checkout root:
+## Validation boundaries
 
-```sh
-python3 python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py \
-  --output /absolute/path/libsglang_nvfp4_cpu.so --native
-export SGLANG_NVFP4_CPU_LIBRARY=/absolute/path/libsglang_nvfp4_cpu.so
-```
+The native CTest harness checks repeated multithreaded forwards, accumulation,
+every finite E4M3 encoding, skipped/invalid slots and handle lifecycle. The
+benchmark checks every selected layer/count against
+an independent FP64 decoded-weight reference before and after timing. The
+standalone sanitizer harness is in
+`test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`; compile it together with
+`moe_mul1.cpp` using `-fsanitize=address,undefined -pthread` for ASan/UBSan.
 
-C++17 and pthreads are sufficient; no PyTorch, CUDA, GGML, OpenMP or special
-GCC version is needed for the library. `--native` enables the build machine's
-ISA; omit it for the portable scalar build. Do not distribute native binaries
-to incompatible CPUs. The Python trait requires PyTorch for tensor views.
-The standalone native code also builds on macOS for correctness tests;
-explicit core placement in the production engine requires Linux.
-
-Construct the trait with verified layer metadata:
-
-```python
-trait = cpu_trait_for(
-    "nvfp4",
-    nvfp4_config=dict(
-        w13_layout="gate_up",
-        inv_input_scale13=1.0,  # only if g1_alphas are weight-only
-        inv_input_scale2=1.0,   # only if g2_alphas are weight-only
-        separate_up_alpha=False,
-    ),
-)
-```
-
-`CpuExpertService` supplies the activation limit at layer registration, or
-standalone callers must set `trait.act_limit=0` explicitly for no clamp.
-The trait retains registered tensors and the library, exposes
-`native_forward()` as a C function address, and registers each layer once.
-The native engine then calls that address without Python involvement.
-
-The plugin and explicit trait factory are implemented here. Automatic
-selection from ModelOpt NVFP4 layers, their GPU runners, or server flags is
-not wired. Existing EXL3 service activation remains unchanged. A future
-runtime hookup must select layout/activation metadata from the actual runner,
-carry separate up alphas where needed, and verify layer-wide input scale
-factors before constructing the trait. Do not simply enable the EXL3 flags
-for an arbitrary NVFP4 model.
-
-## Threading, lifetime and error contract
-
-One process-wide persistent worker pool serves the plugin; one engine thread
-is worker zero. Set distinct allowed Linux core IDs before the first forward.
-The first forward fixes the maximum thread count; later jobs may use fewer
-workers. Another concurrent forward/free/configuration is rejected rather
-than racing the pool. Layers have O(H+N) scratch, allocated at registration,
-with no expanded-weight storage or per-job helper thread creation.
-
-The engine owns slot leases: it must keep slabs stable until a job finishes.
-Once complete, slots may be overwritten; the next job reads their new bytes.
-Stop and join the engine before freeing layer handles or dropping tensors.
-Do not unload the shared library while its function pointer or workers remain
-in use. The callback supports at most eight lanes, skips -1 slots, preserves
-routing order (including duplicate slots), and supports overwrite/accumulate.
-Callers must supply valid pointer extents and finite activations/block scales;
-the native ABI cannot validate the actual allocation behind a raw pointer.
-
-Statuses: 0 success, 1 internal error, 2 invalid arguments, 3 concurrent use.
-The engine's existing nonzero-status fail-stop behavior remains applicable.
-
-## Verification
-
-```sh
-python3 -m unittest discover -s test/registered/unit/kernels \
-  -p test_nvfp4_cpu_experts_native.py -v
-# Test the AVX2 build on an x86 host with AVX2:
-NVFP4_TEST_NATIVE=1 python3 -m unittest discover \
-  -s test/registered/unit/kernels -p test_nvfp4_cpu_experts_native.py -v
-```
-
-The eight native tests compare against independently decoded dense experts,
-cover finite E4M3 codes and FP4 nibbles, partial scale tiles, slot strides,
-three row orders, separate alphas, input-scale cancellation, clamping, lane
-routing, accumulation, thread counts, invalid inputs, handle lifecycle and
-live slab updates. Three PyTorch tests exercise the real trait and verify
-byte identity against the checkout's unchanged production swizzle function.
-They skip when PyTorch is absent. Synthetic CPU tests establish arithmetic
-and layout compatibility; captured GPU execution, full-model quality and
-throughput remain unverified.
-
-For the standalone memory/undefined-behavior harness:
-
-```sh
-c++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined \
-  -fno-omit-frame-pointer \
-  -Ipython/sglang/srt/layers/quantization/nvfp4_cpu/optimized \
-  python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/moe_mul1.cpp \
-  test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp -o /tmp/nvfp4-sanitizer
-/tmp/nvfp4-sanitizer
-```
+Synthetic arithmetic/layout checks and benchmark smoke runs are not captured
+GPU integration, model-level quality validation or an isolated performance
+study. Those remain separate runtime validation steps.
