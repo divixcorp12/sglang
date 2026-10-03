@@ -259,7 +259,7 @@ struct CopyCommitParams {
   int32_t* cpu_lanes;
 };
 
-static_assert(Wire::kLanes <= 32, "a lane mask is one u32");
+static_assert(device::expert_stream::Wire::kLanes <= 32, "a lane mask is one u32");
 
 // CW: see CopyWaitParams. Closes the gate only when a copy-engine or CPU lane exists, and opens it itself when
 // CopyDone already holds G.
