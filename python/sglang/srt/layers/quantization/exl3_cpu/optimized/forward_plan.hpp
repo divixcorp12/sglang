@@ -6,6 +6,17 @@
 // was measured and validated bit-exact on AVX-512BW (exl3_cpu/optimized/README.txt); every other (Shape, I) pair runs
 // the generic plan.
 
+// The forward's phases, in team order; a barrier separates each from the next. The values index the profiling line
+// ("moe_cpu phases(us)"): 4, the old whole-row down transform, is gone (Down's owned blocks include it) and prints 0.
+enum class Phase : int
+{
+    PrepareGateUp = 0,  // quantize gate/up inputs
+    GateUp = 1,         // gate/up GEMVs
+    Middle = 2,         // gate/up output transform, activation, down input
+    Down = 3,           // down GEMVs with their output transform
+    Accumulate = 5,     // routing-weighted sum into out
+};
+
 // What a (Shape, ISA) plan turns on. The primary template is the generic plan.
 template <class Shape, Isa I>
 struct PlanTraits
@@ -135,15 +146,11 @@ private:
                 }
             }
             if(n==count) {
-                for(int p=0;p<6;++p) {
-                    if(p==4)continue; // Complete down blocks already include their output transform.
-                    const auto begin=prof?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
-                    phase(ctx,E,worker,n,p,grouped,wide);
-                    if(p<5) {
-                        #pragma omp barrier
-                    }
-                    if(prof && worker==0)phase_us[p]=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count();
-                }
+                step<Phase::PrepareGateUp>(ctx,E,worker,n,grouped,wide,prof,phase_us);
+                step<Phase::GateUp>(ctx,E,worker,n,grouped,wide,prof,phase_us);
+                step<Phase::Middle>(ctx,E,worker,n,grouped,wide,prof,phase_us);
+                step<Phase::Down>(ctx,E,worker,n,grouped,wide,prof,phase_us);
+                step<Phase::Accumulate>(ctx,E,worker,n,grouped,wide,prof,phase_us);
             }
         }
         TORCH_CHECK(!pin_error.load(),"cannot pin CPU expert worker to its configured core");
@@ -151,148 +158,149 @@ private:
         if(prof)printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",phase_us[0],phase_us[1],phase_us[2],phase_us[3],phase_us[4],phase_us[5]);
     }
 
-    // One phase for this worker. Phases: 0 prepare gate/up inputs, 1 gate/up GEMVs, 2 output transform + activation +
-    // down input, 3 down GEMVs with their output transform, 5 routing-weighted accumulate. Phase 4, the old whole-row
-    // down transform, no longer exists: phase 3's owned blocks include it.
-    template <class Experts>
-    static void phase(ForwardCtx& c, const Experts& E, int worker, int num_workers, int phase, bool grouped, bool wide)
+    // One phase of the team's sequence: run it, then wait for the whole team unless it is the last. Called inside
+    // run_team's parallel region (an orphaned barrier binds to that team). phase_us is indexed by the phase's value.
+    template <Phase P, class Experts>
+    static void step(ForwardCtx& ctx, const Experts& E, int worker, int n, bool grouped, bool wide, bool prof,
+                     double* phase_us)
     {
-        const int nc = static_cast<int>(c.chunks.size());
-        const int H = Shape::hidden(c.info);
-        const int I_ = Shape::intermediate(c.info);
-
-        if(phase==0 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(H) && I==Isa::Bw) {
-            if (wide) prepare_gu_blocks<I, true>(c,E,worker,num_workers);
-            else prepare_gu_blocks<I, false>(c,E,worker,num_workers);
-            return;
+        const auto begin=prof?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        phase<P>(ctx,E,worker,n,grouped,wide);
+        if constexpr (P != Phase::Accumulate) {
+            #pragma omp barrier
         }
-        if (phase==2 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(I_) && I!=Isa::Scalar) {
-            if (wide) middle_blocks<I, true>(c,E,worker,num_workers);
-            else middle_blocks<I, false>(c,E,worker,num_workers);
-            return;
+        if(prof && worker==0)phase_us[static_cast<int>(P)]=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin).count();
+    }
+
+    // One phase for this worker; P picks the phase at compile time, so each instantiation holds one phase's code.
+    template <Phase P, class Experts>
+    static void phase(ForwardCtx& c, const Experts& E, int worker, int num_workers, bool grouped, bool wide)
+    {
+        [[maybe_unused]] const int nc = static_cast<int>(c.chunks.size());
+        [[maybe_unused]] const int H = Shape::hidden(c.info);
+        [[maybe_unused]] const int I_ = Shape::intermediate(c.info);
+
+        if constexpr (P == Phase::PrepareGateUp)
+        {
+            if (EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(H) && I==Isa::Bw) {
+                if (wide) prepare_gu_blocks<Shape, I, true>(c,E,worker,num_workers);
+                else prepare_gu_blocks<Shape, I, false>(c,E,worker,num_workers);
+                return;
+            }
+            // Prepare gate and up inputs, distributed over (chunk, gate/up)
+            const int gu = !Shape::gated(c.info) ? 1 : 2;
+            for (int j = worker; j < nc * gu; j += num_workers)
+            {
+                const Chunk& ch = c.chunks[j / gu];
+                const bool up = gu == 1 || (j % gu);
+                const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
+                PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
+                prepare_rows<I>(mat, c.x, nullptr, H, ch.token, ch.m, p);
+            }
         }
-        switch (phase) {
-
-            case 0:
+        else if constexpr (P == Phase::GateUp)
+        {
+            // Gate + up GEMVs (see assign_gemvs)
+            const int gu = !Shape::gated(c.info) ? 1 : 2;
+            assign_gemvs(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
             {
-                // Prepare gate and up inputs, distributed over (chunk, gate/up)
-                const int gu = !c.info.gated ? 1 : 2;
-                for (int j = worker; j < nc * gu; j += num_workers)
-                {
-                    const Chunk& ch = c.chunks[j / gu];
-                    const bool up = gu == 1 || (j % gu);
-                    const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
-                    PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                    prepare_rows<I>(mat, c.x, nullptr, H, ch.token, ch.m, p);
-                }
-                break;
+                const Chunk& ch = c.chunks[j / gu];
+                const bool up = gu == 1 || (j % gu);
+                const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
+                const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
+                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
+                run_tiles<I>(mat, p, tout, ch.m, t0, t1, grouped);
+            });
+        }
+        else if constexpr (P == Phase::Middle)
+        {
+            if (EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(I_) && I!=Isa::Scalar) {
+                if (wide) middle_blocks<Shape, I, true>(c,E,worker,num_workers);
+                else middle_blocks<Shape, I, false>(c,E,worker,num_workers);
+                return;
             }
-
-            case 1:
-            {
-                // Gate + up GEMVs (see assign_gemvs)
-                const int gu = !c.info.gated ? 1 : 2;
-                assign_gemvs(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
-                {
-                    const Chunk& ch = c.chunks[j / gu];
-                    const bool up = gu == 1 || (j % gu);
-                    const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
-                    const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                    float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
-                    run_tiles<I>(mat, p, tout, ch.m, t0, t1, grouped);
-                });
-                break;
-            }
-
-            case 2:
-            {
-                // Output transform for gate/up, activation, prepare down input; per chunk. Gated: act(g)
-                // * u accumulated into g; gateless: relu2 applied to u in place
-                const bool gated = c.info.gated;
-                for (int j = worker; j < nc; j += num_workers) {
-                    const Chunk& ch = c.chunks[j];
-                    float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I_;
-                    float* u = c.tout_u + static_cast<size_t>(j) * MAX_M * I_;
-                    if (gated) transform_out<I>(E.gate(ch.expert), g, ch.m);
-                    transform_out<I>(E.up(ch.expert), u, ch.m);
-                    const size_t count = static_cast<size_t>(ch.m) * I_;
-                    float* a = gated ? g : u;
-                    // Nonzero act_limit clamps the up path symmetrically and the activated gate
-                    // from above, BEFORE the multiply (matching the GPU act_mul kernels). DS4
-                    // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
-                    // context push |u| into the thousands, and skipping the clamp here made
-                    // offloaded experts diverge arbitrarily far from their GPU-resident twins
-                    const float lim = c.info.act_limit != 0.0f
-                        ? c.info.act_limit : std::numeric_limits<float>::infinity();
-                    switch (c.info.activation) {
-                        case 0:
-                            for (size_t i = 0; i < count; ++i) {
-                                const float gv = g[i];
-                                const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
-                                g[i] = av * std::clamp(u[i], -lim, lim);
-                            }
-                            break;
-                        case 1:
-                            for (size_t i = 0; i < count; ++i) {
-                                const float gv = g[i];
-                                const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
-                                const float av = std::min(gv * cdf, lim);
-                                g[i] = av * std::clamp(u[i], -lim, lim);
-                            }
-                            break;
-                        case 3: {
-                            // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
-                            // sigmoid(1.702 * g)
-                            const float lim = c.info.act_limit;
-                            for (size_t i = 0; i < count; ++i) {
-                                const float gv = std::min(g[i], lim);
-                                const float uv = std::clamp(u[i], -lim, lim);
-                                g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(-1.702f * gv));
-                            }
-                            break;
+            // Output transform for gate/up, activation, prepare down input; per chunk. Gated: act(g)
+            // * u accumulated into g; gateless: relu2 applied to u in place
+            const bool gated = Shape::gated(c.info);
+            for (int j = worker; j < nc; j += num_workers) {
+                const Chunk& ch = c.chunks[j];
+                float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I_;
+                float* u = c.tout_u + static_cast<size_t>(j) * MAX_M * I_;
+                if (gated) transform_out<I>(E.gate(ch.expert), g, ch.m);
+                transform_out<I>(E.up(ch.expert), u, ch.m);
+                const size_t count = static_cast<size_t>(ch.m) * I_;
+                float* a = gated ? g : u;
+                // Nonzero act_limit clamps the up path symmetrically and the activated gate
+                // from above, BEFORE the multiply (matching the GPU act_mul kernels). DS4
+                // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
+                // context push |u| into the thousands, and skipping the clamp here made
+                // offloaded experts diverge arbitrarily far from their GPU-resident twins
+                const float lim = Shape::act_limit(c.info) != 0.0f
+                    ? Shape::act_limit(c.info) : std::numeric_limits<float>::infinity();
+                switch (Shape::activation(c.info)) {
+                    case 0:
+                        for (size_t i = 0; i < count; ++i) {
+                            const float gv = g[i];
+                            const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
+                            g[i] = av * std::clamp(u[i], -lim, lim);
                         }
-                        default:
-                            for (size_t i = 0; i < count; ++i) {
-                                const float uv = u[i] > 0.0f ? u[i] : 0.0f;
-                                u[i] = uv * uv;
-                            }
-                            break;
+                        break;
+                    case 1:
+                        for (size_t i = 0; i < count; ++i) {
+                            const float gv = g[i];
+                            const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
+                            const float av = std::min(gv * cdf, lim);
+                            g[i] = av * std::clamp(u[i], -lim, lim);
+                        }
+                        break;
+                    case 3: {
+                        // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
+                        // sigmoid(1.702 * g)
+                        const float lim = Shape::act_limit(c.info);
+                        for (size_t i = 0; i < count; ++i) {
+                            const float gv = std::min(g[i], lim);
+                            const float uv = std::clamp(u[i], -lim, lim);
+                            g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(-1.702f * gv));
+                        }
+                        break;
                     }
-                    static const int idx4[MAX_M] = {0, 1, 2, 3};
-                    prepare_rows<I>(E.down(ch.expert), nullptr, a, I_, idx4, ch.m, c.prep_d[j]);
+                    default:
+                        for (size_t i = 0; i < count; ++i) {
+                            const float uv = u[i] > 0.0f ? u[i] : 0.0f;
+                            u[i] = uv * uv;
+                        }
+                        break;
                 }
-                break;
+                static const int idx4[MAX_M] = {0, 1, 2, 3};
+                prepare_rows<I>(E.down(ch.expert), nullptr, a, I_, idx4, ch.m, c.prep_d[j]);
             }
-
-            case 3:
+        }
+        else if constexpr (P == Phase::Down)
+        {
+            // Down GEMVs
+            assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
             {
-                // Down GEMVs
-                assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
-                {
-                    const Chunk& ch = c.chunks[j];
-                    float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                    run_tiles<I>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
-                    transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);
-                });
-                break;
-            }
-
-            case 5:
-            {
-                const int c0 = ((H/16) * worker / num_workers)*16;
-                const int c1 = ((H/16) * (worker+1) / num_workers)*16;
-                for (int j = 0; j < nc; ++j) {
-                    const Chunk& ch = c.chunks[j];
-                    const float* d = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
-                    for (int r = 0; r < ch.m; ++r) {
-                        float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
-                        const float* src = d + static_cast<size_t>(r) * H;
-                        const float w = ch.weight[r];
-                        for (int col = c0; col < c1; ++col)
-                            dst[col] += w * src[col];
-                    }
+                const Chunk& ch = c.chunks[j];
+                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
+                run_tiles<I>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
+                transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);
+            });
+        }
+        else
+        {
+            static_assert(P == Phase::Accumulate);
+            const int c0 = ((H/16) * worker / num_workers)*16;
+            const int c1 = ((H/16) * (worker+1) / num_workers)*16;
+            for (int j = 0; j < nc; ++j) {
+                const Chunk& ch = c.chunks[j];
+                const float* d = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
+                for (int r = 0; r < ch.m; ++r) {
+                    float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
+                    const float* src = d + static_cast<size_t>(r) * H;
+                    const float w = ch.weight[r];
+                    for (int col = c0; col < c1; ++col)
+                        dst[col] += w * src[col];
                 }
-                break;
             }
         }
     }
