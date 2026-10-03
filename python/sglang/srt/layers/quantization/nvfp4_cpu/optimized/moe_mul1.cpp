@@ -1,45 +1,10 @@
 // CPU experts derived from pinned GGML NVFP4 x Q8 kernels.
 // GPU weight slabs stay unchanged; see ../upstream/README.md for provenance.
 // A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp) on one OpenMP team per call; layers are read through
-// LayerInfo and StridedExperts (experts.hpp) under a Shape (shapes.hpp).
-#if !defined(__linux__) || !defined(_OPENMP)
-#error The NVFP4 CPU expert kernel requires Linux and OpenMP.
-#endif
-#include "cpu_experts_cabi.h"
-#include "../upstream/kernels.h"
-#include <omp.h>
-#include <pthread.h>
-#include <sched.h>
-#include <algorithm>
-#include <atomic>
-#include <cmath>
-#include <cstring>
-#include <iterator>
-#include <memory>
-#include <mutex>
-#include <new>
-#include <stdexcept>
-#include <unordered_map>
-#include <utility>
-#include <vector>
-#if defined(__AVX2__) && !defined(NVFP4_CPU_FORCE_SCALAR)
-#include <immintrin.h>
-#endif
+// LayerInfo and StridedExperts (experts.hpp) under a Shape (shapes.hpp). Types and declarations: moe_mul1.h.
+#include "moe_mul1.h"
 
 namespace {
-#include "dot_nvfp4.h"
-
-// The dot product's tier is fixed when the library is compiled (dot_nvfp4.h's #if chain): AVX2 under -march=native
-// on an AVX2 host, else the scalar loop.
-enum class Isa { Scalar, Avx2 };
-#if defined(__AVX2__)
-constexpr Isa kBuildIsa = Isa::Avx2;
-#else
-constexpr Isa kBuildIsa = Isa::Scalar;
-#endif
-
-#include "experts.hpp"
-#include "shapes.hpp"
 
 // -------------------------------------------------------------------------------------------
 //   Layer registry
@@ -61,11 +26,6 @@ StridedExperts<GenericShape> strided_of(const SglangNvfp4CpuLayer& d)
     return e;
 }
 
-struct RegisteredLayer
-{
-    LayerInfo info;
-    StridedExperts<GenericShape> strided;
-};
 std::mutex registry_mutex;
 std::unordered_map<int64_t, std::shared_ptr<const RegisteredLayer>> layers;
 int64_t next_handle = 1;
@@ -87,7 +47,6 @@ std::vector<int> g_configured_cores;
 std::atomic<bool> g_compute_started{false};
 std::vector<int> g_compute_cores;  // Immutable after release publication at first forward.
 
-// Freezes the configured cores into g_compute_cores once, at the first forward. Steady-state calls acquire no mutex.
 inline void freeze_compute_cores()
 {
     if (g_compute_started.load(std::memory_order_acquire)) return;
@@ -98,8 +57,6 @@ inline void freeze_compute_cores()
     }
 }
 
-// Inside a parallel region: pins OpenMP worker `worker` to its compute core (none configured: no-op), setting
-// pin_error if it cannot.
 inline void pin_compute_worker(int worker, std::atomic<int>& pin_error)
 {
     if (g_compute_cores.empty()) return;
@@ -117,8 +74,9 @@ inline void pin_compute_worker(int worker, std::atomic<int>& pin_error)
 //   Arithmetic (unchanged from the pre-OpenMP kernel)
 // -------------------------------------------------------------------------------------------
 
-float dot(const uint8_t* w, const uint8_t* sf, int row, int k,
-          const block_q8_0* x, block_nvfp4* scratch) {
+template <int M>
+void dot_rows_of(const uint8_t* w, const uint8_t* sf, int row, int k, const block_q8_0* const* xs,
+                 block_nvfp4* scratch, float* out) {
     GpuRow view(w,sf,row,k);
     const int padded=int(rounded(k,64));
 #if defined(NVFP4_CPU_UPSTREAM_BASELINE)
@@ -139,16 +97,24 @@ float dot(const uint8_t* w, const uint8_t* sf, int row, int k,
             }
         }
     }
-    float result;
-    ggml_vec_dot_nvfp4_q8_0(padded,&result,0,scratch,0,x,0,1);
-    return result;
+    for (int t=0;t<M;++t) ggml_vec_dot_nvfp4_q8_0(padded,&out[t],0,scratch,0,xs[t],0,1);
 #else
     (void)scratch;
-    return dot_gpu(padded,view,x);
+    dot_gpu_rows<M>(padded,view,xs,out);
 #endif
 }
 
-// Whether Q8_0 represents the 32 values of a block: finite, with a delta within FP16 range.
+void dot_rows(const uint8_t* w, const uint8_t* sf, int row, int k, const block_q8_0* const* xs, int m,
+              block_nvfp4* scratch, float* out) {
+    static_assert(kChunkRows == 4, "dot_rows dispatches m in [1, 4]");
+    switch (m) {
+        case 1: dot_rows_of<1>(w, sf, row, k, xs, scratch, out); break;
+        case 2: dot_rows_of<2>(w, sf, row, k, xs, scratch, out); break;
+        case 3: dot_rows_of<3>(w, sf, row, k, xs, scratch, out); break;
+        default: dot_rows_of<4>(w, sf, row, k, xs, scratch, out); break;
+    }
+}
+
 bool q8_representable(const float* v)
 {
     for (int j = 0; j < 32; ++j)
@@ -156,8 +122,7 @@ bool q8_representable(const float* v)
     return true;
 }
 
-// One Q8_0 block. A zero FP16 delta contributes zero; this also avoids overflowing the reciprocal for a subnormal
-// FP32 amax in the upstream reference quantizer.
+// A zero delta also avoids overflowing the reciprocal for a subnormal FP32 amax in the upstream reference quantizer.
 void quantize_block(const float* v, block_q8_0& out)
 {
     float amax = 0;
@@ -166,8 +131,6 @@ void quantize_block(const float* v, block_q8_0& out)
     else quantize_row_q8_0_ref(v, &out, 32);
 }
 
-// Gate/up output of the gated SiLU: optional pre-SiLU clamp (gate from above, up both ways), stable SiLU including
-// large negative gates, times up.
 inline float swiglu(float g, float u, float limit)
 {
     if (limit > 0) { g = std::min(g, limit); u = std::clamp(u, -limit, limit); }
@@ -175,71 +138,17 @@ inline float swiglu(float g, float u, float limit)
     return silu * u;
 }
 
-// -------------------------------------------------------------------------------------------
-//   Forward context and scratch
-// -------------------------------------------------------------------------------------------
-
-constexpr int kMaxRoutes = 8;  // the C ABI's k limit
-
-// 64-byte-aligned storage, so each kRowUnit share of fp32 outputs owns whole cache lines.
-template <class T>
-struct CacheAligned
+ForwardArena& ForwardArena::get()
 {
-    using value_type = T;
-    CacheAligned() = default;
-    template <class U> CacheAligned(const CacheAligned<U>&) {}
-    T* allocate(size_t n) { return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t{64})); }
-    void deallocate(T* p, size_t) { ::operator delete(p, std::align_val_t{64}); }
-    template <class U> bool operator==(const CacheAligned<U>&) const { return true; }
-};
-
-struct Route
-{
-    int slot;
-    float weight;
-};
-
-struct ForwardCtx
-{
-    LayerInfo info;
-    const uint8_t* x;  // fp16 [hidden], possibly unaligned
-    float* out;        // fp32 [hidden]
-    bool accumulate;
-    Route route[kMaxRoutes];  // live routes (no -1 slot, no zero weight), in routing order
-    int routes = 0;
-    // Bound by the plan from the layer's experts, per route.
-    Projection gate[kMaxRoutes], up[kMaxRoutes], down[kMaxRoutes];
-    float gate_alpha[kMaxRoutes], up_alpha[kMaxRoutes], down_alpha[kMaxRoutes];
-    // Scratch from the calling thread's ForwardArena.
-    float* xf;                  // [rounded(hidden, 64)]
-    block_q8_0* qx;             // [rounded(hidden, 64) / 32]
-    float* inter;               // [routes][rounded(intermediate, 64)]
-    block_q8_0* qi;             // [routes][rounded(intermediate, 64) / 32]
-    block_nvfp4* row_scratch;   // [workers][row_scratch_stride], upstream-baseline builds only
-    size_t row_scratch_stride;
-    // Q8_0 cannot represent the input or an intermediate: the forward returns 2 and leaves out untouched.
-    std::atomic<bool> invalid{false};
-};
-
-struct ForwardArena
-{
-    std::vector<float, CacheAligned<float>> xf, inter;
-    std::vector<block_q8_0> qx, qi;
-    std::vector<block_nvfp4> row_scratch;
-
-    static ForwardArena& get()
-    {
-        static thread_local ForwardArena arena;
-        return arena;
-    }
-};
+    static thread_local ForwardArena arena;
+    return arena;
+}
 
 #include "forward_plan.hpp"
 
-// Runs the call's plan: the MiMo V2.6 Pro plan when the layer is that model's routed expert on an AVX2 build, else the
-// generic plan for this build's tier. Both read the same slabs; the MiMo plan through the view checked for it. A template
-// so a scalar build discards, and never instantiates, the AVX2 plan.
-template <Isa I = kBuildIsa>
+// Both plans read the same slabs; the MiMo plan through the view checked for it. A template so a scalar build discards,
+// and never instantiates, the AVX2 plan.
+template <Isa I>
 int run_plan(ForwardCtx& ctx, const RegisteredLayer& layer, int threads)
 {
     if constexpr (I == Isa::Avx2) {
@@ -307,30 +216,48 @@ extern "C" int sglang_nvfp4_cpu_experts_set_cores(const int32_t* c, int32_t n) n
     } catch (...) { return 1; }
 }
 
-extern "C" int sglang_nvfp4_cpu_experts_forward(int64_t h, const void* x,
-    const int32_t* slots, const float* weights, int32_t k, float* out, int32_t threads, int32_t accumulate) noexcept {
+extern "C" int sglang_nvfp4_cpu_experts_forward(const SglangCpuExpertsForward* call) noexcept {
     try {
-        if (!x || !out || k < 0 || k > kMaxRoutes || threads < 1 || threads > 4096
-            || (k && (!slots || !weights)) || (accumulate != 0 && accumulate != 1)) return 2;
+        if (!call || call->abi_version != SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION) return 2;
+        const SglangCpuExpertsForward& c = *call;
+        const int rows = c.rows, k = c.k;
+        if (!c.x || !c.out || rows < 1 || rows > kMaxRows || k < 0 || k > kMaxRoutes || c.threads < 1
+            || c.threads > 4096 || (k && (!c.slots || !c.weights)) || (c.accumulate != 0 && c.accumulate != 1))
+            return 2;
         std::unique_lock<std::mutex> lock(forward_mutex, std::try_to_lock);
         if (!lock.owns_lock()) return 3;
-        const auto l = lookup(h); if (!l) return 2;
+        const auto l = lookup(c.layer); if (!l) return 2;
         const auto& E = l->strided;
-        for (int j = 0; j < k; ++j) {
-            if (slots[j] < -1 || slots[j] >= l->info.capacity || !std::isfinite(weights[j])) return 2;
-            if (slots[j] >= 0 && (!std::isfinite(E.alpha(kGateAlpha, slots[j]))
-                || !std::isfinite(E.alpha(kDownAlpha, slots[j]))
-                || (l->info.up_alpha && !std::isfinite(E.alpha(kUpAlpha, slots[j]))))) return 2;
+        const size_t n = size_t(rows) * size_t(k);
+        for (size_t j = 0; j < n; ++j) {
+            const int slot = c.slots[j];
+            if (slot < -1 || slot >= l->info.capacity || !std::isfinite(c.weights[j])) return 2;
+            if (slot >= 0 && (!std::isfinite(E.alpha(kGateAlpha, slot))
+                || !std::isfinite(E.alpha(kDownAlpha, slot))
+                || (l->info.up_alpha && !std::isfinite(E.alpha(kUpAlpha, slot))))) return 2;
+        }
+        ForwardArena& ar = ForwardArena::get();
+        auto grow = [](auto& v, size_t size) { if (v.size() < size) v.resize(size); };
+        grow(ar.route, size_t(rows) * kMaxRoutes);
+        grow(ar.route_count, size_t(rows));
+        for (int t = 0; t < rows; ++t) {
+            int live = 0;
+            for (int j = 0; j < k; ++j) {
+                const int slot = c.slots[size_t(t) * k + j];
+                const float weight = c.weights[size_t(t) * k + j];
+                if (slot == -1 || weight == 0) continue;
+                ar.route[size_t(t) * kMaxRoutes + live++] = {slot, weight, -1, 0.f};
+            }
+            ar.route_count[t] = live;
         }
         ForwardCtx ctx;
         ctx.info = l->info;
-        ctx.x = static_cast<const uint8_t*>(x);
-        ctx.out = out;
-        ctx.accumulate = accumulate != 0;
-        for (int j = 0; j < k; ++j) {
-            if (slots[j] == -1 || weights[j] == 0) continue;
-            ctx.route[ctx.routes++] = {slots[j], weights[j]};
-        }
-        return run_plan(ctx, *l, threads);
+        ctx.x = static_cast<const uint8_t*>(c.x);
+        ctx.out = c.out;
+        ctx.rows = rows;
+        ctx.accumulate = c.accumulate != 0;
+        ctx.route = ar.route.data();
+        ctx.route_count = ar.route_count.data();
+        return run_plan(ctx, *l, c.threads);
     } catch (...) { return 1; }
 }

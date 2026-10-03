@@ -1,4 +1,4 @@
-// Included by moe_mul1.cpp inside its anonymous namespace, after cpu_experts_cabi.h and layout.h (rounded).
+// Included by moe_mul1.h inside its anonymous namespace, after cpu_experts_cabi.h and layout.h (rounded).
 // The forward reads a layer through these: LayerInfo for the facts, StridedExperts for each slot's projections.
 // Accessors are cheap to copy and allocate nothing.
 

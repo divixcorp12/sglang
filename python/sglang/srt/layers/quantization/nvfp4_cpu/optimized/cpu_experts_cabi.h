@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "../../../../../kernels/jit/csrc/moe/expert_stream/host/cpu_expert_forward_abi.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,12 +32,11 @@ typedef struct SglangNvfp4CpuLayer {
 // Status: 0 success, 1 internal error, 2 invalid arguments, 3 concurrent forward.
 int sglang_nvfp4_cpu_experts_register_slabs(const SglangNvfp4CpuLayer*, int64_t* handle) NVFP4_NOEXCEPT;
 int sglang_nvfp4_cpu_experts_free_layer(int64_t handle) NVFP4_NOEXCEPT;
-// Same CpuExpertForward signature as expert_stream/host/cpu_experts.h.
-// x is FP16[hidden]; GGML Q8_0 is used internally for input and SwiGLU.
-// Routing weights and out are FP32. -1 slots are skipped.
-int sglang_nvfp4_cpu_experts_forward(int64_t layer, const void* x,
-    const int32_t* slots, const float* weights, int32_t k, float* out,
-    int32_t threads, int32_t accumulate) NVFP4_NOEXCEPT;
+// CpuExpertForward (expert_stream/host/cpu_experts.h): SglangCpuExpertsForward's rows, x FP16 [rows][hidden], out FP32
+// [rows][hidden]; rows at most 65536, k at most 8. GGML Q8_0 is used internally for input and SwiGLU. Tokens sharing a
+// slot share each weight row's decode; every row's output is bitwise its own one-row call's. A call is all or nothing:
+// when Q8_0 cannot represent any row's input or intermediate it returns 2 and leaves every row of out untouched.
+int sglang_nvfp4_cpu_experts_forward(const SglangCpuExpertsForward* call) NVFP4_NOEXCEPT;
 // Configure before the first forward (refused with 2 after it). Worker i runs on cores[i]; worker 0 is the calling engine thread.
 int sglang_nvfp4_cpu_experts_set_cores(const int32_t* cores, int32_t n) NVFP4_NOEXCEPT;
 #ifdef __cplusplus

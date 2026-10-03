@@ -28,6 +28,7 @@ pytestmark = pytest.mark.skipif(
 CHILD = r"""
 import ctypes, sys
 import numpy as np
+from sglang.srt.layers.moe.cpu_experts.pool import CPU_EXPERTS_FORWARD_ABI_VERSION, CpuExpertsForwardCall
 
 lib = ctypes.CDLL(sys.argv[1])
 calls = [int(t) for t in sys.argv[2].split(",")]
@@ -65,9 +66,12 @@ slots = np.zeros(1, np.int32)
 weights = np.ones(1, np.float32)
 for threads in calls:
     out = np.full(H, 123.0, np.float32)
-    status = lib.sglang_nvfp4_cpu_experts_forward(
-        handle, x.ctypes.data_as(ctypes.c_void_p), slots.ctypes.data_as(ctypes.c_void_p),
-        weights.ctypes.data_as(ctypes.c_void_p), 1, out.ctypes.data_as(ctypes.c_void_p), threads, 0)
+    call = CpuExpertsForwardCall(
+        abi_version=CPU_EXPERTS_FORWARD_ABI_VERSION, rows=1, layer=handle.value, x=x.ctypes.data,
+        slots=slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        weights=weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out=out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), k=1, threads=threads, accumulate=0)
+    status = lib.sglang_nvfp4_cpu_experts_forward(ctypes.byref(call))
     print("forward", threads, status, "untouched" if (out == 123.0).all() else "written")
 if cores:
     print("cores-after", lib.sglang_nvfp4_cpu_experts_set_cores(core_array, len(cores)))

@@ -1,17 +1,21 @@
-// Included by moe_mul1.cpp inside its anonymous namespace, after the arithmetic (dot, swiglu, q8_representable,
-// quantize_block), the worker-core helpers (freeze_compute_cores, pin_compute_worker) and ForwardCtx/ForwardArena.
+// Included by moe_mul1.cpp inside its anonymous namespace, after the definitions moe_mul1.h declares (dot_rows,
+// swiglu, q8_representable, quantize_block, freeze_compute_cores, pin_compute_worker).
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the
 // dot product's tier, fixed when the library is compiled (kBuildIsa). The primary PlanTraits is the generic plan's;
 // PlanTraits<MimoV26ProShape, Isa::Avx2> is MiMo V2.6 Pro's on an AVX2 build.
+//
+// A call's routes are grouped by slot into units, one per (token, slot), and units into chunks of up to kChunkRows of
+// one slot, so dot_rows decodes each weight row once per chunk. Each token's output is still its own routes' sum in
+// routing order, so a token's result does not depend on the other rows of the call.
 
 // The forward's phases, in team order; a barrier separates each from the next.
 enum class Phase : int
 {
-    PrepareInput = 0,  // fp16 input to fp32, then its Q8_0 blocks
-    GateUp = 1,        // every route's gate/up rows, gated SiLU into its intermediate
-    Middle = 2,        // every route's intermediate to Q8_0 blocks
-    Down = 3,          // every route's down rows, routing-weighted sum into out
+    PrepareInput = 0,  // every token's fp16 input to fp32, then its Q8_0 blocks
+    GateUp = 1,        // every chunk's gate/up rows, gated SiLU into each unit's intermediate
+    Middle = 2,        // every unit's intermediate to Q8_0 blocks
+    Down = 3,          // every chunk's down rows, each token's routing-weighted sum into out
 };
 
 // What a (Shape, ISA) plan sets. The primary template is the generic plan.
@@ -44,29 +48,56 @@ struct ForwardPlan
     using Traits = PlanTraits<Shape, I>;
 
     // Runs ctx's routes through E on `threads` workers (the caller is worker 0). Returns 0, or 2 when Q8_0 cannot
-    // represent the input or an intermediate (out is then untouched). Throws when the team is short or a worker
+    // represent an input or an intermediate (out is then untouched). Throws when the team is short or a worker
     // cannot be pinned.
     static int run(ForwardCtx& ctx, const StridedExperts<Shape>& E, ForwardArena& ar, int threads)
     {
-        bind_routes(ctx, E);
+        bind_routes(ctx, E, ar);
         prepare_scratch(ctx, ar, threads);
         run_team(ctx, threads);
         return ctx.invalid.load(std::memory_order_relaxed) ? 2 : 0;
     }
 
 private:
-    // Each route's projections and scaled alphas, in routing order; the team reads only these.
-    static void bind_routes(ForwardCtx& c, const StridedExperts<Shape>& E)
+    // Groups the live routes into units and chunks, and binds each chunk's projections and scaled alphas and each
+    // route's unit and down alpha; the team reads only these.
+    static void bind_routes(ForwardCtx& c, const StridedExperts<Shape>& E, ForwardArena& ar)
     {
-        for (int r = 0; r < c.routes; ++r) {
-            const int slot = c.route[r].slot;
-            c.gate[r] = E.gate(slot);
-            c.up[r] = E.up(slot);
-            c.down[r] = E.down(slot);
-            c.gate_alpha[r] = c.gate[r].alpha * c.info.inv_input_scale13;
-            c.up_alpha[r] = c.up[r].alpha * c.info.inv_input_scale13;
-            c.down_alpha[r] = c.down[r].alpha * c.info.inv_input_scale2 * c.route[r].weight;
+        ar.refs.clear();
+        for (int t = 0; t < c.rows; ++t)
+            for (int j = 0; j < c.route_count[t]; ++j)
+                ar.refs.push_back({c.route[size_t(t) * kMaxRoutes + j].slot, t, j});
+        std::sort(ar.refs.begin(), ar.refs.end(), [](const RouteRef& a, const RouteRef& b) {
+            return a.slot != b.slot ? a.slot < b.slot : a.token != b.token ? a.token < b.token : a.index < b.index;
+        });
+        ar.chunk.clear();
+        ar.unit_token.clear();
+        for (size_t i = 0; i < ar.refs.size(); ++i) {
+            const RouteRef& ref = ar.refs[i];
+            const bool same_slot = i && ar.refs[i - 1].slot == ref.slot;
+            if (!same_slot || ar.refs[i - 1].token != ref.token) {
+                if (!same_slot || ar.chunk.back().units == kChunkRows) {
+                    Chunk ch;
+                    ch.gate = E.gate(ref.slot);
+                    ch.up = E.up(ref.slot);
+                    ch.down = E.down(ref.slot);
+                    ch.gate_alpha = ch.gate.alpha * c.info.inv_input_scale13;
+                    ch.up_alpha = ch.up.alpha * c.info.inv_input_scale13;
+                    ch.unit0 = int(ar.unit_token.size());
+                    ch.units = 0;
+                    ar.chunk.push_back(ch);
+                }
+                ++ar.chunk.back().units;
+                ar.unit_token.push_back(ref.token);
+            }
+            Route& r = c.route[size_t(ref.token) * kMaxRoutes + ref.index];
+            r.unit = int(ar.unit_token.size()) - 1;
+            r.down_alpha = ar.chunk.back().down.alpha * c.info.inv_input_scale2 * r.weight;
         }
+        c.chunk = ar.chunk.data();
+        c.chunks = int(ar.chunk.size());
+        c.unit_token = ar.unit_token.data();
+        c.units = int(ar.unit_token.size());
     }
 
     // Sizes this call's scratch from the arena. The padded tails are zeroed on every call: the arena is shared by
@@ -74,25 +105,28 @@ private:
     static void prepare_scratch(ForwardCtx& c, ForwardArena& ar, int threads)
     {
         const size_t H = size_t(Shape::hidden(c.info)), N = size_t(Shape::intermediate(c.info));
-        const size_t Hp = rounded(H, 64), Np = rounded(N, 64), routes = size_t(c.routes);
+        const size_t Hp = rounded(H, 64), Np = rounded(N, 64), rows = size_t(c.rows), units = size_t(c.units);
         auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
-        grow(ar.xf, Hp);
-        grow(ar.qx, Hp / 32);
-        grow(ar.inter, routes * Np);
-        grow(ar.qi, routes * Np / 32);
-        std::fill(ar.xf.begin() + H, ar.xf.begin() + Hp, 0.f);
-        for (size_t r = 0; r < routes; ++r)
-            std::fill(ar.inter.begin() + r * Np + N, ar.inter.begin() + (r + 1) * Np, 0.f);
+        grow(ar.xf, rows * Hp);
+        grow(ar.qx, rows * Hp / 32);
+        grow(ar.inter, units * Np);
+        grow(ar.qi, units * Np / 32);
+        for (size_t t = 0; t < rows; ++t)
+            std::fill(ar.xf.begin() + t * Hp + H, ar.xf.begin() + (t + 1) * Hp, 0.f);
+        for (size_t u = 0; u < units; ++u)
+            std::fill(ar.inter.begin() + u * Np + N, ar.inter.begin() + (u + 1) * Np, 0.f);
         c.xf = ar.xf.data();
         c.qx = ar.qx.data();
         c.inter = ar.inter.data();
         c.qi = ar.qi.data();
+        c.partial_stride = rounded(std::max<size_t>(units, 1), 16);  // whole cache lines per worker
+        grow(ar.partial, size_t(threads) * c.partial_stride);
+        c.partial = ar.partial.data();
 #if defined(NVFP4_CPU_UPSTREAM_BASELINE)
         c.row_scratch_stride = std::max(Hp, Np) / 64;
         grow(ar.row_scratch, size_t(threads) * c.row_scratch_stride);
         c.row_scratch = ar.row_scratch.data();
 #else
-        (void)threads;
         c.row_scratch = nullptr;
         c.row_scratch_stride = 0;
 #endif
@@ -145,29 +179,40 @@ private:
             c.row_scratch ? c.row_scratch + size_t(worker) * c.row_scratch_stride : nullptr;
 
         if constexpr (P == Phase::PrepareInput) {
-            const auto [b0, b1] = share<1>(int64_t(Hp / 32), worker, workers);
-            for (int64_t b = b0; b < b1; ++b) {
+            // Token t's blocks are [t * Hp / 32, (t + 1) * Hp / 32) of the flat range.
+            const int64_t per_row = int64_t(Hp / 32);
+            const auto [b0, b1] = share<1>(int64_t(c.rows) * per_row, worker, workers);
+            for (int64_t gb = b0; gb < b1; ++gb) {
+                const int64_t t = gb / per_row, b = gb % per_row;
+                const uint8_t* x = c.x + size_t(t) * size_t(H) * 2;
+                float* xf = c.xf + size_t(t) * Hp;
                 for (int64_t i = b * 32; i < std::min<int64_t>(b * 32 + 32, H); ++i) {
                     uint16_t v;
-                    std::memcpy(&v, c.x + 2 * i, 2);
-                    c.xf[i] = ggml_compute_fp16_to_fp32(v);
+                    std::memcpy(&v, x + 2 * i, 2);
+                    xf[i] = ggml_compute_fp16_to_fp32(v);
                 }
-                if (!q8_representable(c.xf + b * 32)) c.invalid.store(true, std::memory_order_relaxed);
-                else quantize_block(c.xf + b * 32, c.qx[b]);
+                if (!q8_representable(xf + b * 32)) c.invalid.store(true, std::memory_order_relaxed);
+                else quantize_block(xf + b * 32, c.qx[gb]);
             }
         } else if constexpr (P == Phase::GateUp) {
-            const auto [r0, r1] = share<Traits::kRowUnit>(int64_t(c.routes) * N, worker, workers);
+            const auto [r0, r1] = share<Traits::kRowUnit>(int64_t(c.chunks) * N, worker, workers);
             for (int64_t row = r0; row < r1; ++row) {
-                const int r = int(row / N), i = int(row % N);
+                const Chunk& ch = c.chunk[row / N];
+                const int i = int(row % N);
                 int gate_row, up_row;
                 w13_rows(c.info.w13_layout, N, i, gate_row, up_row);
-                const float g = dot(c.gate[r].w, c.gate[r].sf, gate_row, H, c.qx, scratch) * c.gate_alpha[r];
-                const float u = dot(c.up[r].w, c.up[r].sf, up_row, H, c.qx, scratch) * c.up_alpha[r];
-                c.inter[size_t(r) * Np + size_t(i)] = swiglu(g, u, Shape::act_limit(c.info));
+                const block_q8_0* xs[kChunkRows];
+                for (int j = 0; j < ch.units; ++j) xs[j] = c.qx + size_t(c.unit_token[ch.unit0 + j]) * (Hp / 32);
+                float g[kChunkRows], u[kChunkRows];
+                dot_rows(ch.gate.w, ch.gate.sf, gate_row, H, xs, ch.units, scratch, g);
+                dot_rows(ch.up.w, ch.up.sf, up_row, H, xs, ch.units, scratch, u);
+                for (int j = 0; j < ch.units; ++j)
+                    c.inter[size_t(ch.unit0 + j) * Np + size_t(i)] =
+                        swiglu(g[j] * ch.gate_alpha, u[j] * ch.up_alpha, Shape::act_limit(c.info));
             }
         } else if constexpr (P == Phase::Middle) {
-            // Route r's intermediate is Np floats at r * Np, so block b of the flat range is route b / (Np / 32)'s.
-            const auto [b0, b1] = share<1>(int64_t(c.routes) * int64_t(Np / 32), worker, workers);
+            // Unit u's intermediate is Np floats at u * Np, so block b of the flat range is unit b / (Np / 32)'s.
+            const auto [b0, b1] = share<1>(int64_t(c.units) * int64_t(Np / 32), worker, workers);
             for (int64_t b = b0; b < b1; ++b) {
                 const float* v = c.inter + b * 32;
                 if (!q8_representable(v)) c.invalid.store(true, std::memory_order_relaxed);
@@ -175,13 +220,22 @@ private:
             }
         } else {
             static_assert(P == Phase::Down);
+            float* partial = c.partial + size_t(worker) * c.partial_stride;
             const auto [h0, h1] = share<Traits::kRowUnit>(H, worker, workers);
             for (int64_t h = h0; h < h1; ++h) {
-                float sum = 0.f;
-                for (int r = 0; r < c.routes; ++r)
-                    sum += dot(c.down[r].w, c.down[r].sf, int(h), N, c.qi + size_t(r) * (Np / 32), scratch)
-                           * c.down_alpha[r];
-                c.out[h] = c.accumulate ? c.out[h] + sum : sum;
+                for (int ci = 0; ci < c.chunks; ++ci) {
+                    const Chunk& ch = c.chunk[ci];
+                    const block_q8_0* xs[kChunkRows];
+                    for (int j = 0; j < ch.units; ++j) xs[j] = c.qi + size_t(ch.unit0 + j) * (Np / 32);
+                    dot_rows(ch.down.w, ch.down.sf, int(h), N, xs, ch.units, scratch, partial + ch.unit0);
+                }
+                for (int t = 0; t < c.rows; ++t) {
+                    const Route* route = c.route + size_t(t) * kMaxRoutes;
+                    float sum = 0.f;
+                    for (int r = 0; r < c.route_count[t]; ++r) sum += partial[route[r].unit] * route[r].down_alpha;
+                    float& out = c.out[size_t(t) * size_t(H) + size_t(h)];
+                    out = c.accumulate ? out + sum : sum;
+                }
             }
         }
     }

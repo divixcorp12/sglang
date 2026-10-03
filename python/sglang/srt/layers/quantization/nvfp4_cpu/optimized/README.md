@@ -111,16 +111,21 @@ blocks whose delta rounds to zero contribute zero.
 ## Threading and lifetime
 
 Each forward runs one OpenMP team of `threads` workers, the calling engine thread as worker 0, in four phases
-separated by barriers: input to Q8_0; every routed expert's gate/up rows and SiLU; every intermediate to Q8_0; every
-expert's down rows summed in routing order into `out`. Configure distinct allowed Linux cores before the first
+separated by barriers: every token's input to Q8_0; every routed expert's gate/up rows and SiLU; every intermediate to
+Q8_0; every expert's down rows, each token's summed in its routing order into its row of `out`. Configure distinct allowed Linux cores before the first
 forward; worker i is pinned to core i (once, then re-checked cheaply). A forward may use any team size up to the
 configured cores. If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`, `OMP_DYNAMIC`), the forward returns 1 and
 leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave
 `OMP_PROC_BIND` unset. Concurrent forward/free/configuration is rejected (3). Stop/join the engine before freeing
 handles or slab storage; do not unload the library while callbacks are in use. The kernel requires Linux and OpenMP.
 
-The callback accepts up to eight lanes, skips -1 slots, preserves routing order
-including duplicate slots, and supports overwrite or accumulation. Caller
+The forward takes one `SglangCpuExpertsForward` (`cpu_expert_forward_abi.h`
+beside the engine, shared with the EXL3 kernel): up to 65536 token rows of up
+to eight lanes each. It skips -1 slots, preserves each row's routing order
+including duplicate slots, and supports overwrite or accumulation. Rows that
+route to the same slot are computed together, up to four per decoded weight
+row; every row's output is bitwise its own one-row call's. The engine sends
+one row per job. Caller
 pointer extents and finite activation/block-scale values are required. Raw
 pointers cannot prove allocation size. Status: 0 success, 1 internal error,
 2 invalid arguments, 3 concurrent use. The engine's nonzero-status fail-stop
@@ -128,11 +133,14 @@ behavior is unchanged.
 
 ## Code layout
 
-`moe_mul1.cpp` holds the registry, worker cores, the arithmetic and the C ABI. A forward is
+`moe_mul1.h` declares the kernel's types (the registry entry, `Route`, `Chunk`, `ForwardCtx`, `ForwardArena`) and
+functions; `moe_mul1.cpp` defines the registry, worker cores, the arithmetic and the C ABI. A forward is
 `ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `run_plan`:
 `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer on an AVX2 build, else
 `ForwardPlan<GenericShape, kBuildIsa>`. The tier is the build's (`-march=native` AVX2, or the portable scalar loop).
-`PlanTraits<Shape, Isa>` holds the plan's knobs (`kRowUnit`, the split unit). A plan reads every layer fact it may fix
+`PlanTraits<Shape, Isa>` holds the plan's knobs (`kRowUnit`, the split unit). The plan groups a call's routes into
+units, one per (token, slot), and units into chunks of up to `kChunkRows` (4) of one slot; `dot_rows` decodes each
+weight row once per chunk (`dot_gpu_rows<M>` in `dot_nvfp4.h`). A plan reads every layer fact it may fix
 through its Shape (`shapes.hpp`): `GenericShape` from the layer's `LayerInfo`, `MimoV26ProShape` as compile-time
 constants (MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp). Plans read slots through
 `StridedExperts<Shape>` (`experts.hpp`) over the descriptor's slab bases and strides; `SlabRowBytes` is each slab's

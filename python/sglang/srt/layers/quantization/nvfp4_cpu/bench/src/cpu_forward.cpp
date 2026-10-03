@@ -50,7 +50,7 @@ std::vector<int32_t> list(const std::string& s, bool ranges) {
 }
 struct Options {
     std::string cpus = "18-33", experts = "1,3,5", fixture, write_fixture;
-    int workers = 16, node = 1, warmup = 128, gap_us = 0;
+    int workers = 16, node = 1, warmup = 128, gap_us = 0, rows = 1;
     int hidden = 5120, intermediate = 2304, capacity = 5, layers = 1, layout = 0;
     int seed = 20261002;
     bool validate_only = false;
@@ -70,6 +70,7 @@ Options parse(int& argc, char** argv) {
         else if (key == "--numa-node") o.node=number(value);
         else if (key == "--warmup-forwards") o.warmup=number(value);
         else if (key == "--gap-us") o.gap_us=number(value);
+        else if (key == "--rows") o.rows=number(value);
         else if (key == "--hidden") o.hidden=number(value);
         else if (key == "--intermediate") o.intermediate=number(value);
         else if (key == "--capacity") o.capacity=number(value);
@@ -83,12 +84,14 @@ Options parse(int& argc, char** argv) {
                 "--fixture=FILE or synthetic --hidden=5120 --intermediate=2304\n"
                 "--capacity=5 --layers=1 --w13-layout=0|1|2 --seed=20261002\n"
                 "--write-fixture=NEW_FILE --validate-only --warmup-forwards=128 --gap-us=0\n"
+                "--rows=1 (token rows per forward: the layer's x repeated, every row on the same experts)\n"
                 "Memory policy is inherited; Google Benchmark flags also accepted.\n";
             std::exit(0);
         } else argv[keep++]=argv[i];
     }
     argc=keep; argv[keep]=nullptr;
-    if (o.workers < 1 || o.workers > CPU_SETSIZE || o.node < 0 || o.warmup < 0 || o.gap_us < 0)
+    if (o.workers < 1 || o.workers > CPU_SETSIZE || o.node < 0 || o.warmup < 0 || o.gap_us < 0 || o.rows < 1
+        || o.rows > 65536)
         throw std::runtime_error("Invalid workers/node/warmup/gap");
     if (!o.fixture.empty() && !o.write_fixture.empty()) throw std::runtime_error("Cannot read and write fixture together");
     return o;
@@ -292,26 +295,37 @@ struct Workload {
     Fixture& f; const Options& o; int experts;
     std::vector<int32_t> slots;
     std::vector<float> routes,out;
+    std::vector<std::vector<uint16_t>> xs;  // per layer: its x repeated o.rows times
     std::vector<std::vector<double>> refs, dense_refs;
     double quant_nrmse=0, quant_max_abs=0;
-    Workload(Fixture& fixture,const Options& options,int count):f(fixture),o(options),experts(count),out(f.h.hidden) {
-        for (int i=0;i<experts;++i) { slots.push_back(i); routes.push_back(1.f/experts); }
+    Workload(Fixture& fixture,const Options& options,int count)
+        :f(fixture),o(options),experts(count),out(size_t(f.h.hidden)*options.rows) {
+        for (int r=0;r<o.rows;++r) for (int i=0;i<experts;++i) { slots.push_back(i); routes.push_back(1.f/experts); }
+        for (const auto& l:f.layers) {
+            xs.emplace_back();
+            for (int r=0;r<o.rows;++r) xs.back().insert(xs.back().end(),l->x.begin(),l->x.end());
+        }
         for (const auto& l:f.layers) { refs.push_back(reference(f,*l,experts)); dense_refs.push_back(reference(f,*l,experts,false)); }
     }
     void forward(size_t layer) {
-        const auto& l=*f.layers[layer];
-        int rc=sglang_nvfp4_cpu_experts_forward(l.handle,l.x.data(),slots.data(),routes.data(),experts,out.data(),o.workers,0);
+        SglangCpuExpertsForward call{};
+        call.abi_version=SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
+        call.rows=o.rows; call.layer=f.layers[layer]->handle; call.x=xs[layer].data();
+        call.slots=slots.data(); call.weights=routes.data(); call.out=out.data();
+        call.k=experts; call.threads=o.workers;
+        int rc=sglang_nvfp4_cpu_experts_forward(&call);
         if (rc) throw std::runtime_error("CpuExpertForward status "+std::to_string(rc));
     }
     void validate() {
         for (size_t l=0;l<f.layers.size();++l) {
             forward(l);
             double squared_error=0, squared_gold=0;
-            for (size_t i=0;i<out.size();++i) {
+            for (size_t j=0;j<out.size();++j) {
+                const size_t i=j%f.h.hidden;
                 const double gold=refs[l][i], tolerance=1e-4+1e-4*std::abs(gold);
-                if (!std::isfinite(out[i]) || !std::isfinite(gold) || std::abs(out[i]-gold)>tolerance)
-                    throw std::runtime_error("Q8 dense reference mismatch at layer "+std::to_string(l)+" element "+std::to_string(i));
-                double error=out[i]-dense_refs[l][i];
+                if (!std::isfinite(out[j]) || !std::isfinite(gold) || std::abs(out[j]-gold)>tolerance)
+                    throw std::runtime_error("Q8 dense reference mismatch at layer "+std::to_string(l)+" element "+std::to_string(j));
+                double error=out[j]-dense_refs[l][i];
                 squared_error+=error*error; squared_gold+=dense_refs[l][i]*dense_refs[l][i];
                 quant_max_abs=std::max(quant_max_abs,std::abs(error));
             }
@@ -349,7 +363,7 @@ void run(benchmark::State& state,Workload& w) {
         }
         state.counters["q8_vs_fp16_nrmse"]=w.quant_nrmse;
         state.counters["q8_vs_fp16_max_abs"]=w.quant_max_abs;
-        state.counters["experts"]=w.experts; state.counters["workers"]=w.o.workers;
+        state.counters["experts"]=w.experts; state.counters["workers"]=w.o.workers; state.counters["rows"]=w.o.rows;
         state.counters["layers"]=w.f.layers.size(); state.counters["weight_bytes_per_forward"]=w.bytes();
     } catch (const std::exception& e) { failed=true; state.SkipWithError(e.what()); }
 }
@@ -398,7 +412,8 @@ int main(int argc,char** argv) {
         benchmark::AddCustomContext("compiler",__VERSION__);
         benchmark::AddCustomContext("memory_policy","inherited; no benchmark membind");
         for (auto& w:workloads) {
-            auto ptr=w.get(); benchmark::RegisterBenchmark((std::string(NVFP4_BENCH_BACKEND)+"/experts:"+std::to_string(w->experts)).c_str(),
+            const std::string rows=o.rows==1?"":"/rows:"+std::to_string(o.rows);
+            auto ptr=w.get(); benchmark::RegisterBenchmark((std::string(NVFP4_BENCH_BACKEND)+"/experts:"+std::to_string(w->experts)+rows).c_str(),
                 [ptr](benchmark::State& state) { run(state,*ptr); })->UseManualTime()->Unit(benchmark::kMicrosecond);
         }
         benchmark::RunSpecifiedBenchmarks(); benchmark::Shutdown(); verify_workers(before,cores);

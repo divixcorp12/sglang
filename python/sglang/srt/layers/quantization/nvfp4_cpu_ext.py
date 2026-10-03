@@ -17,6 +17,8 @@ from typing import Optional
 from filelock import FileLock
 
 _KERNEL = Path(__file__).resolve().parent / "nvfp4_cpu"
+# cpu_experts_cabi.h includes the engine's forward ABI header, so the library depends on it too.
+_FORWARD_ABI = _KERNEL.parents[3] / "kernels/jit/csrc/moe/expert_stream/host/cpu_expert_forward_abi.h"
 _DEFAULT_BUILD_DIR = "~/.cache/sglang/nvfp4_cpu"
 
 
@@ -31,7 +33,7 @@ def _sources() -> list[Path]:
     optimized, upstream = _KERNEL / "optimized", _KERNEL / "upstream"
     return sorted(
         [*optimized.glob("*.cpp"), *optimized.glob("*.hpp"), *optimized.glob("*.h"), *optimized.glob("*.py")]
-        + [*upstream.glob("*.c"), *upstream.glob("*.h")]
+        + [*upstream.glob("*.c"), *upstream.glob("*.h"), _FORWARD_ABI]
     )
 
 

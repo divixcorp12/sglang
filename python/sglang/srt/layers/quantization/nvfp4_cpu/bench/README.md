@@ -70,7 +70,10 @@ Pass `--experts=1,3,5,8 --capacity=8` to include eight routed experts,
 `--layers=N` to cycle through multiple layer images, or `--gap-us=N` to sleep
 before each timed forward. Gap sleep is excluded from timing; pool wakeup is
 included. W13 layout is `--w13-layout=0` (gate/up), `1` (up/gate), or `2`
-(alternating 64-row up/gate blocks; N must be divisible by 64).
+(alternating 64-row up/gate blocks; N must be divisible by 64). `--rows=N`
+sends N token rows per forward, the layer's x repeated with every row on the
+same experts, so each weight row is decoded once per 4 rows; the benchmark name
+gains `/rows:N` and every row is validated.
 
 ## Timing and correctness
 
