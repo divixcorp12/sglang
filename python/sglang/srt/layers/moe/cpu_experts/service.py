@@ -35,13 +35,21 @@ logger = logging.getLogger(__name__)
 LANES = 8
 
 
-def cpu_trait_for(format_key: str, ext=None):
-    """The quant trait of a streamed expert format; only EXL3 has a CPU kernel today."""
+def cpu_trait_for(format_key: str, ext=None, *, nvfp4_config=None):
+    """Select a kernel; NVFP4 requires explicit GPU layout/alpha metadata."""
     if format_key == "exl3":
         from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
         from sglang.srt.layers.quantization.exl3_ext import exl3_ext
 
         return Exl3CpuQuantTrait(ext if ext is not None else exl3_ext(), act_limit=None)
+    if format_key == "nvfp4":
+        if nvfp4_config is None:
+            raise ValueError(
+                "NVFP4 CPU experts require explicit nvfp4_config layout and input scale reciprocals"
+            )
+        from sglang.srt.layers.moe.cpu_experts.nvfp4 import Nvfp4CpuQuantTrait
+
+        return Nvfp4CpuQuantTrait(library=ext, **nvfp4_config)
     raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
 
 
