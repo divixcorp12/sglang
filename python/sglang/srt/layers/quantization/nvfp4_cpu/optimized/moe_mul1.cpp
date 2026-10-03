@@ -237,15 +237,17 @@ struct ForwardArena
 #include "forward_plan.hpp"
 
 // Runs the call's plan: the MiMo V2.6 Pro plan when the layer is that model's routed expert on an AVX2 build, else the
-// generic plan for this build's tier. Both read the same slabs; the MiMo plan through the view checked for it.
+// generic plan for this build's tier. Both read the same slabs; the MiMo plan through the view checked for it. A template
+// so a scalar build discards, and never instantiates, the AVX2 plan.
+template <Isa I = kBuildIsa>
 int run_plan(ForwardCtx& ctx, const RegisteredLayer& layer, int threads)
 {
-    if constexpr (kBuildIsa == Isa::Avx2) {
+    if constexpr (I == Isa::Avx2) {
         if (MimoV26ProShape::accepts(ctx.info))
             return ForwardPlan<MimoV26ProShape, Isa::Avx2>::run(ctx, layer.strided.as<MimoV26ProShape>(),
                                                                 ForwardArena::get(), threads);
     }
-    return ForwardPlan<GenericShape, kBuildIsa>::run(ctx, layer.strided, ForwardArena::get(), threads);
+    return ForwardPlan<GenericShape, I>::run(ctx, layer.strided, ForwardArena::get(), threads);
 }
 
 bool valid(const SglangNvfp4CpuLayer& d) {
