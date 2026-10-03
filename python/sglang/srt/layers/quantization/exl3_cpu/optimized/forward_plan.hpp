@@ -162,13 +162,13 @@ private:
         const int I_ = Shape::intermediate(c.info);
 
         if(phase==0 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(H) && I==Isa::Bw) {
-            if (wide) prepare_gu_blocks<I, true>(c,E,worker,num_workers);
-            else prepare_gu_blocks<I, false>(c,E,worker,num_workers);
+            if (wide) prepare_gu_blocks<Shape, I, true>(c,E,worker,num_workers);
+            else prepare_gu_blocks<Shape, I, false>(c,E,worker,num_workers);
             return;
         }
         if (phase==2 && EXL3_MOE_CPU_ACT_BLOCK==128 && act_blocked(I_) && I!=Isa::Scalar) {
-            if (wide) middle_blocks<I, true>(c,E,worker,num_workers);
-            else middle_blocks<I, false>(c,E,worker,num_workers);
+            if (wide) middle_blocks<Shape, I, true>(c,E,worker,num_workers);
+            else middle_blocks<Shape, I, false>(c,E,worker,num_workers);
             return;
         }
         switch (phase) {
@@ -176,7 +176,7 @@ private:
             case 0:
             {
                 // Prepare gate and up inputs, distributed over (chunk, gate/up)
-                const int gu = !c.info.gated ? 1 : 2;
+                const int gu = !Shape::gated(c.info) ? 1 : 2;
                 for (int j = worker; j < nc * gu; j += num_workers)
                 {
                     const Chunk& ch = c.chunks[j / gu];
@@ -191,7 +191,7 @@ private:
             case 1:
             {
                 // Gate + up GEMVs (see assign_gemvs)
-                const int gu = !c.info.gated ? 1 : 2;
+                const int gu = !Shape::gated(c.info) ? 1 : 2;
                 assign_gemvs(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
                 {
                     const Chunk& ch = c.chunks[j / gu];
@@ -208,7 +208,7 @@ private:
             {
                 // Output transform for gate/up, activation, prepare down input; per chunk. Gated: act(g)
                 // * u accumulated into g; gateless: relu2 applied to u in place
-                const bool gated = c.info.gated;
+                const bool gated = Shape::gated(c.info);
                 for (int j = worker; j < nc; j += num_workers) {
                     const Chunk& ch = c.chunks[j];
                     float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I_;
@@ -222,9 +222,9 @@ private:
                     // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
                     // context push |u| into the thousands, and skipping the clamp here made
                     // offloaded experts diverge arbitrarily far from their GPU-resident twins
-                    const float lim = c.info.act_limit != 0.0f
-                        ? c.info.act_limit : std::numeric_limits<float>::infinity();
-                    switch (c.info.activation) {
+                    const float lim = Shape::act_limit(c.info) != 0.0f
+                        ? Shape::act_limit(c.info) : std::numeric_limits<float>::infinity();
+                    switch (Shape::activation(c.info)) {
                         case 0:
                             for (size_t i = 0; i < count; ++i) {
                                 const float gv = g[i];
@@ -243,7 +243,7 @@ private:
                         case 3: {
                             // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
                             // sigmoid(1.702 * g)
-                            const float lim = c.info.act_limit;
+                            const float lim = Shape::act_limit(c.info);
                             for (size_t i = 0; i < count; ++i) {
                                 const float gv = std::min(g[i], lim);
                                 const float uv = std::clamp(u[i], -lim, lim);

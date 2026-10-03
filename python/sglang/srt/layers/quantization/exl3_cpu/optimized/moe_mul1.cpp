@@ -2254,10 +2254,10 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
 
 // Same scalar/vector operations and block scale ordering as the original phase 2.
 // Blocks are independent: only their own gate/up outputs and prepared input slices are written.
-template<Isa I, bool Wide = false, class Experts>
+template<class Shape, Isa I, bool Wide = false, class Experts>
 void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
-    const int I_=c.info.intermediate, nb=I_/128, nc=int(c.chunks.size());
-    const bool gated=c.info.gated;
+    const int I_=Shape::intermediate(c.info), nb=I_/128, nc=int(c.chunks.size());
+    const bool gated=Shape::gated(c.info);
     const int first=nc*nb*worker/num_workers,last=nc*nb*(worker+1)/num_workers;
     for (int task=first;task<last;++task) {
         const int j=task/nb,b=task%nb,block=b*128;
@@ -2273,8 +2273,8 @@ void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
             transform_out<I>(up,u,1);
             const size_t count=128;
             float* a=gated?g:u;
-            const float lim=c.info.act_limit!=0.0f?c.info.act_limit:std::numeric_limits<float>::infinity();
-                switch (c.info.activation) {
+            const float lim=Shape::act_limit(c.info)!=0.0f?Shape::act_limit(c.info):std::numeric_limits<float>::infinity();
+                switch (Shape::activation(c.info)) {
                     case 0:
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = g[i];
@@ -2293,7 +2293,7 @@ void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
                     case 3: {
                         // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
                         // sigmoid(1.702 * g)
-                        const float lim = c.info.act_limit;
+                        const float lim = Shape::act_limit(c.info);
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = std::min(g[i], lim);
                             const float uv = std::clamp(u[i], -lim, lim);
@@ -2330,9 +2330,9 @@ void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
 }
 
 
-template<Isa I, bool Wide = false, class Experts>
+template<class Shape, Isa I, bool Wide = false, class Experts>
 void prepare_gu_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
-    const int K=c.info.hidden,nb=K/128,nc=int(c.chunks.size()),gu=!c.info.gated?1:2;
+    const int K=Shape::hidden(c.info),nb=K/128,nc=int(c.chunks.size()),gu=!Shape::gated(c.info)?1:2;
     const int first=nc*gu*nb*worker/num_workers,last=nc*gu*nb*(worker+1)/num_workers;
     for(int task=first;task<last;++task) {
         const int j=task/nb,b=task%nb;

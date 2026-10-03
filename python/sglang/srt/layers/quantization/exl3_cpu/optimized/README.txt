@@ -83,8 +83,10 @@ Code layout
 moe_mul1.cpp holds the kernels and the public API. A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
 picked once per call in forward_raw: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on an
 AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one
-specialization: compact scratch, grouped traversal, wide single-expert quantization. shapes.hpp fixes DeepSeek
-V4.1's dimensions. Plans read experts through an accessor (experts.hpp): TableExperts over make_layer's per-expert
+specialization: compact scratch, grouped traversal, wide single-expert quantization. A plan reads every layer fact
+through its Shape (shapes.hpp): GenericShape from the layer's LayerInfo, Dsv41Shape as compile-time constants
+(5120/2304, 3-bit, gated SiLU, activation limit 10; a layer with any other value takes the generic plan). Plans
+read experts through an accessor (experts.hpp): TableExperts over make_layer's per-expert
 tables, or StridedExperts<Shape> over sglang_exl3_cpu_experts_register_slabs's slab bases.
 
 Bit-exact checks for any change here: test/manual/dsv41/run_exl3_cpu_forward_checks.sh (A/B dumps per ISA tier
