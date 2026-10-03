@@ -138,11 +138,11 @@ constexpr int kMaxDrives = 4;
 
 // Per-row and per-extent stamps live in fixed arrays: the record is copied out as one fixed-width row of int64 and
 // pushed into a preallocated ring, so nothing on the completion path allocates. A request reads at most
-// 2 * Wire::kLanes = 16 distinct experts (need and protect ids, 8 each) and a row issues at most two extents (one per
-// mirror root in use), so 16 rows and 32 extents hold every request the wire format can carry. Anything past them is
+// 2 * Wire::kLanes distinct experts (need and protect ids) and a row issues at most two extents (one per mirror root
+// in use), so kTraceRows rows and kTraceExtents extents hold every request the wire format can carry. Anything past them is
 // counted in rows_untraced / extents_untraced, never stamped and never allowed to grow the record.
-constexpr int kTraceRows = 16;
-constexpr int kTraceExtents = 32;
+constexpr int kTraceRows = 2 * ::sglang::expert_stream::wire::Wire::kLanes;
+constexpr int kTraceExtents = 2 * kTraceRows;
 
 // Terminal status of a traced request (StageRecord::status): how it ended. 0 (none) is never stored in a pushed
 // record.

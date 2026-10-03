@@ -405,7 +405,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     const std::vector<int64_t> dest = slots_of(slots);
     const size_t lanes = static_cast<size_t>(masks.size(1));
     if (static_cast<size_t>(masks.size(0)) != ids.size() || lanes == 0 || lanes > static_cast<size_t>(kPieceTargets)) {
-      throw std::runtime_error(error_prefix<Layout>() + "masks must be [rows, 1..8] readiness words");
+      throw std::runtime_error(error_prefix<Layout>() + "masks must be [rows, 1.." + std::to_string(kPieceTargets) + "] readiness words");
     }
     auto* words = static_cast<uint64_t*>(masks.data_ptr());
     std::vector<PieceTarget> targets(ids.size());

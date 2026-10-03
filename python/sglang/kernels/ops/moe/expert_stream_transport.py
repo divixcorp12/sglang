@@ -773,8 +773,20 @@ def piece_geometry(
 # ``pack_ns`` are built from them as for packing. ``pack_workers`` and ``pack_split``
 # are 0, and ``useful_bytes`` still counts the segment bytes that landed in the slabs.
 STAGE_DRIVES = 4
-STAGE_TRACE_ROWS = 16
-STAGE_TRACE_EXTENTS = 32
+def stage_trace_rows(lanes: int = 8) -> int:
+    """kTraceRows: the need and protect ids a request can read, two per lane."""
+    return 2 * expert_lease_block.wire_layout(lanes).lanes
+
+
+def calibration_shape(lanes: int = 8) -> tuple[int, int]:
+    """The calibration grid (kCalibRows, kCalibCols)."""
+    n = expert_lease_block.wire_layout(lanes).lanes
+    return (n + 2, n + 1)
+
+
+# The 8-lane build's values, for callers that have no lane count yet.
+STAGE_TRACE_ROWS = stage_trace_rows()
+STAGE_TRACE_EXTENTS = 2 * STAGE_TRACE_ROWS
 # The C++ ``kPieces``: pieces per row, and the most sub-reads a row issues under piece
 # streaming.
 STAGE_PIECES = 8
@@ -1712,16 +1724,17 @@ class ExpertStreamHost:
         reps: int,
         scratch: torch.Tensor,
         timeout_s: float = 1.0,
+        lanes: int = 8,
     ) -> torch.Tensor:
         """Run the CPU split's startup calibration on ``row``.
 
-        Returns float64 ``[10, 9]`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
+        Returns float64 ``calibration_shape(lanes)`` (``[10, 9]`` at 8 lanes) mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
         row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no
         thread). ``device`` -1 copies with the test backend; ``scratch`` holds 8
-        experts on that device. Raises RuntimeError on failure.
+        lanes experts on that device. Raises RuntimeError on failure.
         """
-        out = torch.zeros((10, 9), dtype=torch.float64)
-        self._module.expert_stream_calibrate_cpu_split(
+        out = torch.zeros(calibration_shape(lanes), dtype=torch.float64)
+        _host_module(self._layout, self.variant, lanes).expert_stream_calibrate_cpu_split(
             self.handle,
             int(row),
             int(device),
