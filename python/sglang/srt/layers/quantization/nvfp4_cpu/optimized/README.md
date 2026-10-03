@@ -28,11 +28,11 @@ See [upstream provenance and adaptation details](../upstream/README.md).
 
 ## Attach to the existing engine
 
-Include `cpu_experts_cabi.h` and link the shared library or compile
-`moe_mul1.cpp` into the same native module, as with EXL3. Register each layer
+Include `cpu_experts_cabi.h` and load the library `build.py` or
+`nvfp4_cpu_ext.nvfp4_cpu_library()` builds. Register each layer
 using a `SglangNvfp4CpuLayer` descriptor. Registration stores views and allocates
 activation/result scratch. The optimized kernel never repacks or expands full
-weight rows. Compile/link `../upstream/nvfp4.c` alongside `moe_mul1.cpp`.
+weight rows.
 
 ```cpp
 int64_t handle = -1;
@@ -110,13 +110,14 @@ blocks whose delta rounds to zero contribute zero.
 
 ## Threading and lifetime
 
-One process-wide persistent helper pool is owned by the calling engine thread
-(worker zero). Configure distinct allowed Linux cores before the first forward.
-The first call fixes maximum workers; later calls may use fewer. Concurrent
-forward/free/configuration is rejected. Stop/join the engine before freeing
-handles or slab storage; do not unload the library while callbacks/workers are
-in use. Standalone unpinned arithmetic tests also build on macOS; explicit
-production worker placement requires Linux.
+Each forward runs one OpenMP team of `threads` workers, the calling engine thread as worker 0, in four phases
+separated by barriers: input to Q8_0; every routed expert's gate/up rows and SiLU; every intermediate to Q8_0; every
+expert's down rows summed in routing order into `out`. Configure distinct allowed Linux cores before the first
+forward; worker i is pinned to core i (once, then re-checked cheaply). A forward may use any team size up to the
+configured cores. If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`, `OMP_DYNAMIC`), the forward returns 1 and
+leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave
+`OMP_PROC_BIND` unset. Concurrent forward/free/configuration is rejected (3). Stop/join the engine before freeing
+handles or slab storage; do not unload the library while callbacks are in use. The kernel requires Linux and OpenMP.
 
 The callback accepts up to eight lanes, skips -1 slots, preserves routing order
 including duplicate slots, and supports overwrite or accumulation. Caller
@@ -125,9 +126,25 @@ pointers cannot prove allocation size. Status: 0 success, 1 internal error,
 2 invalid arguments, 3 concurrent use. The engine's nonzero-status fail-stop
 behavior is unchanged.
 
+## Code layout
+
+`moe_mul1.cpp` holds the registry, worker cores, the arithmetic and the C ABI. A forward is
+`ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `run_plan`:
+`ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer on an AVX2 build, else
+`ForwardPlan<GenericShape, kBuildIsa>`. The tier is the build's (`-march=native` AVX2, or the portable scalar loop).
+`PlanTraits<Shape, Isa>` holds the plan's knobs (`kRowUnit`, the split unit). A plan reads every layer fact it may fix
+through its Shape (`shapes.hpp`): `GenericShape` from the layer's `LayerInfo`, `MimoV26ProShape` as compile-time
+constants (MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp). Plans read slots through
+`StridedExperts<Shape>` (`experts.hpp`) over the descriptor's slab bases and strides; `SlabRowBytes` is each slab's
+minimum stride.
+
+Bit-exact checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (native, upstream-baseline
+and portable builds against a baseline worktree's dumps), and
+`test/registered/unit/kernels/test_nvfp4_cpu_{build,experts}.py`.
+
 ## Validation boundaries
 
-The native CTest harness checks repeated multithreaded forwards, accumulation,
+The native harness (`test_nvfp4_cpu_build.py` builds and runs it) checks repeated multithreaded forwards, accumulation,
 every finite E4M3 encoding, skipped/invalid slots and handle lifecycle. The
 benchmark checks every selected layer/count against
 an independent decoded-weight Q8 reference before and after timing, and
@@ -136,7 +153,8 @@ test covers every finite signed scale, varying nibbles, GPU scale row
 boundaries, and all partial 64-value block lengths. The
 standalone sanitizer harness is in
 `test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`; compile it together with
-`moe_mul1.cpp` and the vendored C source using ASan/UBSan CMake compiler flags.
+`moe_mul1.cpp` and the vendored C source; `test_nvfp4_cpu_build.py` also runs it under ASan/UBSan where the
+compiler can link them.
 
 Synthetic arithmetic/layout checks and benchmark smoke runs are not captured
 GPU integration, model-level quality validation or an isolated performance

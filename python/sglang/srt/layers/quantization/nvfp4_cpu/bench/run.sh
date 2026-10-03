@@ -9,6 +9,10 @@ fi
 build=$(realpath "$1")
 results=$2
 shift 2
+# The kernel's workers are one OpenMP team per forward: spin between forwards rather than sleep, never let the
+# runtime shrink the team, and never let OpenMP bind threads (the kernel pins each worker to its configured core).
+export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-ACTIVE} GOMP_SPINCOUNT=${GOMP_SPINCOUNT:-INFINITE} OMP_DYNAMIC=FALSE
+unset OMP_PROC_BIND OMP_PLACES
 rounds=${NVFP4_BENCH_ROUNDS:-8}
 counts=${NVFP4_BENCH_WORKERS:-16}
 if [[ ! $rounds =~ ^[1-9][0-9]*$ || ! $counts =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
@@ -50,6 +54,8 @@ fi
   printf 'Rounds: %s\nWorker counts: %s\nArguments:' "$rounds" "$counts"
   printf ' %q' "$@"
   printf '\n'
+  printf 'OMP_WAIT_POLICY=%s GOMP_SPINCOUNT=%s OMP_DYNAMIC=%s OMP_THREAD_LIMIT=%s\n' \
+    "$OMP_WAIT_POLICY" "$GOMP_SPINCOUNT" "$OMP_DYNAMIC" "${OMP_THREAD_LIMIT:-unset}"
   sha256sum "$build/nvfp4_cpu_baseline" "$build/nvfp4_cpu_optimized"
   if [[ -n $fixture ]]; then sha256sum "$fixture"; fi
   ldd "$build/nvfp4_cpu_baseline"

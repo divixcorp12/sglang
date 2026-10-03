@@ -3,14 +3,15 @@
 Follows `kernels/jit/csrc/moe/expert_stream/bench/run.sh`: two separate
 executables with fixed worker teams, alternating backend order each round,
 Google Benchmark manual wall timing, fresh JSON/log files and environment
-records. No Python, PyTorch, CUDA or OpenMP is required.
+records. No Python, PyTorch or CUDA is required; the kernel needs OpenMP, and `run.sh` sets its wait policy
+(`OMP_WAIT_POLICY=ACTIVE`, `GOMP_SPINCOUNT=INFINITE`, `OMP_DYNAMIC=FALSE`) unless the caller already did.
 
 `nvfp4_cpu_baseline` converts each GPU-layout row into worker-local GGML
 scratch and calls the unchanged pinned `ggml_vec_dot_nvfp4_q8_0` kernel.
 `nvfp4_cpu_optimized` adapts that kernel to read the packed GPU weight bytes
 and 128x4-swizzled scales directly. Both compile with `-march=native` and
 use identical Q8_0 activation quantization, FP32 projections, SiLU, routing,
-thread pool and `CpuExpertForward` ABI. Baseline row conversion is timed;
+OpenMP team and `CpuExpertForward` ABI. Baseline row conversion is timed;
 scratch allocation is performed during warmup. Neither retains a repacked
 weight cache. See [source provenance](../upstream/README.md).
 
