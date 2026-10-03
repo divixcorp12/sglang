@@ -122,6 +122,17 @@ def test_cores_cannot_change_after_the_first_forward(library):
     assert _run(library, "2", cores=_allowed(2)) == ["cores 0", "forward 2 0 written", "cores-after 2"]
 
 
+def test_a_worker_that_cannot_be_pinned_fails_the_forward_and_leaves_out_untouched(library, tmp_path):
+    # set_cores checked the cores against the affinity mask; pinning can still fail later (a cgroup change). A preloaded
+    # pthread_setaffinity_np that always fails stands in for that.
+    shim = tmp_path / "unpinnable.c"
+    shim.write_text("int pthread_setaffinity_np(unsigned long t, unsigned long n, const void* s) { return 22; }\n")
+    so = tmp_path / "libunpinnable.so"
+    subprocess.run([CXX, "-x", "c", "-shared", "-fPIC", str(shim), "-o", str(so)], check=True)
+    lines = _run(library, "2", cores=_allowed(2), LD_PRELOAD=str(so))
+    assert lines[:2] == ["cores 0", "forward 2 1 untouched"]
+
+
 def test_an_intermediate_q8_cannot_represent_returns_2_and_leaves_out_untouched(library):
     # gate = up = 80 * 1e30, so SiLU(gate) * up overflows to inf before the down projection's quantization.
     assert _run(library, "2", alpha=1e30) == ["forward 2 2 untouched"]
