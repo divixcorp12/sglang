@@ -3,7 +3,7 @@
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the
 // dot product's tier, fixed when the library is compiled (kBuildIsa). The primary PlanTraits is the generic plan's;
-// PlanTraits<Dsv41Shape, Isa::Avx2> is DeepSeek V4.1's on an AVX2 build.
+// PlanTraits<MimoV26ProShape, Isa::Avx2> is MiMo V2.6 Pro's on an AVX2 build.
 
 // The forward's phases, in team order; a barrier separates each from the next.
 enum class Phase : int
@@ -21,11 +21,11 @@ struct PlanTraits
     static constexpr int kRowUnit = 16;  // output rows per split unit: 16 fp32 outputs fill one cache line
 };
 
-// DeepSeek V4.1 on AVX2: the shape's constants make every loop bound, sf_index group count and row stride a
-// compile-time value. kRowUnit 16 splits 2304 gate/up rows into 144 units and 5120 down rows into 320, both even over
-// 16 workers (Task 6 measures 32 and 48).
+// MiMo V2.6 Pro on AVX2: the shape's constants make every loop bound, sf_index group count and row stride a
+// compile-time value, and the SwiGLU clamp compiles away. kRowUnit 16 splits 2048 gate/up rows into 128 units and
+// 6144 down rows into 384, both even over 16 workers.
 template <>
-struct PlanTraits<Dsv41Shape, Isa::Avx2>
+struct PlanTraits<MimoV26ProShape, Isa::Avx2>
 {
     static constexpr int kRowUnit = 16;
 };

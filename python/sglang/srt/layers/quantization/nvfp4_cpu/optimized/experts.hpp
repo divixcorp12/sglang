@@ -57,7 +57,7 @@ inline void w13_rows(int layout, int n, int i, int& gate, int& up)
 
 // The descriptor registration: slot s of every slab at base + s * stride, nothing stored per slot. Strides are the
 // registrant's (at least SlabRowBytes) under any Shape. Shape names the plan this view is checked for: run_plan makes
-// a StridedExperts<Dsv41Shape> only after Dsv41Shape::accepts, and ForwardPlan<Shape, I> takes only its own Shape's
+// a StridedExperts<MimoV26ProShape> only after MimoV26ProShape::accepts, and ForwardPlan<Shape, I> takes only its own Shape's
 // view. The kernel keeps no reference to the slabs: the registrant keeps them alive.
 template <class Shape>
 struct StridedExperts

@@ -236,14 +236,14 @@ struct ForwardArena
 
 #include "forward_plan.hpp"
 
-// Runs the call's plan: the DSV4.1 plan when the layer is DeepSeek V4.1's routed expert on an AVX2 build, else the
-// generic plan for this build's tier. Both read the same slabs; the DSV4.1 plan through the view checked for it.
+// Runs the call's plan: the MiMo V2.6 Pro plan when the layer is that model's routed expert on an AVX2 build, else the
+// generic plan for this build's tier. Both read the same slabs; the MiMo plan through the view checked for it.
 int run_plan(ForwardCtx& ctx, const RegisteredLayer& layer, int threads)
 {
     if constexpr (kBuildIsa == Isa::Avx2) {
-        if (Dsv41Shape::accepts(ctx.info))
-            return ForwardPlan<Dsv41Shape, Isa::Avx2>::run(ctx, layer.strided.as<Dsv41Shape>(), ForwardArena::get(),
-                                                           threads);
+        if (MimoV26ProShape::accepts(ctx.info))
+            return ForwardPlan<MimoV26ProShape, Isa::Avx2>::run(ctx, layer.strided.as<MimoV26ProShape>(),
+                                                                ForwardArena::get(), threads);
     }
     return ForwardPlan<GenericShape, kBuildIsa>::run(ctx, layer.strided, ForwardArena::get(), threads);
 }
