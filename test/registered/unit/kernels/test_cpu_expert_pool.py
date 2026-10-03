@@ -408,16 +408,16 @@ def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit()
         _service(FakeHost(), trait).register(0, 7.0)
 
 
-def test_service_keeps_the_cpu_warm_only_when_given_a_window():
+def test_service_keeps_the_cpu_warm_for_2_ms_by_default_and_not_at_0():
     from sglang.srt.environ import envs
 
     host = FakeHost()
     _service(host, FakeServiceTrait())
-    assert host.keep_warm == (0, 0)
-    with envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.override(3000):
+    assert host.keep_warm == (0xBEEF, 2000)
+    with envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.override(0):
         host = FakeHost()
         _service(host, FakeServiceTrait())
-    assert host.keep_warm == (0xBEEF, 3000)
+    assert host.keep_warm == (0, 0)
 
 
 def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
