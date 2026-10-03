@@ -21,19 +21,14 @@ From the checkout root, on the Linux machine where timing will run:
 ```sh
 src=python/sglang/srt/layers/quantization/nvfp4_cpu
 build=/absolute/path/nvfp4-cpu-build
-cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release \
-  -DNVFP4_CPU_NATIVE=ON -DNVFP4_BUILD_BENCHMARK=ON
+cmake -S "$src/bench" -B "$build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$build" -j4
-ctest --test-dir "$build" --output-on-failure
 ```
 
-This builds the shared plugin, a native correctness harness and both benchmark
-executables in BUILD_DIR. Google Benchmark v1.9.4 uses the same pinned commit
-as the EXL3 benchmark; it is fetched if not installed. For offline builds,
-install its CMake package and set `NVFP4_FETCH_BENCHMARK=OFF`, or point
-`FETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK` to a local checkout of that version.
-The `bench` directory can also be configured directly to build only the two
-benchmark executables.
+This builds both benchmark executables in BUILD_DIR. Google Benchmark v1.9.4 uses the same pinned commit as the EXL3
+benchmark; it is fetched if not installed. For offline builds, install its CMake package and set
+`NVFP4_FETCH_BENCHMARK=OFF`, or point `FETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK` to a local checkout of that version.
+The library itself and the correctness harnesses build from Python (`../optimized/README.md`).
 
 ## Run and worker sweep
 

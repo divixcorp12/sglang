@@ -5,21 +5,21 @@ Implements the `CpuExpertForward` callback from
 `exl3_cpu/optimized`. The plugin and build are native C/C++ only. The engine's job ring,
 leases, pinned activation/output rows and completion signaling are reused.
 
-Build from the checkout root:
+Build from the checkout root, on the Linux machine that will run it (GCC with OpenMP):
 
 ```sh
-src=python/sglang/srt/layers/quantization/nvfp4_cpu
-cmake -S "$src" -B /absolute/path/build -DCMAKE_BUILD_TYPE=Release \
-  -DNVFP4_CPU_NATIVE=ON
-cmake --build /absolute/path/build -j4
-ctest --test-dir /absolute/path/build --output-on-failure
+python python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py \
+  --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ --output /absolute/path/libsglang_nvfp4_cpu.so
 ```
 
-C11/C++17 and pthreads suffice. The pinned GGML CPU subset is vendored under
-`../upstream`; no Python, PyTorch, CUDA, OpenMP or specific
-GCC release is required. The shared library is `libsglang_nvfp4_cpu.so` on
-Linux. Omit `NVFP4_CPU_NATIVE=ON` for the portable scalar path. Native builds
-select AVX2 on supported x86 CPUs; rebuild before moving to a different ISA.
+`--portable` omits `-march=native` (the scalar dot product); `--upstream-baseline` builds the bench's GGML-conversion
+baseline; `--main HARNESS.cpp` links a native harness into an executable instead. Inside SGLang,
+`sglang.srt.layers.quantization.nvfp4_cpu_ext.nvfp4_cpu_library()` builds the library on first use with `$CXX`
+and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags, compiler and host CPU. A native build
+targets the build machine's ISA. The arithmetic needs `-ffp-contract=off` and must never be built with `-Ofast`.
+
+The native harnesses (`test/registered/unit/kernels/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under
+`test/registered/unit/kernels/test_nvfp4_cpu_build.py`.
 
 See [the benchmark guide](../bench/README.md) for native baseline/optimized
 executables, fixed-team process rounds, fixture format and timing protocol.
