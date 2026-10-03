@@ -1092,7 +1092,11 @@ assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
 
 def seqlock_stress(
-    seconds: float, *, layout: str = "exl3", variant: Optional[str] = None
+    seconds: float,
+    *,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+    lanes: int = 8,
 ) -> tuple[int, int]:
     """Test only: read one record while a C++ thread rewrites it for ``seconds``.
 
@@ -1100,14 +1104,16 @@ def seqlock_stress(
     """
     _refuse_test_only("seqlock_stress", variant)
     out = torch.zeros(2, dtype=torch.int64)
-    _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
+    _host_module(layout, variant, lanes).expert_stream_seqlock_stress(
+        int(seconds * 1e9), out
+    )
     return int(out[0]), int(out[1])
 
 
-_RECORD_LANES = 8  # Wire::kLanes at the default build
-# Words of the C++ read_record result: 6 scalars, the protect ids, the lane count and
-# 5 words per lane.
-READ_RECORD_WORDS = 6 + _RECORD_LANES + 1 + 5 * _RECORD_LANES
+def read_record_words(lanes: int = 8) -> int:
+    """Words of the C++ read_record result: 6 scalars, the protect ids, the lane count and 5 words per lane."""
+    n = expert_lease_block.wire_layout(lanes).lanes
+    return 6 + n + 1 + 5 * n
 
 
 def read_record_fields(
@@ -1116,19 +1122,21 @@ def read_record_fields(
     *,
     layout: str = "exl3",
     variant: Optional[str] = None,
+    lanes: int = 8,
 ) -> dict:
-    """Test only: the service's ``read_record`` over one ``RECORD_BYTES`` record.
+    """Test only: the service's ``read_record`` over one record of ``lanes`` lanes.
 
     ``expected`` is the sequence number the record must carry. Instrumented build only.
     """
     _refuse_test_only("read_record_fields", variant)
-    out = torch.zeros(READ_RECORD_WORDS, dtype=torch.int64)
-    _host_module(layout, variant).expert_stream_read_record_fields(
+    out = torch.zeros(read_record_words(lanes), dtype=torch.int64)
+    _host_module(layout, variant, lanes).expert_stream_read_record_fields(
         record, int(expected), out
     )
     w = out.tolist()
-    protect, lanes = w[5], w[6 + _RECORD_LANES]
-    base = 7 + _RECORD_LANES
+    n = expert_lease_block.wire_layout(lanes).lanes
+    protect, lane_count = w[5], w[6 + n]
+    base = 7 + n
     return {
         "status": ("ok", "torn", "malformed")[w[0]],
         "row": w[1],
@@ -1146,7 +1154,7 @@ def read_record_fields(
                     0
                 ],
             }
-            for j in range(lanes)
+            for j in range(lane_count)
         ],
     }
 

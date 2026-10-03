@@ -489,13 +489,12 @@ class RamTier {
     return true;
   }
 
-  // Starts the loads of every line the request's read will touch: the record's two lines and its hot record's. The
+  // Starts the loads of every line the request's read will touch: the record's lines and its hot record's. The
   // device has just written each, so each is an L3 miss; issued together they overlap instead of queueing behind
   // read_record's branches. Called once the head shows the post, since a line prefetched earlier would be refetched.
   void prefetch_request(const uint8_t* record, uint32_t seq) const {
-    static_assert(Wire::kRecordBytes == 128, "a record is two lines");
-    _mm_prefetch(reinterpret_cast<const char*>(record), _MM_HINT_T0);
-    _mm_prefetch(reinterpret_cast<const char*>(record + 64), _MM_HINT_T0);
+    for (int64_t line = 0; line < Wire::kRecordBytes; line += 64)
+      _mm_prefetch(reinterpret_cast<const char*>(record + line), _MM_HINT_T0);
     if (hot_page_ == nullptr) return;
     const uint8_t* hot = hot_page_ + static_cast<int64_t>((seq - 1u) % Wire::kHotRecords) * hot_stride_;
     for (int64_t line = 0; line < hot_stride_; line += 64)

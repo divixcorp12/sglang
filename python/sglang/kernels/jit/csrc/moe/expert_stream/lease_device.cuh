@@ -192,12 +192,14 @@ SGL_DEVICE uint32_t pack_ids(int64_t lo, int64_t hi) {
 // A record of SM hits only may lap the ring before the service reads it, so a half-rewritten record must never pass
 // the reader's seq re-check (read_record). Traps when the lane or protect count exceeds Wire::kLanes.
 SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& f) {
-  if (f.count > Wire::kLanes || f.protect_count > Wire::kLanes) __trap();
-  uint32_t protect_w[Wire::kLanes / 2], expert_w[Wire::kLanes / 2], slot_w[Wire::kLanes / 2], dst_w[Wire::kLanes / 2];
-  uint32_t weight_w[Wire::kLanes];
-  uint32_t kinds = 0;
+  constexpr int L = Wire::kLanes;
+  constexpr int kHeaderWords = static_cast<int>((Wire::kRecHeaderBytes - Wire::kRecEpoch) / 4);
+  static_assert(kHeaderWords % 4 == 0 && L % 8 == 0, "the header and lane arrays are whole 16-byte stores");
+  if (f.count > L || f.protect_count > L) __trap();
+  uint32_t protect_w[L / 2], expert_w[L / 2], slot_w[L / 2], dst_w[L / 2], weight_w[L];
+  uint32_t header_w[kHeaderWords] = {};
 #pragma unroll
-  for (int i = 0; i < Wire::kLanes; i += 2) {
+  for (int i = 0; i < L; i += 2) {
     const bool a = i < f.count, b = i + 1 < f.count;
     protect_w[i / 2] =
         pack_ids(i < f.protect_count ? f.protect[i] : -1, i + 1 < f.protect_count ? f.protect[i + 1] : -1);
@@ -205,26 +207,39 @@ SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& 
     slot_w[i / 2] = pack_ids(a ? f.lanes->slot[i] : -1, b ? f.lanes->slot[i + 1] : -1);
     dst_w[i / 2] = pack_ids(a ? f.dst[i] : -1, b ? f.dst[i + 1] : -1);
   }
+  header_w[0] = f.epoch;
 #pragma unroll
-  for (int i = 0; i < Wire::kLanes; ++i) {
+  for (int i = 0; i < L; ++i) {
     const bool used = i < f.count;
     weight_w[i] = __float_as_uint(used ? f.weight[i] : 0.0f);
-    kinds |= (used ? static_cast<uint32_t>(f.lanes->kind[i]) : 0u) << (4 * i);
+    header_w[1 + i / 8] |= (used ? static_cast<uint32_t>(f.lanes->kind[i]) : 0u) << (4 * (i % 8));
   }
-  const uint32_t counts = static_cast<uint32_t>(f.count) | static_cast<uint32_t>(f.protect_count) << 4;
+  uint32_t counts = static_cast<uint32_t>(f.count);
+  if constexpr (Wire::kPackedCounts) {
+    counts |= static_cast<uint32_t>(f.protect_count) << 4;
+  } else {
+    constexpr int b = static_cast<int>(Wire::kRecProtectCount - Wire::kRecEpoch);
+    header_w[b / 4] |= static_cast<uint32_t>(f.protect_count) << (8 * (b % 4));
+  }
   const uint32_t head = (static_cast<uint32_t>(f.row) & 0xFFFFu) | counts << 16 | (f.flags & 0xFFu) << 24;
   st_relaxed_sys<uint32_t>(record + Wire::kRecSeq, 0u);
   cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
   st_relaxed_sys<uint32_t>(record + Wire::kRecRow, head);
   st_relaxed_sys_v2(
       record + Wire::kRecChain, static_cast<uint32_t>(f.chain & 0xFFFFFFFFull), static_cast<uint32_t>(f.chain >> 32));
-  st_relaxed_sys_v4(record + Wire::kRecEpoch, f.epoch, kinds, 0u, 0u);
-  st_relaxed_sys_v4(record + Wire::kRecProtect, protect_w[0], protect_w[1], protect_w[2], protect_w[3]);
-  st_relaxed_sys_v4(record + Wire::kRecLaneExpert, expert_w[0], expert_w[1], expert_w[2], expert_w[3]);
-  st_relaxed_sys_v4(record + Wire::kRecLaneSlot, slot_w[0], slot_w[1], slot_w[2], slot_w[3]);
-  st_relaxed_sys_v4(record + Wire::kRecLaneDst, dst_w[0], dst_w[1], dst_w[2], dst_w[3]);
-  st_relaxed_sys_v4(record + Wire::kRecLaneWeight, weight_w[0], weight_w[1], weight_w[2], weight_w[3]);
-  st_relaxed_sys_v4(record + Wire::kRecLaneWeight + 16, weight_w[4], weight_w[5], weight_w[6], weight_w[7]);
+#pragma unroll
+  for (int w = 0; w < kHeaderWords; w += 4)
+    st_relaxed_sys_v4(record + Wire::kRecEpoch + 4 * w, header_w[w], header_w[w + 1], header_w[w + 2], header_w[w + 3]);
+#pragma unroll
+  for (int w = 0; w < L / 2; w += 4) {
+    st_relaxed_sys_v4(record + Wire::kRecProtect + 4 * w, protect_w[w], protect_w[w + 1], protect_w[w + 2], protect_w[w + 3]);
+    st_relaxed_sys_v4(record + Wire::kRecLaneExpert + 4 * w, expert_w[w], expert_w[w + 1], expert_w[w + 2], expert_w[w + 3]);
+    st_relaxed_sys_v4(record + Wire::kRecLaneSlot + 4 * w, slot_w[w], slot_w[w + 1], slot_w[w + 2], slot_w[w + 3]);
+    st_relaxed_sys_v4(record + Wire::kRecLaneDst + 4 * w, dst_w[w], dst_w[w + 1], dst_w[w + 2], dst_w[w + 3]);
+  }
+#pragma unroll
+  for (int w = 0; w < L; w += 4)
+    st_relaxed_sys_v4(record + Wire::kRecLaneWeight + 4 * w, weight_w[w], weight_w[w + 1], weight_w[w + 2], weight_w[w + 3]);
   st_release_sys(record + Wire::kRecSeq, seq);
 }
 
@@ -261,27 +276,33 @@ SGL_DEVICE bool await_map_delta(const uint8_t* delta, const RowMap& map, uint64_
 
 // Loads the delta's payload. Call only after await_map_delta's acquire of the tag.
 SGL_DEVICE MapDelta load_map_delta(const uint8_t* delta) {
+  constexpr int kStagingLoads = Wire::kLanes / 8;  // node 0's list; Phase 2 reads every node's
+  constexpr int kEntryLoads = static_cast<int>(Wire::kDeltaMaxEntries / 4);
+  static_assert(Wire::kDeltaStaging % 16 == 0 && Wire::kDeltaEntries % 16 == 0, "16-byte delta loads");
   MapDelta d;
   d.count = ld_relaxed_sys<uint32_t>(delta + Wire::kDeltaCount);
-  static_assert(Wire::kDeltaStaging % 16 == 0 && Wire::kDeltaEntries % 16 == 0, "16-byte delta loads");
-  static_assert(Wire::kLanes == 8 && Wire::kDeltaMaxEntries % 4 == 0, "staging is one load; entries four to a load");
-  constexpr int kEntryLoads = Wire::kDeltaMaxEntries / 4;
-  uint4 v[1 + kEntryLoads];
-  v[0] = ld_relaxed_sys_v4(delta + Wire::kDeltaStaging);
+  uint4 v[kStagingLoads + kEntryLoads];
+#pragma unroll
+  for (int i = 0; i < kStagingLoads; ++i)
+    v[i] = ld_relaxed_sys_v4(delta + Wire::kDeltaStaging + 16 * i);
 #pragma unroll
   for (int i = 0; i < kEntryLoads; ++i)
-    v[1 + i] = ld_relaxed_sys_v4(delta + Wire::kDeltaEntries + 16 * i);
+    v[kStagingLoads + i] = ld_relaxed_sys_v4(delta + Wire::kDeltaEntries + 16 * i);
   const auto lo = [](uint32_t w) { return static_cast<int32_t>(static_cast<int16_t>(w & 0xFFFFu)); };
   const auto hi = [](uint32_t w) { return static_cast<int32_t>(static_cast<int16_t>(w >> 16)); };
-  const uint32_t staging_words[4] = {v[0].x, v[0].y, v[0].z, v[0].w};
 #pragma unroll
-  for (int k = 0; k < 4; ++k) {
-    d.staging[2 * k] = lo(staging_words[k]);
-    d.staging[2 * k + 1] = hi(staging_words[k]);
+  for (int i = 0; i < kStagingLoads; ++i) {
+    const uint32_t words[4] = {v[i].x, v[i].y, v[i].z, v[i].w};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      d.staging[8 * i + 2 * k] = lo(words[k]);
+      d.staging[8 * i + 2 * k + 1] = hi(words[k]);
+    }
   }
 #pragma unroll
   for (int i = 0; i < kEntryLoads; ++i) {
-    const uint32_t words[4] = {v[1 + i].x, v[1 + i].y, v[1 + i].z, v[1 + i].w};
+    const uint4 e = v[kStagingLoads + i];
+    const uint32_t words[4] = {e.x, e.y, e.z, e.w};
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
       d.expert[4 * i + w] = lo(words[w]);
@@ -329,18 +350,20 @@ struct LanePolicy {
   int32_t split[Wire::kLanes + 1];  // Wire::kSplit: CPU lanes per n eligible lanes
 };
 
-// Loads Wire::kSplit's table in three 16-byte loads. The last three words loaded lie past the table and are dropped.
+// Loads Wire::kSplit's table in whole 16-byte loads; words past the table are dropped.
 SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kLanes + 1]) {
-  static_assert(Wire::kSplit % 16 == 0 && Wire::kSplit + 48 <= Wire::kLeaseBlockBytes && Wire::kLanes + 1 <= 12, "three loads");
-  uint4 v[3];
+  constexpr int kLoads = static_cast<int>(Wire::kSplitStride / 16);
+  static_assert(Wire::kSplit % 16 == 0 && Wire::kSplit + Wire::kSplitStride <= Wire::kLeaseBlockBytes, "split loads");
+  uint4 v[kLoads];
 #pragma unroll
-  for (int i = 0; i < 3; ++i)
+  for (int i = 0; i < kLoads; ++i)
     v[i] = ld_relaxed_sys_v4(split + 16 * i);
-  const uint32_t words[12] = {
-      v[0].x, v[0].y, v[0].z, v[0].w, v[1].x, v[1].y, v[1].z, v[1].w, v[2].x, v[2].y, v[2].z, v[2].w};
 #pragma unroll
-  for (int n = 0; n <= Wire::kLanes; ++n)
-    out[n] = static_cast<int32_t>(words[n]);
+  for (int n = 0; n <= Wire::kLanes; ++n) {
+    const uint4 q = v[n / 4];
+    const uint32_t words[4] = {q.x, q.y, q.z, q.w};
+    out[n] = static_cast<int32_t>(words[n % 4]);
+  }
 }
 
 // Types each lane of the plan: its kind and source slot. Transcribes ram_slot_map.type_lanes, the host reference.
