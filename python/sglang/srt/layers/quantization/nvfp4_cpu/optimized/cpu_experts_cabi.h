@@ -37,7 +37,7 @@ int sglang_nvfp4_cpu_experts_free_layer(int64_t handle) NVFP4_NOEXCEPT;
 int sglang_nvfp4_cpu_experts_forward(int64_t layer, const void* x,
     const int32_t* slots, const float* weights, int32_t k, float* out,
     int32_t threads, int32_t accumulate) NVFP4_NOEXCEPT;
-// Configure once before first forward. Worker 0 is the calling engine thread.
+// Configure before the first forward (refused with 2 after it). Worker i runs on cores[i]; worker 0 is the calling engine thread.
 int sglang_nvfp4_cpu_experts_set_cores(const int32_t* cores, int32_t n) NVFP4_NOEXCEPT;
 #ifdef __cplusplus
 }
