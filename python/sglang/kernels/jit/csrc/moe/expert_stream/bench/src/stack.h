@@ -92,6 +92,8 @@ struct StackConfig {
   RowSet rows;
   int64_t staging = 3;
   es::CpuExpertForward forward = nullptr;
+  es::CpuExpertKeepWarm keep_warm = nullptr;  // with keep_warm_ns > 0: run while idle after each job
+  int64_t keep_warm_ns = 0;
   int threads = 1;
   std::vector<int> cores;  // worker 0 first: the CPU expert thread pins itself there
   uint8_t* x_base = nullptr;
@@ -159,6 +161,8 @@ class Stack {
     cpu.threads = config_.threads;
     cpu.cores = config_.cores;
     cpu.spin_ns = kCpuSpinNs;
+    cpu.keep_warm = config_.keep_warm;
+    cpu.keep_warm_ns = config_.keep_warm_ns;
     tier_->enable_cpu_experts(std::move(cpu), std::vector<int64_t>(config_.split.begin(), config_.split.end()));
     if constexpr (Build::kMetrics) {
       if (config_.trace_capacity > 0) tier_->enable_trace(config_.trace_capacity);
