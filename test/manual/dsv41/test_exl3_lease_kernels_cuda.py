@@ -265,8 +265,15 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
     RAM hits at their map slot, odd lanes misses at the delta's staging slots, and the count is exactly ``count``."""
     w = lease.wire_layout(lanes)
     experts, row_capacity = 2 * lanes, 64
-    page = torch.zeros(w.page_bytes, dtype=torch.uint8).pin_memory()
-    block = torch.zeros(w.lease_block_bytes + w.delta_stride, dtype=torch.uint8).pin_memory()
+
+    def pinned(size, align):
+        # Neither torch.zeros nor the pinned allocator promises the alignment (new_lease_block).
+        raw = torch.zeros(size + align, dtype=torch.uint8, pin_memory=True)
+        start = (-raw.data_ptr()) % align
+        return raw[start : start + size]
+
+    page = pinned(w.page_bytes, 128)
+    block = pinned(w.lease_block_bytes + w.delta_stride, w.block_align)
     delta = w.lease_block_bytes
     block[delta : delta + 8].view(torch.int64)[0] = 1  # the attach delta's tag: map_chain starts at 1
     staging_ids = torch.arange(40, 40 + w.lanes, dtype=torch.int16)
