@@ -13,6 +13,17 @@
 
 The EXL3 reference implementation for every shape here: `python/sglang/srt/layers/quantization/exl3_cpu/optimized/{experts.hpp,shapes.hpp,forward_plan.hpp,moe_mul1.cpp,build.py}` and its plan `docs/superpowers/plans/2026-10-02-exl3-cpu-forward-plan.md`.
 
+## Amendments during execution (2026-10-03)
+
+- **The specialized shape is MiMo V2.6 Pro's, not DeepSeek V4.1's** (user: there is no DSV4.1 NVFP4 checkpoint; the
+  first model is `/mnt/nvme4/mimi-v26-pro`). Wherever this plan says `Dsv41Shape` / "the DSV4.1 plan", read
+  `MimoV26ProShape` (hidden 6144, intermediate 2048, SiLU with no clamp: `act_limit` 0) and
+  `ForwardPlan<MimoV26ProShape, Isa::Avx2>`. The A/B harness's large configs are `mimo_v26_pro`,
+  `mimo_v26_pro_l2_up_scaled` (the specialized plan), `mimo_v26_pro_limit10`, `h5120_n2304_lim10`,
+  `h5120_n2304_l2_up_scaled` (the generic plan): 9 configs, 288 cases. Task 6 benches `--hidden=6144 --intermediate=2048`.
+- **"Portable" pins `-march=x86-64 -mtune=generic`.** divix01's GCC defaults to x86-64-v3 (AVX2), so omitting
+  `-march=native` did not select the scalar dot product. The A/B baseline is `/mnt/nvme1/nvfp4-plan/base3`.
+
 ## Global Constraints
 
 - **Bit-exact or it does not ship.** From Task 3 on, every task's gate includes `run_nvfp4_cpu_forward_checks.sh WT OUT BASE_OUT` (Task 2) printing `PASS native bit-exact`, `PASS baseline bit-exact`, `PASS portable bit-exact` and exiting 0. A refactor task whose behavior must not change has no RED step of its own: the A/B baseline captured in Task 2 is its test.
