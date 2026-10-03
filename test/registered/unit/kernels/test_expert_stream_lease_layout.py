@@ -1,10 +1,13 @@
 """LeaseLayout<NumLanes, NumNodes> (lease_layout.h) and its Python mirror wire_layout agree, and (8, 1) is wire v2."""
 
+import re
+
 import pytest
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as transport
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.expert_stream_sources import device_sources, host_sources, wire_header
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -104,3 +107,14 @@ def test_the_transport_and_lease_modules_carry_the_trait_values():
         ("kDeltaMaxEntries", lease.DELTA_MAX_ENTRIES),
     ]
     assert [(name, wire[name]) for name, _ in python] == [(name, int(value)) for name, value in python]
+
+
+FREE_NAME = re.compile(r"(?<![\w:])k(MaxIds|LeaseLanes|LeaseRing|RecordBytes|PageBytes|RecLane\w+|Delta\w+|Split)\b")
+
+
+def test_no_source_uses_a_free_wire_name():
+    """Every wire offset is spelled Wire::k..., so a build's lane count reaches every use."""
+    for path in (*host_sources(), *device_sources()):
+        text = re.sub(r"//[^\n]*", "", path.read_text())
+        assert not FREE_NAME.search(text), f"{path.name} still uses a free wire name"
+    assert "inline constexpr auto" not in wire_header().read_text()
