@@ -229,6 +229,32 @@ MBIND_PERMITTED = _mbind_permitted()
 MPOL_DEFAULT, MPOL_BIND = 0, 2
 
 
+def _vm_flags(address: int) -> set[str]:
+    """The kernel's VmFlags for the mapping holding ``address`` (/proc/self/smaps)."""
+    inside = False
+    with open("/proc/self/smaps") as smaps:
+        for line in smaps:
+            head = line.split()[0]
+            if "-" in head and not head.endswith(":"):
+                lo, hi = (int(part, 16) for part in head.split("-"))
+                inside = lo <= address < hi
+            elif inside and head == "VmFlags:":
+                return set(line.split()[1:])
+    raise AssertionError(f"no mapping holds {address:#x}")
+
+
+@unittest.skipUnless(os.path.exists("/proc/self/smaps"), "needs Linux /proc/self/smaps")
+class TestHugePages(unittest.TestCase):
+    def test_the_slab_mapping_asks_for_transparent_huge_pages(self):
+        """With THP in madvise mode, or defrag=madvise, only a madvised mapping is promised 2 MiB pages: the CPU
+        expert kernel's traversal touches a new 4 KiB page on nearly every weight load, which costs 1-3% on 4 KiB
+        pages (bench A/B on divix01, 2026-10-02)."""
+        with patch.object(host_numa, "_mbind"):
+            slab = allocate_bound(5 * MIB + 7, [(0, 0, 1)], 5 * MIB + 7)
+        self.assertIn("hg", _vm_flags(slab.data_ptr()))
+        self.assertIn("hg", _vm_flags(slab.data_ptr() + slab.numel() - 1))
+
+
 @unittest.skipUnless(MBIND_PERMITTED, "mbind is not permitted here (seccomp without CAP_SYS_NICE)")
 class TestBinding(unittest.TestCase):
     def test_every_page_of_a_run_is_bound_and_plain_memory_is_not(self):
