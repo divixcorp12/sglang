@@ -131,7 +131,7 @@ RAW_EXPORTS = {
     "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "pause_ns": lambda m, h: m.expert_stream_pause_ns(),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
-        torch.zeros(ops.RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.READ_RECORD_WORDS, dtype=torch.int64)
+        torch.zeros(ops.RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),
 }
 

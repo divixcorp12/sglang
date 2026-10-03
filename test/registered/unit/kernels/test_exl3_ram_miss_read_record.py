@@ -8,6 +8,7 @@ import struct
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import (
     DEMAND_RECORDS,
@@ -27,41 +28,50 @@ LANES = 8
 KINDS = [int(k) for k in (LaneKind.HIT_COPY, LaneKind.HIT_SM, LaneKind.HIT_CPU, LaneKind.MISS_GPU, LaneKind.MISS_CPU)]
 
 
-def _put(record: torch.Tensor, field: str, fmt: str, *values) -> None:
-    data = struct.pack("<" + fmt, *values)
-    at = RECORD_FIELDS[field]
-    record[at : at + len(data)] = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+def encode(lanes, *, seq, row=3, chain=0, epoch=0, flags=0, protect=(), kinds=(), experts=(), slots=(), dsts=(),
+           weights=(), kind_words=None, counts=None):
+    """A record as the post writes it, for LeaseLayout<lanes>. ``kind_words`` and ``counts`` override the packed words
+    (a record the device never writes)."""
+    w = lease.wire_layout(lanes)
+    f, n = w.record_fields, w.lanes
+    raw = bytearray(w.record_bytes)
+    count = len(kinds)
+    struct.pack_into("<IH", raw, f["seq"], seq, row)
+    if counts is not None:
+        raw[f["counts"]] = counts
+    elif w.packed_counts:
+        raw[f["counts"]] = count | len(protect) << 4
+    else:
+        raw[f["counts"]] = count
+        raw[w.protect_count] = len(protect)
+    raw[f["flags"]] = flags
+    struct.pack_into("<QI", raw, f["chain"], chain, epoch)
+    if kind_words is None:
+        kind_words = [0] * w.kind_words
+        for j, kind in enumerate(kinds):
+            kind_words[j // 8] |= kind << (4 * (j % 8))
+    struct.pack_into(f"<{w.kind_words}I", raw, f["kinds"], *kind_words)
+    pad = lambda xs: list(xs) + [-1] * (n - len(xs))
+    struct.pack_into(f"<{n}h", raw, f["protect"], *pad(protect))
+    struct.pack_into(f"<{n}h", raw, f["lane_expert"], *pad(experts))
+    struct.pack_into(f"<{n}h", raw, f["lane_slot"], *pad(slots))
+    struct.pack_into(f"<{n}h", raw, f["lane_dst"], *pad(dsts))
+    struct.pack_into(f"<{n}f", raw, f["lane_weight"], *(list(weights) + [0.0] * (n - len(weights))))
+    return torch.tensor(list(raw), dtype=torch.uint8)
 
 
 def write_record(*, seq, row=0, captured=False, chain=0, epoch=0, protect=(), lanes=(), kinds=None, counts=None):
-    """One record as the post kernel's write_record lays it out. lanes: (expert, slot, dst, weight, kind) tuples;
-    ``kinds`` and ``counts`` override the packed words (a record the device never writes)."""
-    record = torch.zeros(RECORD_BYTES, dtype=torch.uint8)
-    if kinds is None:
-        kinds = sum(lane[4] << (4 * j) for j, lane in enumerate(lanes))
-    if counts is None:
-        counts = len(lanes) | len(protect) << 4
-
-    def ids(values):
-        return list(values) + [-1] * (LANES - len(values))
-
-    _put(record, "seq", "I", seq)
-    _put(record, "row", "H", row)
-    _put(record, "counts", "B", counts)
-    _put(record, "flags", "B", RECORD_FLAG_CAPTURED if captured else 0)
-    _put(record, "chain", "Q", chain)
-    _put(record, "epoch", "I", epoch)
-    _put(record, "kinds", "I", kinds)
-    _put(record, "protect", "8h", *ids(protect))
-    _put(record, "lane_expert", "8h", *ids([lane[0] for lane in lanes]))
-    _put(record, "lane_slot", "8h", *ids([lane[1] for lane in lanes]))
-    _put(record, "lane_dst", "8h", *ids([lane[2] for lane in lanes]))
-    _put(record, "lane_weight", "8f", *([lane[3] for lane in lanes] + [0.0] * (LANES - len(lanes))))
-    return record
+    """An 8-lane record from (expert, slot, dst, weight, kind) tuples; ``kinds`` is the single kinds word."""
+    return encode(
+        8, seq=seq, row=row, chain=chain, epoch=epoch, flags=RECORD_FLAG_CAPTURED if captured else 0,
+        protect=protect, kinds=[lane[4] for lane in lanes], experts=[lane[0] for lane in lanes],
+        slots=[lane[1] for lane in lanes], dsts=[lane[2] for lane in lanes], weights=[lane[3] for lane in lanes],
+        kind_words=None if kinds is None else [kinds], counts=counts,
+    )
 
 
-def read(record, expected):
-    return ops.read_record_fields(record, expected, variant="instr")
+def read(record, expected, lanes=8):
+    return ops.read_record_fields(record, expected, variant="instr", lanes=lanes)
 
 
 @pytest.mark.parametrize("lane_count, protect_count", [(0, 0), (1, 8), (6, 6), (8, 0), (8, 8)])
@@ -115,6 +125,41 @@ def test_a_record_is_one_128_byte_prefetch_pair():
     assert RECORD_BYTES == 128 and DEMAND_RING % 128 == 0
     assert RECORD_FIELDS["lane_weight"] + 4 * LANES == RECORD_BYTES
     assert PAGE_BYTES == DEMAND_RING + DEMAND_RECORDS * RECORD_BYTES
+
+
+@pytest.mark.parametrize(
+    "lanes, count, protect", [(8, 8, 0), (8, 1, 8), (16, 16, 16), (16, 9, 3), (32, 32, 32), (32, 17, 0)]
+)
+def test_read_record_round_trips_every_lane(lanes, count, protect):
+    kinds = [KINDS[j % 5] for j in range(count)]
+    rec = encode(lanes, seq=7, protect=range(protect), kinds=kinds, experts=range(100, 100 + count),
+                 slots=range(count), dsts=range(50, 50 + count), weights=[0.5 + j for j in range(count)])
+    got = read(rec, 7, lanes)
+    assert got["status"] == "ok"
+    assert got["lanes"] == [
+        {"expert": 100 + j, "slot": j, "dst": 50 + j, "weight": 0.5 + j, "kind": kinds[j]} for j in range(count)
+    ]
+    assert got["protect"] == list(range(protect))
+
+
+@pytest.mark.parametrize("lanes", [16, 32])
+def test_a_count_past_the_lane_width_is_malformed(lanes):
+    rec = encode(lanes, seq=7, kinds=[1])
+    rec[lease.wire_layout(lanes).record_fields["counts"]] = lanes + 1
+    assert read(rec, 7, lanes)["status"] == "malformed"
+
+
+@pytest.mark.parametrize("lanes", [16, 32])
+def test_a_protect_count_past_the_lane_width_is_malformed(lanes):
+    rec = encode(lanes, seq=7, kinds=[1])
+    rec[lease.wire_layout(lanes).protect_count] = lanes + 1
+    assert read(rec, 7, lanes)["status"] == "malformed"
+
+
+@pytest.mark.parametrize("lanes", [8, 32])
+def test_no_torn_record_is_accepted(lanes):
+    accepted, torn = ops.seqlock_stress(2.0, variant="instr", lanes=lanes)
+    assert accepted > 0 and torn == 0
 
 
 if __name__ == "__main__":

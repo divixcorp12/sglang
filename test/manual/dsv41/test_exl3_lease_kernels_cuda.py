@@ -21,6 +21,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 from lease_chain_rig import CAPACITY, EXPERTS, LAYERS, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
+from sglang.kernels.ops.moe import expert_stream_transport as ops  # noqa: E402
 from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     DEMAND_RECORDS,
     DEMAND_RING,
@@ -48,6 +49,14 @@ def chain(request, tmp_path):
         yield c
     finally:
         c.close()
+
+
+def kinds_words(kinds, lanes):
+    """The record's kinds words: lane j's kind in word j // 8, bits 4 * (j % 8)."""
+    words = [0] * lease.wire_layout(lanes).kind_words
+    for j, kind in enumerate(kinds):
+        words[j // 8] |= int(kind) << (4 * (j % 8))
+    return words
 
 
 def _step(c, experts, row=0):
@@ -233,7 +242,7 @@ def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x
             return page[at : at + n * dtype.itemsize].view(dtype).tolist()
 
         assert int(page[record + RECORD_FIELDS["counts"]]) & 0xF == 2
-        assert field("kinds", torch.int32, 1)[0] == LaneKind.HIT_CPU | LaneKind.HIT_CPU << 4
+        assert field("kinds", torch.int32, 1) == kinds_words([LaneKind.HIT_CPU, LaneKind.HIT_CPU], lease.LANES)
         assert field("lane_weight", torch.float32, lease.LANES) == [0.25, 0.5 + 0.0625] + [0.0] * (lease.LANES - 2)
         assert field("lane_dst", torch.int16, 2) == [5, 3]
         assert field("lane_expert", torch.int16, lease.LANES) == [9, 5] + [-1] * (lease.LANES - 2)
@@ -248,6 +257,52 @@ def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x
     finally:
         # The posted request is never served: nothing waits on it, and the host stops with it unserved.
         c.close()
+
+
+@pytest.mark.parametrize("lanes, count", [(8, 8), (16, 16), (16, 9), (32, 32), (32, 17)])
+def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
+    """The post kernel built for ``lanes`` writes a record the service's reader decodes lane by lane: even lanes are
+    RAM hits at their map slot, odd lanes misses at the delta's staging slots, and the count is exactly ``count``."""
+    w = lease.wire_layout(lanes)
+    experts, row_capacity = 2 * lanes, 64
+    page = torch.zeros(w.page_bytes, dtype=torch.uint8).pin_memory()
+    block = torch.zeros(w.lease_block_bytes + w.delta_stride, dtype=torch.uint8).pin_memory()
+    delta = w.lease_block_bytes
+    block[delta : delta + 8].view(torch.int64)[0] = 1  # the attach delta's tag: map_chain starts at 1
+    staging_ids = torch.arange(40, 40 + w.lanes, dtype=torch.int16)
+    block[delta + w.delta_fields["staging"] :][: 2 * w.lanes].view(torch.int16)[:] = staging_ids
+    ram_slot = torch.full((1, experts), -1, dtype=torch.int32, device="cuda")
+    for j in range(0, count, 2):
+        ram_slot[0, j] = j // 2
+    planned = torch.arange(count, dtype=torch.int64, device="cuda")
+    dst = torch.arange(10, 10 + count, dtype=torch.int32, device="cuda")
+    state = torch.zeros(len(ops.STATE_WORDS), dtype=torch.int32, device="cuda")
+    out = {n: torch.zeros(w.lanes, dtype=torch.int32, device="cuda") for n in ("kind", "slot", "dst_1")}
+    host_rows_1 = torch.zeros(w.lanes, dtype=torch.int64, device="cuda")
+    zeros_u8 = torch.zeros(1, dtype=torch.uint8, device="cuda")
+    no_i64 = torch.empty(0, dtype=torch.int64, device="cuda")
+    no_i32 = torch.empty(0, dtype=torch.int32, device="cuda")
+    ops._device_module("exl3", lanes).expert_stream_post(
+        page, state, planned, torch.tensor([count], dtype=torch.int32, device="cuda"), planned.clone(), 0, experts,
+        int(block.data_ptr()), 5_000_000_000, 0, 0, no_i64, 0, dst, 0, ram_slot,
+        torch.full((1, w.lanes), -1, dtype=torch.int32, device="cuda"),
+        torch.ones(1, dtype=torch.int64, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda"),
+        zeros_u8, zeros_u8.clone(), torch.zeros(1, dtype=torch.int32, device="cuda"), row_capacity, 0, 0, 0,
+        out["kind"], out["slot"], torch.zeros(1, dtype=torch.int32, device="cuda"), host_rows_1, out["dst_1"],
+        no_i32, 0, no_i32, 0,
+    )
+    torch.cuda.synchronize()
+    record = page[w.demand_ring : w.demand_ring + w.record_bytes].clone()
+    got = ops.read_record_fields(record, 1, variant="instr", lanes=lanes)
+    kinds = [LaneKind.HIT_SM if j % 2 == 0 else LaneKind.MISS_GPU for j in range(count)]
+    assert got["status"] == "ok"
+    assert got["lanes"] == [
+        {"expert": j, "slot": j // 2 if j % 2 == 0 else 40 + j // 2, "dst": 10 + j, "weight": 0.0, "kind": int(kinds[j])}
+        for j in range(count)
+    ]
+    assert got["protect"] == list(range(count))
+    words = record[w.record_fields["kinds"] :][: 4 * w.kind_words].view(torch.int32).tolist()
+    assert [x & 0xFFFFFFFF for x in words] == kinds_words(kinds, lanes)
 
 
 if __name__ == "__main__":
