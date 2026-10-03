@@ -15,8 +15,7 @@ closes. Python writes only the attach-time split, and only through the service's
 export.
 
 The constants mirror ``csrc/moe/expert_stream/lease_layout.h`` (under
-``python/sglang/kernels/jit/``); ``test_exl3_lease_block`` and
-``test_exl3_ram_miss_device_args`` check that they agree.
+``python/sglang/kernels/jit/``); ``test_expert_stream_lease_layout`` checks that they agree.
 See ``analysis/dsv41-drive/LEASE_PROTOCOL.md``, "Wire (v2)".
 """
 
@@ -122,6 +121,8 @@ class WireLayout:
 
     def cpp_constants(self) -> dict[str, int]:
         """The trait's members by their C++ names, as lease_layout_probe prints them."""
+        from sglang.srt.layers.moe.ram_slot_map import LaneKind
+
         f, d = self.record_fields, self.delta_fields
         return {
             "kLanes": self.lanes, "kNodes": self.nodes, "kDemandHead": 0, "kDemandRing": self.demand_ring,
@@ -132,8 +133,9 @@ class WireLayout:
             "kRecHeaderBytes": self.header_bytes, "kRecProtect": f["protect"], "kRecLaneExpert": f["lane_expert"],
             "kRecLaneSlot": f["lane_slot"], "kRecLaneDst": f["lane_dst"], "kRecLaneWeight": f["lane_weight"],
             "kRecPayloadEnd": f["lane_weight"] + 4 * self.lanes, "kRecordBytes": self.record_bytes,
-            "kRecIdMax": self.record_id_max, "kPageBytes": self.page_bytes, "kKindHitCopy": 1, "kKindHitSm": 2,
-            "kKindHitCpu": 3, "kKindMissGpu": 4, "kKindMissCpu": 5, "kHotHeaderBytes": 8, "kHotAlignment": 64,
+            "kRecIdMax": self.record_id_max, "kPageBytes": self.page_bytes, "kKindHitCopy": int(LaneKind.HIT_COPY),
+            "kKindHitSm": int(LaneKind.HIT_SM), "kKindHitCpu": int(LaneKind.HIT_CPU),
+            "kKindMissGpu": int(LaneKind.MISS_GPU), "kKindMissCpu": int(LaneKind.MISS_CPU), "kHotHeaderBytes": 8, "kHotAlignment": 64,
             "kHotRecords": self.demand_records, "kLeaseBlockAlign": self.block_align,
             "kLeasePieceMask": self.piece_mask, "kLeasePieceMaskLineBytes": self.piece_mask_line_bytes,
             "kLeaseCopyDone": self.copy_done, "kLeaseCopyDoneBytes": self.copy_done_bytes,

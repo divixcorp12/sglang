@@ -3,6 +3,7 @@
 import pytest
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe import expert_stream_transport as transport
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
@@ -43,3 +44,63 @@ def test_a_lane_count_outside_1_to_32_is_refused(lanes):
 def test_wider_records_round_to_whole_line_pairs():
     assert [lease.wire_layout(n).record_bytes for n in (16, 24, 32)] == [256, 384, 512]
     assert not lease.wire_layout(16).packed_counts
+
+
+def test_the_transport_and_lease_modules_carry_the_trait_values():
+    """expert_stream_transport and expert_lease_block's module constants, and LaneKind, equal lease_layout.h's v2."""
+    from sglang.srt.layers.moe.ram_slot_map import LaneKind
+
+    wire = lease.wire_probe(8, 1)
+    python = [
+        ("kDemandHead", transport.WORDS["demand_head"]),
+        ("kDemandRing", transport.DEMAND_RING),
+        ("kDemandRecords", transport.DEMAND_RECORDS),
+        ("kRecordBytes", transport.RECORD_BYTES),
+        ("kLanes", transport.MAX_IDS),
+        ("kRecSeq", transport.RECORD_FIELDS["seq"]),
+        ("kRecRow", transport.RECORD_FIELDS["row"]),
+        ("kRecCounts", transport.RECORD_FIELDS["counts"]),
+        ("kRecFlags", transport.RECORD_FIELDS["flags"]),
+        ("kRecFlagCaptured", transport.RECORD_FLAG_CAPTURED),
+        ("kRecChain", transport.RECORD_FIELDS["chain"]),
+        ("kRecEpoch", transport.RECORD_FIELDS["epoch"]),
+        ("kRecKinds", transport.RECORD_FIELDS["kinds"]),
+        ("kRecProtect", transport.RECORD_FIELDS["protect"]),
+        ("kRecLaneExpert", transport.RECORD_FIELDS["lane_expert"]),
+        ("kRecLaneSlot", transport.RECORD_FIELDS["lane_slot"]),
+        ("kRecLaneDst", transport.RECORD_FIELDS["lane_dst"]),
+        ("kRecLaneWeight", transport.RECORD_FIELDS["lane_weight"]),
+        ("kRecIdMax", transport.RECORD_ID_MAX),
+        ("kPageBytes", transport.PAGE_BYTES),
+        ("kKindHitCopy", LaneKind.HIT_COPY),
+        ("kKindHitSm", LaneKind.HIT_SM),
+        ("kKindHitCpu", LaneKind.HIT_CPU),
+        ("kKindMissGpu", LaneKind.MISS_GPU),
+        ("kKindMissCpu", LaneKind.MISS_CPU),
+        ("kHotHeaderBytes", transport.HOT_HEADER_BYTES),
+        ("kHotAlignment", transport.HOT_ALIGNMENT),
+        ("kHotRecords", transport.HOT_RECORDS),
+        ("kDemandRecords", lease.RING),
+        ("kLanes", lease.LANES),
+        ("kLeaseBlockAlign", lease.BLOCK_ALIGN),
+        ("kLeasePieceMask", lease.PIECE_MASK),
+        ("kLeasePieceMaskLineBytes", lease.PIECE_MASK_LINE_BYTES),
+        ("kLeaseCopyDone", lease.COPY_DONE),
+        ("kLeaseCopyDoneBytes", lease.COPY_DONE_BYTES),
+        ("kLeaseCopyGate", lease.COPY_GATE),
+        ("kLeaseGateClosed", lease.GATE["closed"]),
+        ("kLeaseGateOpen", lease.GATE["open"]),
+        ("kLeaseGateSeqShift", lease.GATE_SEQ_SHIFT),
+        ("kLeaseGateSeqMask", lease.GATE_SEQ_MASK),
+        ("kCopyArmed", lease.COPY_ARMED),
+        ("kSplit", lease.SPLIT),
+        ("kLeaseBlockBytes", lease.BLOCK_BYTES),
+        ("kDeltaBase", lease.DELTA_BASE),
+        ("kDeltaStride", lease.DELTA_STRIDE),
+        ("kDeltaTag", lease.DELTA_FIELDS["tag"]),
+        ("kDeltaCount", lease.DELTA_FIELDS["count"]),
+        ("kDeltaStaging", lease.DELTA_FIELDS["staging"]),
+        ("kDeltaEntries", lease.DELTA_FIELDS["entries"]),
+        ("kDeltaMaxEntries", lease.DELTA_MAX_ENTRIES),
+    ]
+    assert [(name, wire[name]) for name, _ in python] == [(name, int(value)) for name, value in python]
