@@ -18,6 +18,8 @@
 #include <span>
 #include <vector>
 
+#include "expert_stream/lease_layout.h"
+
 namespace fullstack {
 
 constexpr int kLanes = ::sglang::expert_stream::wire::Wire::kLanes;
