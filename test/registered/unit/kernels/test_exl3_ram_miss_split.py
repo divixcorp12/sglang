@@ -544,7 +544,7 @@ def test_per_row_and_per_extent_stamps_are_bounded_and_the_overflow_counted(tmp_
     experts = list(range(18))
     result, record = read_rows_traced(s.tables, 1, experts, list(range(18)))
     assert result == 1
-    assert len(record["row_pack"]) == ops.STAGE_TRACE_ROWS and record["rows_untraced"] == 2
+    assert len(record["row_pack"]) == ops.stage_trace_rows() and record["rows_untraced"] == 2
     assert record["extents"] == _n(36, s, 1, experts) and len(record["extent_cqe"]) == ops.STAGE_TRACE_EXTENTS
     assert record["extents_untraced"] == _n(36, s, 1, experts) - ops.STAGE_TRACE_EXTENTS
     assert record["useful_bytes"] == 18 * _segment_bytes(s)  # the totals still cover every row

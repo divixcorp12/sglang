@@ -12,6 +12,7 @@ import time
 
 import torch
 
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
@@ -37,7 +38,7 @@ def _host(tmp_path, request, keep_warm_us):
     cores = sorted(os.sched_getaffinity(0))[:2]
     host.enable_cpu_experts(
         host.test_forward_address(FORWARD_NS),
-        [0] * 9,
+        [0] * (lease.LANES + 1),
         cores,
         x_rows,
         out_rows,

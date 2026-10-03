@@ -264,13 +264,8 @@ class CpuExpertService:
             or not envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.get()
         ):
             return None
-        row = next(
-            (
-                r
-                for r in sorted(self.handles)
-                if self._capacity(self.slabs_by_row[r]) >= LANES
-            ),
-            None,
+        row = calibration_row(
+            {r: self._capacity(self.slabs_by_row[r]) for r in self.handles}, LANES
         )
         if row is None:
             logger.warning(
@@ -325,6 +320,16 @@ class CpuExpertService:
         after = self.host.cpu_stats()
         self._calibration_stats = {key: after[key] - before[key] for key in after}
         self._last_stats = after
+
+
+def calibration_row(capacities: Mapping[int, int], lanes: int) -> Optional[int]:
+    """The first row calibration can run on, or ``None`` to keep the configured split.
+
+    Calibration needs ``lanes`` RAM slots in one row and one expert of scratch per
+    lane, and its grid grows with ``lanes``; a tier whose rows all hold fewer slots
+    skips it rather than failing the launch.
+    """
+    return next((r for r in sorted(capacities) if capacities[r] >= lanes), None)
 
 
 def cpu_expert_cores() -> tuple[list[int], int]:

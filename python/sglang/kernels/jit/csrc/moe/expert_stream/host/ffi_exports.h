@@ -444,7 +444,7 @@ struct HostExports {
     return find(handle)->copy_expert_bytes(row);
   }
 
-  // CPU experts' startup calibration (split_calibration.h): out float64 [10, 9] ms. The caller owns the tier.
+  // CPU experts' startup calibration (split_calibration.h): out float64 [kCalibRows, kCalibCols] ms. The caller owns the tier.
   static void calibrate_cpu_split(
       int64_t handle,
       int64_t row,

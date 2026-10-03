@@ -10,13 +10,16 @@ import os
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe import expert_stream_transport as ram_miss
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
-ROW, ROWS, DST_ROWS, HIDDEN, LANES = 1, 2, 6, 8, 8
+ROW, ROWS, DST_ROWS, HIDDEN = 1, 2, 6, 8
+LANES = lease.wire_layout(8).lanes
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
@@ -33,7 +36,7 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_forward_address(forward_ns), [0] * 9, cores, x_rows, out_rows, threads=2, spin_us=200)
+    host.enable_cpu_experts(host.test_forward_address(forward_ns), [0] * (LANES + 1), cores, x_rows, out_rows, threads=2, spin_us=200)
     if register:
         host.set_cpu_layer(ROW, 7)
     row_bytes = [t[0].numel() * t.element_size() for t in s.slabs[ROW].values()]
@@ -118,3 +121,31 @@ def test_calibration_needs_the_tier_owner(tmp_path):
             host.resume()
     finally:
         host.stop()
+
+
+@pytest.mark.parametrize("lanes", [8, 16])
+def test_the_shape_helpers_follow_the_lane_count(lanes):
+    # A real 16-lane calibration needs a 16-lane host (ExpertStreamHost(lanes), Task 6); until then this checks the
+    # helpers and that the 16-lane host module builds with the lane-scaled capacities.
+    width = lease.wire_layout(lanes).lanes
+    assert ram_miss.calibration_shape(lanes) == (width + 2, width + 1)
+    assert ram_miss.stage_trace_rows(lanes) == 2 * width
+    module = ram_miss._host_module("exl3", None, lanes)
+    assert hasattr(module, "expert_stream_calibrate_cpu_split")
+
+
+def test_the_host_calibration_grid_has_the_shape_helper_size(tmp_path):
+    _, host, _, _keep = _host(tmp_path)
+    grid = host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host))
+    assert tuple(grid.shape) == ram_miss.calibration_shape()
+
+
+@pytest.mark.parametrize(
+    "capacities, lanes, row",
+    [({0: 12, 1: 20}, 16, 1), ({0: 16, 1: 20}, 16, 0), ({0: 12, 1: 15}, 16, None), ({0: 7}, 8, None), ({0: 8}, 8, 0)],
+)
+def test_calibration_runs_on_the_first_row_with_a_slot_per_lane(capacities, lanes, row):
+    """Calibration needs one RAM slot per lane; a tier with no such row keeps the configured split."""
+    from sglang.srt.layers.moe.cpu_experts.service import calibration_row
+
+    assert calibration_row(capacities, lanes) == row
