@@ -10,13 +10,16 @@ Run on divix01 through run_exl3_cpu_forward_checks.sh, which sets the build envi
 
 import argparse
 import ctypes
+import itertools
 import os
 import sys
 
 # (name, hidden, intermediate): a generic shape, and DeepSeek V4.1's, which takes the DSV4.1 plan on AVX-512BW.
 SHAPES = (("generic", 512, 256), ("dsv41", 5120, 2304))
 CAP = 6
-LIMIT = 10.0
+# Activation limits: DeepSeek V4.1's swiglu_limit (10), which its plan requires, and another, which takes the
+# generic plan at the DSV4.1 shape.
+LIMITS = (10.0, 7.0)
 THREADS = 4
 # (tokens, experts per token) -> routes. Two tokens sharing expert 0 and 4 make m=2 chunks, which the DSV4.1 plan
 # refuses: at the DSV4.1 shape that case runs the generic plan.
@@ -53,7 +56,7 @@ def random_slabs(torch, hidden, inter, seed):
     }
 
 
-def register_table(ext, s):
+def register_table(ext, s, limit):
     """make_layer over one view per slot: gate is w13 part 0, up part 1, down w2 part 0."""
     rows = range(CAP)
     return ext.exl3_moe_cpu_make_layer(
@@ -70,12 +73,12 @@ def register_table(ext, s):
         [],
         [],
         0,
-        LIMIT,
+        limit,
         0,
     )
 
 
-def register_slabs(ext, s, hidden, inter):
+def register_slabs(ext, s, hidden, inter, limit):
     """The slab ABI over the same tensors: six base pointers, slot s at base + s rows."""
     fn = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_register_slabs
     fn.restype = ctypes.c_int
@@ -91,7 +94,7 @@ def register_slabs(ext, s, hidden, inter):
     ]
     bases = (ctypes.c_void_p * len(NAMES))(*(s[n].data_ptr() for n in NAMES))
     handle = ctypes.c_int64(-1)
-    status = fn(bases, CAP, hidden, inter, 3, 0, LIMIT, ctypes.byref(handle))
+    status = fn(bases, CAP, hidden, inter, 3, 0, limit, ctypes.byref(handle))
     if status != 0:
         sys.exit(f"register_slabs refused the {hidden}x{inter} slabs: status {status}")
     return handle.value
@@ -112,12 +115,12 @@ def dump(args):
         sys.exit(f"asked for {args.isa}, the kernel reports avx2={tier[0]} bw={tier[1]}")
     torch.set_num_threads(1)
     outputs = {}
-    for name, hidden, inter in SHAPES:
+    for (name, hidden, inter), limit in itertools.product(SHAPES, LIMITS):
         slabs = random_slabs(torch, hidden, inter, seed=hidden)
         if args.registration == "table":
-            handle = register_table(ext, slabs)
+            handle = register_table(ext, slabs, limit)
         else:
-            handle = register_slabs(ext, slabs, hidden, inter)
+            handle = register_slabs(ext, slabs, hidden, inter, limit)
         try:
             g = torch.Generator().manual_seed(7)
             for (tokens, k), route in ROUTES.items():
@@ -127,7 +130,7 @@ def dump(args):
                     x = (torch.randn(tokens, hidden, generator=g) * scale).half()
                     out = torch.full((tokens, hidden), float("nan"))
                     ext.exl3_moe_cpu_forward(handle, x, sel, w, out, THREADS)
-                    case = f"{name}/t{tokens}k{k}/s{scale}"
+                    case = f"{name}/l{limit:g}/t{tokens}k{k}/s{scale}"
                     if not torch.isfinite(out).all():
                         sys.exit(f"{case}: non-finite output")
                     outputs[case] = out
