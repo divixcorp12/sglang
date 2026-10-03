@@ -11,9 +11,8 @@ import torch
 import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STATE_WORDS, ExpertStreamDevice
-from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.expert_stream_sources import device_sources, host_sources, joined_text, wire_header
+from sglang.test.expert_stream_sources import device_sources, host_sources, joined_text
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -149,83 +148,21 @@ def _constants(*paths: Path, known: dict[str, int] | None = None) -> dict[str, i
     found: dict[str, int] = {}
     pattern = r"^\s*(?:static\s+)?constexpr\s+[\w:]+\s+(k\w+)\s*=\s*([^;]+);"
     for name, expression in re.findall(pattern, joined_text(paths), re.MULTILINE):
+        if "::" in expression:
+            continue
         assert name not in found, f"{name} is defined twice: the layout check cannot tell which one applies"
         expression = re.sub(r"(?<=\d)[uU][lL]*\b", "", expression.strip())
         found[name] = seeded[name] = _evaluate(ast.parse(expression, mode="eval").body, seeded)
     return found
 
 
-def _wire():
-    return _constants(wire_header())
-
-
 _NAME = re.compile(r"^\s*(?:static\s+)?constexpr\s+[\w:]+\s+(k\w+)\s*=", re.MULTILINE)
-
-# The wire header, in full: every constant it defines and the Python value it must equal.
-PYTHON_WIRE = {
-    "kDemandHead": ram_miss.WORDS["demand_head"],
-    "kDemandRing": ram_miss.DEMAND_RING,
-    "kDemandRecords": ram_miss.DEMAND_RECORDS,
-    "kRecordBytes": ram_miss.RECORD_BYTES,
-    "kMaxIds": ram_miss.MAX_IDS,
-    "kRecSeq": ram_miss.RECORD_FIELDS["seq"],
-    "kRecRow": ram_miss.RECORD_FIELDS["row"],
-    "kRecCounts": ram_miss.RECORD_FIELDS["counts"],
-    "kRecFlags": ram_miss.RECORD_FIELDS["flags"],
-    "kRecFlagCaptured": ram_miss.RECORD_FLAG_CAPTURED,
-    "kRecChain": ram_miss.RECORD_FIELDS["chain"],
-    "kRecEpoch": ram_miss.RECORD_FIELDS["epoch"],
-    "kRecKinds": ram_miss.RECORD_FIELDS["kinds"],
-    "kRecProtect": ram_miss.RECORD_FIELDS["protect"],
-    "kRecLaneExpert": ram_miss.RECORD_FIELDS["lane_expert"],
-    "kRecLaneSlot": ram_miss.RECORD_FIELDS["lane_slot"],
-    "kRecLaneDst": ram_miss.RECORD_FIELDS["lane_dst"],
-    "kRecLaneWeight": ram_miss.RECORD_FIELDS["lane_weight"],
-    "kRecIdMax": ram_miss.RECORD_ID_MAX,
-    "kPageBytes": PAGE_BYTES,
-    "kKindHitCopy": LaneKind.HIT_COPY,
-    "kKindHitSm": LaneKind.HIT_SM,
-    "kKindHitCpu": LaneKind.HIT_CPU,
-    "kKindMissGpu": LaneKind.MISS_GPU,
-    "kKindMissCpu": LaneKind.MISS_CPU,
-    "kHotHeaderBytes": ram_miss.HOT_HEADER_BYTES,
-    "kHotAlignment": ram_miss.HOT_ALIGNMENT,
-    "kHotRecords": ram_miss.HOT_RECORDS,
-    "kLeaseRing": lease.RING,
-    "kLeaseLanes": lease.LANES,
-    "kLeaseBlockAlign": lease.BLOCK_ALIGN,
-    "kLeasePieceMask": lease.PIECE_MASK,
-    "kLeasePieceMaskLineBytes": lease.PIECE_MASK_LINE_BYTES,
-    "kLeaseCopyDone": lease.COPY_DONE,
-    "kLeaseCopyDoneBytes": lease.COPY_DONE_BYTES,
-    "kLeaseCopyGate": lease.COPY_GATE,
-    "kLeaseGateClosed": lease.GATE["closed"],
-    "kLeaseGateOpen": lease.GATE["open"],
-    "kLeaseGateSeqShift": lease.GATE_SEQ_SHIFT,
-    "kLeaseGateSeqMask": lease.GATE_SEQ_MASK,
-    "kCopyArmed": lease.COPY_ARMED,
-    "kSplit": lease.SPLIT,
-    "kLeaseBlockBytes": lease.BLOCK_BYTES,
-    "kDeltaBase": lease.DELTA_BASE,
-    "kDeltaStride": lease.DELTA_STRIDE,
-    "kDeltaTag": lease.DELTA_FIELDS["tag"],
-    "kDeltaCount": lease.DELTA_FIELDS["count"],
-    "kDeltaStaging": lease.DELTA_FIELDS["staging"],
-    "kDeltaEntries": lease.DELTA_FIELDS["entries"],
-    "kDeltaMaxEntries": lease.DELTA_MAX_ENTRIES,
-}
-
-
-def test_the_wire_header_is_the_python_layout():
-    """The request page and the lease block: one C++ home, equal to Python, and nothing in it Python does not mirror."""
-    assert _wire() == PYTHON_WIRE
-    assert PYTHON_WIRE["kLeaseRing"] == PYTHON_WIRE["kDemandRecords"] and PYTHON_WIRE["kLeaseLanes"] == PYTHON_WIRE["kMaxIds"]
 
 
 def test_no_other_source_defines_a_wire_constant():
     """A layout constant re-added beside its user compiles (an ambiguous name errors only where it is used) and then
     drifts; this names the file that re-added it."""
-    wire = set(_wire())
+    wire = set(lease.wire_probe(8, 1)) - {"kLanes", "kNodes"}
     for path in (*host_sources(), *device_sources()):
         clash = wire & set(_NAME.findall(path.read_text()))
         assert not clash, f"{path.name} redefines wire constants {sorted(clash)}: define them only in lease_layout.h"
@@ -233,7 +170,7 @@ def test_no_other_source_defines_a_wire_constant():
 
 def test_the_device_state_words_are_the_python_state_words():
     """The device state block agrees with Python's STATE_WORDS; this is the only check of it."""
-    device = _constants(*device_sources(), known=_wire())
+    device = _constants(*device_sources(), known={**lease.wire_probe(8, 1), "kMaxIds": 8, "kLeaseLanes": 8, "kLeaseRing": 16})
     state = {
         "kPosted": "posted",
         "kPending": "pending",
@@ -273,7 +210,7 @@ def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
 
 
 def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
-    wire = _wire()
+    wire = lease.wire_probe(8, 1)
     assert wire["kHotHeaderBytes"] == ram_miss.HOT_HEADER_BYTES == 8
     assert wire["kHotAlignment"] == ram_miss.HOT_ALIGNMENT == 64
     assert wire["kHotRecords"] == ram_miss.HOT_RECORDS == ram_miss.DEMAND_RECORDS == 16

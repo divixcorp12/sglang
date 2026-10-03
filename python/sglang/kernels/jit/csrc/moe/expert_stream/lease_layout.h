@@ -5,93 +5,159 @@
 //   Completion block  host-written, device-read: PieceMask, CopyDone, the copy gate, the CPU split table
 //   Map delta block   host-written, device-read: one delta record per row, after the completion block
 //
-// Every offset is a byte offset. This file holds only `constexpr <type> kName = <integer expression>;` lines (plus
-// static_asserts): test_exl3_ram_miss_device_args parses them to check the Python mirrors,
-// python/sglang/kernels/ops/moe/expert_stream_transport.py and python/sglang/kernels/ops/moe/expert_lease_block.py.
+// Every offset is a byte offset. LeaseLayout<NumLanes, NumNodes> computes them; python/sglang/kernels/ops/moe/
+// expert_lease_block.py mirrors them as wire_layout, and test_expert_stream_lease_layout checks the two agree.
 //
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "Wire (v2)".
 #pragma once
 
 #include <cstdint>
 
+// The lane count of this build: every JIT build of the device kernels and the host passes -DSGLANG_EXPERT_STREAM_LANES.
+#ifndef SGLANG_EXPERT_STREAM_LANES
+#define SGLANG_EXPERT_STREAM_LANES 8
+#endif
+
 namespace sglang::expert_stream::wire {
 
-// ---- Request page: device-written, host-read ----
-constexpr int64_t kDemandHead = 0;    // u32: the last posted seq, stored with a release
-constexpr int64_t kDemandRing = 128;  // a 128-byte block of its own: each record below is one prefetch pair
-constexpr uint32_t kDemandRecords = 16;
-constexpr int64_t kRecordBytes = 128;  // two cache lines, one 128-byte-aligned block (the L2's adjacent-line pair)
-constexpr int kMaxIds = 8;
-constexpr int64_t kRecSeq = 0;            // u32 seqlock word: 0 while the payload is rewritten, the seq stored last
-constexpr int64_t kRecRow = 4;            // u16
-constexpr int64_t kRecCounts = 6;         // u8: lanes in bits 0-3, protect ids in bits 4-7
-constexpr int64_t kRecFlags = 7;          // u8
-constexpr uint32_t kRecFlagCaptured = 1;  // posted from a captured graph
-constexpr int64_t kRecChain = 8;          // u64: the row's map-chain number, 0 when no lane misses
-constexpr int64_t kRecEpoch = 16;         // u32: the device's epoch, so G = epoch << 32 | seq
-constexpr int64_t kRecKinds = 20;         // u32: lane j's kKind in bits 4j..4j+3
-constexpr int64_t kRecProtect = 32;       // i16[kMaxIds]: every routed expert of the request, -1 past the count
-constexpr int64_t kRecLaneExpert = 48;    // i16[kMaxIds], -1 past the count
-constexpr int64_t kRecLaneSlot = 64;      // i16[kMaxIds]: the RAM slot of a hit, the staging slot of a miss
-constexpr int64_t kRecLaneDst = 80;       // i16[kMaxIds]: the VRAM destination slot
-constexpr int64_t kRecLaneWeight = 96;    // f32[kMaxIds]: the lane expert's routing weight
-constexpr int64_t kRecIdMax = 32767;      // the largest expert, slot or destination an i16 field carries
-constexpr int64_t kPageBytes = kDemandRing + kDemandRecords * kRecordBytes;
-// Lane kinds (ram_slot_map.LaneKind): what moves the bytes, and what the device waits on.
-constexpr uint32_t kKindHitCopy = 1;  // the copy thread's DMA; CopyDone
-constexpr uint32_t kKindHitSm = 2;    // the SM-copy kernel (C1); stream order
-constexpr uint32_t kKindHitCpu = 3;   // the CPU, from the RAM slot; CopyDone
-constexpr uint32_t kKindMissGpu = 4;  // NVMe into the staging slot, then the stream kernel (S); PieceMask
-constexpr uint32_t kKindMissCpu = 5;  // NVMe into the staging slot, then the CPU; CopyDone
-// The hot page (GPU hot mode), a separate pinned page: per record {u32 seq; u32 reserved}, then the hot bitmap.
-constexpr int64_t kHotHeaderBytes = 8;
-constexpr int64_t kHotAlignment = 64;
-constexpr uint32_t kHotRecords = kDemandRecords;
+constexpr int64_t wire_round_up(int64_t value, int64_t align) {
+  return (value + align - 1) / align * align;
+}
 
-// ---- Completion block: host-written, device-read, 4096-byte aligned ----
-constexpr int64_t kLeaseRing = 16;  // == kDemandRecords
-constexpr int64_t kLeaseLanes = 8;  // == kMaxIds
-constexpr int64_t kLeaseBlockAlign = 4096;
-// PieceMask[kLeaseRing][kLeaseLanes]: u64 G << 8 | 8 piece bits (G is the request's generation, epoch << 32 | seq).
-// One 128-byte line each, so a lane's poll never shares a line with another lane.
-constexpr int64_t kLeasePieceMask = 0;
-constexpr int64_t kLeasePieceMaskLineBytes = 128;
-// CopyDone[kLeaseRing]: u64 G once every kHitCopy, kHitCpu and kMissCpu lane of G has completed.
-// The copy gate follows on its own line: (seq & kLeaseGateSeqMask) << kLeaseGateSeqShift | 1, with bit 31 set while
-// closed. The copy wait kernel (CW) closes it; CW or the copy thread opens it; the decode stream waits on it with
-// cuStreamWaitValue32 GEQ kLeaseGateOpen.
-constexpr int64_t kLeaseCopyDone = kLeasePieceMask + kLeaseRing * kLeaseLanes * kLeasePieceMaskLineBytes;
-constexpr int64_t kLeaseCopyDoneBytes = 8;
-constexpr int64_t kLeaseCopyGate = kLeaseCopyDone + 128;
-constexpr uint32_t kLeaseGateClosed = 0x80000001u;  // (int32_t)(gate - 1) < 0: the cyclic GEQ blocks
-constexpr uint32_t kLeaseGateOpen = 1;
-constexpr uint32_t kLeaseGateSeqShift = 2;
-constexpr uint32_t kLeaseGateSeqMask = 0x1FFFFFFF;
-constexpr int64_t kCopyArmed = kLeaseCopyGate + 128;  // u32: 1 once the service armed its copy engine
-constexpr int64_t kSplit = kCopyArmed + 128;          // i32[kLeaseLanes + 1]: CPU lanes per n eligible lanes
-constexpr int64_t kLeaseBlockBytes = 20480;
+template <int NumLanes, int NumNodes = 1>
+struct LeaseLayout {
+  static_assert(1 <= NumLanes && NumLanes <= 32, "a record carries 1..32 lanes");
+  static_assert(NumNodes >= 1, "at least one NUMA node");
+  // Lane arrays are i16, so a multiple of 8 lanes is whole 16-byte vector loads and stores.
+  static constexpr int kLanes = static_cast<int>(wire_round_up(NumLanes, 8));
+  static constexpr int kNodes = NumNodes;
 
-// ---- Map delta block: host-written, device-read; one record per row, in the completion block's allocation ----
-constexpr int64_t kDeltaBase = kLeaseBlockBytes;
-constexpr int64_t kDeltaStride = 256;
-constexpr int64_t kDeltaTag = 0;       // u64: the map-chain number this delta follows, stored last with a release
-constexpr int64_t kDeltaCount = 8;     // u32: entries used
-constexpr int64_t kDeltaStaging = 16;  // i16[kLeaseLanes]: the row's staging slots after this delta, -1 past K
-constexpr int64_t kDeltaEntries = 32;  // {i16 expert, i16 slot}[kDeltaMaxEntries]: ram_slot[expert] = slot, -1 unmaps
-constexpr int64_t kDeltaMaxEntries = 16;
+  // ---- Request page: device-written, host-read ----
+  static constexpr int64_t kDemandHead = 0;    // u32: the last posted seq, stored with a release
+  static constexpr int64_t kDemandRing = 128;  // a 128-byte block of its own
+  static constexpr uint32_t kDemandRecords = 16;
+  static constexpr int64_t kRecSeq = 0;    // u32 seqlock word: 0 while the payload is rewritten, the seq stored last
+  static constexpr int64_t kRecRow = 4;    // u16
+  static constexpr int64_t kRecCounts = 6; // u8: see kPackedCounts
+  static constexpr int64_t kRecFlags = 7;  // u8
+  static constexpr uint32_t kRecFlagCaptured = 1;
+  static constexpr int64_t kRecChain = 8;  // u64: the row's map-chain number, 0 when no lane misses
+  static constexpr int64_t kRecEpoch = 16; // u32: the device's epoch, so G = epoch << 32 | seq
+  static constexpr int64_t kRecKinds = 20; // u32[kKindWords]: lane j's kind in word j / 8, bits 4(j % 8)..+3
+  static constexpr int kKindWords = kLanes / 8;
+  // v2 packs lanes (bits 0-3) and protect ids (bits 4-7) into kRecCounts; wider records hold the lane count there and
+  // the protect count in its own byte.
+  static constexpr bool kPackedCounts = kLanes == 8;
+  static constexpr int64_t kRecProtectCount = kRecKinds + 4 * kKindWords;  // u8, unpacked counts only
+  static constexpr int64_t kRecHeaderBytes = wire_round_up(kRecProtectCount + (kPackedCounts ? 0 : 1), 16);
+  static constexpr int64_t kRecProtect = kRecHeaderBytes;         // i16[kLanes]
+  static constexpr int64_t kRecLaneExpert = kRecProtect + 2 * kLanes;   // i16[kLanes]
+  static constexpr int64_t kRecLaneSlot = kRecLaneExpert + 2 * kLanes;  // i16[kLanes]: a hit's RAM slot, a miss's staging slot
+  static constexpr int64_t kRecLaneDst = kRecLaneSlot + 2 * kLanes;     // i16[kLanes]: the VRAM destination slot
+  static constexpr int64_t kRecLaneWeight = kRecLaneDst + 2 * kLanes;   // f32[kLanes]
+  static constexpr int64_t kRecPayloadEnd = kRecLaneWeight + 4 * kLanes;
+  static constexpr int64_t kRecordBytes = wire_round_up(kRecPayloadEnd, 128);  // whole L2 adjacent-line pairs
+  static constexpr int64_t kRecIdMax = 32767;
+  static constexpr int64_t kPageBytes = kDemandRing + kDemandRecords * kRecordBytes;
+  static constexpr uint32_t kKindHitCopy = 1;
+  static constexpr uint32_t kKindHitSm = 2;
+  static constexpr uint32_t kKindHitCpu = 3;
+  static constexpr uint32_t kKindMissGpu = 4;
+  static constexpr uint32_t kKindMissCpu = 5;
+  static constexpr int64_t kHotHeaderBytes = 8;
+  static constexpr int64_t kHotAlignment = 64;
+  static constexpr uint32_t kHotRecords = kDemandRecords;
 
-static_assert(kLeaseRing == kDemandRecords && kLeaseLanes == kMaxIds, "the completion block follows the ring");
-static_assert(kMaxIds == 8, "the record's 16-byte stores and its kinds word hold 8 lanes");
-static_assert(kRecCounts == kRecRow + 2 && kRecFlags == kRecRow + 3, "row, counts and flags are one u32 store");
-static_assert(kRecChain % 8 == 0 && kRecKinds == kRecEpoch + 4, "chain is one v2 store; epoch and kinds one v4");
-static_assert(
-    kDemandRing % 16 == 0 && kRecordBytes % 16 == 0 && kRecEpoch % 16 == 0 && kRecProtect % 16 == 0 &&
-        kRecLaneExpert % 16 == 0 && kRecLaneSlot % 16 == 0 && kRecLaneDst % 16 == 0 && kRecLaneWeight % 16 == 0,
-    "the record's v4 stores are 16-byte aligned");
-static_assert(kRecLaneWeight + 4 * kMaxIds == kRecordBytes, "the payload is the whole record: read_record copies it");
-static_assert(kDemandRing % 128 == 0 && kRecordBytes == 128, "a record's two lines are one 128-byte prefetch pair");
-static_assert(kSplit + 4 * (kLeaseLanes + 1) <= kLeaseBlockBytes, "completion block");
-static_assert(kLeaseBlockBytes % kLeaseBlockAlign == 0, "the block is whole pages");
-static_assert(kDeltaEntries + 4 * kDeltaMaxEntries <= kDeltaStride, "delta record");
+  // ---- Completion block: host-written, device-read, 4096-byte aligned ----
+  static constexpr int64_t kLeaseBlockAlign = 4096;
+  static constexpr int64_t kLeasePieceMask = 0;  // u64[kDemandRecords][kLanes], one 128-byte line each
+  static constexpr int64_t kLeasePieceMaskLineBytes = 128;
+  static constexpr int64_t kLeaseCopyDone = kLeasePieceMask + kDemandRecords * kLanes * kLeasePieceMaskLineBytes;
+  static constexpr int64_t kLeaseCopyDoneBytes = 8;
+  static constexpr int64_t kLeaseCopyGate = kLeaseCopyDone + 128;
+  static constexpr uint32_t kLeaseGateClosed = 0x80000001u;
+  static constexpr uint32_t kLeaseGateOpen = 1;
+  static constexpr uint32_t kLeaseGateSeqShift = 2;
+  static constexpr uint32_t kLeaseGateSeqMask = 0x1FFFFFFF;
+  static constexpr int64_t kCopyArmed = kLeaseCopyGate + 128;  // u32
+  static constexpr int64_t kSplit = kCopyArmed + 128;  // i32[kNodes][kSplitStride / 4]: CPU lanes per n eligible lanes
+  static constexpr int64_t kSplitStride = wire_round_up(4 * (kLanes + 1), 16);  // a node's table, in 16-byte loads
+  static constexpr int64_t kLeaseBlockBytes = wire_round_up(kSplit + kNodes * kSplitStride, kLeaseBlockAlign);
+
+  // ---- Map delta block: one record per row after the completion block ----
+  static constexpr int64_t kDeltaBase = kLeaseBlockBytes;
+  static constexpr int64_t kDeltaTag = 0;      // u64, stored last with a release
+  static constexpr int64_t kDeltaCount = 8;    // u32
+  static constexpr int64_t kDeltaStaging = 16; // i16[kNodes][kLanes], -1 past the list
+  static constexpr int64_t kDeltaEntries = wire_round_up(kDeltaStaging + 2 * kNodes * kLanes, 16);
+  static constexpr int64_t kDeltaMaxEntries = 2 * kLanes;  // an insert and an eviction per miss
+  static constexpr int64_t kDeltaStride = wire_round_up(kDeltaEntries + 4 * kDeltaMaxEntries, 256);
+  static_assert(kRecEpoch % 16 == 0 && kRecProtect % 16 == 0 && kRecLaneExpert % 16 == 0 && kRecLaneSlot % 16 == 0 &&
+                    kRecLaneDst % 16 == 0 && kRecLaneWeight % 16 == 0 && kRecordBytes % 16 == 0,
+                "the record's 16-byte stores are aligned");
+  static_assert(kSplit + kNodes * kSplitStride <= kLeaseBlockBytes, "completion block");
+  static_assert(kLeaseBlockBytes % kLeaseBlockAlign == 0, "the block is whole pages");
+  static_assert(kDeltaEntries + 4 * kDeltaMaxEntries <= kDeltaStride, "delta record");
+};
+
+using Wire = LeaseLayout<SGLANG_EXPERT_STREAM_LANES, 1>;
+
+using V2 = LeaseLayout<8, 1>;
+static_assert(V2::kRecordBytes == 128 && V2::kPageBytes == 2176 && V2::kRecLaneWeight == 96, "v2 request page");
+static_assert(V2::kLeaseCopyDone == 0x4000 && V2::kSplit == 16768 && V2::kLeaseBlockBytes == 20480, "v2 block");
+static_assert(V2::kDeltaEntries == 32 && V2::kDeltaMaxEntries == 16 && V2::kDeltaStride == 256, "v2 delta");
+static_assert(Wire::kSplit % 16 == 0 && Wire::kRecProtect % 16 == 0 && Wire::kRecordBytes % 128 == 0, "alignment");
+
+// Transitional aliases so every user still compiles; Task 2 rewrites the users to Wire:: and deletes this block.
+inline constexpr auto kDemandHead = Wire::kDemandHead;
+inline constexpr auto kDemandRing = Wire::kDemandRing;
+inline constexpr auto kDemandRecords = Wire::kDemandRecords;
+inline constexpr auto kRecordBytes = Wire::kRecordBytes;
+inline constexpr int kMaxIds = Wire::kLanes;
+inline constexpr auto kRecSeq = Wire::kRecSeq;
+inline constexpr auto kRecRow = Wire::kRecRow;
+inline constexpr auto kRecCounts = Wire::kRecCounts;
+inline constexpr auto kRecFlags = Wire::kRecFlags;
+inline constexpr auto kRecFlagCaptured = Wire::kRecFlagCaptured;
+inline constexpr auto kRecChain = Wire::kRecChain;
+inline constexpr auto kRecEpoch = Wire::kRecEpoch;
+inline constexpr auto kRecKinds = Wire::kRecKinds;
+inline constexpr auto kRecProtect = Wire::kRecProtect;
+inline constexpr auto kRecLaneExpert = Wire::kRecLaneExpert;
+inline constexpr auto kRecLaneSlot = Wire::kRecLaneSlot;
+inline constexpr auto kRecLaneDst = Wire::kRecLaneDst;
+inline constexpr auto kRecLaneWeight = Wire::kRecLaneWeight;
+inline constexpr auto kRecIdMax = Wire::kRecIdMax;
+inline constexpr auto kPageBytes = Wire::kPageBytes;
+inline constexpr auto kKindHitCopy = Wire::kKindHitCopy;
+inline constexpr auto kKindHitSm = Wire::kKindHitSm;
+inline constexpr auto kKindHitCpu = Wire::kKindHitCpu;
+inline constexpr auto kKindMissGpu = Wire::kKindMissGpu;
+inline constexpr auto kKindMissCpu = Wire::kKindMissCpu;
+inline constexpr auto kHotHeaderBytes = Wire::kHotHeaderBytes;
+inline constexpr auto kHotAlignment = Wire::kHotAlignment;
+inline constexpr auto kHotRecords = Wire::kHotRecords;
+inline constexpr int64_t kLeaseRing = Wire::kDemandRecords;
+inline constexpr int64_t kLeaseLanes = Wire::kLanes;
+inline constexpr auto kLeaseBlockAlign = Wire::kLeaseBlockAlign;
+inline constexpr auto kLeasePieceMask = Wire::kLeasePieceMask;
+inline constexpr auto kLeasePieceMaskLineBytes = Wire::kLeasePieceMaskLineBytes;
+inline constexpr auto kLeaseCopyDone = Wire::kLeaseCopyDone;
+inline constexpr auto kLeaseCopyDoneBytes = Wire::kLeaseCopyDoneBytes;
+inline constexpr auto kLeaseCopyGate = Wire::kLeaseCopyGate;
+inline constexpr auto kLeaseGateClosed = Wire::kLeaseGateClosed;
+inline constexpr auto kLeaseGateOpen = Wire::kLeaseGateOpen;
+inline constexpr auto kLeaseGateSeqShift = Wire::kLeaseGateSeqShift;
+inline constexpr auto kLeaseGateSeqMask = Wire::kLeaseGateSeqMask;
+inline constexpr auto kCopyArmed = Wire::kCopyArmed;
+inline constexpr auto kSplit = Wire::kSplit;
+inline constexpr auto kLeaseBlockBytes = Wire::kLeaseBlockBytes;
+inline constexpr auto kDeltaBase = Wire::kDeltaBase;
+inline constexpr auto kDeltaStride = Wire::kDeltaStride;
+inline constexpr auto kDeltaTag = Wire::kDeltaTag;
+inline constexpr auto kDeltaCount = Wire::kDeltaCount;
+inline constexpr auto kDeltaStaging = Wire::kDeltaStaging;
+inline constexpr auto kDeltaEntries = Wire::kDeltaEntries;
+inline constexpr auto kDeltaMaxEntries = Wire::kDeltaMaxEntries;
 
 }  // namespace sglang::expert_stream::wire
