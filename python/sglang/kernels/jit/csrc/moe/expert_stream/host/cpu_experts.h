@@ -23,6 +23,7 @@
 #include "spsc_ring.h"
 #include "tier_protocol.h"
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -108,7 +109,7 @@ struct CpuExpertConfig {
 // after observing a job done orders the output before the device's read of it.
 class CpuExpertEngine {
  public:
-  static constexpr size_t kRing = 256;
+  static constexpr size_t kRing = std::bit_ceil(static_cast<size_t>(wire::Wire::kDemandRecords) * (wire::Wire::kLanes + 1));
   // A record has at most one CPU-hit job and one job per CPU miss, so the ring holds every job that can be outstanding.
   static_assert(
       kRing >= wire::Wire::kDemandRecords * (wire::Wire::kLanes + 1), "the ring holds every job that can be outstanding");
