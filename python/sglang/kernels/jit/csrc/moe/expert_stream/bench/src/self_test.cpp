@@ -147,8 +147,23 @@ int64_t soon() {
   return monotonic_ns() + 100'000'000;
 }
 
-constexpr std::array<int16_t, 8> kStaging012 = {0, 1, 2, -1, -1, -1, -1, -1};
-constexpr std::array<int32_t, 9> kAllToCpu = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+constexpr int kWireLanes = w::Wire::kLanes;
+using Staging = std::array<int16_t, kWireLanes>;
+using SplitTable = std::array<int32_t, kWireLanes + 1>;
+
+constexpr Staging kStaging012 = [] {
+  Staging s{};
+  s.fill(-1);
+  for (int i = 0; i < 3; ++i)
+    s[i] = static_cast<int16_t>(i);
+  return s;
+}();
+constexpr SplitTable kAllToCpu = [] {
+  SplitTable t{};
+  for (int i = 0; i <= kWireLanes; ++i)
+    t[i] = i;
+  return t;
+}();
 
 // A standalone request page and lease block, with helpers that write the host's words (deltas, the split table, the
 // armed flag) the way the host does, and read the device's words back.
@@ -160,18 +175,18 @@ struct Blocks {
 
   // The host's delta record for `row`: payload, then the tag with a release (RamTier::publish_delta_locked).
   void
-  delta(int64_t row, uint64_t tag, std::array<int16_t, 8> staging, std::vector<std::pair<int16_t, int16_t>> entries) {
+  delta(int64_t row, uint64_t tag, Staging staging, std::vector<std::pair<int16_t, int16_t>> entries) {
     uint8_t* d = lease.get() + w::Wire::kDeltaBase + row * w::Wire::kDeltaStride;
     const auto count = static_cast<uint32_t>(entries.size());
     std::memcpy(d + w::Wire::kDeltaCount, &count, 4);
-    std::memcpy(d + w::Wire::kDeltaStaging, staging.data(), 16);
+    std::memcpy(d + w::Wire::kDeltaStaging, staging.data(), sizeof(staging));
     for (size_t i = 0; i < entries.size(); ++i) {
       const int16_t entry[2] = {entries[i].first, entries[i].second};
       std::memcpy(d + w::Wire::kDeltaEntries + 4 * i, entry, 4);
     }
     __atomic_store_n(reinterpret_cast<uint64_t*>(d + w::Wire::kDeltaTag), tag, __ATOMIC_RELEASE);
   }
-  void split(std::array<int32_t, 9> table) {
+  void split(SplitTable table) {
     std::memcpy(lease.get() + w::Wire::kSplit, table.data(), sizeof(table));
   }
   void armed(bool on) {
@@ -208,20 +223,32 @@ void test_record_bytes() {
   CHECK(b.at<uint32_t>(w::Wire::kDemandHead) == 1);
   CHECK(b.at<uint32_t>(rec + w::Wire::kRecSeq) == 1);
   CHECK(b.at<uint16_t>(rec + w::Wire::kRecRow) == 0);
-  CHECK(b.at<uint8_t>(rec + w::Wire::kRecCounts) == (2 | 2 << 4));
+  if constexpr (w::Wire::kPackedCounts) {
+    CHECK(b.at<uint8_t>(rec + w::Wire::kRecCounts) == (2 | 2 << 4));
+  } else {
+    CHECK(b.at<uint8_t>(rec + w::Wire::kRecCounts) == 2);
+    CHECK(b.at<uint8_t>(rec + w::Wire::kRecProtectCount) == 2);
+  }
   CHECK(b.at<uint8_t>(rec + w::Wire::kRecFlags) == w::Wire::kRecFlagCaptured);
   CHECK(b.at<uint64_t>(rec + w::Wire::kRecChain) == 2);
   CHECK(b.at<uint32_t>(rec + w::Wire::kRecEpoch) == 0);
   CHECK(b.at<uint32_t>(rec + w::Wire::kRecKinds) == (3u | 4u << 4));
-  const int16_t ids[8] = {3, 5, -1, -1, -1, -1, -1, -1};
-  const int16_t slots[8] = {4, 0, -1, -1, -1, -1, -1, -1};
-  const int16_t dst[8] = {0, 1, -1, -1, -1, -1, -1, -1};
-  const float lane_weights[8] = {0.5f, 0.25f, 0, 0, 0, 0, 0, 0};
-  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecProtect, ids, 16) == 0);
-  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecLaneExpert, ids, 16) == 0);
-  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecLaneSlot, slots, 16) == 0);
-  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecLaneDst, dst, 16) == 0);
-  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecLaneWeight, lane_weights, 32) == 0);
+  for (int i = 1; i < w::Wire::kKindWords; ++i)
+    CHECK(b.at<uint32_t>(rec + w::Wire::kRecKinds + 4 * i) == 0);
+  std::array<int16_t, kWireLanes> ids, slots, dst;
+  std::array<float, kWireLanes> lane_weights{};
+  ids.fill(-1);
+  slots.fill(-1);
+  dst.fill(-1);
+  ids[0] = 3, ids[1] = 5;
+  slots[0] = 4, slots[1] = 0;
+  dst[0] = 0, dst[1] = 1;
+  lane_weights[0] = 0.5f, lane_weights[1] = 0.25f;
+  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecProtect, ids.data(), 2 * kWireLanes) == 0);
+  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecLaneExpert, ids.data(), 2 * kWireLanes) == 0);
+  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecLaneSlot, slots.data(), 2 * kWireLanes) == 0);
+  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecLaneDst, dst.data(), 2 * kWireLanes) == 0);
+  CHECK(std::memcmp(b.page.get() + rec + w::Wire::kRecLaneWeight, lane_weights.data(), 4 * kWireLanes) == 0);
   // The production parser reads it back as the device meant it.
   es::Request req;
   CHECK(es::read_record(b.page.get() + rec, 1, &req) == es::RecordRead::kOk);
@@ -231,6 +258,41 @@ void test_record_bytes() {
       req.lanes[0].expert == 3 && req.lanes[0].slot == 4 && req.lanes[0].dst == 0 && req.lanes[0].weight == 0.5f &&
       req.lanes[0].kind == w::Wire::kKindHitCpu);
   CHECK(req.lanes[1].expert == 5 && req.lanes[1].slot == 0 && req.lanes[1].kind == w::Wire::kKindMissGpu);
+}
+
+// A request of every lane a hit: the record's counts, kinds and per-lane arrays decode through read_record at any width.
+void test_full_width_record() {
+  constexpr int n = kWireLanes;
+  Blocks b(1);
+  std::vector<std::pair<int16_t, int16_t>> entries;
+  for (int j = 0; j < n; ++j)
+    entries.emplace_back(static_cast<int16_t>(j), static_cast<int16_t>(100 + j));
+  b.delta(0, 1, kStaging012, entries);
+  b.split(kAllToCpu);
+  b.armed(true);
+  DeviceSim sim(b.page.get(), b.lease.get(), 1, n);
+  sim.set_row_cpu(0);
+  std::vector<int32_t> experts(n);
+  std::vector<float> weights(n);
+  for (int j = 0; j < n; ++j) {
+    experts[j] = n - 1 - j;
+    weights[j] = 0.5f + static_cast<float>(j);
+  }
+  const SimRequest r = sim.post(0, experts, weights, true, soon());
+  es::Request req;
+  CHECK(es::read_record(b.page.get() + w::Wire::kDemandRing + r.idx * w::Wire::kRecordBytes, r.seq, &req) ==
+        es::RecordRead::kOk);
+  CHECK(req.gen == r.gen && req.row == 0 && req.captured);
+  CHECK(static_cast<int>(req.lanes.size()) == n && static_cast<int>(req.protect.size()) == n);
+  for (int j = 0; j < n; ++j) {
+    CHECK(req.protect[j] == experts[j]);
+    CHECK(req.lanes[j].expert == experts[j]);
+    CHECK(req.lanes[j].slot == 100 + experts[j]);
+    CHECK(req.lanes[j].dst == j);
+    CHECK(req.lanes[j].weight == weights[j]);
+    CHECK(req.lanes[j].kind == static_cast<uint32_t>(r.kinds[j]));
+    CHECK(req.lanes[j].kind == w::Wire::kKindHitCpu);  // every lane eligible, split sends all to the CPU
+  }
 }
 
 void test_seqlock_order() {
@@ -592,6 +654,7 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
 int run_self_test(const Placement& placement, const std::filesystem::path& image_dir) {
   test_placement();
   test_record_bytes();
+  test_full_width_record();
   test_seqlock_order();
   test_owed_delta();
   test_typing();
