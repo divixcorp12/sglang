@@ -170,14 +170,21 @@ SimRequest DeviceSim::post(
   __atomic_store_n(reinterpret_cast<uint32_t*>(rec + w::Wire::kRecSeq), 0u, __ATOMIC_RELAXED);
   asm volatile("" ::: "memory");
   put<uint16_t>(rec + w::Wire::kRecRow, static_cast<uint16_t>(row));
-  put<uint8_t>(rec + w::Wire::kRecCounts, static_cast<uint8_t>(count | count << 4));  // protect ids = the lane experts
+  // Protect ids = the lane experts, so the protect count is the lane count.
+  if constexpr (w::Wire::kPackedCounts) {
+    put<uint8_t>(rec + w::Wire::kRecCounts, static_cast<uint8_t>(count | count << 4));
+  } else {
+    put<uint8_t>(rec + w::Wire::kRecCounts, static_cast<uint8_t>(count));
+    put<uint8_t>(rec + w::Wire::kRecProtectCount, static_cast<uint8_t>(count));
+  }
   put<uint8_t>(rec + w::Wire::kRecFlags, static_cast<uint8_t>(captured ? w::Wire::kRecFlagCaptured : 0));
   put<uint64_t>(rec + w::Wire::kRecChain, r.chain);
   put<uint32_t>(rec + w::Wire::kRecEpoch, epoch_);
-  uint32_t kinds = 0;
+  uint32_t kinds[w::Wire::kKindWords] = {};
   for (int j = 0; j < count; ++j)
-    kinds |= (static_cast<uint32_t>(r.kinds[j]) & 0xFu) << (4 * j);
-  put<uint32_t>(rec + w::Wire::kRecKinds, kinds);
+    kinds[j / 8] |= (static_cast<uint32_t>(r.kinds[j]) & 0xFu) << (4 * (j % 8));
+  for (int i = 0; i < w::Wire::kKindWords; ++i)
+    put<uint32_t>(rec + w::Wire::kRecKinds + 4 * i, kinds[i]);
   for (int j = 0; j < kLanes; ++j) {
     const bool lane = j < count;
     put<int16_t>(rec + w::Wire::kRecProtect + 2 * j, static_cast<int16_t>(lane ? experts[j] : -1));
