@@ -62,6 +62,14 @@ def test_the_loader_builds_once_per_content_and_reuses_the_library(tmp_path):
         getattr(library, name)
 
 
+def test_a_portable_build_uses_no_avx_registers(tmp_path):
+    # Toolchains may default past baseline x86-64 (RHEL 10's GCC defaults to x86-64-v3, which has AVX2): portable
+    # must still mean the scalar dot product.
+    library = _build_module().build(tmp_path / "libportable.so", cxx=CXX, native=False)
+    disassembly = subprocess.run(["objdump", "-d", str(library)], capture_output=True, text=True, check=True).stdout
+    assert "%ymm" not in disassembly and "%zmm" not in disassembly
+
+
 SANITIZERS = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
 
 
