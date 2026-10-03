@@ -1,4 +1,4 @@
-"""CPU tests of the pinned tier's NUMA placement: parsing, row split, capacity check, binding, manager wiring."""
+"""CPU tests of the pinned tier's NUMA placement: parsing, 2 MiB stripes, capacity check, binding, manager wiring."""
 
 import errno
 import os
@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.host_numa import (
     page_nodes,
     parse_placement,
     plan_bindings,
-    split_rows,
+    stripe_runs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.moe_expert_fakes import SpecOnlyFormat
@@ -45,25 +45,37 @@ class TestParsePlacement(unittest.TestCase):
                 parse_placement(value)
 
 
-class TestSplitRows(unittest.TestCase):
-    def test_runs_tile_the_rows_in_placement_order(self):
-        runs = split_rows(10, ((0, 65), (1, 35)))
-        self.assertEqual(runs, [(0, 0, 7), (1, 7, 3)])
+class TestStripeRuns(unittest.TestCase):
+    """The tier is bound in 2 MiB stripes, not in per-node blocks of rows: the CPU expert workers read every expert
+    from both nodes at once instead of reading 60% of experts wholly from the remote node (bench A/B on divix01,
+    2026-10-02: all remote +32-37%, 3:2 stripes -3% against all local)."""
 
-    def test_counts_sum_exactly_for_every_row_count(self):
-        placement = ((0, 3), (1, 3), (2, 1))
-        for rows in range(0, 50):
-            runs = split_rows(rows, placement)
-            self.assertEqual(sum(count for _, _, count in runs), rows)
-            starts = [start for _, start, _ in runs]
-            self.assertEqual(starts, sorted(starts))
+    def test_2mib_stripes_alternate_in_the_placements_proportion(self):
+        runs = stripe_runs(10 * HUGE_BYTES, ((0, 60 * MIB), (1, 40 * MIB)))
+        self.assertEqual([node for node, _, _ in runs], [0, 1, 0, 1, 0] * 2)
+        self.assertEqual(runs, [(node, i * HUGE_BYTES, HUGE_BYTES) for i, (node, _, _) in enumerate(runs)])
 
-    def test_largest_remainder_ties_go_to_the_earlier_node(self):
-        self.assertEqual(split_rows(1, ((0, 1), (1, 1))), [(0, 0, 1)])
-        self.assertEqual(split_rows(3, ((0, 1), (1, 1))), [(0, 0, 2), (1, 2, 1)])
+    def test_the_stripes_tile_the_span_and_the_last_one_ends_at_nbytes(self):
+        nbytes = 5 * HUGE_BYTES + 7
+        runs = stripe_runs(nbytes, ((0, 1), (1, 1)))
+        self.assertEqual([node for node, _, _ in runs], [0, 1, 0, 1, 0, 1])
+        self.assertEqual([start for _, start, _ in runs], [i * HUGE_BYTES for i in range(6)])
+        self.assertEqual(runs[-1], (1, 5 * HUGE_BYTES, 7))
 
-    def test_a_node_whose_share_rounds_to_nothing_gets_no_run(self):
-        self.assertEqual(split_rows(2, ((0, 99), (1, 1))), [(0, 0, 2)])
+    def test_every_prefix_keeps_each_node_within_one_stripe_of_its_share(self):
+        for placement in (((0, 61440 * MIB), (1, 40960 * MIB)), ((0, 3), (1, 3), (2, 1)), ((1, 1), (0, 4))):
+            total = sum(nbytes for _, nbytes in placement)
+            runs = stripe_runs(200 * HUGE_BYTES, placement)
+            counts = dict.fromkeys((node for node, _ in placement), 0)
+            for stripes, (node, _, _) in enumerate(runs, 1):
+                counts[node] += 1
+                for other, nbytes in placement:
+                    with self.subTest(placement=placement, stripes=stripes, node=other):
+                        self.assertLessEqual(abs(counts[other] - stripes * nbytes / total), 1)
+
+    def test_a_single_node_takes_every_stripe_and_nothing_is_no_stripe(self):
+        self.assertEqual({node for node, _, _ in stripe_runs(3 * HUGE_BYTES + 1, ((1, 5),))}, {1})
+        self.assertEqual(stripe_runs(0, ((0, 1), (1, 1))), [])
 
 
 class TestCheckCapacity(unittest.TestCase):
@@ -96,6 +108,21 @@ class TestCheckCapacity(unittest.TestCase):
     def test_refuses_a_missing_node(self):
         with self.assertRaisesRegex(ValueError, "does not exist"):
             check_capacity(((7, MIB),), root=self._root({0: (1, 0, 0)}))
+
+
+def _row_runs(rows, share, row_bytes):
+    """Byte runs of ``rows`` rows split in ``share`` order by largest remainder: unaligned runs for plan_bindings."""
+    total = sum(weight for _, weight in share)
+    exact = [rows * weight / total for _, weight in share]
+    counts = [int(x) for x in exact]
+    for i in sorted(range(len(share)), key=lambda i: (counts[i] - exact[i], i))[: rows - sum(counts)]:
+        counts[i] += 1
+    runs, first = [], 0
+    for (node, _), count in zip(share, counts):
+        if count:
+            runs.append((node, first * row_bytes, (first + count) * row_bytes))
+            first += count
+    return runs
 
 
 class TestPlanBindings(unittest.TestCase):
@@ -133,7 +160,7 @@ class TestPlanBindings(unittest.TestCase):
         # chunk could not coalesce (final review, Important 1).
         row_bytes = 3_501_056
         for rows, share in ((460, ((0, 5), (1, 4))), (181, ((0, 60), (1, 40))), (182, ((1, 1), (0, 1))), (1, ((0, 1),))):
-            runs = [(node, first * row_bytes, (first + count) * row_bytes) for node, first, count in split_rows(rows, share)]
+            runs = _row_runs(rows, share, row_bytes)
             nbytes = rows * row_bytes
             with self.subTest(rows=rows, share=share):
                 self.assertNotEqual(nbytes % HUGE_BYTES, 0)
@@ -155,7 +182,7 @@ class TestPlanBindings(unittest.TestCase):
 
     def test_unaligned_row_runs_change_node_on_a_2mib_boundary(self):
         rows, row_bytes = 40, 3_501_056  # dsv41-sized rows: the ideal boundary is not 2 MiB aligned
-        runs = [(node, first * row_bytes, (first + count) * row_bytes) for node, first, count in split_rows(rows, ((0, 60), (1, 40)))]
+        runs = _row_runs(rows, ((0, 60), (1, 40)), row_bytes)
         self.assertNotEqual(runs[1][1] % HUGE_BYTES, 0)
         bindings = plan_bindings(rows * row_bytes, runs)
         self._check_tiling(rows * row_bytes, bindings)
@@ -197,8 +224,7 @@ class TestPlanBindings(unittest.TestCase):
                 for _ in range(3):  # three layers' worth of slab joins
                     for row_bytes in rows_bytes:
                         offset = -(-offset // PAGE_BYTES) * PAGE_BYTES
-                        for node, first, count in split_rows(rows, share):
-                            runs.append((node, offset + first * row_bytes, offset + (first + count) * row_bytes))
+                        runs += [(node, offset + lo, offset + hi) for node, lo, hi in _row_runs(rows, share, row_bytes)]
                         offset += rows * row_bytes
                 with self.subTest(rows=rows, share=share):
                     bindings = plan_bindings(offset, runs)
@@ -316,7 +342,7 @@ class TestBinding(unittest.TestCase):
     @unittest.skipUnless(HAS_NODE1, "needs a second NUMA node")
     def test_the_policy_changes_node_exactly_at_each_2mib_boundary(self):
         rows, row_bytes = 40, 3_501_056
-        runs = split_rows(rows, ((0, 60), (1, 40)))
+        runs = [(0, 0, 24), (1, 24, 16)]
         slab = allocate_bound(rows * row_bytes, runs, row_bytes)
         base = slab.data_ptr()
         byte_runs = [(node, first * row_bytes, (first + count) * row_bytes) for node, first, count in runs]
@@ -331,7 +357,7 @@ class TestBinding(unittest.TestCase):
     @unittest.skipUnless(HAS_NODE1, "needs a second NUMA node")
     def test_the_tail_past_the_slab_is_bound_to_the_last_node_out_to_2mib(self):
         rows, row_bytes = 40, 3_501_056
-        runs = split_rows(rows, ((0, 60), (1, 40)))
+        runs = [(0, 0, 24), (1, 24, 16)]
         nbytes = rows * row_bytes
         slab = allocate_bound(nbytes, runs, row_bytes)
         base, end = slab.data_ptr(), -(-nbytes // HUGE_BYTES) * HUGE_BYTES
@@ -346,7 +372,7 @@ class TestBinding(unittest.TestCase):
     @unittest.skipUnless(HAS_NODE1, "needs a second NUMA node")
     def test_row_runs_land_on_their_nodes(self):
         rows, row_bytes = 20, MIB + 5 * PAGE_BYTES
-        runs = split_rows(rows, ((0, 3), (1, 1)))
+        runs = [(0, 0, 15), (1, 15, 5)]
         slab = allocate_bound(rows * row_bytes, runs, row_bytes)
         slab.fill_(1)
         (_, _, n0), (_, first1, _) = runs
@@ -362,6 +388,31 @@ class TestBinding(unittest.TestCase):
         self.assertEqual(slab._numa_bound_bytes, {0: HUGE_BYTES})  # 210 B of rows, bound out to the 2 MiB end
         slab.copy_(torch.arange(6 * 35, dtype=torch.int16).view(6, 5, 7))
         self.assertEqual(int(slab[5, 4, 6]), 6 * 35 - 1)
+
+    def test_allocate_host_slab_binds_its_rows_in_2mib_stripes(self):
+        rows, row_bytes, placement = 37, 700_000, ((0, 60 * MIB), (1, 40 * MIB))
+        calls = []
+        with patch.object(host_numa, "_mbind", side_effect=lambda a, n, node: calls.append((a, n, node))):
+            slab = allocate_host_slab(rows, (row_bytes,), torch.uint8, register=False, placement=placement)
+        base, nbytes = slab.data_ptr(), rows * row_bytes
+        stripes = -(-nbytes // HUGE_BYTES)
+        self.assertEqual(stripes, 13)
+        # One mbind per 2 MiB stripe (neighbours on one node merge), out to the 2 MiB end.
+        expected = [node for node, _, _ in stripe_runs(nbytes, placement)]
+        bound_nodes = [node for address, length, node in calls for _ in range(length // HUGE_BYTES)]
+        self.assertEqual(bound_nodes, expected)
+        self.assertEqual(calls[0][0], base)
+        self.assertEqual(calls[-1][0] + calls[-1][1], base + stripes * HUGE_BYTES)
+        self.assertEqual(slab._numa_bound_bytes, {0: 8 * HUGE_BYTES, 1: 5 * HUGE_BYTES})
+
+    @unittest.skipUnless(HAS_NODE1, "needs a second NUMA node")
+    def test_a_placed_slabs_policy_alternates_node_every_2mib(self):
+        rows, row_bytes, placement = 37, 700_000, ((0, 60 * MIB), (1, 40 * MIB))
+        slab = allocate_host_slab(rows, (row_bytes,), torch.uint8, register=False, placement=placement)
+        base = slab.data_ptr()
+        for node, start, _ in stripe_runs(rows * row_bytes, placement):
+            for address in (base + start, base + start + HUGE_BYTES - PAGE_BYTES):
+                self.assertEqual(address_policy(address), (MPOL_BIND, frozenset({node})), hex(start))
 
     def test_allocate_host_slab_without_a_placement_keeps_its_page_aligned_path(self):
         with patch.object(host_numa, "allocate_bound") as allocate:

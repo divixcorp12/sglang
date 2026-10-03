@@ -67,18 +67,18 @@ def test_arena_registers_and_releases_one_shared_span(monkeypatch: pytest.Monkey
     assert unregister.call_args.args[0] is owner
 
 
-def test_arena_preserves_each_slab_numa_row_distribution(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_arena_binds_its_whole_span_in_2mib_stripes(monkeypatch: pytest.MonkeyPatch) -> None:
     allocate = Mock(side_effect=lambda nbytes, runs, row_bytes: tier.allocate_host_slab(
         1, (nbytes,), torch.uint8, register=False
     ).view(-1))
     monkeypatch.setattr(host_numa, "allocate_bound", allocate)
+    huge = host_numa.HUGE_BYTES
     slabs = tier.allocate_host_slab_arena(
-        4, {"weights": ((4096,), torch.uint8), "scales": ((2048,), torch.uint8)},
+        4, {"weights": ((1 << 20,), torch.uint8), "scales": ((2048,), torch.uint8)},
         register=False, placement=((0, 1), (1, 1)),
     )
-    allocate.assert_called_once_with(
-        24576, [(0, 0, 8192), (1, 8192, 8192), (0, 16384, 4096), (1, 20480, 4096)], 1
-    )
+    # The stripes ignore the slab join at 4 MiB: each slab's rows are spread over both nodes 2 MiB at a time.
+    allocate.assert_called_once_with((4 << 20) + 8192, [(0, 0, huge), (1, huge, huge), (0, 2 * huge, 8192)], 1)
     assert slabs["weights"]._expert_stream_slab_arena is slabs["scales"]._expert_stream_slab_arena
 
 
@@ -123,15 +123,12 @@ def test_cache_rejects_invalid_arena_option(monkeypatch: pytest.MonkeyPatch, val
         ExpertPinnedHostCache(streamer, 2, device="cpu")
 
 
-def _arena_runs(rows, row_bytes_by_slab, placement):
-    """The byte runs allocate_host_slab_arena asks for: each page-aligned slab's rows split in placement order."""
-    runs, offset = [], 0
+def _arena_bytes(rows, row_bytes_by_slab):
+    """The arena's byte count: each slab's rows at the next page-aligned offset."""
+    offset = 0
     for row_bytes in row_bytes_by_slab:
-        offset = -(-offset // tier.PAGE_BYTES) * tier.PAGE_BYTES
-        for node, first, count in host_numa.split_rows(rows, placement):
-            runs.append((node, offset + first * row_bytes, offset + (first + count) * row_bytes))
-        offset += rows * row_bytes
-    return offset, runs
+        offset = -(-offset // tier.PAGE_BYTES) * tier.PAGE_BYTES + rows * row_bytes
+    return offset
 
 
 def _totals(ranges):
@@ -141,30 +138,18 @@ def _totals(ranges):
     return totals
 
 
-def test_many_slab_arena_binds_on_2mib_boundaries_within_2mib_per_node(monkeypatch: pytest.MonkeyPatch) -> None:
-    # 24 named slabs of 12 rows x 700,000 B, 60/40: every slab join and every in-slab split is a node change.
-    # Rounding each change to its nearest 2 MiB independently drifts node 0 by 16 MiB here; the carried error must not.
+def test_many_slab_arena_binds_in_2mib_stripes_within_2mib_per_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 24 named slabs of 12 rows x 700,000 B, 60/40.
     rows, row_bytes, count, placement = 12, 700_000, 24, ((0, 60), (1, 40))
-    nbytes, runs = _arena_runs(rows, [row_bytes] * count, placement)
-    asked = _totals(runs)
-    span = -(-nbytes // tier.PAGE_BYTES) * tier.PAGE_BYTES
-    merged = [list(runs[0])]
-    for node, lo, hi in runs[1:]:
-        if merged[-1][0] == node:
-            merged[-1][2] = hi
-        else:
-            merged.append([node, lo, hi])
-    cuts = [0] + [(lo + host_numa.HUGE_BYTES // 2) // host_numa.HUGE_BYTES * host_numa.HUGE_BYTES for _, lo, _ in merged[1:]]
-    naive = _totals([(node, cuts[i], (cuts + [span])[i + 1]) for i, (node, _, _) in enumerate(merged)])
-    assert abs(naive[0] - asked[0]) > 2 * host_numa.HUGE_BYTES
-
+    nbytes = _arena_bytes(rows, [row_bytes] * count)
+    huge = host_numa.HUGE_BYTES
     calls = []
     monkeypatch.setattr(host_numa, "_mbind", lambda address, length, node: calls.append((address, length, node)))
     specs = {f"slab{i}": ((row_bytes,), torch.uint8) for i in range(count)}
     slabs = tier.allocate_host_slab_arena(rows, specs, register=False, placement=placement)
     owner = slabs["slab0"]._expert_stream_slab_arena
     base = owner.data_ptr()
-    assert base % host_numa.HUGE_BYTES == 0
+    assert base % huge == 0
     assert owner.nbytes == nbytes
     # The layout is unchanged: page-aligned offsets from the owner, the same shapes.
     offset = 0
@@ -172,17 +157,18 @@ def test_many_slab_arena_binds_on_2mib_boundaries_within_2mib_per_node(monkeypat
         offset = -(-offset // tier.PAGE_BYTES) * tier.PAGE_BYTES
         assert slab.data_ptr() - base == offset and slab.shape == (rows, row_bytes)
         offset += rows * row_bytes
-    # The mbind ranges tile the arena out to its 2 MiB end, change node only on 2 MiB boundaries, and keep each
-    # total (the untouched tail past the arena counts as bound to the last node).
-    end = -(-nbytes // host_numa.HUGE_BYTES) * host_numa.HUGE_BYTES
-    assert span != end and calls[0][0] == base and calls[-1][0] + calls[-1][1] == base + end
+    # The mbind ranges tile the arena out to its 2 MiB end and follow the stripes one 2 MiB piece at a time.
+    end = -(-nbytes // huge) * huge
+    assert calls[0][0] == base and calls[-1][0] + calls[-1][1] == base + end
     for (address, length, node), (following_address, _, following) in zip(calls, calls[1:]):
         assert address + length == following_address and node != following
-        assert (following_address - base) % host_numa.HUGE_BYTES == 0
+        assert (following_address - base) % huge == 0
+    pieces = [node for _, length, node in calls for _ in range(length // huge)]
+    assert pieces == [node for node, _, _ in host_numa.stripe_runs(nbytes, placement)]
     bound = _totals([(node, address, address + length) for address, length, node in calls])
     assert owner._numa_bound_bytes == bound
-    for node in asked:
-        assert abs(bound[node] - asked[node]) <= host_numa.HUGE_BYTES, (node, bound, asked)
+    for node, share in placement:
+        assert abs(bound[node] - end * share / 100) <= huge, (node, bound)
 
 
 def test_arena_with_a_single_node_binds_its_whole_span_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -205,8 +191,8 @@ def test_zero_row_arena_with_a_placement_binds_nothing(monkeypatch: pytest.Monke
 
 
 @pytest.mark.skipif(not os.path.exists("/sys/devices/system/node/node1"), reason="needs a second NUMA node")
-def test_arena_slab_joins_change_node_on_2mib_boundaries_of_the_real_policy() -> None:
-    # The dsv41 EXL3 slabs' rows, 37 rows, 60/40: the real mbind policy flips exactly at each planned boundary.
+def test_arena_real_policy_alternates_node_every_2mib() -> None:
+    # The dsv41 EXL3 slabs' rows, 37 rows, 60/40: the real mbind policy follows the stripes across every slab join.
     rows_bytes = (8_847_360, 20_480, 9_216, 4_423_680, 4_608, 10_240)
     names = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
     placement = ((0, 60), (1, 40))
@@ -218,15 +204,12 @@ def test_arena_slab_joins_change_node_on_2mib_boundaries_of_the_real_policy() ->
     except OSError as error:
         pytest.skip(f"mbind not permitted: {error}")
     owner = slabs["w13_trellis"]._expert_stream_slab_arena
-    base = owner.data_ptr()
-    nbytes, runs = _arena_runs(37, rows_bytes, placement)
-    bindings = host_numa.plan_bindings(nbytes, runs)
-    assert len(bindings) > 1 and base % host_numa.HUGE_BYTES == 0
-    for (node, _, end), (following, _, _) in zip(bindings, bindings[1:]):
-        assert end % host_numa.HUGE_BYTES == 0
-        assert host_numa.address_policy(base + end - tier.PAGE_BYTES) == (2, frozenset({node}))
-        assert host_numa.address_policy(base + end) == (2, frozenset({following}))
-    assert owner._numa_bound_bytes == _totals(bindings)
-    end = bindings[-1][2]
-    assert end % host_numa.HUGE_BYTES == 0 and end >= nbytes
-    assert host_numa.address_policy(base + end - tier.PAGE_BYTES) == (2, frozenset({bindings[-1][0]}))
+    base, huge = owner.data_ptr(), host_numa.HUGE_BYTES
+    stripes = host_numa.stripe_runs(_arena_bytes(37, rows_bytes), placement)
+    assert len(stripes) > 100 and base % huge == 0
+    for node, start, _ in stripes:
+        for address in (base + start, base + start + huge - tier.PAGE_BYTES):
+            assert host_numa.address_policy(address) == (2, frozenset({node})), hex(start)
+    end = stripes[-1][1] + huge
+    assert owner._numa_bound_bytes == _totals([(node, start, start + huge) for node, start, _ in stripes])
+    assert host_numa.address_policy(base + end)[0] == 0  # the slack past the 2 MiB end is not bound
