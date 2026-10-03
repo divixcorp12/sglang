@@ -237,6 +237,10 @@ def allocate_bound(nbytes: int, runs: Sequence[tuple[int, int, int]], row_bytes:
     mapping = mmap.mmap(
         -1, -(-nbytes // HUGE_BYTES) * HUGE_BYTES + HUGE_BYTES, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
     )
+    if hasattr(mmap, "MADV_HUGEPAGE"):
+        # THP "always" with defrag=madvise only gives a fault a huge page that is free without compaction; a madvised
+        # mapping compacts for one. The CPU expert kernel touches a new 4 KiB page on nearly every weight load.
+        mapping.madvise(mmap.MADV_HUGEPAGE)
     whole = torch.frombuffer(mapping, dtype=torch.uint8)
     offset = -whole.data_ptr() % HUGE_BYTES
     tensor = whole[offset : offset + nbytes]  # holds the mapping alive
