@@ -141,6 +141,33 @@ unchanged; ms/token does not regress against the single-group runtime.
   `CpuExpertEngine` runs its own team on its own cores. `cpu_experts_cabi.h` and its bench
   callers change with it; the NVFP4 kernel, which mirrors the same ABI, follows.
 
+### Part 4: CPU experts for Qwen through the lease backend
+
+Qwen3.8-Flash-Next (ModelOpt NVFP4 experts, top-k 10, 512 experts per layer, flashinfer_cutlass MoE) runs the
+zero-host gather today: `InGraphRowBackend` copies every routed expert from pinned RAM with SM loads over UVA
+(`expert_cache_transfer.cuh`), and every expert fits in RAM. The lease path is not a separate pipeline: it is another
+row backend in the same `ExpertStreamer._gather_graph`, sharing the route plan (`expert_route_plan.cuh`), the direct
+gather and commit (`expert_residency/direct_gather.cuh`), the residency updater, and the SM copy kernel itself (C1).
+So the copy kernels are not merged. Qwen gets CPU experts by running the lease backend in a full-resident mode:
+
+- **Backend choice.** With CPU experts off, Qwen keeps `InGraphRowBackend` (no host round trip). With them on, it
+  uses the lease backend, whose lanes are then only `HIT_SM` (C1, the same `.nc` UVA kernel), `HIT_COPY` and
+  `HIT_CPU`; no lane misses.
+- **Lane width.** top-k 10 needs N = 16, delivered by Part 1 (including `cpu_lanes` and every reader of it).
+- **NVFP4 row layout.** An `ExpertRowLayout` for Qwen's six streamed tensors (`w13_weight`, `w2_weight`,
+  `w13_blockscale_swizzled`, `w2_blockscale_swizzled`, `g1_alphas`, `g2_alphas`), built as a second entry of
+  `LAYOUTS` in `expert_stream_transport.py` (host and device), beside `"exl3"`.
+- **Full-resident tier.** The RAM tier registered over the existing all-expert pinned buffers with every expert
+  mapped at start, no NVMe reader, and no staging slots; a record that types a miss is a fail-stop.
+- **NVFP4 CPU trait.** A `CpuExpertQuantTrait` for NVFP4 in `cpu_experts/` (`cpu_trait_for` knows only `"exl3"`
+  today), loading the NVFP4 kernel (`nvfp4_cpu_ext.py`) through the shared C ABI; Qwen runs its `GenericShape` plan
+  until a measured Qwen shape is added to `shapes.hpp`.
+- **Output merge for flashinfer_cutlass.** The CPU's lanes are removed from the fused MoE's top-k (routed to the
+  dump slot with zero weight) and `cpu_out` (both parts) is added to the MoE output in fp32 after it. This is the one
+  format-specific piece; EXL3 keeps its route-tables seeding.
+
+Out of scope for Part 4: NVMe-backed Qwen (a partial tier), and retiring `InGraphRowBackend`.
+
 ### Errors
 
 - Any group's fail-stop stops the whole service, as one fail-stop does today.
@@ -159,6 +186,9 @@ must pass unchanged. This is the degenerate case of the design, not a flag.
    probe test. Gate: byte-identical v2 offsets at N = 8 and the existing lease, RAM-miss and full-stack tests green.
 2. **NUMA groups.** `ThreadingConfig`, per-engine CPU cores, per-node staging and split on the device, the groups,
    the dispatch filter and the combiner.
+3. **Qwen CPU experts** (Part 4), after phase 1; independent of phase 2. Gate: Qwen with CPU experts matches the
+   GPU-only output within the CPU kernel's tolerance, and Qwen with them off is unchanged (same backend, same
+   ms/token).
 
 ## Testing
 
