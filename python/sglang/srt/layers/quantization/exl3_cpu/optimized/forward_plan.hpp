@@ -126,14 +126,7 @@ private:
     template <class Experts>
     static void run_team(ForwardCtx& ctx, const Experts& E, int count, bool grouped, bool wide)
     {
-        // Freeze the configured cores once. Steady-state forwards acquire no pool mutex.
-        if (!g_compute_started.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lock(g_cores_mutex);
-            if (!g_compute_started.load(std::memory_order_relaxed)) {
-                g_compute_cores = g_configured_cores;
-                g_compute_started.store(true, std::memory_order_release);
-            }
-        }
+        freeze_compute_cores();
         TORCH_CHECK(g_compute_cores.empty() || size_t(count)<=g_compute_cores.size(),
                     "CPU expert worker count exceeds configured cores");
         const bool prof=g_prof_enabled.load(std::memory_order_relaxed);
@@ -144,16 +137,7 @@ private:
         {
             const int worker=omp_get_thread_num(),n=omp_get_num_threads();
             if(worker==0)actual_workers.store(n,std::memory_order_relaxed);
-            if(!g_compute_cores.empty()) {
-                const int core=g_compute_cores[worker];
-                static thread_local int pinned_core=-1;
-                if(pinned_core!=core || sched_getcpu()!=core) {
-                    cpu_set_t set;CPU_ZERO(&set);CPU_SET(core,&set);
-                    if(pthread_setaffinity_np(pthread_self(),sizeof(set),&set))
-                        pin_error.store(1,std::memory_order_relaxed);
-                    else pinned_core=core;
-                }
-            }
+            pin_compute_worker(worker,pin_error);
             if(n==count) {
                 step<Phase::PrepareGateUp>(ctx,E,worker,n,grouped,wide,prof,phase_us);
                 step<Phase::GateUp>(ctx,E,worker,n,grouped,wide,prof,phase_us);

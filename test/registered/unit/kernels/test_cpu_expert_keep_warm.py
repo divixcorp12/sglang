@@ -3,8 +3,8 @@
 For ``keep_warm_us`` after its last job, an idle CPU expert thread hands its workers to the format's keep-warm
 function instead of spinning on ``pause``, so the next job finds the cores at the AVX-512 license rather than paying
 the ramp back (about 50 us per call on SKX after a 1 ms gap). The forward and the keep-warm are the instr build's
-native fakes; the fake keep-warm counts its calls and spins until its word moves or its deadline passes. Jobs come
-from the startup calibration, which submits them through the live engine.
+native fakes; the fake keep-warm counts its calls (from 0 at each test_keep_warm_address) and spins until its word
+moves or its deadline passes. Jobs come from the startup calibration, which submits them through the live engine.
 """
 
 import os
@@ -22,7 +22,7 @@ ROW, ROWS, DST_ROWS, HIDDEN, LANES = 1, 2, 6, 8, 8
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
-def _host(tmp_path, keep_warm_us):
+def _host(tmp_path, request, keep_warm_us):
     s = ram_miss_setup(tmp_path, capacity=12, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     host = attached_host(s, new_page(pin=False), k=3)
     host.enable_copy_engine(-1, spin_us=200)
@@ -47,6 +47,7 @@ def _host(tmp_path, keep_warm_us):
         keep_warm_us=keep_warm_us,
     )
     host.set_cpu_layer(ROW, 7)
+    request.addfinalizer(host.stop)  # the fake's call count is per process: no engine may outlive its test
     return s, host, (dst, x_rows, out_rows)
 
 
@@ -56,22 +57,22 @@ def _run_jobs(host):
     return host.calibrate_cpu_split(ROW, device=-1, reps=0, scratch=scratch)
 
 
-def test_keep_warm_waits_for_the_first_job(tmp_path):
-    _, host, _keep = _host(tmp_path, keep_warm_us=500_000)
+def test_keep_warm_waits_for_the_first_job(tmp_path, request):
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000)
     time.sleep(0.05)
     assert host.test_keep_warm_calls() == 0
 
 
-def test_an_idle_engine_keeps_warm_after_a_job(tmp_path):
-    _, host, _keep = _host(tmp_path, keep_warm_us=500_000)
+def test_an_idle_engine_keeps_warm_after_a_job(tmp_path, request):
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000)
     _run_jobs(host)
     time.sleep(0.02)
     assert host.test_keep_warm_calls() >= 1
 
 
-def test_a_job_ends_the_keep_warm_at_once(tmp_path):
+def test_a_job_ends_the_keep_warm_at_once(tmp_path, request):
     # A 2 s window: a keep-warm that ran on to its deadline would hold each job for up to 2 s.
-    _, host, _keep = _host(tmp_path, keep_warm_us=2_000_000)
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=2_000_000)
     _run_jobs(host)
     time.sleep(0.02)
     calls = host.test_keep_warm_calls()
@@ -82,8 +83,8 @@ def test_a_job_ends_the_keep_warm_at_once(tmp_path):
         assert grid[0, k] < k * FORWARD_NS / 1e6 + 5, (k, grid[0].tolist())
 
 
-def test_keep_warm_stops_after_its_window(tmp_path):
-    _, host, _keep = _host(tmp_path, keep_warm_us=20_000)
+def test_keep_warm_stops_after_its_window(tmp_path, request):
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=20_000)
     _run_jobs(host)
     time.sleep(0.1)
     calls = host.test_keep_warm_calls()
@@ -92,8 +93,8 @@ def test_keep_warm_stops_after_its_window(tmp_path):
     assert host.test_keep_warm_calls() == calls
 
 
-def test_stop_ends_a_running_keep_warm(tmp_path):
-    _, host, _keep = _host(tmp_path, keep_warm_us=60_000_000)
+def test_stop_ends_a_running_keep_warm(tmp_path, request):
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=60_000_000)
     _run_jobs(host)
     time.sleep(0.02)
     assert host.test_keep_warm_calls() >= 1

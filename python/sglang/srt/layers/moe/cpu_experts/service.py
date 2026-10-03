@@ -129,6 +129,7 @@ class CpuExpertService:
             )
         self.handles: dict[int, object] = {}
         self._cores_set = False
+        keep_warm_us = envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get()
         host.enable_cpu_experts(
             trait.native_forward(),
             self.split,
@@ -136,6 +137,8 @@ class CpuExpertService:
             self.x_rows,
             self.out_rows,
             threads=self.threads,
+            keep_warm=trait.native_keep_warm() if keep_warm_us > 0 else 0,
+            keep_warm_us=max(keep_warm_us, 0),
         )
         self._last_stats = host.cpu_stats()
         logger.info(

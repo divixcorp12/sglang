@@ -5,6 +5,7 @@
 // into its fused MoE.
 //
 //   CpuExpertForward   the format's kernel, as a C ABI
+//   CpuExpertKeepWarm  the format's idle loop, as a C ABI
 //   CpuJob             one forward: up to kLeaseLanes lanes of one row, writing one output part
 //   CpuExpertConfig    the pinned input/output tables, the thread count and the cores
 //   CpuExpertEngine    the thread, its job ring and its done word
@@ -36,6 +37,9 @@
 
 namespace sglang::expert_stream {
 
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
+              "the keep-warm reads kick_ as a plain uint32_t");
+
 // A format's CPU expert kernel as a C ABI: the native half of CpuExpertQuantTrait
 // (python/sglang/srt/layers/moe/cpu_experts/pool.py).
 //
@@ -52,6 +56,12 @@ using CpuExpertForward = int (*)(
     float* out,
     int32_t threads,
     int32_t accumulate);
+
+// A format's keep-warm, as a C ABI: runs register-only work of the kernel's vector width on `threads` workers, the
+// calling thread counted as one, until *word != seen or CLOCK_MONOTONIC reaches deadline_ns, so the cores keep the
+// kernel's frequency license through an idle gap instead of ramping back on the next job. Returns 0 on success.
+// Called from the CPU expert thread only, between forwards.
+using CpuExpertKeepWarm = int (*)(int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns);
 
 // One forward over up to kLeaseLanes lanes of one row.
 //
@@ -81,6 +91,8 @@ struct CpuExpertConfig {
   int threads = 1;
   std::vector<int> cores;  // worker 0 uses the first CPU; the kernel pins each helper to its assigned CPU
   int64_t spin_ns = 50'000'000;
+  CpuExpertKeepWarm keep_warm = nullptr;  // run while idle for keep_warm_ns after each job; nullptr or 0 ns: off
+  int64_t keep_warm_ns = 0;
 };
 
 // The CPU expert thread, its job ring and its done word.
@@ -89,7 +101,8 @@ struct CpuExpertConfig {
 // increases, so done(seq) is a single compare. The owner claims sequences with claim() and submits jobs with submit();
 // any thread may read done(). The idle protocol is the copy engine's (copy_engine.h): spin for spin_ns, then a futex
 // sleep whose wake the submitter makes only when this thread has gone to sleep (a Dekker pair of seq_cst fences
-// between submit() and sleep_until_submit()).
+// between submit() and sleep_until_submit()). With a keep-warm, the thread first hands its workers to it for
+// keep_warm_ns after each job; every submit and stop() bumps kick_, which ends it.
 //
 // The done_ store is a release after the job's output rows are written, and done() is an acquire: a CopyDone published
 // after observing a job done orders the output before the device's read of it.
@@ -167,6 +180,7 @@ class CpuExpertEngine {
   // kRing's bound rules out: the caller fails stop.
   bool submit(const CpuJob& job) {
     if (!jobs_.push(job)) return false;
+    kick_.fetch_add(1, std::memory_order_release);
     std::atomic_thread_fence(std::memory_order_seq_cst);  // Dekker with run()'s sleeping_ store and ring re-check
     if (sleeping_.load(std::memory_order_relaxed)) {
       wake_.fetch_add(1, std::memory_order_relaxed);
@@ -195,6 +209,7 @@ class CpuExpertEngine {
   void stop() {
     if (!thread_.joinable()) return;
     stop_.store(true, std::memory_order_release);
+    kick_.fetch_add(1, std::memory_order_release);
     wake_.fetch_add(1, std::memory_order_release);
     futex_wake(&wake_);
     thread_.join();
@@ -219,9 +234,19 @@ class CpuExpertEngine {
     ready_cv_.notify_all();
     if (!error.empty()) return;
     uint64_t idle = 0;
+    const bool warm = config_.keep_warm != nullptr && config_.keep_warm_ns > 0;
+    int64_t warm_until = 0;  // the keep-warm window after the last job; 0 before the first
     while (!stop_.load(std::memory_order_acquire)) {
+      // Read before the pop: a submit after an empty pop bumps kick_ past `kick` and so ends the keep-warm.
+      const uint32_t kick = kick_.load(std::memory_order_acquire);
       CpuJob job;
       if (!jobs_.pop(&job)) {
+        if (warm && now_ns() < warm_until) {
+          const int result = config_.keep_warm(
+              config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until);
+          if (result != 0) fail_stop(prefix_ + "CPU expert keep-warm failed (" + std::to_string(result) + ")");
+          continue;
+        }
         if (++idle < spin_iters_) {
           _mm_pause();
         } else {
@@ -250,6 +275,7 @@ class CpuExpertEngine {
       jobs_done_.fetch_add(1, std::memory_order_relaxed);
       lanes_done_.fetch_add(job.k, std::memory_order_relaxed);
       done_.store(job.seq, std::memory_order_release);  // after the output rows: done() is an acquire
+      if (warm) warm_until = now_ns() + config_.keep_warm_ns;
     }
   }
 
@@ -275,6 +301,7 @@ class CpuExpertEngine {
   std::atomic<int64_t> compute_ns_{0};
   std::atomic<bool> sleeping_{false};
   std::atomic<uint32_t> wake_{0};
+  std::atomic<uint32_t> kick_{0};  // bumped by every submit and by stop(); the keep-warm returns once it moves
   std::atomic<bool> stop_{false};
   uint64_t spin_iters_ = 1;
   std::mutex start_mutex_;

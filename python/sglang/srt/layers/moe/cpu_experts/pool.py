@@ -74,6 +74,10 @@ class CpuExpertQuantTrait(Protocol):
         """The address of the kernel's ``CpuExpertForward`` C function."""
         ...
 
+    def native_keep_warm(self) -> int:
+        """The address of the kernel's ``CpuExpertKeepWarm`` C function."""
+        ...
+
     def native_set_cores(self, cores: Sequence[int]) -> None:
         """Place the kernel's workers on ``cores`` before its first forward.
 
