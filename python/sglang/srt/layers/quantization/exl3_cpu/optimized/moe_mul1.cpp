@@ -2155,7 +2155,9 @@ struct ForwardCtx
     float* tout_u;
     float* tout_d;       // chunks x m x H
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
-
+    // Down tiles finished per (chunk, 128-output block), when a plan splits the down GEMVs finer than a block: the
+    // worker that finishes a block's eighth tile applies its output transform.
+    int* down_tiles_done;
 };
 
 struct ForwardArena
@@ -2168,6 +2170,7 @@ struct ForwardArena
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
     std::vector<float> bq_g, bq_u, bq_d;
     std::vector<int32_t> bsum_g, bsum_u, bsum_d;
+    std::vector<int> down_tiles_done;
     // Moved into the call's ForwardCtx and back, so a forward allocates nothing once warm
     std::vector<std::vector<std::pair<int, float>>> per_expert;
     std::vector<Chunk> chunks;
@@ -2237,17 +2240,21 @@ __attribute__((noipa)) void transform_out(const MoeCpuMatrix& mat, float* tout, 
 // chunks together and L3 serves the repeats; the imbalance there is at most one GEMV in four.
 constexpr int FLAT_MAX_GEMVS_PER_WORKER = 4;
 
-template <typename Gemv>
+// Unit is the flat split's granularity in tiles: 8 (one 128-output group, which the swizzled kernels need) or, for
+// a plan whose kernels take any tile pair, 2 (finer balance: 36 gate/up groups over 16 workers leave the slowest
+// worker 3 groups against a mean of 2.25, where 144 pairs give every worker 9).
+template <int Unit = 8, typename Gemv>
 inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Gemv gemv)
 {
+    static_assert(Unit == 2 || Unit == 8);
     if (total > FLAT_MAX_GEMVS_PER_WORKER * num_workers)
     {
         for (int j = worker; j < total; j += num_workers) gemv(j, 0, tiles_n);
         return;
     }
-    const int64_t groups = static_cast<int64_t>(total) * (tiles_n / 8);
-    const int f0 = static_cast<int>(groups * worker / num_workers) * 8;
-    const int f1 = static_cast<int>(groups * (worker + 1) / num_workers) * 8;
+    const int64_t groups = static_cast<int64_t>(total) * (tiles_n / Unit);
+    const int f0 = static_cast<int>(groups * worker / num_workers) * Unit;
+    const int f1 = static_cast<int>(groups * (worker + 1) / num_workers) * Unit;
     for (int j = f0 / tiles_n; j * tiles_n < f1; ++j)
         gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
 }

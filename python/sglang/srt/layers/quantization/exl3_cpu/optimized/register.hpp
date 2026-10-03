@@ -110,12 +110,31 @@ M1_TARGET_BW void register_band(const MoeCpuMatrix& mat,const PreparedIn& in,flo
 
 #include "traversal.hpp"
 
+// Compact tile pairs [t0, t1) inside one 128-output group, t1 - t0 in {0, 2, 4, 6}: the same per-output arithmetic as
+// traversal_kblock, which takes whole groups.
+M1_TARGET_BW void compact_pairs(const MoeCpuMatrix& mat,const PreparedIn& in,float* tout,int t0,int t1) {
+    switch((t1-t0)/2) {
+        case 1:register_band<1,0,0,true>(mat,in,tout,t0);break;
+        case 2:register_band<2,0,0,true>(mat,in,tout,t0);break;
+        case 3:register_band<3,0,0,true>(mat,in,tout,t0);break;
+        default:break;
+    }
+}
+
 M1_TARGET_BW void register_tiles(const MoeCpuMatrix& mat,const PreparedIn& in,float* tout,int t0,int t1,bool grouped) {
     if(in.compact) {
-        // The prepared compact path is private to whole 128-output groups.
-        TORCH_CHECK(t0%8==0 && t1%8==0,"compact input requires whole output blocks");
-        if(!mat.swz)traversal_tiles(mat,in,tout,t0,t1,grouped);
-        else for(int t=t0;t<t1;t+=8)register_band<4,0,0,true>(mat,in,tout,t);
+        if(mat.swz) {
+            // The swizzled layout stores a 128-output group's eight tiles together.
+            TORCH_CHECK(t0%8==0 && t1%8==0,"compact swizzled input requires whole output blocks");
+            for(int t=t0;t<t1;t+=8)register_band<4,0,0,true>(mat,in,tout,t);
+            return;
+        }
+        // Unswizzled: whole groups through the traversal, a partial group at either end as tile pairs.
+        TORCH_CHECK(t0%2==0 && t1%2==0,"compact input requires whole tile pairs");
+        const int a0=std::min(t1,(t0+7)/8*8), a1=std::max(a0,t1/8*8);
+        compact_pairs(mat,in,tout,t0,a0);
+        if(a1>a0)traversal_tiles(mat,in,tout,a0,a1,grouped);
+        compact_pairs(mat,in,tout,a1,t1);
         return;
     }
     for(int n0=t0;n0<t1;) {
