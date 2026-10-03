@@ -62,14 +62,28 @@ def test_the_loader_builds_once_per_content_and_reuses_the_library(tmp_path):
         getattr(library, name)
 
 
+SANITIZERS = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
+
+
+def _links_sanitizers(tmp_path) -> bool:
+    source = tmp_path / "probe.cpp"
+    source.write_text("int main() { return 0; }\n")
+    probe = subprocess.run([CXX, *SANITIZERS, str(source), "-o", str(tmp_path / "probe")], capture_output=True)
+    return probe.returncode == 0
+
+
 @pytest.mark.parametrize(
     "harness, flags",
     [
-        ("nvfp4_cpu_sanitizer.cpp", ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]),
+        ("nvfp4_cpu_sanitizer.cpp", []),
+        ("nvfp4_cpu_sanitizer.cpp", SANITIZERS),
         ("nvfp4_cpu_ggml_check.cpp", []),
     ],
+    ids=["sanitizer-harness", "sanitizer-harness-asan-ubsan", "ggml-check"],
 )
 def test_the_native_harness_passes(tmp_path, harness, flags):
+    if flags and not _links_sanitizers(tmp_path):
+        pytest.skip(f"{CXX} cannot link ASan/UBSan (its sanitizer runtimes are not installed)")
     exe = _build_module().build(
         tmp_path / Path(harness).stem, cxx=CXX, main=REPO / "test/registered/unit/kernels" / harness, extra_flags=flags
     )
