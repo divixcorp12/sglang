@@ -23,22 +23,36 @@
 
 namespace {
 #include "dot_nvfp4.h"
+#include "experts.hpp"
+#include "shapes.hpp"
+
+LayerInfo info_of(const SglangNvfp4CpuLayer& d)
+{
+    return {d.capacity, d.hidden, d.intermediate, d.w13_layout, d.act_limit, d.inv_input_scale13,
+            d.inv_input_scale2, d.slabs[kUpAlpha] != nullptr};
+}
+
+StridedExperts<GenericShape> strided_of(const SglangNvfp4CpuLayer& d)
+{
+    StridedExperts<GenericShape> e{};
+    for (int i = 0; i < kSlabNames; ++i) {
+        e.base[i] = static_cast<const uint8_t*>(d.slabs[i]);
+        e.stride[i] = d.slot_bytes[i];
+    }
+    return e;
+}
+
 struct Layer {
-    SglangNvfp4CpuLayer d;
+    LayerInfo info;
+    StridedExperts<GenericShape> strided;
     // Activations only. Sized once; mutable slab contents are read each job.
     std::vector<float> x, intermediate, result;
     std::vector<block_q8_0> qx, qi;
     std::vector<std::vector<block_nvfp4>> row_scratch;
-    explicit Layer(const SglangNvfp4CpuLayer& desc) : d(desc), x(d.hidden),
+    explicit Layer(const SglangNvfp4CpuLayer& d) : info(info_of(d)), strided(strided_of(d)), x(d.hidden),
         intermediate(d.intermediate), result(d.hidden),
         qx(rounded(d.hidden,64)/32), qi(rounded(d.intermediate,64)/32) {
         x.resize(rounded(d.hidden,64)); intermediate.resize(rounded(d.intermediate,64));
-    }
-    const uint8_t* slab(int i, int slot) const {
-        return static_cast<const uint8_t*>(d.slabs[i]) + size_t(slot) * d.slot_bytes[i];
-    }
-    float alpha(int i, int slot) const {
-        float v; std::memcpy(&v, slab(i, slot), sizeof(v)); return v;
     }
 };
 std::mutex registry_mutex;
@@ -179,29 +193,33 @@ bool quantize(const std::vector<float>& input, std::vector<block_q8_0>& output) 
     }
     return true;
 }
+// Gate/up output of the gated SiLU: optional pre-SiLU clamp (gate from above, up both ways), stable SiLU including
+// large negative gates, times up.
+inline float swiglu(float g, float u, float limit)
+{
+    if (limit > 0) { g = std::min(g, limit); u = std::clamp(u, -limit, limit); }
+    const float silu = g >= 0 ? g / (1 + std::exp(-g)) : g * std::exp(g) / (1 + std::exp(g));
+    return silu * u;
+}
 struct Work { Layer* layer; int slot; float route; int stage; };
 void calculate(void* p, int rank, int n) {
-    auto& c = *static_cast<Work*>(p); auto& l = *c.layer; auto& d = l.d;
+    auto& c = *static_cast<Work*>(p); auto& l = *c.layer; const LayerInfo& d = l.info;
     if (c.stage == 0) {
-        const auto w = l.slab(0, c.slot), sf = l.slab(2, c.slot);
-        const float gate_alpha = l.alpha(4, c.slot) * d.inv_input_scale13;
-        const float up_alpha = l.alpha(d.slabs[6] ? 6 : 4, c.slot) * d.inv_input_scale13;
+        const Projection gate = l.strided.gate(c.slot), up = l.strided.up(c.slot);
+        const float gate_alpha = gate.alpha * d.inv_input_scale13;
+        const float up_alpha = up.alpha * d.inv_input_scale13;
         for (int i = rank; i < d.intermediate; i += n) {
-            int gate = i, up = i + d.intermediate;
-            if (d.w13_layout == 1) std::swap(gate, up);
-            if (d.w13_layout == 2) { up = (i / 64) * 128 + i % 64; gate = up + 64; }
-            float g = dot(w, sf, gate, d.hidden, l.qx.data(), l.row_scratch[rank].data()) * gate_alpha;
-            float u = dot(w, sf, up, d.hidden, l.qx.data(), l.row_scratch[rank].data()) * up_alpha;
-            if (d.act_limit > 0) { g = std::min(g, d.act_limit); u = std::clamp(u, -d.act_limit, d.act_limit); }
-            // Stable SiLU, including large negative gates.
-            const float silu = g >= 0 ? g / (1 + std::exp(-g)) : g * std::exp(g) / (1 + std::exp(g));
-            l.intermediate[i] = silu * u;
+            int gate_row, up_row;
+            w13_rows(d.w13_layout, d.intermediate, i, gate_row, up_row);
+            const float g = dot(gate.w, gate.sf, gate_row, d.hidden, l.qx.data(), l.row_scratch[rank].data()) * gate_alpha;
+            const float u = dot(up.w, up.sf, up_row, d.hidden, l.qx.data(), l.row_scratch[rank].data()) * up_alpha;
+            l.intermediate[i] = swiglu(g, u, d.act_limit);
         }
     } else {
-        const auto w = l.slab(1, c.slot), sf = l.slab(3, c.slot);
-        const float alpha = l.alpha(5, c.slot) * d.inv_input_scale2 * c.route;
+        const Projection down = l.strided.down(c.slot);
+        const float alpha = down.alpha * d.inv_input_scale2 * c.route;
         for (int i = rank; i < d.hidden; i += n)
-            l.result[i] += dot(w, sf, i, d.intermediate, l.qi.data(), l.row_scratch[rank].data()) * alpha;
+            l.result[i] += dot(down.w, down.sf, i, d.intermediate, l.qi.data(), l.row_scratch[rank].data()) * alpha;
     }
 }
 bool valid(const SglangNvfp4CpuLayer& d) {
@@ -212,13 +230,10 @@ bool valid(const SglangNvfp4CpuLayer& d) {
         || !std::isfinite(d.act_limit) || d.act_limit < 0
         || !std::isfinite(d.inv_input_scale13) || d.inv_input_scale13 <= 0
         || !std::isfinite(d.inv_input_scale2) || d.inv_input_scale2 <= 0) return false;
-    const uint64_t minimum[7] = {uint64_t(d.intermediate) * d.hidden,
-        uint64_t(d.hidden) * d.intermediate / 2,
-        rounded(2 * d.intermediate, 128) * rounded(d.hidden / 16, 4),
-        rounded(d.hidden, 128) * rounded(d.intermediate / 16, 4), 4, 4, 4};
-    for (int i = 0; i < 7; ++i) {
-        if (i == 6 && !d.slabs[i]) continue;
-        if (!d.slabs[i] || d.slot_bytes[i] < minimum[i]
+    const SlabRowBytes minimum = SlabRowBytes::of(d.hidden, d.intermediate);
+    for (int i = 0; i < kSlabNames; ++i) {
+        if (i == kUpAlpha && !d.slabs[i]) continue;
+        if (!d.slabs[i] || d.slot_bytes[i] < minimum.bytes[i]
             || d.slot_bytes[i] > SIZE_MAX / uint64_t(d.capacity)) return false;
     }
     return true;
@@ -256,18 +271,20 @@ extern "C" int sglang_nvfp4_cpu_experts_forward(int64_t h, const void* x,
         std::unique_lock<std::mutex> lock(workers.forward_mutex, std::try_to_lock);
         if (!lock.owns_lock()) return 3;
         auto l = lookup(h); if (!l) return 2;
+        const auto& E = l->strided;
         for (int j = 0; j < k; ++j) {
-            if (slots[j] < -1 || slots[j] >= l->d.capacity || !std::isfinite(weights[j])) return 2;
-            if (slots[j] >= 0 && (!std::isfinite(l->alpha(4, slots[j])) || !std::isfinite(l->alpha(5, slots[j]))
-                || (l->d.slabs[6] && !std::isfinite(l->alpha(6, slots[j]))))) return 2;
+            if (slots[j] < -1 || slots[j] >= l->info.capacity || !std::isfinite(weights[j])) return 2;
+            if (slots[j] >= 0 && (!std::isfinite(E.alpha(kGateAlpha, slots[j]))
+                || !std::isfinite(E.alpha(kDownAlpha, slots[j]))
+                || (l->info.up_alpha && !std::isfinite(E.alpha(kUpAlpha, slots[j]))))) return 2;
         }
         workers.initialize(threads);
-        for (int i = 0; i < l->d.hidden; ++i) {
+        for (int i = 0; i < l->info.hidden; ++i) {
             uint16_t v; std::memcpy(&v, static_cast<const uint8_t*>(x) + 2 * i, 2); l->x[i] = ggml_compute_fp16_to_fp32(v);
         }
         if (l->row_scratch.size()<size_t(threads)) {
             l->row_scratch.resize(threads);
-            for (auto& row:l->row_scratch) row.resize(rounded(std::max(l->d.hidden,l->d.intermediate),64)/64);
+            for (auto& row:l->row_scratch) row.resize(rounded(std::max(l->info.hidden,l->info.intermediate),64)/64);
         }
         if (!quantize(l->x,l->qx)) return 2;
         std::fill(l->result.begin(), l->result.end(), 0.f);
@@ -278,7 +295,7 @@ extern "C" int sglang_nvfp4_cpu_experts_forward(int64_t h, const void* x,
             if (!quantize(l->intermediate,l->qi)) return 2;
             c.stage = 1; workers.run(calculate, &c, threads);
         }
-        for (int i = 0; i < l->d.hidden; ++i) {
+        for (int i = 0; i < l->info.hidden; ++i) {
             if (accumulate) out[i] += l->result[i]; else out[i] = l->result[i];
         }
         return 0;
