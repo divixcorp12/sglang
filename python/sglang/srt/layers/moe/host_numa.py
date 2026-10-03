@@ -1,16 +1,21 @@
 """NUMA placement for the pinned host expert tier.
 
-A placement is an ordered list of (node, bytes). Each slab is one anonymous mapping, 2 MiB aligned, whose row
-ranges are bound (``mbind(MPOL_BIND)``) to the nodes in that order before any page is touched. The slab stays one
-contiguous range, so every reader that addresses a row as ``base + slot * row_bytes`` (the C++ RAM-miss service,
-io_uring fixed buffers, the copy kernels) is unaffected by where its pages live.
+A placement is an ordered list of (node, bytes). Each slab (or slab arena) is one anonymous mapping, 2 MiB aligned,
+bound (``mbind(MPOL_BIND)``) in 2 MiB stripes before any page is touched, the stripes dealt to the nodes in
+proportion to their bytes (``stripe_runs``). The slab stays one contiguous range, so every reader that addresses a
+row as ``base + slot * row_bytes`` (the C++ RAM-miss service, io_uring fixed buffers, the copy kernels) is
+unaffected by where its pages live.
 
-The rows are divided in proportion to the nodes' bytes, but the binding is not exact to the row: every place where
-the node changes is rounded to a 2 MiB boundary of the mapping (``plan_bindings``), so the rows around it lie partly
-or wholly on the neighbouring node. With two nodes each node's bound bytes stay within 2 MiB of what its rows asked
-for (with more nodes, within (nodes - 1) x 2 MiB), because each boundary is rounded in whichever direction keeps the
-running per-node error smallest, not independently. The last binding runs past the slab to the next 2 MiB boundary
-(bound to the last node, counted in its bound bytes, never touched), so the slab's last huge page is not split either.
+Why stripes, not a block of rows per node: the CPU expert workers all run on one node, and a row bound wholly to the
+other is read across the socket link. On divix01 the bench forward ran 32-37% slower with every expert remote than
+with every expert local, so binding 60% of the rows to node 0 made the average expert about 20% slower; 3:2 stripes
+ran 3% faster than all local, because every expert then streams from both nodes' memory at once (2026-10-02).
+
+``plan_bindings`` turns byte runs into ``mbind`` ranges: it merges neighbouring runs on one node and rounds every
+node change that is not on a 2 MiB boundary of the mapping (stripes always are) in whichever direction keeps the
+running per-node error smallest, so each node's bound bytes stay within 2 MiB of its ask with two nodes. The last
+binding runs past the slab to the next 2 MiB boundary (bound to the last node, counted in its bound bytes, never
+touched), so the slab's last huge page is not split either.
 
 Why 2 MiB: an ``mbind`` range splits the mapping's VMA at its ends, and a split that is not 2 MiB aligned leaves the
 huge page around it backed by 4 KiB pages. An io_uring registered buffer that mixes 4 KiB and 2 MiB folios does not
@@ -25,7 +30,6 @@ onto a nearly full node, where the allocation stalled in reclaim instead of fail
 from __future__ import annotations
 
 import ctypes
-import math
 import mmap
 import os
 import platform
@@ -104,23 +108,22 @@ def check_capacity(placement: Placement, *, headroom: int = NODE_HEADROOM_BYTES,
         raise ValueError("pinned host tier does not fit its NUMA placement: " + "; ".join(short))
 
 
-def split_rows(rows: int, placement: Placement) -> list[tuple[int, int, int]]:
-    """``rows`` as (node, first row, row count) runs in placement order, in proportion to each node's bytes.
+def stripe_runs(nbytes: int, placement: Placement) -> list[tuple[int, int, int]]:
+    """``[0, nbytes)`` as (node, start, length) runs of ``HUGE_BYTES``, the last cut at ``nbytes``, dealt to the nodes
+    in proportion to their bytes.
 
-    Largest remainder, ties to the earlier node, so the counts sum to ``rows`` exactly; a node whose share rounds to
-    no rows gets no run.
+    Each stripe goes to the node with the most credit (smooth weighted round robin, ties to the earlier node), so every
+    prefix of the span keeps each node within one stripe of its share: 60/40 deals 0, 1, 0, 1, 0 over and over.
     """
-    total = sum(nbytes for _, nbytes in placement)
-    exact = [rows * nbytes / total for _, nbytes in placement]
-    counts = [math.floor(x) for x in exact]
-    order = sorted(range(len(placement)), key=lambda i: (-(exact[i] - counts[i]), i))
-    for i in order[: rows - sum(counts)]:
-        counts[i] += 1
-    runs, start = [], 0
-    for (node, _), count in zip(placement, counts):
-        if count:
-            runs.append((node, start, count))
-            start += count
+    total = sum(weight for _, weight in placement)
+    credit = [0] * len(placement)
+    runs = []
+    for start in range(0, nbytes, HUGE_BYTES):
+        for i, (_, weight) in enumerate(placement):
+            credit[i] += weight
+        chosen = max(range(len(placement)), key=lambda i: (credit[i], -i))
+        credit[chosen] -= total
+        runs.append((placement[chosen][0], start, min(HUGE_BYTES, nbytes - start)))
     return runs
 
 

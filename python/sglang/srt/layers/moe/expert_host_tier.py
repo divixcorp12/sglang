@@ -290,18 +290,16 @@ def allocate_host_slab(
     Page alignment also lets io_uring fill it with ``O_DIRECT``.
 
     A non-empty ``placement`` (host_numa) maps the slab on its own, 2 MiB
-    aligned, and binds its rows to NUMA nodes in proportion before any page is
-    touched, with every node change on a 2 MiB boundary
-    (``host_numa.plan_bindings``). The slab then carries the bytes bound per
-    node as ``_numa_bound_bytes``.
+    aligned, and binds it to NUMA nodes in 2 MiB stripes dealt in proportion
+    (``host_numa.stripe_runs``) before any page is touched. The slab then
+    carries the bytes bound per node as ``_numa_bound_bytes``.
     """
     shape = (int(rows),) + tuple(int(dimension) for dimension in row_shape)
     nbytes = math.prod(shape) * dtype.itemsize
     if placement:
-        from sglang.srt.layers.moe.host_numa import allocate_bound, split_rows
+        from sglang.srt.layers.moe.host_numa import allocate_bound, stripe_runs
 
-        row_bytes = nbytes // shape[0] if shape[0] else 0
-        storage = allocate_bound(nbytes, split_rows(shape[0], placement), row_bytes)
+        storage = allocate_bound(nbytes, stripe_runs(nbytes, placement), 1)
         start = 0
     else:
         # Page-aligned only, not 2 MiB: the first and last huge pages of the slab can
@@ -333,10 +331,9 @@ def allocate_host_slab_arena(
 
     Each view retains its uint8 owner as ``_expert_stream_slab_arena``. The
     owner's pointer and byte count describe the whole span, including alignment
-    gaps. NUMA placement divides each named slab's rows as in the separate-slab
-    allocator, then binds the whole arena as one ``allocate_bound`` call, so
-    the node changes at slab joins also sit on 2 MiB boundaries and each node's
-    total is kept within 2 MiB across all of them (the owner's
+    gaps. NUMA placement stripes the whole arena 2 MiB at a time, across the
+    slab joins, as one ``allocate_bound`` call (``host_numa.stripe_runs``), so
+    each node's total stays within 2 MiB of its share (the owner's
     ``_numa_bound_bytes``). Registration is deliberately one span, even for
     large arenas.
     """
@@ -354,15 +351,9 @@ def allocate_host_slab_arena(
         layout[name] = (offset, size, shape, dtype)
         nbytes = offset + size
     if placement:
-        from sglang.srt.layers.moe.host_numa import allocate_bound, split_rows
+        from sglang.srt.layers.moe.host_numa import allocate_bound, stripe_runs
 
-        runs = [
-            (node, offset + first * (size // rows), count * (size // rows))
-            for offset, size, _, _ in layout.values()
-            if rows and size
-            for node, first, count in split_rows(rows, placement)
-        ]
-        arena = allocate_bound(nbytes, runs, 1)
+        arena = allocate_bound(nbytes, stripe_runs(nbytes, placement), 1)
     else:
         arena = allocate_host_slab(1, (nbytes,), torch.uint8, register=False).view(-1)
     slabs = {}
