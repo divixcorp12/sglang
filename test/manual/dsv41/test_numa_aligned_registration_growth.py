@@ -6,7 +6,7 @@ Task 9's R3 arm hung in ``register_resources``: ``allocate_bound`` split each sl
 boundaries, leaving 4 KiB pages among the THP folios, so every registered chunk spanning a split failed
 ``io_try_coalesce_buffer`` and ``headpage_already_acct`` walked every page of every earlier chunk (about +1.13 s per
 earlier GiB). This builds the tier the way production does (one ``allocate_host_slab_arena`` per layer, the dsv41
-EXL3 slabs and row sizes, rows split 5:4 across nodes 0 and 1 and bound by ``allocate_bound``), touches it, and
+EXL3 slabs and row sizes, bound 5:4 across nodes 0 and 1 in 2 MiB stripes by ``allocate_bound``), touches it, and
 registers every named slab with the production ``RegisteredBufferTable`` in row-aligned chunks of at most 1 GiB,
 one ``update_tag`` per chunk, timing each (the logic of Task 9's ``regtime.cpp`` harness, kept here).
 
@@ -186,6 +186,37 @@ def page_rounded_allocate_bound(nbytes, runs, row_bytes):
     return tensor
 
 
+def old_row_block_arena(rows, specs, placement):
+    """A pre-Task-10 arena, for the control: the production layout (page-aligned slabs in one mapping), each slab's
+    rows split into one block per node by largest remainder, bound by page_rounded_allocate_bound. Production now binds
+    in 2 MiB stripes, so the control builds the old row blocks itself instead of patching the allocator."""
+    from sglang.srt.layers.moe.host_numa import PAGE_BYTES
+
+    total = sum(nbytes for _, nbytes in placement)
+    exact = [rows * nbytes / total for _, nbytes in placement]
+    counts = [int(x) for x in exact]
+    for i in sorted(range(len(placement)), key=lambda i: (counts[i] - exact[i], i))[: rows - sum(counts)]:
+        counts[i] += 1
+    layout, runs, offset = {}, [], 0
+    for name, (row_shape, dtype) in specs.items():
+        offset = -(-offset // PAGE_BYTES) * PAGE_BYTES
+        row_bytes = math.prod(row_shape) * dtype.itemsize
+        layout[name] = (offset, rows * row_bytes, (rows, *row_shape), dtype)
+        first = 0
+        for (node, _), count in zip(placement, counts):
+            if count:
+                runs.append((node, offset + first * row_bytes, count * row_bytes))
+                first += count
+        offset += rows * row_bytes
+    owner = page_rounded_allocate_bound(offset, runs, 1)
+    slabs = {}
+    for name, (start, size, shape, dtype) in layout.items():
+        slab = owner[start : start + size].view(dtype).view(shape)
+        slab._expert_stream_slab_arena = owner
+        slabs[name] = slab
+    return slabs
+
+
 def old_tail_plan_bindings(plan_bindings):
     """plan_bindings with its last range ending at the page-rounded span, as before 46a514d746 (for the control)."""
     from sglang.srt.layers.moe import host_numa
@@ -235,14 +266,19 @@ def node_available_mib(node: int) -> int:
     return (memory["free"] + memory["reclaimable"]) >> 20
 
 
-def build_tier(total_bytes: int, placement, layers: int, separate: bool = False):
+def build_tier(total_bytes: int, placement, layers: int, separate: bool = False, old_alignment: bool = False):
     """One allocate_host_slab_arena per layer, rows spread as the manager does (differ by at most one); with
-    ``separate``, one allocate_host_slab per named slab per layer instead (SLAB_ARENA=0)."""
+    ``separate``, one allocate_host_slab per named slab per layer instead (SLAB_ARENA=0); with ``old_alignment``,
+    one old_row_block_arena per layer (the control)."""
     from sglang.srt.layers.moe.expert_host_tier import allocate_host_slab, allocate_host_slab_arena
 
     rows = total_bytes // ROW_BYTES
     specs = {name: ((row,), torch.uint8) for name, row in EXL3_ROWS}
     counts = [rows // layers + (layer < rows % layers) for layer in range(layers)]
+    if old_alignment:
+        if separate:
+            raise ValueError("the old-alignment control builds arenas only")
+        return [old_row_block_arena(count, specs, placement) for count in counts]
     if separate:
         return [
             {name: allocate_host_slab(count, (row,), torch.uint8, register=False, placement=placement)
@@ -304,13 +340,11 @@ def run(total_bytes: int, placement, layers: int, *, old_alignment=False, collap
               "separate_slabs": separate, "old_tail": old_tail}
     huge0, stat0 = anon_huge_kib(), vmstat()
     saved, saved_plan = host_numa.allocate_bound, host_numa.plan_bindings
-    if old_alignment:
-        host_numa.allocate_bound = page_rounded_allocate_bound
     if old_tail:
         host_numa.plan_bindings = old_tail_plan_bindings(saved_plan)
     try:
         t = time.monotonic()
-        tier = build_tier(total_bytes, placement, layers, separate=separate)
+        tier = build_tier(total_bytes, placement, layers, separate=separate, old_alignment=old_alignment)
         result["allocate_s"] = time.monotonic() - t
     finally:
         host_numa.allocate_bound, host_numa.plan_bindings = saved, saved_plan
