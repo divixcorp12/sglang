@@ -27,6 +27,12 @@ if(NOT EXL3_CXX11_ABI MATCHES "^[01]$")
 endif()
 add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=${EXL3_CXX11_ABI})
 
+set(EXPERT_STREAM_LANES 8 CACHE STRING "lanes per demand record (1..32)")
+if(NOT EXPERT_STREAM_LANES MATCHES "^[0-9]+$" OR EXPERT_STREAM_LANES LESS 1 OR EXPERT_STREAM_LANES GREATER 32)
+  message(FATAL_ERROR "EXPERT_STREAM_LANES must be 1..32")
+endif()
+add_compile_definitions(SGLANG_EXPERT_STREAM_LANES=${EXPERT_STREAM_LANES})
+
 option(EXL3_FETCH_BENCHMARK "Download pinned Google Benchmark when not installed" ON)
 find_package(benchmark 1.9 QUIET CONFIG)
 if(NOT benchmark_FOUND)
