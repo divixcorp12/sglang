@@ -5,12 +5,14 @@ executables with fixed worker teams, alternating backend order each round,
 Google Benchmark manual wall timing, fresh JSON/log files and environment
 records. No Python, PyTorch, CUDA or OpenMP is required.
 
-`nvfp4_cpu_baseline` uses the plugin's scalar dot-product path, compiled for
-the compiler's default CPU target. `nvfp4_cpu_optimized` compiles the same
-source with `-march=native`, selecting AVX2 on the x86 reference host. This
-compares the plugin's own scalar/native paths, not NVFP4 against EXL3. Both
-use the same persistent thread pool, weights, FP16 input, FP32 computation,
-routing coefficients and `CpuExpertForward` ABI.
+`nvfp4_cpu_baseline` converts each GPU-layout row into worker-local GGML
+scratch and calls the unchanged pinned `ggml_vec_dot_nvfp4_q8_0` kernel.
+`nvfp4_cpu_optimized` adapts that kernel to read the packed GPU weight bytes
+and 128x4-swizzled scales directly. Both compile with `-march=native` and
+use identical Q8_0 activation quantization, FP32 projections, SiLU, routing,
+thread pool and `CpuExpertForward` ABI. Baseline row conversion is timed;
+scratch allocation is performed during warmup. Neither retains a repacked
+weight cache. See [source provenance](../upstream/README.md).
 
 ## Build
 
@@ -76,22 +78,27 @@ included. W13 layout is `--w13-layout=0` (gate/up), `1` (up/gate), or `2`
 
 ## Timing and correctness
 
-Before timing, each layer/count is checked against an independent FP64
-decoded-weight reference. Scales are unswizzled by iterating the reshape/
-permute axes; the oracle does not call the production kernel. It uses full
-precision activations and ordinary SiLU, matching the CPU's W4A16 convention.
-The tolerance is `abs_error <= 1e-4 + 1e-4*abs(reference)`; non-finite data and
-outputs fail. This is not a GPU W4A4 reference.
+Before timing, each layer/count is checked against an independent decoded-
+weight reference that explicitly reconstructs Q8_0 quantization. Scale
+unswizzling iterates the reshape/permute axes; the oracle does not call the
+production dot product or quantizer. It shares only GGML's FP16 conversion.
+The tolerance is `abs_error <= 1e-4 + 1e-4*abs(reference)`; nonfinite data and
+outputs fail. The separate W4A16 reference keeps full-precision activations
+and reports Q8 approximation error; it is not a GPU W4A4 reference.
 
 Every measured workload repeats all layer comparisons before and after its
 timing loop. Warmup defaults to 128 calls. Actual helper/caller thread affinity
 is checked before and after the benchmark, not just configured optimistically.
 Reference decoding, registration, warmup, allocation and validation are all
 outside the measured interval. The measured call includes the plugin's worker
-wakeup, both expert matvec stages, SiLU and routed FP32 reduction.
+wakeup, Q8 activation quantization, both expert matvec stages, SiLU and
+routed FP32 reduction. Baseline row layout conversion is also included.
 
 JSON counters include p50/p95/p99 latency in microseconds, workers, experts,
-layers, packed weight/scale bytes per forward and `logical_weight_GBps`.
+layers, packed weight/scale bytes per forward, `logical_weight_GBps`,
+`q8_vs_fp16_nrmse` (worst layer relative RMS error), and
+`q8_vs_fp16_max_abs` (maximum absolute output error). These error counters
+are measurements, not model-quality acceptance thresholds.
 That rate is logical slab bytes divided by call time, **not measured DRAM
 bandwidth**. Cached weights can make it exceed actual memory bandwidth.
 The harness excludes the service job ring, pinned UVA handoff, PCIe/NVMe
@@ -142,3 +149,22 @@ The setup is exercised with small synthetic cases, fixture write/read round
 trips, multiple worker counts, reversed round order, layout variants and invalid
 fixture/core checks. These are harness smoke checks, not performance results
 from an isolated production-size run.
+
+
+### GGML replacement checks, 2026-10-03
+
+- Imported dot-product and quantizer bodies compared byte-for-byte with the
+  pinned source functions.
+- Portable AppleClang build: both CTests passed.
+- Linux GCC 14 native AVX2/FMA and AVX fallback: both CTests passed.
+- Linux Clang 21 ASan/UBSan native build: both CTests passed.
+- Baseline and optimized reference checks: layouts 0/1/2, partial block sizes,
+  multiple layers, and H=5120/N=2304 with one expert.
+- Runner smoke: H=512/N=256/layout2, expert counts 1/3/5, workers 1/3,
+  two alternating rounds; eight JSON/log pairs produced with correctness
+  checks before and after timing.
+- Frozen two-layer GPU-layout fixture written by the optimized executable
+  and read/validated by the upstream baseline.
+
+These checks use seeded synthetic data. They do not establish pretrained
+model quality, live GPU handoff correctness, or production throughput.

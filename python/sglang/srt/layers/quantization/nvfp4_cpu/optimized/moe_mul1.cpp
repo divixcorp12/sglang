@@ -1,6 +1,7 @@
-// CPU W4A16 expert calculation over the GPU's existing packed NVFP4 slabs.
-// No CUDA, PyTorch, GGML, OpenMP, expanded-weight cache or weight repacking.
+// CPU experts derived from pinned GGML NVFP4 x Q8 kernels.
+// GPU weight slabs stay unchanged; see ../upstream/README.md for provenance.
 #include "cpu_experts_cabi.h"
+#include "../upstream/kernels.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -21,37 +22,18 @@
 #endif
 
 namespace {
-constexpr float fp4[16] = {0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6};
-float half(uint16_t h) {
-    const int e = (h >> 10) & 31, m = h & 1023;
-    const float v = e == 0 ? std::ldexp(float(m), -24)
-        : e == 31 ? (m ? NAN : INFINITY) : std::ldexp(float(1024 + m), e - 25);
-    return h & 32768 ? -v : v;
-}
-float e4m3(uint8_t b) {
-    const int e = (b >> 3) & 15, m = b & 7;
-    const float v = (b & 127) == 127 ? NAN
-        : e == 0 ? std::ldexp(float(m), -9) : std::ldexp(float(8 + m), e - 10);
-    return b & 128 ? -v : v;
-}
-const auto scale_values = [] {
-    std::array<float, 256> values{};
-    for (int i = 0; i < 256; ++i) values[i] = e4m3(static_cast<uint8_t>(i));
-    return values;
-}();
-size_t rounded(size_t x, size_t n) { return (x + n - 1) / n * n; }
-// Inverse address of utils.swizzle_blockscale's reshape/permute.
-size_t sf_index(int row, int group, int groups) {
-    const size_t tiles_k = rounded(groups, 4) / 4;
-    return (((size_t(row / 128) * tiles_k + group / 4) * 32 + row % 32) * 4
-            + (row % 128) / 32) * 4 + group % 4;
-}
+#include "dot_nvfp4.h"
 struct Layer {
     SglangNvfp4CpuLayer d;
     // Activations only. Sized once; mutable slab contents are read each job.
     std::vector<float> x, intermediate, result;
+    std::vector<block_q8_0> qx, qi;
+    std::vector<std::vector<block_nvfp4>> row_scratch;
     explicit Layer(const SglangNvfp4CpuLayer& desc) : d(desc), x(d.hidden),
-        intermediate(d.intermediate), result(d.hidden) {}
+        intermediate(d.intermediate), result(d.hidden),
+        qx(rounded(d.hidden,64)/32), qi(rounded(d.intermediate,64)/32) {
+        x.resize(rounded(d.hidden,64)); intermediate.resize(rounded(d.intermediate,64));
+    }
     const uint8_t* slab(int i, int slot) const {
         return static_cast<const uint8_t*>(d.slabs[i]) + size_t(slot) * d.slot_bytes[i];
     }
@@ -155,41 +137,47 @@ public:
     }
 } workers;
 
-float dot(const uint8_t* w, const uint8_t* sf, int row, int k, const float* x) {
-    w += size_t(row) * (k / 2);
-    float sum = 0;
-    for (int g = 0; g < k / 16; ++g) {
-        const float scale = scale_values[sf[sf_index(row, g, k / 16)]];
-        const uint8_t* q = w + g * 8;
-        float block = 0;
-#if defined(__AVX2__) && !defined(NVFP4_CPU_FORCE_SCALAR)
-        const __m256 lut = _mm256_setr_ps(0,.5f,1,1.5f,2,3,4,6);
-        // Expand sixteen nibbles in registers; no full-row unpack buffer.
-        const __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q));
-        const __m128i mask = _mm_set1_epi8(15);
-        const __m128i lo = _mm_and_si128(bytes, mask);
-        const __m128i hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
-        const __m128i nibbles = _mm_unpacklo_epi8(lo, hi);
-        __m256 acc = _mm256_setzero_ps();
-        for (int j = 0; j < 2; ++j) {
-            const __m128i part = j ? _mm_srli_si128(nibbles, 8) : nibbles;
-            const __m256i ids = _mm256_cvtepu8_epi32(part);
-            __m256 values = _mm256_permutevar8x32_ps(lut, _mm256_and_si256(ids, _mm256_set1_epi32(7)));
-            values = _mm256_xor_ps(values, _mm256_castsi256_ps(_mm256_slli_epi32(
-                _mm256_and_si256(ids, _mm256_set1_epi32(8)), 28)));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(values, _mm256_loadu_ps(x + g * 16 + j * 8)));
+float dot(const uint8_t* w, const uint8_t* sf, int row, int k,
+          const block_q8_0* x, block_nvfp4* scratch) {
+    GpuRow view(w,sf,row,k);
+    const int padded=int(rounded(k,64));
+#if defined(NVFP4_CPU_UPSTREAM_BASELINE)
+    // Convert into worker-local scratch on every row; the source slabs may mutate.
+    for (int ib=0;ib<padded/64;++ib) {
+        auto& block=scratch[ib];
+        for (int g=0;g<4;++g) {
+            int group=ib*4+g;
+            uint8_t scale=group<k/16?sf[sf_index(row,group,k/16)]:0;
+            block.d[g]=scale&127;
+            const auto q=view.bytes(ib)+g*8;
+            const uint8_t flip=scale&128?8:0;
+            for (int j=0;j<8;++j) {
+                // GGML puts columns j and j+8 in a byte; GPU puts 2j and 2j+1.
+                uint8_t lo=(q[j/2]>>(4*(j%2)))&15;
+                uint8_t hi=(q[(j+8)/2]>>(4*((j+8)%2)))&15;
+                block.qs[g*8+j]=(lo^flip)|((hi^flip)<<4);
+            }
         }
-        alignas(32) float lanes[8]; _mm256_store_ps(lanes, acc);
-        for (float v : lanes) block += v;
-#else
-        for (int j = 0; j < 8; ++j) {
-            block += fp4[q[j] & 15] * x[g * 16 + 2 * j];
-            block += fp4[q[j] >> 4] * x[g * 16 + 2 * j + 1];
-        }
-#endif
-        sum += block * scale;
     }
-    return sum;
+    float result;
+    ggml_vec_dot_nvfp4_q8_0(padded,&result,0,scratch,0,x,0,1);
+    return result;
+#else
+    (void)scratch;
+    return dot_gpu(padded,view,x);
+#endif
+}
+bool quantize(const std::vector<float>& input, std::vector<block_q8_0>& output) {
+    for (float v:input) if (!std::isfinite(v) || std::abs(v)>65504.f*127.f) return false;
+    for (size_t b=0;b<output.size();++b) {
+        float amax=0;
+        for (int j=0;j<32;++j) amax=std::max(amax,std::abs(input[b*32+j]));
+        // A zero FP16 delta contributes zero. Avoid overflowing the reciprocal
+        // for subnormal FP32 amax in the upstream reference quantizer.
+        if (!ggml_compute_fp32_to_fp16(amax/127.f)) output[b]=block_q8_0{};
+        else quantize_row_q8_0_ref(input.data()+b*32,output.data()+b,32);
+    }
+    return true;
 }
 struct Work { Layer* layer; int slot; float route; int stage; };
 void calculate(void* p, int rank, int n) {
@@ -202,8 +190,8 @@ void calculate(void* p, int rank, int n) {
             int gate = i, up = i + d.intermediate;
             if (d.w13_layout == 1) std::swap(gate, up);
             if (d.w13_layout == 2) { up = (i / 64) * 128 + i % 64; gate = up + 64; }
-            float g = dot(w, sf, gate, d.hidden, l.x.data()) * gate_alpha;
-            float u = dot(w, sf, up, d.hidden, l.x.data()) * up_alpha;
+            float g = dot(w, sf, gate, d.hidden, l.qx.data(), l.row_scratch[rank].data()) * gate_alpha;
+            float u = dot(w, sf, up, d.hidden, l.qx.data(), l.row_scratch[rank].data()) * up_alpha;
             if (d.act_limit > 0) { g = std::min(g, d.act_limit); u = std::clamp(u, -d.act_limit, d.act_limit); }
             // Stable SiLU, including large negative gates.
             const float silu = g >= 0 ? g / (1 + std::exp(-g)) : g * std::exp(g) / (1 + std::exp(g));
@@ -213,7 +201,7 @@ void calculate(void* p, int rank, int n) {
         const auto w = l.slab(1, c.slot), sf = l.slab(3, c.slot);
         const float alpha = l.alpha(5, c.slot) * d.inv_input_scale2 * c.route;
         for (int i = rank; i < d.hidden; i += n)
-            l.result[i] += dot(w, sf, i, d.intermediate, l.intermediate.data()) * alpha;
+            l.result[i] += dot(w, sf, i, d.intermediate, l.qi.data(), l.row_scratch[rank].data()) * alpha;
     }
 }
 bool valid(const SglangNvfp4CpuLayer& d) {
@@ -275,13 +263,20 @@ extern "C" int sglang_nvfp4_cpu_experts_forward(int64_t h, const void* x,
         }
         workers.initialize(threads);
         for (int i = 0; i < l->d.hidden; ++i) {
-            uint16_t v; std::memcpy(&v, static_cast<const uint8_t*>(x) + 2 * i, 2); l->x[i] = half(v);
+            uint16_t v; std::memcpy(&v, static_cast<const uint8_t*>(x) + 2 * i, 2); l->x[i] = ggml_compute_fp16_to_fp32(v);
         }
+        if (l->row_scratch.size()<size_t(threads)) {
+            l->row_scratch.resize(threads);
+            for (auto& row:l->row_scratch) row.resize(rounded(std::max(l->d.hidden,l->d.intermediate),64)/64);
+        }
+        if (!quantize(l->x,l->qx)) return 2;
         std::fill(l->result.begin(), l->result.end(), 0.f);
         for (int j = 0; j < k; ++j) {
             if (slots[j] == -1 || weights[j] == 0) continue;
             Work c{l.get(), slots[j], weights[j], 0};
-            workers.run(calculate, &c, threads); c.stage = 1; workers.run(calculate, &c, threads);
+            workers.run(calculate, &c, threads);
+            if (!quantize(l->intermediate,l->qi)) return 2;
+            c.stage = 1; workers.run(calculate, &c, threads);
         }
         for (int i = 0; i < l->d.hidden; ++i) {
             if (accumulate) out[i] += l->result[i]; else out[i] = l->result[i];

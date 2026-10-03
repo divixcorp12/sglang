@@ -2,7 +2,7 @@
 
 Implements the `CpuExpertForward` callback from
 `kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h`, parallel to
-`exl3_cpu/optimized`. The plugin and build are C++ only. The engine's job ring,
+`exl3_cpu/optimized`. The plugin and build are native C/C++ only. The engine's job ring,
 leases, pinned activation/output rows and completion signaling are reused.
 
 Build from the checkout root:
@@ -15,7 +15,8 @@ cmake --build /absolute/path/build -j4
 ctest --test-dir /absolute/path/build --output-on-failure
 ```
 
-C++17 and pthreads suffice. No Python, PyTorch, GGML, CUDA, OpenMP or specific
+C11/C++17 and pthreads suffice. The pinned GGML CPU subset is vendored under
+`../upstream`; no Python, PyTorch, CUDA, OpenMP or specific
 GCC release is required. The shared library is `libsglang_nvfp4_cpu.so` on
 Linux. Omit `NVFP4_CPU_NATIVE=ON` for the portable scalar path. Native builds
 select AVX2 on supported x86 CPUs; rebuild before moving to a different ISA.
@@ -23,12 +24,15 @@ select AVX2 on supported x86 CPUs; rebuild before moving to a different ISA.
 See [the benchmark guide](../bench/README.md) for native baseline/optimized
 executables, fixed-team process rounds, fixture format and timing protocol.
 
+See [upstream provenance and adaptation details](../upstream/README.md).
+
 ## Attach to the existing engine
 
 Include `cpu_experts_cabi.h` and link the shared library or compile
 `moe_mul1.cpp` into the same native module, as with EXL3. Register each layer
 using a `SglangNvfp4CpuLayer` descriptor. Registration stores views and allocates
-only activation/result scratch; it never repacks or expands weights.
+activation/result scratch. The optimized kernel never repacks or expands full
+weight rows. Compile/link `../upstream/nvfp4.c` alongside `moe_mul1.cpp`.
 
 ```cpp
 int64_t handle = -1;
@@ -92,12 +96,17 @@ between layer descriptors, but each factor is scalar within one layer. A
 per-expert factor must travel with its mutable host slot in a future ABI
 extension. Omitting slab6 asserts gate/up share the same global weight scale.
 
-The kernel computes W4A16: FP16 input, FP32 gate/up projections, ordinary
+The kernel accepts FP16 input and computes W4A8 with GGML Q8_0 activation
+blocks (32 int8 values and a FP16 delta). Input and post-SwiGLU activations are
+quantized once per vector, reused across output rows. FP32 gate/up projections, ordinary
 `SiLU(gate)*up`, down projection, routing and reduction. Positive `act_limit`
 applies `gate=min(gate,L)` and `up=clamp(up,-L,L)` before SiLU; 0 disables it.
 Other activation conventions (Bailing post-SiLU clamps, GPT-OSS shifted/scaled
 SwiGLU, SiTU, GELU, ReLU2, non-gated experts) must not use this descriptor.
-It is not bit-identical to GPU W4A4 activation quantization.
+It is not bit-identical to GPU W4A4 or a full-precision CPU activation path.
+The benchmark reports Q8 quantization error against a W4A16 reference. Q8
+deltas above finite FP16 range and nonfinite activations return status 2;
+blocks whose delta rounds to zero contribute zero.
 
 ## Threading and lifetime
 
@@ -121,10 +130,13 @@ behavior is unchanged.
 The native CTest harness checks repeated multithreaded forwards, accumulation,
 every finite E4M3 encoding, skipped/invalid slots and handle lifecycle. The
 benchmark checks every selected layer/count against
-an independent FP64 decoded-weight reference before and after timing. The
+an independent decoded-weight Q8 reference before and after timing, and
+reports error against a separate FP64 W4A16 reference. The differential GGML
+test covers every finite signed scale, varying nibbles, GPU scale row
+boundaries, and all partial 64-value block lengths. The
 standalone sanitizer harness is in
 `test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`; compile it together with
-`moe_mul1.cpp` using `-fsanitize=address,undefined -pthread` for ASan/UBSan.
+`moe_mul1.cpp` and the vendored C source using ASan/UBSan CMake compiler flags.
 
 Synthetic arithmetic/layout checks and benchmark smoke runs are not captured
 GPU integration, model-level quality validation or an isolated performance

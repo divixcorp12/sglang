@@ -32,7 +32,8 @@ typedef struct SglangNvfp4CpuLayer {
 int sglang_nvfp4_cpu_experts_register_slabs(const SglangNvfp4CpuLayer*, int64_t* handle) NVFP4_NOEXCEPT;
 int sglang_nvfp4_cpu_experts_free_layer(int64_t handle) NVFP4_NOEXCEPT;
 // Same CpuExpertForward signature as expert_stream/host/cpu_experts.h.
-// x is FP16[hidden]; weights and out are FP32. -1 slots are skipped.
+// x is FP16[hidden]; GGML Q8_0 is used internally for input and SwiGLU.
+// Routing weights and out are FP32. -1 slots are skipped.
 int sglang_nvfp4_cpu_experts_forward(int64_t layer, const void* x,
     const int32_t* slots, const float* weights, int32_t k, float* out,
     int32_t threads, int32_t accumulate) NVFP4_NOEXCEPT;

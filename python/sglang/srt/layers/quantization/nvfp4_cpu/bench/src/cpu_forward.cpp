@@ -1,5 +1,6 @@
 // Bare CpuExpertForward timing; no Python, CUDA or service transport.
 #include "cpu_experts_cabi.h"
+#include "../../upstream/kernels.h"
 #include <benchmark/benchmark.h>
 #include <algorithm>
 #include <array>
@@ -230,10 +231,22 @@ double dot(const uint8_t* w,const double* sf,int k,const std::vector<double>& x)
     return sum;
 }
 float alpha(const std::vector<uint8_t>& slab,int slot) { float v; std::memcpy(&v,slab.data()+slot*4,4); return v; }
-std::vector<double> reference(const Fixture& f,const Layer& l,int experts) {
+// Independent reconstruction of Q8_0: FP32 amax/id, rounded int8, FP16 delta.
+// Share only the vendored half conversion; do not call production quantization.
+void q8_reference(std::vector<double>& v) {
+    for (size_t base=0;base<v.size();base+=32) {
+        float amax=0;
+        for (size_t i=base;i<std::min(base+32,v.size());++i) amax=std::max(amax,std::abs(float(v[i])));
+        float d=amax/127.f, inv=d?1.f/d:0;
+        double delta=decode_half(ggml_compute_fp32_to_fp16(d));
+        for (size_t i=base;i<std::min(base+32,v.size());++i) v[i]=delta?std::round(float(v[i])*inv)*delta:0;
+    }
+}
+std::vector<double> reference(const Fixture& f,const Layer& l,int experts,bool q8=true) {
     const int h=f.h.hidden,n=f.h.intermediate;
     std::vector<double> x(h),middle(n),out(h,0);
     for (int i=0;i<h;++i) x[i]=decode_half(l.x[i]);
+    if (q8) q8_reference(x);
     for (int e=0;e<experts;++e) {
         auto sf13=linear_scales(l.slabs[2].data()+e*f.strides[2],2*n,h/16);
         auto sf2=linear_scales(l.slabs[3].data()+e*f.strides[3],h,n/16);
@@ -248,8 +261,9 @@ std::vector<double> reference(const Fixture& f,const Layer& l,int experts) {
             double u=dot(base+size_t(up)*h/2,sf13.data()+size_t(up)*h/16,h,x)*ua;
             if (f.h.limit>0) { g=std::min(g,double(f.h.limit)); u=std::clamp(u,-double(f.h.limit),double(f.h.limit)); }
             const double sigmoid=g>=0?1/(1+std::exp(-g)):std::exp(g)/(1+std::exp(g));
-            middle[i]=g*sigmoid*u;
+            middle[i]=q8?float(float(g)*float(sigmoid)*float(u)):g*sigmoid*u;
         }
+        if (q8) q8_reference(middle);
         // Round routing coefficients exactly as the ABI's FP32 inputs.
         const float route=1.f/experts;
         const double a=alpha(l.slabs[5],e)*f.h.inv2*route;
@@ -278,10 +292,11 @@ struct Workload {
     Fixture& f; const Options& o; int experts;
     std::vector<int32_t> slots;
     std::vector<float> routes,out;
-    std::vector<std::vector<double>> refs;
+    std::vector<std::vector<double>> refs, dense_refs;
+    double quant_nrmse=0, quant_max_abs=0;
     Workload(Fixture& fixture,const Options& options,int count):f(fixture),o(options),experts(count),out(f.h.hidden) {
         for (int i=0;i<experts;++i) { slots.push_back(i); routes.push_back(1.f/experts); }
-        for (const auto& l:f.layers) refs.push_back(reference(f,*l,experts));
+        for (const auto& l:f.layers) { refs.push_back(reference(f,*l,experts)); dense_refs.push_back(reference(f,*l,experts,false)); }
     }
     void forward(size_t layer) {
         const auto& l=*f.layers[layer];
@@ -291,11 +306,16 @@ struct Workload {
     void validate() {
         for (size_t l=0;l<f.layers.size();++l) {
             forward(l);
+            double squared_error=0, squared_gold=0;
             for (size_t i=0;i<out.size();++i) {
                 const double gold=refs[l][i], tolerance=1e-4+1e-4*std::abs(gold);
                 if (!std::isfinite(out[i]) || !std::isfinite(gold) || std::abs(out[i]-gold)>tolerance)
-                    throw std::runtime_error("Dense reference mismatch at layer "+std::to_string(l)+" element "+std::to_string(i));
+                    throw std::runtime_error("Q8 dense reference mismatch at layer "+std::to_string(l)+" element "+std::to_string(i));
+                double error=out[i]-dense_refs[l][i];
+                squared_error+=error*error; squared_gold+=dense_refs[l][i]*dense_refs[l][i];
+                quant_max_abs=std::max(quant_max_abs,std::abs(error));
             }
+            quant_nrmse=std::max(quant_nrmse,std::sqrt(squared_error/std::max(squared_gold,1e-30)));
         }
     }
     uint64_t bytes() const {
@@ -327,6 +347,8 @@ void run(benchmark::State& state,Workload& w) {
             state.counters["p99_us"]=quantile(samples,.99);
             state.counters["logical_weight_GBps"]=double(w.bytes())*samples.size()/total/1e9;
         }
+        state.counters["q8_vs_fp16_nrmse"]=w.quant_nrmse;
+        state.counters["q8_vs_fp16_max_abs"]=w.quant_max_abs;
         state.counters["experts"]=w.experts; state.counters["workers"]=w.o.workers;
         state.counters["layers"]=w.f.layers.size(); state.counters["weight_bytes_per_forward"]=w.bytes();
     } catch (const std::exception& e) { failed=true; state.SkipWithError(e.what()); }
@@ -335,6 +357,7 @@ void run(benchmark::State& state,Workload& w) {
 int main(int argc,char** argv) {
     try {
         const auto o=parse(argc,argv); benchmark::Initialize(&argc,argv);
+        benchmark::AddCustomContext("ggml_commit","889edf43ddae0cfe9a4564a882764dc879759870");
         if (benchmark::ReportUnrecognizedArguments(argc,argv)) return 1;
         auto cores=list(o.cpus,true), counts=list(o.experts,false);
         if (o.workers>int(cores.size())) throw std::runtime_error("Insufficient CPUs");
@@ -353,7 +376,7 @@ int main(int argc,char** argv) {
             auto w=std::make_unique<Workload>(fixture,o,count); w->validate(); workloads.push_back(std::move(w));
         }
         verify_workers(before,cores);
-        std::cerr<<"Dense reference verified; individually pinned CPUs:"; for (int c:cores) std::cerr<<' '<<c;
+        std::cerr<<"Q8 dense reference verified; individually pinned CPUs:"; for (int c:cores) std::cerr<<' '<<c;
         std::cerr<<"; memory policy inherited; inputs="<<(o.fixture.empty()?"synthetic":"fixture")<<'\n';
         if (o.validate_only) return 0;
         benchmark::AddCustomContext("backend",NVFP4_BENCH_BACKEND);
