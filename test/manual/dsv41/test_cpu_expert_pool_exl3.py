@@ -163,6 +163,41 @@ def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
         ext.exl3_moe_cpu_free_layer(direct)
 
 
+def test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline(monkeypatch):
+    """The CpuExpertKeepWarm the idle CPU expert thread calls: it holds its workers until the word differs from
+    `seen` (a submit bumped it) or the CLOCK_MONOTONIC deadline passes, and refuses bad arguments with 2."""
+    import ctypes
+    import threading
+    import time
+
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
+
+    if not optimized_cpu(cpu_act_defines()):
+        pytest.skip("the keep-warm ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
+    keep_warm = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64)(
+        Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT).native_keep_warm()
+    )
+    word = torch.zeros(1, dtype=torch.int32)
+    far = time.monotonic_ns() + 60_000_000_000
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("rc", keep_warm(2, word.data_ptr(), 0, far)))
+    worker.start()
+    time.sleep(0.05)
+    assert worker.is_alive(), "keep-warm returned before its word moved or its deadline"
+    word[0] = 1
+    worker.join(2)
+    assert not worker.is_alive() and result["rc"] == 0
+
+    start = time.monotonic()
+    assert keep_warm(2, word.data_ptr(), 0, far) == 0, "a word already past `seen`"
+    assert keep_warm(2, word.data_ptr(), 1, time.monotonic_ns()) == 0, "a deadline already passed"
+    assert time.monotonic() - start < 0.5
+    assert keep_warm(0, word.data_ptr(), 1, far) == 2
+    assert keep_warm(2, None, 1, far) == 2
+
+
 if __name__ == "__main__":
     import sys
 

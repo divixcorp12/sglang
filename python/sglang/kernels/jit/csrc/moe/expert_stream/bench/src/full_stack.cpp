@@ -52,6 +52,7 @@ struct Options {
   int worker_node = 1;
   int warmup = 128;
   int gap_us = 0;
+  int keep_warm_us = 0;
   int wait_timeout_ms = 2000;
   bool validate_only = false;
   bool self_test = false;
@@ -86,6 +87,8 @@ Options parse_options(int& argc, char** argv) {
       opt.warmup = number(value("--warmup-forwards="));
     else if (arg.starts_with("--gap-us="))
       opt.gap_us = number(value("--gap-us="));
+    else if (arg.starts_with("--keep-warm-us="))
+      opt.keep_warm_us = number(value("--keep-warm-us="));
     else if (arg.starts_with("--wait-timeout-ms="))
       opt.wait_timeout_ms = number(value("--wait-timeout-ms="));
     else if (arg == "--validate-only")
@@ -98,7 +101,8 @@ Options parse_options(int& argc, char** argv) {
              ")\n"
              "--fixture=FILE --reference-dir=DIR --image-dir=DIR (O_DIRECT-capable; row images are written there)\n"
              "--writer-cpu=16 --service-cpu=17 --copy-cpu=52 --cpus=18-33 --host-node=0 --worker-node=1\n"
-             "--warmup-forwards=128 --gap-us=0 --wait-timeout-ms=2000 --validate-only\n"
+             "--warmup-forwards=128 --gap-us=0 --keep-warm-us=0 --wait-timeout-ms=2000 --validate-only\n"
+             "--keep-warm-us: the CPU expert thread's keep-warm window after each job (0: off)\n"
              "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 "
              "--cpus=3\n"
              "Google Benchmark flags are also accepted.\n";
@@ -132,6 +136,8 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
   c.rows = f.row_set();
   c.staging = StackFixture::kStaging;
   c.forward = &sglang_exl3_cpu_experts_forward;
+  c.keep_warm = &sglang_exl3_cpu_experts_keep_warm;
+  c.keep_warm_ns = static_cast<int64_t>(o.keep_warm_us) * 1000;
   c.threads = static_cast<int>(p.workers.size());
   c.cores.assign(p.workers.begin(), p.workers.end());
   c.x_base = f.x_row(0);
@@ -540,6 +546,7 @@ int main(int argc, char** argv) {
     std::ifstream cgroup_file("/proc/self/cgroup");
     benchmark::AddCustomContext("cgroup", std::string((std::istreambuf_iterator<char>(cgroup_file)), {}));
     benchmark::AddCustomContext("gap_us", std::to_string(options.gap_us));
+    benchmark::AddCustomContext("keep_warm_us", std::to_string(options.keep_warm_us));
     benchmark::AddCustomContext("compiler", __VERSION__);
     // Every BM_bare before any BM_stack: one OpenMP team at a time (see Bench). Each benchmark checks its path's 8
     // outputs bit-exactly before and after it is timed.

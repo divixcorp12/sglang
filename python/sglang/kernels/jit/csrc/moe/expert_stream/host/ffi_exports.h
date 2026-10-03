@@ -347,7 +347,8 @@ struct HostExports {
   // int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host memory, where
   // the post kernel writes a row's input; `out_rows` is float32 [rows, >= parts * hidden] in host memory, where the
   // device reads a row's CPU partial sums (part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both tensors
-  // must outlive the service.
+  // must outlive the service. `keep_warm` is a CpuExpertKeepWarm's address (0 for none) that the idle thread runs for
+  // keep_warm_ns after each job.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t forward,
@@ -358,7 +359,9 @@ struct HostExports {
       int64_t hidden,
       int64_t parts,
       int64_t threads,
-      int64_t spin_ns) {
+      int64_t spin_ns,
+      int64_t keep_warm,
+      int64_t keep_warm_ns) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     auto host_mem = SymbolicDevice{};
@@ -388,6 +391,9 @@ struct HostExports {
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
     config.spin_ns = spin_ns;
+    if (keep_warm_ns < 0) throw std::runtime_error(error_prefix<Layout>() + "the keep-warm window is negative");
+    config.keep_warm = reinterpret_cast<expert_stream::CpuExpertKeepWarm>(static_cast<intptr_t>(keep_warm));
+    config.keep_warm_ns = keep_warm != 0 ? keep_warm_ns : 0;
     const auto* sp = static_cast<const int64_t*>(split.data_ptr());
     find(handle)->enable_cpu_experts(std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
   }

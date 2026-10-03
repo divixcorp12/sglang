@@ -146,6 +146,14 @@ class Exl3CpuQuantTrait:
             self._native("sglang_exl3_cpu_experts_forward"), ctypes.c_void_p
         ).value
 
+    def native_keep_warm(self) -> int:
+        """The address of the kernel's keep-warm function, for the idle native CPU thread."""
+        import ctypes
+
+        return ctypes.cast(
+            self._native("sglang_exl3_cpu_experts_keep_warm"), ctypes.c_void_p
+        ).value
+
     def native_set_cores(self, cores) -> None:
         """Place the kernel's workers on ``cores``, before its first forward."""
         import ctypes

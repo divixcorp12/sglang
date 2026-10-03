@@ -16,6 +16,12 @@ int sglang_exl3_cpu_experts_forward(int64_t layer, const void* x,
     const int32_t* slots, const float* weights, int32_t k, float* out,
     int32_t threads, int32_t accumulate) EXL3_CPU_NOEXCEPT;
 
+// Holds `threads` workers in register-only work of the forward's vector width until *word != seen or
+// CLOCK_MONOTONIC reaches deadline_ns, so they keep the forward's frequency license through an idle gap. Caller
+// counts as worker 0. Returns 0 on success, 1 on a kernel error, 2 on invalid arguments.
+int sglang_exl3_cpu_experts_keep_warm(int32_t threads, const uint32_t* word, uint32_t seen,
+    int64_t deadline_ns) EXL3_CPU_NOEXCEPT;
+
 // Before the first forward: worker i uses cores[i].
 // Core IDs must be distinct and valid; configure at least `threads` cores.
 int sglang_exl3_cpu_experts_set_cores(const int32_t* cores, int32_t n) EXL3_CPU_NOEXCEPT;

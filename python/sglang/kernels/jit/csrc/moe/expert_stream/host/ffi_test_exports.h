@@ -10,7 +10,7 @@
 //   tier       pump, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
-//   misc       test_forward_address, pause_ns
+//   misc       test_forward_address, test_keep_warm_address, test_keep_warm_calls, pause_ns
 //
 // Arguments are validated by the Python wrappers in
 // python/sglang/kernels/ops/moe/expert_stream_transport.py.
@@ -642,6 +642,34 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  static std::atomic<int64_t>& test_keep_warm_count() {
+    static std::atomic<int64_t> calls{0};
+    return calls;
+  }
+  static int test_keep_warm(int32_t, const uint32_t* word, uint32_t seen, int64_t deadline_ns) {
+    test_keep_warm_count().fetch_add(1, std::memory_order_relaxed);
+    while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && expert_stream::now_ns() < deadline_ns)
+      _mm_pause();
+    return 0;
+  }
+  // Test only: a fake CpuExpertKeepWarm that counts its calls (from 0 again at each call of this) and spins until its
+  // word moves or its deadline passes.
+  static int64_t test_keep_warm_address() {
+    if constexpr (!Build::kFaults) {
+      test_only("test_keep_warm_address");
+    } else {
+      test_keep_warm_count().store(0, std::memory_order_relaxed);
+      return static_cast<int64_t>(reinterpret_cast<intptr_t>(&test_keep_warm));
+    }
+  }
+  static int64_t test_keep_warm_calls() {
+    if constexpr (!Build::kFaults) {
+      test_only("test_keep_warm_calls");
+    } else {
+      return test_keep_warm_count().load(std::memory_order_relaxed);
+    }
+  }
+
   // Test only (HostCopyBackend): lets `marks` more copy marks complete (negative: all).
   static void copy_engine_release(int64_t handle, int64_t marks) {
     find(handle)->host_copy_backend().release(marks);
@@ -821,6 +849,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   EXPERT_STREAM_HOST_TEST_EXPORTS_OF(::sglang::expert_stream::HostTestExports<Exports>)
 #define EXPERT_STREAM_HOST_TEST_EXPORTS_OF(Exports)                                                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_forward_address, Exports::test_forward_address); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_address, Exports::test_keep_warm_address); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_calls, Exports::test_keep_warm_calls); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_traced, Exports::read_rows_traced);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_faulted, Exports::read_rows_faulted);       \

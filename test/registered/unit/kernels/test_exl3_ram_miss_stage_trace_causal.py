@@ -269,6 +269,11 @@ NON_TRACE_CLOCK_READS = {
     # The native test forward (ffi_test_exports.h, test only, refused on ProdBuild): its spin, on the CPU expert thread.
     "const int64_t until = expert_stream::now_ns() + k * test_forward_ns().load(std::memory_order_relaxed);": 1,
     "while (expert_stream::now_ns() < until)": 1,
+    # CpuExpertEngine's keep-warm window (cpu_experts.h), on the CPU expert thread only: one read after each job sets
+    # the window, one per idle poll checks it. The native test keep-warm (test only) spins on its deadline there too.
+    "if (warm && now_ns() < warm_until) {": 1,
+    "if (warm) warm_until = now_ns() + config_.keep_warm_ns;": 1,
+    "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && expert_stream::now_ns() < deadline_ns)": 1,
     # UringReader, std::chrono directly. register_resources(): the buffer registration's duration (register_ms), at
     # open and at a ring reset, never per read.
     "const auto t0 = std::chrono::steady_clock::now();": 1,
