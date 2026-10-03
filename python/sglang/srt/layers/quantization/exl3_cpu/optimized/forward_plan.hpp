@@ -24,6 +24,7 @@ struct PlanTraits
     static constexpr bool kCompactScratch = false;    // int16 compact activations instead of the int32 splats
     static constexpr bool kGroupedTraversal = false;  // range-aware multi-band traversal when one expert is routed
     static constexpr bool kWideSingleExpert = false;  // 512-wide quantization for one token through one expert
+    static constexpr int kSplitTiles = 8;             // GEMV split unit in tiles (assign_gemvs)
 };
 
 // DeepSeek V4.1 on AVX-512BW: the validated fast path.
@@ -33,6 +34,7 @@ struct PlanTraits<Dsv41Shape, Isa::Bw>
     static constexpr bool kCompactScratch = true;
     static constexpr bool kGroupedTraversal = true;
     static constexpr bool kWideSingleExpert = true;
+    static constexpr int kSplitTiles = 2;  // compact unswizzled kernels take any tile pair (register_tiles)
 };
 
 template <class Shape, Isa I>
@@ -98,6 +100,13 @@ private:
                 ctx.prep_u[j].compact=ar.compact_u.data()+size_t(j)*ACT_ROWS*H;
                 ctx.prep_d[j].compact=ar.compact_d.data()+size_t(j)*ACT_ROWS*I_;
             }
+        }
+        if constexpr (Traits::kSplitTiles < 8)
+        {
+            const size_t blocks = static_cast<size_t>(nc) * (H / 128);
+            grow(ar.down_tiles_done, blocks);
+            std::fill_n(ar.down_tiles_done.data(), blocks, 0);
+            ctx.down_tiles_done = ar.down_tiles_done.data();
         }
         if (EXL3_MOE_CPU_ACT_BLOCK)
         {
@@ -202,7 +211,7 @@ private:
         {
             // Gate + up GEMVs (see assign_gemvs)
             const int gu = !Shape::gated(c.info) ? 1 : 2;
-            assign_gemvs(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
+            assign_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = gu == 1 || (j % gu);
@@ -278,12 +287,23 @@ private:
         else if constexpr (P == Phase::Down)
         {
             // Down GEMVs
-            assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
+            assign_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
                 run_tiles<I>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
-                transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);
+                if constexpr (Traits::kSplitTiles == 8) {
+                    transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);
+                } else {
+                    // A block's tiles may come from several workers: the one that completes it transforms it. The
+                    // acq_rel count makes the other workers' tile stores visible to that worker.
+                    for (int b = t0 / 8; b * 8 < t1; ++b) {
+                        const int done = std::min(t1, b * 8 + 8) - std::max(t0, b * 8);
+                        std::atomic_ref<int> count(c.down_tiles_done[static_cast<size_t>(j) * (H / 128) + b]);
+                        if (count.fetch_add(done, std::memory_order_acq_rel) + done == 8)
+                            transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,b*8,b*8+8);
+                    }
+                }
             });
         }
         else
