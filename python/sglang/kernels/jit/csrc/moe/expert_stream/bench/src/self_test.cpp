@@ -6,6 +6,7 @@
 //                           gate, on a standalone page and lease block with the host's words written by hand
 //   test_image_stamp        row-image layout and stamp reuse
 //   test_stack              the real stack (this binary's build) on synthetic rows with a fake forward
+//   test_two_groups         two NUMA groups' stacks, each with its own engine and slots (a Wire::kNodes == 2 build)
 // Each failed check prints "FAIL file:line" and counts toward run_self_test's return value.
 #include "self_test.h"
 
@@ -78,9 +79,8 @@ Topology fake_topology() {
 Placement production_placement() {
   Placement p;
   p.writer = 16;
-  p.service = 17;
   p.copy = 52;
-  p.workers = parse_cpus("18-33");
+  p.groups.push_back({17, parse_cpus("18-33"), 1});
   return p;
 }
 
@@ -104,7 +104,7 @@ void test_placement() {
   CHECK(passes(production_placement(), t, true));
 
   Placement twice = production_placement();
-  twice.service = 16;
+  twice.groups[0].service = 16;
   CHECK_THROWS(validate_placement(twice, t, true), "two roles");
 
   Placement sibling = production_placement();
@@ -117,14 +117,14 @@ void test_placement() {
 
   Placement writer_node = production_placement();
   writer_node.writer = 19;
-  writer_node.workers = parse_cpus("18,20-33");
+  writer_node.groups[0].workers = parse_cpus("18,20-33");
   CHECK_THROWS(validate_placement(writer_node, t, true), "writer CPU 19 is on NUMA node 1, not node 0");
   CHECK(passes(writer_node, t, false));  // the self-test's mode: no node rules
 
   Topology wider = fake_topology();
   CPU_SET(10, &wider.allowed);
   Placement worker_node = production_placement();
-  worker_node.workers.back() = 10;
+  worker_node.groups[0].workers.back() = 10;
   CHECK_THROWS(validate_placement(worker_node, wider, true), "worker CPU 10 is on NUMA node 0, not node 1");
 
   std::vector<int> expected = expected_threads(production_placement());
@@ -135,6 +135,46 @@ void test_placement() {
   want.push_back(52);
   CHECK(expected == want);
   CHECK(cpu_list({52, 16, 17}) == "16,17,52");
+}
+
+// The reference machine with every CPU allowed: room for two groups' services and workers on their own nodes.
+Topology wide_topology() {
+  Topology t = fake_topology();
+  CPU_ZERO(&t.allowed);
+  for (int cpu = 0; cpu < 72; ++cpu)
+    CPU_SET(cpu, &t.allowed);
+  return t;
+}
+
+// Above one group a group's service and workers sit on its own node; the writer and the copy thread stay on host_node.
+void test_two_group_placement() {
+  const Topology t = wide_topology();
+  Placement p;
+  p.writer = 16;
+  p.copy = 52;
+  p.groups.push_back({17, parse_cpus("8-15"), 0});
+  p.groups.push_back({35, parse_cpus("18-33"), 1});
+  CHECK(passes(p, t, true));
+  CHECK(expected_threads(p) == std::vector<int>({8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35, 52, 52}));
+
+  Placement shared = p;
+  shared.groups[1].workers = parse_cpus("17-32");  // 17 is group 0's service
+  CHECK_THROWS(validate_placement(shared, t, true), "two roles");
+
+  Placement sibling = p;
+  sibling.copy = 53;  // 17's SMT sibling
+  CHECK_THROWS(validate_placement(sibling, t, true), "physical core of the service CPU 17");
+
+  Placement own_node = p;
+  own_node.groups[1].service = 19;
+  own_node.groups[1].workers = parse_cpus("18,20-33");
+  CHECK(passes(own_node, t, true));  // 19 is on node 1, group 1's node
+  own_node.groups[1].service = 0;  // node 0: not group 1's node
+  CHECK_THROWS(validate_placement(own_node, t, true), "service CPU 0 is on NUMA node 0, not node 1");
+
+  Placement wrong_workers = p;
+  wrong_workers.groups[0].workers = parse_cpus("18-25");  // node 1 for a node-0 group
+  CHECK_THROWS(validate_placement(wrong_workers, t, true), "worker CPU 18 is on NUMA node 1, not node 0");
 }
 
 // ---- DeviceSim, on a standalone page and lease block (no service: the host's words are written by hand) ----
@@ -179,7 +219,8 @@ struct Blocks {
     uint8_t* d = lease.get() + w::Wire::kDeltaBase + row * w::Wire::kDeltaStride;
     const auto count = static_cast<uint32_t>(entries.size());
     std::memcpy(d + w::Wire::kDeltaCount, &count, 4);
-    std::memcpy(d + w::Wire::kDeltaStaging, staging.data(), sizeof(staging));
+    for (int node = 0; node < w::Wire::kNodes; ++node)  // every node's list is the same: slots are not under test here
+      std::memcpy(d + w::Wire::kDeltaStaging + node * sizeof(staging), staging.data(), sizeof(staging));
     for (size_t i = 0; i < entries.size(); ++i) {
       const int16_t entry[2] = {entries[i].first, entries[i].second};
       std::memcpy(d + w::Wire::kDeltaEntries + 4 * i, entry, 4);
@@ -187,7 +228,8 @@ struct Blocks {
     __atomic_store_n(reinterpret_cast<uint64_t*>(d + w::Wire::kDeltaTag), tag, __ATOMIC_RELEASE);
   }
   void split(SplitTable table) {
-    std::memcpy(lease.get() + w::Wire::kSplit, table.data(), sizeof(table));
+    for (int node = 0; node < w::Wire::kNodes; ++node)
+      std::memcpy(lease.get() + w::Wire::kSplit + node * w::Wire::kSplitStride, table.data(), sizeof(table));
   }
   void armed(bool on) {
     const uint32_t value = on ? 1 : 0;
@@ -360,12 +402,12 @@ void test_owed_delta() {
 
 void test_typing() {
   Blocks b(1);
-  b.delta(0, 1, kStaging012, {{0, 4}, {1, 5}});
+  b.delta(0, 1, kStaging012, {{0, 4}, {2, 5}});  // experts 0 and 2: one home node, so one split table decides
   b.armed(true);
   b.split({0, 0, 0, 0, 0, 0, 0, 0, 0});
   DeviceSim sim(b.page.get(), b.lease.get(), 1, 8);
   sim.set_row_cpu(0);
-  const int32_t two[] = {0, 1};
+  const int32_t two[] = {0, 2};
   const float halves[] = {0.5f, 0.5f};
   SimRequest r = sim.post(0, two, halves, true, soon());  // split[2] = 0: no CPU lane
   CHECK(r.kinds[0] == int32_t(w::Wire::kKindHitSm) && r.kinds[1] == int32_t(w::Wire::kKindHitSm) && !DeviceSim::needs_copy_wait(r));
@@ -464,6 +506,7 @@ struct FakeCall {
   std::vector<float> weights;
   int32_t threads;
   int32_t accumulate;
+  int64_t engine;
 };
 std::mutex fake_mutex;
 std::vector<FakeCall> fake_calls;
@@ -485,7 +528,7 @@ int fake_forward(const SglangCpuExpertsForward* call) {
   std::lock_guard<std::mutex> guard(fake_mutex);
   fake_calls.push_back(
       {call->layer, std::vector<int32_t>(slots, slots + k), std::vector<float>(weights, weights + k), call->threads,
-       call->accumulate});
+       call->accumulate, call->engine});
   return 0;
 }
 
@@ -504,6 +547,7 @@ bool part0_is(const float* part0, float offset) {
 // Drives the real RamTier, RamThread, copy engine and CPU expert engine through DeviceSim: loading, SM hits, CPU hits,
 // split 0, and a hit with a miss in one post; checks the fake forward's inputs and outputs and the staging slots.
 void test_stack(const Placement& placement, const std::filesystem::path& dir) {
+  if constexpr (w::Wire::kNodes != 1) return;  // one group's stack; test_two_groups builds the multi-group one
   const ImageLayout layout = image_layout({512, 512, 512, 512, 512, 512});
   std::vector<std::array<AlignedBuffer, kNames>> slabs(kSelfRows);
   RowSet set;
@@ -536,16 +580,17 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
   config.rows = set;
   config.staging = 3;
   config.forward = &fake_forward;
-  config.threads = static_cast<int>(placement.workers.size());
-  config.cores.assign(placement.workers.begin(), placement.workers.end());
   config.x_base = x.get();
   config.x_stride = 2 * kSelfHidden;
   config.out_base = out.get();
   config.out_stride = 2 * kSelfHidden * 4;
   config.hidden = kSelfHidden;
-  config.service_cpu = placement.service;
   config.copy_cpu = placement.copy;
-  config.split = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  StackConfig::Group group;
+  group.service_cpu = placement.groups[0].service;
+  group.cores.assign(placement.groups[0].workers.begin(), placement.groups[0].workers.end());
+  group.split = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  config.groups.push_back(group);
   config.trace_capacity = 256;
   fake_calls.clear();
   const int64_t timeout = 1'000'000'000;
@@ -597,7 +642,7 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
         const FakeCall& call = fake_calls[0];
         CHECK(call.layer == kFakeHandle && call.slots == std::vector<int32_t>({2, 0, 1}));
         CHECK(call.weights == std::vector<float>({0.5f, 0.25f, 0.125f}));
-        CHECK(call.threads == static_cast<int32_t>(placement.workers.size()) && call.accumulate == 0);
+        CHECK(call.threads == static_cast<int32_t>(placement.groups[0].workers.size()) && call.accumulate == 0);
       }
     }
     CHECK(part0_is(part0, 100.0f + 2.0f));  // 0.5 * 3 + 0.25 * 1 + 0.125 * 2
@@ -646,10 +691,90 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
   CHECK(fake_calls.size() == 2);
 }
 
+// Two NUMA groups (Wire::kNodes == 2): each group's CPU lanes reach the forward with its own engine and only its own
+// slots, and each group's service thread runs on its own CPU.
+void test_two_groups(const Placement& placement, const std::filesystem::path& dir) {
+  if constexpr (w::Wire::kNodes != 2) {
+    return;
+  } else {
+    constexpr int64_t kGroup = 7;  // per group: 3 staging slots, 4 mappable
+    const ImageLayout layout = image_layout({512, 512, 512, 512, 512, 512});
+    std::vector<std::array<AlignedBuffer, kNames>> slabs(kSelfRows);
+    RowSet set;
+    set.layout = layout;
+    set.experts = kSelfExperts;
+    set.capacity = 2 * kGroup;
+    for (int64_t row = 0; row < kSelfRows; ++row) {
+      std::array<uint8_t*, kNames> bases{};
+      for (int n = 0; n < kNames; ++n) {
+        slabs[row][n] = aligned_zeroed(2 * kGroup * 512);
+        bases[n] = slabs[row][n].get();
+      }
+      set.slabs.push_back(bases);
+      const auto path = dir / ("selftest2-layer-" + std::to_string(row) + ".rows");
+      write_row_image(
+          path,
+          layout,
+          kSelfExperts,
+          [&](int64_t e, uint8_t* image) {
+            for (int n = 0; n < kNames; ++n)
+              std::memset(image + layout.name_offsets[n], pattern(row, e, n), 512);
+          },
+          "");
+      set.paths.push_back(path.string());
+    }
+    AlignedBuffer x = aligned_zeroed(kSelfRows * 2 * kSelfHidden);
+    AlignedBuffer out = aligned_zeroed(kSelfRows * 4 * kSelfHidden * 4);  // two parts per group
+    StackConfig config;
+    config.rows = set;
+    config.staging = 3;
+    config.forward = &fake_forward;
+    config.x_base = x.get();
+    config.x_stride = 2 * kSelfHidden;
+    config.out_base = out.get();
+    config.out_stride = 4 * kSelfHidden * 4;
+    config.hidden = kSelfHidden;
+    config.copy_cpu = placement.copy;
+    config.ranges = {{0, kGroup}, {kGroup, 2 * kGroup}};
+    for (int g = 0; g < 2; ++g) {
+      StackConfig::Group group;
+      group.service_cpu = placement.groups[g].service;
+      group.cores.assign(placement.groups[g].workers.begin(), placement.groups[g].workers.end());
+      group.engine = g + 1;
+      group.split = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+      config.groups.push_back(group);
+    }
+    fake_calls.clear();
+    PinScope writer(placement.writer);
+    Stack<BenchBuild> stack(std::move(config));
+    DeviceSim sim(stack.page(), stack.lease(), kSelfRows, kSelfExperts);
+    const int32_t four[] = {0, 1, 2, 3};
+    load_experts(sim, 0, four, 3, soon());
+    stack.set_cpu_layer(0, kFakeHandle);
+    sim.set_row_cpu(0);
+    const float ones[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    const SimRequest r = sim.post(0, four, ones, /*captured=*/true, soon());
+    CHECK(sim.copy_wait(r, soon()));
+    {
+      std::lock_guard<std::mutex> guard(fake_mutex);
+      CHECK(fake_calls.size() == 2);  // one CPU-hit job per group
+      for (const FakeCall& call : fake_calls) {
+        const int64_t g = call.engine - 1;
+        CHECK(g == 0 || g == 1);
+        for (int32_t slot : call.slots)
+          CHECK(slot >= g * kGroup && slot < (g + 1) * kGroup);
+      }
+    }
+    for (int g = 0; g < 2; ++g)
+      CHECK(stack.group_counters(g)[es::kSpinCpu] == placement.groups[g].service);
+  }
+}
+
 }  // namespace
 
 int run_self_test(const Placement& placement, const std::filesystem::path& image_dir) {
   test_placement();
+  test_two_group_placement();
   test_record_bytes();
   test_full_width_record();
   test_seqlock_order();
@@ -660,6 +785,7 @@ int run_self_test(const Placement& placement, const std::filesystem::path& image
   require_o_direct(image_dir);
   test_image_stamp(image_dir);
   test_stack(placement, image_dir);
+  test_two_groups(placement, image_dir);
   std::fprintf(
       stderr, "self-test (%s): %d checks, %d failed\n", std::string(BenchBuild::kName).c_str(), checks, failures);
   return failures;
