@@ -5,8 +5,6 @@
 // and cache-line output partitioning. See README.txt for measured provenance.
 // The arithmetic is math.hpp and each tier's math_scalar.hpp, math_avx2.hpp and math_avx512.hpp; the forward is
 // forward_plan.hpp (with shapes.hpp). This file holds the C ABI and the torch wrappers.
-#include <atomic>
-#include <type_traits>
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
 #endif
@@ -15,32 +13,13 @@
 #include "../../cpu_experts_common/cabi.hpp"
 #include <c10/util/Half.h>
 #include <ATen/ATen.h>
-#include <omp.h>
 
 #include <algorithm>
-#include <array>
-#include <cctype>
-#include <cmath>
 #include <cstring>
-#include <immintrin.h>
-#include <chrono>
-#include <limits>
-#include <cstdio>
-#include <cstdlib>
-#include <mutex>
 #include <memory>
-#include <string>
+#include <mutex>
+#include <utility>
 #include <vector>
-
-#ifdef __linux__
-#include <pthread.h>
-#include <sched.h>
-#else
-// min/max macro suppression is handled globally (-DNOMINMAX in setup.py): this TU uses
-// std::min/max/clamp throughout
-#include <intrin.h>
-#include <windows.h>
-#endif
 
 // Last: the definition order the kernels were validated in (bit-exact per tier); another order changes what GCC
 // inlines and clones.
