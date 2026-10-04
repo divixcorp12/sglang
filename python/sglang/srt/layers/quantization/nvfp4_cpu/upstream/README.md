@@ -26,8 +26,11 @@ preprocessor guards. Native x86 AVX2 builds also require FMA, as upstream does.
 
 ## Adaptation boundary
 
-`../optimized/dot_nvfp4.h` is derived from the same dot-product function.
-The changes are its signature, weight/scale access, and nibble interleave:
+`../optimized/math_avx2.hpp` (the AVX2 branch, with the `__AVX2__` helpers
+restated under a target attribute) and `../optimized/math_scalar.hpp` (the
+scalar loop) are derived from the same dot-product function, and
+`../optimized/math.hpp`'s `GpuRow` from its block access; the upstream `__AVX__`-only
+branch is not carried. The changes are its signature, weight/scale access, and nibble interleave:
 GPU bytes hold adjacent columns; GGML bytes hold columns j and j+8 per group.
 Integer multiply/reduction, doubled FP4 LUT, activation deltas and floating
 accumulation remain GGML arithmetic. Signed GPU E4M3 scales are supported;
@@ -36,7 +39,7 @@ Shapes divisible by 16 get zero padding in activation scratch and at most
 32 bytes of stack weight scratch for a partial 64-value block. GPU slabs are
 never overwritten, cached in a second format, or persistently repacked.
 
-`../optimized/moe_mul1.cpp` and its headers (`quant.hpp`, `shapes.hpp`, `forward_plan.hpp`) are SGLang glue:
+`../optimized/kernel.cpp` and its headers (`quant.hpp`, `shapes.hpp`, `forward_plan.hpp`) are SGLang glue:
 registration, the OpenMP forward plan, GPU scale addressing, global alphas, FP16 input, SiLU, routing and callback ABI.
 Its Q8 wrapper zeros blocks with a zero FP16 delta before calling the original
 quantizer, avoiding reciprocal overflow on tiny FP32 inputs. Nonfinite inputs

@@ -1,8 +1,12 @@
 // The x86 vector tiers a CPU expert quant may implement, and the tier one runs at: min(hardware, the quant's top
-// tier, the quant's cap environment variable).
+// tier, the quant's cap environment variable). A quant's report variable prints the tier it settled on.
+// Env convention: kIsaCapEnv / kIsaReportEnv per quant; new quants use <QUANT>_CPU_MAX_ISA / <QUANT>_CPU_REPORT_ISA,
+// EXL3 keeps its legacy EXL3_MOE_CPU_* prefix.
 #pragma once
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #if !defined(__GNUC__) || !defined(__linux__) || !defined(__x86_64__)
@@ -28,14 +32,16 @@ template <Isa I> constexpr bool kAvx512 = I == Isa::Bw || I == Isa::Vnni || I ==
 inline Isa detect_isa(Isa top, const char* cap_env)
 {
     __builtin_cpu_init();
+    // Each tier needs every feature its SGLANG_TARGET_* attribute compiles for (fma and f16c included).
+    const bool fma_f16c = __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
     Isa hw;
     if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl")
-        && __builtin_cpu_supports("fma")) {
+        && fma_f16c) {
         if (__builtin_cpu_supports("avx512vnni"))
             hw = __builtin_cpu_supports("avx512vbmi") ? Isa::Vbmi : Isa::Vnni;
         else
             hw = Isa::Bw;
-    } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
+    } else if (__builtin_cpu_supports("avx2") && fma_f16c)
         hw = Isa::Avx2;
     else
         hw = Isa::Scalar;
@@ -54,6 +60,26 @@ inline Isa detect_isa(Isa top, const char* cap_env)
         if (cap < hw) hw = cap;
     }
     return hw;
+}
+
+// The tier's name, as a cap variable spells it.
+inline const char* isa_name(Isa isa)
+{
+    switch (isa) {
+        case Isa::Scalar: return "scalar";
+        case Isa::Avx2: return "avx2";
+        case Isa::Bw: return "bw";
+        case Isa::Vnni: return "vnni";
+        case Isa::Vbmi: return "vbmi";
+    }
+    return "unknown";
+}
+
+// report_env (may be null) names a variable that, when it is "1", makes this print "<name> isa <tier>" to stderr.
+inline void report_isa(const char* name, Isa isa, const char* report_env)
+{
+    const char* e = report_env ? std::getenv(report_env) : nullptr;
+    if (e && std::strcmp(e, "1") == 0) std::fprintf(stderr, "%s isa %s\n", name, isa_name(isa));
 }
 
 }  // namespace

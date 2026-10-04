@@ -1,6 +1,8 @@
 // The registry, validation and dispatch every CPU expert quant shares, generic over the quant (the Quant contract:
-// kName, kSlabs, kOptionalSlabs, kMaxRoutes, kMaxRows, kTopIsa, kIsaCapEnv, Params, Layer, Row, min_slot_bytes,
-// validate, make_layer, check_slot, dispatch, decode). Each quant's library holds its own registry and forward lock.
+// kName, kSlabs, kOptionalSlabs, kMaxRoutes, kMaxRows, kTopIsa, kIsaCapEnv, kIsaReportEnv, Params, Layer, Row,
+// min_slot_bytes, validate, make_layer, check_slot, dispatch, decode). Each quant's library holds its own registry and forward lock.
+// A Quant's dispatch may ignore the RouteTable and read the request directly: EXL3 does, to keep its frozen
+// accumulation order, so it runs the zero-weight routes that RouteTable drops.
 #pragma once
 #include "../../../../kernels/jit/csrc/moe/expert_stream/host/cpu_experts_abi.h"
 #include "buffer_row.hpp"
@@ -13,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace sglang::cpu_experts {
@@ -35,10 +38,15 @@ struct ExpertForward
     // One forward or free at a time: the others return 3 rather than race the forward's scratch.
     static inline std::mutex forward_mutex;
 
-    // Computed at the first call, so a test may set the cap variable before it.
+    // Computed at the first call, so a test may set the cap variable before it. Then, when Quant::kIsaReportEnv (may
+    // be null) is "1", prints "<kName> isa <tier>" to stderr, once.
     static Isa isa()
     {
-        static const Isa isa = detect_isa(Quant::kTopIsa, Quant::kIsaCapEnv);
+        static const Isa isa = [] {
+            const Isa detected = detect_isa(Quant::kTopIsa, Quant::kIsaCapEnv);
+            report_isa(Quant::kName, detected, Quant::kIsaReportEnv);
+            return detected;
+        }();
         return isa;
     }
 
@@ -51,6 +59,7 @@ struct ExpertForward
 
     static int register_layer(const SglangCpuExpertsLayer* d, int64_t* handle) noexcept
     {
+        last_error().clear();
         try {
             if (!d || !handle || d->abi_version != SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION || d->capacity < 1
                 || d->slab_count != Quant::kSlabs)
@@ -71,13 +80,16 @@ struct ExpertForward
             layers.push_back(std::move(layer));
             *handle = int64_t(layers.size() - 1);
             return 0;
+        } catch (const std::exception& e) {
+            return fail(e.what());
         } catch (...) {
-            return 1;
+            return fail("unknown exception");
         }
     }
 
     static int free_layer(int64_t handle) noexcept
     {
+        last_error().clear();
         try {
             std::unique_lock<std::mutex> forward_lock(forward_mutex, std::try_to_lock);
             if (!forward_lock.owns_lock()) return 3;
@@ -85,13 +97,16 @@ struct ExpertForward
             if (handle < 0 || handle >= int64_t(layers.size()) || !layers[size_t(handle)]) return 2;
             layers[size_t(handle)].reset();
             return 0;
+        } catch (const std::exception& e) {
+            return fail(e.what());
         } catch (...) {
-            return 1;
+            return fail("unknown exception");
         }
     }
 
     static int forward(const SglangCpuExpertsForward* call) noexcept
     {
+        last_error().clear();
         try {
             if (!call || call->abi_version != SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION) return 2;
             const SglangCpuExpertsForward& c = *call;
@@ -112,8 +127,10 @@ struct ExpertForward
             }
             const RouteTable routes = RouteTable::build(c.slots, c.weights, c.rows, c.k);
             return Quant::dispatch(*layer, c, routes, isa());
+        } catch (const std::exception& e) {
+            return fail(e.what());
         } catch (...) {
-            return 1;
+            return fail("unknown exception");
         }
     }
 
@@ -122,8 +139,10 @@ struct ExpertForward
     {
         try {
             return ::sglang::cpu_experts::keep_warm<Quant::kTopIsa>(isa(), threads, word, seen, deadline_ns);
+        } catch (const std::exception& e) {
+            return fail(e.what());
         } catch (...) {
-            return 1;
+            return fail("unknown exception");
         }
     }
 };

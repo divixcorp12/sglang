@@ -24,6 +24,7 @@ struct ToyQuant {
     static constexpr int kMaxRows = 64;
     static constexpr Isa kTopIsa = Isa::TOY_TOP_ISA;
     static constexpr const char* kIsaCapEnv = "TOY_CPU_MAX_ISA";
+    static constexpr const char* kIsaReportEnv = "TOY_CPU_REPORT_ISA";
     using Params = ToyParams;
     struct Row { const float* v; };
     struct Layer { int hidden; float scale; MoeBufferRows<ToyQuant> rows; };

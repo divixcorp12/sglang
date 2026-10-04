@@ -1,5 +1,5 @@
-// The one argument of every CPU expert format's forward (CpuExpertForward in cpu_experts.h): the EXL3 and NVFP4
-// kernels' sglang_*_cpu_experts_forward take a pointer to this. Plain C, so a format's standalone build and a ctypes
+// The forward request (SglangCpuExpertsForward, the one argument of every CPU expert format's forward; CpuExpertForward
+// in cpu_experts.h) and the registration descriptor (SglangCpuExpertsLayer) of the EXL3 and NVFP4 kernels. Plain C, so a format's standalone build and a ctypes
 // caller can use it without the engine's headers.
 #pragma once
 #include <stdint.h>

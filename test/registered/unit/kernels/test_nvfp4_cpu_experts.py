@@ -83,7 +83,7 @@ if cores:
 
 
 @pytest.fixture(scope="module")
-def library(tmp_path_factory):
+def built(tmp_path_factory):
     spec = importlib.util.spec_from_file_location(
         "nvfp4_cpu_build", REPO / "python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py"
     )
@@ -92,13 +92,33 @@ def library(tmp_path_factory):
     return build.build(tmp_path_factory.mktemp("nvfp4") / "libnvfp4.so", cxx=CXX)
 
 
+def _host_has_avx2() -> bool:
+    # What detect_isa requires for the AVX2 tier (cpu_experts_common/isa.hpp).
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return False
+    flags = next((line.split(":", 1)[1].split() for line in cpuinfo.splitlines() if line.startswith("flags")), [])
+    return {"avx2", "fma", "f16c"} <= set(flags)
+
+
+# One library holds every tier; each case runs at each, capped by NVFP4_CPU_MAX_ISA. A cap never raises the tier, so
+# the avx2 case is skipped where it would silently run the scalar tier again.
+@pytest.fixture(params=["avx2", "scalar"])
+def library(built, request):
+    if request.param == "avx2" and not _host_has_avx2():
+        pytest.skip("the host has no AVX2/FMA/F16C, so the avx2 cap would run the scalar tier")
+    return built, request.param
+
+
 def _run(library, calls, cores=(), alpha=1.0, **env):
+    path, isa = library
     result = subprocess.run(
-        [sys.executable, "-c", CHILD, str(library), calls, ",".join(map(str, cores)), str(alpha)],
+        [sys.executable, "-c", CHILD, str(path), calls, ",".join(map(str, cores)), str(alpha)],
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, **env},
+        env={**os.environ, "NVFP4_CPU_MAX_ISA": isa, **env},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout.split("\n")[:-1]
@@ -131,7 +151,7 @@ def test_cores_cannot_change_after_the_first_forward(library):
 
 
 def test_a_worker_that_cannot_be_pinned_fails_the_forward_and_leaves_out_untouched(library, tmp_path):
-    # set_cores checked the cores against the affinity mask; pinning can still fail later (a cgroup change). A preloaded
+    # set_cores checks only range and uniqueness; a core the kernel cannot pin fails the first forward. A preloaded
     # pthread_setaffinity_np that always fails stands in for that.
     shim = tmp_path / "unpinnable.c"
     shim.write_text("int pthread_setaffinity_np(unsigned long t, unsigned long n, const void* s) { return 22; }\n")

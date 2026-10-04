@@ -1,15 +1,14 @@
-"""Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (exl3_cpu/optimized/moe_mul1.cpp).
+"""Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (exl3_cpu/optimized/kernel.cpp).
 
 ``dump`` runs a fixed set of forwards through the extension ``exl3_ext()`` builds and saves every output; ``compare``
 checks two dumps for bitwise equality. A dump made at the merge-base is the reference a kernel refactor must reproduce
-exactly, on every ISA tier the host can run. The kernel reads EXL3_MOE_CPU_MAX_ISA once, at load, so each tier is its
-own process.
+exactly, on every ISA tier the host can run. The kernel reads EXL3_MOE_CPU_MAX_ISA once, at its first forward or tier
+query, so each tier is its own process.
 
 Run on divix01 through run_exl3_cpu_forward_checks.sh, which sets the build environment.
 """
 
 import argparse
-import ctypes
 import itertools
 import os
 import sys
@@ -31,8 +30,6 @@ ROUTES = {
 }
 WEIGHTS = (0.5, 0.3, 0.2, 0.15, 0.1)
 SCALES = (1.0, 8.0)
-# exl3_expert_format.EXL3_STREAMED_NAMES, the slab order of sglang_exl3_cpu_experts_register_slabs.
-NAMES = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
 TIERS = {"scalar": (False, False), "avx2": (True, False), "bw": (True, True)}
 
 
@@ -78,30 +75,20 @@ def register_table(ext, s, limit):
     )
 
 
-def register_slabs(ext, s, hidden, inter, limit):
-    """The slab ABI over the same tensors: six base pointers, slot s at base + s rows."""
-    fn = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_register_slabs
-    fn.restype = ctypes.c_int
-    fn.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_int32,
-        ctypes.c_int32,
-        ctypes.c_int32,
-        ctypes.c_int32,
-        ctypes.c_int32,
-        ctypes.c_float,
-        ctypes.POINTER(ctypes.c_int64),
-    ]
-    bases = (ctypes.c_void_p * len(NAMES))(*(s[n].data_ptr() for n in NAMES))
-    handle = ctypes.c_int64(-1)
-    status = fn(bases, CAP, hidden, inter, 3, 0, limit, ctypes.byref(handle))
-    if status != 0:
-        sys.exit(f"register_slabs refused the {hidden}x{inter} slabs: status {status}")
-    return handle.value
+def register_slabs(ext, s, limit):
+    """The C ABI's register_layer over the same tensors, as the RAM-miss service registers them: six base pointers,
+    slot s at base + s rows. Returns the handle and the trait that frees it."""
+    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+
+    trait = Exl3CpuQuantTrait(ext, act_limit=limit)
+    try:
+        return trait.register_layer(s, CAP), trait
+    except RuntimeError as error:
+        sys.exit(f"register_layer refused the slabs: {error}")
 
 
 def dump(args):
-    os.environ["EXL3_MOE_CPU_MAX_ISA"] = args.isa  # read at the kernel's load: before the extension imports
+    os.environ["EXL3_MOE_CPU_MAX_ISA"] = args.isa  # read once, at the kernel's first use
     os.environ.setdefault("EXL3_MOE_CPU_PIN", "0")
     import torch
 
@@ -118,9 +105,9 @@ def dump(args):
     for (name, hidden, inter), limit in itertools.product(SHAPES, LIMITS):
         slabs = random_slabs(torch, hidden, inter, seed=hidden)
         if args.registration == "table":
-            handle = register_table(ext, slabs, limit)
+            handle, trait = register_table(ext, slabs, limit), None
         else:
-            handle = register_slabs(ext, slabs, hidden, inter, limit)
+            handle, trait = register_slabs(ext, slabs, limit)
         try:
             g = torch.Generator().manual_seed(7)
             for (tokens, k), route in ROUTES.items():
@@ -135,7 +122,10 @@ def dump(args):
                         sys.exit(f"{case}: non-finite output")
                     outputs[case] = out
         finally:
-            ext.exl3_moe_cpu_free_layer(handle)
+            if trait is None:
+                ext.exl3_moe_cpu_free_layer(handle)
+            else:
+                trait.free_layer(handle)
     torch.save({"isa": args.isa, "registration": args.registration, "outputs": outputs}, args.out)
     print(f"{len(outputs)} outputs ({args.isa}, {args.registration}) -> {args.out}")
 

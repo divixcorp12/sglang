@@ -35,7 +35,7 @@ class StackFixture {
   float* out_row(int64_t row) const;  // part 0 (CPU hits) at [0, hidden), part 1 (CPU misses) at [hidden, 2 hidden)
   int64_t out_stride() const;         // bytes
   void write_x(int64_t row) const;    // the post's x store: the layer's fixture input into the row's x
-  // Registers the row's kCapacity slot views with exl3_moe_cpu_make_layer and returns the layer handle.
+  // Registers the row's kCapacity slot views with sglang_exl3_cpu_experts_register_layer; returns the layer handle.
   int64_t register_layer(int64_t row) const;
   // Fills slot e of the row's slabs with expert e from the row's image file: the slot the tier's reader would pick (the
   // lowest free slot after reserve_staging(kStaging)). For the bare forwards, which run before the stack exists.

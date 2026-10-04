@@ -1,5 +1,6 @@
 // A call's live routes per token: the -1 slots and zero weights of the call's [rows][k] slots/weights dropped, the
 // routing order kept. Built after the forward validated every slot and weight.
+// A Quant's dispatch may use it or read the request directly (EXL3 does, and so runs zero-weight routes).
 #pragma once
 #include <cstddef>
 #include <cstdint>

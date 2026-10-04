@@ -86,6 +86,7 @@ int32_t keep_warm_loop(Isa isa, const uint32_t* word, uint32_t seen, int64_t dea
 template <Isa Top>
 int keep_warm(Isa isa, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept
 {
+    last_error().clear();
     if (threads < 1 || word == nullptr) return 2;
     try {
         Cores::freeze();
@@ -97,9 +98,12 @@ int keep_warm(Isa isa, int32_t threads, const uint32_t* word, uint32_t seen, int
             keep_warm_detail::sink.fetch_add(keep_warm_loop<Top>(isa, word, seen, deadline_ns),
                                              std::memory_order_relaxed);
         }
-        return pin_error.load(std::memory_order_relaxed) ? 1 : 0;
+        return pin_error.load(std::memory_order_relaxed) ? fail("cannot pin CPU expert worker to its configured core")
+                                                         : 0;
+    } catch (const std::exception& e) {
+        return fail(e.what());
     } catch (...) {
-        return 1;
+        return fail("unknown exception");
     }
 }
 
