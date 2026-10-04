@@ -570,7 +570,7 @@ class RamTier {
   // HIT_COPY lanes with the DMA engine. `device` < 0 selects the CPU test backend (HostCopyBackend). Must run before
   // the service thread starts, and the engine stays unarmed until arm_copy_engine(). `wait_timeout_ns` is how long a
   // closed gate may hold the decode stream before the watchdog aborts the process (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS).
-  void enable_copy_engine(int64_t device, int64_t spin_ns, int64_t wait_timeout_ns) {
+  void enable_copy_engine(int64_t device, int64_t spin_ns, int64_t wait_timeout_ns, std::vector<int> cpus) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable the copy engine before the service thread starts");
     if (copy_engine_ != nullptr)
@@ -589,7 +589,8 @@ class RamTier {
         spin_ns,
         this,
         copy_prefix,
-        std::string(Layout::kName) + "-copy-eng");
+        std::string(Layout::kName) + "-copy-eng",
+        std::move(cpus));
     if (wait_timeout_ns <= 0)
       throw std::runtime_error(error_prefix<Layout>() + "the copy-wait timeout must be positive");
     copy_wait_timeout_ns_ = wait_timeout_ns;

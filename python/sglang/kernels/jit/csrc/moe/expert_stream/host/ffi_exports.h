@@ -351,8 +351,17 @@ struct HostExports {
     find(handle)->set_prefill_share(share);
   }
 
-  static void enable_copy_engine(int64_t handle, int64_t device, int64_t spin_ns, int64_t wait_timeout_ns) {
-    find(handle)->enable_copy_engine(device, spin_ns, wait_timeout_ns);
+  // `cpus` is int64 [n], the copy thread's affinity (ThreadingConfig.copy_cpus); empty inherits the caller's.
+  static void enable_copy_engine(
+      int64_t handle, int64_t device, int64_t spin_ns, int64_t wait_timeout_ns, TensorView cpus) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("cpus", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cpus);
+    std::vector<int> list;
+    const auto* c = static_cast<const int64_t*>(cpus.data_ptr());
+    for (int64_t i = 0; i < cpus.size(0); ++i)
+      list.push_back(static_cast<int>(c[i]));
+    find(handle)->enable_copy_engine(device, spin_ns, wait_timeout_ns, std::move(list));
   }
 
   // entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination;

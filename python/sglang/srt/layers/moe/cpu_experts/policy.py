@@ -16,18 +16,6 @@ from typing import Sequence
 import torch
 
 
-def parse_core_list(spec: str) -> list[int]:
-    """Cores from a taskset-style list such as "36-47,50"."""
-    cores: list[int] = []
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        lo, sep, hi = part.partition("-")
-        cores.extend(range(int(lo), int(hi) + 1) if sep else [int(lo)])
-    return sorted(set(cores))
-
-
 def k_star(n: int, c_cpu_ms: float, c_link_ms: float, handoff_ms: float) -> int:
     """How many of a layer's ``n`` RAM-tier experts go to the CPU.
 

@@ -42,6 +42,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
 )
 from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.cpu_experts.threading_config import ThreadingConfig
 from sglang.srt.layers.moe.exl3_expert_format import (
     EXL3_MAX_GATHER_ROWS,
     EXL3_STREAMED_NAMES,
@@ -53,6 +54,7 @@ from sglang.srt.layers.moe.exl3_row_image import RowImageSet
 from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
+from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
 
 logger = logging.getLogger(__name__)
 # NVTX ranges around the eager host-use pause's stream sync and thread pause.
@@ -938,8 +940,24 @@ class Exl3RamMissService:
             raise RuntimeError(
                 f"exl3 RAM miss: the host module's layout {layout_names} is not EXL3_STREAMED_NAMES {EXL3_STREAMED_NAMES}"
             )
+        numa = ThreadingConfig.from_env(
+            cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
+            device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+        )
+        for line in numa.log_lines():
+            logger.info("exl3 RAM miss %s", line)
+        node_ranges = None
+        if numa.nodes > 1:
+            # Rows in layer order, as exl3_ram_miss_tables numbers them; a slot across a seam is in no range.
+            node_ranges = group_ranges(
+                [
+                    slot_nodes(s.pinned_host_cache.tensors, s.pinned_host_cache.capacity)
+                    for _, s in sorted(streamers.items())
+                ],
+                [plan.node for plan in numa.plans],
+            )
         pin = torch.cuda.is_available()
-        self._wire = wire_layout(lanes)
+        self._wire = wire_layout(lanes, numa.nodes)
         page = new_page(pin=pin, wire=self._wire)
         hot_page = new_hot_page(tables.starts.shape[1], pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
@@ -958,6 +976,8 @@ class Exl3RamMissService:
             hot_page=hot_page,
             variant="instr" if instrumented else None,
             lanes=self.lanes,
+            node_ranges=node_ranges,
+            sq_thread_cpus=[-1 if p.sq is None else p.sq for p in numa.plans],
         )
         try:
             # Before any slot is filled: the hot cache fills the tiers first, after
@@ -970,11 +990,13 @@ class Exl3RamMissService:
                 # Before the thread starts, and unarmed. The watchdog bounds each copy
                 # wait by the RAM-miss timeout.
                 host.enable_copy_engine(
-                    torch.cuda.current_device(), wait_timeout_ms=cfg.ram_miss_timeout_ms
+                    torch.cuda.current_device(),
+                    wait_timeout_ms=cfg.ram_miss_timeout_ms,
+                    cpus=numa.copy_cpus,
                 )
             cpu_experts = None
             if envs.SGLANG_DSV41_CPU_EXPERTS.get():
-                cpu_experts = self._start_cpu_experts(cfg, host, fmt, streamers, pin)
+                cpu_experts = self._start_cpu_experts(cfg, host, fmt, streamers, pin, numa)
             if get_exl3_stream_trace().enabled:
                 # Before the thread starts: without a trace file it takes no timestamps.
                 host.enable_trace()
@@ -994,15 +1016,12 @@ class Exl3RamMissService:
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_SHARE needs the expert distribution recorder "
                         "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
                     )
-            spin_core = envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.get()
-            if spin_core is None:
-                host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
-            else:
-                host.start_thread(
-                    cpu_core=spin_core,
-                    busy_poll=True,
-                    fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
-                )
+            cores = [-1 if plan.ram is None else plan.ram for plan in numa.plans]
+            host.start_thread(
+                cpu_core=cores if numa.nodes > 1 else cores[0],
+                busy_poll=all(plan.busy_poll for plan in numa.plans),
+                fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
+            )
             if fault is not None:
                 demands, seconds = fault
                 host.inject(delay_s=seconds, delay_after_demands=demands)
@@ -1017,6 +1036,7 @@ class Exl3RamMissService:
             host.stop()
             raise
         self.page, self.slot_map, self.host = page, slot_map, host
+        self.numa = numa
         self.hot_page = hot_page
         self.copy_engine = copy_engine
         self.cpu_experts = cpu_experts
@@ -1047,7 +1067,7 @@ class Exl3RamMissService:
         )
 
     @staticmethod
-    def _start_cpu_experts(cfg, host, fmt, streamers, pin: bool):
+    def _start_cpu_experts(cfg, host, fmt, streamers, pin: bool, numa: ThreadingConfig):
         """Build the CPU expert service for ``SGLANG_DSV41_CPU_EXPERTS``.
 
         Runs after the copy engine is enabled and before the service thread starts. CPU
@@ -1056,9 +1076,8 @@ class Exl3RamMissService:
         fused plan, and the prefetch pull join must be off.
         """
         from sglang.srt.layers.moe.cpu_experts.service import (
-            CpuExpertService,
+            CpuExpertGroups,
             configured_split,
-            cpu_expert_cores,
             cpu_trait_for,
         )
 
@@ -1080,7 +1099,6 @@ class Exl3RamMissService:
             raise RuntimeError(
                 "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_MOE_EXPERT_FUSED_PLAN"
             )
-        cores, threads = cpu_expert_cores()
         # Rows in layer order, as exl3_ram_miss_tables numbers them.
         caches = {
             row: s.pinned_host_cache.tensors
@@ -1092,13 +1110,12 @@ class Exl3RamMissService:
             raise RuntimeError(
                 f"exl3 RAM miss: CPU experts need one hidden size, the layers have {hidden}"
             )
-        return CpuExpertService(
+        return CpuExpertGroups(
             host,
             trait,
             caches,
             hidden=hidden.pop(),
-            cores=cores,
-            threads=threads,
+            plans=numa.plans,
             split=configured_split(host.wire.lanes),
             pin=pin,
         )
@@ -1201,6 +1218,7 @@ class Exl3RamMissService:
                 hit_copy=envs.SGLANG_DSV41_RAM_HIT_COPY.get(),
                 cpu_misses=envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get(),
                 lanes=self.lanes,
+                nodes=self.wire.nodes,
             )
             if self.cpu_experts is not None:
                 self.device_side.enable_cpu_experts(

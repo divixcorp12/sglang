@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <sched.h>
 
 #include "../lease_layout.h"
 #include "build_policy.h"
@@ -424,7 +425,7 @@ class CopyEngine {
 
  public:
   // `thread_name` is the copy thread's pthread name (e.g. Layout::kName + "-copy-eng"), truncated to 15 bytes
-  // (pthread_setname_np's limit).
+  // (pthread_setname_np's limit). `cpus` is the thread's affinity; empty inherits the starter's.
   CopyEngine(
       std::unique_ptr<CopyBackend> backend,
       int64_t rows,
@@ -432,13 +433,15 @@ class CopyEngine {
       int64_t spin_ns,
       Owner* owner,
       std::string prefix,
-      std::string thread_name)
+      std::string thread_name,
+      std::vector<int> cpus)
       : backend_(std::move(backend)),
         tables_(static_cast<size_t>(rows)),
         spin_ns_(spin_ns),
         owner_(owner),
         prefix_(std::move(prefix)),
-        thread_name_(thread_name.substr(0, 15)) {
+        thread_name_(thread_name.substr(0, 15)),
+        cpus_(std::move(cpus)) {
     for (int g = 0; g < groups; ++g) jobs_.push_back(std::make_unique<SpscRing<CopyJob, kCopyRing>>());
   }
 
@@ -575,7 +578,16 @@ class CopyEngine {
 
   void run() {
     pthread_setname_np(pthread_self(), thread_name_.c_str());
-    const std::string error = backend_->init();
+    std::string error;
+    if (!cpus_.empty()) {
+      // ThreadingConfig.copy_cpus: the GPU's node. A thread created later inherits the enabling caller's affinity.
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      for (const int cpu : cpus_)
+        CPU_SET(cpu, &set);
+      if (sched_setaffinity(0, sizeof(set), &set) != 0) error = "cannot pin the copy thread to its cores";
+    }
+    if (error.empty()) error = backend_->init();
     {
       std::lock_guard<std::mutex> guard(start_mutex_);  // the start handshake: setup, not the hot path
       init_error_ = error;
@@ -766,6 +778,7 @@ class CopyEngine {
   Owner* owner_;
   std::string prefix_;
   std::string thread_name_;
+  std::vector<int> cpus_;  // the copy thread's affinity; empty inherits the starter's
   std::thread thread_;
   std::vector<std::unique_ptr<SpscRing<CopyJob, kCopyRing>>> jobs_;  // one per group: each group pushes its own
   std::array<std::atomic<uint64_t>, Wire::kNodes> submitted_{};      // each written by its group's thread only

@@ -24,7 +24,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.cpu_experts.policy import (
     format_calibration,
-    parse_core_list,
     split_from_grid,
     split_table,
 )
@@ -81,6 +80,10 @@ class CpuExpertService:
     ``calibrate`` (startup measurement); a calibrated split is final, so ``retune`` then
     does nothing. Calibration's own CPU jobs are subtracted from ``log_stats`` and from
     ``retune``'s baseline.
+
+    At several NUMA nodes there is one service per group (``CpuExpertGroups``): each runs
+    its own engine on its node's cores and writes its own two output parts of a row. A
+    service made with ``shared`` uses that service's pinned rows and layer handles.
     """
 
     def __init__(
@@ -94,6 +97,8 @@ class CpuExpertService:
         threads: int,
         split: Sequence[int],
         pin: bool = True,
+        group: int = 0,
+        shared: Optional["CpuExpertService"] = None,
     ):
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_engine_cores
 
@@ -101,6 +106,7 @@ class CpuExpertService:
         check_engine_cores(cores, threads)
         trait.check_environment()
         self.host, self.trait = host, trait
+        self.group = group
         # The split table covers n = 0..lanes resident lanes, as the host's wire does.
         self.lanes = host.wire.lanes
         self.slabs_by_row = dict(slabs_by_row)
@@ -114,16 +120,19 @@ class CpuExpertService:
             raise ValueError(
                 "CPU experts need the slabs of every service row 0..rows-1"
             )
-        # Row layout is in the class doc; pinned so the device reaches them by UVA.
-        x_bytes = -(-2 * self.hidden // 16) * 16
-        self.x_rows = torch.zeros((rows, x_bytes), dtype=torch.uint8)
-        self.out_rows = torch.zeros((rows, 2, self.hidden), dtype=torch.float32)
-        if pin:
-            self.x_rows, self.out_rows = (
-                self.x_rows.pin_memory(),
-                self.out_rows.pin_memory(),
-            )
-        self.handles: dict[int, object] = {}
+        if shared is not None:
+            self.x_rows, self.out_rows, self.handles = shared.x_rows, shared.out_rows, shared.handles
+        else:
+            # Row layout is in the class doc; pinned so the device reaches them by UVA.
+            x_bytes = -(-2 * self.hidden // 16) * 16
+            self.x_rows = torch.zeros((rows, x_bytes), dtype=torch.uint8)
+            self.out_rows = torch.zeros((rows, 2 * host.nodes, self.hidden), dtype=torch.float32)
+            if pin:
+                self.x_rows, self.out_rows = (
+                    self.x_rows.pin_memory(),
+                    self.out_rows.pin_memory(),
+                )
+            self.handles: dict[int, object] = {}
         keep_warm_us = envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get()
         self.engine = trait.native_create_engine(self.cores)  # never freed: the engine thread may run to process exit
         host.enable_cpu_experts(
@@ -133,13 +142,15 @@ class CpuExpertService:
             self.x_rows,
             self.out_rows,
             threads=self.threads,
+            group=self.group,
             engine=self.engine,
             keep_warm=trait.native_keep_warm() if keep_warm_us > 0 else 0,
             keep_warm_us=max(keep_warm_us, 0),
         )
-        self._last_stats = host.cpu_stats()
+        self._last_stats = host.cpu_stats(self.group)
         logger.info(
-            "CPU experts on: %s trait, cores %s, %d threads, split %s",
+            "CPU experts group %d on: %s trait, cores %s, %d threads, split %s",
+            self.group,
             trait.name,
             list(self.cores),
             self.threads,
@@ -152,6 +163,13 @@ class CpuExpertService:
         if len(rows) != 1:
             raise ValueError(f"the pinned slabs disagree on their row count {rows}")
         return rows.pop()
+
+    def _group_slots(self, row: int) -> int:
+        """The slots of ``row`` this service's NUMA group holds: the row's slab rows at one group."""
+        if self.host.nodes == 1:
+            return self._capacity(self.slabs_by_row[row])
+        lo, hi = self.host.node_ranges[self.group][row]
+        return hi - lo
 
     def registered(self, row: int) -> bool:
         """Whether ``row`` has been registered with the kernel."""
@@ -200,11 +218,12 @@ class CpuExpertService:
         """
         stats = {
             key: value - self._calibration_stats[key]
-            for key, value in self.host.cpu_stats().items()
+            for key, value in self.host.cpu_stats(self.group).items()
         }
         lanes = stats["lanes"]
         logger.info(
-            "CPU experts stats: %d jobs, %d lanes, %.3f ms per lane, split %s",
+            "CPU experts group %d stats: %d jobs, %d lanes, %.3f ms per lane, split %s",
+            self.group,
             stats["jobs"],
             lanes,
             stats["forward_ns"] / lanes / 1e6 if lanes else 0.0,
@@ -221,7 +240,7 @@ class CpuExpertService:
         """
         if self.calibrated:
             return None
-        stats = self.host.cpu_stats()
+        stats = self.host.cpu_stats(self.group)
         lanes = stats["lanes"] - self._last_stats["lanes"]
         ns = stats["forward_ns"] - self._last_stats["forward_ns"]
         if lanes < 64:
@@ -237,9 +256,12 @@ class CpuExpertService:
         if split == self.split:
             return None
         self.split = split
-        self.host.set_cpu_split(split)
+        self.host.set_cpu_split(split, group=self.group)
         logger.info(
-            "CPU experts: measured %.3f ms per expert, split now %s", c_cpu, split
+            "CPU experts group %d: measured %.3f ms per expert, split now %s",
+            self.group,
+            c_cpu,
+            split,
         )
         return split
 
@@ -257,18 +279,17 @@ class CpuExpertService:
             or not envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.get()
         ):
             return None
-        row = calibration_row(
-            {r: self._capacity(self.slabs_by_row[r]) for r in self.handles}, self.lanes
-        )
+        row = calibration_row({r: self._group_slots(r) for r in self.handles}, self.lanes)
         if row is None:
             logger.warning(
-                "CPU experts calibration skipped: no registered row has %d RAM slots; keeping split %s",
+                "CPU experts group %d calibration skipped: no registered row has %d RAM slots; keeping split %s",
+                self.group,
                 self.lanes,
                 self.split,
             )
             return None
         reps = envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.get()
-        before = self.host.cpu_stats()
+        before = self.host.cpu_stats(self.group)
         scratch = None
         try:
             expert_bytes = self.host.copy_expert_bytes(row)
@@ -278,7 +299,7 @@ class CpuExpertService:
                 device="cpu" if device < 0 else torch.device("cuda", device),
             )
             grid = self.host.calibrate_cpu_split(
-                row, device=device, reps=reps, scratch=scratch
+                row, device=device, reps=reps, scratch=scratch, group=self.group
             ).tolist()
         except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
             # A timed-out DMA may still write into the scratch: keep its block out of
@@ -286,7 +307,8 @@ class CpuExpertService:
             self._calibration_scratch = scratch
             self._exclude_calibration_stats(before)
             logger.warning(
-                "CPU experts calibration failed (%s); keeping split %s",
+                "CPU experts group %d calibration failed (%s); keeping split %s",
+                self.group,
                 error,
                 self.split,
             )
@@ -294,7 +316,7 @@ class CpuExpertService:
         self._exclude_calibration_stats(before)
         split = split_from_grid(grid)
         self.split, self.calibrated = split, True
-        self.host.set_cpu_split(split)
+        self.host.set_cpu_split(split, group=self.group)
         report = format_calibration(
             grid, split, row=row, expert_bytes=expert_bytes, reps=reps
         )
@@ -310,7 +332,7 @@ class CpuExpertService:
 
         ``log_stats`` subtracts them and ``retune`` starts counting after them.
         """
-        after = self.host.cpu_stats()
+        after = self.host.cpu_stats(self.group)
         self._calibration_stats = {key: after[key] - before[key] for key in after}
         self._last_stats = after
 
@@ -325,17 +347,48 @@ def calibration_row(capacities: Mapping[int, int], lanes: int) -> Optional[int]:
     return next((r for r in sorted(capacities) if capacities[r] >= lanes), None)
 
 
-def cpu_expert_cores() -> tuple[list[int], int]:
-    """The CPU expert cores and thread count from the environment.
+class CpuExpertGroups:
+    """One CpuExpertService per NUMA group of the host, each on its node's cores (spec 2026-10-03, Part 3).
 
-    Reads ``SGLANG_DSV41_CPU_EXPERTS_CORES`` (a taskset list, required) and
-    ``SGLANG_DSV41_CPU_EXPERTS_THREADS`` (default: one per core).
+    The services share the pinned rows (each group writes its own two output parts of a row) and the kernel's layer
+    registrations: one layer handle addresses a whole slab, so every group's engine gets the same handle. The split is
+    configured, re-tuned and calibrated per group.
     """
-    spec = envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get()
-    if not spec:
-        raise ValueError(
-            "SGLANG_DSV41_CPU_EXPERTS needs SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list, e.g. 18-29)"
-        )
-    cores = parse_core_list(spec)
-    threads = envs.SGLANG_DSV41_CPU_EXPERTS_THREADS.get() or len(cores)
-    return cores, threads
+
+    def __init__(self, host, trait, slabs_by_row, *, hidden: int, plans, split: Sequence[int], pin: bool = True):
+        self.services: list[CpuExpertService] = []
+        for plan in plans:
+            self.services.append(
+                CpuExpertService(
+                    host,
+                    trait,
+                    slabs_by_row,
+                    hidden=hidden,
+                    cores=plan.cpu,
+                    threads=plan.threads,
+                    split=split,
+                    pin=pin,
+                    group=plan.group,
+                    shared=self.services[0] if self.services else None,
+                )
+            )
+        self.x_rows, self.out_rows = self.services[0].x_rows, self.services[0].out_rows
+
+    def registered(self, row: int) -> bool:
+        return self.services[0].registered(row)
+
+    def register(self, row: int, act_limit: Optional[float]) -> None:
+        """Register ``row`` once; the host gives its handle to every group's engine."""
+        self.services[0].register(row, act_limit)
+
+    def attach_device(self, device_side) -> None:
+        self.services[0].attach_device(device_side)
+
+    def retune(self) -> list[Optional[list[int]]]:
+        return [service.retune() for service in self.services]
+
+    def log_stats(self) -> list[dict[str, int]]:
+        return [service.log_stats() for service in self.services]
+
+    def calibrate(self, device: int) -> list[Optional[list[int]]]:
+        return [service.calibrate(device) for service in self.services]

@@ -152,7 +152,11 @@ class Stack {
     tier_->reserve_staging(config_.staging);
     // The copy engine's thread and RamThread's watchdog inherit this thread's affinity: the copy CPU.
     PinScope copy(config_.copy_cpu);
-    tier_->enable_copy_engine(-1, kCopySpinNs, config_.wait_timeout_ns);
+    tier_->enable_copy_engine(
+        -1,
+        kCopySpinNs,
+        config_.wait_timeout_ns,
+        config_.copy_cpu >= 0 ? std::vector<int>{config_.copy_cpu} : std::vector<int>{});
     tier_->arm_copy_engine(true);
     es::CpuExpertConfig cpu;
     cpu.forward = config_.forward;

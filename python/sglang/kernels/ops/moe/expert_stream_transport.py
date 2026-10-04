@@ -1613,7 +1613,7 @@ class ExpertStreamHost:
         self._module.expert_stream_set_prefill_share(self.handle, int(share))
 
     def enable_copy_engine(
-        self, device: int, *, spin_us: int = 5000, wait_timeout_ms: int = 2000
+        self, device: int, *, spin_us: int = 5000, wait_timeout_ms: int = 2000, cpus: Sequence[int] = ()
     ) -> None:
         """Start the copy-engine thread on CUDA ``device`` (-1: the CPU test backend).
 
@@ -1621,10 +1621,15 @@ class ExpertStreamHost:
         :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
         ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the
         process once a closed gate has held the decode stream that long
-        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server).
+        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). ``cpus`` is the copy thread's
+        affinity (``ThreadingConfig.copy_cpus``: the GPU's node); empty inherits the caller's.
         """
         self._module.expert_stream_enable_copy_engine(
-            self.handle, int(device), int(spin_us * 1e3), int(wait_timeout_ms * 1e6)
+            self.handle,
+            int(device),
+            int(spin_us * 1e3),
+            int(wait_timeout_ms * 1e6),
+            torch.tensor([int(c) for c in cpus], dtype=torch.int64),
         )
 
     def set_copy_table(
@@ -2053,6 +2058,11 @@ class ExpertStreamHost:
                     + json.dumps(self.counters())
                     + "\n"
                 )
+                if self.nodes > 1:
+                    for group in range(self.nodes):
+                        sys.stderr.write(
+                            f"exl3 RAM miss group {group} counters " + json.dumps(self.group_counters(group)) + "\n"
+                        )
             finally:
                 close()
 
