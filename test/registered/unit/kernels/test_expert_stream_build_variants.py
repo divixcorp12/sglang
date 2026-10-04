@@ -195,6 +195,17 @@ def test_a_traced_read_on_prod_reads_exact_bytes_with_an_empty_record_and_refuse
     assert instr["rows_asked"] == 2 and instr["bytes"] > 0, "the instrumented build still fills the record"
 
 
+@pytest.mark.parametrize("nodes", [1, 2])
+def test_each_host_build_is_compiled_for_its_node_count(nodes):
+    module = ops._host_module("exl3", "instr", 8, nodes)
+    assert (int(module.expert_stream_wire_lanes()), int(module.expert_stream_wire_nodes())) == (8, nodes)
+
+
+def test_one_node_and_two_nodes_are_separate_modules():
+    assert ops._host_module("exl3", "instr", 8, 1) is ops._host_module("exl3", "instr", 8)
+    assert ops._host_module("exl3", "instr", 8, 2) is not ops._host_module("exl3", "instr", 8, 1)
+
+
 if __name__ == "__main__":
     import sys
 

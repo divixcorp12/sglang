@@ -304,5 +304,10 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
     assert [x & 0xFFFFFFFF for x in words] == kinds_words(kinds, lanes)
 
 
+@pytest.mark.parametrize("lanes, nodes", [(8, 1), (8, 2), (16, 2)])
+def test_each_device_build_is_compiled_for_its_node_count(lanes, nodes):
+    assert int(ops._device_module("exl3", lanes, nodes).expert_stream_wire_nodes()) == nodes
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

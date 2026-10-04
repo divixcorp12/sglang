@@ -19,6 +19,12 @@ def test_the_python_layout_is_the_cpp_trait(lanes, nodes):
     assert lease.wire_layout(lanes, nodes).cpp_constants() == lease.wire_probe(lanes, nodes)
 
 
+@pytest.mark.parametrize("nodes", [1, 2, 3])
+def test_an_expert_is_homed_on_expert_mod_nodes(nodes):
+    w = lease.wire_layout(8, nodes)
+    assert [w.home(e) for e in range(7)] == [e % nodes for e in range(7)]
+
+
 def test_eight_lanes_on_one_node_is_wire_v2():
     w = lease.wire_layout(8)
     assert (w.record_bytes, w.page_bytes, w.lease_block_bytes) == (128, 2176, 20480)
