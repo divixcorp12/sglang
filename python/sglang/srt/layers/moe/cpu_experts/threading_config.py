@@ -71,7 +71,14 @@ def parse_numa_cores(spec: str) -> dict[int, dict[str, list[int]]]:
                 raise ValueError(f"SGLANG_EXPERT_NUMA_CORES: {item!r} on node {node} follows no key")
             else:
                 items[key].append(item)
-        plans[node] = {k: parse_cpu_list(",".join(v)) for k, v in items.items()}
+        plans[node] = {}
+        for k, v in items.items():
+            try:
+                plans[node][k] = parse_cpu_list(",".join(v))
+            except ValueError as refusal:
+                raise ValueError(
+                    f"SGLANG_EXPERT_NUMA_CORES: node {node}'s entry {k}={','.join(v)} is not a taskset core list"
+                ) from refusal
         for k in ("ram", "sq"):
             if k in plans[node] and len(plans[node][k]) != 1:
                 raise ValueError(f"SGLANG_EXPERT_NUMA_CORES: node {node}'s {k} is one core")
@@ -360,4 +367,11 @@ def _check_plan(plan: NodePlan, topology: Topology, affinity: frozenset[int], se
             "so its busy-polling RAM thread would not have the core to itself"
         )
     if settings.cpu_experts:
-        check_engine_cores(plan.cpu, plan.threads)
+        if settings.threads == 1 and plan.threads == 1:
+            raise ValueError(
+                f"THREADS=1 leaves one core for node {plan.node}'s engine; CPU experts need at least 2"
+            )
+        try:
+            check_engine_cores(plan.cpu, plan.threads)
+        except ValueError as refusal:
+            raise ValueError(f"node {plan.node}: {refusal}") from None
