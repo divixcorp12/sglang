@@ -93,6 +93,7 @@ def _host(tmp_path, forwards, *, split, arm=True):
         )
     host.set_cpu_layer(ROW, HANDLE)
     sim = ChainSim(host, page, s.slabs)
+    sim.dst = dst  # the copy thread writes into these: they must outlive the test body
     req = sim.post(ROW, [0, 1, 2, 3])  # make all four resident: two misses per node
     assert host.pump() == 1 and sim.wait_served(req)
     return s, host, sim, out_rows
