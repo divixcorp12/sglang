@@ -28,8 +28,10 @@ LAYERS, EXPERTS, CAPACITY = 2, 8, 8
 
 @pytest.fixture
 def two_groups(tmp_path, monkeypatch):
-    faulthandler.dump_traceback_later(120, exit=True)
     cores = sorted(os.sched_getaffinity(0))
+    if len(cores) < 3:
+        pytest.skip("the two groups' threads and the copy thread need three distinct cores in the affinity")
+    faulthandler.dump_traceback_later(120, exit=True)
     plans = (
         NodePlan(group=0, node=0, ram=cores[0], cpu=(), sq=None, busy_poll=False),
         NodePlan(group=1, node=1, ram=cores[1], cpu=(), sq=None, busy_poll=False),

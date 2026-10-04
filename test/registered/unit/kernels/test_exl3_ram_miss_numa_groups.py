@@ -2,6 +2,7 @@
 group serves only its home lanes (expert % 2), stages and evicts only in its own slots, and the combiner merges
 the groups' map deltas into one per record. ChainSim plays the device with the node-aware reference typing."""
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -166,6 +167,35 @@ def test_ranges_that_overlap_or_leave_the_row_are_refused(tmp_path):
         with pytest.raises(ValueError, match=match):
             ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32),
                              variant="instr", node_ranges=ranges)
+
+
+def test_the_native_start_thread_refuses_a_reserved_core_of_any_group(tmp_path):
+    """The raw FFI, which ExpertStreamHost.start_thread's own check never reaches. Mutation: the native refusal is
+    gone, so a thread pins itself to a core that takes NVMe completion interrupts."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        for cores in ([64, 0], [0, 71]):
+            with pytest.raises(RuntimeError, match=r"cores 64-71 are reserved \(NVMe completion interrupts"):
+                host._module.expert_stream_start_thread(
+                    host.handle, torch.tensor(cores, dtype=torch.int64), int(1e9), 5_000_000, 0
+                )
+            assert not host.threaded
+    finally:
+        host.stop()
+
+
+def test_the_native_start_thread_warns_when_an_inherited_affinity_covers_the_reserved_cores(tmp_path):
+    """Mutation: the warning is gone. The subprocess widens its own affinity to core 64 and starts the threads with
+    -1 (inherit); the C++ fprintf goes to the real stderr, so it is read from the child's."""
+    if (os.cpu_count() or 0) < 72:
+        pytest.skip("needs cores 64-71")
+    body = "import os; os.sched_setaffinity(0, {0, 64})\nhost.start_thread(fatal_wait_s=60.0)\nhost.stop()\nprint('reached')\n"
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_SCRIPT) + body, str(tmp_path)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert "reached" in result.stdout, result.stderr
+    assert "run under taskset -c 0-63" in result.stderr
 
 
 _SCRIPT = """

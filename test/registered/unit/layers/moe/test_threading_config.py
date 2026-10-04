@@ -144,6 +144,32 @@ def test_each_refusal(divix01, settings, match):
         resolve(divix01, nodes=nodes, affinity=affinity, cpu_experts=True, **settings)
 
 
+def test_threads_one_is_refused_in_words_that_say_what_the_cap_did(divix01):
+    """THREADS truncates the node's core list, and an engine needs two cores. Mutation: the bare engine-core refusal
+    ("CPU experts need at least 2 cores, got [..]") is raised, which never mentions the setting."""
+    with pytest.raises(ValueError, match=r"^THREADS=1 leaves one core for node 0's engine; CPU experts need at least 2$"):
+        resolve(divix01, cpu_experts=True, threads=1)
+
+
+def test_an_engine_core_refusal_names_the_node(divix01):
+    """Mutation: check_engine_cores is called unwrapped, so the refusal does not say which node's plan failed."""
+    with pytest.raises(ValueError, match=r"^node 1: CPU experts need at least 2 cores"):
+        resolve(divix01, cpu_experts=True, numa_cores="1:ram=35,cpu=18")
+    with pytest.raises(ValueError, match=r"^node 1: 20 CPU expert threads on 16 cores"):
+        resolve(divix01, cpu_experts=True, numa_cores="1:ram=35,cpu=18-33", threads=20)
+
+
+@pytest.mark.parametrize(
+    "spec, entry",
+    [("1:ram=-1", "ram=-1"), ("1:ram=35,cpu=a-b", "cpu=a-b"), ("1:ram=35,cpu=18-x", "cpu=18-x")],
+)
+def test_a_malformed_core_list_names_the_variable_and_the_entry(spec, entry):
+    """Mutation: parse_cpu_list's bare `invalid literal for int()` escapes."""
+    with pytest.raises(ValueError, match=r"SGLANG_EXPERT_NUMA_CORES") as caught:
+        parse_numa_cores(spec)
+    assert entry in str(caught.value) and "invalid literal" not in str(caught.value)
+
+
 @pytest.mark.parametrize(
     "spec, match",
     [

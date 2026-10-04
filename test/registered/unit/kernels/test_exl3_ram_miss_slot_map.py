@@ -103,6 +103,21 @@ def test_reserve_staging_refuses_a_row_with_one_slot(tmp_path):
         host.stop()
 
 
+def test_a_row_of_capacity_zero_opens_and_its_staging_is_refused(tmp_path):
+    """A one-node tier whose row has no slots opens, as it did before the groups; reserve_staging then refuses it.
+    Mutation: make_groups (or the Python range check) refuses the empty range at open, so the error is the wrong one
+    and comes from the wrong call."""
+    s = ram_miss_setup(tmp_path, capacity=0, layers=1, experts=EXPERTS)
+    host = ExpertStreamHost(
+        s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
+    )
+    try:
+        with pytest.raises(RuntimeError, match="row 0 has too few slots to stage"):
+            host.reserve_staging(K)
+    finally:
+        host.stop()
+
+
 def test_reserve_staging_is_once_and_before_any_slot_is_filled(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=CAPACITY, layers=1, experts=EXPERTS)
     host = ExpertStreamHost(
