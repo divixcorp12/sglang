@@ -173,8 +173,8 @@ void test_two_group_placement() {
   CHECK_THROWS(validate_placement(own_node, t, true), "service CPU 0 is on NUMA node 0, not node 1");
 
   Placement wrong_workers = p;
-  wrong_workers.groups[0].workers = parse_cpus("18-25");  // node 1 for a node-0 group
-  CHECK_THROWS(validate_placement(wrong_workers, t, true), "worker CPU 18 is on NUMA node 1, not node 0");
+  wrong_workers.groups[0].workers = parse_cpus("34");  // a node-1 CPU for a node-0 group
+  CHECK_THROWS(validate_placement(wrong_workers, t, true), "worker CPU 34 is on NUMA node 1, not node 0");
 }
 
 // ---- DeviceSim, on a standalone page and lease block (no service: the host's words are written by hand) ----
