@@ -389,7 +389,8 @@ class FakeHost:
         self.wire = lease.wire_layout(lanes, nodes)
         self.nodes = nodes
         self.enabled, self.layers, self.splits = None, {}, []
-        self.enables, self.group_splits = [], []
+        self.enables, self.group_splits, self.stats_groups = [], [], []
+        self.node_ranges = None  # set by a test that wants a multi-group host
         self.stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
         self.grid = None  # calibrate_cpu_split's answer; an Exception instance is raised instead
         self.calibrations = []
@@ -423,6 +424,7 @@ class FakeHost:
         self.group_splits.append((group, list(split)))
 
     def cpu_stats(self, group=0):
+        self.stats_groups.append(group)
         return dict(self.stats)
 
 
@@ -687,3 +689,51 @@ def test_cpu_expert_groups_run_one_engine_per_node_and_register_each_layer_once(
     groups.register(1, 10.0)
     assert [e for e in trait.events if e[0] == "register"] == [("register", 10.0)], "one kernel layer serves both groups"
     assert host.layers == {1: 100} and groups.registered(1)
+
+
+def _two_group_service(host, capacity=20):
+    from sglang.srt.layers.moe.cpu_experts.service import CpuExpertGroups
+    from sglang.srt.layers.moe.cpu_experts.threading_config import NodePlan
+
+    plans = [
+        NodePlan(group=0, node=0, ram=17, cpu=(8, 9), sq=None, busy_poll=True),
+        NodePlan(group=1, node=1, ram=35, cpu=(18, 19), sq=None, busy_poll=True),
+    ]
+    # Group 0 holds 4 slots of each row (too few to calibrate 8 lanes), group 1 the other 16.
+    host.node_ranges = [[(0, 4)] * 2, [(4, capacity)] * 2]
+    slabs = {row: _fake_slabs(capacity) for row in range(2)}
+    groups = CpuExpertGroups(
+        host, FakeServiceTrait(), slabs, hidden=8, plans=plans, split=[0] * (host.wire.lanes + 1), pin=False
+    )
+    groups.register(0, 10.0)
+    groups.register(1, 10.0)
+    return groups
+
+
+def test_each_group_calibrates_over_its_own_slots_and_keeps_its_own_split():
+    host = FakeHost(nodes=2)
+    host.grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)))
+    groups = _two_group_service(host)
+    result = groups.calibrate(-1)
+    split = split_from_grid(host.grid)
+    assert result == [None, split], "group 0's 4 slots cannot calibrate 8 lanes; group 1's 16 can"
+    assert [c[-1] for c in host.calibrations] == [1]
+    assert host.group_splits == [(1, split)]
+    assert groups.services[1].calibrated and not groups.services[0].calibrated
+
+
+def test_each_group_retunes_and_logs_its_own_stats(caplog):
+    host = FakeHost(nodes=2)
+    groups = _two_group_service(host)
+    host.stats_groups.clear()
+    host.stats = {"jobs": 11, "lanes": 64, "forward_ns": 64 * 100_000}
+    retuned = groups.retune()
+    assert len(retuned) == 2 and all(r is not None for r in retuned)
+    assert [g for g, _ in host.group_splits] == [0, 1]
+    assert sorted(set(host.stats_groups)) == [0, 1]
+    host.stats_groups.clear()
+    with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        stats = groups.log_stats()
+    assert len(stats) == 2 and host.stats_groups == [0, 1]
+    assert "group 0 stats" in caplog.text and "group 1 stats" in caplog.text
+
