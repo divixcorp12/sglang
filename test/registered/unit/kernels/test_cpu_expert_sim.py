@@ -576,7 +576,7 @@ def test_promotion_never_takes_a_filling_slot():
     sim.scores[0, 7] = 10.0
     assert sim.promote({0: [7]}, 1) == {0: 1}
     assert sim.slots[0][2] == tier_sim.FILLING
-    sim.graph_forward({0: [0]})
+    sim.graph_forward({0: [7]})  # 7 hits where it was promoted; 5's fill lands in its own slot
     # Every mapped expert's slot holds it: no expert is left pointing at a slot the landing fill took.
     assert all(sim.slots[0][int(sim.where[0, e])] == e for e in range(8) if sim.where[0, e] >= 0)
     assert {5, 7} <= sim.resident(0)
