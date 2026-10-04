@@ -38,8 +38,8 @@ struct PostParams {
   int64_t hot_capacity;
   const int32_t* dst_slots;
   int64_t captured;
-  // The device's map bank (ExpertStreamDevice.map_bank): row-major [rows, experts] and [rows, Wire::kNodes * Wire::kLanes] int32,
-  // int64 [rows] chain words, per-row eligibility. A graph replay reads what the previous deltas left here.
+  // The device's map bank (ExpertStreamDevice.map_bank): row-major [rows, experts] and
+  // [rows, Wire::kNodes * Wire::kLanes] int32, int64 [rows] chain words, per-row eligibility. A graph replay reads what the previous deltas left here.
   int32_t* ram_slot;
   int32_t* staging;
   int64_t* map_chain;
@@ -379,7 +379,9 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "ram_slot", TensorMatcher({Rows_, experts}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ram_slot);
     expert_stream::verify_named(
-        "staging", TensorMatcher({Rows_, Wire::kNodes * Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), staging);
+        "staging",
+        TensorMatcher({Rows_, Wire::kNodes * Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        staging);
     expert_stream::verify_named(
         "map_chain", TensorMatcher({Rows_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), map_chain);
     expert_stream::verify_named(
@@ -499,7 +501,9 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "ram_slot", TensorMatcher({Rows_, E_}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ram_slot);
     expert_stream::verify_named(
-        "staging", TensorMatcher({Rows_, Wire::kNodes * Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), staging);
+        "staging",
+        TensorMatcher({Rows_, Wire::kNodes * Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        staging);
     expert_stream::verify_named(
         "map_chain", TensorMatcher({Rows_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), map_chain);
     expert_stream::verify_named(

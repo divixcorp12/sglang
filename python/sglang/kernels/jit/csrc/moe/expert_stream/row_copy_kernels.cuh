@@ -276,7 +276,8 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   __shared__ int32_t sm_dst[Wire::kLanes];
   __shared__ uint32_t copying;    // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
   __shared__ uint32_t cpu;        // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
-  __shared__ uint32_t cpu_parts;  // bit 2g: a kHitCpu lane of node g (output part 2g); bit 2g + 1: a kMissCpu lane (part 2g + 1)
+  // bit 2g: a kHitCpu lane of node g (output part 2g); bit 2g + 1: a kMissCpu lane (part 2g + 1)
+  __shared__ uint32_t cpu_parts;
   const int64_t planned_count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
