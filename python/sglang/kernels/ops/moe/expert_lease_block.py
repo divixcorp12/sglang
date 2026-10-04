@@ -4,17 +4,17 @@ The lease block is one pinned allocation that sits beside the request page and i
 read and written by the RAM-miss service thread, the copy thread and the device
 kernels (through UVA). It holds two regions:
 
-  * the completion block (``[0, BLOCK_BYTES)``): the per-request piece masks, the
+  * the completion block (``[0, wire.lease_block_bytes)``): the per-request piece masks, the
     ``CopyDone`` words, the copy-wait gate, the copy-engine armed flag and the CPU
     split table;
-  * the map delta block (from ``DELTA_BASE``): one ``DELTA_STRIDE`` record per
+  * the map delta block (from ``wire.lease_block_bytes``): one ``wire.delta_stride`` record per
     streamed row, through which the service hands map changes to the device.
 
 The service writes both regions, except the gate, which the copy-wait kernel (CW)
 closes. Python writes only the attach-time split, and only through the service's
 export.
 
-The constants mirror ``csrc/moe/expert_stream/lease_layout.h`` (under
+``WireLayout`` mirrors ``csrc/moe/expert_stream/lease_layout.h`` (under
 ``python/sglang/kernels/jit/``); ``test_expert_stream_lease_layout`` checks that they agree.
 See ``analysis/dsv41-drive/LEASE_PROTOCOL.md``, "Wire (v2)".
 """
@@ -176,31 +176,13 @@ def wire_probe(lanes: int, nodes: int) -> dict[str, int]:
     return {name: int(value) for name, value in (line.split("=") for line in text.split("\n"))}
 
 
-
-# The v2 layout, wire_layout(8): every word of the completion block sits on its own 128-byte line.
-_V2 = wire_layout(8)
-RING = _V2.demand_records
-LANES = _V2.lanes
-BLOCK_ALIGN = _V2.block_align
-BLOCK_BYTES = _V2.lease_block_bytes
-PIECE_MASK = _V2.piece_mask
-PIECE_MASK_LINE_BYTES = _V2.piece_mask_line_bytes
-COPY_DONE = _V2.copy_done
-COPY_DONE_BYTES = _V2.copy_done_bytes
-COPY_GATE = _V2.copy_gate
-COPY_ARMED = _V2.copy_armed
-SPLIT = _V2.split
 GATE = {"closed": 0x80000001, "open": 1}
 GATE_SEQ_SHIFT = 2
 GATE_SEQ_MASK = 0x1FFFFFFF
 
-# The map delta block, at DELTA_BASE of the same allocation: one DELTA_STRIDE record per row. The service stores the tag
-# last, with a release, and a zero tag is never a written delta, so a zero-filled record cannot be mistaken for a
-# published one.
-DELTA_BASE = _V2.lease_block_bytes
-DELTA_STRIDE = _V2.delta_stride
-DELTA_FIELDS = _V2.delta_fields
-DELTA_MAX_ENTRIES = _V2.delta_max_entries
+# The map delta block starts at ``wire.lease_block_bytes`` of the same allocation: one ``wire.delta_stride`` record per
+# row. The service stores the tag last, with a release, and a zero tag is never a written delta, so a zero-filled record
+# cannot be mistaken for a published one.
 
 
 def gate_word(seq: int, low: str) -> int:
@@ -208,45 +190,51 @@ def gate_word(seq: int, low: str) -> int:
     return ((seq & GATE_SEQ_MASK) << GATE_SEQ_SHIFT) | GATE[low]
 
 
-def lease_block_bytes(rows: int) -> int:
+def lease_block_bytes(rows: int, wire: WireLayout | None = None) -> int:
     """Return the lease block size: the completion block plus ``rows`` delta records.
 
-    The delta region starts at ``DELTA_BASE`` and is rounded up to whole pages.
+    The delta region starts at ``wire.lease_block_bytes`` and is rounded up to whole pages. ``wire`` defaults to
+    ``wire_layout(8)``.
     """
+    wire = wire_layout(8) if wire is None else wire
     if rows < 1:
         raise ValueError(f"the lease block needs at least one row, got {rows}")
-    return BLOCK_BYTES + -(-rows * DELTA_STRIDE // BLOCK_ALIGN) * BLOCK_ALIGN
+    return wire.lease_block_bytes + _round_up(rows * wire.delta_stride, wire.block_align)
 
 
-def new_lease_block(rows: int, *, pin: bool) -> torch.Tensor:
-    """Allocate a zeroed, aligned uint8 block of ``lease_block_bytes(rows)`` bytes.
+def new_lease_block(rows: int, *, pin: bool, wire: WireLayout | None = None) -> torch.Tensor:
+    """Allocate a zeroed, aligned uint8 block of ``lease_block_bytes(rows, wire)`` bytes.
 
     The block is pinned when ``pin`` is set (a real device). Neither ``torch.zeros``
     nor the pinned allocator promises 4096-byte alignment, so the allocation carries
     one page of slack and the returned view starts at the aligned address; the view
     keeps the storage alive.
     """
-    size = lease_block_bytes(rows)
-    raw = torch.zeros(size + BLOCK_ALIGN, dtype=torch.uint8, pin_memory=pin)
-    start = (-raw.data_ptr()) % BLOCK_ALIGN
+    wire = wire_layout(8) if wire is None else wire
+    size = lease_block_bytes(rows, wire)
+    raw = torch.zeros(size + wire.block_align, dtype=torch.uint8, pin_memory=pin)
+    start = (-raw.data_ptr()) % wire.block_align
     block = raw[start : start + size]
-    check_lease_block(block, rows, need_pinned=pin)
+    check_lease_block(block, rows, need_pinned=pin, wire=wire)
     return block
 
 
-def check_lease_block(block: torch.Tensor, rows: int, *, need_pinned: bool) -> None:
+def check_lease_block(
+    block: torch.Tensor, rows: int, *, need_pinned: bool, wire: WireLayout | None = None
+) -> None:
     """Raise ValueError for a block the kernels and the service cannot address."""
+    wire = wire_layout(8) if wire is None else wire
     if block.dtype != torch.uint8 or block.device.type != "cpu" or block.dim() != 1:
         raise ValueError("the lease block must be a 1-D CPU uint8 tensor")
-    if block.numel() != lease_block_bytes(rows):
+    if block.numel() != lease_block_bytes(rows, wire):
         raise ValueError(
-            f"the lease block has {block.numel()} bytes, not {lease_block_bytes(rows)} for {rows} rows"
+            f"the lease block has {block.numel()} bytes, not {lease_block_bytes(rows, wire)} for {rows} rows"
         )
     if not block.is_contiguous():
         raise ValueError("the lease block must be contiguous")
-    if block.data_ptr() % BLOCK_ALIGN != 0:
+    if block.data_ptr() % wire.block_align != 0:
         raise ValueError(
-            f"the lease block must be {BLOCK_ALIGN}-byte aligned, its address is {block.data_ptr():#x}"
+            f"the lease block must be {wire.block_align}-byte aligned, its address is {block.data_ptr():#x}"
         )
     if need_pinned and not block.is_pinned():
         raise ValueError(

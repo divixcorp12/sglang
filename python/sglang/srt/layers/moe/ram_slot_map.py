@@ -6,8 +6,6 @@ from __future__ import annotations
 from enum import IntEnum
 from typing import Iterable, Optional, Sequence
 
-LANES = 8
-
 
 class LaneKind(IntEnum):
     """lease_layout.h kKind*: what moves a lane's bytes and what the device waits on."""
@@ -25,6 +23,7 @@ def type_lanes(
     staging: Sequence[int],
     split: Sequence[int],
     *,
+    lanes: int,
     captured: bool,
     copy_armed: bool,
     hit_copy: str,
@@ -38,8 +37,8 @@ def type_lanes(
 
     The CPU takes the last split[n] of the n eligible lanes in plan order (miss_keys descending, so the
     lowest-scored): RAM hits, plus NVMe misses with ``cpu_misses``."""
-    if len(experts) > LANES:
-        raise ValueError(f"a request has at most {LANES} lanes, got {len(experts)}")
+    if len(experts) > lanes:
+        raise ValueError(f"a request has at most {lanes} lanes, got {len(experts)}")
     if len(set(experts)) != len(experts):
         raise ValueError(f"a request names an expert twice: {list(experts)}")
     slots, hit, m = [], [], 0
@@ -49,7 +48,7 @@ def type_lanes(
             slots.append(s)
             hit.append(True)
             continue
-        if m >= LANES or staging[m] < 0:
+        if m >= lanes or staging[m] < 0:
             raise ValueError("a miss lane has no staging slot")
         slots.append(staging[m])
         hit.append(False)
@@ -79,13 +78,13 @@ def type_lanes(
 
 
 class MapReplica:
-    """The device's map bank: ram_slot [rows][experts], staging [rows][LANES], map_chain and map_applied [rows].
+    """The device's map bank: ram_slot [rows][experts], staging [rows][lanes], map_chain and map_applied [rows].
 
     map_chain starts at 1 and the attach delta has tag 1, so a zero-filled delta record never matches."""
 
-    def __init__(self, rows: int, experts: int):
+    def __init__(self, rows: int, experts: int, lanes: int):
         self.ram_slot = [[-1] * experts for _ in range(rows)]
-        self.staging = [[-1] * LANES for _ in range(rows)]
+        self.staging = [[-1] * lanes for _ in range(rows)]
         self.map_chain = [1] * rows
         self.map_applied = [0] * rows
 

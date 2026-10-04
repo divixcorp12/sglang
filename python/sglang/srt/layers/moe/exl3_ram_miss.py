@@ -31,8 +31,8 @@ from typing import Callable, Mapping, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
-    MAX_IDS,
     ExpertStreamDevice,
     ExpertStreamHost,
     host_layout,
@@ -518,8 +518,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
 
     ``routes`` holds the layer's routed experts (the protect set); ``_apply_graph``
     copies them in before each gather. ``planned`` pads the plan's expert ids to at
-    least ``MAX_IDS`` lanes (-1 past the plan): the post kernel reads
-    ``min(count, MAX_IDS)`` lanes and ``count`` lives on the device, so no host check
+    least the wire's lanes (-1 past the plan): the post kernel reads
+    ``min(count, lanes)`` lanes and ``count`` lives on the device, so no host check
     can bound it. Every lane of a gather is delivered or the process stops, so ``keep``
     stays 1 and the delivered count is the plan's.
 
@@ -552,7 +552,10 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             (capacity,), -1, dtype=torch.int64, device=host_row_map.device
         )
         self.planned = torch.full(
-            (max(capacity, MAX_IDS),), -1, dtype=torch.int64, device=host_row_map.device
+            (max(capacity, device_side.wire.lanes),),
+            -1,
+            dtype=torch.int64,
+            device=host_row_map.device,
         )
         self.hot_slots = hot_slots
         self.hot_capacity = hot_capacity
@@ -788,10 +791,11 @@ class Exl3RamMissService:
         self._cpu_log_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
-        # Staging slots per row, reserved at start: one per lane a post can miss, fewer
-        # on a small tier. MAX_IDS until plan_gather_width says how wide the gather is.
-        self.staging_slots = MAX_IDS
-        self._gather_planned = None
+        # The widest gather any layer planned (plan_gather_width); None until one does.
+        self._gather_planned: Optional[int] = None
+        # The build's lane count and wire, fixed at start from the planned width.
+        self.wire = wire_layout(1)
+        self.lanes = self.wire.lanes
         self._copy_armed = False
         self._copy_decodes = 0
         # Module loads that drained the device first.
@@ -814,22 +818,29 @@ class Exl3RamMissService:
         self.tables[layer_id] = table
 
     def plan_gather_width(self, rows: int) -> None:
-        """Reserve staging slots for a layer whose graph gather misses ``rows`` ids.
+        """Plan a layer whose graph gather misses ``rows`` ids; the widest layer sets the build's lane count.
 
-        At most ``MAX_IDS`` (the post kernel's lane count) are reserved, and the widest
-        layer wins. Only valid before the service starts.
+        Only valid before the service starts. Raises ValueError for a width outside 1..32.
         """
         if self.host is not None:
             raise RuntimeError(
                 "exl3 RAM miss: the graph gather width was planned after the service started"
             )
-        planned = max(1, min(int(rows), MAX_IDS))
-        self.staging_slots = (
+        planned = max(1, int(rows))
+        wire_layout(planned)
+        self._gather_planned = (
             planned
             if self._gather_planned is None
             else max(self._gather_planned, planned)
         )
-        self._gather_planned = self.staging_slots
+
+    def resolved_lanes(self) -> int:
+        """The lane count the service builds for: the widest planned gather, rounded up to 8."""
+        return wire_layout(self._gather_planned or 1).lanes
+
+    def staging_for(self, capacity: int) -> int:
+        """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""
+        return min(self._gather_planned or self.resolved_lanes(), capacity - 1)
 
     def row_of(self, layer_id: int) -> int:
         """The service row (position in the tables) of a streamed layer."""
@@ -901,7 +912,9 @@ class Exl3RamMissService:
                 f"exl3 RAM miss: the host module's layout {layout_names} is not EXL3_STREAMED_NAMES {EXL3_STREAMED_NAMES}"
             )
         pin = torch.cuda.is_available()
-        page = new_page(pin=pin)
+        self.lanes = self.resolved_lanes()
+        self.wire = wire_layout(self.lanes)
+        page = new_page(pin=pin, wire=self.wire)
         hot_page = new_hot_page(tables.starts.shape[1], pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
@@ -918,11 +931,12 @@ class Exl3RamMissService:
             slot_map=slot_map,
             hot_page=hot_page,
             variant="instr" if instrumented else None,
+            lanes=self.lanes,
         )
         try:
             # Before any slot is filled: the hot cache fills the tiers first, after
             # plan_gather_width.
-            host.reserve_staging(self.staging_slots)
+            host.reserve_staging(self._gather_planned or self.lanes)
             copy_engine = cfg.enable_ram_miss_copy_engine
             check_sm_small_copies(cfg)
             if copy_engine:
@@ -1059,7 +1073,7 @@ class Exl3RamMissService:
             hidden=hidden.pop(),
             cores=cores,
             threads=threads,
-            split=configured_split(),
+            split=configured_split(host.wire.lanes),
             pin=pin,
         )
 
@@ -1131,12 +1145,12 @@ class Exl3RamMissService:
                 updater.enable_miss_order()
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
-        if streamer.graph_gather_rows > MAX_IDS:
-            # The post kernel requests min(count, MAX_IDS) lanes and traps on a wider
+        if streamer.graph_gather_rows > self.lanes:
+            # The post kernel requests min(count, lanes) lanes and traps on a wider
             # plan.
             raise ValueError(
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
-                f"per call but the service requests at most {MAX_IDS} lanes"
+                f"per call but the service requests at most {self.lanes} lanes"
             )
         cache = streamer.hot_cache
         if self.cpu_experts is not None:
@@ -1160,6 +1174,7 @@ class Exl3RamMissService:
                 lease_pdl=self.lease_pdl,
                 hit_copy=envs.SGLANG_DSV41_RAM_HIT_COPY.get(),
                 cpu_misses=envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get(),
+                lanes=self.lanes,
             )
             if self.cpu_experts is not None:
                 self.device_side.enable_cpu_experts(
@@ -1197,10 +1212,10 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
-        # The host staged min(staging_slots, capacity - 1) slots for the row at start; a
-        # post with more misses traps.
+        # The host staged staging_for(capacity) slots for the row at start; a post with
+        # more misses traps.
         want = max(1, streamer.graph_gather_rows)
-        staged = min(self.staging_slots, int(self.host.tables.capacity[row]) - 1)
+        staged = self.staging_for(int(self.host.tables.capacity[row]))
         if staged < want:
             logger.warning(
                 "exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d",
@@ -1271,7 +1286,7 @@ class Exl3RamMissService:
         # The router rings hold ~400 KB per forward, so they get a shallower ring: 32
         # deep is ~13 MB of VRAM.
         log = GraphRouteLog(
-            len(self._rows), MAX_IDS, device, depth=32 if router_prefix else 64
+            len(self._rows), self.lanes, device, depth=32 if router_prefix else 64
         )
         if router_prefix:
             log.enable_router(router_prefix)

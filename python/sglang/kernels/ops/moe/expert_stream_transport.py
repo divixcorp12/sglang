@@ -13,14 +13,16 @@ This module wraps both halves:
   * the byte layouts the two halves share: the request page, the lease block
     (``expert_lease_block``) and the counters.
 
-The layout constants mirror ``csrc/moe/expert_stream/lease_layout.h`` (under
-``python/sglang/kernels/jit/``). See ``analysis/dsv41-drive/LEASE_PROTOCOL.md`` for
+The layouts mirror ``csrc/moe/expert_stream/lease_layout.h`` (under
+``python/sglang/kernels/jit/``): ``expert_lease_block.wire_layout(lanes)`` gives the byte
+offsets of a build with ``lanes`` lanes. See ``analysis/dsv41-drive/LEASE_PROTOCOL.md`` for
 the protocol.
 """
 
 from __future__ import annotations
 
 import atexit
+import functools
 import json
 import struct
 import sys
@@ -762,8 +764,7 @@ def piece_geometry(
 # whole read, while ``pack_start``..``pack_end`` run from the first row's packing to
 # the last row's and overlap the reads. The byte split, terminal status, per-row
 # packing and per-extent CQE stamps are defined at ``StageRecord``;
-# ``STAGE_TRACE_ROWS`` and ``STAGE_TRACE_EXTENTS`` are the 8-lane build's ``kTraceRows``
-# and ``kTraceExtents`` (``stage_trace_rows`` gives them for a lane count).
+# ``stage_trace_rows(lanes)`` is the build's ``kTraceRows`` and twice that its ``kTraceExtents``.
 #
 # Row images, the only reader since the direct mode became the sole mode, copy
 # nothing: the drive writes the slab rows. The pack stamps then mean publish time.
@@ -773,6 +774,8 @@ def piece_geometry(
 # ``pack_ns`` are built from them as for packing. ``pack_workers`` and ``pack_split``
 # are 0, and ``useful_bytes`` still counts the segment bytes that landed in the slabs.
 STAGE_DRIVES = 4
+
+
 def stage_trace_rows(lanes: int = 8) -> int:
     """kTraceRows: the need and protect ids a request can read, two per lane."""
     return 2 * expert_lease_block.wire_layout(lanes).lanes
@@ -784,13 +787,10 @@ def calibration_shape(lanes: int = 8) -> tuple[int, int]:
     return (n + 2, n + 1)
 
 
-# The 8-lane build's values, for callers that have no lane count yet.
-STAGE_TRACE_ROWS = stage_trace_rows()
-STAGE_TRACE_EXTENTS = 2 * STAGE_TRACE_ROWS
 # The C++ ``kPieces``: pieces per row, and the most sub-reads a row issues under piece
 # streaming.
 STAGE_PIECES = 8
-STAGE_FIELDS = (
+_STAGE_HEAD = (
     "seq",
     "kind",
     "row",
@@ -827,43 +827,39 @@ STAGE_FIELDS = (
     "rows_reading_max",
     "pending_max",
     "bank_stalls",
-    *(f"row_pack_start_{k}" for k in range(STAGE_TRACE_ROWS)),
-    *(f"row_pack_end_{k}" for k in range(STAGE_TRACE_ROWS)),
-    *(f"extent_id_{k}" for k in range(STAGE_TRACE_EXTENTS)),
-    *(f"extent_cqe_{k}" for k in range(STAGE_TRACE_EXTENTS)),
-    "dropped_before",
-    *(f"row_admit_{k}" for k in range(STAGE_TRACE_ROWS)),
-    *(f"extent_submit_{k}" for k in range(STAGE_TRACE_EXTENTS)),
-    *(f"extent_attempts_{k}" for k in range(STAGE_TRACE_EXTENTS)),
-    "lanes",
-    "pack_workers",
-    "pack_split",
-    "piece_stream",
-    "pieces_vetted",
-    *(
-        f"sub_land_seq_{k}_{j}"
-        for k in range(STAGE_TRACE_ROWS)
-        for j in range(STAGE_PIECES)
-    ),
-    *(
-        f"piece_cqe_{k}_{j}"
-        for k in range(STAGE_TRACE_ROWS)
-        for j in range(STAGE_PIECES)
-    ),
-    *(
-        f"piece_seq_{k}_{j}"
-        for k in range(STAGE_TRACE_ROWS)
-        for j in range(STAGE_PIECES)
-    ),
-    *(
-        f"piece_publish_{k}_{j}"
-        for k in range(STAGE_TRACE_ROWS)
-        for j in range(STAGE_PIECES)
-    ),
-    "pieces_published",
-    "pieces_out_of_order",
-    "piece_publish_refused",
 )
+
+
+@functools.cache
+def stage_fields(lanes: int = 8) -> tuple[str, ...]:
+    """The C++ ``StageRecord``'s int64 words of a ``lanes``-lane build, in order."""
+    rows = stage_trace_rows(lanes)
+    extents = 2 * rows
+    return (
+        *_STAGE_HEAD,
+        *(f"row_pack_start_{k}" for k in range(rows)),
+        *(f"row_pack_end_{k}" for k in range(rows)),
+        *(f"extent_id_{k}" for k in range(extents)),
+        *(f"extent_cqe_{k}" for k in range(extents)),
+        "dropped_before",
+        *(f"row_admit_{k}" for k in range(rows)),
+        *(f"extent_submit_{k}" for k in range(extents)),
+        *(f"extent_attempts_{k}" for k in range(extents)),
+        "lanes",
+        "pack_workers",
+        "pack_split",
+        "piece_stream",
+        "pieces_vetted",
+        *(f"sub_land_seq_{k}_{j}" for k in range(rows) for j in range(STAGE_PIECES)),
+        *(f"piece_cqe_{k}_{j}" for k in range(rows) for j in range(STAGE_PIECES)),
+        *(f"piece_seq_{k}_{j}" for k in range(rows) for j in range(STAGE_PIECES)),
+        *(f"piece_publish_{k}_{j}" for k in range(rows) for j in range(STAGE_PIECES)),
+        "pieces_published",
+        "pieces_out_of_order",
+        "piece_publish_refused",
+    )
+
+
 STAGE_KINDS = ("demand", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
 STAGE_STATUSES = ("none", "served", "no_read", "failed", "cancelled", "touch")
@@ -885,36 +881,38 @@ STAGE_ORDER = (
 )
 
 
-def _stage_words(layout: str = "exl3", variant: Optional[str] = None) -> int:
-    """Return the C++ ``StageRecord`` word count, checked against ``STAGE_FIELDS``."""
-    words = int(_host_module(layout, variant).expert_stream_trace_words())
-    if words != len(STAGE_FIELDS):
+def _stage_words(
+    layout: str = "exl3", variant: Optional[str] = None, lanes: int = 8
+) -> int:
+    """Return the C++ ``StageRecord`` word count of a ``lanes``-lane build, checked against ``stage_fields``."""
+    words = int(_host_module(layout, variant, lanes).expert_stream_trace_words())
+    if words != len(stage_fields(lanes)):
         raise RuntimeError(
-            f"C++ StageRecord has {words} words, STAGE_FIELDS {len(STAGE_FIELDS)}"
+            f"C++ StageRecord has {words} words, stage_fields({lanes}) {len(stage_fields(lanes))}"
         )
     return words
 
 
-def stage_records(words: torch.Tensor) -> list[dict]:
-    """Decode int64 ``[n, len(STAGE_FIELDS)]`` stage-record rows into dicts.
+def stage_records(words: torch.Tensor, lanes: int = 8) -> list[dict]:
+    """Decode int64 ``[n, len(stage_fields(lanes))]`` stage-record rows of a ``lanes``-lane build into dicts.
 
-    Beyond the ``STAGE_FIELDS`` scalars, each dict has:
+    Beyond the ``stage_fields`` scalars, each dict has:
 
     - ``status``: how the request ended; ``missing_stages``: the ``STAGE_ORDER``
       stamps it never reached.
     - ``drives``: the drives that served an extent, as ``{"dev", "bytes", "extents"}``
       (``dev`` -1: several folded).
     - ``row_pack``: one ``{"row", "admit", "start", "end"}`` per row asked for (first
-      ``STAGE_TRACE_ROWS``); 0/0 for a row that never packed, ``admit`` 0 for one
+      ``stage_trace_rows(lanes)``); 0/0 for a row that never packed, ``admit`` 0 for one
       never admitted.
     - ``extent_cqe``: one ``{"row", "part", "sub", "submit", "attempts", "cqe"}`` per
-      extent issued (first ``STAGE_TRACE_EXTENTS``). ``cqe`` is 0 for an extent that
+      extent issued (first twice ``stage_trace_rows(lanes)``). ``cqe`` is 0 for an extent that
       never completed, and otherwise the time the wait that reaped it returned:
       io_uring gives no per-completion time. ``attempts`` counts resubmissions and
       ``sub`` is the extent's sub-read within its part (0 unless ``piece_stream``).
     - ``pieces``: empty unless ``piece_stream``; otherwise one
       ``{"row", "sub_seq", "seq", "cqe", "publish"}`` per row asked for (first
-      ``STAGE_TRACE_ROWS``), each field a list over ``STAGE_PIECES``. ``sub_seq`` is
+      ``stage_trace_rows(lanes)``), each field a list over ``STAGE_PIECES``. ``sub_seq`` is
       when sub-read j (row file order) landed, ``seq`` when piece j was vetted, and
       ``publish`` when it was published, as sequence numbers shared by all three
       (1-based, 0 never). ``cqe`` is the vetting's clock.
@@ -930,9 +928,12 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     record's pack stamps are not comparable with an inline one's (see
     ``StageRecord``).
     """
+    fields = stage_fields(lanes)
+    trace_rows = stage_trace_rows(lanes)
+    trace_extents = 2 * trace_rows
     out = []
     for row in words.tolist():
-        record = dict(zip(STAGE_FIELDS, row))
+        record = dict(zip(fields, row))
         record["kind"] = STAGE_KINDS[record["kind"]]
         record["status"] = STAGE_STATUSES[record["status"]]
         record["missing_stages"] = [name for name in STAGE_ORDER if not record[name]]
@@ -943,7 +944,7 @@ def stage_records(words: torch.Tensor) -> list[dict]:
                 "start": record[f"row_pack_start_{k}"],
                 "end": record[f"row_pack_end_{k}"],
             }
-            for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
+            for k in range(min(record["rows_asked"], trace_rows))
         ]
         record["extent_cqe"] = [
             {
@@ -954,9 +955,9 @@ def stage_records(words: torch.Tensor) -> list[dict]:
                 "attempts": record[f"extent_attempts_{k}"],
                 "cqe": record[f"extent_cqe_{k}"],
             }
-            for k in range(min(record["extents"], STAGE_TRACE_EXTENTS))
+            for k in range(min(record["extents"], trace_extents))
         ]
-        for k in range(STAGE_TRACE_ROWS):
+        for k in range(trace_rows):
             del (
                 record[f"row_pack_start_{k}"],
                 record[f"row_pack_end_{k}"],
@@ -975,15 +976,15 @@ def stage_records(words: torch.Tensor) -> list[dict]:
                         record[f"piece_publish_{k}_{j}"] for j in range(STAGE_PIECES)
                     ],
                 }
-                for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
+                for k in range(min(record["rows_asked"], trace_rows))
             ]
             if record["piece_stream"]
             else []
         )
-        for k in range(STAGE_TRACE_EXTENTS):
+        for k in range(trace_extents):
             del record[f"extent_id_{k}"], record[f"extent_cqe_{k}"]
             del record[f"extent_submit_{k}"], record[f"extent_attempts_{k}"]
-        for k in range(STAGE_TRACE_ROWS):
+        for k in range(trace_rows):
             for j in range(STAGE_PIECES):
                 del (
                     record[f"sub_land_seq_{k}_{j}"],
@@ -1004,34 +1005,16 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     return out
 
 
-# The request page (``lease_layout.h``): ``demand_head``, then kDemandRecords records
-# of ``RECORD_FIELDS``. A record's ``MAX_IDS`` lanes are one i16 array per id and an
-# f32 weight array; "counts" holds the lane count (bits 0-3) and the protect-id count
-# (bits 4-7), and "kinds" a ``ram_slot_map.LaneKind`` nibble per lane.
-PAGE_BYTES = 2176
-RECORD_BYTES = 128
-DEMAND_RING = 128
-DEMAND_RECORDS = 16
-RECORD_FIELDS = {
-    "seq": 0,
-    "row": 4,
-    "counts": 6,
-    "flags": 7,
-    "chain": 8,
-    "epoch": 16,
-    "kinds": 20,
-    "protect": 32,
-    "lane_expert": 48,
-    "lane_slot": 64,
-    "lane_dst": 80,
-    "lane_weight": 96,
-}
+# The request page (``lease_layout.h``): ``demand_head``, then ``wire.demand_records`` records
+# (``wire.record_fields``). A record's lanes are one i16 array per id and an f32 weight
+# array; "counts" holds the lane count (bits 0-3) and the protect-id count (bits 4-7) on
+# an 8-lane wire, and "kinds" a ``ram_slot_map.LaneKind`` nibble per lane.
 RECORD_FLAG_CAPTURED = 1
 # Experts, slots and destinations are i16 in the record and the map delta.
 RECORD_ID_MAX = 32767
 HOT_HEADER_BYTES = 8
 HOT_ALIGNMENT = 64
-HOT_RECORDS = DEMAND_RECORDS
+HOT_RECORDS = expert_lease_block.wire_layout(8).demand_records
 
 
 def hot_record_bytes(experts: int) -> int:
@@ -1052,7 +1035,6 @@ def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
     )
 
 
-MAX_IDS = 8
 WORDS = {"demand_head": 0}
 # Order of the C++ counters (``host/tier_protocol.h``). Demand rows per layer come only
 # from ``ExpertStreamHost.layer_rows()``: one word per layer written by the tier's
@@ -1180,9 +1162,12 @@ def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
     return float(_host_module(layout, variant).expert_stream_pause_ns())
 
 
-def new_page(pin: bool) -> torch.Tensor:
-    """A zeroed request page; pinned (device-readable through UVA) for a real device."""
-    return torch.zeros(PAGE_BYTES, dtype=torch.uint8, pin_memory=pin)
+def new_page(
+    *, pin: bool, wire: Optional[expert_lease_block.WireLayout] = None
+) -> torch.Tensor:
+    """A zeroed request page of ``wire`` (default ``wire_layout(8)``); pinned (device-readable through UVA) for a real device."""
+    wire = expert_lease_block.wire_layout(8) if wire is None else wire
+    return torch.zeros(wire.page_bytes, dtype=torch.uint8, pin_memory=pin)
 
 
 def page_word(page: torch.Tensor, name: str) -> int:
@@ -1208,7 +1193,8 @@ class ExpertStreamHost:
     """The C++-owned pinned-slot bookkeeping of every streamed layer and its request
     service.
 
-    ``tables`` is an ``Exl3RamMissTables``; ``page`` a ``new_page`` tensor; ``slot_map``
+    ``tables`` is an ``Exl3RamMissTables``; ``page`` a ``new_page`` tensor of the
+    ``lanes``-lane wire (kept as ``self.wire``, which every lane-sized tensor follows); ``slot_map``
     an int32 ``[layers, experts]`` tensor filled with -1 (pinned for a real device).
     Row ``r`` is streamed layer ``tables.layer_ids[r]``. ``variant`` is the host build
     to load (``VARIANTS``), by default ``host_variant()``'s choice, and is kept as
@@ -1242,13 +1228,17 @@ class ExpertStreamHost:
         hot_page: Optional[torch.Tensor] = None,
         layout: str = "exl3",
         variant: Optional[str] = None,
+        lanes: int = 8,
     ) -> None:
+        self.wire = expert_lease_block.wire_layout(lanes)
         if (
-            page.numel() != PAGE_BYTES
+            page.numel() != self.wire.page_bytes
             or page.dtype != torch.uint8
             or page.device.type != "cpu"
         ):
-            raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
+            raise ValueError(
+                f"page must be a CPU uint8 tensor of {self.wire.page_bytes} bytes (new_page of this wire)"
+            )
         if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(
             tables.starts.shape
         ):
@@ -1267,16 +1257,19 @@ class ExpertStreamHost:
         self._layout = layout
         # The host build is chosen once here: every later call goes to this module.
         self.variant = host_variant() if variant is None else variant
-        self._module = _host_module(self._layout, self.variant)
+        self._module = _host_module(self._layout, self.variant, self.wire.lanes)
         self.threaded = False
         # Allocated here when the caller passes none.
         if lease_block is None:
             lease_block = expert_lease_block.new_lease_block(
-                int(tables.starts.shape[0]), pin=page.is_pinned()
+                int(tables.starts.shape[0]), pin=page.is_pinned(), wire=self.wire
             )
         else:
             expert_lease_block.check_lease_block(
-                lease_block, int(tables.starts.shape[0]), need_pinned=page.is_pinned()
+                lease_block,
+                int(tables.starts.shape[0]),
+                need_pinned=page.is_pinned(),
+                wire=self.wire,
             )
         self.lease_block = lease_block
         self.hot_page = hot_page
@@ -1519,14 +1512,16 @@ class ExpertStreamHost:
         values = out.tolist()
         return [tuple(values[i : i + 3]) for i in range(0, len(values), 3)]
 
-    def reserve_staging(self, k: int = MAX_IDS) -> None:
+    def reserve_staging(self, k: Optional[int] = None) -> None:
         """Reserve every row's staging slots and publish its tag-1 map delta.
 
-        The staging slots are the first ``min(k, capacity - 1)`` free slots of each row;
+        The staging slots are the first ``min(k, capacity - 1)`` free slots of each row
+        (``k`` defaults to the wire's lanes);
         no slot is ever taken from them afterwards. Call once, before the thread starts
         (or paused), with every tier empty. A row with fewer than 2 slots raises. See
         ``analysis/dsv41-drive/LEASE_PROTOCOL.md``, "Deltas and the bulk delta".
         """
+        k = self.wire.lanes if k is None else k
         self._module.expert_stream_reserve_staging(self.handle, int(k))
 
     def take_bulk_delta(self) -> torch.Tensor:
@@ -1636,8 +1631,8 @@ class ExpertStreamHost:
 
         ``forward`` is the trait's native forward (a ``CpuExpertForward`` address); each
         row joins once its layer handle is set (:meth:`set_cpu_layer`). Of a captured
-        post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..8; the
-        device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
+        post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..``wire.lanes``;
+        the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
         (float32 ``[rows, hidden]``, or ``[rows, 2, hidden]`` for a CPU-hit and a
         CPU-miss partial sum each) are pinned host rows: the post kernel stages a row's
         input in the first, the CPU writes its partial sums to the second and the device
@@ -1645,7 +1640,7 @@ class ExpertStreamHost:
         native keep-warm (a ``CpuExpertKeepWarm`` address, 0 for none), which the idle
         thread runs on its workers for ``keep_warm_us`` after each job.
         """
-        lanes = expert_lease_block.LANES
+        lanes = self.wire.lanes
         if len(split) != lanes + 1:
             raise ValueError(
                 f"the CPU split table has {lanes + 1} entries (n = 0..{lanes}), not {len(split)}"
@@ -1694,10 +1689,14 @@ class ExpertStreamHost:
         self._module.expert_stream_set_cpu_layer(self.handle, row, int(handle))
 
     def set_cpu_split(self, split: Sequence[int]) -> None:
-        """Set a new split table (CPU lanes per n eligible lanes, n = 0..8).
+        """Set a new split table (CPU lanes per n eligible lanes, n = 0..``wire.lanes``).
 
         Allowed at any time; the device reads it.
         """
+        if len(split) != self.wire.lanes + 1:
+            raise ValueError(
+                f"the CPU split table has {self.wire.lanes + 1} entries (n = 0..{self.wire.lanes}), not {len(split)}"
+            )
         self._module.expert_stream_set_cpu_split(
             self.handle, torch.tensor(list(split), dtype=torch.int64)
         )
@@ -1727,12 +1726,12 @@ class ExpertStreamHost:
     ) -> torch.Tensor:
         """Run the CPU split's startup calibration on ``row``.
 
-        Returns float64 ``calibration_shape()`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
+        Returns float64 ``calibration_shape(wire.lanes)`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
         row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no
-        thread). ``device`` -1 copies with the test backend; ``scratch`` holds 8
-        one expert per lane on that device. Raises RuntimeError on failure.
+        thread). ``device`` -1 copies with the test backend; ``scratch`` holds
+        one expert per lane (``wire.lanes`` of them) on that device. Raises RuntimeError on failure.
         """
-        out = torch.zeros(calibration_shape(), dtype=torch.float64)
+        out = torch.zeros(calibration_shape(self.wire.lanes), dtype=torch.float64)
         self._module.expert_stream_calibrate_cpu_split(
             self.handle,
             int(row),
@@ -1920,7 +1919,7 @@ class ExpertStreamHost:
         Call before ``start_thread``. With the trace off the service takes no
         timestamps.
         """
-        _stage_words(self._layout, self.variant)
+        _stage_words(self._layout, self.variant, self.wire.lanes)
         self._module.expert_stream_trace_enable(self.handle, int(capacity))
 
     def drain_trace(self, limit: int = 4096) -> list[dict]:
@@ -1928,9 +1927,11 @@ class ExpertStreamHost:
         ``stage_records``."""
         out = []
         while True:
-            words = torch.empty((limit, len(STAGE_FIELDS)), dtype=torch.int64)
+            words = torch.empty(
+                (limit, len(stage_fields(self.wire.lanes))), dtype=torch.int64
+            )
             count = int(self._module.expert_stream_trace_drain(self.handle, words))
-            out.extend(stage_records(words[:count]))
+            out.extend(stage_records(words[:count], self.wire.lanes))
             if count < limit:
                 return out
 
@@ -2156,14 +2157,18 @@ class ExpertStreamDevice:
         lease_pdl: bool = False,
         hit_copy: str = "ce",
         cpu_misses: bool = False,
+        lanes: int = 8,
     ) -> None:
+        self.wire = expert_lease_block.wire_layout(lanes)
         if (
-            page.numel() != PAGE_BYTES
+            page.numel() != self.wire.page_bytes
             or page.dtype != torch.uint8
             or page.device.type != "cpu"
             or not page.is_contiguous()
         ):
-            raise ValueError("page must be a contiguous CPU uint8 tensor of PAGE_BYTES")
+            raise ValueError(
+                f"page must be a contiguous CPU uint8 tensor of {self.wire.page_bytes} bytes (new_page of this wire)"
+            )
         if timeout_ms <= 0:
             raise ValueError("the RAM-miss wait timeout must be positive")
         cuda = torch.device(device).type == "cuda"
@@ -2171,7 +2176,9 @@ class ExpertStreamDevice:
         # unpinned address faults inside the captured graph.
         if cuda and not page.is_pinned():
             raise ValueError("page must be pinned for a CUDA device")
-        expert_lease_block.check_lease_block(lease_block, layers, need_pinned=cuda)
+        expert_lease_block.check_lease_block(
+            lease_block, layers, need_pinned=cuda, wire=self.wire
+        )
         if lease_pdl and cuda and not is_arch_support_pdl():
             raise ValueError("lease-chain PDL needs sm_90 or newer (griddepcontrol)")
         if len(row_capacities) != layers:
@@ -2235,13 +2242,12 @@ class ExpertStreamDevice:
                 )
             self._hot_address = int(hot_page.data_ptr())
             self._hot_stride = stride
-        lanes = expert_lease_block.LANES
         self.map_bank = {
             "ram_slot": torch.full(
                 (layers, experts), -1, dtype=torch.int32, device=device
             ),
             "staging": torch.full(
-                (layers, lanes), -1, dtype=torch.int32, device=device
+                (layers, self.wire.lanes), -1, dtype=torch.int32, device=device
             ),
             "map_chain": torch.ones(layers, dtype=torch.int64, device=device),
             "map_applied": torch.zeros(layers, dtype=torch.int64, device=device),
@@ -2256,11 +2262,11 @@ class ExpertStreamDevice:
         )
         # The post's outputs: each lane's kind and source slot (S and CW read them), and
         # C1's compacted SM hits, in one order.
-        self.lane_kind = torch.zeros(lanes, dtype=torch.int32, device=device)
-        self.lane_slot = torch.full((lanes,), -1, dtype=torch.int32, device=device)
+        self.lane_kind = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
+        self.lane_slot = torch.full((self.wire.lanes,), -1, dtype=torch.int32, device=device)
         self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
-        self.host_rows_1 = torch.zeros(lanes, dtype=torch.int64, device=device)
-        self.dst_slots_1 = torch.zeros(lanes, dtype=torch.int32, device=device)
+        self.host_rows_1 = torch.zeros(self.wire.lanes, dtype=torch.int64, device=device)
+        self.dst_slots_1 = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
         # CW's words for CC: the lanes it armed the gate for, the CPU lanes, the CPU output parts; 0: none.
         self.ce_mask = torch.zeros(3, dtype=torch.int32, device=device)
         # CPU experts, written by CC: the lanes the CPU computed, then the output parts holding their partial sums (0: none).
@@ -2278,7 +2284,7 @@ class ExpertStreamDevice:
     def _kernels(self):
         """Return the device module, loading it on first use."""
         if self._module is None:
-            self._module = _device_module(self._layout)
+            self._module = _device_module(self._layout, self.wire.lanes)
         return self._module
 
     def enable_cpu_experts(self, x_rows: torch.Tensor, out_rows: torch.Tensor) -> None:

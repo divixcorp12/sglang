@@ -31,9 +31,6 @@ from sglang.srt.layers.moe.cpu_experts.policy import (
 
 logger = logging.getLogger(__name__)
 
-# expert_lease_block.LANES: the split table covers n = 0..LANES resident lanes.
-LANES = 8
-
 
 def cpu_trait_for(format_key: str, ext=None):
     """The quant trait of a streamed expert format; only EXL3 has a CPU kernel today."""
@@ -45,8 +42,8 @@ def cpu_trait_for(format_key: str, ext=None):
     raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
 
 
-def configured_split() -> list[int]:
-    """The split table: ``SGLANG_DSV41_CPU_EXPERTS_SPLIT`` when set, else ``k_star(n)``.
+def configured_split(lanes: int) -> list[int]:
+    """The split table for a ``lanes``-lane build: ``SGLANG_DSV41_CPU_EXPERTS_SPLIT`` when set, else ``k_star(n)``.
 
     The fallback uses the configured per-expert CPU, link and handoff costs. Raises
     ``ValueError`` for a malformed explicit split.
@@ -54,13 +51,13 @@ def configured_split() -> list[int]:
     spec = envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.get()
     if spec:
         split = [int(v) for v in spec.split(",")]
-        if len(split) != LANES + 1 or any(not 0 <= k <= n for n, k in enumerate(split)):
+        if len(split) != lanes + 1 or any(not 0 <= k <= n for n, k in enumerate(split)):
             raise ValueError(
-                f"SGLANG_DSV41_CPU_EXPERTS_SPLIT must list {LANES + 1} counts with 0 <= split[n] <= n, got {spec!r}"
+                f"SGLANG_DSV41_CPU_EXPERTS_SPLIT must list {lanes + 1} counts with 0 <= split[n] <= n, got {spec!r}"
             )
         return split
     return split_table(
-        LANES,
+        lanes,
         envs.SGLANG_DSV41_CPU_EXPERTS_CPU_MS.get(),
         envs.SGLANG_DSV41_CPU_EXPERTS_LINK_MS.get(),
         envs.SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS.get(),
@@ -107,6 +104,8 @@ class CpuExpertService:
             raise ValueError(f"{threads} CPU expert threads on {len(cores)} cores")
         trait.check_environment()
         self.host, self.trait = host, trait
+        # The split table covers n = 0..lanes resident lanes, as the host's wire does.
+        self.lanes = host.wire.lanes
         self.slabs_by_row = dict(slabs_by_row)
         self.hidden, self.cores, self.threads = int(hidden), tuple(cores), int(threads)
         self.split = list(split)
@@ -236,7 +235,7 @@ class CpuExpertService:
         self._last_stats = stats
         c_cpu = ns / lanes / 1e6
         split = split_table(
-            LANES,
+            self.lanes,
             c_cpu,
             envs.SGLANG_DSV41_CPU_EXPERTS_LINK_MS.get(),
             envs.SGLANG_DSV41_CPU_EXPERTS_HANDOFF_MS.get(),
@@ -265,12 +264,12 @@ class CpuExpertService:
         ):
             return None
         row = calibration_row(
-            {r: self._capacity(self.slabs_by_row[r]) for r in self.handles}, LANES
+            {r: self._capacity(self.slabs_by_row[r]) for r in self.handles}, self.lanes
         )
         if row is None:
             logger.warning(
                 "CPU experts calibration skipped: no registered row has %d RAM slots; keeping split %s",
-                LANES,
+                self.lanes,
                 self.split,
             )
             return None
@@ -280,7 +279,7 @@ class CpuExpertService:
         try:
             expert_bytes = self.host.copy_expert_bytes(row)
             scratch = torch.empty(
-                LANES * expert_bytes,
+                self.lanes * expert_bytes,
                 dtype=torch.uint8,
                 device="cpu" if device < 0 else torch.device("cuda", device),
             )
