@@ -64,9 +64,11 @@ foreach(BACKEND baseline optimized)
   if(BACKEND STREQUAL "baseline")
     set(KERNEL "${CMAKE_CURRENT_BINARY_DIR}/baseline.cpp")
     set(DEFAULT_WORKERS 12)
+    set(BASELINE_DEFINE EXL3_BENCH_BASELINE=1)
   else()
     set(KERNEL "${QUANT}/optimized/kernel.cpp")
     set(DEFAULT_WORKERS 16)
+    set(BASELINE_DEFINE "")
   endif()
   add_executable(exl3_cpu_${BACKEND} src/cpu_forward.cpp src/fixture.cpp "${KERNEL}")
   # ${QUANT}: the baseline copy includes optimized/cpu_experts_cabi.h, which in place resolves beside the source.
@@ -74,7 +76,7 @@ foreach(BACKEND baseline optimized)
   target_include_directories(exl3_cpu_${BACKEND} SYSTEM PRIVATE "${ATEN_INCLUDE}" "${ATEN_INCLUDE}/torch/csrc/api/include")
   target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE
     EXL3_MOE_CPU_ACT_RESIDUAL=1 EXL3_MOE_CPU_ACT_BLOCK=128
-    EXL3_BENCH_BACKEND="${BACKEND}" EXL3_BENCH_DEFAULT_WORKERS=${DEFAULT_WORKERS})
+    EXL3_BENCH_BACKEND="${BACKEND}" EXL3_BENCH_DEFAULT_WORKERS=${DEFAULT_WORKERS} ${BASELINE_DEFINE})
   # Kernel flags match the selected study. Keep the harness's NaN/error checks
   # outside fast-math; kernel and harness are distinct translation units.
   set_source_files_properties("${KERNEL}" PROPERTIES COMPILE_OPTIONS "-Ofast;-march=native")

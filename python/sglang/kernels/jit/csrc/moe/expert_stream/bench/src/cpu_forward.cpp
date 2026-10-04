@@ -31,9 +31,14 @@
 #include <thread>
 #include <unistd.h>
 
+#ifdef EXL3_BENCH_BASELINE
+// The vendored baseline's own core list (exl3_cpu/moe_mul1.cpp); the shared header no longer declares it.
+extern "C" int sglang_exl3_cpu_experts_set_cores(const int32_t* cores, int32_t n) noexcept;
+#endif
+
 namespace {
 namespace fs = std::filesystem;
-int64_t g_engine = 0;  // the kernel's engine on the bench's cores, created in main
+int64_t g_engine = 0;  // the kernel's engine on the bench's cores, created in main (baseline: none, stays 0)
 bool benchmark_failed = false;
 // The command line; the defaults are the reference machine's.
 struct Options {
@@ -289,9 +294,15 @@ int main(int argc, char** argv) {
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
     omp_set_dynamic(0);
+#ifdef EXL3_BENCH_BASELINE
+    // The vendored baseline has no engines (its forward ignores call.engine); it keeps its own process-wide core list.
+    if (sglang_exl3_cpu_experts_set_cores(cores.data(), static_cast<int32_t>(cores.size())))
+      throw std::runtime_error("Cannot configure kernel cores");
+#else
     // Cores must be distinct and in [0, CPU_SETSIZE); one that cannot be pinned fails the forward with status 1.
     if (sglang_exl3_cpu_experts_engine_create(cores.data(), static_cast<int32_t>(cores.size()), &g_engine))
       throw std::runtime_error("Cannot create the kernel's engine");
+#endif
     cpu_set_t caller;
     CPU_ZERO(&caller);
     CPU_SET(cores.front(), &caller);
