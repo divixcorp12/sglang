@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 def cpu_trait_for(format_key: str, ext=None):
     """The quant trait of a streamed expert format; only EXL3 has a CPU kernel today."""
     if format_key == "exl3":
-        from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-        from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+        from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+        from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
         return Exl3CpuQuantTrait(ext if ext is not None else exl3_ext(), act_limit=None)
     raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")

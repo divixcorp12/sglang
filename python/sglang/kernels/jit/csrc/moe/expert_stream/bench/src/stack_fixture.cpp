@@ -143,7 +143,7 @@ void StackFixture::write_x(int64_t row) const {
   std::memcpy(x_row(row), impl_->inputs.data() + row * 2 * impl_->hidden, 2 * impl_->hidden);
 }
 
-// Mirrors cpu_experts/exl3.py::register_layer: the row's six slabs by base pointer and row stride (kNames is
+// Mirrors Exl3CpuQuantTrait.register_layer: the row's six slabs by base pointer and row stride (kNames is
 // EXL3_STREAMED_NAMES order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit.
 int64_t StackFixture::register_layer(int64_t row) const {
   const Impl& f = *impl_;

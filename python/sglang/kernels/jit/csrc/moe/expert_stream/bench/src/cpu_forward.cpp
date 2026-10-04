@@ -32,7 +32,7 @@
 #include <unistd.h>
 
 #ifdef EXL3_BENCH_BASELINE
-// The vendored baseline's own core list (exl3_cpu/moe_mul1.cpp); the shared header no longer declares it.
+// The vendored baseline's own core list (csrc/exl3/moe_mul1.cpp); the shared header no longer declares it.
 extern "C" int sglang_exl3_cpu_experts_set_cores(const int32_t* cores, int32_t n) noexcept;
 #endif
 

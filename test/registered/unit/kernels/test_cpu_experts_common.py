@@ -1,4 +1,4 @@
-"""The header-only CPU experts framework (cpu_experts_common) passes its native harness (Linux, GCC with OpenMP).
+"""The header-only CPU experts framework (host/cpu_experts) passes its native harness (Linux, GCC with OpenMP).
 
 ``cpu_experts_common_check.cpp`` drives a toy quant through ``ExpertForward`` and the C ABI macro and prints
 ``ok <check>`` per contract it holds.

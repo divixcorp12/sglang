@@ -90,7 +90,7 @@ def split_route_tables(remap, weights, mask, bufs: SplitBuffers) -> None:
 
 def launch(fused, x16, out, count, weight_sorted, det0, num_active: int = 6) -> None:
     """One exl3_moe over ``fused``'s slot tables and temps, deterministic path, as Exl3FusedMoE.run issues it."""
-    from sglang.srt.layers.quantization.exl3_fused_moe import ACT_SILU, ROW_TILE
+    from sglang.srt.layers.quantization.exl3.fused_moe import ACT_SILU, ROW_TILE
 
     t = fused.tables
     fused.ext.exl3_moe(
@@ -127,7 +127,7 @@ class SplitState(msgspec.Struct):
 
 def split_run(fused, state: SplitState, x, weights, remap, hit, keep, *, between=None, num_active: int = 6):
     """Resident launch, then missed launch, then one gather; ``between(stage)`` observes the buffers between steps."""
-    from sglang.srt.layers.quantization.exl3_fused_moe import route_tables
+    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
 
     fused.x16.copy_(x)
     # Placement from every route. keep = 1 here: the resident launch cannot know keep.
@@ -154,7 +154,7 @@ def split_run(fused, state: SplitState, x, weights, remap, hit, keep, *, between
 
 def _fused(slot_rows, device, layer_fusion: bool):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.quantization.exl3_fused_moe import Exl3FusedMoE
+    from sglang.srt.layers.quantization.exl3.fused_moe import Exl3FusedMoE
 
     slots = slot_rows["w13_trellis"].shape[0]
     with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(layer_fusion):
@@ -170,7 +170,7 @@ def _fused(slot_rows, device, layer_fusion: bool):
 
 @pytest.fixture(scope="module")
 def slot_rows():
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     ext = exl3_ext()
     missing = [n for n in ("exl3_moe", "exl3_moe_gather", "exl3_moe_max_concurrency") if not hasattr(ext, n)]
@@ -259,7 +259,7 @@ def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
 
 def test_full_weight_table_misplaces_masked_weights(slot_rows):
     """The hazard the compacted weights avoid: a masked launch indexes weight_sorted by its own running prefix."""
-    from sglang.srt.layers.quantization.exl3_fused_moe import route_tables
+    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
 
     device = slot_rows["w13_trellis"].device
     ref = _fused(slot_rows, device, False)
@@ -430,8 +430,8 @@ def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
 def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):
     """End to end over one layer's real rows: the CPU kernel's partial of the CPU routes, from host copies of the same
     slots, lands the output within the kernel's own error of the full GPU run, far closer than dropping those routes."""
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     threads = min(4, len(os.sched_getaffinity(0)))

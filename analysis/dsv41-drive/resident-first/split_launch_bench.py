@@ -75,7 +75,7 @@ class Layer(msgspec.Struct):
 
 def build_layers(par, real: dict, device, gen) -> list[Layer]:
     from sglang.srt.environ import envs
-    from sglang.srt.layers.quantization.exl3_fused_moe import Exl3FusedMoE
+    from sglang.srt.layers.quantization.exl3.fused_moe import Exl3FusedMoE
 
     n_real = real["w13_trellis"].shape[0]
     hidden = real["w13_suh"].shape[-1]
@@ -203,7 +203,7 @@ def main():
     args = ap.parse_args()
 
     par = _parity_module()
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     exl3_ext()
     device = torch.device("cuda", torch.cuda.current_device())

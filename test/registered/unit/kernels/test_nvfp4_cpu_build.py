@@ -1,6 +1,6 @@
 """The NVFP4 CPU expert library builds from Python and passes its native harnesses (Linux, GCC with OpenMP).
 
-``nvfp4_cpu/optimized/build.py`` compiles the kernel into a shared library or, with a harness ``main``, into an
+``quantization/nvfp4/build.py`` compiles the kernel into a shared library or, with a harness ``main``, into an
 executable; ``nvfp4_cpu_ext.nvfp4_cpu_library`` builds the library once per content hash and loads it. The two native
 harnesses are the ones the removed CMake build ran under CTest.
 """
@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=180, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[4]
-OPTIMIZED = REPO / "python/sglang/srt/layers/quantization/nvfp4_cpu/optimized"
+BUILD = REPO / "python/sglang/srt/layers/quantization/nvfp4/build.py"
 CXX = os.environ.get("CXX") or shutil.which("g++")
 C_ABI = (
     "sglang_nvfp4_cpu_experts_register_layer",
@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _build_module():
-    spec = importlib.util.spec_from_file_location("nvfp4_cpu_build", OPTIMIZED / "build.py")
+    spec = importlib.util.spec_from_file_location("nvfp4_cpu_build", BUILD)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -51,7 +51,7 @@ def test_build_py_makes_a_library_exporting_the_c_abi(tmp_path):
 
 
 def test_the_loader_builds_once_per_content_and_reuses_the_library(tmp_path):
-    from sglang.srt.layers.quantization import nvfp4_cpu_ext
+    from sglang.srt.layers.quantization.nvfp4 import ext as nvfp4_cpu_ext
 
     nvfp4_cpu_ext.nvfp4_cpu_library.cache_clear()
     library = nvfp4_cpu_ext.nvfp4_cpu_library(str(tmp_path))

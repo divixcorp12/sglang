@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuParams, Exl3CpuQuantTrait
+from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuParams, Exl3CpuQuantTrait
 from sglang.srt.layers.moe.cpu_experts.policy import (
     format_calibration,
     k_star,

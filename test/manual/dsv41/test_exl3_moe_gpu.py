@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.quantization.exl3_ops import (
+from sglang.srt.layers.quantization.exl3.ops import (
     exl3_dense_weight,
     exl3_moe_loop,
     random_exl3_tensors,

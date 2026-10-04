@@ -31,17 +31,18 @@ from sglang.srt.layers.moe.cpu_experts.pool import (
     CPU_EXPERTS_FORWARD_ABI_VERSION, CPU_EXPERTS_LAYER_ABI_VERSION, CpuExpertsForwardCall, CpuExpertsLayer,
 )
 
-lib = ctypes.CDLL(sys.argv[1])
-calls = [int(t) for t in sys.argv[2].split(",")]
-cores = [int(c) for c in sys.argv[3].split(",")] if sys.argv[3] else []
-alpha_value = float(sys.argv[4])
 
-
-# SglangNvfp4CpuParams (nvfp4_cpu/optimized/cpu_experts_cabi.h).
+# SglangNvfp4CpuParams (csrc/nvfp4/optimized/cpu_experts_cabi.h); the scheme's Nvfp4CpuParams, kept local so each child
+# process imports only the pool and not every quantization config.
 class Params(ctypes.Structure):
     _fields_ = [
         ("w13_layout", ctypes.c_int32), ("inv_input_scale13", ctypes.c_float), ("inv_input_scale2", ctypes.c_float),
     ]
+
+lib = ctypes.CDLL(sys.argv[1])
+calls = [int(t) for t in sys.argv[2].split(",")]
+cores = [int(c) for c in sys.argv[3].split(",")] if sys.argv[3] else []
+alpha_value = float(sys.argv[4])
 
 
 H = N = 80
@@ -124,7 +125,7 @@ else:
 @pytest.fixture(scope="module")
 def built(tmp_path_factory):
     spec = importlib.util.spec_from_file_location(
-        "nvfp4_cpu_build", REPO / "python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py"
+        "nvfp4_cpu_build", REPO / "python/sglang/srt/layers/quantization/nvfp4/build.py"
     )
     build = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(build)
@@ -132,7 +133,7 @@ def built(tmp_path_factory):
 
 
 def _host_has_avx2() -> bool:
-    # What detect_isa requires for the AVX2 tier (cpu_experts_common/isa.hpp).
+    # What detect_isa requires for the AVX2 tier (expert_stream/host/cpu_experts/isa.hpp).
     try:
         cpuinfo = Path("/proc/cpuinfo").read_text()
     except OSError:
@@ -210,3 +211,38 @@ def test_two_engines_forward_at_once_without_a_busy_status(library):
 def test_an_intermediate_q8_cannot_represent_returns_2_and_leaves_out_untouched(library):
     # gate = up = 80 * 1e30, so SiLU(gate) * up overflows to inf before the down projection's quantization.
     assert _run(library, "2", alpha=1e30) == ["forward 2 2 untouched"]
+
+
+def test_the_scheme_registers_a_layer_and_runs_it(built):
+    import ctypes
+
+    import torch
+
+    from sglang.srt.layers.quantization.nvfp4.schemes import Nvfp4CpuQuantTrait
+
+    trait = Nvfp4CpuQuantTrait(hidden=80, intermediate=80, act_limit=0.0, library=ctypes.CDLL(str(built)))
+    slabs = {  # the CHILD's layer: H = N = 80, two slots
+        "w13": torch.full((2, 80 * 80), 0x22, dtype=torch.uint8),
+        "w2": torch.full((2, 80 * 80 // 2), 0x22, dtype=torch.uint8),
+        "sf13": torch.full((2, 256 * 8), 56, dtype=torch.uint8),
+        "sf2": torch.full((2, 128 * 8), 56, dtype=torch.uint8),
+        "gate_alpha": torch.ones(2, 1),
+        "down_alpha": torch.ones(2, 1),
+    }
+    handle = trait.register_layer(slabs, capacity=2)
+    try:
+        x = torch.ones(1, 80, dtype=torch.float16)
+        out = torch.full((1, 80), 123.0)
+        trait.forward(handle, x, torch.zeros(1, 1, dtype=torch.int64), torch.ones(1, 1), out, threads=1)
+        assert torch.isfinite(out).all() and not (out == 123.0).any()
+
+        refused = torch.full((1, 80), 123.0)
+        with pytest.raises(RuntimeError, match="status 2"):  # slot 2 is past the capacity
+            trait.forward(handle, x, torch.full((1, 1), 2, dtype=torch.int64), torch.ones(1, 1), refused, threads=1)
+        assert (refused == 123.0).all()
+        with pytest.raises(ValueError, match="NVFP4 CPU forward takes"):
+            trait.forward(handle, x, torch.zeros(1, 1, dtype=torch.int64), torch.ones(1, 1), out[:, :40], threads=1)
+    finally:
+        trait.free_layer(handle)
+    with pytest.raises(RuntimeError, match="status 2"):
+        trait.free_layer(handle)

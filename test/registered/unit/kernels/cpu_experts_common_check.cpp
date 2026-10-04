@@ -1,4 +1,4 @@
-// Standalone harness for cpu_experts_common: a toy quant through ExpertForward. Built by test_cpu_experts_common.py.
+// Standalone harness for host/cpu_experts: a toy quant through ExpertForward. Built by test_cpu_experts_common.py.
 #include "cpu_experts_common_toy.hpp"
 #include <sched.h>
 #include <atomic>

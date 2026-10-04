@@ -1,4 +1,4 @@
-"""Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (exl3_cpu/optimized/kernel.cpp).
+"""Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (csrc/exl3/optimized/kernel.cpp).
 
 ``dump`` runs a fixed set of forwards through the extension ``exl3_ext()`` builds and saves every output; ``compare``
 checks two dumps for bitwise equality. A dump made at the merge-base is the reference a kernel refactor must reproduce
@@ -78,7 +78,7 @@ def register_table(ext, s, limit):
 def register_slabs(ext, s, limit):
     """The C ABI's register_layer over the same tensors, as the RAM-miss service registers them: six base pointers,
     slot s at base + s rows. Returns the handle and the trait that frees it."""
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     trait = Exl3CpuQuantTrait(ext, act_limit=limit)
     try:
@@ -93,7 +93,7 @@ def dump(args):
     import torch
 
     import sglang
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     print(f"sglang {sglang.__file__}")
     ext = exl3_ext()

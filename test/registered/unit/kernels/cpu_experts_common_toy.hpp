@@ -1,8 +1,8 @@
-// A toy CPU expert quant for cpu_experts_common's tests: one slab of float[hidden] per slot; a forward writes
+// A toy CPU expert quant for the CPU experts framework's tests: one slab of float[hidden] per slot; a forward writes
 // out[t][h] (+)= sum over routes of weight * scale * slab[slot][h]. TOY_TOP_ISA picks kTopIsa (default Avx2).
 #pragma once
-#include "../../../../python/sglang/srt/layers/quantization/cpu_experts_common/expert_forward.hpp"
-#include "../../../../python/sglang/srt/layers/quantization/cpu_experts_common/cabi.hpp"
+#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/expert_forward.hpp"
+#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/cabi.hpp"
 #include <atomic>
 #include <cmath>
 #include <thread>

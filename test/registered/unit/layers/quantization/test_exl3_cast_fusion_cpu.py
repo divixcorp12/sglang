@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import exl3
+from sglang.srt.layers.quantization.exl3 import exl3
 from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3LinearMethod, exl3_cast_fusion_mlp
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.test.ci.ci_register import register_cpu_ci

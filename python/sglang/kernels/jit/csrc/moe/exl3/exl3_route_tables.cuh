@@ -1,6 +1,6 @@
 // REQUIRED BUILD FLAG: none; never -use_fast_math. It implies -ftz, which could flush subnormal products and inputs
 // that torch keeps (the __fmul_rn and __float2half_rn below), and bit parity with the torch chain breaks.
-// The EXL3 fused MoE's route tables and input staging (exl3_fused_moe.route_tables and the copies around it) in one
+// The EXL3 fused MoE's route tables and input staging (exl3.fused_moe.route_tables and the copies around it) in one
 // launch per layer, bit for bit: integer bookkeeping plus two exact float conversions, so nothing reorders a sum.
 #pragma once
 
@@ -30,7 +30,7 @@ __device__ __forceinline__ float route_tables_to_float(__nv_bfloat16 v) {
   return __bfloat162float(v);
 }
 
-// exl3_fused_moe.route_tables plus the copies around it in Exl3FusedMoE.run: the int64 remap, x -> fp16, the zeroed
+// exl3.fused_moe.route_tables plus the copies around it in Exl3FusedMoE.run: the int64 remap, x -> fp16, the zeroed
 // fp32 output, per-slot route counts (zero when keep is 0), inv_order, the keep-scaled fp16 weights in slot order,
 // and the deterministic table stack [start, start, count > 0] over slots + 1 columns.
 //

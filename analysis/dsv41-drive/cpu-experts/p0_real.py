@@ -3,7 +3,7 @@
 The kernel is the fork's own exl3_ext() build (exllamav3 02aef45, cpu/moe_mul1.cpp), called on rows laid out as
 the pinned tier's slabs (ExpertPinnedHostCache.tensors: w13_* [N, 2, ...] with gate at part 0 and up at part 1,
 w2_* [N, ...]), with activation 0 and act_limit = swiglu_limit, which is what the graph decode path passes
-(exl3_fused_moe.py, ACT_SILU).
+(exl3/fused_moe.py, ACT_SILU).
 
 Run from the repo root with PYTHONPATH=$PWD/python. Modes:
   accuracy LAYERS PER_LAYER TAG
@@ -41,8 +41,8 @@ RESULTS = os.path.join(HERE, "p0_results.jsonl")
 
 
 def flavor():
-    """The CPU kernel build this process uses: "" is upstream's, else exl3_ext.build_flavor's suffix."""
-    from sglang.srt.layers.quantization.exl3_ext import build_flavor, cpu_act_defines
+    """The CPU kernel build this process uses: "" is upstream's, else exl3.ext.build_flavor's suffix."""
+    from sglang.srt.layers.quantization.exl3.ext import build_flavor, cpu_act_defines
 
     return build_flavor(cpu_act_defines()) or "upstream"
 
@@ -56,7 +56,7 @@ def emit(rec):
 
 
 def ext():
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     return exl3_ext()
 
@@ -167,7 +167,7 @@ def cpu_outputs(tier, cases_path, out_path):
 def gpu_outputs(cases):
     """Per case: (production exl3_linear path, fp32 reconstruct reference), both fp32 [1, H]."""
     import torch
-    from sglang.srt.layers.quantization.exl3_ops import (
+    from sglang.srt.layers.quantization.exl3.ops import (
         Exl3Tensors,
         exl3_linear,
         exl3_linear_reference,

@@ -28,8 +28,8 @@ KEEP_WARM = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int64, ctypes.c_int32, ctype
 
 
 def _kernel():
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
 
     if not optimized_cpu(cpu_act_defines()):
         pytest.skip("the engine ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")

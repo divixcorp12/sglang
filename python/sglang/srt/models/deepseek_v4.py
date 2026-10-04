@@ -3291,7 +3291,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_half,
                     )
-                    from sglang.srt.layers.quantization.exl3_ops import (
+                    from sglang.srt.layers.quantization.exl3.ops import (
                         EXL3_HALF_INPUT,
                     )
 

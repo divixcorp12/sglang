@@ -55,7 +55,7 @@ def _run(tier, out_path):
     os.environ.setdefault("EXL3_MOE_CPU_PIN", "0")
     import torch
 
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     e = exl3_ext()
     w, x, sel, rw = _weights(torch)
