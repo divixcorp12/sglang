@@ -25,7 +25,8 @@ class StackFixture {
   }
 
   // Where the tier maps `expert`: its home group's slots, after that group's kStaging staging slots took and returned
-  // the first misses (the lowest free slot each time), so a group's j-th expert is at its j-th slot.
+  // the first misses (the lowest free slot each time), so a group's j-th expert is at its j-th slot. That holds when
+  // each group's experts are loaded in ascending order in posts of kStaging, none mixed with another group's.
   static int32_t slot_of(int64_t expert) {
     using Wire = ::sglang::expert_stream::wire::Wire;
     return static_cast<int32_t>(Wire::home(expert) * kGroupSlots + expert / Wire::kNodes);
