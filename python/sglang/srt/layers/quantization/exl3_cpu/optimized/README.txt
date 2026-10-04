@@ -85,10 +85,10 @@ teams and other simultaneous consumers of the same cores.
 Code layout
 -----------
 math.hpp holds the arithmetic every tier shares (state decode, Hadamard, activation quantization) and
-math_scalar.hpp, math_avx2.hpp and math_avx512.hpp each tier's GEMV tiles; moe_mul1.cpp holds the tier dispatch,
-the forward driver and the public API. Registration, validation, the ISA tier, the worker cores and
-keep-warm are cpu_experts_common's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp). The tier is
-min(host, EXL3_MOE_CPU_MAX_ISA), read at the first forward or tier query; EXL3_MOE_CPU_REPORT_ISA=1 prints
+math_scalar.hpp, math_avx2.hpp and math_avx512.hpp each tier's GEMV tiles; forward_plan.hpp holds the tier
+dispatch, the forward driver and the plans; moe_mul1.cpp holds the public API. Registration, validation, the ISA
+tier, the worker cores and keep-warm are cpu_experts_common's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp).
+The tier is min(host, EXL3_MOE_CPU_MAX_ISA), read at the first forward or tier query; EXL3_MOE_CPU_REPORT_ISA=1 prints
 "exl3 isa <tier>" to stderr then. A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
 picked once per call in Exl3Quant::dispatch: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on
 an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one

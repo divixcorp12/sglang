@@ -1,6 +1,5 @@
 // Exl3Quant: the EXL3 CPU expert quant for ExpertForward (cpu_experts_common/expert_forward.hpp), with the layer facts
-// and the expert accessors a forward plan reads. moe_mul1.cpp includes forward_plan.hpp and defines
-// Exl3Quant::dispatch after it.
+// and the expert accessors a forward plan reads. forward_plan.hpp defines Exl3Quant::dispatch.
 #pragma once
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
@@ -146,7 +145,7 @@ struct Exl3Quant
                 exl3_matrix(base[kW2Trellis], base[kW2Suh], base[kW2Svh], n, h, l.bits, l.swz)};
     }
 
-    // Defined in moe_mul1.cpp after forward_plan.hpp.
+    // Defined at the end of forward_plan.hpp.
     static int dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r, Isa isa);
 };
 

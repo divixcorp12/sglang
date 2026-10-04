@@ -1,10 +1,35 @@
-// Included by moe_mul1.cpp inside sglang::exl3_cpu's anonymous namespace, after the phase helpers (prepare_rows,
-// run_tiles, transform_out, middle_blocks, prepare_gu_blocks, transform_owned_blocks, assign_gemvs) and ForwardCtx.
+// EXL3's forward: the tier dispatch of the GEMV tiles (run_tiles), the phase helpers, the plans and the plan entry
+// (Exl3Quant::dispatch). Included by moe_mul1.cpp.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is
 // the ISA tier. The primary template is the generic plan. PlanTraits<Dsv41Shape, Isa::Bw> turns on the fast path that
 // was measured and validated bit-exact on AVX-512BW (exl3_cpu/optimized/README.txt); every other (Shape, I) pair runs
 // the generic plan. ForwardPlan<Shape, I, true> also times each phase and prints one line per forward.
+// Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
+// see ../LICENSE.exllamav3.
+#pragma once
+// The math headers in this order: the definition order the kernels were validated in (bit-exact per tier); another
+// order changes what GCC inlines and clones.
+#include "math_avx512.hpp"
+#include "math_avx2.hpp"
+#include "math_scalar.hpp"
+#include "shapes.hpp"
+#include <c10/util/Half.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <ratio>
+#include <utility>
+#include <vector>
+
+namespace sglang::exl3_cpu {
+namespace {
 
 // -------------------------------------------------------------------------------------------
 //   Dispatch
@@ -237,8 +262,6 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
 // -------------------------------------------------------------------------------------------
 //   Forward driver
 // -------------------------------------------------------------------------------------------
-
-#include "shapes.hpp"
 
 struct ForwardCtx
 {
@@ -874,3 +897,6 @@ int Exl3Quant::dispatch(const Layer& l, const SglangCpuExpertsForward& c, const 
                 c.accumulate != 0);
     return 0;
 }
+
+}  // namespace
+}  // namespace sglang::exl3_cpu
