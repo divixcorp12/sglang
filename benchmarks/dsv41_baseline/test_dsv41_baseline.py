@@ -1126,16 +1126,24 @@ def test_server_cores_touch_no_node_1_core():
     assert not (_cores(arm_env.SERVER_CORES) & NODE1_CPUS)
 
 
-def test_the_ram_miss_spin_core_has_its_physical_core_to_itself():
-    path = f"/sys/devices/system/cpu/cpu{arm_env.SPIN_CORE}/topology/thread_siblings_list"
-    if os.path.exists(path):
-        with open(path) as f:
-            siblings = _cores(f.read().strip())
-    else:
-        # No sysfs (the laptop): divix01's rule, cpu n and n + 36 are one physical core.
-        siblings = {arm_env.SPIN_CORE, arm_env.SPIN_CORE + 36}
-    taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES) | _cores(arm_env.FREE_CORES)
-    assert arm_env.SPIN_CORE in NODE0_CPUS and not (siblings & taken), sorted(siblings & taken)
+def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
+    # ThreadingConfig is the one copy of the rule (busy-polling core: no SMT sibling in the server's affinity).
+    tc = pytest.importorskip("sglang.srt.layers.moe.cpu_experts.threading_config")
+    for node, cpus in {0: "0-17,36-53", 1: "18-35,54-71"}.items():
+        node_dir = tmp_path / "node" / f"node{node}"
+        node_dir.mkdir(parents=True)
+        (node_dir / "cpulist").write_text(cpus)
+        for cpu in _cores(cpus):
+            topology = tmp_path / "cpu" / f"cpu{cpu}" / "topology"
+            topology.mkdir(parents=True)
+            (topology / "thread_siblings_list").write_text(f"{cpu % 36},{cpu % 36 + 36}")
+    nodes = [int(entry.split(":")[0]) for entry in arm_env.PINNED_HOST_NUMA_MB.split(",")]
+    config = tc.ThreadingConfig.resolve(
+        nodes=nodes, gpu_node=0, affinity=_cores(arm_env.SERVER_CORES),
+        topology=tc.Topology.from_sysfs(str(tmp_path)), settings=tc.CoreSettings(spin_core=arm_env.SPIN_CORE),
+    )
+    assert config.plans[0].ram == arm_env.SPIN_CORE and config.plans[0].busy_poll
+    assert not (set(config.copy_cpus) & _cores(arm_env.DRIVER_CORES))
     assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
 
 

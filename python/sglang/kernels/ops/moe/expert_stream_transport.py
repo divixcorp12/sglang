@@ -1350,10 +1350,9 @@ class ExpertStreamHost:
         and no sleep; the C++ side refuses it unless that physical core is the
         service's alone.
         """
-        if 64 <= cpu_core <= 71:
-            raise ValueError(
-                f"cpu_core {cpu_core}: cores 64-71 are reserved (NVMe completion interrupts are pinned there)"
-            )
+        from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
+
+        check_not_reserved(cpu_core)
         self._module.expert_stream_start_thread(
             self.handle,
             cpu_core,

@@ -1846,6 +1846,12 @@ class Envs:
     # core's whole physical core is its own: no SMT sibling in the server's affinity or SGLANG_DSV41_CPU_EXPERTS_CORES.
     # That check runs once, when the service starts; a thread pinned onto that physical core later is not caught.
     SGLANG_DSV41_RAM_MISS_SPIN_CORE = EnvInt(None)
+    # io_uring options the C++ reader also reads itself (host/uring_options.h); declared here because
+    # ThreadingConfig resolves the SQPOLL thread's core from them. The service passes every ring its core explicitly.
+    SGLANG_EXPERT_STREAM_URING_MODE = EnvStr("default")
+    # The SQPOLL thread's core with one NUMA group, -1 or unset unpinned; refused above one group (use
+    # SGLANG_EXPERT_NUMA_CORES's sq=).
+    SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU = EnvInt(None)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.
@@ -1911,6 +1917,10 @@ class Envs:
     SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
     SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
+    # Per-node thread plans replacing the derived ones (cpu_experts/threading_config.py), e.g.
+    # "1:ram=35,cpu=18-33,sq=34;0:ram=17": nodes separated by ";", keys ram, cpu, sq, each a taskset list. Validated
+    # like a derived plan; a refused plan stops the start. Empty derives every node's plan.
+    SGLANG_EXPERT_NUMA_CORES = EnvStr("")
     # CPU lanes per n resident lanes of a layer, n = 0..8, as 9 comma-separated counts ("0,1,1,2,3,3,4,5,5"). Empty
     # computes k*(n) from the three costs below (policy.split_table).
     SGLANG_DSV41_CPU_EXPERTS_SPLIT = EnvStr("")

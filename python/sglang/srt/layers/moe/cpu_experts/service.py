@@ -95,13 +95,10 @@ class CpuExpertService:
         split: Sequence[int],
         pin: bool = True,
     ):
+        from sglang.srt.layers.moe.cpu_experts.threading_config import check_engine_cores
+
         cores = sorted(set(cores))
-        if len(cores) < 2:
-            # Spinning workers sharing one core livelock
-            # (DSV41_REFERENCE.md section 28.2).
-            raise ValueError(f"CPU experts need at least 2 cores, got {cores}")
-        if not 1 <= threads <= len(cores):
-            raise ValueError(f"{threads} CPU expert threads on {len(cores)} cores")
+        check_engine_cores(cores, threads)
         trait.check_environment()
         self.host, self.trait = host, trait
         # The split table covers n = 0..lanes resident lanes, as the host's wire does.

@@ -152,13 +152,10 @@ class CpuExpertPool:
         cores: Sequence[int],
         threads: int,
     ):
+        from sglang.srt.layers.moe.cpu_experts.threading_config import check_engine_cores
+
         cores = sorted(set(cores))
-        if len(cores) < 2:
-            # Spinning workers sharing one core livelock
-            # (DSV41_REFERENCE.md section 28.2).
-            raise ValueError(f"the CPU expert pool needs at least 2 cores, got {cores}")
-        if not 1 <= threads <= len(cores):
-            raise ValueError(f"{threads} pool threads on {len(cores)} cores")
+        check_engine_cores(cores, threads)
         trait.check_environment()
         self.trait = trait
         self.cores = tuple(cores)
