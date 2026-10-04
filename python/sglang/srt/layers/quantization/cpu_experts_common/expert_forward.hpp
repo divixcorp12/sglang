@@ -16,6 +16,9 @@
 #include <vector>
 
 namespace sglang::cpu_experts {
+// Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
+// are STB_GNU_UNIQUE, which the dynamic linker merges across every library in the process, even RTLD_LOCAL ones.
+namespace {
 
 template <class Quant>
 struct ExpertForward
@@ -114,15 +117,16 @@ struct ExpertForward
         }
     }
 
-    // keep_warm (keep_warm.hpp) at this quant's tier.
+    // keep_warm (keep_warm.hpp) at this quant's tier, compiling only the loops up to kTopIsa.
     static int keep_warm(int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept
     {
         try {
-            return ::sglang::cpu_experts::keep_warm(isa(), threads, word, seen, deadline_ns);
+            return ::sglang::cpu_experts::keep_warm<Quant::kTopIsa>(isa(), threads, word, seen, deadline_ns);
         } catch (...) {
             return 1;
         }
     }
 };
 
+}  // namespace
 }  // namespace sglang::cpu_experts

@@ -7,6 +7,9 @@
 #include <cstdint>
 
 namespace sglang::cpu_experts {
+// Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
+// are STB_GNU_UNIQUE, which the dynamic linker merges across every library in the process, even RTLD_LOCAL ones.
+namespace {
 
 template <class Quant>
 struct MoeBufferRow
@@ -42,4 +45,5 @@ struct MoeBufferRows
     }
 };
 
+}  // namespace
 }  // namespace sglang::cpu_experts

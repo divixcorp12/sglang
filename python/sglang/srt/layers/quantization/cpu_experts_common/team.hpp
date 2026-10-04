@@ -11,6 +11,9 @@
 #include <vector>
 
 namespace sglang::cpu_experts {
+// Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
+// are STB_GNU_UNIQUE, which the dynamic linker merges across every library in the process, even RTLD_LOCAL ones.
+namespace {
 
 struct Cores
 {
@@ -100,4 +103,5 @@ void run_team(int threads, Body&& body)
         throw std::runtime_error("OpenMP returned fewer CPU expert workers than requested");
 }
 
+}  // namespace
 }  // namespace sglang::cpu_experts

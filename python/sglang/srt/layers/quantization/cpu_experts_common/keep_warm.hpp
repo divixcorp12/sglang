@@ -11,6 +11,9 @@
 #include <cstdint>
 
 namespace sglang::cpu_experts {
+// Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
+// are STB_GNU_UNIQUE, which the dynamic linker merges across every library in the process, even RTLD_LOCAL ones.
+namespace {
 namespace keep_warm_detail {
 
 inline bool done(const uint32_t* word, uint32_t seen, int64_t deadline_ns, uint32_t tick)
@@ -65,10 +68,23 @@ inline std::atomic<int32_t> sink{0};
 
 }  // namespace keep_warm_detail
 
+// The loop for tier `isa`, clamped to Top: a quant compiles no vector code above its top tier, so a Scalar quant's
+// portable build carries no AVX instructions from here.
+template <Isa Top>
+int32_t keep_warm_loop(Isa isa, const uint32_t* word, uint32_t seen, int64_t deadline_ns)
+{
+    if constexpr (Top >= Isa::Bw)
+        if (isa >= Isa::Bw) return keep_warm_detail::bw(word, seen, deadline_ns);
+    if constexpr (Top >= Isa::Avx2)
+        if (isa >= Isa::Avx2) return keep_warm_detail::avx2(word, seen, deadline_ns);
+    return keep_warm_detail::scalar(word, seen, deadline_ns);
+}
+
 // Holds `threads` workers (the caller as worker 0, each pinned as the forward pins it) in register-only work of tier
-// `isa` until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Returns 0, 1 on a kernel error (a failed pin), 2
-// on invalid arguments or more threads than the configured cores.
-inline int keep_warm(Isa isa, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept
+// min(isa, Top) until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Returns 0, 1 on a kernel error (a failed
+// pin), 2 on invalid arguments or more threads than the configured cores.
+template <Isa Top>
+int keep_warm(Isa isa, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept
 {
     if (threads < 1 || word == nullptr) return 2;
     try {
@@ -78,10 +94,8 @@ inline int keep_warm(Isa isa, int32_t threads, const uint32_t* word, uint32_t se
         #pragma omp parallel num_threads(threads) shared(pin_error)
         {
             Cores::pin(omp_get_thread_num(), pin_error);
-            const int32_t r = isa == Isa::Scalar ? keep_warm_detail::scalar(word, seen, deadline_ns)
-                              : isa == Isa::Avx2 ? keep_warm_detail::avx2(word, seen, deadline_ns)
-                                                 : keep_warm_detail::bw(word, seen, deadline_ns);
-            keep_warm_detail::sink.fetch_add(r, std::memory_order_relaxed);
+            keep_warm_detail::sink.fetch_add(keep_warm_loop<Top>(isa, word, seen, deadline_ns),
+                                             std::memory_order_relaxed);
         }
         return pin_error.load(std::memory_order_relaxed) ? 1 : 0;
     } catch (...) {
@@ -89,4 +103,5 @@ inline int keep_warm(Isa isa, int32_t threads, const uint32_t* word, uint32_t se
     }
 }
 
+}  // namespace
 }  // namespace sglang::cpu_experts

@@ -15,6 +15,9 @@
 #define SGLANG_TARGET_VBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,fma,f16c")))
 
 namespace sglang::cpu_experts {
+// Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
+// are STB_GNU_UNIQUE, which the dynamic linker merges across every library in the process, even RTLD_LOCAL ones.
+namespace {
 
 // Ordered: a lower tier's code runs on every higher tier's hardware.
 enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
@@ -53,4 +56,5 @@ inline Isa detect_isa(Isa top, const char* cap_env)
     return hw;
 }
 
+}  // namespace
 }  // namespace sglang::cpu_experts
