@@ -302,10 +302,13 @@ class CudaCopyBackend : public CopyBackend {
   int (*cu_wait_value32_)(void*, uint64_t, uint32_t, unsigned) = nullptr;
 };
 
-// Capacity of the copy engine's two queues: the service's job ring and the copy thread's in-flight FIFO. The device
-// waits on every record with host lanes, so at most one job per demand record is outstanding and neither queue fills.
+// Capacity of the copy engine's queues: each group's job ring, and the copy thread's one in-flight FIFO. Every record
+// has a part per group, and the device waits on every record with host lanes, so at most one job per demand record and
+// group is outstanding. A ring holds one group's jobs; the FIFO and the marks (kMarks) hold every group's.
 constexpr size_t kCopyRing = 32;
-static_assert(kCopyRing > Wire::kDemandRecords, "the copy engine's queues hold every job that can be outstanding");
+static_assert(
+    kCopyRing >= static_cast<size_t>(Wire::kDemandRecords) * Wire::kNodes,
+    "the copy engine's queues hold every job that can be outstanding, across all groups");
 
 // A CPU-only test backend: "copies" between host buffers, completed only when the test releases them.
 //
