@@ -503,3 +503,45 @@ def test_deferred_inserts_never_take_a_filling_slot():
         {0: [5]}, cpu_lanes=lambda layer, misses: set(misses), cpu_insert=_insert_every_cpu_lane, deferred={0: [7]}
     )
     assert sim.slots[0][2] == tier_sim.FILLING and 7 in sim.resident(0)
+
+
+SPLIT = [0, 1, 1, 2, 3, 3, 4]
+
+
+def test_cpu_insert_p1_lands_the_cpu_ram_hit_a_forward_later_and_costs_one_background_row():
+    loaded = _ram_hit_loaded()
+    merged = replay_nm(loaded, ram_rows=4, num_experts=8, policy="cpu_by_score_desc_tail", split=SPLIT)
+    assert merged["n"].tolist() == [[0], [0], [1], [1], [1]]  # the CPU lane never enters VRAM
+    out = replay_nm(loaded, ram_rows=4, num_experts=8, policy="cpu_insert_p1", split=SPLIT)
+    # Forward 3: expert 2 on the CPU fills the only slot (3 evicted). Forward 4: still FILLING, so a RAM hit again;
+    # it lands at forward 4's commit and hits at forward 5.
+    assert out["n"].tolist() == [[0], [0], [1], [1], [0]]
+    assert out["b"].tolist() == [[0], [0], [1], [0], [0]]
+    res = out["residency"]
+    assert res["cpu_insert_issued_per_token"] == pytest.approx(1 / 5)
+    assert res["cpu_insert_rows_per_token"] == pytest.approx(1 / 5)
+    assert res["cpu_insert_dropped_per_token"] == 0.0
+    assert res["hot_hit_rate"] == pytest.approx(1 / 5)
+
+
+def test_no_cpu_insert_without_a_cpu_lane():
+    out = replay_nm(_ram_hit_loaded(), ram_rows=4, num_experts=8, policy="cpu_insert_all", split=[0] * 7)
+    assert out["residency"]["cpu_insert_issued_per_token"] == 0.0
+    assert out["b"].sum() == 0
+
+
+def test_cpu_insert_policies_are_the_merged_order_with_a_per_layer_cap():
+    from cpu_expert_sim import policy_config
+
+    for name, p in (("cpu_insert_p1", 1), ("cpu_insert_p2", 2), ("cpu_insert_all", MAX_ROUTES)):
+        config = policy_config(name)
+        assert config["choice"] == "tail" and config["sort"] == "desc" and config["insert_per_layer"] == p
+
+
+def test_the_existing_policies_never_insert_a_cpu_lane():
+    from cpu_expert_sim import INSERT_POLICIES
+
+    loaded = _ram_hit_loaded()
+    for name in (n for n in INSERT_POLICIES if not n.startswith("cpu_insert_")):
+        res = replay_nm(loaded, ram_rows=4, num_experts=8, policy=name, split=SPLIT)["residency"]
+        assert res["cpu_insert_issued_per_token"] == 0.0 and res["cpu_insert_rows_per_token"] == 0.0, name
