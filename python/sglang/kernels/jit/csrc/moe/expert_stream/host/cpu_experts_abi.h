@@ -4,13 +4,14 @@
 #pragma once
 #include <stdint.h>
 
-#define SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION 1u
+#define SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION 2u
 
 // `rows` token rows through layer `layer`. Token t's input is row t of x (the format's x type, FP16 for EXL3 and
 // NVFP4, [rows][hidden] contiguous); its experts are slots[t * k + i] weighted by weights[t * k + i], i < k, a -1 slot
 // skipped. Its output, row t of out (FP32 [rows][hidden] contiguous), is overwritten with the weighted sum, or the sum is
 // added to it when `accumulate` is nonzero. `threads` workers, the calling thread counted as one. A kernel refuses
-// (returns 2) an abi_version other than SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION.
+// (returns 2) an abi_version other than SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION. `engine` selects the kernel's core list
+// (its engine_create); a kernel refuses (2) an engine it never created or freed, and more `threads` than its cores.
 typedef struct SglangCpuExpertsForward {
     uint32_t abi_version;
     int32_t rows;
@@ -22,6 +23,9 @@ typedef struct SglangCpuExpertsForward {
     int32_t k;
     int32_t threads;
     int32_t accumulate;
+    // The kernel's engine (its *_engine_create): worker i runs on the engine's cores[i]. 0: no engine, unpinned
+    // workers. Last, so v1's designated and positional initializers still compile.
+    int64_t engine;
 } SglangCpuExpertsForward;
 
 #define SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION 1u

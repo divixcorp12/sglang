@@ -46,13 +46,14 @@ if (sglang_nvfp4_cpu_experts_register_layer(&descriptor, &handle) != 0)
 CpuExpertConfig config;
 config.forward = &sglang_nvfp4_cpu_experts_forward;
 // Fill config's existing x/out row tables, dimensions, threads and core list.
-// Before start/first forward, set the kernel's helper cores:
-sglang_nvfp4_cpu_experts_set_cores(cores.data(), cores.size());
+// The kernel's engine on the same cores, passed on every forward and keep-warm:
+if (sglang_nvfp4_cpu_experts_engine_create(cores.data(), cores.size(), &config.engine) != 0)
+    throw std::runtime_error("NVFP4 CPU engine refused its cores");
 CpuExpertEngine engine(config, prefix, thread_name);
 engine.set_layer(row, handle);
 engine.start();
 // Submit existing CpuJob records through the tier's owner.
-// During teardown: engine.stop(), then free every registered layer.
+// During teardown: engine.stop(), then free every registered layer and the kernel engine.
 ```
 
 Check every native return status in actual integration code. The kernel's core
@@ -115,12 +116,11 @@ blocks whose delta rounds to zero contribute zero.
 
 Each forward runs one OpenMP team of `threads` workers, the calling engine thread as worker 0, in four phases
 separated by barriers: every token's input to Q8_0; every routed expert's gate/up rows and SiLU; every intermediate to
-Q8_0; every expert's down rows, each token's summed in its routing order into its row of `out`. Configure distinct allowed Linux cores before the first
-forward; worker i is pinned to core i (once, then re-checked cheaply). A forward may use any team size up to the
-configured cores. If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`, `OMP_DYNAMIC`), the forward returns 1 and
+Q8_0; every expert's down rows, each token's summed in its routing order into its row of `out`. Create an engine (`sglang_nvfp4_cpu_experts_engine_create`) from distinct Linux cores and name it in the call's
+`engine`; worker i is pinned to its core i (once, then re-checked cheaply), and engine 0 runs unpinned workers. A
+forward may use any team size up to the engine's cores (more is refused, 2). If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`, `OMP_DYNAMIC`), the forward returns 1 and
 leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave
-`OMP_PROC_BIND` unset. A concurrent forward or free is rejected (3); cores configured after the first forward or
-keep-warm are refused (2). `sglang_nvfp4_cpu_experts_keep_warm` holds the same pinned team in register-only work at
+`OMP_PROC_BIND` unset. Forwards on any engines run at once from different threads; `free_layer` returns 3 while one runs. `sglang_nvfp4_cpu_experts_keep_warm` holds the same pinned team in register-only work at
 the forward's vector width between calls. Stop/join the engine before freeing
 handles or slab storage; do not unload the library while callbacks are in use. The kernel requires Linux and OpenMP.
 
@@ -133,12 +133,12 @@ row; every row's output is bitwise its own one-row call's. The engine sends
 one row per job. Caller
 pointer extents and finite activation/block-scale values are required. Raw
 pointers cannot prove allocation size. Status: 0 success, 1 internal error,
-2 invalid arguments, 3 concurrent use. The engine's nonzero-status fail-stop
+2 invalid arguments, 3 a free_layer while a forward runs. The engine's nonzero-status fail-stop
 behavior is unchanged.
 
 ## Code layout
 
-The layer registry, argument and route validation, worker cores, keep-warm and the five C functions are the shared
+The layer registry, argument and route validation, worker cores, keep-warm and the six C functions are the shared
 CPU experts framework's (`../../cpu_experts_common/`, `ExpertForward<Nvfp4Quant>`). `quant.hpp` holds `Nvfp4Quant`
 (slab names and minimum strides, parameter validation, the registered `Layer`, a slot's projections) and the layer
 facts; `math.hpp` the ISA-independent arithmetic (`GpuRow`, Q8_0 quantization, the gated SiLU) and `dot_rows<Isa, M>`,

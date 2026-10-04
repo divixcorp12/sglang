@@ -26,6 +26,7 @@
 
 namespace {
 namespace fs = std::filesystem;
+int64_t g_engine=0; // the kernel's engine on the bench's cores, created in main
 constexpr uint64_t max_bytes = uint64_t(2) << 30;
 size_t pad(size_t x, size_t n) { return (x+n-1)/n*n; }
 int number(const std::string& s) {
@@ -315,7 +316,7 @@ struct Workload {
         call.abi_version=SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
         call.rows=o.rows; call.layer=f.layers[layer]->handle; call.x=xs[layer].data();
         call.slots=slots.data(); call.weights=routes.data(); call.out=out.data();
-        call.k=experts; call.threads=o.workers;
+        call.k=experts; call.threads=o.workers; call.engine=g_engine;
         int rc=sglang_nvfp4_cpu_experts_forward(&call);
         if (rc) throw std::runtime_error("CpuExpertForward status "+std::to_string(rc));
     }
@@ -381,7 +382,7 @@ int main(int argc,char** argv) {
         cores.resize(o.workers);
         for (int c:cores) if (!fs::exists("/sys/devices/system/cpu/cpu"+std::to_string(c)+"/node"+std::to_string(o.node)))
             throw std::runtime_error("CPU not on requested NUMA node");
-        if (sglang_nvfp4_cpu_experts_set_cores(cores.data(),cores.size())) throw std::runtime_error("Core list not allowed by affinity/cgroup");
+        if (sglang_nvfp4_cpu_experts_engine_create(cores.data(),int32_t(cores.size()),&g_engine)) throw std::runtime_error("Kernel refused the engine's cores");
         cpu_set_t caller; CPU_ZERO(&caller); CPU_SET(cores.front(),&caller);
         if (sched_setaffinity(0,sizeof(caller),&caller)) throw std::runtime_error("Caller pin failed");
         const auto before=task_ids(); Fixture fixture(o);

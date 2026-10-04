@@ -10,7 +10,7 @@
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
-//   misc       test_forward_address, test_keep_warm_address, test_keep_warm_calls, pause_ns
+//   misc       test_forward_address, test_keep_warm_address, test_keep_warm_calls, test_keep_warm_engine, pause_ns
 //
 // Arguments are validated by the Python wrappers in
 // python/sglang/kernels/ops/moe/expert_stream_transport.py.
@@ -667,8 +667,13 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     static std::atomic<int64_t> calls{0};
     return calls;
   }
-  static int test_keep_warm(int32_t, const uint32_t* word, uint32_t seen, int64_t deadline_ns) {
+  static std::atomic<int64_t>& test_keep_warm_engine_seen() {
+    static std::atomic<int64_t> engine{-1};
+    return engine;
+  }
+  static int test_keep_warm(int64_t engine, int32_t, const uint32_t* word, uint32_t seen, int64_t deadline_ns) {
     test_keep_warm_count().fetch_add(1, std::memory_order_relaxed);
+    test_keep_warm_engine_seen().store(engine, std::memory_order_relaxed);
     while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && expert_stream::now_ns() < deadline_ns)
       _mm_pause();
     return 0;
@@ -680,6 +685,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       test_only("test_keep_warm_address");
     } else {
       test_keep_warm_count().store(0, std::memory_order_relaxed);
+      test_keep_warm_engine_seen().store(-1, std::memory_order_relaxed);
       return static_cast<int64_t>(reinterpret_cast<intptr_t>(&test_keep_warm));
     }
   }
@@ -688,6 +694,14 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       test_only("test_keep_warm_calls");
     } else {
       return test_keep_warm_count().load(std::memory_order_relaxed);
+    }
+  }
+  // Test only: the engine the fake keep-warm's last call took (-1 before any call since test_keep_warm_address).
+  static int64_t test_keep_warm_engine() {
+    if constexpr (!Build::kFaults) {
+      test_only("test_keep_warm_engine");
+    } else {
+      return test_keep_warm_engine_seen().load(std::memory_order_relaxed);
     }
   }
 
@@ -919,6 +933,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_forward_address, Exports::test_forward_address); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_address, Exports::test_keep_warm_address); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_calls, Exports::test_keep_warm_calls); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_engine, Exports::test_keep_warm_engine); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_traced, Exports::read_rows_traced);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_faulted, Exports::read_rows_faulted);       \

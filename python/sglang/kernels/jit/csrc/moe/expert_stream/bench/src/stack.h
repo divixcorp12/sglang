@@ -96,6 +96,7 @@ struct StackConfig {
   int64_t keep_warm_ns = 0;
   int threads = 1;
   std::vector<int> cores;  // worker 0 first: the CPU expert thread pins itself there
+  int64_t engine = 0;  // the kernel's engine on cores (engine_create); 0: unpinned workers
   uint8_t* x_base = nullptr;
   int64_t x_stride = 0;
   uint8_t* out_base = nullptr;
@@ -163,6 +164,7 @@ class Stack {
     cpu.hidden = config_.hidden;
     cpu.threads = config_.threads;
     cpu.cores = config_.cores;
+    cpu.engine = config_.engine;
     cpu.spin_ns = kCpuSpinNs;
     cpu.keep_warm = config_.keep_warm;
     cpu.keep_warm_ns = config_.keep_warm_ns;

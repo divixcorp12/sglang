@@ -7,7 +7,7 @@
 //   CpuExpertForward   the format's kernel, as a C ABI
 //   CpuExpertKeepWarm  the format's idle loop, as a C ABI
 //   CpuJob             one forward: up to Wire::kLanes lanes of one row, writing one output part
-//   CpuExpertConfig    the pinned input/output tables, the thread count and the cores
+//   CpuExpertConfig    the pinned input/output tables, the thread count, the cores and the kernel's engine
 //   CpuExpertEngine    the thread, its job ring and its done word
 //
 // The tier's owner (the service thread) is the engine's only client. It submits a record's CPU hits before the record's
@@ -48,11 +48,13 @@ static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<u
 // thread only.
 using CpuExpertForward = int (*)(const SglangCpuExpertsForward* call);
 
-// A format's keep-warm, as a C ABI: runs register-only work of the kernel's vector width on `threads` workers, the
-// calling thread counted as one, until *word != seen or CLOCK_MONOTONIC reaches deadline_ns, so the cores keep the
-// kernel's frequency license through an idle gap instead of ramping back on the next job. Returns 0 on success.
+// A format's keep-warm, as a C ABI: runs register-only work of the kernel's vector width on `threads` workers on
+// `engine`'s cores (the kernel's engine, as the forward's call.engine), the calling thread counted as one, until
+// *word != seen or CLOCK_MONOTONIC reaches deadline_ns, so the cores keep the kernel's frequency license through an
+// idle gap instead of ramping back on the next job. Returns 0 on success.
 // Called from the CPU expert thread only, between forwards.
-using CpuExpertKeepWarm = int (*)(int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns);
+using CpuExpertKeepWarm = int (*)(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen,
+                                  int64_t deadline_ns);
 
 // One forward over up to Wire::kLanes lanes of one row.
 //
@@ -72,6 +74,7 @@ struct CpuJob {
 // The pinned tables the engine reads and writes, and how it runs. Validated by the CpuExpertEngine constructor.
 struct CpuExpertConfig {
   CpuExpertForward forward = nullptr;
+  int64_t engine = 0;  // the kernel's engine (its core list), on every forward and keep-warm; 0: unpinned workers
   int64_t rows = 0;  // streamed rows; each gets its layer handle later (set_layer), until then the CPU skips it
   const uint8_t* x_base = nullptr;  // row r's input at x_base + r * x_stride, written by the post kernel
   int64_t x_stride = 0;
@@ -80,7 +83,8 @@ struct CpuExpertConfig {
   int64_t out_part_stride = 0;  // 0: one part, so CPU misses are refused (RamTier::serve_record)
   int64_t hidden = 0;
   int threads = 1;
-  std::vector<int> cores;  // worker 0 uses the first CPU; the kernel pins each helper to its assigned CPU
+  // worker 0 uses the first CPU; the kernel pins worker i to the engine's cores[i], which must be this list
+  std::vector<int> cores;
   int64_t spin_ns = 50'000'000;
   CpuExpertKeepWarm keep_warm = nullptr;  // run while idle for keep_warm_ns after each job; nullptr or 0 ns: off
   int64_t keep_warm_ns = 0;
@@ -236,7 +240,7 @@ class CpuExpertEngine {
       if (!jobs_.pop(&job)) {
         if (warm && now_ns() < warm_until) {
           const int result = config_.keep_warm(
-              config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until);
+              config_.engine, config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until);
           if (result != 0) fail_stop(prefix_ + "CPU expert keep-warm failed (" + std::to_string(result) + ")");
           continue;
         }
@@ -262,6 +266,7 @@ class CpuExpertEngine {
       call.k = job.k;
       call.threads = config_.threads;
       call.accumulate = job.accumulate ? 1 : 0;
+      call.engine = config_.engine;
       const int result = config_.forward(&call);
       if (result != 0)
         fail_stop(

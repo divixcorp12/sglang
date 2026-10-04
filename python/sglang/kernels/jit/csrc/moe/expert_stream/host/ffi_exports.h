@@ -377,11 +377,13 @@ struct HostExports {
   // int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host memory, where
   // the post kernel writes a row's input; `out_rows` is float32 [rows, >= parts * hidden] in host memory, where the
   // device reads a row's CPU partial sums (part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both tensors
-  // must outlive the service. `keep_warm` is a CpuExpertKeepWarm's address (0 for none) that the idle thread runs for
+  // must outlive the service. `engine` is the kernel's engine handle (its engine_create; 0: none), carried by every
+  // forward and keep-warm. `keep_warm` is a CpuExpertKeepWarm's address (0 for none) that the idle thread runs for
   // keep_warm_ns after each job.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t forward,
+      int64_t engine,
       TensorView split,
       TensorView cores,
       TensorView x_rows,
@@ -406,6 +408,7 @@ struct HostExports {
     if (forward == 0) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the trait's native forward");
     expert_stream::CpuExpertConfig config;
     config.forward = reinterpret_cast<expert_stream::CpuExpertForward>(static_cast<intptr_t>(forward));
+    config.engine = engine;
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int64_t i = 0; i < cores.size(0); ++i)
       config.cores.push_back(static_cast<int>(c[i]));

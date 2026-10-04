@@ -18,7 +18,7 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 import torch
 
 
-CPU_EXPERTS_FORWARD_ABI_VERSION = 1
+CPU_EXPERTS_FORWARD_ABI_VERSION = 2
 
 
 class CpuExpertsForwardCall(ctypes.Structure):
@@ -35,6 +35,7 @@ class CpuExpertsForwardCall(ctypes.Structure):
         ("k", ctypes.c_int32),
         ("threads", ctypes.c_int32),
         ("accumulate", ctypes.c_int32),
+        ("engine", ctypes.c_int64),
     ]
 
 
@@ -66,8 +67,8 @@ CpuExpertForward = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(CpuExpertsForwa
 class CpuExpertQuantTrait(Protocol):
     """One expert format's CPU kernel.
 
-    ``slab_names`` are the pinned-tier tensors it reads. ``native_forward`` and
-    ``native_set_cores`` are the kernel's native half, which the RAM-miss service's CPU
+    ``slab_names`` are the pinned-tier tensors it reads. ``native_forward``,
+    ``native_keep_warm`` and ``native_create_engine`` are the kernel's native half, which the RAM-miss service's CPU
     expert thread calls without Python (``expert_stream/host/cpu_experts.h``). That
     forward reads ``x`` as fp16 ``[hidden]`` (the post kernel stages it so) and the
     weights as fp32, and takes ``register_layer``'s handle as an int64 layer argument.
@@ -124,11 +125,13 @@ class CpuExpertQuantTrait(Protocol):
         """The address of the kernel's ``CpuExpertKeepWarm`` C function."""
         ...
 
-    def native_set_cores(self, cores: Sequence[int]) -> None:
-        """Place the kernel's workers on ``cores`` before its first forward.
+    def native_create_engine(self, cores: Sequence[int]) -> int:
+        """Create the kernel's engine on ``cores``: worker i of each call naming it runs on cores[i], the calling
+        thread as worker 0. Returns its handle, never 0."""
+        ...
 
-        The calling thread is worker 0.
-        """
+    def native_free_engine(self, engine: int) -> None:
+        """Free an engine ``native_create_engine`` returned."""
         ...
 
 

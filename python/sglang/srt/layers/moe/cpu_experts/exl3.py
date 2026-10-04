@@ -4,7 +4,7 @@ The kernel is the optimized build of exllamav3's CPU MoE kernel,
 ``python/sglang/srt/layers/quantization/exl3_cpu/optimized/kernel.cpp`` (built by
 SGLANG_DSV41_CPU_EXPERTS=1; only it exports the CPU experts C ABI). ``Exl3CpuQuantTrait``
 registers each streamed layer's pinned slabs with its ``register_layer`` by base pointer and
-slot stride, and exposes the kernel's C entry points (forward, keep-warm and core placement)
+slot stride, and exposes the kernel's C entry points (forward, keep-warm and engines)
 that the native CPU expert thread calls without Python.
 """
 
@@ -167,24 +167,30 @@ class Exl3CpuQuantTrait:
             self._native("sglang_exl3_cpu_experts_keep_warm"), ctypes.c_void_p
         ).value
 
-    def native_set_cores(self, cores) -> None:
-        """Place the kernel's workers on ``cores``, before its first forward."""
+    def native_create_engine(self, cores) -> int:
+        """Create the kernel's engine on ``cores`` (the calling engine thread is worker 0); returns its handle."""
         import ctypes
 
-        fn = self._native("sglang_exl3_cpu_experts_set_cores")
+        fn = self._native("sglang_exl3_cpu_experts_engine_create")
         fn.argtypes, fn.restype = (
-            [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32],
+            [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64)],
             ctypes.c_int,
         )
         array = (ctypes.c_int32 * len(cores))(*cores)
-        result = fn(array, len(cores))
-        if result == 2:
-            raise RuntimeError(
-                f"the EXL3 CPU kernel refused cores {list(cores)} (status 2): either a core repeats or is "
-                "out of range, or the kernel's workers already ran, so something called "
-                "the CPU kernel before the CPU expert thread"
-            )
+        engine = ctypes.c_int64(0)
+        result = fn(array, len(cores), ctypes.byref(engine))
         if result != 0:
             raise RuntimeError(
-                f"the EXL3 CPU kernel could not take cores {list(cores)}: status {result}"
+                f"the EXL3 CPU kernel refused engine cores {list(cores)} (status {result}): a core repeats or is out "
+                "of range"
             )
+        return engine.value
+
+    def native_free_engine(self, engine) -> None:
+        """Free an engine native_create_engine returned."""
+        import ctypes
+
+        fn = self._native("sglang_exl3_cpu_experts_engine_free")
+        fn.argtypes, fn.restype = [ctypes.c_int64], ctypes.c_int
+        if fn(engine) != 0:
+            raise RuntimeError(f"the EXL3 CPU kernel has no engine {engine}")

@@ -33,6 +33,7 @@
 
 namespace {
 namespace fs = std::filesystem;
+int64_t g_engine = 0;  // the kernel's engine on the bench's cores, created in main
 bool benchmark_failed = false;
 // The command line; the defaults are the reference machine's.
 struct Options {
@@ -201,6 +202,7 @@ struct Workload {
     call.out = output.data();
     call.k = experts;
     call.threads = options.workers;
+    call.engine = g_engine;
     if (sglang_exl3_cpu_experts_forward(&call))
       throw std::runtime_error("Native CPU forward failed");
   }
@@ -287,9 +289,9 @@ int main(int argc, char** argv) {
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
     omp_set_dynamic(0);
-    // Cores must be distinct and in [0, CPU_SETSIZE); one that cannot be pinned fails the first forward with status 1.
-    if (sglang_exl3_cpu_experts_set_cores(cores.data(), cores.size()))
-      throw std::runtime_error("Cannot configure kernel cores");
+    // Cores must be distinct and in [0, CPU_SETSIZE); one that cannot be pinned fails the forward with status 1.
+    if (sglang_exl3_cpu_experts_engine_create(cores.data(), static_cast<int32_t>(cores.size()), &g_engine))
+      throw std::runtime_error("Cannot create the kernel's engine");
     cpu_set_t caller;
     CPU_ZERO(&caller);
     CPU_SET(cores.front(), &caller);

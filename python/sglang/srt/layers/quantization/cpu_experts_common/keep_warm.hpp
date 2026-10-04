@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <vector>
 
 namespace sglang::cpu_experts {
 // Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
@@ -80,25 +81,24 @@ int32_t keep_warm_loop(Isa isa, const uint32_t* word, uint32_t seen, int64_t dea
     return keep_warm_detail::scalar(word, seen, deadline_ns);
 }
 
-// Holds `threads` workers (the caller as worker 0, each pinned as the forward pins it) in register-only work of tier
-// min(isa, Top) until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Returns 0, 1 on a kernel error (a failed
-// pin), 2 on invalid arguments or more threads than the configured cores.
+// Holds `threads` workers (the caller as worker 0, each pinned to `cores` as the forward pins them; null: unpinned) in
+// register-only work of tier min(isa, Top) until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Returns 0, 1
+// on a kernel error (a failed pin), 2 on invalid arguments or more threads than `cores`.
 template <Isa Top>
-int keep_warm(Isa isa, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept
+int keep_warm(Isa isa, const std::vector<int>* cores, int32_t threads, const uint32_t* word, uint32_t seen,
+              int64_t deadline_ns) noexcept
 {
     last_error().clear();
-    if (threads < 1 || word == nullptr) return 2;
+    if (threads < 1 || word == nullptr || (cores && size_t(threads) > cores->size())) return 2;
     try {
-        Cores::freeze();
-        if (!Cores::frozen().empty() && size_t(threads) > Cores::frozen().size()) return 2;
         std::atomic<int> pin_error{0};
-        #pragma omp parallel num_threads(threads) shared(pin_error)
+        #pragma omp parallel num_threads(threads) shared(cores, pin_error)
         {
-            Cores::pin(omp_get_thread_num(), pin_error);
+            pin(omp_get_thread_num(), cores, pin_error);
             keep_warm_detail::sink.fetch_add(keep_warm_loop<Top>(isa, word, seen, deadline_ns),
                                              std::memory_order_relaxed);
         }
-        return pin_error.load(std::memory_order_relaxed) ? fail("cannot pin CPU expert worker to its configured core")
+        return pin_error.load(std::memory_order_relaxed) ? fail("cannot pin CPU expert worker to its engine's core")
                                                          : 0;
     } catch (const std::exception& e) {
         return fail(e.what());

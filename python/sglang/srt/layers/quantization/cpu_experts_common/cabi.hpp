@@ -1,4 +1,4 @@
-// The five C functions every CPU expert quant exports, as one-line wrappers over ExpertForward<Quant>.
+// The six C functions every CPU expert quant exports, as one-line wrappers over ExpertForward<Quant> and Engines.
 #pragma once
 #include "expert_forward.hpp"
 #include "keep_warm.hpp"
@@ -15,8 +15,11 @@
         const SglangCpuExpertsForward* call) noexcept                                                           \
     { return ::sglang::cpu_experts::ExpertForward<Quant>::forward(call); }                                      \
     extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_keep_warm(               \
-        int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept                     \
-    { return ::sglang::cpu_experts::ExpertForward<Quant>::keep_warm(threads, word, seen, deadline_ns); }         \
-    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_set_cores(               \
-        const int32_t* cores, int32_t n) noexcept                                                               \
-    { return ::sglang::cpu_experts::Cores::configure(cores, n); }
+        int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept     \
+    { return ::sglang::cpu_experts::ExpertForward<Quant>::keep_warm(engine, threads, word, seen, deadline_ns); } \
+    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_engine_create(           \
+        const int32_t* cores, int32_t n, int64_t* engine) noexcept                                              \
+    { return ::sglang::cpu_experts::Engines::create(cores, n, engine); }                                        \
+    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_engine_free(             \
+        int64_t engine) noexcept                                                                                \
+    { return ::sglang::cpu_experts::Engines::destroy(engine); }

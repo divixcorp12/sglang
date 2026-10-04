@@ -39,6 +39,7 @@
 namespace {
 namespace fs = std::filesystem;
 namespace es = ::sglang::expert_stream;
+int64_t g_engine = 0;  // the kernel's engine on placement.workers, created in main: the stack and the bare forwards run on it
 using namespace fullstack;
 
 // The command line. Defaults match the reference machine's partition (README "Placement"); --self-test has its own.
@@ -140,6 +141,7 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
   c.keep_warm_ns = static_cast<int64_t>(o.keep_warm_us) * 1000;
   c.threads = static_cast<int>(p.workers.size());
   c.cores.assign(p.workers.begin(), p.workers.end());
+  c.engine = g_engine;
   c.x_base = f.x_row(0);
   c.x_stride = f.x_stride();
   c.out_base = reinterpret_cast<uint8_t*>(f.out_row(0));
@@ -292,6 +294,7 @@ class Bench {
     call.out = fixture_.out_row(row);
     call.k = k;
     call.threads = static_cast<int32_t>(placement_.workers.size());
+    call.engine = g_engine;
     if (sglang_exl3_cpu_experts_forward(&call) != 0)
       throw std::runtime_error("the bare CPU forward failed");
   }
@@ -504,9 +507,9 @@ int main(int argc, char** argv) {
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
     configure_cpu_kernel_runtime();
-    if (sglang_exl3_cpu_experts_set_cores(placement.workers.data(), static_cast<int32_t>(placement.workers.size())) !=
-        0)
-      throw std::runtime_error("Cannot configure kernel cores");
+    if (sglang_exl3_cpu_experts_engine_create(placement.workers.data(),
+                                              static_cast<int32_t>(placement.workers.size()), &g_engine) != 0)
+      throw std::runtime_error("Cannot create the kernel's engine");
     const auto before = task_ids();
     std::unique_ptr<StackFixture> fixture;
     {

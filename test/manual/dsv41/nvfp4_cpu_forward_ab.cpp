@@ -86,12 +86,15 @@ Slabs make_slabs(const Config& c, std::mt19937& rng) {
     return s;
 }
 
+int64_t g_engine = 0;  // the kernel's engine on the cores main was given
+
 int forward(int64_t layer, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out,
             int32_t threads, int32_t accumulate, int32_t rows = 1) {
     SglangCpuExpertsForward call{};
     call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
     call.rows = rows; call.layer = layer; call.x = x; call.slots = slots; call.weights = weights;
     call.out = out; call.k = k; call.threads = threads; call.accumulate = accumulate;
+    call.engine = g_engine;
     return sglang_nvfp4_cpu_experts_forward(&call);
 }
 
@@ -140,8 +143,8 @@ int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: %s OUT CORE [CORE...]\n", argv[0]); return 2; }
     std::vector<int32_t> cores;
     for (int i = 2; i < argc; ++i) cores.push_back(std::atoi(argv[i]));
-    if (sglang_nvfp4_cpu_experts_set_cores(cores.data(), int32_t(cores.size())) != 0) {
-        std::fprintf(stderr, "set_cores refused\n"); return 1;
+    if (sglang_nvfp4_cpu_experts_engine_create(cores.data(), int32_t(cores.size()), &g_engine) != 0) {
+        std::fprintf(stderr, "engine_create refused\n"); return 1;
     }
     FILE* f = std::fopen(argv[1], "wb");
     if (!f) return 1;

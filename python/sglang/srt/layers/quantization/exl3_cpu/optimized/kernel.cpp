@@ -60,7 +60,7 @@ void check_status(int status, const char* what)
 {
     TORCH_CHECK(status != 2, what, ": invalid arguments (status 2: an unknown or freed handle, a slot outside the "
                 "layer, a non-finite weight, or rows/k/threads out of range)");
-    TORCH_CHECK(status != 3, what, ": another forward or free is running (status 3)");
+    TORCH_CHECK(status != 3, what, ": a forward is running (status 3)");
     TORCH_CHECK(status == 0, what, ": kernel error (status ", status, "): ", ::sglang::cpu_experts::last_error());
 }
 }  // namespace

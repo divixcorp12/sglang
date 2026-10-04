@@ -124,8 +124,8 @@ class CpuExpertService:
                 self.out_rows.pin_memory(),
             )
         self.handles: dict[int, object] = {}
-        self._cores_set = False
         keep_warm_us = envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get()
+        self.engine = trait.native_create_engine(self.cores)  # never freed: the engine thread may run to process exit
         host.enable_cpu_experts(
             trait.native_forward(),
             self.split,
@@ -133,6 +133,7 @@ class CpuExpertService:
             self.x_rows,
             self.out_rows,
             threads=self.threads,
+            engine=self.engine,
             keep_warm=trait.native_keep_warm() if keep_warm_us > 0 else 0,
             keep_warm_us=max(keep_warm_us, 0),
         )
@@ -180,10 +181,6 @@ class CpuExpertService:
             raise ValueError(
                 f"CPU experts: layer rows use activation limits {self.trait.act_limit} and {act_limit}"
             )
-        if not self._cores_set:
-            # Must precede the kernel's first forward, which runs once a row registers.
-            self.trait.native_set_cores(self.cores)
-            self._cores_set = True
         slabs = self.slabs_by_row[row]
         capacity = self._capacity(slabs)
         if capacity == 0:
