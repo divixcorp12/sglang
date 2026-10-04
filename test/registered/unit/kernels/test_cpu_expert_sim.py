@@ -20,6 +20,7 @@ from cpu_expert_sim import (  # noqa: E402
     _lane_sorter,
     _queue,
     c_cpu_at,
+    cpu_insert_results,
     histogram,
     load_c_cpu_table,
     predict,
@@ -545,3 +546,25 @@ def test_the_existing_policies_never_insert_a_cpu_lane():
     for name in (n for n in INSERT_POLICIES if not n.startswith("cpu_insert_")):
         res = replay_nm(loaded, ram_rows=4, num_experts=8, policy=name, split=SPLIT)["residency"]
         assert res["cpu_insert_issued_per_token"] == 0.0 and res["cpu_insert_rows_per_token"] == 0.0, name
+
+
+def test_cpu_insert_sweep_scales_the_split_and_costs_the_inserts():
+    args = argparse.Namespace(
+        ram_rows=4, num_experts=8, no_initial_from_log=False, numa_mb="0:1", cpu_node=0, measured_c_cpu=0.63,
+        split_c_cpu=0.52, c_link=1.0, handoff=0.02, nvme_ms=[1.5], gpu_ms=14.0, cpu_scale=[1.0, 4.0],
+    )
+    rows = cpu_insert_results(_ram_hit_loaded(), args)
+    assert [(r["cpu_scale"], r["policy"]) for r in rows] == [
+        (s, p) for s in (1.0, 4.0)
+        for p in ("insert_all", "cpu_by_score_desc_tail", "cpu_insert_p1", "cpu_insert_p2", "cpu_insert_all")
+    ]
+    by = {(r["cpu_scale"], r["policy"]): r for r in rows}
+    assert all(a >= b for a, b in zip(by[4.0, "insert_all"]["split"], by[1.0, "insert_all"]["split"]))
+    for r in rows:
+        assert r["ms_per_token_uncosted"] <= r["ms_per_token_amortised"] <= r["ms_per_token_worst"]
+        assert r["ms_per_token_optimistic"] <= r["ms_per_token_amortised"]
+    p1 = by[1.0, "cpu_insert_p1"]
+    assert p1["cpu_insert_issued_per_token"] == pytest.approx(1 / 5)
+    assert p1["hot_hit_rate"] > by[1.0, "cpu_by_score_desc_tail"]["hot_hit_rate"]
+    # A faster CPU makes the same CPU-lane work cheaper.
+    assert by[4.0, "cpu_by_score_desc_tail"]["ms_per_token_uncosted"] < by[1.0, "cpu_by_score_desc_tail"]["ms_per_token_uncosted"]
