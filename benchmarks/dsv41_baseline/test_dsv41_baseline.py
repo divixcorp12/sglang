@@ -1153,12 +1153,12 @@ def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
     assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
 
 
-def test_the_exl3_cpu_kernel_builds_with_gcc_15_and_nothing_else_does():
-    # The optimized EXL3 CPU kernel is validated on GCC 15 (ext.py check_cpu_compiler); a global CXX would move every
-    # other JIT build (tvm-ffi, flashinfer, sglang's JIT) to it too.
+def test_every_jit_build_and_the_exl3_cpu_kernel_use_gcc_15():
+    # The optimized EXL3 CPU kernel is validated on GCC 15 (ext.py check_cpu_compiler). CXX moves sglang's JIT builds
+    # (host C++, and nvcc's host half through -ccbin) to the same compiler.
     env = arm_env.base_env()
     assert env["SGLANG_EXL3_CPU_CXX"] == "/opt/rh/gcc-toolset-15/root/usr/bin/g++"
-    assert "CXX" not in env
+    assert env["CXX"] == arm_env.EXL3_CPU_CXX
 
 
 def test_server_cores_do_not_overlap_the_driver_or_the_reserved_cores():
