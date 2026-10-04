@@ -270,11 +270,16 @@ class ThreadingConfig:
                     f"node {nodes[0]}'s SQPOLL core is set both by SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU "
                     "and SGLANG_EXPERT_NUMA_CORES"
                 )
+            check_not_reserved(settings.sq_thread_cpu)
             overrides.setdefault(nodes[0], {})["sq"] = [settings.sq_thread_cpu]
+        if not settings.sqpoll:
+            for node, plan_keys in overrides.items():
+                if "sq" in plan_keys:
+                    raise ValueError(f"node {node} sets an SQPOLL core, but SGLANG_EXPERT_STREAM_URING_MODE is not sqpoll")
         derive = len(nodes) > 1 or settings.cpu_experts or bool(settings.numa_cores)
         if not derive:
             ram = settings.spin_core
-            sq = overrides.get(nodes[0], {}).get("sq", [None])[0] if settings.sqpoll else None
+            sq = overrides.get(nodes[0], {}).get("sq", [None])[0]
             plan = NodePlan(group=0, node=nodes[0], ram=ram, cpu=(), sq=sq, busy_poll=ram is not None)
             return ThreadingConfig((plan,), (), gpu)
         plans = []
@@ -330,8 +335,6 @@ def _derive(group, node, override, topology, affinity, settings, taken) -> NodeP
     if settings.cpu_experts:
         listed = override["cpu"] if "cpu" in override else sorted(free)
         cpu = tuple(listed[: settings.threads] if settings.threads else listed)
-    if not usable and not override:
-        raise ValueError(f"node {node} has no usable core")
     return NodePlan(group=group, node=node, ram=ram, cpu=cpu, sq=sq, busy_poll=True)
 
 
@@ -339,8 +342,10 @@ def _check_plan(plan: NodePlan, topology: Topology, affinity: frozenset[int], se
     """The design's refusals for one plan, derived or given."""
     cores = plan.cores()
     for core in cores:
-        if core in RESERVED_CORES:
-            raise ValueError(f"node {plan.node}: core {core} is reserved (64-71 take NVMe completion interrupts)")
+        try:
+            check_not_reserved(core)
+        except ValueError as refusal:
+            raise ValueError(f"node {plan.node}: {refusal}") from None
         home = topology.node_of(core)
         if home != plan.node:
             raise ValueError(f"node {plan.node}: core {core} is on node {home}")
