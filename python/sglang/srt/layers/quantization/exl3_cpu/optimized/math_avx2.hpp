@@ -1,3 +1,15 @@
+// The AVX2 tier's GEMV tiles (avx2_tiles), compiled for AVX2/FMA/F16C by attribute (M1_TARGET_AVX2).
+// Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
+// see ../LICENSE.exllamav3.
+#pragma once
+#include "math.hpp"
+#include <immintrin.h>
+#include <cstddef>
+#include <cstdint>
+
+namespace sglang::exl3_cpu {
+namespace {
+
 // -------------------------------------------------------------------------------------------
 //   AVX2
 // -------------------------------------------------------------------------------------------
@@ -221,3 +233,6 @@ void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
         }
     }
 }
+
+}  // namespace
+}  // namespace sglang::exl3_cpu

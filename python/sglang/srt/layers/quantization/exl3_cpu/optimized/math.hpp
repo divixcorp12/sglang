@@ -1,3 +1,8 @@
+// EXL3's arithmetic every tier shares: the format tables and state decode, the Hadamard transforms and the
+// activation quantization. Each tier's GEMV tiles are math_scalar.hpp, math_avx2.hpp and math_avx512.hpp.
+// Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
+// see ../LICENSE.exllamav3.
+//
 // CPU MoE expert GEMM for mul1 EXL3 tensors.
 //
 // The mul1 codebook is affine in a byte-sum: w(s) = (bytesum(s * 0x83DCD12D) - 510) * k_inv with
@@ -21,6 +26,20 @@
 //
 // No generic lambdas inside target-attributed functions (GCC does not let lambdas inherit the
 // target), hence the recursive-template row unrolling.
+
+#pragma once
+#include "quant.hpp"
+#include <c10/util/Half.h>
+#include <immintrin.h>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+namespace sglang::exl3_cpu {
+namespace {
 
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
 constexpr float HAD_SCALE = 0.088388347648f;
@@ -619,3 +638,6 @@ void prepare_rows
         p.sum_x8[r] = s;
     }
 }
+
+}  // namespace
+}  // namespace sglang::exl3_cpu

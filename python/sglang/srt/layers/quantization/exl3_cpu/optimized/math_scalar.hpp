@@ -1,3 +1,15 @@
+// The scalar tier's GEMV tiles (scalar_tiles).
+// Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
+// see ../LICENSE.exllamav3.
+#pragma once
+#include "math.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+namespace sglang::exl3_cpu {
+namespace {
+
 // -------------------------------------------------------------------------------------------
 //   Scalar fallback
 // -------------------------------------------------------------------------------------------
@@ -33,3 +45,6 @@ void scalar_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, in
             std::memcpy(tout + static_cast<size_t>(i) * mat.n + tile_n * 16, acc[i], 16 * sizeof(float));
     }
 }
+
+}  // namespace
+}  // namespace sglang::exl3_cpu

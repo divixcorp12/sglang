@@ -1,3 +1,22 @@
+// The AVX-512 tiers' GEMV tiles: the Bw, Vnni and Vbmi bands (bw_tiles, vnni_tiles, vbmi_tiles) and the K3
+// block-128 residual kernels (bw3_blocked_*, register_tiles and its traversal). Each function carries its tier's
+// target attribute (M1_TARGET_*, math.hpp).
+// Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
+// see ../LICENSE.exllamav3.
+#pragma once
+#include "math.hpp"
+#include <c10/util/Exception.h>
+#include <immintrin.h>
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+
+namespace sglang::exl3_cpu {
+namespace {
+
 // -------------------------------------------------------------------------------------------
 //   AVX-512 VNNI banded kernel
 // -------------------------------------------------------------------------------------------
@@ -1112,3 +1131,6 @@ M1_TARGET_BW void register_tiles(const MoeCpuMatrix& mat,const PreparedIn& in,fl
         n0+=pairs*2;
     }
 }
+
+}  // namespace
+}  // namespace sglang::exl3_cpu

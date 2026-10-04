@@ -3,6 +3,8 @@
 // Optimized residual/block-128 path: original packed weights, register decode,
 // compact activations, parallel preparation/middle stages, fused down transforms,
 // and cache-line output partitioning. See README.txt for measured provenance.
+// The arithmetic is math.hpp and each tier's math_scalar.hpp, math_avx2.hpp and math_avx512.hpp; this file holds
+// the tier dispatch (run_tiles), the forward driver, the C ABI and the torch wrappers.
 #include <atomic>
 #include <type_traits>
 #if !defined(__linux__) || !defined(_OPENMP)
@@ -40,7 +42,11 @@
 #include <windows.h>
 #endif
 
-
+// Last, and in this order: the definition order the kernels were validated in (bit-exact per tier); another order
+// changes what GCC inlines and clones.
+#include "math_avx512.hpp"
+#include "math_avx2.hpp"
+#include "math_scalar.hpp"
 
 // Kept for upstream's bindings. Phase timing is compile-time here (ForwardPlan's Profile, forward_plan.hpp).
 void exl3_moe_cpu_set_prof(bool) {}
@@ -48,14 +54,6 @@ void exl3_moe_cpu_set_prof(bool) {}
 namespace sglang::exl3_cpu {
 namespace {
 using namespace ::sglang::cpu_experts;
-
-#include "math.hpp"
-
-#include "math_avx512.hpp"
-
-#include "math_avx2.hpp"
-
-#include "math_scalar.hpp"
 
 // -------------------------------------------------------------------------------------------
 //   Dispatch
