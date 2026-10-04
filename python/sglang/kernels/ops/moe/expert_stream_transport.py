@@ -65,10 +65,10 @@ class TransportBuild(msgspec.Struct, frozen=True):
 LAYOUTS = {
     "exl3": TransportBuild(
         host_sources={
-            "prod": "moe/exl3_ram_miss_host.cpp",
-            "instr": "moe/exl3_ram_miss_host_instr.cpp",
+            "prod": "moe/exl3/exl3_ram_miss_host.cpp",
+            "instr": "moe/exl3/exl3_ram_miss_host_instr.cpp",
         },
-        device_source="moe/exl3_ram_miss.cuh",
+        device_source="moe/exl3/exl3_ram_miss.cuh",
         device_layout="sglang::exl3::Exl3RowLayout",
     )
 }

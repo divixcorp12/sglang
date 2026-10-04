@@ -1,7 +1,7 @@
 // The compile-time build policy of the expert-stream host transport.
 //
 // ProdBuild carries no metrics, trace or fault state on the request path; InstrBuild carries all of it. Each is
-// instantiated in its own module: exl3_ram_miss_host.cpp (prod) and exl3_ram_miss_host_instr.cpp (instr). The
+// instantiated in its own module: exl3/exl3_ram_miss_host.cpp (prod) and exl3/exl3_ram_miss_host_instr.cpp (instr). The
 // policy is a template parameter rather than a runtime flag so that the production request path compiles none of the
 // instrumentation's storage or branches.
 //

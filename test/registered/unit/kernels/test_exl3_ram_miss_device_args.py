@@ -395,7 +395,7 @@ def test_the_exl3_host_file_is_only_bindings(name):
     """Every export body lives once, in HostExports or HostTestExports (expert_stream/host/ffi_exports.h,
     ffi_test_exports.h); each EXL3 file (one per build) only names its layout, reader and build. Red when a body grows
     back into one of them."""
-    path = CSRC / name
+    path = CSRC / "exl3" / name
     lines = path.read_text().splitlines()
     bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]
     assert not bodies, f"{path.name} defines functions: {bodies}"

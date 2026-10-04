@@ -38,7 +38,7 @@ namespace es = ::sglang::expert_stream;
 using BenchBuild = std::conditional_t<EXL3_FULL_STACK_INSTR != 0, es::InstrBuild, es::ProdBuild>;
 static_assert(kNames == static_cast<int>(::sglang::exl3::Exl3RowLayout::kNames.size()));
 
-// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/exl3_ram_miss_host.cpp and
+// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/exl3/exl3_ram_miss_host.cpp and
 // exl3_ram_miss_host_instr.cpp, minus the instrumented build's FaultyReader.
 template <class Build>
 struct ReaderFor;

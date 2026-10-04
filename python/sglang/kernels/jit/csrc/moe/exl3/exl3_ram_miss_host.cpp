@@ -3,11 +3,11 @@
 // (ProdBuild, build_policy.h), and the FFI exports. exl3_ram_miss_host_instr.cpp is the instrumented build.
 // Production reads through the bare UringReader: no FaultyReader, no fault state (plan 2026-09-29-hotpath-zero-overhead
 // Task 10); every test-only export refuses, naming the instrumented build.
-#include "exl3/exl3_row_layout.h"
-#include "expert_stream/host/build_policy.h"
-#include "expert_stream/host/ffi_exports.h"
-#include "expert_stream/host/ffi_test_exports.h"
-#include "expert_stream/host/uring_reader.h"
+#include "exl3_row_layout.h"
+#include "../expert_stream/host/build_policy.h"
+#include "../expert_stream/host/ffi_exports.h"
+#include "../expert_stream/host/ffi_test_exports.h"
+#include "../expert_stream/host/uring_reader.h"
 
 namespace sglang {
 

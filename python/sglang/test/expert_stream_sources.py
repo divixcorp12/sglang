@@ -8,14 +8,14 @@ MOE = Path(__file__).resolve().parents[1] / "kernels" / "jit" / "csrc" / "moe"
 def host_sources() -> tuple[Path, ...]:
     """The EXL3 host instantiations (production, instrumented) first, then every transport host header."""
     return (
-        MOE / "exl3_ram_miss_host.cpp",
-        MOE / "exl3_ram_miss_host_instr.cpp",
+        MOE / "exl3" / "exl3_ram_miss_host.cpp",
+        MOE / "exl3" / "exl3_ram_miss_host_instr.cpp",
         *sorted((MOE / "expert_stream" / "host").glob("*.h")),
     )
 
 
 def device_sources() -> tuple[Path, ...]:
-    return (MOE / "exl3_ram_miss.cuh", *sorted((MOE / "expert_stream").glob("*.cuh")))
+    return (MOE / "exl3" / "exl3_ram_miss.cuh", *sorted((MOE / "expert_stream").glob("*.cuh")))
 
 
 def wire_header() -> Path:

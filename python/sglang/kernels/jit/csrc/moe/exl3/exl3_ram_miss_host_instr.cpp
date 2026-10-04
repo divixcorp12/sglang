@@ -1,12 +1,12 @@
 // exl3_ram_miss_host_instr.cpp -- the instrumented build: stage trace, full counters and test-only faults.
 // The same EXL3 instantiation as exl3_ram_miss_host.cpp with InstrBuild (build_policy.h). A service loads it when
 // the process writes a stream trace or injects a RAM-miss fault (expert_stream_transport.host_variant).
-#include "exl3/exl3_row_layout.h"
-#include "expert_stream/host/build_policy.h"
-#include "expert_stream/host/faulty_reader.h"
-#include "expert_stream/host/ffi_exports.h"
-#include "expert_stream/host/ffi_test_exports.h"
-#include "expert_stream/host/uring_reader.h"
+#include "exl3_row_layout.h"
+#include "../expert_stream/host/build_policy.h"
+#include "../expert_stream/host/faulty_reader.h"
+#include "../expert_stream/host/ffi_exports.h"
+#include "../expert_stream/host/ffi_test_exports.h"
+#include "../expert_stream/host/uring_reader.h"
 
 namespace sglang {
 

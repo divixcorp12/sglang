@@ -7,6 +7,6 @@
 // the HIT_COPY lanes and closes the gate when the copy thread or the CPU still owes work; CC checks CopyDone after the
 // stream wait. Every failure is fail-stop: a kernel traps, the host aborts. There is no error word.
 
-#include "exl3/exl3_row_layout.h"
-#include "expert_stream/lease_kernels.cuh"
-#include "expert_stream/row_copy_kernels.cuh"
+#include "exl3_row_layout.h"
+#include "../expert_stream/lease_kernels.cuh"
+#include "../expert_stream/row_copy_kernels.cuh"

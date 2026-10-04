@@ -2,8 +2,8 @@
 //
 // HostExports is written once for every row layout and file reader. An instantiation file names a layout, a reader
 // and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and EXPERT_STREAM_HOST_TEST_EXPORTS (the
-// test and tool exports live in ffi_test_exports.h). See exl3_ram_miss_host.cpp (ProdBuild) and
-// exl3_ram_miss_host_instr.cpp (InstrBuild).
+// test and tool exports live in ffi_test_exports.h). See exl3/exl3_ram_miss_host.cpp (ProdBuild) and
+// exl3/exl3_ram_miss_host_instr.cpp (InstrBuild).
 //
 // Every export takes an opaque `handle` naming a service in a per-instantiation registry; each call holds its own
 // reference, so close() from another thread frees the service only after calls in flight return.
