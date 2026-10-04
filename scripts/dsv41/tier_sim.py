@@ -402,7 +402,7 @@ class DirectInsertReplay:
             row = self.row[layer]
             slots, where, s = self.slots[row], self.where[row], scores[row]
             candidates = sorted((e for e in held if where[e] < 0 and s[e] > 0), key=lambda e: (-s[e], e))[:limit]
-            free = [slot for slot, e in enumerate(slots) if e < 0]
+            free = [slot for slot, e in enumerate(slots) if e == -1]
             members = sorted(
                 (slot for slot, e in enumerate(slots) if e >= 0),
                 key=lambda slot: (routed[row, slots[slot]], s[slots[slot]], -slots[slot]),

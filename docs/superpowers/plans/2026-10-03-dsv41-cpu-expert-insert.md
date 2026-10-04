@@ -664,6 +664,33 @@ these files.
 
 Command: Task 4 Step 1. Output: `divix01:cc-expert-prediction/analysis/dsv41-cpu-insert/cpu-insert.{json,txt}`. EXIT=0.
 
+Raw output (`cpu-insert.txt`, the sweep block):
+
+```
+CPU speed-up sweep (flat c_cpu 0.63/s, split from 0.52/s, nvme 1.5 ms/miss; ms/token uncosted | worst | amortised | optimistic, tok/s at optimistic)
+   s policy                   hot hit cpu/tok ins/tok NVMe/tok     unc   worst   amort     opt  tok/s
+   1 insert_all                 0.672   46.08    0.00    11.32   73.03   73.03   73.03   73.03  13.69
+   1 cpu_by_score_desc_tail     0.643   50.20    0.00    11.32   75.94   75.94   75.94   75.94  13.17
+   1 cpu_insert_p1              0.647   49.74   33.10    11.32   75.51   99.64   99.13   76.15  13.13
+   1 cpu_insert_p2              0.646   49.91   44.02    11.32   75.58  110.65  110.10   82.23  12.16
+   1 cpu_insert_all             0.645   50.00   48.40    11.32   75.64  115.08  114.52   86.00  11.63
+   2 insert_all                 0.672   64.01    0.00    11.32   59.11   59.11   59.11   59.11  16.92
+   2 cpu_by_score_desc_tail     0.564   87.06    0.00    11.32   65.53   65.53   65.53   65.53  15.26
+   2 cpu_insert_p1              0.633   72.09   30.70    11.32   61.35   79.81   77.69   61.37  16.30
+   2 cpu_insert_p2              0.636   71.42   51.76    11.32   61.19   99.29   98.71   69.89  14.31
+   2 cpu_insert_all             0.635   71.49   64.35    11.32   61.23  111.84  111.37   81.43  12.28
+   4 insert_all                 0.672   67.46    0.00    11.32   51.03   51.03   51.03   51.03  19.60
+   4 cpu_by_score_desc_tail     0.187  183.86    0.00    11.38   66.33   66.33   66.33   66.33  15.08
+   4 cpu_insert_p1              0.625   78.63   29.81    11.32   52.41   73.81   72.13   52.67  18.99
+   4 cpu_insert_p2              0.632   76.91   50.56    11.32   52.21   93.30   92.86   63.61  15.72
+   4 cpu_insert_all             0.633   76.66   67.46    11.32   52.19  110.01  109.76   79.50  12.58
+   8 insert_all                 0.672   67.46    0.00    11.32   46.92   46.92   46.92   46.92  21.31
+   8 cpu_by_score_desc_tail     0.187  183.86    0.00    11.38   54.69   54.69   54.69   54.69  18.28
+   8 cpu_insert_p1              0.625   78.63   29.81    11.32   47.62   73.00   72.11   48.88  20.46
+   8 cpu_insert_p2              0.632   76.91   50.56    11.32   47.52   93.09   92.86   63.13  15.84
+   8 cpu_insert_all             0.633   76.66   67.46    11.32   47.51  109.90  109.76   79.38  12.60
+```
+
 **Sanity.** At s = 1 the merged policy gives 75.94 ms/token and insert_all's hot hit is 0.672. Both reproduce §30.3.
 
 | s | policy | hot hit | CPU inserts/token | uncosted | amortised | optimistic (tok/s) |
