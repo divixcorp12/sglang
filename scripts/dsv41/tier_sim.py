@@ -192,6 +192,10 @@ def direct_hot_allocation(
     return chosen
 
 
+# A slot whose insert's bytes are in flight: neither mapped nor a victim until the next commit of its layer.
+FILLING = -2
+
+
 class DirectInsertReplay:
     """The running recipe's residency, stage DIRECT insert-on-miss (GpuResidencyUpdater), per layer.
 
@@ -240,6 +244,11 @@ class DirectInsertReplay:
         self.deferred_inserted = 0
         self.deferred_dropped = 0
         self.deferred_last: dict[int, int] = {}
+        self.filling: list[dict[int, int]] = [{} for _ in range(layers)]  # per row: slot -> expert in flight
+        self.cpu_insert_last: dict[int, int] = {}
+        self.cpu_insert_issued = 0
+        self.cpu_inserted = 0
+        self.cpu_insert_dropped = 0
         self.promoted = 0
         self.shortlist = [self._rank(row) for row in range(layers)]  # reset_after_capture
 
@@ -248,7 +257,7 @@ class DirectInsertReplay:
 
     def _rank(self, row: int) -> list[int]:
         slots, scores, routed = self.slots[row], self.scores[row], self.routed[row]
-        free = [slot for slot, expert in enumerate(slots) if expert < 0]
+        free = [slot for slot, expert in enumerate(slots) if expert == -1]
         held = sorted(
             (slot for slot, expert in enumerate(slots) if expert >= 0),
             key=lambda slot: (routed[slots[slot]], scores[slots[slot]], -slots[slot]),
@@ -288,6 +297,7 @@ class DirectInsertReplay:
         deferred: Optional[dict[int, list[int]]] = None,
         deferred_unrouted: bool = False,
         lane_order: Optional[Callable[[int, list[int]], list[int]]] = None,
+        cpu_insert: Optional[Callable[[int, list[int]], list[int]]] = None,
     ) -> dict[int, int]:
         """One forward served by the graph gather (a replay, or a one-token extend run eagerly through
         it); returns each layer's misses (its plan count). ``lane_order(layer, misses)`` reorders a layer's
@@ -297,11 +307,14 @@ class DirectInsertReplay:
         the ones the CPU computes: they are not inserted and their victims keep their experts, as
         direct_commit_gather_kernel does. ``deferred`` inserts experts, in list order, after the forward's
         own misses, into the shortlist entries its live lanes left unused (with ``deferred_unrouted``, only
-        those whose expert the open window did not route), in shortlist order."""
+        those whose expert the open window did not route), in shortlist order. ``cpu_insert(layer, cpu_lanes)``
+        picks CPU lanes whose rows are also copied off the critical path: the victim is freed and left FILLING
+        now, and the expert is mapped at this layer's next graph commit, unless it was inserted elsewhere first."""
         self._apply(self.boundary_pending)  # on_graph_forward: re-ranks even when no boundary is due
         self._count(1, decode=True)  # on_graph_forward counts every graph-served forward as decode
         misses = {}
         self.deferred_last = {}
+        self.cpu_insert_last = {}
         for layer, experts in routes.items():
             row = self.row[layer]
             where, slots = self.where[row], self.slots[row]
@@ -310,12 +323,19 @@ class DirectInsertReplay:
             if lane_order is not None and missing:
                 missing = lane_order(layer, missing)
             np.add.at(self.route_counts[row], experts, np.float32(1.0))
-            usable = [slot for slot in self.shortlist[row] if slot not in hits]
+            filling = self.filling[row]
+            usable = [slot for slot in self.shortlist[row] if slot not in hits and slot not in filling]
             on_cpu = cpu_lanes(layer, missing) if cpu_lanes is not None and missing else set()
             # Lane j's destination is usable[j] whether or not it is live (direct_gather_destinations_kernel).
-            live = [(expert, slot) for expert, slot in zip(missing, usable) if expert not in on_cpu]
+            pairs = list(zip(missing, usable))
+            live = [(expert, slot) for expert, slot in pairs if expert not in on_cpu]
+            fills: list[tuple[int, int]] = []
+            if cpu_insert is not None and on_cpu:
+                cpu_pairs = [(expert, slot) for expert, slot in pairs if expert in on_cpu]
+                wanted = set(cpu_insert(layer, [expert for expert, _ in cpu_pairs]))
+                fills = [(expert, slot) for expert, slot in cpu_pairs if expert in wanted]
             if deferred is not None and deferred.get(layer):
-                taken = {slot for _, slot in live}
+                taken = {slot for _, slot in live} | {slot for _, slot in fills}
                 inserted = {expert for expert, _ in live}
                 spare = [
                     slot
@@ -333,6 +353,28 @@ class DirectInsertReplay:
                     where[old] = -1
                 slots[slot] = expert
                 where[expert] = slot
+            # The previous forward's fills land at this commit; one whose expert a lane inserted meanwhile frees its slot.
+            for slot, expert in list(filling.items()):
+                del filling[slot]
+                if where[expert] >= 0:
+                    slots[slot] = -1
+                    self.cpu_insert_dropped += 1
+                else:
+                    slots[slot] = expert
+                    where[expert] = slot
+                    self.cpu_inserted += 1
+            issued = 0
+            for expert, slot in fills:
+                if where[expert] >= 0:
+                    continue
+                old = slots[slot]
+                if old >= 0:
+                    where[old] = -1
+                slots[slot] = FILLING
+                filling[slot] = expert
+                issued += 1
+            self.cpu_insert_last[layer] = issued
+            self.cpu_insert_issued += issued
             self.truncated += max(len(missing) - len(usable), 0)
             misses[layer] = len(missing)
         # observe_forward(graph_served=True): a decode is a boundary at interval 1; a graph-served
