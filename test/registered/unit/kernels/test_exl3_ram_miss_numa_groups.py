@@ -127,6 +127,23 @@ def test_no_slot_outside_a_groups_range_is_ever_staged_or_taken(tmp_path):
         host.stop()
 
 
+def test_a_lane_less_record_stamps_each_experts_slot_with_its_own_groups_tick(tmp_path):
+    """Review S5: both groups see the record's protect ids but each stamps only its home experts, with its own clock
+    (a foreign stamp would carry the other group's tick and race its owner)."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        for expert in (2, 0, 4, 1):  # node 0's clock reaches 3, node 1's 1
+            _serve(sim, host, [expert])
+        stamp_before = {e: host.slot_info(ROW)[host.mapping(ROW)[e]][2] for e in (2, 1)}
+        req = sim.post(ROW, [], protect=[2, 1])
+        assert host.pump() == 1 and sim.wait_handled(req)
+        info = host.slot_info(ROW)
+        assert info[host.mapping(ROW)[2]][2] > stamp_before[2] and info[host.mapping(ROW)[2]][2] >= 4
+        assert info[host.mapping(ROW)[1]][2] == 2, "node 1's own clock, not node 0's"
+    finally:
+        host.stop()
+
+
 def test_every_group_parks_for_a_pause_and_serves_after_it(tmp_path):
     s, page, host, sim = _host(tmp_path)
     try:
