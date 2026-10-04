@@ -160,6 +160,24 @@ def test_every_group_parks_for_a_pause_and_serves_after_it(tmp_path):
         host.stop()
 
 
+def test_a_group_with_no_slots_in_a_row_opens_and_its_staging_is_refused(tmp_path):
+    """Node 1's range of row 0 is empty (all of the row's slots are node 0's). The tier opens, as it did before the
+    groups, and reserve_staging refuses the row with its message. Mutation: the empty range is refused at open
+    ("outside the row"), from the wrong call. A capacity-0 row itself never reaches the tier: the slab table refuses
+    it first (_slab_table), at db8b55e497 too."""
+    s = ram_miss_setup(tmp_path, capacity=2, experts=EXPERTS)
+    page = new_page(pin=False, wire=wire_layout(8, 2))
+    host = ExpertStreamHost(
+        s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), variant="instr",
+        node_ranges=[[(0, 2)] * 2, [(2, 2)] * 2],
+    )
+    try:
+        with pytest.raises(RuntimeError, match="row 0 has too few slots to stage in group 1"):
+            host.reserve_staging(1)
+    finally:
+        host.stop()
+
+
 def test_ranges_that_overlap_or_leave_the_row_are_refused(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=8, experts=EXPERTS)
     page = new_page(pin=False, wire=wire_layout(8, 2))

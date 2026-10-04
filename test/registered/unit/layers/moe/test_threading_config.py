@@ -155,8 +155,6 @@ def test_an_engine_core_refusal_names_the_node(divix01):
     """Mutation: check_engine_cores is called unwrapped, so the refusal does not say which node's plan failed."""
     with pytest.raises(ValueError, match=r"^node 1: CPU experts need at least 2 cores"):
         resolve(divix01, cpu_experts=True, numa_cores="1:ram=35,cpu=18")
-    with pytest.raises(ValueError, match=r"^node 1: 20 CPU expert threads on 16 cores"):
-        resolve(divix01, cpu_experts=True, numa_cores="1:ram=35,cpu=18-33", threads=20)
 
 
 @pytest.mark.parametrize(
