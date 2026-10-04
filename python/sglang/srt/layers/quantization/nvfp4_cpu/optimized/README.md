@@ -12,8 +12,8 @@ python python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py \
   --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ --output /absolute/path/libsglang_nvfp4_cpu.so
 ```
 
-`--portable` omits `-march=native` (the scalar dot product); `--upstream-baseline` builds the bench's GGML-conversion
-baseline; `--main HARNESS.cpp` links a native harness into an executable instead. Inside SGLang,
+`--portable` omits `-march=native` (the scalar dot product); `--main HARNESS.cpp` links a native harness into an
+executable instead. Inside SGLang,
 `sglang.srt.layers.quantization.nvfp4_cpu_ext.nvfp4_cpu_library()` builds the library on first use with `$CXX`
 and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags, compiler and host CPU. A native build
 targets the build machine's ISA. The arithmetic needs `-ffp-contract=off` and must never be built with `-Ofast`.
@@ -21,8 +21,8 @@ targets the build machine's ISA. The arithmetic needs `-ffp-contract=off` and mu
 The native harnesses (`test/registered/unit/kernels/nvfp4_cpu_{sanitizer,ggml_check}.cpp`) build and run under
 `test/registered/unit/kernels/test_nvfp4_cpu_build.py`.
 
-See [the benchmark guide](../bench/README.md) for native baseline/optimized
-executables, fixed-team process rounds, fixture format and timing protocol.
+See [the benchmark guide](../bench/README.md) for the native benchmark
+executable, fixed-team process rounds, fixture format and timing protocol.
 
 See [upstream provenance and adaptation details](../upstream/README.md).
 
@@ -133,8 +133,8 @@ behavior is unchanged.
 
 ## Code layout
 
-`moe_mul1.h` declares the kernel's types (the registry entry, `Route`, `Chunk`, `ForwardCtx`, `ForwardArena`) and
-functions; `moe_mul1.cpp` defines the registry, worker cores, the arithmetic and the C ABI. A forward is
+`moe_mul1.h` declares the kernel's types (the registry entry, `Route`, `Chunk`, `ForwardCtx`) and functions;
+`forward_plan.hpp` holds the plan and its per-thread scratch, `ForwardArena`; `moe_mul1.cpp` defines the registry, worker cores, the arithmetic and the C ABI. A forward is
 `ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `run_plan`:
 `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer on an AVX2 build, else
 `ForwardPlan<GenericShape, kBuildIsa>`. The tier is the build's (`-march=native` AVX2, or the portable scalar loop).
@@ -146,8 +146,8 @@ constants (MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp). Plans 
 `StridedExperts<Shape>` (`experts.hpp`) over the descriptor's slab bases and strides; `SlabRowBytes` is each slab's
 minimum stride.
 
-Bit-exact checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (native, upstream-baseline
-and portable builds against a baseline worktree's dumps), and
+Bit-exact checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (native and portable builds
+against a baseline worktree's dumps), and
 `test/registered/unit/kernels/test_nvfp4_cpu_{build,experts}.py`.
 
 ## Validation boundaries

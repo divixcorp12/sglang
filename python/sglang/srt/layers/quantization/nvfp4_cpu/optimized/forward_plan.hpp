@@ -18,6 +18,23 @@ enum class Phase : int
     Down = 3,          // every chunk's down rows, each token's routing-weighted sum into out
 };
 
+// The calling thread's per-forward storage, kept across calls so a steady state allocates nothing.
+struct ForwardArena
+{
+    std::vector<float, CacheAligned<float>> xf, inter, partial;
+    std::vector<block_q8_0> qx, qi;
+    std::vector<Route> route;
+    std::vector<int> route_count, unit_token;
+    std::vector<RouteRef> refs;
+    std::vector<Chunk> chunk;
+
+    static ForwardArena& get()
+    {
+        static thread_local ForwardArena arena;
+        return arena;
+    }
+};
+
 // What a (Shape, ISA) plan sets. The primary template is the generic plan.
 template <class Shape, Isa I>
 struct PlanTraits
@@ -122,14 +139,6 @@ private:
         c.partial_stride = rounded(std::max<size_t>(units, 1), 16);  // whole cache lines per worker
         grow(ar.partial, size_t(threads) * c.partial_stride);
         c.partial = ar.partial.data();
-#if defined(NVFP4_CPU_UPSTREAM_BASELINE)
-        c.row_scratch_stride = std::max(Hp, Np) / 64;
-        grow(ar.row_scratch, size_t(threads) * c.row_scratch_stride);
-        c.row_scratch = ar.row_scratch.data();
-#else
-        c.row_scratch = nullptr;
-        c.row_scratch_stride = 0;
-#endif
     }
 
     static void run_team(ForwardCtx& ctx, int count)
@@ -175,8 +184,6 @@ private:
     {
         const int H = Shape::hidden(c.info), N = Shape::intermediate(c.info);
         const size_t Hp = rounded(size_t(H), 64), Np = rounded(size_t(N), 64);
-        [[maybe_unused]] block_nvfp4* scratch =
-            c.row_scratch ? c.row_scratch + size_t(worker) * c.row_scratch_stride : nullptr;
 
         if constexpr (P == Phase::PrepareInput) {
             // Token t's blocks are [t * Hp / 32, (t + 1) * Hp / 32) of the flat range.
@@ -204,8 +211,8 @@ private:
                 const block_q8_0* xs[kChunkRows];
                 for (int j = 0; j < ch.units; ++j) xs[j] = c.qx + size_t(c.unit_token[ch.unit0 + j]) * (Hp / 32);
                 float g[kChunkRows], u[kChunkRows];
-                dot_rows(ch.gate.w, ch.gate.sf, gate_row, H, xs, ch.units, scratch, g);
-                dot_rows(ch.up.w, ch.up.sf, up_row, H, xs, ch.units, scratch, u);
+                dot_rows(ch.gate.w, ch.gate.sf, gate_row, H, xs, ch.units, g);
+                dot_rows(ch.up.w, ch.up.sf, up_row, H, xs, ch.units, u);
                 for (int j = 0; j < ch.units; ++j)
                     c.inter[size_t(ch.unit0 + j) * Np + size_t(i)] =
                         swiglu(g[j] * ch.gate_alpha, u[j] * ch.up_alpha, Shape::act_limit(c.info));
@@ -227,7 +234,7 @@ private:
                     const Chunk& ch = c.chunk[ci];
                     const block_q8_0* xs[kChunkRows];
                     for (int j = 0; j < ch.units; ++j) xs[j] = c.qi + size_t(ch.unit0 + j) * (Np / 32);
-                    dot_rows(ch.down.w, ch.down.sf, int(h), N, xs, ch.units, scratch, partial + ch.unit0);
+                    dot_rows(ch.down.w, ch.down.sf, int(h), N, xs, ch.units, partial + ch.unit0);
                 }
                 for (int t = 0; t < c.rows; ++t) {
                     const Route* route = c.route + size_t(t) * kMaxRoutes;

@@ -12,6 +12,7 @@
 #include <sched.h>
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cmath>
 #include <cstring>
 #include <iterator>
@@ -27,6 +28,14 @@
 #endif
 
 namespace {
+constexpr size_t rounded(size_t x, size_t n) { return (x + n - 1) / n * n; }
+// Inverse address of utils.swizzle_blockscale's reshape/permute.
+inline size_t sf_index(int row, int group, int groups) {
+    const size_t tiles_k = rounded(groups, 4) / 4;
+    return (((size_t(row / 128) * tiles_k + group / 4) * 32 + row % 32) * 4
+            + (row % 128) / 32) * 4 + group % 4;
+}
+
 #include "dot_nvfp4.h"
 
 // The dot product's tier is fixed when the library is compiled (dot_nvfp4.h's #if chain): AVX2 under -march=native
@@ -57,7 +66,7 @@ struct RegisteredLayer
 };
 
 // -------------------------------------------------------------------------------------------
-//   Forward context and scratch
+//   Forward context (its scratch, ForwardArena, is forward_plan.hpp's)
 // -------------------------------------------------------------------------------------------
 
 // 64-byte-aligned storage, so each kRowUnit share of fp32 outputs owns whole cache lines.
@@ -118,24 +127,8 @@ struct ForwardCtx
     block_q8_0* qi;             // [units][rounded(intermediate, 64) / 32]
     float* partial;             // [workers][partial_stride]: one down output of every unit
     size_t partial_stride;
-    block_nvfp4* row_scratch;   // [workers][row_scratch_stride], upstream-baseline builds only
-    size_t row_scratch_stride;
     // Q8_0 cannot represent the input or an intermediate: the forward returns 2 and leaves out untouched.
     std::atomic<bool> invalid{false};
-};
-
-// The calling thread's per-forward storage, kept across calls so a steady state allocates nothing.
-struct ForwardArena
-{
-    std::vector<float, CacheAligned<float>> xf, inter, partial;
-    std::vector<block_q8_0> qx, qi;
-    std::vector<block_nvfp4> row_scratch;
-    std::vector<Route> route;
-    std::vector<int> route_count, unit_token;
-    std::vector<RouteRef> refs;
-    std::vector<Chunk> chunk;
-
-    static ForwardArena& get();
 };
 
 // -------------------------------------------------------------------------------------------
@@ -153,9 +146,8 @@ inline void freeze_compute_cores();
 inline void pin_compute_worker(int worker, std::atomic<int>& pin_error);
 
 // Row `row` of a packed E2M1 matrix of k columns (scales sf) against the m <= kChunkRows Q8_0 vectors xs[0..m), into
-// out[0..m). scratch is the worker's row_scratch (upstream-baseline builds only).
-void dot_rows(const uint8_t* w, const uint8_t* sf, int row, int k, const block_q8_0* const* xs, int m,
-              block_nvfp4* scratch, float* out);
+// out[0..m).
+void dot_rows(const uint8_t* w, const uint8_t* sf, int row, int k, const block_q8_0* const* xs, int m, float* out);
 // Whether Q8_0 represents the 32 values of a block: finite, with a delta within FP16 range.
 bool q8_representable(const float* v);
 // One Q8_0 block. A zero FP16 delta contributes zero.

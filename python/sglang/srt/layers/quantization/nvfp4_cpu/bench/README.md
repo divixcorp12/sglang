@@ -1,19 +1,15 @@
 # Native NVFP4 CPU forward benchmark
 
-Follows `kernels/jit/csrc/moe/expert_stream/bench/run.sh`: two separate
-executables with fixed worker teams, alternating backend order each round,
-Google Benchmark manual wall timing, fresh JSON/log files and environment
+Follows `kernels/jit/csrc/moe/expert_stream/bench/run.sh`: one executable
+with fixed worker teams in separate processes, Google Benchmark manual wall timing, fresh JSON/log files and environment
 records. No Python, PyTorch or CUDA is required; the kernel needs OpenMP, and `run.sh` sets its wait policy
 (`OMP_WAIT_POLICY=ACTIVE`, `GOMP_SPINCOUNT=INFINITE`, `OMP_DYNAMIC=FALSE`) unless the caller already did.
 
-`nvfp4_cpu_baseline` converts each GPU-layout row into worker-local GGML
-scratch and calls the unchanged pinned `ggml_vec_dot_nvfp4_q8_0` kernel.
-`nvfp4_cpu_optimized` adapts that kernel to read the packed GPU weight bytes
-and 128x4-swizzled scales directly. Both compile with `-march=native` and
-use identical Q8_0 activation quantization, FP32 projections, SiLU, routing,
-OpenMP team and `CpuExpertForward` ABI. Baseline row conversion is timed;
-scratch allocation is performed during warmup. Neither retains a repacked
-weight cache. See [source provenance](../upstream/README.md).
+`nvfp4_cpu_optimized` times the kernel, which adapts the pinned GGML
+`ggml_vec_dot_nvfp4_q8_0` to read the packed GPU weight bytes and
+128x4-swizzled scales directly. It compiles with `-march=native`; scratch
+allocation is performed during warmup, and no repacked weight cache is
+retained. See [source provenance](../upstream/README.md).
 
 ## Build
 
@@ -46,8 +42,8 @@ NVFP4_BENCH_ROUNDS=8 NVFP4_BENCH_WORKERS=1,4,8,16 \
     --cpus=18-33 --numa-node=1
 ```
 
-Each worker count and backend gets its own process. Result names are
-`workers-N-round-R-{baseline,optimized}.{json,log}`. The runner refuses an
+Each worker count and round gets its own process. Result names are
+`workers-N-round-R-optimized.{json,log}`. The runner refuses an
 existing results directory. It captures executable SHA256s, fixture SHA256
 when supplied, `compile_commands.json`, dynamic dependencies, launch arguments,
 CPU topology and allowed CPU/memory masks.
@@ -91,7 +87,7 @@ is checked before and after the benchmark, not just configured optimistically.
 Reference decoding, registration, warmup, allocation and validation are all
 outside the measured interval. The measured call includes the plugin's worker
 wakeup, Q8 activation quantization, both expert matvec stages, SiLU and
-routed FP32 reduction. Baseline row layout conversion is also included.
+routed FP32 reduction.
 
 JSON counters include p50/p95/p99 latency in microseconds, workers, experts,
 layers, packed weight/scale bytes per forward, `logical_weight_GBps`,

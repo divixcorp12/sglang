@@ -41,14 +41,9 @@ registration, the OpenMP forward plan, GPU scale addressing, global alphas, FP16
 Its Q8 wrapper zeros blocks with a zero FP16 delta before calling the original
 quantizer, avoiding reciprocal overflow on tiny FP32 inputs. Nonfinite inputs
 or deltas above finite FP16 range return status 2 without publishing output.
-Both benchmark backends share this wrapper and expert glue.
-
-The benchmark baseline converts one GPU row into reusable per-worker scratch
-on every call, then invokes the unchanged upstream dot product. The optimized
-backend reads the GPU layout directly. Both use the same native compiler flags;
-this measures an upstream-based layout adaptation, not scalar vs SIMD or GGML
-against its own full inference engine. Row conversion is included in baseline
-timing because the callback receives GPU-layout slabs. No speedup is assumed.
+The kernel reads the GPU layout directly; the unchanged upstream dot product
+remains only as the reference in the GGML differential check
+(`test/registered/unit/kernels/nvfp4_cpu_ggml_check.cpp`).
 
 ## Reproduce the import
 

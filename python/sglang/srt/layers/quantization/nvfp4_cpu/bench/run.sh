@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Follow expert_stream/bench/run.sh: fixed teams in separate processes,
-# alternating backend order, fresh records, inherited isolation/memory policy.
+# fresh records, inherited isolation/memory policy.
 if [[ $# -lt 2 ]]; then
   echo 'Usage: bash run.sh BUILD_DIR NEW_RESULTS_DIR [benchmark options...]' >&2
   exit 2
@@ -37,9 +37,7 @@ for arg in "$@"; do
       exit 2 ;;
   esac
 done
-for backend in baseline optimized; do
-  test -x "$build/nvfp4_cpu_$backend"
-done
+test -x "$build/nvfp4_cpu_optimized"
 if [[ -n $fixture ]]; then test -f "$fixture"; fi
 mkdir "$results" # Never replace a prior measurement.
 results=$(realpath "$results")
@@ -56,24 +54,19 @@ fi
   printf '\n'
   printf 'OMP_WAIT_POLICY=%s GOMP_SPINCOUNT=%s OMP_DYNAMIC=%s OMP_THREAD_LIMIT=%s\n' \
     "$OMP_WAIT_POLICY" "$GOMP_SPINCOUNT" "$OMP_DYNAMIC" "${OMP_THREAD_LIMIT:-unset}"
-  sha256sum "$build/nvfp4_cpu_baseline" "$build/nvfp4_cpu_optimized"
+  sha256sum "$build/nvfp4_cpu_optimized"
   if [[ -n $fixture ]]; then sha256sum "$fixture"; fi
-  ldd "$build/nvfp4_cpu_baseline"
   ldd "$build/nvfp4_cpu_optimized"
   lscpu
 } > "$results/environment.txt"
 for workers in "${teams[@]}"; do
   for ((round=0; round<rounds; ++round)); do
-    order=(baseline optimized)
-    if (( round % 2 )); then order=(optimized baseline); fi
-    for backend in "${order[@]}"; do
-      stem="$results/workers-$workers-round-$round-$backend"
-      "$build/nvfp4_cpu_$backend" --workers="$workers" \
-        --benchmark_min_time=512x --benchmark_repetitions=1 \
-        --benchmark_out="$stem.json" --benchmark_out_format=json "$@" \
-        > "$stem.log" 2>&1
-      cat "$stem.log"
-    done
+    stem="$results/workers-$workers-round-$round-optimized"
+    "$build/nvfp4_cpu_optimized" --workers="$workers" \
+      --benchmark_min_time=512x --benchmark_repetitions=1 \
+      --benchmark_out="$stem.json" --benchmark_out_format=json "$@" \
+      > "$stem.log" 2>&1
+    cat "$stem.log"
   done
 done
 echo "Results: $results"

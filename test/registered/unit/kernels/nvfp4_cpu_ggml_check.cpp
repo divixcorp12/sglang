@@ -1,5 +1,5 @@
 // Differential GGML/layout check; C++ only, no CUDA or Python runtime.
-#include "dot_nvfp4.h"
+#include "moe_mul1.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>

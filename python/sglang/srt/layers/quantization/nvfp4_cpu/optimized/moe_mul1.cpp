@@ -75,43 +75,17 @@ inline void pin_compute_worker(int worker, std::atomic<int>& pin_error)
 // -------------------------------------------------------------------------------------------
 
 template <int M>
-void dot_rows_of(const uint8_t* w, const uint8_t* sf, int row, int k, const block_q8_0* const* xs,
-                 block_nvfp4* scratch, float* out) {
-    GpuRow view(w,sf,row,k);
-    const int padded=int(rounded(k,64));
-#if defined(NVFP4_CPU_UPSTREAM_BASELINE)
-    // Convert into worker-local scratch on every row; the source slabs may mutate.
-    for (int ib=0;ib<padded/64;++ib) {
-        auto& block=scratch[ib];
-        for (int g=0;g<4;++g) {
-            int group=ib*4+g;
-            uint8_t scale=group<k/16?sf[sf_index(row,group,k/16)]:0;
-            block.d[g]=scale&127;
-            const auto q=view.bytes(ib)+g*8;
-            const uint8_t flip=scale&128?8:0;
-            for (int j=0;j<8;++j) {
-                // GGML puts columns j and j+8 in a byte; GPU puts 2j and 2j+1.
-                uint8_t lo=(q[j/2]>>(4*(j%2)))&15;
-                uint8_t hi=(q[(j+8)/2]>>(4*((j+8)%2)))&15;
-                block.qs[g*8+j]=(lo^flip)|((hi^flip)<<4);
-            }
-        }
-    }
-    for (int t=0;t<M;++t) ggml_vec_dot_nvfp4_q8_0(padded,&out[t],0,scratch,0,xs[t],0,1);
-#else
-    (void)scratch;
-    dot_gpu_rows<M>(padded,view,xs,out);
-#endif
+void dot_rows_of(const uint8_t* w, const uint8_t* sf, int row, int k, const block_q8_0* const* xs, float* out) {
+    dot_gpu_rows<M>(int(rounded(k, 64)), GpuRow(w, sf, row, k), xs, out);
 }
 
-void dot_rows(const uint8_t* w, const uint8_t* sf, int row, int k, const block_q8_0* const* xs, int m,
-              block_nvfp4* scratch, float* out) {
+void dot_rows(const uint8_t* w, const uint8_t* sf, int row, int k, const block_q8_0* const* xs, int m, float* out) {
     static_assert(kChunkRows == 4, "dot_rows dispatches m in [1, 4]");
     switch (m) {
-        case 1: dot_rows_of<1>(w, sf, row, k, xs, scratch, out); break;
-        case 2: dot_rows_of<2>(w, sf, row, k, xs, scratch, out); break;
-        case 3: dot_rows_of<3>(w, sf, row, k, xs, scratch, out); break;
-        default: dot_rows_of<4>(w, sf, row, k, xs, scratch, out); break;
+        case 1: dot_rows_of<1>(w, sf, row, k, xs, out); break;
+        case 2: dot_rows_of<2>(w, sf, row, k, xs, out); break;
+        case 3: dot_rows_of<3>(w, sf, row, k, xs, out); break;
+        default: dot_rows_of<4>(w, sf, row, k, xs, out); break;
     }
 }
 
@@ -136,12 +110,6 @@ inline float swiglu(float g, float u, float limit)
     if (limit > 0) { g = std::min(g, limit); u = std::clamp(u, -limit, limit); }
     const float silu = g >= 0 ? g / (1 + std::exp(-g)) : g * std::exp(g) / (1 + std::exp(g));
     return silu * u;
-}
-
-ForwardArena& ForwardArena::get()
-{
-    static thread_local ForwardArena arena;
-    return arena;
 }
 
 #include "forward_plan.hpp"
