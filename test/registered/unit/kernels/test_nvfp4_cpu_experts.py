@@ -246,3 +246,22 @@ def test_the_scheme_registers_a_layer_and_runs_it(built):
         trait.free_layer(handle)
     with pytest.raises(RuntimeError, match="status 2"):
         trait.free_layer(handle)
+
+
+def test_the_scheme_creates_and_frees_engines(built):
+    """The pool's engine thread creates its engine through the trait (CpuExpertQuantTrait.native_create_engine): a
+    handle, never 0, for distinct cores; a repeated core and a second free are refused, naming why. Nothing forwards
+    here, so this thread stays unpinned."""
+    import ctypes
+
+    from sglang.srt.layers.quantization.nvfp4.schemes import Nvfp4CpuQuantTrait
+
+    trait = Nvfp4CpuQuantTrait(hidden=80, intermediate=80, act_limit=0.0, library=ctypes.CDLL(str(built)))
+    cores = _allowed(2)
+    engine = trait.native_create_engine(cores)
+    assert engine != 0
+    with pytest.raises(RuntimeError, match="refused engine cores"):
+        trait.native_create_engine([cores[0], cores[0]])
+    trait.native_free_engine(engine)
+    with pytest.raises(RuntimeError, match="no engine"):
+        trait.native_free_engine(engine)
