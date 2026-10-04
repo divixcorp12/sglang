@@ -28,7 +28,7 @@ endif()
 # The library's flags (optimized/build.py ARCH_FLAGS): baseline x86-64, the ISA tier picked at run time
 # (NVFP4_CPU_MAX_ISA caps it), so the benchmark times the code production runs.
 set(NVFP4_ARCH_FLAGS -march=x86-64 -mtune=generic)
-add_library(nvfp4_kernel OBJECT ../optimized/moe_mul1.cpp ../upstream/nvfp4.c)
+add_library(nvfp4_kernel OBJECT ../optimized/kernel.cpp ../upstream/nvfp4.c)
 target_link_libraries(nvfp4_kernel PRIVATE OpenMP::OpenMP_CXX)
 target_compile_options(nvfp4_kernel PRIVATE -O3 -g -ffp-contract=off ${NVFP4_ARCH_FLAGS})
 add_executable(nvfp4_cpu_optimized src/cpu_forward.cpp $<TARGET_OBJECTS:nvfp4_kernel>)

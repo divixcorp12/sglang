@@ -1,6 +1,6 @@
 """Build the NVFP4 CPU expert library (or a native harness linked with it) without CMake.
 
-The kernel is optimized/moe_mul1.cpp plus the vendored GGML C subset (../upstream/nvfp4.c, compiled as C: it relies on
+The kernel is optimized/kernel.cpp plus the vendored GGML C subset (../upstream/nvfp4.c, compiled as C: it relies on
 C's implicit void* conversions). -ffp-contract=off is part of the arithmetic contract: never build it with -Ofast.
 One build holds every ISA tier (scalar, and AVX2 by function attribute) and picks one at run time, so it runs on any
 x86-64 host; NVFP4_CPU_MAX_ISA=scalar caps the tier and NVFP4_CPU_REPORT_ISA=1 prints the one chosen.
@@ -37,7 +37,7 @@ def build(
     with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
         c_object = Path(tmp) / "nvfp4.o"
         subprocess.run([cxx, *C_FLAGS, *common, "-c", str(UPSTREAM / "nvfp4.c"), "-o", str(c_object)], check=True)
-        sources = [str(SRC / "moe_mul1.cpp")] + ([str(Path(main).resolve())] if main else [])
+        sources = [str(SRC / "kernel.cpp")] + ([str(Path(main).resolve())] if main else [])
         link = [] if main else ["-shared"]
         subprocess.run(
             [cxx, *CXX_FLAGS, *common, "-I", str(SRC), *sources, str(c_object), *link, "-o", str(output)], check=True

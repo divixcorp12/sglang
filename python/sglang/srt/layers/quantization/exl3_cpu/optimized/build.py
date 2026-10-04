@@ -24,7 +24,7 @@ def main():
            "-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128",
            f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
            "-I" + str(src), "-isystem", str(torch_root / "include"),
-           "-isystem", str(torch_root / "include/torch/csrc/api/include"), str(src / "moe_mul1.cpp"),
+           "-isystem", str(torch_root / "include/torch/csrc/api/include"), str(src / "kernel.cpp"),
            "-L" + str(torch_root / "lib"), "-Wl,-rpath," + str(torch_root / "lib"),
            "-ltorch_cpu", "-lc10", "-o", str(output)]
     subprocess.run(cmd, check=True)

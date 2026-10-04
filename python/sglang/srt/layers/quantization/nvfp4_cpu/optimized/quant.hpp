@@ -1,6 +1,6 @@
 // Nvfp4Quant: the NVFP4 CPU expert quant for ExpertForward (cpu_experts_common/expert_forward.hpp), with the layer facts
 // and slot projections a forward reads. The arithmetic is math.hpp's and its tiers' (math_scalar.hpp, math_avx2.hpp);
-// moe_mul1.cpp includes forward_plan.hpp and defines Nvfp4Quant::dispatch after it.
+// kernel.cpp includes forward_plan.hpp and defines Nvfp4Quant::dispatch after it.
 #pragma once
 #if !defined(__linux__) || !defined(_OPENMP)
 #error The NVFP4 CPU expert kernel requires Linux and OpenMP.
@@ -164,7 +164,7 @@ struct Nvfp4Quant
                 {base[kW2], base[kSf2], alpha_at(base[kDownAlpha])}};
     }
 
-    // Defined in moe_mul1.cpp after forward_plan.hpp.
+    // Defined in kernel.cpp after forward_plan.hpp.
     static int dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r, Isa isa);
 };
 

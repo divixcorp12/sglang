@@ -1,5 +1,5 @@
 // EXL3's forward: the tier dispatch of the GEMV tiles (run_tiles), the phase helpers, the plans and the plan entry
-// (Exl3Quant::dispatch). Included by moe_mul1.cpp.
+// (Exl3Quant::dispatch). Included by kernel.cpp.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is
 // the ISA tier. The primary template is the generic plan. PlanTraits<Dsv41Shape, Isa::Bw> turns on the fast path that

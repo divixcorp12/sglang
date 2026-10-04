@@ -30,7 +30,7 @@ _EXTRA_CUDA_CFLAGS = [
 
 # exllamav3's CPU MoE kernel with this fork's accuracy options (see its header).
 VENDORED_CPU_KERNEL = os.path.join(os.path.dirname(__file__), "exl3_cpu", "moe_mul1.cpp")
-OPTIMIZED_CPU_KERNEL = os.path.join(os.path.dirname(__file__), "exl3_cpu", "optimized", "moe_mul1.cpp")
+OPTIMIZED_CPU_KERNEL = os.path.join(os.path.dirname(__file__), "exl3_cpu", "optimized", "kernel.cpp")
 _UPSTREAM_CPU_KERNEL = os.path.join("cpu", "moe_mul1.cpp")
 
 

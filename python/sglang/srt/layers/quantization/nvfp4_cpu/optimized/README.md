@@ -144,7 +144,7 @@ CPU experts framework's (`../../cpu_experts_common/`, `ExpertForward<Nvfp4Quant>
 facts; `math.hpp` the ISA-independent arithmetic (`GpuRow`, Q8_0 quantization, the gated SiLU) and `dot_rows<Isa, M>`,
 whose tiers are `math_scalar.hpp` and `math_avx2.hpp` (compiled for AVX2 by function attribute); `forward_plan.hpp`
 holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and its per-thread scratch, `ForwardArena`;
-`moe_mul1.cpp` defines `Nvfp4Quant::dispatch` and the C ABI (one `SGLANG_CPU_EXPERTS_DEFINE_CABI`). A forward is
+`kernel.cpp` defines `Nvfp4Quant::dispatch` and the C ABI (one `SGLANG_CPU_EXPERTS_DEFINE_CABI`). A forward is
 `ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `Nvfp4Quant::dispatch` from the tier
 `ExpertForward` detected: `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer at the
 AVX2 tier, else `ForwardPlan<GenericShape, Isa::Avx2>` or `ForwardPlan<GenericShape, Isa::Scalar>`.
@@ -173,7 +173,7 @@ test covers every finite signed scale, varying nibbles, GPU scale row
 boundaries, and all partial 64-value block lengths, for both tiers (AVX2 where the host has it). The
 standalone sanitizer harness is in
 `test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp`; compile it together with
-`moe_mul1.cpp` and the vendored C source; `test_nvfp4_cpu_build.py` also runs it under ASan/UBSan where the
+`kernel.cpp` and the vendored C source; `test_nvfp4_cpu_build.py` also runs it under ASan/UBSan where the
 compiler can link them.
 
 Synthetic arithmetic/layout checks and benchmark smoke runs are not captured

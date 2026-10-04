@@ -1,7 +1,7 @@
 """EXL3 binding of the CPU expert kernel, as a ``CpuExpertQuantTrait``.
 
 The kernel is the optimized build of exllamav3's CPU MoE kernel,
-``python/sglang/srt/layers/quantization/exl3_cpu/optimized/moe_mul1.cpp`` (built by
+``python/sglang/srt/layers/quantization/exl3_cpu/optimized/kernel.cpp`` (built by
 SGLANG_DSV41_CPU_EXPERTS=1; only it exports the CPU experts C ABI). ``Exl3CpuQuantTrait``
 registers each streamed layer's pinned slabs with its ``register_layer`` by base pointer and
 slot stride, and exposes the kernel's C entry points (forward, keep-warm and core placement)

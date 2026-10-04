@@ -1,4 +1,4 @@
-"""Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (exl3_cpu/optimized/moe_mul1.cpp).
+"""Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (exl3_cpu/optimized/kernel.cpp).
 
 ``dump`` runs a fixed set of forwards through the extension ``exl3_ext()`` builds and saves every output; ``compare``
 checks two dumps for bitwise equality. A dump made at the merge-base is the reference a kernel refactor must reproduce

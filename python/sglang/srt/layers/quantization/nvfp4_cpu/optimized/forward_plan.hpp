@@ -1,4 +1,4 @@
-// Included by moe_mul1.cpp inside quant.hpp's namespace, after the arithmetic (math.hpp: swiglu, q8_representable,
+// Included by kernel.cpp inside quant.hpp's namespace, after the arithmetic (math.hpp: swiglu, q8_representable,
 // quantize_block; dot_rows<I, M> from math_scalar.hpp and math_avx2.hpp) and kChunkRows.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the
