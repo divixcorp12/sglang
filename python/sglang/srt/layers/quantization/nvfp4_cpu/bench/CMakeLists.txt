@@ -25,12 +25,15 @@ if(NOT benchmark_FOUND)
     GIT_TAG eddb0241389718a23a42db6af5f0164b6e0139af) # same v1.9.4 as expert_stream/bench
   FetchContent_MakeAvailable(google_benchmark)
 endif()
+# The library's flags (optimized/build.py ARCH_FLAGS): baseline x86-64, the ISA tier picked at run time
+# (NVFP4_CPU_MAX_ISA caps it), so the benchmark times the code production runs.
+set(NVFP4_ARCH_FLAGS -march=x86-64 -mtune=generic)
 add_library(nvfp4_kernel OBJECT ../optimized/moe_mul1.cpp ../upstream/nvfp4.c)
 target_link_libraries(nvfp4_kernel PRIVATE OpenMP::OpenMP_CXX)
-target_compile_options(nvfp4_kernel PRIVATE -O3 -g -ffp-contract=off -march=native)
+target_compile_options(nvfp4_kernel PRIVATE -O3 -g -ffp-contract=off ${NVFP4_ARCH_FLAGS})
 add_executable(nvfp4_cpu_optimized src/cpu_forward.cpp $<TARGET_OBJECTS:nvfp4_kernel>)
 target_include_directories(nvfp4_cpu_optimized PRIVATE ../optimized)
 target_compile_definitions(nvfp4_cpu_optimized PRIVATE NVFP4_BENCH_BACKEND="optimized")
-target_compile_options(nvfp4_cpu_optimized PRIVATE -O3 -g -ffp-contract=off -march=native -Wall -Wextra)
+target_compile_options(nvfp4_cpu_optimized PRIVATE -O3 -g -ffp-contract=off ${NVFP4_ARCH_FLAGS} -Wall -Wextra)
 target_link_libraries(nvfp4_cpu_optimized PRIVATE benchmark::benchmark Threads::Threads OpenMP::OpenMP_CXX)
 set_target_properties(nvfp4_cpu_optimized PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")

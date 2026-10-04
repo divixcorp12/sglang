@@ -116,8 +116,10 @@ void ok(const char* name) { std::printf("ok %s\n", name); std::fflush(stdout); }
 
 int main()
 {
-    // isa() is computed once, at the first forward: the cap must be in the environment before it.
+    // isa() is computed once, at the first forward: the cap and the report switch must be in the environment before
+    // it. The Python test reads the report ("toy isa scalar") from stderr.
     CHECK(setenv("TOY_CPU_MAX_ISA", "scalar", 1) == 0);
+    CHECK(setenv("TOY_CPU_REPORT_ISA", "1", 1) == 0);
     Fixture f;
 
     // Configure the worker cores before the first forward freezes them; checked again after it.

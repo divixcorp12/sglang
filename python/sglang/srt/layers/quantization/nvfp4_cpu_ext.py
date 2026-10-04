@@ -1,8 +1,9 @@
 """The NVFP4 CPU expert library, built on first use by nvfp4_cpu/optimized/build.py.
 
-The library is cached under ``build_dir`` by a hash of its sources, the build flags, the compiler's version and what
--march=native means on this host, so an edit, a compiler change or a different CPU builds a new one; a file lock keeps
-concurrent processes from building the same one twice. The compiler is $CXX, else g++.
+The library is cached under ``build_dir`` by a hash of its sources, the build flags and the compiler's version, so an
+edit or a compiler change builds a new one; a file lock keeps concurrent processes from building the same one twice.
+The build targets baseline x86-64 and picks its ISA tier at run time, so the host CPU is not part of the key. The
+compiler is $CXX, else g++.
 """
 
 import ctypes
@@ -40,12 +41,11 @@ def _sources() -> list[Path]:
 
 
 def library_path(build_dir: Path, cxx: str) -> Path:
-    """Where the library for the current sources, flags, compiler and host CPU lives."""
+    """Where the library for the current sources, flags and compiler lives."""
     build = _build_module()
     digest = hashlib.sha256()
     digest.update(subprocess.check_output([cxx, "--version"]))
-    digest.update(subprocess.check_output([cxx, "-march=native", "-Q", "--help=target"]))
-    digest.update(" ".join(build.CXX_FLAGS + build.C_FLAGS).encode())
+    digest.update(" ".join(build.CXX_FLAGS + build.C_FLAGS + build.ARCH_FLAGS).encode())
     for path in _sources():
         digest.update(path.name.encode())
         digest.update(path.read_bytes())

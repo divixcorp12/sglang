@@ -83,7 +83,7 @@ if cores:
 
 
 @pytest.fixture(scope="module")
-def library(tmp_path_factory):
+def built(tmp_path_factory):
     spec = importlib.util.spec_from_file_location(
         "nvfp4_cpu_build", REPO / "python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py"
     )
@@ -92,13 +92,21 @@ def library(tmp_path_factory):
     return build.build(tmp_path_factory.mktemp("nvfp4") / "libnvfp4.so", cxx=CXX)
 
 
+# One library holds every tier; each case runs at each, capped by NVFP4_CPU_MAX_ISA (a cap above the host's tier
+# runs the host's).
+@pytest.fixture(params=["avx2", "scalar"])
+def library(built, request):
+    return built, request.param
+
+
 def _run(library, calls, cores=(), alpha=1.0, **env):
+    path, isa = library
     result = subprocess.run(
-        [sys.executable, "-c", CHILD, str(library), calls, ",".join(map(str, cores)), str(alpha)],
+        [sys.executable, "-c", CHILD, str(path), calls, ",".join(map(str, cores)), str(alpha)],
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, **env},
+        env={**os.environ, "NVFP4_CPU_MAX_ISA": isa, **env},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout.split("\n")[:-1]

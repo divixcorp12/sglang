@@ -26,8 +26,11 @@ preprocessor guards. Native x86 AVX2 builds also require FMA, as upstream does.
 
 ## Adaptation boundary
 
-`../optimized/dot_nvfp4.h` is derived from the same dot-product function.
-The changes are its signature, weight/scale access, and nibble interleave:
+`../optimized/math_avx2.hpp` (the AVX2 branch, with the `__AVX2__` helpers
+restated under a target attribute) and `../optimized/math_scalar.hpp` (the
+scalar loop) are derived from the same dot-product function, and
+`../optimized/math.hpp`'s `GpuRow` from its block access; the upstream `__AVX__`-only
+branch is not carried. The changes are its signature, weight/scale access, and nibble interleave:
 GPU bytes hold adjacent columns; GGML bytes hold columns j and j+8 per group.
 Integer multiply/reduction, doubled FP4 LUT, activation deltas and floating
 accumulation remain GGML arithmetic. Signed GPU E4M3 scales are supported;

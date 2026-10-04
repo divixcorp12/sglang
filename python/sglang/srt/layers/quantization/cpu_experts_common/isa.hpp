@@ -1,8 +1,10 @@
 // The x86 vector tiers a CPU expert quant may implement, and the tier one runs at: min(hardware, the quant's top
-// tier, the quant's cap environment variable).
+// tier, the quant's cap environment variable). A quant's report variable prints the tier it settled on.
 #pragma once
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #if !defined(__GNUC__) || !defined(__linux__) || !defined(__x86_64__)
@@ -54,6 +56,26 @@ inline Isa detect_isa(Isa top, const char* cap_env)
         if (cap < hw) hw = cap;
     }
     return hw;
+}
+
+// The tier's name, as a cap variable spells it.
+inline const char* isa_name(Isa isa)
+{
+    switch (isa) {
+        case Isa::Scalar: return "scalar";
+        case Isa::Avx2: return "avx2";
+        case Isa::Bw: return "bw";
+        case Isa::Vnni: return "vnni";
+        case Isa::Vbmi: return "vbmi";
+    }
+    return "unknown";
+}
+
+// report_env (may be null) names a variable that, when it is "1", makes this print "<name> isa <tier>" to stderr.
+inline void report_isa(const char* name, Isa isa, const char* report_env)
+{
+    const char* e = report_env ? std::getenv(report_env) : nullptr;
+    if (e && std::strcmp(e, "1") == 0) std::fprintf(stderr, "%s isa %s\n", name, isa_name(isa));
 }
 
 }  // namespace

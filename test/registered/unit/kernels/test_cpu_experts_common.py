@@ -52,13 +52,16 @@ def test_the_native_harness_passes(tmp_path, flags):
         pytest.skip(f"{CXX} cannot link ASan/UBSan (its sanitizer runtimes are not installed)")
     exe = tmp_path / "cpu_experts_common_check"
     subprocess.run([CXX, *CXX_FLAGS, *flags, str(HARNESS), "-o", str(exe)], check=True)
-    # The harness sets TOY_CPU_MAX_ISA itself; a value inherited from the caller must not pre-empt it.
+    # The harness sets TOY_CPU_MAX_ISA and TOY_CPU_REPORT_ISA itself; a value inherited from the caller must not
+    # pre-empt them.
     env = {k: v for k, v in os.environ.items() if not k.startswith("TOY_CPU_")}
     result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=300, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     passed = set(result.stdout.split("\n"))
     missing = [name for name in CHECKS if f"ok {name}" not in passed]
     assert not missing, f"checks that did not report ok: {missing}\n{result.stdout}{result.stderr}"
+    # The harness sets TOY_CPU_REPORT_ISA=1: isa() reports the tier it settled on, once.
+    assert result.stderr.count("toy isa ") == 1 and "toy isa scalar\n" in result.stderr, result.stderr
 
 
 class _Layer(ctypes.Structure):

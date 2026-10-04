@@ -63,12 +63,19 @@ def test_the_loader_builds_once_per_content_and_reuses_the_library(tmp_path):
         getattr(library, name)
 
 
-def test_a_portable_build_uses_no_avx_registers(tmp_path):
-    # Toolchains may default past baseline x86-64 (RHEL 10's GCC defaults to x86-64-v3, which has AVX2): portable
-    # must still mean the scalar dot product.
-    library = _build_module().build(tmp_path / "libportable.so", cxx=CXX, native=False)
-    disassembly = subprocess.run(["objdump", "-d", str(library)], capture_output=True, text=True, check=True).stdout
-    assert "%ymm" not in disassembly and "%zmm" not in disassembly
+def test_the_scalar_cap_runs_the_scalar_tier(tmp_path):
+    """NVFP4_CPU_MAX_ISA=scalar must select the scalar tier in a library that also holds the AVX2 one."""
+    exe = _build_module().build(
+        tmp_path / "ab", cxx=CXX, main=REPO / "test/manual/dsv41/nvfp4_cpu_forward_ab.cpp"
+    )
+    cores = sorted(os.sched_getaffinity(0))[:1]
+    capped = subprocess.run(
+        [str(exe), str(tmp_path / "scalar.bin"), str(cores[0])],
+        env={**os.environ, "NVFP4_CPU_MAX_ISA": "scalar", "NVFP4_CPU_REPORT_ISA": "1"},
+        capture_output=True, text=True, timeout=900,
+    )
+    assert capped.returncode == 0, capped.stdout + capped.stderr
+    assert "nvfp4 isa scalar" in capped.stderr
 
 
 SANITIZERS = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]

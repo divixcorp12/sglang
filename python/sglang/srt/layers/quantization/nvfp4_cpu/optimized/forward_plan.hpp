@@ -1,9 +1,9 @@
-// Included by moe_mul1.cpp inside quant.hpp's namespace, after the arithmetic it defines (dot_rows, swiglu,
-// q8_representable, quantize_block) and kChunkRows.
+// Included by moe_mul1.cpp inside quant.hpp's namespace, after the arithmetic (math.hpp: swiglu, q8_representable,
+// quantize_block; dot_rows<I, M> from math_scalar.hpp and math_avx2.hpp) and kChunkRows.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the
-// dot product's tier, fixed when the library is compiled (kBuildIsa). The primary PlanTraits is the generic plan's;
-// PlanTraits<MimoV26ProShape, Isa::Avx2> is MiMo V2.6 Pro's on an AVX2 build.
+// dot product's tier, the one ExpertForward detected at run time. The primary PlanTraits is the generic plan's;
+// PlanTraits<MimoV26ProShape, Isa::Avx2> is MiMo V2.6 Pro's at the AVX2 tier.
 //
 // A call's routes are grouped by slot into units, one per (token, slot), and units into chunks of up to kChunkRows of
 // one slot, so dot_rows decodes each weight row once per chunk. Each token's output is still its own routes' sum in
@@ -101,7 +101,7 @@ struct PlanTraits
     static constexpr int kRowUnit = 16;  // output rows per split unit: 16 fp32 outputs fill one cache line
 };
 
-// MiMo V2.6 Pro on AVX2: the shape's constants make every loop bound, sf_index group count and row stride a
+// MiMo V2.6 Pro at the AVX2 tier: the shape's constants make every loop bound, sf_index group count and row stride a
 // compile-time value, and the SwiGLU clamp compiles away. kRowUnit 16 splits 2048 gate/up rows into 128 units and
 // 6144 down rows into 384, both even over 16 workers.
 template <>
@@ -219,6 +219,20 @@ private:
         c.partial = ar.partial.data();
     }
 
+    // Projection p's weight row `row` (k columns) against a chunk's m Q8_0 vectors xs, at tier I.
+    static void dot_chunk(const Projection& p, int row, int k, const block_q8_0* const* xs, int m, float* out)
+    {
+        static_assert(kChunkRows == 4, "dot_chunk dispatches m in [1, 4]");
+        const int n = int(rounded(k, 64));
+        const GpuRow x(p.w, p.sf, row, k);
+        switch (m) {
+            case 1: dot_rows<I, 1>(n, x, xs, out); break;
+            case 2: dot_rows<I, 2>(n, x, xs, out); break;
+            case 3: dot_rows<I, 3>(n, x, xs, out); break;
+            default: dot_rows<I, 4>(n, x, xs, out); break;
+        }
+    }
+
     // One phase, then wait for the whole team. Called inside run_team's parallel region (team.hpp; an orphaned barrier
     // binds to that team).
     template <Phase P>
@@ -261,8 +275,8 @@ private:
                 const block_q8_0* xs[kChunkRows];
                 for (int j = 0; j < ch.units; ++j) xs[j] = c.qx + size_t(c.unit_token[ch.unit0 + j]) * (Hp / 32);
                 float g[kChunkRows], u[kChunkRows];
-                dot_rows(ch.gate.w, ch.gate.sf, gate_row, H, xs, ch.units, g);
-                dot_rows(ch.up.w, ch.up.sf, up_row, H, xs, ch.units, u);
+                dot_chunk(ch.gate, gate_row, H, xs, ch.units, g);
+                dot_chunk(ch.up, up_row, H, xs, ch.units, u);
                 for (int j = 0; j < ch.units; ++j)
                     c.inter[size_t(ch.unit0 + j) * Np + size_t(i)] =
                         swiglu(g[j] * ch.gate_alpha, u[j] * ch.up_alpha, Shape::act_limit(c.info));
@@ -284,7 +298,7 @@ private:
                     const Chunk& ch = c.chunk[ci];
                     const block_q8_0* xs[kChunkRows];
                     for (int j = 0; j < ch.units; ++j) xs[j] = c.qi + size_t(ch.unit0 + j) * (Np / 32);
-                    dot_rows(ch.down.w, ch.down.sf, int(h), N, xs, ch.units, partial + ch.unit0);
+                    dot_chunk(ch.down, int(h), N, xs, ch.units, partial + ch.unit0);
                 }
                 for (int t = 0; t < c.rows; ++t) {
                     const RouteBinding* b = c.binding + size_t(t) * c.routes.k;

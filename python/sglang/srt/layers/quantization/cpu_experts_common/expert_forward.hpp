@@ -1,6 +1,6 @@
 // The registry, validation and dispatch every CPU expert quant shares, generic over the quant (the Quant contract:
-// kName, kSlabs, kOptionalSlabs, kMaxRoutes, kMaxRows, kTopIsa, kIsaCapEnv, Params, Layer, Row, min_slot_bytes,
-// validate, make_layer, check_slot, dispatch, decode). Each quant's library holds its own registry and forward lock.
+// kName, kSlabs, kOptionalSlabs, kMaxRoutes, kMaxRows, kTopIsa, kIsaCapEnv, kIsaReportEnv, Params, Layer, Row,
+// min_slot_bytes, validate, make_layer, check_slot, dispatch, decode). Each quant's library holds its own registry and forward lock.
 #pragma once
 #include "../../../../kernels/jit/csrc/moe/expert_stream/host/cpu_experts_abi.h"
 #include "buffer_row.hpp"
@@ -35,10 +35,15 @@ struct ExpertForward
     // One forward or free at a time: the others return 3 rather than race the forward's scratch.
     static inline std::mutex forward_mutex;
 
-    // Computed at the first call, so a test may set the cap variable before it.
+    // Computed at the first call, so a test may set the cap variable before it. Then, when Quant::kIsaReportEnv (may
+    // be null) is "1", prints "<kName> isa <tier>" to stderr, once.
     static Isa isa()
     {
-        static const Isa isa = detect_isa(Quant::kTopIsa, Quant::kIsaCapEnv);
+        static const Isa isa = [] {
+            const Isa detected = detect_isa(Quant::kTopIsa, Quant::kIsaCapEnv);
+            report_isa(Quant::kName, detected, Quant::kIsaReportEnv);
+            return detected;
+        }();
         return isa;
     }
 

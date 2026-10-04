@@ -1,6 +1,6 @@
 // Nvfp4Quant: the NVFP4 CPU expert quant for ExpertForward (cpu_experts_common/expert_forward.hpp), with the layer facts
-// and slot projections a forward reads. moe_mul1.cpp defines the arithmetic, includes forward_plan.hpp and defines
-// Nvfp4Quant::dispatch after it.
+// and slot projections a forward reads. The arithmetic is math.hpp's and its tiers' (math_scalar.hpp, math_avx2.hpp);
+// moe_mul1.cpp includes forward_plan.hpp and defines Nvfp4Quant::dispatch after it.
 #pragma once
 #if !defined(__linux__) || !defined(_OPENMP)
 #error The NVFP4 CPU expert kernel requires Linux and OpenMP.
@@ -19,9 +19,6 @@
 #include <new>
 #include <utility>
 #include <vector>
-#if defined(__AVX2__) && !defined(NVFP4_CPU_FORCE_SCALAR)
-#include <immintrin.h>
-#endif
 
 namespace sglang::nvfp4_cpu {
 // Internal linkage, like the framework: Nvfp4Quant's Layer embeds MoeBufferRows, which has it.
@@ -35,16 +32,6 @@ inline size_t sf_index(int row, int group, int groups) {
     return (((size_t(row / 128) * tiles_k + group / 4) * 32 + row % 32) * 4
             + (row % 128) / 32) * 4 + group % 4;
 }
-
-#include "dot_nvfp4.h"
-
-// The dot product's tier is fixed when the library is compiled (dot_nvfp4.h's #if chain): AVX2 under -march=native
-// on an AVX2 host, else the scalar loop.
-#if defined(__AVX2__)
-constexpr Isa kBuildIsa = Isa::Avx2;
-#else
-constexpr Isa kBuildIsa = Isa::Scalar;
-#endif
 
 // What a forward needs to know about a layer besides its slabs: the descriptor's and SglangNvfp4CpuParams' scalars.
 struct LayerInfo
@@ -114,8 +101,10 @@ struct Nvfp4Quant
     static constexpr uint32_t kOptionalSlabs = 1u << kUpAlpha;
     static constexpr int kMaxRoutes = 8;      // the C ABI's k limit
     static constexpr int kMaxRows = 1 << 16;  // the C ABI's rows limit; arbitrary, it keeps every scratch index in range
-    static constexpr Isa kTopIsa = kBuildIsa;
-    static constexpr const char* kIsaCapEnv = nullptr;
+    // The library holds both tiers and runs min(host, NVFP4_CPU_MAX_ISA): AVX2 on an AVX2/FMA host, else scalar.
+    static constexpr Isa kTopIsa = Isa::Avx2;
+    static constexpr const char* kIsaCapEnv = "NVFP4_CPU_MAX_ISA";
+    static constexpr const char* kIsaReportEnv = "NVFP4_CPU_REPORT_ISA";
     using Params = SglangNvfp4CpuParams;
 
     // One slot's three projections. The slabs are read through the slot's bases, nothing stored per slot.
