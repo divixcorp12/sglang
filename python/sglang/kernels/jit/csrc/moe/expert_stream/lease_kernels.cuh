@@ -39,7 +39,8 @@ struct PostParams {
   const int32_t* dst_slots;
   int64_t captured;
   // The device's map bank (ExpertStreamDevice.map_bank): row-major [rows, experts] and
-  // [rows, Wire::kNodes * Wire::kLanes] int32, int64 [rows] chain words, per-row eligibility. A graph replay reads what the previous deltas left here.
+  // [rows, Wire::kNodes * Wire::kLanes] int32, int64 [rows] chain words, per-row eligibility. A graph replay reads
+  // what the previous deltas left here.
   int32_t* ram_slot;
   int32_t* staging;
   int64_t* map_chain;
