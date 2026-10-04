@@ -659,3 +659,40 @@ these files.
 ## Results
 
 (Filled in by Task 4.)
+
+### Task 4: the gate (2026-10-03, divix01, `cad2f94ae6`)
+
+Command: Task 4 Step 1. Output: `divix01:cc-expert-prediction/analysis/dsv41-cpu-insert/cpu-insert.{json,txt}`. EXIT=0.
+
+**Sanity.** At s = 1 the merged policy gives 75.94 ms/token and insert_all's hot hit is 0.672. Both reproduce §30.3.
+
+| s | policy | hot hit | CPU inserts/token | uncosted | amortised | optimistic (tok/s) |
+|---|---|---|---|---|---|---|
+| 1 | insert_all (bound) | 0.672 | – | 73.03 | 73.03 | 73.03 (13.69) |
+| 1 | merged (today) | 0.643 | 0 | 75.94 | 75.94 | 75.94 (13.17) |
+| 1 | cpu_insert_p1 | 0.647 | 33.1 | 75.51 | 99.13 | 76.15 (13.13) |
+| 2 | insert_all (bound) | 0.672 | – | 59.11 | 59.11 | 59.11 (16.92) |
+| 2 | merged (today) | 0.564 | 0 | 65.53 | 65.53 | 65.53 (15.26) |
+| 2 | cpu_insert_p1 | 0.633 | 30.7 | 61.35 | 77.69 | 61.37 (16.30) |
+| 2 | cpu_insert_p2 | 0.636 | 51.8 | 61.19 | 98.71 | 69.89 (14.31) |
+| 4 | insert_all (bound) | 0.672 | – | 51.03 | 51.03 | 51.03 (19.60) |
+| 4 | merged (today) | 0.187 | 0 | 66.33 | 66.33 | 66.33 (15.08) |
+| 4 | cpu_insert_p1 | 0.625 | 29.8 | 52.41 | 72.13 | 52.67 (18.99) |
+| 4 | cpu_insert_p2 | 0.632 | 50.6 | 52.21 | 92.86 | 63.61 (15.72) |
+| 8 | merged (today) | 0.187 | 0 | 54.69 | 54.69 | 54.69 (18.28) |
+| 8 | cpu_insert_p1 | 0.625 | 29.8 | 47.62 | 72.11 | 48.88 (20.46) |
+
+`cpu_insert_all` is worse than `p2` at every s, and the full table is in the output file.
+
+**What the numbers say:**
+- **The merged policy collapses as the CPU gets faster.** At s = 4 its hot hit is 0.187, and it is slower than at s = 2 (66.33 against 65.53 ms).
+- **`cpu_insert_p1` keeps hot hit near 0.63.** At s = 4 its optimistic cost is within 1.6 ms of the uncosted insert-all bound.
+- **The copies need idle link outside the layers.** P1 issues about 30 copies a token, so about 30 ms of link. The layers' own slack holds only a fraction of that: amortised is 72 ms against optimistic 53 ms. GPU compute plus NVMe waits per token are about 31 ms, so P1 just fits the optimistic idle budget. P2 and all overflow it.
+
+**Verdict: measure first.**
+- At s = 2, P1 gives O = 61.37 against M = 65.53, a 0.936 ratio, under the 0.95 bar. But A = 77.69, well over 1.01 · M.
+- At s = 4, O / M = 0.794, and A = 72.13 is again over 1.01 · M.
+- The win therefore depends on the link really being idle for about 30 row-copies a token during GPU compute and NVMe waits. A production decode trace with PCIe metrics must show that before the device plan is written.
+- At s = 1, P1 costs more even optimistically (76.15 against 75.94). So the device change must take P from the CPU speed, with P = 0 at today's kernel, not a fixed P.
+
+**Chosen P:** 1, for s ≥ 2.
