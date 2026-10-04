@@ -405,7 +405,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     const std::vector<int64_t> dest = slots_of(slots);
     const size_t lanes = static_cast<size_t>(masks.size(1));
     if (static_cast<size_t>(masks.size(0)) != ids.size() || lanes == 0 || lanes > static_cast<size_t>(kPieceTargets)) {
-      throw std::runtime_error(error_prefix<Layout>() + "masks must be [rows, 1.." + std::to_string(kPieceTargets) + "] readiness words");
+      throw std::runtime_error(
+          error_prefix<Layout>() + "masks must be [rows, 1.." + std::to_string(kPieceTargets) + "] readiness words");
     }
     auto* words = static_cast<uint64_t*>(masks.data_ptr());
     std::vector<PieceTarget> targets(ids.size());
@@ -712,7 +713,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       // Every lane field of every cache line carries a value of the round, so a copy that mixes two rounds fails
       // `whole` whichever line it took from the other round.
       const auto id_of = [](uint32_t round, int j, int salt) {
-        return static_cast<int16_t>((round * 7u + static_cast<uint32_t>(j) * 131u + static_cast<uint32_t>(salt)) & 0x7FFFu);
+        return static_cast<int16_t>(
+            (round * 7u + static_cast<uint32_t>(j) * 131u + static_cast<uint32_t>(salt)) & 0x7FFFu);
       };
       const auto kind_of = [](uint32_t round, int j) { return static_cast<uint8_t>(1 + (round + j) % 5); };
       const auto weight_of = [](uint32_t round, int j) { return static_cast<float>((round & 0xFFFFu) + j); };
@@ -791,9 +793,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
-  // Test only: read_record over one record (record: CPU uint8 [Wire::kRecordBytes]) as the service reads seq `expected`.
-  // out int64 [6 + Wire::kLanes + 1 + 5 * Wire::kLanes] = {status (RecordRead: 0 ok, 1 torn, 2 malformed), row, captured,
-  // chain, gen, protect count, protect ids, lane count, then per lane: expert, slot, dst, kind, the weight's bits}.
+  // Test only: read_record over one record (record: CPU uint8 [Wire::kRecordBytes]) as the service reads seq
+  // `expected`.
+  // out int64 [6 + Wire::kLanes + 1 + 5 * Wire::kLanes] = {status (RecordRead: 0 ok, 1 torn, 2 malformed), row,
+  // captured, chain, gen, protect count, protect ids, lane count, then per lane: expert, slot, dst, kind, the weight's
+  // bits}.
   static void read_record_fields(TensorView record, int64_t expected, TensorView out) {
     if constexpr (!Build::kFaults) {
       test_only("read_record_fields");
@@ -804,7 +808,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         expert_stream::verify_named(
             "record", TensorMatcher({Wire::kRecordBytes}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), record);
         expert_stream::verify_named(
-            "out", TensorMatcher({6 + Wire::kLanes + 1 + 5 * Wire::kLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+            "out",
+            TensorMatcher({6 + Wire::kLanes + 1 + 5 * Wire::kLanes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+            out);
       }
       Request request;
       const RecordRead read =

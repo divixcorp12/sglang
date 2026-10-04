@@ -192,19 +192,20 @@ def _host_module_tsan(layout: str = "exl3", lanes: int = 8) -> Module:
     )
 
 
-def host_layout(layout: str = "exl3") -> tuple[tuple[str, ...], int]:
+def host_layout(layout: str = "exl3", lanes: int = 8) -> tuple[tuple[str, ...], int]:
     """Return the host module's row layout.
 
     That is its tensor names in copy-table order and a bit mask of the ones the SMs
-    can read.
+    can read. ``lanes`` picks the build whose module is read, so a launch reads the
+    one it already builds instead of compiling another.
     """
-    return _host_layout_cached(layout)
+    return _host_layout_cached(layout, expert_lease_block.wire_layout(lanes).lanes)
 
 
 @cache_once
-def _host_layout_cached(layout: str) -> tuple[tuple[str, ...], int]:
+def _host_layout_cached(layout: str, lanes: int) -> tuple[tuple[str, ...], int]:
     # The default variant is enough: every variant of a layout has the same layout.
-    module = _host_module(layout)
+    module = _host_module(layout, lanes=lanes)
     return tuple(str(module.expert_stream_layout_names()).split("\n")), int(
         module.expert_stream_layout_small_mask()
     )

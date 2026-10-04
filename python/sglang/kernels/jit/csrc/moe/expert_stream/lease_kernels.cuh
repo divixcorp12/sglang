@@ -336,7 +336,8 @@ struct LeaseProtocolKernel {
     using namespace expert_stream::wire;
     // The record carries i16 ids and is written with 16-byte stores (lease_layout.h).
     RuntimeCheck(experts <= Wire::kRecIdMax, "experts: a demand record carries expert ids up to ", Wire::kRecIdMax);
-    RuntimeCheck(row_capacity <= Wire::kRecIdMax, "row_capacity: a demand record carries slots up to ", Wire::kRecIdMax);
+    RuntimeCheck(
+        row_capacity <= Wire::kRecIdMax, "row_capacity: a demand record carries slots up to ", Wire::kRecIdMax);
     RuntimeCheck(
         reinterpret_cast<uintptr_t>(page.data_ptr()) % 128 == 0,
         "page: must be 128-byte aligned, so each record's two cache lines are one prefetch pair (128-byte block)");
@@ -348,7 +349,9 @@ struct LeaseProtocolKernel {
     auto Rows_ = SymbolicSize{"rows"};
 
     expert_stream::verify_named(
-        "page", TensorMatcher({Wire::kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+        "page",
+        TensorMatcher({Wire::kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host),
+        page);
     expert_stream::verify_named(
         "state",
         TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),

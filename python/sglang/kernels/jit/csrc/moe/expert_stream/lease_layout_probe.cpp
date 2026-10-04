@@ -40,6 +40,7 @@ std::string probe(int64_t lanes, int64_t nodes) {
     case 6: return for_nodes<6>(nodes);
     case 8: return for_nodes<8>(nodes);
     case 13: return for_nodes<13>(nodes);
+    case 24: return for_nodes<24>(nodes);
     case 32: return for_nodes<32>(nodes);
     default: return "";
   }

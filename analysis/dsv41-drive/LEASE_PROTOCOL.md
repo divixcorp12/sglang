@@ -71,7 +71,8 @@ CPU; CopyDone).
 | 16768 | `kSplit` i32[9]: CPU lanes per n eligible lanes | host (`store_split`, at start and on retune) |
 | 20480 + 256 row | the row's delta: `tag` u64 @0, `count` u32 @8, `staging` i16[8] @16, 16 `{i16 expert, i16 slot}` entries @32 | host |
 
-`lease_block_bytes(rows) = 20480 + round_up(rows * 256, 4096)`. A delta entry maps `ram_slot[expert] = slot`; slot -1
+`lease_block_bytes(rows, wire) = wire.lease_block_bytes + round_up(rows * wire.delta_stride, 4096)`; at 8 lanes that is
+`20480 + round_up(rows * 256, 4096)`. A delta entry maps `ram_slot[expert] = slot`; slot -1
 unmaps. Sixteen entries are an insert and an eviction per lane. The post reads the payload with one u32 load and five
 16-byte loads, all issued together after the tag's acquire.
 
@@ -98,13 +99,40 @@ unmaps. Sixteen entries are an insert and an eviction per lane. The post reads t
 2. **C1** copies the `HIT_SM` lanes from their RAM slots into their destination slots.
 3. **S** copies the `MISS_GPU` lanes from their staging slots, piece by piece as PieceMask bits for G appear.
 4. **CW** reads the `HIT_COPY` lanes' small tensors itself when SM small copies are on. If any lane is `HIT_COPY` or a
-   CPU kind, it closes the gate for G and checks CopyDone (see "Copy engine"). It leaves `ce_mask` for CC: the
-   `HIT_COPY` and CPU lanes in bits 0-7, the CPU lanes in 8-15, the CPU parts used in 16-17.
+   CPU kind, it closes the gate for G and checks CopyDone (see "Copy engine"). It leaves `ce_mask` (int32[3]) for CC:
+   `{the HIT_COPY and CPU lanes, the CPU lanes, the CPU output parts used}`, each a bit set indexed by lane (the parts:
+   bit 0 for a `HIT_CPU` lane, bit 1 for a `MISS_CPU` lane).
 5. **Stream wait.** `cuStreamWaitValue32` GEQ open on the gate; no SM spins.
-6. **CC** traps unless `CopyDone == G` when the gate was armed. It writes `cpu_lanes` for the fused MoE: the CPU lane
-   mask in bits 0-7, bit 8 if part 0 (the CPU hits' sum) holds this record's partial, bit 9 if part 1 (the CPU misses')
-   does. The route tables seed the output with the flagged parts' sum and leave the CPU lanes out; DIRECT's commit
-   reads bits 0-7 and inserts only the copied lanes.
+6. **CC** traps unless `CopyDone == G` when the gate was armed. It writes `cpu_lanes` (int32[2]) for the fused MoE:
+   `{the CPU lane mask, the parts}`, where part 0 (the CPU hits' sum) is bit 0 of the parts word if it holds this
+   record's partial and part 1 (the CPU misses') is bit 1. The route tables seed the output with the flagged parts' sum
+   and leave the CPU lanes out; DIRECT's commit reads the lane mask and inserts only the copied lanes.
+
+## N lanes
+
+The wire is built for `kLanes = round_up(N, 8)` lanes, `N` the widest planned gather (1..32), so `kLanes` is 8, 16, 24
+or 32 (`lease_layout.h`'s `LeaseLayout<NumLanes>`; `Wire` is the build's instantiation, `wire_layout(N)` its Python
+mirror). At 8 lanes the layout is byte-identical to the one above.
+
+- `kKindWords = kLanes / 8`: the kinds are 4-bit fields, eight to a u32, from `kRecKinds`.
+- Packed nibble counts (lanes in bits 0-3, protect ids in bits 4-7 of the `counts` byte) exist only at `kLanes == 8`.
+  Above that the `counts` byte is the lane count and the protect count is its own byte at `kRecProtectCount =
+  kRecKinds + 4 * kKindWords`.
+- The header ends at `kRecHeaderBytes = round_up(kRecProtectCount + (packed ? 0 : 1), 16)`; the four i16 arrays and the
+  f32 weights follow it, and `kRecordBytes = round_up(kRecLaneWeight + 4 * kLanes, 128)`.
+- The completion block grows with the lanes: `PieceMask[16][kLanes]` is `16 * kLanes * 128` bytes, then `CopyDone`, the
+  gate, `kCopyArmed` and `kSplit` (a u32 per eligible-lane count, `kLanes + 1` of them), rounded up to 4096. The delta
+  record holds `staging` i16[kLanes] and `2 * kLanes` entries, rounded up to 256.
+
+| kLanes | `kRecordBytes` | `kRecHeaderBytes` | `kPageBytes` | `kLeaseBlockBytes` | `kDeltaStride` | `lease_block_bytes(1)` |
+|---|---|---|---|---|---|---|
+| 8 | 128 | 32 | 2176 | 20480 | 256 | 24576 |
+| 16 | 256 | 32 | 4224 | 36864 | 256 | 40960 |
+| 24 | 384 | 48 | 6272 | 53248 | 256 | 57344 |
+| 32 | 512 | 48 | 8320 | 69632 | 512 | 73728 |
+
+`kPageBytes = 128 + 16 * kRecordBytes`. The lane masks (`ce_mask`, `cpu_lanes`, the HIT_COPY and CPU sets) are u32, so
+lane 31 is bit 31.
 
 ## The host per record
 

@@ -11,7 +11,7 @@ from sglang.test.expert_stream_sources import device_sources, host_sources, wire
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
-GRID = [(lanes, nodes) for lanes in (1, 6, 8, 13, 32) for nodes in (1, 2)]
+GRID = [(lanes, nodes) for lanes in (1, 6, 8, 13, 24, 32) for nodes in (1, 2)]
 
 
 @pytest.mark.parametrize("lanes, nodes", GRID)

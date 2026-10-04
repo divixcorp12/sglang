@@ -204,6 +204,17 @@ def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(ti
     assert all(kwargs["cpu_experts"] for kwargs in built)
 
 
+@pytest.mark.parametrize("lanes, capacity, width", [(8, 3, 8), (16, 5, 16), (16, 40, 40), (32, 12, 32)])
+def test_the_backend_pads_its_plan_to_the_build_lanes(lanes, capacity, width):
+    """The production backend (not only the service's helper) pads ``planned`` to max(capacity, lanes): an eager post
+    of 9-16 lanes at 16 must fit the tensor. Mutation: padded_plan_width returns the capacity."""
+    backend = module.Exl3RamMissRowBackend(
+        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(wire=lease.wire_layout(lanes)),
+        0, capacity, {0: None},
+    )
+    assert backend.planned.numel() == width and backend.routes.numel() == capacity
+
+
 class _CapturedPlan:
     expert_ids = torch.tensor([2], dtype=torch.int64)
     count = torch.ones(1, dtype=torch.int32)

@@ -121,7 +121,7 @@ def test_a_record_is_one_128_byte_prefetch_pair():
 
 
 @pytest.mark.parametrize(
-    "lanes, count, protect", [(8, 8, 0), (8, 1, 8), (16, 16, 16), (16, 9, 3), (32, 32, 32), (32, 17, 0)]
+    "lanes, count, protect", [(8, 8, 0), (8, 1, 8), (16, 16, 16), (16, 9, 3), (24, 24, 24), (24, 17, 5), (32, 32, 32), (32, 17, 0)]
 )
 def test_read_record_round_trips_every_lane(lanes, count, protect):
     kinds = [KINDS[j % 5] for j in range(count)]
@@ -135,21 +135,21 @@ def test_read_record_round_trips_every_lane(lanes, count, protect):
     assert got["protect"] == list(range(protect))
 
 
-@pytest.mark.parametrize("lanes", [16, 32])
+@pytest.mark.parametrize("lanes", [16, 24, 32])
 def test_a_count_past_the_lane_width_is_malformed(lanes):
     rec = encode(lanes, seq=7, kinds=[1])
     rec[lease.wire_layout(lanes).record_fields["counts"]] = lanes + 1
     assert read(rec, 7, lanes)["status"] == "malformed"
 
 
-@pytest.mark.parametrize("lanes", [16, 32])
+@pytest.mark.parametrize("lanes", [16, 24, 32])
 def test_a_protect_count_past_the_lane_width_is_malformed(lanes):
     rec = encode(lanes, seq=7, kinds=[1])
     rec[lease.wire_layout(lanes).protect_count] = lanes + 1
     assert read(rec, 7, lanes)["status"] == "malformed"
 
 
-@pytest.mark.parametrize("lanes", [8, 32])
+@pytest.mark.parametrize("lanes", [8, 24, 32])
 def test_no_torn_record_is_accepted(lanes):
     accepted, torn = ops.seqlock_stress(2.0, variant="instr", lanes=lanes)
     assert accepted > 0, (accepted, torn)

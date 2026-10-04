@@ -751,9 +751,30 @@ def test_ensure_started_refuses_a_host_module_whose_layout_disagrees_with_exl3_s
     service, streamers, caches = tiers
     reordered = tuple(reversed(EXL3_STREAMED_NAMES))
     assert reordered != EXL3_STREAMED_NAMES, "the fixture's names must actually differ once reversed"
-    monkeypatch.setattr(module, "host_layout", lambda: (reordered, 0))
+    monkeypatch.setattr(module, "host_layout", lambda **kwargs: (reordered, 0))
     with pytest.raises(RuntimeError, match="the host module's layout"):
         service.ensure_started()
+
+
+def test_the_layout_is_read_from_the_module_the_launch_builds(tiers, monkeypatch):
+    """A 16-lane launch reads the 16-lane host module's names; the 8-lane default would JIT-build a second host."""
+    from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+
+    service, streamers, caches = tiers
+    asked = []
+    monkeypatch.setattr(module, "host_layout", lambda **kwargs: asked.append(kwargs) or (EXL3_STREAMED_NAMES, 0))
+    service.plan_gather_width(12)
+    service.ensure_started()
+    assert asked == [{"lanes": 16}]
+
+
+def test_the_wire_and_lanes_are_unreadable_before_the_service_starts(tiers):
+    """An unstarted service has no lane count; reading one would silently report 8."""
+    service, _, _ = tiers
+    with pytest.raises(RuntimeError, match="before the service started"):
+        service.wire
+    with pytest.raises(RuntimeError, match="before the service started"):
+        service.lanes
 
 
 def test_shutdown_stops_the_thread_before_releasing_the_tiers_slabs(tiers, monkeypatch):
