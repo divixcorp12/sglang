@@ -351,7 +351,8 @@ class FakeServiceTrait(FakeTrait):
 
 
 class FakeHost:
-    def __init__(self):
+    def __init__(self, lanes=8):
+        self.wire = lease.wire_layout(lanes)
         self.enabled, self.layers, self.splits = None, {}, []
         self.stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
         self.grid = None  # calibrate_cpu_split's answer; an Exception instance is raised instead
@@ -387,8 +388,9 @@ def _service(host, trait, **kw):
     from sglang.srt.layers.moe.cpu_experts.service import CpuExpertService
 
     slabs = {row: _fake_slabs() for row in range(2)}
+    split = [0] * (host.wire.lanes + 1)
     return CpuExpertService(
-        host, trait, slabs, **{"hidden": 8, "cores": [4, 5, 6], "threads": 2, "split": [0] * (lease.LANES + 1), "pin": False, **kw}
+        host, trait, slabs, **{"hidden": 8, "cores": [4, 5, 6], "threads": 2, "split": split, "pin": False, **kw}
     )
 
 
@@ -398,7 +400,7 @@ def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit()
     host, trait = FakeHost(), FakeServiceTrait()
     svc = _service(host, trait)
     # out_rows is two parts per row: the CPU hits' partial sum and the CPU misses'.
-    assert host.enabled == (0xF00D, [0] * (lease.LANES + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2)
+    assert host.enabled == (0xF00D, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2)
     assert host.layers == {}, "a row reached the grant before its registration"
     svc.register(1, 10.0)
     svc.register(1, 10.0)
@@ -435,7 +437,7 @@ def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
     assert svc.retune() == expected and host.splits == [expected]
     # The next window is measured from here: 64 more lanes at 10 ms each, a CPU slower than any link.
     host.stats = {"jobs": 12, "lanes": 128, "forward_ns": 64 * 100_000 + 64 * 10_000_000}
-    assert svc.retune() == [0] * (lease.LANES + 1)
+    assert svc.retune() == [0] * (lease.wire_layout(8).lanes + 1)
 
 
 def test_service_logs_the_cumulative_cost_per_lane(caplog):
@@ -456,7 +458,7 @@ def test_configured_split_refuses_a_table_the_grant_could_not_honour(spec):
 
     with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.override(spec):
         with pytest.raises(ValueError, match="0 <= split"):
-            configured_split()
+            configured_split(8)
 
 
 
@@ -483,13 +485,13 @@ def test_split_from_grid_breaks_a_near_tie_toward_the_cpu():
     near = _grid(lambda n, k: 1.0 + 0.01 * k if k <= 1 else 9.0)
     far = _grid(lambda n, k: 1.0 + 0.03 * k if k <= 1 else 9.0)
     assert split_from_grid(near) == [0] + [1] * 8
-    assert split_from_grid(far) == [0] * (lease.LANES + 1)
+    assert split_from_grid(far) == [0] * (lease.wire_layout(8).lanes + 1)
 
 
 def test_split_from_grid_never_exceeds_n_and_ignores_cells_past_n():
     # Cells k > n are unused (0.0 in the C++ grid); a 0.0 there must not win.
     grid = _grid(lambda n, k: 10.0 - k)  # more CPU is always faster
-    assert split_from_grid(grid) == list(range(lease.LANES + 1))
+    assert split_from_grid(grid) == list(range(lease.wire_layout(8).lanes + 1))
     assert all(0 <= k <= n for n, k in enumerate(split_from_grid(grid)))
 
 
@@ -516,7 +518,7 @@ def _calibrating_service(host, capacity=9):
 
     trait = FakeServiceTrait()
     slabs = {row: _fake_slabs(capacity) for row in range(2)}
-    svc = CpuExpertService(host, trait, slabs, hidden=8, cores=[4, 5, 6], threads=2, split=[0] * (lease.LANES + 1), pin=False)
+    svc = CpuExpertService(host, trait, slabs, hidden=8, cores=[4, 5, 6], threads=2, split=[0] * (host.wire.lanes + 1), pin=False)
     svc.register(0, 10.0)
     svc.register(1, 10.0)
     return svc
@@ -540,6 +542,35 @@ def test_calibration_pushes_the_measured_split_once_and_stops_retuning(capsys):
     assert svc.retune() is None and host.splits == [split]
 
 
+def test_a_16_lane_service_calibrates_a_16_lane_grid_with_16_experts_of_scratch(caplog, capsys):
+    """The service takes its lane count from the host's wire: the split table, the scratch and the row gate all
+    follow it, so calibrating a 16-lane build is not clipped to the first 8 lanes."""
+    host = FakeHost(lanes=16)
+    host.grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)), lanes=16)
+    svc = _calibrating_service(host, capacity=15)
+    with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.cpu_experts.service"):
+        assert svc.calibrate(-1) is None
+    assert "no registered row has 16 RAM slots" in caplog.text and host.calibrations == []
+    svc = _calibrating_service(host, capacity=16)
+    split = svc.calibrate(-1)
+    assert len(split) == 17 and split == split_from_grid(host.grid)
+    assert host.calibrations[0][3] == 16 * 1024 and host.splits == [split]
+
+
+@pytest.mark.parametrize("lanes, count, ok", [(16, 17, True), (16, 9, False), (8, 9, True), (8, 17, False)])
+def test_the_configured_split_lists_one_count_per_lane_plus_one(lanes, count, ok):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts.service import configured_split
+
+    spec = ",".join("0" for _ in range(count))
+    with envs.SGLANG_DSV41_CPU_EXPERTS_SPLIT.override(spec):
+        if ok:
+            assert configured_split(lanes) == [0] * count
+        else:
+            with pytest.raises(ValueError, match=f"must list {lanes + 1} counts"):
+                configured_split(lanes)
+
+
 def test_calibration_is_skipped_when_off_or_when_the_split_is_fixed():
     from sglang.srt.environ import envs
 
@@ -560,7 +591,7 @@ def test_calibration_needs_a_registered_row_with_eight_slots(caplog):
     with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.cpu_experts.service"):
         assert svc.calibrate(-1) is None
     assert "no registered row has 8 RAM slots" in caplog.text
-    assert host.calibrations == [] and svc.split == [0] * (lease.LANES + 1)
+    assert host.calibrations == [] and svc.split == [0] * (lease.wire_layout(8).lanes + 1)
 
 
 def test_failed_calibration_warns_and_keeps_the_split(caplog):
@@ -570,7 +601,7 @@ def test_failed_calibration_warns_and_keeps_the_split(caplog):
     with caplog.at_level("WARNING", logger="sglang.srt.layers.moe.cpu_experts.service"):
         assert svc.calibrate(-1) is None
     assert "did not finish" in caplog.text
-    assert host.splits == [] and svc.split == [0] * (lease.LANES + 1) and not svc.calibrated
+    assert host.splits == [] and svc.split == [0] * (lease.wire_layout(8).lanes + 1) and not svc.calibrated
 
 
 def test_failed_calibration_keeps_its_scratch_alive_and_rebaselines_the_stats():

@@ -5,6 +5,7 @@ process writes a stream trace or injects a RAM-miss fault."""
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.environ import envs
@@ -12,6 +13,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+
+RECORD_BYTES = lease.wire_layout(8).record_bytes
 
 
 @pytest.fixture
@@ -131,7 +134,7 @@ RAW_EXPORTS = {
     "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "pause_ns": lambda m, h: m.expert_stream_pause_ns(),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
-        torch.zeros(ops.RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
+        torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),
 }
 
@@ -167,7 +170,7 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
         "seqlock_stress": lambda: ops.seqlock_stress(0.001, variant="prod"),
         "pause_ns": lambda: ops.pause_ns(variant="prod"),
         "read_record_fields": lambda: ops.read_record_fields(
-            torch.zeros(ops.RECORD_BYTES, dtype=torch.uint8), 1, variant="prod"
+            torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, variant="prod"
         ),
     }
     export = {"read_rows_with_fault": "read_rows_faulted"}.get(helper, helper)  # the name the error carries

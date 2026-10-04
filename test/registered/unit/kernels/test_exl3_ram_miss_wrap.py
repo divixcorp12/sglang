@@ -19,20 +19,16 @@ import faulthandler
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import (
-    DEMAND_RECORDS,
-    DEMAND_RING,
-    RECORD_BYTES,
-    WORDS,
-    ExpertStreamHost,
-    new_page,
-)
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
+from sglang.kernels.ops.moe.expert_stream_transport import WORDS, ExpertStreamHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+W = wire_layout(8)
+DEMAND_RING, DEMAND_RECORDS, RECORD_BYTES = W.demand_ring, W.demand_records, W.record_bytes
 STALE_SEQ = 0xFFFFFFF0  # what the slot before the wrap holds in a run that has been going a while
 
 

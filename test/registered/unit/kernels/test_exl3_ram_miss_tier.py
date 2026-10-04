@@ -12,11 +12,8 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_stream_transport
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
-    DEMAND_RECORDS,
-    DEMAND_RING,
-    PAGE_BYTES,
-    RECORD_BYTES,
     ExpertStreamHost,
     new_hot_page,
     new_page,
@@ -27,6 +24,9 @@ from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script, same_bytes
+
+W = wire_layout(8)
+DEMAND_RING, DEMAND_RECORDS, RECORD_BYTES, PAGE_BYTES = W.demand_ring, W.demand_records, W.record_bytes, W.page_bytes
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -102,7 +102,8 @@ def test_gpu_hot_sidecar_aborts_on_a_stale_or_malformed_record_after_a_wrap(tmp_
     result = run_host_script(
         tmp_path,
         f"""
-        from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, hot_record_bytes
+        from sglang.kernels.ops.moe.expert_stream_transport import hot_record_bytes
+        DEMAND_RECORDS = {DEMAND_RECORDS}
         for _ in range(DEMAND_RECORDS + 1):
             req = sim.post(0, [], hot=[0])
             assert host.pump() == 1

@@ -12,7 +12,7 @@ NO_STAGING = [-1] * 8
 
 
 def _type(experts, ram_slot, staging=NO_STAGING, **kw):
-    args = dict(split=SPLIT, captured=True, copy_armed=True, hit_copy="ce", cpu_on=False, cpu_misses=False)
+    args = dict(split=SPLIT, captured=True, copy_armed=True, hit_copy="ce", cpu_on=False, cpu_misses=False, lanes=8)
     args.update(kw)
     return type_lanes(experts, ram_slot=ram_slot, staging=staging, **args)
 
@@ -58,13 +58,30 @@ def test_refuses_duplicates_too_many_lanes_and_a_miss_without_staging():
     with pytest.raises(ValueError, match="twice"):
         _type([3, 3], [1, 1, 1, 1])
     with pytest.raises(ValueError, match="at most 8"):
-        _type(list(range(9)), [1] * 9)
+        _type(list(range(9)), [1] * 9, lanes=8)
     with pytest.raises(ValueError, match="staging"):
         _type([0], [-1])
 
 
+def test_a_16_lane_request_takes_16_experts_and_refuses_17():
+    """The bound is the build's lane count, not 8: lanes 8-15 take their own staging slots in order."""
+    experts = list(range(16))
+    kinds, slots = _type(experts, ram_slot=[-1] * 17, staging=list(range(40, 56)), lanes=16, split=[0] * 17)
+    assert kinds == [LaneKind.MISS_GPU] * 16 and slots == list(range(40, 56))
+    with pytest.raises(ValueError, match="at most 16"):
+        _type(list(range(17)), [1] * 17, lanes=16, split=[0] * 17)
+    with pytest.raises(ValueError, match="staging"):
+        _type(experts, [-1] * 17, list(range(40, 55)) + [-1], lanes=16, split=[0] * 17)
+
+
+def test_the_cpu_tail_reaches_lanes_past_8_at_16_lanes():
+    ram = list(range(100, 112)) + [-1] * 4
+    kinds, _ = _type(list(range(12)), ram, [-1] * 16, lanes=16, cpu_on=True, split=[0] * 12 + [4] + [0] * 4)
+    assert kinds == [LaneKind.HIT_COPY] * 8 + [LaneKind.HIT_CPU] * 4
+
+
 def test_replica_applies_the_attach_delta_then_a_decode_delta_once():
-    m = MapReplica(rows=1, experts=4)
+    m = MapReplica(rows=1, experts=4, lanes=8)
     assert m.map_chain == [1] and m.map_applied == [0]
     m.apply_delta(0, tag=1, staging=[9] + [-1] * 7, entries=[])
     assert m.staging[0][0] == 9 and m.map_applied[0] == 1
@@ -74,7 +91,11 @@ def test_replica_applies_the_attach_delta_then_a_decode_delta_once():
     assert m.ram_slot[0][2] == 6 and m.map_applied[0] == 2
 
 
+def test_a_replica_keeps_one_staging_slot_per_lane_of_its_build():
+    assert [len(row) for row in MapReplica(rows=2, experts=3, lanes=16).staging] == [16, 16]
+
+
 def test_replica_bulk_writes_entries_across_rows():
-    m = MapReplica(rows=2, experts=3)
+    m = MapReplica(rows=2, experts=3, lanes=8)
     m.apply_bulk([(0, 1, 4), (1, 2, 7), (0, 1, -1)])
     assert m.ram_slot == [[-1, -1, -1], [-1, -1, 7]]

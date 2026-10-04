@@ -10,12 +10,13 @@ import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STATE_WORDS, ExpertStreamDevice
+from sglang.kernels.ops.moe.expert_stream_transport import STATE_WORDS, ExpertStreamDevice
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.expert_stream_sources import device_sources, host_sources, joined_text
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
+PAGE_BYTES = lease.wire_layout(8).page_bytes
 CSRC = Path(ram_miss.__file__).resolve().parents[2] / "jit" / "csrc" / "moe"
 
 
@@ -23,13 +24,15 @@ def _runs(layers=2, experts=4):
     return torch.zeros((layers, experts, ram_miss.STAGE_PIECES, 1, 2), dtype=torch.int32)
 
 
-def _device(layers=2, experts=4, page=None, **kwargs):
-    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8) if page is None else page
+def _device(layers=2, experts=4, page=None, lanes=8, **kwargs):
+    wire = lease.wire_layout(lanes)
+    page = torch.zeros(wire.page_bytes, dtype=torch.uint8) if page is None else page
     kwargs.setdefault("piece_runs", _runs(layers, experts))
     kwargs.setdefault("row_capacities", [5, 7][:layers] + [3] * max(0, layers - 2))
     kwargs.setdefault("timeout_ms", 10)
     return ExpertStreamDevice(
-        page, lease.new_lease_block(layers, pin=False), device="cpu", layers=layers, experts=experts, **kwargs
+        page, lease.new_lease_block(layers, pin=False, wire=wire), device="cpu", layers=layers, experts=experts,
+        lanes=lanes, **kwargs,
     )
 
 
@@ -53,6 +56,20 @@ def test_state_words_are_distinct_and_dense():
 def test_a_page_of_the_wrong_size_is_refused():
     with pytest.raises(ValueError, match="page"):
         _device(page=torch.zeros(10, dtype=torch.uint8))
+
+
+def test_a_page_built_for_another_lane_count_is_refused():
+    """A 16-lane device over an 8-lane page would read past the records the 8-lane service wrote."""
+    with pytest.raises(ValueError, match="page"):
+        _device(lanes=16, page=torch.zeros(PAGE_BYTES, dtype=torch.uint8))
+    assert _device(lanes=16).wire.lanes == 16
+
+
+@pytest.mark.parametrize("lanes", [8, 16, 32])
+def test_the_device_sizes_its_lane_tensors_by_its_wire(lanes):
+    dev = _device(lanes=lanes)
+    assert dev.map_bank["staging"].shape == (2, lanes)
+    assert dev.lane_kind.numel() == dev.lane_slot.numel() == dev.host_rows_1.numel() == dev.dst_slots_1.numel() == lanes
 
 
 def test_the_timeout_must_be_positive():
@@ -84,7 +101,7 @@ def test_an_unpinned_page_is_refused_for_a_cuda_device():
     # Checked before any CUDA call: the kernels read it through UVA.
     with pytest.raises(ValueError, match="pinned"):
         ExpertStreamDevice(
-            torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(2, pin=False), device="cuda", layers=2,
+            torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(2, pin=False, wire=lease.wire_layout(8)), device="cuda", layers=2,
             experts=4, timeout_ms=10, piece_runs=_runs(), row_capacities=[5, 7],
         )
 
@@ -213,7 +230,7 @@ def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
     wire = lease.wire_probe(8, 1)
     assert wire["kHotHeaderBytes"] == ram_miss.HOT_HEADER_BYTES == 8
     assert wire["kHotAlignment"] == ram_miss.HOT_ALIGNMENT == 64
-    assert wire["kHotRecords"] == ram_miss.HOT_RECORDS == ram_miss.DEMAND_RECORDS == 16
+    assert wire["kHotRecords"] == ram_miss.HOT_RECORDS == lease.wire_layout(8).demand_records == 16
     assert ram_miss.hot_record_bytes(384) == 64
     assert ram_miss.new_hot_page(384, pin=False).numel() == 1024
 

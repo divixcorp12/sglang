@@ -13,7 +13,6 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import (
-    DEMAND_RECORDS,
     new_hot_page,
     new_page,
 )
@@ -28,6 +27,8 @@ from sglang.test.dsv41_ram_miss_fixtures import (
 )
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+
+DEMAND_RECORDS = lease.wire_layout(8).demand_records
 
 ROW = 1
 DST_ROWS = 6

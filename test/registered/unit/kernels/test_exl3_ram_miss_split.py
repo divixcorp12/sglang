@@ -16,6 +16,8 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
+TRACE_EXTENTS = 2 * ops.stage_trace_rows()
+
 # True for a rerun of these tests with SGLANG_DSV41_ENABLE_RAM_MISS_PIECE_STREAM's
 # reader, which issues a nonzero part as its sub-reads: a count of reads is then a count of sub-reads.
 PIECE_STREAM = False
@@ -494,7 +496,7 @@ def _assert_row_causality(record, reads_per_row):
     for extent in record["extent_cqe"]:
         by_row.setdefault(extent["row"], []).append(extent)
     for row in record["row_pack"]:
-        if sum(reads_per_row[: row["row"] + 1]) > ops.STAGE_TRACE_EXTENTS:
+        if sum(reads_per_row[: row["row"] + 1]) > TRACE_EXTENTS:
             assert PIECE_STREAM
             continue
         extents = by_row[row["row"]]
@@ -530,7 +532,7 @@ def test_each_rows_stamps_are_causally_ordered_over_several_batches(tmp_path, we
     result, record = read_rows_traced(s.tables, 1, experts, list(range(11)), **fault)
     assert result == 1 and record["batches"] == 2
     reads = _n(11 * s.tables.parts, s, 1, experts)
-    assert len(record["row_pack"]) == 11 and len(record["extent_cqe"]) == min(reads, ops.STAGE_TRACE_EXTENTS)
+    assert len(record["row_pack"]) == 11 and len(record["extent_cqe"]) == min(reads, TRACE_EXTENTS)
     _assert_row_causality(record, [_n(s.tables.parts, s, 1, [e]) for e in experts])
     # The aggregate is the rows': it starts with the first row to pack, ends with the last, adds their spans.
     rows = record["row_pack"]
@@ -545,8 +547,8 @@ def test_per_row_and_per_extent_stamps_are_bounded_and_the_overflow_counted(tmp_
     result, record = read_rows_traced(s.tables, 1, experts, list(range(18)))
     assert result == 1
     assert len(record["row_pack"]) == ops.stage_trace_rows() and record["rows_untraced"] == 2
-    assert record["extents"] == _n(36, s, 1, experts) and len(record["extent_cqe"]) == ops.STAGE_TRACE_EXTENTS
-    assert record["extents_untraced"] == _n(36, s, 1, experts) - ops.STAGE_TRACE_EXTENTS
+    assert record["extents"] == _n(36, s, 1, experts) and len(record["extent_cqe"]) == TRACE_EXTENTS
+    assert record["extents_untraced"] == _n(36, s, 1, experts) - TRACE_EXTENTS
     assert record["useful_bytes"] == 18 * _segment_bytes(s)  # the totals still cover every row
     assert record["submitted_bytes"] == _lengths(s, 1, experts)
     _assert_rows(s, 1, experts, list(range(18)))

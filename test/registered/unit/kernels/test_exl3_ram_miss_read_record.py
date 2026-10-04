@@ -10,15 +10,7 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
-from sglang.kernels.ops.moe.expert_stream_transport import (
-    DEMAND_RECORDS,
-    DEMAND_RING,
-    PAGE_BYTES,
-    RECORD_BYTES,
-    RECORD_FIELDS,
-    RECORD_FLAG_CAPTURED,
-    RECORD_ID_MAX,
-)
+from sglang.kernels.ops.moe.expert_stream_transport import RECORD_FLAG_CAPTURED, RECORD_ID_MAX
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -122,9 +114,10 @@ def test_a_record_whose_seq_is_not_the_expected_one_is_torn():
 def test_a_record_is_one_128_byte_prefetch_pair():
     """The record's two cache lines are one 128-byte-aligned block, so an L2 miss on the first makes the adjacent-line
     prefetcher fetch the second; the ring starts on such a block."""
-    assert RECORD_BYTES == 128 and DEMAND_RING % 128 == 0
-    assert RECORD_FIELDS["lane_weight"] + 4 * LANES == RECORD_BYTES
-    assert PAGE_BYTES == DEMAND_RING + DEMAND_RECORDS * RECORD_BYTES
+    w = lease.wire_layout(8)
+    assert w.record_bytes == 128 and w.demand_ring % 128 == 0
+    assert w.record_fields["lane_weight"] + 4 * LANES == w.record_bytes
+    assert ops.new_page(pin=False, wire=w).numel() == w.demand_ring + w.demand_records * w.record_bytes
 
 
 @pytest.mark.parametrize(

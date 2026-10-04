@@ -21,7 +21,7 @@ LAYOUT_PIN = (7, "71405562602a9b5f")
 
 
 def _layout_digest():
-    return hashlib.sha256("\n".join(ops.STAGE_FIELDS).encode()).hexdigest()[:16]
+    return hashlib.sha256("\n".join(ops.stage_fields()).encode()).hexdigest()[:16]
 
 
 def test_the_schema_moves_with_the_record_layout():

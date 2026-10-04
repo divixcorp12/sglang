@@ -23,9 +23,9 @@ LANES = lease.wire_layout(8).lanes
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
-def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD_NS):
+def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD_NS, lanes=8):
     s = ram_miss_setup(tmp_path, capacity=capacity, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
-    host = attached_host(s, new_page(pin=False), k=3)
+    host = attached_host(s, new_page(pin=False, wire=lease.wire_layout(lanes)), k=3, lanes=lanes)
     host.enable_copy_engine(-1, spin_us=200)
     dst = {n: torch.zeros((DST_ROWS,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
     table = torch.tensor(
@@ -36,7 +36,7 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_forward_address(forward_ns), [0] * (LANES + 1), cores, x_rows, out_rows, threads=2, spin_us=200)
+    host.enable_cpu_experts(host.test_forward_address(forward_ns), [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2, spin_us=200)
     if register:
         host.set_cpu_layer(ROW, 7)
     row_bytes = [t[0].numel() * t.element_size() for t in s.slabs[ROW].values()]
@@ -44,7 +44,7 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
 
 
 def _scratch(host, extra=0):
-    return torch.zeros(LANES * host.copy_expert_bytes(ROW) + extra, dtype=torch.uint8)
+    return torch.zeros(host.wire.lanes * host.copy_expert_bytes(ROW) + extra, dtype=torch.uint8)
 
 
 def test_copy_expert_bytes_is_the_dma_entries_sum(tmp_path):
@@ -125,13 +125,24 @@ def test_calibration_needs_the_tier_owner(tmp_path):
 
 @pytest.mark.parametrize("lanes", [8, 16])
 def test_the_shape_helpers_follow_the_lane_count(lanes):
-    # A real 16-lane calibration needs a 16-lane host (ExpertStreamHost(lanes), Task 6); until then this checks the
-    # helpers and that the 16-lane host module builds with the lane-scaled capacities.
     width = lease.wire_layout(lanes).lanes
     assert ram_miss.calibration_shape(lanes) == (width + 2, width + 1)
     assert ram_miss.stage_trace_rows(lanes) == 2 * width
-    module = ram_miss._host_module("exl3", None, lanes)
-    assert hasattr(module, "expert_stream_calibrate_cpu_split")
+
+
+def test_a_16_lane_host_calibrates_a_16_lane_grid(tmp_path):
+    """The host sizes its calibration output by its own wire, so a 16-lane build is not clipped to 8 lanes (the C++
+    grid is (lanes + 2) x (lanes + 1) and the output tensor must hold it)."""
+    _, host, _, _keep = _host(tmp_path, capacity=20, lanes=16)
+    assert host.wire.lanes == 16
+    jobs_before = host.cpu_stats()["jobs"]
+    grid = host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host))
+    assert tuple(grid.shape) == ram_miss.calibration_shape(16) == (18, 17)
+    for k in range(1, 17):
+        assert grid[0, k] >= k * FORWARD_NS / 1e6 and grid[1, k] > 0, (k, grid[0].tolist())
+    for n in range(1, 17):
+        assert all(grid[1 + n, k] > 0 for k in range(n + 1)) and not any(grid[1 + n, n + 1 :])
+    assert host.cpu_stats()["jobs"] - jobs_before == (16 + 136) * 2
 
 
 def test_the_host_calibration_grid_has_the_shape_helper_size(tmp_path):

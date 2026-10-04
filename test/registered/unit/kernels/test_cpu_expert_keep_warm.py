@@ -38,7 +38,7 @@ def _host(tmp_path, request, keep_warm_us):
     cores = sorted(os.sched_getaffinity(0))[:2]
     host.enable_cpu_experts(
         host.test_forward_address(FORWARD_NS),
-        [0] * (lease.LANES + 1),
+        [0] * (lease.wire_layout(8).lanes + 1),
         cores,
         x_rows,
         out_rows,

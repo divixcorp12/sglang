@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -61,11 +62,11 @@ def tiers(tmp_path, monkeypatch):
                 streamer = ExpertStreamer(layer, fmt.names, layer_id=layer_id, format=fmt)
                 layer._nvfp4_expert_streamer = streamer
                 options = fmt.pinned_tier_options(layer)
-                # One more than the mappable rows: the service stages one slot per row (staging_slots).
+                # One more than the mappable rows: the service stages one slot per row (the planned width of 1).
                 caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY + 1, device="cpu", **options)
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
-        service.staging_slots = 1
+        service.plan_gather_width(1)
         yield service, streamers, caches
         service.shutdown()
     module.Exl3RamMissService._instance = None
@@ -190,20 +191,69 @@ def test_a_planned_gather_width_sets_the_staging_slots_reserved_at_start(tiers, 
     streamers[1].format.plan_graph_gather(streamers[1], 6)
     caches[1].ensure_rows(torch.tensor([4]))
     assert reserved == [6]
-    assert service.staging_slots == 6
+    assert service.lanes == 8 and service.host.wire.lanes == 8
 
 
 def test_without_a_planned_gather_width_the_service_reserves_one_slot_per_post_lane(tiers, reserved):
     service, streamers, caches = tiers
-    service.staging_slots = module.MAX_IDS
+    service._gather_planned = None
     caches[1].ensure_rows(torch.tensor([4]))
-    assert reserved == [module.MAX_IDS]
+    assert reserved == [8]
 
 
-def test_a_gather_wider_than_the_post_lanes_reserves_the_lanes(tiers, reserved):
+@pytest.mark.parametrize("width, lanes", [(1, 8), (6, 8), (8, 8), (9, 16), (12, 16), (16, 16), (17, 24), (32, 32)])
+def test_the_service_builds_for_the_widest_planned_gather(tiers, width, lanes):
+    service, _, _ = tiers
+    service.plan_gather_width(2)
+    service.plan_gather_width(width)
+    service.plan_gather_width(1)
+    assert service.resolved_lanes() == lanes
+
+
+def test_a_gather_wider_than_32_is_refused(tiers):
+    service, _, _ = tiers
+    with pytest.raises(ValueError, match="1..32"):
+        service.plan_gather_width(33)
+    assert service.resolved_lanes() == 8, "a refused width leaves the plan as it was"
+
+
+@pytest.mark.parametrize("width, lanes", [(12, 16), (6, 8)])
+def test_the_started_host_and_page_are_built_for_the_resolved_lanes(tiers, width, lanes):
+    """The page, the lease block and the host's wire all follow the widest planned gather."""
     service, streamers, caches = tiers
-    service.plan_gather_width(module.MAX_IDS + 4)
-    assert service.staging_slots == module.MAX_IDS
+    streamers[0].format.plan_graph_gather(streamers[0], width)
+    service.ensure_started()
+    wire = lease.wire_layout(lanes)
+    assert service.lanes == lanes and service.host.wire == wire
+    assert service.page.numel() == wire.page_bytes
+    assert service.host.lease_block.numel() == lease.lease_block_bytes(LAYERS, wire)
+
+
+def test_staging_keeps_a_fill_slot_on_a_small_tier(tiers):
+    """A width planned between 9 and 32 stages at most capacity - 1 slots, so a row always keeps a slot to fill: N
+    staging slots never take a row's last one. Mutation: staging_for returns the planned width."""
+    service, _, _ = tiers
+    service.plan_gather_width(16)
+    assert service.staging_for(capacity=10) == 9
+    assert service.staging_for(capacity=40) == 16
+    assert service.staging_for(capacity=2) == 1
+
+
+def test_a_post_wider_than_the_staging_a_small_tier_keeps_traps_as_at_8_lanes(tiers, reserved):
+    """16 lanes planned on a 4-slot row stage 3 slots (the host caps k at capacity - 1): the sim's post with 4 misses
+    runs out of staging exactly as an 8-lane build's does."""
+    service, streamers, caches = tiers
+    streamers[0].format.plan_graph_gather(streamers[0], 16)
+    caches[1].ensure_rows(torch.tensor([4]))
+    assert reserved == [16] and service.lanes == 16
+    row = service.row_of(0)
+    with paused(service.host):
+        staged = [s for s, (state, _, _) in enumerate(service.host.slot_info(row)) if state == 3]
+    assert len(staged) == CAPACITY, "the row keeps a slot to fill"
+    sim = _sim(service)
+    sim.sync_bulk()
+    with pytest.raises(ValueError, match="no staging slot"):
+        sim.post(row, list(range(CAPACITY + 1)))
 
 
 def test_a_gather_width_planned_after_the_service_started_is_refused(tiers):
@@ -779,11 +829,11 @@ def test_the_quarantine_keeps_every_device_buffer_a_kernel_may_still_touch(monke
     """A real ExpertStreamDevice's buffers, slot-map bank included, all reach quarantine_host_slabs. Mutation: the list
     names a buffer the device no longer has (AttributeError, so the shutdown frees nothing and reports nothing), or
     leaves out the map bank."""
-    from sglang.kernels.ops.moe import expert_lease_block as lease
-    from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STAGE_PIECES, ExpertStreamDevice
+    from sglang.kernels.ops.moe.expert_stream_transport import STAGE_PIECES, ExpertStreamDevice
 
     side = ExpertStreamDevice(
-        torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(1, pin=False), device="cpu", layers=1,
+        torch.zeros(lease.wire_layout(8).page_bytes, dtype=torch.uint8),
+        lease.new_lease_block(1, pin=False, wire=lease.wire_layout(8)), device="cpu", layers=1,
         experts=4, piece_runs=torch.zeros((1, 4, STAGE_PIECES, 1, 2), dtype=torch.int32), row_capacities=[5],
         timeout_ms=10,
     )
@@ -995,33 +1045,34 @@ def test_apply_graph_pads_the_routes_past_the_routed_ids_with_minus_one():
     assert backend.routes.tolist() == [5, 2, 9, 0, -1, -1]
 
 
-def test_the_row_backend_hands_the_kernels_at_least_eight_planned_lanes(monkeypatch):
-    # The post kernel reads planned for min(count, 8) lanes and count lives on the
-    # device, so a 6-lane plan (graph_gather_rows = top-6) must not be passed as is.
-    from sglang.kernels.ops.moe.expert_stream_transport import MAX_IDS
-
+@pytest.mark.parametrize("lanes, plan_ids", [(8, [4, 2, 5, 0, 0, 0]), (16, [4, 2, 5, 0, 1, 3, 4, 2, 5, 0, 1, 3])])
+def test_the_row_backend_hands_the_kernels_at_least_the_wires_planned_lanes(monkeypatch, lanes, plan_ids):
+    """The post kernel reads planned for min(count, lanes) lanes and count lives on the device, so a plan narrower
+    than the build's lanes (top-6 on an 8-lane build, 12 rows on a 16-lane one) is padded with -1, also on a row whose
+    tier holds fewer slots than lanes (an eager post of 9-16 lanes at 16 must not read past the tensor)."""
     calls = []
     device_side = SimpleNamespace(
         post=lambda row, planned, *a, **kw: calls.append(("post", planned.clone())),
         stream=lambda row, planned, *a: calls.append(("stream", planned.clone())),
         copy_wait=lambda count, dst_slots, sm: calls.append(("copy_wait", None)),
-        host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False,
+        host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False, wire=lease.wire_layout(lanes),
     )
     monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *a: calls.append(("c1", None)))
     backend = module.Exl3RamMissRowBackend(
         {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), device_side, 0, 6, {0: None}
     )
-    assert backend.planned.numel() >= MAX_IDS
+    assert backend.planned.numel() >= lanes
+    n = len(plan_ids)
     plan = SimpleNamespace(
-        expert_ids=torch.tensor([4, 2, 5, 0, 0, 0]), count=torch.tensor([3], dtype=torch.int32),
-        slots=torch.arange(6, dtype=torch.int32),
+        expert_ids=torch.tensor(plan_ids), count=torch.tensor([3], dtype=torch.int32),
+        slots=torch.arange(n, dtype=torch.int32),
     )
     backend.post(0, plan)
     assert [name for name, _ in calls] == ["post", "c1", "stream", "copy_wait"]
     for name, planned in calls:
         if planned is not None:
-            assert planned.numel() >= MAX_IDS, name
-            assert planned.tolist() == [4, 2, 5, 0, 0, 0] + [-1] * (planned.numel() - 6), name
+            assert planned.numel() >= lanes, name
+            assert planned.tolist() == plan_ids + [-1] * (planned.numel() - n), name
     assert backend.delivered_count is plan.count
 
 

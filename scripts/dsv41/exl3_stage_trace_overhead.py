@@ -26,7 +26,7 @@ import torch
 
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.kernels.ops.moe.expert_stream_transport import STAGE_FIELDS
+from sglang.kernels.ops.moe.expert_stream_transport import stage_fields
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 EXPERTS, CAPACITY = 64, 32
@@ -60,8 +60,8 @@ def _conditions():
         "busy_foreign": _busy_foreign(),
         "tree": tree,
         "tree_head": head(tree),
-        "stage_record_words": len(STAGE_FIELDS),
-        "stage_record_bytes": len(STAGE_FIELDS) * 8,
+        "stage_record_words": len(stage_fields()),
+        "stage_record_bytes": len(stage_fields()) * 8,
         "torch": torch.__version__,
         "kind": "host CPU cost per request; cache-resident buffered reads (tmpfs); no O_DIRECT, no drive, no GPU",
     }

@@ -16,18 +16,13 @@ import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import (
-    DEMAND_RECORDS,
-    DEMAND_RING,
-    MAX_IDS,
-    RECORD_BYTES,
-    RECORD_FIELDS,
     RECORD_FLAG_CAPTURED,
     WORDS,
     hot_record_bytes,
     page_word,
     piece_word,
 )
-from sglang.srt.layers.moe.ram_slot_map import LANES, LaneKind, MapReplica, type_lanes
+from sglang.srt.layers.moe.ram_slot_map import LaneKind, MapReplica, type_lanes
 
 ALL_PIECES = 0xFF  # a PieceMask word's bits once every piece of the row is published
 
@@ -68,7 +63,8 @@ class ChainSim:
         self.page, self.slabs, self.epoch = page, slabs, epoch
         self.block, self.hot_page = host.lease_block, host.hot_page
         self.layers, self.experts = host.layers, host.experts
-        self.replica = MapReplica(host.layers, host.experts)
+        self.wire = host.wire
+        self.replica = MapReplica(host.layers, host.experts, self.wire.lanes)
 
     @property
     def host(self):
@@ -86,14 +82,15 @@ class ChainSim:
         return int(self._u64(offset)[0]) & 0xFFFFFFFFFFFFFFFF
 
     def delta(self, row: int) -> tuple[int, list[int], list[tuple[int, int]]]:
-        """Row ``row``'s map delta record: (tag, staging[LANES], entries), as the post reads it."""
-        base = lease.DELTA_BASE + row * lease.DELTA_STRIDE
-        f = lease.DELTA_FIELDS
+        """Row ``row``'s map delta record: (tag, staging[lanes], entries), as the post reads it."""
+        w = self.wire
+        base = w.lease_block_bytes + row * w.delta_stride
+        f = w.delta_fields
         tag = self.read_u64(base + f["tag"])
         count = int(_i32(self.block, base + f["count"])[0])
-        staging = self.block[base + f["staging"] : base + f["staging"] + 2 * LANES].view(torch.int16).tolist()
+        staging = self.block[base + f["staging"] : base + f["staging"] + 2 * w.lanes].view(torch.int16).tolist()
         entries = base + f["entries"]
-        flat = self.block[entries : entries + 4 * lease.DELTA_MAX_ENTRIES].view(torch.int16).tolist()
+        flat = self.block[entries : entries + 4 * w.delta_max_entries].view(torch.int16).tolist()
         return tag, staging, [(flat[2 * i], flat[2 * i + 1]) for i in range(count)]
 
     def staging(self, row: int) -> list[int]:
@@ -103,22 +100,23 @@ class ChainSim:
         return self.replica.map_chain[row]
 
     def copy_armed(self) -> bool:
-        return int(_i32(self.block, lease.COPY_ARMED)[0]) != 0
+        return int(_i32(self.block, self.wire.copy_armed)[0]) != 0
 
     def split(self) -> list[int]:
-        return _i32(self.block, lease.SPLIT, LANES + 1).tolist()
+        return _i32(self.block, self.wire.split, self.wire.lanes + 1).tolist()
 
     def piece_word(self, req: SimRequest, lane: int) -> int:
-        return self.read_u64(lease.PIECE_MASK + (req.idx * lease.LANES + lane) * lease.PIECE_MASK_LINE_BYTES)
+        w = self.wire
+        return self.read_u64(w.piece_mask + (req.idx * w.lanes + lane) * w.piece_mask_line_bytes)
 
     def copy_done(self, req: SimRequest) -> int:
-        return self.read_u64(lease.COPY_DONE + req.idx * lease.COPY_DONE_BYTES)
+        return self.read_u64(self.wire.copy_done + req.idx * self.wire.copy_done_bytes)
 
     def copy_gate(self) -> int:
-        return int(_i32(self.block, lease.COPY_GATE)[0]) & 0xFFFFFFFF
+        return int(_i32(self.block, self.wire.copy_gate)[0]) & 0xFFFFFFFF
 
     def _set_gate(self, word: int) -> None:
-        _i32(self.block, lease.COPY_GATE)[0] = _signed32(word)
+        _i32(self.block, self.wire.copy_gate)[0] = _signed32(word)
 
     def read_slot(self, row: int, slot: int) -> dict[str, torch.Tensor]:
         return {name: tensor[slot].clone() for name, tensor in self.slabs[row].items()}
@@ -173,7 +171,7 @@ class ChainSim:
         if kinds is None:
             typed, slot_list = type_lanes(
                 experts, self.replica.ram_slot[row], self.replica.staging[row], self.split(),
-                captured=captured, copy_armed=self.copy_armed(), hit_copy=hit_copy, cpu_on=cpu_on,
+                lanes=self.wire.lanes, captured=captured, copy_armed=self.copy_armed(), hit_copy=hit_copy, cpu_on=cpu_on,
                 cpu_misses=cpu_misses, cpu_ok=cpu_ok, ce_ok=ce_ok,
             )
         else:
@@ -191,33 +189,42 @@ class ChainSim:
             seq = 1
             self.epoch += 1
         gen = (self.epoch << 32) | seq
-        idx = (seq - 1) % DEMAND_RECORDS
+        w = self.wire
+        idx = (seq - 1) % w.demand_records
         dst = list(range(len(experts))) if dst is None else list(dst)
         weights = [1.0] * len(experts) if weights is None else list(weights)
         protect = list(dict.fromkeys(experts)) if protect is None else list(protect)
         self._write_hot(seq, hot, hot_seq)
-        record = DEMAND_RING + idx * RECORD_BYTES
-        f = RECORD_FIELDS
+        record = w.demand_ring + idx * w.record_bytes
+        f, n = w.record_fields, w.lanes
         count = len(experts)
-        ids = list(dict.fromkeys(int(e) for e in protect))[:MAX_IDS]
-        assert count <= 15, "the counts byte holds 4 bits of lane count"
+        ids = list(dict.fromkeys(int(e) for e in protect))[:n]
+        assert count <= n, "a record carries at most the build's lanes"
 
         def padded(values, fill, dtype):
-            return torch.tensor(list(values)[:count] + [fill] * (LANES - count), dtype=dtype)
+            return torch.tensor(list(values)[:count] + [fill] * (n - count), dtype=dtype)
 
         _i32(self.page, record + f["seq"])[0] = 0
         _u16(self.page, record + f["row"])[0] = row
-        self.page[record + f["counts"]] = count | len(ids) << 4
+        if w.packed_counts:
+            self.page[record + f["counts"]] = count | len(ids) << 4
+        else:
+            self.page[record + f["counts"]] = count
+            self.page[record + w.protect_count] = len(ids)
         self.page[record + f["flags"]] = RECORD_FLAG_CAPTURED if captured else 0
         self.page[record + f["chain"] : record + f["chain"] + 8].view(torch.int64)[0] = chain
         _i32(self.page, record + f["epoch"])[0] = _signed32(self.epoch & 0xFFFFFFFF)
-        _i32(self.page, record + f["kinds"])[0] = _signed32(sum((int(typed[j]) & 0xF) << 4 * j for j in range(count)))
-        _i16(self.page, record + f["protect"], MAX_IDS)[:] = torch.tensor(ids + [-1] * (MAX_IDS - len(ids)), dtype=torch.int16)
-        _i16(self.page, record + f["lane_expert"], LANES)[:] = padded(experts, -1, torch.int16)
-        _i16(self.page, record + f["lane_slot"], LANES)[:] = padded(slot_list, -1, torch.int16)
-        _i16(self.page, record + f["lane_dst"], LANES)[:] = padded(dst, -1, torch.int16)
+        for word in range(w.kind_words):
+            lanes = typed[8 * word : 8 * word + 8]
+            _i32(self.page, record + f["kinds"] + 4 * word)[0] = _signed32(
+                sum((int(kind) & 0xF) << 4 * j for j, kind in enumerate(lanes))
+            )
+        _i16(self.page, record + f["protect"], n)[:] = torch.tensor(ids + [-1] * (n - len(ids)), dtype=torch.int16)
+        _i16(self.page, record + f["lane_expert"], n)[:] = padded(experts, -1, torch.int16)
+        _i16(self.page, record + f["lane_slot"], n)[:] = padded(slot_list, -1, torch.int16)
+        _i16(self.page, record + f["lane_dst"], n)[:] = padded(dst, -1, torch.int16)
         lane_weight = record + f["lane_weight"]
-        self.page[lane_weight : lane_weight + 4 * LANES].view(torch.float32)[:] = padded(weights, 0.0, torch.float32)
+        self.page[lane_weight : lane_weight + 4 * n].view(torch.float32)[:] = padded(weights, 0.0, torch.float32)
         _i32(self.page, record + f["seq"])[0] = _signed32(seq)
         _i32(self.page, WORDS["demand_head"])[0] = _signed32(seq)
         return SimRequest(seq, gen, idx, row, experts, list(typed), slot_list, dst, chain)
@@ -228,7 +235,7 @@ class ChainSim:
             return
         experts = self.experts
         stride = hot_record_bytes(experts)
-        record = hot_page[(seq - 1) % DEMAND_RECORDS * stride :][:stride]
+        record = hot_page[(seq - 1) % self.wire.demand_records * stride :][:stride]
         _i32(record, 0)[0] = 0
         bitmap = record[8 : 8 + (experts + 7) // 8]
         bitmap.zero_()

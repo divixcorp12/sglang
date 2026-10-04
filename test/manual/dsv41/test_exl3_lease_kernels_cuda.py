@@ -23,17 +23,14 @@ from lease_chain_rig import CAPACITY, EXPERTS, LAYERS, TOP_K, Chain  # noqa: E40
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.kernels.ops.moe import expert_stream_transport as ops  # noqa: E402
 from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
-    DEMAND_RECORDS,
-    DEMAND_RING,
-    PAGE_BYTES,
-    RECORD_BYTES,
-    RECORD_FIELDS,
     RECORD_FLAG_CAPTURED,
     RECORD_ID_MAX,
     ExpertStreamDevice,
     new_page,
 )
 from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
+
+W = lease.wire_layout(8)
 
 CONFIGS = {
     "plain": {},
@@ -110,7 +107,7 @@ def test_the_captured_chain_replays_byte_exact_through_ring_reuse_and_eviction(t
             for row in range(LAYERS):
                 c.gather(row)
         rng = random.Random(7)
-        steps = 3 * DEMAND_RECORDS // LAYERS
+        steps = 3 * W.demand_records // LAYERS
         # "served" counts the requests that read a row, "touch_only" the all-hit ones.
         before = c.host.counters()
         served = before["served"] + before["touch_only"]
@@ -199,7 +196,7 @@ def test_the_post_launch_refuses_what_a_narrow_record_cannot_carry(tmp_path, cas
         elif case == "row_capacity":
             c.dev._row_capacities = (RECORD_ID_MAX + 1,) * len(c.dev._row_capacities)
         else:
-            c.dev.page = torch.zeros(PAGE_BYTES + 128, dtype=torch.uint8).pin_memory()[64 : 64 + PAGE_BYTES]
+            c.dev.page = torch.zeros(W.page_bytes + 128, dtype=torch.uint8).pin_memory()[64 : 64 + W.page_bytes]
         with pytest.raises(RuntimeError, match="128-byte" if case == "page" else "32767"):
             c.dev.post(0, backend.planned, plan.count, backend.routes, plan.slots)
     finally:
@@ -219,8 +216,8 @@ def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x
         row = 1
         c.dev.set_row_cpu(row)
         block = c.host.lease_block
-        block[lease.COPY_ARMED : lease.COPY_ARMED + 4].view(torch.int32)[0] = 1
-        block[lease.SPLIT : lease.SPLIT + 4 * (lease.LANES + 1)].view(torch.int32)[:] = torch.arange(lease.LANES + 1)
+        block[W.copy_armed : W.copy_armed + 4].view(torch.int32)[0] = 1
+        block[W.split : W.split + 4 * (W.lanes + 1)].view(torch.int32)[:] = torch.arange(W.lanes + 1)
         c.dev.map_bulk_apply(torch.tensor([[row, 9, 0], [row, 5, 1]], dtype=torch.int32))  # both lanes RAM hits
         c.plan([9, 5], row)
         backend, plan = c.backends[row], c.plans[row]
@@ -233,19 +230,19 @@ def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x
         torch.cuda.synchronize()
         assert c.kinds(2) == [LaneKind.HIT_CPU, LaneKind.HIT_CPU]
         seq = int(c.dev.stats()["posted"]) & 0xFFFFFFFF
-        record = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
+        record = W.demand_ring + (seq - 1) % W.demand_records * W.record_bytes
         page = c.page
-        assert int(page[record + RECORD_FIELDS["flags"]]) == RECORD_FLAG_CAPTURED
+        assert int(page[record + W.record_fields["flags"]]) == RECORD_FLAG_CAPTURED
 
         def field(name, dtype, n):
-            at = record + RECORD_FIELDS[name]
+            at = record + W.record_fields[name]
             return page[at : at + n * dtype.itemsize].view(dtype).tolist()
 
-        assert int(page[record + RECORD_FIELDS["counts"]]) & 0xF == 2
-        assert field("kinds", torch.int32, 1) == kinds_words([LaneKind.HIT_CPU, LaneKind.HIT_CPU], lease.LANES)
-        assert field("lane_weight", torch.float32, lease.LANES) == [0.25, 0.5 + 0.0625] + [0.0] * (lease.LANES - 2)
+        assert int(page[record + W.record_fields["counts"]]) & 0xF == 2
+        assert field("kinds", torch.int32, 1) == kinds_words([LaneKind.HIT_CPU, LaneKind.HIT_CPU], W.lanes)
+        assert field("lane_weight", torch.float32, W.lanes) == [0.25, 0.5 + 0.0625] + [0.0] * (W.lanes - 2)
         assert field("lane_dst", torch.int16, 2) == [5, 3]
-        assert field("lane_expert", torch.int16, lease.LANES) == [9, 5] + [-1] * (lease.LANES - 2)
+        assert field("lane_expert", torch.int16, W.lanes) == [9, 5] + [-1] * (W.lanes - 2)
         staged = x_rows[row, : 2 * hidden].view(torch.float16)
         assert torch.equal(staged.view(torch.int16), x.cpu().half().reshape(-1).view(torch.int16))
         assert (x_rows[row, 2 * hidden :] == 0xAB).all() and (x_rows[1 - row] == 0xAB).all()
@@ -266,14 +263,8 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
     w = lease.wire_layout(lanes)
     experts, row_capacity = 2 * lanes, 64
 
-    def pinned(size, align):
-        # Neither torch.zeros nor the pinned allocator promises the alignment (new_lease_block).
-        raw = torch.zeros(size + align, dtype=torch.uint8, pin_memory=True)
-        start = (-raw.data_ptr()) % align
-        return raw[start : start + size]
-
-    page = pinned(w.page_bytes, 128)
-    block = pinned(w.lease_block_bytes + w.delta_stride, w.block_align)
+    page = ops.new_page(pin=True, wire=w)
+    block = lease.new_lease_block(1, pin=True, wire=w)
     delta = w.lease_block_bytes
     block[delta : delta + 8].view(torch.int64)[0] = 1  # the attach delta's tag: map_chain starts at 1
     staging_ids = torch.arange(40, 40 + w.lanes, dtype=torch.int16)

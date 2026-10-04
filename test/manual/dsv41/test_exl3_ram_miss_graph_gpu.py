@@ -80,7 +80,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     # The staging slots the service reserves at start: the graph's misses, and the rest of the tier is mappable.
-    service_module.Exl3RamMissService.get().staging_slots = TOP_K
+    service_module.Exl3RamMissService.get().plan_gather_width(TOP_K)
     with (
         # The service reads row images with O_DIRECT, in lease mode (always on), as in production.
         service_row_images(tmp_path),
@@ -151,7 +151,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     service = service_module.Exl3RamMissService.get()
-    service.staging_slots = TOP_K
+    service.plan_gather_width(TOP_K)
     try:
         with (
             service_row_images(tmp_path),  # the service reads row images with O_DIRECT, as in production

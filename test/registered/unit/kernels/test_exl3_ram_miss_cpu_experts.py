@@ -36,7 +36,7 @@ ROWS = 2
 DST_ROWS = 6
 HIDDEN = 8
 HANDLE = 7
-NO_SPLIT = [0] * (lease.LANES + 1)
+NO_SPLIT = [0] * (lease.wire_layout(8).lanes + 1)
 
 
 class FakeForward:

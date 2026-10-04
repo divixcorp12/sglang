@@ -11,7 +11,9 @@ Run on divix01 under cc-gpu.lock, with PYTHONPATH pointing at the tree under tes
 import ctypes
 import os
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -80,7 +82,7 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
 
     row, low, high = 0, 3, 7
     forward = _Forward()
-    split = [0] * (lease.LANES + 1)
+    split = [0] * (lease.wire_layout(8).lanes + 1)
     split[2] = 1
     c = Chain(tmp_path, copy_engine=True, start=False, cpu_misses=miss)
     try:
@@ -180,6 +182,126 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         assert c.handled()
     finally:
         c.close()
+
+
+def test_the_cpu_tail_at_16_lanes_goes_through_the_real_chain_and_the_split_planner():
+    """The 8-lane test above at 16 lanes: twelve RAM hits, split[12] = 4, so lanes 8-11 (the four lowest keys) are the
+    CPU's. They go through the real post, CW and CC (ce_mask and cpu_lanes bits 8-11), the route plan's miss order and
+    DIRECT's commit, which leaves their victims alone. A build still fixed at 8 lanes cannot host this chain at all."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+    from sglang.kernels.ops.moe.expert_residency_direct_gather import (
+        direct_commit_gather,
+        direct_gather_destinations,
+    )
+    from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
+
+    lanes, count, slots, experts, row = 16, 12, 16, 32, 0
+    routed = list(range(count))
+    split = [0] * 12 + [4] + [0] * 4
+    forward = _Forward()
+    with tempfile.TemporaryDirectory() as tmp:
+        c = Chain(Path(tmp), copy_engine=True, start=False, lanes=lanes, experts=experts, top_k=lanes, dst_rows=lanes,
+                  capacity=32, staging=lanes)
+        try:
+            x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
+            out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
+            cores = sorted(os.sched_getaffinity(0))[:2]
+            c.host.enable_cpu_experts(forward.address, split, cores, x_rows, out_rows, threads=2)
+            c.host.start_thread(fatal_wait_s=60.0)
+            c.dev.enable_cpu_experts(x_rows, out_rows)
+            c.dev.set_row_cpu(row)
+            backend, plan, dev = c.backends[row], c.plans[row], c.dev
+
+            c.plan(routed, row)
+            c.gather(row)
+            torch.cuda.synchronize()
+            assert c.handled() and set(routed) <= c.resident(row)
+            with paused(c.host):
+                ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
+            c.host.set_cpu_layer(row, HANDLE)
+            c.host.arm_copy_engine()
+
+            # VRAM: slots 0..15 hold experts 16..31, none of the routed ones; victims are taken from slot 15 down.
+            mapping = torch.full((experts + 1,), -1, dtype=torch.int64, device="cuda")
+            slot_to_expert = torch.full((slots + 1,), -1, dtype=torch.int64, device="cuda")
+            for slot in range(slots):
+                mapping[16 + slot] = slot
+                slot_to_expert[slot] = 16 + slot
+            slot_state = torch.full((slots + 1,), READY_STATE, dtype=torch.uint8, device="cuda")
+            slot_state[slots] = FREE_STATE
+            generations = torch.zeros(slots + 1, dtype=torch.int64, device="cuda")
+            victims = torch.arange(slots - 1, -1, -1, dtype=torch.int64, device="cuda")
+            valid = torch.ones(slots, dtype=torch.bool, device="cuda")
+            keys = torch.zeros(experts, dtype=torch.int64, device="cuda")
+            keys[:count] = torch.arange(1, count + 1, device="cuda")
+
+            ids = torch.tensor(routed, dtype=torch.int64, device="cuda")
+            plan.expert_ids.fill_(-1)
+            remap = torch.empty(count, dtype=torch.int64, device="cuda")
+            plan_unique_routes_cuda(
+                ids, mapping[:experts], slots, plan.expert_ids[:count], torch.empty(count, dtype=torch.int32, device="cuda"),
+                plan.count, remap, None, None, None, torch.zeros(1, dtype=torch.int64, device="cuda"),
+                torch.zeros(1, dtype=torch.int32, device="cuda"), 0, None, keys,
+            )
+            destinations = torch.zeros(slots, dtype=torch.int64, device="cuda")
+            live = torch.zeros(slots, dtype=torch.bool, device="cuda")
+            remap_out = torch.empty(count, dtype=torch.int64, device="cuda")
+            direct_gather_destinations(
+                ids, mapping[:experts], victims, valid, plan.count, remap, slots, plan.slots, destinations, live,
+                remap_out,
+            )
+            backend.routes.fill_(-1)
+            backend.routes[:count].copy_(ids)
+            torch.cuda.synchronize()
+            by_key = routed[::-1]
+            assert plan.expert_ids[:count].tolist() == by_key, "the plan sorts the higher key first"
+            assert plan.slots[:count].tolist() == list(range(slots - 1, slots - 1 - count, -1))
+
+            x = torch.randn(1, HIDDEN, device="cuda").half()
+            weights = torch.tensor([[(r + 1) / 64 for r in routed]], device="cuda")
+            backend._stage_planned(plan)
+            dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True, cpu_input=(x, weights))
+            copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+            dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+            dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+            snapshot = c.snapshot(row)
+            assert _until(lambda: len(forward.calls) == 1)
+            torch.cuda.synchronize()
+
+            cpu_experts = by_key[8:]
+            (call,) = forward.calls
+            assert call[0] == HANDLE and sorted(call[1]) == sorted(ram_slot[e] for e in cpu_experts), (
+                "the four lowest-keyed lanes are the CPU's"
+            )
+            assert c.kinds(count) == [LaneKind.HIT_COPY] * 8 + [LaneKind.HIT_CPU] * 4
+            assert dev.cpu_lanes.tolist() == [0xF00, PART_HITS]
+            want = c.expected(by_key[:8], row)
+            for n in c.names:
+                for lane in range(8):
+                    got = snapshot[n][slots - 1 - lane].cpu().contiguous().view(torch.uint8)
+                    assert torch.equal(got, want[n][lane].contiguous().view(torch.uint8)), (n, lane)
+                for lane in range(8, count):
+                    assert not snapshot[n][slots - 1 - lane].view(torch.uint8).any(), f"{n}: a CPU lane's victim was copied into"
+
+            insertions, evictions, truncated = (torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(3))
+            direct_commit_gather(
+                destinations, live, plan.expert_ids, mapping, slot_to_expert, slot_state, generations,
+                insertions, evictions, truncated, plan.count, torch.ones(1, dtype=torch.float32, device="cuda"),
+                plan.count, ready=READY_STATE, free_state=FREE_STATE, cpu_lanes=dev.cpu_lanes,
+            )
+            torch.cuda.synchronize()
+            for lane in range(8):
+                slot = slots - 1 - lane
+                assert int(mapping[by_key[lane]]) == slot and int(slot_to_expert[slot]) == by_key[lane]
+                assert int(mapping[16 + slot]) == -1, "a copied lane's victim was evicted"
+            for lane in range(8, count):
+                slot = slots - 1 - lane
+                assert int(slot_to_expert[slot]) == 16 + slot and int(mapping[16 + slot]) == slot, (
+                    "a CPU lane's victim keeps its expert"
+                )
+            assert (insertions.item(), evictions.item(), truncated.item()) == (8, 8, 0)
+        finally:
+            c.close()
 
 
 @pytest.mark.parametrize("miss_lane", [None, 11], ids=["hits", "last_lane_is_a_miss"])

@@ -5,7 +5,8 @@ import faulthandler
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, stage_fields, stage_trace_rows
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
@@ -55,6 +56,28 @@ def test_an_all_ram_hit_request_still_says_how_many_lanes_it_had(tier):
     _serve(host, sim, 1, [2, 3])
     _, _, hit_only = host.drain_trace()
     assert hit_only["status"] == "no_read" and hit_only["rows_asked"] == 0 and hit_only["lanes"] == 2
+
+
+def test_a_16_lane_trace_decodes_every_row_past_the_8_lane_limit(tmp_path):
+    """The host's stage record has ``stage_trace_rows(16)`` = 32 per-row slots and its words follow the lane count: a
+    decoder fixed at 8 lanes would read the 16-lane words as 8-lane ones (wrong field offsets, and only 8 of the 14 rows
+    a request asked for)."""
+    s = ram_miss_setup(tmp_path, capacity=32, experts=24)
+    wire = lease.wire_layout(16)
+    page = new_page(pin=False, wire=wire)
+    host = attached_host(s, page, k=16, lanes=16)
+    host.enable_trace()
+    sim = ChainSim(host, page, s.slabs)
+    try:
+        req = sim.post(1, list(range(14)))
+        assert host.pump() == 1 and sim.wait_served(req, timeout_s=5.0)
+        (record,) = host.drain_trace()
+    finally:
+        host.stop()
+    assert len(stage_fields(16)) > len(stage_fields(8)) and stage_trace_rows(16) == 32
+    assert record["lanes"] == 14 and record["rows_asked"] == 14 and record["rows_untraced"] == 0
+    assert [r["row"] for r in record["row_pack"]] == list(range(14))
+    assert record["status"] == "served" and record["done"] > 0
 
 
 if __name__ == "__main__":

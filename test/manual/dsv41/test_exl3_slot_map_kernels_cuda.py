@@ -18,9 +18,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 from lease_chain_rig import EXPERTS, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
-from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS, DEMAND_RING, RECORD_BYTES, RECORD_FIELDS  # noqa: E402
 from sglang.srt.layers.moe.ram_slot_map import LaneKind, type_lanes  # noqa: E402
 
+W = lease.wire_layout(8)
 SPLIT = [0, 1, 1, 2, 3, 3, 4, 5, 5]
 
 
@@ -30,12 +30,12 @@ def _i32(t, offset, count=1):
 
 def _write_delta(c, row, tag, staging, entries=()):
     """The host's delta publication, done by the test: payload, then the tag (x86 keeps tensor stores in order)."""
-    base = lease.DELTA_BASE + row * lease.DELTA_STRIDE
-    f = lease.DELTA_FIELDS
+    base = W.lease_block_bytes + row * W.delta_stride
+    f = W.delta_fields
     block = c.host.lease_block
     _i32(block, base + f["count"])[0] = len(entries)
-    block[base + f["staging"] : base + f["staging"] + 2 * lease.LANES].view(torch.int16)[:] = torch.tensor(
-        list(staging) + [-1] * (lease.LANES - len(staging)), dtype=torch.int16)
+    block[base + f["staging"] : base + f["staging"] + 2 * W.lanes].view(torch.int16)[:] = torch.tensor(
+        list(staging) + [-1] * (W.lanes - len(staging)), dtype=torch.int16)
     for i, (expert, slot) in enumerate(entries):
         block[base + f["entries"] + 4 * i : base + f["entries"] + 4 * i + 4].view(torch.int16)[:] = torch.tensor(
             [expert, slot], dtype=torch.int16)
@@ -44,8 +44,8 @@ def _write_delta(c, row, tag, staging, entries=()):
 
 def _set_host_words(c, *, armed, split=SPLIT):
     block = c.host.lease_block
-    _i32(block, lease.COPY_ARMED)[0] = int(armed)
-    _i32(block, lease.SPLIT, lease.LANES + 1)[:] = torch.tensor(split, dtype=torch.int32)
+    _i32(block, W.copy_armed)[0] = int(armed)
+    _i32(block, W.split, W.lanes + 1)[:] = torch.tensor(split, dtype=torch.int32)
 
 
 def _post(c, experts, row=0, *, captured=False, cpu=False):
@@ -62,9 +62,9 @@ def _post(c, experts, row=0, *, captured=False, cpu=False):
 
 def _chain_of_last_record(c):
     seq = int(c.dev.stats()["posted"]) & 0xFFFFFFFF
-    record = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
+    record = W.demand_ring + (seq - 1) % W.demand_records * W.record_bytes
     page = c.page
-    at = record + RECORD_FIELDS["chain"]
+    at = record + W.record_fields["chain"]
     return int(page[at : at + 8].view(torch.int64)[0])
 
 
@@ -93,13 +93,13 @@ def test_post_types_lanes_like_the_reference(tmp_path, hit_copy, cpu_misses):
         _write_delta(c, 0, 1, staging)  # the attach delta's contents, before the device reads it
         for _ in range(200):
             ram = [-1] * EXPERTS
-            for e, slot in zip(rng.sample(range(EXPERTS), rng.randint(0, 8)), rng.sample(range(8), 8)):
+            for e, slot in zip(rng.sample(range(EXPERTS), rng.randint(0, W.lanes)), rng.sample(range(W.lanes), W.lanes)):
                 ram[e] = slot  # distinct RAM slots, none of them staging, as the host keeps them
             c.dev.map_bulk_apply(torch.tensor([[0, e, s] for e, s in enumerate(ram)], dtype=torch.int32))
             experts = rng.sample(range(EXPERTS), rng.randint(1, TOP_K))
             got = _post(c, experts, captured=True, cpu=True)
             want = type_lanes(experts, ram, staging, SPLIT, captured=True, copy_armed=True, hit_copy=hit_copy,
-                              cpu_on=True, cpu_misses=cpu_misses)
+                              cpu_on=True, cpu_misses=cpu_misses, lanes=W.lanes)
             assert (got[0], got[1]) == ([int(k) for k in want[0]], want[1]), (experts, ram, staging)
             chain = _chain_of_last_record(c)
             if chain:
@@ -126,11 +126,11 @@ def test_post_applies_a_full_delta(idle):
     whole record, not just its first words."""
     c = idle
     _post(c, [5])  # applies the attach delta; the miss makes map chain 2
-    entries = [(e, e % 8) for e in range(lease.DELTA_MAX_ENTRIES)]
+    entries = [(e, e % W.lanes) for e in range(W.delta_max_entries)]
     _write_delta(c, 0, 2, [8, 9, 10, 11, 12, 13], entries)
     kinds, slots = _post(c, [5])
     assert kinds == [LaneKind.HIT_SM] and slots == [5]
-    assert c.device_map(0) == [e % 8 for e in range(EXPERTS)]
+    assert c.device_map(0) == [e % W.lanes for e in range(EXPERTS)]
     assert c.device_staging(0)[:6] == [8, 9, 10, 11, 12, 13]
 
 

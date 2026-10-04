@@ -8,11 +8,9 @@ import hashlib
 
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
-    DEMAND_RECORDS,
-    DEMAND_RING,
     HOT_RECORDS,
-    RECORD_BYTES,
     ExpertStreamHost,
     hot_record_bytes,
     new_page,
@@ -38,7 +36,7 @@ FUNCTIONAL = (
 def build_host(tmp_path, *, variant=None, threaded=False, copy_spin_us=200):
     s = ram_miss_setup(tmp_path, capacity=CAPACITY, layers=LAYERS, experts=EXPERTS, row_images=True,
                        mirror_weights=(1.0, 1.0))
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     hot = torch.zeros(HOT_RECORDS * hot_record_bytes(EXPERTS), dtype=torch.uint8)
     host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((LAYERS, EXPERTS), -1, dtype=torch.int32),
                             hot_page=hot, variant=variant)
@@ -83,13 +81,14 @@ def _digest(t: torch.Tensor) -> str:
 
 
 def _records(page, host) -> list[dict]:
-    """Every posted demand record still in the ring (seq 1..demand_head, the last DEMAND_RECORDS of them): its sequence
+    """Every posted demand record still in the ring (seq 1..demand_head, the last ``demand_records`` of them): its sequence
     word as the ring holds it, and whether the service has handled it."""
     head = page_word(page, "demand_head")
     handled = host.handled_through()
+    w = host.wire
     out = []
-    for seq in range(max(1, head - DEMAND_RECORDS + 1), head + 1):
-        base = DEMAND_RING + (seq - 1) % DEMAND_RECORDS * RECORD_BYTES
+    for seq in range(max(1, head - w.demand_records + 1), head + 1):
+        base = w.demand_ring + (seq - 1) % w.demand_records * w.record_bytes
         out.append({
             "seq": seq,
             "ring_seq": int(page[base : base + 4].view(torch.int32)[0]) & 0xFFFFFFFF,

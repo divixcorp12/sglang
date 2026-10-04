@@ -24,13 +24,16 @@ from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
 
 
+W = lease.wire_layout(8)
+
+
 def write_delta(block: torch.Tensor, row: int, tag: int, staging, entries) -> None:
     """The host's delta publication, done here: payload, then the tag (x86 keeps tensor stores in order)."""
-    base = lease.DELTA_BASE + row * lease.DELTA_STRIDE
-    f = lease.DELTA_FIELDS
+    base = W.lease_block_bytes + row * W.delta_stride
+    f = W.delta_fields
     flat = [v for pair in entries for v in pair]
     block[base + f["count"] : base + f["count"] + 4].view(torch.int32)[0] = len(entries)
-    block[base + f["staging"] : base + f["staging"] + 2 * lease.LANES].view(torch.int16)[:] = torch.tensor(
+    block[base + f["staging"] : base + f["staging"] + 2 * W.lanes].view(torch.int16)[:] = torch.tensor(
         staging, dtype=torch.int16)
     block[base + f["entries"] : base + f["entries"] + 2 * len(flat)].view(torch.int16)[:] = torch.tensor(
         flat, dtype=torch.int16)
@@ -59,7 +62,7 @@ def main() -> None:
                 tag = int(c.dev.map_bank["map_chain"][row])
                 staging = c.dev.map_bank["staging"][row].tolist()
                 entries = [(e, e) for e in range(CAPACITY)] + [(e, -1) for e in range(CAPACITY, EXPERTS)]
-                assert len(entries) == lease.DELTA_MAX_ENTRIES
+                assert len(entries) == W.delta_max_entries
                 write_delta(c.host.lease_block, row, tag, staging, entries)
 
             def post() -> None:

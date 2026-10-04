@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.expert_stream_transport import MAX_IDS
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -48,7 +47,7 @@ def tiers(tmp_path, monkeypatch):
                 ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
-        service.staging_slots = 1
+        service.plan_gather_width(1)
         yield service, streamers
         service.shutdown()
     module.Exl3RamMissService._instance = None
@@ -69,18 +68,29 @@ def _attach(service, streamer, rows, manager=None):
     service.attach(manager if manager is not None else _manager(), streamer)
 
 
-@pytest.mark.parametrize("rows", [1, 6, MAX_IDS])
-def test_a_gather_within_the_lanes_attaches(tiers, rows):
+@pytest.mark.parametrize("rows, lanes", [(1, 8), (6, 8), (8, 8), (12, 16), (16, 16), (32, 32)])
+def test_a_gather_within_the_planned_lanes_attaches(tiers, rows, lanes):
+    """The width is planned before the service starts (Exl3ExpertFormat.plan_graph_gather), and the build's lanes are
+    that width rounded up to 8."""
     service, streamers = tiers
+    service.plan_gather_width(rows)
     _attach(service, streamers[0], rows)
-    assert service.routed_rows_per_step == rows
+    assert service.routed_rows_per_step == rows and service.lanes == lanes
+    assert service.device_side.wire.lanes == lanes
     assert streamers[0].row_backend.device_side is service.device_side
 
 
-@pytest.mark.parametrize("rows", [MAX_IDS + 1, 2 * 6])  # 12: two tokens of a top-6 model
-def test_a_gather_wider_than_the_lanes_is_refused_before_anything_is_built(tiers, rows):
+def test_a_gather_wider_than_32_is_refused_when_planned(tiers):
     service, streamers = tiers
-    with pytest.raises(ValueError, match=rf"gathers up to {rows} rows .* at most {MAX_IDS} lanes"):
+    with pytest.raises(ValueError, match="1..32"):
+        service.plan_gather_width(33)
+
+
+@pytest.mark.parametrize("rows", [9, 2 * 6])  # 12: two tokens of a top-6 model
+def test_a_gather_wider_than_the_built_lanes_is_refused_before_anything_is_built(tiers, rows):
+    """A layer that never planned its width (the service built for 8 lanes) cannot post more lanes than it has."""
+    service, streamers = tiers
+    with pytest.raises(ValueError, match=rf"gathers up to {rows} rows .* at most 8 lanes"):
         _attach(service, streamers[1], rows)
     assert service.device_side is None  # no device words were allocated for it
     assert service.routed_rows_per_step == 0
