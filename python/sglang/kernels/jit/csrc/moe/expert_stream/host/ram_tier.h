@@ -257,11 +257,13 @@ class RamTier {
         if (request.row >= 0 && request.row < layers_ && read_gpu_hot(group, group.next_demand, &request) &&
             load_acquire(record + Wire::kRecSeq) == group.next_demand) {
           apply_gpu_hot(group, request);
-        } else if (request.host_work()) {
+        } else if (has_host_lane(group, request)) {
           fail_stop(
               error_prefix<Layout>() + "request " + std::to_string(group.next_demand) + ": no hot set for it");
         } else {
-          // SM hits only: the device did not wait for this record, so a later post may have lapped its hot record.
+          // No host lane of this group's node: the device does not wait on the group for this record (its misses and
+          // host copies are waited for, an SM hit or another node's lane is not), so a later post may have lapped the
+          // hot record, or the record itself. The group then reads nothing it needs.
           count<kOverruns>(group);
           skip = true;
         }
@@ -272,6 +274,13 @@ class RamTier {
     group.handled.store(group.next_demand, std::memory_order_release);
     group.next_demand = skip_zero(group.next_demand + 1u);
     return true;
+  }
+
+  // True when the record has a lane of the group's node that the device waits on: anything but an SM hit.
+  static bool has_host_lane(const Group& group, const Request& request) {
+    for (const Lane& lane : request.lanes)
+      if (lane.kind != Wire::kKindHitSm && Wire::home(lane.expert) == group.index) return true;
+    return false;
   }
 
   // Pump mode: serves the next record of every group, in order, and returns whether group 0 handled one.
@@ -1130,6 +1139,7 @@ class RamTier {
       ReadFault fault;
       {
         std::lock_guard<std::mutex> guard(faults_.fault_mutex);
+        if (!faults_.fault_pending.load(std::memory_order_relaxed)) return;  // another group's reader took it
         fault = faults_.pending_fault;
         faults_.fault_pending.store(false, std::memory_order_relaxed);
       }
@@ -1338,8 +1348,8 @@ class RamTier {
     if (tier.prefill_owned[slot]) disown_locked(owner_row(row, slot), tier, slot);
   }
 
-  // Takes a slot for a row a Python-side read admits (assign, and the prefill fill path), in the range of `expert`'s home
-  // group.
+  // Takes a slot for a row a Python-side read admits (assign, and the prefill fill path), in the range of `expert`'s
+  // home group.
   //
   // With a prefill share set, no free slot in the range, and the layer already holding that many prefill-owned rows
   // (every group's), the victim is the LRU owned row of the range, under every exclusion of take_slot_locked, so a
@@ -1592,13 +1602,18 @@ class RamTier {
       job.mask |= 1u << j;
     }
     if (NumaNodeDistributor<Source>::miss_nodes(request) != 0) {
-      // Every group follows the row's chain, its own misses or not, so each can check the next one.
-      if (request.chain != own.chain + 1) {
+      // A group's own miss is checked against the row's last published delta, which is exact: the device waits for the
+      // miss's pieces, so the group reads the record before the delta of its chain can publish, and the device posted
+      // it after the delta before it. A group with no miss here may have been lapped (nothing waits on it), so it
+      // checks nothing and only follows the chain. At one node every miss record is the group's own and this is the
+      // row's chain check, as before.
+      if (!plan->missing.empty() && request.chain != dist_.expected_chain(request.row)) {
         fail_record(
             request,
-            "map chain " + std::to_string(request.chain) + ", the row expects " + std::to_string(own.chain + 1));
+            "map chain " + std::to_string(request.chain) + ", the row expects " +
+                std::to_string(dist_.expected_chain(request.row)));
       }
-      own.chain = request.chain;
+      if (request.chain > own.chain) own.chain = request.chain;
     } else if (request.chain != 0) {
       fail_record(request, "map chain " + std::to_string(request.chain) + " on a record without a miss");
     }
@@ -1654,7 +1669,8 @@ class RamTier {
   // Picks the victims and publishes the delta, before any read, so a served chain always has its delta published. A
   // miss lands in its staging slot whatever happens here; whether it is cached is the victim's question. inserted[i] is
   // set when miss i took a victim and is cached once read.
-  void reserve_victims_locked(Group& group, Tier& tier, const Request& request, const RecordPlan& plan, bool* inserted) {
+  void reserve_victims_locked(
+      Group& group, Tier& tier, const Request& request, const RecordPlan& plan, bool* inserted) {
     GroupRow& own = group.rows[request.row];
     DeltaReport part;
     part.staging = own.staging;

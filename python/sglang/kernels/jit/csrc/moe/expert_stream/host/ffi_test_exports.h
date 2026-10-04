@@ -570,7 +570,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return g.subs;
   }
 
-  // Serves one demand record per group on the calling thread: 1 if group 0 served one, 0 if nothing was posted (or it was deferred).
+  // Serves one demand record per group on the calling thread: 1 if group 0 served one, 0 if nothing was posted (or it
+  // was deferred).
   // Throws while the service thread runs. Held under caller_mutex(): pump() consumes the copy-completion ring (and owns
   // the tier), so it is serialized against every other Python caller, whose owned calls and wait_copy_idle drain the
   // same ring. Tests only; no hot-path cost.
@@ -586,7 +587,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   static int64_t pump_group(int64_t handle, int64_t group) {
     const auto tier = find(handle);
     std::lock_guard<std::mutex> caller(tier->caller_mutex());
-    if (tier->threaded()) throw std::runtime_error(error_prefix<Layout>() + "pump_group() while the service thread runs");
+    if (tier->threaded())
+      throw std::runtime_error(error_prefix<Layout>() + "pump_group() while the service thread runs");
     if (group < 0 || group >= tier->groups())
       throw std::runtime_error(error_prefix<Layout>() + "group " + std::to_string(group) + " is out of range");
     return tier->pump_demand(static_cast<int>(group)) ? 1 : 0;

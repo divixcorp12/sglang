@@ -1,8 +1,9 @@
 // The RAM-miss service threads of one RamTier, and its watchdog.
 //
 // RamThread owns the service threads, one per NUMA group, which serve posted demand records through
-// RamTier::pump_demand(g), and one watchdog that aborts the process when a request or a copy wait hangs. It also implements the owner handoff,
-// pause() and resume(), by which a Python caller takes the tier from the service thread and gives it back.
+// RamTier::pump_demand(g), and one watchdog that aborts the process when a request or a copy wait hangs. It also
+// implements the owner handoff, pause() and resume(), by which a Python caller takes the tier from the service threads
+// and gives it back.
 //
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "Parties".
 #pragma once
@@ -18,11 +19,11 @@ namespace expert_stream {
 // With busy_poll it runs on a core of its own (checked by start_thread), spins with no PAUSE and never sleeps. The spin
 // is an idle-poll budget calibrated once in start() (idle_budget), so the thread reads no clock while it serves.
 //
-// Ownership: the tier has one owner at a time, its service threads or a caller that paused them all. pause() and resume() are the
-// handoff; the memory-ordering edges are documented at each. They take the tier's caller_mutex(), which the service
-// thread never takes.
+// Ownership: the tier has one owner at a time, its service threads or a caller that paused them all. pause() and
+// resume() are the handoff; the memory-ordering edges are documented at each. They take the tier's caller_mutex(),
+// which the service threads never take.
 //
-// Teardown: stop() joins the service thread first and the watchdog second, so a join blocked on a hung read is aborted
+// Teardown: stop() joins the service threads first and the watchdog second, so a join blocked on a hung read is aborted
 // by the watchdog's stuck rule instead of hanging the process.
 template <class Tier>
 class RamThread {
@@ -30,7 +31,8 @@ class RamThread {
   using Build = typename Tier::Build;
 
   // `cpu_cores` has one entry per group.
-  RamThread(std::shared_ptr<Tier> tier, std::vector<int> cpu_cores, int64_t fatal_wait_ns, int64_t spin_ns, bool busy_poll)
+  RamThread(
+      std::shared_ptr<Tier> tier, std::vector<int> cpu_cores, int64_t fatal_wait_ns, int64_t spin_ns, bool busy_poll)
       : tier_(std::move(tier)),
         cpu_cores_(std::move(cpu_cores)),
         fatal_wait_ns_(fatal_wait_ns),
@@ -51,11 +53,11 @@ class RamThread {
 
   // Starts the service threads and the watchdog.
   //
-  // Throws when a thread cannot be pinned to its core (every thread is then joined, never left floating), and refuses a tier
-  // whose prefill fill (begun in pump mode) still owes its epilogue: the service would then share the reader with the
-  // fill thread, and the epilogue would run off the owner. It refuses rather than joins because the FFI's start_thread
-  // holds the registry lock, and a join there would stall every handle's calls behind a slow or hung fill read; the
-  // caller must call fill_end() first.
+  // Throws when a thread cannot be pinned to its core (every thread is then joined, never left floating), and refuses a
+  // tier whose prefill fill (begun in pump mode) still owes its epilogue: the service would then share the reader
+  // with the fill thread, and the epilogue would run off the owner. It refuses rather than joins because the FFI's
+  // start_thread holds the registry lock, and a join there would stall every handle's calls behind a slow or hung
+  // fill read; the caller must call fill_end() first.
   //
   // Runs under caller_mutex(), which orders the set_parked/set_threaded writes against every Python caller. The
   // service thread never takes it, so holding it across the pin handshake cannot deadlock.
@@ -115,11 +117,10 @@ class RamThread {
   // the wait, so the slots are not the caller's to touch. The caller must have synchronized the stream first, so every
   // copy wait has seen its CopyDone and the copy thread has nothing left to do.
   //
-  // Edge service -> caller: each loop serves every posted record, then stores its parked_epoch_ (release); pause() loads
-  // them all (acquire), then sets the tier's parked_ (release), which later Python callers acquire in caller_owns(). Each
-  // pause
-  // has its own epoch (odd while requested), so a pause right after a resume cannot take the previous pause's
-  // acknowledgement for its own.
+  // Edge service -> caller: each loop serves every posted record, then stores its parked_epoch_ (release); pause()
+  // loads them all (acquire), then sets the tier's parked_ (release), which later Python callers acquire in
+  // caller_owns(). Each pause has its own epoch (odd while requested), so a pause right after a resume cannot take
+  // the previous pause's acknowledgement for its own.
   //
   // Not reentrant: the one owner of the pairing is the slot table's depth counter (pause at depth 0->1, resume at
   // 1->0).

@@ -56,6 +56,12 @@ class NumaNodeDistributor {
     return nodes;
   }
 
+  // The chain a miss record of `row` must carry: the one after the row's last published delta. Exact for a group with
+  // a miss in the record being served, since that delta cannot publish without this group's report.
+  uint64_t expected_chain(int64_t row) const {
+    return rows_[row].written.load(std::memory_order_acquire) + 1;
+  }
+
   // reserve_staging's lists: group g's slots before any record. The owner, before any thread runs.
   void seed(int64_t row, int g, const FixedVec<int32_t, Wire::kLanes>& staging) {
     rows_[row].staging[g] = staging;
