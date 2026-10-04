@@ -52,7 +52,8 @@ struct LeaseLayout {
   static constexpr int64_t kRecHeaderBytes = wire_round_up(kRecProtectCount + (kPackedCounts ? 0 : 1), 16);
   static constexpr int64_t kRecProtect = kRecHeaderBytes;         // i16[kLanes]
   static constexpr int64_t kRecLaneExpert = kRecProtect + 2 * kLanes;   // i16[kLanes]
-  static constexpr int64_t kRecLaneSlot = kRecLaneExpert + 2 * kLanes;  // i16[kLanes]: a hit's RAM slot, a miss's staging slot
+  // i16[kLanes]: a hit's RAM slot, a miss's staging slot
+  static constexpr int64_t kRecLaneSlot = kRecLaneExpert + 2 * kLanes;
   static constexpr int64_t kRecLaneDst = kRecLaneSlot + 2 * kLanes;     // i16[kLanes]: the VRAM destination slot
   static constexpr int64_t kRecLaneWeight = kRecLaneDst + 2 * kLanes;   // f32[kLanes]
   static constexpr int64_t kRecPayloadEnd = kRecLaneWeight + 4 * kLanes;

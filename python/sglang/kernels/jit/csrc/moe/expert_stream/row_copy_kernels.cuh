@@ -351,7 +351,8 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
   // Only a teardown opens a gate without CopyDone: the service is gone, and the copies may not have landed.
-  if (ld_acquire_sys64(p.lease + Wire::kLeaseCopyDone + ring_index(seq) * Wire::kLeaseCopyDoneBytes) != generation) __trap();
+  if (ld_acquire_sys64(p.lease + Wire::kLeaseCopyDone + ring_index(seq) * Wire::kLeaseCopyDoneBytes) != generation)
+    __trap();
   if (p.cpu_lanes != nullptr) {
     p.cpu_lanes[0] = p.ce_mask[1];
     p.cpu_lanes[1] = p.ce_mask[2] & 0x3;

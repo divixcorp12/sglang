@@ -105,7 +105,9 @@ class RamTier {
         experts_(tables.experts),
         reader_(std::move(tables), direct),
         tiers_(static_cast<size_t>(layers_)) {
-    hot_stride_ = ((Wire::kHotHeaderBytes + (experts_ + 7) / 8 + Wire::kHotAlignment - 1) / Wire::kHotAlignment) * Wire::kHotAlignment;
+    hot_stride_ =
+        ((Wire::kHotHeaderBytes + (experts_ + 7) / 8 + Wire::kHotAlignment - 1) / Wire::kHotAlignment) *
+        Wire::kHotAlignment;
     if (hot_page_ != nullptr && hot_bytes != Wire::kHotRecords * hot_stride_)
       throw std::runtime_error(error_prefix<Layout>() + "hot bitmap sidecar size disagrees with expert count");
     for (int64_t row = 0; row < layers_; ++row) {
@@ -591,8 +593,8 @@ class RamTier {
     copy_engine_->set_table(row, std::move(table), dst_rows);
   }
 
-  // Arms or disarms the copy engine. The device reads Wire::kCopyArmed at every post and types copy-engine and CPU lanes only
-  // while it is 1.
+  // Arms or disarms the copy engine. The device reads Wire::kCopyArmed at every post and types copy-engine and CPU
+  // lanes only while it is 1.
   void arm_copy_engine(bool on) {
     if (on && copy_engine_ == nullptr)
       throw std::runtime_error(error_prefix<Layout>() + "the copy engine is not enabled");
@@ -603,8 +605,8 @@ class RamTier {
   // ---- CPU experts ----
 
   // Creates the CPU expert engine. The device types a captured post's CPU lanes as the last split[n] of its n eligible
-  // lanes (Wire::kSplit, written here and by set_cpu_split). The service hands them to the CPU expert thread and the copy
-  // thread waits for them, so CopyDone covers them. Needs the copy engine; call before the service thread starts.
+  // lanes (Wire::kSplit, written here and by set_cpu_split). The service hands them to the CPU expert thread and the
+  // copy thread waits for them, so CopyDone covers them. Needs the copy engine; call before the service thread starts.
   void enable_cpu_experts(CpuExpertConfig config, std::vector<int64_t> split) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");
@@ -1664,7 +1666,8 @@ class RamTier {
       const int32_t lane = miss_lane[i];
       if (request.lanes[lane].kind != Wire::kKindMissGpu) continue;
       uint8_t* word =
-          lease_ + Wire::kLeasePieceMask + (idx * Wire::kLanes + static_cast<int64_t>(lane)) * Wire::kLeasePieceMaskLineBytes;
+          lease_ + Wire::kLeasePieceMask +
+          (idx * Wire::kLanes + static_cast<int64_t>(lane)) * Wire::kLeasePieceMaskLineBytes;
       store_release64(word, piece_word(request.gen));
       PieceTarget& target = piece_targets_[i];
       target.words[target.count++] = reinterpret_cast<uint64_t*>(word);

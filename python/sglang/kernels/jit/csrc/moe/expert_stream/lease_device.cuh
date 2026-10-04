@@ -195,6 +195,15 @@ SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& 
   constexpr int L = Wire::kLanes;
   constexpr int kHeaderWords = static_cast<int>((Wire::kRecHeaderBytes - Wire::kRecEpoch) / 4);
   static_assert(kHeaderWords % 4 == 0 && L % 8 == 0, "the header and lane arrays are whole 16-byte stores");
+  static_assert(
+      Wire::kRecCounts == Wire::kRecRow + 2 && Wire::kRecFlags == Wire::kRecRow + 3,
+      "row, counts and flags are one u32 store");
+  static_assert(
+      Wire::kRecChain % 8 == 0 && Wire::kRecKinds == Wire::kRecEpoch + 4,
+      "chain is one v2 store; epoch and kinds one v4");
+  static_assert(
+      Wire::kDemandRing % 128 == 0 && Wire::kRecordBytes % 128 == 0,
+      "a record's lines are whole 128-byte prefetch pairs");
   if (f.count > L || f.protect_count > L) __trap();
   uint32_t protect_w[L / 2], expert_w[L / 2], slot_w[L / 2], dst_w[L / 2], weight_w[L];
   uint32_t header_w[kHeaderWords] = {};
@@ -232,14 +241,17 @@ SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& 
     st_relaxed_sys_v4(record + Wire::kRecEpoch + 4 * w, header_w[w], header_w[w + 1], header_w[w + 2], header_w[w + 3]);
 #pragma unroll
   for (int w = 0; w < L / 2; w += 4) {
-    st_relaxed_sys_v4(record + Wire::kRecProtect + 4 * w, protect_w[w], protect_w[w + 1], protect_w[w + 2], protect_w[w + 3]);
-    st_relaxed_sys_v4(record + Wire::kRecLaneExpert + 4 * w, expert_w[w], expert_w[w + 1], expert_w[w + 2], expert_w[w + 3]);
+    st_relaxed_sys_v4(
+        record + Wire::kRecProtect + 4 * w, protect_w[w], protect_w[w + 1], protect_w[w + 2], protect_w[w + 3]);
+    st_relaxed_sys_v4(
+        record + Wire::kRecLaneExpert + 4 * w, expert_w[w], expert_w[w + 1], expert_w[w + 2], expert_w[w + 3]);
     st_relaxed_sys_v4(record + Wire::kRecLaneSlot + 4 * w, slot_w[w], slot_w[w + 1], slot_w[w + 2], slot_w[w + 3]);
     st_relaxed_sys_v4(record + Wire::kRecLaneDst + 4 * w, dst_w[w], dst_w[w + 1], dst_w[w + 2], dst_w[w + 3]);
   }
 #pragma unroll
   for (int w = 0; w < L; w += 4)
-    st_relaxed_sys_v4(record + Wire::kRecLaneWeight + 4 * w, weight_w[w], weight_w[w + 1], weight_w[w + 2], weight_w[w + 3]);
+    st_relaxed_sys_v4(
+        record + Wire::kRecLaneWeight + 4 * w, weight_w[w], weight_w[w + 1], weight_w[w + 2], weight_w[w + 3]);
   st_release_sys(record + Wire::kRecSeq, seq);
 }
 
@@ -276,7 +288,7 @@ SGL_DEVICE bool await_map_delta(const uint8_t* delta, const RowMap& map, uint64_
 
 // Loads the delta's payload. Call only after await_map_delta's acquire of the tag.
 SGL_DEVICE MapDelta load_map_delta(const uint8_t* delta) {
-  constexpr int kStagingLoads = Wire::kLanes / 8;  // node 0's list; Phase 2 reads every node's
+  constexpr int kStagingLoads = Wire::kLanes / 8;  // node 0's staging list: the only node a post applies
   constexpr int kEntryLoads = static_cast<int>(Wire::kDeltaMaxEntries / 4);
   static_assert(Wire::kDeltaStaging % 16 == 0 && Wire::kDeltaEntries % 16 == 0, "16-byte delta loads");
   MapDelta d;
@@ -369,9 +381,9 @@ SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kLanes + 1
 // Types each lane of the plan: its kind and source slot. Transcribes ram_slot_map.type_lanes, the host reference.
 //
 // A hit takes its RAM slot and the m-th miss the m-th staging slot. The CPU takes the last split[n] of the n eligible
-// lanes in plan order. Traps where the reference raises: a plan wider than Wire::kLanes, an expert out of range or repeated,
-// a hit slot past the row's capacity, a miss with no staging slot, a split entry above n. Reads no host memory; the
-// caller loads the split table into the policy.
+// lanes in plan order. Traps where the reference raises: a plan wider than Wire::kLanes, an expert out of range or
+// repeated, a hit slot past the row's capacity, a miss with no staging slot, a split entry above n. Reads no host
+// memory; the caller loads the split table into the policy.
 SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
   if (plan.count > Wire::kLanes) __trap();
   int64_t expert[Wire::kLanes];
