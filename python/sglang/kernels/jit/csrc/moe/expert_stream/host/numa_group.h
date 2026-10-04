@@ -10,10 +10,9 @@ namespace sglang::expert_stream {
 struct GroupRow {
   int64_t lo = 0;  // the group's slots of the row are [lo, hi)
   int64_t hi = 0;
-  // Its staging slots, in the order the device gives them to this node's misses, and the row's map chain as this
-  // group last served it (0: reserve_staging has not run, so the row serves no miss).
+  // Its staging slots, in the order the device gives them to this node's misses.
   FixedVec<int32_t, Wire::kLanes> staging;
-  uint64_t chain = 0;
+  bool staging_reserved = false;  // reserve_staging has run; until then the row serves no miss
   int64_t owned = 0;  // prefill-owned slots of the range (Tier::prefill_owned)
 };
 

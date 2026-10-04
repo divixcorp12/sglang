@@ -826,7 +826,7 @@ class RamTier {
       const Tier& tier = tiers_[row];
       for (int g = 0; g < dist_.size(); ++g) {
         const GroupRow& own = dist_.group(g).rows[row];
-        if (own.chain != 0) throw std::runtime_error(error_prefix<Layout>() + "reserve_staging is once");
+        if (own.staging_reserved) throw std::runtime_error(error_prefix<Layout>() + "reserve_staging is once");
         if (own.hi - own.lo < 2)
           throw std::runtime_error(
               error_prefix<Layout>() + "row " + std::to_string(row) + " has too few slots to stage" +
@@ -845,7 +845,7 @@ class RamTier {
           tier.state[slot] = kStaging;
           own.staging.push_back(static_cast<int32_t>(slot));
         }
-        own.chain = 1;
+        own.staging_reserved = true;
         dist_.seed(row, g, own.staging);
       }
       dist_.publish_seed(lease_, row);
@@ -1613,7 +1613,6 @@ class RamTier {
             "map chain " + std::to_string(request.chain) + ", the row expects " +
                 std::to_string(dist_.expected_chain(request.row)));
       }
-      if (request.chain > own.chain) own.chain = request.chain;
     } else if (request.chain != 0) {
       fail_record(request, "map chain " + std::to_string(request.chain) + " on a record without a miss");
     }

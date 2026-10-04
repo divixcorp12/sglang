@@ -128,6 +128,7 @@ def test_a_faulted_read_refuses_on_prod(tmp_path):
 # the C++ refusal is pinned too (a wrapper that forgot to refuse would otherwise reach a silent C++ fallback).
 RAW_EXPORTS = {
     "inject": lambda m, h: m.expert_stream_inject(h, 0, 1, 0),
+    "pump_group": lambda m, h: m.expert_stream_pump_group(h, 0),
     "inject_fault": lambda m, h: m.expert_stream_inject_fault(h, ops._fault_tensor(part=0, part_error=5)),
     "copy_engine_fail": lambda m, h: m.expert_stream_copy_engine_fail(h, 1, 0),
     "copy_engine_ballast": lambda m, h: m.expert_stream_copy_engine_ballast(h, 0, 0, 0),

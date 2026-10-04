@@ -7,7 +7,7 @@
 //
 //   reader     read_rows, read_rows_traced, read_rows_faulted, read_rows_sqes, read_rows_pieces, piece_geometry,
 //              publish_piece: one synchronous read through the reader, with traces and injected faults
-//   tier       pump, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
+//   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_forward_address, test_keep_warm_address, test_keep_warm_calls, pause_ns
@@ -585,13 +585,18 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // Serves one demand record of group `group` alone, on the calling thread: 1 if it served one. Under the same rules as
   // pump(); the other groups stay where they are, so a test can leave one group behind the device.
   static int64_t pump_group(int64_t handle, int64_t group) {
-    const auto tier = find(handle);
-    std::lock_guard<std::mutex> caller(tier->caller_mutex());
-    if (tier->threaded())
-      throw std::runtime_error(error_prefix<Layout>() + "pump_group() while the service thread runs");
-    if (group < 0 || group >= tier->groups())
-      throw std::runtime_error(error_prefix<Layout>() + "group " + std::to_string(group) + " is out of range");
-    return tier->pump_demand(static_cast<int>(group)) ? 1 : 0;
+    if constexpr (!Build::kFaults) {
+      (void)handle, (void)group;
+      test_only("pump_group");
+    } else {
+      const auto tier = find(handle);
+      std::lock_guard<std::mutex> caller(tier->caller_mutex());
+      if (tier->threaded())
+        throw std::runtime_error(error_prefix<Layout>() + "pump_group() while the service thread runs");
+      if (group < 0 || group >= tier->groups())
+        throw std::runtime_error(error_prefix<Layout>() + "group " + std::to_string(group) + " is out of range");
+      return tier->pump_demand(static_cast<int>(group)) ? 1 : 0;
+    }
   }
 
   // Fills `out` with RamTier::slot_info's three words per slot of `row`.

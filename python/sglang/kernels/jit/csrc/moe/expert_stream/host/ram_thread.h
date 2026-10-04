@@ -60,7 +60,7 @@ class RamThread {
   // fill read; the caller must call fill_end() first.
   //
   // Runs under caller_mutex(), which orders the set_parked/set_threaded writes against every Python caller. The
-  // service thread never takes it, so holding it across the pin handshake cannot deadlock.
+  // service threads never take it, so holding it across the pin handshake cannot deadlock.
   void start() {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
     if (tier_->fill_owed()) {
@@ -151,7 +151,7 @@ class RamThread {
     return 1;
   }
 
-  // Hands the tier back to the service thread. Safe after a timed-out or refused pause (which already resumed).
+  // Hands the tier back to the service threads. Safe after a timed-out or refused pause (which already resumed).
   void resume() {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
     resume_locked();

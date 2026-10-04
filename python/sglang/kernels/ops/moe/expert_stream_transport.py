@@ -117,6 +117,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "seqlock_stress",
     "pause_ns",
     "read_record_fields",
+    "pump_group",
 )
 
 
