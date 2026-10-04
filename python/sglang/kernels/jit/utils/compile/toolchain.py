@@ -87,6 +87,9 @@ def host_compiler_path() -> str:
     return os.environ.get("CXX", "c++")
 
 
+_NEVER_EMITTED_MACROS = frozenset({"#define __SGX__ 1"})
+
+
 def _compiler_output(args: List[str]) -> str:
     return subprocess.run(
         args, check=True, capture_output=True, text=True, timeout=30
@@ -100,9 +103,12 @@ def host_arch_flags() -> List[str]:
     ``-march=native`` is never emitted: the flags are hashed into the build key, and
     a cached .so keyed by the literal ``native`` would match on a different CPU and
     die with SIGILL. The compiler is asked what ``native`` means here instead. The
-    answer is used only if ``-march=<name>`` predefines the same macros as native;
-    a VM masking features or an unknown CPU does not, and then the compiler's own
-    default arch is kept.
+    answer is used only if ``-march=<name>`` enables nothing that native does not
+    (compared by predefined macros); a VM masking features or an unknown CPU makes
+    it enable more, and then the compiler's own default arch is kept. Native
+    enabling *more* than the name (``__ABM__``, ``__RTM__`` on divix01) only costs
+    those instructions, and ``__SGX__`` is never emitted by codegen, so a name that
+    carries it for the CPU family is still safe.
 
     ``SGLANG_JIT_HOST_MARCH`` overrides: ``default`` keeps the compiler's arch, and
     any other value is passed as ``-march=<value>`` (building for another machine).
@@ -131,11 +137,13 @@ def host_arch_flags() -> List[str]:
             error,
         )
         return []
-    if native != named:
+    beyond_native = named - native - _NEVER_EMITTED_MACROS
+    if beyond_native:
         logger.warning(
-            "-march=%s does not define the same macros as -march=native on this CPU; "
-            "JIT host code keeps the compiler's default arch.",
+            "-march=%s enables %s, which -march=native does not on this CPU; JIT "
+            "host code keeps the compiler's default arch.",
             name,
+            sorted(beyond_native),
         )
         return []
     return [f"-march={name}"]
