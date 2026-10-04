@@ -764,10 +764,8 @@ def test_the_layout_is_read_from_the_module_the_launch_builds(tiers, monkeypatch
     asked = []
     monkeypatch.setattr(module, "host_layout", lambda **kwargs: asked.append(kwargs) or (EXL3_STREAMED_NAMES, 0))
     service.plan_gather_width(12)
-    service.resolved_lanes()
-    with pytest.raises(Exception):
-        service.ensure_started()
-    assert asked and asked[0] == {"lanes": 16}
+    service.ensure_started()
+    assert asked == [{"lanes": 16}]
 
 
 def test_the_wire_and_lanes_are_unreadable_before_the_service_starts(tiers):
