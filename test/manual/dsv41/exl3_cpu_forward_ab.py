@@ -188,7 +188,7 @@ def dump(args):
     if args.registration == "engines":
         from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
-        cores = parse_cores(args.cores or "")
+        cores = parse_cores(args.cores)
         if len(cores) != 2 * THREADS:
             sys.exit(f"--cores must list {2 * THREADS} cores (two engines of {THREADS} workers), got {len(cores)}")
         engine_trait = Exl3CpuQuantTrait(ext, act_limit=LIMITS[0])
@@ -257,6 +257,8 @@ def main():
     c.add_argument("want")
     c.add_argument("got")
     args = parser.parse_args()
+    if args.cmd == "dump" and args.registration == "engines" and not args.cores:
+        parser.error(f"--registration engines needs --cores: a taskset list of {2 * THREADS} cores")
     dump(args) if args.cmd == "dump" else compare(args)
 
 

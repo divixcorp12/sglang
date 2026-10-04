@@ -119,16 +119,21 @@ Options parse_options(int& argc, char** argv) {
   return opt;
 }
 
-// Splits `text` on `separator`; throws unless there are exactly kGroups entries, one per NUMA group.
+// Splits `text` on `separator`; throws unless there are exactly kGroups entries, one per NUMA group, none empty.
 std::vector<std::string> per_group(const std::string& text, char separator, const char* flag) {
   std::vector<std::string> entries;
-  std::stringstream list(text);
-  std::string entry;
-  while (std::getline(list, entry, separator))
-    entries.push_back(entry);
+  size_t begin = 0;
+  for (;;) {  // not getline: it drops a trailing empty entry, so "18-33/" would pass at one group
+    const size_t end = text.find(separator, begin);
+    entries.push_back(text.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
   if (static_cast<int>(entries.size()) != kGroups)
     throw std::runtime_error(
         std::string(flag) + ": give one entry per NUMA group (" + std::to_string(kGroups) + "), got " + text);
+  for (const std::string& entry : entries)
+    if (entry.empty()) throw std::runtime_error(std::string(flag) + ": an empty entry in " + text);
   return entries;
 }
 
@@ -306,15 +311,16 @@ class Bench {
     stack_ = std::make_unique<Stack<BenchBuild>>(stack_config(fixture_, placement_, options_, engines_));
     sim_ = std::make_unique<DeviceSim>(stack_->page(), stack_->lease(), rows(), fixture_.experts());
     const int64_t timeout_ns = int64_t{options_.wait_timeout_ms} * 1'000'000;
-    // Group-major, so each group's experts arrive in consecutive posts of its kStaging staging slots: that is the
-    // order in which the tier maps a group's j-th expert at its j-th slot (StackFixture::slot_of).
-    std::vector<int32_t> all;
-    for (int g = 0; g < kGroups; ++g)
-      for (int32_t e = 0; e < fixture_.experts(); ++e)
-        if (es::Wire::home(e) == g) all.push_back(e);
+    // One load per group, so no post mixes groups' misses: each group's experts then arrive ascending in posts of its
+    // kStaging staging slots, the order in which the tier maps a group's j-th expert at its j-th slot
+    // (StackFixture::slot_of).
+    std::vector<std::vector<int32_t>> by_group(kGroups);
+    for (int32_t e = 0; e < fixture_.experts(); ++e)
+      by_group[es::Wire::home(e)].push_back(e);
     for (int64_t row = 0; row < rows(); ++row) {
-      load_experts(*sim_, row, all, static_cast<int>(StackFixture::kStaging), timeout_ns);
-      for (int32_t e : all)
+      for (const std::vector<int32_t>& group : by_group)
+        if (!group.empty()) load_experts(*sim_, row, group, static_cast<int>(StackFixture::kStaging), timeout_ns);
+      for (int32_t e = 0; e < fixture_.experts(); ++e)
         if (sim_->ram_slot(row, e) != StackFixture::slot_of(e))
           throw std::runtime_error(
               "row " + std::to_string(row) + ": the tier put expert " + std::to_string(e) + " in slot " +
