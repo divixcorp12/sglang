@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_stream_transport as transport
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, TransportBuild, new_page
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
@@ -68,7 +69,7 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
         transport, "_host_module",
         lambda layout="exl3", variant=None, lanes=8: loaded.append(layout) or real(layout, variant, lanes),
     )
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     slot_map = torch.full(tuple(t.starts.shape), -1, dtype=torch.int32)
     host = ExpertStreamHost(tables, page=page, slot_map=slot_map, layout="two")
     try:

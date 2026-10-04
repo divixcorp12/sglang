@@ -1162,11 +1162,8 @@ def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
     return float(_host_module(layout, variant).expert_stream_pause_ns())
 
 
-def new_page(
-    *, pin: bool, wire: Optional[expert_lease_block.WireLayout] = None
-) -> torch.Tensor:
-    """A zeroed request page of ``wire`` (default ``wire_layout(8)``); pinned (device-readable through UVA) for a real device."""
-    wire = expert_lease_block.wire_layout(8) if wire is None else wire
+def new_page(*, pin: bool, wire: expert_lease_block.WireLayout) -> torch.Tensor:
+    """A zeroed request page of ``wire``; pinned (device-readable through UVA) for a real device."""
     return torch.zeros(wire.page_bytes, dtype=torch.uint8, pin_memory=pin)
 
 

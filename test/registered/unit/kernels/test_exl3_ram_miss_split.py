@@ -8,6 +8,7 @@ import tempfile
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_once, read_rows_traced
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
@@ -253,7 +254,7 @@ def test_open_refuses_a_mirror_copy_of_the_wrong_size_naming_both_files(tmp_path
     for attempt in (
         lambda: read_rows_once(s.tables, 0, [0], [0]),
         lambda: ops.ExpertStreamHost(
-            s.tables, page=ops.new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32)
+            s.tables, page=ops.new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32)
         ),
     ):
         with pytest.raises(RuntimeError) as caught:

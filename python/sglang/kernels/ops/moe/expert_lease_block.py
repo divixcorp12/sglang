@@ -190,28 +190,25 @@ def gate_word(seq: int, low: str) -> int:
     return ((seq & GATE_SEQ_MASK) << GATE_SEQ_SHIFT) | GATE[low]
 
 
-def lease_block_bytes(rows: int, wire: WireLayout | None = None) -> int:
+def lease_block_bytes(rows: int, *, wire: WireLayout) -> int:
     """Return the lease block size: the completion block plus ``rows`` delta records.
 
-    The delta region starts at ``wire.lease_block_bytes`` and is rounded up to whole pages. ``wire`` defaults to
-    ``wire_layout(8)``.
+    The delta region starts at ``wire.lease_block_bytes`` and is rounded up to whole pages.
     """
-    wire = wire_layout(8) if wire is None else wire
     if rows < 1:
         raise ValueError(f"the lease block needs at least one row, got {rows}")
     return wire.lease_block_bytes + _round_up(rows * wire.delta_stride, wire.block_align)
 
 
-def new_lease_block(rows: int, *, pin: bool, wire: WireLayout | None = None) -> torch.Tensor:
-    """Allocate a zeroed, aligned uint8 block of ``lease_block_bytes(rows, wire)`` bytes.
+def new_lease_block(rows: int, *, pin: bool, wire: WireLayout) -> torch.Tensor:
+    """Allocate a zeroed, aligned uint8 block of ``lease_block_bytes(rows, wire=wire)`` bytes.
 
     The block is pinned when ``pin`` is set (a real device). Neither ``torch.zeros``
     nor the pinned allocator promises 4096-byte alignment, so the allocation carries
     one page of slack and the returned view starts at the aligned address; the view
     keeps the storage alive.
     """
-    wire = wire_layout(8) if wire is None else wire
-    size = lease_block_bytes(rows, wire)
+    size = lease_block_bytes(rows, wire=wire)
     raw = torch.zeros(size + wire.block_align, dtype=torch.uint8, pin_memory=pin)
     start = (-raw.data_ptr()) % wire.block_align
     block = raw[start : start + size]
@@ -220,15 +217,14 @@ def new_lease_block(rows: int, *, pin: bool, wire: WireLayout | None = None) -> 
 
 
 def check_lease_block(
-    block: torch.Tensor, rows: int, *, need_pinned: bool, wire: WireLayout | None = None
+    block: torch.Tensor, rows: int, *, need_pinned: bool, wire: WireLayout
 ) -> None:
     """Raise ValueError for a block the kernels and the service cannot address."""
-    wire = wire_layout(8) if wire is None else wire
     if block.dtype != torch.uint8 or block.device.type != "cpu" or block.dim() != 1:
         raise ValueError("the lease block must be a 1-D CPU uint8 tensor")
-    if block.numel() != lease_block_bytes(rows, wire):
+    if block.numel() != lease_block_bytes(rows, wire=wire):
         raise ValueError(
-            f"the lease block has {block.numel()} bytes, not {lease_block_bytes(rows, wire)} for {rows} rows"
+            f"the lease block has {block.numel()} bytes, not {lease_block_bytes(rows, wire=wire)} for {rows} rows"
         )
     if not block.is_contiguous():
         raise ValueError("the lease block must be contiguous")

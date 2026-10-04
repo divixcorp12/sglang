@@ -45,7 +45,7 @@ def tier(tmp_path, request):
     """(capacity, staging slots per row): 4 and 1 by default, so three rows are mappable."""
     capacity, k = getattr(request, "param", (4, 1))
     s = ram_miss_setup(tmp_path, capacity=capacity)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
     host.reserve_staging(k)
@@ -74,7 +74,7 @@ def test_gpu_hot_sidecar_protects_a_victim_and_a_resident_lane_reads_nothing(tmp
     """The hot set applies before the census and serve: expert 0 is the oldest resident row, but hot, so the read of
     expert 3 takes another slot. Mutation: apply_gpu_hot after serve, or not at all."""
     s = ram_miss_setup(tmp_path, capacity=4)
-    page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
+    page, hot_page = new_page(pin=False, wire=wire_layout(8)), new_hot_page(6, pin=False)
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map, hot_page=hot_page)
     host.reserve_staging(1)
@@ -175,7 +175,7 @@ def mirrored_tier(tmp_path):
     for slot in range(6):
         for name in EXL3_STREAMED_NAMES:
             s.slabs[1][name][slot].view(torch.uint8).fill_(0xAB)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = ExpertStreamHost(s.tables, page=page, slot_map=slot_map)
     host.reserve_staging(3)
@@ -337,10 +337,11 @@ def test_the_seqlock_reader_never_accepts_a_torn_record():
 
 _MAPPING_ROW = """
 import pathlib, sys, torch
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 s = ram_miss_setup(pathlib.Path(sys.argv[1]))
-host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
+host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
 try:
     host._module.expert_stream_mapping(host.handle, host.layers, torch.empty(host.experts, dtype=torch.int64))
     print("no refusal")
@@ -436,8 +437,8 @@ def test_a_repeated_protect_id_takes_one_slot(tier):
 @pytest.mark.parametrize(
     "page_fn, map_fn",
     [
-        (lambda: new_page(pin=False), lambda: torch.full((6, 2), -1, dtype=torch.int32).t()),
-        (lambda: new_page(pin=False), lambda: torch.zeros((2, 6), dtype=torch.int32)),
+        (lambda: new_page(pin=False, wire=wire_layout(8)), lambda: torch.full((6, 2), -1, dtype=torch.int32).t()),
+        (lambda: new_page(pin=False, wire=wire_layout(8)), lambda: torch.zeros((2, 6), dtype=torch.int32)),
         (lambda: torch.zeros(2 * PAGE_BYTES, dtype=torch.uint8)[::2], lambda: torch.full((2, 6), -1, dtype=torch.int32)),
     ],
     ids=["transposed_map", "map_not_empty", "strided_page"],
@@ -505,7 +506,7 @@ def test_stop_live_closes_every_host_even_when_one_fails(tmp_path, monkeypatch, 
         s = ram_miss_setup(tmp_path / str(i))
         hosts.append(
             ExpertStreamHost(
-                s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32)
+                s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32)
             )
         )
 

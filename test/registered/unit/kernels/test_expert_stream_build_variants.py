@@ -5,6 +5,7 @@ process writes a stream trace or injects a RAM-miss fault."""
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
@@ -41,7 +42,7 @@ def test_a_ram_miss_fault_selects_the_instrumented_build(no_override):
 def test_each_module_names_its_build_and_a_host_keeps_the_one_it_loaded(variant, tmp_path):
     assert str(ops._host_module("exl3", variant).expert_stream_build_name()) == variant
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant=variant)
     try:
         assert host.variant == variant
@@ -56,7 +57,7 @@ def test_an_unknown_variant_is_refused():
 
 def test_a_production_host_reports_only_the_core_counters(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant="prod")
     try:
         assert tuple(host.counters()) == ops.CORE_COUNTERS
@@ -66,7 +67,7 @@ def test_a_production_host_reports_only_the_core_counters(tmp_path):
 
 def test_the_instrumented_host_still_reports_every_counter(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant="instr")
     try:
         assert tuple(host.counters()) == tuple(ops.COUNTERS) and set(ops.CORE_COUNTERS) < set(ops.COUNTERS)
@@ -108,7 +109,7 @@ TEST_ONLY_CALLS = {
 @pytest.mark.parametrize("name", sorted(TEST_ONLY_CALLS))
 def test_test_only_calls_refuse_on_prod(name, tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant="prod")
     try:
         with pytest.raises(RuntimeError, match="instrumented host build"):
@@ -150,7 +151,7 @@ def test_every_test_only_export_is_listed_and_exported_by_both_builds():
 @pytest.mark.parametrize("name", sorted(RAW_EXPORTS))
 def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant="prod")
     try:
         with pytest.raises(RuntimeError, match=f"{name} is test-only: it exists in the instrumented host build"):

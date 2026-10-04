@@ -7,6 +7,7 @@ import time
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -28,7 +29,7 @@ def hang_guard():
 def _host(s, **kwargs):
     return ExpertStreamHost(
         s.tables,
-        page=new_page(pin=False),
+        page=new_page(pin=False, wire=wire_layout(8)),
         slot_map=torch.full(tuple(s.tables.starts.shape), -1, dtype=torch.int32),
         **kwargs,
     )

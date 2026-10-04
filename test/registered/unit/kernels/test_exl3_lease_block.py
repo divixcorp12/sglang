@@ -46,14 +46,14 @@ def test_the_gate_word_names_its_request_and_only_open_words_pass_the_cyclic_geq
 @pytest.mark.parametrize("rows", [1, 16, 17, 61])
 def test_the_block_is_zeroed_aligned_and_sized_for_its_rows(rows):
     block = lease.new_lease_block(rows, pin=False, wire=W)
-    assert block.numel() == lease.lease_block_bytes(rows, W) and block.data_ptr() % W.block_align == 0
+    assert block.numel() == lease.lease_block_bytes(rows, wire=W) and block.data_ptr() % W.block_align == 0
     assert block.numel() >= W.lease_block_bytes + rows * W.delta_stride and block.numel() % W.block_align == 0
     assert not block.any()
 
 
 @pytest.mark.parametrize("bad", ["dtype", "size", "align", "shape"])
 def test_a_block_the_kernels_cannot_address_is_refused(bad):
-    size = lease.lease_block_bytes(2, W)
+    size = lease.lease_block_bytes(2, wire=W)
     raw = torch.zeros(size + 2 * W.block_align, dtype=torch.uint8)
     good = raw[(-raw.data_ptr()) % W.block_align :][:size]
     blocks = {
@@ -80,7 +80,7 @@ def test_a_block_that_is_not_pinned_is_refused_for_a_cuda_device():
 @pytest.mark.parametrize("lanes", [16, 32])
 def test_a_wider_wire_sizes_its_block_by_its_own_layout(lanes):
     w = lease.wire_layout(lanes)
-    assert lease.lease_block_bytes(1, w) == w.lease_block_bytes + 4096
+    assert lease.lease_block_bytes(1, wire=w) == w.lease_block_bytes + 4096
     block = lease.new_lease_block(1, pin=False, wire=w)
     assert block.numel() == w.lease_block_bytes + 4096
     lease.check_lease_block(block, 1, need_pinned=False, wire=w)

@@ -20,6 +20,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 from lease_chain_rig import CAPACITY, EXPERTS, LAYERS, TOP_K, Chain  # noqa: E402
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.kernels.ops.moe import expert_stream_transport as ops  # noqa: E402
 from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
@@ -168,7 +169,7 @@ def test_the_device_refuses_what_its_kernels_cannot_read(tmp_path):
         kwargs = dict(device="cuda", layers=LAYERS, experts=EXPERTS, timeout_ms=100, piece_runs=c.host.piece_runs(),
                       row_capacities=[CAPACITY] * LAYERS)
         with pytest.raises(ValueError, match="pinned"):
-            ExpertStreamDevice(new_page(pin=False), c.host.lease_block, **kwargs)
+            ExpertStreamDevice(new_page(pin=False, wire=wire_layout(8)), c.host.lease_block, **kwargs)
         with pytest.raises(ValueError, match="row capacities"):
             ExpertStreamDevice(c.page, c.host.lease_block, **{**kwargs, "row_capacities": [CAPACITY]})
         with pytest.raises(ValueError, match="piece_runs"):

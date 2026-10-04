@@ -24,6 +24,7 @@ from pathlib import Path
 
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.kernels.ops.moe.expert_stream_transport import stage_fields
@@ -97,7 +98,7 @@ class Arm:
         root.mkdir()
         self.name, self.trace = name, trace
         self.s = ram_miss_setup(root, capacity=CAPACITY, experts=EXPERTS, row_images=True)
-        self.page = new_page(pin=False)
+        self.page = new_page(pin=False, wire=wire_layout(8))
         # Both arms on the instrumented build: the trace and trace_clock_reads exist only there (plan
         # 2026-09-29-hotpath-zero-overhead Task 10), so the trace-off arm measures InstrBuild with the trace off.
         self.host = ExpertStreamHost(

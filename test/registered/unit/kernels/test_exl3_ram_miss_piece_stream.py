@@ -20,6 +20,7 @@ import pytest
 import torch
 
 import test_exl3_ram_miss_split as split
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
@@ -661,7 +662,7 @@ def test_the_reader_streams_pieces_over_three_to_eight_mirror_parts(tmp_path, we
 def _host(tmp_path, *, weights=(1.0, 1.0)):
     """A tier over row images and ``weights`` mirror parts; the service always streams pieces."""
     s = ram_miss_setup(tmp_path, capacity=6, mirror_weights=weights, hidden=256, inter=512)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=2)
     return s, page, host, ChainSim(host, page, s.slabs)
 

@@ -12,6 +12,7 @@ import time
 
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,7 +26,7 @@ FORWARD_NS = 200_000  # 0.2 ms per expert
 
 def _host(tmp_path, request, keep_warm_us):
     s = ram_miss_setup(tmp_path, capacity=12, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
-    host = attached_host(s, new_page(pin=False), k=3)
+    host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
     host.enable_copy_engine(-1, spin_us=200)
     dst = {n: torch.zeros((DST_ROWS,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
     table = torch.tensor(

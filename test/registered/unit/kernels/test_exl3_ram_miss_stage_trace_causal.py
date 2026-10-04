@@ -12,6 +12,7 @@ import pytest
 import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ops
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, read_rows_traced
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
@@ -33,7 +34,7 @@ def hang_guard():
 def _host(tmp_path, *, trace_capacity=None, capacity=6):
     """A tier and its host; ``trace_capacity`` None leaves the trace off."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=3)
     if trace_capacity is not None:
         host.enable_trace(capacity=trace_capacity)

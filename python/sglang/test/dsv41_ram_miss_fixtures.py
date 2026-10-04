@@ -245,11 +245,12 @@ def attached_host(setup: "RamMissSetup", page: torch.Tensor, *, k: int = 1, slot
 _HOST_SCRIPT_HEAD = """
 import pathlib, sys, time
 import torch
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_hot_page, new_page, page_word
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=int(sys.argv[2]))
-page, hot_page = new_page(pin=False), new_hot_page(6, pin=False)
+page, hot_page = new_page(pin=False, wire=wire_layout(8)), new_hot_page(6, pin=False)
 host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr"%s)
 host.reserve_staging(int(sys.argv[3]))
 sim = ChainSim(host, page, s.slabs)

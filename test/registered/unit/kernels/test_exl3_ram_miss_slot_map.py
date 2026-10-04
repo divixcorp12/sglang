@@ -11,6 +11,7 @@ import time
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
@@ -35,7 +36,7 @@ def hang_guard():
 @pytest.fixture
 def world(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=CAPACITY, layers=1, experts=EXPERTS)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = ExpertStreamHost(
         s.tables, page=page, slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
     )
@@ -81,7 +82,7 @@ def test_a_full_fill_after_the_reservation_never_takes_a_staging_slot(world):
 def test_reserve_staging_clamps_to_the_rows_capacity_minus_one(tmp_path, capacity, want, staged):
     s = ram_miss_setup(tmp_path, capacity=capacity, layers=1, experts=EXPERTS)
     host = ExpertStreamHost(
-        s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
+        s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
     )
     try:
         host.reserve_staging(want)
@@ -93,7 +94,7 @@ def test_reserve_staging_clamps_to_the_rows_capacity_minus_one(tmp_path, capacit
 def test_reserve_staging_refuses_a_row_with_one_slot(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=1, layers=1, experts=EXPERTS)
     host = ExpertStreamHost(
-        s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
+        s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
     )
     try:
         with pytest.raises(RuntimeError, match="row 0 has too few slots to stage"):
@@ -105,14 +106,14 @@ def test_reserve_staging_refuses_a_row_with_one_slot(tmp_path):
 def test_reserve_staging_is_once_and_before_any_slot_is_filled(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=CAPACITY, layers=1, experts=EXPERTS)
     host = ExpertStreamHost(
-        s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
+        s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32), variant="instr"
     )
     try:
         host.assign(0, 3)
         with pytest.raises(RuntimeError, match="before any slot is filled"):
             host.reserve_staging(K)
         fresh = ExpertStreamHost(
-            s.tables, page=new_page(pin=False), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32),
+            s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((1, EXPERTS), -1, dtype=torch.int32),
             variant="instr",
         )
         try:

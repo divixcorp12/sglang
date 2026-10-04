@@ -5,6 +5,7 @@ import faulthandler
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, stage_fields, stage_trace_rows
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -24,7 +25,7 @@ def hang_guard():
 @pytest.fixture
 def tier(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=6)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=2)
     host.enable_trace()
     yield host, ChainSim(host, page, s.slabs)

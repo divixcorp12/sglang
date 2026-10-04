@@ -838,9 +838,17 @@ class Exl3RamMissService:
         """The lane count the service builds for: the widest planned gather, rounded up to 8."""
         return wire_layout(self._gather_planned or 1).lanes
 
+    def staging_width(self) -> int:
+        """The staging slots every row asks for: the planned gather width, else the build's lanes."""
+        return self._gather_planned or self.resolved_lanes()
+
     def staging_for(self, capacity: int) -> int:
         """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""
-        return min(self._gather_planned or self.resolved_lanes(), capacity - 1)
+        return min(self.staging_width(), capacity - 1)
+
+    def planned_padding(self, capacity: int) -> int:
+        """The length of a row backend's ``planned`` tensor: its plan width, and at least the build's lanes."""
+        return max(capacity, self.resolved_lanes())
 
     def row_of(self, layer_id: int) -> int:
         """The service row (position in the tables) of a streamed layer."""
@@ -936,7 +944,7 @@ class Exl3RamMissService:
         try:
             # Before any slot is filled: the hot cache fills the tiers first, after
             # plan_gather_width.
-            host.reserve_staging(self._gather_planned or self.lanes)
+            host.reserve_staging(self.staging_width())
             copy_engine = cfg.enable_ram_miss_copy_engine
             check_sm_small_copies(cfg)
             if copy_engine:

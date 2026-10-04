@@ -53,7 +53,7 @@ def _word(page, offset):
 
 def _host(tmp_path, seed, used):
     s = ram_miss_setup(tmp_path, capacity=6)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     _set_word(page, WORDS["demand_head"], seed)
     if used:
         # The slot a phantom seq 0 would read: (0 - 1) % records, as the service computes it.

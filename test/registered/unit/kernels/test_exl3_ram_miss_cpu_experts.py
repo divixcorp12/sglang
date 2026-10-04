@@ -21,6 +21,7 @@ import time
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertForward
@@ -85,7 +86,7 @@ def _cores() -> list[int]:
 def _host(tmp_path, *, split, forward, copy_engine=True, parts=2):
     # Seven slots, three staging: four mappable rows.
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=3)
     dst = None
     if copy_engine:

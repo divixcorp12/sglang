@@ -9,6 +9,7 @@ import threading
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test import hotpath_script as hp
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
@@ -31,7 +32,7 @@ def hang_guard():
 @pytest.fixture
 def running(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=5, layers=2, experts=8)  # one staging slot: four mappable rows
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page)
     for expert in range(4):
         host.assign(0, expert)  # pump mode: the caller owns the tier
@@ -164,7 +165,7 @@ SLOW_PACK_NS = 300_000_000
 def _fill_host(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=4)
     host = ExpertStreamHost(
-        s.tables, page=new_page(pin=False), slot_map=torch.full(tuple(s.tables.starts.shape), -1, dtype=torch.int32)
+        s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full(tuple(s.tables.starts.shape), -1, dtype=torch.int32)
     )
     return s, host
 

@@ -9,6 +9,7 @@ import os
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 
@@ -19,7 +20,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 def test_calibration_measures_a_link_that_grows_with_the_experts(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=12, mirror_weights=(1.0, 1.0), hidden=2048, inter=4096)
-    host = attached_host(s, new_page(pin=False), k=3)
+    host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
     host.enable_copy_engine(-1, spin_us=200)
     pinned = {n: t.pin_memory() for n, t in s.slabs[ROW].items()}
     table = torch.tensor(

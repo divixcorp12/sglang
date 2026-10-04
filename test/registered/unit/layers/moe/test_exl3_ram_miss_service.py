@@ -226,7 +226,16 @@ def test_the_started_host_and_page_are_built_for_the_resolved_lanes(tiers, width
     wire = lease.wire_layout(lanes)
     assert service.lanes == lanes and service.host.wire == wire
     assert service.page.numel() == wire.page_bytes
-    assert service.host.lease_block.numel() == lease.lease_block_bytes(LAYERS, wire)
+    assert service.host.lease_block.numel() == lease.lease_block_bytes(LAYERS, wire=wire)
+
+
+def test_the_eager_plan_pads_to_the_lane_width(tiers):
+    """An eager post of 9-16 lanes at 16 must fit the planned tensor: it pads to max(capacity, lanes). Mutation:
+    planned_padding returns the capacity."""
+    service, _, _ = tiers
+    service.plan_gather_width(12)
+    assert service.planned_padding(capacity=5) == 16
+    assert service.planned_padding(capacity=40) == 40
 
 
 def test_staging_keeps_a_fill_slot_on_a_small_tier(tiers):
