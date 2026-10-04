@@ -636,9 +636,31 @@ struct HostExports {
         "cpu_cores", TensorMatcher({Wire::kNodes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cpu_cores);
     const auto* core_data = static_cast<const int64_t*>(cpu_cores.data_ptr());
     std::vector<int> cores;
+    bool inherits = false;
     for (int g = 0; g < Wire::kNodes; ++g) {
       if (core_data[g] >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
+      if (core_data[g] >= 64 && core_data[g] <= 71) {
+        throw std::runtime_error(
+            error_prefix<Layout>() + "cores 64-71 are reserved (NVMe completion interrupts are pinned there)");
+      }
+      inherits = inherits || core_data[g] < 0;
       cores.push_back(static_cast<int>(core_data[g]));
+    }
+    if (inherits) {
+      cpu_set_t inherited;
+      CPU_ZERO(&inherited);
+      if (pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited) == 0) {
+        for (int core = 64; core <= 71; ++core) {
+          if (CPU_ISSET(core, &inherited)) {
+            std::fprintf(
+                stderr,
+                "WARNING %sthe service thread inherits an affinity that includes reserved cores 64-71; "
+                "run under taskset -c 0-63 or pass cpu_core\n",
+                error_prefix<Layout>().c_str());
+            break;
+          }
+        }
+      }
     }
     std::shared_ptr<RamTier<Source>> tier = find(handle);
     if (busy_poll != 0) {
