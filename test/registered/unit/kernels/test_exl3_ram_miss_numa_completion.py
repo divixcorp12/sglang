@@ -155,6 +155,31 @@ def test_a_zero_split_keeps_a_node_off_the_cpu_and_copydone_off_its_engine(tmp_p
         host.stop()
 
 
+def test_a_groups_only_host_lane_being_a_cpu_miss_is_waited_for_and_completes_once(tmp_path):
+    """Group 1's only host lane is a CPU miss (the late_cpu / late_seq path): its part carries no copy and no hit job,
+    yet CopyDone waits for group 1's engine, and is stored once. Mutants: drop group 1's bit from CopyJob::groups --
+    red on the early CopyDone; skip the late-CPU wait in the copy thread -- red likewise."""
+    gate = threading.Event()
+    a, b = FakeForward(), FakeForward(gate)
+    s, host, sim, out_rows = _host(tmp_path, [a, b], split=[NONE, [0, 1] + [0] * 7])
+    try:
+        req = sim.post(ROW, [0, 5], captured=True, cpu_on=True, cpu_misses=True, dst=[0, 1], weights=[1.0, 0.5])
+        assert req.kinds == [LaneKind.HIT_COPY, LaneKind.MISS_CPU]
+        assert host.pump() == 1
+        assert _wait(lambda: host.counters()["copy_jobs"] == 4)  # two from the setup post, one part per group here
+        time.sleep(0.05)
+        assert sim.copy_done(req) != req.gen, "CopyDone before group 1's CPU miss finished"
+        gate.set()
+        assert sim.copy_wait(req)
+        assert _wait(lambda: len(b.calls) == 1) and a.calls == []
+        time.sleep(0.05)
+        assert sim.copy_done(req) == req.gen
+        assert host.counters()["cpu_jobs"] == 1
+    finally:
+        gate.set()
+        host.stop()
+
+
 def test_each_groups_split_is_its_own_node_table(tmp_path):
     s, host, sim, out_rows = _host(tmp_path, [FakeForward(), FakeForward()], split=[ONE_OF_TWO, NONE])
     try:
