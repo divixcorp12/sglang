@@ -20,6 +20,7 @@ from cpu_expert_sim import (  # noqa: E402
     _lane_sorter,
     _queue,
     c_cpu_at,
+    cpu_insert_results,
     histogram,
     load_c_cpu_table,
     predict,
@@ -460,3 +461,122 @@ def test_without_protect_reads_a_vram_hot_route_is_not_read_into_ram():
     off = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred", protect_reads=False)
     assert on["residency"]["ram_inserted_rows_per_token"] == 2  # 0 (VRAM-hot, routed) and 2
     assert off["residency"]["ram_inserted_rows_per_token"] == 1  # only the VRAM miss 2
+
+
+def _insert_every_cpu_lane(layer, lanes):
+    return lanes
+
+
+def test_a_cpu_insert_frees_its_victim_now_and_maps_the_expert_a_forward_later():
+    # Shortlist [expert 2, 1, 0]: lane 0 (expert 5, CPU) takes expert 2's slot as a fill, lane 1 (6) expert 1's.
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]}, cpu_insert=_insert_every_cpu_lane)
+    assert sim.resident(0) == {0, 6}
+    assert sim.slots[0][2] == tier_sim.FILLING
+    assert sim.cpu_insert_last == {0: 1} and sim.cpu_insert_issued == 1 and sim.cpu_inserted == 0
+    assert 2 not in sim._rank(0)  # a FILLING slot is never shortlisted
+    sim.graph_forward({0: [0]})
+    assert sim.resident(0) == {0, 5, 6} and sim.cpu_inserted == 1
+    assert tier_sim.FILLING not in sim.slots[0]
+
+
+def test_a_fill_whose_expert_was_inserted_elsewhere_frees_its_slot():
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]}, cpu_insert=_insert_every_cpu_lane)
+    sim.graph_forward({0: [5]})  # 5 misses (its slot is FILLING) and a normal lane inserts it elsewhere
+    assert sim.slots[0].count(5) == 1
+    assert sim.slots[0][2] == -1 and sim.cpu_insert_dropped == 1 and sim.cpu_inserted == 0
+
+
+def test_a_landing_expert_routed_again_on_the_cpu_does_not_fill_a_second_slot():
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    on_cpu = lambda layer, misses: set(misses)  # noqa: E731
+    sim.graph_forward({0: [5]}, cpu_lanes=on_cpu, cpu_insert=_insert_every_cpu_lane)
+    sim.graph_forward({0: [5]}, cpu_lanes=on_cpu, cpu_insert=_insert_every_cpu_lane)
+    assert sim.slots[0].count(5) == 1 and tier_sim.FILLING not in sim.slots[0]
+    assert sim.cpu_inserted == 1 and sim.cpu_insert_issued == 1
+
+
+def test_deferred_inserts_never_take_a_filling_slot():
+    # Same forward: the fill holds expert 2's old slot, so the deferred 7 must take another spare entry.
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    sim.graph_forward(
+        {0: [5]}, cpu_lanes=lambda layer, misses: set(misses), cpu_insert=_insert_every_cpu_lane, deferred={0: [7]}
+    )
+    assert sim.slots[0][2] == tier_sim.FILLING and 7 in sim.resident(0)
+
+
+SPLIT = [0, 1, 1, 2, 3, 3, 4]
+
+
+def test_cpu_insert_p1_lands_the_cpu_ram_hit_a_forward_later_and_costs_one_background_row():
+    loaded = _ram_hit_loaded()
+    merged = replay_nm(loaded, ram_rows=4, num_experts=8, policy="cpu_by_score_desc_tail", split=SPLIT)
+    assert merged["n"].tolist() == [[0], [0], [1], [1], [1]]  # the CPU lane never enters VRAM
+    out = replay_nm(loaded, ram_rows=4, num_experts=8, policy="cpu_insert_p1", split=SPLIT)
+    # Forward 3: expert 2 on the CPU fills the only slot (3 evicted). Forward 4: still FILLING, so a RAM hit again;
+    # it lands at forward 4's commit and hits at forward 5.
+    assert out["n"].tolist() == [[0], [0], [1], [1], [0]]
+    assert out["b"].tolist() == [[0], [0], [1], [0], [0]]
+    res = out["residency"]
+    assert res["cpu_insert_issued_per_token"] == pytest.approx(1 / 5)
+    assert res["cpu_insert_rows_per_token"] == pytest.approx(1 / 5)
+    assert res["cpu_insert_dropped_per_token"] == 0.0
+    assert res["hot_hit_rate"] == pytest.approx(1 / 5)
+
+
+def test_no_cpu_insert_without_a_cpu_lane():
+    out = replay_nm(_ram_hit_loaded(), ram_rows=4, num_experts=8, policy="cpu_insert_all", split=[0] * 7)
+    assert out["residency"]["cpu_insert_issued_per_token"] == 0.0
+    assert out["b"].sum() == 0
+
+
+def test_cpu_insert_policies_are_the_merged_order_with_a_per_layer_cap():
+    from cpu_expert_sim import policy_config
+
+    for name, p in (("cpu_insert_p1", 1), ("cpu_insert_p2", 2), ("cpu_insert_all", MAX_ROUTES)):
+        config = policy_config(name)
+        assert config["choice"] == "tail" and config["sort"] == "desc" and config["insert_per_layer"] == p
+
+
+def test_the_existing_policies_never_insert_a_cpu_lane():
+    from cpu_expert_sim import INSERT_POLICIES
+
+    loaded = _ram_hit_loaded()
+    for name in (n for n in INSERT_POLICIES if not n.startswith("cpu_insert_")):
+        res = replay_nm(loaded, ram_rows=4, num_experts=8, policy=name, split=SPLIT)["residency"]
+        assert res["cpu_insert_issued_per_token"] == 0.0 and res["cpu_insert_rows_per_token"] == 0.0, name
+
+
+def test_cpu_insert_sweep_scales_the_split_and_costs_the_inserts():
+    args = argparse.Namespace(
+        ram_rows=4, num_experts=8, no_initial_from_log=False, numa_mb="0:1", cpu_node=0, measured_c_cpu=0.63,
+        split_c_cpu=0.52, c_link=1.0, handoff=0.02, nvme_ms=[1.5], gpu_ms=14.0, cpu_scale=[1.0, 4.0],
+    )
+    rows = cpu_insert_results(_ram_hit_loaded(), args)
+    assert [(r["cpu_scale"], r["policy"]) for r in rows] == [
+        (s, p) for s in (1.0, 4.0)
+        for p in ("insert_all", "cpu_by_score_desc_tail", "cpu_insert_p1", "cpu_insert_p2", "cpu_insert_all")
+    ]
+    by = {(r["cpu_scale"], r["policy"]): r for r in rows}
+    assert all(a >= b for a, b in zip(by[4.0, "insert_all"]["split"], by[1.0, "insert_all"]["split"]))
+    for r in rows:
+        assert r["ms_per_token_uncosted"] <= r["ms_per_token_amortised"] <= r["ms_per_token_worst"]
+        assert r["ms_per_token_optimistic"] <= r["ms_per_token_amortised"]
+    p1 = by[1.0, "cpu_insert_p1"]
+    assert p1["cpu_insert_issued_per_token"] == pytest.approx(1 / 5)
+    assert p1["hot_hit_rate"] > by[1.0, "cpu_by_score_desc_tail"]["hot_hit_rate"]
+    # A faster CPU makes the same CPU-lane work cheaper.
+    assert by[4.0, "cpu_by_score_desc_tail"]["ms_per_token_uncosted"] < by[1.0, "cpu_by_score_desc_tail"]["ms_per_token_uncosted"]
+
+
+def test_promotion_never_takes_a_filling_slot():
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]}, cpu_insert=_insert_every_cpu_lane)
+    sim.scores[0, 7] = 10.0
+    assert sim.promote({0: [7]}, 1) == {0: 1}
+    assert sim.slots[0][2] == tier_sim.FILLING
+    sim.graph_forward({0: [7]})  # 7 hits where it was promoted; 5's fill lands in its own slot
+    # Every mapped expert's slot holds it: no expert is left pointing at a slot the landing fill took.
+    assert all(sim.slots[0][int(sim.where[0, e])] == e for e in range(8) if sim.where[0, e] >= 0)
+    assert {5, 7} <= sim.resident(0)

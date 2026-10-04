@@ -6282,6 +6282,23 @@ link cost is counted:
 - **Outputs:** `divix01:/mnt/nvme1/cpu-p1/insert-policies{,-v2,-promote,-sorted}.{json,txt}`.
 - **Tests:** `test/registered/unit/kernels/test_cpu_expert_sim.py`, `test/manual/dsv41/test_tier_sim.py`.
 
+**Inserting CPU lanes at faster CPU speeds (2026-10-03, branch `dsv41-cpu-insert`, plan
+`docs/superpowers/plans/2026-10-03-dsv41-cpu-expert-insert.md`).**
+- **What it models.** `tier_sim` gained a FILLING slot. A CPU lane picked for insert frees its own victim now, and its
+  expert is mapped at the layer's next commit, the way a device-side off-critical-path copy would land.
+- **The policies.** `cpu_expert_sim` gained `cpu_insert_p1`, `_p2` and `_all`: the merged policy plus a copy of the
+  head-most 1, 2 or all CPU lanes per layer.
+- **The sweep.** `--cpu-scale 1,2,4,8` divides the split's and the cost model's c_cpu by s.
+- **Sanity.** At s = 1 it reproduces this section's 75.94 ms and 0.672.
+- **Results.** As the CPU gets faster, the merged policy's hot hit collapses to 0.187 at s = 4, where it runs
+  66.3 ms/token. `cpu_insert_p1` keeps 0.625, at 52.7 ms with the copies credited GPU compute and NVMe waits as idle
+  link (`optimistic`). With only the layers' own slack (`amortised`) it is 72.1 ms.
+- **Verdict:** measure first. P1 issues about 30 copies a token, so it pays only if the link is idle for about 30 ms a
+  token outside the layers' copy waits. A PCIe-metrics decode trace must show that before the device change is
+  planned.
+- **At today's speed (s = 1),** P1 loses even optimistically (76.15 against 75.94), so P must be 0 there.
+- **Output:** `divix01:cc-expert-prediction/analysis/dsv41-cpu-insert/`.
+
 ### 30.4 NUMA and layout (microbenchmarks: NUMA 2026-09-30, swizzle P0 2026-09-29)
 
 **NUMA matters little to the kernel.** It ran 12 threads on cores 18-29 (node 1) with the `resid_b128` flavor, in the
