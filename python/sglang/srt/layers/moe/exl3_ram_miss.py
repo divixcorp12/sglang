@@ -1786,6 +1786,7 @@ class Exl3RamMissService:
                 side.dst_slots_1,
                 side.lane_kind,
                 side.lane_slot,
+                side.lane_node,
                 side.ce_mask,
                 side.cpu_lanes,
                 side.piece_runs,
