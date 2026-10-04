@@ -840,37 +840,56 @@ Expected: PASS (`test_a_reserved_or_unusable_core_is_refused` still raises `Valu
 
 ---
 
-### Task 2: CPU kernel engine handle in the EXL3 C ABI
+### Task 2: Per-engine cores in cpu_experts_common: engine_create/engine_free, the engine on forward and keep_warm (EXL3 and NVFP4)
 
-Written against the kernel at this plan's base; read Spec delta 22 before starting it.
+Implements Spec deltas 7, 13, 14 and 22 and User decision 1 on the landed normalized interface (`cpu_experts_common/`). Old Task 11 (NVFP4) is merged into this task: both quants get the engine through `SGLANG_CPU_EXPERTS_DEFINE_CABI`, so neither kernel's own sources change beyond its `cpu_experts_cabi.h` declarations and one status message.
+
+What changes, and why:
+
+- `team.hpp`'s process-wide `Cores` (one list, frozen by the first forward) becomes `Engines`: a per-library registry of immutable core lists, handle `h` is `table[h - 1]`, never reused. Engine 0 is no engine (unpinned workers).
+- `ExpertForward::forward` looks up `call->engine` before anything else (unknown, freed, or `threads` above its cores: 2, `out` untouched), then sets a thread-local `CallCores` around `Quant::dispatch`; `run_team` pins its workers to `call_cores()`. This keeps every quant's dispatch and forward plan unchanged (EXL3's `kernel.cpp` notes that the definition order is what the plans were validated against bit for bit), and `run_team` is only ever called inside a dispatch, on the forward's own thread. `run_team` reads the pointer once on the caller, before the region: a worker's `call_cores()` is its own thread's, not the call's.
+- `ExpertForward::forward_mutex` (a `try_to_lock` mutex, so a second forward got 3) becomes `std::shared_mutex layer_mutex`. Forwards take it shared and block (only for a `free_layer`'s O(1) body), so they never return 3; `free_layer` takes it exclusively with `try_to_lock` and returns 3 while any forward runs. Status 3 means only "a free_layer racing a forward".
+- `keep_warm` takes the engine first and pins to its cores.
+- The macro exports six functions: `register_layer`, `free_layer`, `forward`, `keep_warm(engine, ...)`, `engine_create`, `engine_free`. `set_cores` is gone from both quants.
+- The scratch is already per calling thread (`ForwardArena::get`, `Exl3Quant::dispatch`'s `wts`, both `thread_local`), and the kernels hold no other mutable statics, so two engine threads' forwards share nothing but the layer registry.
+- The vendored upstream kernel `exl3_cpu/moe_mul1.cpp` (built without `SGLANG_DSV41_CPU_EXPERTS`) compiles against the version-2 header unchanged and ignores `engine`; the service never loads it (`Exl3CpuQuantTrait._native` refuses that build), so it keeps its own `set_cores`.
+- `CpuExpertService` creates its engine once in `__init__`, before `enable_cpu_experts`, and never frees it: the engine thread may run until process exit, and a handle is 8 bytes plus its core list.
 
 **Files:**
-- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_expert_forward_abi.h` (version 2, `engine` appended)
-- Modify: `python/sglang/srt/layers/quantization/exl3_cpu/optimized/cpu_experts_cabi.h` (`set_cores` out; `engine_create`, `engine_free`; `keep_warm` takes the engine)
-- Modify: `python/sglang/srt/layers/quantization/exl3_cpu/optimized/moe_mul1.cpp:2103-2135` (core globals), `:2167-2184` (`ForwardCtx`), `:2543-2612` (`forward_raw`), `:2615-2627` (`exl3_moe_cpu_forward_raw`), `:2673-2693` (`sglang_exl3_cpu_experts_forward`), `:2745-2790` (`keep_warm`, `set_cores`)
-- Modify: `python/sglang/srt/layers/quantization/exl3_cpu/optimized/forward_plan.hpp:152-178` (`run_team`)
-- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h:49-87` (`CpuExpertKeepWarm`, `CpuExpertConfig`), `:236-237` and `:250-262` (`run`)
-- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h:352-399` (`enable_cpu_experts`), `ffi_test_exports.h:650-655` (`test_keep_warm`)
-- Modify: `python/sglang/kernels/ops/moe/expert_stream_transport.py` (`ExpertStreamHost.enable_cpu_experts`, ~:1614)
-- Modify: `python/sglang/srt/layers/moe/cpu_experts/pool.py:18-118` (ABI mirror, Protocol), `exl3.py:141-172`, `service.py:128-141,186-189`
-- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/cpu_forward.cpp:195-205,294-295`, `full_stack.cpp:134-145,285-297,505-509`, `stack.h:95-98,154-166`
-- Modify (tests whose API changes): `test/registered/unit/kernels/test_cpu_expert_pool.py:330-425` (`FakeServiceTrait`, `FakeHost`), `test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py:41-110` (`FakeForward`, `_host`), `test/manual/dsv41/test_cpu_expert_pool_exl3.py:174-206` (keep-warm prototype)
+- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts_abi.h:1-25` (version 2, `engine` appended)
+- Modify: `python/sglang/srt/layers/quantization/cpu_experts_common/team.hpp` (whole file: `Engines`, `call_cores`, `CallCores`, `pin`, `run_team`), `keep_warm.hpp:5-12,83-108` (`keep_warm` takes the cores), `expert_forward.hpp:1-3,13-19,35-39,90-147` (`layer_mutex`, the engine lookup, `keep_warm(engine, ...)`), `cabi.hpp` (whole file: six functions)
+- Modify: `python/sglang/srt/layers/quantization/exl3_cpu/optimized/cpu_experts_cabi.h:21-34`, `exl3_cpu/optimized/kernel.cpp:63` (`check_status`'s status-3 text), `exl3_cpu/optimized/README.txt:25-27,44-56`
+- Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/cpu_experts_cabi.h:24-38`, `nvfp4_cpu/optimized/README.md:46-53,117-123,136`
+- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h:10,51-55,73-87,236-240,252-265` (`CpuExpertKeepWarm`, `CpuExpertConfig::engine`, `run`)
+- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h:376-429` (`enable_cpu_experts`), `ffi_test_exports.h:13,666-692,920-921` (`test_keep_warm` takes and records the engine; new `test_keep_warm_engine`)
+- Modify: `python/sglang/kernels/ops/moe/expert_stream_transport.py:1658-1717` (`ExpertStreamHost.enable_cpu_experts`), `:1797-1809` (new `test_keep_warm_engine`)
+- Modify: `python/sglang/srt/layers/moe/cpu_experts/pool.py:21-38,66-132` (ABI mirror, Protocol), `exl3.py:1-9,170-190`, `service.py:126-138,183-186`
+- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/cpu_forward.cpp:34-36,194-205,289-292`, `full_stack.cpp:39-42,134-145,285-297,505-509`, `stack.h:93-98,161-168`
+- Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/bench/src/cpu_forward.cpp:27-28,313-320,384`, `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp:16,89-96,143-145` (the NVFP4 gate's harness; changed in the fix commit, so the Step 2 commit is the gate's baseline)
+- Modify (tests whose API changes): `test/registered/unit/kernels/cpu_experts_common_check.cpp`, `cpu_experts_common_toy.hpp:39-65`, `test_cpu_experts_common.py:25-37,84-132`, `test_cpu_experts_abi.py:30-33`, `test_cpu_experts_layout.py:21-26`, `test_nvfp4_cpu_experts.py`, `test_nvfp4_cpu_build.py:26-32`, `nvfp4_cpu_sanitizer.cpp:138-141`, `test_exl3_ram_miss_cpu_experts.py:43-110`, `test_cpu_expert_pool.py:362-443`, `test_cpu_expert_keep_warm.py:26-55`, `test/manual/dsv41/test_cpu_expert_pool_exl3.py:125-127,159-166,222-291`
 - Create: `test/manual/dsv41/test_cpu_expert_engines_exl3.py`
 
 **Interfaces:**
-- Produces (C ABI, `cpu_expert_forward_abi.h`): `SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION 2u`; `SglangCpuExpertsForward` = v1's fields, then `int64_t engine` (0: no engine).
-- Produces (EXL3 kernel): `int sglang_exl3_cpu_experts_engine_create(const int32_t* cores, int32_t n, int64_t* engine)` (0, 1, 2); `int sglang_exl3_cpu_experts_engine_free(int64_t engine)`; `int sglang_exl3_cpu_experts_keep_warm(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns)`; `sglang_exl3_cpu_experts_forward` reads `call->engine` and returns 2 for an unknown engine or `threads` above its cores. `sglang_exl3_cpu_experts_set_cores` is deleted.
-- Produces (host): `using CpuExpertKeepWarm = int (*)(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns);` `CpuExpertConfig::engine` (`int64_t`, default 0). FFI `expert_stream_enable_cpu_experts(handle, forward, engine, split, cores, x_rows, out_rows, hidden, parts, threads, spin_ns, keep_warm, keep_warm_ns)`.
-- Produces (Python): `ExpertStreamHost.enable_cpu_experts(forward, split, cores, x_rows, out_rows, *, threads, engine: int = 0, spin_us=50_000, keep_warm=0, keep_warm_us=0)`; `pool.CPU_EXPERTS_FORWARD_ABI_VERSION = 2`; `CpuExpertsForwardCall` gains `("engine", ctypes.c_int64)` last; `CpuExpertQuantTrait.native_create_engine(cores: Sequence[int]) -> int` and `native_free_engine(engine: int) -> None` replace `native_set_cores`; `CpuExpertService.engine: int`.
+- Consumes: the landed `cpu_experts_common/` (`ExpertForward<Quant>`, `run_team`, `keep_warm<Top>`, `SGLANG_CPU_EXPERTS_DEFINE_CABI`, `last_error`, `fail`); `ThreadingConfig`'s `OMP_THREAD_LIMIT` refusal (Task 1).
+- Produces (C ABI, `cpu_experts_abi.h`): `SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION 2u`; `SglangCpuExpertsForward` = v1's fields, then `int64_t engine` (0: no engine, unpinned workers).
+- Produces (`cpu_experts_common`, per library, internal linkage): `struct Engines { using Cores = std::shared_ptr<const std::vector<int>>; static int create(const int32_t* cores, int32_t n, int64_t* engine) noexcept; static int destroy(int64_t engine) noexcept; static Cores find(int64_t engine, bool* found); }`; `const std::vector<int>*& call_cores()`; `struct CallCores` (RAII setter); `void pin(int worker, const std::vector<int>* cores, std::atomic<int>& error)`; `run_team(int threads, Body&&)` (signature unchanged, pins to `call_cores()`); `template <Isa Top> int keep_warm(Isa isa, const std::vector<int>* cores, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept`; `ExpertForward<Quant>::layer_mutex` (`std::shared_mutex`, replacing `forward_mutex`), `ExpertForward<Quant>::keep_warm(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns)`.
+- Produces (both quants, from the macro; `<q>` is `exl3` or `nvfp4`): `int sglang_<q>_cpu_experts_engine_create(const int32_t* cores, int32_t n, int64_t* engine)` (0 and a handle that is never 0; 1 kernel error; 2 for null arguments, `n` outside `[1, CPU_SETSIZE]`, a repeated core or one outside `[0, CPU_SETSIZE)`); `int sglang_<q>_cpu_experts_engine_free(int64_t engine)` (0; 2 for a handle never created or already freed); `int sglang_<q>_cpu_experts_keep_warm(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns)` (2 also for an unknown engine or `threads` above its cores); `sglang_<q>_cpu_experts_forward` reads `call->engine` (2 for an unknown or freed engine or `threads` above its cores, `out` untouched; forwards on any engines run at once and never return 3); `sglang_<q>_cpu_experts_free_layer` returns 3 only while a forward runs. `sglang_<q>_cpu_experts_set_cores` is deleted.
+- Produces (host): `using CpuExpertKeepWarm = int (*)(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns);` `CpuExpertConfig::engine` (`int64_t`, default 0), passed as `call.engine` on every forward and first to every keep-warm. FFI `expert_stream_enable_cpu_experts(handle, forward, engine, split, cores, x_rows, out_rows, hidden, parts, threads, spin_ns, keep_warm, keep_warm_ns)`; test export `expert_stream_test_keep_warm_engine()`. Bench: `StackConfig::engine` (`int64_t`, after `cores`).
+- Produces (Python): `ExpertStreamHost.enable_cpu_experts(forward, split, cores, x_rows, out_rows, *, threads, engine: int = 0, spin_us=50_000, keep_warm=0, keep_warm_us=0)`; `ExpertStreamHost.test_keep_warm_engine() -> int`; `pool.CPU_EXPERTS_FORWARD_ABI_VERSION = 2`; `CpuExpertsForwardCall` gains `("engine", ctypes.c_int64)` last; `CpuExpertQuantTrait.native_create_engine(cores: Sequence[int]) -> int` and `native_free_engine(engine: int) -> None` replace `native_set_cores`; `Exl3CpuQuantTrait.native_create_engine` / `native_free_engine`; `CpuExpertService.engine: int`.
+
+These are the names Task 7 (`CpuExpertConfig::engine`, `enable_cpu_experts(..., engine=)`, `c.engine` in its fake forward), Task 8 (`native_create_engine`, `host.enabled`'s engine element) and Task 9 (`sglang_exl3_cpu_experts_engine_create`, `StackConfig::engine`, `test_cpu_expert_engines_exl3._forward`) consume.
 
 - [ ] **Step 1: Write the failing tests.**
 
-`test/manual/dsv41/test_cpu_expert_engines_exl3.py`:
+Create `test/manual/dsv41/test_cpu_expert_engines_exl3.py`:
 
 ```python
 """Two CPU expert engines of the EXL3 kernel on disjoint cores (spec 2026-10-03-numa-node-distributor-design,
 Testing 4). Each engine runs its own OpenMP team on its own cores; two running at once give, bit for bit, what one
-gives alone. Needs the optimized ext build (RUN_EXT) and 4 cores in the affinity mask."""
+gives alone. Needs the optimized ext build (RUN_EXT) and 4 cores in the affinity mask.
+
+Every pinned forward runs on a helper thread: a forward pins its calling thread (worker 0), and a pinned pytest thread
+would leave the next test one core."""
 
 import ctypes
 import os
@@ -890,6 +909,7 @@ from test_cpu_expert_pool_exl3 import CAP, LIMIT, _random_slabs  # noqa: E402
 
 HIDDEN, INTER = 5120, 2304  # DeepSeek V4.1's shape: the DSV4.1 plan on AVX-512BW
 REPEATS = 40
+CORES = sorted(os.sched_getaffinity(0))  # read at import, before any forward could pin this thread
 KEEP_WARM = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64)
 
 
@@ -899,13 +919,13 @@ def _kernel():
 
     if not optimized_cpu(cpu_act_defines()):
         pytest.skip("the engine ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
-    cores = sorted(os.sched_getaffinity(0))
-    if len(cores) < 4:
+    if len(CORES) < 4:
         pytest.skip("needs 4 cores in the affinity mask")
-    return Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT), cores[:4]
+    return Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT), CORES[:4]
 
 
 def _forward(trait, layer, x, slots, weights, engine, threads):
+    """One-row call of the C ABI's forward on ``engine``; returns (status, out)."""
     from sglang.srt.layers.moe.cpu_experts.pool import (
         CPU_EXPERTS_FORWARD_ABI_VERSION,
         CpuExpertForward,
@@ -933,35 +953,45 @@ def _inputs():
     ]
 
 
+def _on_threads(fn, args):
+    """fn(arg) for each arg, each on its own thread, all at once; returns their results in order."""
+    results = [None] * len(args)
+
+    def run(i):
+        results[i] = fn(args[i])
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(args))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
 def test_two_engines_at_once_match_one_engine_bit_for_bit(monkeypatch):
-    """Review Focus 3. Mutants: a process-wide core list (engine B's team pinned onto A's cores) -- red on the
-    affinity test below; a shared static scratch -- red here."""
+    """Review Focus 3. Mutants: one process-wide core list (engine B's team pinned onto A's cores) -- red on the
+    affinity test below; a shared static scratch, or a forward lock returning 3 -- red here."""
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     a, b = trait.native_create_engine(cores[:2]), trait.native_create_engine(cores[2:4])
     layer = trait.register_layer(_random_slabs(20261003, HIDDEN, INTER), CAP)
     inputs = _inputs()
     try:
-        want = []
-        for x, slots, weights in inputs:
-            rc, out = _forward(trait, layer, x, slots, weights, a, 2)
-            assert rc == 0 and torch.isfinite(out).all()
-            want.append(out)
-        bad = []
+        (want,) = _on_threads(
+            lambda engine: [_forward(trait, layer, x, s, w, engine, 2) for x, s, w in inputs], [a]
+        )
+        assert all(rc == 0 and torch.isfinite(out).all() for rc, out in want)
 
         def run(engine):
+            bad = []
             for _ in range(REPEATS):
                 for i, (x, slots, weights) in enumerate(inputs):
                     rc, out = _forward(trait, layer, x, slots, weights, engine, 2)
-                    if rc != 0 or not torch.equal(out, want[i]):
+                    if rc != 0 or not torch.equal(out, want[i][1]):
                         bad.append((engine, i, rc))
+            return bad
 
-        workers = [threading.Thread(target=run, args=(engine,)) for engine in (a, b)]
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join()
-        assert bad == []
+        assert _on_threads(run, [a, b]) == [[], []]
     finally:
         trait.free_layer(layer)
         trait.native_free_engine(a)
@@ -1002,6 +1032,8 @@ def test_each_engines_workers_run_on_its_own_cores(monkeypatch):
 
 
 def test_the_engine_abi_refuses_what_it_cannot_run(monkeypatch):
+    """A repeated core, more workers than the engine's cores, an engine never created and a freed engine are refused
+    (2) before any work; engine 0 runs unpinned workers (this thread stays unpinned, so it runs here)."""
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
     with pytest.raises(RuntimeError, match="refused engine cores"):
@@ -1012,12 +1044,16 @@ def test_the_engine_abi_refuses_what_it_cannot_run(monkeypatch):
     keep_warm = KEEP_WARM(trait.native_keep_warm())
     word = torch.zeros(1, dtype=torch.int32)
     try:
-        assert _forward(trait, layer, x, slots, weights, a, 3)[0] == 2, "more workers than the engine's cores"
-        assert _forward(trait, layer, x, slots, weights, 999, 2)[0] == 2, "an engine never created"
+        rc, out = _forward(trait, layer, x, slots, weights, a, 3)
+        assert rc == 2 and out.isnan().all(), "more workers than the engine's cores"
+        assert _forward(trait, layer, x, slots, weights, a + 1000, 2)[0] == 2, "an engine never created"
         assert _forward(trait, layer, x, slots, weights, 0, 2)[0] == 0, "engine 0: unpinned workers"
         assert keep_warm(a, 3, word.data_ptr(), 0, time.monotonic_ns()) == 2
+        assert keep_warm(a + 1000, 1, word.data_ptr(), 0, time.monotonic_ns()) == 2
         trait.native_free_engine(a)
         assert _forward(trait, layer, x, slots, weights, a, 2)[0] == 2, "a freed engine"
+        with pytest.raises(RuntimeError, match="no engine"):
+            trait.native_free_engine(a)
     finally:
         trait.free_layer(layer)
 
@@ -1025,7 +1061,6 @@ def test_the_engine_abi_refuses_what_it_cannot_run(monkeypatch):
 _LIMIT_SCRIPT = """
 import os, sys, threading
 sys.path.insert(0, sys.argv[1])
-import pytest
 from test_cpu_expert_engines_exl3 import HIDDEN, INTER, _forward, _inputs, _kernel
 from test_cpu_expert_pool_exl3 import CAP, _random_slabs
 trait, cores = _kernel()
@@ -1042,19 +1077,384 @@ print("rcs", sorted(set(rcs)))
 """
 
 
-def test_two_full_teams_run_at_once_at_a_thread_limit_of_their_sum():
-    """Review Focus 3: OMP_THREAD_LIMIT equal to the two engines' workers (2 + 2) leaves neither team short, which is
-    the bound ThreadingConfig enforces. libgomp reads the limit at load, so this runs in a child."""
+def test_two_full_teams_run_at_once_at_a_thread_limit_of_their_sum(monkeypatch):
+    """Review Focus 3: OMP_THREAD_LIMIT equal to the two engines' workers (2 + 2) leaves neither team short (a short
+    team is status 1, which run_team returns rather than run), the bound ThreadingConfig enforces. libgomp reads the
+    limit at load, so this runs in a child."""
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    _kernel()  # skips here, not in the child
     env = dict(os.environ, OMP_THREAD_LIMIT="4", EXL3_MOE_CPU_PIN="0")
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(_LIMIT_SCRIPT), os.path.dirname(__file__)],
-        env=env, capture_output=True, text=True, timeout=300,
+        env=env, capture_output=True, text=True, timeout=1800,
     )
     assert result.returncode == 0, result.stderr[-2000:]
     assert "rcs [0]" in result.stdout, result.stdout[-2000:]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
 ```
 
-In `test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py`, `FakeForward._run` also records `self.engines.append(c.engine)` (initialize `self.engines = []` in `__init__`), `_host` takes `engine=0` and passes `engine=engine` to `host.enable_cpu_experts`, and add:
+`test/manual/dsv41/test_cpu_expert_pool_exl3.py`:
+- `C_NAMES` (`:125-127`) lists `("register_layer", "free_layer", "forward", "keep_warm", "engine_create", "engine_free")`; `test_the_exl3_library_exports_the_five_c_names` becomes `test_the_exl3_library_exports_the_six_c_names`, docstring "Every CPU expert quant exports the same six C functions (cpu_experts_common/cabi.hpp)."
+- Delete `_SET_CORES_CHILD` and `test_set_cores_after_the_first_forward_returns_2` (`:222-255`): their subject, a process-wide core list frozen by the first forward, no longer exists; `test_the_engine_abi_refuses_what_it_cannot_run` above pins its replacement.
+- In `test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline`, the prototype becomes `ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64)`, every call passes engine `0` first (`keep_warm(0, 2, word.data_ptr(), 0, far)` and so on; the expectations stay as they are), and add last `assert keep_warm(999, 2, word.data_ptr(), 1, far) == 2, "an engine never created"`.
+
+`test/registered/unit/kernels/cpu_experts_common_toy.hpp`, replace `dispatch` and the statics below it (`:39-65`) with:
+
+```cpp
+    static int dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r, Isa isa)
+    {
+        last_isa = isa;
+        last_routes.clear();
+        for (int i = 0; i < r.count[0]; ++i) last_routes.push_back(r.route(0, i));
+        if (park_here && hold.load()) {
+            inside.store(true);
+            while (hold.load()) std::this_thread::yield();
+        }
+        // The caller's copy: a worker naming last_cpus would reach its own thread's.
+        std::vector<int>& cpus = last_cpus;
+        cpus.assign(size_t(c.threads), -1);
+        run_team(c.threads, [&](int worker, int workers) {
+            cpus[size_t(worker)] = sched_getcpu();
+            for (int h = worker; h < l.hidden; h += workers)
+                for (int t = 0; t < c.rows; ++t) {
+                    float s = 0;
+                    for (int i = 0; i < r.count[t]; ++i)
+                        s += r.route(t, i).weight * l.scale
+                             * decode(l.rows.slot(r.route(t, i).slot).base.data(), l).v[h];
+                    float& o = c.out[size_t(t) * l.hidden + h];
+                    o = c.accumulate ? o + s : s;
+                }
+        });
+        return 0;
+    }
+    // Per calling thread, so forwards running at once from two threads each keep their own.
+    static inline thread_local Isa last_isa = Isa::Scalar;
+    static inline thread_local std::vector<Route> last_routes;  // token 0's, from this thread's last dispatch
+    static inline thread_local std::vector<int> last_cpus;      // the CPU each worker of this thread's last team ran on
+    // Test-only gate: while `hold` is set, a dispatch on a thread that set park_here parks after setting `inside`,
+    // inside its forward.
+    static inline std::atomic<bool> hold{false};
+    static inline std::atomic<bool> inside{false};
+    static inline thread_local bool park_here = false;
+```
+
+`test/registered/unit/kernels/cpu_experts_common_check.cpp`:
+
+`Call`'s constructor takes `int64_t engine = 0` after `int threads = 2` and sets `c.engine = engine;` after `c.accumulate = 0;`.
+
+Replace `main`'s core configuration (`:126-150`, from the comment "Configure the worker cores" through `set_cores(cores.data(), team) == 0);`) with:
+
+```cpp
+    // Engines: worker i of each call naming the engine runs on cores[i], the caller as worker 0.
+    const std::vector<int> allowed = allowed_cores();
+    const int32_t team = allowed.size() >= 2 ? 2 : 1;
+    const std::vector<int32_t> cores(allowed.begin(), allowed.begin() + team);
+    int64_t engine = 0;
+    CHECK(sglang_toy_cpu_experts_engine_create(nullptr, 1, &engine) == 2);
+    CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), 0, &engine) == 2);
+    CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), team, nullptr) == 2);
+    if (team == 2) {
+        const int32_t twice[2] = {cores[0], cores[0]};
+        CHECK(sglang_toy_cpu_experts_engine_create(twice, 2, &engine) == 2);
+    }
+    const int32_t past = CPU_SETSIZE;
+    CHECK(sglang_toy_cpu_experts_engine_create(&past, 1, &engine) == 2);
+    CHECK(engine == 0);
+    {
+        // The engine thread creates its engine from a thread whose mask may exclude the expert cores (the server runs
+        // under taskset): engine_create accepts a core outside the caller's affinity; only the workers' own pins
+        // must succeed.
+        cpu_set_t saved, one;
+        CHECK(pthread_getaffinity_np(pthread_self(), sizeof(saved), &saved) == 0);
+        CPU_ZERO(&one);
+        CPU_SET(allowed[0], &one);
+        CHECK(pthread_setaffinity_np(pthread_self(), sizeof(one), &one) == 0);
+        const int32_t outside = allowed.size() >= 2 ? allowed[1] : allowed[0] + 1;
+        CHECK(outside < CPU_SETSIZE && !CPU_ISSET(outside, &one));
+        int64_t e = 0;
+        CHECK(sglang_toy_cpu_experts_engine_create(&outside, 1, &e) == 0);
+        CHECK(e != 0);
+        CHECK(sglang_toy_cpu_experts_engine_free(e) == 0);
+        CHECK(pthread_setaffinity_np(pthread_self(), sizeof(saved), &saved) == 0);
+        ok("engine_create_accepts_a_core_outside_the_callers_affinity");
+    }
+    CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), team, &engine) == 0);
+    CHECK(engine != 0);
+```
+
+In the `register_then_forward_overwrites_and_accumulates` block, the call becomes `Call call(h, 2, 2, {0, 2, 1, -1}, {0.5f, 0.25f, 2.0f, 1.0f}, team, engine);`.
+
+Replace the `concurrent_forward_returns_3` block (`:267-285`) with:
+
+```cpp
+    {
+        // Forwards share the layers and no lock: one parked inside its dispatch does not stop another, on another
+        // engine or on none. free_layer refuses (3) while any forward runs, rather than free a layer under it.
+        const int64_t h = register_toy(f);
+        toy::ToyQuant::inside.store(false);
+        toy::ToyQuant::hold.store(true);
+        int first = -1;
+        Call held(h, 1, 1, {0}, {1.0f}, 1, engine);
+        std::thread runner([&] {
+            toy::ToyQuant::park_here = true;
+            first = held.run();
+        });
+        while (!toy::ToyQuant::inside.load()) std::this_thread::yield();
+        Call second(h, 1, 1, {0}, {1.0f}, 1);
+        CHECK(second.run() == 0);
+        CHECK(!second.untouched());
+        CHECK(sglang_toy_cpu_experts_free_layer(h) == 3);
+        toy::ToyQuant::hold.store(false);
+        runner.join();
+        CHECK(first == 0);
+        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
+        ok("forwards_run_at_once_and_a_free_racing_one_returns_3");
+    }
+```
+
+Replace the `set_cores_after_the_first_forward_returns_2` / `last_error_names_why_a_call_failed` block (`:304-322`) with:
+
+```cpp
+    {
+        // Engines stay independent after forwards have run: a second one is created and used now. Each refuses more
+        // workers than its cores (2, out untouched), as do a never-created and a freed engine; handles are never
+        // reused.
+        const int64_t h = register_toy(f);
+        int64_t other = 0;
+        CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), team, &other) == 0);
+        CHECK(other != engine);
+        Call on_other(h, 1, 1, {0}, {1.0f}, team, other);
+        CHECK(on_other.run() == 0);
+        Call too_many(h, 1, 1, {0}, {1.0f}, team + 1, engine);
+        CHECK(too_many.run() == 2);
+        CHECK(too_many.untouched());
+        Call unknown_engine(h, 1, 1, {0}, {1.0f}, 1, other + 1000);
+        CHECK(unknown_engine.run() == 2);
+        CHECK(unknown_engine.untouched());
+        CHECK(sglang_toy_cpu_experts_engine_free(other) == 0);
+        CHECK(sglang_toy_cpu_experts_engine_free(other) == 2);
+        CHECK(sglang_toy_cpu_experts_engine_free(0) == 2);
+        std::fill(on_other.out.begin(), on_other.out.end(), 7.0f);
+        CHECK(on_other.run() == 2);
+        CHECK(on_other.untouched());
+        int64_t third = 0;
+        CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), 1, &third) == 0);
+        CHECK(third != other);
+        CHECK(sglang_toy_cpu_experts_engine_free(third) == 0);
+        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
+        ok("engines_are_independent_and_refuse_what_they_cannot_run");
+    }
+
+    {
+        // Each engine's team runs on that engine's cores, also while another engine's team runs at once from another
+        // thread (the two-engine half needs four allowed CPUs).
+        const int64_t h = register_toy(f);
+        Call one(h, 1, 1, {0}, {1.0f}, team, engine);
+        CHECK(one.run() == 0);
+        CHECK(toy::ToyQuant::last_cpus == std::vector<int>(cores.begin(), cores.end()));
+        if (allowed.size() >= 4) {
+            const int32_t a_cores[2] = {allowed[0], allowed[1]}, b_cores[2] = {allowed[2], allowed[3]};
+            int64_t a = 0, b = 0;
+            CHECK(sglang_toy_cpu_experts_engine_create(a_cores, 2, &a) == 0);
+            CHECK(sglang_toy_cpu_experts_engine_create(b_cores, 2, &b) == 0);
+            std::vector<int> seen_a, seen_b;
+            std::atomic<int> bad{0};
+            auto run = [&](int64_t e, std::vector<int>* seen) {
+                for (int i = 0; i < 200; ++i) {
+                    Call call(h, 1, 1, {0}, {1.0f}, 2, e);
+                    if (call.run() != 0) bad.fetch_add(1);
+                    seen->insert(seen->end(), toy::ToyQuant::last_cpus.begin(), toy::ToyQuant::last_cpus.end());
+                }
+            };
+            std::thread ta(run, a, &seen_a), tb(run, b, &seen_b);
+            ta.join();
+            tb.join();
+            CHECK(bad.load() == 0);
+            CHECK(seen_a.size() == 400 && seen_b.size() == 400);
+            for (int cpu : seen_a) CHECK(cpu == allowed[0] || cpu == allowed[1]);
+            for (int cpu : seen_b) CHECK(cpu == allowed[2] || cpu == allowed[3]);
+            CHECK(sglang_toy_cpu_experts_engine_free(a) == 0);
+            CHECK(sglang_toy_cpu_experts_engine_free(b) == 0);
+        }
+        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
+        ok("each_engines_team_runs_on_its_own_cores");
+    }
+
+    {
+        // Status 1 keeps its reason on this thread, for a quant's own wrappers; the next call clears it. engine_create
+        // checks only the range, so a core past this machine's CPUs is accepted and fails the worker's pin.
+        const int64_t h = register_toy(f);
+        const int32_t absent = CPU_SETSIZE - 1;
+        int64_t unpinnable = 0;
+        CHECK(sglang_toy_cpu_experts_engine_create(&absent, 1, &unpinnable) == 0);
+        Call fails(h, 1, 1, {0}, {1.0f}, 1, unpinnable);
+        CHECK(fails.run() == 1);
+        CHECK(fails.untouched());
+        CHECK(sglang::cpu_experts::last_error().find("cannot pin") != std::string::npos);
+        Call fits(h, 1, 1, {0}, {1.0f}, team, engine);
+        CHECK(fits.run() == 0);
+        CHECK(sglang::cpu_experts::last_error().empty());
+        CHECK(sglang_toy_cpu_experts_engine_free(unpinnable) == 0);
+        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
+        ok("last_error_names_why_a_call_failed");
+    }
+```
+
+In the keep-warm block (`:324-346`), every C call takes the engine first: `keep_warm(engine, 0, &word, ...) == 2`, `keep_warm(engine, 1, nullptr, ...) == 2`, `keep_warm(engine, team + 1, ...) == 2`, `keep_warm(engine, team, &word, 5, now_ns() - 1) == 0`, and the mover's `keep_warm(engine, team, &word, 5, start + ...)`; add after the first three `CHECK(sglang_toy_cpu_experts_keep_warm(engine + 1000, 1, &word, 5, now_ns() - 1) == 2);` (never created) and `CHECK(sglang_toy_cpu_experts_keep_warm(0, team + 1, &word, 5, now_ns() - 1) == 0);` (engine 0 has no core limit). The free-function calls become `sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, nullptr, team, &word, ...)`. Before `std::printf("all ok\n")`, add `CHECK(sglang_toy_cpu_experts_engine_free(engine) == 0);`.
+
+`test/registered/unit/kernels/test_cpu_experts_common.py`: in `CHECKS` replace `"concurrent_forward_returns_3"` with `"forwards_run_at_once_and_a_free_racing_one_returns_3"`, `"set_cores_accepts_a_core_outside_the_callers_affinity"` with `"engine_create_accepts_a_core_outside_the_callers_affinity"`, `"set_cores_after_the_first_forward_returns_2"` with `"engines_are_independent_and_refuse_what_they_cannot_run"`, and add `"each_engines_team_runs_on_its_own_cores"`. `_Forward._fields_` gains `("engine", ctypes.c_int64)` last. Replace `test_each_library_keeps_its_own_registry_and_cores` with:
+
+```python
+def test_each_library_keeps_its_own_registry_and_engines(tmp_path):
+    # Two quant libraries in one process must not share the framework's state: a layer handle or an engine created in
+    # one is unknown to the other.
+    a = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_a.so")))
+    b = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_b.so")))
+    for library in (a, b):
+        library.sglang_toy_cpu_experts_engine_create.argtypes = [
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64),
+        ]
+    hidden, capacity = 16, 2
+    slab = (ctypes.c_float * (hidden * capacity))(*range(hidden * capacity))
+    scale = ctypes.c_float(1.0)
+    layer = _Layer(abi_version=1, capacity=capacity, hidden=hidden, intermediate=hidden, slab_count=1)
+    layer.slabs[0] = ctypes.cast(slab, ctypes.c_void_p)
+    layer.slot_bytes[0] = hidden * 4
+    layer.params = ctypes.cast(ctypes.byref(scale), ctypes.c_void_p)
+    handle = ctypes.c_int64(-1)
+    assert a.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(handle)) == 0
+    core = (ctypes.c_int32 * 1)(min(os.sched_getaffinity(0)))
+    engine = ctypes.c_int64(0)
+    assert a.sglang_toy_cpu_experts_engine_create(core, 1, ctypes.byref(engine)) == 0
+
+    x = (ctypes.c_uint16 * hidden)()
+    slots = (ctypes.c_int32 * 1)(1)
+    weights = (ctypes.c_float * 1)(1.0)
+    out = (ctypes.c_float * hidden)()
+    call = _Forward(abi_version=2, rows=1, layer=handle.value, k=1, threads=1, accumulate=0, engine=engine.value)
+    call.x = ctypes.cast(x, ctypes.c_void_p)
+    call.slots, call.weights, call.out = slots, weights, out
+    assert a.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
+    assert list(out) == [float(hidden + h) for h in range(hidden)]
+
+    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's layer is unknown to library b"
+    other = ctypes.c_int64(-1)
+    assert b.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(other)) == 0
+    call.layer = other.value
+    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's engine is unknown to library b"
+    call.engine = 0
+    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
+```
+
+`test/registered/unit/kernels/test_cpu_experts_abi.py`: in `PROBE`, `F(SglangCpuExpertsForward, accumulate)` becomes `F(SglangCpuExpertsForward, accumulate) F(SglangCpuExpertsForward, engine)`.
+
+`test/registered/unit/kernels/test_cpu_experts_layout.py`: `test_every_quant_declares_the_five_c_names` becomes `test_every_quant_declares_the_six_c_names` over `("register_layer", "free_layer", "forward", "keep_warm", "engine_create", "engine_free")`.
+
+`test/registered/unit/kernels/test_nvfp4_cpu_build.py`: in `C_ABI`, `"sglang_nvfp4_cpu_experts_set_cores",` becomes `"sglang_nvfp4_cpu_experts_engine_create", "sglang_nvfp4_cpu_experts_engine_free",`.
+
+`test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp:138-141`: the keep-warm calls take engine 0 first (`keep_warm(0, 2, &word, 0, INT64_MAX) == 0`, `keep_warm(0, 0, &word, 0, INT64_MAX) == 2`), and add `assert(sglang_nvfp4_cpu_experts_keep_warm(7, 1, &word, 0, INT64_MAX) == 2);  // an engine never created`.
+
+`test/registered/unit/kernels/test_nvfp4_cpu_experts.py`: the module docstring's second sentence becomes "Each case runs in its own process: the OpenMP environment is read when the team first forms." Replace `CHILD`'s lines from `core_array = ...` (`:65`) to its end with:
+
+```python
+engine_count = int(sys.argv[5])
+engines = []
+if cores:
+    lib.sglang_nvfp4_cpu_experts_engine_create.argtypes = [
+        ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64),
+    ]
+    lib.sglang_nvfp4_cpu_experts_engine_free.argtypes = [ctypes.c_int64]
+    width = len(cores) // engine_count
+    for i in range(engine_count):
+        part = cores[i * width:(i + 1) * width]
+        created = ctypes.c_int64(0)
+        print("engine", lib.sglang_nvfp4_cpu_experts_engine_create(
+            (ctypes.c_int32 * len(part))(*part), len(part), ctypes.byref(created)))
+        engines.append(created.value)
+x = np.full(H, 0x3C00, np.uint16)  # fp16 1.0
+slots = np.zeros(1, np.int32)
+weights = np.ones(1, np.float32)
+
+
+def forward(threads, engine):
+    out = np.full(H, 123.0, np.float32)
+    call = CpuExpertsForwardCall(
+        abi_version=CPU_EXPERTS_FORWARD_ABI_VERSION, rows=1, layer=handle.value, x=x.ctypes.data,
+        slots=slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        weights=weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out=out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), k=1, threads=threads, accumulate=0, engine=engine)
+    status = lib.sglang_nvfp4_cpu_experts_forward(ctypes.byref(call))
+    return status, "untouched" if (out == 123.0).all() else "written", out
+
+
+if len(engines) < 2:
+    engine = engines[0] if engines else 0
+    for threads in calls:
+        status, state, _ = forward(threads, engine)
+        print("forward", threads, status, state)
+    if engines:
+        print("free", lib.sglang_nvfp4_cpu_experts_engine_free(engine))
+        status, state, _ = forward(calls[0], engine)
+        print("freed", status, state)
+else:
+    results = {engine: [] for engine in engines}
+
+    def run(engine):
+        for _ in range(20):
+            for threads in calls:
+                results[engine].append((threads,) + forward(threads, engine))
+
+    runners = [threading.Thread(target=run, args=(engine,)) for engine in engines]
+    for runner in runners:
+        runner.start()
+    for runner in runners:
+        runner.join()
+    for engine in engines:
+        for threads, status, state, _ in results[engine]:
+            print("forward", engine, threads, status, state)
+    first, second = (results[engine] for engine in engines)
+    print("same" if all(np.array_equal(p[3], q[3]) for p, q in zip(first, second)) else "different")
+"""
+```
+
+and its first line `import ctypes, sys` becomes `import ctypes, sys, threading`. `_run` becomes `def _run(library, calls, cores=(), alpha=1.0, engines=1, **env)` and passes `str(engines)` after `str(alpha)`. The tests change as follows (the three without cores stay as they are):
+
+```python
+def test_more_workers_than_the_engines_cores_is_refused_and_leaves_out_untouched(library):
+    assert _run(library, "2", cores=_allowed(1)) == ["engine 0", "forward 2 2 untouched", "free 0", "freed 2 untouched"]
+
+
+def test_a_freed_engine_is_refused(library):
+    assert _run(library, "2", cores=_allowed(2)) == ["engine 0", "forward 2 0 written", "free 0", "freed 2 untouched"]
+
+
+def test_a_worker_that_cannot_be_pinned_fails_the_forward_and_leaves_out_untouched(library, tmp_path):
+    # engine_create checks only range and uniqueness; a core the kernel cannot pin fails the forward. A preloaded
+    # pthread_setaffinity_np that always fails stands in for that.
+    shim = tmp_path / "unpinnable.c"
+    shim.write_text("int pthread_setaffinity_np(unsigned long t, unsigned long n, const void* s) { return 22; }\n")
+    so = tmp_path / "libunpinnable.so"
+    subprocess.run([CXX, "-x", "c", "-shared", "-fPIC", str(shim), "-o", str(so)], check=True)
+    lines = _run(library, "2", cores=_allowed(2), LD_PRELOAD=str(so))
+    assert lines[:2] == ["engine 0", "forward 2 1 untouched"]
+
+
+def test_two_engines_forward_at_once_without_a_busy_status(library):
+    """Part 3: a CPU expert engine per NUMA group, both forwarding at once. The process-wide forward lock returned 3
+    to the second; with per-engine cores both run and agree byte for byte."""
+    lines = _run(library, "2,2,2", cores=_allowed(4), engines=2)
+    assert lines[:2] == ["engine 0", "engine 0"]
+    forwards = [line.split() for line in lines if line.startswith("forward")]
+    assert len(forwards) == 2 * 20 * 3 and all(f[3] == "0" and f[4] == "written" for f in forwards), lines
+    assert lines[-1] == "same"
+```
+
+(`test_more_workers_than_configured_cores_fails_the_forward` and `test_cores_cannot_change_after_the_first_forward` are replaced by the first two: a team above the engine's cores is now refused before any work, 2 rather than the team-size throw's 1, and cores no longer freeze.)
+
+`test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py`: `FakeForward.__init__` sets `self.engines = []` and `_run` appends `c.engine` to it beside `self.calls`; `_host` takes `engine=0` and passes `engine=engine` to `host.enable_cpu_experts`. Add:
 
 ```python
 def test_the_kernel_engine_reaches_every_cpu_forward(tmp_path):
@@ -1075,7 +1475,20 @@ def test_the_kernel_engine_reaches_every_cpu_forward(tmp_path):
         host.stop()
 ```
 
-In `test/registered/unit/kernels/test_cpu_expert_pool.py`: `FakeServiceTrait.native_set_cores` becomes
+`test/registered/unit/kernels/test_cpu_expert_keep_warm.py`: `_host` takes `engine=0` (after `keep_warm_us`) and passes `engine=engine` to `host.enable_cpu_experts`. Add:
+
+```python
+def test_the_idle_thread_passes_its_engine_to_the_keep_warm(tmp_path, request):
+    """The keep-warm pins its workers to the cores of the engine it is given, which must be the engine
+    enable_cpu_experts took. Mutant: call the keep-warm with engine 0 -- red."""
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000, engine=41)
+    _run_jobs(host)
+    time.sleep(0.02)
+    assert host.test_keep_warm_calls() >= 1
+    assert host.test_keep_warm_engine() == 41
+```
+
+`test/registered/unit/kernels/test_cpu_expert_pool.py`: `FakeServiceTrait.native_set_cores` becomes
 
 ```python
     def native_create_engine(self, cores):
@@ -1086,148 +1499,407 @@ In `test/registered/unit/kernels/test_cpu_expert_pool.py`: `FakeServiceTrait.nat
         self.events.append(("free", engine))
 ```
 
-`FakeHost.enable_cpu_experts` gains `engine=0` and stores it as the last element of `self.enabled`; `test_service_registers_a_row_once_after_the_cores_and_the_activation_limit` asserts `host.enabled == (0xF00D, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0xE1)` and `trait.events == [("engine", [4, 5, 6]), ("register", 10.0), ("register", 10.0)]`.
-
-In `test/manual/dsv41/test_cpu_expert_pool_exl3.py`'s keep-warm test, the prototype becomes `ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64)` and every call passes engine `0` first (`keep_warm(0, 2, word.data_ptr(), 0, far)` and so on); the expectations stay as they are.
+`FakeHost.enable_cpu_experts` gains the keyword `engine=0` (after `threads`) and stores it as the last element of `self.enabled`. `test_service_registers_a_row_once_after_the_cores_and_the_activation_limit`'s docstring becomes "The kernel's engine is created on the cores before the CPU expert thread starts; the activation limit is only known at the layer's first forward and must be on the trait before register_layer." and it asserts `host.enabled == (0xF00D, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0xE1)` and `trait.events == [("engine", [4, 5, 6]), ("register", 10.0), ("register", 10.0)]`.
 
 - [ ] **Step 2: Run them to verify they fail.** Commit the tests alone:
 
 ```bash
-git add test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_pool.py test/manual/dsv41/test_cpu_expert_pool_exl3.py
+git add test/manual/dsv41/test_cpu_expert_engines_exl3.py test/manual/dsv41/test_cpu_expert_pool_exl3.py test/registered/unit/kernels/cpu_experts_common_check.cpp test/registered/unit/kernels/cpu_experts_common_toy.hpp test/registered/unit/kernels/test_cpu_experts_common.py test/registered/unit/kernels/test_cpu_experts_abi.py test/registered/unit/kernels/test_cpu_experts_layout.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_keep_warm.py test/registered/unit/kernels/test_cpu_expert_pool.py
 git diff --cached --stat
-git commit -m "test(cpu-experts): per-engine cores, two engines at once (failing)
+git commit -m "test(cpu-experts): per-engine cores, two engines at once, status 3 only for a free racing a forward (failing)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01FVzWUFXT8SqY4pbyJn21Ft"
 ```
 
-`SYNC`, `RUN_CPU test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_pool.py`, `RUN_EXT test/manual/dsv41/test_cpu_expert_engines_exl3.py`.
-Expected: FAIL: `TypeError: enable_cpu_experts() got an unexpected keyword argument 'engine'`; `AttributeError: 'Exl3CpuQuantTrait' object has no attribute 'native_create_engine'`.
+Record this commit's SHA as `T2_TEST`: it is the NVFP4 gate's baseline in Step 5 (kernel and harness unchanged).
+
+`SYNC`, then `RUN_CPU test/registered/unit/kernels/test_cpu_experts_common.py test/registered/unit/kernels/test_cpu_experts_abi.py test/registered/unit/kernels/test_cpu_experts_layout.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_keep_warm.py test/registered/unit/kernels/test_cpu_expert_pool.py`, `RUN_EXT test/manual/dsv41/test_cpu_expert_engines_exl3.py test/manual/dsv41/test_cpu_expert_pool_exl3.py`.
+Expected: FAIL, each for its missing feature:
+- `test_cpu_experts_common.py`: both `test_the_native_harness_passes` cases, `CalledProcessError` from g++ (`'sglang_toy_cpu_experts_engine_create' was not declared in this scope`); `test_each_library_keeps_its_own_registry_and_engines`, `AttributeError: .../libtoy_a.so: undefined symbol: sglang_toy_cpu_experts_engine_create`.
+- `test_cpu_experts_abi.py`: `CalledProcessError` (`'SglangCpuExpertsForward' has no member named 'engine'`).
+- `test_cpu_experts_layout.py`: `AssertionError: ('exl3_cpu', 'engine_create')`.
+- `test_nvfp4_cpu_experts.py`: every case with cores (`engine` lines), `AssertionError` whose child output ends `undefined symbol: sglang_nvfp4_cpu_experts_engine_create`; the three cases without cores pass.
+- `test_nvfp4_cpu_build.py`: the two `C_ABI` loops, `AttributeError: ...: undefined symbol: sglang_nvfp4_cpu_experts_engine_create`; the four sanitizer-harness cases, `CalledProcessError` (`too many arguments to function 'int sglang_nvfp4_cpu_experts_keep_warm(...)'`).
+- `test_exl3_ram_miss_cpu_experts.py::test_the_kernel_engine_reaches_every_cpu_forward` and `test_cpu_expert_keep_warm.py::test_the_idle_thread_passes_its_engine_to_the_keep_warm`: `TypeError: ExpertStreamHost.enable_cpu_experts() got an unexpected keyword argument 'engine'`.
+- `test_cpu_expert_pool.py::test_service_registers_a_row_once_after_the_cores_and_the_activation_limit`: `AssertionError` (`host.enabled` ends `2, 0)`, not `2, 225)`).
+- `test_cpu_expert_engines_exl3.py`: `AttributeError: 'Exl3CpuQuantTrait' object has no attribute 'native_create_engine'` (four tests); `test_cpu_expert_pool_exl3.py`: `test_the_exl3_library_exports_the_six_c_names` with `AttributeError: ...: undefined symbol: sglang_exl3_cpu_experts_engine_create`, and the keep-warm test with `AssertionError: keep-warm returned before its word moved or its deadline` (the old function reads engine 0 as `threads`).
 
 - [ ] **Step 3: Implement.**
 
-`cpu_expert_forward_abi.h`: `#define SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION 2u`; after `int32_t accumulate;` add
+`cpu_experts_abi.h`: `#define SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION 2u`; append to the forward struct's comment "`engine` selects the kernel's core list (its engine_create); a kernel refuses (2) an engine it never created or freed, and more `threads` than its cores."; after `int32_t accumulate;` add
 
 ```c
-    // The kernel's engine (its *_engine_create): its workers run on that engine's cores. 0: no engine, unpinned
-    // workers. Last, so v1's positional initializers still compile.
+    // The kernel's engine (its *_engine_create): worker i runs on the engine's cores[i]. 0: no engine, unpinned
+    // workers. Last, so v1's designated and positional initializers still compile.
     int64_t engine;
 ```
 
-and extend the struct's comment by one sentence: "`engine` selects the kernel's core list; a kernel refuses (2) an engine it never created."
+`cpu_experts_common/team.hpp`, the whole file:
 
-`cpu_experts_cabi.h`: delete `sglang_exl3_cpu_experts_set_cores` and its comment; change `keep_warm`'s declaration to take `int64_t engine` first; add
+```cpp
+// The CPU expert engines and the team every forward runs: one OpenMP team per call, the calling thread as worker 0,
+// worker i pinned to core i of the call's engine (engine 0: unpinned).
+#pragma once
+#include <omp.h>
+#include <pthread.h>
+#include <sched.h>
+#include <atomic>
+#include <cstdio>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace sglang::cpu_experts {
+// Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
+// are STB_GNU_UNIQUE, which the dynamic linker merges across every library in the process, even RTLD_LOCAL ones.
+namespace {
+
+// Why this thread's last register, free, forward or keep-warm call returned 1 ("" otherwise); each clears it on entry.
+// Per library, like the rest of the framework; the C ABI does not export it, a quant's own wrappers read it.
+inline std::string& last_error()
+{
+    static thread_local std::string error;
+    return error;
+}
+
+// Records `what` as last_error(), prints it to stderr, and returns 1; never throws (it runs in the C ABI's catch blocks).
+inline int fail(const char* what) noexcept
+{
+    try {
+        last_error() = what;
+        std::fprintf(stderr, "cpu_experts: %s\n", what);
+    } catch (...) {
+    }
+    return 1;
+}
+
+// This library's engines. An engine is an immutable core list: worker i of every forward and keep-warm naming it runs
+// on cores[i], the caller as worker 0. Each CPU expert engine thread (one per NUMA group) names its own, so two teams
+// run at once on disjoint cores. Handle h is table[h - 1]; a destroyed entry is reset and its index never reused, so a
+// stale handle is refused (2). Handle 0 is no engine: its workers run unpinned.
+struct Engines
+{
+    using Cores = std::shared_ptr<const std::vector<int>>;
+
+    // Cores must be distinct and in [0, CPU_SETSIZE), else 2. Not checked against the caller's affinity: the engine
+    // thread creates its engine from a thread whose inherited mask may exclude the expert cores, and the workers pin
+    // themselves outside it. A core that cannot be pinned fails the first call's pin (1).
+    static int create(const int32_t* cores, int32_t n, int64_t* engine) noexcept
+    {
+        try {
+            if (!cores || !engine || n < 1 || n > CPU_SETSIZE) return 2;
+            for (int i = 0; i < n; ++i) {
+                if (cores[i] < 0 || cores[i] >= CPU_SETSIZE) return 2;
+                for (int j = 0; j < i; ++j)
+                    if (cores[j] == cores[i]) return 2;
+            }
+            Cores list = std::make_shared<const std::vector<int>>(cores, cores + n);
+            std::lock_guard<std::mutex> lock(mutex);
+            table.push_back(std::move(list));
+            *engine = int64_t(table.size());
+            return 0;
+        } catch (...) {
+            return 1;
+        }
+    }
+
+    // A call already running on `engine` keeps its cores (it holds the list). Returns 0, or 2 for a handle never
+    // created or already destroyed.
+    static int destroy(int64_t engine) noexcept
+    {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (engine < 1 || engine > int64_t(table.size()) || !table[size_t(engine - 1)]) return 2;
+            table[size_t(engine - 1)].reset();
+            return 0;
+        } catch (...) {
+            return 1;
+        }
+    }
+
+    // The cores of `engine`, null for engine 0. *found is false for a handle never created or destroyed.
+    static Cores find(int64_t engine, bool* found)
+    {
+        *found = true;
+        if (engine == 0) return nullptr;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (engine < 1 || engine > int64_t(table.size()) || !table[size_t(engine - 1)]) {
+            *found = false;
+            return nullptr;
+        }
+        return table[size_t(engine - 1)];
+    }
+
+private:
+    static inline std::mutex mutex;
+    static inline std::vector<Cores> table;
+};
+
+// The cores of the call this thread is running (null: engine 0), which run_team pins its workers to. ExpertForward
+// sets it around a forward's dispatch (CallCores), so a quant's plan calls run_team without passing the engine down.
+inline const std::vector<int>*& call_cores()
+{
+    static thread_local const std::vector<int>* cores = nullptr;
+    return cores;
+}
+
+struct CallCores
+{
+    explicit CallCores(const std::vector<int>* cores) : saved(call_cores()) { call_cores() = cores; }
+    ~CallCores() { call_cores() = saved; }
+    CallCores(const CallCores&) = delete;
+    CallCores& operator=(const CallCores&) = delete;
+    const std::vector<int>* saved;
+};
+
+// Inside a team: pins worker `worker` to cores[worker] (null cores: no-op), setting `error` when it cannot; the caller
+// checks that worker < cores->size(). Each thread remembers its last core, so a team on the same engine repins nothing.
+inline void pin(int worker, const std::vector<int>* cores, std::atomic<int>& error)
+{
+    if (!cores) return;
+    const int core = (*cores)[size_t(worker)];
+    static thread_local int pinned_core = -1;
+    if (pinned_core != core || sched_getcpu() != core) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(core, &set);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set))
+            error.store(1, std::memory_order_relaxed);
+        else
+            pinned_core = core;
+    }
+}
+
+// body(worker, workers) on every worker of a team of `threads` on call_cores(). Every pin precedes a barrier and the
+// body runs only on a full, fully pinned team, so all workers take the same branch; body must not throw (it runs
+// inside an OpenMP region).
+template <class Body>
+void run_team(int threads, Body&& body)
+{
+    if (threads < 1) throw std::runtime_error("CPU expert team needs at least one worker");
+    const std::vector<int>* cores = call_cores();  // the caller's: a worker's call_cores() is its own thread's
+    if (cores && size_t(threads) > cores->size())
+        throw std::runtime_error("CPU expert worker count exceeds the engine's cores");
+    std::atomic<int> pin_error{0};
+    std::atomic<int> actual_workers{0};
+    #pragma omp parallel num_threads(threads) shared(body, cores, pin_error, actual_workers)
+    {
+        const int worker = omp_get_thread_num(), n = omp_get_num_threads();
+        if (worker == 0) actual_workers.store(n, std::memory_order_relaxed);
+        pin(worker, cores, pin_error);
+        #pragma omp barrier
+        if (n == threads && !pin_error.load(std::memory_order_relaxed)) body(worker, n);
+    }
+    if (pin_error.load()) throw std::runtime_error("cannot pin CPU expert worker to its engine's core");
+    if (actual_workers.load() != threads)
+        throw std::runtime_error("OpenMP returned fewer CPU expert workers than requested");
+}
+
+}  // namespace
+}  // namespace sglang::cpu_experts
+```
+
+`keep_warm.hpp`: add `#include <vector>`; replace the `keep_warm` template (`:83-108`) with
+
+```cpp
+// Holds `threads` workers (the caller as worker 0, each pinned to `cores` as the forward pins them; null: unpinned) in
+// register-only work of tier min(isa, Top) until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Returns 0, 1
+// on a kernel error (a failed pin), 2 on invalid arguments or more threads than `cores`.
+template <Isa Top>
+int keep_warm(Isa isa, const std::vector<int>* cores, int32_t threads, const uint32_t* word, uint32_t seen,
+              int64_t deadline_ns) noexcept
+{
+    last_error().clear();
+    if (threads < 1 || word == nullptr || (cores && size_t(threads) > cores->size())) return 2;
+    try {
+        std::atomic<int> pin_error{0};
+        #pragma omp parallel num_threads(threads) shared(cores, pin_error)
+        {
+            pin(omp_get_thread_num(), cores, pin_error);
+            keep_warm_detail::sink.fetch_add(keep_warm_loop<Top>(isa, word, seen, deadline_ns),
+                                             std::memory_order_relaxed);
+        }
+        return pin_error.load(std::memory_order_relaxed) ? fail("cannot pin CPU expert worker to its engine's core")
+                                                         : 0;
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    } catch (...) {
+        return fail("unknown exception");
+    }
+}
+```
+
+`expert_forward.hpp`: add `#include <shared_mutex>`; the header comment's "Each quant's library holds its own registry and forward lock." becomes "Each quant's library holds its own registry, layer lock and engines (team.hpp)."; replace `forward_mutex` and its comment (`:38-39`) with
+
+```cpp
+    // Forwards hold it shared, so any number run at once (one per engine thread); free_layer takes it exclusively and
+    // returns 3 while a forward runs, rather than free a layer a forward may be reading.
+    static inline std::shared_mutex layer_mutex;
+```
+
+In `free_layer`, the two lines taking `forward_lock` become
+
+```cpp
+            std::unique_lock<std::shared_mutex> layer_lock(layer_mutex, std::try_to_lock);
+            if (!layer_lock.owns_lock()) return 3;
+```
+
+In `forward`, replace the two lines taking `lock(forward_mutex, std::try_to_lock)` with
+
+```cpp
+            bool found = false;
+            const Engines::Cores cores = Engines::find(c.engine, &found);
+            if (!found || (cores && size_t(c.threads) > cores->size())) return 2;
+            // Blocks only for a free_layer's own few instructions; a forward never returns 3.
+            const std::shared_lock<std::shared_mutex> lock(layer_mutex);
+```
+
+and the dispatch line with
+
+```cpp
+            const CallCores on_engine(cores.get());
+            return Quant::dispatch(*layer, c, routes, isa());
+```
+
+Replace `keep_warm` (`:137-147`) with
+
+```cpp
+    // keep_warm (keep_warm.hpp) at this quant's tier on `engine`'s cores (0: unpinned), compiling only the loops up to
+    // kTopIsa. An unknown or destroyed engine: 2.
+    static int keep_warm(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen,
+                         int64_t deadline_ns) noexcept
+    {
+        last_error().clear();
+        try {
+            bool found = false;
+            const Engines::Cores cores = Engines::find(engine, &found);
+            if (!found) return 2;
+            return ::sglang::cpu_experts::keep_warm<Quant::kTopIsa>(isa(), cores.get(), threads, word, seen,
+                                                                     deadline_ns);
+        } catch (const std::exception& e) {
+            return fail(e.what());
+        } catch (...) {
+            return fail("unknown exception");
+        }
+    }
+```
+
+`cabi.hpp`, the whole file:
+
+```cpp
+// The six C functions every CPU expert quant exports, as one-line wrappers over ExpertForward<Quant> and Engines.
+#pragma once
+#include "expert_forward.hpp"
+#include "keep_warm.hpp"
+#include "team.hpp"
+
+#define SGLANG_CPU_EXPERTS_DEFINE_CABI(prefix, Quant)                                                             \
+    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_register_layer(          \
+        const SglangCpuExpertsLayer* d, int64_t* handle) noexcept                                               \
+    { return ::sglang::cpu_experts::ExpertForward<Quant>::register_layer(d, handle); }                          \
+    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_free_layer(              \
+        int64_t handle) noexcept                                                                                \
+    { return ::sglang::cpu_experts::ExpertForward<Quant>::free_layer(handle); }                                 \
+    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_forward(                 \
+        const SglangCpuExpertsForward* call) noexcept                                                           \
+    { return ::sglang::cpu_experts::ExpertForward<Quant>::forward(call); }                                      \
+    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_keep_warm(               \
+        int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept     \
+    { return ::sglang::cpu_experts::ExpertForward<Quant>::keep_warm(engine, threads, word, seen, deadline_ns); } \
+    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_engine_create(           \
+        const int32_t* cores, int32_t n, int64_t* engine) noexcept                                              \
+    { return ::sglang::cpu_experts::Engines::create(cores, n, engine); }                                        \
+    extern "C" __attribute__((visibility("default"))) int sglang_##prefix##_cpu_experts_engine_free(             \
+        int64_t engine) noexcept                                                                                \
+    { return ::sglang::cpu_experts::Engines::destroy(engine); }
+```
+
+`exl3_cpu/optimized/cpu_experts_cabi.h:21-34`, the status line becomes `// Status: 0 success, 1 internal error, 2 invalid arguments, 3 a free_layer while a forward runs.`; the forward's comment gains "call->engine names the engine whose cores the workers run on (0: unpinned); an unknown or freed engine, or more threads than its cores, is refused (2). Forwards on any engines run at once from different threads."; the keep-warm declaration and its comment become
 
 ```c
-// An engine: worker i of every forward and keep-warm that names it runs on cores[i], the calling thread as worker 0.
-// Cores must be distinct and in [0, CPU_SETSIZE). Engines are immutable and independent, so two engines' forwards may
-// run at once from two threads. Returns 0 and the handle (never 0), 1 on a kernel error, 2 on invalid arguments.
+// Holds `threads` workers of `engine` (0: unpinned), pinned as the forward pins them, in register-only work at the
+// forward's vector width until *word != seen or CLOCK_MONOTONIC reaches deadline_ns (cpu_experts_common/keep_warm.hpp).
+// 2 as the forward refuses an engine.
+int sglang_exl3_cpu_experts_keep_warm(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen,
+                                      int64_t deadline_ns) EXL3_CPU_NOEXCEPT;
+```
+
+and `set_cores` and its comment become
+
+```c
+// An engine: worker i of each forward and keep-warm naming it runs on cores[i], the calling thread as worker 0. Cores
+// must be distinct and in [0, CPU_SETSIZE); they are not checked against the caller's affinity, and a core that cannot
+// be pinned fails the call's pin (1). Engines are immutable. Returns 0 and the handle (never 0), 1, or 2.
 int sglang_exl3_cpu_experts_engine_create(const int32_t* cores, int32_t n, int64_t* engine) EXL3_CPU_NOEXCEPT;
-// Frees `engine`; a forward already running keeps its cores. Returns 0, or 2 for an unknown engine.
+// Frees `engine`; a call already running on it keeps its cores. Returns 0, or 2 for a handle never created or freed.
 int sglang_exl3_cpu_experts_engine_free(int64_t engine) EXL3_CPU_NOEXCEPT;
 ```
 
-`moe_mul1.cpp:2103-2135`, replace `g_cores_mutex`, `g_configured_cores`, `g_compute_started`, `g_compute_cores`, `freeze_compute_cores` and `pin_compute_worker` with:
+`nvfp4_cpu/optimized/cpu_experts_cabi.h:24-38`: the same four edits with `sglang_nvfp4_` and `NVFP4_NOEXCEPT`.
+
+`exl3_cpu/optimized/kernel.cpp:63`: `TORCH_CHECK(status != 3, what, ": a forward is running (status 3)");` (only `free_layer` returns 3 now).
+
+`exl3_cpu/optimized/README.txt`: the sentences "Core configuration is frozen at the first forward or keep-warm. One forward runs at a time: a forward or free that finds another running returns status 3 rather than wait." become "Each call names an engine (engine_create: an immutable core list; engine 0 runs unpinned workers), and forwards on different engines run at once from different threads. free_layer returns status 3 while any forward runs rather than free a layer under it."; "the five C functions ... keep_warm and set_cores." becomes "the six C functions ... keep_warm, engine_create and engine_free."; "Configure distinct worker core IDs in [0, CPU_SETSIZE) before the first forward or keep-warm; a core that cannot be pinned fails the first forward with status 1." becomes "Create an engine from distinct worker core IDs in [0, CPU_SETSIZE) and name it in each forward's engine field and each keep-warm; a core that cannot be pinned fails the call with status 1."; "3 concurrent use" becomes "3 a free_layer while a forward runs".
+
+`nvfp4_cpu/optimized/README.md`: in the code block, the two lines "// Before start/first forward, set the kernel's helper cores:" and `sglang_nvfp4_cpu_experts_set_cores(...)` become
 
 ```cpp
-// CPU expert engines (sglang_exl3_cpu_experts_engine_create): handle h is g_engines[h - 1], an immutable core list,
-// null once freed. Handle 0 is no engine: its workers are not pinned.
-std::mutex g_engines_mutex;
-std::vector<std::shared_ptr<const std::vector<int>>> g_engines;
-
-// The cores of `engine` (null for engine 0). *found is false for a handle never created, or freed. The shared_ptr
-// keeps the list alive through a forward that races a free.
-std::shared_ptr<const std::vector<int>> engine_cores(int64_t engine, bool* found)
-{
-    *found = true;
-    if (engine == 0) return nullptr;
-    std::lock_guard<std::mutex> lock(g_engines_mutex);
-    if (engine < 1 || engine > static_cast<int64_t>(g_engines.size()) || !g_engines[engine - 1]) {
-        *found = false;
-        return nullptr;
-    }
-    return g_engines[engine - 1];
-}
-
-// Inside a parallel region: pins OpenMP worker `worker` to cores[worker] (no cores: no-op), setting pin_error if it
-// cannot. Each engine's master thread has its own libgomp team, so pinned_core is per worker of that team.
-inline void pin_compute_worker(int worker, const std::vector<int>* cores, std::atomic<int>& pin_error)
-{
-    if (cores == nullptr || cores->empty()) return;
-    const int core = (*cores)[worker];
-    static thread_local int pinned_core = -1;
-    if (pinned_core != core || sched_getcpu() != core) {
-        cpu_set_t set; CPU_ZERO(&set); CPU_SET(core, &set);
-        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set))
-            pin_error.store(1, std::memory_order_relaxed);
-        else pinned_core = core;
-    }
-}
+// The kernel's engine on the same cores, passed on every forward and keep-warm:
+if (sglang_nvfp4_cpu_experts_engine_create(cores.data(), cores.size(), &config.engine) != 0)
+    throw std::runtime_error("NVFP4 CPU engine refused its cores");
 ```
 
-`ForwardCtx` (`:2167`): add `const std::vector<int>* cores = nullptr;  // the engine's worker cores; null: unpinned`.
+and its teardown comment becomes "// During teardown: engine.stop(), then free every registered layer and the kernel engine."; under "Threading and lifetime", "Configure distinct allowed Linux cores before the first forward; worker i is pinned to core i (once, then re-checked cheaply). A forward may use any team size up to the configured cores." becomes "Create an engine (`sglang_nvfp4_cpu_experts_engine_create`) from distinct Linux cores and name it in the call's `engine`; worker i is pinned to its core i (once, then re-checked cheaply), and engine 0 runs unpinned workers. A forward may use any team size up to the engine's cores (more is refused, 2)."; "A concurrent forward or free is rejected (3); cores configured after the first forward or keep-warm are refused (2)." becomes "Forwards on any engines run at once from different threads; `free_layer` returns 3 while one runs."; "3 concurrent use" becomes "3 a free_layer while a forward runs".
 
-`forward_raw` (`:2543`): add a last parameter `const std::vector<int>* cores` and set `ctx.cores = cores;` after `ctx.m_total = m_total;`. `exl3_moe_cpu_forward_raw` (`:2615`) passes `nullptr` (the torch op path stays unpinned, as it was without `set_cores`).
+`cpu_experts.h`: the header list's `CpuExpertConfig` line becomes "the pinned input/output tables, the thread count, the cores and the kernel's engine"; `CpuExpertKeepWarm`'s comment gains "on `engine`'s cores (the kernel's engine, as the forward's call.engine)" and its type becomes `using CpuExpertKeepWarm = int (*)(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns);`; in `CpuExpertConfig`, after `forward`: `int64_t engine = 0;  // the kernel's engine (its core list), on every forward and keep-warm; 0: unpinned workers`, and `cores`' comment becomes "worker 0 uses the first CPU; the kernel pins worker i to the engine's cores[i], which must be this list"; in `run()`, `call.engine = config_.engine;` after `call.accumulate = ...`, and the keep-warm call becomes `config_.keep_warm(config_.engine, config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until)`.
 
-`forward_plan.hpp` `run_team`, replace its first three lines (`freeze_compute_cores(); TORCH_CHECK(g_compute_cores.empty() || ...)`) with
+`ffi_exports.h` `enable_cpu_experts`: add `int64_t engine` after `int64_t forward`, `config.engine = engine;` after `config.forward = ...`, and "`engine` is the kernel's engine handle (its engine_create; 0: none), carried by every forward and keep-warm." in its comment.
 
-```cpp
-        TORCH_CHECK(ctx.cores == nullptr || size_t(count) <= ctx.cores->size(),
-                    "CPU expert worker count exceeds the engine's cores");
-```
-
-and the call inside the region with `pin_compute_worker(worker, ctx.cores, pin_error);`.
-
-`sglang_exl3_cpu_experts_forward` (`:2673`): after the argument checks,
+`ffi_test_exports.h`: the header's `misc` line gains `test_keep_warm_engine`; replace `test_keep_warm` with
 
 ```cpp
-    bool found = false;
-    const auto cores = engine_cores(c.engine, &found);
-    if (!found || (cores && static_cast<size_t>(c.threads) > cores->size())) return 2;
-```
-
-and pass `cores.get()` as `forward_raw`'s last argument.
-
-`sglang_exl3_cpu_experts_keep_warm` (`:2748`): signature `(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns)`; replace `freeze_compute_cores(); if (!g_compute_cores.empty() && ...) return 2;` with the same three-line `engine_cores` lookup on `threads`, and the region's pin call with `pin_compute_worker(omp_get_thread_num(), cores.get(), pin_error);`.
-
-Replace `sglang_exl3_cpu_experts_set_cores` (`:2775-2790`) with:
-
-```cpp
-extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_engine_create(
-    const int32_t* cores, int32_t n, int64_t* engine) noexcept
-{
-    if (cores == nullptr || engine == nullptr || n < 1 || n > CPU_SETSIZE) return 2;
-    for (int i = 0; i < n; ++i) {
-        if (cores[i] < 0 || cores[i] >= CPU_SETSIZE) return 2;
-        for (int j = 0; j < i; ++j) if (cores[i] == cores[j]) return 2;
-    }
-    try {
-        auto list = std::make_shared<const std::vector<int>>(cores, cores + n);
-        std::lock_guard<std::mutex> lock(g_engines_mutex);
-        g_engines.push_back(std::move(list));
-        *engine = static_cast<int64_t>(g_engines.size());
-        return 0;
-    } catch (...) {
-        return 1;
-    }
-}
-
-extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_engine_free(int64_t engine) noexcept
-{
-    std::lock_guard<std::mutex> lock(g_engines_mutex);
-    if (engine < 1 || engine > static_cast<int64_t>(g_engines.size()) || !g_engines[engine - 1]) return 2;
-    g_engines[engine - 1].reset();
+  static std::atomic<int64_t>& test_keep_warm_engine_seen() {
+    static std::atomic<int64_t> engine{-1};
+    return engine;
+  }
+  static int test_keep_warm(int64_t engine, int32_t, const uint32_t* word, uint32_t seen, int64_t deadline_ns) {
+    test_keep_warm_count().fetch_add(1, std::memory_order_relaxed);
+    test_keep_warm_engine_seen().store(engine, std::memory_order_relaxed);
+    while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && expert_stream::now_ns() < deadline_ns)
+      _mm_pause();
     return 0;
-}
+  }
 ```
 
-`cpu_experts.h`: `using CpuExpertKeepWarm = int (*)(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns);`; in `CpuExpertConfig` after `forward`: `int64_t engine = 0;  // the kernel's engine (its core list), passed on every forward and keep-warm; 0: none`; in `run()`, `call.engine = config_.engine;` after `call.accumulate = ...`, and the keep-warm call becomes `config_.keep_warm(config_.engine, config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until)`.
+`test_keep_warm_address` also stores `-1` into `test_keep_warm_engine_seen()`; after `test_keep_warm_calls` add
 
-`ffi_exports.h` `enable_cpu_experts`: add `int64_t engine` after `int64_t forward`, set `config.engine = engine;`, and add "`engine` is the kernel's engine handle (0: none)." to its comment. `ffi_test_exports.h` `test_keep_warm` takes `(int64_t, int32_t, const uint32_t* word, uint32_t seen, int64_t deadline_ns)`.
+```cpp
+  // Test only: the engine the fake keep-warm's last call took (-1 before any call since test_keep_warm_address).
+  static int64_t test_keep_warm_engine() {
+    if constexpr (!Build::kFaults) {
+      test_only("test_keep_warm_engine");
+    } else {
+      return test_keep_warm_engine_seen().load(std::memory_order_relaxed);
+    }
+  }
+```
 
-`expert_stream_transport.py` `ExpertStreamHost.enable_cpu_experts`: add the keyword `engine: int = 0` (docstring: "``engine`` is the kernel's engine handle (``native_create_engine``), carried by every forward and keep-warm; 0 runs unpinned workers") and pass `int(engine)` after `int(forward)`.
+and after the `expert_stream_test_keep_warm_calls` export line, `TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_engine, Exports::test_keep_warm_engine); \`.
 
-`pool.py`: `CPU_EXPERTS_FORWARD_ABI_VERSION = 2`; append `("engine", ctypes.c_int64)` to `CpuExpertsForwardCall._fields_`; in the Protocol replace `native_set_cores` with
+`expert_stream_transport.py`: `ExpertStreamHost.enable_cpu_experts` takes the keyword `engine: int = 0` after `threads` (docstring: "``engine`` is the kernel's engine handle (``native_create_engine``), carried by every forward and keep-warm; 0 runs unpinned workers.") and passes `int(engine)` after `int(forward)`. After `test_keep_warm_calls`:
+
+```python
+    def test_keep_warm_engine(self) -> int:
+        """Test only: the engine the fake keep-warm's last call took (-1 before any call)."""
+        _refuse_test_only("test_keep_warm_engine", self.variant)
+        return int(self._module.expert_stream_test_keep_warm_engine())
+```
+
+`pool.py`: `CPU_EXPERTS_FORWARD_ABI_VERSION = 2`; append `("engine", ctypes.c_int64)` to `CpuExpertsForwardCall._fields_`; the Protocol docstring's "``native_forward`` and ``native_set_cores``" becomes "``native_forward``, ``native_keep_warm`` and ``native_create_engine``"; replace `native_set_cores` with
 
 ```python
     def native_create_engine(self, cores: Sequence[int]) -> int:
@@ -1240,13 +1912,11 @@ extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_en
         ...
 ```
 
-and update the class docstring's "``native_forward`` and ``native_set_cores``" to "``native_forward`` and ``native_create_engine``".
-
-`exl3.py`: replace `native_set_cores` with
+`exl3.py`: the module docstring's "(forward, keep-warm and core placement)" becomes "(forward, keep-warm and engines)"; replace `native_set_cores` with
 
 ```python
     def native_create_engine(self, cores) -> int:
-        """Create the kernel's engine on ``cores`` (the calling engine thread is worker 0)."""
+        """Create the kernel's engine on ``cores`` (the calling engine thread is worker 0); returns its handle."""
         import ctypes
 
         fn = self._native("sglang_exl3_cpu_experts_engine_create")
@@ -1258,7 +1928,10 @@ and update the class docstring's "``native_forward`` and ``native_set_cores``" t
         engine = ctypes.c_int64(0)
         result = fn(array, len(cores), ctypes.byref(engine))
         if result != 0:
-            raise RuntimeError(f"the EXL3 CPU kernel refused engine cores {list(cores)} ({result})")
+            raise RuntimeError(
+                f"the EXL3 CPU kernel refused engine cores {list(cores)} (status {result}): a core repeats or is out "
+                "of range"
+            )
         return engine.value
 
     def native_free_engine(self, engine) -> None:
@@ -1271,25 +1944,74 @@ and update the class docstring's "``native_forward`` and ``native_set_cores``" t
             raise RuntimeError(f"the EXL3 CPU kernel has no engine {engine}")
 ```
 
-`service.py`: in `__init__`, before `host.enable_cpu_experts(...)`, `self.engine = trait.native_create_engine(self.cores)`, and pass `engine=self.engine`; delete `self._cores_set` and, in `register`, the `if not self._cores_set:` block.
+`service.py`: in `__init__`, delete `self._cores_set = False`; before `host.enable_cpu_experts(...)` add `self.engine = trait.native_create_engine(self.cores)  # never freed: the engine thread may run to process exit`, and pass `engine=self.engine`; in `register`, delete the `if not self._cores_set:` block.
 
-Bench: `cpu_forward.cpp` creates one engine in `main` (replacing the `set_cores` call at `:294`: `if (sglang_exl3_cpu_experts_engine_create(cores.data(), cores.size(), &g_engine)) throw ...;` with a file-scope `int64_t g_engine = 0;`) and sets `call.engine = g_engine;` at `:203`. `full_stack.cpp` does the same at `:507` (`int64_t engine`), stores it in `StackConfig::engine` (new member in `stack.h` after `keep_warm_ns`, copied to `cpu.engine` at `:164`), and sets `call.engine` in the bare forward at `:294`.
+Bench (`expert_stream/bench/src`): `cpu_forward.cpp` gets, in its anonymous namespace after `namespace fs = std::filesystem;`, `int64_t g_engine = 0;  // the kernel's engine on the bench's cores, created in main`; `Workload::forward` sets `call.engine = g_engine;` after `call.threads`; `main`'s `set_cores` call (`:289-292`, its comment included) becomes
 
-- [ ] **Step 4: Run.** Commit:
+```cpp
+    // Cores must be distinct and in [0, CPU_SETSIZE); one that cannot be pinned fails the forward with status 1.
+    if (sglang_exl3_cpu_experts_engine_create(cores.data(), static_cast<int32_t>(cores.size()), &g_engine))
+      throw std::runtime_error("Cannot create the kernel's engine");
+```
+
+`full_stack.cpp` gets, after `namespace es = ::sglang::expert_stream;`, `int64_t g_engine = 0;  // the kernel's engine on placement.workers, created in main: the stack and the bare forwards run on it`; `stack_config` sets `c.engine = g_engine;` after `c.cores.assign(...)`; `bare_call` sets `call.engine = g_engine;` after `call.threads`; `main`'s `set_cores` call (`:507-509`) becomes
+
+```cpp
+    if (sglang_exl3_cpu_experts_engine_create(placement.workers.data(),
+                                              static_cast<int32_t>(placement.workers.size()), &g_engine) != 0)
+      throw std::runtime_error("Cannot create the kernel's engine");
+```
+
+`stack.h`: `StackConfig` gains, after `cores`, `int64_t engine = 0;  // the kernel's engine on cores (engine_create); 0: unpinned workers`, and the `Stack` constructor sets `cpu.engine = config_.engine;` after `cpu.cores = config_.cores;`.
+
+NVFP4 bench (`nvfp4_cpu/bench/src/cpu_forward.cpp`): after `namespace fs = std::filesystem;`, `int64_t g_engine=0; // the kernel's engine on the bench's cores, created in main`; `Workload::forward` sets `call.engine=g_engine;` beside `call.threads`; `main`'s `set_cores` line becomes `if (sglang_nvfp4_cpu_experts_engine_create(cores.data(),int32_t(cores.size()),&g_engine)) throw std::runtime_error("Kernel refused the engine's cores");`. `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp`: in its anonymous namespace before `int forward(`, `int64_t g_engine = 0;  // the kernel's engine on the cores main was given`; `forward` sets `call.engine = g_engine;`; `main`'s `set_cores` lines become
+
+```cpp
+    if (sglang_nvfp4_cpu_experts_engine_create(cores.data(), int32_t(cores.size()), &g_engine) != 0) {
+        std::fprintf(stderr, "engine_create refused\n"); return 1;
+    }
+```
+
+- [ ] **Step 4: Run.** Before committing, `grep -rn "set_cores\|forward_mutex\|Cores::" python/sglang/srt/layers/quantization/cpu_experts_common python/sglang/srt/layers/quantization/exl3_cpu/optimized python/sglang/srt/layers/quantization/nvfp4_cpu python/sglang/srt/layers/moe/cpu_experts python/sglang/kernels/jit/csrc/moe/expert_stream test/registered/unit/kernels test/manual/dsv41/nvfp4_cpu_forward_ab.cpp test/manual/dsv41/test_cpu_expert_pool_exl3.py`. Expected: no output (the vendored `exl3_cpu/moe_mul1.cpp` keeps its own `set_cores` and is outside these paths). Commit:
 
 ```bash
-git add python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_expert_forward_abi.h python/sglang/srt/layers/quantization/exl3_cpu/optimized/cpu_experts_cabi.h python/sglang/srt/layers/quantization/exl3_cpu/optimized/moe_mul1.cpp python/sglang/srt/layers/quantization/exl3_cpu/optimized/forward_plan.hpp python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_test_exports.h python/sglang/srt/layers/moe/cpu_experts/pool.py python/sglang/srt/layers/moe/cpu_experts/exl3.py python/sglang/srt/layers/moe/cpu_experts/service.py python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/cpu_forward.cpp python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/full_stack.cpp python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/stack.h
-git add -p python/sglang/kernels/ops/moe/expert_stream_transport.py
+git add python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts_abi.h python/sglang/srt/layers/quantization/cpu_experts_common/team.hpp python/sglang/srt/layers/quantization/cpu_experts_common/keep_warm.hpp python/sglang/srt/layers/quantization/cpu_experts_common/expert_forward.hpp python/sglang/srt/layers/quantization/cpu_experts_common/cabi.hpp python/sglang/srt/layers/quantization/exl3_cpu/optimized/cpu_experts_cabi.h python/sglang/srt/layers/quantization/exl3_cpu/optimized/kernel.cpp python/sglang/srt/layers/quantization/exl3_cpu/optimized/README.txt python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/cpu_experts_cabi.h python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/README.md python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_test_exports.h python/sglang/kernels/ops/moe/expert_stream_transport.py python/sglang/srt/layers/moe/cpu_experts/pool.py python/sglang/srt/layers/moe/cpu_experts/exl3.py python/sglang/srt/layers/moe/cpu_experts/service.py python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/cpu_forward.cpp python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/full_stack.cpp python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/stack.h python/sglang/srt/layers/quantization/nvfp4_cpu/bench/src/cpu_forward.cpp test/manual/dsv41/nvfp4_cpu_forward_ab.cpp
 git diff --cached --stat
-git commit -m "feat(cpu-experts): an engine handle carries each CPU expert engine's cores; set_cores removed
+git commit -m "feat(cpu-experts): engine handles carry each CPU expert engine's cores; forwards run at once, status 3 only for a free racing one
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01FVzWUFXT8SqY4pbyJn21Ft"
 ```
 
-`SYNC`, `RUN_CPU test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_pool.py test/registered/unit/kernels/test_cpu_expert_keep_warm.py`, `RUN_EXT test/manual/dsv41/test_cpu_expert_engines_exl3.py test/manual/dsv41/test_cpu_expert_pool_exl3.py`. Expected: PASS.
+`git diff --cached --stat` lists exactly those 22 files. `SYNC`, then the Step 2 `RUN_CPU` and `RUN_EXT` lines. Expected: PASS, every test of both runs (the RUN_EXT run rebuilds the extension once, since `kernel.cpp`'s headers changed).
 
-- [ ] **Step 5: Bit-exact gate and existing suites.** `CPU_CHECKS` `check` mode with `<task>` = `t2` (no server running). Expected: `ALL GREEN (check)`: every ISA tier's dumps equal the merge-base's, through both registrations, and the bare and full-stack benches' frozen outputs hold. Then `RUN_CPU SUITE_CPU`, `RUN_EXT SUITE_EXT`. Expected: Baseline counts plus this task's tests. NVFP4 is untouched: `test_nvfp4_cpu_experts.py` and `test_nvfp4_cpu_build.py` still pass with the v2 header (they ignore `engine`).
+- [ ] **Step 5: Bit-exact gates, the benches, and the existing suites.** No server may be running (`pgrep -f sglang.launch_server` finds nothing).
+
+1. EXL3: `CPU_CHECKS` `check` mode with `<task>` = `t2`. Expected: `ALL GREEN (check)`: every ISA tier's dumps equal the merge-base's through both registrations, and the bare and full-stack benches' frozen outputs hold (both now through `g_engine`).
+2. NVFP4, against the Step 2 commit (same kernel, the old harness with `set_cores`):
+
+```bash
+ssh divix01 'set -e; R=/data/models/slang/sglang; W=/data/models/slang/nvfp4-work;
+  [ -d $W/wt-nlane-t2base ] || git -C $R worktree add --detach $W/wt-nlane-t2base <T2_TEST>;
+  git -C $W/wt-nlane-t2base log -1 --oneline'
+ssh divix01 'W=/data/models/slang/nvfp4-work;
+  bash $W/wt-nlane-t2base/test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh $W/wt-nlane-t2base $W/nlane-nvfp4-t2base 2>&1 | tail -3; echo EXIT=${PIPESTATUS[0]};
+  bash $W/wt-nlane/test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh $W/wt-nlane $W/nlane-nvfp4-t2 $W/nlane-nvfp4-t2base 2>&1 | tail -3; echo EXIT=${PIPESTATUS[0]};
+  git -C /data/models/slang/sglang worktree remove $W/wt-nlane-t2base'
+```
+
+Expected: the first run `DUMPED avx2: ...`, `DUMPED scalar: ...`, `EXIT=0`; the second `PASS avx2 bit-exact vs avx2`, `PASS scalar bit-exact vs scalar`, `EXIT=0`.
+3. The full-stack bench's self-test: `BENCH nlane-bench-t2`. Expected: `BUILD=0` and `EXIT=0`.
+4. The NVFP4 bench builds and runs its README's smoke test through `g_engine`:
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-nlane && B=/data/models/slang/nvfp4-work/nlane-nvfp4-bench-t2; rm -rf $B/smoke;
+  taskset -c 0-63 cmake -S python/sglang/srt/layers/quantization/nvfp4_cpu/bench -B $B -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-15/root/usr/bin/g++ -DFETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK=/data/models/slang/nvfp4-work/cpubench-build/_deps/google_benchmark-src >/dev/null && taskset -c 0-63 cmake --build $B -j 16 2>&1 | tail -3; echo BUILD=${PIPESTATUS[0]};
+  NVFP4_BENCH_ROUNDS=2 NVFP4_BENCH_WORKERS=1,3 bash python/sglang/srt/layers/quantization/nvfp4_cpu/bench/run.sh $B $B/smoke --cpus=0-2 --numa-node=0 --hidden=80 --intermediate=80 --warmup-forwards=2 --benchmark_min_time=8x 2>&1 | tail -5; echo EXIT=${PIPESTATUS[0]}'
+```
+
+Expected: `BUILD=0` and `EXIT=0`.
+5. `RUN_CPU SUITE_CPU`, `RUN_EXT SUITE_EXT`, and, since `cpu_experts.h` is in every GPU-side CPU-expert path, `RUN_GPU test/manual/dsv41/test_cpu_split_calibration_cuda.py test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py test/manual/dsv41/test_dsv41_layer_fusion_gpu.py`. Expected: Baseline counts plus this task's new tests (`SUITE_CPU` already holds the NVFP4 files; `SUITE_EXT`'s file has one test fewer, `test_set_cores_after_the_first_forward_returns_2`, replaced by `test_cpu_expert_engines_exl3.py`); the GPU run passes, or exits 75 (the lock timed out: rerun).
 
 ---
 
@@ -3561,7 +4283,7 @@ implemented with `syscall(SYS_mbind, first, last - first, MPOL_BIND, &mask, size
 
 The constructor takes the group nodes (`std::vector<int> group_nodes`), allocates every slab with `capacity()` rows, and above one group calls `bind_pages(base + g * kGroupSlots * row_bytes[n], kGroupSlots * row_bytes[n], group_nodes[g])` for every slab and group before `write_row_image`. `out_stride` is `2 * Wire::kNodes * hidden * sizeof(float)`. `preload_slots` copies expert e into `slot_of(e)`; `register_layer` registers `capacity()` slots.
 
-`stack.h`: `StackConfig` replaces `service_cpu`, `threads`, `cores`, `split` with
+`stack.h`: `StackConfig` replaces `service_cpu`, `threads`, `cores`, `engine` (Task 2), `split` with
 
 ```cpp
   struct Group {
@@ -3577,7 +4299,7 @@ The constructor takes the group nodes (`std::vector<int> group_nodes`), allocate
 
 and the `Stack` constructor builds the tier with `ranges` repeated for every row (`{{0, capacity}}` when `ranges` is empty at one group), calls `enable_cpu_experts(g, ...)` for every group with `cpu.out_base = config_.out_base`, the group's `cores`, `threads = cores.size()`, `engine` and split, checks `check_dedicated_core` for every group's service CPU, and starts `Thread(tier_, service_cpus, ...)`. `group_counters(g)` forwards to the tier.
 
-`full_stack.cpp`: `Options` holds `std::optional<std::string> service_cpus, cpus, worker_nodes`; `resolve_placement` splits `--service-cpu` and `--worker-node` on `,` and `--cpus` on `/` into `Wire::kNodes` groups (throws "give one entry per NUMA group (N)" otherwise); the defaults at one group are today's (`17`, `18-33`, `1`); above one group `--self-test` defaults to writer 0, copy 1, services `2,3`, workers `4/5`, and a measured run is refused without explicit flags. `main` creates one engine per group with `sglang_exl3_cpu_experts_engine_create(group.workers...)`; `stack_config` fills `groups` (split `n -> n`, every eligible lane on the CPU, as today) and `ranges` (`{g * kGroupSlots, (g + 1) * kGroupSlots}`). In `Bench`, `enter_stack_phase` checks `sim_->ram_slot(row, e) == StackFixture::slot_of(e)`; `bare_call(int64_t row, int k, int group)` forwards the experts of `experts_[k]` homed on `group` (slots `slot_of(e)`, their weights) on that group's engine with its worker count into `out_row(row) + 2 * group * hidden`, called pinned to that group's worker 0; `validate(k, via_stack)` at one group is today's (bit-exact against `reference-e{k}.bin`); above one group the bare forwards come first, since a bare forward once the stack exists would share worker 0's core with a CPU expert thread (the class doc): `main`'s validate-only flow calls `record_bare(k)` for every k before any stack call, and BM_bare is not registered above one group.
+`full_stack.cpp`: `Options` holds `std::optional<std::string> service_cpus, cpus, worker_nodes`; `resolve_placement` splits `--service-cpu` and `--worker-node` on `,` and `--cpus` on `/` into `Wire::kNodes` groups (throws "give one entry per NUMA group (N)" otherwise); the defaults at one group are today's (`17`, `18-33`, `1`); above one group `--self-test` defaults to writer 0, copy 1, services `2,3`, workers `4/5`, and a measured run is refused without explicit flags. `main` creates one engine per group with `sglang_exl3_cpu_experts_engine_create(group.workers...)`, replacing Task 2's file-scope `g_engine` (`stack_config` and `bare_call` read the group's engine instead); `stack_config` fills `groups` (split `n -> n`, every eligible lane on the CPU, as today) and `ranges` (`{g * kGroupSlots, (g + 1) * kGroupSlots}`). In `Bench`, `enter_stack_phase` checks `sim_->ram_slot(row, e) == StackFixture::slot_of(e)`; `bare_call(int64_t row, int k, int group)` forwards the experts of `experts_[k]` homed on `group` (slots `slot_of(e)`, their weights) on that group's engine with its worker count into `out_row(row) + 2 * group * hidden`, called pinned to that group's worker 0; `validate(k, via_stack)` at one group is today's (bit-exact against `reference-e{k}.bin`); above one group the bare forwards come first, since a bare forward once the stack exists would share worker 0's core with a CPU expert thread (the class doc): `main`'s validate-only flow calls `record_bare(k)` for every k before any stack call, and BM_bare is not registered above one group.
 
 ```cpp
   // Above one group: every row's bare forward of each group's experts, on that group's engine and worker 0, kept for
@@ -3756,40 +4478,6 @@ Expected: only the tests this plan added (and the ones it moved or retired: `tes
 
 ---
 
-### Task 11: NVFP4 follows the engine ABI (touches files under concurrent edit)
+### Task 11: NVFP4 follows the engine ABI (merged into Task 2)
 
-**Schedule this task separately.** The user is editing `python/sglang/srt/layers/quantization/nvfp4_cpu/` (and planning `cpu_experts_common/`, Spec delta 22). Before starting: `git status --short python/sglang/srt/layers/quantization/` and `git log -3 --oneline -- python/sglang/srt/layers/quantization/nvfp4_cpu`; if either shows work in progress, stop and ask the user. Stage with `git add -p` only.
-
-**Files:**
-- Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/cpu_experts_cabi.h:33-42` (`set_cores` out; `engine_create`, `engine_free`)
-- Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/moe_mul1.cpp:30-75` (the forward mutex and the core globals), `:160-231` (`free_layer`, `set_cores`, `forward`), `moe_mul1.h:142-146`, `forward_plan.hpp:144-178` (`run_team`)
-- Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/README.md:40-47`
-- Modify: `python/sglang/srt/layers/quantization/nvfp4_cpu/bench/src/cpu_forward.cpp:371-381`, `test/manual/dsv41/nvfp4_cpu_forward_ab.cpp:143-145`
-- Modify (tests whose API changes): `test/registered/unit/kernels/test_nvfp4_cpu_experts.py` (the child's `set_cores` lines become `engine_create`), `test/registered/unit/kernels/test_nvfp4_cpu_build.py:26-29` (the exported symbols)
-
-**Interfaces:**
-- Consumes: `SglangCpuExpertsForward::engine`, ABI version 2 (Task 2).
-- Produces: `int sglang_nvfp4_cpu_experts_engine_create(const int32_t* cores, int32_t n, int64_t* engine)` (0; 2 for invalid, duplicate or not-allowed cores, as `set_cores` checked them); `int sglang_nvfp4_cpu_experts_engine_free(int64_t engine)`; the forward reads `call->engine` (0: unpinned; unknown or freed: 2; `threads` above the engine's cores: 1, as the team-size check did); two forwards on any engines run at once; status 3 only for `free_layer` while a forward runs.
-
-- [ ] **Step 1: Write the failing test.** In `test_nvfp4_cpu_experts.py`, the child takes a fifth argument, the number of concurrent engines (default 1). With cores given it creates `engines` engines over consecutive slices of the core list (`lib.sglang_nvfp4_cpu_experts_engine_create(slice, n, byref(handle))`, printing `engine <status>`), and with two engines runs each call list on both from two Python threads at once, printing `forward <engine> <threads> <status> <written|untouched>` and finally `same` when both engines' outputs are byte-equal. The existing expectations change only in the configuration lines (`cores 0` becomes `engine 0`; `test_cores_cannot_change_after_the_first_forward` becomes `test_a_freed_engine_is_refused`: after `engine_free`, a forward on it prints status 2). Add:
-
-```python
-def test_two_engines_forward_at_once_without_a_busy_status(library):
-    """Part 3: a CPU expert engine per NUMA group, both forwarding at once. The process-wide forward mutex returned 3
-    to the second; per-engine state lets both run and agree byte for byte."""
-    lines = _run(library, "2,2,2", cores=_allowed(4), engines="2")
-    assert lines[:2] == ["engine 0", "engine 0"]
-    assert all(line.split()[3] == "0" for line in lines if line.startswith("forward"))
-    assert lines[-1] == "same"
-```
-
-(`_run` passes `engines` as `sys.argv[5]`.) `test_nvfp4_cpu_build.py`'s symbol list replaces `sglang_nvfp4_cpu_experts_set_cores` with `sglang_nvfp4_cpu_experts_engine_create` and `sglang_nvfp4_cpu_experts_engine_free`.
-
-- [ ] **Step 2: Run it to verify it fails.** Commit the tests alone (`git add -p` the two files; `git diff --cached --stat` lists only them; message `test(nvfp4-cpu): per-engine cores, two engines at once (failing)` with the trailers). `SYNC`, `RUN_CPU test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_nvfp4_cpu_build.py`.
-Expected: FAIL, `AttributeError: .../libnvfp4.so: undefined symbol: sglang_nvfp4_cpu_experts_engine_create`.
-
-- [ ] **Step 3: Implement.** In `moe_mul1.cpp`: replace `forward_mutex` with `std::shared_mutex layer_mutex;` (comment: "Forwards hold it shared, so any number run at once; free_layer takes it exclusively and returns 3 while a forward runs, rather than free a layer under it."); the forward takes `std::shared_lock<std::shared_mutex> lock(layer_mutex, std::try_to_lock)` and returns 3 only if `free_layer` holds it; `free_layer` takes `std::unique_lock(..., std::try_to_lock)`. Replace the core globals and `freeze_compute_cores`/`pin_compute_worker` with Task 2 Step 3's `g_engines_mutex`, `g_engines`, `engine_cores` and `pin_compute_worker(worker, cores, pin_error)` code blocks, copied verbatim; `engine_create` keeps `set_cores`' checks (each core distinct, in `[0, CPU_SETSIZE)` and in `sched_getaffinity(0)` of the caller, else 2). The forward looks up `call->engine` (unknown or freed: 2) and passes its cores through `ForwardCtx` (a `const std::vector<int>* cores` member) to `run_team`, which keeps its team-size check against `ctx.cores->size()` and its pin check. `cpu_experts_cabi.h` declares the two new functions with Task 2's comments and drops `set_cores`; `moe_mul1.h:142-146` drops the core globals' declarations; `README.md:40-47` shows `engine_create` and `call.engine`. The NVFP4 bench (`cpu_forward.cpp:381`) and `nvfp4_cpu_forward_ab.cpp:143` create one engine and set `call.engine`.
-
-- [ ] **Step 4: Run.** Commit (`git add -p` every file above; `git diff --cached --stat` lists exactly them; message `feat(nvfp4-cpu): engine handles replace set_cores; forwards no longer exclude each other` with the trailers). `SYNC`, the Step 2 run, then `bash test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` in the worktree as its header describes (its bit-exact gate against the merge-base). Expected: PASS, and the script's all-green line.
-
-- [ ] **Step 5: Existing suites.** `RUN_CPU SUITE_CPU`. Expected: Baseline counts plus every task's tests.
+Merged into Task 2 (User decision 1, Spec delta 22): on `cpu_experts_common/`, `engine_create`/`engine_free`, the engine on forward and keep-warm, and status 3 only for a `free_layer` racing a forward come to both quants through `SGLANG_CPU_EXPERTS_DEFINE_CABI`, and Task 2 carries the NVFP4 tests (`test_nvfp4_cpu_experts.py::test_two_engines_forward_at_once_without_a_busy_status`), headers, README, bench and bit-exact gate. Nothing to do here; the heading keeps the task numbering.
