@@ -38,7 +38,7 @@ struct PostParams {
   int64_t hot_capacity;
   const int32_t* dst_slots;
   int64_t captured;
-  // The device's map bank (ExpertStreamDevice.map_bank): row-major [rows, experts] and [rows, Wire::kLanes] int32,
+  // The device's map bank (ExpertStreamDevice.map_bank): row-major [rows, experts] and [rows, Wire::kNodes * Wire::kLanes] int32,
   // int64 [rows] chain words, per-row eligibility. A graph replay reads what the previous deltas left here.
   int32_t* ram_slot;
   int32_t* staging;
@@ -52,9 +52,10 @@ struct PostParams {
   int64_t cpu_on;
   int64_t cpu_misses;
   // The post's outputs for the later kernels of the chain (C1 copies SM hits, S streams misses, CW waits for the copy
-  // engine): each lane's kind and source slot, and C1's compacted list of SM hits.
+  // engine): each lane's kind, source slot and home node, and C1's compacted list of SM hits.
   int32_t* lane_kind;
   int32_t* lane_slot;
+  int32_t* lane_node;
   int32_t* go_1;
   int64_t* host_rows_1;
   int32_t* dst_slots_1;
@@ -122,7 +123,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     if (count > 0) {
       const RowMap map{
           .ram_slot = p.ram_slot + p.row * p.experts,
-          .staging = p.staging + p.row * Wire::kLanes,
+          .staging = p.staging + p.row * (Wire::kNodes * Wire::kLanes),
           .map_chain = p.map_chain + p.row,
           .map_applied = p.map_applied + p.row,
           .experts = p.experts,
@@ -194,6 +195,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     const bool used = j < count;
     p.lane_kind[j] = used ? typed.kind[j] : 0;
     p.lane_slot[j] = used ? typed.slot[j] : -1;
+    p.lane_node[j] = used ? typed.node[j] : 0;
     if (!used) continue;
     any_miss = any_miss || typed.kind[j] == Wire::kKindMissGpu || typed.kind[j] == Wire::kKindMissCpu;
     if (typed.kind[j] == Wire::kKindHitSm) {
@@ -269,7 +271,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     if (ld_acquire_sys64(delta + Wire::kDeltaTag) != static_cast<uint64_t>(p.map_chain[row])) continue;
     const RowMap map{
         .ram_slot = p.ram_slot + row * p.experts,
-        .staging = p.staging + row * Wire::kLanes,
+        .staging = p.staging + row * (Wire::kNodes * Wire::kLanes),
         .map_chain = p.map_chain + row,
         .map_applied = p.map_applied + row,
         .experts = p.experts,
@@ -330,6 +332,7 @@ struct LeaseProtocolKernel {
       int64_t cpu_misses,
       tvm::ffi::TensorView lane_kind,
       tvm::ffi::TensorView lane_slot,
+      tvm::ffi::TensorView lane_node,
       tvm::ffi::TensorView go_1,
       tvm::ffi::TensorView host_rows_1,
       tvm::ffi::TensorView dst_slots_1,
@@ -376,7 +379,7 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "ram_slot", TensorMatcher({Rows_, experts}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ram_slot);
     expert_stream::verify_named(
-        "staging", TensorMatcher({Rows_, Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), staging);
+        "staging", TensorMatcher({Rows_, Wire::kNodes * Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), staging);
     expert_stream::verify_named(
         "map_chain", TensorMatcher({Rows_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), map_chain);
     expert_stream::verify_named(
@@ -391,6 +394,7 @@ struct LeaseProtocolKernel {
     for (auto [name, t] :
          {std::pair{"lane_kind", lane_kind},
           std::pair{"lane_slot", lane_slot},
+          std::pair{"lane_node", lane_node},
           std::pair{"dst_slots_1", dst_slots_1}}) {
       expert_stream::verify_named(
           name, TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), t);
@@ -460,6 +464,7 @@ struct LeaseProtocolKernel {
         .cpu_misses = cpu_misses,
         .lane_kind = static_cast<int32_t*>(lane_kind.data_ptr()),
         .lane_slot = static_cast<int32_t*>(lane_slot.data_ptr()),
+        .lane_node = static_cast<int32_t*>(lane_node.data_ptr()),
         .go_1 = static_cast<int32_t*>(go_1.data_ptr()),
         .host_rows_1 = static_cast<int64_t*>(host_rows_1.data_ptr()),
         .dst_slots_1 = static_cast<int32_t*>(dst_slots_1.data_ptr()),
@@ -494,7 +499,7 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "ram_slot", TensorMatcher({Rows_, E_}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ram_slot);
     expert_stream::verify_named(
-        "staging", TensorMatcher({Rows_, Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), staging);
+        "staging", TensorMatcher({Rows_, Wire::kNodes * Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), staging);
     expert_stream::verify_named(
         "map_chain", TensorMatcher({Rows_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), map_chain);
     expert_stream::verify_named(

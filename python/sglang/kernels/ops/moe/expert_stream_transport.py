@@ -2148,7 +2148,8 @@ class ExpertStreamDevice:
 
     ``map_bank`` is the device's copy of the RAM tier's map: ``ram_slot``
     ``[layers, experts]`` starts at -1 and changes only through the deltas the post
-    applies and ``map_bulk_apply``. ``map_chain`` starts at 1, because tag 1 is the
+    applies and ``map_bulk_apply``; ``staging`` is ``[layers, nodes * lanes]``, node-major.
+    ``map_chain`` starts at 1, because tag 1 is the
     attach delta, so a zero-filled delta record (tag 0) is never taken for a published
     one. Per row, ``ce_ok``/``dst_rows`` say the copy engine may take a hit and
     ``cpu_ok`` that the CPU may; the service sets them as it learns them and the post
@@ -2173,8 +2174,9 @@ class ExpertStreamDevice:
         hit_copy: str = "ce",
         cpu_misses: bool = False,
         lanes: int = 8,
+        nodes: int = 1,
     ) -> None:
-        self.wire = expert_lease_block.wire_layout(lanes)
+        self.wire = expert_lease_block.wire_layout(lanes, nodes)
         if (
             page.numel() != self.wire.page_bytes
             or page.dtype != torch.uint8
@@ -2262,7 +2264,10 @@ class ExpertStreamDevice:
                 (layers, experts), -1, dtype=torch.int32, device=device
             ),
             "staging": torch.full(
-                (layers, self.wire.lanes), -1, dtype=torch.int32, device=device
+                (layers, self.wire.nodes * self.wire.lanes),
+                -1,
+                dtype=torch.int32,
+                device=device,
             ),
             "map_chain": torch.ones(layers, dtype=torch.int64, device=device),
             "map_applied": torch.zeros(layers, dtype=torch.int64, device=device),
@@ -2275,10 +2280,11 @@ class ExpertStreamDevice:
         self._row_capacity_tensor = torch.tensor(
             self._row_capacities, dtype=torch.int32, device=device
         )
-        # The post's outputs: each lane's kind and source slot (S and CW read them), and
-        # C1's compacted SM hits, in one order.
+        # The post's outputs: each lane's kind, source slot (S and CW read them) and home
+        # node (CW reads it), and C1's compacted SM hits, in one order.
         self.lane_kind = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
         self.lane_slot = torch.full((self.wire.lanes,), -1, dtype=torch.int32, device=device)
+        self.lane_node = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
         self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
         self.host_rows_1 = torch.zeros(self.wire.lanes, dtype=torch.int64, device=device)
         self.dst_slots_1 = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
@@ -2299,7 +2305,9 @@ class ExpertStreamDevice:
     def _kernels(self):
         """Return the device module, loading it on first use."""
         if self._module is None:
-            self._module = _device_module(self._layout, self.wire.lanes)
+            self._module = _device_module(
+                self._layout, self.wire.lanes, self.wire.nodes
+            )
         return self._module
 
     def enable_cpu_experts(self, x_rows: torch.Tensor, out_rows: torch.Tensor) -> None:
@@ -2485,6 +2493,7 @@ class ExpertStreamDevice:
             int(self.cpu_misses and cpu_on),
             self.lane_kind,
             self.lane_slot,
+            self.lane_node,
             self.go_1,
             self.host_rows_1,
             self.dst_slots_1,
@@ -2569,6 +2578,7 @@ class ExpertStreamDevice:
             self._lease_address,
             self.lane_kind,
             self.lane_slot,
+            self.lane_node,
             dst_slots,
             sm_address,
             sm_count,

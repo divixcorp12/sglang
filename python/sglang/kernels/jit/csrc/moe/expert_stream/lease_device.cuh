@@ -160,6 +160,7 @@ SGL_DEVICE int64_t ring_index(uint32_t seq) {
 struct TypedLanes {
   int32_t slot[Wire::kLanes];  // the RAM slot of a hit, the staging slot of a miss
   uint8_t kind[Wire::kLanes];  // kKind*
+  int32_t node[Wire::kLanes];  // the lane's home node (Wire::home of its expert)
 };
 
 SGL_DEVICE bool is_cpu_kind(uint32_t kind) {
@@ -259,7 +260,7 @@ SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& 
 // RAM-tier map. The post applies the host's deltas to it and types lanes from it.
 struct RowMap {
   int32_t* ram_slot;     // [experts]: the expert's RAM slot, -1 when not resident
-  int32_t* staging;      // [Wire::kLanes]: the row's staging slots
+  int32_t* staging;      // [Wire::kNodes * Wire::kLanes], node-major: the row's staging slots per node
   int64_t* map_chain;    // the row's chain word
   int64_t* map_applied;  // the chain number of the row's last applied delta
   int64_t experts;
@@ -269,7 +270,7 @@ struct RowMap {
 // A row's map delta in registers. load_map_delta issues every load before it uses any, so their round trips overlap.
 struct MapDelta {
   uint32_t count;
-  int32_t staging[Wire::kLanes];
+  int32_t staging[Wire::kNodes * Wire::kLanes];
   int32_t expert[Wire::kDeltaMaxEntries];
   int32_t slot[Wire::kDeltaMaxEntries];
 };
@@ -288,7 +289,7 @@ SGL_DEVICE bool await_map_delta(const uint8_t* delta, const RowMap& map, uint64_
 
 // Loads the delta's payload. Call only after await_map_delta's acquire of the tag.
 SGL_DEVICE MapDelta load_map_delta(const uint8_t* delta) {
-  constexpr int kStagingLoads = Wire::kLanes / 8;  // node 0's staging list: the only node a post applies
+  constexpr int kStagingLoads = Wire::kNodes * Wire::kLanes / 8;
   constexpr int kEntryLoads = static_cast<int>(Wire::kDeltaMaxEntries / 4);
   static_assert(Wire::kDeltaStaging % 16 == 0 && Wire::kDeltaEntries % 16 == 0, "16-byte delta loads");
   MapDelta d;
@@ -338,7 +339,7 @@ SGL_DEVICE void apply_map_delta(const MapDelta& d, const RowMap& map) {
     }
   }
 #pragma unroll
-  for (int k = 0; k < Wire::kLanes; ++k)
+  for (int k = 0; k < Wire::kNodes * Wire::kLanes; ++k)
     map.staging[k] = d.staging[k];
   *map.map_applied = *map.map_chain;
 }
@@ -359,44 +360,49 @@ struct LanePolicy {
   bool ce_ok;        // the row's copy table is set
   bool cpu_ok;       // the row's CPU layer is registered
   int32_t dst_rows;
-  int32_t split[Wire::kLanes + 1];  // Wire::kSplit: CPU lanes per n eligible lanes
+  int32_t split[Wire::kNodes][Wire::kLanes + 1];  // Wire::kSplit: per node, CPU lanes per n eligible lanes
 };
 
-// Loads Wire::kSplit's table in whole 16-byte loads; words past the table are dropped.
-SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kLanes + 1]) {
+// Loads every node's Wire::kSplit table in whole 16-byte loads; words past a table are dropped.
+SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kNodes][Wire::kLanes + 1]) {
   constexpr int kLoads = static_cast<int>(Wire::kSplitStride / 16);
-  static_assert(Wire::kSplit % 16 == 0 && Wire::kSplit + Wire::kSplitStride <= Wire::kLeaseBlockBytes, "split loads");
-  uint4 v[kLoads];
+  static_assert(
+      Wire::kSplit % 16 == 0 && Wire::kSplit + Wire::kNodes * Wire::kSplitStride <= Wire::kLeaseBlockBytes,
+      "split loads");
 #pragma unroll
-  for (int i = 0; i < kLoads; ++i)
-    v[i] = ld_relaxed_sys_v4(split + 16 * i);
+  for (int node = 0; node < Wire::kNodes; ++node) {
+    uint4 v[kLoads];
 #pragma unroll
-  for (int n = 0; n <= Wire::kLanes; ++n) {
-    const uint4 q = v[n / 4];
-    const uint32_t words[4] = {q.x, q.y, q.z, q.w};
-    out[n] = static_cast<int32_t>(words[n % 4]);
+    for (int i = 0; i < kLoads; ++i)
+      v[i] = ld_relaxed_sys_v4(split + node * Wire::kSplitStride + 16 * i);
+#pragma unroll
+    for (int n = 0; n <= Wire::kLanes; ++n) {
+      const uint4 q = v[n / 4];
+      const uint32_t words[4] = {q.x, q.y, q.z, q.w};
+      out[node][n] = static_cast<int32_t>(words[n % 4]);
+    }
   }
 }
 
 // Types each lane of the plan: its kind and source slot. Transcribes ram_slot_map.type_lanes, the host reference.
 //
-// A hit takes its RAM slot and the m-th miss the m-th staging slot. The CPU takes the last split[n] of the n eligible
-// lanes in plan order. Traps where the reference raises: a plan wider than Wire::kLanes, an expert out of range or
-// repeated, a hit slot past the row's capacity, a miss with no staging slot, a split entry above n. Reads no host
-// memory; the caller loads the split table into the policy.
+// A hit takes its RAM slot, and a miss the next slot of its home node's staging list. Node n's CPU takes the last
+// split[n][k] of its k eligible lanes in plan order. Traps where the reference raises: a plan wider than Wire::kLanes,
+// an expert out of range or repeated, a hit slot past the row's capacity, a miss with no staging slot on its node, a
+// split entry above its n. Reads no host memory; the caller loads the split table into the policy.
 SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
   if (plan.count > Wire::kLanes) __trap();
   int64_t expert[Wire::kLanes];
   int32_t dst[Wire::kLanes];
   int32_t ram[Wire::kLanes];
-  int32_t staging[Wire::kLanes];
+  int32_t staging[Wire::kNodes * Wire::kLanes];
 #pragma unroll
   for (int j = 0; j < Wire::kLanes; ++j) {
     expert[j] = j < plan.count ? plan.planned[j] : 0;
     dst[j] = j < plan.count ? plan.dst[j] : -1;
   }
 #pragma unroll
-  for (int k = 0; k < Wire::kLanes; ++k)
+  for (int k = 0; k < Wire::kNodes * Wire::kLanes; ++k)
     staging[k] = map.staging[k];
 #pragma unroll
   for (int j = 0; j < Wire::kLanes; ++j)
@@ -406,30 +412,37 @@ SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
     ram[j] = j < plan.count ? map.ram_slot[expert[j]] : -1;
   bool hit[Wire::kLanes];
   bool eligible[Wire::kLanes];
-  int m = 0;
-  int n = 0;
+  int m[Wire::kNodes] = {};
+  int n[Wire::kNodes] = {};
 #pragma unroll
   for (int j = 0; j < Wire::kLanes; ++j) {
     if (j >= plan.count) break;
     for (int i = 0; i < j; ++i)
       if (expert[i] == expert[j]) __trap();
+    const int node = Wire::home(expert[j]);
+    out.node[j] = node;
     hit[j] = ram[j] >= 0;
     if (hit[j]) {
       if (static_cast<uint32_t>(ram[j]) >= map.row_capacity) __trap();
       out.slot[j] = ram[j];
     } else {
-      if (m >= Wire::kLanes || staging[m] < 0) __trap();
-      out.slot[j] = staging[m++];
+      if (m[node] >= Wire::kLanes || staging[node * Wire::kLanes + m[node]] < 0) __trap();
+      out.slot[j] = staging[node * Wire::kLanes + m[node]++];
     }
     eligible[j] = policy.host_lanes && policy.cpu_on && policy.cpu_ok && (hit[j] || policy.cpu_misses);
-    n += eligible[j] ? 1 : 0;
+    n[node] += eligible[j] ? 1 : 0;
   }
-  int take = n > 0 ? policy.split[n] : 0;
-  if (take < 0 || take > n) __trap();
+  int take[Wire::kNodes];
+#pragma unroll
+  for (int node = 0; node < Wire::kNodes; ++node) {
+    take[node] = n[node] > 0 ? policy.split[node][n[node]] : 0;
+    if (take[node] < 0 || take[node] > n[node]) __trap();
+  }
   const bool copy_ok = policy.host_lanes && policy.hit_copy_ce && policy.ce_ok;
   for (int64_t j = plan.count - 1; j >= 0; --j) {
-    const bool cpu = take > 0 && eligible[j];
-    if (cpu) --take;
+    const int node = out.node[j];
+    const bool cpu = take[node] > 0 && eligible[j];
+    if (cpu) --take[node];
     uint8_t kind;
     if (cpu) {
       kind = hit[j] ? Wire::kKindHitCpu : Wire::kKindMissCpu;
@@ -443,4 +456,3 @@ SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
 }
 
 }  // namespace device::expert_stream
-}  // namespace sglang

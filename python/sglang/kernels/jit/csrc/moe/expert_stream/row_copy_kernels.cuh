@@ -243,6 +243,7 @@ struct CopyWaitParams {
   uint8_t* lease;
   const int32_t* lane_kind;
   const int32_t* lane_slot;
+  const int32_t* lane_node;  // each lane's home node: its CPU part pair
   const int32_t* dst_slots;
   const int64_t* sm_table;
   int64_t sm_count;
@@ -254,12 +255,13 @@ struct CopyCommitParams {
   const int32_t* state;
   const uint8_t* lease;
   const int32_t* ce_mask;
-  // CPU experts, two words: {the lanes the CPU computed, the output parts holding their partial sums (bit 0: part 0,
-  // the CPU hits'; bit 1: part 1, the CPU misses')}, else 0; null when off.
+  // CPU experts, two words: {the lanes the CPU computed, the output parts holding their partial sums (bit 2g + 0: group
+  // g's CPU hits', bit 2g + 1: its CPU misses')}, else 0; null when off.
   int32_t* cpu_lanes;
 };
 
 static_assert(device::expert_stream::Wire::kLanes <= 32, "a lane mask is one u32");
+static_assert(2 * device::expert_stream::Wire::kNodes <= 32, "a part mask is one u32");
 
 // CW: see CopyWaitParams. Closes the gate only when a copy-engine or CPU lane exists, and opens it itself when
 // CopyDone already holds G.
@@ -274,7 +276,7 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   __shared__ int32_t sm_dst[Wire::kLanes];
   __shared__ uint32_t copying;    // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
   __shared__ uint32_t cpu;        // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
-  __shared__ uint32_t cpu_parts;  // bit 0: a kHitCpu lane (output part 0); bit 1: a kMissCpu lane (part 1)
+  __shared__ uint32_t cpu_parts;  // bit 2g: a kHitCpu lane of node g (output part 2g); bit 2g + 1: a kMissCpu lane (part 2g + 1)
   const int64_t planned_count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
@@ -285,8 +287,9 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
     for (int64_t lane = 0; lane < planned_count && lane < Wire::kLanes; ++lane) {
       const uint32_t kind = static_cast<uint32_t>(p.lane_kind[lane]);
       if (is_cpu_kind(kind)) u |= 1u << lane;
-      if (kind == Wire::kKindHitCpu) parts |= 1u;
-      if (kind == Wire::kKindMissCpu) parts |= 2u;
+      const uint32_t pair = 2u * static_cast<uint32_t>(p.lane_node[lane]);
+      if (kind == Wire::kKindHitCpu) parts |= 1u << pair;
+      if (kind == Wire::kKindMissCpu) parts |= 2u << pair;
       if (kind != Wire::kKindHitCopy) continue;
       c |= 1u << lane;
       sm_host[lane] = p.lane_slot[lane];
@@ -355,7 +358,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     __trap();
   if (p.cpu_lanes != nullptr) {
     p.cpu_lanes[0] = p.ce_mask[1];
-    p.cpu_lanes[1] = p.ce_mask[2] & 0x3;
+    p.cpu_lanes[1] = p.ce_mask[2];
   }
 }
 
@@ -477,6 +480,7 @@ struct RowCopyKernel {
       int64_t lease_address,
       tvm::ffi::TensorView lane_kind,
       tvm::ffi::TensorView lane_slot,
+      tvm::ffi::TensorView lane_node,
       tvm::ffi::TensorView dst_slots,
       int64_t sm_table_address,
       int64_t sm_count,
@@ -497,6 +501,8 @@ struct RowCopyKernel {
         "lane_kind", TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_kind);
     expert_stream::verify_named(
         "lane_slot", TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_slot);
+    expert_stream::verify_named(
+        "lane_node", TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), lane_node);
     expert_stream::verify_named(
         "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
@@ -525,6 +531,7 @@ struct RowCopyKernel {
         .lease = reinterpret_cast<uint8_t*>(lease_address),
         .lane_kind = static_cast<const int32_t*>(lane_kind.data_ptr()),
         .lane_slot = static_cast<const int32_t*>(lane_slot.data_ptr()),
+        .lane_node = static_cast<const int32_t*>(lane_node.data_ptr()),
         .dst_slots = static_cast<const int32_t*>(dst_slots.data_ptr()),
         .sm_table = reinterpret_cast<const int64_t*>(sm_table_address),
         .sm_count = sm_count,
