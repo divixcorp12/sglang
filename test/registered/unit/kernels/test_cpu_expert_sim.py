@@ -460,3 +460,46 @@ def test_without_protect_reads_a_vram_hot_route_is_not_read_into_ram():
     off = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred", protect_reads=False)
     assert on["residency"]["ram_inserted_rows_per_token"] == 2  # 0 (VRAM-hot, routed) and 2
     assert off["residency"]["ram_inserted_rows_per_token"] == 1  # only the VRAM miss 2
+
+
+def _insert_every_cpu_lane(layer, lanes):
+    return lanes
+
+
+def test_a_cpu_insert_frees_its_victim_now_and_maps_the_expert_a_forward_later():
+    # Shortlist [expert 2, 1, 0]: lane 0 (expert 5, CPU) takes expert 2's slot as a fill, lane 1 (6) expert 1's.
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]}, cpu_insert=_insert_every_cpu_lane)
+    assert sim.resident(0) == {0, 6}
+    assert sim.slots[0][2] == tier_sim.FILLING
+    assert sim.cpu_insert_last == {0: 1} and sim.cpu_insert_issued == 1 and sim.cpu_inserted == 0
+    assert 2 not in sim._rank(0)  # a FILLING slot is never shortlisted
+    sim.graph_forward({0: [0]})
+    assert sim.resident(0) == {0, 5, 6} and sim.cpu_inserted == 1
+    assert tier_sim.FILLING not in sim.slots[0]
+
+
+def test_a_fill_whose_expert_was_inserted_elsewhere_frees_its_slot():
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]}, cpu_insert=_insert_every_cpu_lane)
+    sim.graph_forward({0: [5]})  # 5 misses (its slot is FILLING) and a normal lane inserts it elsewhere
+    assert sim.slots[0].count(5) == 1
+    assert sim.slots[0][2] == -1 and sim.cpu_insert_dropped == 1 and sim.cpu_inserted == 0
+
+
+def test_a_landing_expert_routed_again_on_the_cpu_does_not_fill_a_second_slot():
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    on_cpu = lambda layer, misses: set(misses)  # noqa: E731
+    sim.graph_forward({0: [5]}, cpu_lanes=on_cpu, cpu_insert=_insert_every_cpu_lane)
+    sim.graph_forward({0: [5]}, cpu_lanes=on_cpu, cpu_insert=_insert_every_cpu_lane)
+    assert sim.slots[0].count(5) == 1 and tier_sim.FILLING not in sim.slots[0]
+    assert sim.cpu_inserted == 1 and sim.cpu_insert_issued == 1
+
+
+def test_deferred_inserts_never_take_a_filling_slot():
+    # Same forward: the fill holds expert 2's old slot, so the deferred 7 must take another spare entry.
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    sim.graph_forward(
+        {0: [5]}, cpu_lanes=lambda layer, misses: set(misses), cpu_insert=_insert_every_cpu_lane, deferred={0: [7]}
+    )
+    assert sim.slots[0][2] == tier_sim.FILLING and 7 in sim.resident(0)
