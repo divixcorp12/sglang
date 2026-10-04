@@ -376,3 +376,38 @@ def test_route_tables_match_the_torch_chain(
             f"trial {trial}: weight_sorted"
         )
         assert torch.equal(det, det_ref), f"trial {trial}: det"
+
+
+@pytest.mark.parametrize("parts", [0b01, 0b10, 0b11, 0b0101, 0b1111, 0b1010])
+def test_route_tables_seed_every_flagged_cpu_part_in_part_order(parts):
+    """Two groups' CPU partial sums are four parts: 2g the hits', 2g + 1 the misses'. The seed adds every flagged part,
+    lowest first, so one node's (parts 0 and 1) is bit for bit today's."""
+    from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
+
+    routes, slots, hidden = 4, 12, 256
+    dev = "cuda"
+    gen = torch.Generator().manual_seed(parts)
+    host = (torch.randn(4, hidden, generator=gen) * 1e3).pin_memory()
+    remap = torch.arange(routes, dtype=torch.int32, device=dev)
+    weights = torch.ones(routes, device=dev)
+    keep = torch.ones(1, device=dev)
+    x = torch.randn(1, hidden, device=dev)
+    out = torch.full((1, hidden), 5.0, device=dev)
+    args = dict(
+        remap64_out=torch.empty(routes, dtype=torch.int64, device=dev),
+        x16_out=torch.empty(1, hidden, dtype=torch.float16, device=dev), out_zero=out,
+        expert_count=torch.empty(slots + 1, dtype=torch.int64, device=dev),
+        inv_order=torch.empty(routes, dtype=torch.int64, device=dev),
+        weight_sorted=torch.empty(routes, dtype=torch.float16, device=dev),
+        det=torch.empty(3, slots + 1, dtype=torch.int64, device=dev),
+    )
+    exl3_moe_route_tables(
+        remap, weights, keep, x, **args, cpu_lanes=torch.tensor([0, parts], dtype=torch.int32, device=dev),
+        dst_slots=torch.arange(routes, dtype=torch.int32, device=dev), cpu_out=host.data_ptr(), cpu_part_stride=hidden,
+    )
+    torch.cuda.synchronize()
+    want = torch.zeros(hidden)
+    for p in range(4):
+        if parts >> p & 1:
+            want = want + host[p]
+    assert torch.equal(out.cpu()[0], want)

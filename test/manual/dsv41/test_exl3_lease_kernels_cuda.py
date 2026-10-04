@@ -29,7 +29,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (  # noqa: E402
     ExpertStreamDevice,
     new_page,
 )
-from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
+from sglang.srt.layers.moe.ram_slot_map import LaneKind, type_lanes  # noqa: E402
 
 W = lease.wire_layout(8)
 
@@ -287,8 +287,8 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
         torch.full((1, w.lanes), -1, dtype=torch.int32, device="cuda"),
         torch.ones(1, dtype=torch.int64, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda"),
         zeros_u8, zeros_u8.clone(), torch.zeros(1, dtype=torch.int32, device="cuda"), row_capacity, 0, 0, 0,
-        out["kind"], out["slot"], torch.zeros(1, dtype=torch.int32, device="cuda"), host_rows_1, out["dst_1"],
-        no_i32, 0, no_i32, 0,
+        out["kind"], out["slot"], torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
+        torch.zeros(1, dtype=torch.int32, device="cuda"), host_rows_1, out["dst_1"], no_i32, 0, no_i32, 0,
     )
     torch.cuda.synchronize()
     record = page[w.demand_ring : w.demand_ring + w.record_bytes].clone()
@@ -311,3 +311,108 @@ def test_each_device_build_is_compiled_for_its_node_count(lanes, nodes):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, cpu_on=False):
+    """One post of the node-aware device build over one row: ``ram`` its slot map, ``staging`` node-major, ``split``
+    node-major (written to the block and armed when given). Returns the lanes' kinds, slots and nodes."""
+    w = lease.wire_layout(lanes, nodes)
+    count, experts = len(planned), len(ram)
+    page = ops.new_page(pin=True, wire=w)
+    block = lease.new_lease_block(1, pin=True, wire=w)
+    delta = w.lease_block_bytes
+    block[delta : delta + 8].view(torch.int64)[0] = 1
+    block[delta + w.delta_fields["staging"] :][: 2 * nodes * w.lanes].view(torch.int16)[:] = torch.tensor(
+        staging, dtype=torch.int16
+    )
+    if split is not None:
+        block[w.copy_armed : w.copy_armed + 4].view(torch.int32)[0] = 1
+        for node in range(nodes):
+            at = w.split + node * w.split_stride
+            block[at : at + 4 * (w.lanes + 1)].view(torch.int32)[:] = torch.tensor(
+                split[node * (w.lanes + 1) : (node + 1) * (w.lanes + 1)], dtype=torch.int32
+            )
+    cuda = dict(device="cuda")
+    planned_t = torch.tensor(planned, dtype=torch.int64, **cuda)
+    out = {n: torch.zeros(w.lanes, dtype=torch.int32, **cuda) for n in ("kind", "slot", "node", "dst_1")}
+    zeros_u8 = torch.zeros(1, dtype=torch.uint8, **cuda)
+    no_i64, no_i32 = torch.empty(0, dtype=torch.int64, **cuda), torch.empty(0, dtype=torch.int32, **cuda)
+    if cpu_on:  # a CPU lane needs a staged input, else the post traps
+        cpu_buf = torch.zeros(64, dtype=torch.float32).pin_memory()
+        cpu_args = (torch.zeros(1, 8, dtype=torch.float32, **cuda), int(cpu_buf.data_ptr()),
+                    torch.ones(count, dtype=torch.float32, **cuda))
+    else:
+        cpu_buf, cpu_args = None, (no_i32, 0, no_i32)
+    ops._device_module("exl3", lanes, nodes).expert_stream_post(
+        page, torch.zeros(len(ops.STATE_WORDS), dtype=torch.int32, **cuda), planned_t,
+        torch.tensor([count], dtype=torch.int32, **cuda), planned_t.clone(), 0, experts, int(block.data_ptr()),
+        5_000_000_000, 0, 0, no_i64, 0, torch.arange(count, dtype=torch.int32, **cuda), int(captured),
+        torch.tensor([ram], dtype=torch.int32, **cuda), torch.full((1, nodes * w.lanes), -1, dtype=torch.int32, **cuda),
+        torch.ones(1, dtype=torch.int64, **cuda), torch.zeros(1, dtype=torch.int64, **cuda),
+        zeros_u8, torch.ones(1, dtype=torch.uint8, **cuda), torch.full((1,), w.lanes, dtype=torch.int32, **cuda), 64,
+        0, int(cpu_on), 0, out["kind"], out["slot"], out["node"], torch.zeros(1, dtype=torch.int32, **cuda),
+        torch.zeros(w.lanes, dtype=torch.int64, **cuda), out["dst_1"], *cpu_args, 0,
+    )
+    torch.cuda.synchronize()
+    del cpu_buf
+    return [out[n][:count].tolist() for n in ("kind", "slot", "node")]
+
+
+@pytest.mark.parametrize("lanes", [8, 16, 32])
+@pytest.mark.parametrize("nodes", [1, 2])
+def test_each_miss_takes_the_next_staging_slot_of_its_home_node(lanes, nodes):
+    """The device's typing equals ram_slot_map.type_lanes's on random plans of hits and misses on every node."""
+    w = lease.wire_layout(lanes, nodes)
+    rng = random.Random(lanes * 10 + nodes)
+    experts = 4 * lanes
+    for _ in range(20):
+        count = rng.randint(1, lanes)
+        planned = rng.sample(range(experts), count)
+        ram = [rng.randrange(64) if rng.random() < 0.4 else -1 for _ in range(experts)]
+        staging = [100 * (n + 1) + k for n in range(nodes) for k in range(w.lanes)]
+        kinds, slots, homes = _raw_post(lanes, nodes, planned, ram, staging)
+        want_kinds, want_slots = type_lanes(
+            planned, ram, staging, [0] * (nodes * (w.lanes + 1)), lanes=w.lanes, captured=False, copy_armed=False,
+            hit_copy="ce", cpu_on=False, cpu_misses=False, nodes=nodes,
+        )
+        assert (kinds, slots) == ([int(k) for k in want_kinds], want_slots)
+        assert homes == [w.home(e) for e in planned]
+
+
+def test_the_split_is_per_node_and_a_zero_split_keeps_a_node_off_the_cpu():
+    lanes, nodes = 8, 2
+    w = lease.wire_layout(lanes, nodes)
+    split = [0] * (nodes * (w.lanes + 1))
+    split[3] = 2  # node 0: 2 of 3 eligible lanes; node 1's table is all zero
+    planned, ram = [0, 1, 2, 3, 4, 5], list(range(16))
+    staging = [100 * (n + 1) + k for n in range(nodes) for k in range(w.lanes)]
+    kinds, _, _ = _raw_post(lanes, nodes, planned, ram, staging, split=split, captured=True, cpu_on=True)
+    want, _ = type_lanes(planned, ram, staging, split, lanes=w.lanes, captured=True, copy_armed=True, hit_copy="sm",
+                         cpu_on=True, cpu_misses=False, nodes=nodes)
+    assert kinds == [int(k) for k in want] == [int(LaneKind.HIT_SM), int(LaneKind.HIT_SM), int(LaneKind.HIT_CPU),
+                                               int(LaneKind.HIT_SM), int(LaneKind.HIT_CPU), int(LaneKind.HIT_SM)]
+
+
+_NODE_TRAP_SCRIPT = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from test_exl3_lease_kernels_cuda import _raw_post
+staging = [100 + k for k in range(8)] + [200, 201] + [-1] * 6
+print("slots", _raw_post(8, 2, [1, 3, 0, 2, 4, 6, 8], [-1] * 16, staging)[1], flush=True)
+try:
+    _raw_post(8, 2, [1, 3, 5], [-1] * 16, staging)
+    print("reached", flush=True)
+except Exception as error:
+    print("trapped", type(error).__name__, flush=True)
+"""
+
+
+def test_a_node_out_of_staging_traps_while_the_other_node_has_slots():
+    """Review Focus 1: node 1 has 2 staging slots and node 0 eight. Seven misses, two on node 1, take node 1's two
+    and node 0's first five; three misses on node 1 trap, although node 0 has slots to spare."""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_NODE_TRAP_SCRIPT), str(Path(__file__).parent)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert "slots [200, 201, 100, 101, 102, 103, 104]" in result.stdout, (result.stdout, result.stderr[-2000:])
+    assert "reached" not in result.stdout and "trapped" in result.stdout, (result.stdout, result.stderr[-2000:])

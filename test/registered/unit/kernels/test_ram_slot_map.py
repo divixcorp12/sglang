@@ -2,6 +2,7 @@
 
 import pytest
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.srt.layers.moe.ram_slot_map import LaneKind, MapReplica, type_lanes
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -99,3 +100,54 @@ def test_replica_bulk_writes_entries_across_rows():
     m = MapReplica(rows=2, experts=3, lanes=8)
     m.apply_bulk([(0, 1, 4), (1, 2, 7), (0, 1, -1)])
     assert m.ram_slot == [[-1, -1, -1], [-1, -1, 7]]
+
+
+def _staging(nodes, lanes, counts):
+    """Node-major lists: node n's k-th staging slot is 100 * (n + 1) + k, its first counts[n] of them valid."""
+    return [100 * (n + 1) + k if k < counts[n] else -1 for n in range(nodes) for k in range(lanes)]
+
+
+def test_each_miss_takes_the_next_staging_slot_of_its_home_node():
+    ram = [-1] * 16
+    ram[2], ram[5] = 7, 9
+    kinds, slots = type_lanes(
+        [1, 2, 3, 4, 5, 6], ram, _staging(2, 8, [8, 8]), [0] * 18, lanes=8, captured=False, copy_armed=False,
+        hit_copy="ce", cpu_on=False, cpu_misses=False, nodes=2,
+    )
+    # experts 1 and 3 are node 1's misses, 4 and 6 node 0's; 2 and 5 are hits
+    assert slots == [200, 7, 201, 100, 9, 101]
+    assert kinds == [LaneKind.MISS_GPU, LaneKind.HIT_SM, LaneKind.MISS_GPU, LaneKind.MISS_GPU, LaneKind.HIT_SM,
+                     LaneKind.MISS_GPU]
+
+
+def test_misses_homed_on_one_node_draw_only_on_that_nodes_list():
+    """Review Focus 1, the reference: all misses on node 1 use node 1's list and leave node 0's untouched; one miss
+    past node 1's list raises even though node 0 has slots."""
+    staging = _staging(2, 8, [8, 2])
+    _, slots = type_lanes([1, 3], [-1] * 16, staging, [0] * 18, lanes=8, captured=False, copy_armed=False,
+                          hit_copy="ce", cpu_on=False, cpu_misses=False, nodes=2)
+    assert slots == [200, 201]
+    with pytest.raises(ValueError, match="no staging slot on node 1"):
+        type_lanes([1, 3, 5], [-1] * 16, staging, [0] * 18, lanes=8, captured=False, copy_armed=False,
+                   hit_copy="ce", cpu_on=False, cpu_misses=False, nodes=2)
+
+
+def test_the_cpu_split_is_per_node_and_a_zero_split_leaves_a_node_on_the_gpu():
+    lanes = 8
+    ram = list(range(16))  # every expert a hit
+    split = [0] * (2 * (lanes + 1))
+    split[0 * (lanes + 1) + 3] = 2  # node 0: 2 of its 3 eligible lanes on the CPU
+    kinds, _ = type_lanes(
+        [0, 1, 2, 3, 4, 5], ram, _staging(2, lanes, [8, 8]), split, lanes=lanes, captured=True, copy_armed=True,
+        hit_copy="sm", cpu_on=True, cpu_misses=False, nodes=2,
+    )
+    # node 0's lanes are 0, 2, 4: the last two go to the CPU; node 1's split is all zero
+    assert kinds == [LaneKind.HIT_SM, LaneKind.HIT_SM, LaneKind.HIT_CPU, LaneKind.HIT_SM, LaneKind.HIT_CPU,
+                     LaneKind.HIT_SM]
+
+
+def test_one_node_is_the_flat_lists_of_today():
+    replica = MapReplica(2, 16, 8)
+    assert len(replica.staging[0]) == 8
+    assert len(MapReplica(2, 16, 8, nodes=2).staging[0]) == 16
+    assert wire_layout(8, 2).home(5) == 1
