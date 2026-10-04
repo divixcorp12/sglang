@@ -1,6 +1,8 @@
 // The registry, validation and dispatch every CPU expert quant shares, generic over the quant (the Quant contract:
 // kName, kSlabs, kOptionalSlabs, kMaxRoutes, kMaxRows, kTopIsa, kIsaCapEnv, kIsaReportEnv, Params, Layer, Row,
 // min_slot_bytes, validate, make_layer, check_slot, dispatch, decode). Each quant's library holds its own registry and forward lock.
+// A Quant's dispatch may ignore the RouteTable and read the request directly: EXL3 does, to keep its frozen
+// accumulation order, so it runs the zero-weight routes that RouteTable drops.
 #pragma once
 #include "../../../../kernels/jit/csrc/moe/expert_stream/host/cpu_experts_abi.h"
 #include "buffer_row.hpp"

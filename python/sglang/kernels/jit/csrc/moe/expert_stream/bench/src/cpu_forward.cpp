@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
     omp_set_dynamic(0);
-    // Before the caller is pinned: the optimized kernel refuses cores outside the caller's affinity.
+    // Cores must be distinct and in [0, CPU_SETSIZE); one that cannot be pinned fails the first forward with status 1.
     if (sglang_exl3_cpu_experts_set_cores(cores.data(), cores.size()))
       throw std::runtime_error("Cannot configure kernel cores");
     cpu_set_t caller;

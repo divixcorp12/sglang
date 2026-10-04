@@ -120,7 +120,8 @@ class Exl3CpuQuantTrait:
         handle = ctypes.c_int64(-1)
         status = fn(ctypes.byref(layer), ctypes.byref(handle))
         if status != 0:
-            raise RuntimeError(f"the EXL3 CPU kernel refused the layer's slabs: status {status}")
+            reason = "internal error, reason on stderr" if status == 1 else "refused descriptor" if status == 2 else "unexpected status"
+            raise RuntimeError(f"the EXL3 CPU kernel failed to register the layer: status {status} ({reason})")
         # The kernel stores views: the slabs (and, per the ABI, params) stay alive until free_layer.
         self._slabs[handle.value] = [slabs[name] for name in self.slab_names] + [params]
         return handle.value

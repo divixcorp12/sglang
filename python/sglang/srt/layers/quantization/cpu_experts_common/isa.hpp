@@ -1,5 +1,7 @@
 // The x86 vector tiers a CPU expert quant may implement, and the tier one runs at: min(hardware, the quant's top
 // tier, the quant's cap environment variable). A quant's report variable prints the tier it settled on.
+// Env convention: kIsaCapEnv / kIsaReportEnv per quant; new quants use <QUANT>_CPU_MAX_ISA / <QUANT>_CPU_REPORT_ISA,
+// EXL3 keeps its legacy EXL3_MOE_CPU_* prefix.
 #pragma once
 #include <cctype>
 #include <cstdio>

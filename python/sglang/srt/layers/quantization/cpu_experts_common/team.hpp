@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
@@ -24,11 +25,12 @@ inline std::string& last_error()
     return error;
 }
 
-// Records `what` as last_error() and returns 1; never throws (it runs in the C ABI's catch blocks).
+// Records `what` as last_error(), prints it to stderr, and returns 1; never throws (it runs in the C ABI's catch blocks).
 inline int fail(const char* what) noexcept
 {
     try {
         last_error() = what;
+        std::fprintf(stderr, "cpu_experts: %s\n", what);
     } catch (...) {
     }
     return 1;

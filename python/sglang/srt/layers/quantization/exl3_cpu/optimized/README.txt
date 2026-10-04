@@ -49,8 +49,8 @@ expert_stream/host/cpu_experts_abi.h, shared with the NVFP4 kernel): the pinned 
 per-slot strides, with SglangExl3CpuParams (bits, swizzled) as its params. The kernel keeps no reference: the caller
 keeps the slabs alive until it frees the layer. Register and forward through the same library instance: layer
 handles belong to that instance's registry, which make_layer's tables share. Packed matrix tensors must remain
-alive for the registered layer's lifetime. Configure distinct worker core IDs, within the caller's affinity, before
-the first forward or keep-warm. The C ABI forward takes one SglangCpuExpertsForward: rows token rows of FP16
+alive for the registered layer's lifetime. Configure distinct worker core IDs in [0, CPU_SETSIZE) before
+the first forward or keep-warm; a core that cannot be pinned fails the first forward with status 1. The C ABI forward takes one SglangCpuExpertsForward: rows token rows of FP16
 activations, FP32 routing weights (converted to FP16) and FP32 output. Status 0 is success, 1 a kernel error, 2
 invalid arguments (a refused call leaves out untouched), 3 concurrent use. The ATen forward and free run through the
 same functions and raise on a nonzero status.
