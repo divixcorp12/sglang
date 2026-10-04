@@ -230,7 +230,10 @@ class RamTier {
     if (admission_closed_.load()) return false;
     if (!posted) return false;
     if constexpr (Build::kFaults) {
-      if (const int64_t ns = faults_.group_stall_ns[g].exchange(0)) fault_delay(ns);
+      if (const int64_t ns = faults_.group_stall_ns[g].load()) {  // once: the group's own thread is the only reader
+        faults_.group_stall_ns[g].store(0);
+        fault_delay(ns);
+      }
     }
     if (g == 0) begin_stage(kStageDemand, group.next_demand, head - group.next_demand);
     if (head - group.next_demand >= Wire::kDemandRecords) {
