@@ -2,17 +2,25 @@
 
 #include "expert_stream/host/core_topology.h"
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <pthread.h>
 #include <sstream>
 #include <stdexcept>
+#include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
 
 namespace fullstack {
 namespace fs = std::filesystem;
+
+namespace {
+constexpr int kMpolBind = 2;           // MPOL_BIND
+constexpr int kMpolMfMove = 1 << 1;    // MPOL_MF_MOVE
+}  // namespace
 
 int number(const std::string& text) {
   size_t end = 0;
@@ -61,14 +69,20 @@ Topology system_topology() {
 }
 
 void validate_placement(const Placement& p, const Topology& t, bool check_nodes) {
-  if (p.workers.empty()) throw std::runtime_error("placement: no CPU expert cores");
+  if (p.groups.empty()) throw std::runtime_error("placement: no NUMA group");
   struct Role {
     const char* name;
     int cpu;
+    int node;  // the NUMA node the role must be on
   };
-  std::vector<Role> roles = {{"writer", p.writer}, {"service", p.service}, {"copy", p.copy}};
-  for (int32_t cpu : p.workers)
-    roles.push_back({"worker", cpu});
+  const bool one_group = p.groups.size() == 1;
+  std::vector<Role> roles = {{"writer", p.writer, p.host_node}, {"copy", p.copy, p.host_node}};
+  for (const GroupPlacement& group : p.groups) {
+    if (group.workers.empty()) throw std::runtime_error("placement: no CPU expert cores");
+    roles.push_back({"service", group.service, one_group ? p.host_node : group.node});
+    for (int32_t cpu : group.workers)
+      roles.push_back({"worker", cpu, group.node});
+  }
   std::set<int> seen;
   for (const Role& role : roles) {
     if (role.cpu < 0 || role.cpu >= CPU_SETSIZE)
@@ -82,21 +96,35 @@ void validate_placement(const Placement& p, const Topology& t, bool check_nodes)
           " is outside the process's allowed CPUs");
   }
   // A busy-polling service never yields: no other role may share its physical core.
-  for (int sibling : t.siblings_of(p.service)) {
-    if (sibling != p.service && seen.contains(sibling))
-      throw std::runtime_error(
-          "placement: CPU " + std::to_string(sibling) + " shares the physical core of the service CPU " +
-          std::to_string(p.service));
+  for (const GroupPlacement& group : p.groups) {
+    for (int sibling : t.siblings_of(group.service)) {
+      if (sibling != group.service && seen.contains(sibling))
+        throw std::runtime_error(
+            "placement: CPU " + std::to_string(sibling) + " shares the physical core of the service CPU " +
+            std::to_string(group.service));
+    }
   }
   if (!check_nodes) return;
   for (const Role& role : roles) {
-    const int want = std::string(role.name) == "worker" ? p.worker_node : p.host_node;
     const int node = t.node_of(role.cpu);
-    if (node != want)
+    if (node != role.node)
       throw std::runtime_error(
           std::string("placement: the ") + role.name + " CPU " + std::to_string(role.cpu) + " is on NUMA node " +
-          std::to_string(node) + ", not node " + std::to_string(want));
+          std::to_string(node) + ", not node " + std::to_string(role.node));
   }
+}
+
+void bind_pages(void* address, size_t bytes, int node) {
+  const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+  const auto begin = reinterpret_cast<uintptr_t>(address);
+  const uintptr_t first = (begin + page - 1) / page * page;
+  const uintptr_t last = (begin + bytes) / page * page;
+  if (last <= first) return;
+  if (node < 0 || node >= static_cast<int>(sizeof(unsigned long) * 8))
+    throw std::runtime_error("bind_pages: NUMA node " + std::to_string(node) + " is out of range");
+  unsigned long mask = 1ul << node;
+  if (syscall(SYS_mbind, first, last - first, kMpolBind, &mask, sizeof(mask) * 8, kMpolMfMove) != 0)
+    throw std::runtime_error("mbind to NUMA node " + std::to_string(node) + " failed: " + std::strerror(errno));
 }
 
 void pin_self(int cpu) {
@@ -125,8 +153,11 @@ std::set<int> task_ids() {
 }
 
 std::vector<int> expected_threads(const Placement& p) {
-  std::vector<int> cpus = {p.service, p.copy, p.copy};
-  cpus.insert(cpus.end(), p.workers.begin(), p.workers.end());
+  std::vector<int> cpus = {p.copy, p.copy};
+  for (const GroupPlacement& group : p.groups) {
+    cpus.push_back(group.service);
+    cpus.insert(cpus.end(), group.workers.begin(), group.workers.end());
+  }
   std::sort(cpus.begin(), cpus.end());
   return cpus;
 }

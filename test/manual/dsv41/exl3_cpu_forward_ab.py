@@ -1,7 +1,8 @@
 """Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (csrc/exl3/optimized/kernel.cpp).
 
 ``dump`` runs a fixed set of forwards through the extension ``exl3_ext()`` builds and saves every output; ``compare``
-checks two dumps for bitwise equality. A dump made at the merge-base is the reference a kernel refactor must reproduce
+checks two dumps for bitwise equality. ``--registration engines`` runs the C ABI's forward on two engines at once (the
+first and second half of ``--cores``), exits 1 naming the case when they differ, and saves the first engine's outputs. A dump made at the merge-base is the reference a kernel refactor must reproduce
 exactly, on every ISA tier the host can run. The kernel reads EXL3_MOE_CPU_MAX_ISA once, at its first forward or tier
 query, so each tier is its own process.
 
@@ -9,9 +10,11 @@ Run on divix01 through run_exl3_cpu_forward_checks.sh, which sets the build envi
 """
 
 import argparse
+import ctypes
 import itertools
 import os
 import sys
+import threading
 
 # (name, hidden, intermediate): a generic shape, and DeepSeek V4.1's, which takes the DSV4.1 plan on AVX-512BW.
 SHAPES = (("generic", 512, 256), ("dsv41", 5120, 2304))
@@ -87,6 +90,86 @@ def register_slabs(ext, s, limit):
         sys.exit(f"register_layer refused the slabs: {error}")
 
 
+def cases_for(torch, name, hidden, limit):
+    """(case, tokens, k, x, sel, w) in the order the dump's RNG draws them: one generator per shape and limit."""
+    g = torch.Generator().manual_seed(7)
+    for (tokens, k), route in ROUTES.items():
+        sel = torch.tensor(route, dtype=torch.int64)
+        w = torch.tensor([list(WEIGHTS[:k])] * tokens).half()
+        for scale in SCALES:
+            x = (torch.randn(tokens, hidden, generator=g) * scale).half()
+            yield f"{name}/l{limit:g}/t{tokens}k{k}/s{scale}", tokens, k, x, sel, w
+
+
+def parse_cores(text):
+    """A taskset list such as "18-25" or "18-21,26"."""
+    cores = []
+    for item in text.split(","):
+        first, _, last = item.partition("-")
+        cores += range(int(first), int(last or first) + 1)
+    return cores
+
+
+def run_on_engine(torch, trait, handle, hidden, cases, engine, results, errors):
+    """Every case through the C ABI's forward on ``engine``, on this thread: a forward pins its calling thread to the
+    engine's worker 0 core, so each engine gets a thread of its own."""
+    from sglang.srt.layers.moe.cpu_experts.pool import (
+        CPU_EXPERTS_FORWARD_ABI_VERSION,
+        CpuExpertForward,
+        CpuExpertsForwardCall,
+    )
+
+    forward = CpuExpertForward(trait.native_forward())
+    try:
+        for case, tokens, k, x, sel, w in cases:
+            slots = sel.to(torch.int32).contiguous()
+            weights = w.float().contiguous()
+            out = torch.full((tokens, hidden), float("nan"))
+            call = CpuExpertsForwardCall(
+                abi_version=CPU_EXPERTS_FORWARD_ABI_VERSION,
+                rows=tokens,
+                layer=handle,
+                x=x.data_ptr(),
+                slots=ctypes.cast(slots.data_ptr(), ctypes.POINTER(ctypes.c_int32)),
+                weights=ctypes.cast(weights.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+                out=ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+                k=k,
+                threads=THREADS,
+                accumulate=0,
+                engine=engine,
+            )
+            status = forward(ctypes.byref(call))
+            if status != 0:
+                raise RuntimeError(f"{case}: the forward on engine {engine} returned {status}")
+            results[engine][case] = out
+    except Exception as error:  # noqa: BLE001 -- reported by the caller, naming the engine
+        errors[engine] = error
+
+
+def run_two_engines(torch, trait, handle, hidden, cases, engines):
+    """Runs every case on both engines at once and returns engine A's outputs; exits 1 naming the first case the two
+    engines disagree on."""
+    results = {e: {} for e in engines}
+    errors = {}
+    threads = [
+        threading.Thread(target=run_on_engine, args=(torch, trait, handle, hidden, cases, e, results, errors))
+        for e in engines
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        sys.exit(f"an engine failed: {errors}")
+    first, second = engines
+    for case, _, _, _, _, _ in cases:
+        if not torch.isfinite(results[first][case]).all():
+            sys.exit(f"{case}: non-finite output")
+        if not torch.equal(results[first][case], results[second][case]):
+            sys.exit(f"{case}: engine A and engine B differ")
+    return results[first]
+
+
 def dump(args):
     os.environ["EXL3_MOE_CPU_MAX_ISA"] = args.isa  # read once, at the kernel's first use
     os.environ.setdefault("EXL3_MOE_CPU_PIN", "0")
@@ -101,31 +184,45 @@ def dump(args):
     if tier != TIERS[args.isa]:
         sys.exit(f"asked for {args.isa}, the kernel reports avx2={tier[0]} bw={tier[1]}")
     torch.set_num_threads(1)
+    engines, engine_trait = None, None
+    if args.registration == "engines":
+        from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+
+        cores = parse_cores(args.cores or "")
+        if len(cores) != 2 * THREADS:
+            sys.exit(f"--cores must list {2 * THREADS} cores (two engines of {THREADS} workers), got {len(cores)}")
+        engine_trait = Exl3CpuQuantTrait(ext, act_limit=LIMITS[0])
+        engines = (
+            engine_trait.native_create_engine(cores[:THREADS]),
+            engine_trait.native_create_engine(cores[THREADS : 2 * THREADS]),
+        )
     outputs = {}
-    for (name, hidden, inter), limit in itertools.product(SHAPES, LIMITS):
-        slabs = random_slabs(torch, hidden, inter, seed=hidden)
-        if args.registration == "table":
-            handle, trait = register_table(ext, slabs, limit), None
-        else:
-            handle, trait = register_slabs(ext, slabs, limit)
-        try:
-            g = torch.Generator().manual_seed(7)
-            for (tokens, k), route in ROUTES.items():
-                sel = torch.tensor(route, dtype=torch.int64)
-                w = torch.tensor([list(WEIGHTS[:k])] * tokens).half()
-                for scale in SCALES:
-                    x = (torch.randn(tokens, hidden, generator=g) * scale).half()
+    try:
+        for (name, hidden, inter), limit in itertools.product(SHAPES, LIMITS):
+            slabs = random_slabs(torch, hidden, inter, seed=hidden)
+            if args.registration == "table":
+                handle, trait = register_table(ext, slabs, limit), None
+            else:
+                handle, trait = register_slabs(ext, slabs, limit)
+            try:
+                cases = list(cases_for(torch, name, hidden, limit))
+                if engines is not None:
+                    outputs.update(run_two_engines(torch, trait, handle, hidden, cases, engines))
+                    continue
+                for case, tokens, k, x, sel, w in cases:
                     out = torch.full((tokens, hidden), float("nan"))
                     ext.exl3_moe_cpu_forward(handle, x, sel, w, out, THREADS)
-                    case = f"{name}/l{limit:g}/t{tokens}k{k}/s{scale}"
                     if not torch.isfinite(out).all():
                         sys.exit(f"{case}: non-finite output")
                     outputs[case] = out
-        finally:
-            if trait is None:
-                ext.exl3_moe_cpu_free_layer(handle)
-            else:
-                trait.free_layer(handle)
+            finally:
+                if trait is None:
+                    ext.exl3_moe_cpu_free_layer(handle)
+                else:
+                    trait.free_layer(handle)
+    finally:
+        for engine in engines or ():
+            engine_trait.native_free_engine(engine)
     torch.save({"isa": args.isa, "registration": args.registration, "outputs": outputs}, args.out)
     print(f"{len(outputs)} outputs ({args.isa}, {args.registration}) -> {args.out}")
 
@@ -153,7 +250,8 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("dump")
     d.add_argument("--isa", choices=sorted(TIERS), required=True)
-    d.add_argument("--registration", choices=("table", "slabs"), default="table")
+    d.add_argument("--registration", choices=("table", "slabs", "engines"), default="table")
+    d.add_argument("--cores", help="engines: a taskset list of 2 * THREADS cores, one engine on each half")
     d.add_argument("--out", required=True)
     c = sub.add_parser("compare")
     c.add_argument("want")

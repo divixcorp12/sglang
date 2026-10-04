@@ -23,6 +23,7 @@
 namespace fullstack {
 
 constexpr int kLanes = ::sglang::expert_stream::wire::Wire::kLanes;
+constexpr int kNodes = ::sglang::expert_stream::wire::Wire::kNodes;
 
 // CLOCK_MONOTONIC in ns: the host's now_ns() and its stage trace read the same clock, so timestamps are comparable.
 int64_t monotonic_ns();
@@ -81,7 +82,7 @@ class DeviceSim {
   static bool needs_copy_wait(const SimRequest& request);
 
   int32_t ram_slot(int64_t row, int32_t expert) const;
-  std::array<int32_t, kLanes> staging(int64_t row) const;
+  std::array<int32_t, kNodes * kLanes> staging(int64_t row) const;  // node n's list at [n * kLanes, (n + 1) * kLanes)
   uint64_t map_chain(int64_t row) const;
   uint64_t copy_done(const SimRequest& request) const;
   uint32_t copy_gate() const;
@@ -97,7 +98,7 @@ class DeviceSim {
   int64_t experts_;
   uint32_t epoch_;
   std::vector<int32_t> ram_slot_;                     // [rows][experts]
-  std::vector<std::array<int32_t, kLanes>> staging_;  // [rows]
+  std::vector<std::array<int32_t, kNodes * kLanes>> staging_;  // [rows]: every node's staging list, node-major
   std::vector<uint64_t> map_chain_;                   // starts at 1: the attach delta's tag
   std::vector<uint64_t> map_applied_;
   std::vector<uint8_t> row_cpu_;

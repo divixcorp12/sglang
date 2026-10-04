@@ -77,7 +77,7 @@ bool DeviceSim::apply_pending(int64_t row) {
       throw std::runtime_error("a delta entry names expert " + std::to_string(entry[0]));
     ram_slot_[row * experts_ + entry[0]] = entry[1];
   }
-  for (int k = 0; k < kLanes; ++k) {
+  for (int k = 0; k < kNodes * kLanes; ++k) {
     int16_t slot;
     std::memcpy(&slot, d + w::Wire::kDeltaStaging + 2 * k, 2);
     staging_[row][k] = slot;
@@ -121,7 +121,7 @@ SimRequest DeviceSim::post(
   r.row = row;
   r.count = count;
   bool hit[kLanes] = {};
-  int m = 0;
+  int m[kNodes] = {};
   for (int j = 0; j < count; ++j) {
     r.experts[j] = experts[j];
     const int32_t slot = ram_slot(row, experts[j]);
@@ -130,22 +130,29 @@ SimRequest DeviceSim::post(
       hit[j] = true;
       continue;
     }
-    if (m >= kLanes || staging_[row][m] < 0) throw std::runtime_error("a miss lane has no staging slot");
-    r.slots[j] = staging_[row][m++];
+    const int node = w::Wire::home(experts[j]);
+    if (m[node] >= kLanes || staging_[row][node * kLanes + m[node]] < 0)
+      throw std::runtime_error("a miss lane has no staging slot on node " + std::to_string(node));
+    r.slots[j] = staging_[row][node * kLanes + m[node]++];
   }
   const bool host_lanes = captured && load_acquire<uint32_t>(lease_ + w::Wire::kCopyArmed) != 0;
   bool eligible[kLanes] = {};
-  int n = 0;
+  int n[kNodes] = {};
   for (int j = 0; j < count; ++j) {
     eligible[j] = host_lanes && row_cpu_[row] != 0 && hit[j];
-    n += eligible[j] ? 1 : 0;
+    n[w::Wire::home(experts[j])] += eligible[j] ? 1 : 0;
   }
-  int take = n > 0 ? __atomic_load_n(reinterpret_cast<const int32_t*>(lease_ + w::Wire::kSplit) + n, __ATOMIC_RELAXED) : 0;
+  int take[kNodes] = {};
+  for (int node = 0; node < kNodes; ++node) {
+    const auto* split = reinterpret_cast<const int32_t*>(lease_ + w::Wire::kSplit + node * w::Wire::kSplitStride);
+    take[node] = n[node] > 0 ? __atomic_load_n(split + n[node], __ATOMIC_RELAXED) : 0;
+  }
   bool cpu[kLanes] = {};
-  for (int j = count - 1; j >= 0 && take > 0; --j) {
-    if (eligible[j]) {
+  for (int j = count - 1; j >= 0; --j) {
+    const int node = w::Wire::home(experts[j]);
+    if (take[node] > 0 && eligible[j]) {
       cpu[j] = true;
-      --take;
+      --take[node];
     }
   }
   bool miss = false;
@@ -238,7 +245,7 @@ int32_t DeviceSim::ram_slot(int64_t row, int32_t expert) const {
   return ram_slot_.at(static_cast<size_t>(row * experts_ + expert));
 }
 
-std::array<int32_t, kLanes> DeviceSim::staging(int64_t row) const {
+std::array<int32_t, kNodes * kLanes> DeviceSim::staging(int64_t row) const {
   return staging_.at(static_cast<size_t>(row));
 }
 

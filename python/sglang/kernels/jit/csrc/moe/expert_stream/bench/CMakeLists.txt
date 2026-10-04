@@ -33,6 +33,12 @@ if(NOT EXPERT_STREAM_LANES MATCHES "^[0-9]+$" OR EXPERT_STREAM_LANES LESS 1 OR E
 endif()
 add_compile_definitions(SGLANG_EXPERT_STREAM_LANES=${EXPERT_STREAM_LANES})
 
+set(EXPERT_STREAM_NODES 1 CACHE STRING "NUMA groups of the stack (1..8)")
+if(NOT EXPERT_STREAM_NODES MATCHES "^[0-9]+$" OR EXPERT_STREAM_NODES LESS 1 OR EXPERT_STREAM_NODES GREATER 8)
+  message(FATAL_ERROR "EXPERT_STREAM_NODES must be 1..8")
+endif()
+add_compile_definitions(SGLANG_EXPERT_STREAM_NODES=${EXPERT_STREAM_NODES})
+
 option(EXL3_FETCH_BENCHMARK "Download pinned Google Benchmark when not installed" ON)
 find_package(benchmark 1.9 QUIET CONFIG)
 if(NOT benchmark_FOUND)

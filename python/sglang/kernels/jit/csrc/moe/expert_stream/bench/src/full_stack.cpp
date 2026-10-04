@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -39,18 +40,17 @@
 namespace {
 namespace fs = std::filesystem;
 namespace es = ::sglang::expert_stream;
-int64_t g_engine = 0;  // the kernel's engine on placement.workers, created in main: the stack and the bare forwards run on it
 using namespace fullstack;
+constexpr int kGroups = es::Wire::kNodes;
 
 // The command line. Defaults match the reference machine's partition (README "Placement"); --self-test has its own.
 struct Options {
   fs::path fixture = "/data/models/exl3_exp/selected_followup/dsv41-eight-layers-unswizzled.bin";
   fs::path references = "/data/models/exl3_exp/threading";
   fs::path image_dir = "/data/models/exl3_exp/google_benchmark/full-stack-images";
-  std::optional<int> writer_cpu, service_cpu, copy_cpu;
-  std::optional<std::string> cpus;
+  std::optional<int> writer_cpu, copy_cpu;
+  std::optional<std::string> service_cpus, cpus, worker_nodes;  // one entry per NUMA group, see resolve_placement
   int host_node = 0;
-  int worker_node = 1;
   int warmup = 128;
   int gap_us = 0;
   int keep_warm_us = 0;
@@ -75,7 +75,7 @@ Options parse_options(int& argc, char** argv) {
     else if (arg.starts_with("--writer-cpu="))
       opt.writer_cpu = number(value("--writer-cpu="));
     else if (arg.starts_with("--service-cpu="))
-      opt.service_cpu = number(value("--service-cpu="));
+      opt.service_cpus = value("--service-cpu=");
     else if (arg.starts_with("--copy-cpu="))
       opt.copy_cpu = number(value("--copy-cpu="));
     else if (arg.starts_with("--cpus="))
@@ -83,7 +83,7 @@ Options parse_options(int& argc, char** argv) {
     else if (arg.starts_with("--host-node="))
       opt.host_node = number(value("--host-node="));
     else if (arg.starts_with("--worker-node="))
-      opt.worker_node = number(value("--worker-node="));
+      opt.worker_nodes = value("--worker-node=");
     else if (arg.starts_with("--warmup-forwards="))
       opt.warmup = number(value("--warmup-forwards="));
     else if (arg.starts_with("--gap-us="))
@@ -102,10 +102,13 @@ Options parse_options(int& argc, char** argv) {
              ")\n"
              "--fixture=FILE --reference-dir=DIR --image-dir=DIR (O_DIRECT-capable; row images are written there)\n"
              "--writer-cpu=16 --service-cpu=17 --copy-cpu=52 --cpus=18-33 --host-node=0 --worker-node=1\n"
+             "one NUMA group per -DEXPERT_STREAM_NODES: --service-cpu and --worker-node take one entry per group, "
+             "comma-separated, and --cpus one CPU list per group, '/'-separated: --service-cpu=17,35 "
+             "--cpus=8-15/18-33 --worker-node=0,1\n"
              "--warmup-forwards=128 --gap-us=0 --keep-warm-us=0 --wait-timeout-ms=2000 --validate-only\n"
              "--keep-warm-us: the CPU expert thread's keep-warm window after each job (0: off)\n"
              "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 "
-             "--cpus=3\n"
+             "--cpus=3 (two groups: --copy-cpu=1 --service-cpu=2,3 --cpus=4/5)\n"
              "Google Benchmark flags are also accepted.\n";
       argv[remaining++] = argv[i];
     } else
@@ -117,41 +120,83 @@ Options parse_options(int& argc, char** argv) {
   return opt;
 }
 
-// Resolves the CPUs: the defaults are production's placement; the self-test's fit any four CPUs (run it under
-// taskset -c 0-15).
+// Splits `text` on `separator`; throws unless there are exactly kGroups entries, one per NUMA group.
+std::vector<std::string> per_group(const std::string& text, char separator, const char* flag) {
+  std::vector<std::string> entries;
+  std::stringstream list(text);
+  std::string entry;
+  while (std::getline(list, entry, separator))
+    entries.push_back(entry);
+  if (static_cast<int>(entries.size()) != kGroups)
+    throw std::runtime_error(
+        std::string(flag) + ": give one entry per NUMA group (" + std::to_string(kGroups) + "), got " + text);
+  return entries;
+}
+
+// Resolves the CPUs: at one group the defaults are production's placement; the self-test's fit any few CPUs (run it
+// under taskset -c 0-15). Above one group the self-test has its own defaults and a measured run needs every per-group
+// flag, since there is no reference placement to default to.
 Placement resolve_placement(const Options& o) {
   Placement p;
-  p.writer = o.writer_cpu.value_or(o.self_test ? 0 : 16);
-  p.service = o.service_cpu.value_or(o.self_test ? 1 : 17);
-  p.copy = o.copy_cpu.value_or(o.self_test ? 2 : 52);
-  p.workers = parse_cpus(o.cpus.value_or(o.self_test ? "3" : "18-33"));
   p.host_node = o.host_node;
-  p.worker_node = o.worker_node;
+  std::string services, cpus, nodes;
+  if (kGroups == 1) {
+    services = o.self_test ? "1" : "17";
+    cpus = o.self_test ? "3" : "18-33";
+    nodes = "1";
+    p.writer = o.self_test ? 0 : 16;
+    p.copy = o.self_test ? 2 : 52;
+  } else if (o.self_test) {
+    services = "2,3";
+    cpus = "4/5";
+    nodes = "0,1";
+    p.writer = 0;
+    p.copy = 1;
+  } else {
+    if (!o.service_cpus || !o.cpus || !o.worker_nodes)
+      throw std::runtime_error(
+          "a " + std::to_string(kGroups) + "-group run needs --service-cpu, --cpus and --worker-node (one entry per "
+          "NUMA group)");
+    p.writer = 16;
+    p.copy = 52;
+  }
+  p.writer = o.writer_cpu.value_or(p.writer);
+  p.copy = o.copy_cpu.value_or(p.copy);
+  const auto service_list = per_group(o.service_cpus.value_or(services), ',', "--service-cpu");
+  const auto cpu_lists = per_group(o.cpus.value_or(cpus), '/', "--cpus");
+  const auto node_list = per_group(o.worker_nodes.value_or(nodes), ',', "--worker-node");
+  for (int g = 0; g < kGroups; ++g)
+    p.groups.push_back({number(service_list[g]), parse_cpus(cpu_lists[g]), number(node_list[g])});
   return p;
 }
 
-// The Stack's configuration for this fixture and placement: every eligible lane goes to the CPU, and the instrumented
-// build gets a stage trace ring.
-StackConfig stack_config(const StackFixture& f, const Placement& p, const Options& o) {
+// The Stack's configuration for this fixture and placement: every eligible lane goes to the CPU, each group runs on its
+// own engine and slot range, and the instrumented build gets a stage trace ring.
+StackConfig stack_config(
+    const StackFixture& f, const Placement& p, const Options& o, const std::vector<int64_t>& engines) {
   StackConfig c;
   c.rows = f.row_set();
   c.staging = StackFixture::kStaging;
   c.forward = &sglang_exl3_cpu_experts_forward;
   c.keep_warm = &sglang_exl3_cpu_experts_keep_warm;
   c.keep_warm_ns = static_cast<int64_t>(o.keep_warm_us) * 1000;
-  c.threads = static_cast<int>(p.workers.size());
-  c.cores.assign(p.workers.begin(), p.workers.end());
-  c.engine = g_engine;
   c.x_base = f.x_row(0);
   c.x_stride = f.x_stride();
   c.out_base = reinterpret_cast<uint8_t*>(f.out_row(0));
   c.out_stride = f.out_stride();
   c.hidden = f.hidden();
-  c.service_cpu = p.service;
   c.copy_cpu = p.copy;
   c.wait_timeout_ns = int64_t{o.wait_timeout_ms} * 1'000'000;
-  for (int n = 0; n <= es::Wire::kLanes; ++n)
-    c.split[n] = n;
+  for (int g = 0; g < kGroups; ++g) {
+    StackConfig::Group group;
+    group.service_cpu = p.groups[g].service;
+    group.cores.assign(p.groups[g].workers.begin(), p.groups[g].workers.end());
+    group.engine = engines[g];
+    for (int n = 0; n <= es::Wire::kLanes; ++n)
+      group.split[n] = n;
+    c.groups.push_back(group);
+    c.ranges.emplace_back(g * StackFixture::kGroupSlots, (g + 1) * StackFixture::kGroupSlots);
+  }
   if constexpr (BenchBuild::kMetrics) c.trace_capacity = 4096;
   return c;
 }
@@ -175,7 +220,7 @@ struct StackCall {
 
 // The benchmark state, in two phases that must run in this order.
 //
-// Bare phase: the slots hold expert e in slot e (StackFixture::preload_slots) and no stack exists, so no CPU expert
+// Bare phase: the slots hold expert e in slot_of(e) (StackFixture::preload_slots) and no stack exists, so no CPU expert
 // thread spins on worker 0's core, where the kernel puts every caller, and the kernel's per-caller OpenMP team is the
 // only one. Stack phase (enter_stack_phase): the bare caller's team is released, the Stack is built, every expert is
 // loaded through the tier's reader, and the layers are registered. A bare forward after that fails: it would share
@@ -190,11 +235,13 @@ class Bench {
       Placement placement,
       StackFixture& fixture,
       std::vector<int64_t> handles,
+      std::vector<int64_t> engines,
       std::set<int> before)
       : options_(options),
         placement_(std::move(placement)),
         fixture_(fixture),
         handles_(std::move(handles)),
+        engines_(std::move(engines)),
         before_(std::move(before)),
         deadline_ns_(int64_t{options.wait_timeout_ms} * 1'000'000 / 2) {
     for (int k : {1, 3, 5}) {
@@ -216,6 +263,19 @@ class Bench {
     return fixture_.rows();
   }
 
+  // Whether any of the k experts of a call is homed on `group`: only those groups run a CPU job.
+  bool group_has_lanes(int k, int group) const {
+    for (int32_t e : experts_.at(k))
+      if (es::Wire::home(e) == group) return true;
+    return false;
+  }
+  int groups_with_lanes(int k) const {
+    int n = 0;
+    for (int g = 0; g < kGroups; ++g)
+      n += group_has_lanes(k, g) ? 1 : 0;
+    return n;
+  }
+
   Stack<BenchBuild>& stack() {
     enter_stack_phase();
     return *stack_;
@@ -231,7 +291,10 @@ class Bench {
       stack_census_ = true;
     } else {
       if (bare_census_) return;
-      verify_threads(before_, std::vector<int>(placement_.workers.begin() + 1, placement_.workers.end()));
+      // Above one group the bare forwards of every group share this thread's one OpenMP team, which each forward
+      // re-pins to its own engine's cores: only the last group's helpers are left to count.
+      const auto& workers = placement_.groups.back().workers;
+      verify_threads(before_, std::vector<int>(workers.begin() + 1, workers.end()));
       bare_census_ = true;
     }
   }
@@ -241,7 +304,7 @@ class Bench {
   void enter_stack_phase() {
     if (stack_) return;
     release_kernel_team();
-    stack_ = std::make_unique<Stack<BenchBuild>>(stack_config(fixture_, placement_, options_));
+    stack_ = std::make_unique<Stack<BenchBuild>>(stack_config(fixture_, placement_, options_, engines_));
     sim_ = std::make_unique<DeviceSim>(stack_->page(), stack_->lease(), rows(), fixture_.experts());
     const int64_t timeout_ns = int64_t{options_.wait_timeout_ms} * 1'000'000;
     std::vector<int32_t> all(static_cast<size_t>(fixture_.experts()));
@@ -249,7 +312,7 @@ class Bench {
     for (int64_t row = 0; row < rows(); ++row) {
       load_experts(*sim_, row, all, static_cast<int>(StackFixture::kStaging), timeout_ns);
       for (int32_t e : all)
-        if (sim_->ram_slot(row, e) != e)
+        if (sim_->ram_slot(row, e) != StackFixture::slot_of(e))
           throw std::runtime_error(
               "row " + std::to_string(row) + ": the tier put expert " + std::to_string(e) + " in slot " +
               std::to_string(sim_->ram_slot(row, e)) + ", not the slot the bare forwards used");
@@ -276,32 +339,52 @@ class Bench {
     return call;
   }
 
-  // The C ABI forward on the same layer handle, slots, x and output memory, from the calling thread. Slot e holds
-  // expert e, so the experts are the slots. Throws once the stack exists (see the class doc).
-  void bare_call(int64_t row, int k) {
+  // The C ABI forward on the same layer handle, slots and x as the stack, from the calling thread, over the experts of
+  // experts_[k] homed on `group` (their slots are slot_of(expert)), on that group's engine and worker count, into
+  // `out`. Does nothing when the group has none. Throws once the stack exists (see the class doc).
+  void bare_into(int64_t row, int k, int group, float* out) {
     if (stack_)
       throw std::runtime_error(
           "a bare forward once the stack exists would share worker 0's core with the CPU expert "
           "thread and run a second OpenMP team: BM_bare runs first "
           "(no --benchmark_enable_random_interleaving)");
+    std::vector<int32_t> slots;
+    std::vector<float> weights;
+    for (int i = 0; i < k; ++i) {
+      if (es::Wire::home(experts_[k][i]) != group) continue;
+      slots.push_back(StackFixture::slot_of(experts_[k][i]));
+      weights.push_back(weights_[k][i]);
+    }
+    if (slots.empty()) return;
     SglangCpuExpertsForward call{};
     call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
     call.rows = 1;
     call.layer = handles_[row];
     call.x = fixture_.x_row(row);
-    call.slots = experts_[k].data();
-    call.weights = weights_[k].data();
-    call.out = fixture_.out_row(row);
-    call.k = k;
-    call.threads = static_cast<int32_t>(placement_.workers.size());
-    call.engine = g_engine;
+    call.slots = slots.data();
+    call.weights = weights.data();
+    call.out = out;
+    call.k = static_cast<int32_t>(slots.size());
+    call.threads = static_cast<int32_t>(placement_.groups[group].workers.size());
+    call.engine = engines_[group];
     if (sglang_exl3_cpu_experts_forward(&call) != 0)
       throw std::runtime_error("the bare CPU forward failed");
   }
 
+  // bare_into the group's part 0 of the row's output, where the stack's CPU expert thread writes it.
+  void bare_call(int64_t row, int k, int group = 0) {
+    bare_into(row, k, group, fixture_.out_row(row) + 2 * group * fixture_.hidden());
+  }
+
   // Every layer's output for k experts, through the stack or bare, against reference-e{k}.bin, bit-exact. Each output
-  // is NaN-poisoned first, so a forward that did not run fails.
+  // is NaN-poisoned first, so a forward that did not run fails. Above one group only the stack path exists, and each
+  // group's part is checked as validate_groups says.
   void validate(int k, bool via_stack) {
+    if (kGroups > 1) {
+      if (!via_stack) throw std::runtime_error("above one NUMA group the bare forwards are record_bare's");
+      validate_groups(k);
+      return;
+    }
     const int64_t hidden = fixture_.hidden();
     std::vector<float> results(static_cast<size_t>(rows() * hidden));
     for (int64_t row = 0; row < rows(); ++row) {
@@ -319,6 +402,43 @@ class Bench {
     check_reference(options_.references / ("reference-e" + std::to_string(k) + ".bin"), results);
   }
 
+  // Above one group: every row's bare forward of each group's experts, on that group's engine and worker 0, kept for
+  // validate_groups. Before the stack exists.
+  void record_bare(int k) {
+    const int64_t hidden = fixture_.hidden();
+    std::vector<float>& bare = bare_[k];
+    bare.assign(static_cast<size_t>(rows() * es::Wire::kNodes * hidden), 0.0f);
+    for (int g = 0; g < es::Wire::kNodes; ++g) {
+      if (!group_has_lanes(k, g)) continue;
+      PinScope caller(placement_.groups[g].workers.front());
+      for (int64_t row = 0; row < rows(); ++row)
+        bare_into(row, k, g, bare.data() + (row * es::Wire::kNodes + g) * hidden);
+    }
+  }
+
+  // Above one group: each group's part of the stack's output equals, bit for bit, its bare forward; the parts' sum
+  // matches the single-engine reference to within fp32 reassociation.
+  void validate_groups(int k) {
+    const int64_t hidden = fixture_.hidden();
+    const std::vector<float>& bare = bare_.at(k);
+    std::vector<float> stacked(static_cast<size_t>(rows() * hidden), 0.0f);
+    for (int64_t row = 0; row < rows(); ++row) {
+      float* out = fixture_.out_row(row);
+      std::fill(out, out + 2 * es::Wire::kNodes * hidden, std::numeric_limits<float>::quiet_NaN());
+      stack_call(row, k);
+      for (int g = 0; g < es::Wire::kNodes; ++g) {
+        if (!group_has_lanes(k, g)) continue;
+        const float* part = out + 2 * g * hidden;
+        if (std::memcmp(part, bare.data() + (row * es::Wire::kNodes + g) * hidden, hidden * sizeof(float)) != 0)
+          throw std::runtime_error(
+              "row " + std::to_string(row) + ": group " + std::to_string(g) + "'s stack part differs from its bare forward");
+        for (int64_t h = 0; h < hidden; ++h)
+          stacked[row * hidden + h] += part[h];
+      }
+    }
+    check_reference_close(options_.references / ("reference-e" + std::to_string(k) + ".bin"), stacked, 1e-5f);
+  }
+
   // A one-line account of a request and the stack's state, for error messages.
   std::string describe(const SimRequest& r) {
     std::ostringstream s;
@@ -326,10 +446,13 @@ class Bench {
     for (int j = 0; j < r.count; ++j)
       s << ' ' << r.kinds[j];
     const auto c = stack_->counters();
-    const auto cpu = stack_->cpu_stats();
     s << "; served " << c[es::kServedRequests] << " touch_only " << c[es::kTouchOnly] << " rows_read "
-      << c[es::kRowsRead] << " overruns " << c[es::kOverruns] << "; cpu jobs " << cpu[0] << " lanes " << cpu[1]
-      << "; CopyDone " << sim_->copy_done(r) << ", gate 0x" << std::hex << sim_->copy_gate() << std::dec
+      << c[es::kRowsRead] << " overruns " << c[es::kOverruns] << "; cpu jobs/lanes";
+    for (int g = 0; g < kGroups; ++g) {
+      const auto cpu = stack_->cpu_stats(g);
+      s << " g" << g << ' ' << cpu[0] << '/' << cpu[1];
+    }
+    s << "; CopyDone " << sim_->copy_done(r) << ", gate 0x" << std::hex << sim_->copy_gate() << std::dec
       << ", handled through " << stack_->tier().handled_through();
     return s.str();
   }
@@ -341,12 +464,14 @@ class Bench {
   Placement placement_;
   StackFixture& fixture_;
   std::vector<int64_t> handles_;  // owned by main's LayerHandles, which outlives this
+  std::vector<int64_t> engines_;  // one kernel engine per group, on that group's workers
   std::set<int> before_;          // the process's threads before setup
   bool bare_census_ = false;
   bool stack_census_ = false;
   int64_t deadline_ns_;
   std::map<int, std::vector<int32_t>> experts_;
   std::map<int, std::vector<float>> weights_;
+  std::map<int, std::vector<float>> bare_;  // record_bare's [row][group][hidden] per k
   std::unique_ptr<Stack<BenchBuild>> stack_;  // built by enter_stack_phase; null during the bare phase
   std::unique_ptr<DeviceSim> sim_;
 };
@@ -376,7 +501,7 @@ bool skip_after_failure(benchmark::State& state) {
 void bm_bare(benchmark::State& state, Bench& bench, int k) {
   if (skip_after_failure(state)) return;
   try {
-    PinScope caller(bench.placement().workers.front());  // the kernel runs its caller as worker 0, on that core
+    PinScope caller(bench.placement().groups[0].workers.front());  // the kernel runs its caller as worker 0, on that core
     bench.validate(k, false);
     bench.check_threads();
     for (int i = 0; i < bench.options().warmup; ++i)
@@ -402,12 +527,21 @@ void bm_bare(benchmark::State& state, Bench& bench, int k) {
       bench.bare_p50_us[k] = p50;
     }
     state.counters["experts"] = k;
-    state.counters["workers"] = static_cast<double>(bench.placement().workers.size());
+    state.counters["workers"] = static_cast<double>(bench.placement().groups[0].workers.size());
     state.counters["layers"] = static_cast<double>(bench.rows());
   } catch (const std::exception& error) {
     benchmark_failed = true;
     state.SkipWithError(error.what());
   }
+}
+
+// Every group's CPU expert engine totals, {jobs, lanes, forward ns} each.
+using CpuTotals = std::array<std::array<int64_t, 3>, kGroups>;
+CpuTotals cpu_totals(const Stack<BenchBuild>& stack) {
+  CpuTotals totals;
+  for (int g = 0; g < kGroups; ++g)
+    totals[g] = stack.cpu_stats(g);
+  return totals;
 }
 
 // BM_stack/experts:k: x store, record, gate close, spin until CopyDone. Counters: p50/p95/p99 per call and
@@ -424,12 +558,12 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
     [[maybe_unused]] auto stage = std::make_unique<es::StageRecord>();
     if constexpr (BenchBuild::kMetrics) stack.drain_all();
     const auto counters0 = stack.counters();
-    const auto cpu0 = stack.cpu_stats();
+    const auto cpu0 = cpu_totals(stack);
     int64_t calls = 0;
     int64_t row = 0;
     for (auto _ : state) {
       gap(bench.options());
-      const auto cpu_before = stack.cpu_stats();
+      const auto cpu_before = cpu_totals(stack);
       const StackCall call = bench.stack_call(row, k);
       const double seconds = static_cast<double>(call.t1 - call.t0) * 1e-9;
       state.SetIterationTime(seconds);
@@ -438,8 +572,12 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
         // The breakdown, from the stage trace and the CPU expert thread's forward time (exact: one request in flight).
         if (!stack.drain_stage(*stage, call.request.seq, call.t1 + 1'000'000'000))
           throw std::runtime_error("no stage record for request " + std::to_string(call.request.seq));
-        const auto cpu_after = stack.cpu_stats();
-        const double forward_s = static_cast<double>(cpu_after[2] - cpu_before[2]) * 1e-9;
+        // The groups' forwards run at once: the request waits for the slowest.
+        const auto cpu_after = cpu_totals(stack);
+        int64_t forward_ns = 0;
+        for (int g = 0; g < kGroups; ++g)
+          forward_ns = std::max(forward_ns, cpu_after[g][2] - cpu_before[g][2]);
+        const double forward_s = static_cast<double>(forward_ns) * 1e-9;
         pickup.push_back(static_cast<double>(stage->observed - call.t0) * 1e-9);
         service.push_back(static_cast<double>(stage->done - stage->observed) * 1e-9);
         forward.push_back(forward_s);
@@ -448,13 +586,19 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
       ++calls;
       row = (row + 1) % bench.rows();
     }
-    // The timed calls must be exactly the CPU jobs: one job of k lanes per call, no row read, no overrun.
+    // The timed calls must be exactly the CPU jobs: one job per group holding lanes per call, k lanes in all, no row
+    // read, no overrun.
     const auto counters1 = stack.counters();
-    const auto cpu1 = stack.cpu_stats();
-    if (cpu1[0] - cpu0[0] != calls || cpu1[1] - cpu0[1] != calls * k)
+    const auto cpu1 = cpu_totals(stack);
+    int64_t jobs = 0, lanes = 0;
+    for (int g = 0; g < kGroups; ++g) {
+      jobs += cpu1[g][0] - cpu0[g][0];
+      lanes += cpu1[g][1] - cpu0[g][1];
+    }
+    if (jobs != calls * bench.groups_with_lanes(k) || lanes != calls * k)
       throw std::runtime_error(
-          "CPU jobs/lanes " + std::to_string(cpu1[0] - cpu0[0]) + "/" + std::to_string(cpu1[1] - cpu0[1]) + " for " +
-          std::to_string(calls) + " calls of " + std::to_string(k) + " lanes");
+          "CPU jobs/lanes " + std::to_string(jobs) + "/" + std::to_string(lanes) + " for " + std::to_string(calls) +
+          " calls of " + std::to_string(k) + " lanes over " + std::to_string(bench.groups_with_lanes(k)) + " groups");
     if (counters1[es::kRowsRead] != counters0[es::kRowsRead] || counters1[es::kOverruns] != counters0[es::kOverruns])
       throw std::runtime_error("a row read or an overrun during timing");
     if constexpr (BenchBuild::kMetrics) {
@@ -485,7 +629,11 @@ void bm_stack(benchmark::State& state, Bench& bench, int k) {
       }
     }
     state.counters["experts"] = k;
-    state.counters["workers"] = static_cast<double>(bench.placement().workers.size());
+    size_t workers = 0;
+    for (const GroupPlacement& group : bench.placement().groups)
+      workers += group.workers.size();
+    state.counters["workers"] = static_cast<double>(workers);
+    state.counters["groups"] = kGroups;
     state.counters["layers"] = static_cast<double>(bench.rows());
   } catch (const std::exception& error) {
     benchmark_failed = true;
@@ -507,14 +655,19 @@ int main(int argc, char** argv) {
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
     configure_cpu_kernel_runtime();
-    if (sglang_exl3_cpu_experts_engine_create(placement.workers.data(),
-                                              static_cast<int32_t>(placement.workers.size()), &g_engine) != 0)
-      throw std::runtime_error("Cannot create the kernel's engine");
+    std::vector<int64_t> engines(kGroups, 0);  // the kernel's engine on each group's workers: the stack and the bare forwards run on it
+    std::vector<int> group_nodes;
+    for (int g = 0; g < kGroups; ++g) {
+      const auto& workers = placement.groups[g].workers;
+      if (sglang_exl3_cpu_experts_engine_create(workers.data(), static_cast<int32_t>(workers.size()), &engines[g]) != 0)
+        throw std::runtime_error("Cannot create the kernel's engine for group " + std::to_string(g));
+      group_nodes.push_back(placement.groups[g].node);
+    }
     const auto before = task_ids();
     std::unique_ptr<StackFixture> fixture;
     {
-      PinScope first_touch(placement.workers.front());  // slabs, x and outputs on the workers' node
-      fixture = std::make_unique<StackFixture>(options.fixture, options.image_dir);
+      PinScope first_touch(placement.groups[0].workers.front());  // x and outputs on group 0's node; each group's slabs are bound to its own
+      fixture = std::make_unique<StackFixture>(options.fixture, options.image_dir, group_nodes);
     }
     pin_self(placement.writer);  // the writer's stores and clock; the stack's page and lease are first-touched here
     LayerHandles layers;         // outlives the Bench, whose stack's CPU expert thread uses them
@@ -522,11 +675,18 @@ int main(int argc, char** argv) {
       fixture->preload_slots(row);
       layers.handles.push_back(fixture->register_layer(row));
     }
-    Bench bench(options, placement, *fixture, layers.handles, before);
+    Bench bench(options, placement, *fixture, layers.handles, engines, before);
     const std::vector<int> expected = expected_threads(placement);
+    if (kGroups > 1) {
+      // Every group's bare forwards before the stack exists: a bare forward after it would share worker 0's core with
+      // a CPU expert thread.
+      for (int k : {1, 3, 5})
+        bench.record_bare(k);
+      bench.check_threads();
+    }
     if (options.validate_only) {
-      {
-        PinScope caller(placement.workers.front());  // the kernel runs its caller as worker 0, on that core
+      if (kGroups == 1) {
+        PinScope caller(placement.groups[0].workers.front());  // the kernel runs its caller as worker 0, on that core
         for (int k : {1, 3, 5})
           bench.validate(k, /*via_stack=*/false);
         bench.check_threads();
@@ -534,9 +694,16 @@ int main(int argc, char** argv) {
       for (int k : {1, 3, 5})
         bench.validate(k, /*via_stack=*/true);  // the first builds the stack
       bench.check_threads();
-      std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
-                << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName
-                << " build)\n";
+      if (kGroups == 1)
+        std::cerr << "Verified 48 bit-exact layer outputs (24 through the stack, 24 bare); threads pinned to {"
+                  << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName
+                  << " build)\n";
+      else
+        std::cerr << "Verified 24 layer outputs through the stack on " << kGroups
+                  << " NUMA groups (each group's part bit-exact against its bare forward, the parts' sum against the "
+                     "reference within 1e-5); threads pinned to {"
+                  << cpu_list(expected) << "}; writer CPU " << placement.writer << " (" << BenchBuild::kName
+                  << " build)\n";
       return 0;
     }
     benchmark::AddCustomContext("backend", EXL3_BENCH_BACKEND);
@@ -544,22 +711,28 @@ int main(int argc, char** argv) {
     benchmark::AddCustomContext("fixture", options.fixture.string());
     benchmark::AddCustomContext("image_dir", options.image_dir.string());
     benchmark::AddCustomContext("writer_cpu", std::to_string(placement.writer));
-    benchmark::AddCustomContext("service_cpu", std::to_string(placement.service));
     benchmark::AddCustomContext("copy_cpu", std::to_string(placement.copy));
-    benchmark::AddCustomContext(
-        "worker_cpus", cpu_list(std::vector<int>(placement.workers.begin(), placement.workers.end())));
+    for (int g = 0; g < kGroups; ++g) {
+      const std::string suffix = kGroups > 1 ? "_g" + std::to_string(g) : "";
+      const GroupPlacement& group = placement.groups[g];
+      benchmark::AddCustomContext("service_cpu" + suffix, std::to_string(group.service));
+      benchmark::AddCustomContext(
+          "worker_cpus" + suffix, cpu_list(std::vector<int>(group.workers.begin(), group.workers.end())));
+    }
     std::ifstream cgroup_file("/proc/self/cgroup");
     benchmark::AddCustomContext("cgroup", std::string((std::istreambuf_iterator<char>(cgroup_file)), {}));
     benchmark::AddCustomContext("gap_us", std::to_string(options.gap_us));
     benchmark::AddCustomContext("keep_warm_us", std::to_string(options.keep_warm_us));
     benchmark::AddCustomContext("compiler", __VERSION__);
     // Every BM_bare before any BM_stack: one OpenMP team at a time (see Bench). Each benchmark checks its path's 8
-    // outputs bit-exactly before and after it is timed.
-    for (int k : {1, 3, 5})
-      benchmark::RegisterBenchmark(
-          "BM_bare/experts:" + std::to_string(k), [&bench, k](benchmark::State& state) { bm_bare(state, bench, k); })
-          ->UseManualTime()
-          ->Unit(benchmark::kMicrosecond);
+    // outputs bit-exactly before and after it is timed. Above one group there is no BM_bare: record_bare ran each
+    // group's bare forwards above.
+    if (kGroups == 1)
+      for (int k : {1, 3, 5})
+        benchmark::RegisterBenchmark(
+            "BM_bare/experts:" + std::to_string(k), [&bench, k](benchmark::State& state) { bm_bare(state, bench, k); })
+            ->UseManualTime()
+            ->Unit(benchmark::kMicrosecond);
     for (int k : {1, 3, 5})
       benchmark::RegisterBenchmark(
           "BM_stack/experts:" + std::to_string(k), [&bench, k](benchmark::State& state) { bm_stack(state, bench, k); })

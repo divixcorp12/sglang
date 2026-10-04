@@ -7,7 +7,10 @@
 #include "cpu_experts_cabi.h"
 #include "fixture.h"
 #include "moe_mul1.h"
+#include "placement.h"
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -55,8 +58,12 @@ std::string fixture_stamp(const fs::path& fixture, const ImageLayout& layout) {
 
 }  // namespace
 
-StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_dir) : impl_(std::make_unique<Impl>()) {
+StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_dir, std::vector<int> group_nodes)
+    : impl_(std::make_unique<Impl>()) {
   Impl& f = *impl_;
+  constexpr int kNodes = ::sglang::expert_stream::wire::Wire::kNodes;
+  if (kNodes > 1 && static_cast<int>(group_nodes.size()) != kNodes)
+    throw std::runtime_error("give one NUMA node per group (" + std::to_string(kNodes) + ")");
   require_o_direct(image_dir);
   const Fixture fixture(fixture_path);
   f.rows = static_cast<int64_t>(fixture.layers.size());
@@ -68,15 +75,18 @@ StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_d
       2 * nbytes(m[0][0]), 2 * nbytes(m[1][0]), 2 * nbytes(m[2][0]), nbytes(m[6][0]), nbytes(m[7][0]), nbytes(m[8][0])};
   f.set.layout = image_layout(row_bytes);
   f.set.experts = f.experts;
-  f.set.capacity = kCapacity;
+  f.set.capacity = capacity();
   const ImageLayout& layout = f.set.layout;
   const std::string stamp = fixture_stamp(fixture_path, layout);
   f.slabs.resize(static_cast<size_t>(f.rows));
   for (int64_t row = 0; row < f.rows; ++row) {
     std::array<uint8_t*, kNames> bases{};
     for (int n = 0; n < kNames; ++n) {
-      f.slabs[row][n] = aligned_zeroed(kCapacity * row_bytes[n]);
+      f.slabs[row][n] = aligned_zeroed(capacity() * row_bytes[n]);
       bases[n] = f.slabs[row][n].get();
+      if (kNodes > 1)
+        for (int g = 0; g < kNodes; ++g)
+          bind_pages(bases[n] + g * kGroupSlots * row_bytes[n], kGroupSlots * row_bytes[n], group_nodes[g]);
     }
     f.set.slabs.push_back(bases);
     char name[40];
@@ -108,7 +118,7 @@ StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_d
     std::memcpy(f.inputs.data() + row * 2 * f.hidden, fixture.layers[row].input.data_ptr(), 2 * f.hidden);
     std::memcpy(f.x.get() + row * f.x_stride, fixture.layers[row].input.data_ptr(), 2 * f.hidden);
   }
-  f.out_stride = 2 * f.hidden * static_cast<int64_t>(sizeof(float));
+  f.out_stride = 2 * kNodes * f.hidden * static_cast<int64_t>(sizeof(float));
   f.out = aligned_zeroed(f.rows * f.out_stride);
 }
 
@@ -150,7 +160,7 @@ int64_t StackFixture::register_layer(int64_t row) const {
   static const SglangExl3CpuParams params{3, 0};  // the kernel may read params until free_layer
   SglangCpuExpertsLayer d{};
   d.abi_version = SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION;
-  d.capacity = static_cast<int32_t>(kCapacity);
+  d.capacity = static_cast<int32_t>(capacity());
   d.hidden = static_cast<int32_t>(f.hidden);
   d.intermediate = static_cast<int32_t>(f.intermediate);
   d.activation = 0;
@@ -172,7 +182,7 @@ int64_t StackFixture::register_layer(int64_t row) const {
 void StackFixture::preload_slots(int64_t row) const {
   const Impl& f = *impl_;
   const ImageLayout& layout = f.set.layout;
-  if (f.experts > kCapacity - kStaging) throw std::runtime_error("more experts than mappable slots");
+  if (f.experts > kGroupSlots - kStaging) throw std::runtime_error("more experts than mappable slots");
   const std::string& path = f.set.paths[static_cast<size_t>(row)];
   std::ifstream in(path, std::ios::binary);
   std::vector<char> image(static_cast<size_t>(layout.image_bytes));
@@ -182,7 +192,7 @@ void StackFixture::preload_slots(int64_t row) const {
       throw std::runtime_error("cannot read expert " + std::to_string(e) + "'s image from " + path);
     for (int n = 0; n < kNames; ++n)
       std::memcpy(
-          f.set.slabs[row][n] + e * layout.row_bytes[n],
+          f.set.slabs[row][n] + slot_of(e) * layout.row_bytes[n],
           image.data() + layout.name_offsets[n],
           static_cast<size_t>(layout.row_bytes[n]));
   }
@@ -208,6 +218,19 @@ void release_kernel_team() {
 
 void check_reference(const fs::path& path, const std::vector<float>& actual) {
   compare_reference(path, actual);
+}
+
+void check_reference_close(const fs::path& path, const std::vector<float>& actual, float tol) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("Missing reference: " + path.string());
+  const size_t bytes = actual.size() * sizeof(float);
+  if (fs::file_size(path) != bytes) throw std::runtime_error("Reference length mismatch");
+  std::vector<float> expected(actual.size());
+  if (!input.read(reinterpret_cast<char*>(expected.data()), static_cast<std::streamsize>(bytes)))
+    throw std::runtime_error("Cannot read reference: " + path.string());
+  for (size_t i = 0; i < actual.size(); ++i)
+    if (!(std::fabs(actual[i] - expected[i]) <= tol * std::max(1.0f, std::fabs(expected[i]))))
+      throw std::runtime_error("Reference check failed beyond " + std::to_string(tol) + ": " + path.string());
 }
 
 }  // namespace fullstack
