@@ -151,7 +151,7 @@ def test_cores_cannot_change_after_the_first_forward(library):
 
 
 def test_a_worker_that_cannot_be_pinned_fails_the_forward_and_leaves_out_untouched(library, tmp_path):
-    # set_cores checked the cores against the affinity mask; pinning can still fail later (a cgroup change). A preloaded
+    # set_cores checks only range and uniqueness; a core the kernel cannot pin fails the first forward. A preloaded
     # pthread_setaffinity_np that always fails stands in for that.
     shim = tmp_path / "unpinnable.c"
     shim.write_text("int pthread_setaffinity_np(unsigned long t, unsigned long n, const void* s) { return 22; }\n")

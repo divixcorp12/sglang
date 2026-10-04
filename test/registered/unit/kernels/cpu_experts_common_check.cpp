@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -131,6 +132,21 @@ int main()
         const int32_t twice[2] = {cores[0], cores[0]};
         CHECK(sglang_toy_cpu_experts_set_cores(twice, 2) == 2);
     }
+    {
+        // The engine configures from a thread whose mask may exclude the expert cores (the server runs under taskset):
+        // set_cores accepts a core outside the caller's affinity; only the workers' own pins must succeed.
+        cpu_set_t saved, one;
+        CHECK(pthread_getaffinity_np(pthread_self(), sizeof(saved), &saved) == 0);
+        CPU_ZERO(&one);
+        CPU_SET(allowed[0], &one);
+        CHECK(pthread_setaffinity_np(pthread_self(), sizeof(one), &one) == 0);
+        const int32_t outside = allowed.size() >= 2 ? allowed[1] : allowed[0] + 1;
+        CHECK(outside < CPU_SETSIZE && !CPU_ISSET(outside, &one));
+        CHECK(sglang_toy_cpu_experts_set_cores(&outside, 1) == 0);
+        CHECK(pthread_setaffinity_np(pthread_self(), sizeof(saved), &saved) == 0);
+        ok("set_cores_accepts_a_core_outside_the_callers_affinity");
+    }
+    // Before the first forward a later configuration replaces the earlier one.
     CHECK(sglang_toy_cpu_experts_set_cores(cores.data(), team) == 0);
 
     {
@@ -295,8 +311,14 @@ int main()
         const int64_t h = register_toy(f);
         Call call(h, 1, 1, {0}, {1.0f}, team + 1);
         CHECK(call.run() == 1);
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
         ok("set_cores_after_the_first_forward_returns_2");
+        // Status 1 keeps its reason on this thread, for a quant's own wrappers; the next call clears it.
+        CHECK(sglang::cpu_experts::last_error().find("exceeds configured cores") != std::string::npos);
+        Call fits(h, 1, 1, {0}, {1.0f}, team);
+        CHECK(fits.run() == 0);
+        CHECK(sglang::cpu_experts::last_error().empty());
+        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
+        ok("last_error_names_why_a_call_failed");
     }
 
     {

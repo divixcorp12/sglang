@@ -240,7 +240,7 @@ class CpuExpertPool:
         capacity = self.capacity[layer]
         top = int(host_slots.max())
         if top >= capacity:
-            # The kernel would skip an out-of-range slot silently.
+            # Checked here for a message naming the layer and tier; the kernel would refuse it only as status 2.
             raise ValueError(
                 f"layer {layer}: host slot {top} is outside the tier's {capacity} rows"
             )

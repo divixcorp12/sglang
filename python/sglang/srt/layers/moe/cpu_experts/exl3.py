@@ -2,10 +2,10 @@
 
 The kernel is the optimized build of exllamav3's CPU MoE kernel,
 ``python/sglang/srt/layers/quantization/exl3_cpu/optimized/moe_mul1.cpp`` (built by
-SGLANG_DSV41_CPU_EXPERTS=1; only it has the slab registration ABI). ``Exl3CpuQuantTrait``
-registers each streamed layer's pinned slabs with it by base pointer, and exposes the
-kernel's C entry points (forward and core placement) that the native CPU expert thread
-calls without Python.
+SGLANG_DSV41_CPU_EXPERTS=1; only it exports the CPU experts C ABI). ``Exl3CpuQuantTrait``
+registers each streamed layer's pinned slabs with its ``register_layer`` by base pointer and
+slot stride, and exposes the kernel's C entry points (forward, keep-warm and core placement)
+that the native CPU expert thread calls without Python.
 """
 
 import ctypes
@@ -111,7 +111,9 @@ class Exl3CpuQuantTrait:
         )
         for i, name in enumerate(self.slab_names):
             layer.slabs[i] = slabs[name].data_ptr()
-            layer.slot_bytes[i] = slabs[name].stride(0) * slabs[name].element_size()
+            # One slot's row: the slab is contiguous (checked above), so this is its stride(0), which PyTorch does not
+            # keep meaningful for a one-slot slab.
+            layer.slot_bytes[i] = slabs[name][0].numel() * slabs[name].element_size()
         fn = self._native("sglang_exl3_cpu_experts_register_layer")
         fn.restype = ctypes.c_int
         fn.argtypes = [ctypes.POINTER(CpuExpertsLayer), ctypes.POINTER(ctypes.c_int64)]

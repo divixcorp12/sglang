@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace sglang::cpu_experts {
@@ -15,19 +16,36 @@ namespace sglang::cpu_experts {
 // are STB_GNU_UNIQUE, which the dynamic linker merges across every library in the process, even RTLD_LOCAL ones.
 namespace {
 
+// Why this thread's last register, free, forward or keep-warm call returned 1 ("" otherwise); each clears it on entry.
+// Per library, like the rest of the framework; the C ABI does not export it, a quant's own wrappers read it.
+inline std::string& last_error()
+{
+    static thread_local std::string error;
+    return error;
+}
+
+// Records `what` as last_error() and returns 1; never throws (it runs in the C ABI's catch blocks).
+inline int fail(const char* what) noexcept
+{
+    try {
+        last_error() = what;
+    } catch (...) {
+    }
+    return 1;
+}
+
 struct Cores
 {
-    // Worker i on cores[i], the caller as worker 0. Cores must be distinct and allowed by this thread's affinity;
-    // refused (2) once the first forward or keep-warm has frozen them.
+    // Worker i on cores[i], the caller as worker 0. Cores must be distinct and in [0, CPU_SETSIZE); refused (2) once
+    // the first forward or keep-warm has frozen them. Not checked against the caller's affinity: the engine configures
+    // from a thread whose inherited mask may exclude the expert cores, and the workers pin themselves outside it.
+    // A core that cannot be pinned fails the first forward's pin (1).
     static int configure(const int32_t* cores, int32_t n) noexcept
     {
         try {
-            if (!cores || n < 1 || n > 4096) return 2;
-            cpu_set_t allowed;
-            CPU_ZERO(&allowed);
-            if (sched_getaffinity(0, sizeof(allowed), &allowed)) return 2;
+            if (!cores || n < 1 || n > CPU_SETSIZE) return 2;
             for (int i = 0; i < n; ++i) {
-                if (cores[i] < 0 || cores[i] >= CPU_SETSIZE || !CPU_ISSET(cores[i], &allowed)) return 2;
+                if (cores[i] < 0 || cores[i] >= CPU_SETSIZE) return 2;
                 for (int j = 0; j < i; ++j)
                     if (cores[j] == cores[i]) return 2;
             }

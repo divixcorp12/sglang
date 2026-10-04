@@ -30,7 +30,9 @@ CHECKS = (
     "routes_are_validated",
     "concurrent_forward_returns_3",
     "isa_cap_env_lowers_the_tier",
+    "set_cores_accepts_a_core_outside_the_callers_affinity",
     "set_cores_after_the_first_forward_returns_2",
+    "last_error_names_why_a_call_failed",
     "keep_warm_returns_when_the_word_moves",
 )
 

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace sglang::cpu_experts {
@@ -56,6 +57,7 @@ struct ExpertForward
 
     static int register_layer(const SglangCpuExpertsLayer* d, int64_t* handle) noexcept
     {
+        last_error().clear();
         try {
             if (!d || !handle || d->abi_version != SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION || d->capacity < 1
                 || d->slab_count != Quant::kSlabs)
@@ -76,13 +78,16 @@ struct ExpertForward
             layers.push_back(std::move(layer));
             *handle = int64_t(layers.size() - 1);
             return 0;
+        } catch (const std::exception& e) {
+            return fail(e.what());
         } catch (...) {
-            return 1;
+            return fail("unknown exception");
         }
     }
 
     static int free_layer(int64_t handle) noexcept
     {
+        last_error().clear();
         try {
             std::unique_lock<std::mutex> forward_lock(forward_mutex, std::try_to_lock);
             if (!forward_lock.owns_lock()) return 3;
@@ -90,13 +95,16 @@ struct ExpertForward
             if (handle < 0 || handle >= int64_t(layers.size()) || !layers[size_t(handle)]) return 2;
             layers[size_t(handle)].reset();
             return 0;
+        } catch (const std::exception& e) {
+            return fail(e.what());
         } catch (...) {
-            return 1;
+            return fail("unknown exception");
         }
     }
 
     static int forward(const SglangCpuExpertsForward* call) noexcept
     {
+        last_error().clear();
         try {
             if (!call || call->abi_version != SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION) return 2;
             const SglangCpuExpertsForward& c = *call;
@@ -117,8 +125,10 @@ struct ExpertForward
             }
             const RouteTable routes = RouteTable::build(c.slots, c.weights, c.rows, c.k);
             return Quant::dispatch(*layer, c, routes, isa());
+        } catch (const std::exception& e) {
+            return fail(e.what());
         } catch (...) {
-            return 1;
+            return fail("unknown exception");
         }
     }
 
@@ -127,8 +137,10 @@ struct ExpertForward
     {
         try {
             return ::sglang::cpu_experts::keep_warm<Quant::kTopIsa>(isa(), threads, word, seen, deadline_ns);
+        } catch (const std::exception& e) {
+            return fail(e.what());
         } catch (...) {
-            return 1;
+            return fail("unknown exception");
         }
     }
 };

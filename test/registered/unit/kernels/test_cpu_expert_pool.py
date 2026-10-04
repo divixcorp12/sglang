@@ -296,6 +296,22 @@ def test_exl3_trait_registers_the_six_slab_bases(monkeypatch, tier_layout):
     assert fake.calls == [([slabs[n].data_ptr() for n in names], row_bytes, CAP, H, INTER, 3, 1, 10.0)]
 
 
+def test_exl3_trait_reads_a_one_slot_slabs_row_size_not_its_stride():
+    """A one-slot slab's stride(0) is arbitrary (PyTorch ignores it for a size-1 dim, and it still counts as
+    contiguous), so the registered slot bytes must be the row's size."""
+    slabs = {}
+    for name, t in _exl3_slabs().items():
+        one = t[:1].clone()
+        slabs[name] = one.as_strided(one.shape, (1,) + one.stride()[1:])
+        assert slabs[name].is_contiguous() and slabs[name].stride(0) == 1
+    fake = FakeRegisterLayer()
+    trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0)
+    trait._native = lambda name: fake
+    trait.register_layer(slabs, 1)
+    trellis = H * INTER * 3 // 8
+    assert fake.calls[0][1] == [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]
+
+
 def test_exl3_trait_keeps_the_slabs_alive_until_free(monkeypatch):
     """The kernel keeps only pointers: the trait holds the tensors until the layer is freed."""
     slabs = _exl3_slabs()

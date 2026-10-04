@@ -216,27 +216,44 @@ def test_the_c_abi_refuses_a_slot_past_capacity(monkeypatch):
         trait.free_layer(layer)
 
 
+_SET_CORES_CHILD = """
+import ctypes, os, sys
+import torch
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import test_cpu_expert_pool_exl3 as t
+from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+ext = t._optimized_ext()
+set_cores = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_set_cores
+set_cores.argtypes, set_cores.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
+cores = (ctypes.c_int32 * 1)(sorted(os.sched_getaffinity(0))[0])
+print("before", set_cores(cores, 1))
+trait = Exl3CpuQuantTrait(ext, act_limit=t.LIMIT)
+layer = trait.register_layer(t._random_slabs(20261004), t.CAP)
+x = torch.randn(t.H, generator=torch.Generator().manual_seed(4)).half()
+print("forward", t._c_forward(trait, layer, x, [1], [1.0], torch.empty(t.H)))
+trait.free_layer(layer)
+print("after", set_cores(cores, 1))
+try:
+    trait.native_set_cores([cores[0]])
+except RuntimeError as error:
+    print("trait", "status 2" in str(error))
+"""
+
+
 def test_set_cores_after_the_first_forward_returns_2(monkeypatch):
-    """The first forward freezes the worker cores: a later set_cores, even with valid cores, is refused (2)."""
-    import ctypes
+    """In a fresh process: set_cores is accepted (0) before the first forward, which freezes the worker cores; a later
+    set_cores, even with the same valid core, is refused (2), and the trait raises naming the status."""
+    import subprocess
+    import sys
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-
-    ext = _optimized_ext()
-    trait = Exl3CpuQuantTrait(ext, act_limit=LIMIT)
-    layer = trait.register_layer(_random_slabs(20261004), CAP)
-    x = (torch.randn(H, generator=torch.Generator().manual_seed(4))).half()
-    try:
-        assert _c_forward(trait, layer, x, [1], [1.0], torch.empty(H)) == 0
-    finally:
-        trait.free_layer(layer)
-    set_cores = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_set_cores
-    set_cores.argtypes, set_cores.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
-    cores = (ctypes.c_int32 * 1)(sorted(os.sched_getaffinity(0))[0])
-    assert set_cores(cores, 1) == 2
-    with pytest.raises(RuntimeError, match="status 2"):
-        trait.native_set_cores([cores[0]])
+    _optimized_ext()  # skips here, not in the child, when the optimized kernel is not selected
+    result = subprocess.run(
+        [sys.executable, "-c", _SET_CORES_CHILD, __file__], capture_output=True, text=True, timeout=1800
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = [line for line in result.stdout.split("\n") if line.split(" ")[0] in ("before", "forward", "after", "trait")]
+    assert lines == ["before 0", "forward 0", "after 2", "trait True"], result.stdout + result.stderr
 
 
 def test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline(monkeypatch):
