@@ -205,7 +205,9 @@ struct HostExports {
       int64_t row_images,
       int64_t direct,
       TensorView lease,
-      TensorView hot_page) {
+      TensorView hot_page,
+      TensorView ranges,
+      TensorView sq_thread_cpus) {
     using namespace host;
     // Records and map deltas carry expert ids and slots as i16 (lease_layout.h).
     RuntimeCheck(
@@ -238,7 +240,25 @@ struct HostExports {
         "hot_page", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(hot_page_mem), hot_page);
     auto cpu = SymbolicDevice{};
     verify_named("capacity", TensorMatcher({extents.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), capacity);
+    // Each group's slot range of every row, as [lo, hi), and its ring's SQPOLL core.
+    verify_named(
+        "ranges",
+        TensorMatcher({Wire::kNodes, extents.size(0), 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+        ranges);
+    verify_named(
+        "sq_thread_cpus", TensorMatcher({Wire::kNodes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), sq_thread_cpus);
     const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
+    const auto* range_data = static_cast<const int64_t*>(ranges.data_ptr());
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> group_ranges(Wire::kNodes);
+    for (int g = 0; g < Wire::kNodes; ++g)
+      for (int64_t row = 0; row < extents.size(0); ++row) {
+        const int64_t* range = range_data + (g * extents.size(0) + row) * 2;
+        group_ranges[g].emplace_back(range[0], range[1]);
+      }
+    const auto* sq_data = static_cast<const int64_t*>(sq_thread_cpus.data_ptr());
+    std::vector<int> sq_cpus;
+    for (int g = 0; g < Wire::kNodes; ++g)
+      sq_cpus.push_back(static_cast<int>(sq_data[g]));
     auto tier = std::make_shared<RamTier<Source>>(
         static_cast<uint8_t*>(page.data_ptr()),
         static_cast<int32_t*>(slot_map.data_ptr()),
@@ -259,7 +279,9 @@ struct HostExports {
         std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
         direct != 0,
         hot_page.size(0) ? static_cast<uint8_t*>(hot_page.data_ptr()) : nullptr,
-        hot_page.size(0));
+        hot_page.size(0),
+        std::move(group_ranges),
+        std::move(sq_cpus));
     if (!tier->open()) return -1;
     std::lock_guard<std::mutex> guard(registry_mutex());
     static int64_t next_handle = 1;
@@ -521,6 +543,18 @@ struct HostExports {
     find(handle)->set_hot(row, static_cast<const int64_t*>(experts.data_ptr()), experts.size(0));
   }
 
+  // Group `group`'s own counters: its service thread's block (RamTier::group_counters).
+  static void group_counters(int64_t handle, int64_t group, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named(
+        "out", TensorMatcher({expert_stream::kCounterCount}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    const auto tier = find(handle);
+    if (group < 0 || group >= tier->groups())
+      throw std::runtime_error(error_prefix<Layout>() + "group " + std::to_string(group) + " is out of range");
+    tier->group_counters(static_cast<int>(group), static_cast<int64_t*>(out.data_ptr()));
+  }
+
   static void counters(int64_t handle, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -574,39 +608,32 @@ struct HostExports {
     return find(handle)->trace_dropped();
   }
 
-  static void
-  start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns, int64_t busy_poll) {
-    if (cpu_core >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
-    if (cpu_core >= 64 && cpu_core <= 71) {
-      throw std::runtime_error(
-          error_prefix<Layout>() + "cores 64-71 are reserved (NVMe completion interrupts are pinned there)");
-    }
-    if (cpu_core < 0) {
-      cpu_set_t inherited;
-      CPU_ZERO(&inherited);
-      if (pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited) == 0) {
-        for (int core = 64; core <= 71; ++core) {
-          if (CPU_ISSET(core, &inherited)) {
-            std::fprintf(
-                stderr,
-                "WARNING %sthe service thread inherits an affinity that includes reserved cores 64-71; "
-                "run under taskset -c 0-63 or pass cpu_core\n",
-                error_prefix<Layout>().c_str());
-            break;
-          }
-        }
-      }
+  // `cpu_cores`: one core per NUMA group, -1 inherits the caller's affinity. The reserved-core rule is
+  // ExpertStreamHost.start_thread's (check_not_reserved).
+  static void start_thread(
+      int64_t handle, TensorView cpu_cores, int64_t fatal_wait_ns, int64_t spin_ns, int64_t busy_poll) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named(
+        "cpu_cores", TensorMatcher({Wire::kNodes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cpu_cores);
+    const auto* core_data = static_cast<const int64_t*>(cpu_cores.data_ptr());
+    std::vector<int> cores;
+    for (int g = 0; g < Wire::kNodes; ++g) {
+      if (core_data[g] >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
+      cores.push_back(static_cast<int>(core_data[g]));
     }
     std::shared_ptr<RamTier<Source>> tier = find(handle);
-    if (busy_poll != 0) check_dedicated_core(static_cast<int>(cpu_core), tier->cpu_cores(), error_prefix<Layout>());
+    if (busy_poll != 0) {
+      for (const int core : cores)
+        check_dedicated_core(core, tier->cpu_cores(), error_prefix<Layout>());
+    }
     // Checked and registered under one lock, so a concurrent close() either sees the thread
     // (and joins it) or runs before it and leaves no handle to start it on.
     std::lock_guard<std::mutex> guard(registry_mutex());
     if (registry().count(handle) == 0) throw std::runtime_error(error_prefix<Layout>() + "unknown handle");
     if (thread_registry().count(handle))
       throw std::runtime_error(error_prefix<Layout>() + "the service thread already runs");
-    auto thread =
-        std::make_shared<Thread>(std::move(tier), static_cast<int>(cpu_core), fatal_wait_ns, spin_ns, busy_poll != 0);
+    auto thread = std::make_shared<Thread>(std::move(tier), std::move(cores), fatal_wait_ns, spin_ns, busy_poll != 0);
     thread->start();
     thread_registry()[handle] = std::move(thread);
   }
@@ -706,6 +733,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lru_order, Exports::lru_order);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_hot, Exports::set_hot);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_counters, Exports::counters);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_group_counters, Exports::group_counters);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_core_counter_mask, Exports::core_counter_mask);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layer_rows, Exports::layer_rows);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_words, Exports::trace_words);                 \

@@ -87,6 +87,7 @@ def test_the_host_module_refuses_tables_its_records_cannot_carry(experts, capaci
             torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.full((1, experts), -1, dtype=torch.int32), empty,
             torch.zeros((1, experts), dtype=torch.int64), empty, empty, empty, empty, empty,
             torch.tensor([capacity], dtype=torch.int64), "", "", 0, 0, 0, no_bytes, no_bytes,
+            torch.zeros((1, 1, 2), dtype=torch.int64), torch.full((1,), -2, dtype=torch.int64),
         )
 
 

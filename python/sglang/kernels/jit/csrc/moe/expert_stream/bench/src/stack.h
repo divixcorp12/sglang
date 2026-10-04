@@ -143,7 +143,10 @@ class Stack {
         std::vector<int64_t>(static_cast<size_t>(rows_), config_.rows.capacity),
         /*direct=*/true,
         /*hot_page=*/nullptr,
-        0);
+        0,
+        std::vector<std::vector<std::pair<int64_t, int64_t>>>{
+            std::vector<std::pair<int64_t, int64_t>>(static_cast<size_t>(rows_), {0, config_.rows.capacity})},
+        std::vector<int>{-2});  // -2: the ring's SQPOLL core stays the uring env's, as before NUMA groups
     if (!tier_->open()) throw std::runtime_error("the tier's reader did not open (its error is on stderr)");
     tier_->reserve_staging(config_.staging);
     // The copy engine's thread and RamThread's watchdog inherit this thread's affinity: the copy CPU.
@@ -169,7 +172,8 @@ class Stack {
     }
     es::check_dedicated_core(config_.service_cpu, tier_->cpu_cores(), "full-stack bench: ");
     thread_ =
-        std::make_unique<Thread>(tier_, config_.service_cpu, config_.fatal_wait_ns, /*spin_ns=*/0, /*busy_poll=*/true);
+        std::make_unique<Thread>(
+            tier_, std::vector<int>{config_.service_cpu}, config_.fatal_wait_ns, /*spin_ns=*/0, /*busy_poll=*/true);
     thread_->start();
   }
 

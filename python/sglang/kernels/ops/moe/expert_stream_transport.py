@@ -1238,8 +1238,27 @@ class ExpertStreamHost:
         layout: str = "exl3",
         variant: Optional[str] = None,
         lanes: int = 8,
+        node_ranges: Optional[Sequence[Sequence[tuple[int, int]]]] = None,
+        sq_thread_cpus: Optional[Sequence[int]] = None,
     ) -> None:
-        self.wire = expert_lease_block.wire_layout(lanes)
+        # NUMA groups: node_ranges[g][row] = (lo, hi), group g's slots of the row; one group owning every slot by
+        # default. sq_thread_cpus: each group's SQPOLL core (-1 unpinned); None keeps the uring env's.
+        capacity = [int(c) for c in tables.capacity.tolist()]
+        if node_ranges is None:
+            node_ranges = [[(0, c) for c in capacity]]
+        self.nodes = len(node_ranges)
+        self.node_ranges = [[(int(lo), int(hi)) for lo, hi in rows] for rows in node_ranges]
+        for g, rows in enumerate(self.node_ranges):
+            if len(rows) != len(capacity):
+                raise ValueError(f"node_ranges[{g}] has {len(rows)} rows, the tables {len(capacity)}")
+            for row, (lo, hi) in enumerate(rows):
+                if not 0 <= lo < hi <= capacity[row]:
+                    raise ValueError(f"group {g}'s slots [{lo}, {hi}) of row {row} are outside its {capacity[row]} slots")
+                for other in range(g):
+                    olo, ohi = self.node_ranges[other][row]
+                    if lo < ohi and olo < hi:
+                        raise ValueError(f"groups {other} and {g} overlap in row {row}")
+        self.wire = expert_lease_block.wire_layout(lanes, self.nodes)
         if (
             page.numel() != self.wire.page_bytes
             or page.dtype != torch.uint8
@@ -1266,7 +1285,7 @@ class ExpertStreamHost:
         self._layout = layout
         # The host build is chosen once here: every later call goes to this module.
         self.variant = host_variant() if variant is None else variant
-        self._module = _host_module(self._layout, self.variant, self.wire.lanes)
+        self._module = _host_module(self._layout, self.variant, self.wire.lanes, self.nodes)
         self.threaded = False
         # Allocated here when the caller passes none.
         if lease_block is None:
@@ -1319,6 +1338,11 @@ class ExpertStreamHost:
                 self.hot_page
                 if self.hot_page is not None
                 else torch.empty(0, dtype=torch.uint8),
+                torch.tensor(self.node_ranges, dtype=torch.int64).reshape(self.nodes, len(capacity), 2),
+                torch.tensor(
+                    [-2] * self.nodes if sq_thread_cpus is None else [int(c) for c in sq_thread_cpus],
+                    dtype=torch.int64,
+                ),
             )
         )
         if self.handle < 0:
@@ -1349,24 +1373,27 @@ class ExpertStreamHost:
     def start_thread(
         self,
         *,
-        cpu_core: int = -1,
+        cpu_core: int | Sequence[int] = -1,
         fatal_wait_s: float = 30.0,
         spin_us: int = 5000,
         busy_poll: bool = False,
     ) -> None:
-        """Serve requests on a C++ thread (no more ``pump()``), with the watchdog.
+        """Serve requests on one C++ thread per NUMA group (no more ``pump()``), with the watchdog.
 
-        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved for
-        NVMe completion interrupts. ``busy_poll`` spins on ``cpu_core`` with no PAUSE
-        and no sleep; the C++ side refuses it unless that physical core is the
-        service's alone.
+        ``cpu_core`` is one core per group (a sequence), or one int for a single group; -1 inherits the caller's
+        affinity. Cores 64-71 are reserved for NVMe completion interrupts. ``busy_poll`` spins on each group's core
+        with no PAUSE and no sleep; the C++ side refuses it unless each physical core is its service's alone.
         """
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
-        check_not_reserved(cpu_core)
+        cores = [int(cpu_core)] * self.nodes if isinstance(cpu_core, int) else [int(c) for c in cpu_core]
+        if len(cores) != self.nodes or (self.nodes > 1 and isinstance(cpu_core, int) and cpu_core >= 0):
+            raise ValueError(f"start_thread takes one core per NUMA group ({self.nodes}), got {cpu_core!r}")
+        for core in cores:
+            check_not_reserved(core)
         self._module.expert_stream_start_thread(
             self.handle,
-            cpu_core,
+            torch.tensor(cores, dtype=torch.int64),
             int(fatal_wait_s * 1e9),
             int(spin_us * 1e3),
             int(busy_poll),
@@ -1969,6 +1996,12 @@ class ExpertStreamHost:
         return (
             values if self.variant != "prod" else {k: values[k] for k in CORE_COUNTERS}
         )
+
+    def group_counters(self, group: int) -> dict[str, int]:
+        """NUMA group ``group``'s own counters (its service thread's), by the names ``counters`` uses."""
+        out = torch.zeros(len(COUNTERS), dtype=torch.int64)
+        self._module.expert_stream_group_counters(self.handle, int(group), out)
+        return dict(zip(COUNTERS, out.tolist()))
 
     def layer_rows(self) -> list[int]:
         """Return the rows read for demands, per streamed layer (the RAM misses)."""

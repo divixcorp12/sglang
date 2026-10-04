@@ -570,7 +570,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return g.subs;
   }
 
-  // Serves one demand record on the calling thread: 1 if it served one, 0 if nothing was posted (or it was deferred).
+  // Serves one demand record per group on the calling thread: 1 if group 0 served one, 0 if nothing was posted (or it was deferred).
   // Throws while the service thread runs. Held under caller_mutex(): pump() consumes the copy-completion ring (and owns
   // the tier), so it is serialized against every other Python caller, whose owned calls and wait_copy_idle drain the
   // same ring. Tests only; no hot-path cost.
@@ -610,9 +610,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     result[1] = census.evictable;
   }
 
-  // The watchdog's busy episode: nonzero while a request or fill is in service, a new value per episode.
+  // Group 0's busy episode (the watchdog's per group): nonzero while a request or fill is in service, a new value per
+  // episode.
   static int64_t busy_episode(int64_t handle) {
-    return static_cast<int64_t>(find(handle)->busy_episode());
+    return static_cast<int64_t>(find(handle)->busy_episode(0));
   }
 
   // 1 when every job handed to the copy thread completed or failed within `timeout_ns`, else 0.

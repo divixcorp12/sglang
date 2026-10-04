@@ -255,6 +255,11 @@ class ReaderCore {
     return least;
   }
 
+  // Before open(): the ring's SQPOLL core (BasicUringReader::set_sq_thread_cpu).
+  void set_sq_thread_cpu(int cpu) {
+    io_.set_sq_thread_cpu(cpu);
+  }
+
   // Opens the files, sizes every buffer and initializes the ring. Returns false (after logging) on an open or init
   // failure; throws on a file whose size differs from its source. Allocates; call once, on the owner thread.
   bool open() {

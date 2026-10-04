@@ -64,7 +64,7 @@ class ChainSim:
         self.block, self.hot_page = host.lease_block, host.hot_page
         self.layers, self.experts = host.layers, host.experts
         self.wire = host.wire
-        self.replica = MapReplica(host.layers, host.experts, self.wire.lanes)
+        self.replica = MapReplica(host.layers, host.experts, self.wire.lanes, self.wire.nodes)
 
     @property
     def host(self):
@@ -82,13 +82,16 @@ class ChainSim:
         return int(self._u64(offset)[0]) & 0xFFFFFFFFFFFFFFFF
 
     def delta(self, row: int) -> tuple[int, list[int], list[tuple[int, int]]]:
-        """Row ``row``'s map delta record: (tag, staging[lanes], entries), as the post reads it."""
+        """Row ``row``'s map delta record: (tag, staging, entries), as the post reads it; staging is every node's list,
+        node-major."""
         w = self.wire
         base = w.lease_block_bytes + row * w.delta_stride
         f = w.delta_fields
         tag = self.read_u64(base + f["tag"])
         count = int(_i32(self.block, base + f["count"])[0])
-        staging = self.block[base + f["staging"] : base + f["staging"] + 2 * w.lanes].view(torch.int16).tolist()
+        staging = (
+            self.block[base + f["staging"] : base + f["staging"] + 2 * w.nodes * w.lanes].view(torch.int16).tolist()
+        )
         entries = base + f["entries"]
         flat = self.block[entries : entries + 4 * w.delta_max_entries].view(torch.int16).tolist()
         return tag, staging, [(flat[2 * i], flat[2 * i + 1]) for i in range(count)]
@@ -103,7 +106,9 @@ class ChainSim:
         return int(_i32(self.block, self.wire.copy_armed)[0]) != 0
 
     def split(self) -> list[int]:
-        return _i32(self.block, self.wire.split, self.wire.lanes + 1).tolist()
+        """Every node's split table, node-major."""
+        w = self.wire
+        return sum((_i32(self.block, w.split + n * w.split_stride, w.lanes + 1).tolist() for n in range(w.nodes)), [])
 
     def piece_word(self, req: SimRequest, lane: int) -> int:
         w = self.wire
@@ -171,7 +176,7 @@ class ChainSim:
         if kinds is None:
             typed, slot_list = type_lanes(
                 experts, self.replica.ram_slot[row], self.replica.staging[row], self.split(),
-                lanes=self.wire.lanes, captured=captured, copy_armed=self.copy_armed(), hit_copy=hit_copy, cpu_on=cpu_on,
+                lanes=self.wire.lanes, nodes=self.wire.nodes, captured=captured, copy_armed=self.copy_armed(), hit_copy=hit_copy, cpu_on=cpu_on,
                 cpu_misses=cpu_misses, cpu_ok=cpu_ok, ce_ok=ce_ok,
             )
         else:
