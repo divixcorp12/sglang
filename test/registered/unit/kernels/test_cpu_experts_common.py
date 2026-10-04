@@ -105,44 +105,48 @@ def _build_toy_library(output: Path, *flags: str) -> Path:
 
 def test_each_library_keeps_its_own_registry_and_engines(tmp_path):
     # Two quant libraries in one process must not share the framework's state: a layer handle or an engine created in
-    # one is unknown to the other.
-    a = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_a.so")))
-    b = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_b.so")))
-    for library in (a, b):
-        library.sglang_toy_cpu_experts_engine_create.argtypes = [
-            ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64),
-        ]
-    hidden, capacity = 16, 2
-    slab = (ctypes.c_float * (hidden * capacity))(*range(hidden * capacity))
-    scale = ctypes.c_float(1.0)
-    layer = _Layer(abi_version=1, capacity=capacity, hidden=hidden, intermediate=hidden, slab_count=1)
-    layer.slabs[0] = ctypes.cast(slab, ctypes.c_void_p)
-    layer.slot_bytes[0] = hidden * 4
-    layer.params = ctypes.cast(ctypes.byref(scale), ctypes.c_void_p)
-    handle = ctypes.c_int64(-1)
-    assert a.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(handle)) == 0
-    core = (ctypes.c_int32 * 1)(min(os.sched_getaffinity(0)))
-    engine = ctypes.c_int64(0)
-    assert a.sglang_toy_cpu_experts_engine_create(core, 1, ctypes.byref(engine)) == 0
+    # one is unknown to the other. A forward pins its calling thread (worker 0), so the pytest thread's affinity is
+    # restored: a pinned pytest thread leaves every later test one core.
+    saved = os.sched_getaffinity(0)
+    try:
+        a = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_a.so")))
+        b = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_b.so")))
+        for library in (a, b):
+            library.sglang_toy_cpu_experts_engine_create.argtypes = [
+                ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64),
+            ]
+        hidden, capacity = 16, 2
+        slab = (ctypes.c_float * (hidden * capacity))(*range(hidden * capacity))
+        scale = ctypes.c_float(1.0)
+        layer = _Layer(abi_version=1, capacity=capacity, hidden=hidden, intermediate=hidden, slab_count=1)
+        layer.slabs[0] = ctypes.cast(slab, ctypes.c_void_p)
+        layer.slot_bytes[0] = hidden * 4
+        layer.params = ctypes.cast(ctypes.byref(scale), ctypes.c_void_p)
+        handle = ctypes.c_int64(-1)
+        assert a.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(handle)) == 0
+        core = (ctypes.c_int32 * 1)(min(os.sched_getaffinity(0)))
+        engine = ctypes.c_int64(0)
+        assert a.sglang_toy_cpu_experts_engine_create(core, 1, ctypes.byref(engine)) == 0
 
-    x = (ctypes.c_uint16 * hidden)()
-    slots = (ctypes.c_int32 * 1)(1)
-    weights = (ctypes.c_float * 1)(1.0)
-    out = (ctypes.c_float * hidden)()
-    call = _Forward(abi_version=2, rows=1, layer=handle.value, k=1, threads=1, accumulate=0, engine=engine.value)
-    call.x = ctypes.cast(x, ctypes.c_void_p)
-    call.slots, call.weights, call.out = slots, weights, out
-    assert a.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
-    assert list(out) == [float(hidden + h) for h in range(hidden)]
+        x = (ctypes.c_uint16 * hidden)()
+        slots = (ctypes.c_int32 * 1)(1)
+        weights = (ctypes.c_float * 1)(1.0)
+        out = (ctypes.c_float * hidden)()
+        call = _Forward(abi_version=2, rows=1, layer=handle.value, k=1, threads=1, accumulate=0, engine=engine.value)
+        call.x = ctypes.cast(x, ctypes.c_void_p)
+        call.slots, call.weights, call.out = slots, weights, out
+        assert a.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
+        assert list(out) == [float(hidden + h) for h in range(hidden)]
 
-    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's layer is unknown to library b"
-    other = ctypes.c_int64(-1)
-    assert b.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(other)) == 0
-    call.layer = other.value
-    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's engine is unknown to library b"
-    call.engine = 0
-    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
-
+        assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's layer is unknown to library b"
+        other = ctypes.c_int64(-1)
+        assert b.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(other)) == 0
+        call.layer = other.value
+        assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's engine is unknown to library b"
+        call.engine = 0
+        assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
+    finally:
+        os.sched_setaffinity(0, saved)
 
 def test_a_scalar_quant_library_uses_no_avx_registers(tmp_path):
     # A quant whose top tier is Scalar must compile no vector code from the framework, so a portable (baseline x86-64)
