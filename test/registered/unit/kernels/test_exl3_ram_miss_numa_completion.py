@@ -72,6 +72,7 @@ def _host(tmp_path, forwards, *, split, arm=True):
     )
     host.reserve_staging(2)
     host.enable_copy_engine(-1, spin_us=200)
+    host.copy_engine_release(-1)  # the CPU test backend completes only released marks
     dst = {n: torch.zeros((DST_ROWS,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
     table = torch.tensor(
         [[t.data_ptr(), dst[n].data_ptr(), t[0].numel() * t.element_size()] for n, t in s.slabs[ROW].items()],
@@ -187,6 +188,7 @@ host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 8), -1, dty
                         node_ranges=[[(0, 10)] * 2, [(10, 20)] * 2])
 host.reserve_staging(2)
 host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=200)
+host.copy_engine_release(-1)
 dst = {n: torch.zeros((6,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
 host.set_copy_table(ROW, torch.tensor([[t.data_ptr(), dst[n].data_ptr(), t[0].numel() * t.element_size()]
                                        for n, t in s.slabs[ROW].items()], dtype=torch.int64), 6)
