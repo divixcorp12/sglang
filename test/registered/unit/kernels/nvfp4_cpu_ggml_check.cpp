@@ -12,7 +12,7 @@ using namespace sglang::nvfp4_cpu;
 int main() {
     // The scalar tier runs everywhere; the AVX2 tier only where the host has it (the library dispatches the same way).
     __builtin_cpu_init();
-    const bool avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    const bool avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
     std::mt19937 rng(42);
     constexpr float fp4[]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
     for (int k:{16,32,48,64,80,144,512}) for (int row:{0,31,32,127,128}) {

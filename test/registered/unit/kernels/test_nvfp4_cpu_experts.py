@@ -92,10 +92,22 @@ def built(tmp_path_factory):
     return build.build(tmp_path_factory.mktemp("nvfp4") / "libnvfp4.so", cxx=CXX)
 
 
-# One library holds every tier; each case runs at each, capped by NVFP4_CPU_MAX_ISA (a cap above the host's tier
-# runs the host's).
+def _host_has_avx2() -> bool:
+    # What detect_isa requires for the AVX2 tier (cpu_experts_common/isa.hpp).
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return False
+    flags = next((line.split(":", 1)[1].split() for line in cpuinfo.splitlines() if line.startswith("flags")), [])
+    return {"avx2", "fma", "f16c"} <= set(flags)
+
+
+# One library holds every tier; each case runs at each, capped by NVFP4_CPU_MAX_ISA. A cap never raises the tier, so
+# the avx2 case is skipped where it would silently run the scalar tier again.
 @pytest.fixture(params=["avx2", "scalar"])
 def library(built, request):
+    if request.param == "avx2" and not _host_has_avx2():
+        pytest.skip("the host has no AVX2/FMA/F16C, so the avx2 cap would run the scalar tier")
     return built, request.param
 
 

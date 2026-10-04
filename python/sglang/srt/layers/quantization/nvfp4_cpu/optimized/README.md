@@ -148,6 +148,8 @@ holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and its per-th
 `ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `Nvfp4Quant::dispatch` from the tier
 `ExpertForward` detected: `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer at the
 AVX2 tier, else `ForwardPlan<GenericShape, Isa::Avx2>` or `ForwardPlan<GenericShape, Isa::Scalar>`.
+An AVX2 plan enters its gate/up and down row loops through `gate_up_avx2`/`down_avx2`, compiled for AVX2 with
+everything they call inlined (`flatten`), once per phase per worker; the rest of the library is baseline x86-64.
 `PlanTraits<Shape, Isa>` holds the plan's knobs (`kRowUnit`, the split unit). The plan groups a call's routes into
 units, one per (token, slot), and units into chunks of up to `kChunkRows` (4) of one slot; `dot_rows<Isa, M>` decodes
 each weight row once per chunk. A plan reads every layer fact it may fix

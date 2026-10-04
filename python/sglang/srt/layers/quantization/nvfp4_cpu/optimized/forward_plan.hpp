@@ -102,7 +102,8 @@ struct PlanTraits
 };
 
 // MiMo V2.6 Pro at the AVX2 tier: the shape's constants make every loop bound, sf_index group count and row stride a
-// compile-time value, and the SwiGLU clamp compiles away. kRowUnit 16 splits 2048 gate/up rows into 128 units and
+// compile-time value inside the AVX2 entries (gate_up_avx2, down_avx2, which inline the dot product), and the SwiGLU
+// clamp compiles away. kRowUnit 16 splits 2048 gate/up rows into 128 units and
 // 6144 down rows into 384, both even over 16 workers.
 template <>
 struct PlanTraits<MimoV26ProShape, Isa::Avx2>
@@ -233,6 +234,65 @@ private:
         }
     }
 
+    // Gate/up rows [r0, r1) of the flat (chunk, output) range: each chunk's gate and up dot products, gated SiLU into
+    // each unit's intermediate.
+    static inline void gate_up_rows(ForwardCtx& c, int64_t r0, int64_t r1)
+    {
+        const int H = Shape::hidden(c.info), N = Shape::intermediate(c.info);
+        const size_t Hp = rounded(size_t(H), 64), Np = rounded(size_t(N), 64);
+        for (int64_t row = r0; row < r1; ++row) {
+            const Chunk& ch = c.chunk[row / N];
+            const int i = int(row % N);
+            int gate_row, up_row;
+            w13_rows(c.info.w13_layout, N, i, gate_row, up_row);
+            const block_q8_0* xs[kChunkRows];
+            for (int j = 0; j < ch.units; ++j) xs[j] = c.qx + size_t(c.unit_token[ch.unit0 + j]) * (Hp / 32);
+            float g[kChunkRows], u[kChunkRows];
+            dot_chunk(ch.gate, gate_row, H, xs, ch.units, g);
+            dot_chunk(ch.up, up_row, H, xs, ch.units, u);
+            for (int j = 0; j < ch.units; ++j)
+                c.inter[size_t(ch.unit0 + j) * Np + size_t(i)] =
+                    swiglu(g[j] * ch.gate_alpha, u[j] * ch.up_alpha, Shape::act_limit(c.info));
+        }
+    }
+
+    // Down rows [h0, h1): every chunk's down dot products into this worker's partial, then each token's
+    // routing-weighted sum, in routing order, into out.
+    static inline void down_rows(ForwardCtx& c, float* partial, int64_t h0, int64_t h1)
+    {
+        const int H = Shape::hidden(c.info), N = Shape::intermediate(c.info);
+        const size_t Np = rounded(size_t(N), 64);
+        for (int64_t h = h0; h < h1; ++h) {
+            for (int ci = 0; ci < c.chunks; ++ci) {
+                const Chunk& ch = c.chunk[ci];
+                const block_q8_0* xs[kChunkRows];
+                for (int j = 0; j < ch.units; ++j) xs[j] = c.qi + size_t(ch.unit0 + j) * (Np / 32);
+                dot_chunk(ch.down, int(h), N, xs, ch.units, partial + ch.unit0);
+            }
+            for (int t = 0; t < c.rows; ++t) {
+                const RouteBinding* b = c.binding + size_t(t) * c.routes.k;
+                float sum = 0.f;
+                for (int r = 0; r < c.routes.count[t]; ++r) sum += partial[b[r].unit] * b[r].down_alpha;
+                float& out = c.out[size_t(t) * size_t(H) + size_t(h)];
+                out = c.accumulate ? out + sum : sum;
+            }
+        }
+    }
+
+    // The AVX2 tier's entries: one call per phase per worker, compiled for AVX2 with everything below inlined
+    // (flatten), so the dot product, GpuRow, swiglu and the down sum run under one target and the Shape's constants fold
+    // into them. Instantiated only by the Avx2 plans. -ffp-contract=off holds here as everywhere in the library.
+    SGLANG_TARGET_AVX2 __attribute__((flatten)) static void gate_up_avx2(ForwardCtx& c, int64_t r0, int64_t r1)
+    {
+        gate_up_rows(c, r0, r1);
+    }
+
+    SGLANG_TARGET_AVX2 __attribute__((flatten)) static void down_avx2(ForwardCtx& c, float* partial, int64_t h0,
+                                                                       int64_t h1)
+    {
+        down_rows(c, partial, h0, h1);
+    }
+
     // One phase, then wait for the whole team. Called inside run_team's parallel region (team.hpp; an orphaned barrier
     // binds to that team).
     template <Phase P>
@@ -267,20 +327,8 @@ private:
             }
         } else if constexpr (P == Phase::GateUp) {
             const auto [r0, r1] = share<Traits::kRowUnit>(int64_t(c.chunks) * N, worker, workers);
-            for (int64_t row = r0; row < r1; ++row) {
-                const Chunk& ch = c.chunk[row / N];
-                const int i = int(row % N);
-                int gate_row, up_row;
-                w13_rows(c.info.w13_layout, N, i, gate_row, up_row);
-                const block_q8_0* xs[kChunkRows];
-                for (int j = 0; j < ch.units; ++j) xs[j] = c.qx + size_t(c.unit_token[ch.unit0 + j]) * (Hp / 32);
-                float g[kChunkRows], u[kChunkRows];
-                dot_chunk(ch.gate, gate_row, H, xs, ch.units, g);
-                dot_chunk(ch.up, up_row, H, xs, ch.units, u);
-                for (int j = 0; j < ch.units; ++j)
-                    c.inter[size_t(ch.unit0 + j) * Np + size_t(i)] =
-                        swiglu(g[j] * ch.gate_alpha, u[j] * ch.up_alpha, Shape::act_limit(c.info));
-            }
+            if constexpr (I == Isa::Avx2) gate_up_avx2(c, r0, r1);
+            else gate_up_rows(c, r0, r1);
         } else if constexpr (P == Phase::Middle) {
             // Unit u's intermediate is Np floats at u * Np, so block b of the flat range is unit b / (Np / 32)'s.
             const auto [b0, b1] = share<1>(int64_t(c.units) * int64_t(Np / 32), worker, workers);
@@ -293,21 +341,8 @@ private:
             static_assert(P == Phase::Down);
             float* partial = c.partial + size_t(worker) * c.partial_stride;
             const auto [h0, h1] = share<Traits::kRowUnit>(H, worker, workers);
-            for (int64_t h = h0; h < h1; ++h) {
-                for (int ci = 0; ci < c.chunks; ++ci) {
-                    const Chunk& ch = c.chunk[ci];
-                    const block_q8_0* xs[kChunkRows];
-                    for (int j = 0; j < ch.units; ++j) xs[j] = c.qi + size_t(ch.unit0 + j) * (Np / 32);
-                    dot_chunk(ch.down, int(h), N, xs, ch.units, partial + ch.unit0);
-                }
-                for (int t = 0; t < c.rows; ++t) {
-                    const RouteBinding* b = c.binding + size_t(t) * c.routes.k;
-                    float sum = 0.f;
-                    for (int r = 0; r < c.routes.count[t]; ++r) sum += partial[b[r].unit] * b[r].down_alpha;
-                    float& out = c.out[size_t(t) * size_t(H) + size_t(h)];
-                    out = c.accumulate ? out + sum : sum;
-                }
-            }
+            if constexpr (I == Isa::Avx2) down_avx2(c, partial, h0, h1);
+            else down_rows(c, partial, h0, h1);
         }
     }
 };

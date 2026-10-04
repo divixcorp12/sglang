@@ -30,14 +30,16 @@ template <Isa I> constexpr bool kAvx512 = I == Isa::Bw || I == Isa::Vnni || I ==
 inline Isa detect_isa(Isa top, const char* cap_env)
 {
     __builtin_cpu_init();
+    // Each tier needs every feature its SGLANG_TARGET_* attribute compiles for (fma and f16c included).
+    const bool fma_f16c = __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
     Isa hw;
     if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl")
-        && __builtin_cpu_supports("fma")) {
+        && fma_f16c) {
         if (__builtin_cpu_supports("avx512vnni"))
             hw = __builtin_cpu_supports("avx512vbmi") ? Isa::Vbmi : Isa::Vnni;
         else
             hw = Isa::Bw;
-    } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
+    } else if (__builtin_cpu_supports("avx2") && fma_f16c)
         hw = Isa::Avx2;
     else
         hw = Isa::Scalar;
