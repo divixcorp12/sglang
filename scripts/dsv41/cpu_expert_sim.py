@@ -625,6 +625,40 @@ def staging_results(loaded: dict, args, split: list[int]) -> dict[str, dict]:
     return out
 
 
+CPU_INSERT_POLICIES = ("insert_all", STAGING_MERGED, "cpu_insert_p1", "cpu_insert_p2", "cpu_insert_all")
+
+
+def cpu_insert_results(loaded: dict, args) -> list[dict]:
+    """Per CPU speed-up s in ``--cpu-scale``: the split and flat c_cpu at 1/s, each insert policy's own replay, and
+    ms/token with its background rows costed by split_costs. ``insert_all`` inserts CPU lanes uncosted (upper bound)."""
+    rows = []
+    for scale in args.cpu_scale:
+        split = split_table(MAX_ROUTES, args.split_c_cpu / scale, args.c_link, args.handoff).tolist()
+        model = CostModel(
+            [args.measured_c_cpu / scale] * len(CALIBRATED_KS), c_link=args.c_link, handoff=args.handoff,
+            nvme_ms=args.nvme_ms[0], gpu_ms=args.gpu_ms,
+        )
+        for policy in CPU_INSERT_POLICIES:
+            nm = replay_nm(
+                loaded, args.ram_rows, args.num_experts, not args.no_initial_from_log, policy, split,
+                numa_mb=args.numa_mb, cpu_node=args.cpu_node,
+            )
+            res, tokens = nm["residency"], nm["validation"]["decode_tokens"]
+            cost = split_costs(nm["n"], nm["m"], model, split, nm["b"])
+            rows.append({
+                "cpu_scale": scale,
+                "policy": policy,
+                "split": split,
+                "hot_hit_rate": res["hot_hit_rate"],
+                "cpu_lanes_per_token": res["cpu_lanes_per_token"],
+                "cpu_insert_issued_per_token": res["cpu_insert_issued_per_token"],
+                "cpu_insert_rows_per_token": res["cpu_insert_rows_per_token"],
+                "nvme_reads_per_token": float(nm["m"].sum()) / max(tokens, 1),
+                **{f"ms_per_token_{name}": value for name, value in cost.items()},
+            })
+    return rows
+
+
 def load_c_cpu_table(spec: Optional[str]) -> dict[str, list[float]]:
     if not spec:
         return P0_C_CPU_MS
@@ -718,6 +752,23 @@ def summary(report: dict) -> str:
                 f"{r['cpu_hits_per_token']:8.2f} {r['cpu_misses_per_token']:8.2f} "
                 f"{r['ms_per_token_pessimistic']:7.2f} {r['ms_per_token_optimistic']:7.2f}"
             )
+    if report.get("cpu_insert"):
+        params = report["params"]
+        lines.append(
+            f"\nCPU speed-up sweep (flat c_cpu {params['measured_c_cpu']}/s, split from {params['split_c_cpu']}/s, "
+            f"nvme {params['nvme_ms'][0]} ms/miss; ms/token uncosted | worst | amortised | optimistic, tok/s at optimistic)"
+        )
+        lines.append(
+            f"{'s':>4s} {'policy':24s} {'hot hit':>7s} {'cpu/tok':>7s} {'ins/tok':>7s} {'NVMe/tok':>8s} "
+            f"{'unc':>7s} {'worst':>7s} {'amort':>7s} {'opt':>7s} {'tok/s':>6s}"
+        )
+        for r in report["cpu_insert"]:
+            lines.append(
+                f"{r['cpu_scale']:4g} {r['policy']:24s} {r['hot_hit_rate']:7.3f} {r['cpu_lanes_per_token']:7.2f} "
+                f"{r['cpu_insert_issued_per_token']:7.2f} {r['nvme_reads_per_token']:8.2f} "
+                f"{r['ms_per_token_uncosted']:7.2f} {r['ms_per_token_worst']:7.2f} {r['ms_per_token_amortised']:7.2f} "
+                f"{r['ms_per_token_optimistic']:7.2f} {1000.0 / r['ms_per_token_optimistic']:6.2f}"
+            )
     lines.append(
         f"\ngate (>= {g['threshold_pct']}% for k*, threads {g['headline']['threads']}, nvme {g['headline']['nvme_ms']}): "
         f"k* {g['k_star_gain_pct']:.1f}% -> {'PASS' if g['passes'] else 'FAIL'} (best {g['best_policy']} {g['best_gain_pct']:.1f}%)"
@@ -755,6 +806,10 @@ def main() -> None:
         "--staging-reserve", type=lambda v: [int(x) for x in v.split(",")], default=[0, 6, 8],
         help="comma-separated K staging rows per layer for --slot-map",
     )
+    p.add_argument(
+        "--cpu-scale", type=lambda v: [float(x) for x in v.split(",")], default=None,
+        help="comma-separated CPU speed-ups to sweep the insert policies at (cpu_insert_results), e.g. 1,2,4,8",
+    )
     p.add_argument("--row-bytes", type=float, default=13.3e6, help="bytes per expert row (100 GiB / 8063 rows)")
     p.add_argument("--numa-mb", default=DEFAULT_NUMA_MB, help="pinned tier placement node:MiB,... (cpu_numa_local)")
     p.add_argument("--cpu-node", type=int, default=DEFAULT_CPU_NODE, help="the CPU expert cores' node (cpu_numa_local)")
@@ -790,6 +845,7 @@ def main() -> None:
             **{k: getattr(args, k) for k in ("ram_rows", "c_link", "handoff", "gpu_ms", "threads", "nvme_ms", "gate")},
             "split": split,
             "measured_c_cpu": args.measured_c_cpu,
+            "split_c_cpu": args.split_c_cpu,
             "row_bytes": args.row_bytes,
             "numa_mb": args.numa_mb,
             "cpu_node": args.cpu_node,
@@ -825,6 +881,8 @@ def main() -> None:
         report["staging"] = staging_results(loaded, args, split)
     if args.slot_map:
         report["slot_map"] = slot_map_results(loaded, args, split)
+    if args.cpu_scale:
+        report["cpu_insert"] = cpu_insert_results(loaded, args)
     if args.out:
         with open(args.out, "w") as f:
             json.dump(report, f, indent=1)
