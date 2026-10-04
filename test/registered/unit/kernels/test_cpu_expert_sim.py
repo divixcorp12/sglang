@@ -568,3 +568,15 @@ def test_cpu_insert_sweep_scales_the_split_and_costs_the_inserts():
     assert p1["hot_hit_rate"] > by[1.0, "cpu_by_score_desc_tail"]["hot_hit_rate"]
     # A faster CPU makes the same CPU-lane work cheaper.
     assert by[4.0, "cpu_by_score_desc_tail"]["ms_per_token_uncosted"] < by[1.0, "cpu_by_score_desc_tail"]["ms_per_token_uncosted"]
+
+
+def test_promotion_never_takes_a_filling_slot():
+    sim = tier_sim.DirectInsertReplay({0: [0, 1, 2]}, {0: 3}, 8, miss_rows=3)
+    sim.graph_forward({0: [5, 6]}, cpu_lanes=lambda layer, misses: {misses[0]}, cpu_insert=_insert_every_cpu_lane)
+    sim.scores[0, 7] = 10.0
+    assert sim.promote({0: [7]}, 1) == {0: 1}
+    assert sim.slots[0][2] == tier_sim.FILLING
+    sim.graph_forward({0: [0]})
+    # Every mapped expert's slot holds it: no expert is left pointing at a slot the landing fill took.
+    assert all(sim.slots[0][int(sim.where[0, e])] == e for e in range(8) if sim.where[0, e] >= 0)
+    assert {5, 7} <= sim.resident(0)
