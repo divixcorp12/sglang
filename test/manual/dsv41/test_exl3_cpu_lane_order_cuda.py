@@ -259,6 +259,8 @@ def test_the_cpu_tail_at_16_lanes_goes_through_the_real_chain_and_the_split_plan
 
             x = torch.randn(1, HIDDEN, device="cuda").half()
             weights = torch.tensor([[(r + 1) / 64 for r in routed]], device="cuda")
+            # The eager gather above filled destination rows 0..11: a CPU lane's victim must still hold those bytes.
+            before = c.snapshot(row)
             backend._stage_planned(plan)
             dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True, cpu_input=(x, weights))
             copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
@@ -281,7 +283,10 @@ def test_the_cpu_tail_at_16_lanes_goes_through_the_real_chain_and_the_split_plan
                     got = snapshot[n][slots - 1 - lane].cpu().contiguous().view(torch.uint8)
                     assert torch.equal(got, want[n][lane].contiguous().view(torch.uint8)), (n, lane)
                 for lane in range(8, count):
-                    assert not snapshot[n][slots - 1 - lane].view(torch.uint8).any(), f"{n}: a CPU lane's victim was copied into"
+                    slot = slots - 1 - lane
+                    assert torch.equal(snapshot[n][slot].view(torch.uint8), before[n][slot].view(torch.uint8)), (
+                        f"{n}: a CPU lane's victim was copied into"
+                    )
 
             insertions, evictions, truncated = (torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(3))
             direct_commit_gather(
