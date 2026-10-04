@@ -112,6 +112,10 @@ CHILD = textwrap.dedent(
 
 def run_child(shim: Path, *, variant: str = "default", requests: int = 200, warmup: int = 50, tmp,
               copy_spin_us: int = 200) -> dict:
+    from sglang.test.dsv41_ram_miss_fixtures import warm_host_modules
+
+    # Warmed here, without the shim: a cold compile in the child would count against its timeout.
+    warm_host_modules(None if variant == "default" else variant)
     env = dict(os.environ, LD_PRELOAD=str(shim))
     proc = subprocess.run([sys.executable, "-c", CHILD, variant, str(requests), str(warmup), str(tmp),
                            str(copy_spin_us)],

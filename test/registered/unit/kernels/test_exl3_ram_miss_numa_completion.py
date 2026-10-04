@@ -20,7 +20,7 @@ from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertForward
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, warm_host_modules
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -235,6 +235,7 @@ assert host.pump() == 1 and sim.wait_served(req)
 
 
 def _run(tmp_path, body):
+    warm_host_modules("instr", nodes=2)  # the child's build: a cold compile must not count against its timeout
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(_SCRIPT) + textwrap.dedent(body), str(tmp_path)],
         capture_output=True, text=True, timeout=120,

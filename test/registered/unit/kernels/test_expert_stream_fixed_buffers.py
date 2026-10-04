@@ -14,7 +14,7 @@ import torch
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_sqes, read_rows_with_fault
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes, warm_host_modules
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -208,6 +208,7 @@ def test_registration_refusal_is_a_clear_error_not_a_fallback(tmp_path, uring_en
     uring_env(QUEUE_DEPTH=0)
     if os.geteuid() == 0:
         pytest.skip("root has CAP_IPC_LOCK: the memlock limit does not bind")
+    warm_host_modules("instr")  # the child's build: a cold compile must not count against its timeout
     child = subprocess.run(
         [sys.executable, "-c", _MEMLOCK_CHILD, str(tmp_path / "child")],
         env=dict(os.environ, **{PREFIX + "READ_MODE": "readv_fixed"}), capture_output=True, text=True, timeout=120)
@@ -240,6 +241,7 @@ def test_a_failed_ring_reset_raises_its_reason_instead_of_aborting(tmp_path, uri
     # on the way out of the call, and the child must go on to exit cleanly.
     if read_mode != "normal":
         uring_env(READ_MODE=read_mode, FIXED_FILES=1)
+    warm_host_modules("instr")
     child = subprocess.run(
         [sys.executable, "-c", _RESET_CHILD, str(tmp_path / "child"), str(CAP if read_mode != "normal" else 0)],
         capture_output=True, text=True, timeout=120)

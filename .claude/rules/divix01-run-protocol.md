@@ -92,6 +92,25 @@ tests added under `test/registered/`.
 until the target was recovered by arithmetic: 724 + 409 is the 1133 that
 `test/registered/unit/kernels` collects, with the GPU tests skipping that day.
 
+## Cold JIT builds and child-process timeouts
+
+Any C++, compiler or flag change gives every JIT module a new build key, so the first run afterwards rebuilds all of
+them: 50-100 s per expert-stream host variant, serialized by the build lock in `kernels/jit/utils/compile/loader.py`,
+so under `pytest -n 8` the queue makes it longer still.
+
+A test whose child process would build a module must warm it in the parent first, where nothing times the wait.
+`run_host_script` (`python/sglang/test/dsv41_ram_miss_fixtures.py`) is the worked example: it calls
+`warm_host_modules` with the variant and lane count its child script constructs, then spawns. The child has no
+conftest, so it also loads the default build through `host_layout()`; the helper warms that one too. Children that
+test a build itself (a build failure, a fresh build dir) are left cold on purpose.
+
+A `TimeoutExpired` on a cold cache is the compiler, not a hang. Check the module's build-dir mtimes before calling it a
+regression. On 2026-10-04, after the GCC 15 / `-march` change, nine `run_host_script` callers failed at 60 s under
+`-n 8` and all passed serially once the module was cached.
+
+A suite runner warms the modules before `-n 8`; to prove a fix on a cold cache without touching anyone's cache, set
+`SGLANG_JIT_HOST_MARCH=x86-64-v3` for that run, which gives every module a new key.
+
 ## What this costs
 
 Running unverified code needs a commit first. That is the intended trade: the

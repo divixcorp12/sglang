@@ -242,7 +242,33 @@ def attached_host(setup: "RamMissSetup", page: torch.Tensor, *, k: int = 1, slot
     return host
 
 
-_HOST_SCRIPT_HEAD = """
+# The host build and lane count ``run_host_script``'s child constructs; the parent warms exactly these.
+HOST_SCRIPT_VARIANT = "instr"
+HOST_SCRIPT_LANES = 8
+
+
+def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: int = 1) -> None:
+    """Load, in this process, the JIT host modules a child interpreter will load, so the child finds them built.
+
+    A cold module costs 50-100 s to compile, serialized across ``pytest -n`` workers by the JIT build lock; a child
+    under a ``timeout`` would spend it on the compiler (nine ``run_host_script`` callers timed out at 60 s on
+    2026-10-04). The parent has no timeout, so it waits on the lock. Load only: no host is built.
+
+    ``variant``/``lanes``/``nodes`` name the module the child constructs its ``ExpertStreamHost`` with (None: the
+    child's default build). The child has no conftest, so its ``host_layout()`` also loads the default build at one
+    node, whatever the parent's autouse fixture says: that one is warmed too."""
+    from sglang.kernels.ops.moe import expert_stream_transport as ops
+
+    conftest_default, ops._DEFAULT_VARIANT = ops._DEFAULT_VARIANT, None
+    try:
+        child_default = ops.host_variant()
+    finally:
+        ops._DEFAULT_VARIANT = conftest_default
+    ops._host_module("exl3", child_default, 8, 1)
+    ops._host_module("exl3", variant or child_default, lanes, nodes)
+
+
+_HOST_SCRIPT_HEAD = f"""
 import pathlib, sys, time
 import torch
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
@@ -250,8 +276,8 @@ from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=int(sys.argv[2]))
-page, hot_page = new_page(pin=False, wire=wire_layout(8)), new_hot_page(6, pin=False)
-host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr"%s)
+page, hot_page = new_page(pin=False, wire=wire_layout({HOST_SCRIPT_LANES})), new_hot_page(6, pin=False)
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="{HOST_SCRIPT_VARIANT}"%s)
 host.reserve_staging(int(sys.argv[3]))
 sim = ChainSim(host, page, s.slabs)
 """
@@ -265,6 +291,7 @@ def run_host_script(
     constructor (", hot_page=hot_page" hands it the ``hot_page`` in scope).
 
     Every service failure is fail-stop (``std::abort``), so a test of one must watch a child process die."""
+    warm_host_modules(HOST_SCRIPT_VARIANT, lanes=HOST_SCRIPT_LANES)
     return subprocess.run(
         [
             sys.executable, "-c", _HOST_SCRIPT_HEAD % host_args + textwrap.dedent(body), str(tmp_path), str(capacity),
