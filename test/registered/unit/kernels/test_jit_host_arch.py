@@ -30,7 +30,7 @@ _FAKE_COMPILER = textwrap.dedent(
         ;;
       *"-E -dM"*)
         case "$*" in
-          *-march=native*) echo "#define __AVX512F__ 1" ;;
+          *-march=native*) echo "{native_macros}" ;;
           *) echo "{named_macros}" ;;
         esac
         ;;
@@ -39,10 +39,20 @@ _FAKE_COMPILER = textwrap.dedent(
 )
 
 
-def _fake_compiler(tmp_path, *, help_branch, named_macros="#define __AVX512F__ 1"):
+def _fake_compiler(
+    tmp_path,
+    *,
+    help_branch,
+    named_macros="#define __AVX512F__ 1",
+    native_macros="#define __AVX512F__ 1",
+):
     path = tmp_path / "fake-cxx"
     path.write_text(
-        _FAKE_COMPILER.format(help_branch=help_branch, named_macros=named_macros)
+        _FAKE_COMPILER.format(
+            help_branch=help_branch,
+            named_macros=named_macros,
+            native_macros=native_macros,
+        )
     )
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return str(path)
@@ -79,6 +89,18 @@ def test_a_name_with_different_macros_is_refused_with_a_warning(
     with caplog.at_level(logging.WARNING, logger=toolchain.logger.name):
         assert _resolve(monkeypatch, compiler) == []
     assert [r.levelno for r in caplog.records].count(logging.WARNING) == 1
+
+
+def test_a_name_that_is_a_subset_of_native_is_kept(tmp_path, monkeypatch):
+    # divix01: native adds __ABM__ and __RTM__ over skylake-avx512, and the name adds __SGX__
+    # (enclave instructions no codegen emits), so exact equality refuses a name that is safe.
+    compiler = _fake_compiler(
+        tmp_path,
+        help_branch=_ANSWERS_SKYLAKE,
+        native_macros="#define __AVX512F__ 1\n#define __ABM__ 1\n#define __RTM__ 1",
+        named_macros="#define __AVX512F__ 1\n#define __SGX__ 1",
+    )
+    assert _resolve(monkeypatch, compiler) == ["-march=skylake-avx512"]
 
 
 def test_a_compiler_that_cannot_answer_gives_the_default_arch(
