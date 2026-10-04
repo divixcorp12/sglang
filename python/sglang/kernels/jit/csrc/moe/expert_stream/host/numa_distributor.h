@@ -2,6 +2,8 @@
 // (spec 2026-10-03-numa-node-distributor-design, Part 3). At one node: one group, and every report completes.
 #pragma once
 
+#include <algorithm>
+
 #include "numa_group.h"
 
 namespace sglang::expert_stream {
@@ -73,7 +75,10 @@ class NumaNodeDistributor {
   // acquire sees every earlier report of this row, this record's and the reports that left the other nodes' lists.
   bool report(const Request& request, int g, const DeltaReport& part, uint32_t expected) {
     RowCombine& row = rows_[request.row];
-    row.parts[g] = part;
+    DeltaReport& own = row.parts[g];
+    own.count = part.count;
+    own.staging = part.staging;
+    std::copy_n(&part.entries[0][0], 2 * part.count, &own.entries[0][0]);
     row.staging[g] = part.staging;
     const uint64_t chain = (request.chain & 0xFFFFFFFFull) << 32;
     uint64_t seen = row.reported.load(std::memory_order_relaxed);
