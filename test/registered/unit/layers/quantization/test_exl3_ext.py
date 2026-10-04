@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from sglang.srt.layers.quantization import exl3_ext
+from sglang.srt.layers.quantization.exl3 import ext as exl3_ext
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

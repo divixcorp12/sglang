@@ -17,10 +17,10 @@ from sglang.srt.layers.moe.exl3_expert_format import (
 )
 from sglang.srt.layers.moe.exl3_stream_trace import Exl3StreamTrace
 from sglang.srt.layers.moe.expert_row_source import RowReadStats
-from sglang.srt.layers.quantization import exl3 as exl3_mod
-from sglang.srt.layers.quantization import exl3_ops
+from sglang.srt.layers.quantization.exl3 import exl3 as exl3_mod
+from sglang.srt.layers.quantization.exl3 import ops as exl3_ops
 from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod, Exl3RowViews
-from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors
+from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_fake_exl3 import HIDDEN, INTER, write_fake_exl3
 

@@ -1266,14 +1266,14 @@ class Envs:
     # cache); expanded with os.path.expanduser at use.
     SGLANG_EXL3_BUILD_DIR = EnvStr("~/.cache/sglang/exl3_ext")
     # Build-time options of the EXL3 CPU MoE kernel's int8 activation quantization
-    # (quantization/exl3_cpu/moe_mul1.cpp): a second int8 pass over each row's
+    # (kernels/jit/csrc/exl3/moe_mul1.cpp): a second int8 pass over each row's
     # remainder, and one scale per SGLANG_EXL3_CPU_ACT_BLOCK inputs (a multiple of
     # 16; 0 keeps one scale per row). Either one builds the vendored kernel into a
     # separately cached extension; with both off the build is upstream's.
     SGLANG_EXL3_CPU_ACT_RESIDUAL = EnvBool(False)
     SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)
     # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
-    # (exl3_ext.check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
+    # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
     SGLANG_EXL3_CPU_CXX = EnvStr("")
 
     # ===================================================================

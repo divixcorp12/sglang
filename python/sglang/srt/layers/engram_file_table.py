@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.moe.exl3_expert_layout import read_safetensors_header
-from sglang.srt.layers.quantization.exl3_ops import assert_not_capturing
+from sglang.srt.layers.quantization.exl3.ops import assert_not_capturing
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:

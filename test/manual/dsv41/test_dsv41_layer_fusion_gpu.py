@@ -1,7 +1,7 @@
 """SGLANG_DSV41_ENABLE_LAYER_FUSION's three kernels against the torch chains they replace, bit for bit.
 
 The references are the production methods themselves (``GpuResidencyUpdater.gather_destinations`` and
-``commit_gather``, ``exl3_fused_moe.route_tables``), run on a clone of the same state. Every op in those chains is
+``commit_gather``, ``exl3.fused_moe.route_tables``), run on a clone of the same state. Every op in those chains is
 integer bookkeeping or an exact conversion, so the comparison is exact equality of every output and every piece of
 residency state, dump columns included. Shapes cover the production one (six routes, six lanes) and odd ones.
 """
@@ -337,7 +337,7 @@ def test_route_tables_match_the_torch_chain(
     routes, slots, hidden, remap_dtype, weight_dtype, x_dtype
 ):
     from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
-    from sglang.srt.layers.quantization.exl3_fused_moe import route_tables
+    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
 
     gen = torch.Generator().manual_seed(routes * 31 + slots + hidden)
     dev = "cuda"

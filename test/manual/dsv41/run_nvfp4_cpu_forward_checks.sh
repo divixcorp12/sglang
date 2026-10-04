@@ -13,7 +13,7 @@ wt=$(realpath "$1"); out=$2; base=${3:-}
 cxx=${CXX:-/opt/rh/gcc-toolset-15/root/usr/bin/g++}
 py=/data/models/slang/.venv/bin/python
 cores=${NVFP4_AB_CORES:-0,1,2,3,4,5,6,7}
-build=$wt/python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py
+build=$wt/python/sglang/srt/layers/quantization/nvfp4/build.py
 harness=${NVFP4_AB_HARNESS:-$wt/test/manual/dsv41/nvfp4_cpu_forward_ab.cpp}
 variants=(avx2 scalar)
 IFS=, read -ra base_names <<< "${NVFP4_AB_BASE_NAMES:-avx2,scalar}"

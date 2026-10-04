@@ -128,7 +128,7 @@ def _load_slots(device):
 
 
 def _views(slot_tensors, slot):
-    from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors
+    from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors
 
     def t(prefix, part):
         return Exl3Tensors(
@@ -142,7 +142,7 @@ def _views(slot_tensors, slot):
 
 
 def _reference(x16, weights, remap, views):
-    from sglang.srt.layers.quantization.exl3_ops import exl3_linear_reference
+    from sglang.srt.layers.quantization.exl3.ops import exl3_linear_reference
 
     out = torch.zeros((1, x16.shape[1]), dtype=torch.float32, device=x16.device)
     for k, slot in enumerate(remap.tolist()):
@@ -159,8 +159,8 @@ def _rel(y, ref):
 
 
 def test_exl3_moe_probe():
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
-    from sglang.srt.layers.quantization.exl3_ops import exl3_moe_loop
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.ops import exl3_moe_loop
 
     ext = exl3_ext()
     missing = [n for n in ("exl3_moe", "exl3_moe_gather", "exl3_moe_max_concurrency") if not hasattr(ext, n)]

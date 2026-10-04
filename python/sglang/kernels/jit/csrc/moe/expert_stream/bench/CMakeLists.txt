@@ -49,7 +49,7 @@ if(NOT benchmark_FOUND)
   FetchContent_MakeAvailable(google_benchmark)
 endif()
 
-get_filename_component(QUANT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../srt/layers/quantization/exl3_cpu" ABSOLUTE)
+get_filename_component(QUANT "${CMAKE_CURRENT_SOURCE_DIR}/../../../exl3" ABSOLUTE)
 if(NOT EXISTS "${QUANT}/optimized/kernel.cpp")
   message(FATAL_ERROR "Cannot locate the CPU kernels: ${QUANT}")
 endif()

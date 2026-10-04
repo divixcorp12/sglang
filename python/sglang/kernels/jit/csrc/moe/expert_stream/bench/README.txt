@@ -22,7 +22,7 @@ Google Benchmark drives two separate C++ executables:
 Override --workers=N to compare both with the same count. The baseline uses its
 original native pool; the optimized kernel uses OpenMP. Separate processes keep
 one backend's idle workers from contaminating the other's measurements. The
-baseline source is the repo's exl3_cpu/moe_mul1.cpp, not a frozen snapshot.
+baseline source is the repo's csrc/exl3/moe_mul1.cpp, not a frozen snapshot.
 
 There is no Python at configure, build or runtime. The binaries link ATen/c10
 from LibTorch or the server's installed torch directory, not Python bindings or

@@ -74,9 +74,9 @@ def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch, hidden, inter
     cores = sorted(os.sched_getaffinity(0))
     if len(cores) < 2:
         pytest.skip("needs at least 2 cores in the affinity mask")
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
     from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertPool
-    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
+    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
 
     if not optimized_cpu(cpu_act_defines()):
         pytest.skip("the slab ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
@@ -128,7 +128,7 @@ C_NAMES = tuple(
 
 
 def _optimized_ext():
-    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
+    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
 
     if not optimized_cpu(cpu_act_defines()):
         pytest.skip("the C ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
@@ -157,7 +157,7 @@ def _c_forward(trait, handle, x, slots, weights, out, accumulate=0):
 
 
 def test_the_exl3_library_exports_the_five_c_names(monkeypatch):
-    """Every CPU expert quant exports the same five C functions (cpu_experts_common/cabi.hpp)."""
+    """Every CPU expert quant exports the same five C functions (expert_stream/host/cpu_experts/cabi.hpp)."""
     import ctypes
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
@@ -171,7 +171,7 @@ def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
     overwrites whatever out held; accumulate=1 adds, so a record's CPU misses sent in two jobs sum to the two experts'
     outputs. Not bitwise: -Ofast may fuse the add."""
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     trait = Exl3CpuQuantTrait(_optimized_ext(), act_limit=LIMIT)
     layer = trait.register_layer(_random_slabs(20261001), CAP)
@@ -200,7 +200,7 @@ def test_the_c_abi_refuses_a_slot_past_capacity(monkeypatch):
     """A routed slot at the layer's capacity is outside its slabs: the forward refuses the call (2) before writing,
     so out keeps what it held, for accumulate=0 as for 1."""
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     trait = Exl3CpuQuantTrait(_optimized_ext(), act_limit=LIMIT)
     layer = trait.register_layer(_random_slabs(20261003), CAP)
@@ -221,7 +221,7 @@ import ctypes, os, sys
 import torch
 sys.path.insert(0, os.path.dirname(sys.argv[1]))
 import test_cpu_expert_pool_exl3 as t
-from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 ext = t._optimized_ext()
 set_cores = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_set_cores
 set_cores.argtypes, set_cores.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
@@ -261,7 +261,7 @@ import ctypes, os, sys
 import torch
 sys.path.insert(0, os.path.dirname(sys.argv[1]))
 import test_cpu_expert_pool_exl3 as t
-from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 ext = t._optimized_ext()
 set_cores = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_set_cores
 set_cores.argtypes, set_cores.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
@@ -302,8 +302,8 @@ def test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline(monkeypat
     import time
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
 
     if not optimized_cpu(cpu_act_defines()):
         pytest.skip("the keep-warm ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")

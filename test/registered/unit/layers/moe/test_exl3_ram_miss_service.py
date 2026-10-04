@@ -579,7 +579,7 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
     """Every aten op _apply_graph issues around a gather that itself issues none (its post is not under test)."""
     from torch.utils._python_dispatch import TorchDispatchMode
 
-    from sglang.srt.layers.quantization import exl3_fused_moe
+    from sglang.srt.layers.quantization.exl3 import fused_moe as exl3_fused_moe
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
     class Ops(TorchDispatchMode):

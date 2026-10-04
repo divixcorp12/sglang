@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3LinearMethod
-from sglang.srt.layers.quantization.exl3_ops import exl3_linear_reference, random_exl3_tensors
+from sglang.srt.layers.quantization.exl3.ops import exl3_linear_reference, random_exl3_tensors
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and os.environ.get("SGLANG_EXL3_SRC")),
