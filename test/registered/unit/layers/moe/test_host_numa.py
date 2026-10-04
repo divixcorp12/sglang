@@ -18,9 +18,11 @@ from sglang.srt.layers.moe.host_numa import (
     address_policy,
     allocate_bound,
     check_capacity,
+    group_ranges,
     page_nodes,
     parse_placement,
     plan_bindings,
+    slot_nodes,
     split_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -433,3 +435,65 @@ class TestManagerPlacement(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _bound(rows, row_bytes, seam, nodes=(0, 1)):
+    """A uint8 [rows, row_bytes] slab as allocate_bound leaves it, its bytes bound to nodes[0] below ``seam`` and
+    nodes[1] from it; no real mbind."""
+    with patch.object(host_numa, "_mbind"):
+        owner = allocate_bound(rows * row_bytes, [(nodes[0], 0, 1)], rows * row_bytes)
+    slab = owner.view(rows, row_bytes)  # a new tensor object: the attribute goes on it, as allocate_host_slab does
+    slab._numa_bindings = [(nodes[0], 0, seam), (nodes[1], seam, -(-rows * row_bytes // HUGE_BYTES) * HUGE_BYTES)]
+    return slab
+
+
+class TestSlotNodes(unittest.TestCase):
+    def test_allocate_bound_records_exactly_the_bindings_it_applied(self):
+        rows, row_bytes = 10, 3 * MIB + 100
+        calls = []
+        with patch.object(host_numa, "_mbind", side_effect=lambda a, n, node: calls.append((a, n, node))):
+            slab = allocate_bound(rows * row_bytes, [(0, 0, 6), (1, 6, 4)], row_bytes)
+        base = slab.data_ptr()
+        self.assertEqual(slab._numa_bindings, [(node, a - base, a - base + n) for a, n, node in calls])
+
+    def test_slots_take_the_node_that_holds_their_bytes(self):
+        slab = _bound(10, MIB, 4 * MIB)
+        self.assertEqual(slot_nodes({"w": slab}, 10), [0] * 4 + [1] * 6)
+
+    def test_a_slot_across_a_seam_belongs_to_no_group(self):
+        """Review Focus 5: 3 MiB rows with the node change at 8 MiB, which rounding put inside row 2. Row 2 belongs to
+        no node and so to no group; rows 0-1 are node 0's and rows 3-5 node 1's."""
+        slab = _bound(6, 3 * MIB, 8 * MIB)
+        owners = slot_nodes({"w": slab}, 6)
+        self.assertEqual(owners, [0, 0, None, 1, 1, 1])
+        self.assertEqual(group_ranges([owners], [0, 1]), [[(0, 2)], [(3, 6)]])
+
+    def test_a_small_slab_wholly_on_one_node_does_not_move_a_slot(self):
+        """A layer's sign-vector slabs fit one 2 MiB page, so all of them sit on one node: under 1% of a slot."""
+        big = _bound(6, 3 * MIB, 9 * MIB)
+        small = _bound(6, 4096, 2 * MIB, nodes=(0, 0))
+        self.assertEqual(slot_nodes({"trellis": big, "suh": small}, 6), [0, 0, 0, 1, 1, 1])
+
+    def test_an_arena_slabs_offset_into_its_owner_counts(self):
+        with patch.object(host_numa, "_mbind"):
+            arena = allocate_bound(12 * MIB, [(0, 0, 1)], 12 * MIB)
+        arena._numa_bindings = [(0, 0, 6 * MIB), (1, 6 * MIB, 12 * MIB)]
+        first, second = arena[: 6 * MIB].view(3, 2 * MIB), arena[6 * MIB :].view(3, 2 * MIB)
+        for slab in (first, second):
+            slab._expert_stream_slab_arena = arena
+        self.assertEqual(slot_nodes({"a": first}, 3), [0, 0, 0])
+        self.assertEqual(slot_nodes({"b": second}, 3), [1, 1, 1])
+        self.assertEqual(slot_nodes({"a": first, "b": second}, 3), [None, None, None])
+
+    def test_a_slab_without_a_placement_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "without a placement"):
+            slot_nodes({"w": torch.zeros(4, 16, dtype=torch.uint8)}, 4)
+
+    def test_group_ranges_refuse_a_split_or_starved_node(self):
+        with self.assertRaisesRegex(ValueError, "not one contiguous range"):
+            group_ranges([[0, 0, 1, 1, 0]], [0, 1])
+        with self.assertRaisesRegex(ValueError, "at least 2"):
+            group_ranges([[0, 1, 1, 1]], [0, 1])
+        with self.assertRaisesRegex(ValueError, "node 2"):
+            group_ranges([[0, 0, 2, 2]], [0, 1])
+        self.assertEqual(group_ranges([[0, 0, 1, 1], [0, 0, 0, 1, 1]], [0, 1]), [[(0, 2), (0, 3)], [(2, 4), (3, 5)]])
