@@ -1017,11 +1017,16 @@ class Exl3RamMissService:
                         "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
                     )
             cores = [-1 if plan.ram is None else plan.ram for plan in numa.plans]
-            host.start_thread(
-                cpu_core=cores if numa.nodes > 1 else cores[0],
-                busy_poll=all(plan.busy_poll for plan in numa.plans),
-                fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
-            )
+            busy_poll = all(plan.busy_poll for plan in numa.plans)
+            if numa.nodes == 1 and cores[0] == -1 and not busy_poll:
+                # The server's affinity, no spinning: the thread's defaults.
+                host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+            else:
+                host.start_thread(
+                    cpu_core=cores if numa.nodes > 1 else cores[0],
+                    busy_poll=busy_poll,
+                    fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
+                )
             if fault is not None:
                 demands, seconds = fault
                 host.inject(delay_s=seconds, delay_after_demands=demands)

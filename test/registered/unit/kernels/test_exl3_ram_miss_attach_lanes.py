@@ -162,7 +162,7 @@ def test_cpu_experts_refuse_the_generic_route_plan():
     cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
     with envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.override("off"), envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False):
         with pytest.raises(RuntimeError, match="needs SGLANG_MOE_EXPERT_FUSED_PLAN"):
-            module.Exl3RamMissService._start_cpu_experts(cfg, None, None, {}, False)
+            module.Exl3RamMissService._start_cpu_experts(cfg, None, None, {}, False, None)
 
 
 def test_cpu_experts_attach_gives_every_pinned_layer_its_row_of_the_miss_keys(tiers, monkeypatch):
