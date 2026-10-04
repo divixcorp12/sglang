@@ -18,6 +18,12 @@
 #define SGLANG_EXPERT_STREAM_LANES 8
 #endif
 
+// The NUMA node count of this build: every JIT build of the device kernels and the host passes
+// -DSGLANG_EXPERT_STREAM_NODES alongside the lanes.
+#ifndef SGLANG_EXPERT_STREAM_NODES
+#define SGLANG_EXPERT_STREAM_NODES 1
+#endif
+
 namespace sglang::expert_stream::wire {
 
 constexpr int64_t wire_round_up(int64_t value, int64_t align) {
@@ -31,6 +37,12 @@ struct LeaseLayout {
   // Lane arrays are i16, so a multiple of 8 lanes is whole 16-byte vector loads and stores.
   static constexpr int kLanes = static_cast<int>(wire_round_up(NumLanes, 8));
   static constexpr int kNodes = NumNodes;
+
+  // The node whose group serves `expert`: its staging list, its CPU split and its slots. The one home rule, so a
+  // popularity table can replace it here without touching a caller.
+  static constexpr int home(int64_t expert) {
+    return static_cast<int>(expert % kNodes);
+  }
 
   // ---- Request page: device-written, host-read ----
   static constexpr int64_t kDemandHead = 0;    // u32: the last posted seq, stored with a release
@@ -101,12 +113,13 @@ struct LeaseLayout {
   static_assert(kDeltaEntries + 4 * kDeltaMaxEntries <= kDeltaStride, "delta record");
 };
 
-using Wire = LeaseLayout<SGLANG_EXPERT_STREAM_LANES, 1>;
+using Wire = LeaseLayout<SGLANG_EXPERT_STREAM_LANES, SGLANG_EXPERT_STREAM_NODES>;
 
 using V2 = LeaseLayout<8, 1>;
 static_assert(V2::kRecordBytes == 128 && V2::kPageBytes == 2176 && V2::kRecLaneWeight == 96, "v2 request page");
 static_assert(V2::kLeaseCopyDone == 0x4000 && V2::kSplit == 16768 && V2::kLeaseBlockBytes == 20480, "v2 block");
 static_assert(V2::kDeltaEntries == 32 && V2::kDeltaMaxEntries == 16 && V2::kDeltaStride == 256, "v2 delta");
+static_assert(LeaseLayout<8, 2>::home(7) == 1 && V2::home(7) == 0, "home is expert % nodes");
 static_assert(Wire::kSplit % 16 == 0 && Wire::kRecProtect % 16 == 0 && Wire::kRecordBytes % 128 == 0, "alignment");
 
 }  // namespace sglang::expert_stream::wire

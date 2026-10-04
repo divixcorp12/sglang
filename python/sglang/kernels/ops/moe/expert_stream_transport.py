@@ -132,34 +132,44 @@ def _refuse_test_only(name: str, variant: Optional[str]) -> None:
 # cache_once keys f(), f("exl3") and f(layout="exl3") apart, so each cached loader
 # below is called only positionally, through a wrapper: a layout and variant then have
 # exactly one module whatever the call form.
+def _suffix(lanes: int, nodes: int) -> str:
+    """A build's module-name suffix: one node keeps the Phase 1 names, so its modules and caches are unchanged."""
+    return f"_l{lanes}" if nodes == 1 else f"_l{lanes}_n{nodes}"
+
+
 def _host_module(
-    layout: str = "exl3", variant: Optional[str] = None, lanes: int = 8
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+    lanes: int = 8,
+    nodes: int = 1,
 ) -> Module:
-    """Return the cached host module for ``layout``, ``variant`` (default build) and ``lanes``."""
+    """Return the cached host module for ``layout``, ``variant`` (default build), ``lanes`` and ``nodes``."""
     variant = host_variant() if variant is None else variant
-    lanes = expert_lease_block.wire_layout(lanes).lanes
+    wire = expert_lease_block.wire_layout(lanes, nodes)
+    lanes, nodes = wire.lanes, wire.nodes
     if variant == "instr_tsan" and _ALLOW_TSAN:
-        return _host_module_tsan(layout, lanes)
+        return _host_module_tsan(layout, lanes, nodes)
     if variant not in VARIANTS:
         raise ValueError(
             f"unknown host build variant {variant!r}; expected one of {VARIANTS}"
         )
     if variant not in LAYOUTS[layout].host_sources:
         raise ValueError(f"layout {layout!r} has no {variant!r} host build variant")
-    return _host_module_cached(layout, variant, lanes)
+    return _host_module_cached(layout, variant, lanes, nodes)
 
 
 @cache_once
-def _host_module_cached(layout: str, variant: str, lanes: int) -> Module:
+def _host_module_cached(layout: str, variant: str, lanes: int, nodes: int) -> Module:
     # Hidden visibility keeps HostExports' registries and members private to each
     # module's .so; only the TVM_FFI_DLL_EXPORT entry points are exported.
     return load_jit(
-        f"expert_stream_host_{layout}_{variant}_l{lanes}",
+        f"expert_stream_host_{layout}_{variant}{_suffix(lanes, nodes)}",
         cpp_files=[LAYOUTS[layout].host_sources[variant]],
         extra_cflags=[
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+            f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
@@ -175,9 +185,9 @@ _ALLOW_TSAN = False
 
 
 @cache_once
-def _host_module_tsan(layout: str = "exl3", lanes: int = 8) -> Module:
+def _host_module_tsan(layout: str, lanes: int, nodes: int) -> Module:
     return load_jit(
-        f"expert_stream_host_{layout}_instr_tsan_l{lanes}",
+        f"expert_stream_host_{layout}_instr_tsan{_suffix(lanes, nodes)}",
         cpp_files=[LAYOUTS[layout].host_sources["instr"]],
         extra_cflags=[
             "-fvisibility=hidden",
@@ -186,6 +196,7 @@ def _host_module_tsan(layout: str = "exl3", lanes: int = 8) -> Module:
             "-O1",
             "-g",
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+            f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
         extra_ldflags=["-luring", "-lpthread", "-ldl", "-fsanitize=thread"],
         header_only=False,
@@ -2001,6 +2012,7 @@ STATE_WORDS = {
 _LEASE_METHODS = {
     "expert_stream_post": "post",
     "expert_stream_map_bulk_apply": "map_bulk_apply",
+    "expert_stream_wire_nodes": "wire_nodes",
 }
 _ROW_COPY_METHODS = {
     "expert_stream_lease_stream": "lease_stream",
@@ -2020,23 +2032,27 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     ]
 
 
-def _device_module(layout: str = "exl3", lanes: int = 8) -> Module:
-    """Return the cached device module for ``layout`` and ``lanes``."""
-    return _device_module_cached(layout, expert_lease_block.wire_layout(lanes).lanes)
+def _device_module(layout: str = "exl3", lanes: int = 8, nodes: int = 1) -> Module:
+    """Return the cached device module for ``layout``, ``lanes`` and ``nodes``."""
+    wire = expert_lease_block.wire_layout(lanes, nodes)
+    return _device_module_cached(layout, wire.lanes, wire.nodes)
 
 
 @cache_once
-def _device_module_cached(layout: str, lanes: int) -> Module:
+def _device_module_cached(layout: str, lanes: int, nodes: int) -> Module:
     return load_jit(
-        f"expert_stream_{layout}_l{lanes}",
+        f"expert_stream_{layout}{_suffix(lanes, nodes)}",
         cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
-        extra_cuda_cflags=[f"-DSGLANG_EXPERT_STREAM_LANES={lanes}"],
+        extra_cuda_cflags=[
+            f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+            f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
+        ],
     )
 
 
 def device_module_with_hooks(
-    defines: Sequence[str], layout: str = "exl3", lanes: int = 8
+    defines: Sequence[str], layout: str = "exl3", lanes: int = 8, nodes: int = 1
 ) -> Module:
     """Test only: build the device kernels with the ``EXL3_RAM_MISS_TEST_*`` hooks on.
 
@@ -2045,15 +2061,17 @@ def device_module_with_hooks(
     """
     if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
         raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
-    lanes = expert_lease_block.wire_layout(lanes).lanes
+    wire = expert_lease_block.wire_layout(lanes, nodes)
+    lanes, nodes = wire.lanes, wire.nodes
     return load_jit(
-        f"expert_stream_{layout}_l{lanes}",
+        f"expert_stream_{layout}{_suffix(lanes, nodes)}",
         "test",
         cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
         extra_cuda_cflags=[
             *(f"-D{d}" for d in defines),
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+            f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
     )
 

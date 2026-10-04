@@ -98,6 +98,14 @@ struct HostExports {
     return found->second;
   }
 
+  // The wire this module was compiled for (-DSGLANG_EXPERT_STREAM_LANES / _NODES), for the Python side's checks.
+  static int64_t wire_lanes() {
+    return Wire::kLanes;
+  }
+  static int64_t wire_nodes() {
+    return Wire::kNodes;
+  }
+
   /// \brief The build policy this module was compiled with: "prod" or "instr" (build_policy.h).
   static std::string build_name() {
     return std::string(Build::kName);
@@ -664,6 +672,8 @@ struct HostExports {
 // One line per export; this list and ffi_test_exports.h's are the module's whole Python-visible surface.
 #define EXPERT_STREAM_HOST_EXPORTS(Exports)                                                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_build_name, Exports::build_name);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_wire_lanes, Exports::wire_lanes);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_wire_nodes, Exports::wire_nodes);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_names, Exports::layout_names);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_small_mask, Exports::layout_small_mask);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_runs, Exports::piece_runs);                   \

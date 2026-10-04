@@ -24,6 +24,7 @@ std::string members() {
   P(kCopyArmed); P(kSplit); P(kSplitStride); P(kLeaseBlockBytes); P(kDeltaBase); P(kDeltaTag); P(kDeltaCount);
   P(kDeltaStaging); P(kDeltaEntries); P(kDeltaMaxEntries); P(kDeltaStride);
 #undef P
+  put("home7", L::home(7));
   out.pop_back();
   return out;
 }

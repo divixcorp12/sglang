@@ -119,6 +119,10 @@ class WireLayout:
     def delta_stride(self) -> int:
         return _round_up(self.delta_fields["entries"] + 4 * self.delta_max_entries, 256)
 
+    def home(self, expert: int) -> int:
+        """The node whose group serves ``expert``: LeaseLayout::home, the one home rule."""
+        return expert % self.nodes
+
     def cpp_constants(self) -> dict[str, int]:
         """The trait's members by their C++ names, as lease_layout_probe prints them."""
         from sglang.srt.layers.moe.ram_slot_map import LaneKind
@@ -144,7 +148,7 @@ class WireLayout:
             "kSplit": self.split, "kSplitStride": self.split_stride, "kLeaseBlockBytes": self.lease_block_bytes,
             "kDeltaBase": self.lease_block_bytes, "kDeltaTag": d["tag"], "kDeltaCount": d["count"],
             "kDeltaStaging": d["staging"], "kDeltaEntries": d["entries"],
-            "kDeltaMaxEntries": self.delta_max_entries, "kDeltaStride": self.delta_stride,
+            "kDeltaMaxEntries": self.delta_max_entries, "kDeltaStride": self.delta_stride, "home7": self.home(7),
         }
 
 

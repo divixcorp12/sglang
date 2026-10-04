@@ -293,6 +293,11 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 /// `RuntimeCheck` before the params struct is built and the kernel launched. Both launch on the stream of the
 /// tensors' device.
 struct LeaseProtocolKernel {
+  /// The node count this module was compiled for (-DSGLANG_EXPERT_STREAM_NODES).
+  static int64_t wire_nodes() {
+    return expert_stream::wire::Wire::kNodes;
+  }
+
   /// Launches the post kernel with `use_pdl` selecting the PDL instantiation. Argument meanings follow PostParams;
   /// `lease_address` and `cpu_x_dst` are raw addresses of the pinned completion block and the staged input row, and
   /// `hot_address` of the optional hot page (0: none).
