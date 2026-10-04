@@ -1841,10 +1841,12 @@ class Envs:
     # when it first sees the wait armed (LEASE_PROTOCOL.md, "Copy engine"): post to fail-stop can
     # then take about 2x this (+20 ms).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
-    # The core the RAM-miss service thread busy-polls the request page on, with no PAUSE and no sleep; unset, it
-    # inherits the server's affinity and spins with PAUSE, then sleeps. Set, the service refuses to start unless the
-    # core's whole physical core is its own: no SMT sibling in the server's affinity or SGLANG_DSV41_CPU_EXPERTS_CORES.
-    # That check runs once, when the service starts; a thread pinned onto that physical core later is not caught.
+    # The RAM thread's core on the node it belongs to, busy-polling the request page with no PAUSE and no sleep
+    # (ThreadingConfig.resolve). Refused unless it is outside cores 64-71 and the server's affinity, on a node of the
+    # pinned tier, and its whole physical core is the thread's own (no SMT sibling in the affinity or another role's
+    # core); also refused with SGLANG_EXPERT_NUMA_CORES naming that node's ram=. Unset: with several nodes or CPU
+    # experts each node's thread takes the node's highest free physical core; with one node and no CPU experts it
+    # inherits the server's affinity and spins with PAUSE, then sleeps. Checked once, at start.
     SGLANG_DSV41_RAM_MISS_SPIN_CORE = EnvInt(None)
     # io_uring options the C++ reader also reads itself (host/uring_options.h); declared here because
     # ThreadingConfig resolves the SQPOLL thread's core from them. The service passes every ring its core explicitly.
@@ -1913,7 +1915,8 @@ class Envs:
     # CPU experts (plan 2026-09-29-dsv41-cpu-experts): decode computes a layer's RAM-tier experts on the CPU, in place
     # over the pinned tier, instead of copying them over the link. Batch-1 decode only. Off by default.
     SGLANG_DSV41_CPU_EXPERTS = EnvBool(False)
-    # Cores of the CPU expert pool, as a taskset list ("36-47,50"). At least two; empty refuses the pool.
+    # Optional override of the CPU expert pool's cores, as a taskset list ("36-47,50") on one node, at least two.
+    # Unset or empty derives each node's pool from its free physical cores (ThreadingConfig.resolve).
     SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
     SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
