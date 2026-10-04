@@ -16,15 +16,14 @@ use the same default but have no measured performance claim. Invalid/duplicate
 routes and multi-token chunks retain the generic path. Existing scalar, AVX2
 and other ISA/bit-width fallbacks are retained.
 
-Both selections include the register decoder, hoisted coefficients, register
-Hadamard, parallel 128-element preparation/middle stages, fused down output
-transform, cache-line output ownership, compact activation scratch, decoder
-unrolling and T0 prefetching. Experiment selectors, alternate persistent weight
-layouts and benchmark instrumentation have been removed. Scratch is reused
-per calling thread. Workers are individually pinned; a stable assignment avoids
-repeating affinity syscalls on every forward. The caller is worker zero. Each call names an engine (engine_create: an
-immutable core list; engine 0 runs unpinned workers), and forwards on different engines run at once from different
-threads. free_layer returns status 3 while any forward runs rather than free a layer under it. Keep-warm takes no lock, so its callers must not overlap it with a forward on the same cores.
+Both selections include the register decoder, hoisted coefficients, register Hadamard, parallel 128-element
+preparation/middle stages, fused down output transform, cache-line output ownership, compact activation scratch,
+decoder unrolling and T0 prefetching. Experiment selectors, alternate persistent weight layouts and benchmark
+instrumentation have been removed. Scratch is reused per calling thread. Workers are individually pinned; a stable
+assignment avoids repeating affinity syscalls on every forward. The caller is worker zero. Each call names an engine
+(engine_create: an immutable core list; engine 0 runs unpinned workers), and forwards on different engines run at once
+from different threads. free_layer returns status 3 while any forward runs rather than free a layer under it.
+Keep-warm takes no lock, so its callers must not overlap it with a forward on the same cores.
 
 Build and link
 --------------
@@ -40,20 +39,20 @@ Standalone CPU library on divix01 (no CUDA compilation):
     --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ \
     --output /data/models/exl3_exp/clean_integration/sglang/libexl3_cpu.so
 
-Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP.
-Use moe_mul1.h for the ATen layer-registration API (exl3_moe_cpu_make_layer, one tensor per expert and projection)
-and cpu_experts_cabi.h for the service API, the six C functions every CPU expert quant exports
-(cpu_experts_common/cabi.hpp): register_layer, free_layer, forward, keep_warm, engine_create and engine_free.
-sglang_exl3_cpu_experts_register_layer takes an SglangCpuExpertsLayer (the engine's
-expert_stream/host/cpu_experts_abi.h, shared with the NVFP4 kernel): the pinned tier's six slab base pointers and
-per-slot strides, with SglangExl3CpuParams (bits, swizzled) as its params. The kernel keeps no reference: the caller
-keeps the slabs alive until it frees the layer. Register and forward through the same library instance: layer
-handles belong to that instance's registry, which make_layer's tables share. Packed matrix tensors must remain
-alive for the registered layer's lifetime. Create an engine from distinct worker core IDs in [0, CPU_SETSIZE) and name it in each forward's engine field and
-each keep-warm; a core that cannot be pinned fails the call with status 1. The C ABI forward takes one SglangCpuExpertsForward: rows token rows of FP16
-activations, FP32 routing weights (converted to FP16) and FP32 output. Status 0 is success, 1 a kernel error, 2
-invalid arguments (a refused call leaves out untouched), 3 a free_layer while a forward runs. The ATen forward and free run through the
-same functions and raise on a nonzero status.
+Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP. Use moe_mul1.h for the ATen layer-registration
+API (exl3_moe_cpu_make_layer, one tensor per expert and projection) and cpu_experts_cabi.h for the service API, the
+six C functions every CPU expert quant exports (cpu_experts_common/cabi.hpp): register_layer, free_layer, forward,
+keep_warm, engine_create and engine_free. sglang_exl3_cpu_experts_register_layer takes an SglangCpuExpertsLayer (the
+engine's expert_stream/host/cpu_experts_abi.h, shared with the NVFP4 kernel): the pinned tier's six slab base pointers
+and per-slot strides, with SglangExl3CpuParams (bits, swizzled) as its params. The kernel keeps no reference: the
+caller keeps the slabs alive until it frees the layer. Register and forward through the same library instance: layer
+handles belong to that instance's registry, which make_layer's tables share. Packed matrix tensors must remain alive
+for the registered layer's lifetime. Create an engine from distinct worker core IDs in [0, CPU_SETSIZE) and name it in
+each forward's engine field and each keep-warm; a core that cannot be pinned fails the call with status 1. The C ABI
+forward takes one SglangCpuExpertsForward: rows token rows of FP16 activations, FP32 routing weights (converted to
+FP16) and FP32 output. Status 0 is success, 1 a kernel error, 2 invalid arguments (a refused call leaves out
+untouched), 3 a free_layer while a forward runs. The ATen forward and free run through the same functions and raise on
+a nonzero status.
 
 SGLang integration
 ------------------

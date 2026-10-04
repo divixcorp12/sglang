@@ -116,13 +116,15 @@ blocks whose delta rounds to zero contribute zero.
 
 Each forward runs one OpenMP team of `threads` workers, the calling engine thread as worker 0, in four phases
 separated by barriers: every token's input to Q8_0; every routed expert's gate/up rows and SiLU; every intermediate to
-Q8_0; every expert's down rows, each token's summed in its routing order into its row of `out`. Create an engine (`sglang_nvfp4_cpu_experts_engine_create`) from distinct Linux cores and name it in the call's
-`engine`; worker i is pinned to its core i (once, then re-checked cheaply), and engine 0 runs unpinned workers. A
-forward may use any team size up to the engine's cores (more is refused, 2). If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`, `OMP_DYNAMIC`), the forward returns 1 and
-leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave
-`OMP_PROC_BIND` unset. Forwards on any engines run at once from different threads; `free_layer` returns 3 while one runs. `sglang_nvfp4_cpu_experts_keep_warm` holds the same pinned team in register-only work at
-the forward's vector width between calls. Stop/join the engine before freeing
-handles or slab storage; do not unload the library while callbacks are in use. The kernel requires Linux and OpenMP.
+Q8_0; every expert's down rows, each token's summed in its routing order into its row of `out`. Create an engine
+(`sglang_nvfp4_cpu_experts_engine_create`) from distinct Linux cores and name it in the call's `engine`; worker i is
+pinned to its core i (once, then re-checked cheaply), and engine 0 runs unpinned workers. A forward may use any team
+size up to the engine's cores (more is refused, 2). If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`,
+`OMP_DYNAMIC`), the forward returns 1 and leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE
+GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave `OMP_PROC_BIND` unset. Forwards on any engines run at once from
+different threads; `free_layer` returns 3 while one runs. `sglang_nvfp4_cpu_experts_keep_warm` holds the same pinned
+team in register-only work at the forward's vector width between calls. Stop/join the engine before freeing handles or
+slab storage; do not unload the library while callbacks are in use. The kernel requires Linux and OpenMP.
 
 The forward takes one `SglangCpuExpertsForward` (`cpu_experts_abi.h`
 beside the engine, shared with the EXL3 kernel): up to 65536 token rows of up

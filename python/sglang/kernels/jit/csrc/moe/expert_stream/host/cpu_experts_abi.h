@@ -12,6 +12,8 @@
 // added to it when `accumulate` is nonzero. `threads` workers, the calling thread counted as one. A kernel refuses
 // (returns 2) an abi_version other than SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION. `engine` selects the kernel's core list
 // (its engine_create); a kernel refuses (2) an engine it never created or freed, and more `threads` than its cores.
+// A call naming an engine leaves its calling thread (worker 0) and its OpenMP workers pinned to that engine's cores
+// after it returns; engine 0 does not unpin them (it only leaves an unpinned thread unpinned).
 typedef struct SglangCpuExpertsForward {
     uint32_t abi_version;
     int32_t rows;

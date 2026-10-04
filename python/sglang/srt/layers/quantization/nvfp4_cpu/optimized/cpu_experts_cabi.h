@@ -28,8 +28,10 @@ int sglang_nvfp4_cpu_experts_free_layer(int64_t handle) NVFP4_NOEXCEPT;
 // [rows][hidden]; rows at most 65536, k at most 8. GGML Q8_0 is used internally for input and SwiGLU. Tokens sharing a
 // slot share each weight row's decode; every row's output is bitwise its own one-row call's. A call is all or nothing:
 // when Q8_0 cannot represent any row's input or intermediate it returns 2 and leaves every row of out untouched.
-// call->engine names the engine whose cores the workers run on (0: unpinned); an unknown or freed engine, or more threads
-// than its cores, is refused (2). Forwards on any engines run at once from different threads.
+// call->engine names the engine whose cores the workers run on (0: unpinned); an unknown or freed engine, or more
+// threads than its cores, is refused (2). Forwards on any engines run at once from different threads.
+// A call naming an engine leaves its calling thread (worker 0) and its OpenMP workers pinned to that engine's cores
+// after it returns; engine 0 does not unpin them (it only leaves an unpinned thread unpinned).
 int sglang_nvfp4_cpu_experts_forward(const SglangCpuExpertsForward* call) NVFP4_NOEXCEPT;
 // Holds `threads` workers of `engine` (0: unpinned), pinned as the forward pins them, in register-only work at the
 // forward's vector width until *word != seen or CLOCK_MONOTONIC reaches deadline_ns (cpu_experts_common/keep_warm.hpp).

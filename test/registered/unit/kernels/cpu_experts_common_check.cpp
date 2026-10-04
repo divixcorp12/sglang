@@ -277,7 +277,7 @@ int main()
     }
 
     {
-        // Forwards share the layers and no lock: one parked inside its dispatch does not stop another, on another
+        // Forwards hold the layer lock shared: one parked inside its dispatch does not stop another, on another
         // engine or on none. free_layer refuses (3) while any forward runs, rather than free a layer under it.
         const int64_t h = register_toy(f);
         toy::ToyQuant::inside.store(false);
