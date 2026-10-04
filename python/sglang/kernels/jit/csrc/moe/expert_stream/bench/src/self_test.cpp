@@ -750,7 +750,12 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
     Stack<BenchBuild> stack(std::move(config));
     DeviceSim sim(stack.page(), stack.lease(), kSelfRows, kSelfExperts);
     const int32_t four[] = {0, 1, 2, 3};
-    load_experts(sim, 0, four, 3, soon());
+    // One load per group, so no post mixes groups' misses: a mixed post leaves the tier's staging order unlike the
+    // lowest-first order the slot checks below read (expert 3 landed in slot 10).
+    const int32_t home0[] = {0, 2};
+    const int32_t home1[] = {1, 3};
+    load_experts(sim, 0, home0, 3, soon());
+    load_experts(sim, 0, home1, 3, soon());
     stack.set_cpu_layer(0, kFakeHandle);
     sim.set_row_cpu(0);
     const float ones[] = {1.0f, 1.0f, 1.0f, 1.0f};
