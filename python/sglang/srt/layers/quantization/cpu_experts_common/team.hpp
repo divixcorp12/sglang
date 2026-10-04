@@ -1,0 +1,103 @@
+// The worker cores every forward's team runs on, and the team itself: one OpenMP team per call, the calling thread as
+// worker 0, worker i pinned to core i once cores are configured.
+#pragma once
+#include <omp.h>
+#include <pthread.h>
+#include <sched.h>
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <stdexcept>
+#include <vector>
+
+namespace sglang::cpu_experts {
+
+struct Cores
+{
+    // Worker i on cores[i], the caller as worker 0. Cores must be distinct and allowed by this thread's affinity;
+    // refused (2) once the first forward or keep-warm has frozen them.
+    static int configure(const int32_t* cores, int32_t n) noexcept
+    {
+        try {
+            if (!cores || n < 1 || n > 4096) return 2;
+            cpu_set_t allowed;
+            CPU_ZERO(&allowed);
+            if (sched_getaffinity(0, sizeof(allowed), &allowed)) return 2;
+            for (int i = 0; i < n; ++i) {
+                if (cores[i] < 0 || cores[i] >= CPU_SETSIZE || !CPU_ISSET(cores[i], &allowed)) return 2;
+                for (int j = 0; j < i; ++j)
+                    if (cores[j] == cores[i]) return 2;
+            }
+            std::lock_guard<std::mutex> lock(mutex);
+            if (started.load(std::memory_order_relaxed)) return 2;
+            configured.assign(cores, cores + n);
+            return 0;
+        } catch (...) {
+            return 1;
+        }
+    }
+
+    static void freeze()
+    {
+        if (started.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!started.load(std::memory_order_relaxed)) {
+            compute = configured;
+            started.store(true, std::memory_order_release);
+        }
+    }
+
+    // Empty until freeze(), and when no cores were configured (workers then run unpinned).
+    static const std::vector<int>& frozen() { return compute; }
+
+    // Sets `error` when the pin fails; the caller checks that worker < frozen().size().
+    static void pin(int worker, std::atomic<int>& error)
+    {
+        if (compute.empty()) return;
+        const int core = compute[worker];
+        static thread_local int pinned_core = -1;
+        if (pinned_core != core || sched_getcpu() != core) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(core, &set);
+            if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set))
+                error.store(1, std::memory_order_relaxed);
+            else
+                pinned_core = core;
+        }
+    }
+
+private:
+    static inline std::mutex mutex;
+    static inline std::vector<int> configured;
+    static inline std::atomic<bool> started{false};
+    static inline std::vector<int> compute;  // Immutable after the release store of `started`.
+};
+
+// body(worker, workers) on every worker of a pinned team of `threads`. Every pin precedes a barrier and the body runs
+// only on a full, fully pinned team, so all workers take the same branch; body must not throw (it runs inside an
+// OpenMP region).
+template <class Body>
+void run_team(int threads, Body&& body)
+{
+    if (threads < 1) throw std::runtime_error("CPU expert team needs at least one worker");
+    Cores::freeze();
+    const std::vector<int>& cores = Cores::frozen();
+    if (!cores.empty() && size_t(threads) > cores.size())
+        throw std::runtime_error("CPU expert worker count exceeds configured cores");
+    std::atomic<int> pin_error{0};
+    std::atomic<int> actual_workers{0};
+    #pragma omp parallel num_threads(threads) shared(body, pin_error, actual_workers)
+    {
+        const int worker = omp_get_thread_num(), n = omp_get_num_threads();
+        if (worker == 0) actual_workers.store(n, std::memory_order_relaxed);
+        Cores::pin(worker, pin_error);
+        #pragma omp barrier
+        if (n == threads && !pin_error.load(std::memory_order_relaxed)) body(worker, n);
+    }
+    if (pin_error.load()) throw std::runtime_error("cannot pin CPU expert worker to its configured core");
+    if (actual_workers.load() != threads)
+        throw std::runtime_error("OpenMP returned fewer CPU expert workers than requested");
+}
+
+}  // namespace sglang::cpu_experts
