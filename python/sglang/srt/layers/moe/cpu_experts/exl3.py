@@ -179,8 +179,8 @@ class Exl3CpuQuantTrait:
         result = fn(array, len(cores))
         if result == 2:
             raise RuntimeError(
-                f"the EXL3 CPU kernel refused cores {list(cores)} (status 2): either a core repeats or lies "
-                "outside this thread's affinity, or the kernel's workers already ran, so something called "
+                f"the EXL3 CPU kernel refused cores {list(cores)} (status 2): either a core repeats or is "
+                "out of range, or the kernel's workers already ran, so something called "
                 "the CPU kernel before the CPU expert thread"
             )
         if result != 0:
