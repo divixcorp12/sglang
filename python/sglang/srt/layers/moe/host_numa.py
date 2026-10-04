@@ -277,6 +277,8 @@ def slot_nodes(slabs: Mapping[str, torch.Tensor], capacity: int, min_local: floa
         bindings = getattr(owner, "_numa_bindings", None)
         if bindings is None:
             raise ValueError(f"slab {name} has no NUMA bindings: it was allocated without a placement")
+        if slab.shape[0] != capacity:
+            raise ValueError(f"slab {name} has {slab.shape[0]} rows, not the layer's {capacity} slots")
         if capacity == 0 or slab.numel() == 0:
             continue
         row_bytes = slab.numel() * slab.element_size() // slab.shape[0]
