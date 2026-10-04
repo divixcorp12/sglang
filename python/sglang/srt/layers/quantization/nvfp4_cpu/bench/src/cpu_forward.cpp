@@ -118,6 +118,7 @@ std::array<uint64_t,7> sizes(const Header& h) {
 struct Layer {
     std::array<std::vector<uint8_t>,7> slabs;
     std::vector<uint16_t> x;
+    SglangNvfp4CpuParams params{};  // registered by pointer: lives until the handle is freed
     int64_t handle=-1;
     ~Layer() { if (handle>=0) sglang_nvfp4_cpu_experts_free_layer(handle); }
 };
@@ -173,13 +174,15 @@ struct Fixture {
     }
     void register_layers() {
         for (auto& layer:layers) {
-            SglangNvfp4CpuLayer d{};
-            d.abi_version=1; d.capacity=h.capacity; d.hidden=h.hidden; d.intermediate=h.intermediate;
-            d.w13_layout=h.layout; d.act_limit=h.limit; d.inv_input_scale13=h.inv13; d.inv_input_scale2=h.inv2;
+            auto& params=layer->params;
+            params.w13_layout=int32_t(h.layout); params.inv_input_scale13=h.inv13; params.inv_input_scale2=h.inv2;
+            SglangCpuExpertsLayer d{};
+            d.abi_version=SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION; d.capacity=h.capacity; d.hidden=h.hidden;
+            d.intermediate=h.intermediate; d.act_limit=h.limit; d.slab_count=7; d.params=&params;
             for (int i=0;i<7;++i) {
                 d.slabs[i]=layer->slabs[i].empty()?nullptr:layer->slabs[i].data(); d.slot_bytes[i]=strides[i];
             }
-            if (sglang_nvfp4_cpu_experts_register_slabs(&d,&layer->handle)) throw std::runtime_error("Registration failed");
+            if (sglang_nvfp4_cpu_experts_register_layer(&d,&layer->handle)) throw std::runtime_error("Registration failed");
         }
     }
     void write(const std::string& path) const {

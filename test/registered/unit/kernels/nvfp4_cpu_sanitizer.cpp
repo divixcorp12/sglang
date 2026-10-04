@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 #include <cstdio>
 #include <cstring>
@@ -50,9 +51,11 @@ int main() {
     std::vector<unsigned char> sf13(capacity*256*8, 56), sf2(capacity*128*8, 56);
     std::vector<float> alpha(capacity, 1), out(h, 123);
     std::vector<unsigned short> x(h, 0x3c00);
-    SglangNvfp4CpuLayer d{};
-    d.abi_version = 1; d.capacity = capacity; d.hidden = h; d.intermediate = n;
-    d.inv_input_scale13 = .5f; d.inv_input_scale2 = .25f;
+    SglangNvfp4CpuParams params{};
+    params.inv_input_scale13 = .5f; params.inv_input_scale2 = .25f;
+    SglangCpuExpertsLayer d{};
+    d.abi_version = SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION; d.capacity = capacity; d.hidden = h; d.intermediate = n;
+    d.slab_count = 7; d.params = &params;
     d.slabs[0] = w13.data(); d.slabs[1] = w2.data();
     d.slabs[2] = sf13.data(); d.slabs[3] = sf2.data();
     d.slabs[4] = alpha.data(); d.slabs[5] = alpha.data();
@@ -60,7 +63,7 @@ int main() {
     d.slot_bytes[2] = 256*8; d.slot_bytes[3] = 128*8;
     d.slot_bytes[4] = 4; d.slot_bytes[5] = 4;
     int64_t layer = -1;
-    assert(sglang_nvfp4_cpu_experts_register_slabs(&d, &layer) == 0);
+    assert(sglang_nvfp4_cpu_experts_register_layer(&d, &layer) == 0);
     const int32_t slots[] = {1,-1,0}; const float weights[] = {.5f,1,.25f};
     const double g0=h*.5*quantized_constant(1);
     const double mid0=float(float(g0/(1+std::exp(-g0)))*float(g0));
@@ -88,7 +91,7 @@ int main() {
     d.act_limit=8; // Keep Q8 intermediate deltas representable at large scales.
     // Every finite E4M3 encoding, including signed zeros, subnormals and
     // max-normal scales. Compare with an independent double scalar oracle.
-    assert(sglang_nvfp4_cpu_experts_register_slabs(&d, &layer) == 0);
+    assert(sglang_nvfp4_cpu_experts_register_layer(&d, &layer) == 0);
     for (int code = 0; code < 256; ++code) {
         if ((code & 127) == 127) continue;
         std::fill(sf13.begin(), sf13.end(), static_cast<unsigned char>(code));
@@ -116,7 +119,7 @@ int main() {
     d.act_limit=0;
     std::fill(sf13.begin(),sf13.end(),126);
     std::fill(out.begin(),out.end(),123);
-    assert(sglang_nvfp4_cpu_experts_register_slabs(&d,&layer)==0);
+    assert(sglang_nvfp4_cpu_experts_register_layer(&d,&layer)==0);
     // An overflowing Q8 FP16 delta rejects the job without publishing output.
     assert(forward(layer,x.data(),slots,weights,3,out.data(),3,0)==2);
     for (float v:out) assert(v==123);
@@ -124,6 +127,16 @@ int main() {
     assert(forward(layer,x.data(),slots,weights,3,out.data(),3,0)==2);
     for (float v:out) assert(v==123);
     assert(sglang_nvfp4_cpu_experts_free_layer(layer)==0);
+    d.params = nullptr;
+    assert(sglang_nvfp4_cpu_experts_register_layer(&d, &layer) == 2);
+    d.params = &params;
+    d.slab_count = 6;
+    assert(sglang_nvfp4_cpu_experts_register_layer(&d, &layer) == 2);
+    d.slab_count = 7;
     d.abi_version = 2;
-    assert(sglang_nvfp4_cpu_experts_register_slabs(&d, &layer) == 2);
+    assert(sglang_nvfp4_cpu_experts_register_layer(&d, &layer) == 2);
+    // Keep-warm returns at once when the word has already moved past `seen`.
+    const uint32_t word = 1;
+    assert(sglang_nvfp4_cpu_experts_keep_warm(2, &word, 0, INT64_MAX) == 0);
+    assert(sglang_nvfp4_cpu_experts_keep_warm(0, &word, 0, INT64_MAX) == 2);
 }

@@ -2,7 +2,7 @@
 // MIT, ggml authors; see ../upstream/LICENSE.llama.cpp.
 // Changes: GPU row/scale access, adjacent-nibble interleave, return signature, several Q8_0 vectors per weight row.
 #pragma once
-// Included by moe_mul1.h after rounded and sf_index.
+// Included by quant.hpp inside its namespace, after rounded and sf_index.
 #include <cstring>
 #include "../upstream/kernels.h"
 

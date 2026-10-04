@@ -1,5 +1,5 @@
-// Included by moe_mul1.cpp inside its anonymous namespace, after the definitions moe_mul1.h declares (dot_rows,
-// swiglu, q8_representable, quantize_block, freeze_compute_cores, pin_compute_worker).
+// Included by moe_mul1.cpp inside quant.hpp's namespace, after the arithmetic it defines (dot_rows, swiglu,
+// q8_representable, quantize_block) and kChunkRows.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the
 // dot product's tier, fixed when the library is compiled (kBuildIsa). The primary PlanTraits is the generic plan's;
@@ -8,6 +8,65 @@
 // A call's routes are grouped by slot into units, one per (token, slot), and units into chunks of up to kChunkRows of
 // one slot, so dot_rows decodes each weight row once per chunk. Each token's output is still its own routes' sum in
 // routing order, so a token's result does not depend on the other rows of the call.
+
+// 64-byte-aligned storage, so each kRowUnit share of fp32 outputs owns whole cache lines.
+template <class T>
+struct CacheAligned
+{
+    using value_type = T;
+    CacheAligned() = default;
+    template <class U> CacheAligned(const CacheAligned<U>&) {}
+    T* allocate(size_t n) { return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t{64})); }
+    void deallocate(T* p, size_t) { ::operator delete(p, std::align_val_t{64}); }
+    template <class U> bool operator==(const CacheAligned<U>&) const { return true; }
+};
+
+// What the plan binds to route (t, i) of the call's RouteTable, stored at t * k + i like the table.
+struct RouteBinding
+{
+    int unit;          // the (token, slot) unit computing this route's expert
+    float down_alpha;  // the slot's down alpha * inv_input_scale2 * weight
+};
+
+// A route found while grouping a call's routes by slot: token `token`'s route number `index`.
+struct RouteRef
+{
+    int slot, token, index;
+};
+
+// Up to kChunkRows units of one slot, run together so each weight row is decoded once for all of them. A unit is one
+// (token, slot) pair: one intermediate row and one down result per output, however many of the token's routes name
+// the slot.
+struct Chunk
+{
+    Projection gate, up, down;
+    float gate_alpha, up_alpha;  // the projection's alpha * inv_input_scale13
+    int unit0, units;            // units [unit0, unit0 + units)
+};
+
+struct ForwardCtx
+{
+    LayerInfo info;
+    const uint8_t* x;  // fp16 [rows][hidden], possibly unaligned
+    float* out;        // fp32 [rows][hidden]
+    int rows;
+    bool accumulate;
+    RouteTable routes;  // each token's live routes in routing order
+    // From the calling thread's ForwardArena; the plan binds everything below.
+    RouteBinding* binding;   // [rows][routes.k]
+    const Chunk* chunk;      // [chunks]
+    int chunks;
+    const int* unit_token;   // [units], the token each unit reads
+    int units;
+    float* xf;                  // [rows][rounded(hidden, 64)]
+    block_q8_0* qx;             // [rows][rounded(hidden, 64) / 32]
+    float* inter;               // [units][rounded(intermediate, 64)]
+    block_q8_0* qi;             // [units][rounded(intermediate, 64) / 32]
+    float* partial;             // [workers][partial_stride]: one down output of every unit
+    size_t partial_stride;
+    // Q8_0 cannot represent the input or an intermediate: the forward returns 2 and leaves out untouched.
+    std::atomic<bool> invalid{false};
+};
 
 // The forward's phases, in team order; a barrier separates each from the next.
 enum class Phase : int
@@ -23,8 +82,8 @@ struct ForwardArena
 {
     std::vector<float, CacheAligned<float>> xf, inter, partial;
     std::vector<block_q8_0> qx, qi;
-    std::vector<Route> route;
-    std::vector<int> route_count, unit_token;
+    std::vector<RouteBinding> binding;
+    std::vector<int> unit_token;
     std::vector<RouteRef> refs;
     std::vector<Chunk> chunk;
 
@@ -64,26 +123,43 @@ struct ForwardPlan
 {
     using Traits = PlanTraits<Shape, I>;
 
-    // Runs ctx's routes through E on `threads` workers (the caller is worker 0). Returns 0, or 2 when Q8_0 cannot
-    // represent an input or an intermediate (out is then untouched). Throws when the team is short or a worker
+    // Runs the call's routes through layer l on c.threads workers (the caller is worker 0). Returns 0, or 2 when Q8_0
+    // cannot represent an input or an intermediate (out is then untouched). Throws when the team is short or a worker
     // cannot be pinned.
-    static int run(ForwardCtx& ctx, const StridedExperts<Shape>& E, ForwardArena& ar, int threads)
+    static int run(const Nvfp4Quant::Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r)
     {
-        bind_routes(ctx, E, ar);
-        prepare_scratch(ctx, ar, threads);
-        run_team(ctx, threads);
+        ForwardArena& ar = ForwardArena::get();
+        ForwardCtx ctx;
+        ctx.info = l.info;
+        ctx.x = static_cast<const uint8_t*>(c.x);
+        ctx.out = c.out;
+        ctx.rows = c.rows;
+        ctx.accumulate = c.accumulate != 0;
+        ctx.routes = r;
+        bind_routes(ctx, l, ar);
+        prepare_scratch(ctx, ar, c.threads);
+        run_team(c.threads, [&ctx](int worker, int n) {
+            step<Phase::PrepareInput>(ctx, worker, n);
+            // `invalid` is read only after a barrier, so every worker takes the same branch.
+            if (!ctx.invalid.load(std::memory_order_relaxed)) {
+                step<Phase::GateUp>(ctx, worker, n);
+                step<Phase::Middle>(ctx, worker, n);
+                if (!ctx.invalid.load(std::memory_order_relaxed)) phase<Phase::Down>(ctx, worker, n);
+            }
+        });
         return ctx.invalid.load(std::memory_order_relaxed) ? 2 : 0;
     }
 
 private:
     // Groups the live routes into units and chunks, and binds each chunk's projections and scaled alphas and each
     // route's unit and down alpha; the team reads only these.
-    static void bind_routes(ForwardCtx& c, const StridedExperts<Shape>& E, ForwardArena& ar)
+    static void bind_routes(ForwardCtx& c, const Nvfp4Quant::Layer& l, ForwardArena& ar)
     {
+        const RouteTable& r = c.routes;
+        if (ar.binding.size() < size_t(r.rows) * r.k) ar.binding.resize(size_t(r.rows) * r.k);
         ar.refs.clear();
-        for (int t = 0; t < c.rows; ++t)
-            for (int j = 0; j < c.route_count[t]; ++j)
-                ar.refs.push_back({c.route[size_t(t) * kMaxRoutes + j].slot, t, j});
+        for (int t = 0; t < r.rows; ++t)
+            for (int j = 0; j < r.count[t]; ++j) ar.refs.push_back({r.route(t, j).slot, t, j});
         std::sort(ar.refs.begin(), ar.refs.end(), [](const RouteRef& a, const RouteRef& b) {
             return a.slot != b.slot ? a.slot < b.slot : a.token != b.token ? a.token < b.token : a.index < b.index;
         });
@@ -94,10 +170,11 @@ private:
             const bool same_slot = i && ar.refs[i - 1].slot == ref.slot;
             if (!same_slot || ar.refs[i - 1].token != ref.token) {
                 if (!same_slot || ar.chunk.back().units == kChunkRows) {
+                    const Nvfp4Quant::Row row = Nvfp4Quant::decode(l.rows.slot(ref.slot).base.data(), l);
                     Chunk ch;
-                    ch.gate = E.gate(ref.slot);
-                    ch.up = E.up(ref.slot);
-                    ch.down = E.down(ref.slot);
+                    ch.gate = row.gate;
+                    ch.up = row.up;
+                    ch.down = row.down;
                     ch.gate_alpha = ch.gate.alpha * c.info.inv_input_scale13;
                     ch.up_alpha = ch.up.alpha * c.info.inv_input_scale13;
                     ch.unit0 = int(ar.unit_token.size());
@@ -107,10 +184,11 @@ private:
                 ++ar.chunk.back().units;
                 ar.unit_token.push_back(ref.token);
             }
-            Route& r = c.route[size_t(ref.token) * kMaxRoutes + ref.index];
-            r.unit = int(ar.unit_token.size()) - 1;
-            r.down_alpha = ar.chunk.back().down.alpha * c.info.inv_input_scale2 * r.weight;
+            RouteBinding& b = ar.binding[size_t(ref.token) * r.k + ref.index];
+            b.unit = int(ar.unit_token.size()) - 1;
+            b.down_alpha = ar.chunk.back().down.alpha * c.info.inv_input_scale2 * r.route(ref.token, ref.index).weight;
         }
+        c.binding = ar.binding.data();
         c.chunk = ar.chunk.data();
         c.chunks = int(ar.chunk.size());
         c.unit_token = ar.unit_token.data();
@@ -141,36 +219,8 @@ private:
         c.partial = ar.partial.data();
     }
 
-    static void run_team(ForwardCtx& ctx, int count)
-    {
-        freeze_compute_cores();
-        if (!g_compute_cores.empty() && size_t(count) > g_compute_cores.size())
-            throw std::runtime_error("CPU expert worker count exceeds configured cores");
-        std::atomic<int> pin_error{0};
-        std::atomic<int> actual_workers{0};
-        #pragma omp parallel num_threads(count) shared(ctx, pin_error, actual_workers)
-        {
-            const int worker = omp_get_thread_num(), n = omp_get_num_threads();
-            if (worker == 0) actual_workers.store(n, std::memory_order_relaxed);
-            pin_compute_worker(worker, pin_error);
-            if (n == count) {
-                step<Phase::PrepareInput>(ctx, worker, n);
-                // `invalid` and `pin_error` are read only after a barrier (every pin precedes PrepareInput's), so every
-                // worker takes the same branch; a failed pin computes nothing into out.
-                if (!ctx.invalid.load(std::memory_order_relaxed) && !pin_error.load(std::memory_order_relaxed)) {
-                    step<Phase::GateUp>(ctx, worker, n);
-                    step<Phase::Middle>(ctx, worker, n);
-                    if (!ctx.invalid.load(std::memory_order_relaxed)) phase<Phase::Down>(ctx, worker, n);
-                }
-            }
-        }
-        if (pin_error.load()) throw std::runtime_error("cannot pin CPU expert worker to its configured core");
-        if (actual_workers.load() != count)
-            throw std::runtime_error("OpenMP returned fewer CPU expert workers than requested");
-    }
-
-    // One phase, then wait for the whole team. Called inside run_team's parallel region (an orphaned barrier binds to
-    // that team).
+    // One phase, then wait for the whole team. Called inside run_team's parallel region (team.hpp; an orphaned barrier
+    // binds to that team).
     template <Phase P>
     static void step(ForwardCtx& c, int worker, int workers)
     {
@@ -237,9 +287,9 @@ private:
                     dot_rows(ch.down.w, ch.down.sf, int(h), N, xs, ch.units, partial + ch.unit0);
                 }
                 for (int t = 0; t < c.rows; ++t) {
-                    const Route* route = c.route + size_t(t) * kMaxRoutes;
+                    const RouteBinding* b = c.binding + size_t(t) * c.routes.k;
                     float sum = 0.f;
-                    for (int r = 0; r < c.route_count[t]; ++r) sum += partial[route[r].unit] * route[r].down_alpha;
+                    for (int r = 0; r < c.routes.count[t]; ++r) sum += partial[b[r].unit] * b[r].down_alpha;
                     float& out = c.out[size_t(t) * size_t(H) + size_t(h)];
                     out = c.accumulate ? out + sum : sum;
                 }

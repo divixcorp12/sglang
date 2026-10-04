@@ -153,16 +153,17 @@ int main(int argc, char** argv) {
     int cases = 0, unexpected = 0, batch_mismatches = 0;
     for (const Config& c : kConfigs) {
         Slabs s = make_slabs(c, rng);
-        SglangNvfp4CpuLayer d{};
-        d.abi_version = 1; d.capacity = kCapacity; d.hidden = c.hidden; d.intermediate = c.intermediate;
-        d.w13_layout = c.layout; d.activation = 0; d.act_limit = c.limit;
-        d.inv_input_scale13 = c.inv13; d.inv_input_scale2 = c.inv2;
+        SglangNvfp4CpuParams params{};
+        params.w13_layout = c.layout; params.inv_input_scale13 = c.inv13; params.inv_input_scale2 = c.inv2;
+        SglangCpuExpertsLayer d{};
+        d.abi_version = SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION; d.capacity = kCapacity; d.hidden = c.hidden;
+        d.intermediate = c.intermediate; d.activation = 0; d.act_limit = c.limit; d.slab_count = 7; d.params = &params;
         for (int i = 0; i < 7; ++i) {
             d.slabs[i] = s.bytes[i].empty() ? nullptr : s.bytes[i].data();
             d.slot_bytes[i] = s.stride[i];
         }
         int64_t handle = -1;
-        if (sglang_nvfp4_cpu_experts_register_slabs(&d, &handle) != 0) {
+        if (sglang_nvfp4_cpu_experts_register_layer(&d, &handle) != 0) {
             std::fprintf(stderr, "%s: registration refused\n", c.name); return 1;
         }
         std::uniform_real_distribution<float> unit(-1.f, 1.f);

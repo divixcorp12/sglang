@@ -1,4 +1,4 @@
-// Included by moe_mul1.h inside its anonymous namespace, after experts.hpp.
+// Included by moe_mul1.cpp inside quant.hpp's namespace, after quant.hpp.
 //
 // The shapes a forward plan can be specialized for. A plan reads every layer fact a shape may fix through its Shape:
 // GenericShape takes each from the layer's LayerInfo; MimoV26ProShape fixes MiMo V2.6 Pro's routed expert at compile

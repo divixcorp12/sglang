@@ -1,10 +1,12 @@
 // Differential GGML/layout check; C++ only, no CUDA or Python runtime.
-#include "moe_mul1.h"
+#include "quant.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <random>
 #include <vector>
+
+using namespace sglang::nvfp4_cpu;
 
 int main() {
     std::mt19937 rng(42);

@@ -23,9 +23,10 @@ REPO = Path(__file__).resolve().parents[4]
 OPTIMIZED = REPO / "python/sglang/srt/layers/quantization/nvfp4_cpu/optimized"
 CXX = os.environ.get("CXX") or shutil.which("g++")
 C_ABI = (
-    "sglang_nvfp4_cpu_experts_register_slabs",
+    "sglang_nvfp4_cpu_experts_register_layer",
     "sglang_nvfp4_cpu_experts_free_layer",
     "sglang_nvfp4_cpu_experts_forward",
+    "sglang_nvfp4_cpu_experts_keep_warm",
     "sglang_nvfp4_cpu_experts_set_cores",
 )
 

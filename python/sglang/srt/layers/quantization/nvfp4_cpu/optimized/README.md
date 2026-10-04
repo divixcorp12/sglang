@@ -30,15 +30,16 @@ See [upstream provenance and adaptation details](../upstream/README.md).
 
 Include `cpu_experts_cabi.h` and load the library `build.py` or
 `nvfp4_cpu_ext.nvfp4_cpu_library()` builds. Register each layer
-using a `SglangNvfp4CpuLayer` descriptor. Registration stores views and allocates
-activation/result scratch. The optimized kernel never repacks or expands full
+using the common `SglangCpuExpertsLayer` descriptor (`cpu_experts_abi.h`, `slab_count` 7) whose `params` points at a
+`SglangNvfp4CpuParams` (W13 layout, inverse input scales). Registration stores views; the registrant keeps the slabs
+and the parameters alive until `free_layer`. The optimized kernel never repacks or expands full
 weight rows.
 
 ```cpp
 int64_t handle = -1;
 // Populate descriptor with this layer's verified layout/scales/slab pointers.
-if (sglang_nvfp4_cpu_experts_register_slabs(&descriptor, &handle) != 0)
-    throw std::runtime_error("NVFP4 CPU slab registration failed");
+if (sglang_nvfp4_cpu_experts_register_layer(&descriptor, &handle) != 0)
+    throw std::runtime_error("NVFP4 CPU layer registration failed");
 
 CpuExpertConfig config;
 config.forward = &sglang_nvfp4_cpu_experts_forward;
@@ -90,7 +91,7 @@ TRTLLM shuffled weights/scales and Marlin packing are unsupported. Shapes
 cannot identify layout; the registering caller must verify the GPU prep path.
 
 GPU alphas may be `weight_scale * activation_scale`. Register the reciprocal
-activation factors as `inv_input_scale13` and `inv_input_scale2` to cancel them
+activation factors as the parameters' `inv_input_scale13` and `inv_input_scale2` to cancel them
 for full FP16 CPU input. Use 1.0 for weight-only alphas. Factors may differ
 between layer descriptors, but each factor is scalar within one layer. A
 per-expert factor must travel with its mutable host slot in a future ABI
@@ -116,7 +117,9 @@ Q8_0; every expert's down rows, each token's summed in its routing order into it
 forward; worker i is pinned to core i (once, then re-checked cheaply). A forward may use any team size up to the
 configured cores. If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`, `OMP_DYNAMIC`), the forward returns 1 and
 leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave
-`OMP_PROC_BIND` unset. Concurrent forward/free/configuration is rejected (3). Stop/join the engine before freeing
+`OMP_PROC_BIND` unset. A concurrent forward or free is rejected (3); cores configured after the first forward or
+keep-warm are refused (2). `sglang_nvfp4_cpu_experts_keep_warm` holds the same pinned team in register-only work at
+the forward's vector width between calls. Stop/join the engine before freeing
 handles or slab storage; do not unload the library while callbacks are in use. The kernel requires Linux and OpenMP.
 
 The forward takes one `SglangCpuExpertsForward` (`cpu_experts_abi.h`
@@ -133,18 +136,22 @@ behavior is unchanged.
 
 ## Code layout
 
-`moe_mul1.h` declares the kernel's types (the registry entry, `Route`, `Chunk`, `ForwardCtx`) and functions;
-`forward_plan.hpp` holds the plan and its per-thread scratch, `ForwardArena`; `moe_mul1.cpp` defines the registry, worker cores, the arithmetic and the C ABI. A forward is
-`ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `run_plan`:
-`ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer on an AVX2 build, else
-`ForwardPlan<GenericShape, kBuildIsa>`. The tier is the build's (`-march=native` AVX2, or the portable scalar loop).
+The layer registry, argument and route validation, worker cores, keep-warm and the five C functions are the shared
+CPU experts framework's (`../../cpu_experts_common/`, `ExpertForward<Nvfp4Quant>`). `quant.hpp` holds `Nvfp4Quant`
+(slab names and minimum strides, parameter validation, the registered `Layer`, a slot's projections) and the layer
+facts; `forward_plan.hpp` holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and its per-thread
+scratch, `ForwardArena`; `moe_mul1.cpp` defines the arithmetic, `Nvfp4Quant::dispatch` and the C ABI (one
+`SGLANG_CPU_EXPERTS_DEFINE_CABI`). A forward is `ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per
+call in `run_plan`: `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer on an AVX2
+build, else `ForwardPlan<GenericShape, kBuildIsa>`. The tier is the build's (`-march=native` AVX2, or the portable
+scalar loop).
 `PlanTraits<Shape, Isa>` holds the plan's knobs (`kRowUnit`, the split unit). The plan groups a call's routes into
 units, one per (token, slot), and units into chunks of up to `kChunkRows` (4) of one slot; `dot_rows` decodes each
 weight row once per chunk (`dot_gpu_rows<M>` in `dot_nvfp4.h`). A plan reads every layer fact it may fix
 through its Shape (`shapes.hpp`): `GenericShape` from the layer's `LayerInfo`, `MimoV26ProShape` as compile-time
-constants (MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp). Plans read slots through
-`StridedExperts<Shape>` (`experts.hpp`) over the descriptor's slab bases and strides; `SlabRowBytes` is each slab's
-minimum stride.
+constants (MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp). Plans read a slot's projections through
+`Nvfp4Quant::decode` over the framework's `MoeBufferRows` (the descriptor's slab bases and strides); `SlabRowBytes`
+is each slab's minimum stride.
 
 Bit-exact checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (native and portable builds
 against a baseline worktree's dumps), and

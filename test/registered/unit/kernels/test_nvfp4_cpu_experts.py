@@ -28,7 +28,9 @@ pytestmark = pytest.mark.skipif(
 CHILD = r"""
 import ctypes, sys
 import numpy as np
-from sglang.srt.layers.moe.cpu_experts.pool import CPU_EXPERTS_FORWARD_ABI_VERSION, CpuExpertsForwardCall
+from sglang.srt.layers.moe.cpu_experts.pool import (
+    CPU_EXPERTS_FORWARD_ABI_VERSION, CPU_EXPERTS_LAYER_ABI_VERSION, CpuExpertsForwardCall, CpuExpertsLayer,
+)
 
 lib = ctypes.CDLL(sys.argv[1])
 calls = [int(t) for t in sys.argv[2].split(",")]
@@ -36,12 +38,10 @@ cores = [int(c) for c in sys.argv[3].split(",")] if sys.argv[3] else []
 alpha_value = float(sys.argv[4])
 
 
-class Layer(ctypes.Structure):
+# SglangNvfp4CpuParams (nvfp4_cpu/optimized/cpu_experts_cabi.h).
+class Params(ctypes.Structure):
     _fields_ = [
-        ("abi_version", ctypes.c_uint32), ("capacity", ctypes.c_int32), ("hidden", ctypes.c_int32),
-        ("intermediate", ctypes.c_int32), ("w13_layout", ctypes.c_int32), ("activation", ctypes.c_int32),
-        ("act_limit", ctypes.c_float), ("inv_input_scale13", ctypes.c_float), ("inv_input_scale2", ctypes.c_float),
-        ("slabs", ctypes.c_void_p * 7), ("slot_bytes", ctypes.c_uint64 * 7),
+        ("w13_layout", ctypes.c_int32), ("inv_input_scale13", ctypes.c_float), ("inv_input_scale2", ctypes.c_float),
     ]
 
 
@@ -52,12 +52,16 @@ w2 = np.full(CAP * H * N // 2, 0x22, np.uint8)
 sf13 = np.full(CAP * 256 * 8, 56, np.uint8)
 sf2 = np.full(CAP * 128 * 8, 56, np.uint8)
 alpha = np.full(CAP, alpha_value, np.float32)
-d = Layer(abi_version=1, capacity=CAP, hidden=H, intermediate=N, inv_input_scale13=1.0, inv_input_scale2=1.0)
+params = Params(w13_layout=0, inv_input_scale13=1.0, inv_input_scale2=1.0)
+d = CpuExpertsLayer(
+    abi_version=CPU_EXPERTS_LAYER_ABI_VERSION, capacity=CAP, hidden=H, intermediate=N, activation=0, act_limit=0.0,
+    slab_count=7, params=ctypes.cast(ctypes.pointer(params), ctypes.c_void_p),
+)
 for i, (slab, stride) in enumerate([(w13, N * H), (w2, H * N // 2), (sf13, 256 * 8), (sf2, 128 * 8), (alpha, 4), (alpha, 4)]):
     d.slabs[i] = slab.ctypes.data
     d.slot_bytes[i] = stride
 handle = ctypes.c_int64(-1)
-assert lib.sglang_nvfp4_cpu_experts_register_slabs(ctypes.byref(d), ctypes.byref(handle)) == 0
+assert lib.sglang_nvfp4_cpu_experts_register_layer(ctypes.byref(d), ctypes.byref(handle)) == 0
 core_array = (ctypes.c_int32 * max(len(cores), 1))(*cores)
 if cores:
     print("cores", lib.sglang_nvfp4_cpu_experts_set_cores(core_array, len(cores)))

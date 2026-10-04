@@ -36,7 +36,7 @@ Shapes divisible by 16 get zero padding in activation scratch and at most
 32 bytes of stack weight scratch for a partial 64-value block. GPU slabs are
 never overwritten, cached in a second format, or persistently repacked.
 
-`../optimized/moe_mul1.cpp` and its headers (`experts.hpp`, `shapes.hpp`, `forward_plan.hpp`) are SGLang glue:
+`../optimized/moe_mul1.cpp` and its headers (`quant.hpp`, `shapes.hpp`, `forward_plan.hpp`) are SGLang glue:
 registration, the OpenMP forward plan, GPU scale addressing, global alphas, FP16 input, SiLU, routing and callback ABI.
 Its Q8 wrapper zeros blocks with a zero FP16 delta before calling the original
 quantizer, avoiding reciprocal overflow on tiny FP32 inputs. Nonfinite inputs
