@@ -1144,9 +1144,12 @@ def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
     )
     assert config.plans[0].ram == arm_env.SPIN_CORE and config.plans[0].busy_poll
     topology = tc.Topology.from_sysfs(str(tmp_path))
-    taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES) | _cores(arm_env.FREE_CORES)
+    taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES)
     for plan in config.plans:
         assert not (topology.siblings[plan.ram] & taken), (plan.ram, sorted(topology.siblings[plan.ram] & taken))
+    # Node 1's derived RAM core 35 pairs with 71, one of the NVMe interrupt cores; only the spin core is held to FREE.
+    spin = topology.siblings[arm_env.SPIN_CORE]
+    assert not (spin & _cores(arm_env.FREE_CORES)), sorted(spin & _cores(arm_env.FREE_CORES))
     assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
 
 
