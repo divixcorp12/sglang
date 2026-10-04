@@ -184,10 +184,12 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         c.close()
 
 
-def test_the_cpu_tail_at_16_lanes_goes_through_the_real_chain_and_the_split_planner():
-    """The 8-lane test above at 16 lanes: twelve RAM hits, split[12] = 4, so lanes 8-11 (the four lowest keys) are the
-    CPU's. They go through the real post, CW and CC (ce_mask and cpu_lanes bits 8-11), the route plan's miss order and
-    DIRECT's commit, which leaves their victims alone. A build still fixed at 8 lanes cannot host this chain at all."""
+@pytest.mark.parametrize("lanes, count", [(16, 12), (32, 32)])
+def test_the_cpu_tail_past_8_lanes_goes_through_the_real_chain_and_the_split_planner(lanes, count):
+    """The 8-lane test above at 16 and 32 lanes: ``count`` RAM hits, split[count] = 4, so the last four lanes (the four
+    lowest keys; at 32 lanes, lanes 28-31) are the CPU's. They go through the real post, CW and CC (ce_mask and
+    cpu_lanes, whose u32 masks reach bit 31), the route plan's miss order and DIRECT's commit, which leaves their
+    victims alone. A build still fixed at 8 lanes cannot host this chain at all."""
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
     from sglang.kernels.ops.moe.expert_residency_direct_gather import (
         direct_commit_gather,
@@ -195,13 +197,14 @@ def test_the_cpu_tail_at_16_lanes_goes_through_the_real_chain_and_the_split_plan
     )
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
 
-    lanes, count, slots, experts, row = 16, 12, 16, 32, 0
+    cpu, slots, experts, row = 4, lanes, 2 * lanes, 0
+    copied, base = count - cpu, lanes
     routed = list(range(count))
-    split = [0] * 12 + [4] + [0] * 4
+    split = [0] * count + [cpu] + [0] * (lanes - count)
     forward = _Forward()
     with tempfile.TemporaryDirectory() as tmp:
         c = Chain(Path(tmp), copy_engine=True, start=False, lanes=lanes, experts=experts, top_k=lanes, dst_rows=lanes,
-                  capacity=32, staging=lanes)
+                  capacity=2 * lanes, staging=lanes)
         try:
             x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
             out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
@@ -221,12 +224,12 @@ def test_the_cpu_tail_at_16_lanes_goes_through_the_real_chain_and_the_split_plan
             c.host.set_cpu_layer(row, HANDLE)
             c.host.arm_copy_engine()
 
-            # VRAM: slots 0..15 hold experts 16..31, none of the routed ones; victims are taken from slot 15 down.
+            # VRAM: every slot holds an expert from base..2*base-1, none of the routed ones; victims are taken from slot 15 down.
             mapping = torch.full((experts + 1,), -1, dtype=torch.int64, device="cuda")
             slot_to_expert = torch.full((slots + 1,), -1, dtype=torch.int64, device="cuda")
             for slot in range(slots):
-                mapping[16 + slot] = slot
-                slot_to_expert[slot] = 16 + slot
+                mapping[base + slot] = slot
+                slot_to_expert[slot] = base + slot
             slot_state = torch.full((slots + 1,), READY_STATE, dtype=torch.uint8, device="cuda")
             slot_state[slots] = FREE_STATE
             generations = torch.zeros(slots + 1, dtype=torch.int64, device="cuda")
@@ -270,19 +273,20 @@ def test_the_cpu_tail_at_16_lanes_goes_through_the_real_chain_and_the_split_plan
             assert _until(lambda: len(forward.calls) == 1)
             torch.cuda.synchronize()
 
-            cpu_experts = by_key[8:]
+            cpu_experts = by_key[copied:]
             (call,) = forward.calls
             assert call[0] == HANDLE and sorted(call[1]) == sorted(ram_slot[e] for e in cpu_experts), (
                 "the four lowest-keyed lanes are the CPU's"
             )
-            assert c.kinds(count) == [LaneKind.HIT_COPY] * 8 + [LaneKind.HIT_CPU] * 4
-            assert dev.cpu_lanes.tolist() == [0xF00, PART_HITS]
-            want = c.expected(by_key[:8], row)
+            assert c.kinds(count) == [LaneKind.HIT_COPY] * copied + [LaneKind.HIT_CPU] * cpu
+            cpu_mask = ((1 << cpu) - 1) << copied
+            assert dev.cpu_lanes.tolist() == [cpu_mask - (cpu_mask >> 31 << 32), PART_HITS]
+            want = c.expected(by_key[:copied], row)
             for n in c.names:
-                for lane in range(8):
+                for lane in range(copied):
                     got = snapshot[n][slots - 1 - lane].cpu().contiguous().view(torch.uint8)
                     assert torch.equal(got, want[n][lane].contiguous().view(torch.uint8)), (n, lane)
-                for lane in range(8, count):
+                for lane in range(copied, count):
                     slot = slots - 1 - lane
                     assert torch.equal(snapshot[n][slot].view(torch.uint8), before[n][slot].view(torch.uint8)), (
                         f"{n}: a CPU lane's victim was copied into"
@@ -295,16 +299,16 @@ def test_the_cpu_tail_at_16_lanes_goes_through_the_real_chain_and_the_split_plan
                 plan.count, ready=READY_STATE, free_state=FREE_STATE, cpu_lanes=dev.cpu_lanes,
             )
             torch.cuda.synchronize()
-            for lane in range(8):
+            for lane in range(copied):
                 slot = slots - 1 - lane
                 assert int(mapping[by_key[lane]]) == slot and int(slot_to_expert[slot]) == by_key[lane]
-                assert int(mapping[16 + slot]) == -1, "a copied lane's victim was evicted"
-            for lane in range(8, count):
+                assert int(mapping[base + slot]) == -1, "a copied lane's victim was evicted"
+            for lane in range(copied, count):
                 slot = slots - 1 - lane
-                assert int(slot_to_expert[slot]) == 16 + slot and int(mapping[16 + slot]) == slot, (
+                assert int(slot_to_expert[slot]) == base + slot and int(mapping[base + slot]) == slot, (
                     "a CPU lane's victim keeps its expert"
                 )
-            assert (insertions.item(), evictions.item(), truncated.item()) == (8, 8, 0)
+            assert (insertions.item(), evictions.item(), truncated.item()) == (copied, copied, 0)
         finally:
             c.close()
 

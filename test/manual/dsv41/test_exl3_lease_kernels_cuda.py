@@ -257,7 +257,7 @@ def test_the_post_stages_the_cpu_input_and_each_lanes_routing_weight(tmp_path, x
         c.close()
 
 
-@pytest.mark.parametrize("lanes, count", [(8, 8), (16, 16), (16, 9), (32, 32), (32, 17)])
+@pytest.mark.parametrize("lanes, count", [(8, 8), (16, 16), (16, 9), (24, 24), (24, 17), (32, 32), (32, 17)])
 def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
     """The post kernel built for ``lanes`` writes a record the service's reader decodes lane by lane: even lanes are
     RAM hits at their map slot, odd lanes misses at the delta's staging slots, and the count is exactly ``count``."""
