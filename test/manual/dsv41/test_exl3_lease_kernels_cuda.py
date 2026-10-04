@@ -309,8 +309,6 @@ def test_each_device_build_is_compiled_for_its_node_count(lanes, nodes):
     assert int(ops._device_module("exl3", lanes, nodes).expert_stream_wire_nodes()) == nodes
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
 
 
 def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, cpu_on=False):
@@ -416,3 +414,44 @@ def test_a_node_out_of_staging_traps_while_the_other_node_has_slots():
     )
     assert "slots [200, 201, 100, 101, 102, 103, 104]" in result.stdout, (result.stdout, result.stderr[-2000:])
     assert "reached" not in result.stdout and "trapped" in result.stdout, (result.stdout, result.stderr[-2000:])
+
+
+@pytest.mark.parametrize(
+    "kinds, nodes_of, parts",
+    [
+        ([LaneKind.HIT_CPU, LaneKind.HIT_CPU], [0, 1], 0b0101),
+        ([LaneKind.HIT_CPU, LaneKind.MISS_CPU], [0, 1], 0b1001),
+        ([LaneKind.MISS_CPU], [1], 0b1000),
+        ([LaneKind.HIT_CPU, LaneKind.HIT_CPU, LaneKind.MISS_CPU, LaneKind.MISS_CPU], [0, 1, 1, 0], 0b1111),
+    ],
+    ids=["hits_on_both", "hit_n0_miss_n1", "miss_n1", "all_four"],
+)
+def test_the_copy_wait_flags_the_cpu_part_of_each_lanes_node(kinds, nodes_of, parts):
+    """Two nodes: a lane's CPU part is 2 * node + (miss). CW collects the bits into ce_mask[2] and CC passes every one
+    on in cpu_lanes[1]. Mutation: CC masking the parts with 0x3 drops node 1's."""
+    lanes, nodes = 8, 2
+    w = lease.wire_layout(lanes, nodes)
+    block = lease.new_lease_block(1, pin=True, wire=w)
+    block[w.copy_done : w.copy_done + 8].view(torch.int64)[0] = 1  # request 1's CopyDone: CW opens the gate itself
+    cuda = dict(device="cuda")
+    count = len(kinds)
+    lane_kind = torch.zeros(w.lanes, dtype=torch.int32, **cuda)
+    lane_kind[:count] = torch.tensor([int(k) for k in kinds], dtype=torch.int32)
+    lane_node = torch.zeros(w.lanes, dtype=torch.int32, **cuda)
+    lane_node[:count] = torch.tensor(nodes_of, dtype=torch.int32)
+    state = torch.zeros(len(ops.STATE_WORDS), dtype=torch.int32, **cuda)
+    state[ops.STATE_WORDS["pending"]] = 1
+    ce_mask = torch.full((3,), -1, dtype=torch.int32, **cuda)
+    cpu_lanes = torch.full((2,), -1, dtype=torch.int32, **cuda)
+    ops._device_module("exl3", lanes, nodes).expert_stream_lease_copy_wait(
+        state, torch.tensor([count], dtype=torch.int32, **cuda), int(block.data_ptr()), lane_kind,
+        torch.arange(w.lanes, dtype=torch.int32, **cuda), lane_node, torch.arange(w.lanes, dtype=torch.int32, **cuda),
+        0, 0, ce_mask, cpu_lanes, 0,
+    )
+    torch.cuda.synchronize()
+    assert ce_mask[2].item() == parts
+    assert cpu_lanes.tolist() == [(1 << count) - 1, parts]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
