@@ -15,6 +15,7 @@
 #include "expert_stream/host/tier_protocol.h"
 #include "row_images.h"
 #include "stack.h"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -758,13 +759,25 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
     {
       std::lock_guard<std::mutex> guard(fake_mutex);
       CHECK(fake_calls.size() == 2);  // one CPU-hit job per group
+      std::vector<int64_t> engines;
       for (const FakeCall& call : fake_calls) {
+        engines.push_back(call.engine);
         const int64_t g = call.engine - 1;
+        std::vector<int32_t> slots = call.slots;
+        std::sort(slots.begin(), slots.end());
+        // Each group's staging slots are the lowest of its range: experts {0, 2} (home 0) land in 0, 1 and {1, 3}
+        // (home 1) in kGroup, kGroup + 1.
         CHECK(g == 0 || g == 1);
-        for (int32_t slot : call.slots)
-          CHECK(slot >= g * kGroup && slot < (g + 1) * kGroup);
+        CHECK(slots == std::vector<int32_t>({int32_t(g * kGroup), int32_t(g * kGroup + 1)}));
       }
+      std::sort(engines.begin(), engines.end());
+      CHECK(engines == std::vector<int64_t>({1, 2}));
     }
+    // Group g's part 0 sits at floats [2 g hidden, (2 g + 1) hidden) of the row: the fake forward wrote
+    // h + x[0] + sum(weight * (slot + 1)) there, 1 * (0 + 1) + 1 * (1 + 1) for group 0 and 1 * 8 + 1 * 9 for group 1.
+    const auto* row0 = reinterpret_cast<const float*>(out.get());
+    CHECK(part0_is(row0, 3.0f));
+    CHECK(part0_is(row0 + 2 * kSelfHidden, 17.0f));
     for (int g = 0; g < 2; ++g)
       CHECK(stack.group_counters(g)[es::kSpinCpu] == placement.groups[g].service);
   }
