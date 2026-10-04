@@ -166,7 +166,7 @@ def test_a_groups_only_host_lane_being_a_cpu_miss_is_waited_for_and_completes_on
         req = sim.post(ROW, [0, 5], captured=True, cpu_on=True, cpu_misses=True, dst=[0, 1], weights=[1.0, 0.5])
         assert req.kinds == [LaneKind.HIT_COPY, LaneKind.MISS_CPU]
         assert host.pump() == 1
-        assert _wait(lambda: host.counters()["copy_jobs"] == 4)  # two from the setup post, one part per group here
+        assert _wait(lambda: host.counters()["copy_jobs"] == 2)  # one part per group
         time.sleep(0.05)
         assert sim.copy_done(req) != req.gen, "CopyDone before group 1's CPU miss finished"
         gate.set()
