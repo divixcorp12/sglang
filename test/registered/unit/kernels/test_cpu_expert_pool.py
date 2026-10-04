@@ -13,7 +13,6 @@ from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuParams, Exl3CpuQu
 from sglang.srt.layers.moe.cpu_experts.policy import (
     format_calibration,
     k_star,
-    parse_core_list,
     split_from_grid,
     split_table,
 )
@@ -63,10 +62,6 @@ def test_split_table_is_k_star_per_n_as_int32():
     assert table.dtype == torch.int32
     # The plan's k*(n) at 12 node-1 threads: 1->1, 2->2, 3->2, 4->3, 6->4.
     assert table.tolist() == [0, 1, 2, 2, 3, 4, 4]
-
-
-def test_parse_core_list():
-    assert parse_core_list("36-38, 40,36") == [36, 37, 38, 40]
 
 
 class FakeTrait:
@@ -390,9 +385,11 @@ class FakeServiceTrait(FakeTrait):
 
 
 class FakeHost:
-    def __init__(self, lanes=8):
-        self.wire = lease.wire_layout(lanes)
+    def __init__(self, lanes=8, nodes=1):
+        self.wire = lease.wire_layout(lanes, nodes)
+        self.nodes = nodes
         self.enabled, self.layers, self.splits = None, {}, []
+        self.enables, self.group_splits = [], []
         self.stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
         self.grid = None  # calibrate_cpu_split's answer; an Exception instance is raised instead
         self.calibrations = []
@@ -400,8 +397,8 @@ class FakeHost:
     def copy_expert_bytes(self, row):
         return 1024
 
-    def calibrate_cpu_split(self, row, *, device, reps, scratch, timeout_s=1.0):
-        self.calibrations.append((row, device, reps, scratch.numel(), str(scratch.device)))
+    def calibrate_cpu_split(self, row, *, device, reps, scratch, timeout_s=1.0, group=0):
+        self.calibrations.append((row, device, reps, scratch.numel(), str(scratch.device), group))
         self.scratch = scratch
         # Calibration's own jobs show in the stats, also those of a calibration that then fails.
         self.stats = {"jobs": 999, "lanes": 999, "forward_ns": 999}
@@ -409,19 +406,23 @@ class FakeHost:
             raise self.grid
         return torch.tensor(self.grid, dtype=torch.float64)
 
-    def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads, engine=0, keep_warm=0, keep_warm_us=0):
+    def enable_cpu_experts(
+        self, forward, split, cores, x_rows, out_rows, *, threads, group=0, engine=0, keep_warm=0, keep_warm_us=0
+    ):
         self.enabled = (
-            forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, engine
+            forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, engine, group
         )
+        self.enables.append((group, forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, engine))
         self.keep_warm = (keep_warm, keep_warm_us)
 
     def set_cpu_layer(self, row, handle):
         self.layers[row] = handle
 
-    def set_cpu_split(self, split):
+    def set_cpu_split(self, split, group=0):
         self.splits.append(list(split))
+        self.group_splits.append((group, list(split)))
 
-    def cpu_stats(self):
+    def cpu_stats(self, group=0):
         return dict(self.stats)
 
 
@@ -441,7 +442,7 @@ def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit()
     host, trait = FakeHost(), FakeServiceTrait()
     svc = _service(host, trait)
     # out_rows is two parts per row: the CPU hits' partial sum and the CPU misses'.
-    assert host.enabled == (0xF00D, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0xE1)
+    assert host.enabled == (0xF00D, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0xE1, 0)
     assert host.layers == {}, "a row reached the grant before its registration"
     svc.register(1, 10.0)
     svc.register(1, 10.0)
@@ -575,7 +576,7 @@ def test_calibration_pushes_the_measured_split_once_and_stops_retuning(capsys):
         split = svc.calibrate(-1)
     assert split == split_from_grid(host.grid)
     assert host.splits == [split] and svc.split == split and svc.calibrated
-    assert host.calibrations == [(0, -1, 3, 8 * 1024, "cpu")]
+    assert host.calibrations == [(0, -1, 3, 8 * 1024, "cpu", 0)]
     assert "CPU experts calibration: row 0" in capsys.readouterr().out
     # The stats baseline is re-taken after calibration's own jobs, and retune no longer changes the split.
     assert svc._last_stats == host.stats
@@ -666,3 +667,23 @@ def test_log_stats_leaves_out_calibrations_jobs(caplog, fails):
     with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
         assert svc.log_stats() == {"jobs": 3, "lanes": 8, "forward_ns": 8 * 500_000}
     assert "3 jobs, 8 lanes, 0.500 ms per lane" in caplog.text
+
+
+def test_cpu_expert_groups_run_one_engine_per_node_and_register_each_layer_once():
+    from sglang.srt.layers.moe.cpu_experts.service import CpuExpertGroups
+    from sglang.srt.layers.moe.cpu_experts.threading_config import NodePlan
+
+    host, trait = FakeHost(nodes=2), FakeServiceTrait()
+    plans = [
+        NodePlan(group=0, node=0, ram=17, cpu=(8, 9), sq=None, busy_poll=True),
+        NodePlan(group=1, node=1, ram=35, cpu=(18, 19, 20), sq=None, busy_poll=True),
+    ]
+    split = [0] * (host.wire.lanes + 1)
+    groups = CpuExpertGroups(host, trait, {r: _fake_slabs() for r in range(2)}, hidden=8, plans=plans, split=split, pin=False)
+    assert [(e[0], e[3], e[6]) for e in host.enables] == [(0, [8, 9], 2), (1, [18, 19, 20], 3)]
+    assert tuple(groups.out_rows.shape) == (2, 4, 8), "two output parts per group"
+    assert groups.services[1].out_rows is groups.services[0].out_rows
+    groups.register(1, 10.0)
+    groups.register(1, 10.0)
+    assert [e for e in trait.events if e[0] == "register"] == [("register", 10.0)], "one kernel layer serves both groups"
+    assert host.layers == {1: 100} and groups.registered(1)

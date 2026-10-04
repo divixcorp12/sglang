@@ -6,6 +6,7 @@ copy to its copy thread at record time. The CPU test backend lands a job's bytes
 so each test can hold a copy in flight and look at what the service has published meanwhile.
 """
 
+import os
 import time
 
 import pytest
@@ -594,3 +595,18 @@ def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
         tier.count("std::memcpy(lease_ + Wire::kLeaseCopyGate") == 1
     )  # init_lease_block, before any thread
     assert "reinterpret_cast<uint32_t*>(lease_ + Wire::kLeaseCopyGate), &expected" in tier
+
+
+def test_the_copy_thread_runs_on_the_cpus_it_is_given(tmp_path):
+    """ThreadingConfig puts the copy thread on the GPU's node; enable_copy_engine's cpus are its affinity."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        cpu = sorted(os.sched_getaffinity(0))[-1]
+        host.enable_copy_engine(-1, cpus=[cpu])
+        tids = [
+            int(tid) for tid in os.listdir("/proc/self/task")
+            if open(f"/proc/self/task/{tid}/comm").read().strip() == "exl3-copy-eng"
+        ]
+        assert len(tids) == 1 and os.sched_getaffinity(tids[0]) == {cpu}
+    finally:
+        host.stop()
