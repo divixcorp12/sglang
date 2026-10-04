@@ -37,7 +37,8 @@ then still crosses the link (tier_sim.ms_per_token does the same). Assumptions:
   queue by score or spare only unrouted entries. ``<base>_promote_N<n>_P<p>`` adds DirectInsertReplay.promote
   (GpuResidencyUpdater._promote on DIRECT decode boundaries, off today) every n decode forwards. Background and
   promoted rows are costed three ways (``split_costs``; promotions amortise over their n forwards).
-  Scores count every route.
+  Scores count every route. ``cpu_insert_p<P>`` / ``_all`` add, to the merged policy, a copy of the head-most P CPU
+  lanes per layer into their own victim slot (tier_sim FILLING), costed as background rows ``b``.
 - Not modeled: the real pinned slot of each row (``cpu_numa_local`` uses the replay's, which starts empty), c_cpu
   inflation under NVMe DMA or copy-engine load (P0 open item), link idle time outside the per-layer CPU slack
   (GPU compute, NVMe waits), which the amortised background cost leaves unused.
@@ -134,6 +135,11 @@ INSERT_POLICIES = {
     # (asc) or last (desc) split[n] job lanes; lane j pairs with usable[j] in the sorted order.
     "cpu_by_score_asc_head": {"choice": "head", "sort": "asc"},
     "cpu_by_score_desc_tail": {"choice": "tail", "sort": "desc"},
+    # The merged policy, and the head-most (highest-scored) P CPU lanes of each layer also copied into their own
+    # victim slot off the critical path (tier_sim FILLING): mapped at the layer's next commit.
+    "cpu_insert_p1": {"choice": "tail", "sort": "desc", "insert_per_layer": 1},
+    "cpu_insert_p2": {"choice": "tail", "sort": "desc", "insert_per_layer": 2},
+    "cpu_insert_all": {"choice": "tail", "sort": "desc", "insert_per_layer": MAX_ROUTES},
     "cpu_numa_local": {"choice": "numa"},
     "cpu_deferred": {"choice": "lane", "queue": "lane"},
     "cpu_deferred_scoreq": {"choice": "lane", "queue": "score"},
@@ -335,6 +341,8 @@ def replay_nm(
                 _cpu_chooser(policy, sim, split, ram_hits, chosen, local, cpu_misses=cpu_misses)
                 if decode and not config.get("insert") else None
             )
+            per_layer = config.get("insert_per_layer", 0)
+            insert_hook = (lambda layer, lanes: lanes[:per_layer]) if decode and per_layer else None
             simulated = sim.graph_forward(
                 forward["routes"],
                 forward["phase"],
@@ -342,6 +350,7 @@ def replay_nm(
                 deferred=pending if defer else None,
                 deferred_unrouted=bool(config.get("unrouted")),
                 lane_order=_lane_sorter(policy, sim),
+                cpu_insert=insert_hook,
             )
             for layer, (missing, wanted) in staged.items():
                 # The copy runs after the forward: its victim is not VRAM-hot as the forward left it, nor routed by it.
@@ -353,7 +362,10 @@ def replay_nm(
             if decode:
                 n_tok.append(n_row)
                 m_tok.append(m_row)
-                b_tok.append([sim.deferred_last.get(layer, 0) + promoted.get(layer, 0) for layer in forward["routes"]])
+                b_tok.append([
+                    sim.deferred_last.get(layer, 0) + promoted.get(layer, 0) + sim.cpu_insert_last.get(layer, 0)
+                    for layer in forward["routes"]
+                ])
                 cpu_tok.append(sum(split[min(n, len(split) - 1)] for n in n_row))
                 kh_row = [sum(e in set(ram_hits[layer]) for e in chosen.get(layer, [])) for layer in forward["routes"]]
                 kh_tok.append(kh_row)
@@ -395,6 +407,9 @@ def replay_nm(
             "deferred_dropped_per_token": sim.deferred_dropped / max(tokens, 1),
             "deferred_evicted_per_token": evicted / max(tokens, 1),
             "promoted_rows_per_token": sim.promoted / max(tokens, 1),
+            "cpu_insert_issued_per_token": sim.cpu_insert_issued / max(tokens, 1),
+            "cpu_insert_rows_per_token": sim.cpu_inserted / max(tokens, 1),
+            "cpu_insert_dropped_per_token": sim.cpu_insert_dropped / max(tokens, 1),
             "unique_routes_per_token": unique_total / max(tokens, 1),
             "ram_inserted_rows_per_token": admitted / max(tokens, 1),
             "ram_capacity_per_row": list(ram_capacity),
