@@ -1,0 +1,178 @@
+"""The RAM tier with two NUMA groups (spec 2026-10-03-numa-node-distributor-design, Part 3 and Testing 3): each
+group serves only its home lanes (expert % 2), stages and evicts only in its own slots, and the combiner merges
+the groups' map deltas into one per record. ChainSim plays the device with the node-aware reference typing."""
+
+import subprocess
+import sys
+import textwrap
+
+import pytest
+import torch
+
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.srt.layers.moe.ram_slot_map import LaneKind
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_chain_sim import ChainSim
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, paused, ram_miss_setup
+
+register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+
+ROW = 1
+EXPERTS = 8
+HALVES = [[(0, 4)] * 2, [(4, 8)] * 2]  # [group][row] -> (lo, hi): node 0 slots 0-3, node 1 slots 4-7
+
+
+def _host(tmp_path, *, ranges=HALVES, capacity=8, staging=2):
+    s = ram_miss_setup(tmp_path, capacity=capacity, experts=EXPERTS)
+    page = new_page(pin=False, wire=wire_layout(8, 2))
+    host = ExpertStreamHost(
+        s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32), variant="instr",
+        node_ranges=ranges,
+    )
+    host.reserve_staging(staging)
+    return s, page, host, ChainSim(host, page, s.slabs)
+
+
+def _serve(sim, host, experts):
+    req = sim.post(ROW, experts)
+    assert host.pump() == 1 and sim.wait_served(req)
+    return req
+
+
+def _lists(staging):
+    return staging[:8], staging[8:]
+
+
+def test_reserve_staging_takes_each_groups_lowest_slots_and_publishes_every_nodes_list(tmp_path):
+    s, page, host, sim = _host(tmp_path)
+    try:
+        tag, staging, entries = sim.delta(ROW)
+        assert (tag, entries) == (1, [])
+        assert _lists(staging) == ([0, 1] + [-1] * 6, [4, 5] + [-1] * 6)
+    finally:
+        host.stop()
+
+
+def test_each_group_serves_only_its_home_lanes(tmp_path):
+    s, page, host, sim = _host(tmp_path)
+    try:
+        _serve(sim, host, [2, 1])
+        mapping = host.mapping(ROW)
+        assert 0 <= mapping[2] < 4 and 4 <= mapping[1] < 8
+        assert host.group_counters(0)["rows_read"] == 1 and host.group_counters(1)["rows_read"] == 1
+    finally:
+        host.stop()
+
+
+def test_misses_homed_on_one_node_publish_one_delta_with_the_other_nodes_list_unchanged(tmp_path):
+    """Review Focus 1, host side: only group 1 reports, and the delta it writes carries node 0's list as reserved."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        req = _serve(sim, host, [1, 3])
+        tag, staging, entries = sim.delta(ROW)
+        assert tag == req.chain == 2
+        assert _lists(staging) == ([0, 1] + [-1] * 6, [6, 7] + [-1] * 6)
+        assert entries == [(1, 4), (3, 5)]
+    finally:
+        host.stop()
+
+
+def test_both_nodes_missing_in_one_record_yield_exactly_one_merged_delta(tmp_path):
+    s, page, host, sim = _host(tmp_path)
+    try:
+        req = _serve(sim, host, [2, 1])
+        tag, staging, entries = sim.delta(ROW)
+        assert tag == req.chain == 2, "one delta per record, not one per group"
+        assert _lists(staging) == ([2, 1] + [-1] * 6, [6, 5] + [-1] * 6)
+        assert entries == [(2, 0), (1, 4)], "node 0's entries, then node 1's"
+        _serve(sim, host, [2, 1])  # both hits now: the next post applied the merged delta
+        assert host.mapping(ROW)[2] == 0 and host.mapping(ROW)[1] == 4
+    finally:
+        host.stop()
+
+
+def test_victims_come_only_from_the_groups_range(tmp_path):
+    s, page, host, sim = _host(tmp_path, staging=1)
+    try:
+        for expert in (0, 2, 4, 1, 3, 5):  # fills both ranges: three mapped rows and one staging slot each
+            _serve(sim, host, [expert])
+        _serve(sim, host, [7])
+        mapping = host.mapping(ROW)
+        assert mapping[1] == -1, "node 1's LRU row is the victim"
+        assert all(0 <= mapping[e] < 4 for e in (0, 2, 4)), "node 0 lost nothing"
+        assert 4 <= mapping[7] < 8
+        _serve(sim, host, [6])
+        assert host.mapping(ROW)[0] == -1 and 0 <= host.mapping(ROW)[6] < 4
+    finally:
+        host.stop()
+
+
+def test_no_slot_outside_a_groups_range_is_ever_staged_or_taken(tmp_path):
+    """Review Focus 5: slot 4 straddles the seam and belongs to no group. Forty random records of hits and misses on
+    both nodes never stage it, map it or evict into it."""
+    import random
+
+    rng = random.Random(4)
+    s, page, host, sim = _host(tmp_path, ranges=[[(0, 4)] * 2, [(5, 9)] * 2], capacity=9)
+    try:
+        for _ in range(40):
+            experts = rng.sample(range(EXPERTS), rng.randint(1, 2))
+            _serve(sim, host, experts)
+            assert 4 not in sim.staging(ROW)
+            state, expert, _ = host.slot_info(ROW)[4]
+            assert (state, expert) == (0, -1)
+        assert 4 not in host.mapping(ROW)
+    finally:
+        host.stop()
+
+
+def test_every_group_parks_for_a_pause_and_serves_after_it(tmp_path):
+    s, page, host, sim = _host(tmp_path)
+    try:
+        host.start_thread(fatal_wait_s=60.0)
+        req = sim.post(ROW, [2, 1])
+        assert sim.wait_served(req, timeout_s=5.0)
+        with paused(host):
+            assert [state for state, _, _ in host.slot_info(ROW)].count(2) == 2
+        req = sim.post(ROW, [4, 3])
+        assert sim.wait_served(req, timeout_s=5.0)
+        assert sim.wait_handled(req)
+    finally:
+        host.stop()
+
+
+def test_ranges_that_overlap_or_leave_the_row_are_refused(tmp_path):
+    s = ram_miss_setup(tmp_path, capacity=8, experts=EXPERTS)
+    page = new_page(pin=False, wire=wire_layout(8, 2))
+    for ranges, match in [([[(0, 5)] * 2, [(4, 8)] * 2], "overlap"), ([[(0, 4)] * 2, [(4, 9)] * 2], "outside")]:
+        with pytest.raises(ValueError, match=match):
+            ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, EXPERTS), -1, dtype=torch.int32),
+                             variant="instr", node_ranges=ranges)
+
+
+_SCRIPT = """
+import pathlib, sys, torch
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
+from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
+from sglang.srt.layers.moe.ram_slot_map import LaneKind
+from sglang.test.dsv41_chain_sim import ChainSim
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
+s = ram_miss_setup(pathlib.Path(sys.argv[1]), capacity=8, experts=8)
+page = new_page(pin=False, wire=wire_layout(8, 2))
+host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 8), -1, dtype=torch.int32), variant="instr",
+                        node_ranges=[[(0, 4)] * 2, [(4, 8)] * 2])
+host.reserve_staging(2)
+sim = ChainSim(host, page, s.slabs)
+"""
+
+
+def test_a_miss_on_another_nodes_staging_slot_fail_stops(tmp_path):
+    """A device that put node 1's miss in node 0's staging slot 0 would have it read into node 0's memory: group 1
+    checks its own list and fail-stops. A row-wide list would accept slot 0 (mutant: red)."""
+    body = "sim.post(1, [1], kinds=[LaneKind.MISS_GPU], slots=[0])\nhost.pump()\nprint('reached')\n"
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_SCRIPT) + body, str(tmp_path)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert_aborted(result, "is not a staging slot")
