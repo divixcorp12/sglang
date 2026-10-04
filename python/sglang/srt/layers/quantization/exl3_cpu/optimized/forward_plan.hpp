@@ -1,5 +1,5 @@
-// Included by moe_mul1.cpp inside its anonymous namespace, after the phase helpers (prepare_rows, run_tiles,
-// transform_out, middle_blocks, prepare_gu_blocks, transform_owned_blocks, assign_gemvs) and ForwardCtx.
+// Included by moe_mul1.cpp inside sglang::exl3_cpu's anonymous namespace, after the phase helpers (prepare_rows,
+// run_tiles, transform_out, middle_blocks, prepare_gu_blocks, transform_owned_blocks, assign_gemvs) and ForwardCtx.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is
 // the ISA tier. The primary template is the generic plan. PlanTraits<Dsv41Shape, Isa::Bw> turns on the fast path that
@@ -148,30 +148,19 @@ private:
         }
     }
 
+    // The phases on cpu_experts_common's pinned team (team.hpp's run_team), which throws when the team is short or a
+    // worker cannot be pinned.
     template <class Experts>
     static void run_team(ForwardCtx& ctx, const Experts& E, int count, bool grouped, bool wide)
     {
-        freeze_compute_cores();
-        TORCH_CHECK(g_compute_cores.empty() || size_t(count)<=g_compute_cores.size(),
-                    "CPU expert worker count exceeds configured cores");
         [[maybe_unused]] double phase_us[6]{};
-        std::atomic<int> pin_error{0};
-        std::atomic<int> actual_workers{0};
-        #pragma omp parallel num_threads(count) shared(ctx, pin_error, actual_workers, phase_us)
-        {
-            const int worker = omp_get_thread_num(), n = omp_get_num_threads();
-            if (worker == 0) actual_workers.store(n, std::memory_order_relaxed);
-            pin_compute_worker(worker, pin_error);
-            if (n == count) {
-                step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us);
-                step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us);
-                step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us);
-                step<Phase::Down>(ctx, E, worker, n, grouped, wide, phase_us);
-                step<Phase::Accumulate>(ctx, E, worker, n, grouped, wide, phase_us);
-            }
-        }
-        TORCH_CHECK(!pin_error.load(), "cannot pin CPU expert worker to its configured core");
-        TORCH_CHECK(actual_workers.load() == count, "OpenMP returned fewer CPU expert workers than requested");
+        ::sglang::cpu_experts::run_team(count, [&](int worker, int n) {
+            step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us);
+            step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us);
+            step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us);
+            step<Phase::Down>(ctx, E, worker, n, grouped, wide, phase_us);
+            step<Phase::Accumulate>(ctx, E, worker, n, grouped, wide, phase_us);
+        });
         if constexpr (Profile)
             printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",
                    phase_us[0], phase_us[1], phase_us[2], phase_us[3], phase_us[4], phase_us[5]);

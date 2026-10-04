@@ -1,4 +1,4 @@
-// Included by moe_mul1.cpp inside its anonymous namespace, after struct Chunk and experts.hpp.
+// Included by moe_mul1.cpp inside sglang::exl3_cpu's anonymous namespace, after struct Chunk and quant.hpp.
 //
 // The shapes a forward plan can be specialized for. A plan reads every layer fact through its Shape: GenericShape takes
 // each from the layer's LayerInfo; Dsv41Shape fixes DeepSeek V4.1's routed expert at compile time: hidden 5120,

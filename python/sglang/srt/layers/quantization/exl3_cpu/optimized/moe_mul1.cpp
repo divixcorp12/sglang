@@ -9,6 +9,8 @@
 #error This CPU expert implementation requires Linux and OpenMP.
 #endif
 #include "moe_mul1.h"
+#include "quant.hpp"
+#include "../../cpu_experts_common/cabi.hpp"
 #include <c10/util/Half.h>
 #include <ATen/ATen.h>
 #include <omp.h>
@@ -67,7 +69,9 @@
 // Kept for upstream's bindings. Phase timing is compile-time here (ForwardPlan's Profile, forward_plan.hpp).
 void exl3_moe_cpu_set_prof(bool) {}
 
+namespace sglang::exl3_cpu {
 namespace {
+using namespace ::sglang::cpu_experts;
 
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
 constexpr float HAD_SCALE = 0.088388347648f;
@@ -211,13 +215,11 @@ inline float decode_mul1_scalar(uint16_t state)
 //   ISA dispatch
 // -------------------------------------------------------------------------------------------
 
-// Declared early: the transforms below select on it. Vbmi = Vnni + AVX512-VBMI (Zen4+, Ice
+// Isa and kAvx512 are cpu_experts_common/isa.hpp's. Vbmi = Vnni + AVX512-VBMI (Zen4+, Ice
 // Lake+); kept as a separate tier because Cascade/Cooper Lake have VNNI without VBMI. Bw =
 // AVX-512F/BW/VL without VNNI (Skylake-SP/X): the dword kernel with the AVX2-style accumulate.
-enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
-extern const Isa g_isa;
-// The forward is instantiated per tier; g_isa picks the instantiation once per call (forward_raw).
-template <Isa I> constexpr bool kAvx512 = I == Isa::Bw || I == Isa::Vnni || I == Isa::Vbmi;
+// The forward is instantiated per tier; ExpertForward's detected tier picks the instantiation once per call
+// (Exl3Quant::dispatch).
 
 // -------------------------------------------------------------------------------------------
 //   Transforms
@@ -1712,76 +1714,6 @@ void scalar_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, in
 //   Dispatch
 // -------------------------------------------------------------------------------------------
 
-Isa detect_isa()
-{
-    Isa hw;
-#if defined(__GNUC__) && defined(__linux__)
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("fma"))
-    {
-        if (__builtin_cpu_supports("avx512vnni"))
-            hw = __builtin_cpu_supports("avx512vbmi") ? Isa::Vbmi : Isa::Vnni;
-        else
-            hw = Isa::Bw;
-    }
-    else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
-        hw = Isa::Avx2;
-    else
-        hw = Isa::Scalar;
-#else
-    // __builtin_cpu_supports checks OS state-saving internally; this branch must do it by hand:
-    // CPUID feature bits report hardware capability only, so without OSXSAVE + XCR0 checks a
-    // hypervisor/OS that doesn't context-switch YMM/ZMM state would pass detection and fault at
-    // the first vector instruction. FMA (leaf 1) mirrors the Linux branch's avx2+fma gate.
-    int l0[4];
-    __cpuid(l0, 0);
-    if (l0[0] < 7)
-    {
-        hw = Isa::Scalar;
-    }
-    else
-    {
-        int l1[4];
-        __cpuid(l1, 1);
-        const bool osxsave = (l1[2] & (1u << 27)) != 0;
-        const bool fma = (l1[2] & (1u << 12)) != 0;
-        const uint64_t xcr0 = osxsave ? _xgetbv(0) : 0;
-        const bool ymm_os = (xcr0 & 0x06) == 0x06;          // XMM + YMM state
-        const bool zmm_os = (xcr0 & 0xe6) == 0xe6;          // + opmask, ZMM_Hi256, Hi16_ZMM
-        int info[4];
-        __cpuidex(info, 7, 0);
-        const bool avx512 = (info[1] & (1u << 16)) && (info[1] & (1u << 30)) && (info[1] & (1u << 31));
-        const bool vnni = (info[2] & (1u << 11)) != 0;
-        const bool vbmi = (info[2] & (1u << 1)) != 0;
-        const bool avx2 = (info[1] & (1u << 5)) != 0;
-        hw = (avx512 && fma && zmm_os) ? (vnni ? (vbmi ? Isa::Vbmi : Isa::Vnni) : Isa::Bw)
-           : (avx2 && fma && ymm_os)    ? Isa::Avx2
-           :                              Isa::Scalar;
-    }
-#endif
-
-    // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|bw|vnni|vbmi: cap detection at a lower tier for testing
-    // (e.g. exercising the AVX2 path on AVX512-VNNI hardware, or the dword scheme on VBMI
-    // hardware). Never upgrades past what the CPU actually supports; an unrecognized value is
-    // ignored.
-    if (const char* e = std::getenv("EXL3_MOE_CPU_MAX_ISA"))
-    {
-        std::string s(e);
-        for (char& c : s) c = (char) std::tolower((unsigned char) c);
-        Isa cap;
-        if (s == "scalar") cap = Isa::Scalar;
-        else if (s == "avx2") cap = Isa::Avx2;
-        else if (s == "bw" || s == "avx512bw") cap = Isa::Bw;
-        else if (s == "vnni" || s == "avx512") cap = Isa::Vnni;
-        else if (s == "vbmi") cap = Isa::Vbmi;
-        else return hw;
-        if (cap < hw) hw = cap;
-    }
-    return hw;
-}
-
-const Isa g_isa = []{ return detect_isa(); }();
-
 template <Isa I>
 void run_tiles_raw(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
@@ -2100,40 +2032,6 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
     }
 }
 
-// Worker cores set by sglang_exl3_cpu_experts_set_cores; copied into g_compute_cores at the first forward.
-std::mutex g_cores_mutex;
-std::vector<int> g_configured_cores;
-std::atomic<bool> g_compute_started{false};
-std::vector<int> g_compute_cores; // Immutable after release publication at first forward.
-
-// Freezes the configured cores into g_compute_cores once, at the first forward or keep-warm. Steady-state calls
-// acquire no pool mutex.
-inline void freeze_compute_cores()
-{
-    if (g_compute_started.load(std::memory_order_acquire)) return;
-    std::lock_guard<std::mutex> lock(g_cores_mutex);
-    if (!g_compute_started.load(std::memory_order_relaxed)) {
-        g_compute_cores = g_configured_cores;
-        g_compute_started.store(true, std::memory_order_release);
-    }
-}
-
-// Inside a parallel region: pins OpenMP worker `worker` to its compute core (none configured: no-op), setting
-// pin_error if it cannot.
-inline void pin_compute_worker(int worker, std::atomic<int>& pin_error)
-{
-    if (g_compute_cores.empty()) return;
-    const int core = g_compute_cores[worker];
-    static thread_local int pinned_core = -1;
-    if (pinned_core != core || sched_getcpu() != core) {
-        cpu_set_t set; CPU_ZERO(&set); CPU_SET(core, &set);
-        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set))
-            pin_error.store(1, std::memory_order_relaxed);
-        else pinned_core = core;
-    }
-}
-
-
 // -------------------------------------------------------------------------------------------
 //   Forward driver
 // -------------------------------------------------------------------------------------------
@@ -2146,23 +2044,7 @@ struct Chunk
     float weight[MAX_M];
 };
 
-#include "experts.hpp"
 #include "shapes.hpp"
-
-// -------------------------------------------------------------------------------------------
-//   MoE Layer registry
-// -------------------------------------------------------------------------------------------
-
-// A registered layer: make_layer's per-expert tables, or the slab registration's view (table == nullptr).
-struct RegisteredLayer
-{
-    LayerInfo info;
-    std::unique_ptr<MoeCpuLayer> table;
-    StridedExperts<GenericShape> strided{};
-};
-
-std::vector<std::unique_ptr<RegisteredLayer>> g_layers;
-std::mutex g_layers_mutex;
 
 struct ForwardCtx
 {
@@ -2380,16 +2262,16 @@ void transform_owned_blocks(const MoeCpuMatrix& mat,float* out,int m,int t0,int 
 // and all middle blocks must be prepared before any down output band can run.
 #include "forward_plan.hpp"
 
-// Runs the call's plan. E reads the layer's experts under the generic plan; D reads the same experts under the
-// DSV4.1 plan's assumptions (for a strided layer, the compile-time-shaped view of the same slabs).
+// Runs the call's plan at tier `isa`. E reads the layer's experts under the generic plan; D reads the same experts
+// under the DSV4.1 plan's assumptions (for a strided layer, the compile-time-shaped view of the same slabs).
 template <class Experts, class Dsv41Experts>
-void run_plan(ForwardCtx& ctx, const Experts& E, const Dsv41Experts& D, ForwardArena& ar, int threads)
+void run_plan(ForwardCtx& ctx, const Experts& E, const Dsv41Experts& D, ForwardArena& ar, int threads, Isa isa)
 {
-    if (g_isa == Isa::Bw && Dsv41Shape::accepts(ctx.info, E, ctx.chunks)) {
+    if (isa == Isa::Bw && Dsv41Shape::accepts(ctx.info, E, ctx.chunks)) {
         ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, D, ar, threads);
         return;
     }
-    switch (g_isa) {
+    switch (isa) {
         case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, threads); return;
         case Isa::Avx2:   ForwardPlan<GenericShape, Isa::Avx2>::run(ctx, E, ar, threads); return;
         case Isa::Bw:     ForwardPlan<GenericShape, Isa::Bw>::run(ctx, E, ar, threads); return;
@@ -2398,13 +2280,102 @@ void run_plan(ForwardCtx& ctx, const Experts& E, const Dsv41Experts& D, ForwardA
     }
 }
 
+// The plan entry: groups the routes by expert and splits them into chunks of CHUNK_M rows. This grouping, not the
+// framework's RouteTable, fixes EXL3's accumulation order, so it reads the call's slots and FP16 weights as given.
+void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, const int32_t* sel, const at::Half* wts,
+                 float* out, int rows, int topk, int threads, bool accumulate)
+{
+    const LayerInfo& info = layer.info;
+    const int m_total = rows;
+    const int top_k = topk;
 
+    ForwardCtx ctx;
+    ctx.info = info;
+    ctx.x = x;
+    ctx.out = out;
+    ctx.m_total = m_total;
+    if (!accumulate) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * info.hidden * sizeof(float));
 
-// The forward's OpenMP team for tier I: pins worker i to the configured core i, runs the phases with a barrier after
-// each, and checks the team. Phase 4 (the whole-row down transform) is folded into phase 3's owned blocks.
+    ForwardArena& ar = ForwardArena::get();
+    ctx.chunks = std::move(ar.chunks);
+    ctx.chunks.clear();
+    ctx.prep_g = std::move(ar.prep_g); ctx.prep_u = std::move(ar.prep_u); ctx.prep_d = std::move(ar.prep_d);
+    const auto give_back = [&] {
+        ar.chunks = std::move(ctx.chunks);
+        ar.prep_g = std::move(ctx.prep_g); ar.prep_u = std::move(ctx.prep_u); ar.prep_d = std::move(ctx.prep_d);
+    };
 
+    // Group token assignments by expert, then split into chunks of CHUNK_M rows
+    auto& per_expert = ar.per_expert;
+    if (per_expert.size() < static_cast<size_t>(info.num_experts)) per_expert.resize(info.num_experts);
+    for (int t = 0; t < m_total; ++t)
+        for (int j = 0; j < top_k; ++j)
+        {
+            const int32_t e = sel[static_cast<size_t>(t) * top_k + j];
+            if (e >= 0 && e < info.num_experts)
+                per_expert[e].emplace_back(t, half_to_float(wts[static_cast<size_t>(t) * top_k + j]));
+        }
+    for (int e = 0; e < info.num_experts; ++e)
+    {
+        auto& lst = per_expert[e];
+        for (size_t i = 0; i < lst.size(); i += CHUNK_M)
+        {
+            Chunk ch;
+            ch.expert = e;
+            ch.m = static_cast<int>(std::min<size_t>(CHUNK_M, lst.size() - i));
+            for (int r = 0; r < ch.m; ++r)
+            {
+                ch.token[r] = lst[i + r].first;
+                ch.weight[r] = lst[i + r].second;
+            }
+            ctx.chunks.push_back(ch);
+        }
+        lst.clear();
+    }
+    const int nc = static_cast<int>(ctx.chunks.size());
+    if (!nc) { give_back(); return; }
 
-} // namespace
+    if (layer.table) {
+        const TableExperts t{layer.table.get()};
+        run_plan(ctx, t, t, ar, threads, isa);
+    } else {
+        const StridedExperts<GenericShape> s{&layer};
+        run_plan(ctx, s, s.as<Dsv41Shape>(), ar, threads, isa);
+    }
+    give_back();
+}
+
+// ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range); the
+// weights are converted to FP16, the registered kernel's convention.
+int Exl3Quant::dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable&, Isa isa)
+{
+    static thread_local std::vector<at::Half> wts;
+    const size_t n = static_cast<size_t>(c.rows) * c.k;
+    wts.resize(n);
+    for (size_t i = 0; i < n; ++i) wts[i] = at::Half(c.weights[i]);
+    run_forward(l, isa, static_cast<const at::Half*>(c.x), c.slots, wts.data(), c.out, c.rows, c.k, c.threads,
+                c.accumulate != 0);
+    return 0;
+}
+
+}  // namespace
+}  // namespace sglang::exl3_cpu
+
+SGLANG_CPU_EXPERTS_DEFINE_CABI(exl3, ::sglang::exl3_cpu::Exl3Quant)
+
+namespace {
+using ::sglang::exl3_cpu::Exl3Quant;
+using Exl3Forward = ::sglang::cpu_experts::ExpertForward<Exl3Quant>;
+
+// A nonzero ExpertForward status as a torch error.
+void check_status(int status, const char* what)
+{
+    TORCH_CHECK(status != 2, what, ": invalid arguments (status 2: an unknown or freed handle, a slot outside the "
+                "layer, a non-finite weight, or rows/k/threads out of range)");
+    TORCH_CHECK(status != 3, what, ": another forward or free is running (status 3)");
+    TORCH_CHECK(status == 0, what, ": kernel error (status ", status, ")");
+}
+}  // namespace
 
 // -------------------------------------------------------------------------------------------
 //   Upstream link compatibility
@@ -2426,10 +2397,10 @@ int64_t exl3_moe_cpu_pool_stress(int, int, int, int)
     return 0;
 }
 
-bool exl3_moe_cpu_has_avx2() { return g_isa != Isa::Scalar; }
-bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
-bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
-bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
+bool exl3_moe_cpu_has_avx2() { return Exl3Forward::isa() != ::sglang::cpu_experts::Isa::Scalar; }
+bool exl3_moe_cpu_has_avx512_bw() { return Exl3Forward::isa() >= ::sglang::cpu_experts::Isa::Bw; }
+bool exl3_moe_cpu_has_avx512_vnni() { return Exl3Forward::isa() >= ::sglang::cpu_experts::Isa::Vnni; }
+bool exl3_moe_cpu_has_avx512_vbmi() { return Exl3Forward::isa() == ::sglang::cpu_experts::Isa::Vbmi; }
 
 static MoeCpuMatrix make_matrix
 (
@@ -2513,105 +2484,25 @@ int64_t exl3_moe_cpu_make_layer
     TORCH_CHECK(table->downs[0].k == table->interm_size && table->downs[0].n == table->hidden_size,
                 "expert shape mismatch");
 
-    auto entry = std::make_unique<RegisteredLayer>();
-    entry->info = {table->num_experts, table->hidden_size, table->interm_size, !table->gates.empty(),
-                   table->activation, table->act_limit};
-    entry->table = std::move(table);
-    std::lock_guard<std::mutex> lock(g_layers_mutex);
-    g_layers.push_back(std::move(entry));
-    return static_cast<int64_t>(g_layers.size() - 1);
+    // A table layer: ExpertForward refuses a slot at or past its expert count, as it does a slab layer's capacity.
+    const ::sglang::exl3_cpu::LayerInfo info{table->num_experts, table->hidden_size, table->interm_size,
+                                             !table->gates.empty(), table->activation, table->act_limit};
+    Exl3Quant::Layer layer{info, {}, 0, 0, std::move(table)};
+    layer.rows.capacity = info.num_experts;
+    auto entry = std::make_shared<const Exl3Quant::Layer>(std::move(layer));
+    std::lock_guard<std::mutex> lock(Exl3Forward::registry_mutex);
+    Exl3Forward::layers.push_back(std::move(entry));
+    return static_cast<int64_t>(Exl3Forward::layers.size() - 1);
 }
 
 void exl3_moe_cpu_free_layer(int64_t handle)
 {
-    std::lock_guard<std::mutex> lock(g_layers_mutex);
-    if (handle >= 0 && handle < static_cast<int64_t>(g_layers.size()))
-    {
-        g_layers[handle].reset();
-    }
+    const int status = Exl3Forward::free_layer(handle);
+    if (status == 2) return;  // an unknown or already freed handle: a no-op, as upstream's free is
+    check_status(status, "exl3_moe_cpu_free_layer");
 }
 
-static const RegisteredLayer& get_layer(int64_t handle)
-{
-    std::lock_guard<std::mutex> lock(g_layers_mutex);
-    TORCH_CHECK(handle >= 0 && handle < static_cast<int64_t>(g_layers.size()) && g_layers[handle], "invalid CPU MoE layer handle");
-    return *g_layers[handle];
-}
-
-// exl3_moe_cpu_forward_raw, adding into out when `accumulate`: the sglang C ABI's forward. Other units of the
-// extension are built against upstream's header, so the public signature stays as upstream declares it.
-static void forward_raw(
-    int64_t handle,
-    const at::Half* x,
-    const int32_t* sel,
-    const at::Half* wts,
-    float* out,
-    int rows,
-    int topk,
-    int threads,
-    bool accumulate
-)
-{
-    const RegisteredLayer& layer = get_layer(handle);
-    const LayerInfo& info = layer.info;
-    const int m_total = rows;
-    const int top_k = topk;
-
-    ForwardCtx ctx;
-    ctx.info = info;
-    ctx.x = x;
-    ctx.out = out;
-    ctx.m_total = m_total;
-    if (!accumulate) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * info.hidden * sizeof(float));
-
-    ForwardArena& ar = ForwardArena::get();
-    ctx.chunks = std::move(ar.chunks);
-    ctx.chunks.clear();
-    ctx.prep_g = std::move(ar.prep_g); ctx.prep_u = std::move(ar.prep_u); ctx.prep_d = std::move(ar.prep_d);
-    const auto give_back = [&] {
-        ar.chunks = std::move(ctx.chunks);
-        ar.prep_g = std::move(ctx.prep_g); ar.prep_u = std::move(ctx.prep_u); ar.prep_d = std::move(ctx.prep_d);
-    };
-
-    // Group token assignments by expert, then split into chunks of CHUNK_M rows
-    auto& per_expert = ar.per_expert;
-    if (per_expert.size() < static_cast<size_t>(info.num_experts)) per_expert.resize(info.num_experts);
-    for (int t = 0; t < m_total; ++t)
-        for (int j = 0; j < top_k; ++j)
-        {
-            const int32_t e = sel[static_cast<size_t>(t) * top_k + j];
-            if (e >= 0 && e < info.num_experts)
-                per_expert[e].emplace_back(t, half_to_float(wts[static_cast<size_t>(t) * top_k + j]));
-        }
-    for (int e = 0; e < info.num_experts; ++e)
-    {
-        auto& lst = per_expert[e];
-        for (size_t i = 0; i < lst.size(); i += CHUNK_M)
-        {
-            Chunk ch;
-            ch.expert = e;
-            ch.m = static_cast<int>(std::min<size_t>(CHUNK_M, lst.size() - i));
-            for (int r = 0; r < ch.m; ++r)
-            {
-                ch.token[r] = lst[i + r].first;
-                ch.weight[r] = lst[i + r].second;
-            }
-            ctx.chunks.push_back(ch);
-        }
-        lst.clear();
-    }
-    const int nc = static_cast<int>(ctx.chunks.size());
-    if (!nc) { give_back(); return; }
-
-    if (layer.table) {
-        const TableExperts t{layer.table.get()};
-        run_plan(ctx, t, t, ar, threads);
-    } else {
-        run_plan(ctx, layer.strided, layer.strided.as<Dsv41Shape>(), ar, threads);
-    }
-    give_back();
-}
-
+// The C ABI's forward with accumulate 0: the FP16 weights widen to FP32 exactly and the kernel narrows them back.
 void exl3_moe_cpu_forward_raw(
     int64_t handle,
     const at::Half* x,
@@ -2623,7 +2514,23 @@ void exl3_moe_cpu_forward_raw(
     int threads
 )
 {
-    forward_raw(handle, x, sel, wts, out, rows, topk, threads, false);
+    if (rows == 0) return;  // upstream's forward of no tokens is a no-op; the C ABI refuses rows < 1
+    static thread_local std::vector<float> weights;
+    const size_t n = static_cast<size_t>(rows) * topk;
+    weights.resize(n);
+    for (size_t i = 0; i < n; ++i) weights[i] = static_cast<float>(wts[i]);
+    SglangCpuExpertsForward call{};
+    call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
+    call.rows = rows;
+    call.layer = handle;
+    call.x = x;
+    call.slots = sel;
+    call.weights = weights.data();
+    call.out = out;
+    call.k = topk;
+    call.threads = std::max(threads, 1);  // upstream's forward ran fewer than one thread as one
+    call.accumulate = 0;
+    check_status(Exl3Forward::forward(&call), "exl3_moe_cpu_forward");
 }
 
 void exl3_moe_cpu_forward
@@ -2665,157 +2572,4 @@ void exl3_moe_cpu_forward
         m_total, top_k,
         static_cast<int>(num_threads)
     );
-}
-
-// C ABI consumed by expert_stream/host/cpu_experts.h.
-// expert_stream/host/cpu_experts.h calls these through addresses Exl3CpuQuantTrait resolves with dlsym, so the
-// service module links nothing of this one. Neither throws across the boundary.
-
-// CpuExpertForward: call->rows token rows (x fp16 [rows][hidden]) through each row's experts, into out
-// (fp32 [rows][hidden]): overwritten, or added to when `accumulate` is nonzero. The calling thread is worker 0.
-extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_forward(
-    const SglangCpuExpertsForward* call) noexcept
-{
-    if (!call || call->abi_version != SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION) return 2;
-    const SglangCpuExpertsForward& c = *call;
-    if (c.rows < 1 || c.k < 0 || c.k > 32 || !c.x || !c.out || c.threads < 1 || (c.k && (!c.slots || !c.weights)))
-        return 2;
-    try
-    {
-        static thread_local std::vector<at::Half> wts;
-        const size_t n = static_cast<size_t>(c.rows) * c.k;
-        wts.resize(n);
-        for (size_t i = 0; i < n; ++i) wts[i] = at::Half(c.weights[i]);
-        forward_raw(c.layer, static_cast<const at::Half*>(c.x), c.slots, wts.data(), c.out, c.rows, c.k, c.threads,
-                    c.accumulate != 0);
-        return 0;
-    }
-    catch (...)
-    {
-        return 1;
-    }
-}
-
-// Register-only work at the forward's vector width: the GEMV inner loop's vpmaddwd/vpaddd chains, so the core holds
-// the license the forward runs at. Polls the word every 16 iterations and the clock every 1024 (the deadline is the
-// engine's CLOCK_MONOTONIC, which libstdc++'s steady_clock reads).
-namespace {
-inline bool keep_warm_done(const uint32_t* word, uint32_t seen, int64_t deadline_ns, uint32_t tick)
-{
-    if (__atomic_load_n(word, __ATOMIC_ACQUIRE) != seen) return true;
-    return (tick & 63) == 0 &&
-           std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch()).count() >= deadline_ns;
-}
-M1_TARGET_BW __attribute__((noinline)) int32_t keep_warm_bw(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
-{
-    __m512i a = _mm512_set1_epi16(3), b = _mm512_set1_epi16(5), c0 = _mm512_setzero_si512(), c1 = c0, c2 = c0, c3 = c0;
-    for (uint32_t tick = 0; !keep_warm_done(word, seen, deadline_ns, tick); ++tick)
-        for (int i = 0; i < 16; ++i) {
-            c0 = _mm512_add_epi32(c0, _mm512_madd_epi16(a, b));
-            c1 = _mm512_add_epi32(c1, _mm512_madd_epi16(b, a));
-            c2 = _mm512_add_epi32(c2, _mm512_madd_epi16(a, a));
-            c3 = _mm512_add_epi32(c3, _mm512_madd_epi16(b, b));
-            a = _mm512_xor_si512(a, c3);
-        }
-    return _mm512_reduce_add_epi32(_mm512_add_epi32(_mm512_add_epi32(c0, c1), _mm512_add_epi32(c2, a)));
-}
-M1_TARGET_AVX2 __attribute__((noinline)) int32_t keep_warm_avx2(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
-{
-    __m256i a = _mm256_set1_epi16(3), b = _mm256_set1_epi16(5), c0 = _mm256_setzero_si256(), c1 = c0, c2 = c0, c3 = c0;
-    for (uint32_t tick = 0; !keep_warm_done(word, seen, deadline_ns, tick); ++tick)
-        for (int i = 0; i < 16; ++i) {
-            c0 = _mm256_add_epi32(c0, _mm256_madd_epi16(a, b));
-            c1 = _mm256_add_epi32(c1, _mm256_madd_epi16(b, a));
-            c2 = _mm256_add_epi32(c2, _mm256_madd_epi16(a, a));
-            c3 = _mm256_add_epi32(c3, _mm256_madd_epi16(b, b));
-            a = _mm256_xor_si256(a, c3);
-        }
-    const __m256i t = _mm256_add_epi32(_mm256_add_epi32(c0, c1), _mm256_add_epi32(c2, a));
-    return _mm256_extract_epi32(t, 0) + _mm256_extract_epi32(t, 7);
-}
-int32_t keep_warm_scalar(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
-{
-    for (uint32_t tick = 0; !keep_warm_done(word, seen, deadline_ns, tick); ++tick) _mm_pause();
-    return 0;
-}
-std::atomic<int32_t> g_keep_warm_sink{0};
-}  // namespace
-
-// CpuExpertKeepWarm: holds `threads` workers (the caller as worker 0, each pinned as the forward pins it) in
-// register-only work of the forward's ISA until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Returns 0, 1 on
-// a kernel error, 2 on invalid arguments.
-extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_keep_warm(
-    int32_t threads, const uint32_t* word, uint32_t seen, int64_t deadline_ns) noexcept
-{
-    if (threads < 1 || word == nullptr) return 2;
-    try
-    {
-        freeze_compute_cores();
-        if (!g_compute_cores.empty() && size_t(threads) > g_compute_cores.size()) return 2;
-        std::atomic<int> pin_error{0};
-        #pragma omp parallel num_threads(threads)
-        {
-            pin_compute_worker(omp_get_thread_num(), pin_error);
-            const int32_t r = g_isa == Isa::Scalar ? keep_warm_scalar(word, seen, deadline_ns)
-                              : g_isa == Isa::Avx2 ? keep_warm_avx2(word, seen, deadline_ns)
-                                                   : keep_warm_bw(word, seen, deadline_ns);
-            g_keep_warm_sink.fetch_add(r, std::memory_order_relaxed);
-        }
-        return pin_error.load(std::memory_order_relaxed) ? 1 : 0;
-    }
-    catch (...)
-    {
-        return 1;
-    }
-}
-
-// Configure worker i on cores[i], with the calling thread as worker 0. Refuse
-// reconfiguration after the first forward.
-extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_set_cores(const int32_t* cores, int32_t n)
-    noexcept
-{
-    if (n < 1 || n > CPU_SETSIZE || cores==nullptr) return 2;
-    for(int i=0;i<n;++i) {
-        if(cores[i]<0 || cores[i]>=CPU_SETSIZE)return 2;
-        for(int j=0;j<i;++j)if(cores[i]==cores[j])return 2;
-    }
-    try {
-        std::lock_guard<std::mutex> lock(g_cores_mutex);
-        if (g_compute_started.load(std::memory_order_relaxed)) return 1;
-        g_configured_cores.assign(cores, cores + n);
-        return 0;
-    } catch (...) {
-        return 1;
-    }
-}
-
-extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_register_slabs(
-    const void* const* slabs, int32_t capacity, int32_t hidden, int32_t intermediate, int32_t bits, int32_t swizzled,
-    float act_limit, int64_t* handle) noexcept
-{
-    if (!slabs || !handle || capacity < 1 || bits < 1 || bits > 8 || (swizzled != 0 && swizzled != 1)) return 2;
-    // make_matrix's limits: 128-element blocks, and k (hidden for gate/up, intermediate for down) <= 8192 for the
-    // int32 accumulators.
-    if (hidden < 128 || intermediate < 128 || hidden % 128 || intermediate % 128 || hidden > 8192 || intermediate > 8192)
-        return 2;
-    if (!std::isfinite(act_limit) || act_limit < 0.0f) return 2;
-    for (int i = 0; i < kSlabNames; ++i)
-        if (!slabs[i]) return 2;
-    try {
-        auto entry = std::make_unique<RegisteredLayer>();
-        entry->info = {capacity, hidden, intermediate, true, 0, act_limit};
-        for (int i = 0; i < kSlabNames; ++i)
-            entry->strided.base[i] = static_cast<const uint8_t*>(slabs[i]);
-        entry->strided.hidden = hidden;
-        entry->strided.intermediate = intermediate;
-        entry->strided.bits = bits;
-        entry->strided.swz = swizzled && bits != 8 ? 1 : 0;  // make_matrix's rule: K8 is never swizzled
-        std::lock_guard<std::mutex> lock(g_layers_mutex);
-        g_layers.push_back(std::move(entry));
-        *handle = static_cast<int64_t>(g_layers.size() - 1);
-        return 0;
-    } catch (...) {
-        return 1;
-    }
 }

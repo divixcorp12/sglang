@@ -22,9 +22,9 @@ transform, cache-line output ownership, compact activation scratch, decoder
 unrolling and T0 prefetching. Experiment selectors, alternate persistent weight
 layouts and benchmark instrumentation have been removed. Scratch is reused
 per calling thread. Workers are individually pinned; a stable assignment avoids
-repeating affinity syscalls on every forward. The caller is worker zero. Core configuration is frozen at the first forward;
-steady-state forwards acquire no pool mutex. Concurrent callers are responsible
-for avoiding overlapping OpenMP teams on the configured cores.
+repeating affinity syscalls on every forward. The caller is worker zero. Core configuration is frozen at the first
+forward or keep-warm. One forward runs at a time: a forward or free that finds another running returns status 3
+rather than wait. Keep-warm takes no lock, so its callers must not overlap it with a forward on the same cores.
 
 Build and link
 --------------
@@ -42,16 +42,18 @@ Standalone CPU library on divix01 (no CUDA compilation):
 
 Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP.
 Use moe_mul1.h for the ATen layer-registration API (exl3_moe_cpu_make_layer, one tensor per expert and projection)
-and cpu_experts_cabi.h for the service API: forward, core configuration, and
-sglang_exl3_cpu_experts_register_slabs, which registers a layer as the pinned tier's six slab base pointers (the
-kernel keeps no reference: the caller keeps the slabs alive until exl3_moe_cpu_free_layer). Register and forward through the same
-library instance: layer handles belong to that instance's registry. Packed
-matrix tensors must remain alive for the registered layer's lifetime.
-Configure distinct worker core IDs before the first forward or staging use.
-The service C ABI forward takes one SglangCpuExpertsForward (the engine's
-expert_stream/host/cpu_experts_abi.h, shared with the NVFP4 kernel):
-rows token rows of FP16 activations, FP32 routing weights (converted to FP16)
-and FP32 output. Errors return a nonzero status.
+and cpu_experts_cabi.h for the service API, the five C functions every CPU expert quant exports
+(cpu_experts_common/cabi.hpp): register_layer, free_layer, forward, keep_warm and set_cores.
+sglang_exl3_cpu_experts_register_layer takes an SglangCpuExpertsLayer (the engine's
+expert_stream/host/cpu_experts_abi.h, shared with the NVFP4 kernel): the pinned tier's six slab base pointers and
+per-slot strides, with SglangExl3CpuParams (bits, swizzled) as its params. The kernel keeps no reference: the caller
+keeps the slabs alive until it frees the layer. Register and forward through the same library instance: layer
+handles belong to that instance's registry, which make_layer's tables share. Packed matrix tensors must remain
+alive for the registered layer's lifetime. Configure distinct worker core IDs, within the caller's affinity, before
+the first forward or keep-warm. The C ABI forward takes one SglangCpuExpertsForward: rows token rows of FP16
+activations, FP32 routing weights (converted to FP16) and FP32 output. Status 0 is success, 1 a kernel error, 2
+invalid arguments (a refused call leaves out untouched), 3 concurrent use. The ATen forward and free run through the
+same functions and raise on a nonzero status.
 
 SGLang integration
 ------------------
@@ -82,14 +84,17 @@ teams and other simultaneous consumers of the same cores.
 
 Code layout
 -----------
-moe_mul1.cpp holds the kernels and the public API. A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
-picked once per call in forward_raw: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on an
-AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one
+moe_mul1.cpp holds the kernels and the public API. Registration, validation, the ISA tier, the worker cores and
+keep-warm are cpu_experts_common's ExpertForward<Exl3Quant> (Exl3Quant: quant.hpp). The tier is
+min(host, EXL3_MOE_CPU_MAX_ISA), read at the first forward or tier query; EXL3_MOE_CPU_REPORT_ISA=1 prints
+"exl3 isa <tier>" to stderr then. A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
+picked once per call in Exl3Quant::dispatch: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on
+an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one
 specialization: compact scratch, grouped traversal, wide single-expert quantization. A plan reads every layer fact
 through its Shape (shapes.hpp): GenericShape from the layer's LayerInfo, Dsv41Shape as compile-time constants
 (5120/2304, 3-bit, gated SiLU, activation limit 10; a layer with any other value takes the generic plan). Plans
-read experts through an accessor (experts.hpp): TableExperts over make_layer's per-expert
-tables, or StridedExperts<Shape> over sglang_exl3_cpu_experts_register_slabs's slab bases.
+read experts through an accessor (quant.hpp): TableExperts over make_layer's per-expert
+tables, or StridedExperts<Shape> over sglang_exl3_cpu_experts_register_layer's slab bases and strides.
 
 Bit-exact checks for any change here: test/manual/dsv41/run_exl3_cpu_forward_checks.sh (A/B dumps per ISA tier
 against the merge-base, the bare and full-stack benches' frozen references, the CPU expert pool tests).

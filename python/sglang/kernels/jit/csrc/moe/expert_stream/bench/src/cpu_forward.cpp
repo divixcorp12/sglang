@@ -281,18 +281,19 @@ int main(int argc, char** argv) {
     }
     setenv("EXL3_MOE_CPU_PIN", "0", 1);
     setenv("EXL3_MOE_CPU_SMALL_WORKERS", "0", 1);
-    // ISA detection occurs during kernel static initialization, before main.
+    // The tier is fixed from EXL3_MOE_CPU_MAX_ISA as set at launch: at load (baseline) or at this first query.
     if (!exl3_moe_cpu_has_avx512_bw() || exl3_moe_cpu_has_avx512_vnni() || exl3_moe_cpu_has_avx512_vbmi())
       throw std::runtime_error("This study requires AVX512BW; set EXL3_MOE_CPU_MAX_ISA=bw before launch");
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
     omp_set_dynamic(0);
+    // Before the caller is pinned: the optimized kernel refuses cores outside the caller's affinity.
+    if (sglang_exl3_cpu_experts_set_cores(cores.data(), cores.size()))
+      throw std::runtime_error("Cannot configure kernel cores");
     cpu_set_t caller;
     CPU_ZERO(&caller);
     CPU_SET(cores.front(), &caller);
     if (sched_setaffinity(0, sizeof(caller), &caller)) throw std::runtime_error("Cannot pin caller");
-    if (sglang_exl3_cpu_experts_set_cores(cores.data(), cores.size()))
-      throw std::runtime_error("Cannot configure kernel cores");
     const auto before = task_ids();
     const Fixture fixture(options.fixture);
     std::vector<std::unique_ptr<Workload>> workloads;

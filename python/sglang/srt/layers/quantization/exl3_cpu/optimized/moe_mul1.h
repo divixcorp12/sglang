@@ -66,12 +66,14 @@ void exl3_moe_cpu_free_layer(int64_t handle);
 
 // Run the routed experts for one forward:
 //   x:        [m, hidden] fp16, CPU
-//   selected: [m, top_k] int64, CPU (global expert ids)
-//   weights:  [m, top_k] fp16, CPU
+//   selected: [m, top_k] int64, CPU (global expert ids; -1 skips, any other id outside the layer is an error)
+//   weights:  [m, top_k] fp16, CPU (finite)
 //   out:      [m, hidden] fp32, CPU (overwritten)
 // Tokens are grouped by expert; each expert runs gate/up GEMVs,
 // the activation, and the down GEMV, accumulating routing-weighted rows into out. Threaded over
-// an OpenMP team; the caller should release the GIL around this.
+// an OpenMP team; the caller should release the GIL around this. Runs through the C ABI's forward
+// (sglang_exl3_cpu_experts_forward), so its limits apply (m <= 65536, top_k <= 32) and a refused
+// or concurrent call raises.
 void exl3_moe_cpu_forward
 (
     int64_t handle,

@@ -143,16 +143,26 @@ void StackFixture::write_x(int64_t row) const {
   std::memcpy(x_row(row), impl_->inputs.data() + row * 2 * impl_->hidden, 2 * impl_->hidden);
 }
 
-// Mirrors cpu_experts/exl3.py::register_layer: the row's six slabs by base pointer (kNames is EXL3_STREAMED_NAMES
-// order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit.
+// Mirrors cpu_experts/exl3.py::register_layer: the row's six slabs by base pointer and row stride (kNames is
+// EXL3_STREAMED_NAMES order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit.
 int64_t StackFixture::register_layer(int64_t row) const {
   const Impl& f = *impl_;
-  const void* slabs[kNames];
-  for (int n = 0; n < kNames; ++n) slabs[n] = f.set.slabs[row][n];
+  static const SglangExl3CpuParams params{3, 0};  // the kernel may read params until free_layer
+  SglangCpuExpertsLayer d{};
+  d.abi_version = SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION;
+  d.capacity = static_cast<int32_t>(kCapacity);
+  d.hidden = static_cast<int32_t>(f.hidden);
+  d.intermediate = static_cast<int32_t>(f.intermediate);
+  d.activation = 0;
+  d.act_limit = 10.0f;
+  d.slab_count = kNames;
+  for (int n = 0; n < kNames; ++n) {
+    d.slabs[n] = f.set.slabs[row][n];
+    d.slot_bytes[n] = static_cast<uint64_t>(f.set.layout.row_bytes[n]);
+  }
+  d.params = &params;
   int64_t handle = -1;
-  const int status = sglang_exl3_cpu_experts_register_slabs(
-      slabs, static_cast<int32_t>(kCapacity), static_cast<int32_t>(f.hidden), static_cast<int32_t>(f.intermediate), 3,
-      0, 10.0f, &handle);
+  const int status = sglang_exl3_cpu_experts_register_layer(&d, &handle);
   if (status != 0)
     throw std::runtime_error("the kernel refused row " + std::to_string(row) + "'s slabs: status " +
                              std::to_string(status));
@@ -183,7 +193,7 @@ void StackFixture::free_layer(int64_t handle) {
 }
 
 void configure_cpu_kernel_runtime() {
-  // ISA detection occurs during kernel static initialization, before main.
+  // The kernel detects its ISA tier at the first query, here, after EXL3_MOE_CPU_MAX_ISA was set at launch.
   if (!exl3_moe_cpu_has_avx512_bw() || exl3_moe_cpu_has_avx512_vnni() || exl3_moe_cpu_has_avx512_vbmi())
     throw std::runtime_error("This study requires AVX512BW; set EXL3_MOE_CPU_MAX_ISA=bw before launch");
   at::set_num_threads(1);

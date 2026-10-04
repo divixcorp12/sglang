@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuParams, Exl3CpuQuantTrait
 from sglang.srt.layers.moe.cpu_experts.policy import (
     format_calibration,
     k_star,
@@ -17,7 +17,10 @@ from sglang.srt.layers.moe.cpu_experts.policy import (
     split_from_grid,
     split_table,
 )
-from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertPool
+from sglang.srt.layers.moe.cpu_experts.pool import (
+    CPU_EXPERTS_LAYER_ABI_VERSION,
+    CpuExpertPool,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -244,21 +247,35 @@ def _exl3_slabs():
     }
 
 
-class FakeRegisterSlabs:
-    """Stands in for the kernel's sglang_exl3_cpu_experts_register_slabs; records each call's values."""
+class FakeRegisterLayer:
+    """Stands in for the kernel's sglang_exl3_cpu_experts_register_layer; records each descriptor's values."""
 
     def __init__(self, status=0):
         self.status, self.calls = status, []
 
-    def __call__(self, bases, capacity, hidden, intermediate, bits, swizzled, act_limit, handle):
-        self.calls.append(([bases[i] for i in range(6)], capacity, hidden, intermediate, bits, swizzled, act_limit))
+    def __call__(self, layer, handle):
+        d = layer._obj
+        assert (d.abi_version, d.slab_count, d.activation) == (CPU_EXPERTS_LAYER_ABI_VERSION, 6, 0)
+        params = Exl3CpuParams.from_address(d.params)
+        self.calls.append(
+            (
+                list(d.slabs[:6]),
+                list(d.slot_bytes[:6]),
+                d.capacity,
+                d.hidden,
+                d.intermediate,
+                params.bits,
+                params.swizzled,
+                d.act_limit,
+            )
+        )
         handle._obj.value = 40 + len(self.calls)
         return self.status
 
 
 def _trait_with(monkeypatch, fake, **kw):
     trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0, **kw)
-    monkeypatch.setattr(trait, "_native", lambda name: fake if name == "sglang_exl3_cpu_experts_register_slabs" else None)
+    monkeypatch.setattr(trait, "_native", lambda name: fake if name == "sglang_exl3_cpu_experts_register_layer" else None)
     return trait
 
 
@@ -269,18 +286,20 @@ def test_exl3_trait_registers_the_six_slab_bases(monkeypatch, tier_layout):
     slabs = _exl3_slabs()
     if tier_layout:
         slabs = {n: (t.unsqueeze(1) if n.startswith("w2_") else t) for n, t in slabs.items()}
-    fake = FakeRegisterSlabs()
+    fake = FakeRegisterLayer()
     trait = _trait_with(monkeypatch, fake, swizzled=True)
     handle = trait.register_layer(slabs, CAP)
     names = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
+    trellis = H * INTER * 3 // 8  # bytes of one 3-bit [k/16, n/16, 48] trellis
+    row_bytes = [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]  # quant.hpp's SlabRowBytes
     assert handle == 41
-    assert fake.calls == [([slabs[n].data_ptr() for n in names], CAP, H, INTER, 3, 1, 10.0)]
+    assert fake.calls == [([slabs[n].data_ptr() for n in names], row_bytes, CAP, H, INTER, 3, 1, 10.0)]
 
 
 def test_exl3_trait_keeps_the_slabs_alive_until_free(monkeypatch):
     """The kernel keeps only pointers: the trait holds the tensors until the layer is freed."""
     slabs = _exl3_slabs()
-    trait = _trait_with(monkeypatch, FakeRegisterSlabs())
+    trait = _trait_with(monkeypatch, FakeRegisterLayer())
     handle = trait.register_layer(slabs, CAP)
     probe = weakref.ref(slabs["w2_svh"])
     del slabs
@@ -303,14 +322,14 @@ def test_exl3_trait_keeps_the_slabs_alive_until_free(monkeypatch):
 def test_exl3_trait_refuses_slabs_the_kernel_would_misaddress(monkeypatch, name, bad):
     slabs = _exl3_slabs()
     slabs[name] = bad(slabs[name])
-    fake = FakeRegisterSlabs()
+    fake = FakeRegisterLayer()
     with pytest.raises(ValueError, match=name):
         _trait_with(monkeypatch, fake).register_layer(slabs, CAP)
     assert fake.calls == []
 
 
 def test_exl3_trait_reports_a_refused_registration(monkeypatch):
-    trait = _trait_with(monkeypatch, FakeRegisterSlabs(status=2))
+    trait = _trait_with(monkeypatch, FakeRegisterLayer(status=2))
     with pytest.raises(RuntimeError, match="status 2"):
         trait.register_layer(_exl3_slabs(), CAP)
 

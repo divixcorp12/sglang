@@ -8,12 +8,23 @@ kernel's C entry points (forward and core placement) that the native CPU expert 
 calls without Python.
 """
 
+import ctypes
 import os
 from typing import Any, Mapping, Optional
 
 import torch
 
+from sglang.srt.layers.moe.cpu_experts.pool import (
+    CPU_EXPERTS_LAYER_ABI_VERSION,
+    CpuExpertsLayer,
+)
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
+
+
+class Exl3CpuParams(ctypes.Structure):
+    """``SglangExl3CpuParams`` (``exl3_cpu/optimized/cpu_experts_cabi.h``); the field order is the C struct's."""
+
+    _fields_ = [("bits", ctypes.c_int32), ("swizzled", ctypes.c_int32)]
 
 
 class Exl3CpuQuantTrait:
@@ -87,30 +98,29 @@ class Exl3CpuQuantTrait:
                     f"EXL3 slab {name} {tuple(slab.shape)} {slab.dtype} is not {capacity} contiguous CPU rows of "
                     f"{row[name]} {dtype} elements"
                 )
-        import ctypes
-
-        fn = self._native("sglang_exl3_cpu_experts_register_slabs")
+        params = Exl3CpuParams(bits=bits, swizzled=int(self.swizzled))
+        layer = CpuExpertsLayer(
+            abi_version=CPU_EXPERTS_LAYER_ABI_VERSION,
+            capacity=capacity,
+            hidden=hidden,
+            intermediate=intermediate,
+            activation=0,
+            act_limit=self.act_limit,
+            slab_count=len(self.slab_names),
+            params=ctypes.addressof(params),
+        )
+        for i, name in enumerate(self.slab_names):
+            layer.slabs[i] = slabs[name].data_ptr()
+            layer.slot_bytes[i] = slabs[name].stride(0) * slabs[name].element_size()
+        fn = self._native("sglang_exl3_cpu_experts_register_layer")
         fn.restype = ctypes.c_int
-        fn.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_int32,
-            ctypes.c_int32,
-            ctypes.c_int32,
-            ctypes.c_int32,
-            ctypes.c_int32,
-            ctypes.c_float,
-            ctypes.POINTER(ctypes.c_int64),
-        ]
-        bases = (ctypes.c_void_p * len(self.slab_names))(
-            *(slabs[name].data_ptr() for name in self.slab_names)
-        )
+        fn.argtypes = [ctypes.POINTER(CpuExpertsLayer), ctypes.POINTER(ctypes.c_int64)]
         handle = ctypes.c_int64(-1)
-        status = fn(
-            bases, capacity, hidden, intermediate, bits, int(self.swizzled), self.act_limit, ctypes.byref(handle)
-        )
+        status = fn(ctypes.byref(layer), ctypes.byref(handle))
         if status != 0:
             raise RuntimeError(f"the EXL3 CPU kernel refused the layer's slabs: status {status}")
-        self._slabs[handle.value] = [slabs[name] for name in self.slab_names]
+        # The kernel stores views: the slabs (and, per the ABI, params) stay alive until free_layer.
+        self._slabs[handle.value] = [slabs[name] for name in self.slab_names] + [params]
         return handle.value
 
     def forward(self, handle, x, slots, weights, out, threads) -> None:
@@ -165,8 +175,13 @@ class Exl3CpuQuantTrait:
         )
         array = (ctypes.c_int32 * len(cores))(*cores)
         result = fn(array, len(cores))
+        if result == 2:
+            raise RuntimeError(
+                f"the EXL3 CPU kernel refused cores {list(cores)} (status 2): either a core repeats or lies "
+                "outside this thread's affinity, or the kernel's workers already ran, so something called "
+                "the CPU kernel before the CPU expert thread"
+            )
         if result != 0:
             raise RuntimeError(
-                f"the EXL3 CPU kernel refused cores {list(cores)} ({result}): its pool already runs, "
-                "so something called the CPU kernel before the CPU expert thread"
+                f"the EXL3 CPU kernel could not take cores {list(cores)}: status {result}"
             )

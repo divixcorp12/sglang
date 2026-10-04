@@ -122,38 +122,63 @@ def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch, hidden, inter
 
 
 
-def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
-    """The CpuExpertForward the service calls: accumulate=0 overwrites whatever out held; accumulate=1 adds, so a
-    record's CPU misses sent in two jobs sum to the two experts' outputs. Not bitwise: -Ofast may fuse the add."""
+C_NAMES = tuple(
+    f"sglang_exl3_cpu_experts_{name}" for name in ("register_layer", "free_layer", "forward", "keep_warm", "set_cores")
+)
+
+
+def _optimized_ext():
+    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
+
+    if not optimized_cpu(cpu_act_defines()):
+        pytest.skip("the C ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
+    return exl3_ext()
+
+
+def _c_forward(trait, handle, x, slots, weights, out, accumulate=0):
+    """One-row call of the C ABI's forward; returns its status."""
     import ctypes
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
     from sglang.srt.layers.moe.cpu_experts.pool import (
         CPU_EXPERTS_FORWARD_ABI_VERSION,
         CpuExpertForward,
         CpuExpertsForwardCall,
     )
-    from sglang.srt.layers.quantization.exl3_ext import cpu_act_defines, exl3_ext, optimized_cpu
 
-    if not optimized_cpu(cpu_act_defines()):
-        pytest.skip("the slab ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
-    ext = exl3_ext()
-    slabs = _random_slabs(20261001)
-    direct = _direct_layer(ext, slabs)
-    forward = CpuExpertForward(Exl3CpuQuantTrait(ext, act_limit=LIMIT).native_forward())
+    s = torch.tensor(slots, dtype=torch.int32)
+    w = torch.tensor(weights, dtype=torch.float32)
+    call = CpuExpertsForwardCall(
+        abi_version=CPU_EXPERTS_FORWARD_ABI_VERSION, rows=1, layer=handle, x=x.data_ptr(),
+        slots=ctypes.cast(s.data_ptr(), ctypes.POINTER(ctypes.c_int32)),
+        weights=ctypes.cast(w.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        out=ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_float)), k=len(slots), threads=1, accumulate=accumulate,
+    )
+    return CpuExpertForward(trait.native_forward())(ctypes.byref(call))
+
+
+def test_the_exl3_library_exports_the_five_c_names(monkeypatch):
+    """Every CPU expert quant exports the same five C functions (cpu_experts_common/cabi.hpp)."""
+    import ctypes
+
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    library = ctypes.CDLL(_optimized_ext().__file__)
+    for name in C_NAMES:
+        assert getattr(library, name), name
+
+
+def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
+    """The CpuExpertForward the service calls, over a layer registered through register_layer: accumulate=0
+    overwrites whatever out held; accumulate=1 adds, so a record's CPU misses sent in two jobs sum to the two experts'
+    outputs. Not bitwise: -Ofast may fuse the add."""
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+
+    trait = Exl3CpuQuantTrait(_optimized_ext(), act_limit=LIMIT)
+    layer = trait.register_layer(_random_slabs(20261001), CAP)
     x = (torch.randn(H, generator=torch.Generator().manual_seed(2))).half()
 
     def run(slots, weights, out, accumulate):
-        s = torch.tensor(slots, dtype=torch.int32)
-        w = torch.tensor(weights, dtype=torch.float32)
-        call = CpuExpertsForwardCall(
-            abi_version=CPU_EXPERTS_FORWARD_ABI_VERSION, rows=1, layer=direct, x=x.data_ptr(),
-            slots=ctypes.cast(s.data_ptr(), ctypes.POINTER(ctypes.c_int32)),
-            weights=ctypes.cast(w.data_ptr(), ctypes.POINTER(ctypes.c_float)),
-            out=ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_float)), k=len(slots), threads=1, accumulate=accumulate,
-        )
-        assert forward(ctypes.byref(call)) == 0
+        assert _c_forward(trait, layer, x, slots, weights, out, accumulate) == 0
 
     try:
         first, second = torch.empty(H), torch.empty(H)
@@ -168,7 +193,50 @@ def test_the_c_abi_forward_overwrites_or_accumulates(monkeypatch):
         run([4], [0.25], summed, 1)
         torch.testing.assert_close(summed, first + second, rtol=1e-6, atol=1e-6)
     finally:
-        ext.exl3_moe_cpu_free_layer(direct)
+        trait.free_layer(layer)
+
+
+def test_the_c_abi_refuses_a_slot_past_capacity(monkeypatch):
+    """A routed slot at the layer's capacity is outside its slabs: the forward refuses the call (2) before writing,
+    so out keeps what it held, for accumulate=0 as for 1."""
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+
+    trait = Exl3CpuQuantTrait(_optimized_ext(), act_limit=LIMIT)
+    layer = trait.register_layer(_random_slabs(20261003), CAP)
+    x = (torch.randn(H, generator=torch.Generator().manual_seed(3))).half()
+    try:
+        for accumulate in (0, 1):
+            out = torch.full((H,), 1e6)
+            assert _c_forward(trait, layer, x, [0, CAP], [0.5, 0.5], out, accumulate) == 2
+            assert torch.equal(out, torch.full((H,), 1e6)), "a refused forward wrote out"
+        out = torch.full((H,), 1e6)
+        assert _c_forward(trait, layer, x, [CAP - 1], [0.5], out) == 0, "the last slot is inside the layer"
+    finally:
+        trait.free_layer(layer)
+
+
+def test_set_cores_after_the_first_forward_returns_2(monkeypatch):
+    """The first forward freezes the worker cores: a later set_cores, even with valid cores, is refused (2)."""
+    import ctypes
+
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+
+    ext = _optimized_ext()
+    trait = Exl3CpuQuantTrait(ext, act_limit=LIMIT)
+    layer = trait.register_layer(_random_slabs(20261004), CAP)
+    x = (torch.randn(H, generator=torch.Generator().manual_seed(4))).half()
+    try:
+        assert _c_forward(trait, layer, x, [1], [1.0], torch.empty(H)) == 0
+    finally:
+        trait.free_layer(layer)
+    set_cores = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_set_cores
+    set_cores.argtypes, set_cores.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
+    cores = (ctypes.c_int32 * 1)(sorted(os.sched_getaffinity(0))[0])
+    assert set_cores(cores, 1) == 2
+    with pytest.raises(RuntimeError, match="status 2"):
+        trait.native_set_cores([cores[0]])
 
 
 def test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline(monkeypatch):
