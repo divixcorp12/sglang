@@ -67,9 +67,27 @@ def _copy_engine(s, host, *, arm=True, wait_timeout_ms=2000):
         for name, slab in s.slabs[ROW].items()
     }
     host.set_copy_table(ROW, _copy_table(s, dst), DST_ROWS)
+    # The table holds raw addresses of these tensors and the copy thread writes through them until host.stop(), so
+    # they must outlive a caller that drops the return value (a freed destination is a heap-use-after-free that
+    # corrupts the allocator and crashes a later test, or hangs the run in malloc).
+    host._copy_destinations = dst
     if arm:
         host.arm_copy_engine()
     return dst
+
+
+def test_the_copy_destinations_outlive_a_caller_that_drops_them(tmp_path):
+    """The copy table points into the destination tensors, so the helper keeps them alive for the host's lifetime."""
+    import gc
+    import weakref
+
+    s, page, host, sim = _host(tmp_path)
+    try:
+        refs = [weakref.ref(t) for t in _copy_engine(s, host).values()]
+        gc.collect()
+        assert all(ref() is not None for ref in refs)
+    finally:
+        host.stop()
 
 
 def _load(sim, host, experts):
