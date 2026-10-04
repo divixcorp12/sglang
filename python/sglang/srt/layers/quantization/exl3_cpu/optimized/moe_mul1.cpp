@@ -2183,28 +2183,6 @@ struct ForwardCtx
     int* down_tiles_done;
 };
 
-struct ForwardArena
-{
-    std::vector<float> tin_g, tin_u, tin_d;
-    std::vector<int32_t> splat_g, splat_u, splat_d;
-    std::vector<int32_t> splat_dup_g, splat_dup_u, splat_dup_d;
-    std::vector<int16_t> compact_g, compact_u, compact_d;
-    std::vector<float> tout_g, tout_u, tout_d;
-    std::vector<PreparedIn> prep_g, prep_u, prep_d;
-    std::vector<float> bq_g, bq_u, bq_d;
-    std::vector<int32_t> bsum_g, bsum_u, bsum_d;
-    std::vector<int> down_tiles_done;
-    // Moved into the call's ForwardCtx and back, so a forward allocates nothing once warm
-    std::vector<std::vector<std::pair<int, float>>> per_expert;
-    std::vector<Chunk> chunks;
-
-    static ForwardArena& get()
-    {
-        static thread_local ForwardArena arena;
-        return arena;
-    }
-};
-
 template <Isa I>
 M1_TARGET_AVX2
 void transform_out_avx2(const MoeCpuMatrix& mat, float* tout, int m)

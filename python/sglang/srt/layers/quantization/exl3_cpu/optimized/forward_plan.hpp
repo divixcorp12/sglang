@@ -1,5 +1,5 @@
 // Included by moe_mul1.cpp inside its anonymous namespace, after the phase helpers (prepare_rows, run_tiles,
-// transform_out, middle_blocks, prepare_gu_blocks, transform_owned_blocks, assign_gemvs) and ForwardCtx/ForwardArena.
+// transform_out, middle_blocks, prepare_gu_blocks, transform_owned_blocks, assign_gemvs) and ForwardCtx.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is
 // the ISA tier. The primary template is the generic plan. PlanTraits<Dsv41Shape, Isa::Bw> turns on the fast path that
@@ -15,6 +15,29 @@ enum class Phase : int
     Middle = 2,         // gate/up output transform, activation, down input
     Down = 3,           // down GEMVs with their output transform
     Accumulate = 5,     // routing-weighted sum into out
+};
+
+// The calling thread's scratch for every forward it runs: a plan sizes its share of it per call (prepare_scratch).
+struct ForwardArena
+{
+    std::vector<float> tin_g, tin_u, tin_d;
+    std::vector<int32_t> splat_g, splat_u, splat_d;
+    std::vector<int32_t> splat_dup_g, splat_dup_u, splat_dup_d;
+    std::vector<int16_t> compact_g, compact_u, compact_d;
+    std::vector<float> tout_g, tout_u, tout_d;
+    std::vector<PreparedIn> prep_g, prep_u, prep_d;
+    std::vector<float> bq_g, bq_u, bq_d;
+    std::vector<int32_t> bsum_g, bsum_u, bsum_d;
+    std::vector<int> down_tiles_done;
+    // Moved into the call's ForwardCtx and back, so a forward allocates nothing once warm
+    std::vector<std::vector<std::pair<int, float>>> per_expert;
+    std::vector<Chunk> chunks;
+
+    static ForwardArena& get()
+    {
+        static thread_local ForwardArena arena;
+        return arena;
+    }
 };
 
 // What a (Shape, ISA) plan turns on. The primary template is the generic plan.
