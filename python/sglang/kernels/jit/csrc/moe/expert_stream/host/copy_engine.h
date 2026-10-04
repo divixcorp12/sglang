@@ -13,6 +13,7 @@
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "Copy engine".
 #pragma once
 
+#include <algorithm>
 #include <array>
 
 #include "../lease_layout.h"
@@ -489,7 +490,8 @@ class CopyEngine {
 
   // Hands a job to the copy thread. Called only by the tier's owner (the service thread, or the caller of pump()).
   // Takes no lock and never blocks; makes a syscall only to wake a sleeping copy thread. Each group has its own ring
-  // and pushes only to it. At most Wire::kDemandRecords jobs per group are outstanding and a ring holds kCopyRing, so a full ring is an internal error and fails stop.
+  // and pushes only to it. At most Wire::kDemandRecords jobs per group are outstanding and a ring holds kCopyRing, so
+  // a full ring is an internal error and fails stop.
   void submit(int group, const CopyJob& job) {
     if (!jobs_[group]->push(job)) {
       owner_->copy_failed(job, kRingOverflow);

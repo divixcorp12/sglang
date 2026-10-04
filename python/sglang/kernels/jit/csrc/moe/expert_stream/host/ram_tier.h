@@ -583,7 +583,13 @@ class RamTier {
       backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device), copy_prefix);
     }
     auto engine = std::make_unique<Engine>(
-        std::move(backend), layers_, dist_.size(), spin_ns, this, copy_prefix, std::string(Layout::kName) + "-copy-eng");
+        std::move(backend),
+        layers_,
+        dist_.size(),
+        spin_ns,
+        this,
+        copy_prefix,
+        std::string(Layout::kName) + "-copy-eng");
     if (wait_timeout_ns <= 0)
       throw std::runtime_error(error_prefix<Layout>() + "the copy-wait timeout must be positive");
     copy_wait_timeout_ns_ = wait_timeout_ns;
@@ -666,13 +672,15 @@ class RamTier {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");
     if (g < 0 || g >= groups())
-      throw std::runtime_error(error_prefix<Layout>() + "CPU experts name group " + std::to_string(g) + " of " + std::to_string(groups()));
+      throw std::runtime_error(
+          error_prefix<Layout>() + "CPU experts name group " + std::to_string(g) + " of " + std::to_string(groups()));
     if (copy_engine_ == nullptr)
       throw std::runtime_error(
           error_prefix<Layout>() + "CPU experts need the copy engine, which completes their lanes");
     std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(g).cpu;
     if (cpu != nullptr)
-      throw std::runtime_error(error_prefix<Layout>() + "CPU experts are already enabled for group " + std::to_string(g));
+      throw std::runtime_error(
+          error_prefix<Layout>() + "CPU experts are already enabled for group " + std::to_string(g));
     config.rows = layers_;
     store_split(g, split.data(), static_cast<int64_t>(split.size()));
     const std::string prefix = std::string(Layout::kName) + " CPU experts: ";
@@ -1029,7 +1037,8 @@ class RamTier {
       (void)g, (void)ns;
       test_only("inject_group_stall");
     } else {
-      if (g < 0 || g >= groups()) throw std::runtime_error(error_prefix<Layout>() + "no NUMA group " + std::to_string(g));
+      if (g < 0 || g >= groups())
+        throw std::runtime_error(error_prefix<Layout>() + "no NUMA group " + std::to_string(g));
       faults_.group_stall_ns[g].store(ns);
     }
   }
@@ -1375,7 +1384,9 @@ class RamTier {
         throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
     for (int64_t n = 0; n < count; ++n)
       __atomic_store_n(
-          reinterpret_cast<int32_t*>(lease_ + Wire::kSplit + g * Wire::kSplitStride) + n, static_cast<int32_t>(split[n]), __ATOMIC_RELAXED);
+          reinterpret_cast<int32_t*>(lease_ + Wire::kSplit + g * Wire::kSplitStride) + n,
+          static_cast<int32_t>(split[n]),
+          __ATOMIC_RELAXED);
   }
 
   // Ends the slot's prefill ownership: decode used it, or it is gone. `own` is the row of the group whose range holds

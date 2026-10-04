@@ -39,9 +39,10 @@ constexpr int kCalibRows = kCalibLanes + 2;
 
 // Everything one calibration needs, built by RamTier::calibrate_cpu_split.
 //
-// All measurements use one row and its host slots first_slot..first_slot + kCalibLanes - 1. Slot contents do not matter for timing; the bytes
-// are real pinned memory of the real size and format. The DMA goes through `backend`, a private CopyBackend with its
-// own stream and completion word, and lands in `scratch`, so calibration touches no destination tensor and no CopyJob.
+// All measurements use one row and its host slots first_slot..first_slot + kCalibLanes - 1. Slot contents do not matter
+// for timing; the bytes are real pinned memory of the real size and format. The DMA goes through `backend`, a private
+// CopyBackend with its own stream and completion word, and lands in `scratch`, so calibration touches no destination
+// tensor and no CopyJob.
 struct CalibrationSetup {
   CpuExpertEngine* cpu = nullptr;
   int64_t row = 0;
@@ -62,9 +63,9 @@ inline int64_t calibration_expert_bytes(std::span<const CopyEntry> entries) {
   return bytes;
 }
 
-// Runs k CPU lanes on host slots first_slot.. first_slot + k - 1 and the DMA of m experts from the k slots after them, started together, and returns the
-// ns from the start until both are observed done (queueing and wake-up included). Either side may be empty. Throws on a
-// failed copy, a full CPU ring, or past the timeout.
+// Runs k CPU lanes on host slots first_slot.. first_slot + k - 1 and the DMA of m experts from the k slots after them,
+// started together, and returns the ns from the start until both are observed done (queueing and wake-up included).
+// Either side may be empty. Throws on a failed copy, a full CPU ring, or past the timeout.
 inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
   const int64_t start = now_ns();
   uint32_t seq = 0;

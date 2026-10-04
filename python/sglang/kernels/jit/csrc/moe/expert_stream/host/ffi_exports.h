@@ -372,14 +372,14 @@ struct HostExports {
     find(handle)->arm_copy_engine(on != 0);
   }
 
-  // Enables NUMA group `group`'s CPU experts. `forward` is a CpuExpertForward's address (the trait's native forward), whose layers
-  // register later (set_cpu_layer). `split` is int64 [Wire::kLanes + 1], CPU lanes per n eligible lanes; `cores` is
-  // int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host memory, where
-  // the post kernel writes a row's input; `out_rows` is float32 [rows, >= Wire::kNodes * parts * hidden] in host
-  // memory, where the device reads a row's CPU partial sums (group g's part 0 the CPU hits', part 1 the CPU misses'
-  // when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. `engine` is the kernel's engine handle (its engine_create; 0: none), carried by every
-  // forward and keep-warm. `keep_warm` is a CpuExpertKeepWarm's address (0 for none) that the idle thread runs for
-  // keep_warm_ns after each job.
+  // Enables NUMA group `group`'s CPU experts. `forward` is a CpuExpertForward's address (the trait's native forward),
+  // whose layers register later (set_cpu_layer). `split` is int64 [Wire::kLanes + 1], CPU lanes per n eligible lanes;
+  // `cores` is int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host
+  // memory, where the post kernel writes a row's input; `out_rows` is float32 [rows, >= Wire::kNodes * parts * hidden]
+  // in host memory, where the device reads a row's CPU partial sums (group g's part 0 the CPU hits', part 1 the CPU
+  // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. `engine` is the kernel's
+  // engine handle (its engine_create; 0: none), carried by every forward and keep-warm. `keep_warm` is a
+  // CpuExpertKeepWarm's address (0 for none) that the idle thread runs for keep_warm_ns after each job.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t group,
@@ -431,7 +431,8 @@ struct HostExports {
     config.keep_warm = reinterpret_cast<expert_stream::CpuExpertKeepWarm>(static_cast<intptr_t>(keep_warm));
     config.keep_warm_ns = keep_warm != 0 ? keep_warm_ns : 0;
     const auto* sp = static_cast<const int64_t*>(split.data_ptr());
-    find(handle)->enable_cpu_experts(static_cast<int>(group), std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
+    find(handle)->enable_cpu_experts(
+        static_cast<int>(group), std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
   }
 
   // CPU experts: `row`'s layer handle (the trait's register_layer), once per row, at any time.
