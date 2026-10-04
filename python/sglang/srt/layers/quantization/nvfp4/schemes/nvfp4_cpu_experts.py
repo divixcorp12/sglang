@@ -3,7 +3,7 @@
 The kernel is ``python/sglang/kernels/jit/csrc/nvfp4/optimized/kernel.cpp``, built and loaded by
 ``nvfp4.ext.nvfp4_cpu_library``. ``Nvfp4CpuQuantTrait`` registers a layer's pinned slabs with the kernel's
 ``register_layer`` by base pointer and slot stride, runs its C forward, and exposes the C entry points (forward,
-keep-warm and core placement) that the native CPU expert thread calls without Python.
+keep-warm and engines) that the native CPU expert thread calls without Python.
 """
 
 import ctypes
@@ -22,7 +22,7 @@ from sglang.srt.layers.moe.cpu_experts.pool import (
 # alphas per slot. Its seventh, up_alpha, is optional (up shares gate_alpha without it), so it is not a pool slab name.
 NVFP4_CPU_SLAB_NAMES = ("w13", "w2", "sf13", "sf2", "gate_alpha", "down_alpha")
 _UP_ALPHA = "up_alpha"
-_STATUS = {1: "internal error, reason on stderr", 2: "invalid arguments", 3: "concurrent use"}
+_STATUS = {1: "internal error, reason on stderr", 2: "invalid arguments", 3: "a free_layer while a forward runs"}
 
 
 class Nvfp4CpuParams(ctypes.Structure):
@@ -76,7 +76,7 @@ class Nvfp4CpuQuantTrait:
         self._slabs: dict[int, list] = {}
 
     def check_environment(self) -> None:
-        """Nothing to check: the kernel pins its workers only to the cores ``native_set_cores`` gives it."""
+        """Nothing to check: the kernel pins its workers only to the cores of the engine a call names."""
 
     def hidden_size(self, slabs: Mapping[str, torch.Tensor]) -> int:
         """The hidden size, as configured (NVFP4 slabs do not encode it)."""
@@ -204,15 +204,26 @@ class Nvfp4CpuQuantTrait:
         """The address of the kernel's keep-warm function, for the idle native CPU thread."""
         return ctypes.cast(self.library.sglang_nvfp4_cpu_experts_keep_warm, ctypes.c_void_p).value
 
-    def native_set_cores(self, cores: Sequence[int]) -> None:
-        """Place the kernel's workers on ``cores``, before its first forward."""
-        fn = self.library.sglang_nvfp4_cpu_experts_set_cores
-        fn.argtypes, fn.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
+    def native_create_engine(self, cores: Sequence[int]) -> int:
+        """Create the kernel's engine on ``cores`` (the calling engine thread is worker 0); returns its handle."""
+        fn = self.library.sglang_nvfp4_cpu_experts_engine_create
+        fn.argtypes, fn.restype = (
+            [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64)],
+            ctypes.c_int,
+        )
         array = (ctypes.c_int32 * max(len(cores), 1))(*cores)
-        result = fn(array, len(cores))
+        engine = ctypes.c_int64(0)
+        result = fn(array, len(cores), ctypes.byref(engine))
         if result != 0:
             raise RuntimeError(
-                f"the NVFP4 CPU kernel refused cores {list(cores)}: status {result} "
-                f"({_STATUS.get(result, 'unexpected status')}; 2 means a core repeats or is out of range, or the "
-                "kernel's workers already ran)"
+                f"the NVFP4 CPU kernel refused engine cores {list(cores)} (status {result}): a core repeats or is out "
+                "of range"
             )
+        return engine.value
+
+    def native_free_engine(self, engine: int) -> None:
+        """Free an engine native_create_engine returned."""
+        fn = self.library.sglang_nvfp4_cpu_experts_engine_free
+        fn.argtypes, fn.restype = [ctypes.c_int64], ctypes.c_int
+        if fn(engine) != 0:
+            raise RuntimeError(f"the NVFP4 CPU kernel has no engine {engine}")
