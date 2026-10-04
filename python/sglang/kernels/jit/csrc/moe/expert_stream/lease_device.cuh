@@ -456,3 +456,4 @@ SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
 }
 
 }  // namespace device::expert_stream
+}  // namespace sglang
