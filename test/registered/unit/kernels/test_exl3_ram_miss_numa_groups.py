@@ -193,3 +193,45 @@ def test_a_miss_on_another_nodes_staging_slot_fail_stops(tmp_path):
         capture_output=True, text=True, timeout=120,
     )
     assert_aborted(result, "is not a staging slot")
+
+
+_LAGGING = textwrap.dedent(_SCRIPT) + """
+for i in range(18):  # node 0's misses only, served by group 0 alone: group 1 falls past the ring behind
+    req = sim.post(1, [(0, 2, 4, 6)[i % 4]])
+    assert host.pump_group(0) == 1 and sim.wait_served(req)
+req = sim.post(1, [1])  # group 1's first miss, chain 20 against the row's chain it last saw
+for _ in range(40):
+    host.pump()
+    if sim.wait_served(req):
+        break
+assert sim.wait_served(req)
+print('reached')
+"""
+
+
+def test_a_group_the_device_lapped_serves_its_next_miss(tmp_path):
+    """A record with no lane of a group's node is never waited on for that group, so it can fall a ring behind
+    (delta 10); its next own miss must still pass the chain check, against the row's published chain."""
+    result = subprocess.run(
+        [sys.executable, "-c", _LAGGING, str(tmp_path)], capture_output=True, text=True, timeout=180
+    )
+    assert result.returncode == 0 and "reached" in result.stdout, result.stderr[-2000:]
+
+
+_STALE_HOT = (
+    textwrap.dedent(_SCRIPT).replace("variant=\"instr\",", "variant=\"instr\", hot_page=new_hot_page(8, pin=False),")
+    .replace("import ExpertStreamHost, new_page", "import ExpertStreamHost, new_hot_page, new_page")
+    + """
+sim.post(1, [0], hot_seq=7)  # node 0's miss with no hot record: group 0 would fail-stop, group 1 has no work in it
+assert host.pump_group(1) == 1
+print(host.group_counters(1)['overruns'])
+print('reached')
+"""
+)
+
+
+def test_a_group_with_no_host_lane_skips_a_record_whose_hot_set_is_gone(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-c", _STALE_HOT, str(tmp_path)], capture_output=True, text=True, timeout=180
+    )
+    assert result.returncode == 0 and result.stdout.split() == ["1", "reached"], result.stderr[-2000:]

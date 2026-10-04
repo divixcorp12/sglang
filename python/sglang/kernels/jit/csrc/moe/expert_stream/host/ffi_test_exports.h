@@ -581,6 +581,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return tier->pump_demand() ? 1 : 0;
   }
 
+  // Serves one demand record of group `group` alone, on the calling thread: 1 if it served one. Under the same rules as
+  // pump(); the other groups stay where they are, so a test can leave one group behind the device.
+  static int64_t pump_group(int64_t handle, int64_t group) {
+    const auto tier = find(handle);
+    std::lock_guard<std::mutex> caller(tier->caller_mutex());
+    if (tier->threaded()) throw std::runtime_error(error_prefix<Layout>() + "pump_group() while the service thread runs");
+    if (group < 0 || group >= tier->groups())
+      throw std::runtime_error(error_prefix<Layout>() + "group " + std::to_string(group) + " is out of range");
+    return tier->pump_demand(static_cast<int>(group)) ? 1 : 0;
+  }
+
   // Fills `out` with RamTier::slot_info's three words per slot of `row`.
   static void slot_info(int64_t handle, int64_t row, TensorView out) {
     using namespace host;
@@ -909,6 +920,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_pieces, Exports::read_rows_pieces);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_geometry, Exports::piece_geometry);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump, Exports::pump);                                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pump_group, Exports::pump_group);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_slot_info, Exports::slot_info);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_handled_through, Exports::handled_through);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_victim_census, Exports::victim_census);               \

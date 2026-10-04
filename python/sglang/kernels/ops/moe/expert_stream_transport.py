@@ -1431,6 +1431,11 @@ class ExpertStreamHost:
         """Serve the pending requests on the calling thread (no service thread)."""
         return int(self._module.expert_stream_pump(self.handle))
 
+    def pump_group(self, group: int) -> int:
+        """Test only: serve NUMA group ``group``'s next pending request alone, on the calling thread."""
+        _refuse_test_only("pump_group", self.variant)
+        return int(self._module.expert_stream_pump_group(self.handle, int(group)))
+
     def contains(self, row: int, expert: int) -> bool:
         """Return True once the expert holds a slot in ``row``.
 
