@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import exl3_ram_miss as module
 from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -213,6 +214,7 @@ class _Side:
     """The device side's chain, recorded: which stages a post launched, in order."""
 
     host_rows_1 = dst_slots_1 = go_1 = None
+    wire = lease.wire_layout(8)
 
     def __init__(self):
         self.calls = []
@@ -265,8 +267,8 @@ def test_a_captured_cpu_expert_gather_whose_streamer_is_gone_is_refused(monkeypa
 def test_cpu_experts_backend_needs_its_streamer():
     with pytest.raises(ValueError, match="pass streamer_of"):
         module.Exl3RamMissRowBackend(
-            {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, 1, {0: None},
-            copy_engine=True, cpu_experts=True,
+            {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(wire=lease.wire_layout(8)), 0, 1,
+            {0: None}, copy_engine=True, cpu_experts=True,
         )
 
 

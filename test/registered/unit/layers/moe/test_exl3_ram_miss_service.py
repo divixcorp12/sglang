@@ -251,7 +251,8 @@ def test_a_post_wider_than_the_staging_a_small_tier_keeps_traps_as_at_8_lanes(ti
         staged = [s for s, (state, _, _) in enumerate(service.host.slot_info(row)) if state == 3]
     assert len(staged) == CAPACITY, "the row keeps a slot to fill"
     sim = _sim(service)
-    sim.sync_bulk()
+    with paused(service.host):
+        sim.sync_bulk()
     with pytest.raises(ValueError, match="no staging slot"):
         sim.post(row, list(range(CAPACITY + 1)))
 
@@ -585,7 +586,8 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
                         lambda layer, streamer: SimpleNamespace(
                             layer_fusion=layer_fusion, run=lambda x, w, remap, keep, limit, cpu=None: x.float()))
     backend = module.Exl3RamMissRowBackend(
-        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(), 0, 6, {0: None}, route_log=route_log
+        {0: None}, torch.full((EXPERTS,), -1, dtype=torch.int64), SimpleNamespace(wire=lease.wire_layout(8)), 0, 6, {0: None},
+        route_log=route_log
     )
     remap = torch.zeros(6, dtype=torch.int32)
     streamer = SimpleNamespace(row_backend=backend, gather=lambda topk_ids: (remap, None))
