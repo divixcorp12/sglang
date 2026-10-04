@@ -31,7 +31,7 @@ from typing import Callable, Mapping, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
-from sglang.kernels.ops.moe.expert_lease_block import wire_layout
+from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamDevice,
     ExpertStreamHost,
@@ -292,13 +292,13 @@ def _row_image_tables(
     )
 
 
-def sm_copy_mask(names: Sequence[str]) -> int:
+def sm_copy_mask(names: Sequence[str], lanes: int = 8) -> int:
     """Bitmask of the copy-table entries the copy wait copies itself.
 
     With ``SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`` the copy wait moves the host
     layout's small tensors, wherever they sit in ``names``.
     """
-    layout_names, small = host_layout()
+    layout_names, small = host_layout(lanes=lanes)
     small_names = {name for i, name in enumerate(layout_names) if small >> i & 1}
     return sum(1 << i for i, name in enumerate(names) if name in small_names)
 
@@ -507,6 +507,11 @@ class NativePinnedSlotTable:
             )
 
 
+def padded_plan_width(capacity: int, lanes: int) -> int:
+    """The length of a row backend's ``planned`` tensor: its plan width, and at least the build's lanes."""
+    return max(capacity, lanes)
+
+
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
     """``PinnedTierRowBackend`` whose gather is the lease chain.
 
@@ -552,7 +557,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             (capacity,), -1, dtype=torch.int64, device=host_row_map.device
         )
         self.planned = torch.full(
-            (max(capacity, device_side.wire.lanes),),
+            (padded_plan_width(capacity, device_side.wire.lanes),),
             -1,
             dtype=torch.int64,
             device=host_row_map.device,
@@ -793,9 +798,8 @@ class Exl3RamMissService:
         self.lease_pdl = False
         # The widest gather any layer planned (plan_gather_width); None until one does.
         self._gather_planned: Optional[int] = None
-        # The build's lane count and wire, fixed at start from the planned width.
-        self.wire = wire_layout(1)
-        self.lanes = self.wire.lanes
+        # The build's wire, fixed at start from the planned width.
+        self._wire: Optional[WireLayout] = None
         self._copy_armed = False
         self._copy_decodes = 0
         # Module loads that drained the device first.
@@ -834,6 +838,20 @@ class Exl3RamMissService:
             else max(self._gather_planned, planned)
         )
 
+    @property
+    def wire(self) -> WireLayout:
+        """The started build's wire; raises before ``ensure_started`` fixes the lane count."""
+        if self._wire is None:
+            raise RuntimeError(
+                "exl3 RAM miss: the build's wire is read before the service started"
+            )
+        return self._wire
+
+    @property
+    def lanes(self) -> int:
+        """The started build's lane count; raises before ``ensure_started``."""
+        return self.wire.lanes
+
     def resolved_lanes(self) -> int:
         """The lane count the service builds for: the widest planned gather, rounded up to 8."""
         return wire_layout(self._gather_planned or 1).lanes
@@ -848,7 +866,7 @@ class Exl3RamMissService:
 
     def planned_padding(self, capacity: int) -> int:
         """The length of a row backend's ``planned`` tensor: its plan width, and at least the build's lanes."""
-        return max(capacity, self.resolved_lanes())
+        return padded_plan_width(capacity, self.resolved_lanes())
 
     def row_of(self, layer_id: int) -> int:
         """The service row (position in the tables) of a streamed layer."""
@@ -914,15 +932,15 @@ class Exl3RamMissService:
                 fmt.layout, fmt.segment_map(), mirrors, direct, streamers
             ),
         )
-        layout_names, _ = host_layout()
+        lanes = self.resolved_lanes()
+        layout_names, _ = host_layout(lanes=lanes)
         if layout_names != EXL3_STREAMED_NAMES:
             raise RuntimeError(
                 f"exl3 RAM miss: the host module's layout {layout_names} is not EXL3_STREAMED_NAMES {EXL3_STREAMED_NAMES}"
             )
         pin = torch.cuda.is_available()
-        self.lanes = self.resolved_lanes()
-        self.wire = wire_layout(self.lanes)
-        page = new_page(pin=pin, wire=self.wire)
+        self._wire = wire_layout(lanes)
+        page = new_page(pin=pin, wire=self._wire)
         hot_page = new_hot_page(tables.starts.shape[1], pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
@@ -1250,7 +1268,7 @@ class Exl3RamMissService:
                     raise ValueError(
                         f"exl3 RAM miss: layer {streamer.layer_id}'s copy table does not match its sources {names}"
                     )
-                sm_mask = sm_copy_mask(names)
+                sm_mask = sm_copy_mask(names, self.lanes)
                 copy_sm = sm_copy_table(segments, sm_mask) if sm_mask else None
         streamer.row_backend = Exl3RamMissRowBackend(
             previous.segments,
