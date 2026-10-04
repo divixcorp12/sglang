@@ -41,11 +41,15 @@ struct ToyQuant {
         last_isa = isa;
         last_routes.clear();
         for (int i = 0; i < r.count[0]; ++i) last_routes.push_back(r.route(0, i));
-        if (hold.load()) {
+        if (park_here && hold.load()) {
             inside.store(true);
             while (hold.load()) std::this_thread::yield();
         }
+        // The caller's copy: a worker naming last_cpus would reach its own thread's.
+        std::vector<int>& cpus = last_cpus;
+        cpus.assign(size_t(c.threads), -1);
         run_team(c.threads, [&](int worker, int workers) {
+            cpus[size_t(worker)] = sched_getcpu();
             for (int h = worker; h < l.hidden; h += workers)
                 for (int t = 0; t < c.rows; ++t) {
                     float s = 0;
@@ -58,11 +62,15 @@ struct ToyQuant {
         });
         return 0;
     }
-    static inline Isa last_isa = Isa::Scalar;
-    static inline std::vector<Route> last_routes;  // token 0's, from the last dispatch
-    // Test-only gate: while `hold` is set, dispatch parks after setting `inside`, holding the forward lock.
+    // Per calling thread, so forwards running at once from two threads each keep their own.
+    static inline thread_local Isa last_isa = Isa::Scalar;
+    static inline thread_local std::vector<Route> last_routes;  // token 0's, from this thread's last dispatch
+    static inline thread_local std::vector<int> last_cpus;      // the CPU each worker of this thread's last team ran on
+    // Test-only gate: while `hold` is set, a dispatch on a thread that set park_here parks after setting `inside`,
+    // inside its forward.
     static inline std::atomic<bool> hold{false};
     static inline std::atomic<bool> inside{false};
+    static inline thread_local bool park_here = false;
 };
 }  // namespace
 }  // namespace toy

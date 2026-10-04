@@ -137,6 +137,7 @@ int main() {
     assert(sglang_nvfp4_cpu_experts_register_layer(&d, &layer) == 2);
     // Keep-warm returns at once when the word has already moved past `seen`.
     const uint32_t word = 1;
-    assert(sglang_nvfp4_cpu_experts_keep_warm(2, &word, 0, INT64_MAX) == 0);
-    assert(sglang_nvfp4_cpu_experts_keep_warm(0, &word, 0, INT64_MAX) == 2);
+    assert(sglang_nvfp4_cpu_experts_keep_warm(0, 2, &word, 0, INT64_MAX) == 0);
+    assert(sglang_nvfp4_cpu_experts_keep_warm(0, 0, &word, 0, INT64_MAX) == 2);
+    assert(sglang_nvfp4_cpu_experts_keep_warm(7, 1, &word, 0, INT64_MAX) == 2);  // an engine never created
 }

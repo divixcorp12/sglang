@@ -28,10 +28,11 @@ CHECKS = (
     "slot_bytes_below_the_minimum_are_refused",
     "unknown_handle_is_refused",
     "routes_are_validated",
-    "concurrent_forward_returns_3",
+    "forwards_run_at_once_and_a_free_racing_one_returns_3",
     "isa_cap_env_lowers_the_tier",
-    "set_cores_accepts_a_core_outside_the_callers_affinity",
-    "set_cores_after_the_first_forward_returns_2",
+    "engine_create_accepts_a_core_outside_the_callers_affinity",
+    "engines_are_independent_and_refuse_what_they_cannot_run",
+    "each_engines_team_runs_on_its_own_cores",
     "last_error_names_why_a_call_failed",
     "keep_warm_returns_when_the_word_moves",
 )
@@ -93,6 +94,7 @@ class _Forward(ctypes.Structure):
         ("k", ctypes.c_int32),
         ("threads", ctypes.c_int32),
         ("accumulate", ctypes.c_int32),
+        ("engine", ctypes.c_int64),
     ]
 
 
@@ -101,11 +103,15 @@ def _build_toy_library(output: Path, *flags: str) -> Path:
     return output
 
 
-def test_each_library_keeps_its_own_registry_and_cores(tmp_path):
-    # Two quant libraries in one process must not share the framework's state: a forward in one may not freeze the
-    # other's cores, and a handle registered in one is unknown to the other.
+def test_each_library_keeps_its_own_registry_and_engines(tmp_path):
+    # Two quant libraries in one process must not share the framework's state: a layer handle or an engine created in
+    # one is unknown to the other.
     a = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_a.so")))
     b = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_b.so")))
+    for library in (a, b):
+        library.sglang_toy_cpu_experts_engine_create.argtypes = [
+            ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64),
+        ]
     hidden, capacity = 16, 2
     slab = (ctypes.c_float * (hidden * capacity))(*range(hidden * capacity))
     scale = ctypes.c_float(1.0)
@@ -115,21 +121,27 @@ def test_each_library_keeps_its_own_registry_and_cores(tmp_path):
     layer.params = ctypes.cast(ctypes.byref(scale), ctypes.c_void_p)
     handle = ctypes.c_int64(-1)
     assert a.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(handle)) == 0
+    core = (ctypes.c_int32 * 1)(min(os.sched_getaffinity(0)))
+    engine = ctypes.c_int64(0)
+    assert a.sglang_toy_cpu_experts_engine_create(core, 1, ctypes.byref(engine)) == 0
 
     x = (ctypes.c_uint16 * hidden)()
     slots = (ctypes.c_int32 * 1)(1)
     weights = (ctypes.c_float * 1)(1.0)
     out = (ctypes.c_float * hidden)()
-    call = _Forward(abi_version=1, rows=1, layer=handle.value, k=1, threads=1, accumulate=0)
+    call = _Forward(abi_version=2, rows=1, layer=handle.value, k=1, threads=1, accumulate=0, engine=engine.value)
     call.x = ctypes.cast(x, ctypes.c_void_p)
     call.slots, call.weights, call.out = slots, weights, out
     assert a.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
     assert list(out) == [float(hidden + h) for h in range(hidden)]
 
-    core = (ctypes.c_int32 * 1)(min(os.sched_getaffinity(0)))
-    assert a.sglang_toy_cpu_experts_set_cores(core, 1) == 2
-    assert b.sglang_toy_cpu_experts_set_cores(core, 1) == 0
-    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2
+    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's layer is unknown to library b"
+    other = ctypes.c_int64(-1)
+    assert b.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(other)) == 0
+    call.layer = other.value
+    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's engine is unknown to library b"
+    call.engine = 0
+    assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
 
 
 def test_a_scalar_quant_library_uses_no_avx_registers(tmp_path):

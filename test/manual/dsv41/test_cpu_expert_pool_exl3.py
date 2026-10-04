@@ -123,7 +123,7 @@ def test_pool_matches_direct_kernel_calls_bit_for_bit(monkeypatch, hidden, inter
 
 
 C_NAMES = tuple(
-    f"sglang_exl3_cpu_experts_{name}" for name in ("register_layer", "free_layer", "forward", "keep_warm", "set_cores")
+    f"sglang_exl3_cpu_experts_{name}" for name in ("register_layer", "free_layer", "forward", "keep_warm", "engine_create", "engine_free")
 )
 
 
@@ -156,8 +156,8 @@ def _c_forward(trait, handle, x, slots, weights, out, accumulate=0):
     return CpuExpertForward(trait.native_forward())(ctypes.byref(call))
 
 
-def test_the_exl3_library_exports_the_five_c_names(monkeypatch):
-    """Every CPU expert quant exports the same five C functions (cpu_experts_common/cabi.hpp)."""
+def test_the_exl3_library_exports_the_six_c_names(monkeypatch):
+    """Every CPU expert quant exports the same six C functions (cpu_experts_common/cabi.hpp)."""
     import ctypes
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
@@ -216,46 +216,6 @@ def test_the_c_abi_refuses_a_slot_past_capacity(monkeypatch):
         trait.free_layer(layer)
 
 
-_SET_CORES_CHILD = """
-import ctypes, os, sys
-import torch
-sys.path.insert(0, os.path.dirname(sys.argv[1]))
-import test_cpu_expert_pool_exl3 as t
-from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-ext = t._optimized_ext()
-set_cores = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_set_cores
-set_cores.argtypes, set_cores.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
-cores = (ctypes.c_int32 * 1)(sorted(os.sched_getaffinity(0))[0])
-print("before", set_cores(cores, 1))
-trait = Exl3CpuQuantTrait(ext, act_limit=t.LIMIT)
-layer = trait.register_layer(t._random_slabs(20261004), t.CAP)
-x = torch.randn(t.H, generator=torch.Generator().manual_seed(4)).half()
-print("forward", t._c_forward(trait, layer, x, [1], [1.0], torch.empty(t.H)))
-trait.free_layer(layer)
-print("after", set_cores(cores, 1))
-try:
-    trait.native_set_cores([cores[0]])
-except RuntimeError as error:
-    print("trait", "status 2" in str(error))
-"""
-
-
-def test_set_cores_after_the_first_forward_returns_2(monkeypatch):
-    """In a fresh process: set_cores is accepted (0) before the first forward, which freezes the worker cores; a later
-    set_cores, even with the same valid core, is refused (2), and the trait raises naming the status."""
-    import subprocess
-    import sys
-
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
-    _optimized_ext()  # skips here, not in the child, when the optimized kernel is not selected
-    result = subprocess.run(
-        [sys.executable, "-c", _SET_CORES_CHILD, __file__], capture_output=True, text=True, timeout=1800
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    lines = [line for line in result.stdout.split("\n") if line.split(" ")[0] in ("before", "forward", "after", "trait")]
-    assert lines == ["before 0", "forward 0", "after 2", "trait True"], result.stdout + result.stderr
-
-
 def test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline(monkeypatch):
     """The CpuExpertKeepWarm the idle CPU expert thread calls: it holds its workers until the word differs from
     `seen` (a submit bumped it) or the CLOCK_MONOTONIC deadline passes, and refuses bad arguments with 2."""
@@ -269,13 +229,15 @@ def test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline(monkeypat
 
     if not optimized_cpu(cpu_act_defines()):
         pytest.skip("the keep-warm ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
-    keep_warm = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64)(
+    keep_warm = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64
+    )(
         Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT).native_keep_warm()
     )
     word = torch.zeros(1, dtype=torch.int32)
     far = time.monotonic_ns() + 60_000_000_000
     result = {}
-    worker = threading.Thread(target=lambda: result.setdefault("rc", keep_warm(2, word.data_ptr(), 0, far)))
+    worker = threading.Thread(target=lambda: result.setdefault("rc", keep_warm(0, 2, word.data_ptr(), 0, far)))
     worker.start()
     time.sleep(0.05)
     assert worker.is_alive(), "keep-warm returned before its word moved or its deadline"
@@ -284,11 +246,12 @@ def test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline(monkeypat
     assert not worker.is_alive() and result["rc"] == 0
 
     start = time.monotonic()
-    assert keep_warm(2, word.data_ptr(), 0, far) == 0, "a word already past `seen`"
-    assert keep_warm(2, word.data_ptr(), 1, time.monotonic_ns()) == 0, "a deadline already passed"
+    assert keep_warm(0, 2, word.data_ptr(), 0, far) == 0, "a word already past `seen`"
+    assert keep_warm(0, 2, word.data_ptr(), 1, time.monotonic_ns()) == 0, "a deadline already passed"
     assert time.monotonic() - start < 0.5
-    assert keep_warm(0, word.data_ptr(), 1, far) == 2
-    assert keep_warm(2, None, 1, far) == 2
+    assert keep_warm(0, 0, word.data_ptr(), 1, far) == 2
+    assert keep_warm(0, 2, None, 1, far) == 2
+    assert keep_warm(999, 2, word.data_ptr(), 1, far) == 2, "an engine never created"
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ class FakeForward:
     def __init__(self, result: int = 0):
         self.result = result
         self.calls = []
+        self.engines = []
         self.accumulates = []
         self.affinities = []
         self.c = CpuExpertForward(self._run)  # kept alive for as long as the host may call it
@@ -58,6 +59,7 @@ class FakeForward:
         s = [slots[i] for i in range(k)]
         w = [weights[i] for i in range(k)]
         self.calls.append((c.layer, s, w, c.threads))
+        self.engines.append(c.engine)
         self.accumulates.append(bool(accumulate))
         if self.result == 0:
             total = sum(wi * (si + 1) for si, wi in zip(s, w))
@@ -83,7 +85,7 @@ def _cores() -> list[int]:
     return sorted(os.sched_getaffinity(0))[:2]
 
 
-def _host(tmp_path, *, split, forward, copy_engine=True, parts=2):
+def _host(tmp_path, *, split, forward, copy_engine=True, parts=2, engine=0):
     # Seven slots, three staging: four mappable rows.
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False, wire=wire_layout(8))
@@ -101,7 +103,9 @@ def _host(tmp_path, *, split, forward, copy_engine=True, parts=2):
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN) if parts == 2 else (ROWS, HIDDEN), dtype=torch.float32)
     if copy_engine:
-        host.enable_cpu_experts(forward.address, split, _cores(), x_rows, out_rows, threads=2, spin_us=200)
+        host.enable_cpu_experts(
+            forward.address, split, _cores(), x_rows, out_rows, threads=2, engine=engine, spin_us=200
+        )
     return s, page, host, ChainSim(host, page, s.slabs), dst, out_rows
 
 
@@ -160,6 +164,24 @@ def test_split_n_hit_lanes_go_to_the_cpu_and_copydone_waits_for_both(tmp_path):
         counters = host.counters()
         assert counters["cpu_jobs"] == 1 and counters["cpu_lanes"] == 1
         assert host.cpu_stats()["jobs"] == 1 and host.cpu_stats()["lanes"] == 1
+    finally:
+        host.stop()
+
+
+def test_the_kernel_engine_reaches_every_cpu_forward(tmp_path):
+    """The engine handle enable_cpu_experts takes is the one every forward of the CPU expert thread carries, so the
+    kernel runs that engine's team on that engine's cores. Mutant: leave call.engine at 0 -- red."""
+    forward = FakeForward()
+    s, page, host, sim, dst, out_rows = _host(tmp_path, split=_split(n1=1), forward=forward, engine=41)
+    try:
+        _load(sim, host, [2])
+        host.set_cpu_layer(ROW, HANDLE)
+        req = _post(sim, [2])
+        assert req.kinds == [LaneKind.HIT_CPU]
+        assert host.pump() == 1
+        assert _wait(lambda: len(forward.engines) == 1)
+        assert sim.copy_wait(req)
+        assert forward.engines == [41]
     finally:
         host.stop()
 

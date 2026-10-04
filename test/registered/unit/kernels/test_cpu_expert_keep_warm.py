@@ -24,7 +24,7 @@ ROW, ROWS, DST_ROWS, HIDDEN, LANES = 1, 2, 6, 8, 8
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
-def _host(tmp_path, request, keep_warm_us):
+def _host(tmp_path, request, keep_warm_us, engine=0):
     s = ram_miss_setup(tmp_path, capacity=12, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
     host.enable_copy_engine(-1, spin_us=200)
@@ -44,6 +44,7 @@ def _host(tmp_path, request, keep_warm_us):
         x_rows,
         out_rows,
         threads=2,
+        engine=engine,
         spin_us=200,
         keep_warm=host.test_keep_warm_address(),
         keep_warm_us=keep_warm_us,
@@ -103,3 +104,13 @@ def test_stop_ends_a_running_keep_warm(tmp_path, request):
     start = time.monotonic()
     host.stop()
     assert time.monotonic() - start < 5
+
+
+def test_the_idle_thread_passes_its_engine_to_the_keep_warm(tmp_path, request):
+    """The keep-warm pins its workers to the cores of the engine it is given, which must be the engine
+    enable_cpu_experts took. Mutant: call the keep-warm with engine 0 -- red."""
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000, engine=41)
+    _run_jobs(host)
+    time.sleep(0.02)
+    assert host.test_keep_warm_calls() >= 1
+    assert host.test_keep_warm_engine() == 41

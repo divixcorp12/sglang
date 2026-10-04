@@ -28,7 +28,8 @@ C_ABI = (
     "sglang_nvfp4_cpu_experts_free_layer",
     "sglang_nvfp4_cpu_experts_forward",
     "sglang_nvfp4_cpu_experts_keep_warm",
-    "sglang_nvfp4_cpu_experts_set_cores",
+    "sglang_nvfp4_cpu_experts_engine_create",
+    "sglang_nvfp4_cpu_experts_engine_free",
 )
 
 pytestmark = pytest.mark.skipif(

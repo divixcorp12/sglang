@@ -18,9 +18,9 @@ def test_every_quant_has_the_standard_files():
         assert STANDARD <= present, (quant, sorted(STANDARD - present))
 
 
-def test_every_quant_declares_the_five_c_names():
+def test_every_quant_declares_the_six_c_names():
     for quant in QUANTS:
         prefix = quant.removesuffix("_cpu")
         header = (QUANT / quant / "optimized/cpu_experts_cabi.h").read_text()
-        for name in ("register_layer", "free_layer", "forward", "keep_warm", "set_cores"):
+        for name in ("register_layer", "free_layer", "forward", "keep_warm", "engine_create", "engine_free"):
             assert f"sglang_{prefix}_cpu_experts_{name}(" in header, (quant, name)

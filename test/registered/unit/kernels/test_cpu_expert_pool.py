@@ -378,8 +378,12 @@ class FakeServiceTrait(FakeTrait):
     def native_forward(self):
         return 0xF00D
 
-    def native_set_cores(self, cores):
-        self.events.append(("cores", list(cores)))
+    def native_create_engine(self, cores):
+        self.events.append(("engine", list(cores)))
+        return 0xE1
+
+    def native_free_engine(self, engine):
+        self.events.append(("free", engine))
 
     def native_keep_warm(self):
         return 0xBEEF
@@ -405,8 +409,10 @@ class FakeHost:
             raise self.grid
         return torch.tensor(self.grid, dtype=torch.float64)
 
-    def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads, keep_warm=0, keep_warm_us=0):
-        self.enabled = (forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads)
+    def enable_cpu_experts(self, forward, split, cores, x_rows, out_rows, *, threads, engine=0, keep_warm=0, keep_warm_us=0):
+        self.enabled = (
+            forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, engine
+        )
         self.keep_warm = (keep_warm, keep_warm_us)
 
     def set_cpu_layer(self, row, handle):
@@ -430,17 +436,17 @@ def _service(host, trait, **kw):
 
 
 def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit():
-    """The kernel's pool spawns at its first forward, which follows the first registration, so the cores go first; the
-    activation limit is only known at the layer's first forward and must be on the trait before register_layer."""
+    """The kernel's engine is created on the cores before the CPU expert thread starts; the activation limit is only
+    known at the layer's first forward and must be on the trait before register_layer."""
     host, trait = FakeHost(), FakeServiceTrait()
     svc = _service(host, trait)
     # out_rows is two parts per row: the CPU hits' partial sum and the CPU misses'.
-    assert host.enabled == (0xF00D, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2)
+    assert host.enabled == (0xF00D, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0xE1)
     assert host.layers == {}, "a row reached the grant before its registration"
     svc.register(1, 10.0)
     svc.register(1, 10.0)
     svc.register(0, 10.0)
-    assert trait.events == [("cores", [4, 5, 6]), ("register", 10.0), ("register", 10.0)]
+    assert trait.events == [("engine", [4, 5, 6]), ("register", 10.0), ("register", 10.0)]
     assert host.layers == {1: 100, 0: 101}
     with pytest.raises(ValueError, match="activation limits"):
         _service(FakeHost(), trait).register(0, 7.0)

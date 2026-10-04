@@ -30,7 +30,7 @@ int main() {
     F(SglangCpuExpertsForward, abi_version) F(SglangCpuExpertsForward, rows) F(SglangCpuExpertsForward, layer)
     F(SglangCpuExpertsForward, x) F(SglangCpuExpertsForward, slots) F(SglangCpuExpertsForward, weights)
     F(SglangCpuExpertsForward, out) F(SglangCpuExpertsForward, k) F(SglangCpuExpertsForward, threads)
-    F(SglangCpuExpertsForward, accumulate)
+    F(SglangCpuExpertsForward, accumulate) F(SglangCpuExpertsForward, engine)
     std::printf("SglangCpuExpertsLayer sizeof %zu\nSglangCpuExpertsForward sizeof %zu\n",
                 sizeof(SglangCpuExpertsLayer), sizeof(SglangCpuExpertsForward));
 }

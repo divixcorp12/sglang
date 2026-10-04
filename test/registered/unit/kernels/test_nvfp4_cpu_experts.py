@@ -1,8 +1,7 @@
 """The NVFP4 CPU expert C ABI under its OpenMP team (Linux, GCC with OpenMP).
 
-Each case runs in its own process: core configuration freezes at a process's first forward, and the OpenMP
-environment is read when the team first forms. The child registers the sanitizer harness's 80 x 80 layer (every
-weight nibble 1.0, every scale 1.0) and prints one line per call.
+Each case runs in its own process: the OpenMP environment is read when the team first forms. The child registers
+the sanitizer harness's 80 x 80 layer (every weight nibble 1.0, every scale 1.0) and prints one line per call.
 """
 
 import importlib.util
@@ -26,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 CHILD = r"""
-import ctypes, sys
+import ctypes, sys, threading
 import numpy as np
 from sglang.srt.layers.moe.cpu_experts.pool import (
     CPU_EXPERTS_FORWARD_ABI_VERSION, CPU_EXPERTS_LAYER_ABI_VERSION, CpuExpertsForwardCall, CpuExpertsLayer,
@@ -62,23 +61,63 @@ for i, (slab, stride) in enumerate([(w13, N * H), (w2, H * N // 2), (sf13, 256 *
     d.slot_bytes[i] = stride
 handle = ctypes.c_int64(-1)
 assert lib.sglang_nvfp4_cpu_experts_register_layer(ctypes.byref(d), ctypes.byref(handle)) == 0
-core_array = (ctypes.c_int32 * max(len(cores), 1))(*cores)
+engine_count = int(sys.argv[5])
+engines = []
 if cores:
-    print("cores", lib.sglang_nvfp4_cpu_experts_set_cores(core_array, len(cores)))
+    lib.sglang_nvfp4_cpu_experts_engine_create.argtypes = [
+        ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64),
+    ]
+    lib.sglang_nvfp4_cpu_experts_engine_free.argtypes = [ctypes.c_int64]
+    width = len(cores) // engine_count
+    for i in range(engine_count):
+        part = cores[i * width:(i + 1) * width]
+        created = ctypes.c_int64(0)
+        print("engine", lib.sglang_nvfp4_cpu_experts_engine_create(
+            (ctypes.c_int32 * len(part))(*part), len(part), ctypes.byref(created)))
+        engines.append(created.value)
 x = np.full(H, 0x3C00, np.uint16)  # fp16 1.0
 slots = np.zeros(1, np.int32)
 weights = np.ones(1, np.float32)
-for threads in calls:
+
+
+def forward(threads, engine):
     out = np.full(H, 123.0, np.float32)
     call = CpuExpertsForwardCall(
         abi_version=CPU_EXPERTS_FORWARD_ABI_VERSION, rows=1, layer=handle.value, x=x.ctypes.data,
         slots=slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
         weights=weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        out=out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), k=1, threads=threads, accumulate=0)
+        out=out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), k=1, threads=threads, accumulate=0, engine=engine)
     status = lib.sglang_nvfp4_cpu_experts_forward(ctypes.byref(call))
-    print("forward", threads, status, "untouched" if (out == 123.0).all() else "written")
-if cores:
-    print("cores-after", lib.sglang_nvfp4_cpu_experts_set_cores(core_array, len(cores)))
+    return status, "untouched" if (out == 123.0).all() else "written", out
+
+
+if len(engines) < 2:
+    engine = engines[0] if engines else 0
+    for threads in calls:
+        status, state, _ = forward(threads, engine)
+        print("forward", threads, status, state)
+    if engines:
+        print("free", lib.sglang_nvfp4_cpu_experts_engine_free(engine))
+        status, state, _ = forward(calls[0], engine)
+        print("freed", status, state)
+else:
+    results = {engine: [] for engine in engines}
+
+    def run(engine):
+        for _ in range(20):
+            for threads in calls:
+                results[engine].append((threads,) + forward(threads, engine))
+
+    runners = [threading.Thread(target=run, args=(engine,)) for engine in engines]
+    for runner in runners:
+        runner.start()
+    for runner in runners:
+        runner.join()
+    for engine in engines:
+        for threads, status, state, _ in results[engine]:
+            print("forward", engine, threads, status, state)
+    first, second = (results[engine] for engine in engines)
+    print("same" if all(np.array_equal(p[3], q[3]) for p, q in zip(first, second)) else "different")
 """
 
 
@@ -111,10 +150,10 @@ def library(built, request):
     return built, request.param
 
 
-def _run(library, calls, cores=(), alpha=1.0, **env):
+def _run(library, calls, cores=(), alpha=1.0, engines=1, **env):
     path, isa = library
     result = subprocess.run(
-        [sys.executable, "-c", CHILD, str(path), calls, ",".join(map(str, cores)), str(alpha)],
+        [sys.executable, "-c", CHILD, str(path), calls, ",".join(map(str, cores)), str(alpha), str(engines)],
         capture_output=True,
         text=True,
         timeout=120,
@@ -139,26 +178,33 @@ def test_a_team_smaller_than_requested_fails_the_forward_and_leaves_out_untouche
     assert _run(library, "4", OMP_THREAD_LIMIT="2") == ["forward 4 1 untouched"]
 
 
-def test_more_workers_than_configured_cores_fails_the_forward(library):
-    # Only the first two lines: whether cores can still change after this refused forward differs between the old
-    # pool (it refused before starting, so yes) and the OpenMP team (the cores froze at the attempt), and neither is
-    # a contract.
-    assert _run(library, "2", cores=_allowed(1))[:2] == ["cores 0", "forward 2 1 untouched"]
+def test_more_workers_than_the_engines_cores_is_refused_and_leaves_out_untouched(library):
+    assert _run(library, "2", cores=_allowed(1)) == ["engine 0", "forward 2 2 untouched", "free 0", "freed 2 untouched"]
 
 
-def test_cores_cannot_change_after_the_first_forward(library):
-    assert _run(library, "2", cores=_allowed(2)) == ["cores 0", "forward 2 0 written", "cores-after 2"]
+def test_a_freed_engine_is_refused(library):
+    assert _run(library, "2", cores=_allowed(2)) == ["engine 0", "forward 2 0 written", "free 0", "freed 2 untouched"]
 
 
 def test_a_worker_that_cannot_be_pinned_fails_the_forward_and_leaves_out_untouched(library, tmp_path):
-    # set_cores checks only range and uniqueness; a core the kernel cannot pin fails the first forward. A preloaded
+    # engine_create checks only range and uniqueness; a core the kernel cannot pin fails the forward. A preloaded
     # pthread_setaffinity_np that always fails stands in for that.
     shim = tmp_path / "unpinnable.c"
     shim.write_text("int pthread_setaffinity_np(unsigned long t, unsigned long n, const void* s) { return 22; }\n")
     so = tmp_path / "libunpinnable.so"
     subprocess.run([CXX, "-x", "c", "-shared", "-fPIC", str(shim), "-o", str(so)], check=True)
     lines = _run(library, "2", cores=_allowed(2), LD_PRELOAD=str(so))
-    assert lines[:2] == ["cores 0", "forward 2 1 untouched"]
+    assert lines[:2] == ["engine 0", "forward 2 1 untouched"]
+
+
+def test_two_engines_forward_at_once_without_a_busy_status(library):
+    """Part 3: a CPU expert engine per NUMA group, both forwarding at once. The process-wide forward lock returned 3
+    to the second; with per-engine cores both run and agree byte for byte."""
+    lines = _run(library, "2,2,2", cores=_allowed(4), engines=2)
+    assert lines[:2] == ["engine 0", "engine 0"]
+    forwards = [line.split() for line in lines if line.startswith("forward")]
+    assert len(forwards) == 2 * 20 * 3 and all(f[3] == "0" and f[4] == "written" for f in forwards), lines
+    assert lines[-1] == "same"
 
 
 def test_an_intermediate_q8_cannot_represent_returns_2_and_leaves_out_untouched(library):
