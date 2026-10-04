@@ -23,7 +23,7 @@ from sglang.test.dsv41_ram_miss_fixtures import ROW_IMAGE_DIM, paused, service_r
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
-LAYERS, EXPERTS, CAPACITY = 2, 6, 8
+LAYERS, EXPERTS, CAPACITY = 2, 8, 8
 
 
 @pytest.fixture
