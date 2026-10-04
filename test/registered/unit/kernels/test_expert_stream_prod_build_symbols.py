@@ -31,9 +31,12 @@ def _loaded_path(module_name: str) -> str:
     raise AssertionError(f"{module_name}.so is not mapped")
 
 
+LANES = 8  # the default build; load_jit names the module _l<lanes>
+
+
 def _symbols(variant: str) -> str:
-    ops._host_module("exl3", variant).expert_stream_build_name()
-    path = _loaded_path(f"expert_stream_host_exl3_{variant}")
+    ops._host_module("exl3", variant, LANES).expert_stream_build_name()
+    path = _loaded_path(f"expert_stream_host_exl3_{variant}_l{LANES}")
     return subprocess.run(["nm", "-C", path], capture_output=True, text=True, check=True).stdout
 
 

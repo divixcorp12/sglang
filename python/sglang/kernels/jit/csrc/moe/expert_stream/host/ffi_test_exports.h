@@ -752,10 +752,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
           }
           std::atomic_thread_fence(std::memory_order_seq_cst);
           store_release(record + Wire::kRecSeq, round * Wire::kDemandRecords + 1u);  // seqs of one ring slot
-          // Hold every 64th record stable for 20 us so a starved reader still gets a whole copy under CPU load.
+          // Hold every 64th record stable for a few us so a starved reader still gets a whole copy under CPU load.
+          // A fixed spin count, not a deadline: this file reads the clock only where the census registers it.
           if (round % 64u == 0) {
-            for (const int64_t until = now_ns() + 20'000; now_ns() < until;) {
-            }
+            for (int spin = 0; spin < 256; ++spin)
+              _mm_pause();
           }
         }
       });

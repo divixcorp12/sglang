@@ -571,8 +571,8 @@ def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
     ).read_text()
     # Whitespace-normalized, so clang-format may wrap a call's arguments without breaking the pin.
     tier = " ".join(source.split())
-    assert "store_release(lease_ + kLeaseCopyGate" not in tier
+    assert "store_release(lease_ + Wire::kLeaseCopyGate" not in tier
     assert (
-        tier.count("std::memcpy(lease_ + kLeaseCopyGate") == 1
+        tier.count("std::memcpy(lease_ + Wire::kLeaseCopyGate") == 1
     )  # init_lease_block, before any thread
-    assert "reinterpret_cast<uint32_t*>(lease_ + kLeaseCopyGate), &expected" in tier
+    assert "reinterpret_cast<uint32_t*>(lease_ + Wire::kLeaseCopyGate), &expected" in tier
