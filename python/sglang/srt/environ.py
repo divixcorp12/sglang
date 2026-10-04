@@ -1465,6 +1465,10 @@ class Envs:
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # The -march of JIT host code. None = unset = the host compiler's `-march=native`,
+    # resolved to a concrete name so the build key carries it. `default` keeps the
+    # compiler's own arch; any other value is passed as `-march=<value>` verbatim.
+    SGLANG_JIT_HOST_MARCH = EnvStr(None)
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
