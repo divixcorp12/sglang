@@ -65,7 +65,8 @@ def test_a_two_name_host_serves_a_demand_through_its_own_module(two, tmp_path, m
     loaded = []
     real = transport._host_module
     monkeypatch.setattr(
-        transport, "_host_module", lambda layout="exl3", variant=None: loaded.append(layout) or real(layout, variant)
+        transport, "_host_module",
+        lambda layout="exl3", variant=None, lanes=8: loaded.append(layout) or real(layout, variant, lanes),
     )
     page = new_page(pin=False)
     slot_map = torch.full(tuple(t.starts.shape), -1, dtype=torch.int32)

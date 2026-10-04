@@ -196,6 +196,7 @@ def test_a_lane_the_copy_engine_cannot_take_is_an_sm_hit(tmp_path, case):
             sim.replica.ram_slot[ROW],
             sim.replica.staging[ROW],
             sim.split(),
+            lanes=sim.wire.lanes,
             captured=case != "uncaptured",
             copy_armed=sim.copy_armed(),
             hit_copy="ce",
