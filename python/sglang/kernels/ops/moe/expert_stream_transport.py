@@ -111,6 +111,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "read_rows_sqes",
     "inject",
     "inject_fault",
+    "inject_group_stall",
     "copy_engine_fail",
     "copy_engine_ballast",
     "trace_clock_reads",
@@ -1664,21 +1665,22 @@ class ExpertStreamHost:
         out_rows: torch.Tensor,
         *,
         threads: int,
+        group: int = 0,
         engine: int = 0,
         spin_us: int = 50_000,
         keep_warm: int = 0,
         keep_warm_us: int = 0,
     ) -> None:
-        """Start the CPU expert thread (after the copy engine, before the service).
+        """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
         ``forward`` is the trait's native forward (a ``CpuExpertForward`` address); each
         row joins once its layer handle is set (:meth:`set_cpu_layer`). Of a captured
         post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..``wire.lanes``;
         the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
-        (float32 ``[rows, hidden]``, or ``[rows, 2, hidden]`` for a CPU-hit and a
-        CPU-miss partial sum each) are pinned host rows: the post kernel stages a row's
-        input in the first, the CPU writes its partial sums to the second and the device
-        reads them. The host keeps references to both. ``engine`` is the kernel's engine
+        (float32 ``[rows, hidden]`` at one node, otherwise ``[rows, 2 * nodes, hidden]``:
+        group g's CPU-hit and CPU-miss partial sums are parts ``2g`` and ``2g + 1``) are
+        pinned host rows: the post kernel stages a row's input in the first, the CPU
+        writes its partial sums to the second and the device reads them. The host keeps references to both. ``engine`` is the kernel's engine
         handle (``native_create_engine``), carried by every forward and keep-warm; 0 runs
         unpinned workers. ``keep_warm`` is the trait's
         native keep-warm (a ``CpuExpertKeepWarm`` address, 0 for none), which the idle
@@ -1698,24 +1700,27 @@ class ExpertStreamHost:
             raise ValueError("x_rows must be a contiguous host uint8 [rows, n] tensor")
         if (
             out_rows.dtype != torch.float32
-            or out_rows.dim() not in (2, 3)
             or out_rows.device.type != "cpu"
             or not out_rows.is_contiguous()
-            or (out_rows.dim() == 3 and out_rows.shape[1] != 2)
+            or not (
+                (out_rows.dim() == 2 and self.nodes == 1)
+                or (out_rows.dim() == 3 and out_rows.shape[1] == 2 * self.nodes)
+            )
         ):
             raise ValueError(
-                "out_rows must be a contiguous host float32 [rows, hidden] or [rows, 2, hidden] tensor"
+                "out_rows must be a contiguous host float32 [rows, hidden] at one node or [rows, 2 * nodes, hidden] tensor"
             )
         parts = 1 if out_rows.dim() == 2 else 2
         hidden = int(out_rows.shape[-1])
         self._module.expert_stream_enable_cpu_experts(
             self.handle,
+            int(group),
             int(forward),
             int(engine),
             torch.tensor(list(split), dtype=torch.int64),
             torch.tensor(list(cores), dtype=torch.int64),
             x_rows,
-            out_rows.view(out_rows.shape[0], parts * hidden),
+            out_rows.view(out_rows.shape[0], -1),
             hidden,
             parts,
             int(threads),
@@ -1733,8 +1738,8 @@ class ExpertStreamHost:
         self._check(row)
         self._module.expert_stream_set_cpu_layer(self.handle, row, int(handle))
 
-    def set_cpu_split(self, split: Sequence[int]) -> None:
-        """Set a new split table (CPU lanes per n eligible lanes, n = 0..``wire.lanes``).
+    def set_cpu_split(self, split: Sequence[int], group: int = 0) -> None:
+        """Set NUMA group ``group``'s new split table (CPU lanes per n eligible lanes, n = 0..``wire.lanes``).
 
         Allowed at any time; the device reads it.
         """
@@ -1743,13 +1748,13 @@ class ExpertStreamHost:
                 f"the CPU split table has {self.wire.lanes + 1} entries (n = 0..{self.wire.lanes}), not {len(split)}"
             )
         self._module.expert_stream_set_cpu_split(
-            self.handle, torch.tensor(list(split), dtype=torch.int64)
+            self.handle, int(group), torch.tensor(list(split), dtype=torch.int64)
         )
 
-    def cpu_stats(self) -> dict[str, int]:
-        """Return the jobs and lanes the CPU expert thread computed, and its forward ns."""
+    def cpu_stats(self, group: int = 0) -> dict[str, int]:
+        """Return the jobs and lanes group ``group``'s CPU expert thread computed, and its forward ns."""
         out = torch.zeros(3, dtype=torch.int64)
-        self._module.expert_stream_cpu_stats(self.handle, out)
+        self._module.expert_stream_cpu_stats(self.handle, int(group), out)
         jobs, lanes, ns = out.tolist()
         return {"jobs": jobs, "lanes": lanes, "forward_ns": ns}
 
@@ -1768,8 +1773,9 @@ class ExpertStreamHost:
         reps: int,
         scratch: torch.Tensor,
         timeout_s: float = 1.0,
+        group: int = 0,
     ) -> torch.Tensor:
-        """Run the CPU split's startup calibration on ``row``.
+        """Run the CPU split's startup calibration on ``row``, on group ``group``'s engine and RAM slots.
 
         Returns float64 ``calibration_shape(wire.lanes)`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
         row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no
@@ -1779,6 +1785,7 @@ class ExpertStreamHost:
         out = torch.zeros(calibration_shape(self.wire.lanes), dtype=torch.float64)
         self._module.expert_stream_calibrate_cpu_split(
             self.handle,
+            int(group),
             int(row),
             int(device),
             int(reps),
@@ -1923,6 +1930,11 @@ class ExpertStreamHost:
         self._module.expert_stream_inject(
             self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands
         )
+
+    def inject_group_stall(self, group: int, seconds: float) -> None:
+        """Test only: NUMA group ``group``'s service thread sleeps ``seconds`` before it reads its next record."""
+        _refuse_test_only("inject_group_stall", self.variant)
+        self._module.expert_stream_inject_group_stall(self.handle, int(group), int(seconds * 1e9))
 
     def piece_runs(self) -> torch.Tensor:
         """Return the stream kernel's piece table.

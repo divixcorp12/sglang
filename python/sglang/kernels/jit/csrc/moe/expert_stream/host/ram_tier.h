@@ -85,8 +85,6 @@ class RamTier {
   using Build = typename Source::BuildType;  // ProdBuild or InstrBuild (build_policy.h)
   using Engine = CopyEngine<Build, RamTier>;
   using Group = NumaGroup<Source>;
-  static constexpr const char* kNeedsCombiner =
-      "the copy engine and CPU experts with several NUMA groups need the combiner's completion side";
   // The copy thread's callbacks are copy_completed and copy_failed; it also reads stats_ for its latency max.
   friend Engine;
 
@@ -231,6 +229,9 @@ class RamTier {
     const bool posted = head != 0 && reached(head, group.next_demand);
     if (admission_closed_.load()) return false;
     if (!posted) return false;
+    if constexpr (Build::kFaults) {
+      if (const int64_t ns = faults_.group_stall_ns[g].exchange(0)) fault_delay(ns);
+    }
     if (g == 0) begin_stage(kStageDemand, group.next_demand, head - group.next_demand);
     if (head - group.next_demand >= Wire::kDemandRecords) {
       // Lapped: resume at head - 14 (head - 15 may be mid-rewrite) and count every skipped seq. Only records nothing
@@ -569,7 +570,6 @@ class RamTier {
   void enable_copy_engine(int64_t device, int64_t spin_ns, int64_t wait_timeout_ns) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable the copy engine before the service thread starts");
-    if (Wire::kNodes > 1) throw std::runtime_error(error_prefix<Layout>() + kNeedsCombiner);
     if (copy_engine_ != nullptr)
       throw std::runtime_error(error_prefix<Layout>() + "the copy engine is already enabled");
     const std::string copy_prefix = std::string(Layout::kName) + " RAM miss copy engine: ";
@@ -580,7 +580,7 @@ class RamTier {
       backend = std::make_unique<CudaCopyBackend>(static_cast<int>(device), copy_prefix);
     }
     auto engine = std::make_unique<Engine>(
-        std::move(backend), layers_, spin_ns, this, copy_prefix, std::string(Layout::kName) + "-copy-eng");
+        std::move(backend), layers_, dist_.size(), spin_ns, this, copy_prefix, std::string(Layout::kName) + "-copy-eng");
     if (wait_timeout_ns <= 0)
       throw std::runtime_error(error_prefix<Layout>() + "the copy-wait timeout must be positive");
     copy_wait_timeout_ns_ = wait_timeout_ns;
@@ -655,54 +655,89 @@ class RamTier {
 
   // ---- CPU experts ----
 
-  // Creates the CPU expert engine. The device types a captured post's CPU lanes as the last split[n] of its n eligible
-  // lanes (Wire::kSplit, written here and by set_cpu_split). The service hands them to the CPU expert thread and the
-  // copy thread waits for them, so CopyDone covers them. Needs the copy engine; call before the service thread starts.
-  void enable_cpu_experts(CpuExpertConfig config, std::vector<int64_t> split) {
+  // Creates group g's CPU expert engine, on that group's cores. The device types a captured post's CPU lanes as the
+  // last split[n] of its n eligible lanes (the node's table at Wire::kSplit, written here and by set_cpu_split). The
+  // service hands them to the group's CPU expert thread and the copy thread waits for them, so CopyDone covers them.
+  // Needs the copy engine; call before the service thread starts.
+  void enable_cpu_experts(int g, CpuExpertConfig config, std::vector<int64_t> split) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable CPU experts before the service thread starts");
-    if (Wire::kNodes > 1) throw std::runtime_error(error_prefix<Layout>() + kNeedsCombiner);
+    if (g < 0 || g >= groups())
+      throw std::runtime_error(error_prefix<Layout>() + "CPU experts name group " + std::to_string(g) + " of " + std::to_string(groups()));
     if (copy_engine_ == nullptr)
       throw std::runtime_error(
           error_prefix<Layout>() + "CPU experts need the copy engine, which completes their lanes");
-    std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(0).cpu;
-    if (cpu != nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are already enabled");
+    std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(g).cpu;
+    if (cpu != nullptr)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU experts are already enabled for group " + std::to_string(g));
     config.rows = layers_;
-    store_split(split.data(), static_cast<int64_t>(split.size()));
+    store_split(g, split.data(), static_cast<int64_t>(split.size()));
     const std::string prefix = std::string(Layout::kName) + " CPU experts: ";
-    auto engine = std::make_unique<CpuExpertEngine>(std::move(config), prefix, std::string(Layout::kName) + "-cpu-exp");
+    const std::string suffix = Wire::kNodes > 1 ? std::to_string(g) : std::string();
+    auto engine =
+        std::make_unique<CpuExpertEngine>(std::move(config), prefix, std::string(Layout::kName) + "-cpu-exp" + suffix);
     engine->start();
     cpu = std::move(engine);
-    copy_engine_->set_cpu(cpu.get());
+    copy_engine_->set_cpu(g, cpu.get());
   }
 
-  // Registers `row`'s layer handle, from the trait's register_layer. Any time, once per row; until then no post types a
-  // CPU lane for the row.
+  // Registers `row`'s layer handle, from the trait's register_layer, on every group's engine: the kernel's handle
+  // addresses the whole slab, so one serves them all. Any time, once per row; until then no post types a CPU lane for
+  // the row.
   void set_cpu_layer(int64_t row, int64_t handle) {
-    const std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(0).cpu;
-    if (cpu == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
-    cpu->set_layer(row, handle);
+    bool any = false;
+    for (int g = 0; g < groups(); ++g) {
+      if (dist_.group(g).cpu == nullptr) continue;
+      dist_.group(g).cpu->set_layer(row, handle);
+      any = true;
+    }
+    if (!any) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
   }
 
-  // Replaces the split table, for re-tuning. Any time; the device reads each entry once per post.
-  void set_cpu_split(const int64_t* split, int64_t count) {
-    const std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(0).cpu;
-    if (cpu == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
-    store_split(split, count);
+  // Replaces group g's split table, for re-tuning. Any time; the device reads each entry once per post.
+  void set_cpu_split(int g, const int64_t* split, int64_t count) {
+    if (cpu_engine(g) == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+    store_split(g, split, count);
   }
 
-  // The CPU expert thread's metrics, {jobs, lanes, forward ns}; zeros when CPU experts are off.
-  void cpu_stats(int64_t* out) const {
-    const std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(0).cpu;
+  // Group g's CPU expert thread's metrics, {jobs, lanes, forward ns}; zeros when its CPU experts are off.
+  void cpu_stats(int g, int64_t* out) const {
+    const CpuExpertEngine* cpu = cpu_engine(g);
     out[0] = cpu != nullptr ? cpu->jobs() : 0;
     out[1] = cpu != nullptr ? cpu->lanes() : 0;
     out[2] = cpu != nullptr ? cpu->compute_ns() : 0;
   }
 
-  // The CPU experts' cores, empty without CPU experts. For the caller, before the service thread starts.
+  // Every group's CPU experts' cores, empty without CPU experts. For the caller, before the service thread starts.
   std::vector<int> cpu_cores() const {
-    const std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(0).cpu;
-    return cpu != nullptr ? cpu->cores() : std::vector<int>{};
+    std::vector<int> cores;
+    for (int g = 0; g < groups(); ++g) {
+      if (dist_.group(g).cpu == nullptr) continue;
+      const std::vector<int> own = dist_.group(g).cpu->cores();
+      cores.insert(cores.end(), own.begin(), own.end());
+    }
+    return cores;
+  }
+
+  // The copy thread's reason for withholding CopyDone, for the watchdog's abort: "; group G: its CPU job S is not
+  // done" or "; group G: sent no part". Empty at one group, whose abort line stays as it was, or when nothing waits.
+  std::string copy_stall() const {
+    if (Wire::kNodes == 1 || copy_engine_ == nullptr) return "";
+    const uint64_t word = copy_engine_->stall();
+    const std::string group = "; group " + std::to_string(word >> 8 & 0xFF);
+    switch (word & 0xFF) {
+      case Engine::kStallCpu:
+        return group + ": its CPU job " + std::to_string(word >> 32) + " is not done";
+      case Engine::kStallNoPart:
+        return group + ": sent no part";
+      default:
+        return "";
+    }
+  }
+
+  const CpuExpertEngine* cpu_engine(int g) const {
+    if (g < 0 || g >= groups()) throw std::runtime_error(error_prefix<Layout>() + "no NUMA group " + std::to_string(g));
+    return dist_.group(g).cpu.get();
   }
 
   // The bytes the DMA moves per expert of `row`: its copy table less the SM entries.
@@ -716,6 +751,7 @@ class RamTier {
   // owner's. device -1 copies with the test backend; `scratch` holds kCalibLanes experts on that device. Throws on bad
   // arguments, a failed copy or a timeout.
   void calibrate_cpu_split(
+      int g,
       int64_t row,
       int64_t device,
       int64_t reps,
@@ -725,20 +761,23 @@ class RamTier {
       double* out) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("calibrate_cpu_split");
-    const std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(0).cpu;
     const std::string prefix = error_prefix<Layout>() + "calibration: ";
+    if (g < 0 || g >= groups()) throw std::runtime_error(prefix + "group " + std::to_string(g) + " does not exist");
+    const std::unique_ptr<CpuExpertEngine>& cpu = dist_.group(g).cpu;
     if (cpu == nullptr) throw std::runtime_error(prefix + "CPU experts are not enabled");
     if (copy_engine_ == nullptr) throw std::runtime_error(prefix + "the copy engine is not enabled");
     if (row < 0 || row >= layers_) throw std::runtime_error(prefix + "row out of range");
     if (!cpu->eligible(row))
       throw std::runtime_error(prefix + "row " + std::to_string(row) + " has no registered CPU layer");
-    if (tiers_[row].capacity < kCalibLanes)
+    const GroupRow& own = dist_.group(g).rows[row];
+    if (own.hi - own.lo < kCalibLanes)
       throw std::runtime_error(
-          prefix + "it needs 8 RAM slots in row " + std::to_string(row) + ", the row has " +
-          std::to_string(tiers_[row].capacity));
+          prefix + "it needs " + std::to_string(kCalibLanes) + " RAM slots of group " + std::to_string(g) + " in row " +
+          std::to_string(row) + ", the group has " + std::to_string(own.hi - own.lo));
     if (reps < 1 || timeout_ns <= 0) throw std::runtime_error(prefix + "reps and the timeout must be positive");
     CalibrationSetup s;
     s.cpu = cpu.get();
+    s.first_slot = own.lo;
     s.row = row;
     s.entries = copy_engine_->dma_entries(row);
     const int64_t need = kCalibLanes * calibration_expert_bytes(s.entries);
@@ -978,6 +1017,17 @@ class RamTier {
       faults_.delay_ns.store(delay_ns);
       faults_.fail_reads.store(fail_reads);
       faults_.delay_after.store(after_demands);
+    }
+  }
+
+  // Test only (InstrBuild; ProdBuild throws): group g's service sleeps `ns` once, before it reads its next record.
+  void inject_group_stall(int g, int64_t ns) {
+    if constexpr (!Build::kFaults) {
+      (void)g, (void)ns;
+      test_only("inject_group_stall");
+    } else {
+      if (g < 0 || g >= groups()) throw std::runtime_error(error_prefix<Layout>() + "no NUMA group " + std::to_string(g));
+      faults_.group_stall_ns[g].store(ns);
     }
   }
 
@@ -1312,9 +1362,9 @@ class RamTier {
     bulk_.push_back({static_cast<int32_t>(row), static_cast<int32_t>(expert), slot});
   }
 
-  // Validates the split table (one entry per n = 0..Wire::kLanes, 0 <= split[n] <= n) and publishes it to the device
-  // with relaxed stores; the device reads each entry once per post.
-  void store_split(const int64_t* split, int64_t count) {
+  // Validates group g's split table (one entry per n = 0..Wire::kLanes, 0 <= split[n] <= n) and publishes it to the
+  // device, in its node's table, with relaxed stores; the device reads each entry once per post.
+  void store_split(int g, const int64_t* split, int64_t count) {
     if (count != static_cast<int64_t>(Wire::kLanes) + 1)
       throw std::runtime_error(error_prefix<Layout>() + "the CPU split table has one entry per n = 0..Wire::kLanes");
     for (int64_t n = 0; n < count; ++n)
@@ -1322,7 +1372,7 @@ class RamTier {
         throw std::runtime_error(error_prefix<Layout>() + "the CPU split table must satisfy 0 <= split[n] <= n");
     for (int64_t n = 0; n < count; ++n)
       __atomic_store_n(
-          reinterpret_cast<int32_t*>(lease_ + Wire::kSplit) + n, static_cast<int32_t>(split[n]), __ATOMIC_RELAXED);
+          reinterpret_cast<int32_t*>(lease_ + Wire::kSplit + g * Wire::kSplitStride) + n, static_cast<int32_t>(split[n]), __ATOMIC_RELAXED);
   }
 
   // Ends the slot's prefill ownership: decode used it, or it is gone. `own` is the row of the group whose range holds
@@ -1634,6 +1684,8 @@ class RamTier {
     job.gen = request.gen;
     job.idx = plan->idx;
     job.row = request.row;
+    job.group = group.index;
+    job.groups = NumaNodeDistributor<Source>::host_nodes(request);
     if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
     this->template count<kCopyJobs>(group);
     this->template count<kCopyLanes>(group, job.count + job.late_cpu);
@@ -1661,7 +1713,7 @@ class RamTier {
         submit_cpu_job(group, request, cpu_job);
       }
     }
-    copy_engine_->submit(job);
+    copy_engine_->submit(group.index, job);
     return misses;
   }
 
@@ -1910,6 +1962,7 @@ class RamTier {
     std::mutex fault_mutex;  // guards pending_fault between inject_fault() and the service thread
     ReadFault pending_fault{};
     std::atomic<bool> fault_pending{false};
+    std::array<std::atomic<int64_t>, Wire::kNodes> group_stall_ns{};  // inject_group_stall, once per group
   };
   struct NoTierFaults {};
   [[no_unique_address]] std::conditional_t<Build::kFaults, TierFaults, NoTierFaults> faults_;

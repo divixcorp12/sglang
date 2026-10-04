@@ -372,16 +372,17 @@ struct HostExports {
     find(handle)->arm_copy_engine(on != 0);
   }
 
-  // Enables CPU experts. `forward` is a CpuExpertForward's address (the trait's native forward), whose layers
+  // Enables NUMA group `group`'s CPU experts. `forward` is a CpuExpertForward's address (the trait's native forward), whose layers
   // register later (set_cpu_layer). `split` is int64 [Wire::kLanes + 1], CPU lanes per n eligible lanes; `cores` is
   // int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host memory, where
-  // the post kernel writes a row's input; `out_rows` is float32 [rows, >= parts * hidden] in host memory, where the
-  // device reads a row's CPU partial sums (part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both tensors
-  // must outlive the service. `engine` is the kernel's engine handle (its engine_create; 0: none), carried by every
+  // the post kernel writes a row's input; `out_rows` is float32 [rows, >= Wire::kNodes * parts * hidden] in host
+  // memory, where the device reads a row's CPU partial sums (group g's part 0 the CPU hits', part 1 the CPU misses'
+  // when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. `engine` is the kernel's engine handle (its engine_create; 0: none), carried by every
   // forward and keep-warm. `keep_warm` is a CpuExpertKeepWarm's address (0 for none) that the idle thread runs for
   // keep_warm_ns after each job.
   static void enable_cpu_experts(
       int64_t handle,
+      int64_t group,
       int64_t forward,
       int64_t engine,
       TensorView split,
@@ -414,12 +415,14 @@ struct HostExports {
       config.cores.push_back(static_cast<int>(c[i]));
     config.x_base = static_cast<const uint8_t*>(x_rows.data_ptr());
     config.x_stride = x_rows.size(1);
-    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr());
-    config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
     if (parts != 1 && parts != 2)
       throw std::runtime_error(error_prefix<Layout>() + "CPU experts write 1 or 2 output parts");
-    if (out_rows.size(1) < parts * hidden)
-      throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than its parts");
+    if (group < 0 || group >= expert_stream::Wire::kNodes)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU experts name a group the build does not have");
+    if (out_rows.size(1) < expert_stream::Wire::kNodes * parts * hidden)
+      throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than every group's parts");
+    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr()) + group * parts * hidden * sizeof(float);
+    config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
     config.out_part_stride = parts == 2 ? hidden * static_cast<int64_t>(sizeof(float)) : 0;
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
@@ -428,7 +431,7 @@ struct HostExports {
     config.keep_warm = reinterpret_cast<expert_stream::CpuExpertKeepWarm>(static_cast<intptr_t>(keep_warm));
     config.keep_warm_ns = keep_warm != 0 ? keep_warm_ns : 0;
     const auto* sp = static_cast<const int64_t*>(split.data_ptr());
-    find(handle)->enable_cpu_experts(std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
+    find(handle)->enable_cpu_experts(static_cast<int>(group), std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
   }
 
   // CPU experts: `row`'s layer handle (the trait's register_layer), once per row, at any time.
@@ -456,20 +459,20 @@ struct HostExports {
     find(handle)->take_bulk_delta(static_cast<int32_t*>(out.data_ptr()), out.size(0));
   }
 
-  // CPU experts: installs a new split table (int64 [Wire::kLanes + 1]), at any time.
-  static void set_cpu_split(int64_t handle, TensorView split) {
+  // CPU experts: installs group `group`'s new split table (int64 [Wire::kLanes + 1]), at any time.
+  static void set_cpu_split(int64_t handle, int64_t group, TensorView split) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("split", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), split);
-    find(handle)->set_cpu_split(static_cast<const int64_t*>(split.data_ptr()), split.size(0));
+    find(handle)->set_cpu_split(static_cast<int>(group), static_cast<const int64_t*>(split.data_ptr()), split.size(0));
   }
 
-  // CPU experts' metrics: out int64 [3] = {jobs, lanes, forward ns}.
-  static void cpu_stats(int64_t handle, TensorView out) {
+  // Group `group`'s CPU experts' metrics: out int64 [3] = {jobs, lanes, forward ns}.
+  static void cpu_stats(int64_t handle, int64_t group, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    find(handle)->cpu_stats(static_cast<int64_t*>(out.data_ptr()));
+    find(handle)->cpu_stats(static_cast<int>(group), static_cast<int64_t*>(out.data_ptr()));
   }
 
   // CPU experts' calibration: the bytes the DMA moves per expert of `row`.
@@ -480,6 +483,7 @@ struct HostExports {
   // CPU experts' startup calibration (split_calibration.h): out float64 [kCalibRows, kCalibCols] ms. The caller owns the tier.
   static void calibrate_cpu_split(
       int64_t handle,
+      int64_t group,
       int64_t row,
       int64_t device,
       int64_t reps,
@@ -496,6 +500,7 @@ struct HostExports {
             .with_device<kDLCPU>(cpu),
         out);
     find(handle)->calibrate_cpu_split(
+        static_cast<int>(group),
         row,
         device,
         reps,

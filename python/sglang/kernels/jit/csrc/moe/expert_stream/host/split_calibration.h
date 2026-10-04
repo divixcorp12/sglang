@@ -39,12 +39,13 @@ constexpr int kCalibRows = kCalibLanes + 2;
 
 // Everything one calibration needs, built by RamTier::calibrate_cpu_split.
 //
-// All measurements use one row and its host slots 0..kCalibLanes-1. Slot contents do not matter for timing; the bytes
+// All measurements use one row and its host slots first_slot..first_slot + kCalibLanes - 1. Slot contents do not matter for timing; the bytes
 // are real pinned memory of the real size and format. The DMA goes through `backend`, a private CopyBackend with its
 // own stream and completion word, and lands in `scratch`, so calibration touches no destination tensor and no CopyJob.
 struct CalibrationSetup {
   CpuExpertEngine* cpu = nullptr;
   int64_t row = 0;
+  int64_t first_slot = 0;  // the first of the kCalibLanes host slots measured (a NUMA group's lowest)
   std::vector<CopyEntry> entries;  // the entries production's DMA copies
   CopyBackend* backend = nullptr;
   HostCopyBackend* host_backend = nullptr;  // set: release each mark (the test backend completes only released ones)
@@ -61,7 +62,7 @@ inline int64_t calibration_expert_bytes(std::span<const CopyEntry> entries) {
   return bytes;
 }
 
-// Runs k CPU lanes on host slots 0..k-1 and the DMA of m experts from slots k..k+m-1, started together, and returns the
+// Runs k CPU lanes on host slots first_slot.. first_slot + k - 1 and the DMA of m experts from the k slots after them, started together, and returns the
 // ns from the start until both are observed done (queueing and wake-up included). Either side may be empty. Throws on a
 // failed copy, a full CPU ring, or past the timeout.
 inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
@@ -73,7 +74,7 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
     job.part = 0;
     job.k = k;
     for (int i = 0; i < k; ++i) {
-      job.slots[i] = i;
+      job.slots[i] = static_cast<int32_t>(s.first_slot + i);
       job.weights[i] = 1.0f;
     }
     job.seq = seq = s.cpu->claim(1);
@@ -85,7 +86,7 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
     for (const CopyEntry& entry : s.entries) {
       const uint64_t bytes = static_cast<uint64_t>(entry.bytes);
       for (int j = 0; j < m; ++j) {
-        const uint64_t src = entry.src + static_cast<uint64_t>(k + j) * bytes;
+        const uint64_t src = entry.src + static_cast<uint64_t>(s.first_slot + k + j) * bytes;
         if (const int r = s.backend->issue(base + static_cast<uint64_t>(j) * bytes, src, entry.bytes))
           throw std::runtime_error("calibration: a DMA issue failed (" + std::to_string(r) + ")");
       }

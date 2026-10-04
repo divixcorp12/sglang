@@ -260,13 +260,15 @@ class RamThread {
       const bool stuck = stuck_group >= 0;
       const bool held = gate != 0 && now - gate_since > tier_->copy_wait_timeout_ns();
       if (stuck || held) {
+        const std::string why = stuck ? "" : tier_->copy_stall();
         std::fprintf(
             stderr,
-            "FATAL %s%s%s for %.1f s; aborting instead of hanging decode\n",
+            "FATAL %s%s%s for %.1f s%s; aborting instead of hanging decode\n",
             error_prefix<typename Tier::Layout>().c_str(),
             stuck && threads_.size() > 1 ? ("group " + std::to_string(stuck_group) + ": ").c_str() : "",
             stuck ? "a request stayed in service" : "a copy wait held the decode stream",
-            static_cast<double>(stuck ? fatal_wait_ns_ : tier_->copy_wait_timeout_ns()) / 1e9);
+            static_cast<double>(stuck ? fatal_wait_ns_ : tier_->copy_wait_timeout_ns()) / 1e9,
+            why.c_str());
         std::fflush(stderr);
         prctl(PR_SET_DUMPABLE, 0);
         std::abort();

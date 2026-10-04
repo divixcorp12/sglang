@@ -887,6 +887,16 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only (RamTier::inject_group_stall): NUMA group `group`'s service sleeps `ns` before it reads its next record.
+  // InstrBuild only.
+  static void inject_group_stall(int64_t handle, int64_t group, int64_t ns) {
+    if constexpr (!Build::kFaults) {
+      test_only("inject_group_stall");
+    } else {
+      find(handle)->inject_group_stall(static_cast<int>(group), ns);
+    }
+  }
+
   // Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
   static void inject_fault(int64_t handle, TensorView fault) {
     if constexpr (!Build::kFaults) {
@@ -956,5 +966,6 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_record_fields, Exports::read_record_fields);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                 \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_group_stall, Exports::inject_group_stall);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);

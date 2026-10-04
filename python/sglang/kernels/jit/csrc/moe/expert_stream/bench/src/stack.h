@@ -168,7 +168,7 @@ class Stack {
     cpu.spin_ns = kCpuSpinNs;
     cpu.keep_warm = config_.keep_warm;
     cpu.keep_warm_ns = config_.keep_warm_ns;
-    tier_->enable_cpu_experts(std::move(cpu), std::vector<int64_t>(config_.split.begin(), config_.split.end()));
+    tier_->enable_cpu_experts(0, std::move(cpu), std::vector<int64_t>(config_.split.begin(), config_.split.end()));
     if constexpr (Build::kMetrics) {
       if (config_.trace_capacity > 0) tier_->enable_trace(config_.trace_capacity);
     }
@@ -226,13 +226,13 @@ class Stack {
 
   // Replaces the split table: of a post's n eligible hit lanes, the CPU takes the last split[n].
   void set_split(const std::array<int64_t, es::Wire::kLanes + 1>& split) {
-    tier_->set_cpu_split(split.data(), static_cast<int64_t>(split.size()));
+    tier_->set_cpu_split(0, split.data(), static_cast<int64_t>(split.size()));
   }
 
   // The CPU expert engine's totals: {jobs, lanes, forward ns}.
   std::array<int64_t, 3> cpu_stats() const {
     std::array<int64_t, 3> out{};
-    tier_->cpu_stats(out.data());
+    tier_->cpu_stats(0, out.data());
     return out;
   }
 
