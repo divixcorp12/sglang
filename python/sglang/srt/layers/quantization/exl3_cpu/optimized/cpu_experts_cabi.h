@@ -23,7 +23,7 @@ int sglang_exl3_cpu_experts_register_layer(const SglangCpuExpertsLayer*, int64_t
 int sglang_exl3_cpu_experts_free_layer(int64_t handle) EXL3_CPU_NOEXCEPT;
 // CpuExpertForward (expert_stream/host/cpu_experts.h): SglangCpuExpertsForward's rows, x FP16 [rows][hidden], out FP32
 // [rows][hidden]; rows at most 65536, k at most 32. Routing weights are converted to FP16, preserving the registered
-// EXL3 kernel's convention. A refused call (2) leaves out untouched.
+// EXL3 kernel's convention. A failed call (1 or 2) leaves out untouched.
 int sglang_exl3_cpu_experts_forward(const SglangCpuExpertsForward* call) EXL3_CPU_NOEXCEPT;
 // Holds `threads` pinned workers in register-only work at the forward's vector width until *word != seen or
 // CLOCK_MONOTONIC reaches deadline_ns (cpu_experts_common/keep_warm.hpp).

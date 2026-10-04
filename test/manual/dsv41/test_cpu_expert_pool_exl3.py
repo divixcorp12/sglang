@@ -256,6 +256,44 @@ def test_set_cores_after_the_first_forward_returns_2(monkeypatch):
     assert lines == ["before 0", "forward 0", "after 2", "trait True"], result.stdout + result.stderr
 
 
+_PIN_FAILURE_CHILD = """
+import ctypes, os, sys
+import torch
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import test_cpu_expert_pool_exl3 as t
+from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
+ext = t._optimized_ext()
+set_cores = ctypes.CDLL(ext.__file__).sglang_exl3_cpu_experts_set_cores
+set_cores.argtypes, set_cores.restype = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32], ctypes.c_int
+print("set", set_cores((ctypes.c_int32 * 1)(1023), 1))
+trait = Exl3CpuQuantTrait(ext, act_limit=t.LIMIT)
+layer = trait.register_layer(t._random_slabs(20261005), t.CAP)
+x = torch.randn(t.H, generator=torch.Generator().manual_seed(5)).half()
+out = torch.full((t.H,), 1e6)
+print("forward", t._c_forward(trait, layer, x, [1], [1.0], out))
+print("untouched", torch.equal(out, torch.full((t.H,), 1e6)))
+"""
+
+
+def test_a_forward_whose_worker_cannot_be_pinned_leaves_out_untouched(monkeypatch):
+    """In a fresh process whose only worker core (1023) does not exist: set_cores accepts it, the first forward fails
+    its pin (1) and names the reason on stderr, and an overwrite call (accumulate=0) has not zeroed out."""
+    import subprocess
+    import sys
+
+    if os.cpu_count() > 1023:
+        pytest.skip("core 1023 exists on this host")
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    _optimized_ext()
+    result = subprocess.run(
+        [sys.executable, "-c", _PIN_FAILURE_CHILD, __file__], capture_output=True, text=True, timeout=1800
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = [line for line in result.stdout.split("\n") if line.split(" ")[0] in ("set", "forward", "untouched")]
+    assert lines == ["set 0", "forward 1", "untouched True"], result.stdout + result.stderr
+    assert "cpu_experts: cannot pin" in result.stderr, result.stderr
+
+
 def test_the_c_abi_keep_warm_runs_until_its_word_moves_or_its_deadline(monkeypatch):
     """The CpuExpertKeepWarm the idle CPU expert thread calls: it holds its workers until the word differs from
     `seen` (a submit bumped it) or the CLOCK_MONOTONIC deadline passes, and refuses bad arguments with 2."""

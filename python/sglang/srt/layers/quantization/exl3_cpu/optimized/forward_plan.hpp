@@ -269,6 +269,7 @@ struct ForwardCtx
     const at::Half* x;
     float* out;
     int m_total;
+    bool zero_out;  // Overwrite: worker 0 zeroes out inside the team, so a team that never runs leaves out untouched.
     std::vector<Chunk> chunks;
 
     // workspace, per chunk (pointers into the persistent per-thread arena below: fresh
@@ -626,6 +627,8 @@ private:
     {
         [[maybe_unused]] double phase_us[6]{};
         ::sglang::cpu_experts::run_team(count, [&](int worker, int n) {
+            if (ctx.zero_out && worker == 0)
+                std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.info.hidden * sizeof(float));
             step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us);
             step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us);
             step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us);
@@ -834,7 +837,7 @@ void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, cons
     ctx.x = x;
     ctx.out = out;
     ctx.m_total = m_total;
-    if (!accumulate) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * info.hidden * sizeof(float));
+    ctx.zero_out = !accumulate;
 
     ForwardArena& ar = ForwardArena::get();
     ctx.chunks = std::move(ar.chunks);
@@ -873,7 +876,11 @@ void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, cons
         lst.clear();
     }
     const int nc = static_cast<int>(ctx.chunks.size());
-    if (!nc) { give_back(); return; }
+    if (!nc) {
+        if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * info.hidden * sizeof(float));
+        give_back();
+        return;
+    }
 
     if (layer.table) {
         const TableExperts t{layer.table.get()};
