@@ -1254,7 +1254,7 @@ class ExpertStreamHost:
             if len(rows) != len(capacity):
                 raise ValueError(f"node_ranges[{g}] has {len(rows)} rows, the tables {len(capacity)}")
             for row, (lo, hi) in enumerate(rows):
-                if not 0 <= lo < hi <= capacity[row]:
+                if not 0 <= lo <= hi <= capacity[row]:
                     raise ValueError(f"group {g}'s slots [{lo}, {hi}) of row {row} are outside its {capacity[row]} slots")
                 for other in range(g):
                     olo, ohi = self.node_ranges[other][row]

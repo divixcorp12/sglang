@@ -1109,7 +1109,7 @@ class RamTier {
       std::vector<GroupRow> rows(static_cast<size_t>(tables.layers));
       for (int64_t row = 0; row < tables.layers; ++row) {
         const auto [lo, hi] = ranges[g][row];
-        if (lo < 0 || hi > capacity[row] || lo >= hi)
+        if (lo < 0 || hi > capacity[row] || lo > hi)
           throw std::runtime_error(
               error_prefix<Layout>() + "group " + std::to_string(g) + "'s slots of row " + std::to_string(row) +
               " are outside the row");
