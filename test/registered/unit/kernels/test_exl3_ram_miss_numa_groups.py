@@ -130,7 +130,7 @@ def test_no_slot_outside_a_groups_range_is_ever_staged_or_taken(tmp_path):
 def test_a_lane_less_record_stamps_each_experts_slot_with_its_own_groups_tick(tmp_path):
     """Review S5: both groups see the record's protect ids but each stamps only its home experts, with its own clock
     (a foreign stamp would carry the other group's tick and race its owner)."""
-    s, page, host, sim = _host(tmp_path)
+    s, page, host, sim = _host(tmp_path, staging=1)
     try:
         for expert in (2, 0, 4, 1):  # node 0's clock reaches 3, node 1's 1
             _serve(sim, host, [expert])
