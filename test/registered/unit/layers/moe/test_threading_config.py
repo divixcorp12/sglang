@@ -86,6 +86,11 @@ def test_one_node_without_numa_or_cpu_experts_is_todays_runtime(divix01):
     assert pinned.plans[0] == NodePlan(group=0, node=0, ram=17, cpu=(), sq=15, busy_poll=True)
 
 
+def test_a_reserved_sq_core_is_refused_without_the_derivation(divix01):
+    with pytest.raises(ValueError, match="64-71"):
+        resolve(divix01, nodes=(0,), affinity=frozenset(range(72)), sqpoll=True, sq_thread_cpu=70)
+
+
 def test_the_override_replaces_the_plans_of_the_nodes_it_names(divix01):
     config = resolve(divix01, cpu_experts=True, sqpoll=True, numa_cores="1:ram=34,cpu=18-25,27,sq=33")
     assert config.plans[1] == NodePlan(
@@ -120,6 +125,7 @@ def test_a_server_affinity_covering_a_node_is_refused(divix01):
         ({"cores": "18-29", "nodes": (0,)}, "core 18 is on node 1"),
         ({"spin_core": 8}, "core 8 shares a physical core with the server's affinity"),
         ({"omp_thread_limit": 16}, "OMP_THREAD_LIMIT"),
+        ({"numa_cores": "1:ram=35,cpu=18-33,sq=34"}, "node 1 sets an SQPOLL core, but .* is not sqpoll"),
         (
             {"numa_cores": "1:ram=34,cpu=18-33", "spin_core": 35},
             "node 1's RAM core is set both by SGLANG_DSV41_RAM_MISS_SPIN_CORE and SGLANG_EXPERT_NUMA_CORES",

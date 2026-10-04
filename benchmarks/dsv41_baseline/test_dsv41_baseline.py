@@ -1143,7 +1143,10 @@ def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
         topology=tc.Topology.from_sysfs(str(tmp_path)), settings=tc.CoreSettings(spin_core=arm_env.SPIN_CORE),
     )
     assert config.plans[0].ram == arm_env.SPIN_CORE and config.plans[0].busy_poll
-    assert not (set(config.copy_cpus) & _cores(arm_env.DRIVER_CORES))
+    topology = tc.Topology.from_sysfs(str(tmp_path))
+    taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES) | _cores(arm_env.FREE_CORES)
+    for plan in config.plans:
+        assert not (topology.siblings[plan.ram] & taken), (plan.ram, sorted(topology.siblings[plan.ram] & taken))
     assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
 
 
