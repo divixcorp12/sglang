@@ -22,7 +22,7 @@ CPU_EXPERTS_FORWARD_ABI_VERSION = 1
 
 
 class CpuExpertsForwardCall(ctypes.Structure):
-    """``SglangCpuExpertsForward`` (``expert_stream/host/cpu_expert_forward_abi.h``); the field order is the C struct's."""
+    """``SglangCpuExpertsForward`` (``expert_stream/host/cpu_experts_abi.h``); the field order is the C struct's."""
 
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
@@ -35,6 +35,27 @@ class CpuExpertsForwardCall(ctypes.Structure):
         ("k", ctypes.c_int32),
         ("threads", ctypes.c_int32),
         ("accumulate", ctypes.c_int32),
+    ]
+
+
+CPU_EXPERTS_LAYER_ABI_VERSION = 1
+CPU_EXPERTS_MAX_SLABS = 8
+
+
+class CpuExpertsLayer(ctypes.Structure):
+    """``SglangCpuExpertsLayer`` (``expert_stream/host/cpu_experts_abi.h``); the field order is the C struct's."""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("capacity", ctypes.c_int32),
+        ("hidden", ctypes.c_int32),
+        ("intermediate", ctypes.c_int32),
+        ("activation", ctypes.c_int32),
+        ("act_limit", ctypes.c_float),
+        ("slab_count", ctypes.c_int32),
+        ("slabs", ctypes.c_void_p * CPU_EXPERTS_MAX_SLABS),
+        ("slot_bytes", ctypes.c_uint64 * CPU_EXPERTS_MAX_SLABS),
+        ("params", ctypes.c_void_p),
     ]
 
 

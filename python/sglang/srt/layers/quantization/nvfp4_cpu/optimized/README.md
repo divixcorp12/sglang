@@ -119,7 +119,7 @@ leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=I
 `OMP_PROC_BIND` unset. Concurrent forward/free/configuration is rejected (3). Stop/join the engine before freeing
 handles or slab storage; do not unload the library while callbacks are in use. The kernel requires Linux and OpenMP.
 
-The forward takes one `SglangCpuExpertsForward` (`cpu_expert_forward_abi.h`
+The forward takes one `SglangCpuExpertsForward` (`cpu_experts_abi.h`
 beside the engine, shared with the EXL3 kernel): up to 65536 token rows of up
 to eight lanes each. It skips -1 slots, preserves each row's routing order
 including duplicate slots, and supports overwrite or accumulation. Rows that

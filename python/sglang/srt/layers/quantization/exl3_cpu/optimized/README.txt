@@ -49,7 +49,7 @@ library instance: layer handles belong to that instance's registry. Packed
 matrix tensors must remain alive for the registered layer's lifetime.
 Configure distinct worker core IDs before the first forward or staging use.
 The service C ABI forward takes one SglangCpuExpertsForward (the engine's
-expert_stream/host/cpu_expert_forward_abi.h, shared with the NVFP4 kernel):
+expert_stream/host/cpu_experts_abi.h, shared with the NVFP4 kernel):
 rows token rows of FP16 activations, FP32 routing weights (converted to FP16)
 and FP32 output. Errors return a nonzero status.
 

@@ -19,7 +19,7 @@
 #pragma once
 
 #include "../lease_layout.h"
-#include "cpu_expert_forward_abi.h"
+#include "cpu_experts_abi.h"
 #include "reader_base.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
@@ -43,7 +43,7 @@ static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<u
               "the keep-warm reads kick_ as a plain uint32_t");
 
 // A format's CPU expert kernel as a C ABI: the native half of CpuExpertQuantTrait
-// (python/sglang/srt/layers/moe/cpu_experts/pool.py). `call` is cpu_expert_forward_abi.h's contract; the engine passes
+// (python/sglang/srt/layers/moe/cpu_experts/pool.py). `call` is cpu_experts_abi.h's contract; the engine passes
 // one row (rows 1) whose slots index the layer's pinned host tier. Returns 0 on success. Called from the CPU expert
 // thread only.
 using CpuExpertForward = int (*)(const SglangCpuExpertsForward* call);

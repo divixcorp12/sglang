@@ -23,3 +23,24 @@ typedef struct SglangCpuExpertsForward {
     int32_t threads;
     int32_t accumulate;
 } SglangCpuExpertsForward;
+
+#define SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION 1u
+#define SGLANG_CPU_EXPERTS_MAX_SLABS 8
+
+// One layer's pinned host tier, for every quant's register_layer: slot s of slab i starts at slabs[i] + s *
+// slot_bytes[i]. slab_count is the quant's own count (a slab the quant marks optional may be null); params points at
+// the quant's parameter struct (cpu_experts_cabi.h), or is null when the quant has none. activation 0 is gated SiLU
+// with the pre-SiLU clamp act_limit (0: none); a quant refuses (2) an activation it does not implement. The kernel
+// stores the pointers only: the registrant keeps every slab and params alive until free_layer.
+typedef struct SglangCpuExpertsLayer {
+    uint32_t abi_version;
+    int32_t capacity;
+    int32_t hidden;
+    int32_t intermediate;
+    int32_t activation;
+    float act_limit;
+    int32_t slab_count;
+    const void* slabs[SGLANG_CPU_EXPERTS_MAX_SLABS];
+    uint64_t slot_bytes[SGLANG_CPU_EXPERTS_MAX_SLABS];
+    const void* params;
+} SglangCpuExpertsLayer;

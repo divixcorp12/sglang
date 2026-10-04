@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-#include "../../../../../kernels/jit/csrc/moe/expert_stream/host/cpu_expert_forward_abi.h"
+#include "../../../../../kernels/jit/csrc/moe/expert_stream/host/cpu_experts_abi.h"
 
 #ifdef __cplusplus
 extern "C" {
