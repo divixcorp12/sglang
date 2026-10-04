@@ -4,6 +4,14 @@
 // each from the layer's LayerInfo; Dsv41Shape fixes DeepSeek V4.1's routed expert at compile time: hidden 5120,
 // intermediate 2304, 3-bit, unswizzled, gated SiLU clamped at its swiglu_limit of 10.
 
+struct Chunk
+{
+    int expert;
+    int m;
+    int token[MAX_M];
+    float weight[MAX_M];
+};
+
 struct GenericShape
 {
     static constexpr bool kFixed = false;
