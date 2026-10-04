@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import expert_stream, host_numa
-from sglang.srt.layers.moe.expert_host_tier import PAGE_BYTES, allocate_host_slab
+from sglang.srt.layers.moe.expert_host_tier import PAGE_BYTES, allocate_host_slab, allocate_host_slab_arena
 from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCacheManager, ExpertStreamer
 from sglang.srt.layers.moe.host_numa import (
     HUGE_BYTES,
@@ -432,9 +432,20 @@ class TestManagerPlacement(unittest.TestCase):
         self.assertIn(f'"numa": {{"bound_bytes": {{"0": {bound}}}', output)
         self.assertEqual(output.count('"bound_bytes"'), 1)
 
+    def test_a_slab_with_other_rows_than_slots_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "slab w has 4 rows, not the layer's 5 slots"):
+            slot_nodes({"w": _bound(4, MIB, 2 * MIB)}, 5)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_the_real_allocators_leave_slabs_slot_nodes_can_read(self):
+        placement = ((0, 4 * MIB), (1, 6 * MIB))
+        with patch.object(host_numa, "_mbind"):
+            slab = allocate_host_slab(10, (MIB,), torch.uint8, register=False, placement=placement)
+            arena = allocate_host_slab_arena(
+                10, {"a": ((MIB,), torch.uint8), "b": ((MIB,), torch.uint8)}, register=False, placement=placement
+            )
+        self.assertEqual(slot_nodes({"w": slab}, 10), [0] * 4 + [1] * 6)
+        self.assertEqual(slot_nodes(arena, 10), [0] * 4 + [1] * 6)
+
 
 
 def _bound(rows, row_bytes, seam, nodes=(0, 1)):
@@ -497,3 +508,7 @@ class TestSlotNodes(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "node 2"):
             group_ranges([[0, 0, 2, 2]], [0, 1])
         self.assertEqual(group_ranges([[0, 0, 1, 1], [0, 0, 0, 1, 1]], [0, 1]), [[(0, 2), (0, 3)], [(2, 4), (3, 5)]])
+
+
+if __name__ == "__main__":
+    unittest.main()
