@@ -6960,7 +6960,7 @@ This is the second of four v2 plans. It covers §33.3 items 1 and 2.
   - The kernel is one warp. It translated a route's remap only where `lane < top_k`, and its launcher refused more
     than 32 routes. The remap loop now strides by the warp.
   - The launcher checks the shortlist (1-32) and the routes (1-64) separately.
-  - The per-layer remap rows are sized at the 64-route bound, not at the shortlist.
+  - Layer fusion's per-layer remap rows are as wide as the routes, not the shortlist (`f503e4caa3`). BS1 is unchanged.
 - **A miss width W separate from the routes, `1136ec5f0e`.**
   - `SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES` (an `EnvInt(0)`), or `from_model(graph_gather_miss_lanes=)`, caps each
     layer's distinct misses per gather. It is capped at the routes, and 0 keeps one lane per route.
@@ -6969,6 +6969,7 @@ This is the second of four v2 plans. It covers §33.3 items 1 and 2.
     shortlist, the allocator floor (`2W`) and the attach check.
   - A width below the routes needs DIRECT (`SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2`) and refuses CPU experts.
   - `exl3_fused_moe_for` needs `top_k` resident slots, not one per route.
+  - The RAM-miss attach checks a row's staging against W, not the routes (`37cd93df93`).
 - **Clamp and flag, `7d06ed4782`.**
   - `GpuResidencyUpdater.clamp_gather_misses` runs after the DIRECT destinations, only when W is below the routes.
     It sets the shared miss count to the lanes that found a victim.
