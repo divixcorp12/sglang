@@ -413,7 +413,7 @@ def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_ho
     cache.ensure_rows(torch.tensor([1, 2]))  # full (capacity 3); 0 is the LRU-oldest row
     # Chunk 1 promoted 0 into VRAM: the hot cache holds it; no _push_hot has run yet.
     streamers[0].hot_cache = SimpleNamespace(slot_to_expert=[0, -1])
-    assert cache.evictable_rows() == 3  # the tier's 4 slots, less 0, which is_pinned already protects
+    assert cache.evictable_rows() == 2  # the tier's 4 slots, less its staging slot and 0, which is_pinned protects
     cache.ensure_rows(torch.tensor([4]))  # chunk 2's admission
     assert [_holds(service.host, row, e) for e in (0, 1, 2, 4)] == [True, False, True, True]
 
