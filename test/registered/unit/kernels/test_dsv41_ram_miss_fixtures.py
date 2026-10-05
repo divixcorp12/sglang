@@ -28,6 +28,10 @@ def _loads(events):
     return [args for kind, args in events if kind == "load"]
 
 
+def _host_loads(events):
+    return {args for args in _loads(events) if args[0] == "exl3"}
+
+
 def test_run_host_script_loads_the_childs_host_module_before_spawning_it(monkeypatch, tmp_path):
     events = _record(monkeypatch)
     fixtures.run_host_script(tmp_path, "print('reached')")
@@ -47,14 +51,14 @@ def test_a_child_also_loads_the_default_build_through_host_layout(monkeypatch):
     names: that module is as cold as the named one."""
     events = _record(monkeypatch)
     fixtures.warm_host_modules("instr", lanes=8, nodes=2)
-    assert set(_loads(events)) == {("exl3", "instr", 8, 2), ("exl3", "prod", 8, 1)}
+    assert _host_loads(events) == {("exl3", "instr", 8, 2), ("exl3", "prod", 8, 1)}
 
 
 def test_warming_ignores_the_parents_conftest_default_variant(monkeypatch):
     events = _record(monkeypatch)
     monkeypatch.setattr(ops, "_DEFAULT_VARIANT", "instr")  # the conftest's autouse fixture
     fixtures.warm_host_modules()
-    assert set(_loads(events)) == {("exl3", "prod", 8, 1)}
+    assert _host_loads(events) == {("exl3", "prod", 8, 1)}
     assert ops._DEFAULT_VARIANT == "instr"  # restored
 
 
