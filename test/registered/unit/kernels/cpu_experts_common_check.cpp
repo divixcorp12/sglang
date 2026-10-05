@@ -369,29 +369,37 @@ int main()
 
     {
         uint32_t word = 5;
-        auto warm = [&](std::span<const int> on, int32_t threads, const uint32_t* w, int64_t deadline) {
-            return status_of([&] { kernel.keep_warm(on, threads, w, 5, deadline); });
+        auto warm = [&](std::span<const int> on, int32_t threads, const uint32_t* w, uint32_t seen, int64_t until) {
+            return status_of([&] { kernel.keep_warm(on, threads, w, seen, until); });
         };
-        CHECK(warm(cores, 0, &word, now_ns() + 1000000000) == 2);
-        CHECK(warm(cores, 1, nullptr, now_ns() + 1000000000) == 2);
-        CHECK(warm(cores, team + 1, &word, now_ns() + 1000000000) == 2);
-        CHECK(warm({}, team + 1, &word, now_ns() - 1) == 0);  // no cores: no core limit
-        // An expired deadline returns at the first clock poll.
-        CHECK(warm(cores, team, &word, now_ns() - 1) == 0);
-        const int64_t start = now_ns();
-        std::thread mover([&] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
-        });
-        const int r = warm(cores, team, &word, start + 60LL * 1000000000);
-        mover.join();
-        CHECK(r == 0);
-        CHECK(now_ns() - start < 1000000000);
-        // Every tier's loop, as far as this CPU runs them, through the free function.
+        CHECK(warm(cores, 0, &word, 5, now_ns() + 1000000000) == 2);
+        CHECK(warm(cores, 1, nullptr, 5, now_ns() + 1000000000) == 2);
+        CHECK(warm(cores, team + 1, &word, 5, now_ns() + 1000000000) == 2);
+        CHECK(warm({}, team + 1, &word, 4, now_ns() - 1) == 0);  // no cores: no core limit
+        // The hold returns only when the word moves: inside the warm window, and after it (the PAUSE phase).
+        for (const int64_t window : {60LL * 1000000000, -1LL}) {
+            word = 5;
+            const int64_t start = now_ns();
+            std::thread mover([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
+            });
+            const int r = warm(cores, team, &word, 5, window < 0 ? start - 1 : start + window);
+            mover.join();
+            CHECK(r == 0);
+            CHECK(now_ns() - start >= 2000000 && now_ns() - start < 1000000000);
+        }
+        // Every tier's loop, as far as this CPU runs them, through the free function: 1 ms warm, then PAUSE until
+        // the word moves.
         for (Isa tier : {Isa::Scalar, Isa::Avx2, Isa::Bw, Isa::Vnni, Isa::Vbmi}) {
             if (tier > sglang::cpu_experts::detect_isa(Isa::Vbmi, nullptr)) break;
-            sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, {}, team, &word, 6, now_ns() + 2000000);
-            sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, {}, team, &word, 5, now_ns() + 1000000000);
+            word = 5;
+            std::thread mover([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
+            });
+            sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, {}, team, &word, 5, now_ns() + 1000000);
+            mover.join();
         }
         ok("keep_warm_returns_when_the_word_moves");
     }

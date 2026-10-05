@@ -352,8 +352,7 @@ struct HostExports {
   }
 
   // `cpus` is int64 [n], the copy thread's affinity (ThreadingConfig.copy_cpus); empty inherits the caller's.
-  static void enable_copy_engine(
-      int64_t handle, int64_t device, int64_t spin_ns, int64_t wait_timeout_ns, TensorView cpus) {
+  static void enable_copy_engine(int64_t handle, int64_t device, int64_t wait_timeout_ns, TensorView cpus) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("cpus", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cpus);
@@ -361,7 +360,7 @@ struct HostExports {
     const auto* c = static_cast<const int64_t*>(cpus.data_ptr());
     for (int64_t i = 0; i < cpus.size(0); ++i)
       list.push_back(static_cast<int>(c[i]));
-    find(handle)->enable_copy_engine(device, spin_ns, wait_timeout_ns, std::move(list));
+    find(handle)->enable_copy_engine(device, wait_timeout_ns, std::move(list));
   }
 
   // entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination;
@@ -421,8 +420,8 @@ struct HostExports {
   // `cores` is int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host
   // memory, where the post kernel writes a row's input; `out_rows` is float32 [rows, >= Wire::kNodes * parts * hidden]
   // in host memory, where the device reads a row's CPU partial sums (group g's part 0 the CPU hits', part 1 the CPU
-  // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. `keep_warm_ns` > 0 runs
-  // the kernel's keep-warm while idle for that long after each job.
+  // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. The idle engine holds its
+  // team in the kernel's keep_warm, in register work for `keep_warm_ns` after each job and in PAUSE after that.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t group,
@@ -434,7 +433,6 @@ struct HostExports {
       int64_t hidden,
       int64_t parts,
       int64_t threads,
-      int64_t spin_ns,
       int64_t keep_warm_ns) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -466,7 +464,6 @@ struct HostExports {
     config.out_part_stride = parts == 2 ? hidden * static_cast<int64_t>(sizeof(float)) : 0;
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
-    config.spin_ns = spin_ns;
     if (keep_warm_ns < 0) throw std::runtime_error(error_prefix<Layout>() + "the keep-warm window is negative");
     config.keep_warm_ns = keep_warm_ns;
     const auto* sp = static_cast<const int64_t*>(split.data_ptr());
@@ -670,8 +667,7 @@ struct HostExports {
 
   // `cpu_cores`: one core per NUMA group, -1 inherits the caller's affinity. The reserved-core rule is
   // ExpertStreamHost.start_thread's (check_not_reserved).
-  static void start_thread(
-      int64_t handle, TensorView cpu_cores, int64_t fatal_wait_ns, int64_t spin_ns, int64_t busy_poll) {
+  static void start_thread(int64_t handle, TensorView cpu_cores, int64_t fatal_wait_ns, int64_t busy_poll) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named(
@@ -715,7 +711,7 @@ struct HostExports {
     if (registry().count(handle) == 0) throw std::runtime_error(error_prefix<Layout>() + "unknown handle");
     if (thread_registry().count(handle))
       throw std::runtime_error(error_prefix<Layout>() + "the service thread already runs");
-    auto thread = std::make_shared<Thread>(std::move(tier), std::move(cores), fatal_wait_ns, spin_ns, busy_poll != 0);
+    auto thread = std::make_shared<Thread>(std::move(tier), std::move(cores), fatal_wait_ns, busy_poll != 0);
     thread->start();
     thread_registry()[handle] = std::move(thread);
   }

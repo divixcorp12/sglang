@@ -1019,7 +1019,7 @@ class Exl3RamMissService:
             cores = [-1 if plan.ram is None else plan.ram for plan in numa.plans]
             busy_poll = all(plan.busy_poll for plan in numa.plans)
             if numa.nodes == 1 and cores[0] == -1 and not busy_poll:
-                # The server's affinity, no spinning: the thread's defaults.
+                # The server's affinity: the thread spins there with PAUSE.
                 host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
             else:
                 host.start_thread(

@@ -236,10 +236,6 @@ NON_TRACE_CLOCK_READS = {
     "if (now_ns() > deadline) {": 1,
     "if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {": 1,
     "if (now_ns() > deadline) return -1;": 1,
-    # The spin budget (spec M8): idle_budget() times kProbe pauses once, on the thread that calls start() (RamThread and
-    # CopyEngine), so neither the service nor the copy thread reads the clock to pace itself.
-    "const int64_t t0 = now_ns();": 1,
-    "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread.
     "const int64_t now = now_ns();": 1,
     # The copy engine (LEASE_PROTOCOL.md, "Copy engine"): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
@@ -270,11 +266,6 @@ NON_TRACE_CLOCK_READS = {
     # The native test forward (ffi_test_exports.h, test only, refused on ProdBuild): its spin, on the CPU expert thread.
     "const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);": 1,
     "while (now_ns() < until)": 1,
-    # CpuExpertEngine's keep-warm window (cpu_experts.h), on the CPU expert thread only: the job's end stamp (above)
-    # sets it, and one read per idle poll checks it until it expires. The native test keep-warm (test only) spins on its
-    # deadline there too.
-    "if (now_ns() < warm_until)": 1,
-    "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < deadline_ns)": 1,
     # UringReader, std::chrono directly. register_resources(): the buffer registration's duration (register_ms), at
     # open and at a ring reset, never per read.
     "const auto t0 = std::chrono::steady_clock::now();": 1,

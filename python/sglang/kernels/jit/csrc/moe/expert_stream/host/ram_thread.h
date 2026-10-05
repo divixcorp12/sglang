@@ -19,9 +19,8 @@ enum PauseResult : int {
 /// Pumps one RamTier with one service thread per NUMA group, each serving its group's posted demand records through
 /// RamTier::pump_demand(g), plus a watchdog that aborts the process when a request or a copy wait hangs.
 ///
-/// Idle: after the last request a thread spins with _mm_pause() for spin_ns, then sleeps 50 us between polls; the
-/// spin is a poll budget calibrated once in start() (idle_budget), so a serving thread reads no clock. With busy_poll
-/// it runs on a core of its own (checked by start_thread), spins with no PAUSE and never sleeps.
+/// Idle: a thread never sleeps between polls and reads no clock. It spins with _mm_pause(), or, with busy_poll, on a
+/// core of its own (checked by start_thread) with no PAUSE.
 ///
 /// Ownership: the tier has one owner at a time, its service threads or a caller that paused them all; pause() and
 /// resume() are the handoff. Both take the tier's caller_mutex(), which the service threads never take.
@@ -34,12 +33,10 @@ class RamThread {
   using Build = typename Tier::Build;
 
   /// `cpu_cores` has one entry per group; a negative entry leaves that thread unpinned.
-  RamThread(
-      std::shared_ptr<Tier> tier, std::vector<int> cpu_cores, int64_t fatal_wait_ns, int64_t spin_ns, bool busy_poll)
+  RamThread(std::shared_ptr<Tier> tier, std::vector<int> cpu_cores, int64_t fatal_wait_ns, bool busy_poll)
       : tier_(std::move(tier)),
         cpu_cores_(std::move(cpu_cores)),
         fatal_wait_ns_(fatal_wait_ns),
-        spin_ns_(spin_ns),
         busy_poll_(busy_poll),
         threads_(cpu_cores_.size()),
         pinned_(cpu_cores_.size()),
@@ -65,7 +62,6 @@ class RamThread {
           error_prefix<typename Tier::Layout>() +
           "start_thread with a prefill fill running (or not yet ended): call fill_end() first");
     }
-    spin_iters_ = idle_budget(spin_ns_);
     tier_->set_parked(false);
     tier_->set_threaded(true);
     std::vector<std::future<int>> pins;
@@ -193,22 +189,13 @@ class RamThread {
     pinned_[g].set_value(error);
     if (error != 0) return;
     tier_->set_counter(g, kRunning, 1);
-    uint64_t idle = 0;  // empty polls since the last request, counted against spin_iters_
     while (!stop_.load(std::memory_order_relaxed)) {
       const uint64_t epoch = pause_epoch_.load(std::memory_order_acquire);
       if (epoch & 1u) {
         if (!park(g, epoch)) break;
         continue;
       }
-      if (tier_->pump_demand(g)) {
-        idle = 0;
-        continue;
-      }
-      if (busy_poll_) continue;
-      if (++idle < spin_iters_)
-        _mm_pause();
-      else
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      if (!tier_->pump_demand(g) && !busy_poll_) _mm_pause();
     }
     tier_->set_counter(g, kRunning, 0);
   }
@@ -224,7 +211,7 @@ class RamThread {
     }
     parked_epoch_[g].store(epoch, std::memory_order_release);
     while (pause_epoch_.load(std::memory_order_acquire) == epoch && !stop_.load())
-      std::this_thread::sleep_for(std::chrono::microseconds(20));
+      _mm_pause();
     return pause_epoch_.load(std::memory_order_acquire) != epoch;
   }
 
@@ -297,9 +284,7 @@ class RamThread {
   std::shared_ptr<Tier> tier_;
   std::vector<int> cpu_cores_;  // one per group
   int64_t fatal_wait_ns_;
-  int64_t spin_ns_;
   bool busy_poll_;
-  uint64_t spin_iters_ = 1;
   std::vector<std::thread> threads_;      // one per group
   std::vector<std::promise<int>> pinned_;  // per group: 0 pinned (or not asked), else the errno
   std::thread watchdog_;

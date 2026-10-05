@@ -225,7 +225,7 @@ class FakeHost:
         return torch.tensor(self.grid, dtype=torch.float64)
 
     def enable_cpu_experts(
-        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, spin_us=50_000, keep_warm_us=0
+        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0
     ):
         self.enabled = (kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, group)
         self.enables.append((group, kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads))

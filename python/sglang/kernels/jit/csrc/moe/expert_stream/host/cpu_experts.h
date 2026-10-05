@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
-#include <immintrin.h>
 #include <memory>
 #include <pthread.h>
 #include <sched.h>
@@ -94,8 +93,7 @@ struct CpuExpertConfig {
   int64_t hidden = 0;
   int threads = 1;
   std::vector<int> cores;  // worker i runs on cores[i]; the engine's own thread on cores[0]
-  int64_t spin_ns = 50'000'000;
-  int64_t keep_warm_ns = 0;  // > 0: the kernel's keep-warm holds the workers this long after each job
+  int64_t keep_warm_ns = 0;  // how long after each job the held team runs register work instead of PAUSE
   bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
 };
 
@@ -110,8 +108,9 @@ struct CpuExpertConfig {
 /// order and done_ only increases, so done(seq) is a single compare any thread may make. The copy thread reads only
 /// done(), so CopyDone and the copy wait's gate keep their single publisher.
 ///
-/// Idle: spin for spin_ns, then sleep on the doorbell. With a keep-warm, the thread first hands its workers to the
-/// kernel for keep_warm_ns after each job; every submit and stop() rings the doorbell, whose word ends it.
+/// Idle, nothing sleeps: the thread holds its team in the kernel's keep_warm, which runs register work at the forward's
+/// width for keep_warm_ns after each job and then PAUSE, until a submit or stop() moves kick_. A job therefore never
+/// waits for a worker to wake, and only a long gap pays the vector-frequency ramp.
 class CpuExpertEngine {
  public:
   /// A record has at most one CPU-hit job and one job per CPU miss: the ring holds every job that can be outstanding.
@@ -129,7 +128,6 @@ class CpuExpertEngine {
 
   /// Starts the thread and waits until it has pinned itself to its core. Throws, after joining it, if it cannot.
   void start() {
-    spin_iters_ = idle_budget(config_.spin_ns);
     std::future<std::string> started = started_.get_future();
     thread_ = std::thread([this] { run(); });
     if (const std::string error = started.get(); !error.empty()) {
@@ -165,7 +163,7 @@ class CpuExpertEngine {
   /// rules out: the caller fails stop.
   bool submit(const CpuJob& job) {
     if (!jobs_.push(job)) return false;
-    doorbell_.ring();
+    kick_.fetch_add(1, std::memory_order_release);
     return true;
   }
 
@@ -190,14 +188,14 @@ class CpuExpertEngine {
   void stop() {
     if (!thread_.joinable()) return;
     stop_.store(true, std::memory_order_release);
-    doorbell_.ring();
+    kick_.fetch_add(1, std::memory_order_release);
     thread_.join();
   }
 
  private:
   static_assert(
       sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
-      "the keep-warm reads the doorbell's word as a plain uint32_t");
+      "the keep-warm reads kick_ as a plain uint32_t");
 
   /// Refuses a config the forwards would refuse later, since a refused forward aborts the process.
   void validate() const {
@@ -240,27 +238,15 @@ class CpuExpertEngine {
     const std::string error = pin();
     started_.set_value(error);
     if (!error.empty()) return;
-    uint64_t idle = 0;
-    int64_t warm_until = 0;  // the keep-warm window after the last job; 0 when there is none
+    int64_t warm_until = 0;  // the register-work window after the last job; 0 before the first
     while (!stop_.load(std::memory_order_acquire)) {
-      // Read before the pop: a submit after an empty pop moves the word past `kick` and so ends the keep-warm.
-      const uint32_t kick = doorbell_.word().load(std::memory_order_acquire);
+      // Read before the pop: a submit after an empty pop moves kick_ past `kick` and so ends the hold.
+      const uint32_t kick = kick_.load(std::memory_order_acquire);
       CpuJob job;
-      if (jobs_.pop(&job)) {
-        idle = 0;
-        const int64_t end = run_job(job);
-        if (config_.keep_warm_ns > 0) warm_until = end + config_.keep_warm_ns;
-      } else if (warm_until != 0) {
-        if (now_ns() < warm_until)
-          keep_warm(kick, warm_until);
-        else
-          warm_until = 0;
-      } else if (++idle < spin_iters_) {
-        _mm_pause();
-      } else {
-        doorbell_.sleep_unless([this] { return !jobs_.empty() || stop_.load(std::memory_order_acquire); });
-        idle = 0;
-      }
+      if (jobs_.pop(&job))
+        warm_until = run_job(job) + config_.keep_warm_ns;
+      else
+        hold(kick, warm_until);
     }
   }
 
@@ -294,10 +280,11 @@ class CpuExpertEngine {
     return end;
   }
 
-  void keep_warm(uint32_t kick, int64_t until) {
+  /// Holds the team until kick_ moves past `kick`.
+  void hold(uint32_t kick, int64_t warm_until) {
     try {
       config_.kernel->keep_warm(
-          config_.cores, config_.threads, reinterpret_cast<const uint32_t*>(&doorbell_.word()), kick, until);
+          config_.cores, config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until);
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert keep-warm failed: " + e.what());
     }
@@ -314,14 +301,13 @@ class CpuExpertEngine {
   std::thread thread_;
   std::promise<std::string> started_;  // the thread's pin result, for start()
   SpscRing<CpuJob, kRing> jobs_;
-  Doorbell doorbell_;
+  std::atomic<uint32_t> kick_{0};  // moved by every submit and by stop(); ends the hold
   uint32_t claimed_ = 0;  // tier owner only
   std::atomic<uint32_t> done_{0};
   std::atomic<int64_t> jobs_done_{0};
   std::atomic<int64_t> lanes_done_{0};
   std::atomic<int64_t> compute_ns_{0};
   std::atomic<bool> stop_{false};
-  uint64_t spin_iters_ = 1;
 };
 
 }  // namespace sglang::expert_stream

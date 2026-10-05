@@ -52,7 +52,7 @@ def _host(tmp_path, *, split, arm=True, ns_per_expert=0):
         node_ranges=HALVES,
     )
     host.reserve_staging(2)
-    host.enable_copy_engine(-1, spin_us=200)
+    host.enable_copy_engine(-1)
     host.copy_engine_release(-1)  # the CPU test backend completes only released marks
     dst = {n: torch.zeros((DST_ROWS,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
     table = torch.tensor(
@@ -68,7 +68,7 @@ def _host(tmp_path, *, split, arm=True, ns_per_expert=0):
     kernel = host.test_kernel_address(ns_per_expert)  # one kernel serves both groups
     for group in range(2):
         host.enable_cpu_experts(
-            kernel, split[group], cores[2 * group : 2 * group + 2], x_rows, out_rows, threads=2, spin_us=200,
+            kernel, split[group], cores[2 * group : 2 * group + 2], x_rows, out_rows, threads=2,
             group=group,
         )
     host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
@@ -195,7 +195,7 @@ page = new_page(pin=False, wire=wire_layout(8, 2))
 host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 8), -1, dtype=torch.int32), variant="instr",
                         node_ranges=[[(0, 10)] * 2, [(10, 20)] * 2])
 host.reserve_staging(2)
-host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=200)
+host.enable_copy_engine(-1, wait_timeout_ms=200)
 host.copy_engine_release(-1)
 dst = {n: torch.zeros((6,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
 host.set_copy_table(ROW, torch.tensor([[t.data_ptr(), dst[n].data_ptr(), t[0].numel() * t.element_size()]
@@ -205,8 +205,8 @@ x_rows, out_rows = torch.zeros((2, 16), dtype=torch.uint8), torch.zeros((2, 4, 8
 cores = sorted(os.sched_getaffinity(0))
 split = [0, 0, 1] + [0] * 6
 kernel = host.test_kernel_address(0)
-host.enable_cpu_experts(kernel, split, cores[0:2], x_rows, out_rows, threads=2, spin_us=200, group=0)
-host.enable_cpu_experts(kernel, split, cores[2:4], x_rows, out_rows, threads=2, spin_us=200, group=1)
+host.enable_cpu_experts(kernel, split, cores[0:2], x_rows, out_rows, threads=2, group=0)
+host.enable_cpu_experts(kernel, split, cores[2:4], x_rows, out_rows, threads=2, group=1)
 host.set_cpu_layer(ROW, fake_cpu_layer(8))
 sim = ChainSim(host, page, s.slabs)
 req = sim.post(ROW, [0, 1, 2, 3])

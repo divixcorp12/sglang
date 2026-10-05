@@ -378,8 +378,9 @@ class HostCopyBackend : public CopyBackend {
 ///                                          submitting thread for a ring overflow);
 ///   owner->template copy_count<K>(n)       the copy thread's counters.
 ///
-/// Each group's service thread pushes to its own SPSC ring and rings the doorbell; submit() takes no lock and never
-/// blocks. The copy thread polls the rings and, after spin_ns with nothing popped or in flight, sleeps on the doorbell.
+/// Each group's service thread pushes to its own SPSC ring; submit() takes no lock, never blocks and makes no syscall.
+/// The copy thread never sleeps: it polls the rings and its in-flight marks with PAUSE between polls, on a core of
+/// its own (ThreadingConfig.copy_cpus).
 /// After the first backend error nothing the backend issued can be assumed complete, so that job and every job behind
 /// it go to copy_failed.
 template <class Build, class Owner>
@@ -398,14 +399,12 @@ class CopyEngine {
       std::unique_ptr<CopyBackend> backend,
       int64_t rows,
       int groups,
-      int64_t spin_ns,
       Owner* owner,
       std::string prefix,
       std::string thread_name,
       std::vector<int> cpus)
       : backend_(std::move(backend)),
         tables_(static_cast<size_t>(rows)),
-        spin_ns_(spin_ns),
         owner_(owner),
         prefix_(std::move(prefix)),
         thread_name_(thread_name.substr(0, 15)),
@@ -420,7 +419,6 @@ class CopyEngine {
 
   /// Starts the thread and returns once the backend is initialised on it; throws with the backend's error.
   void start() {
-    spin_iters_ = idle_budget(spin_ns_);
     std::future<std::string> started = started_.get_future();
     thread_ = std::thread([this] { run(); });
     if (const std::string error = started.get(); !error.empty()) {
@@ -461,7 +459,6 @@ class CopyEngine {
       return;
     }
     submitted_[group].store(submitted_[group].load(std::memory_order_relaxed) + 1, std::memory_order_release);
-    doorbell_.ring();
   }
 
   /// True when every submitted job has completed or failed.
@@ -486,7 +483,6 @@ class CopyEngine {
     if (!thread_.joinable()) return;
     drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);
     stop_.store(true, std::memory_order_release);
-    doorbell_.ring();
     thread_.join();
   }
 
@@ -560,7 +556,6 @@ class CopyEngine {
     started_.set_value(error);
     if (!error.empty()) return;
     Queue in_flight;
-    uint64_t idle = 0;  // empty polls since the last progress, counted against spin_iters_
     while (true) {
       // Read before the rings: stop() comes after the last submit, so a stop seen here has every job in them.
       const bool stopping = stop_.load(std::memory_order_acquire);
@@ -568,14 +563,7 @@ class CopyEngine {
       progressed |= retire_completed(in_flight);
       // The drain deadline is read only once a stop was asked for: never while serving.
       if (stopping && (in_flight.empty() || now_ns() > drain_deadline_.load(std::memory_order_relaxed))) break;
-      if (progressed) {
-        idle = 0;
-      } else if (!in_flight.empty() || ++idle < spin_iters_) {
-        _mm_pause();
-      } else {
-        doorbell_.sleep_unless([this] { return !rings_empty() || stop_.load(std::memory_order_acquire); });
-        idle = 0;
-      }
+      if (!progressed) _mm_pause();
     }
     backend_->shutdown(in_flight.empty() && broken_ == 0);
   }
@@ -656,10 +644,6 @@ class CopyEngine {
         static_cast<uint64_t>(seq) << 32 | static_cast<uint64_t>(group) << 8 | reason, std::memory_order_relaxed);
   }
 
-  bool rings_empty() const {
-    return std::all_of(jobs_.begin(), jobs_.end(), [](const auto& ring) { return ring->empty(); });
-  }
-
   /// Issues `job`'s copies and marks the point after them; 0 or the backend's error.
   int issue(CopyJob& job) {
     const Table& table = tables_[job.row];
@@ -729,8 +713,6 @@ class CopyEngine {
   std::unique_ptr<CopyBackend> backend_;
   std::array<std::atomic<CpuExpertEngine*>, Wire::kNodes> cpu_{};
   std::vector<Table> tables_;
-  int64_t spin_ns_;
-  uint64_t spin_iters_ = 1;
   Owner* owner_;
   std::string prefix_;
   std::string thread_name_;
@@ -740,7 +722,6 @@ class CopyEngine {
   std::vector<std::unique_ptr<SpscRing<CopyJob, kCopyRing>>> jobs_;  // one per group
   std::array<std::atomic<uint64_t>, Wire::kNodes> submitted_{};      // each written by its group's thread only
   std::array<Assembly, Wire::kDemandRecords> assembly_{};            // copy thread only
-  Doorbell doorbell_;
   std::atomic<uint64_t> stall_{0};     // written by the copy thread, read by the watchdog
   std::atomic<uint64_t> finished_{0};  // written by the copy thread only
   std::atomic<bool> stop_{false};

@@ -187,7 +187,7 @@ class NodePlan:
 @dataclass(frozen=True)
 class ThreadingConfig:
     plans: tuple[NodePlan, ...]  # one per node of the tier, in placement order
-    copy_cpus: tuple[int, ...]  # the copy thread's affinity; () inherits the server's
+    copy_cpus: tuple[int, ...]  # the copy thread's core, which it spins on; () inherits the server's affinity
     gpu_node: int
 
     @property
@@ -289,8 +289,9 @@ class ThreadingConfig:
             sq = overrides.get(nodes[0], {}).get("sq", [None])[0]
             plan = NodePlan(group=0, node=nodes[0], ram=ram, cpu=(), sq=sq, busy_poll=ram is not None)
             return ThreadingConfig((plan,), (), gpu)
+        copy = _copy_core(gpu, overrides, topology, affinity)
         plans = []
-        taken: set[int] = set()
+        taken: set[int] = set(topology.siblings[copy])
         for group, node in enumerate(nodes):
             plan = _derive(group, node, overrides.get(node, {}), topology, affinity, settings, taken)
             _check_plan(plan, topology, affinity, settings)
@@ -302,10 +303,23 @@ class ThreadingConfig:
                 f"OMP_THREAD_LIMIT={settings.omp_thread_limit} is below the {workers} CPU expert workers of all nodes; "
                 "two engines' teams run at once"
             )
-        copy = sorted(c for c in topology.node_cpus[gpu] if c in affinity)
-        if not copy:
-            copy = sorted(c for c in topology.node_cpus[gpu] if c not in RESERVED_CORES and c not in taken)
-        return ThreadingConfig(tuple(plans), tuple(copy), gpu)
+        return ThreadingConfig(tuple(plans), (copy,), gpu)
+
+
+def _copy_core(gpu, overrides, topology, affinity) -> int:
+    """The copy thread's core on the GPU's node, outside the server's affinity, since the thread never sleeps. Chosen
+    before the nodes' plans, so CPU experts that take every free core leave it alone. It spins with PAUSE, so it
+    prefers a core whose SMT sibling is the server's and leaves the fully free cores to the busy-polling RAM threads."""
+    named = {c for plan in overrides.values() for cores in plan.values() for c in cores}
+    free = [
+        c
+        for c in reversed(topology.physical(gpu))
+        if c not in affinity and c not in RESERVED_CORES and not (topology.siblings[c] & named)
+    ]
+    shared = [c for c in free if topology.siblings[c] & affinity]
+    if not free:
+        raise ValueError(f"node {gpu} has no core outside the server's affinity for the copy thread")
+    return (shared or free)[0]
 
 
 def _derive(group, node, override, topology, affinity, settings, taken) -> NodePlan:

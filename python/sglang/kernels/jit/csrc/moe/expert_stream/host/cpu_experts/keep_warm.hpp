@@ -1,6 +1,7 @@
-// Register-only work at a forward's vector width (the GEMV inner loop's vpmaddwd/vpaddd chains), so a core holds the
-// license the forward runs at between calls. Polls the word every 16 iterations and the clock every 1024; the deadline
-// is the engine's CLOCK_MONOTONIC, which libstdc++'s steady_clock reads.
+// Holds a forward's team between calls: register-only work at the forward's vector width (the GEMV inner loop's
+// vpmaddwd/vpaddd chains), so a core keeps the license the forward runs at, then PAUSE once the warm window ends.
+// Polls the word every 16 iterations and the clock every 1024; the window ends on the engine's CLOCK_MONOTONIC, which
+// libstdc++'s steady_clock reads.
 #pragma once
 #include "isa.hpp"
 #include "team.hpp"
@@ -82,12 +83,13 @@ int32_t keep_warm_loop(Isa isa, const uint32_t* word, uint32_t seen, int64_t dea
     return keep_warm_detail::scalar(word, seen, deadline_ns);
 }
 
-// Holds `threads` workers (the caller as worker 0, each pinned to `cores` as the forward pins them; empty: unpinned) in
-// register-only work of tier min(isa, Top) until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Throws
-// std::invalid_argument for no worker, no word or more threads than `cores`, std::runtime_error for a failed pin.
+// Holds `threads` workers (the caller as worker 0, each pinned to `cores` as the forward pins them; empty: unpinned)
+// until *word != seen: register-only work of tier min(isa, Top) until CLOCK_MONOTONIC reaches warm_until_ns, then
+// PAUSE. Throws std::invalid_argument for no worker, no word or more threads than `cores`, std::runtime_error for a
+// failed pin.
 template <Isa Top>
 void keep_warm(Isa isa, std::span<const int> cores, int32_t threads, const uint32_t* word, uint32_t seen,
-               int64_t deadline_ns)
+               int64_t warm_until_ns)
 {
     if (threads < 1 || word == nullptr || (!cores.empty() && size_t(threads) > cores.size()))
         throw std::invalid_argument("CPU expert keep-warm needs a worker, a word and no more workers than its cores");
@@ -95,7 +97,9 @@ void keep_warm(Isa isa, std::span<const int> cores, int32_t threads, const uint3
     #pragma omp parallel num_threads(threads) shared(cores, pin_error)
     {
         pin(omp_get_thread_num(), cores, pin_error);
-        keep_warm_detail::sink.fetch_add(keep_warm_loop<Top>(isa, word, seen, deadline_ns), std::memory_order_relaxed);
+        const int32_t warm = keep_warm_loop<Top>(isa, word, seen, warm_until_ns);
+        keep_warm_detail::sink.fetch_add(warm, std::memory_order_relaxed);
+        while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen) _mm_pause();
     }
     if (pin_error.load(std::memory_order_relaxed)) throw std::runtime_error("cannot pin CPU expert worker to its core");
 }

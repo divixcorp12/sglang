@@ -67,7 +67,7 @@ def _host(tmp_path, *, split, copy_engine=True, parts=2, fail=0, enable=True):
     host = attached_host(s, page, k=3)
     dst = None
     if copy_engine:
-        host.enable_copy_engine(-1, spin_us=200)
+        host.enable_copy_engine(-1)
         dst = {name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype) for name, slab in s.slabs[ROW].items()}
         table = torch.tensor(
             [[slab.data_ptr(), dst[name].data_ptr(), slab[0].numel() * slab.element_size()] for name, slab in s.slabs[ROW].items()],
@@ -78,7 +78,7 @@ def _host(tmp_path, *, split, copy_engine=True, parts=2, fail=0, enable=True):
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN) if parts == 2 else (ROWS, HIDDEN), dtype=torch.float32)
     if copy_engine and enable:
-        host.enable_cpu_experts(host.test_kernel_address(fail=fail), split, _cores(), x_rows, out_rows, threads=2, spin_us=200)
+        host.enable_cpu_experts(host.test_kernel_address(fail=fail), split, _cores(), x_rows, out_rows, threads=2)
     return s, page, host, ChainSim(host, page, s.slabs), dst, out_rows
 
 
@@ -396,7 +396,7 @@ _SCRIPT_HOST = """
         from test_exl3_ram_miss_cpu_experts import ROW, ROWS, HIDDEN, DST_ROWS, _cores, _split
         from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
         from sglang.srt.layers.moe.ram_slot_map import LaneKind
-        host.enable_copy_engine(-1, spin_us=200)
+        host.enable_copy_engine(-1)
         dst = {{n: torch.zeros((DST_ROWS,) + tuple(v.shape[1:]), dtype=v.dtype) for n, v in s.slabs[ROW].items()}}
         table = torch.tensor(
             [[v.data_ptr(), dst[n].data_ptr(), v[0].numel() * v.element_size()] for n, v in s.slabs[ROW].items()],
@@ -406,7 +406,7 @@ _SCRIPT_HOST = """
         host.arm_copy_engine()
         x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
         out_rows = torch.zeros(({out_shape}), dtype=torch.float32)
-        host.enable_cpu_experts(host.test_kernel_address(fail={result}), _split(n1=1, n2=2), _cores(), x_rows, out_rows, threads=2, spin_us=200)
+        host.enable_cpu_experts(host.test_kernel_address(fail={result}), _split(n1=1, n2=2), _cores(), x_rows, out_rows, threads=2)
         req = sim.post(ROW, [3])
         assert host.pump() == 1
         host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))

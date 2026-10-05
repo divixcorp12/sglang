@@ -51,15 +51,24 @@ def resolve(topology, *, nodes=(0, 1), affinity=SERVER, gpu_node=0, **settings):
 def test_divix01_derives_the_designs_plan(divix01):
     config = resolve(divix01, cpu_experts=True, threads=16)
     assert config.plans == (
-        NodePlan(group=0, node=0, ram=17, cpu=tuple(range(8, 16)), sq=None, busy_poll=True),
+        NodePlan(group=0, node=0, ram=17, cpu=tuple(range(8, 15)), sq=None, busy_poll=True),
         NodePlan(group=1, node=1, ram=35, cpu=tuple(range(18, 34)), sq=None, busy_poll=True),
     )
-    assert config.copy_cpus == tuple(sorted(SERVER))
+    assert config.copy_cpus == (15,)
     assert config.log_lines() == [
-        "numa node0: ram=17 cpu=8-15 (8) sq=-",
+        "numa node0: ram=17 cpu=8-14 (7) sq=-",
         "numa node1: ram=35 cpu=18-33 (16) sq=-",
-        "numa copy thread: node0 cpus=0-7,16,36-52",
+        "numa copy thread: node0 cpus=15",
     ]
+
+
+def test_the_copy_thread_takes_a_shared_core_and_leaves_the_free_one_to_the_ram_thread(divix01):
+    """Node 0's only core whose sibling is outside the server's affinity is 17, which the busy-polling RAM thread
+    needs; the copy thread, which spins with PAUSE, takes 15 (sibling 51 is the server's). Mutant: drop the `shared`
+    preference in _copy_core -- red (node 0 has no core for its RAM thread)."""
+    config = resolve(divix01, cpu_experts=True)
+    assert config.copy_cpus == (15,) and config.plans[0].ram == 17
+    assert 15 not in config.plans[0].cpu
 
 
 def test_without_a_threads_cap_the_engine_takes_every_remaining_core(divix01):
@@ -69,7 +78,7 @@ def test_without_a_threads_cap_the_engine_takes_every_remaining_core(divix01):
 
 def test_sqpoll_takes_the_next_usable_core_below_the_ram_core(divix01):
     config = resolve(divix01, cpu_experts=True, sqpoll=True)
-    assert [(p.ram, p.sq, p.cpu[0], p.cpu[-1]) for p in config.plans] == [(17, 15, 8, 14), (35, 34, 18, 33)]
+    assert [(p.ram, p.sq, p.cpu[0], p.cpu[-1]) for p in config.plans] == [(17, 14, 8, 13), (35, 34, 18, 33)]
 
 
 def test_two_nodes_without_cpu_experts_pin_only_the_ram_threads(divix01):
@@ -96,7 +105,7 @@ def test_the_override_replaces_the_plans_of_the_nodes_it_names(divix01):
     assert config.plans[1] == NodePlan(
         group=1, node=1, ram=34, cpu=(18, 19, 20, 21, 22, 23, 24, 25, 27), sq=33, busy_poll=True
     )
-    assert (config.plans[0].ram, config.plans[0].sq) == (17, 15), "node 0 is still derived"
+    assert (config.plans[0].ram, config.plans[0].sq) == (17, 14), "node 0 is still derived"
 
 
 def test_cpu_experts_cores_is_the_cpu_override_of_its_node(divix01):
@@ -125,6 +134,7 @@ def test_a_server_affinity_covering_a_node_is_refused(divix01):
         ({"cores": "18-29", "nodes": (0,)}, "core 18 is on node 1"),
         ({"spin_core": 8}, "core 8 shares a physical core with the server's affinity"),
         ({"omp_thread_limit": 16}, "OMP_THREAD_LIMIT"),
+        ({"affinity": SERVER | frozenset(range(8, 18))}, "node 0 has no core .* for the copy thread"),
         ({"numa_cores": "1:ram=35,cpu=18-33,sq=34"}, "node 1 sets an SQPOLL core, but .* is not sqpoll"),
         (
             {"numa_cores": "1:ram=34,cpu=18-33", "spin_core": 35},

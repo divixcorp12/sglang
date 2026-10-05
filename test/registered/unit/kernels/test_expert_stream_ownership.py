@@ -38,7 +38,7 @@ def running(tmp_path):
         host.assign(0, expert)  # pump mode: the caller owns the tier
     sim = ChainSim(host, page, s.slabs)
     sim.sync_bulk()  # the device learns the eager assignments before any post
-    host.start_thread(fatal_wait_s=60.0, spin_us=2000)
+    host.start_thread(fatal_wait_s=60.0)
     yield s, page, host, sim
     host.stop()
 
@@ -110,7 +110,7 @@ def test_a_pause_waits_for_an_outstanding_copy(tmp_path):
     s, page, host, sim, dst = hp.build_host(tmp_path)
     try:
         req = _copy_request(s, page, host, sim)
-        host.start_thread(fatal_wait_s=60.0, spin_us=2000)
+        host.start_thread(fatal_wait_s=60.0)
         threading.Timer(0.2, lambda: host.copy_engine_release(-1)).start()
         host.pause(5.0)  # waits for the copy engine to go idle
         try:
@@ -142,7 +142,7 @@ def test_the_tier_declares_only_the_callers_mutex():
     caller_mutex_ (Python callers against each other only) and the two InstrBuild-only guards, TraceState::mutex and
     TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; it locks nothing else, and no other
     lock stands in for the deleted mutex_: no rwlock, recursive, timed or pthread lock, no atomic_flag or exchange spin
-    lock, no raw futex (the only futex is the copy engine's documented idle protocol, in spsc_ring.h), and the one
+    lock, no raw futex (no expert-stream thread sleeps on one), and the one
     compare-exchange is cas_gate's open of the copy wait's gate (LEASE_PROTOCOL.md, "Copy engine")."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
     assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex"}

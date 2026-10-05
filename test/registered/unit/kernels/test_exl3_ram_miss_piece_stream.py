@@ -709,7 +709,7 @@ def test_the_miss_lanes_words_carry_the_generation_before_the_read_lands(tmp_pat
     request's generation with no bit, and the row's delta is already published. Without that initialisation every
     publish would be refused (another generation) and the process would abort."""
     s, page, host, sim = _host(tmp_path)
-    host.start_thread(fatal_wait_s=60.0, spin_us=200)
+    host.start_thread(fatal_wait_s=60.0)
     try:
         first = sim.post(1, [3])
         assert sim.wait_served(first, timeout_s=5.0) and sim.wait_handled(first)

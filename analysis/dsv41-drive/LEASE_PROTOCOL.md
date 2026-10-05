@@ -20,12 +20,15 @@ constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/ex
   `dst_rows` (set at attach by `set_row_copy`, copy engine on) and `cpu_ok` (set when the layer registers with the
   CPU expert service, `set_row_cpu`).
 - **Service thread** (`host/ram_tier.h`, `host/ram_thread.h`). The tier's single owner. It handles records in
-  sequence, chooses victims, publishes deltas and reads misses. With `SGLANG_DSV41_RAM_MISS_SPIN_CORE`, the service
-  busy-polls that core with no PAUSE and never sleeps; `start_thread` refuses unless no SMT sibling of the core is in
-  the server's affinity or among the CPU experts' cores.
+  sequence, chooses victims, publishes deltas and reads misses. It never sleeps between polls: it spins with PAUSE,
+  or, with `SGLANG_DSV41_RAM_MISS_SPIN_CORE` (busy_poll), with no PAUSE on that core; `start_thread` refuses busy_poll
+  unless no SMT sibling of the core is in the server's affinity or among the CPU experts' cores.
 - **Copy thread** (`host/copy_engine.h`). Copies a record's copy-engine hits with `cuMemcpyAsync`, runs its CPU jobs
-  through the CPU expert thread, and publishes CopyDone.
-- **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row.
+  through the CPU expert thread, and publishes CopyDone. It never sleeps: it spins with PAUSE on a core of its own
+  (`ThreadingConfig.copy_cpus`).
+- **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row. It never sleeps:
+  between jobs it holds its OpenMP team in the kernel's keep-warm (register work for
+  `SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US`, then PAUSE) until the next submit.
 - **Watchdog** (`host/ram_thread.h`, `watch`). Samples every 20 ms; aborts on a busy episode held past `fatal_wait` or
   a gate held closed past the copy-wait timeout.
 

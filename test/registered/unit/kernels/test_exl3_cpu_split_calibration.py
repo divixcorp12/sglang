@@ -26,7 +26,7 @@ FORWARD_NS = 200_000  # 0.2 ms per expert
 def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD_NS, lanes=8):
     s = ram_miss_setup(tmp_path, capacity=capacity, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     host = attached_host(s, new_page(pin=False, wire=lease.wire_layout(lanes)), k=3, lanes=lanes)
-    host.enable_copy_engine(-1, spin_us=200)
+    host.enable_copy_engine(-1)
     dst = {n: torch.zeros((DST_ROWS,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[ROW].items()}
     table = torch.tensor(
         [[t.data_ptr(), dst[n].data_ptr(), t[0].numel() * t.element_size()] for n, t in s.slabs[ROW].items()],
@@ -36,7 +36,7 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_kernel_address(forward_ns), [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2, spin_us=200)
+    host.enable_cpu_experts(host.test_kernel_address(forward_ns), [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2)
     if register:
         host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     row_bytes = [t[0].numel() * t.element_size() for t in s.slabs[ROW].values()]
@@ -109,7 +109,7 @@ def test_a_timed_out_calibration_reports_and_a_later_one_completes(tmp_path):
 
 def test_calibration_needs_the_tier_owner(tmp_path):
     _, host, _, _keep = _host(tmp_path)
-    host.start_thread(fatal_wait_s=60.0, spin_us=2000)
+    host.start_thread(fatal_wait_s=60.0)
     try:
         with pytest.raises(RuntimeError, match="needs the service thread paused"):
             host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host))

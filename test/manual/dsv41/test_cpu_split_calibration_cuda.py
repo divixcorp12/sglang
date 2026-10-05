@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 def test_calibration_measures_a_link_that_grows_with_the_experts(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=12, mirror_weights=(1.0, 1.0), hidden=2048, inter=4096)
     host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
-    host.enable_copy_engine(-1, spin_us=200)
+    host.enable_copy_engine(-1)
     pinned = {n: t.pin_memory() for n, t in s.slabs[ROW].items()}
     table = torch.tensor(
         [[t.data_ptr(), t.data_ptr(), t[0].numel() * t.element_size()] for t in pinned.values()], dtype=torch.int64
@@ -30,7 +30,7 @@ def test_calibration_measures_a_link_that_grows_with_the_experts(tmp_path):
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_kernel_address(100_000), [0] * 9, cores, x_rows, out_rows, threads=2, spin_us=200)
+    host.enable_cpu_experts(host.test_kernel_address(100_000), [0] * 9, cores, x_rows, out_rows, threads=2)
     host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     scratch = torch.empty(LANES * host.copy_expert_bytes(ROW), dtype=torch.uint8, device="cuda")
     grid = host.calibrate_cpu_split(ROW, device=torch.cuda.current_device(), reps=5, scratch=scratch)

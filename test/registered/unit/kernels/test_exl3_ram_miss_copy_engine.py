@@ -62,7 +62,7 @@ def _copy_table(s, dst):
 
 def _copy_engine(s, host, *, arm=True, wait_timeout_ms=2000):
     """The CPU backend, a copy table from the row's slabs to host "destination" tensors, and (by default) armed."""
-    host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=wait_timeout_ms)
+    host.enable_copy_engine(-1, wait_timeout_ms=wait_timeout_ms)
     dst = {
         name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype)
         for name, slab in s.slabs[ROW].items()
@@ -257,7 +257,7 @@ table = torch.tensor(
     [[slab.data_ptr(), dst[n].data_ptr(), slab[0].numel() * slab.element_size()] for n, slab in s.slabs[ROW].items()],
     dtype=torch.int64,
 )
-host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=50)
+host.enable_copy_engine(-1, wait_timeout_ms=50)
 host.set_copy_table(ROW, table, 6)
 host.arm_copy_engine()
 req = sim.post(ROW, [3])
@@ -324,7 +324,7 @@ def test_pause_refuses_while_a_copy_job_is_outstanding(tmp_path):
         _load(sim, host, [3])
         req = sim.post(ROW, [3], dst=[1], captured=True)
         assert host.pump() == 1
-        host.start_thread(fatal_wait_s=60.0, spin_us=2000)
+        host.start_thread(fatal_wait_s=60.0)
         with pytest.raises(RuntimeError, match="copy thread still has a job"):
             host.pause(0.2)
         host.copy_engine_release(-1)
@@ -379,7 +379,7 @@ def _sm_copy_engine(s, host):
     """As _copy_engine, with the row's small (non-trellis) entries left to CW's SM reads."""
     from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_mask
 
-    host.enable_copy_engine(-1, spin_us=200)
+    host.enable_copy_engine(-1)
     names = list(s.slabs[ROW])
     dst = {
         name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype)
@@ -423,7 +423,7 @@ def test_a_copy_table_sm_mask_naming_a_trellis_is_refused(tmp_path):
     wait would stall the chain instead of using the DMA engine."""
     s, _page, host, _sim = _host(tmp_path)
     try:
-        host.enable_copy_engine(-1, spin_us=200)
+        host.enable_copy_engine(-1)
         table = torch.zeros((6, 3), dtype=torch.int64)
         with pytest.raises(RuntimeError, match="exl3 RAM miss: .*small"):
             host.set_copy_table(ROW, table, DST_ROWS, sm_mask=0b000001)

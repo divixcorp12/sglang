@@ -105,7 +105,8 @@ Options parse_options(int& argc, char** argv) {
              "comma-separated, and --cpus one CPU list per group, '/'-separated: --service-cpu=17,35 "
              "--cpus=8-15/18-33 --worker-node=0,1\n"
              "--warmup-forwards=128 --gap-us=0 --keep-warm-us=0 --wait-timeout-ms=2000 --validate-only\n"
-             "--keep-warm-us: the CPU expert thread's keep-warm window after each job (0: off)\n"
+             "--keep-warm-us: register work after each job, before the held CPU team falls back to PAUSE\n"
+             "  (0: PAUSE only)\n"
              "--self-test: synthetic rows and a fake forward; defaults --writer-cpu=0 --service-cpu=1 --copy-cpu=2 "
              "--cpus=3 (two groups: --copy-cpu=1 --service-cpu=2,3 --cpus=4/5)\n"
              "Google Benchmark flags are also accepted.\n";

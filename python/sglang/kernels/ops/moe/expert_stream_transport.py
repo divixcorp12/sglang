@@ -1468,14 +1468,14 @@ class ExpertStreamHost:
         *,
         cpu_core: int | Sequence[int] = -1,
         fatal_wait_s: float = 30.0,
-        spin_us: int = 5000,
         busy_poll: bool = False,
     ) -> None:
         """Serve requests on one C++ thread per NUMA group (no more ``pump()``), with the watchdog.
 
         ``cpu_core`` is one core per group (a sequence), or one int for a single group; -1 inherits the caller's
-        affinity. Cores 64-71 are reserved for NVMe completion interrupts. ``busy_poll`` spins on each group's core
-        with no PAUSE and no sleep; the C++ side refuses it unless each physical core is its service's alone.
+        affinity. Cores 64-71 are reserved for NVMe completion interrupts. A service thread never sleeps: it spins
+        with PAUSE, or with ``busy_poll`` with no PAUSE, which the C++ side refuses unless each physical core is its
+        service's alone.
         """
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
@@ -1488,7 +1488,6 @@ class ExpertStreamHost:
             self.handle,
             torch.tensor(cores, dtype=torch.int64),
             int(fatal_wait_s * 1e9),
-            int(spin_us * 1e3),
             int(busy_poll),
         )
         self.threaded = True
@@ -1704,7 +1703,7 @@ class ExpertStreamHost:
         self._module.expert_stream_set_prefill_share(self.handle, int(share))
 
     def enable_copy_engine(
-        self, device: int, *, spin_us: int = 5000, wait_timeout_ms: int = 2000, cpus: Sequence[int] = ()
+        self, device: int, *, wait_timeout_ms: int = 2000, cpus: Sequence[int] = ()
     ) -> None:
         """Start the copy-engine thread on CUDA ``device`` (-1: the CPU test backend).
 
@@ -1712,13 +1711,13 @@ class ExpertStreamHost:
         :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
         ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the
         process once a closed gate has held the decode stream that long
-        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). ``cpus`` is the copy thread's
-        affinity (``ThreadingConfig.copy_cpus``: the GPU's node); empty inherits the caller's.
+        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). The copy thread never sleeps, so
+        ``cpus`` should be a core of its own (``ThreadingConfig.copy_cpus``); empty inherits
+        the caller's affinity.
         """
         self._module.expert_stream_enable_copy_engine(
             self.handle,
             int(device),
-            int(spin_us * 1e3),
             int(wait_timeout_ms * 1e6),
             torch.tensor([int(c) for c in cpus], dtype=torch.int64),
         )
@@ -1762,7 +1761,6 @@ class ExpertStreamHost:
         *,
         threads: int,
         group: int = 0,
-        spin_us: int = 50_000,
         keep_warm_us: int = 0,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
@@ -1776,8 +1774,9 @@ class ExpertStreamHost:
         group g's CPU-hit and CPU-miss partial sums are parts ``2g`` and ``2g + 1``) are
         pinned host rows: the post kernel stages a row's input in the first, the CPU
         writes its partial sums to the second and the device reads them. The host keeps
-        references to both. For ``keep_warm_us`` after each job the idle thread runs the
-        kernel's keep-warm on its workers (0: off).
+        references to both. The idle thread never sleeps: it holds its workers in the
+        kernel's keep-warm, in register work for ``keep_warm_us`` after each job and in
+        PAUSE after that.
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -1816,7 +1815,6 @@ class ExpertStreamHost:
             hidden,
             parts,
             int(threads),
-            int(spin_us * 1e3),
             int(keep_warm_us * 1e3),
         )
         self.cpu_rows = (x_rows, out_rows)

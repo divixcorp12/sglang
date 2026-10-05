@@ -1948,10 +1948,10 @@ class Envs:
     # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
     # (slot-map plan, Task 0), so a served A/B decides.
     SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
-    # For this many us after its last job, the idle CPU expert thread runs the kernel's register-only AVX-512 loop on
-    # every worker instead of spinning on pause, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms
-    # idle gap costs about 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench
-    # 2026-10-03: a 1 ms or 3 ms gap then costs nothing). 0 is off. Costs the pool's cores their idle power.
+    # For this many us after its last job, the idle CPU expert thread holds its workers in the kernel's register-only
+    # AVX-512 loop instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap
+    # costs about 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03:
+    # a 1 ms or 3 ms gap then costs nothing). 0: PAUSE only. The workers never sleep either way.
     SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is

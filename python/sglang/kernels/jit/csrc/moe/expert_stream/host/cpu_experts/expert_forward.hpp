@@ -115,9 +115,9 @@ public:
     // keep_warm (keep_warm.hpp) at this quant's tier, compiling only the loops up to kTopIsa. The cores are the
     // caller's, checked where they were configured (the engine checks them when it is built).
     void keep_warm(std::span<const int> cores, int32_t threads, const uint32_t* word, uint32_t seen,
-                   int64_t deadline_ns) const override
+                   int64_t warm_until_ns) const override
     {
-        ::sglang::cpu_experts::keep_warm<Quant::kTopIsa>(isa(), cores, threads, word, seen, deadline_ns);
+        ::sglang::cpu_experts::keep_warm<Quant::kTopIsa>(isa(), cores, threads, word, seen, warm_until_ns);
     }
 
 private:

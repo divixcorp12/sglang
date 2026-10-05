@@ -92,7 +92,7 @@ struct StackConfig {
   RowSet rows;
   int64_t staging = 3;
   const ::sglang::cpu_experts::CpuExpertKernel* kernel = nullptr;  // the format's kernel, every group's
-  int64_t keep_warm_ns = 0;  // > 0: the kernel's keep-warm runs while idle after each job
+  int64_t keep_warm_ns = 0;  // register work this long after each job before the held team falls back to PAUSE
   // One NUMA group's CPU lanes: its service thread, its cores and its split table.
   struct Group {
     int service_cpu = -1;
@@ -126,8 +126,6 @@ class Stack {
   using Source = es::RowReader<::sglang::exl3::Exl3RowLayout, typename ReaderFor<Build>::type, Build>;
   using Tier = es::RamTier<Source>;
   using Thread = es::RamThread<Tier>;
-  static constexpr int64_t kCopySpinNs = 5'000'000;  // the transport's enable_copy_engine default (spin_us=5000)
-  static constexpr int64_t kCpuSpinNs = 50'000'000;  // enable_cpu_experts' default (spin_us=50_000)
 
   // Opens the tier, starts the copy engine, the CPU expert engine and the service, in that order. Throws if the
   // reader cannot open or the service CPU's physical core is shared. The request page and lease block are first-touched
@@ -157,7 +155,6 @@ class Stack {
     PinScope copy(config_.copy_cpu);
     tier_->enable_copy_engine(
         -1,
-        kCopySpinNs,
         config_.wait_timeout_ns,
         config_.copy_cpu >= 0 ? std::vector<int>{config_.copy_cpu} : std::vector<int>{});
     tier_->arm_copy_engine(true);
@@ -177,7 +174,6 @@ class Stack {
       cpu.hidden = config_.hidden;
       cpu.threads = static_cast<int>(group.cores.size());
       cpu.cores = group.cores;
-      cpu.spin_ns = kCpuSpinNs;
       cpu.keep_warm_ns = config_.keep_warm_ns;
       tier_->enable_cpu_experts(g, std::move(cpu), std::vector<int64_t>(group.split.begin(), group.split.end()));
       service_cpus.push_back(group.service_cpu);
@@ -187,7 +183,7 @@ class Stack {
     }
     for (int service_cpu : service_cpus)
       es::check_dedicated_core(service_cpu, tier_->cpu_cores(), "full-stack bench: ");
-    thread_ = std::make_unique<Thread>(tier_, service_cpus, config_.fatal_wait_ns, /*spin_ns=*/0, /*busy_poll=*/true);
+    thread_ = std::make_unique<Thread>(tier_, service_cpus, config_.fatal_wait_ns, /*busy_poll=*/true);
     thread_->start();
   }
 
