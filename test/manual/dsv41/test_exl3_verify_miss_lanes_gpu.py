@@ -53,7 +53,9 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
             layer = torch.nn.Module()
             layer.layer_id, layer.top_k = 0, TOP_K
             fmt = Exl3ExpertFormat(layout, 0, source_root=str(tmp_path))
-            fmt.max_gather_rows = TOKENS * TOP_K
+            # The eager staging bound: this test runs no eager gather, and the inclusive tier holds
+            # 3 * LANES - max_gather_rows hot slots, so the miss width leaves the 2 * LANES DIRECT needs.
+            fmt.max_gather_rows = LANES
             streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
             layer._nvfp4_expert_streamer = streamer
             model.add_module("expert_layer", layer)
