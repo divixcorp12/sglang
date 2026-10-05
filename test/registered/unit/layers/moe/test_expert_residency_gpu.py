@@ -1158,6 +1158,10 @@ def _cache_bytes(cache):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class _GraphPathTaken(Exception):
+    """Raised by a patched _gather_graph: a gather that should be eager took the graph path."""
+
+
 class TestInsertOnMissDirect(unittest.TestCase):
     """Stage DIRECT: a gather copies each miss straight into a victim slot, and no scratch is held.
 
@@ -1423,6 +1427,81 @@ class TestInsertOnMissDirect(unittest.TestCase):
             graph, static, outputs = self.capture(manager)
             self.step(manager, graph, static, outputs, _random_routes(random.Random(5)), "one token")
         self.assertNotIn("gather_overflow", manager.gpu_residency.snapshot())
+
+    # ----- the host side of a graphed verify -----
+
+    def _overflow_routes(self, manager):
+        """Layer 0's two tokens route four non-resident experts into two lanes; the other layers route hits."""
+        mapping = manager.caches[0].expert_to_slot.tolist()
+        outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+        hits = [
+            [[e for e, s in enumerate(manager.caches[layer].expert_to_slot.tolist()) if s >= 0][:TOP_K]] * 2
+            for layer in range(1, LAYERS)
+        ]
+        return [[outsiders[0:2], outsiders[2:4]]] + hits
+
+    def test_the_verify_overflow_is_read_once_and_cleared(self):
+        manager = self._narrow(self.model, 2, False)
+        self.assertTrue(manager.narrow_graph_gather)
+        graph, static, outputs = self.capture(manager, tokens=2)
+        self.replay_verify(manager, graph, static, outputs, self._overflow_routes(manager), check_outputs=False)
+        self.assertTrue(manager.take_verify_overflow())
+        self.assertEqual(int(manager.gpu_residency.overflow_flag.item()), 0)
+        self.assertFalse(manager.take_verify_overflow())
+        self.assertEqual((manager.graphed_verify_ct, manager.verify_overflow_ct), (2, 1))
+
+    def test_a_manager_without_a_narrow_gather_reads_nothing(self):
+        wide = self._narrow(self.model, 0, False)
+        self.assertFalse(wide.narrow_graph_gather)
+        one_token = _manager(_model(), gpu=True, **DIRECT)
+        self.assertFalse(one_token.narrow_graph_gather)
+        self.assertFalse(_manager(_model(), gpu=True, **IOM).narrow_graph_gather)
+
+    def test_suspending_the_graph_gather_turns_it_off_for_every_streamer_and_restores_it(self):
+        manager = self._narrow(self.model, 2, False)
+        ids = torch.zeros((2, TOP_K), dtype=torch.int32, device="cuda")
+        topk = SimpleNamespace(topk_ids=ids)
+        streamers = list(manager.streamers.values())
+        self.assertTrue(all(s.serves_graph_gather(topk) for s in streamers))
+        self.assertFalse(manager.graph_gather_suspended)
+        with self.assertRaises(KeyError):
+            with manager.suspend_graph_gather():
+                self.assertTrue(manager.graph_gather_suspended)
+                self.assertFalse(any(s.serves_graph_gather(topk) for s in streamers))
+                with unittest.mock.patch.object(ExpertStreamer, "_gather_graph", side_effect=_GraphPathTaken):
+                    try:
+                        streamers[0].gather(ids)
+                    except _GraphPathTaken:
+                        self.fail("a suspended gather took the graph path")
+                    except Exception:
+                        pass  # the eager path's own requirements are not under test here
+                raise KeyError("restore on error")
+        self.assertFalse(manager.graph_gather_suspended)
+        self.assertTrue(all(s.serves_graph_gather(topk) for s in streamers))
+
+    def test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies(self):
+        import json
+
+        with tempfile.NamedTemporaryFile() as trace:
+            from sglang.srt.environ import envs
+
+            with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(False):
+                manager = _manager(
+                    self.model, gpu=True, seed_scale=(0, 0, 0), graph_gather_batch_size=2, graph_gather_miss_lanes=2,
+                    budget_bytes=56 * LAYERS * 8, metrics_path=trace.name, log_interval=1, **DIRECT,
+                )
+            graph, static, outputs = self.capture(manager, tokens=2)
+            self.replay_verify(manager, graph, static, outputs, self._overflow_routes(manager), check_outputs=False)
+            self.assertTrue(manager.take_verify_overflow())
+            self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=False)
+            self.assertFalse(manager.take_verify_overflow())
+            self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=False)
+            manager.close_telemetry()
+            trace.seek(0)
+            last = json.loads(trace.read().splitlines()[-1])
+        self.assertEqual(last["counters"]["residency_gpu"]["gather_overflow"], [1, 0, 0])
+        self.assertEqual(last["counters"]["graphed_verify"], {"graphed_verify_ct": 2, "verify_overflow_ct": 1})
+        self.assertIs(manager._trace_sources()["gpu_residency:gather_overflow"], manager.gpu_residency.gather_overflow)
 
     # ----- the consolidated safety guard (one guard, three reasons) -----
 
