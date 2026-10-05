@@ -4,6 +4,7 @@ measure the compiler. Observed 2026-10-04: nine ``run_host_script`` callers hit 
 ``pytest -n 8`` after a flag change gave every module a new key."""
 
 import subprocess
+import sys
 
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.test import dsv41_ram_miss_fixtures as fixtures
