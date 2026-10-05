@@ -1,0 +1,119 @@
+"""DSpark's graphed verify: a flagged forward is re-run eagerly, and startup skips what cannot be captured (CPU)."""
+
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
+
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
+from sglang.srt.speculative.dspark_components.dspark_graphed_verify import (
+    draft_runs_exl3,
+    forward_verify_with_reverify,
+    target_gather_is_narrow,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class _Manager:
+    def __init__(self, narrow, overflows):
+        self.narrow_graph_gather = narrow
+        self._overflows = list(overflows)
+        self.suspended = False
+        self.reads = 0
+
+    def take_verify_overflow(self):
+        self.reads += 1
+        return self._overflows.pop(0)
+
+    @contextmanager
+    def suspend_graph_gather(self):
+        self.suspended = True
+        try:
+            yield
+        finally:
+            self.suspended = False
+
+
+def _runner(manager):
+    graph_runner = object.__new__(DecodeCudaGraphRunner)
+    return SimpleNamespace(expert_hot_cache_manager=manager, decode_cuda_graph_runner=graph_runner)
+
+
+def _forward(runner, log):
+    def forward():
+        graphed = runner.decode_cuda_graph_runner.can_run_graph(SimpleNamespace(replace_embeds=None)) is not False
+        log.append((graphed, runner.expert_hot_cache_manager.suspended))
+        return SimpleNamespace(can_run_cuda_graph=graphed, tag=len(log))
+
+    return forward
+
+
+def test_a_flagged_graphed_verify_is_re_run_eagerly_with_the_gather_suspended(monkeypatch):
+    manager = _Manager(narrow=True, overflows=[True])
+    runner = _runner(manager)
+    monkeypatch.setattr(DecodeCudaGraphRunner, "can_run_graph", lambda self, batch: not self._eager_only)
+    log = []
+    out = forward_verify_with_reverify(runner, _forward(runner, log))
+    assert log == [(True, False), (False, True)]
+    assert out.tag == 2 and not out.can_run_cuda_graph
+    assert not manager.suspended and not runner.decode_cuda_graph_runner._eager_only
+
+
+def test_an_unflagged_graphed_verify_is_kept(monkeypatch):
+    manager = _Manager(narrow=True, overflows=[False])
+    runner = _runner(manager)
+    monkeypatch.setattr(DecodeCudaGraphRunner, "can_run_graph", lambda self, batch: not self._eager_only)
+    log = []
+    out = forward_verify_with_reverify(runner, _forward(runner, log))
+    assert log == [(True, False)] and out.tag == 1 and manager.reads == 1
+
+
+@pytest.mark.parametrize("narrow, graphed", [(False, True), (True, False)])
+def test_no_narrow_gather_or_no_graph_reads_nothing(narrow, graphed):
+    manager = _Manager(narrow=narrow, overflows=[])
+    runner = SimpleNamespace(expert_hot_cache_manager=manager, decode_cuda_graph_runner=None)
+    out = forward_verify_with_reverify(runner, lambda: SimpleNamespace(can_run_cuda_graph=graphed))
+    assert manager.reads == 0 and out.can_run_cuda_graph is graphed
+
+
+def test_no_hot_cache_reads_nothing():
+    runner = SimpleNamespace(expert_hot_cache_manager=None, decode_cuda_graph_runner=None)
+    out = forward_verify_with_reverify(runner, lambda: SimpleNamespace(can_run_cuda_graph=True))
+    assert out.can_run_cuda_graph
+
+
+def test_the_test_switch_re_runs_every_graphed_verify(monkeypatch):
+    manager = _Manager(narrow=True, overflows=[False])
+    runner = _runner(manager)
+    monkeypatch.setattr(DecodeCudaGraphRunner, "can_run_graph", lambda self, batch: not self._eager_only)
+    log = []
+    with envs.SGLANG_TEST_DSPARK_FORCE_REVERIFY.override(True):
+        forward_verify_with_reverify(runner, _forward(runner, log))
+    assert log == [(True, False), (False, True)] and manager.reads == 1
+
+
+def test_eager_only_refuses_the_graph_and_restores_on_error():
+    runner = object.__new__(DecodeCudaGraphRunner)
+    assert runner._eager_only is False
+    with pytest.raises(KeyError):
+        with runner.eager_only():
+            assert runner.can_run_graph(SimpleNamespace(replace_embeds=None)) is False
+            raise KeyError("restore")
+    assert runner._eager_only is False
+
+
+def test_draft_runs_exl3():
+    exl3 = SimpleNamespace(quant_config=SimpleNamespace(get_name=lambda: "exl3"))
+    fp8 = SimpleNamespace(quant_config=SimpleNamespace(get_name=lambda: "fp8"))
+    assert draft_runs_exl3(exl3) and not draft_runs_exl3(fp8)
+    assert not draft_runs_exl3(SimpleNamespace(quant_config=None)) and not draft_runs_exl3(SimpleNamespace())
+
+
+def test_target_gather_is_narrow():
+    assert target_gather_is_narrow(SimpleNamespace(expert_hot_cache_manager=SimpleNamespace(narrow_graph_gather=True)))
+    assert not target_gather_is_narrow(SimpleNamespace(expert_hot_cache_manager=SimpleNamespace(narrow_graph_gather=False)))
+    assert not target_gather_is_narrow(SimpleNamespace(expert_hot_cache_manager=None))
+    assert not target_gather_is_narrow(SimpleNamespace())
