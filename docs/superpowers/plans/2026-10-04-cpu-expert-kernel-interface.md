@@ -60,7 +60,7 @@ Expected: the runner's last line `EXIT=0` (its first line is the worktree's `git
 `RUN_GPU <files...>` (divix01, under the GPU lock):
 
 ```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work/wt-kiface && PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-kiface && CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++ PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 \
   /data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-phase3b/gpu-run.sh \
   /data/models/slang/.venv/bin/python -m pytest <files...> -q -p no:randomly 2>&1 | tail -15; echo EXIT=${PIPESTATUS[0]}'
 ```
@@ -72,9 +72,12 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/wt-kiface && B=/data/models/slang/
   [ -d $B/resid_b128_cpu_v1 ] || { mkdir -p $B && cp -a ~/.cache/sglang/exl3_ext/resid_b128_cpu_v1 $B/; };
   PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 EXL3_MOE_CPU_PIN=0 SGLANG_DSV41_CPU_EXPERTS=1 \
   SGLANG_EXL3_SRC=/data/models/slang/nvfp4-work/exllamav3 SGLANG_EXL3_BUILD_DIR=$B \
-  SGLANG_EXL3_CPU_CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++ CUDA_HOME=/usr/local/cuda-13.4 taskset -c 18-21 \
+  SGLANG_EXL3_CPU_CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++ CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++ \
+  CUDA_HOME=/usr/local/cuda-13.4 taskset -c 18-21 \
   /data/models/slang/.venv/bin/python -m pytest <files...> -q -p no:randomly 2>&1 | tail -15; echo EXIT=${PIPESTATUS[0]}'
 ```
+
+`RUN_EXT`, `RUN_GPU`, `RUN_CPU` and (from Task 1) `run_exl3_cpu_forward_checks.sh` all export `CXX` as GCC 15: the expert-stream host module is JIT-built with `$CXX` (else `c++`, `jit/utils/compile/toolchain.py`), and it must share GCC 15's libstdc++ and C++ ABI with both kernel libraries.
 
 `SUITE_EXT`: `RUN_EXT test/manual/dsv41/test_cpu_expert_engines_exl3.py test/manual/dsv41/test_cpu_expert_pool_exl3.py` (from Task 7 on, without `test_cpu_expert_pool_exl3.py`, which that task deletes).
 
@@ -139,7 +142,7 @@ Expected: `BUILD=0`, `EXIT=0`. Run as `BENCH kiface-bench 1` and `BENCH kiface-b
 
 **Files:** none.
 
-- [ ] **Step 1:** `SYNC` (the branch head is the spec commit `48d94f269f`, which changes no code). Check `sglang.__file__`.
+- [ ] **Step 1:** `SYNC` (the branch head is the plan commit `c69f0dca2d` or a later plan-only commit; none changes code). Check `sglang.__file__`.
 - [ ] **Step 2:** Confirm the EXL3 baseline exists: `ssh divix01 'ls /data/models/slang/nvfp4-work/nlane-cpu-base/ab-{bw,avx2,scalar}-table.pt'`. If any is missing, make it at `53963aa379`:
   `ssh divix01 'git -C /data/models/slang/sglang worktree add --detach /data/models/slang/nvfp4-work/wt-kiface-base 53963aa379 && bash /data/models/slang/nvfp4-work/wt-kiface-base/test/manual/dsv41/run_exl3_cpu_forward_checks.sh baseline /data/models/slang/nvfp4-work/wt-kiface-base /data/models/slang/nvfp4-work/nlane-cpu-base 2>&1 | tail -5'` -- expect `ALL GREEN (baseline)`.
 - [ ] **Step 3:** Make the NVFP4 baseline dump: `ssh divix01 'bash /data/models/slang/nvfp4-work/wt-kiface/test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh /data/models/slang/nvfp4-work/wt-kiface /data/models/slang/nvfp4-work/kiface-nvfp4-base; echo EXIT=$?'` -- expect `DUMPED avx2: ...`, `DUMPED scalar: ...`, `EXIT=0`.
@@ -161,6 +164,7 @@ Expected: `BUILD=0`, `EXIT=0`. Run as `BENCH kiface-bench 1` and `BENCH kiface-b
 - Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/quant.hpp`, `forward_plan.hpp:895-905`, `kernel.cpp`
 - Modify: `python/sglang/kernels/jit/csrc/nvfp4/optimized/quant.hpp`, `forward_plan.hpp:127-145`, `kernel.cpp`
 - Modify: `test/registered/unit/kernels/cpu_experts_common_toy.hpp`, `cpu_experts_common_toy_lib.cpp`, `cpu_experts_common_check.cpp` (rewrite), `test_cpu_experts_common.py` (`CHECKS`)
+- Modify: `test/manual/dsv41/run_exl3_cpu_forward_checks.sh` (one line: `export CXX`)
 
 **Interfaces:**
 - Produces (`kernel.hpp`, namespace `sglang::cpu_experts`, external linkage, NOT in an anonymous namespace):
@@ -668,7 +672,7 @@ class CpuExpertKernel {
  public:
   virtual ~CpuExpertKernel() = default;
   virtual const char* name() const noexcept = 0;
-  // Validates (today's register_layer checks) and stores views; throws std::invalid_argument. `params` is the quant's
+  // Validates (the old C ABI's registration checks) and stores views; throws std::invalid_argument. `params` is the quant's
   // own parameter struct, size-checked against it (empty when the quant has none).
   virtual std::unique_ptr<CpuExpertLayer> make_layer(const LayerSlabs&, std::span<const std::byte> params) const = 0;
   // Validates (today's forward checks) and runs. Throws std::invalid_argument for a bad call, std::runtime_error for a
@@ -754,7 +758,18 @@ void keep_warm(Isa isa, std::span<const int> cores, int32_t threads, const uint3
 
 In `buffer_row.hpp`, include `kernel.hpp` instead of `../cpu_experts_abi.h` and change `of` to `static MoeBufferRows of(const LayerSlabs& d)` (body unchanged: `d.slabs[i]`, `d.slot_bytes[i]` index `std::array`).
 
-- [ ] **Step 5: Rewrite `expert_forward.hpp`.** Keep the file comment's contract list; replace its second line with "ExpertForward<Quant> is the quant's CpuExpertKernel (kernel.hpp): each library holds one, behind its accessor; it keeps no registry and takes no lock." Body:
+- [ ] **Step 5: Rewrite `expert_forward.hpp`.** Replace the whole file comment (today's first three lines name a registry and per-library state, which Task 9's grep must not find) with:
+
+```cpp
+// The validation and dispatch every CPU expert quant shares, generic over the quant (the Quant contract: kName,
+// kSlabs, kOptionalSlabs, kMaxRoutes, kMaxRows, kTopIsa, kIsaCapEnv, kIsaReportEnv, Params, Layer, Row,
+// min_slot_bytes, validate, make_layer, check_slot, dispatch, decode). ExpertForward<Quant> is the quant's
+// CpuExpertKernel (kernel.hpp): each library holds one behind its accessor; it holds no layer table and takes no lock.
+// A Quant's dispatch may ignore the RouteTable and read the request directly: EXL3 does, to keep its frozen
+// accumulation order, so it runs the zero-weight routes that RouteTable drops.
+```
+
+Body:
 
 ```cpp
 #pragma once
@@ -1054,7 +1069,7 @@ inline int cabi_keep_warm(const CpuExpertKernel& kernel, int64_t engine, int32_t
     { return ::sglang::cpu_experts::Engines::destroy(engine); }
 ```
 
-- [ ] **Step 7: Port the three quants (mechanical).** In each of `cpu_experts_common_toy.hpp`, `exl3/optimized/quant.hpp`, `nvfp4/optimized/quant.hpp`: replace `SglangCpuExpertsLayer` with `LayerSlabs` and `SglangCpuExpertsForward` with `ForwardCall` in `min_slot_bytes`, `validate`, `make_layer` and `dispatch` (bodies unchanged: `d.slabs[kUpAlpha]` indexes `std::array`; `c.accumulate != 0` compiles on a `bool`). Change `exl3/optimized/forward_plan.hpp:897` and `nvfp4/optimized/forward_plan.hpp:130` and `nvfp4/optimized/kernel.cpp:23` the same way. Fix the NVFP4 `static_assert` message to "SlabName indexes LayerSlabs::slabs as cpu_experts_cabi.h orders them". The toy header now includes only `expert_forward.hpp` (drop `cabi.hpp`) and, after its anonymous namespace, declares the accessor:
+- [ ] **Step 7: Port the three quants (mechanical).** In `cpu_experts_common_toy.hpp`, make the quant's name overridable so two toy libraries can be told apart (Task 2): before `namespace toy`, `#ifndef TOY_NAME` / `#define TOY_NAME "toy"` / `#endif`, and `static constexpr const char* kName = TOY_NAME;`. In each of `cpu_experts_common_toy.hpp`, `exl3/optimized/quant.hpp`, `nvfp4/optimized/quant.hpp`: replace `SglangCpuExpertsLayer` with `LayerSlabs` and `SglangCpuExpertsForward` with `ForwardCall` in `min_slot_bytes`, `validate`, `make_layer` and `dispatch` (bodies unchanged: `d.slabs[kUpAlpha]` indexes `std::array`; `c.accumulate != 0` compiles on a `bool`). Change `exl3/optimized/forward_plan.hpp:897` and `nvfp4/optimized/forward_plan.hpp:130` and `nvfp4/optimized/kernel.cpp:23` the same way. Fix the NVFP4 `static_assert` message to "SlabName indexes LayerSlabs::slabs as cpu_experts_cabi.h orders them". The toy header now includes only `expert_forward.hpp` (drop `cabi.hpp`) and, after its anonymous namespace, declares the accessor:
 
 ```cpp
 #ifndef TOY_KERNEL
@@ -1120,13 +1135,20 @@ __attribute__((visibility("default"))) const sglang::cpu_experts::CpuExpertKerne
 SGLANG_CPU_EXPERTS_DEFINE_CABI(toy, toy::ToyQuant, toy::TOY_KERNEL)
 ```
 
+- [ ] **Step 8b: GCC 15 for the host JIT in the EXL3 gate.** In `test/manual/dsv41/run_exl3_cpu_forward_checks.sh`, after the line `export SGLANG_DSV41_CPU_EXPERTS=1 SGLANG_EXL3_CPU_CXX=$GXX CUDA_HOME=/usr/local/cuda-13.4`, add:
+
+```bash
+export CXX=$GXX  # the host module's JIT build (kernel_layer/kernel_forward from Task 6): the kernels' GCC 15
+```
+
 - [ ] **Step 9: Commit, sync, run.**
 
 ```bash
 git add python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/{kernel.hpp,expert_forward.hpp,team.hpp,keep_warm.hpp,buffer_row.hpp,cabi.hpp} \
   python/sglang/kernels/jit/csrc/exl3/optimized/{kernel.h,quant.hpp,forward_plan.hpp,kernel.cpp} \
   python/sglang/kernels/jit/csrc/nvfp4/optimized/{kernel.h,quant.hpp,forward_plan.hpp,kernel.cpp} \
-  test/registered/unit/kernels/{cpu_experts_common_toy.hpp,cpu_experts_common_toy_lib.cpp,cpu_experts_common_check.cpp,test_cpu_experts_common.py}
+  test/registered/unit/kernels/{cpu_experts_common_toy.hpp,cpu_experts_common_toy_lib.cpp,cpu_experts_common_check.cpp,test_cpu_experts_common.py} \
+  test/manual/dsv41/run_exl3_cpu_forward_checks.sh
 git commit -m "feat(cpu-experts): CpuExpertKernel interface; ExpertForward is a kernel, the C ABI a shim over it" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01FVzWUFXT8SqY4pbyJn21Ft"
 ```
@@ -1177,7 +1199,7 @@ int main()
     using namespace sglang::cpu_experts;
     const CpuExpertKernel& a = toy::toy_kernel_a();
     const CpuExpertKernel& b = toy::toy_kernel_b();
-    CHECK(&a != &b && std::strcmp(a.name(), "toy") == 0 && std::strcmp(b.name(), "toy") == 0);
+    CHECK(&a != &b && std::strcmp(a.name(), "toy_a") == 0 && std::strcmp(b.name(), "toy_b") == 0);
 
     constexpr int hidden = 16, capacity = 2;
     std::vector<float> slab(hidden * capacity);
@@ -1215,7 +1237,8 @@ int main()
     try {
         b.forward(*layer, c);
     } catch (const std::invalid_argument& e) {
-        refused = std::strstr(e.what(), "toy") != nullptr;
+        // b's refusal names both kernels: itself ("toy_b CPU experts: ...") and the layer's ("kernel toy_a").
+        refused = std::strstr(e.what(), "toy_b") != nullptr && std::strstr(e.what(), "kernel toy_a") != nullptr;
     }
     CHECK(refused);
     for (float v : out) CHECK(v == 7.0f);
@@ -1243,7 +1266,9 @@ HIDDEN = ["-fvisibility=hidden", "-fvisibility-inlines-hidden"]
 
 def test_two_libraries_refuse_each_others_layers_across_the_so_boundary(tmp_path):
     for name in ("a", "b"):
-        _build_toy_library(tmp_path / f"libtoy_{name}.so", *HIDDEN, f"-DTOY_KERNEL=toy_kernel_{name}")
+        _build_toy_library(
+            tmp_path / f"libtoy_{name}.so", *HIDDEN, f"-DTOY_KERNEL=toy_kernel_{name}", f'-DTOY_NAME="toy_{name}"'
+        )
     exe = tmp_path / "cross_library"
     subprocess.run(
         [CXX, *CXX_FLAGS, str(CROSS), f"-L{tmp_path}", "-ltoy_a", "-ltoy_b", f"-Wl,-rpath,{tmp_path}", "-o", str(exe)],
@@ -1343,7 +1368,7 @@ In `test_cpu_expert_pool.py` add, beside the EXL3 trait tests (it reuses that fi
 ```python
 @pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
 def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
-    """layer_spec gives the kernel's make_layer what register_layer gave the C ABI: each slab's base and row size in
+    """layer_spec gives the kernel's make_layer what the C ABI's registration took: each slab's base and row size in
     EXL3_STREAMED_NAMES order, the shape, the clamp and SglangExl3CpuParams {bits, swizzled}."""
     import struct
 
@@ -1361,16 +1386,14 @@ def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
     assert all(any(k is slabs[n] for k in spec.keep) for n in names)
 ```
 
-In `test/manual/dsv41/test_cpu_expert_engines_exl3.py` add (`_kernel` is that file's helper returning `(Exl3CpuQuantTrait, cores)`):
+In `test/manual/dsv41/test_cpu_expert_engines_exl3.py` add (`_kernel()` is that file's helper returning `(Exl3CpuQuantTrait, cores)`; it takes no arguments):
 
 ```python
-def test_the_extension_hands_out_one_kernel_address(monkeypatch):
-    trait, _ = _kernel(monkeypatch)
+def test_the_extension_hands_out_one_kernel_address():
+    trait, _ = _kernel()
     address = trait.kernel_address()
     assert address != 0 and trait.kernel_address() == address
 ```
-
-(read `_kernel`'s signature first: if it takes no `monkeypatch`, call it without one.)
 
 - [ ] **Step 2: Run to verify they fail.** Commit the tests (`test(cpu-experts): kernel addresses and layer specs`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_pool.py`. Expected: the four new tests fail (`has no attribute 'nvfp4_cpu_kernel_address'`, `nvfp4_cpu_module`, `unexpected keyword argument 'module'`, `has no attribute 'layer_spec'`).
 
@@ -1535,7 +1558,21 @@ In `Exl3CpuQuantTrait`: move the checks at the top of `register_layer` (the `act
         )
 ```
 
-In `Nvfp4CpuQuantTrait`: add the `module=None` keyword (store it; `kernel_address()` uses `self.module` when given, else `nvfp4_cpu_kernel_address()`); move `register_layer`'s checks into `def _checked(self, slabs, capacity) -> tuple[str, ...]` returning the slab names present (with `up_alpha` when given); and add:
+In `Nvfp4CpuQuantTrait`: add the `module=None` keyword (store it; `kernel_address()` uses `self.module` when given, else `nvfp4_cpu_kernel_address()`); make the ctypes library lazy, so a trait built with `module=` never builds or loads the default-directory library (until Task 7 deletes it): `__init__` stores `self._library = library` instead of calling `nvfp4_cpu_library()`, and
+
+```python
+    @property
+    def library(self) -> ctypes.CDLL:
+        """The kernel's C ABI through ctypes, loaded on first use (only register_layer, forward, free_layer and the
+        native_* methods use it)."""
+        if self._library is None:
+            from sglang.srt.layers.quantization.nvfp4.ext import nvfp4_cpu_library
+
+            self._library = nvfp4_cpu_library()
+        return self._library
+```
+
+(the methods keep reading `self.library`); move `register_layer`'s checks into `def _checked(self, slabs, capacity) -> tuple[str, ...]` returning the slab names present (with `up_alpha` when given); and add:
 
 ```python
     def kernel_address(self) -> int:
@@ -1642,10 +1679,10 @@ def test_a_rows_layer_is_made_once_by_the_enabled_kernel(tmp_path):
         host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
         with pytest.raises(Exception, match="registered once"):
             host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
-        with pytest.raises(Exception, match="row"):
+        with pytest.raises(Exception, match=f"CPU expert layer for row {ROWS + 5} of {ROWS}"):
             host.set_cpu_layer(ROWS + 5, fake_cpu_layer(HIDDEN))
         bad = dataclasses.replace(fake_cpu_layer(HIDDEN), slabs=((1, 2),) * 9)
-        with pytest.raises(Exception, match="slabs"):
+        with pytest.raises(Exception, match="has at most 8 slabs"):
             host.set_cpu_layer(0, bad)
     finally:
         host.stop()
@@ -1817,28 +1854,18 @@ Replace `set_cpu_layer(int64_t row, int64_t handle)` with:
   }
 ```
 
-(the row check precedes `make_layer` in production only through `set_cpu_layer`; `make_cpu_layer` checks the row first too: add the same row check before calling `make_layer`.)
+(`make_cpu_layer` repeats `set_cpu_layer`'s row check, with the same "CPU expert layer for row R of N" text, before calling `make_layer`, so an out-of-range row never reaches the kernel. `ROWS` in the test is the tier's row count: confirm `ram_miss_setup` builds that many rows, and use its count in the `match` if it differs.)
 
-- [ ] **Step 5: `ffi_exports.h`.** `enable_cpu_experts(int64_t handle, int64_t group, int64_t kernel, TensorView split, TensorView cores, TensorView x_rows, TensorView out_rows, int64_t hidden, int64_t parts, int64_t threads, int64_t spin_ns, int64_t keep_warm_ns)`: doc "`kernel` is the format's CpuExpertKernel's address (the trait's kernel_address()), which must outlive the service; rows join once their layer is made (set_cpu_layer). ... `keep_warm_ns` > 0 runs the kernel's keep-warm while idle for that long after each job." Body: `if (kernel == 0) throw ... "CPU experts need the format's kernel";` `config.kernel = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));` drop `config.engine`/`config.forward`/`config.keep_warm`; `if (keep_warm_ns < 0) throw ...` stays; `config.keep_warm_ns = keep_warm_ns;`. Replace `set_cpu_layer`:
+- [ ] **Step 5: `ffi_exports.h`.** First two helpers in `HostExports`, which `set_cpu_layer` here and Task 6's `kernel_layer` both call:
 
 ```cpp
-  // CPU experts: `row`'s layer, made here by the enabled kernel's make_layer from the row's pinned slabs. `slabs` is
-  // int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab), `params`
-  // uint8 [bytes] the format's parameter struct. Once per row, at any time; the slabs must outlive the service.
-  static void set_cpu_layer(
-      int64_t handle,
-      int64_t row,
-      TensorView slabs,
-      int64_t capacity,
-      int64_t hidden,
-      int64_t intermediate,
-      int64_t activation,
-      double act_limit,
-      TensorView params) {
+  // A slab table and a layer's scalars as LayerSlabs (set_cpu_layer, the test export kernel_layer): `slabs` int64
+  // [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab), n <= kMaxSlabs.
+  static cpu_experts::LayerSlabs layer_slabs(
+      TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation, double act_limit) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("slabs", TensorMatcher({-1, 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slabs);
-    expert_stream::verify_named("params", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), params);
     if (slabs.size(0) > cpu_experts::kMaxSlabs)
       throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer has at most " +
                                std::to_string(cpu_experts::kMaxSlabs) + " slabs");
@@ -1854,12 +1881,40 @@ Replace `set_cpu_layer(int64_t row, int64_t handle)` with:
       d.slabs[i] = reinterpret_cast<const void*>(static_cast<intptr_t>(s[2 * i]));
       d.slot_bytes[i] = static_cast<uint64_t>(s[2 * i + 1]);
     }
-    const std::span<const std::byte> bytes(static_cast<const std::byte*>(params.data_ptr()), params.size(0));
-    find(handle)->make_cpu_layer(row, d, bytes);
+    return d;
+  }
+
+  // A layer's params tensor (uint8 [m], the format's parameter struct) as make_layer's bytes; empty for m = 0.
+  static std::span<const std::byte> params_bytes(TensorView params) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("params", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), params);
+    return {static_cast<const std::byte*>(params.data_ptr()), static_cast<size_t>(params.size(0))};
   }
 ```
 
-(`TensorMatcher({-1, 2})` must accept `n = 0` rows; if it does not, build the Python side's empty table as `torch.zeros((0, 2), dtype=torch.int64)` and confirm the matcher's behaviour in the test for `fake_cpu_layer`, whose `slabs` is empty.) The export lines keep their names.
+Then `enable_cpu_experts(int64_t handle, int64_t group, int64_t kernel, TensorView split, TensorView cores, TensorView x_rows, TensorView out_rows, int64_t hidden, int64_t parts, int64_t threads, int64_t spin_ns, int64_t keep_warm_ns)`: doc "`kernel` is the format's CpuExpertKernel's address (the trait's kernel_address()), which must outlive the service; rows join once their layer is made (set_cpu_layer). ... `keep_warm_ns` > 0 runs the kernel's keep-warm while idle for that long after each job." Body: `if (kernel == 0) throw ... "CPU experts need the format's kernel";` `config.kernel = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));` drop `config.engine`/`config.forward`/`config.keep_warm`; `if (keep_warm_ns < 0) throw ...` stays; `config.keep_warm_ns = keep_warm_ns;`. Replace `set_cpu_layer`:
+
+```cpp
+  // CPU experts: `row`'s layer, made here by the enabled kernel's make_layer from the row's pinned slabs. `slabs` is
+  // int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab), `params`
+  // uint8 [bytes] the format's parameter struct. Once per row, at any time; the slabs must outlive the service.
+  static void set_cpu_layer(
+      int64_t handle,
+      int64_t row,
+      TensorView slabs,
+      int64_t capacity,
+      int64_t hidden,
+      int64_t intermediate,
+      int64_t activation,
+      double act_limit,
+      TensorView params) {
+    find(handle)->make_cpu_layer(
+        row, layer_slabs(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params));
+  }
+```
+
+(`fake_cpu_layer`'s table has zero rows: the Python side builds it as an int64 `[0, 2]` tensor (`_layer_tensors`, Step 7), and every Task 4 test that registers a fake layer exercises `TensorMatcher({-1, 2})` on it.) The export lines keep their names.
 
 - [ ] **Step 6: The fake kernel (`ffi_test_exports.h`).** Replace `test_forward_ns` through `test_keep_warm_engine` with the fake below and its exports, and update the header's `misc` line to `test_kernel_address, test_kernel_calls, test_kernel_hold, test_keep_warm_calls, test_keep_warm_core, pause_ns`:
 
@@ -2040,7 +2095,20 @@ Replace `set_cpu_layer(int64_t row, int64_t handle)` with:
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_core, Exports::test_keep_warm_core);   \
 ```
 
-- [ ] **Step 7: The transport.** Add `"test_kernel_address", "test_kernel_calls", "test_kernel_hold", "test_keep_warm_calls", "test_keep_warm_core"` to `TEST_ONLY_EXPORTS`. `enable_cpu_experts(self, kernel: int, split, cores, x_rows, out_rows, *, threads, group=0, spin_us=50_000, keep_warm_us=0)`: docstring's `forward`/`engine`/`keep_warm` sentences become "``kernel`` is the format's ``CpuExpertKernel`` address (the trait's ``kernel_address()``); its library must stay loaded while the host runs. Each row joins once its layer is set (:meth:`set_cpu_layer`). ... For ``keep_warm_us`` after each job the idle thread runs the kernel's keep-warm on its workers (0: off)."; the FFI call passes `int(kernel)` and drops `engine`/`keep_warm`. Then:
+- [ ] **Step 7: The transport.** Add one module-level helper, used by `set_cpu_layer` here and by Task 6's `kernel_layer`:
+
+```python
+def _layer_tensors(spec) -> tuple[torch.Tensor, torch.Tensor]:
+    """A ``CpuExpertLayerSpec``'s slab table (int64 ``[n, 2]`` of {address, slot bytes}) and params (uint8 ``[m]``),
+    as the host's set_cpu_layer and kernel_layer take them. ``reshape(n, 2)``: torch refuses ``reshape(-1, 2)`` of a
+    zero-slab table (the fake kernel's layers have none)."""
+    flat = [int(v) for pair in spec.slabs for v in pair]
+    slabs = torch.tensor(flat, dtype=torch.int64).reshape(len(spec.slabs), 2)
+    params = torch.tensor(list(spec.params), dtype=torch.uint8)
+    return slabs, params
+```
+
+Add `"test_kernel_address", "test_kernel_calls", "test_kernel_hold", "test_keep_warm_calls", "test_keep_warm_core"` to `TEST_ONLY_EXPORTS`. `enable_cpu_experts(self, kernel: int, split, cores, x_rows, out_rows, *, threads, group=0, spin_us=50_000, keep_warm_us=0)`: docstring's `forward`/`engine`/`keep_warm` sentences become "``kernel`` is the format's ``CpuExpertKernel`` address (the trait's ``kernel_address()``); its library must stay loaded while the host runs. Each row joins once its layer is set (:meth:`set_cpu_layer`). ... For ``keep_warm_us`` after each job the idle thread runs the kernel's keep-warm on its workers (0: off)."; the FFI call passes `int(kernel)` and drops `engine`/`keep_warm`. Then:
 
 ```python
     def set_cpu_layer(self, row: int, spec) -> None:
@@ -2048,9 +2116,7 @@ Replace `set_cpu_layer(int64_t row, int64_t handle)` with:
 
         Once per row, at any time. The host keeps ``spec.keep`` (the slabs the layer reads) alive.
         """
-        self._check(row)
-        slabs = torch.tensor(list(spec.slabs), dtype=torch.int64).reshape(-1, 2)
-        params = torch.frombuffer(bytearray(spec.params), dtype=torch.uint8) if spec.params else torch.zeros(0, dtype=torch.uint8)
+        slabs, params = _layer_tensors(spec)
         self._module.expert_stream_set_cpu_layer(
             self.handle, row, slabs, int(spec.capacity), int(spec.hidden), int(spec.intermediate),
             int(spec.activation), float(spec.act_limit), params,
@@ -2058,7 +2124,7 @@ Replace `set_cpu_layer(int64_t row, int64_t handle)` with:
         self._cpu_layer_keep[row] = spec.keep
 ```
 
-(initialise `self._cpu_layer_keep: dict[int, tuple] = {}` in `__init__`; `self._check(row)` raises for a row outside the tier with "row" in its message -- if it does not, the C++ check does). Replace the four fake wrappers with:
+(initialise `self._cpu_layer_keep: dict[int, tuple] = {}` in `__init__`. No Python row check: `RamTier::make_cpu_layer`'s "CPU expert layer for row" refusal is the one the test pins.) Replace the four fake wrappers with:
 
 ```python
     def test_kernel_address(self, ns_per_expert: int = 0, *, fail: int = 0, zero: bool = False) -> int:
@@ -2182,29 +2248,94 @@ class FakeKernel final : public es::cpu_experts::CpuExpertKernel {
 };
 ```
 
-(`es` is the bench's alias for `sglang::expert_stream`; `cpu_experts` is `sglang::cpu_experts`, so write `::sglang::cpu_experts::` if `es::cpu_experts` does not name it.) `test_stack` and `test_two_groups` create `FakeKernel fake;` before the `StackConfig`, set `config.kernel = &fake;`, register with `stack.set_cpu_layer(0, fake.make_layer({}, {}))`, read `fake.calls` under `fake.mutex`, and `test_two_groups` tells the groups apart by `call.core == placement.groups[g].workers.front()` where it read `call.engine - 1` (drop `group.engine = g + 1`). Add:
+(`es` is the bench's alias for `sglang::expert_stream`; `cpu_experts` is `sglang::cpu_experts`, so write `::sglang::cpu_experts::` if `es::cpu_experts` does not name it.) `test_stack` and `test_two_groups` create `FakeKernel fake;` before the `StackConfig`, set `config.kernel = &fake;`, register with `stack.set_cpu_layer(0, fake.make_layer({}, {}))`, read `fake.calls` under `fake.mutex`, and `test_two_groups` tells the groups apart by `call.core == placement.groups[g].workers.front()` where it read `call.engine - 1` (drop `group.engine = g + 1`). Give the bench fake a name, so a refusal can be shown to name both kernels: `explicit FakeKernel(const char* name = "bench-fake") : name_(name) {}`, `const char* name() const noexcept override { return name_; }`, member `const char* name_;`.
+
+Factor `test_two_groups`' rows, images and buffers into a rig both two-group tests use (its body is `test_two_groups`' current setup, lines 701-743 of `self_test.cpp`, moved):
 
 ```cpp
-// Review Focus 2: one tier runs one kernel; a second group naming another kernel is refused, naming both.
-void test_groups_must_share_one_kernel(const Placement& placement, const std::filesystem::path& dir) {
-  if constexpr (w::Wire::kNodes != 2) return;
-  // ... the same rows, x and out as test_two_groups ...
-  FakeKernel first, second;
-  StackConfig config = /* test_two_groups' config */;
-  config.kernel = &first;
-  config.groups[1].kernel = &second;
-  bool refused = false;
-  try {
-    PinScope writer(placement.writer);
-    Stack<BenchBuild> stack(std::move(config));
-  } catch (const std::runtime_error& e) {
-    refused = std::string(e.what()).find("run one kernel") != std::string::npos;
+// Two NUMA groups' synthetic rows, row images and pinned buffers (test_two_groups, test_groups_must_share_one_kernel):
+// per group 3 staging slots and 4 mappable; config() sends every eligible lane to the CPU.
+struct TwoGroupRig {
+  static constexpr int64_t kGroup = 7;
+  std::vector<std::array<AlignedBuffer, kNames>> slabs;
+  RowSet set;
+  AlignedBuffer x;
+  AlignedBuffer out;
+
+  TwoGroupRig(const std::filesystem::path& dir, const std::string& name)
+      : slabs(kSelfRows),
+        x(aligned_zeroed(kSelfRows * 2 * kSelfHidden)),
+        out(aligned_zeroed(kSelfRows * 4 * kSelfHidden * 4)) {  // two parts per group
+    const ImageLayout layout = image_layout({512, 512, 512, 512, 512, 512});
+    set.layout = layout;
+    set.experts = kSelfExperts;
+    set.capacity = 2 * kGroup;
+    for (int64_t row = 0; row < kSelfRows; ++row) {
+      std::array<uint8_t*, kNames> bases{};
+      for (int n = 0; n < kNames; ++n) {
+        slabs[row][n] = aligned_zeroed(2 * kGroup * 512);
+        bases[n] = slabs[row][n].get();
+      }
+      set.slabs.push_back(bases);
+      const auto path = dir / (name + "-layer-" + std::to_string(row) + ".rows");
+      write_row_image(
+          path,
+          layout,
+          kSelfExperts,
+          [&](int64_t e, uint8_t* image) {
+            for (int n = 0; n < kNames; ++n)
+              std::memset(image + layout.name_offsets[n], pattern(row, e, n), 512);
+          },
+          "");
+      set.paths.push_back(path.string());
+    }
   }
-  expect(refused, "a second kernel for group 1 is refused");
+
+  StackConfig config(const Placement& placement, const ::sglang::cpu_experts::CpuExpertKernel& kernel) const {
+    StackConfig c;
+    c.rows = set;
+    c.staging = 3;
+    c.kernel = &kernel;
+    c.x_base = x.get();
+    c.x_stride = 2 * kSelfHidden;
+    c.out_base = out.get();
+    c.out_stride = 4 * kSelfHidden * 4;
+    c.hidden = kSelfHidden;
+    c.copy_cpu = placement.copy;
+    c.ranges = {{0, kGroup}, {kGroup, 2 * kGroup}};
+    for (int g = 0; g < 2; ++g) {
+      StackConfig::Group group;
+      group.service_cpu = placement.groups[g].service;
+      group.cores.assign(placement.groups[g].workers.begin(), placement.groups[g].workers.end());
+      group.split = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+      c.groups.push_back(group);
+    }
+    return c;
+  }
+};
+```
+
+`test_two_groups` becomes `TwoGroupRig rig(dir, "selftest2"); FakeKernel fake; StackConfig config = rig.config(placement, fake);` followed by its unchanged body from `PinScope writer` on, with `kGroup` read as `TwoGroupRig::kGroup` and `out` as `rig.out`. Add, and call it from `run_self_test` after `test_two_groups`:
+
+```cpp
+// Review Focus 2: one tier runs one kernel. Group 1 naming a second kernel is refused while the stack is built, the
+// message naming both kernels. Runs only in the two-node build: BENCH kiface-bench-n2 gates it, kiface-bench (one node)
+// returns at once.
+void test_groups_must_share_one_kernel(const Placement& placement, const std::filesystem::path& dir) {
+  if constexpr (w::Wire::kNodes != 2) {
+    return;
+  } else {
+    TwoGroupRig rig(dir, "selftest-kernels");
+    FakeKernel first("fake-a"), second("fake-b");
+    StackConfig config = rig.config(placement, first);
+    config.groups[1].kernel = &second;
+    PinScope writer(placement.writer);
+    CHECK_THROWS(Stack<BenchBuild> stack(std::move(config)), "group 1 names fake-b, another group fake-a");
+  }
 }
 ```
 
-For that test only, `StackConfig::Group` keeps one optional field `const cpu_experts::CpuExpertKernel* kernel = nullptr;  // null: the stack's kernel` (used only to provoke the refusal). Factor the rows/x/out setup of `test_two_groups` into a helper both call rather than copying it; use the file's existing `expect`/check helper (read it first) and register the new test in the self-test runner's list.
+`StackConfig::Group` gains one field for this test, `const ::sglang::cpu_experts::CpuExpertKernel* kernel = nullptr;  // null: the stack's kernel (set only to provoke the one-kernel refusal)`. The needle is `RamTier::enable_cpu_experts`' message (Task 4 Step 4): "every group's CPU experts run one kernel: group 1 names fake-b, another group fake-a".
 
 - [ ] **Step 2: Run to verify it fails.** Commit, `SYNC`, `BENCH kiface-bench 1` -- expected `BUILD` nonzero (`StackConfig` has no member `kernel`).
 
@@ -2393,7 +2524,18 @@ Update the module docstring: "The NVFP4 CPU expert kernel under its OpenMP team,
     "kernel_drop": lambda m, h: m.expert_stream_kernel_drop(0),
 ```
 
-and the three helpers to the module-level refusal test's `calls` (`"kernel_layer": lambda: ops.kernel_layer(0, fake_cpu_layer(), variant="prod")`, and the same shape for the other two).
+In `test_the_module_level_test_only_helpers_refuse_on_prod`, the literal parametrize tuple becomes
+`("read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields", "kernel_layer", "kernel_forward", "kernel_drop")`
+and `calls` gains (with `from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer`):
+
+```python
+        "kernel_layer": lambda: ops.kernel_layer(0, fake_cpu_layer(), variant="prod"),
+        "kernel_forward": lambda: ops.kernel_forward(
+            0, torch.zeros((1, 8), dtype=torch.float16), torch.zeros((1, 1)), torch.zeros((1, 1)),
+            torch.zeros((1, 8)), threads=1, variant="prod",
+        ),
+        "kernel_drop": lambda: ops.kernel_drop(0, variant="prod"),
+```
 
 `test/manual/dsv41/exl3_cpu_forward_ab.py`: `register_slabs(ext, s, limit)` returns `(es.kernel_layer(trait.kernel_address(), trait.layer_spec(s, CAP)), trait)` (exit on `RuntimeError` as today); the `slabs` registration's forward is `status, why = es.kernel_forward(handle, x, sel, w.float(), out, threads=THREADS)` (exit naming the case unless `status == 0`); `engines` mode splits `--cores` into two halves and runs each half's cases on its own thread through `kernel_forward(..., cores=half)` (rename it `--registration cores`, keeping `engines` as an accepted alias so the check script's history reads); cleanup is `es.kernel_drop(handle)` for slab layers, `ext.exl3_moe_cpu_free_layer(handle)` for table layers. Fp16 weights widen exactly to fp32 and the kernel narrows them back, so the dumps stay bit-exact. Update its docstring to name `kernel_forward` instead of "the C ABI's forward". `test/manual/dsv41/test_cpu_expert_engines_exl3.py`: `_forward(trait, layer, x, slots, weights, cores, threads)` returns `(status, out)` from `es.kernel_forward(..., cores=cores)`; the test creates the layer with `kernel_layer(trait.kernel_address(), trait.layer_spec(_random_slabs(...), CAP))` and runs on `cores[:2]` and `cores[2:4]`; its docstring's "engines" become "core groups".
 
@@ -2407,8 +2549,13 @@ and the three helpers to the module-level refusal test's `calls` (`"kernel_layer
     static std::mutex mutex;
     return mutex;
   }
-  static std::vector<std::shared_ptr<cpu_experts::CpuExpertLayer>>& kernel_layers() {
-    static std::vector<std::shared_ptr<cpu_experts::CpuExpertLayer>> layers;
+  // A test layer and the hidden size it was made with, which bounds kernel_forward's x and out.
+  struct KernelLayer {
+    std::shared_ptr<cpu_experts::CpuExpertLayer> layer;
+    int64_t hidden = 0;
+  };
+  static std::vector<KernelLayer>& kernel_layers() {
+    static std::vector<KernelLayer> layers;
     return layers;
   }
   static std::string& kernel_error_text() {
@@ -2423,42 +2570,44 @@ and the three helpers to the module-level refusal test's `calls` (`"kernel_layer
     if constexpr (!Build::kFaults) {
       test_only("kernel_layer");
     } else {
-      // [the LayerSlabs / params construction of HostExports::set_cpu_layer: factor it into a static helper
-      //  `layer_slabs(slabs, capacity, hidden, intermediate, activation, act_limit)` in HostExports and call it from
-      //  both, plus `params_bytes(params)`]
       const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
       std::shared_ptr<cpu_experts::CpuExpertLayer> layer =
           k->make_layer(Base::layer_slabs(slabs, capacity, hidden, intermediate, activation, act_limit),
                         Base::params_bytes(params));
       std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-      kernel_layers().push_back(std::move(layer));
+      kernel_layers().push_back({std::move(layer), hidden});
       return static_cast<int64_t>(kernel_layers().size() - 1);
     }
   }
 
-  // Test only: one forward of layer `id` with its own kernel: x [rows, ...] any dtype (the kernel reads its own),
-  // slots int32 and weights float32 [rows, k], out float32 [rows, hidden], all contiguous CPU; cores int64 [n] (empty:
-  // unpinned). Returns 0, 2 for std::invalid_argument, 1 for any other exception, its message in kernel_error().
+  // Test only: one forward of layer `id` with its own kernel: x fp16 [rows, hidden] (every format's input today),
+  // slots int32 and weights float32 [rows, k], out float32 [rows, hidden], hidden the layer's, all contiguous CPU;
+  // cores int64 [n] (empty: unpinned). The shapes are checked against the layer, so a short x or out is refused here
+  // rather than read or written past its end. Returns 0, 2 for std::invalid_argument, 1 for any other exception, its
+  // message in kernel_error().
   static int64_t kernel_forward(int64_t id, TensorView x, TensorView slots, TensorView weights, TensorView out,
                                 int64_t threads, TensorView cores, int64_t accumulate) {
     if constexpr (!Build::kFaults) {
       test_only("kernel_forward");
     } else {
+      KernelLayer entry;
+      {
+        std::lock_guard<std::mutex> lock(kernel_layers_mutex());
+        if (id < 0 || id >= static_cast<int64_t>(kernel_layers().size()) || !kernel_layers()[id].layer)
+          throw std::runtime_error("kernel_forward: no layer " + std::to_string(id));
+        entry = kernel_layers()[id];
+      }
       using namespace host;
       auto cpu = SymbolicDevice{};
       auto rows = SymbolicSize{"rows"};
       auto k = SymbolicSize{"k"};
+      const int64_t hidden = entry.hidden;
+      expert_stream::verify_named("x", TensorMatcher({rows, hidden}).with_dtype<uint16_t>().with_device<kDLCPU>(cpu), x);
       expert_stream::verify_named("slots", TensorMatcher({rows, k}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), slots);
       expert_stream::verify_named("weights", TensorMatcher({rows, k}).with_dtype<float>().with_device<kDLCPU>(cpu), weights);
-      expert_stream::verify_named("out", TensorMatcher({rows, -1}).with_dtype<float>().with_device<kDLCPU>(cpu), out);
+      expert_stream::verify_named("out", TensorMatcher({rows, hidden}).with_dtype<float>().with_device<kDLCPU>(cpu), out);
       expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
-      std::shared_ptr<cpu_experts::CpuExpertLayer> layer;
-      {
-        std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-        if (id < 0 || id >= static_cast<int64_t>(kernel_layers().size()) || !kernel_layers()[id])
-          throw std::runtime_error("kernel_forward: no layer " + std::to_string(id));
-        layer = kernel_layers()[id];
-      }
+      const std::shared_ptr<cpu_experts::CpuExpertLayer>& layer = entry.layer;
       std::vector<int> on;
       const auto* c = static_cast<const int64_t*>(cores.data_ptr());
       for (int64_t i = 0; i < cores.size(0); ++i)
@@ -2500,12 +2649,12 @@ and the three helpers to the module-level refusal test's `calls` (`"kernel_layer
       test_only("kernel_drop");
     } else {
       std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-      if (id >= 0 && id < static_cast<int64_t>(kernel_layers().size())) kernel_layers()[id].reset();
+      if (id >= 0 && id < static_cast<int64_t>(kernel_layers().size())) kernel_layers()[id] = {};
     }
   }
 ```
 
-(`out` is checked for rows only; the kernel writes `hidden` floats per row and the Python wrapper checks the width. Return the message string the way `build_name` returns one -- read its signature and use the same type.) Export the four with `expert_stream_` prefixes and add `"kernel_layer", "kernel_forward", "kernel_error", "kernel_drop"` to `TEST_ONLY_EXPORTS` (and `"kernel_error": lambda m, h: m.expert_stream_kernel_error()` to `RAW_EXPORTS`). In the transport:
+(`TensorMatcher`'s dtype for fp16 is whatever the codebase's matchers use for half -- read `sgl_kernel/tensor.h` and use that type in place of `uint16_t`; the Python wrapper passes x as `float16`. Return the message string the way `build_name` returns one -- read its signature and use the same type.) Export the four with `expert_stream_` prefixes and add `"kernel_layer", "kernel_forward", "kernel_error", "kernel_drop"` to `TEST_ONLY_EXPORTS` (and `"kernel_error": lambda m, h: m.expert_stream_kernel_error()` to `RAW_EXPORTS`). In the transport:
 
 ```python
 def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
@@ -2514,8 +2663,7 @@ def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[s
     The caller keeps ``spec.keep`` alive until :func:`kernel_drop`. Instrumented build only.
     """
     _refuse_test_only("kernel_layer", variant)
-    slabs = torch.tensor(list(spec.slabs), dtype=torch.int64).reshape(-1, 2)
-    params = torch.frombuffer(bytearray(spec.params), dtype=torch.uint8) if spec.params else torch.zeros(0, dtype=torch.uint8)
+    slabs, params = _layer_tensors(spec)
     return int(_host_module(layout, variant).expert_stream_kernel_layer(
         int(kernel), slabs, int(spec.capacity), int(spec.hidden), int(spec.intermediate), int(spec.activation),
         float(spec.act_limit), params,
@@ -2529,11 +2677,9 @@ def kernel_forward(layer: int, x: torch.Tensor, slots: torch.Tensor, weights: to
     for a bad call, (1, why) for a failure; ``out`` is untouched then. Pins the calling thread to ``cores[0]``.
     Instrumented build only."""
     _refuse_test_only("kernel_forward", variant)
-    if out.dtype != torch.float32 or not out.is_contiguous() or out.shape[0] != slots.shape[0]:
-        raise ValueError("out must be a contiguous float32 [rows, hidden] tensor")
     module = _host_module(layout, variant)
     status = int(module.expert_stream_kernel_forward(
-        int(layer), x.contiguous(), slots.to(torch.int32).contiguous(), weights.to(torch.float32).contiguous(), out,
+        int(layer), x.to(torch.float16).contiguous(), slots.to(torch.int32).contiguous(), weights.to(torch.float32).contiguous(), out,
         int(threads), torch.tensor(list(cores), dtype=torch.int64), int(bool(accumulate)),
     ))
     return status, (str(module.expert_stream_kernel_error()) if status else "")
@@ -2564,7 +2710,7 @@ def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = No
 - Consumes: everything above.
 - Produces: `sglang.srt.layers.moe.cpu_experts.trait.CpuExpertQuantTrait` (Protocol: `name`, `slab_names`, `act_limit`, `x_dtype`, `weights_dtype`, `out_dtype`, `check_environment()`, `hidden_size(slabs)`, `kernel_address()`, `layer_spec(slabs, capacity)`). Removed: `CpuExpertPool`, `CpuExpertsForwardCall`, `CpuExpertsLayer`, `CpuExpertForward`, `CPU_EXPERTS_*_ABI_VERSION`, `CPU_EXPERTS_MAX_SLABS`; trait methods `register_layer`, `free_layer`, `forward`, `_native`, `native_forward`, `native_keep_warm`, `native_create_engine`, `native_free_engine`; `Exl3CpuParams`, `Nvfp4CpuParams`; `Nvfp4CpuQuantTrait(library=...)`; `nvfp4_cpu_library()`.
 
-- [ ] **Step 1: Split the tests (mechanical move).** Create `test/registered/unit/kernels/test_cpu_expert_service.py` with `register_cpu_ci(est_time=<the old file's>, suite="base-a-test-cpu")`, the old file's imports minus `CpuExpertPool`, and these tests moved verbatim from `test_cpu_expert_pool.py` with the helpers they use (`FakeServiceTrait`, `FakeHost`, `FakeExt`, the slab helpers, fixtures): every `test_k_star_*`, `test_split_table_*`, `test_service_*`, `test_configured_split_*`, `test_split_from_grid_*`, `test_format_calibration_*`, `test_calibration_*`, `test_a_16_lane_service_*`, `test_the_configured_split_lists_*`, `test_failed_calibration_*`, `test_log_stats_*`, `test_cpu_expert_groups_*`, `test_each_group_*`, `test_exl3_trait_refuses_slabs_the_kernel_would_misaddress`, `test_exl3_trait_reads_a_one_slot_slabs_row_size_not_its_stride`, `test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers`, `test_exl3_trait_describes_the_six_slabs_for_make_layer`. Port the moved EXL3 trait tests from `register_layer` to `layer_spec` (they assert on `spec.slabs` / the `ValueError`, not on a ctypes call; `FakeRegisterLayer` goes). Delete, not port: the `FakeTrait`/`RecordingSlabs` pool tests (`test_pool_*`, `test_compute_*`, `test_capacity_zero_layer_*`, `test_single_core_pool_*`, `test_failed_registration_frees_*`, `test_close_frees_*`), `test_exl3_trait_registers_the_six_slab_bases`, `test_exl3_trait_keeps_the_slabs_alive_until_free`, `test_exl3_trait_reports_a_refused_registration`. Move `CAP`, `LIMIT` and `_random_slabs` from `test/manual/dsv41/test_cpu_expert_pool_exl3.py` into `test_cpu_expert_engines_exl3.py` (drop its import of them) and delete the former. Every `from sglang.srt.layers.moe.cpu_experts.pool import ...` in the tree becomes `...cpu_experts.trait import ...` (`git grep -l "cpu_experts.pool"` lists them; expect the two scheme files, `service.py`'s docstring and the moved tests).
+- [ ] **Step 1: Split the tests (mechanical move).** Create `test/registered/unit/kernels/test_cpu_expert_service.py` with `register_cpu_ci(est_time=<the old file's>, suite="base-a-test-cpu")`, the old file's imports minus `CpuExpertPool`, and these tests moved verbatim from `test_cpu_expert_pool.py` with the helpers they use (`FakeTrait`, which `FakeServiceTrait` subclasses, minus its `register_layer`, `forward` and `free_layer` methods and the state only they set; `RecordingSlabs` if a moved test still uses it; `FakeServiceTrait`, `FakeHost`, `FakeExt`, the slab helpers, fixtures): every `test_k_star_*`, `test_split_table_*`, `test_service_*`, `test_configured_split_*`, `test_split_from_grid_*`, `test_format_calibration_*`, `test_calibration_*`, `test_a_16_lane_service_*`, `test_the_configured_split_lists_*`, `test_failed_calibration_*`, `test_log_stats_*`, `test_cpu_expert_groups_*`, `test_each_group_*`, `test_exl3_trait_refuses_slabs_the_kernel_would_misaddress`, `test_exl3_trait_reads_a_one_slot_slabs_row_size_not_its_stride`, `test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers`, `test_exl3_trait_describes_the_six_slabs_for_make_layer`. Port the moved EXL3 trait tests from `register_layer` to `layer_spec` (they assert on `spec.slabs` / the `ValueError`, not on a ctypes call; `FakeRegisterLayer` goes). Delete, not port: the pool tests (`test_pool_*`, `test_compute_*`, `test_capacity_zero_layer_*`, `test_single_core_pool_*`, `test_failed_registration_frees_*`, `test_close_frees_*`), `test_exl3_trait_registers_the_six_slab_bases`, `test_exl3_trait_keeps_the_slabs_alive_until_free`, `test_exl3_trait_reports_a_refused_registration`. Move `CAP`, `LIMIT` and `_random_slabs` from `test/manual/dsv41/test_cpu_expert_pool_exl3.py` into `test_cpu_expert_engines_exl3.py` (drop its import of them) and delete the former. Every `from sglang.srt.layers.moe.cpu_experts.pool import ...` in the tree becomes `...cpu_experts.trait import ...` (`git grep -l "cpu_experts.pool"` lists them; expect the two scheme files, `service.py`'s docstring and the moved tests).
   Add to the new file the test that pins the deletion:
 
 ```python
@@ -2581,7 +2727,7 @@ def test_the_pool_and_the_c_abi_mirrors_are_gone():
 
 - [ ] **Step 2: Run to verify it fails.** `git rm test/registered/unit/kernels/test_cpu_expert_pool.py test/registered/unit/kernels/test_cpu_experts_abi.py test/manual/dsv41/test_cpu_expert_pool_exl3.py`, `git add` the new file and the moved helpers, commit (`test(cpu-experts): service, policy and trait tests leave the pool's file`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_expert_service.py`. Expected: `test_the_pool_and_the_c_abi_mirrors_are_gone` FAILS (`cannot import name 'CpuExpertQuantTrait'`); every moved test passes.
 - [ ] **Step 3: Implement.** Move the `CpuExpertQuantTrait` Protocol into `trait.py` with only the members listed under Produces (its docstring: "One expert format's CPU kernel. ``slab_names`` are the pinned-tier tensors it reads; ``kernel_address`` and ``layer_spec`` are what the RAM-miss service gives the host (``expert_stream/host/cpu_experts/kernel.hpp``); its CPU expert threads run the kernel without Python.") and `git rm python/sglang/srt/layers/moe/cpu_experts/pool.py`. In both scheme files delete the removed methods and ctypes structs (the params are `struct.pack` already) and rewrite the module docstrings: EXL3 "The kernel is the optimized build of exllamav3's CPU MoE kernel, ``csrc/exl3/optimized/kernel.cpp`` (built by SGLANG_DSV41_CPU_EXPERTS=1). ``Exl3CpuQuantTrait`` describes each streamed layer's pinned slabs for the kernel's ``make_layer`` (``layer_spec``) and hands out the kernel's address (the extension's torch op ``sglang_exl3_cpu::kernel_address``)."; NVFP4 likewise with "loaded by ``nvfp4.ext.nvfp4_cpu_module``" and "its tvm-ffi export ``nvfp4_cpu_kernel_address``". `Nvfp4CpuQuantTrait` loses `library` (keeps `module`). In `nvfp4/ext.py` delete `nvfp4_cpu_library` and the `ctypes` import, and update the docstring. `test_the_loader_builds_once_per_content_and_reuses_the_library` uses `nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()` / `nvfp4_cpu_library_path(str(tmp_path))`. In `run_exl3_cpu_forward_checks.sh`, the pytest step runs `test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_cpu_expert_service.py`, and its header comment's "(4) the CPU expert pool tests" becomes "(4) the CPU expert engine and service tests".
-- [ ] **Step 4: Run.** `git grep -nwE "CpuExpertPool|CpuExpertForward|CpuExpertsForwardCall|CpuExpertsLayer|native_forward|native_keep_warm|native_create_engine|native_free_engine|register_layer|free_layer" -- python test benchmarks` -- expected hits only in C++ (`csrc/`) and in `exl3_moe_cpu_*`-free lines; no Python hit. Commit (`refactor(cpu-experts): delete CpuExpertPool and the traits' ctypes halves`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_expert_service.py test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py`, then `POOL=test/registered/unit/kernels/test_cpu_expert_service.py KIFACE_CPU` -- `EXIT=0`. `SUITE_EXT` (now without the deleted file) -- pass. `CPU_CHECKS t7` -- `ALL GREEN (check)`.
+- [ ] **Step 4: Run.** `git grep -nE '\b(CpuExpertPool|CpuExpertForward|CpuExpertsForwardCall|CpuExpertsLayer)\b|\b(native_forward|native_keep_warm|native_create_engine|native_free_engine|register_layer|free_layer)\s*\(' -- '*.py'` -- expected: no output (C++ keeps the C ABI until Task 9; the deletion test names the methods only as strings). Commit (`refactor(cpu-experts): delete CpuExpertPool and the traits' ctypes halves`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_expert_service.py test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py`, then `POOL=test/registered/unit/kernels/test_cpu_expert_service.py KIFACE_CPU` -- `EXIT=0`. `SUITE_EXT` (now without the deleted file) -- pass. `CPU_CHECKS t7` -- `ALL GREEN (check)`.
 
 ---
 
@@ -2766,12 +2912,13 @@ def test_build_py_makes_a_library_exporting_no_c_abi(tmp_path):
 - [ ] **Step 4: The success-criteria greps.** On the laptop:
 
 ```bash
-git grep -nE 'cpu_experts_cabi\.h|cabi\.hpp|cpu_experts_abi\.h|SGLANG_CPU_EXPERTS_DEFINE_CABI' -- python test benchmarks
-git grep -nwE 'register_layer|free_layer|engine_create|engine_free|SglangCpuExpertsForward|SglangCpuExpertsLayer' -- python test benchmarks ':!docs'
+git grep -nE '#include .*(cpu_experts_cabi\.h|cabi\.hpp|cpu_experts_abi\.h)|SGLANG_CPU_EXPERTS_DEFINE_CABI\(' -- python test benchmarks
+git grep -nE '\b(register_layer|free_layer|engine_create|engine_free)\s*\(|\bSglangCpuExperts(Forward|Layer)\b' -- python test benchmarks
 git grep -nE 'mutex|registry' -- python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/expert_forward.hpp
+git grep -n 'extern "C"' -- python/sglang/kernels/jit/csrc/exl3 python/sglang/kernels/jit/csrc/nvfp4/optimized python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts
 ```
 
-Expected: no output from any of the three (docs and analysis notes are history and may keep the old names).
+Expected: no output from any of the four. The patterns match code (an include, a declaration or call, a type), not prose; `\b` keeps upstream's `exl3_moe_cpu_free_layer(` and the unrelated `register_layer_transfer_counter(` out. If a comment or docstring still matches, reword it (it describes the deleted ABI) rather than widening the pattern; docs/ and analysis/ are history and are not searched.
 - [ ] **Step 5: Run.** Commit (`refactor(cpu-experts): delete the C ABI`), `SYNC`, `RUN_CPU test/registered/unit/kernels/test_cpu_experts_layout.py test/registered/unit/kernels/test_nvfp4_cpu_build.py test/registered/unit/kernels/test_nvfp4_cpu_experts.py test/registered/unit/kernels/test_cpu_experts_common.py` -- all pass. `NVFP4_AB t9`, `CPU_CHECKS t9`, `BENCH kiface-bench 1`, `SUITE_EXT` -- green.
 
 ---
