@@ -79,45 +79,6 @@ def test_shutdown_does_not_free_a_tier_while_the_gpu_still_has_work_in_flight(tm
         service_module.Exl3RamMissService._instance = None
 
 
-def test_shutdown_ends_a_gpu_reader_waiting_on_the_service_without_waiting_out_its_timeout(tmp_path):
-    """Stale, and failing at the merge base 59cfb07c99 too: it was written for a design with a shutdown word (D4) that
-    ended a wait kernel at once. Shutdown now runs its barrier before admission closes, by design (LEASE_PROTOCOL.md,
-    "Shutdown"), so a chain waiting on a paused service waits for its deadline."""
-    from test_exl3_ram_miss_graph_gpu import HIDDEN, TOP_K, _handled_all, _layers, _step_route
-
-    from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
-
-    layer, streamer, service, checks = _layers(tmp_path, timeout_ms=20000)
-    try:
-        x = torch.zeros((1, HIDDEN), device="cuda", dtype=torch.bfloat16)
-        weights = torch.full((1, TOP_K), 1.0 / TOP_K, device="cuda")
-        ids = torch.tensor([_step_route(0, -1)], device="cuda", dtype=torch.int32)
-        Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, 10.0)
-        graph.replay()  # the warm route is resident: every record it posts is handled
-        torch.cuda.synchronize()
-        assert _handled_all(service), service.host.counters()
-        service.host.pause(2.0)  # nobody serves from here on, so the next wait kernel spins until its timeout
-        ids.copy_(torch.tensor([_step_route(0, 0)], device="cuda", dtype=torch.int32))  # rows the tier lacks
-        graph.replay()
-        time.sleep(0.4)
-        done = torch.cuda.Event()
-        done.record()
-        assert not done.query(), "precondition: the wait kernel is still spinning on a service that is not serving"
-        start = time.perf_counter()
-        service.shutdown()
-        elapsed = time.perf_counter() - start
-        assert elapsed < 10.0, f"shutdown waited out the reader's timeout ({elapsed:.1f} s of a 20 s timeout)"
-        assert not service._quarantined and done.query()
-        assert service.host is not None and not service.host.threaded
-    finally:
-        import sglang.srt.layers.moe.exl3_ram_miss as service_module
-
-        service_module.Exl3RamMissService._instance = None
-
-
 CHILD = """
 import json, sys
 sys.path.insert(0, {here!r})

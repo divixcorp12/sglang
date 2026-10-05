@@ -269,9 +269,7 @@ secondary be scheduled.
 
 If the barrier fails or times out, or the process is exiting, the tiers are **quarantined**: never unregistered or
 freed, with every device buffer (the map bank included) kept alive. A chain waiting on a paused service is not ended by
-shutdown; it waits for its deadline. `test/manual/dsv41/test_exl3_task5_item6_shutdown_gpu.py::test_shutdown_ends_a_
-gpu_reader_waiting_on_the_service_without_waiting_out_its_timeout` asserts otherwise (from an older design with a
-shutdown word) and fails at the merge base too.
+shutdown; it waits for its deadline, where it traps (`test_exl3_slot_map_kernels_cuda.py` pins the trap).
 
 ## Tests
 
