@@ -2869,14 +2869,15 @@ class ExpertHotCacheManager:
         updater = getattr(self, "gpu_residency", None)
         return updater is not None and bool(getattr(updater, "narrow_gather", False))
 
-    def take_verify_overflow(self) -> bool:
-        """After a graphed verify: whether a layer's gather could not serve its misses. Clears the flag.
+    def take_verify_overflow(self, graphed: bool = True) -> bool:
+        """After a verify on the narrowed gather: whether a layer's gather could not serve its misses. Clears the flag.
 
         One host read of the sticky device flag (GpuResidencyUpdater.clamp_gather_misses). A True result means the
-        verify's output is not a verify result and must be re-run with the graph gather suspended.
+        verify's output is not a verify result and must be re-run with the graph gather suspended. ``graphed`` says
+        whether the verify replayed the decode graph; only those count in ``graphed_verify_ct``.
         """
         flag = self.gpu_residency.overflow_flag
-        self.graphed_verify_ct += 1
+        self.graphed_verify_ct += int(graphed)
         if not int(flag.item()):
             return False
         flag.zero_()

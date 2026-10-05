@@ -9,17 +9,20 @@ from sglang.srt.environ import envs
 
 
 def forward_verify_with_reverify(model_runner, forward):
-    """Run a target verify; re-run it eagerly when its graphed expert gather overflowed.
+    """Run a target verify; re-run it eagerly when its narrowed expert gather overflowed.
 
-    ``forward`` runs the verify and returns an object with ``can_run_cuda_graph``. The flag is read only after a
-    graphed verify on a narrowed gather: one host read, before anything reads the logits.
+    ``forward`` runs the verify and returns an object with ``can_run_cuda_graph``. The flag is read after every verify
+    on a narrowed gather, graphed or not: the gather is chosen by route count, not by whether a graph runs, so a verify
+    the runner declined to graph (replace_embeds, a refused attention key) overflows the same way. One host read,
+    before anything reads the logits.
     """
     out = forward()
     manager = getattr(model_runner, "expert_hot_cache_manager", None)
-    if manager is None or not manager.narrow_graph_gather or not out.can_run_cuda_graph:
+    if manager is None or not manager.narrow_graph_gather:
         return out
-    overflowed = manager.take_verify_overflow()
-    if not overflowed and not envs.SGLANG_TEST_DSPARK_FORCE_REVERIFY.get():
+    graphed = bool(out.can_run_cuda_graph)
+    overflowed = manager.take_verify_overflow(graphed=graphed)
+    if not overflowed and not (graphed and envs.SGLANG_TEST_DSPARK_FORCE_REVERIFY.get()):
         return out
     with manager.suspend_graph_gather(), model_runner.decode_cuda_graph_runner.eager_only():
         return forward()
