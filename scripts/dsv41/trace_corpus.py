@@ -59,12 +59,12 @@ def engine_kwargs(args) -> dict:
     if getattr(args, "log_level", None):
         kwargs["log_level"] = args.log_level
     dspark_draft = getattr(args, "dspark", None)
-    if getattr(args, "graphs", False) and not dspark_draft:
-        # The capture, RAM-miss thread and hot cache startup lines are info logs.
+    if getattr(args, "graphs", False):
+        # The capture, RAM-miss thread and hot cache startup lines are info logs. With
+        # --dspark the verify runs in the decode graph, which the EXL3 gate admits on
+        # DIRECT residency at W miss lanes (DSV41_REFERENCE.md §33.8).
         kwargs.update(GRAPH_KWARGS, log_level="info")
     else:
-        # The EXL3 expert-caching gate refuses speculation under a decode CUDA
-        # graph, so a --dspark run is always eager regardless of --graphs.
         kwargs["disable_cuda_graph"] = True
     if dspark_draft:
         kwargs.update(
@@ -138,6 +138,12 @@ def mean_decode_tok_s(sessions: list) -> float:
     return sum(s["decode_tok_s"] for s in sessions) / len(sessions)
 
 
+def dspark_info(engine):
+    """The DSpark worker's info records (SGLANG_DSPARK_DEBUG_DUMP), or None when the dump is off."""
+    states = engine.get_server_info().get("internal_states") or [{}]
+    return states[0].get("dspark_info_record")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
@@ -160,8 +166,7 @@ def main() -> None:
     p.add_argument(
         "--dspark",
         metavar="DRAFT_DIR",
-        help="run DSpark speculative decoding with this draft checkpoint dir "
-        "(forces eager decode; the EXL3 gate refuses speculation under a decode graph)",
+        help="run DSpark speculative decoding with this draft checkpoint dir (eager unless --graphs)",
     )
     p.add_argument(
         "--stop-at-eos",
@@ -219,8 +224,9 @@ def main() -> None:
         )
         boundaries.append({"label": f"session_{len(sessions) - 1}", **provenance.system_sample()})
         print(json.dumps(sessions[-1]), flush=True)
+    info = dspark_info(engine) if args.dspark else None
     engine.shutdown()
-    report = {"provenance": prov, "expert_residency": residency, "boundary_samples": boundaries, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions)}
+    report = {"provenance": prov, "expert_residency": residency, "boundary_samples": boundaries, "per_session": sessions, "mean_decode_tok_s": mean_decode_tok_s(sessions), "dspark_info_record": info}
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
 
