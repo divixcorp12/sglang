@@ -6792,6 +6792,77 @@ N = 2/4/6. That gives:
 
 Build items 1-5 only if the projection beats it.
 
+### 33.5 The verify union curve and the graphed-verify projection (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-verify-gate.md`, branch `dsv41-dspark-graph`, run at
+`00cff9c620`. This is §33.3's "next step" and §10's measurement gate 1. The run is offline, on the CPU only.
+
+**Method.** `scripts/dsv41/verify_union.py` replays the DSV4.1 router capture:
+`direct-two-phase-tests/hot-cache-policy/router-capture/stages.jsonl`, with 40 layers, 384 experts, top-6, 6,153
+decode tokens and 26 requests.
+- **Windows.** Each verify is a window of `width` consecutive decode tokens of one request. The next window starts
+  `stride` tokens later, so stride stands for the accept length. A window never crosses a request or a prefill.
+- **Draft tokens.** The true next tokens' routes stand in for the draft tokens' (teacher forcing).
+- **Replay.** Windows go through `cpu_expert_sim.replay_nm`, which now takes the DIRECT shortlist width (`miss_rows`
+  = W). The settings are the slot-map recipe's: deferred RAM inserts, K = 0, and CPU experts off, as §33.3 v1 requires.
+- **Cost.** A verify costs `(n + m) × 1.0 ms` of link plus `m × 1.5 ms` of NVMe wait plus 14 ms of GPU.
+- **Baseline.** The baseline is the same simulator's plain-decode arm with CPU hits: 75.94 ms/token = 13.17 tok/s,
+  exactly §31.2's figure.
+- **Command.** `taskset -c 0-63 python scripts/dsv41/verify_union.py <stages.jsonl> --out $G/projection.json --jobs 8`,
+  with `$G = cc-expert-prediction/analysis/dsv41-dspark/graph-verify/` (`projection.{md,json}`). It ran in 2 minutes
+  with exit 0.
+
+**Union curve** (distinct experts per verify and layer):
+
+| width:stride | mean | p95 | p99 | max |
+|---|---|---|---|---|
+| 4:2 / 4:3 | 16.0 / 15.9 | 21 | 23 | 24 |
+| 6:2 / 6:3 / 6:4 | 21.2 / 21.1 / 21.2 | 29 | 32 | 36 |
+
+- A 6-token verify touches 3.5× one token's 6 experts per layer.
+- The p99 of 32 sits exactly at the wire cap, and the maximum of 36 exceeds it.
+
+**Projection** (draft slots = hot slots per layer given to the draft: hybrid ≈ 4, resident ≈ 13; tok/s assumes no
+draft time):
+
+| width:stride | W | draft slots | overflow | VRAM ok (cap ≥ 2W) | ms per accepted token | tok/s |
+|---|---|---|---|---|---|---|
+| 6:3 | 8 | 4 | 0.502 | yes | 149.0 | 6.71 |
+| 6:3 | 24 | 4 | 0.002 | no | 115.1 | 8.69 |
+| 6:3 | 32 | 0 | 0.000 | no | 101.8 | 9.83 |
+| 6:4 | 32 | 0 | 0.000 | no | 99.6 | 10.04 |
+| 4:3 | 24 | 0 | 0.000 | no | 99.6 | 10.04 |
+| plain decode, CPU experts off (§31.2) | | | | | 109.76 | 9.11 |
+| **plain decode, CPU hits (baseline)** | | | | | **75.94** | **13.17** |
+
+- **NVMe floor.** NVMe reads per verify are 11.3 × stride in every row. That is the same per accepted token as plain
+  decode (§31.2's 11.32). A verify cannot avoid reading each accepted token's new experts, so both paths pay the same
+  ≈28 ms/token NVMe floor.
+- **Saving over plain decode.** What the union saves is link time on RAM hits: at most 9% against plain decode without
+  CPU experts (99.6 vs 109.76 ms).
+- **What it gives up.** Plain decode with CPU experts saves 31%.
+- **The W that keeps overflow low does not fit.** It needs W ≥ 24, and DIRECT's `capacity ≥ 2W` rule needs ≥ 48 hot
+  slots per layer against about 30.
+- **The W that fits overflows.** W = 8 overflows half the layers (0.50) once the hybrid draft takes its 4 slots.
+
+**Verdict: NO-GO.** The gate (6:3, hybrid draft slots, overflow ≤ 2%, VRAM-admissible W) finds no admissible lane
+count. Every row loses, even with the gate's limits dropped:
+- every one of the 60 rows is below the baseline with zero draft time;
+- the best is 10.04 tok/s against 13.17;
+- the draft budget at parity (`stride × 75.94 − verify ms`) is negative in all 60.
+
+Every modelling simplification favours verify, so the true gap is wider:
+- 14 ms of GPU for a 6-token verify leaves out the attention and Engram breaks (§33.3 item 6);
+- rejected draft tokens route at least as diversely as the true tokens that stand in for them;
+- residency decays once per verify, not once per token.
+
+**What would change it.** Only multi-token CPU experts in verify (§33.3 item 5, size L) attack the gap. Scaling the
+best row by plain decode's CPU saving (109.76 → 75.94, −31%) gives ≈69 ms per accepted token ≈ 14.5 tok/s with no draft
+time, about +10% at most. A ≈5 ms graphed draft per verify (≈1.7 ms per token) takes that to ≈+8%, and verify
+hits fewer RAM rows per token for the CPU to take, so even this is an upper bound. Measured accept lengths (2.9-3.4,
+§33.2) do not move it: tok/s is flat in stride, because NVMe reads scale with it. Graphed DSpark verify is therefore
+not built. §33.3 items 1-8 stay open, and §33.4's eager hybrid draft remains the only DSpark path.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
