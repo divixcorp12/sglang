@@ -471,8 +471,22 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
     )
     with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
         service.ensure_started()
-    assert started == [{"fatal_wait_s": module.watchdog_wait_s(40_000)}]
+    assert started == [{"fatal_wait_s": module.watchdog_wait_s(40_000), "spin_us": 5000}]
     assert started[0]["fatal_wait_s"] > 40.0 * 2 + 1.0
+
+
+@pytest.mark.parametrize("spin_us", [-1, 0, 777])
+def test_the_service_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us):
+    """SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US reaches start_thread: -1 never sleeps, else the spin before the idle sleep."""
+    service, streamers, caches = tiers
+    started = []
+    start = module.ExpertStreamHost.start_thread
+    monkeypatch.setattr(
+        module.ExpertStreamHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
+    )
+    with envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.override(spin_us):
+        service.ensure_started()
+    assert [kw["spin_us"] for kw in started] == [spin_us]
 
 
 def _attach_all(service, streamers, capacity=CAPACITY):
@@ -1292,6 +1306,29 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
         with pytest.raises(RuntimeError, match="CUDA_MODULE_LOADING=EAGER"):
             service.ensure_started()
     assert service.host is None, "a refused start left a host behind"
+
+
+@pytest.mark.parametrize("spin_us", [None, -1, 321])
+def test_the_copy_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us):
+    """SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US reaches enable_copy_engine (default 5000 us; -1 never sleeps)."""
+    service, streamers, caches = tiers
+    monkeypatch.setenv("CUDA_MODULE_LOADING", "EAGER")
+    seen = []
+
+    def reached(self, device, **kwargs):
+        seen.append(kwargs)
+        raise _CopyEngineReached
+
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_copy_engine", reached)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setenv("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE", "1")
+    if spin_us is None:
+        monkeypatch.delenv("SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US", str(spin_us))
+    with pytest.raises(_CopyEngineReached):
+        service.ensure_started()
+    assert [kw["spin_us"] for kw in seen] == [5000 if spin_us is None else spin_us]
 
 
 def test_a_jit_library_load_drains_the_device_first_once_armed(monkeypatch):

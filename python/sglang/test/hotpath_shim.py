@@ -11,9 +11,11 @@ the copy thread retired it and CopyDone is published. The window therefore cover
 map deltas, copy jobs and the copy thread's completions; the child reports how many of each it saw (``copy_jobs`` =
 marks the copy thread recorded, ``copies_done`` = requests whose CopyDone the service published, ``posts``).
 
-Neither thread ever sleeps: the service and copy threads spin between polls, so their ``sleep`` and ``futex`` counts
-are 0 even across the Python-paced gaps between steps. What a zero cannot rule out at all is listed in
-``hotpath_shim.c``'s header comment."""
+``service_spin_us`` and ``copy_spin_us`` are the two threads' idle spin budgets (``start_thread`` and
+``enable_copy_engine``'s ``spin_us``). At -1, the default, neither thread ever sleeps, so their ``sleep`` and ``futex``
+counts are 0 even across the Python-paced gaps between steps. With a small budget the gaps exceed it: the service
+sleeps between polls and the copy thread sleeps on its doorbell, which the service's submit rings. What a zero cannot
+rule out at all is listed in ``hotpath_shim.c``'s header comment."""
 
 from __future__ import annotations
 
@@ -52,8 +54,10 @@ CHILD = textwrap.dedent(
     from sglang.test import hotpath_script as hp
 
     variant, requests, warmup, tmp = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-    s, page, host, sim, dst = hp.build_host(Path(tmp), variant=None if variant == "default" else variant)
-    host.start_thread(fatal_wait_s=60.0)
+    service_spin_us, copy_spin_us = int(sys.argv[5]), int(sys.argv[6])
+    s, page, host, sim, dst = hp.build_host(Path(tmp), variant=None if variant == "default" else variant,
+                                            copy_spin_us=copy_spin_us)
+    host.start_thread(fatal_wait_s=60.0, spin_us=service_spin_us)
     seen = {"posts": 0, "copies_done": 0}
     last = [None]
 
@@ -104,11 +108,12 @@ CHILD = textwrap.dedent(
 )
 
 
-def run_child(shim: Path, *, variant: str = "default", requests: int = 200, warmup: int = 50, tmp) -> dict:
+def run_child(shim: Path, *, variant: str = "default", requests: int = 200, warmup: int = 50, tmp,
+              service_spin_us: int = -1, copy_spin_us: int = -1) -> dict:
     from sglang.test.dsv41_ram_miss_fixtures import spawn_child
 
     # spawn_child warms the modules in this process, which has no preload: only the child gets the shim.
-    proc = spawn_child(CHILD, variant, requests, warmup, tmp, timeout_s=600,
+    proc = spawn_child(CHILD, variant, requests, warmup, tmp, service_spin_us, copy_spin_us, timeout_s=600,
                        variant=None if variant == "default" else variant, env=dict(os.environ, LD_PRELOAD=str(shim)))
     line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("HOTPATH-COUNTS ")), None)
     assert proc.returncode == 0 and line, proc.stdout[-4000:] + proc.stderr[-4000:]
