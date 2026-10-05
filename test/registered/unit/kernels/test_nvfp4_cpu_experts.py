@@ -33,7 +33,8 @@ from tvm_ffi import load_module
 from sglang.kernels.ops.moe import expert_stream_transport as es
 from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 
-kernel = int(load_module(sys.argv[1]).nvfp4_cpu_kernel_address())
+lib = load_module(sys.argv[1])
+kernel = int(lib.nvfp4_cpu_kernel_address())
 calls = [int(t) for t in sys.argv[2].split(",")]
 cores = [int(c) for c in sys.argv[3].split(",")] if sys.argv[3] else []
 alpha_value = float(sys.argv[4])
@@ -49,7 +50,7 @@ alpha = np.full(CAP, alpha_value, np.float32)
 slabs = [(w13, N * H), (w2, H * N // 2), (sf13, 256 * 8), (sf2, 128 * 8), (alpha, 4), (alpha, 4)]
 spec = CpuExpertLayerSpec(capacity=CAP, hidden=H, intermediate=N, act_limit=0.0,
                           slabs=tuple((a.ctypes.data, s) for a, s in slabs) + ((0, 0),),
-                          params=struct.pack("<iff", 0, 1.0, 1.0))
+                          params=bytes(lib.nvfp4_cpu_params(0, 1.0, 1.0)))
 layer = es.kernel_layer(kernel, spec, variant="instr")
 x = torch.full((1, H), 1.0, dtype=torch.float16)
 slots = torch.zeros((1, 1), dtype=torch.int32)

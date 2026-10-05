@@ -159,7 +159,7 @@ void StackFixture::write_x(int64_t row) const {
 // by the EXL3 kernel. Views only: the fixture's slabs outlive it.
 std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> StackFixture::make_layer(int64_t row) const {
   const Impl& f = *impl_;
-  const int32_t params[2] = {3, 0};  // SglangExl3CpuParams {bits, swizzled}
+  const SglangExl3CpuParams params{3, 0};  // bits, swizzled
   ::sglang::cpu_experts::LayerSlabs d;
   d.capacity = static_cast<int32_t>(capacity());
   d.hidden = static_cast<int32_t>(f.hidden);
@@ -171,7 +171,7 @@ std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> StackFixture::make_layer(
     d.slabs[n] = f.set.slabs[row][n];
     d.slot_bytes[n] = static_cast<uint64_t>(f.set.layout.row_bytes[n]);
   }
-  return ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(d, std::as_bytes(std::span<const int32_t>(params, 2)));
+  return ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(d, std::as_bytes(std::span<const SglangExl3CpuParams>(&params, 1)));
 }
 
 void StackFixture::preload_slots(int64_t row) const {

@@ -7,7 +7,6 @@ SGLANG_DSV41_CPU_EXPERTS=1). ``Exl3CpuQuantTrait`` describes each streamed layer
 """
 
 import os
-import struct
 from typing import Any, Mapping, Optional
 
 import torch
@@ -83,15 +82,23 @@ class Exl3CpuQuantTrait:
                 )
         return hidden, intermediate, bits
 
-    def kernel_address(self) -> int:
-        """The address of the extension's EXL3 CpuExpertKernel (its torch op ``sglang_exl3_cpu::kernel_address``)."""
+    def _op(self, name: str):
+        """The optimized extension's torch op ``sglang_exl3_cpu::<name>``."""
         try:
-            return int(torch.ops.sglang_exl3_cpu.kernel_address())
+            return getattr(torch.ops.sglang_exl3_cpu, name)
         except (AttributeError, RuntimeError) as error:
             raise RuntimeError(
-                f"the EXL3 extension {self.ext.__file__} has no sglang_exl3_cpu::kernel_address: CPU experts need the "
+                f"the EXL3 extension {self.ext.__file__} has no sglang_exl3_cpu::{name}: CPU experts need the "
                 "optimized CPU kernel, which SGLANG_DSV41_CPU_EXPERTS=1 builds (csrc/exl3/optimized)"
             ) from error
+
+    def kernel_address(self) -> int:
+        """The address of the extension's EXL3 CpuExpertKernel (its torch op ``sglang_exl3_cpu::kernel_address``)."""
+        return int(self._op("kernel_address")())
+
+    def _params(self, bits: int) -> bytes:
+        """``SglangExl3CpuParams``' bytes as the extension packs them (its torch op ``sglang_exl3_cpu::params``)."""
+        return self._op("params")(bits, int(self.swizzled)).numpy().tobytes()
 
     def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
         """The layer's six slabs by base pointer and row size, and ``SglangExl3CpuParams``' bytes ({bits, swizzled})."""
@@ -105,6 +112,6 @@ class Exl3CpuQuantTrait:
             # One slot's row: the slab is contiguous (checked), so this is its stride(0), which PyTorch does not keep
             # meaningful for a one-slot slab.
             slabs=tuple((v.data_ptr(), v[0].numel() * v.element_size()) for v in views),
-            params=struct.pack("<ii", bits, int(self.swizzled)),
+            params=self._params(bits),
             keep=tuple(views),
         )

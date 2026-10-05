@@ -75,8 +75,3 @@ def nvfp4_cpu_module(build_dir: Optional[str] = None):
     from tvm_ffi import load_module
 
     return load_module(str(nvfp4_cpu_library_path(build_dir)))
-
-
-def nvfp4_cpu_kernel_address(build_dir: Optional[str] = None) -> int:
-    """The address of the library's CpuExpertKernel, for ExpertStreamHost.enable_cpu_experts."""
-    return int(nvfp4_cpu_module(build_dir).nvfp4_cpu_kernel_address())

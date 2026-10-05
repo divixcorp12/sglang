@@ -31,11 +31,11 @@ See [upstream provenance and adaptation details](../upstream/README.md).
 ## Attach to the existing engine
 
 The library's kernel is a `CpuExpertKernel` behind its accessor `nvfp4_cpu_kernel()` (`kernel.h`, hidden: never
-interposed across libraries). Python reaches it through the library's one tvm-ffi export, `nvfp4_cpu_kernel_address`
-(`ffi.cpp`; `nvfp4.ext.nvfp4_cpu_kernel_address()`), and hands that address to
+interposed across libraries). Python reaches it through the library's tvm-ffi export `nvfp4_cpu_kernel_address`
+(`ffi.cpp`, on `nvfp4.ext.nvfp4_cpu_module()`), and hands that address to
 `ExpertStreamHost.enable_cpu_experts`. The host makes each layer with the kernel's `make_layer`
 (`ExpertStreamHost.set_cpu_layer`) from a `CpuExpertLayerSpec` (`Nvfp4CpuQuantTrait.layer_spec`): seven slabs
-(`LayerSlabs`) and a `SglangNvfp4CpuParams` (W13 layout, inverse input scales; `quant.hpp`) as the params bytes. A
+(`LayerSlabs`) and a `SglangNvfp4CpuParams` (W13 layout, inverse input scales; `kernel.h`) as the params bytes, packed by the library's export `nvfp4_cpu_params`. A
 layer stores views; the registrant keeps the slabs alive while the host may read them. The optimized kernel never
 repacks or expands full weight rows. A native caller does the same through `kernel.h`:
 

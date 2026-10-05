@@ -42,6 +42,7 @@ def test_build_py_makes_a_library_exporting_no_c_abi(tmp_path):
     ).stdout
     assert "sglang_nvfp4_cpu_experts_" not in symbols
     assert "__tvm_ffi_nvfp4_cpu_kernel_address" in symbols  # tvm-ffi's TVM_FFI_DLL_EXPORT_TYPED_FUNC prefix
+    assert "__tvm_ffi_nvfp4_cpu_params" in symbols
 
 
 def test_the_loader_builds_once_per_content_and_reuses_the_library(tmp_path):
@@ -63,6 +64,16 @@ def test_the_library_hands_out_its_kernel_address(tmp_path):
     module = load_module(str(_build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)))
     address = int(module.nvfp4_cpu_kernel_address())
     assert address != 0 and int(module.nvfp4_cpu_kernel_address()) == address
+
+
+def test_the_library_packs_the_params_make_layer_reads(tmp_path):
+    """nvfp4_cpu_params is SglangNvfp4CpuParams {int32 w13_layout, float inv_input_scale13, float inv_input_scale2}."""
+    import struct
+
+    from tvm_ffi import load_module
+
+    module = load_module(str(_build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)))
+    assert bytes(module.nvfp4_cpu_params(2, 0.5, 1.0)) == struct.pack("<iff", 2, 0.5, 1.0)
 
 
 def test_the_module_is_loaded_once_and_kept(tmp_path):

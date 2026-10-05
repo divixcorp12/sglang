@@ -7,6 +7,7 @@
 #endif
 #include "../upstream/kernels.h"
 #include "../../moe/expert_stream/host/cpu_experts/expert_forward.hpp"
+#include "kernel.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -19,17 +20,6 @@
 #include <utility>
 #include <vector>
 
-// A layer's params: make_layer's `params` bytes are this struct. Packed row-major E2M1 weights (low nibble first),
-// GPU-ready 128x4-swizzled E4M3 scales. Slab strides are BYTES per host slot. slabs: w13, w2, sf13, sf2, gate_alpha,
-// down_alpha, optional up_alpha (null shares gate_alpha). Alphas are FP32 scalars per slot. activation 0 is ordinary
-// SiLU(gate)*up; act_limit L > 0 clamps gate=min(gate,L), up=clamp(up,-L,L) before SiLU. A layer stores views, never
-// repacks.
-struct SglangNvfp4CpuParams {
-    // 0: [gate,up], 1: [up,gate], 2: alternating 64-row [up,gate] chunks.
-    int32_t w13_layout;
-    // Cancel activation scales folded into GPU GEMM alphas; use 1 for weight-only alphas.
-    float inv_input_scale13, inv_input_scale2;
-};
 
 namespace sglang::nvfp4_cpu {
 // Internal linkage, like the framework's templates: each library's translation unit owns its state.

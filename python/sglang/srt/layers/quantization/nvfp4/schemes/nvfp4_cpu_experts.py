@@ -5,7 +5,6 @@ The kernel is ``python/sglang/kernels/jit/csrc/nvfp4/optimized/kernel.cpp``, bui
 (``layer_spec``) and hands out the kernel's address (the library's tvm-ffi export ``nvfp4_cpu_kernel_address``).
 """
 
-import struct
 from typing import Mapping, Optional
 
 import torch
@@ -73,13 +72,17 @@ class Nvfp4CpuQuantTrait:
                 raise ValueError(f"NVFP4 slab {name} {shape} is not {capacity} contiguous CPU rows")
         return names
 
+    def _module(self):
+        """The library as a tvm-ffi module: ``module``, else the process's cached ``nvfp4_cpu_module()``."""
+        if self.module is not None:
+            return self.module
+        from sglang.srt.layers.quantization.nvfp4.ext import nvfp4_cpu_module
+
+        return nvfp4_cpu_module()
+
     def kernel_address(self) -> int:
         """The address of the library's NVFP4 CpuExpertKernel (its tvm-ffi export ``nvfp4_cpu_kernel_address``)."""
-        if self.module is not None:
-            return int(self.module.nvfp4_cpu_kernel_address())
-        from sglang.srt.layers.quantization.nvfp4.ext import nvfp4_cpu_kernel_address
-
-        return nvfp4_cpu_kernel_address()
+        return int(self._module().nvfp4_cpu_kernel_address())
 
     def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
         """The seven slabs (up_alpha (0, 0) when absent) and ``SglangNvfp4CpuParams``' bytes."""
@@ -92,6 +95,9 @@ class Nvfp4CpuQuantTrait:
             intermediate=self.intermediate,
             act_limit=float(self.act_limit),
             slabs=tuple(pairs + [(0, 0)] * (len(self.slab_names) + 1 - len(pairs))),
-            params=struct.pack("<iff", self.w13_layout, self.inv_input_scale13, self.inv_input_scale2),
+            # SglangNvfp4CpuParams as the library packs them (its tvm-ffi export nvfp4_cpu_params).
+            params=bytes(
+                self._module().nvfp4_cpu_params(self.w13_layout, self.inv_input_scale13, self.inv_input_scale2)
+            ),
             keep=tuple(views),
         )

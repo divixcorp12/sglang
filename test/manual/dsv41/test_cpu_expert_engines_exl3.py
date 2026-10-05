@@ -105,6 +105,17 @@ def test_the_extension_hands_out_one_kernel_address():
     assert address != 0 and trait.kernel_address() == address
 
 
+def test_the_extension_packs_the_params_make_layer_reads():
+    """sglang_exl3_cpu::params is SglangExl3CpuParams {int32 bits, int32 swizzled}, little-endian."""
+    import struct
+
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+
+    trait, _ = _kernel()
+    swizzled = Exl3CpuQuantTrait(trait.ext, act_limit=10.0, swizzled=True)
+    assert trait._params(3) == struct.pack("<ii", 3, 0) and swizzled._params(4) == struct.pack("<ii", 4, 1)
+
+
 def test_two_core_groups_at_once_match_one_group_bit_for_bit(monkeypatch):
     """Review Focus 3. Mutants: one process-wide core list (group B's team pinned onto A's cores) -- red on the
     affinity test below; a shared static scratch, or a forward lock returning 3 -- red here."""

@@ -6,6 +6,7 @@
 #endif
 #include "moe_mul1.h"
 #include "../../moe/expert_stream/host/cpu_experts/expert_forward.hpp"
+#include "kernel.h"
 #include <c10/util/Half.h>
 #include <algorithm>
 #include <array>
@@ -15,14 +16,6 @@
 #include <iterator>
 #include <memory>
 
-// A layer's params: make_layer's `params` bytes are this struct. slabs: w13_trellis, w13_suh, w13_svh, w2_trellis,
-// w2_suh, w2_svh (exl3_expert_format.EXL3_STREAMED_NAMES order); slot s of each starts s * slot_bytes[i] in, w13 rows
-// holding gate then up. hidden and intermediate are multiples of 128 in [128, 8192]; activation 0 (gated SiLU, clamped
-// at act_limit when it is nonzero). A layer stores views.
-struct SglangExl3CpuParams {
-    int32_t bits;      // trellis bits per weight, 1..8
-    int32_t swizzled;  // 0 or 1: band-contiguous trellis layout; ignored at 8 bits, which is never swizzled
-};
 
 namespace sglang::exl3_cpu {
 // Internal linkage, like the framework's templates: each library's translation unit owns its state.

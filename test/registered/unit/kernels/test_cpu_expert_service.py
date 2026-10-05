@@ -152,12 +152,19 @@ def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch)
     trait.check_environment()
 
 
+@pytest.fixture(autouse=True)
+def exl3_params(monkeypatch):
+    """The extension packs SglangExl3CpuParams (its torch op sglang_exl3_cpu::params, which needs the optimized
+    extension: test_cpu_expert_engines_exl3.py checks its bytes); here the trait's params name what it passed."""
+    monkeypatch.setattr(
+        Exl3CpuQuantTrait, "_params", lambda self, bits: f"bits={bits} swizzled={int(self.swizzled)}".encode()
+    )
+
+
 @pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
 def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
     """layer_spec gives the kernel's make_layer each slab's base and row size in EXL3_STREAMED_NAMES order, the shape,
-    the clamp and SglangExl3CpuParams {bits, swizzled}."""
-    import struct
-
+    the clamp and the params the extension packs from {bits, swizzled}."""
     slabs = _exl3_slabs()
     if tier_layout:
         slabs = {n: (t.unsqueeze(1) if n.startswith("w2_") else t) for n, t in slabs.items()}
@@ -168,7 +175,7 @@ def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
     row_bytes = [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]  # quant.hpp's SlabRowBytes
     assert spec.slabs == tuple(zip([slabs[n].data_ptr() for n in names], row_bytes))
     assert (spec.capacity, spec.hidden, spec.intermediate, spec.act_limit, spec.activation) == (CAP, H, INTER, 10.0, 0)
-    assert spec.params == struct.pack("<ii", 3, 1)
+    assert spec.params == b"bits=3 swizzled=1"
     assert all(any(k is slabs[n] for k in spec.keep) for n in names)
 
 
