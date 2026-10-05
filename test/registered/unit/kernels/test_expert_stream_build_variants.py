@@ -141,6 +141,16 @@ RAW_EXPORTS = {
     "test_kernel_hold": lambda m, h: m.expert_stream_test_kernel_hold(0, 0),
     "test_keep_warm_calls": lambda m, h: m.expert_stream_test_keep_warm_calls(),
     "test_keep_warm_core": lambda m, h: m.expert_stream_test_keep_warm_core(),
+    "kernel_layer": lambda m, h: m.expert_stream_kernel_layer(
+        0, torch.zeros((0, 2), dtype=torch.int64), 0, 0, 0, 0, 0.0, torch.zeros(0, dtype=torch.uint8)
+    ),
+    "kernel_forward": lambda m, h: m.expert_stream_kernel_forward(
+        0, torch.zeros(1, dtype=torch.uint8), torch.zeros((1, 1), dtype=torch.int32),
+        torch.zeros((1, 1), dtype=torch.float32), torch.zeros((1, 1), dtype=torch.float32), 1,
+        torch.zeros(0, dtype=torch.int64), 0,
+    ),
+    "kernel_drop": lambda m, h: m.expert_stream_kernel_drop(0),
+    "kernel_error": lambda m, h: m.expert_stream_kernel_error(),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
         torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),
@@ -168,9 +178,15 @@ def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "helper", ("read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields")
+    "helper",
+    (
+        "read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields",
+        "kernel_layer", "kernel_forward", "kernel_drop",
+    ),
 )
 def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
+    from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
+
     s = ram_miss_setup(tmp_path)
     calls = {
         "read_rows_with_fault": lambda: ops.read_rows_with_fault(s.tables, 0, [1], [0], [], [], variant="prod"),
@@ -180,6 +196,12 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
         "read_record_fields": lambda: ops.read_record_fields(
             torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, variant="prod"
         ),
+        "kernel_layer": lambda: ops.kernel_layer(0, fake_cpu_layer(), variant="prod"),
+        "kernel_forward": lambda: ops.kernel_forward(
+            0, torch.zeros((1, 8), dtype=torch.float16), torch.zeros((1, 1)), torch.zeros((1, 1)),
+            torch.zeros((1, 8)), threads=1, variant="prod",
+        ),
+        "kernel_drop": lambda: ops.kernel_drop(0, variant="prod"),
     }
     export = {"read_rows_with_fault": "read_rows_faulted"}.get(helper, helper)  # the name the error carries
     with pytest.raises(RuntimeError, match=f"{export} is test-only"):

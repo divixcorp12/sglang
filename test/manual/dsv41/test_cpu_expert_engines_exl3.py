@@ -1,11 +1,10 @@
-"""Two CPU expert engines of the EXL3 kernel on disjoint cores (spec 2026-10-03-numa-node-distributor-design,
-Testing 4). Each engine runs its own OpenMP team on its own cores; two running at once give, bit for bit, what one
+"""Two CPU expert core groups of the EXL3 kernel on disjoint cores (spec 2026-10-03-numa-node-distributor-design,
+Testing 4). Each group runs its own OpenMP team on its own cores; two running at once give, bit for bit, what one
 gives alone. Needs the optimized ext build (RUN_EXT) and 4 cores in the affinity mask.
 
 Every pinned forward runs on a helper thread: a forward pins its calling thread (worker 0), and a pinned pytest thread
 would leave the next test one core."""
 
-import ctypes
 import os
 import subprocess
 import sys
@@ -24,7 +23,6 @@ from test_cpu_expert_pool_exl3 import CAP, LIMIT, _random_slabs  # noqa: E402
 HIDDEN, INTER = 5120, 2304  # DeepSeek V4.1's shape: the DSV4.1 plan on AVX-512BW
 REPEATS = 40
 CORES = sorted(os.sched_getaffinity(0))  # read at import, before any forward could pin this thread
-KEEP_WARM = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64)
 
 
 def _kernel():
@@ -32,31 +30,28 @@ def _kernel():
     from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, exl3_ext, optimized_cpu
 
     if not optimized_cpu(cpu_act_defines()):
-        pytest.skip("the engine ABI is the optimized kernel's: set SGLANG_DSV41_CPU_EXPERTS=1")
+        pytest.skip("the kernel under test is the optimized one: set SGLANG_DSV41_CPU_EXPERTS=1")
     if len(CORES) < 4:
         pytest.skip("needs 4 cores in the affinity mask")
     return Exl3CpuQuantTrait(exl3_ext(), act_limit=LIMIT), CORES[:4]
 
 
-def _forward(trait, layer, x, slots, weights, engine, threads):
-    """One-row call of the C ABI's forward on ``engine``; returns (status, out)."""
-    from sglang.srt.layers.moe.cpu_experts.pool import (
-        CPU_EXPERTS_FORWARD_ABI_VERSION,
-        CpuExpertForward,
-        CpuExpertsForwardCall,
-    )
+def _forward(trait, layer, x, slots, weights, cores, threads):
+    """One-row ``kernel_forward`` on ``cores``; returns (status, out)."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
 
-    s = torch.tensor(slots, dtype=torch.int32)
-    w = torch.tensor(weights, dtype=torch.float32)
-    out = torch.full((HIDDEN,), float("nan"))
-    call = CpuExpertsForwardCall(
-        abi_version=CPU_EXPERTS_FORWARD_ABI_VERSION, rows=1, layer=layer, x=x.data_ptr(),
-        slots=ctypes.cast(s.data_ptr(), ctypes.POINTER(ctypes.c_int32)),
-        weights=ctypes.cast(w.data_ptr(), ctypes.POINTER(ctypes.c_float)),
-        out=ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_float)), k=len(slots), threads=threads, accumulate=0,
-        engine=engine,
+    out = torch.full((1, HIDDEN), float("nan"))
+    status, _ = es.kernel_forward(
+        layer, x.unsqueeze(0), torch.tensor([slots], dtype=torch.int32), torch.tensor([weights], dtype=torch.float32),
+        out, threads=threads, cores=cores, variant="instr",
     )
-    return CpuExpertForward(trait.native_forward())(ctypes.byref(call)), out
+    return status, out
+
+
+def _layer(trait, seed):
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
+    return es.kernel_layer(trait.kernel_address(), trait.layer_spec(_random_slabs(seed, HIDDEN, INTER), CAP), variant="instr")
 
 
 def _inputs():
@@ -88,109 +83,101 @@ def test_the_extension_hands_out_one_kernel_address():
     assert address != 0 and trait.kernel_address() == address
 
 
-def test_two_engines_at_once_match_one_engine_bit_for_bit(monkeypatch):
-    """Review Focus 3. Mutants: one process-wide core list (engine B's team pinned onto A's cores) -- red on the
+def test_two_core_groups_at_once_match_one_group_bit_for_bit(monkeypatch):
+    """Review Focus 3. Mutants: one process-wide core list (group B's team pinned onto A's cores) -- red on the
     affinity test below; a shared static scratch, or a forward lock returning 3 -- red here."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
-    a, b = trait.native_create_engine(cores[:2]), trait.native_create_engine(cores[2:4])
-    layer = trait.register_layer(_random_slabs(20261003, HIDDEN, INTER), CAP)
+    a, b = cores[:2], cores[2:4]
+    layer = _layer(trait, 20261003)
     inputs = _inputs()
     try:
-        (want,) = _on_threads(
-            lambda engine: [_forward(trait, layer, x, s, w, engine, 2) for x, s, w in inputs], [a]
-        )
+        (want,) = _on_threads(lambda on: [_forward(trait, layer, x, s, w, on, 2) for x, s, w in inputs], [a])
         assert all(rc == 0 and torch.isfinite(out).all() for rc, out in want)
 
-        def run(engine):
+        def run(on):
             bad = []
             for _ in range(REPEATS):
                 for i, (x, slots, weights) in enumerate(inputs):
-                    rc, out = _forward(trait, layer, x, slots, weights, engine, 2)
+                    rc, out = _forward(trait, layer, x, slots, weights, on, 2)
                     if rc != 0 or not torch.equal(out, want[i][1]):
-                        bad.append((engine, i, rc))
+                        bad.append((on, i, rc))
             return bad
 
         assert _on_threads(run, [a, b]) == [[], []]
     finally:
-        trait.free_layer(layer)
-        trait.native_free_engine(a)
-        trait.native_free_engine(b)
+        es.kernel_drop(layer, variant="instr")
 
 
-def test_each_engines_workers_run_on_its_own_cores(monkeypatch):
-    """Two keep-warms at once, one per engine: while they run, the process has a thread pinned to each of the four
-    engine cores. Mutant: pin every worker from one core list -- red."""
+def test_each_groups_workers_run_on_its_own_cores(monkeypatch):
+    """Two core groups forwarding at once: while they run, the process has a thread pinned to each of the four
+    cores. Mutant: pin every worker from one core list -- red."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
-    a, b = trait.native_create_engine(cores[:2]), trait.native_create_engine(cores[2:4])
-    keep_warm = KEEP_WARM(trait.native_keep_warm())
-    word = torch.zeros(1, dtype=torch.int32)
-    deadline = time.monotonic_ns() + 10_000_000_000
-    rc = {}
-    runners = [
-        threading.Thread(target=lambda e=e: rc.setdefault(e, keep_warm(e, 2, word.data_ptr(), 0, deadline)))
-        for e in (a, b)
-    ]
+    layer = _layer(trait, 20261005)
+    x, slots, weights = _inputs()[0]
+    stop = threading.Event()
+    rcs = []
+
+    def run(on):
+        while not stop.is_set():
+            rcs.append(_forward(trait, layer, x, slots, weights, on, 2)[0])
+
+    runners = [threading.Thread(target=run, args=(on,)) for on in (cores[:2], cores[2:4])]
     try:
         for runner in runners:
             runner.start()
         time.sleep(0.3)
         pinned = set()
         for tid in os.listdir("/proc/self/task"):
-            mask = os.sched_getaffinity(int(tid))
+            try:
+                mask = os.sched_getaffinity(int(tid))
+            except OSError:  # a worker that exited between the listing and the read
+                continue
             if len(mask) == 1:
                 pinned |= mask
-        word[0] = 1
+        stop.set()
         for runner in runners:
-            runner.join(5)
+            runner.join(30)
         assert set(cores) <= pinned, (cores, sorted(pinned))
-        assert rc == {a: 0, b: 0}
+        assert set(rcs) == {0}
     finally:
-        trait.native_free_engine(a)
-        trait.native_free_engine(b)
+        stop.set()
+        es.kernel_drop(layer, variant="instr")
 
 
-def test_the_engine_abi_refuses_what_it_cannot_run(monkeypatch):
-    """A repeated core, more workers than the engine's cores, an engine never created and a freed engine are refused
-    (2) before any work; engine 0 runs unpinned workers (this thread stays unpinned, so it runs here)."""
+def test_the_kernel_refuses_what_it_cannot_run(monkeypatch):
+    """More workers than the call's cores is refused (2) before any work; no cores at all runs unpinned workers (this
+    thread stays unpinned, so it runs here)."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     trait, cores = _kernel()
-    with pytest.raises(RuntimeError, match="refused engine cores"):
-        trait.native_create_engine([cores[0], cores[0]])
-    a = trait.native_create_engine(cores[:2])
-    layer = trait.register_layer(_random_slabs(1, HIDDEN, INTER), CAP)
+    layer = _layer(trait, 1)
     x, slots, weights = _inputs()[0]
-    keep_warm = KEEP_WARM(trait.native_keep_warm())
-    word = torch.zeros(1, dtype=torch.int32)
     try:
-        rc, out = _forward(trait, layer, x, slots, weights, a, 3)
-        assert rc == 2 and out.isnan().all(), "more workers than the engine's cores"
-        assert _forward(trait, layer, x, slots, weights, a + 1000, 2)[0] == 2, "an engine never created"
-        assert _forward(trait, layer, x, slots, weights, 0, 2)[0] == 0, "engine 0: unpinned workers"
-        assert keep_warm(a, 3, word.data_ptr(), 0, time.monotonic_ns()) == 2
-        assert keep_warm(a + 1000, 1, word.data_ptr(), 0, time.monotonic_ns()) == 2
-        trait.native_free_engine(a)
-        assert _forward(trait, layer, x, slots, weights, a, 2)[0] == 2, "a freed engine"
-        with pytest.raises(RuntimeError, match="no engine"):
-            trait.native_free_engine(a)
+        rc, out = _forward(trait, layer, x, slots, weights, cores[:2], 3)
+        assert rc == 2 and out.isnan().all(), "more workers than the call's cores"
+        assert _forward(trait, layer, x, slots, weights, (), 2)[0] == 0, "no cores: unpinned workers"
     finally:
-        trait.free_layer(layer)
+        es.kernel_drop(layer, variant="instr")
 
 
 _LIMIT_SCRIPT = """
 import os, sys, threading
 sys.path.insert(0, sys.argv[1])
-from test_cpu_expert_engines_exl3 import HIDDEN, INTER, _forward, _inputs, _kernel
-from test_cpu_expert_pool_exl3 import CAP, _random_slabs
+from test_cpu_expert_engines_exl3 import _forward, _inputs, _kernel, _layer
 trait, cores = _kernel()
-a, b = trait.native_create_engine(cores[:2]), trait.native_create_engine(cores[2:4])
-layer = trait.register_layer(_random_slabs(5, HIDDEN, INTER), CAP)
+layer = _layer(trait, 5)
 rcs = []
-def run(engine):
+def run(on):
     for x, slots, weights in _inputs() * 10:
-        rcs.append(_forward(trait, layer, x, slots, weights, engine, 2)[0])
-workers = [threading.Thread(target=run, args=(e,)) for e in (a, b)]
+        rcs.append(_forward(trait, layer, x, slots, weights, on, 2)[0])
+workers = [threading.Thread(target=run, args=(on,)) for on in (cores[:2], cores[2:4])]
 [w.start() for w in workers]
 [w.join() for w in workers]
 print("rcs", sorted(set(rcs)))
@@ -198,7 +185,7 @@ print("rcs", sorted(set(rcs)))
 
 
 def test_two_full_teams_run_at_once_at_a_thread_limit_of_their_sum(monkeypatch):
-    """Review Focus 3: OMP_THREAD_LIMIT equal to the two engines' workers (2 + 2) leaves neither team short (a short
+    """Review Focus 3: OMP_THREAD_LIMIT equal to the two core groups' workers (2 + 2) leaves neither team short (a short
     team is status 1, which run_team returns rather than run), the bound ThreadingConfig enforces. libgomp reads the
     limit at load, so this runs in a child."""
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
