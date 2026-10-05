@@ -101,11 +101,11 @@ def _run_route(args: dict) -> None:
 GATHER_REFUSALS = {
     "width_past_32": (
         lambda: _gather_args(width=33),
-        "the shortlist and the routes must hold 1-32 entries",
+        "the shortlist must hold 1-32 entries",
     ),
-    "routes_past_32": (
-        lambda: _gather_args(routes=33),
-        "the shortlist and the routes must hold 1-32 entries",
+    "routes_past_64": (
+        lambda: _gather_args(routes=65),
+        "the routes must hold 1-64 entries",
     ),
     "victims_on_cpu": (
         lambda: {**_gather_args(), "victims": torch.arange(6, dtype=torch.int64)},

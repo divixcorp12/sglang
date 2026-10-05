@@ -90,7 +90,7 @@ def _scenario(
         )  # out-of-range ranks exercise the clamp
     # Planner order (misses, then hits), padded with distinct experts no route names.
     unrouted = expert_perm[~torch.isin(expert_perm, flat)]
-    source_rows = torch.cat([flat[miss], flat[~miss], unrouted[: width - routes]])
+    source_rows = torch.cat([flat[miss], flat[~miss], unrouted[: max(0, width - routes)]])
     misses = int(miss.sum())
     miss_count = (
         misses
@@ -170,6 +170,9 @@ STATE = (
         (7, 5, 33, 15),
         (13, 13, 101, 29),
         (32, 32, 400, 64),
+        (8, 36, 256, 40),  # a 6-token verify at top-6 over an 8-lane shortlist
+        (16, 64, 400, 64),
+        (32, 64, 400, 64),
     ],
 )
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
