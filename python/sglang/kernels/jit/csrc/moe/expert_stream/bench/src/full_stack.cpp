@@ -235,7 +235,7 @@ class Bench {
       : options_(options),
         placement_(std::move(placement)),
         fixture_(fixture),
-        bare_(bare),
+        bare_layers_(bare),
         before_(std::move(before)),
         deadline_ns_(int64_t{options.wait_timeout_ms} * 1'000'000 / 2) {
     for (int k : {1, 3, 5}) {
@@ -366,7 +366,7 @@ class Bench {
     call.accumulate = false;
     call.cores = placement_.groups[group].workers;
     try {
-      ::sglang::exl3_cpu::exl3_cpu_kernel().forward(*bare_.layers[static_cast<size_t>(row)], call);
+      ::sglang::exl3_cpu::exl3_cpu_kernel().forward(*bare_layers_.layers[static_cast<size_t>(row)], call);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("the bare CPU forward failed: ") + e.what());
     }
@@ -464,7 +464,7 @@ class Bench {
   const Options& options_;
   Placement placement_;
   StackFixture& fixture_;
-  const BareLayers& bare_;  // main's, which outlives this
+  const BareLayers& bare_layers_;  // main's, which outlives this
   std::set<int> before_;          // the process's threads before setup
   bool bare_census_ = false;
   bool stack_census_ = false;
