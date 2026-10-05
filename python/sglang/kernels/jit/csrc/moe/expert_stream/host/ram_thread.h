@@ -1,36 +1,39 @@
 // The RAM-miss service threads of one RamTier, and its watchdog.
-//
-// RamThread owns the service threads, one per NUMA group, which serve posted demand records through
-// RamTier::pump_demand(g), and one watchdog that aborts the process when a request or a copy wait hangs. It also
-// implements the owner handoff, pause() and resume(), by which a Python caller takes the tier from the service threads
-// and gives it back.
-//
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "Parties".
 #pragma once
+
+#include <future>
 
 #include "ram_tier.h"
 
 namespace sglang {
 namespace expert_stream {
 
-// Pumps one RamTier, one thread per NUMA group.
-//
-// Idle policy: after the last request the thread spins with _mm_pause() for spin_ns, then sleeps 50 us between polls.
-// With busy_poll it runs on a core of its own (checked by start_thread), spins with no PAUSE and never sleeps. The spin
-// is an idle-poll budget calibrated once in start() (idle_budget), so the thread reads no clock while it serves.
-//
-// Ownership: the tier has one owner at a time, its service threads or a caller that paused them all. pause() and
-// resume() are the handoff; the memory-ordering edges are documented at each. They take the tier's caller_mutex(),
-// which the service threads never take.
-//
-// Teardown: stop() joins the service threads first and the watchdog second, so a join blocked on a hung read is aborted
-// by the watchdog's stuck rule instead of hanging the process.
+/// pause()'s result; the values cross the FFI as ints.
+enum PauseResult : int {
+  kPauseTimedOut = 0,  // or a racing stop()
+  kPaused = 1,
+  kPauseRefused = 2,  // the copy thread still has a job: the slots are not the caller's to touch
+};
+
+/// Pumps one RamTier with one service thread per NUMA group, each serving its group's posted demand records through
+/// RamTier::pump_demand(g), plus a watchdog that aborts the process when a request or a copy wait hangs.
+///
+/// Idle: after the last request a thread spins with _mm_pause() for spin_ns, then sleeps 50 us between polls; the
+/// spin is a poll budget calibrated once in start() (idle_budget), so a serving thread reads no clock. With busy_poll
+/// it runs on a core of its own (checked by start_thread), spins with no PAUSE and never sleeps.
+///
+/// Ownership: the tier has one owner at a time, its service threads or a caller that paused them all; pause() and
+/// resume() are the handoff. Both take the tier's caller_mutex(), which the service threads never take.
+///
+/// Teardown: stop() joins the service threads first and the watchdog second, so a join blocked on a hung read is
+/// aborted by the watchdog instead of hanging the process.
 template <class Tier>
 class RamThread {
  public:
   using Build = typename Tier::Build;
 
-  // `cpu_cores` has one entry per group.
+  /// `cpu_cores` has one entry per group; a negative entry leaves that thread unpinned.
   RamThread(
       std::shared_ptr<Tier> tier, std::vector<int> cpu_cores, int64_t fatal_wait_ns, int64_t spin_ns, bool busy_poll)
       : tier_(std::move(tier)),
@@ -39,28 +42,22 @@ class RamThread {
         spin_ns_(spin_ns),
         busy_poll_(busy_poll),
         threads_(cpu_cores_.size()),
-        pin_error_(std::make_unique<std::atomic<int>[]>(cpu_cores_.size())),
+        pinned_(cpu_cores_.size()),
         parked_epoch_(std::make_unique<std::atomic<uint64_t>[]>(cpu_cores_.size())) {
-    for (size_t g = 0; g < cpu_cores_.size(); ++g) {
-      pin_error_[g].store(kPinPending);
+    for (size_t g = 0; g < cpu_cores_.size(); ++g)
       parked_epoch_[g].store(0);
-    }
   }
 
   ~RamThread() {
     stop();
   }
 
-  // Starts the service threads and the watchdog.
-  //
-  // Throws when a thread cannot be pinned to its core (every thread is then joined, never left floating), and refuses a
-  // tier whose prefill fill (begun in pump mode) still owes its epilogue: the service would then share the reader
-  // with the fill thread, and the epilogue would run off the owner. It refuses rather than joins because the FFI's
-  // start_thread holds the registry lock, and a join there would stall every handle's calls behind a slow or hung
-  // fill read; the caller must call fill_end() first.
-  //
-  // Runs under caller_mutex(), which orders the set_parked/set_threaded writes against every Python caller. The
-  // service threads never take it, so holding it across the pin handshake cannot deadlock.
+  /// Starts the service threads and the watchdog, under caller_mutex().
+  ///
+  /// Throws when a thread cannot be pinned to its core, after joining every thread. Refuses a tier whose prefill fill
+  /// (begun in pump mode) still owes its epilogue, since the service would share the reader with the fill thread; it
+  /// refuses rather than joins because the FFI's start_thread holds the registry lock, and a join there would stall
+  /// every handle's calls behind a slow fill read. The caller must call fill_end() first.
   void start() {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
     if (tier_->fill_owed()) {
@@ -68,19 +65,21 @@ class RamThread {
           error_prefix<typename Tier::Layout>() +
           "start_thread with a prefill fill running (or not yet ended): call fill_end() first");
     }
-    spin_iters_ = idle_budget(spin_ns_);  // calibrated here: the service thread never reads the clock to pace
+    spin_iters_ = idle_budget(spin_ns_);
     tier_->set_parked(false);
     tier_->set_threaded(true);
+    std::vector<std::future<int>> pins;
+    for (std::promise<int>& pinned : pinned_)
+      pins.push_back(pinned.get_future());
     for (size_t g = 0; g < threads_.size(); ++g)
       threads_[g] = std::thread([this, g] { run(static_cast<int>(g)); });
     int failed = -1;
     int error = 0;
-    for (size_t g = 0; g < threads_.size(); ++g) {
-      while (pin_error_[g].load() == kPinPending)
-        std::this_thread::sleep_for(std::chrono::microseconds(20));
-      if (failed < 0 && pin_error_[g].load() != 0) {
+    for (size_t g = 0; g < pins.size(); ++g) {
+      const int pin_error = pins[g].get();
+      if (failed < 0 && pin_error != 0) {
         failed = static_cast<int>(g);
-        error = pin_error_[g].load();
+        error = pin_error;
       }
     }
     if (failed >= 0) {
@@ -96,92 +95,84 @@ class RamThread {
     watchdog_ = std::thread([this] { watch(); });
   }
 
-  // Stops the service threads, then the watchdog (see the class comment); idempotent.
-  //
-  // The service joins order every service write before stop()'s release of threaded_, after which a caller owns the
-  // tier. A prefill fill a pausing caller left running is joined by stop_thread's final settle
-  // (RamTier::final_settle), under caller_mutex(); the fill thread writes no tier state, so that join is the only edge
-  // it needs.
+  /// Stops the service threads, then the watchdog; idempotent.
+  ///
+  /// The joins order every service write before the release of threaded_, after which a caller owns the tier. A
+  /// prefill fill a pausing caller left running is joined by stop_thread's final settle (RamTier::final_settle), under
+  /// caller_mutex(); the fill thread writes no tier state, so that join is the only edge it needs.
   void stop() {
     stop_.store(true);
     for (std::thread& thread : threads_)
       if (thread.joinable()) thread.join();
     watch_stop_.store(true);
     if (watchdog_.joinable()) watchdog_.join();
-    tier_->set_threaded(false);  // release: after the join, a caller owns the tier
+    tier_->set_threaded(false);
   }
 
-  // Asks the service threads to park and, once every one has, takes ownership of the tier until resume().
-  //
-  // Returns 1 when paused, 0 on timeout (or a racing stop()), and 2 when refused: the copy thread still has a job after
-  // the wait, so the slots are not the caller's to touch. The caller must have synchronized the stream first, so every
-  // copy wait has seen its CopyDone and the copy thread has nothing left to do.
-  //
-  // Edge service -> caller: each loop serves every posted record, then stores its parked_epoch_ (release); pause()
-  // loads them all (acquire), then sets the tier's parked_ (release), which later Python callers acquire in
-  // caller_owns(). Each pause has its own epoch (odd while requested), so a pause right after a resume cannot take
-  // the previous pause's acknowledgement for its own.
-  //
-  // Not reentrant: the one owner of the pairing is the slot table's depth counter (pause at depth 0->1, resume at
-  // 1->0).
-  int pause(int64_t timeout_ns) {
+  /// Asks the service threads to park and, once every one has, takes ownership of the tier until resume().
+  ///
+  /// The caller must have synchronized the stream first, so every copy wait has seen its CopyDone and the copy thread
+  /// has nothing left to do. Not reentrant: the slot table's depth counter owns the pairing (pause at depth 0->1,
+  /// resume at 1->0).
+  ///
+  /// Service -> caller edge: each service loop serves every posted record, then stores its parked_epoch_ (release);
+  /// pause() loads them all (acquire), then sets the tier's parked_ (release), which later callers acquire in
+  /// caller_owns(). Each pause has its own odd epoch, so a pause right after a resume cannot take the previous pause's
+  /// acknowledgement for its own.
+  PauseResult pause(int64_t timeout_ns) {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
-    const uint64_t epoch = (pause_epoch_.load(std::memory_order_relaxed) | 1u) + 2u;  // a new odd epoch
+    const uint64_t epoch = (pause_epoch_.load(std::memory_order_relaxed) | 1u) + 2u;
     pause_epoch_.store(epoch);
     const int64_t deadline = now_ns() + timeout_ns;
     while (!all_parked(epoch)) {
-      // A stop() racing this pause: the service is leaving and will not park for this epoch, so do not wait out the
-      // whole timeout. stop_ is its first store and threaded_ its last; either says so. The deadline test stays on its
-      // own line: test_exl3_ram_miss_stage_trace_causal counts clock reads by line.
+      // A racing stop() will not park for this epoch: stop_ is its first store and threaded_ its last.
       if (stop_.load(std::memory_order_acquire) || !tier_->threaded()) {
         resume_locked();
-        return 0;
+        return kPauseTimedOut;
       }
+      // On its own line: test_exl3_ram_miss_stage_trace_causal counts clock reads by line.
       if (now_ns() > deadline) {
         resume_locked();
-        return 0;
+        return kPauseTimedOut;
       }
       std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
-    tier_->set_parked(true);  // the service parked for this epoch: this caller owns the tier until resume
+    tier_->set_parked(true);
     if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {
       resume_locked();
-      return 2;
+      return kPauseRefused;
     }
-    return 1;
+    return kPaused;
   }
 
-  // Hands the tier back to the service threads. Safe after a timed-out or refused pause (which already resumed).
+  /// Hands the tier back to the service threads. Safe after a timed-out or refused pause (which already resumed).
   void resume() {
     std::lock_guard<std::mutex> caller(tier_->caller_mutex());
     resume_locked();
   }
 
  private:
-  // True once every group's service thread has parked for `epoch`.
   bool all_parked(uint64_t epoch) const {
     for (size_t g = 0; g < threads_.size(); ++g)
       if (parked_epoch_[g].load(std::memory_order_acquire) != epoch) return false;
     return true;
   }
 
-  // The owner hands the tier back, under caller_mutex().
-  //
-  // The owner's writes happen-before the service's next request through the release of pause_epoch_, which the parked
-  // loop acquires. parked_ is cleared first, so a caller that then takes caller_mutex() sees the service as the owner
-  // and is refused instead of touching the tier. A timed-out pause never set parked_.
+  /// The owner hands the tier back, under caller_mutex().
+  ///
+  /// A prefill fill uses the reader the service is about to use, so it is joined and its epilogue run here, on the
+  /// owner. parked_ is cleared next, so a caller that then takes caller_mutex() sees the service as the owner and is
+  /// refused. Last, the release of pause_epoch_ (acquired by the parked loop) orders the owner's writes before the
+  /// service's next request. A timed-out pause never set parked_.
   void resume_locked() {
-    // A prefill fill uses the reader the service thread is about to use: join it and run its epilogue here, on the
-    // owner, before the release below.
     tier_->fill_join();
     tier_->set_parked(false);
     const uint64_t epoch = pause_epoch_.load(std::memory_order_relaxed);
     if (epoch & 1u) pause_epoch_.store(epoch + 1u, std::memory_order_release);
   }
 
-  // The body of group g's service thread: pin, then pump its demand records until stopped, parking whenever a pause is
-  // requested.
-  void run(int g) {
+  /// Names group g's thread and pins it to its core; returns 0 or the errno.
+  int pin(int g) {
     std::string name = std::string(Tier::Layout::kName) + "-ram-miss";
     if (Wire::kNodes > 1) name += std::to_string(g);
     pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
@@ -193,88 +184,114 @@ class RamThread {
       error = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
     }
     tier_->set_counter(g, kSpinCpu, error != 0 ? -error : sched_getcpu());
-    pin_error_[g].store(error);
+    return error;
+  }
+
+  /// Group g's service thread: pumps its demand records until stopped, parking whenever a pause is requested.
+  void run(int g) {
+    const int error = pin(g);
+    pinned_[g].set_value(error);
     if (error != 0) return;
     tier_->set_counter(g, kRunning, 1);
-    uint64_t idle = 0;  // empty polls since the last request: the spin budget counts these, not elapsed time
+    uint64_t idle = 0;  // empty polls since the last request, counted against spin_iters_
     while (!stop_.load(std::memory_order_relaxed)) {
       const uint64_t epoch = pause_epoch_.load(std::memory_order_acquire);
       if (epoch & 1u) {
-        // Serve every record posted before the pause first: an all-HIT_SM chain never waits on the service, so its
-        // record can still be unread, and checked after the caller moved its expert it would fail-stop a correct
-        // device. The caller synchronized the stream, so demand_head is final and this ends.
-        while (tier_->pump_demand(g)) {
-        }
-        parked_epoch_[g].store(epoch, std::memory_order_release);  // the handoff: the pausing caller owns the tier
-        while (pause_epoch_.load(std::memory_order_acquire) == epoch && !stop_.load())
-          std::this_thread::sleep_for(std::chrono::microseconds(20));
-        if (pause_epoch_.load(std::memory_order_acquire) == epoch) {
-          break;  // stopped while parked: the caller owns the tier, touch nothing
-        }
+        if (!park(g, epoch)) break;
         continue;
       }
       if (tier_->pump_demand(g)) {
         idle = 0;
         continue;
       }
-      if (busy_poll_) continue;  // a core of its own: no PAUSE, no sleep (keeps detection latency minimal)
-      if (++idle < spin_iters_) {
+      if (busy_poll_) continue;
+      if (++idle < spin_iters_)
         _mm_pause();
-      } else {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));  // idle: stop burning the core
-      }
+      else
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
     tier_->set_counter(g, kRunning, 0);
   }
 
-  // The watchdog body: aborts the process, instead of hanging decode, in two cases.
-  //   - One demand or fill stays in service on a group for fatal_wait_ns (a hung read), timed as one busy episode
-  //     (RamTier::busy_episode(g)).
-  //   - The copy wait's gate stays closed on one value for longer than the copy-wait timeout: the copy thread is stuck
-  //     in a driver call, and the device's wait must still end.
-  // It runs on its own thread so a stuck read cannot silence it. The clock is read here, every 20 ms, never by the
-  // service, so detection is at most 20 ms late against a 30 s deadline.
-  void watch() {
-    std::vector<uint64_t> episode(threads_.size(), 0);  // each group's busy episode last seen, 0: idle
-    std::vector<int64_t> episode_since(threads_.size(), 0);  // when the watchdog first saw it
-    uint32_t gate = 0;          // the gate word last seen closed, 0: open
+  /// Serves every record posted before the pause, acknowledges `epoch` and waits for the resume. False when stopped
+  /// while parked: the caller then owns the tier, so the thread must touch nothing.
+  ///
+  /// The records are served first because an all-HIT_SM chain never waits on the service, so its record can still be
+  /// unread; checked after the caller moved its expert, it would fail-stop a correct device. The caller synchronized
+  /// the stream, so demand_head is final and this ends.
+  bool park(int g, uint64_t epoch) {
+    while (tier_->pump_demand(g)) {
+    }
+    parked_epoch_[g].store(epoch, std::memory_order_release);
+    while (pause_epoch_.load(std::memory_order_acquire) == epoch && !stop_.load())
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    return pause_epoch_.load(std::memory_order_acquire) != epoch;
+  }
+
+  /// What the watchdog last saw, per group and for the copy gate.
+  struct WatchState {
+    std::vector<uint64_t> episode;      // each group's busy episode, 0: idle
+    std::vector<int64_t> episode_since;  // when the watchdog first saw it
+    uint32_t gate = 0;                   // the gate word last seen closed, 0: open
     int64_t gate_since = 0;
+  };
+
+  /// The watchdog: aborts the process, instead of hanging decode, when one demand or fill stays in service on a group
+  /// for fatal_wait_ns (a hung read, timed as one busy episode, RamTier::busy_episode), or when the copy wait's gate
+  /// stays closed on one value past the copy-wait timeout (the copy thread is stuck in a driver call, and the device's
+  /// wait must still end). It reads the clock every 20 ms on its own thread, so a stuck read cannot silence it.
+  void watch() {
+    WatchState seen{std::vector<uint64_t>(threads_.size(), 0), std::vector<int64_t>(threads_.size(), 0)};
     while (!watch_stop_.load()) {
       const int64_t now = now_ns();
-      int stuck_group = -1;
-      for (size_t g = 0; g < threads_.size(); ++g) {
-        const uint64_t busy = tier_->busy_episode(static_cast<int>(g));
-        if (busy != episode[g]) {
-          episode[g] = busy;
-          episode_since[g] = now;
-        }
-        if (stuck_group < 0 && episode[g] != 0 && now - episode_since[g] > fatal_wait_ns_)
-          stuck_group = static_cast<int>(g);
-      }
-      const uint32_t word = tier_->copy_gate();
-      const uint32_t closed = (word & 0x80000000u) != 0 ? word : 0;
-      if (closed != gate) {
-        gate = closed;
-        gate_since = now;
-      }
-      const bool stuck = stuck_group >= 0;
-      const bool held = gate != 0 && now - gate_since > tier_->copy_wait_timeout_ns();
-      if (stuck || held) {
-        const std::string why = stuck ? "" : tier_->copy_stall();
-        std::fprintf(
-            stderr,
-            "FATAL %s%s%s for %.1f s%s; aborting instead of hanging decode\n",
-            error_prefix<typename Tier::Layout>().c_str(),
-            stuck && threads_.size() > 1 ? ("group " + std::to_string(stuck_group) + ": ").c_str() : "",
-            stuck ? "a request stayed in service" : "a copy wait held the decode stream",
-            static_cast<double>(stuck ? fatal_wait_ns_ : tier_->copy_wait_timeout_ns()) / 1e9,
-            why.c_str());
-        std::fflush(stderr);
-        prctl(PR_SET_DUMPABLE, 0);
-        std::abort();
-      }
+      const int stuck = stuck_group(seen, now);
+      if (stuck >= 0 || gate_held(seen, now)) abort_hung(stuck);
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+  }
+
+  /// The first group whose busy episode has lasted past fatal_wait_ns, or -1.
+  int stuck_group(WatchState& seen, int64_t now) const {
+    int stuck = -1;
+    for (size_t g = 0; g < threads_.size(); ++g) {
+      const uint64_t busy = tier_->busy_episode(static_cast<int>(g));
+      if (busy != seen.episode[g]) {
+        seen.episode[g] = busy;
+        seen.episode_since[g] = now;
+      }
+      if (stuck < 0 && seen.episode[g] != 0 && now - seen.episode_since[g] > fatal_wait_ns_)
+        stuck = static_cast<int>(g);
+    }
+    return stuck;
+  }
+
+  /// True once the copy gate has stayed closed on one value past the copy-wait timeout.
+  bool gate_held(WatchState& seen, int64_t now) const {
+    const uint32_t word = tier_->copy_gate();
+    const uint32_t closed = (word & 0x80000000u) != 0 ? word : 0;
+    if (closed != seen.gate) {
+      seen.gate = closed;
+      seen.gate_since = now;
+    }
+    return seen.gate != 0 && now - seen.gate_since > tier_->copy_wait_timeout_ns();
+  }
+
+  /// Reports the hang (group `stuck`'s request, or the copy gate when -1) and aborts without a core dump.
+  [[noreturn]] void abort_hung(int stuck) const {
+    const bool request = stuck >= 0;
+    const std::string why = request ? "" : tier_->copy_stall();
+    const std::string group = request && threads_.size() > 1 ? "group " + std::to_string(stuck) + ": " : "";
+    std::fprintf(
+        stderr,
+        "FATAL %s%s%s for %.1f s%s; aborting instead of hanging decode\n",
+        error_prefix<typename Tier::Layout>().c_str(),
+        group.c_str(),
+        request ? "a request stayed in service" : "a copy wait held the decode stream",
+        static_cast<double>(request ? fatal_wait_ns_ : tier_->copy_wait_timeout_ns()) / 1e9,
+        why.c_str());
+    std::fflush(stderr);
+    prctl(PR_SET_DUMPABLE, 0);
+    std::abort();
   }
 
   std::shared_ptr<Tier> tier_;
@@ -282,17 +299,15 @@ class RamThread {
   int64_t fatal_wait_ns_;
   int64_t spin_ns_;
   bool busy_poll_;
-  uint64_t spin_iters_ = 1;  // idle polls before the idle sleep: idle_budget(spin_ns_), set in start()
-  std::vector<std::thread> threads_;  // one service thread per group
+  uint64_t spin_iters_ = 1;
+  std::vector<std::thread> threads_;      // one per group
+  std::vector<std::promise<int>> pinned_;  // per group: 0 pinned (or not asked), else the errno
   std::thread watchdog_;
-  static constexpr int kPinPending = -1;
   std::atomic<bool> stop_{false};
   std::atomic<bool> watch_stop_{false};
-  // The pause handshake. pause_epoch_ is odd while a pause is requested (a new value per pause); each loop stores into
-  // its parked_epoch_ the epoch it parked for. pause_epoch_ is written under caller_mutex(), parked_epoch_[g] by group
-  // g's service thread only.
+  // Odd while a pause is requested, a new value per pause; written under caller_mutex().
   std::atomic<uint64_t> pause_epoch_{0};
-  std::unique_ptr<std::atomic<int>[]> pin_error_;  // per group: 0 pinned (or not asked), else the errno
+  // Per group, the epoch its thread parked for; written by that group's thread only.
   std::unique_ptr<std::atomic<uint64_t>[]> parked_epoch_;
 };
 
