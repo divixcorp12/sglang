@@ -124,6 +124,10 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "test_kernel_hold",
     "test_keep_warm_calls",
     "test_keep_warm_core",
+    "kernel_layer",
+    "kernel_forward",
+    "kernel_error",
+    "kernel_drop",
 )
 
 
@@ -1180,6 +1184,69 @@ def read_record_fields(
             for j in range(lane_count)
         ],
     }
+
+
+def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
+    """Test only: kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
+
+    The caller keeps ``spec.keep`` alive until :func:`kernel_drop`. Instrumented build only.
+    """
+    _refuse_test_only("kernel_layer", variant)
+    slabs, params = _layer_tensors(spec)
+    return int(
+        _host_module(layout, variant).expert_stream_kernel_layer(
+            int(kernel),
+            slabs,
+            int(spec.capacity),
+            int(spec.hidden),
+            int(spec.intermediate),
+            int(spec.activation),
+            float(spec.act_limit),
+            params,
+        )
+    )
+
+
+def kernel_forward(
+    layer: int,
+    x: torch.Tensor,
+    slots: torch.Tensor,
+    weights: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    threads: int,
+    cores: Sequence[int] = (),
+    accumulate: bool = False,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+) -> tuple[int, str]:
+    """Test only: one forward of :func:`kernel_layer`'s ``layer``.
+
+    Returns (0, "") or the kernel's refusal: (2, why) for a bad call, (1, why) for a failure; ``out`` is untouched
+    then. Pins the calling thread to ``cores[0]``. Instrumented build only.
+    """
+    _refuse_test_only("kernel_forward", variant)
+    module = _host_module(layout, variant)
+    status = int(
+        module.expert_stream_kernel_forward(
+            int(layer),
+            x.to(torch.float16).contiguous(),
+            slots.to(torch.int32).contiguous(),
+            weights.to(torch.float32).contiguous(),
+            out,
+            int(threads),
+            torch.tensor(list(cores), dtype=torch.int64),
+            int(bool(accumulate)),
+        )
+    )
+    # The message is this thread's (a thread-local in the module), read on the same thread.
+    return status, (str(module.expert_stream_kernel_error()) if status else "")
+
+
+def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = None) -> None:
+    """Test only: release :func:`kernel_layer`'s ``layer``. Instrumented build only."""
+    _refuse_test_only("kernel_drop", variant)
+    _host_module(layout, variant).expert_stream_kernel_drop(int(layer))
 
 
 def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
