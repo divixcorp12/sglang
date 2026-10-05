@@ -313,7 +313,7 @@ def test_captured_gather_and_commit_replay_new_inputs():
         streamer.row_backend.keep.fill_(keep)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(fused.fused_remaps[torch.int32][0].long(), want.long()), (
+        assert torch.equal(fused.fused_remaps[torch.int32][0, :routes].long(), want.long()), (
             f"trial {trial}: remap"
         )
         for name in STATE:
