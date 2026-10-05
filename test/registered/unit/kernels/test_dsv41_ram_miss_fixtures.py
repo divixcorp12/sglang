@@ -6,6 +6,7 @@ measure the compiler. Observed 2026-10-04: nine ``run_host_script`` callers hit 
 import subprocess
 import sys
 
+from sglang.kernels.ops.io import uring_file_reader
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.test import dsv41_ram_miss_fixtures as fixtures
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -16,6 +17,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def _record(monkeypatch):
     events = []
     monkeypatch.setattr(ops, "_host_module", lambda *args: events.append(("load", args)))
+    monkeypatch.setattr(uring_file_reader, "_uring_file_reader_type", lambda: events.append(("load", ("uring_file_reader",))))
     monkeypatch.setattr(
         fixtures.subprocess, "run", lambda *args, **kwargs: events.append(("spawn", args)) or subprocess.CompletedProcess(args, 0)
     )
@@ -72,3 +74,20 @@ def test_run_host_script_children_disable_core_dumps(monkeypatch, tmp_path):
     fixtures.run_host_script(tmp_path, "print('reached')")
     script = next(args for kind, args in events if kind == "spawn")[0][2]
     assert script.startswith(fixtures.NO_CORE_DUMP)
+
+
+def test_a_reading_child_also_finds_the_uring_file_reader_built(monkeypatch):
+    """Children that serve a miss read through ``uring_file_reader``, a JIT module of its own that a host warm-up
+    does not touch (it was cold in the 2026-10-04 ``-n 8`` run)."""
+    events = _record(monkeypatch)
+    fixtures.warm_host_modules("instr")
+    assert ("uring_file_reader",) in _loads(events)
+
+
+def test_spawn_child_warms_then_spawns_a_child_with_core_dumps_off(monkeypatch, tmp_path):
+    """The one place every child goes through: warm first, no core file, the arguments after the script."""
+    events = _record(monkeypatch)
+    fixtures.spawn_child("print(1)", tmp_path, 7, timeout_s=33, variant="instr", nodes=2)
+    assert events[-1][0] == "spawn" and ("exl3", "instr", 8, 2) in _loads(events)
+    argv = events[-1][1][0]
+    assert argv[1:3] == ["-c", fixtures.NO_CORE_DUMP + "print(1)"] and argv[3:] == [str(tmp_path), "7"]
