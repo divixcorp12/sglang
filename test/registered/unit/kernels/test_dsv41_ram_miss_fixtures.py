@@ -18,7 +18,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def _record(monkeypatch):
     events = []
     monkeypatch.setattr(ops, "_host_module", lambda *args: events.append(("load", args)))
-    monkeypatch.setattr(uring_file_reader, "_uring_file_reader_type", lambda: events.append(("load", ("uring_file_reader",))))
+    monkeypatch.setattr(
+        uring_file_reader, "_uring_file_reader_type", lambda: events.append(("load", ("uring_file_reader",)))
+    )
     monkeypatch.setattr(
         fixtures.subprocess, "run", lambda *args, **kwargs: events.append(("spawn", args, kwargs))
         or subprocess.CompletedProcess(args, 0, stdout="HOTPATH-COUNTS {}")
@@ -69,8 +71,11 @@ def test_an_aborting_child_is_not_asked_to_write_a_core_file():
     ``ulimit -c unlimited``, and each of these children maps ~440 MB: under ``-n 8`` the dump outlasted the 60 s timeout
     (observed 2026-10-04, with every JIT module already warm)."""
     probe = subprocess.run(
-        [sys.executable, "-c", fixtures.NO_CORE_DUMP + "import resource; print(resource.getrlimit(resource.RLIMIT_CORE))"],
-        capture_output=True, text=True,
+        [
+            sys.executable, "-c", fixtures.NO_CORE_DUMP + "import resource; print(resource.getrlimit(resource.RLIMIT_CORE))"
+        ],
+        capture_output=True,
+        text=True,
     )
     assert probe.stdout.strip() == "(0, 0)", probe
 

@@ -232,8 +232,17 @@ assert host.pump() == 1 and sim.wait_served(req)
 """
 
 
+CHILD_VARIANT, CHILD_NODES = "instr", 2  # what _SCRIPT constructs; test_the_child_script_builds_what_the_parent_warms pins it
+
+
+def test_the_child_script_builds_what_the_parent_warms():
+    assert f'variant="{CHILD_VARIANT}"' in _SCRIPT and f"wire_layout(8, {CHILD_NODES})" in _SCRIPT
+
+
 def _run(tmp_path, body):
-    return spawn_child(textwrap.dedent(_SCRIPT) + textwrap.dedent(body), tmp_path, timeout_s=120, variant="instr", nodes=2)
+    return spawn_child(
+        textwrap.dedent(_SCRIPT) + textwrap.dedent(body), tmp_path, timeout_s=120, variant=CHILD_VARIANT, nodes=CHILD_NODES
+    )
 
 
 def test_a_group_whose_cpu_job_stalls_is_named_by_the_copy_wait_abort(tmp_path):

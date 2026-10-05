@@ -211,8 +211,15 @@ def test_the_native_start_thread_warns_when_an_inherited_affinity_covers_the_res
     assert "run under taskset -c 0-63" in result.stderr
 
 
+CHILD_VARIANT, CHILD_NODES = "instr", 2  # what _SCRIPT constructs; test_the_child_script_builds_what_the_parent_warms pins it
+
+
+def test_the_child_script_builds_what_the_parent_warms():
+    assert f'variant="{CHILD_VARIANT}"' in _SCRIPT and f"wire_layout(8, {CHILD_NODES})" in _SCRIPT
+
+
 def _run_child(script, tmp_path, timeout):
-    return spawn_child(script, tmp_path, timeout_s=timeout, variant="instr", nodes=2)
+    return spawn_child(script, tmp_path, timeout_s=timeout, variant=CHILD_VARIANT, nodes=CHILD_NODES)
 
 
 _SCRIPT = """

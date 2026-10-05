@@ -264,7 +264,7 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
         child_default = ops.host_variant()
     finally:
         ops._DEFAULT_VARIANT = conftest_default
-    ops._host_module("exl3", child_default, 8, 1)
+    ops._host_module("exl3", child_default, 8, 1)  # what host_layout() loads: its default lanes, one node
     ops._host_module("exl3", variant or child_default, lanes, nodes)
     # A child that serves a miss reads through this module, which the host modules do not load.
     from sglang.kernels.ops.io import uring_file_reader
@@ -277,13 +277,17 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
 # 60 s timeout writing a ~440 MB core under ``pytest -n 8`` (2026-10-04). The limit is read at crash time.
 NO_CORE_DUMP = "import resource; resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
 
+
 def spawn_child(
     script: str, *args, timeout_s: float, variant: Optional[str] = None, lanes: int = 8, nodes: int = 1, env=None
 ) -> subprocess.CompletedProcess:
     """Run ``script`` in a fresh interpreter with ``args`` as its ``sys.argv[1:]``: the one way a test starts a child
     that builds expert-stream hosts. The JIT modules it loads are warmed here first (``warm_host_modules``, arguments
     as there), so the timeout measures the child; its core dumps are off (``NO_CORE_DUMP``), so a child that is meant
-    to abort, or dies when its test is red, is not held up writing one. The pytest process's own limit is untouched."""
+    to abort, or dies when its test is red, is not held up writing one. The pytest process's own limit is untouched.
+
+    ``env`` must not change what picks the child's default build (``SGLANG_DSV41_EXPERT_TRACE_PATH``,
+    ``SGLANG_TEST_DSV41_RAM_MISS_FAULT``): the warm-up reads this process's."""
     warm_host_modules(variant, lanes=lanes, nodes=nodes)
     return subprocess.run(
         [sys.executable, "-c", NO_CORE_DUMP + script, *map(str, args)],

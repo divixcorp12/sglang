@@ -100,10 +100,11 @@ so under `pytest -n 8` the queue makes it longer still.
 
 A test whose child process would build a module must warm it in the parent first, where nothing times the wait.
 `run_host_script` (`python/sglang/test/dsv41_ram_miss_fixtures.py`) is the worked example: it calls
-`warm_host_modules` with the variant and lane count its child script constructs, then spawns. The child has no
-conftest, so it also loads the default build through `host_layout()`; the helper warms that one too (and
-`uring_file_reader`, which a child that serves a miss builds on its own). Start such a child with `spawn_child` in the same
-file. Children that test a build itself (a build failure, a fresh build dir) are left cold on purpose.
+`warm_host_modules` with the variant and lane count its child script constructs, then spawns. Start every such child
+with `spawn_child` in the same file, which does both steps. The child has no conftest, so it also loads the default
+build through `host_layout()`, and a child that serves a miss builds `uring_file_reader`; the helper warms both.
+Children that test a build itself (a build failure, a fresh build dir) are left cold on purpose. `hotpath_shim.run_child`
+goes through `spawn_child` too, with `LD_PRELOAD` on the child only.
 
 An abort-expecting child must run with core dumps off (`spawn_child` does it, through `NO_CORE_DUMP`): each dump is about
 443 MB through systemd-coredump, which can outlast a 60 s timeout under load. Leave pytest's own limit alone, so a real
@@ -113,8 +114,9 @@ A `TimeoutExpired` on a cold cache is the compiler, not a hang. Check the module
 regression. On 2026-10-04, after the GCC 15 / `-march` change, nine `run_host_script` callers failed at 60 s under
 `-n 8` and all passed serially once the module was cached.
 
-A suite runner warms the modules before `-n 8`; to prove a fix on a cold cache without touching anyone's cache, set
-`SGLANG_JIT_HOST_MARCH=x86-64-v3` for that run, which gives every module a new key.
+A suite runner should load the modules once before `-n 8` (the session runner does; no repo script does). To prove a
+fix on a cold cache without touching anyone's cache, set `SGLANG_JIT_HOST_MARCH` to a name not used before (for example
+`x86-64-v2`), which gives every module a new key.
 
 ## What this costs
 

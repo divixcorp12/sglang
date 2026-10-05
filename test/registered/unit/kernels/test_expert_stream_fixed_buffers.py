@@ -207,10 +207,18 @@ def test_registration_refusal_is_a_clear_error_not_a_fallback(tmp_path, uring_en
     if os.geteuid() == 0:
         pytest.skip("root has CAP_IPC_LOCK: the memlock limit does not bind")
     child = spawn_child(
-        _MEMLOCK_CHILD, tmp_path / "child", timeout_s=120, variant="instr",
+        _MEMLOCK_CHILD, tmp_path / "child", timeout_s=120, variant=CHILD_VARIANT,
         env=dict(os.environ, **{PREFIX + "READ_MODE": "readv_fixed"}))
     assert child.returncode == 0, child.stdout + child.stderr
     assert "REFUSED" in child.stdout and "RLIMIT_MEMLOCK" in child.stdout, child.stdout
+
+
+CHILD_VARIANT = "instr"  # what both child scripts construct; test_the_child_scripts_build_what_the_parent_warms pins it
+
+
+def test_the_child_scripts_build_what_the_parent_warms():
+    for script in (_MEMLOCK_CHILD, _RESET_CHILD):
+        assert f'variant="{CHILD_VARIANT}"' in script
 
 
 _MEMLOCK_CHILD = r'''
@@ -239,7 +247,8 @@ def test_a_failed_ring_reset_raises_its_reason_instead_of_aborting(tmp_path, uri
     if read_mode != "normal":
         uring_env(READ_MODE=read_mode, FIXED_FILES=1)
     child = spawn_child(
-        _RESET_CHILD, tmp_path / "child", CAP if read_mode != "normal" else 0, timeout_s=120, variant="instr")
+        _RESET_CHILD, tmp_path / "child", CAP if read_mode != "normal" else 0, timeout_s=120,
+        variant=CHILD_VARIANT)
     if "unsupported by the running kernel" in child.stdout or "requires liburing 2.10" in child.stdout:
         pytest.skip(child.stdout)
     assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)

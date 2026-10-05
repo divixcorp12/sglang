@@ -350,10 +350,15 @@ host.stop()
 """
 
 
+def test_the_mapping_child_builds_what_the_parent_warms():
+    """spawn_child warms the default build at 8 lanes and one node: the script names no variant and no other wire."""
+    assert "variant=" not in _MAPPING_ROW and "wire_layout(8)" in _MAPPING_ROW
+
+
 def test_mapping_refuses_a_row_out_of_range(tmp_path):
     """mapping indexes tiers_[row] with no check; its three row-taking siblings refuse through row_capacity.
     In a subprocess: before the check, the row indexes past tiers_, which may kill the process."""
-    result = spawn_child(_MAPPING_ROW, tmp_path, timeout_s=120)
+    result = spawn_child(_MAPPING_ROW, tmp_path, timeout_s=120)  # no variant: the child's default build
     assert "streamed row 2 is out of range" in result.stdout, (result.returncode, result.stdout, result.stderr[-2000:])
 
 
