@@ -105,6 +105,40 @@ def _check_dspark_cpu_experts(cfg) -> None:
         load_resident_set(resident)
 
 
+_EAGER_VERIFY_REMEDY = "or pass --cuda-graph-backend-decode disabled to run the DSpark verify eagerly"
+
+
+def _check_graphed_verify(cfg) -> None:
+    """A speculative verify in the breakable decode graph (DSV41_REFERENCE.md §33.7-§33.8).
+
+    Only DSpark's static verify, on DIRECT residency at W miss lanes: a verify routes more than the wire's 32 lanes,
+    and only DIRECT's gather flags the misses it cannot serve, which the DSpark worker re-runs eagerly.
+    """
+    algorithm = cfg.speculative_algorithm
+    if str(algorithm).upper() != "DSPARK":
+        raise ValueError(
+            f"EXL3 expert caching graphs the verify of DSpark only, not {algorithm}; {_EAGER_VERIFY_REMEDY}"
+        )
+    lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
+    if not (
+        envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get()
+        and envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
+        and envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2
+        and 1 <= lanes <= 32
+    ):
+        raise ValueError(
+            "EXL3 expert caching runs a DSpark verify in the decode graph only with SGLANG_MOE_EXPERT_GRAPH_GATHER=1, "
+            "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 and "
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES=1-32 (got {lanes}): a verify routes more experts than the 32 "
+            f"lanes; {_EAGER_VERIFY_REMEDY}"
+        )
+    if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
+        raise ValueError(
+            "EXL3 expert caching runs a DSpark verify in the decode graph with SGLANG_RAGGED_VERIFY_MODE=static only "
+            f"(compact mode reads the host); {_EAGER_VERIFY_REMEDY}"
+        )
+
+
 def _check(cfg, budgets) -> None:
     """The eager checks, with decode allowed as a breakable CUDA graph at max batch size 1.
 
@@ -148,12 +182,7 @@ def _check(cfg, budgets) -> None:
         getattr(cfg, "speculative_algorithm", None) is not None
         and graph.decode.backend != Backend.DISABLED
     ):
-        # The graph-gather scratch and RAM-miss posting are sized for one token per
-        # step; a DSpark verify runs up to block_size + 1 tokens.
-        raise ValueError(
-            "EXL3 expert caching runs DSpark verify eagerly only; pass "
-            "--cuda-graph-backend-decode disabled (or --disable-cuda-graph)"
-        )
+        _check_graphed_verify(cfg)
     if graph.decode.backend == Backend.DISABLED:
         _EAGER.check(cfg, budgets)
         return
