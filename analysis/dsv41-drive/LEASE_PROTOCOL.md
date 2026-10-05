@@ -10,6 +10,42 @@ Paths are relative to `python/sglang/kernels/jit/csrc/moe/expert_stream/` unless
 constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/expert_stream_transport.py` and
 `expert_lease_block.py`; `test_exl3_ram_miss_device_args` checks the mirrors.
 
+## The lease channel
+
+The device-to-host handoff every expert-stream client uses, as one template (`LeaseChannel<Spec>`):
+`lease_channel_layout.h` (the spec and the gate word), `lease_channel.cuh` (the device half), `host/lease_channel.h`
+(the host half) and `stream_wait.h` (the wait node). A client is a `ChannelSpec<Head, Ring, Records, RecordBytes, Done,
+Gate>`: where its head word, record ring, done words and gate sit. The record's payload, what the host does with it,
+and the client's data areas are its own; only the protocol is shared. The target is the first client
+(`TargetChannel` in `lease_layout.h`, over the request page and the completion block below).
+
+- **Page and lease.** Two pinned host areas. The page is device-written and host-read: the head word (u32, the last
+  posted seq, stored with a release) and a ring of `Records` records. The lease is host-written and device-read: the
+  done words and the gate.
+- **The seqlock.** A record's first word is its seq. The device stores 0 there, fences (release), writes the payload,
+  then stores the seq last with a release (`begin_record`, `end_record`). The host copies the record once between two
+  acquire loads of the seq word and keeps it only if both read the seq it expects (`read_seqlocked`). The head is
+  published after the record (`publish_head`).
+- **G.** `advance` gives the next seq, never 0; a wrap of the 32-bit seq bumps the epoch. G = epoch << 32 | seq never
+  repeats.
+- **done[].** One u64 per ring record, at `Done + 8 * ((seq - 1) % Records)`. The host stores G there with a release
+  once the record's work is complete (`complete`).
+- **The gate.** Its word is `(seq & 0x1FFFFFFF) << 2 | 1`, with bit 31 set while closed (`gate_word`). It starts
+  open(0), so a wait that armed nothing passes.
+- **The Dekker pair.** Two sides race to open the gate:
+  - device (`close_gate`): store closed(G) relaxed, `fence.sc.sys` (`__threadfence_system`), then load done[G] with
+    acquire. If it reads G, it opens the gate itself.
+  - host (`complete`): store done[G] = G with release, `seq_cst` fence, load the gate. If it reads closed(G), it CASes
+    closed(G) to open(G).
+
+  Each side's store precedes its load behind a full fence, so at least one side sees the other's store. Both write the
+  same word, so a double open is harmless. A stale completion for G that meets closed(G + k) fails its CAS.
+- **The wait node.** `enqueue_gate_wait` queues `cuStreamWaitValue32_v2` GEQ open on the gate, a cyclic compare on the
+  bit-31 encoding; under capture it is a memory-op node of the graph.
+- **The commit trap.** After the wait, the gate is only the wake-up; done[G] == G is the commit. `commit_or_trap`
+  loads it with acquire, which orders the host's results before every later device read of them, and traps otherwise.
+  Only a teardown opens a gate without done[G] (`open_closed_gate`), and the process is ending then.
+
 ## Parties
 
 - **Device.** One linear chain per layer, in one stream, capturable in a graph
@@ -67,7 +103,8 @@ Lane kinds: `HIT_COPY`=1 (the copy thread's DMA; CopyDone), `HIT_SM`=2 (C1; stre
 RAM slot; CopyDone), `MISS_GPU`=4 (NVMe into staging, then S; PieceMask), `MISS_CPU`=5 (NVMe into staging, then the
 CPU; CopyDone).
 
-**Completion block** (20480 B, `kLeaseBlockBytes`, 4096-aligned), then the delta block:
+**Completion block** (20480 B, `kLeaseBlockBytes`, 4096-aligned), then the delta block. `CopyDone` and the gate are
+the target's lease channel (["The lease channel"](#the-lease-channel)):
 
 | Offset | Area | Writer |
 |---|---|---|
@@ -214,19 +251,8 @@ with `CUDA_MODULE_LOADING=EAGER` and a module-load guard; the host then writes `
 while a copy wait holds the stream can stall the copy thread's driver calls until the watchdog aborts. Only a captured
 post can type copy or CPU lanes, so an eager forward is always served by C1 and S.
 
-**The gate.** Its word is `(seq & 0x1FFFFFFF) << 2 | 1`, with bit 31 set while closed. It starts open(0), so a copy
-wait that armed nothing passes. The stream waits with `cuStreamWaitValue32` GEQ open, a cyclic compare on the bit-31
-encoding.
-
-**The Dekker pair.** Two sides race to open the gate:
-
-- CW: store closed(G) relaxed, `fence.sc.sys` (`__threadfence_system`), then load CopyDone with acquire. If it reads
-  G, it opens the gate itself.
-- Copy thread (`copy_completed`): store CopyDone = G with release, `seq_cst` fence, load the gate. If it reads
-  closed(G), it CASes closed(G) to open(G).
-
-Each side's store precedes its load behind a full fence, so at least one side sees the other's store. Both write the
-same word, so a double open is harmless. A stale copy thread for G that meets closed(G + k) fails its CAS.
+**The gate and the Dekker pair** are the lease channel's (["The lease channel"](#the-lease-channel)): CW is the
+device side (`close_gate`), and the copy thread's `copy_completed` is the host side (`complete`).
 
 **CC and the CPU parts.** The gate is only the wake-up; `CopyDone == G` is the commit. The CPU partial sums reach the
 fused MoE through the CPU thread's done word, the copy thread, the CopyDone release and CC's acquire.
