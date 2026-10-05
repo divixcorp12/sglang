@@ -47,10 +47,14 @@ class DraftResidentMoe:
         self.slots = len(self.ids)
         self.expert_to_slot = draft_slot_map(self.ids, n_experts=n_experts, device=device)
         index = torch.tensor(self.ids, dtype=torch.long)
-        self.tensors = {
-            name: getattr(layer, name).data.index_select(0, index.to(getattr(layer, name).device)).to(device).contiguous()
-            for name in EXL3_STREAMED_NAMES
-        }
+
+        def slab(name):
+            data = getattr(layer, name).data
+            if self.ids == list(range(data.shape[0])) and data.device == device and data.is_contiguous():
+                return data  # every expert resident where it already lives: the parameters are the slab, no copy
+            return data.index_select(0, index.to(data.device)).to(device).contiguous()
+
+        self.tensors = {name: slab(name) for name in EXL3_STREAMED_NAMES}
         self.hidden = self.tensors["w13_suh"].shape[-1]
         self.inter = self.tensors["w2_suh"].shape[-1]
         self.top_k = layer.top_k
@@ -86,3 +90,21 @@ class DraftResidentMoe:
             raise RuntimeError("DraftResidentMoe.run before prepare()")
         weights = topk_weights.reshape(-1).to(torch.float32)
         return self.fused.run(x, weights, self.remap(topk_ids), self.keep, act_limit)
+
+
+def prepare_dspark_draft_graph(model) -> int:
+    """Prepare every DSpark draft stage's MoE for capture (host work: the fused MoE's buffers and tables, and the CPU
+    runtime when any stage has CPU experts). Returns how many draft MoE layers it prepared."""
+    count, cpu = 0, False
+    for module in model.modules():
+        moe = getattr(module, "exl3_draft_moe", None)
+        if moe is None:
+            continue
+        moe.prepare()
+        count += 1
+        cpu = cpu or hasattr(module, "exl3_cpu_draft_key")
+    if cpu:
+        from sglang.srt.layers.moe.cpu_experts import draft
+
+        draft.DRAFT_CPU_EXPERTS.prepare()
+    return count

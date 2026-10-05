@@ -1,20 +1,16 @@
-"""The DSpark draft's non-resident routed experts on the CPU (eager).
+"""The DSpark draft's non-resident routed experts on the CPU, in the decode graph.
 
 With ``SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS`` each draft stage's ``FusedMoE`` loads its experts into host RAM and
-keeps only its resident set (``draft_resident.py``) and any fused shared expert on the GPU. This module computes the
-rest with the format's CPU expert kernel, through the host module's ``kernel_layer`` / ``kernel_forward``
-(``expert_stream_transport.py``), whose forward takes every row of a stage call at once. The stages register here as
-they finish loading; the runtime is built on first use.
-
-One worker thread runs the kernel; ``kernel_forward`` pins it and its workers to the draft's cores, so the caller (the
-scheduler) never is. The forward releases the GIL, so the caller runs the resident experts on the GPU meanwhile.
+keeps only its resident set (``draft_resident.py``) and any fused shared expert on the GPU (``DraftResidentMoe``). The
+rest run on the draft CPU thread (host/draft_cpu_thread.h) over the draft channel (``dspark_draft_cpu.py``): the
+stage's call posts its CPU share (device-only), runs its GPU share, then its finish waits on the channel's gate and
+adds the CPU rows, all on the stream, so a CUDA graph captures the whole call. The stages register here as they finish
+loading; ``prepare()`` builds the runtime before capture.
 """
 
 import atexit
 import logging
 import threading
-import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
@@ -44,28 +40,16 @@ class DraftLayer:
 
 
 class DraftKernel:
-    """A format's CPU expert kernel as the draft calls it: ``make`` a layer over a stage's slabs, ``forward`` m rows,
-    ``drop`` the layer. Production goes through the host module's ``kernel_*`` exports."""
+    """A format's CPU expert kernel as the draft thread takes it: the kernel's address and a stage's layer spec."""
 
     def __init__(self, trait):
         self.trait = trait
 
-    def make(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> int:
-        from sglang.kernels.ops.moe import expert_stream_transport as es
+    def address(self) -> int:
+        return self.trait.kernel_address()
 
-        return es.kernel_layer(self.trait.kernel_address(), self.trait.layer_spec(slabs, capacity))
-
-    def forward(self, layer, x16, slots, weights, out, threads: int, cores: Sequence[int]) -> None:
-        from sglang.kernels.ops.moe import expert_stream_transport as es
-
-        status, why = es.kernel_forward(layer, x16, slots, weights, out, threads=threads, cores=cores)
-        if status:
-            raise RuntimeError(f"DSpark draft CPU experts: {self.trait.name} kernel refused a forward: {why}")
-
-    def drop(self, layer) -> None:
-        from sglang.kernels.ops.moe import expert_stream_transport as es
-
-        es.kernel_drop(layer)
+    def spec(self, slabs: Mapping[str, torch.Tensor], capacity: int):
+        return self.trait.layer_spec(slabs, capacity)
 
 
 def draft_kernel_for(format_key: str, act_limit: Optional[float]) -> DraftKernel:
@@ -76,54 +60,28 @@ def draft_kernel_for(format_key: str, act_limit: Optional[float]) -> DraftKernel
     return DraftKernel(trait)
 
 
-class DraftCpuStats:
-    """Cost and routing of the draft's CPU share, logged every ``log_every`` stage calls.
+def cpu_slots(on_cpu: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """``ids`` with every route the CPU does not compute (resident, fused shared, -1, out of range) set to -1: the
+    mask draft_post_kernel applies on the device, as a host reference."""
+    valid = (ids >= 0) & (ids < len(on_cpu))
+    keep = valid & on_cpu[ids.clamp(0, len(on_cpu) - 1)]
+    return torch.where(keep, ids, torch.full_like(ids, -1))
 
-    ``passes`` counts weight reads: the kernel reads an expert once per two rows routed to it. ``skips`` counts
-    stage calls whose routes were all resident.
-    """
 
-    def __init__(self, log_every: int):
-        self.log_every = log_every
-        self.calls = 0
-        self.skips = 0
-        self.seconds: list[float] = []
-        self.unions: list[int] = []
-        self.passes: list[int] = []
+def _new_host(areas, **kw):
+    from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuHost
 
-    def record(self, slots: torch.Tensor, seconds: float) -> None:
-        used = torch.bincount(slots[slots >= 0])
-        used = used[used > 0]
-        self.unions.append(int(used.numel()))
-        self.passes.append(int(((used + 1) // 2).sum()))
-        self.seconds.append(seconds)
-        self._count()
+    return DraftCpuHost(areas, **kw)
 
-    def record_skip(self) -> None:
-        self.skips += 1
-        self._count()
 
-    def _count(self) -> None:
-        self.calls += 1
-        if self.calls % self.log_every == 0:
-            logger.info(self.summary())
-            self.seconds, self.unions, self.passes = [], [], []
+def _new_device(areas, on_cpu: torch.Tensor, device):
+    from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuDevice
 
-    def summary(self) -> str:
-        head = f"DSpark CPU experts: {self.calls} stage calls, {self.skips} without CPU work"
-        if not self.seconds:
-            return head
-        ms = sorted(s * 1e3 for s in self.seconds)
-        window = len(ms)
-        return (
-            f"{head}; last {window} CPU calls: {sum(ms) / window:.2f} ms mean, "
-            f"{ms[int(0.9 * (window - 1))]:.2f} ms p90, union {sum(self.unions) / window:.1f}, "
-            f"weight passes {sum(self.passes) / window:.1f}"
-        )
+    return DraftCpuDevice(areas, on_cpu, device)
 
 
 class DraftCpuExperts:
-    """The draft stages' kernel layers and the worker thread that runs their forwards."""
+    """The draft stages' CPU share: the draft channel's pinned areas, its device half and the draft CPU thread."""
 
     def __init__(
         self,
@@ -132,51 +90,60 @@ class DraftCpuExperts:
         *,
         cores: Sequence[int],
         threads: int,
-        log_every: int = 300,
+        device=None,
     ):
+        from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
+        from sglang.srt.layers.moe.exl3_ram_miss import watchdog_wait_s
+
         self.kernel = kernel
         self.cores = list(cores)
         self.threads = threads
+        keys = sorted(layers)
+        if keys != list(range(len(keys))):
+            raise ValueError(f"DSpark draft stage keys must be 0..n-1, not {keys}")
         # Every slab holds one row per expert of the stage, so the first slab's rows are the layer's capacity.
         self.capacity = {key: int(next(iter(layer.slabs.values())).shape[0]) for key, layer in layers.items()}
-        self._layers = {key: kernel.make(layer.slabs, self.capacity[key]) for key, layer in layers.items()}
         self.on_cpu = {key: layer.on_cpu for key, layer in layers.items()}
-        self.stats = DraftCpuStats(log_every)
-        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dspark-cpu-experts")
+        hidden = {int(layer.slabs["w13_suh"].shape[-1]) for layer in layers.values()}
+        if len(hidden) != 1:
+            raise ValueError(f"DSpark draft stages disagree on the hidden size: {sorted(hidden)}")
+        if device is None and torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.areas = DraftCpuAreas(len(keys), hidden.pop(), pin=torch.cuda.is_available())
+        self.host = _new_host(
+            self.areas,
+            cores=self.cores,
+            threads=threads,
+            spin_us=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_IDLE_SPIN_US.get(),
+            keep_warm_us=envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get(),
+            fatal_wait_s=watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get()),
+        )
+        try:
+            for key in keys:
+                self.host.set_layer(key, kernel.address(), kernel.spec(layers[key].slabs, self.capacity[key]))
+            self.host.start()
+        except BaseException:
+            self.host.stop()
+            raise
+        on_cpu = torch.stack([layers[key].on_cpu.to(torch.uint8) for key in keys])
+        self.device_half = _new_device(self.areas, on_cpu, device) if device is not None else None
 
     def cpu_slots(self, key: int, ids: torch.Tensor) -> torch.Tensor:
-        on_cpu = self.on_cpu[key]
-        valid = (ids >= 0) & (ids < len(on_cpu))
-        keep = valid & on_cpu[ids.clamp(0, len(on_cpu) - 1)]
-        return torch.where(keep, ids, torch.full_like(ids, -1))
+        return cpu_slots(self.on_cpu[key], ids)
 
-    def submit(
-        self, key: int, ids: torch.Tensor, x: torch.Tensor, weights: torch.Tensor
-    ) -> Optional[Future]:
-        """Start stage ``key``'s CPU routes over ``x`` ``[m, H]``; None when every route is resident."""
-        slots = self.cpu_slots(key, ids)
-        if not bool((slots >= 0).any()):
-            self.stats.record_skip()
-            return None
-        # kernel_forward's dtypes: x fp16, slots int32, weights fp32.
-        x16 = x.to(torch.float16).cpu().contiguous()
-        w32 = weights.to(torch.float32).cpu().contiguous()
-        return self._worker.submit(self._run, key, x16, slots, w32)
+    def post(self, key: int, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
+        """Stage ``key``'s CPU share of one call (x [M, H], M <= 16); device-only."""
+        self.device_half.post(key, x, topk_ids, topk_weights)
 
-    def _run(self, key: int, x16: torch.Tensor, slots: torch.Tensor, w32: torch.Tensor) -> torch.Tensor:
-        out = torch.empty(x16.shape, dtype=torch.float32)
-        start = time.perf_counter()
-        self.kernel.forward(
-            self._layers[key], x16, slots.to(torch.int32).contiguous(), w32, out, self.threads, self.cores
-        )
-        self.stats.record(slots, time.perf_counter() - start)
-        return out
+    def finish(self, key: int, out: torch.Tensor) -> None:
+        """Wait (on the stream) for the posted share and add it into ``out`` [M, H] fp32; device-only."""
+        self.device_half.finish(key, out)
+
+    def stats(self) -> dict:
+        return self.host.stats()
 
     def close(self) -> None:
-        self._worker.shutdown(wait=True)
-        layers, self._layers = self._layers, {}
-        for layer in layers.values():
-            self.kernel.drop(layer)
+        self.host.stop()
 
 
 class DraftCpuExpertsRegistry:
@@ -210,9 +177,16 @@ class DraftCpuExpertsRegistry:
             self._layers[key] = DraftLayer(slabs, on_cpu, act_limit)
             return key
 
+    def prepare(self) -> None:
+        """Build and start the runtime (host work: the pinned areas, the thread, the device module); idempotent. Call
+        before capturing the draft: runtime() refuses to build inside a capture."""
+        self.runtime()
+
     def runtime(self) -> DraftCpuExperts:
         with self._lock:
             if self._runtime is None:
+                if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("prepare the DSpark draft before capture (DRAFT_CPU_EXPERTS.prepare())")
                 if not self._layers:
                     raise RuntimeError("no DSpark draft stage registered for CPU experts")
                 path = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
@@ -254,7 +228,7 @@ class DraftCpuExpertsRegistry:
         with self._lock:
             runtime, self._runtime = self._runtime, None
         if runtime is not None:
-            logger.info(runtime.stats.summary())
+            logger.info("DSpark CPU experts: %s", runtime.stats())
             runtime.close()
 
 
