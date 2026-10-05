@@ -768,11 +768,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       auto cpu = SymbolicDevice{};
       expert_stream::verify_named(
           "out", TensorMatcher({-1, 5 + 2 * Wire::kLanes}).with_dtype<double>().with_device<kDLCPU>(cpu), out);
-      const std::vector<FakeKernel::Call> calls = fake_kernel().calls();
+      const std::vector<typename FakeKernel::Call> calls = fake_kernel().calls();
       auto* o = static_cast<double*>(out.data_ptr());
       const int64_t width = 5 + 2 * Wire::kLanes;
       for (int64_t r = 0; r < std::min<int64_t>(out.size(0), static_cast<int64_t>(calls.size())); ++r) {
-        const FakeKernel::Call& c = calls[r];
+        const typename FakeKernel::Call& c = calls[r];
         double* row = o + r * width;
         row[0] = c.core;
         row[1] = c.affinity;
