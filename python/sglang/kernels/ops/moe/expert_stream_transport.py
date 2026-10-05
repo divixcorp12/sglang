@@ -1186,14 +1186,18 @@ def read_record_fields(
     }
 
 
+# kernel_layer's layers' spec.keep, by layer id: the slabs each layer reads stay alive until kernel_drop.
+_kernel_layer_keep: dict[int, tuple] = {}
+
+
 def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
     """Test only: kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
 
-    The caller keeps ``spec.keep`` alive until :func:`kernel_drop`. Instrumented build only.
+    ``spec.keep`` is kept alive until :func:`kernel_drop`. Instrumented build only.
     """
     _refuse_test_only("kernel_layer", variant)
     slabs, params = _layer_tensors(spec)
-    return int(
+    layer = int(
         _host_module(layout, variant).expert_stream_kernel_layer(
             int(kernel),
             slabs,
@@ -1205,6 +1209,8 @@ def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[s
             params,
         )
     )
+    _kernel_layer_keep[layer] = spec.keep
+    return layer
 
 
 def kernel_forward(
@@ -1247,6 +1253,7 @@ def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = No
     """Test only: release :func:`kernel_layer`'s ``layer``. Instrumented build only."""
     _refuse_test_only("kernel_drop", variant)
     _host_module(layout, variant).expert_stream_kernel_drop(int(layer))
+    _kernel_layer_keep.pop(int(layer), None)
 
 
 def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:

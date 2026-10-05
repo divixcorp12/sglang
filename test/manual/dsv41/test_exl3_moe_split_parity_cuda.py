@@ -430,6 +430,7 @@ def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
 def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):
     """End to end over one layer's real rows: the CPU kernel's partial of the CPU routes, from host copies of the same
     slots, lands the output within the kernel's own error of the full GPU run, far closer than dropping those routes."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
@@ -440,7 +441,7 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
     hidden = slot_rows["w13_suh"].shape[-1]
     trait = Exl3CpuQuantTrait(exl3_ext(), act_limit=ACT_LIMIT)
     host_rows = {name: t.cpu() for name, t in slot_rows.items()}
-    handle = trait.register_layer(host_rows, fused.slots)
+    layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(host_rows, fused.slots), variant="instr")
     partial = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
     zero = torch.zeros_like(partial).pin_memory()
     keep = torch.ones(1, device=device)
@@ -453,7 +454,8 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
             want = fused.run(x, weights, remap, keep, ACT_LIMIT).clone()
             slots = remap[routes].cpu().reshape(1, -1)
             w = weights[routes].cpu().half().reshape(1, -1)
-            trait.forward(handle, x.cpu().half(), slots, w, partial, threads)
+            status, why = es.kernel_forward(layer, x.cpu().half(), slots, w, partial, threads=threads, variant="instr")
+            assert status == 0, why
             got = _cpu_run(fused, x, weights, remap, keep, mask, partial)
             dropped = _cpu_run(fused, x, weights, remap, keep, mask, zero)
             err = float((got - want).norm() / want.norm())
@@ -461,4 +463,4 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
             print(f"mask={mask:#x}: relative error {err:.2e}, dropping the CPU routes {drop:.2e}")
             assert err < 2e-2 and err < 0.1 * drop, f"mask={mask:#x}: {err:.2e} vs dropped {drop:.2e}"
     finally:
-        trait.free_layer(handle)
+        es.kernel_drop(layer, variant="instr")

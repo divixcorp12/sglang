@@ -201,8 +201,8 @@ class CpuExpertService:
         if capacity == 0:
             return
         spec = self.trait.layer_spec({name: slabs[name] for name in self.trait.slab_names}, capacity)
-        self.layers[row] = spec
         self.host.set_cpu_layer(row, spec)
+        self.layers[row] = spec
         if getattr(self, "device_side", None) is not None:
             self.device_side.set_row_cpu(row)
 
