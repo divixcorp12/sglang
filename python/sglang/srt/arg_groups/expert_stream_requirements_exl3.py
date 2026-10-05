@@ -93,6 +93,13 @@ def _check_dspark_cpu_experts(cfg) -> None:
             "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs EXL3_MOE_CPU_PIN=0: the kernel would otherwise pin "
             "its workers to the first cores"
         )
+    # Only the optimized build exports a CpuExpertKernel. SGLANG_DSV41_CPU_EXPERTS, which also selects it, is refused
+    # under speculation, so these two defines are the way in (exl3/ext.py, cpu_act_defines and optimized_cpu).
+    if not (envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get() and envs.SGLANG_EXL3_CPU_ACT_BLOCK.get() == 128):
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS runs the optimized EXL3 CPU kernel: set "
+            "SGLANG_EXL3_CPU_ACT_RESIDUAL=1 and SGLANG_EXL3_CPU_ACT_BLOCK=128"
+        )
     resident = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
     if resident:
         load_resident_set(resident)
