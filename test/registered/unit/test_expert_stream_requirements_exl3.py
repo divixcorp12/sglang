@@ -502,6 +502,18 @@ def test_dspark_cpu_experts_refuse_the_nvme_interrupt_cores(model_dir, cpu_pin_o
         )
 
 
+NO_EXPERT_CACHE = dict(SGLANG_MOE_HOT_GPU_MB=0, SGLANG_MOE_PINNED_HOST_MB=0, SGLANG_MOE_EXPERT_HOST_ARENA=False)
+
+
+def test_dspark_cpu_experts_are_checked_without_an_expert_cache(model_dir, cpu_pin_off):
+    """The draft's CPU experts need no hot or pinned cache, so a launch without one still meets their rules at launch,
+    not at the first draft call."""
+    args = _launch(model_dir, speculative_algorithm="DSPARK")
+    _gate(args, **DSPARK_CPU_ENV, **NO_EXPERT_CACHE)
+    with pytest.raises(ValueError, match="64"):
+        _gate(args, **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "62-65"}, **NO_EXPERT_CACHE)
+
+
 @pytest.mark.parametrize(
     "unset", [{"SGLANG_EXL3_CPU_ACT_RESIDUAL": False}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 0}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 64}]
 )
