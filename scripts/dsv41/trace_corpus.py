@@ -56,6 +56,8 @@ def engine_kwargs(args) -> dict:
         # the stream trace would count as a decode token.
         disable_radix_cache=True,
     )
+    if getattr(args, "log_level", None):
+        kwargs["log_level"] = args.log_level
     dspark_draft = getattr(args, "dspark", None)
     if getattr(args, "graphs", False) and not dspark_draft:
         # The capture, RAM-miss thread and hot cache startup lines are info logs.
@@ -154,6 +156,7 @@ def main() -> None:
     p.add_argument("--mem-fraction-static", type=float, default=0.85)
     p.add_argument("--chunked-prefill-size", type=int, default=512)
     p.add_argument("--graphs", action="store_true", help="breakable decode graphs at batch size 1")
+    p.add_argument("--log-level", help="the Engine's log level (graph runs default to info)")
     p.add_argument(
         "--dspark",
         metavar="DRAFT_DIR",
