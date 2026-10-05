@@ -126,7 +126,7 @@ def _scenario(
     )
 
 
-def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int, cpu_lanes=None):
+def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int, cpu_lanes=None, routes=None):
     backend = (
         SimpleNamespace(
             name="exl3_ram_miss",
@@ -147,6 +147,7 @@ def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int
             (width,), -7, dtype=torch.int32, device="cuda"
         ),
         row_backend=backend,
+        graph_gather_rows=routes or width,
     )
 
 
@@ -191,10 +192,10 @@ def test_gather_and_commit_match_the_torch_chain(
         )
         flat, remap = flat.to(id_dtype), remap.to(remap_dtype)
         ref_streamer = _streamer(
-            source_rows, miss_count, delivered, keep, leased, width
+            source_rows, miss_count, delivered, keep, leased, width, routes=routes
         )
         fused_streamer = _streamer(
-            source_rows, miss_count, delivered, keep, leased, width
+            source_rows, miss_count, delivered, keep, leased, width, routes=routes
         )
         ref = _updater(width, experts, capacity, False, state, ref_streamer)
         fused = _updater(width, experts, capacity, True, state, fused_streamer)
