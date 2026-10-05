@@ -1,7 +1,7 @@
 """Startup split calibration with the real CUDA copy backend (GPU; spec 2026-10-01-cpu-split-calibration).
 
 The DMA runs on the calibration's own stream from pinned host rows into a VRAM scratch buffer; the CPU side is the
-instr build's native fake forward, so this checks the link measurement, not the kernel.
+instr build's fake CPU expert kernel, so this checks the link measurement, not the kernel.
 """
 
 import os
@@ -11,7 +11,7 @@ import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
-from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, fake_cpu_layer, ram_miss_setup
 
 ROW, ROWS, HIDDEN, LANES = 1, 2, 8, 8
 
@@ -30,8 +30,8 @@ def test_calibration_measures_a_link_that_grows_with_the_experts(tmp_path):
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_forward_address(100_000), [0] * 9, cores, x_rows, out_rows, threads=2, spin_us=200)
-    host.set_cpu_layer(ROW, 7)
+    host.enable_cpu_experts(host.test_kernel_address(100_000), [0] * 9, cores, x_rows, out_rows, threads=2, spin_us=200)
+    host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     scratch = torch.empty(LANES * host.copy_expert_bytes(ROW), dtype=torch.uint8, device="cuda")
     grid = host.calibrate_cpu_split(ROW, device=torch.cuda.current_device(), reps=5, scratch=scratch)
     link = grid[1, 1:].tolist()

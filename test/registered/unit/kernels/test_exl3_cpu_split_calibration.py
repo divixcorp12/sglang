@@ -1,8 +1,8 @@
 """Startup CPU/DMA split calibration's host half (CPU; spec 2026-10-01-cpu-split-calibration).
 
 The host times CPU jobs through the live CPU expert engine and the DMA through its own copy backend (the test backend
-here, device -1) into a scratch buffer, and returns the mean ms of every cell. The forward is the instr build's native
-fake: the calibration waits inside one FFI call, which holds the GIL, so a ctypes forward would deadlock.
+here, device -1) into a scratch buffer, and returns the mean ms of every cell. The kernel is the instr build's fake
+CpuExpertKernel (test_kernel_address): the calibration waits inside one FFI call, so the forward must run natively.
 """
 
 import os
@@ -14,7 +14,7 @@ from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ram_miss
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, fake_cpu_layer, ram_miss_setup
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -36,9 +36,9 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_forward_address(forward_ns), [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2, spin_us=200)
+    host.enable_cpu_experts(host.test_kernel_address(forward_ns), [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2, spin_us=200)
     if register:
-        host.set_cpu_layer(ROW, 7)
+        host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     row_bytes = [t[0].numel() * t.element_size() for t in s.slabs[ROW].values()]
     return s, host, row_bytes, (dst, x_rows, out_rows)
 
@@ -102,7 +102,7 @@ def test_a_timed_out_calibration_reports_and_a_later_one_completes(tmp_path):
     with pytest.raises(RuntimeError, match="did not finish"):
         host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), timeout_s=0.05)
     # The engine runs jobs in order; the stale job finishes and a fresh calibration with room for it completes.
-    host.test_forward_address(1_000)
+    host.test_kernel_address(1_000)
     grid = host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), timeout_s=2.0)
     assert grid[0, 1] > 0
 

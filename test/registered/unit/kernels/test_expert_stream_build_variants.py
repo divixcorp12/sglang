@@ -136,6 +136,11 @@ RAW_EXPORTS = {
     "trace_clock_reads": lambda m, h: m.expert_stream_trace_clock_reads(),
     "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "pause_ns": lambda m, h: m.expert_stream_pause_ns(),
+    "test_kernel_address": lambda m, h: m.expert_stream_test_kernel_address(0, 0, 0),
+    "test_kernel_calls": lambda m, h: m.expert_stream_test_kernel_calls(torch.zeros((0, 5 + 2 * 8), dtype=torch.float64)),
+    "test_kernel_hold": lambda m, h: m.expert_stream_test_kernel_hold(0, 0),
+    "test_keep_warm_calls": lambda m, h: m.expert_stream_test_keep_warm_calls(),
+    "test_keep_warm_core": lambda m, h: m.expert_stream_test_keep_warm_core(),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
         torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),

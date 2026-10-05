@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.cpu_experts.pool import (
     CPU_EXPERTS_LAYER_ABI_VERSION,
     CpuExpertPool,
 )
+from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -375,7 +376,8 @@ def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
 
 
 class FakeServiceTrait(FakeTrait):
-    """FakeTrait with the RAM-miss service's half: the lazily set activation limit and the native entry points."""
+    """FakeTrait with the RAM-miss service's half: the lazily set activation limit, the kernel's address and the layer
+    spec."""
 
     act_limit = None
 
@@ -386,22 +388,12 @@ class FakeServiceTrait(FakeTrait):
     def hidden_size(self, slabs):
         return int(slabs["alpha"].shape[-1])
 
-    def register_layer(self, slabs, capacity):
+    def kernel_address(self):
+        return 0x1234
+
+    def layer_spec(self, slabs, capacity):
         self.events.append(("register", self.act_limit))
-        return 100 + super().register_layer(slabs, capacity)
-
-    def native_forward(self):
-        return 0xF00D
-
-    def native_create_engine(self, cores):
-        self.events.append(("engine", list(cores)))
-        return 0xE1
-
-    def native_free_engine(self, engine):
-        self.events.append(("free", engine))
-
-    def native_keep_warm(self):
-        return 0xBEEF
+        return CpuExpertLayerSpec(capacity, 8, 8, self.act_limit, (), b"")
 
 
 class FakeHost:
@@ -409,6 +401,7 @@ class FakeHost:
         self.wire = lease.wire_layout(lanes, nodes)
         self.nodes = nodes
         self.enabled, self.layers, self.splits = None, {}, []
+        self.layer_calls = []  # every set_cpu_layer call, as (row, spec)
         self.enables, self.group_splits, self.stats_groups = [], [], []
         self.node_ranges = None  # set by a test that wants a multi-group host
         self.stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
@@ -428,16 +421,15 @@ class FakeHost:
         return torch.tensor(self.grid, dtype=torch.float64)
 
     def enable_cpu_experts(
-        self, forward, split, cores, x_rows, out_rows, *, threads, group=0, engine=0, keep_warm=0, keep_warm_us=0
+        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, spin_us=50_000, keep_warm_us=0
     ):
-        self.enabled = (
-            forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, engine, group
-        )
-        self.enables.append((group, forward, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, engine))
-        self.keep_warm = (keep_warm, keep_warm_us)
+        self.enabled = (kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, group)
+        self.enables.append((group, kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads))
+        self.keep_warm_us = keep_warm_us
 
-    def set_cpu_layer(self, row, handle):
-        self.layers[row] = handle
+    def set_cpu_layer(self, row, spec):
+        self.layers[row] = spec
+        self.layer_calls.append((row, spec))
 
     def set_cpu_split(self, split, group=0):
         self.splits.append(list(split))
@@ -459,18 +451,19 @@ def _service(host, trait, **kw):
 
 
 def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit():
-    """The kernel's engine is created on the cores before the CPU expert thread starts; the activation limit is only
-    known at the layer's first forward and must be on the trait before register_layer."""
+    """The kernel's address and the cores reach the host before the CPU expert thread starts; the activation limit is
+    only known at the layer's first forward and must be on the trait before layer_spec."""
     host, trait = FakeHost(), FakeServiceTrait()
     svc = _service(host, trait)
     # out_rows is two parts per row: the CPU hits' partial sum and the CPU misses'.
-    assert host.enabled == (0xF00D, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0xE1, 0)
+    assert host.enabled == (0x1234, [0] * (lease.wire_layout(8).lanes + 1), [4, 5, 6], (2, 16), (2, 2, 8), 2, 0)
     assert host.layers == {}, "a row reached the grant before its registration"
     svc.register(1, 10.0)
     svc.register(1, 10.0)
     svc.register(0, 10.0)
-    assert trait.events == [("engine", [4, 5, 6]), ("register", 10.0), ("register", 10.0)]
-    assert host.layers == {1: 100, 0: 101}
+    assert trait.events == [("register", 10.0), ("register", 10.0)]
+    assert sorted(host.layers) == [0, 1] and [row for row, _ in host.layer_calls] == [1, 0]
+    assert all(spec.act_limit == 10.0 for spec in host.layers.values())
     with pytest.raises(ValueError, match="activation limits"):
         _service(FakeHost(), trait).register(0, 7.0)
 
@@ -480,11 +473,11 @@ def test_service_keeps_the_cpu_warm_for_2_ms_by_default_and_not_at_0():
 
     host = FakeHost()
     _service(host, FakeServiceTrait())
-    assert host.keep_warm == (0xBEEF, 2000)
+    assert host.enabled[0] == 0x1234 and host.keep_warm_us == 2000
     with envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.override(0):
         host = FakeHost()
         _service(host, FakeServiceTrait())
-    assert host.keep_warm == (0, 0)
+    assert host.keep_warm_us == 0
 
 
 def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():
@@ -691,7 +684,7 @@ def test_log_stats_leaves_out_calibrations_jobs(caplog, fails):
     assert "3 jobs, 8 lanes, 0.500 ms per lane" in caplog.text
 
 
-def test_cpu_expert_groups_run_one_engine_per_node_and_register_each_layer_once():
+def test_cpu_expert_groups_run_one_kernel_per_node_and_register_each_layer_once():
     from sglang.srt.layers.moe.cpu_experts.service import CpuExpertGroups
     from sglang.srt.layers.moe.cpu_experts.threading_config import NodePlan
 
@@ -702,13 +695,13 @@ def test_cpu_expert_groups_run_one_engine_per_node_and_register_each_layer_once(
     ]
     split = [0] * (host.wire.lanes + 1)
     groups = CpuExpertGroups(host, trait, {r: _fake_slabs() for r in range(2)}, hidden=8, plans=plans, split=split, pin=False)
-    assert [(e[0], e[3], e[6]) for e in host.enables] == [(0, [8, 9], 2), (1, [18, 19, 20], 3)]
+    assert [(e[0], e[1], e[3], e[6]) for e in host.enables] == [(0, 0x1234, [8, 9], 2), (1, 0x1234, [18, 19, 20], 3)]
     assert tuple(groups.out_rows.shape) == (2, 4, 8), "two output parts per group"
     assert groups.services[1].out_rows is groups.services[0].out_rows
     groups.register(1, 10.0)
     groups.register(1, 10.0)
     assert [e for e in trait.events if e[0] == "register"] == [("register", 10.0)], "one kernel layer serves both groups"
-    assert host.layers == {1: 100} and groups.registered(1)
+    assert [row for row, _ in host.layer_calls] == [1] and groups.registered(1), "one set_cpu_layer per row across groups"
 
 
 def _two_group_service(host, capacity=20):

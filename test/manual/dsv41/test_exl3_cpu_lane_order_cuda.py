@@ -8,7 +8,6 @@ and A's victim keeps its expert.
 Run on divix01 under cc-gpu.lock, with PYTHONPATH pointing at the tree under test.
 """
 
-import ctypes
 import os
 import sys
 import tempfile
@@ -24,34 +23,11 @@ from lease_chain_rig import EXPERTS, LAYERS, TOP_K, Chain  # noqa: E402
 
 from sglang.kernels.ops.moe import expert_lease_block as lease  # noqa: E402
 from sglang.kernels.ops.moe import expert_stream_transport as ops  # noqa: E402
-from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertForward  # noqa: E402
 from sglang.srt.layers.moe.ram_slot_map import LaneKind  # noqa: E402
-from sglang.test.dsv41_ram_miss_fixtures import paused  # noqa: E402
+from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer, paused  # noqa: E402
 
 HIDDEN = 64
-HANDLE = 7
 READY_STATE, FREE_STATE = 3, 0  # expert_residency_gpu's _READY and _FREE
-
-
-class _Forward:
-    """Records (layer, slots, weights) and writes a zero partial."""
-
-    def __init__(self):
-        self.calls = []
-        self.c = CpuExpertForward(self._run)
-
-    def _run(self, call):
-        c = call.contents
-        k, out = c.k, c.out
-        self.calls.append((c.layer, [c.slots[i] for i in range(k)], [c.weights[i] for i in range(k)]))
-        if not c.accumulate:
-            for j in range(HIDDEN):
-                out[j] = 0.0
-        return 0
-
-    @property
-    def address(self) -> int:
-        return ctypes.cast(self.c, ctypes.c_void_p).value
 
 
 def _until(predicate, timeout_s=10.0):
@@ -81,7 +57,6 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
 
     row, low, high = 0, 3, 7
-    forward = _Forward()
     split = [0] * (lease.wire_layout(8).lanes + 1)
     split[2] = 1
     c = Chain(tmp_path, copy_engine=True, start=False, cpu_misses=miss)
@@ -89,7 +64,7 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
         cores = sorted(os.sched_getaffinity(0))[:2]
-        c.host.enable_cpu_experts(forward.address, split, cores, x_rows, out_rows, threads=2)
+        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), split, cores, x_rows, out_rows, threads=2)
         c.host.start_thread(fatal_wait_s=60.0)
         c.dev.enable_cpu_experts(x_rows, out_rows)
         c.dev.set_row_cpu(row)
@@ -103,7 +78,7 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         assert ({high} if miss else {low, high}) <= c.resident(row) and (low in c.resident(row)) != miss
         with paused(c.host):
             ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
-        c.host.set_cpu_layer(row, HANDLE)
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
         c.host.arm_copy_engine()
 
         # VRAM: slots 0..5 hold experts 10..15, neither A nor B resident; the shortlist names slot 3 coldest, then 5.
@@ -150,12 +125,12 @@ def test_the_low_scored_lane_goes_to_the_cpu_and_the_high_scored_one_takes_the_c
         dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
         dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
         snapshot = c.snapshot(row)
-        # The fake forward takes the GIL: let it run before anything blocks in the host.
-        assert _until(lambda: len(forward.calls) == 1)
+        assert _until(lambda: len(c.host.test_kernel_calls()) == 1)
         torch.cuda.synchronize()
 
         low_slot = int(dev.lane_slot[1]) if miss else ram_slot[low]
-        assert forward.calls == [(HANDLE, [low_slot], [0.25])], "the tail lane (the low key) is the CPU's"
+        calls = [(call["slots"], call["weights"]) for call in c.host.test_kernel_calls()]
+        assert calls == [([low_slot], [0.25])], "the tail lane (the low key) is the CPU's"
         assert c.kinds(2) == [LaneKind.HIT_COPY, LaneKind.MISS_CPU if miss else LaneKind.HIT_CPU]
         assert dev.cpu_lanes.tolist() == [0b10, PART_MISSES if miss else PART_HITS]
         if miss:
@@ -201,7 +176,6 @@ def test_the_cpu_tail_past_8_lanes_goes_through_the_real_chain_and_the_split_pla
     copied, base = count - cpu, lanes
     routed = list(range(count))
     split = [0] * count + [cpu] + [0] * (lanes - count)
-    forward = _Forward()
     with tempfile.TemporaryDirectory() as tmp:
         c = Chain(Path(tmp), copy_engine=True, start=False, lanes=lanes, experts=experts, top_k=lanes, dst_rows=lanes,
                   capacity=2 * lanes, staging=lanes)
@@ -209,7 +183,7 @@ def test_the_cpu_tail_past_8_lanes_goes_through_the_real_chain_and_the_split_pla
             x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
             out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
             cores = sorted(os.sched_getaffinity(0))[:2]
-            c.host.enable_cpu_experts(forward.address, split, cores, x_rows, out_rows, threads=2)
+            c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), split, cores, x_rows, out_rows, threads=2)
             c.host.start_thread(fatal_wait_s=60.0)
             c.dev.enable_cpu_experts(x_rows, out_rows)
             c.dev.set_row_cpu(row)
@@ -221,7 +195,7 @@ def test_the_cpu_tail_past_8_lanes_goes_through_the_real_chain_and_the_split_pla
             assert c.handled() and set(routed) <= c.resident(row)
             with paused(c.host):
                 ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
-            c.host.set_cpu_layer(row, HANDLE)
+            c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
             c.host.arm_copy_engine()
 
             # VRAM: every slot holds an expert from base..2*base-1, none of the routed ones; victims are taken from slot 15 down.
@@ -270,12 +244,12 @@ def test_the_cpu_tail_past_8_lanes_goes_through_the_real_chain_and_the_split_pla
             dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
             dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
             snapshot = c.snapshot(row)
-            assert _until(lambda: len(forward.calls) == 1)
+            assert _until(lambda: len(c.host.test_kernel_calls()) == 1)
             torch.cuda.synchronize()
 
             cpu_experts = by_key[copied:]
-            (call,) = forward.calls
-            assert call[0] == HANDLE and sorted(call[1]) == sorted(ram_slot[e] for e in cpu_experts), (
+            (call,) = c.host.test_kernel_calls()
+            assert sorted(call["slots"]) == sorted(ram_slot[e] for e in cpu_experts), (
                 "the four lowest-keyed lanes are the CPU's"
             )
             assert c.kinds(count) == [LaneKind.HIT_COPY] * copied + [LaneKind.HIT_CPU] * cpu

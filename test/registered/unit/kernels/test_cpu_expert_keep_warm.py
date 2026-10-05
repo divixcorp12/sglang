@@ -3,8 +3,8 @@
 For ``keep_warm_us`` after its last job, an idle CPU expert thread hands its workers to the format's keep-warm
 function instead of spinning on ``pause``, so the next job finds the cores at the AVX-512 license rather than paying
 the ramp back (about 50 us per call on SKX after a 1 ms gap). The forward and the keep-warm are the instr build's
-native fakes; the fake keep-warm counts its calls (from 0 at each test_keep_warm_address) and spins until its word
-moves or its deadline passes. Jobs come from the startup calibration, which submits them through the live engine.
+fake kernel; its keep-warm counts its calls (from 0 at each test_kernel_address) and spins until its word moves or
+its deadline passes. Jobs come from the startup calibration, which submits them through the live engine.
 """
 
 import os
@@ -16,7 +16,7 @@ from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import attached_host, fake_cpu_layer, ram_miss_setup
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -24,7 +24,7 @@ ROW, ROWS, DST_ROWS, HIDDEN, LANES = 1, 2, 6, 8, 8
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
-def _host(tmp_path, request, keep_warm_us, engine=0):
+def _host(tmp_path, request, keep_warm_us):
     s = ram_miss_setup(tmp_path, capacity=12, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
     host.enable_copy_engine(-1, spin_us=200)
@@ -38,18 +38,16 @@ def _host(tmp_path, request, keep_warm_us, engine=0):
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
     host.enable_cpu_experts(
-        host.test_forward_address(FORWARD_NS),
+        host.test_kernel_address(FORWARD_NS),
         [0] * (lease.wire_layout(8).lanes + 1),
         cores,
         x_rows,
         out_rows,
         threads=2,
-        engine=engine,
         spin_us=200,
-        keep_warm=host.test_keep_warm_address(),
         keep_warm_us=keep_warm_us,
     )
-    host.set_cpu_layer(ROW, 7)
+    host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     request.addfinalizer(host.stop)  # the fake's call count is per process: no engine may outlive its test
     return s, host, (dst, x_rows, out_rows)
 
@@ -106,11 +104,11 @@ def test_stop_ends_a_running_keep_warm(tmp_path, request):
     assert time.monotonic() - start < 5
 
 
-def test_the_idle_thread_passes_its_engine_to_the_keep_warm(tmp_path, request):
-    """The keep-warm pins its workers to the cores of the engine it is given, which must be the engine
-    enable_cpu_experts took. Mutant: call the keep-warm with engine 0 -- red."""
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000, engine=41)
+def test_the_idle_thread_keeps_its_own_cores_warm(tmp_path, request):
+    """The keep-warm pins its workers to the group's cores, which must be the ones enable_cpu_experts took. Mutant:
+    pass empty cores to keep_warm in CpuExpertEngine::run -- red (core -1)."""
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000)
     _run_jobs(host)
     time.sleep(0.02)
     assert host.test_keep_warm_calls() >= 1
-    assert host.test_keep_warm_engine() == 41
+    assert host.test_keep_warm_core() == sorted(os.sched_getaffinity(0))[0]
