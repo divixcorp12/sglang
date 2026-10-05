@@ -46,6 +46,8 @@ _STAGE_DIRECT = 2
 # Above every residency_rank_keys key of a nonnegative score: sign-bit-0 float32 bits
 # shifted left by 16 stay below 2**47. Adding it ranks a routed expert after all others.
 _ROUTED_RANK_OFFSET = 1 << 48
+# Routes one fused DIRECT gather translates (kDirectGatherMaxRoutes, direct_gather.cuh).
+_GATHER_MAX_ROUTES = 64
 
 
 class GpuResidencyUpdater:
@@ -404,8 +406,11 @@ class GpuResidencyUpdater:
         shape, device = (self.num_layers, self.miss_rows), self.device
         self.fused_destinations = torch.zeros(shape, dtype=torch.long, device=device)
         self.fused_live = torch.zeros(shape, dtype=torch.bool, device=device)
+        # The remap has one entry per route, and a verify's routes outnumber its miss lanes.
         self.fused_remaps = {
-            dtype: torch.zeros(shape, dtype=dtype, device=device)
+            dtype: torch.zeros(
+                (self.num_layers, _GATHER_MAX_ROUTES), dtype=dtype, device=device
+            )
             for dtype in (torch.int32, torch.int64)
         }
 

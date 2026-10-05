@@ -21,6 +21,8 @@
 namespace sglang::expert_residency {
 
 constexpr int kDirectGatherWarp = 32;
+// Routes a gather may carry: a verify's tokens x top_k, the dedup planner's bound (expert_route_plan.cuh).
+constexpr int kDirectGatherMaxRoutes = 64;
 
 // GpuResidencyUpdater.gather_destinations, for one layer. One warp; lane j owns shortlist entry j (width <= 32).
 //
@@ -28,6 +30,7 @@ constexpr int kDirectGatherWarp = 32;
 // the front in shortlist order, the others follow in shortlist order (the stable argsort of the torch chain). Lane k
 // of the reordered list is live when it is usable and k < miss_count; a live lane's destination is its slot, any other
 // lane's is 0. A remap entry at or past scratch_base is a miss lane's rank and becomes that lane's destination.
+// Routes may outnumber the warp (a verify carries up to 64); every lane translates routes lane, lane + 32, ...
 template <typename IdT, typename RemapInT, typename RemapOutT>
 __global__ __launch_bounds__(kDirectGatherWarp, 1) void direct_gather_destinations_kernel(
     const IdT* __restrict__ topk_ids,
@@ -75,11 +78,11 @@ __global__ __launch_bounds__(kDirectGatherWarp, 1) void direct_gather_destinatio
     live_out[lane] = live;
   }
   __syncwarp();
-  if (static_cast<int>(lane) < top_k) {
-    const int64_t remap = static_cast<int64_t>(remap_in[lane]);
+  for (int i = static_cast<int>(lane); i < top_k; i += kDirectGatherWarp) {
+    const int64_t remap = static_cast<int64_t>(remap_in[i]);
     int64_t rank = remap - scratch_base;
     rank = rank < 0 ? 0 : (rank > width - 1 ? width - 1 : rank);
-    remap_out[lane] = static_cast<RemapOutT>(remap >= scratch_base ? destinations[rank] : remap);
+    remap_out[i] = static_cast<RemapOutT>(remap >= scratch_base ? destinations[rank] : remap);
   }
 }
 
@@ -207,9 +210,8 @@ void direct_gather_destinations_gpu(
   verify_bool_named("live_out", TensorMatcher({W_}).with_device<kDLCUDA>(device), live_out);
   expert_stream::verify_named(
       "remap_out", TensorMatcher({K_}).with_dtype<RemapOutT>().template with_device<kDLCUDA>(device), remap_out);
-  RuntimeCheck(
-      0 < W_.unwrap() && W_.unwrap() <= kDirectGatherWarp && 0 < K_.unwrap() && K_.unwrap() <= kDirectGatherWarp,
-      "the shortlist and the routes must hold 1-32 entries");
+  RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= kDirectGatherWarp, "the shortlist must hold 1-32 entries");
+  RuntimeCheck(0 < K_.unwrap() && K_.unwrap() <= kDirectGatherMaxRoutes, "the routes must hold 1-64 entries");
   const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
   host::LaunchKernel(1, kDirectGatherWarp, stream)(
       direct_gather_destinations_kernel<IdT, RemapInT, RemapOutT>,
