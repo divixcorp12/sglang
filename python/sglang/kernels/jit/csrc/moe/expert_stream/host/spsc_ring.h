@@ -5,6 +5,7 @@
 //   SpscRing     single-producer single-consumer ring between two threads
 //   FixedDeque   circular FIFO owned by one thread (the copy thread's in-flight jobs)
 //   futex_wait / futex_wake   sleep and wake on a 32-bit word
+//   Doorbell     a futex wake that costs a syscall only when the consumer sleeps
 #pragma once
 
 #include <linux/futex.h>
@@ -127,5 +128,40 @@ inline void futex_wait(std::atomic<uint32_t>* word, uint32_t expected, int64_t t
 inline void futex_wake(std::atomic<uint32_t>* word) {
   syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
 }
+
+/// Wakes one consumer thread that sleeps when its queue runs dry; ring() makes a syscall only while it sleeps.
+///
+/// No wake is lost. ring() bumps the word, fences, then reads sleeping_; sleep_unless() sets sleeping_, fences, then
+/// re-checks its queue. The two seq_cst fences are totally ordered: if ring()'s comes first, the re-check sees the
+/// producer's work and the consumer does not wait; if the consumer's comes first, ring() sees sleeping_ and wakes it,
+/// either before futex_wait (the word moved, so the kernel returns at once) or during it. The 1 ms cap is a backstop.
+class Doorbell {
+ public:
+  /// Producer, after publishing the work the consumer's predicate checks.
+  void ring() {
+    word_.fetch_add(1, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (sleeping_.load(std::memory_order_relaxed)) futex_wake(&word_);
+  }
+
+  /// Consumer: sleeps until the next ring(), unless `ready()` already holds after the fence.
+  template <class Ready>
+  void sleep_unless(Ready ready) {
+    const uint32_t seen = word_.load(std::memory_order_acquire);
+    sleeping_.store(true, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!ready()) futex_wait(&word_, seen, 1'000'000);
+    sleeping_.store(false, std::memory_order_relaxed);
+  }
+
+  /// Moves on every ring(): a consumer busy elsewhere can watch it for new work.
+  const std::atomic<uint32_t>& word() const {
+    return word_;
+  }
+
+ private:
+  std::atomic<uint32_t> word_{0};
+  std::atomic<bool> sleeping_{false};
+};
 
 }  // namespace sglang::expert_stream
