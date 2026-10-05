@@ -37,6 +37,22 @@ def test_route_tables_sort_routes_by_slot_and_scale_by_keep():
     assert count.tolist() == [0] * 6  # a dropped layer runs no expert at all
 
 
+def test_route_tables_rank_cross_token_duplicates_by_route_and_name_their_tokens():
+    # Two tokens of top-3; slot 4 is routed by both.
+    remap = torch.tensor([4, 1, 3, 2, 4, 0])
+    count = torch.zeros(6, dtype=torch.long)
+    token_sorted = torch.full((6,), -1, dtype=torch.long)
+    weights = torch.tensor([0.5, 0.25, 0.125, 1.0, 2.0, 4.0])
+    inv, ws, det = route_tables(
+        remap, count, torch.ones(6, dtype=torch.long), weights, torch.tensor([1.0]), token_sorted=token_sorted, top_k=3
+    )
+    assert count.tolist() == [1, 1, 1, 1, 2, 0]
+    assert inv.tolist() == [4, 1, 3, 2, 5, 0]  # slot order, route order within slot 4
+    assert token_sorted.tolist() == [1, 0, 1, 0, 0, 1]
+    assert ws.tolist() == [4.0, 0.25, 1.0, 0.125, 0.5, 2.0]
+    assert det[0].tolist() == [0, 1, 2, 3, 4, 6] and det[2].tolist() == [1, 1, 1, 1, 1, 0]
+
+
 class _GatherReached(Exception):
     """The stub streamer's gather ran: _apply_graph got past its setup checks."""
 
