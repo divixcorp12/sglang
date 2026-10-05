@@ -24,6 +24,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.cpu_experts.draft_resident import load_resident_set
 from sglang.srt.layers.moe.cpu_experts.service import cpu_trait_for
 from sglang.srt.layers.moe.cpu_experts.threading_config import (
+    ThreadingConfig,
     check_engine_cores,
     check_not_reserved,
     parse_cpu_list,
@@ -221,10 +222,21 @@ class DraftCpuExpertsRegistry:
                         f"DSpark draft resident set {path} lists stages {extra} that this draft does not have "
                         f"(it has {sorted(self._stages)}); recalibrate it from this draft's routes"
                     )
-                cores = parse_cpu_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())
-                for core in cores:
-                    check_not_reserved(core)
-                threads = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get() or len(cores)
+                named = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get()
+                if named:
+                    cores = parse_cpu_list(named)
+                    for core in cores:
+                        check_not_reserved(core)
+                    threads = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get() or len(cores)
+                else:
+                    # The plan the RAM-miss service resolves too, so the draft and its threads never share a core.
+                    cores = list(
+                        ThreadingConfig.from_env(
+                            cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
+                            device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+                        ).draft_cpus
+                    )
+                    threads = len(cores)
                 check_engine_cores(cores, threads)
                 kernel = draft_kernel_for("exl3", next(iter(self._layers.values())).act_limit)
                 self._runtime = DraftCpuExperts(kernel, self._layers, cores=cores, threads=threads)

@@ -1,8 +1,9 @@
 """Where the expert stream's threads run: one plan per NUMA node of the pinned tier.
 
 ThreadingConfig is the only reader of the core settings (SGLANG_DSV41_CPU_EXPERTS_CORES and _THREADS,
-SGLANG_DSV41_RAM_MISS_SPIN_CORE, SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU, SGLANG_EXPERT_NUMA_CORES), of the process
-affinity and of the reserved cores; C++ receives resolved core lists only. The rules are the design's
+SGLANG_DSV41_RAM_MISS_SPIN_CORE, SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU, SGLANG_EXPERT_NUMA_CORES, and the DSpark
+draft's SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and _THREADS), of the process affinity and of the reserved cores; C++
+receives resolved core lists only. A core a setting names is used as given; every other core is derived. The rules are the design's
 (docs/superpowers/specs/2026-10-03-numa-node-distributor-design.md, Part 2). ``resolve`` reads nothing, so it runs
 on any topology; ``from_env`` gathers the machine's.
 """
@@ -160,6 +161,9 @@ class CoreSettings:
     sq_thread_cpu: Optional[int] = None  # SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU
     numa_cores: str = ""  # SGLANG_EXPERT_NUMA_CORES
     omp_thread_limit: Optional[int] = None  # OMP_THREAD_LIMIT
+    draft: bool = False  # SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS
+    draft_cores: str = ""  # SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES; empty derives them on the GPU's node
+    draft_threads: int = 0  # SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS, 0: no cap on the derived cores
 
 
 @dataclass(frozen=True)
@@ -189,6 +193,7 @@ class ThreadingConfig:
     plans: tuple[NodePlan, ...]  # one per node of the tier, in placement order
     copy_cpus: tuple[int, ...]  # the copy thread's core, which it spins on; () inherits the server's affinity
     gpu_node: int
+    draft_cpus: tuple[int, ...] = ()  # the DSpark draft's CPU expert cores; () without them
 
     @property
     def nodes(self) -> int:
@@ -198,6 +203,10 @@ class ThreadingConfig:
         lines = [plan.log_line() for plan in self.plans]
         if self.copy_cpus:
             lines.append(f"numa copy thread: node{self.gpu_node} cpus={_format_cpus(self.copy_cpus)}")
+        if self.draft_cpus:
+            lines.append(
+                f"numa dspark draft: node{self.gpu_node} cpus={_format_cpus(self.draft_cpus)} ({len(self.draft_cpus)})"
+            )
         return lines
 
     @classmethod
@@ -216,6 +225,9 @@ class ThreadingConfig:
             sq_thread_cpu=envs.SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU.get(),
             numa_cores=envs.SGLANG_EXPERT_NUMA_CORES.get(),
             omp_thread_limit=int(limit) if limit else None,
+            draft=envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get(),
+            draft_cores=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get(),
+            draft_threads=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get(),
         )
         placement = parse_placement(envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.get())
         gpu_node = gpu_numa_node(device)
@@ -279,19 +291,28 @@ class ThreadingConfig:
                 )
             check_not_reserved(settings.sq_thread_cpu)
             overrides.setdefault(nodes[0], {})["sq"] = [settings.sq_thread_cpu]
+        named_draft = parse_cpu_list(settings.draft_cores) if settings.draft and settings.draft_cores else []
+        for node, plan_keys in overrides.items():
+            for key, cores in plan_keys.items():
+                for core in cores:
+                    if topology.siblings[core] & set(named_draft):
+                        raise ValueError(
+                            f"core {core} is named both for the DSpark draft's CPU experts "
+                            f"(SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES={settings.draft_cores}) and as node {node}'s {key} core"
+                        )
         if not settings.sqpoll:
             for node, plan_keys in overrides.items():
                 if "sq" in plan_keys:
                     raise ValueError(f"node {node} sets an SQPOLL core, but SGLANG_EXPERT_STREAM_URING_MODE is not sqpoll")
-        derive = len(nodes) > 1 or settings.cpu_experts or bool(settings.numa_cores)
+        derive = len(nodes) > 1 or settings.cpu_experts or bool(settings.numa_cores) or settings.draft
         if not derive:
             ram = settings.spin_core
             sq = overrides.get(nodes[0], {}).get("sq", [None])[0]
             plan = NodePlan(group=0, node=nodes[0], ram=ram, cpu=(), sq=sq, busy_poll=ram is not None)
             return ThreadingConfig((plan,), (), gpu)
-        copy = _copy_core(gpu, overrides, topology, affinity)
+        copy = _copy_core(gpu, overrides, topology, affinity, named_draft)
         plans = []
-        taken: set[int] = set(topology.siblings[copy])
+        taken: set[int] = set(topology.siblings[copy]) | {s for c in named_draft for s in topology.siblings[c]}
         for group, node in enumerate(nodes):
             plan = _derive(group, node, overrides.get(node, {}), topology, affinity, settings, taken)
             _check_plan(plan, topology, affinity, settings)
@@ -303,14 +324,40 @@ class ThreadingConfig:
                 f"OMP_THREAD_LIMIT={settings.omp_thread_limit} is below the {workers} CPU expert workers of all nodes; "
                 "two engines' teams run at once"
             )
-        return ThreadingConfig(tuple(plans), (copy,), gpu)
+        draft: tuple[int, ...] = ()
+        if settings.draft:
+            draft = tuple(named_draft) or _derive_draft(gpu, topology, affinity, settings, taken)
+        return ThreadingConfig(tuple(plans), (copy,), gpu, draft)
 
 
-def _copy_core(gpu, overrides, topology, affinity) -> int:
+def _derive_draft(gpu, topology, affinity, settings, taken) -> tuple[int, ...]:
+    """The DSpark draft's CPU expert cores: the GPU node's physical cores left after the copy thread and every node's
+    plan, lowest first, capped at SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS. Derived last, so the busy-polling threads
+    get their dedicated cores first."""
+    free = sorted(
+        c
+        for c in topology.physical(gpu)
+        if c not in affinity and c not in RESERVED_CORES and not (topology.siblings[c] & taken)
+    )
+    if len(free) < 2:
+        raise ValueError(
+            f"node {gpu}: {free} is left for the DSpark draft's CPU experts, which need at least 2 cores; "
+            "free more of the node from the server's affinity or name them in SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES"
+        )
+    if settings.draft_threads:
+        try:
+            check_engine_cores(free, settings.draft_threads)
+        except ValueError as refusal:
+            raise ValueError(f"SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS on node {gpu}: {refusal}") from None
+        free = free[: settings.draft_threads]
+    return tuple(free)
+
+
+def _copy_core(gpu, overrides, topology, affinity, draft=()) -> int:
     """The copy thread's core on the GPU's node, outside the server's affinity, since the thread never sleeps. Chosen
     before the nodes' plans, so CPU experts that take every free core leave it alone. It spins with PAUSE, so it
     prefers a core whose SMT sibling is the server's and leaves the fully free cores to the busy-polling RAM threads."""
-    named = {c for plan in overrides.values() for cores in plan.values() for c in cores}
+    named = {c for plan in overrides.values() for cores in plan.values() for c in cores} | set(draft)
     free = [
         c
         for c in reversed(topology.physical(gpu))

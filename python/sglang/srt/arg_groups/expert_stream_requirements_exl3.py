@@ -74,16 +74,17 @@ def _check_dspark_cpu_experts(cfg) -> None:
             "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS computes the DSpark draft's routed experts on the CPU; "
             "pass --speculative-algorithm DSPARK or unset it"
         )
+    # Unset cores are derived by ThreadingConfig when the draft starts; named ones are checked here.
     cores = parse_cpu_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())
     for core in cores:
         check_not_reserved(core)
-    if len(cores) < 2:
+    if len(cores) == 1:
         raise ValueError(
             "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES with at "
-            "least two cores (one spinning worker per core)"
+            "least two cores (one spinning worker per core), or unset to derive them"
         )
     threads = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get()
-    if not 0 <= threads <= len(cores):
+    if cores and not 0 <= threads <= len(cores):
         raise ValueError(
             f"SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS={threads} on {len(cores)} cores: use 0 (one per core) "
             f"up to {len(cores)}"

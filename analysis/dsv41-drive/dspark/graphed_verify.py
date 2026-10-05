@@ -45,16 +45,27 @@ D23_ARMS = {
 }
 
 
-def run(arm: str, outdir: str, n: int, new_tokens: int) -> int:
-    overrides, graphs = D23_ARMS[arm]
+# Cores the recipe and ab_cpu_draft name for their own affinities. Unset, ThreadingConfig derives the RAM threads' and
+# the draft's cores from this run's affinity (the recipe's server cores, 0-5,36-41), keeping them apart.
+HAND_PINNED = ("SGLANG_DSV41_RAM_MISS_SPIN_CORE", "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES")
+
+
+def arm_environment(arm: str, outdir: str) -> dict:
+    overrides, _ = D23_ARMS[arm]
     overrides = {
         **overrides,
         "SGLANG_DSPARK_DEBUG_DUMP": "target_verify_gpu_time",
         "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(outdir, f"{arm}.metrics.jsonl"),
     }
-    env = os.environ | arm_env.arm_env(overrides)
+    env = {k: v for k, v in (os.environ | arm_env.arm_env(overrides)).items() if k not in HAND_PINNED}
     env["PYTHONPATH"] = os.path.join(REPO, "python")
     env.setdefault("OMP_NUM_THREADS", "16")
+    return env
+
+
+def run(arm: str, outdir: str, n: int, new_tokens: int) -> int:
+    _, graphs = D23_ARMS[arm]
+    env = arm_environment(arm, outdir)
     cmd = [
         PYTHON, os.path.join(REPO, "scripts", "dsv41", "trace_corpus.py"),
         "--model", arm_env.MODEL_PATH,
