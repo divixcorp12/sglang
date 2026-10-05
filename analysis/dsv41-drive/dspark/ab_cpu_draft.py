@@ -25,6 +25,10 @@ COMMON = {
     # The base recipe runs the target's CPU experts in the decode graph's copy wait; the gate refuses them with
     # speculation, which is eager here.
     "SGLANG_DSV41_CPU_EXPERTS": "0",
+    # The optimized EXL3 CPU build, the only one exporting a CpuExpertKernel (the hybrid arm's draft runs on it), in
+    # both arms so they load the same extension.
+    "SGLANG_EXL3_CPU_ACT_RESIDUAL": "1",
+    "SGLANG_EXL3_CPU_ACT_BLOCK": "128",
     "SGLANG_MOE_EXPERT_GRAPH_GATHER": "0",
     "SGLANG_MOE_GPU_RESIDENCY_UPDATE": "0",
     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": "0",
