@@ -1,16 +1,16 @@
-"""The EXL3 CPU MoE kernel under the build's activation quantization options (SGLANG_EXL3_CPU_ACT_*).
+"""The optimized EXL3 CPU MoE kernel (residual int8 activations, 128-wide blocks) against the scalar tier.
 
-Builds whatever flavor the environment selects, then checks it on random DSV4.1-shaped experts against the scalar
-tier (fp32 activations, which ignores the options):
+The CPU kernel's ops (sglang_exl3_cpu::*) exist only in the optimized extension, which SGLANG_DSV41_CPU_EXPERTS=1
+builds, so each tier's child process runs with it set. Checks on random DSV4.1-shaped experts against the scalar tier
+(fp32 activations, which ignores the options):
   - the swizzled layout gives the same bits as the native one (the k-block sub-view addresses both);
   - a 5-token batch gives each token the same bits as running it alone (chunks are capped for the residual rows);
-  - the relative error against the scalar tier is under the flavor's bound.
+  - the relative error against the scalar tier is under the residual kernel's bound.
 
 Needs SGLANG_EXL3_SRC and an AVX2-or-better CPU, and builds the expert-stream host module's instrumented variant for its
 test exports (kernel_layer, kernel_forward; CXX the kernels' GCC 15, as run_exl3_cpu_forward_checks.sh sets it). Each
 ISA tier runs in its own process, since the tier is fixed at the first kernel call. Run on divix01 under taskset, e.g.
-  SGLANG_EXL3_CPU_ACT_RESIDUAL=1 SGLANG_EXL3_CPU_ACT_BLOCK=128 \\
-    taskset -c 18-25 python -m pytest test/manual/dsv41/test_exl3_cpu_act_quant.py -q
+  taskset -c 18-25 python -m pytest test/manual/dsv41/test_exl3_cpu_act_quant.py -q
 """
 
 import os
@@ -105,18 +105,14 @@ def _tier(tier, tmp_path):
     import torch
 
     out = tmp_path / f"{tier}.pt"
-    subprocess.run([sys.executable, __file__, tier, str(out)], check=True)
+    env = {**os.environ, "SGLANG_DSV41_CPU_EXPERTS": "1"}
+    subprocess.run([sys.executable, __file__, tier, str(out)], check=True, env=env)
     return torch.load(out)
 
 
-def _bound():
-    from sglang.srt.environ import envs
-
-    residual = envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get()
-    block = envs.SGLANG_EXL3_CPU_ACT_BLOCK.get()
-    # Upstream measures ~1.4-1.9% on real DSV4.1 rows (DSV41_REFERENCE §28, the P0 plan results); a second int8 pass
-    # leaves ~1/127 of the first pass's error, and per-block scales a fraction of it.
-    return 0.006 if residual else (0.02 if block else 0.03)
+# Upstream measures ~1.4-1.9% on real DSV4.1 rows (DSV41_REFERENCE §28, the P0 plan results); the residual pass leaves
+# ~1/127 of the first pass's error.
+ERROR_BOUND = 0.006
 
 
 @pytest.fixture(scope="module")
@@ -152,8 +148,8 @@ def test_error_against_fp32_activations_is_bounded(tiers):
     got = tiers["bw"]["native"]["batch"]
     assert torch.isfinite(got).all()
     err = _rel(got, ref)
-    print(f"rel L2 vs scalar tier: {err:.5f} (bound {_bound()})")
-    assert err < _bound()
+    print(f"rel L2 vs scalar tier: {err:.5f} (bound {ERROR_BOUND})")
+    assert err < ERROR_BOUND
 
 
 if __name__ == "__main__":
