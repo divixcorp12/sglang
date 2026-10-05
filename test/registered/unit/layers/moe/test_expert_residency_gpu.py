@@ -1315,7 +1315,9 @@ class TestInsertOnMissDirect(unittest.TestCase):
 
     def test_a_narrow_gather_is_the_wide_gather_until_it_overflows(self):
         """Two tokens route 4 ids a layer. Until the narrow gather first flags, its residency is the wide one's bit for
-        bit: the served lanes are the same prefix of the same usable shortlist entries."""
+        bit: the served lanes are the same prefix of the same usable shortlist entries. The first steps route one
+        token's experts twice (at most 2 distinct, so H + M <= 2 lanes and the guarantee holds); random routes
+        follow until the first overflow."""
         for fused in (False, True):
             self.model = _model()
             wide, narrow = self._narrow(self.model, 0, fused), self._narrow(_model(), 2, fused)
@@ -1329,6 +1331,8 @@ class TestInsertOnMissDirect(unittest.TestCase):
             compared, overflowed = 0, False
             for step in range(60):
                 routes = _verify_routes(generator, 2)
+                if step < 6:
+                    routes = [[layer[0], layer[0]] for layer in routes]
                 for manager, graph, static, outputs in twins:
                     self.replay_verify(manager, graph, static, outputs, routes, check_outputs=True)
                 if int(narrow.gpu_residency.overflow_flag.item()) > 0:
@@ -1339,7 +1343,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
                 assert_slot_rows(self, narrow, self.model, context)
                 self.assertEqual(narrow.gpu_residency.snapshot()["gather_overflow"], [0] * LAYERS)
                 compared += 1
-            self.assertGreaterEqual(compared, 3, f"fused={fused}: too few steps before the first overflow")
+            self.assertGreaterEqual(compared, 6, f"fused={fused}: a repeated-token step overflowed")
             self.assertTrue(overflowed, f"fused={fused}: no step overflowed two lanes")
             self.assertEqual(wide.gpu_residency.overflow_flag.item(), 0)
             self.assertNotIn("gather_overflow", wide.gpu_residency.snapshot())
