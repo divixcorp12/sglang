@@ -1434,9 +1434,16 @@ class Exl3RamMissService:
         An eager forward may load a kernel module, and a load blocks the copy thread's
         ``cuMemcpyAsync`` until the deadline while a decode graph in flight is held in
         its copy wait, so that step must end first. Captured decode forwards are
-        counted toward arming.
+        counted toward arming. A DSpark verify counts as a captured forward unless the
+        manager's graph gather is suspended (the eager re-run of an overflowed verify).
         """
-        if not forward_batch.forward_mode.is_decode():
+        mode = forward_batch.forward_mode
+        # A DSpark verify replays the decode graph unless its eager re-run suspended the graph gather.
+        graphed = mode.is_decode() or (
+            mode.is_target_verify()
+            and not (self._manager is not None and self._manager.graph_gather_suspended)
+        )
+        if not graphed:
             if self._copy_armed:
                 torch.cuda.synchronize()
         elif self.device_side is not None and self.device_side.copy_engine_captured:
