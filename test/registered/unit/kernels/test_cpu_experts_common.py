@@ -1,10 +1,10 @@
 """The header-only CPU experts framework (host/cpu_experts) passes its native harness (Linux, GCC with OpenMP).
 
 ``cpu_experts_common_check.cpp`` drives a toy quant through ``ExpertForward`` as a ``CpuExpertKernel`` and prints
-``ok <check>`` per contract it holds.
+``ok <check>`` per contract it holds, and ``cpu_experts_cross_library_check.cpp`` links two toy libraries and passes a
+layer between them.
 """
 
-import ctypes
 import os
 import shutil
 import subprocess
@@ -65,86 +65,30 @@ def test_the_native_harness_passes(tmp_path, flags):
     assert result.stderr.count("toy isa ") == 1 and "toy isa scalar\n" in result.stderr, result.stderr
 
 
-class _Layer(ctypes.Structure):
-    _fields_ = [
-        ("abi_version", ctypes.c_uint32),
-        ("capacity", ctypes.c_int32),
-        ("hidden", ctypes.c_int32),
-        ("intermediate", ctypes.c_int32),
-        ("activation", ctypes.c_int32),
-        ("act_limit", ctypes.c_float),
-        ("slab_count", ctypes.c_int32),
-        ("slabs", ctypes.c_void_p * 8),
-        ("slot_bytes", ctypes.c_uint64 * 8),
-        ("params", ctypes.c_void_p),
-    ]
-
-
-class _Forward(ctypes.Structure):
-    _fields_ = [
-        ("abi_version", ctypes.c_uint32),
-        ("rows", ctypes.c_int32),
-        ("layer", ctypes.c_int64),
-        ("x", ctypes.c_void_p),
-        ("slots", ctypes.POINTER(ctypes.c_int32)),
-        ("weights", ctypes.POINTER(ctypes.c_float)),
-        ("out", ctypes.POINTER(ctypes.c_float)),
-        ("k", ctypes.c_int32),
-        ("threads", ctypes.c_int32),
-        ("accumulate", ctypes.c_int32),
-        ("engine", ctypes.c_int64),
-    ]
-
-
 def _build_toy_library(output: Path, *flags: str) -> Path:
     subprocess.run([CXX, *CXX_FLAGS, "-fPIC", "-shared", *flags, str(TOY_LIBRARY), "-o", str(output)], check=True)
     return output
 
 
-def test_each_library_keeps_its_own_registry_and_engines(tmp_path):
-    # Two quant libraries in one process must not share the framework's state: a layer handle or an engine created in
-    # one is unknown to the other. A forward pins its calling thread (worker 0), so the pytest thread's affinity is
-    # restored: a pinned pytest thread leaves every later test one core.
-    saved = os.sched_getaffinity(0)
-    try:
-        a = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_a.so")))
-        b = ctypes.CDLL(str(_build_toy_library(tmp_path / "libtoy_b.so")))
-        for library in (a, b):
-            library.sglang_toy_cpu_experts_engine_create.argtypes = [
-                ctypes.POINTER(ctypes.c_int32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int64),
-            ]
-        hidden, capacity = 16, 2
-        slab = (ctypes.c_float * (hidden * capacity))(*range(hidden * capacity))
-        scale = ctypes.c_float(1.0)
-        layer = _Layer(abi_version=1, capacity=capacity, hidden=hidden, intermediate=hidden, slab_count=1)
-        layer.slabs[0] = ctypes.cast(slab, ctypes.c_void_p)
-        layer.slot_bytes[0] = hidden * 4
-        layer.params = ctypes.cast(ctypes.byref(scale), ctypes.c_void_p)
-        handle = ctypes.c_int64(-1)
-        assert a.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(handle)) == 0
-        core = (ctypes.c_int32 * 1)(min(os.sched_getaffinity(0)))
-        engine = ctypes.c_int64(0)
-        assert a.sglang_toy_cpu_experts_engine_create(core, 1, ctypes.byref(engine)) == 0
+CROSS = Path(__file__).resolve().parent / "cpu_experts_cross_library_check.cpp"
+# As the expert-stream host module builds (expert_stream_transport._host_module_cached): the interface must cross a
+# hidden-visibility library.
+HIDDEN = ["-fvisibility=hidden", "-fvisibility-inlines-hidden"]
 
-        x = (ctypes.c_uint16 * hidden)()
-        slots = (ctypes.c_int32 * 1)(1)
-        weights = (ctypes.c_float * 1)(1.0)
-        out = (ctypes.c_float * hidden)()
-        call = _Forward(abi_version=2, rows=1, layer=handle.value, k=1, threads=1, accumulate=0, engine=engine.value)
-        call.x = ctypes.cast(x, ctypes.c_void_p)
-        call.slots, call.weights, call.out = slots, weights, out
-        assert a.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
-        assert list(out) == [float(hidden + h) for h in range(hidden)]
 
-        assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's layer is unknown to library b"
-        other = ctypes.c_int64(-1)
-        assert b.sglang_toy_cpu_experts_register_layer(ctypes.byref(layer), ctypes.byref(other)) == 0
-        call.layer = other.value
-        assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 2, "library a's engine is unknown to library b"
-        call.engine = 0
-        assert b.sglang_toy_cpu_experts_forward(ctypes.byref(call)) == 0
-    finally:
-        os.sched_setaffinity(0, saved)
+def test_two_libraries_refuse_each_others_layers_across_the_so_boundary(tmp_path):
+    for name in ("a", "b"):
+        _build_toy_library(
+            tmp_path / f"libtoy_{name}.so", *HIDDEN, f"-DTOY_KERNEL=toy_kernel_{name}", f'-DTOY_NAME="toy_{name}"'
+        )
+    exe = tmp_path / "cross_library"
+    subprocess.run(
+        [CXX, *CXX_FLAGS, str(CROSS), f"-L{tmp_path}", "-ltoy_a", "-ltoy_b", f"-Wl,-rpath,{tmp_path}", "-o", str(exe)],
+        check=True,
+    )
+    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0 and "ok cross_library" in result.stdout, result.stdout + result.stderr
+
 
 def test_a_scalar_quant_library_uses_no_avx_registers(tmp_path):
     # A quant whose top tier is Scalar must compile no vector code from the framework, so a portable (baseline x86-64)
