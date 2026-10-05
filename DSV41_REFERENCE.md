@@ -7042,6 +7042,8 @@ This is the third of four v2 plans. It covers §33.3 items 6-8, and measures the
   - **A pinned gather's room counted the row's staging slots, `218d31446a`.** `evictable_rows` counted the slots the
     service's lanes own, which `assign` never hands out. The eager re-run then evicted pinned rows before their copy
     ("pinned host rows of experts [24, 25] were evicted"). `NativePinnedSlotTable.reserved_rows` is now subtracted.
+    This is the one change that reaches a non-DSpark launch: every option-C tier's eager chunks shrink by its staging
+    slots.
   - **The draft's CPU-expert cores were outside the core plan, `ceec0db386`.** The first arm run was refused at start
     (`core 17 shares a physical core with the server's affinity`). The recipe hand-pins the RAM thread to 17, the plan's
     `taskset 0-5,18-63` held its sibling 53, and the hybrid draft's hand-named 6-17 overlapped the copy and RAM threads
@@ -7051,6 +7053,10 @@ This is the third of four v2 plans. It covers §33.3 items 6-8, and measures the
     - a named list overrides, is kept out of every derived role, and a given role on its physical core is refused.
 
     The D2-3 driver names no cores.
+  - **A verify the runner did not graph went unread, `90076d1cca`** (final review). The narrowed gather is chosen by
+    route count, so an eager verify (`replace_embeds`, a refused attention key) took it too and could consume an
+    overflowed output. The flag is now read after every verify on a narrowed gather, and `graphed_verify_ct` counts
+    only graphed ones.
   - **A captured verify took the prefill graph's break-points, `3c9d547cbd`.** `ForwardMode.is_extend()` counts
     `TARGET_VERIFY`, so four break-points meant for the breakable prefill graph fired while the decode graph captured
     a verify: the Engram hash ids, low-ratio sources, MQA attention, and the backend's low-ratio projections. Each
@@ -7083,7 +7089,7 @@ The eager arm ran at `ceec0db386`; `graphed` and `reverify` ran at `3c9d547cbd`.
 eager arm never enters. Raw data is in `cc-expert-prediction/analysis/dsv41-dspark/graph-verify/d2-3/`
 (`summary.json`). The earlier refused and capture-failed runs are kept in its subdirectories.
 
-| arm | tok/s | accept length | verify ms mean / p50 / p95 (n) | re-verify rate | layer overflow mean / max | text = eager |
+| arm | tok/s | accept length | verify ms mean / p50 / p95 (n, < 1 s only) | re-verify rate | layer overflow mean / max | consumed text = eager |
 |---|---|---|---|---|---|---|
 | eager | 2.22 | 2.37 | 862 / 872 / 989 (183) | - | - | - |
 | graphed, W 8 | 2.84 | 2.37 | 831 / 828 / 967 (354) | 1.00 | 0.75 / 1.00 | 8 / 8 |
@@ -7100,9 +7106,17 @@ eager arm never enters. Raw data is in `cc-expert-prediction/analysis/dsv41-dspa
 - **The graphed arm's tok/s gain is not a graph gain.** Every verify was re-run eagerly, so each graphed verify paid a
   replay and an eager forward. The +28% over `eager` comes with the graphed arms' expert-stream configuration (DIRECT
   in-graph residency, the fused plan, prefill fills), which the eager arm turns off. Its re-runs run on that residency.
-- **Verify ms is GPU-event time over the `TARGET_VERIFY` segment.**
+- **No graphed verify's own output was consumed.** At a re-verify rate of 1.00, every verify output the graphed and
+  reverify arms used came from the eager re-run. Their "8 / 8" is the re-run's parity with eager, not the graph's.
+  The in-graph verify path (in-graph MQA attention, low-ratio sources and Engram hash under a narrowed gather that does
+  not overflow) has no end-to-end parity evidence yet.
+- **Verify ms is GPU-event time over the `TARGET_VERIFY` segment, and it is right-censored at 1 s.**
   - It includes waiting on RAM and NVMe misses. In the graphed arms it covers the replay plus the re-run.
-  - Not every verify has a record (n < 380), so the n column is reported.
+  - The DSpark info dump drops a segment longer than `INFO_DUMP_MAX_STEP_CPU_SECONDS` (1.0 s,
+    `dspark_observability.py`), and `summarize` drops the missing record. Eager keeps 183 of about 380 verifies and
+    its p95 (989 ms) sits at the cap, so about half of eager's verifies, the slow ones, are missing.
+  - The columns are means of differently truncated distributions. They do not compare eager with graphed, and they
+    bound nothing.
 
 **What it decides, against §33.5.**
 - **Measurement 1 is not answered by this run.** The graphed verify ms (≈830 ms) is an upper bound on replay + eager
@@ -7113,7 +7127,9 @@ eager arm never enters. Raw data is in `cc-expert-prediction/analysis/dsv41-dspa
 - **So by §33.5's rule, v2 (D2-4, multi-token CPU experts) is not worth building on this evidence.** Graphed DSpark
   stays shelved, and §33.4's eager hybrid draft remains the DSpark path.
 - **What would reopen it:**
-  - a W sweep (`D23_MISS_LANES` 16, 24, 32) to find where the re-verify rate falls;
+  - a W sweep (`D23_MISS_LANES` 16, 24, 32) to find where the re-verify rate falls. At a rate below 1 it must gate
+    `graphed.text_matches_eager` (or a logit comparison) before any graphed-verify number is trusted, and its verify
+    timing needs a source without the 1 s cap;
   - more hot slots for the `2W` floor, freed from VRAM (the Qwen NextN lever, +6% there);
   - §33.5's measurement 3 (what `capacity ≥ 2W` really requires).
 
