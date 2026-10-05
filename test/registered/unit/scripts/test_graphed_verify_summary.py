@@ -35,6 +35,16 @@ def _arm(outdir, arm, texts, verify_ms, overflow=None, graphed=None, truncated=N
             f.write(json.dumps({"counters": {}}) + "\n" + json.dumps(record) + "\n")
 
 
+@pytest.mark.parametrize("arm", sorted(graphed_verify.D23_ARMS))
+def test_no_arm_names_a_core_by_hand(tmp_path, arm):
+    """ThreadingConfig derives the RAM thread's and the draft's cores from the arm's affinity. The recipe's spin core 17
+    and ab_cpu_draft's draft cores 6-17 were chosen for other affinities, and the graphed arm was refused for them."""
+    env = graphed_verify.arm_environment(arm, str(tmp_path))
+    assert "SGLANG_DSV41_RAM_MISS_SPIN_CORE" not in env
+    assert "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES" not in env
+    assert env["SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS"] == "1"
+
+
 def test_the_summary_reads_every_arm(tmp_path):
     out = str(tmp_path)
     _arm(out, "eager", ["a", "b"], [20.0, 30.0, None])
