@@ -834,9 +834,9 @@ class ExpertPinnedHostCacheManager:
                     "pinned host cache requires unique nonnegative layer IDs"
                 )
             streamers[layer_id] = streamer
-        placement = pinned_host_placement(budget_bytes)
         if not streamers:
             return None
+        placement = pinned_host_placement(budget_bytes)
         capacities = {layer_id: 0 for layer_id in streamers}
         remaining = budget_bytes
         progress = True
