@@ -22,6 +22,7 @@ module runs during server-args processing, so it imports only the gate module,
 """
 
 import dataclasses
+import os
 
 from sglang.srt.arg_groups.expert_stream_requirements import (
     ExpertStreamRequirements,
@@ -29,6 +30,11 @@ from sglang.srt.arg_groups.expert_stream_requirements import (
     register_expert_stream_requirements,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.cpu_experts.draft_resident import load_resident_set
+from sglang.srt.layers.moe.cpu_experts.threading_config import (
+    check_not_reserved,
+    parse_cpu_list,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 
 _EAGER = eager_expert_stream_requirements(
@@ -60,6 +66,38 @@ class _EagerGraphView:
         return getattr(self._cfg, name)
 
 
+def _check_dspark_cpu_experts(cfg) -> None:
+    """The draft CPU experts' launch rules, so a bad core list or resident file fails here, not at the first draft
+    call."""
+    if getattr(cfg, "speculative_algorithm", None) != "DSPARK":
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS computes the DSpark draft's routed experts on the CPU; "
+            "pass --speculative-algorithm DSPARK or unset it"
+        )
+    cores = parse_cpu_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())
+    for core in cores:
+        check_not_reserved(core)
+    if len(cores) < 2:
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES with at "
+            "least two cores (one spinning worker per core)"
+        )
+    threads = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get()
+    if not 0 <= threads <= len(cores):
+        raise ValueError(
+            f"SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS={threads} on {len(cores)} cores: use 0 (one per core) "
+            f"up to {len(cores)}"
+        )
+    if os.environ.get("EXL3_MOE_CPU_PIN") != "0":
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs EXL3_MOE_CPU_PIN=0: the kernel would otherwise pin "
+            "its workers to the first cores"
+        )
+    resident = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
+    if resident:
+        load_resident_set(resident)
+
+
 def _check(cfg, budgets) -> None:
     """The eager checks, with decode allowed as a breakable CUDA graph at max batch size 1.
 
@@ -86,6 +124,8 @@ def _check(cfg, budgets) -> None:
         # parse_cuda_graph_config, while this is still the raw CLI value: the decode
         # backend is not known yet, and the pass after parsing runs every check below.
         return
+    if envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get():
+        _check_dspark_cpu_experts(cfg)
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
     if cpu_experts and (
         getattr(cfg, "speculative_algorithm", None) is not None

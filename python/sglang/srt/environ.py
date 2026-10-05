@@ -769,6 +769,8 @@ class Envs:
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
+    # Appends each DSpark draft MoE call's topk ids as a JSON line; the routes probe the draft resident set is made from.
+    SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
@@ -1948,6 +1950,17 @@ class Envs:
     # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
     # (slot-map plan, Task 0), so a served A/B decides.
     SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
+    # DSpark draft experts on the CPU (plan 2026-10-05-dsv41-dspark-port): each draft stage keeps the experts its
+    # resident set lists on the GPU and computes the rest with the CPU expert kernel, eagerly, so their VRAM goes to the
+    # target's hot cache. A fused shared expert stays on the GPU. Needs --speculative-algorithm DSPARK.
+    SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS = EnvBool(False)
+    # Cores of the draft's CPU expert kernel, as a taskset list ("18-27"). At least two, none of the reserved 64-71.
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES = EnvStr("")
+    # Worker threads of the draft's CPU expert kernel, at most one per core. 0 takes one per core.
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS = EnvInt(0)
+    # The draft experts kept on the GPU, per stage (analysis/dsv41-drive/dspark/draft_resident_set.py).
+    # Empty keeps none: every routed draft expert runs on the CPU.
+    SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH = EnvStr("")
     # For this many us after its last job, the idle CPU expert thread holds its workers in the kernel's register-only
     # AVX-512 loop instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap
     # costs about 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03:
