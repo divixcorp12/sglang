@@ -17,6 +17,7 @@
 
 #include "../row_layout.h"
 #include "copy_engine.h"
+#include "host_copy_backend.h"
 #include "numa_distributor.h"
 #include "split_calibration.h"
 
@@ -878,7 +879,7 @@ class RamTier {
 
   // The CPU test backend of the copy engine; throws when the engine uses another backend.
   HostCopyBackend& host_copy_backend() {
-    HostCopyBackend* backend = copy_engine_ != nullptr ? copy_engine_->host_backend() : nullptr;
+    auto* backend = copy_engine_ != nullptr ? dynamic_cast<HostCopyBackend*>(copy_engine_->backend()) : nullptr;
     if (backend == nullptr) throw std::runtime_error(error_prefix<Layout>() + "no test copy backend");
     return *backend;
   }

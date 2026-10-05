@@ -16,6 +16,7 @@
 
 #include "copy_engine.h"
 #include "cpu_experts.h"
+#include "host_copy_backend.h"
 #include "reader_base.h"
 #include <algorithm>
 #include <cstdint>
