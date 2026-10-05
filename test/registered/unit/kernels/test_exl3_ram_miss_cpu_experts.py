@@ -60,7 +60,7 @@ def _cores() -> list[int]:
     return sorted(os.sched_getaffinity(0))[:2]
 
 
-def _host(tmp_path, *, split, copy_engine=True, parts=2, fail=0):
+def _host(tmp_path, *, split, copy_engine=True, parts=2, fail=0, enable=True):
     # Seven slots, three staging: four mappable rows.
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     page = new_page(pin=False, wire=wire_layout(8))
@@ -77,7 +77,7 @@ def _host(tmp_path, *, split, copy_engine=True, parts=2, fail=0):
         host.arm_copy_engine()
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN) if parts == 2 else (ROWS, HIDDEN), dtype=torch.float32)
-    if copy_engine:
+    if copy_engine and enable:
         host.enable_cpu_experts(host.test_kernel_address(fail=fail), split, _cores(), x_rows, out_rows, threads=2, spin_us=200)
     return s, page, host, ChainSim(host, page, s.slabs), dst, out_rows
 
@@ -202,6 +202,22 @@ def test_a_test_kernel_layer_keeps_its_slabs_until_it_is_dropped(tmp_path):
         es.kernel_drop(layer, variant="instr")
         gc.collect()
         assert alive() is None
+    finally:
+        host.stop()
+
+
+@pytest.mark.parametrize(
+    "cores, threads, why",
+    [([4, 4], 2, "core 4 repeats"), ([-1], 1, "outside"), ([4], 2, "2 workers on 1 cores")],
+    ids=["repeat", "negative", "threads"],
+)
+def test_a_bad_core_list_is_refused_when_the_cpu_experts_are_enabled(tmp_path, cores, threads, why):
+    """Not at the first CPU job, where a refusal aborts the process."""
+    s, page, host, sim, dst, out_rows = _host(tmp_path, split=NO_SPLIT, enable=False)
+    try:
+        x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
+        with pytest.raises(Exception, match=why):
+            host.enable_cpu_experts(host.test_kernel_address(), NO_SPLIT, cores, x_rows, out_rows, threads=threads)
     finally:
         host.stop()
 
