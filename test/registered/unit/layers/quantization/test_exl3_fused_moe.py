@@ -152,6 +152,26 @@ def test_direct_fused_moe_covers_resident_slots_with_zero_scratch(monkeypatch):
         module.exl3_fused_moe_for(layer, streamer)
 
 
+def test_direct_fused_moe_for_a_verify_needs_one_token_of_resident_slots_not_every_route(monkeypatch):
+    """Six tokens route 36 ids into 16 resident slots: tokens share slots, and the gather flags what it cannot serve,
+    so DIRECT needs a token's top_k slots, not a slot per route."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.quantization.exl3 import fused_moe as module
+
+    calls = []
+    monkeypatch.setattr(module, "Exl3FusedMoE", lambda tensors, slots, **kw: calls.append((slots, kw)) or object())
+    layer = torch.nn.Module()
+    layer.top_k = 6
+    streamer = _stub_streamer(SimpleNamespace(name="exl3_ram_miss"), graph_gather_rows=36, scratch_rows=0)
+    streamer.hot_cache.capacity = 16
+    streamer.hot_cache.device_residency = SimpleNamespace(insert_on_miss=True, insert_direct=True)
+    streamer.hot_cache.device = torch.device("cpu")
+    streamer.hot_cache.tensors = {"w13_suh": torch.zeros((16, 2, 8)), "w2_suh": torch.zeros((16, 1, 8))}
+    module.exl3_fused_moe_for(layer, streamer)
+    assert calls == [(16, calls[0][1])] and calls[0][1]["tokens"] == 6
+
+
 class _FakeExt:
     """exl3_ext() stand-in: records what the fused MoE hands exllamav3."""
 

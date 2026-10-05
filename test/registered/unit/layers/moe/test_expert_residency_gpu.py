@@ -1235,8 +1235,45 @@ class TestInsertOnMissDirect(unittest.TestCase):
         The allocator gives every layer that floor first, so only a budget short of all the floors
         together leaves a layer under it: here one slot short of three floors."""
         floors = LAYERS * 2 * TOP_K
-        with self.assertRaisesRegex(ValueError, "twice its graph-gather rows"):
+        with self.assertRaisesRegex(ValueError, "twice its graph-gather miss lanes"):
             _manager(_model(), gpu=True, budget_bytes=56 * (floors - 1), **DIRECT)
+
+    # ----- a miss width below the routes (a verify) -----
+
+    def test_a_narrow_miss_width_sizes_the_shortlist_not_the_routes(self):
+        """Three verify tokens route 6 ids a layer; the gather serves 2 distinct misses. The routes keep their width,
+        the shortlist and the lanes take the miss width, and DIRECT still holds no scratch."""
+        manager = _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **DIRECT)
+        updater = manager.gpu_residency
+        for streamer in manager.streamers.values():
+            self.assertEqual(streamer.graph_gather_rows, 3 * TOP_K)
+            self.assertEqual(streamer.graph_miss_lanes, 2)
+            self.assertEqual(streamer.graph_miss_width, 2)
+            self.assertEqual(streamer.hot_cache.scratch_rows, 0)
+        self.assertEqual(updater.miss_rows, 2)
+        self.assertEqual(tuple(updater.victims.shape), (LAYERS, 2))
+
+    def test_the_miss_width_defaults_to_one_lane_per_route_and_reads_the_env(self):
+        from sglang.srt.environ import envs
+
+        # Two tokens route 4 ids: one lane per route needs a floor of 8 slots a layer.
+        budget = dict(budget_bytes=56 * LAYERS * 8, graph_gather_batch_size=2)
+        wide = _manager(_model(), gpu=True, **budget, **DIRECT)
+        capped = _manager(_model(), gpu=True, graph_gather_miss_lanes=99, **budget, **DIRECT)
+        with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.override(3):
+            narrow = _manager(_model(), gpu=True, **budget, **DIRECT)
+        for manager, lanes, width in ((wide, 0, 4), (capped, 0, 4), (narrow, 3, 3)):
+            for streamer in manager.streamers.values():
+                self.assertEqual((streamer.graph_miss_lanes, streamer.graph_miss_width), (lanes, width))
+            self.assertEqual(manager.gpu_residency.miss_rows, width)
+
+    def test_a_narrow_miss_width_needs_direct(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"):
+            _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **IOM)
+
+    def test_a_negative_miss_width_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "miss lanes"):
+            _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=-1, **DIRECT)
 
     # ----- the consolidated safety guard (one guard, three reasons) -----
 
