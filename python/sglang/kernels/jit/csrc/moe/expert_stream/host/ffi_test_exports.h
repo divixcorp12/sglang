@@ -12,6 +12,7 @@
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_keep_warm_calls, test_keep_warm_core,
 //              pause_ns
+//   draft      draft_test_post, draft_test_tear, draft_test_finish_close: the draft channel's device half on the host
 //   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: any kernel's make_layer and forward, by layer id;
 //              in both builds, as the DSpark draft's CPU experts call them (cpu_experts/draft.py)
 //
@@ -648,16 +649,18 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   }
 
   // Test only: the CPU expert kernel tests enable in place of a format's (test_kernel_address). Its layers read only
-  // their hidden. A forward spins k * ns_per_expert, waits while its worker-0 core is held (test_kernel_hold),
-  // throws when made failing, else writes out[j] for j < max(hidden, 1) -- (accumulate ? out[j] : j) + sum_i weights[i]
-  // * (slots[i] + 1), or a zero partial (accumulate ? out[j] : 0) when made zeroing -- and records the call. A
-  // keep-warm counts its calls and records its first core, then spins until its word moves or its deadline passes.
+  // their hidden (and capacity, which a call records). A forward spins k * ns_per_expert, waits while its worker-0 core
+  // is held (test_kernel_hold), throws when made failing, else for each row t < max(rows, 1) writes out[t * hidden + j]
+  // for j < max(hidden, 1) -- (accumulate ? out[..] : j) + sum_i weights[t * k + i] * (slots[t * k + i] + 1), or a zero
+  // partial (accumulate ? out[..] : 0) when made zeroing -- and records one call per row. A keep-warm counts its calls
+  // and records its first core, then spins until its word moves or its deadline passes.
   class FakeKernel final : public cpu_experts::CpuExpertKernel {
    public:
     struct Call {
       int32_t core, affinity, threads, accumulate, k;
       std::array<int32_t, Wire::kLanes> slots;
       std::array<float, Wire::kLanes> weights;
+      int32_t capacity;  // the layer's: which layer the call ran
     };
 
     void reset(int64_t ns_per_expert, int64_t fail, bool zero) {
@@ -698,14 +701,19 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         _mm_pause();
       if (const int64_t f = fail_.load(std::memory_order_relaxed); f != 0)
         throw std::runtime_error("fake CPU expert forward failed (" + std::to_string(f) + ")");
-      double sum = 0;
-      for (int32_t i = 0; i < c.k; ++i)
-        sum += static_cast<double>(c.weights[i]) * (c.slots[i] + 1);
       const int32_t hidden = std::max(layer.hidden, 1);
       const bool zero = zero_.load(std::memory_order_relaxed);
-      for (int32_t j = 0; j < hidden; ++j) {
-        const double base = c.accumulate ? static_cast<double>(c.out[j]) : (zero ? 0.0 : static_cast<double>(j));
-        c.out[j] = static_cast<float>(zero ? base : base + sum);
+      for (int32_t t = 0; t < std::max(c.rows, 1); ++t) {
+        const int32_t* slots = c.slots + static_cast<int64_t>(t) * c.k;
+        const float* weights = c.weights + static_cast<int64_t>(t) * c.k;
+        float* out = c.out + static_cast<int64_t>(t) * hidden;
+        double sum = 0;
+        for (int32_t i = 0; i < c.k; ++i)
+          sum += static_cast<double>(weights[i]) * (slots[i] + 1);
+        for (int32_t j = 0; j < hidden; ++j) {
+          const double base = c.accumulate ? static_cast<double>(out[j]) : (zero ? 0.0 : static_cast<double>(j));
+          out[j] = static_cast<float>(zero ? base : base + sum);
+        }
       }
       cpu_set_t mask;
       CPU_ZERO(&mask);
@@ -713,13 +721,16 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       if (sched_getaffinity(0, sizeof(mask), &mask) == 0 && CPU_COUNT(&mask) == 1)
         for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
           if (CPU_ISSET(cpu, &mask)) affinity = cpu;
-      Call call{core, affinity, c.threads, c.accumulate ? 1 : 0, std::min<int32_t>(c.k, Wire::kLanes), {}, {}};
-      for (int32_t i = 0; i < call.k; ++i) {
-        call.slots[i] = c.slots[i];
-        call.weights[i] = c.weights[i];
-      }
       std::lock_guard<std::mutex> lock(mutex_);
-      calls_.push_back(call);
+      for (int32_t t = 0; t < std::max(c.rows, 1); ++t) {
+        Call call{core, affinity, c.threads, c.accumulate ? 1 : 0, std::min<int32_t>(c.k, Wire::kLanes), {}, {},
+                  layer.capacity};
+        for (int32_t i = 0; i < call.k; ++i) {
+          call.slots[i] = c.slots[static_cast<int64_t>(t) * c.k + i];
+          call.weights[i] = c.weights[static_cast<int64_t>(t) * c.k + i];
+        }
+        calls_.push_back(call);
+      }
     }
     void keep_warm(std::span<const int> cores, int32_t, const uint32_t* word, uint32_t seen, int64_t,
                    int64_t release_ns) const override {
@@ -765,8 +776,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       return static_cast<int64_t>(reinterpret_cast<intptr_t>(&fake_kernel()));
     }
   }
-  // Test only: the fake's calls since test_kernel_address, as float64 rows {core, affinity, threads, accumulate, k,
-  // slots[kLanes], weights[kLanes]} into `out` (as many as fit); returns how many there are.
+  // Test only: the fake's calls since test_kernel_address, one per row, as float64 rows {core, affinity, threads,
+  // accumulate, k, slots[kLanes], weights[kLanes], capacity} into `out` (as many as fit); returns how many there are.
   static int64_t test_kernel_calls(TensorView out) {
     if constexpr (!Build::kFaults) {
       test_only("test_kernel_calls");
@@ -774,10 +785,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       using namespace host;
       auto cpu = SymbolicDevice{};
       expert_stream::verify_named(
-          "out", TensorMatcher({-1, 5 + 2 * Wire::kLanes}).with_dtype<double>().with_device<kDLCPU>(cpu), out);
+          "out", TensorMatcher({-1, 6 + 2 * Wire::kLanes}).with_dtype<double>().with_device<kDLCPU>(cpu), out);
       const std::vector<typename FakeKernel::Call> calls = fake_kernel().calls();
       auto* o = static_cast<double*>(out.data_ptr());
-      const int64_t width = 5 + 2 * Wire::kLanes;
+      const int64_t width = 6 + 2 * Wire::kLanes;
       for (int64_t r = 0; r < std::min<int64_t>(out.size(0), static_cast<int64_t>(calls.size())); ++r) {
         const typename FakeKernel::Call& c = calls[r];
         double* row = o + r * width;
@@ -790,6 +801,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
           row[5 + i] = c.slots[i];
           row[5 + Wire::kLanes + i] = c.weights[i];
         }
+        row[5 + 2 * Wire::kLanes] = c.capacity;
       }
       return static_cast<int64_t>(calls.size());
     }
@@ -815,6 +827,62 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       test_only("test_keep_warm_core");
     } else {
       return fake_kernel().warm_core();
+    }
+  }
+
+  // Test only: the draft channel's device half on the host (draft_kernels.cuh), at the pinned channel's address.
+  // draft_test_post writes what draft_post_kernel's thread 0 writes, in its order: the record's seqlock open, the
+  // stage|rows|k word and the epoch, the seq, then the head.
+  static void draft_test_post(int64_t address, int64_t stage, int64_t rows, int64_t k, int64_t seq, int64_t epoch) {
+    if constexpr (!Build::kFaults) {
+      test_only("draft_test_post");
+    } else {
+      using S = draft::DraftChannel;
+      auto* ch = reinterpret_cast<uint8_t*>(static_cast<intptr_t>(address));
+      const auto s = static_cast<uint32_t>(seq);
+      auto* rec = reinterpret_cast<uint32_t*>(ch + S::kRing + channel::ring_index<S>(s) * S::kRecordBytes);
+      __atomic_store_n(rec, 0u, __ATOMIC_RELAXED);
+      std::atomic_thread_fence(std::memory_order_release);
+      __atomic_store_n(
+          rec + draft::kRecStage / 4,
+          (static_cast<uint32_t>(stage) & 0xFFFFu) | (static_cast<uint32_t>(rows) & 0xFFu) << 16 |
+              (static_cast<uint32_t>(k) & 0xFFu) << 24,
+          __ATOMIC_RELAXED);
+      __atomic_store_n(rec + draft::kRecEpoch / 4, static_cast<uint32_t>(epoch), __ATOMIC_RELAXED);
+      __atomic_store_n(rec, s, __ATOMIC_RELEASE);
+      __atomic_store_n(reinterpret_cast<uint32_t*>(ch + S::kHead), s, __ATOMIC_RELEASE);
+    }
+  }
+  // Test only: publishes head `seq` over a record whose seq word reads 0 (a torn record).
+  static void draft_test_tear(int64_t address, int64_t seq) {
+    if constexpr (!Build::kFaults) {
+      test_only("draft_test_tear");
+    } else {
+      using S = draft::DraftChannel;
+      auto* ch = reinterpret_cast<uint8_t*>(static_cast<intptr_t>(address));
+      const auto s = static_cast<uint32_t>(seq);
+      __atomic_store_n(
+          reinterpret_cast<uint32_t*>(ch + S::kRing + channel::ring_index<S>(s) * S::kRecordBytes), 0u, __ATOMIC_RELEASE);
+      __atomic_store_n(reinterpret_cast<uint32_t*>(ch + S::kHead), s, __ATOMIC_RELEASE);
+    }
+  }
+  // Test only: the device's close_gate on the host: close the gate for G, fence, re-check done[G] and open the gate
+  // itself if it is there. Returns 1 when it opened the gate.
+  static int64_t draft_test_finish_close(int64_t address, int64_t seq, int64_t epoch) {
+    if constexpr (!Build::kFaults) {
+      test_only("draft_test_finish_close");
+    } else {
+      using S = draft::DraftChannel;
+      auto* ch = reinterpret_cast<uint8_t*>(static_cast<intptr_t>(address));
+      const auto s = static_cast<uint32_t>(seq);
+      const uint64_t gen = static_cast<uint64_t>(static_cast<uint32_t>(epoch)) << 32 | s;
+      auto* gate = reinterpret_cast<uint32_t*>(ch + S::kGate);
+      __atomic_store_n(gate, channel::gate_word(s, channel::kGateClosed), __ATOMIC_RELAXED);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      const auto* done = reinterpret_cast<const uint64_t*>(ch + S::kDone + channel::ring_index<S>(s) * S::kDoneBytes);
+      if (__atomic_load_n(done, __ATOMIC_ACQUIRE) != gen) return 0;
+      __atomic_store_n(gate, channel::gate_word(s, channel::kGateOpen), __ATOMIC_RELEASE);
+      return 1;
     }
   }
 
@@ -1156,6 +1224,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_hold, Exports::test_kernel_hold);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_calls, Exports::test_keep_warm_calls); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_core, Exports::test_keep_warm_core);   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_post, Exports::draft_test_post);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_tear, Exports::draft_test_tear);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_finish_close, Exports::draft_test_finish_close); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_layer, Exports::kernel_layer);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_forward, Exports::kernel_forward);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_error, Exports::kernel_error);                 \

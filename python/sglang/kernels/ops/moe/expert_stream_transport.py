@@ -124,6 +124,9 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "test_kernel_hold",
     "test_keep_warm_calls",
     "test_keep_warm_core",
+    "draft_test_post",
+    "draft_test_tear",
+    "draft_test_finish_close",
 )
 
 
@@ -1907,10 +1910,10 @@ class ExpertStreamHost:
         return int(self._module.expert_stream_test_kernel_address(int(ns_per_expert), int(fail), int(bool(zero))))
 
     def test_kernel_calls(self) -> list[dict]:
-        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, in order."""
+        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, one per row, in order."""
         _refuse_test_only("test_kernel_calls", self.variant)
         lanes = self.wire.lanes
-        width = 5 + 2 * lanes
+        width = 6 + 2 * lanes
         count = int(self._module.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
         out = torch.zeros((count, width), dtype=torch.float64)
         self._module.expert_stream_test_kernel_calls(out)
@@ -1920,6 +1923,7 @@ class ExpertStreamHost:
             calls.append({
                 "core": int(row[0]), "affinity": int(row[1]), "threads": int(row[2]), "accumulate": bool(row[3]),
                 "slots": [int(s) for s in row[5 : 5 + k]], "weights": row[5 + lanes : 5 + lanes + k],
+                "capacity": int(row[5 + 2 * lanes]),
             })
         return calls
 

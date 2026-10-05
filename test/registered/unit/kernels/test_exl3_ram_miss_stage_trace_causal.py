@@ -241,11 +241,13 @@ NON_TRACE_CLOCK_READS = {
     "const int64_t t0 = now_ns();": 1,
     "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
     # CpuExpertEngine's first release time (cpu_experts.h): once, when its thread starts; the CPU expert thread only.
-    # The native test keep-warm (test only) spins on its release time on that thread too.
-    "int64_t release_at = config_.spin_ns < 0 ? kNever : now_ns() + config_.spin_ns;": 1,
+    # The native test keep-warm (test only) spins on its release time on that thread too. DraftCpuThread
+    # (draft_cpu_thread.h) takes its own first release time the same way, on the draft CPU thread.
+    "int64_t release_at = config_.spin_ns < 0 ? kNever : now_ns() + config_.spin_ns;": 2,
     "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < release_ns)": 1,
-    # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread.
-    "const int64_t now = now_ns();": 1,
+    # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread. DraftCpuThread's
+    # watchdog times an incomplete draft record the same way, on its own thread.
+    "const int64_t now = now_ns();": 2,
     # The copy engine (LEASE_PROTOCOL.md, "Copy engine"): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
     # through it) and stop()'s drain deadline, which the copy thread reads only once a stop was asked for.
     "if (now_ns() > deadline_ns) return false;": 1,
@@ -266,8 +268,9 @@ NON_TRACE_CLOCK_READS = {
     # ... and pause_ns, test only (refused on ProdBuild): one PAUSE probe on the caller's thread.
     # ... and the startup split calibration (split_calibration.h): once, on the calibrating caller's thread with the
     # service paused and the copy engine not armed, each run's start, its two completion stamps and its timeout.
-    "const int64_t start = now_ns();": 3,
-    "const int64_t end = now_ns();": 1,
+    # ... and DraftCpuThread's pair per draft forward (forward_ns), on the draft CPU thread.
+    "const int64_t start = now_ns();": 4,
+    "const int64_t end = now_ns();": 2,
     "return static_cast<double>(now_ns() - start) / kProbe;": 1,
     "end = std::max(end, now_ns());": 2,
     "if (now_ns() - start > s.timeout_ns)": 1,

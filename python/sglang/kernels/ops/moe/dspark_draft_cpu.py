@@ -3,7 +3,8 @@
 * ``DraftWire`` mirrors draft_channel.h (test_dspark_draft_channel_layout checks the two agree);
 * ``DraftCpuAreas`` owns the channel buffer and the per-stage pinned areas the host thread reads and writes;
 * ``DraftCpuDevice`` queues the device half: ``post`` (stage the CPU share, publish a record) and ``finish`` (close the
-  gate, the stream's wait, add the host's rows). Both are device-only, so a graph captures them.
+  gate, the stream's wait, add the host's rows). Both are device-only, so a graph captures them;
+* ``DraftCpuHost`` runs the host half, the draft CPU thread (host/draft_cpu_thread.h), in the expert-stream host module.
 
 The protocol is the lease channel's (LEASE_PROTOCOL.md, "The lease channel"); only the record and the areas are the
 draft's.
@@ -11,8 +12,11 @@ draft's.
 
 from __future__ import annotations
 
+import atexit
+import sys
+import weakref
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
@@ -117,3 +121,90 @@ class DraftCpuDevice:
     def finish(self, stage: int, out: torch.Tensor) -> None:
         """Wait (on the stream) for the posted record's done word and add the host's rows into `out` [M, H] fp32."""
         self.module.finish(self.state, self.areas.channel.data_ptr(), self.areas.out[stage].data_ptr(), out)
+
+
+class DraftCpuHost:
+    """The host half: one draft CPU thread over `areas`, on `cores` with `threads` workers (the first core its own).
+
+    Idle as the target's CPU expert engine: the team is held `keep_warm_us` in register work after each job, then
+    `spin_us` in PAUSE (-1: until the next post), then the thread polls the head with 50 us sleeps. A record that stays
+    incomplete for `fatal_wait_s` ends the process. Set every stage's layer, then `start`; `stop` is idempotent.
+    """
+
+    def __init__(
+        self,
+        areas: DraftCpuAreas,
+        *,
+        cores: Sequence[int],
+        threads: int,
+        spin_us: int,
+        keep_warm_us: int,
+        fatal_wait_s: float,
+        variant: Optional[str] = None,
+        layout: str = "exl3",
+    ):
+        from sglang.kernels.ops.moe import expert_stream_transport as ops
+
+        self.areas = areas
+        self._ops = ops
+        self._module = ops._host_module(layout, variant)
+        self._keep: dict[int, tuple] = {}  # each stage's spec.keep: the slabs its layer reads
+        self.handle = int(
+            self._module.expert_stream_draft_cpu_open(
+                areas.channel,
+                areas.x,
+                areas.slots,
+                areas.weights,
+                areas.out,
+                int(areas.hidden),
+                int(areas.stages),
+                int(threads),
+                torch.tensor(list(cores), dtype=torch.int64),
+                ops._spin_ns(int(spin_us)),
+                int(keep_warm_us * 1000),
+                int(fatal_wait_s * 1e9),
+            )
+        )
+        _LIVE.add(self)
+
+    def set_layer(self, stage: int, kernel: int, spec) -> None:
+        """Stage `stage`'s layer from `kernel`'s make_layer over `spec` (a ``CpuExpertLayerSpec``); before start."""
+        slabs, params = self._ops._layer_tensors(spec)
+        self._module.expert_stream_draft_cpu_set_layer(
+            self.handle,
+            int(stage),
+            int(kernel),
+            slabs,
+            int(spec.capacity),
+            int(spec.hidden),
+            int(spec.intermediate),
+            int(spec.activation),
+            float(spec.act_limit),
+            params,
+        )
+        self._keep[int(stage)] = spec.keep
+
+    def start(self) -> None:
+        self._module.expert_stream_draft_cpu_start(self.handle)
+
+    def stop(self) -> None:
+        self._module.expert_stream_draft_cpu_stop(self.handle)
+
+    def stats(self) -> dict:
+        out = torch.zeros(4, dtype=torch.int64)
+        self._module.expert_stream_draft_cpu_stats(self.handle, out)
+        jobs, rows, forward_ns, holds = (int(v) for v in out.tolist())
+        return {"jobs": jobs, "rows": rows, "forward_ns": forward_ns, "keep_warm_calls": holds}
+
+
+_LIVE: "weakref.WeakSet[DraftCpuHost]" = weakref.WeakSet()
+
+
+@atexit.register
+def _stop_live() -> None:
+    """Stop every live draft CPU thread at exit, before the areas it reads are freed."""
+    for host in list(_LIVE):
+        try:
+            host.stop()
+        except Exception as error:  # noqa: BLE001 - keep stopping the others
+            sys.stderr.write(f"DSpark draft CPU experts: stopping a thread failed: {error!r}\n")

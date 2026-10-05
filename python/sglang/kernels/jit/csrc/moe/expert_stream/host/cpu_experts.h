@@ -65,6 +65,21 @@ class CpuExpertLayers {
   std::unique_ptr<std::atomic<uint8_t>[]> state_;
 };
 
+/// Refuses a CPU expert team its forwards would refuse later: fewer than one thread, a core outside [0, CPU_SETSIZE)
+/// or repeated, or more threads than cores. Every CPU expert thread (CpuExpertEngine, DraftCpuThread) checks its own.
+inline void check_cpu_expert_team(const std::string& prefix, const std::vector<int>& cores, int threads) {
+  if (threads < 1) throw std::runtime_error(prefix + "the CPU expert pool needs at least one thread");
+  for (size_t i = 0; i < cores.size(); ++i) {
+    if (cores[i] < 0 || cores[i] >= CPU_SETSIZE)
+      throw std::runtime_error(prefix + "CPU expert core " + std::to_string(cores[i]) + " is outside [0, CPU_SETSIZE)");
+    for (size_t j = 0; j < i; ++j)
+      if (cores[j] == cores[i])
+        throw std::runtime_error(prefix + "CPU expert core " + std::to_string(cores[i]) + " repeats");
+  }
+  if (!cores.empty() && static_cast<size_t>(threads) > cores.size())
+    throw std::runtime_error(prefix + std::to_string(threads) + " workers on " + std::to_string(cores.size()) + " cores");
+}
+
 /// One forward over up to Wire::kLanes lanes of one row.
 ///
 /// A record produces at most one job for its CPU hits (part 0) and one per batch of CPU misses that landed together
@@ -213,18 +228,7 @@ class CpuExpertEngine {
       throw std::runtime_error(prefix_ + "the CPU expert input and output rows are required");
     if (c.hidden <= 0 || c.out_stride < c.hidden * static_cast<int64_t>(sizeof(float)))
       throw std::runtime_error(prefix_ + "the CPU expert output rows are smaller than the hidden size");
-    if (c.threads < 1) throw std::runtime_error(prefix_ + "the CPU expert pool needs at least one thread");
-    for (size_t i = 0; i < c.cores.size(); ++i) {
-      if (c.cores[i] < 0 || c.cores[i] >= CPU_SETSIZE)
-        throw std::runtime_error(
-            prefix_ + "CPU expert core " + std::to_string(c.cores[i]) + " is outside [0, CPU_SETSIZE)");
-      for (size_t j = 0; j < i; ++j)
-        if (c.cores[j] == c.cores[i])
-          throw std::runtime_error(prefix_ + "CPU expert core " + std::to_string(c.cores[i]) + " repeats");
-    }
-    if (!c.cores.empty() && static_cast<size_t>(c.threads) > c.cores.size())
-      throw std::runtime_error(
-          prefix_ + std::to_string(c.threads) + " workers on " + std::to_string(c.cores.size()) + " cores");
+    check_cpu_expert_team(prefix_, c.cores, c.threads);
   }
 
   /// Names the thread and pins it to cores[0]; returns why it could not, else "".

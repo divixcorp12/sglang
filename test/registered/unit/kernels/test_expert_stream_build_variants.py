@@ -137,10 +137,13 @@ RAW_EXPORTS = {
     "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "pause_ns": lambda m, h: m.expert_stream_pause_ns(),
     "test_kernel_address": lambda m, h: m.expert_stream_test_kernel_address(0, 0, 0),
-    "test_kernel_calls": lambda m, h: m.expert_stream_test_kernel_calls(torch.zeros((0, 5 + 2 * 8), dtype=torch.float64)),
+    "test_kernel_calls": lambda m, h: m.expert_stream_test_kernel_calls(torch.zeros((0, 6 + 2 * 8), dtype=torch.float64)),
     "test_kernel_hold": lambda m, h: m.expert_stream_test_kernel_hold(0, 0),
     "test_keep_warm_calls": lambda m, h: m.expert_stream_test_keep_warm_calls(),
     "test_keep_warm_core": lambda m, h: m.expert_stream_test_keep_warm_core(),
+    "draft_test_post": lambda m, h: m.expert_stream_draft_test_post(0, 0, 1, 1, 1, 0),
+    "draft_test_tear": lambda m, h: m.expert_stream_draft_test_tear(0, 1),
+    "draft_test_finish_close": lambda m, h: m.expert_stream_draft_test_finish_close(0, 1, 0),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
         torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),

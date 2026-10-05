@@ -1971,6 +1971,9 @@ class Envs:
     SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the draft's CPU expert kernel, at most one per core. 0 takes one per core.
     SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS = EnvInt(0)
+    # How long the idle draft CPU thread holds its workers in PAUSE after each job before it releases them and polls the
+    # draft channel's head with 50 us sleeps (the GPU cannot ring a futex). -1: never release.
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_IDLE_SPIN_US = EnvInt(100_000)
     # The draft experts kept on the GPU, per stage (analysis/dsv41-drive/dspark/draft_resident_set.py).
     # Empty keeps none: every routed draft expert runs on the CPU.
     SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH = EnvStr("")
