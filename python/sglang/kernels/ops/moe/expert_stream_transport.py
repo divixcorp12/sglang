@@ -1284,6 +1284,11 @@ def _stop_live() -> None:
             sys.stderr.write(f"exl3 RAM miss: stopping a host failed: {error!r}\n")
 
 
+def _spin_ns(spin_us: int) -> int:
+    """An idle spin budget in ns for the C++ side; a negative budget (never sleep) stays -1."""
+    return -1 if spin_us < 0 else int(spin_us * 1e3)
+
+
 class ExpertStreamHost:
     """The C++-owned pinned-slot bookkeeping of every streamed layer and its request
     service.
@@ -1463,14 +1468,16 @@ class ExpertStreamHost:
         *,
         cpu_core: int | Sequence[int] = -1,
         fatal_wait_s: float = 30.0,
+        spin_us: int = -1,
         busy_poll: bool = False,
     ) -> None:
         """Serve requests on one C++ thread per NUMA group (no more ``pump()``), with the watchdog.
 
         ``cpu_core`` is one core per group (a sequence), or one int for a single group; -1 inherits the caller's
-        affinity. Cores 64-71 are reserved for NVMe completion interrupts. A service thread never sleeps: it spins
-        with PAUSE, or with ``busy_poll`` with no PAUSE, which the C++ side refuses unless each physical core is its
-        service's alone.
+        affinity. Cores 64-71 are reserved for NVMe completion interrupts. An idle service thread spins with PAUSE,
+        or with ``busy_poll`` with no PAUSE (which the C++ side refuses unless each physical core is its service's
+        alone), for ``spin_us``, then sleeps 50 us between polls; parked, it sleeps 20 us between checks. -1 never
+        sleeps (``SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US`` in a server).
         """
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
@@ -1483,6 +1490,7 @@ class ExpertStreamHost:
             self.handle,
             torch.tensor(cores, dtype=torch.int64),
             int(fatal_wait_s * 1e9),
+            _spin_ns(spin_us),
             int(busy_poll),
         )
         self.threaded = True
@@ -1698,7 +1706,7 @@ class ExpertStreamHost:
         self._module.expert_stream_set_prefill_share(self.handle, int(share))
 
     def enable_copy_engine(
-        self, device: int, *, wait_timeout_ms: int = 2000, cpus: Sequence[int] = ()
+        self, device: int, *, spin_us: int = -1, wait_timeout_ms: int = 2000, cpus: Sequence[int] = ()
     ) -> None:
         """Start the copy-engine thread on CUDA ``device`` (-1: the CPU test backend).
 
@@ -1706,13 +1714,15 @@ class ExpertStreamHost:
         :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
         ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the
         process once a closed gate has held the decode stream that long
-        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). The copy thread never sleeps, so
-        ``cpus`` should be a core of its own (``ThreadingConfig.copy_cpus``); empty inherits
-        the caller's affinity.
+        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). The idle copy thread polls for
+        ``spin_us``, then sleeps on its doorbell until the next submit; -1 never sleeps
+        (``SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US`` in a server). ``cpus`` is its core
+        (``ThreadingConfig.copy_cpus``); empty inherits the caller's affinity.
         """
         self._module.expert_stream_enable_copy_engine(
             self.handle,
             int(device),
+            _spin_ns(spin_us),
             int(wait_timeout_ms * 1e6),
             torch.tensor([int(c) for c in cpus], dtype=torch.int64),
         )
@@ -1756,6 +1766,7 @@ class ExpertStreamHost:
         *,
         threads: int,
         group: int = 0,
+        spin_us: int = -1,
         keep_warm_us: int = 0,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
@@ -1769,9 +1780,10 @@ class ExpertStreamHost:
         group g's CPU-hit and CPU-miss partial sums are parts ``2g`` and ``2g + 1``) are
         pinned host rows: the post kernel stages a row's input in the first, the CPU
         writes its partial sums to the second and the device reads them. The host keeps
-        references to both. The idle thread never sleeps: it holds its workers in the
-        kernel's keep-warm, in register work for ``keep_warm_us`` after each job and in
-        PAUSE after that.
+        references to both. The idle thread holds its workers in the kernel's keep-warm, in
+        register work for ``keep_warm_us`` after each job and in PAUSE for ``spin_us`` after
+        that, then releases them and sleeps until the next submit; -1 holds them until the
+        next submit (``SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US`` in a server).
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -1810,6 +1822,7 @@ class ExpertStreamHost:
             hidden,
             parts,
             int(threads),
+            _spin_ns(spin_us),
             int(keep_warm_us * 1e3),
         )
         self.cpu_rows = (x_rows, out_rows)

@@ -721,11 +721,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       std::lock_guard<std::mutex> lock(mutex_);
       calls_.push_back(call);
     }
-    void keep_warm(std::span<const int> cores, int32_t, const uint32_t* word, uint32_t seen, int64_t)
-        const override {
+    void keep_warm(std::span<const int> cores, int32_t, const uint32_t* word, uint32_t seen, int64_t,
+                   int64_t release_ns) const override {
       warm_calls_.fetch_add(1, std::memory_order_relaxed);
       warm_core_.store(cores.empty() ? -1 : cores.front(), std::memory_order_relaxed);
-      while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen)
+      while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < release_ns)
         _mm_pause();
     }
 

@@ -552,8 +552,9 @@ class FakeKernel final : public ce::CpuExpertKernel {
          c.accumulate,
          c.cores.empty() ? -1 : c.cores.front()});
   }
-  void keep_warm(std::span<const int>, int32_t, const uint32_t* word, uint32_t seen, int64_t) const override {
-    while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen) _mm_pause();
+  void keep_warm(std::span<const int>, int32_t, const uint32_t* word, uint32_t seen, int64_t, int64_t release_ns)
+      const override {
+    while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && es::now_ns() < release_ns) _mm_pause();
   }
 
   mutable std::mutex mutex;

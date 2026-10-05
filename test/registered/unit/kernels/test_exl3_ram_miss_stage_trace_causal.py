@@ -236,6 +236,14 @@ NON_TRACE_CLOCK_READS = {
     "if (now_ns() > deadline) {": 1,
     "if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {": 1,
     "if (now_ns() > deadline) return -1;": 1,
+    # The spin budget (spec M8): idle_budget() times kProbe pauses once, on the thread that calls start() (RamThread and
+    # CopyEngine), so neither the service nor the copy thread reads the clock to pace itself.
+    "const int64_t t0 = now_ns();": 1,
+    "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
+    # CpuExpertEngine's first release time (cpu_experts.h): once, when its thread starts; the CPU expert thread only.
+    # The native test keep-warm (test only) spins on its release time on that thread too.
+    "int64_t release_at = config_.spin_ns < 0 ? kNever : now_ns() + config_.spin_ns;": 1,
+    "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < release_ns)": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread.
     "const int64_t now = now_ns();": 1,
     # The copy engine (LEASE_PROTOCOL.md, "Copy engine"): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle

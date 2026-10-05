@@ -191,7 +191,7 @@ class NodePlan:
 @dataclass(frozen=True)
 class ThreadingConfig:
     plans: tuple[NodePlan, ...]  # one per node of the tier, in placement order
-    copy_cpus: tuple[int, ...]  # the copy thread's core, which it spins on; () inherits the server's affinity
+    copy_cpus: tuple[int, ...]  # the copy thread's core, which it polls on; () inherits the server's affinity
     gpu_node: int
     draft_cpus: tuple[int, ...] = ()  # the DSpark draft's CPU expert cores; () without them
 
@@ -354,7 +354,7 @@ def _derive_draft(gpu, topology, affinity, settings, taken) -> tuple[int, ...]:
 
 
 def _copy_core(gpu, overrides, topology, affinity, draft=()) -> int:
-    """The copy thread's core on the GPU's node, outside the server's affinity, since the thread never sleeps. Chosen
+    """The copy thread's core on the GPU's node, outside the server's affinity, since the thread may spin. Chosen
     before the nodes' plans, so CPU experts that take every free core leave it alone. It spins with PAUSE, so it
     prefers a core whose SMT sibling is the server's and leaves the fully free cores to the busy-polling RAM threads."""
     named = {c for plan in overrides.values() for cores in plan.values() for c in cores} | set(draft)

@@ -996,6 +996,7 @@ class Exl3RamMissService:
                 # wait by the RAM-miss timeout.
                 host.enable_copy_engine(
                     torch.cuda.current_device(),
+                    spin_us=envs.SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US.get(),
                     wait_timeout_ms=cfg.ram_miss_timeout_ms,
                     cpus=numa.copy_cpus,
                 )
@@ -1023,14 +1024,16 @@ class Exl3RamMissService:
                     )
             cores = [-1 if plan.ram is None else plan.ram for plan in numa.plans]
             busy_poll = all(plan.busy_poll for plan in numa.plans)
+            spin_us = envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.get()
             if numa.nodes == 1 and cores[0] == -1 and not busy_poll:
-                # The server's affinity: the thread spins there with PAUSE.
-                host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+                # The server's affinity: the thread spins there with PAUSE, then sleeps.
+                host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms), spin_us=spin_us)
             else:
                 host.start_thread(
                     cpu_core=cores if numa.nodes > 1 else cores[0],
                     busy_poll=busy_poll,
                     fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
+                    spin_us=spin_us,
                 )
             if fault is not None:
                 demands, seconds = fault

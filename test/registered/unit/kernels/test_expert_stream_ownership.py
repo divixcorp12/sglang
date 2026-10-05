@@ -142,7 +142,7 @@ def test_the_tier_declares_only_the_callers_mutex():
     caller_mutex_ (Python callers against each other only) and the two InstrBuild-only guards, TraceState::mutex and
     TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; it locks nothing else, and no other
     lock stands in for the deleted mutex_: no rwlock, recursive, timed or pthread lock, no atomic_flag or exchange spin
-    lock, no raw futex (no expert-stream thread sleeps on one), and the one
+    lock, no raw futex (the only futex is the idle threads' Doorbell, in spsc_ring.h), and the one
     compare-exchange is cas_gate's open of the copy wait's gate (LEASE_PROTOCOL.md, "Copy engine")."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
     assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex"}

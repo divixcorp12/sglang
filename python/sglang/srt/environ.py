@@ -1855,6 +1855,11 @@ class Envs:
     # when it first sees the wait armed (LEASE_PROTOCOL.md, "Copy engine"): post to fail-stop can
     # then take about 2x this (+20 ms).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
+    # How long an idle RAM-miss service thread (one per NUMA group) polls before it sleeps 50 us between polls; a
+    # parked thread then sleeps 20 us between checks too. -1: never sleep (spin, with PAUSE or busy-polling).
+    SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US = EnvInt(5000)
+    # How long the idle copy-engine thread polls before it sleeps on a futex until the next copy job. -1: never sleep.
+    SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US = EnvInt(5000)
     # The RAM thread's core on the node it belongs to, busy-polling the request page with no PAUSE and no sleep
     # (ThreadingConfig.resolve). Refused unless it is outside cores 64-71 and the server's affinity, on a node of the
     # pinned tier, and its whole physical core is the thread's own (no SMT sibling in the affinity or another role's
@@ -1972,8 +1977,12 @@ class Envs:
     # For this many us after its last job, the idle CPU expert thread holds its workers in the kernel's register-only
     # AVX-512 loop instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap
     # costs about 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03:
-    # a 1 ms or 3 ms gap then costs nothing). 0: PAUSE only. The workers never sleep either way.
+    # a 1 ms or 3 ms gap then costs nothing). 0: PAUSE only.
     SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
+    # How long after that window the idle CPU expert thread keeps holding its workers in PAUSE before it releases them
+    # (to OpenMP's idle wait) and sleeps on a futex until the next job. -1: never release, so the cores stay busy and
+    # no job waits for a worker to wake.
+    SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US = EnvInt(50_000)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts
