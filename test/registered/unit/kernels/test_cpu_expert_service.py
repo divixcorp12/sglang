@@ -311,12 +311,12 @@ def test_service_keeps_the_cpu_warm_for_2_ms_by_default_and_not_at_0():
     assert host.keep_warm_us == 0
 
 
-def test_service_releases_the_idle_cpu_team_after_50_ms_by_default_and_never_at_minus_1():
+def test_service_releases_the_idle_cpu_team_after_100_ms_by_default_and_never_at_minus_1():
     from sglang.srt.environ import envs
 
     host = FakeHost()
     _service(host, FakeServiceTrait())
-    assert host.spin_us == 50_000
+    assert host.spin_us == 100_000
     with envs.SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US.override(-1):
         host = FakeHost()
         _service(host, FakeServiceTrait())
