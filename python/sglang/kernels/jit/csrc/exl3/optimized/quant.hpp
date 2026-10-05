@@ -34,7 +34,7 @@ constexpr std::array<uint64_t, kSlabNames> row_bytes(int hidden, int intermediat
 }
 
 // One projection's matrix over a slot's trellis and sign vectors (k inputs, n outputs).
-inline Exl3Projection exl3_matrix(const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int k, int n, int bits,
+inline Exl3Projection exl3_projection(const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int k, int n, int bits,
                                 int swz)
 {
     Exl3Projection m;
@@ -107,7 +107,7 @@ struct Experts
     Exl3Projection down(int e) const
     {
         const ExpertRow r = (*layer)[e];
-        return exl3_matrix(r.slab[kW2Trellis], r.slab[kW2Suh], r.slab[kW2Svh], I(), H(), B(), params.swizzled);
+        return exl3_projection(r.slab[kW2Trellis], r.slab[kW2Suh], r.slab[kW2Svh], I(), H(), B(), params.swizzled);
     }
 
 private:
@@ -116,7 +116,7 @@ private:
     {
         const ExpertRow r = (*layer)[e];
         const std::array<uint64_t, kSlabNames> row = row_bytes(H(), I(), B());
-        return exl3_matrix(r.slab[kW13Trellis] + part * (row[kW13Trellis] / 2),
+        return exl3_projection(r.slab[kW13Trellis] + part * (row[kW13Trellis] / 2),
                            r.slab[kW13Suh] + part * (row[kW13Suh] / 2), r.slab[kW13Svh] + part * (row[kW13Svh] / 2),
                            H(), I(), B(), params.swizzled);
     }
