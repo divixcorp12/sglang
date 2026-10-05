@@ -5,8 +5,9 @@
 //   test_record_bytes ...   DeviceSim's records, seqlock order, delta handling, lane typing, epoch wrap and copy-wait
 //                           gate, on a standalone page and lease block with the host's words written by hand
 //   test_image_stamp        row-image layout and stamp reuse
-//   test_stack              the real stack (this binary's build) on synthetic rows with a fake forward
-//   test_two_groups         two NUMA groups' stacks, each with its own engine and slots (a Wire::kNodes == 2 build)
+//   test_stack              the real stack (this binary's build) on synthetic rows with a fake kernel
+//   test_two_groups         two NUMA groups' stacks, each with its own cores and slots (a Wire::kNodes == 2 build)
+//   test_groups_must_share_one_kernel  a group naming a second kernel is refused (a Wire::kNodes == 2 build)
 // Each failed check prints "FAIL file:line" and counts toward run_self_test's return value.
 #include "self_test.h"
 
@@ -22,6 +23,8 @@
 #include <exception>
 #include <filesystem>
 #include <mutex>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,6 +36,7 @@ int checks = 0;
 int failures = 0;
 namespace w = ::sglang::expert_stream::wire;
 namespace es = ::sglang::expert_stream;
+namespace ce = ::sglang::cpu_experts;
 
 // Records one check and reports it on stderr when it fails.
 void check(bool ok, const char* what, const char* file, int line) {
@@ -492,53 +496,68 @@ void test_image_stamp(const std::filesystem::path& dir) {
   CHECK(fills == 6 && std::filesystem::file_size(path) == 2 * 4096);
 }
 
-// ---- the real stack, synthetic rows, a fake forward ----
+// ---- the real stack, synthetic rows, a fake kernel ----
 
 constexpr int64_t kSelfRows = 2;
 constexpr int64_t kSelfExperts = 8;
 constexpr int64_t kSelfCapacity = 7;  // 3 staging slots, 4 mappable
 constexpr int64_t kSelfHidden = 64;
-constexpr int64_t kFakeHandle = 7;
 
-// One call of the fake forward, recorded for the test to inspect.
+// One call of the fake kernel, recorded for the test to inspect.
 struct FakeCall {
-  int64_t layer;
   std::vector<int32_t> slots;
   std::vector<float> weights;
   int32_t threads;
-  int32_t accumulate;
-  int64_t engine;
+  bool accumulate;
+  int core;  // worker 0's core: the group's first
 };
-std::mutex fake_mutex;
-std::vector<FakeCall> fake_calls;
 
 // The kernel's stand-in: out[h] = h + x[0] + sum_i weights[i] * (slots[i] + 1), x[0] read as an integer, so the output
 // proves the row's x, the slots and the weights reached it.
-int fake_forward(const SglangCpuExpertsForward* call) {
-  const int32_t k = call->k;
-  const int32_t* slots = call->slots;
-  const float* weights = call->weights;
-  float* out = call->out;
-  uint16_t x0;
-  std::memcpy(&x0, call->x, 2);
-  float sum = 0.0f;
-  for (int32_t i = 0; i < k; ++i)
-    sum += weights[i] * static_cast<float>(slots[i] + 1);
-  for (int64_t h = 0; h < kSelfHidden; ++h)
-    out[h] = (call->accumulate != 0 ? out[h] : 0.0f) + static_cast<float>(h) + static_cast<float>(x0) + sum;
-  std::lock_guard<std::mutex> guard(fake_mutex);
-  fake_calls.push_back(
-      {call->layer, std::vector<int32_t>(slots, slots + k), std::vector<float>(weights, weights + k), call->threads,
-       call->accumulate, call->engine});
-  return 0;
-}
+class FakeKernel final : public ce::CpuExpertKernel {
+ public:
+  struct Layer final : ce::CpuExpertLayer {
+    explicit Layer(const CpuExpertKernel& k) : CpuExpertLayer(k) {}
+  };
+  explicit FakeKernel(const char* name = "bench-fake") : name_(name) {}
+  const char* name() const noexcept override {
+    return name_;
+  }
+  std::unique_ptr<ce::CpuExpertLayer> make_layer(const ce::LayerSlabs&, std::span<const std::byte>) const override {
+    return std::make_unique<Layer>(*this);
+  }
+  void forward(const ce::CpuExpertLayer& layer, const ce::ForwardCall& c) const override {
+    if (&layer.kernel() != this) throw std::invalid_argument("bench fake: another kernel's layer");
+    uint16_t x0;
+    std::memcpy(&x0, c.x, 2);
+    float sum = 0.0f;
+    for (int32_t i = 0; i < c.k; ++i)
+      sum += c.weights[i] * static_cast<float>(c.slots[i] + 1);
+    for (int64_t h = 0; h < kSelfHidden; ++h)
+      c.out[h] = (c.accumulate ? c.out[h] : 0.0f) + static_cast<float>(h) + static_cast<float>(x0) + sum;
+    std::lock_guard<std::mutex> guard(mutex);
+    calls.push_back(
+        {std::vector<int32_t>(c.slots, c.slots + c.k),
+         std::vector<float>(c.weights, c.weights + c.k),
+         c.threads,
+         c.accumulate,
+         c.cores.empty() ? -1 : c.cores.front()});
+  }
+  void keep_warm(std::span<const int>, int32_t, const uint32_t*, uint32_t, int64_t) const override {}
+
+  mutable std::mutex mutex;
+  mutable std::vector<FakeCall> calls;
+
+ private:
+  const char* name_;
+};
 
 // The byte filling expert `expert`'s `name` slab row in row `row`'s image, so a landed slot identifies its source.
 uint8_t pattern(int64_t row, int64_t expert, int name) {
   return static_cast<uint8_t>(1 + row * 64 + expert * 6 + name);
 }
 
-// True when part 0 of an output row is fake_forward's result for the given x and weight sum.
+// True when part 0 of an output row is the fake kernel's result for the given x and weight sum.
 bool part0_is(const float* part0, float offset) {
   for (int64_t h = 0; h < kSelfHidden; ++h)
     if (part0[h] != static_cast<float>(h) + offset) return false;
@@ -546,7 +565,7 @@ bool part0_is(const float* part0, float offset) {
 }
 
 // Drives the real RamTier, RamThread, copy engine and CPU expert engine through DeviceSim: loading, SM hits, CPU hits,
-// split 0, and a hit with a miss in one post; checks the fake forward's inputs and outputs and the staging slots.
+// split 0, and a hit with a miss in one post; checks the fake kernel's inputs and outputs and the staging slots.
 void test_stack(const Placement& placement, const std::filesystem::path& dir) {
   if constexpr (w::Wire::kNodes != 1) return;  // one group's stack; test_two_groups builds the multi-group one
   const ImageLayout layout = image_layout({512, 512, 512, 512, 512, 512});
@@ -577,10 +596,11 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
   AlignedBuffer x = aligned_zeroed(kSelfRows * 2 * kSelfHidden);
   AlignedBuffer out = aligned_zeroed(kSelfRows * 2 * kSelfHidden * 4);
   auto* part0 = reinterpret_cast<float*>(out.get());  // row 0, part 0
+  FakeKernel fake;
   StackConfig config;
   config.rows = set;
   config.staging = 3;
-  config.forward = &fake_forward;
+  config.kernel = &fake;
   config.x_base = x.get();
   config.x_stride = 2 * kSelfHidden;
   config.out_base = out.get();
@@ -593,7 +613,6 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
   group.split = {0, 1, 2, 3, 4, 5, 6, 7, 8};
   config.groups.push_back(group);
   config.trace_capacity = 256;
-  fake_calls.clear();
   const int64_t timeout = 1'000'000'000;
   {
     PinScope writer(placement.writer);
@@ -621,10 +640,13 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
     SimRequest r = sim.post(0, two, halves, true, monotonic_ns() + timeout);
     CHECK(r.kinds[0] == int32_t(w::Wire::kKindHitSm) && r.kinds[1] == int32_t(w::Wire::kKindHitSm));
     CHECK(stack.wait_handled(r.seq, monotonic_ns() + timeout));
-    CHECK(fake_calls.empty());
+    {
+      std::lock_guard<std::mutex> guard(fake.mutex);
+      CHECK(fake.calls.empty());
+    }
 
     // Registered: split[3] = 3, every lane is the CPU's; one CPU job computes slots 2, 0, 1 into part 0.
-    stack.set_cpu_layer(0, kFakeHandle);
+    stack.set_cpu_layer(0, fake.make_layer({}, {}));
     sim.set_row_cpu(0);
     uint16_t mark = 100;
     std::memcpy(x.get(), &mark, 2);  // the post kernel's x store, before the record
@@ -637,13 +659,14 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
         r.kinds[2] == int32_t(w::Wire::kKindHitCpu));
     CHECK(sim.copy_wait(r, monotonic_ns() + timeout));
     {
-      std::lock_guard<std::mutex> guard(fake_mutex);
-      CHECK(fake_calls.size() == 1);
-      if (fake_calls.size() == 1) {
-        const FakeCall& call = fake_calls[0];
-        CHECK(call.layer == kFakeHandle && call.slots == std::vector<int32_t>({2, 0, 1}));
+      std::lock_guard<std::mutex> guard(fake.mutex);
+      CHECK(fake.calls.size() == 1);
+      if (fake.calls.size() == 1) {
+        const FakeCall& call = fake.calls[0];
+        CHECK(call.slots == std::vector<int32_t>({2, 0, 1}));
         CHECK(call.weights == std::vector<float>({0.5f, 0.25f, 0.125f}));
-        CHECK(call.threads == static_cast<int32_t>(placement.groups[0].workers.size()) && call.accumulate == 0);
+        CHECK(call.threads == static_cast<int32_t>(placement.groups[0].workers.size()) && !call.accumulate);
+        CHECK(call.core == placement.groups[0].workers.front());
       }
     }
     CHECK(part0_is(part0, 100.0f + 2.0f));  // 0.5 * 3 + 0.25 * 1 + 0.125 * 2
@@ -689,19 +712,23 @@ void test_stack(const Placement& placement, const std::filesystem::path& dir) {
       untouched = untouched && row1[i] == 0.0f;
     CHECK(untouched);
   }  // teardown: open the gate, stop the service, settle, stop the copy and CPU threads
-  CHECK(fake_calls.size() == 2);
+  CHECK(fake.calls.size() == 2);
 }
 
-// Two NUMA groups (Wire::kNodes == 2): each group's CPU lanes reach the forward with its own engine and only its own
-// slots, and each group's service thread runs on its own CPU.
-void test_two_groups(const Placement& placement, const std::filesystem::path& dir) {
-  if constexpr (w::Wire::kNodes != 2) {
-    return;
-  } else {
-    constexpr int64_t kGroup = 7;  // per group: 3 staging slots, 4 mappable
+// Two NUMA groups' synthetic rows, row images and pinned buffers (test_two_groups, test_groups_must_share_one_kernel):
+// per group 3 staging slots and 4 mappable; config() sends every eligible lane to the CPU.
+struct TwoGroupRig {
+  static constexpr int64_t kGroup = 7;
+  std::vector<std::array<AlignedBuffer, kNames>> slabs;
+  RowSet set;
+  AlignedBuffer x;
+  AlignedBuffer out;
+
+  TwoGroupRig(const std::filesystem::path& dir, const std::string& name)
+      : slabs(kSelfRows),
+        x(aligned_zeroed(kSelfRows * 2 * kSelfHidden)),
+        out(aligned_zeroed(kSelfRows * 4 * kSelfHidden * 4)) {  // two parts per group
     const ImageLayout layout = image_layout({512, 512, 512, 512, 512, 512});
-    std::vector<std::array<AlignedBuffer, kNames>> slabs(kSelfRows);
-    RowSet set;
     set.layout = layout;
     set.experts = kSelfExperts;
     set.capacity = 2 * kGroup;
@@ -712,7 +739,7 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
         bases[n] = slabs[row][n].get();
       }
       set.slabs.push_back(bases);
-      const auto path = dir / ("selftest2-layer-" + std::to_string(row) + ".rows");
+      const auto path = dir / (name + "-layer-" + std::to_string(row) + ".rows");
       write_row_image(
           path,
           layout,
@@ -724,28 +751,41 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
           "");
       set.paths.push_back(path.string());
     }
-    AlignedBuffer x = aligned_zeroed(kSelfRows * 2 * kSelfHidden);
-    AlignedBuffer out = aligned_zeroed(kSelfRows * 4 * kSelfHidden * 4);  // two parts per group
-    StackConfig config;
-    config.rows = set;
-    config.staging = 3;
-    config.forward = &fake_forward;
-    config.x_base = x.get();
-    config.x_stride = 2 * kSelfHidden;
-    config.out_base = out.get();
-    config.out_stride = 4 * kSelfHidden * 4;
-    config.hidden = kSelfHidden;
-    config.copy_cpu = placement.copy;
-    config.ranges = {{0, kGroup}, {kGroup, 2 * kGroup}};
+  }
+
+  StackConfig config(const Placement& placement, const ce::CpuExpertKernel& kernel) const {
+    StackConfig c;
+    c.rows = set;
+    c.staging = 3;
+    c.kernel = &kernel;
+    c.x_base = x.get();
+    c.x_stride = 2 * kSelfHidden;
+    c.out_base = out.get();
+    c.out_stride = 4 * kSelfHidden * 4;
+    c.hidden = kSelfHidden;
+    c.copy_cpu = placement.copy;
+    c.ranges = {{0, kGroup}, {kGroup, 2 * kGroup}};
     for (int g = 0; g < 2; ++g) {
       StackConfig::Group group;
       group.service_cpu = placement.groups[g].service;
       group.cores.assign(placement.groups[g].workers.begin(), placement.groups[g].workers.end());
-      group.engine = g + 1;
       group.split = {0, 1, 2, 3, 4, 5, 6, 7, 8};
-      config.groups.push_back(group);
+      c.groups.push_back(group);
     }
-    fake_calls.clear();
+    return c;
+  }
+};
+
+// Two NUMA groups (Wire::kNodes == 2): each group's CPU lanes reach the kernel on its own cores with only its own
+// slots, and each group's service thread runs on its own CPU.
+void test_two_groups(const Placement& placement, const std::filesystem::path& dir) {
+  if constexpr (w::Wire::kNodes != 2) {
+    return;
+  } else {
+    constexpr int64_t kGroup = TwoGroupRig::kGroup;
+    TwoGroupRig rig(dir, "selftest2");
+    FakeKernel fake;
+    StackConfig config = rig.config(placement, fake);
     PinScope writer(placement.writer);
     Stack<BenchBuild> stack(std::move(config));
     DeviceSim sim(stack.page(), stack.lease(), kSelfRows, kSelfExperts);
@@ -756,18 +796,20 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
     const int32_t home1[] = {1, 3};
     load_experts(sim, 0, home0, 3, soon());
     load_experts(sim, 0, home1, 3, soon());
-    stack.set_cpu_layer(0, kFakeHandle);
+    stack.set_cpu_layer(0, fake.make_layer({}, {}));
     sim.set_row_cpu(0);
     const float ones[] = {1.0f, 1.0f, 1.0f, 1.0f};
     const SimRequest r = sim.post(0, four, ones, /*captured=*/true, soon());
     CHECK(sim.copy_wait(r, soon()));
     {
-      std::lock_guard<std::mutex> guard(fake_mutex);
-      CHECK(fake_calls.size() == 2);  // one CPU-hit job per group
-      std::vector<int64_t> engines;
-      for (const FakeCall& call : fake_calls) {
-        engines.push_back(call.engine);
-        const int64_t g = call.engine - 1;
+      std::lock_guard<std::mutex> guard(fake.mutex);
+      CHECK(fake.calls.size() == 2);  // one CPU-hit job per group
+      std::vector<int64_t> groups;
+      for (const FakeCall& call : fake.calls) {
+        int64_t g = -1;
+        for (int candidate = 0; candidate < 2; ++candidate)
+          if (call.core == placement.groups[candidate].workers.front()) g = candidate;
+        groups.push_back(g);
         std::vector<int32_t> slots = call.slots;
         std::sort(slots.begin(), slots.end());
         // Each group's staging slots are the lowest of its range: experts {0, 2} (home 0) land in 0, 1 and {1, 3}
@@ -775,16 +817,32 @@ void test_two_groups(const Placement& placement, const std::filesystem::path& di
         CHECK(g == 0 || g == 1);
         CHECK(slots == std::vector<int32_t>({int32_t(g * kGroup), int32_t(g * kGroup + 1)}));
       }
-      std::sort(engines.begin(), engines.end());
-      CHECK(engines == std::vector<int64_t>({1, 2}));
+      std::sort(groups.begin(), groups.end());
+      CHECK(groups == std::vector<int64_t>({0, 1}));
     }
     // Group g's part 0 sits at floats [2 g hidden, (2 g + 1) hidden) of the row: the fake forward wrote
     // h + x[0] + sum(weight * (slot + 1)) there, 1 * (0 + 1) + 1 * (1 + 1) for group 0 and 1 * 8 + 1 * 9 for group 1.
-    const auto* row0 = reinterpret_cast<const float*>(out.get());
+    const auto* row0 = reinterpret_cast<const float*>(rig.out.get());
     CHECK(part0_is(row0, 3.0f));
     CHECK(part0_is(row0 + 2 * kSelfHidden, 17.0f));
     for (int g = 0; g < 2; ++g)
       CHECK(stack.group_counters(g)[es::kSpinCpu] == placement.groups[g].service);
+  }
+}
+
+// Review Focus 2: one tier runs one kernel. Group 1 naming a second kernel is refused while the stack is built, the
+// message naming both kernels. Runs only in the two-node build: BENCH kiface-bench-n2 gates it, kiface-bench (one node)
+// returns at once.
+void test_groups_must_share_one_kernel(const Placement& placement, const std::filesystem::path& dir) {
+  if constexpr (w::Wire::kNodes != 2) {
+    return;
+  } else {
+    TwoGroupRig rig(dir, "selftest-kernels");
+    FakeKernel first("fake-a"), second("fake-b");
+    StackConfig config = rig.config(placement, first);
+    config.groups[1].kernel = &second;
+    PinScope writer(placement.writer);
+    CHECK_THROWS(Stack<BenchBuild> stack(std::move(config)), "group 1 names fake-b, another group fake-a");
   }
 }
 
@@ -804,6 +862,7 @@ int run_self_test(const Placement& placement, const std::filesystem::path& image
   test_image_stamp(image_dir);
   test_stack(placement, image_dir);
   test_two_groups(placement, image_dir);
+  test_groups_must_share_one_kernel(placement, image_dir);
   std::fprintf(
       stderr, "self-test (%s): %d checks, %d failed\n", std::string(BenchBuild::kName).c_str(), checks, failures);
   return failures;
