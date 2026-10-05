@@ -3,6 +3,7 @@ a cold cache the child would compile them (50-100 s each, serialized by the JIT 
 measure the compiler. Observed 2026-10-04: nine ``run_host_script`` callers hit ``TimeoutExpired`` at 60 s under
 ``pytest -n 8`` after a flag change gave every module a new key."""
 
+import os
 import subprocess
 import sys
 
@@ -19,13 +20,14 @@ def _record(monkeypatch):
     monkeypatch.setattr(ops, "_host_module", lambda *args: events.append(("load", args)))
     monkeypatch.setattr(uring_file_reader, "_uring_file_reader_type", lambda: events.append(("load", ("uring_file_reader",))))
     monkeypatch.setattr(
-        fixtures.subprocess, "run", lambda *args, **kwargs: events.append(("spawn", args)) or subprocess.CompletedProcess(args, 0)
+        fixtures.subprocess, "run", lambda *args, **kwargs: events.append(("spawn", args, kwargs))
+        or subprocess.CompletedProcess(args, 0, stdout="HOTPATH-COUNTS {}")
     )
     return events
 
 
 def _loads(events):
-    return [args for kind, args in events if kind == "load"]
+    return [event[1] for event in events if event[0] == "load"]
 
 
 def _host_loads(events):
@@ -35,7 +37,7 @@ def _host_loads(events):
 def test_run_host_script_loads_the_childs_host_module_before_spawning_it(monkeypatch, tmp_path):
     events = _record(monkeypatch)
     fixtures.run_host_script(tmp_path, "print('reached')")
-    assert [kind for kind, _ in events].count("spawn") == 1
+    assert [event[0] for event in events].count("spawn") == 1
     assert events[-1][0] == "spawn", events  # every load precedes the timed child
     assert ("exl3", fixtures.HOST_SCRIPT_VARIANT, fixtures.HOST_SCRIPT_LANES, 1) in _loads(events)
 
@@ -76,7 +78,7 @@ def test_an_aborting_child_is_not_asked_to_write_a_core_file():
 def test_run_host_script_children_disable_core_dumps(monkeypatch, tmp_path):
     events = _record(monkeypatch)
     fixtures.run_host_script(tmp_path, "print('reached')")
-    script = next(args for kind, args in events if kind == "spawn")[0][2]
+    script = next(event[1] for event in events if event[0] == "spawn")[0][2]
     assert script.startswith(fixtures.NO_CORE_DUMP)
 
 
@@ -95,3 +97,17 @@ def test_spawn_child_warms_then_spawns_a_child_with_core_dumps_off(monkeypatch, 
     assert events[-1][0] == "spawn" and ("exl3", "instr", 8, 2) in _loads(events)
     argv = events[-1][1][0]
     assert argv[1:3] == ["-c", fixtures.NO_CORE_DUMP + "print(1)"] and argv[3:] == [str(tmp_path), "7"]
+
+
+def test_the_hotpath_shim_child_is_warmed_and_core_dump_free_with_the_shim_preloaded(monkeypatch, tmp_path):
+    """The warm-up runs in this process, which has no preload; only the child gets LD_PRELOAD."""
+    from sglang.test import hotpath_shim
+
+    events = _record(monkeypatch)
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    hotpath_shim.run_child(tmp_path / "shim.so", variant="instr", tmp=tmp_path)
+    kind, args, kwargs = events[-1]
+    assert kind == "spawn" and ("exl3", "instr", 8, 1) in _loads(events)
+    assert args[0][2].startswith(fixtures.NO_CORE_DUMP)
+    assert kwargs["env"]["LD_PRELOAD"] == str(tmp_path / "shim.so")
+    assert "LD_PRELOAD" not in os.environ
