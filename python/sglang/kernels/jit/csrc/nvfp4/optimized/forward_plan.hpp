@@ -2,8 +2,7 @@
 // quantize_block; dot_rows<I, M> from math_scalar.hpp and math_avx2.hpp) and kChunkRows.
 //
 // One forward = ForwardPlan<Shape, I>::run. Shape (shapes.hpp) fixes what the plan may assume about the layer; I is the
-// dot product's tier, the one ExpertForward detected at run time. The primary PlanTraits is the generic plan's;
-// PlanTraits<MimoV26ProShape, Isa::Avx2> is MiMo V2.6 Pro's at the AVX2 tier.
+// dot product's tier, the one ExpertForward detected at run time.
 //
 // A call's routes are grouped by slot into units, one per (token, slot), and units into chunks of up to kChunkRows of
 // one slot, so dot_rows decodes each weight row once per chunk. Each token's output is still its own routes' sum in
@@ -46,7 +45,8 @@ struct Chunk
 
 struct ForwardCtx
 {
-    const Nvfp4Quant::Layer* layer;
+    const ExpertLayer* layer;
+    Nvfp4Quant::Params params;
     const uint8_t* x;  // fp16 [rows][hidden], possibly unaligned
     float* out;        // fp32 [rows][hidden]
     int rows;
@@ -94,22 +94,11 @@ struct ForwardArena
     }
 };
 
-// What a (Shape, ISA) plan sets. The primary template is the generic plan.
-template <class Shape, Isa I>
-struct PlanTraits
-{
-    static constexpr int kRowUnit = 16;  // output rows per split unit: 16 fp32 outputs fill one cache line
-};
-
-// MiMo V2.6 Pro at the AVX2 tier: the shape's constants make every loop bound, sf_index group count and row stride a
-// compile-time value inside the AVX2 entries (gate_up_avx2, down_avx2, which inline the dot product), and the SwiGLU
-// clamp compiles away. kRowUnit 16 splits 2048 gate/up rows into 128 units and
-// 6144 down rows into 384, both even over 16 workers.
-template <>
-struct PlanTraits<MimoV26ProShape, Isa::Avx2>
-{
-    static constexpr int kRowUnit = 16;
-};
+// Output rows per split unit: 16 fp32 outputs fill one cache line. At MiMo V2.6 Pro's shape it splits 2048 gate/up
+// rows into 128 units and 6144 down rows into 384, both even over 16 workers. That shape's plan gains from the Shape's
+// constants alone: every loop bound, sf_index group count and row stride is a compile-time value inside the AVX2
+// entries (gate_up_avx2, down_avx2, which inline the dot product), and the SwiGLU clamp compiles away.
+constexpr int kRowUnit = 16;
 
 // Worker `worker`'s contiguous share [first, last) of `total` items, cut on multiples of Unit.
 template <int Unit>
@@ -122,16 +111,15 @@ std::pair<int64_t, int64_t> share(int64_t total, int worker, int workers)
 template <class Shape, Isa I>
 struct ForwardPlan
 {
-    using Traits = PlanTraits<Shape, I>;
-
     // Runs the call's routes through layer l on c.threads workers (the caller is worker 0). Returns 0, or 2 when Q8_0
     // cannot represent an input or an intermediate (out is then untouched). Throws when the team is short or a worker
     // cannot be pinned.
-    static int run(const Nvfp4Quant::Layer& l, const ForwardCall& c, const RouteTable& r)
+    static int run(const ExpertLayer& l, const Nvfp4Quant::Params& p, const ForwardCall& c, const RouteTable& r)
     {
         ForwardArena& ar = ForwardArena::get();
         ForwardCtx ctx;
         ctx.layer = &l;
+        ctx.params = p;
         ctx.x = static_cast<const uint8_t*>(c.x);
         ctx.out = c.out;
         ctx.rows = c.rows;
@@ -154,7 +142,7 @@ struct ForwardPlan
 private:
     // Groups the live routes into units and chunks, and binds each chunk's projections and scaled alphas and each
     // route's unit and down alpha; the team reads only these.
-    static void bind_routes(ForwardCtx& c, const Nvfp4Quant::Layer& l, ForwardArena& ar)
+    static void bind_routes(ForwardCtx& c, const ExpertLayer& l, ForwardArena& ar)
     {
         const RouteTable& r = c.routes;
         if (ar.binding.size() < size_t(r.rows) * r.k) ar.binding.resize(size_t(r.rows) * r.k);
@@ -171,13 +159,13 @@ private:
             const bool same_slot = i && ar.refs[i - 1].slot == ref.slot;
             if (!same_slot || ar.refs[i - 1].token != ref.token) {
                 if (!same_slot || ar.chunk.back().units == kChunkRows) {
-                    const Nvfp4Quant::Row row = Nvfp4Quant::decode(l.slabs.slot_bases<Nvfp4Quant::kSlabs>(ref.slot).data(), l);
+                    const Nvfp4Quant::Expert e = Nvfp4Quant::expert(l[ref.slot]);
                     Chunk ch;
-                    ch.gate = row.gate;
-                    ch.up = row.up;
-                    ch.down = row.down;
-                    ch.gate_alpha = ch.gate.alpha * c.layer->inv_input_scale13;
-                    ch.up_alpha = ch.up.alpha * c.layer->inv_input_scale13;
+                    ch.gate = e.gate;
+                    ch.up = e.up;
+                    ch.down = e.down;
+                    ch.gate_alpha = e.gate.alpha * c.params.inv_input_scale13;
+                    ch.up_alpha = e.up.alpha * c.params.inv_input_scale13;
                     ch.unit0 = int(ar.unit_token.size());
                     ch.units = 0;
                     ar.chunk.push_back(ch);
@@ -187,7 +175,7 @@ private:
             }
             RouteBinding& b = ar.binding[size_t(ref.token) * r.k + ref.index];
             b.unit = int(ar.unit_token.size()) - 1;
-            b.down_alpha = ar.chunk.back().down.alpha * c.layer->inv_input_scale2 * r.route(ref.token, ref.index).weight;
+            b.down_alpha = ar.chunk.back().down.alpha * c.params.inv_input_scale2 * r.route(ref.token, ref.index).weight;
         }
         c.binding = ar.binding.data();
         c.chunk = ar.chunk.data();
@@ -244,7 +232,7 @@ private:
             const Chunk& ch = c.chunk[row / N];
             const int i = int(row % N);
             int gate_row, up_row;
-            w13_rows(c.layer->w13_layout, N, i, gate_row, up_row);
+            w13_rows(c.params.w13_layout, N, i, gate_row, up_row);
             const block_q8_0* xs[kChunkRows];
             for (int j = 0; j < ch.units; ++j) xs[j] = c.qx + size_t(c.unit_token[ch.unit0 + j]) * (Hp / 32);
             float g[kChunkRows], u[kChunkRows];
@@ -326,7 +314,7 @@ private:
                 else quantize_block(xf + b * 32, c.qx[gb]);
             }
         } else if constexpr (P == Phase::GateUp) {
-            const auto [r0, r1] = share<Traits::kRowUnit>(int64_t(c.chunks) * N, worker, workers);
+            const auto [r0, r1] = share<kRowUnit>(int64_t(c.chunks) * N, worker, workers);
             if constexpr (I == Isa::Avx2) gate_up_avx2(c, r0, r1);
             else gate_up_rows(c, r0, r1);
         } else if constexpr (P == Phase::Middle) {
@@ -340,7 +328,7 @@ private:
         } else {
             static_assert(P == Phase::Down);
             float* partial = c.partial + size_t(worker) * c.partial_stride;
-            const auto [h0, h1] = share<Traits::kRowUnit>(H, worker, workers);
+            const auto [h0, h1] = share<kRowUnit>(H, worker, workers);
             if constexpr (I == Isa::Avx2) down_avx2(c, partial, h0, h1);
             else down_rows(c, partial, h0, h1);
         }

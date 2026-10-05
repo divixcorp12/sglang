@@ -39,20 +39,17 @@ Standalone CPU library on divix01 (no CUDA compilation):
     --cxx /opt/rh/gcc-toolset-15/root/usr/bin/g++ \
     --output /data/models/exl3_exp/clean_integration/sglang/libexl3_cpu.so
 
-Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP and use moe_mul1.h, upstream's ATen
-layer-registration API (exl3_moe_cpu_make_layer, one tensor per expert and projection; exl3_moe_cpu_forward and
-exl3_moe_cpu_free_layer). A handle is its layer's address, owned by the caller until it frees it once; an unknown or
-freed handle is undefined, and upstream's child worker (moe_handoff.cu, which names layers by registration index) does
-not run against this kernel. Packed matrix tensors must remain alive for the registered layer's lifetime. A forward
-runs the kernel's check, then the kernel, and raises when the call is refused (a slot outside the layer, a non-finite
-weight, rows or top_k out of range), leaving out untouched.
+Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP and use kernel.h: the kernel's make_layer over the
+experts' slabs, then check and forward (below). moe_mul1.h's upstream per-expert tensor API (exl3_moe_cpu_make_layer,
+exl3_moe_cpu_forward, exl3_moe_cpu_free_layer) is declared for upstream's bindings only and refuses when called.
 
 The service side is the library's kernel, a CpuExpertKernel (expert_stream/host/cpu_experts/kernel.hpp) behind its
 accessor exl3_cpu_kernel() (kernel.h, hidden: never interposed across libraries). Python reaches it through the
 optimized extension's torch op sglang_exl3_cpu::kernel_address (torch_ops.cpp), and the expert-stream host makes each
 streamed layer with the kernel's make_layer (ExpertStreamHost.set_cpu_layer) from a CpuExpertLayerSpec
 (Exl3CpuQuantTrait.layer_spec): the pinned tier's six slab base pointers and per-slot strides, with SglangExl3CpuParams
-(bits, swizzled; kernel.h) as its params bytes, packed by the torch op sglang_exl3_cpu::params. A layer keeps views: the caller keeps the slabs alive. Every forward and
+(bits, swizzled; kernel.h) as its params bytes, packed by the torch op sglang_exl3_cpu::params. A layer (ExpertLayer,
+kernel.hpp) is a value of views with its params stored in it: the caller keeps the slabs alive. Every forward and
 keep-warm carries its worker cores (distinct, in [0, CPU_SETSIZE)); a core that cannot be pinned fails the call. A
 refused call throws std::invalid_argument and a failed one another std::exception, leaving out untouched.
 
@@ -94,10 +91,11 @@ The tier is min(host, EXL3_MOE_CPU_MAX_ISA), read at the first forward or tier q
 picked once per call in Exl3Quant::dispatch: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on
 an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one
 specialization: compact scratch, grouped traversal, wide single-expert quantization. A plan reads every layer fact
-through its Shape (shapes.hpp): GenericShape from the layer's LayerSlabs (and gated), Dsv41Shape as compile-time constants
-(5120/2304, 3-bit, gated SiLU, activation limit 10; a layer with any other value takes the generic plan). Plans
-read experts through an accessor (quant.hpp): TableExperts over make_layer's per-expert
-tables, or StridedExperts<Shape> over the kernel's make_layer slab bases and strides.
+through its Shape (shapes.hpp): GenericShape from the ExpertLayer, Dsv41Shape as compile-time constants (5120/2304,
+3-bit unswizzled, activation limit 10; a layer with any other value takes the generic plan). Every layer is gated SiLU.
+Plans read experts through Experts<Shape> (quant.hpp): slot e's gate, up and down, each a MoeCpuMatrix over the slot's
+ExpertRow. Exl3Quant::dispatch groups the call's routes by expert itself (a sort of the call's live routes), which fixes
+the accumulation order.
 
 Bit-exact checks for any change here: test/manual/dsv41/run_exl3_cpu_forward_checks.sh (A/B dumps per ISA tier
 against the merge-base, the bare and full-stack benches' frozen references, the CPU expert pool tests).

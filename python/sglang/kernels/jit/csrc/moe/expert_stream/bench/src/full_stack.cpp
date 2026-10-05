@@ -204,7 +204,7 @@ StackConfig stack_config(const StackFixture& f, const Placement& p, const Option
 
 // The bare forwards' layers, made before the stack exists (BM_bare runs first); the stack gets its own per row.
 struct BareLayers {
-  std::vector<std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer>> layers;
+  std::vector<::sglang::cpu_experts::ExpertLayer> layers;
 };
 
 // One timed request: t0 is taken before the x store, t1 when CopyDone is seen.
@@ -366,7 +366,7 @@ class Bench {
     call.accumulate = false;
     call.cores = placement_.groups[group].workers;
     try {
-      ::sglang::exl3_cpu::exl3_cpu_kernel().forward(*bare_layers_.layers[static_cast<size_t>(row)], call);
+      ::sglang::exl3_cpu::exl3_cpu_kernel().forward(bare_layers_.layers[static_cast<size_t>(row)], call);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string("the bare CPU forward failed: ") + e.what());
     }

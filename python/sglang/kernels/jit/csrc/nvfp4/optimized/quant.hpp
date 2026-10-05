@@ -1,12 +1,13 @@
-// Nvfp4Quant: the NVFP4 CPU expert quant for ExpertForward (host/cpu_experts/expert_forward.hpp), with the layer facts
-// and slot projections a forward reads. The arithmetic is math.hpp's and its tiers' (math_scalar.hpp, math_avx2.hpp);
-// kernel.cpp includes forward_plan.hpp and defines Nvfp4Quant::dispatch after it.
+// Nvfp4Quant: the NVFP4 CPU expert quant for ExpertForward (host/cpu_experts/expert_forward.hpp), and its typed view of
+// an expert slot (Expert: three Projections over the slot's ExpertRow). The arithmetic is math.hpp's and its tiers'
+// (math_scalar.hpp, math_avx2.hpp); kernel.cpp includes forward_plan.hpp and defines Nvfp4Quant::dispatch after it.
 #pragma once
 #if !defined(__linux__) || !defined(_OPENMP)
 #error The NVFP4 CPU expert kernel requires Linux and OpenMP.
 #endif
 #include "../upstream/kernels.h"
 #include "../../moe/expert_stream/host/cpu_experts/expert_forward.hpp"
+#include "../../moe/expert_stream/host/cpu_experts/routes.hpp"
 #include "kernel.h"
 #include <algorithm>
 #include <array>
@@ -37,24 +38,18 @@ inline size_t sf_index(int row, int group, int groups) {
 // The layer's slabs, in the slab order of SglangNvfp4CpuParams' comment.
 enum SlabName { kW13, kW2, kSf13, kSf2, kGateAlpha, kDownAlpha, kUpAlpha, kSlabNames };
 static_assert(kW13 == 0 && kSf13 == 2 && kGateAlpha == 4 && kUpAlpha == 6 && kSlabNames == 7,
-              "SlabName indexes LayerSlabs::slabs in the quant's slab order");
+              "SlabName indexes ExpertLayer::slabs and ExpertRow::slab in the quant's slab order");
 
 // The fewest bytes one slot's row of each slab holds: packed E2M1 weights (two per byte), E4M3 scales in the GPU's
 // 128x4 swizzle (rows padded to 128, scale groups to 4), one fp32 alpha. Registration refuses a smaller stride.
-struct SlabRowBytes
+constexpr std::array<uint64_t, kSlabNames> row_bytes(int hidden, int intermediate)
 {
-    uint64_t bytes[kSlabNames];
-
-    static constexpr SlabRowBytes of(int hidden, int intermediate)
-    {
-        const uint64_t h = uint64_t(hidden), n = uint64_t(intermediate);
-        return {{n * h, h * n / 2, rounded(2 * n, 128) * rounded(h / 16, 4), rounded(h, 128) * rounded(n / 16, 4),
-                 4, 4, 4}};
-    }
-};
+    const uint64_t h = uint64_t(hidden), n = uint64_t(intermediate);
+    return {n * h, h * n / 2, rounded(2 * n, 128) * rounded(h / 16, 4), rounded(h, 128) * rounded(n / 16, 4), 4, 4, 4};
+}
 // The sanitizer harness's 80 x 80 layer (test/registered/unit/kernels/nvfp4_cpu_sanitizer.cpp) registers exactly these.
-static_assert(SlabRowBytes::of(80, 80).bytes[kW13] == 80 * 80 && SlabRowBytes::of(80, 80).bytes[kW2] == 80 * 80 / 2);
-static_assert(SlabRowBytes::of(80, 80).bytes[kSf13] == 256 * 8 && SlabRowBytes::of(80, 80).bytes[kSf2] == 128 * 8);
+static_assert(row_bytes(80, 80)[kW13] == 80 * 80 && row_bytes(80, 80)[kW2] == 80 * 80 / 2);
+static_assert(row_bytes(80, 80)[kSf13] == 256 * 8 && row_bytes(80, 80)[kSf2] == 128 * 8);
 
 // One projection of one slot: packed E2M1 rows, their swizzled E4M3 scales, and the slot's fp32 GPU GEMM alpha. Gate
 // and up share the w13 rows (w13_rows maps an output to its row); down's rows are its own.
@@ -65,7 +60,7 @@ struct Projection
     float alpha;
 };
 
-// The w13 rows holding gate and up output i of n, per Nvfp4Quant::Layer::w13_layout.
+// The w13 rows holding gate and up output i of n, per SglangNvfp4CpuParams::w13_layout.
 inline void w13_rows(int layout, int n, int i, int& gate, int& up)
 {
     gate = i;
@@ -86,7 +81,7 @@ struct Nvfp4Quant
 {
     static constexpr const char* kName = "nvfp4";
     static constexpr int kSlabs = kSlabNames;
-    static constexpr uint32_t kOptionalSlabs = 1u << kUpAlpha;
+    static constexpr uint32_t kOptionalSlabs = 1u << kUpAlpha;  // absent: up shares the gate alpha
     static constexpr int kMaxRoutes = 8;      // the forward's k limit
     static constexpr int kMaxRows = 1 << 16;  // the forward's rows limit; arbitrary, it keeps every scratch index in range
     // The library holds both tiers and runs min(host, NVFP4_CPU_MAX_ISA): AVX2 on an AVX2/FMA host, else scalar.
@@ -95,68 +90,52 @@ struct Nvfp4Quant
     static constexpr const char* kIsaReportEnv = "NVFP4_CPU_REPORT_ISA";
     using Params = SglangNvfp4CpuParams;
 
-    // One slot's three projections. The slabs are read through the slot's bases, nothing stored per slot.
-    struct Row
+    // One expert slot read as NVFP4: its three projections, over its ExpertRow.
+    struct Expert
     {
         Projection gate, up, down;
     };
 
-    // The descriptor as made (capacity; hidden: columns of gate/up, rows of down; intermediate: rows of gate and of
-    // up, columns of down; act_limit, 0: no clamp; the slabs), and SglangNvfp4CpuParams.
-    struct Layer
+    static Expert expert(const ExpertRow& r)
     {
-        LayerSlabs slabs;
-        int w13_layout;           // 0 [gate, up], 1 [up, gate], 2 alternating 64-row [up, gate] chunks
-        float inv_input_scale13;  // cancels an activation scale folded into the GPU gate/up alphas
-        float inv_input_scale2;   // the same for down
-        bool up_alpha;            // slab kUpAlpha is registered; else up shares the gate alpha
-    };
-
-    static std::array<uint64_t, kSlabs> min_slot_bytes(const LayerSlabs& d, const Params&)
-    {
-        const SlabRowBytes minimum = SlabRowBytes::of(d.hidden, d.intermediate);
-        std::array<uint64_t, kSlabs> bytes;
-        std::copy(std::begin(minimum.bytes), std::end(minimum.bytes), bytes.begin());
-        return bytes;
+        const float gate_alpha = alpha_at(r.slab[kGateAlpha]);
+        return {{r.slab[kW13], r.slab[kSf13], gate_alpha},
+                {r.slab[kW13], r.slab[kSf13], r.slab[kUpAlpha] ? alpha_at(r.slab[kUpAlpha]) : gate_alpha},
+                {r.slab[kW2], r.slab[kSf2], alpha_at(r.slab[kDownAlpha])}};
     }
 
-    // The descriptor's scalars and the parameters; ExpertForward checks the slabs against min_slot_bytes.
-    static int validate(const LayerSlabs& d, const Params* p)
+    static std::array<uint64_t, kSlabs> row_bytes(const ExpertLayer& l, const Params&)
     {
-        if (!p || d.hidden < 16 || d.intermediate < 16 || d.hidden > (1 << 20) || d.intermediate > (1 << 20)
-            || d.hidden % 16 || d.intermediate % 16 || p->w13_layout < 0 || p->w13_layout > 2
-            || (p->w13_layout == 2 && d.intermediate % 64) || d.activation != 0 || !std::isfinite(d.act_limit)
-            || d.act_limit < 0 || !std::isfinite(p->inv_input_scale13) || p->inv_input_scale13 <= 0
-            || !std::isfinite(p->inv_input_scale2) || p->inv_input_scale2 <= 0)
-            return 2;
-        return 0;
+        return ::sglang::nvfp4_cpu::row_bytes(l.hidden, l.intermediate);
     }
 
-    static Layer make_layer(const LayerSlabs& d, const Params* p)
+    // The layer's shape and the parameters (ExpertForward checks the slabs against row_bytes): hidden (columns of
+    // gate/up, rows of down) and intermediate (rows of gate and of up, columns of down) multiples of 16, gated SiLU,
+    // act_limit 0 (no clamp) or a finite clamp.
+    static const char* validate(const ExpertLayer& l, Params& p)
     {
-        return {d, p->w13_layout, p->inv_input_scale13, p->inv_input_scale2, d.slabs[kUpAlpha] != nullptr};
+        if (l.hidden < 16 || l.intermediate < 16 || l.hidden > (1 << 20) || l.intermediate > (1 << 20)
+            || l.hidden % 16 || l.intermediate % 16)
+            return "hidden and intermediate must be multiples of 16 in [16, 2^20]";
+        if (p.w13_layout < 0 || p.w13_layout > 2 || (p.w13_layout == 2 && l.intermediate % 64))
+            return "w13_layout must be 0, 1 or 2 (2 needs intermediate % 64 == 0)";
+        if (l.activation != 0 || !std::isfinite(l.act_limit) || l.act_limit < 0)
+            return "the activation must be gated SiLU with a finite, non-negative act_limit";
+        if (!std::isfinite(p.inv_input_scale13) || p.inv_input_scale13 <= 0 || !std::isfinite(p.inv_input_scale2)
+            || p.inv_input_scale2 <= 0)
+            return "the inverse input scales must be finite and positive";
+        return nullptr;
     }
 
     // A routed slot's alphas must be finite.
-    static int check_slot(const Layer& l, int slot)
+    static bool usable(const ExpertLayer& l, const Params&, int slot)
     {
-        const LayerSlabs& s = l.slabs;
-        return std::isfinite(alpha_at(s.slot(kGateAlpha, slot))) && std::isfinite(alpha_at(s.slot(kDownAlpha, slot)))
-                       && (!l.up_alpha || std::isfinite(alpha_at(s.slot(kUpAlpha, slot))))
-                   ? 0
-                   : 2;
-    }
-
-    static Row decode(const uint8_t* const* base, const Layer&)
-    {
-        const float gate_alpha = alpha_at(base[kGateAlpha]);
-        return {{base[kW13], base[kSf13], gate_alpha},
-                {base[kW13], base[kSf13], base[kUpAlpha] ? alpha_at(base[kUpAlpha]) : gate_alpha},
-                {base[kW2], base[kSf2], alpha_at(base[kDownAlpha])}};
+        const Expert e = expert(l[slot]);
+        return std::isfinite(e.gate.alpha) && std::isfinite(e.up.alpha) && std::isfinite(e.down.alpha);
     }
 
     // Defined in kernel.cpp after forward_plan.hpp.
-    static int dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa);
+    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa);
 };
 
 }  // namespace

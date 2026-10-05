@@ -33,7 +33,7 @@ int main()
     std::vector<float> slab(hidden * capacity);
     for (int i = 0; i < hidden * capacity; ++i) slab[i] = float(i);
     const float scale = 1.0f;
-    LayerSlabs d;
+    ExpertLayer d;
     d.capacity = capacity;
     d.hidden = hidden;
     d.intermediate = hidden;
@@ -41,8 +41,8 @@ int main()
     d.slabs[0] = slab.data();
     d.slot_bytes[0] = hidden * 4;
     const auto params = std::as_bytes(std::span<const float>(&scale, 1));
-    std::unique_ptr<CpuExpertLayer> layer = a.make_layer(d, params);
-    CHECK(&layer->kernel() == &a);
+    const ExpertLayer layer = a.make_layer(d, params);
+    CHECK(layer.kernel == &a);
 
     std::vector<uint16_t> x(hidden);
     const int32_t slot = 1;
@@ -56,15 +56,15 @@ int main()
     c.slots = &slot;
     c.weights = &weight;
     c.out = out.data();
-    a.forward(*layer, c);
+    a.forward(layer, c);
     for (int h = 0; h < hidden; ++h) CHECK(out[h] == float(hidden + h));
 
     // Library b refuses library a's layer: its std::invalid_argument reaches this executable's catch.
     std::fill(out.begin(), out.end(), 7.0f);
     bool refused = false;
     try {
-        b.check(*layer, c);
-        b.forward(*layer, c);
+        b.check(layer, c);
+        b.forward(layer, c);
     } catch (const std::invalid_argument& e) {
         // b's refusal names both kernels: itself ("toy_b CPU experts: ...") and the layer's ("kernel toy_a").
         refused = std::strstr(e.what(), "toy_b") != nullptr && std::strstr(e.what(), "kernel toy_a") != nullptr;
@@ -78,7 +78,6 @@ int main()
         refused = true;
     }
     CHECK(refused);
-    layer.reset();  // the deleting destructor runs in library a
     std::printf("ok cross_library\n");
     return 0;
 }

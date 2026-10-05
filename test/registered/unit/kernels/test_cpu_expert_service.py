@@ -172,7 +172,7 @@ def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
     spec = trait.layer_spec(slabs, CAP)
     names = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
     trellis = H * INTER * 3 // 8  # bytes of one 3-bit [k/16, n/16, 48] trellis
-    row_bytes = [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]  # quant.hpp's SlabRowBytes
+    row_bytes = [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]  # quant.hpp's row_bytes
     assert spec.slabs == tuple(zip([slabs[n].data_ptr() for n in names], row_bytes))
     assert (spec.capacity, spec.hidden, spec.intermediate, spec.act_limit, spec.activation) == (CAP, H, INTER, 10.0, 0)
     assert spec.params == b"bits=3 swizzled=1"

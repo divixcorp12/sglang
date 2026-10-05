@@ -122,7 +122,7 @@ struct Layer {
     std::array<std::vector<uint8_t>,7> slabs;
     std::vector<uint16_t> x;
     SglangNvfp4CpuParams params{};
-    std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> layer;  // the kernel's, over the slabs above
+    ::sglang::cpu_experts::ExpertLayer layer;  // the kernel's, over the slabs above
 };
 struct Fixture {
     Header h;
@@ -178,7 +178,7 @@ struct Fixture {
         for (auto& layer:layers) {
             auto& params=layer->params;
             params.w13_layout=int32_t(h.layout); params.inv_input_scale13=h.inv13; params.inv_input_scale2=h.inv2;
-            ::sglang::cpu_experts::LayerSlabs d;
+            ::sglang::cpu_experts::ExpertLayer d;
             d.capacity=h.capacity; d.hidden=h.hidden;
             d.intermediate=h.intermediate; d.act_limit=h.limit; d.slab_count=7;
             for (int i=0;i<7;++i) {
@@ -323,7 +323,7 @@ struct Workload {
         call.slots=slots.data(); call.weights=routes.data(); call.out=out.data();
         call.k=experts; call.threads=o.workers; call.cores=g_cores;
         try {
-            ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().forward(*f.layers[layer]->layer,call);
+            ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().forward(f.layers[layer]->layer,call);
         } catch (const std::exception& e) {
             throw std::runtime_error(std::string("CPU expert forward failed: ")+e.what());
         }

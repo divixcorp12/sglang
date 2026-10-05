@@ -704,24 +704,24 @@ class RamTier {
   // Installs `row`'s layer, made by the enabled kernel, for every group's engine: the layer addresses the whole slab,
   // so one serves them all. Any time, once per row; until then no post types a CPU lane for the row. The layer must
   // hold every slot of the row (make_cpu_layer checks it): forwards take the tier's slots unchecked.
-  void set_cpu_layer(int64_t row, std::unique_ptr<cpu_experts::CpuExpertLayer> layer) {
+  void set_cpu_layer(int64_t row, const cpu_experts::ExpertLayer& layer) {
     if (cpu_kernel_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
     check_cpu_layer_row(row);
-    if (layer == nullptr || &layer->kernel() != cpu_kernel_)
+    if (layer.kernel != cpu_kernel_)
       throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer must come from the enabled kernel");
-    if (!cpu_layers_->set(row, std::move(layer)))
+    if (!cpu_layers_->set(row, layer))
       throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer is registered once");
   }
 
-  // set_cpu_layer of the enabled kernel's make_layer over `d` and `params` (its std::invalid_argument propagates).
-  void make_cpu_layer(int64_t row, const cpu_experts::LayerSlabs& d, std::span<const std::byte> params) {
+  // set_cpu_layer of the enabled kernel's make_layer over `shape` and `params` (its std::invalid_argument propagates).
+  void make_cpu_layer(int64_t row, const cpu_experts::ExpertLayer& shape, std::span<const std::byte> params) {
     if (cpu_kernel_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
     check_cpu_layer_row(row);
-    if (d.capacity < row_capacity(row))
+    if (shape.capacity < row_capacity(row))
       throw std::runtime_error(
           error_prefix<Layout>() + "CPU expert layer for row " + std::to_string(row) + " holds " +
-          std::to_string(d.capacity) + " slots, the row " + std::to_string(row_capacity(row)));
-    set_cpu_layer(row, cpu_kernel_->make_layer(d, params));
+          std::to_string(shape.capacity) + " slots, the row " + std::to_string(row_capacity(row)));
+    set_cpu_layer(row, cpu_kernel_->make_layer(shape, params));
   }
 
   const cpu_experts::CpuExpertKernel* cpu_kernel() const {

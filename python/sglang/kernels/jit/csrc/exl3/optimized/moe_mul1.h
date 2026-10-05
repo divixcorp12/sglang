@@ -64,16 +64,13 @@ int64_t exl3_moe_cpu_make_layer
 
 void exl3_moe_cpu_free_layer(int64_t handle);
 
-// Run the routed experts for one forward:
+// Run the routed experts for one forward (upstream's contract):
 //   x:        [m, hidden] fp16, CPU
-//   selected: [m, top_k] int64, CPU (global expert ids; -1 skips, any other id outside the layer is an error)
-//   weights:  [m, top_k] fp16, CPU (finite)
+//   selected: [m, top_k] int64, CPU (global expert ids; -1 skips)
+//   weights:  [m, top_k] fp16, CPU
 //   out:      [m, hidden] fp32, CPU (overwritten)
-// Tokens are grouped by expert; each expert runs gate/up GEMVs,
-// the activation, and the down GEMV, accumulating routing-weighted rows into out. Threaded over
-// an OpenMP team; the caller should release the GIL around this. Runs through the kernel's forward
-// (exl3_cpu_kernel(), kernel.h), so its limits apply (m <= 65536, top_k <= 32) and a refused call
-// raises.
+// This build's kernel takes slab layers only (exl3_cpu_kernel(), kernel.h): exl3_moe_cpu_make_layer, its forwards and
+// free_layer refuse, and exist so upstream's bindings link.
 void exl3_moe_cpu_forward
 (
     int64_t handle,
@@ -84,8 +81,7 @@ void exl3_moe_cpu_forward
     int64_t num_threads
 );
 
-// Raw-pointer variant used by the persistent worker (moe_handoff.cu): same computation as
-// exl3_moe_cpu_forward, expert selection as int32, buffers caller-owned
+// Raw-pointer variant used by upstream's persistent worker (moe_handoff.cu); refuses, as above
 void exl3_moe_cpu_forward_raw
 (
     int64_t handle,

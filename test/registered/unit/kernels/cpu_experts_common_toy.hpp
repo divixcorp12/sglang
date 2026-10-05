@@ -2,6 +2,7 @@
 // out[t][h] (+)= sum over routes of weight * scale * slab[slot][h]. TOY_TOP_ISA picks kTopIsa (default Avx2).
 #pragma once
 #include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/expert_forward.hpp"
+#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/routes.hpp"
 #include <atomic>
 #include <cmath>
 #include <thread>
@@ -29,18 +30,15 @@ struct ToyQuant {
     static constexpr const char* kIsaCapEnv = "TOY_CPU_MAX_ISA";
     static constexpr const char* kIsaReportEnv = "TOY_CPU_REPORT_ISA";
     using Params = ToyParams;
-    struct Row { const float* v; };
-    struct Layer { LayerSlabs slabs; float scale; };
-    static std::array<uint64_t, 1> min_slot_bytes(const LayerSlabs& d, const Params&)
-    { return {uint64_t(d.hidden) * 4}; }
-    static int validate(const LayerSlabs& d, const Params* p)
-    { return d.activation == 0 && p && std::isfinite(p->scale) ? 0 : 2; }
-    static Layer make_layer(const LayerSlabs& d, const Params* p)
-    { return {d, p->scale}; }
-    static int check_slot(const Layer&, int) { return 0; }
-    static Row decode(const uint8_t* const* base, const Layer&) { return {reinterpret_cast<const float*>(base[0])}; }
-    static int dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa)
+    static std::array<uint64_t, 1> row_bytes(const ExpertLayer& l, const Params&) { return {uint64_t(l.hidden) * 4}; }
+    static const char* validate(const ExpertLayer& l, Params& p)
+    { return l.activation == 0 && std::isfinite(p.scale) ? nullptr : "the toy takes activation 0 and a finite scale"; }
+    static bool usable(const ExpertLayer&, const Params&, int) { return true; }
+    // The toy's typed view of a slot: its row of floats.
+    static const float* expert(const ExpertRow& r) { return reinterpret_cast<const float*>(r.slab[0]); }
+    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa)
     {
+        const RouteTable r = RouteTable::build(c.slots, c.weights, c.rows, c.k);
         last_isa = isa;
         last_routes.clear();
         for (int i = 0; i < r.count[0]; ++i) last_routes.push_back(r.route(0, i));
@@ -53,13 +51,12 @@ struct ToyQuant {
         cpus.assign(size_t(c.threads), -1);
         run_team(c.threads, [&](int worker, int workers) {
             cpus[size_t(worker)] = sched_getcpu();
-            for (int h = worker; h < l.slabs.hidden; h += workers)
+            for (int h = worker; h < l.hidden; h += workers)
                 for (int t = 0; t < c.rows; ++t) {
                     float s = 0;
                     for (int i = 0; i < r.count[t]; ++i)
-                        s += r.route(t, i).weight * l.scale
-                             * decode(l.slabs.slot_bases<kSlabs>(r.route(t, i).slot).data(), l).v[h];
-                    float& o = c.out[size_t(t) * l.slabs.hidden + h];
+                        s += r.route(t, i).weight * p.scale * expert(l[r.route(t, i).slot])[h];
+                    float& o = c.out[size_t(t) * l.hidden + h];
                     o = c.accumulate ? o + s : s;
                 }
         });

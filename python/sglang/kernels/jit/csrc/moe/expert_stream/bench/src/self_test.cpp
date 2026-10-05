@@ -517,16 +517,15 @@ struct FakeCall {
 // proves the row's x, the slots and the weights reached it.
 class FakeKernel final : public ce::CpuExpertKernel {
  public:
-  struct Layer final : ce::CpuExpertLayer {
-    explicit Layer(const CpuExpertKernel& k) : CpuExpertLayer(k) {}
-  };
   explicit FakeKernel(const char* name = "bench-fake", int32_t max_routes = 1 << 10)
       : name_(name), max_routes_(max_routes) {}
   const char* name() const noexcept override {
     return name_;
   }
-  std::unique_ptr<ce::CpuExpertLayer> make_layer(const ce::LayerSlabs&, std::span<const std::byte>) const override {
-    return std::make_unique<Layer>(*this);
+  ce::ExpertLayer make_layer(const ce::ExpertLayer& shape, std::span<const std::byte>) const override {
+    ce::ExpertLayer layer = shape;
+    layer.kernel = this;
+    return layer;
   }
   int32_t max_routes() const noexcept override {
     return max_routes_;
@@ -534,10 +533,10 @@ class FakeKernel final : public ce::CpuExpertKernel {
   int32_t max_rows() const noexcept override {
     return 1;
   }
-  void check(const ce::CpuExpertLayer& layer, const ce::ForwardCall&) const override {
-    if (&layer.kernel() != this) throw std::invalid_argument("bench fake: another kernel's layer");
+  void check(const ce::ExpertLayer& layer, const ce::ForwardCall&) const override {
+    if (layer.kernel != this) throw std::invalid_argument("bench fake: another kernel's layer");
   }
-  void forward(const ce::CpuExpertLayer&, const ce::ForwardCall& c) const override {
+  void forward(const ce::ExpertLayer&, const ce::ForwardCall& c) const override {
     uint16_t x0;
     std::memcpy(&x0, c.x, 2);
     float sum = 0.0f;

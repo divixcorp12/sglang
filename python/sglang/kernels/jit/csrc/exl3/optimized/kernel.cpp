@@ -14,12 +14,7 @@
 #include <c10/util/Half.h>
 #include <ATen/ATen.h>
 
-#include <algorithm>
-#include <cstring>
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <utility>
+#include <cstdint>
 #include <vector>
 
 // Last: the definition order the kernels were validated in (bit-exact per tier); another order changes what GCC
@@ -38,8 +33,7 @@ const ::sglang::cpu_experts::CpuExpertKernel& exl3_cpu_kernel()
 void exl3_moe_cpu_set_prof(bool) {}
 
 namespace {
-using ::sglang::exl3_cpu::Exl3Quant;
-using Exl3Forward = ::sglang::cpu_experts::ExpertForward<Exl3Quant>;
+using Exl3Forward = ::sglang::cpu_experts::ExpertForward<::sglang::exl3_cpu::Exl3Quant>;
 }  // namespace
 
 // -------------------------------------------------------------------------------------------
@@ -47,9 +41,10 @@ using Exl3Forward = ::sglang::cpu_experts::ExpertForward<Exl3Quant>;
 // -------------------------------------------------------------------------------------------
 
 // This file replaces upstream's cpu/moe_mul1.cpp inside the exllamav3 extension, whose
-// bindings.cpp and cpu/moe_handoff.cu still reference these symbols. sglang never calls them:
-// the staging copy belongs to upstream's handoff worker, and the pool they exercised was
-// replaced by the OpenMP forward. They exist only so the extension links, and fail if called.
+// bindings.cpp and cpu/moe_handoff.cu still reference these symbols. sglang never calls the
+// ones below that fail: the staging copy belongs to upstream's handoff worker, the pool they
+// exercised was replaced by the OpenMP forward, and the per-expert layers by slab layers. They
+// exist only so the extension links.
 
 void exl3_moe_cpu_stage_experts(int64_t, const uint32_t*, int, uint8_t*, int)
 {
@@ -67,181 +62,32 @@ bool exl3_moe_cpu_has_avx512_bw() { return Exl3Forward::isa() >= ::sglang::cpu_e
 bool exl3_moe_cpu_has_avx512_vnni() { return Exl3Forward::isa() >= ::sglang::cpu_experts::Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return Exl3Forward::isa() == ::sglang::cpu_experts::Isa::Vbmi; }
 
-static MoeCpuMatrix make_matrix
-(
-    const at::Tensor& trellis,
-    const at::Tensor& suh,
-    const at::Tensor& svh,
-    const at::Tensor* bias,
-    bool swizzled
-)
+// Upstream's per-expert tensor API: its layers are tables of tensors anywhere in memory, which the kernel does not take
+// (its layers are slab layers, made by its make_layer). bindings.cpp still binds these, so they exist and refuse.
+
+int64_t exl3_moe_cpu_make_layer(const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+                                const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+                                const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+                                const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+                                const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
+                                const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, int64_t, double, int64_t)
 {
-    TORCH_CHECK(trellis.device().is_cpu() && trellis.is_contiguous(), "trellis must be contiguous CPU");
-    TORCH_CHECK(trellis.dim() == 3, "trellis must be [k/16, n/16, 16K]");
-    MoeCpuMatrix m;
-    m.trellis = reinterpret_cast<const uint16_t*>(trellis.data_ptr());
-    m.suh = reinterpret_cast<const at::Half*>(suh.data_ptr());
-    m.svh = reinterpret_cast<const at::Half*>(svh.data_ptr());
-    m.bias = bias ? reinterpret_cast<const at::Half*>(bias->data_ptr()) : nullptr;
-    m.k = static_cast<int>(trellis.size(0)) * 16;
-    m.n = static_cast<int>(trellis.size(1)) * 16;
-    m.bits = static_cast<int>(trellis.size(2)) / 16;
-    // K8 tensors are exempt from swizzling (routed to the dword kernel, which would gain
-    // nothing) -- the child loader applies the same bits != 8 rule when repacking, so the two
-    // sides agree per tensor
-    m.swz = swizzled && m.bits != 8 ? 1 : 0;
-    TORCH_CHECK(m.bits >= 1 && m.bits <= 8, "CPU MoE requires K in [1, 8]");
-    TORCH_CHECK(m.k % 128 == 0 && m.n % 128 == 0, "dims must be divisible by 128");
-    TORCH_CHECK(m.k <= 8192, "k too large for i32 accumulation");
-    return m;
+    TORCH_CHECK(false, "exl3_moe_cpu_make_layer is not supported by the optimized CPU expert kernel: make a slab layer "
+                       "with its make_layer (Exl3CpuQuantTrait.layer_spec)");
+    return 0;
 }
 
-int64_t exl3_moe_cpu_make_layer
-(
-    const std::vector<at::Tensor>& gate_trellis,
-    const std::vector<at::Tensor>& gate_suh,
-    const std::vector<at::Tensor>& gate_svh,
-    const std::vector<at::Tensor>& up_trellis,
-    const std::vector<at::Tensor>& up_suh,
-    const std::vector<at::Tensor>& up_svh,
-    const std::vector<at::Tensor>& down_trellis,
-    const std::vector<at::Tensor>& down_suh,
-    const std::vector<at::Tensor>& down_svh,
-    const std::vector<at::Tensor>& gate_bias,
-    const std::vector<at::Tensor>& up_bias,
-    const std::vector<at::Tensor>& down_bias,
-    int64_t activation,
-    double act_limit,
-    int64_t swizzled
-)
+void exl3_moe_cpu_free_layer(int64_t)
 {
-    auto table = std::unique_ptr<MoeCpuLayer>(new MoeCpuLayer);
-    const bool swz = swizzled != 0;
-    const size_t E = up_trellis.size();
-    const bool gated = !gate_trellis.empty();
-    TORCH_CHECK(down_trellis.size() == E && (!gated || gate_trellis.size() == E), "expert count mismatch");
-    TORCH_CHECK(gated ? (activation == 0 || activation == 1 || activation == 3) : activation == 2, "gated experts take silu/gelu/swiglu_oai, gateless take relu2");
-    TORCH_CHECK(gate_bias.empty() || gate_bias.size() == E, "gate bias count mismatch");
-    TORCH_CHECK(up_bias.empty() || up_bias.size() == E, "up bias count mismatch");
-    TORCH_CHECK(down_bias.empty() || down_bias.size() == E, "down bias count mismatch");
-    table->num_experts = static_cast<int>(E);
-    table->activation = static_cast<int>(activation);
-    table->act_limit = static_cast<float>(act_limit);
-    for (size_t e = 0; e < E; ++e) {
-        if (gated) {
-            table->gates.push_back(make_matrix(gate_trellis[e], gate_suh[e], gate_svh[e],
-                                               gate_bias.empty() ? nullptr : &gate_bias[e], swz));
-            for (auto& t : {gate_trellis[e], gate_suh[e], gate_svh[e]})
-                table->refs.push_back(t);
-            if (!gate_bias.empty()) table->refs.push_back(gate_bias[e]);
-        }
-        table->ups.push_back(make_matrix(up_trellis[e], up_suh[e], up_svh[e],
-                                         up_bias.empty() ? nullptr : &up_bias[e], swz));
-        table->downs.push_back(make_matrix(down_trellis[e], down_suh[e], down_svh[e],
-                                           down_bias.empty() ? nullptr : &down_bias[e], swz));
-        for (auto& t : {up_trellis[e], up_suh[e], up_svh[e], down_trellis[e], down_suh[e], down_svh[e]})
-            table->refs.push_back(t);
-        if (!up_bias.empty()) table->refs.push_back(up_bias[e]);
-        if (!down_bias.empty()) table->refs.push_back(down_bias[e]);
-    }
-    table->hidden_size = table->ups[0].k;
-    table->interm_size = table->ups[0].n;
-    TORCH_CHECK(table->downs[0].k == table->interm_size && table->downs[0].n == table->hidden_size,
-                "expert shape mismatch");
-
-    // A table layer: ExpertForward refuses a slot at or past its expert count, as it does a slab layer's capacity.
-    ::sglang::cpu_experts::LayerSlabs shape;
-    shape.capacity = table->num_experts;
-    shape.hidden = table->hidden_size;
-    shape.intermediate = table->interm_size;
-    shape.activation = table->activation;
-    shape.act_limit = table->act_limit;
-    const bool gated = !table->gates.empty();
-    Exl3Quant::Layer layer{shape, gated, 0, 0, std::move(table)};
-    const auto& kernel = static_cast<const Exl3Forward&>(::sglang::exl3_cpu::exl3_cpu_kernel());
-    // The handle is the layer's address (kernel.h, exl3_cpu_table_layer); the caller owns it until free_layer.
-    return reinterpret_cast<int64_t>(kernel.wrap(std::move(layer)).release());
+    TORCH_CHECK(false, "exl3_moe_cpu_free_layer is not supported by the optimized CPU expert kernel");
 }
 
-void exl3_moe_cpu_free_layer(int64_t handle)
+void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int)
 {
-    delete reinterpret_cast<const ::sglang::cpu_experts::CpuExpertLayer*>(handle);
+    TORCH_CHECK(false, "exl3_moe_cpu_forward_raw is not supported by the optimized CPU expert kernel");
 }
 
-// The kernel's forward with accumulate off: the FP16 weights widen to FP32 exactly and the kernel narrows them back.
-void exl3_moe_cpu_forward_raw(
-    int64_t handle,
-    const at::Half* x,
-    const int32_t* sel,
-    const at::Half* wts,
-    float* out,
-    int rows,
-    int topk,
-    int threads
-)
+void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t)
 {
-    if (rows == 0) return;  // upstream's forward of no tokens is a no-op; the kernel refuses rows < 1
-    static thread_local std::vector<float> weights;
-    const size_t n = static_cast<size_t>(rows) * topk;
-    weights.resize(n);
-    for (size_t i = 0; i < n; ++i) weights[i] = static_cast<float>(wts[i]);
-    ::sglang::cpu_experts::ForwardCall call;
-    call.rows = rows;
-    call.k = topk;
-    call.threads = std::max(threads, 1);  // upstream's forward ran fewer than one thread as one
-    call.x = x;
-    call.slots = sel;
-    call.weights = weights.data();
-    call.out = out;
-    call.accumulate = false;
-    try {
-        // Upstream's API takes its caller's tensors, so its calls are checked.
-        const auto& layer = ::sglang::exl3_cpu::exl3_cpu_table_layer(handle);
-        const auto& kernel = ::sglang::exl3_cpu::exl3_cpu_kernel();
-        kernel.check(layer, call);
-        kernel.forward(layer, call);
-    } catch (const std::exception& e) {
-        TORCH_CHECK(false, "exl3_moe_cpu_forward: ", e.what());
-    }
-}
-
-void exl3_moe_cpu_forward
-(
-    int64_t handle,
-    const at::Tensor& x,
-    const at::Tensor& selected,
-    const at::Tensor& weights,
-    at::Tensor& out,
-    int64_t num_threads
-)
-{
-    TORCH_CHECK(x.device().is_cpu() && selected.device().is_cpu() && weights.device().is_cpu() && out.device().is_cpu(), "CPU MoE tensors must be on CPU");
-    TORCH_CHECK(x.scalar_type() == at::kHalf && out.scalar_type() == at::kFloat, "dtype mismatch");
-
-    const int m_total = static_cast<int>(x.size(0));
-    const int top_k = static_cast<int>(selected.size(-1));
-
-    // Raw path takes int32 selection
-    std::vector<int32_t> sel32(static_cast<size_t>(m_total) * top_k);
-    if (selected.scalar_type() == at::kLong)
-    {
-        const int64_t* s = selected.data_ptr<int64_t>();
-        for (size_t i = 0; i < sel32.size(); ++i) sel32[i] = static_cast<int32_t>(s[i]);
-    }
-    else
-    {
-        TORCH_CHECK(selected.scalar_type() == at::kInt, "selected must be int32 or int64");
-        std::memcpy(sel32.data(), selected.data_ptr<int32_t>(), sel32.size() * 4);
-    }
-
-    exl3_moe_cpu_forward_raw
-    (
-        handle,
-        reinterpret_cast<const at::Half*>(x.data_ptr()),
-        sel32.data(),
-        reinterpret_cast<const at::Half*>(weights.data_ptr()),
-        out.data_ptr<float>(),
-        m_total, top_k,
-        static_cast<int>(num_threads)
-    );
+    TORCH_CHECK(false, "exl3_moe_cpu_forward is not supported by the optimized CPU expert kernel");
 }

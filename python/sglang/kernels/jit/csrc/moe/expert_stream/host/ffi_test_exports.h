@@ -646,8 +646,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;
   }
 
-  // Test only: the CPU expert kernel tests enable in place of a format's (test_kernel_address). Its layers keep only the
-  // LayerSlabs' hidden. A forward spins k * ns_per_expert, waits while its worker-0 core is held (test_kernel_hold),
+  // Test only: the CPU expert kernel tests enable in place of a format's (test_kernel_address). Its layers read only
+  // their hidden. A forward spins k * ns_per_expert, waits while its worker-0 core is held (test_kernel_hold),
   // throws when made failing, else writes out[j] for j < max(hidden, 1) -- (accumulate ? out[j] : j) + sum_i weights[i]
   // * (slots[i] + 1), or a zero partial (accumulate ? out[j] : 0) when made zeroing -- and records the call. A
   // keep-warm counts its calls and records its first core, then spins until its word moves or its deadline passes.
@@ -657,10 +657,6 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       int32_t core, affinity, threads, accumulate, k;
       std::array<int32_t, Wire::kLanes> slots;
       std::array<float, Wire::kLanes> weights;
-    };
-    struct Layer final : cpu_experts::CpuExpertLayer {
-      Layer(const CpuExpertKernel& k, int32_t h) : CpuExpertLayer(k), hidden(h) {}
-      const int32_t hidden;
     };
 
     void reset(int64_t ns_per_expert, int64_t fail, bool zero) {
@@ -677,9 +673,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     const char* name() const noexcept override {
       return "fake";
     }
-    std::unique_ptr<cpu_experts::CpuExpertLayer> make_layer(
-        const cpu_experts::LayerSlabs& d, std::span<const std::byte>) const override {
-      return std::make_unique<Layer>(*this, d.hidden);
+    cpu_experts::ExpertLayer make_layer(
+        const cpu_experts::ExpertLayer& shape, std::span<const std::byte>) const override {
+      cpu_experts::ExpertLayer layer = shape;
+      layer.kernel = this;
+      return layer;
     }
     int32_t max_routes() const noexcept override {
       return Wire::kLanes;
@@ -687,10 +685,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     int32_t max_rows() const noexcept override {
       return 1 << 16;
     }
-    void check(const cpu_experts::CpuExpertLayer& layer, const cpu_experts::ForwardCall&) const override {
-      if (&layer.kernel() != this) throw std::invalid_argument("fake CPU expert kernel: another kernel's layer");
+    void check(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall&) const override {
+      if (layer.kernel != this) throw std::invalid_argument("fake CPU expert kernel: another kernel's layer");
     }
-    void forward(const cpu_experts::CpuExpertLayer& layer, const cpu_experts::ForwardCall& c) const override {
+    void forward(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall& c) const override {
       const int32_t core = c.cores.empty() ? -1 : c.cores.front();
       const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);
       while (now_ns() < until)
@@ -702,7 +700,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       double sum = 0;
       for (int32_t i = 0; i < c.k; ++i)
         sum += static_cast<double>(c.weights[i]) * (c.slots[i] + 1);
-      const int32_t hidden = std::max(static_cast<const Layer&>(layer).hidden, 1);
+      const int32_t hidden = std::max(layer.hidden, 1);
       const bool zero = zero_.load(std::memory_order_relaxed);
       for (int32_t j = 0; j < hidden; ++j) {
         const double base = c.accumulate ? static_cast<double>(c.out[j]) : (zero ? 0.0 : static_cast<double>(j));
@@ -826,7 +824,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   }
   // A test layer and the hidden size it was made with, which bounds kernel_forward's x and out.
   struct KernelLayer {
-    std::shared_ptr<cpu_experts::CpuExpertLayer> layer;
+    cpu_experts::ExpertLayer layer;  // kernel null: dropped
     int64_t hidden = 0;
   };
   static std::vector<KernelLayer>& kernel_layers() {
@@ -846,11 +844,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       test_only("kernel_layer");
     } else {
       const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
-      std::shared_ptr<cpu_experts::CpuExpertLayer> layer =
-          k->make_layer(Base::layer_slabs(slabs, capacity, hidden, intermediate, activation, act_limit),
+      cpu_experts::ExpertLayer layer =
+          k->make_layer(Base::layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit),
                         Base::params_bytes(params));
       std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-      kernel_layers().push_back({std::move(layer), hidden});
+      kernel_layers().push_back({layer, hidden});
       return static_cast<int64_t>(kernel_layers().size() - 1);
     }
   }
@@ -868,7 +866,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       KernelLayer entry;
       {
         std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-        if (id < 0 || id >= static_cast<int64_t>(kernel_layers().size()) || !kernel_layers()[id].layer)
+        if (id < 0 || id >= static_cast<int64_t>(kernel_layers().size()) || !kernel_layers()[id].layer.kernel)
           throw std::runtime_error("kernel_forward: no layer " + std::to_string(id));
         entry = kernel_layers()[id];
       }
@@ -885,7 +883,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       expert_stream::verify_named("weights", TensorMatcher({rows, k}).with_dtype<float>().with_device<kDLCPU>(cpu), weights);
       expert_stream::verify_named("out", TensorMatcher({rows, hidden}).with_dtype<float>().with_device<kDLCPU>(cpu), out);
       expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
-      const std::shared_ptr<cpu_experts::CpuExpertLayer>& layer = entry.layer;
+      const cpu_experts::ExpertLayer& layer = entry.layer;
       std::vector<int> on;
       const auto* c = static_cast<const int64_t*>(cores.data_ptr());
       for (int64_t i = 0; i < cores.size(0); ++i)
@@ -902,8 +900,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       call.cores = on;
       kernel_error_text().clear();
       try {
-        layer->kernel().check(*layer, call);
-        layer->kernel().forward(*layer, call);
+        layer.kernel->check(layer, call);
+        layer.kernel->forward(layer, call);
         return 0;
       } catch (const std::invalid_argument& e) {
         kernel_error_text() = e.what();

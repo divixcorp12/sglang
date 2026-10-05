@@ -92,7 +92,7 @@ Slabs make_slabs(const Config& c, std::mt19937& rng) {
 }
 
 std::vector<int> g_cores;  // the cores main was given, carried by every forward
-using Layer = ::sglang::cpu_experts::CpuExpertLayer;
+using Layer = ::sglang::cpu_experts::ExpertLayer;
 
 // The C ABI's status for what a kernel call threw: 0 none, 2 std::invalid_argument, 1 any other exception.
 template <class F>
@@ -181,21 +181,21 @@ int main(int argc, char** argv) {
         Slabs s = make_slabs(c, rng);
         SglangNvfp4CpuParams params{};
         params.w13_layout = c.layout; params.inv_input_scale13 = c.inv13; params.inv_input_scale2 = c.inv2;
-        ::sglang::cpu_experts::LayerSlabs d;
+        ::sglang::cpu_experts::ExpertLayer d;
         d.capacity = kCapacity; d.hidden = c.hidden;
         d.intermediate = c.intermediate; d.activation = 0; d.act_limit = c.limit; d.slab_count = 7;
         for (int i = 0; i < 7; ++i) {
             d.slabs[i] = s.bytes[i].empty() ? nullptr : s.bytes[i].data();
             d.slot_bytes[i] = s.stride[i];
         }
-        std::unique_ptr<Layer> layer;
+        Layer layer;
         if (status_of([&] {
                 layer = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().make_layer(
                     d, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)));
             }) != 0) {
             std::fprintf(stderr, "%s: registration refused\n", c.name); return 1;
         }
-        const Layer& handle = *layer;
+        const Layer& handle = layer;
         std::uniform_real_distribution<float> unit(-1.f, 1.f);
         std::vector<uint16_t> x(c.hidden);
         for (auto& v : x) v = ggml_compute_fp32_to_fp16(unit(rng));

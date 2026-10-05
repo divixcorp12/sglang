@@ -21,6 +21,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <span>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -151,18 +153,72 @@ void verify_workers(const std::set<int>& before, const std::vector<int32_t>& cor
   if (assigned != expected) throw std::runtime_error("Worker count/CPU assignment mismatch");
 }
 
+#ifndef EXL3_BENCH_BASELINE
+// One fixture layer's first `experts` experts as the pinned tier holds them, expert e in slot e of six slabs
+// (w13_trellis, w13_suh, w13_svh, w2_trellis, w2_suh, w2_svh; w13 rows hold gate then up), and the kernel's layer
+// over them.
+struct SlabLayer {
+  struct Free {
+    void operator()(uint8_t* p) const {
+      std::free(p);
+    }
+  };
+  std::array<std::unique_ptr<uint8_t, Free>, 6> slabs;
+  ::sglang::cpu_experts::ExpertLayer layer;
+
+  SlabLayer(const LayerFixture& f, int hidden, int experts) {
+    ::sglang::cpu_experts::ExpertLayer shape;
+    shape.capacity = experts;
+    shape.hidden = hidden;
+    shape.intermediate = static_cast<int32_t>(f.matrices[0][0].size(1)) * 16;
+    shape.activation = 0;
+    shape.act_limit = 10.0f;
+    shape.slab_count = 6;
+    for (int n = 0; n < 6; ++n) {
+      // The matrices (fixture.h's order) one slot's row of slab n holds: gate's then up's for w13, down's for w2.
+      std::vector<const std::vector<at::Tensor>*> parts;
+      if (n < 3) parts = {&f.matrices[n], &f.matrices[3 + n]};
+      else parts = {&f.matrices[3 + n]};
+      size_t row = 0;
+      for (const auto* part : parts) row += (*part)[0].nbytes();
+      slabs[n].reset(static_cast<uint8_t*>(std::aligned_alloc(64, (experts * row + 63) / 64 * 64)));
+      if (!slabs[n]) throw std::runtime_error("Cannot allocate a slab");
+      for (int e = 0; e < experts; ++e) {
+        uint8_t* dst = slabs[n].get() + e * row;
+        for (const auto* part : parts) {
+          const at::Tensor t = (*part)[e].contiguous();
+          std::memcpy(dst, t.data_ptr(), t.nbytes());
+          dst += t.nbytes();
+        }
+      }
+      shape.slabs[n] = slabs[n].get();
+      shape.slot_bytes[n] = row;
+    }
+    const SglangExl3CpuParams params{3, 0};  // bits, swizzled
+    layer = ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(
+        shape, std::as_bytes(std::span<const SglangExl3CpuParams>(&params, 1)));
+  }
+};
+#endif
+
 // One expert count k: every layer registered with the first k experts, expert e in slot e, and fixed routing weights
-// (the coefficients the frozen references were computed with). Owns the layer handles.
+// (the coefficients the frozen references were computed with). Owns the layers: the baseline's upstream handles, or
+// the optimized kernel's slab layers.
 struct Workload {
   const Fixture& fixture;
   const Options& options;
   const int experts;
+#ifdef EXL3_BENCH_BASELINE
   std::vector<int64_t> handles;
+#else
+  std::vector<std::unique_ptr<SlabLayer>> layers;
+#endif
   std::vector<int32_t> slots;
   std::vector<float> weights;
   std::vector<float> output;
 
   Workload(const Fixture& f, const Options& opt, int e) : fixture(f), options(opt), experts(e), output(f.hidden) {
+#ifdef EXL3_BENCH_BASELINE
     try {
       for (const auto& layer : f.layers) {
         std::array<std::vector<at::Tensor>, 9> matrices;
@@ -190,14 +246,24 @@ struct Workload {
         exl3_moe_cpu_free_layer(handle);
       throw;
     }
+#else
+    for (const auto& layer : f.layers)
+      layers.push_back(std::make_unique<SlabLayer>(layer, f.hidden, e));
+#endif
     for (int i = 0; i < experts; ++i) {
       slots.push_back(i);
       weights.push_back(0.071234f + (experts == 1 ? 0.0f : 0.23f * i / (experts - 1)));
     }
   }
   ~Workload() {
+#ifdef EXL3_BENCH_BASELINE
     for (auto handle : handles)
       exl3_moe_cpu_free_layer(handle);
+#endif
+  }
+
+  size_t layer_count() const {
+    return fixture.layers.size();
   }
 
   // One full forward on `layer`, writing `output`. Throws if the call fails.
@@ -215,7 +281,7 @@ struct Workload {
     call.weights = weights.data();
     call.out = output.data();
     call.cores = g_cores;
-    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(::sglang::exl3_cpu::exl3_cpu_table_layer(handles[layer]), call);
+    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call);
 #endif
   }
 
@@ -246,7 +312,7 @@ void full_forward(benchmark::State& state, Workload& workload) {
   try {
     workload.validate();
     for (int i = 0; i < workload.options.warmup; ++i)
-      workload.forward(i % workload.handles.size());
+      workload.forward(i % workload.layer_count());
     std::vector<double> samples;
     size_t layer = 0;
     for (auto _ : state) {
@@ -258,7 +324,7 @@ void full_forward(benchmark::State& state, Workload& workload) {
       state.SetIterationTime(seconds);
       // Sample storage and layer selection stay outside the timed interval.
       samples.push_back(seconds);
-      layer = (layer + 1) % workload.handles.size();
+      layer = (layer + 1) % workload.layer_count();
       benchmark::DoNotOptimize(workload.output.data());
     }
     workload.validate();
@@ -269,7 +335,7 @@ void full_forward(benchmark::State& state, Workload& workload) {
     }
     state.counters["experts"] = workload.experts;
     state.counters["workers"] = workload.options.workers;
-    state.counters["layers"] = workload.handles.size();
+    state.counters["layers"] = workload.layer_count();
   } catch (const std::exception& error) {
     benchmark_failed = true;
     state.SkipWithError(error.what());

@@ -1,11 +1,13 @@
 """Bit-exact A/B harness for the optimized EXL3 CPU expert kernel (csrc/exl3/optimized/kernel.cpp).
 
-``dump`` runs a fixed set of forwards through the extension ``exl3_ext()`` builds and saves every output; ``compare``
-checks two dumps for bitwise equality. ``--registration cores`` (``engines`` is accepted as an alias) runs the host's
-``kernel_forward`` on two core groups at once (the first and second half of ``--cores``), exits 1 naming the case when
-they differ, and saves the first group's outputs. A dump made at the merge-base is the reference a kernel refactor must reproduce
-exactly, on every ISA tier the host can run. The kernel reads EXL3_MOE_CPU_MAX_ISA once, at its first forward or tier
-query, so each tier is its own process.
+``dump`` runs a fixed set of forwards through the extension ``exl3_ext()`` builds, on slab layers made by its kernel's
+make_layer as the RAM-miss service makes them, and saves every output; ``compare`` checks two dumps for bitwise
+equality. (Revisions before 2026-10-05 also took ``--registration table``, upstream's per-expert tensor layers, which
+run the same plans: a ``table`` dump there equals its ``slabs`` dump.) ``--registration cores`` (``engines`` is accepted
+as an alias) runs the host's ``kernel_forward`` on two core groups at once (the first and second half of ``--cores``),
+exits 1 naming the case when they differ, and saves the first group's outputs. A dump made at the merge-base is the
+reference a kernel refactor must reproduce exactly, on every ISA tier the host can run. The kernel reads
+EXL3_MOE_CPU_MAX_ISA once, at its first forward or tier query, so each tier is its own process.
 
 Run on divix01 through run_exl3_cpu_forward_checks.sh, which sets the build environment.
 """
@@ -54,28 +56,6 @@ def random_slabs(torch, hidden, inter, seed):
         "w2_suh": signs(CAP, 1, inter),
         "w2_svh": signs(CAP, 1, hidden),
     }
-
-
-def register_table(ext, s, limit):
-    """make_layer over one view per slot: gate is w13 part 0, up part 1, down w2 part 0."""
-    rows = range(CAP)
-    return ext.exl3_moe_cpu_make_layer(
-        [s["w13_trellis"][i, 0] for i in rows],
-        [s["w13_suh"][i, 0] for i in rows],
-        [s["w13_svh"][i, 0] for i in rows],
-        [s["w13_trellis"][i, 1] for i in rows],
-        [s["w13_suh"][i, 1] for i in rows],
-        [s["w13_svh"][i, 1] for i in rows],
-        [s["w2_trellis"][i, 0] for i in rows],
-        [s["w2_suh"][i, 0] for i in rows],
-        [s["w2_svh"][i, 0] for i in rows],
-        [],
-        [],
-        [],
-        0,
-        limit,
-        0,
-    )
 
 
 def register_slabs(ext, s, limit):
@@ -181,31 +161,21 @@ def dump(args):
     outputs = {}
     for (name, hidden, inter), limit in itertools.product(SHAPES, LIMITS):
         slabs = random_slabs(torch, hidden, inter, seed=hidden)
-        if args.registration == "table":
-            handle, trait = register_table(ext, slabs, limit), None
-        else:
-            handle, trait = register_slabs(ext, slabs, limit)
+        handle, _ = register_slabs(ext, slabs, limit)
         try:
             cases = list(cases_for(torch, name, hidden, limit))
             if halves is not None:
                 outputs.update(run_two_core_groups(torch, handle, hidden, cases, halves))
                 continue
             for case, tokens, k, x, sel, w in cases:
-                if trait is None:
-                    out = torch.full((tokens, hidden), float("nan"))
-                    ext.exl3_moe_cpu_forward(handle, x, sel, w, out, THREADS)
-                else:
-                    out = kernel_forward(torch, handle, hidden, case, tokens, k, x, sel, w)
+                out = kernel_forward(torch, handle, hidden, case, tokens, k, x, sel, w)
                 if not torch.isfinite(out).all():
                     sys.exit(f"{case}: non-finite output")
                 outputs[case] = out
         finally:
-            if trait is None:
-                ext.exl3_moe_cpu_free_layer(handle)
-            else:
-                from sglang.kernels.ops.moe import expert_stream_transport as es
+            from sglang.kernels.ops.moe import expert_stream_transport as es
 
-                es.kernel_drop(handle, variant="instr")
+            es.kernel_drop(handle, variant="instr")
     torch.save({"isa": args.isa, "registration": args.registration, "outputs": outputs}, args.out)
     print(f"{len(outputs)} outputs ({args.isa}, {args.registration}) -> {args.out}")
 
@@ -233,7 +203,7 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("dump")
     d.add_argument("--isa", choices=sorted(TIERS), required=True)
-    d.add_argument("--registration", choices=("table", "slabs", "cores", "engines"), default="table")
+    d.add_argument("--registration", choices=("slabs", "cores", "engines"), default="slabs")
     d.add_argument("--cores", help="cores: a taskset list of 2 * THREADS cores, one core group on each half")
     d.add_argument("--out", required=True)
     c = sub.add_parser("compare")

@@ -44,19 +44,17 @@ static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<u
               "the keep-warm reads kick_ as a plain uint32_t");
 
 // Every row's CPU expert layer, one per RamTier and shared by every group's engine: a row's layer addresses the row's
-// whole slab, so one serves every group. Set once per row from any thread; read lock-free by the engines. Owns the
-// layers, and is destroyed only after every engine has stopped (RamTier's member order), so no forward reads a freed
-// one.
+// whole slab, so one serves every group. Set once per row from any thread; read lock-free by the engines. The layers are
+// values (views of the slabs), held here until the tier is destroyed, after every engine has stopped (RamTier's member
+// order).
 class CpuExpertLayers {
  public:
   explicit CpuExpertLayers(int64_t rows)
-      : rows_(rows), layers_(std::make_unique<std::atomic<cpu_experts::CpuExpertLayer*>[]>(static_cast<size_t>(rows))) {
+      : rows_(rows),
+        layers_(std::make_unique<cpu_experts::ExpertLayer[]>(static_cast<size_t>(rows))),
+        state_(std::make_unique<std::atomic<uint8_t>[]>(static_cast<size_t>(rows))) {
     for (int64_t r = 0; r < rows_; ++r)
-      layers_[r].store(nullptr, std::memory_order_relaxed);
-  }
-  ~CpuExpertLayers() {
-    for (int64_t r = 0; r < rows_; ++r)
-      delete layers_[r].load(std::memory_order_relaxed);
+      state_[r].store(kEmpty, std::memory_order_relaxed);
   }
   CpuExpertLayers(const CpuExpertLayers&) = delete;
   CpuExpertLayers& operator=(const CpuExpertLayers&) = delete;
@@ -65,23 +63,27 @@ class CpuExpertLayers {
     return rows_;
   }
 
-  // Installs `layer` as `row`'s (the caller checks both); false, destroying `layer`, when the row already has one. The
-  // release pairs with get()'s acquire, so an engine that sees the layer sees it constructed.
-  bool set(int64_t row, std::unique_ptr<cpu_experts::CpuExpertLayer> layer) {
-    cpu_experts::CpuExpertLayer* unset = nullptr;
-    if (!layers_[row].compare_exchange_strong(unset, layer.get(), std::memory_order_acq_rel)) return false;
-    layer.release();
+  // Installs `layer` as `row`'s (the caller checks both); false when the row already has one. The release pairs with
+  // get()'s acquire, so an engine that sees the layer sees all of it.
+  bool set(int64_t row, const cpu_experts::ExpertLayer& layer) {
+    uint8_t empty = kEmpty;
+    if (!state_[row].compare_exchange_strong(empty, kWriting, std::memory_order_relaxed)) return false;
+    layers_[row] = layer;
+    state_[row].store(kReady, std::memory_order_release);
     return true;
   }
 
-  // `row`'s layer; nullptr outside [0, rows) or before set().
-  const cpu_experts::CpuExpertLayer* get(int64_t row) const {
-    return row >= 0 && row < rows_ ? layers_[row].load(std::memory_order_acquire) : nullptr;
+  // `row`'s layer; nullptr outside [0, rows) or before set() completes.
+  const cpu_experts::ExpertLayer* get(int64_t row) const {
+    if (row < 0 || row >= rows_ || state_[row].load(std::memory_order_acquire) != kReady) return nullptr;
+    return &layers_[row];
   }
 
  private:
+  static constexpr uint8_t kEmpty = 0, kWriting = 1, kReady = 2;
   int64_t rows_;
-  std::unique_ptr<std::atomic<cpu_experts::CpuExpertLayer*>[]> layers_;
+  std::unique_ptr<cpu_experts::ExpertLayer[]> layers_;
+  std::unique_ptr<std::atomic<uint8_t>[]> state_;
 };
 
 // One forward over up to Wire::kLanes lanes of one row.
@@ -302,7 +304,7 @@ class CpuExpertEngine {
       call.accumulate = job.accumulate;
       call.cores = config_.cores;
       try {
-        const cpu_experts::CpuExpertLayer* layer = config_.layers->get(job.row);
+        const cpu_experts::ExpertLayer* layer = config_.layers->get(job.row);
         if (layer == nullptr) throw std::invalid_argument("the row has no registered layer");
         if (config_.check_calls) config_.kernel->check(*layer, call);
         config_.kernel->forward(*layer, call);

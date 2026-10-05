@@ -53,7 +53,7 @@ class StackFixture {
   int64_t out_stride() const;         // bytes
   void write_x(int64_t row) const;    // the post's x store: the layer's fixture input into the row's x
   // The row's layer over its capacity() slot views, made by the EXL3 kernel (exl3_cpu_kernel).
-  std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> make_layer(int64_t row) const;
+  ::sglang::cpu_experts::ExpertLayer make_layer(int64_t row) const;
   // Fills slot_of(e) of the row's slabs with expert e from the row's image file: the slot the tier's reader would pick
   // (see slot_of). For the bare forwards, which run before the stack exists.
   void preload_slots(int64_t row) const;

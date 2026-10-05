@@ -265,7 +265,7 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
 
 struct ForwardCtx
 {
-    const Exl3Quant::Layer* layer;
+    const ExpertLayer* layer;
     const at::Half* x;
     float* out;
     int m_total;
@@ -360,12 +360,25 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
         gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
 }
 
+// The gated SiLU, into g: act(g) * u. A nonzero act_limit clamps the up path symmetrically and the activated gate from
+// above, BEFORE the multiply (matching the GPU act_mul kernels). DS4 ships swiglu_limit = 10 with plain silu: hidden
+// states deep into a long context push |u| into the thousands, and skipping the clamp here made offloaded experts
+// diverge arbitrarily far from their GPU-resident twins.
+inline void silu_mul(float* g, const float* u, size_t count, float act_limit)
+{
+    const float lim = act_limit != 0.0f ? act_limit : std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < count; ++i) {
+        const float gv = g[i];
+        const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
+        g[i] = av * std::clamp(u[i], -lim, lim);
+    }
+}
+
 // Same scalar/vector operations and block scale ordering as the original phase 2.
 // Blocks are independent: only their own gate/up outputs and prepared input slices are written.
-template<class Shape, Isa I, bool Wide = false, class Experts>
-void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
+template<class Shape, Isa I, bool Wide = false>
+void middle_blocks(ForwardCtx& c,const Experts<Shape>& E,int worker,int num_workers) {
     const int I_=Shape::intermediate(*c.layer), nb=I_/128, nc=int(c.chunks.size());
-    const bool gated=Shape::gated(*c.layer);
     const int first=nc*nb*worker/num_workers,last=nc*nb*(worker+1)/num_workers;
     for (int task=first;task<last;++task) {
         const int j=task/nb,b=task%nb,block=b*128;
@@ -373,53 +386,15 @@ void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
         for (int r=0;r<ch.m;++r) {
             float* g=c.tout_g+size_t(j)*MAX_M*I_+size_t(r)*I_+block;
             float* u=c.tout_u+size_t(j)*MAX_M*I_+size_t(r)*I_+block;
-            if (gated) {
-                auto mat=E.gate(ch.expert);mat.n=128;mat.svh+=block;if(mat.bias)mat.bias+=block;
-                transform_out<I>(mat,g,1);
-            }
+            auto gate=E.gate(ch.expert);gate.n=128;gate.svh+=block;if(gate.bias)gate.bias+=block;
+            transform_out<I>(gate,g,1);
             auto up=E.up(ch.expert);up.n=128;up.svh+=block;if(up.bias)up.bias+=block;
             transform_out<I>(up,u,1);
-            const size_t count=128;
-            float* a=gated?g:u;
-            const float lim=Shape::act_limit(*c.layer)!=0.0f?Shape::act_limit(*c.layer):std::numeric_limits<float>::infinity();
-                switch (Shape::activation(*c.layer)) {
-                    case 0:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = g[i];
-                            const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
-                            g[i] = av * std::clamp(u[i], -lim, lim);
-                        }
-                        break;
-                    case 1:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = g[i];
-                            const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
-                            const float av = std::min(gv * cdf, lim);
-                            g[i] = av * std::clamp(u[i], -lim, lim);
-                        }
-                        break;
-                    case 3: {
-                        // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
-                        // sigmoid(1.702 * g)
-                        const float lim = Shape::act_limit(*c.layer);
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = std::min(g[i], lim);
-                            const float uv = std::clamp(u[i], -lim, lim);
-                            g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(-1.702f * gv));
-                        }
-                        break;
-                    }
-                    default:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float uv = u[i] > 0.0f ? u[i] : 0.0f;
-                            u[i] = uv * uv;
-                        }
-                        break;
-                }
+            silu_mul(g,u,128,Shape::act_limit(*c.layer));
 
             auto& p=c.prep_d[j];
             float* dst=p.tin+size_t(r)*I_+block;
-            prepare_block_avx2<I>(a,false,E.down(ch.expert).suh+block,dst,128);
+            prepare_block_avx2<I>(g,false,E.down(ch.expert).suh+block,dst,128);
             if(p.compact){compact_quantize_block<Wide>(p,r,ch.m,I_,b,dst);continue;}
             float* residual=p.tin+size_t(r+ch.m)*I_+block;
             for (int pass=0;pass<ACT_ROWS;++pass) {
@@ -438,14 +413,14 @@ void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
 }
 
 
-template<class Shape, Isa I, bool Wide = false, class Experts>
-void prepare_gu_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
-    const int K=Shape::hidden(*c.layer),nb=K/128,nc=int(c.chunks.size()),gu=!Shape::gated(*c.layer)?1:2;
+template<class Shape, Isa I, bool Wide = false>
+void prepare_gu_blocks(ForwardCtx& c,const Experts<Shape>& E,int worker,int num_workers) {
+    const int K=Shape::hidden(*c.layer),nb=K/128,nc=int(c.chunks.size()),gu=2;
     const int first=nc*gu*nb*worker/num_workers,last=nc*gu*nb*(worker+1)/num_workers;
     for(int task=first;task<last;++task) {
         const int j=task/nb,b=task%nb;
         const auto& ch=c.chunks[j/gu];
-        const bool up=gu==1 || j%gu;
+        const bool up=j%gu;
         const MoeCpuMatrix& mat=up?E.up(ch.expert):E.gate(ch.expert);
         auto& p=(up?c.prep_u:c.prep_g)[j/gu];
         for(int r=0;r<ch.m;++r) {
@@ -501,8 +476,8 @@ struct ForwardArena
     std::vector<float> bq_g, bq_u, bq_d;
     std::vector<int32_t> bsum_g, bsum_u, bsum_d;
     std::vector<int> down_tiles_done;
+    std::vector<std::pair<int32_t, int32_t>> routes;  // the call's live routes, (slot, t * k + j)
     // Moved into the call's ForwardCtx and back, so a forward allocates nothing once warm
-    std::vector<std::vector<std::pair<int, float>>> per_expert;
     std::vector<Chunk> chunks;
 
     static ForwardArena& get()
@@ -540,8 +515,7 @@ struct ForwardPlan
     using Traits = PlanTraits<Shape, I>;
 
     // Sizes this call's scratch from the arena, runs the team, and returns. ctx.chunks must be non-empty.
-    template <class Experts>
-    static void run(ForwardCtx& ctx, const Experts& E, ForwardArena& ar, int threads)
+    static void run(ForwardCtx& ctx, const Experts<Shape>& E, ForwardArena& ar, int threads)
     {
         prepare_scratch(ctx, ar);
         const int nc = static_cast<int>(ctx.chunks.size());
@@ -622,13 +596,12 @@ private:
 
     // The phases on the framework's pinned team (team.hpp's run_team), which throws when the team is short or a
     // worker cannot be pinned.
-    template <class Experts>
-    static void run_team(ForwardCtx& ctx, const Experts& E, int count, bool grouped, bool wide)
+    static void run_team(ForwardCtx& ctx, const Experts<Shape>& E, int count, bool grouped, bool wide)
     {
         [[maybe_unused]] double phase_us[6]{};
         ::sglang::cpu_experts::run_team(count, [&](int worker, int n) {
             if (ctx.zero_out && worker == 0)
-                std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->slabs.hidden * sizeof(float));
+                std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->hidden * sizeof(float));
             step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us);
             step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us);
             step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us);
@@ -643,8 +616,8 @@ private:
     // One phase of the team's sequence: run it, then wait for the whole team unless it is the last. Called inside
     // run_team's parallel region (an orphaned barrier binds to that team). Profile: phase_us is indexed by the
     // phase's value; otherwise it is untouched.
-    template <Phase P, class Experts>
-    static void step(ForwardCtx& ctx, const Experts& E, int worker, int n, bool grouped, bool wide,
+    template <Phase P>
+    static void step(ForwardCtx& ctx, const Experts<Shape>& E, int worker, int n, bool grouped, bool wide,
                      [[maybe_unused]] double* phase_us)
     {
         using Clock = std::chrono::steady_clock;
@@ -661,8 +634,8 @@ private:
     }
 
     // One phase for this worker; P picks the phase at compile time, so each instantiation holds one phase's code.
-    template <Phase P, class Experts>
-    static void phase(ForwardCtx& c, const Experts& E, int worker, int num_workers, bool grouped, bool wide)
+    template <Phase P>
+    static void phase(ForwardCtx& c, const Experts<Shape>& E, int worker, int num_workers, bool grouped, bool wide)
     {
         [[maybe_unused]] const int nc = static_cast<int>(c.chunks.size());
         [[maybe_unused]] const int H = Shape::hidden(*c.layer);
@@ -676,11 +649,11 @@ private:
                 return;
             }
             // Prepare gate and up inputs, distributed over (chunk, gate/up)
-            const int gu = !Shape::gated(*c.layer) ? 1 : 2;
+            const int gu = 2;
             for (int j = worker; j < nc * gu; j += num_workers)
             {
                 const Chunk& ch = c.chunks[j / gu];
-                const bool up = gu == 1 || (j % gu);
+                const bool up = j % gu;
                 const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
                 PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 prepare_rows<I>(mat, c.x, nullptr, H, ch.token, ch.m, p);
@@ -689,11 +662,11 @@ private:
         else if constexpr (P == Phase::GateUp)
         {
             // Gate + up GEMVs (see assign_gemvs)
-            const int gu = !Shape::gated(*c.layer) ? 1 : 2;
+            const int gu = 2;
             assign_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
-                const bool up = gu == 1 || (j % gu);
+                const bool up = j % gu;
                 const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
@@ -707,60 +680,16 @@ private:
                 else middle_blocks<Shape, I, false>(c,E,worker,num_workers);
                 return;
             }
-            // Output transform for gate/up, activation, prepare down input; per chunk. Gated: act(g)
-            // * u accumulated into g; gateless: relu2 applied to u in place
-            const bool gated = Shape::gated(*c.layer);
+            // Output transform for gate/up, the gated SiLU into g, prepare down input; per chunk.
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
                 float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I_;
                 float* u = c.tout_u + static_cast<size_t>(j) * MAX_M * I_;
-                if (gated) transform_out<I>(E.gate(ch.expert), g, ch.m);
+                transform_out<I>(E.gate(ch.expert), g, ch.m);
                 transform_out<I>(E.up(ch.expert), u, ch.m);
-                const size_t count = static_cast<size_t>(ch.m) * I_;
-                float* a = gated ? g : u;
-                // Nonzero act_limit clamps the up path symmetrically and the activated gate
-                // from above, BEFORE the multiply (matching the GPU act_mul kernels). DS4
-                // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
-                // context push |u| into the thousands, and skipping the clamp here made
-                // offloaded experts diverge arbitrarily far from their GPU-resident twins
-                const float lim = Shape::act_limit(*c.layer) != 0.0f
-                    ? Shape::act_limit(*c.layer) : std::numeric_limits<float>::infinity();
-                switch (Shape::activation(*c.layer)) {
-                    case 0:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = g[i];
-                            const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
-                            g[i] = av * std::clamp(u[i], -lim, lim);
-                        }
-                        break;
-                    case 1:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = g[i];
-                            const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
-                            const float av = std::min(gv * cdf, lim);
-                            g[i] = av * std::clamp(u[i], -lim, lim);
-                        }
-                        break;
-                    case 3: {
-                        // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
-                        // sigmoid(1.702 * g)
-                        const float lim = Shape::act_limit(*c.layer);
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = std::min(g[i], lim);
-                            const float uv = std::clamp(u[i], -lim, lim);
-                            g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(-1.702f * gv));
-                        }
-                        break;
-                    }
-                    default:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float uv = u[i] > 0.0f ? u[i] : 0.0f;
-                            u[i] = uv * uv;
-                        }
-                        break;
-                }
+                silu_mul(g, u, static_cast<size_t>(ch.m) * I_, Shape::act_limit(*c.layer));
                 static const int idx4[MAX_M] = {0, 1, 2, 3};
-                prepare_rows<I>(E.down(ch.expert), nullptr, a, I_, idx4, ch.m, c.prep_d[j]);
+                prepare_rows<I>(E.down(ch.expert), nullptr, g, I_, idx4, ch.m, c.prep_d[j]);
             }
         }
         else if constexpr (P == Phase::Down)
@@ -805,15 +734,15 @@ private:
     }
 };
 
-// Runs the call's plan at tier `isa`. E reads the layer's experts under the generic plan; D reads the same experts
-// under the DSV4.1 plan's assumptions (for a strided layer, the compile-time-shaped view of the same slabs).
-template <class Experts, class Dsv41Experts>
-void run_plan(ForwardCtx& ctx, const Experts& E, const Dsv41Experts& D, ForwardArena& ar, int threads, Isa isa)
+// Runs the call's plan at tier `isa`: the DSV4.1 plan when it accepts the call, else the generic plan at the tier.
+void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, int threads, Isa isa)
 {
-    if (isa == Isa::Bw && Dsv41Shape::accepts(*ctx.layer, E, ctx.chunks)) {
-        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, D, ar, threads);
+    const ExpertLayer& l = *ctx.layer;
+    if (isa == Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
+        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, Experts<Dsv41Shape>{&l, p}, ar, threads);
         return;
     }
+    const Experts<GenericShape> E{&l, p};
     switch (isa) {
         case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, threads); return;
         case Isa::Avx2:   ForwardPlan<GenericShape, Isa::Avx2>::run(ctx, E, ar, threads); return;
@@ -824,20 +753,17 @@ void run_plan(ForwardCtx& ctx, const Experts& E, const Dsv41Experts& D, ForwardA
 }
 
 // The plan entry: groups the routes by expert and splits them into chunks of CHUNK_M rows. This grouping, not the
-// framework's RouteTable, fixes EXL3's accumulation order, so it reads the call's slots and FP16 weights as given.
-void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, const int32_t* sel, const at::Half* wts,
-                 float* out, int rows, int topk, int threads, bool accumulate)
+// framework's RouteTable, fixes EXL3's accumulation order (expert ascending, then token, then route), so it reads the
+// call's slots as given and runs zero-weight routes. Each weight is rounded to FP16, the registered kernel's
+// convention. ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range).
+int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa)
 {
-    const LayerSlabs& slabs = layer.slabs;
-    const int m_total = rows;
-    const int top_k = topk;
-
     ForwardCtx ctx;
-    ctx.layer = &layer;
-    ctx.x = x;
-    ctx.out = out;
-    ctx.m_total = m_total;
-    ctx.zero_out = !accumulate;
+    ctx.layer = &l;
+    ctx.x = static_cast<const at::Half*>(c.x);
+    ctx.out = c.out;
+    ctx.m_total = c.rows;
+    ctx.zero_out = !c.accumulate;
 
     ForwardArena& ar = ForwardArena::get();
     ctx.chunks = std::move(ar.chunks);
@@ -848,60 +774,31 @@ void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, cons
         ar.prep_g = std::move(ctx.prep_g); ar.prep_u = std::move(ctx.prep_u); ar.prep_d = std::move(ctx.prep_d);
     };
 
-    // Group token assignments by expert, then split into chunks of CHUNK_M rows
-    auto& per_expert = ar.per_expert;
-    if (per_expert.size() < static_cast<size_t>(slabs.capacity)) per_expert.resize(slabs.capacity);
-    for (int t = 0; t < m_total; ++t)
-        for (int j = 0; j < top_k; ++j)
-        {
-            const int32_t e = sel[static_cast<size_t>(t) * top_k + j];
-            if (e >= 0 && e < slabs.capacity)
-                per_expert[e].emplace_back(t, half_to_float(wts[static_cast<size_t>(t) * top_k + j]));
-        }
-    for (int e = 0; e < slabs.capacity; ++e)
+    // The live routes as (slot, route index t * k + j), sorted: each expert's routes in token, then route, order.
+    auto& routes = ar.routes;
+    routes.clear();
+    const int n = c.rows * c.k;
+    for (int i = 0; i < n; ++i)
+        if (c.slots[i] >= 0) routes.emplace_back(c.slots[i], i);
+    std::sort(routes.begin(), routes.end());
+    for (size_t i = 0; i < routes.size();)
     {
-        auto& lst = per_expert[e];
-        for (size_t i = 0; i < lst.size(); i += CHUNK_M)
+        Chunk ch;
+        ch.expert = routes[i].first;
+        ch.m = 0;
+        for (; i < routes.size() && routes[i].first == ch.expert && ch.m < CHUNK_M; ++i, ++ch.m)
         {
-            Chunk ch;
-            ch.expert = e;
-            ch.m = static_cast<int>(std::min<size_t>(CHUNK_M, lst.size() - i));
-            for (int r = 0; r < ch.m; ++r)
-            {
-                ch.token[r] = lst[i + r].first;
-                ch.weight[r] = lst[i + r].second;
-            }
-            ctx.chunks.push_back(ch);
+            ch.token[ch.m] = routes[i].second / c.k;
+            ch.weight[ch.m] = half_to_float(at::Half(c.weights[routes[i].second]));
         }
-        lst.clear();
+        ctx.chunks.push_back(ch);
     }
-    const int nc = static_cast<int>(ctx.chunks.size());
-    if (!nc) {
-        if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * slabs.hidden * sizeof(float));
-        give_back();
-        return;
-    }
-
-    if (layer.table) {
-        const TableExperts t{layer.table.get()};
-        run_plan(ctx, t, t, ar, threads, isa);
+    if (ctx.chunks.empty()) {
+        if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * l.hidden * sizeof(float));
     } else {
-        const StridedExperts<GenericShape> s{&layer};
-        run_plan(ctx, s, s.as<Dsv41Shape>(), ar, threads, isa);
+        run_plan(ctx, p, ar, c.threads, isa);
     }
     give_back();
-}
-
-// ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range); the
-// weights are converted to FP16, the registered kernel's convention.
-int Exl3Quant::dispatch(const Layer& l, const ForwardCall& c, const RouteTable&, Isa isa)
-{
-    static thread_local std::vector<at::Half> wts;
-    const size_t n = static_cast<size_t>(c.rows) * c.k;
-    wts.resize(n);
-    for (size_t i = 0; i < n; ++i) wts[i] = at::Half(c.weights[i]);
-    run_forward(l, isa, static_cast<const at::Half*>(c.x), c.slots, wts.data(), c.out, c.rows, c.k, c.threads,
-                c.accumulate != 0);
     return 0;
 }
 

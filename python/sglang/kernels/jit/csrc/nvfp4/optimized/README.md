@@ -34,19 +34,20 @@ The library's kernel is a `CpuExpertKernel` behind its accessor `nvfp4_cpu_kerne
 interposed across libraries). Python reaches it through the library's tvm-ffi export `nvfp4_cpu_kernel_address`
 (`ffi.cpp`, on `nvfp4.ext.nvfp4_cpu_module()`), and hands that address to
 `ExpertStreamHost.enable_cpu_experts`. The host makes each layer with the kernel's `make_layer`
-(`ExpertStreamHost.set_cpu_layer`) from a `CpuExpertLayerSpec` (`Nvfp4CpuQuantTrait.layer_spec`): seven slabs
-(`LayerSlabs`) and a `SglangNvfp4CpuParams` (W13 layout, inverse input scales; `kernel.h`) as the params bytes, packed by the library's export `nvfp4_cpu_params`. A
-layer stores views; the registrant keeps the slabs alive while the host may read them. The optimized kernel never
+(`ExpertStreamHost.set_cpu_layer`) from a `CpuExpertLayerSpec` (`Nvfp4CpuQuantTrait.layer_spec`): seven slabs and the
+shape (an `ExpertLayer`, `kernel.hpp`) and a `SglangNvfp4CpuParams` (W13 layout, inverse input scales; `kernel.h`) as
+the params bytes, packed by the library's export `nvfp4_cpu_params`. A layer is a value of views, its params stored in
+it; the registrant keeps the slabs alive while the host may read them. The optimized kernel never
 repacks or expands full weight rows. A native caller does the same through `kernel.h`:
 
 ```cpp
 const auto& kernel = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel();
-// Populate d (LayerSlabs) with this layer's verified slab pointers and strides, and params.
-std::unique_ptr<CpuExpertLayer> layer =
-    kernel.make_layer(d, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)));
+// Populate shape (an ExpertLayer) with this layer's verified slab pointers and strides, and params.
+const ExpertLayer layer =
+    kernel.make_layer(shape, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)));
 ForwardCall call;  // rows, k, threads, x, slots, weights, out, accumulate
 call.cores = cores;  // worker i on cores[i]; distinct, at least call.threads of them
-kernel.forward(*layer, call);  // throws std::invalid_argument on a refused call, out untouched
+kernel.forward(layer, call);  // throws std::invalid_argument on a refused call, out untouched
 ```
 
 A refused call throws `std::invalid_argument`, a failure another `std::exception`; either leaves `out` untouched.
@@ -130,11 +131,11 @@ pointers cannot prove allocation size. A refused call throws `std::invalid_argum
 
 ## Code layout
 
-The layer registry, argument and route validation, worker cores, keep-warm and the six C functions are the shared
-CPU experts framework's (`expert_stream/host/cpu_experts/`, `ExpertForward<Nvfp4Quant>`). `quant.hpp` holds `Nvfp4Quant`
-(slab names and minimum strides, parameter validation, the registered `Layer`, a slot's projections) and the layer
-facts; `math.hpp` the ISA-independent arithmetic (`GpuRow`, Q8_0 quantization, the gated SiLU) and `dot_rows<Isa, M>`,
-whose tiers are `math_scalar.hpp` and `math_avx2.hpp` (compiled for AVX2 by function attribute); `forward_plan.hpp`
+Layer and argument validation, worker cores and keep-warm are the shared CPU experts framework's
+(`expert_stream/host/cpu_experts/`, `ExpertForward<Nvfp4Quant>`). `quant.hpp` holds `Nvfp4Quant` (slab names and
+`row_bytes`, each slab's minimum stride; parameter validation; `Expert`, a slot's three projections read from its
+`ExpertRow`); `math.hpp` the ISA-independent arithmetic (`GpuRow`, Q8_0 quantization, the gated SiLU) and
+`dot_rows<Isa, M>`, whose tiers are `math_scalar.hpp` and `math_avx2.hpp` (compiled for AVX2 by function attribute); `forward_plan.hpp`
 holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and its per-thread scratch, `ForwardArena`;
 `kernel.cpp` defines `Nvfp4Quant::dispatch` and the kernel's accessor (`nvfp4_cpu_kernel`). A forward is
 `ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `Nvfp4Quant::dispatch` from the tier
@@ -142,13 +143,12 @@ holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and its per-th
 AVX2 tier, else `ForwardPlan<GenericShape, Isa::Avx2>` or `ForwardPlan<GenericShape, Isa::Scalar>`.
 An AVX2 plan enters its gate/up and down row loops through `gate_up_avx2`/`down_avx2`, compiled for AVX2 with
 everything they call inlined (`flatten`), once per phase per worker; the rest of the library is baseline x86-64.
-`PlanTraits<Shape, Isa>` holds the plan's knobs (`kRowUnit`, the split unit). The plan groups a call's routes into
+`kRowUnit` is the plans' split unit. The plan builds the call's `RouteTable` and groups a call's routes into
 units, one per (token, slot), and units into chunks of up to `kChunkRows` (4) of one slot; `dot_rows<Isa, M>` decodes
 each weight row once per chunk. A plan reads every layer fact it may fix
-through its Shape (`shapes.hpp`): `GenericShape` from the layer's `LayerSlabs`, `MimoV26ProShape` as compile-time
-constants (MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp). Plans read a slot's projections through
-`Nvfp4Quant::decode` over the layer's `LayerSlabs` (the descriptor's slab bases and strides, `slot_bases`); `SlabRowBytes`
-is each slab's minimum stride.
+through its Shape (`shapes.hpp`): `GenericShape` from the `ExpertLayer`, `MimoV26ProShape` as compile-time constants
+(MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp); the W13 layout and input scales are the layer's params.
+Plans read a slot's projections through `Nvfp4Quant::expert(layer[slot])`.
 
 Bit-exact checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (the avx2 and scalar tiers
 of one build against a baseline worktree's dumps), and

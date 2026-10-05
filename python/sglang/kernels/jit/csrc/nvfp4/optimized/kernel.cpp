@@ -20,12 +20,13 @@ constexpr int kChunkRows = 4;
 
 // The detected tier (min(host, kTopIsa, NVFP4_CPU_MAX_ISA)) picks the plan: the MiMo plan when the layer is that
 // model's routed expert at the AVX2 tier, else the generic plan at the tier.
-int Nvfp4Quant::dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa)
+int Nvfp4Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa)
 {
+    const RouteTable r = RouteTable::build(c.slots, c.weights, c.rows, c.k);
     if (isa >= Isa::Avx2 && MimoV26ProShape::accepts(l))
-        return ForwardPlan<MimoV26ProShape, Isa::Avx2>::run(l, c, r);
-    return isa >= Isa::Avx2 ? ForwardPlan<GenericShape, Isa::Avx2>::run(l, c, r)
-                            : ForwardPlan<GenericShape, Isa::Scalar>::run(l, c, r);
+        return ForwardPlan<MimoV26ProShape, Isa::Avx2>::run(l, p, c, r);
+    return isa >= Isa::Avx2 ? ForwardPlan<GenericShape, Isa::Avx2>::run(l, p, c, r)
+                            : ForwardPlan<GenericShape, Isa::Scalar>::run(l, p, c, r);
 }
 
 }  // namespace

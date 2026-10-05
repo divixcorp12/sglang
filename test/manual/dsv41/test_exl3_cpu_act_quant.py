@@ -6,8 +6,9 @@ tier (fp32 activations, which ignores the options):
   - a 5-token batch gives each token the same bits as running it alone (chunks are capped for the residual rows);
   - the relative error against the scalar tier is under the flavor's bound.
 
-Needs SGLANG_EXL3_SRC and an AVX2-or-better CPU; each ISA tier runs in its own process, since the tier is fixed at
-the first kernel call. Run on divix01 under taskset, e.g.
+Needs SGLANG_EXL3_SRC and an AVX2-or-better CPU, and builds the expert-stream host module's instrumented variant for its
+test exports (kernel_layer, kernel_forward; CXX the kernels' GCC 15, as run_exl3_cpu_forward_checks.sh sets it). Each
+ISA tier runs in its own process, since the tier is fixed at the first kernel call. Run on divix01 under taskset, e.g.
   SGLANG_EXL3_CPU_ACT_RESIDUAL=1 SGLANG_EXL3_CPU_ACT_BLOCK=128 \\
     taskset -c 18-25 python -m pytest test/manual/dsv41/test_exl3_cpu_act_quant.py -q
 """
@@ -50,32 +51,52 @@ def _weights(torch):
     return w, x, sel, (rw / rw.sum(-1, keepdim=True)).half()
 
 
+def _slabs(torch, w, tr):
+    """The experts as the pinned tier holds them, expert e in slot e: w13 rows hold gate then up, w2 rows hold down."""
+
+    def stack(*parts):
+        return torch.stack([torch.stack([p[e] for p in parts]) for e in range(E)]).contiguous()
+
+    return {
+        "w13_trellis": stack([tr(t) for t in w["gt"]], [tr(t) for t in w["ut"]]),
+        "w13_suh": stack(w["gs"], w["us"]),
+        "w13_svh": stack(w["gv"], w["uv"]),
+        "w2_trellis": stack([tr(t) for t in w["dt"]]),
+        "w2_suh": stack(w["ds"]),
+        "w2_svh": stack(w["dv"]),
+    }
+
+
 def _run(tier, out_path):
     os.environ["EXL3_MOE_CPU_MAX_ISA"] = tier
     os.environ.setdefault("EXL3_MOE_CPU_PIN", "0")
     import torch
 
+    from sglang.kernels.ops.moe import expert_stream_transport as es
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     e = exl3_ext()
     w, x, sel, rw = _weights(torch)
     threads = min(8, len(os.sched_getaffinity(0)))
     res = {"bw": bool(e.exl3_moe_cpu_has_avx512_bw())}
+
+    def forward(layer, rows):
+        out = torch.zeros(x[rows].shape[0], H)
+        status, why = es.kernel_forward(layer, x[rows], sel[rows], rw[rows], out, threads=threads, variant="instr")
+        assert status == 0, why
+        return out
+
     for layout in ("native", "swizzled") if tier != "scalar" else ("native",):
         swz = layout == "swizzled"
-        tr = _swizzle if swz else (lambda t: t)
-        h = e.exl3_moe_cpu_make_layer(
-            [tr(t) for t in w["gt"]], w["gs"], w["gv"], [tr(t) for t in w["ut"]], w["us"], w["uv"],
-            [tr(t) for t in w["dt"]], w["ds"], w["dv"], [], [], [], 0, SWIGLU_LIMIT, int(swz),
-        )
-        batch = torch.zeros(TOKENS, H)
-        e.exl3_moe_cpu_forward(h, x, sel, rw, batch, threads)
-        single = torch.zeros(TOKENS, H)
-        for t in range(TOKENS):
-            out = torch.zeros(1, H)
-            e.exl3_moe_cpu_forward(h, x[t : t + 1], sel[t : t + 1], rw[t : t + 1], out, threads)
-            single[t] = out[0]
-        e.exl3_moe_cpu_free_layer(h)
+        trait = Exl3CpuQuantTrait(e, act_limit=SWIGLU_LIMIT, swizzled=swz)
+        spec = trait.layer_spec(_slabs(torch, w, _swizzle if swz else (lambda t: t)), E)
+        layer = es.kernel_layer(trait.kernel_address(), spec, variant="instr")
+        try:
+            batch = forward(layer, slice(0, TOKENS))
+            single = torch.cat([forward(layer, slice(t, t + 1)) for t in range(TOKENS)])
+        finally:
+            es.kernel_drop(layer, variant="instr")
         res[layout] = {"batch": batch, "single": single}
     torch.save(res, out_path)
 

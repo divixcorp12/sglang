@@ -14,7 +14,7 @@ import torch
 
 @dataclasses.dataclass(frozen=True)
 class CpuExpertLayerSpec:
-    """One layer's pinned host tier as the kernel's ``make_layer`` reads it (``LayerSlabs``), and the quant's parameter
+    """One layer's pinned host tier as the kernel's ``make_layer`` reads it (``ExpertLayer``), and the quant's parameter
     bytes.
 
     ``slabs`` holds one ``(address, slot bytes)`` pair per slab in the quant's order, ``(0, 0)`` for an absent optional

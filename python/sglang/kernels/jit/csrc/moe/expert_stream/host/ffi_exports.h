@@ -381,9 +381,10 @@ struct HostExports {
     find(handle)->arm_copy_engine(on != 0);
   }
 
-  // A slab table and a layer's scalars as LayerSlabs (set_cpu_layer, the test export kernel_layer): `slabs` int64
-  // [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab), n <= kMaxSlabs.
-  static cpu_experts::LayerSlabs layer_slabs(
+  // A slab table and a layer's scalars as the ExpertLayer make_layer takes (set_cpu_layer, the test export kernel_layer):
+  // `slabs` int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab),
+  // n <= kMaxSlabs.
+  static cpu_experts::ExpertLayer layer_shape(
       TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation, double act_limit) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -391,7 +392,7 @@ struct HostExports {
     if (slabs.size(0) > cpu_experts::kMaxSlabs)
       throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer has at most " +
                                std::to_string(cpu_experts::kMaxSlabs) + " slabs");
-    cpu_experts::LayerSlabs d;
+    cpu_experts::ExpertLayer d;
     d.capacity = static_cast<int32_t>(capacity);
     d.hidden = static_cast<int32_t>(hidden);
     d.intermediate = static_cast<int32_t>(intermediate);
@@ -487,7 +488,7 @@ struct HostExports {
       double act_limit,
       TensorView params) {
     find(handle)->make_cpu_layer(
-        row, layer_slabs(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params));
+        row, layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params));
   }
 
   // Reserves every row's staging slots (up to k, fewer on a small tier) and publishes its first map delta

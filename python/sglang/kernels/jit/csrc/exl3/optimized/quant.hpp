@@ -1,5 +1,6 @@
-// Exl3Quant: the EXL3 CPU expert quant for ExpertForward (host/cpu_experts/expert_forward.hpp), with the layer facts
-// and the expert accessors a forward plan reads. forward_plan.hpp defines Exl3Quant::dispatch.
+// Exl3Quant: the EXL3 CPU expert quant for ExpertForward (host/cpu_experts/expert_forward.hpp), and its typed view of
+// a layer's expert slots (Experts<Shape>: each projection a MoeCpuMatrix over the slot's ExpertRow). forward_plan.hpp
+// defines Exl3Quant::dispatch.
 #pragma once
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
@@ -8,13 +9,10 @@
 #include "../../moe/expert_stream/host/cpu_experts/expert_forward.hpp"
 #include "kernel.h"
 #include <c10/util/Half.h>
-#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
-#include <memory>
 
 
 namespace sglang::exl3_cpu {
@@ -28,17 +26,12 @@ enum SlabName { kW13Trellis, kW13Suh, kW13Svh, kW2Trellis, kW2Suh, kW2Svh, kSlab
 // The fewest bytes one slot's row of each slab holds. w13 rows hold gate (part 0) then up (part 1); w2 rows hold
 // down. A trellis is [k/16][n/16][16 * bits] uint16, i.e. k * n * bits / 8 bytes; sign vectors are fp16.
 // Registration refuses a smaller stride; at exactly these strides every address equals the packed layout's.
-struct SlabRowBytes
+constexpr std::array<uint64_t, kSlabNames> row_bytes(int hidden, int intermediate, int bits)
 {
-    uint64_t bytes[kSlabNames];
-
-    static constexpr SlabRowBytes of(int hidden, int intermediate, int bits)
-    {
-        const uint64_t trellis = uint64_t(hidden) * uint64_t(intermediate) * uint64_t(bits) / 8;
-        return {{2 * trellis, 2 * 2 * uint64_t(hidden), 2 * 2 * uint64_t(intermediate),
-                 trellis, 2 * uint64_t(intermediate), 2 * uint64_t(hidden)}};
-    }
-};
+    const uint64_t trellis = uint64_t(hidden) * uint64_t(intermediate) * uint64_t(bits) / 8;
+    return {2 * trellis, 2 * 2 * uint64_t(hidden), 2 * 2 * uint64_t(intermediate),
+            trellis, 2 * uint64_t(intermediate), 2 * uint64_t(hidden)};
+}
 
 // One projection's matrix over a slot's trellis and sign vectors (k inputs, n outputs).
 inline MoeCpuMatrix exl3_matrix(const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int k, int n, int bits,
@@ -56,15 +49,6 @@ inline MoeCpuMatrix exl3_matrix(const uint8_t* trellis, const uint8_t* suh, cons
     return m;
 }
 
-// Part 0 (gate) or 1 (up) of a slot's w13 rows, given the slot's first byte in each w13 slab.
-inline MoeCpuMatrix w13_part(const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int part, int hidden,
-                             int intermediate, int bits, int swz)
-{
-    const SlabRowBytes r = SlabRowBytes::of(hidden, intermediate, bits);
-    return exl3_matrix(trellis + part * (r.bytes[kW13Trellis] / 2), suh + part * (r.bytes[kW13Suh] / 2),
-                       svh + part * (r.bytes[kW13Svh] / 2), hidden, intermediate, bits, swz);
-}
-
 struct Exl3Quant
 {
     static constexpr const char* kName = "exl3";
@@ -78,112 +62,63 @@ struct Exl3Quant
     static constexpr const char* kIsaReportEnv = "EXL3_MOE_CPU_REPORT_ISA";
     using Params = SglangExl3CpuParams;
 
-    // One slot's three projections, as the plans read them.
-    struct Row
+    static std::array<uint64_t, kSlabs> row_bytes(const ExpertLayer& l, const Params& p)
     {
-        MoeCpuMatrix gate, up, down;
-    };
-
-    // `slabs`: capacity (the routable slots), hidden (k of gate/up, n of down), intermediate (n of gate/up, k of
-    // down), activation (0 silu, 1 gelu, 2 relu2 (gateless), 3 swiglu_oai) and act_limit. A slab layer (make_layer)
-    // keeps its descriptor as made, and the slabs' bits/swz. A table layer (exl3_moe_cpu_make_layer) holds `table`;
-    // its slabs carry only those scalars, capacity being its expert count.
-    struct Layer
-    {
-        LayerSlabs slabs;
-        bool gated;
-        int bits;
-        int swz;
-        std::unique_ptr<MoeCpuLayer> table;
-    };
-
-    static std::array<uint64_t, kSlabs> min_slot_bytes(const LayerSlabs& d, const Params& p)
-    {
-        const SlabRowBytes minimum = SlabRowBytes::of(d.hidden, d.intermediate, p.bits);
-        std::array<uint64_t, kSlabs> bytes;
-        std::copy(std::begin(minimum.bytes), std::end(minimum.bytes), bytes.begin());
-        return bytes;
+        return ::sglang::exl3_cpu::row_bytes(l.hidden, l.intermediate, p.bits);
     }
 
-    // The descriptor's scalars and the parameters; ExpertForward checks the slabs against min_slot_bytes. The
-    // dimensions are make_matrix's limits: 128-element blocks, and k <= 8192 for the int32 accumulators.
-    static int validate(const LayerSlabs& d, const Params* p)
+    // The layer's shape and the parameters (ExpertForward checks the slabs against row_bytes): make_matrix's limits,
+    // 128-element blocks and k <= 8192 for the int32 accumulators, and gated SiLU. Normalizes swizzled to the layout
+    // the slabs hold: 8-bit trellises are never swizzled.
+    static const char* validate(const ExpertLayer& l, Params& p)
     {
-        if (!p || p->bits < 1 || p->bits > 8 || (p->swizzled != 0 && p->swizzled != 1)) return 2;
-        if (d.hidden < 128 || d.intermediate < 128 || d.hidden % 128 || d.intermediate % 128 || d.hidden > 8192
-            || d.intermediate > 8192)
-            return 2;
-        if (d.activation != 0 || !std::isfinite(d.act_limit) || d.act_limit < 0.0f) return 2;
-        return 0;
+        if (p.bits < 1 || p.bits > 8 || (p.swizzled != 0 && p.swizzled != 1))
+            return "bits must be in [1, 8] and swizzled 0 or 1";
+        if (l.hidden < 128 || l.intermediate < 128 || l.hidden % 128 || l.intermediate % 128 || l.hidden > 8192
+            || l.intermediate > 8192)
+            return "hidden and intermediate must be multiples of 128 in [128, 8192]";
+        if (l.activation != 0 || !std::isfinite(l.act_limit) || l.act_limit < 0.0f)
+            return "the activation must be gated SiLU with a finite, non-negative act_limit";
+        if (p.bits == 8) p.swizzled = 0;
+        return nullptr;
     }
 
-    static Layer make_layer(const LayerSlabs& d, const Params* p)
-    {
-        return {d,
-                true,
-                p->bits,
-                p->swizzled && p->bits != 8 ? 1 : 0,  // make_matrix's rule: K8 is never swizzled
-                nullptr};
-    }
-
-    static int check_slot(const Layer&, int) { return 0; }
-
-    // A slab layer's slot, from its first byte in each slab (LayerSlabs::slot_bases).
-    static Row decode(const uint8_t* const* base, const Layer& l)
-    {
-        const int h = l.slabs.hidden, n = l.slabs.intermediate;
-        return {w13_part(base[kW13Trellis], base[kW13Suh], base[kW13Svh], 0, h, n, l.bits, l.swz),
-                w13_part(base[kW13Trellis], base[kW13Suh], base[kW13Svh], 1, h, n, l.bits, l.swz),
-                exl3_matrix(base[kW2Trellis], base[kW2Suh], base[kW2Svh], n, h, l.bits, l.swz)};
-    }
+    static bool usable(const ExpertLayer&, const Params&, int) { return true; }
 
     // Defined at the end of forward_plan.hpp.
-    static int dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa);
+    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa);
 };
 
-// The plans read a layer's experts through an accessor: gate(e), up(e), down(e) of slot e.
-
-// A table layer: one MoeCpuMatrix per expert and projection, wherever each tensor lives.
-struct TableExperts
-{
-    const MoeCpuLayer* layer;
-    const MoeCpuMatrix& gate(int e) const { return layer->gates[e]; }
-    const MoeCpuMatrix& up(int e) const { return layer->ups[e]; }
-    const MoeCpuMatrix& down(int e) const { return layer->downs[e]; }
-};
-
-// A slab layer: slot e of slab i at slabs[i] + e * slot_bytes[i], nothing stored per expert. A fixed Shape
-// (Dsv41Shape) makes the dimensions compile-time constants; GenericShape reads them from the layer.
+// The layer's experts as the plans read them: slot e's gate, up and down, each a MoeCpuMatrix over the slot's
+// ExpertRow. A fixed Shape (Dsv41Shape) makes the dimensions compile-time constants; GenericShape reads them from the
+// layer and its params.
 template <class Shape>
-struct StridedExperts
+struct Experts
 {
-    const Exl3Quant::Layer* layer;
+    const ExpertLayer* layer;
+    Exl3Quant::Params params;
 
-    int H() const { if constexpr (Shape::kFixed) return Shape::kHidden; else return layer->slabs.hidden; }
-    int I() const { if constexpr (Shape::kFixed) return Shape::kIntermediate; else return layer->slabs.intermediate; }
-    int B() const { if constexpr (Shape::kFixed) return Shape::kBits; else return layer->bits; }
+    int H() const { if constexpr (Shape::kFixed) return Shape::kHidden; else return layer->hidden; }
+    int I() const { if constexpr (Shape::kFixed) return Shape::kIntermediate; else return layer->intermediate; }
+    int B() const { if constexpr (Shape::kFixed) return Shape::kBits; else return params.bits; }
 
     MoeCpuMatrix gate(int e) const { return w13(e, 0); }
     MoeCpuMatrix up(int e) const { return w13(e, 1); }
     MoeCpuMatrix down(int e) const
     {
-        return exl3_matrix(at(kW2Trellis, e), at(kW2Suh, e), at(kW2Svh, e), I(), H(), B(), layer->swz);
+        const ExpertRow r = (*layer)[e];
+        return exl3_matrix(r.slab[kW2Trellis], r.slab[kW2Suh], r.slab[kW2Svh], I(), H(), B(), params.swizzled);
     }
-
-    // The same slabs under another shape's assumptions (the caller has checked they hold).
-    template <class Other>
-    StridedExperts<Other> as() const { return {layer}; }
 
 private:
-    // LayerSlabs::slot(name, e) without its absent-slab check: a slab layer has all six.
-    const uint8_t* at(SlabName name, int e) const
-    {
-        return static_cast<const uint8_t*>(layer->slabs.slabs[name]) + size_t(e) * layer->slabs.slot_bytes[name];
-    }
-
+    // Part 0 (gate) or 1 (up) of the slot's w13 rows.
     MoeCpuMatrix w13(int e, int part) const
     {
-        return w13_part(at(kW13Trellis, e), at(kW13Suh, e), at(kW13Svh, e), part, H(), I(), B(), layer->swz);
+        const ExpertRow r = (*layer)[e];
+        const std::array<uint64_t, kSlabNames> row = row_bytes(H(), I(), B());
+        return exl3_matrix(r.slab[kW13Trellis] + part * (row[kW13Trellis] / 2),
+                           r.slab[kW13Suh] + part * (row[kW13Suh] / 2), r.slab[kW13Svh] + part * (row[kW13Svh] / 2),
+                           H(), I(), B(), params.swizzled);
     }
 };
 

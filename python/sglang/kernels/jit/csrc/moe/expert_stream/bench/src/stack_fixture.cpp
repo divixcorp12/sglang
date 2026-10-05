@@ -157,10 +157,10 @@ void StackFixture::write_x(int64_t row) const {
 // Mirrors Exl3CpuQuantTrait.layer_spec: the row's six slabs by base pointer and row stride (kNames is
 // EXL3_STREAMED_NAMES' order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit, made into a layer
 // by the EXL3 kernel. Views only: the fixture's slabs outlive it.
-std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> StackFixture::make_layer(int64_t row) const {
+::sglang::cpu_experts::ExpertLayer StackFixture::make_layer(int64_t row) const {
   const Impl& f = *impl_;
   const SglangExl3CpuParams params{3, 0};  // bits, swizzled
-  ::sglang::cpu_experts::LayerSlabs d;
+  ::sglang::cpu_experts::ExpertLayer d;
   d.capacity = static_cast<int32_t>(capacity());
   d.hidden = static_cast<int32_t>(f.hidden);
   d.intermediate = static_cast<int32_t>(f.intermediate);

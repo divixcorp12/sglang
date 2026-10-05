@@ -232,8 +232,8 @@ class Stack {
   }
 
   // Installs the row's CPU layer (StackFixture::make_layer), made by the stack's kernel.
-  void set_cpu_layer(int64_t row, std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> layer) {
-    tier_->set_cpu_layer(row, std::move(layer));
+  void set_cpu_layer(int64_t row, const ::sglang::cpu_experts::ExpertLayer& layer) {
+    tier_->set_cpu_layer(row, layer);
   }
 
   // Replaces every group's split table: of a post's n eligible hit lanes on a node, the CPU takes the last split[n].
