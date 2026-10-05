@@ -1276,6 +1276,18 @@ class TestInsertOnMissDirect(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"):
             _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **IOM)
 
+    def test_the_fused_remap_rows_hold_the_routes(self):
+        """Layer fusion's remap rows are as wide as a gather's routes: one token's at BS1, unchanged, and every
+        route of a verify whose misses are narrower."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
+            one = _manager(_model(), gpu=True, **DIRECT)
+            verify = _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **DIRECT)
+        for manager, routes in ((one, TOP_K), (verify, 3 * TOP_K)):
+            for remaps in manager.gpu_residency.fused_remaps.values():
+                self.assertEqual(tuple(remaps.shape), (LAYERS, routes))
+
     def test_a_negative_miss_width_is_refused(self):
         with self.assertRaisesRegex(ValueError, "miss lanes"):
             _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=-1, **DIRECT)
