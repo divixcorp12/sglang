@@ -411,6 +411,15 @@ class TestManagerPlacement(unittest.TestCase):
                 ExpertPinnedHostCacheManager.from_model(self.model, budget_bytes=4 * MIB)
             allocate.assert_not_called()
 
+    def test_a_model_without_streamed_experts_checks_no_capacity(self):
+        # A DSpark draft runner shares the target's budget env but streams nothing; the target already holds the tier.
+        with envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(
+            host_numa, "check_capacity", side_effect=ValueError("short")
+        ) as check:
+            manager = ExpertPinnedHostCacheManager.from_model(torch.nn.Linear(2, 2), budget_bytes=4 * MIB)
+        self.assertIsNone(manager)
+        check.assert_not_called()
+
     @unittest.skipUnless(MBIND_PERMITTED, "mbind is not permitted here")
     def test_the_manager_binds_every_slab_and_logs_the_placement(self):
         with envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("0:4"), patch.object(host_numa, "check_capacity"):

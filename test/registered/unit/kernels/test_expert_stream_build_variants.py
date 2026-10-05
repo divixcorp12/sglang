@@ -141,16 +141,6 @@ RAW_EXPORTS = {
     "test_kernel_hold": lambda m, h: m.expert_stream_test_kernel_hold(0, 0),
     "test_keep_warm_calls": lambda m, h: m.expert_stream_test_keep_warm_calls(),
     "test_keep_warm_core": lambda m, h: m.expert_stream_test_keep_warm_core(),
-    "kernel_layer": lambda m, h: m.expert_stream_kernel_layer(
-        0, torch.zeros((0, 2), dtype=torch.int64), 0, 0, 0, 0, 0.0, torch.zeros(0, dtype=torch.uint8)
-    ),
-    "kernel_forward": lambda m, h: m.expert_stream_kernel_forward(
-        0, torch.zeros(1, dtype=torch.uint8), torch.zeros((1, 1), dtype=torch.int32),
-        torch.zeros((1, 1), dtype=torch.float32), torch.zeros((1, 1), dtype=torch.float32), 1,
-        torch.zeros(0, dtype=torch.int64), 0,
-    ),
-    "kernel_drop": lambda m, h: m.expert_stream_kernel_drop(0),
-    "kernel_error": lambda m, h: m.expert_stream_kernel_error(),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
         torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),
@@ -181,12 +171,9 @@ def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
     "helper",
     (
         "read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields",
-        "kernel_layer", "kernel_forward", "kernel_drop",
     ),
 )
 def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
-    from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
-
     s = ram_miss_setup(tmp_path)
     calls = {
         "read_rows_with_fault": lambda: ops.read_rows_with_fault(s.tables, 0, [1], [0], [], [], variant="prod"),
@@ -196,16 +183,38 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
         "read_record_fields": lambda: ops.read_record_fields(
             torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, variant="prod"
         ),
-        "kernel_layer": lambda: ops.kernel_layer(0, fake_cpu_layer(), variant="prod"),
-        "kernel_forward": lambda: ops.kernel_forward(
-            0, torch.zeros((1, 8), dtype=torch.float16), torch.zeros((1, 1)), torch.zeros((1, 1)),
-            torch.zeros((1, 8)), threads=1, variant="prod",
-        ),
-        "kernel_drop": lambda: ops.kernel_drop(0, variant="prod"),
     }
     export = {"read_rows_with_fault": "read_rows_faulted"}.get(helper, helper)  # the name the error carries
     with pytest.raises(RuntimeError, match=f"{export} is test-only"):
         calls[helper]()
+
+
+def test_the_draft_kernel_exports_run_multi_row_forwards_on_prod(tmp_path):
+    """The DSpark draft computes its CPU experts through kernel_layer/kernel_forward (cpu_experts/draft.py), so the
+    production build serves them: two rows through the instr build's fake kernel, out[t][j] = j + sum(w * (s + 1))."""
+    from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
+
+    s = ram_miss_setup(tmp_path, capacity=2)
+    instr = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+                             variant="instr")
+    try:
+        assert not {"kernel_layer", "kernel_forward", "kernel_error", "kernel_drop"} & set(ops.TEST_ONLY_EXPORTS)
+        layer = ops.kernel_layer(instr.test_kernel_address(), fake_cpu_layer(hidden=4), variant="prod")
+        slots = torch.tensor([[0, 2], [1, -1]], dtype=torch.int32)
+        weights = torch.tensor([[0.5, 0.25], [2.0, 9.0]])
+        out = torch.full((2, 4), float("nan"))
+        status, why = ops.kernel_forward(
+            layer, torch.zeros((2, 4), dtype=torch.float16), slots, weights, out, threads=1, variant="prod"
+        )
+        assert (status, why) == (0, "")
+        j = torch.arange(4, dtype=torch.float32)
+        assert torch.equal(out, torch.stack([j + 0.5 * 1 + 0.25 * 3, j + 2.0 * 2]))
+        ops.kernel_drop(layer, variant="prod")
+        with pytest.raises(RuntimeError, match="no layer"):
+            ops.kernel_forward(layer, torch.zeros((2, 4), dtype=torch.float16), slots, weights, out, threads=1,
+                               variant="prod")
+    finally:
+        instr.stop()
 
 
 def test_a_traced_read_on_prod_reads_exact_bytes_with_an_empty_record_and_refuses_a_fault(tmp_path):
