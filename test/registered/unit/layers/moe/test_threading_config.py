@@ -237,7 +237,10 @@ def test_from_env_reads_every_core_setting(monkeypatch):
             envs.SGLANG_EXPERT_STREAM_URING_MODE.override("sqpoll_iopoll"), \
             envs.SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU.override(15), \
             envs.SGLANG_EXPERT_NUMA_CORES.override("1:ram=35,cpu=18-33"), \
-            envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("1:1024,0:1024"):
+            envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("1:1024,0:1024"), \
+            envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.override(True), \
+            envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override("6-11"), \
+            envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.override(3):
         assert ThreadingConfig.from_env(cpu_experts=True, device=None) == "resolved"
     assert seen == {
         "nodes": [1, 0],
@@ -246,6 +249,63 @@ def test_from_env_reads_every_core_setting(monkeypatch):
         "topology": "topology",
         "settings": CoreSettings(
             cpu_experts=True, cores="18-29", threads=4, spin_core=17, sqpoll=True, sq_thread_cpu=15,
-            numa_cores="1:ram=35,cpu=18-33", omp_thread_limit=24,
+            numa_cores="1:ram=35,cpu=18-33", omp_thread_limit=24, draft=True, draft_cores="6-11", draft_threads=3,
         ),
     }
+
+
+# The recipe's server cores (benchmarks/dsv41_baseline/arm_env.py SERVER_CORES): node 0's 6-17 and their siblings free.
+RECIPE_SERVER = frozenset(parse_cpu_list("0-5,36-41"))
+
+
+def test_the_draft_takes_the_gpu_nodes_cores_left_after_the_copy_and_ram_threads(divix01):
+    """Only the server's affinity and the draft switch are given; every thread's core is derived. Mutant: derive the
+    draft before the node plans -- red (the draft takes 16 and 17's neighbours, the RAM thread lands lower)."""
+    config = resolve(divix01, affinity=RECIPE_SERVER, draft=True)
+    assert config.copy_cpus == (17,)
+    assert [p.ram for p in config.plans] == [16, 35]
+    assert config.draft_cpus == tuple(range(6, 16))
+    assert config.log_lines()[-1] == "numa dspark draft: node0 cpus=6-15 (10)"
+
+
+def test_the_draft_threads_cap_takes_the_lowest_free_cores(divix01):
+    config = resolve(divix01, affinity=RECIPE_SERVER, draft=True, draft_threads=4)
+    assert config.draft_cpus == (6, 7, 8, 9)
+
+
+def test_a_one_node_tier_with_the_draft_on_is_derived(divix01):
+    """Without the draft this tier is today's underived runtime; with it, the draft's cores must be kept off the copy
+    and RAM threads, so the plan is derived."""
+    config = resolve(divix01, nodes=(0,), affinity=RECIPE_SERVER, draft=True)
+    assert (config.copy_cpus, config.plans[0].ram, config.draft_cpus) == ((17,), 16, tuple(range(6, 16)))
+
+
+def test_without_the_draft_there_are_no_draft_cores(divix01):
+    assert resolve(divix01, affinity=RECIPE_SERVER, spin_core=17).draft_cpus == ()
+
+
+def test_named_draft_cores_are_left_out_of_every_derived_role(divix01):
+    """D2-3's graphed arm: the draft held 6-17 by name and the copy and RAM threads were placed among them. Named draft
+    cores are taken first, so the derived threads go below them. Mutant: leave the draft out of `taken` -- red."""
+    config = resolve(divix01, affinity=RECIPE_SERVER, draft=True, draft_cores="8-17")
+    assert config.copy_cpus == (7,) and config.plans[0].ram == 6
+    assert config.draft_cpus == tuple(range(8, 18))
+
+
+@pytest.mark.parametrize(
+    "settings, match",
+    [
+        ({"spin_core": 17}, "core 17 is named both for the DSpark draft"),
+        ({"spin_core": 17, "draft_cores": "6-16,53"}, "core 17 is named both for the DSpark draft"),
+        ({"numa_cores": "0:ram=12"}, "core 12 is named both for the DSpark draft"),
+    ],
+)
+def test_a_given_role_on_a_named_draft_core_is_refused(divix01, settings, match):
+    settings = {"draft_cores": "6-17", **settings}
+    with pytest.raises(ValueError, match=match):
+        resolve(divix01, affinity=RECIPE_SERVER, draft=True, **settings)
+
+
+def test_too_few_cores_left_for_the_draft_is_refused(divix01):
+    with pytest.raises(ValueError, match=r"node 0: \[15\] is left for the DSpark draft's CPU experts"):
+        resolve(divix01, affinity=RECIPE_SERVER | frozenset(range(6, 15)), draft=True)

@@ -485,13 +485,20 @@ def test_dspark_cpu_experts_without_dspark_are_refused(model_dir):
         _gate(_launch(model_dir), **DSPARK_CPU_ENV)
 
 
-@pytest.mark.parametrize("cores", ["", "18"])
-def test_dspark_cpu_experts_need_two_cores(model_dir, cores):
+def test_dspark_cpu_experts_named_cores_need_two(model_dir):
     with pytest.raises(ValueError, match="SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES"):
         _gate(
             _launch(model_dir, speculative_algorithm="DSPARK"),
-            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": cores},
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "18"},
         )
+
+
+def test_dspark_cpu_experts_without_named_cores_pass(model_dir, cpu_pin_off):
+    """Unset cores: ThreadingConfig derives the draft's cores at its start, so the launch does not ask for them."""
+    _gate(
+        _launch(model_dir, speculative_algorithm="DSPARK"),
+        **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": ""},
+    )
 
 
 def test_a_bad_resident_file_is_refused_at_launch(model_dir, tmp_path, cpu_pin_off):

@@ -141,6 +141,33 @@ def test_the_registry_builds_once_from_the_envs_and_refuses_mixed_limits(monkeyp
             registry.close()
 
 
+def test_without_named_cores_the_registry_runs_on_the_threading_plans_draft_cores(monkeypatch):
+    """Unset SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES: the draft runs on the cores ThreadingConfig derived for it, the plan
+    the RAM-miss service resolves too, so neither lands on the other. Mutant: parse the empty env list -- red (refused
+    for fewer than 2 cores)."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.moe.cpu_experts import draft
+    from sglang.srt.layers.moe.cpu_experts.threading_config import ThreadingConfig
+
+    monkeypatch.setattr(draft, "draft_kernel_for", lambda key, act_limit: _Kernel())
+    cores = tuple(_cores())
+    asked = []
+    monkeypatch.setattr(
+        ThreadingConfig,
+        "from_env",
+        classmethod(lambda cls, **kw: asked.append(kw) or SimpleNamespace(draft_cpus=cores)),
+    )
+    registry = DraftCpuExpertsRegistry()
+    registry.register(_slabs(), _on_cpu(), 10.0, layer_id=0)
+    try:
+        runtime = registry.runtime()
+        assert (tuple(runtime.cores), runtime.threads) == (cores, len(cores))
+        assert len(asked) == 1
+    finally:
+        registry.close()
+
+
 def test_the_registry_refuses_more_threads_than_cores(monkeypatch):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe.cpu_experts import draft
