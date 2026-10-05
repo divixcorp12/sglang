@@ -784,6 +784,9 @@ class Envs:
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
+    # Test only: re-run every graphed DSpark verify eagerly, as an overflowed one is. Its output must equal an eager
+    # verify's (D2-3's end-to-end check of the re-run path).
+    SGLANG_TEST_DSPARK_FORCE_REVERIFY = EnvBool(False)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)

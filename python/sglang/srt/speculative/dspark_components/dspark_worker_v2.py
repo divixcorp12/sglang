@@ -52,6 +52,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
+from sglang.srt.speculative.dspark_components.dspark_graphed_verify import draft_runs_exl3, target_gather_is_narrow
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -393,12 +394,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             == "deepseek_v41"
         )
+        # A narrowed verify gather may flag its forward, whose in-graph epilogue would commit draft KV from wrong hidden states.
         static_epilogue_supported = (
             target_is_dsv41
             and self._verify_planner.mode_value == "static"
             and self._draft_is_moe
             and not get_parallel().enable_dp_attention
             and self.ps.pp_size == 1
+            and not target_gather_is_narrow(self.target_worker.model_runner)
         )
         if (
             (self._verify_planner.is_compact_mode or static_epilogue_supported)
@@ -529,7 +532,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = self._decode_graph_allowed
+        # An EXL3 draft's MoE (exl3_moe_loop) reads expert counts on the host and refuses capture; the draft then runs
+        # eagerly while the target keeps its decode graph.
+        capture_decode_cuda_graph = self._decode_graph_allowed and not draft_runs_exl3(self.draft_model)
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
             self.device,
