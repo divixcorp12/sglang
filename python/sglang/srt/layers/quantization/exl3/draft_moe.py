@@ -33,6 +33,10 @@ class DraftResidentMoe:
     TOKENS = ROW_TILE  # one fused call's tokens; a larger M runs in chunks of TOKENS
 
     def __init__(self, layer, resident_ids: Sequence[int], n_experts: int, device):
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            # The fused MoE sizes its temps by the device's index (exl3_moe_max_concurrency).
+            device = torch.device("cuda", torch.cuda.current_device())
         self.ids = sorted(set(int(e) for e in resident_ids))
         if not self.ids:
             raise ValueError("a DSpark draft stage with no GPU expert has no GPU share; CPU-only stages are not supported")
