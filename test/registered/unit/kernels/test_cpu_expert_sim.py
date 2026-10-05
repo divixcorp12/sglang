@@ -460,3 +460,17 @@ def test_without_protect_reads_a_vram_hot_route_is_not_read_into_ram():
     off = replay_nm(loaded, ram_rows=4, num_experts=8, ram_insert="deferred", protect_reads=False)
     assert on["residency"]["ram_inserted_rows_per_token"] == 2  # 0 (VRAM-hot, routed) and 2
     assert off["residency"]["ram_inserted_rows_per_token"] == 1  # only the VRAM miss 2
+
+
+def test_miss_rows_widens_the_insert_shortlist():
+    # One layer, 16 hot slots holding experts 0-15. Both forwards route 20-27, 8 VRAM misses. With the default
+    # shortlist of 6, two of them stay uninserted and miss again (RAM hits, n = 2); with 8, all 8 land.
+    loaded = {
+        "layer_ids": [0],
+        "hot_capacity": {0: 16},
+        "forwards": [_graph(1, list(range(20, 28)), list(range(16))), _graph(2, list(range(20, 28)), list(range(16)))],
+    }
+    narrow = replay_nm(loaded, ram_rows=64, num_experts=64)
+    wide = replay_nm(loaded, ram_rows=64, num_experts=64, miss_rows=8)
+    assert (narrow["n"] + narrow["m"]).tolist() == [[8], [2]]
+    assert (wide["n"] + wide["m"]).tolist() == [[8], [0]]
