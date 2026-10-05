@@ -1,4 +1,4 @@
-"""JIT wrapper for the fused BS1, top_k<=32 demand route planner."""
+"""JIT wrapper for the fused demand route planners: one token (<= 32 routes), or several with dedup (<= 64)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 MAX_ROUTES = 32
+MAX_DEDUP_ROUTES = 64
 _ROUTING_DTYPES = (torch.int32, torch.int64)
 
 
@@ -22,7 +23,10 @@ def _jit_expert_route_plan_module(topk_dtype: torch.dtype, remap_dtype: torch.dt
         "expert_route_plan",
         *args,
         cuda_files=["moe/expert_route_plan.cuh"],
-        cuda_wrappers=[("plan_unique_routes_gpu", f"plan_unique_routes_gpu<{args}>")],
+        cuda_wrappers=[
+            ("plan_unique_routes_gpu", f"plan_unique_routes_gpu<{args}>"),
+            ("plan_dedup_routes_gpu", f"plan_dedup_routes_gpu<{args}>"),
+        ],
     )
 
 
@@ -71,6 +75,7 @@ def _validate_route_plan_inputs(
     prefetch_count: torch.Tensor,
     outcome_counters: Optional[torch.Tensor],
     miss_keys: Optional[torch.Tensor],
+    max_routes: int,
 ) -> None:
     if topk_ids.device.type != "cuda":
         raise ValueError("topk_ids must be a CUDA tensor.")
@@ -79,8 +84,8 @@ def _validate_route_plan_inputs(
         raise ValueError("topk_ids must be int32 or int64.")
     if topk_ids.ndim != 1:
         raise ValueError("topk_ids must be one-dimensional.")
-    if not 0 < topk_ids.numel() <= MAX_ROUTES:
-        raise ValueError(f"topk_ids must hold 1-{MAX_ROUTES} routes.")
+    if not 0 < topk_ids.numel() <= max_routes:
+        raise ValueError(f"topk_ids must hold 1-{max_routes} routes.")
     _validate_device_tensor("topk_ids", topk_ids, device)
     if expert_to_slot.dtype != torch.int64 or expert_to_slot.ndim != 1:
         raise ValueError("expert_to_slot must be int64 [num_experts].")
@@ -130,6 +135,7 @@ def plan_unique_routes_cuda(
     prefetch_slot: int,
     outcome_counters: Optional[torch.Tensor] = None,
     miss_keys: Optional[torch.Tensor] = None,
+    dedup: bool = False,
 ) -> None:
     """Write a BS1, K<=32 plan into supplied stable CUDA buffers.
 
@@ -142,6 +148,8 @@ def plan_unique_routes_cuda(
     caller joins the side-stream payload before it consumes a covered remap.
     miss_keys is an optional int64 [num_experts] key per expert: when given,
     residual rows are ordered by key, highest first, instead of by route order.
+    ``dedup`` plans several tokens' routes (up to 64) with the kernel that shares a
+    scratch row between an expert's routes.
     """
     _validate_route_plan_inputs(
         topk_ids,
@@ -157,9 +165,10 @@ def plan_unique_routes_cuda(
         prefetch_count,
         outcome_counters,
         miss_keys,
+        MAX_DEDUP_ROUTES if dedup else MAX_ROUTES,
     )
     module = _jit_expert_route_plan_module(topk_ids.dtype, remap_out.dtype)
-    module.plan_unique_routes_gpu(
+    (module.plan_dedup_routes_gpu if dedup else module.plan_unique_routes_gpu)(
         topk_ids,
         expert_to_slot,
         int(scratch_base),

@@ -1459,7 +1459,7 @@ class ExpertStreamer:
         if self._plan_miss_keys is not None and not fused:
             raise RuntimeError(
                 f"layer {self.layer_id}: the sorted miss order needs the fused route plan "
-                "(SGLANG_MOE_EXPERT_FUSED_PLAN, a BS1 gather)"
+                "(SGLANG_MOE_EXPERT_FUSED_PLAN; at most 32 routes of one token or 64 of several)"
             )
         flat = topk_ids.reshape(-1) if fused else topk_ids.reshape(-1).long()
         count = flat.numel()
@@ -1510,6 +1510,7 @@ class ExpertStreamer:
                 outcome_counters=prefetch_outcomes,
                 remap_out=self._graph_fused_remaps[flat.dtype][:count],
                 miss_keys=self._plan_miss_keys,
+                dedup=topk_ids.shape[0] != 1,
             )
             source_rows = self._graph_source_rows[:count]
             scratch = self._graph_scratch_slots[: source_rows.numel()]

@@ -186,4 +186,158 @@ void plan_unique_routes_gpu(
       miss_keys_ptr);
 }
 
+constexpr int kExpertRoutePlanDedupMaxRoutes = 64;
+
+// Several tokens' routes (up to 64): `plan_graph_routes` in one block, one thread per route. An expert's first
+// route is its earliest; only a residual expert's first route takes a scratch row, and every route of that expert
+// remaps to it. Compaction puts those rows first, by first appearance (or by `miss_keys`, highest first, ties by
+// first appearance), then every other route in route order. Counters are `plan_graph_routes`': routes and
+// nonresident routes with multiplicity, hits and misses by distinct expert.
+template <typename IdT, typename RemapT>
+__global__ __launch_bounds__(kExpertRoutePlanDedupMaxRoutes, 1) void plan_dedup_routes_kernel(
+    const IdT* __restrict__ topk_ids,
+    const int64_t* __restrict__ expert_to_slot,
+    int routes,
+    int32_t scratch_base,
+    int64_t* __restrict__ source_rows_out,
+    int32_t* __restrict__ slots_out,
+    int32_t* __restrict__ count_out,
+    RemapT* __restrict__ remap_out,
+    int64_t* __restrict__ graph_counters,
+    int64_t* __restrict__ graph_unique_counters,
+    float* __restrict__ route_counts,
+    const int64_t* __restrict__ prefetch_expert,
+    const int32_t* __restrict__ prefetch_count,
+    int32_t prefetch_slot,
+    int64_t* __restrict__ outcome_counters,
+    const int64_t* __restrict__ miss_keys) {
+  enum : uint8_t { kInactive = 0, kHit = 1, kPrefetched = 2, kResidual = 3 };
+  __shared__ int64_t s_expert[kExpertRoutePlanDedupMaxRoutes];
+  __shared__ int64_t s_key[kExpertRoutePlanDedupMaxRoutes];
+  __shared__ uint8_t s_kind[kExpertRoutePlanDedupMaxRoutes];
+  __shared__ uint8_t s_first[kExpertRoutePlanDedupMaxRoutes];
+  __shared__ int32_t s_rank[kExpertRoutePlanDedupMaxRoutes];
+  const int i = static_cast<int>(threadIdx.x);
+  const bool active = i < routes;
+  const int64_t expert = active ? static_cast<int64_t>(topk_ids[i]) : -1;
+  const int64_t slot = active ? expert_to_slot[expert] : -1;
+  const bool hot_hit = active && slot >= 0;
+  const bool prefetched = active && !hot_hit && prefetch_count[0] == 1 && expert == prefetch_expert[0];
+  const uint8_t kind = !active ? kInactive : hot_hit ? kHit : prefetched ? kPrefetched : kResidual;
+  s_expert[i] = expert;
+  s_key[i] = (miss_keys != nullptr && active) ? miss_keys[expert] : 0;
+  s_kind[i] = kind;
+  __syncthreads();
+  int first = i;
+  for (int j = 0; active && j < i; ++j) {
+    if (s_expert[j] == expert) {
+      first = j;
+      break;
+    }
+  }
+  s_first[i] = active && first == i;
+  __syncthreads();
+  const bool first_residual = s_first[i] && kind == kResidual;
+  int miss_rows = 0;
+  int before = 0;
+  for (int j = 0; j < routes; ++j) {
+    const bool fr = s_first[j] && s_kind[j] == kResidual;
+    miss_rows += fr;
+    before += fr && j < i;
+  }
+  if (first_residual) {
+    int rank = before;
+    if (miss_keys != nullptr) {
+      rank = 0;
+      for (int j = 0; j < routes; ++j)
+        if (s_first[j] && s_kind[j] == kResidual)
+          rank += s_key[j] > s_key[i] || (s_key[j] == s_key[i] && j < i);
+    }
+    s_rank[i] = rank;
+  }
+  __syncthreads();
+  if (active) {
+    const int rank = kind == kResidual ? s_rank[first] : 0;
+    const int32_t destination =
+        hot_hit ? static_cast<int32_t>(slot) : (prefetched ? prefetch_slot : scratch_base + rank);
+    const int dest_pos = first_residual ? rank : miss_rows + (i - before);
+    source_rows_out[dest_pos] = expert;
+    slots_out[dest_pos] = destination;
+    remap_out[i] = static_cast<RemapT>(destination);
+    if (route_counts != nullptr) atomicAdd(route_counts + expert, 1.0f);
+  }
+  if (i == 0) {
+    unsigned demand = 0, covered = 0, residual_routes = 0, unique_hits = 0, unique_misses = 0;
+    for (int j = 0; j < routes; ++j) {
+      demand += s_kind[j] >= kPrefetched;
+      covered += s_kind[j] == kPrefetched;
+      residual_routes += s_kind[j] == kResidual;
+      unique_hits += s_first[j] && s_kind[j] == kHit;
+      unique_misses += s_first[j] && s_kind[j] >= kPrefetched;
+    }
+    count_out[0] = miss_rows;
+    if (graph_counters != nullptr) {
+      auto* counters = reinterpret_cast<unsigned long long*>(graph_counters);
+      atomicAdd(counters, static_cast<unsigned long long>(routes));
+      atomicAdd(counters + 1, static_cast<unsigned long long>(demand));
+    }
+    if (graph_unique_counters != nullptr) {
+      auto* unique_counters = reinterpret_cast<unsigned long long*>(graph_unique_counters);
+      atomicAdd(unique_counters, static_cast<unsigned long long>(unique_hits));
+      atomicAdd(unique_counters + 1, static_cast<unsigned long long>(unique_misses));
+    }
+    if (outcome_counters != nullptr) {
+      const unsigned posted_rows = prefetch_count[0] == 1 ? 1u : 0u;
+      const unsigned wasted_rows = posted_rows && covered == 0 ? 1u : 0u;
+      auto* outcomes = reinterpret_cast<unsigned long long*>(outcome_counters);
+      atomicAdd(outcomes, static_cast<unsigned long long>(covered));
+      atomicAdd(outcomes + 1, static_cast<unsigned long long>(residual_routes));
+      atomicAdd(outcomes + 2, static_cast<unsigned long long>(wasted_rows));
+      atomicAdd(outcomes + 3, static_cast<unsigned long long>(posted_rows));
+    }
+  }
+}
+
+// `plan_unique_routes_gpu`'s arguments, for `plan_dedup_routes_kernel`: one block of 64 threads.
+template <typename IdT, typename RemapT>
+void plan_dedup_routes_gpu(
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView expert_to_slot,
+    int64_t scratch_base,
+    tvm::ffi::TensorView source_rows_out,
+    tvm::ffi::TensorView slots_out,
+    tvm::ffi::TensorView count_out,
+    tvm::ffi::TensorView remap_out,
+    tvm::ffi::Optional<tvm::ffi::TensorView> graph_counters,
+    tvm::ffi::Optional<tvm::ffi::TensorView> graph_unique_counters,
+    tvm::ffi::Optional<tvm::ffi::TensorView> route_counts,
+    tvm::ffi::TensorView prefetch_expert,
+    tvm::ffi::TensorView prefetch_count,
+    int64_t prefetch_slot,
+    tvm::ffi::Optional<tvm::ffi::TensorView> outcome_counters,
+    tvm::ffi::Optional<tvm::ffi::TensorView> miss_keys) {
+  host::RuntimeCheck(
+      0 < topk_ids.numel() && topk_ids.numel() <= kExpertRoutePlanDedupMaxRoutes, "topk_ids must hold 1-64 routes");
+  const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
+  auto ptr = [](auto& opt) { return opt.has_value() ? opt.value().data_ptr() : nullptr; };
+  host::LaunchKernel(1, kExpertRoutePlanDedupMaxRoutes, stream)(
+      plan_dedup_routes_kernel<IdT, RemapT>,
+      static_cast<const IdT*>(topk_ids.data_ptr()),
+      static_cast<const int64_t*>(expert_to_slot.data_ptr()),
+      static_cast<int>(topk_ids.numel()),
+      static_cast<int32_t>(scratch_base),
+      static_cast<int64_t*>(source_rows_out.data_ptr()),
+      static_cast<int32_t*>(slots_out.data_ptr()),
+      static_cast<int32_t*>(count_out.data_ptr()),
+      static_cast<RemapT*>(remap_out.data_ptr()),
+      static_cast<int64_t*>(ptr(graph_counters)),
+      static_cast<int64_t*>(ptr(graph_unique_counters)),
+      static_cast<float*>(ptr(route_counts)),
+      static_cast<const int64_t*>(prefetch_expert.data_ptr()),
+      static_cast<const int32_t*>(prefetch_count.data_ptr()),
+      static_cast<int32_t>(prefetch_slot),
+      static_cast<int64_t*>(ptr(outcome_counters)),
+      static_cast<const int64_t*>(ptr(miss_keys)));
+}
+
 }  // namespace sglang
