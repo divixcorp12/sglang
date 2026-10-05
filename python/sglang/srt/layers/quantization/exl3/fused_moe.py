@@ -285,9 +285,11 @@ def exl3_fused_moe_for(layer, streamer) -> Exl3FusedMoE:
             getattr(updater, "insert_direct", False)
             and getattr(streamer.row_backend, "name", None) == "exl3_ram_miss"
         )
-        if direct and cache.capacity < rows:
+        # A token's routes are distinct slots; tokens share slots, and a verify's gather flags the misses it
+        # cannot place (GpuResidencyUpdater.clamp_gather_misses).
+        if direct and cache.capacity < top_k:
             raise ValueError(
-                f"exl3 DIRECT needs at least top_k resident slots per token, one per route ({cache.capacity} < {rows})"
+                f"exl3 DIRECT needs at least top_k resident slots per token, one per route ({cache.capacity} < {top_k})"
             )
         if not direct and cache.scratch_rows < rows:
             raise ValueError(

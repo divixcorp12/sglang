@@ -276,10 +276,11 @@ class GpuResidencyUpdater:
             )
         if not 0.0 < self.insert_on_miss_decay <= 1.0:
             raise ValueError("insert-on-miss decay must be in (0, 1]")
-        rows = {streamer.graph_gather_rows for streamer in self.streamers}
+        # The misses one gather serves, not its routes: a verify's routes may outnumber them.
+        rows = {streamer.graph_miss_width for streamer in self.streamers}
         if len(rows) != 1:
             raise ValueError(
-                "insert-on-miss needs one graph-gather row count on every layer"
+                "insert-on-miss needs one graph-gather miss width on every layer"
             )
         device, layers = self.device, self.num_layers
         self.miss_rows = rows.pop()
@@ -360,6 +361,10 @@ class GpuResidencyUpdater:
         miss_rows`` is required on top of that. Without a full shortlist a miss could
         find no slot, and with no scratch row to fall back on its routes would read
         another expert, so a smaller layer is refused rather than allowed to truncate.
+        That holds when the miss width equals the routes (one token). A verify's
+        narrower width loses it: ``H + M`` may exceed ``miss_rows``. Its gathers serve
+        the misses that find a victim and flag the rest (:meth:`clamp_gather_misses`),
+        so the floor stays ``2 * miss_rows``.
         """
         width = self.miss_rows
         for layer_id, streamer in zip(self.layer_ids, self.streamers):
@@ -380,8 +385,8 @@ class GpuResidencyUpdater:
             if cache.capacity < 2 * width:
                 raise ValueError(
                     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs every layer to hold at least "
-                    f"twice its graph-gather rows; layer {layer_id} has {cache.capacity} "
-                    f"slots for {width} rows. Raise SGLANG_MOE_HOT_GPU_MB or use stage 1."
+                    f"twice its graph-gather miss lanes; layer {layer_id} has {cache.capacity} "
+                    f"slots for {width} lanes. Raise SGLANG_MOE_HOT_GPU_MB or use stage 1."
                 )
         device, layers = self.device, self.num_layers
         # Shortlisted slots per layer, and which of those columns name a real slot.
@@ -929,7 +934,8 @@ class GpuResidencyUpdater:
         # remapped to. A counted lane that is not live would copy to slot 0; the full
         # shortlist rules that out and _commit_gather counts it if it happens.
         destinations = torch.where(live, usable, torch.zeros_like(usable))
-        streamer._graph_destination_slots.copy_(destinations.to(torch.int32))
+        # The plan's slot buffer has a row per route; the lanes are the first miss_rows.
+        streamer._graph_destination_slots[: self.miss_rows].copy_(destinations.to(torch.int32))
         self._pending_commit = (row, streamer, destinations, live)
         # The fused planner keeps the router's native ids, so remap may be int32, but
         # index_select takes int64 only. The caller casts the result back.
@@ -967,7 +973,7 @@ class GpuResidencyUpdater:
             streamer._graph_miss_count,
             remap,
             scratch_base,
-            streamer._graph_destination_slots,
+            streamer._graph_destination_slots[: self.miss_rows],
             destinations,
             live,
             remap_out,

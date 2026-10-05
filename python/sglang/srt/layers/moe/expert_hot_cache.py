@@ -1082,6 +1082,7 @@ class ExpertHotCacheManager:
         insert_on_miss: bool | int | None = None,
         insert_on_miss_decay: float | None = None,
         fused_insert: bool | None = None,
+        graph_gather_miss_lanes: int | None = None,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -1108,6 +1109,10 @@ class ExpertHotCacheManager:
         ``fused_insert`` defaults to ``SGLANG_MOE_HOT_FUSED_INSERT`` and runs
         stage SCRATCH's boundary copies through the fused masked kernel; it is
         byte-identical to the index copy it replaces and only changes its cost.
+        ``graph_gather_miss_lanes`` caps each layer's distinct misses per graph gather
+        below its routes (a verify); ``None`` reads
+        ``SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES``, and 0 keeps one lane per route.
+        It needs stage DIRECT.
         """
         if fused_insert is None:
             fused_insert = envs.SGLANG_MOE_HOT_FUSED_INSERT.get()
@@ -1115,6 +1120,11 @@ class ExpertHotCacheManager:
         if insert_on_miss is None:
             insert_on_miss = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get()
         insert_on_miss = int(insert_on_miss)
+        if graph_gather_miss_lanes is None:
+            graph_gather_miss_lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
+        graph_gather_miss_lanes = index(graph_gather_miss_lanes)
+        if graph_gather_miss_lanes < 0:
+            raise ValueError(f"graph gather miss lanes cannot be negative, got {graph_gather_miss_lanes}")
         if insert_on_miss not in tuple(InsertOnMissStage):
             raise ValueError(
                 f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE must be one of "
@@ -1239,12 +1249,24 @@ class ExpertHotCacheManager:
         scratch_rows = {
             layer_id: 0 if direct else rows for layer_id, rows in gather_rows.items()
         }
+        # A verify's gather may serve fewer distinct misses than it has routes; the misses take the lanes, the
+        # routes keep their width.
+        miss_lanes = {
+            layer_id: min(rows, graph_gather_miss_lanes) if graph_gather_miss_lanes else rows
+            for layer_id, rows in gather_rows.items()
+        }
+        if not direct and any(miss_lanes[layer_id] < rows for layer_id, rows in gather_rows.items()):
+            raise ValueError(
+                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES={graph_gather_miss_lanes} below a layer's graph-gather "
+                "routes needs SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 (DIRECT): only its gathers flag the misses they "
+                "cannot serve"
+            )
         # Runs before enable_graph_gather so a format that stages per post learns the
         # gather width first.
         for layer_id, rows in gather_rows.items():
             plan = getattr(streamers[layer_id].format, "plan_graph_gather", None)
             if rows and plan is not None:
-                plan(streamers[layer_id], rows)
+                plan(streamers[layer_id], miss_lanes[layer_id])
         selected = {layer_id: [] for layer_id in streamers}
         pull_row_enabled = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
         allocated_layers = {
@@ -1266,14 +1288,14 @@ class ExpertHotCacheManager:
             raise ValueError(
                 "expert hot cache budget cannot hold the graph-gather scratch and pull rows"
             )
-        # DIRECT refuses a layer holding fewer than twice its gather rows (see
+        # DIRECT refuses a layer holding fewer than twice its gather miss lanes (see
         # `_init_insert_direct`), so a seed that scores one layer low would refuse the
         # whole budget. Give every layer that floor from its own best experts first and
         # let the scores spend the rest; if every layer clears the floor anyway, the
         # selection is unchanged.
         floors = {
-            layer_id: 2 * rows if direct else 0
-            for layer_id, rows in gather_rows.items()
+            layer_id: 2 * miss_lanes[layer_id] if direct else 0
+            for layer_id in gather_rows
         }
         for layer_id, floor in floors.items():
             if floor > streamers[layer_id].num_experts:
@@ -1325,7 +1347,7 @@ class ExpertHotCacheManager:
                 raise ValueError(
                     f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
                     f"budget provides {len(selected[layer_id])} resident slots; "
-                    f"required capacity is {floor} (twice its graph-gather rows)"
+                    f"required capacity is {floor} (twice its graph-gather miss lanes)"
                 )
         for layer_id in sorted(clamped):
             streamer = streamers[layer_id]
@@ -1477,7 +1499,7 @@ class ExpertHotCacheManager:
         for layer_id, rows in gather_rows.items():
             if rows:
                 streamers[layer_id].enable_graph_gather(
-                    rows, scratch_destinations=not direct
+                    rows, scratch_destinations=not direct, miss_lanes=miss_lanes[layer_id]
                 )
         manager._share_graph_counters()
         manager.gpu_residency = None

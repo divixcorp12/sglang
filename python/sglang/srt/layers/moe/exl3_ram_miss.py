@@ -1193,12 +1193,18 @@ class Exl3RamMissService:
                 updater.enable_miss_order()
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
-        if streamer.graph_gather_rows > self.lanes:
+        width = streamer.graph_miss_width
+        if width > self.lanes:
             # The post kernel requests min(count, lanes) lanes and traps on a wider
-            # plan.
+            # plan. A verify's misses take lanes, not its routes.
             raise ValueError(
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
-                f"per call but the service requests at most {self.lanes} lanes"
+                f"({width} miss lanes) per call but the service requests at most {self.lanes} lanes"
+            )
+        if self.cpu_experts is not None and width < streamer.graph_gather_rows:
+            raise ValueError(
+                f"exl3 RAM miss: CPU experts serve one token; layer {streamer.layer_id}'s gather serves {width} "
+                f"misses of {streamer.graph_gather_rows} routes (a verify)"
             )
         cache = streamer.hot_cache
         if self.cpu_experts is not None:

@@ -517,6 +517,11 @@ class Envs:
     # one per verify route (decode max_bs x draft tokens x top_k); 0 keeps that bound.
     # Startup rejects a cap below one request's routes: that needs phase 3's overflow path.
     SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS = EnvInt(0)
+    # Speculative decoding with DIRECT residency (SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2) only: each layer's graph gather
+    # serves at most this many distinct misses (the RAM-miss lanes and the victim shortlist), below one per verify
+    # route. A gather with more serves the lanes that find a victim and sets the residency's overflow flag; its output
+    # is then not a verify result. 0 keeps one lane per route.
+    SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES = EnvInt(0)
     # Debug only: write Qwen4-Exp MoE routing tensors of eager decode forwards to
     # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
     SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")

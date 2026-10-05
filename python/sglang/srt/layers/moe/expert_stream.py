@@ -1148,6 +1148,8 @@ class ExpertStreamer:
         # expert_prediction/serving/runtime.py.
         self.prefetch_puller = None
         self.graph_gather_rows = 0
+        # Distinct misses a graph gather serves when below its routes (a verify); 0: one per route.
+        self.graph_miss_lanes = 0
         self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
         # Row-source reads outside eager gathers (promotions, seeding, direct calls).
@@ -1286,8 +1288,13 @@ class ExpertStreamer:
             and 0 < topk_ids.numel() <= self.graph_gather_rows
         )
 
+    @property
+    def graph_miss_width(self) -> int:
+        """Distinct misses one graph gather serves: ``graph_miss_lanes`` when narrowed, else one per route."""
+        return self.graph_miss_lanes or self.graph_gather_rows
+
     def enable_graph_gather(
-        self, max_rows: int, scratch_destinations: bool = True
+        self, max_rows: int, scratch_destinations: bool = True, miss_lanes: int = 0
     ) -> None:
         """Serve gathers of at most ``max_rows`` routes with device-only operations.
 
@@ -1304,7 +1311,18 @@ class ExpertStreamer:
         ``scratch_destinations=False`` sends miss lanes to victim slots instead of
         scratch rows: the direct residency insert (``expert_residency_gpu.py``) writes
         them into ``_graph_destination_slots`` before each gather.
+
+        ``miss_lanes`` > 0 serves at most that many distinct misses, below ``max_rows``
+        routes (a verify). It needs ``scratch_destinations=False``: only DIRECT's victim
+        slots know which misses found a row (see
+        ``GpuResidencyUpdater.clamp_gather_misses``).
         """
+        if not 0 <= miss_lanes <= max_rows:
+            raise ValueError(f"graph gather miss lanes must be 0-{max_rows}, got {miss_lanes}")
+        if 0 < miss_lanes < max_rows and scratch_destinations:
+            raise ValueError(
+                "a graph gather that serves fewer misses than its routes needs DIRECT residency's victim slots"
+            )
         pinned_tier = graph_source_kind_of(self.format) == "pinned_tier"
         require_graph_gather_support((self,), pinned_tier_ok=True)
         from sglang.kernels.ops.moe.expert_cache_transfer import (
@@ -1438,6 +1456,7 @@ class ExpertStreamer:
         self.graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
         self.graph_unique_counters = torch.zeros(2, dtype=torch.int64, device=device)
         self.graph_gather_rows = max_rows
+        self.graph_miss_lanes = miss_lanes if miss_lanes < max_rows else 0
 
     def _gather_graph(
         self, topk_ids: torch.Tensor
