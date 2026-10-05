@@ -15,6 +15,7 @@ from verify_union import (  # noqa: E402
     project,
     shrink_hot,
     union_stats,
+    verify_cpu_ms,
     verify_ms,
     window_forwards,
 )
@@ -128,6 +129,36 @@ def test_gate_says_no_when_no_lane_count_is_admissible():
     out = gate([_row(8, 100.0, 0.5)], {"ms_per_token": 76.0}, width=6, stride=3, draft_slots=4, gain=1.10,
                draft_ms_floor=5.0, max_overflow=0.02)
     assert out["go"] is False and "overflow" in out["why"]
+
+
+def test_verify_cpu_ms_takes_the_best_split_per_layer():
+    # n = 4 RAM hits, flat 0.5 ms per CPU row, no handoff: k = 3 gives max(1.5, 1.0) = 1.5 ms, the minimum.
+    n, m = np.array([[4]]), np.array([[0]])
+    out = verify_cpu_ms(n, m, c_cpu=0.5, c_link=1.0, handoff=0.0, nvme_ms=1.5, gpu_ms=14.0)
+    assert out.tolist() == [15.5]
+
+
+def test_verify_cpu_ms_is_verify_ms_when_the_cpu_never_pays():
+    n, m = np.array([[3, 1], [0, 5]]), np.array([[1, 0], [2, 0]])
+    off = verify_ms(n, m, c_link=1.0, nvme_ms=1.5, gpu_ms=14.0)
+    on = verify_cpu_ms(n, m, c_cpu=1e6, c_link=1.0, handoff=0.02, nvme_ms=1.5, gpu_ms=14.0)
+    assert on.tolist() == off.tolist()
+
+
+def test_project_reports_cpu_on_cost_per_accepted_token_for_each_grid_point():
+    loaded = _loaded([_decode(i, [i % 5, 10 + i % 7]) for i in range(12)])
+    row = project(loaded, width=4, stride=2, lanes=4, draft_slots=0, ram_rows=64, num_experts=64,
+                  c_link=1.0, nvme_ms=1.5, gpu_ms=14.0, c_cpu=0.63, handoff=0.02,
+                  cpu_grid=[(1.0, 14.0), (2.0, 28.0)])
+    assert set(row["cpu_on"]) == {"1.0x_14ms", "2.0x_28ms"}
+    assert row["cpu_on"]["1.0x_14ms"] <= row["verify_ms"] / 2
+    assert row["cpu_on"]["2.0x_28ms"] >= row["cpu_on"]["1.0x_14ms"]
+
+
+def test_gate_refuses_a_row_the_sweep_does_not_hold():
+    with pytest.raises(ValueError, match="sweep"):
+        gate([_row(8, 100.0, 0.0, width=4)], {"ms_per_token": 76.0}, width=6, stride=3, draft_slots=4, gain=1.10,
+             draft_ms_floor=5.0, max_overflow=0.02)
 
 
 if __name__ == "__main__":
