@@ -4,8 +4,8 @@
 #include <ATen/Parallel.h>
 
 #include "aligned.h"
-#include "cpu_experts_cabi.h"
 #include "fixture.h"
+#include "kernel.h"
 #include "moe_mul1.h"
 #include "placement.h"
 #include <algorithm>
@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <fstream>
 #include <omp.h>
 #include <stdexcept>
@@ -153,13 +154,13 @@ void StackFixture::write_x(int64_t row) const {
   std::memcpy(x_row(row), impl_->inputs.data() + row * 2 * impl_->hidden, 2 * impl_->hidden);
 }
 
-// Mirrors Exl3CpuQuantTrait.register_layer: the row's six slabs by base pointer and row stride (kNames is
-// EXL3_STREAMED_NAMES order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit.
-int64_t StackFixture::register_layer(int64_t row) const {
+// Mirrors Exl3CpuQuantTrait.layer_spec: the row's six slabs by base pointer and row stride (kNames is
+// EXL3_STREAMED_NAMES' order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit, made into a layer
+// by the EXL3 kernel. Views only: the fixture's slabs outlive it.
+std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> StackFixture::make_layer(int64_t row) const {
   const Impl& f = *impl_;
-  static const SglangExl3CpuParams params{3, 0};  // the kernel may read params until free_layer
-  SglangCpuExpertsLayer d{};
-  d.abi_version = SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION;
+  const int32_t params[2] = {3, 0};  // SglangExl3CpuParams {bits, swizzled}
+  ::sglang::cpu_experts::LayerSlabs d;
   d.capacity = static_cast<int32_t>(capacity());
   d.hidden = static_cast<int32_t>(f.hidden);
   d.intermediate = static_cast<int32_t>(f.intermediate);
@@ -170,13 +171,7 @@ int64_t StackFixture::register_layer(int64_t row) const {
     d.slabs[n] = f.set.slabs[row][n];
     d.slot_bytes[n] = static_cast<uint64_t>(f.set.layout.row_bytes[n]);
   }
-  d.params = &params;
-  int64_t handle = -1;
-  const int status = sglang_exl3_cpu_experts_register_layer(&d, &handle);
-  if (status != 0)
-    throw std::runtime_error("the kernel refused row " + std::to_string(row) + "'s slabs: status " +
-                             std::to_string(status));
-  return handle;
+  return ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(d, std::as_bytes(std::span<const int32_t>(params, 2)));
 }
 
 void StackFixture::preload_slots(int64_t row) const {
@@ -196,10 +191,6 @@ void StackFixture::preload_slots(int64_t row) const {
           image.data() + layout.name_offsets[n],
           static_cast<size_t>(layout.row_bytes[n]));
   }
-}
-
-void StackFixture::free_layer(int64_t handle) {
-  exl3_moe_cpu_free_layer(handle);
 }
 
 void configure_cpu_kernel_runtime() {

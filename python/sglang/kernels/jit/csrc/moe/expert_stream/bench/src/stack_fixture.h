@@ -5,6 +5,7 @@
 // (and tvm-ffi's) never include ATen. cpu_forward.cpp's kernel runtime is configured through the helpers at the end.
 #pragma once
 
+#include "expert_stream/host/cpu_experts/kernel.hpp"
 #include "expert_stream/lease_layout.h"
 #include "row_images.h"
 #include <cstdint>
@@ -51,12 +52,11 @@ class StackFixture {
   float* out_row(int64_t row) const;
   int64_t out_stride() const;         // bytes
   void write_x(int64_t row) const;    // the post's x store: the layer's fixture input into the row's x
-  // Registers the row's capacity() slot views with sglang_exl3_cpu_experts_register_layer; returns the layer handle.
-  int64_t register_layer(int64_t row) const;
+  // The row's layer over its capacity() slot views, made by the EXL3 kernel (exl3_cpu_kernel).
+  std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> make_layer(int64_t row) const;
   // Fills slot_of(e) of the row's slabs with expert e from the row's image file: the slot the tier's reader would pick
   // (see slot_of). For the bare forwards, which run before the stack exists.
   void preload_slots(int64_t row) const;
-  static void free_layer(int64_t handle);
 
  private:
   struct Impl;

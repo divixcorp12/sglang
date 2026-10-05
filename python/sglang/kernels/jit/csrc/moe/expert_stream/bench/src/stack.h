@@ -91,15 +91,14 @@ inline es::Tables image_tables(const RowSet& set) {
 struct StackConfig {
   RowSet rows;
   int64_t staging = 3;
-  es::CpuExpertForward forward = nullptr;
-  es::CpuExpertKeepWarm keep_warm = nullptr;  // with keep_warm_ns > 0: run while idle after each job
-  int64_t keep_warm_ns = 0;
-  // One NUMA group's CPU lanes: its service thread, its kernel engine and its split table.
+  const ::sglang::cpu_experts::CpuExpertKernel* kernel = nullptr;  // the format's kernel, every group's
+  int64_t keep_warm_ns = 0;  // > 0: the kernel's keep-warm runs while idle after each job
+  // One NUMA group's CPU lanes: its service thread, its cores and its split table.
   struct Group {
     int service_cpu = -1;
-    std::vector<int> cores;  // worker 0 first: its CPU expert thread pins itself there
-    int64_t engine = 0;      // the kernel's engine on those cores (engine_create); 0: unpinned workers
-    es::CpuExpertForward forward = nullptr;  // null: the stack's forward
+    std::vector<int> cores;  // worker 0 first: its CPU expert thread pins itself there; the kernel's workers run there
+    // null: the stack's kernel (set only to provoke the one-kernel refusal)
+    const ::sglang::cpu_experts::CpuExpertKernel* kernel = nullptr;
     std::array<int64_t, es::Wire::kLanes + 1> split{};
   };
   std::vector<Group> groups;                        // one per Wire::kNodes
@@ -168,7 +167,7 @@ class Stack {
     for (int g = 0; g < es::Wire::kNodes; ++g) {
       const StackConfig::Group& group = config_.groups[g];
       es::CpuExpertConfig cpu;
-      cpu.forward = group.forward != nullptr ? group.forward : config_.forward;
+      cpu.kernel = group.kernel != nullptr ? group.kernel : config_.kernel;
       cpu.x_base = config_.x_base;
       cpu.x_stride = config_.x_stride;
       // Group g's parts are parts 2 g and 2 g + 1 of the row's output.
@@ -178,9 +177,7 @@ class Stack {
       cpu.hidden = config_.hidden;
       cpu.threads = static_cast<int>(group.cores.size());
       cpu.cores = group.cores;
-      cpu.engine = group.engine;
       cpu.spin_ns = kCpuSpinNs;
-      cpu.keep_warm = config_.keep_warm;
       cpu.keep_warm_ns = config_.keep_warm_ns;
       tier_->enable_cpu_experts(g, std::move(cpu), std::vector<int64_t>(group.split.begin(), group.split.end()));
       service_cpus.push_back(group.service_cpu);
@@ -234,9 +231,9 @@ class Stack {
     return true;
   }
 
-  // Binds the row to a registered CPU layer handle (StackFixture::register_layer).
-  void set_cpu_layer(int64_t row, int64_t handle) {
-    tier_->set_cpu_layer(row, handle);
+  // Installs the row's CPU layer (StackFixture::make_layer), made by the stack's kernel.
+  void set_cpu_layer(int64_t row, std::unique_ptr<::sglang::cpu_experts::CpuExpertLayer> layer) {
+    tier_->set_cpu_layer(row, std::move(layer));
   }
 
   // Replaces every group's split table: of a post's n eligible hit lanes on a node, the CPU takes the last split[n].
