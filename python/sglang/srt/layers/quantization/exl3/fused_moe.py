@@ -114,6 +114,9 @@ class Exl3FusedMoE:
             raise RuntimeError(
                 "Exl3FusedMoE must be built before CUDA-graph capture (in a warmup)"
             )
+        # Past ROW_TILE, exllamav3 skips a slot every token routes, and the gather sums its stale scratch rows.
+        if not 1 <= tokens <= ROW_TILE:
+            raise ValueError(f"exl3 in-graph MoE holds 1-{ROW_TILE} tokens (the fused kernel's row tile), not {tokens}")
         ext = exl3_ext()
         self.ext = ext
         self.slots = slots
