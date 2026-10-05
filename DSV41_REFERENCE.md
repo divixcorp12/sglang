@@ -6835,33 +6835,59 @@ draft time):
 | plain decode, CPU experts off (§31.2) | | | | | 109.76 | 9.11 |
 | **plain decode, CPU hits (baseline)** | | | | | **75.94** | **13.17** |
 
-- **NVMe floor.** NVMe reads per verify are 11.3 × stride in every row. That is the same per accepted token as plain
-  decode (§31.2's 11.32). A verify cannot avoid reading each accepted token's new experts, so both paths pay the same
-  ≈28 ms/token NVMe floor.
-- **Saving over plain decode.** What the union saves is link time on RAM hits: at most 9% against plain decode without
-  CPU experts (99.6 vs 109.76 ms).
+- **NVMe floor.** NVMe reads per verify are 11.2-11.3 × stride in every row. That is the same per accepted token as
+  plain decode (§31.2's 11.32). A verify cannot avoid reading each accepted token's new experts, so both paths pay
+  the same ≈28 ms/token NVMe floor.
+- **The union saves no link time.** At 6:3, W = 32, a verify moves 69.2 RAM-hit rows per accepted token against
+  plain decode's 67.5. Its whole 9% lead over plain decode without CPU experts (99.6 vs 109.76 ms) is the 14 ms of
+  GPU shared by 3 tokens, the one term this model understates.
 - **What it gives up.** Plain decode with CPU experts saves 31%.
+- **The VRAM base.** The trace ran at `SGLANG_MOE_HOT_GPU_MB=14336` (`router-capture/env.txt`): 28-29 hot slots per
+  layer. The current recipe without a draft runs at 16080 MB, about 31.6 per layer. The A/B arms of §33.4 run at
+  12040 (hybrid) and 7168 MB (resident), about 23.7 and 14 per layer. That is the trace's capacity minus ≈4.5 and
+  minus ≈14, which `draft_slots` 4 and 13 model.
 - **The W that keeps overflow low does not fit.** It needs W ≥ 24, and DIRECT's `capacity ≥ 2W` rule needs ≥ 48 hot
-  slots per layer against about 30.
-- **The W that fits overflows.** W = 8 overflows half the layers (0.50) once the hybrid draft takes its 4 slots.
+  slots per layer.
+- **The W that fits overflows.** At about 24 slots, W ≤ 11. W = 8 overflows half the layers (0.50).
 
-**Verdict: NO-GO.** The gate (6:3, hybrid draft slots, overflow ≤ 2%, VRAM-admissible W) finds no admissible lane
-count. Every row loses, even with the gate's limits dropped:
+**Verdict for v1 (CPU experts off in verify): NO-GO.** The gate (6:3, hybrid draft slots, overflow ≤ 2%,
+VRAM-admissible W) finds no admissible lane count. Every row loses, even with the gate's limits dropped:
 - every one of the 60 rows is below the baseline with zero draft time;
 - the best is 10.04 tok/s against 13.17;
 - the draft budget at parity (`stride × 75.94 − verify ms`) is negative in all 60.
 
-Every modelling simplification favours verify, so the true gap is wider:
+Every modelling simplification favours verify:
 - 14 ms of GPU for a 6-token verify leaves out the attention and Engram breaks (§33.3 item 6);
 - rejected draft tokens route at least as diversely as the true tokens that stand in for them;
 - residency decays once per verify, not once per token.
 
-**What would change it.** Only multi-token CPU experts in verify (§33.3 item 5, size L) attack the gap. Scaling the
-best row by plain decode's CPU saving (109.76 → 75.94, −31%) gives ≈69 ms per accepted token ≈ 14.5 tok/s with no draft
-time, about +10% at most. A ≈5 ms graphed draft per verify (≈1.7 ms per token) takes that to ≈+8%, and verify
-hits fewer RAM rows per token for the CPU to take, so even this is an upper bound. Measured accept lengths (2.9-3.4,
-§33.2) do not move it: tok/s is flat in stride, because NVMe reads scale with it. Graphed DSpark verify is therefore
-not built. §33.3 items 1-8 stay open, and §33.4's eager hybrid draft remains the only DSpark path.
+**v2, multi-token CPU experts in verify (§33.3 item 5, size L): undecided.** A second run at `9bd866391b`
+(`projection2.{md,json}`, same command) costs the same misses with the simulator's own best per-layer CPU split
+(`verify_cpu_ms`, `CostModel.best_k`). It sweeps two unmeasured inputs: CPU cost per row as a multiple of the
+calibrated 0.63 ms (a verify's expert can serve several tokens), and GPU ms per verify.
+- **The CPU amortizes better in a verify than in plain decode.** A verify has 5.2 RAM-hit rows per layer against
+  1.7 for one token, so it pays the handoff once and overlaps more of the CPU with the link. That is why scaling
+  plain decode's 31% saving understated it.
+
+  | arm (no draft time) | 1.0× CPU, 14 ms | 1.5×, 28 ms | 2.0×, 42 ms |
+  |---|---|---|---|
+  | plain decode, ideal split (1.0×, 14 ms only) | 14.16 | | |
+  | 6:3, W 32, draft slots 0 | 17.93 | 14.57 | 12.58 |
+  | 6:3, W 32, draft slots 4 (hybrid) | 16.47 | 13.34 | 11.52 |
+  | 6:4, W 32, draft slots 4 | 17.37 | 14.23 | 12.41 |
+
+- **The band.** Against the served 13.17 tok/s it runs from +25% to −13% for the hybrid draft at 6:3. A graphed
+  draft's time per verify comes off the top. Tok/s rises mildly with stride (6:2 → 6:4 with the hybrid's slots: 14.8 → 17.4 at 1.0×, 14 ms).
+- **It needs item 1 solved first.** Every W ≥ 24 row fails `capacity ≥ 2W`. At W ≤ 11, half the layers overflow, and
+  the model does not cost the overflow path (⌈U/W⌉ records per layer, or an eager re-verify).
+- **Three measurements decide v2 before any build:**
+  1. GPU ms of a 6-token target verify forward with the attention and Engram breaks;
+  2. CPU ms per expert row when an expert serves 1-6 tokens. §33.4's kernel bench suggests ≈1.0-1.3×: 21 experts per
+     layer cover 36 routes, so about 1.7 tokens each at ≈⌈t/2⌉ weight passes. That is an inference, not a measurement;
+  3. what the `capacity ≥ 2W` rule (`expert_residency_gpu.py:377-383`) really requires at W ≈ 21.
+
+  If 1 and 2 land near 1.0-1.5× and ≤ 28 ms, and item 1 has a cheap answer, v2 is worth a build plan. Otherwise
+  graphed DSpark stays shelved, and §33.4's eager hybrid draft remains the only DSpark path.
 
 ## Sources
 
