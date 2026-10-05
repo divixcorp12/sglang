@@ -107,6 +107,19 @@ def test_a_verify_gather_attaches_by_its_miss_width_not_its_routes(tiers):
     assert service.lanes == 8 and service.routed_rows_per_step == 36
 
 
+@pytest.mark.parametrize("staged, warns", [(8, False), (7, True)])
+def test_a_verify_row_stages_its_miss_width_not_its_routes(tiers, monkeypatch, caplog, staged, warns):
+    """A post requests at most the miss width, so a row staging W slots is enough though the gather routes 36 ids;
+    fewer than W still warns."""
+    service, streamers = tiers
+    service.plan_gather_width(8)
+    monkeypatch.setattr(service, "staging_for", lambda capacity: staged)
+    streamers[0].graph_miss_lanes = 8
+    with caplog.at_level("WARNING", logger=module.__name__):
+        _attach(service, streamers[0], 36)
+    assert any("stages" in r.getMessage() for r in caplog.records) is warns
+
+
 def test_cpu_experts_refuse_a_miss_width_below_the_routes(tiers):
     """CPU experts are one token: their lanes and partials cover one token's routes (D2-4 lifts this)."""
     service, streamers = tiers
