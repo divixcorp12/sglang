@@ -145,6 +145,18 @@ class CpuExpertEngine {
     if (config_.hidden <= 0 || config_.out_stride < config_.hidden * static_cast<int64_t>(sizeof(float)))
       throw std::runtime_error(prefix_ + "the CPU expert output rows are smaller than the hidden size");
     if (config_.threads < 1) throw std::runtime_error(prefix_ + "the CPU expert pool needs at least one thread");
+    // The kernel refuses these at every forward, and a refused forward aborts the process: refuse them here instead.
+    const std::vector<int>& cores = config_.cores;
+    for (size_t i = 0; i < cores.size(); ++i) {
+      if (cores[i] < 0 || cores[i] >= CPU_SETSIZE)
+        throw std::runtime_error(prefix_ + "CPU expert core " + std::to_string(cores[i]) + " is outside [0, CPU_SETSIZE)");
+      for (size_t j = 0; j < i; ++j)
+        if (cores[j] == cores[i])
+          throw std::runtime_error(prefix_ + "CPU expert core " + std::to_string(cores[i]) + " repeats");
+    }
+    if (!cores.empty() && static_cast<size_t>(config_.threads) > cores.size())
+      throw std::runtime_error(
+          prefix_ + std::to_string(config_.threads) + " workers on " + std::to_string(cores.size()) + " cores");
   }
 
   ~CpuExpertEngine() {

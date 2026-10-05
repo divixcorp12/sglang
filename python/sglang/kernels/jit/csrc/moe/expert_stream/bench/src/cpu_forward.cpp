@@ -38,7 +38,7 @@
 // The vendored baseline's entry points (csrc/exl3/moe_mul1.cpp, its end); no header declares them.
 void exl3_moe_cpu_baseline_forward(int64_t handle, const at::Half* x, const int32_t* slots, const float* weights,
                                    float* out, int rows, int k, int threads, bool accumulate);
-void exl3_moe_cpu_baseline_set_cores(std::span<const int> cores);
+void exl3_moe_cpu_baseline_set_cores(const int* cores, int n);
 #endif
 
 namespace {
@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
     // fails the forward); the vendored baseline keeps its own process-wide core list.
     g_cores.assign(cores.begin(), cores.end());
 #ifdef EXL3_BENCH_BASELINE
-    exl3_moe_cpu_baseline_set_cores(g_cores);
+    exl3_moe_cpu_baseline_set_cores(g_cores.data(), static_cast<int>(g_cores.size()));
 #endif
     cpu_set_t caller;
     CPU_ZERO(&caller);

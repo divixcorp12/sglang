@@ -27,7 +27,6 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
-#include <span>
 #include <stdexcept>
 #include <fstream>
 #include <immintrin.h>
@@ -2687,11 +2686,12 @@ void exl3_moe_cpu_baseline_forward(int64_t handle, const at::Half* x, const int3
 }
 
 // The pool's cores, worker i on cores[i % n] (worker 0 is the thread that calls the forward). Before the first
-// forward: once the pool has spawned, its workers are already placed, and this throws.
-void exl3_moe_cpu_baseline_set_cores(std::span<const int> cores)
+// forward: once the pool has spawned, its workers are already placed, and this throws. A pointer and count, not a
+// std::span: the torch extension's vendored flavor builds this file as C++17.
+void exl3_moe_cpu_baseline_set_cores(const int* cores, int n)
 {
-    if (cores.empty()) throw std::runtime_error("baseline set_cores: no cores");
+    if (n < 1) throw std::runtime_error("baseline set_cores: no cores");
     std::lock_guard<std::mutex> lock(g_pool_mutex);
     if (g_pool.spawned > 0) throw std::runtime_error("baseline set_cores: the pool has spawned");
-    g_pool.core_order.assign(cores.begin(), cores.end());
+    g_pool.core_order.assign(cores, cores + n);
 }
