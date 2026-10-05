@@ -25,6 +25,9 @@ class FaultyReader {
       inner_.set_nop_flush_refused(fault.nop_flush_refused);
     }
   }
+  void set_sq_thread_cpu(int cpu) {
+    inner_.set_sq_thread_cpu(cpu);
+  }
   bool init(unsigned depth) {
     return inner_.init(depth);
   }

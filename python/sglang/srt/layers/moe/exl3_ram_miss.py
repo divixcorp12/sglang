@@ -31,8 +31,8 @@ from typing import Callable, Mapping, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+from sglang.kernels.ops.moe.expert_lease_block import WireLayout, wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import (
-    MAX_IDS,
     ExpertStreamDevice,
     ExpertStreamHost,
     host_layout,
@@ -42,6 +42,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
 )
 from sglang.srt.dsv41_config import Dsv41Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.cpu_experts.threading_config import ThreadingConfig
 from sglang.srt.layers.moe.exl3_expert_format import (
     EXL3_MAX_GATHER_ROWS,
     EXL3_STREAMED_NAMES,
@@ -53,6 +54,7 @@ from sglang.srt.layers.moe.exl3_row_image import RowImageSet
 from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
 from sglang.srt.layers.moe.expert_host_tier import quarantine_host_slabs
 from sglang.srt.layers.moe.expert_row_plan import PinnedTierRowBackend
+from sglang.srt.layers.moe.host_numa import group_ranges, slot_nodes
 
 logger = logging.getLogger(__name__)
 # NVTX ranges around the eager host-use pause's stream sync and thread pause.
@@ -292,13 +294,13 @@ def _row_image_tables(
     )
 
 
-def sm_copy_mask(names: Sequence[str]) -> int:
+def sm_copy_mask(names: Sequence[str], lanes: int = 8) -> int:
     """Bitmask of the copy-table entries the copy wait copies itself.
 
     With ``SGLANG_DSV41_ENABLE_RAM_MISS_SM_SMALL_COPIES`` the copy wait moves the host
     layout's small tensors, wherever they sit in ``names``.
     """
-    layout_names, small = host_layout()
+    layout_names, small = host_layout(lanes=lanes)
     small_names = {name for i, name in enumerate(layout_names) if small >> i & 1}
     return sum(1 << i for i, name in enumerate(names) if name in small_names)
 
@@ -507,6 +509,11 @@ class NativePinnedSlotTable:
             )
 
 
+def padded_plan_width(capacity: int, lanes: int) -> int:
+    """The length of a row backend's ``planned`` tensor: its plan width, and at least the build's lanes."""
+    return max(capacity, lanes)
+
+
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
     """``PinnedTierRowBackend`` whose gather is the lease chain.
 
@@ -518,8 +525,8 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
 
     ``routes`` holds the layer's routed experts (the protect set); ``_apply_graph``
     copies them in before each gather. ``planned`` pads the plan's expert ids to at
-    least ``MAX_IDS`` lanes (-1 past the plan): the post kernel reads
-    ``min(count, MAX_IDS)`` lanes and ``count`` lives on the device, so no host check
+    least the wire's lanes (-1 past the plan): the post kernel reads
+    ``min(count, lanes)`` lanes and ``count`` lives on the device, so no host check
     can bound it. Every lane of a gather is delivered or the process stops, so ``keep``
     stays 1 and the delivered count is the plan's.
 
@@ -552,7 +559,10 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             (capacity,), -1, dtype=torch.int64, device=host_row_map.device
         )
         self.planned = torch.full(
-            (max(capacity, MAX_IDS),), -1, dtype=torch.int64, device=host_row_map.device
+            (padded_plan_width(capacity, device_side.wire.lanes),),
+            -1,
+            dtype=torch.int64,
+            device=host_row_map.device,
         )
         self.hot_slots = hot_slots
         self.hot_capacity = hot_capacity
@@ -788,10 +798,10 @@ class Exl3RamMissService:
         self._cpu_log_batches = 0
         # SGLANG_DSV41_ENABLE_LEASE_PDL: the lease chain's kernels launch with PDL.
         self.lease_pdl = False
-        # Staging slots per row, reserved at start: one per lane a post can miss, fewer
-        # on a small tier. MAX_IDS until plan_gather_width says how wide the gather is.
-        self.staging_slots = MAX_IDS
-        self._gather_planned = None
+        # The widest gather any layer planned (plan_gather_width); None until one does.
+        self._gather_planned: Optional[int] = None
+        # The build's wire, fixed at start from the planned width.
+        self._wire: Optional[WireLayout] = None
         self._copy_armed = False
         self._copy_decodes = 0
         # Module loads that drained the device first.
@@ -814,22 +824,51 @@ class Exl3RamMissService:
         self.tables[layer_id] = table
 
     def plan_gather_width(self, rows: int) -> None:
-        """Reserve staging slots for a layer whose graph gather misses ``rows`` ids.
+        """Plan a layer whose graph gather misses ``rows`` ids; the widest layer sets the build's lane count.
 
-        At most ``MAX_IDS`` (the post kernel's lane count) are reserved, and the widest
-        layer wins. Only valid before the service starts.
+        Only valid before the service starts. Raises ValueError for a width outside 1..32.
         """
         if self.host is not None:
             raise RuntimeError(
                 "exl3 RAM miss: the graph gather width was planned after the service started"
             )
-        planned = max(1, min(int(rows), MAX_IDS))
-        self.staging_slots = (
+        planned = max(1, int(rows))
+        wire_layout(planned)
+        self._gather_planned = (
             planned
             if self._gather_planned is None
             else max(self._gather_planned, planned)
         )
-        self._gather_planned = self.staging_slots
+
+    @property
+    def wire(self) -> WireLayout:
+        """The started build's wire; raises before ``ensure_started`` fixes the lane count."""
+        if self._wire is None:
+            raise RuntimeError(
+                "exl3 RAM miss: the build's wire is read before the service started"
+            )
+        return self._wire
+
+    @property
+    def lanes(self) -> int:
+        """The started build's lane count; raises before ``ensure_started``."""
+        return self.wire.lanes
+
+    def resolved_lanes(self) -> int:
+        """The lane count the service builds for: the widest planned gather, rounded up to 8."""
+        return wire_layout(self._gather_planned or 1).lanes
+
+    def staging_width(self) -> int:
+        """The staging slots every row asks for: the planned gather width, else the build's lanes."""
+        return self._gather_planned or self.resolved_lanes()
+
+    def staging_for(self, capacity: int) -> int:
+        """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""
+        return min(self.staging_width(), capacity - 1)
+
+    def planned_padding(self, capacity: int) -> int:
+        """The length of a row backend's ``planned`` tensor: its plan width, and at least the build's lanes."""
+        return padded_plan_width(capacity, self.resolved_lanes())
 
     def row_of(self, layer_id: int) -> int:
         """The service row (position in the tables) of a streamed layer."""
@@ -895,13 +934,31 @@ class Exl3RamMissService:
                 fmt.layout, fmt.segment_map(), mirrors, direct, streamers
             ),
         )
-        layout_names, _ = host_layout()
+        lanes = self.resolved_lanes()
+        layout_names, _ = host_layout(lanes=lanes)
         if layout_names != EXL3_STREAMED_NAMES:
             raise RuntimeError(
                 f"exl3 RAM miss: the host module's layout {layout_names} is not EXL3_STREAMED_NAMES {EXL3_STREAMED_NAMES}"
             )
+        numa = ThreadingConfig.from_env(
+            cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
+            device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+        )
+        for line in numa.log_lines():
+            logger.info("exl3 RAM miss %s", line)
+        node_ranges = None
+        if numa.nodes > 1:
+            # Rows in layer order, as exl3_ram_miss_tables numbers them; a slot across a seam is in no range.
+            node_ranges = group_ranges(
+                [
+                    slot_nodes(s.pinned_host_cache.tensors, s.pinned_host_cache.capacity)
+                    for _, s in sorted(streamers.items())
+                ],
+                [plan.node for plan in numa.plans],
+            )
         pin = torch.cuda.is_available()
-        page = new_page(pin=pin)
+        self._wire = wire_layout(lanes, numa.nodes)
+        page = new_page(pin=pin, wire=self._wire)
         hot_page = new_hot_page(tables.starts.shape[1], pin=pin)
         slot_map = torch.full(tuple(tables.starts.shape), -1, dtype=torch.int32)
         slot_map = slot_map.pin_memory() if pin else slot_map
@@ -918,11 +975,14 @@ class Exl3RamMissService:
             slot_map=slot_map,
             hot_page=hot_page,
             variant="instr" if instrumented else None,
+            lanes=self.lanes,
+            node_ranges=node_ranges,
+            sq_thread_cpus=[-1 if p.sq is None else p.sq for p in numa.plans],
         )
         try:
             # Before any slot is filled: the hot cache fills the tiers first, after
             # plan_gather_width.
-            host.reserve_staging(self.staging_slots)
+            host.reserve_staging(self.staging_width())
             copy_engine = cfg.enable_ram_miss_copy_engine
             check_sm_small_copies(cfg)
             if copy_engine:
@@ -930,11 +990,13 @@ class Exl3RamMissService:
                 # Before the thread starts, and unarmed. The watchdog bounds each copy
                 # wait by the RAM-miss timeout.
                 host.enable_copy_engine(
-                    torch.cuda.current_device(), wait_timeout_ms=cfg.ram_miss_timeout_ms
+                    torch.cuda.current_device(),
+                    wait_timeout_ms=cfg.ram_miss_timeout_ms,
+                    cpus=numa.copy_cpus,
                 )
             cpu_experts = None
             if envs.SGLANG_DSV41_CPU_EXPERTS.get():
-                cpu_experts = self._start_cpu_experts(cfg, host, fmt, streamers, pin)
+                cpu_experts = self._start_cpu_experts(cfg, host, fmt, streamers, pin, numa)
             if get_exl3_stream_trace().enabled:
                 # Before the thread starts: without a trace file it takes no timestamps.
                 host.enable_trace()
@@ -954,13 +1016,15 @@ class Exl3RamMissService:
                         "exl3 RAM miss: SGLANG_DSV41_ENABLE_PREFILL_SHARE needs the expert distribution recorder "
                         "(--expert-distribution-recorder-mode), which calls the pre-forward observer that sets it"
                     )
-            spin_core = envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.get()
-            if spin_core is None:
+            cores = [-1 if plan.ram is None else plan.ram for plan in numa.plans]
+            busy_poll = all(plan.busy_poll for plan in numa.plans)
+            if numa.nodes == 1 and cores[0] == -1 and not busy_poll:
+                # The server's affinity: the thread spins there with PAUSE.
                 host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
             else:
                 host.start_thread(
-                    cpu_core=spin_core,
-                    busy_poll=True,
+                    cpu_core=cores if numa.nodes > 1 else cores[0],
+                    busy_poll=busy_poll,
                     fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
                 )
             if fault is not None:
@@ -977,6 +1041,7 @@ class Exl3RamMissService:
             host.stop()
             raise
         self.page, self.slot_map, self.host = page, slot_map, host
+        self.numa = numa
         self.hot_page = hot_page
         self.copy_engine = copy_engine
         self.cpu_experts = cpu_experts
@@ -1007,7 +1072,7 @@ class Exl3RamMissService:
         )
 
     @staticmethod
-    def _start_cpu_experts(cfg, host, fmt, streamers, pin: bool):
+    def _start_cpu_experts(cfg, host, fmt, streamers, pin: bool, numa: ThreadingConfig):
         """Build the CPU expert service for ``SGLANG_DSV41_CPU_EXPERTS``.
 
         Runs after the copy engine is enabled and before the service thread starts. CPU
@@ -1016,9 +1081,8 @@ class Exl3RamMissService:
         fused plan, and the prefetch pull join must be off.
         """
         from sglang.srt.layers.moe.cpu_experts.service import (
-            CpuExpertService,
+            CpuExpertGroups,
             configured_split,
-            cpu_expert_cores,
             cpu_trait_for,
         )
 
@@ -1040,7 +1104,6 @@ class Exl3RamMissService:
             raise RuntimeError(
                 "exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS needs SGLANG_MOE_EXPERT_FUSED_PLAN"
             )
-        cores, threads = cpu_expert_cores()
         # Rows in layer order, as exl3_ram_miss_tables numbers them.
         caches = {
             row: s.pinned_host_cache.tensors
@@ -1052,14 +1115,13 @@ class Exl3RamMissService:
             raise RuntimeError(
                 f"exl3 RAM miss: CPU experts need one hidden size, the layers have {hidden}"
             )
-        return CpuExpertService(
+        return CpuExpertGroups(
             host,
             trait,
             caches,
             hidden=hidden.pop(),
-            cores=cores,
-            threads=threads,
-            split=configured_split(),
+            plans=numa.plans,
+            split=configured_split(host.wire.lanes),
             pin=pin,
         )
 
@@ -1131,12 +1193,12 @@ class Exl3RamMissService:
                 updater.enable_miss_order()
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
-        if streamer.graph_gather_rows > MAX_IDS:
-            # The post kernel requests min(count, MAX_IDS) lanes and traps on a wider
+        if streamer.graph_gather_rows > self.lanes:
+            # The post kernel requests min(count, lanes) lanes and traps on a wider
             # plan.
             raise ValueError(
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
-                f"per call but the service requests at most {MAX_IDS} lanes"
+                f"per call but the service requests at most {self.lanes} lanes"
             )
         cache = streamer.hot_cache
         if self.cpu_experts is not None:
@@ -1160,6 +1222,8 @@ class Exl3RamMissService:
                 lease_pdl=self.lease_pdl,
                 hit_copy=envs.SGLANG_DSV41_RAM_HIT_COPY.get(),
                 cpu_misses=envs.SGLANG_DSV41_CPU_EXPERTS_MISSES.get(),
+                lanes=self.lanes,
+                nodes=self.wire.nodes,
             )
             if self.cpu_experts is not None:
                 self.device_side.enable_cpu_experts(
@@ -1197,10 +1261,10 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
-        # The host staged min(staging_slots, capacity - 1) slots for the row at start; a
-        # post with more misses traps.
+        # The host staged staging_for(capacity) slots for the row at start; a post with
+        # more misses traps.
         want = max(1, streamer.graph_gather_rows)
-        staged = min(self.staging_slots, int(self.host.tables.capacity[row]) - 1)
+        staged = self.staging_for(int(self.host.tables.capacity[row]))
         if staged < want:
             logger.warning(
                 "exl3 RAM miss: row %d stages %d slots, not %d: its tier has %d",
@@ -1227,7 +1291,7 @@ class Exl3RamMissService:
                     raise ValueError(
                         f"exl3 RAM miss: layer {streamer.layer_id}'s copy table does not match its sources {names}"
                     )
-                sm_mask = sm_copy_mask(names)
+                sm_mask = sm_copy_mask(names, self.lanes)
                 copy_sm = sm_copy_table(segments, sm_mask) if sm_mask else None
         streamer.row_backend = Exl3RamMissRowBackend(
             previous.segments,
@@ -1271,7 +1335,7 @@ class Exl3RamMissService:
         # The router rings hold ~400 KB per forward, so they get a shallower ring: 32
         # deep is ~13 MB of VRAM.
         log = GraphRouteLog(
-            len(self._rows), MAX_IDS, device, depth=32 if router_prefix else 64
+            len(self._rows), self.lanes, device, depth=32 if router_prefix else 64
         )
         if router_prefix:
             log.enable_router(router_prefix)
@@ -1722,6 +1786,7 @@ class Exl3RamMissService:
                 side.dst_slots_1,
                 side.lane_kind,
                 side.lane_slot,
+                side.lane_node,
                 side.ce_mask,
                 side.cpu_lanes,
                 side.piece_runs,

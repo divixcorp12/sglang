@@ -1,15 +1,16 @@
-"""The EXL3 CPU MoE kernel under the build's activation quantization options (SGLANG_EXL3_CPU_ACT_*).
+"""The optimized EXL3 CPU MoE kernel (residual int8 activations, 128-wide blocks) against the scalar tier.
 
-Builds whatever flavor the environment selects, then checks it on random DSV4.1-shaped experts against the scalar
-tier (fp32 activations, which ignores the options):
+The CPU kernel's ops (sglang_exl3_cpu::*) exist only in the optimized extension, which SGLANG_DSV41_CPU_EXPERTS=1
+builds, so each tier's child process runs with it set. Checks on random DSV4.1-shaped experts against the scalar tier
+(fp32 activations, which ignores the options):
   - the swizzled layout gives the same bits as the native one (the k-block sub-view addresses both);
   - a 5-token batch gives each token the same bits as running it alone (chunks are capped for the residual rows);
-  - the relative error against the scalar tier is under the flavor's bound.
+  - the relative error against the scalar tier is under the residual kernel's bound.
 
-Needs SGLANG_EXL3_SRC and an AVX2-or-better CPU; each ISA tier runs in its own process, since the tier is fixed at
-the first kernel call. Run on divix01 under taskset, e.g.
-  SGLANG_EXL3_CPU_ACT_RESIDUAL=1 SGLANG_EXL3_CPU_ACT_BLOCK=128 \\
-    taskset -c 18-25 python -m pytest test/manual/dsv41/test_exl3_cpu_act_quant.py -q
+Needs SGLANG_EXL3_SRC and an AVX2-or-better CPU, and builds the expert-stream host module's instrumented variant for its
+test exports (kernel_layer, kernel_forward; CXX the kernels' GCC 15, as run_exl3_cpu_forward_checks.sh sets it). Each
+ISA tier runs in its own process, since the tier is fixed at the first kernel call. Run on divix01 under taskset, e.g.
+  taskset -c 18-25 python -m pytest test/manual/dsv41/test_exl3_cpu_act_quant.py -q
 """
 
 import os
@@ -50,32 +51,52 @@ def _weights(torch):
     return w, x, sel, (rw / rw.sum(-1, keepdim=True)).half()
 
 
+def _slabs(torch, w, tr):
+    """The experts as the pinned tier holds them, expert e in slot e: w13 rows hold gate then up, w2 rows hold down."""
+
+    def stack(*parts):
+        return torch.stack([torch.stack([p[e] for p in parts]) for e in range(E)]).contiguous()
+
+    return {
+        "w13_trellis": stack([tr(t) for t in w["gt"]], [tr(t) for t in w["ut"]]),
+        "w13_suh": stack(w["gs"], w["us"]),
+        "w13_svh": stack(w["gv"], w["uv"]),
+        "w2_trellis": stack([tr(t) for t in w["dt"]]),
+        "w2_suh": stack(w["ds"]),
+        "w2_svh": stack(w["dv"]),
+    }
+
+
 def _run(tier, out_path):
     os.environ["EXL3_MOE_CPU_MAX_ISA"] = tier
     os.environ.setdefault("EXL3_MOE_CPU_PIN", "0")
     import torch
 
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     e = exl3_ext()
     w, x, sel, rw = _weights(torch)
     threads = min(8, len(os.sched_getaffinity(0)))
     res = {"bw": bool(e.exl3_moe_cpu_has_avx512_bw())}
+
+    def forward(layer, rows):
+        out = torch.zeros(x[rows].shape[0], H)
+        status, why = es.kernel_forward(layer, x[rows], sel[rows], rw[rows], out, threads=threads, variant="instr")
+        assert status == 0, why
+        return out
+
     for layout in ("native", "swizzled") if tier != "scalar" else ("native",):
         swz = layout == "swizzled"
-        tr = _swizzle if swz else (lambda t: t)
-        h = e.exl3_moe_cpu_make_layer(
-            [tr(t) for t in w["gt"]], w["gs"], w["gv"], [tr(t) for t in w["ut"]], w["us"], w["uv"],
-            [tr(t) for t in w["dt"]], w["ds"], w["dv"], [], [], [], 0, SWIGLU_LIMIT, int(swz),
-        )
-        batch = torch.zeros(TOKENS, H)
-        e.exl3_moe_cpu_forward(h, x, sel, rw, batch, threads)
-        single = torch.zeros(TOKENS, H)
-        for t in range(TOKENS):
-            out = torch.zeros(1, H)
-            e.exl3_moe_cpu_forward(h, x[t : t + 1], sel[t : t + 1], rw[t : t + 1], out, threads)
-            single[t] = out[0]
-        e.exl3_moe_cpu_free_layer(h)
+        trait = Exl3CpuQuantTrait(e, act_limit=SWIGLU_LIMIT, swizzled=swz)
+        spec = trait.layer_spec(_slabs(torch, w, _swizzle if swz else (lambda t: t)), E)
+        layer = es.kernel_layer(trait.kernel_address(), spec, variant="instr")
+        try:
+            batch = forward(layer, slice(0, TOKENS))
+            single = torch.cat([forward(layer, slice(t, t + 1)) for t in range(TOKENS)])
+        finally:
+            es.kernel_drop(layer, variant="instr")
         res[layout] = {"batch": batch, "single": single}
     torch.save(res, out_path)
 
@@ -84,18 +105,14 @@ def _tier(tier, tmp_path):
     import torch
 
     out = tmp_path / f"{tier}.pt"
-    subprocess.run([sys.executable, __file__, tier, str(out)], check=True)
+    env = {**os.environ, "SGLANG_DSV41_CPU_EXPERTS": "1"}
+    subprocess.run([sys.executable, __file__, tier, str(out)], check=True, env=env)
     return torch.load(out)
 
 
-def _bound():
-    from sglang.srt.environ import envs
-
-    residual = envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get()
-    block = envs.SGLANG_EXL3_CPU_ACT_BLOCK.get()
-    # Upstream measures ~1.4-1.9% on real DSV4.1 rows (DSV41_REFERENCE §28, the P0 plan results); a second int8 pass
-    # leaves ~1/127 of the first pass's error, and per-block scales a fraction of it.
-    return 0.006 if residual else (0.02 if block else 0.03)
+# Upstream measures ~1.4-1.9% on real DSV4.1 rows (DSV41_REFERENCE §28, the P0 plan results); the residual pass leaves
+# ~1/127 of the first pass's error.
+ERROR_BOUND = 0.006
 
 
 @pytest.fixture(scope="module")
@@ -131,8 +148,8 @@ def test_error_against_fp32_activations_is_bounded(tiers):
     got = tiers["bw"]["native"]["batch"]
     assert torch.isfinite(got).all()
     err = _rel(got, ref)
-    print(f"rel L2 vs scalar tier: {err:.5f} (bound {_bound()})")
-    assert err < _bound()
+    print(f"rel L2 vs scalar tier: {err:.5f} (bound {ERROR_BOUND})")
+    assert err < ERROR_BOUND
 
 
 if __name__ == "__main__":

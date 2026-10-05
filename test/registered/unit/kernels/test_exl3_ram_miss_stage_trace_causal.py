@@ -12,6 +12,7 @@ import pytest
 import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ops
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, read_rows_traced
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
@@ -33,7 +34,7 @@ def hang_guard():
 def _host(tmp_path, *, trace_capacity=None, capacity=6):
     """A tier and its host; ``trace_capacity`` None leaves the trace off."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=3)
     if trace_capacity is not None:
         host.enable_trace(capacity=trace_capacity)
@@ -235,10 +236,6 @@ NON_TRACE_CLOCK_READS = {
     "if (now_ns() > deadline) {": 1,
     "if (!tier_->wait_copy_idle_owned(now_ns() + timeout_ns)) {": 1,
     "if (now_ns() > deadline) return -1;": 1,
-    # The spin budget (spec M8): idle_budget() times kProbe pauses once, on the thread that calls start() (RamThread and
-    # CopyEngine), so neither the service nor the copy thread reads the clock to pace itself.
-    "const int64_t t0 = now_ns();": 1,
-    "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread.
     "const int64_t now = now_ns();": 1,
     # The copy engine (LEASE_PROTOCOL.md, "Copy engine"): its idle waits (CopyEngine::wait_idle, and the FFI's copy_engine_idle
@@ -246,13 +243,13 @@ NON_TRACE_CLOCK_READS = {
     "if (now_ns() > deadline_ns) return false;": 1,
     "return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;": 1,
     "drain_deadline_.store(now_ns() + drain_ns, std::memory_order_relaxed);": 1,
-    "if (stopping && (in_flight.empty() || now_ns() > drain_deadline())) break;": 1,
+    "if (stopping && (in_flight.empty() || now_ns() > drain_deadline_.load(std::memory_order_relaxed))) break;": 1,
     # seqlock_stress, test only (refused on ProdBuild): its run's deadline, on the caller's thread.
     "const int64_t deadline = now_ns() + duration_ns;": 1,
     "while (now_ns() < deadline) {": 1,
     # Metrics, compiled only into InstrBuild (each inside `if constexpr (Build::kMetrics)`): copy_issue_ns, and the copy
     # latency's submit and completion reads.
-    "if constexpr (Build::kMetrics) start = now_ns();  // copy_issue_ns, a metric": 1,
+    "if constexpr (Build::kMetrics) start = now_ns();": 1,
     "count<kCopyIssueNs>(now_ns() - start);": 1,
     "if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric": 1,
     "const int64_t latency = now_ns() - job.submit_ns;": 1,
@@ -262,18 +259,13 @@ NON_TRACE_CLOCK_READS = {
     # ... and the startup split calibration (split_calibration.h): once, on the calibrating caller's thread with the
     # service paused and the copy engine not armed, each run's start, its two completion stamps and its timeout.
     "const int64_t start = now_ns();": 3,
-    "compute_ns_.fetch_add(now_ns() - start, std::memory_order_relaxed);": 1,
+    "const int64_t end = now_ns();": 1,
     "return static_cast<double>(now_ns() - start) / kProbe;": 1,
     "end = std::max(end, now_ns());": 2,
     "if (now_ns() - start > s.timeout_ns)": 1,
     # The native test forward (ffi_test_exports.h, test only, refused on ProdBuild): its spin, on the CPU expert thread.
-    "const int64_t until = expert_stream::now_ns() + k * test_forward_ns().load(std::memory_order_relaxed);": 1,
-    "while (expert_stream::now_ns() < until)": 1,
-    # CpuExpertEngine's keep-warm window (cpu_experts.h), on the CPU expert thread only: one read after each job sets
-    # the window, one per idle poll checks it. The native test keep-warm (test only) spins on its deadline there too.
-    "if (warm && now_ns() < warm_until) {": 1,
-    "if (warm) warm_until = now_ns() + config_.keep_warm_ns;": 1,
-    "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && expert_stream::now_ns() < deadline_ns)": 1,
+    "const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);": 1,
+    "while (now_ns() < until)": 1,
     # UringReader, std::chrono directly. register_resources(): the buffer registration's duration (register_ms), at
     # open and at a ring reset, never per read.
     "const auto t0 = std::chrono::steady_clock::now();": 1,

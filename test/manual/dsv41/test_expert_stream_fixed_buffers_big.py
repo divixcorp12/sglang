@@ -8,8 +8,10 @@ fixed_legs + prep_readv_fixed. It proves that the big slab registers as 306 + 15
 306 x 3,501,056), that the two rows around the cut land in buffers 0 and 1, that an iovec straddling the cut is
 refused, and that a two-slab destination fans out into two legs submitted together.
 
-A second case lowers RLIMIT_MEMLOCK to 256 KiB in the child: the ring still sets up, and the real registration
-ENOMEM must surface as the explicit fixed-buffer refusal naming the limit.
+A second case lowers RLIMIT_MEMLOCK to 256 KiB in the child once its ring is set up: the real registration ENOMEM must
+surface as the explicit fixed-buffer refusal naming the limit. The limit is lowered after ring setup, not before exec,
+because ring setup is charged to the same limit (RLIMIT_MEMLOCK=0 refuses it on 6.12), so a pre-exec limit can refuse
+the ring first and never reach registration.
 
 The harness drives InstrUringReader: the fan-out counters it asserts (fixed_cuts, fanout_sqes) are InstrBuild
 metrics (spec M10) and do not exist on the production UringReader, whose I/O code is the same template.
@@ -19,7 +21,6 @@ Run on divix01 (see the brief's Step 2 command): under rowimg-disk.lock, numactl
 
 import os
 import re
-import resource
 import shutil
 import subprocess
 from pathlib import Path
@@ -31,6 +32,7 @@ pytestmark = pytest.mark.skipif(os.uname().nodename != "divix01", reason="1.5 Gi
 _SOURCE = r'''
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -52,6 +54,7 @@ constexpr size_t kBigRow = 3501056, kBigRows = 460, kBigBytes = kBigRow * kBigRo
 constexpr size_t kSmallRow = 49152, kSmallRows = 64, kSmallBytes = kSmallRow * kSmallRows;
 constexpr size_t kFileBytes = 16u << 20;
 constexpr size_t kCut = 306;  // floor(1 GiB / 3,501,056): rows in chunk 0
+constexpr rlim_t kMemlockLimit = 262144;  // the memlock case's limit; MEMLOCK_LIMIT in the test
 
 void require(bool condition, const std::string& message) {
   if (!condition) throw std::runtime_error(message);
@@ -165,6 +168,8 @@ int main(int argc, char** argv) {
     UringReader reader;
     require(reader.init(8), "ring setup failed");
     if (std::string(argv[2]) == "memlock") {
+      const rlimit limit{kMemlockLimit, kMemlockLimit};
+      require(setrlimit(RLIMIT_MEMLOCK, &limit) == 0, "lowering RLIMIT_MEMLOCK failed");
       try {
         reader.configure_resources(fds, regions, true);
       } catch (const std::exception& e) {
@@ -308,14 +313,13 @@ def test_big_fixed_slab_real_kernel(harness, tmp_path):
     print(f"DIAG chunks={diag[1]} register_ms={diag[3]}")
 
 
+MEMLOCK_LIMIT = 262144  # kMemlockLimit in the harness
+
+
 def test_big_fixed_slab_memlock_refused(harness, tmp_path):
-    limit = 262144
-
-    def lower_memlock():
-        resource.setrlimit(resource.RLIMIT_MEMLOCK, (limit, limit))
-
+    limit = MEMLOCK_LIMIT
     run = subprocess.run([str(harness), str(tmp_path), "memlock"], env=_env(), capture_output=True, text=True,
-                         timeout=300, check=False, preexec_fn=lower_memlock)
+                         timeout=300, check=False)
     output = run.stdout + run.stderr
     print(output)
     assert run.returncode == 0, output

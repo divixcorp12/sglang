@@ -1326,7 +1326,7 @@ These variables configure DeepSeek V4.1: streaming EXL3 routed experts from disk
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_RAM_MISS_SPIN_CORE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Core the RAM-miss service thread busy-polls on. Unset inherits the server affinity. The service refuses to start unless that core's physical core is its own.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The RAM thread's core on its NUMA node, busy-polled. Refused unless it is outside cores 64-71 and the server affinity, on a node of the pinned tier, and its physical core is the thread's own. Unset derives each node's core when there are several nodes or CPU experts; otherwise the thread inherits the server affinity.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
     <tr>
@@ -1458,7 +1458,7 @@ Decode computes a layer's RAM-tier experts on the CPU, in place over the pinned 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_CPU_EXPERTS_CORES</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cores of the CPU expert pool as a taskset list such as <code>36-47,50</code>. At least two; empty refuses the pool.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Optional override of the CPU expert pool's cores, a taskset list on one node such as <code>36-47,50</code>, at least two. Empty derives each node's pool from its free physical cores.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>empty</code></td>
     </tr>
     <tr>

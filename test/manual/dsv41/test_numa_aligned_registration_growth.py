@@ -412,9 +412,27 @@ def _gib_run(gib: int, tmp_path: Path, old: bool = False, separate: bool = False
     return result
 
 
+# Above this share of THP faults falling back to 4 KiB pages, the run measures the uncoalesced path whatever the
+# binding does. A fallback means the kernel had no free huge page (fragmented memory), not a split VMA: an alignment
+# regression shows as missing huge pages with no fallbacks, and still fails the growth asserts.
+MAX_THP_FALLBACK = 0.05
+
+
+def _require_huge_pages(result: dict) -> None:
+    stat = result["vmstat_alloc_touch"]
+    alloc, fallback = stat.get("thp_fault_alloc", 0), stat.get("thp_fault_fallback", 0)
+    if fallback > MAX_THP_FALLBACK * (alloc + fallback):
+        pytest.skip(
+            f"the kernel could not supply huge pages: {fallback} of {alloc + fallback} THP faults fell back to 4 KiB "
+            f"(tier {result['anon_huge_fraction']:.0%} THP), so registration cannot coalesce; compact memory "
+            "(as root: echo 1 > /proc/sys/vm/compact_memory) and rerun"
+        )
+
+
 @pytest.mark.parametrize("gib", [8, 16, 32])
 def test_aligned_registration_grows_linearly(gib, tmp_path):
     result = _gib_run(gib, tmp_path)
+    _require_huge_pages(result)
     assert result["register_error"] == "", result["register_error"]
     assert result["chunks_registered"] == result["chunks_planned"]
     assert result["base_2mib_aligned"] == result["mappings"] == result["layers"]
@@ -425,6 +443,7 @@ def test_aligned_registration_grows_linearly(gib, tmp_path):
 def test_separate_slab_registration_grows_linearly(tmp_path):
     # SLAB_ARENA=0: one mapping per named slab per layer, each ending in a tail that is now bound out to 2 MiB.
     result = _gib_run(32, tmp_path, separate=True)
+    _require_huge_pages(result)
     assert result["register_error"] == "", result["register_error"]
     assert result["chunks_registered"] == result["chunks_planned"]
     assert result["base_2mib_aligned"] == result["mappings"] == 6 * result["layers"]

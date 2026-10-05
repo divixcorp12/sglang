@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import sys
 from collections import OrderedDict
 
 import numpy as np
@@ -14,6 +15,8 @@ _SIM = os.path.join(
 )
 _spec = importlib.util.spec_from_file_location("engram_cache_sim", _SIM)
 sim = importlib.util.module_from_spec(_spec)
+# numba's on-disk cache (cache=True) re-imports the module by name when it loads a cached function.
+sys.modules["engram_cache_sim"] = sim
 _spec.loader.exec_module(sim)
 
 

@@ -4,12 +4,16 @@
 #include <ATen/Parallel.h>
 
 #include "aligned.h"
-#include "cpu_experts_cabi.h"
 #include "fixture.h"
+#include "kernel.h"
 #include "moe_mul1.h"
+#include "placement.h"
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <fstream>
 #include <omp.h>
 #include <stdexcept>
@@ -55,8 +59,12 @@ std::string fixture_stamp(const fs::path& fixture, const ImageLayout& layout) {
 
 }  // namespace
 
-StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_dir) : impl_(std::make_unique<Impl>()) {
+StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_dir, std::vector<int> group_nodes)
+    : impl_(std::make_unique<Impl>()) {
   Impl& f = *impl_;
+  constexpr int kNodes = ::sglang::expert_stream::wire::Wire::kNodes;
+  if (kNodes > 1 && static_cast<int>(group_nodes.size()) != kNodes)
+    throw std::runtime_error("give one NUMA node per group (" + std::to_string(kNodes) + ")");
   require_o_direct(image_dir);
   const Fixture fixture(fixture_path);
   f.rows = static_cast<int64_t>(fixture.layers.size());
@@ -68,15 +76,18 @@ StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_d
       2 * nbytes(m[0][0]), 2 * nbytes(m[1][0]), 2 * nbytes(m[2][0]), nbytes(m[6][0]), nbytes(m[7][0]), nbytes(m[8][0])};
   f.set.layout = image_layout(row_bytes);
   f.set.experts = f.experts;
-  f.set.capacity = kCapacity;
+  f.set.capacity = capacity();
   const ImageLayout& layout = f.set.layout;
   const std::string stamp = fixture_stamp(fixture_path, layout);
   f.slabs.resize(static_cast<size_t>(f.rows));
   for (int64_t row = 0; row < f.rows; ++row) {
     std::array<uint8_t*, kNames> bases{};
     for (int n = 0; n < kNames; ++n) {
-      f.slabs[row][n] = aligned_zeroed(kCapacity * row_bytes[n]);
+      f.slabs[row][n] = aligned_zeroed(capacity() * row_bytes[n]);
       bases[n] = f.slabs[row][n].get();
+      if (kNodes > 1)
+        for (int g = 0; g < kNodes; ++g)
+          bind_pages(bases[n] + g * kGroupSlots * row_bytes[n], kGroupSlots * row_bytes[n], group_nodes[g]);
     }
     f.set.slabs.push_back(bases);
     char name[40];
@@ -108,7 +119,7 @@ StackFixture::StackFixture(const fs::path& fixture_path, const fs::path& image_d
     std::memcpy(f.inputs.data() + row * 2 * f.hidden, fixture.layers[row].input.data_ptr(), 2 * f.hidden);
     std::memcpy(f.x.get() + row * f.x_stride, fixture.layers[row].input.data_ptr(), 2 * f.hidden);
   }
-  f.out_stride = 2 * f.hidden * static_cast<int64_t>(sizeof(float));
+  f.out_stride = 2 * kNodes * f.hidden * static_cast<int64_t>(sizeof(float));
   f.out = aligned_zeroed(f.rows * f.out_stride);
 }
 
@@ -143,26 +154,30 @@ void StackFixture::write_x(int64_t row) const {
   std::memcpy(x_row(row), impl_->inputs.data() + row * 2 * impl_->hidden, 2 * impl_->hidden);
 }
 
-// Mirrors cpu_experts/exl3.py::register_layer: the row's six slabs by base pointer (kNames is EXL3_STREAMED_NAMES
-// order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit.
-int64_t StackFixture::register_layer(int64_t row) const {
+// Mirrors Exl3CpuQuantTrait.layer_spec: the row's six slabs by base pointer and row stride (kNames is
+// EXL3_STREAMED_NAMES' order), activation 0 (silu) with cpu_forward.cpp's limit 10, unswizzled 3-bit, made into a layer
+// by the EXL3 kernel. Views only: the fixture's slabs outlive it.
+::sglang::cpu_experts::ExpertLayer StackFixture::make_layer(int64_t row) const {
   const Impl& f = *impl_;
-  const void* slabs[kNames];
-  for (int n = 0; n < kNames; ++n) slabs[n] = f.set.slabs[row][n];
-  int64_t handle = -1;
-  const int status = sglang_exl3_cpu_experts_register_slabs(
-      slabs, static_cast<int32_t>(kCapacity), static_cast<int32_t>(f.hidden), static_cast<int32_t>(f.intermediate), 3,
-      0, 10.0f, &handle);
-  if (status != 0)
-    throw std::runtime_error("the kernel refused row " + std::to_string(row) + "'s slabs: status " +
-                             std::to_string(status));
-  return handle;
+  const SglangExl3CpuParams params{3, 0};  // bits, swizzled
+  ::sglang::cpu_experts::ExpertLayer d;
+  d.capacity = static_cast<int32_t>(capacity());
+  d.hidden = static_cast<int32_t>(f.hidden);
+  d.intermediate = static_cast<int32_t>(f.intermediate);
+  d.activation = 0;
+  d.act_limit = 10.0f;
+  d.slab_count = kNames;
+  for (int n = 0; n < kNames; ++n) {
+    d.slabs[n] = f.set.slabs[row][n];
+    d.slot_bytes[n] = static_cast<uint64_t>(f.set.layout.row_bytes[n]);
+  }
+  return ::sglang::exl3_cpu::exl3_cpu_kernel().make_layer(d, std::as_bytes(std::span<const SglangExl3CpuParams>(&params, 1)));
 }
 
 void StackFixture::preload_slots(int64_t row) const {
   const Impl& f = *impl_;
   const ImageLayout& layout = f.set.layout;
-  if (f.experts > kCapacity - kStaging) throw std::runtime_error("more experts than mappable slots");
+  if (f.experts > kGroupSlots - kStaging) throw std::runtime_error("more experts than mappable slots");
   const std::string& path = f.set.paths[static_cast<size_t>(row)];
   std::ifstream in(path, std::ios::binary);
   std::vector<char> image(static_cast<size_t>(layout.image_bytes));
@@ -172,18 +187,14 @@ void StackFixture::preload_slots(int64_t row) const {
       throw std::runtime_error("cannot read expert " + std::to_string(e) + "'s image from " + path);
     for (int n = 0; n < kNames; ++n)
       std::memcpy(
-          f.set.slabs[row][n] + e * layout.row_bytes[n],
+          f.set.slabs[row][n] + slot_of(e) * layout.row_bytes[n],
           image.data() + layout.name_offsets[n],
           static_cast<size_t>(layout.row_bytes[n]));
   }
 }
 
-void StackFixture::free_layer(int64_t handle) {
-  exl3_moe_cpu_free_layer(handle);
-}
-
 void configure_cpu_kernel_runtime() {
-  // ISA detection occurs during kernel static initialization, before main.
+  // The kernel detects its ISA tier at the first query, here, after EXL3_MOE_CPU_MAX_ISA was set at launch.
   if (!exl3_moe_cpu_has_avx512_bw() || exl3_moe_cpu_has_avx512_vnni() || exl3_moe_cpu_has_avx512_vbmi())
     throw std::runtime_error("This study requires AVX512BW; set EXL3_MOE_CPU_MAX_ISA=bw before launch");
   at::set_num_threads(1);
@@ -198,6 +209,19 @@ void release_kernel_team() {
 
 void check_reference(const fs::path& path, const std::vector<float>& actual) {
   compare_reference(path, actual);
+}
+
+void check_reference_close(const fs::path& path, const std::vector<float>& actual, float tol) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("Missing reference: " + path.string());
+  const size_t bytes = actual.size() * sizeof(float);
+  if (fs::file_size(path) != bytes) throw std::runtime_error("Reference length mismatch");
+  std::vector<float> expected(actual.size());
+  if (!input.read(reinterpret_cast<char*>(expected.data()), static_cast<std::streamsize>(bytes)))
+    throw std::runtime_error("Cannot read reference: " + path.string());
+  for (size_t i = 0; i < actual.size(); ++i)
+    if (!(std::fabs(actual[i] - expected[i]) <= tol * std::max(1.0f, std::fabs(expected[i]))))
+      throw std::runtime_error("Reference check failed beyond " + std::to_string(tol) + ": " + path.string());
 }
 
 }  // namespace fullstack

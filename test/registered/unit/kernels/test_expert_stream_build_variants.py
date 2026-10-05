@@ -5,6 +5,8 @@ process writes a stream trace or injects a RAM-miss fault."""
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
+from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.environ import envs
@@ -12,6 +14,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+
+RECORD_BYTES = lease.wire_layout(8).record_bytes
 
 
 @pytest.fixture
@@ -38,7 +42,7 @@ def test_a_ram_miss_fault_selects_the_instrumented_build(no_override):
 def test_each_module_names_its_build_and_a_host_keeps_the_one_it_loaded(variant, tmp_path):
     assert str(ops._host_module("exl3", variant).expert_stream_build_name()) == variant
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant=variant)
     try:
         assert host.variant == variant
@@ -53,7 +57,7 @@ def test_an_unknown_variant_is_refused():
 
 def test_a_production_host_reports_only_the_core_counters(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant="prod")
     try:
         assert tuple(host.counters()) == ops.CORE_COUNTERS
@@ -63,7 +67,7 @@ def test_a_production_host_reports_only_the_core_counters(tmp_path):
 
 def test_the_instrumented_host_still_reports_every_counter(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant="instr")
     try:
         assert tuple(host.counters()) == tuple(ops.COUNTERS) and set(ops.CORE_COUNTERS) < set(ops.COUNTERS)
@@ -105,7 +109,7 @@ TEST_ONLY_CALLS = {
 @pytest.mark.parametrize("name", sorted(TEST_ONLY_CALLS))
 def test_test_only_calls_refuse_on_prod(name, tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant="prod")
     try:
         with pytest.raises(RuntimeError, match="instrumented host build"):
@@ -124,14 +128,31 @@ def test_a_faulted_read_refuses_on_prod(tmp_path):
 # the C++ refusal is pinned too (a wrapper that forgot to refuse would otherwise reach a silent C++ fallback).
 RAW_EXPORTS = {
     "inject": lambda m, h: m.expert_stream_inject(h, 0, 1, 0),
+    "pump_group": lambda m, h: m.expert_stream_pump_group(h, 0),
     "inject_fault": lambda m, h: m.expert_stream_inject_fault(h, ops._fault_tensor(part=0, part_error=5)),
+    "inject_group_stall": lambda m, h: m.expert_stream_inject_group_stall(h, 0, 0),
     "copy_engine_fail": lambda m, h: m.expert_stream_copy_engine_fail(h, 1, 0),
     "copy_engine_ballast": lambda m, h: m.expert_stream_copy_engine_ballast(h, 0, 0, 0),
     "trace_clock_reads": lambda m, h: m.expert_stream_trace_clock_reads(),
     "seqlock_stress": lambda m, h: m.expert_stream_seqlock_stress(1000, torch.zeros(2, dtype=torch.int64)),
     "pause_ns": lambda m, h: m.expert_stream_pause_ns(),
+    "test_kernel_address": lambda m, h: m.expert_stream_test_kernel_address(0, 0, 0),
+    "test_kernel_calls": lambda m, h: m.expert_stream_test_kernel_calls(torch.zeros((0, 5 + 2 * 8), dtype=torch.float64)),
+    "test_kernel_hold": lambda m, h: m.expert_stream_test_kernel_hold(0, 0),
+    "test_keep_warm_calls": lambda m, h: m.expert_stream_test_keep_warm_calls(),
+    "test_keep_warm_core": lambda m, h: m.expert_stream_test_keep_warm_core(),
+    "kernel_layer": lambda m, h: m.expert_stream_kernel_layer(
+        0, torch.zeros((0, 2), dtype=torch.int64), 0, 0, 0, 0, 0.0, torch.zeros(0, dtype=torch.uint8)
+    ),
+    "kernel_forward": lambda m, h: m.expert_stream_kernel_forward(
+        0, torch.zeros(1, dtype=torch.uint8), torch.zeros((1, 1), dtype=torch.int32),
+        torch.zeros((1, 1), dtype=torch.float32), torch.zeros((1, 1), dtype=torch.float32), 1,
+        torch.zeros(0, dtype=torch.int64), 0,
+    ),
+    "kernel_drop": lambda m, h: m.expert_stream_kernel_drop(0),
+    "kernel_error": lambda m, h: m.expert_stream_kernel_error(),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
-        torch.zeros(ops.RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.READ_RECORD_WORDS, dtype=torch.int64)
+        torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),
 }
 
@@ -147,7 +168,7 @@ def test_every_test_only_export_is_listed_and_exported_by_both_builds():
 @pytest.mark.parametrize("name", sorted(RAW_EXPORTS))
 def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
     s = ram_miss_setup(tmp_path, capacity=2)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32),
                             variant="prod")
     try:
         with pytest.raises(RuntimeError, match=f"{name} is test-only: it exists in the instrumented host build"):
@@ -157,9 +178,15 @@ def test_the_prod_module_refuses_each_test_only_export_itself(name, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "helper", ("read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields")
+    "helper",
+    (
+        "read_rows_with_fault", "read_rows_sqes", "seqlock_stress", "pause_ns", "read_record_fields",
+        "kernel_layer", "kernel_forward", "kernel_drop",
+    ),
 )
 def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
+    from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
+
     s = ram_miss_setup(tmp_path)
     calls = {
         "read_rows_with_fault": lambda: ops.read_rows_with_fault(s.tables, 0, [1], [0], [], [], variant="prod"),
@@ -167,8 +194,14 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
         "seqlock_stress": lambda: ops.seqlock_stress(0.001, variant="prod"),
         "pause_ns": lambda: ops.pause_ns(variant="prod"),
         "read_record_fields": lambda: ops.read_record_fields(
-            torch.zeros(ops.RECORD_BYTES, dtype=torch.uint8), 1, variant="prod"
+            torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, variant="prod"
         ),
+        "kernel_layer": lambda: ops.kernel_layer(0, fake_cpu_layer(), variant="prod"),
+        "kernel_forward": lambda: ops.kernel_forward(
+            0, torch.zeros((1, 8), dtype=torch.float16), torch.zeros((1, 1)), torch.zeros((1, 1)),
+            torch.zeros((1, 8)), threads=1, variant="prod",
+        ),
+        "kernel_drop": lambda: ops.kernel_drop(0, variant="prod"),
     }
     export = {"read_rows_with_fault": "read_rows_faulted"}.get(helper, helper)  # the name the error carries
     with pytest.raises(RuntimeError, match=f"{export} is test-only"):
@@ -189,6 +222,17 @@ def test_a_traced_read_on_prod_reads_exact_bytes_with_an_empty_record_and_refuse
         ops.read_rows_traced(s.tables, 0, [1], [0], variant="prod", part=0, part_error=5)
     _, instr = ops.read_rows_traced(s.tables, 0, [1, 2], [0, 1], variant="instr")
     assert instr["rows_asked"] == 2 and instr["bytes"] > 0, "the instrumented build still fills the record"
+
+
+@pytest.mark.parametrize("nodes", [1, 2])
+def test_each_host_build_is_compiled_for_its_node_count(nodes):
+    module = ops._host_module("exl3", "instr", 8, nodes)
+    assert (int(module.expert_stream_wire_lanes()), int(module.expert_stream_wire_nodes())) == (8, nodes)
+
+
+def test_one_node_and_two_nodes_are_separate_modules():
+    assert ops._host_module("exl3", "instr", 8, 1) is ops._host_module("exl3", "instr", 8)
+    assert ops._host_module("exl3", "instr", 8, 2) is not ops._host_module("exl3", "instr", 8, 1)
 
 
 if __name__ == "__main__":

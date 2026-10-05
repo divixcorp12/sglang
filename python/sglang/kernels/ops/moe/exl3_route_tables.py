@@ -1,6 +1,6 @@
 """JIT wrapper for the EXL3 fused MoE's route tables (SGLANG_DSV41_ENABLE_LAYER_FUSION).
 
-``exl3_moe_route_tables`` launches one kernel in place of ``exl3_fused_moe.route_tables`` and the copies around it in
+``exl3_moe_route_tables`` launches one kernel in place of ``exl3.fused_moe.route_tables`` and the copies around it in
 ``Exl3FusedMoE.run`` (22 kernels per layer), with bit-identical results; the flag-off path runs the torch chain, and
 the parity test compares against it.
 """
@@ -50,15 +50,16 @@ def exl3_moe_route_tables(
     cpu_out: int = 0,
     cpu_part_stride: int = 0,
 ) -> None:
-    """The fused MoE's route tables and input staging; see ``exl3_fused_moe.route_tables``.
+    """The fused MoE's route tables and input staging; see ``exl3.fused_moe.route_tables``.
 
     Writes ``remap64_out`` (``remap`` as int64), ``x16_out`` (``x`` as fp16), zeroes ``out_zero``, and fills
     ``expert_count`` [slots + 1], ``inv_order``, ``weight_sorted`` (fp16) and ``det`` [3, slots + 1].
 
-    CPU experts: ``cpu_lanes`` (int32 ``[1]``, CC's word) masks the plan lanes the CPU computed in bits 0-7 and flags
-    the output parts holding their partial sums in bits 8 (part 0, the CPU hits') and 9 (part 1, the CPU misses');
-    ``dst_slots`` (int32) are the plan's lane slots, ``cpu_out`` the address of the row's part 0 and
-    ``cpu_part_stride`` the floats from part 0 to part 1 (0 for a one-part row). The flagged parts' sum seeds
+    CPU experts: ``cpu_lanes`` (int32 ``[2]``: CPU lanes, then the part bits) masks the plan lanes the CPU computed and
+    flags the output parts holding their partial sums, a bit per part: bit 2g group g's CPU hits', bit 2g + 1 its CPU
+    misses'; ``dst_slots`` (int32) are the plan's lane slots, ``cpu_out`` the address of the row's part 0 and
+    ``cpu_part_stride`` the floats between consecutive parts (0 for a one-part row). The flagged parts' sum, lowest
+    part first, seeds
     ``out_zero``; the CPU routes' slots count 0 and rank last, so the fused kernel and the gather skip them.
 
     The launcher checks every tensor; this refuses only a dtype that has no instantiation.

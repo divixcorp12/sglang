@@ -22,6 +22,9 @@
 # indices and ids are recorded in run-manifest.json.
 # Env: DSV41_MEM_FRACTION_STATIC=0.x replaces arm_env's --mem-fraction-static for this arm only (logged to server.log).
 # Env: DSV41_EXTRA_SERVER_ARGS="--flag v ..." appends server flags for this arm only (logged to server.log).
+# Env: DSV41_SERVER_CORES=<taskset list> replaces arm_env.SERVER_CORES for this arm only; it must stay on node 0 (see
+# arm_env.SERVER_CORES). DSV41_DRIVER_CORES=<taskset list> replaces arm_env.DRIVER_CORES; set but empty runs the
+# driver unpinned (not for timed comparisons). Both are recorded in run-manifest.json.
 # Env: EXPECT_SHA=<sha> to pin the worktree to an exact commit (refuse otherwise); the
 # worktree must always be clean (preflight). The python/ tree must be registered in
 # generations.json first (`python -c "import generations; generations.register(TREE,
@@ -56,8 +59,13 @@ py=/data/models/slang/.venv/bin/python
 # spanning both NUMA nodes is exactly the startup hang of 2026-09-22. The command
 # substitution finishes long before the launch below, so it does not break the
 # "nothing may fork between the shell and python" rule that keeps $! the server.
-server_cores=$("$py" -c "import sys; sys.path.insert(0, '$here'); import arm_env; print(arm_env.SERVER_CORES)") \
+arm_cores=$("$py" -c "import sys; sys.path.insert(0, '$here'); import arm_env; print(arm_env.SERVER_CORES, arm_env.DRIVER_CORES)") \
     || { echo "cannot read arm_env.SERVER_CORES" >&2; exit 1; }
+read -r arm_server_cores arm_driver_cores <<< "$arm_cores"
+server_cores=${DSV41_SERVER_CORES:-$arm_server_cores}
+driver_cores=${DSV41_DRIVER_CORES-$arm_driver_cores}
+driver_pin=()
+[ -n "$driver_cores" ] && driver_pin=(taskset -c "$driver_cores")
 gpu_lock=/data/models/slang/nvfp4-work/cc-gpu.lock
 out_root=${DSV41_RUN_ROOT:-/data/models/slang/nvfp4-work/cc-expert-prediction/dsv41-baseline}
 run_dir=$out_root/servers/$arm/run-$(date +%Y%m%d-%H%M%S)
@@ -78,6 +86,7 @@ exec > >(tee -a "$log_pretty") 2>&1
 touch "$log"
 
 echo "arm=$arm port=$port run_dir=$run_dir worktree=$worktree overrides=${overrides[*]:-none}"
+echo "server cores $server_cores; driver cores ${driver_cores:-unpinned}"
 
 # --- preflight: refuse a dirty worktree, and a wrong one if EXPECT_SHA is set. Adopted
 #     from task1-baseline-arms.sh's preflight()/harness_gate() — a harness launching
@@ -425,7 +434,7 @@ recent_clocks=()
 recent_tok_s=()
 for round in $(seq 1 "$max_warmup_rounds"); do
     round_results="$run_dir/results-warmup-$round.jsonl"
-    taskset -c 8-15 env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
+    "${driver_pin[@]}" env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
         "$worktree/scripts/expert_prediction/benchmarks/run_capture_sessions.py" \
         --port "$port" --sessions "$synthetic_sessions" --session-ids "$warmup_session_id" \
         --max-tokens "$max_tokens" --results "$round_results" --rid-suffix="-w$round"
@@ -523,7 +532,7 @@ do
     before_byte=$(pyrun -c "import compile_watch as cw; print(cw.log_size('$log'))")
     clock_start=$(pyrun -c "import clock_ramp as cr; print(cr.sample_sm_clock_mhz())")
     cpu_start=$(pyrun -c "import provenance; v = provenance.process_tree_cpu_s(pid=$spid); print(v if v is not None else 'None')")
-    taskset -c 8-15 env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
+    "${driver_pin[@]}" env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
         "$worktree/scripts/expert_prediction/benchmarks/run_capture_sessions.py" \
         --port "$port" --sessions "$synthetic_sessions" --session-ids "$session_id" \
         --max-tokens "$max_tokens" --results "$run_dir/results.jsonl"
@@ -698,6 +707,8 @@ manifest = {
     'session_indices_override': '${DSV41_SESSION_INDICES:-}' or None,
     'warmup_session_id': '$warmup_session_id',
     'max_tokens': $max_tokens,
+    'server_cores': '$server_cores',
+    'driver_cores': '$driver_cores' or None,
     'env': env,
     'tenancy_start': json.loads('''$tenancy_start'''),
     'tenancy_end': json.loads('''$tenancy_end'''),

@@ -13,14 +13,16 @@ This module wraps both halves:
   * the byte layouts the two halves share: the request page, the lease block
     (``expert_lease_block``) and the counters.
 
-The layout constants mirror ``csrc/moe/expert_stream/lease_layout.h`` (under
-``python/sglang/kernels/jit/``). See ``analysis/dsv41-drive/LEASE_PROTOCOL.md`` for
+The layouts mirror ``csrc/moe/expert_stream/lease_layout.h`` (under
+``python/sglang/kernels/jit/``): ``expert_lease_block.wire_layout(lanes)`` gives the byte
+offsets of a build with ``lanes`` lanes. See ``analysis/dsv41-drive/LEASE_PROTOCOL.md`` for
 the protocol.
 """
 
 from __future__ import annotations
 
 import atexit
+import functools
 import json
 import struct
 import sys
@@ -63,10 +65,10 @@ class TransportBuild(msgspec.Struct, frozen=True):
 LAYOUTS = {
     "exl3": TransportBuild(
         host_sources={
-            "prod": "moe/exl3_ram_miss_host.cpp",
-            "instr": "moe/exl3_ram_miss_host_instr.cpp",
+            "prod": "moe/exl3/exl3_ram_miss_host.cpp",
+            "instr": "moe/exl3/exl3_ram_miss_host_instr.cpp",
         },
-        device_source="moe/exl3_ram_miss.cuh",
+        device_source="moe/exl3/exl3_ram_miss.cuh",
         device_layout="sglang::exl3::Exl3RowLayout",
     )
 }
@@ -109,13 +111,34 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "read_rows_sqes",
     "inject",
     "inject_fault",
+    "inject_group_stall",
     "copy_engine_fail",
     "copy_engine_ballast",
     "trace_clock_reads",
     "seqlock_stress",
     "pause_ns",
     "read_record_fields",
+    "pump_group",
+    "test_kernel_address",
+    "test_kernel_calls",
+    "test_kernel_hold",
+    "test_keep_warm_calls",
+    "test_keep_warm_core",
+    "kernel_layer",
+    "kernel_forward",
+    "kernel_error",
+    "kernel_drop",
 )
+
+
+def _layer_tensors(spec) -> tuple[torch.Tensor, torch.Tensor]:
+    """A ``CpuExpertLayerSpec``'s slab table (int64 ``[n, 2]`` of {address, slot bytes}) and params (uint8 ``[m]``),
+    as the host's set_cpu_layer and kernel_layer take them. ``reshape(n, 2)``: torch refuses ``reshape(-1, 2)`` of a
+    zero-slab table (the fake kernel's layers have none)."""
+    flat = [int(v) for pair in spec.slabs for v in pair]
+    slabs = torch.tensor(flat, dtype=torch.int64).reshape(len(spec.slabs), 2)
+    params = torch.tensor(list(spec.params), dtype=torch.uint8)
+    return slabs, params
 
 
 def _refuse_test_only(name: str, variant: Optional[str]) -> None:
@@ -130,28 +153,45 @@ def _refuse_test_only(name: str, variant: Optional[str]) -> None:
 # cache_once keys f(), f("exl3") and f(layout="exl3") apart, so each cached loader
 # below is called only positionally, through a wrapper: a layout and variant then have
 # exactly one module whatever the call form.
-def _host_module(layout: str = "exl3", variant: Optional[str] = None) -> Module:
-    """Return the cached host module for ``layout`` and ``variant`` (default build)."""
+def _suffix(lanes: int, nodes: int) -> str:
+    """A build's module-name suffix: one node keeps the Phase 1 names, so its modules and caches are unchanged."""
+    return f"_l{lanes}" if nodes == 1 else f"_l{lanes}_n{nodes}"
+
+
+def _host_module(
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+    lanes: int = 8,
+    nodes: int = 1,
+) -> Module:
+    """Return the cached host module for ``layout``, ``variant`` (default build), ``lanes`` and ``nodes``."""
     variant = host_variant() if variant is None else variant
+    wire = expert_lease_block.wire_layout(lanes, nodes)
+    lanes, nodes = wire.lanes, wire.nodes
     if variant == "instr_tsan" and _ALLOW_TSAN:
-        return _host_module_tsan(layout)
+        return _host_module_tsan(layout, lanes, nodes)
     if variant not in VARIANTS:
         raise ValueError(
             f"unknown host build variant {variant!r}; expected one of {VARIANTS}"
         )
     if variant not in LAYOUTS[layout].host_sources:
         raise ValueError(f"layout {layout!r} has no {variant!r} host build variant")
-    return _host_module_cached(layout, variant)
+    return _host_module_cached(layout, variant, lanes, nodes)
 
 
 @cache_once
-def _host_module_cached(layout: str, variant: str) -> Module:
+def _host_module_cached(layout: str, variant: str, lanes: int, nodes: int) -> Module:
     # Hidden visibility keeps HostExports' registries and members private to each
     # module's .so; only the TVM_FFI_DLL_EXPORT entry points are exported.
     return load_jit(
-        f"expert_stream_host_{layout}_{variant}",
+        f"expert_stream_host_{layout}_{variant}{_suffix(lanes, nodes)}",
         cpp_files=[LAYOUTS[layout].host_sources[variant]],
-        extra_cflags=["-fvisibility=hidden", "-fvisibility-inlines-hidden"],
+        extra_cflags=[
+            "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden",
+            f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+            f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
+        ],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,
     )
@@ -166,9 +206,9 @@ _ALLOW_TSAN = False
 
 
 @cache_once
-def _host_module_tsan(layout: str = "exl3") -> Module:
+def _host_module_tsan(layout: str, lanes: int, nodes: int) -> Module:
     return load_jit(
-        f"expert_stream_host_{layout}_instr_tsan",
+        f"expert_stream_host_{layout}_instr_tsan{_suffix(lanes, nodes)}",
         cpp_files=[LAYOUTS[layout].host_sources["instr"]],
         extra_cflags=[
             "-fvisibility=hidden",
@@ -176,25 +216,28 @@ def _host_module_tsan(layout: str = "exl3") -> Module:
             "-fsanitize=thread",
             "-O1",
             "-g",
+            f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+            f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
         ],
         extra_ldflags=["-luring", "-lpthread", "-ldl", "-fsanitize=thread"],
         header_only=False,
     )
 
 
-def host_layout(layout: str = "exl3") -> tuple[tuple[str, ...], int]:
+def host_layout(layout: str = "exl3", lanes: int = 8) -> tuple[tuple[str, ...], int]:
     """Return the host module's row layout.
 
     That is its tensor names in copy-table order and a bit mask of the ones the SMs
-    can read.
+    can read. ``lanes`` picks the build whose module is read, so a launch reads the
+    one it already builds instead of compiling another.
     """
-    return _host_layout_cached(layout)
+    return _host_layout_cached(layout, expert_lease_block.wire_layout(lanes).lanes)
 
 
 @cache_once
-def _host_layout_cached(layout: str) -> tuple[tuple[str, ...], int]:
+def _host_layout_cached(layout: str, lanes: int) -> tuple[tuple[str, ...], int]:
     # The default variant is enough: every variant of a layout has the same layout.
-    module = _host_module(layout)
+    module = _host_module(layout, lanes=lanes)
     return tuple(str(module.expert_stream_layout_names()).split("\n")), int(
         module.expert_stream_layout_small_mask()
     )
@@ -754,8 +797,7 @@ def piece_geometry(
 # whole read, while ``pack_start``..``pack_end`` run from the first row's packing to
 # the last row's and overlap the reads. The byte split, terminal status, per-row
 # packing and per-extent CQE stamps are defined at ``StageRecord``;
-# ``STAGE_TRACE_ROWS`` and ``STAGE_TRACE_EXTENTS`` are its ``kTraceRows`` and
-# ``kTraceExtents``.
+# ``stage_trace_rows(lanes)`` is the build's ``kTraceRows`` and twice that its ``kTraceExtents``.
 #
 # Row images, the only reader since the direct mode became the sole mode, copy
 # nothing: the drive writes the slab rows. The pack stamps then mean publish time.
@@ -765,12 +807,23 @@ def piece_geometry(
 # ``pack_ns`` are built from them as for packing. ``pack_workers`` and ``pack_split``
 # are 0, and ``useful_bytes`` still counts the segment bytes that landed in the slabs.
 STAGE_DRIVES = 4
-STAGE_TRACE_ROWS = 16
-STAGE_TRACE_EXTENTS = 32
+
+
+def stage_trace_rows(lanes: int = 8) -> int:
+    """kTraceRows: the need and protect ids a request can read, two per lane."""
+    return 2 * expert_lease_block.wire_layout(lanes).lanes
+
+
+def calibration_shape(lanes: int = 8) -> tuple[int, int]:
+    """The calibration grid (kCalibRows, kCalibCols)."""
+    n = expert_lease_block.wire_layout(lanes).lanes
+    return (n + 2, n + 1)
+
+
 # The C++ ``kPieces``: pieces per row, and the most sub-reads a row issues under piece
 # streaming.
 STAGE_PIECES = 8
-STAGE_FIELDS = (
+_STAGE_HEAD = (
     "seq",
     "kind",
     "row",
@@ -807,43 +860,39 @@ STAGE_FIELDS = (
     "rows_reading_max",
     "pending_max",
     "bank_stalls",
-    *(f"row_pack_start_{k}" for k in range(STAGE_TRACE_ROWS)),
-    *(f"row_pack_end_{k}" for k in range(STAGE_TRACE_ROWS)),
-    *(f"extent_id_{k}" for k in range(STAGE_TRACE_EXTENTS)),
-    *(f"extent_cqe_{k}" for k in range(STAGE_TRACE_EXTENTS)),
-    "dropped_before",
-    *(f"row_admit_{k}" for k in range(STAGE_TRACE_ROWS)),
-    *(f"extent_submit_{k}" for k in range(STAGE_TRACE_EXTENTS)),
-    *(f"extent_attempts_{k}" for k in range(STAGE_TRACE_EXTENTS)),
-    "lanes",
-    "pack_workers",
-    "pack_split",
-    "piece_stream",
-    "pieces_vetted",
-    *(
-        f"sub_land_seq_{k}_{j}"
-        for k in range(STAGE_TRACE_ROWS)
-        for j in range(STAGE_PIECES)
-    ),
-    *(
-        f"piece_cqe_{k}_{j}"
-        for k in range(STAGE_TRACE_ROWS)
-        for j in range(STAGE_PIECES)
-    ),
-    *(
-        f"piece_seq_{k}_{j}"
-        for k in range(STAGE_TRACE_ROWS)
-        for j in range(STAGE_PIECES)
-    ),
-    *(
-        f"piece_publish_{k}_{j}"
-        for k in range(STAGE_TRACE_ROWS)
-        for j in range(STAGE_PIECES)
-    ),
-    "pieces_published",
-    "pieces_out_of_order",
-    "piece_publish_refused",
 )
+
+
+@functools.cache
+def stage_fields(lanes: int = 8) -> tuple[str, ...]:
+    """The C++ ``StageRecord``'s int64 words of a ``lanes``-lane build, in order."""
+    rows = stage_trace_rows(lanes)
+    extents = 2 * rows
+    return (
+        *_STAGE_HEAD,
+        *(f"row_pack_start_{k}" for k in range(rows)),
+        *(f"row_pack_end_{k}" for k in range(rows)),
+        *(f"extent_id_{k}" for k in range(extents)),
+        *(f"extent_cqe_{k}" for k in range(extents)),
+        "dropped_before",
+        *(f"row_admit_{k}" for k in range(rows)),
+        *(f"extent_submit_{k}" for k in range(extents)),
+        *(f"extent_attempts_{k}" for k in range(extents)),
+        "lanes",
+        "pack_workers",
+        "pack_split",
+        "piece_stream",
+        "pieces_vetted",
+        *(f"sub_land_seq_{k}_{j}" for k in range(rows) for j in range(STAGE_PIECES)),
+        *(f"piece_cqe_{k}_{j}" for k in range(rows) for j in range(STAGE_PIECES)),
+        *(f"piece_seq_{k}_{j}" for k in range(rows) for j in range(STAGE_PIECES)),
+        *(f"piece_publish_{k}_{j}" for k in range(rows) for j in range(STAGE_PIECES)),
+        "pieces_published",
+        "pieces_out_of_order",
+        "piece_publish_refused",
+    )
+
+
 STAGE_KINDS = ("demand", "touch")
 # Index 0 is a record that never finished: the service never pushes one.
 STAGE_STATUSES = ("none", "served", "no_read", "failed", "cancelled", "touch")
@@ -865,36 +914,38 @@ STAGE_ORDER = (
 )
 
 
-def _stage_words(layout: str = "exl3", variant: Optional[str] = None) -> int:
-    """Return the C++ ``StageRecord`` word count, checked against ``STAGE_FIELDS``."""
-    words = int(_host_module(layout, variant).expert_stream_trace_words())
-    if words != len(STAGE_FIELDS):
+def _stage_words(
+    layout: str = "exl3", variant: Optional[str] = None, lanes: int = 8
+) -> int:
+    """Return the C++ ``StageRecord`` word count of a ``lanes``-lane build, checked against ``stage_fields``."""
+    words = int(_host_module(layout, variant, lanes).expert_stream_trace_words())
+    if words != len(stage_fields(lanes)):
         raise RuntimeError(
-            f"C++ StageRecord has {words} words, STAGE_FIELDS {len(STAGE_FIELDS)}"
+            f"C++ StageRecord has {words} words, stage_fields({lanes}) {len(stage_fields(lanes))}"
         )
     return words
 
 
-def stage_records(words: torch.Tensor) -> list[dict]:
-    """Decode int64 ``[n, len(STAGE_FIELDS)]`` stage-record rows into dicts.
+def stage_records(words: torch.Tensor, lanes: int = 8) -> list[dict]:
+    """Decode int64 ``[n, len(stage_fields(lanes))]`` stage-record rows of a ``lanes``-lane build into dicts.
 
-    Beyond the ``STAGE_FIELDS`` scalars, each dict has:
+    Beyond the ``stage_fields`` scalars, each dict has:
 
     - ``status``: how the request ended; ``missing_stages``: the ``STAGE_ORDER``
       stamps it never reached.
     - ``drives``: the drives that served an extent, as ``{"dev", "bytes", "extents"}``
       (``dev`` -1: several folded).
     - ``row_pack``: one ``{"row", "admit", "start", "end"}`` per row asked for (first
-      ``STAGE_TRACE_ROWS``); 0/0 for a row that never packed, ``admit`` 0 for one
+      ``stage_trace_rows(lanes)``); 0/0 for a row that never packed, ``admit`` 0 for one
       never admitted.
     - ``extent_cqe``: one ``{"row", "part", "sub", "submit", "attempts", "cqe"}`` per
-      extent issued (first ``STAGE_TRACE_EXTENTS``). ``cqe`` is 0 for an extent that
+      extent issued (first twice ``stage_trace_rows(lanes)``). ``cqe`` is 0 for an extent that
       never completed, and otherwise the time the wait that reaped it returned:
       io_uring gives no per-completion time. ``attempts`` counts resubmissions and
       ``sub`` is the extent's sub-read within its part (0 unless ``piece_stream``).
     - ``pieces``: empty unless ``piece_stream``; otherwise one
       ``{"row", "sub_seq", "seq", "cqe", "publish"}`` per row asked for (first
-      ``STAGE_TRACE_ROWS``), each field a list over ``STAGE_PIECES``. ``sub_seq`` is
+      ``stage_trace_rows(lanes)``), each field a list over ``STAGE_PIECES``. ``sub_seq`` is
       when sub-read j (row file order) landed, ``seq`` when piece j was vetted, and
       ``publish`` when it was published, as sequence numbers shared by all three
       (1-based, 0 never). ``cqe`` is the vetting's clock.
@@ -910,9 +961,12 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     record's pack stamps are not comparable with an inline one's (see
     ``StageRecord``).
     """
+    fields = stage_fields(lanes)
+    trace_rows = stage_trace_rows(lanes)
+    trace_extents = 2 * trace_rows
     out = []
     for row in words.tolist():
-        record = dict(zip(STAGE_FIELDS, row))
+        record = dict(zip(fields, row))
         record["kind"] = STAGE_KINDS[record["kind"]]
         record["status"] = STAGE_STATUSES[record["status"]]
         record["missing_stages"] = [name for name in STAGE_ORDER if not record[name]]
@@ -923,7 +977,7 @@ def stage_records(words: torch.Tensor) -> list[dict]:
                 "start": record[f"row_pack_start_{k}"],
                 "end": record[f"row_pack_end_{k}"],
             }
-            for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
+            for k in range(min(record["rows_asked"], trace_rows))
         ]
         record["extent_cqe"] = [
             {
@@ -934,9 +988,9 @@ def stage_records(words: torch.Tensor) -> list[dict]:
                 "attempts": record[f"extent_attempts_{k}"],
                 "cqe": record[f"extent_cqe_{k}"],
             }
-            for k in range(min(record["extents"], STAGE_TRACE_EXTENTS))
+            for k in range(min(record["extents"], trace_extents))
         ]
-        for k in range(STAGE_TRACE_ROWS):
+        for k in range(trace_rows):
             del (
                 record[f"row_pack_start_{k}"],
                 record[f"row_pack_end_{k}"],
@@ -955,15 +1009,15 @@ def stage_records(words: torch.Tensor) -> list[dict]:
                         record[f"piece_publish_{k}_{j}"] for j in range(STAGE_PIECES)
                     ],
                 }
-                for k in range(min(record["rows_asked"], STAGE_TRACE_ROWS))
+                for k in range(min(record["rows_asked"], trace_rows))
             ]
             if record["piece_stream"]
             else []
         )
-        for k in range(STAGE_TRACE_EXTENTS):
+        for k in range(trace_extents):
             del record[f"extent_id_{k}"], record[f"extent_cqe_{k}"]
             del record[f"extent_submit_{k}"], record[f"extent_attempts_{k}"]
-        for k in range(STAGE_TRACE_ROWS):
+        for k in range(trace_rows):
             for j in range(STAGE_PIECES):
                 del (
                     record[f"sub_land_seq_{k}_{j}"],
@@ -984,34 +1038,16 @@ def stage_records(words: torch.Tensor) -> list[dict]:
     return out
 
 
-# The request page (``lease_layout.h``): ``demand_head``, then kDemandRecords records
-# of ``RECORD_FIELDS``. A record's ``MAX_IDS`` lanes are one i16 array per id and an
-# f32 weight array; "counts" holds the lane count (bits 0-3) and the protect-id count
-# (bits 4-7), and "kinds" a ``ram_slot_map.LaneKind`` nibble per lane.
-PAGE_BYTES = 2176
-RECORD_BYTES = 128
-DEMAND_RING = 128
-DEMAND_RECORDS = 16
-RECORD_FIELDS = {
-    "seq": 0,
-    "row": 4,
-    "counts": 6,
-    "flags": 7,
-    "chain": 8,
-    "epoch": 16,
-    "kinds": 20,
-    "protect": 32,
-    "lane_expert": 48,
-    "lane_slot": 64,
-    "lane_dst": 80,
-    "lane_weight": 96,
-}
+# The request page (``lease_layout.h``): ``demand_head``, then ``wire.demand_records`` records
+# (``wire.record_fields``). A record's lanes are one i16 array per id and an f32 weight
+# array; "counts" holds the lane count (bits 0-3) and the protect-id count (bits 4-7) on
+# an 8-lane wire, and "kinds" a ``ram_slot_map.LaneKind`` nibble per lane.
 RECORD_FLAG_CAPTURED = 1
 # Experts, slots and destinations are i16 in the record and the map delta.
 RECORD_ID_MAX = 32767
 HOT_HEADER_BYTES = 8
 HOT_ALIGNMENT = 64
-HOT_RECORDS = DEMAND_RECORDS
+HOT_RECORDS = expert_lease_block.wire_layout(8).demand_records
 
 
 def hot_record_bytes(experts: int) -> int:
@@ -1032,7 +1068,6 @@ def new_hot_page(experts: int, *, pin: bool = True) -> torch.Tensor:
     )
 
 
-MAX_IDS = 8
 WORDS = {"demand_head": 0}
 # Order of the C++ counters (``host/tier_protocol.h``). Demand rows per layer come only
 # from ``ExpertStreamHost.layer_rows()``: one word per layer written by the tier's
@@ -1084,7 +1119,11 @@ assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
 
 def seqlock_stress(
-    seconds: float, *, layout: str = "exl3", variant: Optional[str] = None
+    seconds: float,
+    *,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+    lanes: int = 8,
 ) -> tuple[int, int]:
     """Test only: read one record while a C++ thread rewrites it for ``seconds``.
 
@@ -1092,14 +1131,16 @@ def seqlock_stress(
     """
     _refuse_test_only("seqlock_stress", variant)
     out = torch.zeros(2, dtype=torch.int64)
-    _host_module(layout, variant).expert_stream_seqlock_stress(int(seconds * 1e9), out)
+    _host_module(layout, variant, lanes).expert_stream_seqlock_stress(
+        int(seconds * 1e9), out
+    )
     return int(out[0]), int(out[1])
 
 
-_RECORD_LANES = 8  # kMaxIds == kLeaseLanes
-# Words of the C++ read_record result: 6 scalars, the protect ids, the lane count and
-# 5 words per lane.
-READ_RECORD_WORDS = 6 + _RECORD_LANES + 1 + 5 * _RECORD_LANES
+def read_record_words(lanes: int = 8) -> int:
+    """Words of the C++ read_record result: 6 scalars, the protect ids, the lane count and 5 words per lane."""
+    n = expert_lease_block.wire_layout(lanes).lanes
+    return 6 + n + 1 + 5 * n
 
 
 def read_record_fields(
@@ -1108,19 +1149,21 @@ def read_record_fields(
     *,
     layout: str = "exl3",
     variant: Optional[str] = None,
+    lanes: int = 8,
 ) -> dict:
-    """Test only: the service's ``read_record`` over one ``RECORD_BYTES`` record.
+    """Test only: the service's ``read_record`` over one record of ``lanes`` lanes.
 
     ``expected`` is the sequence number the record must carry. Instrumented build only.
     """
     _refuse_test_only("read_record_fields", variant)
-    out = torch.zeros(READ_RECORD_WORDS, dtype=torch.int64)
-    _host_module(layout, variant).expert_stream_read_record_fields(
+    out = torch.zeros(read_record_words(lanes), dtype=torch.int64)
+    _host_module(layout, variant, lanes).expert_stream_read_record_fields(
         record, int(expected), out
     )
     w = out.tolist()
-    protect, lanes = w[5], w[6 + _RECORD_LANES]
-    base = 7 + _RECORD_LANES
+    n = expert_lease_block.wire_layout(lanes).lanes
+    protect, lane_count = w[5], w[6 + n]
+    base = 7 + n
     return {
         "status": ("ok", "torn", "malformed")[w[0]],
         "row": w[1],
@@ -1138,9 +1181,79 @@ def read_record_fields(
                     0
                 ],
             }
-            for j in range(lanes)
+            for j in range(lane_count)
         ],
     }
+
+
+# kernel_layer's layers' spec.keep, by layer id: the slabs each layer reads stay alive until kernel_drop.
+_kernel_layer_keep: dict[int, tuple] = {}
+
+
+def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
+    """Test only: kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
+
+    ``spec.keep`` is kept alive until :func:`kernel_drop`. Instrumented build only.
+    """
+    _refuse_test_only("kernel_layer", variant)
+    slabs, params = _layer_tensors(spec)
+    layer = int(
+        _host_module(layout, variant).expert_stream_kernel_layer(
+            int(kernel),
+            slabs,
+            int(spec.capacity),
+            int(spec.hidden),
+            int(spec.intermediate),
+            int(spec.activation),
+            float(spec.act_limit),
+            params,
+        )
+    )
+    _kernel_layer_keep[layer] = spec.keep
+    return layer
+
+
+def kernel_forward(
+    layer: int,
+    x: torch.Tensor,
+    slots: torch.Tensor,
+    weights: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    threads: int,
+    cores: Sequence[int] = (),
+    accumulate: bool = False,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+) -> tuple[int, str]:
+    """Test only: one forward of :func:`kernel_layer`'s ``layer``.
+
+    Returns (0, "") or the kernel's refusal: (2, why) for a bad call, (1, why) for a failure; ``out`` is untouched
+    then. Pins the calling thread to ``cores[0]``. Instrumented build only.
+    """
+    _refuse_test_only("kernel_forward", variant)
+    module = _host_module(layout, variant)
+    status = int(
+        module.expert_stream_kernel_forward(
+            int(layer),
+            x.to(torch.float16).contiguous(),
+            slots.to(torch.int32).contiguous(),
+            weights.to(torch.float32).contiguous(),
+            out,
+            int(threads),
+            torch.tensor(list(cores), dtype=torch.int64),
+            int(bool(accumulate)),
+        )
+    )
+    # The message is this thread's (a thread-local in the module), read on the same thread.
+    return status, (str(module.expert_stream_kernel_error()) if status else "")
+
+
+def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = None) -> None:
+    """Test only: release :func:`kernel_layer`'s ``layer``. Instrumented build only."""
+    _refuse_test_only("kernel_drop", variant)
+    _host_module(layout, variant).expert_stream_kernel_drop(int(layer))
+    _kernel_layer_keep.pop(int(layer), None)
 
 
 def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
@@ -1152,9 +1265,9 @@ def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
     return float(_host_module(layout, variant).expert_stream_pause_ns())
 
 
-def new_page(pin: bool) -> torch.Tensor:
-    """A zeroed request page; pinned (device-readable through UVA) for a real device."""
-    return torch.zeros(PAGE_BYTES, dtype=torch.uint8, pin_memory=pin)
+def new_page(*, pin: bool, wire: expert_lease_block.WireLayout) -> torch.Tensor:
+    """A zeroed request page of ``wire``; pinned (device-readable through UVA) for a real device."""
+    return torch.zeros(wire.page_bytes, dtype=torch.uint8, pin_memory=pin)
 
 
 def page_word(page: torch.Tensor, name: str) -> int:
@@ -1180,7 +1293,8 @@ class ExpertStreamHost:
     """The C++-owned pinned-slot bookkeeping of every streamed layer and its request
     service.
 
-    ``tables`` is an ``Exl3RamMissTables``; ``page`` a ``new_page`` tensor; ``slot_map``
+    ``tables`` is an ``Exl3RamMissTables``; ``page`` a ``new_page`` tensor of the
+    ``lanes``-lane wire (kept as ``self.wire``, which every lane-sized tensor follows); ``slot_map``
     an int32 ``[layers, experts]`` tensor filled with -1 (pinned for a real device).
     Row ``r`` is streamed layer ``tables.layer_ids[r]``. ``variant`` is the host build
     to load (``VARIANTS``), by default ``host_variant()``'s choice, and is kept as
@@ -1214,13 +1328,36 @@ class ExpertStreamHost:
         hot_page: Optional[torch.Tensor] = None,
         layout: str = "exl3",
         variant: Optional[str] = None,
+        lanes: int = 8,
+        node_ranges: Optional[Sequence[Sequence[tuple[int, int]]]] = None,
+        sq_thread_cpus: Optional[Sequence[int]] = None,
     ) -> None:
+        # NUMA groups: node_ranges[g][row] = (lo, hi), group g's slots of the row; one group owning every slot by
+        # default. sq_thread_cpus: each group's SQPOLL core (-1 unpinned); None keeps the uring env's.
+        capacity = [int(c) for c in tables.capacity.tolist()]
+        if node_ranges is None:
+            node_ranges = [[(0, c) for c in capacity]]
+        self.nodes = len(node_ranges)
+        self.node_ranges = [[(int(lo), int(hi)) for lo, hi in rows] for rows in node_ranges]
+        for g, rows in enumerate(self.node_ranges):
+            if len(rows) != len(capacity):
+                raise ValueError(f"node_ranges[{g}] has {len(rows)} rows, the tables {len(capacity)}")
+            for row, (lo, hi) in enumerate(rows):
+                if not 0 <= lo <= hi <= capacity[row]:
+                    raise ValueError(f"group {g}'s slots [{lo}, {hi}) of row {row} are outside its {capacity[row]} slots")
+                for other in range(g):
+                    olo, ohi = self.node_ranges[other][row]
+                    if lo < ohi and olo < hi:
+                        raise ValueError(f"groups {other} and {g} overlap in row {row}")
+        self.wire = expert_lease_block.wire_layout(lanes, self.nodes)
         if (
-            page.numel() != PAGE_BYTES
+            page.numel() != self.wire.page_bytes
             or page.dtype != torch.uint8
             or page.device.type != "cpu"
         ):
-            raise ValueError("page must be a CPU uint8 tensor of PAGE_BYTES")
+            raise ValueError(
+                f"page must be a CPU uint8 tensor of {self.wire.page_bytes} bytes (new_page of this wire)"
+            )
         if slot_map.dtype != torch.int32 or tuple(slot_map.shape) != tuple(
             tables.starts.shape
         ):
@@ -1239,16 +1376,21 @@ class ExpertStreamHost:
         self._layout = layout
         # The host build is chosen once here: every later call goes to this module.
         self.variant = host_variant() if variant is None else variant
-        self._module = _host_module(self._layout, self.variant)
+        self._module = _host_module(self._layout, self.variant, self.wire.lanes, self.nodes)
         self.threaded = False
+        # set_cpu_layer's specs' tensors, kept alive while the host's layers read them.
+        self._cpu_layer_keep: dict[int, tuple] = {}
         # Allocated here when the caller passes none.
         if lease_block is None:
             lease_block = expert_lease_block.new_lease_block(
-                int(tables.starts.shape[0]), pin=page.is_pinned()
+                int(tables.starts.shape[0]), pin=page.is_pinned(), wire=self.wire
             )
         else:
             expert_lease_block.check_lease_block(
-                lease_block, int(tables.starts.shape[0]), need_pinned=page.is_pinned()
+                lease_block,
+                int(tables.starts.shape[0]),
+                need_pinned=page.is_pinned(),
+                wire=self.wire,
             )
         self.lease_block = lease_block
         self.hot_page = hot_page
@@ -1289,6 +1431,11 @@ class ExpertStreamHost:
                 self.hot_page
                 if self.hot_page is not None
                 else torch.empty(0, dtype=torch.uint8),
+                torch.tensor(self.node_ranges, dtype=torch.int64).reshape(self.nodes, len(capacity), 2),
+                torch.tensor(
+                    [-2] * self.nodes if sq_thread_cpus is None else [int(c) for c in sq_thread_cpus],
+                    dtype=torch.int64,
+                ),
             )
         )
         if self.handle < 0:
@@ -1319,27 +1466,28 @@ class ExpertStreamHost:
     def start_thread(
         self,
         *,
-        cpu_core: int = -1,
+        cpu_core: int | Sequence[int] = -1,
         fatal_wait_s: float = 30.0,
-        spin_us: int = 5000,
         busy_poll: bool = False,
     ) -> None:
-        """Serve requests on a C++ thread (no more ``pump()``), with the watchdog.
+        """Serve requests on one C++ thread per NUMA group (no more ``pump()``), with the watchdog.
 
-        ``cpu_core`` -1 inherits the caller's affinity; cores 64-71 are reserved for
-        NVMe completion interrupts. ``busy_poll`` spins on ``cpu_core`` with no PAUSE
-        and no sleep; the C++ side refuses it unless that physical core is the
+        ``cpu_core`` is one core per group (a sequence), or one int for a single group; -1 inherits the caller's
+        affinity. Cores 64-71 are reserved for NVMe completion interrupts. A service thread never sleeps: it spins
+        with PAUSE, or with ``busy_poll`` with no PAUSE, which the C++ side refuses unless each physical core is its
         service's alone.
         """
-        if 64 <= cpu_core <= 71:
-            raise ValueError(
-                f"cpu_core {cpu_core}: cores 64-71 are reserved (NVMe completion interrupts are pinned there)"
-            )
+        from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
+
+        cores = [int(cpu_core)] * self.nodes if isinstance(cpu_core, int) else [int(c) for c in cpu_core]
+        if len(cores) != self.nodes or (self.nodes > 1 and isinstance(cpu_core, int) and cpu_core >= 0):
+            raise ValueError(f"start_thread takes one core per NUMA group ({self.nodes}), got {cpu_core!r}")
+        for core in cores:
+            check_not_reserved(core)
         self._module.expert_stream_start_thread(
             self.handle,
-            cpu_core,
+            torch.tensor(cores, dtype=torch.int64),
             int(fatal_wait_s * 1e9),
-            int(spin_us * 1e3),
             int(busy_poll),
         )
         self.threaded = True
@@ -1374,6 +1522,11 @@ class ExpertStreamHost:
     def pump(self) -> int:
         """Serve the pending requests on the calling thread (no service thread)."""
         return int(self._module.expert_stream_pump(self.handle))
+
+    def pump_group(self, group: int) -> int:
+        """Test only: serve NUMA group ``group``'s next pending request alone, on the calling thread."""
+        _refuse_test_only("pump_group", self.variant)
+        return int(self._module.expert_stream_pump_group(self.handle, int(group)))
 
     def contains(self, row: int, expert: int) -> bool:
         """Return True once the expert holds a slot in ``row``.
@@ -1491,14 +1644,16 @@ class ExpertStreamHost:
         values = out.tolist()
         return [tuple(values[i : i + 3]) for i in range(0, len(values), 3)]
 
-    def reserve_staging(self, k: int = MAX_IDS) -> None:
+    def reserve_staging(self, k: Optional[int] = None) -> None:
         """Reserve every row's staging slots and publish its tag-1 map delta.
 
-        The staging slots are the first ``min(k, capacity - 1)`` free slots of each row;
+        The staging slots are the first ``min(k, capacity - 1)`` free slots of each row
+        (``k`` defaults to the wire's lanes);
         no slot is ever taken from them afterwards. Call once, before the thread starts
         (or paused), with every tier empty. A row with fewer than 2 slots raises. See
         ``analysis/dsv41-drive/LEASE_PROTOCOL.md``, "Deltas and the bulk delta".
         """
+        k = self.wire.lanes if k is None else k
         self._module.expert_stream_reserve_staging(self.handle, int(k))
 
     def take_bulk_delta(self) -> torch.Tensor:
@@ -1548,7 +1703,7 @@ class ExpertStreamHost:
         self._module.expert_stream_set_prefill_share(self.handle, int(share))
 
     def enable_copy_engine(
-        self, device: int, *, spin_us: int = 5000, wait_timeout_ms: int = 2000
+        self, device: int, *, wait_timeout_ms: int = 2000, cpus: Sequence[int] = ()
     ) -> None:
         """Start the copy-engine thread on CUDA ``device`` (-1: the CPU test backend).
 
@@ -1556,10 +1711,15 @@ class ExpertStreamHost:
         :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
         ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the
         process once a closed gate has held the decode stream that long
-        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server).
+        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). The copy thread never sleeps, so
+        ``cpus`` should be a core of its own (``ThreadingConfig.copy_cpus``); empty inherits
+        the caller's affinity.
         """
         self._module.expert_stream_enable_copy_engine(
-            self.handle, int(device), int(spin_us * 1e3), int(wait_timeout_ms * 1e6)
+            self.handle,
+            int(device),
+            int(wait_timeout_ms * 1e6),
+            torch.tensor([int(c) for c in cpus], dtype=torch.int64),
         )
 
     def set_copy_table(
@@ -1593,31 +1753,32 @@ class ExpertStreamHost:
 
     def enable_cpu_experts(
         self,
-        forward: int,
+        kernel: int,
         split: Sequence[int],
         cores: Sequence[int],
         x_rows: torch.Tensor,
         out_rows: torch.Tensor,
         *,
         threads: int,
-        spin_us: int = 50_000,
-        keep_warm: int = 0,
+        group: int = 0,
         keep_warm_us: int = 0,
     ) -> None:
-        """Start the CPU expert thread (after the copy engine, before the service).
+        """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
-        ``forward`` is the trait's native forward (a ``CpuExpertForward`` address); each
-        row joins once its layer handle is set (:meth:`set_cpu_layer`). Of a captured
-        post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..8; the
-        device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
-        (float32 ``[rows, hidden]``, or ``[rows, 2, hidden]`` for a CPU-hit and a
-        CPU-miss partial sum each) are pinned host rows: the post kernel stages a row's
-        input in the first, the CPU writes its partial sums to the second and the device
-        reads them. The host keeps references to both. ``keep_warm`` is the trait's
-        native keep-warm (a ``CpuExpertKeepWarm`` address, 0 for none), which the idle
-        thread runs on its workers for ``keep_warm_us`` after each job.
+        ``kernel`` is the format's ``CpuExpertKernel`` address (the trait's ``kernel_address()``);
+        its library must stay loaded while the host runs. Each row joins once its layer is set
+        (:meth:`set_cpu_layer`). Of a captured
+        post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..``wire.lanes``;
+        the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
+        (float32 ``[rows, hidden]`` at one node, otherwise ``[rows, 2 * nodes, hidden]``:
+        group g's CPU-hit and CPU-miss partial sums are parts ``2g`` and ``2g + 1``) are
+        pinned host rows: the post kernel stages a row's input in the first, the CPU
+        writes its partial sums to the second and the device reads them. The host keeps
+        references to both. The idle thread never sleeps: it holds its workers in the
+        kernel's keep-warm, in register work for ``keep_warm_us`` after each job and in
+        PAUSE after that.
         """
-        lanes = expert_lease_block.LANES
+        lanes = self.wire.lanes
         if len(split) != lanes + 1:
             raise ValueError(
                 f"the CPU split table has {lanes + 1} entries (n = 0..{lanes}), not {len(split)}"
@@ -1631,53 +1792,62 @@ class ExpertStreamHost:
             raise ValueError("x_rows must be a contiguous host uint8 [rows, n] tensor")
         if (
             out_rows.dtype != torch.float32
-            or out_rows.dim() not in (2, 3)
             or out_rows.device.type != "cpu"
             or not out_rows.is_contiguous()
-            or (out_rows.dim() == 3 and out_rows.shape[1] != 2)
+            or not (
+                (out_rows.dim() == 2 and self.nodes == 1)
+                or (out_rows.dim() == 3 and out_rows.shape[1] == 2 * self.nodes)
+            )
         ):
             raise ValueError(
-                "out_rows must be a contiguous host float32 [rows, hidden] or [rows, 2, hidden] tensor"
+                "out_rows must be a contiguous host float32 [rows, hidden] at one node or [rows, 2 * nodes, hidden] tensor"
             )
         parts = 1 if out_rows.dim() == 2 else 2
         hidden = int(out_rows.shape[-1])
         self._module.expert_stream_enable_cpu_experts(
             self.handle,
-            int(forward),
+            int(group),
+            int(kernel),
             torch.tensor(list(split), dtype=torch.int64),
             torch.tensor(list(cores), dtype=torch.int64),
             x_rows,
-            out_rows.view(out_rows.shape[0], parts * hidden),
+            out_rows.view(out_rows.shape[0], -1),
             hidden,
             parts,
             int(threads),
-            int(spin_us * 1e3),
-            int(keep_warm),
             int(keep_warm_us * 1e3),
         )
         self.cpu_rows = (x_rows, out_rows)
 
-    def set_cpu_layer(self, row: int, handle: int) -> None:
-        """Set ``row``'s layer handle from the trait's ``register_layer``.
+    def set_cpu_layer(self, row: int, spec) -> None:
+        """Make ``row``'s layer with the enabled kernel from ``spec`` (a ``CpuExpertLayerSpec``).
 
-        Once per row, at any time.
+        Once per row, at any time. The host keeps ``spec.keep`` (the slabs the layer reads) alive.
         """
-        self._check(row)
-        self._module.expert_stream_set_cpu_layer(self.handle, row, int(handle))
+        slabs, params = _layer_tensors(spec)
+        self._module.expert_stream_set_cpu_layer(
+            self.handle, row, slabs, int(spec.capacity), int(spec.hidden), int(spec.intermediate),
+            int(spec.activation), float(spec.act_limit), params,
+        )
+        self._cpu_layer_keep[row] = spec.keep
 
-    def set_cpu_split(self, split: Sequence[int]) -> None:
-        """Set a new split table (CPU lanes per n eligible lanes, n = 0..8).
+    def set_cpu_split(self, split: Sequence[int], group: int = 0) -> None:
+        """Set NUMA group ``group``'s new split table (CPU lanes per n eligible lanes, n = 0..``wire.lanes``).
 
         Allowed at any time; the device reads it.
         """
+        if len(split) != self.wire.lanes + 1:
+            raise ValueError(
+                f"the CPU split table has {self.wire.lanes + 1} entries (n = 0..{self.wire.lanes}), not {len(split)}"
+            )
         self._module.expert_stream_set_cpu_split(
-            self.handle, torch.tensor(list(split), dtype=torch.int64)
+            self.handle, int(group), torch.tensor(list(split), dtype=torch.int64)
         )
 
-    def cpu_stats(self) -> dict[str, int]:
-        """Return the jobs and lanes the CPU expert thread computed, and its forward ns."""
+    def cpu_stats(self, group: int = 0) -> dict[str, int]:
+        """Return the jobs and lanes group ``group``'s CPU expert thread computed, and its forward ns."""
         out = torch.zeros(3, dtype=torch.int64)
-        self._module.expert_stream_cpu_stats(self.handle, out)
+        self._module.expert_stream_cpu_stats(self.handle, int(group), out)
         jobs, lanes, ns = out.tolist()
         return {"jobs": jobs, "lanes": lanes, "forward_ns": ns}
 
@@ -1696,17 +1866,19 @@ class ExpertStreamHost:
         reps: int,
         scratch: torch.Tensor,
         timeout_s: float = 1.0,
+        group: int = 0,
     ) -> torch.Tensor:
-        """Run the CPU split's startup calibration on ``row``.
+        """Run the CPU split's startup calibration on ``row``, on group ``group``'s engine and RAM slots.
 
-        Returns float64 ``[10, 9]`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
+        Returns float64 ``calibration_shape(wire.lanes)`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
         row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no
-        thread). ``device`` -1 copies with the test backend; ``scratch`` holds 8
-        experts on that device. Raises RuntimeError on failure.
+        thread). ``device`` -1 copies with the test backend; ``scratch`` holds
+        one expert per lane (``wire.lanes`` of them) on that device. Raises RuntimeError on failure.
         """
-        out = torch.zeros((10, 9), dtype=torch.float64)
+        out = torch.zeros(calibration_shape(self.wire.lanes), dtype=torch.float64)
         self._module.expert_stream_calibrate_cpu_split(
             self.handle,
+            int(group),
             int(row),
             int(device),
             int(reps),
@@ -1717,28 +1889,46 @@ class ExpertStreamHost:
         )
         return out
 
-    def test_forward_address(self, ns_per_expert: int) -> int:
-        """Test only: return a native fake CPU expert forward.
+    def test_kernel_address(self, ns_per_expert: int = 0, *, fail: int = 0, zero: bool = False) -> int:
+        """Test only: the instr build's fake ``CpuExpertKernel`` (``FakeKernel``, ffi_test_exports.h), reset.
 
-        It spins ``ns_per_expert`` per expert and writes ``out[0] = k``. Instrumented
-        build only.
+        A forward spins ``ns_per_expert`` per expert and writes ``out[j] = (out[j] if accumulate else j) + sum(w * (s +
+        1))`` (``zero``: a zero partial); ``fail`` nonzero makes every forward throw. Instrumented build only.
         """
-        _refuse_test_only("test_forward_address", self.variant)
-        return int(self._module.expert_stream_test_forward_address(int(ns_per_expert)))
+        _refuse_test_only("test_kernel_address", self.variant)
+        return int(self._module.expert_stream_test_kernel_address(int(ns_per_expert), int(fail), int(bool(zero))))
 
-    def test_keep_warm_address(self) -> int:
-        """Test only: return a native fake CPU expert keep-warm.
+    def test_kernel_calls(self) -> list[dict]:
+        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, in order."""
+        _refuse_test_only("test_kernel_calls", self.variant)
+        lanes = self.wire.lanes
+        width = 5 + 2 * lanes
+        count = int(self._module.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
+        out = torch.zeros((count, width), dtype=torch.float64)
+        self._module.expert_stream_test_kernel_calls(out)
+        calls = []
+        for row in out.tolist()[:count]:
+            k = int(row[4])
+            calls.append({
+                "core": int(row[0]), "affinity": int(row[1]), "threads": int(row[2]), "accumulate": bool(row[3]),
+                "slots": [int(s) for s in row[5 : 5 + k]], "weights": row[5 + lanes : 5 + lanes + k],
+            })
+        return calls
 
-        It counts its calls from 0 (:meth:`test_keep_warm_calls`) and spins until its word
-        moves or its deadline passes. Instrumented build only.
-        """
-        _refuse_test_only("test_keep_warm_address", self.variant)
-        return int(self._module.expert_stream_test_keep_warm_address())
+    def test_kernel_hold(self, core: int, on: bool = True) -> None:
+        """Test only: hold (or release) the fake forwards whose worker-0 core is ``core``."""
+        _refuse_test_only("test_kernel_hold", self.variant)
+        self._module.expert_stream_test_kernel_hold(int(core), int(bool(on)))
 
     def test_keep_warm_calls(self) -> int:
-        """Test only: calls of the fake keep-warm since the last test_keep_warm_address."""
+        """Test only: calls of the fake kernel's keep-warm since :meth:`test_kernel_address`."""
         _refuse_test_only("test_keep_warm_calls", self.variant)
         return int(self._module.expert_stream_test_keep_warm_calls())
+
+    def test_keep_warm_core(self) -> int:
+        """Test only: the first core the fake keep-warm's last call took (-1 before any call)."""
+        _refuse_test_only("test_keep_warm_core", self.variant)
+        return int(self._module.expert_stream_test_keep_warm_core())
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
         """Return whether every job given to the copy thread finished in ``timeout_s``.
@@ -1847,6 +2037,11 @@ class ExpertStreamHost:
             self.handle, int(delay_s * 1e9), int(fail_reads), delay_after_demands
         )
 
+    def inject_group_stall(self, group: int, seconds: float) -> None:
+        """Test only: NUMA group ``group``'s service thread sleeps ``seconds`` before it reads its next record."""
+        _refuse_test_only("inject_group_stall", self.variant)
+        self._module.expert_stream_inject_group_stall(self.handle, int(group), int(seconds * 1e9))
+
     def piece_runs(self) -> torch.Tensor:
         """Return the stream kernel's piece table.
 
@@ -1892,7 +2087,7 @@ class ExpertStreamHost:
         Call before ``start_thread``. With the trace off the service takes no
         timestamps.
         """
-        _stage_words(self._layout, self.variant)
+        _stage_words(self._layout, self.variant, self.wire.lanes)
         self._module.expert_stream_trace_enable(self.handle, int(capacity))
 
     def drain_trace(self, limit: int = 4096) -> list[dict]:
@@ -1900,9 +2095,11 @@ class ExpertStreamHost:
         ``stage_records``."""
         out = []
         while True:
-            words = torch.empty((limit, len(STAGE_FIELDS)), dtype=torch.int64)
+            words = torch.empty(
+                (limit, len(stage_fields(self.wire.lanes))), dtype=torch.int64
+            )
             count = int(self._module.expert_stream_trace_drain(self.handle, words))
-            out.extend(stage_records(words[:count]))
+            out.extend(stage_records(words[:count], self.wire.lanes))
             if count < limit:
                 return out
 
@@ -1933,6 +2130,12 @@ class ExpertStreamHost:
             values if self.variant != "prod" else {k: values[k] for k in CORE_COUNTERS}
         )
 
+    def group_counters(self, group: int) -> dict[str, int]:
+        """NUMA group ``group``'s own counters (its service thread's), by the names ``counters`` uses."""
+        out = torch.zeros(len(COUNTERS), dtype=torch.int64)
+        self._module.expert_stream_group_counters(self.handle, int(group), out)
+        return dict(zip(COUNTERS, out.tolist()))
+
     def layer_rows(self) -> list[int]:
         """Return the rows read for demands, per streamed layer (the RAM misses)."""
         out = torch.zeros(self.layers, dtype=torch.int64)
@@ -1956,6 +2159,11 @@ class ExpertStreamHost:
                     + json.dumps(self.counters())
                     + "\n"
                 )
+                if self.nodes > 1:
+                    for group in range(self.nodes):
+                        sys.stderr.write(
+                            f"exl3 RAM miss group {group} counters " + json.dumps(self.group_counters(group)) + "\n"
+                        )
             finally:
                 close()
 
@@ -1975,6 +2183,7 @@ STATE_WORDS = {
 _LEASE_METHODS = {
     "expert_stream_post": "post",
     "expert_stream_map_bulk_apply": "map_bulk_apply",
+    "expert_stream_wire_nodes": "wire_nodes",
 }
 _ROW_COPY_METHODS = {
     "expert_stream_lease_stream": "lease_stream",
@@ -1994,21 +2203,28 @@ def _device_wrappers(layout: str = "exl3") -> list[tuple[str, str]]:
     ]
 
 
-def _device_module(layout: str = "exl3") -> Module:
-    """Return the cached device module for ``layout``."""
-    return _device_module_cached(layout)
+def _device_module(layout: str = "exl3", lanes: int = 8, nodes: int = 1) -> Module:
+    """Return the cached device module for ``layout``, ``lanes`` and ``nodes``."""
+    wire = expert_lease_block.wire_layout(lanes, nodes)
+    return _device_module_cached(layout, wire.lanes, wire.nodes)
 
 
 @cache_once
-def _device_module_cached(layout: str) -> Module:
+def _device_module_cached(layout: str, lanes: int, nodes: int) -> Module:
     return load_jit(
-        f"expert_stream_{layout}",
+        f"expert_stream_{layout}{_suffix(lanes, nodes)}",
         cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
+        extra_cuda_cflags=[
+            f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+            f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
+        ],
     )
 
 
-def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Module:
+def device_module_with_hooks(
+    defines: Sequence[str], layout: str = "exl3", lanes: int = 8, nodes: int = 1
+) -> Module:
     """Test only: build the device kernels with the ``EXL3_RAM_MISS_TEST_*`` hooks on.
 
     ``defines`` are ``NAME`` or ``NAME=value`` entries. The result is a module of its
@@ -2016,12 +2232,18 @@ def device_module_with_hooks(defines: Sequence[str], layout: str = "exl3") -> Mo
     """
     if not defines or not all(d.startswith("EXL3_RAM_MISS_TEST_") for d in defines):
         raise ValueError(f"not a set of EXL3_RAM_MISS_TEST_* hooks: {defines}")
+    wire = expert_lease_block.wire_layout(lanes, nodes)
+    lanes, nodes = wire.lanes, wire.nodes
     return load_jit(
-        f"expert_stream_{layout}",
+        f"expert_stream_{layout}{_suffix(lanes, nodes)}",
         "test",
         cuda_files=[LAYOUTS[layout].device_source],
         cuda_wrappers=_device_wrappers(layout),
-        extra_cuda_cflags=[f"-D{d}" for d in defines],
+        extra_cuda_cflags=[
+            *(f"-D{d}" for d in defines),
+            f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
+            f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
+        ],
     )
 
 
@@ -2097,7 +2319,8 @@ class ExpertStreamDevice:
 
     ``map_bank`` is the device's copy of the RAM tier's map: ``ram_slot``
     ``[layers, experts]`` starts at -1 and changes only through the deltas the post
-    applies and ``map_bulk_apply``. ``map_chain`` starts at 1, because tag 1 is the
+    applies and ``map_bulk_apply``; ``staging`` is ``[layers, nodes * lanes]``, node-major.
+    ``map_chain`` starts at 1, because tag 1 is the
     attach delta, so a zero-filled delta record (tag 0) is never taken for a published
     one. Per row, ``ce_ok``/``dst_rows`` say the copy engine may take a hit and
     ``cpu_ok`` that the CPU may; the service sets them as it learns them and the post
@@ -2121,14 +2344,19 @@ class ExpertStreamDevice:
         lease_pdl: bool = False,
         hit_copy: str = "ce",
         cpu_misses: bool = False,
+        lanes: int = 8,
+        nodes: int = 1,
     ) -> None:
+        self.wire = expert_lease_block.wire_layout(lanes, nodes)
         if (
-            page.numel() != PAGE_BYTES
+            page.numel() != self.wire.page_bytes
             or page.dtype != torch.uint8
             or page.device.type != "cpu"
             or not page.is_contiguous()
         ):
-            raise ValueError("page must be a contiguous CPU uint8 tensor of PAGE_BYTES")
+            raise ValueError(
+                f"page must be a contiguous CPU uint8 tensor of {self.wire.page_bytes} bytes (new_page of this wire)"
+            )
         if timeout_ms <= 0:
             raise ValueError("the RAM-miss wait timeout must be positive")
         cuda = torch.device(device).type == "cuda"
@@ -2136,7 +2364,9 @@ class ExpertStreamDevice:
         # unpinned address faults inside the captured graph.
         if cuda and not page.is_pinned():
             raise ValueError("page must be pinned for a CUDA device")
-        expert_lease_block.check_lease_block(lease_block, layers, need_pinned=cuda)
+        expert_lease_block.check_lease_block(
+            lease_block, layers, need_pinned=cuda, wire=self.wire
+        )
         if lease_pdl and cuda and not is_arch_support_pdl():
             raise ValueError("lease-chain PDL needs sm_90 or newer (griddepcontrol)")
         if len(row_capacities) != layers:
@@ -2200,13 +2430,15 @@ class ExpertStreamDevice:
                 )
             self._hot_address = int(hot_page.data_ptr())
             self._hot_stride = stride
-        lanes = expert_lease_block.LANES
         self.map_bank = {
             "ram_slot": torch.full(
                 (layers, experts), -1, dtype=torch.int32, device=device
             ),
             "staging": torch.full(
-                (layers, lanes), -1, dtype=torch.int32, device=device
+                (layers, self.wire.nodes * self.wire.lanes),
+                -1,
+                dtype=torch.int32,
+                device=device,
             ),
             "map_chain": torch.ones(layers, dtype=torch.int64, device=device),
             "map_applied": torch.zeros(layers, dtype=torch.int64, device=device),
@@ -2219,17 +2451,18 @@ class ExpertStreamDevice:
         self._row_capacity_tensor = torch.tensor(
             self._row_capacities, dtype=torch.int32, device=device
         )
-        # The post's outputs: each lane's kind and source slot (S and CW read them), and
-        # C1's compacted SM hits, in one order.
-        self.lane_kind = torch.zeros(lanes, dtype=torch.int32, device=device)
-        self.lane_slot = torch.full((lanes,), -1, dtype=torch.int32, device=device)
+        # The post's outputs: each lane's kind, source slot (S and CW read them) and home
+        # node (CW reads it), and C1's compacted SM hits, in one order.
+        self.lane_kind = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
+        self.lane_slot = torch.full((self.wire.lanes,), -1, dtype=torch.int32, device=device)
+        self.lane_node = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
         self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
-        self.host_rows_1 = torch.zeros(lanes, dtype=torch.int64, device=device)
-        self.dst_slots_1 = torch.zeros(lanes, dtype=torch.int32, device=device)
-        # The lanes CW armed the gate for, handed to CC; 0: none.
-        self.ce_mask = torch.zeros(1, dtype=torch.int32, device=device)
-        # CPU experts: the lanes the CPU computed, written by CC (0: none).
-        self.cpu_lanes = torch.zeros(1, dtype=torch.int32, device=device)
+        self.host_rows_1 = torch.zeros(self.wire.lanes, dtype=torch.int64, device=device)
+        self.dst_slots_1 = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
+        # CW's words for CC: the lanes it armed the gate for, the CPU lanes, the CPU output parts; 0: none.
+        self.ce_mask = torch.zeros(3, dtype=torch.int32, device=device)
+        # CPU experts, written by CC: the lanes the CPU computed, then the output parts holding their partial sums (0: none).
+        self.cpu_lanes = torch.zeros(2, dtype=torch.int32, device=device)
         # CPU experts (``enable_cpu_experts``): the host rows the post stages each
         # layer's input into, and those the CPU expert thread writes each layer's
         # partial sum to; None when off.
@@ -2243,7 +2476,9 @@ class ExpertStreamDevice:
     def _kernels(self):
         """Return the device module, loading it on first use."""
         if self._module is None:
-            self._module = _device_module(self._layout)
+            self._module = _device_module(
+                self._layout, self.wire.lanes, self.wire.nodes
+            )
         return self._module
 
     def enable_cpu_experts(self, x_rows: torch.Tensor, out_rows: torch.Tensor) -> None:
@@ -2429,6 +2664,7 @@ class ExpertStreamDevice:
             int(self.cpu_misses and cpu_on),
             self.lane_kind,
             self.lane_slot,
+            self.lane_node,
             self.go_1,
             self.host_rows_1,
             self.dst_slots_1,
@@ -2513,6 +2749,7 @@ class ExpertStreamDevice:
             self._lease_address,
             self.lane_kind,
             self.lane_slot,
+            self.lane_node,
             dst_slots,
             sm_address,
             sm_count,

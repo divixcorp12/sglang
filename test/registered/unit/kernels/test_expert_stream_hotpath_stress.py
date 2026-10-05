@@ -86,7 +86,7 @@ def run_stress(tmp_path, *, variant=None, seconds=8.0, seed=1, fills=False):
     belongs to the thread that first opened it) must come from that owner, as master's eager contract requires. The
     device, the copy releaser and the noise run on worker threads."""
     s, page, host, sim, dst = hp.build_host(tmp_path, variant=variant)
-    host.start_thread(fatal_wait_s=60.0, spin_us=2000)
+    host.start_thread(fatal_wait_s=60.0)
     stop, quiet, idle = threading.Event(), threading.Event(), threading.Event()
     device_gone = threading.Event()  # set once the device thread has left: the releaser outlives its last wait
     stats = {

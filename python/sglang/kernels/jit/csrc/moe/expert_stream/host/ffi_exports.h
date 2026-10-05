@@ -2,8 +2,8 @@
 //
 // HostExports is written once for every row layout and file reader. An instantiation file names a layout, a reader
 // and a build policy (build_policy.h) and expands EXPERT_STREAM_HOST_EXPORTS and EXPERT_STREAM_HOST_TEST_EXPORTS (the
-// test and tool exports live in ffi_test_exports.h). See exl3_ram_miss_host.cpp (ProdBuild) and
-// exl3_ram_miss_host_instr.cpp (InstrBuild).
+// test and tool exports live in ffi_test_exports.h). See exl3/exl3_ram_miss_host.cpp (ProdBuild) and
+// exl3/exl3_ram_miss_host_instr.cpp (InstrBuild).
 //
 // Every export takes an opaque `handle` naming a service in a per-instantiation registry; each call holds its own
 // reference, so close() from another thread frees the service only after calls in flight return.
@@ -96,6 +96,14 @@ struct HostExports {
     const auto found = thread_registry().find(handle);
     if (found == thread_registry().end()) throw std::runtime_error(error_prefix<Layout>() + "no service thread");
     return found->second;
+  }
+
+  // The wire this module was compiled for (-DSGLANG_EXPERT_STREAM_LANES / _NODES), for the Python side's checks.
+  static int64_t wire_lanes() {
+    return Wire::kLanes;
+  }
+  static int64_t wire_nodes() {
+    return Wire::kNodes;
   }
 
   /// \brief The build policy this module was compiled with: "prod" or "instr" (build_policy.h).
@@ -197,19 +205,21 @@ struct HostExports {
       int64_t row_images,
       int64_t direct,
       TensorView lease,
-      TensorView hot_page) {
+      TensorView hot_page,
+      TensorView ranges,
+      TensorView sq_thread_cpus) {
     using namespace host;
     // Records and map deltas carry expert ids and slots as i16 (lease_layout.h).
     RuntimeCheck(
-        starts.dim() == 2 && starts.size(1) <= kRecIdMax, "starts: records carry expert ids up to ", kRecIdMax);
+        starts.dim() == 2 && starts.size(1) <= Wire::kRecIdMax, "starts: records carry expert ids up to ", Wire::kRecIdMax);
     auto capacity_mem = SymbolicDevice{};
     verify_named(
         "capacity", TensorMatcher({starts.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(capacity_mem), capacity);
     for (int64_t row = 0; row < capacity.size(0); ++row)
       RuntimeCheck(
-          static_cast<const int64_t*>(capacity.data_ptr())[row] <= kRecIdMax,
+          static_cast<const int64_t*>(capacity.data_ptr())[row] <= Wire::kRecIdMax,
           "capacity: records carry slots up to ",
-          kRecIdMax);
+          Wire::kRecIdMax);
     check_table_tensors(extents, starts, file_sizes, segments, slabs, row_bytes, buffer_regions);
     // page, slot_map and lease are pinned (or not) together (ExpertStreamHost.__init__), so one SymbolicDevice
     // ties them to the same actual device; capacity is always a plain CPU tensor. hot_page is optional (an
@@ -217,7 +227,7 @@ struct HostExports {
     // page's device when it is not given.
     auto host_mem = SymbolicDevice{};
     verify_named(
-        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);
+        "page", TensorMatcher({Wire::kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), page);
     verify_named(
         "slot_map",
         TensorMatcher({extents.size(0), extents.size(1)})
@@ -230,7 +240,25 @@ struct HostExports {
         "hot_page", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(hot_page_mem), hot_page);
     auto cpu = SymbolicDevice{};
     verify_named("capacity", TensorMatcher({extents.size(0)}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), capacity);
+    // Each group's slot range of every row, as [lo, hi), and its ring's SQPOLL core.
+    verify_named(
+        "ranges",
+        TensorMatcher({Wire::kNodes, extents.size(0), 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+        ranges);
+    verify_named(
+        "sq_thread_cpus", TensorMatcher({Wire::kNodes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), sq_thread_cpus);
     const auto* capacity_data = static_cast<const int64_t*>(capacity.data_ptr());
+    const auto* range_data = static_cast<const int64_t*>(ranges.data_ptr());
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> group_ranges(Wire::kNodes);
+    for (int g = 0; g < Wire::kNodes; ++g)
+      for (int64_t row = 0; row < extents.size(0); ++row) {
+        const int64_t* range = range_data + (g * extents.size(0) + row) * 2;
+        group_ranges[g].emplace_back(range[0], range[1]);
+      }
+    const auto* sq_data = static_cast<const int64_t*>(sq_thread_cpus.data_ptr());
+    std::vector<int> sq_cpus;
+    for (int g = 0; g < Wire::kNodes; ++g)
+      sq_cpus.push_back(static_cast<int>(sq_data[g]));
     auto tier = std::make_shared<RamTier<Source>>(
         static_cast<uint8_t*>(page.data_ptr()),
         static_cast<int32_t*>(slot_map.data_ptr()),
@@ -251,7 +279,9 @@ struct HostExports {
         std::vector<int64_t>(capacity_data, capacity_data + capacity.size(0)),
         direct != 0,
         hot_page.size(0) ? static_cast<uint8_t*>(hot_page.data_ptr()) : nullptr,
-        hot_page.size(0));
+        hot_page.size(0),
+        std::move(group_ranges),
+        std::move(sq_cpus));
     if (!tier->open()) return -1;
     std::lock_guard<std::mutex> guard(registry_mutex());
     static int64_t next_handle = 1;
@@ -321,8 +351,16 @@ struct HostExports {
     find(handle)->set_prefill_share(share);
   }
 
-  static void enable_copy_engine(int64_t handle, int64_t device, int64_t spin_ns, int64_t wait_timeout_ns) {
-    find(handle)->enable_copy_engine(device, spin_ns, wait_timeout_ns);
+  // `cpus` is int64 [n], the copy thread's affinity (ThreadingConfig.copy_cpus); empty inherits the caller's.
+  static void enable_copy_engine(int64_t handle, int64_t device, int64_t wait_timeout_ns, TensorView cpus) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("cpus", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cpus);
+    std::vector<int> list;
+    const auto* c = static_cast<const int64_t*>(cpus.data_ptr());
+    for (int64_t i = 0; i < cpus.size(0); ++i)
+      list.push_back(static_cast<int>(c[i]));
+    find(handle)->enable_copy_engine(device, wait_timeout_ns, std::move(list));
   }
 
   // entries: int64 [n, 3] of {source address, destination address, row bytes}; dst_rows: rows of every destination;
@@ -342,16 +380,52 @@ struct HostExports {
     find(handle)->arm_copy_engine(on != 0);
   }
 
-  // Enables CPU experts. `forward` is a CpuExpertForward's address (the trait's native forward), whose layers
-  // register later (set_cpu_layer). `split` is int64 [kLeaseLanes + 1], CPU lanes per n eligible lanes; `cores` is
-  // int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host memory, where
-  // the post kernel writes a row's input; `out_rows` is float32 [rows, >= parts * hidden] in host memory, where the
-  // device reads a row's CPU partial sums (part 0 the CPU hits', part 1 the CPU misses' when parts is 2). Both tensors
-  // must outlive the service. `keep_warm` is a CpuExpertKeepWarm's address (0 for none) that the idle thread runs for
-  // keep_warm_ns after each job.
+  // A slab table and a layer's scalars as the ExpertLayer make_layer takes (set_cpu_layer, the test export kernel_layer):
+  // `slabs` int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab),
+  // n <= kMaxSlabs.
+  static cpu_experts::ExpertLayer layer_shape(
+      TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation, double act_limit) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("slabs", TensorMatcher({-1, 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slabs);
+    if (slabs.size(0) > cpu_experts::kMaxSlabs)
+      throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer has at most " +
+                               std::to_string(cpu_experts::kMaxSlabs) + " slabs");
+    cpu_experts::ExpertLayer d;
+    d.capacity = static_cast<int32_t>(capacity);
+    d.hidden = static_cast<int32_t>(hidden);
+    d.intermediate = static_cast<int32_t>(intermediate);
+    d.activation = static_cast<int32_t>(activation);
+    d.act_limit = static_cast<float>(act_limit);
+    d.slab_count = static_cast<int32_t>(slabs.size(0));
+    const auto* s = static_cast<const int64_t*>(slabs.data_ptr());
+    for (int i = 0; i < d.slab_count; ++i) {
+      d.slabs[i] = reinterpret_cast<const void*>(static_cast<intptr_t>(s[2 * i]));
+      d.slot_bytes[i] = static_cast<uint64_t>(s[2 * i + 1]);
+    }
+    return d;
+  }
+
+  // A layer's params tensor (uint8 [m], the format's parameter struct) as make_layer's bytes; empty for m = 0.
+  static std::span<const std::byte> params_bytes(TensorView params) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("params", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), params);
+    return {static_cast<const std::byte*>(params.data_ptr()), static_cast<size_t>(params.size(0))};
+  }
+
+  // Enables NUMA group `group`'s CPU experts. `kernel` is the format's CpuExpertKernel's address (the trait's
+  // kernel_address()), which must outlive the service; rows join once their layer is made (set_cpu_layer). `split` is
+  // int64 [Wire::kLanes + 1], CPU lanes per n eligible lanes;
+  // `cores` is int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host
+  // memory, where the post kernel writes a row's input; `out_rows` is float32 [rows, >= Wire::kNodes * parts * hidden]
+  // in host memory, where the device reads a row's CPU partial sums (group g's part 0 the CPU hits', part 1 the CPU
+  // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. The idle engine holds its
+  // team in the kernel's keep_warm, in register work for `keep_warm_ns` after each job and in PAUSE after that.
   static void enable_cpu_experts(
       int64_t handle,
-      int64_t forward,
+      int64_t group,
+      int64_t kernel,
       TensorView split,
       TensorView cores,
       TensorView x_rows,
@@ -359,48 +433,59 @@ struct HostExports {
       int64_t hidden,
       int64_t parts,
       int64_t threads,
-      int64_t spin_ns,
-      int64_t keep_warm,
       int64_t keep_warm_ns) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     auto host_mem = SymbolicDevice{};
     auto rows = SymbolicSize{"rows"};
     expert_stream::verify_named(
-        "split", TensorMatcher({expert_stream::kLeaseLanes + 1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), split);
+        "split", TensorMatcher({expert_stream::Wire::kLanes + 1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), split);
     expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
     expert_stream::verify_named(
         "x_rows", TensorMatcher({rows, -1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), x_rows);
     expert_stream::verify_named(
         "out_rows", TensorMatcher({rows, -1}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_mem), out_rows);
-    if (forward == 0) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the trait's native forward");
+    if (kernel == 0) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the format's kernel");
     expert_stream::CpuExpertConfig config;
-    config.forward = reinterpret_cast<expert_stream::CpuExpertForward>(static_cast<intptr_t>(forward));
+    config.kernel = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int64_t i = 0; i < cores.size(0); ++i)
       config.cores.push_back(static_cast<int>(c[i]));
     config.x_base = static_cast<const uint8_t*>(x_rows.data_ptr());
     config.x_stride = x_rows.size(1);
-    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr());
-    config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
     if (parts != 1 && parts != 2)
       throw std::runtime_error(error_prefix<Layout>() + "CPU experts write 1 or 2 output parts");
-    if (out_rows.size(1) < parts * hidden)
-      throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than its parts");
+    if (group < 0 || group >= expert_stream::Wire::kNodes)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU experts name a group the build does not have");
+    if (out_rows.size(1) < expert_stream::Wire::kNodes * parts * hidden)
+      throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than every group's parts");
+    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr()) + group * parts * hidden * sizeof(float);
+    config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
     config.out_part_stride = parts == 2 ? hidden * static_cast<int64_t>(sizeof(float)) : 0;
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
-    config.spin_ns = spin_ns;
     if (keep_warm_ns < 0) throw std::runtime_error(error_prefix<Layout>() + "the keep-warm window is negative");
-    config.keep_warm = reinterpret_cast<expert_stream::CpuExpertKeepWarm>(static_cast<intptr_t>(keep_warm));
-    config.keep_warm_ns = keep_warm != 0 ? keep_warm_ns : 0;
+    config.keep_warm_ns = keep_warm_ns;
     const auto* sp = static_cast<const int64_t*>(split.data_ptr());
-    find(handle)->enable_cpu_experts(std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
+    find(handle)->enable_cpu_experts(
+        static_cast<int>(group), std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
   }
 
-  // CPU experts: `row`'s layer handle (the trait's register_layer), once per row, at any time.
-  static void set_cpu_layer(int64_t handle, int64_t row, int64_t layer) {
-    find(handle)->set_cpu_layer(row, layer);
+  // CPU experts: `row`'s layer, made here by the enabled kernel's make_layer from the row's pinned slabs. `slabs` is
+  // int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab), `params`
+  // uint8 [bytes] the format's parameter struct. Once per row, at any time; the slabs must outlive the service.
+  static void set_cpu_layer(
+      int64_t handle,
+      int64_t row,
+      TensorView slabs,
+      int64_t capacity,
+      int64_t hidden,
+      int64_t intermediate,
+      int64_t activation,
+      double act_limit,
+      TensorView params) {
+    find(handle)->make_cpu_layer(
+        row, layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params));
   }
 
   // Reserves every row's staging slots (up to k, fewer on a small tier) and publishes its first map delta
@@ -423,20 +508,20 @@ struct HostExports {
     find(handle)->take_bulk_delta(static_cast<int32_t*>(out.data_ptr()), out.size(0));
   }
 
-  // CPU experts: installs a new split table (int64 [kLeaseLanes + 1]), at any time.
-  static void set_cpu_split(int64_t handle, TensorView split) {
+  // CPU experts: installs group `group`'s new split table (int64 [Wire::kLanes + 1]), at any time.
+  static void set_cpu_split(int64_t handle, int64_t group, TensorView split) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("split", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), split);
-    find(handle)->set_cpu_split(static_cast<const int64_t*>(split.data_ptr()), split.size(0));
+    find(handle)->set_cpu_split(static_cast<int>(group), static_cast<const int64_t*>(split.data_ptr()), split.size(0));
   }
 
-  // CPU experts' metrics: out int64 [3] = {jobs, lanes, forward ns}.
-  static void cpu_stats(int64_t handle, TensorView out) {
+  // Group `group`'s CPU experts' metrics: out int64 [3] = {jobs, lanes, forward ns}.
+  static void cpu_stats(int64_t handle, int64_t group, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({3}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    find(handle)->cpu_stats(static_cast<int64_t*>(out.data_ptr()));
+    find(handle)->cpu_stats(static_cast<int>(group), static_cast<int64_t*>(out.data_ptr()));
   }
 
   // CPU experts' calibration: the bytes the DMA moves per expert of `row`.
@@ -444,9 +529,10 @@ struct HostExports {
     return find(handle)->copy_expert_bytes(row);
   }
 
-  // CPU experts' startup calibration (split_calibration.h): out float64 [10, 9] ms. The caller owns the tier.
+  // CPU experts' startup calibration (split_calibration.h): out float64 [kCalibRows, kCalibCols] ms. The caller owns the tier.
   static void calibrate_cpu_split(
       int64_t handle,
+      int64_t group,
       int64_t row,
       int64_t device,
       int64_t reps,
@@ -463,6 +549,7 @@ struct HostExports {
             .with_device<kDLCPU>(cpu),
         out);
     find(handle)->calibrate_cpu_split(
+        static_cast<int>(group),
         row,
         device,
         reps,
@@ -511,6 +598,18 @@ struct HostExports {
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("experts", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), experts);
     find(handle)->set_hot(row, static_cast<const int64_t*>(experts.data_ptr()), experts.size(0));
+  }
+
+  // Group `group`'s own counters: its service thread's block (RamTier::group_counters).
+  static void group_counters(int64_t handle, int64_t group, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named(
+        "out", TensorMatcher({expert_stream::kCounterCount}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    const auto tier = find(handle);
+    if (group < 0 || group >= tier->groups())
+      throw std::runtime_error(error_prefix<Layout>() + "group " + std::to_string(group) + " is out of range");
+    tier->group_counters(static_cast<int>(group), static_cast<int64_t*>(out.data_ptr()));
   }
 
   static void counters(int64_t handle, TensorView out) {
@@ -566,14 +665,26 @@ struct HostExports {
     return find(handle)->trace_dropped();
   }
 
-  static void
-  start_thread(int64_t handle, int64_t cpu_core, int64_t fatal_wait_ns, int64_t spin_ns, int64_t busy_poll) {
-    if (cpu_core >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
-    if (cpu_core >= 64 && cpu_core <= 71) {
-      throw std::runtime_error(
-          error_prefix<Layout>() + "cores 64-71 are reserved (NVMe completion interrupts are pinned there)");
+  // `cpu_cores`: one core per NUMA group, -1 inherits the caller's affinity. The reserved-core rule is
+  // ExpertStreamHost.start_thread's (check_not_reserved).
+  static void start_thread(int64_t handle, TensorView cpu_cores, int64_t fatal_wait_ns, int64_t busy_poll) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named(
+        "cpu_cores", TensorMatcher({Wire::kNodes}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cpu_cores);
+    const auto* core_data = static_cast<const int64_t*>(cpu_cores.data_ptr());
+    std::vector<int> cores;
+    bool inherits = false;
+    for (int g = 0; g < Wire::kNodes; ++g) {
+      if (core_data[g] >= CPU_SETSIZE) throw std::runtime_error(error_prefix<Layout>() + "cpu_core out of range");
+      if (core_data[g] >= 64 && core_data[g] <= 71) {
+        throw std::runtime_error(
+            error_prefix<Layout>() + "cores 64-71 are reserved (NVMe completion interrupts are pinned there)");
+      }
+      inherits = inherits || core_data[g] < 0;
+      cores.push_back(static_cast<int>(core_data[g]));
     }
-    if (cpu_core < 0) {
+    if (inherits) {
       cpu_set_t inherited;
       CPU_ZERO(&inherited);
       if (pthread_getaffinity_np(pthread_self(), sizeof(inherited), &inherited) == 0) {
@@ -590,15 +701,17 @@ struct HostExports {
       }
     }
     std::shared_ptr<RamTier<Source>> tier = find(handle);
-    if (busy_poll != 0) check_dedicated_core(static_cast<int>(cpu_core), tier->cpu_cores(), error_prefix<Layout>());
+    if (busy_poll != 0) {
+      for (const int core : cores)
+        check_dedicated_core(core, tier->cpu_cores(), error_prefix<Layout>());
+    }
     // Checked and registered under one lock, so a concurrent close() either sees the thread
     // (and joins it) or runs before it and leaves no handle to start it on.
     std::lock_guard<std::mutex> guard(registry_mutex());
     if (registry().count(handle) == 0) throw std::runtime_error(error_prefix<Layout>() + "unknown handle");
     if (thread_registry().count(handle))
       throw std::runtime_error(error_prefix<Layout>() + "the service thread already runs");
-    auto thread =
-        std::make_shared<Thread>(std::move(tier), static_cast<int>(cpu_core), fatal_wait_ns, spin_ns, busy_poll != 0);
+    auto thread = std::make_shared<Thread>(std::move(tier), std::move(cores), fatal_wait_ns, busy_poll != 0);
     thread->start();
     thread_registry()[handle] = std::move(thread);
   }
@@ -664,6 +777,8 @@ struct HostExports {
 // One line per export; this list and ffi_test_exports.h's are the module's whole Python-visible surface.
 #define EXPERT_STREAM_HOST_EXPORTS(Exports)                                                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_build_name, Exports::build_name);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_wire_lanes, Exports::wire_lanes);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_wire_nodes, Exports::wire_nodes);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_names, Exports::layout_names);               \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layout_small_mask, Exports::layout_small_mask);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_piece_runs, Exports::piece_runs);                   \
@@ -696,6 +811,7 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lru_order, Exports::lru_order);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_hot, Exports::set_hot);                         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_counters, Exports::counters);                       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_group_counters, Exports::group_counters);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_core_counter_mask, Exports::core_counter_mask);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_layer_rows, Exports::layer_rows);                   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_words, Exports::trace_words);                 \

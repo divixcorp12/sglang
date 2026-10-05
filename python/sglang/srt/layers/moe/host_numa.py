@@ -30,7 +30,7 @@ import mmap
 import os
 import platform
 from collections import Counter
-from typing import Sequence
+from typing import Mapping, Optional, Sequence
 
 import torch
 
@@ -228,11 +228,13 @@ def allocate_bound(nbytes: int, runs: Sequence[tuple[int, int, int]], row_bytes:
     ``_numa_bound_bytes`` ({node: bytes}). The mapping is over-allocated for the alignment and the tail: nbytes
     rounded up to 2 MiB, plus 2 MiB. The tail is bound but never touched; the slack before the base and past the
     tail is neither bound nor touched. Nothing is touched here: pages land on their node when first written or
-    registered.
+    registered. The ranges themselves, as (node, start, end) byte offsets from the tensor's base, are its
+    ``_numa_bindings``: ``slot_nodes`` reads them, so a group's slots are exactly the pages bound to its node.
     """
     if nbytes == 0:
         tensor = torch.empty(0, dtype=torch.uint8)
         tensor._numa_bound_bytes = {}
+        tensor._numa_bindings = []
         return tensor
     mapping = mmap.mmap(
         -1, -(-nbytes // HUGE_BYTES) * HUGE_BYTES + HUGE_BYTES, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
@@ -246,12 +248,75 @@ def allocate_bound(nbytes: int, runs: Sequence[tuple[int, int, int]], row_bytes:
     tensor = whole[offset : offset + nbytes]  # holds the mapping alive
     base = tensor.data_ptr()
     bound: Counter = Counter()
+    applied: list[tuple[int, int, int]] = []
     byte_runs = [(node, first * row_bytes, (first + count) * row_bytes) for node, first, count in runs]
     for node, lo, hi in plan_bindings(nbytes, byte_runs):
         _mbind(base + lo, hi - lo, node)
         bound[node] += hi - lo
+        applied.append((node, lo, hi))
     tensor._numa_bound_bytes = dict(bound)
+    tensor._numa_bindings = applied
     return tensor
+
+
+# A slot belongs to a node holding this share of its bytes. Arbitrary: a layer's sign-vector slabs fit one 2 MiB page
+# and so sit on one node, about 0.1% of a DeepSeek V4.1 slot; a slot across a seam holds far less on either node.
+MIN_LOCAL = 0.99
+
+
+def slot_nodes(slabs: Mapping[str, torch.Tensor], capacity: int, min_local: float = MIN_LOCAL) -> list[Optional[int]]:
+    """Each of a layer's ``capacity`` slots' NUMA node, from the bindings ``allocate_bound`` applied to its slabs.
+
+    A slot's bytes are its row of every named slab (an arena slab at its offset into the arena). It belongs to the
+    node holding at least ``min_local`` of them; None, belonging to no NUMA group, when no node does. Raises ValueError
+    for a slab allocated without a placement.
+    """
+    per_slot = [Counter() for _ in range(capacity)]
+    for name, slab in slabs.items():
+        owner = getattr(slab, "_expert_stream_slab_arena", slab)
+        bindings = getattr(owner, "_numa_bindings", None)
+        if bindings is None:
+            raise ValueError(f"slab {name} has no NUMA bindings: it was allocated without a placement")
+        if slab.shape[0] != capacity:
+            raise ValueError(f"slab {name} has {slab.shape[0]} rows, not the layer's {capacity} slots")
+        if capacity == 0 or slab.numel() == 0:
+            continue
+        row_bytes = slab.numel() * slab.element_size() // slab.shape[0]
+        offset = slab.data_ptr() - owner.data_ptr()
+        for slot in range(capacity):
+            lo = offset + slot * row_bytes
+            for node, start, end in bindings:
+                overlap = min(lo + row_bytes, end) - max(lo, start)
+                if overlap > 0:
+                    per_slot[slot][node] += overlap
+    owners: list[Optional[int]] = []
+    for counts in per_slot:
+        total = sum(counts.values())
+        node, held = counts.most_common(1)[0] if counts else (None, 0)
+        owners.append(node if total and held >= min_local * total else None)
+    return owners
+
+
+def group_ranges(rows: Sequence[Sequence[Optional[int]]], nodes: Sequence[int]) -> list[list[tuple[int, int]]]:
+    """Per NUMA group (in ``nodes`` order), per row: the slot range [lo, hi) its node holds.
+
+    ``rows[r]`` is ``slot_nodes``' answer for row r. Raises ValueError when a node's slots of a row are not one
+    contiguous range, a slot names a node outside ``nodes``, or a group holds fewer than 2 slots of a row (it could
+    not stage a miss and keep a hit at once).
+    """
+    ranges: list[list[tuple[int, int]]] = [[] for _ in nodes]
+    for row, owners in enumerate(rows):
+        stray = sorted({owner for owner in owners if owner is not None and owner not in nodes})
+        if stray:
+            raise ValueError(f"row {row}: slots on node {stray[0]}, which is not one of the tier's nodes {list(nodes)}")
+        for group, node in enumerate(nodes):
+            slots = [slot for slot, owner in enumerate(owners) if owner == node]
+            if len(slots) < 2:
+                raise ValueError(f"row {row}: node {node} holds {len(slots)} slots; a NUMA group needs at least 2")
+            if slots[-1] + 1 - slots[0] != len(slots):
+                raise ValueError(f"row {row}: node {node}'s slots are not one contiguous range")
+            ranges[group].append((slots[0], slots[-1] + 1))
+    return ranges
 
 
 def address_policy(address: int) -> tuple[int, frozenset[int]]:

@@ -59,7 +59,7 @@ def world(tmp_path, monkeypatch):
                 caches[layer_id] = ExpertPinnedHostCache(streamer, CAPACITY, device="cpu", **fmt.pinned_tier_options(layer))
                 streamers[layer_id] = streamer
         service = module.Exl3RamMissService.get()
-        service.staging_slots = 1
+        service.plan_gather_width(1)
         service.ensure_started()
         order = []
         # A CUDA device is pretended, so the barrier path runs; the barrier itself is a fake the test controls.
@@ -292,6 +292,27 @@ def test_the_barrier_syncs_the_service_device_and_the_tiers_device_each_once_wit
     service.shutdown()
     assert seen == [torch.device("cuda", 1), torch.device("cuda", 3), torch.device("cuda", 2)]
     assert not service._quarantined
+
+
+def test_a_failed_barrier_quarantines_every_device_buffer_of_the_chain_lane_node_included(world, monkeypatch):
+    """Mutation: a device buffer a kernel reads (lane_node, the copy-wait and lease kernels' home-node table) is left
+    out of `_quarantine`, so the allocator may recycle it under a running kernel. Each buffer is a stub tensor whose
+    identity is looked up in the quarantine list."""
+    from types import SimpleNamespace
+
+    service, caches, order = world
+    names = ("state", "go_1", "host_rows_1", "dst_slots_1", "lane_kind", "lane_slot", "lane_node", "ce_mask", "cpu_lanes", "piece_runs")
+    side = SimpleNamespace(**{name: torch.zeros(1, dtype=torch.int32) for name in names}, map_bank={0: torch.zeros(1)})
+    monkeypatch.setattr(service, "device_side", side)
+
+    def fail():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    _barrier(service, monkeypatch, order, fail)
+    service.shutdown()
+    kept = expert_host_tier._QUARANTINED
+    missing = [name for name in names if not any(t is getattr(side, name) for t in kept)]
+    assert not missing, f"not quarantined: {missing}"
 
 
 def test_a_device_shared_by_the_service_and_the_tiers_is_synced_once(world, monkeypatch):

@@ -10,6 +10,7 @@ import faulthandler
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
@@ -31,7 +32,7 @@ def hang_guard():
 def tier(tmp_path):
     # Six slots, two of them staging: four mappable rows, as the tests' arithmetic assumes.
     s = ram_miss_setup(tmp_path, capacity=6, experts=EXPERTS)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=2)
     yield ChainSim(host, page, None), host
     host.stop()

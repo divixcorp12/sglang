@@ -62,11 +62,20 @@ class BasicUringReader {
   static_assert(BuildPolicy<Build>);
 
  public:
+  // set_sq_thread_cpu's "keep the env's value".
+  static constexpr int kEnvSqThreadCpu = -2;
+
   BasicUringReader() = default;
   BasicUringReader(const BasicUringReader&) = delete;
   BasicUringReader& operator=(const BasicUringReader&) = delete;
   ~BasicUringReader() {
     close();
+  }
+
+  // Replaces SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU for this ring: the RAM tier's groups get their cores from
+  // ThreadingConfig. -1 leaves the SQPOLL thread unpinned; kEnvSqThreadCpu keeps the env's value. Before init().
+  void set_sq_thread_cpu(int cpu) {
+    sq_override_ = cpu;
   }
 
   // Creates the ring with room for `depth` reads, from the SGLANG_EXPERT_STREAM_URING_* options. Returns false if
@@ -75,6 +84,11 @@ class BasicUringReader {
   bool init(unsigned depth) {
     close();
     options_ = UringOptions::from_env();
+    if (sq_override_ != kEnvSqThreadCpu) {
+      if (sq_override_ >= 0 && !options_.sqpoll())
+        throw std::invalid_argument("SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU: requires a sqpoll mode");
+      options_.sq_thread_cpu = sq_override_;
+    }
     depth_ = depth;
     if (depth == 0 || depth > 32768) throw std::invalid_argument("io_uring depth must be in [1, 32768]");
 #if !SGLANG_URING_HAS_READV_FIXED
@@ -657,6 +671,7 @@ class BasicUringReader {
   io_uring ring_{};
   io_uring_params params_{};
   UringOptions options_{};
+  int sq_override_ = kEnvSqThreadCpu;  // set_sq_thread_cpu
   unsigned depth_ = 0;
   unsigned requested_flags_ = 0;
   unsigned outstanding_ = 0;

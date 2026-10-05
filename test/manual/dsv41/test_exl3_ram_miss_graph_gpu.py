@@ -42,7 +42,7 @@ def _reference(x, weights, slots, tensors):
     """fp32 routed output over the hot-cache rows at ``slots`` (the probe's reference)."""
     import torch.nn.functional as F
 
-    from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_linear_reference
+    from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_linear_reference
 
     def view(prefix, slot, part):
         return Exl3Tensors(
@@ -80,7 +80,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     # The staging slots the service reserves at start: the graph's misses, and the rest of the tier is mappable.
-    service_module.Exl3RamMissService.get().staging_slots = TOP_K
+    service_module.Exl3RamMissService.get().plan_gather_width(TOP_K)
     with (
         # The service reads row images with O_DIRECT, in lease mode (always on), as in production.
         service_row_images(tmp_path),
@@ -125,7 +125,7 @@ def _layers(tmp_path, timeout_ms=2000, num_layers=1):
     return pairs, service, checks
 
 
-# The demand ring and the lease lanes are 16 deep (kDemandRecords, kLeaseRing): 4 layers fit, and 20 wrap them
+# The demand ring and the lease lanes are 16 deep (Wire::kDemandRecords): 4 layers fit, and 20 wrap them
 # inside one replay, as the 40+ streamed layers of a real decode step do.
 LAYER_COUNTS = pytest.mark.parametrize("layers", [4, 20], ids=["layers_4", "layers_20"])
 REPLAY_STEPS = 4
@@ -151,7 +151,7 @@ def test_direct_insert_replay_hit_evict_refetch_and_prefill_handoff(tmp_path, fu
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     service = service_module.Exl3RamMissService.get()
-    service.staging_slots = TOP_K
+    service.plan_gather_width(TOP_K)
     try:
         with (
             service_row_images(tmp_path),  # the service reads row images with O_DIRECT, as in production

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from sglang.srt.layers.quantization.exl3_fused_moe import route_tables, slot_pointer_tables
+from sglang.srt.layers.quantization.exl3.fused_moe import route_tables, slot_pointer_tables
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -97,7 +97,7 @@ def test_apply_graph_accepts_an_option_c_backend():
     ],
 )
 def test_the_fused_moe_refuses_shapes_its_tables_do_not_cover(streamer_changes, match):
-    from sglang.srt.layers.quantization.exl3_fused_moe import exl3_fused_moe_for
+    from sglang.srt.layers.quantization.exl3.fused_moe import exl3_fused_moe_for
 
     layer = torch.nn.Module()
     layer.top_k = 6
@@ -108,7 +108,7 @@ def test_the_fused_moe_refuses_shapes_its_tables_do_not_cover(streamer_changes, 
 def test_direct_fused_moe_covers_resident_slots_with_zero_scratch(monkeypatch):
     from types import SimpleNamespace
 
-    from sglang.srt.layers.quantization import exl3_fused_moe as module
+    from sglang.srt.layers.quantization.exl3 import fused_moe as module
 
     calls = []
     monkeypatch.setattr(module, "Exl3FusedMoE", lambda tensors, slots, **kw: calls.append(slots) or object())

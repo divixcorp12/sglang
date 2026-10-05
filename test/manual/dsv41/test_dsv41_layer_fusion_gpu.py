@@ -1,7 +1,7 @@
 """SGLANG_DSV41_ENABLE_LAYER_FUSION's three kernels against the torch chains they replace, bit for bit.
 
 The references are the production methods themselves (``GpuResidencyUpdater.gather_destinations`` and
-``commit_gather``, ``exl3_fused_moe.route_tables``), run on a clone of the same state. Every op in those chains is
+``commit_gather``, ``exl3.fused_moe.route_tables``), run on a clone of the same state. Every op in those chains is
 integer bookkeeping or an exact conversion, so the comparison is exact equality of every output and every piece of
 residency state, dump columns included. Shapes cover the production one (six routes, six lanes) and odd ones.
 """
@@ -134,7 +134,7 @@ def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int
             keep=torch.tensor([keep], dtype=torch.float32, device="cuda"),
             cpu_experts=cpu_lanes is not None,
             device_side=SimpleNamespace(
-                cpu_lanes=torch.tensor([cpu_lanes or 0], dtype=torch.int32, device="cuda")
+                cpu_lanes=torch.tensor([cpu_lanes or 0, 0], dtype=torch.int32, device="cuda")
             ),
         )
         if leased
@@ -337,7 +337,7 @@ def test_route_tables_match_the_torch_chain(
     routes, slots, hidden, remap_dtype, weight_dtype, x_dtype
 ):
     from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
-    from sglang.srt.layers.quantization.exl3_fused_moe import route_tables
+    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
 
     gen = torch.Generator().manual_seed(routes * 31 + slots + hidden)
     dev = "cuda"
@@ -376,3 +376,38 @@ def test_route_tables_match_the_torch_chain(
             f"trial {trial}: weight_sorted"
         )
         assert torch.equal(det, det_ref), f"trial {trial}: det"
+
+
+@pytest.mark.parametrize("parts", [0b01, 0b10, 0b11, 0b0101, 0b1111, 0b1010])
+def test_route_tables_seed_every_flagged_cpu_part_in_part_order(parts):
+    """Two groups' CPU partial sums are four parts: 2g the hits', 2g + 1 the misses'. The seed adds every flagged part,
+    lowest first, so one node's (parts 0 and 1) is bit for bit today's."""
+    from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
+
+    routes, slots, hidden = 4, 12, 256
+    dev = "cuda"
+    gen = torch.Generator().manual_seed(parts)
+    host = (torch.randn(4, hidden, generator=gen) * 1e3).pin_memory()
+    remap = torch.arange(routes, dtype=torch.int32, device=dev)
+    weights = torch.ones(routes, device=dev)
+    keep = torch.ones(1, device=dev)
+    x = torch.randn(1, hidden, device=dev)
+    out = torch.full((1, hidden), 5.0, device=dev)
+    args = dict(
+        remap64_out=torch.empty(routes, dtype=torch.int64, device=dev),
+        x16_out=torch.empty(1, hidden, dtype=torch.float16, device=dev), out_zero=out,
+        expert_count=torch.empty(slots + 1, dtype=torch.int64, device=dev),
+        inv_order=torch.empty(routes, dtype=torch.int64, device=dev),
+        weight_sorted=torch.empty(routes, dtype=torch.float16, device=dev),
+        det=torch.empty(3, slots + 1, dtype=torch.int64, device=dev),
+    )
+    exl3_moe_route_tables(
+        remap, weights, keep, x, **args, cpu_lanes=torch.tensor([0, parts], dtype=torch.int32, device=dev),
+        dst_slots=torch.arange(routes, dtype=torch.int32, device=dev), cpu_out=host.data_ptr(), cpu_part_stride=hidden,
+    )
+    torch.cuda.synchronize()
+    want = torch.zeros(hidden)
+    for p in range(4):
+        if parts >> p & 1:
+            want = want + host[p]
+    assert torch.equal(out.cpu()[0], want)

@@ -224,10 +224,6 @@ def _check_cpu_experts(budgets) -> None:
             envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2,
         ),
         ("SGLANG_MOE_EXPERT_FUSED_PLAN=1", envs.SGLANG_MOE_EXPERT_FUSED_PLAN.get()),
-        (
-            "SGLANG_DSV41_CPU_EXPERTS_CORES (a taskset list)",
-            bool(envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get()),
-        ),
     ]
     missing = [name for name, ok in needs if not ok]
     if missing:

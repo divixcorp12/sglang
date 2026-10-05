@@ -12,6 +12,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import (
     ExpertStreamHost,
     new_page,
 )
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
 from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup, same_bytes
@@ -29,7 +30,7 @@ def hang_guard():
 @pytest.fixture
 def tier(tmp_path):
     s = ram_miss_setup(tmp_path, capacity=7)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=3)
     yield s, page, host, ChainSim(host, page, None)
     host.stop()
@@ -212,7 +213,7 @@ def test_disabled_tracing_serves_the_same_bytes_and_state_as_enabled(tmp_path):
         root = tmp_path / name
         root.mkdir()
         s = ram_miss_setup(root, capacity=7)
-        page = new_page(pin=False)
+        page = new_page(pin=False, wire=wire_layout(8))
         slot_map = torch.full((2, 6), -1, dtype=torch.int32)
         host = attached_host(s, page, k=3, slot_map=slot_map)
         sim = ChainSim(host, page, None)

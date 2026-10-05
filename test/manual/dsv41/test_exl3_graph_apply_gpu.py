@@ -71,7 +71,7 @@ def _reference(x, weights, slots, tensors):
     """fp32 routed output over the hot-cache rows at ``slots`` (the probe's reference)."""
     import torch.nn.functional as F
 
-    from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_linear_reference
+    from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_linear_reference
 
     def view(prefix, slot, part):
         return Exl3Tensors(

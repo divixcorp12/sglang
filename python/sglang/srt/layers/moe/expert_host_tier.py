@@ -312,6 +312,7 @@ def allocate_host_slab(
     slab = storage[start : start + nbytes].view(dtype).view(shape)
     if placement:
         slab._numa_bound_bytes = storage._numa_bound_bytes
+        slab._numa_bindings = storage._numa_bindings
     if register and nbytes:
         # Imported here: expert_stream imports this module while the model
         # loader package is still importing, and mem_cache.pool_host's package

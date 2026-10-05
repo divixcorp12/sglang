@@ -1266,14 +1266,14 @@ class Envs:
     # cache); expanded with os.path.expanduser at use.
     SGLANG_EXL3_BUILD_DIR = EnvStr("~/.cache/sglang/exl3_ext")
     # Build-time options of the EXL3 CPU MoE kernel's int8 activation quantization
-    # (quantization/exl3_cpu/moe_mul1.cpp): a second int8 pass over each row's
+    # (kernels/jit/csrc/exl3/moe_mul1.cpp): a second int8 pass over each row's
     # remainder, and one scale per SGLANG_EXL3_CPU_ACT_BLOCK inputs (a multiple of
     # 16; 0 keeps one scale per row). Either one builds the vendored kernel into a
     # separately cached extension; with both off the build is upstream's.
     SGLANG_EXL3_CPU_ACT_RESIDUAL = EnvBool(False)
     SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)
     # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
-    # (exl3_ext.check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
+    # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
     SGLANG_EXL3_CPU_CXX = EnvStr("")
 
     # ===================================================================
@@ -1465,6 +1465,10 @@ class Envs:
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # The -march of JIT host code. None = unset = the host compiler's `-march=native`,
+    # resolved to a concrete name so the build key carries it. `default` keeps the
+    # compiler's own arch; any other value is passed as `-march=<value>` verbatim.
+    SGLANG_JIT_HOST_MARCH = EnvStr(None)
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
@@ -1841,11 +1845,19 @@ class Envs:
     # when it first sees the wait armed (LEASE_PROTOCOL.md, "Copy engine"): post to fail-stop can
     # then take about 2x this (+20 ms).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
-    # The core the RAM-miss service thread busy-polls the request page on, with no PAUSE and no sleep; unset, it
-    # inherits the server's affinity and spins with PAUSE, then sleeps. Set, the service refuses to start unless the
-    # core's whole physical core is its own: no SMT sibling in the server's affinity or SGLANG_DSV41_CPU_EXPERTS_CORES.
-    # That check runs once, when the service starts; a thread pinned onto that physical core later is not caught.
+    # The RAM thread's core on the node it belongs to, busy-polling the request page with no PAUSE and no sleep
+    # (ThreadingConfig.resolve). Refused unless it is outside cores 64-71 and the server's affinity, on a node of the
+    # pinned tier, and its whole physical core is the thread's own (no SMT sibling in the affinity or another role's
+    # core); also refused with SGLANG_EXPERT_NUMA_CORES naming that node's ram=. Unset: with several nodes or CPU
+    # experts each node's thread takes the node's highest free physical core; with one node and no CPU experts it
+    # inherits the server's affinity and spins with PAUSE, then sleeps. Checked once, at start.
     SGLANG_DSV41_RAM_MISS_SPIN_CORE = EnvInt(None)
+    # io_uring options the C++ reader also reads itself (host/uring_options.h); declared here because
+    # ThreadingConfig resolves the SQPOLL thread's core from them. The service passes every ring its core explicitly.
+    SGLANG_EXPERT_STREAM_URING_MODE = EnvStr("default")
+    # The SQPOLL thread's core with one NUMA group, -1 or unset unpinned; refused above one group (use
+    # SGLANG_EXPERT_NUMA_CORES's sq=).
+    SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU = EnvInt(None)
     # Test only: "<demands>:<seconds>" makes the RAM-miss thread sleep before every
     # demand read once that many demands have read rows (forces an Engine-level
     # timeout after capture). Empty: off.
@@ -1907,10 +1919,15 @@ class Envs:
     # CPU experts (plan 2026-09-29-dsv41-cpu-experts): decode computes a layer's RAM-tier experts on the CPU, in place
     # over the pinned tier, instead of copying them over the link. Batch-1 decode only. Off by default.
     SGLANG_DSV41_CPU_EXPERTS = EnvBool(False)
-    # Cores of the CPU expert pool, as a taskset list ("36-47,50"). At least two; empty refuses the pool.
+    # Optional override of the CPU expert pool's cores, as a taskset list ("36-47,50") on one node, at least two.
+    # Unset or empty derives each node's pool from its free physical cores (ThreadingConfig.resolve).
     SGLANG_DSV41_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the CPU expert pool, at most one per core. 0 takes one per core.
     SGLANG_DSV41_CPU_EXPERTS_THREADS = EnvInt(0)
+    # Per-node thread plans replacing the derived ones (cpu_experts/threading_config.py), e.g.
+    # "1:ram=35,cpu=18-33,sq=34;0:ram=17": nodes separated by ";", keys ram, cpu, sq, each a taskset list. Validated
+    # like a derived plan; a refused plan stops the start. Empty derives every node's plan.
+    SGLANG_EXPERT_NUMA_CORES = EnvStr("")
     # CPU lanes per n resident lanes of a layer, n = 0..8, as 9 comma-separated counts ("0,1,1,2,3,3,4,5,5"). Empty
     # computes k*(n) from the three costs below (policy.split_table).
     SGLANG_DSV41_CPU_EXPERTS_SPLIT = EnvStr("")
@@ -1931,10 +1948,10 @@ class Envs:
     # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
     # (slot-map plan, Task 0), so a served A/B decides.
     SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
-    # For this many us after its last job, the idle CPU expert thread runs the kernel's register-only AVX-512 loop on
-    # every worker instead of spinning on pause, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms
-    # idle gap costs about 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench
-    # 2026-10-03: a 1 ms or 3 ms gap then costs nothing). 0 is off. Costs the pool's cores their idle power.
+    # For this many us after its last job, the idle CPU expert thread holds its workers in the kernel's register-only
+    # AVX-512 loop instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap
+    # costs about 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03:
+    # a 1 ms or 3 ms gap then costs nothing). 0: PAUSE only. The workers never sleep either way.
     SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is

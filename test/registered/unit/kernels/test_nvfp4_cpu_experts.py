@@ -1,8 +1,8 @@
-"""The NVFP4 CPU expert C ABI under its OpenMP team (Linux, GCC with OpenMP).
+"""The NVFP4 CPU expert kernel under its OpenMP team, through the expert-stream host's kernel test exports (Linux, GCC
+with OpenMP).
 
-Each case runs in its own process: core configuration freezes at a process's first forward, and the OpenMP
-environment is read when the team first forms. The child registers the sanitizer harness's 80 x 80 layer (every
-weight nibble 1.0, every scale 1.0) and prints one line per call.
+Each case runs in its own process: the OpenMP environment is read when the team first forms. The child makes
+the sanitizer harness's 80 x 80 layer (every weight nibble 1.0, every scale 1.0) and prints one line per call.
 """
 
 import importlib.util
@@ -26,23 +26,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 CHILD = r"""
-import ctypes, sys
+import struct, sys, threading
 import numpy as np
+import torch
+from tvm_ffi import load_module
+from sglang.kernels.ops.moe import expert_stream_transport as es
+from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 
-lib = ctypes.CDLL(sys.argv[1])
+lib = load_module(sys.argv[1])
+kernel = int(lib.nvfp4_cpu_kernel_address())
 calls = [int(t) for t in sys.argv[2].split(",")]
 cores = [int(c) for c in sys.argv[3].split(",")] if sys.argv[3] else []
 alpha_value = float(sys.argv[4])
-
-
-class Layer(ctypes.Structure):
-    _fields_ = [
-        ("abi_version", ctypes.c_uint32), ("capacity", ctypes.c_int32), ("hidden", ctypes.c_int32),
-        ("intermediate", ctypes.c_int32), ("w13_layout", ctypes.c_int32), ("activation", ctypes.c_int32),
-        ("act_limit", ctypes.c_float), ("inv_input_scale13", ctypes.c_float), ("inv_input_scale2", ctypes.c_float),
-        ("slabs", ctypes.c_void_p * 7), ("slot_bytes", ctypes.c_uint64 * 7),
-    ]
-
+groups = int(sys.argv[5])
 
 H = N = 80
 CAP = 2
@@ -51,46 +47,86 @@ w2 = np.full(CAP * H * N // 2, 0x22, np.uint8)
 sf13 = np.full(CAP * 256 * 8, 56, np.uint8)
 sf2 = np.full(CAP * 128 * 8, 56, np.uint8)
 alpha = np.full(CAP, alpha_value, np.float32)
-d = Layer(abi_version=1, capacity=CAP, hidden=H, intermediate=N, inv_input_scale13=1.0, inv_input_scale2=1.0)
-for i, (slab, stride) in enumerate([(w13, N * H), (w2, H * N // 2), (sf13, 256 * 8), (sf2, 128 * 8), (alpha, 4), (alpha, 4)]):
-    d.slabs[i] = slab.ctypes.data
-    d.slot_bytes[i] = stride
-handle = ctypes.c_int64(-1)
-assert lib.sglang_nvfp4_cpu_experts_register_slabs(ctypes.byref(d), ctypes.byref(handle)) == 0
-core_array = (ctypes.c_int32 * max(len(cores), 1))(*cores)
-if cores:
-    print("cores", lib.sglang_nvfp4_cpu_experts_set_cores(core_array, len(cores)))
-x = np.full(H, 0x3C00, np.uint16)  # fp16 1.0
-slots = np.zeros(1, np.int32)
-weights = np.ones(1, np.float32)
-for threads in calls:
-    out = np.full(H, 123.0, np.float32)
-    status = lib.sglang_nvfp4_cpu_experts_forward(
-        handle, x.ctypes.data_as(ctypes.c_void_p), slots.ctypes.data_as(ctypes.c_void_p),
-        weights.ctypes.data_as(ctypes.c_void_p), 1, out.ctypes.data_as(ctypes.c_void_p), threads, 0)
-    print("forward", threads, status, "untouched" if (out == 123.0).all() else "written")
-if cores:
-    print("cores-after", lib.sglang_nvfp4_cpu_experts_set_cores(core_array, len(cores)))
+slabs = [(w13, N * H), (w2, H * N // 2), (sf13, 256 * 8), (sf2, 128 * 8), (alpha, 4), (alpha, 4)]
+spec = CpuExpertLayerSpec(capacity=CAP, hidden=H, intermediate=N, act_limit=0.0,
+                          slabs=tuple((a.ctypes.data, s) for a, s in slabs) + ((0, 0),),
+                          params=bytes(lib.nvfp4_cpu_params(0, 1.0, 1.0)))
+layer = es.kernel_layer(kernel, spec, variant="instr")
+x = torch.full((1, H), 1.0, dtype=torch.float16)
+slots = torch.zeros((1, 1), dtype=torch.int32)
+weights = torch.ones((1, 1), dtype=torch.float32)
+
+
+def forward(threads, on):
+    out = torch.full((1, H), 123.0)
+    status, _ = es.kernel_forward(layer, x, slots, weights, out, threads=threads, cores=on, variant="instr")
+    return status, "untouched" if bool((out == 123.0).all()) else "written", out
+
+
+if groups < 2:
+    for threads in calls:
+        status, state, _ = forward(threads, cores)
+        print("forward", threads, status, state)
+else:
+    width = len(cores) // groups
+    parts = [cores[i * width:(i + 1) * width] for i in range(groups)]
+    results = {i: [] for i in range(groups)}
+
+    def run(i):
+        for _ in range(20):
+            for threads in calls:
+                results[i].append((threads,) + forward(threads, parts[i]))
+
+    runners = [threading.Thread(target=run, args=(i,)) for i in range(groups)]
+    for runner in runners:
+        runner.start()
+    for runner in runners:
+        runner.join()
+    for i in range(groups):
+        for threads, status, state, _ in results[i]:
+            print("forward", i, threads, status, state)
+    first, second = results[0], results[1]
+    print("same" if all(torch.equal(p[3], q[3]) for p, q in zip(first, second)) else "different")
 """
 
 
 @pytest.fixture(scope="module")
-def library(tmp_path_factory):
+def built(tmp_path_factory):
     spec = importlib.util.spec_from_file_location(
-        "nvfp4_cpu_build", REPO / "python/sglang/srt/layers/quantization/nvfp4_cpu/optimized/build.py"
+        "nvfp4_cpu_build", REPO / "python/sglang/srt/layers/quantization/nvfp4/build.py"
     )
     build = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(build)
     return build.build(tmp_path_factory.mktemp("nvfp4") / "libnvfp4.so", cxx=CXX)
 
 
-def _run(library, calls, cores=(), alpha=1.0, **env):
+def _host_has_avx2() -> bool:
+    # What detect_isa requires for the AVX2 tier (expert_stream/host/cpu_experts/isa.hpp).
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return False
+    flags = next((line.split(":", 1)[1].split() for line in cpuinfo.splitlines() if line.startswith("flags")), [])
+    return {"avx2", "fma", "f16c"} <= set(flags)
+
+
+# One library holds every tier; each case runs at each, capped by NVFP4_CPU_MAX_ISA. A cap never raises the tier, so
+# the avx2 case is skipped where it would silently run the scalar tier again.
+@pytest.fixture(params=["avx2", "scalar"])
+def library(built, request):
+    if request.param == "avx2" and not _host_has_avx2():
+        pytest.skip("the host has no AVX2/FMA/F16C, so the avx2 cap would run the scalar tier")
+    return built, request.param
+
+
+def _run(library, calls, cores=(), alpha=1.0, groups=1, **env):
+    path, isa = library
     result = subprocess.run(
-        [sys.executable, "-c", CHILD, str(library), calls, ",".join(map(str, cores)), str(alpha)],
+        [sys.executable, "-c", CHILD, str(path), calls, ",".join(map(str, cores)), str(alpha), str(groups)],
         capture_output=True,
         text=True,
         timeout=120,
-        env={**os.environ, **env},
+        env={**os.environ, "NVFP4_CPU_MAX_ISA": isa, **env},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout.split("\n")[:-1]
@@ -111,28 +147,109 @@ def test_a_team_smaller_than_requested_fails_the_forward_and_leaves_out_untouche
     assert _run(library, "4", OMP_THREAD_LIMIT="2") == ["forward 4 1 untouched"]
 
 
-def test_more_workers_than_configured_cores_fails_the_forward(library):
-    # Only the first two lines: whether cores can still change after this refused forward differs between the old
-    # pool (it refused before starting, so yes) and the OpenMP team (the cores froze at the attempt), and neither is
-    # a contract.
-    assert _run(library, "2", cores=_allowed(1))[:2] == ["cores 0", "forward 2 1 untouched"]
-
-
-def test_cores_cannot_change_after_the_first_forward(library):
-    assert _run(library, "2", cores=_allowed(2)) == ["cores 0", "forward 2 0 written", "cores-after 2"]
+def test_more_workers_than_cores_is_refused_and_leaves_out_untouched(library):
+    assert _run(library, "2", cores=_allowed(1)) == ["forward 2 2 untouched"]
 
 
 def test_a_worker_that_cannot_be_pinned_fails_the_forward_and_leaves_out_untouched(library, tmp_path):
-    # set_cores checked the cores against the affinity mask; pinning can still fail later (a cgroup change). A preloaded
+    # The kernel cannot pin the cores it is given, so the forward fails. A preloaded
     # pthread_setaffinity_np that always fails stands in for that.
     shim = tmp_path / "unpinnable.c"
     shim.write_text("int pthread_setaffinity_np(unsigned long t, unsigned long n, const void* s) { return 22; }\n")
     so = tmp_path / "libunpinnable.so"
     subprocess.run([CXX, "-x", "c", "-shared", "-fPIC", str(shim), "-o", str(so)], check=True)
     lines = _run(library, "2", cores=_allowed(2), LD_PRELOAD=str(so))
-    assert lines[:2] == ["cores 0", "forward 2 1 untouched"]
+    assert lines[:1] == ["forward 2 1 untouched"]
+
+
+def test_two_core_groups_forward_at_once(library):
+    """Part 3: a CPU expert thread per NUMA group, both forwarding at once; with per-call cores both run and agree
+    byte for byte."""
+    lines = _run(library, "2,2,2", cores=_allowed(4), groups=2)
+    forwards = [line.split() for line in lines if line.startswith("forward")]
+    assert len(forwards) == 2 * 20 * 3 and all(f[3] == "0" and f[4] == "written" for f in forwards), lines
+    assert lines[-1] == "same"
 
 
 def test_an_intermediate_q8_cannot_represent_returns_2_and_leaves_out_untouched(library):
     # gate = up = 80 * 1e30, so SiLU(gate) * up overflows to inf before the down projection's quantization.
     assert _run(library, "2", alpha=1e30) == ["forward 2 2 untouched"]
+
+
+def test_the_scheme_layer_runs_through_the_kernel(built):
+    import torch
+    from tvm_ffi import load_module
+
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+    from sglang.srt.layers.quantization.nvfp4.schemes import Nvfp4CpuQuantTrait
+
+    trait = Nvfp4CpuQuantTrait(hidden=80, intermediate=80, act_limit=0.0, module=load_module(str(built)))
+    slabs = {  # the CHILD's layer: H = N = 80, two slots
+        "w13": torch.full((2, 80 * 80), 0x22, dtype=torch.uint8),
+        "w2": torch.full((2, 80 * 80 // 2), 0x22, dtype=torch.uint8),
+        "sf13": torch.full((2, 256 * 8), 56, dtype=torch.uint8),
+        "sf2": torch.full((2, 128 * 8), 56, dtype=torch.uint8),
+        "gate_alpha": torch.ones(2, 1),
+        "down_alpha": torch.ones(2, 1),
+    }
+    layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(slabs, capacity=2), variant="instr")
+    saved = os.sched_getaffinity(0)
+    try:
+        x = torch.ones(1, 80, dtype=torch.float16)
+        out = torch.full((1, 80), 123.0)
+        assert es.kernel_forward(layer, x, torch.zeros(1, 1), torch.ones(1, 1), out, threads=1, variant="instr")[0] == 0
+        assert torch.isfinite(out).all() and not (out == 123.0).any()
+        refused = torch.full((1, 80), 123.0)
+        status, why = es.kernel_forward(layer, x, torch.full((1, 1), 2), torch.ones(1, 1), refused, threads=1, variant="instr")
+        assert status == 2 and "nvfp4" in why and (refused == 123.0).all()  # slot 2 is past the capacity
+    finally:
+        es.kernel_drop(layer, variant="instr")
+        os.sched_setaffinity(0, saved)
+
+
+def test_the_kernel_refuses_params_of_the_wrong_size(built):
+    """Review Focus 4: make_layer checks the params' size against the quant's struct and names both."""
+    import dataclasses
+
+    import torch
+    from tvm_ffi import load_module
+
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+    from sglang.srt.layers.quantization.nvfp4.schemes import Nvfp4CpuQuantTrait
+
+    trait = Nvfp4CpuQuantTrait(hidden=80, intermediate=80, act_limit=0.0, module=load_module(str(built)))
+    slabs = {n: torch.zeros((2, b), dtype=torch.uint8) for n, b in
+             (("w13", 6400), ("w2", 3200), ("sf13", 2048), ("sf2", 1024))}
+    slabs |= {"gate_alpha": torch.ones(2, 1), "down_alpha": torch.ones(2, 1)}
+    spec = dataclasses.replace(trait.layer_spec(slabs, capacity=2), params=b"\0" * 8)
+    with pytest.raises(Exception, match="params hold 8 bytes, the quant's hold 12"):
+        es.kernel_layer(trait.kernel_address(), spec, variant="instr")
+
+
+def test_the_scheme_describes_a_layer_for_make_layer(built):
+    import struct
+
+    import torch
+    from tvm_ffi import load_module
+
+    from sglang.srt.layers.quantization.nvfp4.schemes import Nvfp4CpuQuantTrait
+
+    trait = Nvfp4CpuQuantTrait(hidden=80, intermediate=80, act_limit=0.0, w13_layout=2, inv_input_scale13=0.5,
+                               module=load_module(str(built)))
+    slabs = {
+        "w13": torch.zeros((2, 80 * 80), dtype=torch.uint8),
+        "w2": torch.zeros((2, 80 * 80 // 2), dtype=torch.uint8),
+        "sf13": torch.zeros((2, 256 * 8), dtype=torch.uint8),
+        "sf2": torch.zeros((2, 128 * 8), dtype=torch.uint8),
+        "gate_alpha": torch.ones(2, 1),
+        "down_alpha": torch.ones(2, 1),
+    }
+    spec = trait.layer_spec(slabs, capacity=2)
+    assert (spec.capacity, spec.hidden, spec.intermediate, spec.act_limit) == (2, 80, 80, 0.0)
+    names = ("w13", "w2", "sf13", "sf2", "gate_alpha", "down_alpha")
+    assert spec.slabs == tuple((slabs[n].data_ptr(), slabs[n][0].numel() * slabs[n].element_size()) for n in names) + ((0, 0),)
+    assert spec.params == struct.pack("<iff", 2, 0.5, 1.0)
+    assert all(any(k is slabs[n] for k in spec.keep) for n in names)
+    assert trait.kernel_address() != 0
+    with pytest.raises(ValueError, match="w2"):
+        trait.layer_spec({**slabs, "w2": slabs["w2"][:1]}, capacity=2)

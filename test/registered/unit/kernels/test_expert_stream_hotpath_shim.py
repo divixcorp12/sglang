@@ -206,10 +206,8 @@ def _measured(counts):
 def test_the_copy_thread_allocates_nothing_and_waits_on_no_condvar(shim, tmp_path, variant):
     """Spec A7, A8, L8, L9 and 6.3 item 4: no per-pass deque, no queue node, no condition variable, a submit that nests
     no lock, and no lock at all on the copy thread: it publishes each completed job's CopyDone itself. The service
-    thread takes no lock either (Task 15: the tier
-    has no mutex). With the tests' 200 us copy spin the copy thread goes to sleep between the
-    Python-paced steps, so this run also covers the futex idle path: a wait on the copy thread each time it sleeps, and
-    at most one wake per submitted job on the service thread (submit wakes only a thread that is asleep)."""
+    thread takes no lock either (Task 15: the tier has no mutex). The copy thread never sleeps, even across the
+    Python-paced gaps between steps, so a job crosses from the service with no syscall at all."""
     counts = hotpath_shim.run_child(shim, variant=variant, tmp=tmp_path)
     print("HOTPATH", variant, counts)
     _measured(counts)
@@ -219,40 +217,28 @@ def test_the_copy_thread_allocates_nothing_and_waits_on_no_condvar(shim, tmp_pat
     assert service["cond"] == 0, counts
     assert copy["mutex"] == 0, counts
     assert service["mutex"] == 0, counts  # Task 15; before Task 14 a per-turn lock counted hundreds of thousands here
-    assert copy["sleep"] == 0, counts  # the copy thread's idle wait is a futex, never a nanosleep
+    assert copy["sleep"] == 0 and copy["futex"] == 0, counts
     if variant == "prod":
         assert copy["clock"] == 0, counts  # InstrBuild's copy latency and issue-time metrics read the clock
-    assert service["futex"] <= counts["copy_jobs"], counts
-
-
-def test_a_spinning_copy_thread_costs_the_service_no_syscall(shim, tmp_path):
-    """Spec 6.3 item 5: while the copy thread spins (a 50 ms budget, which the window never exhausts) it never
-    sleeps, so it makes no futex wait and the service's submit, which wakes only a sleeping thread, makes no futex
-    wake: copy jobs cross from the service to the copy thread with no syscall at all."""
-    counts = hotpath_shim.run_child(shim, variant="prod", tmp=tmp_path, copy_spin_us=50_000)
-    print("HOTPATH spinning", counts)
-    _measured(counts)
-    assert counts["copy"]["futex"] == 0 and counts["service"]["futex"] == 0, counts
-    assert counts["copy"]["cond"] == 0 and counts["copy"]["malloc"] == 0 and counts["service"]["malloc"] == 0, counts
+    assert service["futex"] == 0, counts
 
 
 @pytest.mark.parametrize("variant", ["prod", "instr"])
 def test_the_service_and_copy_threads_take_no_lock_and_never_wait_on_a_condvar(shim, tmp_path, variant):
     """Spec L1-L10 and 6.3 (Task 15): over the measured requests -- copy jobs on the copy thread, and misses with their
-    victims and deltas -- neither thread takes a mutex, touches a condition variable or allocates, and the service thread never
-    sleeps. The request path's only kernel wait is the io_uring completion (D5), which is not a lock, and the only
-    futex calls are the copy engine's documented idle protocol: the copy thread's wait when it sleeps, and the service's
-    wake in submit, at most one per job, only for a sleeping copy thread. The shim counts pthread mutexes and condvars
-    only; that nothing else stands in for the tier mutex (a rwlock, a raw futex, a spin lock) is the source backstop's
-    job (test_expert_stream_ownership.py::test_the_tier_declares_only_the_callers_mutex)."""
+    victims and deltas -- neither thread takes a mutex, touches a condition variable, allocates, sleeps or makes a
+    futex call. The request path's only kernel wait is the io_uring completion (D5), which is not a lock. The shim
+    counts pthread mutexes and condvars only; that nothing else stands in for the tier mutex (a rwlock, a raw futex, a
+    spin lock) is the source backstop's job
+    (test_expert_stream_ownership.py::test_the_tier_declares_only_the_callers_mutex)."""
     counts = hotpath_shim.run_child(shim, variant=variant, tmp=tmp_path)
     print("HOTPATH no-lock", variant, counts)
     _measured(counts)
     for thread in ("service", "copy"):
         assert counts[thread]["mutex"] == 0 and counts[thread]["cond"] == 0, counts
         assert counts[thread]["malloc"] == 0 and counts[thread]["free"] == 0, counts
-    assert counts["service"]["sleep"] == 0 and counts["copy"]["sleep"] == 0, counts
-    assert counts["service"]["futex"] <= counts["copy_jobs"], counts
+    for thread in ("service", "copy"):
+        assert counts[thread]["sleep"] == 0 and counts[thread]["futex"] == 0, counts
     if variant == "prod":
         assert counts["service"]["clock"] == 0 and counts["copy"]["clock"] == 0, counts
     else:

@@ -13,7 +13,7 @@ import os
 import pytest
 import torch
 
-from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_dense_weight
+from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_dense_weight
 
 EXL3_DIR = os.environ.get(
     "DSV41_EXL3_DIR", "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"

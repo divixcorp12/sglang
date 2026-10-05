@@ -4,7 +4,7 @@
 //   - the bank geometry of the read pipeline (kBounceRows, kBanks, kQueueDepth): pipeline state only, since the one
 //     reader, RowReader, reads straight into the slab rows and allocates no bounce memory;
 //   - the piece-streaming geometry (kSubReads, kPieces, sub_reads_per_part);
-//   - the clock helpers (now_ns, idle_budget, stamp), and
+//   - the clock helpers (now_ns, stamp), and
 //   - StageRecord, the per-request stage trace, with its status codes.
 #pragma once
 
@@ -105,17 +105,6 @@ inline int64_t now_ns() {
   return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
-// How many idle polls approximate spin_ns. Setup only: it reads the clock twice on the caller's thread. An idle poll
-// is at least one _mm_pause plus the loop's empty pumps, so the real spin is at least spin_ns; the budget is a floor.
-// The service and copy threads count polls against it instead of reading the clock on every turn.
-inline uint64_t idle_budget(int64_t spin_ns) {
-  constexpr int kProbe = 4096;
-  const int64_t t0 = now_ns();
-  for (int i = 0; i < kProbe; ++i)
-    _mm_pause();
-  const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);
-  return static_cast<uint64_t>(std::max<int64_t>(1, spin_ns / per_pause));
-}
 
 struct StageRecord;
 
@@ -138,11 +127,11 @@ constexpr int kMaxDrives = 4;
 
 // Per-row and per-extent stamps live in fixed arrays: the record is copied out as one fixed-width row of int64 and
 // pushed into a preallocated ring, so nothing on the completion path allocates. A request reads at most
-// 2 * kMaxIds = 16 distinct experts (need and protect ids, 8 each) and a row issues at most two extents (one per
-// mirror root in use), so 16 rows and 32 extents hold every request the wire format can carry. Anything past them is
+// 2 * Wire::kLanes distinct experts (need and protect ids) and a row issues at most two extents (one per mirror root
+// in use), so kTraceRows rows and kTraceExtents extents hold every request the wire format can carry. Anything past them is
 // counted in rows_untraced / extents_untraced, never stamped and never allowed to grow the record.
-constexpr int kTraceRows = 16;
-constexpr int kTraceExtents = 32;
+constexpr int kTraceRows = 2 * ::sglang::expert_stream::wire::Wire::kLanes;
+constexpr int kTraceExtents = 2 * kTraceRows;
 
 // Terminal status of a traced request (StageRecord::status): how it ended. 0 (none) is never stored in a pushed
 // record.
@@ -155,7 +144,7 @@ constexpr int64_t kStatusTouch = 5;      // an unarmed demand: recency refreshed
 // One request's stage record, written only when the stage trace is on.
 //
 // The record is fixed size and int64 words only, so it is copied out to Python as a row of a torch int64 tensor: keep
-// STAGE_FIELDS in ops/moe/expert_stream_transport.py in step. Every time is now_ns() (CLOCK_MONOTONIC on the host); a
+// stage_fields() in ops/moe/expert_stream_transport.py in step. Every time is now_ns() (CLOCK_MONOTONIC on the host); a
 // stage the request never reached stays 0. Nothing here is a GPU timestamp. Fields added after the first layout carry
 // the schema version that introduced them.
 //

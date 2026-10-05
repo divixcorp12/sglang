@@ -25,7 +25,7 @@ from sglang.srt.layers.quantization.exl3 import (
     Exl3LinearMethod,
     exl3_swiglu_mlp,
 )
-from sglang.srt.layers.quantization.exl3_ops import EXL3_HALF_INPUT, random_exl3_tensors
+from sglang.srt.layers.quantization.exl3.ops import EXL3_HALF_INPUT, random_exl3_tensors
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     capturing_host_node_count,
 )

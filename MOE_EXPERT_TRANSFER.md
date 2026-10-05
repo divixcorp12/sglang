@@ -103,7 +103,7 @@ earlier work on this path added are in "Env vars this work added" below.
 | `SGLANG_MOE_EXPERT_PREFETCH_PREDICTOR` | `""` | Prefetch candidate scoring; shadow-only unless a pull mode is set. |
 | `SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE` | `False` | DMA copy engine for RAM-resident rows; needs `CUDA_MODULE_LOADING=EAGER`. |
 | `SGLANG_DSV41_CPU_EXPERTS` | `False` | Computes RAM-tier experts on the CPU instead of copying them (BS1 decode). |
-| `SGLANG_DSV41_CPU_EXPERTS_CORES` | `""` | Taskset list of the CPU expert pool (at least two cores). |
+| `SGLANG_DSV41_CPU_EXPERTS_CORES` | `""` | Optional override: taskset list of the CPU expert pool (at least two cores, all on one node). Unset, the pool is derived from the node's free physical cores; `SGLANG_EXPERT_NUMA_CORES` sets per-node plans. |
 | `SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION` | `True` | Measures the CPU/DMA split once when the copy engine arms. |
 
 ## Prod server run

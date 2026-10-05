@@ -5,8 +5,6 @@ leg of a fanned-out read. The real >1 GiB slab is the manual test of Task 8."""
 
 import errno
 import os
-import subprocess
-import sys
 
 import pytest
 import torch
@@ -14,7 +12,7 @@ import torch
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.kernels.ops.moe.expert_stream_transport import read_rows_sqes, read_rows_with_fault
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes
+from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup, same_bytes, spawn_child
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -208,11 +206,19 @@ def test_registration_refusal_is_a_clear_error_not_a_fallback(tmp_path, uring_en
     uring_env(QUEUE_DEPTH=0)
     if os.geteuid() == 0:
         pytest.skip("root has CAP_IPC_LOCK: the memlock limit does not bind")
-    child = subprocess.run(
-        [sys.executable, "-c", _MEMLOCK_CHILD, str(tmp_path / "child")],
-        env=dict(os.environ, **{PREFIX + "READ_MODE": "readv_fixed"}), capture_output=True, text=True, timeout=120)
+    child = spawn_child(
+        _MEMLOCK_CHILD, tmp_path / "child", timeout_s=120, variant=CHILD_VARIANT,
+        env=dict(os.environ, **{PREFIX + "READ_MODE": "readv_fixed"}))
     assert child.returncode == 0, child.stdout + child.stderr
     assert "REFUSED" in child.stdout and "RLIMIT_MEMLOCK" in child.stdout, child.stdout
+
+
+CHILD_VARIANT = "instr"  # what both child scripts construct; test_the_child_scripts_build_what_the_parent_warms pins it
+
+
+def test_the_child_scripts_build_what_the_parent_warms():
+    for script in (_MEMLOCK_CHILD, _RESET_CHILD):
+        assert f'variant="{CHILD_VARIANT}"' in script
 
 
 _MEMLOCK_CHILD = r'''
@@ -240,9 +246,9 @@ def test_a_failed_ring_reset_raises_its_reason_instead_of_aborting(tmp_path, uri
     # on the way out of the call, and the child must go on to exit cleanly.
     if read_mode != "normal":
         uring_env(READ_MODE=read_mode, FIXED_FILES=1)
-    child = subprocess.run(
-        [sys.executable, "-c", _RESET_CHILD, str(tmp_path / "child"), str(CAP if read_mode != "normal" else 0)],
-        capture_output=True, text=True, timeout=120)
+    child = spawn_child(
+        _RESET_CHILD, tmp_path / "child", CAP if read_mode != "normal" else 0, timeout_s=120,
+        variant=CHILD_VARIANT)
     if "unsupported by the running kernel" in child.stdout or "requires liburing 2.10" in child.stdout:
         pytest.skip(child.stdout)
     assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)

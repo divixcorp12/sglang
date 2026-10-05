@@ -30,7 +30,7 @@ struct PostParams {
   int64_t route_count;
   int64_t row;
   int64_t experts;
-  uint8_t* lease;  // the completion block, then the delta block at kDeltaBase
+  uint8_t* lease;  // the completion block, then the delta block at Wire::kDeltaBase
   int64_t timeout_ns;
   uint8_t* hot_page;
   int64_t hot_stride;
@@ -38,8 +38,9 @@ struct PostParams {
   int64_t hot_capacity;
   const int32_t* dst_slots;
   int64_t captured;
-  // The device's map bank (ExpertStreamDevice.map_bank): row-major [rows, experts] and [rows, kLeaseLanes] int32,
-  // int64 [rows] chain words, per-row eligibility. A graph replay reads what the previous deltas left here.
+  // The device's map bank (ExpertStreamDevice.map_bank): row-major [rows, experts] and
+  // [rows, Wire::kNodes * Wire::kLanes] int32, int64 [rows] chain words, per-row eligibility. A graph replay reads
+  // what the previous deltas left here.
   int32_t* ram_slot;
   int32_t* staging;
   int64_t* map_chain;
@@ -52,9 +53,10 @@ struct PostParams {
   int64_t cpu_on;
   int64_t cpu_misses;
   // The post's outputs for the later kernels of the chain (C1 copies SM hits, S streams misses, CW waits for the copy
-  // engine): each lane's kind and source slot, and C1's compacted list of SM hits.
+  // engine): each lane's kind, source slot and home node, and C1's compacted list of SM hits.
   int32_t* lane_kind;
   int32_t* lane_slot;
+  int32_t* lane_node;
   int32_t* go_1;
   int64_t* host_rows_1;
   int32_t* dst_slots_1;
@@ -117,12 +119,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const uint64_t deadline = global_ns() + static_cast<uint64_t>(p.timeout_ns);
   const int64_t count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   if (threadIdx.x == 0) {
-    if (count > kLeaseLanes || count > p.lanes) __trap();  // the record and the plan's buffers hold no more
+    if (count > Wire::kLanes || count > p.lanes) __trap();  // the record and the plan's buffers hold no more
     any_cpu = 0;
     if (count > 0) {
       const RowMap map{
           .ram_slot = p.ram_slot + p.row * p.experts,
-          .staging = p.staging + p.row * kLeaseLanes,
+          .staging = p.staging + p.row * (Wire::kNodes * Wire::kLanes),
           .map_chain = p.map_chain + p.row,
           .map_applied = p.map_applied + p.row,
           .experts = p.experts,
@@ -140,13 +142,13 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       // Loaded before the tag spin: the host stores split relaxed at any time, ordered by nothing (set_cpu_split in
       // host/ram_tier.h). Only a post that can have eligible lanes reads it; otherwise split stays zero and type_lanes
       // never indexes it.
-      if (p.captured != 0 && policy.cpu_on && policy.cpu_ok) load_split(p.lease + kSplit, policy.split);
-      const uint8_t* delta = p.lease + kDeltaBase + p.row * kDeltaStride;
+      if (p.captured != 0 && policy.cpu_on && policy.cpu_ok) load_split(p.lease + Wire::kSplit, policy.split);
+      const uint8_t* delta = p.lease + Wire::kDeltaBase + p.row * Wire::kDeltaStride;
       const bool pending = await_map_delta(delta, map, deadline);
       MapDelta d;
       if (pending) d = load_map_delta(delta);
       // Ordered after the tag's acquire; issued while the delta's loads are in flight.
-      policy.host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + kCopyArmed) == 1u;
+      policy.host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + Wire::kCopyArmed) == 1u;
       if (pending) apply_map_delta(d, map);
       type_lanes(LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count}, map, policy, typed);
       for (int64_t j = 0; j < count; ++j)
@@ -159,9 +161,9 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     stage_cpu_input(p);
   }
   if (threadIdx.x != 0) return;
-  int32_t protect[kMaxIds];
+  int32_t protect[Wire::kLanes];
   int protect_count = 0;
-  for (int64_t i = 0; i < p.route_count && protect_count < kMaxIds; ++i) {
+  for (int64_t i = 0; i < p.route_count && protect_count < Wire::kLanes; ++i) {
     const int32_t expert = static_cast<int32_t>(p.routes[i]);
     if (expert >= 0 && expert < p.experts && !listed(protect, protect_count, expert)) protect[protect_count++] = expert;
   }
@@ -173,10 +175,10 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   state[kPosted] = static_cast<int32_t>(seq);
   const uint32_t epoch = static_cast<uint32_t>(state[kEpoch]);
   if (p.hot_page != nullptr) {
-    uint8_t* hot = p.hot_page + static_cast<int64_t>((seq - 1u) % kHotRecords) * p.hot_stride;
+    uint8_t* hot = p.hot_page + static_cast<int64_t>((seq - 1u) % Wire::kHotRecords) * p.hot_stride;
     st_relaxed_sys<uint32_t>(hot, 0u);
     cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
-    uint8_t* bits = hot + kHotHeaderBytes;
+    uint8_t* bits = hot + Wire::kHotHeaderBytes;
     for (int64_t byte = 0; byte < (p.experts + 7) / 8; ++byte) {
       uint8_t mask = 0;
       for (int64_t slot = 0; slot < p.hot_capacity; ++slot) {
@@ -189,14 +191,15 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   }
   bool any_miss = false;
   int64_t go = 0;
-  float weight[kMaxIds];
-  for (int64_t j = 0; j < kLeaseLanes; ++j) {
+  float weight[Wire::kLanes];
+  for (int64_t j = 0; j < Wire::kLanes; ++j) {
     const bool used = j < count;
     p.lane_kind[j] = used ? typed.kind[j] : 0;
     p.lane_slot[j] = used ? typed.slot[j] : -1;
+    p.lane_node[j] = used ? typed.node[j] : 0;
     if (!used) continue;
-    any_miss = any_miss || typed.kind[j] == kKindMissGpu || typed.kind[j] == kKindMissCpu;
-    if (typed.kind[j] == kKindHitSm) {
+    any_miss = any_miss || typed.kind[j] == Wire::kKindMissGpu || typed.kind[j] == Wire::kKindMissCpu;
+    if (typed.kind[j] == Wire::kKindHitSm) {
       p.host_rows_1[go] = static_cast<int64_t>(typed.slot[j]);
       p.dst_slots_1[go] = p.dst_slots[j];
       ++go;
@@ -216,13 +219,13 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     p.map_chain[p.row] += 1;  // the host publishes this chain's delta under this number
     chain = static_cast<uint64_t>(p.map_chain[p.row]);
   }
-  uint8_t* record = p.page + kDemandRing + ring_index(seq) * kRecordBytes;
+  uint8_t* record = p.page + Wire::kDemandRing + ring_index(seq) * Wire::kRecordBytes;
   write_record(
       record,
       seq,
       RecordFields{
           .row = p.row,
-          .flags = p.captured != 0 ? kRecFlagCaptured : 0u,
+          .flags = p.captured != 0 ? Wire::kRecFlagCaptured : 0u,
           .chain = chain,
           .epoch = epoch,
           .protect = protect,
@@ -234,7 +237,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           .lanes = &typed,
       });
   // A release orders every earlier store of this thread: the hot page and the record come first.
-  st_release_sys(p.page + kDemandHead, seq);
+  st_release_sys(p.page + Wire::kDemandHead, seq);
   state[kPending] = count > 0 ? static_cast<int32_t>(seq) : 0;
   state[kPendingEpoch] = state[kEpoch];
   store_deadline(state, global_ns() + static_cast<uint64_t>(p.timeout_ns));
@@ -264,12 +267,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
   for (int64_t row = 0; row < p.rows; ++row) {
-    const uint8_t* delta = p.lease + kDeltaBase + row * kDeltaStride;
+    const uint8_t* delta = p.lease + Wire::kDeltaBase + row * Wire::kDeltaStride;
     // The paused host has already published every delta it owes, so nothing is waited for here.
-    if (ld_acquire_sys64(delta + kDeltaTag) != static_cast<uint64_t>(p.map_chain[row])) continue;
+    if (ld_acquire_sys64(delta + Wire::kDeltaTag) != static_cast<uint64_t>(p.map_chain[row])) continue;
     const RowMap map{
         .ram_slot = p.ram_slot + row * p.experts,
-        .staging = p.staging + row * kLeaseLanes,
+        .staging = p.staging + row * (Wire::kNodes * Wire::kLanes),
         .map_chain = p.map_chain + row,
         .map_applied = p.map_applied + row,
         .experts = p.experts,
@@ -293,6 +296,11 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
 /// `RuntimeCheck` before the params struct is built and the kernel launched. Both launch on the stream of the
 /// tensors' device.
 struct LeaseProtocolKernel {
+  /// The node count this module was compiled for (-DSGLANG_EXPERT_STREAM_NODES).
+  static int64_t wire_nodes() {
+    return expert_stream::wire::Wire::kNodes;
+  }
+
   /// Launches the post kernel with `use_pdl` selecting the PDL instantiation. Argument meanings follow PostParams;
   /// `lease_address` and `cpu_x_dst` are raw addresses of the pinned completion block and the staged input row, and
   /// `hot_address` of the optional hot page (0: none).
@@ -325,6 +333,7 @@ struct LeaseProtocolKernel {
       int64_t cpu_misses,
       tvm::ffi::TensorView lane_kind,
       tvm::ffi::TensorView lane_slot,
+      tvm::ffi::TensorView lane_node,
       tvm::ffi::TensorView go_1,
       tvm::ffi::TensorView host_rows_1,
       tvm::ffi::TensorView dst_slots_1,
@@ -335,8 +344,9 @@ struct LeaseProtocolKernel {
     using namespace host;
     using namespace expert_stream::wire;
     // The record carries i16 ids and is written with 16-byte stores (lease_layout.h).
-    RuntimeCheck(experts <= kRecIdMax, "experts: a demand record carries expert ids up to ", kRecIdMax);
-    RuntimeCheck(row_capacity <= kRecIdMax, "row_capacity: a demand record carries slots up to ", kRecIdMax);
+    RuntimeCheck(experts <= Wire::kRecIdMax, "experts: a demand record carries expert ids up to ", Wire::kRecIdMax);
+    RuntimeCheck(
+        row_capacity <= Wire::kRecIdMax, "row_capacity: a demand record carries slots up to ", Wire::kRecIdMax);
     RuntimeCheck(
         reinterpret_cast<uintptr_t>(page.data_ptr()) % 128 == 0,
         "page: must be 128-byte aligned, so each record's two cache lines are one prefetch pair (128-byte block)");
@@ -348,7 +358,9 @@ struct LeaseProtocolKernel {
     auto Rows_ = SymbolicSize{"rows"};
 
     expert_stream::verify_named(
-        "page", TensorMatcher({kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host), page);
+        "page",
+        TensorMatcher({Wire::kPageBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(on_host),
+        page);
     expert_stream::verify_named(
         "state",
         TensorMatcher({device::expert_stream::kStateWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
@@ -368,7 +380,9 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "ram_slot", TensorMatcher({Rows_, experts}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ram_slot);
     expert_stream::verify_named(
-        "staging", TensorMatcher({Rows_, kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), staging);
+        "staging",
+        TensorMatcher({Rows_, Wire::kNodes * Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        staging);
     expert_stream::verify_named(
         "map_chain", TensorMatcher({Rows_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), map_chain);
     expert_stream::verify_named(
@@ -383,13 +397,14 @@ struct LeaseProtocolKernel {
     for (auto [name, t] :
          {std::pair{"lane_kind", lane_kind},
           std::pair{"lane_slot", lane_slot},
+          std::pair{"lane_node", lane_node},
           std::pair{"dst_slots_1", dst_slots_1}}) {
       expert_stream::verify_named(
-          name, TensorMatcher({kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), t);
+          name, TensorMatcher({Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), t);
     }
     expert_stream::verify_named("go_1", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), go_1);
     expert_stream::verify_named(
-        "host_rows_1", TensorMatcher({kLeaseLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
+        "host_rows_1", TensorMatcher({Wire::kLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
     RuntimeCheck(experts > 0, "experts: must be positive");
     // CPU experts: cpu_x is the layer's input row [1, hidden] (empty when off), cpu_weights the routes' weights.
     auto cpu_dtype = [](tvm::ffi::TensorView t) -> int64_t {
@@ -417,8 +432,8 @@ struct LeaseProtocolKernel {
     }
     RuntimeCheck(cpu_on == 0 || cpu_input || captured == 0, "CPU experts: a captured post needs the CPU input");
     RuntimeCheck(
-        lease_address != 0 && lease_address % kLeaseBlockAlign == 0,
-        "lease_address: must be a nonzero multiple of kLeaseBlockAlign");
+        lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
+        "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
 
     const auto stream = LaunchKernel::resolve_device(state.device());
     const auto params = PostParams{
@@ -452,6 +467,7 @@ struct LeaseProtocolKernel {
         .cpu_misses = cpu_misses,
         .lane_kind = static_cast<int32_t*>(lane_kind.data_ptr()),
         .lane_slot = static_cast<int32_t*>(lane_slot.data_ptr()),
+        .lane_node = static_cast<int32_t*>(lane_node.data_ptr()),
         .go_1 = static_cast<int32_t*>(go_1.data_ptr()),
         .host_rows_1 = static_cast<int64_t*>(host_rows_1.data_ptr()),
         .dst_slots_1 = static_cast<int32_t*>(dst_slots_1.data_ptr()),
@@ -486,7 +502,9 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "ram_slot", TensorMatcher({Rows_, E_}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ram_slot);
     expert_stream::verify_named(
-        "staging", TensorMatcher({Rows_, kLeaseLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device), staging);
+        "staging",
+        TensorMatcher({Rows_, Wire::kNodes * Wire::kLanes}).with_dtype<int32_t>().with_device<kDLCUDA>(device),
+        staging);
     expert_stream::verify_named(
         "map_chain", TensorMatcher({Rows_}).with_dtype<int64_t>().with_device<kDLCUDA>(device), map_chain);
     expert_stream::verify_named(
@@ -496,8 +514,8 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "row_capacity", TensorMatcher({Rows_}).with_dtype<int32_t>().with_device<kDLCUDA>(device), row_capacity);
     RuntimeCheck(
-        lease_address != 0 && lease_address % kLeaseBlockAlign == 0,
-        "lease_address: must be a nonzero multiple of kLeaseBlockAlign");
+        lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
+        "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
     const auto stream = LaunchKernel::resolve_device(ram_slot.device());
     const auto params = BulkApplyParams{
         .lease = reinterpret_cast<const uint8_t*>(lease_address),

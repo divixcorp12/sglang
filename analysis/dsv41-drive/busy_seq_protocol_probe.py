@@ -24,6 +24,7 @@ import time
 
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page, page_word, sim_post
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
@@ -31,7 +32,7 @@ from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 def _host(capacity=6):
     s = ram_miss_setup(pathlib.Path(tempfile.mkdtemp(prefix="busy_seq_probe_")), capacity=capacity, experts=6,
                        row_images=True)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     # The instrumented build: inject() and the `advisories` metric exist only there (plan hotpath-zero-overhead Task 10).
     host = ExpertStreamHost(s.tables, page=page, slot_map=torch.full((2, 6), -1, dtype=torch.int32), variant="instr")
     return page, host
