@@ -189,9 +189,10 @@ def test_the_module_level_test_only_helpers_refuse_on_prod(helper, tmp_path):
         calls[helper]()
 
 
-def test_the_draft_kernel_exports_run_multi_row_forwards_on_prod(tmp_path):
+def test_the_draft_kernel_exports_run_on_prod(tmp_path):
     """The DSpark draft computes its CPU experts through kernel_layer/kernel_forward (cpu_experts/draft.py), so the
-    production build serves them: two rows through the instr build's fake kernel, out[t][j] = j + sum(w * (s + 1))."""
+    production build serves them: one row through the instr build's fake kernel, out[j] = j + sum(w * (s + 1)). The
+    fake computes one row (the host only calls it so); test_cpu_expert_engines_exl3.py pins m rows on the real kernel."""
     from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
 
     s = ram_miss_setup(tmp_path, capacity=2)
@@ -200,18 +201,17 @@ def test_the_draft_kernel_exports_run_multi_row_forwards_on_prod(tmp_path):
     try:
         assert not {"kernel_layer", "kernel_forward", "kernel_error", "kernel_drop"} & set(ops.TEST_ONLY_EXPORTS)
         layer = ops.kernel_layer(instr.test_kernel_address(), fake_cpu_layer(hidden=4), variant="prod")
-        slots = torch.tensor([[0, 2], [1, -1]], dtype=torch.int32)
-        weights = torch.tensor([[0.5, 0.25], [2.0, 9.0]])
-        out = torch.full((2, 4), float("nan"))
+        slots = torch.tensor([[0, 2]], dtype=torch.int32)
+        weights = torch.tensor([[0.5, 0.25]])
+        out = torch.full((1, 4), float("nan"))
         status, why = ops.kernel_forward(
-            layer, torch.zeros((2, 4), dtype=torch.float16), slots, weights, out, threads=1, variant="prod"
+            layer, torch.zeros((1, 4), dtype=torch.float16), slots, weights, out, threads=1, variant="prod"
         )
         assert (status, why) == (0, "")
-        j = torch.arange(4, dtype=torch.float32)
-        assert torch.equal(out, torch.stack([j + 0.5 * 1 + 0.25 * 3, j + 2.0 * 2]))
+        assert torch.equal(out, (torch.arange(4, dtype=torch.float32) + 0.5 * 1 + 0.25 * 3).unsqueeze(0))
         ops.kernel_drop(layer, variant="prod")
         with pytest.raises(RuntimeError, match="no layer"):
-            ops.kernel_forward(layer, torch.zeros((2, 4), dtype=torch.float16), slots, weights, out, threads=1,
+            ops.kernel_forward(layer, torch.zeros((1, 4), dtype=torch.float16), slots, weights, out, threads=1,
                                variant="prod")
     finally:
         instr.stop()
