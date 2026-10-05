@@ -1,24 +1,17 @@
-"""CPU expert split policy, the format-free pool, and the EXL3 trait's registration (CPU, fake kernels)."""
+"""CPU expert split policy, the RAM-miss service over a fake host and trait, and the EXL3 trait's layer spec (CPU)."""
 
 import itertools
-import os
-import threading
-import weakref
 
 import pytest
 import torch
 
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuParams, Exl3CpuQuantTrait
+from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 from sglang.srt.layers.moe.cpu_experts.policy import (
     format_calibration,
     k_star,
     split_from_grid,
     split_table,
-)
-from sglang.srt.layers.moe.cpu_experts.pool import (
-    CPU_EXPERTS_LAYER_ABI_VERSION,
-    CpuExpertPool,
 )
 from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -74,30 +67,15 @@ class FakeTrait:
     weights_dtype = torch.float32
     out_dtype = torch.bfloat16
 
-    def __init__(self, fail_on_register=None):
-        self.fail_on_register = fail_on_register
-        self.registered, self.freed, self.forwards, self.env_checks = [], [], [], 0
+    def __init__(self):
+        self.env_checks = 0
 
     def check_environment(self):
         self.env_checks += 1
 
-    def register_layer(self, slabs, capacity):
-        if len(self.registered) == self.fail_on_register:
-            raise RuntimeError("register failed")
-        self.registered.append((dict(slabs), capacity))
-        return len(self.registered) - 1
-
-    def forward(self, handle, x, slots, weights, out, threads):
-        capacity = self.registered[handle][1]
-        ran = [int(s) for s in slots[0] if 0 <= int(s) < capacity]
-        self.forwards.append((handle, ran, threads))
-
-    def free_layer(self, handle):
-        self.freed.append(handle)
-
 
 class RecordingSlabs(dict):
-    """Records which names the pool reads."""
+    """Records which names the service reads."""
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
@@ -112,114 +90,6 @@ def _fake_slabs(capacity=CAP):
     return RecordingSlabs(
         alpha=torch.zeros(capacity, 8), beta=torch.zeros(capacity, 2, 4)
     )
-
-
-@pytest.fixture
-def affinity(monkeypatch):
-    bound = []
-    monkeypatch.setattr(
-        os, "sched_setaffinity", lambda pid, cores: bound.append(sorted(cores))
-    )
-    return bound
-
-
-def _pool(trait, layers, **kw):
-    return CpuExpertPool(trait, layers, **{"cores": [4, 5, 6], "threads": 2, **kw})
-
-
-def _args(slots, dtype_x=torch.bfloat16):
-    k = len(slots[0])
-    return (
-        torch.tensor(slots),
-        torch.ones(1, k, dtype=torch.float32),
-        torch.zeros(1, H, dtype=dtype_x),
-        torch.ones(1, H, dtype=torch.bfloat16),
-    )
-
-
-def test_pool_touches_only_the_traits_slab_names(affinity):
-    """Contract: a new format plugs in without the pool knowing its tensor names."""
-    trait, slabs = FakeTrait(), _fake_slabs()
-    slabs["unrelated"] = torch.zeros(3)  # a name the trait does not list
-    slabs.read.clear()
-    pool = _pool(trait, {5: slabs})
-    assert slabs.read == {"alpha", "beta"}
-    assert set(trait.registered[0][0]) == {"alpha", "beta"}
-    assert trait.registered[0][1] == CAP and trait.env_checks == 1
-    pool.bind_current_thread()
-    pool.compute(5, *_args([[2, -1, 0]]))
-    assert trait.forwards == [(0, [2, 0], 2)]
-    assert affinity == [[4, 5, 6]]
-
-
-def test_compute_refuses_an_unbound_thread(affinity):
-    """The scheduler's thread must never be pinned by accident; only a thread that bound itself may compute."""
-    pool = _pool(FakeTrait(), {5: _fake_slabs()})
-    slots, w, x, out = _args([[1]])
-    with pytest.raises(RuntimeError, match="bind_current_thread"):
-        pool.compute(5, slots, w, x, out)
-    pool.bind_current_thread()
-    errors = []
-
-    def other():
-        try:
-            pool.compute(5, slots, w, x, out)
-        except RuntimeError as e:
-            errors.append(e)
-
-    t = threading.Thread(target=other)
-    t.start()
-    t.join()
-    assert len(errors) == 1
-
-
-def test_compute_refuses_a_slot_beyond_the_tier_and_more_than_one_row(affinity):
-    """The kernel drops an out-of-range id silently, which for a slot past capacity would lose an expert."""
-    trait = FakeTrait()
-    pool = _pool(trait, {5: _fake_slabs()})
-    pool.bind_current_thread()
-    with pytest.raises(ValueError, match="outside the tier"):
-        pool.compute(5, *_args([[2, CAP, 0]]))
-    slots, w, _, out = _args([[1]])
-    with pytest.raises(ValueError, match="batch-1"):
-        pool.compute(5, slots, w, torch.zeros(2, H, dtype=torch.bfloat16), out)
-    assert trait.forwards == []
-
-
-def test_capacity_zero_layer_zeroes_out_and_refuses_a_real_slot(affinity):
-    trait = FakeTrait()
-    pool = _pool(trait, {5: _fake_slabs(0)})
-    pool.bind_current_thread()
-    slots, w, x, out = _args([[-1, -1]])
-    pool.compute(5, slots, w, x, out)
-    assert not out.any() and trait.forwards == [] and trait.registered == []
-    with pytest.raises(ValueError, match="outside the tier"):
-        pool.compute(5, *_args([[0]]))
-    with pytest.raises(ValueError, match="not in the CPU expert pool"):
-        pool.compute(9, slots, w, x, out)
-
-
-def test_single_core_pool_is_refused_before_touching_the_trait(affinity):
-    """Many spinning workers on one core livelocked the box (DSV41_REFERENCE section 28)."""
-    trait = FakeTrait()
-    with pytest.raises(ValueError, match="at least 2 cores"):
-        _pool(trait, {5: _fake_slabs()}, cores=[4, 4], threads=1)
-    assert trait.env_checks == 0 and trait.registered == []
-
-
-def test_failed_registration_frees_the_layers_already_registered(affinity):
-    trait = FakeTrait(fail_on_register=1)
-    with pytest.raises(RuntimeError, match="register failed"):
-        _pool(trait, {1: _fake_slabs(), 2: _fake_slabs()})
-    assert trait.freed == [0]
-
-
-def test_close_frees_each_layer_once(affinity):
-    trait = FakeTrait()
-    pool = _pool(trait, {1: _fake_slabs(), 2: _fake_slabs()})
-    pool.close()
-    pool.close()
-    assert sorted(trait.freed) == [0, 1]
 
 
 class FakeExt:
@@ -243,55 +113,6 @@ def _exl3_slabs():
     }
 
 
-class FakeRegisterLayer:
-    """Stands in for the kernel's sglang_exl3_cpu_experts_register_layer; records each descriptor's values."""
-
-    def __init__(self, status=0):
-        self.status, self.calls = status, []
-
-    def __call__(self, layer, handle):
-        d = layer._obj
-        assert (d.abi_version, d.slab_count, d.activation) == (CPU_EXPERTS_LAYER_ABI_VERSION, 6, 0)
-        params = Exl3CpuParams.from_address(d.params)
-        self.calls.append(
-            (
-                list(d.slabs[:6]),
-                list(d.slot_bytes[:6]),
-                d.capacity,
-                d.hidden,
-                d.intermediate,
-                params.bits,
-                params.swizzled,
-                d.act_limit,
-            )
-        )
-        handle._obj.value = 40 + len(self.calls)
-        return self.status
-
-
-def _trait_with(monkeypatch, fake, **kw):
-    trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0, **kw)
-    monkeypatch.setattr(trait, "_native", lambda name: fake if name == "sglang_exl3_cpu_experts_register_layer" else None)
-    return trait
-
-
-@pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
-def test_exl3_trait_registers_the_six_slab_bases(monkeypatch, tier_layout):
-    """The CPU expert id is the host slot: the kernel addresses slot s at each slab's base plus s rows, gate and up as
-    w13 parts 0 and 1. The pinned tier's w2 slabs carry a one-part axis ([slot, 1, ...]), which changes no row."""
-    slabs = _exl3_slabs()
-    if tier_layout:
-        slabs = {n: (t.unsqueeze(1) if n.startswith("w2_") else t) for n, t in slabs.items()}
-    fake = FakeRegisterLayer()
-    trait = _trait_with(monkeypatch, fake, swizzled=True)
-    handle = trait.register_layer(slabs, CAP)
-    names = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
-    trellis = H * INTER * 3 // 8  # bytes of one 3-bit [k/16, n/16, 48] trellis
-    row_bytes = [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]  # quant.hpp's SlabRowBytes
-    assert handle == 41
-    assert fake.calls == [([slabs[n].data_ptr() for n in names], row_bytes, CAP, H, INTER, 3, 1, 10.0)]
-
-
 def test_exl3_trait_reads_a_one_slot_slabs_row_size_not_its_stride():
     """A one-slot slab's stride(0) is arbitrary (PyTorch ignores it for a size-1 dim, and it still counts as
     contiguous), so the registered slot bytes must be the row's size."""
@@ -300,25 +121,9 @@ def test_exl3_trait_reads_a_one_slot_slabs_row_size_not_its_stride():
         one = t[:1].clone()
         slabs[name] = one.as_strided(one.shape, (1,) + one.stride()[1:])
         assert slabs[name].is_contiguous() and slabs[name].stride(0) == 1
-    fake = FakeRegisterLayer()
-    trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0)
-    trait._native = lambda name: fake
-    trait.register_layer(slabs, 1)
+    spec = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).layer_spec(slabs, 1)
     trellis = H * INTER * 3 // 8
-    assert fake.calls[0][1] == [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]
-
-
-def test_exl3_trait_keeps_the_slabs_alive_until_free(monkeypatch):
-    """The kernel keeps only pointers: the trait holds the tensors until the layer is freed."""
-    slabs = _exl3_slabs()
-    trait = _trait_with(monkeypatch, FakeRegisterLayer())
-    handle = trait.register_layer(slabs, CAP)
-    probe = weakref.ref(slabs["w2_svh"])
-    del slabs
-    assert probe() is not None
-    trait.free_layer(handle)
-    assert trait.ext.freed == [handle]
-    assert probe() is None
+    assert [row_bytes for _, row_bytes in spec.slabs] == [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]
 
 
 @pytest.mark.parametrize(
@@ -331,19 +136,11 @@ def test_exl3_trait_keeps_the_slabs_alive_until_free(monkeypatch):
     ],
     ids=["noncontiguous", "dtype", "row_size", "rows"],
 )
-def test_exl3_trait_refuses_slabs_the_kernel_would_misaddress(monkeypatch, name, bad):
+def test_exl3_trait_refuses_slabs_the_kernel_would_misaddress(name, bad):
     slabs = _exl3_slabs()
     slabs[name] = bad(slabs[name])
-    fake = FakeRegisterLayer()
     with pytest.raises(ValueError, match=name):
-        _trait_with(monkeypatch, fake).register_layer(slabs, CAP)
-    assert fake.calls == []
-
-
-def test_exl3_trait_reports_a_refused_registration(monkeypatch):
-    trait = _trait_with(monkeypatch, FakeRegisterLayer(status=2))
-    with pytest.raises(RuntimeError, match="status 2"):
-        trait.register_layer(_exl3_slabs(), CAP)
+        Exl3CpuQuantTrait(FakeExt(), act_limit=10.0).layer_spec(slabs, CAP)
 
 
 def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch):
@@ -357,8 +154,7 @@ def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch)
 
 @pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
 def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
-    """layer_spec gives the kernel's make_layer what the C ABI's registration took: each slab's base and row size in
-    EXL3_STREAMED_NAMES order, the shape, the clamp and SglangExl3CpuParams {bits, swizzled}."""
+    """layer_spec gives the kernel's make_layer each slab's base and row size in EXL3_STREAMED_NAMES order, the shape, the clamp and SglangExl3CpuParams {bits, swizzled}."""
     import struct
 
     slabs = _exl3_slabs()
@@ -750,3 +546,13 @@ def test_each_group_retunes_and_logs_its_own_stats(caplog):
     assert len(stats) == 2 and host.stats_groups == [0, 1]
     assert "group 0 stats" in caplog.text and "group 1 stats" in caplog.text
 
+
+def test_the_pool_and_the_c_abi_mirrors_are_gone():
+    import importlib
+
+    from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertQuantTrait
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("sglang.srt.layers.moe.cpu_experts.pool")
+    assert {"kernel_address", "layer_spec"} <= set(dir(CpuExpertQuantTrait))
+    assert not {"register_layer", "free_layer", "forward", "native_forward"} & set(dir(CpuExpertQuantTrait))

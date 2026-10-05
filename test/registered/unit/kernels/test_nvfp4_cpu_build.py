@@ -1,11 +1,10 @@
 """The NVFP4 CPU expert library builds from Python and passes its native harnesses (Linux, GCC with OpenMP).
 
 ``quantization/nvfp4/build.py`` compiles the kernel into a shared library or, with a harness ``main``, into an
-executable; ``nvfp4_cpu_ext.nvfp4_cpu_library`` builds the library once per content hash and loads it. The two native
-harnesses are the ones the removed CMake build ran under CTest.
+executable; ``nvfp4_cpu_ext.nvfp4_cpu_library_path`` builds the library once per content hash (``nvfp4_cpu_module``
+loads it). The two native harnesses are the ones the removed CMake build ran under CTest.
 """
 
-import ctypes
 import importlib.util
 import os
 import re
@@ -23,14 +22,6 @@ register_cpu_ci(est_time=180, suite="base-a-test-cpu")
 REPO = Path(__file__).resolve().parents[4]
 BUILD = REPO / "python/sglang/srt/layers/quantization/nvfp4/build.py"
 CXX = os.environ.get("CXX") or shutil.which("g++")
-C_ABI = (
-    "sglang_nvfp4_cpu_experts_register_layer",
-    "sglang_nvfp4_cpu_experts_free_layer",
-    "sglang_nvfp4_cpu_experts_forward",
-    "sglang_nvfp4_cpu_experts_keep_warm",
-    "sglang_nvfp4_cpu_experts_engine_create",
-    "sglang_nvfp4_cpu_experts_engine_free",
-)
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux") or CXX is None, reason="the kernel needs Linux and a GCC with OpenMP"
@@ -44,25 +35,26 @@ def _build_module():
     return module
 
 
-def test_build_py_makes_a_library_exporting_the_c_abi(tmp_path):
-    library = ctypes.CDLL(str(_build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)))
-    for name in C_ABI:
-        getattr(library, name)
+def test_build_py_makes_a_library_exporting_no_c_abi(tmp_path):
+    library = _build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)
+    symbols = subprocess.run(
+        ["nm", "-D", "--defined-only", str(library)], capture_output=True, text=True, check=True
+    ).stdout
+    assert "sglang_nvfp4_cpu_experts_" not in symbols
+    assert "__tvm_ffi_nvfp4_cpu_kernel_address" in symbols  # tvm-ffi's TVM_FFI_DLL_EXPORT_TYPED_FUNC prefix
 
 
 def test_the_loader_builds_once_per_content_and_reuses_the_library(tmp_path):
     from sglang.srt.layers.quantization.nvfp4 import ext as nvfp4_cpu_ext
 
-    nvfp4_cpu_ext.nvfp4_cpu_library.cache_clear()
-    library = nvfp4_cpu_ext.nvfp4_cpu_library(str(tmp_path))
+    nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()
+    path = nvfp4_cpu_ext.nvfp4_cpu_library_path(str(tmp_path))
     built = list(tmp_path.glob("*.so"))
-    assert len(built) == 1
+    assert len(built) == 1 and Path(path) == built[0]
     stamp = built[0].stat().st_mtime_ns
-    nvfp4_cpu_ext.nvfp4_cpu_library.cache_clear()
-    nvfp4_cpu_ext.nvfp4_cpu_library(str(tmp_path))
+    nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()
+    nvfp4_cpu_ext.nvfp4_cpu_library_path(str(tmp_path))
     assert [p.stat().st_mtime_ns for p in tmp_path.glob("*.so")] == [stamp]
-    for name in C_ABI:
-        getattr(library, name)
 
 
 def test_the_library_hands_out_its_kernel_address(tmp_path):

@@ -18,7 +18,29 @@ import torch
 pytestmark = pytest.mark.skipif(not os.environ.get("SGLANG_EXL3_SRC"), reason="needs SGLANG_EXL3_SRC")
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_cpu_expert_pool_exl3 import CAP, LIMIT, _random_slabs  # noqa: E402
+
+CAP = 6
+LIMIT = 10.0
+
+
+def _random_slabs(seed, hidden, inter):
+    g = torch.Generator().manual_seed(seed)
+
+    def signs(*shape):
+        return (torch.randint(0, 2, shape, generator=g) * 2 - 1).half()
+
+    def codes(*shape):
+        return torch.randint(-32768, 32767, shape, generator=g, dtype=torch.int16)
+
+    return {
+        "w13_trellis": codes(CAP, 2, hidden // 16, inter // 16, 48),
+        "w13_suh": signs(CAP, 2, hidden),
+        "w13_svh": signs(CAP, 2, inter),
+        "w2_trellis": codes(CAP, inter // 16, hidden // 16, 48),
+        "w2_suh": signs(CAP, inter),
+        "w2_svh": signs(CAP, hidden),
+    }
+
 
 HIDDEN, INTER = 5120, 2304  # DeepSeek V4.1's shape: the DSV4.1 plan on AVX-512BW
 REPEATS = 40
