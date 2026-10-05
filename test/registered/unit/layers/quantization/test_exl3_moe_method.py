@@ -1,5 +1,7 @@
 """exl3 MoE parameter registration and per-expert loading (no kernels)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -147,6 +149,93 @@ def test_apply_scales_routed_output_unless_fused(monkeypatch, fused):
     dispatch = SimpleNamespace(hidden_states=torch.zeros(3, HIDDEN), topk_output=topk)
     out = method.apply(layer, dispatch).hidden_states
     assert torch.equal(out, base if fused else base * 1.5)
+
+
+def _cpu_draft_moe(monkeypatch, tmp_path, resident, fused_shared=0):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts import draft, draft_resident
+
+    registered = []
+    registry = SimpleNamespace(register=lambda slabs, on_cpu, limit, *, layer_id: registered.append((slabs, on_cpu, limit)) or 0)
+    monkeypatch.setattr(draft, "DRAFT_CPU_EXPERTS", registry)
+    path = tmp_path / "resident.json"
+    draft_resident.write_resident_set(str(path), {0: resident}, n=len(resident), source="")
+    draft_resident._cache.clear()
+    layer = nn.Module()
+    layer.layer_id = 0
+    layer.num_experts = E
+    layer.num_fused_shared_experts = fused_shared
+    layer.moe_runner_config = SimpleNamespace(swiglu_limit=10.0)
+    method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=False, cpu_draft=True)
+    method.create_weights(layer, E, HIDDEN, INTER, torch.bfloat16)
+    _load_all(layer)
+    with envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.override(str(path)):
+        method.process_weights_after_loading(layer)
+    return layer, method, registered
+
+
+def test_a_cpu_draft_layer_loads_into_host_memory_and_keeps_its_resident_set_for_the_gpu(monkeypatch, tmp_path):
+    layer, method, registered = _cpu_draft_moe(monkeypatch, tmp_path, resident=[2])
+    assert layer.w13_trellis.device.type == "cpu" and layer.w2_svh.device.type == "cpu"
+    (slabs, on_cpu, limit), = registered
+    assert on_cpu.tolist() == [True, True, False, True] and limit == 10.0
+    assert slabs["w13_trellis"].data_ptr() == layer.w13_trellis.data_ptr()
+    assert layer.exl3_cpu_draft_key == 0 and layer.exl3_gpu_experts == frozenset({2})
+    gate, up = layer.exl3_gpu_w13[2]
+    assert int(gate.trellis[0, 0, 0]) == 10 * 2 + 1 and sorted(layer.exl3_gpu_w2) == [2]
+
+
+def test_a_fused_shared_expert_is_always_on_the_gpu(monkeypatch, tmp_path):
+    layer, method, registered = _cpu_draft_moe(monkeypatch, tmp_path, resident=[0], fused_shared=1)
+    assert registered[0][1].tolist() == [False, True, True, False]
+    assert layer.exl3_gpu_experts == frozenset({0, E - 1})
+
+
+def test_a_resident_id_outside_the_routed_experts_is_refused(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="resident"):
+        _cpu_draft_moe(monkeypatch, tmp_path, resident=[E - 1], fused_shared=1)
+
+
+def test_apply_adds_the_gpu_and_cpu_shares(monkeypatch, tmp_path):
+    from sglang.srt.layers.moe.cpu_experts import draft
+    from sglang.srt.layers.quantization.exl3 import exl3
+
+    layer, method, _ = _cpu_draft_moe(monkeypatch, tmp_path, resident=[2])
+    seen = {}
+
+    class _Future:
+        def result(self):
+            return torch.full((2, HIDDEN), 1.0)
+
+    def submit(key, ids, x, weights):
+        seen["ids"] = ids.tolist()
+        return _Future()
+
+    monkeypatch.setattr(draft, "DRAFT_CPU_EXPERTS", SimpleNamespace(runtime=lambda: SimpleNamespace(submit=submit)))
+
+    def accumulate(out, x, w, ids, w13, w2, limit, experts):
+        seen["gpu"] = list(experts)
+        out += 2.0
+
+    monkeypatch.setattr(exl3, "exl3_moe_accumulate", accumulate)
+    x = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
+    ids = torch.tensor([[2, 0], [1, 3]])
+    out = method._apply_cpu_draft(layer, x, torch.ones(2, 2), ids, 10.0)
+    assert seen == {"ids": [[2, 0], [1, 3]], "gpu": [2]}
+    assert out.dtype == torch.bfloat16 and torch.all(out == 3.0)
+
+
+def test_without_the_flag_a_draft_layer_stays_on_the_default_device():
+    method = Exl3MoEMethod(Exl3Config.from_config(CFG), streamed=False)
+    assert method.cpu_draft is False
+
+
+def test_cpu_draft_parameters_are_not_staged_to_the_gpu_for_post_load(monkeypatch, tmp_path):
+    # The loader stages CPU parameters onto the GPU around process_weights_after_loading; views taken then would
+    # keep GPU copies of every draft expert alive.
+    layer, _, _ = _cpu_draft_moe(monkeypatch, tmp_path, resident=[2])
+    for name, param in layer.named_parameters():
+        assert getattr(param, "_sglang_skip_device_loading", False), name
 
 
 if __name__ == "__main__":
