@@ -11,6 +11,7 @@
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "Wire (v2)".
 #pragma once
 
+#include "lease_channel_layout.h"
 #include <cstdint>
 
 // The lane count of this build: every JIT build of the device kernels and the host passes -DSGLANG_EXPERT_STREAM_LANES.
@@ -88,10 +89,10 @@ struct LeaseLayout {
   static constexpr int64_t kLeaseCopyDone = kLeasePieceMask + kDemandRecords * kLanes * kLeasePieceMaskLineBytes;
   static constexpr int64_t kLeaseCopyDoneBytes = 8;
   static constexpr int64_t kLeaseCopyGate = kLeaseCopyDone + 128;
-  static constexpr uint32_t kLeaseGateClosed = 0x80000001u;
-  static constexpr uint32_t kLeaseGateOpen = 1;
-  static constexpr uint32_t kLeaseGateSeqShift = 2;
-  static constexpr uint32_t kLeaseGateSeqMask = 0x1FFFFFFF;
+  static constexpr uint32_t kLeaseGateClosed = channel::kGateClosed;  // the lease channel's gate encoding
+  static constexpr uint32_t kLeaseGateOpen = channel::kGateOpen;
+  static constexpr uint32_t kLeaseGateSeqShift = channel::kGateSeqShift;
+  static constexpr uint32_t kLeaseGateSeqMask = channel::kGateSeqMask;
   static constexpr int64_t kCopyArmed = kLeaseCopyGate + 128;  // u32
   static constexpr int64_t kSplit = kCopyArmed + 128;  // i32[kNodes][kSplitStride / 4]: CPU lanes per n eligible lanes
   static constexpr int64_t kSplitStride = wire_round_up(4 * (kLanes + 1), 16);  // a node's table, in 16-byte loads
@@ -114,6 +115,15 @@ struct LeaseLayout {
 };
 
 using Wire = LeaseLayout<SGLANG_EXPERT_STREAM_LANES, SGLANG_EXPERT_STREAM_NODES>;
+
+// The target is the lease channel's first client (LEASE_PROTOCOL.md, "The lease channel"): its request page and its
+// completion block's CopyDone words and gate.
+template <class L>
+using TargetChannelOf = channel::ChannelSpec<L::kDemandHead, L::kDemandRing, L::kDemandRecords, L::kRecordBytes,
+                                             L::kLeaseCopyDone, L::kLeaseCopyGate>;
+using TargetChannel = TargetChannelOf<Wire>;
+static_assert(TargetChannel::kDone == Wire::kLeaseCopyDone && TargetChannel::kGate == Wire::kLeaseCopyGate, "channel");
+static_assert(TargetChannel::kDoneBytes == Wire::kLeaseCopyDoneBytes && Wire::kRecSeq == 0, "the seq word is first");
 
 using V2 = LeaseLayout<8, 1>;
 static_assert(V2::kRecordBytes == 128 && V2::kPageBytes == 2176 && V2::kRecLaneWeight == 96, "v2 request page");

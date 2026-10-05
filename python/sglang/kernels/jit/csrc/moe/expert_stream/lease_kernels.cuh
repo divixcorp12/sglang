@@ -167,12 +167,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     const int32_t expert = static_cast<int32_t>(p.routes[i]);
     if (expert >= 0 && expert < p.experts && !listed(protect, protect_count, expert)) protect[protect_count++] = expert;
   }
-  uint32_t seq = static_cast<uint32_t>(state[kPosted]) + 1u;
-  if (seq == 0) {
-    seq = 1;
-    state[kEpoch] += 1;
-  }
-  state[kPosted] = static_cast<int32_t>(seq);
+  const uint32_t seq = channel::advance(state);
   const uint32_t epoch = static_cast<uint32_t>(state[kEpoch]);
   if (p.hot_page != nullptr) {
     uint8_t* hot = p.hot_page + static_cast<int64_t>((seq - 1u) % Wire::kHotRecords) * p.hot_stride;
@@ -219,7 +214,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     p.map_chain[p.row] += 1;  // the host publishes this chain's delta under this number
     chain = static_cast<uint64_t>(p.map_chain[p.row]);
   }
-  uint8_t* record = p.page + Wire::kDemandRing + ring_index(seq) * Wire::kRecordBytes;
+  uint8_t* record = channel::record_at<TargetChannel>(p.page, seq);
   write_record(
       record,
       seq,
@@ -237,7 +232,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
           .lanes = &typed,
       });
   // A release orders every earlier store of this thread: the hot page and the record come first.
-  st_release_sys(p.page + Wire::kDemandHead, seq);
+  channel::publish_head<TargetChannel>(p.page, seq);
   state[kPending] = count > 0 ? static_cast<int32_t>(seq) : 0;
   state[kPendingEpoch] = state[kEpoch];
   store_deadline(state, global_ns() + static_cast<uint64_t>(p.timeout_ns));

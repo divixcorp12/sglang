@@ -34,6 +34,41 @@ std::string for_nodes(int64_t nodes) {
   return nodes == 1 ? members<LeaseLayout<N, 1>>() : members<LeaseLayout<N, 2>>();
 }
 
+template <class L>
+std::string channel_members() {
+  using C = TargetChannelOf<L>;
+  std::string out;
+  auto put = [&](const std::string& name, int64_t value) { out += name + "=" + std::to_string(value) + "\n"; };
+  put("chan_head", C::kHead);
+  put("chan_ring", C::kRing);
+  put("chan_records", C::kRecords);
+  put("chan_record_bytes", C::kRecordBytes);
+  put("chan_done", C::kDone);
+  put("chan_gate", C::kGate);
+  for (uint32_t seq : {1u, 2u, 0x1FFFFFFFu, 0x20000001u}) {
+    put("gate_open_" + std::to_string(seq), ::sglang::expert_stream::channel::gate_word(seq, L::kLeaseGateOpen));
+    put("gate_closed_" + std::to_string(seq), ::sglang::expert_stream::channel::gate_word(seq, L::kLeaseGateClosed));
+  }
+  out.pop_back();
+  return out;
+}
+
+template <int N>
+std::string channel_for_nodes(int64_t nodes) {
+  return nodes == 1 ? channel_members<LeaseLayout<N, 1>>() : channel_members<LeaseLayout<N, 2>>();
+}
+
+// The target's lease channel (TargetChannelOf) and the shared gate encoding, for test_lease_channel_layout.
+std::string channel_probe(int64_t lanes, int64_t nodes) {
+  if (nodes != 1 && nodes != 2) return "";
+  switch (lanes) {
+    case 8: return channel_for_nodes<8>(nodes);
+    case 24: return channel_for_nodes<24>(nodes);
+    case 32: return channel_for_nodes<32>(nodes);
+    default: return "";
+  }
+}
+
 std::string probe(int64_t lanes, int64_t nodes) {
   if (nodes != 1 && nodes != 2) return "";
   switch (lanes) {
@@ -50,3 +85,4 @@ std::string probe(int64_t lanes, int64_t nodes) {
 }  // namespace
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lease_layout_probe, probe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lease_channel_probe, channel_probe);
