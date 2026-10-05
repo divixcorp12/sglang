@@ -101,8 +101,13 @@ so under `pytest -n 8` the queue makes it longer still.
 A test whose child process would build a module must warm it in the parent first, where nothing times the wait.
 `run_host_script` (`python/sglang/test/dsv41_ram_miss_fixtures.py`) is the worked example: it calls
 `warm_host_modules` with the variant and lane count its child script constructs, then spawns. The child has no
-conftest, so it also loads the default build through `host_layout()`; the helper warms that one too. Children that
-test a build itself (a build failure, a fresh build dir) are left cold on purpose.
+conftest, so it also loads the default build through `host_layout()`; the helper warms that one too (and
+`uring_file_reader`, which a child that serves a miss builds on its own). Start such a child with `spawn_child` in the same
+file. Children that test a build itself (a build failure, a fresh build dir) are left cold on purpose.
+
+An abort-expecting child must run with core dumps off (`spawn_child` does it, through `NO_CORE_DUMP`): each dump is about
+443 MB through systemd-coredump, which can outlast a 60 s timeout under load. Leave pytest's own limit alone, so a real
+crash of the test process still leaves a dump.
 
 A `TimeoutExpired` on a cold cache is the compiler, not a hang. Check the module's build-dir mtimes before calling it a
 regression. On 2026-10-04, after the GCC 15 / `-march` change, nine `run_host_script` callers failed at 60 s under

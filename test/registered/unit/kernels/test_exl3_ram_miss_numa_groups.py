@@ -3,8 +3,6 @@ group serves only its home lanes (expert % 2), stages and evicts only in its own
 the groups' map deltas into one per record. ChainSim plays the device with the node-aware reference typing."""
 
 import os
-import subprocess
-import sys
 import textwrap
 
 import pytest
@@ -15,7 +13,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import NO_CORE_DUMP, assert_aborted, paused, ram_miss_setup, warm_host_modules
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, paused, ram_miss_setup, spawn_child
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -214,10 +212,7 @@ def test_the_native_start_thread_warns_when_an_inherited_affinity_covers_the_res
 
 
 def _run_child(script, tmp_path, timeout):
-    """``script`` in a fresh interpreter, its host modules warmed here first: a cold compile in the child would count
-    against its timeout."""
-    warm_host_modules("instr", nodes=2)
-    return subprocess.run([sys.executable, "-c", NO_CORE_DUMP + script, str(tmp_path)], capture_output=True, text=True, timeout=timeout)
+    return spawn_child(script, tmp_path, timeout_s=timeout, variant="instr", nodes=2)
 
 
 _SCRIPT = """
