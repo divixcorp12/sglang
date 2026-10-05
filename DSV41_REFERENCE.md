@@ -6889,6 +6889,60 @@ calibrated 0.63 ms (a verify's expert can serve several tokens), and GPU ms per 
   If 1 and 2 land near 1.0-1.5× and ≤ 28 ms, and item 1 has a cheap answer, v2 is worth a build plan. Otherwise
   graphed DSpark stays shelved, and §33.4's eager hybrid draft remains the only DSpark path.
 
+### 33.6 D2-1: the route plan and the in-graph MoE over M tokens (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-d2-1-multitoken-moe.md`, branch `dsv41-dspark-graph`.
+This is the first of four v2 plans. It covers §33.3 items 3 and 4.
+
+**What changed.**
+- **Route plan (item 3), `93213724ca`.**
+  - A second fused planner kernel, `plan_dedup_routes_kernel` (`expert_route_plan.cuh`), plans up to 64 routes of
+    several tokens in one launch. It uses one block of 64 threads and dedups by first occurrence, so a slot shared
+    across tokens is planned once.
+  - The one-warp BS1 kernel is unchanged and still serves `topk_ids.shape[0] == 1`.
+  - `supports_fused_graph_routes` admits multi-token calls up to 64 routes.
+- **Route tables, `bc832c0a88`.**
+  - `route_tables` and the layer-fusion kernel `exl3_moe_route_tables` now take `[M, H]` and up to 64 routes.
+  - Both rank routes stably (torch: `argsort(stable=True)`), so they agree bit for bit when tokens share a slot.
+  - Both write each rank's token (`route // top_k`) as exllamav3's `token_sorted`.
+  - The launcher refuses CPU experts for M > 1.
+- **The MoE (item 4), `aeafeac263`.**
+  - `Exl3FusedMoE(tokens=)` sizes its route buffers to `tokens × top_k` and runs any 1 ≤ M ≤ tokens by slicing them.
+  - `exl3_fused_moe_for` sets `tokens = graph_gather_rows // top_k` and refuses more than `ROW_TILE` = 16 tokens.
+
+**exllamav3 needed no change.** This closes item 4's "Unverified" line. `exl3_moe` is multi-token already:
+- `token_sorted` maps each sorted route to its input row;
+- experts are handed out by ticket, so a slot carries as many rows as `expert_count` says, up to its 16-row tile;
+- `num_active` only sizes the launch;
+- `exl3_moe_gather` sums per token.
+
+**Gate.** `test/manual/dsv41/test_exl3_fused_moe_multitoken_gpu.py` (`919f726c79`) ran on real layer-3 rows: 16
+experts in 16 slots, top-6, 8 route sets per M, with tokens sharing slots.
+- It passed every bar: rel ≤ 1.2e-2 and ≤ 2× the per-expert loop's error; layer fusion equal to the torch chain bitwise;
+  eager reruns and graph replays with rewritten inputs bitwise equal; M = 1 after M = 6 equal to a fresh object.
+- The P2 probe passed in the same run, so BS1 is intact.
+- Raw data: `cc-expert-prediction/analysis/dsv41-dspark/graph-verify/d2-1-multitoken.{json,log}`.
+
+| M | max rel_fused | max rel_loop | eager µs | replay µs | num_active |
+|---|---|---|---|---|---|
+| 1 | 1.10e-3 | 1.15e-2 | 97.0 | 96.6 | 6 |
+| 2 | 1.00e-3 | 1.21e-2 | 267.4 | 266.5 | -1 |
+| 4 | 1.00e-3 | 1.12e-2 | 272.3 | 271.4 | -1 |
+| 6 | 1.01e-3 | 1.08e-2 | 274.2 | 274.3 | -1 |
+
+**The first measured input to §33.5's "verify GPU ms".** This covers the MoE kernels only, for one layer of 16 slots.
+- Replay at M = 6 costs 2.84× M = 1 (274 vs 97 µs).
+- Almost all of that is the launch size, not the tokens. M = 2 already costs 267 µs, and the probe's own run gives
+  `num_active = -1` 279 µs of replay at M = 1, against 113 µs at 6.
+- **`num_active = -1` at M > 1 is untuned.** A launch sized to the distinct-slot bound (≤ min(M × top_k, slots)) is
+  the obvious next measurement. At 40 layers, today's figure adds ≈7 ms per verify over BS1's MoE.
+
+**What D2-1 does not do:**
+- the record and wire at width W (D2-2, item 2);
+- DIRECT's `capacity ≥ 2W` and the overflow path (D2-2);
+- the end-to-end graphed verify with CPU experts off, the small items and the gate (D2-3, items 6-8);
+- multi-token CPU experts (D2-4, item 5).
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
