@@ -6943,6 +6943,78 @@ experts in 16 slots, top-6, 8 route sets per M, with tokens sharing slots.
 - the end-to-end graphed verify with CPU experts off, the small items and the gate (D2-3, items 6-8);
 - multi-token CPU experts (D2-4, item 5).
 
+### 33.7 D2-2: a miss width below the routes, and the overflow flag (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-d2-2-miss-lanes.md`, branch `dsv41-dspark-graph`.
+This is the second of four v2 plans. It covers §33.3 items 1 and 2.
+
+**§33.3 item 2 is out of date.**
+- The record is no longer 8 lanes. `LeaseLayout<NumLanes, NumNodes>` takes 1-32 lanes, one JIT build per lane count
+  (`0b82fc37c5`, `5813a147d5`, `7a77475a20`).
+- The real one-token assumption was the unit the width counted: `graph_gather_rows` counts routes (36 for a 6-token
+  verify at top-6). From it came the lane build (`plan_gather_width` raises above 32), DIRECT's victim shortlist and
+  `capacity ≥ 2 × rows` floor, the allocator's floor, and the attach check `graph_gather_rows > lanes`.
+
+**What changed.**
+- **The fused DIRECT gather takes up to 64 routes, `3ad17dfb8a`.**
+  - The kernel is one warp. It translated a route's remap only where `lane < top_k`, and its launcher refused more
+    than 32 routes. The remap loop now strides by the warp.
+  - The launcher checks the shortlist (1-32) and the routes (1-64) separately.
+  - The per-layer remap rows are sized at the 64-route bound, not at the shortlist.
+- **A miss width W separate from the routes, `1136ec5f0e`.**
+  - `SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES` (an `EnvInt(0)`), or `from_model(graph_gather_miss_lanes=)`, caps each
+    layer's distinct misses per gather. It is capped at the routes, and 0 keeps one lane per route.
+  - `ExpertStreamer.graph_miss_lanes` and `graph_miss_width` carry it.
+  - Routes keep their width: planner, remap and protect list. Misses take W: the lane build, staging, DIRECT's
+    shortlist, the allocator floor (`2W`) and the attach check.
+  - A width below the routes needs DIRECT (`SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2`) and refuses CPU experts.
+  - `exl3_fused_moe_for` needs `top_k` resident slots, not one per route.
+- **Clamp and flag, `7d06ed4782`.**
+  - `GpuResidencyUpdater.clamp_gather_misses` runs after the DIRECT destinations, only when W is below the routes.
+    It sets the shared miss count to the lanes that found a victim.
+  - `gather_overflow` (int64 per layer) counts the gathers that had more misses than that.
+  - `overflow_flag` (int32 [1], sticky) says this forward's output is not a verify result.
+  - The metrics snapshot gains `gather_overflow` only when some layer is narrowed.
+
+**Why residency stays exact.**
+- The live lanes are a prefix: usable shortlist entries come first, then `lane < count`. So `live.sum()` is the
+  number served.
+- The post kernel, S, the copy wait and the commit all read one count, `_graph_miss_count`. After the clamp, every row
+  copied is committed, and nothing else is.
+- Without the clamp, a counted lane that is not live copies into slot 0. Reusing `keep = 0` would be wrong as well:
+  the copies have already been issued, and the commit would then skip rows it had overwritten.
+- An overflowed forward reads valid slots for the wrong experts. Its unserved misses' routes point at a served
+  lane's slot, and the flag marks the output.
+- A mutant that drops the clamp fails all three narrow-gather tests: the flag stays 0, and served rows are wrong.
+
+**The `capacity ≥ 2W` floor stays, though its guarantee no longer holds for a verify.**
+- At one token, `H + M ≤ rows` guarantees every miss a victim. For a verify, `H + M` may exceed W, and the hits may
+  disqualify more shortlist entries than there are to spare.
+- The flag covers that shortfall. Whether a floor below `2W` is safe is §33.5's measurement 3, still open.
+
+**Gate.** `test/manual/dsv41/test_exl3_verify_miss_lanes_gpu.py` (`7d66c99a1c`, `8cc3050e44`) captures a 6-token verify
+at top-6 through the real EXL3 lease chain, with the service built for 8 lanes. It passed both arms, generic and
+layer fusion.
+- One step has 6 shared misses (copied once), then a step of all hits (no rows read), then a union of 8 that fills
+  the lanes. These are served exactly, and every token's output is within the probe's bar.
+- A union of 12 serves 8 and flags the forward, with `gather_overflow` + 1 and no trap or fail-stop. Every mapped
+  slot still holds its checkpoint bytes, and `insertion_truncated` stays 0.
+- The next step is served exactly again.
+- The BS1 lease-chain, lease-kernel and layer-fusion files stayed green in the same run.
+- The NVFP4 residency tests cover the rest:
+  - a narrow gather equals the one-lane-per-route gather bit for bit until its first overflow;
+  - hits can empty the shortlist even when the misses fit, and the gather is flagged with nothing copied;
+  - a one-token gather never calls the clamp.
+
+**What D2-2 does not do:**
+- D2-3 owns the rest of the graphed verify:
+  - reading and clearing the flag, and re-verifying an overflowed verify;
+  - the gate lift;
+  - the protect list, which still truncates silently at the lane count (recency stamps only, §33.3 item 6).
+- W is not chosen. That waits for D2-3's overflow rate on real routes, against §33.5's projection; in the offline
+  model W = 8 overflows half the layers.
+- D2-4 owns CPU experts at W < routes.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
