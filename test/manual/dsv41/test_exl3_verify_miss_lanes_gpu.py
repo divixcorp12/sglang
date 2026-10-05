@@ -133,6 +133,11 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
             assert updater.gather_overflow[0].item() == overflowed + 1
             # The DSpark re-run: read and clear the flag, then the same verify with the graph gather suspended.
             assert manager.take_verify_overflow()
+            # The eager re-run stages its misses in the tier's free rows: the room it is told of excludes the row's
+            # LANES staging slots the in-graph lanes own, or a chunk outgrows the room and reuses its own slots.
+            pinned = streamer.pinned_host_cache
+            protected = sum(1 for e in pinned._lru.expert_to_slot if pinned.is_pinned(e))
+            assert pinned.evictable_rows() == pinned.capacity - LANES - protected
             with manager.suspend_graph_gather():
                 assert not streamer.serves_graph_gather(SimpleNamespace(topk_ids=ids))
                 eager = Exl3MoEMethod._apply_streamed(layer, streamer, x, weights, ids, ACT_LIMIT)
