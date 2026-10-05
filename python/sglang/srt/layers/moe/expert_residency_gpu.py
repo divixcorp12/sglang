@@ -997,9 +997,10 @@ class GpuResidencyUpdater:
         and the hits can disqualify more entries than the shortlist has to spare. The lanes
         :meth:`gather_destinations` made live are a prefix (usable entries first, then ``lane < count``), so their sum
         is the number served. The shared miss count, which the copy, the lease record and the commit all read, drops
-        to it: every row copied is committed, and nothing is copied into slot 0. The unserved misses' routes read a
-        served lane's slot (a valid slot, the wrong expert), so the forward's output is not a verify result, and
-        ``overflow_flag`` says so. Device only, capture-safe.
+        to it: every row copied is committed, and nothing is copied into slot 0. The unserved misses' routes read
+        slot 0 (a lane that is not live has destination 0; a rank past the shortlist reads its last lane), which may
+        be free and hold any bytes. The forward's output, NaN or Inf included, is not a verify result and must not
+        be kept; ``overflow_flag`` says so. Device only, capture-safe.
         """
         row, streamer, _, live = self._pending_commit
         count = streamer._graph_miss_count

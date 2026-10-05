@@ -6983,8 +6983,10 @@ This is the second of four v2 plans. It covers §33.3 items 1 and 2.
   copied is committed, and nothing else is.
 - Without the clamp, a counted lane that is not live copies into slot 0. Reusing `keep = 0` would be wrong as well:
   the copies have already been issued, and the commit would then skip rows it had overwritten.
-- An overflowed forward reads valid slots for the wrong experts. Its unserved misses' routes point at a served
-  lane's slot, and the flag marks the output.
+- An overflowed forward reads the wrong rows. An unserved miss's route reads slot 0, because a lane that is not live
+  has destination 0 (a rank past the shortlist reads its last lane). Slot 0 may be free and hold any bytes, so the
+  output can be NaN or Inf, not merely the wrong experts. The flag marks the output, and D2-3 must discard
+  everything the flagged forward wrote, not only its tokens.
 - A mutant that drops the clamp fails all three narrow-gather tests: the flag stays 0, and served rows are wrong.
 
 **The `capacity ≥ 2W` floor stays, though its guarantee no longer holds for a verify.**
