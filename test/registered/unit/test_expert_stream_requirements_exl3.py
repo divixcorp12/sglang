@@ -440,6 +440,8 @@ def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
 DSPARK_CPU_ENV = dict(
     SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS=True,
     SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES="18-27",
+    SGLANG_EXL3_CPU_ACT_RESIDUAL=True,
+    SGLANG_EXL3_CPU_ACT_BLOCK=128,
 )
 
 
@@ -498,3 +500,14 @@ def test_dspark_cpu_experts_refuse_the_nvme_interrupt_cores(model_dir, cpu_pin_o
             _launch(model_dir, speculative_algorithm="DSPARK"),
             **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "62-65"},
         )
+
+
+@pytest.mark.parametrize(
+    "unset", [{"SGLANG_EXL3_CPU_ACT_RESIDUAL": False}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 0}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 64}]
+)
+def test_dspark_cpu_experts_need_the_optimized_cpu_kernel_build(model_dir, cpu_pin_off, unset):
+    """Only the optimized EXL3 build exports a CpuExpertKernel (sglang_exl3_cpu::kernel_address), and with the target's
+    CPU experts refused under speculation the residual/128 defines are what select it; without them the draft would
+    fail at its first step, after the model loaded."""
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ACT_RESIDUAL=1"):
+        _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **{**DSPARK_CPU_ENV, **unset})
