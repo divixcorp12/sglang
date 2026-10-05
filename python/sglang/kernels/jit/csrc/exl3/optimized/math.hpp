@@ -559,7 +559,7 @@ void compact_quantize_block(PreparedIn& p,int r,int m,int k,int block,const floa
 template <Isa I>
 void prepare_rows
 (
-    const MoeCpuMatrix& mat,
+    const Exl3Projection& mat,
     const at::Half* src_f16, const float* src_f32, int src_stride,
     const int* token_idx, int m,
     PreparedIn& p

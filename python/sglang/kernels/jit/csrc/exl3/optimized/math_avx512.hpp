@@ -145,7 +145,7 @@ inline void vnni_band_rows
 
 template <int bits, int rows, int band>
 M1_TARGET_VNNI
-void vnni_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+void vnni_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int n0)
 {
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
@@ -226,7 +226,7 @@ void vnni_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
 
 template <int bits, int rows>
 M1_TARGET_VNNI
-void vnni_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+void vnni_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
 {
     // m = 1 supports band widths up to 16 (16 zmm accumulators). Measured on the 7960X: 16 is
     // not better than 8 for decode-shape jobs (medians 1.01 vs 0.98 ms, interleaved A/B) -- the
@@ -439,7 +439,7 @@ M1_ALWAYS_INLINE void bw3_band_rows(__m512i p0, __m512i p1, int b,
 
 template <int bits, int rows, int band>
 M1_TARGET_BW
-void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+void bw_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int n0)
 {
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
@@ -511,7 +511,7 @@ void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
 
 template <int bits, int rows>
 M1_TARGET_BW
-void bw_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+void bw_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
 {
     // Same band widths as vnni_tiles (one more live temporary per band step, same budget)
     constexpr int band_cap = 8;
@@ -690,7 +690,7 @@ inline void vbmi_band_rows
 
 template <int bits, int rows, int band>
 M1_TARGET_VBMI
-void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+void vbmi_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int n0)
 {
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
@@ -765,7 +765,7 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
 
 template <int bits, int rows>
 M1_TARGET_VBMI
-void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+void vbmi_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
 {
     constexpr int band_cap = 8;
 
@@ -803,7 +803,7 @@ void vbmi_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
 // sum blocks separately for base/residual rows, then add the residual exactly once.
 template <int band>
 M1_TARGET_BW
-void bw3_blocked_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
+void bw3_blocked_band(const Exl3Projection& mat, const PreparedIn& in, float* tout, int n0)
 {
     constexpr int B = 128, rows = 2, packed_size = 48;
     const int tiles_k = mat.k / 16, tiles_n = mat.n / 16;
@@ -856,7 +856,7 @@ void bw3_blocked_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout
 }
 
 M1_TARGET_BW
-void bw3_blocked_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+void bw3_blocked_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
 {
     // Match the eight output tiles stored together in the swizzled layout.
     // Keep each output's fp32 block accumulation order unchanged.
@@ -949,7 +949,7 @@ M1_TARGET_BW M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i 
 }
 
 template<int Pairs,int FixedK=0,int FixedN=0,bool Compact=false>
-M1_TARGET_BW void register_band(const MoeCpuMatrix& mat,const PreparedIn& in,float* tout,int n0) {
+M1_TARGET_BW void register_band(const Exl3Projection& mat,const PreparedIn& in,float* tout,int n0) {
     const int k=FixedK?FixedK:mat.k,n=FixedN?FixedN:mat.n;
     const bool swz=FixedK?false:mat.swz;
     const int tiles_k=k/16,tiles_n=n/16;
@@ -1009,7 +1009,7 @@ M1_TARGET_BW inline void integer_acc_zero(IntegerAccum& a) {
 }
 
 M1_TARGET_BW __attribute__((noinline))
-void traversal_kblock(const MoeCpuMatrix& mat, const PreparedIn& in,
+void traversal_kblock(const Exl3Projection& mat, const PreparedIn& in,
                       __m512 (&sums)[4][2][2], int n0, int kb) {
     const int tiles_k=mat.k/16, tiles_n=mat.n/16;
     const bool swz=mat.swz;
@@ -1054,7 +1054,7 @@ void traversal_kblock(const MoeCpuMatrix& mat, const PreparedIn& in,
 }
 
 template<int Groups>
-M1_TARGET_BW void traversal_group(const MoeCpuMatrix& mat, const PreparedIn& in,
+M1_TARGET_BW void traversal_group(const Exl3Projection& mat, const PreparedIn& in,
                                  float* tout, int n0) {
     static_assert(Groups>=1 && Groups<=4);
     // Each group has 16 ZMM partial sums: 1024 bytes per 128 outputs.
@@ -1075,7 +1075,7 @@ M1_TARGET_BW void traversal_group(const MoeCpuMatrix& mat, const PreparedIn& in,
     }
 }
 
-M1_TARGET_BW void traversal_tiles(const MoeCpuMatrix& mat,const PreparedIn& in,
+M1_TARGET_BW void traversal_tiles(const Exl3Projection& mat,const PreparedIn& in,
                                  float* tout,int t0,int t1,bool grouped) {
     for(int t=t0;t<t1;) {
         const int remaining=(t1-t)/8;
@@ -1094,7 +1094,7 @@ M1_TARGET_BW void traversal_tiles(const MoeCpuMatrix& mat,const PreparedIn& in,
 
 // Compact tile pairs [t0, t1) inside one 128-output group, t1 - t0 in {0, 2, 4, 6}: the same per-output arithmetic as
 // traversal_kblock, which takes whole groups.
-M1_TARGET_BW void compact_pairs(const MoeCpuMatrix& mat,const PreparedIn& in,float* tout,int t0,int t1) {
+M1_TARGET_BW void compact_pairs(const Exl3Projection& mat,const PreparedIn& in,float* tout,int t0,int t1) {
     switch((t1-t0)/2) {
         case 1:register_band<1,0,0,true>(mat,in,tout,t0);break;
         case 2:register_band<2,0,0,true>(mat,in,tout,t0);break;
@@ -1103,7 +1103,7 @@ M1_TARGET_BW void compact_pairs(const MoeCpuMatrix& mat,const PreparedIn& in,flo
     }
 }
 
-M1_TARGET_BW void register_tiles(const MoeCpuMatrix& mat,const PreparedIn& in,float* tout,int t0,int t1,bool grouped) {
+M1_TARGET_BW void register_tiles(const Exl3Projection& mat,const PreparedIn& in,float* tout,int t0,int t1,bool grouped) {
     if(in.compact) {
         if(mat.swz) {
             // The swizzled layout stores a 128-output group's eight tiles together.

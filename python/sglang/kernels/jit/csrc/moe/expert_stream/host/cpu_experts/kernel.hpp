@@ -5,7 +5,7 @@
 // must name the same classes.
 //
 // The layer types are quant-agnostic views of the pinned tier's bytes. A quant reads them through its own typed view
-// (EXL3's MoeCpuMatrix, NVFP4's Projection), made from an ExpertRow's pointers and its Params.
+// (EXL3's Exl3Projection, NVFP4's Projection), made from an ExpertRow's pointers and its Params.
 #pragma once
 #include <array>
 #include <cstddef>

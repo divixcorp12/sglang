@@ -14,7 +14,7 @@
 // Current limits: mul1 codebook only, K in [1, 8]. Gated experts with silu/gelu/swiglu_oai
 // (act_limit) or gateless with relu2; optional per-expert biases (uniform per projection).
 
-struct MoeCpuMatrix
+struct Exl3Projection
 {
     const uint16_t* trellis;
     const at::Half* suh;
@@ -28,11 +28,15 @@ struct MoeCpuMatrix
     int swz = 0;
 };
 
+// The vendored per-expert kernel (exl3/moe_mul1.cpp) keeps upstream's name: production builds it against
+// upstream's cpu/moe_mul1.h, the bench baseline against this header.
+using MoeCpuMatrix = Exl3Projection;
+
 struct MoeCpuLayer
 {
-    std::vector<MoeCpuMatrix> gates;
-    std::vector<MoeCpuMatrix> ups;
-    std::vector<MoeCpuMatrix> downs;
+    std::vector<Exl3Projection> gates;
+    std::vector<Exl3Projection> ups;
+    std::vector<Exl3Projection> downs;
     // Tensor references keeping the CPU weight storage alive
     std::vector<at::Tensor> refs;
     int num_experts;

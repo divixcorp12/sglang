@@ -36,7 +36,7 @@ namespace {
 // -------------------------------------------------------------------------------------------
 
 template <Isa I>
-void run_tiles_raw(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+void run_tiles_raw(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     if (tn0 >= tn1) return;
     if constexpr (I == Isa::Vbmi)
@@ -192,7 +192,8 @@ void run_tiles_raw(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, i
 // k-block sub-views summed in fp32, then each remainder row added onto its token row. Only this
 // worker's columns [tn0, tn1) are touched, so the sums need no synchronization.
 template <Isa I>
-void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped = false)
+void run_tiles(
+    const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped = false)
 {
     if (tn0 >= tn1) return;
     if constexpr (I == Isa::Bw && ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128)
@@ -225,7 +226,7 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
         tl_swz_tiles_k = mat.k / 16;
         for (int b = 0; b < mat.k / B; ++b)
         {
-            MoeCpuMatrix sub = mat;
+            Exl3Projection sub = mat;
             sub.k = B;
             // Native: k-tile rows are tiles_n tiles apart. Swizzled: consecutive k-tiles of an 8-tile
             // group are 8 tiles apart, with the group stride from tl_swz_tiles_k
@@ -285,7 +286,7 @@ struct ForwardCtx
 
 template <Isa I>
 M1_TARGET_AVX2
-void transform_out_avx2(const MoeCpuMatrix& mat, float* tout, int m)
+void transform_out_avx2(const Exl3Projection& mat, float* tout, int m)
 {
     const __m256 hs = _mm256_set1_ps(HAD_SCALE);
     for (int r = 0; r < m; ++r)
@@ -308,7 +309,7 @@ void transform_out_avx2(const MoeCpuMatrix& mat, float* tout, int m)
 }
 
 template <Isa I>
-__attribute__((noipa)) void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
+__attribute__((noipa)) void transform_out(const Exl3Projection& mat, float* tout, int m)
 {
     if constexpr (I != Isa::Scalar) { transform_out_avx2<I>(mat, tout, m); return; }
     else
@@ -421,7 +422,7 @@ void prepare_gu_blocks(ForwardCtx& c,const Experts<Shape>& E,int worker,int num_
         const int j=task/nb,b=task%nb;
         const auto& ch=c.chunks[j/gu];
         const bool up=j%gu;
-        const MoeCpuMatrix& mat=up?E.up(ch.expert):E.gate(ch.expert);
+        const Exl3Projection& mat=up?E.up(ch.expert):E.gate(ch.expert);
         auto& p=(up?c.prep_u:c.prep_g)[j/gu];
         for(int r=0;r<ch.m;++r) {
             float* dst=p.tin+size_t(r)*K+b*128;
@@ -444,7 +445,7 @@ void prepare_gu_blocks(ForwardCtx& c,const Experts<Shape>& E,int worker,int num_
 
 
 template <Isa I>
-void transform_owned_blocks(const MoeCpuMatrix& mat,float* out,int m,int t0,int t1) {
+void transform_owned_blocks(const Exl3Projection& mat,float* out,int m,int t0,int t1) {
     for(int r=0;r<m;++r) for(int block=t0*16;block<t1*16;block+=128) {
         auto sub=mat;sub.n=128;sub.svh+=block;if(sub.bias)sub.bias+=block;
         transform_out<I>(sub,out+size_t(r)*mat.n+block,1);
@@ -654,7 +655,7 @@ private:
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = j % gu;
-                const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
+                const Exl3Projection& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
                 PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 prepare_rows<I>(mat, c.x, nullptr, H, ch.token, ch.m, p);
             }
@@ -667,7 +668,7 @@ private:
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = j % gu;
-                const MoeCpuMatrix& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
+                const Exl3Projection& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
                 run_tiles<I>(mat, p, tout, ch.m, t0, t1, grouped);

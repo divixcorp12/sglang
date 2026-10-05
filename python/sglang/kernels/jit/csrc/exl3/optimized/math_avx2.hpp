@@ -176,7 +176,7 @@ inline void avx2_rows_accum(
 
 template <int bits>
 M1_TARGET_AVX2
-void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+void avx2_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;

@@ -15,7 +15,7 @@ namespace {
 // -------------------------------------------------------------------------------------------
 
 template <int bits>
-void scalar_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+void scalar_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;

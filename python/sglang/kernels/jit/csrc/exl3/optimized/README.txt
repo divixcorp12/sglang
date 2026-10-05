@@ -93,9 +93,9 @@ an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTr
 specialization: compact scratch, grouped traversal, wide single-expert quantization. A plan reads every layer fact
 through its Shape (shapes.hpp): GenericShape from the ExpertLayer, Dsv41Shape as compile-time constants (5120/2304,
 3-bit unswizzled, activation limit 10; a layer with any other value takes the generic plan). Every layer is gated SiLU.
-Plans read experts through Experts<Shape> (quant.hpp): slot e's gate, up and down, each a MoeCpuMatrix over the slot's
-ExpertRow. Exl3Quant::dispatch groups the call's routes by expert itself (a sort of the call's live routes), which fixes
-the accumulation order.
+Plans read experts through Experts<Shape> (quant.hpp): slot e's gate, up and down, each an Exl3Projection over the
+slot's ExpertRow. Exl3Quant::dispatch groups the call's routes by expert itself (a sort of the call's live routes), which
+fixes the accumulation order.
 
 Bit-exact checks for any change here: test/manual/dsv41/run_exl3_cpu_forward_checks.sh (A/B dumps per ISA tier
 against the merge-base, the bare and full-stack benches' frozen references, the CPU expert pool tests).

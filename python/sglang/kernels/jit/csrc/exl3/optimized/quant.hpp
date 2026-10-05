@@ -1,5 +1,5 @@
 // Exl3Quant: the EXL3 CPU expert quant for ExpertForward (host/cpu_experts/expert_forward.hpp), and its typed view of
-// a layer's expert slots (Experts<Shape>: each projection a MoeCpuMatrix over the slot's ExpertRow). forward_plan.hpp
+// a layer's expert slots (Experts<Shape>: each projection a Exl3Projection over the slot's ExpertRow). forward_plan.hpp
 // defines Exl3Quant::dispatch.
 #pragma once
 #if !defined(__linux__) || !defined(_OPENMP)
@@ -34,10 +34,10 @@ constexpr std::array<uint64_t, kSlabNames> row_bytes(int hidden, int intermediat
 }
 
 // One projection's matrix over a slot's trellis and sign vectors (k inputs, n outputs).
-inline MoeCpuMatrix exl3_matrix(const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int k, int n, int bits,
+inline Exl3Projection exl3_matrix(const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int k, int n, int bits,
                                 int swz)
 {
-    MoeCpuMatrix m;
+    Exl3Projection m;
     m.trellis = reinterpret_cast<const uint16_t*>(trellis);
     m.suh = reinterpret_cast<const at::Half*>(suh);
     m.svh = reinterpret_cast<const at::Half*>(svh);
@@ -89,7 +89,7 @@ struct Exl3Quant
     static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa);
 };
 
-// The layer's experts as the plans read them: slot e's gate, up and down, each a MoeCpuMatrix over the slot's
+// The layer's experts as the plans read them: slot e's gate, up and down, each a Exl3Projection over the slot's
 // ExpertRow. A fixed Shape (Dsv41Shape) makes the dimensions compile-time constants; GenericShape reads them from the
 // layer and its params.
 template <class Shape>
@@ -102,9 +102,9 @@ struct Experts
     int I() const { if constexpr (Shape::kFixed) return Shape::kIntermediate; else return layer->intermediate; }
     int B() const { if constexpr (Shape::kFixed) return Shape::kBits; else return params.bits; }
 
-    MoeCpuMatrix gate(int e) const { return w13(e, 0); }
-    MoeCpuMatrix up(int e) const { return w13(e, 1); }
-    MoeCpuMatrix down(int e) const
+    Exl3Projection gate(int e) const { return w13(e, 0); }
+    Exl3Projection up(int e) const { return w13(e, 1); }
+    Exl3Projection down(int e) const
     {
         const ExpertRow r = (*layer)[e];
         return exl3_matrix(r.slab[kW2Trellis], r.slab[kW2Suh], r.slab[kW2Svh], I(), H(), B(), params.swizzled);
@@ -112,7 +112,7 @@ struct Experts
 
 private:
     // Part 0 (gate) or 1 (up) of the slot's w13 rows.
-    MoeCpuMatrix w13(int e, int part) const
+    Exl3Projection w13(int e, int part) const
     {
         const ExpertRow r = (*layer)[e];
         const std::array<uint64_t, kSlabNames> row = row_bytes(H(), I(), B());
