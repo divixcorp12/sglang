@@ -1267,9 +1267,9 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
-        # The host staged staging_for(capacity) slots for the row at start; a post with
-        # more misses traps.
-        want = max(1, streamer.graph_gather_rows)
+        # The host staged staging_for(capacity) slots for the row at start. A post requests
+        # at most the miss width (a verify's clamp keeps its count there), not the routes.
+        want = max(1, streamer.graph_miss_width)
         staged = self.staging_for(int(self.host.tables.capacity[row]))
         if staged < want:
             logger.warning(
