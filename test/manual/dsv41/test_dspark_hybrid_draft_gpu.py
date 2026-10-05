@@ -1,4 +1,6 @@
-"""The DSpark hybrid draft path matches exl3_moe_loop on the GPU, at the target's 3 and the draft's 4 bits.
+"""The DSpark hybrid draft path (Exl3MoEMethod._apply_draft: the draft channel's post, DraftResidentMoe, finish) matches
+exl3_moe_loop on the GPU, at the target's 3 and the draft's 4 bits; a captured call replays what eager computes; an eager
+call reads nothing from the device.
 
 Run on divix01 with the GPU lock, EXL3_MOE_CPU_PIN=0, SGLANG_DSV41_CPU_EXPERTS=1 and SGLANG_EXL3_SRC set (the
 optimized CPU kernel's build):
@@ -17,7 +19,7 @@ pytestmark = pytest.mark.skipif(
     reason="needs CUDA and SGLANG_EXL3_SRC",
 )
 
-E_ROUTED, SHARED, HIDDEN, INTER, ROWS, TOPK = 8, 1, 512, 256, 5, 3
+E_ROUTED, SHARED, HIDDEN, INTER, TOPK = 8, 1, 512, 256, 3
 LIMIT = 10.0
 
 
@@ -37,7 +39,8 @@ def _layer(bits, resident, monkeypatch, registry, tmp_path):
     layer.num_experts = e
     layer.num_fused_shared_experts = SHARED
     layer.moe_runner_config = SimpleNamespace(swiglu_limit=LIMIT)
-    method = Exl3MoEMethod(Exl3Config.from_config(cfg), streamed=False, cpu_draft=True)
+    layer.top_k = TOPK + SHARED
+    method = Exl3MoEMethod(Exl3Config.from_config(cfg), streamed=False, draft=True, cpu_draft=True)
     method.create_weights(layer, e, HIDDEN, INTER, torch.bfloat16)
     g = torch.Generator().manual_seed(bits)
     for expert in range(e):
@@ -60,49 +63,125 @@ def _layer(bits, resident, monkeypatch, registry, tmp_path):
     return layer, method
 
 
-def _routes(pattern, g):
+def _routes(pattern, g, rows):
     if pattern == "shared":
-        routed = torch.randperm(E_ROUTED, generator=g)[:TOPK].repeat(ROWS, 1)
+        routed = torch.randperm(E_ROUTED, generator=g)[:TOPK].repeat(rows, 1)
     else:
-        routed = torch.stack([torch.randperm(E_ROUTED, generator=g)[:TOPK] for _ in range(ROWS)])
-    shared = torch.full((ROWS, 1), E_ROUTED, dtype=torch.int64)
+        routed = torch.stack([torch.randperm(E_ROUTED, generator=g)[:TOPK] for _ in range(rows)])
+    shared = torch.full((rows, 1), E_ROUTED, dtype=torch.int64)
     return torch.cat([routed, shared], dim=1)
 
 
+def _cores():
+    return sorted(os.sched_getaffinity(0) & set(range(6, 18))) or sorted(os.sched_getaffinity(0))[:4]
+
+
+class _Model(nn.Module):
+    def __init__(self, layer):
+        super().__init__()
+        self.stage = layer
+
+
+def _prepared(bits, resident, monkeypatch, tmp_path):
+    """A prepared hybrid stage on a fresh registry; the caller closes the registry."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts.draft import DraftCpuExpertsRegistry
+    from sglang.srt.layers.quantization.exl3.draft_moe import prepare_dspark_draft_graph
+
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    registry = DraftCpuExpertsRegistry()
+    layer, method = _layer(bits, resident, monkeypatch, registry, tmp_path)
+    with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(",".join(map(str, _cores()))):
+        assert prepare_dspark_draft_graph(_Model(layer)) == 1
+    return layer, method, registry
+
+
+def _inputs(g, pattern, rows):
+    x = (torch.randn(rows, HIDDEN, generator=g) * 0.5).to(torch.bfloat16).cuda()
+    ids = _routes(pattern, g, rows).cuda()
+    weights = torch.rand(rows, TOPK + 1, generator=g).cuda()
+    return x, ids, weights
+
+
+@pytest.mark.parametrize("m", [1, 5, 16, 40])
 @pytest.mark.parametrize("resident", [[], [1, 5], list(range(E_ROUTED))], ids=["all-cpu", "hybrid", "all-gpu"])
 @pytest.mark.parametrize("pattern", ["independent", "shared"])
 @pytest.mark.parametrize("bits", [3, 4])
-def test_hybrid_draft_matches_the_gpu_loop(bits, pattern, resident, monkeypatch, tmp_path):
+def test_hybrid_draft_matches_the_gpu_loop(bits, pattern, resident, m, monkeypatch, tmp_path):
     from dataclasses import replace
 
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.moe.cpu_experts.draft import DraftCpuExpertsRegistry
     from sglang.srt.layers.quantization.exl3.ops import exl3_moe_loop
 
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
-    cores = sorted(os.sched_getaffinity(0) & set(range(6, 18))) or sorted(os.sched_getaffinity(0))[:4]
-    registry = DraftCpuExpertsRegistry()
-    layer, method = _layer(bits, resident, monkeypatch, registry, tmp_path)
+    layer, method, registry = _prepared(bits, resident, monkeypatch, tmp_path)
     g = torch.Generator().manual_seed(100 + bits)
-    x = (torch.randn(ROWS, HIDDEN, generator=g) * 0.5).to(torch.bfloat16).cuda()
-    ids = _routes(pattern, g).cuda()
-    weights = torch.rand(ROWS, TOPK + 1, generator=g).cuda()
+    x, ids, weights = _inputs(g, pattern, m)
 
     def gpu(t):
         return replace(t, trellis=t.trellis.cuda(), suh=t.suh.cuda(), svh=t.svh.cuda())
 
     w13 = [tuple(gpu(t) for t in pair) for pair in layer.exl3_w13]
     w2 = [gpu(t) for t in layer.exl3_w2]
-    with envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override(",".join(map(str, cores))):
-        try:
-            got = method._apply_cpu_draft(layer, x, weights, ids, LIMIT).float()
-            stats = registry.runtime().stats
-            skips = stats.skips
-        finally:
-            registry.close()
+    try:
+        got = method._apply_draft(layer, x, weights, ids, LIMIT).float()
+        torch.cuda.synchronize()
+        jobs = registry.runtime().stats()["jobs"]
+    finally:
+        registry.close()
     ref = exl3_moe_loop(x, weights, ids, w13, w2, LIMIT).float()
     rel = float((got - ref).norm() / ref.norm())
-    print(f"bits={bits} pattern={pattern} resident={len(resident)} rel_l2={rel:.4f} skips={skips}")
+    chunks = -(-m // layer.exl3_draft_moe.tokens)
+    print(f"bits={bits} pattern={pattern} resident={len(resident)} m={m} rel_l2={rel:.4f} jobs={jobs}")
     assert torch.isfinite(got).all()
     assert rel < 0.05
-    assert skips == (1 if len(resident) == E_ROUTED else 0)
+    assert jobs == (0 if len(resident) == E_ROUTED else chunks)
+
+
+def test_the_captured_hybrid_draft_matches_eager(monkeypatch, tmp_path):
+    layer, method, registry = _prepared(4, [1, 5], monkeypatch, tmp_path)
+    g = torch.Generator().manual_seed(7)
+    try:
+        x_s, ids_s, w_s = _inputs(g, "independent", 5)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            method._apply_draft(layer, x_s, w_s, ids_s, LIMIT)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out_s = method._apply_draft(layer, x_s, w_s, ids_s, LIMIT)
+        runtime = registry.runtime()
+        on_cpu = runtime.on_cpu[layer.exl3_cpu_draft_key]
+        for replay in range(5):
+            x_n, ids_n, w_n = _inputs(g, "independent" if replay % 2 else "shared", 5)
+            if replay == 3:
+                ids_n[:, :TOPK] = torch.tensor([1, 5, -1], device="cuda")  # resident and -1 only: nothing posted
+            x_s.copy_(x_n), ids_s.copy_(ids_n), w_s.copy_(w_n)
+            torch.cuda.synchronize()
+            before = runtime.stats()["jobs"]
+            graph.replay()
+            torch.cuda.synchronize()
+            posted = bool((runtime.cpu_slots(layer.exl3_cpu_draft_key, ids_n.cpu()) >= 0).any())
+            assert runtime.stats()["jobs"] - before == int(posted), replay
+            replayed = out_s.clone()
+            eager = method._apply_draft(layer, x_s, w_s, ids_s, LIMIT)
+            torch.cuda.synchronize()
+            assert torch.equal(replayed, eager), replay
+        assert on_cpu.any()
+    finally:
+        registry.close()
+
+
+def test_the_draft_path_reads_no_host(monkeypatch, tmp_path):
+    layer, method, registry = _prepared(4, [1, 5], monkeypatch, tmp_path)
+    try:
+        x, ids, w = _inputs(torch.Generator().manual_seed(3), "independent", 5)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            method._apply_draft(layer, x, w, ids, LIMIT)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+    finally:
+        registry.close()
