@@ -53,3 +53,21 @@ def test_warming_ignores_the_parents_conftest_default_variant(monkeypatch):
     fixtures.warm_host_modules()
     assert set(_loads(events)) == {("exl3", "prod", 8, 1)}
     assert ops._DEFAULT_VARIANT == "instr"  # restored
+
+
+def test_an_aborting_child_is_not_asked_to_write_a_core_file():
+    """Every service failure is a deliberate ``std::abort``. On divix01 ``core_pattern`` pipes to systemd-coredump with
+    ``ulimit -c unlimited``, and each of these children maps ~440 MB: under ``-n 8`` the dump outlasted the 60 s timeout
+    (observed 2026-10-04, with every JIT module already warm)."""
+    probe = subprocess.run(
+        [sys.executable, "-c", fixtures.NO_CORE_DUMP + "import resource; print(resource.getrlimit(resource.RLIMIT_CORE))"],
+        capture_output=True, text=True,
+    )
+    assert probe.stdout.strip() == "(0, 0)", probe
+
+
+def test_run_host_script_children_disable_core_dumps(monkeypatch, tmp_path):
+    events = _record(monkeypatch)
+    fixtures.run_host_script(tmp_path, "print('reached')")
+    script = next(args for kind, args in events if kind == "spawn")[0][2]
+    assert script.startswith(fixtures.NO_CORE_DUMP)
