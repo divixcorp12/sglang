@@ -6792,6 +6792,158 @@ N = 2/4/6. That gives:
 
 Build items 1-5 only if the projection beats it.
 
+### 33.4 The draft's experts: GPU resident set plus CPU (2026-10-02)
+
+Plans: `docs/superpowers/plans/2026-10-02-dsv41-dspark-cpu-draft.md` (all-CPU draft, superseded after its Task 1 and
+the routes probe) and `docs/superpowers/plans/2026-10-02-dsv41-dspark-hybrid-draft.md` (what was built). Branch
+`dsv41-dspark-cpu-draft`. The question: the resident draft holds 3 stages × 128 four-bit experts (6.75 GiB) that the
+target's hot cache could use. Can the CPU expert kernel compute some of them instead?
+
+**What was built.**
+- Each draft stage keeps a static top-N set of experts on the GPU. N comes from a calibration file
+  (`SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH`, written by `analysis/dsv41-drive/dspark/draft_resident_set.py`).
+- The other experts stay in host memory. A one-thread worker computes them on the CPU pool
+  (`cpu_experts/draft.py`, `CpuExpertPool.compute_rows`), bound to `SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES`. The
+  resident experts run on the GPU at the same time, and the two results are summed.
+- `SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS` turns it on. At launch, the gate requires DSpark, at least 2 cores,
+  `SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS` no larger than the core count, `EXL3_MOE_CPU_PIN=0`, and a well-formed
+  resident file (no stage longer than its `n`).
+- The file's stages are checked against the draft's at the first draft step. A stage the draft lacks, or a draft
+  stage the file lacks, is refused, as is an expert id outside the stage's routed experts.
+- A file calibrated on another checkpoint with the same shape is not detected. The only sign is a low share of
+  stage calls without CPU work in the `DSpark CPU experts:` log line.
+- Eager only, like the rest of DSpark (§33.3): routes are copied to the host, and `exl3_moe_accumulate`
+  synchronizes per expert.
+
+**Kernel benchmark** (`analysis/dsv41-drive/cpu-experts/draft_bench.py`, 12 threads, cores 18-29, NUMA node 1).
+Each cell is `draft_step_ms`: 3 stages × the median stage call, with the mean union in brackets.
+
+| bits | rows | independent routes (union) | shared routes (union 3) |
+|---|---|---|---|
+| 4 | 1 | 4.94 (3) | 5.02 |
+| 4 | 3 | 13.86 (8.8) | 7.85 |
+| 4 | 6 | 26.53 (17.1) | 14.46 |
+| 3 | 6 | 31.08 (17.1) | 15.87 |
+
+- The kernel reads an expert once per 2 rows routed to it (`CHUNK_M = 2`), at 0.52 ms per pass (4-bit).
+- The optimized `_resid_b128_cpu_v1` build is faster at 1 row but slower at 6: 30.9 vs 26.5 ms independent,
+  20.8 vs 14.5 ms shared. The draft uses the plain build, which is what `exl3_ext()` loads under DSpark.
+
+**Routes probe** (`SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH`, sessions 0-7, 128 tokens, 352 draft steps, accept 3.07;
+`cc-expert-prediction/analysis/dsv41-dspark/cpu-draft-routes/`).
+- Every draft call is 5 rows.
+- Mean union per stage: 9.25, 7.59 and 5.61 experts.
+- An all-CPU draft would cost 15.7 ms per draft step (p90 17.1). That is break-even against the ~13-18 ms the freed
+  VRAM is worth, so the all-CPU plan stopped there.
+- Hybrid estimate: top-N chosen on steps 1-176 and scored on 177-352.
+
+| N per stage | VRAM freed | CPU ms per draft step (mean / p90) |
+|---|---|---|
+| 16 | 5.9 GiB | 3.58 / 5.70 |
+| 32 | 5.1 GiB | 1.43 / 3.11 |
+| 48 | 4.3 GiB | 0.67 / 1.55 |
+
+**GPU parity** (`test/manual/dsv41/test_dspark_hybrid_draft_gpu.py`, 12 passed, at `af2414b762`). The table gives
+rel_l2 against `exl3_moe_loop`. The column is the number of the 8 routed experts kept on the GPU.
+
+| bits | pattern | 0 resident | 2 resident | 8 resident (CPU skipped) |
+|---|---|---|---|---|
+| 3 | independent | 0.0135 | 0.0124 | 0.0000 |
+| 3 | shared | 0.0129 | 0.0129 | 0.0000 |
+| 4 | independent | 0.0142 | 0.0119 | 0.0000 |
+| 4 | shared | 0.0117 | 0.0103 | 0.0000 |
+
+**Served A/B** (eager, held-out sessions 8-15, 128 tokens, EOS honoured, at `1f766ed58f`).
+- **Arms.**
+  - resident: `SGLANG_MOE_HOT_GPU_MB=7168`.
+  - hybrid: `12040`, top-32 per stage (`resident-top32.json` from the probe), CPU cores 18-29, 12 threads,
+    `[96, 96, 96]` experts on the CPU. Its draft loads at 2.34 GB against the resident arm's 6.82 GB.
+- **Commands.**
+  - Repeat 1, resident then hybrid: `AB_SKIP=8 AB_SESSIONS=8 AB_NEW_TOKENS=128 flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-17,30-63 python analysis/dsv41-drive/dspark/ab_cpu_draft.py $A/r1 resident hybrid`.
+  - Repeat 2: the same command with the arms reversed, into `$A/r2`.
+  - `A=cc-expert-prediction/analysis/dsv41-dspark/cpu-draft-ab`. Both exits were 0.
+
+| | resident r1 | hybrid r1 | resident r2 | hybrid r2 |
+|---|---|---|---|---|
+| decode tok/s, median of sessions | 2.10 | 2.22 | 2.14 | 2.23 |
+| accept length (tokens / verifies) | 2.26 | 2.22 | 2.26 | 2.22 |
+| TTFT, median | 20.9 s | 20.3 s | 20.9 s | 20.3 s |
+
+- **Paired ratio hybrid/resident** over 16 session pairs: median **1.117**. The hybrid wins **12 of 16**.
+  - r1: 0.94, 1.18, 1.13, 0.82, 1.13, 1.12, 1.15, 1.12.
+  - r2: 1.00, 1.16, 1.12, 0.76, 1.11, 1.06, 1.18, 1.11.
+  - Session 11 loses in both repeats (0.82 and 0.76).
+- **Accept length** agrees within noise, 2.22 vs 2.26. The draft's CPU path quantizes activations, so outputs
+  diverge after a while: 853 vs 930 tokens, with EOS honoured. Each arm is deterministic across repeats.
+- **TTFT** is 3% better in the hybrid arm. No prefill-sized draft forward reached the CPU.
+- **CPU work**, from the last stats line of each hybrid log:
+  - 900 stage calls, of which 505 (56%) had every expert resident and did no CPU work.
+  - A CPU call averaged 2.77 / 2.31 ms (r1 / r2), p90 3.83 / 2.87 ms, union 1.8.
+  - That is ≈3.0-3.7 ms of CPU per draft step against the 1.43 ms estimate. 1.8 passes × 0.52 ms is 0.94 ms, so
+    about 1.4-1.8 ms per call is fixed overhead: host copy of the routes, the thread handoff and the result copy.
+    It overlaps the resident GPU experts, so it costs less than its wall time.
+
+**Verdict: win, at the plan's threshold.** The median paired ratio is above 1 and the wins are exactly 12/16. The
+4.9 GiB moved from the draft to the target's hot cache is worth ~11% decode throughput under eager DSpark.
+
+This does not make DSpark worth shipping. Both arms run at ~2.2 tok/s, far below the production non-spec path's
+~13.5 tok/s with CPU experts (§30.1). The A/B measures the draft's VRAM trade, not whether DSpark ships.
+
+The static resident set and `compute_rows` carry over to a graphed path. The worker thread and the per-expert syncs
+do not.
+
+**Two fixes found on the way.**
+- **Master bug:** `ExpertPinnedHostCacheManager.from_model` ran the NUMA capacity check before returning `None`
+  for a model with no streamed experts. The DSpark draft runner therefore asked for a second pinned tier and refused
+  any launch that sets `SGLANG_MOE_PINNED_HOST_NUMA_MB`. Fixed in `d40d781771`.
+- **Branch fix:** the loader's post-load staging (`stage_module_for_post_load`) moved CPU-placed draft experts to
+  the GPU anyway. The hybrid arm's first smoke still used 6.84 GB and ran out of KV memory. The params now carry
+  `_sglang_skip_device_loading` (`1f766ed58f`).
+
+**Rerun on `numa-node-distributor` (2026-10-05).** Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-port.md`,
+branch `dsv41-dspark` at `1636e58758`. The hybrid draft was ported onto the NUMA-distributed CPU experts. Three things
+differ from the run above:
+- The draft runs the optimized EXL3 CPU build. It is now the only `CpuExpertKernel`, and the gate requires its
+  `SGLANG_EXL3_CPU_ACT_RESIDUAL=1` and `SGLANG_EXL3_CPU_ACT_BLOCK=128`. The plain build that §33.4 used benched faster
+  at 6 rows.
+- The draft runs on cores 6-17 (NUMA node 0) instead of 18-29. Target CPU experts are off under DSpark, so node 0's
+  CPU-expert cores are free.
+- `draft_bench.py` was not ported. It called the Python CPU forward that this branch deletes.
+
+Tests on divix01 at `27688b47bd`:
+- The registered selection: 196 passed.
+- `test/manual/dsv41/test_cpu_expert_engines_exl3.py`: 7 passed. The m-row results are bit-exact against the
+  production kernel.
+- `test_dspark_hybrid_draft_gpu.py`: 12 passed, with rel_l2 0.0032-0.0127.
+
+Served A/B, same protocol (held-out sessions 8-15, 128 tokens, r1 resident then hybrid, r2 reversed):
+- Command: `analysis/dsv41-drive/dspark/ab_cpu_draft.py` under `flock rowimg-disk.lock flock cc-gpu.lock taskset -c
+  0-5,18-63`.
+- Outputs: `cc-expert-prediction/analysis/dsv41-dspark/port/{smoke,r1,r2}`.
+- All exits were 0.
+
+| | resident r1 | hybrid r1 | resident r2 | hybrid r2 |
+|---|---|---|---|---|
+| decode tok/s, median of sessions | 1.87 | 1.96 | 1.88 | 1.95 |
+| accept length (tokens / verifies) | 2.26 (930 / 411) | 2.37 (902 / 380) | 2.26 | 2.37 |
+| TTFT, median | 26.2 s | 26.6 s | 25.8 s | 27.5 s |
+
+- **Paired ratio hybrid/resident:** median **1.111**. The hybrid wins **14 of 16** pairs, against 1.117 and 12/16
+  above.
+  - r1: 1.08, 0.84, 1.12, 1.08, 1.17, 1.10, 1.16, 1.14.
+  - r2: 1.00, 1.13, 1.13, 0.94, 1.17, 1.11, 1.10, 1.12.
+  - Session 11 no longer loses in both repeats.
+- **CPU work:** 900 stage calls, of which 484 (54%) did no CPU work. The last 114 CPU calls averaged 1.69 / 1.97 ms
+  (r1 / r2), p90 2.77 / 3.25 ms, union 1.9. That is faster than the 2.77 / 2.31 ms above despite the slower build at
+  6 rows: draft calls carry 1.9 rows per expert pass.
+- **Accept length:** the hybrid accepts 2.37 against 2.22 above. This is still the activation-quantization divergence,
+  now with the optimized build's arithmetic.
+- **Open item, not explained:** both arms are slower in absolute terms than above, by 11% on decode (1.87-1.96 vs
+  2.10-2.22 tok/s) and 25% on TTFT (26 vs 20.9 s). Both arms share the slowdown, so the ratio stands. The base
+  branch and the process mask (`0-5,18-63` against `0-17,30-63`) both changed, and neither was isolated.
+
+**Verdict:** the VRAM trade reproduces on `numa-node-distributor`, at +11% decode under eager DSpark.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
