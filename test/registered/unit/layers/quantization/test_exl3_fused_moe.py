@@ -214,6 +214,13 @@ def test_fused_moe_refuses_more_tokens_than_its_buffers(monkeypatch, m):
         fused.run(torch.ones((m, 8)), torch.ones(6 * m), torch.zeros(6 * m, dtype=torch.long), torch.ones(1), 10.0)
 
 
+@pytest.mark.parametrize("tokens", [0, 17])
+def test_fused_moe_refuses_more_tokens_than_its_row_tile(monkeypatch, tokens):
+    # Past 16, a slot shared by every token is skipped by exllamav3 and its stale scratch is summed: no error.
+    with pytest.raises(ValueError, match="row tile"):
+        _fused(monkeypatch, tokens=tokens)
+
+
 def test_fused_moe_refuses_cpu_experts_for_several_tokens(monkeypatch):
     fused, _ = _fused(monkeypatch, tokens=2)
     with pytest.raises(RuntimeError, match="one token"):
