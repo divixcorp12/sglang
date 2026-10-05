@@ -10,6 +10,7 @@ that the native CPU expert thread calls without Python.
 
 import ctypes
 import os
+import struct
 from typing import Any, Mapping, Optional
 
 import torch
@@ -18,6 +19,7 @@ from sglang.srt.layers.moe.cpu_experts.pool import (
     CPU_EXPERTS_LAYER_ABI_VERSION,
     CpuExpertsLayer,
 )
+from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 
 
@@ -59,14 +61,9 @@ class Exl3CpuQuantTrait:
         """The hidden size, read off the gate's input sign vector."""
         return int(slabs["w13_suh"].shape[-1])  # the gate's input sign vector
 
-    def register_layer(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> int:
-        """Register one layer's first ``capacity`` slab rows with the kernel, by base pointer.
-
-        The kernel addresses slot ``s`` of each slab at its base plus ``s`` rows, so each slab must be a contiguous
-        CPU tensor of at least ``capacity`` rows of the format's row size; the trait keeps the tensors alive until
-        ``free_layer``. Returns the kernel's layer handle. Raises if the activation limit is not known yet, if a slab
-        would be misaddressed, or if the kernel refuses the registration.
-        """
+    def _dims(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> tuple[int, int, int]:
+        """``(hidden, intermediate, bits)`` of a layer whose first ``capacity`` slab rows the kernel can address;
+        raises if the activation limit is not known yet or a slab would be misaddressed."""
         if self.act_limit is None:
             raise ValueError(
                 "the EXL3 CPU kernel needs the layers' activation limit before a layer registers"
@@ -98,6 +95,43 @@ class Exl3CpuQuantTrait:
                     f"EXL3 slab {name} {tuple(slab.shape)} {slab.dtype} is not {capacity} contiguous CPU rows of "
                     f"{row[name]} {dtype} elements"
                 )
+        return hidden, intermediate, bits
+
+    def kernel_address(self) -> int:
+        """The address of the extension's EXL3 CpuExpertKernel (its torch op ``sglang_exl3_cpu::kernel_address``)."""
+        try:
+            return int(torch.ops.sglang_exl3_cpu.kernel_address())
+        except (AttributeError, RuntimeError) as error:
+            raise RuntimeError(
+                f"the EXL3 extension {self.ext.__file__} has no sglang_exl3_cpu::kernel_address: CPU experts need the "
+                "optimized CPU kernel, which SGLANG_DSV41_CPU_EXPERTS=1 builds (csrc/exl3/optimized)"
+            ) from error
+
+    def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
+        """The layer's six slabs by base pointer and row size, and ``SglangExl3CpuParams``' bytes ({bits, swizzled})."""
+        hidden, intermediate, bits = self._dims(slabs, capacity)
+        views = [slabs[name] for name in self.slab_names]
+        return CpuExpertLayerSpec(
+            capacity=capacity,
+            hidden=hidden,
+            intermediate=intermediate,
+            act_limit=float(self.act_limit),
+            # One slot's row: the slab is contiguous (checked), so this is its stride(0), which PyTorch does not keep
+            # meaningful for a one-slot slab.
+            slabs=tuple((v.data_ptr(), v[0].numel() * v.element_size()) for v in views),
+            params=struct.pack("<ii", bits, int(self.swizzled)),
+            keep=tuple(views),
+        )
+
+    def register_layer(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> int:
+        """Register one layer's first ``capacity`` slab rows with the kernel, by base pointer.
+
+        The kernel addresses slot ``s`` of each slab at its base plus ``s`` rows, so each slab must be a contiguous
+        CPU tensor of at least ``capacity`` rows of the format's row size; the trait keeps the tensors alive until
+        ``free_layer``. Returns the kernel's layer handle. Raises if the activation limit is not known yet, if a slab
+        would be misaddressed, or if the kernel refuses the registration.
+        """
+        hidden, intermediate, bits = self._dims(slabs, capacity)
         params = Exl3CpuParams(bits=bits, swizzled=int(self.swizzled))
         layer = CpuExpertsLayer(
             abi_version=CPU_EXPERTS_LAYER_ABI_VERSION,

@@ -7,6 +7,7 @@ keep-warm and engines) that the native CPU expert thread calls without Python.
 """
 
 import ctypes
+import struct
 from typing import Mapping, Optional, Sequence
 
 import torch
@@ -17,6 +18,7 @@ from sglang.srt.layers.moe.cpu_experts.pool import (
     CpuExpertsForwardCall,
     CpuExpertsLayer,
 )
+from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 
 # The descriptor's required slabs, in cpu_experts_cabi.h order: packed E2M1 weights, 128x4-swizzled E4M3 scales, FP32
 # alphas per slot. Its seventh, up_alpha, is optional (up shares gate_alpha without it), so it is not a pool slab name.
@@ -43,7 +45,8 @@ class Nvfp4CpuQuantTrait:
     for alternating 64-row [up, gate] chunks. ``inv_input_scale13``/``inv_input_scale2`` cancel activation scales
     folded into GPU GEMM alphas (1 for weight-only alphas). ``act_limit`` 0 means no SwiGLU clamp; ``None`` lets the
     RAM-miss service fill it in at the first registration. ``library`` is
-    the loaded kernel, by default ``nvfp4_cpu_library()``.
+    the kernel's C ABI through ctypes, by default ``nvfp4_cpu_library()`` on first use; ``module`` is the library loaded
+    with tvm-ffi, by default ``nvfp4_cpu_module()``.
     """
 
     name = "nvfp4"
@@ -61,6 +64,7 @@ class Nvfp4CpuQuantTrait:
         inv_input_scale13: float = 1.0,
         inv_input_scale2: float = 1.0,
         library: Optional[ctypes.CDLL] = None,
+        module=None,
     ):
         self.hidden = hidden
         self.intermediate = intermediate
@@ -68,11 +72,8 @@ class Nvfp4CpuQuantTrait:
         self.w13_layout = w13_layout
         self.inv_input_scale13 = inv_input_scale13
         self.inv_input_scale2 = inv_input_scale2
-        if library is None:
-            from sglang.srt.layers.quantization.nvfp4.ext import nvfp4_cpu_library
-
-            library = nvfp4_cpu_library()
-        self.library = library
+        self._library = library
+        self.module = module
         self._slabs: dict[int, list] = {}
 
     def check_environment(self) -> None:
@@ -82,14 +83,19 @@ class Nvfp4CpuQuantTrait:
         """The hidden size, as configured (NVFP4 slabs do not encode it)."""
         return self.hidden
 
-    def register_layer(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> int:
-        """Register one layer's first ``capacity`` slab rows with the kernel, by base pointer.
+    @property
+    def library(self) -> ctypes.CDLL:
+        """The kernel's C ABI through ctypes, loaded on first use (only register_layer, forward, free_layer and the
+        native_* methods use it)."""
+        if self._library is None:
+            from sglang.srt.layers.quantization.nvfp4.ext import nvfp4_cpu_library
 
-        Each slab must be a contiguous CPU tensor of at least ``capacity`` rows; an ``up_alpha`` slab is optional. The
-        trait keeps the tensors alive until ``free_layer``. Returns the kernel's layer handle. Raises if the
-        activation limit is not known yet, a slab is misaddressed, or the kernel refuses the registration (which it
-        does for a slot stride too small for the layer's shape).
-        """
+            self._library = nvfp4_cpu_library()
+        return self._library
+
+    def _checked(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> tuple[str, ...]:
+        """The slab names present (with ``up_alpha`` when given), each checked as ``capacity`` contiguous CPU rows;
+        raises if the activation limit is not known yet or a slab is misaddressed."""
         if self.act_limit is None:
             raise ValueError("the NVFP4 CPU kernel needs the layers' activation limit before a layer registers")
         names = self.slab_names + ((_UP_ALPHA,) if _UP_ALPHA in slabs else ())
@@ -98,6 +104,40 @@ class Nvfp4CpuQuantTrait:
             if slab is None or slab.device.type != "cpu" or not slab.is_contiguous() or slab.shape[0] < capacity:
                 shape = None if slab is None else tuple(slab.shape)
                 raise ValueError(f"NVFP4 slab {name} {shape} is not {capacity} contiguous CPU rows")
+        return names
+
+    def kernel_address(self) -> int:
+        """The address of the library's NVFP4 CpuExpertKernel (its tvm-ffi export ``nvfp4_cpu_kernel_address``)."""
+        if self.module is not None:
+            return int(self.module.nvfp4_cpu_kernel_address())
+        from sglang.srt.layers.quantization.nvfp4.ext import nvfp4_cpu_kernel_address
+
+        return nvfp4_cpu_kernel_address()
+
+    def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
+        """The seven slabs (up_alpha (0, 0) when absent) and ``SglangNvfp4CpuParams``' bytes."""
+        names = self._checked(slabs, capacity)
+        views = [slabs[name] for name in names]
+        pairs = [(v.data_ptr(), v[0].numel() * v.element_size()) for v in views]
+        return CpuExpertLayerSpec(
+            capacity=capacity,
+            hidden=self.hidden,
+            intermediate=self.intermediate,
+            act_limit=float(self.act_limit),
+            slabs=tuple(pairs + [(0, 0)] * (len(self.slab_names) + 1 - len(pairs))),
+            params=struct.pack("<iff", self.w13_layout, self.inv_input_scale13, self.inv_input_scale2),
+            keep=tuple(views),
+        )
+
+    def register_layer(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> int:
+        """Register one layer's first ``capacity`` slab rows with the kernel, by base pointer.
+
+        Each slab must be a contiguous CPU tensor of at least ``capacity`` rows; an ``up_alpha`` slab is optional. The
+        trait keeps the tensors alive until ``free_layer``. Returns the kernel's layer handle. Raises if the
+        activation limit is not known yet, a slab is misaddressed, or the kernel refuses the registration (which it
+        does for a slot stride too small for the layer's shape).
+        """
+        names = self._checked(slabs, capacity)
         params = Nvfp4CpuParams(
             w13_layout=self.w13_layout,
             inv_input_scale13=self.inv_input_scale13,

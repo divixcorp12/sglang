@@ -17,6 +17,8 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 
 import torch
 
+from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
+
 
 CPU_EXPERTS_FORWARD_ABI_VERSION = 2
 
@@ -89,6 +91,14 @@ class CpuExpertQuantTrait(Protocol):
 
     def hidden_size(self, slabs: Mapping[str, torch.Tensor]) -> int:
         """The hidden size (length of x and out), as the layer's slabs encode it."""
+        ...
+
+    def kernel_address(self) -> int:
+        """The address of the format's ``CpuExpertKernel`` (``expert_stream/host/cpu_experts/kernel.hpp``)."""
+        ...
+
+    def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> "CpuExpertLayerSpec":
+        """One layer's first ``capacity`` slab rows, checked, as the kernel's ``make_layer`` takes them."""
         ...
 
     def register_layer(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> Any:

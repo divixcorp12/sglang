@@ -32,6 +32,8 @@ _EXTRA_CUDA_CFLAGS = [
 _CSRC = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../../kernels/jit/csrc/exl3"))
 VENDORED_CPU_KERNEL = os.path.join(_CSRC, "moe_mul1.cpp")
 OPTIMIZED_CPU_KERNEL = os.path.join(_CSRC, "optimized", "kernel.cpp")
+# The torch op sglang_exl3_cpu::kernel_address: the optimized extension hands its CpuExpertKernel to Python.
+OPTIMIZED_TORCH_OPS = os.path.join(_CSRC, "optimized", "torch_ops.cpp")
 _UPSTREAM_CPU_KERNEL = os.path.join("cpu", "moe_mul1.cpp")
 
 
@@ -156,7 +158,8 @@ def exl3_ext():
             name="sglang_exl3_ext" + flavor,
             sources=extension_sources(
                 ext_dir, OPTIMIZED_CPU_KERNEL if optimized else VENDORED_CPU_KERNEL if flavor else None
-            ),
+            )
+            + ([OPTIMIZED_TORCH_OPS] if optimized else []),
             # The generic vendored kernel uses the upstream CPU header; optimized has its own.
             extra_include_paths=[ext_dir] + ([os.path.join(ext_dir, "cpu")] if flavor else []),
             extra_cflags=_EXTRA_CFLAGS

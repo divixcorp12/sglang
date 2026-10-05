@@ -1,4 +1,5 @@
-"""The NVFP4 CPU expert library, built on first use by quantization/nvfp4/build.py.
+"""The NVFP4 CPU expert library, built on first use by quantization/nvfp4/build.py, loaded with tvm-ffi (its one
+export hands out the kernel's address) and, until the C ABI is gone, with ctypes.
 
 The library is cached under ``build_dir`` by a hash of its sources, the build flags and the compiler's version, so an
 edit or a compiler change builds a new one; a file lock keeps concurrent processes from building the same one twice.
@@ -43,8 +44,11 @@ def _sources() -> list[Path]:
 
 def library_path(build_dir: Path, cxx: str) -> Path:
     """Where the library for the current sources, flags and compiler lives."""
+    import tvm_ffi
+
     build = _build_module()
     digest = hashlib.sha256()
+    digest.update(tvm_ffi.__version__.encode())
     digest.update(subprocess.check_output([cxx, "--version"]))
     digest.update(" ".join(build.CXX_FLAGS + build.C_FLAGS + build.ARCH_FLAGS).encode())
     for path in _sources():
@@ -53,9 +57,8 @@ def library_path(build_dir: Path, cxx: str) -> Path:
     return build_dir / f"libsglang_nvfp4_cpu_{digest.hexdigest()[:16]}.so"
 
 
-@functools.cache
-def nvfp4_cpu_library(build_dir: Optional[str] = None) -> ctypes.CDLL:
-    """The native library (built here first if needed), exporting the cpu_experts_cabi.h functions."""
+def nvfp4_cpu_library_path(build_dir: Optional[str] = None) -> Path:
+    """The built library's path (built here first if needed)."""
     cxx = os.environ.get("CXX", "g++")
     root = Path(os.path.expanduser(build_dir or _DEFAULT_BUILD_DIR))
     root.mkdir(parents=True, exist_ok=True)
@@ -65,4 +68,25 @@ def nvfp4_cpu_library(build_dir: Optional[str] = None) -> ctypes.CDLL:
             partial = path.with_name(f"{path.stem}.{os.getpid()}.partial.so")
             _build_module().build(partial, cxx=cxx)
             os.replace(partial, path)
-    return ctypes.CDLL(str(path))
+    return path
+
+
+@functools.cache
+def nvfp4_cpu_module(build_dir: Optional[str] = None):
+    """The library as a tvm-ffi module. Cached for the process: a host holds its kernel's address, so the module is
+    never unloaded."""
+    from tvm_ffi import load_module
+
+    return load_module(str(nvfp4_cpu_library_path(build_dir)))
+
+
+def nvfp4_cpu_kernel_address(build_dir: Optional[str] = None) -> int:
+    """The address of the library's CpuExpertKernel, for ExpertStreamHost.enable_cpu_experts."""
+    return int(nvfp4_cpu_module(build_dir).nvfp4_cpu_kernel_address())
+
+
+@functools.cache
+def nvfp4_cpu_library(build_dir: Optional[str] = None) -> ctypes.CDLL:
+    """The native library through ctypes, exporting the cpu_experts_cabi.h functions (until Task 9 of plan
+    2026-10-04-cpu-expert-kernel-interface)."""
+    return ctypes.CDLL(str(nvfp4_cpu_library_path(build_dir)))

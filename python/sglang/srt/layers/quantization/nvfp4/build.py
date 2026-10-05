@@ -4,6 +4,8 @@ The kernel is optimized/kernel.cpp plus the vendored GGML C subset (../upstream/
 C's implicit void* conversions). -ffp-contract=off is part of the arithmetic contract: never build it with -Ofast.
 One build holds every ISA tier (scalar, and AVX2 by function attribute) and picks one at run time, so it runs on any
 x86-64 host; NVFP4_CPU_MAX_ISA=scalar caps the tier and NVFP4_CPU_REPORT_ISA=1 prints the one chosen.
+The shared library also links tvm-ffi for its one export (optimized/ffi.cpp: the kernel's address); a harness
+executable (``main``) calls the kernel accessor itself and links neither.
 """
 from __future__ import annotations
 
@@ -23,6 +25,15 @@ C_FLAGS = ["-x", "c", "-std=c11", "-O3", "-ffp-contract=off", "-fPIC"]
 ARCH_FLAGS = ["-march=x86-64", "-mtune=generic"]
 
 
+def tvm_ffi_flags() -> list[str]:
+    """Include and link flags for tvm-ffi, located as the JIT locates them (jit/utils/compile/toolchain.tvm_ffi_paths)."""
+    from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path, find_libtvm_ffi
+
+    lib = Path(find_libtvm_ffi())
+    includes = dict.fromkeys([find_include_path(), find_dlpack_include_path()])
+    return [f"-I{p}" for p in includes] + [f"-L{lib.parent}", f"-l{lib.stem.removeprefix('lib')}"]
+
+
 def build(
     output: Path,
     *,
@@ -37,8 +48,9 @@ def build(
     with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
         c_object = Path(tmp) / "nvfp4.o"
         subprocess.run([cxx, *C_FLAGS, *common, "-c", str(UPSTREAM / "nvfp4.c"), "-o", str(c_object)], check=True)
-        sources = [str(SRC / "kernel.cpp")] + ([str(Path(main).resolve())] if main else [])
-        link = [] if main else ["-shared"]
+        sources = [str(SRC / "kernel.cpp")] + ([str(Path(main).resolve())] if main else [str(SRC / "ffi.cpp")])
+        # The tvm-ffi includes ride in link: one command compiles and links.
+        link = [] if main else ["-shared", *tvm_ffi_flags()]
         subprocess.run(
             [cxx, *CXX_FLAGS, *common, "-I", str(SRC), *sources, str(c_object), *link, "-o", str(output)], check=True
         )
