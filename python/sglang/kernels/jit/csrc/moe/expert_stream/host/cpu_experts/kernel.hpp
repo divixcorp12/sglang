@@ -84,7 +84,8 @@ class CpuExpertKernel {
   // workers to cores.
   virtual void forward(const CpuExpertLayer&, const ForwardCall&) const = 0;
   // Register-only work at the forward's vector width on `threads` workers pinned to cores, until *word != seen or
-  // CLOCK_MONOTONIC reaches deadline_ns (keep_warm.hpp). Throws on a bad argument.
+  // CLOCK_MONOTONIC reaches deadline_ns (keep_warm.hpp). The cores are not checked (in range, distinct): the caller
+  // passes cores it has checked, as forward's. Throws for no worker, no word or more workers than cores.
   virtual void keep_warm(std::span<const int> cores, int32_t threads, const uint32_t* word, uint32_t seen,
                          int64_t deadline_ns) const = 0;
 };

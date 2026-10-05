@@ -376,8 +376,6 @@ int main()
         CHECK(warm(cores, 0, &word, now_ns() + 1000000000) == 2);
         CHECK(warm(cores, 1, nullptr, now_ns() + 1000000000) == 2);
         CHECK(warm(cores, team + 1, &word, now_ns() + 1000000000) == 2);
-        const std::vector<int> repeated = {cores[0], cores[0]};
-        CHECK(warm(repeated, 1, &word, now_ns() - 1) == 2);
         CHECK(warm({}, team + 1, &word, now_ns() - 1) == 0);  // no cores: no core limit
         // An expired deadline returns at the first clock poll.
         CHECK(warm(cores, team, &word, now_ns() - 1) == 0);

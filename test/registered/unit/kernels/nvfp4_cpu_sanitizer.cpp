@@ -152,6 +152,4 @@ int main() {
     const uint32_t word = 1;
     assert(status_of([&] { kernel.keep_warm({}, 2, &word, 0, INT64_MAX); }) == 0);
     assert(status_of([&] { kernel.keep_warm({}, 0, &word, 0, INT64_MAX); }) == 2);
-    const int twice[2] = {0, 0};
-    assert(status_of([&] { kernel.keep_warm(twice, 1, &word, 0, INT64_MAX); }) == 2);  // a repeated core
 }

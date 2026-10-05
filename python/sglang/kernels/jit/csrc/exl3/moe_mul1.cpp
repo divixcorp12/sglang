@@ -1986,13 +1986,6 @@ static void pool_stress_fn(void* c, int idx, int nw)
 
 
 // -------------------------------------------------------------------------------------------
-//   MoE Layer registry
-// -------------------------------------------------------------------------------------------
-
-std::vector<MoeCpuLayer*> g_layers;
-std::mutex g_layers_mutex;
-
-// -------------------------------------------------------------------------------------------
 //   Forward driver
 // -------------------------------------------------------------------------------------------
 
@@ -2420,26 +2413,19 @@ int64_t exl3_moe_cpu_make_layer
     TORCH_CHECK(layer->downs[0].k == layer->interm_size && layer->downs[0].n == layer->hidden_size,
                 "expert shape mismatch");
 
-    std::lock_guard<std::mutex> lock(g_layers_mutex);
-    g_layers.push_back(layer);
-    return static_cast<int64_t>(g_layers.size() - 1);
+    // sglang: the handle is the layer's address, owned by the caller until free_layer; no registry and no lock.
+    return reinterpret_cast<int64_t>(layer);
 }
 
 void exl3_moe_cpu_free_layer(int64_t handle)
 {
-    std::lock_guard<std::mutex> lock(g_layers_mutex);
-    if (handle >= 0 && handle < static_cast<int64_t>(g_layers.size()))
-    {
-        delete g_layers[handle];
-        g_layers[handle] = nullptr;
-    }
+    delete reinterpret_cast<MoeCpuLayer*>(handle);
 }
 
+// sglang: an unknown or freed handle is undefined (no registry to look it up in).
 static const MoeCpuLayer* get_layer(int64_t handle)
 {
-    std::lock_guard<std::mutex> lock(g_layers_mutex);
-    TORCH_CHECK(handle >= 0 && handle < static_cast<int64_t>(g_layers.size()) && g_layers[handle], "invalid CPU MoE layer handle");
-    return g_layers[handle];
+    return reinterpret_cast<const MoeCpuLayer*>(handle);
 }
 
 // Exported pool self-test (helpers above live in the anonymous namespace of this TU)
