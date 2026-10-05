@@ -15,7 +15,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, paused, ram_miss_setup, warm_host_modules
+from sglang.test.dsv41_ram_miss_fixtures import NO_CORE_DUMP, assert_aborted, paused, ram_miss_setup, warm_host_modules
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -217,7 +217,7 @@ def _run_child(script, tmp_path, timeout):
     """``script`` in a fresh interpreter, its host modules warmed here first: a cold compile in the child would count
     against its timeout."""
     warm_host_modules("instr", nodes=2)
-    return subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run([sys.executable, "-c", NO_CORE_DUMP + script, str(tmp_path)], capture_output=True, text=True, timeout=timeout)
 
 
 _SCRIPT = """

@@ -268,7 +268,12 @@ def warm_host_modules(variant: Optional[str] = None, *, lanes: int = 8, nodes: i
     ops._host_module("exl3", variant or child_default, lanes, nodes)
 
 
-_HOST_SCRIPT_HEAD = f"""
+# First line of a child that is meant to abort: every service failure is a deliberate ``std::abort``, and on divix01
+# ``core_pattern`` pipes to systemd-coredump with ``ulimit -c unlimited``, so each such child spent longer than its
+# 60 s timeout writing a ~440 MB core under ``pytest -n 8`` (2026-10-04). The limit is read at crash time.
+NO_CORE_DUMP = "import resource; resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+
+_HOST_SCRIPT_HEAD = NO_CORE_DUMP + f"""
 import pathlib, sys, time
 import torch
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
