@@ -1982,7 +1982,7 @@ class Envs:
     # How long after that window the idle CPU expert thread keeps holding its workers in PAUSE before it releases them
     # (to OpenMP's idle wait) and sleeps on a futex until the next job. -1: never release, so the cores stay busy and
     # no job waits for a worker to wake.
-    SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US = EnvInt(50_000)
+    SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US = EnvInt(100_000)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

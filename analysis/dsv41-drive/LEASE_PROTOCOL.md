@@ -31,7 +31,7 @@ constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/ex
   doorbell that every submit and `stop()` ring (a syscall only while it sleeps); -1 never sleeps.
 - **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row. Between jobs it
   holds its OpenMP team in the kernel's keep-warm (register work for `SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US`, then
-  PAUSE) until the next submit or, `SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US` (default 50 ms) after the warm window,
+  PAUSE) until the next submit or, `SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US` (default 100 ms) after the warm window,
   releases the team and sleeps on its futex doorbell until the next submit; -1 never releases it.
 - **Watchdog** (`host/ram_thread.h`, `watch`). Samples every 20 ms; aborts on a busy episode held past `fatal_wait` or
   a gate held closed past the copy-wait timeout.
