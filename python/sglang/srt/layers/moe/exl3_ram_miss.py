@@ -402,6 +402,11 @@ class NativePinnedSlotTable:
         self.capacity = int(capacity)
 
     @property
+    def reserved_rows(self) -> int:
+        """The row's staging slots: the service's lanes own them, so ``assign`` never hands one out."""
+        return self.service.staging_for(self.capacity)
+
+    @property
     def _row(self) -> int:
         self.service.ensure_started()
         return self.service.row_of(self.layer_id)

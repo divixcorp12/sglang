@@ -376,10 +376,14 @@ class ExpertPinnedHostCache:
         quarantine_host_slabs(self.tensors.values())
 
     def evictable_rows(self) -> int:
-        """Slots a request can use: capacity minus residents ``is_pinned`` protects."""
+        """Slots a request can use: capacity minus the table's reserved slots and the residents ``is_pinned`` protects.
+
+        A native table reserves each row's staging slots for the in-graph miss lanes; no read admits an expert there.
+        """
+        room = self.capacity - getattr(self._lru, "reserved_rows", 0)
         if self.is_pinned is None:
-            return self.capacity
-        return self.capacity - sum(
+            return room
+        return room - sum(
             1 for expert_id in self._lru.expert_to_slot if self.is_pinned(expert_id)
         )
 

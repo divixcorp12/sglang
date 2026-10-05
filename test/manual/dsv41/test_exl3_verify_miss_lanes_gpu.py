@@ -55,13 +55,13 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
             layer = torch.nn.Module()
             layer.layer_id, layer.top_k = 0, TOP_K
             fmt = Exl3ExpertFormat(layout, 0, source_root=str(tmp_path))
-            # The eager staging bound: this test runs no eager gather, and the inclusive tier holds
-            # 3 * LANES - max_gather_rows hot slots, so the miss width leaves the 2 * LANES DIRECT needs.
+            # The eager staging bound. The tier holds the 2 * LANES hot rows DIRECT needs, the row's LANES staging
+            # slots, and LANES free rows the eager re-run of an overflowed verify stages its misses in.
             fmt.max_gather_rows = LANES
             streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
             layer._nvfp4_expert_streamer = streamer
             model.add_module("expert_layer", layer)
-            ExpertPinnedHostCache(streamer, 3 * LANES, **fmt.pinned_tier_options(layer))
+            ExpertPinnedHostCache(streamer, 4 * LANES, **fmt.pinned_tier_options(layer))
             manager = ExpertHotCacheManager.from_model(
                 model, budget_bytes=2 * LANES * streamer.bytes_per_expert,
                 seed_path=None, dynamic=True, update_prefill_tokens=16,
