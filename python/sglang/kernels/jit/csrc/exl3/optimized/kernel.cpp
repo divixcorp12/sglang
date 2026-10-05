@@ -167,10 +167,14 @@ int64_t exl3_moe_cpu_make_layer
                 "expert shape mismatch");
 
     // A table layer: ExpertForward refuses a slot at or past its expert count, as it does a slab layer's capacity.
-    const ::sglang::exl3_cpu::LayerInfo info{table->num_experts, table->hidden_size, table->interm_size,
-                                             !table->gates.empty(), table->activation, table->act_limit};
-    Exl3Quant::Layer layer{info, {}, 0, 0, std::move(table)};
-    layer.rows.capacity = info.num_experts;
+    ::sglang::cpu_experts::LayerSlabs shape;
+    shape.capacity = table->num_experts;
+    shape.hidden = table->hidden_size;
+    shape.intermediate = table->interm_size;
+    shape.activation = table->activation;
+    shape.act_limit = table->act_limit;
+    const bool gated = !table->gates.empty();
+    Exl3Quant::Layer layer{shape, gated, 0, 0, std::move(table)};
     const auto& kernel = static_cast<const Exl3Forward&>(::sglang::exl3_cpu::exl3_cpu_kernel());
     std::shared_ptr<const ::sglang::cpu_experts::CpuExpertLayer> wrapped = kernel.wrap(std::move(layer));
     std::lock_guard<std::mutex> lock(g_table_mutex);

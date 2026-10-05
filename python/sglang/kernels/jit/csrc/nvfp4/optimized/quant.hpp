@@ -32,7 +32,7 @@ struct SglangNvfp4CpuParams {
 };
 
 namespace sglang::nvfp4_cpu {
-// Internal linkage, like the framework: Nvfp4Quant's Layer embeds MoeBufferRows, which has it.
+// Internal linkage, like the framework's templates: each library's translation unit owns its state.
 namespace {
 using namespace ::sglang::cpu_experts;
 
@@ -43,19 +43,6 @@ inline size_t sf_index(int row, int group, int groups) {
     return (((size_t(row / 128) * tiles_k + group / 4) * 32 + row % 32) * 4
             + (row % 128) / 32) * 4 + group % 4;
 }
-
-// What a forward needs to know about a layer besides its slabs: the descriptor's and SglangNvfp4CpuParams' scalars.
-struct LayerInfo
-{
-    int capacity;
-    int hidden;               // columns of gate/up, rows of down
-    int intermediate;         // rows of gate and of up, columns of down
-    int w13_layout;           // 0 [gate, up], 1 [up, gate], 2 alternating 64-row [up, gate] chunks
-    float act_limit;          // 0: no clamp
-    float inv_input_scale13;  // cancels an activation scale folded into the GPU gate/up alphas
-    float inv_input_scale2;   // the same for down
-    bool up_alpha;            // slab kUpAlpha is registered; else up shares the gate alpha
-};
 
 // The layer's slabs, in the slab order of SglangNvfp4CpuParams' comment.
 enum SlabName { kW13, kW2, kSf13, kSf2, kGateAlpha, kDownAlpha, kUpAlpha, kSlabNames };
@@ -88,7 +75,7 @@ struct Projection
     float alpha;
 };
 
-// The w13 rows holding gate and up output i of n, per LayerInfo::w13_layout.
+// The w13 rows holding gate and up output i of n, per Nvfp4Quant::Layer::w13_layout.
 inline void w13_rows(int layout, int n, int i, int& gate, int& up)
 {
     gate = i;
@@ -124,10 +111,15 @@ struct Nvfp4Quant
         Projection gate, up, down;
     };
 
+    // The descriptor as made (capacity; hidden: columns of gate/up, rows of down; intermediate: rows of gate and of
+    // up, columns of down; act_limit, 0: no clamp; the slabs), and SglangNvfp4CpuParams.
     struct Layer
     {
-        LayerInfo info;
-        MoeBufferRows<Nvfp4Quant> rows;
+        LayerSlabs slabs;
+        int w13_layout;           // 0 [gate, up], 1 [up, gate], 2 alternating 64-row [up, gate] chunks
+        float inv_input_scale13;  // cancels an activation scale folded into the GPU gate/up alphas
+        float inv_input_scale2;   // the same for down
+        bool up_alpha;            // slab kUpAlpha is registered; else up shares the gate alpha
     };
 
     static std::array<uint64_t, kSlabs> min_slot_bytes(const LayerSlabs& d, const Params&)
@@ -152,17 +144,15 @@ struct Nvfp4Quant
 
     static Layer make_layer(const LayerSlabs& d, const Params* p)
     {
-        return {{d.capacity, d.hidden, d.intermediate, p->w13_layout, d.act_limit, p->inv_input_scale13,
-                 p->inv_input_scale2, d.slabs[kUpAlpha] != nullptr},
-                MoeBufferRows<Nvfp4Quant>::of(d)};
+        return {d, p->w13_layout, p->inv_input_scale13, p->inv_input_scale2, d.slabs[kUpAlpha] != nullptr};
     }
 
     // A routed slot's alphas must be finite.
     static int check_slot(const Layer& l, int slot)
     {
-        const MoeBufferRow<Nvfp4Quant> s = l.rows.slot(slot);
-        return std::isfinite(alpha_at(s.slab(kGateAlpha))) && std::isfinite(alpha_at(s.slab(kDownAlpha)))
-                       && (!l.info.up_alpha || std::isfinite(alpha_at(s.slab(kUpAlpha))))
+        const LayerSlabs& s = l.slabs;
+        return std::isfinite(alpha_at(s.slot(kGateAlpha, slot))) && std::isfinite(alpha_at(s.slot(kDownAlpha, slot)))
+                       && (!l.up_alpha || std::isfinite(alpha_at(s.slot(kUpAlpha, slot))))
                    ? 0
                    : 2;
     }

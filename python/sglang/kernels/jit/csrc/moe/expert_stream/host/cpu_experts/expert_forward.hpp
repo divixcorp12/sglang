@@ -5,7 +5,6 @@
 // A Quant's dispatch may ignore the RouteTable and read the request directly: EXL3 does, to keep its frozen
 // accumulation order, so it runs the zero-weight routes that RouteTable drops.
 #pragma once
-#include "buffer_row.hpp"
 #include "isa.hpp"
 #include "keep_warm.hpp"
 #include "kernel.hpp"
@@ -98,7 +97,7 @@ public:
             refuse(std::to_string(c.threads) + " workers on " + std::to_string(c.cores.size()) + " cores");
         check_cores(c.cores);
         const typename Quant::Layer& l = static_cast<const Layer&>(layer).quant;
-        const int capacity = l.rows.capacity;
+        const int capacity = l.slabs.capacity;
         const size_t n = size_t(c.rows) * size_t(c.k);
         for (size_t j = 0; j < n; ++j) {
             const int32_t slot = c.slots[j];

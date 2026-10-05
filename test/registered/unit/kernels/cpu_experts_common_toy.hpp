@@ -30,13 +30,13 @@ struct ToyQuant {
     static constexpr const char* kIsaReportEnv = "TOY_CPU_REPORT_ISA";
     using Params = ToyParams;
     struct Row { const float* v; };
-    struct Layer { int hidden; float scale; MoeBufferRows<ToyQuant> rows; };
+    struct Layer { LayerSlabs slabs; float scale; };
     static std::array<uint64_t, 1> min_slot_bytes(const LayerSlabs& d, const Params&)
     { return {uint64_t(d.hidden) * 4}; }
     static int validate(const LayerSlabs& d, const Params* p)
     { return d.activation == 0 && p && std::isfinite(p->scale) ? 0 : 2; }
     static Layer make_layer(const LayerSlabs& d, const Params* p)
-    { return {d.hidden, p->scale, MoeBufferRows<ToyQuant>::of(d)}; }
+    { return {d, p->scale}; }
     static int check_slot(const Layer&, int) { return 0; }
     static Row decode(const uint8_t* const* base, const Layer&) { return {reinterpret_cast<const float*>(base[0])}; }
     static int dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa)
@@ -53,13 +53,13 @@ struct ToyQuant {
         cpus.assign(size_t(c.threads), -1);
         run_team(c.threads, [&](int worker, int workers) {
             cpus[size_t(worker)] = sched_getcpu();
-            for (int h = worker; h < l.hidden; h += workers)
+            for (int h = worker; h < l.slabs.hidden; h += workers)
                 for (int t = 0; t < c.rows; ++t) {
                     float s = 0;
                     for (int i = 0; i < r.count[t]; ++i)
                         s += r.route(t, i).weight * l.scale
-                             * decode(l.rows.slot(r.route(t, i).slot).base.data(), l).v[h];
-                    float& o = c.out[size_t(t) * l.hidden + h];
+                             * decode(l.slabs.slot_bases<kSlabs>(r.route(t, i).slot).data(), l).v[h];
+                    float& o = c.out[size_t(t) * l.slabs.hidden + h];
                     o = c.accumulate ? o + s : s;
                 }
         });

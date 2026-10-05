@@ -145,9 +145,9 @@ everything they call inlined (`flatten`), once per phase per worker; the rest of
 `PlanTraits<Shape, Isa>` holds the plan's knobs (`kRowUnit`, the split unit). The plan groups a call's routes into
 units, one per (token, slot), and units into chunks of up to `kChunkRows` (4) of one slot; `dot_rows<Isa, M>` decodes
 each weight row once per chunk. A plan reads every layer fact it may fix
-through its Shape (`shapes.hpp`): `GenericShape` from the layer's `LayerInfo`, `MimoV26ProShape` as compile-time
+through its Shape (`shapes.hpp`): `GenericShape` from the layer's `LayerSlabs`, `MimoV26ProShape` as compile-time
 constants (MiMo V2.6 Pro's routed expert: 6144/2048, SiLU with no clamp). Plans read a slot's projections through
-`Nvfp4Quant::decode` over the framework's `MoeBufferRows` (the descriptor's slab bases and strides); `SlabRowBytes`
+`Nvfp4Quant::decode` over the layer's `LayerSlabs` (the descriptor's slab bases and strides, `slot_bases`); `SlabRowBytes`
 is each slab's minimum stride.
 
 Bit-exact checks for any change here: `test/manual/dsv41/run_nvfp4_cpu_forward_checks.sh` (the avx2 and scalar tiers

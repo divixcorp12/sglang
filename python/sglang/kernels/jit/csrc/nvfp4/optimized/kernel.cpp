@@ -22,7 +22,7 @@ constexpr int kChunkRows = 4;
 // model's routed expert at the AVX2 tier, else the generic plan at the tier.
 int Nvfp4Quant::dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa)
 {
-    if (isa >= Isa::Avx2 && MimoV26ProShape::accepts(l.info))
+    if (isa >= Isa::Avx2 && MimoV26ProShape::accepts(l))
         return ForwardPlan<MimoV26ProShape, Isa::Avx2>::run(l, c, r);
     return isa >= Isa::Avx2 ? ForwardPlan<GenericShape, Isa::Avx2>::run(l, c, r)
                             : ForwardPlan<GenericShape, Isa::Scalar>::run(l, c, r);

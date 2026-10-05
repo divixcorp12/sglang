@@ -15,13 +15,25 @@ namespace sglang::cpu_experts {
 inline constexpr int kMaxSlabs = 8;
 
 // One layer's pinned host tier: slot s of slab i starts at slabs[i] + s * slot_bytes[i]. Views only: the caller keeps
-// every slab alive for the layer's lifetime.
+// every slab alive for the layer's lifetime. A quant's layer keeps it as made and addresses its slots through it.
 struct LayerSlabs {
   int32_t capacity = 0, hidden = 0, intermediate = 0, activation = 0;
   float act_limit = 0;
   int32_t slab_count = 0;
   std::array<const void*, kMaxSlabs> slabs{};
   std::array<uint64_t, kMaxSlabs> slot_bytes{};
+
+  // Slot s's first byte in slab i; null when the slab is absent (an optional one).
+  const uint8_t* slot(int i, int s) const {
+    return slabs[i] ? static_cast<const uint8_t*>(slabs[i]) + std::size_t(s) * slot_bytes[i] : nullptr;
+  }
+  // Slot s's first byte in each of the first N slabs, as a quant's decode reads them.
+  template <int N>
+  std::array<const uint8_t*, N> slot_bases(int s) const {
+    std::array<const uint8_t*, N> base;
+    for (int i = 0; i < N; ++i) base[i] = slot(i, s);
+    return base;
+  }
 };
 
 // One forward: `rows` token rows; row t's experts are slots[t*k+i] weighted by weights[t*k+i], -1 skipped. out (fp32

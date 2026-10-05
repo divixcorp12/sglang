@@ -93,7 +93,7 @@ The tier is min(host, EXL3_MOE_CPU_MAX_ISA), read at the first forward or tier q
 picked once per call in Exl3Quant::dispatch: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on
 an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one
 specialization: compact scratch, grouped traversal, wide single-expert quantization. A plan reads every layer fact
-through its Shape (shapes.hpp): GenericShape from the layer's LayerInfo, Dsv41Shape as compile-time constants
+through its Shape (shapes.hpp): GenericShape from the layer's LayerSlabs (and gated), Dsv41Shape as compile-time constants
 (5120/2304, 3-bit, gated SiLU, activation limit 10; a layer with any other value takes the generic plan). Plans
 read experts through an accessor (quant.hpp): TableExperts over make_layer's per-expert
 tables, or StridedExperts<Shape> over the kernel's make_layer slab bases and strides.

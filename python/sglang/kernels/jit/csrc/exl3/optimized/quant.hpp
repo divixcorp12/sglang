@@ -25,20 +25,9 @@ struct SglangExl3CpuParams {
 };
 
 namespace sglang::exl3_cpu {
-// Internal linkage, like the framework: Exl3Quant's Layer embeds MoeBufferRows, which has it.
+// Internal linkage, like the framework's templates: each library's translation unit owns its state.
 namespace {
 using namespace ::sglang::cpu_experts;
-
-// What a forward needs to know about a layer besides its matrices.
-struct LayerInfo
-{
-    int num_experts;   // the routable slots: a slab layer's capacity, a table layer's expert count
-    int hidden;        // k of gate/up, n of down
-    int intermediate;  // n of gate/up, k of down
-    bool gated;
-    int activation;    // 0 silu, 1 gelu, 2 relu2 (gateless), 3 swiglu_oai
-    float act_limit;
-};
 
 // The pinned tier's slabs, in exl3_expert_format.EXL3_STREAMED_NAMES order: one row per expert slot.
 enum SlabName { kW13Trellis, kW13Suh, kW13Svh, kW2Trellis, kW2Suh, kW2Svh, kSlabNames };
@@ -102,12 +91,14 @@ struct Exl3Quant
         MoeCpuMatrix gate, up, down;
     };
 
-    // A slab layer (register_layer): rows' bases and strides, and the slabs' bits/swz. A table layer
-    // (exl3_moe_cpu_make_layer): `table`, with rows holding only the capacity (its expert count).
+    // `slabs`: capacity (the routable slots), hidden (k of gate/up, n of down), intermediate (n of gate/up, k of
+    // down), activation (0 silu, 1 gelu, 2 relu2 (gateless), 3 swiglu_oai) and act_limit. A slab layer (make_layer)
+    // keeps its descriptor as made, and the slabs' bits/swz. A table layer (exl3_moe_cpu_make_layer) holds `table`;
+    // its slabs carry only those scalars, capacity being its expert count.
     struct Layer
     {
-        LayerInfo info;
-        MoeBufferRows<Exl3Quant> rows;
+        LayerSlabs slabs;
+        bool gated;
         int bits;
         int swz;
         std::unique_ptr<MoeCpuLayer> table;
@@ -135,8 +126,8 @@ struct Exl3Quant
 
     static Layer make_layer(const LayerSlabs& d, const Params* p)
     {
-        return {{d.capacity, d.hidden, d.intermediate, true, 0, d.act_limit},
-                MoeBufferRows<Exl3Quant>::of(d),
+        return {d,
+                true,
                 p->bits,
                 p->swizzled && p->bits != 8 ? 1 : 0,  // make_matrix's rule: K8 is never swizzled
                 nullptr};
@@ -144,10 +135,10 @@ struct Exl3Quant
 
     static int check_slot(const Layer&, int) { return 0; }
 
-    // A slab layer's slot, from its first byte in each slab (MoeBufferRow::base).
+    // A slab layer's slot, from its first byte in each slab (LayerSlabs::slot_bases).
     static Row decode(const uint8_t* const* base, const Layer& l)
     {
-        const int h = l.info.hidden, n = l.info.intermediate;
+        const int h = l.slabs.hidden, n = l.slabs.intermediate;
         return {w13_part(base[kW13Trellis], base[kW13Suh], base[kW13Svh], 0, h, n, l.bits, l.swz),
                 w13_part(base[kW13Trellis], base[kW13Suh], base[kW13Svh], 1, h, n, l.bits, l.swz),
                 exl3_matrix(base[kW2Trellis], base[kW2Suh], base[kW2Svh], n, h, l.bits, l.swz)};
@@ -168,15 +159,15 @@ struct TableExperts
     const MoeCpuMatrix& down(int e) const { return layer->downs[e]; }
 };
 
-// A slab layer: slot e of slab i at rows.base[i] + e * rows.stride[i], nothing stored per expert. A fixed Shape
+// A slab layer: slot e of slab i at slabs[i] + e * slot_bytes[i], nothing stored per expert. A fixed Shape
 // (Dsv41Shape) makes the dimensions compile-time constants; GenericShape reads them from the layer.
 template <class Shape>
 struct StridedExperts
 {
     const Exl3Quant::Layer* layer;
 
-    int H() const { if constexpr (Shape::kFixed) return Shape::kHidden; else return layer->info.hidden; }
-    int I() const { if constexpr (Shape::kFixed) return Shape::kIntermediate; else return layer->info.intermediate; }
+    int H() const { if constexpr (Shape::kFixed) return Shape::kHidden; else return layer->slabs.hidden; }
+    int I() const { if constexpr (Shape::kFixed) return Shape::kIntermediate; else return layer->slabs.intermediate; }
     int B() const { if constexpr (Shape::kFixed) return Shape::kBits; else return layer->bits; }
 
     MoeCpuMatrix gate(int e) const { return w13(e, 0); }
@@ -191,10 +182,10 @@ struct StridedExperts
     StridedExperts<Other> as() const { return {layer}; }
 
 private:
-    // MoeBufferRows::slot(e).slab(name), without forming the other slabs' bases.
+    // LayerSlabs::slot(name, e) without its absent-slab check: a slab layer has all six.
     const uint8_t* at(SlabName name, int e) const
     {
-        return layer->rows.base[name] + size_t(e) * layer->rows.stride[name];
+        return static_cast<const uint8_t*>(layer->slabs.slabs[name]) + size_t(e) * layer->slabs.slot_bytes[name];
     }
 
     MoeCpuMatrix w13(int e, int part) const

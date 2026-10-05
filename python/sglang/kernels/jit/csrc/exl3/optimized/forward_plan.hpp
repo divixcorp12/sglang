@@ -265,7 +265,7 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
 
 struct ForwardCtx
 {
-    LayerInfo info;
+    const Exl3Quant::Layer* layer;
     const at::Half* x;
     float* out;
     int m_total;
@@ -364,8 +364,8 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
 // Blocks are independent: only their own gate/up outputs and prepared input slices are written.
 template<class Shape, Isa I, bool Wide = false, class Experts>
 void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
-    const int I_=Shape::intermediate(c.info), nb=I_/128, nc=int(c.chunks.size());
-    const bool gated=Shape::gated(c.info);
+    const int I_=Shape::intermediate(*c.layer), nb=I_/128, nc=int(c.chunks.size());
+    const bool gated=Shape::gated(*c.layer);
     const int first=nc*nb*worker/num_workers,last=nc*nb*(worker+1)/num_workers;
     for (int task=first;task<last;++task) {
         const int j=task/nb,b=task%nb,block=b*128;
@@ -381,8 +381,8 @@ void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
             transform_out<I>(up,u,1);
             const size_t count=128;
             float* a=gated?g:u;
-            const float lim=Shape::act_limit(c.info)!=0.0f?Shape::act_limit(c.info):std::numeric_limits<float>::infinity();
-                switch (Shape::activation(c.info)) {
+            const float lim=Shape::act_limit(*c.layer)!=0.0f?Shape::act_limit(*c.layer):std::numeric_limits<float>::infinity();
+                switch (Shape::activation(*c.layer)) {
                     case 0:
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = g[i];
@@ -401,7 +401,7 @@ void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
                     case 3: {
                         // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
                         // sigmoid(1.702 * g)
-                        const float lim = Shape::act_limit(c.info);
+                        const float lim = Shape::act_limit(*c.layer);
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = std::min(g[i], lim);
                             const float uv = std::clamp(u[i], -lim, lim);
@@ -440,7 +440,7 @@ void middle_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
 
 template<class Shape, Isa I, bool Wide = false, class Experts>
 void prepare_gu_blocks(ForwardCtx& c,const Experts& E,int worker,int num_workers) {
-    const int K=Shape::hidden(c.info),nb=K/128,nc=int(c.chunks.size()),gu=!Shape::gated(c.info)?1:2;
+    const int K=Shape::hidden(*c.layer),nb=K/128,nc=int(c.chunks.size()),gu=!Shape::gated(*c.layer)?1:2;
     const int first=nc*gu*nb*worker/num_workers,last=nc*gu*nb*(worker+1)/num_workers;
     for(int task=first;task<last;++task) {
         const int j=task/nb,b=task%nb;
@@ -555,8 +555,8 @@ private:
     {
         constexpr bool compact = Traits::kCompactScratch;
         const int nc = static_cast<int>(ctx.chunks.size());
-        const int H = Shape::hidden(ctx.info);
-        const int I_ = Shape::intermediate(ctx.info);
+        const int H = Shape::hidden(*ctx.layer);
+        const int I_ = Shape::intermediate(*ctx.layer);
         auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
         grow(ar.tin_g, static_cast<size_t>(nc) * MAX_M * H);
         grow(ar.tin_u, static_cast<size_t>(nc) * MAX_M * H);
@@ -628,7 +628,7 @@ private:
         [[maybe_unused]] double phase_us[6]{};
         ::sglang::cpu_experts::run_team(count, [&](int worker, int n) {
             if (ctx.zero_out && worker == 0)
-                std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.info.hidden * sizeof(float));
+                std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->slabs.hidden * sizeof(float));
             step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us);
             step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us);
             step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us);
@@ -665,8 +665,8 @@ private:
     static void phase(ForwardCtx& c, const Experts& E, int worker, int num_workers, bool grouped, bool wide)
     {
         [[maybe_unused]] const int nc = static_cast<int>(c.chunks.size());
-        [[maybe_unused]] const int H = Shape::hidden(c.info);
-        [[maybe_unused]] const int I_ = Shape::intermediate(c.info);
+        [[maybe_unused]] const int H = Shape::hidden(*c.layer);
+        [[maybe_unused]] const int I_ = Shape::intermediate(*c.layer);
 
         if constexpr (P == Phase::PrepareGateUp)
         {
@@ -676,7 +676,7 @@ private:
                 return;
             }
             // Prepare gate and up inputs, distributed over (chunk, gate/up)
-            const int gu = !Shape::gated(c.info) ? 1 : 2;
+            const int gu = !Shape::gated(*c.layer) ? 1 : 2;
             for (int j = worker; j < nc * gu; j += num_workers)
             {
                 const Chunk& ch = c.chunks[j / gu];
@@ -689,7 +689,7 @@ private:
         else if constexpr (P == Phase::GateUp)
         {
             // Gate + up GEMVs (see assign_gemvs)
-            const int gu = !Shape::gated(c.info) ? 1 : 2;
+            const int gu = !Shape::gated(*c.layer) ? 1 : 2;
             assign_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
@@ -709,7 +709,7 @@ private:
             }
             // Output transform for gate/up, activation, prepare down input; per chunk. Gated: act(g)
             // * u accumulated into g; gateless: relu2 applied to u in place
-            const bool gated = Shape::gated(c.info);
+            const bool gated = Shape::gated(*c.layer);
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
                 float* g = c.tout_g + static_cast<size_t>(j) * MAX_M * I_;
@@ -723,9 +723,9 @@ private:
                 // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
                 // context push |u| into the thousands, and skipping the clamp here made
                 // offloaded experts diverge arbitrarily far from their GPU-resident twins
-                const float lim = Shape::act_limit(c.info) != 0.0f
-                    ? Shape::act_limit(c.info) : std::numeric_limits<float>::infinity();
-                switch (Shape::activation(c.info)) {
+                const float lim = Shape::act_limit(*c.layer) != 0.0f
+                    ? Shape::act_limit(*c.layer) : std::numeric_limits<float>::infinity();
+                switch (Shape::activation(*c.layer)) {
                     case 0:
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = g[i];
@@ -744,7 +744,7 @@ private:
                     case 3: {
                         // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
                         // sigmoid(1.702 * g)
-                        const float lim = Shape::act_limit(c.info);
+                        const float lim = Shape::act_limit(*c.layer);
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = std::min(g[i], lim);
                             const float uv = std::clamp(u[i], -lim, lim);
@@ -810,7 +810,7 @@ private:
 template <class Experts, class Dsv41Experts>
 void run_plan(ForwardCtx& ctx, const Experts& E, const Dsv41Experts& D, ForwardArena& ar, int threads, Isa isa)
 {
-    if (isa == Isa::Bw && Dsv41Shape::accepts(ctx.info, E, ctx.chunks)) {
+    if (isa == Isa::Bw && Dsv41Shape::accepts(*ctx.layer, E, ctx.chunks)) {
         ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, D, ar, threads);
         return;
     }
@@ -828,12 +828,12 @@ void run_plan(ForwardCtx& ctx, const Experts& E, const Dsv41Experts& D, ForwardA
 void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, const int32_t* sel, const at::Half* wts,
                  float* out, int rows, int topk, int threads, bool accumulate)
 {
-    const LayerInfo& info = layer.info;
+    const LayerSlabs& slabs = layer.slabs;
     const int m_total = rows;
     const int top_k = topk;
 
     ForwardCtx ctx;
-    ctx.info = info;
+    ctx.layer = &layer;
     ctx.x = x;
     ctx.out = out;
     ctx.m_total = m_total;
@@ -850,15 +850,15 @@ void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, cons
 
     // Group token assignments by expert, then split into chunks of CHUNK_M rows
     auto& per_expert = ar.per_expert;
-    if (per_expert.size() < static_cast<size_t>(info.num_experts)) per_expert.resize(info.num_experts);
+    if (per_expert.size() < static_cast<size_t>(slabs.capacity)) per_expert.resize(slabs.capacity);
     for (int t = 0; t < m_total; ++t)
         for (int j = 0; j < top_k; ++j)
         {
             const int32_t e = sel[static_cast<size_t>(t) * top_k + j];
-            if (e >= 0 && e < info.num_experts)
+            if (e >= 0 && e < slabs.capacity)
                 per_expert[e].emplace_back(t, half_to_float(wts[static_cast<size_t>(t) * top_k + j]));
         }
-    for (int e = 0; e < info.num_experts; ++e)
+    for (int e = 0; e < slabs.capacity; ++e)
     {
         auto& lst = per_expert[e];
         for (size_t i = 0; i < lst.size(); i += CHUNK_M)
@@ -877,7 +877,7 @@ void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, cons
     }
     const int nc = static_cast<int>(ctx.chunks.size());
     if (!nc) {
-        if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * info.hidden * sizeof(float));
+        if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(m_total) * slabs.hidden * sizeof(float));
         give_back();
         return;
     }
