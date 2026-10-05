@@ -1567,6 +1567,9 @@ class ExpertStreamer:
                 expert_to_slot.index_select(0, flat.long()),
                 self.row_planner.scratch_base,
             )
+        if direct is not None and self.graph_miss_width < self.graph_gather_rows:
+            # A verify: serve the misses that found a victim; the rest flag the forward.
+            direct.clamp_gather_misses()
         if prefetch_puller is not None:
             # Join after the actual routing: `remap` and `expert_to_slot` are this
             # forward's real decision, not the prediction that posted the pull. The

@@ -399,6 +399,13 @@ class GpuResidencyUpdater:
         self.gather_insertions = torch.zeros(layers, dtype=torch.long, device=device)
         self.gather_evictions = torch.zeros(layers, dtype=torch.long, device=device)
         self._pending_commit = None
+        # A verify's gather may hold more misses than lanes: per layer, the gathers that did, and one sticky word
+        # that says this forward's output is not a verify result (clamp_gather_misses).
+        self.gather_overflow = torch.zeros(layers, dtype=torch.long, device=device)
+        self.overflow_flag = torch.zeros(1, dtype=torch.int32, device=device)
+        self.narrow_gather = any(
+            streamer.graph_miss_width < streamer.graph_gather_rows for streamer in self.streamers
+        )
         # SGLANG_DSV41_ENABLE_LAYER_FUSION fuses gather_destinations and commit_gather
         # into one kernel each. Their per-layer outputs live in per-layer rows, so a
         # commit forked onto the side stream reads buffers nothing else reuses.
@@ -574,6 +581,8 @@ class GpuResidencyUpdater:
         }
         for name, counter in self.insertion_counters().items():
             snapshot[name] = counter.cpu().tolist()
+        if self.insert_direct and self.narrow_gather:
+            snapshot["gather_overflow"] = self.gather_overflow.cpu().tolist()
         return snapshot
 
     def insertion_counters(self) -> dict[str, torch.Tensor]:
@@ -980,6 +989,25 @@ class GpuResidencyUpdater:
         )
         self._pending_commit = (row, streamer, destinations, live)
         return remap_out
+
+    def clamp_gather_misses(self) -> None:
+        """Serve the miss lanes that found a victim, and flag the gather when its misses outnumber them.
+
+        Only for a gather whose miss width is below its routes (a verify). There, the misses can exceed the shortlist,
+        and the hits can disqualify more entries than the shortlist has to spare. The lanes
+        :meth:`gather_destinations` made live are a prefix (usable entries first, then ``lane < count``), so their sum
+        is the number served. The shared miss count, which the copy, the lease record and the commit all read, drops
+        to it: every row copied is committed, and nothing is copied into slot 0. The unserved misses' routes read a
+        served lane's slot (a valid slot, the wrong expert), so the forward's output is not a verify result, and
+        ``overflow_flag`` says so. Device only, capture-safe.
+        """
+        row, streamer, _, live = self._pending_commit
+        count = streamer._graph_miss_count
+        served = live.sum(dtype=torch.int32)
+        over = count > served
+        self.gather_overflow[row].add_(over.sum())
+        self.overflow_flag.bitwise_or_(over.to(torch.int32))
+        count.copy_(torch.minimum(count, served))
 
     def pending_commit_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The ``(destinations, live)`` tensors ``commit_gather`` reads.
