@@ -9,6 +9,7 @@ neither traps nor fail-stops.
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -36,6 +37,7 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
 
     write_fake_exl3(str(tmp_path), num_layers=1, num_experts=EXPERTS, hidden=HIDDEN, inter=INTER, finite=True)
     source = _source_rows(tmp_path, num_experts=EXPERTS)
+    source_cuda = {name: rows.cuda() for name, rows in source.items()}
     layout = build_exl3_expert_layout(str(tmp_path))
     service_module.Exl3RamMissService._instance = None
     service = service_module.Exl3RamMissService.get()
@@ -92,8 +94,9 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
                     for name, rows in manager.caches[0].tensors.items():
                         assert torch.equal(rows[slot].cpu(), source[name][expert]), (expert, slot, name)
 
-            def replay(routes, overflow):
-                updater.overflow_flag.zero_()
+            def replay(routes, overflow, clear=True):
+                if clear:
+                    updater.overflow_flag.zero_()
                 ids.copy_(torch.tensor(routes, device="cuda", dtype=torch.int32))
                 graph.replay()
                 torch.cuda.synchronize()
@@ -125,8 +128,22 @@ def test_a_verify_gather_serves_its_lanes_and_flags_what_it_cannot(tmp_path, fus
             replay([[eight[(t + k) % 8] for k in range(TOP_K)] for t in range(TOKENS)], overflow=False)  # 8 fill the lanes
             overflowed = updater.gather_overflow[0].item()
             twelve = outsiders()[:12]
-            replay([[twelve[(2 * t + k) % 12] for k in range(TOP_K)] for t in range(TOKENS)], overflow=True)  # 12 > 8
+            routes = [[twelve[(2 * t + k) % 12] for k in range(TOP_K)] for t in range(TOKENS)]
+            replay(routes, overflow=True, clear=False)  # 12 > 8
             assert updater.gather_overflow[0].item() == overflowed + 1
+            # The DSpark re-run: read and clear the flag, then the same verify with the graph gather suspended.
+            assert manager.take_verify_overflow()
+            with manager.suspend_graph_gather():
+                assert not streamer.serves_graph_gather(SimpleNamespace(topk_ids=ids))
+                eager = Exl3MoEMethod._apply_streamed(layer, streamer, x, weights, ids, ACT_LIMIT)
+            torch.cuda.synchronize()
+            service.fail_stop_check()
+            assert int(updater.overflow_flag.item()) == 0, "the eager re-run flagged"
+            assert updater.insertion_truncated[0].item() == 0
+            residency_is_exact()
+            for t, route in enumerate(routes):
+                ref = _reference(x[t : t + 1], weights[t], torch.tensor(route), source_cuda)
+                assert _rel(eager[t : t + 1], ref) <= REL_BOUND, (t, route)
             replay([outsiders()[:TOP_K]] * TOKENS, overflow=False)  # served exactly again afterwards
     finally:
         service.shutdown()
