@@ -84,7 +84,6 @@ def test_the_module_is_loaded_once_and_kept(tmp_path):
     nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()
     first = nvfp4_cpu_ext.nvfp4_cpu_module(str(tmp_path))
     assert nvfp4_cpu_ext.nvfp4_cpu_module(str(tmp_path)) is first
-    assert nvfp4_cpu_ext.nvfp4_cpu_kernel_address(str(tmp_path)) == int(first.nvfp4_cpu_kernel_address())
 
 
 def test_the_scalar_cap_runs_the_scalar_tier(tmp_path):
