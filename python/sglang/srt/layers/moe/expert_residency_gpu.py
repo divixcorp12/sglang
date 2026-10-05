@@ -578,8 +578,6 @@ class GpuResidencyUpdater:
         }
         for name, counter in self.insertion_counters().items():
             snapshot[name] = counter.cpu().tolist()
-        if self.insert_direct and self.narrow_gather:
-            snapshot["gather_overflow"] = self.gather_overflow.cpu().tolist()
         return snapshot
 
     def insertion_counters(self) -> dict[str, torch.Tensor]:
@@ -599,11 +597,14 @@ class GpuResidencyUpdater:
         insertions, evictions = self.insertions, self.insertion_evictions
         if self.insert_direct:
             insertions, evictions = self.gather_insertions, self.gather_evictions
-        return {
+        counters = {
             "insertions": insertions,
             "insertion_evictions": evictions,
             "insertion_truncated": self.insertion_truncated,
         }
+        if self.insert_direct and self.narrow_gather:
+            counters["gather_overflow"] = self.gather_overflow
+        return counters
 
     def _decode_boundary_reached(self) -> torch.Tensor:
         """Per layer: whether the decode forwards reach the boundary period."""

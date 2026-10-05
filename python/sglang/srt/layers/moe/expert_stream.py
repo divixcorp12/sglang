@@ -1150,6 +1150,9 @@ class ExpertStreamer:
         self.graph_gather_rows = 0
         # Distinct misses a graph gather serves when below its routes (a verify); 0: one per route.
         self.graph_miss_lanes = 0
+        # Set by ExpertHotCacheManager.suspend_graph_gather: an eager re-run of a verify whose graph gather
+        # overflowed must not take the same narrowed gather again.
+        self.graph_gather_suspended = False
         self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
         # Row-source reads outside eager gathers (promotions, seeding, direct calls).
@@ -1283,7 +1286,8 @@ class ExpertStreamer:
         """Whether ``topk_output`` fits the sync-free gather enabled at startup."""
         topk_ids = getattr(topk_output, "topk_ids", None)
         return (
-            self.graph_gather_rows > 0
+            not self.graph_gather_suspended
+            and self.graph_gather_rows > 0
             and isinstance(topk_ids, torch.Tensor)
             and 0 < topk_ids.numel() <= self.graph_gather_rows
         )
@@ -2087,7 +2091,7 @@ class ExpertStreamer:
         """
         if topk_ids.device.type != "cuda":
             raise ValueError("selected expert IDs must be on CUDA")
-        if 0 < topk_ids.numel() <= self.graph_gather_rows:
+        if not self.graph_gather_suspended and 0 < topk_ids.numel() <= self.graph_gather_rows:
             return self._gather_graph(topk_ids)
         # A source score may have forked a side pull for this target even though this
         # eager shape is outside graph-gather support. The pull is unusable here but

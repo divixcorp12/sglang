@@ -1362,6 +1362,8 @@ class ExpertHotCacheManager:
         if not any(selected.values()) and not any(gather_rows.values()):
             return None
         manager = cls()
+        manager.graphed_verify_ct = 0
+        manager.verify_overflow_ct = 0
         manager.streamers = streamers
         manager.caches = {}
         manager.residency_policies = {}
@@ -2378,6 +2380,11 @@ class ExpertHotCacheManager:
         if updater is not None:
             metadata["gpu_residency_layers"] = tuple(updater.layer_ids)
             metadata["gpu_residency_insert_on_miss"] = updater.insert_on_miss
+            if self.narrow_graph_gather:
+                metadata["graphed_verify"] = {
+                    "graphed_verify_ct": self.graphed_verify_ct,
+                    "verify_overflow_ct": self.verify_overflow_ct,
+                }
         return metadata
 
     def _schedule_trace(self, phase: str) -> None:
@@ -2642,6 +2649,8 @@ class ExpertHotCacheManager:
             result["residency_policy"] = metadata["residency_policy"]
         if "residency_async" in metadata:
             result["residency_async"] = metadata["residency_async"]
+        if "graphed_verify" in metadata:
+            result["graphed_verify"] = metadata["graphed_verify"]
         if "gpu_residency_layers" in metadata:
             device = {}
             for name in (
@@ -2652,6 +2661,10 @@ class ExpertHotCacheManager:
             ) + (
                 _INSERTION_TRACE_NAMES
                 if metadata["gpu_residency_insert_on_miss"]
+                else ()
+            ) + (
+                ("gpu_residency:gather_overflow",)
+                if "gpu_residency:gather_overflow" in buffers
                 else ()
             ):
                 device[name.rsplit(":", 1)[-1]] = buffers[name].tolist()
@@ -2849,6 +2862,41 @@ class ExpertHotCacheManager:
                         device["evictions"][0][row] + device["evictions"][1][row]
                     )
         return result
+
+    @property
+    def narrow_graph_gather(self) -> bool:
+        """Whether a graph gather may serve fewer misses than its routes (a verify at W miss lanes)."""
+        updater = getattr(self, "gpu_residency", None)
+        return updater is not None and bool(getattr(updater, "narrow_gather", False))
+
+    def take_verify_overflow(self) -> bool:
+        """After a graphed verify: whether a layer's gather could not serve its misses. Clears the flag.
+
+        One host read of the sticky device flag (GpuResidencyUpdater.clamp_gather_misses). A True result means the
+        verify's output is not a verify result and must be re-run with the graph gather suspended.
+        """
+        flag = self.gpu_residency.overflow_flag
+        self.graphed_verify_ct += 1
+        if not int(flag.item()):
+            return False
+        flag.zero_()
+        self.verify_overflow_ct += 1
+        return True
+
+    @property
+    def graph_gather_suspended(self) -> bool:
+        return any(streamer.graph_gather_suspended for streamer in self.streamers.values())
+
+    @contextmanager
+    def suspend_graph_gather(self):
+        """Every layer gathers eagerly inside the block (an overflowed verify's re-run)."""
+        for streamer in self.streamers.values():
+            streamer.graph_gather_suspended = True
+        try:
+            yield
+        finally:
+            for streamer in self.streamers.values():
+                streamer.graph_gather_suspended = False
 
     def _refresh_side_pull_delivery(self) -> None:
         """Read pull counters only when a caller actually asks for a snapshot."""
