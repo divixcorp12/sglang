@@ -1126,24 +1126,32 @@ def test_server_cores_touch_no_node_1_core():
     assert not (_cores(arm_env.SERVER_CORES) & NODE1_CPUS)
 
 
-def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
-    # ThreadingConfig is the one copy of the rule (busy-polling core: no SMT sibling in the server's affinity).
-    tc = pytest.importorskip("sglang.srt.layers.moe.cpu_experts.threading_config")
+def _divix01_topology(tc, root):
+    """divix01's sysfs as ThreadingConfig reads it: nodes 0-17,36-53 and 18-35,54-71, siblings c and c + 36."""
     for node, cpus in {0: "0-17,36-53", 1: "18-35,54-71"}.items():
-        node_dir = tmp_path / "node" / f"node{node}"
+        node_dir = root / "node" / f"node{node}"
         node_dir.mkdir(parents=True)
         (node_dir / "cpulist").write_text(cpus)
         for cpu in _cores(cpus):
-            topology = tmp_path / "cpu" / f"cpu{cpu}" / "topology"
+            topology = root / "cpu" / f"cpu{cpu}" / "topology"
             topology.mkdir(parents=True)
             (topology / "thread_siblings_list").write_text(f"{cpu % 36},{cpu % 36 + 36}")
-    nodes = [int(entry.split(":")[0]) for entry in arm_env.PINNED_HOST_NUMA_MB.split(",")]
+    return tc.Topology.from_sysfs(str(root))
+
+
+def _recipe_nodes():
+    return [int(entry.split(":")[0]) for entry in arm_env.PINNED_HOST_NUMA_MB.split(",")]
+
+
+def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
+    # ThreadingConfig is the one copy of the rule (busy-polling core: no SMT sibling in the server's affinity).
+    tc = pytest.importorskip("sglang.srt.layers.moe.cpu_experts.threading_config")
+    topology = _divix01_topology(tc, tmp_path)
     config = tc.ThreadingConfig.resolve(
-        nodes=nodes, gpu_node=0, affinity=_cores(arm_env.SERVER_CORES),
-        topology=tc.Topology.from_sysfs(str(tmp_path)), settings=tc.CoreSettings(spin_core=arm_env.SPIN_CORE),
+        nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES),
+        topology=topology, settings=tc.CoreSettings(spin_core=arm_env.SPIN_CORE),
     )
     assert config.plans[0].ram == arm_env.SPIN_CORE and config.plans[0].busy_poll
-    topology = tc.Topology.from_sysfs(str(tmp_path))
     taken = _cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES)
     for plan in config.plans:
         assert not (topology.siblings[plan.ram] & taken), (plan.ram, sorted(topology.siblings[plan.ram] & taken))
@@ -1151,6 +1159,25 @@ def test_the_ram_miss_spin_core_has_its_physical_core_to_itself(tmp_path):
     spin = topology.siblings[arm_env.SPIN_CORE]
     assert not (spin & _cores(arm_env.FREE_CORES)), sorted(spin & _cores(arm_env.FREE_CORES))
     assert arm_env.base_env()["SGLANG_DSV41_RAM_MISS_SPIN_CORE"] == str(arm_env.SPIN_CORE)
+
+
+def test_the_recipes_cpu_experts_get_their_cores_on_every_node_clear_of_the_server_and_driver(tmp_path):
+    # The recipe runs CPU experts on both nodes: each node's engine gets CPU_EXPERTS_THREADS cores, and no
+    # expert-stream thread (engine, RAM, copy) shares a physical core with the server or the benchmark driver.
+    tc = pytest.importorskip("sglang.srt.layers.moe.cpu_experts.threading_config")
+    env = arm_env.base_env()
+    assert env["SGLANG_DSV41_CPU_EXPERTS"] == "1" and env["EXL3_MOE_CPU_PIN"] == "0"
+    threads = int(env["SGLANG_DSV41_CPU_EXPERTS_THREADS"])
+    topology = _divix01_topology(tc, tmp_path)
+    config = tc.ThreadingConfig.resolve(
+        nodes=_recipe_nodes(), gpu_node=0, affinity=_cores(arm_env.SERVER_CORES), topology=topology,
+        settings=tc.CoreSettings(cpu_experts=True, threads=threads, spin_core=arm_env.SPIN_CORE),
+    )
+    assert [plan.threads for plan in config.plans] == [threads] * len(_recipe_nodes())
+    busy = {c for plan in config.plans for c in plan.cores()} | set(config.copy_cpus)
+    physical = lambda cores: {c % 36 for c in cores}  # noqa: E731
+    others = physical(_cores(arm_env.SERVER_CORES) | _cores(arm_env.DRIVER_CORES))
+    assert not (physical(busy) & others), sorted(physical(busy) & others)
 
 
 def test_every_jit_build_and_the_exl3_cpu_kernel_use_gcc_15():
