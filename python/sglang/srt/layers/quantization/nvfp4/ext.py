@@ -1,5 +1,5 @@
-"""The NVFP4 CPU expert library, built on first use by quantization/nvfp4/build.py, loaded with tvm-ffi (its one
-export hands out the kernel's address) and, until the C ABI is gone, with ctypes.
+"""The NVFP4 CPU expert library, built on first use by quantization/nvfp4/build.py and loaded with tvm-ffi (its one
+export hands out the kernel's address).
 
 The library is cached under ``build_dir`` by a hash of its sources, the build flags and the compiler's version, so an
 edit or a compiler change builds a new one; a file lock keeps concurrent processes from building the same one twice.
@@ -7,7 +7,6 @@ The build targets baseline x86-64 and picks its ISA tier at run time, so the hos
 compiler is $CXX, else g++.
 """
 
-import ctypes
 import functools
 import hashlib
 import importlib.util
@@ -83,10 +82,3 @@ def nvfp4_cpu_module(build_dir: Optional[str] = None):
 def nvfp4_cpu_kernel_address(build_dir: Optional[str] = None) -> int:
     """The address of the library's CpuExpertKernel, for ExpertStreamHost.enable_cpu_experts."""
     return int(nvfp4_cpu_module(build_dir).nvfp4_cpu_kernel_address())
-
-
-@functools.cache
-def nvfp4_cpu_library(build_dir: Optional[str] = None) -> ctypes.CDLL:
-    """The native library through ctypes, exporting the cpu_experts_cabi.h functions (until Task 9 of plan
-    2026-10-04-cpu-expert-kernel-interface)."""
-    return ctypes.CDLL(str(nvfp4_cpu_library_path(build_dir)))

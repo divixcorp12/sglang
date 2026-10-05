@@ -6,7 +6,7 @@
 #   run_exl3_cpu_forward_checks.sh check WORKTREE OUT BASELINE_OUT [slabs]
 #       (1) the same dumps, compared bitwise with BASELINE_OUT's; with `slabs`, also through the slab registration,
 #       compared with the same make_layer baseline; (2) the bare-forward bench's 24 frozen DSV4.1 outputs;
-#       (3) the full-stack bench's 48; (4) the CPU expert pool tests.
+#       (3) the full-stack bench's 48; (4) the CPU expert engine and service tests.
 #
 # Builds into OUT: a private copy of the extension's build directory (~670 MB) and the bench. Exits nonzero when any
 # step fails; each step's log is OUT/<step>.log.
@@ -79,7 +79,7 @@ if [[ $mode == check ]]; then
   step full-stack-validate "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
   unset EXL3_MOE_CPU_MAX_ISA
   step pytest taskset -c 0-63 "$PY" -m pytest -q -p no:randomly \
-    test/manual/dsv41/test_cpu_expert_pool_exl3.py test/registered/unit/kernels/test_cpu_expert_pool.py
+    test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_cpu_expert_service.py
 fi
 
 if ((${#failed[@]})); then
