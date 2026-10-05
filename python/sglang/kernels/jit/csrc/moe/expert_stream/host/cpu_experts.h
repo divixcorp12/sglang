@@ -1,13 +1,12 @@
 // The CPU expert engine: computes a record's CPU lanes on a host thread instead of copying their rows to the device.
 //
-// A CPU lane is a RAM-tier expert the device typed with kLeaseTagCpu. The engine runs it from its host slot through a
-// format's C ABI forward (CpuExpertForward) and writes the result into the row's pinned output, which the device folds
-// into its fused MoE.
+// A CPU lane is a RAM-tier expert the device typed with kLeaseTagCpu. The engine runs it from its host slot through the
+// format's CpuExpertKernel (cpu_experts/kernel.hpp) and writes the result into the row's pinned output, which the device
+// folds into its fused MoE.
 //
-//   CpuExpertForward   the format's kernel, as a C ABI
-//   CpuExpertKeepWarm  the format's idle loop, as a C ABI
+//   CpuExpertLayers    every row's layer, shared by the tier's engines
 //   CpuJob             one forward: up to Wire::kLanes lanes of one row, writing one output part
-//   CpuExpertConfig    the pinned input/output tables, the thread count, the cores and the kernel's engine
+//   CpuExpertConfig    the pinned input/output tables, the thread count, the cores and the kernel
 //   CpuExpertEngine    the thread, its job ring and its done word
 //
 // The tier's owner (the service thread) is the engine's only client. It submits a record's CPU hits before the record's
@@ -19,7 +18,7 @@
 #pragma once
 
 #include "../lease_layout.h"
-#include "cpu_experts_abi.h"
+#include "cpu_experts/kernel.hpp"
 #include "reader_base.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
@@ -33,6 +32,8 @@
 #include <mutex>
 #include <pthread.h>
 #include <sched.h>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,19 +43,46 @@ namespace sglang::expert_stream {
 static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
               "the keep-warm reads kick_ as a plain uint32_t");
 
-// A format's CPU expert kernel as a C ABI: the native half of CpuExpertQuantTrait
-// (python/sglang/srt/layers/moe/cpu_experts/pool.py). `call` is cpu_experts_abi.h's contract; the engine passes
-// one row (rows 1) whose slots index the layer's pinned host tier. Returns 0 on success. Called from the CPU expert
-// thread only.
-using CpuExpertForward = int (*)(const SglangCpuExpertsForward* call);
+// Every row's CPU expert layer, one per RamTier and shared by every group's engine: a row's layer addresses the row's
+// whole slab, so one serves every group. Set once per row from any thread; read lock-free by the engines. Owns the
+// layers, and is destroyed only after every engine has stopped (RamTier's member order), so no forward reads a freed
+// one.
+class CpuExpertLayers {
+ public:
+  explicit CpuExpertLayers(int64_t rows)
+      : rows_(rows), layers_(std::make_unique<std::atomic<cpu_experts::CpuExpertLayer*>[]>(static_cast<size_t>(rows))) {
+    for (int64_t r = 0; r < rows_; ++r)
+      layers_[r].store(nullptr, std::memory_order_relaxed);
+  }
+  ~CpuExpertLayers() {
+    for (int64_t r = 0; r < rows_; ++r)
+      delete layers_[r].load(std::memory_order_relaxed);
+  }
+  CpuExpertLayers(const CpuExpertLayers&) = delete;
+  CpuExpertLayers& operator=(const CpuExpertLayers&) = delete;
 
-// A format's keep-warm, as a C ABI: runs register-only work of the kernel's vector width on `threads` workers on
-// `engine`'s cores (the kernel's engine, as the forward's call.engine), the calling thread counted as one, until
-// *word != seen or CLOCK_MONOTONIC reaches deadline_ns, so the cores keep the kernel's frequency license through an
-// idle gap instead of ramping back on the next job. Returns 0 on success.
-// Called from the CPU expert thread only, between forwards.
-using CpuExpertKeepWarm = int (*)(int64_t engine, int32_t threads, const uint32_t* word, uint32_t seen,
-                                  int64_t deadline_ns);
+  int64_t rows() const {
+    return rows_;
+  }
+
+  // Installs `layer` as `row`'s (the caller checks both); false, destroying `layer`, when the row already has one. The
+  // release pairs with get()'s acquire, so an engine that sees the layer sees it constructed.
+  bool set(int64_t row, std::unique_ptr<cpu_experts::CpuExpertLayer> layer) {
+    cpu_experts::CpuExpertLayer* unset = nullptr;
+    if (!layers_[row].compare_exchange_strong(unset, layer.get(), std::memory_order_acq_rel)) return false;
+    layer.release();
+    return true;
+  }
+
+  // `row`'s layer; nullptr outside [0, rows) or before set().
+  const cpu_experts::CpuExpertLayer* get(int64_t row) const {
+    return row >= 0 && row < rows_ ? layers_[row].load(std::memory_order_acquire) : nullptr;
+  }
+
+ private:
+  int64_t rows_;
+  std::unique_ptr<std::atomic<cpu_experts::CpuExpertLayer*>[]> layers_;
+};
 
 // One forward over up to Wire::kLanes lanes of one row.
 //
@@ -73,9 +101,8 @@ struct CpuJob {
 
 // The pinned tables the engine reads and writes, and how it runs. Validated by the CpuExpertEngine constructor.
 struct CpuExpertConfig {
-  CpuExpertForward forward = nullptr;
-  int64_t engine = 0;  // the kernel's engine (its core list), on every forward and keep-warm; 0: unpinned workers
-  int64_t rows = 0;  // streamed rows; each gets its layer handle later (set_layer), until then the CPU skips it
+  const cpu_experts::CpuExpertKernel* kernel = nullptr;  // the format's kernel, for every forward and keep-warm
+  const CpuExpertLayers* layers = nullptr;  // the tier's rows' layers (RamTier sets it); a row without one is skipped
   const uint8_t* x_base = nullptr;  // row r's input at x_base + r * x_stride, written by the post kernel
   int64_t x_stride = 0;
   uint8_t* out_base = nullptr;  // row r's part p fp32 output at out_base + r * out_stride + p * out_part_stride
@@ -83,11 +110,10 @@ struct CpuExpertConfig {
   int64_t out_part_stride = 0;  // 0: one part, so CPU misses are refused (RamTier::serve_record)
   int64_t hidden = 0;
   int threads = 1;
-  // worker 0 uses the first CPU; the kernel pins worker i to the engine's cores[i], which must be this list
+  // worker 0 uses the first CPU; every forward and keep-warm pins worker i to cores[i]
   std::vector<int> cores;
   int64_t spin_ns = 50'000'000;
-  CpuExpertKeepWarm keep_warm = nullptr;  // run while idle for keep_warm_ns after each job; nullptr or 0 ns: off
-  int64_t keep_warm_ns = 0;
+  int64_t keep_warm_ns = 0;  // > 0: the kernel's keep-warm runs while idle for this long after each job
 };
 
 // The CPU expert thread, its job ring and its done word.
@@ -112,26 +138,13 @@ class CpuExpertEngine {
 
   CpuExpertEngine(CpuExpertConfig config, std::string prefix, std::string thread_name)
       : config_(std::move(config)), prefix_(std::move(prefix)), thread_name_(thread_name.substr(0, 15)) {
-    if (config_.forward == nullptr) throw std::runtime_error(prefix_ + "no CPU expert forward");
+    if (config_.kernel == nullptr) throw std::runtime_error(prefix_ + "no CPU expert kernel");
+    if (config_.layers == nullptr) throw std::runtime_error(prefix_ + "no CPU expert layers");
     if (config_.x_base == nullptr || config_.out_base == nullptr || config_.x_stride <= 0 || config_.out_stride <= 0)
       throw std::runtime_error(prefix_ + "the CPU expert input and output rows are required");
     if (config_.hidden <= 0 || config_.out_stride < config_.hidden * static_cast<int64_t>(sizeof(float)))
       throw std::runtime_error(prefix_ + "the CPU expert output rows are smaller than the hidden size");
     if (config_.threads < 1) throw std::runtime_error(prefix_ + "the CPU expert pool needs at least one thread");
-    if (config_.rows < 1) throw std::runtime_error(prefix_ + "the CPU expert engine needs its row count");
-    handles_ = std::make_unique<std::atomic<int64_t>[]>(static_cast<size_t>(config_.rows));
-    for (int64_t r = 0; r < config_.rows; ++r)
-      handles_[r].store(-1, std::memory_order_relaxed);
-  }
-
-  // Registers the trait's layer handle for `row`, once per row, from any thread. Throws on a bad row or a second call.
-  // The release pairs with eligible()'s acquire on the service thread, so a grant that sends the row to the CPU is
-  // ordered after the registration it relies on.
-  void set_layer(int64_t row, int64_t handle) {
-    if (row < 0 || row >= config_.rows || handle < 0) throw std::runtime_error(prefix_ + "bad CPU expert layer");
-    int64_t unset = -1;
-    if (!handles_[row].compare_exchange_strong(unset, handle, std::memory_order_acq_rel))
-      throw std::runtime_error(prefix_ + "a CPU expert layer is registered once");
   }
 
   ~CpuExpertEngine() {
@@ -160,9 +173,10 @@ class CpuExpertEngine {
     return config_.cores;
   }
 
-  // True for a row the device may send to the CPU: inside the tables and registered.
+  // True for a row the device may send to the CPU: inside the tables and its layer made. The acquire (in get) pairs with
+  // CpuExpertLayers::set's release, so a grant that sends the row to the CPU is ordered after the layer it relies on.
   bool eligible(int64_t row) const {
-    return row >= 0 && row < config_.rows && handles_[row].load(std::memory_order_acquire) >= 0;
+    return config_.layers->get(row) != nullptr;
   }
 
   // Tier owner only. Returns the first of `n` consecutive sequences for jobs it will submit, in order. A sequence left
@@ -231,7 +245,7 @@ class CpuExpertEngine {
     ready_cv_.notify_all();
     if (!error.empty()) return;
     uint64_t idle = 0;
-    const bool warm = config_.keep_warm != nullptr && config_.keep_warm_ns > 0;
+    const bool warm = config_.keep_warm_ns > 0;
     int64_t warm_until = 0;  // the keep-warm window after the last job; 0 before the first
     while (!stop_.load(std::memory_order_acquire)) {
       // Read before the pop: a submit after an empty pop bumps kick_ past `kick` and so ends the keep-warm.
@@ -239,9 +253,12 @@ class CpuExpertEngine {
       CpuJob job;
       if (!jobs_.pop(&job)) {
         if (warm && now_ns() < warm_until) {
-          const int result = config_.keep_warm(
-              config_.engine, config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until);
-          if (result != 0) fail_stop(prefix_ + "CPU expert keep-warm failed (" + std::to_string(result) + ")");
+          try {
+            config_.kernel->keep_warm(
+                config_.cores, config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until);
+          } catch (const std::exception& e) {
+            fail_stop(prefix_ + "CPU expert keep-warm failed: " + e.what());
+          }
           continue;
         }
         if (++idle < spin_iters_) {
@@ -254,24 +271,24 @@ class CpuExpertEngine {
       }
       idle = 0;
       const int64_t start = now_ns();
-      SglangCpuExpertsForward call{};
-      call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
+      cpu_experts::ForwardCall call;
       call.rows = 1;
-      call.layer = handles_[job.row].load(std::memory_order_acquire);
+      call.k = job.k;
+      call.threads = config_.threads;
       call.x = config_.x_base + job.row * config_.x_stride;
       call.slots = job.slots;
       call.weights = job.weights;
       call.out =
           reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride);
-      call.k = job.k;
-      call.threads = config_.threads;
-      call.accumulate = job.accumulate ? 1 : 0;
-      call.engine = config_.engine;
-      const int result = config_.forward(&call);
-      if (result != 0)
-        fail_stop(
-            prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed (" + std::to_string(result) +
-            ")");
+      call.accumulate = job.accumulate;
+      call.cores = config_.cores;
+      try {
+        const cpu_experts::CpuExpertLayer* layer = config_.layers->get(job.row);
+        if (layer == nullptr) throw std::invalid_argument("the row has no registered layer");
+        config_.kernel->forward(*layer, call);
+      } catch (const std::exception& e) {
+        fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + e.what());
+      }
       compute_ns_.fetch_add(now_ns() - start, std::memory_order_relaxed);
       jobs_done_.fetch_add(1, std::memory_order_relaxed);
       lanes_done_.fetch_add(job.k, std::memory_order_relaxed);
@@ -290,7 +307,6 @@ class CpuExpertEngine {
   }
 
   CpuExpertConfig config_;
-  std::unique_ptr<std::atomic<int64_t>[]> handles_;
   std::string prefix_;
   std::string thread_name_;
   std::thread thread_;

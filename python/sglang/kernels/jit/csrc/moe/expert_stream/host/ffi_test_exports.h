@@ -10,13 +10,19 @@
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
-//   misc       test_forward_address, test_keep_warm_address, test_keep_warm_calls, test_keep_warm_engine, pause_ns
+//   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_keep_warm_calls, test_keep_warm_core,
+//              pause_ns
 //
 // Arguments are validated by the Python wrappers in
 // python/sglang/kernels/ops/moe/expert_stream_transport.py.
 #pragma once
 
 #include "ffi_exports.h"
+#include <algorithm>
+#include <array>
+#include <mutex>
+#include <span>
+#include <vector>
 
 namespace sglang::expert_stream {
 
@@ -639,69 +645,168 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return find(handle)->wait_copy_idle(expert_stream::now_ns() + timeout_ns) ? 1 : 0;
   }
 
-  // Test only: a native CPU expert forward, for tests whose waits hold the GIL (a ctypes forward needs it on the CPU
-  // expert thread). It spins k * the configured ns, then writes out[0] = k (adds it when accumulating).
-  static std::atomic<int64_t>& test_forward_ns() {
-    static std::atomic<int64_t> ns{0};
-    return ns;
-  }
-  static int test_forward(const SglangCpuExpertsForward* call) {
-    const int32_t k = call->k;
-    const int64_t until = expert_stream::now_ns() + k * test_forward_ns().load(std::memory_order_relaxed);
-    while (expert_stream::now_ns() < until)
-      _mm_pause();
-    float* out = call->out;
-    out[0] = call->accumulate != 0 ? out[0] + static_cast<float>(k) : static_cast<float>(k);
-    return 0;
-  }
-  static int64_t test_forward_address(int64_t ns_per_expert) {
-    if constexpr (!Build::kFaults) {
-      test_only("test_forward_address");
-    } else {
-      test_forward_ns().store(ns_per_expert, std::memory_order_relaxed);
-      return static_cast<int64_t>(reinterpret_cast<intptr_t>(&test_forward));
+  // Test only: the CPU expert kernel tests enable in place of a format's (test_kernel_address). Its layers keep only the
+  // LayerSlabs' hidden. A forward spins k * ns_per_expert, waits while its worker-0 core is held (test_kernel_hold),
+  // throws when made failing, else writes out[j] for j < max(hidden, 1) -- (accumulate ? out[j] : j) + sum_i weights[i]
+  // * (slots[i] + 1), or a zero partial (accumulate ? out[j] : 0) when made zeroing -- and records the call. A
+  // keep-warm counts its calls and records its first core, then spins until its word moves or its deadline passes.
+  class FakeKernel final : public cpu_experts::CpuExpertKernel {
+   public:
+    struct Call {
+      int32_t core, affinity, threads, accumulate, k;
+      std::array<int32_t, Wire::kLanes> slots;
+      std::array<float, Wire::kLanes> weights;
+    };
+    struct Layer final : cpu_experts::CpuExpertLayer {
+      Layer(const CpuExpertKernel& k, int32_t h) : CpuExpertLayer(k), hidden(h) {}
+      const int32_t hidden;
+    };
+
+    void reset(int64_t ns_per_expert, int64_t fail, bool zero) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      calls_.clear();
+      ns_.store(ns_per_expert, std::memory_order_relaxed);
+      fail_.store(fail, std::memory_order_relaxed);
+      zero_.store(zero, std::memory_order_relaxed);
+      held_core_.store(-1, std::memory_order_release);
+      warm_calls_.store(0, std::memory_order_relaxed);
+      warm_core_.store(-1, std::memory_order_relaxed);
     }
+
+    const char* name() const noexcept override {
+      return "fake";
+    }
+    std::unique_ptr<cpu_experts::CpuExpertLayer> make_layer(
+        const cpu_experts::LayerSlabs& d, std::span<const std::byte>) const override {
+      return std::make_unique<Layer>(*this, d.hidden);
+    }
+    void forward(const cpu_experts::CpuExpertLayer& layer, const cpu_experts::ForwardCall& c) const override {
+      if (&layer.kernel() != this) throw std::invalid_argument("fake CPU expert kernel: another kernel's layer");
+      const int32_t core = c.cores.empty() ? -1 : c.cores.front();
+      const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);
+      while (now_ns() < until)
+        _mm_pause();
+      while (core >= 0 && held_core_.load(std::memory_order_acquire) == core)
+        _mm_pause();
+      if (const int64_t f = fail_.load(std::memory_order_relaxed); f != 0)
+        throw std::runtime_error("fake CPU expert forward failed (" + std::to_string(f) + ")");
+      double sum = 0;
+      for (int32_t i = 0; i < c.k; ++i)
+        sum += static_cast<double>(c.weights[i]) * (c.slots[i] + 1);
+      const int32_t hidden = std::max(static_cast<const Layer&>(layer).hidden, 1);
+      const bool zero = zero_.load(std::memory_order_relaxed);
+      for (int32_t j = 0; j < hidden; ++j) {
+        const double base = c.accumulate ? static_cast<double>(c.out[j]) : (zero ? 0.0 : static_cast<double>(j));
+        c.out[j] = static_cast<float>(zero ? base : base + sum);
+      }
+      cpu_set_t mask;
+      CPU_ZERO(&mask);
+      int32_t affinity = -1;
+      if (sched_getaffinity(0, sizeof(mask), &mask) == 0 && CPU_COUNT(&mask) == 1)
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+          if (CPU_ISSET(cpu, &mask)) affinity = cpu;
+      Call call{core, affinity, c.threads, c.accumulate ? 1 : 0, std::min<int32_t>(c.k, Wire::kLanes), {}, {}};
+      for (int32_t i = 0; i < call.k; ++i) {
+        call.slots[i] = c.slots[i];
+        call.weights[i] = c.weights[i];
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      calls_.push_back(call);
+    }
+    void keep_warm(std::span<const int> cores, int32_t, const uint32_t* word, uint32_t seen, int64_t deadline_ns)
+        const override {
+      warm_calls_.fetch_add(1, std::memory_order_relaxed);
+      warm_core_.store(cores.empty() ? -1 : cores.front(), std::memory_order_relaxed);
+      while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < deadline_ns)
+        _mm_pause();
+    }
+
+    std::vector<Call> calls() const {
+      std::lock_guard<std::mutex> lock(mutex_);
+      return calls_;
+    }
+    void hold(int64_t core, bool on) {
+      held_core_.store(on ? core : -1, std::memory_order_release);
+    }
+    int64_t warm_calls() const {
+      return warm_calls_.load(std::memory_order_relaxed);
+    }
+    int64_t warm_core() const {
+      return warm_core_.load(std::memory_order_relaxed);
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    mutable std::vector<Call> calls_;
+    std::atomic<int64_t> ns_{0}, fail_{0}, held_core_{-1};
+    std::atomic<bool> zero_{false};
+    mutable std::atomic<int64_t> warm_calls_{0}, warm_core_{-1};
+  };
+  static FakeKernel& fake_kernel() {
+    static FakeKernel kernel;
+    return kernel;
   }
 
-  static std::atomic<int64_t>& test_keep_warm_count() {
-    static std::atomic<int64_t> calls{0};
-    return calls;
-  }
-  static std::atomic<int64_t>& test_keep_warm_engine_seen() {
-    static std::atomic<int64_t> engine{-1};
-    return engine;
-  }
-  static int test_keep_warm(int64_t engine, int32_t, const uint32_t* word, uint32_t seen, int64_t deadline_ns) {
-    test_keep_warm_count().fetch_add(1, std::memory_order_relaxed);
-    test_keep_warm_engine_seen().store(engine, std::memory_order_relaxed);
-    while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && expert_stream::now_ns() < deadline_ns)
-      _mm_pause();
-    return 0;
-  }
-  // Test only: a fake CpuExpertKeepWarm that counts its calls (from 0 again at each call of this) and spins until its
-  // word moves or its deadline passes.
-  static int64_t test_keep_warm_address() {
+  // Test only: the fake kernel's address, its calls and keep-warm counts reset; `fail` nonzero makes every forward
+  // throw, `zero` makes it write a zero partial.
+  static int64_t test_kernel_address(int64_t ns_per_expert, int64_t fail, int64_t zero) {
     if constexpr (!Build::kFaults) {
-      test_only("test_keep_warm_address");
+      test_only("test_kernel_address");
     } else {
-      test_keep_warm_count().store(0, std::memory_order_relaxed);
-      test_keep_warm_engine_seen().store(-1, std::memory_order_relaxed);
-      return static_cast<int64_t>(reinterpret_cast<intptr_t>(&test_keep_warm));
+      fake_kernel().reset(ns_per_expert, fail, zero != 0);
+      return static_cast<int64_t>(reinterpret_cast<intptr_t>(&fake_kernel()));
+    }
+  }
+  // Test only: the fake's calls since test_kernel_address, as float64 rows {core, affinity, threads, accumulate, k,
+  // slots[kLanes], weights[kLanes]} into `out` (as many as fit); returns how many there are.
+  static int64_t test_kernel_calls(TensorView out) {
+    if constexpr (!Build::kFaults) {
+      test_only("test_kernel_calls");
+    } else {
+      using namespace host;
+      auto cpu = SymbolicDevice{};
+      expert_stream::verify_named(
+          "out", TensorMatcher({-1, 5 + 2 * Wire::kLanes}).with_dtype<double>().with_device<kDLCPU>(cpu), out);
+      const std::vector<FakeKernel::Call> calls = fake_kernel().calls();
+      auto* o = static_cast<double*>(out.data_ptr());
+      const int64_t width = 5 + 2 * Wire::kLanes;
+      for (int64_t r = 0; r < std::min<int64_t>(out.size(0), static_cast<int64_t>(calls.size())); ++r) {
+        const FakeKernel::Call& c = calls[r];
+        double* row = o + r * width;
+        row[0] = c.core;
+        row[1] = c.affinity;
+        row[2] = c.threads;
+        row[3] = c.accumulate;
+        row[4] = c.k;
+        for (int i = 0; i < Wire::kLanes; ++i) {
+          row[5 + i] = c.slots[i];
+          row[5 + Wire::kLanes + i] = c.weights[i];
+        }
+      }
+      return static_cast<int64_t>(calls.size());
+    }
+  }
+  // Test only: while on, a fake forward whose worker-0 core is `core` waits (one held core at a time).
+  static void test_kernel_hold(int64_t core, int64_t on) {
+    if constexpr (!Build::kFaults) {
+      test_only("test_kernel_hold");
+    } else {
+      fake_kernel().hold(core, on != 0);
     }
   }
   static int64_t test_keep_warm_calls() {
     if constexpr (!Build::kFaults) {
       test_only("test_keep_warm_calls");
     } else {
-      return test_keep_warm_count().load(std::memory_order_relaxed);
+      return fake_kernel().warm_calls();
     }
   }
-  // Test only: the engine the fake keep-warm's last call took (-1 before any call since test_keep_warm_address).
-  static int64_t test_keep_warm_engine() {
+  // Test only: the first core the fake keep-warm's last call took (-1 before any call since test_kernel_address).
+  static int64_t test_keep_warm_core() {
     if constexpr (!Build::kFaults) {
-      test_only("test_keep_warm_engine");
+      test_only("test_keep_warm_core");
     } else {
-      return test_keep_warm_engine_seen().load(std::memory_order_relaxed);
+      return fake_kernel().warm_core();
     }
   }
 
@@ -940,10 +1045,11 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
 #define EXPERT_STREAM_HOST_TEST_EXPORTS(Exports) \
   EXPERT_STREAM_HOST_TEST_EXPORTS_OF(::sglang::expert_stream::HostTestExports<Exports>)
 #define EXPERT_STREAM_HOST_TEST_EXPORTS_OF(Exports)                                                 \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_forward_address, Exports::test_forward_address); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_address, Exports::test_keep_warm_address); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_address, Exports::test_kernel_address);   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_calls, Exports::test_kernel_calls);       \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_hold, Exports::test_kernel_hold);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_calls, Exports::test_keep_warm_calls); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_engine, Exports::test_keep_warm_engine); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_core, Exports::test_keep_warm_core);   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows, Exports::read_rows);                       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_traced, Exports::read_rows_traced);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_read_rows_faulted, Exports::read_rows_faulted);       \

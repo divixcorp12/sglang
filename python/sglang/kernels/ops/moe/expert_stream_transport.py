@@ -119,7 +119,22 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "pause_ns",
     "read_record_fields",
     "pump_group",
+    "test_kernel_address",
+    "test_kernel_calls",
+    "test_kernel_hold",
+    "test_keep_warm_calls",
+    "test_keep_warm_core",
 )
+
+
+def _layer_tensors(spec) -> tuple[torch.Tensor, torch.Tensor]:
+    """A ``CpuExpertLayerSpec``'s slab table (int64 ``[n, 2]`` of {address, slot bytes}) and params (uint8 ``[m]``),
+    as the host's set_cpu_layer and kernel_layer take them. ``reshape(n, 2)``: torch refuses ``reshape(-1, 2)`` of a
+    zero-slab table (the fake kernel's layers have none)."""
+    flat = [int(v) for pair in spec.slabs for v in pair]
+    slabs = torch.tensor(flat, dtype=torch.int64).reshape(len(spec.slabs), 2)
+    params = torch.tensor(list(spec.params), dtype=torch.uint8)
+    return slabs, params
 
 
 def _refuse_test_only(name: str, variant: Optional[str]) -> None:
@@ -1289,6 +1304,8 @@ class ExpertStreamHost:
         self.variant = host_variant() if variant is None else variant
         self._module = _host_module(self._layout, self.variant, self.wire.lanes, self.nodes)
         self.threaded = False
+        # set_cpu_layer's specs' tensors, kept alive while the host's layers read them.
+        self._cpu_layer_keep: dict[int, tuple] = {}
         # Allocated here when the caller passes none.
         if lease_block is None:
             lease_block = expert_lease_block.new_lease_block(
@@ -1663,7 +1680,7 @@ class ExpertStreamHost:
 
     def enable_cpu_experts(
         self,
-        forward: int,
+        kernel: int,
         split: Sequence[int],
         cores: Sequence[int],
         x_rows: torch.Tensor,
@@ -1671,25 +1688,22 @@ class ExpertStreamHost:
         *,
         threads: int,
         group: int = 0,
-        engine: int = 0,
         spin_us: int = 50_000,
-        keep_warm: int = 0,
         keep_warm_us: int = 0,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
 
-        ``forward`` is the trait's native forward (a ``CpuExpertForward`` address); each
-        row joins once its layer handle is set (:meth:`set_cpu_layer`). Of a captured
+        ``kernel`` is the format's ``CpuExpertKernel`` address (the trait's ``kernel_address()``);
+        its library must stay loaded while the host runs. Each row joins once its layer is set
+        (:meth:`set_cpu_layer`). Of a captured
         post's n eligible lanes, ``split[n]`` are computed on the CPU (n = 0..``wire.lanes``;
         the device reads the table). ``x_rows`` (uint8 ``[rows, stride]``) and ``out_rows``
         (float32 ``[rows, hidden]`` at one node, otherwise ``[rows, 2 * nodes, hidden]``:
         group g's CPU-hit and CPU-miss partial sums are parts ``2g`` and ``2g + 1``) are
         pinned host rows: the post kernel stages a row's input in the first, the CPU
-        writes its partial sums to the second and the device reads them. The host keeps references to both. ``engine`` is the kernel's engine
-        handle (``native_create_engine``), carried by every forward and keep-warm; 0 runs
-        unpinned workers. ``keep_warm`` is the trait's
-        native keep-warm (a ``CpuExpertKeepWarm`` address, 0 for none), which the idle
-        thread runs on its workers for ``keep_warm_us`` after each job.
+        writes its partial sums to the second and the device reads them. The host keeps
+        references to both. For ``keep_warm_us`` after each job the idle thread runs the
+        kernel's keep-warm on its workers (0: off).
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -1720,8 +1734,7 @@ class ExpertStreamHost:
         self._module.expert_stream_enable_cpu_experts(
             self.handle,
             int(group),
-            int(forward),
-            int(engine),
+            int(kernel),
             torch.tensor(list(split), dtype=torch.int64),
             torch.tensor(list(cores), dtype=torch.int64),
             x_rows,
@@ -1730,18 +1743,21 @@ class ExpertStreamHost:
             parts,
             int(threads),
             int(spin_us * 1e3),
-            int(keep_warm),
             int(keep_warm_us * 1e3),
         )
         self.cpu_rows = (x_rows, out_rows)
 
-    def set_cpu_layer(self, row: int, handle: int) -> None:
-        """Set ``row``'s layer handle from the trait's ``register_layer``.
+    def set_cpu_layer(self, row: int, spec) -> None:
+        """Make ``row``'s layer with the enabled kernel from ``spec`` (a ``CpuExpertLayerSpec``).
 
-        Once per row, at any time.
+        Once per row, at any time. The host keeps ``spec.keep`` (the slabs the layer reads) alive.
         """
-        self._check(row)
-        self._module.expert_stream_set_cpu_layer(self.handle, row, int(handle))
+        slabs, params = _layer_tensors(spec)
+        self._module.expert_stream_set_cpu_layer(
+            self.handle, row, slabs, int(spec.capacity), int(spec.hidden), int(spec.intermediate),
+            int(spec.activation), float(spec.act_limit), params,
+        )
+        self._cpu_layer_keep[row] = spec.keep
 
     def set_cpu_split(self, split: Sequence[int], group: int = 0) -> None:
         """Set NUMA group ``group``'s new split table (CPU lanes per n eligible lanes, n = 0..``wire.lanes``).
@@ -1801,33 +1817,46 @@ class ExpertStreamHost:
         )
         return out
 
-    def test_forward_address(self, ns_per_expert: int) -> int:
-        """Test only: return a native fake CPU expert forward.
+    def test_kernel_address(self, ns_per_expert: int = 0, *, fail: int = 0, zero: bool = False) -> int:
+        """Test only: the instr build's fake ``CpuExpertKernel`` (``FakeKernel``, ffi_test_exports.h), reset.
 
-        It spins ``ns_per_expert`` per expert and writes ``out[0] = k``. Instrumented
-        build only.
+        A forward spins ``ns_per_expert`` per expert and writes ``out[j] = (out[j] if accumulate else j) + sum(w * (s +
+        1))`` (``zero``: a zero partial); ``fail`` nonzero makes every forward throw. Instrumented build only.
         """
-        _refuse_test_only("test_forward_address", self.variant)
-        return int(self._module.expert_stream_test_forward_address(int(ns_per_expert)))
+        _refuse_test_only("test_kernel_address", self.variant)
+        return int(self._module.expert_stream_test_kernel_address(int(ns_per_expert), int(fail), int(bool(zero))))
 
-    def test_keep_warm_address(self) -> int:
-        """Test only: return a native fake CPU expert keep-warm.
+    def test_kernel_calls(self) -> list[dict]:
+        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, in order."""
+        _refuse_test_only("test_kernel_calls", self.variant)
+        lanes = self.wire.lanes
+        width = 5 + 2 * lanes
+        count = int(self._module.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
+        out = torch.zeros((count, width), dtype=torch.float64)
+        self._module.expert_stream_test_kernel_calls(out)
+        calls = []
+        for row in out.tolist()[:count]:
+            k = int(row[4])
+            calls.append({
+                "core": int(row[0]), "affinity": int(row[1]), "threads": int(row[2]), "accumulate": bool(row[3]),
+                "slots": [int(s) for s in row[5 : 5 + k]], "weights": row[5 + lanes : 5 + lanes + k],
+            })
+        return calls
 
-        It counts its calls from 0 (:meth:`test_keep_warm_calls`) and spins until its word
-        moves or its deadline passes. Instrumented build only.
-        """
-        _refuse_test_only("test_keep_warm_address", self.variant)
-        return int(self._module.expert_stream_test_keep_warm_address())
+    def test_kernel_hold(self, core: int, on: bool = True) -> None:
+        """Test only: hold (or release) the fake forwards whose worker-0 core is ``core``."""
+        _refuse_test_only("test_kernel_hold", self.variant)
+        self._module.expert_stream_test_kernel_hold(int(core), int(bool(on)))
 
     def test_keep_warm_calls(self) -> int:
-        """Test only: calls of the fake keep-warm since the last test_keep_warm_address."""
+        """Test only: calls of the fake kernel's keep-warm since :meth:`test_kernel_address`."""
         _refuse_test_only("test_keep_warm_calls", self.variant)
         return int(self._module.expert_stream_test_keep_warm_calls())
 
-    def test_keep_warm_engine(self) -> int:
-        """Test only: the engine the fake keep-warm's last call took (-1 before any call)."""
-        _refuse_test_only("test_keep_warm_engine", self.variant)
-        return int(self._module.expert_stream_test_keep_warm_engine())
+    def test_keep_warm_core(self) -> int:
+        """Test only: the first core the fake keep-warm's last call took (-1 before any call)."""
+        _refuse_test_only("test_keep_warm_core", self.variant)
+        return int(self._module.expert_stream_test_keep_warm_core())
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
         """Return whether every job given to the copy thread finished in ``timeout_s``.

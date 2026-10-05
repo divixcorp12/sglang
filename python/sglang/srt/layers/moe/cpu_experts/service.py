@@ -83,7 +83,7 @@ class CpuExpertService:
 
     At several NUMA nodes there is one service per group (``CpuExpertGroups``): each runs
     its own engine on its node's cores and writes its own two output parts of a row. A
-    service made with ``shared`` uses that service's pinned rows and layer handles.
+    service made with ``shared`` uses that service's pinned rows and layer specs.
     """
 
     def __init__(
@@ -121,7 +121,7 @@ class CpuExpertService:
                 "CPU experts need the slabs of every service row 0..rows-1"
             )
         if shared is not None:
-            self.x_rows, self.out_rows, self.handles = shared.x_rows, shared.out_rows, shared.handles
+            self.x_rows, self.out_rows, self.layers = shared.x_rows, shared.out_rows, shared.layers
         else:
             # Row layout is in the class doc; pinned so the device reaches them by UVA.
             x_bytes = -(-2 * self.hidden // 16) * 16
@@ -132,19 +132,16 @@ class CpuExpertService:
                     self.x_rows.pin_memory(),
                     self.out_rows.pin_memory(),
                 )
-            self.handles: dict[int, object] = {}
+            self.layers: dict[int, object] = {}
         keep_warm_us = envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get()
-        self.engine = trait.native_create_engine(self.cores)  # never freed: the engine thread may run to process exit
         host.enable_cpu_experts(
-            trait.native_forward(),
+            trait.kernel_address(),
             self.split,
             self.cores,
             self.x_rows,
             self.out_rows,
             threads=self.threads,
             group=self.group,
-            engine=self.engine,
-            keep_warm=trait.native_keep_warm() if keep_warm_us > 0 else 0,
             keep_warm_us=max(keep_warm_us, 0),
         )
         self._last_stats = host.cpu_stats(self.group)
@@ -173,7 +170,7 @@ class CpuExpertService:
 
     def registered(self, row: int) -> bool:
         """Whether ``row`` has been registered with the kernel."""
-        return row in self.handles
+        return row in self.layers
 
     def attach_device(self, device_side) -> None:
         """Attach the device side, which types CPU lanes for registered rows only.
@@ -181,7 +178,7 @@ class CpuExpertService:
         It is told of every row registered now and of each registered later.
         """
         self.device_side = device_side
-        for row in self.handles:
+        for row in self.layers:
             device_side.set_row_cpu(row)
 
     def register(self, row: int, act_limit: Optional[float]) -> None:
@@ -191,7 +188,7 @@ class CpuExpertService:
         activation limit is the layer's MoE runner config, which the service does not
         see at start-up. Every layer must use the same limit. A no-op once registered.
         """
-        if row in self.handles:
+        if row in self.layers:
             return
         if self.trait.act_limit is None:
             self.trait.act_limit = act_limit
@@ -203,11 +200,9 @@ class CpuExpertService:
         capacity = self._capacity(slabs)
         if capacity == 0:
             return
-        handle = self.trait.register_layer(
-            {name: slabs[name] for name in self.trait.slab_names}, capacity
-        )
-        self.handles[row] = handle
-        self.host.set_cpu_layer(row, int(handle))
+        spec = self.trait.layer_spec({name: slabs[name] for name in self.trait.slab_names}, capacity)
+        self.layers[row] = spec
+        self.host.set_cpu_layer(row, spec)
         if getattr(self, "device_side", None) is not None:
             self.device_side.set_row_cpu(row)
 
@@ -279,7 +274,7 @@ class CpuExpertService:
             or not envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.get()
         ):
             return None
-        row = calibration_row({r: self._group_slots(r) for r in self.handles}, self.lanes)
+        row = calibration_row({r: self._group_slots(r) for r in self.layers}, self.lanes)
         if row is None:
             logger.warning(
                 "CPU experts group %d calibration skipped: no registered row has %d RAM slots; keeping split %s",
@@ -351,8 +346,8 @@ class CpuExpertGroups:
     """One CpuExpertService per NUMA group of the host, each on its node's cores (spec 2026-10-03, Part 3).
 
     The services share the pinned rows (each group writes its own two output parts of a row) and the kernel's layer
-    registrations: one layer handle addresses a whole slab, so every group's engine gets the same handle. The split is
-    configured, re-tuned and calibrated per group.
+    registrations: one layer addresses a whole slab, so the host shares each row's layer among the groups' engines. The
+    split is configured, re-tuned and calibrated per group.
     """
 
     def __init__(self, host, trait, slabs_by_row, *, hidden: int, plans, split: Sequence[int], pin: bool = True):
@@ -378,7 +373,7 @@ class CpuExpertGroups:
         return self.services[0].registered(row)
 
     def register(self, row: int, act_limit: Optional[float]) -> None:
-        """Register ``row`` once; the host gives its handle to every group's engine."""
+        """Register ``row`` once; the host shares its layer among every group's engine."""
         self.services[0].register(row, act_limit)
 
     def attach_device(self, device_side) -> None:

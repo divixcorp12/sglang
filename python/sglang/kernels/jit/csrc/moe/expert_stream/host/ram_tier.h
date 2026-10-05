@@ -138,6 +138,7 @@ class RamTier {
     for (int64_t c : capacity)
       widest = std::max(widest, c);
     fill_packed_.reserve(static_cast<size_t>(widest));
+    cpu_layers_ = std::make_unique<CpuExpertLayers>(layers_);
   }
 
   // Joins the fill thread, then the copy thread, then the CPU thread. The copy thread's callbacks use the lease block
@@ -682,7 +683,13 @@ class RamTier {
     if (cpu != nullptr)
       throw std::runtime_error(
           error_prefix<Layout>() + "CPU experts are already enabled for group " + std::to_string(g));
-    config.rows = layers_;
+    if (config.kernel == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the format's kernel");
+    if (cpu_kernel_ != nullptr && cpu_kernel_ != config.kernel)
+      throw std::runtime_error(
+          error_prefix<Layout>() + "every group's CPU experts run one kernel: group " + std::to_string(g) +
+          " names " + config.kernel->name() + ", another group " + cpu_kernel_->name());
+    cpu_kernel_ = config.kernel;
+    config.layers = cpu_layers_.get();
     store_split(g, split.data(), static_cast<int64_t>(split.size()));
     const std::string prefix = std::string(Layout::kName) + " CPU experts: ";
     const std::string suffix = Wire::kNodes > 1 ? std::to_string(g) : std::string();
@@ -693,17 +700,32 @@ class RamTier {
     copy_engine_->set_cpu(g, cpu.get());
   }
 
-  // Registers `row`'s layer handle, from the trait's register_layer, on every group's engine: the kernel's handle
-  // addresses the whole slab, so one serves them all. Any time, once per row; until then no post types a CPU lane for
-  // the row.
-  void set_cpu_layer(int64_t row, int64_t handle) {
-    bool any = false;
-    for (int g = 0; g < groups(); ++g) {
-      if (dist_.group(g).cpu == nullptr) continue;
-      dist_.group(g).cpu->set_layer(row, handle);
-      any = true;
-    }
-    if (!any) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+  // Installs `row`'s layer, made by the enabled kernel, for every group's engine: the layer addresses the whole slab,
+  // so one serves them all. Any time, once per row; until then no post types a CPU lane for the row.
+  void set_cpu_layer(int64_t row, std::unique_ptr<cpu_experts::CpuExpertLayer> layer) {
+    if (cpu_kernel_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+    check_cpu_layer_row(row);
+    if (layer == nullptr || &layer->kernel() != cpu_kernel_)
+      throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer must come from the enabled kernel");
+    if (!cpu_layers_->set(row, std::move(layer)))
+      throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer is registered once");
+  }
+
+  // set_cpu_layer of the enabled kernel's make_layer over `d` and `params` (its std::invalid_argument propagates).
+  void make_cpu_layer(int64_t row, const cpu_experts::LayerSlabs& d, std::span<const std::byte> params) {
+    if (cpu_kernel_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
+    check_cpu_layer_row(row);
+    set_cpu_layer(row, cpu_kernel_->make_layer(d, params));
+  }
+
+  const cpu_experts::CpuExpertKernel* cpu_kernel() const {
+    return cpu_kernel_;
+  }
+
+  void check_cpu_layer_row(int64_t row) const {
+    if (row < 0 || row >= layers_)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU expert layer for row " + std::to_string(row) + " of " +
+                               std::to_string(layers_));
   }
 
   // Replaces group g's split table, for re-tuning. Any time; the device reads each entry once per post.
@@ -1944,6 +1966,9 @@ class RamTier {
   std::vector<std::array<int32_t, 3>> bulk_;
   int64_t layers_;
   int64_t experts_;
+  // Every row's CPU expert layer, shared by every group's engine; declared before dist_, so destroyed after the engines.
+  std::unique_ptr<CpuExpertLayers> cpu_layers_;
+  const cpu_experts::CpuExpertKernel* cpu_kernel_ = nullptr;  // every group's engine runs this one kernel
   // The NUMA groups: each one's reader, serve state and CPU experts (when enabled, group 0's, after the copy engine and
   // before the service threads; stopped after the copy thread). Declared before tiers_: the groups' ranges are checked
   // against the capacities first.

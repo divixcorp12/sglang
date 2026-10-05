@@ -381,19 +381,51 @@ struct HostExports {
     find(handle)->arm_copy_engine(on != 0);
   }
 
-  // Enables NUMA group `group`'s CPU experts. `forward` is a CpuExpertForward's address (the trait's native forward),
-  // whose layers register later (set_cpu_layer). `split` is int64 [Wire::kLanes + 1], CPU lanes per n eligible lanes;
+  // A slab table and a layer's scalars as LayerSlabs (set_cpu_layer, the test export kernel_layer): `slabs` int64
+  // [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab), n <= kMaxSlabs.
+  static cpu_experts::LayerSlabs layer_slabs(
+      TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation, double act_limit) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("slabs", TensorMatcher({-1, 2}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), slabs);
+    if (slabs.size(0) > cpu_experts::kMaxSlabs)
+      throw std::runtime_error(error_prefix<Layout>() + "a CPU expert layer has at most " +
+                               std::to_string(cpu_experts::kMaxSlabs) + " slabs");
+    cpu_experts::LayerSlabs d;
+    d.capacity = static_cast<int32_t>(capacity);
+    d.hidden = static_cast<int32_t>(hidden);
+    d.intermediate = static_cast<int32_t>(intermediate);
+    d.activation = static_cast<int32_t>(activation);
+    d.act_limit = static_cast<float>(act_limit);
+    d.slab_count = static_cast<int32_t>(slabs.size(0));
+    const auto* s = static_cast<const int64_t*>(slabs.data_ptr());
+    for (int i = 0; i < d.slab_count; ++i) {
+      d.slabs[i] = reinterpret_cast<const void*>(static_cast<intptr_t>(s[2 * i]));
+      d.slot_bytes[i] = static_cast<uint64_t>(s[2 * i + 1]);
+    }
+    return d;
+  }
+
+  // A layer's params tensor (uint8 [m], the format's parameter struct) as make_layer's bytes; empty for m = 0.
+  static std::span<const std::byte> params_bytes(TensorView params) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    expert_stream::verify_named("params", TensorMatcher({-1}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), params);
+    return {static_cast<const std::byte*>(params.data_ptr()), static_cast<size_t>(params.size(0))};
+  }
+
+  // Enables NUMA group `group`'s CPU experts. `kernel` is the format's CpuExpertKernel's address (the trait's
+  // kernel_address()), which must outlive the service; rows join once their layer is made (set_cpu_layer). `split` is
+  // int64 [Wire::kLanes + 1], CPU lanes per n eligible lanes;
   // `cores` is int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host
   // memory, where the post kernel writes a row's input; `out_rows` is float32 [rows, >= Wire::kNodes * parts * hidden]
   // in host memory, where the device reads a row's CPU partial sums (group g's part 0 the CPU hits', part 1 the CPU
-  // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. `engine` is the kernel's
-  // engine handle (its engine_create; 0: none), carried by every forward and keep-warm. `keep_warm` is a
-  // CpuExpertKeepWarm's address (0 for none) that the idle thread runs for keep_warm_ns after each job.
+  // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. `keep_warm_ns` > 0 runs
+  // the kernel's keep-warm while idle for that long after each job.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t group,
-      int64_t forward,
-      int64_t engine,
+      int64_t kernel,
       TensorView split,
       TensorView cores,
       TensorView x_rows,
@@ -402,7 +434,6 @@ struct HostExports {
       int64_t parts,
       int64_t threads,
       int64_t spin_ns,
-      int64_t keep_warm,
       int64_t keep_warm_ns) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -415,10 +446,9 @@ struct HostExports {
         "x_rows", TensorMatcher({rows, -1}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), x_rows);
     expert_stream::verify_named(
         "out_rows", TensorMatcher({rows, -1}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_mem), out_rows);
-    if (forward == 0) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the trait's native forward");
+    if (kernel == 0) throw std::runtime_error(error_prefix<Layout>() + "CPU experts need the format's kernel");
     expert_stream::CpuExpertConfig config;
-    config.forward = reinterpret_cast<expert_stream::CpuExpertForward>(static_cast<intptr_t>(forward));
-    config.engine = engine;
+    config.kernel = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int64_t i = 0; i < cores.size(0); ++i)
       config.cores.push_back(static_cast<int>(c[i]));
@@ -437,16 +467,27 @@ struct HostExports {
     config.threads = static_cast<int>(threads);
     config.spin_ns = spin_ns;
     if (keep_warm_ns < 0) throw std::runtime_error(error_prefix<Layout>() + "the keep-warm window is negative");
-    config.keep_warm = reinterpret_cast<expert_stream::CpuExpertKeepWarm>(static_cast<intptr_t>(keep_warm));
-    config.keep_warm_ns = keep_warm != 0 ? keep_warm_ns : 0;
+    config.keep_warm_ns = keep_warm_ns;
     const auto* sp = static_cast<const int64_t*>(split.data_ptr());
     find(handle)->enable_cpu_experts(
         static_cast<int>(group), std::move(config), std::vector<int64_t>(sp, sp + split.size(0)));
   }
 
-  // CPU experts: `row`'s layer handle (the trait's register_layer), once per row, at any time.
-  static void set_cpu_layer(int64_t handle, int64_t row, int64_t layer) {
-    find(handle)->set_cpu_layer(row, layer);
+  // CPU experts: `row`'s layer, made here by the enabled kernel's make_layer from the row's pinned slabs. `slabs` is
+  // int64 [n, 2] of {address, slot bytes} in the format's slab order (address 0: an absent optional slab), `params`
+  // uint8 [bytes] the format's parameter struct. Once per row, at any time; the slabs must outlive the service.
+  static void set_cpu_layer(
+      int64_t handle,
+      int64_t row,
+      TensorView slabs,
+      int64_t capacity,
+      int64_t hidden,
+      int64_t intermediate,
+      int64_t activation,
+      double act_limit,
+      TensorView params) {
+    find(handle)->make_cpu_layer(
+        row, layer_slabs(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params));
   }
 
   // Reserves every row's staging slots (up to k, fewer on a small tier) and publishes its first map delta
