@@ -5,7 +5,6 @@
 #if !defined(__linux__) || !defined(_OPENMP)
 #error The NVFP4 CPU expert kernel requires Linux and OpenMP.
 #endif
-#include "cpu_experts_cabi.h"
 #include "../upstream/kernels.h"
 #include "../../moe/expert_stream/host/cpu_experts/expert_forward.hpp"
 #include <algorithm>
@@ -19,6 +18,18 @@
 #include <new>
 #include <utility>
 #include <vector>
+
+// A layer's params: make_layer's `params` bytes are this struct. Packed row-major E2M1 weights (low nibble first),
+// GPU-ready 128x4-swizzled E4M3 scales. Slab strides are BYTES per host slot. slabs: w13, w2, sf13, sf2, gate_alpha,
+// down_alpha, optional up_alpha (null shares gate_alpha). Alphas are FP32 scalars per slot. activation 0 is ordinary
+// SiLU(gate)*up; act_limit L > 0 clamps gate=min(gate,L), up=clamp(up,-L,L) before SiLU. A layer stores views, never
+// repacks.
+struct SglangNvfp4CpuParams {
+    // 0: [gate,up], 1: [up,gate], 2: alternating 64-row [up,gate] chunks.
+    int32_t w13_layout;
+    // Cancel activation scales folded into GPU GEMM alphas; use 1 for weight-only alphas.
+    float inv_input_scale13, inv_input_scale2;
+};
 
 namespace sglang::nvfp4_cpu {
 // Internal linkage, like the framework: Nvfp4Quant's Layer embeds MoeBufferRows, which has it.
@@ -46,10 +57,10 @@ struct LayerInfo
     bool up_alpha;            // slab kUpAlpha is registered; else up shares the gate alpha
 };
 
-// The descriptor's slabs, in cpu_experts_cabi.h order.
+// The layer's slabs, in the slab order of SglangNvfp4CpuParams' comment.
 enum SlabName { kW13, kW2, kSf13, kSf2, kGateAlpha, kDownAlpha, kUpAlpha, kSlabNames };
 static_assert(kW13 == 0 && kSf13 == 2 && kGateAlpha == 4 && kUpAlpha == 6 && kSlabNames == 7,
-              "SlabName indexes LayerSlabs::slabs as cpu_experts_cabi.h orders them");
+              "SlabName indexes LayerSlabs::slabs in the quant's slab order");
 
 // The fewest bytes one slot's row of each slab holds: packed E2M1 weights (two per byte), E4M3 scales in the GPU's
 // 128x4 swizzle (rows padded to 128, scale groups to 4), one fp32 alpha. Registration refuses a smaller stride.
@@ -99,8 +110,8 @@ struct Nvfp4Quant
     static constexpr const char* kName = "nvfp4";
     static constexpr int kSlabs = kSlabNames;
     static constexpr uint32_t kOptionalSlabs = 1u << kUpAlpha;
-    static constexpr int kMaxRoutes = 8;      // the C ABI's k limit
-    static constexpr int kMaxRows = 1 << 16;  // the C ABI's rows limit; arbitrary, it keeps every scratch index in range
+    static constexpr int kMaxRoutes = 8;      // the forward's k limit
+    static constexpr int kMaxRows = 1 << 16;  // the forward's rows limit; arbitrary, it keeps every scratch index in range
     // The library holds both tiers and runs min(host, NVFP4_CPU_MAX_ISA): AVX2 on an AVX2/FMA host, else scalar.
     static constexpr Isa kTopIsa = Isa::Avx2;
     static constexpr const char* kIsaCapEnv = "NVFP4_CPU_MAX_ISA";

@@ -19,9 +19,7 @@ from filelock import FileLock
 
 _BUILD = Path(__file__).resolve().parent / "build.py"
 _KERNEL = Path(__file__).resolve().parents[4] / "kernels/jit/csrc/nvfp4"
-# cpu_experts_cabi.h includes the engine's forward ABI header, and quant.hpp the shared CPU experts framework, so the
-# library depends on both too.
-_FORWARD_ABI = _KERNEL.parent / "moe/expert_stream/host/cpu_experts_abi.h"
+# quant.hpp includes the shared CPU experts framework (kernel.hpp among it), so the library depends on it too.
 _COMMON = _KERNEL.parent / "moe/expert_stream/host/cpu_experts"
 _DEFAULT_BUILD_DIR = "~/.cache/sglang/nvfp4_cpu"
 
@@ -37,7 +35,7 @@ def _sources() -> list[Path]:
     optimized, upstream = _KERNEL / "optimized", _KERNEL / "upstream"
     return sorted(
         [*optimized.glob("*.cpp"), *optimized.glob("*.hpp"), *optimized.glob("*.h"), _BUILD]
-        + [*upstream.glob("*.c"), *upstream.glob("*.h"), *_COMMON.glob("*.hpp"), _FORWARD_ABI]
+        + [*upstream.glob("*.c"), *upstream.glob("*.h"), *_COMMON.glob("*.hpp")]
     )
 
 

@@ -154,7 +154,8 @@ def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch)
 
 @pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
 def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
-    """layer_spec gives the kernel's make_layer each slab's base and row size in EXL3_STREAMED_NAMES order, the shape, the clamp and SglangExl3CpuParams {bits, swizzled}."""
+    """layer_spec gives the kernel's make_layer each slab's base and row size in EXL3_STREAMED_NAMES order, the shape,
+    the clamp and SglangExl3CpuParams {bits, swizzled}."""
     import struct
 
     slabs = _exl3_slabs()

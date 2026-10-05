@@ -71,9 +71,9 @@ void exl3_moe_cpu_free_layer(int64_t handle);
 //   out:      [m, hidden] fp32, CPU (overwritten)
 // Tokens are grouped by expert; each expert runs gate/up GEMVs,
 // the activation, and the down GEMV, accumulating routing-weighted rows into out. Threaded over
-// an OpenMP team; the caller should release the GIL around this. Runs through the C ABI's forward
-// (sglang_exl3_cpu_experts_forward), so its limits apply (m <= 65536, top_k <= 32) and a refused
-// or concurrent call raises.
+// an OpenMP team; the caller should release the GIL around this. Runs through the kernel's forward
+// (exl3_cpu_kernel(), kernel.h), so its limits apply (m <= 65536, top_k <= 32) and a refused call
+// raises.
 void exl3_moe_cpu_forward
 (
     int64_t handle,
@@ -113,4 +113,3 @@ bool exl3_moe_cpu_has_avx512_bw();
 bool exl3_moe_cpu_has_avx512_vnni();
 bool exl3_moe_cpu_has_avx512_vbmi();
 
-#include "cpu_experts_cabi.h"

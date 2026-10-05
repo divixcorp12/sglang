@@ -1,7 +1,7 @@
 # Native NVFP4 CPU expert plugin
 
-Implements the `CpuExpertForward` callback from
-`kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h`, parallel to
+Implements a `CpuExpertKernel` (`kernels/jit/csrc/moe/expert_stream/host/cpu_experts/kernel.hpp`) for the
+CPU expert engine of `kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h`, parallel to
 `csrc/exl3/optimized`. The plugin and build are native C/C++ only. The engine's job ring,
 leases, pinned activation/output rows and completion signaling are reused.
 
@@ -13,7 +13,7 @@ python python/sglang/srt/layers/quantization/nvfp4/build.py \
 ```
 
 `--main HARNESS.cpp` links a native harness into an executable instead. Inside SGLang,
-`sglang.srt.layers.quantization.nvfp4.ext.nvfp4_cpu_library()` builds the library on first use with `$CXX`
+`sglang.srt.layers.quantization.nvfp4.ext.nvfp4_cpu_module()` builds the library on first use with `$CXX`
 and caches it under `~/.cache/sglang/nvfp4_cpu` by a hash of the sources, flags and compiler. The build targets
 baseline x86-64 and holds both ISA tiers: at the first forward the library picks AVX2 on an AVX2/FMA host, else the
 scalar loop. `NVFP4_CPU_MAX_ISA=scalar` caps the tier (it never raises it) and `NVFP4_CPU_REPORT_ISA=1` prints the
@@ -30,34 +30,26 @@ See [upstream provenance and adaptation details](../upstream/README.md).
 
 ## Attach to the existing engine
 
-Include `cpu_experts_cabi.h` and load the library `build.py` or
-`nvfp4.ext.nvfp4_cpu_library()` builds. Register each layer
-using the common `SglangCpuExpertsLayer` descriptor (`cpu_experts_abi.h`, `slab_count` 7) whose `params` points at a
-`SglangNvfp4CpuParams` (W13 layout, inverse input scales). Registration stores views; the registrant keeps the slabs
-and the parameters alive until `free_layer`. The optimized kernel never repacks or expands full
-weight rows.
+The library's kernel is a `CpuExpertKernel` behind its accessor `nvfp4_cpu_kernel()` (`kernel.h`, hidden: never
+interposed across libraries). Python reaches it through the library's one tvm-ffi export, `nvfp4_cpu_kernel_address`
+(`ffi.cpp`; `nvfp4.ext.nvfp4_cpu_kernel_address()`), and hands that address to
+`ExpertStreamHost.enable_cpu_experts`. The host makes each layer with the kernel's `make_layer`
+(`ExpertStreamHost.set_cpu_layer`) from a `CpuExpertLayerSpec` (`Nvfp4CpuQuantTrait.layer_spec`): seven slabs
+(`LayerSlabs`) and a `SglangNvfp4CpuParams` (W13 layout, inverse input scales; `quant.hpp`) as the params bytes. A
+layer stores views; the registrant keeps the slabs alive while the host may read them. The optimized kernel never
+repacks or expands full weight rows. A native caller does the same through `kernel.h`:
 
 ```cpp
-int64_t handle = -1;
-// Populate descriptor with this layer's verified layout/scales/slab pointers.
-if (sglang_nvfp4_cpu_experts_register_layer(&descriptor, &handle) != 0)
-    throw std::runtime_error("NVFP4 CPU layer registration failed");
-
-CpuExpertConfig config;
-config.forward = &sglang_nvfp4_cpu_experts_forward;
-// Fill config's existing x/out row tables, dimensions, threads and core list.
-// The kernel's engine on the same cores, passed on every forward and keep-warm:
-if (sglang_nvfp4_cpu_experts_engine_create(cores.data(), cores.size(), &config.engine) != 0)
-    throw std::runtime_error("NVFP4 CPU engine refused its cores");
-CpuExpertEngine engine(config, prefix, thread_name);
-engine.set_layer(row, handle);
-engine.start();
-// Submit existing CpuJob records through the tier's owner.
-// During teardown: engine.stop(), then free every registered layer and the kernel engine.
+const auto& kernel = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel();
+// Populate d (LayerSlabs) with this layer's verified slab pointers and strides, and params.
+std::unique_ptr<CpuExpertLayer> layer =
+    kernel.make_layer(d, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)));
+ForwardCall call;  // rows, k, threads, x, slots, weights, out, accumulate
+call.cores = cores;  // worker i on cores[i]; distinct, at least call.threads of them
+kernel.forward(*layer, call);  // throws std::invalid_argument on a refused call, out untouched
 ```
 
-Check every native return status in actual integration code. The kernel's core
-list must match the engine's list and contain at least `config.threads` cores.
+A refused call throws `std::invalid_argument`, a failure another `std::exception`; either leaves `out` untouched.
 Registration supports different descriptors per layer. This change supplies
 the native kernel and benchmark; automatic runtime selection is not wired.
 
@@ -109,7 +101,7 @@ Other activation conventions (Bailing post-SiLU clamps, GPT-OSS shifted/scaled
 SwiGLU, SiTU, GELU, ReLU2, non-gated experts) must not use this descriptor.
 It is not bit-identical to GPU W4A4 or a full-precision CPU activation path.
 The benchmark reports Q8 quantization error against a W4A16 reference. Q8
-deltas above finite FP16 range and nonfinite activations return status 2;
+deltas above finite FP16 range and nonfinite activations are refused (`std::invalid_argument`);
 blocks whose delta rounds to zero contribute zero.
 
 ## Threading and lifetime
@@ -117,26 +109,24 @@ blocks whose delta rounds to zero contribute zero.
 Each forward runs one OpenMP team of `threads` workers, the calling engine thread as worker 0, in four phases
 separated by barriers: every token's input to Q8_0; every routed expert's gate/up rows and SiLU; every intermediate to
 Q8_0; every expert's down rows, each token's summed in its routing order into its row of `out`. Create an engine
-(`sglang_nvfp4_cpu_experts_engine_create`) from distinct Linux cores and name it in the call's `engine`; worker i is
-pinned to its core i (once, then re-checked cheaply), and engine 0 runs unpinned workers. A forward may use any team
-size up to the engine's cores (more is refused, 2). If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`,
-`OMP_DYNAMIC`), the forward returns 1 and leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE
-GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave `OMP_PROC_BIND` unset. Forwards on any engines run at once from
-different threads; `free_layer` returns 3 while one runs. `sglang_nvfp4_cpu_experts_keep_warm` holds the same pinned
-team in register-only work at the forward's vector width between calls. Stop/join the engine before freeing handles or
-slab storage; do not unload the library while callbacks are in use. The kernel requires Linux and OpenMP.
+Pass distinct Linux cores in the call's `cores`; worker i is pinned to cores[i] (once, then re-checked cheaply), and
+no cores runs unpinned workers. A forward may use any team size up to its cores (more is refused:
+`std::invalid_argument`). If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`, `OMP_DYNAMIC`), the forward throws and
+leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE
+GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave `OMP_PROC_BIND` unset. Forwards on any cores run at once from
+different threads. The kernel's `keep_warm` holds the same pinned team in register-only work at the forward's vector
+width between calls. Stop/join the engine before freeing layers or slab storage; do not unload the library while the
+host holds its kernel's address. The kernel requires Linux and OpenMP.
 
-The forward takes one `SglangCpuExpertsForward` (`cpu_experts_abi.h`
-beside the engine, shared with the EXL3 kernel): up to 65536 token rows of up
+The forward takes one `ForwardCall` (`kernel.hpp`, shared with the EXL3 kernel): up to 65536 token rows of up
 to eight lanes each. It skips -1 slots, preserves each row's routing order
 including duplicate slots, and supports overwrite or accumulation. Rows that
 route to the same slot are computed together, up to four per decoded weight
 row; every row's output is bitwise its own one-row call's. The engine sends
 one row per job. Caller
 pointer extents and finite activation/block-scale values are required. Raw
-pointers cannot prove allocation size. Status: 0 success, 1 internal error,
-2 invalid arguments, 3 a free_layer while a forward runs. The engine's nonzero-status fail-stop
-behavior is unchanged.
+pointers cannot prove allocation size. A refused call throws `std::invalid_argument`, a failure another
+`std::exception`; the engine fails stop on either, as it did on a nonzero status.
 
 ## Code layout
 
@@ -146,7 +136,7 @@ CPU experts framework's (`expert_stream/host/cpu_experts/`, `ExpertForward<Nvfp4
 facts; `math.hpp` the ISA-independent arithmetic (`GpuRow`, Q8_0 quantization, the gated SiLU) and `dot_rows<Isa, M>`,
 whose tiers are `math_scalar.hpp` and `math_avx2.hpp` (compiled for AVX2 by function attribute); `forward_plan.hpp`
 holds the plan, its types (`RouteBinding`, `Chunk`, `ForwardCtx`) and its per-thread scratch, `ForwardArena`;
-`kernel.cpp` defines `Nvfp4Quant::dispatch` and the C ABI (one `SGLANG_CPU_EXPERTS_DEFINE_CABI`). A forward is
+`kernel.cpp` defines `Nvfp4Quant::dispatch` and the kernel's accessor (`nvfp4_cpu_kernel`). A forward is
 `ForwardPlan<Shape, Isa>::run` (`forward_plan.hpp`), picked once per call in `Nvfp4Quant::dispatch` from the tier
 `ExpertForward` detected: `ForwardPlan<MimoV26ProShape, Isa::Avx2>` when `MimoV26ProShape::accepts` the layer at the
 AVX2 tier, else `ForwardPlan<GenericShape, Isa::Avx2>` or `ForwardPlan<GenericShape, Isa::Scalar>`.

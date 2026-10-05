@@ -4,14 +4,13 @@
 // compact activations, parallel preparation/middle stages, fused down transforms,
 // and cache-line output partitioning. See README.txt for measured provenance.
 // The arithmetic is math.hpp and each tier's math_scalar.hpp, math_avx2.hpp and math_avx512.hpp; the forward is
-// forward_plan.hpp (with shapes.hpp). This file holds the C ABI and the torch wrappers.
+// forward_plan.hpp (with shapes.hpp). This file holds the kernel's accessor and the torch wrappers.
 #if !defined(__linux__) || !defined(_OPENMP)
 #error This CPU expert implementation requires Linux and OpenMP.
 #endif
 #include "moe_mul1.h"
 #include "kernel.h"
 #include "quant.hpp"
-#include "../../moe/expert_stream/host/cpu_experts/cabi.hpp"
 #include <c10/util/Half.h>
 #include <ATen/ATen.h>
 
@@ -38,8 +37,6 @@ const ::sglang::cpu_experts::CpuExpertKernel& exl3_cpu_kernel()
 
 // Kept for upstream's bindings. Phase timing is compile-time here (ForwardPlan's Profile, forward_plan.hpp).
 void exl3_moe_cpu_set_prof(bool) {}
-
-SGLANG_CPU_EXPERTS_DEFINE_CABI(exl3, ::sglang::exl3_cpu::Exl3Quant, ::sglang::exl3_cpu::exl3_cpu_kernel)
 
 namespace {
 using ::sglang::exl3_cpu::Exl3Quant;

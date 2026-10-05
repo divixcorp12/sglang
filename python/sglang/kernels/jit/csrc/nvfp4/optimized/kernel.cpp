@@ -7,7 +7,6 @@
 #include "quant.hpp"
 #include "math_scalar.hpp"
 #include "math_avx2.hpp"
-#include "../../moe/expert_stream/host/cpu_experts/cabi.hpp"
 
 namespace sglang::nvfp4_cpu {
 namespace {
@@ -38,4 +37,3 @@ const ::sglang::cpu_experts::CpuExpertKernel& nvfp4_cpu_kernel()
 }
 }  // namespace sglang::nvfp4_cpu
 
-SGLANG_CPU_EXPERTS_DEFINE_CABI(nvfp4, ::sglang::nvfp4_cpu::Nvfp4Quant, ::sglang::nvfp4_cpu::nvfp4_cpu_kernel)

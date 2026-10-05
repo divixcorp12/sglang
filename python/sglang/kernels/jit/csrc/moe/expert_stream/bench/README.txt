@@ -2,7 +2,7 @@ Native DSV4.1 CPU expert benchmarks
 ===================================
 
 Two benchmark families live here:
-  - the bare forward: one full CPU-expert forward through the native C ABI,
+  - the bare forward: one full CPU-expert forward through the kernel interface,
     baseline kernel against optimized kernel (exl3_cpu_baseline,
     exl3_cpu_optimized);
   - the full stack: the real RamTier, RamThread, copy engine and CPU expert
@@ -119,7 +119,7 @@ Single-process examples:
 
 Timing interpretation
 ---------------------
-One iteration is one native service C ABI full forward: routing-weight
+One iteration is one full forward through the kernel interface: routing-weight
 conversion, kernel preparation, gate/up, activation/down preparation, down and
 output reduction, including OpenMP scheduling and barriers. No Python, GPU work
 or driver-process work is inside it. Manual timing brackets only this C++ call
@@ -245,8 +245,8 @@ with a fake forward.
 Benchmarks and counters
 -----------------------
 Per k in 1, 3, 5 (experts 0..k-1, cpu_forward.cpp's weights, 8 layers rotated):
-  BM_bare/experts:k   the C ABI forward, called from worker 0's CPU, on the
-                      stack's handles, slots, x and output
+  BM_bare/experts:k   the kernel's forward, called from worker 0's CPU, on
+                      the stack's slabs (its own layers), slots, x and output
   BM_stack/experts:k  x store, record, gate close, spin until CopyDone == G;
                       t0 before the x store, t1 at CopyDone
 
