@@ -124,10 +124,6 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "test_kernel_hold",
     "test_keep_warm_calls",
     "test_keep_warm_core",
-    "kernel_layer",
-    "kernel_forward",
-    "kernel_error",
-    "kernel_drop",
 )
 
 
@@ -1191,11 +1187,11 @@ _kernel_layer_keep: dict[int, tuple] = {}
 
 
 def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
-    """Test only: kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
+    """Kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
 
-    ``spec.keep`` is kept alive until :func:`kernel_drop`. Instrumented build only.
+    ``spec.keep`` is kept alive until :func:`kernel_drop`. Both builds: the DSpark draft's CPU experts
+    (``cpu_experts/draft.py``) run through it, and tests.
     """
-    _refuse_test_only("kernel_layer", variant)
     slabs, params = _layer_tensors(spec)
     layer = int(
         _host_module(layout, variant).expert_stream_kernel_layer(
@@ -1226,12 +1222,12 @@ def kernel_forward(
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> tuple[int, str]:
-    """Test only: one forward of :func:`kernel_layer`'s ``layer``.
+    """One forward of :func:`kernel_layer`'s ``layer`` over ``rows`` token rows (x ``[rows, H]``, slots and weights
+    ``[rows, k]``).
 
     Returns (0, "") or the kernel's refusal: (2, why) for a bad call, (1, why) for a failure; ``out`` is untouched
-    then. Pins the calling thread to ``cores[0]``. Instrumented build only.
+    then. Pins the calling thread to ``cores[0]``. Both builds.
     """
-    _refuse_test_only("kernel_forward", variant)
     module = _host_module(layout, variant)
     status = int(
         module.expert_stream_kernel_forward(
@@ -1250,8 +1246,7 @@ def kernel_forward(
 
 
 def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = None) -> None:
-    """Test only: release :func:`kernel_layer`'s ``layer``. Instrumented build only."""
-    _refuse_test_only("kernel_drop", variant)
+    """Release :func:`kernel_layer`'s ``layer``. Both builds."""
     _host_module(layout, variant).expert_stream_kernel_drop(int(layer))
     _kernel_layer_keep.pop(int(layer), None)
 

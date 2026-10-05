@@ -12,7 +12,8 @@
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_keep_warm_calls, test_keep_warm_core,
 //              pause_ns
-//   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: any kernel's make_layer and forward, by layer id
+//   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: any kernel's make_layer and forward, by layer id;
+//              in both builds, as the DSpark draft's CPU experts call them (cpu_experts/draft.py)
 //
 // Arguments are validated by the Python wrappers in
 // python/sglang/kernels/ops/moe/expert_stream_transport.py.
@@ -817,7 +818,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
-  // Test only: layers a test made with any kernel's make_layer (kernel_layer), by id, for kernel_forward.
+  // Layers made with any kernel's make_layer (kernel_layer), by id, for kernel_forward: the DSpark draft's CPU experts
+  // (cpu_experts/draft.py) and tests.
   static std::mutex& kernel_layers_mutex() {
     static std::mutex mutex;
     return mutex;
@@ -836,98 +838,82 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     return text;
   }
 
-  // Test only: kernel `kernel`'s make_layer over a slab table as set_cpu_layer takes it; returns the layer's id. The
+  // Kernel `kernel`'s make_layer over a slab table as set_cpu_layer takes it; returns the layer's id. The
   // kernel's std::invalid_argument propagates.
   static int64_t kernel_layer(int64_t kernel, TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate,
                               int64_t activation, double act_limit, TensorView params) {
-    if constexpr (!Build::kFaults) {
-      test_only("kernel_layer");
-    } else {
-      const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
-      cpu_experts::ExpertLayer layer =
-          k->make_layer(Base::layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit),
-                        Base::params_bytes(params));
-      std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-      kernel_layers().push_back({layer, hidden});
-      return static_cast<int64_t>(kernel_layers().size() - 1);
-    }
+    const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
+    cpu_experts::ExpertLayer layer =
+        k->make_layer(Base::layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit),
+                      Base::params_bytes(params));
+    std::lock_guard<std::mutex> lock(kernel_layers_mutex());
+    kernel_layers().push_back({layer, hidden});
+    return static_cast<int64_t>(kernel_layers().size() - 1);
   }
 
-  // Test only: one forward of layer `id` with its own kernel: x fp16 [rows, hidden] (every format's input today),
+  // One forward of layer `id` with its own kernel: x fp16 [rows, hidden] (every format's input today),
   // slots int32 and weights float32 [rows, k], out float32 [rows, hidden], hidden the layer's, all contiguous CPU;
   // cores int64 [n] (empty: unpinned). The shapes are checked against the layer, so a short x or out is refused here
   // rather than read or written past its end. Returns 0, 2 for std::invalid_argument, 1 for any other exception, its
   // message in kernel_error().
   static int64_t kernel_forward(int64_t id, TensorView x, TensorView slots, TensorView weights, TensorView out,
                                 int64_t threads, TensorView cores, int64_t accumulate) {
-    if constexpr (!Build::kFaults) {
-      test_only("kernel_forward");
-    } else {
-      KernelLayer entry;
-      {
-        std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-        if (id < 0 || id >= static_cast<int64_t>(kernel_layers().size()) || !kernel_layers()[id].layer.kernel)
-          throw std::runtime_error("kernel_forward: no layer " + std::to_string(id));
-        entry = kernel_layers()[id];
-      }
-      using namespace host;
-      auto cpu = SymbolicDevice{};
-      auto rows = SymbolicSize{"rows"};
-      auto k = SymbolicSize{"k"};
-      const int64_t hidden = entry.hidden;
-      // fp16 has no host-side dtype trait (fp16_t is CUDA-only), so the dtype is checked by hand.
-      expert_stream::verify_named("x", TensorMatcher({rows, hidden}).with_device<kDLCPU>(cpu), x);
-      if (x.dtype().code != kDLFloat || x.dtype().bits != 16 || x.dtype().lanes != 1)
-        throw std::runtime_error("kernel_forward: x must be float16");
-      expert_stream::verify_named("slots", TensorMatcher({rows, k}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), slots);
-      expert_stream::verify_named("weights", TensorMatcher({rows, k}).with_dtype<float>().with_device<kDLCPU>(cpu), weights);
-      expert_stream::verify_named("out", TensorMatcher({rows, hidden}).with_dtype<float>().with_device<kDLCPU>(cpu), out);
-      expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
-      const cpu_experts::ExpertLayer& layer = entry.layer;
-      std::vector<int> on;
-      const auto* c = static_cast<const int64_t*>(cores.data_ptr());
-      for (int64_t i = 0; i < cores.size(0); ++i)
-        on.push_back(static_cast<int>(c[i]));
-      cpu_experts::ForwardCall call;
-      call.rows = static_cast<int32_t>(slots.size(0));
-      call.k = static_cast<int32_t>(slots.size(1));
-      call.threads = static_cast<int32_t>(threads);
-      call.x = x.data_ptr();
-      call.slots = static_cast<const int32_t*>(slots.data_ptr());
-      call.weights = static_cast<const float*>(weights.data_ptr());
-      call.out = static_cast<float*>(out.data_ptr());
-      call.accumulate = accumulate != 0;
-      call.cores = on;
-      kernel_error_text().clear();
-      try {
-        layer.kernel->check(layer, call);
-        layer.kernel->forward(layer, call);
-        return 0;
-      } catch (const std::invalid_argument& e) {
-        kernel_error_text() = e.what();
-        return 2;
-      } catch (const std::exception& e) {
-        kernel_error_text() = e.what();
-        return 1;
-      }
+    KernelLayer entry;
+    {
+      std::lock_guard<std::mutex> lock(kernel_layers_mutex());
+      if (id < 0 || id >= static_cast<int64_t>(kernel_layers().size()) || !kernel_layers()[id].layer.kernel)
+        throw std::runtime_error("kernel_forward: no layer " + std::to_string(id));
+      entry = kernel_layers()[id];
+    }
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    auto rows = SymbolicSize{"rows"};
+    auto k = SymbolicSize{"k"};
+    const int64_t hidden = entry.hidden;
+    // fp16 has no host-side dtype trait (fp16_t is CUDA-only), so the dtype is checked by hand.
+    expert_stream::verify_named("x", TensorMatcher({rows, hidden}).with_device<kDLCPU>(cpu), x);
+    if (x.dtype().code != kDLFloat || x.dtype().bits != 16 || x.dtype().lanes != 1)
+      throw std::runtime_error("kernel_forward: x must be float16");
+    expert_stream::verify_named("slots", TensorMatcher({rows, k}).with_dtype<int32_t>().with_device<kDLCPU>(cpu), slots);
+    expert_stream::verify_named("weights", TensorMatcher({rows, k}).with_dtype<float>().with_device<kDLCPU>(cpu), weights);
+    expert_stream::verify_named("out", TensorMatcher({rows, hidden}).with_dtype<float>().with_device<kDLCPU>(cpu), out);
+    expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
+    const cpu_experts::ExpertLayer& layer = entry.layer;
+    std::vector<int> on;
+    const auto* c = static_cast<const int64_t*>(cores.data_ptr());
+    for (int64_t i = 0; i < cores.size(0); ++i)
+      on.push_back(static_cast<int>(c[i]));
+    cpu_experts::ForwardCall call;
+    call.rows = static_cast<int32_t>(slots.size(0));
+    call.k = static_cast<int32_t>(slots.size(1));
+    call.threads = static_cast<int32_t>(threads);
+    call.x = x.data_ptr();
+    call.slots = static_cast<const int32_t*>(slots.data_ptr());
+    call.weights = static_cast<const float*>(weights.data_ptr());
+    call.out = static_cast<float*>(out.data_ptr());
+    call.accumulate = accumulate != 0;
+    call.cores = on;
+    kernel_error_text().clear();
+    try {
+      layer.kernel->check(layer, call);
+      layer.kernel->forward(layer, call);
+      return 0;
+    } catch (const std::invalid_argument& e) {
+      kernel_error_text() = e.what();
+      return 2;
+    } catch (const std::exception& e) {
+      kernel_error_text() = e.what();
+      return 1;
     }
   }
 
   static std::string kernel_error() {
-    if constexpr (!Build::kFaults) {
-      test_only("kernel_error");
-    } else {
-      return kernel_error_text();
-    }
+    return kernel_error_text();
   }
 
   static void kernel_drop(int64_t id) {
-    if constexpr (!Build::kFaults) {
-      test_only("kernel_drop");
-    } else {
-      std::lock_guard<std::mutex> lock(kernel_layers_mutex());
-      if (id >= 0 && id < static_cast<int64_t>(kernel_layers().size())) kernel_layers()[id] = {};
-    }
+    std::lock_guard<std::mutex> lock(kernel_layers_mutex());
+    if (id >= 0 && id < static_cast<int64_t>(kernel_layers().size())) kernel_layers()[id] = {};
   }
 
   // Test only (HostCopyBackend): lets `marks` more copy marks complete (negative: all).
