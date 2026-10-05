@@ -3,7 +3,6 @@
 import dataclasses
 import faulthandler
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -23,7 +22,7 @@ from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script, same_bytes
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, run_host_script, same_bytes, spawn_child
 
 W = wire_layout(8)
 DEMAND_RING, DEMAND_RECORDS, RECORD_BYTES, PAGE_BYTES = W.demand_ring, W.demand_records, W.record_bytes, W.page_bytes
@@ -351,12 +350,15 @@ host.stop()
 """
 
 
+def test_the_mapping_child_builds_what_the_parent_warms():
+    """spawn_child warms the default build at 8 lanes and one node: the script names no variant and no other wire."""
+    assert "variant=" not in _MAPPING_ROW and "wire_layout(8)" in _MAPPING_ROW
+
+
 def test_mapping_refuses_a_row_out_of_range(tmp_path):
     """mapping indexes tiers_[row] with no check; its three row-taking siblings refuse through row_capacity.
     In a subprocess: before the check, the row indexes past tiers_, which may kill the process."""
-    result = subprocess.run(
-        [sys.executable, "-c", _MAPPING_ROW, str(tmp_path)], capture_output=True, text=True, timeout=120
-    )
+    result = spawn_child(_MAPPING_ROW, tmp_path, timeout_s=120)  # no variant: the child's default build
     assert "streamed row 2 is out of range" in result.stdout, (result.returncode, result.stdout, result.stderr[-2000:])
 
 

@@ -87,13 +87,27 @@ def host_compiler_path() -> str:
     return os.environ.get("CXX", "c++")
 
 
-_NEVER_EMITTED_MACROS = frozenset({"#define __SGX__ 1"})
+# Macros a resolved -march may define beyond what native does, matched by name.
+# __SGX__ gates enclave intrinsics only; the compiler never emits those instructions
+# on its own, so a name that carries it for the CPU family cannot cause a SIGILL.
+_ALLOWED_EXTRA_MACROS = frozenset({"__SGX__"})
 
 
 def _compiler_output(args: List[str]) -> str:
+    # C locale: the `-Q --help=target` text is parsed, and a translated one would not match.
     return subprocess.run(
-        args, check=True, capture_output=True, text=True, timeout=30
+        args,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "LC_ALL": "C"},
     ).stdout
+
+
+def _macro_name(line: str) -> str:
+    parts = line.split()
+    return parts[1] if len(parts) > 1 else line
 
 
 @cache_once
@@ -107,16 +121,16 @@ def host_arch_flags() -> List[str]:
     (compared by predefined macros); a VM masking features or an unknown CPU makes
     it enable more, and then the compiler's own default arch is kept. Native
     enabling *more* than the name (``__ABM__``, ``__RTM__`` on divix01) only costs
-    those instructions, and ``__SGX__`` is never emitted by codegen, so a name that
-    carries it for the CPU family is still safe.
+    those instructions, and the macros in ``_ALLOWED_EXTRA_MACROS`` are safe in the name.
 
     ``SGLANG_JIT_HOST_MARCH`` overrides: ``default`` keeps the compiler's arch, and
-    any other value is passed as ``-march=<value>`` (building for another machine).
+    ``native`` resolves like unset, and any other value is passed as ``-march=<value>``
+    (building for another machine).
     """
     if is_hip_runtime():
         return []
     override = envs.SGLANG_JIT_HOST_MARCH.get()
-    if override is not None:
+    if override is not None and override != "native":
         return [] if override == "default" else [f"-march={override}"]
 
     cxx = host_compiler_path()
@@ -137,7 +151,11 @@ def host_arch_flags() -> List[str]:
             error,
         )
         return []
-    beyond_native = named - native - _NEVER_EMITTED_MACROS
+    beyond_native = {
+        line
+        for line in named - native
+        if _macro_name(line) not in _ALLOWED_EXTRA_MACROS
+    }
     if beyond_native:
         logger.warning(
             "-march=%s enables %s, which -march=native does not on this CPU; JIT "

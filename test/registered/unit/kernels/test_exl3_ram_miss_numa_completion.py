@@ -6,8 +6,6 @@ The Python fake forwards run on the CPU expert threads and need the GIL, so ever
 
 import ctypes
 import os
-import subprocess
-import sys
 import textwrap
 import threading
 import time
@@ -20,7 +18,7 @@ from sglang.srt.layers.moe.cpu_experts.pool import CpuExpertForward
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, ram_miss_setup, spawn_child
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -234,10 +232,16 @@ assert host.pump() == 1 and sim.wait_served(req)
 """
 
 
+CHILD_VARIANT, CHILD_NODES = "instr", 2  # what _SCRIPT constructs; test_the_child_script_builds_what_the_parent_warms pins it
+
+
+def test_the_child_script_builds_what_the_parent_warms():
+    assert f'variant="{CHILD_VARIANT}"' in _SCRIPT and f"wire_layout(8, {CHILD_NODES})" in _SCRIPT
+
+
 def _run(tmp_path, body):
-    return subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(_SCRIPT) + textwrap.dedent(body), str(tmp_path)],
-        capture_output=True, text=True, timeout=120,
+    return spawn_child(
+        textwrap.dedent(_SCRIPT) + textwrap.dedent(body), tmp_path, timeout_s=120, variant=CHILD_VARIANT, nodes=CHILD_NODES
     )
 
 

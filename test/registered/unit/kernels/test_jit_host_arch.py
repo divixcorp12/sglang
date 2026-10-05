@@ -112,8 +112,38 @@ def test_a_compiler_that_cannot_answer_gives_the_default_arch(
     assert [r.levelno for r in caplog.records].count(logging.WARNING) == 1
 
 
-def test_a_missing_compiler_gives_the_default_arch(tmp_path, monkeypatch):
-    assert _resolve(monkeypatch, str(tmp_path / "absent")) == []
+def test_a_missing_compiler_gives_the_default_arch(tmp_path, monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger=toolchain.logger.name):
+        assert _resolve(monkeypatch, str(tmp_path / "absent")) == []
+    assert [r.levelno for r in caplog.records].count(logging.WARNING) == 1
+
+
+def test_an_allowlisted_macro_matches_by_name_not_by_value(tmp_path, monkeypatch):
+    compiler = _fake_compiler(
+        tmp_path,
+        help_branch=_ANSWERS_SKYLAKE,
+        named_macros="#define __AVX512F__ 1\n#define __SGX__ 2",
+    )
+    assert _resolve(monkeypatch, compiler) == ["-march=skylake-avx512"]
+
+
+def test_a_macro_off_the_allowlist_is_refused(tmp_path, monkeypatch):
+    compiler = _fake_compiler(
+        tmp_path,
+        help_branch=_ANSWERS_SKYLAKE,
+        named_macros="#define __AVX512F__ 1\n#define __SGX__ 1\n#define __RDSEED__ 1",
+    )
+    assert _resolve(monkeypatch, compiler) == []
+
+
+def test_the_probes_run_in_the_c_locale(tmp_path, monkeypatch):
+    # A translated `-Q --help=target` would not match the -march= parse.
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    compiler = _fake_compiler(
+        tmp_path,
+        help_branch=f'if [ "$LC_ALL" = C ]; then {_ANSWERS_SKYLAKE}; else echo Ziel; fi',
+    )
+    assert _resolve(monkeypatch, compiler) == ["-march=skylake-avx512"]
 
 
 def test_hip_takes_no_host_arch(tmp_path, monkeypatch):
@@ -132,6 +162,18 @@ def test_override_names_the_arch_verbatim(tmp_path, monkeypatch):
     # The compiler is not consulted: the point is building on one machine for another.
     with envs.SGLANG_JIT_HOST_MARCH.override("x86-64-v4"):
         assert _resolve(monkeypatch, str(tmp_path / "absent")) == ["-march=x86-64-v4"]
+
+
+def test_override_native_is_resolved_like_unset(tmp_path, monkeypatch):
+    compiler = _fake_compiler(tmp_path, help_branch=_ANSWERS_SKYLAKE)
+    with envs.SGLANG_JIT_HOST_MARCH.override("native"):
+        assert _resolve(monkeypatch, compiler) == ["-march=skylake-avx512"]
+
+
+def test_override_native_never_passes_native_through(tmp_path, monkeypatch):
+    compiler = _fake_compiler(tmp_path, help_branch="exit 1")
+    with envs.SGLANG_JIT_HOST_MARCH.override("native"):
+        assert "-march=native" not in _resolve(monkeypatch, compiler)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +216,20 @@ def test_both_halves_get_the_resolved_arch_and_nvcc_the_host_compiler(monkeypatc
     assert "-march=skylake-avx512" in fields["cxxflags"].split()
     assert "-Xcompiler -march=skylake-avx512" in fields["cudaflags"]
     assert "-ccbin /opt/gcc15/bin/g++" in fields["cudaflags"]
+    assert "-march=native" not in text
+
+
+def test_native_never_reaches_the_build_file_through_the_real_resolution(
+    tmp_path, monkeypatch
+):
+    compiler = _fake_compiler(tmp_path, help_branch=_ANSWERS_SKYLAKE)
+    monkeypatch.setattr(toolchain, "host_compiler_path", lambda: compiler)
+    monkeypatch.setattr(
+        toolchain, "host_arch_flags", toolchain.host_arch_flags.__wrapped__
+    )
+    with envs.SGLANG_JIT_HOST_MARCH.override("native"):
+        text = ninja.generate(_spec())
+    assert "-march=skylake-avx512" in text
     assert "-march=native" not in text
 
 

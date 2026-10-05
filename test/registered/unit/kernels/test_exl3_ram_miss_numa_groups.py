@@ -3,8 +3,6 @@ group serves only its home lanes (expert % 2), stages and evicts only in its own
 the groups' map deltas into one per record. ChainSim plays the device with the node-aware reference typing."""
 
 import os
-import subprocess
-import sys
 import textwrap
 
 import pytest
@@ -15,7 +13,7 @@ from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, paused, ram_miss_setup
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, paused, ram_miss_setup, spawn_child
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
@@ -208,12 +206,20 @@ def test_the_native_start_thread_warns_when_an_inherited_affinity_covers_the_res
     if (os.cpu_count() or 0) < 72:
         pytest.skip("needs cores 64-71")
     body = "import os; os.sched_setaffinity(0, {0, 64})\nhost.start_thread(fatal_wait_s=60.0)\nhost.stop()\nprint('reached')\n"
-    result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(_SCRIPT) + body, str(tmp_path)],
-        capture_output=True, text=True, timeout=120,
-    )
+    result = _run_child(textwrap.dedent(_SCRIPT) + body, tmp_path, 120)
     assert "reached" in result.stdout, result.stderr
     assert "run under taskset -c 0-63" in result.stderr
+
+
+CHILD_VARIANT, CHILD_NODES = "instr", 2  # what _SCRIPT constructs; test_the_child_script_builds_what_the_parent_warms pins it
+
+
+def test_the_child_script_builds_what_the_parent_warms():
+    assert f'variant="{CHILD_VARIANT}"' in _SCRIPT and f"wire_layout(8, {CHILD_NODES})" in _SCRIPT
+
+
+def _run_child(script, tmp_path, timeout):
+    return spawn_child(script, tmp_path, timeout_s=timeout, variant=CHILD_VARIANT, nodes=CHILD_NODES)
 
 
 _SCRIPT = """
@@ -236,10 +242,7 @@ def test_a_miss_on_another_nodes_staging_slot_fail_stops(tmp_path):
     """A device that put node 1's miss in node 0's staging slot 0 would have it read into node 0's memory: group 1
     checks its own list and fail-stops. A row-wide list would accept slot 0 (mutant: red)."""
     body = "sim.post(1, [1], kinds=[LaneKind.MISS_GPU], slots=[0])\nhost.pump()\nprint('reached')\n"
-    result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(_SCRIPT) + body, str(tmp_path)],
-        capture_output=True, text=True, timeout=120,
-    )
+    result = _run_child(textwrap.dedent(_SCRIPT) + body, tmp_path, 120)
     assert_aborted(result, "is not a staging slot")
 
 
@@ -260,9 +263,7 @@ print('reached')
 def test_a_group_the_device_lapped_serves_its_next_miss(tmp_path):
     """A record with no lane of a group's node is never waited on for that group, so it can fall a ring behind
     (delta 10); its next own miss must still pass the chain check, against the row's published chain."""
-    result = subprocess.run(
-        [sys.executable, "-c", _LAGGING, str(tmp_path)], capture_output=True, text=True, timeout=180
-    )
+    result = _run_child(_LAGGING, tmp_path, 180)
     assert result.returncode == 0 and "reached" in result.stdout, result.stderr[-2000:]
 
 
@@ -279,7 +280,5 @@ print('reached')
 
 
 def test_a_group_with_no_host_lane_skips_a_record_whose_hot_set_is_gone(tmp_path):
-    result = subprocess.run(
-        [sys.executable, "-c", _STALE_HOT, str(tmp_path)], capture_output=True, text=True, timeout=180
-    )
+    result = _run_child(_STALE_HOT, tmp_path, 180)
     assert result.returncode == 0 and result.stdout.split() == ["1", "reached"], result.stderr[-2000:]

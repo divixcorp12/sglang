@@ -112,10 +112,11 @@ CHILD = textwrap.dedent(
 
 def run_child(shim: Path, *, variant: str = "default", requests: int = 200, warmup: int = 50, tmp,
               copy_spin_us: int = 200) -> dict:
-    env = dict(os.environ, LD_PRELOAD=str(shim))
-    proc = subprocess.run([sys.executable, "-c", CHILD, variant, str(requests), str(warmup), str(tmp),
-                           str(copy_spin_us)],
-                          env=env, capture_output=True, text=True, timeout=600)
+    from sglang.test.dsv41_ram_miss_fixtures import spawn_child
+
+    # spawn_child warms the modules in this process, which has no preload: only the child gets the shim.
+    proc = spawn_child(CHILD, variant, requests, warmup, tmp, copy_spin_us, timeout_s=600,
+                       variant=None if variant == "default" else variant, env=dict(os.environ, LD_PRELOAD=str(shim)))
     line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("HOTPATH-COUNTS ")), None)
     assert proc.returncode == 0 and line, proc.stdout[-4000:] + proc.stderr[-4000:]
     return json.loads(line.split(" ", 1)[1])
