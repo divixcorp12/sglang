@@ -1170,7 +1170,7 @@ def _copy_engine_service(monkeypatch):
 
 
 def _batch(decode: bool):
-    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode))
+    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode, is_target_verify=lambda: False))
 
 
 def test_the_copy_engine_arms_only_after_enough_decode_forwards_not_batches(monkeypatch):
@@ -1197,6 +1197,27 @@ def test_the_copy_engine_arms_only_after_enough_decode_forwards_not_batches(monk
     assert not syncs, "a decode forward drained the device"
     service._copy_engine_barrier(0, _batch(decode=False))
     assert syncs == [True], "an eager forward did not drain the device once armed"
+
+
+def _verify_batch():
+    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: False, is_target_verify=lambda: True))
+
+
+def test_a_graphed_verify_counts_toward_arming_and_its_eager_re_run_drains(monkeypatch):
+    """A DSpark server's target forwards are all verifies: a graphed one counts like a decode, and the eager re-run
+    of an overflowed one (the manager's graph gather suspended) drains the device once armed."""
+    service, armed, syncs = _copy_engine_service(monkeypatch)
+    service.device_side.copy_engine_captured = True
+    service._manager = SimpleNamespace(graph_gather_suspended=False)
+    for _ in range(module.COPY_ENGINE_ARM_DECODES):
+        service._copy_engine_barrier(0, _verify_batch())
+    service._arm_copy_engine()
+    assert armed == [True] and not syncs
+    service._copy_engine_barrier(0, _verify_batch())
+    assert not syncs, "a graphed verify drained the device"
+    service._manager = SimpleNamespace(graph_gather_suspended=True)
+    service._copy_engine_barrier(0, _verify_batch())
+    assert syncs == [True], "an eager re-run did not drain the device once armed"
 
 
 @pytest.mark.parametrize("raises", [False, True])
