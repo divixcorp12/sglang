@@ -3,7 +3,8 @@ captured in a graph with no host read.
 
 Random valid EXL3 experts (no checkpoint read) in the [expert, part, ...] slab layout of a DSpark draft stage's
 parameters. Bars:
-  * parity: run() over all resident experts matches a dense fp32 reference, rel <= 2e-2, for M in (1, 2, 5, 6, 16);
+  * parity: run() over all resident experts matches a dense fp32 reference, rel <= 2e-2, for M in (1, 2, 5, 6, 10);
+    10 is the most a call holds at top-k 6 (64 routes, exl3_route_tables.cuh), and 11 is refused;
   * the sink: with resident {0, 2, 5}, routes to 1, 7 (not resident), -1 and 9 (out of range) add nothing, so run()
     matches exl3_moe_accumulate over experts [0, 2, 5]; with layer fusion on and off;
   * capture: a graph captured at M = 5 replays rewritten ids, weights and inputs bitwise equal to an eager run;
@@ -82,14 +83,22 @@ def _rel(got, want):
     return float((got.float() - want).norm() / want.norm())
 
 
-@pytest.mark.parametrize("m", [1, 2, 5, 6, 16])
+@pytest.mark.parametrize("m", [1, 2, 5, 6, 10])
 def test_all_resident_matches_the_dense_experts(layer, m):
     moe = _moe(layer, range(EXPERTS))
+    assert moe.tokens == 10
     gen = torch.Generator().manual_seed(100 + m)
     x, ids, weights = _inputs(gen, m, list(range(EXPERTS)))
     got = moe.run(x, ids, weights, LIMIT)
     assert got.dtype == torch.float32 and got.shape == (m, HIDDEN)
     assert _rel(got, _dense(layer, x, ids, weights, range(EXPERTS))) <= REL
+
+
+def test_a_call_past_the_stages_tokens_is_refused(layer):
+    moe = _moe(layer, range(EXPERTS))
+    x, ids, weights = _inputs(torch.Generator().manual_seed(5), 11, list(range(EXPERTS)))
+    with pytest.raises(ValueError, match="1-10 tokens"):
+        moe.run(x, ids, weights, LIMIT)
 
 
 @pytest.mark.parametrize("layer_fusion", [True, False])
@@ -130,7 +139,7 @@ def test_a_captured_run_replays_what_eager_computes(layer):
 
 def test_an_eager_run_reads_nothing_from_the_device(layer):
     moe = _moe(layer, [0, 2, 5])
-    x, ids, weights = _inputs(torch.Generator().manual_seed(3), 4, [0, 1, 2, 5, -1])
+    x, ids, weights = _inputs(torch.Generator().manual_seed(3), 4, [0, 1, 2, 5, 7, -1, 9])
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:

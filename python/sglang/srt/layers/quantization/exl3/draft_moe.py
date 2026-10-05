@@ -13,6 +13,9 @@ import torch
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.srt.layers.quantization.exl3.fused_moe import ROW_TILE, Exl3FusedMoE
 
+# The fused route tables take at most this many routes a call (exl3_route_tables.cuh, kMaxRoutes).
+FUSED_MAX_ROUTES = 64
+
 
 def draft_slot_map(resident_ids: Sequence[int], *, n_experts: int, device) -> torch.Tensor:
     """int64 [n_experts + 1]: the slot of each resident id, and `len(resident_ids)` (the sink) for every other id and at
@@ -30,7 +33,7 @@ class DraftResidentMoe:
     id that is not resident (CPU-owned, -1, out of range) goes to the sink slot `slots`, which the fused kernel
     ignores."""
 
-    TOKENS = ROW_TILE  # one fused call's tokens; a larger M runs in chunks of TOKENS
+    TOKENS = ROW_TILE  # the most tokens any stage's call holds (the fused kernel's row tile); `tokens` is this stage's
 
     def __init__(self, layer, resident_ids: Sequence[int], n_experts: int, device):
         device = torch.device(device)
@@ -51,6 +54,10 @@ class DraftResidentMoe:
         self.hidden = self.tensors["w13_suh"].shape[-1]
         self.inter = self.tensors["w2_suh"].shape[-1]
         self.top_k = layer.top_k
+        # One call's tokens: the row tile, and at most FUSED_MAX_ROUTES routes. A larger M runs in chunks of `tokens`.
+        self.tokens = min(self.TOKENS, FUSED_MAX_ROUTES // self.top_k)
+        if self.tokens < 1:
+            raise ValueError(f"a DSpark draft stage's top_k ({self.top_k}) exceeds the fused MoE's {FUSED_MAX_ROUTES} routes")
         self.device = device
         self.keep = torch.ones(1, dtype=torch.float32, device=device)
         self.fused = None
@@ -59,7 +66,7 @@ class DraftResidentMoe:
         """Build the fused MoE's static buffers and pointer tables (host work): before capture."""
         if self.fused is None:
             self.fused = Exl3FusedMoE(
-                self.tensors, self.slots, self.hidden, self.inter, self.top_k, self.device, tokens=self.TOKENS
+                self.tensors, self.slots, self.hidden, self.inter, self.top_k, self.device, tokens=self.tokens
             )
 
     @staticmethod
@@ -73,7 +80,7 @@ class DraftResidentMoe:
         return self.remap_with(self.expert_to_slot, topk_ids, n_experts=self.n_experts)
 
     def run(self, x, topk_ids, topk_weights, act_limit) -> torch.Tensor:
-        """x [M, H], M <= TOKENS; returns the fp32 [M, H] output of the resident routes, a view of the fused MoE's
+        """x [M, H], M <= tokens; returns the fp32 [M, H] output of the resident routes, a view of the fused MoE's
         buffer (valid until its next run)."""
         if self.fused is None:
             raise RuntimeError("DraftResidentMoe.run before prepare()")
