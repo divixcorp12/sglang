@@ -32,6 +32,7 @@ class ExpertForward final : public CpuExpertKernel
 public:
     static_assert(Quant::kSlabs >= 1 && Quant::kSlabs <= kMaxSlabs);
     static_assert(Quant::kMaxRows >= 1 && Quant::kMaxRoutes >= 1);
+
     using Params = typename Quant::Params;
     static_assert(std::is_trivially_copyable_v<Params> && sizeof(Params) <= kMaxParamBytes,
                   "params are stored in the layer as bytes");
@@ -106,6 +107,7 @@ public:
     {
         const CallCores on_cores(c.cores);
         const int status = Quant::dispatch(layer, layer.params_as<Params>(), c, isa());
+
         if (status != 0) [[unlikely]]
             failed(status);
     }
