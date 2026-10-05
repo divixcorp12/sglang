@@ -41,10 +41,11 @@ Standalone CPU library on divix01 (no CUDA compilation):
 
 Link the consumer against libexl3_cpu.so, torch_cpu, c10 and OpenMP and use moe_mul1.h, upstream's ATen
 layer-registration API (exl3_moe_cpu_make_layer, one tensor per expert and projection; exl3_moe_cpu_forward and
-exl3_moe_cpu_free_layer). Those layers live in this library's own handle table; packed matrix tensors must remain alive
-for the registered layer's lifetime. A forward runs through the kernel and raises when the kernel refuses the call
-(an unknown or freed handle, a slot outside the layer, a non-finite weight, rows or top_k out of range), leaving out
-untouched.
+exl3_moe_cpu_free_layer). A handle is its layer's address, owned by the caller until it frees it once; an unknown or
+freed handle is undefined, and upstream's child worker (moe_handoff.cu, which names layers by registration index) does
+not run against this kernel. Packed matrix tensors must remain alive for the registered layer's lifetime. A forward
+runs the kernel's check, then the kernel, and raises when the call is refused (a slot outside the layer, a non-finite
+weight, rows or top_k out of range), leaving out untouched.
 
 The service side is the library's kernel, a CpuExpertKernel (expert_stream/host/cpu_experts/kernel.hpp) behind its
 accessor exl3_cpu_kernel() (kernel.h, hidden: never interposed across libraries). Python reaches it through the

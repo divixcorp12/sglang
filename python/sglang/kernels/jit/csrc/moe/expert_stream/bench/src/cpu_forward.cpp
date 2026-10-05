@@ -215,7 +215,7 @@ struct Workload {
     call.weights = weights.data();
     call.out = output.data();
     call.cores = g_cores;
-    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(*::sglang::exl3_cpu::exl3_cpu_table_layer(handles[layer]), call);
+    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(::sglang::exl3_cpu::exl3_cpu_table_layer(handles[layer]), call);
 #endif
   }
 

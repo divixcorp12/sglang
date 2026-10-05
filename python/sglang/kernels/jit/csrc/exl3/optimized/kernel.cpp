@@ -17,7 +17,6 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -41,23 +40,7 @@ void exl3_moe_cpu_set_prof(bool) {}
 namespace {
 using ::sglang::exl3_cpu::Exl3Quant;
 using Exl3Forward = ::sglang::cpu_experts::ExpertForward<Exl3Quant>;
-
-// Upstream's handle API (exl3_moe_cpu_make_layer / free_layer / forward), which bindings.cpp links: its own table of
-// this kernel's layers. A freed entry is reset and its index never reused; a forward holds its layer's shared_ptr, so a
-// free racing it only drops the table's reference.
-std::mutex g_table_mutex;
-std::vector<std::shared_ptr<const ::sglang::cpu_experts::CpuExpertLayer>> g_table;
 }  // namespace
-
-namespace sglang::exl3_cpu {
-std::shared_ptr<const ::sglang::cpu_experts::CpuExpertLayer> exl3_cpu_table_layer(int64_t handle)
-{
-    std::lock_guard<std::mutex> lock(g_table_mutex);
-    if (handle < 0 || handle >= int64_t(g_table.size()) || !g_table[size_t(handle)])
-        throw std::invalid_argument("exl3 CPU experts: no table layer " + std::to_string(handle));
-    return g_table[size_t(handle)];
-}
-}  // namespace sglang::exl3_cpu
 
 // -------------------------------------------------------------------------------------------
 //   Upstream link compatibility
@@ -176,17 +159,13 @@ int64_t exl3_moe_cpu_make_layer
     const bool gated = !table->gates.empty();
     Exl3Quant::Layer layer{shape, gated, 0, 0, std::move(table)};
     const auto& kernel = static_cast<const Exl3Forward&>(::sglang::exl3_cpu::exl3_cpu_kernel());
-    std::shared_ptr<const ::sglang::cpu_experts::CpuExpertLayer> wrapped = kernel.wrap(std::move(layer));
-    std::lock_guard<std::mutex> lock(g_table_mutex);
-    g_table.push_back(std::move(wrapped));
-    return static_cast<int64_t>(g_table.size() - 1);
+    // The handle is the layer's address (kernel.h, exl3_cpu_table_layer); the caller owns it until free_layer.
+    return reinterpret_cast<int64_t>(kernel.wrap(std::move(layer)).release());
 }
 
 void exl3_moe_cpu_free_layer(int64_t handle)
 {
-    std::lock_guard<std::mutex> lock(g_table_mutex);
-    // An unknown or already freed handle: a no-op, as upstream's free is.
-    if (handle >= 0 && handle < int64_t(g_table.size())) g_table[size_t(handle)].reset();
+    delete reinterpret_cast<const ::sglang::cpu_experts::CpuExpertLayer*>(handle);
 }
 
 // The kernel's forward with accumulate off: the FP16 weights widen to FP32 exactly and the kernel narrows them back.
@@ -217,10 +196,10 @@ void exl3_moe_cpu_forward_raw(
     call.accumulate = false;
     try {
         // Upstream's API takes its caller's tensors, so its calls are checked.
-        const auto layer = ::sglang::exl3_cpu::exl3_cpu_table_layer(handle);
+        const auto& layer = ::sglang::exl3_cpu::exl3_cpu_table_layer(handle);
         const auto& kernel = ::sglang::exl3_cpu::exl3_cpu_kernel();
-        kernel.check(*layer, call);
-        kernel.forward(*layer, call);
+        kernel.check(layer, call);
+        kernel.forward(layer, call);
     } catch (const std::exception& e) {
         TORCH_CHECK(false, "exl3_moe_cpu_forward: ", e.what());
     }
