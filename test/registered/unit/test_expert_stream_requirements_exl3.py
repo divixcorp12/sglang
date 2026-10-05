@@ -153,10 +153,36 @@ def test_dspark_with_a_decode_graph_names_the_remedy(model_dir):
 
 
 def test_dspark_speculation_passes_with_decode_disabled(model_dir):
-    # DSpark's verify step runs up to block_size + 1 tokens; option C's in-graph scratch
-    # and RAM-miss posting are sized for one token per step, so eager decode is required,
-    # but is otherwise unaffected by speculative decoding being enabled.
+    # An eager DSpark verify needs none of the graphed verify's configuration (§33.8).
     _gate(_launch(model_dir, speculative_algorithm="DSPARK"))
+
+
+# DSpark's verify in the breakable decode graph (DSV41_REFERENCE.md §33.8): DIRECT residency at W miss lanes.
+GRAPHED_VERIFY = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True, **DIRECT, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 8}
+
+
+def test_dspark_verify_in_the_breakable_decode_graph_passes(model_dir):
+    _gate(_launch(model_dir, speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1), **GRAPHED_VERIFY)
+
+
+@pytest.mark.parametrize(
+    "launch_changes, env_changes, match",
+    [
+        ({"speculative_algorithm": "EAGLE"}, GRAPHED_VERIFY, "graphs the verify of DSpark only"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-32"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 33}, "MISS_LANES=1-32"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}, "INSERT_ON_MISS_STAGE=2"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False}, "SGLANG_MOE_EXPERT_GRAPH_GATHER=1"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_RAGGED_VERIFY_MODE": "compact"}, "SGLANG_RAGGED_VERIFY_MODE=static"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_DSV41_CPU_EXPERTS": True}, "without speculative decoding"),
+    ],
+)
+def test_a_graphed_dspark_verify_needs_its_configuration(model_dir, launch_changes, env_changes, match):
+    launch = dict(speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1) | launch_changes
+    with pytest.raises(ValueError, match=match) as raised:
+        _gate(_launch(model_dir, **launch), **env_changes)
+    if match != "without speculative decoding":
+        assert "--cuda-graph-backend-decode disabled" in str(raised.value)
 
 
 def test_breakable_decode_at_batch_size_one_passes(model_dir):
