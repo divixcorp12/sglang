@@ -19,6 +19,8 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -43,15 +45,22 @@ namespace {
 using ::sglang::exl3_cpu::Exl3Quant;
 using Exl3Forward = ::sglang::cpu_experts::ExpertForward<Exl3Quant>;
 
-// A nonzero ExpertForward status as a torch error.
-void check_status(int status, const char* what)
-{
-    TORCH_CHECK(status != 2, what, ": invalid arguments (status 2: an unknown or freed handle, a slot outside the "
-                "layer, a non-finite weight, or rows/k/threads out of range)");
-    TORCH_CHECK(status != 3, what, ": a forward is running (status 3)");
-    TORCH_CHECK(status == 0, what, ": kernel error (status ", status, "): ", ::sglang::cpu_experts::last_error());
-}
+// Upstream's handle API (exl3_moe_cpu_make_layer / free_layer / forward), which bindings.cpp links: its own table of
+// this kernel's layers. A freed entry is reset and its index never reused; a forward holds its layer's shared_ptr, so a
+// free racing it only drops the table's reference.
+std::mutex g_table_mutex;
+std::vector<std::shared_ptr<const ::sglang::cpu_experts::CpuExpertLayer>> g_table;
 }  // namespace
+
+namespace sglang::exl3_cpu {
+std::shared_ptr<const ::sglang::cpu_experts::CpuExpertLayer> exl3_cpu_table_layer(int64_t handle)
+{
+    std::lock_guard<std::mutex> lock(g_table_mutex);
+    if (handle < 0 || handle >= int64_t(g_table.size()) || !g_table[size_t(handle)])
+        throw std::invalid_argument("exl3 CPU experts: no table layer " + std::to_string(handle));
+    return g_table[size_t(handle)];
+}
+}  // namespace sglang::exl3_cpu
 
 // -------------------------------------------------------------------------------------------
 //   Upstream link compatibility
@@ -166,17 +175,20 @@ int64_t exl3_moe_cpu_make_layer
     Exl3Quant::Layer layer{info, {}, 0, 0, std::move(table)};
     layer.rows.capacity = info.num_experts;
     const auto& kernel = static_cast<const Exl3Forward&>(::sglang::exl3_cpu::exl3_cpu_kernel());
-    return ::sglang::cpu_experts::CabiLayers::add(kernel.wrap(std::move(layer)));
+    std::shared_ptr<const ::sglang::cpu_experts::CpuExpertLayer> wrapped = kernel.wrap(std::move(layer));
+    std::lock_guard<std::mutex> lock(g_table_mutex);
+    g_table.push_back(std::move(wrapped));
+    return static_cast<int64_t>(g_table.size() - 1);
 }
 
 void exl3_moe_cpu_free_layer(int64_t handle)
 {
-    const int status = sglang_exl3_cpu_experts_free_layer(handle);
-    if (status == 2) return;  // an unknown or already freed handle: a no-op, as upstream's free is
-    check_status(status, "exl3_moe_cpu_free_layer");
+    std::lock_guard<std::mutex> lock(g_table_mutex);
+    // An unknown or already freed handle: a no-op, as upstream's free is.
+    if (handle >= 0 && handle < int64_t(g_table.size())) g_table[size_t(handle)].reset();
 }
 
-// The C ABI's forward with accumulate 0: the FP16 weights widen to FP32 exactly and the kernel narrows them back.
+// The kernel's forward with accumulate off: the FP16 weights widen to FP32 exactly and the kernel narrows them back.
 void exl3_moe_cpu_forward_raw(
     int64_t handle,
     const at::Half* x,
@@ -188,23 +200,25 @@ void exl3_moe_cpu_forward_raw(
     int threads
 )
 {
-    if (rows == 0) return;  // upstream's forward of no tokens is a no-op; the C ABI refuses rows < 1
+    if (rows == 0) return;  // upstream's forward of no tokens is a no-op; the kernel refuses rows < 1
     static thread_local std::vector<float> weights;
     const size_t n = static_cast<size_t>(rows) * topk;
     weights.resize(n);
     for (size_t i = 0; i < n; ++i) weights[i] = static_cast<float>(wts[i]);
-    SglangCpuExpertsForward call{};
-    call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
+    ::sglang::cpu_experts::ForwardCall call;
     call.rows = rows;
-    call.layer = handle;
+    call.k = topk;
+    call.threads = std::max(threads, 1);  // upstream's forward ran fewer than one thread as one
     call.x = x;
     call.slots = sel;
     call.weights = weights.data();
     call.out = out;
-    call.k = topk;
-    call.threads = std::max(threads, 1);  // upstream's forward ran fewer than one thread as one
-    call.accumulate = 0;
-    check_status(sglang_exl3_cpu_experts_forward(&call), "exl3_moe_cpu_forward");
+    call.accumulate = false;
+    try {
+        ::sglang::exl3_cpu::exl3_cpu_kernel().forward(*::sglang::exl3_cpu::exl3_cpu_table_layer(handle), call);
+    } catch (const std::exception& e) {
+        TORCH_CHECK(false, "exl3_moe_cpu_forward: ", e.what());
+    }
 }
 
 void exl3_moe_cpu_forward

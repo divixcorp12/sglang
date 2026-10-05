@@ -1,15 +1,20 @@
 // Bit-exact A/B harness for the NVFP4 CPU expert kernel; run_nvfp4_cpu_forward_checks.sh builds and runs it.
-// It calls only the C ABI (cpu_experts_cabi.h). Every one-row output and status is written to OUT in a fixed order: two
+// It calls only the kernel interface (nvfp4_cpu_kernel(), kernel.h). Every one-row output and status (status_of) is
+// written to OUT in a fixed order: two
 // revisions agree when their files are byte-identical, each built with its own revision of this harness.
 //   nvfp4_cpu_forward_ab OUT CORE [CORE...]     worker i runs on CORE i; the caller is worker 0
-#include "cpu_experts_cabi.h"
+#include "kernel.h"
+#include "quant.hpp"
 #include "../upstream/kernels.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -86,22 +91,35 @@ Slabs make_slabs(const Config& c, std::mt19937& rng) {
     return s;
 }
 
-int64_t g_engine = 0;  // the kernel's engine on the cores main was given
+std::vector<int> g_cores;  // the cores main was given, carried by every forward
+using Layer = ::sglang::cpu_experts::CpuExpertLayer;
 
-int forward(int64_t layer, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out,
+// The C ABI's status for what a kernel call threw: 0 none, 2 std::invalid_argument, 1 any other exception.
+template <class F>
+int status_of(F&& f) {
+    try {
+        f();
+        return 0;
+    } catch (const std::invalid_argument&) {
+        return 2;
+    } catch (const std::exception&) {
+        return 1;
+    }
+}
+
+int forward(const Layer& layer, const void* x, const int32_t* slots, const float* weights, int32_t k, float* out,
             int32_t threads, int32_t accumulate, int32_t rows = 1) {
-    SglangCpuExpertsForward call{};
-    call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
-    call.rows = rows; call.layer = layer; call.x = x; call.slots = slots; call.weights = weights;
-    call.out = out; call.k = k; call.threads = threads; call.accumulate = accumulate;
-    call.engine = g_engine;
-    return sglang_nvfp4_cpu_experts_forward(&call);
+    ::sglang::cpu_experts::ForwardCall call;
+    call.rows = rows; call.x = x; call.slots = slots; call.weights = weights;
+    call.out = out; call.k = k; call.threads = threads; call.accumulate = accumulate != 0;
+    call.cores = g_cores;
+    return status_of([&] { ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().forward(layer, call); });
 }
 
 // Rows token rows in one call against one call per row, bitwise; returns the number of rows that differ or fail.
 // Token t takes routing kRoutings[(t + shift) % 5] padded with -1 slots to k 8, or k8_negzero for all when shift < 0
 // (every slot shared by every token: chunks of 4, 4 and 1 for 9 rows).
-int check_batch(int64_t handle, int hidden, int threads, int rows, int shift, std::mt19937& rng) {
+int check_batch(const Layer& handle, int hidden, int threads, int rows, int shift, std::mt19937& rng) {
     constexpr int k = 8;
     std::uniform_real_distribution<float> unit(-1.f, 1.f);
     std::vector<uint16_t> x(size_t(rows) * hidden);
@@ -143,8 +161,9 @@ int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: %s OUT CORE [CORE...]\n", argv[0]); return 2; }
     std::vector<int32_t> cores;
     for (int i = 2; i < argc; ++i) cores.push_back(std::atoi(argv[i]));
-    if (sglang_nvfp4_cpu_experts_engine_create(cores.data(), int32_t(cores.size()), &g_engine) != 0) {
-        std::fprintf(stderr, "engine_create refused\n"); return 1;
+    g_cores.assign(cores.begin(), cores.end());
+    if (status_of([&] { ::sglang::cpu_experts::check_cores(g_cores); }) != 0) {
+        std::fprintf(stderr, "cores refused\n"); return 1;
     }
     FILE* f = std::fopen(argv[1], "wb");
     if (!f) return 1;
@@ -158,17 +177,21 @@ int main(int argc, char** argv) {
         Slabs s = make_slabs(c, rng);
         SglangNvfp4CpuParams params{};
         params.w13_layout = c.layout; params.inv_input_scale13 = c.inv13; params.inv_input_scale2 = c.inv2;
-        SglangCpuExpertsLayer d{};
-        d.abi_version = SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION; d.capacity = kCapacity; d.hidden = c.hidden;
-        d.intermediate = c.intermediate; d.activation = 0; d.act_limit = c.limit; d.slab_count = 7; d.params = &params;
+        ::sglang::cpu_experts::LayerSlabs d;
+        d.capacity = kCapacity; d.hidden = c.hidden;
+        d.intermediate = c.intermediate; d.activation = 0; d.act_limit = c.limit; d.slab_count = 7;
         for (int i = 0; i < 7; ++i) {
             d.slabs[i] = s.bytes[i].empty() ? nullptr : s.bytes[i].data();
             d.slot_bytes[i] = s.stride[i];
         }
-        int64_t handle = -1;
-        if (sglang_nvfp4_cpu_experts_register_layer(&d, &handle) != 0) {
+        std::unique_ptr<Layer> layer;
+        if (status_of([&] {
+                layer = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().make_layer(
+                    d, std::as_bytes(std::span<const SglangNvfp4CpuParams>(&params, 1)));
+            }) != 0) {
             std::fprintf(stderr, "%s: registration refused\n", c.name); return 1;
         }
+        const Layer& handle = *layer;
         std::uniform_real_distribution<float> unit(-1.f, 1.f);
         std::vector<uint16_t> x(c.hidden);
         for (auto& v : x) v = ggml_compute_fp32_to_fp16(unit(rng));
@@ -204,7 +227,6 @@ int main(int argc, char** argv) {
         // with a revision that has no batched forward.
         for (int threads : teams)
             for (int shift : {0, 2, -1}) batch_mismatches += check_batch(handle, c.hidden, threads, 9, shift, batch_rng);
-        if (sglang_nvfp4_cpu_experts_free_layer(handle) != 0) { std::fprintf(stderr, "free refused\n"); return 1; }
     }
     std::fclose(f);
     std::printf("%d cases, %d unexpected statuses, %d batched rows differing from one-row calls\n", cases, unexpected,

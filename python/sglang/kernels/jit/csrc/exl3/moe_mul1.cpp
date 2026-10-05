@@ -2,7 +2,7 @@
 // 02aef45cd681b960a00afcd0749a4ab99e6c1bfe, exllamav3/exllamav3_ext/cpu/moe_mul1.cpp.
 // MIT License, Copyright (c) 2025 Turboderp; the full notice is in LICENSE.exllamav3 beside this file.
 //
-// Local change: a C ABI for sglang's CPU expert thread (the end of this file), and two compile-time
+// Local change: two C++ entry points for sglang's bare-forward bench baseline (the end of this file), and two compile-time
 // options that reduce the int8 activation quantization error of the
 // quantized tiers (AVX2 / AVX-512BW / VNNI / VBMI; the scalar tier computes in fp32 and ignores both).
 // quantization/exl3/ext.py builds this copy in place of upstream's only when one of them is on, so the default
@@ -18,7 +18,6 @@
 //                                summed in fp32. A matrix whose k is not a multiple of B keeps one
 //                                scale per row.
 #include "moe_mul1.h"
-#include "optimized/cpu_experts_cabi.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
 
@@ -28,6 +27,8 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <span>
+#include <stdexcept>
 #include <fstream>
 #include <immintrin.h>
 #include <chrono>
@@ -2467,7 +2468,7 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
     return anomalies;
 }
 
-// exl3_moe_cpu_forward_raw, adding into out when `accumulate`: the sglang C ABI's forward. Upstream's header fixes
+// exl3_moe_cpu_forward_raw, adding into out when `accumulate`: the bench baseline's forward. Upstream's header fixes
 // the public signature, so the flag lives here.
 static void forward_raw(
     int64_t handle,
@@ -2663,42 +2664,34 @@ void exl3_moe_cpu_forward
     );
 }
 
-// ---- sglang: the C ABI of the CPU expert thread (plan 2026-09-29-dsv41-cpu-experts, "Step B") ----
-// expert_stream/host/cpu_experts.h calls these through addresses Exl3CpuQuantTrait resolves with dlsym, so the
-// service module links nothing of this one. Neither throws across the boundary.
+// ---- sglang: the bench baseline's entry points (expert_stream/bench/src/cpu_forward.cpp, EXL3_BENCH_BASELINE) ----
 
-// CpuExpertForward: call->rows token rows (x fp16 [rows][hidden]) through each row's experts, into out
-// (fp32 [rows][hidden]): overwritten, or added to when `accumulate` is nonzero. The calling thread is the pool's
-// worker 0.
-extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_forward(
-    const SglangCpuExpertsForward* call) noexcept
+// forward_raw over `rows` token rows (x fp16 [rows][hidden]) through layer `handle`, into out (fp32 [rows][hidden]):
+// overwritten, or added to when `accumulate`. Routing weights narrow to fp16 as the optimized kernel narrows them. The
+// calling thread is the pool's worker 0. Throws std::runtime_error when the forward fails.
+void exl3_moe_cpu_baseline_forward(int64_t handle, const at::Half* x, const int32_t* slots, const float* weights,
+                                   float* out, int rows, int k, int threads, bool accumulate)
 {
-    if (!call || call->abi_version != SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION) return 2;
-    const SglangCpuExpertsForward& c = *call;
-    if (c.rows < 1 || c.k < 0 || c.k > 32) return 2;
+    if (rows < 1 || k < 0 || k > 32) throw std::runtime_error("baseline forward: rows or k out of range");
+    static thread_local std::vector<at::Half> wts;
+    wts.resize(static_cast<size_t>(rows) * k);
+    for (size_t i = 0; i < wts.size(); ++i) wts[i] = at::Half(weights[i]);
     try
     {
-        static thread_local std::vector<at::Half> wts;
-        wts.resize(static_cast<size_t>(c.rows) * c.k);
-        for (size_t i = 0; i < wts.size(); ++i) wts[i] = at::Half(c.weights[i]);
-        forward_raw(c.layer, static_cast<const at::Half*>(c.x), c.slots, wts.data(), c.out, c.rows, c.k, c.threads,
-                    c.accumulate != 0);
-        return 0;
+        forward_raw(handle, x, slots, wts.data(), out, rows, k, threads, accumulate);
     }
-    catch (...)
+    catch (const std::exception& e)
     {
-        return 1;
+        throw std::runtime_error(std::string("baseline forward: ") + e.what());
     }
 }
 
 // The pool's cores, worker i on cores[i % n] (worker 0 is the thread that calls the forward). Before the first
-// forward: once the pool has spawned, its workers are already placed, and this refuses (returns 1).
-extern "C" __attribute__((visibility("default"))) int sglang_exl3_cpu_experts_set_cores(const int32_t* cores, int32_t n)
-    noexcept
+// forward: once the pool has spawned, its workers are already placed, and this throws.
+void exl3_moe_cpu_baseline_set_cores(std::span<const int> cores)
 {
-    if (n < 1) return 2;
+    if (cores.empty()) throw std::runtime_error("baseline set_cores: no cores");
     std::lock_guard<std::mutex> lock(g_pool_mutex);
-    if (g_pool.spawned > 0) return 1;
-    g_pool.core_order.assign(cores, cores + n);
-    return 0;
+    if (g_pool.spawned > 0) throw std::runtime_error("baseline set_cores: the pool has spawned");
+    g_pool.core_order.assign(cores.begin(), cores.end());
 }

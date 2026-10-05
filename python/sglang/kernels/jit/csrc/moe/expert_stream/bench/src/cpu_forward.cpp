@@ -1,7 +1,8 @@
-// The bare CPU-expert forward benchmark: one full forward through the native service C ABI, per backend.
+// The bare CPU-expert forward benchmark: one full forward through the kernel interface, per backend (the baseline
+// through its own entry point).
 //
 // Built twice (EXL3_BENCH_BACKEND): the baseline kernel and the optimized one run as separate processes, so one
-// backend's idle workers cannot disturb the other's timings. A forward is timed from the C ABI call alone; sample
+// backend's idle workers cannot disturb the other's timings. A forward is timed from the forward call alone; sample
 // storage and layer rotation are outside the interval. Before and after each timed run, all eight layers' outputs are
 // compared bit-exactly with the frozen references; setup, warmup and checks are excluded from the reported latency.
 //
@@ -13,8 +14,8 @@
 #include <ATen/Parallel.h>
 #include <benchmark/benchmark.h>
 
-#include "cpu_experts_cabi.h"
 #include "fixture.h"
+#include "kernel.h"
 #include "moe_mul1.h"
 #include <algorithm>
 #include <chrono>
@@ -32,13 +33,17 @@
 #include <unistd.h>
 
 #ifdef EXL3_BENCH_BASELINE
-// The vendored baseline's own core list (csrc/exl3/moe_mul1.cpp); the shared header no longer declares it.
-extern "C" int sglang_exl3_cpu_experts_set_cores(const int32_t* cores, int32_t n) noexcept;
+#include <c10/util/Half.h>
+#include <span>
+// The vendored baseline's entry points (csrc/exl3/moe_mul1.cpp, its end); no header declares them.
+void exl3_moe_cpu_baseline_forward(int64_t handle, const at::Half* x, const int32_t* slots, const float* weights,
+                                   float* out, int rows, int k, int threads, bool accumulate);
+void exl3_moe_cpu_baseline_set_cores(std::span<const int> cores);
 #endif
 
 namespace {
 namespace fs = std::filesystem;
-int64_t g_engine = 0;  // the kernel's engine on the bench's cores, created in main (baseline: none, stays 0)
+std::vector<int> g_cores;  // the bench's worker cores, worker 0 first
 bool benchmark_failed = false;
 // The command line; the defaults are the reference machine's.
 struct Options {
@@ -195,21 +200,23 @@ struct Workload {
       exl3_moe_cpu_free_layer(handle);
   }
 
-  // One full C ABI forward on `layer`, writing `output`. Throws if the call fails.
+  // One full forward on `layer`, writing `output`. Throws if the call fails.
   void forward(size_t layer) {
-    SglangCpuExpertsForward call{};
-    call.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
+#ifdef EXL3_BENCH_BASELINE
+    exl3_moe_cpu_baseline_forward(handles[layer], static_cast<const at::Half*>(fixture.layers[layer].input.data_ptr()),
+                                  slots.data(), weights.data(), output.data(), 1, experts, options.workers, false);
+#else
+    ::sglang::cpu_experts::ForwardCall call;
     call.rows = 1;
-    call.layer = handles[layer];
+    call.k = experts;
+    call.threads = options.workers;
     call.x = fixture.layers[layer].input.data_ptr();
     call.slots = slots.data();
     call.weights = weights.data();
     call.out = output.data();
-    call.k = experts;
-    call.threads = options.workers;
-    call.engine = g_engine;
-    if (sglang_exl3_cpu_experts_forward(&call))
-      throw std::runtime_error("Native CPU forward failed");
+    call.cores = g_cores;
+    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(*::sglang::exl3_cpu::exl3_cpu_table_layer(handles[layer]), call);
+#endif
   }
 
   // Runs every layer once and compares the outputs bit-exactly with the reference for this expert count. Throws on a
@@ -294,14 +301,11 @@ int main(int argc, char** argv) {
     at::set_num_threads(1);
     at::set_num_interop_threads(1);
     omp_set_dynamic(0);
+    // The optimized kernel takes the cores on each call (distinct, in [0, CPU_SETSIZE); one that cannot be pinned
+    // fails the forward); the vendored baseline keeps its own process-wide core list.
+    g_cores.assign(cores.begin(), cores.end());
 #ifdef EXL3_BENCH_BASELINE
-    // The vendored baseline has no engines (its forward ignores call.engine); it keeps its own process-wide core list.
-    if (sglang_exl3_cpu_experts_set_cores(cores.data(), static_cast<int32_t>(cores.size())))
-      throw std::runtime_error("Cannot configure kernel cores");
-#else
-    // Cores must be distinct and in [0, CPU_SETSIZE); one that cannot be pinned fails the forward with status 1.
-    if (sglang_exl3_cpu_experts_engine_create(cores.data(), static_cast<int32_t>(cores.size()), &g_engine))
-      throw std::runtime_error("Cannot create the kernel's engine");
+    exl3_moe_cpu_baseline_set_cores(g_cores);
 #endif
     cpu_set_t caller;
     CPU_ZERO(&caller);

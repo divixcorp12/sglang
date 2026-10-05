@@ -77,7 +77,7 @@ foreach(BACKEND baseline optimized)
     set(BASELINE_DEFINE "")
   endif()
   add_executable(exl3_cpu_${BACKEND} src/cpu_forward.cpp src/fixture.cpp "${KERNEL}")
-  # ${QUANT}: the baseline copy includes optimized/cpu_experts_cabi.h, which in place resolves beside the source.
+  # ${QUANT}: the baseline copy includes the vendored kernel's own headers beside the source.
   target_include_directories(exl3_cpu_${BACKEND} PRIVATE "${QUANT}/optimized" "${QUANT}")
   target_include_directories(exl3_cpu_${BACKEND} SYSTEM PRIVATE "${ATEN_INCLUDE}" "${ATEN_INCLUDE}/torch/csrc/api/include")
   target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE
