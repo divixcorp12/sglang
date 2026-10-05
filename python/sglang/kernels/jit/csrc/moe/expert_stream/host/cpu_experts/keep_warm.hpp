@@ -9,7 +9,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <vector>
+#include <span>
+#include <stdexcept>
 
 namespace sglang::cpu_experts {
 // Internal linkage: each quant library's translation unit owns its state. Inline statics with external linkage
@@ -81,30 +82,22 @@ int32_t keep_warm_loop(Isa isa, const uint32_t* word, uint32_t seen, int64_t dea
     return keep_warm_detail::scalar(word, seen, deadline_ns);
 }
 
-// Holds `threads` workers (the caller as worker 0, each pinned to `cores` as the forward pins them; null: unpinned) in
-// register-only work of tier min(isa, Top) until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Returns 0, 1
-// on a kernel error (a failed pin), 2 on invalid arguments or more threads than `cores`.
+// Holds `threads` workers (the caller as worker 0, each pinned to `cores` as the forward pins them; empty: unpinned) in
+// register-only work of tier min(isa, Top) until *word != seen or CLOCK_MONOTONIC reaches deadline_ns. Throws
+// std::invalid_argument for no worker, no word or more threads than `cores`, std::runtime_error for a failed pin.
 template <Isa Top>
-int keep_warm(Isa isa, const std::vector<int>* cores, int32_t threads, const uint32_t* word, uint32_t seen,
-              int64_t deadline_ns) noexcept
+void keep_warm(Isa isa, std::span<const int> cores, int32_t threads, const uint32_t* word, uint32_t seen,
+               int64_t deadline_ns)
 {
-    last_error().clear();
-    if (threads < 1 || word == nullptr || (cores && size_t(threads) > cores->size())) return 2;
-    try {
-        std::atomic<int> pin_error{0};
-        #pragma omp parallel num_threads(threads) shared(cores, pin_error)
-        {
-            pin(omp_get_thread_num(), cores, pin_error);
-            keep_warm_detail::sink.fetch_add(keep_warm_loop<Top>(isa, word, seen, deadline_ns),
-                                             std::memory_order_relaxed);
-        }
-        return pin_error.load(std::memory_order_relaxed) ? fail("cannot pin CPU expert worker to its engine's core")
-                                                         : 0;
-    } catch (const std::exception& e) {
-        return fail(e.what());
-    } catch (...) {
-        return fail("unknown exception");
+    if (threads < 1 || word == nullptr || (!cores.empty() && size_t(threads) > cores.size()))
+        throw std::invalid_argument("CPU expert keep-warm needs a worker, a word and no more workers than its cores");
+    std::atomic<int> pin_error{0};
+    #pragma omp parallel num_threads(threads) shared(cores, pin_error)
+    {
+        pin(omp_get_thread_num(), cores, pin_error);
+        keep_warm_detail::sink.fetch_add(keep_warm_loop<Top>(isa, word, seen, deadline_ns), std::memory_order_relaxed);
     }
+    if (pin_error.load(std::memory_order_relaxed)) throw std::runtime_error("cannot pin CPU expert worker to its core");
 }
 
 }  // namespace

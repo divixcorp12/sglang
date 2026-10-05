@@ -894,7 +894,7 @@ void run_forward(const Exl3Quant::Layer& layer, Isa isa, const at::Half* x, cons
 
 // ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range); the
 // weights are converted to FP16, the registered kernel's convention.
-int Exl3Quant::dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable&, Isa isa)
+int Exl3Quant::dispatch(const Layer& l, const ForwardCall& c, const RouteTable&, Isa isa)
 {
     static thread_local std::vector<at::Half> wts;
     const size_t n = static_cast<size_t>(c.rows) * c.k;

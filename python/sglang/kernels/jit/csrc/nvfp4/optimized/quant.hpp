@@ -49,7 +49,7 @@ struct LayerInfo
 // The descriptor's slabs, in cpu_experts_cabi.h order.
 enum SlabName { kW13, kW2, kSf13, kSf2, kGateAlpha, kDownAlpha, kUpAlpha, kSlabNames };
 static_assert(kW13 == 0 && kSf13 == 2 && kGateAlpha == 4 && kUpAlpha == 6 && kSlabNames == 7,
-              "SlabName indexes SglangCpuExpertsLayer::slabs as cpu_experts_cabi.h orders them");
+              "SlabName indexes LayerSlabs::slabs as cpu_experts_cabi.h orders them");
 
 // The fewest bytes one slot's row of each slab holds: packed E2M1 weights (two per byte), E4M3 scales in the GPU's
 // 128x4 swizzle (rows padded to 128, scale groups to 4), one fp32 alpha. Registration refuses a smaller stride.
@@ -119,7 +119,7 @@ struct Nvfp4Quant
         MoeBufferRows<Nvfp4Quant> rows;
     };
 
-    static std::array<uint64_t, kSlabs> min_slot_bytes(const SglangCpuExpertsLayer& d, const Params&)
+    static std::array<uint64_t, kSlabs> min_slot_bytes(const LayerSlabs& d, const Params&)
     {
         const SlabRowBytes minimum = SlabRowBytes::of(d.hidden, d.intermediate);
         std::array<uint64_t, kSlabs> bytes;
@@ -128,7 +128,7 @@ struct Nvfp4Quant
     }
 
     // The descriptor's scalars and the parameters; ExpertForward checks the slabs against min_slot_bytes.
-    static int validate(const SglangCpuExpertsLayer& d, const Params* p)
+    static int validate(const LayerSlabs& d, const Params* p)
     {
         if (!p || d.hidden < 16 || d.intermediate < 16 || d.hidden > (1 << 20) || d.intermediate > (1 << 20)
             || d.hidden % 16 || d.intermediate % 16 || p->w13_layout < 0 || p->w13_layout > 2
@@ -139,7 +139,7 @@ struct Nvfp4Quant
         return 0;
     }
 
-    static Layer make_layer(const SglangCpuExpertsLayer& d, const Params* p)
+    static Layer make_layer(const LayerSlabs& d, const Params* p)
     {
         return {{d.capacity, d.hidden, d.intermediate, p->w13_layout, d.act_limit, p->inv_input_scale13,
                  p->inv_input_scale2, d.slabs[kUpAlpha] != nullptr},
@@ -165,7 +165,7 @@ struct Nvfp4Quant
     }
 
     // Defined in kernel.cpp after forward_plan.hpp.
-    static int dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r, Isa isa);
+    static int dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa);
 };
 
 }  // namespace

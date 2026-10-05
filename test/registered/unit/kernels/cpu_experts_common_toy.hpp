@@ -2,7 +2,6 @@
 // out[t][h] (+)= sum over routes of weight * scale * slab[slot][h]. TOY_TOP_ISA picks kTopIsa (default Avx2).
 #pragma once
 #include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/expert_forward.hpp"
-#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/cabi.hpp"
 #include <atomic>
 #include <cmath>
 #include <thread>
@@ -12,12 +11,16 @@
 #define TOY_TOP_ISA Avx2
 #endif
 
+#ifndef TOY_NAME
+#define TOY_NAME "toy"
+#endif
+
 namespace toy {
 namespace {
 using namespace sglang::cpu_experts;
 struct ToyParams { float scale; };
 struct ToyQuant {
-    static constexpr const char* kName = "toy";
+    static constexpr const char* kName = TOY_NAME;
     static constexpr int kSlabs = 1;
     static constexpr uint32_t kOptionalSlabs = 0;
     static constexpr int kMaxRoutes = 8;
@@ -28,15 +31,15 @@ struct ToyQuant {
     using Params = ToyParams;
     struct Row { const float* v; };
     struct Layer { int hidden; float scale; MoeBufferRows<ToyQuant> rows; };
-    static std::array<uint64_t, 1> min_slot_bytes(const SglangCpuExpertsLayer& d, const Params&)
+    static std::array<uint64_t, 1> min_slot_bytes(const LayerSlabs& d, const Params&)
     { return {uint64_t(d.hidden) * 4}; }
-    static int validate(const SglangCpuExpertsLayer& d, const Params* p)
+    static int validate(const LayerSlabs& d, const Params* p)
     { return d.activation == 0 && p && std::isfinite(p->scale) ? 0 : 2; }
-    static Layer make_layer(const SglangCpuExpertsLayer& d, const Params* p)
+    static Layer make_layer(const LayerSlabs& d, const Params* p)
     { return {d.hidden, p->scale, MoeBufferRows<ToyQuant>::of(d)}; }
     static int check_slot(const Layer&, int) { return 0; }
     static Row decode(const uint8_t* const* base, const Layer&) { return {reinterpret_cast<const float*>(base[0])}; }
-    static int dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r, Isa isa)
+    static int dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa)
     {
         last_isa = isa;
         last_routes.clear();
@@ -73,4 +76,13 @@ struct ToyQuant {
     static inline thread_local bool park_here = false;
 };
 }  // namespace
+}  // namespace toy
+
+#ifndef TOY_KERNEL
+#define TOY_KERNEL toy_kernel
+#endif
+namespace toy {
+// The toy kernel of this library or harness: each defines it (test_cpu_experts_common.py builds libraries with
+// distinct names, so a harness links two side by side).
+const sglang::cpu_experts::CpuExpertKernel& TOY_KERNEL();
 }  // namespace toy

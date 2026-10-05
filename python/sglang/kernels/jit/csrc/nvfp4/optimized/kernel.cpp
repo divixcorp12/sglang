@@ -3,6 +3,7 @@
 // A forward is ExpertForward<Nvfp4Quant> (expert_stream/host/cpu_experts/expert_forward.hpp) dispatching to
 // ForwardPlan<Shape, Isa>::run (forward_plan.hpp) at the tier ExpertForward detected; Nvfp4Quant (quant.hpp) reads a
 // layer's slots under a Shape (shapes.hpp), and each tier's dot product is in math_scalar.hpp or math_avx2.hpp.
+#include "kernel.h"
 #include "quant.hpp"
 #include "math_scalar.hpp"
 #include "math_avx2.hpp"
@@ -20,7 +21,7 @@ constexpr int kChunkRows = 4;
 
 // The detected tier (min(host, kTopIsa, NVFP4_CPU_MAX_ISA)) picks the plan: the MiMo plan when the layer is that
 // model's routed expert at the AVX2 tier, else the generic plan at the tier.
-int Nvfp4Quant::dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r, Isa isa)
+int Nvfp4Quant::dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa)
 {
     if (isa >= Isa::Avx2 && MimoV26ProShape::accepts(l.info))
         return ForwardPlan<MimoV26ProShape, Isa::Avx2>::run(l, c, r);
@@ -29,6 +30,12 @@ int Nvfp4Quant::dispatch(const Layer& l, const SglangCpuExpertsForward& c, const
 }
 
 }  // namespace
+
+const ::sglang::cpu_experts::CpuExpertKernel& nvfp4_cpu_kernel()
+{
+    static const ::sglang::cpu_experts::ExpertForward<Nvfp4Quant> kernel{};
+    return kernel;
+}
 }  // namespace sglang::nvfp4_cpu
 
-SGLANG_CPU_EXPERTS_DEFINE_CABI(nvfp4, ::sglang::nvfp4_cpu::Nvfp4Quant)
+SGLANG_CPU_EXPERTS_DEFINE_CABI(nvfp4, ::sglang::nvfp4_cpu::Nvfp4Quant, ::sglang::nvfp4_cpu::nvfp4_cpu_kernel)

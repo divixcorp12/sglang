@@ -1,6 +1,6 @@
 """The header-only CPU experts framework (host/cpu_experts) passes its native harness (Linux, GCC with OpenMP).
 
-``cpu_experts_common_check.cpp`` drives a toy quant through ``ExpertForward`` and the C ABI macro and prints
+``cpu_experts_common_check.cpp`` drives a toy quant through ``ExpertForward`` as a ``CpuExpertKernel`` and prints
 ``ok <check>`` per contract it holds.
 """
 
@@ -23,17 +23,15 @@ CXX = os.environ.get("CXX") or shutil.which("g++")
 CXX_FLAGS = ["-std=c++20", "-O2", "-fopenmp", "-pthread"]
 SANITIZERS = ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined", "-fno-omit-frame-pointer", "-g"]
 CHECKS = (
-    "register_then_forward_overwrites_and_accumulates",
-    "abi_versions_are_checked",
-    "slot_bytes_below_the_minimum_are_refused",
-    "unknown_handle_is_refused",
+    "make_layer_then_forward_overwrites_and_accumulates",
+    "params_and_slabs_are_validated",
+    "a_layer_of_another_kernel_is_refused",
     "routes_are_validated",
-    "forwards_run_at_once_and_a_free_racing_one_returns_3",
+    "forwards_run_at_once",
     "isa_cap_env_lowers_the_tier",
-    "engine_create_accepts_a_core_outside_the_callers_affinity",
-    "engines_are_independent_and_refuse_what_they_cannot_run",
-    "each_engines_team_runs_on_its_own_cores",
-    "last_error_names_why_a_call_failed",
+    "cores_are_validated_and_bound_the_team",
+    "each_calls_team_runs_on_its_own_cores",
+    "a_failed_pin_throws_runtime_error_and_leaves_out_untouched",
     "keep_warm_returns_when_the_word_moves",
 )
 

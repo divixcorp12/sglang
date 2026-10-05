@@ -9,6 +9,7 @@
 #error This CPU expert implementation requires Linux and OpenMP.
 #endif
 #include "moe_mul1.h"
+#include "kernel.h"
 #include "quant.hpp"
 #include "../../moe/expert_stream/host/cpu_experts/cabi.hpp"
 #include <c10/util/Half.h>
@@ -25,10 +26,18 @@
 // inlines and clones.
 #include "forward_plan.hpp"
 
+namespace sglang::exl3_cpu {
+const ::sglang::cpu_experts::CpuExpertKernel& exl3_cpu_kernel()
+{
+    static const ::sglang::cpu_experts::ExpertForward<Exl3Quant> kernel{};
+    return kernel;
+}
+}  // namespace sglang::exl3_cpu
+
 // Kept for upstream's bindings. Phase timing is compile-time here (ForwardPlan's Profile, forward_plan.hpp).
 void exl3_moe_cpu_set_prof(bool) {}
 
-SGLANG_CPU_EXPERTS_DEFINE_CABI(exl3, ::sglang::exl3_cpu::Exl3Quant)
+SGLANG_CPU_EXPERTS_DEFINE_CABI(exl3, ::sglang::exl3_cpu::Exl3Quant, ::sglang::exl3_cpu::exl3_cpu_kernel)
 
 namespace {
 using ::sglang::exl3_cpu::Exl3Quant;
@@ -156,15 +165,13 @@ int64_t exl3_moe_cpu_make_layer
                                              !table->gates.empty(), table->activation, table->act_limit};
     Exl3Quant::Layer layer{info, {}, 0, 0, std::move(table)};
     layer.rows.capacity = info.num_experts;
-    auto entry = std::make_shared<const Exl3Quant::Layer>(std::move(layer));
-    std::lock_guard<std::mutex> lock(Exl3Forward::registry_mutex);
-    Exl3Forward::layers.push_back(std::move(entry));
-    return static_cast<int64_t>(Exl3Forward::layers.size() - 1);
+    const auto& kernel = static_cast<const Exl3Forward&>(::sglang::exl3_cpu::exl3_cpu_kernel());
+    return ::sglang::cpu_experts::CabiLayers::add(kernel.wrap(std::move(layer)));
 }
 
 void exl3_moe_cpu_free_layer(int64_t handle)
 {
-    const int status = Exl3Forward::free_layer(handle);
+    const int status = sglang_exl3_cpu_experts_free_layer(handle);
     if (status == 2) return;  // an unknown or already freed handle: a no-op, as upstream's free is
     check_status(status, "exl3_moe_cpu_free_layer");
 }
@@ -197,7 +204,7 @@ void exl3_moe_cpu_forward_raw(
     call.k = topk;
     call.threads = std::max(threads, 1);  // upstream's forward ran fewer than one thread as one
     call.accumulate = 0;
-    check_status(Exl3Forward::forward(&call), "exl3_moe_cpu_forward");
+    check_status(sglang_exl3_cpu_experts_forward(&call), "exl3_moe_cpu_forward");
 }
 
 void exl3_moe_cpu_forward

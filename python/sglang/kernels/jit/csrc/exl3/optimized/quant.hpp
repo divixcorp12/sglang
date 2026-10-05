@@ -105,7 +105,7 @@ struct Exl3Quant
         std::unique_ptr<MoeCpuLayer> table;
     };
 
-    static std::array<uint64_t, kSlabs> min_slot_bytes(const SglangCpuExpertsLayer& d, const Params& p)
+    static std::array<uint64_t, kSlabs> min_slot_bytes(const LayerSlabs& d, const Params& p)
     {
         const SlabRowBytes minimum = SlabRowBytes::of(d.hidden, d.intermediate, p.bits);
         std::array<uint64_t, kSlabs> bytes;
@@ -115,7 +115,7 @@ struct Exl3Quant
 
     // The descriptor's scalars and the parameters; ExpertForward checks the slabs against min_slot_bytes. The
     // dimensions are make_matrix's limits: 128-element blocks, and k <= 8192 for the int32 accumulators.
-    static int validate(const SglangCpuExpertsLayer& d, const Params* p)
+    static int validate(const LayerSlabs& d, const Params* p)
     {
         if (!p || p->bits < 1 || p->bits > 8 || (p->swizzled != 0 && p->swizzled != 1)) return 2;
         if (d.hidden < 128 || d.intermediate < 128 || d.hidden % 128 || d.intermediate % 128 || d.hidden > 8192
@@ -125,7 +125,7 @@ struct Exl3Quant
         return 0;
     }
 
-    static Layer make_layer(const SglangCpuExpertsLayer& d, const Params* p)
+    static Layer make_layer(const LayerSlabs& d, const Params* p)
     {
         return {{d.capacity, d.hidden, d.intermediate, true, 0, d.act_limit},
                 MoeBufferRows<Exl3Quant>::of(d),
@@ -146,7 +146,7 @@ struct Exl3Quant
     }
 
     // Defined at the end of forward_plan.hpp.
-    static int dispatch(const Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r, Isa isa);
+    static int dispatch(const Layer& l, const ForwardCall& c, const RouteTable& r, Isa isa);
 };
 
 // The plans read a layer's experts through an accessor: gate(e), up(e), down(e) of slot e.

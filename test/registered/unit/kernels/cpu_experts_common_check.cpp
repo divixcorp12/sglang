@@ -1,12 +1,18 @@
-// Standalone harness for host/cpu_experts: a toy quant through ExpertForward. Built by test_cpu_experts_common.py.
+// Standalone harness for host/cpu_experts: a toy quant through ExpertForward, as a CpuExpertKernel. Built by
+// test_cpu_experts_common.py.
 #include "cpu_experts_common_toy.hpp"
+#include <pthread.h>
 #include <sched.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,10 +25,20 @@
         }                                                                                   \
     } while (0)
 
-SGLANG_CPU_EXPERTS_DEFINE_CABI(toy, toy::ToyQuant)
+namespace toy {
+const sglang::cpu_experts::CpuExpertKernel& toy_kernel()
+{
+    static const sglang::cpu_experts::ExpertForward<ToyQuant> kernel{};
+    return kernel;
+}
+}  // namespace toy
 
 namespace {
+using sglang::cpu_experts::CpuExpertKernel;
+using sglang::cpu_experts::CpuExpertLayer;
+using sglang::cpu_experts::ForwardCall;
 using sglang::cpu_experts::Isa;
+using sglang::cpu_experts::LayerSlabs;
 
 constexpr int kCapacity = 3;
 constexpr int kHidden = 16;
@@ -31,6 +47,20 @@ int64_t now_ns()
 {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// What a call threw: 0 nothing, 2 std::invalid_argument, 1 any other std::exception.
+template <class F>
+int status_of(F&& f)
+{
+    try {
+        f();
+        return 0;
+    } catch (const std::invalid_argument&) {
+        return 2;
+    } catch (const std::exception&) {
+        return 1;
+    }
 }
 
 struct Fixture {
@@ -43,48 +73,51 @@ struct Fixture {
             for (int h = 0; h < kHidden; ++h) slab[size_t(s) * kHidden + h] = float(s + h);
     }
 
-    SglangCpuExpertsLayer layer() const
+    LayerSlabs layer() const
     {
-        SglangCpuExpertsLayer d{};
-        d.abi_version = SGLANG_CPU_EXPERTS_LAYER_ABI_VERSION;
+        LayerSlabs d;
         d.capacity = kCapacity;
         d.hidden = kHidden;
         d.intermediate = kHidden;
-        d.activation = 0;
-        d.act_limit = 0;
         d.slab_count = 1;
         d.slabs[0] = slab.data();
         d.slot_bytes[0] = uint64_t(kHidden) * 4;
-        d.params = &params;
         return d;
     }
+
+    std::span<const std::byte> params_bytes() const { return std::as_bytes(std::span<const toy::ToyParams>(&params, 1)); }
 };
 
+std::unique_ptr<CpuExpertLayer> make_toy(const Fixture& f) { return toy::toy_kernel().make_layer(f.layer(), f.params_bytes()); }
+
+// One forward's buffers; out starts at 7 so a refused call is seen to leave it untouched.
 struct Call {
+    const CpuExpertLayer* layer;
     std::vector<uint16_t> x;
     std::vector<int32_t> slots;
     std::vector<float> weights;
     std::vector<float> out;
-    SglangCpuExpertsForward c{};
+    std::vector<int> cores;
+    ForwardCall c;
 
-    Call(int64_t handle, int rows, int k, std::vector<int32_t> s, std::vector<float> w, int threads = 2,
-         int64_t engine = 0)
-        : x(size_t(rows) * kHidden), slots(std::move(s)), weights(std::move(w)), out(size_t(rows) * kHidden, 7.0f)
+    Call(const CpuExpertLayer& l, int rows, int k, std::vector<int32_t> s, std::vector<float> w, int threads = 2,
+         std::vector<int> on = {})
+        : layer(&l), x(size_t(rows) * kHidden), slots(std::move(s)), weights(std::move(w)),
+          out(size_t(rows) * kHidden, 7.0f), cores(std::move(on))
     {
-        c.abi_version = SGLANG_CPU_EXPERTS_FORWARD_ABI_VERSION;
         c.rows = rows;
-        c.layer = handle;
+        c.k = k;
+        c.threads = threads;
         c.x = x.data();
         c.slots = slots.data();
         c.weights = weights.data();
         c.out = out.data();
-        c.k = k;
-        c.threads = threads;
-        c.accumulate = 0;
-        c.engine = engine;
+        c.cores = cores;
     }
+    Call(const Call&) = delete;
+    Call& operator=(const Call&) = delete;
 
-    int run() { return sglang_toy_cpu_experts_forward(&c); }
+    int run(const CpuExpertKernel& kernel = toy::toy_kernel()) { return status_of([&] { kernel.forward(*layer, c); }); }
     bool untouched() const
     {
         for (float v : out)
@@ -92,15 +125,6 @@ struct Call {
         return true;
     }
 };
-
-int64_t register_toy(const Fixture& f)
-{
-    const SglangCpuExpertsLayer d = f.layer();
-    int64_t handle = -1;
-    CHECK(sglang_toy_cpu_experts_register_layer(&d, &handle) == 0);
-    CHECK(handle >= 0);
-    return handle;
-}
 
 std::vector<int> allowed_cores()
 {
@@ -124,49 +148,19 @@ int main()
     CHECK(setenv("TOY_CPU_MAX_ISA", "scalar", 1) == 0);
     CHECK(setenv("TOY_CPU_REPORT_ISA", "1", 1) == 0);
     Fixture f;
-
-    // Engines: worker i of each call naming the engine runs on cores[i], the caller as worker 0.
+    const CpuExpertKernel& kernel = toy::toy_kernel();
+    CHECK(std::string(kernel.name()) == "toy");
     const std::vector<int> allowed = allowed_cores();
-    const int32_t team = allowed.size() >= 2 ? 2 : 1;
-    const std::vector<int32_t> cores(allowed.begin(), allowed.begin() + team);
-    int64_t engine = 0;
-    CHECK(sglang_toy_cpu_experts_engine_create(nullptr, 1, &engine) == 2);
-    CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), 0, &engine) == 2);
-    CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), team, nullptr) == 2);
-    if (team == 2) {
-        const int32_t twice[2] = {cores[0], cores[0]};
-        CHECK(sglang_toy_cpu_experts_engine_create(twice, 2, &engine) == 2);
-    }
-    const int32_t past = CPU_SETSIZE;
-    CHECK(sglang_toy_cpu_experts_engine_create(&past, 1, &engine) == 2);
-    CHECK(engine == 0);
-    {
-        // The engine thread creates its engine from a thread whose mask may exclude the expert cores (the server runs
-        // under taskset): engine_create accepts a core outside the caller's affinity; only the workers' own pins
-        // must succeed.
-        cpu_set_t saved, one;
-        CHECK(pthread_getaffinity_np(pthread_self(), sizeof(saved), &saved) == 0);
-        CPU_ZERO(&one);
-        CPU_SET(allowed[0], &one);
-        CHECK(pthread_setaffinity_np(pthread_self(), sizeof(one), &one) == 0);
-        const int32_t outside = allowed.size() >= 2 ? allowed[1] : allowed[0] + 1;
-        CHECK(outside < CPU_SETSIZE && !CPU_ISSET(outside, &one));
-        int64_t e = 0;
-        CHECK(sglang_toy_cpu_experts_engine_create(&outside, 1, &e) == 0);
-        CHECK(e != 0);
-        CHECK(sglang_toy_cpu_experts_engine_free(e) == 0);
-        CHECK(pthread_setaffinity_np(pthread_self(), sizeof(saved), &saved) == 0);
-        ok("engine_create_accepts_a_core_outside_the_callers_affinity");
-    }
-    CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), team, &engine) == 0);
-    CHECK(engine != 0);
+    const int team = allowed.size() >= 2 ? 2 : 1;
+    const std::vector<int> cores(allowed.begin(), allowed.begin() + team);
 
     {
-        const int64_t h = register_toy(f);
+        const auto layer = make_toy(f);
+        CHECK(&layer->kernel() == &kernel);
         // Token 0: slots 0 and 2; token 1: slot 1 and a skipped -1.
-        Call call(h, 2, 2, {0, 2, 1, -1}, {0.5f, 0.25f, 2.0f, 1.0f}, team, engine);
+        Call call(*layer, 2, 2, {0, 2, 1, -1}, {0.5f, 0.25f, 2.0f, 1.0f}, team, cores);
         for (int accumulate = 0; accumulate < 2; ++accumulate) {
-            call.c.accumulate = accumulate;
+            call.c.accumulate = accumulate != 0;
             CHECK(call.run() == 0);
             for (int hh = 0; hh < kHidden; ++hh) {
                 const float base = accumulate ? 1.0f : 0.0f;
@@ -177,127 +171,104 @@ int main()
             }
             std::fill(call.out.begin(), call.out.end(), 1.0f);
         }
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
-        ok("register_then_forward_overwrites_and_accumulates");
+        ok("make_layer_then_forward_overwrites_and_accumulates");
     }
 
     {
-        SglangCpuExpertsLayer d = f.layer();
-        d.abi_version += 1;
-        int64_t handle = -1;
-        CHECK(sglang_toy_cpu_experts_register_layer(&d, &handle) == 2);
-        CHECK(handle == -1);
-        const int64_t h = register_toy(f);
-        Call call(h, 1, 1, {0}, {1.0f});
-        call.c.abi_version += 1;
-        CHECK(call.run() == 2);
-        CHECK(call.untouched());
-        CHECK(sglang_toy_cpu_experts_forward(nullptr) == 2);
-        CHECK(sglang_toy_cpu_experts_register_layer(nullptr, &handle) == 2);
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
-        ok("abi_versions_are_checked");
-    }
-
-    {
-        SglangCpuExpertsLayer d = f.layer();
+        const LayerSlabs good = f.layer();
+        auto refused = [&](const LayerSlabs& d, std::span<const std::byte> p) {
+            return status_of([&] { kernel.make_layer(d, p); }) == 2;
+        };
+        LayerSlabs d = good;
         d.slot_bytes[0] = uint64_t(kHidden) * 4 - 4;
-        int64_t handle = -1;
-        CHECK(sglang_toy_cpu_experts_register_layer(&d, &handle) == 2);
-        d = f.layer();
+        CHECK(refused(d, f.params_bytes()));
+        d = good;
         d.slabs[0] = nullptr;
-        CHECK(sglang_toy_cpu_experts_register_layer(&d, &handle) == 2);
-        d = f.layer();
+        CHECK(refused(d, f.params_bytes()));
+        d = good;
         d.slab_count = 2;
-        CHECK(sglang_toy_cpu_experts_register_layer(&d, &handle) == 2);
-        d = f.layer();
+        CHECK(refused(d, f.params_bytes()));
+        d = good;
         d.activation = 1;
-        CHECK(sglang_toy_cpu_experts_register_layer(&d, &handle) == 2);
-        CHECK(handle == -1);
-        ok("slot_bytes_below_the_minimum_are_refused");
+        CHECK(refused(d, f.params_bytes()));
+        d = good;
+        d.capacity = 0;
+        CHECK(refused(d, f.params_bytes()));
+        CHECK(refused(good, {}));  // the toy needs its params
+        const std::byte wide[8]{};
+        CHECK(refused(good, wide));  // not sizeof(ToyParams)
+        ok("params_and_slabs_are_validated");
     }
 
     {
-        Call unknown(99, 1, 1, {0}, {1.0f});
-        CHECK(unknown.run() == 2);
-        CHECK(unknown.untouched());
-        const int64_t h = register_toy(f);
-        Call call(h, 1, 1, {0}, {1.0f});
-        CHECK(call.run() == 0);
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
-        std::fill(call.out.begin(), call.out.end(), 7.0f);
-        CHECK(call.run() == 2);
+        // A second kernel object of the same quant (another library's, in production) refuses this one's layer.
+        const sglang::cpu_experts::ExpertForward<toy::ToyQuant> other{};
+        const auto layer = make_toy(f);
+        Call call(*layer, 1, 1, {0}, {1.0f});
+        CHECK(call.run(other) == 2);
         CHECK(call.untouched());
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 2);
-        CHECK(sglang_toy_cpu_experts_free_layer(-1) == 2);
-        // Handles are never reused: a new registration does not revive the freed one.
-        const int64_t next = register_toy(f);
-        CHECK(next != h);
-        CHECK(call.run() == 2);
-        CHECK(sglang_toy_cpu_experts_free_layer(next) == 0);
-        ok("unknown_handle_is_refused");
+        CHECK(call.run() == 0);
+        ok("a_layer_of_another_kernel_is_refused");
     }
 
     {
-        const int64_t h = register_toy(f);
+        const auto layer = make_toy(f);
         const float nan = std::numeric_limits<float>::quiet_NaN();
         const int max_routes = toy::ToyQuant::kMaxRoutes, max_rows = toy::ToyQuant::kMaxRows;
-        Call bad_slot(h, 1, 1, {kCapacity}, {1.0f});
-        Call negative_slot(h, 1, 1, {-2}, {1.0f});
-        Call nan_weight(h, 1, 1, {0}, {nan});
-        Call wide(h, 1, max_routes + 1, std::vector<int32_t>(max_routes + 1, 0),
+        Call bad_slot(*layer, 1, 1, {kCapacity}, {1.0f});
+        Call negative_slot(*layer, 1, 1, {-2}, {1.0f});
+        Call nan_weight(*layer, 1, 1, {0}, {nan});
+        Call wide(*layer, 1, max_routes + 1, std::vector<int32_t>(max_routes + 1, 0),
                   std::vector<float>(max_routes + 1, 1.0f));
-        Call tall(h, max_rows + 1, 1, std::vector<int32_t>(max_rows + 1, 0), std::vector<float>(max_rows + 1, 1.0f));
-        Call empty(h, 1, 1, {0}, {1.0f});
+        Call tall(*layer, max_rows + 1, 1, std::vector<int32_t>(max_rows + 1, 0),
+                  std::vector<float>(max_rows + 1, 1.0f));
+        Call empty(*layer, 1, 1, {0}, {1.0f});
         empty.c.rows = 0;
-        Call no_threads(h, 1, 1, {0}, {1.0f});
+        Call no_threads(*layer, 1, 1, {0}, {1.0f});
         no_threads.c.threads = 0;
-        Call bad_accumulate(h, 1, 1, {0}, {1.0f});
-        bad_accumulate.c.accumulate = 2;
-        Call null_slots(h, 1, 1, {0}, {1.0f});
+        Call null_slots(*layer, 1, 1, {0}, {1.0f});
         null_slots.c.slots = nullptr;
-        for (Call* c : {&bad_slot, &negative_slot, &nan_weight, &wide, &tall, &empty, &no_threads, &bad_accumulate,
-                        &null_slots}) {
+        Call null_out(*layer, 1, 1, {0}, {1.0f});
+        null_out.c.out = nullptr;
+        for (Call* c : {&bad_slot, &negative_slot, &nan_weight, &wide, &tall, &empty, &no_threads, &null_slots}) {
             CHECK(c->run() == 2);
             CHECK(c->untouched());
         }
+        CHECK(null_out.run() == 2);
         // k = 0 has no routes to read: the output is overwritten with zeros.
-        Call no_routes(h, 1, 0, {}, {});
+        Call no_routes(*layer, 1, 0, {}, {});
         no_routes.c.slots = nullptr;
         no_routes.c.weights = nullptr;
         CHECK(no_routes.run() == 0);
         for (float v : no_routes.out) CHECK(v == 0.0f);
         // -1 slots and zero weights are dropped, the routing order kept.
-        Call sparse(h, 1, 4, {1, -1, 2, 0}, {0.0f, 1.0f, 0.5f, 0.25f});
+        Call sparse(*layer, 1, 4, {1, -1, 2, 0}, {0.0f, 1.0f, 0.5f, 0.25f});
         CHECK(sparse.run() == 0);
         const auto& kept = toy::ToyQuant::last_routes;
         CHECK(kept.size() == 2 && kept[0].slot == 2 && kept[0].weight == 0.5f && kept[1].slot == 0
               && kept[1].weight == 0.25f);
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
         ok("routes_are_validated");
     }
 
     {
-        // Forwards hold the layer lock shared: one parked inside its dispatch does not stop another, on another
-        // engine or on none. free_layer refuses (3) while any forward runs, rather than free a layer under it.
-        const int64_t h = register_toy(f);
+        // No lock: a forward parked inside its dispatch does not stop another on the same layer.
+        const auto layer = make_toy(f);
         toy::ToyQuant::inside.store(false);
         toy::ToyQuant::hold.store(true);
         int first = -1;
-        Call held(h, 1, 1, {0}, {1.0f}, 1, engine);
+        Call held(*layer, 1, 1, {0}, {1.0f}, 1, cores);
         std::thread runner([&] {
             toy::ToyQuant::park_here = true;
             first = held.run();
         });
         while (!toy::ToyQuant::inside.load()) std::this_thread::yield();
-        Call second(h, 1, 1, {0}, {1.0f}, 1);
+        Call second(*layer, 1, 1, {0}, {1.0f}, 1);
         CHECK(second.run() == 0);
         CHECK(!second.untouched());
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 3);
         toy::ToyQuant::hold.store(false);
         runner.join();
         CHECK(first == 0);
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
-        ok("forwards_run_at_once_and_a_free_racing_one_returns_3");
+        ok("forwards_run_at_once");
     }
 
     {
@@ -317,118 +288,111 @@ int main()
         ok("isa_cap_env_lowers_the_tier");
     }
 
-    {
-        // Engines stay independent after forwards have run: a second one is created and used now. Each refuses more
-        // workers than its cores (2, out untouched), as do a never-created and a freed engine; handles are never
-        // reused.
-        const int64_t h = register_toy(f);
-        int64_t other = 0;
-        CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), team, &other) == 0);
-        CHECK(other != engine);
-        Call on_other(h, 1, 1, {0}, {1.0f}, team, other);
-        CHECK(on_other.run() == 0);
-        Call too_many(h, 1, 1, {0}, {1.0f}, team + 1, engine);
-        CHECK(too_many.run() == 2);
-        CHECK(too_many.untouched());
-        Call unknown_engine(h, 1, 1, {0}, {1.0f}, 1, other + 1000);
-        CHECK(unknown_engine.run() == 2);
-        CHECK(unknown_engine.untouched());
-        CHECK(sglang_toy_cpu_experts_engine_free(other) == 0);
-        CHECK(sglang_toy_cpu_experts_engine_free(other) == 2);
-        CHECK(sglang_toy_cpu_experts_engine_free(0) == 2);
-        std::fill(on_other.out.begin(), on_other.out.end(), 7.0f);
-        CHECK(on_other.run() == 2);
-        CHECK(on_other.untouched());
-        int64_t third = 0;
-        CHECK(sglang_toy_cpu_experts_engine_create(cores.data(), 1, &third) == 0);
-        CHECK(third != other);
-        CHECK(sglang_toy_cpu_experts_engine_free(third) == 0);
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
-        ok("engines_are_independent_and_refuse_what_they_cannot_run");
+    if (allowed.size() >= 2) {
+        // The engine thread may run under a mask that excludes the expert cores (the server runs under taskset): a
+        // call accepts a core outside the caller's affinity; only the workers' own pins must succeed.
+        const auto layer = make_toy(f);
+        cpu_set_t saved, one;
+        CHECK(pthread_getaffinity_np(pthread_self(), sizeof(saved), &saved) == 0);
+        CPU_ZERO(&one);
+        CPU_SET(allowed[0], &one);
+        CHECK(pthread_setaffinity_np(pthread_self(), sizeof(one), &one) == 0);
+        Call outside(*layer, 1, 1, {0}, {1.0f}, 1, {allowed[1]});
+        CHECK(outside.run() == 0);
+        CHECK(toy::ToyQuant::last_cpus == std::vector<int>{allowed[1]});
+        CHECK(pthread_setaffinity_np(pthread_self(), sizeof(saved), &saved) == 0);
+        ok("a_core_outside_the_callers_affinity_is_pinned");
     }
 
     {
-        // Each engine's team runs on that engine's cores, also while another engine's team runs at once from another
-        // thread (the two-engine half needs four allowed CPUs).
-        const int64_t h = register_toy(f);
-        Call one(h, 1, 1, {0}, {1.0f}, team, engine);
+        // More workers than cores, a repeated core and a core outside [0, CPU_SETSIZE) are refused, out untouched;
+        // without cores the team is unpinned and has no core limit.
+        const auto layer = make_toy(f);
+        Call too_many(*layer, 1, 1, {0}, {1.0f}, team + 1, cores);
+        Call repeated(*layer, 1, 1, {0}, {1.0f}, 1, {cores[0], cores[0]});
+        Call past(*layer, 1, 1, {0}, {1.0f}, 1, {CPU_SETSIZE});
+        Call negative(*layer, 1, 1, {0}, {1.0f}, 1, {-1});
+        for (Call* c : {&too_many, &repeated, &past, &negative}) {
+            CHECK(c->run() == 2);
+            CHECK(c->untouched());
+        }
+        Call unpinned(*layer, 1, 1, {0}, {1.0f}, team + 1);
+        CHECK(unpinned.run() == 0);
+        ok("cores_are_validated_and_bound_the_team");
+    }
+
+    {
+        // Each call's team runs on its own cores, also while another call's team runs at once from another thread
+        // (the two-team half needs four allowed CPUs).
+        const auto layer = make_toy(f);
+        Call one(*layer, 1, 1, {0}, {1.0f}, team, cores);
         CHECK(one.run() == 0);
-        CHECK(toy::ToyQuant::last_cpus == std::vector<int>(cores.begin(), cores.end()));
+        CHECK(toy::ToyQuant::last_cpus == cores);
         if (allowed.size() >= 4) {
-            const int32_t a_cores[2] = {allowed[0], allowed[1]}, b_cores[2] = {allowed[2], allowed[3]};
-            int64_t a = 0, b = 0;
-            CHECK(sglang_toy_cpu_experts_engine_create(a_cores, 2, &a) == 0);
-            CHECK(sglang_toy_cpu_experts_engine_create(b_cores, 2, &b) == 0);
+            const std::vector<int> a = {allowed[0], allowed[1]}, b = {allowed[2], allowed[3]};
             std::vector<int> seen_a, seen_b;
             std::atomic<int> bad{0};
-            auto run = [&](int64_t e, std::vector<int>* seen) {
+            auto run = [&](const std::vector<int>& on, std::vector<int>* seen) {
                 for (int i = 0; i < 200; ++i) {
-                    Call call(h, 1, 1, {0}, {1.0f}, 2, e);
+                    Call call(*layer, 1, 1, {0}, {1.0f}, 2, on);
                     if (call.run() != 0) bad.fetch_add(1);
                     seen->insert(seen->end(), toy::ToyQuant::last_cpus.begin(), toy::ToyQuant::last_cpus.end());
                 }
             };
-            std::thread ta(run, a, &seen_a), tb(run, b, &seen_b);
+            std::thread ta(run, std::cref(a), &seen_a), tb(run, std::cref(b), &seen_b);
             ta.join();
             tb.join();
             CHECK(bad.load() == 0);
             CHECK(seen_a.size() == 400 && seen_b.size() == 400);
-            for (int cpu : seen_a) CHECK(cpu == allowed[0] || cpu == allowed[1]);
-            for (int cpu : seen_b) CHECK(cpu == allowed[2] || cpu == allowed[3]);
-            CHECK(sglang_toy_cpu_experts_engine_free(a) == 0);
-            CHECK(sglang_toy_cpu_experts_engine_free(b) == 0);
+            for (int cpu : seen_a) CHECK(cpu == a[0] || cpu == a[1]);
+            for (int cpu : seen_b) CHECK(cpu == b[0] || cpu == b[1]);
         }
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
-        ok("each_engines_team_runs_on_its_own_cores");
+        ok("each_calls_team_runs_on_its_own_cores");
     }
 
     {
-        // Status 1 keeps its reason on this thread, for a quant's own wrappers; the next call clears it. engine_create
-        // checks only the range, so a core past this machine's CPUs is accepted and fails the worker's pin.
-        const int64_t h = register_toy(f);
-        const int32_t absent = CPU_SETSIZE - 1;
-        int64_t unpinnable = 0;
-        CHECK(sglang_toy_cpu_experts_engine_create(&absent, 1, &unpinnable) == 0);
-        Call fails(h, 1, 1, {0}, {1.0f}, 1, unpinnable);
+        // A core in range but past this machine's CPUs passes validation and fails the worker's pin: a
+        // std::runtime_error, out untouched; the next call runs.
+        const auto layer = make_toy(f);
+        Call fails(*layer, 1, 1, {0}, {1.0f}, 1, {CPU_SETSIZE - 1});
         CHECK(fails.run() == 1);
         CHECK(fails.untouched());
-        CHECK(sglang::cpu_experts::last_error().find("cannot pin") != std::string::npos);
-        Call fits(h, 1, 1, {0}, {1.0f}, team, engine);
+        Call fits(*layer, 1, 1, {0}, {1.0f}, team, cores);
         CHECK(fits.run() == 0);
-        CHECK(sglang::cpu_experts::last_error().empty());
-        CHECK(sglang_toy_cpu_experts_engine_free(unpinnable) == 0);
-        CHECK(sglang_toy_cpu_experts_free_layer(h) == 0);
-        ok("last_error_names_why_a_call_failed");
+        ok("a_failed_pin_throws_runtime_error_and_leaves_out_untouched");
     }
 
     {
         uint32_t word = 5;
-        CHECK(sglang_toy_cpu_experts_keep_warm(engine, 0, &word, 5, now_ns() + 1000000000) == 2);
-        CHECK(sglang_toy_cpu_experts_keep_warm(engine, 1, nullptr, 5, now_ns() + 1000000000) == 2);
-        CHECK(sglang_toy_cpu_experts_keep_warm(engine, team + 1, &word, 5, now_ns() + 1000000000) == 2);
-        CHECK(sglang_toy_cpu_experts_keep_warm(engine + 1000, 1, &word, 5, now_ns() - 1) == 2);  // never created
-        CHECK(sglang_toy_cpu_experts_keep_warm(0, team + 1, &word, 5, now_ns() - 1) == 0);  // engine 0: no core limit
+        auto warm = [&](std::span<const int> on, int32_t threads, const uint32_t* w, int64_t deadline) {
+            return status_of([&] { kernel.keep_warm(on, threads, w, 5, deadline); });
+        };
+        CHECK(warm(cores, 0, &word, now_ns() + 1000000000) == 2);
+        CHECK(warm(cores, 1, nullptr, now_ns() + 1000000000) == 2);
+        CHECK(warm(cores, team + 1, &word, now_ns() + 1000000000) == 2);
+        const std::vector<int> repeated = {cores[0], cores[0]};
+        CHECK(warm(repeated, 1, &word, now_ns() - 1) == 2);
+        CHECK(warm({}, team + 1, &word, now_ns() - 1) == 0);  // no cores: no core limit
         // An expired deadline returns at the first clock poll.
-        CHECK(sglang_toy_cpu_experts_keep_warm(engine, team, &word, 5, now_ns() - 1) == 0);
+        CHECK(warm(cores, team, &word, now_ns() - 1) == 0);
         const int64_t start = now_ns();
         std::thread mover([&] {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
         });
-        const int r = sglang_toy_cpu_experts_keep_warm(engine, team, &word, 5, start + 60LL * 1000000000);
+        const int r = warm(cores, team, &word, start + 60LL * 1000000000);
         mover.join();
         CHECK(r == 0);
         CHECK(now_ns() - start < 1000000000);
         // Every tier's loop, as far as this CPU runs them, through the free function.
         for (Isa tier : {Isa::Scalar, Isa::Avx2, Isa::Bw, Isa::Vnni, Isa::Vbmi}) {
             if (tier > sglang::cpu_experts::detect_isa(Isa::Vbmi, nullptr)) break;
-            CHECK(sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, nullptr, team, &word, 6, now_ns() + 2000000) == 0);
-            CHECK(sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, nullptr, team, &word, 5, now_ns() + 1000000000) == 0);
+            sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, {}, team, &word, 6, now_ns() + 2000000);
+            sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, {}, team, &word, 5, now_ns() + 1000000000);
         }
         ok("keep_warm_returns_when_the_word_moves");
     }
 
-    CHECK(sglang_toy_cpu_experts_engine_free(engine) == 0);
     std::printf("all ok\n");
     return 0;
 }

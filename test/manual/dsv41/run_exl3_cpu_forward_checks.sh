@@ -31,6 +31,7 @@ export TMPDIR=$out/tmp
 export SGLANG_EXL3_SRC=/data/models/slang/nvfp4-work/exllamav3
 export SGLANG_EXL3_BUILD_DIR=$out/exl3-build
 export SGLANG_DSV41_CPU_EXPERTS=1 SGLANG_EXL3_CPU_CXX=$GXX CUDA_HOME=/usr/local/cuda-13.4
+export CXX=$GXX  # the host module's JIT build (kernel_layer/kernel_forward from Task 6): the kernels' GCC 15
 export PYTHONPATH=$wt/python OMP_NUM_THREADS=8 EXL3_MOE_CPU_PIN=0
 if [[ ! -d $SGLANG_EXL3_BUILD_DIR/resid_b128_cpu_v1 ]]; then
   mkdir -p "$SGLANG_EXL3_BUILD_DIR"

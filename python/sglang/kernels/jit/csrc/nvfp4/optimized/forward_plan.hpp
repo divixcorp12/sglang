@@ -127,7 +127,7 @@ struct ForwardPlan
     // Runs the call's routes through layer l on c.threads workers (the caller is worker 0). Returns 0, or 2 when Q8_0
     // cannot represent an input or an intermediate (out is then untouched). Throws when the team is short or a worker
     // cannot be pinned.
-    static int run(const Nvfp4Quant::Layer& l, const SglangCpuExpertsForward& c, const RouteTable& r)
+    static int run(const Nvfp4Quant::Layer& l, const ForwardCall& c, const RouteTable& r)
     {
         ForwardArena& ar = ForwardArena::get();
         ForwardCtx ctx;

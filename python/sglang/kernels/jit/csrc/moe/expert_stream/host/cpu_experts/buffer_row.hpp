@@ -1,7 +1,7 @@
 // One expert slot of a layer's pinned host tier, and the layer's slots. Slot s of slab i is at base[i] + s *
 // stride[i]; the quant decodes a slot's bytes into its Row. Views only: nothing is copied or owned.
 #pragma once
-#include "../cpu_experts_abi.h"
+#include "kernel.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +26,7 @@ struct MoeBufferRows
     std::array<uint64_t, Quant::kSlabs> stride;
     int32_t capacity;  // slots per slab: ExpertForward refuses a routed slot outside [0, capacity)
 
-    static MoeBufferRows of(const SglangCpuExpertsLayer& d)
+    static MoeBufferRows of(const LayerSlabs& d)
     {
         MoeBufferRows r{};
         r.capacity = d.capacity;
