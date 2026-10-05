@@ -1449,6 +1449,10 @@ class TestInsertOnMissDirect(unittest.TestCase):
         self.assertEqual(int(manager.gpu_residency.overflow_flag.item()), 0)
         self.assertFalse(manager.take_verify_overflow())
         self.assertEqual((manager.graphed_verify_ct, manager.verify_overflow_ct), (2, 1))
+        # An eager verify on the narrowed gather is read too, but is not a graphed one.
+        self.replay_verify(manager, graph, static, outputs, self._overflow_routes(manager), check_outputs=False)
+        self.assertTrue(manager.take_verify_overflow(graphed=False))
+        self.assertEqual((manager.graphed_verify_ct, manager.verify_overflow_ct), (2, 2))
 
     def test_a_manager_without_a_narrow_gather_reads_nothing(self):
         wide = self._narrow(self.model, 0, False)

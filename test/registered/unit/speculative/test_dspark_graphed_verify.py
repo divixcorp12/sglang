@@ -23,9 +23,11 @@ class _Manager:
         self._overflows = list(overflows)
         self.suspended = False
         self.reads = 0
+        self.graphed = []
 
-    def take_verify_overflow(self):
+    def take_verify_overflow(self, graphed=True):
         self.reads += 1
+        self.graphed.append(graphed)
         return self._overflows.pop(0)
 
     @contextmanager
@@ -71,12 +73,26 @@ def test_an_unflagged_graphed_verify_is_kept(monkeypatch):
     assert log == [(True, False)] and out.tag == 1 and manager.reads == 1
 
 
-@pytest.mark.parametrize("narrow, graphed", [(False, True), (True, False)])
-def test_no_narrow_gather_or_no_graph_reads_nothing(narrow, graphed):
-    manager = _Manager(narrow=narrow, overflows=[])
+@pytest.mark.parametrize("graphed", [True, False])
+def test_no_narrow_gather_reads_nothing(graphed):
+    manager = _Manager(narrow=False, overflows=[])
     runner = SimpleNamespace(expert_hot_cache_manager=manager, decode_cuda_graph_runner=None)
     out = forward_verify_with_reverify(runner, lambda: SimpleNamespace(can_run_cuda_graph=graphed))
     assert manager.reads == 0 and out.can_run_cuda_graph is graphed
+
+
+@pytest.mark.parametrize("overflowed, runs", [(True, 2), (False, 1)])
+def test_a_verify_the_runner_did_not_graph_still_answers_to_the_narrowed_gather(monkeypatch, overflowed, runs):
+    """The gather is chosen by route count, not by whether a graph runs: an eager verify (replace_embeds, a refused
+    attention key) also takes the narrowed gather and may overflow into slot 0. Its flag is read, and a flagged one is
+    re-run with the gather suspended. Mutant: return before the read when the runner did not graph -- red."""
+    manager = _Manager(narrow=True, overflows=[overflowed])
+    runner = _runner(manager)
+    monkeypatch.setattr(DecodeCudaGraphRunner, "can_run_graph", lambda self, batch: False)
+    log = []
+    out = forward_verify_with_reverify(runner, _forward(runner, log))
+    assert log == [(False, False), (False, True)][:runs] and out.tag == runs
+    assert manager.graphed == [False] and not manager.suspended
 
 
 def test_no_hot_cache_reads_nothing():
