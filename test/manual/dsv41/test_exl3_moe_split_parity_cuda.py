@@ -427,6 +427,16 @@ def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
             assert torch.allclose(got - base, torch.full_like(base, seed), atol=1e-5 * scale), (mask, parts)
 
 
+def _optimized_cpu_build() -> bool:
+    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, optimized_cpu
+
+    return optimized_cpu(cpu_act_defines())
+
+
+@pytest.mark.skipif(
+    not _optimized_cpu_build(),
+    reason="the CPU kernel's ops exist only in the optimized EXL3 extension: set SGLANG_DSV41_CPU_EXPERTS=1",
+)
 def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):
     """End to end over one layer's real rows: the CPU kernel's partial of the CPU routes, from host copies of the same
     slots, lands the output within the kernel's own error of the full GPU run, far closer than dropping those routes."""
