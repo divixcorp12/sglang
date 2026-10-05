@@ -7018,6 +7018,112 @@ layer fusion.
   model W = 8 overflows half the layers.
 - D2-4 owns CPU experts at W < routes.
 
+### 33.8 D2-3: the DSpark verify in the decode graph, end to end (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-d2-3-graphed-verify.md`, branch `dsv41-dspark-graph`.
+This is the third of four v2 plans. It covers §33.3 items 6-8, and measures the overflow rate and verify time that choose W.
+
+**What changed.**
+- **The manager reads and clears the flag, suspends the graph gather, and traces both, `bea76848d7`.**
+  - `take_verify_overflow()` does one `.item()` on the sticky `overflow_flag`, zeroes it when it is set, and counts
+    `graphed_verify_ct` and `verify_overflow_ct`.
+  - `suspend_graph_gather()` turns the gather off on every streamer and restores it in `finally`.
+  - The metrics trace gains `graphed_verify` and, when narrowed, `gpu_residency:gather_overflow`.
+- **The DSpark re-verify, `1237b9e487`.** `forward_verify_with_reverify` (`dspark_graphed_verify.py`) re-runs a flagged
+  graphed verify with `DecodeCudaGraphRunner.eager_only()` and the gather suspended. `SGLANG_TEST_DSPARK_FORCE_REVERIFY`
+  re-runs every verify.
+- **No epilogue while the gather is narrowed, and no decode graphs for an EXL3 draft**, also `1237b9e487`.
+- **The copy-engine barrier, `9f6dcb2407`.** A graphed verify counts toward arming like a graphed decode. Its eager
+  re-run is not graphed, so it drains the device first.
+- **The gate, `5c7173519b`.** DSpark verify may run in the breakable decode graph when it is a static verify
+  (`SGLANG_RAGGED_VERIFY_MODE=static`) on DIRECT residency (graph gather, GPU residency update, insert-on-miss stage 2)
+  with `MISS_LANES` 1-32. This replaces the old refusal, "runs DSpark verify eagerly only".
+- **Three defects the run found, each fixed test-first:**
+  - **A pinned gather's room counted the row's staging slots, `218d31446a`.** `evictable_rows` counted the slots the
+    service's lanes own, which `assign` never hands out. The eager re-run then evicted pinned rows before their copy
+    ("pinned host rows of experts [24, 25] were evicted"). `NativePinnedSlotTable.reserved_rows` is now subtracted.
+  - **The draft's CPU-expert cores were outside the core plan, `ceec0db386`.** The first arm run was refused at start
+    (`core 17 shares a physical core with the server's affinity`). The recipe hand-pins the RAM thread to 17, the plan's
+    `taskset 0-5,18-63` held its sibling 53, and the hybrid draft's hand-named 6-17 overlapped the copy and RAM threads
+    (16, 17), which `ThreadingConfig` never saw. The draft is now a role of `ThreadingConfig`:
+    - unset `SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES` derives its cores on the GPU's node from what the copy thread and
+      every node's plan leave, capped by `_THREADS`;
+    - a named list overrides, is kept out of every derived role, and a given role on its physical core is refused.
+
+    The D2-3 driver names no cores.
+  - **A captured verify took the prefill graph's break-points, `3c9d547cbd`.** `ForwardMode.is_extend()` counts
+    `TARGET_VERIFY`, so four break-points meant for the breakable prefill graph fired while the decode graph captured
+    a verify: the Engram hash ids, low-ratio sources, MQA attention, and the backend's low-ratio projections. Each
+    reads the prefill runner's piecewise forward context, which the decode runner never sets, and capture died in
+    `deepseek_v4_engram_hash_ids`. `is_in_breakable_prefill_graph(mode)` names the condition once, and a verify now
+    takes the in-graph paths, as decode does.
+
+**Why a re-run, and why eager.**
+- Re-running in the graph would overflow again: the narrowed gather is chosen by route count alone.
+- The eager MoE (`_apply_streamed`) is the path DSpark verify ran on before D2, so a re-run is the old verify.
+- Everything the flagged forward wrote is overwritten: its KV and compressed-cache writes go to the same
+  `out_cache_loc`, and its logits are discarded.
+- **Known bias:** the residency and recorder counters count an overflowed verify twice, once per forward.
+
+**The protect list needs no wire change.**
+- The post kernel keeps the first `Wire::kLanes` distinct routes (`lease_kernels.cuh:164-169`).
+- With no overflow, every route is either a VRAM hit or a lane, and lanes enter `wanted` on their own.
+- So the routes the truncation drops are exactly an overflowed verify's clamped misses, and that verify is re-run.
+
+**The run.** Arms: `eager` (§33.4's hybrid draft, eager verify), `graphed` (W = 8), and `reverify` (graphed, every verify
+re-run eagerly). Each runs 8 sessions of 256 prompt tokens and 128 new tokens, under the recipe's server cores 0-5,36-41.
+Core plan, from the logs: copy thread 17, RAM threads 16 and 35, draft CPU experts 6-15 (10 workers; §33.4 had 12).
+
+```bash
+flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-5,36-41 \
+  python analysis/dsv41-drive/dspark/graphed_verify.py $G eager graphed reverify
+```
+
+The eager arm ran at `ceec0db386`; `graphed` and `reverify` ran at `3c9d547cbd`. The last fix changed only paths an
+eager arm never enters. Raw data is in `cc-expert-prediction/analysis/dsv41-dspark/graph-verify/d2-3/`
+(`summary.json`). The earlier refused and capture-failed runs are kept in its subdirectories.
+
+| arm | tok/s | accept length | verify ms mean / p50 / p95 (n) | re-verify rate | layer overflow mean / max | text = eager |
+|---|---|---|---|---|---|---|
+| eager | 2.22 | 2.37 | 862 / 872 / 989 (183) | - | - | - |
+| graphed, W 8 | 2.84 | 2.37 | 831 / 828 / 967 (354) | 1.00 | 0.75 / 1.00 | 8 / 8 |
+| reverify | 2.75 | 2.37 | 826 / 825 / 973 (334) | 1.00 (forced) | 0.75 / 1.00 | 8 / 8 |
+
+- **Bars: all met.**
+  - The re-verify-all arm's text equals eager's in 8 of 8 sessions, so the graphed forward leaves no state the re-run
+    reads.
+  - `insertion_truncated` is 0 in both graphed arms.
+  - Every arm finishes its 8 sessions with identical token counts.
+  - The verify graph is captured (breakable, 3 segments, 2 breaks), with no `RuntimeError`, trap or fail-stop.
+- **At W = 8, every graphed verify overflows.** 380 of 380 were re-run, and 75% of layers overflow per verify (max
+  100%). §33.5 projected 0.50 of layers at W = 8; real routes are worse.
+- **The graphed arm's tok/s gain is not a graph gain.** Every verify was re-run eagerly, so each graphed verify paid a
+  replay and an eager forward. The +28% over `eager` comes with the graphed arms' expert-stream configuration (DIRECT
+  in-graph residency, the fused plan, prefill fills), which the eager arm turns off. Its re-runs run on that residency.
+- **Verify ms is GPU-event time over the `TARGET_VERIFY` segment.**
+  - It includes waiting on RAM and NVMe misses. In the graphed arms it covers the replay plus the re-run.
+  - Not every verify has a record (n < 380), so the n column is reported.
+
+**What it decides, against §33.5.**
+- **Measurement 1 is not answered by this run.** The graphed verify ms (≈830 ms) is an upper bound on replay + eager
+  re-run + miss waits, not on the GPU compute of a graphed verify. §33.5's ≤ 28 ms test needs a verify that does not
+  overflow, which W = 8 never produced.
+- **The overflow path is not cheap at an admissible W.** At W = 8 it is taken by every verify. W ≥ 24 is what §33.5
+  needed for low overflow, and DIRECT's `capacity ≥ 2W` floor cannot fit that in today's hot slots.
+- **So by §33.5's rule, v2 (D2-4, multi-token CPU experts) is not worth building on this evidence.** Graphed DSpark
+  stays shelved, and §33.4's eager hybrid draft remains the DSpark path.
+- **What would reopen it:**
+  - a W sweep (`D23_MISS_LANES` 16, 24, 32) to find where the re-verify rate falls;
+  - more hot slots for the `2W` floor, freed from VRAM (the Qwen NextN lever, +6% there);
+  - §33.5's measurement 3 (what `capacity ≥ 2W` really requires).
+
+**What D2-3 does not do:**
+- multi-token CPU experts (D2-4);
+- the epilogue under a narrowed gather;
+- decode graphs for an EXL3 draft;
+- the num_active launch sizing (§33.6);
+- choosing W, which the sweep above would do.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
