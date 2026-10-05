@@ -34,8 +34,8 @@ constexpr std::array<uint64_t, kSlabNames> row_bytes(int hidden, int intermediat
 }
 
 // One projection's matrix over a slot's trellis and sign vectors (k inputs, n outputs).
-inline Exl3Projection exl3_projection(const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int k, int n, int bits,
-                                int swz)
+inline Exl3Projection exl3_projection(
+    const uint8_t* trellis, const uint8_t* suh, const uint8_t* svh, int k, int n, int bits, int swz)
 {
     Exl3Projection m;
     m.trellis = reinterpret_cast<const uint16_t*>(trellis);
