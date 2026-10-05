@@ -153,6 +153,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
+    is_in_breakable_prefill_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -2060,10 +2061,8 @@ class MQALayer(MqaAttentionBase):
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
         ):
-            if (
-                forward_batch.forward_mode.is_extend()
-                and is_in_breakable_cuda_graph()
-                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            if is_in_breakable_prefill_graph(forward_batch.forward_mode) and not getattr(
+                attn_backend, "low_ratio_prefill_graph", False
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
@@ -2364,7 +2363,7 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if is_in_breakable_prefill_graph(forward_batch.forward_mode):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
@@ -4453,9 +4452,7 @@ class DeepseekV4Model(nn.Module):
                     hash_ids = torch.cat(
                         [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
                     )
-            elif (
-                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
-            ):
+            elif is_in_breakable_prefill_graph(forward_batch.forward_mode):
                 hash_ids = bcg_deepseek_v4_engram_hash_ids(
                     self.engram_hasher, input_ids
                 )

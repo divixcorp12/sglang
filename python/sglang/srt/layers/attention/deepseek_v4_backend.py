@@ -2888,10 +2888,7 @@ class DeepseekV4AttnBackend(
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             # Every consumer takes int32 or int64 positions; keep the caller's.
             pos = positions
-        if (
-            forward_batch.forward_mode.is_extend()
-            and self._low_ratio_in_prefill_graph()
-        ):
+        if self._low_ratio_in_prefill_graph(forward_batch.forward_mode):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
             _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
             if run_compressor and layer.compressor is not None:
@@ -2974,12 +2971,12 @@ class DeepseekV4AttnBackend(
                 ),
             )
 
-    def _low_ratio_in_prefill_graph(self) -> bool:
+    def _low_ratio_in_prefill_graph(self, forward_mode) -> bool:
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
-            is_in_breakable_cuda_graph,
+            is_in_breakable_prefill_graph,
         )
 
-        return self.low_ratio_prefill_graph and is_in_breakable_cuda_graph()
+        return self.low_ratio_prefill_graph and is_in_breakable_prefill_graph(forward_mode)
 
     def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:
         # Projection layout and fused-write support are fixed together at load time.
