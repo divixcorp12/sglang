@@ -1283,11 +1283,12 @@ class TestInsertOnMissDirect(unittest.TestCase):
     # ----- a narrow gather: serve what found a victim, flag the rest -----
 
     def replay_verify(self, manager, graph, static, outputs, routes, check_outputs):
-        """One captured verify; checks every token's gathered rows when ``check_outputs``."""
+        """One captured verify; checks every token's gathered rows when ``check_outputs`` and the replay did not
+        flag its output (an overflowed forward reads wrong rows by design)."""
         static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
         graph.replay()
         torch.cuda.synchronize()
-        if check_outputs:
+        if check_outputs and not int(manager.gpu_residency.overflow_flag.item()):
             for layer in range(LAYERS):
                 source_layer = self.model.get_submodule(str(layer))
                 experts = torch.tensor(routes[layer]).reshape(-1)
@@ -1329,8 +1330,7 @@ class TestInsertOnMissDirect(unittest.TestCase):
             for step in range(60):
                 routes = _verify_routes(generator, 2)
                 for manager, graph, static, outputs in twins:
-                    flagged = int(narrow.gpu_residency.overflow_flag.item()) > 0
-                    self.replay_verify(manager, graph, static, outputs, routes, check_outputs=not flagged)
+                    self.replay_verify(manager, graph, static, outputs, routes, check_outputs=True)
                 if int(narrow.gpu_residency.overflow_flag.item()) > 0:
                     overflowed = True
                     break
