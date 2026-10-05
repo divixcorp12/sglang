@@ -216,7 +216,11 @@ void exl3_moe_cpu_forward_raw(
     call.out = out;
     call.accumulate = false;
     try {
-        ::sglang::exl3_cpu::exl3_cpu_kernel().forward(*::sglang::exl3_cpu::exl3_cpu_table_layer(handle), call);
+        // Upstream's API takes its caller's tensors, so its calls are checked.
+        const auto layer = ::sglang::exl3_cpu::exl3_cpu_table_layer(handle);
+        const auto& kernel = ::sglang::exl3_cpu::exl3_cpu_kernel();
+        kernel.check(*layer, call);
+        kernel.forward(*layer, call);
     } catch (const std::exception& e) {
         TORCH_CHECK(false, "exl3_moe_cpu_forward: ", e.what());
     }

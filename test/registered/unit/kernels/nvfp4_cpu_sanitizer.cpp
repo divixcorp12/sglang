@@ -35,7 +35,10 @@ int forward(const Layer& layer, const void* x, const int32_t* slots, const float
     ::sglang::cpu_experts::ForwardCall call;
     call.rows = rows; call.x = x; call.slots = slots; call.weights = weights;
     call.out = out; call.k = k; call.threads = threads; call.accumulate = accumulate != 0;
-    return status_of([&] { kernel.forward(layer, call); });
+    return status_of([&] {
+        kernel.check(layer, call);
+        kernel.forward(layer, call);
+    });
 }
 
 // A batched call's rows are bitwise the one-row calls': distinct inputs, a token with no live route, a slot named twice by

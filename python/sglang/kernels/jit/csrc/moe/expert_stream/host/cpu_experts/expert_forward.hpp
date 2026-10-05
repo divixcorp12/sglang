@@ -86,7 +86,10 @@ public:
         return std::make_unique<Layer>(*this, std::move(quant));
     }
 
-    void forward(const CpuExpertLayer& layer, const ForwardCall& c) const override
+    int32_t max_routes() const noexcept override { return Quant::kMaxRoutes; }
+    int32_t max_rows() const noexcept override { return Quant::kMaxRows; }
+
+    void check(const CpuExpertLayer& layer, const ForwardCall& c) const override
     {
         if (&layer.kernel() != this)
             refuse(std::string("a layer of kernel ") + layer.kernel().name() + " (another library's or object's)");
@@ -106,13 +109,16 @@ public:
                        + " or a non-finite weight");
             if (slot >= 0 && Quant::check_slot(l, slot) != 0) refuse("slot " + std::to_string(slot) + " is unusable");
         }
+    }
+
+    void forward(const CpuExpertLayer& layer, const ForwardCall& c) const override
+    {
+        const typename Quant::Layer& l = static_cast<const Layer&>(layer).quant;
         const RouteTable routes = RouteTable::build(c.slots, c.weights, c.rows, c.k);
         const CallCores on_cores(c.cores);
         const int status = Quant::dispatch(l, c, routes, isa());
-        if (status == 2) refuse("the forward refused its input (status 2)");
-        if (status != 0)
-            throw std::runtime_error(std::string(Quant::kName) + " CPU experts: forward failed (status "
-                                     + std::to_string(status) + ")");
+        if (status != 0) [[unlikely]]
+            failed(status);
     }
 
     // keep_warm (keep_warm.hpp) at this quant's tier, compiling only the loops up to kTopIsa.
@@ -124,6 +130,14 @@ public:
     }
 
 private:
+    // Out of line and cold, so forward's failure path costs it one predicted branch.
+    [[noreturn, gnu::noinline, gnu::cold]] static void failed(int status)
+    {
+        if (status == 2) refuse("the forward refused its input (status 2)");
+        throw std::runtime_error(std::string(Quant::kName) + " CPU experts: forward failed (status "
+                                 + std::to_string(status) + ")");
+    }
+
     [[noreturn]] static void refuse(const std::string& why)
     {
         throw std::invalid_argument(std::string(Quant::kName) + " CPU experts: " + why);

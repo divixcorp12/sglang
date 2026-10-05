@@ -690,6 +690,7 @@ class RamTier {
           " names " + config.kernel->name() + ", another group " + cpu_kernel_->name());
     cpu_kernel_ = config.kernel;
     config.layers = cpu_layers_.get();
+    config.check_calls = Build::kFaults;
     store_split(g, split.data(), static_cast<int64_t>(split.size()));
     const std::string prefix = std::string(Layout::kName) + " CPU experts: ";
     const std::string suffix = Wire::kNodes > 1 ? std::to_string(g) : std::string();
@@ -701,7 +702,8 @@ class RamTier {
   }
 
   // Installs `row`'s layer, made by the enabled kernel, for every group's engine: the layer addresses the whole slab,
-  // so one serves them all. Any time, once per row; until then no post types a CPU lane for the row.
+  // so one serves them all. Any time, once per row; until then no post types a CPU lane for the row. The layer must
+  // hold every slot of the row (make_cpu_layer checks it): forwards take the tier's slots unchecked.
   void set_cpu_layer(int64_t row, std::unique_ptr<cpu_experts::CpuExpertLayer> layer) {
     if (cpu_kernel_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
     check_cpu_layer_row(row);
@@ -715,6 +717,10 @@ class RamTier {
   void make_cpu_layer(int64_t row, const cpu_experts::LayerSlabs& d, std::span<const std::byte> params) {
     if (cpu_kernel_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "CPU experts are not enabled");
     check_cpu_layer_row(row);
+    if (d.capacity < row_capacity(row))
+      throw std::runtime_error(
+          error_prefix<Layout>() + "CPU expert layer for row " + std::to_string(row) + " holds " +
+          std::to_string(d.capacity) + " slots, the row " + std::to_string(row_capacity(row)));
     set_cpu_layer(row, cpu_kernel_->make_layer(d, params));
   }
 

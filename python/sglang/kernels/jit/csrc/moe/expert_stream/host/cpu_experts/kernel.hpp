@@ -71,8 +71,17 @@ class CpuExpertKernel {
   // Validates (the old C ABI's registration checks) and stores views; throws std::invalid_argument. `params` is the quant's
   // own parameter struct, size-checked against it (empty when the quant has none).
   virtual std::unique_ptr<CpuExpertLayer> make_layer(const LayerSlabs&, std::span<const std::byte> params) const = 0;
-  // Validates (today's forward checks) and runs. Throws std::invalid_argument for a bad call, std::runtime_error for a
-  // failure; out is untouched when it throws. Pins the calling thread and its workers to cores, as today's engine did.
+  // The largest k and rows a forward takes. The host checks its jobs fit once, when it enables the kernel.
+  virtual int32_t max_routes() const noexcept = 0;
+  virtual int32_t max_rows() const noexcept = 0;
+  // Throws std::invalid_argument for a call forward may not take: a layer of another kernel, rows, k, threads or a
+  // buffer out of range, cores out of range or repeated, or fewer cores than threads, a slot outside the layer's
+  // capacity or unusable, a non-finite weight. forward checks none of it; a caller whose calls are not built to fit
+  // (a test, a harness, an upstream API) calls check first.
+  virtual void check(const CpuExpertLayer&, const ForwardCall&) const = 0;
+  // Runs a call check would pass. Throws std::invalid_argument when the input itself refuses (the quant cannot
+  // represent it), std::runtime_error for a failure; out is untouched when it throws. Pins the calling thread and its
+  // workers to cores.
   virtual void forward(const CpuExpertLayer&, const ForwardCall&) const = 0;
   // Register-only work at the forward's vector width on `threads` workers pinned to cores, until *word != seen or
   // CLOCK_MONOTONIC reaches deadline_ns (keep_warm.hpp). Throws on a bad argument.

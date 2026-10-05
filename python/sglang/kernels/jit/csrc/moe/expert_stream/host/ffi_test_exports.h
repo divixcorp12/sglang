@@ -681,8 +681,16 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         const cpu_experts::LayerSlabs& d, std::span<const std::byte>) const override {
       return std::make_unique<Layer>(*this, d.hidden);
     }
-    void forward(const cpu_experts::CpuExpertLayer& layer, const cpu_experts::ForwardCall& c) const override {
+    int32_t max_routes() const noexcept override {
+      return Wire::kLanes;
+    }
+    int32_t max_rows() const noexcept override {
+      return 1 << 16;
+    }
+    void check(const cpu_experts::CpuExpertLayer& layer, const cpu_experts::ForwardCall&) const override {
       if (&layer.kernel() != this) throw std::invalid_argument("fake CPU expert kernel: another kernel's layer");
+    }
+    void forward(const cpu_experts::CpuExpertLayer& layer, const cpu_experts::ForwardCall& c) const override {
       const int32_t core = c.cores.empty() ? -1 : c.cores.front();
       const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);
       while (now_ns() < until)
@@ -894,6 +902,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       call.cores = on;
       kernel_error_text().clear();
       try {
+        layer->kernel().check(*layer, call);
         layer->kernel().forward(*layer, call);
         return 0;
       } catch (const std::invalid_argument& e) {

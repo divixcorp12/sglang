@@ -8,6 +8,7 @@
 //   test_stack              the real stack (this binary's build) on synthetic rows with a fake kernel
 //   test_two_groups         two NUMA groups' stacks, each with its own cores and slots (a Wire::kNodes == 2 build)
 //   test_groups_must_share_one_kernel  a group naming a second kernel is refused (a Wire::kNodes == 2 build)
+//   test_a_kernel_takes_a_jobs_lanes   an engine whose kernel takes fewer routes than a job's lanes is refused
 // Each failed check prints "FAIL file:line" and counts toward run_self_test's return value.
 #include "self_test.h"
 
@@ -519,15 +520,24 @@ class FakeKernel final : public ce::CpuExpertKernel {
   struct Layer final : ce::CpuExpertLayer {
     explicit Layer(const CpuExpertKernel& k) : CpuExpertLayer(k) {}
   };
-  explicit FakeKernel(const char* name = "bench-fake") : name_(name) {}
+  explicit FakeKernel(const char* name = "bench-fake", int32_t max_routes = 1 << 10)
+      : name_(name), max_routes_(max_routes) {}
   const char* name() const noexcept override {
     return name_;
   }
   std::unique_ptr<ce::CpuExpertLayer> make_layer(const ce::LayerSlabs&, std::span<const std::byte>) const override {
     return std::make_unique<Layer>(*this);
   }
-  void forward(const ce::CpuExpertLayer& layer, const ce::ForwardCall& c) const override {
+  int32_t max_routes() const noexcept override {
+    return max_routes_;
+  }
+  int32_t max_rows() const noexcept override {
+    return 1;
+  }
+  void check(const ce::CpuExpertLayer& layer, const ce::ForwardCall&) const override {
     if (&layer.kernel() != this) throw std::invalid_argument("bench fake: another kernel's layer");
+  }
+  void forward(const ce::CpuExpertLayer&, const ce::ForwardCall& c) const override {
     uint16_t x0;
     std::memcpy(&x0, c.x, 2);
     float sum = 0.0f;
@@ -550,6 +560,7 @@ class FakeKernel final : public ce::CpuExpertKernel {
 
  private:
   const char* name_;
+  int32_t max_routes_;
 };
 
 // The byte filling expert `expert`'s `name` slab row in row `row`'s image, so a landed slot identifies its source.
@@ -846,6 +857,16 @@ void test_groups_must_share_one_kernel(const Placement& placement, const std::fi
   }
 }
 
+// The engine's forwards take its jobs unchecked, so it refuses, when built, a kernel that cannot take a job's lanes.
+void test_a_kernel_takes_a_jobs_lanes() {
+  FakeKernel narrow("fake-narrow", w::Wire::kLanes - 1);
+  es::CpuExpertConfig config;
+  config.kernel = &narrow;
+  CHECK_THROWS(
+      es::CpuExpertEngine engine(std::move(config), "bench: ", "bench-cpu"),
+      "kernel fake-narrow takes");
+}
+
 }  // namespace
 
 int run_self_test(const Placement& placement, const std::filesystem::path& image_dir) {
@@ -863,6 +884,7 @@ int run_self_test(const Placement& placement, const std::filesystem::path& image
   test_stack(placement, image_dir);
   test_two_groups(placement, image_dir);
   test_groups_must_share_one_kernel(placement, image_dir);
+  test_a_kernel_takes_a_jobs_lanes();
   std::fprintf(
       stderr, "self-test (%s): %d checks, %d failed\n", std::string(BenchBuild::kName).c_str(), checks, failures);
   return failures;

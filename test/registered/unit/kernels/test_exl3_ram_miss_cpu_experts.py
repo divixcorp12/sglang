@@ -163,8 +163,8 @@ def test_the_groups_cores_reach_every_cpu_forward(tmp_path):
 
 
 def test_a_rows_layer_is_made_once_by_the_enabled_kernel(tmp_path):
-    """Review Focus 4: a second layer for a row, a layer before any group is enabled, a row past the tier and a
-    malformed slab table are refused, naming why."""
+    """Review Focus 4: a second layer for a row, a layer before any group is enabled, a row past the tier, a malformed
+    slab table and a layer smaller than its row (forwards take the tier's slots unchecked) are refused, naming why."""
     s, page, host, sim, dst, out_rows = _host(tmp_path, split=NO_SPLIT, copy_engine=False)
     try:
         with pytest.raises(Exception, match="not enabled"):
@@ -182,6 +182,8 @@ def test_a_rows_layer_is_made_once_by_the_enabled_kernel(tmp_path):
         bad = dataclasses.replace(fake_cpu_layer(HIDDEN), slabs=((1, 2),) * 9)
         with pytest.raises(Exception, match="has at most 8 slabs"):
             host.set_cpu_layer(0, bad)
+        with pytest.raises(Exception, match="CPU expert layer for row 0 holds 6 slots, the row 7"):
+            host.set_cpu_layer(0, dataclasses.replace(fake_cpu_layer(HIDDEN), capacity=6))
     finally:
         host.stop()
 

@@ -244,10 +244,10 @@ def attached_host(setup: "RamMissSetup", page: torch.Tensor, *, k: int = 1, slot
 
 def fake_cpu_layer(hidden: int = 8):
     """A layer for the instr build's fake CPU expert kernel (ExpertStreamHost.test_kernel_address), which reads only
-    its hidden size."""
+    its hidden size. Its capacity covers any test tier's row: the host refuses a layer smaller than the row."""
     from sglang.srt.layers.moe.cpu_experts.trait import CpuExpertLayerSpec
 
-    return CpuExpertLayerSpec(capacity=1, hidden=hidden, intermediate=0, act_limit=0.0, slabs=(), params=b"")
+    return CpuExpertLayerSpec(capacity=1 << 20, hidden=hidden, intermediate=0, act_limit=0.0, slabs=(), params=b"")
 
 
 # The host build and lane count ``run_host_script``'s child constructs; the parent warms exactly these.

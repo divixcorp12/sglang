@@ -113,7 +113,11 @@ int forward(const Layer& layer, const void* x, const int32_t* slots, const float
     call.rows = rows; call.x = x; call.slots = slots; call.weights = weights;
     call.out = out; call.k = k; call.threads = threads; call.accumulate = accumulate != 0;
     call.cores = g_cores;
-    return status_of([&] { ::sglang::nvfp4_cpu::nvfp4_cpu_kernel().forward(layer, call); });
+    return status_of([&] {
+        const auto& kernel = ::sglang::nvfp4_cpu::nvfp4_cpu_kernel();
+        kernel.check(layer, call);
+        kernel.forward(layer, call);
+    });
 }
 
 // Rows token rows in one call against one call per row, bitwise; returns the number of rows that differ or fail.

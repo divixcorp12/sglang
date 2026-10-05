@@ -63,6 +63,7 @@ int main()
     std::fill(out.begin(), out.end(), 7.0f);
     bool refused = false;
     try {
+        b.check(*layer, c);
         b.forward(*layer, c);
     } catch (const std::invalid_argument& e) {
         // b's refusal names both kernels: itself ("toy_b CPU experts: ...") and the layer's ("kernel toy_a").

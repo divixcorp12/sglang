@@ -117,7 +117,13 @@ struct Call {
     Call(const Call&) = delete;
     Call& operator=(const Call&) = delete;
 
-    int run(const CpuExpertKernel& kernel = toy::toy_kernel()) { return status_of([&] { kernel.forward(*layer, c); }); }
+    int run(const CpuExpertKernel& kernel = toy::toy_kernel())
+    {
+        return status_of([&] {
+            kernel.check(*layer, c);
+            kernel.forward(*layer, c);
+        });
+    }
     bool untouched() const
     {
         for (float v : out)

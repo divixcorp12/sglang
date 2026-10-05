@@ -114,6 +114,9 @@ struct CpuExpertConfig {
   std::vector<int> cores;
   int64_t spin_ns = 50'000'000;
   int64_t keep_warm_ns = 0;  // > 0: the kernel's keep-warm runs while idle for this long after each job
+  // Each forward runs the kernel's check first (the instr build). Off, a forward trusts the calls this engine builds:
+  // the constructor and RamTier's layer registration check what they rely on.
+  bool check_calls = false;
 };
 
 // The CPU expert thread, its job ring and its done word.
@@ -139,6 +142,10 @@ class CpuExpertEngine {
   CpuExpertEngine(CpuExpertConfig config, std::string prefix, std::string thread_name)
       : config_(std::move(config)), prefix_(std::move(prefix)), thread_name_(thread_name.substr(0, 15)) {
     if (config_.kernel == nullptr) throw std::runtime_error(prefix_ + "no CPU expert kernel");
+    if (config_.kernel->max_routes() < wire::Wire::kLanes || config_.kernel->max_rows() < 1)
+      throw std::runtime_error(
+          prefix_ + "kernel " + config_.kernel->name() + " takes " + std::to_string(config_.kernel->max_routes()) +
+          " routes per forward, a job up to " + std::to_string(wire::Wire::kLanes));
     if (config_.layers == nullptr) throw std::runtime_error(prefix_ + "no CPU expert layers");
     if (config_.x_base == nullptr || config_.out_base == nullptr || config_.x_stride <= 0 || config_.out_stride <= 0)
       throw std::runtime_error(prefix_ + "the CPU expert input and output rows are required");
@@ -297,6 +304,7 @@ class CpuExpertEngine {
       try {
         const cpu_experts::CpuExpertLayer* layer = config_.layers->get(job.row);
         if (layer == nullptr) throw std::invalid_argument("the row has no registered layer");
+        if (config_.check_calls) config_.kernel->check(*layer, call);
         config_.kernel->forward(*layer, call);
       } catch (const std::exception& e) {
         fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + e.what());
