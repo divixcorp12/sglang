@@ -354,6 +354,26 @@ def test_exl3_trait_refuses_a_kernel_that_would_pin_its_own_workers(monkeypatch)
     trait.check_environment()
 
 
+@pytest.mark.parametrize("tier_layout", [False, True], ids=["flat_w2", "tier_w2"])
+def test_exl3_trait_describes_the_six_slabs_for_make_layer(tier_layout):
+    """layer_spec gives the kernel's make_layer what the C ABI's registration took: each slab's base and row size in
+    EXL3_STREAMED_NAMES order, the shape, the clamp and SglangExl3CpuParams {bits, swizzled}."""
+    import struct
+
+    slabs = _exl3_slabs()
+    if tier_layout:
+        slabs = {n: (t.unsqueeze(1) if n.startswith("w2_") else t) for n, t in slabs.items()}
+    trait = Exl3CpuQuantTrait(FakeExt(), act_limit=10.0, swizzled=True)
+    spec = trait.layer_spec(slabs, CAP)
+    names = ("w13_trellis", "w13_suh", "w13_svh", "w2_trellis", "w2_suh", "w2_svh")
+    trellis = H * INTER * 3 // 8  # bytes of one 3-bit [k/16, n/16, 48] trellis
+    row_bytes = [2 * trellis, 2 * 2 * H, 2 * 2 * INTER, trellis, 2 * INTER, 2 * H]  # quant.hpp's SlabRowBytes
+    assert spec.slabs == tuple(zip([slabs[n].data_ptr() for n in names], row_bytes))
+    assert (spec.capacity, spec.hidden, spec.intermediate, spec.act_limit, spec.activation) == (CAP, H, INTER, 10.0, 0)
+    assert spec.params == struct.pack("<ii", 3, 1)
+    assert all(any(k is slabs[n] for k in spec.keep) for n in names)
+
+
 class FakeServiceTrait(FakeTrait):
     """FakeTrait with the RAM-miss service's half: the lazily set activation limit and the native entry points."""
 

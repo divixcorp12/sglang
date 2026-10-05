@@ -82,6 +82,12 @@ def _on_threads(fn, args):
     return results
 
 
+def test_the_extension_hands_out_one_kernel_address():
+    trait, _ = _kernel()
+    address = trait.kernel_address()
+    assert address != 0 and trait.kernel_address() == address
+
+
 def test_two_engines_at_once_match_one_engine_bit_for_bit(monkeypatch):
     """Review Focus 3. Mutants: one process-wide core list (engine B's team pinned onto A's cores) -- red on the
     affinity test below; a shared static scratch, or a forward lock returning 3 -- red here."""

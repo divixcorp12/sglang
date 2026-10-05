@@ -265,3 +265,32 @@ def test_the_scheme_creates_and_frees_engines(built):
     trait.native_free_engine(engine)
     with pytest.raises(RuntimeError, match="no engine"):
         trait.native_free_engine(engine)
+
+
+def test_the_scheme_describes_a_layer_for_make_layer(built):
+    import struct
+
+    import torch
+    from tvm_ffi import load_module
+
+    from sglang.srt.layers.quantization.nvfp4.schemes import Nvfp4CpuQuantTrait
+
+    trait = Nvfp4CpuQuantTrait(hidden=80, intermediate=80, act_limit=0.0, w13_layout=2, inv_input_scale13=0.5,
+                               module=load_module(str(built)))
+    slabs = {
+        "w13": torch.zeros((2, 80 * 80), dtype=torch.uint8),
+        "w2": torch.zeros((2, 80 * 80 // 2), dtype=torch.uint8),
+        "sf13": torch.zeros((2, 256 * 8), dtype=torch.uint8),
+        "sf2": torch.zeros((2, 128 * 8), dtype=torch.uint8),
+        "gate_alpha": torch.ones(2, 1),
+        "down_alpha": torch.ones(2, 1),
+    }
+    spec = trait.layer_spec(slabs, capacity=2)
+    assert (spec.capacity, spec.hidden, spec.intermediate, spec.act_limit) == (2, 80, 80, 0.0)
+    names = ("w13", "w2", "sf13", "sf2", "gate_alpha", "down_alpha")
+    assert spec.slabs == tuple((slabs[n].data_ptr(), slabs[n][0].numel() * slabs[n].element_size()) for n in names) + ((0, 0),)
+    assert spec.params == struct.pack("<iff", 2, 0.5, 1.0)
+    assert all(any(k is slabs[n] for k in spec.keep) for n in names)
+    assert trait.kernel_address() != 0
+    with pytest.raises(ValueError, match="w2"):
+        trait.layer_spec({**slabs, "w2": slabs["w2"][:1]}, capacity=2)

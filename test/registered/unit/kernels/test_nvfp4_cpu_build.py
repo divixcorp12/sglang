@@ -65,6 +65,25 @@ def test_the_loader_builds_once_per_content_and_reuses_the_library(tmp_path):
         getattr(library, name)
 
 
+def test_the_library_hands_out_its_kernel_address(tmp_path):
+    from tvm_ffi import load_module
+
+    module = load_module(str(_build_module().build(tmp_path / "libnvfp4.so", cxx=CXX)))
+    address = int(module.nvfp4_cpu_kernel_address())
+    assert address != 0 and int(module.nvfp4_cpu_kernel_address()) == address
+
+
+def test_the_module_is_loaded_once_and_kept(tmp_path):
+    """Review Focus 1: the host holds the kernel's address, so the module that owns it must outlive every host: the
+    loader is cached for the process and hands out one module."""
+    from sglang.srt.layers.quantization.nvfp4 import ext as nvfp4_cpu_ext
+
+    nvfp4_cpu_ext.nvfp4_cpu_module.cache_clear()
+    first = nvfp4_cpu_ext.nvfp4_cpu_module(str(tmp_path))
+    assert nvfp4_cpu_ext.nvfp4_cpu_module(str(tmp_path)) is first
+    assert nvfp4_cpu_ext.nvfp4_cpu_kernel_address(str(tmp_path)) == int(first.nvfp4_cpu_kernel_address())
+
+
 def test_the_scalar_cap_runs_the_scalar_tier(tmp_path):
     """NVFP4_CPU_MAX_ISA=scalar must select the scalar tier in a library that also holds the AVX2 one."""
     exe = _build_module().build(
