@@ -65,7 +65,7 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/wt-kiface && CXX=/opt/rh/gcc-tools
   /data/models/slang/.venv/bin/python -m pytest <files...> -q -p no:randomly 2>&1 | tail -15; echo EXIT=${PIPESTATUS[0]}'
 ```
 
-`RUN_EXT <files...>` (divix01; manual tests needing the EXL3 extension built with the optimized kernel, from a private build directory; refuse to run while `pgrep -f sglang.launch_server` finds a server). Task 3 adds a source to the extension, so the first `RUN_EXT` after it rebuilds the flavor in `kiface-exl3-build` (minutes):
+`RUN_EXT <files...>` (divix01; manual tests needing the EXL3 extension built with the optimized kernel, from a private build directory; refuse to run while `pgrep -f "[s]glang.launch_server"` finds a server; the bracket keeps pgrep from matching its own ssh command line). Task 3 adds a source to the extension, so the first `RUN_EXT` after it rebuilds the flavor in `kiface-exl3-build` (minutes):
 
 ```bash
 ssh divix01 'cd /data/models/slang/nvfp4-work/wt-kiface && B=/data/models/slang/nvfp4-work/kiface-exl3-build;
