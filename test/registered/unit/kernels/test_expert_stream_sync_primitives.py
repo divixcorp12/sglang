@@ -43,42 +43,50 @@ def kernel_body(name: str, kernel: str) -> str:
     return text[start : text.index("\n}", start)]
 
 
-def test_the_three_device_headers_are_found():
-    assert sorted(HEADERS) == ["lease_device.cuh", "lease_kernels.cuh", "row_copy_kernels.cuh"]
+def test_the_device_headers_are_found():
+    assert sorted(HEADERS) == [
+        "lease_channel.cuh",
+        "lease_device.cuh",
+        "lease_kernels.cuh",
+        "lease_primitives.cuh",
+        "row_copy_kernels.cuh",
+    ]
 
 
 def test_cache_hinted_copies_and_the_timer_use_intrinsics_not_ptx():
     assert matches(r"ld\.global\.cv|st\.global\.cg|%globaltimer") == []
 
 
-def test_inline_ptx_lives_only_in_the_lease_device_helpers():
-    assert sorted({name for name, _, _ in matches(r"\basm\b")}) == ["lease_device.cuh"]
+def test_inline_ptx_lives_only_in_the_lease_primitives():
+    assert sorted({name for name, _, _ in matches(r"\basm\b")}) == ["lease_primitives.cuh"]
 
 
 def test_volatile_lives_only_in_the_relaxed_helpers():
     # Every concurrent access goes through ld/st_relaxed_sys, ld_acquire_sys{,64}, st_release_sys{,64} or
     # ld_relaxed_gpu; a raw volatile cast at a call site hides which ordering it relies on.
     assert [(name, code) for name, _, code in matches(r"\bvolatile\b") if not code.startswith("asm")] == [
-        ("lease_device.cuh", "return *reinterpret_cast<const volatile T*>(word);"),
-        ("lease_device.cuh", "*reinterpret_cast<volatile T*>(word) = value;"),
+        ("lease_primitives.cuh", "return *reinterpret_cast<const volatile T*>(word);"),
+        ("lease_primitives.cuh", "*reinterpret_cast<volatile T*>(word) = value;"),
     ]
 
 
 def test_only_the_post_staging_and_cws_gate_close_keep_a_seq_cst_system_fence():
     # The post's CPU-input staging: every thread's stores of x to the host row, ordered through __syncthreads before
-    # thread 0 publishes the record. CW's gate close orders its store before its CopyDone load (a Dekker pair with the
-    # copy thread's seq_cst fence, LEASE_PROTOCOL.md "Copy engine"): store->load needs seq_cst. CW publishes no Done.
+    # thread 0 publishes the record. The lease channel's gate close (CW's, through close_gate) orders its store before
+    # its done load (a Dekker pair with the host's seq_cst fence, LEASE_PROTOCOL.md "The lease channel"): store->load
+    # needs seq_cst. CW publishes no Done.
     assert [(name, code) for name, _, code in matches(r"__threadfence_system\(\)")] == [
+        ("lease_channel.cuh", "__threadfence_system();"),
         ("lease_kernels.cuh", "__threadfence_system();"),
-        ("row_copy_kernels.cuh", "__threadfence_system();"),
     ]
 
 
 def test_the_seqlock_writers_fences_are_two_releases():
-    # write_record and the hot bitmap record: seq 0, a release fence, the payload, then the seq with a release store.
+    # The channel's begin_record (write_record's) and the hot bitmap record: seq 0, a release fence, the payload, then
+    # the seq with a release store.
     # The device reads no seqlock (the delta block's tag is one acquire), so it has no acquire fence.
     assert [(name, code) for name, _, code in matches(r"atomic_thread_fence")] == [
-        ("lease_device.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
+        ("lease_channel.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
         ("lease_kernels.cuh", "cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);"),
     ]
 

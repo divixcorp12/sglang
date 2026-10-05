@@ -142,8 +142,9 @@ def test_the_tier_declares_only_the_callers_mutex():
     caller_mutex_ (Python callers against each other only) and the two InstrBuild-only guards, TraceState::mutex and
     TierFaults::fault_mutex, which ProdBuild's static_asserts leave without storage; it locks nothing else, and no other
     lock stands in for the deleted mutex_: no rwlock, recursive, timed or pthread lock, no atomic_flag or exchange spin
-    lock, no raw futex (the only futex is the idle threads' Doorbell, in spsc_ring.h), and the one
-    compare-exchange is cas_gate's open of the copy wait's gate (LEASE_PROTOCOL.md, "Copy engine")."""
+    lock, no raw futex (the only futex is the idle threads' Doorbell, in spsc_ring.h), and no compare-exchange: the one
+    the tier relies on is the lease channel's cas_gate, its open of the copy wait's gate (host/lease_channel.h,
+    LEASE_PROTOCOL.md "The lease channel")."""
     code = _code(MOE / "expert_stream" / "host" / "ram_tier.h")
     assert set(re.findall(r"std::mutex\s+(\w+)\s*[;{]", code)) == {"caller_mutex_", "fault_mutex", "mutex"}
     assert "std::mutex fault_mutex;" in _struct(code, "TierFaults"), "fault_mutex left TierFaults"
@@ -154,8 +155,10 @@ def test_the_tier_declares_only_the_callers_mutex():
     for other in ("shared_mutex", "recursive_mutex", "timed_mutex", "pthread_", "atomic_flag", "test_and_set",
                   ".exchange(", "futex", ".wait(", "notify_one", "notify_all", "condition_variable"):
         assert other not in code, other
-    assert code.count("compare_exchange") == 1 and "__atomic_compare_exchange_n(" in code
-    assert "__atomic_compare_exchange_n(" in _struct(code, "cas_gate", opener="void cas_gate(")
+    assert "compare_exchange" not in code
+    channel = _code(MOE / "expert_stream" / "host" / "lease_channel.h")
+    assert channel.count("compare_exchange") == 1
+    assert "__atomic_compare_exchange_n(" in _struct(channel, "cas_gate", opener="void cas_gate(")
 
 
 # One row's pack takes this long under the pack_delay fault, so a fill of a few rows is still running when checked.

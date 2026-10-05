@@ -16,9 +16,11 @@ namespace device::expert_stream::channel {
 
 using namespace ::sglang::expert_stream::channel;
 
-// The device's own state words (never on the wire): the last posted seq and the epoch, at the indices every client's
-// int32 state uses.
-constexpr int kPosted = 0, kEpoch = 2;
+// The device's own words (`state`, int32, device memory): never on the wire. Every client's state starts with these.
+constexpr int kPosted = 0;        // the last posted seq
+constexpr int kPending = 1;       // the seq of the request the client's wait serves, 0 when nothing is pending
+constexpr int kEpoch = 2;         // times seq32 wrapped; G = epoch << 32 | seq
+constexpr int kPendingEpoch = 3;  // the epoch of the request kPending names
 
 // The next seq, never 0; a wrap bumps the epoch, so G = epoch << 32 | seq never repeats.
 SGL_DEVICE uint32_t advance(int32_t* state) {

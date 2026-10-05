@@ -294,16 +294,22 @@ def test_the_copy_wait_is_cw_a_stream_wait_on_the_gate_and_a_plain_commit_kernel
     text = (CSRC / "expert_stream" / "row_copy_kernels.cuh").read_text()
     launcher = text[text.index("static void lease_copy_wait("):]
     arm = launcher.index("exl3_ram_miss_lease_copy_wait_kernel<true>")
-    wait = launcher.index("stream_wait_value32()(")
+    wait = launcher.index("enqueue_gate_wait(")
     commit = launcher.index("(exl3_ram_miss_lease_copy_commit_kernel, commit)")
     assert arm < wait < commit
     call = launcher[wait:launcher.index(";", wait)]
-    assert "kLeaseCopyGate" in call and "kLeaseGateOpen" in call and "kStreamWaitValueGeq" in call, call
+    assert "kLeaseCopyGate" in call, call
+    # The lease channel's wait node (stream_wait.h): GEQ open on the gate word.
+    stream_wait = (CSRC / "expert_stream" / "stream_wait.h").read_text()
+    enqueue = stream_wait[stream_wait.index("inline void enqueue_gate_wait("):]
+    enqueue = enqueue[: enqueue.index("\n}\n")]
+    assert "channel::kGateOpen" in enqueue and "kStreamWaitValueGeq" in enqueue, enqueue
+    assert "kStreamWaitValueGeq = 0;" in stream_wait and '"cuStreamWaitValue32_v2"' in stream_wait
     assert re.search(r"LaunchKernel\(1, device::expert_stream::kBlock, stream\)\(exl3_ram_miss_lease_copy_commit_kernel", launcher)
     body = text[text.index("void exl3_ram_miss_lease_copy_commit_kernel("):]
     body = body[: body.index("\n}\n")]
     assert "PDL" not in body and "while" not in body and "__nanosleep" not in body, "the commit kernel must not wait"
-    assert '"cuStreamWaitValue32_v2"' in text
+    assert "channel::commit_or_trap<TargetChannel>(" in body
 
 
 def test_cw_closes_the_gate_after_its_sm_reads_and_fences_before_the_copydone_load():
@@ -314,11 +320,17 @@ def test_cw_closes_the_gate_after_its_sm_reads_and_fences_before_the_copydone_lo
     body = body[: body.index("\n}\n")]
     reads = body.index("copy_wait_read(")
     barrier = body.index("__syncthreads();", reads)
-    close = body.index("kLeaseGateClosed")
-    fence = body.index("__threadfence_system();", close)
-    load = body.index("kLeaseCopyDone", fence)
-    assert reads < barrier < close < fence < load
+    close_gate = body.index("channel::close_gate<TargetChannel>(lease, seq, generation);")
+    assert reads < barrier < close_gate
     assert "kLeaseDone" not in text and "lane_kind" in body
+    # The lease channel's close (lease_channel.cuh): the closed word, the Dekker fence, then the done load.
+    channel = (CSRC / "expert_stream" / "lease_channel.cuh").read_text()
+    close_body = channel[channel.index("SGL_DEVICE void close_gate("):]
+    close_body = close_body[: close_body.index("\n}\n")]
+    close = close_body.index("gate_word(seq, kGateClosed)")
+    fence = close_body.index("__threadfence_system();", close)
+    load = close_body.index("S::kDone", fence)
+    assert close < fence < load
 
 
 def test_the_python_side_passes_the_pdl_flag_to_exactly_the_chain_launchers():

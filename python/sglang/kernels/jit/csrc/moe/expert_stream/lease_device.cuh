@@ -37,17 +37,17 @@ using namespace ::sglang::expert_stream::wire;
 constexpr int kBlock = 32;
 constexpr int kCopyWaitThreads = 256;  // the copy wait's block when it also reads the small tensors
 
-// The device's own words (`state`, int32, device memory): never on the wire.
-constexpr int kPosted = 0;        // the last posted seq
-constexpr int kPending = 1;       // the seq of the request this layer's chain serves, 0 for an unarmed post
-constexpr int kEpoch = 2;         // times seq32 wrapped; G = epoch << 32 | seq
-constexpr int kPendingEpoch = 3;  // the epoch of the request kPending names
+// The device's own words (`state`, int32, device memory): never on the wire. The first four are the lease channel's
+// (lease_channel.cuh); kPending is the seq of the request this layer's chain serves, 0 for an unarmed post.
+using channel::kEpoch;
+using channel::kPending;
+using channel::kPendingEpoch;
+using channel::kPosted;
 // The stream kernel's absolute deadline, written by the post as two int32 halves. It bounds the one device spin that
 // nothing else bounds.
 constexpr int kDeadlineLo = 4;
 constexpr int kDeadlineHi = 5;
 constexpr int kStateWords = 6;
-static_assert(kPosted == channel::kPosted && kEpoch == channel::kEpoch, "the lease channel's state words");
 
 constexpr uint64_t kGenerationMask = (1ull << 56) - 1;
 

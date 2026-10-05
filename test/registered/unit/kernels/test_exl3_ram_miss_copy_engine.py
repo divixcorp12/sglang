@@ -584,17 +584,19 @@ def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
 
     import sglang.kernels.ops.moe.expert_stream_transport as transport
 
-    source = (
-        Path(transport.__file__).resolve().parents[2]
-        / "jit/csrc/moe/expert_stream/host/ram_tier.h"
-    ).read_text()
+    host = Path(transport.__file__).resolve().parents[2] / "jit/csrc/moe/expert_stream/host"
     # Whitespace-normalized, so clang-format may wrap a call's arguments without breaking the pin.
-    tier = " ".join(source.split())
+    tier = " ".join((host / "ram_tier.h").read_text().split())
     assert "store_release(lease_ + Wire::kLeaseCopyGate" not in tier
     assert (
         tier.count("std::memcpy(lease_ + Wire::kLeaseCopyGate") == 1
     )  # init_lease_block, before any thread
-    assert "reinterpret_cast<uint32_t*>(lease_ + Wire::kLeaseCopyGate), &expected" in tier
+    assert tier.count("kLeaseCopyGate") == 1, "the tier reaches the gate only through the lease channel"
+    assert "channel::complete<TargetChannel>(" in tier and "channel::open_closed_gate<TargetChannel>(" in tier
+    # The lease channel's host half (host/lease_channel.h) loads the gate and changes it only by a CAS.
+    channel = " ".join((host / "lease_channel.h").read_text().split())
+    assert channel.count("S::kGate") == 2, "gate(): one acquire load; cas_gate(): one compare-exchange"
+    assert "reinterpret_cast<uint32_t*>(lease + S::kGate), &expected" in channel
 
 
 def test_the_copy_thread_runs_on_the_cpus_it_is_given(tmp_path):
