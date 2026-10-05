@@ -72,19 +72,23 @@ def slot_pointer_tables(
     }
 
 
-def route_tables(remap, expert_count, ones, weights, keep):
+def route_tables(remap, expert_count, ones, weights, keep, token_sorted=None, top_k=1):
     """Fill ``expert_count`` from ``remap``; return (inv_order, weight_sorted fp16, det tables).
 
+    Routes are ranked by slot, ties by route index (a stable sort: several tokens may route one slot); with
+    ``token_sorted`` given, each rank's token, ``route // top_k``, is written into it.
     ``keep`` (fp32 [1]) scales every route weight and, when 0, empties ``expert_count``,
     so a dropped layer runs no expert.
     ``det`` is exllamav3's device-built deterministic table stack
     ``[expert_start, expert_start, count > 0]``.
     """
     expert_count.zero_().index_add_(0, remap, ones)
-    order = torch.argsort(remap)
+    order = torch.argsort(remap, stable=True)
     inv_order = torch.empty_like(order).scatter_(
         0, order, torch.arange(order.numel(), device=order.device)
     )
+    if token_sorted is not None:
+        torch.floor_divide(order, top_k, out=token_sorted)
     weight_sorted = (weights[order].float() * keep).to(torch.float16)
     # A dropped layer runs no expert: nothing reads rows that may be half written.
     expert_count.mul_((keep > 0).to(torch.int64))

@@ -49,13 +49,16 @@ def exl3_moe_route_tables(
     dst_slots: Optional[torch.Tensor] = None,
     cpu_out: int = 0,
     cpu_part_stride: int = 0,
+    token_sorted_out: Optional[torch.Tensor] = None,
 ) -> None:
     """The fused MoE's route tables and input staging; see ``exl3.fused_moe.route_tables``.
 
-    Writes ``remap64_out`` (``remap`` as int64), ``x16_out`` (``x`` as fp16), zeroes ``out_zero``, and fills
-    ``expert_count`` [slots + 1], ``inv_order``, ``weight_sorted`` (fp16) and ``det`` [3, slots + 1].
+    ``x`` and the staging buffers ``x16_out`` and ``out_zero`` are the M tokens' ``[M, H]`` rows; ``remap`` holds
+    their routes token-major, a multiple of M and at most 64. Writes ``remap64_out`` (``remap`` as int64), ``x16_out``
+    (``x`` as fp16), zeroes ``out_zero``, and fills ``expert_count`` [slots + 1], ``inv_order``, ``weight_sorted``
+    (fp16) and ``det`` [3, slots + 1]. ``token_sorted_out`` (int64 ``[routes]``, optional) receives each rank's token.
 
-    CPU experts: ``cpu_lanes`` (int32 ``[2]``: CPU lanes, then the part bits) masks the plan lanes the CPU computed and
+    CPU experts (one token only): ``cpu_lanes`` (int32 ``[2]``: CPU lanes, then the part bits) masks the plan lanes the CPU computed and
     flags the output parts holding their partial sums, a bit per part: bit 2g group g's CPU hits', bit 2g + 1 its CPU
     misses'; ``dst_slots`` (int32) are the plan's lane slots, ``cpu_out`` the address of the row's part 0 and
     ``cpu_part_stride`` the floats between consecutive parts (0 for a one-part row). The flagged parts' sum, lowest
@@ -83,6 +86,7 @@ def exl3_moe_route_tables(
         inv_order,
         weight_sorted,
         det,
+        token_sorted_out if token_sorted_out is not None else _empty_i64(det.device),
         cpu_lanes if cpu_lanes is not None else _empty_i32(det.device),
         dst_slots if dst_slots is not None else _empty_i32(det.device),
         int(cpu_out),
@@ -99,4 +103,16 @@ def _empty_i32(device) -> torch.Tensor:
     t = _EMPTY_I32.get(key)
     if t is None:
         t = _EMPTY_I32[key] = torch.empty(0, dtype=torch.int32, device=device)
+    return t
+
+
+_EMPTY_I64: dict = {}
+
+
+def _empty_i64(device) -> torch.Tensor:
+    """The int64 twin of ``_empty_i32``: the launcher's "off" for ``token_sorted_out``, capture-safe."""
+    key = str(device)
+    t = _EMPTY_I64.get(key)
+    if t is None:
+        t = _EMPTY_I64[key] = torch.empty(0, dtype=torch.int64, device=device)
     return t
