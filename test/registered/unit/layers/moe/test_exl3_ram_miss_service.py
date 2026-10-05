@@ -522,16 +522,23 @@ def test_graph_routes_are_logged_only_when_the_stage_trace_is_on(tiers, monkeypa
 
     monkeypatch.setattr(expert_row_plan, "copy_expert_row_segments_gpu", lambda *args: None)
     monkeypatch.setattr(module, "copy_expert_row_segments_gpu", lambda *args: None)
+    # The fixture's teardown shuts the service down, which reads the real device side's state: restore it first.
+    real_sides = (service.device_side, [backend.device_side for backend in backends])
     service.device_side = SimpleNamespace(
         post=lambda *a, **kw: None, hit_wait=lambda *a: None, stream=lambda *a: None, copy_wait=lambda *a: None,
         host_rows_1=None, dst_slots_1=None, go_1=None, copy_engine_captured=False,
     )
-    for backend in backends:
-        backend.device_side = service.device_side
-    for row, backend in enumerate(backends):  # one forward, as _apply_graph then the gather leave it
-        backend.routes.copy_(torch.tensor([row, 3, 5, -1, -1, -1][: backend.routes.numel()]))
-        backend.post(0, SimpleNamespace(expert_ids=torch.tensor([3]), slots=torch.zeros(1, dtype=torch.int32),
-                                        count=torch.tensor([row + 1], dtype=torch.int32)))
+    try:
+        for backend in backends:
+            backend.device_side = service.device_side
+        for row, backend in enumerate(backends):  # one forward, as _apply_graph then the gather leave it
+            backend.routes.copy_(torch.tensor([row, 3, 5, -1, -1, -1][: backend.routes.numel()]))
+            backend.post(0, SimpleNamespace(expert_ids=torch.tensor([3]), slots=torch.zeros(1, dtype=torch.int32),
+                                            count=torch.tensor([row + 1], dtype=torch.int32)))
+    finally:
+        service.device_side = real_sides[0]
+        for backend, side in zip(backends, real_sides[1]):
+            backend.device_side = side
     assert int(log.seq[0]) == 1
     log.poll(trace)
     trace.close()
