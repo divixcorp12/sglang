@@ -3,6 +3,7 @@
 
 #include <string>
 
+#include "draft_channel.h"
 #include "lease_layout.h"
 
 namespace {
@@ -49,6 +50,21 @@ std::string channel_members() {
     put("gate_open_" + std::to_string(seq), ::sglang::expert_stream::channel::gate_word(seq, L::kLeaseGateOpen));
     put("gate_closed_" + std::to_string(seq), ::sglang::expert_stream::channel::gate_word(seq, L::kLeaseGateClosed));
   }
+  namespace d = ::sglang::expert_stream::draft;
+  using D = d::DraftChannel;
+  put("draft_head", D::kHead);
+  put("draft_ring", D::kRing);
+  put("draft_records", D::kRecords);
+  put("draft_record_bytes", D::kRecordBytes);
+  put("draft_done", D::kDone);
+  put("draft_gate", D::kGate);
+  put("draft_channel_bytes", d::kChannelBytes);
+  put("draft_max_rows", d::kMaxRows);
+  put("draft_max_k", d::kMaxK);
+  put("draft_rec_stage", d::kRecStage);
+  put("draft_rec_rows", d::kRecRows);
+  put("draft_rec_k", d::kRecK);
+  put("draft_rec_epoch", d::kRecEpoch);
   out.pop_back();
   return out;
 }
@@ -58,7 +74,8 @@ std::string channel_for_nodes(int64_t nodes) {
   return nodes == 1 ? channel_members<LeaseLayout<N, 1>>() : channel_members<LeaseLayout<N, 2>>();
 }
 
-// The target's lease channel (TargetChannelOf) and the shared gate encoding, for test_lease_channel_layout.
+// The target's lease channel (TargetChannelOf), the shared gate encoding and the draft's channel
+// (draft_channel.h), for test_lease_channel_layout and test_dspark_draft_channel_layout.
 std::string channel_probe(int64_t lanes, int64_t nodes) {
   if (nodes != 1 && nodes != 2) return "";
   switch (lanes) {

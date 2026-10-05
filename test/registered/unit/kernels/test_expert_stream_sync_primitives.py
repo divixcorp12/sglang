@@ -45,6 +45,7 @@ def kernel_body(name: str, kernel: str) -> str:
 
 def test_the_device_headers_are_found():
     assert sorted(HEADERS) == [
+        "draft_kernels.cuh",
         "lease_channel.cuh",
         "lease_device.cuh",
         "lease_kernels.cuh",
@@ -71,11 +72,12 @@ def test_volatile_lives_only_in_the_relaxed_helpers():
 
 
 def test_only_the_post_staging_and_cws_gate_close_keep_a_seq_cst_system_fence():
-    # The post's CPU-input staging: every thread's stores of x to the host row, ordered through __syncthreads before
-    # thread 0 publishes the record. The lease channel's gate close (CW's, through close_gate) orders its store before
+    # The posts' CPU-input staging (the target's and the draft's): every thread's stores of x to the host area, ordered
+    # through __syncthreads before thread 0 publishes the record. The lease channel's gate close (CW's, through close_gate) orders its store before
     # its done load (a Dekker pair with the host's seq_cst fence, LEASE_PROTOCOL.md "The lease channel"): store->load
     # needs seq_cst. CW publishes no Done.
     assert [(name, code) for name, _, code in matches(r"__threadfence_system\(\)")] == [
+        ("draft_kernels.cuh", "__threadfence_system();"),
         ("lease_channel.cuh", "__threadfence_system();"),
         ("lease_kernels.cuh", "__threadfence_system();"),
     ]
