@@ -15,14 +15,17 @@ The fake runs natively on the CPU expert thread, so no wait for the CPU lanes de
 """
 
 import dataclasses
+import gc
 import os
 import time
+import weakref
 
 import pytest
 import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
+from sglang.kernels.ops.moe import expert_stream_transport as es
 from sglang.kernels.ops.moe.expert_stream_transport import new_page
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -179,6 +182,26 @@ def test_a_rows_layer_is_made_once_by_the_enabled_kernel(tmp_path):
         bad = dataclasses.replace(fake_cpu_layer(HIDDEN), slabs=((1, 2),) * 9)
         with pytest.raises(Exception, match="has at most 8 slabs"):
             host.set_cpu_layer(0, bad)
+    finally:
+        host.stop()
+
+
+def test_a_test_kernel_layer_keeps_its_slabs_until_it_is_dropped(tmp_path):
+    """kernel_layer's layer reads spec.keep's tensors: a caller that passes the spec as a temporary must not free them
+    under the layer."""
+    s, page, host, sim, dst, out_rows = _host(tmp_path, split=NO_SPLIT)
+    try:
+        slab = torch.zeros(64)
+        alive = weakref.ref(slab)
+        layer = es.kernel_layer(
+            host.test_kernel_address(), dataclasses.replace(fake_cpu_layer(HIDDEN), keep=(slab,)), variant="instr"
+        )
+        del slab
+        gc.collect()
+        assert alive() is not None
+        es.kernel_drop(layer, variant="instr")
+        gc.collect()
+        assert alive() is None
     finally:
         host.stop()
 

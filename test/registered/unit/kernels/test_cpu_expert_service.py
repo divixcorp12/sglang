@@ -265,6 +265,32 @@ def test_service_registers_a_row_once_after_the_cores_and_the_activation_limit()
         _service(FakeHost(), trait).register(0, 7.0)
 
 
+class RefusingHost(FakeHost):
+    """A host whose kernel's make_layer refuses the first layer it is given."""
+
+    def __init__(self):
+        super().__init__()
+        self.refuse = True
+
+    def set_cpu_layer(self, row, spec):
+        if self.refuse:
+            self.refuse = False
+            raise ValueError("fake CPU experts: refused")
+        super().set_cpu_layer(row, spec)
+
+
+def test_a_row_the_kernel_refuses_stays_unregistered():
+    """The kernel validates the layer inside set_cpu_layer: a refused row is not recorded, so a later register retries
+    it."""
+    host, trait = RefusingHost(), FakeServiceTrait()
+    svc = _service(host, trait)
+    with pytest.raises(ValueError, match="refused"):
+        svc.register(1, 10.0)
+    assert not svc.registered(1)
+    svc.register(1, 10.0)
+    assert svc.registered(1) and sorted(host.layers) == [1]
+
+
 def test_service_keeps_the_cpu_warm_for_2_ms_by_default_and_not_at_0():
     from sglang.srt.environ import envs
 
