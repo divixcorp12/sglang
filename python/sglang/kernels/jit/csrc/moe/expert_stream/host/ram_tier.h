@@ -1648,8 +1648,13 @@ class RamTier {
                 std::to_string(lane.slot) + ")" + why);
       };
       if (is_miss(lane.kind)) {
-        if (!listed(own.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
-        if (listed(plan->slots, static_cast<int64_t>(lane.slot))) fail(" shares its staging slot with another miss");
+        if (lane.slot < 0) {
+          // A forced CPU miss (spill): no staging slot; reserve_victims_locked reads it into a RAM victim.
+          if (lane.kind != Wire::kKindMissCpu) fail(" is a GPU miss without a staging slot");
+        } else {
+          if (!listed(own.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
+          if (listed(plan->slots, static_cast<int64_t>(lane.slot))) fail(" shares its staging slot with another miss");
+        }
         if (tier.expert_slot[lane.expert] >= 0) fail(" misses an expert the tier holds");
         if (lane.kind == Wire::kKindMissCpu) {
           if (!cpu_row || group.cpu->parts() < 2) fail(": a CPU miss on a row without CPU experts' miss part");
@@ -1750,11 +1755,34 @@ class RamTier {
   // miss lands in its staging slot whatever happens here; whether it is cached is the victim's question. inserted[i] is
   // set when miss i took a victim and is cached once read.
   void reserve_victims_locked(
-      Group& group, Tier& tier, const Request& request, const RecordPlan& plan, bool* inserted) {
+      Group& group, Tier& tier, const Request& request, RecordPlan& plan, bool* inserted) {
     GroupRow& own = group.rows[request.row];
     DeltaReport part;
     part.staging = own.staging;
+    // Forced CPU misses first (spill, slot -1): each is read straight into a victim, which it takes over, so it is
+    // cached with no staging slot. The start-up capacity check (Exl3RamMissService.attach) leaves every node range a
+    // victim for each, so none missing is a broken invariant, not a skipped insert.
+    bool placed[Wire::kLanes] = {};
     for (size_t i = 0; i < plan.missing.size(); ++i) {
+      if (plan.slots[i] >= 0) continue;
+      int32_t old = -1;
+      const int64_t victim = take_victim_locked(group, request.row, plan.wanted, &old);
+      if (victim < 0) fail_record(request, "a forced CPU miss found no RAM victim on its node");
+      if (old >= 0) {
+        part.entries[part.count][0] = old;
+        part.entries[part.count][1] = -1;
+        ++part.count;
+      }
+      part.entries[part.count][0] = plan.missing[i];
+      part.entries[part.count][1] = static_cast<int32_t>(victim);
+      ++part.count;
+      tier.state[victim] = kStaging;  // being read; commit_inserted_locked makes it READY
+      plan.slots[i] = victim;
+      placed[i] = true;
+      inserted[i] = true;
+    }
+    for (size_t i = 0; i < plan.missing.size(); ++i) {
+      if (placed[i]) continue;
       int32_t old = -1;
       const int64_t victim = take_victim_locked(group, request.row, plan.wanted, &old);
       if (victim < 0) {
