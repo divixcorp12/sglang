@@ -3,7 +3,7 @@
 import pytest
 
 from sglang.kernels.ops.moe.expert_lease_block import wire_layout
-from sglang.srt.layers.moe.ram_slot_map import LaneKind, MapReplica, type_lanes
+from sglang.srt.layers.moe.ram_slot_map import LaneKind, LaneOverflow, MapReplica, type_lanes
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -151,3 +151,58 @@ def test_one_node_is_the_flat_lists_of_today():
     assert len(replica.staging[0]) == 8
     assert len(MapReplica(2, 16, 8, nodes=2).staging[0]) == 16
     assert wire_layout(8, 2).home(5) == 1
+
+
+def test_forced_lanes_are_cpu_lanes_outside_the_split():
+    """Lanes 0-1 found VRAM victims, lanes 2-3 did not (spill). The split sees only lane 0, the one eligible unforced
+    lane (split[1] = 1), so it is the CPU's; lane 1, an unforced miss, stays on the GPU in staging slot 9. The forced
+    hit is a CPU lane at its RAM slot; the forced miss is a CPU miss with slot -1, though staging slot 10 is free: the
+    host reads it into a RAM victim (Task 9), so staging only ever holds live misses."""
+    ram = [-1] * 16
+    ram[1], ram[2] = 4, 5
+    staging = [9, 10] + [-1] * 6
+    kinds, slots = _type([1, 0, 2, 7], ram, staging, cpu_on=True, forced_from=2)
+    assert kinds == [LaneKind.HIT_CPU, LaneKind.MISS_GPU, LaneKind.HIT_CPU, LaneKind.MISS_CPU]
+    assert slots == [4, 9, 5, -1]
+
+
+def test_36_forced_misses_on_one_node_need_no_staging():
+    """Review Focus 2 at the record's full width: 36 lanes on a 40-lane, 2-node wire, 8 of them with VRAM victims,
+    every lane an NVMe miss homed on node 0 (even experts). The 8 live misses take node 0's 8 staging slots; the 28
+    forced ones take none. No LaneOverflow, whatever one node holds."""
+    lanes, nodes = 40, 2
+    experts = [2 * e for e in range(36)]
+    staging = list(range(100, 108)) + [-1] * (lanes - 8) + [-1] * lanes  # node 0's list, then node 1's
+    kinds, slots = type_lanes(
+        experts, [-1] * 80, staging, [0] * (nodes * (lanes + 1)), lanes=lanes, captured=True, copy_armed=True,
+        hit_copy="ce", cpu_on=True, cpu_misses=False, nodes=nodes, forced_from=8,
+    )
+    assert kinds == [LaneKind.MISS_GPU] * 8 + [LaneKind.MISS_CPU] * 28
+    assert slots == list(range(100, 108)) + [-1] * 28
+
+
+def test_forced_from_the_count_forces_nothing():
+    ram = [-1] * 16
+    ram[1] = 4
+    staging = [9, 10] + [-1] * 6
+    assert _type([1, 0], ram, staging, cpu_on=True, forced_from=2) == _type([1, 0], ram, staging, cpu_on=True)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"copy_armed": False}, {"captured": False}, {"cpu_on": False}, {"cpu_ok": False}],
+    ids=["unarmed", "eager", "cpu-off", "no-cpu-layer"],
+)
+def test_a_forced_lane_that_cannot_be_the_cpus_overflows(changes):
+    ram = [-1] * 16
+    ram[1], ram[2] = 4, 5
+    with pytest.raises(LaneOverflow):
+        _type([1, 2], ram, forced_from=1, **{"cpu_on": True, **changes})
+
+
+def test_an_unforced_miss_without_staging_still_raises_plainly():
+    """A live miss always has a staging slot (live <= victim lanes = staging per node): its absence is a broken
+    invariant, a plain ValueError (the device traps), never an overflow."""
+    with pytest.raises(ValueError) as refused:
+        _type([0, 7], [-1] * 16, NO_STAGING, cpu_on=True, forced_from=1)
+    assert not isinstance(refused.value, LaneOverflow)
