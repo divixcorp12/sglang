@@ -117,13 +117,16 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
     // GCC spills the pair sums and pays per-iteration overhead (~1.4x on Zen 3).
     const __m256i p_lo = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_lo, mult), ones32);
     const __m256i p_hi = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_hi, mult), ones32);
+    // Rows 0..7 cover the largest MAX_M (8); rows >= MAX_M are constant-false and index row 0 so the dead code is
+    // still in bounds.
     #define ACC_ROW(i) \
-        if ((i) < m) { \
+        if ((i) < MAX_M && (i) < m) { \
+            constexpr int r = (i) < MAX_M ? (i) : 0; \
             const __m256i xs = _mm256_set1_epi32(splat_dup[static_cast<size_t>(i) * k + row]); \
-            acc[i][0] = _mm256_add_epi32(acc[i][0], _mm256_madd_epi16(p_lo, xs)); \
-            acc[i][1] = _mm256_add_epi32(acc[i][1], _mm256_madd_epi16(p_hi, xs)); \
+            acc[r][0] = _mm256_add_epi32(acc[r][0], _mm256_madd_epi16(p_lo, xs)); \
+            acc[r][1] = _mm256_add_epi32(acc[r][1], _mm256_madd_epi16(p_hi, xs)); \
         }
-    ACC_ROW(0) ACC_ROW(1) ACC_ROW(2) ACC_ROW(3)
+    ACC_ROW(0) ACC_ROW(1) ACC_ROW(2) ACC_ROW(3) ACC_ROW(4) ACC_ROW(5) ACC_ROW(6) ACC_ROW(7)
     #undef ACC_ROW
 }
 
