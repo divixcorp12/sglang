@@ -1,6 +1,6 @@
 # DSV4.1: DSpark with the target's and the draft's CPU experts at once — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. The owner chose subagent-driven development with Sonnet implementers and a fresh reviewer per task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Serve DSV4.1 EXL3 with DSpark speculative decoding while both the target's CPU experts
 (`SGLANG_DSV41_CPU_EXPERTS=1`) and the draft's CPU experts (`SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS=1`) are on, and
@@ -26,8 +26,11 @@ a verify is never re-run eagerly. The one remaining eager re-verify is the one t
   per-node tier-capacity check at start-up.
 - **Overflow and the eager re-verify (GPU-only):** the post overflows only when a forced lane cannot be the CPU's,
   which means the copy engine is unarmed or the CPU layer is not yet registered. Both occur only before arming.
-- **The draft keeps its own lease channel and thread** on dedicated node-0 cores (12-15). The target's node-0 team
-  shrinks to 6-11; node 1 keeps 18-27.
+- **One CPU expert team per NUMA node (owner's ruling).** Node 0's engine serves both the target's lease records and
+  the DSpark draft channel. That is one thread with one job at a time, the kind tagged in the host loop. Its idle hold
+  watches both the doorbell and the channel head. Node 1's engine serves the target. The draft's separate thread and
+  cores go away, and node 0's team keeps 6-15, node 1's 18-27. A draft-only DSpark launch (target CPU experts off)
+  runs the same engine with the draft channel as its only source.
 
 **Tech Stack:** CUDA (JIT `lease_kernels.cuh`, `lease_device.cuh`, `row_copy_kernels.cuh`, `exl3_route_tables.cuh`,
 `direct_gather.cuh`), C++20 host (`host/cpu_experts.h`, `host/ram_tier.h`, `host/copy_engine.h`,
@@ -55,18 +58,15 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
    ~13 tok/s plain decode with CPU experts (§30.1, §33.5). §33.5's v2 projection, multi-token CPU experts in the verify,
    ranges from +25% to −13% against 13.17 tok/s. This plan builds the mode and a one-line switch (`PROD_DSPARK` in
    `arm_env.py`).
-   **Recommendation:** flip only if the A/B (Task 15) shows `dspark-both` at or below production's median ms/token
-   and passes the text bar, or on the owner's explicit go regardless. Task 16 is gated on this.
-2. **Cores for the two CPU-expert clients.** Node 0 has no free physical core under today's recipe: 0-5 server, 6-15
-   target, 16 copy, 17 RAM. Options:
-   - **(a) Recommended.** The draft takes named cores 12-15 and the target's node-0 team shrinks to 6-11, leaving
-     node 1's 18-27 as is. No code change: `ThreadingConfig` already leaves named draft cores out of every derived
-     role. No spin interaction: each team spins only on its own cores. The draft weights are first-touch on node 0,
-     local to its cores.
-   - **(b) Time-share 6-15.** Both teams' keep-warm and idle spin (100 ms PAUSE after 2 ms of register work) would
-     fight for the same logical cores. That needs spin coordination code and `ThreadingConfig` changes that refuse
-     today's rules.
-   - **(c) The draft on node 1's 32-34.** Only 3 cores, and the draft weights would be remote (node 0).
+   **Recommendation:** flip only if the A/B (Task 17) shows `dspark-both` at or below production's median ms/token
+   and passes the text bar, or on the owner's explicit go regardless. Task 18 is gated on this.
+2. **Cores for the two CPU-expert clients — ruled by the owner (2026-10-06): one team per NUMA node.**
+   - Node 0's `CpuExpertEngine` serves the target and the draft channel. Node 1's serves the target. Both keep all of
+     their derived cores (6-15 and 18-27).
+   - The draft has no core role under CPU experts. `SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES` and `_THREADS` are
+     refused there (Task 12).
+   - A draft-only launch keeps its derived draft cores and runs a draft-only engine.
+   - The design is in Tasks 11-12; its risks are in Review Focus 6-8.
 3. **Lane count, victim lanes, staging.**
    - **Record:** one lane per route, which is `MISS_LANES` unset: a 36-lane gather on a **40-lane wire**.
      - 36 is the maximum distinct experts of 6 tokens at top-6 (§33.5: max 36, p99 32).
@@ -97,7 +97,7 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
      | **Host-placed into a RAM victim** | **0** | Recommended |
 
 4. **Hot cache under DSpark.** **Recommendation:** `SGLANG_MOE_HOT_GPU_MB=12040`, the hybrid draft's value (§33.4,
-   §33.5), which leaves 4040 MiB of production's 16080 for the draft's resident experts, dense weights and KV. Task 15
+   §33.5), which leaves 4040 MiB of production's 16080 for the draft's resident experts, dense weights and KV. Task 17
    gates it: the server's KV pool must be no smaller than the production arm's in the same A/B. It also bounds Task 9's
    start-up check, which uses the layer's VRAM capacity.
 5. **The eager re-verify stays GPU-only, and in steady state it never runs.** The ways a verify could overflow:
@@ -109,7 +109,7 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
    | 3 | More distinct misses than lanes | Cannot happen: a lane per route (Tasks 2 and 8) |
 
    **Recommendation:** keep the re-run GPU-only. Case 1 is a start-up transient, and CPU experts are not armed then
-   anyway. Task 15 reports the re-verify count, which must equal the verifies before arming.
+   anyway. Task 17 reports the re-verify count, which must equal the verifies before arming.
 
 ## Global Constraints
 
@@ -140,8 +140,8 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
 - GPU steps:
   - GPU work runs under `flock /data/models/slang/nvfp4-work/cc-gpu.lock`, on cores 32-63 unless the step names cores.
   - A step that needs both locks takes `rowimg-disk.lock` first.
-  - Production holds `cc-gpu.lock` for its whole lifetime. The executor waits on the lock and **never starts or stops
-    production**; GPU windows are the owner's.
+  - Production stays down for the whole run, so GPU windows are open. The lock rule still holds: every GPU step
+    takes `cc-gpu.lock`, and the executor never starts production.
 - Environment variables go through `sglang.srt.environ.envs` (`env-var-conventions` skill). The one new variable is
   `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)`.
 - Speculative names follow the `speculative-naming` skill (`accept_length`, `spec_verify_ct`, `verify`).
@@ -158,13 +158,13 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
 1. **A captured verify before the copy engine arms** (the first `COPY_ENGINE_ARM_DECODES` forwards after capture, and
    every eager graph-path verify). This is the one overflow left. No forced lane can be a CPU lane: `host_lanes` is
    false. Expected: the post serves the victims' prefix, writes the count, flags the forward, and the eager re-verify
-   gives the right text. No trap. Owner: Task 4 (`armed=False`), Task 11 (unarmed replay).
+   gives the right text. No trap. Owner: Task 4 (`armed=False`), Task 13 (unarmed replay).
 2. **Every non-victim lane an NVMe miss, all on one node.** This cannot overflow, and it is asserted.
    - The device types each forced miss `MISS_CPU` with slot −1, never a staging slot. It traps if a *live* miss finds
      no staging (live ≤ V = staging per node).
    - The host reads each forced miss into a RAM victim of that node and fail-stops if none exists, which Task 10's
      start-up capacity check rules out.
-   - Owner: Task 4 (36 forced misses on a 40-lane post), Task 9 (36 host-placed misses on one node), Task 11 (end to
+   - Owner: Task 4 (36 forced misses on a 40-lane post), Task 9 (36 host-placed misses on one node), Task 13 (end to
      end).
 3. **A verify with fewer tokens than the rows hold** (a 3-token post into 4-token rows, a short eager verify). Expected:
    the host reads the count from the table header. It neither assumes `tokens_max` nor reads stale rows. Owner: Task 5,
@@ -178,8 +178,22 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
    - With a lane per route, the miss count never exceeds the lanes.
    - Under spill the gather never calls the clamp, which asserts it is not spilling.
    - The post still traps on `count > Wire::kLanes`. The updater refuses spill with a narrowed `MISS_LANES`.
-   - Owner: Task 8 (`test_spill_never_clamps`, `test_spill_needs_a_lane_per_route`), Task 11 (a 36-distinct-expert
+   - Owner: Task 8 (`test_spill_never_clamps`, `test_spill_needs_a_lane_per_route`), Task 13 (a 36-distinct-expert
      verify, no overflow).
+6. **A job of one kind arriving while the other runs on node 0's shared team.** Expected: the second runs after the
+   first completes, never concurrently, and both complete. Owner: Task 11
+   (`test_one_team_runs_a_job_of_each_kind_one_after_the_other`, both orders).
+7. **A stuck job of either kind, and stop() during either kind.** Expected:
+   - a held forward fail-stops within the fatal wait and names the job (draft record or target row);
+   - stop() during a hung job still fail-stops, because the watchdog outlives the join;
+   - stop() during a slow job returns after it completes.
+   - All existing draft teardown tests (I1 closed gate, I2 poll-loads stop, I3 hung forward) pass on both the shared
+     and the draft-only engine.
+   Owner: Task 11.
+8. **A launch with no draft source.** Expected: it behaves exactly as before. That means no watchdog thread, holds
+   through the one-word `keep_warm`, and the CPU kernel's one-word keep-warm and forward machine code pinned by the
+   digest. Owner: Task 11 (`test_a_launch_without_a_draft_source_holds_on_the_doorbell_alone`, the digest's `cpu`
+   section).
 
 ---
 
@@ -199,7 +213,7 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/cpu_token_table.h` | create | the token table's layout constants, shared by device and host |
 | `python/sglang/kernels/ops/moe/expert_lease_block.py` | modify | `MAX_LANES = 64`, `cpu_row_bytes` |
 | `python/sglang/kernels/ops/moe/expert_stream_transport.py` | modify | device `post` (`spill`, M tokens), both `enable_cpu_experts`, wide mask tensors, calibration lanes |
-| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h` | modify | `CpuJob.per_token/lanes`, `CpuExpertConfig.tokens`, `run_job` expansion |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h` | modify | `CpuJob.per_token/lanes`, `CpuExpertConfig.tokens`, `run_job` expansion; `DraftSource`, the engine's draft source, unified watchdog |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h` | modify | `LaneMask` masks; record jobs carry lanes; host-placed forced misses |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/host/split_calibration.h` | modify | calibrate up to a runtime lane count |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h` | modify | `enable_cpu_experts(tokens)`, `calibrate_cpu_split(lanes)` |
@@ -213,7 +227,15 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
 | `python/sglang/srt/layers/moe/exl3_ram_miss.py` | modify | staging width, CPU rows by tokens, attach, spill words, capacity check |
 | `python/sglang/srt/layers/moe/cpu_experts/service.py` | modify | rows sized by tokens, calibration lanes |
 | `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` | modify | the gate |
-| `scripts/dsv41/bs1_build_digest.py` | create | SASS and `.text` digests of the one-token build |
+| `scripts/dsv41/bs1_build_digest.py` | create | SASS and `.text` digests of the one-token build; the CPU kernel's one-word keep-warm (Task 11) |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/kernel.hpp`, `keep_warm.hpp`, `expert_forward.hpp` | modify | `keep_warm_either`: the hold on two words |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/spsc_ring.h` | modify | `Doorbell::sleep_unless` with a timeout |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/draft_cpu_thread.h` | delete | replaced by the engine's draft source |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_test_exports.h`, `bench/src/self_test.cpp` | modify | test kernels' `keep_warm_either` |
+| `python/sglang/kernels/ops/moe/dspark_draft_cpu.py` | modify | `SharedDraftHost`; `DraftCpuHost` backed by a draft-only engine |
+| `python/sglang/srt/layers/moe/cpu_experts/threading_config.py` | modify | no draft role under CPU experts |
+| `python/sglang/srt/layers/moe/cpu_experts/draft.py` | modify | the registry attaches to node 0's engine under CPU experts |
+| `python/sglang/test/dsv41_ram_miss_fixtures.py` | modify | `draft_cpu_host` (both shapes) |
 | `benchmarks/dsv41_baseline/arm_env.py`, `launch_prod.sh` | modify | DSpark mode, `PROD_DSPARK` |
 | `scripts/expert_prediction/benchmarks/run_capture_sessions.py` | modify | record `sglext.spec_tokens_details` |
 | `scripts/dsv41/dspark_text_band.py` | create | the §33.2/§33.9 near-tie text bar |
@@ -978,7 +1000,7 @@ Include `../expert_stream/lane_mask.cuh`.
 - `exl3_ram_miss.py`: `plan_gather_width`'s docstring "outside 1..32" becomes "outside 1..64".
 - `expert_stream.py:1489`: "at most 32 routes of one token or 64 of several" is unchanged; it is the planner's limit,
   which already holds 36 routes.
-- The gate's 1-32 stays until Task 12.
+- The gate's 1-32 stays until Task 14.
 
 - [ ] **Step 10: Run and pass, then prove the one-token build unchanged**
 
@@ -3006,8 +3028,9 @@ VRAM-hot slots, so a victim always exists, and a live miss always has its stagin
 Both are asserted (fail_record, __trap), never handled. The post overflows only when forced lanes cannot be CPU lanes
 at all: before the copy engine arms (or before a row's CPU layer is registered). Then it serves the live prefix,
 writes that count, and sets DIRECT's overflow flag and the layer's counter, and the DSpark worker re-runs the verify
-eagerly. The draft (the second client) is untouched: separate channel, areas, thread and cores, on the same stream
-strictly before the verify.
+eagerly. The draft (the second client) keeps its own channel and areas, on the same stream strictly before the
+verify. From Task 11 on it shares node 0's CPU expert team: one thread, one job at a time, its hold watching the
+doorbell and the channel head.
 ```
 
 - [ ] **Step 6: Run and pass**
@@ -3035,7 +3058,1249 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 11: End to end on the GPU: a captured 6-token verify with CPU experts and spill
+### Task 11: One CPU expert team per node: the engine serves the draft channel as a second job source
+
+The owner's ruling (2026-10-06): one CPU expert team per NUMA node. Node 0's `CpuExpertEngine` serves both the
+target's lease records and the DSpark draft channel. Node 1's serves the target only. `DraftCpuThread`, with its own
+OpenMP team and its own cores, goes away.
+
+**Design:**
+- **The kernel stays client-agnostic.** `CpuExpertKernel::forward(ExpertLayer, ForwardCall)` already takes plain
+  pointers, so neither `ForwardCall` nor the forward plan gets a flag.
+- **The tag lives in the host loop.** The engine pops a target job from its ring, or reads a posted draft record. The
+  kind decides how the call is built and how the job completes:
+  - target: a `CpuJob`'s lanes and the pinned slabs, completed by the tier protocol (`done_`);
+  - draft: the stage's x/slots/weights areas and the draft's pageable `ExpertLayer`, completed by `channel::complete`
+    (done, then the Dekker open of the gate).
+- **One thread, so never two jobs at once.** A job of one kind that arrives while the other runs waits for it to
+  finish. A pending target job is taken first. In practice the two never meet: the draft step ends on the stream
+  before the verify's first post.
+- **The idle hold watches both words.** These are the engine doorbell and the channel head, through a new
+  `CpuExpertKernel::keep_warm_either`. The one-word `keep_warm` is left as it is: its machine code joins the BS1 digest
+  in Step 1, before anything changes. With no draft source, the engine calls exactly what it calls today.
+- **Detection is unified across both kinds.**
+  - A torn, malformed or lapped draft record, or a refused forward of either kind, fail-stops as before.
+  - A watchdog, started when a draft source is attached, fail-stops a job of either kind that runs past the fatal
+    wait. It also fail-stops a posted draft record left unserved that long.
+  - A launch without a draft source starts no watchdog, as today. Its stuck target jobs stay the RAM-miss service's
+    copy-wait deadline to catch.
+- **`stop()`.** It no longer bumps the draft head to end a hold, since the doorbell ends it. That removes the reason
+  the run loop had to tell a bump from a record.
+- **The draft-only launch** (DSpark, target CPU experts off) builds the same `CpuExpertEngine` in draft-only mode. It
+  has no tier and no ring jobs, and the draft channel is its only source. It runs on the derived draft cores (node 0's
+  6-15 under the recipe's server cores, §33.8). The `DraftCpuHost` Python API, its FFI names and its thread name
+  `dspark-cpu` are unchanged, so the draft registry and the draft tests drive it as before.
+
+**Files:**
+- Modify:
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/kernel.hpp` (`keep_warm_either`)
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/keep_warm.hpp` (two-word loops)
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/expert_forward.hpp` (the override)
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/spsc_ring.h` (`Doorbell::sleep_unless` with a timeout)
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h` (`DraftSource`, draft-only config, the engine)
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h` (per-group draft attach)
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h` (the draft-only registry on the engine, the host's `draft_*`)
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_test_exports.h` (`FakeKernel::keep_warm_either`)
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/self_test.cpp` (its test kernel's override)
+  - `python/sglang/kernels/ops/moe/dspark_draft_cpu.py` (`SharedDraftHost`)
+  - `python/sglang/kernels/ops/moe/expert_stream_transport.py` (`ExpertStreamHost.draft_source`)
+  - `python/sglang/test/dsv41_ram_miss_fixtures.py` (`draft_cpu_host`)
+  - `scripts/dsv41/bs1_build_digest.py`, `test/manual/dsv41/golden/bs1_build_digest.json` (the CPU kernel's one-word keep-warm)
+- Delete: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/draft_cpu_thread.h`
+- Test: `test/registered/unit/kernels/test_dspark_draft_cpu_thread.py`, `test/registered/unit/kernels/test_dspark_shared_cpu_team.py` (new)
+
+**Interfaces:**
+- Consumes: Task 6's engine (`CpuJob.per_token/lanes`, `run_job`); Task 2's digest script.
+- Produces:
+  - `CpuExpertKernel::keep_warm_either(cores, threads, word_a, seen_a, word_b, seen_b, warm_until_ns, release_ns)`;
+  - `DraftSource`; `CpuExpertConfig::draft_only`;
+  - `CpuExpertEngine::attach_draft(std::unique_ptr<DraftSource>, int64_t fatal_wait_ns)`, `::detach_draft()`,
+    `::draft_stats()`;
+  - `RamTier::draft_open/draft_set_layer/draft_start/draft_stop/draft_stats(group, ...)`;
+  - FFI `expert_stream_draft_open/_draft_set_layer/_draft_start/_draft_stop/_draft_stats(handle, group, ...)`;
+  - `ExpertStreamHost.draft_source(areas, *, fatal_wait_s, group=0) -> SharedDraftHost`. `SharedDraftHost` has
+    `DraftCpuHost`'s `set_layer/start/stop/stats`, and its `stop` detaches the source.
+  - Fixture `draft_cpu_host(mode, areas, kernel, *, cores, threads, spin_us, keep_warm_us, fatal_wait_s, tmp_path)`,
+    with `mode` in {"draft_only", "shared"}.
+
+- [ ] **Step 1: Pin the CPU kernel's one-word keep-warm before changing it**
+
+In `scripts/dsv41/bs1_build_digest.py`:
+- add `--cpu-kernel` to the parser (store_true);
+- add this function:
+```python
+def _cpu_kernel() -> dict[str, str]:
+    """The optimized EXL3 CPU kernel library's one-word keep-warm and forward entry points: objdump per function,
+    addresses and raw bytes stripped, operand addresses reduced to the symbols they name. Needs SGLANG_EXL3_SRC and
+    SGLANG_DSV41_CPU_EXPERTS=1 (the optimized build)."""
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+
+    so = exl3_ext().__file__
+    text = subprocess.run(["objdump", "-d", "-C", "--no-show-raw-insn", so], capture_output=True, text=True,
+                          check=True).stdout
+    keep = re.compile(r"keep_warm_detail::(bw|avx2|scalar)\(|keep_warm<|ExpertForward<.*>::(keep_warm|forward)\(")
+    digests, name, lines = {}, None, []
+    for line in text.splitlines() + [""]:
+        header = re.match(r"^[0-9a-f]+ <(.+)>:$", line)
+        if header or not line.strip():
+            if name is not None and keep.search(name):
+                digests[name] = hashlib.sha256("\n".join(lines).encode()).hexdigest()
+            name, lines = (header.group(1), []) if header else (None, [])
+            continue
+        if name is not None:
+            body = re.sub(r"^\s*[0-9a-f]+:\s*", "", line)
+            body = re.sub(r"\b[0-9a-f]{5,}\b", "", body)  # absolute addresses; the <symbol> after each stays
+            lines.append(body.strip())
+    return digests
+```
+- in `collect()`, `if os.environ.get("SGLANG_EXL3_SRC"): result["cpu"] = _cpu_kernel()`;
+- in the comparison, `kinds` becomes `("device", "cpu") if args.permanent else ("device", "host", "cpu")`, reading
+  `golden.get(kind, {})`;
+- in `--write` mode with `--cpu-kernel`, merge only the `cpu` key into an existing file:
+```python
+    if args.write:
+        if args.cpu_kernel and os.path.exists(args.write):
+            with open(args.write) as f:
+                merged = json.load(f)
+            merged["cpu"] = now.get("cpu", {})
+            now = merged
+        with open(args.write, "w") as f:
+            json.dump(now, f, indent=1, sort_keys=True)
+        return
+```
+Run it at the commit before this task's source changes, with the optimized build env (Task 13 Step 2's env block), and
+commit the golden:
+```bash
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 env PYTHONPATH=$PWD/python SGLANG_DSV41_CPU_EXPERTS=1 \
+  SGLANG_EXL3_SRC=/data/models/slang/nvfp4-work/exllamav3 SGLANG_EXL3_CPU_CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++ \
+  CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++ /data/models/slang/.venv/bin/python scripts/dsv41/bs1_build_digest.py \
+  --write test/manual/dsv41/golden/bs1_build_digest.json --cpu-kernel
+git add scripts/dsv41/bs1_build_digest.py test/manual/dsv41/golden/bs1_build_digest.json
+git commit -m "test(cpu-experts): record the CPU kernel's one-word keep-warm before the shared team adds a two-word one
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
+```
+Expected: the golden gains a `cpu` section listing `keep_warm_detail::bw(...)`, `avx2`, `scalar`, the
+`keep_warm<...>` instantiations and `ExpertForward<...>::keep_warm`/`forward`.
+
+- [ ] **Step 2: Write the failing tests**
+
+Add to `python/sglang/test/dsv41_ram_miss_fixtures.py`:
+```python
+def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, spin_us: int, keep_warm_us: int,
+                   fatal_wait_s: float, tmp_path, variant: str = "instr", ns_per_expert: int = 0):
+    """A DSpark draft channel server, unstarted, with DraftCpuHost's interface, in one of the two shapes the shared CPU
+    team allows (plan 2026-10-06 Task 11):
+      draft_only  a draft-only engine (DraftCpuHost), as a launch with the target's CPU experts off builds;
+      shared      group 0's CPU expert engine of an ExpertStreamHost whose CPU experts are on (the fake kernel at
+                  `kernel`), the draft attached as its second job source; .expert_host is that host and .sim its
+                  ChainSim, so a test can post target jobs to the same team. stop() detaches the draft; the caller
+                  stops .expert_host.
+    """
+    from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuHost
+    from sglang.kernels.ops.moe.expert_lease_block import wire_layout
+    from sglang.kernels.ops.moe.expert_stream_transport import new_page
+    from sglang.test.dsv41_chain_sim import ChainSim
+
+    if mode == "draft_only":
+        return DraftCpuHost(areas, cores=cores, threads=threads, spin_us=spin_us, keep_warm_us=keep_warm_us,
+                            fatal_wait_s=fatal_wait_s, variant=variant)
+    if mode != "shared":
+        raise ValueError(mode)
+    s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    page = new_page(pin=False, wire=wire_layout(8))
+    host = attached_host(s, page, k=3)
+    host.enable_copy_engine(-1)
+    row = 1
+    dst = {n: torch.zeros((6,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[row].items()}
+    table = torch.tensor([[t.data_ptr(), dst[n].data_ptr(), t[0].numel() * t.element_size()] for n, t in s.slabs[row].items()],
+                         dtype=torch.int64)
+    host.set_copy_table(row, table, 6)
+    host.arm_copy_engine()
+    x_rows = torch.zeros((2, 16), dtype=torch.uint8)
+    out_rows = torch.zeros((2, 2, 8), dtype=torch.float32)
+    split = [0] * (host.wire.lanes + 1)
+    split[1] = 1  # one eligible hit lane: the CPU's
+    host.enable_cpu_experts(kernel, split, cores, x_rows, out_rows, threads=threads, spin_us=spin_us,
+                            keep_warm_us=keep_warm_us)
+    host.set_cpu_layer(row, fake_cpu_layer(8))
+    draft = host.draft_source(areas, fatal_wait_s=fatal_wait_s, group=0)
+    draft.expert_host, draft.sim, draft.keep = host, ChainSim(host, page, s.slabs), (s, dst, x_rows, out_rows)
+    return draft
+```
+
+In `test_dspark_draft_cpu_thread.py`, every existing test runs on both shapes:
+- `_host(request, ...)` gains a `mode` parameter and builds with `draft_cpu_host(mode, areas, kernel, ...,
+  tmp_path=request.getfixturevalue("tmp_path"))`. In shared mode it adds `request.addfinalizer(host.expert_host.stop)`
+  after `host.stop`.
+- A module-level `MODES = ["draft_only", "shared"]` and `@pytest.mark.parametrize("mode", MODES)` go on each of
+  `test_one_stage_serves_m_rows`, `test_stats_count_the_jobs_whose_routes_share_a_slot`,
+  `test_three_stages_in_turn_each_run_their_own_layer`, `test_the_head_store_ends_the_hold`,
+  `test_an_idle_thread_sleeps_and_still_serves` and `test_stop_with_a_closed_gate_returns_and_leaves_it_open`. Each
+  passes `mode` to `_host`.
+- `test_one_stage_serves_m_rows` asserts `c["core"] == _cores()[0]`. That holds in both shapes, because the shared
+  engine's team is `_cores()` too.
+- `_draft_cpu_s()` takes the thread name: `"dspark-cpu"` for draft_only, the host's group-0 engine thread name for
+  shared. That name is `thread_name` as `ExpertStreamHost.enable_cpu_experts` builds it; read it there and pass it
+  here.
+- `test_the_head_store_ends_the_hold`: in shared mode, keep-warm calls count `keep_warm_either` calls. The fake counts
+  both in one counter (Step 4).
+- The three child-process tests (`test_a_failure_fail_stops`, `test_a_stop_between_the_poll_loads_is_not_a_torn_record`,
+  `test_a_stop_during_a_hung_forward_still_fail_stops`) gain `@pytest.mark.parametrize("mode", MODES)`. They pass
+  `mode` as the child's second argument. `_CHILD` and `_STOP_CHILD` build with:
+  ```python
+  import tempfile
+  from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host
+  mode = sys.argv[2]
+  host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, spin_us=..., keep_warm_us=0,
+                        fatal_wait_s=..., tmp_path=__import__("pathlib").Path(tempfile.mkdtemp(dir=os.getcwd())))
+  ```
+  (the same `spin_us`/`fatal_wait_s` as today) in place of `DraftCpuHost(...)`.
+
+Not one test is dropped. In particular the three teardown cases (I1 the closed gate, I2 the poll-loads stop, I3 the
+hung-forward stop) run in both shapes. In shared mode their `host.stop()` is the draft's detach, and I3 must still
+fail-stop through the engine's watchdog.
+
+Create `test/registered/unit/kernels/test_dspark_shared_cpu_team.py`:
+```python
+"""One CPU expert team per node (plan 2026-10-06 Task 11): node 0's engine serves the target's lease records and the
+DSpark draft channel on one thread, one job at a time, on the instr build's fake kernel (CPU)."""
+
+import dataclasses
+import os
+import time
+
+import pytest
+import torch
+
+from sglang.kernels.ops.moe import expert_stream_transport as ops
+from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer, spawn_child
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+
+H, STAGES, ROW, CAPACITY = 64, 3, 1, 1 << 20
+
+
+def _m():
+    return ops._host_module("exl3", "instr")
+
+
+def _cores():
+    return sorted(os.sched_getaffinity(0))[:2]
+
+
+def _until(predicate, timeout_s=5.0):
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.002)
+
+
+def _shared(tmp_path, request, fatal_wait_s=30.0):
+    areas = DraftCpuAreas(STAGES, H, pin=False)
+    kernel = int(_m().expert_stream_test_kernel_address(0, 0, 0))
+    draft = draft_cpu_host("shared", areas, kernel, cores=_cores(), threads=2, spin_us=-1, keep_warm_us=0,
+                           fatal_wait_s=fatal_wait_s, tmp_path=tmp_path)
+    for stage in range(STAGES):
+        draft.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(H), capacity=CAPACITY + stage))
+    draft.start()
+    request.addfinalizer(draft.expert_host.stop)
+    request.addfinalizer(draft.stop)
+    return areas, draft
+
+
+def _post_draft(areas, seq, stage=0, rows=2, k=2):
+    areas.slots[stage, :rows, :k] = torch.tensor([[0, 1]] * rows, dtype=torch.int32)
+    areas.weights[stage, :rows, :k] = 0.5
+    _m().expert_stream_draft_test_post(areas.channel.data_ptr(), stage, rows, k, seq, 0)
+
+
+def _draft_done(areas, seq):
+    off = areas.wire.done + 8 * ((seq - 1) % areas.wire.records)
+    return (int(areas.channel[off : off + 8].view(torch.int64)[0]) & 0xFFFFFFFF) == seq
+
+
+def _post_target(draft):
+    """A captured CPU-hit lane of row ROW on the same team: expert 2 made resident, then posted as a CPU lane."""
+    sim, host = draft.sim, draft.expert_host
+    req = sim.post(ROW, [2])
+    assert host.pump() == 1 and sim.wait_served(req)
+    req = sim.post(ROW, [2], captured=True, cpu_on=True, dst=[0], weights=[1.0])
+    assert host.pump() == 1
+    return req
+
+
+def _kinds():
+    """The fake's calls in order: 'draft' (a stage's layer, capacity >= CAPACITY) or 'target'."""
+    width = 6 + 2 * 8
+    count = int(_m().expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
+    out = torch.zeros((count, width), dtype=torch.float64)
+    _m().expert_stream_test_kernel_calls(out)
+    return ["draft" if int(r[5 + 2 * 8]) >= CAPACITY else "target" for r in out.tolist()]
+
+
+@pytest.mark.parametrize("first", ["draft", "target"])
+def test_one_team_runs_a_job_of_each_kind_one_after_the_other(tmp_path, request, first):
+    """(a) The first job is held in its forward; the second kind arrives meanwhile and runs only once the first
+    completes, on the same team (core 0 is both jobs' worker 0). Mutation: serve the draft from a second thread -- the
+    second job's calls interleave with or precede the held one's."""
+    areas, draft = _shared(tmp_path, request)
+    core = _cores()[0]
+    _m().expert_stream_test_kernel_hold(core, 1)
+    if first == "draft":
+        _post_draft(areas, 1)
+        time.sleep(0.05)
+        _post_target(draft)
+    else:
+        _post_target(draft)
+        time.sleep(0.05)
+        _post_draft(areas, 1)
+    time.sleep(0.1)
+    assert _kinds() == [], "nothing completes while the first job is held"
+    _m().expert_stream_test_kernel_hold(core, 0)
+    _until(lambda: _draft_done(areas, 1) and draft.expert_host.cpu_stats()["jobs"] == 1)
+    second = "target" if first == "draft" else "draft"
+    calls = _kinds()
+    assert calls == [first] * calls.count(first) + [second] * calls.count(second), calls
+    assert calls.count("draft") == 2 and calls.count("target") == 1  # the draft record's 2 rows, the target's 1
+
+
+_STUCK_CHILD = """
+import os, sys, time, tempfile, dataclasses, pathlib
+import torch
+from sglang.kernels.ops.moe import expert_stream_transport as ops
+from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
+from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
+kind, when = sys.argv[1], sys.argv[2]   # kind: draft | target; when: run (left stuck) | stop (stop() during it)
+m = ops._host_module("exl3", "instr")
+slow = when == "slow"
+kernel = int(m.expert_stream_test_kernel_address(200_000_000 if slow else 0, 0, 0))
+areas = DraftCpuAreas(3, 64, pin=False)
+cores = sorted(os.sched_getaffinity(0))[:2]
+draft = draft_cpu_host("shared", areas, kernel, cores=cores, threads=2, spin_us=-1, keep_warm_us=0,
+                       fatal_wait_s=5.0 if slow else 0.5, tmp_path=pathlib.Path(tempfile.mkdtemp(dir=os.getcwd())))
+for stage in range(3):
+    draft.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(64), capacity=(1 << 20) + stage))
+draft.start()
+host, sim = draft.expert_host, draft.sim
+req = sim.post(1, [2]); assert host.pump() == 1 and sim.wait_served(req)
+if not slow:
+    m.expert_stream_test_kernel_hold(cores[0], 1)
+if kind == "draft":
+    areas.slots[0, :2, :2] = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+    m.expert_stream_draft_test_post(areas.channel.data_ptr(), 0, 2, 2, 1, 0)
+else:
+    sim.post(1, [2], captured=True, cpu_on=True, dst=[0], weights=[1.0]); assert host.pump() == 1
+time.sleep(0.1)
+if when in ("stop", "slow"):
+    host.stop()   # the engine's stop() with a job of `kind` in its forward
+    print("stopped", flush=True)
+    if slow:
+        if kind == "draft":
+            done = int(areas.channel[areas.wire.done : areas.wire.done + 8].view(torch.int64)[0]) & 0xFFFFFFFF
+            print("draft done" if done == 1 else "draft not done", flush=True)
+        else:
+            width = 6 + 2 * 8
+            count = int(m.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
+            calls = torch.zeros((count, width), dtype=torch.float64)
+            m.expert_stream_test_kernel_calls(calls)
+            target = [r for r in calls.tolist() if int(r[5 + 2 * 8]) < (1 << 20)]
+            print("target done" if target else "target not done", flush=True)
+time.sleep(2)
+print("late", flush=True)
+"""
+
+
+@pytest.mark.parametrize("kind", ["draft", "target"])
+@pytest.mark.parametrize("when", ["run", "stop"])
+def test_a_stuck_job_of_either_kind_fail_stops(kind, when):
+    """(b) A held forward of either kind fail-stops within the fatal wait (0.5 s), with the job's identity. (c, hung) A
+    stop() during it still fail-stops: the watchdog outlives the run thread's join."""
+    result = spawn_child(_STUCK_CHILD, kind, when, timeout_s=60, variant="instr")
+    assert "late" not in result.stdout, (result.stdout, result.stderr[-2000:])
+    assert result.returncode != 0
+    says = ["DSpark draft CPU experts", "record 1", "incomplete"] if kind == "draft" else ["CPU job of row 1", "incomplete"]
+    for text in says:
+        assert text in result.stderr, result.stderr[-2000:]
+
+
+@pytest.mark.parametrize("kind", ["draft", "target"])
+def test_stop_during_a_job_of_either_kind_lets_it_complete(kind):
+    """(c) stop() while a 400 ms forward of either kind runs: stop returns after it completes, the job is done (the
+    draft record's done word, or the target's CPU job count), nothing fail-stops."""
+    result = spawn_child(_STUCK_CHILD, kind, "slow", timeout_s=60, variant="instr")
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "stopped" in result.stdout and f"{kind} done" in result.stdout, result.stdout
+    assert "FATAL" not in result.stderr, result.stderr[-2000:]
+
+
+def test_a_launch_without_a_draft_source_holds_on_the_doorbell_alone(tmp_path, request):
+    """The non-DSpark engine is today's: no watchdog thread, and its holds call the one-word keep_warm (the fake counts
+    which). Mutation: always hold on both words -- the two-word count moves."""
+    from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
+
+    s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    host = attached_host(s, ops.new_page(pin=False, wire=ops.expert_lease_block.wire_layout(8)), k=3)
+    request.addfinalizer(host.stop)
+    host.enable_copy_engine(-1)
+    kernel = int(_m().expert_stream_test_kernel_address(0, 0, 0))
+    threads_before = len(os.listdir("/proc/self/task"))
+    host.enable_cpu_experts(kernel, [0] * (host.wire.lanes + 1), _cores(), torch.zeros((2, 16), dtype=torch.uint8),
+                            torch.zeros((2, 2, 8), dtype=torch.float32), threads=2, spin_us=-1, keep_warm_us=0)
+    _until(lambda: int(_m().expert_stream_test_keep_warm_calls()) >= 1)
+    assert int(_m().expert_stream_test_keep_warm_either_calls()) == 0
+    assert len(os.listdir("/proc/self/task")) - threads_before == 1, "the engine thread only, no watchdog"
+```
+If `ops.expert_lease_block` is not re-exported by the transport module, import `expert_lease_block` directly.
+
+- [ ] **Step 3: Run and see them fail**
+
+CPU, on divix01: `test/registered/unit/kernels/test_dspark_draft_cpu_thread.py test/registered/unit/kernels/test_dspark_shared_cpu_team.py`.
+Expected: the shared-mode parametrizations and the new file fail on `AttributeError: ... draft_source`, and the
+draft-only ones pass.
+
+- [ ] **Step 4: The kernel interface** (`kernel.hpp`, `keep_warm.hpp`, `expert_forward.hpp`, the two test kernels)
+
+`kernel.hpp`, appended to `CpuExpertKernel` after `keep_warm`:
+```cpp
+  // keep_warm watching two words: holds until *word_a != seen_a, *word_b != seen_b or CLOCK_MONOTONIC reaches
+  // release_ns. A CPU expert engine with a second job source (the DSpark draft channel) holds on its doorbell and the
+  // channel's head together; one without calls keep_warm, whose code this leaves as it was.
+  virtual void keep_warm_either(std::span<const int> cores, int32_t threads, const uint32_t* word_a, uint32_t seen_a,
+                                const uint32_t* word_b, uint32_t seen_b, int64_t warm_until_ns,
+                                int64_t release_ns) const = 0;
+```
+`keep_warm.hpp`: inside `keep_warm_detail`, after `scalar`, add the two-word loops. They are separate functions so the
+one-word ones stay byte-for-byte what they are:
+```cpp
+inline bool done_either(const uint32_t* a, uint32_t seen_a, const uint32_t* b, uint32_t seen_b, int64_t deadline_ns,
+                        uint32_t tick)
+{
+    if (__atomic_load_n(a, __ATOMIC_ACQUIRE) != seen_a || __atomic_load_n(b, __ATOMIC_ACQUIRE) != seen_b) return true;
+    return (tick & 63) == 0
+           && std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                      .count()
+                  >= deadline_ns;
+}
+
+SGLANG_TARGET_BW __attribute__((noinline)) inline int32_t bw_either(const uint32_t* a, uint32_t seen_a, const uint32_t* b,
+                                                                     uint32_t seen_b, int64_t deadline_ns)
+{
+    __m512i x = _mm512_set1_epi16(3), y = _mm512_set1_epi16(5), c0 = _mm512_setzero_si512(), c1 = c0, c2 = c0, c3 = c0;
+    for (uint32_t tick = 0; !done_either(a, seen_a, b, seen_b, deadline_ns, tick); ++tick)
+        for (int i = 0; i < 16; ++i) {
+            c0 = _mm512_add_epi32(c0, _mm512_madd_epi16(x, y));
+            c1 = _mm512_add_epi32(c1, _mm512_madd_epi16(y, x));
+            c2 = _mm512_add_epi32(c2, _mm512_madd_epi16(x, x));
+            c3 = _mm512_add_epi32(c3, _mm512_madd_epi16(y, y));
+            x = _mm512_xor_si512(x, c3);
+        }
+    return _mm512_reduce_add_epi32(_mm512_add_epi32(_mm512_add_epi32(c0, c1), _mm512_add_epi32(c2, x)));
+}
+
+SGLANG_TARGET_AVX2 __attribute__((noinline)) inline int32_t avx2_either(const uint32_t* a, uint32_t seen_a,
+                                                                         const uint32_t* b, uint32_t seen_b,
+                                                                         int64_t deadline_ns)
+{
+    __m256i x = _mm256_set1_epi16(3), y = _mm256_set1_epi16(5), c0 = _mm256_setzero_si256(), c1 = c0, c2 = c0, c3 = c0;
+    for (uint32_t tick = 0; !done_either(a, seen_a, b, seen_b, deadline_ns, tick); ++tick)
+        for (int i = 0; i < 16; ++i) {
+            c0 = _mm256_add_epi32(c0, _mm256_madd_epi16(x, y));
+            c1 = _mm256_add_epi32(c1, _mm256_madd_epi16(y, x));
+            c2 = _mm256_add_epi32(c2, _mm256_madd_epi16(x, x));
+            c3 = _mm256_add_epi32(c3, _mm256_madd_epi16(y, y));
+            x = _mm256_xor_si256(x, c3);
+        }
+    const __m256i t = _mm256_add_epi32(_mm256_add_epi32(c0, c1), _mm256_add_epi32(c2, x));
+    return int32_t(uint32_t(_mm256_extract_epi32(t, 0)) + uint32_t(_mm256_extract_epi32(t, 7)));
+}
+
+inline int32_t scalar_either(const uint32_t* a, uint32_t seen_a, const uint32_t* b, uint32_t seen_b, int64_t deadline_ns)
+{
+    for (uint32_t tick = 0; !done_either(a, seen_a, b, seen_b, deadline_ns, tick); ++tick) _mm_pause();
+    return 0;
+}
+```
+After `keep_warm` (the one-word template, untouched), add:
+```cpp
+// keep_warm on two words: the same hold, ended by either word moving.
+template <Isa Top>
+void keep_warm_either(Isa isa, std::span<const int> cores, int32_t threads, const uint32_t* word_a, uint32_t seen_a,
+                      const uint32_t* word_b, uint32_t seen_b, int64_t warm_until_ns, int64_t release_ns)
+{
+    if (threads < 1 || word_a == nullptr || word_b == nullptr || (!cores.empty() && size_t(threads) > cores.size()))
+        throw std::invalid_argument("CPU expert keep-warm needs a worker, two words and no more workers than its cores");
+    std::atomic<int> pin_error{0};
+    #pragma omp parallel num_threads(threads) shared(cores, pin_error)
+    {
+        pin(omp_get_thread_num(), cores, pin_error);
+        const int64_t warm_deadline = std::min(warm_until_ns, release_ns);
+        int32_t warm = 0;
+        if constexpr (Top >= Isa::Bw) {
+            if (isa >= Isa::Bw) warm = keep_warm_detail::bw_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+            else if (isa >= Isa::Avx2) warm = keep_warm_detail::avx2_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+            else warm = keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+        } else if constexpr (Top >= Isa::Avx2) {
+            if (isa >= Isa::Avx2) warm = keep_warm_detail::avx2_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+            else warm = keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+        } else {
+            warm = keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+        }
+        keep_warm_detail::sink.fetch_add(warm, std::memory_order_relaxed);
+        keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, release_ns);
+    }
+    if (pin_error.load(std::memory_order_relaxed)) throw std::runtime_error("cannot pin CPU expert worker to its core");
+}
+```
+`expert_forward.hpp`, after the `keep_warm` override:
+```cpp
+    void keep_warm_either(std::span<const int> cores, int32_t threads, const uint32_t* word_a, uint32_t seen_a,
+                          const uint32_t* word_b, uint32_t seen_b, int64_t warm_until_ns,
+                          int64_t release_ns) const override
+    {
+        ::sglang::cpu_experts::keep_warm_either<Quant::kTopIsa>(isa(), cores, threads, word_a, seen_a, word_b, seen_b,
+                                                                 warm_until_ns, release_ns);
+    }
+```
+`ffi_test_exports.h` `FakeKernel`: add the override. It counts in `either_calls_` and in the shared `warm_calls_`, and
+records the core as `keep_warm` does:
+```cpp
+    void keep_warm_either(std::span<const int> cores, int32_t, const uint32_t* word_a, uint32_t seen_a,
+                          const uint32_t* word_b, uint32_t seen_b, int64_t, int64_t release_ns) const override {
+      warm_calls_.fetch_add(1, std::memory_order_relaxed);
+      either_calls_.fetch_add(1, std::memory_order_relaxed);
+      warm_core_.store(cores.empty() ? -1 : cores.front(), std::memory_order_relaxed);
+      while (__atomic_load_n(word_a, __ATOMIC_ACQUIRE) == seen_a && __atomic_load_n(word_b, __ATOMIC_ACQUIRE) == seen_b &&
+             now_ns() < release_ns)
+        _mm_pause();
+    }
+```
+Also:
+- add `mutable std::atomic<int64_t> either_calls_{0};`, reset it in `reset()`, with a getter `either_calls()`;
+- add the export `static int64_t test_keep_warm_either_calls()`, registered as
+  `TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_either_calls, Exports::test_keep_warm_either_calls);`
+  next to `expert_stream_test_keep_warm_calls`, and refused outside the instr build as its neighbour is.
+
+`bench/src/self_test.cpp`: its test kernel gets the same two-word body, which spins until either word moves or
+`release_ns`.
+
+- [ ] **Step 5: The engine** (`cpu_experts.h`, `spsc_ring.h`)
+
+`spsc_ring.h` `Doorbell`, add next to `sleep_unless`:
+```cpp
+  /// sleep_unless, waking after `timeout_ns` at the latest: for a consumer that must also poll a word nobody rings
+  /// (the DSpark draft channel's head, which the GPU stores).
+  template <class Ready>
+  void sleep_unless(Ready ready, int64_t timeout_ns) {
+    const uint32_t seen = word_.load(std::memory_order_acquire);
+    sleeping_.store(true, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!ready()) futex_wait(&word_, seen, timeout_ns);
+    sleeping_.store(false, std::memory_order_relaxed);
+  }
+```
+`cpu_experts.h`: add `#include "../draft_channel.h"`, `#include "lease_channel.h"`, `#include "reader_base.h"` (for
+`idle_budget`, if not already reached), `#include <algorithm>`, `<chrono>`, `<climits>`, `<immintrin.h>`. Move
+`count_shared_routes` here from `draft_cpu_thread.h` as a free function in `namespace draft`, and move
+`g_test_poll_pause_us` with it (`namespace draft { inline std::atomic<int64_t> g_test_poll_pause_us{0}; }`). Then add,
+before `CpuExpertConfig`:
+```cpp
+/// The DSpark draft channel (draft_channel.h) as a CpuExpertEngine's second job source (plan 2026-10-06 Task 11): each
+/// posted record is a stage's M-row forward over the stage's pinned areas, completed through the lease channel (done,
+/// then the Dekker open of the gate). The stages' layers read the draft's own slabs (pageable host memory).
+struct DraftSource {
+  uint8_t* channel = nullptr;      // draft::kChannelBytes, pinned: the page and the completion block
+  const uint8_t* x = nullptr;      // fp16 [stages, kMaxRows, hidden]
+  const int32_t* slots = nullptr;  // [stages, kMaxRows, kMaxK]
+  const float* weights = nullptr;  // [stages, kMaxRows, kMaxK]
+  float* out = nullptr;            // [stages, kMaxRows, hidden]
+  int64_t hidden = 0;
+  std::vector<cpu_experts::ExpertLayer> layers;  // one per stage, each on the engine's kernel
+  bool test_hooks = false;                       // the instr build's: honour draft::g_test_poll_pause_us
+};
+```
+In `CpuExpertConfig`, after `check_calls`:
+```cpp
+  bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
+```
+In `validate()`:
+- wrap the target-only checks (the `max_routes() < kLanes` check, `layers`, the `x_base`/`out_base` rows, the hidden
+  vs out stride, the tokens check of Task 6) in `if (!c.draft_only) { ... }`;
+- keep `kernel == nullptr` and `check_cpu_expert_team` for both.
+
+Public members, after `stop()`:
+```cpp
+  static constexpr const char* kDraftPrefix = "DSpark draft CPU experts: ";
+
+  /// Makes the DSpark draft channel this engine's second job source: from then on the thread also serves each posted
+  /// record, one job at a time with the target's, never two at once. Starts the watchdog, which fail-stops a job of
+  /// either kind that runs past fatal_wait_ns and a posted record left unserved that long. After start(); once.
+  void attach_draft(std::unique_ptr<DraftSource> source, int64_t fatal_wait_ns) {
+    if (draft_owned_ != nullptr) throw std::runtime_error(std::string(kDraftPrefix) + "a draft source is attached already");
+    if (!thread_.joinable()) throw std::runtime_error(std::string(kDraftPrefix) + "attach after the engine started");
+    if (fatal_wait_ns <= 0) throw std::runtime_error(std::string(kDraftPrefix) + "the fatal wait must be positive");
+    const DraftSource& d = *source;
+    if (!d.channel || !d.x || !d.slots || !d.weights || !d.out || d.hidden <= 0 || d.layers.empty())
+      throw std::runtime_error(std::string(kDraftPrefix) + "the channel, the stage areas and a layer per stage are required");
+    for (size_t s = 0; s < d.layers.size(); ++s) {
+      if (d.layers[s].kernel != config_.kernel)
+        throw std::runtime_error(std::string(kDraftPrefix) + "stage " + std::to_string(s) +
+                                 " runs on another kernel than the team's");
+      if (d.layers[s].hidden != d.hidden)
+        throw std::runtime_error(std::string(kDraftPrefix) + "stage " + std::to_string(s) + "'s layer has hidden " +
+                                 std::to_string(d.layers[s].hidden) + ", the areas " + std::to_string(d.hidden));
+    }
+    if (config_.kernel->max_routes() < draft::kMaxK || config_.kernel->max_rows() < draft::kMaxRows)
+      throw std::runtime_error(std::string(kDraftPrefix) + "kernel " + config_.kernel->name() +
+                               " takes fewer rows or routes than a draft call");
+    const uint32_t head = channel::head<DraftChannel>(d.channel);
+    draft_completed_.store(head, std::memory_order_relaxed);
+    draft_next_ = channel::skip_zero(head + 1u);  // the run thread reads it after acquiring draft_
+    fatal_wait_ns_ = fatal_wait_ns;
+    draft_owned_ = std::move(source);
+    draft_.store(draft_owned_.get(), std::memory_order_release);
+    doorbell_.ring();  // a sleeping thread starts watching the channel
+    watchdog_ = std::thread([this] { watch(); });
+  }
+
+  /// Stops serving the draft channel: the thread finishes a draft job in progress and drops the source, then the gate
+  /// a wait still holds closed is opened (no completer is left). The watchdog runs on, so a hung job still fail-stops.
+  /// Idempotent; stop() opens the gate too.
+  void detach_draft() {
+    DraftSource* d = draft_.load(std::memory_order_acquire);
+    if (d == nullptr) return;
+    draft_detach_.store(true, std::memory_order_seq_cst);
+    doorbell_.ring();
+    while (draft_.load(std::memory_order_acquire) != nullptr && !exited_.load(std::memory_order_acquire))
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    channel::open_closed_gate<DraftChannel>(d->channel);
+  }
+
+  struct DraftStats {
+    int64_t jobs, rows, forward_ns, holds, collided_jobs, shared_routes, collided_forward_ns;
+  };
+  DraftStats draft_stats() const {
+    return {draft_jobs_.load(std::memory_order_relaxed), draft_rows_.load(std::memory_order_relaxed),
+            draft_forward_ns_.load(std::memory_order_relaxed), draft_holds_.load(std::memory_order_relaxed),
+            draft_collided_jobs_.load(std::memory_order_relaxed), draft_shared_routes_.load(std::memory_order_relaxed),
+            draft_collided_forward_ns_.load(std::memory_order_relaxed)};
+  }
+```
+Replace `stop()`:
+```cpp
+  /// Stops and joins the thread, then the watchdog (a hung forward still fail-stops meanwhile), then opens a draft gate
+  /// a wait still holds closed; idempotent.
+  void stop() {
+    if (!thread_.joinable()) return;
+    stop_.store(true, std::memory_order_release);
+    doorbell_.ring();
+    thread_.join();
+    watchdog_stop_.store(true, std::memory_order_seq_cst);
+    if (watchdog_.joinable()) watchdog_.join();
+    if (draft_owned_ != nullptr) channel::open_closed_gate<DraftChannel>(draft_owned_->channel);
+  }
+```
+Replace `run()`:
+```cpp
+  void run() {
+    const std::string error = pin();
+    started_.set_value(error);
+    if (!error.empty()) return;
+    constexpr int64_t kNever = INT64_MAX;
+    int64_t warm_until = 0;  // the register-work window after the last job; 0 before the first
+    // When the hold releases the team; 0 once it has and the thread sleeps between jobs.
+    int64_t release_at = config_.spin_ns < 0 ? kNever : now_ns() + config_.spin_ns;
+    const uint64_t spin_iters = idle_budget(config_.spin_ns);
+    uint64_t idle = 0;
+    while (!stop_.load(std::memory_order_acquire)) {
+      DraftSource* draft = draft_.load(std::memory_order_acquire);
+      if (draft != nullptr && draft_detach_.load(std::memory_order_acquire)) {
+        draft_.store(nullptr, std::memory_order_release);  // detach_draft waits for this
+        draft = nullptr;
+      }
+      if (draft != nullptr && draft->test_hooks)
+        if (const int64_t pause = draft::g_test_poll_pause_us.load(std::memory_order_relaxed); pause > 0)
+          std::this_thread::sleep_for(std::chrono::microseconds(pause));
+      // Read before the pop and the head load: a submit or a post after them moves a word the hold watches.
+      const uint32_t kick = doorbell_.word().load(std::memory_order_acquire);
+      const uint32_t head = draft != nullptr ? channel::head<DraftChannel>(draft->channel) : 0u;
+      CpuJob job;
+      if (jobs_.pop(&job)) {
+        warm_until = run_job(job) + config_.keep_warm_ns;
+        release_at = config_.spin_ns < 0 ? kNever : warm_until + config_.spin_ns;
+        idle = 0;
+      } else if (draft != nullptr && head != 0 && channel::reached(head, draft_next_)) {
+        if (head != draft_next_)
+          fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(draft_next_) + " lapped (head " +
+                    std::to_string(head) + "); the device posts one record per wait");
+        warm_until = serve_draft(*draft, draft_next_) + config_.keep_warm_ns;
+        release_at = config_.spin_ns < 0 ? kNever : warm_until + config_.spin_ns;
+        draft_next_ = channel::skip_zero(draft_next_ + 1u);
+        idle = 0;
+      } else if (release_at != 0) {
+        hold(kick, draft, head, warm_until, release_at);
+        const bool moved = doorbell_.word().load(std::memory_order_acquire) != kick ||
+                           (draft != nullptr && channel::head<DraftChannel>(draft->channel) != head);
+        if (!moved) release_at = 0;  // ran out: sleep (or, with a draft source, poll) from now on
+      } else if (draft != nullptr) {
+        // The GPU cannot ring the futex: spin the idle budget, then sleep 50 us at a time; a submit, an attach or
+        // stop() cuts a sleep short.
+        if (++idle < spin_iters) {
+          _mm_pause();
+        } else {
+          doorbell_.sleep_unless([this] { return !jobs_.empty() || stop_.load(std::memory_order_acquire); }, 50'000);
+        }
+      } else {
+        doorbell_.sleep_unless([this] {
+          return !jobs_.empty() || stop_.load(std::memory_order_acquire) ||
+                 draft_.load(std::memory_order_acquire) != nullptr;
+        });
+      }
+    }
+    exited_.store(true, std::memory_order_release);
+  }
+```
+In `run_job`, around the forward, mark the job for the watchdog:
+`busy(kTargetJob, job.row);` before the `try`, and `job_started_ns_.store(0, std::memory_order_release);` after it.
+Replace `hold` with:
+```cpp
+  /// Holds the team until the doorbell's word moves past `kick`, the draft head (with a draft source) past `head`, or
+  /// the clock reaches release_at. Without a draft source this is today's one-word hold.
+  void hold(uint32_t kick, const DraftSource* draft, uint32_t head, int64_t warm_until, int64_t release_at) {
+    try {
+      if (draft == nullptr) {
+        config_.kernel->keep_warm(
+            config_.cores,
+            config_.threads,
+            reinterpret_cast<const uint32_t*>(&doorbell_.word()),
+            kick,
+            warm_until,
+            release_at);
+      } else {
+        add(draft_holds_, 1);
+        config_.kernel->keep_warm_either(
+            config_.cores,
+            config_.threads,
+            reinterpret_cast<const uint32_t*>(&doorbell_.word()),
+            kick,
+            reinterpret_cast<const uint32_t*>(draft->channel + DraftChannel::kHead),
+            head,
+            warm_until,
+            release_at);
+      }
+    } catch (const std::exception& e) {
+      fail_stop(prefix_ + "CPU expert keep-warm failed: " + e.what());
+    }
+  }
+
+  static constexpr int32_t kTargetJob = 1, kDraftJob = 2;
+
+  /// Marks the job the thread starts now for the watchdog: its kind and its id (a target job's row, a draft record's
+  /// sequence). The release orders the id and kind before the start time the watchdog reads first.
+  void busy(int32_t kind, int64_t id) {
+    job_kind_.store(kind, std::memory_order_relaxed);
+    job_id_.store(id, std::memory_order_relaxed);
+    job_started_ns_.store(now_ns(), std::memory_order_release);
+  }
+
+  /// Reads draft record `seq`, runs its forward on the team, completes it through the channel; returns the forward's
+  /// end. A torn or malformed record, or a refused forward, fail-stops.
+  int64_t serve_draft(const DraftSource& d, uint32_t seq) {
+    alignas(64) uint8_t raw[DraftChannel::kRecordBytes];
+    const uint8_t* rec = channel::record_at<DraftChannel>(d.channel, seq);
+    if (!channel::read_seqlocked<DraftChannel>(rec, seq, raw))
+      fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(seq) + " torn");
+    uint32_t word, epoch;
+    std::memcpy(&word, raw + draft::kRecStage, 4);
+    std::memcpy(&epoch, raw + draft::kRecEpoch, 4);
+    const int stage = static_cast<int>(word & 0xFFFFu), rows = static_cast<int>((word >> 16) & 0xFFu),
+              k = static_cast<int>(word >> 24);
+    if (stage >= static_cast<int>(d.layers.size()) || rows < 1 || rows > draft::kMaxRows || k < 1 || k > draft::kMaxK)
+      fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(seq) + " malformed (stage " +
+                std::to_string(stage) + ", rows " + std::to_string(rows) + ", k " + std::to_string(k) + ")");
+    // The slot and weight areas are kMaxK wide per token; the kernel reads [rows, k] contiguous, so compact them.
+    int32_t slots[draft::kMaxRows * draft::kMaxK];
+    float weights[draft::kMaxRows * draft::kMaxK];
+    const int32_t* s = d.slots + static_cast<int64_t>(stage) * draft::kMaxRows * draft::kMaxK;
+    const float* w = d.weights + static_cast<int64_t>(stage) * draft::kMaxRows * draft::kMaxK;
+    for (int t = 0; t < rows; ++t)
+      for (int i = 0; i < k; ++i) {
+        slots[t * k + i] = s[t * draft::kMaxK + i];
+        weights[t * k + i] = w[t * draft::kMaxK + i];
+      }
+    const int shared = draft::count_shared_routes(slots, rows * k);
+    const cpu_experts::ExpertLayer& layer = d.layers[stage];
+    cpu_experts::ForwardCall call;
+    call.rows = rows;
+    call.k = k;
+    call.threads = config_.threads;
+    call.cores = config_.cores;
+    call.x = d.x + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden * 2;
+    call.slots = slots;
+    call.weights = weights;
+    call.out = d.out + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden;
+    busy(kDraftJob, seq);
+    const int64_t start = now_ns();
+    try {
+      layer.kernel->forward(layer, call);
+    } catch (const std::exception& e) {
+      fail_stop(std::string(kDraftPrefix) + "forward of record " + std::to_string(seq) + " (stage " +
+                std::to_string(stage) + ") failed: " + e.what());
+    }
+    const int64_t end = now_ns();
+    job_started_ns_.store(0, std::memory_order_release);
+    add(draft_forward_ns_, end - start);
+    add(draft_jobs_, 1);
+    add(draft_rows_, rows);
+    if (shared > 0) {
+      add(draft_collided_jobs_, 1);
+      add(draft_shared_routes_, shared);
+      add(draft_collided_forward_ns_, end - start);
+    }
+    channel::complete<DraftChannel>(d.channel, seq, static_cast<uint64_t>(epoch) << 32 | seq);
+    draft_completed_.store(seq, std::memory_order_release);
+    return end;
+  }
+
+  /// Every 20 ms, once a draft source is attached: fail-stops a job of either kind that has run for fatal_wait_ns, and
+  /// a posted draft record that has stood unserved that long.
+  void watch() {
+    uint32_t watched = 0;
+    int64_t since = 0;
+    const std::string wait = std::to_string(static_cast<double>(fatal_wait_ns_) * 1e-9);
+    while (!watchdog_stop_.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      if (watchdog_stop_.load(std::memory_order_acquire)) return;
+      const int64_t now = now_ns();
+      const int64_t started = job_started_ns_.load(std::memory_order_acquire);
+      if (started != 0 && now - started >= fatal_wait_ns_) {
+        const int64_t id = job_id_.load(std::memory_order_relaxed);
+        if (job_kind_.load(std::memory_order_relaxed) == kDraftJob)
+          fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(id) + " incomplete after " + wait +
+                    " s (fatal wait)");
+        fail_stop(prefix_ + "the CPU job of row " + std::to_string(id) + " incomplete after " + wait + " s (fatal wait)");
+      }
+      const DraftSource* d = draft_.load(std::memory_order_acquire);
+      const uint32_t head = d != nullptr ? channel::head<DraftChannel>(d->channel) : 0u;
+      if (head == 0 || head == draft_completed_.load(std::memory_order_acquire)) {
+        watched = 0;
+        continue;
+      }
+      if (head != watched) {
+        watched = head;
+        since = now;
+      } else if (now - since >= fatal_wait_ns_) {
+        fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(head) + " incomplete after " + wait +
+                  " s (fatal wait)");
+      }
+    }
+  }
+```
+The target message reads "...the CPU job of row 1 incomplete after 0.5 s". The new test matches "CPU job of row 1" and
+"incomplete".
+
+Members, after `stop_`:
+```cpp
+  // The DSpark draft source (attach_draft): owned here, published to the run thread through draft_ (null: none, or
+  // detached). draft_next_ is the run thread's after the publication.
+  std::unique_ptr<DraftSource> draft_owned_;
+  std::atomic<DraftSource*> draft_{nullptr};
+  std::atomic<bool> draft_detach_{false}, watchdog_stop_{false}, exited_{false};
+  uint32_t draft_next_ = 0;
+  std::atomic<uint32_t> draft_completed_{0};
+  int64_t fatal_wait_ns_ = 0;
+  std::thread watchdog_;
+  // The job running now, for the watchdog (busy()): its start (0: none), kind and id.
+  std::atomic<int64_t> job_started_ns_{0}, job_id_{0};
+  std::atomic<int32_t> job_kind_{0};
+  std::atomic<int64_t> draft_jobs_{0}, draft_rows_{0}, draft_forward_ns_{0}, draft_holds_{0}, draft_collided_jobs_{0},
+      draft_shared_routes_{0}, draft_collided_forward_ns_{0};
+```
+`stop_` keeps its `std::memory_order_release` store. The engine class comment gains this paragraph:
+"With a DSpark draft source (attach_draft) the thread serves the draft channel too, one job at a time with the target's;
+its idle hold watches the doorbell and the channel head, and its poll sleeps 50 us at a time since the GPU cannot ring
+the futex. A draft-only engine (CpuExpertConfig::draft_only) has only that source."
+
+- [ ] **Step 6: The tier and the exports** (`ram_tier.h`, `ffi_exports.h`)
+
+`RamTier`: add per-group pending sources and their entry points, next to `make_cpu_layer`:
+```cpp
+  // The DSpark draft channel on group g's CPU expert engine (CpuExpertEngine::attach_draft): draft_open makes the
+  // source, draft_set_layer fills a stage's layer, draft_start attaches it, draft_stop detaches it.
+  void draft_open(int g, std::unique_ptr<DraftSource> source, int64_t fatal_wait_ns) {
+    draft_cpu(g);
+    pending_draft_[g] = std::move(source);
+    draft_fatal_ns_[g] = fatal_wait_ns;
+  }
+  void draft_set_layer(int g, int stage, const cpu_experts::ExpertLayer& layer) {
+    DraftSource* d = pending_draft_[g].get();
+    if (d == nullptr) throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "draft_open first");
+    if (stage < 0 || stage >= static_cast<int>(d->layers.size()))
+      throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "stage " + std::to_string(stage) + " is out of range");
+    d->layers[stage] = layer;
+  }
+  void draft_start(int g) {
+    if (pending_draft_[g] == nullptr) throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "draft_open first");
+    for (size_t s = 0; s < pending_draft_[g]->layers.size(); ++s)
+      if (pending_draft_[g]->layers[s].kernel == nullptr)
+        throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "stage " + std::to_string(s) + " has no layer");
+    draft_cpu(g).attach_draft(std::move(pending_draft_[g]), draft_fatal_ns_[g]);
+  }
+  void draft_stop(int g) {
+    draft_cpu(g).detach_draft();
+  }
+  CpuExpertEngine::DraftStats draft_stats(int g) {
+    return draft_cpu(g).draft_stats();
+  }
+```
+with
+```cpp
+  CpuExpertEngine& draft_cpu(int g) {
+    if (g < 0 || g >= groups() || dist_.group(g).cpu == nullptr)
+      throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "group " + std::to_string(g) +
+                               " has no CPU expert engine (SGLANG_DSV41_CPU_EXPERTS)");
+    return *dist_.group(g).cpu;
+  }
+  std::array<std::unique_ptr<DraftSource>, Wire::kNodes> pending_draft_;
+  std::array<int64_t, Wire::kNodes> draft_fatal_ns_{};
+```
+
+`ffi_exports.h`:
+- Factor the area checks of `draft_cpu_open` into
+  `static std::unique_ptr<DraftSource> make_draft_source(TensorView channel, TensorView x, TensorView slots, TensorView weights, TensorView out, int64_t hidden, int64_t stages)`.
+  Its body is the `verify_named` block and the alignment check as they are, and it fills `DraftSource` (`layers`
+  resized to `stages`, `test_hooks = Build::kFaults`).
+- Replace the draft registry's value type with:
+  ```cpp
+  // A DSpark draft-only launch's engine (the target's CPU experts off): node 0's team with the draft channel its only
+  // job source (CpuExpertConfig::draft_only), built at draft_cpu_start once every stage has a layer.
+  struct DraftOnly {
+    CpuExpertConfig config;
+    std::unique_ptr<DraftSource> source;
+    int64_t fatal_wait_ns = 0;
+    std::unique_ptr<CpuExpertEngine> engine;
+  };
+  ```
+  `draft_registry()` maps handles to `std::shared_ptr<DraftOnly>`, and `find_draft` returns one.
+- `draft_cpu_open`: build `source = make_draft_source(...)`, and `config` with `threads`, `cores`, `spin_ns`,
+  `keep_warm_ns` and `draft_only = true`. Store both with `fatal_wait_ns`.
+- `draft_cpu_set_layer`: make the layer as now. Check `stage` against `source->layers.size()`, and check every stage
+  shares one kernel (the same messages as `DraftCpuThread::set_layer`). Store it in `source->layers[stage]`.
+- `draft_cpu_start`: refuse a stage without a layer ("stage s has no layer"). Set `config.kernel = source->layers[0].kernel`,
+  then `engine = std::make_unique<CpuExpertEngine>(config, CpuExpertEngine::kDraftPrefix, "dspark-cpu"); engine->start();
+  engine->attach_draft(std::move(source), fatal_wait_ns);`.
+- `draft_cpu_stop`: erase the handle as now, then `if (d->engine) d->engine->stop();`.
+- `draft_cpu_stats`: `out` holds 7 int64 values from `engine->draft_stats()` in `DraftStats` order. Before start the
+  values are 0.
+- Add the host's group exports, registered next to `expert_stream_enable_cpu_experts`:
+  ```cpp
+  // The DSpark draft channel as group `group`'s CPU expert engine's second job source (one team per node): the areas as
+  // draft_cpu_open's; then draft_set_layer per stage (the arguments as draft_cpu_set_layer's), draft_start; draft_stop
+  // detaches it. stats: int64 [7] as draft_cpu_stats.
+  static void draft_open(int64_t handle, int64_t group, TensorView channel, TensorView x, TensorView slots,
+                         TensorView weights, TensorView out, int64_t hidden, int64_t stages, int64_t fatal_wait_ns) {
+    find(handle)->draft_open(static_cast<int>(group), make_draft_source(channel, x, slots, weights, out, hidden, stages),
+                             fatal_wait_ns);
+  }
+  static void draft_set_layer(int64_t handle, int64_t group, int64_t stage, int64_t kernel, TensorView slabs,
+                              int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation,
+                              double act_limit, TensorView params) {
+    if (kernel == 0) throw std::runtime_error("DSpark draft CPU experts need the format's kernel");
+    const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
+    find(handle)->draft_set_layer(
+        static_cast<int>(group), static_cast<int>(stage),
+        k->make_layer(layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params)));
+  }
+  static void draft_start(int64_t handle, int64_t group) { find(handle)->draft_start(static_cast<int>(group)); }
+  static void draft_stop(int64_t handle, int64_t group) { find(handle)->draft_stop(static_cast<int>(group)); }
+  static void draft_stats(int64_t handle, int64_t group, TensorView out) { /* fills 7 values as draft_cpu_stats */ }
+  ```
+  `draft_stats`'s body is `draft_cpu_stats`'s with `find(handle)->draft_stats(static_cast<int>(group))` as the source.
+  Register all five with `TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_<name>, Exports::draft_<name>)`.
+- Delete `draft_cpu_thread.h` and its `#include`.
+  `grep -rn "DraftCpuThread\|draft_cpu_thread.h" python test scripts analysis` must print nothing but historical
+  docs.
+
+- [ ] **Step 7: Python** (`dspark_draft_cpu.py`, `expert_stream_transport.py`)
+
+`dspark_draft_cpu.py`, after `DraftCpuHost`:
+```python
+class SharedDraftHost:
+    """The draft channel served by an ExpertStreamHost group's CPU expert engine (one team per node, plan 2026-10-06
+    Task 11), with DraftCpuHost's interface so the registry and the tests drive either. The engine's team, idle and
+    watchdog are the host's; ``stop`` detaches the draft source (the engine stops with the host)."""
+
+    def __init__(self, host, areas: DraftCpuAreas, *, group: int, fatal_wait_s: float):
+        from sglang.kernels.ops.moe import expert_stream_transport as ops
+
+        self.host, self.areas, self.group = host, areas, int(group)
+        self._ops = ops
+        self._module = host._module
+        self._keep: dict[int, tuple] = {}
+        self._module.expert_stream_draft_open(
+            host.handle, self.group, areas.channel, areas.x, areas.slots, areas.weights, areas.out,
+            int(areas.hidden), int(areas.stages), int(fatal_wait_s * 1e9),
+        )
+        host._draft_keep = (areas, self)  # the engine reads the areas until the host stops
+
+    def set_layer(self, stage: int, kernel: int, spec) -> None:
+        slabs, params = self._ops._layer_tensors(spec)
+        self._module.expert_stream_draft_set_layer(
+            self.host.handle, self.group, int(stage), int(kernel), slabs, int(spec.capacity), int(spec.hidden),
+            int(spec.intermediate), int(spec.activation), float(spec.act_limit), params,
+        )
+        self._keep[int(stage)] = spec.keep
+
+    def start(self) -> None:
+        self._module.expert_stream_draft_start(self.host.handle, self.group)
+
+    def stop(self) -> None:
+        self._module.expert_stream_draft_stop(self.host.handle, self.group)
+
+    def stats(self) -> dict:
+        out = torch.zeros(7, dtype=torch.int64)
+        self._module.expert_stream_draft_stats(self.host.handle, self.group, out)
+        jobs, rows, forward_ns, holds, collided_jobs, shared_routes, collided_forward_ns = (int(v) for v in out.tolist())
+        return {"jobs": jobs, "rows": rows, "forward_ns": forward_ns, "keep_warm_calls": holds,
+                "collided_jobs": collided_jobs, "shared_routes": shared_routes,
+                "collided_forward_ns": collided_forward_ns}
+```
+`ExpertStreamHost`, after `enable_cpu_experts`:
+```python
+    def draft_source(self, areas, *, fatal_wait_s: float, group: int = 0):
+        """The DSpark draft channel over ``areas`` (a ``DraftCpuAreas``) as group ``group``'s CPU expert engine's second
+        job source: a ``SharedDraftHost``; set its stages' layers, then ``start``. After enable_cpu_experts."""
+        from sglang.kernels.ops.moe.dspark_draft_cpu import SharedDraftHost
+
+        return SharedDraftHost(self, areas, group=group, fatal_wait_s=fatal_wait_s)
+```
+
+- [ ] **Step 8: Run and pass, and prove the BS1 path unchanged**
+
+CPU, on divix01:
+- `test/registered/unit/kernels/test_dspark_draft_cpu_thread.py test/registered/unit/kernels/test_dspark_shared_cpu_team.py`;
+- `test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_keep_warm.py`;
+- `test/registered/unit/kernels/test_cpu_expert_service.py test/registered/unit/kernels/test_dspark_draft_cpu_experts.py`;
+- `test/registered/unit/kernels/test_expert_stream_hotpath_golden.py`.
+
+GPU lock, with the optimized build env:
+- `test/manual/dsv41/test_cpu_expert_engines_exl3.py test/manual/dsv41/test_dspark_draft_channel_cuda.py test/manual/dsv41/test_dspark_hybrid_draft_gpu.py`;
+- `test/manual/dsv41/test_bs1_build_digest.py`, whose `--permanent` now covers the CPU kernel's one-word keep-warm and
+  forward.
+
+Expected: `EXIT=0` everywhere, and the digest test prints `BS1 build unchanged`.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/kernel.hpp \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/keep_warm.hpp \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/expert_forward.hpp \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/spsc_ring.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_test_exports.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/self_test.cpp \
+  python/sglang/kernels/ops/moe/dspark_draft_cpu.py python/sglang/kernels/ops/moe/expert_stream_transport.py \
+  python/sglang/test/dsv41_ram_miss_fixtures.py \
+  test/registered/unit/kernels/test_dspark_draft_cpu_thread.py test/registered/unit/kernels/test_dspark_shared_cpu_team.py
+git rm python/sglang/kernels/jit/csrc/moe/expert_stream/host/draft_cpu_thread.h
+git commit -m "feat(cpu-experts): one CPU expert team per node; node 0's engine serves the DSpark draft channel as a second job source
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
+```
+
+---
+
+### Task 12: The shared team in ThreadingConfig, the gate and the draft registry
+
+**Decisions:**
+- **No draft core role when CPU experts are on.** The draft runs on node 0's team. `SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES`
+  and `_THREADS` are **refused**, not ignored, with CPU experts on. Ignoring a core list the operator set would leave
+  them believing the draft runs there. A refusal names the shared team and costs nothing: the recipe stops setting it.
+- **A draft-only launch** (DSpark, target CPU experts off) keeps today's derived draft role and builds the draft-only
+  engine of Task 11 on it: node 0's 6-15 under the recipe's server cores, as in §33.8. Named cores still work there.
+- **The draft registry** attaches to the RAM-miss service's GPU-node group when CPU experts are on. It first starts
+  the service if the draft is prepared before the target's first gather, so the draft never posts to an engine that
+  does not exist.
+
+**Files:**
+- Modify: `python/sglang/srt/layers/moe/cpu_experts/threading_config.py` (`ThreadingConfig.resolve`)
+- Modify: `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` (`_check_dspark_cpu_experts`)
+- Modify: `python/sglang/srt/layers/moe/cpu_experts/draft.py` (`DraftCpuExperts`, `DraftCpuExpertsRegistry.runtime`)
+- Modify: `python/sglang/srt/layers/moe/exl3_ram_miss.py` (`ensure_started`, `draft_host`)
+- Test: `test/registered/unit/layers/moe/test_threading_config.py`, `test/registered/unit/test_expert_stream_requirements_exl3.py`, `test/registered/unit/kernels/test_dspark_draft_cpu_experts.py`
+
+**Interfaces:**
+- Consumes: Task 11's `ExpertStreamHost.draft_source`, `SharedDraftHost`, the draft-only `DraftCpuHost`.
+- Produces:
+  - `ThreadingConfig.resolve(...)` returns `draft_cpus == ()` under CPU experts and refuses named draft cores there;
+  - `Exl3RamMissService.draft_host(areas, *, fatal_wait_s) -> SharedDraftHost`;
+  - `Exl3RamMissService.gpu_group: int`.
+
+- [ ] **Step 1: Write the failing tests**
+
+`test_threading_config.py`:
+```python
+def test_under_cpu_experts_the_draft_has_no_cores_of_its_own(divix01):
+    """One team per node: with the target's CPU experts on, the draft is a job source on node 0's team, so the plan
+    derives no draft role and node 0's team keeps every free core (the recipe's 6-15)."""
+    config = resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, spin_core=17, draft=True)
+    assert config.draft_cpus == ()
+    assert [(p.ram, p.cpu) for p in config.plans] == [(17, tuple(range(6, 16))), (35, tuple(range(18, 28)))]
+    assert config.copy_cpus == (16,)
+
+
+@pytest.mark.parametrize("settings", [{"draft_cores": "12-15"}, {"draft_threads": 4}])
+def test_under_cpu_experts_named_draft_cores_are_refused(divix01, settings):
+    with pytest.raises(ValueError, match="shares node 0's CPU expert team"):
+        resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, spin_core=17, draft=True, **settings)
+
+
+def test_a_draft_only_launch_still_derives_the_draft_cores(divix01):
+    config = resolve(divix01, affinity=RECIPE_SERVER, draft=True)
+    assert config.draft_cpus == tuple(range(6, 16))
+```
+`test_expert_stream_requirements_exl3.py`:
+```python
+@pytest.mark.parametrize("name, value", [("SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES", "12-15"),
+                                         ("SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS", 4)])
+def test_draft_cores_are_refused_when_the_draft_shares_the_cpu_team(model_dir, name, value):
+    env = {**CPU_EXPERTS_ENV, **SPILL, "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": True,
+           "SGLANG_EXL3_CPU_ACT_RESIDUAL": True, "SGLANG_EXL3_CPU_ACT_BLOCK": 128, name: value}
+    with pytest.raises(ValueError, match="shares node 0's CPU expert team"):
+        _gate(_launch(model_dir, **DSPARK_BREAKABLE), **env)
+```
+`SPILL` and `DSPARK_BREAKABLE` come from Task 14's tests, which already exist by now if the tasks run in order. If they
+do not yet, define both here exactly as Task 14 does, and let Task 14 reuse them.
+
+`test_dspark_draft_cpu_experts.py`, using that file's existing fakes for the host (`_new_host`) and device
+(`_new_device`):
+```python
+def test_with_target_cpu_experts_the_draft_attaches_to_the_services_gpu_group(monkeypatch):
+    """One team per node: the registry builds no thread of its own, it asks the RAM-miss service for its GPU-node
+    group's engine (starting the service first), and drives it through DraftCpuHost's interface."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts import draft as draft_module
+
+    asked = {}
+
+    class Service:
+        def draft_host(self, areas, *, fatal_wait_s):
+            asked["fatal_wait_s"] = fatal_wait_s
+            return _RecordingHost(areas)
+
+    monkeypatch.setattr(draft_module, "_ram_miss_service", lambda: Service())
+    monkeypatch.setattr(draft_module, "_new_host", lambda *a, **k: pytest.fail("built a draft-only engine"))
+    with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+        runtime = draft_module.DraftCpuExperts(_kernel(), _layers(), cores=[], threads=0, device=None)
+    assert asked["fatal_wait_s"] > 0 and runtime.host.started
+```
+`_RecordingHost`, `_kernel` and `_layers` are the file's existing fakes. If the file names them differently, reuse its
+own. `_RecordingHost(areas)` records `set_layer` and `start` and exposes `.started`.
+
+- [ ] **Step 2: Run and see them fail**
+
+CPU: the three files with `-k "shares or draft_has_no_cores or draft_only_launch or attaches_to_the_services"`.
+Expected: assertion failures (a draft role is still derived), no refusal, and `AttributeError: _ram_miss_service`.
+
+- [ ] **Step 3: Implement**
+
+`threading_config.py` `resolve`, at the top after `affinity = frozenset(affinity)`:
+```python
+        if settings.cpu_experts and settings.draft and (settings.draft_cores or settings.draft_threads):
+            # One team per node (plan 2026-10-06 Task 11): the draft is a job source on node 0's CPU expert team.
+            raise ValueError(
+                "the DSpark draft shares node 0's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
+                "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"
+            )
+```
+and at the end, `if settings.draft:` becomes `if settings.draft and not settings.cpu_experts:`. Its comment becomes
+"A draft-only launch's draft engine gets cores of its own; under CPU experts it runs on node 0's team."
+
+`expert_stream_requirements_exl3.py` `_check_dspark_cpu_experts`, after the `DSPARK` check:
+```python
+    if envs.SGLANG_DSV41_CPU_EXPERTS.get() and (
+        envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get() or envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get()
+    ):
+        raise ValueError(
+            "the DSpark draft shares node 0's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
+            "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"
+        )
+```
+`exl3_ram_miss.py`:
+- in `ensure_started`, after `numa` is resolved,
+  `self.gpu_group = next(p.group for p in numa.plans if p.node == numa.gpu_node)`, and initialize
+  `self.gpu_group = 0` in `__init__`;
+- add:
+```python
+    def draft_host(self, areas, *, fatal_wait_s: float):
+        """The DSpark draft channel on the GPU node's CPU expert engine (one team per node): a SharedDraftHost. Starts
+        the service first when the draft is prepared before the target's first gather."""
+        self.ensure_started()
+        if self.cpu_experts is None:
+            raise RuntimeError("exl3 RAM miss: the draft shares the CPU expert team, but SGLANG_DSV41_CPU_EXPERTS is off")
+        return self.host.draft_source(areas, fatal_wait_s=fatal_wait_s, group=self.gpu_group)
+```
+`draft.py`:
+- add
+```python
+def _ram_miss_service():
+    from sglang.srt.layers.moe.exl3_ram_miss import Exl3RamMissService
+
+    return Exl3RamMissService.get()
+```
+- in `DraftCpuExperts.__init__`, replace the `self.host = _new_host(...)` call with:
+```python
+        fatal_wait_s = watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get())
+        if envs.SGLANG_DSV41_CPU_EXPERTS.get():
+            # One team per node: node 0's CPU expert engine serves the draft channel too.
+            self.host = _ram_miss_service().draft_host(self.areas, fatal_wait_s=fatal_wait_s)
+        else:
+            self.host = _new_host(
+                self.areas,
+                cores=self.cores,
+                threads=threads,
+                spin_us=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_IDLE_SPIN_US.get(),
+                keep_warm_us=envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get(),
+                fatal_wait_s=fatal_wait_s,
+            )
+```
+- in `DraftCpuExpertsRegistry.runtime`, wrap the core resolution (the `named = ...` block through `check_engine_cores`)
+  in `if not envs.SGLANG_DSV41_CPU_EXPERTS.get(): ... else: cores, threads = [], 0`;
+- the log line names "node 0's CPU expert team" when cores is empty;
+- the module docstring's "run on the draft CPU thread (host/draft_cpu_thread.h)" becomes "run on node 0's CPU expert
+  engine (host/cpu_experts.h, one team per node), or, with the target's CPU experts off, on a draft-only engine".
+
+- [ ] **Step 4: Run and pass**
+
+CPU: `test/registered/unit/layers/moe/test_threading_config.py test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/kernels/test_dspark_draft_cpu_experts.py`.
+GPU lock, optimized build env: `test/manual/dsv41/test_dspark_hybrid_draft_gpu.py` (the draft-only shape).
+Expected: `EXIT=0`. The existing test `test_named_draft_cores_are_left_out_of_every_derived_role` resolves without CPU
+experts, so it still passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add python/sglang/srt/layers/moe/cpu_experts/threading_config.py \
+  python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py python/sglang/srt/layers/moe/cpu_experts/draft.py \
+  python/sglang/srt/layers/moe/exl3_ram_miss.py test/registered/unit/layers/moe/test_threading_config.py \
+  test/registered/unit/test_expert_stream_requirements_exl3.py test/registered/unit/kernels/test_dspark_draft_cpu_experts.py
+git commit -m "feat(dspark): under CPU experts the draft runs on node 0's CPU expert team; named draft cores are refused
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
+```
+
+---
+
+### Task 13: End to end on the GPU: a captured 6-token verify with CPU experts and spill
 
 This task runs the D2-2 rig (`test_exl3_verify_miss_lanes_gpu.py`) with CPU experts on: the real EXL3 lease chain, the
 real optimized CPU kernel, a captured verify, and a lane per route on a 40-lane wire. It is the end-to-end proof of
@@ -3060,7 +4325,7 @@ Only the replay before the copy engine arms overflows (Review Focus 1).
 ```python
 """A captured 6-token verify through the real EXL3 lease chain with CPU experts and spill (GPU, real CPU kernel).
 
-Plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 11. A lane per route (36 on a 40-lane wire), two victim lanes.
+Plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 13. A lane per route (36 on a 40-lane wire), two victim lanes.
   - Before the copy engine arms, forced lanes cannot be the CPU's: the replay overflows (Review Focus 1, the one
     overflow left) and the eager re-run is exact.
   - Armed, 36 distinct RAM-resident experts (Review Focus 5) are served with no overflow: two on the GPU, the rest on
@@ -3247,7 +4512,7 @@ PYTHONPATH=$PWD/python CUDA_MODULE_LOADING=EAGER SGLANG_DSV41_CPU_EXPERTS=1 EXL3
   2>&1 | tail -20; echo "EXIT=${PIPESTATUS[0]}"
 ```
 Expected: `EXIT=0`. If it fails, debug with `superpowers:systematic-debugging` before changing the bar. A
-`fail_stop` or `__trap` is a defect in Tasks 2-10. It is never a reason to drop an assertion.
+`fail_stop` or `__trap` is a defect in Tasks 2-12. It is never a reason to drop an assertion.
 
 - [ ] **Step 3: Re-run the D2-2 rig and the BS1 graph suites** (same locks, cores 32-63):
 `test/manual/dsv41/test_exl3_verify_miss_lanes_gpu.py test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py test/manual/dsv41/test_exl3_graph_apply_gpu.py test/manual/dsv41/test_bs1_build_digest.py`.
@@ -3265,7 +4530,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 12: The gate admits the target's CPU experts under a graphed DSpark verify
+### Task 14: The gate admits the target's CPU experts under a graphed DSpark verify
 
 The refusal at `expert_stream_requirements_exl3.py:171-181` dates from `3937a8833a` (2026-09-30), before a verify
 could run in the breakable graph. The narrowest change:
@@ -3435,28 +4700,27 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 13: The recipe's DSpark mode and the production switch
+### Task 15: The recipe's DSpark mode and the production switch
 
 Which of the DSpark arms' overrides are still required with a graphed verify, and why (research, 2026-10-06):
 
 | Override in `ab_cpu_draft.COMMON` | Verdict for this mode | Evidence |
 |---|---|---|
-| `SGLANG_DSV41_CPU_EXPERTS=0` | **Dropped**: the point of this plan | Tasks 2-12 |
+| `SGLANG_DSV41_CPU_EXPERTS=0` | **Dropped**: the point of this plan | Tasks 2-14 |
 | `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0` | **Required** | `layer_major/gate.py:38-50` refuses any speculative algorithm |
 | `SGLANG_DSV41_ENABLE_PREFILL_FILLS=0` | **Dropped** | refused only without graph gather (`exl3_expert_format.py:226-231`); `graphed_verify.py` already keeps 1 |
 | `SGLANG_MOE_EXPERT_GRAPH_GATHER/GPU_RESIDENCY_UPDATE/INSERT_ON_MISS_STAGE/FUSED_PLAN=0` | **Dropped** | the graphed verify needs them on (`_check_graphed_verify`) |
-| `SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING=0`, `..._ENGRAM_DEVICE_WAIT=0` | **Dropped**, with a fallback | A verify never takes the native captured lookup (`engram.py:124-139`: one token, decode mode); it runs the eager break, and the uring store serves N tokens (`engram_file_table.py:147-163`). Device wait engages only in a one-token decode capture, which a DSpark target never captures. No DSpark run has had them on, so Task 15's smoke checks them, with the fallback named there. |
+| `SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING=0`, `..._ENGRAM_DEVICE_WAIT=0` | **Dropped**, with a fallback | A verify never takes the native captured lookup (`engram.py:124-139`: one token, decode mode); it runs the eager break, and the uring store serves N tokens (`engram_file_table.py:147-163`). Device wait engages only in a one-token decode capture, which a DSpark target never captures. No DSpark run has had them on, so Task 17's smoke checks them, with the fallback named there. |
 | `SGLANG_SM120_FLASHMLA_BACKEND=triton` | **Kept** | No refusal: flashinfer handles up to 64 query rows (`flash_mla_sm120.py:212, 317-341`). But every DSpark text result (§33.2, §33.8, §33.9) is triton, and §33.2 names the sm120 attention at 6 rows as a drift suspect. Dropping it is its own A/B. |
 | `SGLANG_EXL3_CPU_ACT_RESIDUAL=1`, `SGLANG_EXL3_CPU_ACT_BLOCK=128` | **Kept** | `_check_dspark_cpu_experts` requires them; with CPU experts on they equal the build's own values (`ext.py:76-89`) |
 
 **Files:**
 - Modify: `benchmarks/dsv41_baseline/arm_env.py`, `benchmarks/dsv41_baseline/launch_prod.sh`
 - Create: `benchmarks/dsv41_baseline/test_dspark_recipe.py`
-- Test: `test/registered/unit/layers/moe/test_threading_config.py`
 
 **Interfaces:**
 - Produces:
-  - `arm_env.DSPARK_DRAFT`, `DSPARK_RESIDENT`, `DSPARK_DRAFT_CORES = "12-15"`, `DSPARK_ARGV`;
+  - `arm_env.DSPARK_DRAFT`, `DSPARK_RESIDENT`, `DSPARK_ARGV`;
   - `dspark_env() -> dict[str, str]`, the overrides on top of `base_env()`;
   - `prod_env() -> dict[str, str]`;
   - `PROD_DSPARK = False`;
@@ -3468,7 +4732,7 @@ Which of the DSpark arms' overrides are still required with a graphed verify, an
 `benchmarks/dsv41_baseline/test_dspark_recipe.py`:
 ```python
 """The DSpark mode of the recipe: both CPU-expert clients on, the graphed verify's configuration, and argv the server
-parses as DSpark (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 13)."""
+parses as DSpark (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 15)."""
 
 import argparse
 
@@ -3479,7 +4743,8 @@ def test_dspark_env_turns_both_cpu_expert_clients_on_with_spill():
     env = arm_env.arm_env(arm_env.dspark_env())
     assert env["SGLANG_DSV41_CPU_EXPERTS"] == "1"
     assert env["SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS"] == "1"
-    assert env["SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES"] == "12-15"
+    # One team per node: the draft runs on node 0's CPU expert team, so no draft cores are named (Task 12 refuses them).
+    assert "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES" not in env and "SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS" not in env
     assert "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES" not in env  # a lane per route: 36 on a 40-lane wire
     assert env["SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES"] == "8"
     assert env["SGLANG_RAGGED_VERIFY_MODE"] == "static"
@@ -3506,42 +4771,25 @@ def test_the_dspark_argv_parses_as_dspark_at_block_size_5():
     assert int(ns.speculative_dspark_block_size) == 5
     assert ns.max_running_requests == 1
 ```
-Append to `test_threading_config.py`:
-```python
-def test_the_dspark_recipe_layout_keeps_both_cpu_expert_clients_apart(divix01):
-    """arm_env's DSpark mode: server 0-5,36-41, RAM 17 by name, target THREADS=10, the draft named on 12-15. The draft's
-    cores leave every derived role, so node 0's target team is 6-11, node 1's 18-27, copy 16, node 1's RAM thread 35;
-    no core or SMT sibling is in two roles. Mutation: leave named draft cores out of `taken` -- the target takes 6-15."""
-    config = resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, spin_core=17, draft=True,
-                     draft_cores="12-15")
-    assert config.copy_cpus == (16,)
-    assert [(p.ram, p.cpu) for p in config.plans] == [(17, tuple(range(6, 12))), (35, tuple(range(18, 28)))]
-    assert config.draft_cpus == (12, 13, 14, 15)
-    roles = [*config.copy_cpus, *config.draft_cpus] + [c for p in config.plans for c in (p.ram, *p.cpu)]
-    physical = [c % 36 for c in roles]
-    assert len(set(physical)) == len(physical)
-```
+The core layout of this mode (node 0's team 6-15 serving both clients, node 1's 18-27, copy 16, no draft role) is
+Task 12's `test_under_cpu_experts_the_draft_has_no_cores_of_its_own`.
 
 - [ ] **Step 2: Run and see them fail**
 
 On divix01:
-- `cd benchmarks/dsv41_baseline && PYTHONPATH=$WT/python:. taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q test_dspark_recipe.py`;
-- `test/registered/unit/layers/moe/test_threading_config.py -k dspark_recipe`.
-Expected: `AttributeError: module 'arm_env' has no attribute 'dspark_env'`. The threading test may already pass:
-`ThreadingConfig` needs no change for option (a). It then stands as the guard for that layout.
+- `cd benchmarks/dsv41_baseline && PYTHONPATH=$WT/python:. taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest -q test_dspark_recipe.py`.
+Expected: `AttributeError: module 'arm_env' has no attribute 'dspark_env'`.
 
 - [ ] **Step 3: Implement `arm_env.py`**
 
 After `PROD_HOST`:
 ```python
 # DSpark with both CPU-expert clients (plan 2026-10-06-dsv41-dspark-both-cpu-experts). Production serves it only once
-# PROD_DSPARK is True (Owner decision 1, the A/B of that plan's Task 15).
+# PROD_DSPARK is True (Owner decision 1, the A/B of that plan's Task 17).
 PROD_DSPARK = False
 DSPARK_DRAFT = f"{CC}/dsv41-dspark-draft"
 # Each stage's top-32 draft experts stay on the GPU, the other 96 on the CPU (§33.4).
 DSPARK_RESIDENT = f"{CC}/analysis/dsv41-dspark/cpu-draft-routes/resident-top32.json"
-# The draft's CPU experts by name: node 0's 12-15, so the target's node-0 team derives 6-11 (Owner decision 2a).
-DSPARK_DRAFT_CORES = "12-15"
 # gamma = 5 draft tokens, a 6-token verify (speculative_hook.py).
 DSPARK_ARGV = (
     "--speculative-algorithm", "DSPARK",
@@ -3552,7 +4800,7 @@ DSPARK_ARGV = (
 
 def dspark_env() -> dict[str, str]:
     """The DSpark mode's overrides on base_env: the graphed verify with the target's CPU experts and spill, and the
-    draft's CPU experts. Every value's reason is in the plan's Task 13 table."""
+    draft's CPU experts. Every value's reason is in the plan's Task 15 table."""
     return {
         # The verify in the breakable decode graph with a lane per route (MISS_LANES unset: 36 lanes, a 40-lane wire),
         # the first 8 VRAM victims; the rest are CPU lanes, a miss among them read into a RAM victim (Owner decision 3).
@@ -3560,9 +4808,9 @@ def dspark_env() -> dict[str, str]:
         "SGLANG_RAGGED_VERIFY_MODE": "static",
         # Layer-major prefill refuses speculative decoding (layer_major/gate.py).
         "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "0",
-        # The draft's CPU experts on their own cores, reading the optimized build (its gate names both defines).
+        # The draft's CPU experts as a second job source of node 0's CPU expert team (one team per node), on the
+        # optimized build (its gate names both defines).
         "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": "1",
-        "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": DSPARK_DRAFT_CORES,
         "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": DSPARK_RESIDENT,
         "SGLANG_EXL3_CPU_ACT_RESIDUAL": "1",
         "SGLANG_EXL3_CPU_ACT_BLOCK": "128",
@@ -3600,8 +4848,8 @@ current DRY_RUN output. Diff them and record it.
 
 ```bash
 git add benchmarks/dsv41_baseline/arm_env.py benchmarks/dsv41_baseline/launch_prod.sh \
-  benchmarks/dsv41_baseline/test_dspark_recipe.py test/registered/unit/layers/moe/test_threading_config.py
-git commit -m "feat(dsv41-baseline): the recipe's DSpark mode with both CPU-expert clients; production behind PROD_DSPARK (off)
+  benchmarks/dsv41_baseline/test_dspark_recipe.py
+git commit -m "feat(dsv41-baseline): the recipe's DSpark mode with both CPU-expert clients on one team per node; production behind PROD_DSPARK (off)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
@@ -3609,7 +4857,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 14: A/B tooling: accept length from the driver, the text band, the three-arm driver
+### Task 16: A/B tooling: accept length from the driver, the text band, the three-arm driver
 
 **Files:**
 - Modify: `scripts/expert_prediction/benchmarks/run_capture_sessions.py`
@@ -3787,7 +5035,7 @@ if __name__ == "__main__":
 
 `analysis/dsv41-drive/dspark/both_cpu_ab.py`:
 ```python
-"""Server A/B (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 15): today's production recipe against DSpark with
+"""Server A/B (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 17): today's production recipe against DSpark with
 both CPU-expert clients, and DSpark with the draft's only (the target's CPU experts off, §33.9's configuration in a
 server) to isolate them.
 
@@ -3970,12 +5218,12 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 15: Smoke, then the server A/B on divix01, then §33.10
+### Task 17: Smoke, then the server A/B on divix01, then §33.11
 
 Needs a GPU window: production down, owned by the owner. The executor waits on the locks.
 
 **Files:**
-- Modify: `DSV41_REFERENCE.md` (new §33.10, after §33.9)
+- Modify: `DSV41_REFERENCE.md` (new §33.11, after §33.9)
 
 - [ ] **Step 1: Smoke `dspark-both` (2 sessions)**
 
@@ -3991,7 +5239,8 @@ flock /data/models/slang/nvfp4-work/rowimg-disk.lock env DSV41_RUN_ROOT=$G/smoke
 Every one of these must hold in `$G/smoke/servers/dspark-both/run-*/server.log`. Record each line, or record its
 absence as a failure:
 1. `DSpark: EXL3 draft graphs on`.
-2. `numa dspark draft: node0 cpus=12-15 (4)`, and CPU experts groups on cores `[6, ..., 11]` and `[18, ..., 27]`.
+2. CPU experts groups on cores `[6, ..., 15]` and `[18, ..., 27]`, no `numa dspark draft` line, and the draft
+   registry's line naming node 0's CPU expert team.
 3. The decode graph captured as `TARGET_VERIFY`, and `exl3 RAM miss copy engine armed after`.
 4. No `fail-stop`, `__trap`, `RemoteDisconnected`, `CUDA error`, or `out of memory`.
 5. The KV pool line (`max_total_num_tokens`). Record it for Step 2's bar.
@@ -4020,7 +5269,7 @@ Bars, each recorded from `$G/ab/summary.json` and the logs:
    - `gather_overflow` must not grow after the armed line. Read the per-layer counters from the metrics file's first
      and last records after arming.
    For contrast, report `dspark-draft-only.reverify_rate`, which §33.8/§33.9 put at 1.00. Any armed overflow is a
-   failed bar and a defect in Tasks 2-10, not noise.
+   failed bar and a defect in Tasks 2-12, not noise.
 4. `dspark-both`'s server log shows nonzero target CPU-expert jobs (the periodic `CPU experts group` stats).
 5. `dspark-both`'s KV pool is at least the `prod` arm's.
 6. Report for all three: `ms_per_token_median` with the per-session list, `accept_length`, and the reverify rate.
@@ -4028,9 +5277,9 @@ Bars, each recorded from `$G/ab/summary.json` and the logs:
 
 A failed bar is reported as failed, with its numbers. Do not re-run an arm to get a different number without saying so.
 
-- [ ] **Step 3: Write §33.10** in `DSV41_REFERENCE.md`, after §33.9's "What this plan does not do" list:
+- [ ] **Step 3: Write §33.11** in `DSV41_REFERENCE.md`, after §33.9's "What this plan does not do" list:
   - the commit and the plan;
-  - what changed (Tasks 2-13, one line each);
+  - what changed (Tasks 2-15, one line each);
   - Steps 1-2's commands;
   - a table of the three arms × (ms/token median, accept length, reverify rate, text pass and max gap, KV pool);
   - each bar's verdict;
@@ -4052,9 +5301,9 @@ git push origin dsv41-dspark-both-cpu
 
 ---
 
-### Task 16: Flip production to DSpark (owner-gated)
+### Task 18: Flip production to DSpark (owner-gated)
 
-Run only on the owner's go (Owner decision 1), given in their own words after reading §33.10.
+Run only on the owner's go (Owner decision 1), given in their own words after reading §33.11.
 
 **Files:**
 - Modify: `benchmarks/dsv41_baseline/arm_env.py` (`PROD_DSPARK = True`), `benchmarks/dsv41_baseline/test_dspark_recipe.py`
@@ -4071,7 +5320,7 @@ def test_prod_serves_the_dspark_mode():
 ```
 Run it and see it fail (`PROD_DSPARK is False`).
 
-- [ ] **Step 2: Set `PROD_DSPARK = True`.** Add a comment above it naming §33.10 and the owner's go (date, words).
+- [ ] **Step 2: Set `PROD_DSPARK = True`.** Add a comment above it naming §33.11 and the owner's go (date, words).
 Run the test and see it pass. Then run `DRY_RUN=1 benchmarks/dsv41_baseline/launch_prod.sh` and check `dspark: True`,
 the DSpark argv, and `dspark_env()`'s values in the printed env.
 
@@ -4080,7 +5329,7 @@ This plan does neither.
 
 ```bash
 git add benchmarks/dsv41_baseline/arm_env.py benchmarks/dsv41_baseline/test_dspark_recipe.py
-git commit -m "feat(dsv41-baseline): production serves DSpark with both CPU-expert clients (owner go, §33.10)
+git commit -m "feat(dsv41-baseline): production serves DSpark with both CPU-expert clients (owner go, §33.11)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
@@ -4089,33 +5338,39 @@ git push origin dsv41-dspark-both-cpu
 
 ---
 
-## Self-review notes (writer's pass, 2026-10-06, after amendments A and B)
+## Self-review notes (writer's pass, 2026-10-06, after amendments A, B and the shared-team ruling)
 
 - **Spec coverage.**
-  - Both clients at once: Tasks 2-13.
-  - The verify, graphed: Tasks 2-11. The eager re-verify is unchanged and GPU-only, and in steady state it never runs
-    (Owner decision 5). Task 15 bounds its count by the pre-arming verifies.
+  - Both clients at once: Tasks 2-15.
+  - The verify, graphed: Tasks 2-10 and 13. The eager re-verify is unchanged and GPU-only, and in steady state it
+    never runs (Owner decision 5). Task 17 bounds its count by the pre-arming verifies.
   - Amendment A, a record a 6-token verify cannot exceed: Task 2 (40-lane wire, u64 masks, shared kernels, BS1 digest)
     and Task 8 (spill requires a lane per route; the clamp asserts).
   - Amendment B, forced misses always land: Tasks 3-4 (no staging for forced misses), Task 9 (host-placed into RAM
     victims) and Task 10 (start-up room check). The costs are in Owner decision 3.
-  - The one overflow left (case 1): Tasks 4 and 11.
+  - Shared team: Task 11 (the engine, `keep_warm_either`, unified watchdog, ported draft tests, ordering, stuck and stop
+    tests, the no-draft path pinned) and Task 12 (no draft role, refused draft cores, the registry on node 0's engine,
+    the draft-only launch).
+  - The one overflow left (case 1): Tasks 4 and 13.
   - Prefill: unchanged. The target's CPU experts type lanes only on a captured post (`lease_kernels.cuh:151`), prefill
     is eager, and the DSpark draft does not run at prefill (`dspark_worker_v2.py:653-745`).
-  - Cores: Owner decision 2 and Task 13's layout test.
   - Lease and pinned-tier interplay: separate channels and areas (`LEASE_PROTOCOL.md:71`); strictly sequential on one
     stream; draft weights pageable, not tier rows (`exl3.py:431-441`). Forced misses take tier victims only in the
-    target's own rows. Task 10 documents it.
-  - Gate: Task 12. Recipe and launch: Task 13. Validation: Tasks 2-11, 14, 15.
+    target's own rows. The two clients now also share one team, serialized by its single thread.
+  - Gate: Tasks 12 and 14. Recipe and launch: Task 15. Validation: Tasks 2-13, 16, 17. The write-up is §33.11.
 - **Type consistency.**
   - The post's FFI tail order is `cpu_x, cpu_x_dst, cpu_weights, cpu_tokens_max, cpu_x_token_bytes, spill,
     overflow_flag, gather_overflow, use_pdl` in Tasks 4 and 5 and their raw-call edits.
-  - The mask words are `ce_mask` {lo, cpu lo, parts, hi, cpu hi} and `cpu_lanes` {cpu lo, parts, cpu hi}, in Task 2's
-    CW/CC, route tables, commit and transport.
-  - `victim_lanes` is used in Tasks 8, 10 and 12.
-  - `cpu_row_bytes(hidden, tokens, lanes)` is used in Tasks 5, 6 and 10.
+  - The mask words are `ce_mask` {lo, cpu lo, parts, hi, cpu hi} and `cpu_lanes` {cpu lo, parts, cpu hi}, in Task 2.
+  - `victim_lanes` is used in Tasks 8, 10 and 14.
+  - `cpu_row_bytes` is used in Tasks 5, 6 and 10.
   - `spill = (overflow_flag, gather_overflow[row:row+1])` is used in Tasks 4 and 10.
   - Lane slot −1 for a forced miss is used in Tasks 3, 4 and 9.
+  - `DraftSource`, `attach_draft`, `detach_draft` and `DraftStats` are used in Task 11's engine, tier and exports.
+    `SharedDraftHost` and `DraftCpuHost` share `set_layer/start/stop/stats` (7 stats values).
+- **Order note.** Task 12's gate test reuses `SPILL` and `DSPARK_BREAKABLE`, which Task 14 defines. Task 12 defines
+  them if they do not exist yet, and Task 14 then reuses them.
 - **Known open item, not a placeholder.** The BS1 digest's host `.text` comparison is meaningful only within Task 2.
-  Tasks 6 and 9 change the host on purpose, so the permanent test compares device kernels, and the host's BS1
-  behaviour stays pinned by `test_expert_stream_hotpath_golden.py`.
+  Tasks 6, 9 and 11 change the host on purpose, so the permanent test compares the device kernels and the CPU
+  kernel's one-word keep-warm and forward, and the host's BS1 behaviour stays pinned by
+  `test_expert_stream_hotpath_golden.py`.
