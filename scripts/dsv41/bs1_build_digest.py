@@ -83,6 +83,31 @@ def _text(so: str) -> str:
         return hashlib.sha256(open(out.name, "rb").read()).hexdigest()
 
 
+def _cpu_kernel() -> dict[str, str]:
+    """The optimized EXL3 CPU kernel library's one-word keep-warm and forward entry points: objdump per function,
+    addresses and raw bytes stripped, operand addresses reduced to the symbols they name. Needs SGLANG_EXL3_SRC and
+    SGLANG_DSV41_CPU_EXPERTS=1 (the optimized build)."""
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
+
+    so = exl3_ext().__file__
+    text = subprocess.run(["objdump", "-d", "-C", "--no-show-raw-insn", so], capture_output=True, text=True,
+                          check=True).stdout
+    keep = re.compile(r"keep_warm_detail::(bw|avx2|scalar)\(|keep_warm<|ExpertForward<.*>::(keep_warm|forward)\(")
+    digests, name, lines = {}, None, []
+    for line in text.splitlines() + [""]:
+        header = re.match(r"^[0-9a-f]+ <(.+)>:$", line)
+        if header or not line.strip():
+            if name is not None and keep.search(name):
+                digests[name] = hashlib.sha256("\n".join(lines).encode()).hexdigest()
+            name, lines = (header.group(1), []) if header else (None, [])
+            continue
+        if name is not None:
+            body = re.sub(r"^\s*[0-9a-f]+:\s*", "", line)
+            body = re.sub(r"\b[0-9a-f]{5,}\b", "", body)  # absolute addresses; the <symbol> after each stays
+            lines.append(body.strip())
+    return digests
+
+
 def collect(keep_cache: str | None = None, reuse_cache: str | None = None) -> dict:
     cache = reuse_cache or os.path.join(REPO, ".bs1-digest-cache")
     if not reuse_cache:
@@ -114,6 +139,8 @@ def collect(keep_cache: str | None = None, reuse_cache: str | None = None) -> di
         if len(leaves) != 1:
             raise SystemExit(f"{kind} module {module} was built {len(leaves)} times: {[root for root, _ in leaves]}")
         result[kind].update(leaves[0][1])
+    if os.environ.get("SGLANG_EXL3_SRC"):
+        result["cpu"] = _cpu_kernel()
     if not keep_cache and not reuse_cache:
         shutil.rmtree(cache, ignore_errors=True)
     return result
@@ -125,11 +152,17 @@ def main():
     group.add_argument("--write")
     group.add_argument("--compare")
     parser.add_argument("--permanent", action="store_true")
+    parser.add_argument("--cpu-kernel", action="store_true")
     parser.add_argument("--keep-cache", action="store_true", help="leave the fresh JIT cache in .bs1-digest-cache")
     parser.add_argument("--reuse-cache", help="digest this JIT cache instead of running the suites (a kept one)")
     args = parser.parse_args()
     now = collect(args.keep_cache, args.reuse_cache)
     if args.write:
+        if args.cpu_kernel and os.path.exists(args.write):
+            with open(args.write) as f:
+                merged = json.load(f)
+            merged["cpu"] = now.get("cpu", {})
+            now = merged
         with open(args.write, "w") as f:
             json.dump(now, f, indent=1, sort_keys=True)
         return
@@ -138,9 +171,9 @@ def main():
     if (golden["arch"], golden["nvcc"]) != (now["arch"], now["nvcc"]):
         print(f"toolchain differs: golden {golden['arch']} {golden['nvcc']}, now {now['arch']} {now['nvcc']}")
         raise SystemExit(2)
-    kinds = ("device",) if args.permanent else ("device", "host")
-    diffs = [f"{kind} {key}" for kind in kinds for key, digest in golden[kind].items()
-             if now[kind].get(key) != digest and not (args.permanent and "exl3_ram_miss_post_kernel" in key)]
+    kinds = ("device", "cpu") if args.permanent else ("device", "host", "cpu")
+    diffs = [f"{kind} {key}" for kind in kinds for key, digest in golden.get(kind, {}).items()
+             if now.get(kind, {}).get(key) != digest and not (args.permanent and "exl3_ram_miss_post_kernel" in key)]
     print("\n".join(diffs) or "BS1 build unchanged")
     raise SystemExit(1 if diffs else 0)
 
