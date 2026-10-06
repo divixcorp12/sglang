@@ -25,6 +25,7 @@
 # Env: DSV41_SERVER_CORES=<taskset list> replaces arm_env.SERVER_CORES for this arm only; it must stay on node 0 (see
 # arm_env.SERVER_CORES). DSV41_DRIVER_CORES=<taskset list> replaces arm_env.DRIVER_CORES; set but empty runs the
 # driver unpinned (not for timed comparisons). Both are recorded in run-manifest.json.
+# Env: DSV41_HEALTH_TIMEOUT_S=<s> sets the /health gate (default 900; never shorten it for a cold arm).
 # Env: EXPECT_SHA=<sha> to pin the worktree to an exact commit (refuse otherwise); the
 # worktree must always be clean (preflight). The python/ tree must be registered in
 # generations.json first (`python -c "import generations; generations.register(TREE,
@@ -74,6 +75,7 @@ corpus=/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl
 corpus_checksum=249e8a73a32b69aff563471dbae2f4f3a2a9beaa1a3ae5cb03b4c2c549c16c72
 max_tokens=128
 warmup_session_id='fb-financebench_id_04209'
+health_timeout_s=${DSV41_HEALTH_TIMEOUT_S:-900}  # a DSpark arm starts in ~15+ min; both_cpu_ab.py sets more for it
 max_warmup_rounds=12  # a live trace run showed decode tok/s still climbing at round 5
 expert_shard_dir=/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw
 
@@ -382,12 +384,12 @@ stop_server() {
 #     non-2xx (including the 503 the smoke log showed while still starting) as failure,
 #     so this already only succeeds on a real 200. Never shorten the per-call timeout. ---
 healthy=0
-for _ in $(seq 1 180); do
+for _ in $(seq 1 $((health_timeout_s / 5))); do
     sleep 5
     kill -0 "$spid" 2>/dev/null || break
     curl -sf -m 60 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { healthy=1; break; }
 done
-[ "$healthy" = 1 ] || { stop_server; abort "$arm never became healthy within 900s (see $log)"; }
+[ "$healthy" = 1 ] || { stop_server; abort "$arm never became healthy within ${health_timeout_s}s (see $log)"; }
 echo "$arm healthy"
 
 # --- verify env from the live server process, not from what we think we set ---

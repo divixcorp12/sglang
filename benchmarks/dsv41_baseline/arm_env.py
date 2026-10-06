@@ -137,6 +137,8 @@ NODE0_FREE_MIB = 81869  # measured 2026-09-24 14:08, production and every arm do
 WEIGHTS_AND_OVERHEAD_MIB = 12288  # ~9.94 GiB of weights, plus slack
 
 HEALTH_TIMEOUT_S = 900  # /health runs a real generation; slow cold. Never shorten this.
+# A DSpark server loads the target (~435 s), the draft (~870 s in), then autotunes and captures graphs (2026-10-06 smoke).
+DSPARK_HEALTH_TIMEOUT_S = 2700
 
 # Production serves the base recipe unchanged on all interfaces; launch_prod.sh is its only launcher.
 PROD_PORT = 7867

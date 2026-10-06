@@ -53,12 +53,17 @@ def _probe_overrides(arm: str, out: str) -> dict:
     return {**_overrides(arm, out), "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.probe.metrics.jsonl")}
 
 
+def _health_timeout_s(dspark: bool) -> int:
+    return arm_env.DSPARK_HEALTH_TIMEOUT_S if dspark else arm_env.HEALTH_TIMEOUT_S
+
+
 def run_timed(arm: str, out: str) -> int:
     _, dspark = ARMS[arm]
     env = os.environ | {
         "DSV41_RUN_ROOT": out,
         "DSV41_SESSION_INDICES": ",".join(str(i) for i in range(8)),
         "DSV41_EXTRA_SERVER_ARGS": shlex.join(arm_env.DSPARK_ARGV) if dspark else "",
+        "DSV41_HEALTH_TIMEOUT_S": str(_health_timeout_s(dspark)),
     }
     cmd = [os.path.join(REPO, "benchmarks", "dsv41_baseline", "run_arm.sh"), arm, str(PORT)]
     cmd += [f"{k}={v}" for k, v in _overrides(arm, out).items()]
@@ -89,7 +94,7 @@ def run_probe(arm: str, out: str) -> int:
             server = subprocess.Popen(["taskset", "-c", arm_env.SERVER_CORES, *argv], env=env, stdout=log,
                                       stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True)
         try:
-            if not _healthy(PROBE_PORT, time.monotonic() + arm_env.HEALTH_TIMEOUT_S):
+            if not _healthy(PROBE_PORT, time.monotonic() + _health_timeout_s(dspark)):
                 return 1
             probe = os.path.join(REPO, "scripts", "expert_prediction", "prefetch", "logprob_probe.py")
             return subprocess.run(
