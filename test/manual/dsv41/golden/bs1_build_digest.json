@@ -1,5 +1,14 @@
 {
  "arch": "sm_120",
+ "cpu": {
+  "sglang::cpu_experts::(anonymous namespace)::ExpertForward<sglang::exl3_cpu::(anonymous namespace)::Exl3Quant>::forward(sglang::cpu_experts::ExpertLayer const&, sglang::cpu_experts::ForwardCall const&) const": "bd861c5fc993d96a1a809d006dfb01b9f8f0d260012b4edbaa092f0f1931f8d2",
+  "sglang::cpu_experts::(anonymous namespace)::ExpertForward<sglang::exl3_cpu::(anonymous namespace)::Exl3Quant>::forward(sglang::cpu_experts::ExpertLayer const&, sglang::cpu_experts::ForwardCall const&) const [clone .cold]": "990bea6eafaac7c6bc653b3f763bca56c6a1ccea961b37eb25e1be29e235f5a5",
+  "sglang::cpu_experts::(anonymous namespace)::ExpertForward<sglang::exl3_cpu::(anonymous namespace)::Exl3Quant>::keep_warm(std::span<int const, 18446744073709551615ul>, int, unsigned int const*, unsigned int, long, long) const": "2e2a7ec16c63f948a45d4f2cdef475c2c7cc29834f5e0a82741664d4f810658b",
+  "sglang::cpu_experts::(anonymous namespace)::ExpertForward<sglang::exl3_cpu::(anonymous namespace)::Exl3Quant>::keep_warm(std::span<int const, 18446744073709551615ul>, int, unsigned int const*, unsigned int, long, long) const [clone .cold]": "515cbe9de6703ae24e9b084a31a66b757371ab9def8900ad6e6844d13dc9e6e5",
+  "sglang::cpu_experts::(anonymous namespace)::keep_warm_detail::avx2(unsigned int const*, unsigned int, long)": "a3b2c4414b8b96b5409bb85a8c56746dd14d6c256e9c9c79cf3c9d77114a70b5",
+  "sglang::cpu_experts::(anonymous namespace)::keep_warm_detail::bw(unsigned int const*, unsigned int, long)": "4ecda3261cfdc9af295f90f0319a26311591a5137df955412be4d256242f1a7a",
+  "void sglang::cpu_experts::(anonymous namespace)::keep_warm<(sglang::cpu_experts::(anonymous namespace)::Isa)4>(sglang::cpu_experts::(anonymous namespace)::Isa, std::span<int const, 18446744073709551615ul>, int, unsigned int const*, unsigned int, long, long) [clone ._omp_fn.0]": "a374a3d60c60b15407f685731ff033e465868ea653ef473639271f5ed2dcb54f"
+ },
  "device": {
   "exl3_moe_route_tables_int32_t_fp32_t_bf16_t::void sglang::exl3::exl3_moe_route_tables_kernel<int, float, __nv_bfloat16>(int const*, int, float const*, float const*, __nv_bfloat16 const*, long, long, long, long*, __half*, float*, long*, long*, __half*, long*, long*, int const*, int const*, long, float const*, long)": "b2f8141a165288dc1722a124b813cd62051d4a99ef9125b9a786053976bb2cb7",
   "exl3_moe_route_tables_int64_t_fp32_t_fp32_t::void sglang::exl3::exl3_moe_route_tables_kernel<long, float, float>(long const*, int, float const*, float const*, float const*, long, long, long, long*, __half*, float*, long*, long*, __half*, long*, long*, int const*, int const*, long, float const*, long)": "a6e8cd8b826c5f2b7ac483671b3bf425bdf172dc68bda5f6212a6fd3a900e469",
