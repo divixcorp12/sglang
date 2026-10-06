@@ -11,9 +11,10 @@ It registers :data:`exl3_expert_stream_requirements`, which requires:
   pinned host tier (never the host arena). It needs DIRECT residency: the GPU
   residency update with ``SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2``.
 * A ``stat`` or ``per_pass`` recorder under dynamic residency.
-* Speculative decoding (DSpark or otherwise) only with the decode graph disabled: a
-  speculative verify step runs more than one token through scratch and RAM-miss
-  posting sized for one.
+* Speculative decoding as DSpark: its verify eager (decode graphs disabled), or in the breakable decode graph on DIRECT
+  residency at 1-64 miss lanes with a static verify (§33.8). The target's CPU experts serve that graphed verify; with
+  SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES (and a lane per route: MISS_LANES unset) the lanes past the victims are
+  theirs (spill).
 
 Nothing else is required; ``--max-running-requests`` and the overlap schedule stay
 free. The shared eager checks come from ``eager_expert_stream_requirements``. This
@@ -101,8 +102,9 @@ def _check_dspark_cpu_experts(cfg) -> None:
             "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs EXL3_MOE_CPU_PIN=0: the kernel would otherwise pin "
             "its workers to the first cores"
         )
-    # Only the optimized build exports a CpuExpertKernel. SGLANG_DSV41_CPU_EXPERTS, which also selects it, is refused
-    # under speculation, so these two defines are the way in (exl3/ext.py, cpu_act_defines and optimized_cpu).
+    # Only the optimized build exports a CpuExpertKernel. SGLANG_DSV41_CPU_EXPERTS also selects it, but a draft-only
+    # launch has it off, so these two defines are the way in. The recipe sets them in either case (exl3/ext.py,
+    # cpu_act_defines and optimized_cpu).
     if not (envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get() and envs.SGLANG_EXL3_CPU_ACT_BLOCK.get() == 128):
         raise ValueError(
             "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS runs the optimized EXL3 CPU kernel: set "
@@ -114,36 +116,55 @@ def _check_dspark_cpu_experts(cfg) -> None:
 
 
 _EAGER_VERIFY_REMEDY = "or pass --cuda-graph-backend-decode disabled to run the DSpark verify eagerly"
+# SGLANG_DSV41_CPU_EXPERTS computes in the captured graph's copy wait, so its verify cannot go eager.
+_CPU_EXPERTS_VERIFY_REMEDY = "SGLANG_DSV41_CPU_EXPERTS serves the DSpark verify only in the decode graph"
 
 
-def _check_graphed_verify(cfg) -> None:
+def _check_graphed_verify(cfg, remedy: str = _EAGER_VERIFY_REMEDY) -> None:
     """A speculative verify in the breakable decode graph (DSV41_REFERENCE.md §33.7-§33.8).
 
-    Only DSpark's static verify, on DIRECT residency at W miss lanes: a verify routes more than the wire's 32 lanes,
+    Only DSpark's static verify, on DIRECT residency at W miss lanes: a verify routes more than a few lanes,
     and only DIRECT's gather flags the misses it cannot serve, which the DSpark worker re-runs eagerly.
     """
     algorithm = cfg.speculative_algorithm
     if str(algorithm).upper() != "DSPARK":
         raise ValueError(
-            f"EXL3 expert caching graphs the verify of DSpark only, not {algorithm}; {_EAGER_VERIFY_REMEDY}"
+            f"EXL3 expert caching graphs the verify of DSpark only, not {algorithm}; {remedy}"
         )
     lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
     if not (
         envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get()
         and envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
         and envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2
-        and 1 <= lanes <= 32
+        and (1 <= lanes <= 64 or (lanes == 0 and envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get() > 0))
     ):
         raise ValueError(
             "EXL3 expert caching runs a DSpark verify in the decode graph only with SGLANG_MOE_EXPERT_GRAPH_GATHER=1, "
             "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 and "
-            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES=1-32 (got {lanes}): a verify routes more experts than the 32 "
-            f"lanes; {_EAGER_VERIFY_REMEDY}"
+            "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES=1-64, or unset with "
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES (got {lanes}): a lane per route needs spill's CPU lanes; "
+            f"{remedy}"
         )
     if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
         raise ValueError(
             "EXL3 expert caching runs a DSpark verify in the decode graph with SGLANG_RAGGED_VERIFY_MODE=static only "
-            f"(compact mode reads the host); {_EAGER_VERIFY_REMEDY}"
+            f"(compact mode reads the host); {remedy}"
+        )
+
+
+def _check_victim_lanes() -> None:
+    """SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES (spill): the CPU takes the lanes past the victims, and every route has
+    a lane, so a verify's distinct misses never outnumber its lanes."""
+    victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
+    if not victims:
+        return
+    if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        raise ValueError(f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} needs SGLANG_DSV41_CPU_EXPERTS=1")
+    lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
+    if lanes:
+        raise ValueError(
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES (got {lanes})"
         )
 
 
@@ -176,21 +197,17 @@ def _check(cfg, budgets) -> None:
     if envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get():
         _check_dspark_cpu_experts(cfg)
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
-    if cpu_experts and (
-        getattr(cfg, "speculative_algorithm", None) is not None
-        or graph.decode.backend != Backend.BREAKABLE
-    ):
-        # Checked before the speculative and backend rules: each would point a
-        # CPU-experts launch at the other's decode backend.
+    speculative = getattr(cfg, "speculative_algorithm", None) is not None
+    if cpu_experts and graph.decode.backend != Backend.BREAKABLE:
+        # Checked before the speculative and backend rules: each would point a CPU-experts launch at the other's
+        # decode backend.
         raise ValueError(
             "SGLANG_DSV41_CPU_EXPERTS computes experts inside the captured decode graph's copy wait; "
-            "pass --cuda-graph-backend-decode breakable, without speculative decoding"
+            "pass --cuda-graph-backend-decode breakable"
         )
-    if (
-        getattr(cfg, "speculative_algorithm", None) is not None
-        and graph.decode.backend != Backend.DISABLED
-    ):
-        _check_graphed_verify(cfg)
+    if speculative and graph.decode.backend != Backend.DISABLED:
+        _check_graphed_verify(cfg, _CPU_EXPERTS_VERIFY_REMEDY if cpu_experts else _EAGER_VERIFY_REMEDY)
+    _check_victim_lanes()
     if graph.decode.backend == Backend.DISABLED:
         _EAGER.check(cfg, budgets)
         return
