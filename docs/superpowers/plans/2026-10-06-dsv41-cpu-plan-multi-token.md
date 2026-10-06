@@ -1,74 +1,76 @@
-# The DSV4.1 CPU plan takes chunks of two tokens: Implementation Plan
+# The DSV4.1 CPU plan takes chunks of any size up to CHUNK_M: Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A forward whose routes put two tokens on one expert runs the EXL3 CPU kernel's DSV4.1 plan
-(`ForwardPlan<Dsv41Shape, Isa::Bw>`) instead of falling back, for the whole call, to `ForwardPlan<GenericShape, Bw>`,
-with bit-identical output.
+**Goal:** A forward whose routes put several tokens on one expert runs the EXL3 CPU kernel's DSV4.1 plan
+(`ForwardPlan<Dsv41Shape, Isa::Bw>`), with bit-identical output. Today it falls back, for the whole call, to
+`ForwardPlan<GenericShape, Bw>`. The token count is generic, so raising `MAX_M` later is a one-constant change.
 
 **Architecture:**
-- `Exl3Quant::dispatch` groups routes into chunks of at most `CHUNK_M` tokens. `CHUNK_M = MAX_M / ACT_ROWS = 4 / 2 = 2`
-  in this build, so "m ≥ 2" means exactly **m = 2**. One new case, not a family.
-- The register kernels (`register_rows`, `register_band`, `math_avx512.hpp`) get a template parameter `M` (token rows,
-  default 1). `M = 2` reads the four quantized rows that `compact_quantize_block` already writes for a two-token chunk,
-  and shares each decoded weight tile between both tokens. A new `register_tiles_m2` drives them; `run_tiles` calls it
-  for compact input at `m == 2`. Only the DSV4.1 plan hands in compact input, so the generic plan is unchanged.
-- The compact scratch is laid out by rows (each chunk's `ACT_ROWS * m` rows follow the previous chunk's) instead of
-  one fixed stride per chunk. A call whose chunks are all one token keeps today's offsets exactly.
-- `Dsv41Shape::accepts` takes chunks of one or two tokens.
-- The grouped multi-band traversal and the 512-wide quantization stay one-token only (see the table in "What assumes
-  m == 1").
-- Two counters come first, so the change can be measured and tested:
-  - the draft CPU thread counts the jobs whose routes share a slot (Task 1);
-  - the kernel counts the forwards each plan took (Task 2, `sglang_exl3_cpu::plan_calls`).
+- **What a chunk is.** `Exl3Quant::dispatch` groups routes into chunks of at most `CHUNK_M = MAX_M / ACT_ROWS` tokens.
+  In this build `CHUNK_M` is 4 / 2 = 2.
+- **One build-time constant.** `MAX_M` becomes `EXL3_MOE_CPU_MAX_M` (default 4), the way `EXL3_MOE_CPU_ACT_BLOCK` is
+  done. A test build raises it with `SGLANG_EXL3_CPU_MAX_M`, which gets its own extension build key (Task 4b).
+  - Every array, stride and dispatch derives from it. That includes the generic tiers' hand-written
+    `bits * 4 + rows - 1` switches, which become tables generated from `MAX_M`.
+  - The generic plan's output does not depend on `MAX_M`. Its per-row arithmetic is row-independent and its
+    accumulation order is set by the dispatch. Task 4b proves this at `MAX_M = 8` against BASE, on every tier
+    divix01 runs.
+- **The register kernels, generic in M.** `register_rows`, `register_band` and `register_tiles` (`math_avx512.hpp`)
+  are templated on `M`, the number of tokens in a chunk.
+  - `run_tiles` dispatches `m = 1..CHUNK_M` through a direct-call sequence generated from `CHUNK_M`.
+  - One table, `kRegisterBudget`, gives each M its tile pairs per call and whether it uses the grouped traversal.
+  - A `static_assert` proves every entry fits 32 zmm. A `CHUNK_M` without an entry fails to compile, and the message
+    names the table.
+  - `M = 1` is today's code, byte for byte (Task 5's objdump check).
+- **Compact scratch, laid out by rows.** Each chunk's `ACT_ROWS * m` rows follow the previous chunk's. A call of
+  one-token chunks keeps today's offsets.
+- **What the DSV4.1 plan accepts.** `Dsv41Shape::accepts` takes `1 <= m <= CHUNK_M`. The grouped traversal and the
+  512-wide quantization stay one-token only (`kRegisterBudget[0]`, `wide`).
+- **Counters come first:**
+  - jobs whose routes share a slot, counted by the draft CPU thread (Task 1);
+  - forwards per plan and the build's `CHUNK_M`, counted by the kernel (Task 2: `sglang_exl3_cpu::plan_calls` and
+    `chunk_m`).
+- **Task 5b (conditional).** It raises the default `MAX_M` to 8 (`CHUNK_M` 4) if and only if the m = 2 measurement
+  beat the generic plan.
 
-**Tech Stack:** C++20 (GCC 15, AVX-512BW intrinsics, OpenMP), the EXL3 torch extension and the expert-stream host module
-(JIT), Python/pytest, Google Benchmark (the native bench under `expert_stream/bench`). Every run is on divix01, CPU only.
+**Tech Stack:** C++20 (GCC 15, AVX-512BW intrinsics, OpenMP, `std::integer_sequence`), the EXL3 torch extension and
+the expert-stream host module (JIT), Python/pytest, Google Benchmark (the native bench under `expert_stream/bench`).
+Every run is on divix01, CPU only.
 
 **Spec:**
-- The team lead's brief for this plan (2026-10-05), items 1-5.
+- The team lead's brief (2026-10-05), items 1-5.
+- The owner's revision (2026-10-06), relayed by the team lead:
+  - the token count is generic and `MAX_M` is one constant with a build-time override;
+  - a register-budget table with a static_assert;
+  - an audit of every `MAX_M` and `CHUNK_M` use;
+  - `accepts` takes `1 <= m <= CHUNK_M`;
+  - `CHUNK_M` is exposed to Python, and the parity tests widen with it, including one `MAX_M = 8` run;
+  - the conditional Task 5b;
+  - results in `DSV41_REFERENCE.md` §33.10.
 - `DSV41_REFERENCE.md` §33.3 item 5 ("The tuned path turns off for chunks with more than one token"), §33.5's v2 note,
-  §33.8 ("v2 ... not worth building on this evidence").
+  and §33.8.
 - `python/sglang/kernels/jit/csrc/exl3/optimized/README.txt`, "Selection": "Invalid/duplicate routes and multi-token
   chunks retain the generic path."
-- `.claude/rules/divix01-run-protocol.md`: how every run below is done.
+- `.claude/rules/divix01-run-protocol.md`, which governs every run below.
 
-## Open questions for the owner
+## Owner decisions (2026-10-06)
 
-Each has a default the plan follows unless the owner says otherwise.
-
-1. **Ship gate (Task 6).**
-   - Default proposal:
-     - every one-token control (`experts:1/3/5`) has a median p50 within ±2% of BASE;
-     - the new plan is no slower than the generic plan on any routed pattern;
-     - it is ≥5% faster on `16:3:random` or `16:3:pairs`.
-   - If it fails, does the kernel change (Task 5) still merge, or do only the counters and harness (Tasks 1-4) merge?
-   - The plan's default is to stop and ask.
-2. **Is this worth doing now?**
-   - §33.8 shelved graphed DSpark, and this change helps only multi-row callers.
-   - Today that is the DSpark draft's CPU share: `DraftCpuThread`, M ≤ 16, the eager and the graphed draft both.
-   - The target's `CpuExpertEngine` calls `rows = 1` per job (`host/cpu_experts.h`, `run_job`), so target decode and
-     prefill gain nothing until D2-4 exists.
-   - Default: land Task 1 first, read the draft's collision rate from one DSpark arm, then decide on Tasks 5-6.
-3. **Plan-selection observability.**
-   - Task 2 adds two process-wide relaxed counters to the production kernel (one RMW per forward) and a torch op.
-   - Alternative: an env knob forcing the generic plan. It would let one build A/B itself, but it is a new
-     `EXL3_MOE_*` variable and more code.
-   - Default: counters.
-4. **Follow-ups.** Grouped traversal and wide (512) quantization at m = 2 are numerically identical, but their
-   performance is untested there. Default: out of scope here, listed under Out of scope.
+1. **Scope.** Do the whole plan, Tasks 1-7, kernel included.
+2. **Ship gate.** It applies to Task 6, and again to Task 5b.
+   - Every one-token control (`experts:1/3/5`) has a median p50 within ±2% of the reference build.
+   - The new build is no slower than the reference on any routed pattern.
+   - It is ≥5% faster on at least one of the named patterns.
+   - On a miss, stop and ask. Do not revert without the owner.
+3. **Observability.** Counters (`plan_calls`, `chunk_m`), not an env knob that forces the generic plan.
+4. **Follow-ups.** The grouped traversal and wide quantization at m ≥ 2 stay a follow-up.
 
 ## Global Constraints
 
-- **Branch** `dsv41-cpu-plan-m2`, off `dsv41-dspark-graph`.
+- **Branch** `dsv41-cpu-plan-m2`, already created off `dsv41-dspark-graph`.
   - Laptop worktree: `/Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2`.
   - Never edit, stage, check out or stash anything in `/Users/dnikolaidis/Desktop/divix/sglang-nvfp4-dspark-graph`.
     Another agent commits there.
-  ```bash
-  git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-dspark-graph fetch origin
-  git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-dspark-graph worktree add -b dsv41-cpu-plan-m2 \
-    /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 origin/dsv41-dspark-graph
-  ```
 - **Running code (`.claude/rules/divix01-run-protocol.md`).**
   - Commit, push `origin dsv41-cpu-plan-m2`, then run in the divix01 worktree at the pushed commit. No rsync or scp.
     Fix-up commits are fine; never amend or rebase.
@@ -106,67 +108,151 @@ Each has a default the plan follows unless the owner says otherwise.
   ```
 - **Cold JIT.**
   - A header change rebuilds the EXL3 extension (minutes) and the host module (50-100 s per variant).
-  - The first run after one may hit a child-process timeout. Check the build directory's mtimes before calling that
-    a regression.
-  - Run these suites serially, not `-n 8`.
+  - `SGLANG_EXL3_CPU_MAX_M=8` builds a separate extension, flavor `resid_b128_m8_cpu_v1`, under the private
+    `SGLANG_EXL3_BUILD_DIR`. It is a fresh build key that touches nobody's cache, and its first build is cold.
+  - Warm each new build once with a serial one-line import (Task 4b Step 6) before any test times out on it.
+  - Check the build directory's mtimes before calling a timeout a regression. Run these suites serially, not `-n 8`.
 - **Numerics contract (the plan's acceptance condition).**
-  - **m = 1:** byte-identical to today. A call whose chunks are all one token runs the same code at the same scratch
-    offsets.
-    - Proven by the 24 frozen bare-forward outputs, the 48 full-stack outputs, and the A/B dumps against BASE.
-  - **m = 2:** byte-identical to the generic plan.
-    - Both keep exact per-row int32 block sums, one FMA scale per (k-block, row), fp32 sums in increasing-k-block
-      order, and base plus residual added once.
-    - Both also use the dispatch's accumulation order (expert ascending, then token, then route; FP16-rounded
+  - **m = 1:** byte-identical to today. A call whose chunks are all one token runs the same register code at the
+    same scratch offsets.
+    - Proven by the 24 frozen bare-forward outputs, the 48 full-stack outputs, the A/B dumps against BASE, and the
+      objdump check.
+  - **1 < m <= CHUNK_M:** byte-identical to the generic plan.
+    - Both keep exact per-row int32 block sums, one FMA scale per (k-block, quantized row), fp32 sums in
+      increasing-k-block order, and token plus residual added once.
+    - Both also keep the dispatch's accumulation order (expert ascending, then token, then route; FP16-rounded
       weights), which this plan does not touch.
     - Proven three ways:
       - the A/B dumps against BASE, where those cases ran the generic plan;
       - the swizzled layer, which the DSV4.1 plan refuses, so it runs the generic plan in the same process;
       - each token run alone.
-- **No new environment variables.** No change to `CHUNK_M`, `MAX_M`, the dispatch's grouping or the generic plan's
-  kernels.
-- **BASE** is the commit that ends Task 4. It has every counter and harness change and no kernel change. Record its
-  sha in Task 4's last step. Every A/B compares against it.
+  - **The generic plan at any `MAX_M`:** byte-identical to `MAX_M = 4`. Proven by the A/B dumps of a
+    `SGLANG_EXL3_CPU_MAX_M=8` build against BASE's on the scalar, avx2 and bw tiers.
+    - The VNNI and VBMI tiers compile at every `MAX_M` but cannot run on divix01 (Xeon Gold 6154, AVX-512BW only).
+- **Environment variables.**
+  - One new build-only variable, `SGLANG_EXL3_CPU_MAX_M` (Task 4b), defined in `Envs` beside
+    `SGLANG_EXL3_CPU_ACT_BLOCK`.
+  - Read the `env-var-conventions` skill before adding it (`.claude/rules/modify-component-must-read.md`).
+  - No change to the dispatch's grouping or its accumulation order.
+  - The default `MAX_M` stays 4 unless Task 5b's gate passes.
+- **BASE** is the commit that ends Task 4. It has every counter and harness change and no kernel change.
+  - Record its sha in Task 4's last step.
+  - Every A/B and every bit-exact comparison is made against BASE's dumps.
 
 ## Review Focus
 
-1. **A call that mixes one- and two-token chunks, in any order.** The compact scratch offsets are now a running row
-   sum. Expect bits equal to the generic plan's. Pinned by `mixed-sizes` and `three-tokens-one-expert` (Task 2's test,
-   flipped in Task 5) and AB case `(3, 1)` (Task 3).
-2. **One token routed twice to one expert.** This makes a chunk of two holding the same token twice; both rows are added
-   into its out row in route order. Expect the generic plan's bits. Pinned by `one-token-twice` (Task 2) and AB case
-   `(1, 2)` (Task 3). The draft counter counts it as a collision (Task 1's test, job 3).
-3. **A one-expert call of two tokens.** Here `nc == 1`, so `grouped` is passed as true while `wide` is false. The m = 2
-   path must ignore `grouped`. Pinned by `two-tokens-one-expert` (Task 2) and AB case `(2, 1)` (Task 3).
-4. **Tile-pair ranges that split a 128-output block across workers at odd team sizes.** The down phase's per-block
-   atomic transform now finishes two token rows. Expect bits independent of the team. Pinned by
-   `test_dsv41_plan_bits_do_not_depend_on_the_team` at 1, 3 and 16 threads (Task 2, plan check flipped in Task 5).
-5. **Two forwards with two-token chunks running at once on different core groups.** Each has its own thread-local
-   arena, which now grows by rows. Expect each group's output to equal the one-group output. Pinned by Task 5 Step 9:
-   `exl3_cpu_forward_ab.py dump --registration cores` over Task 3's routes.
+1. **A `MAX_M` raise that misses an index.**
+   - The failure: any array, stride or dispatch still sized for 4 rows.
+   - Expect a `SGLANG_EXL3_CPU_MAX_M=8` build to give BASE's bits on every tier divix01 runs, and the DSV4.1 plan to
+     take chunks of 1-4 with the generic plan's bits.
+   - Pinned by Task 4b Step 7 (A/B dumps at `MAX_M = 8` against BASE) and Task 5 Step 12 (the parity file at
+     `MAX_M = 8`). That file's `test_every_chunk_size_matches_the_generic_plan` loops `m = 1..CHUNK_M` read from the
+     build.
+   - The "Every use of MAX_M and CHUNK_M" audit lists each site.
+2. **Register spills at a higher M.**
+   - The failure: an M whose accumulators spill inside the k-tile loop. That is bit-correct but slow, and invisible
+     to every bit test.
+   - The `kRegisterBudget` static_assert (Task 5 Step 4) refuses any entry whose accumulators plus decode
+     temporaries exceed 32 zmm.
+   - Task 5 Step 14 counts the zmm stack accesses of every instantiated `register_band<…, M>` / `register_tiles<M>`
+     and gates them against BASE's M = 1 code.
+3. **Generic-plan drift at a raised `MAX_M`.**
+   - The failure: the generated tile tables, the row-index table or the VBMI band rule changing a bit at
+     `MAX_M = 8`.
+   - Pinned by Task 4b Step 7, which compares scalar, avx2 and bw against BASE at 72/72 each. It also includes
+     swizzled cases through `test_exl3_cpu_act_quant.py` (Task 4b Step 8).
+4. **Mixed chunk sizes, and one token routed twice.**
+   - The compact scratch offsets are a running row sum. A token routed twice to one expert fills one chunk with the
+     same token twice.
+   - Expect the generic plan's bits.
+   - Pinned by `mixed-sizes`, `three-tokens-one-expert`, `one-token-twice`, the generated `m{CHUNK_M+1}-overflow`
+     case (Tasks 2 and 5), and AB cases `(3, 1)` and `(1, 2)` (Task 3). The draft counter counts the second as a
+     collision (Task 1).
+5. **Odd team sizes and concurrent core groups.**
+   - Tile-pair ranges split a 128-output block across workers. The down phase's per-block atomic transform finishes
+     m rows. Each thread-local arena grows by rows.
+   - Expect bits independent of the team, and two groups at once equal to one.
+   - Pinned by `test_dsv41_plan_bits_do_not_depend_on_the_team` at 1, 3 and 16 threads, and by Task 5 Step 11
+     (`exl3_cpu_forward_ab.py dump --registration cores`).
 
 ---
 
-## What assumes m == 1, and what this plan does with each piece
+## What assumes one token per chunk, and what this plan does with each piece
 
-| Piece | Where | m == 1 assumption | Decision |
+| Piece | Where | Assumption today | Decision |
 |---|---|---|---|
-| `Dsv41Shape::accepts` | `shapes.hpp:42-50` | refuses any chunk with `m != 1` | **Generalise**: refuse only `m < 1 \|\| m > 2` (Task 5) |
-| Compact scratch sizing and offsets | `forward_plan.hpp:547-551, 570-574` | `nc * ACT_ROWS * H` int16, chunk `j` at `j * ACT_ROWS * H` | **Generalise**: running row offset (`ACT_ROWS * m` rows per chunk); all-one-token calls keep today's offsets (Task 5) |
-| Compact quantization `compact_quantize_block` | `math.hpp:543-556` | none: already lays out `m` rows (`block * ACT_ROWS * m * 128 + row * 128`, residual rows at `r + m`) | **Unchanged** |
+| `Dsv41Shape::accepts` | `shapes.hpp:42-50` | refuses any chunk with `m != 1` | **Generalise**: `1 <= m <= CHUNK_M` (Task 5) |
+| Compact scratch sizing and offsets | `forward_plan.hpp:547-551, 570-574` | `nc * ACT_ROWS * H` int16; chunk `j` at `j * ACT_ROWS * H` | **Generalise**: running row offset, `ACT_ROWS * m` rows per chunk. All-one-token calls keep today's offsets (Task 5) |
+| `compact_quantize_block` | `math.hpp:543-556` | none: lays out `m` rows (`block * ACT_ROWS * m * 128 + row * 128`, residual rows at `r + m`) | **Unchanged** |
 | `prepare_gu_blocks`, `middle_blocks` | `forward_plan.hpp:380-444` | none: loop `r < ch.m`, residual at `r + ch.m` | **Unchanged** |
-| `register_rows` / `register_band` | `math_avx512.hpp:929-1001` | two quantized rows (`i < 2`), k-block stride 256, stores row 0 = base + residual, row 1 = residual | **Generalise**: template `M` (default 1): `2 * M` rows, stride `2 * M * 128`, stores per token; at `M = 1` the same code (Task 5) |
-| `register_tiles` (compact, unswizzled) | `math_avx512.hpp:1106-1121` | called only at `m == 1` (`run_tiles` :201) | **Keep m == 1**. New `register_tiles_m2` for `m == 2`, compact and unswizzled only (Task 5) |
-| Grouped multi-band traversal `traversal_tiles` / `traversal_kblock` / `traversal_group` | `math_avx512.hpp:1003-1093` | hard-wired four bands × two rows (`IntegerAccum [4][2][2]`, 16 ZMM) | **Keep m == 1**. At m = 2 four bands would need 32 integer accumulators. `register_tiles_m2` ignores `grouped` |
-| Wide 512 quantization | `forward_plan.hpp:524`, `math.hpp:522-541` | `wide = m_total == 1 && nc == 1` | **Keep m == 1** (out of scope). It is numerically identical (exact max and int sums), so widening it is a perf-only follow-up |
-| Down phase, `kSplitTiles = 2` | `forward_plan.hpp:696-717` | none: `transform_owned_blocks` loops `ch.m` rows, and the block counter counts tiles, not rows | **Unchanged**; Review Focus 4 tests it |
+| `register_rows` / `register_band` | `math_avx512.hpp:912-1001` | two quantized rows (`i < 2`), k-block stride 256, stores row 0 = token + residual and row 1 = residual | **Generalise**: template `M`. `2 * M` rows, stride `2 * M * 128`, stores per token. At `M = 1` the same code (Task 5) |
+| `register_tiles` | `math_avx512.hpp:1106-1133` | one token (`run_tiles` :201) | **Generalise**: `register_tiles<M>`. `M = 1` keeps today's body (non-compact and swizzled callers, grouped traversal); `M > 1` takes compact, unswizzled tile pairs, `kRegisterBudget[M-1].pairs` per call (Task 5) |
+| `run_tiles` register gate | `forward_plan.hpp:199-206` | `m == 1` only | **Generalise**: `m == 1 \|\| in.compact`, dispatched to `register_tiles<1..CHUNK_M>` by a sequence generated from `CHUNK_M` (Task 5). Generic input never has `compact` set |
+| Grouped traversal (`traversal_tiles` / `_kblock` / `_group`) | `math_avx512.hpp:1003-1093` | four bands × two rows (`IntegerAccum [4][2][2]`, 16 zmm) | **One token only** (`kRegisterBudget[0].traversal`). Follow-up |
+| Wide 512 quantization | `forward_plan.hpp:524`, `math.hpp:522-541` | `wide = m_total == 1 && nc == 1` | **One token only**. Numerically identical, so widening it is a perf-only follow-up |
+| Down phase, `kSplitTiles = 2` | `forward_plan.hpp:696-717` | none: `transform_owned_blocks` loops `ch.m` rows; the counter counts tiles | **Unchanged**; Review Focus 5 |
 | Accumulate | `forward_plan.hpp:718-734` | none | **Unchanged** |
-| `run_tiles` gate | `forward_plan.hpp:199-206` | register path only at `m == 1` | **Add** `m == 2 && in.compact` → `register_tiles_m2` (Task 5). Generic input never has `compact` set |
 
-History (`git log -p --follow` on `forward_plan.hpp` and its predecessor `moe_mul1.cpp`): the m == 1 limit came with
-the imported "selected" kernels (`e5e5e8cec2`, 2026-10-01), measured and validated for one-token decode only. In
-`00bdf9d5e5^`, `single_expert_quant512` was "Compact scratch already guarantees the DSV4.1 shape, unswizzled 3-bit
-weights and one row per chunk". `00bdf9d5e5` turned that comment into `Dsv41Shape::accepts`. `58668eedfc` added
-`kSplitTiles = 2`. None of them records a correctness reason beyond the two-row register kernels.
+History (`git log -p --follow` on `forward_plan.hpp` and its predecessor `moe_mul1.cpp`):
+- The one-token limit came with the imported "selected" kernels (`e5e5e8cec2`, 2026-10-01), which were measured and
+  validated for one-token decode only.
+- `00bdf9d5e5^`'s `single_expert_quant512` said "Compact scratch already guarantees the DSV4.1 shape, unswizzled
+  3-bit weights and one row per chunk". `00bdf9d5e5` turned that into `Dsv41Shape::accepts`.
+- `58668eedfc` added `kSplitTiles = 2`.
+- None of them records a correctness reason beyond the two-row register kernels.
+
+## Every use of MAX_M and CHUNK_M (the audit; line numbers at `fbfb799`)
+
+After this plan, every entry derives from the single `MAX_M` (`EXL3_MOE_CPU_MAX_M`). The "fix" rows are the ones that
+are hard-coded today.
+
+| Site | File:line | Today | After |
+|---|---|---|---|
+| `MAX_M` | `math.hpp:46` | `constexpr int MAX_M = 4;` | **fix**: `= EXL3_MOE_CPU_MAX_M` (default 4; static_assert even, 2..8) (Task 4b) |
+| `ACT_ROWS`, `CHUNK_M` | `math.hpp:57-58` | derived | unchanged |
+| `PreparedIn::q`, `sum_x8` | `math.hpp:340-341` | `[MAX_M]`, one per quantized row | unchanged |
+| `PreparedIn::bq`, `bsum` | `math.hpp:342-344`; written `math.hpp:412, 551, 554`, `forward_plan.hpp:408, 438`; read `forward_plan.hpp:240-241`, `math_avx512.hpp:844-845, 982-984, 1045-1047` | `[k / B][MAX_M]`, index `b * MAX_M + row` | unchanged (row < `ACT_ROWS * m` <= `MAX_M`) |
+| `quantize_act` layout | `math.hpp:390-417` | `rows = ACT_ROWS * m`, block offset `b * rows * B` | unchanged |
+| `compact_quantize_block` | `math.hpp:544-556` | block offset `block * ACT_ROWS * m * 128` | unchanged |
+| `Chunk::token`, `weight` | `shapes.hpp:18-19` | `[MAX_M]`; holds <= `CHUNK_M` | unchanged; comment `shapes.hpp:4` says "up to MAX_M token rows", **fix** to CHUNK_M (Task 4b) |
+| Dispatch chunk cap | `forward_plan.hpp:790` | `ch.m < CHUNK_M` | unchanged |
+| Generic raw tile switches | `forward_plan.hpp:44, 85, 124` | `switch (mat.bits * 4 + m - 1)`: **4 rows hard-coded**, 32 cases per tier | **fix**: `kTiles<I>[bits - 1][rows - 1]`, generated from `MAX_M` (Task 4b) |
+| `run_tiles` rows and `part` | `forward_plan.hpp:212-261` | `rows = ACT_ROWS * m`, `part` sized `rows * n`, `sub_in.q[i] = bq[b * MAX_M + i]` | unchanged |
+| `run_tiles` register gate | `forward_plan.hpp:199-206` | `m == 1` | **fix**: dispatch sequence over `1..CHUNK_M` (Task 5) |
+| Down-input row index | `forward_plan.hpp:692` | `static const int idx4[MAX_M] = {0, 1, 2, 3};` (**4 hard-coded**) | **fix**: `kRowIndex`, `std::array<int, MAX_M>` 0..MAX_M-1 (Task 4b) |
+| Arena per-chunk strides | `forward_plan.hpp:536-569, 586-593` (`tin`, `splat`, `splat_dup`, `tout`, `bq`, `bsum`) | `j * MAX_M * {H, I_}`, `MAX_M * (k / 16)` | unchanged |
+| `tout` per-chunk strides | `forward_plan.hpp:388-389, 673, 687-688, 702, 725` | `j * MAX_M * {I_, H}` | unchanged (the register stores write rows < `2 * M` <= `MAX_M`) |
+| Compact arena | `forward_plan.hpp:547-551, 570-574` | `nc * ACT_ROWS * {H, I_}` (**one token hard-coded**) | **fix**: running rows (Task 5) |
+| Scalar tile accumulators | `math_scalar.hpp:27` | `float acc[MAX_M][16]` | unchanged |
+| AVX2 tile accumulators | `math_avx2.hpp:109, 138, 201` | `__m256i acc[MAX_M][2]`, runtime `m` | unchanged (16 ymm at `MAX_M = 8`: correct, may spill; Risks) |
+| AVX-512 band accumulators | `math_avx512.hpp:101, 165, 300, 394, 659, 709, 814` | `__m512i acc[band][MAX_M]`, `rows` a template parameter | unchanged |
+| AVX-512 band widths | `math_avx512.hpp:242-243` (vnni), `518-519` (bw), `778-779` (vbmi) | by `rows`; VBMI swizzled gives `rows > 4` four bands (**32 accumulators at rows 8**) | **fix**: VBMI swizzled `rows > 4` → 2 bands. Every rule keeps `rows * band <= 16` (Task 4b) |
+| `bw3_blocked_band` | `math_avx512.hpp:806-857` | `rows = 2` constant (the generic m == 1 odd-tile path) | unchanged |
+| Register kernels | `math_avx512.hpp:912-1001, 1106-1121` | two rows, stride 256 | **fix**: `M`, `kRegisterBudget` (Task 5) |
+| Traversal | `math_avx512.hpp:1006-1093` | `[4][2][2]` | unchanged; M = 1 only |
+| `Dsv41Shape::accepts` | `shapes.hpp:47-48` | `ch.m != 1` | **fix**: `1..CHUNK_M` (Task 5) |
+| Python | `test/…`, `exl3_cpu_forward_ab.py` | none | `chunk_m` op (Task 2); the parity tests read it |
+
+Out of scope: the vendored baseline kernel (`csrc/exl3/moe_mul1.cpp`), which has its own `MAX_M`.
+
+## How the plan checks register spills, per M
+
+- **At compile time.** `kRegisterBudget` (`math_avx512.hpp`, Task 5 Step 4) holds one entry per M.
+  - A `static_assert` over the whole table checks `4 * M * pairs + kRegisterDecodeZmm <= 32` for every entry. The
+    integer accumulators are `[pairs][2 halves][2 * M rows]`. `kRegisterDecodeZmm = 12` covers the decode
+    temporaries of `register_rows`: prev, a, b, c, state, sum, two products, the multiplier pair, ones, and the
+    broadcast pair.
+  - A second `static_assert` refuses a `CHUNK_M` with no entry.
+  - So M = 2 can have 1 or 2 pairs (3 would need 36), and M = 3 and 4 can have 1.
+- **In the binary.** Task 5 Step 14, and Task 5b Step 3 at `MAX_M = 8`.
+  - For each instantiated `register_band<P, 0, 0, true, M>` and `register_tiles<M>`, count the zmm loads and stores
+    against `%rsp`/`%rbp` in `objdump -d`, and report `-fstack-usage` frame sizes.
+  - The fp32 partial sums `sums[P][2][2M]` live across the k-block loop and may sit in memory by design (the
+    validated M = 1, P = 4 code already does that).
+  - The gate is per fp32 partial sum: (zmm stack accesses) / (4 · M · P summed over the instantiated P) must not
+    exceed BASE's ratio for M = 1 (`register_band<P, 0, 0, true>`, or `compact_pairs` where it is inlined) plus 1.
+  - An accumulator spill inside the k-tile loop breaks that ratio. A miss is reported, and the measured timings
+    decide.
 
 ## File map
 
@@ -176,19 +262,22 @@ weights and one row per chunk". `00bdf9d5e5` turned that comment into `Dsv41Shap
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h` | `draft_cpu_stats` returns 7 values | 1 |
 | `python/sglang/kernels/ops/moe/dspark_draft_cpu.py` | `stats()` keys | 1 |
 | `test/registered/unit/kernels/test_dspark_draft_cpu_thread.py` | collision test | 1 |
-| `python/sglang/kernels/jit/csrc/exl3/optimized/kernel.h`, `kernel.cpp`, `forward_plan.hpp`, `torch_ops.cpp` | plan counters and op | 2 |
-| `test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py` (new) | parity and plan tests | 2, 5 |
+| `python/sglang/kernels/jit/csrc/exl3/optimized/kernel.h`, `kernel.cpp`, `forward_plan.hpp`, `torch_ops.cpp` | plan counters, `chunk_m` | 2 |
+| `test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py` (new) | parity, plan and chunk-size tests | 2, 5, 5b |
 | `test/manual/dsv41/run_exl3_cpu_forward_checks.sh` | runs the new test | 2 |
 | `test/manual/dsv41/exl3_cpu_forward_ab.py` | more routes | 3, 5 |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/bench/src/cpu_forward.cpp`, `bench/ab.sh` (new), `bench/README.txt` | routed workloads, A/B driver | 4 |
-| `python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp`, `forward_plan.hpp`, `shapes.hpp`, `README.txt` | the kernel change | 5 |
-| `DSV41_REFERENCE.md` | results | 7 |
+| `python/sglang/kernels/jit/csrc/exl3/optimized/math.hpp`, `forward_plan.hpp`, `math_avx512.hpp`, `shapes.hpp` | `MAX_M` override, generated tile tables, row index, VBMI band rule | 4b |
+| `python/sglang/srt/environ.py`, `python/sglang/srt/layers/quantization/exl3/ext.py`, `test/registered/unit/layers/quantization/test_exl3_ext.py`, `bench/CMakeLists.txt` | `SGLANG_EXL3_CPU_MAX_M` → define and flavor; bench `EXL3_MAX_M` | 4b |
+| `python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp`, `forward_plan.hpp`, `shapes.hpp`, `README.txt` | register kernels in M, budget table, dispatch, scratch, `accepts` | 5 |
+| `python/sglang/kernels/jit/csrc/exl3/optimized/math.hpp` | default `MAX_M` 8 (only if 5b's gate passes) | 5b |
+| `DSV41_REFERENCE.md` | §33.10 | 7 |
 
 ---
 
 ### Task 1: The draft CPU thread counts jobs whose routes share a slot
 
-The measurement to take before (or alongside) the kernel work: how often a real draft call has a chunk of two.
+The measurement to take before (or alongside) the kernel work: how often a real draft call has a chunk of more than one token.
 
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/draft_cpu_thread.h` (`serve` :175-222, getters :116-127, members :267)
@@ -210,8 +299,8 @@ The measurement to take before (or alongside) the kernel work: how often a real 
 
 ```python
 def test_stats_count_the_jobs_whose_routes_share_a_slot(request):
-    """The EXL3 kernel groups a call's live routes by slot (two tokens per chunk), so a job whose routes name one slot
-    twice runs a chunk of two: collided_jobs counts those jobs, shared_routes the routes past each slot's first, and
+    """The EXL3 kernel groups a call's live routes by slot (up to CHUNK_M tokens per chunk), so a job whose routes name
+    one slot twice runs a chunk of several tokens: collided_jobs counts those jobs, shared_routes the routes past each slot's first, and
     collided_forward_ns their forward time. -1 is not a route."""
     areas, host = _host(request, ns_per_expert=1000)
     k = 3
@@ -250,7 +339,7 @@ Expected: `1 failed` with `KeyError: 'collided_jobs'`, and `EXIT=1`.
   1. Add `#include <algorithm>` to the includes, in sorted position before `<atomic>`.
   2. After `holds()` (:125-127), add:
   ```cpp
-  /// Jobs whose live routes name one slot more than once: the EXL3 kernel runs each with a chunk of two tokens.
+  /// Jobs whose live routes name one slot more than once: the EXL3 kernel runs each with a chunk of several tokens.
   int64_t collided_jobs() const {
     return collided_jobs_.load(std::memory_order_relaxed);
   }
@@ -355,7 +444,7 @@ JIT), then rerun.
 
 ---
 
-### Task 2: The kernel counts the forwards each plan took; the parity test
+### Task 2: The kernel counts the forwards each plan took and reports CHUNK_M; the parity test
 
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/kernel.h`
@@ -368,11 +457,17 @@ JIT), then rerun.
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `struct SglangExl3CpuPlanCalls { int64_t dsv41; int64_t generic; };` in `kernel.h`.
-  - `sglang::exl3_cpu::exl3_cpu_plan_calls()`, hidden visibility, returning `SglangExl3CpuPlanCalls`.
-  - The torch op `sglang_exl3_cpu::plan_calls() -> int[]`, returning `[dsv41, generic]`.
-  - In the test file: `_expected_plan(routes) -> str` (`"dsv41"` or `"generic"`). Task 5 changes exactly this
-    function.
+  - In `kernel.h`:
+    - `struct SglangExl3CpuPlanCalls { int64_t dsv41; int64_t generic; };`;
+    - `sglang::exl3_cpu::exl3_cpu_plan_calls()` (hidden), returning it;
+    - `int32_t sglang::exl3_cpu::exl3_cpu_chunk_m()` (hidden), returning the build's `CHUNK_M`.
+  - Torch ops:
+    - `sglang_exl3_cpu::plan_calls() -> int[]`, returning `[dsv41, generic]`;
+    - `sglang_exl3_cpu::chunk_m() -> int`.
+  - In the test file:
+    - `_expected_plan(routes) -> str` (`"dsv41"` or `"generic"`), which Task 5 changes;
+    - `DEFAULT_CHUNK_M = 2`, which Task 5b changes only if its gate passes;
+    - `_chunk_m()`, read by every chunk-size case.
 
 - [ ] **Step 0: Set up the divix01 environment, once.**
   1. Create `/data/models/slang/nvfp4-work/cpu-plan-m2/env.sh` with the KENV content from Global Constraints.
@@ -388,12 +483,14 @@ JIT), then rerun.
 ```python
 """The EXL3 CPU kernel's DSV4.1 plan on calls whose routes share an expert (csrc/exl3/optimized/forward_plan.hpp).
 
-Exl3Quant::dispatch groups a call's routes by expert into chunks of up to CHUNK_M (2 in this build) tokens. Each case
-runs one call on a DeepSeek V4.1-shaped layer:
+Exl3Quant::dispatch groups a call's routes by expert into chunks of up to CHUNK_M tokens (sglang_exl3_cpu::chunk_m:
+MAX_M / 2, so 2 by default and 4 in a SGLANG_EXL3_CPU_MAX_M=8 build). Each case runs one call on a DeepSeek
+V4.1-shaped layer:
   - unswizzled (native), which Dsv41Shape::accepts may take on AVX-512BW;
   - swizzled, which it always refuses, so it runs the generic plan;
   - token by token, through the native layer.
-The three must agree bit for bit. The plan counter (sglang_exl3_cpu::plan_calls) shows which plan each call took.
+The three must agree bit for bit. The plan counter (sglang_exl3_cpu::plan_calls) shows which plan each call took. The
+chunk-size cases are generated from the build's CHUNK_M, so a larger MAX_M widens them with no edit here.
 
 Needs SGLANG_EXL3_SRC, SGLANG_DSV41_CPU_EXPERTS=1 and the bw tier (EXL3_MOE_CPU_MAX_ISA=bw on a host above it). Run on
 divix01 under taskset -c 0-63.
@@ -407,6 +504,7 @@ import torch
 pytestmark = pytest.mark.skipif(not os.environ.get("SGLANG_EXL3_SRC"), reason="needs SGLANG_EXL3_SRC")
 
 H, I, CAP, LIMIT, THREADS = 5120, 2304, 12, 10.0, 4
+DEFAULT_CHUNK_M = 2  # CHUNK_M at the source's default MAX_M (math.hpp's EXL3_MOE_CPU_MAX_M)
 
 
 def _swizzle(t):
@@ -440,7 +538,7 @@ def _random_routes(seed, rows, k):
     return [torch.randperm(CAP, generator=g)[:k].tolist() for _ in range(rows)]
 
 
-# (name, routes [rows][k]; -1 is no route). The comment gives the chunks dispatch makes, in expert order.
+# (name, routes [rows][k]; -1 is no route). The comment gives the chunks dispatch makes at CHUNK_M = 2, in expert order.
 CASES = [
     ("one-token", [[4, 0, 5]]),  # 1, 1, 1
     ("two-tokens-one-expert", [[3], [3]]),  # 2: a single-expert call (grouped on, wide off)
@@ -466,6 +564,10 @@ def _shares_an_expert(routes):
 def _expected_plan(routes):
     """The plan a call on the native layer takes: the DSV4.1 plan unless two of its routes share an expert."""
     return "generic" if _shares_an_expert(routes) else "dsv41"
+
+
+def _chunk_m():
+    return int(torch.ops.sglang_exl3_cpu.chunk_m())
 
 
 def _inputs(name, routes):
@@ -517,18 +619,39 @@ def _forward(layer, x, slots, weights, threads=THREADS):
     return out, "dsv41" if step == (1, 0) else "generic"
 
 
-@pytest.mark.parametrize("name,routes", CASES, ids=[c[0] for c in CASES])
-def test_dsv41_plan_matches_the_generic_plan_and_one_token_runs(layers, name, routes):
+def _check(layers, name, routes):
+    """One call on both layers and token by token: the same bits everywhere, and the plan _expected_plan names."""
     x, slots, weights = _inputs(name, routes)
     got, plan = _forward(layers["native"], x, slots, weights)
     want, generic = _forward(layers["swizzled"], x, slots, weights)
-    assert (plan, generic) == (_expected_plan(routes), "generic")
-    assert torch.isfinite(got).all()
-    assert torch.equal(got, want)
+    assert (plan, generic) == (_expected_plan(routes), "generic"), name
+    assert torch.isfinite(got).all(), name
+    assert torch.equal(got, want), name
     singles = torch.cat(
         [_forward(layers["native"], x[t : t + 1], slots[t : t + 1], weights[t : t + 1])[0] for t in range(len(routes))]
     )
-    assert torch.equal(got, singles)
+    assert torch.equal(got, singles), name
+
+
+def test_the_build_reports_its_chunk_size(layers):
+    """CHUNK_M is half of MAX_M: SGLANG_EXL3_CPU_MAX_M's half when the build sets it, else the source default's."""
+    max_m = int(os.environ.get("SGLANG_EXL3_CPU_MAX_M") or 0)
+    assert _chunk_m() == (max_m // 2 if max_m else DEFAULT_CHUNK_M)
+
+
+@pytest.mark.parametrize("name,routes", CASES, ids=[c[0] for c in CASES])
+def test_dsv41_plan_matches_the_generic_plan_and_one_token_runs(layers, name, routes):
+    _check(layers, name, routes)
+
+
+def test_every_chunk_size_matches_the_generic_plan(layers):
+    """For m = 1..CHUNK_M, read from the build: m tokens on one expert and m tokens sharing three experts (chunks of
+    exactly m), then CHUNK_M + 1 tokens on one expert (a full chunk, then a chunk of one)."""
+    chunk_m = _chunk_m()
+    for m in range(1, chunk_m + 1):
+        _check(layers, f"m{m}-one-expert", [[3]] * m)
+        _check(layers, f"m{m}-three-experts", [[4, 0, 5]] * m)
+    _check(layers, f"m{chunk_m + 1}-overflow", [[2]] * (chunk_m + 1))
 
 
 @pytest.mark.parametrize("threads", [1, 3, 16])
@@ -545,7 +668,7 @@ def test_dsv41_plan_bits_do_not_depend_on_the_team(layers, threads):
 
 ```bash
 git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 add test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py
-git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "test(exl3-cpu): the DSV4.1 plan against the generic plan and one-token runs, with the plan each call took (failing)"
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "test(exl3-cpu): the DSV4.1 plan against the generic plan and one-token runs, at every chunk size (failing)"
 ```
 Then run:
 ```bash
@@ -553,56 +676,65 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/wt-cpu-plan-m2 && source /data/mod
   && PYTHONPATH=$PWD/python taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
   test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py -q -p no:randomly 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"'
 ```
-Expected: `15 failed`, each on a missing `plan_calls` op (`AttributeError`/`RuntimeError` naming
-`sglang_exl3_cpu.plan_calls`), and `EXIT=1`.
+Expected: `17 failed`, and `EXIT=1`. The 17 are 1 chunk-size test, 12 cases, 1 every-chunk-size test and 3 team
+sizes. Each fails on a missing op: an `AttributeError` or `RuntimeError` naming `sglang_exl3_cpu.plan_calls` or
+`sglang_exl3_cpu.chunk_m`.
 
-- [ ] **Step 3: Add the counters.**
+- [ ] **Step 3: Add the counters and `chunk_m`.**
 
-  1. In `kernel.h`, after `struct SglangExl3CpuParams { ... };`:
-  ```cpp
-  // Forwards since load by the plan they took (forward_plan.hpp's run_plan): dsv41, ForwardPlan<Dsv41Shape, Bw>;
-  // generic, ForwardPlan<GenericShape, *>. Read by tests and benches to see which plan a call took.
-  struct SglangExl3CpuPlanCalls {
-      int64_t dsv41;
-      int64_t generic;
-  };
-  ```
-  2. Inside `namespace sglang::exl3_cpu { ... }`, after `exl3_cpu_kernel()`:
-  ```cpp
-  __attribute__((visibility("hidden"))) SglangExl3CpuPlanCalls exl3_cpu_plan_calls();
-  ```
-  3. In `forward_plan.hpp`, just above `run_plan` (:738):
-  ```cpp
-  // Forwards by plan since load: [0] the DSV4.1 plan, [1] the generic plan. Relaxed: counts only, read through
-  // exl3_cpu_plan_calls (kernel.cpp, the one file that includes this header).
-  std::atomic<int64_t> g_plan_calls[2];
-  ```
-  4. In `run_plan`, put `g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);` as the first statement inside the
-     `if (isa == Isa::Bw && Dsv41Shape::accepts(...))` block. Put
-     `g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);` right after that block, before
+1. In `kernel.h`, after `struct SglangExl3CpuParams { ... };`:
+```cpp
+// Forwards since load by the plan they took (forward_plan.hpp's run_plan): dsv41, ForwardPlan<Dsv41Shape, Bw>;
+// generic, ForwardPlan<GenericShape, *>. Read by tests and benches to see which plan a call took.
+struct SglangExl3CpuPlanCalls {
+    int64_t dsv41;
+    int64_t generic;
+};
+```
+2. Inside `namespace sglang::exl3_cpu { ... }`, after `exl3_cpu_kernel()`:
+```cpp
+__attribute__((visibility("hidden"))) SglangExl3CpuPlanCalls exl3_cpu_plan_calls();
+// The most tokens a chunk holds in this build (math.hpp's CHUNK_M = MAX_M / ACT_ROWS).
+__attribute__((visibility("hidden"))) int32_t exl3_cpu_chunk_m();
+```
+3. In `forward_plan.hpp`, just above `run_plan` (:738):
+```cpp
+// Forwards by plan since load: [0] the DSV4.1 plan, [1] the generic plan. Relaxed: counts only, read through
+// exl3_cpu_plan_calls (kernel.cpp, the one file that includes this header).
+std::atomic<int64_t> g_plan_calls[2];
+```
+4. In `run_plan`:
+   - Put `g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);` as the first statement inside the
+     `if (isa == Isa::Bw && Dsv41Shape::accepts(...))` block.
+   - Put `g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);` right after that block, before
      `const Experts<GenericShape> E{&l, p};`.
-  5. In `kernel.cpp`, inside `namespace sglang::exl3_cpu`, after `exl3_cpu_kernel()`:
-  ```cpp
-  SglangExl3CpuPlanCalls exl3_cpu_plan_calls()
-  {
-      return {g_plan_calls[0].load(std::memory_order_relaxed), g_plan_calls[1].load(std::memory_order_relaxed)};
-  }
-  ```
-  6. In `torch_ops.cpp`:
-     - Add `#include <vector>`.
-     - Inside the anonymous namespace:
-       ```cpp
-       std::vector<int64_t> plan_calls()
-       {
-           const SglangExl3CpuPlanCalls c = ::sglang::exl3_cpu::exl3_cpu_plan_calls();
-           return {c.dsv41, c.generic};
-       }
-       ```
-     - In `TORCH_LIBRARY`: `m.def("plan_calls() -> int[]", &plan_calls);`.
-     - Extend the header comment's first sentence with: ", and sglang_exl3_cpu::plan_calls, the forwards each plan
-       took ([dsv41, generic])".
-  7. In `run_exl3_cpu_forward_checks.sh`, add `test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py` to the
-     final `step pytest` line's file list.
+5. In `kernel.cpp`, inside `namespace sglang::exl3_cpu`, after `exl3_cpu_kernel()`:
+```cpp
+SglangExl3CpuPlanCalls exl3_cpu_plan_calls()
+{
+    return {g_plan_calls[0].load(std::memory_order_relaxed), g_plan_calls[1].load(std::memory_order_relaxed)};
+}
+
+int32_t exl3_cpu_chunk_m() { return CHUNK_M; }
+```
+6. In `torch_ops.cpp`:
+   - Add `#include <vector>`.
+   - Inside the anonymous namespace:
+```cpp
+std::vector<int64_t> plan_calls()
+{
+    const SglangExl3CpuPlanCalls c = ::sglang::exl3_cpu::exl3_cpu_plan_calls();
+    return {c.dsv41, c.generic};
+}
+
+int64_t chunk_m() { return ::sglang::exl3_cpu::exl3_cpu_chunk_m(); }
+```
+   - In `TORCH_LIBRARY`, add `m.def("plan_calls() -> int[]", &plan_calls);` and
+     `m.def("chunk_m() -> int", &chunk_m);`.
+   - Extend the header comment's first sentence with ", sglang_exl3_cpu::plan_calls, the forwards each plan took
+     ([dsv41, generic]), and sglang_exl3_cpu::chunk_m, the build's CHUNK_M".
+7. In `run_exl3_cpu_forward_checks.sh`, add `test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py` to the
+   final `step pytest` line's file list.
 
 - [ ] **Step 4: Commit, push, SYNC, and run.** The extension rebuilds cold.
 
@@ -610,18 +742,19 @@ Expected: `15 failed`, each on a missing `plan_calls` op (`AttributeError`/`Runt
 git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 add python/sglang/kernels/jit/csrc/exl3/optimized/kernel.h \
   python/sglang/kernels/jit/csrc/exl3/optimized/kernel.cpp python/sglang/kernels/jit/csrc/exl3/optimized/forward_plan.hpp \
   python/sglang/kernels/jit/csrc/exl3/optimized/torch_ops.cpp test/manual/dsv41/run_exl3_cpu_forward_checks.sh
-git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "feat(exl3-cpu): the kernel counts the forwards each plan took (sglang_exl3_cpu::plan_calls)"
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "feat(exl3-cpu): the kernel counts the forwards each plan took and reports CHUNK_M (sglang_exl3_cpu::plan_calls, chunk_m)"
 ```
 Then run the same command as Step 2.
 
-Expected: `15 passed`, `EXIT=0`. Today a call whose routes share an expert runs the generic plan on both layers, so
-"generic" is expected there. Generic output already equals the one-token DSV4.1 runs bitwise (as
-`test_exl3_cpu_act_quant.py::test_batch_matches_single_token_runs` pins). If `one-token` reports `generic`, the tier
-is not bw: check `EXL3_MOE_CPU_MAX_ISA`.
+Expected: `17 passed`, `EXIT=0`.
+- Today a call whose routes share an expert runs the generic plan on both layers, so "generic" is expected there.
+- Generic output already equals the one-token DSV4.1 runs bitwise, as
+  `test_exl3_cpu_act_quant.py::test_batch_matches_single_token_runs` pins.
+- If `one-token` reports `generic`, the tier is not bw: check `EXL3_MOE_CPU_MAX_ISA`.
 
 ---
 
-### Task 3: The A/B harness covers two-token chunks
+### Task 3: The A/B harness covers multi-token chunks
 
 The A/B dumps of `exl3_cpu_forward_ab.py` at BASE ran the generic plan for these cases. The same dumps at the head
 run the DSV4.1 plan. The cases must exist before BASE, or the two dumps hold different case sets.
@@ -637,10 +770,10 @@ run the DSV4.1 plan. The cases must exist before BASE, or the two dumps hold dif
 - [ ] **Step 1: Replace `ROUTES` and its comment:**
 
 ```python
-# (tokens, experts per token) -> routes. Two tokens on one expert make a chunk of two (CHUNK_M): (2, 3) shares experts
-# 0 and 4; (2, 1) is one expert's chunk of two; (3, 1) one expert's chunks of two and one; (1, 2) routes one token
-# twice to expert 1; (6, 3) and (16, 3) mix both sizes, as a DSpark draft call does. The DSV4.1 plan refuses chunks of
-# two: at the DSV4.1 shape those cases run the generic plan.
+# (tokens, experts per token) -> routes. Tokens sharing an expert make chunks of up to CHUNK_M tokens: (2, 3) shares
+# experts 0 and 4; (2, 1) is one expert's chunk of two; (3, 1) one expert's three tokens; (1, 2) routes one token twice
+# to expert 1; (6, 3) and (16, 3) mix chunk sizes, as a DSpark draft call does ((16, 3) fills chunks of 4 at MAX_M 8).
+# The DSV4.1 plan refuses chunks of more than one token: at the DSV4.1 shape those cases run the generic plan.
 ROUTES = {
     (1, 1): [[2]],
     (1, 3): [[4, 0, 5]],
@@ -684,10 +817,13 @@ Expected:
 
 **Interfaces:**
 - Consumes:
-  - `SglangExl3CpuPlanCalls` and `sglang::exl3_cpu::exl3_cpu_plan_calls()` (Task 2, `kernel.h`).
+  - `SglangExl3CpuPlanCalls`, `sglang::exl3_cpu::exl3_cpu_plan_calls()` and `sglang::exl3_cpu::exl3_cpu_chunk_m()`
+    (Task 2, `kernel.h`).
 - Produces:
-  - Flags `--routed=M:k:pattern[,...]`, with pattern one of `distinct`, `pairs` or `random`; `--routed-slots=N`
-    (default 48); and `--routed-layers=N` (default 2).
+  - Flags `--routed=M:k:pattern[,...]`, with pattern `shared<G>` (tokens in groups of G share all k slots, so every
+    chunk holds min(G, CHUNK_M) tokens; `shared1` shares nothing) or `random`; `--routed-slots=N` (default 48); and
+    `--routed-layers=N` (default 2).
+  - Benchmark context `chunk_m`: the build's CHUNK_M.
   - Benchmarks named `optimized/rows:M/k:K/PATTERN`.
   - Counters `dsv41_calls` and `generic_calls` on every optimized benchmark.
   - `bash ab.sh BASE_BUILD HEAD_BUILD NEW_RESULTS_DIR [flags]`, which writes `summary.tsv`.
@@ -703,10 +839,10 @@ taskset -c 0-63 cmake -S python/sglang/kernels/jit/csrc/moe/expert_stream/bench 
   -DFETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK=/data/models/slang/nvfp4-work/cpubench-build/_deps/google_benchmark-src > /dev/null
 taskset -c 0-63 cmake --build $W/bench-head -j16 --target exl3_cpu_optimized 2>&1 | tail -1
 export EXL3_MOE_CPU_MAX_ISA=bw OMP_WAIT_POLICY=ACTIVE GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE OMP_THREAD_LIMIT=16
-$W/bench-head/exl3_cpu_optimized --validate-only --routed=2:3:pairs; echo "EXIT=$?"
+$W/bench-head/exl3_cpu_optimized --validate-only --routed=2:3:shared2; echo "EXIT=$?"
 EOF
 ```
-Expected: Google Benchmark reports `unrecognized command-line flag: --routed=2:3:pairs`, and `EXIT=1`.
+Expected: Google Benchmark reports `unrecognized command-line flag: --routed=2:3:shared2`, and `EXIT=1`.
 
 - [ ] **Step 2: Implement routed workloads in `cpu_forward.cpp`.**
 
@@ -730,7 +866,7 @@ Expected: Google Benchmark reports `unrecognized command-line flag: --routed=2:3
       opt.routed_layers = number(value("--routed-layers="));
   ```
      Then append to the `--help` text:
-     `"--routed=M:k:distinct|pairs|random,... --routed-slots=48 --routed-layers=2 (optimized build)\n"`.
+     `"--routed=M:k:shared<G>|random,... --routed-slots=48 --routed-layers=2 (optimized build)\n"`.
   4. **`SlabLayer`.** Fill `slots` slots, slot `s` holding fixture expert `s % experts`. The existing workloads pass
      `slots <= 5`, so they copy exactly what they copied before:
   ```cpp
@@ -757,8 +893,8 @@ Expected: Google Benchmark reports `unrecognized command-line flag: --routed=2:3
   using RoutedLayers = std::vector<std::unique_ptr<SlabLayer>>;
 
   // One --routed=M:k:pattern workload: M token rows of k routes each, rotating over the routed layers. Token t's input
-  // is its layer's fixture input rotated by 641 * t elements. Patterns: distinct (no slot shared: every chunk holds one
-  // token), pairs (tokens 2i and 2i + 1 share all k slots: every chunk holds two), random (each token k distinct slots,
+  // is its layer's fixture input rotated by 641 * t elements. Patterns: shared<G> (tokens in groups of G share all k
+  // slots, so every chunk holds min(G, CHUNK_M) tokens; shared1 shares nothing), random (each token k distinct slots,
   // seeded). No frozen reference: validate checks the outputs are finite and that a second run repeats them bit for bit.
   struct RoutedWorkload {
     const Fixture& fixture;
@@ -780,9 +916,13 @@ Expected: Google Benchmark reports `unrecognized command-line flag: --routed=2:3
       rows = number(m);
       k = number(kk);
       const int capacity = opt.routed_slots;
-      if (pattern != "distinct" && pattern != "pairs" && pattern != "random")
+      int group = 0;  // shared<G>: G; random: 0
+      if (pattern.starts_with("shared"))
+        group = number(pattern.substr(6));
+      else if (pattern != "random")
         throw std::runtime_error("Unknown routed pattern: " + pattern);
-      const int needed = pattern == "distinct" ? rows * k : pattern == "pairs" ? (rows + 1) / 2 * k : k;
+      if (pattern.starts_with("shared") && group < 1) throw std::runtime_error("shared<G> needs G >= 1: " + spec);
+      const int needed = group ? (rows + group - 1) / group * k : k;
       if (rows < 1 || k < 1 || needed > capacity)
         throw std::runtime_error(spec + " needs " + std::to_string(needed) + " slots of " + std::to_string(capacity));
       std::mt19937 rng(20261006u + 1000u * rows + k);
@@ -791,10 +931,8 @@ Expected: Google Benchmark reports `unrecognized command-line flag: --routed=2:3
         std::iota(pool.begin(), pool.end(), 0);
         for (int j = 0; j < k; ++j) {
           int32_t slot;
-          if (pattern == "distinct")
-            slot = t * k + j;
-          else if (pattern == "pairs")
-            slot = t / 2 * k + j;
+          if (group)
+            slot = t / group * k + j;
           else {
             std::swap(pool[j], pool[j + rng() % (capacity - j)]);
             slot = pool[j];
@@ -887,7 +1025,13 @@ Expected: Google Benchmark reports `unrecognized command-line flag: --routed=2:3
       if (!options.routed.empty()) throw std::runtime_error("--routed runs on the optimized build only");
   #endif
   ```
-     Then, in the registration block, after the `workloads` loop:
+     Then, in the registration block, after `benchmark::AddCustomContext("compiler", __VERSION__);`, and again after the
+     `workloads` loop:
+  ```cpp
+  #ifndef EXL3_BENCH_BASELINE
+        benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::exl3_cpu_chunk_m()));
+  #endif
+  ```
   ```cpp
   #ifndef EXL3_BENCH_BASELINE
         for (auto& workload : routed) {
@@ -979,12 +1123,13 @@ Make it executable: `chmod +x python/sglang/kernels/jit/csrc/moe/expert_stream/b
 Routed workloads and A/B
 ------------------------
 The optimized build also runs M-row calls, as the DSpark draft's CPU thread does:
-  --routed=M:k:pattern[,...]  pattern distinct (no slot shared), pairs (tokens 2i, 2i+1 share all k slots) or random
+  --routed=M:k:pattern[,...]  pattern shared<G> (tokens in groups of G share all k slots; shared1 shares none) or
+                              random (each token k distinct slots, seeded)
   --routed-slots=48           slab slots per routed layer; slot s holds fixture expert s % 5
   --routed-layers=2           fixture layers the routed workloads rotate over (shared by all of them)
 Token t's input is the layer's fixture input rotated by 641 * t elements. There is no frozen reference: validation
 checks the outputs are finite and repeat bit for bit. Every optimized benchmark reports dsv41_calls and generic_calls,
-the forwards each plan ran (exl3_cpu_plan_calls).
+the forwards each plan ran (exl3_cpu_plan_calls), and the context records the build's chunk_m (exl3_cpu_chunk_m).
 
 ab.sh BASE_BUILD HEAD_BUILD NEW_RESULTS_DIR [flags] runs two optimized builds as alternating processes for
 EXL3_BENCH_ROUNDS rounds (default 8) and writes summary.tsv (median p50 per build, head/base, the plan each ran).
@@ -999,11 +1144,11 @@ git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "feat
 Then run Step 1's command again, replacing its last line with:
 ```bash
 $W/bench-head/exl3_cpu_optimized --validate-only \
-  --routed=2:3:pairs,16:3:pairs,16:3:distinct,6:3:random,16:3:random,64:6:random; echo "EXIT=$?"
+  --routed=2:3:shared2,16:3:shared2,16:3:shared4,16:3:shared1,6:3:random,16:3:random,64:6:random; echo "EXIT=$?"
 ```
 Expected on stderr:
 - `Verified 24 bit-exact layer outputs; ...`
-- `Verified 6 routed workloads repeat bit for bit`
+- `Verified 7 routed workloads repeat bit for bit`
 - `EXIT=0`
 
 - [ ] **Step 6: Record BASE.** Run
@@ -1016,37 +1161,344 @@ ssh divix01 'git -C /data/models/slang/sglang worktree add --detach /data/models
 
 ---
 
-### Task 5: The DSV4.1 plan takes chunks of two tokens
+### Task 4b: MAX_M is one build-time constant; the generic plan is the same at any MAX_M
+
+This task makes every `MAX_M` use derive from one overridable constant. The DSV4.1 plan still takes one-token chunks
+only (Task 5 widens it), so at `MAX_M = 8` every shared-expert call runs the generic plan with chunks of up to four.
+That is exactly the generic-drift test.
+
+**Files:**
+- Modify: `python/sglang/srt/environ.py:1283-1284` (beside `SGLANG_EXL3_CPU_ACT_BLOCK`)
+- Modify: `python/sglang/srt/layers/quantization/exl3/ext.py:66-101` (`cpu_act_defines`, `build_flavor`)
+- Test: `test/registered/unit/layers/quantization/test_exl3_ext.py` (`_cpu_experts_defines` :56-67, new tests)
+- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/bench/CMakeLists.txt` (`EXL3_MAX_M`)
+- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/math.hpp:46`
+- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/forward_plan.hpp:38-189` (`run_tiles_raw`), `:692-693` (`idx4`)
+- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp:771-779` (the VBMI band rule)
+- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/shapes.hpp:1-4` (comment)
+
+**Interfaces:**
+- Consumes: BASE (Task 4); `exl3_cpu_forward_ab.py`'s routes (Task 3); `chunk_m` (Task 2).
+- Produces:
+  - `EXL3_MOE_CPU_MAX_M` (C++ macro, default 4) and `constexpr int MAX_M`.
+  - `SGLANG_EXL3_CPU_MAX_M`: an `EnvInt`, 0 for the default, else even in [2, 8], with the optimized kernel only. It
+    adds the define `-DEXL3_MOE_CPU_MAX_M=N` and the flavor `_resid_b128_mN_cpu_v1`.
+  - The bench's CMake cache variable `EXL3_MAX_M` (empty means the source default).
+  - `kTiles<I>[bits - 1][rows - 1]` and `kRowIndex` (`forward_plan.hpp`).
+
+- [ ] **Step 1: Read the `env-var-conventions` skill** (`.claude/skills/env-var-conventions/SKILL.md`), as
+  `.claude/rules/modify-component-must-read.md` requires before adding an `SGLANG_*` variable.
+
+- [ ] **Step 2: Write the failing tests.** In `test/registered/unit/layers/quantization/test_exl3_ext.py`:
+
+  1. In `_cpu_experts_defines`, change the name tuple to
+     `("SGLANG_EXL3_CPU_ACT_RESIDUAL", "SGLANG_EXL3_CPU_ACT_BLOCK", "SGLANG_EXL3_CPU_MAX_M")`. A `MAX_M` in the
+     caller's environment then cannot leak into the existing cases.
+  2. After `test_cpu_experts_refuse_another_accuracy_flavor`, add:
+```python
+def test_cpu_max_m_maps_to_a_define_and_its_own_flavor():
+    defines = _cpu_experts_defines(SGLANG_EXL3_CPU_MAX_M=8)
+    assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128", "-DEXL3_MOE_CPU_MAX_M=8"]
+    assert exl3_ext.optimized_cpu(defines) and exl3_ext.build_flavor(defines) == "_resid_b128_m8_cpu_v1"
+
+
+@pytest.mark.parametrize("max_m", [1, 3, 10, -2])
+def test_cpu_max_m_must_be_even_in_2_to_8(max_m):
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_MAX_M"):
+        _cpu_experts_defines(SGLANG_EXL3_CPU_MAX_M=max_m)
+
+
+def test_cpu_max_m_needs_the_optimized_kernel():
+    """The vendored kernel (moe_mul1.cpp) keeps its own MAX_M: setting the variable without CPU experts is refused."""
+    with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(False), exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M.override(8):
+        with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_MAX_M"):
+            exl3_ext.cpu_act_defines()
+```
+
+- [ ] **Step 3: Commit, push, SYNC, and run them to see them fail.**
+
+```bash
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 add test/registered/unit/layers/quantization/test_exl3_ext.py
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "test(exl3-ext): SGLANG_EXL3_CPU_MAX_M sizes the optimized CPU kernel in its own build (failing)"
+```
+Then run:
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-cpu-plan-m2 && PYTHONPATH=$PWD/python OMP_NUM_THREADS=8 taskset -c 0-63 \
+  /data/models/slang/.venv/bin/python -m pytest test/registered/unit/layers/quantization/test_exl3_ext.py -q -p no:randomly \
+  -k max_m 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"'
+```
+Expected: `6 failed` (an `AttributeError` naming `SGLANG_EXL3_CPU_MAX_M` on `envs`), and `EXIT=1`.
+
+- [ ] **Step 4: Add the variable and the bench option.**
+
+1. In `environ.py`, after `SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)`:
+```python
+    # Build-time: the optimized EXL3 CPU kernel's quantized activation rows per chunk (EXL3_MOE_CPU_MAX_M, even in
+    # [2, 8]; a chunk holds half as many tokens). 0 keeps the kernel's default. Any other value builds into its own
+    # extension (flavor _m<N>). SGLANG_DSV41_CPU_EXPERTS only: the vendored kernel keeps its own.
+    SGLANG_EXL3_CPU_MAX_M = EnvInt(0)
+```
+2. In `ext.py`, add above `cpu_act_defines`:
+```python
+def _max_m_defines() -> list[str]:
+    """-DEXL3_MOE_CPU_MAX_M from SGLANG_EXL3_CPU_MAX_M; none at 0, the kernel's default."""
+    max_m = envs.SGLANG_EXL3_CPU_MAX_M.get()
+    if not max_m:
+        return []
+    if max_m < 2 or max_m > 8 or max_m % 2:
+        raise ValueError(f"SGLANG_EXL3_CPU_MAX_M must be 0 or even in [2, 8], got {max_m}")
+    return [f"-DEXL3_MOE_CPU_MAX_M={max_m}"]
+```
+3. In `cpu_act_defines`:
+   - Change `return list(OPTIMIZED_CPU_DEFINES)` to `return list(OPTIMIZED_CPU_DEFINES) + _max_m_defines()`.
+   - Right after the `if envs.SGLANG_DSV41_CPU_EXPERTS.get(): ...` block, add:
+```python
+    if envs.SGLANG_EXL3_CPU_MAX_M.get():
+        raise ValueError(
+            "SGLANG_EXL3_CPU_MAX_M sizes the optimized EXL3 CPU kernel, which SGLANG_DSV41_CPU_EXPERTS=1 builds; "
+            "the vendored kernel keeps its own"
+        )
+```
+4. In `build_flavor`'s loop, after the `-DEXL3_MOE_CPU_ACT_BLOCK=` branch:
+```python
+        elif d.startswith("-DEXL3_MOE_CPU_MAX_M="):
+            flavor += "_m" + d.split("=", 1)[1]
+```
+   Also update the docstring example to `"_resid_b128"` or `"_resid_b128_m8_cpu_v1"`.
+5. In `bench/CMakeLists.txt`:
+   - After the `EXPERT_STREAM_NODES` cache line:
+```cmake
+set(EXL3_MAX_M "" CACHE STRING "EXL3_MOE_CPU_MAX_M for the optimized kernel (even, 2..8); empty: the source default")
+```
+   - After the `target_compile_definitions(exl3_cpu_${BACKEND} ...)` call:
+```cmake
+  if(EXL3_MAX_M AND NOT BACKEND STREQUAL "baseline")
+    target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE EXL3_MOE_CPU_MAX_M=${EXL3_MAX_M})
+  endif()
+```
+   - After the full-stack target's `target_compile_definitions(${TARGET} ...)`:
+```cmake
+    if(EXL3_MAX_M)
+      target_compile_definitions(${TARGET} PRIVATE EXL3_MOE_CPU_MAX_M=${EXL3_MAX_M})
+    endif()
+```
+
+- [ ] **Step 5: Derive every use from one MAX_M** (the "fix" rows of the audit that belong to this task).
+
+1. `math.hpp:46`. Replace `constexpr int MAX_M = 4;` with:
+```cpp
+#ifndef EXL3_MOE_CPU_MAX_M
+#define EXL3_MOE_CPU_MAX_M 4
+#endif
+// Quantized activation rows per chunk: CHUNK_M tokens times ACT_ROWS (below). Every per-chunk array, stride and tile
+// table derives from it. A build raises it with -DEXL3_MOE_CPU_MAX_M (SGLANG_EXL3_CPU_MAX_M; the bench's EXL3_MAX_M).
+constexpr int MAX_M = EXL3_MOE_CPU_MAX_M;
+static_assert(MAX_M >= 2 && MAX_M <= 8 && MAX_M % 2 == 0, "EXL3_MOE_CPU_MAX_M must be even, in [2, 8]");
+```
+2. `shapes.hpp:4`. Change "(up to MAX_M token rows)" to "(up to CHUNK_M tokens)".
+3. `forward_plan.hpp`, `run_tiles_raw` (:38-189).
+   - Add `#include <array>` to the includes, in sorted position.
+   - Replace the function with the tables below and this `run_tiles_raw`:
+```cpp
+using TilesFn = void (*)(const Exl3Projection&, const PreparedIn&, float*, int, int);
+
+// One AVX-512 tier's GEMV tiles for `bits` and `rows` quantized rows. VBMI at 8 bits runs the VNNI tiles: byte pairing
+// is impossible there (shift % 8 == 0) and the byte windows straddle the register pairs, measured slower than the
+// dword scheme.
+template <Isa I, int bits, int rows>
+void tiles_for(const Exl3Projection& mat, const PreparedIn& in, float* tout, int tn0, int tn1)
+{
+    if constexpr (I == Isa::Vbmi && bits != 8) vbmi_tiles<bits, rows>(mat, in, tout, tn0, tn1);
+    else if constexpr (I == Isa::Vbmi || I == Isa::Vnni) vnni_tiles<bits, rows>(mat, in, tout, tn0, tn1);
+    else bw_tiles<bits, rows>(mat, in, tout, tn0, tn1);
+}
+
+template <Isa I, int bits, int... R>
+constexpr std::array<TilesFn, sizeof...(R)> tiles_rows(std::integer_sequence<int, R...>)
+{
+    return {&tiles_for<I, bits, R + 1>...};
+}
+
+template <Isa I, int... B>
+constexpr std::array<std::array<TilesFn, MAX_M>, sizeof...(B)> tiles_table(std::integer_sequence<int, B...>)
+{
+    return {tiles_rows<I, B + 1>(std::make_integer_sequence<int, MAX_M>{})...};
+}
+
+// [bits - 1][rows - 1] for bits 1..8 and rows 1..MAX_M, generated from MAX_M: a larger MAX_M instantiates its rows
+// here with no hand-written case.
+template <Isa I>
+constexpr auto kTiles = tiles_table<I>(std::make_integer_sequence<int, 8>{});
+
+template <Isa I>
+void run_tiles_raw(const Exl3Projection& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+{
+    if (tn0 >= tn1) return;
+    if constexpr (I == Isa::Vbmi || I == Isa::Vnni || I == Isa::Bw)
+    {
+        kTiles<I>[mat.bits - 1][m - 1](mat, in, tout, tn0, tn1);
+    }
+    else if constexpr (I == Isa::Avx2)
+    {
+        switch (mat.bits)
+        {
+            case 1: avx2_tiles<1>(mat, in, tout, m, tn0, tn1); return;
+            case 2: avx2_tiles<2>(mat, in, tout, m, tn0, tn1); return;
+            case 3: avx2_tiles<3>(mat, in, tout, m, tn0, tn1); return;
+            case 4: avx2_tiles<4>(mat, in, tout, m, tn0, tn1); return;
+            case 5: avx2_tiles<5>(mat, in, tout, m, tn0, tn1); return;
+            case 6: avx2_tiles<6>(mat, in, tout, m, tn0, tn1); return;
+            case 7: avx2_tiles<7>(mat, in, tout, m, tn0, tn1); return;
+            default: avx2_tiles<8>(mat, in, tout, m, tn0, tn1); return;
+        }
+    }
+    else
+    {
+        switch (mat.bits)
+        {
+            case 1: scalar_tiles<1>(mat, in, tout, m, tn0, tn1); return;
+            case 2: scalar_tiles<2>(mat, in, tout, m, tn0, tn1); return;
+            case 3: scalar_tiles<3>(mat, in, tout, m, tn0, tn1); return;
+            case 4: scalar_tiles<4>(mat, in, tout, m, tn0, tn1); return;
+            case 5: scalar_tiles<5>(mat, in, tout, m, tn0, tn1); return;
+            case 6: scalar_tiles<6>(mat, in, tout, m, tn0, tn1); return;
+            case 7: scalar_tiles<7>(mat, in, tout, m, tn0, tn1); return;
+            default: scalar_tiles<8>(mat, in, tout, m, tn0, tn1); return;
+        }
+    }
+}
+```
+   The AVX2 and scalar branches are today's (:161-188), unchanged: their tiles take `m` at run time.
+4. `forward_plan.hpp:692-693`.
+   - Delete `static const int idx4[MAX_M] = {0, 1, 2, 3};`.
+   - Pass `kRowIndex.data()` instead of `idx4`.
+   - Define, above `enum class Phase`:
+```cpp
+// A chunk's down input row r is its gate output row r: the identity over MAX_M rows (prepare_rows' token_idx).
+constexpr std::array<int, MAX_M> kRowIndex = [] {
+    std::array<int, MAX_M> rows{};
+    for (int i = 0; i < MAX_M; ++i) rows[i] = i;
+    return rows;
+}();
+```
+5. `math_avx512.hpp:777-779` (`vbmi_tiles`). Replace the `max_band` expression with the one below. Up to 4 rows the
+   values are today's:
+```cpp
+    // rows > 4 (a raised MAX_M): two bands, at most 16 accumulators.
+    const int max_band = mat.swz
+        ? (rows <= 2 ? 8 : rows > 4 ? 2 : (rows == 4 && bits == 2 ? 2 : 4))
+        : (rows == 1 ? band_cap : (12 / rows < 8 ? 12 / rows : 8));
+```
+   The other tiers already keep `rows * band <= 16` for rows 5..8:
+   - unswizzled, `12 / rows` gives 2 or 1;
+   - BW and VNNI swizzled, `rows <= 3 ? 4 : 2` gives 2.
+
+- [ ] **Step 6: Commit, push, SYNC; run the ext tests, and warm both extension builds.**
+
+```bash
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 add python/sglang/srt/environ.py \
+  python/sglang/srt/layers/quantization/exl3/ext.py python/sglang/kernels/jit/csrc/moe/expert_stream/bench/CMakeLists.txt \
+  python/sglang/kernels/jit/csrc/exl3/optimized
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "feat(exl3-cpu): MAX_M is one build-time constant (EXL3_MOE_CPU_MAX_M, SGLANG_EXL3_CPU_MAX_M); the generic tiles are generated from it"
+```
+Then run:
+```bash
+ssh divix01 'bash -s' <<'EOF'
+cd /data/models/slang/nvfp4-work/wt-cpu-plan-m2 && source /data/models/slang/nvfp4-work/cpu-plan-m2/env.sh
+export PYTHONPATH=$PWD/python PY=/data/models/slang/.venv/bin/python
+taskset -c 0-63 $PY -m pytest test/registered/unit/layers/quantization/test_exl3_ext.py -q -p no:randomly 2>&1 | tail -2
+echo "EXIT=${PIPESTATUS[0]}"
+WARM='import torch; from sglang.srt.layers.quantization.exl3.ext import exl3_ext; e = exl3_ext(); print(e.__file__, torch.ops.sglang_exl3_cpu.chunk_m())'
+taskset -c 0-63 $PY -c "$WARM" 2>&1 | tail -1
+SGLANG_EXL3_CPU_MAX_M=8 taskset -c 0-63 $PY -c "$WARM" 2>&1 | tail -1
+EOF
+```
+Expected:
+- The ext tests all pass with `EXIT=0`.
+- The two warm lines read `.../resid_b128_cpu_v1/sglang_exl3_ext_resid_b128_cpu_v1.so 2` and
+  `.../resid_b128_m8_cpu_v1/sglang_exl3_ext_resid_b128_m8_cpu_v1.so 4`. The second is a cold build, several minutes.
+
+- [ ] **Step 7: The bit-exact gate at both MAX_M values, against BASE.**
+
+1. Take BASE's dumps, once, if `cpu-plan-m2/checks-base.out` does not end `ALL GREEN (baseline)` yet:
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work && bash wt-cpu-plan-m2-base/test/manual/dsv41/run_exl3_cpu_forward_checks.sh \
+  baseline wt-cpu-plan-m2-base cpu-plan-m2/checks-base > cpu-plan-m2/checks-base.out 2>&1; tail -1 cpu-plan-m2/checks-base.out'
+```
+   Expected: `ALL GREEN (baseline)`.
+2. Run the default build's full gate:
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work && bash wt-cpu-plan-m2/test/manual/dsv41/run_exl3_cpu_forward_checks.sh \
+  check wt-cpu-plan-m2 cpu-plan-m2/checks-4b cpu-plan-m2/checks-base 2>&1 | tail -16; echo "EXIT=${PIPESTATUS[0]}"'
+```
+   Expected: `ALL GREEN (check)`, with `compare-{bw,avx2,scalar}` each `72/72 bit-exact`. This shows the generated
+   tables change no bit at `MAX_M = 4`.
+3. Compare the `MAX_M = 8` build's dumps on every tier divix01 runs (generic drift):
+```bash
+ssh divix01 'bash -s' <<'EOF'
+cd /data/models/slang/nvfp4-work/wt-cpu-plan-m2 && source /data/models/slang/nvfp4-work/cpu-plan-m2/env.sh
+export PYTHONPATH=$PWD/python SGLANG_EXL3_CPU_MAX_M=8 PY=/data/models/slang/.venv/bin/python
+for isa in bw avx2 scalar; do
+  taskset -c 0-63 $PY test/manual/dsv41/exl3_cpu_forward_ab.py dump --isa $isa --registration slabs \
+    --out $W/m8-4b-$isa.pt 2>&1 | tail -1
+  $PY test/manual/dsv41/exl3_cpu_forward_ab.py compare $W/checks-base/ab-$isa-slabs.pt $W/m8-4b-$isa.pt 2>&1 | tail -1
+  echo "EXIT=${PIPESTATUS[0]}"
+done
+EOF
+```
+   Expected, for each of bw, avx2 and scalar:
+   - `72 outputs (<isa>, slabs) -> .../m8-4b-<isa>.pt`;
+   - `72/72 bit-exact: <isa>/slabs vs <isa>/slabs`;
+   - `EXIT=0`.
+
+   A `MISMATCH` names the case. Find the site in the audit table that still assumes 4 rows. Do not touch a reference.
+
+- [ ] **Step 8: The swizzled generic plan at MAX_M = 8.**
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work/wt-cpu-plan-m2 && source /data/models/slang/nvfp4-work/cpu-plan-m2/env.sh \
+  && SGLANG_EXL3_CPU_MAX_M=8 PYTHONPATH=$PWD/python taskset -c 0-63 /data/models/slang/.venv/bin/python -m pytest \
+  test/manual/dsv41/test_exl3_cpu_act_quant.py -q -p no:randomly 2>&1 | tail -2; echo "EXIT=${PIPESTATUS[0]}"'
+```
+Expected: `3 passed`, `EXIT=0`. Its five-token batch now runs chunks of up to four through the generic plan, and must
+equal the one-token runs and the swizzled layout bit for bit.
+
+---
+
+### Task 5: The DSV4.1 plan takes chunks of 1..CHUNK_M tokens
 
 **Files:**
 - Modify: `test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py` (`_expected_plan`)
-- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp:929-1001` (`register_rows`, `register_band`), plus a new `register_tiles_m2` after `register_tiles` (:1121)
-- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/forward_plan.hpp:199-206` (`run_tiles`), `:529-596` (`prepare_scratch`), `:491-509` (PlanTraits comments)
+- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp`:
+  - `:912-1001` (`register_rows`, `register_band`);
+  - `:1106-1133` (`register_tiles`);
+  - new `kRegisterBudget` and `register_band_for`.
+- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/forward_plan.hpp`:
+  - `run_tiles` and its new `register_tiles_for`;
+  - `prepare_scratch` (:529-596);
+  - the PlanTraits comments (:491-509).
 - Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/shapes.hpp:39-50` (`accepts`)
 - Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/README.txt` ("Selection", "Code layout")
 - Modify: `test/manual/dsv41/exl3_cpu_forward_ab.py` (the `ROUTES` comment)
 
 **Interfaces:**
-- Consumes: `torch.ops.sglang_exl3_cpu.plan_calls` (Task 2); the A/B cases (Task 3); BASE (Task 4).
+- Consumes:
+  - `chunk_m` and `plan_calls` (Task 2), the A/B cases (Task 3), and BASE with its dumps (Tasks 4 and 4b);
+  - `MAX_M` and `SGLANG_EXL3_CPU_MAX_M` (Task 4b).
 - Produces:
-  - `register_rows<J, Pairs, Compact, M = 1>` and `register_band<Pairs, FixedK, FixedN, Compact, M = 1>`;
-    `M` is the number of token rows.
-  - `constexpr int kTwoTokenPairs = 2;` and
-    `void register_tiles_m2(const Exl3Projection&, const PreparedIn&, float* tout, int t0, int t1)`.
-  - `Dsv41Shape::accepts` takes `m ∈ {1, 2}`.
-
-- [ ] **Step 0: Start the BASE baseline dumps in the background.** They need no change from this task:
-```bash
-ssh divix01 'cd /data/models/slang/nvfp4-work && nohup bash wt-cpu-plan-m2-base/test/manual/dsv41/run_exl3_cpu_forward_checks.sh \
-  baseline wt-cpu-plan-m2-base cpu-plan-m2/checks-base > cpu-plan-m2/checks-base.out 2>&1 &'
-```
-Expected at the end of `cpu-plan-m2/checks-base.out`: `ALL GREEN (baseline)`.
+  - `struct RegisterBudget { int pairs; bool traversal; }` and `constexpr RegisterBudget kRegisterBudget[]`, one entry
+    per M. Also `constexpr int kRegisterDecodeZmm = 12;`.
+  - `register_rows<J, Pairs, Compact, M = 1>` and `register_band<Pairs, FixedK, FixedN, Compact, M = 1>`.
+  - `template <int M> void register_tiles(const Exl3Projection&, const PreparedIn&, float* tout, int t0, int t1, bool grouped)`,
+    where `M = 1` is today's `register_tiles`.
+  - `register_tiles_for(std::integer_sequence<int, Ms...>, ...)` (`forward_plan.hpp`).
+  - `Dsv41Shape::accepts`, which takes `1 <= m <= CHUNK_M`.
 
 - [ ] **Step 1: Make the test expect the DSV4.1 plan for every native call.** Replace `_expected_plan` with:
 
 ```python
 def _expected_plan(routes):
-    """The plan a call on the native layer takes: the DSV4.1 plan, whose chunks hold one or two tokens."""
+    """The plan a call on the native layer takes: the DSV4.1 plan, whose chunks hold 1..CHUNK_M tokens."""
     return "dsv41"
 ```
 
@@ -1058,18 +1510,16 @@ git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "test
 ```
 Then run Task 2 Step 2's command.
 
-Expected: `EXIT=1`, with failures of the form `assert ('generic', 'generic') == ('dsv41', 'generic')`:
-- every hand-written case except `one-token`;
-- `draft-16x3`, `prefill-64x6`, and all three `threads` cases;
-- any random draft case whose routes collide.
+Expected: `EXIT=1`, with failures of the form `AssertionError: <case>`, where `('generic', 'generic') != ('dsv41', 'generic')`.
+- These fail: every hand-written case except `one-token`, `draft-16x3`, `prefill-64x6`, any random draft case whose
+  routes collide, `test_every_chunk_size_matches_the_generic_plan` (at `m2-one-expert`), and all three team-size
+  cases.
+- These pass: `one-token` and `test_the_build_reports_its_chunk_size`.
 
-`one-token` passes.
+- [ ] **Step 3: Make the register kernels generic in M (`math_avx512.hpp`).**
 
-- [ ] **Step 3: Generalise the register kernels to M token rows (`math_avx512.hpp`).**
-
-**3a.** `register_rows`: replace its template line, parameter list and inner row loop. Keep the body between them as
-it is.
-
+  1. Add `#include <iterator>` and `#include <utility>` to the includes, in sorted position.
+  2. `register_rows`: replace its template line, parameter list and inner row loop. Keep the body between them.
 ```cpp
 template<int J,int Pairs,bool Compact=false,int M=1>
 M1_TARGET_BW M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i b,__m512i c,
@@ -1083,14 +1533,12 @@ M1_TARGET_BW M1_ALWAYS_INLINE void register_rows(__m512i prev,__m512i a,__m512i 
         }
         register_rows<J+1,Pairs,Compact,M>(prev,a,b,c,splat,acc,band);
 ```
-
-**3b.** `register_band`: replace the whole function with this. At `M = 1` it is the same code: `R = 2`, stride
-`kb * 256`, and the same stores in the same order.
-
+  3. `register_band`: replace the whole function with the version below. At `M = 1` it is the same code: `R = 2`, the
+     same `kb * 256` stride, and the same stores in the same order.
 ```cpp
-// M token rows (1, or 2 for a two-token chunk of the DSV4.1 plan) share each decoded tile. Per output: the int32 sum of
-// each (k-block, quantized row), one FMA scale each, fp32 sums in increasing k-block order, then token + residual once:
-// the generic path's rounding (bw3_blocked_band).
+// M token rows (the tokens of one chunk) share each decoded tile. Per output: the int32 sum of each (k-block,
+// quantized row), one FMA scale each, fp32 sums in increasing k-block order, then token + residual once: the generic
+// path's rounding (bw3_blocked_band).
 template<int Pairs,int FixedK=0,int FixedN=0,bool Compact=false,int M=1>
 M1_TARGET_BW void register_band(const Exl3Projection& mat,const PreparedIn& in,float* tout,int n0) {
     constexpr int R=2*M;  // quantized rows: M token rows, then their M residual rows
@@ -1147,48 +1595,127 @@ M1_TARGET_BW void register_band(const Exl3Projection& mat,const PreparedIn& in,f
 }
 ```
 
-**3c.** After `register_tiles` (:1121), add:
+- [ ] **Step 4: The register budget table, and `register_tiles<M>` (`math_avx512.hpp`).**
 
+  1. Insert the table just above `register_rows` (:912):
 ```cpp
-// Compact input of a two-token chunk (the DSV4.1 plan, unswizzled): tile pairs through register_band at M = 2, at most
-// kTwoTokenPairs pairs per call (each pair holds eight integer accumulators). No grouped traversal: that is one token's.
-constexpr int kTwoTokenPairs = 2;
+// The compact register kernels' register budget, one entry per tokens-per-chunk M = 1..CHUNK_M (register_tiles<M>):
+// pairs, the tile pairs one register_band call holds; traversal, whether whole 128-output groups take the grouped
+// traversal (its IntegerAccum holds one token's rows). Raising EXL3_MOE_CPU_MAX_M past twice the entries fails to
+// compile below until an entry is added.
+struct RegisterBudget
+{
+    int pairs;
+    bool traversal;
+};
+constexpr RegisterBudget kRegisterBudget[] = {
+    {4, true},   // M = 1: today's kernels (register_band<1..4>, traversal_kblock's four bands)
+    {2, false},  // M = 2
+    {1, false},  // M = 3
+    {1, false},  // M = 4
+};
+// zmm registers register_rows keeps live besides the integer accumulators: prev, a, b, c, the state, its byte sum, two
+// products, the multiplier halves, the ones vector and the broadcast activation pair.
+constexpr int kRegisterDecodeZmm = 12;
 
-M1_TARGET_BW void register_tiles_m2(const Exl3Projection& mat,const PreparedIn& in,float* tout,int t0,int t1) {
-    TORCH_CHECK(in.compact && !mat.swz && t0%2==0 && t1%2==0,"two-token input must be compact, unswizzled tile pairs");
-    for(int n0=t0;n0<t1;) {
-        const int pairs=std::min(kTwoTokenPairs,(t1-n0)/2);
-        switch(pairs) {
-            case 1:register_band<1,0,0,true,2>(mat,in,tout,n0);break;
-            case 2:register_band<2,0,0,true,2>(mat,in,tout,n0);break;
-            case 3:register_band<3,0,0,true,2>(mat,in,tout,n0);break;
-            default:register_band<4,0,0,true,2>(mat,in,tout,n0);break;
+constexpr bool register_budget_fits()
+{
+    for (int m = 1; m <= int(std::size(kRegisterBudget)); ++m)
+        if (kRegisterBudget[m - 1].pairs < 1 || 4 * m * kRegisterBudget[m - 1].pairs + kRegisterDecodeZmm > 32)
+            return false;
+    return true;
+}
+static_assert(register_budget_fits(), "kRegisterBudget (math_avx512.hpp): an entry's integer accumulators "
+                                      "(4 * M * pairs) plus kRegisterDecodeZmm exceed the 32 zmm registers");
+static_assert(ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128 || CHUNK_M <= int(std::size(kRegisterBudget)),
+              "kRegisterBudget (math_avx512.hpp) has no entry for this CHUNK_M: add one before raising "
+              "EXL3_MOE_CPU_MAX_M");
+```
+  2. Just after `register_band`, add:
+```cpp
+// register_band<P, 0, 0, true, M> for a runtime P in 1..sizeof...(P): one direct call per P.
+template<int M,int... P>
+M1_TARGET_BW M1_ALWAYS_INLINE void register_band_for(std::integer_sequence<int,P...>,const Exl3Projection& mat,
+                                                     const PreparedIn& in,float* tout,int n0,int pairs) {
+    (void)((pairs==P+1 && (register_band<P+1,0,0,true,M>(mat,in,tout,n0),true)) || ...);
+}
+```
+  3. Make `register_tiles` (:1106) a template on M. Its `M == 1` branch is today's body, unchanged:
+```cpp
+// The tokens of one chunk, M = 1..CHUNK_M. M = 1 is the one-token kernel either plan calls (compact or not, swizzled
+// or not; the grouped traversal: kRegisterBudget[0]). M > 1 is the DSV4.1 plan's compact, unswizzled input, in runs of
+// up to kRegisterBudget[M - 1].pairs tile pairs.
+template<int M>
+M1_TARGET_BW void register_tiles(const Exl3Projection& mat,const PreparedIn& in,float* tout,int t0,int t1,
+                                 [[maybe_unused]] bool grouped) {
+    [[maybe_unused]] constexpr RegisterBudget budget=kRegisterBudget[M-1];
+    if constexpr (M==1) {
+        if(in.compact) {
+            if(mat.swz) {
+                // The swizzled layout stores a 128-output group's eight tiles together.
+                TORCH_CHECK(t0%8==0 && t1%8==0,"compact swizzled input requires whole output blocks");
+                for(int t=t0;t<t1;t+=8)register_band<4,0,0,true>(mat,in,tout,t);
+                return;
+            }
+            // Unswizzled: whole groups through the traversal, a partial group at either end as tile pairs.
+            TORCH_CHECK(t0%2==0 && t1%2==0,"compact input requires whole tile pairs");
+            const int a0=std::min(t1,(t0+7)/8*8), a1=std::max(a0,t1/8*8);
+            compact_pairs(mat,in,tout,t0,a0);
+            if(a1>a0)traversal_tiles(mat,in,tout,a0,a1,grouped);
+            compact_pairs(mat,in,tout,a1,t1);
+            return;
         }
-        n0+=pairs*2;
+        for(int n0=t0;n0<t1;) {
+            if((n0%2)||t1-n0<2){bw3_blocked_band<1>(mat,in,tout,n0++);continue;}
+            const int pairs=std::min({4,(t1-n0)/2,(8-n0%8)/2});
+            switch(pairs) {
+                case 1:register_band<1>(mat,in,tout,n0);break;
+                case 2:register_band<2>(mat,in,tout,n0);break;
+                case 3:register_band<3>(mat,in,tout,n0);break;
+                case 4:register_band<4>(mat,in,tout,n0);break;
+            }
+            n0+=pairs*2;
+        }
+    } else {
+        static_assert(!budget.traversal,"the grouped traversal holds one token's rows (IntegerAccum)");
+        TORCH_CHECK(in.compact && !mat.swz && t0%2==0 && t1%2==0,
+                    "a chunk of several tokens needs compact, unswizzled tile pairs");
+        for(int n0=t0;n0<t1;) {
+            const int pairs=std::min(budget.pairs,(t1-n0)/2);
+            register_band_for<M>(std::make_integer_sequence<int,budget.pairs>{},mat,in,tout,n0,pairs);
+            n0+=pairs*2;
+        }
     }
 }
 ```
+  4. In the file header comment, change "register_tiles and its traversal" to "register_tiles<M> (M tokens per chunk,
+     kRegisterBudget) and the one-token traversal".
 
-**3d.** In the file header comment, change "register_tiles and its traversal" to "register_tiles, register_tiles_m2
-and the traversal".
+- [ ] **Step 5: Dispatch 1..CHUNK_M, and lay out compact scratch by rows (`forward_plan.hpp`).**
 
-- [ ] **Step 4: Route compact two-token chunks to it, and lay out compact scratch by rows (`forward_plan.hpp`).**
-
-**4a.** In `run_tiles`, inside `if constexpr (I == Isa::Bw && ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128)` and after
-the `m == 1` block:
-
+  1. Above `run_tiles`, add:
 ```cpp
-        // Only the DSV4.1 plan hands in compact input (PlanTraits::kCompactScratch); its chunks hold one or two tokens.
-        if (m == 2 && in.compact)
+// register_tiles<M> for M = 1..CHUNK_M, generated from CHUNK_M: one direct call per M.
+template <int... Ms>
+M1_ALWAYS_INLINE void register_tiles_for(std::integer_sequence<int, Ms...>, const Exl3Projection& mat,
+                                         const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped)
+{
+    (void)((m == Ms + 1 && (register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
+}
+```
+  2. In `run_tiles`, replace the body of `if constexpr (I == Isa::Bw && ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128)`
+     with:
+```cpp
+        // One token from either plan; several only as the DSV4.1 plan's compact input (PlanTraits::kCompactScratch).
+        if ((m == 1 || in.compact) && mat.bits == 3 && act_blocked(mat.k))
         {
-            register_tiles_m2(mat,in,tout,tn0,tn1);
+            register_tiles_for(std::make_integer_sequence<int, CHUNK_M>{}, mat, in, tout, m, tn0, tn1, grouped);
             return;
         }
 ```
-
-**4b.** In `prepare_scratch`:
-1. Replace the `} else { grow(ar.compact_g, ...` branch with:
-   ```cpp
+  3. In `prepare_scratch`:
+     - Replace the `} else { grow(ar.compact_g, ...` branch with:
+```cpp
         } else {
             // Compact: each chunk's ACT_ROWS * m rows follow the previous chunk's (a call of one-token chunks keeps chunk
             // j at j * ACT_ROWS rows).
@@ -1198,68 +1725,71 @@ the `m == 1` block:
             grow(ar.compact_u,rows*H);
             grow(ar.compact_d,rows*I_);
         }
-   ```
-2. Before the `for (int j = 0; j < nc; ++j)` loop that fills `ctx.prep_*`, declare `size_t row0 = 0;`.
-3. Replace its `if(compact) { ... }` block with:
-   ```cpp
+```
+     - Declare `size_t row0 = 0;` before the `for (int j = 0; j < nc; ++j)` loop that fills `ctx.prep_*`.
+     - Replace its `if(compact) { ... }` block with:
+```cpp
             if(compact) {
                 ctx.prep_g[j].compact=ar.compact_g.data()+row0*H;
                 ctx.prep_u[j].compact=ar.compact_u.data()+row0*H;
                 ctx.prep_d[j].compact=ar.compact_d.data()+row0*I_;
                 row0+=size_t(ACT_ROWS)*ctx.chunks[j].m;
             }
-   ```
+```
+  4. In `PlanTraits`, change the `kGroupedTraversal` comment to
+     `// range-aware multi-band traversal when one expert is routed (one-token chunks: kRegisterBudget[0])`.
 
-**4c.** In `PlanTraits`, change these two comments to:
-- `kGroupedTraversal`: `// range-aware multi-band traversal when one expert is routed (one-token chunks only)`
-- `kWideSingleExpert`: `// 512-wide quantization for one token through one expert`, which stays as is.
-
-- [ ] **Step 5: Accept chunks of two (`shapes.hpp`).** Replace the comment and the loop in `accepts`:
+- [ ] **Step 6: Accept 1..CHUNK_M (`shapes.hpp`).** Replace the comment and the loop in `accepts`:
 
 ```cpp
     // Whether this call may take the DSV4.1 plan: the build quantizes activations residual/block-128, the layer has
-    // every fact above (shape, limit 10, unswizzled 3-bit), and every chunk holds one or two tokens (the register
-    // kernels' M; CHUNK_M is 2 in this build).
+    // every fact above (shape, limit 10, unswizzled 3-bit), and every chunk holds 1..CHUNK_M tokens (register_tiles<M>,
+    // kRegisterBudget).
     static bool accepts(const ExpertLayer& l, const Exl3Quant::Params& p, const std::vector<Chunk>& chunks)
     {
         if (ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128) return false;
         if (l.hidden != kHidden || l.intermediate != kIntermediate || l.act_limit != kActLimit) return false;
         if (p.bits != kBits || p.swizzled) return false;
         for (const auto& ch : chunks)
-            if (ch.m < 1 || ch.m > 2) return false;
+            if (ch.m < 1 || ch.m > CHUNK_M) return false;
         return true;
     }
 ```
 
-- [ ] **Step 6: Update the documentation the change falsifies.**
+- [ ] **Step 7: Update the documentation the change falsifies.**
 
   1. In `README.txt` "Selection", replace the first paragraph (through "...other ISA/bit-width fallbacks are
      retained.") with:
   ```text
-  For a call whose chunks each hold one or two tokens, with H=5120, I=2304, residual activation rows,
+  For a call whose chunks each hold 1..CHUNK_M tokens (CHUNK_M = MAX_M / 2; MAX_M is
+  EXL3_MOE_CPU_MAX_M, default 4), with H=5120, I=2304, residual activation rows,
   128-element quantization blocks, 3-bit unswizzled matrices and AVX512BW:
     one expert, one token: range3_unroll (range-aware neighboring-band traversal);
     other one-token chunks: unroll_small (one-band traversal);
-    two-token chunks: register_band at M = 2 (kTwoTokenPairs pairs per call), both tokens
-    sharing each decoded tile.
-  The measured multiple-expert counts are 3 and 5; counts 2, 4 and above 5
-  use the same default but have no measured performance claim. Two-token chunks
-  are bit-identical to the generic plan (test_exl3_cpu_dsv41_plan_multitoken.py).
-  Invalid routes retain the generic path. Existing scalar, AVX2 and other
-  ISA/bit-width fallbacks are retained.
+    chunks of M > 1 tokens: register_tiles<M>, all M tokens sharing each decoded tile,
+    kRegisterBudget[M - 1].pairs tile pairs per call.
+  kRegisterBudget (math_avx512.hpp) holds one entry per M and a static_assert keeps each
+  within 32 zmm; raising MAX_M needs an entry per new M. The measured multiple-expert
+  counts are 3 and 5; counts 2, 4 and above 5 use the same default but have no
+  measured performance claim. Every chunk size is bit-identical to the generic plan
+  (test_exl3_cpu_dsv41_plan_multitoken.py). Invalid routes retain the generic path.
+  Existing scalar, AVX2 and other ISA/bit-width fallbacks are retained.
   ```
-  2. In "Code layout", change "compact scratch, grouped traversal, wide single-expert quantization" to "compact
-     scratch (one- and two-token chunks), grouped traversal and wide single-expert quantization (one token)".
-  3. In `exl3_cpu_forward_ab.py`, replace the `ROUTES` comment's last sentence with: "The DSV4.1 plan takes chunks of
-     one or two tokens, so at the DSV4.1 shape these cases run it: a dump made before 2026-10-06 ran them on the
-     generic plan, and the two must agree bit for bit."
+  2. In "Code layout":
+     - Change "compact scratch, grouped traversal, wide single-expert quantization" to "compact scratch (chunks of
+       1..CHUNK_M tokens), grouped traversal and wide single-expert quantization (one token)".
+     - Add the sentence "MAX_M (math.hpp) is one build-time constant, EXL3_MOE_CPU_MAX_M; the generic tiers' tile
+       tables (kTiles) and the register dispatch (register_tiles_for) are generated from it."
+  3. In `exl3_cpu_forward_ab.py`, replace the `ROUTES` comment's last sentence with:
+     > The DSV4.1 plan takes chunks of 1..CHUNK_M tokens, so at the DSV4.1 shape these cases run it. A dump made
+     > before 2026-10-06 ran them on the generic plan, and the two must agree bit for bit.
 
-- [ ] **Step 7: Commit, push, SYNC, and run the parity test and the existing multi-row tests.**
+- [ ] **Step 8: Commit, push, SYNC, and run the parity test and the existing multi-row tests.**
 
 ```bash
 git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 add python/sglang/kernels/jit/csrc/exl3/optimized \
   test/manual/dsv41/exl3_cpu_forward_ab.py
-git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "feat(exl3-cpu): the DSV4.1 plan takes chunks of two tokens, bit-identical to the generic plan"
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "feat(exl3-cpu): the DSV4.1 plan takes chunks of 1..CHUNK_M tokens (register_tiles<M>, kRegisterBudget), bit-identical to the generic plan"
 ```
 Then run:
 ```bash
@@ -1269,68 +1799,225 @@ ssh divix01 'cd /data/models/slang/nvfp4-work/wt-cpu-plan-m2 && source /data/mod
   "test/manual/dsv41/test_cpu_expert_engines_exl3.py::test_a_multi_row_forward_on_prod_matches_one_row_forwards" \
   -q -p no:randomly 2>&1 | tail -3; echo "EXIT=${PIPESTATUS[0]}"'
 ```
-Expected: `19 passed` (15 + 3 + 1), `EXIT=0`.
+Expected: `21 passed` (17 + 3 + 1), `EXIT=0`.
 
-`test_batch_matches_single_token_runs` now compares the DSV4.1 plan's two-token chunks with its one-token runs.
-`test_swizzled_layout_matches_native` now compares them with the generic plan.
-
-- [ ] **Step 8: Run the full bit-exact gate against BASE.** First confirm Step 0's `checks-base.out` ends
-  `ALL GREEN (baseline)`. Then:
+- [ ] **Step 9: Run the full bit-exact gate against BASE.**
 
 ```bash
 ssh divix01 'cd /data/models/slang/nvfp4-work && bash wt-cpu-plan-m2/test/manual/dsv41/run_exl3_cpu_forward_checks.sh \
   check wt-cpu-plan-m2 cpu-plan-m2/checks-head cpu-plan-m2/checks-base 2>&1 | tail -16; echo "EXIT=${PIPESTATUS[0]}"'
 ```
 Expected: every step `EXIT=0` and `ALL GREEN (check)`:
-- `compare-bw`, `compare-avx2` and `compare-scalar` print `72/72 bit-exact`. This is the m = 2 parity against the
-  generic plan at BASE and the m = 1 identity, in one comparison.
-- `bare-validate` prints `Verified 24 bit-exact layer outputs`.
-- `full-stack-validate` passes (48 frozen outputs).
+- `compare-{bw,avx2,scalar}` print `72/72 bit-exact`. This covers parity for chunks of two against BASE's generic
+  plan and the m = 1 identity, in one comparison.
+- `bare-validate` verifies 24 outputs; `full-stack-validate` verifies 48.
 - `pytest` passes.
 
-On a mismatch, `compare-bw` names the case (`MISMATCH dsv41/l10/t16k3/s8.0: ...`). Stop and debug with
-superpowers:systematic-debugging. Do not adjust a reference.
+On a mismatch, stop and use superpowers:systematic-debugging. Never adjust a reference.
 
-- [ ] **Step 9: Run two core groups at once with two-token chunks (Review Focus 5).**
+- [ ] **Step 10: Rebuild the `MAX_M = 8` extension.** It is cold again: the kernel changed. Run Task 4b Step 6's
+  `SGLANG_EXL3_CPU_MAX_M=8` warm line.
+  Expected: `.../sglang_exl3_ext_resid_b128_m8_cpu_v1.so 4`.
+
+- [ ] **Step 11: Run two core groups at once with multi-token chunks (Review Focus 5).**
 
 ```bash
 ssh divix01 'cd /data/models/slang/nvfp4-work/wt-cpu-plan-m2 && source /data/models/slang/nvfp4-work/cpu-plan-m2/env.sh \
-  && PYTHONPATH=$PWD/python taskset -c 0-63 /data/models/slang/.venv/bin/python test/manual/dsv41/exl3_cpu_forward_ab.py \
-  dump --isa bw --registration cores --cores 0-7 --out $W/t5-cores.pt 2>&1 | tail -1; echo "EXIT=${PIPESTATUS[0]}"; \
-  /data/models/slang/.venv/bin/python test/manual/dsv41/exl3_cpu_forward_ab.py compare $W/checks-base/ab-bw-slabs.pt $W/t5-cores.pt \
-  2>&1 | tail -1; echo "EXIT=${PIPESTATUS[0]}"'
+  && export PYTHONPATH=$PWD/python && PY=/data/models/slang/.venv/bin/python \
+  && taskset -c 0-63 $PY test/manual/dsv41/exl3_cpu_forward_ab.py dump --isa bw --registration cores --cores 0-7 \
+     --out $W/t5-cores.pt 2>&1 | tail -1; echo "EXIT=${PIPESTATUS[0]}"; \
+  $PY test/manual/dsv41/exl3_cpu_forward_ab.py compare $W/checks-base/ab-bw-slabs.pt $W/t5-cores.pt 2>&1 | tail -1; \
+  echo "EXIT=${PIPESTATUS[0]}"'
 ```
 Expected: `72 outputs (bw, cores)` and `EXIT=0`, then `72/72 bit-exact: bw/slabs vs bw/cores` and `EXIT=0`.
 
-- [ ] **Step 10: Check the one-token path's machine code.** This is informative, not a gate. Build the bench at BASE
-  and at head (Task 6 Step 1 builds both; run it first if needed), then:
+- [ ] **Step 12: Check parity at MAX_M = 8 (chunks of 1..4; Review Focus 1).**
+
+```bash
+ssh divix01 'bash -s' <<'EOF'
+cd /data/models/slang/nvfp4-work/wt-cpu-plan-m2 && source /data/models/slang/nvfp4-work/cpu-plan-m2/env.sh
+export PYTHONPATH=$PWD/python SGLANG_EXL3_CPU_MAX_M=8 PY=/data/models/slang/.venv/bin/python
+taskset -c 0-63 $PY -m pytest test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py test/manual/dsv41/test_exl3_cpu_act_quant.py \
+  -q -p no:randomly 2>&1 | tail -2; echo "EXIT=${PIPESTATUS[0]}"
+taskset -c 0-63 $PY test/manual/dsv41/exl3_cpu_forward_ab.py dump --isa bw --registration slabs --out $W/m8-t5-bw.pt 2>&1 | tail -1
+$PY test/manual/dsv41/exl3_cpu_forward_ab.py compare $W/checks-base/ab-bw-slabs.pt $W/m8-t5-bw.pt 2>&1 | tail -1
+echo "EXIT=${PIPESTATUS[0]}"
+EOF
+```
+Expected:
+- `20 passed`, `EXIT=0`. `test_the_build_reports_its_chunk_size` sees 4, and
+  `test_every_chunk_size_matches_the_generic_plan` runs m = 1..4 and 5.
+- `72/72 bit-exact: bw/slabs vs bw/slabs`, `EXIT=0`. Chunks of up to four through the DSV4.1 plan equal BASE's
+  generic plan.
+
+- [ ] **Step 13: Check the one-token machine code (byte-identical to BASE).** Build the default benches first
+  (Task 6 Step 1). Then:
 
 ```bash
 ssh divix01 'bash -s' <<'EOF'
 W=/data/models/slang/nvfp4-work/cpu-plan-m2
 for side in base head; do
   objdump -d --no-show-raw-insn -C $W/bench-$side/exl3_cpu_optimized \
-    | awk '/<\(anonymous namespace\)::(traversal_kblock|compact_pairs|register_tiles)\(/,/^$/' \
-    | sed -E 's/^ *[0-9a-f]+:[[:space:]]*//; s/\b[0-9a-f]{6,}\b/ADDR/g' > $W/disasm-$side.txt
+    | awk '/^[0-9a-f]+ <\(anonymous namespace\)::(traversal_kblock|compact_pairs|register_tiles(<1>)?)\(/,/^$/' \
+    | sed -E 's/^ *[0-9a-f]+:[[:space:]]*//; s/\b[0-9a-f]{6,}\b/ADDR/g; s/register_tiles<1>/register_tiles/g' \
+    > $W/disasm-$side.txt
 done
 wc -l $W/disasm-base.txt $W/disasm-head.txt; diff -q $W/disasm-base.txt $W/disasm-head.txt && echo IDENTICAL
 EOF
 ```
-Expected: `IDENTICAL`. If the code differs, record it with Task 6's one-token controls. Only those timings decide
-whether the difference matters.
+Expected: `IDENTICAL`, from two non-empty files.
+- `run_tiles` itself is expected to differ (the generated dispatch), and so are the generic tiers (Task 4b's tables).
+  Task 6 Step 2's one-token controls time those.
+- If these three functions differ, report the diff with Task 6's controls. Do not paper over it.
+
+- [ ] **Step 14: Check spills for every instantiated M** (see "How the plan checks register spills").
+
+```bash
+ssh divix01 'bash -s' <<'EOF'
+source /data/models/slang/nvfp4-work/cpu-plan-m2/env.sh
+SITE=/data/models/slang/.venv/lib/python3.13/site-packages
+B=/data/models/slang/nvfp4-work/wt-cpu-plan-m2/python/sglang/kernels/jit/csrc/moe/expert_stream/bench
+GB=/data/models/slang/nvfp4-work/cpubench-build/_deps/google_benchmark-src
+for max_m in "" 8; do
+  build=$W/bench-head-su${max_m:+-m$max_m}
+  taskset -c 0-63 cmake -S $B -B $build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=$GXX -DEXL3_TORCH_ROOT=$SITE/torch \
+    -DEXL3_CXX11_ABI=1 -DEXL3_TVM_FFI_ROOT=$SITE/tvm_ffi -DFETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK=$GB \
+    -DEXL3_MAX_M=$max_m -DCMAKE_CXX_FLAGS=-fstack-usage > /dev/null
+  taskset -c 0-63 cmake --build $build -j16 --target exl3_cpu_optimized 2>&1 | tail -1
+done
+for build in bench-base bench-head-su bench-head-su-m8; do
+  echo "== $build: zmm stack accesses per function"
+  objdump -d --no-show-raw-insn -C $W/$build/exl3_cpu_optimized | awk '
+    /^[0-9a-f]+ <.*>:$/ { name = $0; keep = name ~ /register_band<|register_tiles|compact_pairs/; next }
+    keep && /zmm/ && /\(%r[sb]p\)/ { count[name]++ }
+    END { for (f in count) print count[f] "\t" f }' | sort -t$'\t' -k2
+  echo "== $build: stack frames"
+  find $W/$build -name '*.su' -exec grep -hE 'register_band|register_tiles|compact_pairs' {} + | sort
+done
+EOF
+```
+Expected:
+- **Builds.** Both builds end `[100%] Built target exl3_cpu_optimized`. Compiling at all is the `kRegisterBudget`
+  static_assert passing for M = 1..2 and 1..4.
+- **Rows.** One row per instantiated function. A function that is absent has no zmm stack access, or was inlined into
+  its caller (read the caller's row).
+- **Gate.** For each M ≥ 2, divide its rows' total count by the fp32 partial sums of the bands it instantiates,
+  `4 · M · Σ_{P=1..pairs} P`. M = 2 gives 4·2·(1+2) = 24; M = 3 and M = 4 give 12 and 16.
+  - That ratio must not exceed BASE's, computed the same way over `register_band<1..3, 0, 0, true>` /
+    `compact_pairs` (M = 1, Σ P = 6, 24 partial sums), plus 1.
+  - Record the table and the ratios in Task 7.
+- **On a miss.** It is an accumulator spill in the k-tile loop. Report it with Task 6's timings, and with Task 5b's
+  for M = 3 and 4. Lowering that entry's `pairs` is the fix to try.
+
+---
+
+### Task 5b (conditional): Raise the default MAX_M to 8 (CHUNK_M 4), only if chunks of two beat the generic plan
+
+This task runs after Task 5's gate and before Task 6's decision. It changes the source default only if both of these
+hold:
+- chunks of two beat the generic plan (the Task 6 measurement);
+- chunks of up to four beat chunks of two, under the same ship gate.
+
+Every measurement here uses the build-time override, so nothing is committed unless the gate passes.
+
+**Files (only if Step 6 is reached):**
+- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/math.hpp` (the `EXL3_MOE_CPU_MAX_M` default)
+- Modify: `test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py` (`DEFAULT_CHUNK_M`)
+- Modify: `python/sglang/kernels/jit/csrc/exl3/optimized/README.txt` ("Selection": "default 4")
+
+**Interfaces:**
+- Consumes: Task 6 Steps 1-4 (`ab-routed-*/summary.tsv`); Task 5 Step 14's `bench-head-su-m8` spill table; `ab.sh`;
+  `--routed=…:sharedG`.
+- Produces: the decision "5b applied" or "5b skipped: <reason>", for Task 6 Step 5 and Task 7. If applied: default
+  `MAX_M = 8` and `DEFAULT_CHUNK_M = 4`.
+
+- [ ] **Step 1: Run Task 6 Steps 1-4 now** (benches, one-token controls, routed m = 2 against the generic plan, the
+  M = 2 mutant).
+  - Read `ab-routed-*/summary.tsv`. Chunks of two "beat the generic plan" when Task 6's ship gate passes on it:
+    - no routed row has head/base > 1.00;
+    - `16:3:random` or `16:3:shared2` has head/base ≤ 0.95;
+    - every `experts:` control is in [0.98, 1.02].
+  - If it does not pass: skip this task. Write "5b skipped: chunks of two did not beat the generic plan" plus the
+    three numbers into Task 7's notes, and go to Task 6 Step 5.
+
+- [ ] **Step 2: Build the `MAX_M = 8` bench without `-fstack-usage`** (timing build; same sources as Task 5 Step 14):
+
+```bash
+ssh divix01 'bash -s' <<'EOF'
+source /data/models/slang/nvfp4-work/cpu-plan-m2/env.sh
+SITE=/data/models/slang/.venv/lib/python3.13/site-packages
+taskset -c 0-63 cmake -S /data/models/slang/nvfp4-work/wt-cpu-plan-m2/python/sglang/kernels/jit/csrc/moe/expert_stream/bench \
+  -B $W/bench-head-m8 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=$GXX -DEXL3_TORCH_ROOT=$SITE/torch -DEXL3_CXX11_ABI=1 \
+  -DEXL3_TVM_FFI_ROOT=$SITE/tvm_ffi -DFETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK=/data/models/slang/nvfp4-work/cpubench-build/_deps/google_benchmark-src \
+  -DEXL3_MAX_M=8 > /dev/null
+taskset -c 0-63 cmake --build $W/bench-head-m8 -j16 --target exl3_cpu_optimized 2>&1 | tail -1
+EOF
+```
+Expected: `[100%] Built target exl3_cpu_optimized`.
+
+- [ ] **Step 3: Check the M = 3 and M = 4 spill gate** from Task 5 Step 14's `bench-head-su-m8` table. Expected: both
+  ratios within the gate. On a miss, stop and ask. Do not lower `pairs` below 1: there is nothing lower.
+
+- [ ] **Step 4: Run the one-token controls, `MAX_M` 4 against 8:**
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work && PYTHON=/data/models/slang/.venv/bin/python bash \
+  wt-cpu-plan-m2/python/sglang/kernels/jit/csrc/moe/expert_stream/bench/ab.sh cpu-plan-m2/bench-head cpu-plan-m2/bench-head-m8 \
+  cpu-plan-m2/ab-m8-m1-$(date +%Y%m%d-%H%M%S) --benchmark_filter=experts: 2>&1 | tail -5'
+```
+Expected: three rows, `dsv41` on both sides, and head/base (here 8 against 4) in [0.98, 1.02].
+
+- [ ] **Step 5: Run chunks of two and four on the routed 16:3 patterns:**
+
+```bash
+ssh divix01 'cd /data/models/slang/nvfp4-work && PYTHON=/data/models/slang/.venv/bin/python bash \
+  wt-cpu-plan-m2/python/sglang/kernels/jit/csrc/moe/expert_stream/bench/ab.sh cpu-plan-m2/bench-head cpu-plan-m2/bench-head-m8 \
+  cpu-plan-m2/ab-m8-routed-$(date +%Y%m%d-%H%M%S) \
+  --routed=16:3:shared1,16:3:shared2,16:3:shared4,16:3:random,6:3:random,64:6:random --benchmark_filter=rows: 2>&1 | tail -8'
+```
+Expected: six rows, `dsv41`/`dsv41`.
+- `16:3:shared1` and `16:3:shared2` are controls. They make the same chunks in both builds and should read ≈1.00.
+- `16:3:shared4` is the first pattern that runs chunks of four.
+- The gate: no row above 1.00, and `16:3:shared4` or `16:3:random` at ≤ 0.95.
+- For the record (not gating), run the same command with `cpu-plan-m2/bench-base` in place of `cpu-plan-m2/bench-head`.
+  That gives chunks of four against the generic plan.
+
+- [ ] **Step 6: If Steps 3-5 pass, raise the default.** Otherwise stop and ask the owner, with both tables, and commit
+  nothing.
+
+  1. `math.hpp`: `#define EXL3_MOE_CPU_MAX_M 4` → `#define EXL3_MOE_CPU_MAX_M 8`.
+  2. The test: `DEFAULT_CHUNK_M = 2` → `DEFAULT_CHUNK_M = 4`.
+  3. `README.txt` "Selection": "default 4" → "default 8".
+  4. Commit and push:
+```bash
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 add python/sglang/kernels/jit/csrc/exl3/optimized \
+  test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "perf(exl3-cpu): chunks hold up to four tokens by default (EXL3_MOE_CPU_MAX_M 8)"
+```
+  5. SYNC, then rerun:
+     - Task 5 Step 8 (expected `21 passed`, now at `CHUNK_M` 4);
+     - Step 9 (`ALL GREEN (check)`, 72/72 against BASE);
+     - Step 11 (cores, 72/72).
+
+     The extension under `resid_b128_cpu_v1` rebuilds cold (Task 4b Step 6's default warm line now prints `4`).
+  6. Rerun Task 5 Step 13. Expected: the three one-token functions now differ from BASE only in the
+     `bq`/`bsum` stride immediates (`kb * MAX_M`, 16 → 32 bytes). Record the diff.
+  7. Record "5b applied" for Task 6 Step 5 and Task 7.
 
 ---
 
 ### Task 6: Measure the new plan against the generic plan, and decide
 
-**Files:** none in the repo. Results go under `/data/models/slang/nvfp4-work/cpu-plan-m2/` on divix01 and into Task 7.
+**Files:** none in the repo. Results go under `/data/models/slang/nvfp4-work/cpu-plan-m2/` on divix01, and into
+Task 7.
 
 **Interfaces:**
-- Consumes: `ab.sh` and `--routed` (Task 4), BASE and the base worktree (Task 4), the head (Task 5).
-- Produces: `ab-m1-*/summary.tsv`, `ab-routed-*/summary.tsv`, the `kTwoTokenPairs` choice, and the gate decision.
+- Consumes: `ab.sh` and `--routed` (Task 4); BASE and the base worktree (Task 4); the head (Task 5); Task 5b's outcome.
+- Produces: `ab-m1-*/summary.tsv`, `ab-routed-*/summary.tsv`, the `kRegisterBudget[1].pairs` choice, and the gate
+  decision.
 
-- [ ] **Step 1: Build both benches.** Run this once per side, with `side=base wt=wt-cpu-plan-m2-base` and with
-  `side=head wt=wt-cpu-plan-m2`:
+- [ ] **Step 1: Build both default benches.** Run this once per side: first `side=base` with
+  `wt=…/wt-cpu-plan-m2-base`, then `side=head` with `wt=…/wt-cpu-plan-m2`.
 
 ```bash
 ssh divix01 'bash -s' <<'EOF'
@@ -1352,109 +2039,127 @@ ssh divix01 'cd /data/models/slang/nvfp4-work && PYTHON=/data/models/slang/.venv
   wt-cpu-plan-m2/python/sglang/kernels/jit/csrc/moe/expert_stream/bench/ab.sh cpu-plan-m2/bench-base cpu-plan-m2/bench-head \
   cpu-plan-m2/ab-m1-$(date +%Y%m%d-%H%M%S) --benchmark_filter=experts: 2>&1 | tail -5'
 ```
-Expected: three rows (`experts:1`, `experts:3`, `experts:5`), each with `dsv41` on both sides. The gate for each
-(open question 1): head/base in [0.98, 1.02].
+Expected: three rows (`experts:1`, `:3`, `:5`), `dsv41` on both sides, each head/base in [0.98, 1.02].
 
-- [ ] **Step 3: Run the routed workloads, the comparison itself:**
+- [ ] **Step 3: Run the routed workloads: chunks of two against the generic plan.**
 
 ```bash
 ssh divix01 'cd /data/models/slang/nvfp4-work && PYTHON=/data/models/slang/.venv/bin/python bash \
   wt-cpu-plan-m2/python/sglang/kernels/jit/csrc/moe/expert_stream/bench/ab.sh cpu-plan-m2/bench-base cpu-plan-m2/bench-head \
   cpu-plan-m2/ab-routed-$(date +%Y%m%d-%H%M%S) \
-  --routed=2:3:pairs,16:3:pairs,16:3:distinct,6:3:random,16:3:random,64:6:random --benchmark_filter=rows: 2>&1 | tail -8'
+  --routed=2:3:shared2,16:3:shared2,16:3:shared1,6:3:random,16:3:random,64:6:random --benchmark_filter=rows: 2>&1 | tail -8'
 ```
 Expected: six rows.
-- `16:3:distinct` is `dsv41`/`dsv41`, a control that should read ≈1.00.
-- Every other row is `generic` on base and `dsv41` on head. The head/base column is the answer.
+- `16:3:shared1` is `dsv41`/`dsv41`, a control at ≈1.00.
+- Every other row is `generic` on base and `dsv41` on head.
+- The gate: no row above 1.00, and `16:3:random` or `16:3:shared2` at ≤ 0.95.
 
-- [ ] **Step 4: Tune `kTwoTokenPairs` with mutants.** This follows the run protocol: a private worktree, never
-  committed. For P in 1, 3 and 4:
+- [ ] **Step 4: Run the M = 2 mutant.**
+  - The budget table allows `pairs` 1 or 2 for M = 2: 3 needs 36 zmm, which the static_assert refuses.
+  - Try 1 by the run protocol: a private worktree, never committed.
 
 ```bash
 ssh divix01 'bash -s' <<'EOF'
-P=4   # then 1, then 3
-R=/data/models/slang/sglang; M=/data/models/slang/nvfp4-work/wt-cpu-plan-m2-p$P
+R=/data/models/slang/sglang; M=/data/models/slang/nvfp4-work/wt-cpu-plan-m2-p1
 source /data/models/slang/nvfp4-work/cpu-plan-m2/env.sh; SITE=/data/models/slang/.venv/lib/python3.13/site-packages
 git -C $R worktree add --detach $M origin/dsv41-cpu-plan-m2
-sed -i "s/constexpr int kTwoTokenPairs = 2;/constexpr int kTwoTokenPairs = $P;/" $M/python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp
-grep -n "kTwoTokenPairs = " $M/python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp
-taskset -c 0-63 cmake -S $M/python/sglang/kernels/jit/csrc/moe/expert_stream/bench -B $W/bench-p$P -DCMAKE_BUILD_TYPE=Release \
+sed -i 's|    {2, false},  // M = 2|    {1, false},  // M = 2|' $M/python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp
+grep -n "// M = 2" $M/python/sglang/kernels/jit/csrc/exl3/optimized/math_avx512.hpp
+taskset -c 0-63 cmake -S $M/python/sglang/kernels/jit/csrc/moe/expert_stream/bench -B $W/bench-p1 -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_COMPILER=$GXX -DEXL3_TORCH_ROOT=$SITE/torch -DEXL3_CXX11_ABI=1 -DEXL3_TVM_FFI_ROOT=$SITE/tvm_ffi \
   -DFETCHCONTENT_SOURCE_DIR_GOOGLE_BENCHMARK=/data/models/slang/nvfp4-work/cpubench-build/_deps/google_benchmark-src > /dev/null
-taskset -c 0-63 cmake --build $W/bench-p$P -j16 --target exl3_cpu_optimized 2>&1 | tail -1
+taskset -c 0-63 cmake --build $W/bench-p1 -j16 --target exl3_cpu_optimized 2>&1 | tail -1
 PYTHON=/data/models/slang/.venv/bin/python bash $M/python/sglang/kernels/jit/csrc/moe/expert_stream/bench/ab.sh \
-  $W/bench-head $W/bench-p$P $W/ab-p$P-$(date +%Y%m%d-%H%M%S) \
-  --routed=2:3:pairs,16:3:pairs,16:3:random,64:6:random --benchmark_filter=rows: 2>&1 | tail -5
+  $W/bench-head $W/bench-p1 $W/ab-p1-$(date +%Y%m%d-%H%M%S) \
+  --routed=2:3:shared2,16:3:shared2,16:3:random,64:6:random --benchmark_filter=rows: 2>&1 | tail -5
 git -C $M checkout -- . && git -C $R worktree remove $M
 EOF
 ```
-Expected: four rows per P; "head" in this run means the mutant.
-- If a P is ≥3% faster than 2 on `16:3:random` and `16:3:pairs` and slower on none, set `kTwoTokenPairs` to it in a
-  commit (`perf(exl3-cpu): two-token chunks take P tile pairs per call`).
-- Then rerun Task 5 Steps 7 and 8, and this task's Step 3. Expected: green again, and the bench numbers in that
-  record.
+Expected: the `grep` shows `{1, false},  // M = 2`, then four rows, where "head" means the mutant.
+- If the mutant is ≥3% faster on `16:3:random` and `16:3:shared2` and slower on none: set `{1, false}` in a commit
+  (`perf(exl3-cpu): chunks of two take one tile pair per call`).
+- Then rerun Task 5 Steps 8, 9 and 14, and this task's Step 3.
 
-- [ ] **Step 5: Decide by the gate (open question 1) and report to the owner.** The report gives both `summary.tsv`
-  tables, the Task 5 Step 10 verdict and the Task 1 collision rate if it is in.
-  - If the gate passes: proceed to Task 7.
-  - If it fails: stop. Report to the owner with the numbers, and do not revert anything without their decision.
+- [ ] **Step 5: Decide by the ship gate and report to the owner.**
+  - The report covers:
+    - Steps 2-4's `summary.tsv` tables;
+    - Task 5 Steps 13-14's verdicts;
+    - Task 5b's outcome (applied with its tables, or skipped with its reason);
+    - Task 1's collision rate, if it is in.
+  - If the gate passes, proceed to Task 7.
+  - If it fails, stop. Report to the owner with the numbers, and revert nothing without their decision.
 
 ---
 
 ### Task 7: Record the result
 
 **Files:**
-- Modify: `DSV41_REFERENCE.md`. Add §33.9 after §33.8 ("What D2-3 does not do" ends its section).
+- Modify: `DSV41_REFERENCE.md`. Add **§33.10**, after §33.9. The dspark-graph branch's Task 7 writes §33.9; if it is
+  not on this branch yet, put §33.10 after §33.8 and keep its number.
 
 **Interfaces:**
-- Consumes: Task 1 Step 6's collision rate, Task 5 Steps 8-10, and Task 6's tables and decision.
+- Consumes: Task 1 Step 6's collision rate; Task 4b Steps 7-8; Task 5 Steps 9-14; Task 5b's outcome; Task 6's tables and
+  decision.
 - Produces: nothing code reads.
 
-- [ ] **Step 1: Write §33.9.** Copy every number from the named `summary.tsv` or log, with its command. Use this
+- [ ] **Step 1: Write §33.10.** Copy every number, with its command, from the `summary.tsv` or log it came from. Use this
   structure:
 
 ```markdown
-### 33.9 The DSV4.1 CPU plan takes chunks of two tokens (2026-10-06)
+### 33.10 The DSV4.1 CPU plan takes chunks of 1..CHUNK_M tokens (2026-10-06)
 
-Plan `docs/superpowers/plans/2026-10-06-dsv41-cpu-plan-multi-token.md`, branch `dsv41-cpu-plan-m2`. This covers §33.3
-item 5's "the tuned path turns off for chunks with more than one token".
+Plan `docs/superpowers/plans/2026-10-06-dsv41-cpu-plan-multi-token.md`, branch `dsv41-cpu-plan-m2`. It covers §33.3 item
+5's "the tuned path turns off for chunks with more than one token".
 
 **What changed.**
-- `Dsv41Shape::accepts` takes chunks of one or two tokens (`CHUNK_M` is 2).
-- Two-token chunks run `register_band` at `M = 2`: both tokens share each decoded tile, `kTwoTokenPairs` = <P>.
-  The grouped traversal and the wide quantization stay one-token only.
-- The kernel counts the forwards per plan (`sglang_exl3_cpu::plan_calls`).
-- The draft CPU thread counts collided jobs (`collided_jobs`, `shared_routes`, `collided_forward_ns`).
+- `MAX_M` is one build-time constant, `EXL3_MOE_CPU_MAX_M`, default <4 | 8 (Task 5b)>.
+  - A test build sets it through `SGLANG_EXL3_CPU_MAX_M`.
+  - The generic tiers' tile tables and the register dispatch are generated from it.
+- `Dsv41Shape::accepts` takes chunks of 1..CHUNK_M tokens.
+- `register_tiles<M>` shares each decoded tile among a chunk's M tokens.
+  - `kRegisterBudget`: M = 2 → <pairs>, M = 3 and 4 → 1. A static_assert keeps every entry within 32 zmm.
+  - The grouped traversal and wide quantization stay one-token only.
+- The kernel counts forwards per plan and reports CHUNK_M (`sglang_exl3_cpu::plan_calls`, `chunk_m`).
+- The draft CPU thread counts collided jobs.
 
 **Bits.**
 - `run_exl3_cpu_forward_checks.sh check` against BASE `<sha>`: 72/72 per tier, 24 + 48 frozen outputs, ALL GREEN.
-- `test_exl3_cpu_dsv41_plan_multitoken.py`: 15 passed.
-- The one-token path's machine code: <IDENTICAL | differs, see the controls>.
+- At `SGLANG_EXL3_CPU_MAX_M=8`: scalar, avx2 and bw dumps 72/72 against BASE (the generic plan before Task 5, the
+  DSV4.1 plan after it). The parity file passes, 17 tests at CHUNK_M 4.
+- One-token machine code: <IDENTICAL | the diff>.
+- Spill ratios per M (zmm stack accesses per fp32 partial sum): M = 1 (BASE) <r1>; M = 2 <r2>; M = 3 <r3>;
+  M = 4 <r4>.
 
-**Time** (`ab.sh`, 8 rounds, 16 workers on 18-33, median p50 µs; <dir>):
+**Time** (`ab.sh`, 8 rounds, 16 workers on 18-33, median p50 µs; <dirs>):
 
-| workload | generic (BASE) | DSV4.1 (head) | head/base |
-|---|---|---|---|
-| experts:1 / 3 / 5 (controls) | | | |
-| rows:2/k:3/pairs | | | |
-| rows:16/k:3/pairs | | | |
-| rows:16/k:3/distinct (control) | | | |
-| rows:6/k:3/random | | | |
-| rows:16/k:3/random | | | |
-| rows:64/k:6/random | | | |
+| workload | generic (BASE) | chunks ≤ 2 (head) | head/base | chunks ≤ 4 (MAX_M 8) | 8/4 |
+|---|---|---|---|---|---|
+| experts:1 / 3 / 5 (controls) | | | | | |
+| rows:2/k:3/shared2 | | | | | |
+| rows:16/k:3/shared1 (control) | | | | | |
+| rows:16/k:3/shared2 | | | | | |
+| rows:16/k:3/shared4 | | | | | |
+| rows:6/k:3/random | | | | | |
+| rows:16/k:3/random | | | | | |
+| rows:64/k:6/random | | | | | |
+
+**Task 5b:** <applied: default MAX_M 8 | skipped: reason and numbers>.
 
 **How often the draft hits it** (Task 1, one DSpark arm, <log path>): collided_jobs / jobs = <x>;
 collided_forward_ns / forward_ns = <y>.
 
-**What it does not do:** the target's `CpuExpertEngine` (one token per job; D2-4); grouped traversal or wide quantization
-at m = 2; swizzled compact input.
+**What it does not do:**
+- multi-row jobs in the target's `CpuExpertEngine` (D2-4);
+- the grouped traversal or wide quantization at m ≥ 2;
+- swizzled compact input;
+- running the VNNI and VBMI tiers at a raised `MAX_M` (compiled only; no such CPU here).
 ```
 
 - [ ] **Step 2: Commit and push.**
 
 ```bash
 git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 add DSV41_REFERENCE.md
-git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "docs(dsv41): §33.9, the DSV4.1 CPU plan on chunks of two tokens"
+git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 commit -m "docs(dsv41): §33.10, the DSV4.1 CPU plan on chunks of 1..CHUNK_M tokens"
 git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 push origin dsv41-cpu-plan-m2
 ```
 
@@ -1462,60 +2167,80 @@ git -C /Users/dnikolaidis/Desktop/divix/sglang-nvfp4-cpu-plan-m2 push origin dsv
 
 ## Risks
 
-- **The M = 2 kernel may not beat the generic plan.**
-  - `register_band<2,…,M=2>` holds 16 integer accumulators plus 16 fp32 partial sums. GCC will spill the sums, as it
-    already does at `M = 1, Pairs = 4`.
-  - The generic `bw_tiles<3, 4>` also shares each decode across four rows.
-  - Mitigation: Task 6's A/B, the `kTwoTokenPairs` mutants, and the stop-and-ask gate.
+- **Chunks of M > 1 may not beat the generic plan.**
+  - `register_band<…, M>` holds up to 16 integer accumulators plus `4 · M · P` fp32 partial sums, which may sit in
+    memory.
+  - The generic `bw_tiles<3, 2M>` also shares each decode across the chunk's rows.
+  - Mitigation: Task 6's A/B, the M = 2 mutant, Task 5b's own gate, and stop-and-ask.
 - **Templating perturbs the one-token path.**
   - `forward_plan.hpp`'s header warns that inlining and cloning follow definition order.
-  - Mitigation: the frozen references (bits), Task 5 Step 10 (machine code), and Task 6 Step 2 (time).
-- **Scratch offsets.** A wrong running row offset corrupts only calls that mix chunk sizes, silently.
-  Mitigation: `mixed-sizes`, `three-tokens-one-expert`, AB `(3, 1)` / `(6, 3)` / `(16, 3)`.
-- **The in-process generic oracle depends on layout independence.**
-  - The generic oracle is the swizzled layer. It is valid only while the generic plan gives the same bits for both
-    layouts, which `test_swizzled_layout_matches_native` pins today.
+  - Mitigation: the frozen references (bits), Task 5 Step 13 (machine code), and Task 6 Step 2 (time).
+- **The generated dispatches.**
+  - The generic tiers now call through `kTiles` function pointers instead of a switch of direct calls. The register
+    dispatch is a fold of direct calls.
+  - Bits are unaffected (Task 4b Step 7). The cost is one indirect call per GEMV range, against microseconds of work.
+  - Task 6 Step 2 times the DSV4.1 path; the generic plan is not timed.
+- **The generic tiers at a raised `MAX_M` are correct, not tuned.**
+  - AVX2's `acc[MAX_M][2]` is 16 ymm at `MAX_M = 8`.
+  - The VNNI and VBMI rows 5..8 compile but cannot run on divix01, a Skylake-SP: no bit test covers them there.
+  - The default stays 4 unless Task 5b passes, and 5b gates on the DSV4.1 path only.
+- **Compile time.** The tile tables instantiate bits × `MAX_M` rows × up to 8 bands per AVX-512 tier, so
+  `MAX_M = 8` roughly doubles the AVX-512 tile instantiations of a cold extension build.
+- **`kRegisterDecodeZmm` is an estimate.** It is counted by hand from `register_rows`. The binary check (Task 5 Step 14)
+  is the backstop, and timing is the arbiter.
+- **Scratch offsets.** A wrong running row offset corrupts only calls that mix chunk sizes, and it does so silently.
+  Mitigation: `mixed-sizes`, `m{CHUNK_M+1}-overflow`, and AB `(3, 1)` / `(6, 3)` / `(16, 3)`.
+- **The in-process generic oracle is the swizzled layer.**
+  - It is valid while the generic plan is layout-independent bitwise, which `test_swizzled_layout_matches_native`
+    pins.
   - The A/B dumps against BASE are the independent oracle.
-- **Counter contention.**
-  - The target engine and the draft thread both touch `g_plan_calls` once per forward: about 100 ns of cache-line
-    transfer at worst, against forwards of 300 µs or more.
-  - Task 6 Step 2 would show it.
+- **Counter contention.** The target engine and the draft thread touch `g_plan_calls` once per forward each: about
+  100 ns at worst, against forwards of 300 µs or more.
 - **Production and shared caches.**
-  - The benches pin 18-33 and the scripts refuse while a server runs.
-  - The extension builds into the private `SGLANG_EXL3_BUILD_DIR`, never into `~/.cache`.
-- **A one-token payoff, measured synthetically.**
-  - The routed patterns span the extremes. Only Task 1's real collision rate says how much a DSpark arm gains.
+  - The benches pin 18-33, and the scripts refuse while a server runs.
+  - Every extension build lives under the private `SGLANG_EXL3_BUILD_DIR`, the `MAX_M = 8` one with its own flavor.
+- **The payoff is measured synthetically.** Only Task 1's real collision rate says how much a DSpark arm gains.
 
 ## Out of scope
 
-- Multi-row jobs in the target's `CpuExpertEngine` (`rows = 1`) and the rest of D2-4 (§33.3 item 5's record, wire and
-  summed lane weight).
-- Grouped multi-band traversal and wide (512) quantization for two-token chunks.
-- Swizzled compact input at m = 2: the DSV4.1 plan refuses swizzled layers.
-- The generic plan, the AVX2, VNNI and VBMI tiers, and `ACT_ROWS == 1` builds (where `CHUNK_M` is 4).
-- Changing `CHUNK_M`, `MAX_M`, the dispatch's grouping or its accumulation order.
+- Multi-row jobs in the target's `CpuExpertEngine` (`rows = 1`), and the rest of D2-4.
+- The grouped multi-band traversal and wide (512) quantization at m ≥ 2 (owner: follow-up).
+- Swizzled compact input at m > 1: the DSV4.1 plan refuses swizzled layers.
+- `CHUNK_M` above 4.
+  - `kRegisterBudget` would need entries for M ≥ 5. M = 5 at one pair fills all 32 zmm exactly, and M ≥ 6 does not
+    fit, so it needs a different register kernel.
+  - `math.hpp`'s static_assert caps `MAX_M` at 8, which also bounds the generic tile tables.
+- Tuning the generic tiers (AVX2, VNNI, VBMI) for rows 5..8, and the vendored baseline kernel's `MAX_M`.
+- Changing the dispatch's grouping or its accumulation order.
 - Running a DSpark arm. The owner schedules it; Task 1 Step 6 only reads its log.
-- An env knob forcing the generic plan (open question 3).
+- An env knob forcing the generic plan (owner: counters).
 
 ## Self-review
 
 1. **Spec coverage.**
-   - Brief item 1 (which pieces assume m == 1, and what to do with each): the table under "What assumes m == 1".
-   - Item 2 (the numerics contract and its proofs): Global Constraints, then Task 5 Steps 7-9.
-   - Item 3 (tests):
-     - parity at m ∈ {1, 2} (`CHUNK_M` = 2), mixed sizes, draft M = 2..16 with k = 3, prefill 64×6: Tasks 2 and 5;
-     - `accepts` takes m = 2, through the plan counter: Task 5 Step 1;
-     - the m == 1 tests stay byte-exact: Task 5 Step 8.
-   - Item 4 (measurement): the bench A/B in Tasks 4 and 6; the draft counter in Task 1, ordered first.
-   - Item 5 (risks, out of scope): the sections above.
-   - The branch name, the plan path and the open questions are at the top.
+   - Brief item 1 (which pieces assume one token): the "What assumes one token per chunk" table.
+   - Item 2 (the numerics): Global Constraints, then Task 4b Step 7 and Task 5 Steps 8-12.
+   - Item 3 (tests): Tasks 2, 3 and 5. Item 4 (measurement): Tasks 1, 4, 6 and 5b. Item 5: Risks and Out of scope.
+   - The revision, point by point:
+     1. no m == 2 special case: `register_tiles<M>` and the `register_tiles_for` fold over `CHUNK_M`, with M = 1
+        identical by objdump (Task 5);
+     2. one `kRegisterBudget` table with static_asserts, and a per-M spill check (Task 5 Steps 4 and 14);
+     3. the audit table, with every site derived from `MAX_M` and generic drift tested at `MAX_M = 8` (Task 4b);
+     4. `accepts` takes `1..CHUNK_M` (Task 5 Step 6);
+     5. `EXL3_MOE_CPU_MAX_M` / `SGLANG_EXL3_CPU_MAX_M` / `EXL3_MAX_M`, `chunk_m` to Python, tests generated from
+        `chunk_m`, and a `MAX_M = 8` run (Tasks 2, 4b and 5 Step 12);
+     6. Task 5b;
+     7. §33.10 (Task 7).
 2. **Placeholders.**
-   - Only Task 7's result table has blanks, by design: results not yet measured, each tied to the file it is copied
-     from.
+   - Only Task 7's result table has blanks, by design: values not yet measured, each tied to its source file.
    - No TBD or TODO, and no step without its code or command.
 3. **Type consistency.** These names are used the same way in every task:
-   - `SglangExl3CpuPlanCalls{dsv41, generic}`, `exl3_cpu_plan_calls()`, `sglang_exl3_cpu::plan_calls`, `g_plan_calls`;
-   - `register_tiles_m2`, `kTwoTokenPairs`, `register_band<…, M>`, `_expected_plan`;
-   - `RoutedWorkload`, `RoutedLayers`, `ab.sh` and its `summary.tsv`;
+   - `SglangExl3CpuPlanCalls{dsv41, generic}`, `exl3_cpu_plan_calls()`, `exl3_cpu_chunk_m()`,
+     `sglang_exl3_cpu::plan_calls`, `sglang_exl3_cpu::chunk_m`, `g_plan_calls`;
+   - `EXL3_MOE_CPU_MAX_M`, `SGLANG_EXL3_CPU_MAX_M`, `EXL3_MAX_M`, `kTiles`, `tiles_for`, `kRowIndex`;
+   - `RegisterBudget`, `kRegisterBudget`, `kRegisterDecodeZmm`, `register_tiles<M>`, `register_tiles_for`,
+     `register_band_for`;
+   - `_expected_plan`, `DEFAULT_CHUNK_M`, `_chunk_m`, `_check`;
+   - `RoutedWorkload`, `sharedG`, `ab.sh`, `summary.tsv`;
    - `collided_jobs`, `shared_routes`, `collided_forward_ns`, `count_shared_routes`.
-4. **Review Focus.** Each of the five lines names its test and the task that owns it.
+4. **Review Focus.** Each of the five lines names its test and the step that owns it.
