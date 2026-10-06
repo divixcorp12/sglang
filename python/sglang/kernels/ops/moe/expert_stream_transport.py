@@ -1788,7 +1788,9 @@ class ExpertStreamHost:
         references to both. The idle thread holds its workers in the kernel's keep-warm, in
         register work for ``keep_warm_us`` after each job and in PAUSE for ``spin_us`` after
         that, then releases them and sleeps until the next submit; -1 holds them until the
-        next submit (``SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US`` in a server).
+        next submit (``SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US`` in a server). With ``[rows,
+        2 * nodes, tokens, hidden]`` rows a record's CPU job runs one forward of its tokens
+        from the row's token table.
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -1808,13 +1810,15 @@ class ExpertStreamHost:
             or not out_rows.is_contiguous()
             or not (
                 (out_rows.dim() == 2 and self.nodes == 1)
-                or (out_rows.dim() == 3 and out_rows.shape[1] == 2 * self.nodes)
+                or (out_rows.dim() in (3, 4) and out_rows.shape[1] == 2 * self.nodes)
             )
         ):
             raise ValueError(
-                "out_rows must be a contiguous host float32 [rows, hidden] at one node or [rows, 2 * nodes, hidden] tensor"
+                "out_rows must be a contiguous host float32 [rows, hidden] at one node, [rows, 2 * nodes, hidden], or "
+                "[rows, 2 * nodes, tokens, hidden] for multi-token rows"
             )
         parts = 1 if out_rows.dim() == 2 else 2
+        tokens = int(out_rows.shape[2]) if out_rows.dim() == 4 else 1
         hidden = int(out_rows.shape[-1])
         self._module.expert_stream_enable_cpu_experts(
             self.handle,
@@ -1826,6 +1830,7 @@ class ExpertStreamHost:
             out_rows.view(out_rows.shape[0], -1),
             hidden,
             parts,
+            int(tokens),
             int(threads),
             _spin_ns(spin_us),
             int(keep_warm_us * 1e3),

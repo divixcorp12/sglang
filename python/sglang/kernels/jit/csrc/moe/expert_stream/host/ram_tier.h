@@ -1730,11 +1730,13 @@ class RamTier {
         cpu_job.row = request.row;
         cpu_job.part = 0;
         cpu_job.seq = first;
+        cpu_job.per_token = true;
         for (int i = 0; i < job.count; ++i) {
           const CopyLane& lane = job.lanes[i];
           if ((job.cpu_mask >> lane.lane & 1u) == 0) continue;
           cpu_job.slots[cpu_job.k] = lane.host_slot;
           cpu_job.weights[cpu_job.k] = lane.weight;
+          cpu_job.lanes[cpu_job.k] = lane.lane;
           ++cpu_job.k;
         }
         submit_cpu_job(group, request, cpu_job);
@@ -1788,12 +1790,14 @@ class RamTier {
     cpu_job.row = request.row;
     cpu_job.part = 1;
     cpu_job.accumulate = misses->left < job.late_cpu;
+    cpu_job.per_token = true;
     for (size_t i = 0; i < plan.missing.size(); ++i) {
       const Lane& lane = request.lanes[plan.miss_lane[i]];
       if (lane.kind != Wire::kKindMissCpu || (misses->sent >> i & 1u) != 0) continue;
       if (!(i < group.packed.size() && group.packed[i] != 0)) continue;
       cpu_job.slots[cpu_job.k] = static_cast<int32_t>(plan.slots[i]);
       cpu_job.weights[cpu_job.k] = lane.weight;
+      cpu_job.lanes[cpu_job.k] = static_cast<int32_t>(plan.miss_lane[i]);
       ++cpu_job.k;
       misses->sent |= Wire::LaneMask{1} << i;
     }

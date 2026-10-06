@@ -440,6 +440,7 @@ struct HostExports {
       TensorView out_rows,
       int64_t hidden,
       int64_t parts,
+      int64_t tokens,
       int64_t threads,
       int64_t spin_ns,
       int64_t keep_warm_ns) {
@@ -466,11 +467,22 @@ struct HostExports {
       throw std::runtime_error(error_prefix<Layout>() + "CPU experts write 1 or 2 output parts");
     if (group < 0 || group >= expert_stream::Wire::kNodes)
       throw std::runtime_error(error_prefix<Layout>() + "CPU experts name a group the build does not have");
-    if (out_rows.size(1) < expert_stream::Wire::kNodes * parts * hidden)
+    if (tokens < 1 || tokens > expert_stream::CpuTokenTable::kMaxTokens)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU expert rows hold 1-32 tokens");
+    if (tokens > 1 && parts != 2)
+      throw std::runtime_error(error_prefix<Layout>() + "a multi-token CPU expert row has two parts per group");
+    config.tokens = tokens;
+    config.x_token_bytes = (2 * hidden + 15) / 16 * 16;
+    const int64_t table = tokens > 1 ? expert_stream::CpuTokenTable::kHeaderBytes +
+                                           4 * expert_stream::Wire::kLanes * (1 + tokens)
+                                     : 0;
+    if (x_rows.size(1) < tokens * config.x_token_bytes + table)
+      throw std::runtime_error(error_prefix<Layout>() + "x_rows is narrower than its tokens and token table");
+    if (out_rows.size(1) < expert_stream::Wire::kNodes * parts * tokens * hidden)
       throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than every group's parts");
-    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr()) + group * parts * hidden * sizeof(float);
+    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr()) + group * parts * tokens * hidden * sizeof(float);
     config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
-    config.out_part_stride = parts == 2 ? hidden * static_cast<int64_t>(sizeof(float)) : 0;
+    config.out_part_stride = parts == 2 ? tokens * hidden * static_cast<int64_t>(sizeof(float)) : 0;
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
     config.spin_ns = spin_ns;

@@ -2,11 +2,13 @@
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "Copy engine".
 #pragma once
 
+#include "../cpu_token_table.h"
 #include "../lease_layout.h"
 #include "cpu_experts/kernel.hpp"
 #include "reader_base.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdint>
@@ -84,15 +86,18 @@ inline void check_cpu_expert_team(const std::string& prefix, const std::vector<i
 ///
 /// A record produces at most one job for its CPU hits (part 0) and one per batch of CPU misses that landed together
 /// (part 1). Every miss job after the first adds into part 1 in landing order, so that part's fp32 sum order varies
-/// from run to run.
+/// from run to run. A record's job is per_token: on a multi-token row (CpuExpertConfig::tokens > 1) the row's token
+/// table gives each token its own slots and weights, `lanes` naming each job lane's column there.
 struct CpuJob {
   int64_t row = 0;
   int32_t part = 0;
   bool accumulate = false;  // add into the part rather than overwrite it
+  bool per_token = false;   // a record's job: a multi-token row's table gives each token its weights
   uint32_t seq = 0;         // from claim()
   int32_t k = 0;
   int32_t slots[wire::Wire::kLanes] = {};
   float weights[wire::Wire::kLanes] = {};
+  int32_t lanes[wire::Wire::kLanes] = {};  // each job lane's record lane
 };
 
 /// The pinned tables a CpuExpertEngine reads and writes, and how it runs. Row r's input is at x_base + r * x_stride
@@ -106,6 +111,8 @@ struct CpuExpertConfig {
   int64_t out_stride = 0;
   int64_t out_part_stride = 0;  // 0: one part, so CPU misses are refused (RamTier::serve_record)
   int64_t hidden = 0;
+  int64_t tokens = 1;         // tokens a row holds; above 1 a token table follows the inputs (cpu_token_table.h)
+  int64_t x_token_bytes = 0;  // bytes between two tokens' staged inputs
   int threads = 1;
   std::vector<int> cores;  // worker i runs on cores[i]; the engine's own thread on cores[0]
   int64_t keep_warm_ns = 0;  // how long after each job the held team runs register work instead of PAUSE
@@ -228,6 +235,8 @@ class CpuExpertEngine {
       throw std::runtime_error(prefix_ + "the CPU expert input and output rows are required");
     if (c.hidden <= 0 || c.out_stride < c.hidden * static_cast<int64_t>(sizeof(float)))
       throw std::runtime_error(prefix_ + "the CPU expert output rows are smaller than the hidden size");
+    if (c.tokens < 1 || c.tokens > CpuTokenTable::kMaxTokens || (c.tokens > 1 && c.x_token_bytes < 2 * c.hidden))
+      throw std::runtime_error(prefix_ + "the CPU expert rows hold 1-32 tokens of the hidden size");
     check_cpu_expert_team(prefix_, c.cores, c.threads);
   }
 
@@ -279,6 +288,15 @@ class CpuExpertEngine {
         reinterpret_cast<float*>(config_.out_base + job.row * config_.out_stride + job.part * config_.out_part_stride);
     call.accumulate = job.accumulate;
     call.cores = config_.cores;
+    if (job.per_token && config_.tokens > 1) {
+      call.rows = static_cast<int32_t>(expand_tokens(job, call.x));
+      call.slots = token_slots_.data();
+      call.weights = token_weights_.data();
+      // A token that routes none of the lanes must read 0, whatever an earlier record left: zero the rows here rather
+      // than trust the kernel's overwrite, then accumulate.
+      if (!job.accumulate) std::memset(call.out, 0, static_cast<size_t>(call.rows) * config_.hidden * sizeof(float));
+      call.accumulate = true;
+    }
     try {
       const cpu_experts::ExpertLayer* layer = config_.layers->get(job.row);
       if (layer == nullptr) throw std::invalid_argument("the row has no registered layer");
@@ -293,6 +311,35 @@ class CpuExpertEngine {
     add(lanes_done_, job.k);
     done_.store(job.seq, std::memory_order_release);
     return end;
+  }
+
+  /// A record's job on a multi-token row: each token's slots and weights from the row's token table
+  /// (cpu_token_table.h), -1 where the token does not route the lane's expert (the kernel skips only slot -1, never a
+  /// zero weight). Returns the record's tokens; fails stop on a count the row cannot hold.
+  uint32_t expand_tokens(const CpuJob& job, const uint8_t* x) {
+    constexpr int64_t kLanes = wire::Wire::kLanes;
+    const uint8_t* table = x + config_.tokens * config_.x_token_bytes;
+    const uint32_t tokens = load_u32(table);
+    if (tokens < 1 || tokens > static_cast<uint32_t>(config_.tokens)) {
+      fail_stop(prefix_ + "row " + std::to_string(job.row) + "'s token table holds " + std::to_string(tokens) +
+                " tokens");
+      return 1;
+    }
+    for (uint32_t t = 0; t < tokens; ++t)
+      for (int32_t i = 0; i < job.k; ++i) {
+        const int32_t lane = job.lanes[i];
+        const bool routed = (load_u32(table + CpuTokenTable::kHeaderBytes + 4 * lane) >> t & 1u) != 0;
+        const uint32_t bits = load_u32(table + CpuTokenTable::kHeaderBytes + 4 * kLanes + 4 * (t * kLanes + lane));
+        token_slots_[t * job.k + i] = routed ? job.slots[i] : -1;
+        token_weights_[t * job.k + i] = routed ? std::bit_cast<float>(bits) : 0.0f;
+      }
+    return tokens;
+  }
+
+  static uint32_t load_u32(const uint8_t* p) {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
   }
 
   /// Holds the team until the doorbell's word moves past `kick` or the clock reaches release_at.
@@ -327,6 +374,9 @@ class CpuExpertEngine {
   std::atomic<int64_t> jobs_done_{0};
   std::atomic<int64_t> lanes_done_{0};
   std::atomic<int64_t> compute_ns_{0};
+  // A per-token job's expanded slots and weights, [tokens][k]; this thread only.
+  std::array<int32_t, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_slots_{};
+  std::array<float, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_weights_{};
   std::atomic<bool> stop_{false};
 };
 
