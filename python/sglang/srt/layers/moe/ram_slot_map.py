@@ -19,6 +19,12 @@ class LaneKind(IntEnum):
     MISS_CPU = 5
 
 
+class LaneOverflow(ValueError):
+    """Forced lanes (DIRECT found them no VRAM victim, the post's spill) cannot be CPU lanes: no host lanes (the copy
+    engine is not armed) or no CPU layer. The post then serves the unforced prefix and flags the forward
+    (exl3_ram_miss_post_kernel)."""
+
+
 def type_lanes(
     experts: Sequence[int],
     ram_slot: Sequence[int],
@@ -35,24 +41,35 @@ def type_lanes(
     cpu_ok: bool = True,
     dst_ok: Optional[Sequence[bool]] = None,
     nodes: int = 1,
+    forced_from: Optional[int] = None,
 ) -> tuple[list[LaneKind], list[int]]:
     """Each lane's kind and source slot: its RAM slot for a hit, the next staging slot of its home node for a miss.
 
     ``staging`` is node-major, ``nodes * lanes`` slots, and ``split`` node-major, ``nodes * (lanes + 1)`` counts. A
     miss takes the next slot of its home node's list; node n's CPU takes the last ``split[n][k]`` of its k eligible
     lanes in plan order (miss_keys descending, so the lowest-scored): RAM hits, plus NVMe misses with
-    ``cpu_misses``."""
+    ``cpu_misses``.
+
+    Lanes from ``forced_from`` on (spill, SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES) found no VRAM victim: each is a
+    CPU lane whatever the split. A forced hit runs from its RAM slot; a forced miss gets slot -1 and no staging slot,
+    since the host reads it into a RAM victim (RamTier::reserve_victims_locked). The split counts only the lanes before
+    ``forced_from``. Raises LaneOverflow when forced lanes cannot be CPU lanes (no host lanes, no CPU layer)."""
     if len(experts) > lanes:
         raise ValueError(f"a request has at most {lanes} lanes, got {len(experts)}")
     if len(set(experts)) != len(experts):
         raise ValueError(f"a request names an expert twice: {list(experts)}")
+    forced_from = len(experts) if forced_from is None else forced_from
     home = wire_layout(lanes, nodes).home
     slots, hit, taken = [], [], [0] * nodes
-    for e in experts:
+    for j, e in enumerate(experts):
         s = ram_slot[e]
         if s >= 0:
             slots.append(s)
             hit.append(True)
+            continue
+        if j >= forced_from:
+            slots.append(-1)  # host-placed: read into a RAM victim, never a staging slot
+            hit.append(False)
             continue
         node = home(e)
         m = taken[node]
@@ -62,12 +79,15 @@ def type_lanes(
         hit.append(False)
         taken[node] += 1
     host_lanes = captured and copy_armed
-    eligible = [host_lanes and cpu_on and cpu_ok and (h or cpu_misses) for h in hit]
+    can_cpu = host_lanes and cpu_on and cpu_ok
+    if forced_from < len(experts) and not can_cpu:
+        raise LaneOverflow(f"lanes {forced_from}.. found no victim and cannot be CPU lanes")
+    eligible = [j < forced_from and can_cpu and (h or cpu_misses) for j, h in enumerate(hit)]
     take = [0] * nodes
     for node in range(nodes):
         n = sum(1 for e, ok in zip(experts, eligible) if ok and home(e) == node)
         take[node] = split[node * (lanes + 1) + n] if n else 0
-    cpu = [False] * len(experts)
+    cpu = [j >= forced_from for j in range(len(experts))]
     for j in reversed(range(len(experts))):
         node = home(experts[j])
         if take[node] > 0 and eligible[j]:
