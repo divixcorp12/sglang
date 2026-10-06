@@ -180,14 +180,13 @@ class Exl3FusedMoE:
         """x [M, H], 1 <= M <= tokens, any float dtype; topk_weights [M * top_k]; remap [M * top_k] slots, int64
         (int32 too with layer fusion); keep fp32 [1]. Returns the fp32 [M, H] output, a view of this object's buffer.
 
-        ``cpu`` = (cpu_lanes, dst_slots, cpu_out address, part stride), CPU experts only, one token: the routes the
+        ``cpu`` = (cpu_lanes, dst_slots, cpu_out address, part stride), CPU experts only, any M (each token's partial at
+        ``t * hidden`` within each part): the routes the
         CPU computed are left out and the partial sums CC flagged seed the output (exl3_route_tables.cuh). Layer
         fusion only."""
         m = x.shape[0]  # a host-side shape read: capture-safe
         if not 1 <= m <= self.tokens:
             raise ValueError(f"exl3 in-graph MoE runs 1-{self.tokens} tokens, not {m}")
-        if cpu is not None and m != 1:
-            raise RuntimeError(f"CPU experts run one token, not {m}")
         if cpu is not None and not self.layer_fusion:
             raise RuntimeError("CPU experts need SGLANG_DSV41_ENABLE_LAYER_FUSION: only its route tables leave CPU routes out")
         routes = m * self.top_k

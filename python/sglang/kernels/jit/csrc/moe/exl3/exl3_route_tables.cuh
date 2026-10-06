@@ -40,9 +40,9 @@ __device__ __forceinline__ float route_tables_to_float(__nv_bfloat16 v) {
 // each), and token_sorted_out (when non-null) receives each rank's token, which exllamav3's fused MoE reads as
 // token_sorted.
 //
-// CPU experts (plan 2026-09-29-dsv41-cpu-experts; cpu_lanes non-null; one token only): the lanes of cpu_lanes[0] were
+// CPU experts (plan 2026-09-29-dsv41-cpu-experts; cpu_lanes non-null; any M tokens, plan 2026-10-06-dsv41-dspark-both-cpu-experts): the lanes of cpu_lanes[0] were
 // computed by the CPU expert thread, whose partial sums seed the output instead of zero: part p at cpu_out + p *
-// part_stride (host memory, [hidden] fp32) for every bit p of cpu_lanes[1]: bit 2g group g's CPU hits', bit 2g + 1 its
+// part_stride (host memory, [tokens][hidden] fp32) for every bit p of cpu_lanes[1]: bit 2g group g's CPU hits', bit 2g + 1 its
 // CPU misses'. A part whose bit is clear holds an earlier record's sum and is never read. A route
 // whose slot is such a lane's dst_slots entry is ranked as if its slot were past every column: its slot's count is 0
 // (the fused kernel and the gather skip it) and every other slot's start, which the fused kernel recomputes as a
@@ -86,7 +86,7 @@ __global__ void exl3_moe_route_tables_kernel(
     }
     return r;
   };
-  // CPU experts run one token, so a seeded part is read only where i < hidden.
+  // Each token's partial is its own [hidden] row of each part, so element i of the output reads element i of each.
   for (int64_t i = tid; i < tokens * hidden; i += stride) {
     x16_out[i] = __float2half_rn(route_tables_to_float(x[i]));
     float seed = 0.0f;
@@ -193,7 +193,6 @@ void exl3_moe_route_tables_gpu(
       cpu_lanes.size(0) == 0 || cpu_lanes.size(0) == 2 || cpu_lanes.size(0) == 3,
       "cpu_lanes: two words (three for a wide wire), or empty when CPU experts are off");
   RuntimeCheck(!cpu_on || (cpu_out != 0 && cpu_out % 16 == 0), "cpu_out: the CPU partial's host row, 16-byte aligned");
-  RuntimeCheck(!cpu_on || M_.unwrap() == 1, "CPU experts run one token (x has one row)");
   RuntimeCheck(cpu_part_stride >= 0 && cpu_part_stride % 4 == 0, "cpu_part_stride: floats between parts, 16-byte steps");
   const auto stream = host::LaunchKernel::resolve_device(remap.device());
   const int64_t tokens = x.size(0);
