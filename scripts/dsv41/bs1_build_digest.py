@@ -85,10 +85,11 @@ def _text(so: str) -> str:
 
 def _cpu_kernel() -> dict[str, str]:
     """The optimized EXL3 CPU kernel library's one-word keep-warm and forward entry points: objdump per function,
-    addresses and raw bytes stripped, operand addresses reduced to the symbols they name. Needs SGLANG_EXL3_SRC and
-    SGLANG_DSV41_CPU_EXPERTS=1 (the optimized build)."""
+    addresses and raw bytes stripped, operand addresses reduced to the symbols they name. Needs SGLANG_EXL3_SRC and a
+    GCC 15 (SGLANG_EXL3_CPU_CXX); builds the optimized kernel (SGLANG_DSV41_CPU_EXPERTS=1, set here)."""
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
+    os.environ["SGLANG_DSV41_CPU_EXPERTS"] = "1"  # the optimized build; the BS1 suites above ran without it
     so = exl3_ext().__file__
     text = subprocess.run(["objdump", "-d", "-C", "--no-show-raw-insn", so], capture_output=True, text=True,
                           check=True).stdout
@@ -112,7 +113,9 @@ def collect(keep_cache: str | None = None, reuse_cache: str | None = None) -> di
     cache = reuse_cache or os.path.join(REPO, ".bs1-digest-cache")
     if not reuse_cache:
         shutil.rmtree(cache, ignore_errors=True)
-        env = os.environ | {"SGLANG_JIT_CACHE_DIR": cache, "PYTHONPATH": os.path.join(REPO, "python")}
+        # The BS1 suites build the 8-lane one-token modules; the CPU-experts switch would put the copy engine under them.
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_DSV41_CPU_EXPERTS"}
+        env |= {"SGLANG_JIT_CACHE_DIR": cache, "PYTHONPATH": os.path.join(REPO, "python")}
         rc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *SUITES], env=env,
                             cwd=REPO).returncode
         if rc != 0:
