@@ -37,15 +37,15 @@ struct Dsv41Shape
     static constexpr float act_limit(const ExpertLayer&) { return kActLimit; }
 
     // Whether this call may take the DSV4.1 plan: the build quantizes activations residual/block-128, the layer has
-    // every fact above (shape, limit 10, unswizzled 3-bit), and every chunk holds one token (a prefill chunk of two
-    // tokens takes the generic plan).
+    // every fact above (shape, limit 10, unswizzled 3-bit), and every chunk holds 1..CHUNK_M tokens (register_tiles<M>,
+    // kRegisterBudget).
     static bool accepts(const ExpertLayer& l, const Exl3Quant::Params& p, const std::vector<Chunk>& chunks)
     {
         if (ACT_ROWS != 2 || EXL3_MOE_CPU_ACT_BLOCK != 128) return false;
         if (l.hidden != kHidden || l.intermediate != kIntermediate || l.act_limit != kActLimit) return false;
         if (p.bits != kBits || p.swizzled) return false;
         for (const auto& ch : chunks)
-            if (ch.m != 1) return false;
+            if (ch.m < 1 || ch.m > CHUNK_M) return false;
         return true;
     }
 };

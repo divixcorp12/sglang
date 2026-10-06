@@ -104,6 +104,14 @@ void run_tiles_raw(const Exl3Projection& mat, const PreparedIn& in, float* tout,
     }
 }
 
+// register_tiles<M> for M = 1..CHUNK_M, generated from CHUNK_M: one direct call per M.
+template <int... Ms>
+M1_ALWAYS_INLINE void register_tiles_for(std::integer_sequence<int, Ms...>, const Exl3Projection& mat,
+                                         const PreparedIn& in, float* tout, int m, int tn0, int tn1, bool grouped)
+{
+    (void)((m == Ms + 1 && (register_tiles<Ms + 1>(mat, in, tout, tn0, tn1, grouped), true)) || ...);
+}
+
 // m token rows through the quantized kernels under the accuracy options (quantize_act's layout): per
 // k-block sub-views summed in fp32, then each remainder row added onto its token row. Only this
 // worker's columns [tn0, tn1) are touched, so the sums need no synchronization.
@@ -114,9 +122,10 @@ void run_tiles(
     if (tn0 >= tn1) return;
     if constexpr (I == Isa::Bw && ACT_ROWS == 2 && EXL3_MOE_CPU_ACT_BLOCK == 128)
     {
-        if (m == 1 && mat.bits == 3 && act_blocked(mat.k))
+        // One token from either plan; several only as the DSV4.1 plan's compact input (PlanTraits::kCompactScratch).
+        if ((m == 1 || in.compact) && mat.bits == 3 && act_blocked(mat.k))
         {
-            register_tiles(mat,in,tout,tn0,tn1,grouped);
+            register_tiles_for(std::make_integer_sequence<int, CHUNK_M>{}, mat, in, tout, m, tn0, tn1, grouped);
             return;
         }
     }
@@ -416,7 +425,7 @@ template <class Shape, Isa I>
 struct PlanTraits
 {
     static constexpr bool kCompactScratch = false;    // int16 compact activations instead of the int32 splats
-    static constexpr bool kGroupedTraversal = false;  // range-aware multi-band traversal when one expert is routed
+    static constexpr bool kGroupedTraversal = false;  // range-aware multi-band traversal when one expert is routed (one-token chunks: kRegisterBudget[0])
     static constexpr bool kWideSingleExpert = false;  // 512-wide quantization for one token through one expert
     static constexpr int kSplitTiles = 8;             // GEMV split unit in tiles (assign_gemvs)
 };
@@ -468,9 +477,13 @@ private:
             grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H);
             grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I_);
         } else {
-            grow(ar.compact_g,size_t(nc)*ACT_ROWS*H);
-            grow(ar.compact_u,size_t(nc)*ACT_ROWS*H);
-            grow(ar.compact_d,size_t(nc)*ACT_ROWS*I_);
+            // Compact: each chunk's ACT_ROWS * m rows follow the previous chunk's (a call of one-token chunks keeps chunk
+            // j at j * ACT_ROWS rows).
+            size_t rows = 0;
+            for (const Chunk& ch : ctx.chunks) rows += size_t(ACT_ROWS) * ch.m;
+            grow(ar.compact_g,rows*H);
+            grow(ar.compact_u,rows*H);
+            grow(ar.compact_d,rows*I_);
         }
         grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I_);
         grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I_);
@@ -479,6 +492,7 @@ private:
         ctx.tout_g = ar.tout_g.data();
         ctx.tout_u = ar.tout_u.data();
         ctx.tout_d = ar.tout_d.data();
+        size_t row0 = 0;
         for (int j = 0; j < nc; ++j)
         {
             ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_M * H,
@@ -491,9 +505,10 @@ private:
                               compact?nullptr:(ar.splat_d.data() + static_cast<size_t>(j) * MAX_M * I_),
                               compact?nullptr:(ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_M * I_), {}, {} };
             if(compact) {
-                ctx.prep_g[j].compact=ar.compact_g.data()+size_t(j)*ACT_ROWS*H;
-                ctx.prep_u[j].compact=ar.compact_u.data()+size_t(j)*ACT_ROWS*H;
-                ctx.prep_d[j].compact=ar.compact_d.data()+size_t(j)*ACT_ROWS*I_;
+                ctx.prep_g[j].compact=ar.compact_g.data()+row0*H;
+                ctx.prep_u[j].compact=ar.compact_u.data()+row0*H;
+                ctx.prep_d[j].compact=ar.compact_d.data()+row0*I_;
+                row0+=size_t(ACT_ROWS)*ctx.chunks[j].m;
             }
         }
         if constexpr (Traits::kSplitTiles < 8)
