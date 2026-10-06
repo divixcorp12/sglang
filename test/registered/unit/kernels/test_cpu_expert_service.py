@@ -215,7 +215,7 @@ class FakeHost:
     def copy_expert_bytes(self, row):
         return 1024
 
-    def calibrate_cpu_split(self, row, *, device, reps, scratch, timeout_s=1.0, group=0):
+    def calibrate_cpu_split(self, row, *, device, reps, scratch, timeout_s=1.0, group=0, lanes=None):
         self.calibrations.append((row, device, reps, scratch.numel(), str(scratch.device), group))
         self.scratch = scratch
         # Calibration's own jobs show in the stats, also those of a calibration that then fails.

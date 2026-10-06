@@ -160,3 +160,30 @@ def test_calibration_runs_on_the_first_row_with_a_slot_per_lane(capacities, lane
     from sglang.srt.layers.moe.cpu_experts.service import calibration_row
 
     assert calibration_row(capacities, lanes) == row
+
+
+def test_a_capped_calibration_times_only_its_lanes(tmp_path):
+    """Spill caps calibration at the victim lanes (the split is only indexed below them): a 16-lane host told 4 lanes
+    times the 4-lane cells, leaves every other cell 0, and needs 4 experts of scratch."""
+    _, host, _, _keep = _host(tmp_path, capacity=20, lanes=16)
+    jobs_before = host.cpu_stats()["jobs"]
+    scratch = torch.zeros(4 * host.copy_expert_bytes(ROW), dtype=torch.uint8)
+    grid = host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=scratch, lanes=4)
+    assert tuple(grid.shape) == (18, 17)
+    assert all(grid[0, k] > 0 for k in range(1, 5)) and not any(grid[0, 5:])
+    for n in range(1, 17):
+        row = grid[1 + n]
+        assert all(row[k] > 0 for k in range(n + 1)) if n <= 4 else not any(row), n
+    assert host.cpu_stats()["jobs"] - jobs_before == (4 + 10) * 2
+
+
+def test_the_capped_split_keeps_the_configured_entries_above_the_cap():
+    from sglang.srt.layers.moe.cpu_experts.policy import capped_split, split_from_grid
+
+    grid = [[0.0] * 17 for _ in range(18)]
+    for n in range(1, 5):
+        for k in range(n + 1):
+            grid[1 + n][k] = 10.0 - k  # more CPU lanes are faster: split[n] = n
+    configured = list(range(100, 117))
+    assert capped_split(grid, 4, configured) == [0, 1, 2, 3, 4] + configured[5:]
+    assert capped_split(grid, 4, configured)[:5] == split_from_grid([r[:5] for r in grid[:6]])

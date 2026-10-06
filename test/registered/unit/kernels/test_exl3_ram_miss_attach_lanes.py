@@ -1,6 +1,7 @@
 """Attaching an in-graph layer refuses a gather wider than the lanes the post kernel requests (CPU)."""
 
 import faulthandler
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -118,20 +119,6 @@ def test_a_verify_row_stages_its_miss_width_not_its_routes(tiers, monkeypatch, c
     with caplog.at_level("WARNING", logger=module.__name__):
         _attach(service, streamers[0], 36)
     assert any("stages" in r.getMessage() for r in caplog.records) is warns
-
-
-def test_cpu_experts_refuse_a_miss_width_below_the_routes(tiers):
-    """CPU experts are one token: their lanes and partials cover one token's routes (D2-4 lifts this)."""
-    service, streamers = tiers
-    service.plan_gather_width(8)
-    service.ensure_started()
-    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
-    try:
-        streamers[0].graph_miss_lanes = 8
-        with pytest.raises(ValueError, match="CPU experts serve one token"):
-            _attach(service, streamers[0], 36)
-    finally:
-        service.cpu_experts = None
 
 
 def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
@@ -334,3 +321,95 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def _spill_updater():
+    updater = DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
+    updater.miss_rows, updater.victim_lanes = 36, 8
+    updater.overflow_flag = torch.zeros(1, dtype=torch.int32)
+    updater.gather_overflow = torch.zeros(LAYERS, dtype=torch.int64)
+    return updater
+
+
+def _attach_verify(service, streamer, updater):
+    streamer._graph_pinned_tier = True
+    streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
+    streamer.graph_gather_rows, streamer.graph_miss_lanes = 36, 0  # a lane per route
+    streamer.residency_row = 1
+    streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
+    service.attach(SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater), streamer)
+
+
+def test_cpu_experts_attach_a_verify_gather_and_wire_its_spill_words(tiers, monkeypatch):
+    """Six tokens of top-6 with a lane per route (36 on a 40-lane wire), 8 of them victim lanes: the layer attaches with
+    CPU experts on, and its backend posts with DIRECT's overflow flag and its own row of the overflow counter (a view:
+    the post's increment is the updater's). The room check is the next test's."""
+    service, streamers = tiers
+    service.plan_gather_width(36)
+    service.ensure_started()
+    monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(service, "_check_spill_room", lambda row, streamer, width: None)
+    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
+    updater = _spill_updater()
+    try:
+        _attach_verify(service, streamers[0], updater)
+    finally:
+        service.cpu_experts = None
+    flag, counter = streamers[0].row_backend.spill
+    assert flag is updater.overflow_flag
+    counter.add_(1)
+    assert updater.gather_overflow.tolist() == [0, 1]
+
+
+def test_spill_refuses_a_tier_without_a_victim_for_every_forced_miss(tiers, monkeypatch):
+    """Review Focus 2 at start-up: a forced CPU miss is read into a RAM victim, so every node range of the layer must hold
+    staging + 36 lanes + the VRAM-hot slots. These 3-slot tiers cannot: refused at attach, not fail-stopped mid-verify."""
+    service, streamers = tiers
+    service.plan_gather_width(36)
+    service.ensure_started()
+    monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
+    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
+    try:
+        with pytest.raises(ValueError, match="reads every forced CPU miss into a RAM victim"):
+            _attach_verify(service, streamers[0], _spill_updater())
+    finally:
+        service.cpu_experts = None
+
+
+@pytest.mark.parametrize(
+    "ranges, short",
+    [
+        ([(0, 80), (80, 161)], []),  # the recipe: 80 and 81 slots, 8 + 36 + 24 = 68 needed
+        ([(0, 60), (60, 161)], [(0, 60, 68)]),
+        ([(0, 161)], []),  # one node
+    ],
+)
+def test_spill_room_is_staging_plus_lanes_plus_hot_per_node(ranges, short):
+    assert module.spill_room_shortfall(ranges, staging=8, lanes=36, hot=24) == short
+
+
+def test_a_captured_cpu_expert_gather_posts_its_spill_words(monkeypatch):
+    streamer = SimpleNamespace(_plan_miss_keys=torch.zeros(EXPERTS, dtype=torch.int64))
+    backend, side = _captured_backend(monkeypatch, lambda: streamer)
+    assert backend.spill is None
+    backend.spill = (torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int64))
+    backend.post(0, _CapturedPlan())
+    assert side.calls[0][1]["spill"] is backend.spill
+
+
+def test_cpu_rows_hold_the_verify_tokens():
+    """A 6-token verify's service rows: x rows of cpu_row_bytes(hidden, 6, lanes), out rows [rows, 2 * nodes, 6,
+    hidden]; one token keeps today's shapes."""
+    from sglang.srt.layers.moe.cpu_experts.service import CpuExpertService
+
+    cores = sorted(os.sched_getaffinity(0))[:2]
+    for tokens, out_shape in ((1, (2, 2, 64)), (6, (2, 2, 6, 64))):
+        host = SimpleNamespace(
+            wire=lease.wire_layout(40), nodes=1, enable_cpu_experts=lambda *a, **k: None, cpu_stats=lambda group: {},
+        )
+        trait = SimpleNamespace(check_environment=lambda: None, kernel_address=lambda: 1, name="t")
+        service = CpuExpertService(
+            host, trait, {0: {}, 1: {}}, hidden=64, cores=cores, threads=2, split=[0] * 41, pin=False, tokens=tokens,
+        )
+        assert tuple(service.out_rows.shape) == out_shape
+        assert service.x_rows.shape[1] == lease.cpu_row_bytes(64, tokens, 40)
