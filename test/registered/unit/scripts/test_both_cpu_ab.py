@@ -42,4 +42,4 @@ def test_a_dspark_arm_gets_a_health_budget_past_its_measured_startup_and_run_arm
     assert seen["env"]["DSV41_HEALTH_TIMEOUT_S"] == str(ab._health_timeout_s(True))
     script = open(os.path.join(ROOT, "benchmarks", "dsv41_baseline", "run_arm.sh")).read()
     assert "${DSV41_HEALTH_TIMEOUT_S:-900}" in script
-    assert "seq 1 180" not in script
+    assert "seq 1 $((health_timeout_s / 5))" in script

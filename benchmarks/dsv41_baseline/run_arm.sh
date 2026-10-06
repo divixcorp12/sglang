@@ -380,7 +380,7 @@ stop_server() {
     for _ in $(seq 1 60); do [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && break; sleep 2; done
 }
 
-# --- health gate: up to 900 s (smoke.sh's own shape: 180 x 5 s), curl -f treats any
+# --- health gate: up to $health_timeout_s (900 s by default; smoke.sh's own shape: 180 x 5 s), curl -f treats any
 #     non-2xx (including the 503 the smoke log showed while still starting) as failure,
 #     so this already only succeeds on a real 200. Never shorten the per-call timeout. ---
 healthy=0
