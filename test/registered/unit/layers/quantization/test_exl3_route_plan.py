@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from sglang.srt.layers.quantization import exl3_ops
-from sglang.srt.layers.quantization.exl3_ops import Exl3RoutePlan, random_exl3_tensors
+from sglang.srt.layers.quantization.exl3 import ops as exl3_ops
+from sglang.srt.layers.quantization.exl3.ops import Exl3RoutePlan, random_exl3_tensors
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

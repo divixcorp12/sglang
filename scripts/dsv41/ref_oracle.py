@@ -34,7 +34,7 @@ import numpy as np
 # All EXL3-dequantizing pieces of this module (Exl3Tensors, exl3_dense_weight) are pure GPU
 # kernels; importing sglang itself does not need a GPU.
 from sglang.srt.layers.engram_file_table import EngramFileTable
-from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_dense_weight
+from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_dense_weight
 
 _DEFAULT_SESSIONS = "/mnt/nvme2/nvfp4-work/benchmarks/full/sessions.jsonl"
 

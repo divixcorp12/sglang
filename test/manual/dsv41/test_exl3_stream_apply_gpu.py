@@ -36,7 +36,7 @@ def test_streamed_apply_equals_resident(tmp_path, tokens, max_gather_rows, hot_e
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
     from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
-    from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_moe_loop
+    from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_moe_loop
 
     write_fake_exl3(str(tmp_path), num_layers=2, num_experts=NUM_EXPERTS, finite=True)
     exl3_expert_layout_for.cache_clear()
@@ -127,7 +127,7 @@ def test_many_experts_route_plan_equals_resident(tmp_path, route_plan):
     from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
     from sglang.srt.layers.moe.expert_stream import ExpertPinnedHostCache
     from sglang.srt.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
-    from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_moe_loop
+    from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_moe_loop
 
     num_experts, tokens, topk = 80, 40, 6
     write_fake_exl3(str(tmp_path), num_layers=2, num_experts=num_experts, finite=True)
@@ -190,7 +190,7 @@ def test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands(monkeyp
     import contextlib
 
     from sglang.srt.layers.moe.exl3_stream_trace import Exl3StreamTrace
-    from sglang.srt.layers.quantization import exl3 as exl3_mod
+    from sglang.srt.layers.quantization.exl3 import exl3 as exl3_mod
     from sglang.srt.layers.quantization.exl3 import Exl3MoEMethod
 
     gather_done = []
@@ -228,7 +228,7 @@ def test_route_plan_leaves_the_host_use_only_after_the_last_gather_lands(monkeyp
     assert len(gather_done) == 2 and exit_saw == [[True, True]]
 
 def _planned_inputs(experts=8, hidden=5120, inter=2304, tokens=40):
-    from sglang.srt.layers.quantization.exl3_ops import Exl3RoutePlan, random_exl3_tensors
+    from sglang.srt.layers.quantization.exl3.ops import Exl3RoutePlan, random_exl3_tensors
 
     w13 = [
         (
@@ -246,7 +246,7 @@ def _planned_inputs(experts=8, hidden=5120, inter=2304, tokens=40):
 
 def test_planned_chunk_body_never_syncs():
     """With the plan built, a chunk's expert compute issues no host sync, so the host can run ahead of its gather."""
-    from sglang.srt.layers.quantization.exl3_ops import exl3_moe_accumulate_planned
+    from sglang.srt.layers.quantization.exl3.ops import exl3_moe_accumulate_planned
 
     x, _, topk_weights, w13, w2, plan = _planned_inputs()
     out = torch.zeros(x.shape[0], x.shape[1], device="cuda")
@@ -261,7 +261,7 @@ def test_planned_chunk_body_never_syncs():
 
 def test_the_where_loop_does_sync():
     """The control for the test above: sync debug mode does catch the per-expert torch.where readback."""
-    from sglang.srt.layers.quantization.exl3_ops import exl3_moe_accumulate
+    from sglang.srt.layers.quantization.exl3.ops import exl3_moe_accumulate
 
     x, topk_ids, topk_weights, w13, w2, plan = _planned_inputs()
     out = torch.zeros(x.shape[0], x.shape[1], device="cuda")

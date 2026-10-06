@@ -7,7 +7,7 @@
 namespace fullstack {
 
 // Runs, in order: the placement rules, DeviceSim's records and lane typing on a standalone page, the row images, then
-// the real stack (this binary's build) on synthetic rows with a fake forward. Returns the number of failed checks.
+// the real stack (this binary's build) on synthetic rows with a fake kernel. Returns the number of failed checks.
 int run_self_test(const Placement& placement, const std::filesystem::path& image_dir);
 
 }  // namespace fullstack

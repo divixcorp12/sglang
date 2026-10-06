@@ -13,7 +13,7 @@ from typing import Callable, Iterable, Iterator
 
 import torch
 
-from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_dense_weight
+from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_dense_weight
 
 EXL3_SUFFIXES = ("suh", "svh", "mul1", "trellis")
 ROUTED_EXPERT_WEIGHT_RE = re.compile(r"^layers\.\d+\.ffn\.experts\.\d+\.")

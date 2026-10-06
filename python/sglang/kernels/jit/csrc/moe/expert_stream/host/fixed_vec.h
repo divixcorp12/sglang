@@ -1,7 +1,7 @@
 // A fixed-capacity vector, and the id-membership helper used with it.
 //
-// The service's per-request lists live in FixedVec: the wire format bounds every one of them (kMaxIds need and protect
-// ids, kLeaseLanes lanes), so nothing on the request path needs the heap.
+// The service's per-request lists live in FixedVec: the wire format bounds every one of them (Wire::kLanes
+// need and protect ids, Wire::kLanes lanes), so nothing on the request path needs the heap.
 #pragma once
 
 #include <algorithm>

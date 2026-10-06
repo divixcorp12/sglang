@@ -2,7 +2,7 @@ Native DSV4.1 CPU expert benchmarks
 ===================================
 
 Two benchmark families live here:
-  - the bare forward: one full CPU-expert forward through the native C ABI,
+  - the bare forward: one full CPU-expert forward through the kernel interface,
     baseline kernel against optimized kernel (exl3_cpu_baseline,
     exl3_cpu_optimized);
   - the full stack: the real RamTier, RamThread, copy engine and CPU expert
@@ -22,7 +22,7 @@ Google Benchmark drives two separate C++ executables:
 Override --workers=N to compare both with the same count. The baseline uses its
 original native pool; the optimized kernel uses OpenMP. Separate processes keep
 one backend's idle workers from contaminating the other's measurements. The
-baseline source is the repo's exl3_cpu/moe_mul1.cpp, not a frozen snapshot.
+baseline source is the repo's csrc/exl3/moe_mul1.cpp, not a frozen snapshot.
 
 There is no Python at configure, build or runtime. The binaries link ATen/c10
 from LibTorch or the server's installed torch directory, not Python bindings or
@@ -119,7 +119,7 @@ Single-process examples:
 
 Timing interpretation
 ---------------------
-One iteration is one native service C ABI full forward: routing-weight
+One iteration is one full forward through the kernel interface: routing-weight
 conversion, kernel preparation, gate/up, activation/down preparation, down and
 output reduction, including OpenMP scheduling and barriers. No Python, GPU work
 or driver-process work is inside it. Manual timing brackets only this C++ call
@@ -180,6 +180,32 @@ the partition, use another placement, for example
 --writer-cpu=0 --service-cpu=1 --copy-cpu=36 --cpus=2-15 --host-node=0
 --worker-node=0 under taskset -c 0-15,36: it is correct, but not a measurement.
 
+Two or more NUMA groups
+-----------------------
+-DEXPERT_STREAM_NODES=N (default 1, 1..8) builds the bench for N groups, as the
+wire's node axis: expert e is homed on group e % N, each group has its own
+service thread, CPU expert thread, kernel engine and slot range of every row
+(StackFixture::kGroupSlots = 8 slots each: 5 experts and 3 staging slots), and
+one copy thread completes every group's lanes. Per-group flags take one entry
+per group:
+  --service-cpu=17,35 --cpus=8-15/18-33 --worker-node=0,1
+(',' between groups' service CPUs and nodes, '/' between groups' CPU lists).
+Above one group a group's service and workers must sit on its own node; the
+writer and the copy thread stay on --host-node. A measured run needs all three
+flags; --self-test defaults to --writer-cpu=0 --copy-cpu=1 --service-cpu=2,3
+--cpus=4/5, and also runs test_two_groups (a fake forward per group, each seeing
+its own engine and only its own slots).
+
+Each group's slots of every slab are bound to that group's node (mbind) before
+the row images are read into them, and slot_of(e) names where the tier maps
+expert e. Group g writes its parts at floats [2 g hidden, 2 g hidden + 2 hidden)
+of the row's output. There is no BM_bare: every group's bare forward (its own
+experts, its own engine, called from its worker 0) is recorded before the stack
+exists, and each BM_stack and --validate-only call checks that every group's part
+equals its bare forward bit for bit (validate_groups) and that the parts' sum
+matches reference-e{k}.bin to within 1e-5 (relative above 1.0), since splitting
+the experts across engines reassociates the fp32 sum.
+
 Row images
 ----------
 --image-dir (default /data/models/exl3_exp/google_benchmark/full-stack-images)
@@ -201,7 +227,8 @@ exists fails.
 Checks
 ------
 --validate-only compares all 24 layer outputs bare, then all 24 through the
-stack, bit-exactly with reference-e{1,3,5}.bin, and requires every thread created
+stack, bit-exactly with reference-e{1,3,5}.bin (above one group: see "Two or
+more NUMA groups"), and requires every thread created
 during setup to be pinned to its CPU.
 
 In a timed run, each benchmark compares its 8 outputs before and after it is
@@ -218,8 +245,8 @@ with a fake forward.
 Benchmarks and counters
 -----------------------
 Per k in 1, 3, 5 (experts 0..k-1, cpu_forward.cpp's weights, 8 layers rotated):
-  BM_bare/experts:k   the C ABI forward, called from worker 0's CPU, on the
-                      stack's handles, slots, x and output
+  BM_bare/experts:k   the kernel's forward, called from worker 0's CPU, on
+                      the stack's slabs (its own layers), slots, x and output
   BM_stack/experts:k  x store, record, gate close, spin until CopyDone == G;
                       t0 before the x store, t1 at CopyDone
 

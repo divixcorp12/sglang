@@ -24,9 +24,10 @@ from pathlib import Path
 
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.test.dsv41_chain_sim import ChainSim
-from sglang.kernels.ops.moe.expert_stream_transport import STAGE_FIELDS
+from sglang.kernels.ops.moe.expert_stream_transport import stage_fields
 from sglang.test.dsv41_ram_miss_fixtures import ram_miss_setup
 
 EXPERTS, CAPACITY = 64, 32
@@ -60,8 +61,8 @@ def _conditions():
         "busy_foreign": _busy_foreign(),
         "tree": tree,
         "tree_head": head(tree),
-        "stage_record_words": len(STAGE_FIELDS),
-        "stage_record_bytes": len(STAGE_FIELDS) * 8,
+        "stage_record_words": len(stage_fields()),
+        "stage_record_bytes": len(stage_fields()) * 8,
         "torch": torch.__version__,
         "kind": "host CPU cost per request; cache-resident buffered reads (tmpfs); no O_DIRECT, no drive, no GPU",
     }
@@ -97,7 +98,7 @@ class Arm:
         root.mkdir()
         self.name, self.trace = name, trace
         self.s = ram_miss_setup(root, capacity=CAPACITY, experts=EXPERTS, row_images=True)
-        self.page = new_page(pin=False)
+        self.page = new_page(pin=False, wire=wire_layout(8))
         # Both arms on the instrumented build: the trace and trace_clock_reads exist only there (plan
         # 2026-09-29-hotpath-zero-overhead Task 10), so the trace-off arm measures InstrBuild with the trace off.
         self.host = ExpertStreamHost(
@@ -150,7 +151,7 @@ def main():
     if args.smoke:
         args.reps, args.requests, args.rows = 2, 20, [1, 3]
     if max(args.rows) > 8:
-        raise SystemExit("a request carries at most 8 ids (kMaxIds); more would silently read fewer rows")
+        raise SystemExit("a request carries at most 8 ids (Wire::kLanes); more would silently read fewer rows")
 
     base = Path(tempfile.mkdtemp(prefix="stage_trace_overhead_", dir="/dev/shm"))
     arms = {"off": Arm(base / "off", "off", False, args.ring), "on": Arm(base / "on", "on", True, args.ring)}

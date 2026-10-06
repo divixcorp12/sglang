@@ -12,7 +12,7 @@ NEEDED = ("exl3_gemm", "reconstruct", "reconstruct_had_slice", "had_r_128", "exl
 
 
 def test_builds_and_exposes_kernels():
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     ext = exl3_ext()
     missing = [name for name in NEEDED if not hasattr(ext, name)]

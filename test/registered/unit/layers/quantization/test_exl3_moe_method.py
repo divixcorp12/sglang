@@ -133,7 +133,7 @@ def test_apply_scales_routed_output_unless_fused(monkeypatch, fused):
     # must apply it exactly once (not again when it is fused into topk_weights).
     from types import SimpleNamespace
 
-    from sglang.srt.layers.quantization import exl3 as exl3_mod
+    from sglang.srt.layers.quantization.exl3 import exl3 as exl3_mod
 
     layer, method = _moe()
     layer.should_fuse_routed_scaling_factor_in_topk = fused

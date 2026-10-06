@@ -5,7 +5,7 @@ import os
 import pytest
 import torch
 
-from sglang.srt.layers.quantization.exl3_ops import (
+from sglang.srt.layers.quantization.exl3.ops import (
     exl3_dense_weight,
     exl3_linear,
     exl3_linear_reference,

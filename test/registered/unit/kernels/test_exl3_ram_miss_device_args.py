@@ -10,13 +10,13 @@ import torch
 
 import sglang.kernels.ops.moe.expert_stream_transport as ram_miss
 from sglang.kernels.ops.moe import expert_lease_block as lease
-from sglang.kernels.ops.moe.expert_stream_transport import PAGE_BYTES, STATE_WORDS, ExpertStreamDevice
-from sglang.srt.layers.moe.ram_slot_map import LaneKind
+from sglang.kernels.ops.moe.expert_stream_transport import STATE_WORDS, ExpertStreamDevice
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.expert_stream_sources import device_sources, host_sources, joined_text, wire_header
+from sglang.test.expert_stream_sources import device_sources, host_sources, joined_text
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
+PAGE_BYTES = lease.wire_layout(8).page_bytes
 CSRC = Path(ram_miss.__file__).resolve().parents[2] / "jit" / "csrc" / "moe"
 
 
@@ -24,13 +24,15 @@ def _runs(layers=2, experts=4):
     return torch.zeros((layers, experts, ram_miss.STAGE_PIECES, 1, 2), dtype=torch.int32)
 
 
-def _device(layers=2, experts=4, page=None, **kwargs):
-    page = torch.zeros(PAGE_BYTES, dtype=torch.uint8) if page is None else page
+def _device(layers=2, experts=4, page=None, lanes=8, **kwargs):
+    wire = lease.wire_layout(lanes)
+    page = torch.zeros(wire.page_bytes, dtype=torch.uint8) if page is None else page
     kwargs.setdefault("piece_runs", _runs(layers, experts))
     kwargs.setdefault("row_capacities", [5, 7][:layers] + [3] * max(0, layers - 2))
     kwargs.setdefault("timeout_ms", 10)
     return ExpertStreamDevice(
-        page, lease.new_lease_block(layers, pin=False), device="cpu", layers=layers, experts=experts, **kwargs
+        page, lease.new_lease_block(layers, pin=False, wire=wire), device="cpu", layers=layers, experts=experts,
+        lanes=lanes, **kwargs,
     )
 
 
@@ -56,6 +58,20 @@ def test_a_page_of_the_wrong_size_is_refused():
         _device(page=torch.zeros(10, dtype=torch.uint8))
 
 
+def test_a_page_built_for_another_lane_count_is_refused():
+    """A 16-lane device over an 8-lane page would read past the records the 8-lane service wrote."""
+    with pytest.raises(ValueError, match="page"):
+        _device(lanes=16, page=torch.zeros(PAGE_BYTES, dtype=torch.uint8))
+    assert _device(lanes=16).wire.lanes == 16
+
+
+@pytest.mark.parametrize("lanes", [8, 16, 32])
+def test_the_device_sizes_its_lane_tensors_by_its_wire(lanes):
+    dev = _device(lanes=lanes)
+    assert dev.map_bank["staging"].shape == (2, lanes)
+    assert dev.lane_kind.numel() == dev.lane_slot.numel() == dev.host_rows_1.numel() == dev.dst_slots_1.numel() == lanes
+
+
 def test_the_timeout_must_be_positive():
     with pytest.raises(ValueError, match="timeout"):
         _device(timeout_ms=0)
@@ -71,6 +87,7 @@ def test_the_host_module_refuses_tables_its_records_cannot_carry(experts, capaci
             torch.zeros(PAGE_BYTES, dtype=torch.uint8), torch.full((1, experts), -1, dtype=torch.int32), empty,
             torch.zeros((1, experts), dtype=torch.int64), empty, empty, empty, empty, empty,
             torch.tensor([capacity], dtype=torch.int64), "", "", 0, 0, 0, no_bytes, no_bytes,
+            torch.tensor([[[0, capacity]]], dtype=torch.int64), torch.full((1,), -2, dtype=torch.int64),
         )
 
 
@@ -85,7 +102,7 @@ def test_an_unpinned_page_is_refused_for_a_cuda_device():
     # Checked before any CUDA call: the kernels read it through UVA.
     with pytest.raises(ValueError, match="pinned"):
         ExpertStreamDevice(
-            torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(2, pin=False), device="cuda", layers=2,
+            torch.zeros(PAGE_BYTES, dtype=torch.uint8), lease.new_lease_block(2, pin=False, wire=lease.wire_layout(8)), device="cuda", layers=2,
             experts=4, timeout_ms=10, piece_runs=_runs(), row_capacities=[5, 7],
         )
 
@@ -149,83 +166,21 @@ def _constants(*paths: Path, known: dict[str, int] | None = None) -> dict[str, i
     found: dict[str, int] = {}
     pattern = r"^\s*(?:static\s+)?constexpr\s+[\w:]+\s+(k\w+)\s*=\s*([^;]+);"
     for name, expression in re.findall(pattern, joined_text(paths), re.MULTILINE):
+        if "::" in expression:
+            continue
         assert name not in found, f"{name} is defined twice: the layout check cannot tell which one applies"
         expression = re.sub(r"(?<=\d)[uU][lL]*\b", "", expression.strip())
         found[name] = seeded[name] = _evaluate(ast.parse(expression, mode="eval").body, seeded)
     return found
 
 
-def _wire():
-    return _constants(wire_header())
-
-
 _NAME = re.compile(r"^\s*(?:static\s+)?constexpr\s+[\w:]+\s+(k\w+)\s*=", re.MULTILINE)
-
-# The wire header, in full: every constant it defines and the Python value it must equal.
-PYTHON_WIRE = {
-    "kDemandHead": ram_miss.WORDS["demand_head"],
-    "kDemandRing": ram_miss.DEMAND_RING,
-    "kDemandRecords": ram_miss.DEMAND_RECORDS,
-    "kRecordBytes": ram_miss.RECORD_BYTES,
-    "kMaxIds": ram_miss.MAX_IDS,
-    "kRecSeq": ram_miss.RECORD_FIELDS["seq"],
-    "kRecRow": ram_miss.RECORD_FIELDS["row"],
-    "kRecCounts": ram_miss.RECORD_FIELDS["counts"],
-    "kRecFlags": ram_miss.RECORD_FIELDS["flags"],
-    "kRecFlagCaptured": ram_miss.RECORD_FLAG_CAPTURED,
-    "kRecChain": ram_miss.RECORD_FIELDS["chain"],
-    "kRecEpoch": ram_miss.RECORD_FIELDS["epoch"],
-    "kRecKinds": ram_miss.RECORD_FIELDS["kinds"],
-    "kRecProtect": ram_miss.RECORD_FIELDS["protect"],
-    "kRecLaneExpert": ram_miss.RECORD_FIELDS["lane_expert"],
-    "kRecLaneSlot": ram_miss.RECORD_FIELDS["lane_slot"],
-    "kRecLaneDst": ram_miss.RECORD_FIELDS["lane_dst"],
-    "kRecLaneWeight": ram_miss.RECORD_FIELDS["lane_weight"],
-    "kRecIdMax": ram_miss.RECORD_ID_MAX,
-    "kPageBytes": PAGE_BYTES,
-    "kKindHitCopy": LaneKind.HIT_COPY,
-    "kKindHitSm": LaneKind.HIT_SM,
-    "kKindHitCpu": LaneKind.HIT_CPU,
-    "kKindMissGpu": LaneKind.MISS_GPU,
-    "kKindMissCpu": LaneKind.MISS_CPU,
-    "kHotHeaderBytes": ram_miss.HOT_HEADER_BYTES,
-    "kHotAlignment": ram_miss.HOT_ALIGNMENT,
-    "kHotRecords": ram_miss.HOT_RECORDS,
-    "kLeaseRing": lease.RING,
-    "kLeaseLanes": lease.LANES,
-    "kLeaseBlockAlign": lease.BLOCK_ALIGN,
-    "kLeasePieceMask": lease.PIECE_MASK,
-    "kLeasePieceMaskLineBytes": lease.PIECE_MASK_LINE_BYTES,
-    "kLeaseCopyDone": lease.COPY_DONE,
-    "kLeaseCopyDoneBytes": lease.COPY_DONE_BYTES,
-    "kLeaseCopyGate": lease.COPY_GATE,
-    "kLeaseGateClosed": lease.GATE["closed"],
-    "kLeaseGateOpen": lease.GATE["open"],
-    "kLeaseGateSeqShift": lease.GATE_SEQ_SHIFT,
-    "kLeaseGateSeqMask": lease.GATE_SEQ_MASK,
-    "kCopyArmed": lease.COPY_ARMED,
-    "kSplit": lease.SPLIT,
-    "kLeaseBlockBytes": lease.BLOCK_BYTES,
-    "kDeltaBase": lease.DELTA_BASE,
-    "kDeltaStride": lease.DELTA_STRIDE,
-    "kDeltaTag": lease.DELTA_FIELDS["tag"],
-    "kDeltaCount": lease.DELTA_FIELDS["count"],
-    "kDeltaStaging": lease.DELTA_FIELDS["staging"],
-    "kDeltaEntries": lease.DELTA_FIELDS["entries"],
-    "kDeltaMaxEntries": lease.DELTA_MAX_ENTRIES,
-}
-
-
-def test_the_wire_header_is_the_python_layout():
-    """The request page and the lease block: one C++ home, equal to Python, and nothing in it Python does not mirror."""
-    assert _wire() == PYTHON_WIRE
-    assert PYTHON_WIRE["kLeaseRing"] == PYTHON_WIRE["kDemandRecords"] and PYTHON_WIRE["kLeaseLanes"] == PYTHON_WIRE["kMaxIds"]
 
 
 def test_no_other_source_defines_a_wire_constant():
     """A layout constant re-added beside its user compiles (an ambiguous name errors only where it is used) and then
     drifts; this names the file that re-added it."""
-    wire = set(_wire())
+    wire = set(lease.wire_probe(8, 1)) - {"kLanes", "kNodes"}
     for path in (*host_sources(), *device_sources()):
         clash = wire & set(_NAME.findall(path.read_text()))
         assert not clash, f"{path.name} redefines wire constants {sorted(clash)}: define them only in lease_layout.h"
@@ -233,7 +188,7 @@ def test_no_other_source_defines_a_wire_constant():
 
 def test_the_device_state_words_are_the_python_state_words():
     """The device state block agrees with Python's STATE_WORDS; this is the only check of it."""
-    device = _constants(*device_sources(), known=_wire())
+    device = _constants(*device_sources(), known=lease.wire_probe(8, 1))
     state = {
         "kPosted": "posted",
         "kPending": "pending",
@@ -273,10 +228,10 @@ def test_the_stream_kernel_refuses_copy_targets_off_16_byte_alignment():
 
 
 def test_hot_sidecar_layout_and_384_expert_size_match_the_native_abi():
-    wire = _wire()
+    wire = lease.wire_probe(8, 1)
     assert wire["kHotHeaderBytes"] == ram_miss.HOT_HEADER_BYTES == 8
     assert wire["kHotAlignment"] == ram_miss.HOT_ALIGNMENT == 64
-    assert wire["kHotRecords"] == ram_miss.HOT_RECORDS == ram_miss.DEMAND_RECORDS == 16
+    assert wire["kHotRecords"] == ram_miss.HOT_RECORDS == lease.wire_layout(8).demand_records == 16
     assert ram_miss.hot_record_bytes(384) == 64
     assert ram_miss.new_hot_page(384, pin=False).numel() == 1024
 
@@ -441,7 +396,7 @@ def test_the_exl3_host_file_is_only_bindings(name):
     """Every export body lives once, in HostExports or HostTestExports (expert_stream/host/ffi_exports.h,
     ffi_test_exports.h); each EXL3 file (one per build) only names its layout, reader and build. Red when a body grows
     back into one of them."""
-    path = CSRC / name
+    path = CSRC / "exl3" / name
     lines = path.read_text().splitlines()
     bodies = [line for line in lines if re.match(r"^\w.*\)\s*\{$", line) and not line.startswith("namespace")]
     assert not bodies, f"{path.name} defines functions: {bodies}"

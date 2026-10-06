@@ -6628,7 +6628,7 @@ the recipe leaves the variable alone. Most `SGLANG_DSV41_*` flags are parsed onc
 | Variable | Default | What it does |
 |---|---|---|
 | `SGLANG_DSV41_CPU_EXPERTS` | `False` | Computes a layer's RAM-tier experts on the CPU. Batch-1 decode only. |
-| `SGLANG_DSV41_CPU_EXPERTS_CORES` | `""` | Cores of the pool as a taskset list; at least two, required. |
+| `SGLANG_DSV41_CPU_EXPERTS_CORES` | `""` | Optional override of the pool's cores as a taskset list (at least two); unset, derived from the node's free physical cores. `SGLANG_EXPERT_NUMA_CORES` sets per-node plans. |
 | `SGLANG_DSV41_CPU_EXPERTS_THREADS` | `0` | Worker threads, at most one per core; `0` is one per core. |
 | `SGLANG_DSV41_CPU_EXPERTS_SPLIT` | `""` | Nine counts, CPU lanes per n lanes; set, it disables calibration. |
 | `SGLANG_DSV41_CPU_EXPERTS_CPU_MS` / `_LINK_MS` / `_HANDOFF_MS` | `0.52` / `1.0` / `0.02` | Cost model that builds the starting split. |

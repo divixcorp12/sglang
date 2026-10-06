@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import IntEnum
 from typing import Iterable, Optional, Sequence
 
-LANES = 8
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 
 
 class LaneKind(IntEnum):
@@ -25,6 +25,7 @@ def type_lanes(
     staging: Sequence[int],
     split: Sequence[int],
     *,
+    lanes: int,
     captured: bool,
     copy_armed: bool,
     hit_copy: str,
@@ -33,38 +34,45 @@ def type_lanes(
     ce_ok: bool = True,
     cpu_ok: bool = True,
     dst_ok: Optional[Sequence[bool]] = None,
+    nodes: int = 1,
 ) -> tuple[list[LaneKind], list[int]]:
-    """Each lane's kind and source slot: its RAM slot for a hit, the m-th staging slot for the m-th miss.
+    """Each lane's kind and source slot: its RAM slot for a hit, the next staging slot of its home node for a miss.
 
-    The CPU takes the last split[n] of the n eligible lanes in plan order (miss_keys descending, so the
-    lowest-scored): RAM hits, plus NVMe misses with ``cpu_misses``."""
-    if len(experts) > LANES:
-        raise ValueError(f"a request has at most {LANES} lanes, got {len(experts)}")
+    ``staging`` is node-major, ``nodes * lanes`` slots, and ``split`` node-major, ``nodes * (lanes + 1)`` counts. A
+    miss takes the next slot of its home node's list; node n's CPU takes the last ``split[n][k]`` of its k eligible
+    lanes in plan order (miss_keys descending, so the lowest-scored): RAM hits, plus NVMe misses with
+    ``cpu_misses``."""
+    if len(experts) > lanes:
+        raise ValueError(f"a request has at most {lanes} lanes, got {len(experts)}")
     if len(set(experts)) != len(experts):
         raise ValueError(f"a request names an expert twice: {list(experts)}")
-    slots, hit, m = [], [], 0
+    home = wire_layout(lanes, nodes).home
+    slots, hit, taken = [], [], [0] * nodes
     for e in experts:
         s = ram_slot[e]
         if s >= 0:
             slots.append(s)
             hit.append(True)
             continue
-        if m >= LANES or staging[m] < 0:
-            raise ValueError("a miss lane has no staging slot")
-        slots.append(staging[m])
+        node = home(e)
+        m = taken[node]
+        if m >= lanes or staging[node * lanes + m] < 0:
+            raise ValueError(f"a miss lane has no staging slot on node {node}")
+        slots.append(staging[node * lanes + m])
         hit.append(False)
-        m += 1
+        taken[node] += 1
     host_lanes = captured and copy_armed
     eligible = [host_lanes and cpu_on and cpu_ok and (h or cpu_misses) for h in hit]
-    n = sum(eligible)
-    take = split[n] if n else 0
+    take = [0] * nodes
+    for node in range(nodes):
+        n = sum(1 for e, ok in zip(experts, eligible) if ok and home(e) == node)
+        take[node] = split[node * (lanes + 1) + n] if n else 0
     cpu = [False] * len(experts)
     for j in reversed(range(len(experts))):
-        if take == 0:
-            break
-        if eligible[j]:
+        node = home(experts[j])
+        if take[node] > 0 and eligible[j]:
             cpu[j] = True
-            take -= 1
+            take[node] -= 1
     copy_ok = host_lanes and hit_copy == "ce" and ce_ok
     kinds = []
     for j, (h, c) in enumerate(zip(hit, cpu)):
@@ -79,13 +87,13 @@ def type_lanes(
 
 
 class MapReplica:
-    """The device's map bank: ram_slot [rows][experts], staging [rows][LANES], map_chain and map_applied [rows].
+    """The device's map bank: ram_slot [rows][experts], staging [rows][nodes * lanes], map_chain and map_applied [rows].
 
     map_chain starts at 1 and the attach delta has tag 1, so a zero-filled delta record never matches."""
 
-    def __init__(self, rows: int, experts: int):
+    def __init__(self, rows: int, experts: int, lanes: int, nodes: int = 1):
         self.ram_slot = [[-1] * experts for _ in range(rows)]
-        self.staging = [[-1] * LANES for _ in range(rows)]
+        self.staging = [[-1] * (nodes * lanes) for _ in range(rows)]
         self.map_chain = [1] * rows
         self.map_applied = [0] * rows
 

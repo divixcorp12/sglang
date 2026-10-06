@@ -48,7 +48,8 @@ EXPERT_DIR = "/mnt/nvme2/DeepSeek-V4.1-Flash-EXL3-3.0bpw"
 EXPERT_MIRROR_DIRS = "/mnt/nvme0/dsv41_flash:/mnt/nvme4/dsv41_flash:/mnt/nvme2/dsv41_flash"
 EXL3_SRC = f"{NVFP4_WORK}/exllamav3"
 EXL3_BUILD_DIR = f"{CC}/exl3-build"
-# The optimized EXL3 CPU kernel is validated on GCC 15; only its build uses this (not a global CXX).
+# GCC 15 builds the optimized EXL3 CPU kernel (validated on it) and, as CXX, every sglang JIT build: host C++ and
+# nvcc's host half through -ccbin.
 EXL3_CPU_CXX = "/opt/rh/gcc-toolset-15/root/usr/bin/g++"
 CUDA_HOME = "/usr/local/cuda-13.2"
 PYTHON = "/data/models/slang/.venv/bin/python"
@@ -95,13 +96,18 @@ MAX_TOKENS = 128
 # compaction: three threads at 100% system time, zero completed syscalls, GPU idle,
 # and no server log line after "Load weight end" until the 900s abort. Keeping every
 # server thread on node 0 keeps its memory on node 0's free ~70 GiB.
-# Driver cores 8-15 are node 0 too and are excluded here so the two never overlap.
-SERVER_CORES = "0-7,16,36-52"
+# Since 2026-10-05 the server keeps 6 physical cores (0-5 and their siblings 36-41): CPU experts run on both nodes,
+# and node 0's other 12 physical cores go to the expert stream (CPU experts 6-15, copy thread 16, RAM thread 17).
+# Arms from here on are not comparable to earlier cells.
+SERVER_CORES = "0-5,36-41"
 # The RAM-miss service busy-polls cpu 17; its SMT sibling 53 and 17 itself are left out of SERVER_CORES so the physical
 # core is the service's alone (plan 2026-10-01-expert-stream-read-record D4). Arms from here on have one physical core
 # fewer: not comparable to earlier cells.
 SPIN_CORE = 17
-DRIVER_CORES = "8-15"
+# CPU expert workers per NUMA node (SGLANG_DSV41_CPU_EXPERTS_THREADS): node 0 gets 6-15, node 1 18-27.
+CPU_EXPERTS_THREADS = 10
+# Node 1, clear of its CPU experts (18-27) and RAM thread (35): node 0 has no physical core left for the driver.
+DRIVER_CORES = "28-31"
 FREE_CORES = "64-71"  # never touched; NVMe completion interrupts are pinned there.
 
 # Host-memory budget, resized 2026-09-22. The server's threads all sit on NUMA node 0
@@ -141,6 +147,7 @@ def base_env() -> dict[str, str]:
     """The option-C EXL3 recipe env, before a V2 storage-change override is applied."""
     return {
         "CUDA_HOME": CUDA_HOME,
+        "CXX": EXL3_CPU_CXX,
         "OMP_NUM_THREADS": "16",
         "MKL_NUM_THREADS": "16",
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -184,6 +191,11 @@ def base_env() -> dict[str, str]:
         "SGLANG_MOE_EXPERT_FUSED_PLAN": "1",
         "SGLANG_DSV41_RAM_MISS_TIMEOUT_MS": "2000",
         "SGLANG_DSV41_RAM_MISS_SPIN_CORE": str(SPIN_CORE),
+        # CPU experts on both NUMA nodes' pinned tiers (ThreadingConfig derives each node's cores; see SERVER_CORES).
+        # EXL3_MOE_CPU_PIN=0: the engine pins its own workers; the kernel's default would pin them to the first cores.
+        "SGLANG_DSV41_CPU_EXPERTS": "1",
+        "SGLANG_DSV41_CPU_EXPERTS_THREADS": str(CPU_EXPERTS_THREADS),
+        "EXL3_MOE_CPU_PIN": "0",
         # The lease chain's W1 budget (the chain is two-phase with piece streaming, DSV41_REFERENCE.md section 24).
         "SGLANG_DSV41_RAM_MISS_HIT_WAIT_US": "100",
         # Three fused bookkeeping kernels replace 89 torch kernels per layer, byte-identical

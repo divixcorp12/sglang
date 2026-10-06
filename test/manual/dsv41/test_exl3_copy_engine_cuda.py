@@ -21,7 +21,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 from lease_chain_rig import LAYERS, TOP_K, Chain  # noqa: E402
 
-from sglang.kernels.ops.moe.expert_stream_transport import DEMAND_RECORDS  # noqa: E402
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout  # noqa: E402
+
+DEMAND_RECORDS = wire_layout(8).demand_records
 
 BALLAST_BYTES = 256 << 20  # ~20 ms of H2D at the copy engine's ~13.5 GB/s, ahead of every copy job
 POOL = 10  # experts the plans draw from: a capacity of 8 keeps most lanes hits and still evicts

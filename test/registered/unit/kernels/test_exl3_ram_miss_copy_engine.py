@@ -6,14 +6,15 @@ copy to its copy thread at record time. The CPU test backend lands a job's bytes
 so each test can hold a copy in flight and look at what the service has published meanwhile.
 """
 
+import os
 import time
 
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe.expert_stream_transport import (
-    DEMAND_RECORDS,
     new_hot_page,
     new_page,
 )
@@ -29,6 +30,8 @@ from sglang.test.dsv41_ram_miss_fixtures import (
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
+DEMAND_RECORDS = lease.wire_layout(8).demand_records
+
 ROW = 1
 DST_ROWS = 6
 
@@ -38,7 +41,7 @@ def _host(tmp_path, **host_kw):
     s = ram_miss_setup(
         tmp_path, capacity=6, mirror_weights=(1.0, 1.0), hidden=256, inter=512
     )
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = attached_host(s, page, k=2, **host_kw)
     return s, page, host, ChainSim(host, page, s.slabs)
 
@@ -59,15 +62,33 @@ def _copy_table(s, dst):
 
 def _copy_engine(s, host, *, arm=True, wait_timeout_ms=2000):
     """The CPU backend, a copy table from the row's slabs to host "destination" tensors, and (by default) armed."""
-    host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=wait_timeout_ms)
+    host.enable_copy_engine(-1, wait_timeout_ms=wait_timeout_ms)
     dst = {
         name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype)
         for name, slab in s.slabs[ROW].items()
     }
     host.set_copy_table(ROW, _copy_table(s, dst), DST_ROWS)
+    # The table holds raw addresses of these tensors and the copy thread writes through them until host.stop(), so
+    # they must outlive a caller that drops the return value (a freed destination is a heap-use-after-free that
+    # corrupts the allocator and crashes a later test, or hangs the run in malloc).
+    host._copy_destinations = dst
     if arm:
         host.arm_copy_engine()
     return dst
+
+
+def test_the_copy_destinations_outlive_a_caller_that_drops_them(tmp_path):
+    """The copy table points into the destination tensors, so the helper keeps them alive for the host's lifetime."""
+    import gc
+    import weakref
+
+    s, page, host, sim = _host(tmp_path)
+    try:
+        refs = [weakref.ref(t) for t in _copy_engine(s, host).values()]
+        gc.collect()
+        assert all(ref() is not None for ref in refs)
+    finally:
+        host.stop()
 
 
 def _load(sim, host, experts):
@@ -195,6 +216,7 @@ def test_a_lane_the_copy_engine_cannot_take_is_an_sm_hit(tmp_path, case):
             sim.replica.ram_slot[ROW],
             sim.replica.staging[ROW],
             sim.split(),
+            lanes=sim.wire.lanes,
             captured=case != "uncaptured",
             copy_armed=sim.copy_armed(),
             hit_copy="ce",
@@ -235,7 +257,7 @@ table = torch.tensor(
     [[slab.data_ptr(), dst[n].data_ptr(), slab[0].numel() * slab.element_size()] for n, slab in s.slabs[ROW].items()],
     dtype=torch.int64,
 )
-host.enable_copy_engine(-1, spin_us=200, wait_timeout_ms=50)
+host.enable_copy_engine(-1, wait_timeout_ms=50)
 host.set_copy_table(ROW, table, 6)
 host.arm_copy_engine()
 req = sim.post(ROW, [3])
@@ -302,7 +324,7 @@ def test_pause_refuses_while_a_copy_job_is_outstanding(tmp_path):
         _load(sim, host, [3])
         req = sim.post(ROW, [3], dst=[1], captured=True)
         assert host.pump() == 1
-        host.start_thread(fatal_wait_s=60.0, spin_us=2000)
+        host.start_thread(fatal_wait_s=60.0)
         with pytest.raises(RuntimeError, match="copy thread still has a job"):
             host.pause(0.2)
         host.copy_engine_release(-1)
@@ -357,7 +379,7 @@ def _sm_copy_engine(s, host):
     """As _copy_engine, with the row's small (non-trellis) entries left to CW's SM reads."""
     from sglang.srt.layers.moe.exl3_ram_miss import sm_copy_mask
 
-    host.enable_copy_engine(-1, spin_us=200)
+    host.enable_copy_engine(-1)
     names = list(s.slabs[ROW])
     dst = {
         name: torch.zeros((DST_ROWS,) + tuple(slab.shape[1:]), dtype=slab.dtype)
@@ -401,7 +423,7 @@ def test_a_copy_table_sm_mask_naming_a_trellis_is_refused(tmp_path):
     wait would stall the chain instead of using the DMA engine."""
     s, _page, host, _sim = _host(tmp_path)
     try:
-        host.enable_copy_engine(-1, spin_us=200)
+        host.enable_copy_engine(-1)
         table = torch.zeros((6, 3), dtype=torch.int64)
         with pytest.raises(RuntimeError, match="exl3 RAM miss: .*small"):
             host.set_copy_table(ROW, table, DST_ROWS, sm_mask=0b000001)
@@ -568,8 +590,23 @@ def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
     ).read_text()
     # Whitespace-normalized, so clang-format may wrap a call's arguments without breaking the pin.
     tier = " ".join(source.split())
-    assert "store_release(lease_ + kLeaseCopyGate" not in tier
+    assert "store_release(lease_ + Wire::kLeaseCopyGate" not in tier
     assert (
-        tier.count("std::memcpy(lease_ + kLeaseCopyGate") == 1
+        tier.count("std::memcpy(lease_ + Wire::kLeaseCopyGate") == 1
     )  # init_lease_block, before any thread
-    assert "reinterpret_cast<uint32_t*>(lease_ + kLeaseCopyGate), &expected" in tier
+    assert "reinterpret_cast<uint32_t*>(lease_ + Wire::kLeaseCopyGate), &expected" in tier
+
+
+def test_the_copy_thread_runs_on_the_cpus_it_is_given(tmp_path):
+    """ThreadingConfig puts the copy thread on the GPU's node; enable_copy_engine's cpus are its affinity."""
+    s, page, host, sim = _host(tmp_path)
+    try:
+        cpu = sorted(os.sched_getaffinity(0))[-1]
+        host.enable_copy_engine(-1, cpus=[cpu])
+        tids = [
+            int(tid) for tid in os.listdir("/proc/self/task")
+            if open(f"/proc/self/task/{tid}/comm").read().strip() == "exl3-copy-eng"
+        ]
+        assert len(tids) == 1 and os.sched_getaffinity(tids[0]) == {cpu}
+    finally:
+        host.stop()

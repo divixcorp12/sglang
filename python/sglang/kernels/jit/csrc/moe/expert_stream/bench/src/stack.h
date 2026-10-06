@@ -38,7 +38,7 @@ namespace es = ::sglang::expert_stream;
 using BenchBuild = std::conditional_t<EXL3_FULL_STACK_INSTR != 0, es::InstrBuild, es::ProdBuild>;
 static_assert(kNames == static_cast<int>(::sglang::exl3::Exl3RowLayout::kNames.size()));
 
-// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/exl3_ram_miss_host.cpp and
+// The reader of each build, as in python/sglang/kernels/jit/csrc/moe/exl3/exl3_ram_miss_host.cpp and
 // exl3_ram_miss_host_instr.cpp, minus the instrumented build's FaultyReader.
 template <class Build>
 struct ReaderFor;
@@ -91,21 +91,26 @@ inline es::Tables image_tables(const RowSet& set) {
 struct StackConfig {
   RowSet rows;
   int64_t staging = 3;
-  es::CpuExpertForward forward = nullptr;
-  es::CpuExpertKeepWarm keep_warm = nullptr;  // with keep_warm_ns > 0: run while idle after each job
-  int64_t keep_warm_ns = 0;
-  int threads = 1;
-  std::vector<int> cores;  // worker 0 first: the CPU expert thread pins itself there
+  const ::sglang::cpu_experts::CpuExpertKernel* kernel = nullptr;  // the format's kernel, every group's
+  int64_t keep_warm_ns = 0;  // register work this long after each job before the held team falls back to PAUSE
+  // One NUMA group's CPU lanes: its service thread, its cores and its split table.
+  struct Group {
+    int service_cpu = -1;
+    std::vector<int> cores;  // worker 0 first: its CPU expert thread pins itself there; the kernel's workers run there
+    // null: the stack's kernel (set only to provoke the one-kernel refusal)
+    const ::sglang::cpu_experts::CpuExpertKernel* kernel = nullptr;
+    std::array<int64_t, es::Wire::kLanes + 1> split{};
+  };
+  std::vector<Group> groups;                        // one per Wire::kNodes
+  std::vector<std::pair<int64_t, int64_t>> ranges;  // group g's slots of every row; empty at one group: all of them
   uint8_t* x_base = nullptr;
   int64_t x_stride = 0;
   uint8_t* out_base = nullptr;
-  int64_t out_stride = 0;  // bytes; two parts of `hidden` floats per row
+  int64_t out_stride = 0;  // bytes; two parts of `hidden` floats per group per row, group g's at [2 g, 2 g + 2) parts
   int64_t hidden = 0;
-  int service_cpu = -1;
   int copy_cpu = -1;
   int64_t wait_timeout_ns = 2'000'000'000;  // the watchdog's copy-wait deadline (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS)
   int64_t fatal_wait_ns = 30'000'000'000;   // the watchdog's hung-request deadline
-  std::array<int64_t, es::kLeaseLanes + 1> split{};
   size_t trace_capacity = 0;  // InstrBuild: the stage trace's ring, 0 off
 };
 
@@ -121,8 +126,6 @@ class Stack {
   using Source = es::RowReader<::sglang::exl3::Exl3RowLayout, typename ReaderFor<Build>::type, Build>;
   using Tier = es::RamTier<Source>;
   using Thread = es::RamThread<Tier>;
-  static constexpr int64_t kCopySpinNs = 5'000'000;  // the transport's enable_copy_engine default (spin_us=5000)
-  static constexpr int64_t kCpuSpinNs = 50'000'000;  // enable_cpu_experts' default (spin_us=50_000)
 
   // Opens the tier, starts the copy engine, the CPU expert engine and the service, in that order. Throws if the
   // reader cannot open or the service CPU's physical core is shared. The request page and lease block are first-touched
@@ -130,8 +133,8 @@ class Stack {
   explicit Stack(StackConfig config) : config_(std::move(config)) {
     rows_ = static_cast<int64_t>(config_.rows.paths.size());
     experts_ = config_.rows.experts;
-    page_ = aligned_zeroed(es::kPageBytes);
-    lease_bytes_ = es::kLeaseBlockBytes + round_up(rows_ * es::kDeltaStride, 4096);
+    page_ = aligned_zeroed(es::Wire::kPageBytes);
+    lease_bytes_ = es::Wire::kLeaseBlockBytes + round_up(rows_ * es::Wire::kDeltaStride, 4096);
     lease_ = aligned_zeroed(lease_bytes_);
     slot_map_.assign(static_cast<size_t>(rows_ * experts_), -1);
     tier_ = std::make_shared<Tier>(
@@ -143,33 +146,44 @@ class Stack {
         std::vector<int64_t>(static_cast<size_t>(rows_), config_.rows.capacity),
         /*direct=*/true,
         /*hot_page=*/nullptr,
-        0);
+        0,
+        group_ranges(),
+        std::vector<int>(es::Wire::kNodes, -2));  // -2: the ring's SQPOLL core stays the uring env's, as before NUMA groups
     if (!tier_->open()) throw std::runtime_error("the tier's reader did not open (its error is on stderr)");
     tier_->reserve_staging(config_.staging);
     // The copy engine's thread and RamThread's watchdog inherit this thread's affinity: the copy CPU.
     PinScope copy(config_.copy_cpu);
-    tier_->enable_copy_engine(-1, kCopySpinNs, config_.wait_timeout_ns);
+    tier_->enable_copy_engine(
+        -1,
+        config_.wait_timeout_ns,
+        config_.copy_cpu >= 0 ? std::vector<int>{config_.copy_cpu} : std::vector<int>{});
     tier_->arm_copy_engine(true);
-    es::CpuExpertConfig cpu;
-    cpu.forward = config_.forward;
-    cpu.x_base = config_.x_base;
-    cpu.x_stride = config_.x_stride;
-    cpu.out_base = config_.out_base;
-    cpu.out_stride = config_.out_stride;
-    cpu.out_part_stride = config_.hidden * static_cast<int64_t>(sizeof(float));
-    cpu.hidden = config_.hidden;
-    cpu.threads = config_.threads;
-    cpu.cores = config_.cores;
-    cpu.spin_ns = kCpuSpinNs;
-    cpu.keep_warm = config_.keep_warm;
-    cpu.keep_warm_ns = config_.keep_warm_ns;
-    tier_->enable_cpu_experts(std::move(cpu), std::vector<int64_t>(config_.split.begin(), config_.split.end()));
+    if (static_cast<int>(config_.groups.size()) != es::Wire::kNodes)
+      throw std::runtime_error("the stack needs one group per NUMA node of the build (" + std::to_string(es::Wire::kNodes) + ")");
+    std::vector<int> service_cpus;
+    for (int g = 0; g < es::Wire::kNodes; ++g) {
+      const StackConfig::Group& group = config_.groups[g];
+      es::CpuExpertConfig cpu;
+      cpu.kernel = group.kernel != nullptr ? group.kernel : config_.kernel;
+      cpu.x_base = config_.x_base;
+      cpu.x_stride = config_.x_stride;
+      // Group g's parts are parts 2 g and 2 g + 1 of the row's output.
+      cpu.out_base = config_.out_base + g * 2 * config_.hidden * static_cast<int64_t>(sizeof(float));
+      cpu.out_stride = config_.out_stride;
+      cpu.out_part_stride = config_.hidden * static_cast<int64_t>(sizeof(float));
+      cpu.hidden = config_.hidden;
+      cpu.threads = static_cast<int>(group.cores.size());
+      cpu.cores = group.cores;
+      cpu.keep_warm_ns = config_.keep_warm_ns;
+      tier_->enable_cpu_experts(g, std::move(cpu), std::vector<int64_t>(group.split.begin(), group.split.end()));
+      service_cpus.push_back(group.service_cpu);
+    }
     if constexpr (Build::kMetrics) {
       if (config_.trace_capacity > 0) tier_->enable_trace(config_.trace_capacity);
     }
-    es::check_dedicated_core(config_.service_cpu, tier_->cpu_cores(), "full-stack bench: ");
-    thread_ =
-        std::make_unique<Thread>(tier_, config_.service_cpu, config_.fatal_wait_ns, /*spin_ns=*/0, /*busy_poll=*/true);
+    for (int service_cpu : service_cpus)
+      es::check_dedicated_core(service_cpu, tier_->cpu_cores(), "full-stack bench: ");
+    thread_ = std::make_unique<Thread>(tier_, service_cpus, config_.fatal_wait_ns, /*busy_poll=*/true);
     thread_->start();
   }
 
@@ -213,20 +227,28 @@ class Stack {
     return true;
   }
 
-  // Binds the row to a registered CPU layer handle (StackFixture::register_layer).
-  void set_cpu_layer(int64_t row, int64_t handle) {
-    tier_->set_cpu_layer(row, handle);
+  // Installs the row's CPU layer (StackFixture::make_layer), made by the stack's kernel.
+  void set_cpu_layer(int64_t row, const ::sglang::cpu_experts::ExpertLayer& layer) {
+    tier_->set_cpu_layer(row, layer);
   }
 
-  // Replaces the split table: of a post's n eligible hit lanes, the CPU takes the last split[n].
-  void set_split(const std::array<int64_t, es::kLeaseLanes + 1>& split) {
-    tier_->set_cpu_split(split.data(), static_cast<int64_t>(split.size()));
+  // Replaces every group's split table: of a post's n eligible hit lanes on a node, the CPU takes the last split[n].
+  void set_split(const std::array<int64_t, es::Wire::kLanes + 1>& split) {
+    for (int g = 0; g < es::Wire::kNodes; ++g)
+      tier_->set_cpu_split(g, split.data(), static_cast<int64_t>(split.size()));
   }
 
-  // The CPU expert engine's totals: {jobs, lanes, forward ns}.
-  std::array<int64_t, 3> cpu_stats() const {
+  // Group g's CPU expert engine's totals: {jobs, lanes, forward ns}.
+  std::array<int64_t, 3> cpu_stats(int g = 0) const {
     std::array<int64_t, 3> out{};
-    tier_->cpu_stats(out.data());
+    tier_->cpu_stats(g, out.data());
+    return out;
+  }
+
+  // Group g's own core counters (its service thread's block), in the tier's counter order.
+  std::array<int64_t, es::kCounterCount> group_counters(int g) const {
+    std::array<int64_t, es::kCounterCount> out{};
+    tier_->group_counters(g, out.data());
     return out;
   }
 
@@ -256,6 +278,20 @@ class Stack {
   }
 
  private:
+  // Every row's slot range of each group; at one group with none given, the whole row.
+  std::vector<std::vector<std::pair<int64_t, int64_t>>> group_ranges() const {
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> ranges;
+    if (config_.ranges.empty() && es::Wire::kNodes == 1) {
+      ranges.emplace_back(static_cast<size_t>(rows_), std::pair<int64_t, int64_t>{0, config_.rows.capacity});
+      return ranges;
+    }
+    if (static_cast<int>(config_.ranges.size()) != es::Wire::kNodes)
+      throw std::runtime_error("the stack needs one slot range per NUMA group (" + std::to_string(es::Wire::kNodes) + ")");
+    for (const auto& range : config_.ranges)
+      ranges.emplace_back(static_cast<size_t>(rows_), range);
+    return ranges;
+  }
+
   StackConfig config_;
   int64_t rows_ = 0;
   int64_t experts_ = 0;

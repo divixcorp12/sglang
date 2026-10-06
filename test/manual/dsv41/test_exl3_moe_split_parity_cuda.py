@@ -90,7 +90,7 @@ def split_route_tables(remap, weights, mask, bufs: SplitBuffers) -> None:
 
 def launch(fused, x16, out, count, weight_sorted, det0, num_active: int = 6) -> None:
     """One exl3_moe over ``fused``'s slot tables and temps, deterministic path, as Exl3FusedMoE.run issues it."""
-    from sglang.srt.layers.quantization.exl3_fused_moe import ACT_SILU, ROW_TILE
+    from sglang.srt.layers.quantization.exl3.fused_moe import ACT_SILU, ROW_TILE
 
     t = fused.tables
     fused.ext.exl3_moe(
@@ -127,7 +127,7 @@ class SplitState(msgspec.Struct):
 
 def split_run(fused, state: SplitState, x, weights, remap, hit, keep, *, between=None, num_active: int = 6):
     """Resident launch, then missed launch, then one gather; ``between(stage)`` observes the buffers between steps."""
-    from sglang.srt.layers.quantization.exl3_fused_moe import route_tables
+    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
 
     fused.x16.copy_(x)
     # Placement from every route. keep = 1 here: the resident launch cannot know keep.
@@ -154,7 +154,7 @@ def split_run(fused, state: SplitState, x, weights, remap, hit, keep, *, between
 
 def _fused(slot_rows, device, layer_fusion: bool):
     from sglang.srt.environ import envs
-    from sglang.srt.layers.quantization.exl3_fused_moe import Exl3FusedMoE
+    from sglang.srt.layers.quantization.exl3.fused_moe import Exl3FusedMoE
 
     slots = slot_rows["w13_trellis"].shape[0]
     with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(layer_fusion):
@@ -170,7 +170,7 @@ def _fused(slot_rows, device, layer_fusion: bool):
 
 @pytest.fixture(scope="module")
 def slot_rows():
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     ext = exl3_ext()
     missing = [n for n in ("exl3_moe", "exl3_moe_gather", "exl3_moe_max_concurrency") if not hasattr(ext, n)]
@@ -259,7 +259,7 @@ def test_split_launch_is_bitwise_the_single_launch(slot_rows, layer_fusion):
 
 def test_full_weight_table_misplaces_masked_weights(slot_rows):
     """The hazard the compacted weights avoid: a masked launch indexes weight_sorted by its own running prefix."""
-    from sglang.srt.layers.quantization.exl3_fused_moe import route_tables
+    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
 
     device = slot_rows["w13_trellis"].device
     ref = _fused(slot_rows, device, False)
@@ -347,13 +347,13 @@ def test_the_bench_copy_lands_in_the_rows_the_missed_launch_reads(slot_rows):
 
 # CPU experts (plan 2026-09-29-dsv41-cpu-experts, Step B): the lanes of cpu_lanes leave the fused MoE and the CPU's
 # partial sums seed its output. Here lane i is route i (dst_slots = remap), as the post's plan makes it for a BS1 remap.
-# cpu_lanes is CC's word: the lane mask in bits 0-7, then which parts hold a partial (bit 8 the CPU hits', part 0;
-# bit 9 the CPU misses', part 1, part_stride floats on).
-PART_HITS, PART_MISSES = 1 << 8, 1 << 9
+# cpu_lanes is CC's pair: the lane mask, then which parts hold a partial (bit 0 the CPU hits', part 0; bit 1 the CPU
+# misses', part 1, part_stride floats on).
+PART_HITS, PART_MISSES = 1, 2
 
 
 def _cpu_run(fused, x, weights, remap, keep, mask: int, partial: torch.Tensor, parts: int = PART_HITS) -> torch.Tensor:
-    lanes = torch.tensor([mask | parts], dtype=torch.int32, device=x.device)
+    lanes = torch.tensor([mask, parts], dtype=torch.int32, device=x.device)
     stride = partial.stride(1) if partial.dim() == 3 else 0
     cpu = (lanes, remap.to(torch.int32), partial.data_ptr(), stride)
     return fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=cpu).clone()
@@ -427,11 +427,22 @@ def test_each_cpu_part_seeds_the_output_only_when_its_bit_is_set(slot_rows):
             assert torch.allclose(got - base, torch.full_like(base, seed), atol=1e-5 * scale), (mask, parts)
 
 
+def _optimized_cpu_build() -> bool:
+    from sglang.srt.layers.quantization.exl3.ext import cpu_act_defines, optimized_cpu
+
+    return optimized_cpu(cpu_act_defines())
+
+
+@pytest.mark.skipif(
+    not _optimized_cpu_build(),
+    reason="the CPU kernel's ops exist only in the optimized EXL3 extension: set SGLANG_DSV41_CPU_EXPERTS=1",
+)
 def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeypatch):
     """End to end over one layer's real rows: the CPU kernel's partial of the CPU routes, from host copies of the same
     slots, lands the output within the kernel's own error of the full GPU run, far closer than dropping those routes."""
-    from sglang.srt.layers.moe.cpu_experts.exl3 import Exl3CpuQuantTrait
-    from sglang.srt.layers.quantization.exl3_ext import exl3_ext
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+    from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     threads = min(4, len(os.sched_getaffinity(0)))
@@ -440,7 +451,7 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
     hidden = slot_rows["w13_suh"].shape[-1]
     trait = Exl3CpuQuantTrait(exl3_ext(), act_limit=ACT_LIMIT)
     host_rows = {name: t.cpu() for name, t in slot_rows.items()}
-    handle = trait.register_layer(host_rows, fused.slots)
+    layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(host_rows, fused.slots), variant="instr")
     partial = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
     zero = torch.zeros_like(partial).pin_memory()
     keep = torch.ones(1, device=device)
@@ -453,7 +464,8 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
             want = fused.run(x, weights, remap, keep, ACT_LIMIT).clone()
             slots = remap[routes].cpu().reshape(1, -1)
             w = weights[routes].cpu().half().reshape(1, -1)
-            trait.forward(handle, x.cpu().half(), slots, w, partial, threads)
+            status, why = es.kernel_forward(layer, x.cpu().half(), slots, w, partial, threads=threads, variant="instr")
+            assert status == 0, why
             got = _cpu_run(fused, x, weights, remap, keep, mask, partial)
             dropped = _cpu_run(fused, x, weights, remap, keep, mask, zero)
             err = float((got - want).norm() / want.norm())
@@ -461,4 +473,4 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
             print(f"mask={mask:#x}: relative error {err:.2e}, dropping the CPU routes {drop:.2e}")
             assert err < 2e-2 and err < 0.1 * drop, f"mask={mask:#x}: {err:.2e} vs dropped {drop:.2e}"
     finally:
-        trait.free_layer(handle)
+        es.kernel_drop(layer, variant="instr")

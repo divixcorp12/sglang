@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import wire_layout
 from sglang.kernels.ops.moe.expert_stream_transport import ExpertStreamHost, new_page
 from sglang.srt.layers.moe.exl3_expert_format import EXL3_STREAMED_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -38,7 +39,7 @@ def _attached(s, page, slot_map, k):
 
 def _host(tmp_path, capacity=3, fatal_wait_s=5.0, k=1):
     s = ram_miss_setup(tmp_path, capacity=capacity)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     slot_map = torch.full((2, 6), -1, dtype=torch.int32)
     host = _attached(s, page, slot_map, k)
     host.start_thread(fatal_wait_s=fatal_wait_s)
@@ -197,7 +198,7 @@ def test_a_stop_during_a_hung_read_still_ends_in_the_watchdog_abort(tmp_path):
 
 def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
     s = ram_miss_setup(tmp_path)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     try:
         core = min(os.sched_getaffinity(0))
         assert core < 64
@@ -210,7 +211,7 @@ def test_the_thread_runs_on_the_core_it_is_pinned_to(tmp_path):
 @pytest.mark.parametrize("core, error, match", [(71, ValueError, "64-71"), (1000, RuntimeError, "pin")])
 def test_a_reserved_or_unusable_core_is_refused(tmp_path, core, error, match):
     s = ram_miss_setup(tmp_path)
-    host = ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
+    host = ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
     try:
         with pytest.raises(error, match=match):
             host.start_thread(cpu_core=core)
@@ -259,7 +260,7 @@ def test_collecting_a_threaded_host_stops_its_thread(tmp_path):
 def _tier(tmp_path, capacity=6, k=1):
     """A host with no service thread: the tests pump it, so nothing races."""
     s = ram_miss_setup(tmp_path, capacity=capacity)
-    page = new_page(pin=False)
+    page = new_page(pin=False, wire=wire_layout(8))
     host = _attached(s, page, torch.full((2, 6), -1, dtype=torch.int32), k)
     return s, page, host, ChainSim(host, page, s.slabs)
 
@@ -378,7 +379,7 @@ def test_when_every_resident_expert_is_protected_the_miss_is_served_and_not_cach
 
 def _plain_host(tmp_path):
     s = ram_miss_setup(tmp_path)
-    return ExpertStreamHost(s.tables, page=new_page(pin=False), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
+    return ExpertStreamHost(s.tables, page=new_page(pin=False, wire=wire_layout(8)), slot_map=torch.full((2, 6), -1, dtype=torch.int32))
 
 
 def _cpu_list(text: str) -> set[int]:
@@ -446,19 +447,19 @@ def test_a_busy_polling_service_refuses_a_physical_core_it_would_share(tmp_path,
 
 
 @pytest.mark.parametrize("busy", [False, True])
-def test_a_busy_polling_service_spins_where_a_default_one_sleeps(tmp_path, busy):
-    """Idle for half a second: a busy-polling service uses its core the whole time, a default one (1 ms of spin) sleeps.
-    Both still park for a pause and stop."""
+def test_an_idle_service_never_sleeps(tmp_path, busy):
+    """Idle for half a second, a service thread uses its core the whole time, with or without busy_poll (which only
+    drops the PAUSE). Both still park for a pause and stop. Mutant: restore an idle sleep in RamThread::run -- red."""
     core, sibling = _physical_core_pair()
     host = _plain_host(tmp_path)
     try:
         with _affinity(os.sched_getaffinity(0) - {core, sibling}):
-            host.start_thread(cpu_core=core, busy_poll=busy, spin_us=1000)
+            host.start_thread(cpu_core=core, busy_poll=busy)
         assert host.counters()["spin_cpu"] == core
         before = _service_cpu_s()
         time.sleep(0.5)
         used = _service_cpu_s() - before
-        assert (used > 0.3) if busy else (used < 0.1), (busy, used)
+        assert used > 0.3, (busy, used)
         host.pause(5.0)
         host.resume()
     finally:

@@ -16,13 +16,16 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import re
 import shutil
+import subprocess
 from typing import List, Tuple
 
 import torch
 
 from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
 from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,86 @@ def host_compiler_path() -> str:
     return os.environ.get("CXX", "c++")
 
 
+# Macros a resolved -march may define beyond what native does, matched by name.
+# __SGX__ gates enclave intrinsics only; the compiler never emits those instructions
+# on its own, so a name that carries it for the CPU family cannot cause a SIGILL.
+_ALLOWED_EXTRA_MACROS = frozenset({"__SGX__"})
+
+
+def _compiler_output(args: List[str]) -> str:
+    # C locale: the `-Q --help=target` text is parsed, and a translated one would not match.
+    return subprocess.run(
+        args,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "LC_ALL": "C"},
+    ).stdout
+
+
+def _macro_name(line: str) -> str:
+    parts = line.split()
+    return parts[1] if len(parts) > 1 else line
+
+
+@cache_once
+def host_arch_flags() -> List[str]:
+    """The ``-march`` host code is built for, as a concrete name.
+
+    ``-march=native`` is never emitted: the flags are hashed into the build key, and
+    a cached .so keyed by the literal ``native`` would match on a different CPU and
+    die with SIGILL. The compiler is asked what ``native`` means here instead. The
+    answer is used only if ``-march=<name>`` enables nothing that native does not
+    (compared by predefined macros); a VM masking features or an unknown CPU makes
+    it enable more, and then the compiler's own default arch is kept. Native
+    enabling *more* than the name (``__ABM__``, ``__RTM__`` on divix01) only costs
+    those instructions, and the macros in ``_ALLOWED_EXTRA_MACROS`` are safe in the name.
+
+    ``SGLANG_JIT_HOST_MARCH`` overrides: ``default`` keeps the compiler's arch, and
+    ``native`` resolves like unset, and any other value is passed as ``-march=<value>``
+    (building for another machine).
+    """
+    if is_hip_runtime():
+        return []
+    override = envs.SGLANG_JIT_HOST_MARCH.get()
+    if override is not None and override != "native":
+        return [] if override == "default" else [f"-march={override}"]
+
+    cxx = host_compiler_path()
+    try:
+        target = _compiler_output([cxx, "-march=native", "-Q", "--help=target"])
+        match = re.search(r"^\s*-march=\s*(\S+)\s*$", target, re.MULTILINE)
+        if match is None:
+            raise ValueError("no -march= line in `-Q --help=target`")
+        name = match.group(1)
+        macros = ["-E", "-dM", "-x", "c++", "/dev/null"]
+        native = set(_compiler_output([cxx, "-march=native", *macros]).splitlines())
+        named = set(_compiler_output([cxx, f"-march={name}", *macros]).splitlines())
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        logger.warning(
+            "Cannot resolve -march=native with %s (%s); JIT host code keeps the "
+            "compiler's default arch.",
+            cxx,
+            error,
+        )
+        return []
+    beyond_native = {
+        line
+        for line in named - native
+        if _macro_name(line) not in _ALLOWED_EXTRA_MACROS
+    }
+    if beyond_native:
+        logger.warning(
+            "-march=%s enables %s, which -march=native does not on this CPU; JIT "
+            "host code keeps the compiler's default arch.",
+            name,
+            sorted(beyond_native),
+        )
+        return []
+    return [f"-march={name}"]
+
+
 @cache_once
 def gpu_arch_name() -> str:
     """The compile target as the vendor names it.
@@ -143,13 +226,17 @@ def base_cxx_flags() -> List[str]:
     `-std=c++20` from both is what used to make nvcc warn about an incompatible
     redefinition on every single build.
     """
-    return ["-fPIC"]
+    return ["-fPIC"] + host_arch_flags()
 
 
 def base_cuda_flags() -> List[str]:
+    """`-ccbin` makes nvcc's host half use the compiler the C++ units use."""
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
-    return ["-Xcompiler", "-fPIC"]
+    flags = ["-ccbin", host_compiler_path(), "-Xcompiler", "-fPIC"]
+    for flag in host_arch_flags():
+        flags += ["-Xcompiler", flag]
+    return flags
 
 
 def base_include_paths() -> List[str]:

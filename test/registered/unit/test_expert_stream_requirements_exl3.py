@@ -348,7 +348,6 @@ CPU_EXPERTS_ENV = dict(
     SGLANG_MOE_GPU_RESIDENCY_UPDATE=True,
     SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2,
     SGLANG_MOE_EXPERT_FUSED_PLAN=True,
-    SGLANG_DSV41_CPU_EXPERTS_CORES="18-29",
     SGLANG_DSV41_CPU_EXPERTS=True,
 )
 
@@ -359,7 +358,7 @@ def test_cpu_experts_name_every_missing_prerequisite(model_dir, missing):
     MoE (layer fusion), not the lowest-scored misses (DIRECT residency's keys, which only the fused plan sorts by), or
     run on no cores; the refusal names the one that is off."""
     _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV)
-    off = {"SGLANG_DSV41_CPU_EXPERTS_CORES": "", "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}.get(missing, False)
+    off = {"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}.get(missing, False)
     with pytest.raises(ValueError, match=f"SGLANG_DSV41_CPU_EXPERTS needs {missing}"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, missing: off})
 

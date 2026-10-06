@@ -79,6 +79,7 @@ def run(a):
     if not str(Path(sglang.__file__).resolve()).startswith(str(repo)):
         raise SystemExit("INTERPRETER TRAP: sglang imported from %s, not under %s; set PYTHONPATH=%s/python" % (sglang.__file__, repo, repo))
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu, expert_row_segments
+    from sglang.kernels.ops.moe.expert_lease_block import wire_layout
     from sglang.kernels.ops.moe.expert_stream_transport import new_page
     import c_harness as H
 
@@ -91,7 +92,7 @@ def run(a):
     torch.cuda.init(); dev = torch.device("cuda", torch.cuda.current_device()); torch.cuda.set_device(dev)
     torch.set_num_threads(1)
     stream = torch.cuda.Stream(device=dev)
-    page = new_page(pin=True)                                   # the request page, as the service allocates it
+    page = new_page(pin=True, wire=wire_layout(8))                                   # the request page, as the service allocates it
     words = page[:64 * 8].view(torch.int32)
     words[::16] = 1                                             # 8 poll lines, all "ready"
     acks = torch.zeros(ACK_LINES * 64, dtype=torch.uint8, pin_memory=True)   # a distinct mapped line per ack

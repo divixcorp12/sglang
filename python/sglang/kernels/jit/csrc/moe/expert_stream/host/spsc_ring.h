@@ -1,21 +1,15 @@
-// Thread-handoff primitives for the service path: a lock-free SPSC ring, a one-thread deque, and futex wait/wake.
+// Thread-handoff primitives for the service path: a lock-free SPSC ring and a one-thread deque.
 //
 // Nothing here allocates after construction or takes a lock.
 //
 //   SpscRing     single-producer single-consumer ring between two threads
 //   FixedDeque   circular FIFO owned by one thread (the copy thread's in-flight jobs)
-//   futex_wait / futex_wake   sleep and wake on a 32-bit word
 #pragma once
-
-#include <linux/futex.h>
-#include <sys/syscall.h>
 
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <time.h>
-#include <unistd.h>
 
 namespace sglang::expert_stream {
 
@@ -115,17 +109,5 @@ class FixedDeque {
   size_t head_ = 0;
   size_t n_ = 0;
 };
-
-// Sleeps while *word == expected, for at most timeout_ns. Returns at once if *word already differs: the kernel
-// compares under its own lock, so a wake that changed the word before the call is never lost.
-inline void futex_wait(std::atomic<uint32_t>* word, uint32_t expected, int64_t timeout_ns) {
-  timespec timeout{static_cast<time_t>(timeout_ns / 1000000000), static_cast<long>(timeout_ns % 1000000000)};
-  syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAIT_PRIVATE, expected, &timeout, nullptr, 0);
-}
-
-// Wakes at most one thread sleeping in futex_wait on `word`.
-inline void futex_wake(std::atomic<uint32_t>* word) {
-  syscall(SYS_futex, reinterpret_cast<uint32_t*>(word), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
-}
 
 }  // namespace sglang::expert_stream

@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.quantization.exl3_ops import Exl3Tensors, exl3_moe_loop
+from sglang.srt.layers.quantization.exl3.ops import Exl3Tensors, exl3_moe_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -78,7 +78,7 @@ def test_loop_without_limit_does_not_clamp():
 
 def test_loop_zero_limit_does_not_clamp():
     # Matches the reference and LazyExpert: swiglu_limit=0.0 means "no limit",
-    # same as None, not "clamp to zero" (exl3_ops.py exl3_moe_loop).
+    # same as None, not "clamp to zero" (exl3/ops.py exl3_moe_loop).
     x = torch.full((1, HIDDEN), 3.0)
     t_g, gd = _fake(HIDDEN, INTER, 1)
     t_u, ud = _fake(HIDDEN, INTER, 2)
