@@ -85,8 +85,9 @@ def _text(so: str) -> str:
 
 def _cpu_kernel() -> dict[str, str]:
     """The optimized EXL3 CPU kernel library's one-word keep-warm loops and forward entry point: objdump per function,
-    addresses, raw bytes and rip-relative displacements stripped, operand addresses reduced to the symbols they
-    name. Needs SGLANG_EXL3_SRC and a GCC 15 (SGLANG_EXL3_CPU_CXX); builds the optimized kernel (SGLANG_DSV41_CPU_EXPERTS=1, set here)."""
+    addresses, raw bytes, rip-relative displacements and nop padding stripped, operand addresses reduced to the
+    symbols they name. Needs SGLANG_EXL3_SRC and a GCC 15 (SGLANG_EXL3_CPU_CXX); builds the optimized kernel
+    (SGLANG_DSV41_CPU_EXPERTS=1, set here)."""
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     os.environ["SGLANG_DSV41_CPU_EXPERTS"] = "1"  # the optimized build; the BS1 suites above ran without it
@@ -110,7 +111,9 @@ def _cpu_kernel() -> dict[str, str]:
             body = re.sub(r"\b[0-9a-f]+(?= <)", "", body)  # absolute addresses; the <symbol> after each stays
             body = re.sub(r"-?0x[0-9a-f]+\(%rip\)", "(%rip)", body)  # displacements move with the library's layout
             body = re.sub(r"<(_fini|_DYNAMIC|_init)\+0x[0-9a-f]+>", r"<\1>", body)  # unnamed data: layout, not code
-            lines.append(body.strip())
+            body = body.strip()
+            if not re.match(r"^(data16 |cs )*(nop[wl]?\b|xchg\s+%ax,%ax)", body):  # alignment padding: layout, not code
+                lines.append(body)
     return digests
 
 
