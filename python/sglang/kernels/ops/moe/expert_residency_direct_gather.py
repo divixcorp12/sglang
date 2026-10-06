@@ -112,7 +112,7 @@ def direct_commit_gather(
 
     ``mapping`` is the layer's ``[experts + 1]`` row (last column the dump), ``slot_*`` its ``[slots + 1]`` rows (last
     column the dump). ``delivered`` and ``keep`` are the leased backend's delivered count and keep flag, both or
-    neither; without them the truncation tripwire compares ``miss_count``. ``cpu_lanes`` (int32 ``[2]``: CPU lanes, then the part bits; CPU experts) is
+    neither; without them the truncation tripwire compares ``miss_count``. ``cpu_lanes`` (int32 ``[2]`` (``[3]`` on a wide wire): CPU lanes, then the part bits, then the lanes' high half; CPU experts) is
     the mask of lanes the CPU computed: never inserted, and not counted as truncated.
     """
     _commit_module().run(

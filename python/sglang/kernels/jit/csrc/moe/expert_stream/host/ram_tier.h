@@ -15,6 +15,8 @@
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "The host per record".
 #pragma once
 
+#include <bit>
+
 #include "../row_layout.h"
 #include "copy_engine.h"
 #include "host_copy_backend.h"
@@ -1599,7 +1601,7 @@ class RamTier {
 
   // The record's CPU-miss jobs still to submit, advanced as rows land.
   struct CpuMissBatch {
-    uint32_t sent = 0;  // bit i: miss i went to the CPU
+    Wire::LaneMask sent = 0;  // bit i: miss i went to the CPU
     int left = 0;
     uint32_t next = 0;  // the next CPU-miss job's sequence, short of the last (job.late_seq)
   };
@@ -1669,12 +1671,12 @@ class RamTier {
           fail(": a copy-engine lane on an ineligible row");
       } else if (lane.kind == Wire::kKindHitCpu) {
         if (!cpu_row) fail(": a CPU lane on a row without CPU experts");
-        job.cpu_mask |= 1u << j;
+        job.cpu_mask |= Wire::LaneMask{1} << j;
       } else {
         continue;  // Wire::kKindHitSm: the device's SM kernel copies it, the host has nothing to do
       }
       job.lanes[job.count++] = CopyLane{static_cast<int32_t>(j), lane.slot, lane.dst, lane.weight};
-      job.mask |= 1u << j;
+      job.mask |= Wire::LaneMask{1} << j;
     }
     if (NumaNodeDistributor<Source>::miss_nodes(request) != 0) {
       // A group's own miss is checked against the row's last published delta, which is exact: the device waits for the
@@ -1714,7 +1716,7 @@ class RamTier {
     if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
     this->template count<kCopyJobs>(group);
     this->template count<kCopyLanes>(group, job.count + job.late_cpu);
-    const int cpu_hits = __builtin_popcount(job.cpu_mask);
+    const int cpu_hits = std::popcount(job.cpu_mask);
     this->template count<kCpuLanes>(group, cpu_hits + job.late_cpu);
     if (cpu_hits > 0 || job.late_cpu > 0) {
       // One sequence per job the record can need: the hits' and one per CPU miss. The last miss job takes the last,
@@ -1793,7 +1795,7 @@ class RamTier {
       cpu_job.slots[cpu_job.k] = static_cast<int32_t>(plan.slots[i]);
       cpu_job.weights[cpu_job.k] = lane.weight;
       ++cpu_job.k;
-      misses->sent |= 1u << i;
+      misses->sent |= Wire::LaneMask{1} << i;
     }
     if (cpu_job.k == 0) return;
     misses->left -= cpu_job.k;

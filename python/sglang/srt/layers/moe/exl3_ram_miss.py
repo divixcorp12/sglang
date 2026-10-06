@@ -831,7 +831,7 @@ class Exl3RamMissService:
     def plan_gather_width(self, rows: int) -> None:
         """Plan a layer whose graph gather misses ``rows`` ids; the widest layer sets the build's lane count.
 
-        Only valid before the service starts. Raises ValueError for a width outside 1..32.
+        Only valid before the service starts. Raises ValueError for a width outside 1..64.
         """
         if self.host is not None:
             raise RuntimeError(

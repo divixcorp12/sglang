@@ -48,6 +48,19 @@ class WireLayout:
         return self.lanes // 8
 
     @property
+    def wide_lanes(self) -> bool:
+        """Lane masks are u64 (LeaseLayout::kWideLanes): more than 32 lanes."""
+        return self.lanes > 32
+
+    @property
+    def ce_mask_words(self) -> int:
+        return 5 if self.wide_lanes else 3
+
+    @property
+    def cpu_lane_words(self) -> int:
+        return 3 if self.wide_lanes else 2
+
+    @property
     def packed_counts(self) -> bool:
         return self.lanes == 8
 
@@ -152,7 +165,7 @@ class WireLayout:
         }
 
 
-MAX_LANES = 32
+MAX_LANES = 64
 
 
 @functools.cache

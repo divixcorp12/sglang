@@ -2472,10 +2472,12 @@ class ExpertStreamDevice:
         self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
         self.host_rows_1 = torch.zeros(self.wire.lanes, dtype=torch.int64, device=device)
         self.dst_slots_1 = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
-        # CW's words for CC: the lanes it armed the gate for, the CPU lanes, the CPU output parts; 0: none.
-        self.ce_mask = torch.zeros(3, dtype=torch.int32, device=device)
-        # CPU experts, written by CC: the lanes the CPU computed, then the output parts holding their partial sums (0: none).
-        self.cpu_lanes = torch.zeros(2, dtype=torch.int32, device=device)
+        # CW's words for CC: the lanes it armed the gate for, the CPU lanes, the CPU output parts; 0: none; a wide wire
+        # appends the masks' high halves.
+        self.ce_mask = torch.zeros(self.wire.ce_mask_words, dtype=torch.int32, device=device)
+        # CPU experts, written by CC: the lanes the CPU computed, then the output parts holding their partial sums (0: none);
+        # a wide wire appends the lanes' high half.
+        self.cpu_lanes = torch.zeros(self.wire.cpu_lane_words, dtype=torch.int32, device=device)
         # CPU experts (``enable_cpu_experts``): the host rows the post stages each
         # layer's input into, and those the CPU expert thread writes each layer's
         # partial sum to; None when off.
