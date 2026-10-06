@@ -735,14 +735,20 @@ private:
     }
 };
 
+// Forwards by plan since load: [0] the DSV4.1 plan, [1] the generic plan. Relaxed: counts only, read through
+// exl3_cpu_plan_calls (kernel.cpp, the one file that includes this header).
+std::atomic<int64_t> g_plan_calls[2];
+
 // Runs the call's plan at tier `isa`: the DSV4.1 plan when it accepts the call, else the generic plan at the tier.
 void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, int threads, Isa isa)
 {
     const ExpertLayer& l = *ctx.layer;
     if (isa == Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
+        g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
         ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, Experts<Dsv41Shape>{&l, p}, ar, threads);
         return;
     }
+    g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);
     const Experts<GenericShape> E{&l, p};
     switch (isa) {
         case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, threads); return;
