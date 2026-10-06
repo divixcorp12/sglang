@@ -35,7 +35,8 @@ SUITES = [
     "test/manual/dsv41/test_exl3_moe_split_parity_cuda.py",
     "test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py",
 ]
-DEVICE = re.compile(r"^(expert_stream_exl3_l8(_n2)?|expert_residency_direct_.*|exl3_moe_route_tables.*)$")
+PREFIX = "sgl_kernel_jit_"  # the JIT cache's module names
+DEVICE = re.compile(r"^(expert_stream_exl3_l8(_n2)?|expert_residency_direct_.*|(dsv41_)?exl3_moe_route_tables.*)$")
 HOST = re.compile(r"^expert_stream_host_exl3_(prod|instr)_l8(_n2)?$")
 # The wide template arguments this plan adds to shared kernels; their narrow instantiation is the old kernel.
 RENAMES = [
@@ -76,29 +77,39 @@ def _text(so: str) -> str:
         return hashlib.sha256(open(out.name, "rb").read()).hexdigest()
 
 
-def collect() -> dict:
-    cache = os.path.join(REPO, ".bs1-digest-cache")
-    shutil.rmtree(cache, ignore_errors=True)
-    env = os.environ | {"SGLANG_JIT_CACHE_DIR": cache, "PYTHONPATH": os.path.join(REPO, "python")}
-    rc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *SUITES], env=env, cwd=REPO).returncode
-    if rc != 0:
-        raise SystemExit(f"the BS1 suites failed (exit {rc}); a digest of a red build proves nothing")
+def collect(keep_cache: str | None = None, reuse_cache: str | None = None) -> dict:
+    cache = reuse_cache or os.path.join(REPO, ".bs1-digest-cache")
+    if not reuse_cache:
+        shutil.rmtree(cache, ignore_errors=True)
+        env = os.environ | {"SGLANG_JIT_CACHE_DIR": cache, "PYTHONPATH": os.path.join(REPO, "python")}
+        rc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *SUITES], env=env,
+                            cwd=REPO).returncode
+        if rc != 0:
+            raise SystemExit(f"the BS1 suites failed (exit {rc}); a digest of a red build proves nothing")
     result = {"nvcc": subprocess.run(["nvcc", "--version"], capture_output=True, text=True).stdout.splitlines()[-1],
               "device": {}, "host": {}}
     import torch
 
     result["arch"] = "sm_%d%d" % torch.cuda.get_device_capability()
+    found = {}
     for root, _, files in os.walk(cache):
         for f in files:
             if not f.endswith(".so"):
                 continue
-            module, path = f[:-3], os.path.join(root, f)
+            module, path = f[:-3].removeprefix(PREFIX), os.path.join(root, f)
             if DEVICE.match(module):
-                for kernel, digest in _sass(path).items():
-                    result["device"][f"{module}::{kernel}"] = digest
+                digests = {f"{module}::{kernel}": digest for kernel, digest in _sass(path).items()}
+                found.setdefault(("device", module), []).append((root, digests))
             elif HOST.match(module):
-                result["host"][module] = _text(path)
-    shutil.rmtree(cache, ignore_errors=True)
+                found.setdefault(("host", module), []).append((root, {module: _text(path)}))
+    # One build of a module per cache leaf; the suites build each module once, so two leaves would make the digest
+    # depend on the walk order. Refuse rather than guess.
+    for (kind, module), leaves in sorted(found.items()):
+        if len(leaves) != 1:
+            raise SystemExit(f"{kind} module {module} was built {len(leaves)} times: {[root for root, _ in leaves]}")
+        result[kind].update(leaves[0][1])
+    if not keep_cache and not reuse_cache:
+        shutil.rmtree(cache, ignore_errors=True)
     return result
 
 
@@ -108,8 +119,10 @@ def main():
     group.add_argument("--write")
     group.add_argument("--compare")
     parser.add_argument("--permanent", action="store_true")
+    parser.add_argument("--keep-cache", action="store_true", help="leave the fresh JIT cache in .bs1-digest-cache")
+    parser.add_argument("--reuse-cache", help="digest this JIT cache instead of running the suites (a kept one)")
     args = parser.parse_args()
-    now = collect()
+    now = collect(args.keep_cache, args.reuse_cache)
     if args.write:
         with open(args.write, "w") as f:
             json.dump(now, f, indent=1, sort_keys=True)
