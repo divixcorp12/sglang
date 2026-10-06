@@ -15,6 +15,7 @@
 #include "../draft_channel.h"
 #include "cpu_experts.h"
 #include "lease_channel.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -125,6 +126,18 @@ class DraftCpuThread {
   int64_t holds() const {
     return holds_.load(std::memory_order_relaxed);
   }
+  /// Jobs whose live routes name one slot more than once: the EXL3 kernel runs each with a chunk of several tokens.
+  int64_t collided_jobs() const {
+    return collided_jobs_.load(std::memory_order_relaxed);
+  }
+  /// Live routes past each slot's first, summed over jobs.
+  int64_t shared_routes() const {
+    return shared_routes_.load(std::memory_order_relaxed);
+  }
+  /// Forward time of the collided jobs, in ns.
+  int64_t collided_forward_ns() const {
+    return collided_forward_ns_.load(std::memory_order_relaxed);
+  }
 
  private:
   const uint32_t* head_word() const {
@@ -195,6 +208,7 @@ class DraftCpuThread {
         slots[t * k + i] = s[t * kMaxK + i];
         weights[t * k + i] = w[t * kMaxK + i];
       }
+    const int shared = count_shared_routes(slots, rows * k);
     const cpu_experts::ExpertLayer& layer = layers_[stage];
     cpu_experts::ForwardCall call;
     call.rows = rows;
@@ -216,6 +230,11 @@ class DraftCpuThread {
     add(forward_ns_, end - start);
     add(jobs_, 1);
     add(rows_, rows);
+    if (shared > 0) {
+      add(collided_jobs_, 1);
+      add(shared_routes_, shared);
+      add(collided_forward_ns_, end - start);
+    }
     channel::complete<DraftChannel>(config_.channel, seq, static_cast<uint64_t>(epoch) << 32 | seq);
     completed_.store(seq, std::memory_order_release);
     return end;
@@ -254,6 +273,18 @@ class DraftCpuThread {
     }
   }
 
+  /// The call's live routes (slot >= 0) past each slot's first. Outside the timed forward; at most kMaxRows * kMaxK.
+  static int count_shared_routes(const int32_t* slots, int n) {
+    int32_t live[kMaxRows * kMaxK];
+    int count = 0;
+    for (int i = 0; i < n; ++i)
+      if (slots[i] >= 0) live[count++] = slots[i];
+    std::sort(live, live + count);
+    int shared = 0;
+    for (int i = 1; i < count; ++i) shared += live[i] == live[i - 1];
+    return shared;
+  }
+
   /// A counter only the draft thread writes: no locked add needed.
   static void add(std::atomic<int64_t>& counter, int64_t n) {
     counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
@@ -264,7 +295,8 @@ class DraftCpuThread {
   std::thread thread_, watchdog_;
   std::atomic<bool> stop_{false};
   std::atomic<uint32_t> completed_{0};
-  std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0};
+  std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0}, collided_jobs_{0}, shared_routes_{0},
+      collided_forward_ns_{0};
 };
 
 }  // namespace sglang::expert_stream::draft

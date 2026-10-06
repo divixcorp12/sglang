@@ -191,10 +191,18 @@ class DraftCpuHost:
         self._module.expert_stream_draft_cpu_stop(self.handle)
 
     def stats(self) -> dict:
-        out = torch.zeros(4, dtype=torch.int64)
+        out = torch.zeros(7, dtype=torch.int64)
         self._module.expert_stream_draft_cpu_stats(self.handle, out)
-        jobs, rows, forward_ns, holds = (int(v) for v in out.tolist())
-        return {"jobs": jobs, "rows": rows, "forward_ns": forward_ns, "keep_warm_calls": holds}
+        jobs, rows, forward_ns, holds, collided_jobs, shared_routes, collided_forward_ns = (int(v) for v in out.tolist())
+        return {
+            "jobs": jobs,
+            "rows": rows,
+            "forward_ns": forward_ns,
+            "keep_warm_calls": holds,
+            "collided_jobs": collided_jobs,
+            "shared_routes": shared_routes,
+            "collided_forward_ns": collided_forward_ns,
+        }
 
 
 _LIVE: "weakref.WeakSet[DraftCpuHost]" = weakref.WeakSet()

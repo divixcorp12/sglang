@@ -613,17 +613,20 @@ struct HostExports {
     thread->stop();
   }
 
-  // int64 [4]: jobs, rows, forward ns, keep-warm holds.
+  // int64 [7]: jobs, rows, forward ns, keep-warm holds, collided jobs, shared routes, collided forward ns.
   static void draft_cpu_stats(int64_t handle, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("out", TensorMatcher({4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    expert_stream::verify_named("out", TensorMatcher({7}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     const std::shared_ptr<draft::DraftCpuThread> thread = find_draft(handle);
     auto* o = static_cast<int64_t*>(out.data_ptr());
     o[0] = thread->jobs();
     o[1] = thread->rows();
     o[2] = thread->forward_ns();
     o[3] = thread->holds();
+    o[4] = thread->collided_jobs();
+    o[5] = thread->shared_routes();
+    o[6] = thread->collided_forward_ns();
   }
 
   // Reserves every row's staging slots (up to k, fewer on a small tier) and publishes its first map delta
