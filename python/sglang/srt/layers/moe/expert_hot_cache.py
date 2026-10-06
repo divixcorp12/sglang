@@ -1266,7 +1266,7 @@ class ExpertHotCacheManager:
         for layer_id, rows in gather_rows.items():
             plan = getattr(streamers[layer_id].format, "plan_graph_gather", None)
             if rows and plan is not None:
-                plan(streamers[layer_id], miss_lanes[layer_id])
+                plan(streamers[layer_id], miss_lanes[layer_id], rows)
         selected = {layer_id: [] for layer_id in streamers}
         pull_row_enabled = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
         allocated_layers = {

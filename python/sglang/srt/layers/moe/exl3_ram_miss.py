@@ -820,6 +820,8 @@ class Exl3RamMissService:
         self.lease_pdl = False
         # The widest gather any layer planned (plan_gather_width); None until one does.
         self._gather_planned: Optional[int] = None
+        # The most routes one layer's graph gather takes (a verify's tokens x top_k); the CPU expert rows size from it.
+        self._gather_routes_planned = 0
         # The victim lanes a spill gather plans (plan_staging_width); None without spill.
         self._staging_planned: Optional[int] = None
         # The build's wire, fixed at start from the planned width.
@@ -845,15 +847,18 @@ class Exl3RamMissService:
             )
         self.tables[layer_id] = table
 
-    def plan_gather_width(self, rows: int) -> None:
+    def plan_gather_width(self, rows: int, routes: int = 0) -> None:
         """Plan a layer whose graph gather misses ``rows`` ids; the widest layer sets the build's lane count.
 
+        ``routes`` is the layer's gather routes when they exceed its miss lanes: the service starts before the streamers
+        enable their graph gather, so the CPU expert rows learn the verify's token count here.
         Only valid before the service starts. Raises ValueError for a width outside 1..64.
         """
         if self.host is not None:
             raise RuntimeError(
                 "exl3 RAM miss: the graph gather width was planned after the service started"
             )
+        self._gather_routes_planned = max(self._gather_routes_planned, int(routes))
         planned = max(1, int(rows))
         wire_layout(planned)
         self._gather_planned = (
@@ -1053,7 +1058,9 @@ class Exl3RamMissService:
                 )
             cpu_experts = None
             if envs.SGLANG_DSV41_CPU_EXPERTS.get():
-                cpu_experts = self._start_cpu_experts(cfg, host, fmt, streamers, pin, numa)
+                cpu_experts = self._start_cpu_experts(
+                    cfg, host, fmt, streamers, pin, numa, self._gather_routes_planned
+                )
             if get_exl3_stream_trace().enabled:
                 # Before the thread starts: without a trace file it takes no timestamps.
                 host.enable_trace()
@@ -1131,7 +1138,9 @@ class Exl3RamMissService:
         )
 
     @staticmethod
-    def _start_cpu_experts(cfg, host, fmt, streamers, pin: bool, numa: ThreadingConfig):
+    def _start_cpu_experts(
+        cfg, host, fmt, streamers, pin: bool, numa: ThreadingConfig, planned_routes: int = 0
+    ):
         """Build the CPU expert service for ``SGLANG_DSV41_CPU_EXPERTS``.
 
         Runs after the copy engine is enabled and before the service thread starts. CPU
@@ -1175,7 +1184,15 @@ class Exl3RamMissService:
                 f"exl3 RAM miss: CPU experts need one hidden size, the layers have {hidden}"
             )
         # A DSpark verify gathers tokens x top_k routes a layer; the CPU rows hold that many tokens.
-        tokens = max((s.graph_gather_rows // s.layer.top_k for s in streamers.values() if s.graph_gather_rows), default=1)
+        # The service starts before the streamers enable their graph gather, so the planned routes stand in for it.
+        tokens = max(
+            (
+                (s.graph_gather_rows or planned_routes) // s.layer.top_k
+                for s in streamers.values()
+                if s.graph_gather_rows or planned_routes
+            ),
+            default=1,
+        )
         # Spill: a split entry is only read for the live lanes, at most the victim lanes.
         victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get() or None
         return CpuExpertGroups(

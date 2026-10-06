@@ -232,8 +232,8 @@ class Exl3ExpertFormat:
             )
         return options
 
-    def plan_graph_gather(self, streamer, rows: int) -> None:
-        """Tell the RAM-miss service the layer's graph gather misses up to ``rows`` ids.
+    def plan_graph_gather(self, streamer, rows: int, routes: int = 0) -> None:
+        """Tell the RAM-miss service the layer's graph gather misses up to ``rows`` ids (of ``routes`` routes).
 
         Called before the first tier fill, while the service reserves its staging
         slots. A no-op unless the tier runs on the native slot table.
@@ -245,7 +245,7 @@ class Exl3ExpertFormat:
 
         tier = getattr(streamer, "pinned_host_cache", None)
         if isinstance(getattr(tier, "_lru", None), NativePinnedSlotTable):
-            Exl3RamMissService.get().plan_gather_width(rows)
+            Exl3RamMissService.get().plan_gather_width(rows, routes)
             victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
             if victims and victims < rows:
                 Exl3RamMissService.get().plan_staging_width(victims)
