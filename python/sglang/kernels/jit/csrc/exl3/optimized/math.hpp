@@ -43,7 +43,13 @@ namespace {
 
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
 constexpr float HAD_SCALE = 0.088388347648f;
-constexpr int MAX_M = 4;
+#ifndef EXL3_MOE_CPU_MAX_M
+#define EXL3_MOE_CPU_MAX_M 4
+#endif
+// Quantized activation rows per chunk: CHUNK_M tokens times ACT_ROWS (below). Every per-chunk array, stride and tile
+// table derives from it. A build raises it with -DEXL3_MOE_CPU_MAX_M (SGLANG_EXL3_CPU_MAX_M; the bench's EXL3_MAX_M).
+constexpr int MAX_M = EXL3_MOE_CPU_MAX_M;
+static_assert(MAX_M >= 2 && MAX_M <= 8 && MAX_M % 2 == 0, "EXL3_MOE_CPU_MAX_M must be even, in [2, 8]");
 
 #ifndef EXL3_MOE_CPU_ACT_RESIDUAL
 #define EXL3_MOE_CPU_ACT_RESIDUAL 0

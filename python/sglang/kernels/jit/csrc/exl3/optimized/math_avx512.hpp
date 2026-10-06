@@ -774,8 +774,9 @@ void vbmi_tiles(const Exl3Projection& mat, const PreparedIn& in, float* tout, in
     // zmm accumulators: rows2 x band8, rows3/4 x band4) fit the register budget and keep the
     // swizzled stream at full duty. Narrow divisor bands (read-N-skip-N) measured BELOW
     // native layout at m>1. K2 rows4 prefers band 2 (measured 216 vs 197 Gw/s at band 4).
+    // rows > 4 (a raised MAX_M): two bands, at most 16 accumulators.
     const int max_band = mat.swz
-        ? (rows <= 2 ? 8 : (rows == 4 && bits == 2 ? 2 : 4))
+        ? (rows <= 2 ? 8 : rows > 4 ? 2 : (rows == 4 && bits == 2 ? 2 : 4))
         : (rows == 1 ? band_cap : (12 / rows < 8 ? 12 / rows : 8));
     int n0 = tn0;
     while (n0 < tn1)

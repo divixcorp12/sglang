@@ -63,6 +63,16 @@ def check_cpu_compiler() -> None:
 OPTIMIZED_CPU_DEFINES = ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128"]  # as exl3/build.py
 
 
+def _max_m_defines() -> list[str]:
+    """-DEXL3_MOE_CPU_MAX_M from SGLANG_EXL3_CPU_MAX_M; none at 0, the kernel's default."""
+    max_m = envs.SGLANG_EXL3_CPU_MAX_M.get()
+    if not max_m:
+        return []
+    if max_m < 2 or max_m > 8 or max_m % 2:
+        raise ValueError(f"SGLANG_EXL3_CPU_MAX_M must be 0 or even in [2, 8], got {max_m}")
+    return [f"-DEXL3_MOE_CPU_MAX_M={max_m}"]
+
+
 def cpu_act_defines() -> list[str]:
     """Compiler defines for the CPU kernel's activation quantization options; empty when both are off.
 
@@ -76,7 +86,12 @@ def cpu_act_defines() -> list[str]:
                 f"SGLANG_EXL3_CPU_ACT_BLOCK=128), but residual={residual.get()} block={block.get()} are set: "
                 "unset them or set those values"
             )
-        return list(OPTIMIZED_CPU_DEFINES)
+        return list(OPTIMIZED_CPU_DEFINES) + _max_m_defines()
+    if envs.SGLANG_EXL3_CPU_MAX_M.get():
+        raise ValueError(
+            "SGLANG_EXL3_CPU_MAX_M sizes the optimized EXL3 CPU kernel, which SGLANG_DSV41_CPU_EXPERTS=1 builds; "
+            "the vendored kernel keeps its own"
+        )
     defines = []
     if envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get():
         defines.append("-DEXL3_MOE_CPU_ACT_RESIDUAL=1")
@@ -89,13 +104,15 @@ def cpu_act_defines() -> list[str]:
 
 
 def build_flavor(defines: list[str]) -> str:
-    """The empty string for upstream's kernel, else a suffix naming the options, e.g. "_resid_b128"."""
+    """The empty string for upstream's kernel, else a suffix naming the options, e.g. "_resid_b128" or "_resid_b128_m8_cpu_v1"."""
     flavor = ""
     if "-DEXL3_MOE_CPU_ACT_RESIDUAL=1" in defines:
         flavor += "_resid"
     for d in defines:
         if d.startswith("-DEXL3_MOE_CPU_ACT_BLOCK="):
             flavor += "_b" + d.split("=", 1)[1]
+        elif d.startswith("-DEXL3_MOE_CPU_MAX_M="):
+            flavor += "_m" + d.split("=", 1)[1]
     if optimized_cpu(defines):
         flavor += "_cpu_v1"
     return flavor

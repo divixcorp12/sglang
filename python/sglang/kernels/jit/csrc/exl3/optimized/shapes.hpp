@@ -1,7 +1,7 @@
 // The shapes a forward plan can be specialized for. A plan reads every layer fact through its Shape: GenericShape takes
 // each from the ExpertLayer; Dsv41Shape fixes DeepSeek V4.1's routed expert at compile time: hidden 5120, intermediate
 // 2304, 3-bit, unswizzled, clamped at its swiglu_limit of 10. Every layer is gated SiLU (Exl3Quant::validate). A Chunk
-// is one expert's share of a call (up to MAX_M token rows), which Dsv41Shape::accepts reads.
+// is one expert's share of a call (up to CHUNK_M tokens), which Dsv41Shape::accepts reads.
 // Derived from exllamav3 02aef45cd681b960a00afcd0749a4ab99e6c1bfe. MIT License, Copyright (c) 2025 Turboderp;
 // see ../LICENSE.exllamav3.
 #pragma once
