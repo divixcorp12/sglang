@@ -268,3 +268,16 @@ def test_a_stop_between_the_poll_loads_is_not_a_torn_record():
     assert result.returncode == 0, result.stderr[-2000:]
     assert "stopped" in result.stdout
     assert "FATAL" not in result.stderr and "torn" not in result.stderr, result.stderr[-2000:]
+
+
+def test_a_stop_during_a_hung_forward_still_fail_stops():
+    # The watchdog outlives stop(): a forward that never returns aborts within the fatal wait instead of hanging
+    # the join.
+    try:
+        result = spawn_child(_STOP_CHILD, "hung", timeout_s=20, variant=VARIANT)
+    except subprocess.TimeoutExpired:
+        pytest.fail("stop() hung behind a forward that never returned: the watchdog had stopped")
+    assert "late" not in result.stdout, (result.stdout, result.stderr[-2000:])
+    assert result.returncode != 0
+    for text in ["DSpark draft CPU experts", "record 1", "incomplete"]:
+        assert text in result.stderr, result.stderr[-2000:]
