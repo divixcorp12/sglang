@@ -111,6 +111,7 @@ class DraftCpuThread {
   /// The device is past its last post at teardown, so moving the head word to end a hold misleads no one.
   void stop() {
     if (!thread_.joinable()) return;
+    head_at_stop_.store(channel::head<DraftChannel>(config_.channel), std::memory_order_relaxed);
     stop_.store(true, std::memory_order_seq_cst);
     __atomic_fetch_add(reinterpret_cast<uint32_t*>(config_.channel + DraftChannel::kHead), 1u, __ATOMIC_SEQ_CST);
     thread_.join();
@@ -251,7 +252,10 @@ class DraftCpuThread {
     while (!watchdog_stop_.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
       if (watchdog_stop_.load(std::memory_order_acquire)) return;
-      const uint32_t head = channel::head<DraftChannel>(config_.channel);
+      // The bump stop() makes to end a hold is not a record: once stopped, the head is what it was before.
+      const uint32_t head =
+          stop_.load(std::memory_order_acquire) ? head_at_stop_.load(std::memory_order_relaxed)
+                                                : channel::head<DraftChannel>(config_.channel);
       if (head == 0 || head == completed_.load(std::memory_order_acquire)) {
         watched = 0;
         continue;
@@ -276,7 +280,7 @@ class DraftCpuThread {
   std::vector<cpu_experts::ExpertLayer> layers_;
   std::thread thread_, watchdog_;
   std::atomic<bool> stop_{false}, watchdog_stop_{false};  // the watchdog stops after the run thread has joined
-  std::atomic<uint32_t> completed_{0};
+  std::atomic<uint32_t> completed_{0}, head_at_stop_{0};
   std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0};
 };
 
