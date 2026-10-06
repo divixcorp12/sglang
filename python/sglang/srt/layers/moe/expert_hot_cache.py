@@ -1293,8 +1293,12 @@ class ExpertHotCacheManager:
         # whole budget. Give every layer that floor from its own best experts first and
         # let the scores spend the rest; if every layer clears the floor anyway, the
         # selection is unchanged.
+        # Spill: only the victim lanes need VRAM slots (GpuResidencyUpdater._init_insert_direct's floor).
+        victim_lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
         floors = {
-            layer_id: 2 * miss_lanes[layer_id] if direct else 0
+            layer_id: 2 * (min(miss_lanes[layer_id], victim_lanes) if victim_lanes else miss_lanes[layer_id])
+            if direct
+            else 0
             for layer_id in gather_rows
         }
         for layer_id, floor in floors.items():

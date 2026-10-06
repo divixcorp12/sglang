@@ -59,8 +59,12 @@ def direct_gather_destinations(
     destinations_out: torch.Tensor,
     live_out: torch.Tensor,
     remap_out: torch.Tensor,
+    idle_destination: int = 0,
+    idle_slot: int = 0,
 ) -> None:
     """One layer's DIRECT gather destinations; see ``GpuResidencyUpdater.gather_destinations``.
+
+    A lane that is not live gets ``idle_destination`` and ``idle_slot``; nonzero values always run the wide kernel.
 
     ``topk_ids`` and ``remap`` are this forward's flat routes and the planner's remap (int32 or int64);
     ``remap_out`` may be either dtype. ``victims``/``victim_valid`` are the layer's shortlist row.
@@ -86,6 +90,8 @@ def direct_gather_destinations(
         destinations_out,
         live_out,
         remap_out,
+        int(idle_destination),
+        int(idle_slot),
     )
 
 

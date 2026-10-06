@@ -805,6 +805,8 @@ class Exl3RamMissService:
         self.lease_pdl = False
         # The widest gather any layer planned (plan_gather_width); None until one does.
         self._gather_planned: Optional[int] = None
+        # The victim lanes a spill gather plans (plan_staging_width); None without spill.
+        self._staging_planned: Optional[int] = None
         # The build's wire, fixed at start from the planned width.
         self._wire: Optional[WireLayout] = None
         self._copy_armed = False
@@ -845,6 +847,14 @@ class Exl3RamMissService:
             else max(self._gather_planned, planned)
         )
 
+    def plan_staging_width(self, rows: int) -> None:
+        """Plan the staging slots a row reserves under spill: the victim lanes, since only live misses stage (a forced
+        miss is read into a RAM victim). Only valid before the service starts; the widest plan wins."""
+        if self.host is not None:
+            raise RuntimeError("exl3 RAM miss: the staging width was planned after the service started")
+        planned = max(1, int(rows))
+        self._staging_planned = planned if self._staging_planned is None else max(self._staging_planned, planned)
+
     @property
     def wire(self) -> WireLayout:
         """The started build's wire; raises before ``ensure_started`` fixes the lane count."""
@@ -864,8 +874,9 @@ class Exl3RamMissService:
         return wire_layout(self._gather_planned or 1).lanes
 
     def staging_width(self) -> int:
-        """The staging slots every row asks for: the planned gather width, else the build's lanes."""
-        return self._gather_planned or self.resolved_lanes()
+        """The staging slots every row asks for: the planned victim lanes under spill, the planned gather width, else
+        the build's lanes."""
+        return self._staging_planned or self._gather_planned or self.resolved_lanes()
 
     def staging_for(self, capacity: int) -> int:
         """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""

@@ -246,6 +246,9 @@ class Exl3ExpertFormat:
         tier = getattr(streamer, "pinned_host_cache", None)
         if isinstance(getattr(tier, "_lru", None), NativePinnedSlotTable):
             Exl3RamMissService.get().plan_gather_width(rows)
+            victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
+            if victims and victims < rows:
+                Exl3RamMissService.get().plan_staging_width(victims)
 
     def attach_hot_cache_manager(self, manager, streamer) -> None:
         """Attach the RAM-miss service (fail-stop check, residency pushes, row backend).

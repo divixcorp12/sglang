@@ -522,6 +522,10 @@ class Envs:
     # route. A gather with more serves the lanes that find a victim and sets the residency's overflow flag; its output
     # is then not a verify result. 0 keeps one lane per route.
     SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES = EnvInt(0)
+    # Spill (SGLANG_DSV41_CPU_EXPERTS, a DSpark verify with a lane per route: MISS_LANES unset): only the first V of a
+    # gather's miss lanes in plan order take a VRAM victim and a staging slot; the post makes every later lane a CPU
+    # lane, a miss of which the host reads into a RAM victim. 0: every miss lane may take a victim. 1 <= V < the routes.
+    SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)
     # Debug only: write Qwen4-Exp MoE routing tensors of eager decode forwards to
     # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
     SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")

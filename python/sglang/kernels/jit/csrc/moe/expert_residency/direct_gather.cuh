@@ -89,7 +89,8 @@ __global__ __launch_bounds__(kDirectGatherWarp, 1) void direct_gather_destinatio
 
 // The same for a shortlist of 33-64 entries (a verify with a lane per route): two warps, thread j owns entry j, and the
 // usable entries' order crosses the warps through per-warp counts. Same outputs as the torch chain; the narrow kernel
-// above is left as it was for the one-token build.
+// above is left as it was for the one-token build. A lane that is not live gets idle_destination and idle_slot (0 and
+// 0, or slot_dump and -1 under spill: GpuResidencyUpdater._idle_destination).
 template <typename IdT, typename RemapInT, typename RemapOutT>
 __global__ __launch_bounds__(2 * kDirectGatherWarp, 1) void direct_gather_destinations_wide_kernel(
     const IdT* __restrict__ topk_ids,
@@ -104,7 +105,9 @@ __global__ __launch_bounds__(2 * kDirectGatherWarp, 1) void direct_gather_destin
     int32_t* __restrict__ destination_slots_out,
     int64_t* __restrict__ destinations_out,
     bool* __restrict__ live_out,
-    RemapOutT* __restrict__ remap_out) {
+    RemapOutT* __restrict__ remap_out,
+    int64_t idle_destination,
+    int32_t idle_slot) {
   constexpr int kThreads = 2 * kDirectGatherWarp;
   __shared__ int64_t usable[kThreads];
   __shared__ bool usable_valid[kThreads];
@@ -142,10 +145,10 @@ __global__ __launch_bounds__(2 * kDirectGatherWarp, 1) void direct_gather_destin
   __syncthreads();
   if (entry) {
     const bool live = t < miss_count[0] && usable_valid[t];
-    const int64_t destination = live ? usable[t] : 0;
+    const int64_t destination = live ? usable[t] : idle_destination;
     destinations[t] = destination;
     destinations_out[t] = destination;
-    destination_slots_out[t] = static_cast<int32_t>(destination);
+    destination_slots_out[t] = live ? static_cast<int32_t>(destination) : idle_slot;
     live_out[t] = live;
   }
   __syncthreads();
@@ -252,7 +255,9 @@ void direct_gather_destinations_gpu(
     tvm::ffi::TensorView destination_slots_out,
     tvm::ffi::TensorView destinations_out,
     tvm::ffi::TensorView live_out,
-    tvm::ffi::TensorView remap_out) {
+    tvm::ffi::TensorView remap_out,
+    int64_t idle_destination,
+    int64_t idle_slot) {
   using namespace host;
   static_assert(
       (std::is_same_v<IdT, int32_t> || std::is_same_v<IdT, int64_t>) &&
@@ -285,23 +290,29 @@ void direct_gather_destinations_gpu(
   RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= 2 * kDirectGatherWarp, "the shortlist must hold 1-64 entries");
   RuntimeCheck(0 < K_.unwrap() && K_.unwrap() <= kDirectGatherMaxRoutes, "the routes must hold 1-64 entries");
   const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
-  const bool wide = W_.unwrap() > kDirectGatherWarp;
-  host::LaunchKernel(1, wide ? 2 * kDirectGatherWarp : kDirectGatherWarp, stream)(
-      wide ? direct_gather_destinations_wide_kernel<IdT, RemapInT, RemapOutT>
-           : direct_gather_destinations_kernel<IdT, RemapInT, RemapOutT>,
-      static_cast<const IdT*>(topk_ids.data_ptr()),
-      static_cast<int>(topk_ids.numel()),
-      static_cast<const int64_t*>(expert_to_slot.data_ptr()),
-      static_cast<const int64_t*>(victims.data_ptr()),
-      static_cast<const bool*>(victim_valid.data_ptr()),
-      static_cast<int>(victims.numel()),
-      static_cast<const int32_t*>(miss_count.data_ptr()),
-      static_cast<const RemapInT*>(remap_in.data_ptr()),
-      scratch_base,
-      static_cast<int32_t*>(destination_slots_out.data_ptr()),
-      static_cast<int64_t*>(destinations_out.data_ptr()),
-      static_cast<bool*>(live_out.data_ptr()),
-      static_cast<RemapOutT*>(remap_out.data_ptr()));
+  const bool wide = W_.unwrap() > kDirectGatherWarp || idle_destination != 0 || idle_slot != 0;
+  const auto ids = static_cast<const IdT*>(topk_ids.data_ptr());
+  const int routes = static_cast<int>(topk_ids.numel());
+  const auto to_slot = static_cast<const int64_t*>(expert_to_slot.data_ptr());
+  const auto victim_ids = static_cast<const int64_t*>(victims.data_ptr());
+  const auto valid = static_cast<const bool*>(victim_valid.data_ptr());
+  const int width = static_cast<int>(victims.numel());
+  const auto count = static_cast<const int32_t*>(miss_count.data_ptr());
+  const auto remap = static_cast<const RemapInT*>(remap_in.data_ptr());
+  const auto slots = static_cast<int32_t*>(destination_slots_out.data_ptr());
+  const auto dests = static_cast<int64_t*>(destinations_out.data_ptr());
+  const auto live = static_cast<bool*>(live_out.data_ptr());
+  const auto out = static_cast<RemapOutT*>(remap_out.data_ptr());
+  if (wide) {
+    host::LaunchKernel(1, 2 * kDirectGatherWarp, stream)(
+        direct_gather_destinations_wide_kernel<IdT, RemapInT, RemapOutT>,
+        ids, routes, to_slot, victim_ids, valid, width, count, remap, scratch_base, slots, dests, live, out,
+        idle_destination, static_cast<int32_t>(idle_slot));
+  } else {
+    host::LaunchKernel(1, kDirectGatherWarp, stream)(
+        direct_gather_destinations_kernel<IdT, RemapInT, RemapOutT>,
+        ids, routes, to_slot, victim_ids, valid, width, count, remap, scratch_base, slots, dests, live, out);
+  }
 }
 
 /// \brief Checked launcher for `direct_commit_gather_kernel`: one layer's DIRECT residency commit.
