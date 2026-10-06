@@ -402,6 +402,11 @@ class NativePinnedSlotTable:
         self.capacity = int(capacity)
 
     @property
+    def reserved_rows(self) -> int:
+        """The row's staging slots: the service's lanes own them, so ``assign`` never hands one out."""
+        return self.service.staging_for(self.capacity)
+
+    @property
     def _row(self) -> int:
         self.service.ensure_started()
         return self.service.row_of(self.layer_id)
@@ -991,6 +996,7 @@ class Exl3RamMissService:
                 # wait by the RAM-miss timeout.
                 host.enable_copy_engine(
                     torch.cuda.current_device(),
+                    spin_us=envs.SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US.get(),
                     wait_timeout_ms=cfg.ram_miss_timeout_ms,
                     cpus=numa.copy_cpus,
                 )
@@ -1018,14 +1024,16 @@ class Exl3RamMissService:
                     )
             cores = [-1 if plan.ram is None else plan.ram for plan in numa.plans]
             busy_poll = all(plan.busy_poll for plan in numa.plans)
+            spin_us = envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.get()
             if numa.nodes == 1 and cores[0] == -1 and not busy_poll:
-                # The server's affinity: the thread spins there with PAUSE.
-                host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms))
+                # The server's affinity: the thread spins there with PAUSE, then sleeps.
+                host.start_thread(fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms), spin_us=spin_us)
             else:
                 host.start_thread(
                     cpu_core=cores if numa.nodes > 1 else cores[0],
                     busy_poll=busy_poll,
                     fatal_wait_s=watchdog_wait_s(cfg.ram_miss_timeout_ms),
+                    spin_us=spin_us,
                 )
             if fault is not None:
                 demands, seconds = fault
@@ -1193,12 +1201,18 @@ class Exl3RamMissService:
                 updater.enable_miss_order()
         if not getattr(streamer, "_graph_pinned_tier", False):
             return
-        if streamer.graph_gather_rows > self.lanes:
+        width = streamer.graph_miss_width
+        if width > self.lanes:
             # The post kernel requests min(count, lanes) lanes and traps on a wider
-            # plan.
+            # plan. A verify's misses take lanes, not its routes.
             raise ValueError(
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
-                f"per call but the service requests at most {self.lanes} lanes"
+                f"({width} miss lanes) per call but the service requests at most {self.lanes} lanes"
+            )
+        if self.cpu_experts is not None and width < streamer.graph_gather_rows:
+            raise ValueError(
+                f"exl3 RAM miss: CPU experts serve one token; layer {streamer.layer_id}'s gather serves {width} "
+                f"misses of {streamer.graph_gather_rows} routes (a verify)"
             )
         cache = streamer.hot_cache
         if self.cpu_experts is not None:
@@ -1261,9 +1275,9 @@ class Exl3RamMissService:
                 self._install_copy_engine_module_load_guard()
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
-        # The host staged staging_for(capacity) slots for the row at start; a post with
-        # more misses traps.
-        want = max(1, streamer.graph_gather_rows)
+        # The host staged staging_for(capacity) slots for the row at start. A post requests
+        # at most the miss width (a verify's clamp keeps its count there), not the routes.
+        want = max(1, streamer.graph_miss_width)
         staged = self.staging_for(int(self.host.tables.capacity[row]))
         if staged < want:
             logger.warning(
@@ -1423,9 +1437,16 @@ class Exl3RamMissService:
         An eager forward may load a kernel module, and a load blocks the copy thread's
         ``cuMemcpyAsync`` until the deadline while a decode graph in flight is held in
         its copy wait, so that step must end first. Captured decode forwards are
-        counted toward arming.
+        counted toward arming. A DSpark verify counts as a captured forward unless the
+        manager's graph gather is suspended (the eager re-run of an overflowed verify).
         """
-        if not forward_batch.forward_mode.is_decode():
+        mode = forward_batch.forward_mode
+        # A DSpark verify replays the decode graph unless its eager re-run suspended the graph gather.
+        graphed = mode.is_decode() or (
+            mode.is_target_verify()
+            and not (self._manager is not None and self._manager.graph_gather_suspended)
+        )
+        if not graphed:
             if self._copy_armed:
                 torch.cuda.synchronize()
         elif self.device_side is not None and self.device_side.copy_engine_captured:

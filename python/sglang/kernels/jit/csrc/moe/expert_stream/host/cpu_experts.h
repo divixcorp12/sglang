@@ -65,6 +65,21 @@ class CpuExpertLayers {
   std::unique_ptr<std::atomic<uint8_t>[]> state_;
 };
 
+/// Refuses a CPU expert team its forwards would refuse later: fewer than one thread, a core outside [0, CPU_SETSIZE)
+/// or repeated, or more threads than cores. Every CPU expert thread (CpuExpertEngine, DraftCpuThread) checks its own.
+inline void check_cpu_expert_team(const std::string& prefix, const std::vector<int>& cores, int threads) {
+  if (threads < 1) throw std::runtime_error(prefix + "the CPU expert pool needs at least one thread");
+  for (size_t i = 0; i < cores.size(); ++i) {
+    if (cores[i] < 0 || cores[i] >= CPU_SETSIZE)
+      throw std::runtime_error(prefix + "CPU expert core " + std::to_string(cores[i]) + " is outside [0, CPU_SETSIZE)");
+    for (size_t j = 0; j < i; ++j)
+      if (cores[j] == cores[i])
+        throw std::runtime_error(prefix + "CPU expert core " + std::to_string(cores[i]) + " repeats");
+  }
+  if (!cores.empty() && static_cast<size_t>(threads) > cores.size())
+    throw std::runtime_error(prefix + std::to_string(threads) + " workers on " + std::to_string(cores.size()) + " cores");
+}
+
 /// One forward over up to Wire::kLanes lanes of one row.
 ///
 /// A record produces at most one job for its CPU hits (part 0) and one per batch of CPU misses that landed together
@@ -94,6 +109,7 @@ struct CpuExpertConfig {
   int threads = 1;
   std::vector<int> cores;  // worker i runs on cores[i]; the engine's own thread on cores[0]
   int64_t keep_warm_ns = 0;  // how long after each job the held team runs register work instead of PAUSE
+  int64_t spin_ns = -1;      // how long the team is held in PAUSE after that before the engine sleeps; < 0: never
   bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
 };
 
@@ -108,9 +124,11 @@ struct CpuExpertConfig {
 /// order and done_ only increases, so done(seq) is a single compare any thread may make. The copy thread reads only
 /// done(), so CopyDone and the copy wait's gate keep their single publisher.
 ///
-/// Idle, nothing sleeps: the thread holds its team in the kernel's keep_warm, which runs register work at the forward's
-/// width for keep_warm_ns after each job and then PAUSE, until a submit or stop() moves kick_. A job therefore never
-/// waits for a worker to wake, and only a long gap pays the vector-frequency ramp.
+/// Idle: the thread holds its team in the kernel's keep_warm, which runs register work at the forward's width for
+/// keep_warm_ns after each job and then PAUSE, until a submit or stop() rings the doorbell, so a job inside the hold
+/// never waits for a worker to wake. spin_ns after the warm window (and spin_ns after start, before the first job) the
+/// hold releases the team to OpenMP's idle wait and the thread sleeps on the doorbell; the next submit wakes it. A
+/// negative spin_ns holds the team until the next submit, however long.
 class CpuExpertEngine {
  public:
   /// A record has at most one CPU-hit job and one job per CPU miss: the ring holds every job that can be outstanding.
@@ -163,7 +181,7 @@ class CpuExpertEngine {
   /// rules out: the caller fails stop.
   bool submit(const CpuJob& job) {
     if (!jobs_.push(job)) return false;
-    kick_.fetch_add(1, std::memory_order_release);
+    doorbell_.ring();
     return true;
   }
 
@@ -188,14 +206,14 @@ class CpuExpertEngine {
   void stop() {
     if (!thread_.joinable()) return;
     stop_.store(true, std::memory_order_release);
-    kick_.fetch_add(1, std::memory_order_release);
+    doorbell_.ring();
     thread_.join();
   }
 
  private:
   static_assert(
       sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
-      "the keep-warm reads kick_ as a plain uint32_t");
+      "the keep-warm reads the doorbell's word as a plain uint32_t");
 
   /// Refuses a config the forwards would refuse later, since a refused forward aborts the process.
   void validate() const {
@@ -210,18 +228,7 @@ class CpuExpertEngine {
       throw std::runtime_error(prefix_ + "the CPU expert input and output rows are required");
     if (c.hidden <= 0 || c.out_stride < c.hidden * static_cast<int64_t>(sizeof(float)))
       throw std::runtime_error(prefix_ + "the CPU expert output rows are smaller than the hidden size");
-    if (c.threads < 1) throw std::runtime_error(prefix_ + "the CPU expert pool needs at least one thread");
-    for (size_t i = 0; i < c.cores.size(); ++i) {
-      if (c.cores[i] < 0 || c.cores[i] >= CPU_SETSIZE)
-        throw std::runtime_error(
-            prefix_ + "CPU expert core " + std::to_string(c.cores[i]) + " is outside [0, CPU_SETSIZE)");
-      for (size_t j = 0; j < i; ++j)
-        if (c.cores[j] == c.cores[i])
-          throw std::runtime_error(prefix_ + "CPU expert core " + std::to_string(c.cores[i]) + " repeats");
-    }
-    if (!c.cores.empty() && static_cast<size_t>(c.threads) > c.cores.size())
-      throw std::runtime_error(
-          prefix_ + std::to_string(c.threads) + " workers on " + std::to_string(c.cores.size()) + " cores");
+    check_cpu_expert_team(prefix_, c.cores, c.threads);
   }
 
   /// Names the thread and pins it to cores[0]; returns why it could not, else "".
@@ -238,15 +245,23 @@ class CpuExpertEngine {
     const std::string error = pin();
     started_.set_value(error);
     if (!error.empty()) return;
+    constexpr int64_t kNever = INT64_MAX;
     int64_t warm_until = 0;  // the register-work window after the last job; 0 before the first
+    // When the hold releases the team; 0 once it has and the thread sleeps between submits.
+    int64_t release_at = config_.spin_ns < 0 ? kNever : now_ns() + config_.spin_ns;
     while (!stop_.load(std::memory_order_acquire)) {
-      // Read before the pop: a submit after an empty pop moves kick_ past `kick` and so ends the hold.
-      const uint32_t kick = kick_.load(std::memory_order_acquire);
+      // Read before the pop: a submit after an empty pop moves the word past `kick` and so ends the hold.
+      const uint32_t kick = doorbell_.word().load(std::memory_order_acquire);
       CpuJob job;
-      if (jobs_.pop(&job))
+      if (jobs_.pop(&job)) {
         warm_until = run_job(job) + config_.keep_warm_ns;
-      else
-        hold(kick, warm_until);
+        release_at = config_.spin_ns < 0 ? kNever : warm_until + config_.spin_ns;
+      } else if (release_at != 0) {
+        hold(kick, warm_until, release_at);
+        if (doorbell_.word().load(std::memory_order_acquire) == kick) release_at = 0;  // ran out: sleep from now on
+      } else {
+        doorbell_.sleep_unless([this] { return !jobs_.empty() || stop_.load(std::memory_order_acquire); });
+      }
     }
   }
 
@@ -280,11 +295,16 @@ class CpuExpertEngine {
     return end;
   }
 
-  /// Holds the team until kick_ moves past `kick`.
-  void hold(uint32_t kick, int64_t warm_until) {
+  /// Holds the team until the doorbell's word moves past `kick` or the clock reaches release_at.
+  void hold(uint32_t kick, int64_t warm_until, int64_t release_at) {
     try {
       config_.kernel->keep_warm(
-          config_.cores, config_.threads, reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until);
+          config_.cores,
+          config_.threads,
+          reinterpret_cast<const uint32_t*>(&doorbell_.word()),
+          kick,
+          warm_until,
+          release_at);
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert keep-warm failed: " + e.what());
     }
@@ -301,7 +321,7 @@ class CpuExpertEngine {
   std::thread thread_;
   std::promise<std::string> started_;  // the thread's pin result, for start()
   SpscRing<CpuJob, kRing> jobs_;
-  std::atomic<uint32_t> kick_{0};  // moved by every submit and by stop(); ends the hold
+  Doorbell doorbell_;  // rung by every submit and by stop(); its word ends the hold
   uint32_t claimed_ = 0;  // tier owner only
   std::atomic<uint32_t> done_{0};
   std::atomic<int64_t> jobs_done_{0};

@@ -6809,6 +6809,444 @@ N = 2/4/6. That gives:
 
 Build items 1-5 only if the projection beats it.
 
+### 33.5 The verify union curve and the graphed-verify projection (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-verify-gate.md`, branch `dsv41-dspark-graph`, run at
+`00cff9c620`. This is §33.3's "next step" and §10's measurement gate 1. The run is offline, on the CPU only.
+
+**Method.** `scripts/dsv41/verify_union.py` replays the DSV4.1 router capture:
+`direct-two-phase-tests/hot-cache-policy/router-capture/stages.jsonl`, with 40 layers, 384 experts, top-6, 6,153
+decode tokens and 26 requests.
+- **Windows.** Each verify is a window of `width` consecutive decode tokens of one request. The next window starts
+  `stride` tokens later, so stride stands for the accept length. A window never crosses a request or a prefill.
+- **Draft tokens.** The true next tokens' routes stand in for the draft tokens' (teacher forcing).
+- **Replay.** Windows go through `cpu_expert_sim.replay_nm`, which now takes the DIRECT shortlist width (`miss_rows`
+  = W). The settings are the slot-map recipe's: deferred RAM inserts, K = 0, and CPU experts off, as §33.3 v1 requires.
+- **Cost.** A verify costs `(n + m) × 1.0 ms` of link plus `m × 1.5 ms` of NVMe wait plus 14 ms of GPU.
+- **Baseline.** The baseline is the same simulator's plain-decode arm with CPU hits: 75.94 ms/token = 13.17 tok/s,
+  exactly §31.2's figure.
+- **Command.** `taskset -c 0-63 python scripts/dsv41/verify_union.py <stages.jsonl> --out $G/projection.json --jobs 8`,
+  with `$G = cc-expert-prediction/analysis/dsv41-dspark/graph-verify/` (`projection.{md,json}`). It ran in 2 minutes
+  with exit 0.
+
+**Union curve** (distinct experts per verify and layer):
+
+| width:stride | mean | p95 | p99 | max |
+|---|---|---|---|---|
+| 4:2 / 4:3 | 16.0 / 15.9 | 21 | 23 | 24 |
+| 6:2 / 6:3 / 6:4 | 21.2 / 21.1 / 21.2 | 29 | 32 | 36 |
+
+- A 6-token verify touches 3.5× one token's 6 experts per layer.
+- The p99 of 32 sits exactly at the wire cap, and the maximum of 36 exceeds it.
+
+**Projection** (draft slots = hot slots per layer given to the draft: hybrid ≈ 4, resident ≈ 13; tok/s assumes no
+draft time):
+
+| width:stride | W | draft slots | overflow | VRAM ok (cap ≥ 2W) | ms per accepted token | tok/s |
+|---|---|---|---|---|---|---|
+| 6:3 | 8 | 4 | 0.502 | yes | 149.0 | 6.71 |
+| 6:3 | 24 | 4 | 0.002 | no | 115.1 | 8.69 |
+| 6:3 | 32 | 0 | 0.000 | no | 101.8 | 9.83 |
+| 6:4 | 32 | 0 | 0.000 | no | 99.6 | 10.04 |
+| 4:3 | 24 | 0 | 0.000 | no | 99.6 | 10.04 |
+| plain decode, CPU experts off (§31.2) | | | | | 109.76 | 9.11 |
+| **plain decode, CPU hits (baseline)** | | | | | **75.94** | **13.17** |
+
+- **NVMe floor.** NVMe reads per verify are 11.2-11.3 × stride in every row. That is the same per accepted token as
+  plain decode (§31.2's 11.32). A verify cannot avoid reading each accepted token's new experts, so both paths pay
+  the same ≈28 ms/token NVMe floor.
+- **The union saves no link time.** At 6:3, W = 32, a verify moves 69.2 RAM-hit rows per accepted token against
+  plain decode's 67.5. Its whole 9% lead over plain decode without CPU experts (99.6 vs 109.76 ms) is the 14 ms of
+  GPU shared by 3 tokens, the one term this model understates.
+- **What it gives up.** Plain decode with CPU experts saves 31%.
+- **The VRAM base.** The trace ran at `SGLANG_MOE_HOT_GPU_MB=14336` (`router-capture/env.txt`): 28-29 hot slots per
+  layer. The current recipe without a draft runs at 16080 MB, about 31.6 per layer. The A/B arms of §33.4 run at
+  12040 (hybrid) and 7168 MB (resident), about 23.7 and 14 per layer. That is the trace's capacity minus ≈4.5 and
+  minus ≈14, which `draft_slots` 4 and 13 model.
+- **The W that keeps overflow low does not fit.** It needs W ≥ 24, and DIRECT's `capacity ≥ 2W` rule needs ≥ 48 hot
+  slots per layer.
+- **The W that fits overflows.** At about 24 slots, W ≤ 11. W = 8 overflows half the layers (0.50).
+
+**Verdict for v1 (CPU experts off in verify): NO-GO.** The gate (6:3, hybrid draft slots, overflow ≤ 2%,
+VRAM-admissible W) finds no admissible lane count. Every row loses, even with the gate's limits dropped:
+- every one of the 60 rows is below the baseline with zero draft time;
+- the best is 10.04 tok/s against 13.17;
+- the draft budget at parity (`stride × 75.94 − verify ms`) is negative in all 60.
+
+Every modelling simplification favours verify:
+- 14 ms of GPU for a 6-token verify leaves out the attention and Engram breaks (§33.3 item 6);
+- rejected draft tokens route at least as diversely as the true tokens that stand in for them;
+- residency decays once per verify, not once per token.
+
+**v2, multi-token CPU experts in verify (§33.3 item 5, size L): undecided.** A second run at `9bd866391b`
+(`projection2.{md,json}`, same command) costs the same misses with the simulator's own best per-layer CPU split
+(`verify_cpu_ms`, `CostModel.best_k`). It sweeps two unmeasured inputs: CPU cost per row as a multiple of the
+calibrated 0.63 ms (a verify's expert can serve several tokens), and GPU ms per verify.
+- **The CPU amortizes better in a verify than in plain decode.** A verify has 5.2 RAM-hit rows per layer against
+  1.7 for one token, so it pays the handoff once and overlaps more of the CPU with the link. That is why scaling
+  plain decode's 31% saving understated it.
+
+  | arm (no draft time) | 1.0× CPU, 14 ms | 1.5×, 28 ms | 2.0×, 42 ms |
+  |---|---|---|---|
+  | plain decode, ideal split (1.0×, 14 ms only) | 14.16 | | |
+  | 6:3, W 32, draft slots 0 | 17.93 | 14.57 | 12.58 |
+  | 6:3, W 32, draft slots 4 (hybrid) | 16.47 | 13.34 | 11.52 |
+  | 6:4, W 32, draft slots 4 | 17.37 | 14.23 | 12.41 |
+
+- **The band.** Against the served 13.17 tok/s it runs from +25% to −13% for the hybrid draft at 6:3. A graphed
+  draft's time per verify comes off the top. Tok/s rises mildly with stride (6:2 → 6:4 with the hybrid's slots: 14.8 → 17.4 at 1.0×, 14 ms).
+- **It needs item 1 solved first.** Every W ≥ 24 row fails `capacity ≥ 2W`. At W ≤ 11, half the layers overflow, and
+  the model does not cost the overflow path (⌈U/W⌉ records per layer, or an eager re-verify).
+- **Three measurements decide v2 before any build:**
+  1. GPU ms of a 6-token target verify forward with the attention and Engram breaks;
+  2. CPU ms per expert row when an expert serves 1-6 tokens. §33.4's kernel bench suggests ≈1.0-1.3×: 21 experts per
+     layer cover 36 routes, so about 1.7 tokens each at ≈⌈t/2⌉ weight passes. That is an inference, not a measurement;
+  3. what the `capacity ≥ 2W` rule (`expert_residency_gpu.py:377-383`) really requires at W ≈ 21.
+
+  If 1 and 2 land near 1.0-1.5× and ≤ 28 ms, and item 1 has a cheap answer, v2 is worth a build plan. Otherwise
+  graphed DSpark stays shelved, and §33.4's eager hybrid draft remains the only DSpark path.
+
+### 33.6 D2-1: the route plan and the in-graph MoE over M tokens (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-d2-1-multitoken-moe.md`, branch `dsv41-dspark-graph`.
+This is the first of four v2 plans. It covers §33.3 items 3 and 4.
+
+**What changed.**
+- **Route plan (item 3), `93213724ca`.**
+  - A second fused planner kernel, `plan_dedup_routes_kernel` (`expert_route_plan.cuh`), plans up to 64 routes of
+    several tokens in one launch. It uses one block of 64 threads and dedups by first occurrence, so a slot shared
+    across tokens is planned once.
+  - The one-warp BS1 kernel is unchanged and still serves `topk_ids.shape[0] == 1`.
+  - `supports_fused_graph_routes` admits multi-token calls up to 64 routes.
+- **Route tables, `bc832c0a88`.**
+  - `route_tables` and the layer-fusion kernel `exl3_moe_route_tables` now take `[M, H]` and up to 64 routes.
+  - Both rank routes stably (torch: `argsort(stable=True)`), so they agree bit for bit when tokens share a slot.
+  - Both write each rank's token (`route // top_k`) as exllamav3's `token_sorted`.
+  - The launcher refuses CPU experts for M > 1.
+- **The MoE (item 4), `aeafeac263`.**
+  - `Exl3FusedMoE(tokens=)` sizes its route buffers to `tokens × top_k` and runs any 1 ≤ M ≤ tokens by slicing them.
+  - `exl3_fused_moe_for` sets `tokens = graph_gather_rows // top_k` and refuses more than `ROW_TILE` = 16 tokens.
+
+**exllamav3 needed no change.** This closes item 4's "Unverified" line. `exl3_moe` is multi-token already:
+- `token_sorted` maps each sorted route to its input row;
+- experts are handed out by ticket, so a slot carries as many rows as `expert_count` says, up to its 16-row tile;
+- `num_active` only sizes the launch;
+- `exl3_moe_gather` sums per token.
+
+**Gate.** `test/manual/dsv41/test_exl3_fused_moe_multitoken_gpu.py` (`919f726c79`) ran on real layer-3 rows: 16
+experts in 16 slots, top-6, 8 route sets per M, with tokens sharing slots.
+- It passed every bar: rel ≤ 1.2e-2 and ≤ 2× the per-expert loop's error; layer fusion equal to the torch chain bitwise;
+  eager reruns and graph replays with rewritten inputs bitwise equal; M = 1 after M = 6 equal to a fresh object.
+- The P2 probe passed in the same run, so BS1 is intact.
+- Raw data: `cc-expert-prediction/analysis/dsv41-dspark/graph-verify/d2-1-multitoken.{json,log}`.
+
+| M | max rel_fused | max rel_loop | eager µs | replay µs | num_active |
+|---|---|---|---|---|---|
+| 1 | 1.10e-3 | 1.15e-2 | 97.0 | 96.6 | 6 |
+| 2 | 1.00e-3 | 1.21e-2 | 267.4 | 266.5 | -1 |
+| 4 | 1.00e-3 | 1.12e-2 | 272.3 | 271.4 | -1 |
+| 6 | 1.01e-3 | 1.08e-2 | 274.2 | 274.3 | -1 |
+
+**The first measured input to §33.5's "verify GPU ms".** This covers the MoE kernels only, for one layer of 16 slots.
+- Replay at M = 6 costs 2.84× M = 1 (274 vs 97 µs).
+- Almost all of that is the launch size, not the tokens. M = 2 already costs 267 µs, and the probe's own run gives
+  `num_active = -1` 279 µs of replay at M = 1, against 113 µs at 6.
+- **`num_active = -1` at M > 1 is untuned.** A launch sized to the distinct-slot bound (≤ min(M × top_k, slots)) is
+  the obvious next measurement. At 40 layers, today's figure adds ≈7 ms per verify over BS1's MoE.
+
+**What D2-1 does not do:**
+- the record and wire at width W (D2-2, item 2);
+- DIRECT's `capacity ≥ 2W` and the overflow path (D2-2);
+- the end-to-end graphed verify with CPU experts off, the small items and the gate (D2-3, items 6-8);
+- multi-token CPU experts (D2-4, item 5).
+
+### 33.7 D2-2: a miss width below the routes, and the overflow flag (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-d2-2-miss-lanes.md`, branch `dsv41-dspark-graph`.
+This is the second of four v2 plans. It covers §33.3 items 1 and 2.
+
+**§33.3 item 2 is out of date.**
+- The record is no longer 8 lanes. `LeaseLayout<NumLanes, NumNodes>` takes 1-32 lanes, one JIT build per lane count
+  (`0b82fc37c5`, `5813a147d5`, `7a77475a20`).
+- The real one-token assumption was the unit the width counted: `graph_gather_rows` counts routes (36 for a 6-token
+  verify at top-6). From it came the lane build (`plan_gather_width` raises above 32), DIRECT's victim shortlist and
+  `capacity ≥ 2 × rows` floor, the allocator's floor, and the attach check `graph_gather_rows > lanes`.
+
+**What changed.**
+- **The fused DIRECT gather takes up to 64 routes, `3ad17dfb8a`.**
+  - The kernel is one warp. It translated a route's remap only where `lane < top_k`, and its launcher refused more
+    than 32 routes. The remap loop now strides by the warp.
+  - The launcher checks the shortlist (1-32) and the routes (1-64) separately.
+  - Layer fusion's per-layer remap rows are as wide as the routes, not the shortlist (`f503e4caa3`). BS1 is unchanged.
+- **A miss width W separate from the routes, `1136ec5f0e`.**
+  - `SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES` (an `EnvInt(0)`), or `from_model(graph_gather_miss_lanes=)`, caps each
+    layer's distinct misses per gather. It is capped at the routes, and 0 keeps one lane per route.
+  - `ExpertStreamer.graph_miss_lanes` and `graph_miss_width` carry it.
+  - Routes keep their width: planner, remap and protect list. Misses take W: the lane build, staging, DIRECT's
+    shortlist, the allocator floor (`2W`) and the attach check.
+  - A width below the routes needs DIRECT (`SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2`) and refuses CPU experts.
+  - `exl3_fused_moe_for` needs `top_k` resident slots, not one per route.
+  - The RAM-miss attach checks a row's staging against W, not the routes (`37cd93df93`).
+- **Clamp and flag, `7d06ed4782`.**
+  - `GpuResidencyUpdater.clamp_gather_misses` runs after the DIRECT destinations, only when W is below the routes.
+    It sets the shared miss count to the lanes that found a victim.
+  - `gather_overflow` (int64 per layer) counts the gathers that had more misses than that.
+  - `overflow_flag` (int32 [1], sticky) says this forward's output is not a verify result.
+  - The metrics snapshot gains `gather_overflow` only when some layer is narrowed.
+
+**Why residency stays exact.**
+- The live lanes are a prefix: usable shortlist entries come first, then `lane < count`. So `live.sum()` is the
+  number served.
+- The post kernel, S, the copy wait and the commit all read one count, `_graph_miss_count`. After the clamp, every row
+  copied is committed, and nothing else is.
+- Without the clamp, a counted lane that is not live copies into slot 0. Reusing `keep = 0` would be wrong as well:
+  the copies have already been issued, and the commit would then skip rows it had overwritten.
+- An overflowed forward reads the wrong rows. An unserved miss's route reads slot 0, because a lane that is not live
+  has destination 0 (a rank past the shortlist reads its last lane). Slot 0 may be free and hold any bytes, so the
+  output can be NaN or Inf, not merely the wrong experts. The flag marks the output, and D2-3 must discard
+  everything the flagged forward wrote, not only its tokens.
+- A mutant that drops the clamp fails all three narrow-gather tests: the flag stays 0, and served rows are wrong.
+
+**The `capacity ≥ 2W` floor stays, though its guarantee no longer holds for a verify.**
+- At one token, `H + M ≤ rows` guarantees every miss a victim. For a verify, `H + M` may exceed W, and the hits may
+  disqualify more shortlist entries than there are to spare.
+- The flag covers that shortfall. Whether a floor below `2W` is safe is §33.5's measurement 3, still open.
+
+**Gate.** `test/manual/dsv41/test_exl3_verify_miss_lanes_gpu.py` (`7d66c99a1c`, `8cc3050e44`) captures a 6-token verify
+at top-6 through the real EXL3 lease chain, with the service built for 8 lanes. It passed both arms, generic and
+layer fusion.
+- One step has 6 shared misses (copied once), then a step of all hits (no rows read), then a union of 8 that fills
+  the lanes. These are served exactly, and every token's output is within the probe's bar.
+- A union of 12 serves 8 and flags the forward, with `gather_overflow` + 1 and no trap or fail-stop. Every mapped
+  slot still holds its checkpoint bytes, and `insertion_truncated` stays 0.
+- The next step is served exactly again.
+- The BS1 lease-chain, lease-kernel and layer-fusion files stayed green in the same run.
+- The NVFP4 residency tests cover the rest:
+  - a narrow gather equals the one-lane-per-route gather bit for bit until its first overflow;
+  - hits can empty the shortlist even when the misses fit, and the gather is flagged with nothing copied;
+  - a one-token gather never calls the clamp.
+
+**What D2-2 does not do:**
+- D2-3 owns the rest of the graphed verify:
+  - reading and clearing the flag, and re-verifying an overflowed verify;
+  - the gate lift;
+  - the protect list, which still truncates silently at the lane count (recency stamps only, §33.3 item 6).
+- W is not chosen. That waits for D2-3's overflow rate on real routes, against §33.5's projection; in the offline
+  model W = 8 overflows half the layers.
+- D2-4 owns CPU experts at W < routes.
+
+### 33.8 D2-3: the DSpark verify in the decode graph, end to end (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-d2-3-graphed-verify.md`, branch `dsv41-dspark-graph`.
+This is the third of four v2 plans. It covers §33.3 items 6-8, and measures the overflow rate and verify time that choose W.
+
+**What changed.**
+- **The manager reads and clears the flag, suspends the graph gather, and traces both, `bea76848d7`.**
+  - `take_verify_overflow()` does one `.item()` on the sticky `overflow_flag`, zeroes it when it is set, and counts
+    `graphed_verify_ct` and `verify_overflow_ct`.
+  - `suspend_graph_gather()` turns the gather off on every streamer and restores it in `finally`.
+  - The metrics trace gains `graphed_verify` and, when narrowed, `gpu_residency:gather_overflow`.
+- **The DSpark re-verify, `1237b9e487`.** `forward_verify_with_reverify` (`dspark_graphed_verify.py`) re-runs a flagged
+  graphed verify with `DecodeCudaGraphRunner.eager_only()` and the gather suspended. `SGLANG_TEST_DSPARK_FORCE_REVERIFY`
+  re-runs every verify.
+- **No epilogue while the gather is narrowed, and no decode graphs for an EXL3 draft**, also `1237b9e487`.
+- **The copy-engine barrier, `9f6dcb2407`.** A graphed verify counts toward arming like a graphed decode. Its eager
+  re-run is not graphed, so it drains the device first.
+- **The gate, `5c7173519b`.** DSpark verify may run in the breakable decode graph when it is a static verify
+  (`SGLANG_RAGGED_VERIFY_MODE=static`) on DIRECT residency (graph gather, GPU residency update, insert-on-miss stage 2)
+  with `MISS_LANES` 1-32. This replaces the old refusal, "runs DSpark verify eagerly only".
+- **Three defects the run found, each fixed test-first:**
+  - **A pinned gather's room counted the row's staging slots, `218d31446a`.** `evictable_rows` counted the slots the
+    service's lanes own, which `assign` never hands out. The eager re-run then evicted pinned rows before their copy
+    ("pinned host rows of experts [24, 25] were evicted"). `NativePinnedSlotTable.reserved_rows` is now subtracted.
+    This is the one change that reaches a non-DSpark launch: every option-C tier's eager chunks shrink by its staging
+    slots.
+  - **The draft's CPU-expert cores were outside the core plan, `ceec0db386`.** The first arm run was refused at start
+    (`core 17 shares a physical core with the server's affinity`). The recipe hand-pins the RAM thread to 17, the plan's
+    `taskset 0-5,18-63` held its sibling 53, and the hybrid draft's hand-named 6-17 overlapped the copy and RAM threads
+    (16, 17), which `ThreadingConfig` never saw. The draft is now a role of `ThreadingConfig`:
+    - unset `SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES` derives its cores on the GPU's node from what the copy thread and
+      every node's plan leave, capped by `_THREADS`;
+    - a named list overrides, is kept out of every derived role, and a given role on its physical core is refused.
+
+    The D2-3 driver names no cores.
+  - **A verify the runner did not graph went unread, `90076d1cca`** (final review). The narrowed gather is chosen by
+    route count, so an eager verify (`replace_embeds`, a refused attention key) took it too and could consume an
+    overflowed output. The flag is now read after every verify on a narrowed gather, and `graphed_verify_ct` counts
+    only graphed ones.
+  - **A captured verify took the prefill graph's break-points, `3c9d547cbd`.** `ForwardMode.is_extend()` counts
+    `TARGET_VERIFY`, so four break-points meant for the breakable prefill graph fired while the decode graph captured
+    a verify: the Engram hash ids, low-ratio sources, MQA attention, and the backend's low-ratio projections. Each
+    reads the prefill runner's piecewise forward context, which the decode runner never sets, and capture died in
+    `deepseek_v4_engram_hash_ids`. `is_in_breakable_prefill_graph(mode)` names the condition once, and a verify now
+    takes the in-graph paths, as decode does.
+
+**Why a re-run, and why eager.**
+- Re-running in the graph would overflow again: the narrowed gather is chosen by route count alone.
+- The eager MoE (`_apply_streamed`) is the path DSpark verify ran on before D2, so a re-run is the old verify.
+- Everything the flagged forward wrote is overwritten: its KV and compressed-cache writes go to the same
+  `out_cache_loc`, and its logits are discarded.
+- **Known bias:** the residency and recorder counters count an overflowed verify twice, once per forward.
+
+**The protect list needs no wire change.**
+- The post kernel keeps the first `Wire::kLanes` distinct routes (`lease_kernels.cuh:164-169`).
+- With no overflow, every route is either a VRAM hit or a lane, and lanes enter `wanted` on their own.
+- So the routes the truncation drops are exactly an overflowed verify's clamped misses, and that verify is re-run.
+
+**The run.** Arms: `eager` (§33.4's hybrid draft, eager verify), `graphed` (W = 8), and `reverify` (graphed, every verify
+re-run eagerly). Each runs 8 sessions of 256 prompt tokens and 128 new tokens, under the recipe's server cores 0-5,36-41.
+Core plan, from the logs: copy thread 17, RAM threads 16 and 35, draft CPU experts 6-15 (10 workers; §33.4 had 12).
+
+```bash
+flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-5,36-41 \
+  python analysis/dsv41-drive/dspark/graphed_verify.py $G eager graphed reverify
+```
+
+The eager arm ran at `ceec0db386`; `graphed` and `reverify` ran at `3c9d547cbd`. The last fix changed only paths an
+eager arm never enters. Raw data is in `cc-expert-prediction/analysis/dsv41-dspark/graph-verify/d2-3/`
+(`summary.json`). The earlier refused and capture-failed runs are kept in its subdirectories.
+
+| arm | tok/s | accept length | verify ms mean / p50 / p95 (n, < 1 s only) | re-verify rate | layer overflow mean / max | consumed text = eager |
+|---|---|---|---|---|---|---|
+| eager | 2.22 | 2.37 | 862 / 872 / 989 (183) | - | - | - |
+| graphed, W 8 | 2.84 | 2.37 | 831 / 828 / 967 (354) | 1.00 | 0.75 / 1.00 | 8 / 8 |
+| reverify | 2.75 | 2.37 | 826 / 825 / 973 (334) | 1.00 (forced) | 0.75 / 1.00 | 8 / 8 |
+
+- **Bars: all met.**
+  - The re-verify-all arm's text equals eager's in 8 of 8 sessions, so the graphed forward leaves no state the re-run
+    reads.
+  - `insertion_truncated` is 0 in both graphed arms.
+  - Every arm finishes its 8 sessions with identical token counts.
+  - The verify graph is captured (breakable, 3 segments, 2 breaks), with no `RuntimeError`, trap or fail-stop.
+- **At W = 8, every graphed verify overflows.** 380 of 380 were re-run, and 75% of layers overflow per verify (max
+  100%). §33.5 projected 0.50 of layers at W = 8; real routes are worse.
+- **The graphed arm's tok/s gain is not a graph gain.** Every verify was re-run eagerly, so each graphed verify paid a
+  replay and an eager forward. The +28% over `eager` comes with the graphed arms' expert-stream configuration (DIRECT
+  in-graph residency, the fused plan, prefill fills), which the eager arm turns off. Its re-runs run on that residency.
+- **No graphed verify's own output was consumed.** At a re-verify rate of 1.00, every verify output the graphed and
+  reverify arms used came from the eager re-run. Their "8 / 8" is the re-run's parity with eager, not the graph's.
+  The in-graph verify path (in-graph MQA attention, low-ratio sources and Engram hash under a narrowed gather that does
+  not overflow) has no end-to-end parity evidence yet.
+- **Verify ms is GPU-event time over the `TARGET_VERIFY` segment, and it is right-censored at 1 s.**
+  - It includes waiting on RAM and NVMe misses. In the graphed arms it covers the replay plus the re-run.
+  - The DSpark info dump drops a segment longer than `INFO_DUMP_MAX_STEP_CPU_SECONDS` (1.0 s,
+    `dspark_observability.py`), and `summarize` drops the missing record. Eager keeps 183 of about 380 verifies and
+    its p95 (989 ms) sits at the cap, so about half of eager's verifies, the slow ones, are missing.
+  - The columns are means of differently truncated distributions. They do not compare eager with graphed, and they
+    bound nothing.
+
+**What it decides, against §33.5.**
+- **Measurement 1 is not answered by this run.** The graphed verify ms (≈830 ms) is an upper bound on replay + eager
+  re-run + miss waits, not on the GPU compute of a graphed verify. §33.5's ≤ 28 ms test needs a verify that does not
+  overflow, which W = 8 never produced.
+- **The overflow path is not cheap at an admissible W.** At W = 8 it is taken by every verify. W ≥ 24 is what §33.5
+  needed for low overflow, and DIRECT's `capacity ≥ 2W` floor cannot fit that in today's hot slots.
+- **So by §33.5's rule, v2 (D2-4, multi-token CPU experts) is not worth building on this evidence.** Graphed DSpark
+  stays shelved, and §33.4's eager hybrid draft remains the DSpark path.
+- **What would reopen it:**
+  - a W sweep (`D23_MISS_LANES` 16, 24, 32) to find where the re-verify rate falls. At a rate below 1 it must gate
+    `graphed.text_matches_eager` (or a logit comparison) before any graphed-verify number is trusted, and its verify
+    timing needs a source without the 1 s cap;
+  - more hot slots for the `2W` floor, freed from VRAM (the Qwen NextN lever, +6% there);
+  - §33.5's measurement 3 (what `capacity ≥ 2W` really requires).
+
+**What D2-3 does not do:**
+- multi-token CPU experts (D2-4);
+- the epilogue under a narrowed gather;
+- decode graphs for an EXL3 draft;
+- the num_active launch sizing (§33.6);
+- choosing W, which the sweep above would do.
+
+### 33.9 The DSpark draft in the decode graph, end to end (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-draft-graph.md`, branch `dsv41-dspark-graph`. It captures
+the EXL3 draft's decode graphs with its MoE inside, and measures the draft step with and without the graph.
+
+**What changed.**
+- **The draft's MoE is graph-safe, eager or captured.** The draft MoE always runs post, `DraftResidentMoe`, finish:
+  - the resident experts run in the fused EXL3 call (`draft_moe.py`), at `min(16, 64 // top_k)` tokens per pass;
+  - the CPU share runs on the draft CPU thread (`DraftCpuThread`) over the draft's lease channel.
+- **The draft is the lease channel's second client** (`LEASE_PROTOCOL.md`, "The second client: the DSpark draft").
+- **Capture.** `init_cuda_graphs` prepares every EXL3 draft and captures it unless
+  `SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH=1`. Logs: `DSpark: EXL3 draft graphs on (3 draft MoE layers prepared)`, or
+  `... off, eager (3 ...)`.
+- **The defect this run found, `fc0da8db2f`.** The first `draft-eager` arm died at 20:11 with `DraftResidentMoe.run
+  before prepare()`: prepare ran only when the graph was captured, but the eager draft takes the same path. The switch
+  now decides capture only. The tests were written first (`4dd0310`). That run's last log line holds the one draft CPU
+  sample ever read: 1 job, 5 rows, 4.43 ms forward.
+
+**The run.** Arms `draft-eager` and `draft-graph`, both D2-3's graphed configuration (W = 8, the verify eager-re-run
+at every overflow) with the hybrid draft's CPU experts (3 draft stages, 96 experts per stage on the CPU, 10
+workers on cores 6-15). 8 sessions, 256 prompt and 128 new tokens, server cores 0-5,36-41. Both ran at `fc0da8db2f`:
+
+```bash
+flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-5,36-41 \
+  python analysis/dsv41-drive/dspark/graphed_verify.py $G draft-eager draft-graph
+```
+
+Raw data is in `cc-expert-prediction/analysis/dsv41-dspark/graph-verify/draft-graph/` (`summary.json`; the crashed first
+run is in `crashed-run/`).
+
+| arm | tok/s | accept length | draft step ms mean / p50 / p95 (n) | verify ms mean (n, < 1 s only) | re-verify rate | text = draft-eager |
+|---|---|---|---|---|---|---|
+| draft-eager | 2.81 | 2.51 | 11.3 / 10.8 / 14.3 (377) | 844 (328) | 1.00 | - |
+| draft-graph | 2.85 | 2.51 | 6.1 / 5.5 / 10.4 (378) | 841 (327) | 1.00 | 8 / 8 |
+
+- **Bars: met.** Both arms ran to the end, `draft-graph`'s log shows the capture line, `draft-eager`'s shows the "off"
+  line, and the text is identical in all 8 sessions. No margin probe was needed.
+- **The draft step's time.** The draft step is the `draft` segment of the DSpark info dump (`draft_gpu_time`): GPU
+  event time from the segment's start to its end, so it includes the wait on the CPU experts. It falls from 11.3 ms
+  (p50 10.8) eager to 6.1 ms (p50 5.5) in the graph, about 5.2 ms per step. The step is not censored at 1 s the way
+  the verify is, and n is 377 and 378.
+- **DSpark's tok/s barely moved: 2.81 to 2.85 (+1.3%).** A step is about 850 ms, almost all the verify, so 5 ms is
+  0.6% of it. The gain is within the noise of 8 sessions, and these two runs are not a repeat.
+- **Accept length is identical (2.51)**, as it must be with identical text. It is above D2-3's 2.37 for the same 8
+  sessions, and the text differs from D2-3's in 6 of 8 sessions. Both are legitimate (final review I4, probe outputs in
+  `graph-verify/i4/`):
+  - **The target did not change.** Run alone, it is bit-identical at `c932392148` and `fc0da8db2f`: greedy ids,
+    logprobs, top-5 and teacher-forced prefill logprobs, all 8 sessions.
+  - **The target alone matches neither text.** It leaves both D2-3 and this run at chars 25-148, earlier than they
+    leave each other, each time at a margin of 0 to 0.25 in its own prefill.
+  - **The draft-to-draft divergences are near-ties for the target, in both directions.** At s12 D2-3's token is the one
+    0.625 behind. The largest is s8 (1.125), inside §33.2's verify-vs-decode band of 1.4 logprob.
+  - **Teacher-forced over every position, this run's text is at least as consistent with the target as D2-3's**:
+    8 of 929 tokens more than 0.25 below the target's argmax (max 1.5), against D2-3's 12 of 899 (max 8.4). The
+    target's own greedy text, scored the same way, gives 4 of 823 (max 0.5).
+  - So the new draft's proposals moved which near-ties the verify forward settles; they did not move the target.
+  - **It is not a fault in the draft MoE:** eager and captured draft text agree 8/8; the fp16 staging is unchanged from
+    the old path; on random weights `test_dspark_hybrid_draft_gpu.py` measures rel_l2 0.003-0.014 against
+    `exl3_moe_loop`, the same with and without the CPU share (its bound is now 0.02, was 0.05).
+  - Exact-text parity across draft changes is the wrong bar, as §33.2 found against the base.
+- **The target's CPU experts are still off in verify** (`SGLANG_DSV41_CPU_EXPERTS=0`), so the verify column is the
+  eager target's.
+- **W = 8 still re-runs every verify (§33.8).** 348 of 348 graphed verifies were re-run in both arms, and 77% of layers
+  overflow per verify. So graphed DSpark's end-to-end number stays bounded by the re-verify until the W sweep.
+  The verify ms column is right-censored at 1 s as in §33.8 and compares nothing.
+
+**Gaps.**
+- **The draft CPU forward ms per stage is not measured by the clean runs.** The `DSpark CPU experts: {jobs, rows,
+  forward_ns, keep_warm_calls}` line is logged in the registry's atexit close, and the driver kills the server with
+  `kill_process_tree`, which skips atexit. Both clean logs lack it, so `draft_cpu` is null in `summary.json`. No
+  instrumentation was added. The only sample is the crashed run's 5-row stage at 4.43 ms.
+- **The graph's saving is not split** between the fused resident-expert call, the removed launch gaps and the CPU
+  wait; the draft segment covers all three.
+- **D2-3's s12 emits " .\n" where the target's prefill gives ".b" at about 0.0 (gap 8.4).** Pre-existing (the old
+  draft path, eager and graphed verify alike), unexplained and not probed here. It fits §33.2's unverified suspect, a
+  wrong Engram verify context at block offset >= 1. The scored context is retokenized at position 119, so it is a lead,
+  not a finding.
+
+**What it decides.**
+- The draft's capture is correct (text equal) and cheap (about 5 ms per step). It does not change the DSpark verdict
+  of §33.8: the verify's 840 ms and the W = 8 overflow decide the end-to-end number, not the draft.
+- It reopens nothing by itself. The W sweep, and a source of verify timing without the 1 s cap, stay the next
+  measurements.
+
+**What this plan does not do:**
+- multi-token CPU experts for the target (D2-4);
+- the W sweep;
+- the epilogue under a narrowed gather;
+- a draft CPU forward ms per stage (see the gap).
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

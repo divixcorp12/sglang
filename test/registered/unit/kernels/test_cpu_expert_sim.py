@@ -580,3 +580,17 @@ def test_promotion_never_takes_a_filling_slot():
     # Every mapped expert's slot holds it: no expert is left pointing at a slot the landing fill took.
     assert all(sim.slots[0][int(sim.where[0, e])] == e for e in range(8) if sim.where[0, e] >= 0)
     assert {5, 7} <= sim.resident(0)
+
+
+def test_miss_rows_widens_the_insert_shortlist():
+    # One layer, 16 hot slots holding experts 0-15. Both forwards route 20-27, 8 VRAM misses. With the default
+    # shortlist of 6, two of them stay uninserted and miss again (RAM hits, n = 2); with 8, all 8 land.
+    loaded = {
+        "layer_ids": [0],
+        "hot_capacity": {0: 16},
+        "forwards": [_graph(1, list(range(20, 28)), list(range(16))), _graph(2, list(range(20, 28)), list(range(16)))],
+    }
+    narrow = replay_nm(loaded, ram_rows=64, num_experts=64)
+    wide = replay_nm(loaded, ram_rows=64, num_experts=64, miss_rows=8)
+    assert (narrow["n"] + narrow["m"]).tolist() == [[8], [2]]
+    assert (wide["n"] + wide["m"]).tolist() == [[8], [0]]

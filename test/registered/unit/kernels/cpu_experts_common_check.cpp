@@ -369,8 +369,9 @@ int main()
 
     {
         uint32_t word = 5;
-        auto warm = [&](std::span<const int> on, int32_t threads, const uint32_t* w, uint32_t seen, int64_t until) {
-            return status_of([&] { kernel.keep_warm(on, threads, w, seen, until); });
+        auto warm = [&](std::span<const int> on, int32_t threads, const uint32_t* w, uint32_t seen, int64_t until,
+                        int64_t release = INT64_MAX) {
+            return status_of([&] { kernel.keep_warm(on, threads, w, seen, until, release); });
         };
         CHECK(warm(cores, 0, &word, 5, now_ns() + 1000000000) == 2);
         CHECK(warm(cores, 1, nullptr, 5, now_ns() + 1000000000) == 2);
@@ -389,6 +390,13 @@ int main()
             CHECK(r == 0);
             CHECK(now_ns() - start >= 2000000 && now_ns() - start < 1000000000);
         }
+        // Without a move the hold ends at its release time, after the warm window (1 ms warm, 3 ms release).
+        {
+            word = 5;
+            const int64_t start = now_ns();
+            CHECK(warm(cores, team, &word, 5, start + 1000000, start + 3000000) == 0);
+            CHECK(now_ns() - start >= 3000000 && now_ns() - start < 1000000000);
+        }
         // Every tier's loop, as far as this CPU runs them, through the free function: 1 ms warm, then PAUSE until
         // the word moves.
         for (Isa tier : {Isa::Scalar, Isa::Avx2, Isa::Bw, Isa::Vnni, Isa::Vbmi}) {
@@ -398,7 +406,7 @@ int main()
                 std::this_thread::sleep_for(std::chrono::milliseconds(3));
                 __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
             });
-            sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, {}, team, &word, 5, now_ns() + 1000000);
+            sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, {}, team, &word, 5, now_ns() + 1000000, INT64_MAX);
             mover.join();
         }
         ok("keep_warm_returns_when_the_word_moves");

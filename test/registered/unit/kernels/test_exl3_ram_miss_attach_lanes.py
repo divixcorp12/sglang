@@ -98,6 +98,42 @@ def test_a_gather_wider_than_the_built_lanes_is_refused_before_anything_is_built
     assert not hasattr(streamers[1].row_backend, "device_side")  # the layer keeps its previous backend
 
 
+def test_a_verify_gather_attaches_by_its_miss_width_not_its_routes(tiers):
+    """Six tokens of top-6 route 36 ids a layer, past the wire's 32; the gather serves 8 misses, so it builds 8 lanes."""
+    service, streamers = tiers
+    service.plan_gather_width(8)
+    streamers[0].graph_miss_lanes = 8
+    _attach(service, streamers[0], 36)
+    assert service.lanes == 8 and service.routed_rows_per_step == 36
+
+
+@pytest.mark.parametrize("staged, warns", [(8, False), (7, True)])
+def test_a_verify_row_stages_its_miss_width_not_its_routes(tiers, monkeypatch, caplog, staged, warns):
+    """A post requests at most the miss width, so a row staging W slots is enough though the gather routes 36 ids;
+    fewer than W still warns."""
+    service, streamers = tiers
+    service.plan_gather_width(8)
+    monkeypatch.setattr(service, "staging_for", lambda capacity: staged)
+    streamers[0].graph_miss_lanes = 8
+    with caplog.at_level("WARNING", logger=module.__name__):
+        _attach(service, streamers[0], 36)
+    assert any("stages" in r.getMessage() for r in caplog.records) is warns
+
+
+def test_cpu_experts_refuse_a_miss_width_below_the_routes(tiers):
+    """CPU experts are one token: their lanes and partials cover one token's routes (D2-4 lifts this)."""
+    service, streamers = tiers
+    service.plan_gather_width(8)
+    service.ensure_started()
+    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
+    try:
+        streamers[0].graph_miss_lanes = 8
+        with pytest.raises(ValueError, match="CPU experts serve one token"):
+            _attach(service, streamers[0], 36)
+    finally:
+        service.cpu_experts = None
+
+
 def test_a_full_eager_fill_after_start_maps_no_staging_slot(tiers):
     """The host reserves each row's staging at start, so a fill that fills the tier evicts for its mappable slots only,
     and no bulk-delta entry (what the device's map applies) names a staging slot. Mutation: staging is reserved after

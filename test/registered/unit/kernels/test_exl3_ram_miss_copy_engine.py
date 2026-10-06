@@ -584,17 +584,39 @@ def test_the_host_changes_the_gate_only_by_a_cas_from_the_closed_word():
 
     import sglang.kernels.ops.moe.expert_stream_transport as transport
 
-    source = (
-        Path(transport.__file__).resolve().parents[2]
-        / "jit/csrc/moe/expert_stream/host/ram_tier.h"
-    ).read_text()
+    host = Path(transport.__file__).resolve().parents[2] / "jit/csrc/moe/expert_stream/host"
     # Whitespace-normalized, so clang-format may wrap a call's arguments without breaking the pin.
-    tier = " ".join(source.split())
+    tier = " ".join((host / "ram_tier.h").read_text().split())
     assert "store_release(lease_ + Wire::kLeaseCopyGate" not in tier
     assert (
         tier.count("std::memcpy(lease_ + Wire::kLeaseCopyGate") == 1
     )  # init_lease_block, before any thread
-    assert "reinterpret_cast<uint32_t*>(lease_ + Wire::kLeaseCopyGate), &expected" in tier
+    assert tier.count("kLeaseCopyGate") == 1, "the tier reaches the gate only through the lease channel"
+    assert "channel::complete<TargetChannel>(" in tier and "channel::open_closed_gate<TargetChannel>(" in tier
+    # The lease channel's host half (host/lease_channel.h) loads the gate and changes it only by a CAS.
+    channel = " ".join((host / "lease_channel.h").read_text().split())
+    assert channel.count("S::kGate") == 2, "gate(): one acquire load; cas_gate(): one compare-exchange"
+    assert "reinterpret_cast<uint32_t*>(lease + S::kGate), &expected" in channel
+
+
+def test_the_host_publishes_done_before_it_reads_the_gate():
+    """The host half of the Dekker pair (host/lease_channel.h complete): done[G]'s release store, then a seq_cst fence,
+    then the gate load and the CAS. Red if the store moves after the gate check or the fence goes: the race either
+    leaves a closed gate nobody opens or opens one before done[G] is visible (LEASE_PROTOCOL.md "The lease channel")."""
+    from pathlib import Path
+
+    import sglang.kernels.ops.moe.expert_stream_transport as transport
+
+    source = (
+        Path(transport.__file__).resolve().parents[2] / "jit/csrc/moe/expert_stream/host/lease_channel.h"
+    ).read_text()
+    body = source[source.index("void complete(uint8_t* lease, uint32_t seq, uint64_t gen) {"):]
+    body = body[: body.index("\n}\n")]
+    store = body.index("store_release64(lease + S::kDone")
+    fence = body.index("std::atomic_thread_fence(std::memory_order_seq_cst);")
+    load = body.index("gate<S>(lease)")
+    cas = body.index("cas_gate<S>(")
+    assert store < fence < load < cas
 
 
 def test_the_copy_thread_runs_on_the_cpus_it_is_given(tmp_path):

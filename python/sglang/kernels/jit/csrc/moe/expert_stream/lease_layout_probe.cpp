@@ -3,6 +3,7 @@
 
 #include <string>
 
+#include "draft_channel.h"
 #include "lease_layout.h"
 
 namespace {
@@ -34,6 +35,57 @@ std::string for_nodes(int64_t nodes) {
   return nodes == 1 ? members<LeaseLayout<N, 1>>() : members<LeaseLayout<N, 2>>();
 }
 
+template <class L>
+std::string channel_members() {
+  using C = TargetChannelOf<L>;
+  std::string out;
+  auto put = [&](const std::string& name, int64_t value) { out += name + "=" + std::to_string(value) + "\n"; };
+  put("chan_head", C::kHead);
+  put("chan_ring", C::kRing);
+  put("chan_records", C::kRecords);
+  put("chan_record_bytes", C::kRecordBytes);
+  put("chan_done", C::kDone);
+  put("chan_gate", C::kGate);
+  for (uint32_t seq : {1u, 2u, 0x1FFFFFFFu, 0x20000001u}) {
+    put("gate_open_" + std::to_string(seq), ::sglang::expert_stream::channel::gate_word(seq, L::kLeaseGateOpen));
+    put("gate_closed_" + std::to_string(seq), ::sglang::expert_stream::channel::gate_word(seq, L::kLeaseGateClosed));
+  }
+  namespace d = ::sglang::expert_stream::draft;
+  using D = d::DraftChannel;
+  put("draft_head", D::kHead);
+  put("draft_ring", D::kRing);
+  put("draft_records", D::kRecords);
+  put("draft_record_bytes", D::kRecordBytes);
+  put("draft_done", D::kDone);
+  put("draft_gate", D::kGate);
+  put("draft_channel_bytes", d::kChannelBytes);
+  put("draft_max_rows", d::kMaxRows);
+  put("draft_max_k", d::kMaxK);
+  put("draft_rec_stage", d::kRecStage);
+  put("draft_rec_rows", d::kRecRows);
+  put("draft_rec_k", d::kRecK);
+  put("draft_rec_epoch", d::kRecEpoch);
+  out.pop_back();
+  return out;
+}
+
+template <int N>
+std::string channel_for_nodes(int64_t nodes) {
+  return nodes == 1 ? channel_members<LeaseLayout<N, 1>>() : channel_members<LeaseLayout<N, 2>>();
+}
+
+// The target's lease channel (TargetChannelOf), the shared gate encoding and the draft's channel
+// (draft_channel.h), for test_lease_channel_layout and test_dspark_draft_channel_layout.
+std::string channel_probe(int64_t lanes, int64_t nodes) {
+  if (nodes != 1 && nodes != 2) return "";
+  switch (lanes) {
+    case 8: return channel_for_nodes<8>(nodes);
+    case 24: return channel_for_nodes<24>(nodes);
+    case 32: return channel_for_nodes<32>(nodes);
+    default: return "";
+  }
+}
+
 std::string probe(int64_t lanes, int64_t nodes) {
   if (nodes != 1 && nodes != 2) return "";
   switch (lanes) {
@@ -50,3 +102,4 @@ std::string probe(int64_t lanes, int64_t nodes) {
 }  // namespace
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lease_layout_probe, probe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_lease_channel_probe, channel_probe);

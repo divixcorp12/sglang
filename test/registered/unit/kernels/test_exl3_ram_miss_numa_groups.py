@@ -193,7 +193,7 @@ def test_the_native_start_thread_refuses_a_reserved_core_of_any_group(tmp_path):
         for cores in ([64, 0], [0, 71]):
             with pytest.raises(RuntimeError, match=r"cores 64-71 are reserved \(NVMe completion interrupts"):
                 host._module.expert_stream_start_thread(
-                    host.handle, torch.tensor(cores, dtype=torch.int64), int(1e9), 0
+                    host.handle, torch.tensor(cores, dtype=torch.int64), int(1e9), -1, 0
                 )
             assert not host.threaded
     finally:

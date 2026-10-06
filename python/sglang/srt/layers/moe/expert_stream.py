@@ -376,10 +376,14 @@ class ExpertPinnedHostCache:
         quarantine_host_slabs(self.tensors.values())
 
     def evictable_rows(self) -> int:
-        """Slots a request can use: capacity minus residents ``is_pinned`` protects."""
+        """Slots a request can use: capacity minus the table's reserved slots and the residents ``is_pinned`` protects.
+
+        A native table reserves each row's staging slots for the in-graph miss lanes; no read admits an expert there.
+        """
+        room = self.capacity - getattr(self._lru, "reserved_rows", 0)
         if self.is_pinned is None:
-            return self.capacity
-        return self.capacity - sum(
+            return room
+        return room - sum(
             1 for expert_id in self._lru.expert_to_slot if self.is_pinned(expert_id)
         )
 
@@ -834,9 +838,9 @@ class ExpertPinnedHostCacheManager:
                     "pinned host cache requires unique nonnegative layer IDs"
                 )
             streamers[layer_id] = streamer
-        placement = pinned_host_placement(budget_bytes)
         if not streamers:
             return None
+        placement = pinned_host_placement(budget_bytes)
         capacities = {layer_id: 0 for layer_id in streamers}
         remaining = budget_bytes
         progress = True
@@ -1148,6 +1152,11 @@ class ExpertStreamer:
         # expert_prediction/serving/runtime.py.
         self.prefetch_puller = None
         self.graph_gather_rows = 0
+        # Distinct misses a graph gather serves when below its routes (a verify); 0: one per route.
+        self.graph_miss_lanes = 0
+        # Set by ExpertHotCacheManager.suspend_graph_gather: an eager re-run of a verify whose graph gather
+        # overflowed must not take the same narrowed gather again.
+        self.graph_gather_suspended = False
         self.graph_counters: torch.Tensor | None = None
         self.last_gather_stats = ExpertGatherStats()
         # Row-source reads outside eager gathers (promotions, seeding, direct calls).
@@ -1281,13 +1290,19 @@ class ExpertStreamer:
         """Whether ``topk_output`` fits the sync-free gather enabled at startup."""
         topk_ids = getattr(topk_output, "topk_ids", None)
         return (
-            self.graph_gather_rows > 0
+            not self.graph_gather_suspended
+            and self.graph_gather_rows > 0
             and isinstance(topk_ids, torch.Tensor)
             and 0 < topk_ids.numel() <= self.graph_gather_rows
         )
 
+    @property
+    def graph_miss_width(self) -> int:
+        """Distinct misses one graph gather serves: ``graph_miss_lanes`` when narrowed, else one per route."""
+        return self.graph_miss_lanes or self.graph_gather_rows
+
     def enable_graph_gather(
-        self, max_rows: int, scratch_destinations: bool = True
+        self, max_rows: int, scratch_destinations: bool = True, miss_lanes: int = 0
     ) -> None:
         """Serve gathers of at most ``max_rows`` routes with device-only operations.
 
@@ -1304,7 +1319,18 @@ class ExpertStreamer:
         ``scratch_destinations=False`` sends miss lanes to victim slots instead of
         scratch rows: the direct residency insert (``expert_residency_gpu.py``) writes
         them into ``_graph_destination_slots`` before each gather.
+
+        ``miss_lanes`` > 0 serves at most that many distinct misses, below ``max_rows``
+        routes (a verify). It needs ``scratch_destinations=False``: only DIRECT's victim
+        slots know which misses found a row (see
+        ``GpuResidencyUpdater.clamp_gather_misses``).
         """
+        if not 0 <= miss_lanes <= max_rows:
+            raise ValueError(f"graph gather miss lanes must be 0-{max_rows}, got {miss_lanes}")
+        if 0 < miss_lanes < max_rows and scratch_destinations:
+            raise ValueError(
+                "a graph gather that serves fewer misses than its routes needs DIRECT residency's victim slots"
+            )
         pinned_tier = graph_source_kind_of(self.format) == "pinned_tier"
         require_graph_gather_support((self,), pinned_tier_ok=True)
         from sglang.kernels.ops.moe.expert_cache_transfer import (
@@ -1438,6 +1464,7 @@ class ExpertStreamer:
         self.graph_counters = torch.zeros(2, dtype=torch.int64, device=device)
         self.graph_unique_counters = torch.zeros(2, dtype=torch.int64, device=device)
         self.graph_gather_rows = max_rows
+        self.graph_miss_lanes = miss_lanes if miss_lanes < max_rows else 0
 
     def _gather_graph(
         self, topk_ids: torch.Tensor
@@ -1459,7 +1486,7 @@ class ExpertStreamer:
         if self._plan_miss_keys is not None and not fused:
             raise RuntimeError(
                 f"layer {self.layer_id}: the sorted miss order needs the fused route plan "
-                "(SGLANG_MOE_EXPERT_FUSED_PLAN, a BS1 gather)"
+                "(SGLANG_MOE_EXPERT_FUSED_PLAN; at most 32 routes of one token or 64 of several)"
             )
         flat = topk_ids.reshape(-1) if fused else topk_ids.reshape(-1).long()
         count = flat.numel()
@@ -1510,6 +1537,7 @@ class ExpertStreamer:
                 outcome_counters=prefetch_outcomes,
                 remap_out=self._graph_fused_remaps[flat.dtype][:count],
                 miss_keys=self._plan_miss_keys,
+                dedup=topk_ids.shape[0] != 1,
             )
             source_rows = self._graph_source_rows[:count]
             scratch = self._graph_scratch_slots[: source_rows.numel()]
@@ -1547,6 +1575,9 @@ class ExpertStreamer:
                 expert_to_slot.index_select(0, flat.long()),
                 self.row_planner.scratch_base,
             )
+        if direct is not None and self.graph_miss_width < self.graph_gather_rows:
+            # A verify: serve the misses that found a victim; the rest flag the forward.
+            direct.clamp_gather_misses()
         if prefetch_puller is not None:
             # Join after the actual routing: `remap` and `expert_to_slot` are this
             # forward's real decision, not the prediction that posted the pull. The
@@ -2064,7 +2095,7 @@ class ExpertStreamer:
         """
         if topk_ids.device.type != "cuda":
             raise ValueError("selected expert IDs must be on CUDA")
-        if 0 < topk_ids.numel() <= self.graph_gather_rows:
+        if not self.graph_gather_suspended and 0 < topk_ids.numel() <= self.graph_gather_rows:
             return self._gather_graph(topk_ids)
         # A source score may have forked a side pull for this target even though this
         # eager shape is outside graph-gather support. The pull is unusable here but

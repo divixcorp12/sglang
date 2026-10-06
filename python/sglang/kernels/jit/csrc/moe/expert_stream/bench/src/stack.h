@@ -155,6 +155,7 @@ class Stack {
     PinScope copy(config_.copy_cpu);
     tier_->enable_copy_engine(
         -1,
+        /*spin_ns=*/-1,
         config_.wait_timeout_ns,
         config_.copy_cpu >= 0 ? std::vector<int>{config_.copy_cpu} : std::vector<int>{});
     tier_->arm_copy_engine(true);
@@ -174,6 +175,7 @@ class Stack {
       cpu.hidden = config_.hidden;
       cpu.threads = static_cast<int>(group.cores.size());
       cpu.cores = group.cores;
+      cpu.spin_ns = -1;
       cpu.keep_warm_ns = config_.keep_warm_ns;
       tier_->enable_cpu_experts(g, std::move(cpu), std::vector<int64_t>(group.split.begin(), group.split.end()));
       service_cpus.push_back(group.service_cpu);
@@ -183,7 +185,7 @@ class Stack {
     }
     for (int service_cpu : service_cpus)
       es::check_dedicated_core(service_cpu, tier_->cpu_cores(), "full-stack bench: ");
-    thread_ = std::make_unique<Thread>(tier_, service_cpus, config_.fatal_wait_ns, /*busy_poll=*/true);
+    thread_ = std::make_unique<Thread>(tier_, service_cpus, config_.fatal_wait_ns, /*spin_ns=*/-1, /*busy_poll=*/true);
     thread_->start();
   }
 

@@ -153,10 +153,36 @@ def test_dspark_with_a_decode_graph_names_the_remedy(model_dir):
 
 
 def test_dspark_speculation_passes_with_decode_disabled(model_dir):
-    # DSpark's verify step runs up to block_size + 1 tokens; option C's in-graph scratch
-    # and RAM-miss posting are sized for one token per step, so eager decode is required,
-    # but is otherwise unaffected by speculative decoding being enabled.
+    # An eager DSpark verify needs none of the graphed verify's configuration (§33.8).
     _gate(_launch(model_dir, speculative_algorithm="DSPARK"))
+
+
+# DSpark's verify in the breakable decode graph (DSV41_REFERENCE.md §33.8): DIRECT residency at W miss lanes.
+GRAPHED_VERIFY = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True, **DIRECT, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 8}
+
+
+def test_dspark_verify_in_the_breakable_decode_graph_passes(model_dir):
+    _gate(_launch(model_dir, speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1), **GRAPHED_VERIFY)
+
+
+@pytest.mark.parametrize(
+    "launch_changes, env_changes, match",
+    [
+        ({"speculative_algorithm": "EAGLE"}, GRAPHED_VERIFY, "graphs the verify of DSpark only"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-32"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 33}, "MISS_LANES=1-32"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}, "INSERT_ON_MISS_STAGE=2"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False}, "SGLANG_MOE_EXPERT_GRAPH_GATHER=1"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_RAGGED_VERIFY_MODE": "compact"}, "SGLANG_RAGGED_VERIFY_MODE=static"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_DSV41_CPU_EXPERTS": True}, "without speculative decoding"),
+    ],
+)
+def test_a_graphed_dspark_verify_needs_its_configuration(model_dir, launch_changes, env_changes, match):
+    launch = dict(speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1) | launch_changes
+    with pytest.raises(ValueError, match=match) as raised:
+        _gate(_launch(model_dir, **launch), **env_changes)
+    if match != "without speculative decoding":
+        assert "--cuda-graph-backend-decode disabled" in str(raised.value)
 
 
 def test_breakable_decode_at_batch_size_one_passes(model_dir):
@@ -435,3 +461,86 @@ def test_cpu_experts_refuse_the_prefetch_pull_join(model_dir):
             _launch(model_dir, cuda_graph_config=BREAKABLE_BS1),
             **{**CPU_EXPERTS_ENV, "SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE": "always"},
         )
+
+
+DSPARK_CPU_ENV = dict(
+    SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS=True,
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES="18-27",
+    SGLANG_EXL3_CPU_ACT_RESIDUAL=True,
+    SGLANG_EXL3_CPU_ACT_BLOCK=128,
+)
+
+
+@pytest.fixture
+def cpu_pin_off(monkeypatch):
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+
+
+def test_dspark_cpu_experts_pass_with_dspark_and_cores(model_dir, cpu_pin_off):
+    _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **DSPARK_CPU_ENV)
+
+
+def test_dspark_cpu_experts_without_dspark_are_refused(model_dir):
+    with pytest.raises(ValueError, match="--speculative-algorithm DSPARK"):
+        _gate(_launch(model_dir), **DSPARK_CPU_ENV)
+
+
+def test_dspark_cpu_experts_named_cores_need_two(model_dir):
+    with pytest.raises(ValueError, match="SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES"):
+        _gate(
+            _launch(model_dir, speculative_algorithm="DSPARK"),
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "18"},
+        )
+
+
+def test_dspark_cpu_experts_without_named_cores_pass(model_dir, cpu_pin_off):
+    """Unset cores: ThreadingConfig derives the draft's cores at its start, so the launch does not ask for them."""
+    _gate(
+        _launch(model_dir, speculative_algorithm="DSPARK"),
+        **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": ""},
+    )
+
+
+def test_a_bad_resident_file_is_refused_at_launch(model_dir, tmp_path, cpu_pin_off):
+    bad = tmp_path / "resident.json"
+    bad.write_text("{}")
+    with pytest.raises(ValueError, match="resident.json"):
+        _gate(
+            _launch(model_dir, speculative_algorithm="DSPARK"),
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": str(bad)},
+        )
+
+
+def test_dspark_cpu_experts_need_the_kernel_pin_off(model_dir, monkeypatch):
+    monkeypatch.delenv("EXL3_MOE_CPU_PIN", raising=False)
+    with pytest.raises(ValueError, match="EXL3_MOE_CPU_PIN=0"):
+        _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **DSPARK_CPU_ENV)
+
+
+def test_dspark_cpu_experts_refuse_more_threads_than_cores(model_dir, cpu_pin_off):
+    with pytest.raises(ValueError, match="SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"):
+        _gate(
+            _launch(model_dir, speculative_algorithm="DSPARK"),
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS": 13},
+        )
+
+
+def test_dspark_cpu_experts_refuse_the_nvme_interrupt_cores(model_dir, cpu_pin_off):
+    """Cores 64-71 take the NVMe completion interrupts the RAM-miss reads wait on; a spinning draft worker there would
+    stall them, so the launch refuses rather than the first draft call."""
+    with pytest.raises(ValueError, match="64"):
+        _gate(
+            _launch(model_dir, speculative_algorithm="DSPARK"),
+            **{**DSPARK_CPU_ENV, "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "62-65"},
+        )
+
+
+@pytest.mark.parametrize(
+    "unset", [{"SGLANG_EXL3_CPU_ACT_RESIDUAL": False}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 0}, {"SGLANG_EXL3_CPU_ACT_BLOCK": 64}]
+)
+def test_dspark_cpu_experts_need_the_optimized_cpu_kernel_build(model_dir, cpu_pin_off, unset):
+    """Only the optimized EXL3 build exports a CpuExpertKernel (sglang_exl3_cpu::kernel_address), and with the target's
+    CPU experts refused under speculation the residual/128 defines are what select it; without them the draft would
+    fail at its first step, after the model loaded."""
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ACT_RESIDUAL=1"):
+        _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **{**DSPARK_CPU_ENV, **unset})

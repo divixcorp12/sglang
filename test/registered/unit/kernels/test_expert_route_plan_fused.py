@@ -51,6 +51,7 @@ def run_fused_case(
     prefetch_count: int = 0,
     outcome_counters: torch.Tensor | None = None,
     miss_keys: torch.Tensor | None = None,
+    dedup: bool = False,
 ) -> SimpleNamespace:
     """Allocate stable outputs/counters and run the kernel."""
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
@@ -87,6 +88,7 @@ def run_fused_case(
         0,
         outcome_counters,
         miss_keys,
+        dedup=dedup,
     )
     return SimpleNamespace(
         source_rows=source_rows_out,
@@ -100,29 +102,23 @@ def run_fused_case(
     )
 
 
-def _expected_slots(ids: torch.Tensor, oracle: SimpleNamespace) -> torch.Tensor:
-    """The destination each compacted `oracle.source_rows` position should hold.
-
-    IDs are unique, so each compacted position corresponds to exactly one
-    original route; that route's `remap` value is the destination the fused
-    kernel's `slots_out` must carry at that position.
-    """
-    match = ids.unsqueeze(1) == oracle.source_rows.unsqueeze(0)
-    assert bool((match.sum(dim=0) == 1).all())
-    origin = match.float().argmax(dim=0)
-    return oracle.remap[origin]
+def _expected_slots_any(ids: torch.Tensor, oracle: SimpleNamespace) -> torch.Tensor:
+    """Every route of one expert shares its destination, so a compacted position's slot is the remap of any route
+    of the expert it holds (the first one here)."""
+    first = (ids.unsqueeze(1) == oracle.source_rows.unsqueeze(0)).float().argmax(dim=0)
+    return oracle.remap[first]
 
 
 def assert_matches_reference(
-    ids: torch.Tensor, resident: list[int], scratch_base: int
+    ids: torch.Tensor, resident: list[int], scratch_base: int, dedup: bool = False
 ) -> SimpleNamespace:
     expert_to_slot = _expert_to_slot(resident)
     oracle = plan_graph_routes(ids, expert_to_slot, ids.numel(), scratch_base)
-    result = run_fused_case(ids, expert_to_slot, scratch_base)
+    result = run_fused_case(ids, expert_to_slot, scratch_base, dedup=dedup)
 
     torch.testing.assert_close(result.source_rows, oracle.source_rows)
     torch.testing.assert_close(result.remap, oracle.remap)
-    torch.testing.assert_close(result.slots.to(torch.int64), _expected_slots(ids, oracle))
+    torch.testing.assert_close(result.slots.to(torch.int64), _expected_slots_any(ids, oracle))
     assert int(result.count.item()) == int(oracle.miss_plan_rows)
     assert int(result.graph_counters[0].item()) == ids.numel()
     assert int(result.graph_counters[1].item()) == int(oracle.routed_miss_rows)
@@ -635,23 +631,149 @@ def test_miss_keys_capture_and_replay_after_an_in_place_key_change():
         _assert_sorted_plan(ids, expert_to_slot, scratch_base, keys, out, unsorted)
 
 
-def test_gate_refuses_multi_token_calls_even_when_shape_would_otherwise_qualify():
-    """`graph_gather_rows` is sized `tokens * top_k`, so a multi-token call's
-    combined route count can still fit `scratch_rows`; only requiring exactly
-    one token row keeps a multi-request batch off this path. `single_token`
-    is duplicate-free on purpose: a within-row duplicate cannot arise from
-    real routing (see `supports_fused_graph_routes`'s docstring), so this
-    fixture must not assert anything about duplicate handling."""
+def test_dedup_plan_worked_case():
+    """Two tokens of three routes: 2 is a hit (slot 7); 5 is missed by both tokens and takes one scratch row."""
+    ids = torch.tensor([5, 2, 9, 2, 7, 5], device="cuda", dtype=torch.int64)
+    expert_to_slot = _expert_to_slot([])
+    expert_to_slot[2] = 7
+    result = run_fused_case(ids, expert_to_slot, scratch_base=10, dedup=True)
+    assert result.source_rows.tolist() == [5, 9, 7, 2, 2, 5]
+    assert result.slots.tolist() == [10, 11, 12, 7, 7, 10]
+    assert result.remap.tolist() == [10, 7, 11, 7, 12, 10]
+    assert int(result.count.item()) == 3
+    assert result.graph_counters.tolist() == [6, 4]
+    assert result.graph_unique_counters.tolist() == [1, 3]
+    oracle = plan_graph_routes(ids, expert_to_slot, ids.numel(), 10)
+    assert torch.equal(result.source_rows, oracle.source_rows) and torch.equal(result.remap, oracle.remap)
+
+
+def _multi_token_ids(rng, tokens, top_k):
+    return torch.tensor(
+        [e for _ in range(tokens) for e in rng.sample(range(EXPERTS), top_k)], device="cuda", dtype=torch.int64
+    )
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_random_multi_token_ids_match_the_reference(seed):
+    rng = random.Random(seed)
+    tokens = rng.randint(2, 10)
+    top_k = rng.randint(1, 64 // tokens)
+    ids = _multi_token_ids(rng, tokens, top_k)
+    resident = rng.sample(range(EXPERTS), rng.randint(0, EXPERTS // 2))
+    assert_matches_reference(ids, resident, scratch_base=len(resident), dedup=True)
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_multi_token_prefetch_coverage_matches_the_reference(seed):
+    """Every route of a covered expert goes to the prefetch slot, duplicates included, and takes no scratch row."""
+    rng = random.Random(seed)
+    ids = _multi_token_ids(rng, rng.randint(2, 6), 6)
+    resident = rng.sample(range(EXPERTS), rng.randint(0, EXPERTS // 2))
+    expert_to_slot = _expert_to_slot(resident)
+    predicted = int(ids[rng.randrange(ids.numel())])
+    posted = rng.choice([0, 1])
+    oracle = plan_graph_routes(
+        ids, expert_to_slot, ids.numel(), len(resident),
+        prefetch_expert=torch.tensor([predicted], device="cuda"), prefetch_slot=99,
+        prefetch_count=torch.tensor([posted], dtype=torch.int32, device="cuda"),
+    )
+    from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
+
+    n = ids.numel()
+    out = SimpleNamespace(
+        source_rows=torch.full((n,), -1, dtype=torch.int64, device="cuda"),
+        slots=torch.full((n,), -1, dtype=torch.int32, device="cuda"),
+        count=torch.full((1,), -1, dtype=torch.int32, device="cuda"),
+        remap=torch.full((n,), -1, dtype=torch.int64, device="cuda"),
+    )
+    plan_unique_routes_cuda(
+        ids, expert_to_slot, len(resident), out.source_rows, out.slots, out.count, out.remap, None, None, None,
+        torch.tensor([predicted], device="cuda"), torch.tensor([posted], dtype=torch.int32, device="cuda"), 99,
+        None, None, dedup=True,
+    )
+    assert torch.equal(out.remap, oracle.remap)
+    assert torch.equal(out.source_rows, oracle.source_rows)
+    assert int(out.count.item()) == int(oracle.miss_plan_rows)
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_multi_token_miss_keys_sort_distinct_residual_experts(seed):
+    """Residual rows hold each missed expert once, by key descending, ties by first appearance; every route of a
+    missed expert remaps to its expert's row; everything past the residual rows is the unsorted plan's."""
+    rng = random.Random(seed)
+    ids = _multi_token_ids(rng, rng.randint(2, 8), 6)
+    resident = rng.sample(range(EXPERTS), rng.randint(0, EXPERTS // 2))
+    expert_to_slot = _expert_to_slot(resident)
+    base = len(resident)
+    high = 4 if seed % 2 else 1 << 62
+    keys = torch.tensor([rng.randrange(-high, high) for _ in range(EXPERTS)], dtype=torch.int64, device="cuda")
+    unsorted = run_fused_case(ids, expert_to_slot, base, dedup=True)
+    result = run_fused_case(ids, expert_to_slot, base, miss_keys=keys, dedup=True)
+    first = {}
+    for i, e in enumerate(ids.tolist()):
+        if int(expert_to_slot[e]) < 0:
+            first.setdefault(e, i)
+    order = sorted(first, key=lambda e: (-int(keys[e]), first[e]))
+    count = len(order)
+    assert int(result.count.item()) == count
+    assert result.source_rows[:count].tolist() == order
+    assert result.slots[:count].tolist() == [base + p for p in range(count)]
+    assert torch.equal(result.source_rows[count:], unsorted.source_rows[count:])
+    for i, e in enumerate(ids.tolist()):
+        want = base + order.index(e) if e in first else int(unsorted.remap[i])
+        assert int(result.remap[i]) == want
+    for name in ("graph_counters", "graph_unique_counters", "route_counts"):
+        assert torch.equal(getattr(result, name), getattr(unsorted, name))
+
+
+def test_dedup_plans_64_routes_and_refuses_65():
+    rng = random.Random(7)
+    assert_matches_reference(_multi_token_ids(rng, 8, 8), [1, 2, 3], scratch_base=3, dedup=True)
+    with pytest.raises(ValueError, match="1-64"):
+        run_fused_case(_multi_token_ids(rng, 5, 13), _expert_to_slot([]), scratch_base=0, dedup=True)
+
+
+def test_dedup_plan_reads_no_device_value_on_the_host_and_replays():
+    from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
+
+    rng = random.Random(3)
+    ids = _multi_token_ids(rng, 6, 6)
+    expert_to_slot = _expert_to_slot([1, 4, 9])
+    n = ids.numel()
+    bufs = [torch.full((n,), -1, dtype=torch.int64, device="cuda"), torch.full((n,), -1, dtype=torch.int32, device="cuda"),
+            torch.zeros(1, dtype=torch.int32, device="cuda"), torch.full((n,), -1, dtype=torch.int64, device="cuda")]
+    pe, pc = torch.zeros(1, dtype=torch.int64, device="cuda"), torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    def plan():
+        plan_unique_routes_cuda(ids, expert_to_slot, 3, *bufs, None, None, None, pe, pc, 0, None, None, dedup=True)
+
+    with _NoHostReads():
+        plan()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan()
+    ids.copy_(_multi_token_ids(rng, 6, 6))
+    expert_to_slot.copy_(_expert_to_slot([2, 5, 30]))
+    graph.replay()
+    torch.cuda.synchronize()
+    oracle = plan_graph_routes(ids, expert_to_slot, n, 3)
+    assert torch.equal(bufs[3], oracle.remap) and torch.equal(bufs[0], oracle.source_rows)
+
+
+def test_gate_admits_multi_token_calls_up_to_64_routes():
+    """One token keeps the warp kernel's 32-route limit; several tokens take the dedup kernel, up to 64 routes."""
     from sglang.srt.layers.moe.expert_route_plan import supports_fused_graph_routes
 
     expert_to_slot = _expert_to_slot([1, 6])
-    single_token = torch.tensor([[1, 2, 3, 6]], device="cuda", dtype=torch.int64)
-    multi_token = torch.tensor(
-        [[1, 2, 2, 6], [3, 4, 4, 5]], device="cuda", dtype=torch.int64
-    )
-
-    assert supports_fused_graph_routes(single_token, expert_to_slot, scratch_rows=8)
-    assert not supports_fused_graph_routes(multi_token, expert_to_slot, scratch_rows=8)
+    single = torch.zeros((1, 32), device="cuda", dtype=torch.int64)
+    assert supports_fused_graph_routes(single, expert_to_slot, scratch_rows=64)
+    assert not supports_fused_graph_routes(torch.zeros((1, 33), device="cuda", dtype=torch.int64), expert_to_slot, 64)
+    multi = torch.tensor([[1, 2, 2, 6], [3, 4, 4, 5]], device="cuda", dtype=torch.int64)
+    assert supports_fused_graph_routes(multi, expert_to_slot, scratch_rows=8)
+    assert supports_fused_graph_routes(torch.zeros((8, 8), device="cuda", dtype=torch.int64), expert_to_slot, 64)
+    assert not supports_fused_graph_routes(torch.zeros((9, 8), device="cuda", dtype=torch.int64), expert_to_slot, 72)
+    assert not supports_fused_graph_routes(multi, expert_to_slot, scratch_rows=7)
 
 
 if __name__ == "__main__":

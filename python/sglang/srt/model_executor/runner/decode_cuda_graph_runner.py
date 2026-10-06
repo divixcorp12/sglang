@@ -221,6 +221,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # Set by eager_only(): a DSpark verify whose graphed expert gather overflowed is re-run eagerly.
+    _eager_only = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -641,7 +644,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         return max(request_counts)
 
+    @contextlib.contextmanager
+    def eager_only(self):
+        """Every forward inside the block runs eagerly (can_run_graph returns False)."""
+        self._eager_only = True
+        try:
+            yield
+        finally:
+            self._eager_only = False
+
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if self._eager_only:
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False

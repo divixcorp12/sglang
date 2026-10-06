@@ -150,6 +150,6 @@ int main() {
     d.slab_count = 7;
     // Keep-warm returns at once when the word has already moved past `seen`.
     const uint32_t word = 1;
-    assert(status_of([&] { kernel.keep_warm({}, 2, &word, 0, INT64_MAX); }) == 0);
-    assert(status_of([&] { kernel.keep_warm({}, 0, &word, 0, INT64_MAX); }) == 2);
+    assert(status_of([&] { kernel.keep_warm({}, 2, &word, 0, INT64_MAX, INT64_MAX); }) == 0);
+    assert(status_of([&] { kernel.keep_warm({}, 0, &word, 0, INT64_MAX, INT64_MAX); }) == 2);
 }

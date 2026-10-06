@@ -22,6 +22,7 @@ module runs during server-args processing, so it imports only the gate module,
 """
 
 import dataclasses
+import os
 
 from sglang.srt.arg_groups.expert_stream_requirements import (
     ExpertStreamRequirements,
@@ -29,6 +30,11 @@ from sglang.srt.arg_groups.expert_stream_requirements import (
     register_expert_stream_requirements,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.cpu_experts.draft_resident import load_resident_set
+from sglang.srt.layers.moe.cpu_experts.threading_config import (
+    check_not_reserved,
+    parse_cpu_list,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 
 _EAGER = eager_expert_stream_requirements(
@@ -60,6 +66,80 @@ class _EagerGraphView:
         return getattr(self._cfg, name)
 
 
+def _check_dspark_cpu_experts(cfg) -> None:
+    """The draft CPU experts' launch rules, so a bad core list or resident file fails here, not at the first draft
+    call."""
+    if getattr(cfg, "speculative_algorithm", None) != "DSPARK":
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS computes the DSpark draft's routed experts on the CPU; "
+            "pass --speculative-algorithm DSPARK or unset it"
+        )
+    # Unset cores are derived by ThreadingConfig when the draft starts; named ones are checked here.
+    cores = parse_cpu_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())
+    for core in cores:
+        check_not_reserved(core)
+    if len(cores) == 1:
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES with at "
+            "least two cores (one spinning worker per core), or unset to derive them"
+        )
+    threads = envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get()
+    if cores and not 0 <= threads <= len(cores):
+        raise ValueError(
+            f"SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS={threads} on {len(cores)} cores: use 0 (one per core) "
+            f"up to {len(cores)}"
+        )
+    if os.environ.get("EXL3_MOE_CPU_PIN") != "0":
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS needs EXL3_MOE_CPU_PIN=0: the kernel would otherwise pin "
+            "its workers to the first cores"
+        )
+    # Only the optimized build exports a CpuExpertKernel. SGLANG_DSV41_CPU_EXPERTS, which also selects it, is refused
+    # under speculation, so these two defines are the way in (exl3/ext.py, cpu_act_defines and optimized_cpu).
+    if not (envs.SGLANG_EXL3_CPU_ACT_RESIDUAL.get() and envs.SGLANG_EXL3_CPU_ACT_BLOCK.get() == 128):
+        raise ValueError(
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS runs the optimized EXL3 CPU kernel: set "
+            "SGLANG_EXL3_CPU_ACT_RESIDUAL=1 and SGLANG_EXL3_CPU_ACT_BLOCK=128"
+        )
+    resident = envs.SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH.get()
+    if resident:
+        load_resident_set(resident)
+
+
+_EAGER_VERIFY_REMEDY = "or pass --cuda-graph-backend-decode disabled to run the DSpark verify eagerly"
+
+
+def _check_graphed_verify(cfg) -> None:
+    """A speculative verify in the breakable decode graph (DSV41_REFERENCE.md §33.7-§33.8).
+
+    Only DSpark's static verify, on DIRECT residency at W miss lanes: a verify routes more than the wire's 32 lanes,
+    and only DIRECT's gather flags the misses it cannot serve, which the DSpark worker re-runs eagerly.
+    """
+    algorithm = cfg.speculative_algorithm
+    if str(algorithm).upper() != "DSPARK":
+        raise ValueError(
+            f"EXL3 expert caching graphs the verify of DSpark only, not {algorithm}; {_EAGER_VERIFY_REMEDY}"
+        )
+    lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
+    if not (
+        envs.SGLANG_MOE_EXPERT_GRAPH_GATHER.get()
+        and envs.SGLANG_MOE_GPU_RESIDENCY_UPDATE.get()
+        and envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get() == 2
+        and 1 <= lanes <= 32
+    ):
+        raise ValueError(
+            "EXL3 expert caching runs a DSpark verify in the decode graph only with SGLANG_MOE_EXPERT_GRAPH_GATHER=1, "
+            "SGLANG_MOE_GPU_RESIDENCY_UPDATE=1, SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 and "
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES=1-32 (got {lanes}): a verify routes more experts than the 32 "
+            f"lanes; {_EAGER_VERIFY_REMEDY}"
+        )
+    if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
+        raise ValueError(
+            "EXL3 expert caching runs a DSpark verify in the decode graph with SGLANG_RAGGED_VERIFY_MODE=static only "
+            f"(compact mode reads the host); {_EAGER_VERIFY_REMEDY}"
+        )
+
+
 def _check(cfg, budgets) -> None:
     """The eager checks, with decode allowed as a breakable CUDA graph at max batch size 1.
 
@@ -86,6 +166,8 @@ def _check(cfg, budgets) -> None:
         # parse_cuda_graph_config, while this is still the raw CLI value: the decode
         # backend is not known yet, and the pass after parsing runs every check below.
         return
+    if envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get():
+        _check_dspark_cpu_experts(cfg)
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
     if cpu_experts and (
         getattr(cfg, "speculative_algorithm", None) is not None
@@ -101,12 +183,7 @@ def _check(cfg, budgets) -> None:
         getattr(cfg, "speculative_algorithm", None) is not None
         and graph.decode.backend != Backend.DISABLED
     ):
-        # The graph-gather scratch and RAM-miss posting are sized for one token per
-        # step; a DSpark verify runs up to block_size + 1 tokens.
-        raise ValueError(
-            "EXL3 expert caching runs DSpark verify eagerly only; pass "
-            "--cuda-graph-backend-decode disabled (or --disable-cuda-graph)"
-        )
+        _check_graphed_verify(cfg)
     if graph.decode.backend == Backend.DISABLED:
         _EAGER.check(cfg, budgets)
         return

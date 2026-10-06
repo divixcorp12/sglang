@@ -572,7 +572,7 @@ class RamTier {
   // HIT_COPY lanes with the DMA engine. `device` < 0 selects the CPU test backend (HostCopyBackend). Must run before
   // the service thread starts, and the engine stays unarmed until arm_copy_engine(). `wait_timeout_ns` is how long a
   // closed gate may hold the decode stream before the watchdog aborts the process (SGLANG_DSV41_RAM_MISS_TIMEOUT_MS).
-  void enable_copy_engine(int64_t device, int64_t wait_timeout_ns, std::vector<int> cpus) {
+  void enable_copy_engine(int64_t device, int64_t spin_ns, int64_t wait_timeout_ns, std::vector<int> cpus) {
     if (threaded_.load())
       throw std::runtime_error(error_prefix<Layout>() + "enable the copy engine before the service thread starts");
     if (copy_engine_ != nullptr)
@@ -588,6 +588,7 @@ class RamTier {
         std::move(backend),
         layers_,
         dist_.size(),
+        spin_ns,
         this,
         copy_prefix,
         std::string(Layout::kName) + "-copy-eng",
@@ -609,12 +610,12 @@ class RamTier {
 
   // The gate word for record `seq`: its sequence number in the high bits, the closed/open state in the low bits.
   static uint32_t gate_word(uint32_t seq, uint32_t low) {
-    return ((seq & Wire::kLeaseGateSeqMask) << Wire::kLeaseGateSeqShift) | low;
+    return channel::gate_word(seq, low);
   }
 
   // The watchdog's view: the gate word, whose closed bit is set while a copy wait holds the decode stream.
   uint32_t copy_gate() const {
-    return load_acquire(lease_ + Wire::kLeaseCopyGate);
+    return channel::gate<TargetChannel>(lease_);
   }
 
   int64_t copy_wait_timeout_ns() const {
@@ -625,8 +626,7 @@ class RamTier {
   // forever. Opening the gate lets the device continue; the consumer traps unless CopyDone is there, which is
   // acceptable because the process is ending either way.
   void open_closed_gate() {
-    const uint32_t gate = copy_gate();
-    if ((gate & 0x80000000u) != 0) cas_gate(gate, gate & ~0x80000000u);
+    channel::open_closed_gate<TargetChannel>(lease_);
   }
 
   // Sets row `row`'s copy table: `count` entries of {source slab address, destination tensor address, row bytes}. Bit i
@@ -1164,14 +1164,8 @@ class RamTier {
   // Copy thread. Called once every DMA and CPU job of the record is done: publishes CopyDone, so the device's wait ends
   // as soon as the work did, and opens the gate if the copy wait closed it.
   void copy_completed(const CopyJob& job) {
-    const uint32_t seq = static_cast<uint32_t>(job.gen);
-    store_release64(lease_ + Wire::kLeaseCopyDone + job.idx * Wire::kLeaseCopyDoneBytes, job.gen);
-    // Dekker with the copy wait kernel (row_copy_kernels.cuh: gate close, fence.sc.sys, CopyDone load): CopyDone is
-    // stored before the gate load, so if the kernel missed this store it closed the gate before this load, which then
-    // sees closed(G) and opens it.
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    const uint32_t closed = gate_word(seq, Wire::kLeaseGateClosed);
-    if (copy_gate() == closed) cas_gate(closed, gate_word(seq, Wire::kLeaseGateOpen));
+    // Dekker with the copy wait kernel (the channel's close_gate in CW): job.idx is the ring index of G's seq.
+    channel::complete<TargetChannel>(lease_, static_cast<uint32_t>(job.gen), job.gen);
   }
 
   // Copy thread, or the submitter when the copy engine's job ring is full. Completion cannot be established and the
@@ -1180,18 +1174,6 @@ class RamTier {
     fail_stop(
         std::string(Layout::kName) + " RAM miss copy engine: copy of request " + std::to_string(job.gen) + " failed (" +
         std::to_string(error) + ")");
-  }
-
-  // Replaces the gate word if it still equals `expected`. A locked cmpxchg on the host line is atomic against the
-  // device's posted stores to it.
-  void cas_gate(uint32_t expected, uint32_t desired) {
-    __atomic_compare_exchange_n(
-        reinterpret_cast<uint32_t*>(lease_ + Wire::kLeaseCopyGate),
-        &expected,
-        desired,
-        false,
-        __ATOMIC_SEQ_CST,
-        __ATOMIC_ACQUIRE);
   }
 
   // Starts the stage record of the request just found. With the trace off this is one relaxed load and no clock read;

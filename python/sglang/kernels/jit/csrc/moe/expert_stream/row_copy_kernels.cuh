@@ -12,6 +12,7 @@
 #include <sgl_kernel/tensor.h>
 
 #include "lease_device.cuh"
+#include "stream_wait.h"
 #include "row_layout.h"
 #include "tensor_checks.h"
 #include <bit>
@@ -281,7 +282,6 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   const int64_t planned_count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
-  const int64_t idx = ring_index(seq);
   uint8_t* const lease = p.lease;
   if (threadIdx.x == 0) {
     uint32_t c = 0, u = 0, parts = 0;
@@ -327,18 +327,13 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   if (planned_count == 0) return;
   const uint32_t mask = copying | cpu;
   if (mask == 0) return;
-  uint8_t* const gate = lease + Wire::kLeaseCopyGate;
-  st_relaxed_sys<uint32_t>(gate, copy_gate_word(seq, Wire::kLeaseGateClosed));
+  // CC reads these after the stream's wait, stream-ordered; nothing on the host reads them.
   p.ce_mask[0] = static_cast<int32_t>(mask);
   p.ce_mask[1] = static_cast<int32_t>(cpu);
   p.ce_mask[2] = static_cast<int32_t>(cpu_parts);
-  // Dekker with the copy thread (RamTier::copy_completed: CopyDone store, fence, gate load): this close is ordered
-  // before the CopyDone load below, so one side always sees the other's store and opens the gate. Both open with the
-  // same word, so opening twice is harmless.
-  __threadfence_system();
-  if (ld_acquire_sys64(lease + Wire::kLeaseCopyDone + idx * Wire::kLeaseCopyDoneBytes) == generation) {
-    st_release_sys(gate, copy_gate_word(seq, Wire::kLeaseGateOpen));
-  }
+  // Dekker with the copy thread (RamTier::copy_completed, the channel's complete): the close is ordered before the
+  // CopyDone load, so one side always sees the other's store and opens the gate.
+  channel::close_gate<TargetChannel>(lease, seq, generation);
 }
 
 // CC, launched after the stream wait on the gate. It is a plain launch because the wait node before it is not a kernel.
@@ -355,31 +350,13 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
   // Only a teardown opens a gate without CopyDone: the service is gone, and the copies may not have landed.
-  if (ld_acquire_sys64(p.lease + Wire::kLeaseCopyDone + ring_index(seq) * Wire::kLeaseCopyDoneBytes) != generation)
-    __trap();
+  channel::commit_or_trap<TargetChannel>(p.lease, seq, generation);
   if (p.cpu_lanes != nullptr) {
     p.cpu_lanes[0] = p.ce_mask[1];
     p.cpu_lanes[1] = p.ce_mask[2];
   }
 }
 
-namespace expert_stream {
-
-// cuStreamWaitValue32_v2 from libcuda.so.1, resolved once. Uses the v2 name, never the plain one: that is the v1 API,
-// gated by NVreg_EnableStreamMemOPs (host/copy_engine.h). Returns null when the driver lacks it; the launcher then
-// refuses.
-using StreamWaitValue32 = int (*)(void*, uint64_t, uint32_t, unsigned);
-inline StreamWaitValue32 stream_wait_value32() {
-  static const StreamWaitValue32 fn = [] {
-    void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
-    if (lib == nullptr) lib = dlopen("libcuda.so.1", RTLD_NOW);
-    return lib == nullptr ? nullptr : reinterpret_cast<StreamWaitValue32>(dlsym(lib, "cuStreamWaitValue32_v2"));
-  }();
-  return fn;
-}
-constexpr unsigned kStreamWaitValueGeq = 0;  // CU_STREAM_WAIT_VALUE_GEQ: (int32_t)(*addr - value) >= 0
-
-}  // namespace expert_stream
 
 /// \brief Checked host launchers for the row-copy kernels above (lease_stream, lease_copy_wait), templated on the
 /// streamed row's compile-time layout facts (name count, small-tensor mask).
@@ -544,12 +521,7 @@ struct RowCopyKernel {
             params);
     // The gate is not a counter, so the cyclic GEQ never wraps: an open word (29-bit seq << 2 | 1) is in [1, 2^31)
     // and passes, a closed word has bit 31 set and blocks. Captured as a memory-op node of the graph.
-    const int r = expert_stream::stream_wait_value32()(
-        static_cast<void*>(stream),
-        static_cast<uint64_t>(lease_address + Wire::kLeaseCopyGate),
-        Wire::kLeaseGateOpen,
-        expert_stream::kStreamWaitValueGeq);
-    RuntimeCheck(r == 0, "the copy wait's cuStreamWaitValue32_v2 on the gate failed: CUresult ", r);
+    expert_stream::enqueue_gate_wait(stream, static_cast<uint64_t>(lease_address + Wire::kLeaseCopyGate));
     const auto commit = CopyCommitParams{
         .state = static_cast<const int32_t*>(state.data_ptr()),
         .lease = reinterpret_cast<const uint8_t*>(lease_address),

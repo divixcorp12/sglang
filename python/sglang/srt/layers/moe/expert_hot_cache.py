@@ -1082,6 +1082,7 @@ class ExpertHotCacheManager:
         insert_on_miss: bool | int | None = None,
         insert_on_miss_decay: float | None = None,
         fused_insert: bool | None = None,
+        graph_gather_miss_lanes: int | None = None,
     ) -> ExpertHotCacheManager | None:
         """Build the per-layer hot caches.
 
@@ -1108,6 +1109,10 @@ class ExpertHotCacheManager:
         ``fused_insert`` defaults to ``SGLANG_MOE_HOT_FUSED_INSERT`` and runs
         stage SCRATCH's boundary copies through the fused masked kernel; it is
         byte-identical to the index copy it replaces and only changes its cost.
+        ``graph_gather_miss_lanes`` caps each layer's distinct misses per graph gather
+        below its routes (a verify); ``None`` reads
+        ``SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES``, and 0 keeps one lane per route.
+        It needs stage DIRECT.
         """
         if fused_insert is None:
             fused_insert = envs.SGLANG_MOE_HOT_FUSED_INSERT.get()
@@ -1115,6 +1120,11 @@ class ExpertHotCacheManager:
         if insert_on_miss is None:
             insert_on_miss = envs.SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE.get()
         insert_on_miss = int(insert_on_miss)
+        if graph_gather_miss_lanes is None:
+            graph_gather_miss_lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
+        graph_gather_miss_lanes = index(graph_gather_miss_lanes)
+        if graph_gather_miss_lanes < 0:
+            raise ValueError(f"graph gather miss lanes cannot be negative, got {graph_gather_miss_lanes}")
         if insert_on_miss not in tuple(InsertOnMissStage):
             raise ValueError(
                 f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE must be one of "
@@ -1239,12 +1249,24 @@ class ExpertHotCacheManager:
         scratch_rows = {
             layer_id: 0 if direct else rows for layer_id, rows in gather_rows.items()
         }
+        # A verify's gather may serve fewer distinct misses than it has routes; the misses take the lanes, the
+        # routes keep their width.
+        miss_lanes = {
+            layer_id: min(rows, graph_gather_miss_lanes) if graph_gather_miss_lanes else rows
+            for layer_id, rows in gather_rows.items()
+        }
+        if not direct and any(miss_lanes[layer_id] < rows for layer_id, rows in gather_rows.items()):
+            raise ValueError(
+                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES={graph_gather_miss_lanes} below a layer's graph-gather "
+                "routes needs SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 (DIRECT): only its gathers flag the misses they "
+                "cannot serve"
+            )
         # Runs before enable_graph_gather so a format that stages per post learns the
         # gather width first.
         for layer_id, rows in gather_rows.items():
             plan = getattr(streamers[layer_id].format, "plan_graph_gather", None)
             if rows and plan is not None:
-                plan(streamers[layer_id], rows)
+                plan(streamers[layer_id], miss_lanes[layer_id])
         selected = {layer_id: [] for layer_id in streamers}
         pull_row_enabled = envs.SGLANG_MOE_EXPERT_PREFETCH_PULL_MODE.get() != "off"
         allocated_layers = {
@@ -1266,14 +1288,14 @@ class ExpertHotCacheManager:
             raise ValueError(
                 "expert hot cache budget cannot hold the graph-gather scratch and pull rows"
             )
-        # DIRECT refuses a layer holding fewer than twice its gather rows (see
+        # DIRECT refuses a layer holding fewer than twice its gather miss lanes (see
         # `_init_insert_direct`), so a seed that scores one layer low would refuse the
         # whole budget. Give every layer that floor from its own best experts first and
         # let the scores spend the rest; if every layer clears the floor anyway, the
         # selection is unchanged.
         floors = {
-            layer_id: 2 * rows if direct else 0
-            for layer_id, rows in gather_rows.items()
+            layer_id: 2 * miss_lanes[layer_id] if direct else 0
+            for layer_id in gather_rows
         }
         for layer_id, floor in floors.items():
             if floor > streamers[layer_id].num_experts:
@@ -1325,7 +1347,7 @@ class ExpertHotCacheManager:
                 raise ValueError(
                     f"SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 layer {layer_id}: "
                     f"budget provides {len(selected[layer_id])} resident slots; "
-                    f"required capacity is {floor} (twice its graph-gather rows)"
+                    f"required capacity is {floor} (twice its graph-gather miss lanes)"
                 )
         for layer_id in sorted(clamped):
             streamer = streamers[layer_id]
@@ -1340,6 +1362,8 @@ class ExpertHotCacheManager:
         if not any(selected.values()) and not any(gather_rows.values()):
             return None
         manager = cls()
+        manager.graphed_verify_ct = 0
+        manager.verify_overflow_ct = 0
         manager.streamers = streamers
         manager.caches = {}
         manager.residency_policies = {}
@@ -1477,7 +1501,7 @@ class ExpertHotCacheManager:
         for layer_id, rows in gather_rows.items():
             if rows:
                 streamers[layer_id].enable_graph_gather(
-                    rows, scratch_destinations=not direct
+                    rows, scratch_destinations=not direct, miss_lanes=miss_lanes[layer_id]
                 )
         manager._share_graph_counters()
         manager.gpu_residency = None
@@ -2356,6 +2380,11 @@ class ExpertHotCacheManager:
         if updater is not None:
             metadata["gpu_residency_layers"] = tuple(updater.layer_ids)
             metadata["gpu_residency_insert_on_miss"] = updater.insert_on_miss
+            if self.narrow_graph_gather:
+                metadata["graphed_verify"] = {
+                    "graphed_verify_ct": self.graphed_verify_ct,
+                    "verify_overflow_ct": self.verify_overflow_ct,
+                }
         return metadata
 
     def _schedule_trace(self, phase: str) -> None:
@@ -2620,6 +2649,8 @@ class ExpertHotCacheManager:
             result["residency_policy"] = metadata["residency_policy"]
         if "residency_async" in metadata:
             result["residency_async"] = metadata["residency_async"]
+        if "graphed_verify" in metadata:
+            result["graphed_verify"] = metadata["graphed_verify"]
         if "gpu_residency_layers" in metadata:
             device = {}
             for name in (
@@ -2630,6 +2661,10 @@ class ExpertHotCacheManager:
             ) + (
                 _INSERTION_TRACE_NAMES
                 if metadata["gpu_residency_insert_on_miss"]
+                else ()
+            ) + (
+                ("gpu_residency:gather_overflow",)
+                if "gpu_residency:gather_overflow" in buffers
                 else ()
             ):
                 device[name.rsplit(":", 1)[-1]] = buffers[name].tolist()
@@ -2827,6 +2862,42 @@ class ExpertHotCacheManager:
                         device["evictions"][0][row] + device["evictions"][1][row]
                     )
         return result
+
+    @property
+    def narrow_graph_gather(self) -> bool:
+        """Whether a graph gather may serve fewer misses than its routes (a verify at W miss lanes)."""
+        updater = getattr(self, "gpu_residency", None)
+        return updater is not None and bool(getattr(updater, "narrow_gather", False))
+
+    def take_verify_overflow(self, graphed: bool = True) -> bool:
+        """After a verify on the narrowed gather: whether a layer's gather could not serve its misses. Clears the flag.
+
+        One host read of the sticky device flag (GpuResidencyUpdater.clamp_gather_misses). A True result means the
+        verify's output is not a verify result and must be re-run with the graph gather suspended. ``graphed`` says
+        whether the verify replayed the decode graph; only those count in ``graphed_verify_ct``.
+        """
+        flag = self.gpu_residency.overflow_flag
+        self.graphed_verify_ct += int(graphed)
+        if not int(flag.item()):
+            return False
+        flag.zero_()
+        self.verify_overflow_ct += 1
+        return True
+
+    @property
+    def graph_gather_suspended(self) -> bool:
+        return any(streamer.graph_gather_suspended for streamer in self.streamers.values())
+
+    @contextmanager
+    def suspend_graph_gather(self):
+        """Every layer gathers eagerly inside the block (an overflowed verify's re-run)."""
+        for streamer in self.streamers.values():
+            streamer.graph_gather_suspended = True
+        try:
+            yield
+        finally:
+            for streamer in self.streamers.values():
+                streamer.graph_gather_suspended = False
 
     def _refresh_side_pull_delivery(self) -> None:
         """Read pull counters only when a caller actually asks for a snapshot."""

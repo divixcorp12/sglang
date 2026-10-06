@@ -517,6 +517,11 @@ class Envs:
     # one per verify route (decode max_bs x draft tokens x top_k); 0 keeps that bound.
     # Startup rejects a cap below one request's routes: that needs phase 3's overflow path.
     SGLANG_MOE_EXPERT_GRAPH_GATHER_SCRATCH_ROWS = EnvInt(0)
+    # Speculative decoding with DIRECT residency (SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2) only: each layer's graph gather
+    # serves at most this many distinct misses (the RAM-miss lanes and the victim shortlist), below one per verify
+    # route. A gather with more serves the lanes that find a victim and sets the residency's overflow flag; its output
+    # is then not a verify result. 0 keeps one lane per route.
+    SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES = EnvInt(0)
     # Debug only: write Qwen4-Exp MoE routing tensors of eager decode forwards to
     # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
     SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")
@@ -769,6 +774,8 @@ class Envs:
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
+    # Appends each DSpark draft MoE call's topk ids as a JSON line; the routes probe the draft resident set is made from.
+    SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
@@ -777,6 +784,9 @@ class Envs:
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
+    # Test only: re-run every graphed DSpark verify eagerly, as an overflowed one is. Its output must equal an eager
+    # verify's (D2-3's end-to-end check of the re-run path).
+    SGLANG_TEST_DSPARK_FORCE_REVERIFY = EnvBool(False)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
@@ -1845,6 +1855,11 @@ class Envs:
     # when it first sees the wait armed (LEASE_PROTOCOL.md, "Copy engine"): post to fail-stop can
     # then take about 2x this (+20 ms).
     SGLANG_DSV41_RAM_MISS_TIMEOUT_MS = EnvInt(2000)
+    # How long an idle RAM-miss service thread (one per NUMA group) polls before it sleeps 50 us between polls; a
+    # parked thread then sleeps 20 us between checks too. -1: never sleep (spin, with PAUSE or busy-polling).
+    SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US = EnvInt(5000)
+    # How long the idle copy-engine thread polls before it sleeps on a futex until the next copy job. -1: never sleep.
+    SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US = EnvInt(5000)
     # The RAM thread's core on the node it belongs to, busy-polling the request page with no PAUSE and no sleep
     # (ThreadingConfig.resolve). Refused unless it is outside cores 64-71 and the server's affinity, on a node of the
     # pinned tier, and its whole physical core is the thread's own (no SMT sibling in the affinity or another role's
@@ -1948,11 +1963,32 @@ class Envs:
     # SGLANG_DSV41_CPU_EXPERTS. Off by default: the 2026-09-30 replay put it between +0.35 and -5.8 ms/token
     # (slot-map plan, Task 0), so a served A/B decides.
     SGLANG_DSV41_CPU_EXPERTS_MISSES = EnvBool(False)
+    # DSpark draft experts on the CPU (plan 2026-10-05-dsv41-dspark-port): each draft stage keeps the experts its
+    # resident set lists on the GPU and computes the rest with the CPU expert kernel, eagerly, so their VRAM goes to the
+    # target's hot cache. A fused shared expert stays on the GPU. Needs --speculative-algorithm DSPARK.
+    SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS = EnvBool(False)
+    # Cores of the draft's CPU expert kernel, as a taskset list ("18-27"). At least two, none of the reserved 64-71.
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES = EnvStr("")
+    # Worker threads of the draft's CPU expert kernel, at most one per core. 0 takes one per core.
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS = EnvInt(0)
+    # How long the idle draft CPU thread holds its workers in PAUSE after each job before it releases them and polls the
+    # draft channel's head with 50 us sleeps (the GPU cannot ring a futex). -1: never release.
+    SGLANG_DSV41_DSPARK_CPU_EXPERTS_IDLE_SPIN_US = EnvInt(100_000)
+    # Keeps an EXL3 DSpark draft eager (no decode graph); the draft MoE then runs the same graph-safe path eagerly.
+    # For A/B only.
+    SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH = EnvBool(False)
+    # The draft experts kept on the GPU, per stage (analysis/dsv41-drive/dspark/draft_resident_set.py).
+    # Empty keeps none: every routed draft expert runs on the CPU.
+    SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH = EnvStr("")
     # For this many us after its last job, the idle CPU expert thread holds its workers in the kernel's register-only
     # AVX-512 loop instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap
     # costs about 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03:
-    # a 1 ms or 3 ms gap then costs nothing). 0: PAUSE only. The workers never sleep either way.
+    # a 1 ms or 3 ms gap then costs nothing). 0: PAUSE only.
     SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
+    # How long after that window the idle CPU expert thread keeps holding its workers in PAUSE before it releases them
+    # (to OpenMP's idle wait) and sleeps on a futex until the next job. -1: never release, so the cores stay busy and
+    # no job waits for a worker to wake.
+    SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US = EnvInt(100_000)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

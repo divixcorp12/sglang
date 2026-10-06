@@ -9,6 +9,7 @@ import torch
 
 NO_DEDUP_LIMIT = 64
 FUSED_MAX_ROUTES = 32
+FUSED_MAX_DEDUP_ROUTES = 64
 
 
 def should_dedup(topk_ids: torch.Tensor) -> bool:
@@ -125,35 +126,21 @@ def supports_fused_graph_routes(
 ) -> bool:
     """Whether `plan_graph_routes_fused` may serve this gather.
 
-    The fused kernel is BS1 and unique-ID only: one warp, one route per lane,
-    no duplicate-ID handling. ``graph_gather_rows`` is sized ``tokens *
-    top_k``, so a multi-token call can pass the route-count and scratch
-    checks below while carrying several requests' routes, which may repeat
-    an expert across tokens (``plan_graph_routes`` dedups that; this kernel
-    does not). Requiring exactly one token row (``topk_ids.shape[0] == 1``)
-    is what actually guarantees unique IDs here.
-
-    Within one token row, uniqueness holds structurally rather than by
-    construction of this predicate: `torch.topk` returns distinct indices,
-    and the logical-to-physical expert remap applied before this gather
-    (`topk_ids_logical_to_physical`, `eplb/expert_location_dispatch.py`) maps
-    distinct logical experts to distinct physical replicas, because the
-    physical-to-logical direction (`phy2log`, `eplb/lplb_solver.py`) is a
-    function -- every physical expert belongs to exactly one logical expert,
-    so two different logical experts can never land on the same physical ID.
-    A within-row duplicate therefore cannot arise from real routing; this
-    function does not itself check for one.
+    One token row (``topk_ids.shape[0] == 1``) takes the one-warp kernel, up to 32 routes: a token's top-k ids are
+    distinct (`torch.topk`, and the logical-to-physical remap maps distinct experts to distinct replicas), which
+    that kernel relies on. Several token rows take the dedup kernel (``dedup=True``), up to 64 routes, which
+    shares one scratch row between an expert's routes as `plan_graph_routes` does.
     """
-    return (
+    if not (
         topk_ids.is_cuda
         and topk_ids.dtype in (torch.int32, torch.int64)
         and topk_ids.ndim >= 1
-        and topk_ids.shape[0] == 1
-        and 0 < topk_ids.numel() <= FUSED_MAX_ROUTES
-        and topk_ids.numel() <= scratch_rows
         and expert_to_slot.dtype == torch.int64
         and expert_to_slot.device == topk_ids.device
-    )
+    ):
+        return False
+    limit = FUSED_MAX_ROUTES if topk_ids.shape[0] == 1 else FUSED_MAX_DEDUP_ROUTES
+    return 0 < topk_ids.numel() <= min(limit, scratch_rows)
 
 
 _ZERO_PREFETCH_STATE: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -198,8 +185,9 @@ def plan_graph_routes_fused(
     outcome_counters: Optional[torch.Tensor] = None,
     remap_out: Optional[torch.Tensor] = None,
     miss_keys: Optional[torch.Tensor] = None,
+    dedup: bool = False,
 ) -> torch.Tensor:
-    """`plan_graph_routes`'s BS1, unique-ID fast path: one fused kernel launch.
+    """`plan_graph_routes` in one fused kernel launch: one token's unique ids, or several tokens' with ``dedup``.
 
     Reproduces its exact semantics for unique-ID ``flat``, prefetch coverage
     included. ``prefetch_expert`` is an optional int64 CUDA scalar (or
@@ -227,6 +215,8 @@ def plan_graph_routes_fused(
 
     ``miss_keys`` (int64 ``[num_experts]``, CPU experts' miss order) sorts the
     residual rows by key, highest first; ``plan_graph_routes`` has no such mode.
+
+    ``dedup``: the routes are several tokens' (`supports_fused_graph_routes`), planned by the dedup kernel.
     """
     from sglang.kernels.ops.moe.expert_route_plan import plan_unique_routes_cuda
 
@@ -260,5 +250,6 @@ def plan_graph_routes_fused(
         prefetch_slot,
         outcome_counters,
         miss_keys,
+        dedup=dedup,
     )
     return remap_out

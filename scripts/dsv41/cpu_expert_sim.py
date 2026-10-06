@@ -259,6 +259,7 @@ def replay_nm(
     staging_reserve: int = 0,
     cpu_misses: bool = False,
     protect_reads: bool = True,
+    miss_rows: int = 6,
 ) -> dict:
     """Per decode token and layer, n (VRAM miss, RAM hit) and m (miss both), from the DIRECT + RamTier replays.
 
@@ -270,7 +271,9 @@ def replay_nm(
     ``ram_insert`` is where a decode NVMe miss goes (see RAM_INSERTS); prefill admits as today except under ``never``.
     ``staging_reserve`` takes K rows of every layer's tier for staging slots, never mapped. ``cpu_misses`` lets a
     head/tail policy put NVMe misses on the CPU (``kh``/``km``: CPU hits and CPU misses per token and layer).
-    ``protect_reads=False`` reads only VRAM-missing experts into the tier on decode, not VRAM-hot routed ones."""
+    ``protect_reads=False`` reads only VRAM-missing experts into the tier on decode, not VRAM-hot routed ones.
+    ``miss_rows`` is the DIRECT victim shortlist, the most misses a layer inserts per forward (6 at batch size 1; a
+    verify's gather width W)."""
     if ram_insert not in RAM_INSERTS:
         raise ValueError(f"unknown ram_insert {ram_insert!r}, want one of {RAM_INSERTS}")
     config = policy_config(policy)
@@ -285,7 +288,7 @@ def replay_nm(
             initial = {layer: list(experts) for layer, experts in first["hot"].items()}
     if initial is None:
         initial = {layer: list(range(slots)) for layer, slots in capacity.items()}
-    sim = tier_sim.DirectInsertReplay(initial, capacity, num_experts)
+    sim = tier_sim.DirectInsertReplay(initial, capacity, num_experts, miss_rows=miss_rows)
     ram_capacity = [c - staging_reserve for c in tier_sim.ram_rows_per_layer(ram_rows, len(layer_ids), num_experts)]
     if min(ram_capacity) < 1:
         raise ValueError(f"staging_reserve {staging_reserve} leaves a layer with {min(ram_capacity)} mappable rows")

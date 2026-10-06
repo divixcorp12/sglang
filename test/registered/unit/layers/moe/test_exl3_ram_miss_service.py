@@ -413,7 +413,7 @@ def test_a_later_promotion_chunk_never_evicts_an_expert_an_earlier_chunk_made_ho
     cache.ensure_rows(torch.tensor([1, 2]))  # full (capacity 3); 0 is the LRU-oldest row
     # Chunk 1 promoted 0 into VRAM: the hot cache holds it; no _push_hot has run yet.
     streamers[0].hot_cache = SimpleNamespace(slot_to_expert=[0, -1])
-    assert cache.evictable_rows() == 3  # the tier's 4 slots, less 0, which is_pinned already protects
+    assert cache.evictable_rows() == 2  # the tier's 4 slots, less its staging slot and 0, which is_pinned protects
     cache.ensure_rows(torch.tensor([4]))  # chunk 2's admission
     assert [_holds(service.host, row, e) for e in (0, 1, 2, 4)] == [True, False, True, True]
 
@@ -471,8 +471,22 @@ def test_the_watchdog_wait_outlasts_the_wait_timeout_and_the_pause_bound(tiers, 
     )
     with envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.override(40_000):
         service.ensure_started()
-    assert started == [{"fatal_wait_s": module.watchdog_wait_s(40_000)}]
+    assert started == [{"fatal_wait_s": module.watchdog_wait_s(40_000), "spin_us": 5000}]
     assert started[0]["fatal_wait_s"] > 40.0 * 2 + 1.0
+
+
+@pytest.mark.parametrize("spin_us", [-1, 0, 777])
+def test_the_service_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us):
+    """SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US reaches start_thread: -1 never sleeps, else the spin before the idle sleep."""
+    service, streamers, caches = tiers
+    started = []
+    start = module.ExpertStreamHost.start_thread
+    monkeypatch.setattr(
+        module.ExpertStreamHost, "start_thread", lambda self, **kw: (started.append(kw), start(self, **kw))[1]
+    )
+    with envs.SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US.override(spin_us):
+        service.ensure_started()
+    assert [kw["spin_us"] for kw in started] == [spin_us]
 
 
 def _attach_all(service, streamers, capacity=CAPACITY):
@@ -1170,7 +1184,7 @@ def _copy_engine_service(monkeypatch):
 
 
 def _batch(decode: bool):
-    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode))
+    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode, is_target_verify=lambda: False))
 
 
 def test_the_copy_engine_arms_only_after_enough_decode_forwards_not_batches(monkeypatch):
@@ -1197,6 +1211,27 @@ def test_the_copy_engine_arms_only_after_enough_decode_forwards_not_batches(monk
     assert not syncs, "a decode forward drained the device"
     service._copy_engine_barrier(0, _batch(decode=False))
     assert syncs == [True], "an eager forward did not drain the device once armed"
+
+
+def _verify_batch():
+    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: False, is_target_verify=lambda: True))
+
+
+def test_a_graphed_verify_counts_toward_arming_and_its_eager_re_run_drains(monkeypatch):
+    """A DSpark server's target forwards are all verifies: a graphed one counts like a decode, and the eager re-run
+    of an overflowed one (the manager's graph gather suspended) drains the device once armed."""
+    service, armed, syncs = _copy_engine_service(monkeypatch)
+    service.device_side.copy_engine_captured = True
+    service._manager = SimpleNamespace(graph_gather_suspended=False)
+    for _ in range(module.COPY_ENGINE_ARM_DECODES):
+        service._copy_engine_barrier(0, _verify_batch())
+    service._arm_copy_engine()
+    assert armed == [True] and not syncs
+    service._copy_engine_barrier(0, _verify_batch())
+    assert not syncs, "a graphed verify drained the device"
+    service._manager = SimpleNamespace(graph_gather_suspended=True)
+    service._copy_engine_barrier(0, _verify_batch())
+    assert syncs == [True], "an eager re-run did not drain the device once armed"
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -1271,6 +1306,29 @@ def test_the_service_start_refuses_the_copy_engine_under_lazy_module_loading(tie
         with pytest.raises(RuntimeError, match="CUDA_MODULE_LOADING=EAGER"):
             service.ensure_started()
     assert service.host is None, "a refused start left a host behind"
+
+
+@pytest.mark.parametrize("spin_us", [None, -1, 321])
+def test_the_copy_threads_idle_spin_follows_its_env(tiers, monkeypatch, spin_us):
+    """SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US reaches enable_copy_engine (default 5000 us; -1 never sleeps)."""
+    service, streamers, caches = tiers
+    monkeypatch.setenv("CUDA_MODULE_LOADING", "EAGER")
+    seen = []
+
+    def reached(self, device, **kwargs):
+        seen.append(kwargs)
+        raise _CopyEngineReached
+
+    monkeypatch.setattr(module.ExpertStreamHost, "enable_copy_engine", reached)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setenv("SGLANG_DSV41_ENABLE_RAM_MISS_COPY_ENGINE", "1")
+    if spin_us is None:
+        monkeypatch.delenv("SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US", str(spin_us))
+    with pytest.raises(_CopyEngineReached):
+        service.ensure_started()
+    assert [kw["spin_us"] for kw in seen] == [5000 if spin_us is None else spin_us]
 
 
 def test_a_jit_library_load_drains_the_device_first_once_armed(monkeypatch):

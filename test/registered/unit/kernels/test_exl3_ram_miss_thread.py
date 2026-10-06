@@ -447,20 +447,28 @@ def test_a_busy_polling_service_refuses_a_physical_core_it_would_share(tmp_path,
 
 
 @pytest.mark.parametrize("busy", [False, True])
-def test_an_idle_service_never_sleeps(tmp_path, busy):
-    """Idle for half a second, a service thread uses its core the whole time, with or without busy_poll (which only
-    drops the PAUSE). Both still park for a pause and stop. Mutant: restore an idle sleep in RamThread::run -- red."""
+@pytest.mark.parametrize("spin_us", [-1, 1000])
+def test_an_idle_service_sleeps_only_after_its_spin(tmp_path, busy, spin_us):
+    """Idle for half a second: with spin_us=-1 a service thread uses its core the whole time, with or without busy_poll
+    (which only drops the PAUSE); with a 1 ms spin it sleeps 50 us between polls and uses almost none. Parked for a
+    pause, it sleeps too, unless spin_us is -1. Both still stop. Mutant: drop the idle sleep in RamThread::run -- red
+    for spin_us=1000."""
     core, sibling = _physical_core_pair()
     host = _plain_host(tmp_path)
+    spinning = spin_us < 0
     try:
         with _affinity(os.sched_getaffinity(0) - {core, sibling}):
-            host.start_thread(cpu_core=core, busy_poll=busy)
+            host.start_thread(cpu_core=core, busy_poll=busy, spin_us=spin_us)
         assert host.counters()["spin_cpu"] == core
         before = _service_cpu_s()
         time.sleep(0.5)
         used = _service_cpu_s() - before
-        assert used > 0.3, (busy, used)
+        assert (used > 0.3) if spinning else (used < 0.1), (busy, spin_us, used)
         host.pause(5.0)
+        before = _service_cpu_s()
+        time.sleep(0.5)
+        parked = _service_cpu_s() - before
+        assert (parked > 0.3) if spinning else (parked < 0.1), (busy, spin_us, parked)
         host.resume()
     finally:
         host.stop()

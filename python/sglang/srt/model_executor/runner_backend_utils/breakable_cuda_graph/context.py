@@ -32,6 +32,13 @@ def is_in_breakable_cuda_graph() -> bool:
     return _in_breakable_cuda_graph
 
 
+def is_in_breakable_prefill_graph(forward_mode) -> bool:
+    """Inside the breakable prefill graph: a breakable capture or replay of an extend. ForwardMode.is_extend() counts a
+    target verify, which only the breakable decode graph captures (the prefill runner refuses it), and the decode
+    runner sets no piecewise forward context for a break-point to read."""
+    return _in_breakable_cuda_graph and forward_mode.is_extend() and not forward_mode.is_target_verify()
+
+
 @contextmanager
 def enable_breakable_cuda_graph():
     """Mark the enclosed scope as inside a BCG capture/replay. Any exception

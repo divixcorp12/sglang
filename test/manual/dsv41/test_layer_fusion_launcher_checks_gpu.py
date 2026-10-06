@@ -56,20 +56,21 @@ def _commit_args(width: int = 6, experts: int = 16, slots: int = 8) -> dict:
     }
 
 
-def _route_args(routes: int = 6, slots: int = 12, hidden: int = 64) -> dict:
+def _route_args(routes: int = 6, slots: int = 12, hidden: int = 64, tokens: int = 1) -> dict:
     """Valid inputs for ``exl3_moe_route_tables_gpu<int32_t, bf16_t, bf16_t>``, in FFI parameter order."""
     return {
         "remap": torch.arange(routes, dtype=torch.int32, device=CUDA),
         "weights": torch.ones(routes, dtype=torch.bfloat16, device=CUDA),
         "keep": torch.ones(1, dtype=torch.float32, device=CUDA),
-        "x": torch.zeros(1, hidden, dtype=torch.bfloat16, device=CUDA),
+        "x": torch.zeros(tokens, hidden, dtype=torch.bfloat16, device=CUDA),
         "remap64_out": torch.zeros(routes, dtype=torch.int64, device=CUDA),
-        "x16_out": torch.zeros(1, hidden, dtype=torch.float16, device=CUDA),
-        "out_zero": torch.zeros(1, hidden, dtype=torch.float32, device=CUDA),
+        "x16_out": torch.zeros(tokens, hidden, dtype=torch.float16, device=CUDA),
+        "out_zero": torch.zeros(tokens, hidden, dtype=torch.float32, device=CUDA),
         "expert_count": torch.zeros(slots + 1, dtype=torch.int64, device=CUDA),
         "inv_order": torch.zeros(routes, dtype=torch.int64, device=CUDA),
         "weight_sorted": torch.zeros(routes, dtype=torch.float16, device=CUDA),
         "det": torch.zeros(3, slots + 1, dtype=torch.int64, device=CUDA),
+        "token_sorted_out": torch.empty(0, dtype=torch.int64, device=CUDA),
         "cpu_lanes": torch.empty(0, dtype=torch.int32, device=CUDA),
         "dst_slots": torch.empty(0, dtype=torch.int32, device=CUDA),
         "cpu_out": 0,
@@ -100,11 +101,11 @@ def _run_route(args: dict) -> None:
 GATHER_REFUSALS = {
     "width_past_32": (
         lambda: _gather_args(width=33),
-        "the shortlist and the routes must hold 1-32 entries",
+        "the shortlist must hold 1-32 entries",
     ),
-    "routes_past_32": (
-        lambda: _gather_args(routes=33),
-        "the shortlist and the routes must hold 1-32 entries",
+    "routes_past_64": (
+        lambda: _gather_args(routes=65),
+        "the routes must hold 1-64 entries",
     ),
     "victims_on_cpu": (
         lambda: {**_gather_args(), "victims": torch.arange(6, dtype=torch.int64)},
@@ -194,7 +195,24 @@ COMMIT_REFUSALS = {
 }
 
 ROUTE_REFUSALS = {
-    "routes_past_32": (lambda: _route_args(routes=33), "remap must hold 1-32 routes"),
+    "routes_past_64": (lambda: _route_args(routes=65), "remap must hold 1-64 routes"),
+    "routes_not_a_multiple_of_tokens": (lambda: _route_args(routes=7, tokens=2), "multiple of the tokens"),
+    "cpu_experts_with_two_tokens": (
+        lambda: {
+            **_route_args(routes=12, tokens=2),
+            "cpu_lanes": torch.zeros(2, dtype=torch.int32, device=CUDA),
+            "cpu_out": 16,
+        },
+        "CPU experts run one token",
+    ),
+    "token_sorted_out_wrong_size": (
+        lambda: {**_route_args(), "token_sorted_out": torch.zeros(5, dtype=torch.int64, device=CUDA)},
+        "token_sorted_out: ",
+    ),
+    "x16_out_wrong_tokens": (
+        lambda: {**_route_args(routes=12, tokens=2), "x16_out": torch.zeros(1, 64, dtype=torch.float16, device=CUDA)},
+        "^x16_out: ",
+    ),
     "x_on_cpu": (
         lambda: {**_route_args(), "x": torch.zeros(1, 64, dtype=torch.bfloat16)},
         "^x: ",

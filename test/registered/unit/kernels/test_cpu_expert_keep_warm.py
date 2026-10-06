@@ -26,7 +26,7 @@ ROW, ROWS, DST_ROWS, HIDDEN, LANES = 1, 2, 6, 8, 8
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
-def _host(tmp_path, request, keep_warm_us):
+def _host(tmp_path, request, keep_warm_us, spin_us=-1):
     s = ram_miss_setup(tmp_path, capacity=12, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
     host.enable_copy_engine(-1)
@@ -46,6 +46,7 @@ def _host(tmp_path, request, keep_warm_us):
         x_rows,
         out_rows,
         threads=2,
+        spin_us=spin_us,
         keep_warm_us=keep_warm_us,
     )
     host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
@@ -110,6 +111,45 @@ def test_the_hold_outlasts_its_warm_window(tmp_path, request):
     grid = _run_jobs(host)
     for k in range(1, LANES + 1):
         assert grid[0, k] < k * FORWARD_NS / 1e6 + 5, (k, grid[0].tolist())
+
+
+def test_a_spin_budget_releases_the_team_and_the_engine_sleeps(tmp_path, request):
+    """With spin_us the hold ends spin_us after the warm window: the engine releases its team and sleeps on its
+    doorbell, using no CPU, and the next job still runs (the submit wakes it). Mutant: ignore the release deadline in
+    keep_warm -- red (the idle thread keeps its core)."""
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=10_000, spin_us=20_000)
+    _run_jobs(host)
+    time.sleep(0.1)
+    calls = host.test_keep_warm_calls()
+    assert calls >= 1
+    before = _engine_cpu_s()
+    time.sleep(0.5)
+    assert _engine_cpu_s() - before < 0.1
+    assert host.test_keep_warm_calls() == calls
+    grid = _run_jobs(host)
+    for k in range(1, LANES + 1):
+        assert grid[0, k] < k * FORWARD_NS / 1e6 + 5, (k, grid[0].tolist())
+    assert host.test_keep_warm_calls() > calls
+
+
+def test_a_sleeping_engine_spins_its_budget_before_the_first_job(tmp_path, request):
+    """Before any job the engine holds its team for its spin budget, then releases it and sleeps."""
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000, spin_us=20_000)
+    time.sleep(0.1)
+    assert host.test_keep_warm_calls() == 1
+    before = _engine_cpu_s()
+    time.sleep(0.3)
+    assert _engine_cpu_s() - before < 0.06
+    assert host.test_keep_warm_calls() == 1
+
+
+def test_stop_wakes_a_sleeping_engine(tmp_path, request):
+    _, host, _keep = _host(tmp_path, request, keep_warm_us=0, spin_us=0)
+    _run_jobs(host)
+    time.sleep(0.05)
+    start = time.monotonic()
+    host.stop()
+    assert time.monotonic() - start < 5
 
 
 def test_stop_ends_a_running_keep_warm(tmp_path, request):

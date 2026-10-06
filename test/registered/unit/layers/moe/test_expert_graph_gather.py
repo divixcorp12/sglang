@@ -106,6 +106,30 @@ class TestExpertGraphGather(unittest.TestCase):
         scratch = compact[compact >= cache.capacity]
         self.assertEqual(scratch.unique().numel(), 5)
 
+    def test_fused_plan_serves_verify_shaped_routes_through_the_dedup_kernel(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_hot_cache import ExpertHotCache
+
+        layer = _layer()
+        streamer = ExpertStreamer(layer, NVFP4_STREAM_TENSORS)
+        routes = 4 * TOP_K
+        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override("true"):
+            cache = ExpertHotCache(streamer, 3, scratch_rows=routes)
+            cache.reassign([1, 4, 6])
+            streamer.enable_graph_gather(routes)
+        ids = torch.tensor(
+            [[0, 1, 2, 3], [2, 3, 4, 5], [5, 0, 6, 7], [7, 2, 1, 3]], dtype=torch.int32, device="cuda"
+        )
+
+        compact, tensors = streamer.gather(ids)
+
+        self._assert_rows(layer, ids, compact, tensors)
+        # The fused planner wrote its remap: the dedup kernel served the call, not the generic plan.
+        self.assertTrue(torch.equal(streamer._graph_fused_remaps[torch.int32][:routes], compact.reshape(-1)))
+        self.assertEqual(streamer.graph_counters.tolist(), [routes, 12])
+        self.assertEqual(streamer.graph_unique_counters.tolist(), [3, 5])
+        self.assertEqual(compact[compact >= cache.capacity].unique().numel(), 5)
+
     def test_graph_gather_performs_no_host_synchronization(self):
         streamer, _ = self._graph_streamer(_layer())
         ids = torch.tensor([[0, 4, 7, 0]], dtype=torch.int32, device="cuda")

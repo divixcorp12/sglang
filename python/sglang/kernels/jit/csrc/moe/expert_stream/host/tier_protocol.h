@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../lease_layout.h"
+#include "lease_channel.h"
 #include "fixed_vec.h"
 #include "row_reader.h"
 
@@ -76,7 +77,7 @@ static_assert(is_core_counter(kVersion), "version is functional (Python's LRU vi
 
 // Acquire load of the 32-bit word at `address` in a lease block shared with the device.
 inline uint32_t load_acquire(const uint8_t* address) {
-  return __atomic_load_n(reinterpret_cast<const uint32_t*>(address), __ATOMIC_ACQUIRE);
+  return channel::load_acquire(address);
 }
 
 // Release store of the 32-bit word at `address` in a lease block shared with the device.
@@ -91,18 +92,18 @@ inline uint64_t load_acquire64(const uint8_t* address) {
 
 // Release store of a 64-bit word of the completion and delta blocks.
 inline void store_release64(uint8_t* address, uint64_t value) {
-  __atomic_store_n(reinterpret_cast<uint64_t*>(address), value, __ATOMIC_RELEASE);
+  channel::store_release64(address, value);
 }
 
 // Maps sequence 0 to 1. The device never posts sequence 0 (the post kernel wraps 0xFFFFFFFF to 1), so a service that
 // reached 0 would spend an iteration on a record nobody posted and store a done word of 0.
 inline uint32_t skip_zero(uint32_t seq) {
-  return seq == 0 ? 1u : seq;
+  return channel::skip_zero(seq);
 }
 
 // True when `observed` has reached `seq`, correct across the 2^32 wrap.
 inline bool reached(uint32_t observed, uint32_t seq) {
-  return static_cast<int32_t>(observed - seq) >= 0;
+  return channel::reached(observed, seq);
 }
 
 // Byte offset of the record for sequence `seq` in a ring of `records` records starting at `ring`.
@@ -160,12 +161,8 @@ static_assert(Wire::kRecPayloadEnd <= Wire::kRecordBytes, "read_record copies th
 // issue together, before anything depends on the counts, and nothing after the second seq load reads the shared
 // record.
 inline RecordRead read_record(const uint8_t* record, uint32_t expected, Request* request) {
-  if (load_acquire(record + Wire::kRecSeq) != expected) return RecordRead::kTorn;
   alignas(64) uint8_t raw[Wire::kRecordBytes];
-  std::memcpy(raw, record, Wire::kRecordBytes);
-  std::atomic_thread_fence(std::memory_order_acquire);
-  asm volatile("" ::: "memory");  // the copy's plain loads must stay before the seq re-check
-  if (load_acquire(record + Wire::kRecSeq) != expected) return RecordRead::kTorn;
+  if (!channel::read_seqlocked<TargetChannel>(record, expected, raw)) return RecordRead::kTorn;
   uint16_t row;
   uint8_t counts, flags;
   uint64_t chain;

@@ -667,6 +667,11 @@ def _random_routes(generator):
     return [[generator.sample(range(EXPERTS), TOP_K)] for _ in range(LAYERS)]
 
 
+def _verify_routes(generator, tokens):
+    """Each layer's routes for a ``tokens``-token verify: top-k distinct per token, tokens may share experts."""
+    return [[generator.sample(range(EXPERTS), TOP_K) for _ in range(tokens)] for _ in range(LAYERS)]
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestInsertOnMiss(unittest.TestCase):
     """SGLANG_MOE_HOT_INSERT_ON_MISS: a decode forward's missed experts move from scratch rows into slots."""
@@ -1153,6 +1158,10 @@ def _cache_bytes(cache):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class _GraphPathTaken(Exception):
+    """Raised by a patched _gather_graph: a gather that should be eager took the graph path."""
+
+
 class TestInsertOnMissDirect(unittest.TestCase):
     """Stage DIRECT: a gather copies each miss straight into a victim slot, and no scratch is held.
 
@@ -1235,8 +1244,268 @@ class TestInsertOnMissDirect(unittest.TestCase):
         The allocator gives every layer that floor first, so only a budget short of all the floors
         together leaves a layer under it: here one slot short of three floors."""
         floors = LAYERS * 2 * TOP_K
-        with self.assertRaisesRegex(ValueError, "twice its graph-gather rows"):
+        with self.assertRaisesRegex(ValueError, "twice its graph-gather miss lanes"):
             _manager(_model(), gpu=True, budget_bytes=56 * (floors - 1), **DIRECT)
+
+    # ----- a miss width below the routes (a verify) -----
+
+    def test_a_narrow_miss_width_sizes_the_shortlist_not_the_routes(self):
+        """Three verify tokens route 6 ids a layer; the gather serves 2 distinct misses. The routes keep their width,
+        the shortlist and the lanes take the miss width, and DIRECT still holds no scratch."""
+        manager = _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **DIRECT)
+        updater = manager.gpu_residency
+        for streamer in manager.streamers.values():
+            self.assertEqual(streamer.graph_gather_rows, 3 * TOP_K)
+            self.assertEqual(streamer.graph_miss_lanes, 2)
+            self.assertEqual(streamer.graph_miss_width, 2)
+            self.assertEqual(streamer.hot_cache.scratch_rows, 0)
+        self.assertEqual(updater.miss_rows, 2)
+        self.assertEqual(tuple(updater.victims.shape), (LAYERS, 2))
+
+    def test_the_miss_width_defaults_to_one_lane_per_route_and_reads_the_env(self):
+        from sglang.srt.environ import envs
+
+        # Two tokens route 4 ids: one lane per route needs a floor of 8 slots a layer.
+        budget = dict(budget_bytes=56 * LAYERS * 8, graph_gather_batch_size=2)
+        wide = _manager(_model(), gpu=True, **budget, **DIRECT)
+        capped = _manager(_model(), gpu=True, graph_gather_miss_lanes=99, **budget, **DIRECT)
+        with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.override(3):
+            narrow = _manager(_model(), gpu=True, **budget, **DIRECT)
+        for manager, lanes, width in ((wide, 0, 4), (capped, 0, 4), (narrow, 3, 3)):
+            for streamer in manager.streamers.values():
+                self.assertEqual((streamer.graph_miss_lanes, streamer.graph_miss_width), (lanes, width))
+            self.assertEqual(manager.gpu_residency.miss_rows, width)
+
+    def test_a_narrow_miss_width_needs_direct(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2"):
+            _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **IOM)
+
+    def test_the_fused_remap_rows_hold_the_routes(self):
+        """Layer fusion's remap rows are as wide as a gather's routes: one token's at BS1, unchanged, and every
+        route of a verify whose misses are narrower."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
+            one = _manager(_model(), gpu=True, **DIRECT)
+            verify = _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=2, **DIRECT)
+        for manager, routes in ((one, TOP_K), (verify, 3 * TOP_K)):
+            for remaps in manager.gpu_residency.fused_remaps.values():
+                self.assertEqual(tuple(remaps.shape), (LAYERS, routes))
+
+    def test_a_negative_miss_width_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "miss lanes"):
+            _manager(_model(), gpu=True, graph_gather_batch_size=3, graph_gather_miss_lanes=-1, **DIRECT)
+
+    # ----- a narrow gather: serve what found a victim, flag the rest -----
+
+    def replay_verify(self, manager, graph, static, outputs, routes, check_outputs):
+        """One captured verify; checks every token's gathered rows when ``check_outputs`` and the replay did not
+        flag its output (an overflowed forward reads wrong rows by design)."""
+        static.copy_(torch.tensor(routes, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.cuda.synchronize()
+        if check_outputs and not int(manager.gpu_residency.overflow_flag.item()):
+            for layer in range(LAYERS):
+                source_layer = self.model.get_submodule(str(layer))
+                experts = torch.tensor(routes[layer]).reshape(-1)
+                for name in NVFP4_STREAM_TENSORS:
+                    source = getattr(source_layer, name)
+                    expected = source[experts.to(source.device)].reshape(-1).view(torch.uint8).cpu()
+                    actual = outputs[layer][name].view(torch.uint8).reshape(-1).cpu()
+                    self.assertTrue(torch.equal(actual, expected), f"layer {layer} {name}")
+        manager.on_expert_distribution(_decode_batch(), {"global_physical_count": _counts(routes)})
+        torch.cuda.synchronize()
+
+    def _narrow(self, model, lanes, fused):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(fused), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(fused):
+            # Zero seed scores fill every layer evenly (8 slots each) whatever its floor, so the narrow and the wide
+            # twin hold the same capacities.
+            manager = _manager(
+                model, gpu=True, seed_scale=(0, 0, 0), graph_gather_batch_size=2, graph_gather_miss_lanes=lanes,
+                budget_bytes=56 * LAYERS * 8, **DIRECT,
+            )
+        self.assertEqual(manager.gpu_residency.layer_fusion, fused)
+        return manager
+
+    def test_a_narrow_gather_is_the_wide_gather_until_it_overflows(self):
+        """Two tokens route 4 ids a layer. Until the narrow gather first flags, its residency is the wide one's bit for
+        bit: the served lanes are the same prefix of the same usable shortlist entries. The first steps route one
+        token's experts twice (at most 2 distinct, so H + M <= 2 lanes and the guarantee holds); random routes
+        follow until the first overflow."""
+        for fused in (False, True):
+            self.model = _model()
+            wide, narrow = self._narrow(self.model, 0, fused), self._narrow(_model(), 2, fused)
+            self.assertEqual(wide.gpu_residency.miss_rows, 4)
+            self.assertEqual(narrow.gpu_residency.miss_rows, 2)
+            for layer_id in wide.caches:
+                self.assertEqual(wide.caches[layer_id].capacity, 8)
+                self.assertEqual(narrow.caches[layer_id].capacity, 8)
+            twins = [(manager, *self.capture(manager, tokens=2)) for manager in (wide, narrow)]
+            generator = random.Random(23)
+            compared, overflowed = 0, False
+            for step in range(60):
+                routes = _verify_routes(generator, 2)
+                if step < 6:
+                    routes = [[layer[0], layer[0]] for layer in routes]
+                for manager, graph, static, outputs in twins:
+                    self.replay_verify(manager, graph, static, outputs, routes, check_outputs=True)
+                if int(narrow.gpu_residency.overflow_flag.item()) > 0:
+                    overflowed = True
+                    break
+                context = f"fused={fused} step {step}"
+                assert_states_equal(self, device_state(narrow), device_state(wide), context)
+                assert_slot_rows(self, narrow, self.model, context)
+                self.assertEqual(narrow.gpu_residency.snapshot()["gather_overflow"], [0] * LAYERS)
+                compared += 1
+            self.assertGreaterEqual(compared, 6, f"fused={fused}: a repeated-token step overflowed")
+            self.assertTrue(overflowed, f"fused={fused}: no step overflowed two lanes")
+            self.assertEqual(wide.gpu_residency.overflow_flag.item(), 0)
+            self.assertNotIn("gather_overflow", wide.gpu_residency.snapshot())
+
+    def test_an_overflowing_gather_serves_its_lanes_and_flags_its_layer(self):
+        """Layer 0's two tokens route four non-resident experts into two lanes: two are copied and committed, the
+        layer is flagged, and every mapped expert's slot still holds its own bytes."""
+        for fused in (False, True):
+            self.model = _model()
+            manager = self._narrow(self.model, 2, fused)
+            updater = manager.gpu_residency
+            graph, static, outputs = self.capture(manager, tokens=2)
+            mapping = manager.caches[0].expert_to_slot.tolist()
+            outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+            self.assertGreaterEqual(len(outsiders), 4)
+            hits = [
+                [[e for e, s in enumerate(manager.caches[layer].expert_to_slot.tolist()) if s >= 0][:TOP_K]] * 2
+                for layer in range(1, LAYERS)
+            ]
+            routes = [[outsiders[0:2], outsiders[2:4]]] + hits
+            inserted = updater.gather_insertions.clone()
+            self.replay_verify(manager, graph, static, outputs, routes, check_outputs=False)
+            context = f"fused={fused}"
+            self.assertEqual(int(updater.overflow_flag.item()), 1, context)
+            self.assertEqual(updater.gather_overflow.tolist(), [1, 0, 0], context)
+            self.assertEqual((updater.gather_insertions - inserted).tolist(), [2, 0, 0], context)
+            self.assertEqual(int(manager.streamers[0]._graph_miss_count.item()), 2, context)
+            self.assertEqual(updater.insertion_truncated.tolist(), [0] * LAYERS, context)
+            assert_slot_rows(self, manager, self.model, context)
+            # The next all-hit verify neither flags nor reads a wrong row.
+            updater.overflow_flag.zero_()
+            self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=True)
+            self.assertEqual(int(updater.overflow_flag.item()), 0, context)
+
+    def test_hits_that_empty_the_shortlist_flag_the_gather(self):
+        """Two misses fit two lanes, but the other token routes both shortlisted residents: no entry survives, nothing
+        is copied, and the gather is flagged instead of copying into slot 0."""
+        for fused in (False, True):
+            self.model = _model()
+            manager = self._narrow(self.model, 2, fused)
+            updater = manager.gpu_residency
+            graph, static, outputs = self.capture(manager, tokens=2)
+            victims = updater.victims[0].tolist()
+            self.assertTrue(bool(updater.victim_valid[0].all()))
+            shortlisted = [int(updater.slot_to_expert[0, slot]) for slot in victims]
+            self.assertTrue(all(expert >= 0 for expert in shortlisted), "the shortlist names free slots")
+            mapping = manager.caches[0].expert_to_slot.tolist()
+            outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+            routes = [[shortlisted, outsiders[:2]]] + [[[0, 1], [0, 1]]] * (LAYERS - 1)
+            before = _cache_bytes(manager.caches[0])
+            self.replay_verify(manager, graph, static, outputs, routes, check_outputs=False)
+            context = f"fused={fused}"
+            self.assertEqual(int(updater.overflow_flag.item()), 1, context)
+            self.assertEqual(int(manager.streamers[0]._graph_miss_count.item()), 0, context)
+            self.assertEqual(updater.insertion_truncated.tolist(), [0] * LAYERS, context)
+            after = _cache_bytes(manager.caches[0])
+            for name in before:
+                self.assertTrue(torch.equal(after[name], before[name]), f"{context}: {name} was written")
+
+    def test_a_one_token_gather_never_clamps(self):
+        from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
+
+        manager = _manager(self.model, gpu=True, **DIRECT)
+        with unittest.mock.patch.object(GpuResidencyUpdater, "clamp_gather_misses", side_effect=AssertionError):
+            graph, static, outputs = self.capture(manager)
+            self.step(manager, graph, static, outputs, _random_routes(random.Random(5)), "one token")
+        self.assertNotIn("gather_overflow", manager.gpu_residency.snapshot())
+
+    # ----- the host side of a graphed verify -----
+
+    def _overflow_routes(self, manager):
+        """Layer 0's two tokens route four non-resident experts into two lanes; the other layers route hits."""
+        mapping = manager.caches[0].expert_to_slot.tolist()
+        outsiders = [expert for expert, slot in enumerate(mapping) if slot < 0]
+        hits = [
+            [[e for e, s in enumerate(manager.caches[layer].expert_to_slot.tolist()) if s >= 0][:TOP_K]] * 2
+            for layer in range(1, LAYERS)
+        ]
+        return [[outsiders[0:2], outsiders[2:4]]] + hits
+
+    def test_the_verify_overflow_is_read_once_and_cleared(self):
+        manager = self._narrow(self.model, 2, False)
+        self.assertTrue(manager.narrow_graph_gather)
+        graph, static, outputs = self.capture(manager, tokens=2)
+        self.replay_verify(manager, graph, static, outputs, self._overflow_routes(manager), check_outputs=False)
+        self.assertTrue(manager.take_verify_overflow())
+        self.assertEqual(int(manager.gpu_residency.overflow_flag.item()), 0)
+        self.assertFalse(manager.take_verify_overflow())
+        self.assertEqual((manager.graphed_verify_ct, manager.verify_overflow_ct), (2, 1))
+        # An eager verify on the narrowed gather is read too, but is not a graphed one.
+        self.replay_verify(manager, graph, static, outputs, self._overflow_routes(manager), check_outputs=False)
+        self.assertTrue(manager.take_verify_overflow(graphed=False))
+        self.assertEqual((manager.graphed_verify_ct, manager.verify_overflow_ct), (2, 2))
+
+    def test_a_manager_without_a_narrow_gather_reads_nothing(self):
+        wide = self._narrow(self.model, 0, False)
+        self.assertFalse(wide.narrow_graph_gather)
+        one_token = _manager(_model(), gpu=True, **DIRECT)
+        self.assertFalse(one_token.narrow_graph_gather)
+        self.assertFalse(_manager(_model(), gpu=True, **IOM).narrow_graph_gather)
+
+    def test_suspending_the_graph_gather_turns_it_off_for_every_streamer_and_restores_it(self):
+        manager = self._narrow(self.model, 2, False)
+        ids = torch.zeros((2, TOP_K), dtype=torch.int32, device="cuda")
+        topk = SimpleNamespace(topk_ids=ids)
+        streamers = list(manager.streamers.values())
+        self.assertTrue(all(s.serves_graph_gather(topk) for s in streamers))
+        self.assertFalse(manager.graph_gather_suspended)
+        with self.assertRaises(KeyError):
+            with manager.suspend_graph_gather():
+                self.assertTrue(manager.graph_gather_suspended)
+                self.assertFalse(any(s.serves_graph_gather(topk) for s in streamers))
+                with unittest.mock.patch.object(ExpertStreamer, "_gather_graph", side_effect=_GraphPathTaken):
+                    try:
+                        streamers[0].gather(ids)
+                    except _GraphPathTaken:
+                        self.fail("a suspended gather took the graph path")
+                    except Exception:
+                        pass  # the eager path's own requirements are not under test here
+                raise KeyError("restore on error")
+        self.assertFalse(manager.graph_gather_suspended)
+        self.assertTrue(all(s.serves_graph_gather(topk) for s in streamers))
+
+    def test_the_metrics_trace_reports_the_overflow_and_the_graphed_verifies(self):
+        import json
+
+        with tempfile.NamedTemporaryFile() as trace:
+            from sglang.srt.environ import envs
+
+            with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(False), envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(False):
+                manager = _manager(
+                    self.model, gpu=True, seed_scale=(0, 0, 0), graph_gather_batch_size=2, graph_gather_miss_lanes=2,
+                    budget_bytes=56 * LAYERS * 8, metrics_path=trace.name, log_interval=1, **DIRECT,
+                )
+            graph, static, outputs = self.capture(manager, tokens=2)
+            self.replay_verify(manager, graph, static, outputs, self._overflow_routes(manager), check_outputs=False)
+            self.assertTrue(manager.take_verify_overflow())
+            self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=False)
+            self.assertFalse(manager.take_verify_overflow())
+            self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=False)
+            manager.close_telemetry()
+            trace.seek(0)
+            last = json.loads(trace.read().splitlines()[-1])
+        self.assertEqual(last["counters"]["residency_gpu"]["gather_overflow"], [1, 0, 0])
+        self.assertEqual(last["counters"]["graphed_verify"], {"graphed_verify_ct": 2, "verify_overflow_ct": 1})
+        self.assertIs(manager._trace_sources()["gpu_residency:gather_overflow"], manager.gpu_residency.gather_overflow)
 
     # ----- the consolidated safety guard (one guard, three reasons) -----
 

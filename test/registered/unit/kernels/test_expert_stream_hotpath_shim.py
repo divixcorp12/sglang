@@ -223,6 +223,21 @@ def test_the_copy_thread_allocates_nothing_and_waits_on_no_condvar(shim, tmp_pat
     assert service["futex"] == 0, counts
 
 
+def test_sleeping_threads_wake_on_a_futex_and_still_take_no_lock(shim, tmp_path):
+    """With 200 us idle spins the Python-paced gaps between steps put both threads to sleep: the service between polls
+    (nanosleep), the copy thread on its doorbell (a futex wait), which the service's submit wakes, at most once per
+    job, and only while the copy thread sleeps. Every step is still served, and neither thread locks or allocates.
+    Mutant: drop doorbell_.ring() from CopyEngine::submit -- red (copies wait out the 1 ms backstop, service futex 0)."""
+    counts = hotpath_shim.run_child(shim, variant="prod", tmp=tmp_path, service_spin_us=200, copy_spin_us=200)
+    print("HOTPATH sleeping", counts)
+    _measured(counts)
+    assert counts["service"]["sleep"] > 0 and counts["copy"]["futex"] > 0, counts
+    assert 0 < counts["service"]["futex"] <= counts["copy_jobs"], counts
+    for thread in ("service", "copy"):
+        assert counts[thread]["mutex"] == 0 and counts[thread]["cond"] == 0, counts
+        assert counts[thread]["malloc"] == 0 and counts[thread]["free"] == 0, counts
+
+
 @pytest.mark.parametrize("variant", ["prod", "instr"])
 def test_the_service_and_copy_threads_take_no_lock_and_never_wait_on_a_condvar(shim, tmp_path, variant):
     """Spec L1-L10 and 6.3 (Task 15): over the measured requests -- copy jobs on the copy thread, and misses with their

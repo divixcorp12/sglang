@@ -124,10 +124,10 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "test_kernel_hold",
     "test_keep_warm_calls",
     "test_keep_warm_core",
-    "kernel_layer",
-    "kernel_forward",
-    "kernel_error",
-    "kernel_drop",
+    "draft_test_post",
+    "draft_test_tear",
+    "draft_test_finish_close",
+    "draft_test_poll_pause",
 )
 
 
@@ -1191,11 +1191,11 @@ _kernel_layer_keep: dict[int, tuple] = {}
 
 
 def kernel_layer(kernel: int, spec, *, layout: str = "exl3", variant: Optional[str] = None) -> int:
-    """Test only: kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
+    """Kernel ``kernel``'s make_layer over ``spec`` (a ``CpuExpertLayerSpec``); returns the layer's id.
 
-    ``spec.keep`` is kept alive until :func:`kernel_drop`. Instrumented build only.
+    ``spec.keep`` is kept alive until :func:`kernel_drop`. Both builds: the DSpark draft's CPU experts
+    (``cpu_experts/draft.py``) run through it, and tests.
     """
-    _refuse_test_only("kernel_layer", variant)
     slabs, params = _layer_tensors(spec)
     layer = int(
         _host_module(layout, variant).expert_stream_kernel_layer(
@@ -1226,12 +1226,12 @@ def kernel_forward(
     layout: str = "exl3",
     variant: Optional[str] = None,
 ) -> tuple[int, str]:
-    """Test only: one forward of :func:`kernel_layer`'s ``layer``.
+    """One forward of :func:`kernel_layer`'s ``layer`` over ``rows`` token rows (x ``[rows, H]``, slots and weights
+    ``[rows, k]``).
 
     Returns (0, "") or the kernel's refusal: (2, why) for a bad call, (1, why) for a failure; ``out`` is untouched
-    then. Pins the calling thread to ``cores[0]``. Instrumented build only.
+    then. Pins the calling thread to ``cores[0]``. Both builds.
     """
-    _refuse_test_only("kernel_forward", variant)
     module = _host_module(layout, variant)
     status = int(
         module.expert_stream_kernel_forward(
@@ -1250,8 +1250,7 @@ def kernel_forward(
 
 
 def kernel_drop(layer: int, *, layout: str = "exl3", variant: Optional[str] = None) -> None:
-    """Test only: release :func:`kernel_layer`'s ``layer``. Instrumented build only."""
-    _refuse_test_only("kernel_drop", variant)
+    """Release :func:`kernel_layer`'s ``layer``. Both builds."""
     _host_module(layout, variant).expert_stream_kernel_drop(int(layer))
     _kernel_layer_keep.pop(int(layer), None)
 
@@ -1287,6 +1286,11 @@ def _stop_live() -> None:
             host.stop()
         except Exception as error:  # noqa: BLE001 - keep stopping the other hosts
             sys.stderr.write(f"exl3 RAM miss: stopping a host failed: {error!r}\n")
+
+
+def _spin_ns(spin_us: int) -> int:
+    """An idle spin budget in ns for the C++ side; a negative budget (never sleep) stays -1."""
+    return -1 if spin_us < 0 else int(spin_us * 1e3)
 
 
 class ExpertStreamHost:
@@ -1468,14 +1472,16 @@ class ExpertStreamHost:
         *,
         cpu_core: int | Sequence[int] = -1,
         fatal_wait_s: float = 30.0,
+        spin_us: int = -1,
         busy_poll: bool = False,
     ) -> None:
         """Serve requests on one C++ thread per NUMA group (no more ``pump()``), with the watchdog.
 
         ``cpu_core`` is one core per group (a sequence), or one int for a single group; -1 inherits the caller's
-        affinity. Cores 64-71 are reserved for NVMe completion interrupts. A service thread never sleeps: it spins
-        with PAUSE, or with ``busy_poll`` with no PAUSE, which the C++ side refuses unless each physical core is its
-        service's alone.
+        affinity. Cores 64-71 are reserved for NVMe completion interrupts. An idle service thread spins with PAUSE,
+        or with ``busy_poll`` with no PAUSE (which the C++ side refuses unless each physical core is its service's
+        alone), for ``spin_us``, then sleeps 50 us between polls; parked, it sleeps 20 us between checks. -1 never
+        sleeps (``SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US`` in a server).
         """
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_not_reserved
 
@@ -1488,6 +1494,7 @@ class ExpertStreamHost:
             self.handle,
             torch.tensor(cores, dtype=torch.int64),
             int(fatal_wait_s * 1e9),
+            _spin_ns(spin_us),
             int(busy_poll),
         )
         self.threaded = True
@@ -1703,7 +1710,7 @@ class ExpertStreamHost:
         self._module.expert_stream_set_prefill_share(self.handle, int(share))
 
     def enable_copy_engine(
-        self, device: int, *, wait_timeout_ms: int = 2000, cpus: Sequence[int] = ()
+        self, device: int, *, spin_us: int = -1, wait_timeout_ms: int = 2000, cpus: Sequence[int] = ()
     ) -> None:
         """Start the copy-engine thread on CUDA ``device`` (-1: the CPU test backend).
 
@@ -1711,13 +1718,15 @@ class ExpertStreamHost:
         :meth:`arm_copy_engine`, and then only rows :meth:`set_copy_table` registered.
         ``wait_timeout_ms`` bounds an armed copy wait: the service watchdog aborts the
         process once a closed gate has held the decode stream that long
-        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). The copy thread never sleeps, so
-        ``cpus`` should be a core of its own (``ThreadingConfig.copy_cpus``); empty inherits
-        the caller's affinity.
+        (``SGLANG_DSV41_RAM_MISS_TIMEOUT_MS`` in a server). The idle copy thread polls for
+        ``spin_us``, then sleeps on its doorbell until the next submit; -1 never sleeps
+        (``SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US`` in a server). ``cpus`` is its core
+        (``ThreadingConfig.copy_cpus``); empty inherits the caller's affinity.
         """
         self._module.expert_stream_enable_copy_engine(
             self.handle,
             int(device),
+            _spin_ns(spin_us),
             int(wait_timeout_ms * 1e6),
             torch.tensor([int(c) for c in cpus], dtype=torch.int64),
         )
@@ -1761,6 +1770,7 @@ class ExpertStreamHost:
         *,
         threads: int,
         group: int = 0,
+        spin_us: int = -1,
         keep_warm_us: int = 0,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
@@ -1774,9 +1784,10 @@ class ExpertStreamHost:
         group g's CPU-hit and CPU-miss partial sums are parts ``2g`` and ``2g + 1``) are
         pinned host rows: the post kernel stages a row's input in the first, the CPU
         writes its partial sums to the second and the device reads them. The host keeps
-        references to both. The idle thread never sleeps: it holds its workers in the
-        kernel's keep-warm, in register work for ``keep_warm_us`` after each job and in
-        PAUSE after that.
+        references to both. The idle thread holds its workers in the kernel's keep-warm, in
+        register work for ``keep_warm_us`` after each job and in PAUSE for ``spin_us`` after
+        that, then releases them and sleeps until the next submit; -1 holds them until the
+        next submit (``SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US`` in a server).
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -1815,6 +1826,7 @@ class ExpertStreamHost:
             hidden,
             parts,
             int(threads),
+            _spin_ns(spin_us),
             int(keep_warm_us * 1e3),
         )
         self.cpu_rows = (x_rows, out_rows)
@@ -1899,10 +1911,10 @@ class ExpertStreamHost:
         return int(self._module.expert_stream_test_kernel_address(int(ns_per_expert), int(fail), int(bool(zero))))
 
     def test_kernel_calls(self) -> list[dict]:
-        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, in order."""
+        """Test only: the fake kernel's forwards since :meth:`test_kernel_address`, one per row, in order."""
         _refuse_test_only("test_kernel_calls", self.variant)
         lanes = self.wire.lanes
-        width = 5 + 2 * lanes
+        width = 6 + 2 * lanes
         count = int(self._module.expert_stream_test_kernel_calls(torch.zeros((0, width), dtype=torch.float64)))
         out = torch.zeros((count, width), dtype=torch.float64)
         self._module.expert_stream_test_kernel_calls(out)
@@ -1912,6 +1924,7 @@ class ExpertStreamHost:
             calls.append({
                 "core": int(row[0]), "affinity": int(row[1]), "threads": int(row[2]), "accumulate": bool(row[3]),
                 "slots": [int(s) for s in row[5 : 5 + k]], "weights": row[5 + lanes : 5 + lanes + k],
+                "capacity": int(row[5 + 2 * lanes]),
             })
         return calls
 

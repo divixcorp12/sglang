@@ -232,5 +232,36 @@ def test_two_full_teams_run_at_once_at_a_thread_limit_of_their_sum(monkeypatch):
     assert "rcs [0]" in result.stdout, result.stdout[-2000:]
 
 
+
+def test_a_multi_row_forward_on_prod_matches_one_row_forwards(monkeypatch):
+    """The DSpark draft (cpu_experts/draft.py) runs m rows per kernel_forward on the production build; the kernel groups
+    the rows' routes by expert, so this pins that grouping to the one-row results bit for bit, at m = 1..6."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    trait, cores = _kernel()
+    layer = es.kernel_layer(trait.kernel_address(), trait.layer_spec(_random_slabs(20261005, HIDDEN, INTER), CAP),
+                            variant="prod")
+    inputs = _inputs()[:6]
+
+    def forward(rows):
+        out = torch.full((len(rows), HIDDEN), float("nan"))
+        status, why = es.kernel_forward(
+            layer, torch.stack([x for x, _, _ in rows]), torch.tensor([s for _, s, _ in rows], dtype=torch.int32),
+            torch.tensor([w for _, _, w in rows], dtype=torch.float32), out, threads=2, cores=cores[:2], variant="prod",
+        )
+        assert (status, why) == (0, "")
+        return out
+
+    def run(_):
+        singles = torch.cat([forward([row]) for row in inputs])
+        return [(m, torch.equal(forward(inputs[:m]), singles[:m])) for m in range(1, 7)]
+
+    try:
+        (results,) = _on_threads(run, [None])
+        assert results == [(m, True) for m in range(1, 7)]
+    finally:
+        es.kernel_drop(layer, variant="prod")
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

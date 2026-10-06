@@ -22,7 +22,9 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "lease_channel.cuh"
 #include "lease_layout.h"
+#include "lease_primitives.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <type_traits>
@@ -35,86 +37,23 @@ using namespace ::sglang::expert_stream::wire;
 constexpr int kBlock = 32;
 constexpr int kCopyWaitThreads = 256;  // the copy wait's block when it also reads the small tensors
 
-// The device's own words (`state`, int32, device memory): never on the wire.
-constexpr int kPosted = 0;        // the last posted seq
-constexpr int kPending = 1;       // the seq of the request this layer's chain serves, 0 for an unarmed post
-constexpr int kEpoch = 2;         // times seq32 wrapped; G = epoch << 32 | seq
-constexpr int kPendingEpoch = 3;  // the epoch of the request kPending names
+// The device's own words (`state`, int32, device memory): never on the wire. The first four are the lease channel's
+// (lease_channel.cuh); kPending is the seq of the request this layer's chain serves, 0 for an unarmed post.
+using channel::kEpoch;
+using channel::kPending;
+using channel::kPendingEpoch;
+using channel::kPosted;
 // The stream kernel's absolute deadline, written by the post as two int32 halves. It bounds the one device spin that
 // nothing else bounds.
 constexpr int kDeadlineLo = 4;
 constexpr int kDeadlineHi = 5;
 constexpr int kStateWords = 6;
 
-SGL_DEVICE uint32_t ld_acquire_sys(const uint8_t* address) {
-  return ::sglang::device::ptx::load_acquire_sys(reinterpret_cast<const uint32_t*>(address));
-}
-
-SGL_DEVICE void st_release_sys(uint8_t* address, uint32_t value) {
-  asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(address), "r"(value) : "memory");
-}
-
-SGL_DEVICE uint64_t ld_acquire_sys64(const uint8_t* address) {
-  uint64_t value;
-  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
-  return value;
-}
-
-SGL_DEVICE void st_release_sys64(uint8_t* address, uint64_t value) {
-  asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(address), "l"(value) : "memory");
-}
-
-SGL_DEVICE void st_relaxed_sys_v2(uint8_t* address, uint32_t x, uint32_t y) {
-  asm volatile("st.relaxed.sys.global.v2.b32 [%0], {%1, %2};" ::"l"(address), "r"(x), "r"(y) : "memory");
-}
-
-SGL_DEVICE void st_relaxed_sys_v4(uint8_t* address, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
-  asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};" ::"l"(address), "r"(x), "r"(y), "r"(z), "r"(w)
-               : "memory");
-}
-
-SGL_DEVICE uint4 ld_relaxed_sys_v4(const uint8_t* address) {
-  uint4 v;
-  asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-               : "l"(address)
-               : "memory");
-  return v;
-}
-
 constexpr uint64_t kGenerationMask = (1ull << 56) - 1;
 
 // The copy wait's gate word for request `seq`: `low` is Wire::kLeaseGateClosed or Wire::kLeaseGateOpen.
 SGL_DEVICE uint32_t copy_gate_word(uint32_t seq, uint32_t low) {
-  return ((seq & Wire::kLeaseGateSeqMask) << Wire::kLeaseGateSeqShift) | low;
-}
-
-// Relaxed system-scope accessors. Every word the host or another kernel accesses concurrently goes through these or
-// the acquire/release forms above, so each call site states its ordering.
-//
-// A relaxed access is a volatile access: the PTX memory model treats ld/st.volatile as relaxed at system scope, and
-// nvcc emits LDG/STG.E.STRONG.SYS for it. cuda::atomic_ref is avoided: with CUDA 13.4's libcu++, an access through a
-// __grid_constant__ parameter gains a run-time local-pointer check with a byte-copy fallback, and adjacent relaxed
-// accesses are merged and reordered.
-template <typename T>
-SGL_DEVICE T ld_relaxed_sys(const T* word) {
-  return *reinterpret_cast<const volatile T*>(word);
-}
-
-template <typename T>
-SGL_DEVICE void st_relaxed_sys(T* word, std::type_identity_t<T> value) {
-  *reinterpret_cast<volatile T*>(word) = value;
-}
-
-// A wire field at a byte address (lease_layout.h offsets); T names the field's type.
-template <typename T>
-SGL_DEVICE T ld_relaxed_sys(const uint8_t* address) {
-  return ld_relaxed_sys(reinterpret_cast<const T*>(address));
-}
-
-template <typename T>
-SGL_DEVICE void st_relaxed_sys(uint8_t* address, std::type_identity_t<T> value) {
-  st_relaxed_sys<T>(reinterpret_cast<T*>(address), value);
+  return channel::gate_word(seq, low);
 }
 
 // The device's global timer in nanoseconds, the clock every deadline is measured on.
@@ -147,12 +86,11 @@ SGL_DEVICE bool listed(const int32_t* ids, int count, int32_t id) {
 // The generation G of the request the chain serves. kPending and kPendingEpoch change only at the next post,
 // stream-ordered after the chain's last kernel, so every kernel of the chain reads the same value.
 SGL_DEVICE uint64_t pending_generation(const int32_t* state) {
-  const uint32_t seq = static_cast<uint32_t>(state[kPending]);
-  return (static_cast<uint64_t>(static_cast<uint32_t>(state[kPendingEpoch])) << 32) | seq;
+  return channel::generation(static_cast<uint32_t>(state[kPending]), static_cast<uint32_t>(state[kPendingEpoch]));
 }
 
 SGL_DEVICE int64_t ring_index(uint32_t seq) {
-  return static_cast<int64_t>((seq - 1u) % Wire::kDemandRecords);
+  return channel::ring_index<TargetChannel>(seq);
 }
 
 // One request's typed lanes, as type_lanes produces them and the post writes them into its record (lease_layout.h
@@ -232,8 +170,7 @@ SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& 
     header_w[b / 4] |= static_cast<uint32_t>(f.protect_count) << (8 * (b % 4));
   }
   const uint32_t head = (static_cast<uint32_t>(f.row) & 0xFFFFu) | counts << 16 | (f.flags & 0xFFu) << 24;
-  st_relaxed_sys<uint32_t>(record + Wire::kRecSeq, 0u);
-  cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
+  channel::begin_record<TargetChannel>(record);
   st_relaxed_sys<uint32_t>(record + Wire::kRecRow, head);
   st_relaxed_sys_v2(
       record + Wire::kRecChain, static_cast<uint32_t>(f.chain & 0xFFFFFFFFull), static_cast<uint32_t>(f.chain >> 32));
@@ -253,7 +190,7 @@ SGL_DEVICE void write_record(uint8_t* record, uint32_t seq, const RecordFields& 
   for (int w = 0; w < L; w += 4)
     st_relaxed_sys_v4(
         record + Wire::kRecLaneWeight + 4 * w, weight_w[w], weight_w[w + 1], weight_w[w + 2], weight_w[w + 3]);
-  st_release_sys(record + Wire::kRecSeq, seq);
+  channel::end_record<TargetChannel>(record, seq);
 }
 
 // One row of the device's map bank (ExpertStreamDevice.map_bank), in device memory: the device's copy of the row's

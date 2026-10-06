@@ -10,6 +10,66 @@ Paths are relative to `python/sglang/kernels/jit/csrc/moe/expert_stream/` unless
 constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/expert_stream_transport.py` and
 `expert_lease_block.py`; `test_exl3_ram_miss_device_args` checks the mirrors.
 
+## The lease channel
+
+The device-to-host handoff every expert-stream client uses, as one template (`LeaseChannel<Spec>`):
+`lease_channel_layout.h` (the spec and the gate word), `lease_channel.cuh` (the device half), `host/lease_channel.h`
+(the host half) and `stream_wait.h` (the wait node). A client is a `ChannelSpec<Head, Ring, Records, RecordBytes, Done,
+Gate>`: where its head word, record ring, done words and gate sit. The record's payload, what the host does with it,
+and the client's data areas are its own; only the protocol is shared. The target is the first client
+(`TargetChannel` in `lease_layout.h`, over the request page and the completion block below).
+
+- **Page and lease.** Two pinned host areas. The page is device-written and host-read: the head word (u32, the last
+  posted seq, stored with a release) and a ring of `Records` records. The lease is host-written and device-read: the
+  done words and the gate.
+- **The seqlock.** A record's first word is its seq. The device stores 0 there, fences (release), writes the payload,
+  then stores the seq last with a release (`begin_record`, `end_record`). The host copies the record once between two
+  acquire loads of the seq word and keeps it only if both read the seq it expects (`read_seqlocked`). The head is
+  published after the record (`publish_head`).
+- **G.** `advance` gives the next seq, never 0; a wrap of the 32-bit seq bumps the epoch. G = epoch << 32 | seq never
+  repeats.
+- **done[].** One u64 per ring record, at `Done + 8 * ((seq - 1) % Records)`. The host stores G there with a release
+  once the record's work is complete (`complete`).
+- **The gate.** Its word is `(seq & 0x1FFFFFFF) << 2 | 1`, with bit 31 set while closed (`gate_word`). It starts
+  open(0), so a wait that armed nothing passes.
+- **The Dekker pair.** Two sides race to open the gate:
+  - device (`close_gate`): store closed(G) relaxed, `fence.sc.sys` (`__threadfence_system`), then load done[G] with
+    acquire. If it reads G, it opens the gate itself.
+  - host (`complete`): store done[G] = G with release, `seq_cst` fence, load the gate. If it reads closed(G), it CASes
+    closed(G) to open(G).
+
+  Each side's store precedes its load behind a full fence, so at least one side sees the other's store. Both write the
+  same word, so a double open is harmless. A stale completion for G that meets closed(G + k) fails its CAS.
+- **The wait node.** `enqueue_gate_wait` queues `cuStreamWaitValue32_v2` GEQ open on the gate, a cyclic compare on the
+  bit-31 encoding; under capture it is a memory-op node of the graph.
+- **The commit trap.** After the wait, the gate is only the wake-up; done[G] == G is the commit. `commit_or_trap`
+  loads it with acquire, which orders the host's results before every later device read of them, and traps otherwise.
+  Only a teardown opens a gate without done[G] (`open_closed_gate`), and the process is ending then.
+
+### The second client: the DSpark draft
+
+The draft's CPU experts (`draft_channel.h`, `host/draft_cpu_thread.h`) run on the same channel, so a draft MoE layer's
+call sits inside the draft's decode graph as one post, one gate wait and one commit.
+
+- **Spec.** `DraftChannel = ChannelSpec<Head 0, Ring 128, Records 4, RecordBytes 128, Done 640, Gate 768>`, in one
+  4096-byte pinned buffer (`kChannelBytes`) that holds the page and the completion block together. The target keeps
+  them in two areas.
+- **Record.** seq u32 @0 (the seqlock word), stage u16 @4, rows u8 @6, k u8 @7, epoch u32 @8; the other bytes of the
+  128-byte slot are unused. It names the CPU share of one call. The inputs and outputs are not in it: they are the
+  draft's own pinned areas (`DraftCpuAreas`), `[stages, kMaxRows = 16, ...]` each, indexed by the stage.
+- **One record per wait.** The draft posts at most one record before its finish waits on the gate, so the ring never
+  laps. The host takes a head that is more than one past the record it expects (a lap), and a record whose seq word
+  does not match (torn), as protocol failures and fail-stops.
+- **Completer.** `DraftCpuThread`, the OpenMP master of the draft's team. It reads the record, runs the stage's M-row
+  forward over the staged x and routes, and calls `channel::complete` (done[G], then the Dekker open of the gate).
+- **Idle.** After a job the thread holds its team in the CPU kernel's `keep_warm`, which watches the channel's head
+  word. The GPU's release store of the next head ends the hold, with no syscall. Past the warm window and
+  `spin_ns` the team is released and the thread polls the head (spinning, then 50 us sleeps), because the GPU cannot
+  ring a futex.
+- **Failure.** A watchdog checks every 20 ms and fail-stops a record that stays incomplete for `fatal_wait_ns`.
+  `stop()` joins both threads and then opens a gate still held closed (`open_closed_gate`), as at the target's teardown.
+- **Not shared.** The two clients share the protocol only: separate buffers, areas and threads.
+
 ## Parties
 
 - **Device.** One linear chain per layer, in one stream, capturable in a graph
@@ -20,15 +80,19 @@ constants are in `lease_layout.h`, mirrored by `python/sglang/kernels/ops/moe/ex
   `dst_rows` (set at attach by `set_row_copy`, copy engine on) and `cpu_ok` (set when the layer registers with the
   CPU expert service, `set_row_cpu`).
 - **Service thread** (`host/ram_tier.h`, `host/ram_thread.h`). The tier's single owner. It handles records in
-  sequence, chooses victims, publishes deltas and reads misses. It never sleeps between polls: it spins with PAUSE,
-  or, with `SGLANG_DSV41_RAM_MISS_SPIN_CORE` (busy_poll), with no PAUSE on that core; `start_thread` refuses busy_poll
-  unless no SMT sibling of the core is in the server's affinity or among the CPU experts' cores.
+  sequence, chooses victims, publishes deltas and reads misses. Idle, it spins with PAUSE, or, with
+  `SGLANG_DSV41_RAM_MISS_SPIN_CORE` (busy_poll), with no PAUSE on that core, for `SGLANG_DSV41_RAM_MISS_IDLE_SPIN_US`
+  (default 5 ms), then sleeps 50 us between polls (20 us between checks while parked); -1 never sleeps.
+  `start_thread` refuses busy_poll unless no SMT sibling of the core is in the server's affinity or among the CPU
+  experts' cores.
 - **Copy thread** (`host/copy_engine.h`). Copies a record's copy-engine hits with `cuMemcpyAsync`, runs its CPU jobs
-  through the CPU expert thread, and publishes CopyDone. It never sleeps: it spins with PAUSE on a core of its own
-  (`ThreadingConfig.copy_cpus`).
-- **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row. It never sleeps:
-  between jobs it holds its OpenMP team in the kernel's keep-warm (register work for
-  `SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US`, then PAUSE) until the next submit.
+  through the CPU expert thread, and publishes CopyDone. Idle, it spins with PAUSE on a core of its own
+  (`ThreadingConfig.copy_cpus`) for `SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US` (default 5 ms), then sleeps on a futex
+  doorbell that every submit and `stop()` ring (a syscall only while it sleeps); -1 never sleeps.
+- **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row. Between jobs it
+  holds its OpenMP team in the kernel's keep-warm (register work for `SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US`, then
+  PAUSE) until the next submit or, `SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US` (default 100 ms) after the warm window,
+  releases the team and sleeps on its futex doorbell until the next submit; -1 never releases it.
 - **Watchdog** (`host/ram_thread.h`, `watch`). Samples every 20 ms; aborts on a busy episode held past `fatal_wait` or
   a gate held closed past the copy-wait timeout.
 
@@ -63,7 +127,8 @@ Lane kinds: `HIT_COPY`=1 (the copy thread's DMA; CopyDone), `HIT_SM`=2 (C1; stre
 RAM slot; CopyDone), `MISS_GPU`=4 (NVMe into staging, then S; PieceMask), `MISS_CPU`=5 (NVMe into staging, then the
 CPU; CopyDone).
 
-**Completion block** (20480 B, `kLeaseBlockBytes`, 4096-aligned), then the delta block:
+**Completion block** (20480 B, `kLeaseBlockBytes`, 4096-aligned), then the delta block. `CopyDone` and the gate are
+the target's lease channel (["The lease channel"](#the-lease-channel)):
 
 | Offset | Area | Writer |
 |---|---|---|
@@ -210,19 +275,8 @@ with `CUDA_MODULE_LOADING=EAGER` and a module-load guard; the host then writes `
 while a copy wait holds the stream can stall the copy thread's driver calls until the watchdog aborts. Only a captured
 post can type copy or CPU lanes, so an eager forward is always served by C1 and S.
 
-**The gate.** Its word is `(seq & 0x1FFFFFFF) << 2 | 1`, with bit 31 set while closed. It starts open(0), so a copy
-wait that armed nothing passes. The stream waits with `cuStreamWaitValue32` GEQ open, a cyclic compare on the bit-31
-encoding.
-
-**The Dekker pair.** Two sides race to open the gate:
-
-- CW: store closed(G) relaxed, `fence.sc.sys` (`__threadfence_system`), then load CopyDone with acquire. If it reads
-  G, it opens the gate itself.
-- Copy thread (`copy_completed`): store CopyDone = G with release, `seq_cst` fence, load the gate. If it reads
-  closed(G), it CASes closed(G) to open(G).
-
-Each side's store precedes its load behind a full fence, so at least one side sees the other's store. Both write the
-same word, so a double open is harmless. A stale copy thread for G that meets closed(G + k) fails its CAS.
+**The gate and the Dekker pair** are the lease channel's (["The lease channel"](#the-lease-channel)): CW is the
+device side (`close_gate`), and the copy thread's `copy_completed` is the host side (`complete`).
 
 **CC and the CPU parts.** The gate is only the wake-up; `CopyDone == G` is the commit. The CPU partial sums reach the
 fused MoE through the CPU thread's done word, the copy thread, the CopyDone release and CC's acquire.

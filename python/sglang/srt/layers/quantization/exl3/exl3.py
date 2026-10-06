@@ -108,10 +108,17 @@ class Exl3Config(QuantizationConfig):
             return Exl3LinearMethod(self)
         if isinstance(layer, FusedMoE):
             from sglang.srt.models.deepseek_v4_exl3_weights import (
+                is_dspark_draft_expert_module,
                 is_streamed_expert_module,
             )
 
-            return Exl3MoEMethod(self, streamed=is_streamed_expert_module(prefix))
+            draft = is_dspark_draft_expert_module(prefix)
+            return Exl3MoEMethod(
+                self,
+                streamed=is_streamed_expert_module(prefix),
+                draft=draft,
+                cpu_draft=envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get() and draft,
+            )
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -339,10 +346,42 @@ class Exl3RowViews:
 EXL3_ROW_VIEWS = Exl3RowViews()
 
 
+_DRAFT_ROUTES_LOCK = threading.Lock()
+
+
+def record_draft_routes(layer_id: int, topk_ids: torch.Tensor) -> None:
+    """Append one draft MoE call's topk ids to ``SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH`` as a JSON line (the probe
+    ``draft_resident.top_n_resident_set`` calibrates from); a no-op when the path is unset."""
+    path = envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.get()
+    if not path:
+        return
+    import json
+
+    line = json.dumps({"layer": int(layer_id), "ids": topk_ids.tolist()})
+    with _DRAFT_ROUTES_LOCK, open(path, "a") as f:
+        f.write(line + "\n")
+
+
+def _capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def check_draft_coverage(layer_id: int, on_cpu: torch.Tensor, gpu: frozenset, *, n_routed: int) -> None:
+    """Refuses a DSpark draft stage with a routed expert neither on the GPU nor on the CPU: its routes would add
+    nothing, silently."""
+    holes = [e for e in range(n_routed) if e not in gpu and not bool(on_cpu[e])]
+    if holes:
+        raise ValueError(f"exl3: DSpark draft stage {layer_id}'s experts {holes} are neither resident nor on the CPU")
+
+
 class Exl3MoEMethod(FusedMoEMethodBase):
-    def __init__(self, config: Exl3Config, *, streamed: bool):
+    def __init__(self, config: Exl3Config, *, streamed: bool, draft: bool = False, cpu_draft: bool = False):
         self.config = config
         self.streamed = streamed
+        # A DSpark draft stage: its GPU experts run through DraftResidentMoe (draft_moe.py), graph-safe.
+        self.draft = draft or cpu_draft
+        # A DSpark draft stage whose non-resident experts run on the CPU (cpu_experts/draft.py).
+        self.cpu_draft = cpu_draft
         self.moe_runner_config = None
         self.cast_fusion = envs.SGLANG_DSV41_ENABLE_EXL3_CAST_FUSION.get()
         self.route_plan = envs.SGLANG_DSV41_ENABLE_PREFILL_ROUTE_PLAN.get()
@@ -389,11 +428,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             "_map_global_expert_id_to_local_expert_id",
             lambda expert_id: expert_id,
         )
+        device = "cpu" if self.cpu_draft else None
         for prefix in ("w13", "w2"):
             for name in EXL3_PARAMS:
                 param = nn.Parameter(
-                    torch.empty(0, dtype=torch.int8), requires_grad=False
+                    torch.empty(0, dtype=torch.int8, device=device), requires_grad=False
                 )
+                if self.cpu_draft:
+                    # The loader stages CPU parameters onto the GPU around post-load; the views and CPU kernel
+                    # slabs taken there would keep a GPU copy of every draft expert alive.
+                    param._sglang_skip_device_loading = True
                 set_weight_attrs(
                     param,
                     {
@@ -460,6 +504,65 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     f"exl3: expert {e} w2[0] loaded {t2.in_features}x{t2.out_features}, "
                     f"module expects {layer.exl3_inter}x{layer.exl3_hidden}"
                 )
+        if self.cpu_draft:
+            self._attach_cpu_draft(layer)
+        elif self.draft:
+            from sglang.srt.layers.quantization.exl3.draft_moe import DraftResidentMoe
+
+            # Every expert resident, on the parameters' own device: the slab is the parameters, not a copy.
+            n = layer.exl3_num_experts
+            layer.exl3_draft_moe = DraftResidentMoe(layer, range(n), n, layer.w13_trellis.device)
+
+    def _attach_cpu_draft(self, layer: nn.Module) -> None:
+        """Copy the resident set and fused shared experts to the GPU (DraftResidentMoe); register every slab with the CPU
+        runtime.
+
+        The parameters are the pinned tier's slab layout ([expert, part, ...]), so they register as they are.
+        """
+        from sglang.srt.layers.moe.cpu_experts import draft
+        from sglang.srt.layers.moe.cpu_experts.draft_resident import resident_for
+        from sglang.srt.layers.quantization.exl3.draft_moe import DraftResidentMoe
+
+        n_routed = layer.exl3_num_experts - getattr(layer, "num_fused_shared_experts", 0)
+        resident = resident_for(layer.layer_id)
+        outside = sorted(e for e in resident if e >= n_routed)
+        if outside:
+            raise ValueError(
+                f"exl3: DSpark draft stage {layer.layer_id}'s resident set lists {outside}, "
+                f"outside its {n_routed} routed experts"
+            )
+        gpu = frozenset(resident) | frozenset(range(n_routed, layer.exl3_num_experts))
+        on_cpu = torch.ones(layer.exl3_num_experts, dtype=torch.bool)
+        on_cpu[sorted(gpu)] = False
+        check_draft_coverage(layer.layer_id, on_cpu, gpu, n_routed=n_routed)
+        slabs = {name: getattr(layer, name).data for name in EXL3_STREAMED_NAMES}
+        layer.exl3_cpu_draft_key = draft.DRAFT_CPU_EXPERTS.register(
+            slabs, on_cpu, layer.moe_runner_config.swiglu_limit, layer_id=layer.layer_id
+        )
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        layer.exl3_draft_moe = DraftResidentMoe(layer, sorted(gpu), layer.exl3_num_experts, device)
+
+    def _apply_draft(self, layer, x, topk_weights, topk_ids, swiglu_limit) -> torch.Tensor:
+        """The draft stage's routed experts, graph-safe: the CPU share posted first, the GPU share while it runs, then
+        the wait that adds it. `moe.tokens` per pass (at most DraftResidentMoe.TOKENS); a longer x (the prompt's
+        extend) loops on host shapes only."""
+        moe = layer.exl3_draft_moe
+        cpu = None
+        if self.cpu_draft:
+            from sglang.srt.layers.moe.cpu_experts import draft
+
+            cpu = draft.DRAFT_CPU_EXPERTS.runtime()
+        out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+        for lo in range(0, x.shape[0], moe.tokens):
+            hi = min(lo + moe.tokens, x.shape[0])
+            xs, ids, ws = x[lo:hi], topk_ids[lo:hi], topk_weights[lo:hi]
+            if cpu is not None:
+                cpu.post(layer.exl3_cpu_draft_key, xs, ids, ws)
+            part = moe.run(xs, ids, ws, swiglu_limit)
+            if cpu is not None:
+                cpu.finish(layer.exl3_cpu_draft_key, part)
+            out[lo:hi] = part
+        return out.to(x.dtype)
 
     def apply(self, layer: nn.Module, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -518,6 +621,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 cfg.swiglu_limit,
                 route_plan=self.route_plan,
             )
+        elif self.draft:
+            if envs.SGLANG_DSPARK_DEBUG_DRAFT_ROUTES_PATH.get() and not _capturing():
+                record_draft_routes(layer.layer_id, topk_ids)
+            out = self._apply_draft(layer, x, topk_weights, topk_ids, cfg.swiglu_limit)
         else:
             assert_not_capturing("Exl3MoEMethod.apply")
             out = exl3_moe_loop(

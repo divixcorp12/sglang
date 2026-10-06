@@ -180,6 +180,22 @@ def wire_probe(lanes: int, nodes: int) -> dict[str, int]:
     return {name: int(value) for name, value in (line.split("=") for line in text.split("\n"))}
 
 
+def channel_probe(lanes: int, nodes: int) -> dict[str, int]:
+    """Test only: the target's lease channel (lease_channel_layout.h, TargetChannelOf<LeaseLayout<lanes, nodes>>) and
+    the shared gate encoding, as the C++ compiler computes them."""
+    from sglang.kernels.jit.utils import load_jit
+
+    module = load_jit(
+        "expert_stream_lease_layout_probe",
+        cpp_files=["moe/expert_stream/lease_layout_probe.cpp"],
+        header_only=False,
+    )
+    text = str(module.expert_stream_lease_channel_probe(lanes, nodes))
+    if not text:
+        raise ValueError(f"the probe has no channel for LeaseLayout<{lanes}, {nodes}>")
+    return {name: int(value) for name, value in (line.split("=") for line in text.split("\n"))}
+
+
 GATE = {"closed": 0x80000001, "open": 1}
 GATE_SEQ_SHIFT = 2
 GATE_SEQ_MASK = 0x1FFFFFFF

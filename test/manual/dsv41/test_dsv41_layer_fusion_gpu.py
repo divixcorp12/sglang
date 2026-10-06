@@ -90,7 +90,7 @@ def _scenario(
         )  # out-of-range ranks exercise the clamp
     # Planner order (misses, then hits), padded with distinct experts no route names.
     unrouted = expert_perm[~torch.isin(expert_perm, flat)]
-    source_rows = torch.cat([flat[miss], flat[~miss], unrouted[: width - routes]])
+    source_rows = torch.cat([flat[miss], flat[~miss], unrouted[: max(0, width - routes)]])
     misses = int(miss.sum())
     miss_count = (
         misses
@@ -126,7 +126,7 @@ def _scenario(
     )
 
 
-def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int, cpu_lanes=None):
+def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int, cpu_lanes=None, routes=None):
     backend = (
         SimpleNamespace(
             name="exl3_ram_miss",
@@ -147,6 +147,7 @@ def _streamer(source_rows, miss_count, delivered, keep, leased: bool, width: int
             (width,), -7, dtype=torch.int32, device="cuda"
         ),
         row_backend=backend,
+        graph_gather_rows=routes or width,
     )
 
 
@@ -170,6 +171,9 @@ STATE = (
         (7, 5, 33, 15),
         (13, 13, 101, 29),
         (32, 32, 400, 64),
+        (8, 36, 256, 40),  # a 6-token verify at top-6 over an 8-lane shortlist
+        (16, 64, 400, 64),
+        (32, 64, 400, 64),
     ],
 )
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
@@ -188,10 +192,10 @@ def test_gather_and_commit_match_the_torch_chain(
         )
         flat, remap = flat.to(id_dtype), remap.to(remap_dtype)
         ref_streamer = _streamer(
-            source_rows, miss_count, delivered, keep, leased, width
+            source_rows, miss_count, delivered, keep, leased, width, routes=routes
         )
         fused_streamer = _streamer(
-            source_rows, miss_count, delivered, keep, leased, width
+            source_rows, miss_count, delivered, keep, leased, width, routes=routes
         )
         ref = _updater(width, experts, capacity, False, state, ref_streamer)
         fused = _updater(width, experts, capacity, True, state, fused_streamer)
@@ -310,7 +314,7 @@ def test_captured_gather_and_commit_replay_new_inputs():
         streamer.row_backend.keep.fill_(keep)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(fused.fused_remaps[torch.int32][0].long(), want.long()), (
+        assert torch.equal(fused.fused_remaps[torch.int32][0, :routes].long(), want.long()), (
             f"trial {trial}: remap"
         )
         for name in STATE:
@@ -376,6 +380,60 @@ def test_route_tables_match_the_torch_chain(
             f"trial {trial}: weight_sorted"
         )
         assert torch.equal(det, det_ref), f"trial {trial}: det"
+
+
+@pytest.mark.parametrize(
+    "tokens,top_k,slots,hidden",
+    [(1, 6, 12, 256), (2, 6, 12, 256), (6, 6, 40, 4096), (8, 8, 70, 1024), (3, 5, 16, 1025)],
+)
+@pytest.mark.parametrize("remap_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("x_dtype", [torch.bfloat16, torch.float32])
+def test_route_tables_match_the_torch_chain_for_several_tokens(tokens, top_k, slots, hidden, remap_dtype, x_dtype):
+    """Each token routes top_k distinct slots; tokens share slots. Stable ranks make kernel and chain agree bit for
+    bit, token_sorted included."""
+    from sglang.kernels.ops.moe.exl3_route_tables import exl3_moe_route_tables
+    from sglang.srt.layers.quantization.exl3.fused_moe import route_tables
+
+    gen = torch.Generator().manual_seed(tokens * 131 + top_k * 7 + slots)
+    dev = "cuda"
+    routes = tokens * top_k
+    for trial in range(10):
+        remap = torch.cat([torch.randperm(slots, generator=gen)[:top_k] for _ in range(tokens)]).to(dev, remap_dtype)
+        weights = (torch.rand(routes, generator=gen) * 3).to(dev, torch.bfloat16)
+        keep = torch.tensor([[1.0, 0.0, 0.75][trial % 3]], device=dev)
+        x = (torch.randn(tokens, hidden, generator=gen) * 40).to(dev, x_dtype)
+
+        count_ref = torch.full((slots + 1,), 99, dtype=torch.int64, device=dev)
+        ts_ref = torch.full((routes,), -3, dtype=torch.int64, device=dev)
+        inv_ref, ws_ref, det_ref = route_tables(
+            remap.long(),
+            count_ref,
+            torch.ones(routes, dtype=torch.int64, device=dev),
+            weights,
+            keep,
+            token_sorted=ts_ref,
+            top_k=top_k,
+        )
+        x16_ref = torch.empty(tokens, hidden, dtype=torch.float16, device=dev).copy_(x)
+
+        remap64 = torch.full((routes,), -3, dtype=torch.int64, device=dev)
+        x16 = torch.full((tokens, hidden), 7.0, dtype=torch.float16, device=dev)
+        out = torch.full((tokens, hidden), 5.0, dtype=torch.float32, device=dev)
+        count = torch.full((slots + 1,), 99, dtype=torch.int64, device=dev)
+        inv = torch.full((routes,), -3, dtype=torch.int64, device=dev)
+        ws = torch.full((routes,), 9.0, dtype=torch.float16, device=dev)
+        det = torch.full((3, slots + 1), -3, dtype=torch.int64, device=dev)
+        ts = torch.full((routes,), -3, dtype=torch.int64, device=dev)
+        exl3_moe_route_tables(remap, weights, keep, x, remap64, x16, out, count, inv, ws, det, token_sorted_out=ts)
+
+        assert torch.equal(remap64, remap.long())
+        assert torch.equal(x16.view(torch.int16), x16_ref.view(torch.int16)), f"trial {trial}: x16"
+        assert torch.equal(out, torch.zeros_like(out))
+        assert torch.equal(count, count_ref), f"trial {trial}: expert_count"
+        assert torch.equal(inv, inv_ref), f"trial {trial}: inv_order"
+        assert torch.equal(ws.view(torch.int16), ws_ref.view(torch.int16)), f"trial {trial}: weight_sorted"
+        assert torch.equal(det, det_ref), f"trial {trial}: det"
+        assert torch.equal(ts, ts_ref), f"trial {trial}: token_sorted"
 
 
 @pytest.mark.parametrize("parts", [0b01, 0b10, 0b11, 0b0101, 0b1111, 0b1010])
