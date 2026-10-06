@@ -480,7 +480,8 @@ def test_36_forced_cpu_misses_on_one_node_are_read_into_ram_victims(tmp_path):
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 
     row, lanes, experts = 0, 40, list(range(36))
-    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=48)
+    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=48,
+              experts=40)  # the rig's default 16 experts would leave 36 routes past the slot map
     try:
         x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
