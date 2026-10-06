@@ -1,4 +1,3 @@
-```python
 """One CPU expert team per node (plan 2026-10-06 Task 11): node 0's engine serves the target's lease records and the
 DSpark draft channel on one thread, one job at a time, on the instr build's fake kernel (CPU)."""
 
