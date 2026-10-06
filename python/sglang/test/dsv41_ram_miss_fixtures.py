@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import pathlib
 import shutil
@@ -286,7 +287,9 @@ def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, spin_u
     split[1] = 1  # one eligible hit lane: the CPU's
     host.enable_cpu_experts(kernel, split, cores, x_rows, out_rows, threads=threads, spin_us=spin_us,
                             keep_warm_us=keep_warm_us)
-    host.set_cpu_layer(row, fake_cpu_layer(8))
+    # The target's layer holds fewer slots than a draft stage's (>= 1 << 20), which the fake kernel records per call: a test
+    # tells a target forward from a draft one by it.
+    host.set_cpu_layer(row, dataclasses.replace(fake_cpu_layer(8), capacity=1024))
     draft = host.draft_source(areas, fatal_wait_s=fatal_wait_s, group=0)
     draft.expert_host, draft.sim, draft.keep = host, ChainSim(host, page, s.slabs), (s, dst, x_rows, out_rows)
     return draft
