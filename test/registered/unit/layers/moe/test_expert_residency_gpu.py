@@ -228,7 +228,10 @@ def _gather_harness(manager, tokens=1):
         for layer, streamer in enumerate(streamers):
             compact, tensors = streamer.gather(static[layer])
             for name, output in outputs[layer].items():
-                output.copy_(tensors[name][compact.reshape(-1).long()])
+                # Spill remaps a victimless route to slot_dump, past every slot row (the fused MoE skips such a route);
+                # clamping keeps this stand-in's read in range, and its row is not checked.
+                rows = compact.reshape(-1).long().clamp(max=tensors[name].shape[0] - 1)
+                output.copy_(tensors[name][rows])
 
     return static, outputs, forward
 
