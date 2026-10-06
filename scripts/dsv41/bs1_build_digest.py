@@ -84,16 +84,18 @@ def _text(so: str) -> str:
 
 
 def _cpu_kernel() -> dict[str, str]:
-    """The optimized EXL3 CPU kernel library's one-word keep-warm and forward entry points: objdump per function,
-    addresses and raw bytes stripped, operand addresses reduced to the symbols they name. Needs SGLANG_EXL3_SRC and a
-    GCC 15 (SGLANG_EXL3_CPU_CXX); builds the optimized kernel (SGLANG_DSV41_CPU_EXPERTS=1, set here)."""
+    """The optimized EXL3 CPU kernel library's one-word keep-warm loops and forward entry point: objdump per function,
+    addresses, raw bytes and rip-relative displacements stripped, operand addresses reduced to the symbols they
+    name. Needs SGLANG_EXL3_SRC and a GCC 15 (SGLANG_EXL3_CPU_CXX); builds the optimized kernel (SGLANG_DSV41_CPU_EXPERTS=1, set here)."""
     from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
     os.environ["SGLANG_DSV41_CPU_EXPERTS"] = "1"  # the optimized build; the BS1 suites above ran without it
     so = exl3_ext().__file__
     text = subprocess.run(["objdump", "-d", "-C", "--no-show-raw-insn", so], capture_output=True, text=True,
                           check=True).stdout
-    keep = re.compile(r"keep_warm_detail::(bw|avx2|scalar)\(|keep_warm<|ExpertForward<.*>::(keep_warm|forward)\(")
+    # The ExpertForward::keep_warm wrapper is left out: it only resolves the tier and calls keep_warm<>, and where GCC puts
+    # that resolution (inline or a call to isa()) moves when keep_warm_either is added next to it. The loops are pinned.
+    keep = re.compile(r"keep_warm_detail::(bw|avx2|scalar)\(|keep_warm<|ExpertForward<.*>::forward\(")
     digests, name, lines = {}, None, []
     for line in text.splitlines() + [""]:
         header = re.match(r"^[0-9a-f]+ <(.+)>:$", line)
@@ -104,7 +106,10 @@ def _cpu_kernel() -> dict[str, str]:
             continue
         if name is not None:
             body = re.sub(r"^\s*[0-9a-f]+:\s*", "", line)
-            body = re.sub(r"\b[0-9a-f]{5,}\b", "", body)  # absolute addresses; the <symbol> after each stays
+            body = re.sub(r"\b[0-9a-f]{5,}\b", "", body)
+            body = re.sub(r"\b[0-9a-f]+(?= <)", "", body)  # absolute addresses; the <symbol> after each stays
+            body = re.sub(r"-?0x[0-9a-f]+\(%rip\)", "(%rip)", body)  # displacements move with the library's layout
+            body = re.sub(r"<(_fini|_DYNAMIC|_init)\+0x[0-9a-f]+>", r"<\1>", body)  # unnamed data: layout, not code
             lines.append(body.strip())
     return digests
 
