@@ -142,6 +142,19 @@ HEALTH_TIMEOUT_S = 900  # /health runs a real generation; slow cold. Never short
 PROD_PORT = 7867
 PROD_HOST = "0.0.0.0"
 
+# DSpark with both CPU-expert clients (plan 2026-10-06-dsv41-dspark-both-cpu-experts). Production serves it only once
+# PROD_DSPARK is True (Owner decision 1, the A/B of that plan's Task 17).
+PROD_DSPARK = False
+DSPARK_DRAFT = f"{CC}/dsv41-dspark-draft"
+# Each stage's top-32 draft experts stay on the GPU, the other 96 on the CPU (§33.4).
+DSPARK_RESIDENT = f"{CC}/analysis/dsv41-dspark/cpu-draft-routes/resident-top32.json"
+# gamma = 5 draft tokens, a 6-token verify (speculative_hook.py).
+DSPARK_ARGV = (
+    "--speculative-algorithm", "DSPARK",
+    "--speculative-draft-model-path", DSPARK_DRAFT,
+    "--speculative-dspark-block-size", "5",
+)
+
 
 def base_env() -> dict[str, str]:
     """The option-C EXL3 recipe env, before a V2 storage-change override is applied."""
@@ -247,6 +260,34 @@ def arm_env(overrides: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def dspark_env() -> dict[str, str]:
+    """The DSpark mode's overrides on base_env: the graphed verify with the target's CPU experts and spill, and the
+    draft's CPU experts. Every value's reason is in the plan's Task 15 table."""
+    return {
+        # The verify in the breakable decode graph with a lane per route (MISS_LANES unset: 36 lanes, a 40-lane wire),
+        # the first 8 VRAM victims; the rest are CPU lanes, a miss among them read into a RAM victim (Owner decision 3).
+        "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": "8",
+        "SGLANG_RAGGED_VERIFY_MODE": "static",
+        # Layer-major prefill refuses speculative decoding (layer_major/gate.py).
+        "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "0",
+        # The draft's CPU experts as a second job source of node 0's CPU expert team (one team per node), on the
+        # optimized build (its gate names both defines).
+        "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": "1",
+        "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": DSPARK_RESIDENT,
+        "SGLANG_EXL3_CPU_ACT_RESIDUAL": "1",
+        "SGLANG_EXL3_CPU_ACT_BLOCK": "128",
+        # 4040 MiB of the hot cache go to the draft's resident experts, dense weights and KV (Owner decision 4).
+        "SGLANG_MOE_HOT_GPU_MB": "12040",
+        # Every DSpark text result so far ran triton attention (§33.2, §33.8, §33.9).
+        "SGLANG_SM120_FLASHMLA_BACKEND": "triton",
+    }
+
+
+def prod_env() -> dict[str, str]:
+    """Production's env: the base recipe, with the DSpark mode once PROD_DSPARK is set."""
+    return arm_env(dspark_env()) if PROD_DSPARK else base_env()
+
+
 class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     port: int
     host: str = "127.0.0.1"
@@ -256,10 +297,12 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
     # engine-side step-latency source, with an unmeasured observer-effect risk at
     # interval=1 that this override exists to measure, not to assume.
     decode_log_interval: int | None = None
+    # the DSpark mode's argv (DSPARK_ARGV); its env is dspark_env()
+    dspark: bool = False
 
     @classmethod
     def prod(cls) -> "ServerArgs":
-        return cls(port=PROD_PORT, host=PROD_HOST)
+        return cls(port=PROD_PORT, host=PROD_HOST, dspark=PROD_DSPARK)
 
     def argv(self, *, python: str = PYTHON) -> list[str]:
         """The smoke-validated launch, updated to production's context and cache mode."""
@@ -320,4 +363,6 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
         ]
         if self.decode_log_interval is not None:
             argv += ["--decode-log-interval", str(self.decode_log_interval)]
+        if self.dspark:
+            argv += list(DSPARK_ARGV)
         return argv
