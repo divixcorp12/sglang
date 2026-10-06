@@ -2668,11 +2668,14 @@ class ExpertStreamDevice:
             if not captured:
                 raise ValueError("only a captured post stages the CPU experts' input")
             cpu_x, cpu_weights = cpu_input
+            tokens = cpu_x.shape[0] if cpu_x.dim() == 2 else 1
+            if tokens > self.cpu_tokens_max:
+                raise ValueError(f"a {tokens}-token input does not fit rows of {self.cpu_tokens_max} tokens")
             if cpu_x.shape[-1] * 2 > self.cpu_x_rows.shape[1]:
                 raise ValueError(
                     f"a {cpu_x.shape[-1]}-wide input does not fit the {self.cpu_x_rows.shape[1]}-byte row"
                 )
-            cpu_x, cpu_weights = cpu_x.reshape(1, -1), cpu_weights.reshape(-1)
+            cpu_x, cpu_weights = cpu_x.reshape(tokens, -1), cpu_weights.reshape(-1)
             cpu_x_dst = int(self.cpu_x_rows[row].data_ptr())
         spill_on, (overflow_flag, gather_overflow) = 0, self._no_spill
         if spill is not None:
@@ -2686,6 +2689,7 @@ class ExpertStreamDevice:
             spill_on = 1
         bank = self.map_bank
         cpu_on = self.cpu_x_rows is not None
+        token_bytes = self.cpu_x_token_bytes or -(-2 * int(cpu_x.shape[-1]) // 16) * 16
         self._kernels().expert_stream_post(
             self.page,
             self.state,
@@ -2722,6 +2726,8 @@ class ExpertStreamDevice:
             cpu_x,
             cpu_x_dst,
             cpu_weights,
+            self.cpu_tokens_max,
+            token_bytes,
             spill_on,
             overflow_flag,
             gather_overflow,
