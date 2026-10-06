@@ -47,6 +47,12 @@ def _overrides(arm: str, out: str) -> dict:
     return {**overrides, "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.metrics.jsonl")}
 
 
+def _probe_overrides(arm: str, out: str) -> dict:
+    """The arm's overrides for the probe server, with a metrics file of its own: the timed server's file is appended to
+    and summarize() reads its last record, which a second server would replace."""
+    return {**_overrides(arm, out), "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(out, f"{arm}.probe.metrics.jsonl")}
+
+
 def run_timed(arm: str, out: str) -> int:
     _, dspark = ARMS[arm]
     env = os.environ | {
@@ -75,7 +81,7 @@ def _healthy(port: int, deadline: float) -> bool:
 def run_probe(arm: str, out: str) -> int:
     """The arm's server on PROBE_PORT under cc-gpu.lock, for logprob_probe.py only."""
     _, dspark = ARMS[arm]
-    env = os.environ | arm_env.arm_env(_overrides(arm, out)) | {"PYTHONPATH": os.path.join(REPO, "python")}
+    env = os.environ | arm_env.arm_env(_probe_overrides(arm, out)) | {"PYTHONPATH": os.path.join(REPO, "python")}
     argv = arm_env.ServerArgs(port=PROBE_PORT, dspark=dspark).argv()
     with open(arm_env.GPU_LOCK, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
