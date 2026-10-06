@@ -289,7 +289,7 @@ class CpuExpertEngine {
     call.accumulate = job.accumulate;
     call.cores = config_.cores;
     if (job.per_token && config_.tokens > 1) {
-      call.rows = static_cast<int32_t>(expand_tokens(job, call.x));
+      call.rows = static_cast<int32_t>(expand_tokens(job, static_cast<const uint8_t*>(call.x)));
       call.slots = token_slots_.data();
       call.weights = token_weights_.data();
       // A token that routes none of the lanes must read 0, whatever an earlier record left: zero the rows here rather
