@@ -92,5 +92,11 @@ class CpuExpertKernel {
   // word or more workers than cores.
   virtual void keep_warm(std::span<const int> cores, int32_t threads, const uint32_t* word, uint32_t seen,
                          int64_t warm_until_ns, int64_t release_ns) const = 0;
+  // keep_warm watching two words: holds until *word_a != seen_a, *word_b != seen_b or CLOCK_MONOTONIC reaches
+  // release_ns. A CPU expert engine with a second job source (the DSpark draft channel) holds on its doorbell and the
+  // channel's head together; one without calls keep_warm, whose code this leaves as it was.
+  virtual void keep_warm_either(std::span<const int> cores, int32_t threads, const uint32_t* word_a, uint32_t seen_a,
+                                const uint32_t* word_b, uint32_t seen_b, int64_t warm_until_ns,
+                                int64_t release_ns) const = 0;
 };
 }  // namespace sglang::cpu_experts

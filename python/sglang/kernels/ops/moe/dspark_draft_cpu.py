@@ -4,7 +4,8 @@
 * ``DraftCpuAreas`` owns the channel buffer and the per-stage pinned areas the host thread reads and writes;
 * ``DraftCpuDevice`` queues the device half: ``post`` (stage the CPU share, publish a record) and ``finish`` (close the
   gate, the stream's wait, add the host's rows). Both are device-only, so a graph captures them;
-* ``DraftCpuHost`` runs the host half, the draft CPU thread (host/draft_cpu_thread.h), in the expert-stream host module.
+* ``DraftCpuHost`` runs the host half, the draft-only CPU expert engine (host/cpu_experts.h), in the expert-stream host module;
+* ``SharedDraftHost`` serves the channel from an ``ExpertStreamHost`` group's CPU expert engine instead (one team per node).
 
 The protocol is the lease channel's (LEASE_PROTOCOL.md, "The lease channel"); only the record and the areas are the
 draft's.
@@ -204,6 +205,47 @@ class DraftCpuHost:
             "collided_forward_ns": collided_forward_ns,
         }
 
+
+
+class SharedDraftHost:
+    """The draft channel served by an ExpertStreamHost group's CPU expert engine (one team per node, plan 2026-10-06
+    Task 11), with DraftCpuHost's interface so the registry and the tests drive either. The engine's team, idle and
+    watchdog are the host's; ``stop`` detaches the draft source (the engine stops with the host)."""
+
+    def __init__(self, host, areas: DraftCpuAreas, *, group: int, fatal_wait_s: float):
+        from sglang.kernels.ops.moe import expert_stream_transport as ops
+
+        self.host, self.areas, self.group = host, areas, int(group)
+        self._ops = ops
+        self._module = host._module
+        self._keep: dict[int, tuple] = {}
+        self._module.expert_stream_draft_open(
+            host.handle, self.group, areas.channel, areas.x, areas.slots, areas.weights, areas.out,
+            int(areas.hidden), int(areas.stages), int(fatal_wait_s * 1e9),
+        )
+        host._draft_keep = (areas, self)  # the engine reads the areas until the host stops
+
+    def set_layer(self, stage: int, kernel: int, spec) -> None:
+        slabs, params = self._ops._layer_tensors(spec)
+        self._module.expert_stream_draft_set_layer(
+            self.host.handle, self.group, int(stage), int(kernel), slabs, int(spec.capacity), int(spec.hidden),
+            int(spec.intermediate), int(spec.activation), float(spec.act_limit), params,
+        )
+        self._keep[int(stage)] = spec.keep
+
+    def start(self) -> None:
+        self._module.expert_stream_draft_start(self.host.handle, self.group)
+
+    def stop(self) -> None:
+        self._module.expert_stream_draft_stop(self.host.handle, self.group)
+
+    def stats(self) -> dict:
+        out = torch.zeros(7, dtype=torch.int64)
+        self._module.expert_stream_draft_stats(self.host.handle, self.group, out)
+        jobs, rows, forward_ns, holds, collided_jobs, shared_routes, collided_forward_ns = (int(v) for v in out.tolist())
+        return {"jobs": jobs, "rows": rows, "forward_ns": forward_ns, "keep_warm_calls": holds,
+                "collided_jobs": collided_jobs, "shared_routes": shared_routes,
+                "collided_forward_ns": collided_forward_ns}
 
 _LIVE: "weakref.WeakSet[DraftCpuHost]" = weakref.WeakSet()
 

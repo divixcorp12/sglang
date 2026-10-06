@@ -730,6 +730,34 @@ class RamTier {
     return cpu_kernel_;
   }
 
+  // The DSpark draft channel on group g's CPU expert engine (CpuExpertEngine::attach_draft): draft_open makes the
+  // source, draft_set_layer fills a stage's layer, draft_start attaches it, draft_stop detaches it.
+  void draft_open(int g, std::unique_ptr<DraftSource> source, int64_t fatal_wait_ns) {
+    draft_cpu(g);
+    pending_draft_[g] = std::move(source);
+    draft_fatal_ns_[g] = fatal_wait_ns;
+  }
+  void draft_set_layer(int g, int stage, const cpu_experts::ExpertLayer& layer) {
+    DraftSource* d = pending_draft_[g].get();
+    if (d == nullptr) throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "draft_open first");
+    if (stage < 0 || stage >= static_cast<int>(d->layers.size()))
+      throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "stage " + std::to_string(stage) + " is out of range");
+    d->layers[stage] = layer;
+  }
+  void draft_start(int g) {
+    if (pending_draft_[g] == nullptr) throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "draft_open first");
+    for (size_t s = 0; s < pending_draft_[g]->layers.size(); ++s)
+      if (pending_draft_[g]->layers[s].kernel == nullptr)
+        throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "stage " + std::to_string(s) + " has no layer");
+    draft_cpu(g).attach_draft(std::move(pending_draft_[g]), draft_fatal_ns_[g]);
+  }
+  void draft_stop(int g) {
+    draft_cpu(g).detach_draft();
+  }
+  CpuExpertEngine::DraftStats draft_stats(int g) {
+    return draft_cpu(g).draft_stats();
+  }
+
   void check_cpu_layer_row(int64_t row) const {
     if (row < 0 || row >= layers_)
       throw std::runtime_error(error_prefix<Layout>() + "CPU expert layer for row " + std::to_string(row) + " of " +
@@ -1994,6 +2022,14 @@ class RamTier {
   int64_t experts_;
   // Every row's CPU expert layer, shared by every group's engine; declared before dist_, so destroyed after the engines.
   std::unique_ptr<CpuExpertLayers> cpu_layers_;
+  CpuExpertEngine& draft_cpu(int g) {
+    if (g < 0 || g >= groups() || dist_.group(g).cpu == nullptr)
+      throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "group " + std::to_string(g) +
+                               " has no CPU expert engine (SGLANG_DSV41_CPU_EXPERTS)");
+    return *dist_.group(g).cpu;
+  }
+  std::array<std::unique_ptr<DraftSource>, Wire::kNodes> pending_draft_;
+  std::array<int64_t, Wire::kNodes> draft_fatal_ns_{};
   const cpu_experts::CpuExpertKernel* cpu_kernel_ = nullptr;  // every group's engine runs this one kernel
   // The NUMA groups: each one's reader, serve state and CPU experts (when enabled, group 0's, after the copy engine and
   // before the service threads; stopped after the copy thread). Declared before tiers_: the groups' ranges are checked

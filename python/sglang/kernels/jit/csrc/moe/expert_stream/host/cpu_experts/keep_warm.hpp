@@ -67,6 +67,55 @@ inline int32_t scalar(const uint32_t* word, uint32_t seen, int64_t deadline_ns)
     return 0;
 }
 
+inline bool done_either(const uint32_t* a, uint32_t seen_a, const uint32_t* b, uint32_t seen_b, int64_t deadline_ns,
+                        uint32_t tick)
+{
+    if (__atomic_load_n(a, __ATOMIC_ACQUIRE) != seen_a || __atomic_load_n(b, __ATOMIC_ACQUIRE) != seen_b) return true;
+    return (tick & 63) == 0
+           && std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                      .count()
+                  >= deadline_ns;
+}
+
+SGLANG_TARGET_BW __attribute__((noinline)) inline int32_t bw_either(const uint32_t* a, uint32_t seen_a, const uint32_t* b,
+                                                                     uint32_t seen_b, int64_t deadline_ns)
+{
+    __m512i x = _mm512_set1_epi16(3), y = _mm512_set1_epi16(5), c0 = _mm512_setzero_si512(), c1 = c0, c2 = c0, c3 = c0;
+    for (uint32_t tick = 0; !done_either(a, seen_a, b, seen_b, deadline_ns, tick); ++tick)
+        for (int i = 0; i < 16; ++i) {
+            c0 = _mm512_add_epi32(c0, _mm512_madd_epi16(x, y));
+            c1 = _mm512_add_epi32(c1, _mm512_madd_epi16(y, x));
+            c2 = _mm512_add_epi32(c2, _mm512_madd_epi16(x, x));
+            c3 = _mm512_add_epi32(c3, _mm512_madd_epi16(y, y));
+            x = _mm512_xor_si512(x, c3);
+        }
+    return _mm512_reduce_add_epi32(_mm512_add_epi32(_mm512_add_epi32(c0, c1), _mm512_add_epi32(c2, x)));
+}
+
+SGLANG_TARGET_AVX2 __attribute__((noinline)) inline int32_t avx2_either(const uint32_t* a, uint32_t seen_a,
+                                                                         const uint32_t* b, uint32_t seen_b,
+                                                                         int64_t deadline_ns)
+{
+    __m256i x = _mm256_set1_epi16(3), y = _mm256_set1_epi16(5), c0 = _mm256_setzero_si256(), c1 = c0, c2 = c0, c3 = c0;
+    for (uint32_t tick = 0; !done_either(a, seen_a, b, seen_b, deadline_ns, tick); ++tick)
+        for (int i = 0; i < 16; ++i) {
+            c0 = _mm256_add_epi32(c0, _mm256_madd_epi16(x, y));
+            c1 = _mm256_add_epi32(c1, _mm256_madd_epi16(y, x));
+            c2 = _mm256_add_epi32(c2, _mm256_madd_epi16(x, x));
+            c3 = _mm256_add_epi32(c3, _mm256_madd_epi16(y, y));
+            x = _mm256_xor_si256(x, c3);
+        }
+    const __m256i t = _mm256_add_epi32(_mm256_add_epi32(c0, c1), _mm256_add_epi32(c2, x));
+    return int32_t(uint32_t(_mm256_extract_epi32(t, 0)) + uint32_t(_mm256_extract_epi32(t, 7)));
+}
+
+inline int32_t scalar_either(const uint32_t* a, uint32_t seen_a, const uint32_t* b, uint32_t seen_b, int64_t deadline_ns)
+{
+    for (uint32_t tick = 0; !done_either(a, seen_a, b, seen_b, deadline_ns, tick); ++tick) _mm_pause();
+    return 0;
+}
+
 // Keeps the loops' results observable so the compiler cannot drop the register work.
 inline std::atomic<int32_t> sink{0};
 
@@ -101,6 +150,35 @@ void keep_warm(Isa isa, std::span<const int> cores, int32_t threads, const uint3
         const int32_t warm = keep_warm_loop<Top>(isa, word, seen, std::min(warm_until_ns, release_ns));
         keep_warm_detail::sink.fetch_add(warm, std::memory_order_relaxed);
         keep_warm_detail::scalar(word, seen, release_ns);
+    }
+    if (pin_error.load(std::memory_order_relaxed)) throw std::runtime_error("cannot pin CPU expert worker to its core");
+}
+
+// keep_warm on two words: the same hold, ended by either word moving.
+template <Isa Top>
+void keep_warm_either(Isa isa, std::span<const int> cores, int32_t threads, const uint32_t* word_a, uint32_t seen_a,
+                      const uint32_t* word_b, uint32_t seen_b, int64_t warm_until_ns, int64_t release_ns)
+{
+    if (threads < 1 || word_a == nullptr || word_b == nullptr || (!cores.empty() && size_t(threads) > cores.size()))
+        throw std::invalid_argument("CPU expert keep-warm needs a worker, two words and no more workers than its cores");
+    std::atomic<int> pin_error{0};
+    #pragma omp parallel num_threads(threads) shared(cores, pin_error)
+    {
+        pin(omp_get_thread_num(), cores, pin_error);
+        const int64_t warm_deadline = std::min(warm_until_ns, release_ns);
+        int32_t warm = 0;
+        if constexpr (Top >= Isa::Bw) {
+            if (isa >= Isa::Bw) warm = keep_warm_detail::bw_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+            else if (isa >= Isa::Avx2) warm = keep_warm_detail::avx2_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+            else warm = keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+        } else if constexpr (Top >= Isa::Avx2) {
+            if (isa >= Isa::Avx2) warm = keep_warm_detail::avx2_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+            else warm = keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+        } else {
+            warm = keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, warm_deadline);
+        }
+        keep_warm_detail::sink.fetch_add(warm, std::memory_order_relaxed);
+        keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, release_ns);
     }
     if (pin_error.load(std::memory_order_relaxed)) throw std::runtime_error("cannot pin CPU expert worker to its core");
 }

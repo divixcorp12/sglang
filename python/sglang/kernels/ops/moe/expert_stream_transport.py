@@ -124,6 +124,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "test_kernel_calls",
     "test_kernel_hold",
     "test_keep_warm_calls",
+    "test_keep_warm_either_calls",
     "test_keep_warm_core",
     "draft_test_post",
     "draft_test_tear",
@@ -1837,6 +1838,13 @@ class ExpertStreamHost:
         )
         self.cpu_rows = (x_rows, out_rows)
 
+    def draft_source(self, areas, *, fatal_wait_s: float, group: int = 0):
+        """The DSpark draft channel over ``areas`` (a ``DraftCpuAreas``) as group ``group``'s CPU expert engine's second
+        job source: a ``SharedDraftHost``; set its stages' layers, then ``start``. After enable_cpu_experts."""
+        from sglang.kernels.ops.moe.dspark_draft_cpu import SharedDraftHost
+
+        return SharedDraftHost(self, areas, group=group, fatal_wait_s=fatal_wait_s)
+
     def set_cpu_layer(self, row: int, spec) -> None:
         """Make ``row``'s layer with the enabled kernel from ``spec`` (a ``CpuExpertLayerSpec``).
 
@@ -1946,6 +1954,11 @@ class ExpertStreamHost:
         """Test only: calls of the fake kernel's keep-warm since :meth:`test_kernel_address`."""
         _refuse_test_only("test_keep_warm_calls", self.variant)
         return int(self._module.expert_stream_test_keep_warm_calls())
+
+    def test_keep_warm_either_calls(self) -> int:
+        """Test only: how many of those calls were the two-word ``keep_warm_either`` (a draft source's hold)."""
+        _refuse_test_only("test_keep_warm_either_calls", self.variant)
+        return int(self._module.expert_stream_test_keep_warm_either_calls())
 
     def test_keep_warm_core(self) -> int:
         """Test only: the first core the fake keep-warm's last call took (-1 before any call)."""

@@ -557,6 +557,13 @@ class FakeKernel final : public ce::CpuExpertKernel {
     while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && es::now_ns() < release_ns) _mm_pause();
   }
 
+  void keep_warm_either(std::span<const int>, int32_t, const uint32_t* word_a, uint32_t seen_a, const uint32_t* word_b,
+                        uint32_t seen_b, int64_t, int64_t release_ns) const override {
+    while (__atomic_load_n(word_a, __ATOMIC_ACQUIRE) == seen_a && __atomic_load_n(word_b, __ATOMIC_ACQUIRE) == seen_b &&
+           es::now_ns() < release_ns)
+      _mm_pause();
+  }
+
   mutable std::mutex mutex;
   mutable std::vector<FakeCall> calls;
 
