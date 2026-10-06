@@ -1,0 +1,31 @@
+{
+ "arch": "sm_120",
+ "device": {
+  "exl3_moe_route_tables_int32_t_fp32_t_bf16_t::void sglang::exl3::exl3_moe_route_tables_kernel<int, float, __nv_bfloat16>(int const*, int, float const*, float const*, __nv_bfloat16 const*, long, long, long, long*, __half*, float*, long*, long*, __half*, long*, long*, int const*, int const*, long, float const*, long)": "b4a0af9d0e715ba9cdb2026ba6eee01fbc23bdef7ee7659d183365db3ecf0692",
+  "exl3_moe_route_tables_int64_t_fp32_t_fp32_t::void sglang::exl3::exl3_moe_route_tables_kernel<long, float, float>(long const*, int, float const*, float const*, float const*, long, long, long, long*, __half*, float*, long*, long*, __half*, long*, long*, int const*, int const*, long, float const*, long)": "98137ae96ce059317ac2fe7086a23a90c91d8655a81a99881c6b420aca53df32",
+  "expert_residency_direct_commit_gather::sglang::expert_residency::direct_commit_gather_kernel(long const*, bool const*, long const*, int, long, long, long*, long*, unsigned char*, long*, long*, long*, long*, int const*, float const*, int const*, int const*, unsigned char, unsigned char)": "8e59e1d4351e02bd96b4c369bc7b3563969ceb63363954e381c42f86cff41d1a",
+  "expert_residency_direct_gather_destinations_int64_t_int64_t_int64_t::sglang::expert_residency::direct_commit_gather_kernel(long const*, bool const*, long const*, int, long, long, long*, long*, unsigned char*, long*, long*, long*, long*, int const*, float const*, int const*, int const*, unsigned char, unsigned char)": "8e59e1d4351e02bd96b4c369bc7b3563969ceb63363954e381c42f86cff41d1a",
+  "expert_residency_direct_gather_destinations_int64_t_int64_t_int64_t::void sglang::expert_residency::direct_gather_destinations_kernel<long, long, long>(long const*, int, long const*, long const*, bool const*, int, int const*, long const*, long, int*, long*, bool*, long*)": "8ac1226e4921ebfdaa8e042986e2a0bc24a4a7010872d77e1acb320079590632",
+  "expert_stream_exl3_l8::sglang::exl3_ram_miss_lease_copy_commit_kernel(sglang::CopyCommitParams)": "f83b3091bccff88336f0e8fa59401688f0779879108437073aa519d7e250cd98",
+  "expert_stream_exl3_l8::sglang::exl3_ram_miss_map_bulk_apply_kernel(sglang::BulkApplyParams)": "79b7083b69ab654c896f00abef28bf2b3dd92fc3aae1e2fbe52229c8e114efd6",
+  "expert_stream_exl3_l8::void sglang::exl3_ram_miss_lease_copy_wait_kernel<false>(sglang::CopyWaitParams)": "c43c53d495c67ae2bb092ee69c9a42d1c9a1afa418e8a946a94884c14424416d",
+  "expert_stream_exl3_l8::void sglang::exl3_ram_miss_lease_copy_wait_kernel<true>(sglang::CopyWaitParams)": "12311a9bf903635a03a9569d5bd96739f74d8427133ca09b8ec552f920d9aed2",
+  "expert_stream_exl3_l8::void sglang::exl3_ram_miss_lease_stream_kernel<false>(sglang::StreamParams)": "71911f1df9358fe368d0cd531690c2620adef1b686770b1dd67c54526c3fccec",
+  "expert_stream_exl3_l8::void sglang::exl3_ram_miss_lease_stream_kernel<true>(sglang::StreamParams)": "1a873a78512a2c666d924558384b9e489585432d8570995053568a09c91fb75c",
+  "expert_stream_exl3_l8::void sglang::exl3_ram_miss_post_kernel<false>(sglang::PostParams)": "72c94fac817a3e0d22303bd325a195b2a2fea691f7e6f7575ea897dce088747c",
+  "expert_stream_exl3_l8::void sglang::exl3_ram_miss_post_kernel<true>(sglang::PostParams)": "ff9bf41d4fa9e9c400db18e010fdd364e687af12f19b674a841ae8b60bd35c25",
+  "expert_stream_exl3_l8_n2::sglang::exl3_ram_miss_lease_copy_commit_kernel(sglang::CopyCommitParams)": "f83b3091bccff88336f0e8fa59401688f0779879108437073aa519d7e250cd98",
+  "expert_stream_exl3_l8_n2::sglang::exl3_ram_miss_map_bulk_apply_kernel(sglang::BulkApplyParams)": "a4474316ce67c273caa00f2a73a477e69274cbd78e18362068c1adc32ae70bc8",
+  "expert_stream_exl3_l8_n2::void sglang::exl3_ram_miss_lease_copy_wait_kernel<false>(sglang::CopyWaitParams)": "c43c53d495c67ae2bb092ee69c9a42d1c9a1afa418e8a946a94884c14424416d",
+  "expert_stream_exl3_l8_n2::void sglang::exl3_ram_miss_lease_copy_wait_kernel<true>(sglang::CopyWaitParams)": "12311a9bf903635a03a9569d5bd96739f74d8427133ca09b8ec552f920d9aed2",
+  "expert_stream_exl3_l8_n2::void sglang::exl3_ram_miss_lease_stream_kernel<false>(sglang::StreamParams)": "71911f1df9358fe368d0cd531690c2620adef1b686770b1dd67c54526c3fccec",
+  "expert_stream_exl3_l8_n2::void sglang::exl3_ram_miss_lease_stream_kernel<true>(sglang::StreamParams)": "1a873a78512a2c666d924558384b9e489585432d8570995053568a09c91fb75c",
+  "expert_stream_exl3_l8_n2::void sglang::exl3_ram_miss_post_kernel<false>(sglang::PostParams)": "d98b077bb88e93600c5028003738b0d65f2e3fc9043442b3b199fb3d8000e1b4",
+  "expert_stream_exl3_l8_n2::void sglang::exl3_ram_miss_post_kernel<true>(sglang::PostParams)": "0fbb5cb2d284a5db2a8b88d8a33a65243f9e0e333ad2769e7f43d4055986c513"
+ },
+ "host": {
+  "expert_stream_host_exl3_instr_l8": "6b535e0e99b65bd1fa74042e614f8ebb3c49a839dc7e37cdef36f875f7c87251",
+  "expert_stream_host_exl3_prod_l8": "ae20e7b0912fc93c420ad0fa4ad644bdb01091a1fca67966c69aa4d71339ec87"
+ },
+ "nvcc": "Build cuda_13.4.r13.4/compiler.38501229_0"
+}
