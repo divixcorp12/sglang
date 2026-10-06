@@ -230,6 +230,8 @@ def _post_spill(c, experts, forced_from, flag, overflows, row=0):
     """A captured post whose lanes from forced_from on have no VRAM victim (dst -1), as DIRECT's spill leaves them."""
     c.plan(experts, row)
     backend, plan = c.backends[row], c.plans[row]
+    # The live lanes keep their destination rows; plan.slots carries the previous call's -1 otherwise.
+    plan.slots[: len(experts)] = torch.arange(len(experts), dtype=torch.int32, device=plan.slots.device)
     plan.slots[forced_from : len(experts)] = -1
     backend._stage_planned(plan)
     cpu_input = (torch.zeros(1, 64, device="cuda"), torch.ones(TOP_K, device="cuda"))
