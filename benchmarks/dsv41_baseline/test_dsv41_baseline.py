@@ -1019,7 +1019,8 @@ def test_prod_server_args_serve_the_base_recipe_on_port_7867_on_all_interfaces()
 
 def test_launch_prod_uses_the_base_recipe_without_overrides():
     script = open(os.path.join(os.path.dirname(__file__), "launch_prod.sh")).read()
-    assert "arm_env.base_env()" in script
+    assert "arm_env.prod_env()" in script
+    assert "arm_env.base_env()" not in script
     assert "arm_env.ServerArgs.prod().argv()" in script
     assert "overrides" not in script
     assert "flock --nonblock 9" in script
