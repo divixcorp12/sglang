@@ -411,5 +411,64 @@ def test_a_40_lane_build_carries_36_cpu_lanes_through_cw_and_cc(tmp_path):
         c.close()
 
 
+@pytest.mark.parametrize("tokens", [1, 3])
+def test_a_verify_records_cpu_lanes_run_one_forward_of_its_tokens(tmp_path, tokens):
+    """Three RAM hits, every lane the CPU's (split[3] = 3), in rows that hold 4 tokens. The record's CPU job runs one
+    forward of `tokens` rows: row t names a lane's RAM slot only where token t routes its expert (-1 elsewhere, Review
+    Focus 4) with t's own weight, and its output row is t's partial alone, over stale bytes (7.0). One token in 4-token
+    rows reads the table too. Mutations: every row the record's summed weight; the slot kept where t does not route;
+    no zeroing of a non-accumulating job's rows."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    row, experts, tokens_max = 0, [3, 5, 7], 4
+    lanes = lease.wire_layout(8).lanes
+    c = Chain(tmp_path, copy_engine=True, start=False)
+    try:
+        x_rows = torch.zeros((LAYERS, lease.cpu_row_bytes(HIDDEN, tokens_max, lanes)), dtype=torch.uint8).pin_memory()
+        out_rows = torch.full((LAYERS, 2, tokens_max, HIDDEN), 7.0, dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(), list(range(lanes + 1)), cores, x_rows, out_rows,
+                                  threads=2)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
+        backend, plan, dev = c.backends[row], c.plans[row], c.dev
+        c.plan(experts, row)
+        c.gather(row)
+        torch.cuda.synchronize()
+        assert c.handled() and set(experts) <= c.resident(row)
+        with paused(c.host):
+            ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        c.host.arm_copy_engine()
+
+        c.plan(experts, row)
+        backend._stage_planned(plan)
+        planned = backend.planned[:3].tolist()
+        routes = [[3, 5, 8, 9, 10, 11], [7, 3, 12, 13, 14, 15], [5, 8, 12, 9, 13, 10]][:tokens]
+        weights = torch.tensor([[0.01 * (10 * t + i + 1) for i in range(TOP_K)] for t in range(tokens)], device="cuda")
+        route_ids = torch.tensor(sum(routes, []), dtype=torch.int64, device="cuda")
+        x = torch.randn(tokens, HIDDEN, device="cuda").half()
+        dev.post(row, backend.planned, plan.count, route_ids, plan.slots, captured=True, cpu_input=(x, weights))
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+        assert _until(lambda: len(c.host.test_kernel_calls()) == tokens)
+        torch.cuda.synchronize()
+
+        assert c.kinds(3) == [LaneKind.HIT_CPU] * 3
+        assert dev.cpu_lanes.tolist() == [0b111, PART_HITS]
+        for t, call in enumerate(c.host.test_kernel_calls()):
+            want_slots = [ram_slot[e] if e in routes[t] else -1 for e in planned]
+            want_weights = [float(weights[t, routes[t].index(e)]) if e in routes[t] else 0.0 for e in planned]
+            assert call["slots"] == want_slots, (t, call)
+            assert call["weights"] == pytest.approx(want_weights), (t, call)
+            assert call["accumulate"], "a per-token job accumulates into the rows the engine zeroed"
+            partial = sum(w * (s + 1) for s, w in zip(want_slots, want_weights))
+            assert torch.allclose(out_rows[row, 0, t], torch.full((HIDDEN,), partial), atol=1e-4), t
+    finally:
+        c.close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
