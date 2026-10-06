@@ -69,7 +69,7 @@ def _attach(service, streamer, rows, manager=None):
     service.attach(manager if manager is not None else _manager(), streamer)
 
 
-@pytest.mark.parametrize("rows, lanes", [(1, 8), (6, 8), (8, 8), (12, 16), (16, 16), (32, 32)])
+@pytest.mark.parametrize("rows, lanes", [(1, 8), (6, 8), (8, 8), (12, 16), (16, 16), (32, 32), (36, 40), (40, 40)])
 def test_a_gather_within_the_planned_lanes_attaches(tiers, rows, lanes):
     """The width is planned before the service starts (Exl3ExpertFormat.plan_graph_gather), and the build's lanes are
     that width rounded up to 8."""
@@ -81,10 +81,10 @@ def test_a_gather_within_the_planned_lanes_attaches(tiers, rows, lanes):
     assert streamers[0].row_backend.device_side is service.device_side
 
 
-def test_a_gather_wider_than_32_is_refused_when_planned(tiers):
+def test_a_gather_wider_than_64_is_refused_when_planned(tiers):
     service, streamers = tiers
-    with pytest.raises(ValueError, match="1..32"):
-        service.plan_gather_width(33)
+    with pytest.raises(ValueError, match="1..64"):
+        service.plan_gather_width(65)
 
 
 @pytest.mark.parametrize("rows", [9, 2 * 6])  # 12: two tokens of a top-6 model

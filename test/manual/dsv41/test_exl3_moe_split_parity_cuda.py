@@ -386,6 +386,28 @@ def test_cpu_lanes_with_a_zero_partial_are_the_gpu_run_without_them(slot_rows):
                 assert torch.equal(_cpu_run(fused, x, weights, remap, keep, mask, seed), torch.zeros_like(want))
 
 
+def test_cpu_lanes_past_32_rank_their_routes_out(slot_rows):
+    """A 40-lane build's cpu_lanes is {low, parts, high}: CPU lanes 32-35 (their dst_slots entries the routes' slots,
+    lanes 0-31 naming no slot) leave the fused MoE exactly as low lanes do, bit for bit against the masked run.
+    Mutation: read only the low word -- the routes stay in."""
+    device = slot_rows["w13_trellis"].device
+    fused = _fused(slot_rows, device, True)
+    hidden = slot_rows["w13_suh"].shape[-1]
+    zero = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
+    keep = torch.ones(1, device=device)
+    gen = torch.Generator().manual_seed(933)
+    for trial in range(TRIALS * 4):
+        x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
+        high = int(torch.randint(1, 16, (1,), generator=gen))  # which of lanes 32-35 are the CPU's
+        dst = torch.full((36,), -1, dtype=torch.int32, device=device)
+        dst[32:36] = remap[:4].to(torch.int32)  # lane 32 + i names route i's slot
+        lanes = torch.tensor([0, PART_HITS, high], dtype=torch.int32, device=device)
+        on_cpu = torch.tensor([i < 4 and bool(high >> i & 1) for i in range(TOP_K)], device=device)
+        want = fused.run(x, torch.where(on_cpu, torch.zeros_like(weights), weights), remap, keep, ACT_LIMIT).clone()
+        got = fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=(lanes, dst, zero.data_ptr(), 0)).clone()
+        assert torch.equal(_bits(got), _bits(want)), f"high={high:#x} remap={remap.tolist()}"
+
+
 def test_the_cpu_partial_seeds_the_output(slot_rows):
     """The GPU's own partial of the CPU routes, fed back as the CPU partial, reproduces the full run up to fp32
     reassociation."""

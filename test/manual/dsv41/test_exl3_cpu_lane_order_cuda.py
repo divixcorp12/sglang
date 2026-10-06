@@ -366,5 +366,49 @@ def test_cpu_lanes_past_bit_7_reach_the_route_tables_and_the_direct_gather(miss_
     assert (insertions.item(), truncated.item()) == (8, 0)
 
 
+def test_a_40_lane_build_carries_36_cpu_lanes_through_cw_and_cc(tmp_path):
+    """Lanes 32-35 live in the masks' high words: CW marks all 36 RAM-hit lanes CPU, CC publishes {low, parts, high},
+    and the host's cpu_mask hands all 36 RAM slots to one CPU job. Mutation: keep CW's mask a u32 -- lanes 32-35 are
+    lost and the copy wait never covers them."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    row, lanes, experts = 0, 40, list(range(36))
+    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=80, staging=36)
+    try:
+        x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
+        out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), list(range(lanes + 1)), cores, x_rows,
+                                  out_rows, threads=2)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
+        backend, plan, dev = c.backends[row], c.plans[row], c.dev
+        assert (dev.ce_mask.numel(), dev.cpu_lanes.numel()) == (5, 3)
+        c.plan(experts, row)
+        c.gather(row)
+        torch.cuda.synchronize()
+        assert c.handled() and set(experts) <= c.resident(row)
+        with paused(c.host):
+            ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        c.host.arm_copy_engine()
+        backend._stage_planned(plan)
+        x = torch.randn(1, HIDDEN, device="cuda").half()
+        dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True,
+                 cpu_input=(x, torch.ones(36, device="cuda")))
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+        assert _until(lambda: len(c.host.test_kernel_calls()) == 1)
+        torch.cuda.synchronize()
+        assert c.kinds(36) == [int(LaneKind.HIT_CPU)] * 36
+        assert dev.cpu_lanes.tolist() == [-1, PART_HITS, 0xF]
+        (call,) = c.host.test_kernel_calls()
+        assert sorted(call["slots"]) == sorted(ram_slot[e] for e in experts)
+    finally:
+        c.close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

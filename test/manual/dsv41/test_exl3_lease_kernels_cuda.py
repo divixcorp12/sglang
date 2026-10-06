@@ -356,7 +356,7 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
     return [out[n][:count].tolist() for n in ("kind", "slot", "node")]
 
 
-@pytest.mark.parametrize("lanes", [8, 16, 32])
+@pytest.mark.parametrize("lanes", [8, 16, 32, 40])
 @pytest.mark.parametrize("nodes", [1, 2])
 def test_each_miss_takes_the_next_staging_slot_of_its_home_node(lanes, nodes):
     """The device's typing equals ram_slot_map.type_lanes's on random plans of hits and misses on every node."""
