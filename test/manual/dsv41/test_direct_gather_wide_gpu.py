@@ -65,3 +65,20 @@ def test_the_commit_leaves_out_cpu_lanes_past_32():
     cpu = {0, 33, 35}
     assert [int(mapping[10 + j]) for j in range(WIDTH)] == [-1 if j in cpu else j for j in range(WIDTH)]
     assert int(counters[0].item()) == WIDTH - 3 and int(counters[2].item()) == 0  # insertions; nothing truncated
+
+
+def test_idle_destinations_run_the_wide_kernel_at_any_width():
+    """At a width the narrow kernel could take, nonzero idle values still give (idle, idle_slot) for every lane that
+    is not live, so the narrow BS1 kernel never needs them."""
+    from sglang.kernels.ops.moe.expert_residency_direct_gather import direct_gather_destinations
+
+    cuda = dict(device="cuda")
+    ids = torch.tensor([1, 2, 3, 4], **cuda)
+    expert_to_slot = torch.full((8,), -1, dtype=torch.int64, **cuda)
+    out = [torch.zeros(4, dtype=t, **cuda) for t in (torch.int32, torch.int64, torch.bool, torch.int64)]
+    direct_gather_destinations(
+        ids, expert_to_slot, torch.tensor([3, 5, 6, 7], **cuda), torch.tensor([True, False, False, False], **cuda),
+        torch.tensor([4], dtype=torch.int32, **cuda), torch.tensor([20, 21, 22, 23], **cuda), 20, *out,
+        idle_destination=99, idle_slot=-1,
+    )
+    assert out[0].tolist() == [3, -1, -1, -1] and out[1].tolist() == [3, 99, 99, 99]

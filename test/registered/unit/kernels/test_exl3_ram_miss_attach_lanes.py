@@ -319,6 +319,17 @@ def test_cpu_experts_backend_needs_its_streamer():
         )
 
 
+def test_victim_lanes_stage_their_width_not_the_lanes(tiers):
+    """Spill: the post types up to 36 lanes, but only the V victim lanes stage (a forced miss never does), so a row
+    reserves V staging slots (Exl3ExpertFormat.plan_graph_gather plans it)."""
+    service, streamers = tiers
+    with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(2):
+        streamers[0].format.plan_graph_gather(streamers[0], 36)
+    assert service.resolved_lanes() == 40
+    assert service.staging_width() == 2
+    assert service.staging_for(CAPACITY) == 2
+
+
 if __name__ == "__main__":
     import sys
 
