@@ -107,13 +107,16 @@ class DraftCpuThread {
     watchdog_ = std::thread([this] { watch(); });
   }
 
-  /// Stops and joins both threads, then opens a gate a wait still holds closed (no completer is left); idempotent.
+  /// Stops and joins the run thread, then the watchdog (a hung forward still fail-stops meanwhile), then opens a gate a wait still holds closed (no completer is left); idempotent.
   /// The device is past its last post at teardown, so moving the head word to end a hold misleads no one.
   void stop() {
     if (!thread_.joinable()) return;
     stop_.store(true, std::memory_order_seq_cst);
     __atomic_fetch_add(reinterpret_cast<uint32_t*>(config_.channel + DraftChannel::kHead), 1u, __ATOMIC_SEQ_CST);
     thread_.join();
+    // The watchdog outlives the run thread's stop: a forward that never returns fail-stops within the fatal wait
+    // instead of hanging this join.
+    watchdog_stop_.store(true, std::memory_order_seq_cst);
     if (watchdog_.joinable()) watchdog_.join();
     channel::open_closed_gate<DraftChannel>(config_.channel);
   }
@@ -245,9 +248,9 @@ class DraftCpuThread {
   void watch() {
     uint32_t watched = 0;
     int64_t since = 0;
-    while (!stop_.load(std::memory_order_acquire)) {
+    while (!watchdog_stop_.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      if (stop_.load(std::memory_order_acquire)) return;
+      if (watchdog_stop_.load(std::memory_order_acquire)) return;
       const uint32_t head = channel::head<DraftChannel>(config_.channel);
       if (head == 0 || head == completed_.load(std::memory_order_acquire)) {
         watched = 0;
@@ -272,7 +275,7 @@ class DraftCpuThread {
   Config config_;
   std::vector<cpu_experts::ExpertLayer> layers_;
   std::thread thread_, watchdog_;
-  std::atomic<bool> stop_{false};
+  std::atomic<bool> stop_{false}, watchdog_stop_{false};  // the watchdog stops after the run thread has joined
   std::atomic<uint32_t> completed_{0};
   std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0};
 };
