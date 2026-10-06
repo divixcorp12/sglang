@@ -210,10 +210,10 @@ def test_the_service_builds_for_the_widest_planned_gather(tiers, width, lanes):
     assert service.resolved_lanes() == lanes
 
 
-def test_a_gather_wider_than_32_is_refused(tiers):
+def test_a_gather_wider_than_64_is_refused(tiers):
     service, _, _ = tiers
-    with pytest.raises(ValueError, match="1..32"):
-        service.plan_gather_width(33)
+    with pytest.raises(ValueError, match="1..64"):
+        service.plan_gather_width(65)
     assert service.resolved_lanes() == 8, "a refused width leaves the plan as it was"
 
 
