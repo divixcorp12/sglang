@@ -130,13 +130,16 @@ def test_a_verify_spills_every_victimless_lane_to_the_cpu_and_never_overflows_on
 
             def served_without_overflow(routes):
                 inserted = updater.gather_insertions[0].item()
+                # A route already in VRAM is a hit and takes no miss lane.
+                lanes = len({e for route in routes for e in route} & set(outsiders()))
                 assert replay(routes) == 0, "an armed verify overflowed"
                 count = int(streamer._graph_miss_count.item())
                 kinds = service.device_side.lane_kind[:count].tolist()
                 cpu = sum(k in (int(LaneKind.HIT_CPU), int(LaneKind.MISS_CPU)) for k in kinds)
                 live = updater.gather_insertions[0].item() - inserted
-                assert count == LANES and live <= VICTIMS and cpu >= LANES - VICTIMS, (count, live, kinds)
+                assert count == lanes and live <= VICTIMS and cpu >= lanes - VICTIMS, (count, lanes, live, kinds)
                 exact(out, routes)
+                return lanes
 
             # Review Focus 1: before the copy engine arms, forced lanes cannot be the CPU's; the re-run is exact.
             warm = outsiders()[:LANES]
@@ -156,13 +159,13 @@ def test_a_verify_spills_every_victimless_lane_to_the_cpu_and_never_overflows_on
 
             # Review Focus 5: 36 distinct RAM-resident experts, a lane each.
             in_ram(warm)
-            served_without_overflow(_distinct(warm))
+            assert served_without_overflow(_distinct(warm)) >= LANES - VICTIMS
 
             # Review Focus 2: 36 distinct cold experts, every one an NVMe miss on the one node. The live ones stage, the
             # forced ones are read into RAM victims, and all stay cached in the tier afterwards.
             cold = [e for e in outsiders() if e not in warm][:LANES]
             assert len(cold) == LANES
-            served_without_overflow(_distinct(cold))
+            assert served_without_overflow(_distinct(cold)) == LANES
             resident = {e for e, s in enumerate(service.host.mapping(0).tolist()) if s >= 0}
             assert len(set(cold) - resident) <= VICTIMS, "the forced misses are cached in their RAM victims"
             assert updater.gather_overflow[0].item() == before, "no armed verify overflowed"
