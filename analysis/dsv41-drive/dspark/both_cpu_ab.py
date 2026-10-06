@@ -65,6 +65,9 @@ def run_timed(arm: str, out: str) -> int:
         "DSV41_EXTRA_SERVER_ARGS": shlex.join(arm_env.DSPARK_ARGV) if dspark else "",
         "DSV41_HEALTH_TIMEOUT_S": str(_health_timeout_s(dspark)),
     }
+    if dspark:
+        # run_arm.sh builds its argv without dspark=True, so the recipe's fraction reaches it as the arm override.
+        env["DSV41_MEM_FRACTION_STATIC"] = arm_env.DSPARK_MEM_FRACTION_STATIC
     cmd = [os.path.join(REPO, "benchmarks", "dsv41_baseline", "run_arm.sh"), arm, str(PORT)]
     cmd += [f"{k}={v}" for k, v in _overrides(arm, out).items()]
     print("===", " ".join(cmd), flush=True)

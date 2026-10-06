@@ -253,6 +253,16 @@ def base_env() -> dict[str, str]:
         # (DSV41_REFERENCE.md 27.19, 27.20). Not yet measured at 128k+. An arm sets "0" to force chunked.
         "SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS": "8192",
     }
+# Budget A (both-cpu/mem-budget-report.md, launch L2), for the DSpark arms only; production keeps MEM_FRACTION_STATIC
+# and its 16080 MiB hot cache. The triton FlashMLA prefill merge runs in fp32 and costs about 0.9 GiB at a 2048-token
+# chunk and 1.75 GiB at 4096 over production's flashinfer path, so DSpark's prefill peak sits 4,808 MiB above the end of
+# init. Init headroom is set by the fraction alone: a hot-cache cut by itself only grows the KV pool (launch A3). At
+# 0.78 / 10840 init has 5.21 GB of headroom, the 4096 warm-up leaves 508 MiB, and KV is 381,184 tokens (prod 288,768).
+# TODO(owner, 2026-10-06): the real fix is option C — chunk the triton fp32 prefill merge over tokens (bit-identical
+# math), then return the DSpark arms to MEM_FRACTION_STATIC 0.82 and the full 12040 MiB hot cache (Owner decision 4).
+# flashinfer is not an alternative: it refuses the 5-token draft capture (`num_tokens > 64`).
+DSPARK_MEM_FRACTION_STATIC = "0.78"
+DSPARK_HOT_GPU_MB = "10840"
 
 
 def arm_env(overrides: dict[str, str]) -> dict[str, str]:
@@ -278,8 +288,8 @@ def dspark_env() -> dict[str, str]:
         "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": DSPARK_RESIDENT,
         "SGLANG_EXL3_CPU_ACT_RESIDUAL": "1",
         "SGLANG_EXL3_CPU_ACT_BLOCK": "128",
-        # 4040 MiB of the hot cache go to the draft's resident experts, dense weights and KV (Owner decision 4).
-        "SGLANG_MOE_HOT_GPU_MB": "12040",
+        # Budget A, with DSPARK_MEM_FRACTION_STATIC (reasons and the owner's option-C TODO at DSPARK_MEM_FRACTION_STATIC).
+        "SGLANG_MOE_HOT_GPU_MB": DSPARK_HOT_GPU_MB,
         # Every DSpark text result so far ran triton attention (§33.2, §33.8, §33.9).
         "SGLANG_SM120_FLASHMLA_BACKEND": "triton",
     }
@@ -321,7 +331,7 @@ class ServerArgs(msgspec.Struct, frozen=True, kw_only=True):
             "--context-length",
             str(CONTEXT_LENGTH),
             "--mem-fraction-static",
-            str(MEM_FRACTION_STATIC),
+            DSPARK_MEM_FRACTION_STATIC if self.dspark else str(MEM_FRACTION_STATIC),
             "--chunked-prefill-size",
             str(CHUNKED_PREFILL_SIZE),
             "--max-prefill-tokens",
