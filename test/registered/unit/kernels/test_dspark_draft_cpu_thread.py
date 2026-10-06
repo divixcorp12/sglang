@@ -132,6 +132,28 @@ def test_one_stage_serves_m_rows(request):
     assert (stats["jobs"], stats["rows"]) == (1, rows)
 
 
+def test_stats_count_the_jobs_whose_routes_share_a_slot(request):
+    """The EXL3 kernel groups a call's live routes by slot (up to CHUNK_M tokens per chunk), so a job whose routes name
+    one slot twice runs a chunk of several tokens: collided_jobs counts those jobs, shared_routes the routes past each slot's first, and
+    collided_forward_ns their forward time. -1 is not a route."""
+    areas, host = _host(request, ns_per_expert=1000)
+    k = 3
+    jobs = [
+        [[0, 1, 2], [3, 4, 5]],  # every slot once
+        [[0, 1, 2], [2, -1, 5]],  # slot 2 twice
+        [[7, 7, -1]],  # one token routed twice to slot 7
+    ]
+    for seq, slots in enumerate(jobs, start=1):
+        rows = len(slots)
+        _stage(areas, 0, rows, k, seed=seq)
+        areas.slots[0, :rows, :k] = torch.tensor(slots, dtype=areas.slots.dtype)
+        _post(areas, 0, rows, k, seq=seq)
+        _finish(areas, seq)
+    stats = host.stats()
+    assert (stats["jobs"], stats["collided_jobs"], stats["shared_routes"]) == (3, 2, 2)
+    assert 0 < stats["collided_forward_ns"] < stats["forward_ns"]
+
+
 def test_three_stages_in_turn_each_run_their_own_layer(request):
     areas, host = _host(request)
     for seq, stage in enumerate(range(STAGES), start=1):
