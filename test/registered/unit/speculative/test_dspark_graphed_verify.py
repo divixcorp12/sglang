@@ -1,17 +1,20 @@
 """DSpark's graphed verify: a flagged forward is re-run eagerly, and startup skips what cannot be captured (CPU)."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
+from sglang.srt.speculative.dspark_components import dspark_worker_v2
 from sglang.srt.speculative.dspark_components.dspark_graphed_verify import (
+    draft_graph_allowed,
     draft_runs_exl3,
     forward_verify_with_reverify,
     target_gather_is_narrow,
 )
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -133,3 +136,67 @@ def test_target_gather_is_narrow():
     assert not target_gather_is_narrow(SimpleNamespace(expert_hot_cache_manager=SimpleNamespace(narrow_graph_gather=False)))
     assert not target_gather_is_narrow(SimpleNamespace(expert_hot_cache_manager=None))
     assert not target_gather_is_narrow(SimpleNamespace())
+
+
+def _draft(name):
+    return SimpleNamespace(quant_config=SimpleNamespace(get_name=lambda: name))
+
+
+def test_an_exl3_draft_captures_unless_disabled():
+    assert draft_graph_allowed(_draft("exl3"))
+    with envs.SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH.override(True):
+        assert not draft_graph_allowed(_draft("exl3"))
+        assert draft_graph_allowed(_draft("fp8"))
+    assert draft_graph_allowed(_draft("fp8"))
+
+
+def _worker(monkeypatch, draft, log):
+    monkeypatch.setattr(dspark_worker_v2, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(dspark_worker_v2, "draft_pp_context", nullcontext)
+    worker = object.__new__(DSparkWorkerV2)
+    worker._decode_graph_allowed = True
+    worker.draft_model = draft
+    worker._tp_sync = SimpleNamespace(available_memory_gb=lambda *a, **k: 10.0)
+    worker.device = "cuda"
+    worker.gpu_id = 0
+    worker.ps = SimpleNamespace(tp_rank=0)
+    worker._draft_graph_group = None
+    worker._draft_context = nullcontext
+    worker._draft_sampler = None
+    worker._proposer = SimpleNamespace(attach_draft_sampler=lambda sampler: None)
+    worker.draft_model_runner = SimpleNamespace(capture_tail_hooks=[])
+    worker._draft_worker = SimpleNamespace(
+        init_cuda_graphs=lambda capture_decode_cuda_graph: log.append(("capture", capture_decode_cuda_graph))
+    )
+    return worker
+
+
+def test_init_cuda_graphs_prepares_the_exl3_draft_before_capture(monkeypatch):
+    from sglang.srt.layers.quantization.exl3 import draft_moe
+
+    log = []
+    monkeypatch.setattr(draft_moe, "prepare_dspark_draft_graph", lambda model: log.append(("prepare", model)) or 3)
+    draft = _draft("exl3")
+    with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(False):
+        _worker(monkeypatch, draft, log).init_cuda_graphs()
+    assert log == [("prepare", draft), ("capture", True)]
+
+
+def test_init_cuda_graphs_leaves_a_disabled_exl3_draft_eager(monkeypatch):
+    from sglang.srt.layers.quantization.exl3 import draft_moe
+
+    log = []
+    monkeypatch.setattr(draft_moe, "prepare_dspark_draft_graph", lambda model: log.append("prepare") or 3)
+    with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(False), envs.SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH.override(True):
+        _worker(monkeypatch, _draft("exl3"), log).init_cuda_graphs()
+    assert log == [("capture", False)]
+
+
+def test_init_cuda_graphs_prepares_nothing_for_a_non_exl3_draft(monkeypatch):
+    from sglang.srt.layers.quantization.exl3 import draft_moe
+
+    log = []
+    monkeypatch.setattr(draft_moe, "prepare_dspark_draft_graph", lambda model: log.append("prepare") or 0)
+    with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(False):
+        _worker(monkeypatch, _draft("fp8"), log).init_cuda_graphs()
+    assert log == [("capture", True)]
