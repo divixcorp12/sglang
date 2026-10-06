@@ -28,6 +28,7 @@ from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer, paused  # noqa: 
 
 HIDDEN = 64
 READY_STATE, FREE_STATE = 3, 0  # expert_residency_gpu's _READY and _FREE
+STAGING_STATE = 3  # slot_info's state of a staging slot (tier_protocol.h: kFree 0, kReady 2, kStaging 3)
 
 
 def _until(predicate, timeout_s=10.0):
@@ -466,6 +467,58 @@ def test_a_verify_records_cpu_lanes_run_one_forward_of_its_tokens(tmp_path, toke
             assert call["accumulate"], "a per-token job accumulates into the rows the engine zeroed"
             partial = sum(w * (s + 1) for s, w in zip(want_slots, want_weights))
             assert torch.allclose(out_rows[row, 0, t], torch.full((HIDDEN,), partial), atol=1e-4), t
+    finally:
+        c.close()
+
+
+def test_36_forced_cpu_misses_on_one_node_are_read_into_ram_victims(tmp_path):
+    """Review Focus 2 at the record's full width: 36 cold experts on one node, every lane forced (no VRAM victim:
+    MISS_CPU, slot -1). The host reads each into a RAM victim of the row's own tier, the CPU computes it there (part 1),
+    and the tier maps it afterwards. No staging slot is touched, nothing overflows, the device's count stands.
+    Mutations: read a forced miss into a staging slot (the 7th of the 6 collides); skip the insert (the experts are not
+    resident afterwards)."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    row, lanes, experts = 0, 40, list(range(36))
+    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=48)
+    try:
+        x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
+        out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), [0] * (lanes + 1), cores, x_rows, out_rows,
+                                  threads=2)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        c.host.arm_copy_engine()
+        backend, plan, dev = c.backends[row], c.plans[row], c.dev
+        with paused(c.host):
+            staging_before = [s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if state == STAGING_STATE]
+        c.plan(experts, row)
+        plan.slots[:36] = -1  # every lane forced
+        backend._stage_planned(plan)
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        overflows = torch.zeros(1, dtype=torch.int64, device="cuda")
+        x = torch.randn(1, HIDDEN, device="cuda").half()
+        dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True,
+                 cpu_input=(x, torch.ones(36, device="cuda")), spill=(flag, overflows))
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+        torch.cuda.synchronize()
+        assert c.handled()
+        assert (int(plan.count[0]), int(flag.item())) == (36, 0)
+        assert c.kinds(36) == [int(LaneKind.MISS_CPU)] * 36
+        assert dev.cpu_lanes.tolist() == [-1, PART_MISSES, 0xF]
+        assert set(experts) <= c.resident(row), "every forced miss is cached in the RAM victim it was read into"
+        with paused(c.host):
+            info = c.host.slot_info(row)
+            slot_of = {e: s for s, (state, e, _) in enumerate(info) if e >= 0}
+            staging_after = [s for s, (state, e, _) in enumerate(info) if state == STAGING_STATE]
+        assert staging_after == staging_before, "no staging slot was used"
+        computed = sorted(s for call in c.host.test_kernel_calls() for s in call["slots"])
+        assert computed == sorted(slot_of[e] for e in experts)
     finally:
         c.close()
 
