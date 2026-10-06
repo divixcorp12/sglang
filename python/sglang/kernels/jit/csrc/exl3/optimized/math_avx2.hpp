@@ -104,6 +104,25 @@ inline void avx2_row_codes(const __m256i (&preg)[bits], __m256i& codes_lo, __m25
         _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
 }
 
+// Token rows I..MAX_M-1 below m: the maddwd of one pair-summed product against that row's activation. A template
+// recursion, so it unrolls to exactly MAX_M rows at any MAX_M (an unrolled call per row, no runtime loop).
+template <int I = 0>
+M1_TARGET_AVX2
+inline void avx2_accum_rows(const __m256i& p_lo, const __m256i& p_hi, const int32_t* splat_dup, int k, int m,
+    __m256i (&acc)[MAX_M][2], int row)
+{
+    if constexpr (I < MAX_M)
+    {
+        if (I < m)
+        {
+            const __m256i xs = _mm256_set1_epi32(splat_dup[static_cast<size_t>(I) * k + row]);
+            acc[I][0] = _mm256_add_epi32(acc[I][0], _mm256_madd_epi16(p_lo, xs));
+            acc[I][1] = _mm256_add_epi32(acc[I][1], _mm256_madd_epi16(p_hi, xs));
+        }
+        avx2_accum_rows<I + 1>(p_lo, p_hi, splat_dup, k, m, acc, row);
+    }
+}
+
 M1_TARGET_AVX2
 inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat_dup, int k,
     int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, const __m256i& ones32, int row)
@@ -113,21 +132,11 @@ inline void avx2_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* sp
     // at full +-127 activations; one vpmaddwd per token row against splat_dup (x8 in both 16-bit
     // slots) then folds (b0+b1)*x+(b2+b3)*x into a single i32. 4 shared + 4 per-row ops,
     // bit-exact vs the 16-op masked accumulate it replaces (verified K1-K8 x m1-4 against an
-    // exact scalar reference). The token loop is unrolled by hand: with a runtime-bounded loop
+    // exact scalar reference). The token loop is unrolled (avx2_accum_rows): with a runtime-bounded loop
     // GCC spills the pair sums and pays per-iteration overhead (~1.4x on Zen 3).
     const __m256i p_lo = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_lo, mult), ones32);
     const __m256i p_hi = _mm256_maddubs_epi16(_mm256_mullo_epi32(codes_hi, mult), ones32);
-    // Rows 0..7 cover the largest MAX_M (8); rows >= MAX_M are constant-false and index row 0 so the dead code is
-    // still in bounds.
-    #define ACC_ROW(i) \
-        if ((i) < MAX_M && (i) < m) { \
-            constexpr int r = (i) < MAX_M ? (i) : 0; \
-            const __m256i xs = _mm256_set1_epi32(splat_dup[static_cast<size_t>(i) * k + row]); \
-            acc[r][0] = _mm256_add_epi32(acc[r][0], _mm256_madd_epi16(p_lo, xs)); \
-            acc[r][1] = _mm256_add_epi32(acc[r][1], _mm256_madd_epi16(p_hi, xs)); \
-        }
-    ACC_ROW(0) ACC_ROW(1) ACC_ROW(2) ACC_ROW(3) ACC_ROW(4) ACC_ROW(5) ACC_ROW(6) ACC_ROW(7)
-    #undef ACC_ROW
+    avx2_accum_rows(p_lo, p_hi, splat_dup, k, m, acc, row);
 }
 
 // Word-level row pairing on AVX2 is gated to bits == 8 ONLY: measured +11% there (each gather
