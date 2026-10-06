@@ -569,6 +569,7 @@ struct HostExports {
     config.spin_ns = spin_ns;
     config.keep_warm_ns = keep_warm_ns;
     config.fatal_wait_ns = fatal_wait_ns;
+    config.test_hooks = Build::kFaults;
     auto thread = std::make_shared<draft::DraftCpuThread>(std::move(config));
     static std::atomic<int64_t> next_handle{1};
     const int64_t handle = next_handle.fetch_add(1);

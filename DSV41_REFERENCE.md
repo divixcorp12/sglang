@@ -6282,6 +6282,23 @@ link cost is counted:
 - **Outputs:** `divix01:/mnt/nvme1/cpu-p1/insert-policies{,-v2,-promote,-sorted}.{json,txt}`.
 - **Tests:** `test/registered/unit/kernels/test_cpu_expert_sim.py`, `test/manual/dsv41/test_tier_sim.py`.
 
+**Inserting CPU lanes at faster CPU speeds (2026-10-03, branch `dsv41-cpu-insert`, plan
+`docs/superpowers/plans/2026-10-03-dsv41-cpu-expert-insert.md`).**
+- **What it models.** `tier_sim` gained a FILLING slot. A CPU lane picked for insert frees its own victim now, and its
+  expert is mapped at the layer's next commit, the way a device-side off-critical-path copy would land.
+- **The policies.** `cpu_expert_sim` gained `cpu_insert_p1`, `_p2` and `_all`: the merged policy plus a copy of the
+  head-most 1, 2 or all CPU lanes per layer.
+- **The sweep.** `--cpu-scale 1,2,4,8` divides the split's and the cost model's c_cpu by s.
+- **Sanity.** At s = 1 it reproduces this section's 75.94 ms and 0.672.
+- **Results.** As the CPU gets faster, the merged policy's hot hit collapses to 0.187 at s = 4, where it runs
+  66.3 ms/token. `cpu_insert_p1` keeps 0.625, at 52.7 ms with the copies credited GPU compute and NVMe waits as idle
+  link (`optimistic`). With only the layers' own slack (`amortised`) it is 72.1 ms.
+- **Verdict:** measure first. P1 issues about 30 copies a token, so it pays only if the link is idle for about 30 ms a
+  token outside the layers' copy waits. A PCIe-metrics decode trace must show that before the device change is
+  planned.
+- **At today's speed (s = 1),** P1 loses even optimistically (76.15 against 75.94), so P must be 0 there.
+- **Output:** `divix01:cc-expert-prediction/analysis/dsv41-cpu-insert/`.
+
 ### 30.4 NUMA and layout (microbenchmarks: NUMA 2026-09-30, swizzle P0 2026-09-29)
 
 **NUMA matters little to the kernel.** It ran 12 threads on cores 18-29 (node 1) with the `resid_b128` flavor, in the
@@ -7139,6 +7156,96 @@ eager arm never enters. Raw data is in `cc-expert-prediction/analysis/dsv41-dspa
 - decode graphs for an EXL3 draft;
 - the num_active launch sizing (§33.6);
 - choosing W, which the sweep above would do.
+
+### 33.9 The DSpark draft in the decode graph, end to end (2026-10-05)
+
+Plan `docs/superpowers/plans/2026-10-05-dsv41-dspark-graph-draft-graph.md`, branch `dsv41-dspark-graph`. It captures
+the EXL3 draft's decode graphs with its MoE inside, and measures the draft step with and without the graph.
+
+**What changed.**
+- **The draft's MoE is graph-safe, eager or captured.** The draft MoE always runs post, `DraftResidentMoe`, finish:
+  - the resident experts run in the fused EXL3 call (`draft_moe.py`), at `min(16, 64 // top_k)` tokens per pass;
+  - the CPU share runs on the draft CPU thread (`DraftCpuThread`) over the draft's lease channel.
+- **The draft is the lease channel's second client** (`LEASE_PROTOCOL.md`, "The second client: the DSpark draft").
+- **Capture.** `init_cuda_graphs` prepares every EXL3 draft and captures it unless
+  `SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH=1`. Logs: `DSpark: EXL3 draft graphs on (3 draft MoE layers prepared)`, or
+  `... off, eager (3 ...)`.
+- **The defect this run found, `fc0da8db2f`.** The first `draft-eager` arm died at 20:11 with `DraftResidentMoe.run
+  before prepare()`: prepare ran only when the graph was captured, but the eager draft takes the same path. The switch
+  now decides capture only. The tests were written first (`4dd0310`). That run's last log line holds the one draft CPU
+  sample ever read: 1 job, 5 rows, 4.43 ms forward.
+
+**The run.** Arms `draft-eager` and `draft-graph`, both D2-3's graphed configuration (W = 8, the verify eager-re-run
+at every overflow) with the hybrid draft's CPU experts (3 draft stages, 96 experts per stage on the CPU, 10
+workers on cores 6-15). 8 sessions, 256 prompt and 128 new tokens, server cores 0-5,36-41. Both ran at `fc0da8db2f`:
+
+```bash
+flock rowimg-disk.lock flock cc-gpu.lock taskset -c 0-5,36-41 \
+  python analysis/dsv41-drive/dspark/graphed_verify.py $G draft-eager draft-graph
+```
+
+Raw data is in `cc-expert-prediction/analysis/dsv41-dspark/graph-verify/draft-graph/` (`summary.json`; the crashed first
+run is in `crashed-run/`).
+
+| arm | tok/s | accept length | draft step ms mean / p50 / p95 (n) | verify ms mean (n, < 1 s only) | re-verify rate | text = draft-eager |
+|---|---|---|---|---|---|---|
+| draft-eager | 2.81 | 2.51 | 11.3 / 10.8 / 14.3 (377) | 844 (328) | 1.00 | - |
+| draft-graph | 2.85 | 2.51 | 6.1 / 5.5 / 10.4 (378) | 841 (327) | 1.00 | 8 / 8 |
+
+- **Bars: met.** Both arms ran to the end, `draft-graph`'s log shows the capture line, `draft-eager`'s shows the "off"
+  line, and the text is identical in all 8 sessions. No margin probe was needed.
+- **The draft step's time.** The draft step is the `draft` segment of the DSpark info dump (`draft_gpu_time`): GPU
+  event time from the segment's start to its end, so it includes the wait on the CPU experts. It falls from 11.3 ms
+  (p50 10.8) eager to 6.1 ms (p50 5.5) in the graph, about 5.2 ms per step. The step is not censored at 1 s the way
+  the verify is, and n is 377 and 378.
+- **DSpark's tok/s barely moved: 2.81 to 2.85 (+1.3%).** A step is about 850 ms, almost all the verify, so 5 ms is
+  0.6% of it. The gain is within the noise of 8 sessions, and these two runs are not a repeat.
+- **Accept length is identical (2.51)**, as it must be with identical text. It is above D2-3's 2.37 for the same 8
+  sessions, and the text differs from D2-3's in 6 of 8 sessions. Both are legitimate (final review I4, probe outputs in
+  `graph-verify/i4/`):
+  - **The target did not change.** Run alone, it is bit-identical at `c932392148` and `fc0da8db2f`: greedy ids,
+    logprobs, top-5 and teacher-forced prefill logprobs, all 8 sessions.
+  - **The target alone matches neither text.** It leaves both D2-3 and this run at chars 25-148, earlier than they
+    leave each other, each time at a margin of 0 to 0.25 in its own prefill.
+  - **The draft-to-draft divergences are near-ties for the target, in both directions.** At s12 D2-3's token is the one
+    0.625 behind. The largest is s8 (1.125), inside §33.2's verify-vs-decode band of 1.4 logprob.
+  - **Teacher-forced over every position, this run's text is at least as consistent with the target as D2-3's**:
+    8 of 929 tokens more than 0.25 below the target's argmax (max 1.5), against D2-3's 12 of 899 (max 8.4). The
+    target's own greedy text, scored the same way, gives 4 of 823 (max 0.5).
+  - So the new draft's proposals moved which near-ties the verify forward settles; they did not move the target.
+  - **It is not a fault in the draft MoE:** eager and captured draft text agree 8/8; the fp16 staging is unchanged from
+    the old path; on random weights `test_dspark_hybrid_draft_gpu.py` measures rel_l2 0.003-0.014 against
+    `exl3_moe_loop`, the same with and without the CPU share (its bound is now 0.02, was 0.05).
+  - Exact-text parity across draft changes is the wrong bar, as §33.2 found against the base.
+- **The target's CPU experts are still off in verify** (`SGLANG_DSV41_CPU_EXPERTS=0`), so the verify column is the
+  eager target's.
+- **W = 8 still re-runs every verify (§33.8).** 348 of 348 graphed verifies were re-run in both arms, and 77% of layers
+  overflow per verify. So graphed DSpark's end-to-end number stays bounded by the re-verify until the W sweep.
+  The verify ms column is right-censored at 1 s as in §33.8 and compares nothing.
+
+**Gaps.**
+- **The draft CPU forward ms per stage is not measured by the clean runs.** The `DSpark CPU experts: {jobs, rows,
+  forward_ns, keep_warm_calls}` line is logged in the registry's atexit close, and the driver kills the server with
+  `kill_process_tree`, which skips atexit. Both clean logs lack it, so `draft_cpu` is null in `summary.json`. No
+  instrumentation was added. The only sample is the crashed run's 5-row stage at 4.43 ms.
+- **The graph's saving is not split** between the fused resident-expert call, the removed launch gaps and the CPU
+  wait; the draft segment covers all three.
+- **D2-3's s12 emits " .\n" where the target's prefill gives ".b" at about 0.0 (gap 8.4).** Pre-existing (the old
+  draft path, eager and graphed verify alike), unexplained and not probed here. It fits §33.2's unverified suspect, a
+  wrong Engram verify context at block offset >= 1. The scored context is retokenized at position 119, so it is a lead,
+  not a finding.
+
+**What it decides.**
+- The draft's capture is correct (text equal) and cheap (about 5 ms per step). It does not change the DSpark verdict
+  of §33.8: the verify's 840 ms and the W = 8 overflow decide the end-to-end number, not the draft.
+- It reopens nothing by itself. The W sweep, and a source of verify timing without the 1 s cap, stay the next
+  measurements.
+
+**What this plan does not do:**
+- multi-token CPU experts for the target (D2-4);
+- the W sweep;
+- the epilogue under a narrowed gather;
+- a draft CPU forward ms per stage (see the gap).
 
 ## Sources
 

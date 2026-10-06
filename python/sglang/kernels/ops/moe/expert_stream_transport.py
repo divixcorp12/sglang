@@ -127,6 +127,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "draft_test_post",
     "draft_test_tear",
     "draft_test_finish_close",
+    "draft_test_poll_pause",
 )
 
 

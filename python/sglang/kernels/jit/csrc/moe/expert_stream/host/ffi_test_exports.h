@@ -12,7 +12,8 @@
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_keep_warm_calls, test_keep_warm_core,
 //              pause_ns
-//   draft      draft_test_post, draft_test_tear, draft_test_finish_close: the draft channel's device half on the host
+//   draft      draft_test_post, draft_test_tear, draft_test_finish_close: the draft channel's device half on the host;
+//              draft_test_poll_pause: the draft CPU thread's poll path sleeps between its stop and head loads
 //   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: any kernel's make_layer and forward, by layer id;
 //              in both builds, as the DSpark draft's CPU experts call them (cpu_experts/draft.py)
 //
@@ -886,6 +887,16 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only: the draft CPU thread's poll path sleeps `us` microseconds (0: not at all) between loading its stop flag
+  // and the head word, which holds open the window a stop() landing there needs.
+  static void draft_test_poll_pause(int64_t us) {
+    if constexpr (!Build::kFaults) {
+      test_only("draft_test_poll_pause");
+    } else {
+      draft::g_test_poll_pause_us.store(us, std::memory_order_relaxed);
+    }
+  }
+
   // Layers made with any kernel's make_layer (kernel_layer), by id, for kernel_forward: the DSpark draft's CPU experts
   // (cpu_experts/draft.py) and tests.
   static std::mutex& kernel_layers_mutex() {
@@ -1227,6 +1238,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_post, Exports::draft_test_post);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_tear, Exports::draft_test_tear);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_finish_close, Exports::draft_test_finish_close); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_poll_pause, Exports::draft_test_poll_pause); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_layer, Exports::kernel_layer);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_forward, Exports::kernel_forward);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_kernel_error, Exports::kernel_error);                 \

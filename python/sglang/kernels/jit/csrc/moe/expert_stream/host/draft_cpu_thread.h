@@ -32,6 +32,10 @@
 
 namespace sglang::expert_stream::draft {
 
+/// Instr build only (Config::test_hooks): how long the poll path sleeps between its stop and head loads, to make the
+/// teardown interleaving deterministic (draft_test_poll_pause).
+inline std::atomic<int64_t> g_test_poll_pause_us{0};
+
 class DraftCpuThread {
  public:
   struct Config {
@@ -45,6 +49,7 @@ class DraftCpuThread {
     int threads = 1;
     std::vector<int> cores;             // worker i on cores[i]; this thread on cores[0]
     int64_t spin_ns = -1, keep_warm_ns = 0, fatal_wait_ns = 0;
+    bool test_hooks = false;            // the instr build's: honour g_test_poll_pause_us
   };
 
   static constexpr const char* kPrefix = "DSpark draft CPU experts: ";
@@ -103,13 +108,17 @@ class DraftCpuThread {
     watchdog_ = std::thread([this] { watch(); });
   }
 
-  /// Stops and joins both threads, then opens a gate a wait still holds closed (no completer is left); idempotent.
+  /// Stops and joins the run thread, then the watchdog (a hung forward still fail-stops meanwhile), then opens a gate a wait still holds closed (no completer is left); idempotent.
   /// The device is past its last post at teardown, so moving the head word to end a hold misleads no one.
   void stop() {
     if (!thread_.joinable()) return;
+    head_at_stop_.store(channel::head<DraftChannel>(config_.channel), std::memory_order_relaxed);
     stop_.store(true, std::memory_order_seq_cst);
     __atomic_fetch_add(reinterpret_cast<uint32_t*>(config_.channel + DraftChannel::kHead), 1u, __ATOMIC_SEQ_CST);
     thread_.join();
+    // The watchdog outlives the run thread's stop: a forward that never returns fail-stops within the fatal wait
+    // instead of hanging this join.
+    watchdog_stop_.store(true, std::memory_order_seq_cst);
     if (watchdog_.joinable()) watchdog_.join();
     channel::open_closed_gate<DraftChannel>(config_.channel);
   }
@@ -164,8 +173,13 @@ class DraftCpuThread {
     const uint64_t spin_iters = idle_budget(config_.spin_ns);
     uint64_t idle = 0;
     while (!stop_.load(std::memory_order_acquire)) {
+      if (config_.test_hooks)
+        if (const int64_t pause = g_test_poll_pause_us.load(std::memory_order_relaxed); pause > 0)
+          std::this_thread::sleep_for(std::chrono::microseconds(pause));
       const uint32_t head = channel::head<DraftChannel>(config_.channel);
       if (head != 0 && channel::reached(head, next)) {
+        // stop() stores stop_ before it bumps the head word to end a hold: a bump seen here is not a record.
+        if (stop_.load(std::memory_order_acquire)) break;
         if (head != next)
           fail_stop(std::string(kPrefix) + "record " + std::to_string(next) + " lapped (head " + std::to_string(head) +
                     "); the device posts one record per wait");
@@ -254,10 +268,13 @@ class DraftCpuThread {
   void watch() {
     uint32_t watched = 0;
     int64_t since = 0;
-    while (!stop_.load(std::memory_order_acquire)) {
+    while (!watchdog_stop_.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      if (stop_.load(std::memory_order_acquire)) return;
-      const uint32_t head = channel::head<DraftChannel>(config_.channel);
+      if (watchdog_stop_.load(std::memory_order_acquire)) return;
+      // The bump stop() makes to end a hold is not a record: once stopped, the head is what it was before.
+      const uint32_t head =
+          stop_.load(std::memory_order_acquire) ? head_at_stop_.load(std::memory_order_relaxed)
+                                                : channel::head<DraftChannel>(config_.channel);
       if (head == 0 || head == completed_.load(std::memory_order_acquire)) {
         watched = 0;
         continue;
@@ -293,10 +310,16 @@ class DraftCpuThread {
   Config config_;
   std::vector<cpu_experts::ExpertLayer> layers_;
   std::thread thread_, watchdog_;
+<<<<<<< HEAD
   std::atomic<bool> stop_{false};
   std::atomic<uint32_t> completed_{0};
   std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0}, collided_jobs_{0}, shared_routes_{0},
       collided_forward_ns_{0};
+=======
+  std::atomic<bool> stop_{false}, watchdog_stop_{false};  // the watchdog stops after the run thread has joined
+  std::atomic<uint32_t> completed_{0}, head_at_stop_{0};
+  std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0};
+>>>>>>> origin/master
 };
 
 }  // namespace sglang::expert_stream::draft

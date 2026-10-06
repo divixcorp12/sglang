@@ -8,6 +8,7 @@ spins until the gate opens and checks done[G], as the finish kernel, the stream 
 
 import dataclasses
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -195,16 +196,10 @@ def test_an_idle_thread_sleeps_and_still_serves(request):
 
 
 def test_stop_with_a_closed_gate_returns_and_leaves_it_open(request):
+    # No record is posted, so no forward completes and opens the gate: only stop() can.
     areas, host = _host(request)
-    m = _module()
-    core = _cores()[0]
-    m.expert_stream_test_kernel_hold(core, 1)
-    try:
-        _stage(areas, 0, 1, 2)
-        _post(areas, 0, 1, 2, seq=1)
-        m.expert_stream_draft_test_finish_close(areas.channel.data_ptr(), 1, 0)
-    finally:
-        m.expert_stream_test_kernel_hold(core, 0)
+    _module().expert_stream_draft_test_finish_close(areas.channel.data_ptr(), 1, 0)
+    assert _u32(areas.channel, areas.wire.gate) == lease.gate_word(1, "closed")
     started = time.monotonic()
     host.stop()
     assert time.monotonic() - started < 5.0
@@ -252,3 +247,53 @@ def test_a_failure_fail_stops(case, says):
         assert text in result.stderr, result.stderr[-2000:]
     if case == "hold":
         assert "incomplete" in next(line for line in result.stderr.splitlines() if "FATAL" in line)
+
+
+_STOP_CHILD = """
+import os, sys, time
+from sglang.kernels.ops.moe import expert_stream_transport as ops
+from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas, DraftCpuHost
+from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
+case = sys.argv[1]
+m = ops._host_module("exl3", "instr")
+areas = DraftCpuAreas(3, 64, pin=False)
+kernel = int(m.expert_stream_test_kernel_address(0, 0, 0))
+cores = sorted(os.sched_getaffinity(0))[:2]
+polling = case == "poll"
+host = DraftCpuHost(areas, cores=cores, threads=2, spin_us=0 if polling else -1, keep_warm_us=0,
+                    fatal_wait_s=30.0 if polling else 0.5, variant="instr")
+for stage in range(3):
+    host.set_layer(stage, kernel, fake_cpu_layer(64))
+host.start()
+if polling:
+    m.expert_stream_draft_test_poll_pause(300_000)  # the poll path sleeps between its stop and head loads
+    time.sleep(0.05)
+else:
+    m.expert_stream_test_kernel_hold(cores[0], 1)
+    m.expert_stream_draft_test_post(areas.channel.data_ptr(), 2, 3, 2, 1, 0)
+    time.sleep(0.1)
+host.stop()
+print("stopped" if polling else "late", flush=True)
+"""
+
+
+def test_a_stop_between_the_poll_loads_is_not_a_torn_record():
+    # stop() lands after the run loop read stop_ (false) and before it reads the head: the head word it bumped must
+    # not be read as a posted record.
+    result = spawn_child(_STOP_CHILD, "poll", timeout_s=60, variant=VARIANT)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "stopped" in result.stdout
+    assert "FATAL" not in result.stderr and "torn" not in result.stderr, result.stderr[-2000:]
+
+
+def test_a_stop_during_a_hung_forward_still_fail_stops():
+    # The watchdog outlives stop(): a forward that never returns aborts within the fatal wait instead of hanging
+    # the join.
+    try:
+        result = spawn_child(_STOP_CHILD, "hung", timeout_s=20, variant=VARIANT)
+    except subprocess.TimeoutExpired:
+        pytest.fail("stop() hung behind a forward that never returned: the watchdog had stopped")
+    assert "late" not in result.stdout, (result.stdout, result.stderr[-2000:])
+    assert result.returncode != 0
+    for text in ["DSpark draft CPU experts", "record 1", "incomplete"]:
+        assert text in result.stderr, result.stderr[-2000:]
