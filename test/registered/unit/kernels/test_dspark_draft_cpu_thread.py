@@ -105,8 +105,8 @@ def _host(request, mode, *, spin_us=-1, keep_warm_us=0, fatal_wait_s=30.0, ns_pe
     return areas, host
 
 
-# The shared engine's thread: ExpertStreamHost.enable_cpu_experts names it "<build>-cpu-exp" (RamTier::enable_cpu_experts).
-THREAD = {"draft_only": "dspark-cpu", "shared": VARIANT + "-cpu-exp"}
+# The shared engine's thread: RamTier::enable_cpu_experts names it "<layout>-cpu-exp" (one node: no group suffix).
+THREAD = {"draft_only": "dspark-cpu", "shared": "exl3-cpu-exp"}
 
 
 def _draft_cpu_s(mode) -> float:
