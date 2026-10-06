@@ -373,7 +373,8 @@ def test_a_40_lane_build_carries_36_cpu_lanes_through_cw_and_cc(tmp_path):
     from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
 
     row, lanes, experts = 0, 40, list(range(36))
-    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=80, staging=36)
+    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=80, staging=36,
+              experts=40)  # the rig's default 16 experts would leave 36 routes past the slot map
     try:
         x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
         out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
