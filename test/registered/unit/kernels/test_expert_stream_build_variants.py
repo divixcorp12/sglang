@@ -144,6 +144,7 @@ RAW_EXPORTS = {
     "draft_test_post": lambda m, h: m.expert_stream_draft_test_post(0, 0, 1, 1, 1, 0),
     "draft_test_tear": lambda m, h: m.expert_stream_draft_test_tear(0, 1),
     "draft_test_finish_close": lambda m, h: m.expert_stream_draft_test_finish_close(0, 1, 0),
+    "draft_test_poll_pause": lambda m, h: m.expert_stream_draft_test_poll_pause(0),
     "read_record_fields": lambda m, h: m.expert_stream_read_record_fields(
         torch.zeros(RECORD_BYTES, dtype=torch.uint8), 1, torch.zeros(ops.read_record_words(), dtype=torch.int64)
     ),

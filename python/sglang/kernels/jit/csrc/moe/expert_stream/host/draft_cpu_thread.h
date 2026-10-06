@@ -31,6 +31,10 @@
 
 namespace sglang::expert_stream::draft {
 
+/// Instr build only (Config::test_hooks): how long the poll path sleeps between its stop and head loads, to make the
+/// teardown interleaving deterministic (draft_test_poll_pause).
+inline std::atomic<int64_t> g_test_poll_pause_us{0};
+
 class DraftCpuThread {
  public:
   struct Config {
@@ -44,6 +48,7 @@ class DraftCpuThread {
     int threads = 1;
     std::vector<int> cores;             // worker i on cores[i]; this thread on cores[0]
     int64_t spin_ns = -1, keep_warm_ns = 0, fatal_wait_ns = 0;
+    bool test_hooks = false;            // the instr build's: honour g_test_poll_pause_us
   };
 
   static constexpr const char* kPrefix = "DSpark draft CPU experts: ";
@@ -151,6 +156,9 @@ class DraftCpuThread {
     const uint64_t spin_iters = idle_budget(config_.spin_ns);
     uint64_t idle = 0;
     while (!stop_.load(std::memory_order_acquire)) {
+      if (config_.test_hooks)
+        if (const int64_t pause = g_test_poll_pause_us.load(std::memory_order_relaxed); pause > 0)
+          std::this_thread::sleep_for(std::chrono::microseconds(pause));
       const uint32_t head = channel::head<DraftChannel>(config_.channel);
       if (head != 0 && channel::reached(head, next)) {
         if (head != next)
