@@ -310,16 +310,10 @@ class DraftCpuThread {
   Config config_;
   std::vector<cpu_experts::ExpertLayer> layers_;
   std::thread thread_, watchdog_;
-<<<<<<< HEAD
-  std::atomic<bool> stop_{false};
-  std::atomic<uint32_t> completed_{0};
-  std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0}, collided_jobs_{0}, shared_routes_{0},
-      collided_forward_ns_{0};
-=======
   std::atomic<bool> stop_{false}, watchdog_stop_{false};  // the watchdog stops after the run thread has joined
   std::atomic<uint32_t> completed_{0}, head_at_stop_{0};
-  std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0};
->>>>>>> origin/master
+  std::atomic<int64_t> jobs_{0}, rows_{0}, forward_ns_{0}, holds_{0}, collided_jobs_{0}, shared_routes_{0},
+      collided_forward_ns_{0};
 };
 
 }  // namespace sglang::expert_stream::draft
