@@ -54,7 +54,10 @@ def _demangle(name: str) -> str:
 
 
 def _sass(so: str) -> dict[str, str]:
-    text = subprocess.run(["cuobjdump", "-sass", so], capture_output=True, text=True, check=True).stdout
+    return _sass_digests(subprocess.run(["cuobjdump", "-sass", so], capture_output=True, text=True, check=True).stdout)
+
+
+def _sass_digests(text: str) -> dict[str, str]:
     digests, name, lines = {}, None, []
 
     def close():
