@@ -174,16 +174,10 @@ def test_an_idle_thread_sleeps_and_still_serves(request):
 
 
 def test_stop_with_a_closed_gate_returns_and_leaves_it_open(request):
+    # No record is posted, so no forward completes and opens the gate: only stop() can.
     areas, host = _host(request)
-    m = _module()
-    core = _cores()[0]
-    m.expert_stream_test_kernel_hold(core, 1)
-    try:
-        _stage(areas, 0, 1, 2)
-        _post(areas, 0, 1, 2, seq=1)
-        m.expert_stream_draft_test_finish_close(areas.channel.data_ptr(), 1, 0)
-    finally:
-        m.expert_stream_test_kernel_hold(core, 0)
+    _module().expert_stream_draft_test_finish_close(areas.channel.data_ptr(), 1, 0)
+    assert _u32(areas.channel, areas.wire.gate) == lease.gate_word(1, "closed")
     started = time.monotonic()
     host.stop()
     assert time.monotonic() - started < 5.0
