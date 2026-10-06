@@ -553,12 +553,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        if capture_decode_cuda_graph and draft_runs_exl3(self.draft_model):
+        if draft_runs_exl3(self.draft_model):
+            # The draft MoE runs its graph-safe path eagerly too, so an uncaptured EXL3 draft is prepared as well.
             from sglang.srt.layers.quantization.exl3.draft_moe import prepare_dspark_draft_graph
 
             prepared = prepare_dspark_draft_graph(self.draft_model)
             if self.ps.tp_rank == 0:
-                logger.info("DSpark: EXL3 draft graphs on (%d draft MoE layers prepared)", prepared)
+                logger.info(
+                    "DSpark: EXL3 draft graphs %s (%d draft MoE layers prepared)",
+                    "on" if capture_decode_cuda_graph else "off, eager",
+                    prepared,
+                )
         with draft_pp_context(), self._draft_context():
             if capture_decode_cuda_graph:
                 # Keep the draft model graph enabled when folded proposal is
