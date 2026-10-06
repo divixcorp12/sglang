@@ -46,6 +46,30 @@ and the client's data areas are its own; only the protocol is shared. The target
   loads it with acquire, which orders the host's results before every later device read of them, and traps otherwise.
   Only a teardown opens a gate without done[G] (`open_closed_gate`), and the process is ending then.
 
+### The second client: the DSpark draft
+
+The draft's CPU experts (`draft_channel.h`, `host/draft_cpu_thread.h`) run on the same channel, so a draft MoE layer's
+call sits inside the draft's decode graph as one post, one gate wait and one commit.
+
+- **Spec.** `DraftChannel = ChannelSpec<Head 0, Ring 128, Records 4, RecordBytes 128, Done 640, Gate 768>`, in one
+  4096-byte pinned buffer (`kChannelBytes`) that holds the page and the completion block together. The target keeps
+  them in two areas.
+- **Record.** seq u32 @0 (the seqlock word), stage u16 @4, rows u8 @6, k u8 @7, epoch u32 @8; the other bytes of the
+  128-byte slot are unused. It names the CPU share of one call. The inputs and outputs are not in it: they are the
+  draft's own pinned areas (`DraftCpuAreas`), `[stages, kMaxRows = 16, ...]` each, indexed by the stage.
+- **One record per wait.** The draft posts at most one record before its finish waits on the gate, so the ring never
+  laps. The host takes a head that is more than one past the record it expects (a lap), and a record whose seq word
+  does not match (torn), as protocol failures and fail-stops.
+- **Completer.** `DraftCpuThread`, the OpenMP master of the draft's team. It reads the record, runs the stage's M-row
+  forward over the staged x and routes, and calls `channel::complete` (done[G], then the Dekker open of the gate).
+- **Idle.** After a job the thread holds its team in the CPU kernel's `keep_warm`, which watches the channel's head
+  word. The GPU's release store of the next head ends the hold, with no syscall. Past the warm window and
+  `spin_ns` the team is released and the thread polls the head (spinning, then 50 us sleeps), because the GPU cannot
+  ring a futex.
+- **Failure.** A watchdog checks every 20 ms and fail-stops a record that stays incomplete for `fatal_wait_ns`.
+  `stop()` joins both threads and then opens a gate still held closed (`open_closed_gate`), as at the target's teardown.
+- **Not shared.** The two clients share the protocol only: separate buffers, areas and threads.
+
 ## Parties
 
 - **Device.** One linear chain per layer, in one stream, capturable in a graph
