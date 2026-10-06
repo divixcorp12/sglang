@@ -166,7 +166,7 @@ def test_a_verify_spills_every_victimless_lane_to_the_cpu_and_never_overflows_on
             cold = [e for e in outsiders() if e not in warm][:LANES]
             assert len(cold) == LANES
             assert served_without_overflow(_distinct(cold)) == LANES
-            resident = {e for e, s in enumerate(service.host.mapping(0).tolist()) if s >= 0}
+            resident = {e for e, s in enumerate(service.host.mapping(0)) if s >= 0}
             assert len(set(cold) - resident) <= VICTIMS, "the forced misses are cached in their RAM victims"
             assert updater.gather_overflow[0].item() == before, "no armed verify overflowed"
     finally:
