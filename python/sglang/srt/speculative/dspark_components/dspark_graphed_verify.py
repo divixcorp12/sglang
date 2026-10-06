@@ -29,9 +29,15 @@ def forward_verify_with_reverify(model_runner, forward):
 
 
 def draft_runs_exl3(draft_model) -> bool:
-    """Whether the draft's MoE is EXL3: exl3_moe_loop reads expert counts on the host and refuses capture."""
+    """Whether the draft's MoE is EXL3."""
     config = getattr(draft_model, "quant_config", None)
     return config is not None and config.get_name() == "exl3"
+
+
+def draft_graph_allowed(draft_model) -> bool:
+    """An EXL3 draft captures its decode graphs (its MoE is graph-safe: draft_moe.py and the draft channel) unless
+    SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH keeps it eager for an A/B."""
+    return not (draft_runs_exl3(draft_model) and envs.SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH.get())
 
 
 def target_gather_is_narrow(model_runner) -> bool:

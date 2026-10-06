@@ -52,7 +52,11 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
-from sglang.srt.speculative.dspark_components.dspark_graphed_verify import draft_runs_exl3, target_gather_is_narrow
+from sglang.srt.speculative.dspark_components.dspark_graphed_verify import (
+    draft_graph_allowed,
+    draft_runs_exl3,
+    target_gather_is_narrow,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -532,9 +536,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        # An EXL3 draft's MoE (exl3_moe_loop) reads expert counts on the host and refuses capture; the draft then runs
-        # eagerly while the target keeps its decode graph.
-        capture_decode_cuda_graph = self._decode_graph_allowed and not draft_runs_exl3(self.draft_model)
+        # An EXL3 draft captures its decode graphs through its graph-safe MoE (prepare_dspark_draft_graph) unless
+        # SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH keeps it eager; the target keeps its decode graph either way.
+        capture_decode_cuda_graph = self._decode_graph_allowed and draft_graph_allowed(self.draft_model)
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
             self.device,
@@ -549,6 +553,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
+        if capture_decode_cuda_graph and draft_runs_exl3(self.draft_model):
+            from sglang.srt.layers.quantization.exl3.draft_moe import prepare_dspark_draft_graph
+
+            prepared = prepare_dspark_draft_graph(self.draft_model)
+            if self.ps.tp_rank == 0:
+                logger.info("DSpark: EXL3 draft graphs on (%d draft MoE layers prepared)", prepared)
         with draft_pp_context(), self._draft_context():
             if capture_decode_cuda_graph:
                 # Keep the draft model graph enabled when folded proposal is
