@@ -40,7 +40,8 @@ DEVICE = re.compile(r"^(expert_stream_exl3_l8(_n2)?|expert_residency_direct_.*|(
 HOST = re.compile(r"^expert_stream_host_exl3_(prod|instr)_l8(_n2)?$")
 # The wide template arguments this plan adds to shared kernels; their narrow instantiation is the old kernel.
 RENAMES = [
-    (re.compile(r"direct_commit_gather_kernel<unsigned int, 32>"), "direct_commit_gather_kernel"),
+    # a function template demangles with its return type; the plain kernel it replaces has none
+    (re.compile(r"^void (.*?direct_commit_gather_kernel)<unsigned int, 32>"), r"\1"),
     (re.compile(r"(exl3_moe_route_tables_kernel<[^<>]*?), unsigned int>"), r"\1>"),
 ]
 
