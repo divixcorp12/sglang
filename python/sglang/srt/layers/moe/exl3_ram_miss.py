@@ -519,6 +519,16 @@ def padded_plan_width(capacity: int, lanes: int) -> int:
     return max(capacity, lanes)
 
 
+def spill_room_shortfall(ranges, *, staging: int, lanes: int, hot: int) -> list[tuple[int, int, int]]:
+    """The node ranges of a layer that cannot give every forced CPU miss a RAM victim, as (group, slots, needed).
+
+    A forced miss is read into a victim of its node's range: neither a staging slot (`staging`), nor an expert the
+    record routes (at most `lanes` less the forced misses themselves), nor a VRAM-hot expert (at most `hot`). So a
+    range of at least staging + lanes + hot slots always has one (plan 2026-10-06, Task 9)."""
+    need = staging + lanes + hot
+    return [(g, hi - lo, need) for g, (lo, hi) in enumerate(ranges) if hi - lo < need]
+
+
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
     """``PinnedTierRowBackend`` whose gather is the lease chain.
 
@@ -593,6 +603,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             )
         self.cpu_experts = cpu_experts
         self.cpu_input = None
+        self.spill = None  # DIRECT's (overflow flag, this layer's counter) under spill; set by Exl3RamMissService.attach
         self.streamer_of = streamer_of
         self._delivered: Optional[torch.Tensor] = None
 
@@ -655,6 +666,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             self.hot_capacity,
             captured=captured,
             cpu_input=self.cpu_input if captured and self.cpu_experts else None,
+            spill=self.spill,
         )
         side.copy_engine_captured |= captured
         copy_expert_row_segments_gpu(
@@ -772,6 +784,7 @@ class Exl3RamMissService:
         self.device_side: Optional[ExpertStreamDevice] = None
         self.page = None
         self.slot_map = None
+        self._node_ranges = None
         self._rows: dict[int, int] = {}
         self._manager = None
         # The only caller of host.pause()/resume(), which are not reentrant.
@@ -878,6 +891,21 @@ class Exl3RamMissService:
         the build's lanes."""
         return self._staging_planned or self._gather_planned or self.resolved_lanes()
 
+    def _check_spill_room(self, row: int, streamer, width: int) -> None:
+        """Refuse a layer whose node ranges cannot place every forced CPU miss (spill_room_shortfall)."""
+        capacity = int(self.host.tables.capacity[row])
+        # group_ranges is per group, then per row.
+        ranges = [group[row] for group in self._node_ranges] if self._node_ranges is not None else [(0, capacity)]
+        short = spill_room_shortfall(
+            ranges, staging=self.staging_for(capacity), lanes=width, hot=int(streamer.hot_cache.capacity)
+        )
+        if short:
+            raise ValueError(
+                f"exl3 RAM miss: spill reads every forced CPU miss into a RAM victim; layer {streamer.layer_id}'s "
+                f"node ranges (group, slots, needed) {short} are too small: raise SGLANG_MOE_PINNED_HOST_NUMA_MB or "
+                "lower SGLANG_MOE_HOT_GPU_MB"
+            )
+
     def staging_for(self, capacity: int) -> int:
         """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""
         return min(self.staging_width(), capacity - 1)
@@ -972,6 +1000,7 @@ class Exl3RamMissService:
                 ],
                 [plan.node for plan in numa.plans],
             )
+        self._node_ranges = node_ranges
         pin = torch.cuda.is_available()
         self._wire = wire_layout(lanes, numa.nodes)
         page = new_page(pin=pin, wire=self._wire)
@@ -1134,6 +1163,10 @@ class Exl3RamMissService:
             raise RuntimeError(
                 f"exl3 RAM miss: CPU experts need one hidden size, the layers have {hidden}"
             )
+        # A DSpark verify gathers tokens x top_k routes a layer; the CPU rows hold that many tokens.
+        tokens = max((s.graph_gather_rows // s.layer.top_k for s in streamers.values() if s.graph_gather_rows), default=1)
+        # Spill: a split entry is only read for the live lanes, at most the victim lanes.
+        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get() or None
         return CpuExpertGroups(
             host,
             trait,
@@ -1142,6 +1175,8 @@ class Exl3RamMissService:
             plans=numa.plans,
             split=configured_split(host.wire.lanes),
             pin=pin,
+            tokens=tokens,
+            calibration_lanes=victims,
         )
 
     def before_host_use(self) -> None:
@@ -1220,11 +1255,6 @@ class Exl3RamMissService:
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
                 f"({width} miss lanes) per call but the service requests at most {self.lanes} lanes"
             )
-        if self.cpu_experts is not None and width < streamer.graph_gather_rows:
-            raise ValueError(
-                f"exl3 RAM miss: CPU experts serve one token; layer {streamer.layer_id}'s gather serves {width} "
-                f"misses of {streamer.graph_gather_rows} routes (a verify)"
-            )
         cache = streamer.hot_cache
         if self.cpu_experts is not None:
             # The fused plan sorts this layer's miss lanes by residency key, highest
@@ -1287,8 +1317,10 @@ class Exl3RamMissService:
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
         # The host staged staging_for(capacity) slots for the row at start. A post requests
-        # at most the miss width (a verify's clamp keeps its count there), not the routes.
-        want = max(1, streamer.graph_miss_width)
+        # at most the miss width (a verify's clamp keeps its count there), not the routes; under spill, the victim
+        # lanes (only live misses stage).
+        victims = getattr(manager.gpu_residency, "victim_lanes", None)
+        want = max(1, min(streamer.graph_miss_width, victims) if victims else streamer.graph_miss_width)
         staged = self.staging_for(int(self.host.tables.capacity[row]))
         if staged < want:
             logger.warning(
@@ -1338,6 +1370,16 @@ class Exl3RamMissService:
             cpu_experts=self.cpu_experts is not None,
             streamer_of=self.tables[streamer.layer_id].streamer_of,
         )
+        updater = manager.gpu_residency
+        if self.cpu_experts is not None and getattr(updater, "victim_lanes", width) < width:
+            # Spill: forced CPU misses land in RAM victims (RamTier::reserve_victims_locked), so the layer must have
+            # room for them; the post flags this layer itself only before the copy engine arms.
+            self._check_spill_room(row, streamer, width)
+            residency_row = streamer.residency_row
+            streamer.row_backend.spill = (
+                updater.overflow_flag,
+                updater.gather_overflow[residency_row : residency_row + 1],
+            )
         if self.copy_engine:
             dst_rows = min(
                 int(destination.shape[0]) for _, destination in segments.pairs

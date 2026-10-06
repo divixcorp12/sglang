@@ -58,6 +58,12 @@ def split_from_grid(grid: Sequence[Sequence[float]], tie: float = 0.02) -> list[
     return split
 
 
+def capped_split(grid, width: int, configured) -> list[int]:
+    """The split from a grid measured up to `width` lanes: split_from_grid's entries 0..width, then the configured
+    entries above, which a split capped at the live lanes never reads."""
+    return split_from_grid([row[: width + 1] for row in grid[: width + 2]]) + list(configured[width + 1 :])
+
+
 def format_calibration(
     grid: Sequence[Sequence[float]],
     split: Sequence[int],

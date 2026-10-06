@@ -51,7 +51,8 @@ struct CalibrationSetup {
   std::vector<CopyEntry> entries;  // the entries production's DMA copies
   CopyBackend* backend = nullptr;
   HostCopyBackend* host_backend = nullptr;  // set: release each mark (the test backend completes only released ones)
-  uint64_t scratch = 0;                     // kCalibLanes experts: entry e's rows at its own offset
+  uint64_t scratch = 0;                     // `lanes` experts: entry e's rows at its own offset
+  int lanes = kCalibLanes;  // the most lanes measured, 1..kCalibLanes (spill: the victim lanes)
   int reps = 1;                             // timed repetitions per cell, after one discarded warm-up
   int64_t timeout_ns = 0;                   // per measurement
 };
@@ -92,7 +93,7 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
         if (const int r = s.backend->issue(base + static_cast<uint64_t>(j) * bytes, src, entry.bytes))
           throw std::runtime_error("calibration: a DMA issue failed (" + std::to_string(r) + ")");
       }
-      base += static_cast<uint64_t>(kCalibLanes) * bytes;
+      base += static_cast<uint64_t>(s.lanes) * bytes;
     }
     if (const int r = s.backend->mark(&token))
       throw std::runtime_error("calibration: a DMA mark failed (" + std::to_string(r) + ")");
@@ -135,11 +136,11 @@ inline double calibration_mean_ms(const CalibrationSetup& s, int k, int m) {
 // Fills `out` (kCalibRows x kCalibCols doubles, layout above) with the mean ms of every cell.
 inline void calibrate_split(const CalibrationSetup& s, double* out) {
   std::fill(out, out + kCalibRows * kCalibCols, 0.0);
-  for (int k = 1; k <= kCalibLanes; ++k)
+  for (int k = 1; k <= s.lanes; ++k)
     out[k] = calibration_mean_ms(s, k, 0);
-  for (int m = 1; m <= kCalibLanes; ++m)
+  for (int m = 1; m <= s.lanes; ++m)
     out[kCalibCols + m] = calibration_mean_ms(s, 0, m);
-  for (int n = 1; n <= kCalibLanes; ++n)
+  for (int n = 1; n <= s.lanes; ++n)
     for (int k = 0; k <= n; ++k)
       out[(1 + n) * kCalibCols + k] = calibration_mean_ms(s, k, n - k);
 }

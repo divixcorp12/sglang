@@ -790,13 +790,14 @@ class RamTier {
 
   // Runs the startup calibration of the CPU split (split_calibration.h) and fills `out`, float64
   // [kCalibRows][kCalibCols] in ms. The caller must own the tier, since it claims CPU job sequences, which are the
-  // owner's. device -1 copies with the test backend; `scratch` holds kCalibLanes experts on that device. Throws on bad
+  // owner's. device -1 copies with the test backend; `scratch` holds `lanes` experts on that device. Throws on bad
   // arguments, a failed copy or a timeout.
   void calibrate_cpu_split(
       int g,
       int64_t row,
       int64_t device,
       int64_t reps,
+      int64_t lanes,
       uint64_t scratch,
       int64_t scratch_bytes,
       int64_t timeout_ns,
@@ -812,17 +813,19 @@ class RamTier {
     if (!cpu->eligible(row))
       throw std::runtime_error(prefix + "row " + std::to_string(row) + " has no registered CPU layer");
     const GroupRow& own = dist_.group(g).rows[row];
-    if (own.hi - own.lo < kCalibLanes)
+    if (own.hi - own.lo < lanes)
       throw std::runtime_error(
-          prefix + "it needs " + std::to_string(kCalibLanes) + " RAM slots of group " + std::to_string(g) + " in row " +
+          prefix + "it needs " + std::to_string(lanes) + " RAM slots of group " + std::to_string(g) + " in row " +
           std::to_string(row) + ", the group has " + std::to_string(own.hi - own.lo));
     if (reps < 1 || timeout_ns <= 0) throw std::runtime_error(prefix + "reps and the timeout must be positive");
+    if (lanes < 1 || lanes > kCalibLanes)
+      throw std::runtime_error(prefix + "lanes must be 1.." + std::to_string(kCalibLanes));
     CalibrationSetup s;
     s.cpu = cpu.get();
     s.first_slot = own.lo;
     s.row = row;
     s.entries = copy_engine_->dma_entries(row);
-    const int64_t need = kCalibLanes * calibration_expert_bytes(s.entries);
+    const int64_t need = lanes * calibration_expert_bytes(s.entries);
     if (need == 0) throw std::runtime_error(prefix + "row " + std::to_string(row) + " copies no bytes");
     if (scratch == 0 || scratch_bytes < need)
       throw std::runtime_error(
@@ -847,6 +850,7 @@ class RamTier {
     s.backend = backend.get();
     s.scratch = scratch;
     s.reps = static_cast<int>(reps);
+    s.lanes = static_cast<int>(lanes);
     s.timeout_ns = timeout_ns;
     calibrate_split(s, out);
     shutdown.idle = true;
