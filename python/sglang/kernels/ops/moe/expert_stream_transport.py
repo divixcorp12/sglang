@@ -2424,6 +2424,11 @@ class ExpertStreamDevice:
         # Stable sentinels for absent tensors (see the class doc on graph capture).
         self._no_hot_slots = torch.empty(0, dtype=torch.int64, device=device)
         self._no_cpu = torch.empty(0, dtype=torch.int32, device=device)
+        # The spill words of a post without spill: never read (the post's spill is 0).
+        self._no_spill = (
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int64, device=device),
+        )
         self._module = None
         self._layout = layout
         self.hot_page = hot_page
@@ -2610,6 +2615,7 @@ class ExpertStreamDevice:
         hot_capacity: int = 0,
         captured: bool = False,
         cpu_input=None,
+        spill=None,
     ) -> None:
         """Post the layer's request.
 
@@ -2621,6 +2627,10 @@ class ExpertStreamDevice:
         ``cpu_input`` is ``(x [1, hidden], route weights aligned with routes)``, for CPU
         experts and only with ``captured``: the post stages x in the row's host row when
         a lane is the CPU's, and the weights in the record.
+
+        ``spill`` is DIRECT's ``(overflow_flag int32 [1], gather_overflow int64 [1])`` for this row, given when lanes
+        may have no VRAM victim (SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES): a lane whose ``dst_slots`` entry is -1
+        becomes a CPU lane, or, when one cannot, the post serves the live prefix, lowers ``count`` and flags both words.
         """
         self._check_row(row)
         self._check_buffers(
@@ -2648,6 +2658,16 @@ class ExpertStreamDevice:
                 )
             cpu_x, cpu_weights = cpu_x.reshape(1, -1), cpu_weights.reshape(-1)
             cpu_x_dst = int(self.cpu_x_rows[row].data_ptr())
+        spill_on, (overflow_flag, gather_overflow) = 0, self._no_spill
+        if spill is not None:
+            overflow_flag, gather_overflow = spill
+            for name, t, dtype in (
+                ("overflow_flag", overflow_flag, torch.int32),
+                ("gather_overflow", gather_overflow, torch.int64),
+            ):
+                if t.dtype != dtype or t.numel() != 1 or t.device != self.state.device:
+                    raise ValueError(f"{name} must be one {dtype} word on {self.state.device}")
+            spill_on = 1
         bank = self.map_bank
         cpu_on = self.cpu_x_rows is not None
         self._kernels().expert_stream_post(
@@ -2686,6 +2706,9 @@ class ExpertStreamDevice:
             cpu_x,
             cpu_x_dst,
             cpu_weights,
+            spill_on,
+            overflow_flag,
+            gather_overflow,
             int(self.lease_pdl),
         )
 

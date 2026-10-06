@@ -24,7 +24,7 @@ struct PostParams {
   uint8_t* page;
   int32_t* state;
   const int64_t* planned;
-  const int32_t* count;
+  int32_t* count;  // the plan's miss count; a spill overflow lowers it
   int64_t lanes;  // the plan's buffers: planned and dst_slots hold this many
   const int64_t* routes;
   int64_t route_count;
@@ -70,6 +70,13 @@ struct PostParams {
   const void* cpu_weights;
   int64_t cpu_weights_dtype;
   int64_t cpu_weights_count;
+  // Spill (GpuResidencyUpdater.victim_lanes below its miss lanes, CPU experts on): a lane whose dst_slots entry is -1
+  // found no VRAM victim and must be a CPU lane. When forced lanes cannot be (copy engine unarmed, no CPU layer), the
+  // post serves the live prefix, writes it to count and flags the forward in DIRECT's words: overflow_flag (int32,
+  // sticky) and gather_overflow (this layer's int64 counter). Both unused when spill is 0.
+  int64_t spill;
+  int32_t* overflow_flag;
+  int64_t* gather_overflow;
 };
 
 // Element dtypes of the CPU experts' staged input and routing weights (PostParams).
@@ -117,7 +124,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   __shared__ TypedLanes typed;
   int32_t* __restrict__ const state = p.state;
   const uint64_t deadline = global_ns() + static_cast<uint64_t>(p.timeout_ns);
-  const int64_t count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
+  int64_t count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   if (threadIdx.x == 0) {
     if (count > Wire::kLanes || count > p.lanes) __trap();  // the record and the plan's buffers hold no more
     any_cpu = 0;
@@ -150,7 +157,30 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       // Ordered after the tag's acquire; issued while the delta's loads are in flight.
       policy.host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + Wire::kCopyArmed) == 1u;
       if (pending) apply_map_delta(d, map);
-      type_lanes(LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count}, map, policy, typed);
+      // Spill: DIRECT gives the lanes past its victims destination -1 (GpuResidencyUpdater.gather_destinations), and
+      // the live lanes are a prefix.
+      int64_t live = count;
+      if (p.spill != 0)
+        for (int64_t j = 0; j < count; ++j)
+          if (p.dst_slots[j] < 0) {
+            live = j;
+            break;
+          }
+      if (!type_lanes(
+              LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count, .forced_from = live},
+              map,
+              policy,
+              typed)) {
+        // Forced lanes cannot be the CPU's (the copy engine is not armed, or no CPU layer yet): serve the live prefix
+        // and flag the forward, as clamp_gather_misses does without CPU experts. S, CW, CC and the DIRECT commit read
+        // the count written here.
+        count = live;
+        p.count[0] = static_cast<int32_t>(live);
+        *p.overflow_flag = 1;
+        *p.gather_overflow += 1;
+        type_lanes(
+            LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = live, .forced_from = live}, map, policy, typed);
+      }
       for (int64_t j = 0; j < count; ++j)
         any_cpu |= is_cpu_kind(typed.kind[j]) ? 1 : 0;
     }
@@ -335,6 +365,9 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView cpu_x,
       int64_t cpu_x_dst,
       tvm::ffi::TensorView cpu_weights,
+      int64_t spill,
+      tvm::ffi::TensorView overflow_flag,
+      tvm::ffi::TensorView gather_overflow,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -430,12 +463,19 @@ struct LeaseProtocolKernel {
         lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
         "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
 
+    if (spill != 0) {
+      expert_stream::verify_named(
+          "overflow_flag", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), overflow_flag);
+      expert_stream::verify_named(
+          "gather_overflow", TensorMatcher({1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), gather_overflow);
+    }
+
     const auto stream = LaunchKernel::resolve_device(state.device());
     const auto params = PostParams{
         .page = static_cast<uint8_t*>(page.data_ptr()),
         .state = static_cast<int32_t*>(state.data_ptr()),
         .planned = static_cast<const int64_t*>(planned.data_ptr()),
-        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .count = static_cast<int32_t*>(count.data_ptr()),
         .lanes = std::min<int64_t>(planned.size(0), dst_slots.size(0)),
         .routes = static_cast<const int64_t*>(routes.data_ptr()),
         .route_count = routes.size(0),
@@ -473,6 +513,9 @@ struct LeaseProtocolKernel {
         .cpu_weights = cpu_input ? cpu_weights.data_ptr() : nullptr,
         .cpu_weights_dtype = cpu_input ? cpu_dtype(cpu_weights) : 0,
         .cpu_weights_count = cpu_input ? cpu_weights.numel() : 0,
+        .spill = spill,
+        .overflow_flag = spill != 0 ? static_cast<int32_t*>(overflow_flag.data_ptr()) : nullptr,
+        .gather_overflow = spill != 0 ? static_cast<int64_t*>(gather_overflow.data_ptr()) : nullptr,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)
         .enable_pdl(use_pdl != 0)(
