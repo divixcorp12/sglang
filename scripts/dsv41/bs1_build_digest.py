@@ -4,8 +4,8 @@ Widening the wire past 32 lanes edits source the BS1 build compiles too. Its ins
 machine code, which is what keeps BS1 outputs and timing unchanged. This runs the BS1 suites into a fresh JIT cache (so
 every module they load is built here), then records:
   - for every kernel in the BS1 device modules and the shared DIRECT and route-table modules: the sha256 of its SASS
-    (cuobjdump -sass), instruction words and encodings, addresses stripped, keyed by its demangled name with the wide
-    template arguments this plan adds normalised away;
+    (cuobjdump -sass), instruction words and encodings, addresses and whitespace padding stripped, keyed by its
+    demangled name with the wide template arguments this plan adds normalised away;
   - for every 8-lane host module: the sha256 of its .text section.
 Run on divix01 under cc-gpu.lock from the worktree root:
     python scripts/dsv41/bs1_build_digest.py --write OUT.json      (record)
@@ -70,7 +70,9 @@ def _sass_digests(text: str) -> dict[str, str]:
             close()
             name, lines = match.group(1), []
         elif name is not None and "/*" in line:
-            lines.append(re.sub(r"/\*[0-9a-f]{4,}\*/", "", line).strip())  # drop the address column
+            # drop the address and encoding columns; cuobjdump pads the encoding column to the widest instruction of the
+            # module, so a change to one kernel re-pads every other kernel's lines: collapse the whitespace too
+            lines.append(re.sub(r"\s+", " ", re.sub(r"/\*[0-9a-f]{4,}\*/", "", line)).strip())
     close()
     return digests
 
