@@ -1,6 +1,6 @@
 """The draft channel's device half (draft_kernels.cuh): post, finish (close + wait node) and commit (GPU).
 
-A Python thread stands in for the host half (Task 4's DraftCpuThread): it watches the head word through a numpy view
+A Python thread stands in for the host half (the CPU expert engine's draft source): it watches the head word through a numpy view
 of the pinned channel, checks the record's seq, writes the stage's output rows, then completes the way the lease
 channel's host `complete` does (done[G], then open the gate if it reads closed(G)). Python has no store->load fence,
 so the stand-in keeps re-checking the gate until it reads open(G); the real host half fences.
