@@ -4,12 +4,18 @@ Three arms, one Engine each through trace_corpus.py, the same sessions, the hybr
   eager     the verify eager (decode disabled), as §33.4's hybrid arm;
   graphed   the verify in the breakable decode graph at W miss lanes; an overflowed verify is re-run eagerly;
   reverify  graphed, with every verify re-run eagerly (SGLANG_TEST_DSPARK_FORCE_REVERIFY): its text must equal eager's.
+Two more arms, the draft in the decode graph (plan 2026-10-05-dsv41-dspark-graph-draft-graph Task 7), both graphed at W
+miss lanes with the draft's CPU experts on:
+  draft-eager  the draft's MoE eager (SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH=1);
+  draft-graph  the draft captured in its own graph; its text is compared with draft-eager's.
 Run on divix01 from a worktree at the pushed branch, holding rowimg-disk.lock then cc-gpu.lock:
   python analysis/dsv41-drive/dspark/graphed_verify.py OUTDIR [ARM ...]
 """
 
 import json
+import ast
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -42,7 +48,12 @@ D23_ARMS = {
     "eager": ({**COMMON, **ARMS["hybrid"]}, False),
     "graphed": ({**GRAPHED, **ARMS["hybrid"]}, True),
     "reverify": ({**GRAPHED, **ARMS["hybrid"], "SGLANG_TEST_DSPARK_FORCE_REVERIFY": "1"}, True),
+    "draft-eager": ({**GRAPHED, **ARMS["hybrid"], "SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH": "1"}, True),
+    "draft-graph": ({**GRAPHED, **ARMS["hybrid"]}, True),
 }
+# The draft arms also dump the draft's GPU time, and read the draft CPU thread's close-time counters from the log.
+DRAFT_ARMS = ("draft-eager", "draft-graph")
+DRAFT_CPU_LINE = re.compile(r"DSpark CPU experts: (\{.*\})")
 
 
 # Cores the recipe and ab_cpu_draft name for their own affinities. Unset, ThreadingConfig derives the RAM threads' and
@@ -54,7 +65,7 @@ def arm_environment(arm: str, outdir: str) -> dict:
     overrides, _ = D23_ARMS[arm]
     overrides = {
         **overrides,
-        "SGLANG_DSPARK_DEBUG_DUMP": "target_verify_gpu_time",
+        "SGLANG_DSPARK_DEBUG_DUMP": "target_verify_gpu_time,draft_gpu_time" if arm in DRAFT_ARMS else "target_verify_gpu_time",
         "SGLANG_MOE_HOT_METRICS_FILE": os.path.join(outdir, f"{arm}.metrics.jsonl"),
     }
     env = {k: v for k, v in (os.environ | arm_env.arm_env(overrides)).items() if k not in HAND_PINNED}
@@ -92,6 +103,35 @@ def _last_metrics(path: str):
     return json.loads(lines[-1]) if lines else None
 
 
+def _log_has(path: str, needle: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    with open(path, errors="replace") as f:
+        return any(needle in line for line in f)
+
+
+def draft_cpu_stats(log_path: str):
+    """The draft CPU thread's {jobs, rows, forward_ns, keep_warm_calls}, from the registry's close-time log line; None
+    when the line is absent (the server was killed past its atexit)."""
+    if not os.path.exists(log_path):
+        return None
+    with open(log_path, errors="replace") as f:
+        found = [m.group(1) for m in map(DRAFT_CPU_LINE.search, f) if m]
+    return ast.literal_eval(found[-1]) if found else None
+
+
+def _percentiles(values):
+    values = sorted(values)
+    if not values:
+        return {"n": 0, "mean": None, "p50": None, "p95": None}
+    return {
+        "n": len(values),
+        "mean": statistics.fmean(values),
+        "p50": values[len(values) // 2],
+        "p95": values[min(len(values) - 1, int(0.95 * len(values)))],
+    }
+
+
 def summarize(outdir: str) -> dict:
     """Per arm: tok/s, accept length, verify GPU ms; for graphed arms the overflow, re-verify rate and text parity."""
     reports = {}
@@ -100,7 +140,11 @@ def summarize(outdir: str) -> dict:
         if os.path.exists(path):
             with open(path) as f:
                 reports[arm] = json.load(f)
-    eager_texts = [s.get("output_text") for s in reports["eager"]["per_session"]] if "eager" in reports else None
+    texts = {
+        arm: [s.get("output_text") for s in reports[arm]["per_session"]]
+        for arm in ("eager", "draft-eager")
+        if arm in reports
+    }
     summary = {}
     for arm, report in reports.items():
         sessions = report["per_session"]
@@ -116,9 +160,20 @@ def summarize(outdir: str) -> dict:
                 "p95": verify_ms[min(len(verify_ms) - 1, int(0.95 * len(verify_ms)))] if verify_ms else None,
             },
         }
-        if eager_texts is not None and arm != "eager":
+        log = os.path.join(outdir, f"{arm}.log")
+        if arm in DRAFT_ARMS:
+            entry["draft_gpu_ms"] = _percentiles(
+                [r["draft_gpu_ms"] for r in records if r.get("draft_gpu_ms") is not None]
+            )
+            entry["draft_cpu"] = draft_cpu_stats(log)
+            entry["draft_graphs_on"] = _log_has(log, "EXL3 draft graphs on")
+            if arm == "draft-graph" and "draft-eager" in texts:
+                entry["text_matches_draft_eager"] = [
+                    s.get("output_text") == text for s, text in zip(sessions, texts["draft-eager"])
+                ]
+        elif "eager" in texts and arm != "eager":
             entry["text_matches_eager"] = sum(
-                s.get("output_text") == text for s, text in zip(sessions, eager_texts)
+                s.get("output_text") == text for s, text in zip(sessions, texts["eager"])
             )
         metrics = _last_metrics(os.path.join(outdir, f"{arm}.metrics.jsonl"))
         counters = (metrics or {}).get("counters", {})

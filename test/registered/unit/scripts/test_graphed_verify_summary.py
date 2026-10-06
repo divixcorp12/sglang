@@ -61,3 +61,32 @@ def test_the_summary_reads_every_arm(tmp_path):
     assert summary["reverify"]["text_matches_eager"] == 2
     with open(os.path.join(out, "summary.json")) as f:
         assert json.load(f) == summary
+
+
+def test_the_draft_arms_summary(tmp_path):
+    out = str(tmp_path)
+    for arm, texts in (("draft-eager", ["a", "b"]), ("draft-graph", ["a", "c"])):
+        _arm(out, arm, texts, [10.0], overflow=[0], graphed={"graphed_verify_ct": 4, "verify_overflow_ct": 4}, truncated=[0])
+        with open(os.path.join(out, f"{arm}.json")) as f:
+            report = json.load(f)
+        report["dspark_info_record"]["records"] = [{"target_verify_gpu_ms": 10.0, "draft_gpu_ms": 30.0 if arm == "draft-eager" else 12.0}]
+        with open(os.path.join(out, f"{arm}.json"), "w") as f:
+            json.dump(report, f)
+    with open(os.path.join(out, "draft-graph.log"), "w") as f:
+        f.write("DSpark: EXL3 draft graphs on (3 draft MoE layers prepared)\n")
+        f.write("DSpark CPU experts: {'jobs': 5, 'rows': 40, 'forward_ns': 2000000, 'keep_warm_calls': 7}\n")
+    summary = graphed_verify.summarize(out)
+    assert summary["draft-graph"]["text_matches_draft_eager"] == [True, False]
+    assert summary["draft-graph"]["draft_cpu"] == {"jobs": 5, "rows": 40, "forward_ns": 2000000, "keep_warm_calls": 7}
+    assert summary["draft-graph"]["draft_graphs_on"] and not summary["draft-eager"]["draft_graphs_on"]
+    assert summary["draft-eager"]["draft_cpu"] is None
+    assert summary["draft-graph"]["draft_gpu_ms"]["mean"] == 12.0
+
+
+def test_the_draft_eager_arm_only_differs_by_the_switch(tmp_path):
+    eager = graphed_verify.arm_environment("draft-eager", str(tmp_path))
+    graph = graphed_verify.arm_environment("draft-graph", str(tmp_path))
+    assert eager.pop("SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH") == "1"
+    assert "SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH" not in graph
+    assert eager.pop("SGLANG_MOE_HOT_METRICS_FILE") != graph.pop("SGLANG_MOE_HOT_METRICS_FILE")
+    assert eager == graph
