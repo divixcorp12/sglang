@@ -219,6 +219,7 @@ class SharedDraftHost:
         self._ops = ops
         self._module = host._module
         self._keep: dict[int, tuple] = {}
+        self._last_stats: dict = {}
         self._module.expert_stream_draft_open(
             host.handle, self.group, areas.channel, areas.x, areas.slots, areas.weights, areas.out,
             int(areas.hidden), int(areas.stages), int(fatal_wait_s * 1e9),
@@ -236,16 +237,27 @@ class SharedDraftHost:
     def start(self) -> None:
         self._module.expert_stream_draft_start(self.host.handle, self.group)
 
+    def _host_open(self) -> bool:
+        """False once the service closed the host's native handle (its shutdown runs before the registry's atexit
+        close); the engine and this source went with it, and every call on the handle raises "unknown handle"."""
+        close = getattr(self.host, "_close", None)
+        return close is None or close.alive
+
     def stop(self) -> None:
-        self._module.expert_stream_draft_stop(self.host.handle, self.group)
+        if self._host_open():
+            self._module.expert_stream_draft_stop(self.host.handle, self.group)
 
     def stats(self) -> dict:
+        """The counters; once the host is closed, the last ones read here (``{}`` if none was)."""
+        if not self._host_open():
+            return self._last_stats
         out = torch.zeros(7, dtype=torch.int64)
         self._module.expert_stream_draft_stats(self.host.handle, self.group, out)
         jobs, rows, forward_ns, holds, collided_jobs, shared_routes, collided_forward_ns = (int(v) for v in out.tolist())
-        return {"jobs": jobs, "rows": rows, "forward_ns": forward_ns, "keep_warm_calls": holds,
-                "collided_jobs": collided_jobs, "shared_routes": shared_routes,
-                "collided_forward_ns": collided_forward_ns}
+        self._last_stats = {"jobs": jobs, "rows": rows, "forward_ns": forward_ns, "keep_warm_calls": holds,
+                            "collided_jobs": collided_jobs, "shared_routes": shared_routes,
+                            "collided_forward_ns": collided_forward_ns}
+        return self._last_stats
 
 _LIVE: "weakref.WeakSet[DraftCpuHost]" = weakref.WeakSet()
 
