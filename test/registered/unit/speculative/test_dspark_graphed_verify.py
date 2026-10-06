@@ -182,14 +182,40 @@ def test_init_cuda_graphs_prepares_the_exl3_draft_before_capture(monkeypatch):
     assert log == [("prepare", draft), ("capture", True)]
 
 
-def test_init_cuda_graphs_leaves_a_disabled_exl3_draft_eager(monkeypatch):
+# The EXL3 draft MoE runs its graph-safe path eagerly too (DraftResidentMoe.run refuses before prepare()), so an
+# EXL3 draft that is not captured is still prepared: the switch decides capture, never preparation.
+def test_init_cuda_graphs_prepares_a_disabled_exl3_draft_and_keeps_it_eager(monkeypatch):
     from sglang.srt.layers.quantization.exl3 import draft_moe
 
     log = []
     monkeypatch.setattr(draft_moe, "prepare_dspark_draft_graph", lambda model: log.append("prepare") or 3)
     with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(False), envs.SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH.override(True):
         _worker(monkeypatch, _draft("exl3"), log).init_cuda_graphs()
-    assert log == [("capture", False)]
+    assert log == ["prepare", ("capture", False)]
+
+
+def test_init_cuda_graphs_prepares_an_exl3_draft_short_of_memory_for_its_graph(monkeypatch):
+    from sglang.srt.layers.quantization.exl3 import draft_moe
+
+    log = []
+    monkeypatch.setattr(draft_moe, "prepare_dspark_draft_graph", lambda model: log.append("prepare") or 3)
+    worker = _worker(monkeypatch, _draft("exl3"), log)
+    worker._tp_sync = SimpleNamespace(available_memory_gb=lambda *a, **k: 0.5)
+    with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(False):
+        worker.init_cuda_graphs()
+    assert log == ["prepare", ("capture", False)]
+
+
+def test_init_cuda_graphs_prepares_an_exl3_draft_whose_decode_graph_is_not_allowed(monkeypatch):
+    from sglang.srt.layers.quantization.exl3 import draft_moe
+
+    log = []
+    monkeypatch.setattr(draft_moe, "prepare_dspark_draft_graph", lambda model: log.append("prepare") or 3)
+    worker = _worker(monkeypatch, _draft("exl3"), log)
+    worker._decode_graph_allowed = False
+    with envs.SGLANG_DSPARK_FOLDED_PROPOSAL.override(False):
+        worker.init_cuda_graphs()
+    assert log == ["prepare", ("capture", False)]
 
 
 def test_init_cuda_graphs_prepares_nothing_for_a_non_exl3_draft(monkeypatch):
