@@ -161,6 +161,8 @@ class DraftCpuThread {
           std::this_thread::sleep_for(std::chrono::microseconds(pause));
       const uint32_t head = channel::head<DraftChannel>(config_.channel);
       if (head != 0 && channel::reached(head, next)) {
+        // stop() stores stop_ before it bumps the head word to end a hold: a bump seen here is not a record.
+        if (stop_.load(std::memory_order_acquire)) break;
         if (head != next)
           fail_stop(std::string(kPrefix) + "record " + std::to_string(next) + " lapped (head " + std::to_string(head) +
                     "); the device posts one record per wait");
