@@ -250,6 +250,48 @@ def fake_cpu_layer(hidden: int = 8):
     return CpuExpertLayerSpec(capacity=1 << 20, hidden=hidden, intermediate=0, act_limit=0.0, slabs=(), params=b"")
 
 
+def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, spin_us: int, keep_warm_us: int,
+                   fatal_wait_s: float, tmp_path, variant: str = "instr", ns_per_expert: int = 0):
+    """A DSpark draft channel server, unstarted, with DraftCpuHost's interface, in one of the two shapes the shared CPU
+    team allows (plan 2026-10-06 Task 11):
+      draft_only  a draft-only engine (DraftCpuHost), as a launch with the target's CPU experts off builds;
+      shared      group 0's CPU expert engine of an ExpertStreamHost whose CPU experts are on (the fake kernel at
+                  `kernel`), the draft attached as its second job source; .expert_host is that host and .sim its
+                  ChainSim, so a test can post target jobs to the same team. stop() detaches the draft; the caller
+                  stops .expert_host.
+    """
+    from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuHost
+    from sglang.kernels.ops.moe.expert_lease_block import wire_layout
+    from sglang.kernels.ops.moe.expert_stream_transport import new_page
+    from sglang.test.dsv41_chain_sim import ChainSim
+
+    if mode == "draft_only":
+        return DraftCpuHost(areas, cores=cores, threads=threads, spin_us=spin_us, keep_warm_us=keep_warm_us,
+                            fatal_wait_s=fatal_wait_s, variant=variant)
+    if mode != "shared":
+        raise ValueError(mode)
+    s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
+    page = new_page(pin=False, wire=wire_layout(8))
+    host = attached_host(s, page, k=3)
+    host.enable_copy_engine(-1)
+    row = 1
+    dst = {n: torch.zeros((6,) + tuple(t.shape[1:]), dtype=t.dtype) for n, t in s.slabs[row].items()}
+    table = torch.tensor([[t.data_ptr(), dst[n].data_ptr(), t[0].numel() * t.element_size()] for n, t in s.slabs[row].items()],
+                         dtype=torch.int64)
+    host.set_copy_table(row, table, 6)
+    host.arm_copy_engine()
+    x_rows = torch.zeros((2, 16), dtype=torch.uint8)
+    out_rows = torch.zeros((2, 2, 8), dtype=torch.float32)
+    split = [0] * (host.wire.lanes + 1)
+    split[1] = 1  # one eligible hit lane: the CPU's
+    host.enable_cpu_experts(kernel, split, cores, x_rows, out_rows, threads=threads, spin_us=spin_us,
+                            keep_warm_us=keep_warm_us)
+    host.set_cpu_layer(row, fake_cpu_layer(8))
+    draft = host.draft_source(areas, fatal_wait_s=fatal_wait_s, group=0)
+    draft.expert_host, draft.sim, draft.keep = host, ChainSim(host, page, s.slabs), (s, dst, x_rows, out_rows)
+    return draft
+
+
 # The host build and lane count ``run_host_script``'s child constructs; the parent warms exactly these.
 HOST_SCRIPT_VARIANT = "instr"
 HOST_SCRIPT_LANES = 8
