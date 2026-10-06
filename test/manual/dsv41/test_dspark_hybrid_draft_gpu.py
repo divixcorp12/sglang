@@ -132,7 +132,9 @@ def test_hybrid_draft_matches_the_gpu_loop(bits, pattern, resident, m, monkeypat
     chunks = -(-m // layer.exl3_draft_moe.tokens)
     print(f"bits={bits} pattern={pattern} resident={len(resident)} m={m} rel_l2={rel:.4f} jobs={jobs}")
     assert torch.isfinite(got).all()
-    assert rel < 0.05
+    # Measured 0.003-0.014 (fused-vs-loop rounding, worst at m=1; the CPU share adds none): 0.02 still fails a dropped
+    # low-weight route, which 0.05 would pass.
+    assert rel < 0.02
     assert jobs == (0 if len(resident) == E_ROUTED else chunks)
 
 

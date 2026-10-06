@@ -7184,8 +7184,22 @@ run is in `crashed-run/`).
 - **DSpark's tok/s barely moved: 2.81 to 2.85 (+1.3%).** A step is about 850 ms, almost all the verify, so 5 ms is
   0.6% of it. The gain is within the noise of 8 sessions, and these two runs are not a repeat.
 - **Accept length is identical (2.51)**, as it must be with identical text. It is above D2-3's 2.37 for the same 8
-  sessions; this run did not investigate why (the draft's MoE path changed in this plan, and D2-3 ran the earlier
-  one).
+  sessions, and the text differs from D2-3's in 6 of 8 sessions. Both are legitimate (final review I4, probe outputs in
+  `graph-verify/i4/`):
+  - **The target did not change.** Run alone, it is bit-identical at `c932392148` and `fc0da8db2f`: greedy ids,
+    logprobs, top-5 and teacher-forced prefill logprobs, all 8 sessions.
+  - **The target alone matches neither text.** It leaves both D2-3 and this run at chars 25-148, earlier than they
+    leave each other, each time at a margin of 0 to 0.25 in its own prefill.
+  - **The draft-to-draft divergences are near-ties for the target, in both directions.** At s12 D2-3's token is the one
+    0.625 behind. The largest is s8 (1.125), inside §33.2's verify-vs-decode band of 1.4 logprob.
+  - **Teacher-forced over every position, this run's text is at least as consistent with the target as D2-3's**:
+    8 of 929 tokens more than 0.25 below the target's argmax (max 1.5), against D2-3's 12 of 899 (max 8.4). The
+    target's own greedy text, scored the same way, gives 4 of 823 (max 0.5).
+  - So the new draft's proposals moved which near-ties the verify forward settles; they did not move the target.
+  - **It is not a fault in the draft MoE:** eager and captured draft text agree 8/8; the fp16 staging is unchanged from
+    the old path; on random weights `test_dspark_hybrid_draft_gpu.py` measures rel_l2 0.003-0.014 against
+    `exl3_moe_loop`, the same with and without the CPU share (its bound is now 0.02, was 0.05).
+  - Exact-text parity across draft changes is the wrong bar, as §33.2 found against the base.
 - **The target's CPU experts are still off in verify** (`SGLANG_DSV41_CPU_EXPERTS=0`), so the verify column is the
   eager target's.
 - **W = 8 still re-runs every verify (§33.8).** 348 of 348 graphed verifies were re-run in both arms, and 77% of layers
@@ -7199,6 +7213,10 @@ run is in `crashed-run/`).
   instrumentation was added. The only sample is the crashed run's 5-row stage at 4.43 ms.
 - **The graph's saving is not split** between the fused resident-expert call, the removed launch gaps and the CPU
   wait; the draft segment covers all three.
+- **D2-3's s12 emits " .\n" where the target's prefill gives ".b" at about 0.0 (gap 8.4).** Pre-existing (the old
+  draft path, eager and graphed verify alike), unexplained and not probed here. It fits §33.2's unverified suspect, a
+  wrong Engram verify context at block offset >= 1. The scored context is retokenized at position 119, so it is a lead,
+  not a finding.
 
 **What it decides.**
 - The draft's capture is correct (text equal) and cheap (about 5 ms per step). It does not change the DSpark verdict
