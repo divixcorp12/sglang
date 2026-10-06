@@ -321,5 +321,53 @@ def test_a_40_lane_post_makes_36_forced_misses_on_one_node_cpu_lanes(tmp_path):
         c.close()
 
 
+from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKEN_TABLE_HEADER, cpu_row_bytes  # noqa: E402
+
+
+def test_a_verify_post_stages_every_token_and_the_token_table(idle):
+    """Three tokens in rows that hold four (Review Focus 3); three RAM-hit lanes, all the CPU's. Each token's input is
+    staged at its own offset as fp16, the header holds 3, each lane's mask has a bit per token that routes its expert,
+    and each such token's own weight sits in the table. The record's lane weight is still the sum (the one-token
+    path's). Mutations: stage token 0 only; t = r / route_count instead of r / top_k; mask from the summed weight."""
+    c = idle
+    hidden, tokens_max, lanes = 64, 4, W.lanes
+    xb = 2 * hidden
+    x_rows = torch.zeros((2, cpu_row_bytes(hidden, tokens_max, lanes)), dtype=torch.uint8).pin_memory()
+    out_rows = torch.zeros((2, 2, tokens_max, hidden), dtype=torch.float32).pin_memory()
+    c.dev.enable_cpu_experts(x_rows, out_rows)
+    assert (c.dev.cpu_tokens_max, c.dev.cpu_x_token_bytes) == (tokens_max, xb)
+    c.dev.set_row_cpu(0)
+    _set_host_words(c, armed=True, split=ALL_CPU)
+    _write_delta(c, 0, 1, [9, 10, 11, 12, 13, 14])
+    experts = [3, 5, 7]
+    c.dev.map_bulk_apply(torch.tensor([[0, e, s] for s, e in enumerate(experts)], dtype=torch.int32))
+    c.plan(experts)
+    backend, plan = c.backends[0], c.plans[0]
+    backend._stage_planned(plan)
+    routes = [[3, 5, 8, 9, 10, 11], [7, 3, 12, 13, 14, 15], [5, 7, 8, 12, 9, 13]]
+    weights = torch.tensor([[0.01 * (10 * t + i + 1) for i in range(TOP_K)] for t in range(3)], device="cuda")
+    x = torch.randn(3, hidden, device="cuda")
+    route_ids = torch.tensor(sum(routes, []), dtype=torch.int64, device="cuda")
+    c.dev.post(0, backend.planned, plan.count, route_ids, plan.slots, captured=True, cpu_input=(x, weights))
+    torch.cuda.synchronize()
+    assert c.kinds(3) == [LaneKind.HIT_CPU] * 3
+    row = x_rows[0]
+    for t in range(3):
+        assert torch.equal(row[t * xb : (t + 1) * xb].view(torch.float16), x[t].half().cpu()), t
+    table = tokens_max * xb
+    assert int(row[table : table + 4].view(torch.int32)[0]) == 3
+    planned = backend.planned[:3].tolist()
+    for j, expert in enumerate(planned):
+        at = table + CPU_TOKEN_TABLE_HEADER + 4 * j
+        mask = int(row[at : at + 4].view(torch.int32)[0])
+        assert mask == sum(1 << t for t in range(3) if expert in routes[t]), (j, expert)
+        for t in range(3):
+            if expert in routes[t]:
+                at = table + CPU_TOKEN_TABLE_HEADER + 4 * lanes + 4 * (t * lanes + j)
+                assert float(row[at : at + 4].view(torch.float32)[0]) == pytest.approx(
+                    float(weights[t, routes[t].index(expert)])
+                ), (j, t)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
