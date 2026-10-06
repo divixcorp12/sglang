@@ -323,6 +323,13 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
 
 
+def _cpu_stand_in():
+    return SimpleNamespace(
+        x_rows=torch.zeros((LAYERS, 16), dtype=torch.uint8), out_rows=torch.zeros((LAYERS, 4), dtype=torch.float32),
+        attach_device=lambda device_side: None,
+    )
+
+
 def _spill_updater():
     updater = DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
     updater.miss_rows, updater.victim_lanes = 36, 8
@@ -349,7 +356,7 @@ def test_cpu_experts_attach_a_verify_gather_and_wire_its_spill_words(tiers, monk
     service.ensure_started()
     monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(service, "_check_spill_room", lambda row, streamer, width: None)
-    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
+    service.cpu_experts = _cpu_stand_in()
     updater = _spill_updater()
     try:
         _attach_verify(service, streamers[0], updater)
@@ -368,7 +375,7 @@ def test_spill_refuses_a_tier_without_a_victim_for_every_forced_miss(tiers, monk
     service.plan_gather_width(36)
     service.ensure_started()
     monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
-    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
+    service.cpu_experts = _cpu_stand_in()
     try:
         with pytest.raises(ValueError, match="reads every forced CPU miss into a RAM victim"):
             _attach_verify(service, streamers[0], _spill_updater())
