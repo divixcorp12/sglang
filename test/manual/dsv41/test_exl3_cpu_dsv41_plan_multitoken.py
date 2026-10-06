@@ -79,8 +79,8 @@ def _shares_an_expert(routes):
 
 
 def _expected_plan(routes):
-    """The plan a call on the native layer takes: the DSV4.1 plan unless two of its routes share an expert."""
-    return "generic" if _shares_an_expert(routes) else "dsv41"
+    """The plan a call on the native layer takes: the DSV4.1 plan, whose chunks hold 1..CHUNK_M tokens."""
+    return "dsv41"
 
 
 def _chunk_m():
