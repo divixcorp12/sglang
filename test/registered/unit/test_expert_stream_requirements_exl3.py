@@ -576,8 +576,9 @@ def _exl3_launch(model_dir, **changes):
 
 
 def test_cpu_experts_with_a_graphed_dspark_verify_pass(model_dir):
-    _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **CPU_EXPERTS_ENV, **GRAPHED_VERIFY)
-    _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **CPU_EXPERTS_ENV, **SPILL)
+    # The envs share SGLANG_MOE_EXPERT_GRAPH_GATHER and the DIRECT pair, so they merge rather than splat twice.
+    _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **GRAPHED_VERIFY})
+    _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **SPILL})
 
 
 @pytest.mark.parametrize(
@@ -592,7 +593,7 @@ def test_cpu_experts_under_speculation_need_the_graphed_dspark_verify(model_dir,
     """The graphed verify's own rules, with a remedy for a CPU-experts launch: the verify must be graphed, so the
     eager-decode remedy is never offered."""
     with pytest.raises(ValueError, match=match) as refused:
-        _gate(_exl3_launch(model_dir, **(DSPARK_BREAKABLE | launch)), **CPU_EXPERTS_ENV, **env)
+        _gate(_exl3_launch(model_dir, **(DSPARK_BREAKABLE | launch)), **{**CPU_EXPERTS_ENV, **env})
     assert "--cuda-graph-backend-decode disabled" not in str(refused.value)
     assert "SGLANG_DSV41_CPU_EXPERTS" in str(refused.value)
 
