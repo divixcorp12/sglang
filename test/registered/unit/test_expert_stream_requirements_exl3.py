@@ -544,3 +544,27 @@ def test_dspark_cpu_experts_need_the_optimized_cpu_kernel_build(model_dir, cpu_p
     fail at its first step, after the model loaded."""
     with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ACT_RESIDUAL=1"):
         _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **{**DSPARK_CPU_ENV, **unset})
+
+
+DSPARK_BREAKABLE = dict(speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1)
+# The recipe's DSpark mode: a lane per route (MISS_LANES unset), 8 victim lanes.
+SPILL = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True, **DIRECT, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": 8}
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [("SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES", "12-15"), ("SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS", 4)],
+)
+def test_draft_cores_are_refused_when_the_draft_shares_the_cpu_team(model_dir, name, value):
+    env = {
+        **CPU_EXPERTS_ENV,
+        **SPILL,
+        "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": True,
+        "SGLANG_EXL3_CPU_ACT_RESIDUAL": True,
+        "SGLANG_EXL3_CPU_ACT_BLOCK": 128,
+        name: value,
+    }
+    # The refusal is an EXL3 rule, so matching it also shows the gate resolved the EXL3 requirements, not the NVFP4
+    # fallback a non-directory model_path gets.
+    with pytest.raises(ValueError, match="shares node 0's CPU expert team"):
+        _gate(_launch(model_dir, **DSPARK_BREAKABLE), **env)

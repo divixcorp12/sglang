@@ -181,3 +181,24 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_with_target_cpu_experts_the_draft_attaches_to_the_services_gpu_group(monkeypatch):
+    """One team per node: the registry builds no thread of its own, it asks the RAM-miss service for its GPU-node
+    group's engine (starting the service first), and drives it through DraftCpuHost's interface."""
+    from sglang.srt.environ import envs
+
+    asked = {}
+
+    class Service:
+        def draft_host(self, areas, *, fatal_wait_s):
+            asked["fatal_wait_s"] = fatal_wait_s
+            return _Host(areas)
+
+    monkeypatch.setattr(draft, "_ram_miss_service", lambda: Service())
+    monkeypatch.setattr(draft, "_new_host", lambda *a, **k: pytest.fail("built a draft-only engine"))
+    with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+        runtime = draft.DraftCpuExperts(
+            _Kernel(), {0: draft.DraftLayer(_slabs(), _on_cpu(), 10.0)}, cores=[], threads=0, device=None
+        )
+    assert asked["fatal_wait_s"] > 0 and runtime.host.started
