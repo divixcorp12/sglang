@@ -168,6 +168,18 @@ class WireLayout:
 MAX_LANES = 64
 
 
+# The CPU experts' input rows (cpu_token_table.h): CpuTokenTable::kHeaderBytes and kMaxTokens.
+CPU_TOKEN_TABLE_HEADER = 16
+CPU_TOKENS_MAX = 32
+
+
+def cpu_row_bytes(hidden: int, tokens: int, lanes: int) -> int:
+    """Bytes of one CPU experts input row: ``tokens`` fp16 inputs, each padded to 16 bytes, then, for more than one
+    token, the token table: a 16-byte header, a u32 mask per lane and an fp32 weight per token and lane."""
+    x = -(-2 * hidden // 16) * 16
+    return tokens * x + (CPU_TOKEN_TABLE_HEADER + 4 * lanes + 4 * tokens * lanes if tokens > 1 else 0)
+
+
 @functools.cache
 def wire_layout(lanes: int, nodes: int = 1) -> WireLayout:
     """Return the wire layout for ``lanes`` (rounded up to 8) on ``nodes`` NUMA nodes."""

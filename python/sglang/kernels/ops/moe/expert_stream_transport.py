@@ -34,6 +34,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
+from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKENS_MAX, cpu_row_bytes
 from sglang.srt.environ import envs
 
 # Rows per io_uring batch and per bounce bank. The C++ reader has kBanks = 2 banks of
@@ -2488,6 +2489,9 @@ class ExpertStreamDevice:
         # partial sum to; None when off.
         self.cpu_x_rows = None
         self.cpu_out_rows = None
+        # The rows' token capacity and the bytes between two tokens' staged inputs (enable_cpu_experts); 1 and 0
+        # until then.
+        self.cpu_tokens_max, self.cpu_x_token_bytes = 1, 0
         # Set by the row backend when it captures a post that lets the service copy; the
         # service arms its copy engine on it.
         self.copy_engine_captured = False
@@ -2504,7 +2508,9 @@ class ExpertStreamDevice:
     def enable_cpu_experts(self, x_rows: torch.Tensor, out_rows: torch.Tensor) -> None:
         """Take the same pinned rows the host's ``enable_cpu_experts`` took.
 
-        There is one row per layer, readable through UVA.
+        There is one row per layer, readable through UVA. A multi-token row's ``out_rows`` is
+        ``[layers, 2 * nodes, tokens, hidden]``; ``x_rows`` then holds
+        ``expert_lease_block.cpu_row_bytes`` a row (the token table follows the inputs).
         """
         for rows, name in ((x_rows, "x_rows"), (out_rows, "out_rows")):
             if (
@@ -2526,7 +2532,17 @@ class ExpertStreamDevice:
             or (out_rows.stride(0) * 4) % 16
         ):
             raise ValueError("the CPU expert rows must be 16-byte aligned")
+        tokens = int(out_rows.shape[2]) if out_rows.dim() == 4 else 1
+        hidden = int(out_rows.shape[-1])
+        if not 1 <= tokens <= CPU_TOKENS_MAX:
+            raise ValueError(f"CPU expert rows hold 1-{CPU_TOKENS_MAX} tokens, not {tokens}")
+        if x_rows.shape[1] < cpu_row_bytes(hidden, tokens, self.wire.lanes):
+            raise ValueError(
+                f"x_rows holds {x_rows.shape[1]} bytes a row; {tokens} tokens of {hidden} need "
+                f"{cpu_row_bytes(hidden, tokens, self.wire.lanes)}"
+            )
         self.cpu_x_rows, self.cpu_out_rows = x_rows, out_rows
+        self.cpu_tokens_max, self.cpu_x_token_bytes = tokens, -(-2 * hidden // 16) * 16
 
     def set_row_copy(self, row: int, dst_rows: int) -> None:
         """Record that the row's copy table is registered with ``dst_rows`` rows.
@@ -2578,9 +2594,9 @@ class ExpertStreamDevice:
     def cpu_out_part_stride(self) -> int:
         """Return the floats from a row's part 0 (CPU hits) to its part 1 (CPU misses).
 
-        0 for one-part rows.
+        0 for one-part rows. (``tokens * hidden`` for a multi-token row.)
         """
-        return int(self.cpu_out_rows.stride(1)) if self.cpu_out_rows.dim() == 3 else 0
+        return int(self.cpu_out_rows.stride(1)) if self.cpu_out_rows.dim() >= 3 else 0
 
     def _check_row(self, row: int) -> None:
         """Raise ValueError for a row outside ``[0, layers)``."""
