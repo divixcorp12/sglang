@@ -74,6 +74,13 @@ def _check_dspark_cpu_experts(cfg) -> None:
             "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS computes the DSpark draft's routed experts on the CPU; "
             "pass --speculative-algorithm DSPARK or unset it"
         )
+    if envs.SGLANG_DSV41_CPU_EXPERTS.get() and (
+        envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get() or envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get()
+    ):
+        raise ValueError(
+            "the DSpark draft shares node 0's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
+            "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"
+        )
     # Unset cores are derived by ThreadingConfig when the draft starts; named ones are checked here.
     cores = parse_cpu_list(envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get())
     for core in cores:

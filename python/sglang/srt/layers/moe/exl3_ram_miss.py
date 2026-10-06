@@ -781,6 +781,8 @@ class Exl3RamMissService:
     def __init__(self) -> None:
         self.tables: dict[int, NativePinnedSlotTable] = {}
         self.host: Optional[ExpertStreamHost] = None
+        # The wire group of the GPU's node, whose CPU expert engine serves the DSpark draft (set by ensure_started).
+        self.gpu_group = 0
         self.device_side: Optional[ExpertStreamDevice] = None
         self.page = None
         self.slot_map = None
@@ -926,6 +928,14 @@ class Exl3RamMissService:
                 "exl3 RAM miss: the option C service was shut down; its pinned tiers are closed"
             )
 
+    def draft_host(self, areas, *, fatal_wait_s: float):
+        """The DSpark draft channel on the GPU node's CPU expert engine (one team per node): a SharedDraftHost. Starts
+        the service first when the draft is prepared before the target's first gather."""
+        self.ensure_started()
+        if self.cpu_experts is None:
+            raise RuntimeError("exl3 RAM miss: the draft shares the CPU expert team, but SGLANG_DSV41_CPU_EXPERTS is off")
+        return self.host.draft_source(areas, fatal_wait_s=fatal_wait_s, group=self.gpu_group)
+
     def ensure_started(self) -> None:
         """Start the service on first use; a no-op once started.
 
@@ -988,6 +998,7 @@ class Exl3RamMissService:
             cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
             device=torch.cuda.current_device() if torch.cuda.is_available() else None,
         )
+        self.gpu_group = next(p.group for p in numa.plans if p.node == numa.gpu_node)
         for line in numa.log_lines():
             logger.info("exl3 RAM miss %s", line)
         node_ranges = None

@@ -250,6 +250,12 @@ class ThreadingConfig:
     ) -> "ThreadingConfig":
         """Every node's plan by the design's rules, validated; raises ValueError naming the node and the rule."""
         affinity = frozenset(affinity)
+        if settings.cpu_experts and settings.draft and (settings.draft_cores or settings.draft_threads):
+            # One team per node (plan 2026-10-06 Task 11): the draft is a job source on node 0's CPU expert team.
+            raise ValueError(
+                "the DSpark draft shares node 0's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
+                "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"
+            )
         gpu = gpu_node if gpu_node is not None else nodes[0]
         overrides = parse_numa_cores(settings.numa_cores)
         for node in overrides:
@@ -325,7 +331,7 @@ class ThreadingConfig:
                 "two engines' teams run at once"
             )
         draft: tuple[int, ...] = ()
-        if settings.draft:
+        if settings.draft and not settings.cpu_experts:
             draft = tuple(named_draft) or _derive_draft(gpu, topology, affinity, settings, taken)
         return ThreadingConfig(tuple(plans), (copy,), gpu, draft)
 
