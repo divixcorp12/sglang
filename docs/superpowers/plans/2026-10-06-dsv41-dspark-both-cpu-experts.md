@@ -4,26 +4,46 @@
 
 **Goal:** Serve DSV4.1 EXL3 with DSpark speculative decoding while both the target's CPU experts
 (`SGLANG_DSV41_CPU_EXPERTS=1`) and the draft's CPU experts (`SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS=1`) are on, and
-make that the production recipe once a server A/B against today's production clears the owner's bar.
+make that the production recipe once a server A/B against today's production clears the owner's bar. In steady state
+a verify is never re-run eagerly. The one remaining eager re-verify is the one the copy engine forces before it arms.
 
-**Architecture:** The target's CPU experts learn to serve a DSpark verify (6 tokens per layer) inside the captured
-decode graph. The post kernel stages all M token rows and writes a per-lane **token table** (each token's routing
-weight per lane). The CPU expert thread runs one M-row forward per job from that table, and the route tables seed each
-token's output from its own partial. A new DIRECT knob, `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES` (V), gives VRAM
-victims only to the first V miss lanes of a 32-lane verify record. The post makes every lane past them a **forced CPU
-lane** (spill) instead of overflowing. When a forced lane cannot be the CPU's, the post serves the victims' prefix and
-flags the forward, which takes the existing eager re-verify, kept GPU-only. The draft keeps its own lease channel and
-thread on dedicated node-0 cores (12-15). The target's node-0 team shrinks to 6-11, and node 1 keeps 18-27.
+**Architecture:**
+- **Every route has a lane.** A 6-token verify at top-6 routes at most 36 distinct experts per layer, and the record
+  gets one lane per route: `SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES` stays unset, so the miss width equals the
+  routes. The wire is widened to 64 lanes and builds at 40 (36 rounded up to the wire's 8). Its lane masks become 64-bit
+  only in builds above 32 lanes. The one-token build keeps its 32-bit types, and a SASS and `.text` digest test pins it
+  byte for byte.
+- **CPU lanes take M tokens.** The post stages all M token rows and writes a per-lane token table, holding each token's
+  routing weight per lane. The CPU expert thread runs one M-row forward per job, and the route tables seed each token's
+  output from its own partial.
+- **Victims for the first V lanes only.** A new DIRECT knob, `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES` (V), gives
+  VRAM victims and staging slots only to the first V lanes in plan order. Every later lane is a **forced CPU lane**
+  (spill).
+- **A forced RAM hit runs from its RAM slot.**
+- **A forced NVMe miss gets no staging slot (slot −1).** The host reads it straight into a RAM victim of the layer's
+  own tier, computes it there, and keeps it cached.
+- **Two invariants are asserted:** live misses ≤ V = staging per node, and a victim always exists. The second is a
+  per-node tier-capacity check at start-up.
+- **Overflow and the eager re-verify (GPU-only):** the post overflows only when a forced lane cannot be the CPU's,
+  which means the copy engine is unarmed or the CPU layer is not yet registered. Both occur only before arming.
+- **The draft keeps its own lease channel and thread** on dedicated node-0 cores (12-15). The target's node-0 team
+  shrinks to 6-11; node 1 keeps 18-27.
 
-**Tech Stack:** CUDA (JIT `lease_kernels.cuh`, `lease_device.cuh`, `exl3_route_tables.cuh`, `direct_gather.cuh`),
-C++20 host (`host/cpu_experts.h`, `host/ram_tier.h`, `host/ffi_exports.h`), Python (sglang EXL3 expert stream, DIRECT
-residency, server-args gate), pytest (registered CPU/GPU units, manual `test/manual/dsv41` CUDA suites), bash
-(`run_arm.sh`, `launch_prod.sh`).
+**Tech Stack:** CUDA (JIT `lease_kernels.cuh`, `lease_device.cuh`, `row_copy_kernels.cuh`, `exl3_route_tables.cuh`,
+`direct_gather.cuh`), C++20 host (`host/cpu_experts.h`, `host/ram_tier.h`, `host/copy_engine.h`,
+`host/split_calibration.h`, `host/ffi_exports.h`), Python (sglang EXL3 expert stream, DIRECT residency, server-args
+gate), pytest (registered CPU/GPU units, manual `test/manual/dsv41` CUDA suites), bash (`run_arm.sh`, `launch_prod.sh`),
+`cuobjdump`/`objcopy` for the one-token build digest.
 
 **Spec:** The owner's request (2026-10-06, relayed by team-lead): "we absolutely need to support both cpu_experts and
-dspark cpu_experts at the same time". The evidence this plan argues from is `DSV41_REFERENCE.md` §33.3–§33.9 on
-`origin/master`; §33.9 reaches this branch in Task 1. Base: `origin/dsv41-cpu-plan-m2` (the multi-token DSV4.1 CPU
-plan, `CHUNK_M` token chunks, `MAX_M = 4`), which the verify's M-row forwards use.
+dspark cpu_experts at the same time". It came with two amendments the same day:
+- (A) widen the record so a 6-token verify never exceeds it, with no second record per layer and the one-token path
+  byte-identical;
+- (B) a forced NVMe miss must always have somewhere to land, never falling back to re-verify.
+
+The evidence this plan argues from is `DSV41_REFERENCE.md` §33.3–§33.9 on `origin/master`; §33.9 reaches this branch
+in Task 1. Base: `origin/dsv41-cpu-plan-m2` (the multi-token DSV4.1 CPU plan, `CHUNK_M` token chunks, `MAX_M = 4`),
+which the verify's M-row forwards use.
 
 ---
 
@@ -35,8 +55,8 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
    ~13 tok/s plain decode with CPU experts (§30.1, §33.5). §33.5's v2 projection, multi-token CPU experts in the verify,
    ranges from +25% to −13% against 13.17 tok/s. This plan builds the mode and a one-line switch (`PROD_DSPARK` in
    `arm_env.py`).
-   **Recommendation:** flip only if the A/B (Task 13) shows `dspark-both` at or below production's median ms/token
-   and passes the text bar, or on the owner's explicit go regardless. Task 14 is gated on this.
+   **Recommendation:** flip only if the A/B (Task 15) shows `dspark-both` at or below production's median ms/token
+   and passes the text bar, or on the owner's explicit go regardless. Task 16 is gated on this.
 2. **Cores for the two CPU-expert clients.** Node 0 has no free physical core under today's recipe: 0-5 server, 6-15
    target, 16 copy, 17 RAM. Options:
    - **(a) Recommended.** The draft takes named cores 12-15 and the target's node-0 team shrinks to 6-11, leaving
@@ -47,21 +67,49 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
      fight for the same logical cores. That needs spin coordination code and `ThreadingConfig` changes that refuse
      today's rules.
    - **(c) The draft on node 1's 32-34.** Only 3 cores, and the draft weights would be remote (node 0).
-3. **Victim lanes V.** A 6-token verify routes up to 36 distinct experts per layer (§33.5: mean 21, p99 32).
-   **Recommendation:** a 32-lane record (`MISS_LANES=32`) with `VICTIM_LANES=8`.
-   - V = 8 is D2-3's miss width. It gives the same 8 VRAM victims and 8 staging slots per node as the measured
-     graphed arms, so the DIRECT floor is 16 slots per layer (≤ ~23.7 at the hot cache below).
-   - A larger V moves more lanes to the link and costs 2 pinned rows per layer per extra lane (~12.4 MiB each, §33.3).
+3. **Lane count, victim lanes, staging.**
+   - **Record:** one lane per route, which is `MISS_LANES` unset: a 36-lane gather on a **40-lane wire**.
+     - 36 is the maximum distinct experts of 6 tokens at top-6 (§33.5: max 36, p99 32).
+     - The wire rounds lanes up to 8 so its i16 lane arrays are whole 16-byte stores (`lease_layout.h:38-39`). A
+       36-lane build *is* a 40-lane build.
+     - 40-lane, 2-node wire, computed from the layout formulas: 640-byte record (128 at 8 lanes), 10,368-byte request
+       page, 86,016-byte lease block (20,480), 512-byte delta stride (256). All of it is pinned host memory, about
+       80 KiB in total.
+     - The type limit moves to 64 lanes, one u64 mask. Block size 6 (7 tokens, 42 routes) would then need only a
+       rebuild, not a redesign.
+   - **Victims:** **V = 8**, D2-3's miss width: 8 VRAM victims per layer, so the DIRECT floor is 16 slots
+     (≤ ~23.7 at the hot cache below).
+   - **Staging: 8 slots per node, unchanged from the D2-3 arms.** Only live (victim) misses stage, and they number at
+     most V. That is an invariant, asserted on the device.
+   - **Forced NVMe misses are host-placed (recommended): they land in a RAM victim the host picks per record. Extra
+     pinned RAM: 0 bytes.**
+     - Each such miss evicts one RAM row on its node and is cached in its place, which is today's insert-on-miss
+       policy.
+     - The guarantee is a start-up check on every layer and node: `slots ≥ staging + 36 lanes + the layer's VRAM-hot
+       capacity`. That is 8 + 36 + ~24 = 68 against ~80 slots per node per layer at `PINNED_HOST_NUMA_MB=0:40960,1:40960`.
+       The derivation is in Task 9.
+     - The rejected options, measured against the 80 GiB tier (13,315,584 B per expert row, 40 MoE layers, 2 nodes):
+
+     | Option | Pinned RAM | Verdict |
+     |---|---|---|
+     | Staging sized for the worst case (all 36 lanes NVMe misses on one node: 36 slots per node per layer) | 2 × 36 × 40 × 13,315,584 B = **35.7 GiB**, vs 7.9 GiB at 8 | Unaffordable: 45% of each node's 40 GiB tier |
+     | Per-node shared scratch (staging is per layer, but one record is in flight, so a scratch can be shared across layers) | 36 rows per node = 457 MiB per node, **914 MiB** in all | Affordable, but needs a reader destination override, a scratch CPU layer, and node-0 headroom the 2026-10-02 note says is thin |
+     | **Host-placed into a RAM victim** | **0** | Recommended |
+
 4. **Hot cache under DSpark.** **Recommendation:** `SGLANG_MOE_HOT_GPU_MB=12040`, the hybrid draft's value (§33.4,
-   §33.5), which leaves 4040 MiB of production's 16080 for the draft's resident experts, dense weights and KV. Task 13
-   gates it: the server's KV pool must be no smaller than the production arm's in the same A/B.
-5. **The eager re-verify stays GPU-only.** **Recommendation:** keep it so. Spill removes the cause, not the symptom.
-   - At W = 8 every verify re-ran eagerly because every verify overflowed (§33.8, §33.9: 348/348).
-   - With spill, a verify overflows only when a layer has more than 32 distinct misses, the copy engine is not yet
-     armed, or a forced NVMe miss finds no staging slot.
-   - Putting CPU experts in `_apply_streamed` would need a host-submitted job path into an engine that today only the
-     tier thread feeds, while the service is paused for eager pinned-tier use (`before_host_use`).
-   - Task 13 measures the re-verify rate. If it stays high, that is the next plan.
+   §33.5), which leaves 4040 MiB of production's 16080 for the draft's resident experts, dense weights and KV. Task 15
+   gates it: the server's KV pool must be no smaller than the production arm's in the same A/B. It also bounds Task 9's
+   start-up check, which uses the layer's VRAM capacity.
+5. **The eager re-verify stays GPU-only, and in steady state it never runs.** The ways a verify could overflow:
+
+   | Case | Cause | What happens |
+   |---|---|---|
+   | 1 | Copy engine not yet armed (the first `COPY_ENGINE_ARM_DECODES` verifies after capture), or the CPU layer not registered (warm-up only) | The only one left: overflows and re-runs eagerly |
+   | 2 | A forced NVMe miss without a staging slot | Cannot happen: it is host-placed (Task 9) |
+   | 3 | More distinct misses than lanes | Cannot happen: a lane per route (Tasks 2 and 8) |
+
+   **Recommendation:** keep the re-run GPU-only. Case 1 is a start-up transient, and CPU experts are not armed then
+   anyway. Task 15 reports the re-verify count, which must equal the verifies before arming.
 
 ## Global Constraints
 
@@ -97,32 +145,41 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
 - Environment variables go through `sglang.srt.environ.envs` (`env-var-conventions` skill). The one new variable is
   `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)`.
 - Speculative names follow the `speculative-naming` skill (`accept_length`, `spec_verify_ct`, `verify`).
-- Non-speculative decode must stay byte-for-byte what it is:
-  - Every new path is gated on `cpu_tokens_max > 1`, on `spill`, or on `victim_lanes < miss_rows`. A BS1 launch has
-    none of them.
-  - The BS1 suites named in each task must stay green.
+- Non-speculative decode stays byte-for-byte what it is:
+  - Every new path is gated on `Wire::kLanes > 32`, on `cpu_tokens_max > 1`, on `spill`, or on
+    `victim_lanes < miss_rows`. A BS1 launch (8-lane wire, one token, no victim knob) has none of them.
+  - Task 2's digest test pins the BS1 code its mask change touches.
+  - The BS1 suites named in each task stay green.
 - The verify is `gamma + 1 = 6` tokens at `speculative_dspark_block_size=5` (`speculative_hook.py:680-704`,
   `dspark_config.py:131-132`), not 5. Tests and comments say 6.
 
 ## Review Focus
 
 1. **A captured verify before the copy engine arms** (the first `COPY_ENGINE_ARM_DECODES` forwards after capture, and
-   every eager graph-path verify). No forced lane can be a CPU lane: `host_lanes` is false. Expected: the post serves
-   the victims' prefix, writes the count, flags the forward, and the eager re-verify gives the right text. No trap.
-   Owner: Task 3 (`armed=False` parametrization), Task 9 (unarmed replay).
-2. **A forced NVMe miss when its home node's staging list is exhausted.** Expected: overflow and re-verify, never the
-   unforced path's `__trap`. Owner: Task 3 (`test_a_forced_miss_without_staging_overflows_not_traps`), Task 9.
+   every eager graph-path verify). This is the one overflow left. No forced lane can be a CPU lane: `host_lanes` is
+   false. Expected: the post serves the victims' prefix, writes the count, flags the forward, and the eager re-verify
+   gives the right text. No trap. Owner: Task 4 (`armed=False`), Task 11 (unarmed replay).
+2. **Every non-victim lane an NVMe miss, all on one node.** This cannot overflow, and it is asserted.
+   - The device types each forced miss `MISS_CPU` with slot −1, never a staging slot. It traps if a *live* miss finds
+     no staging (live ≤ V = staging per node).
+   - The host reads each forced miss into a RAM victim of that node and fail-stops if none exists, which Task 10's
+     start-up capacity check rules out.
+   - Owner: Task 4 (36 forced misses on a 40-lane post), Task 9 (36 host-placed misses on one node), Task 11 (end to
+     end).
 3. **A verify with fewer tokens than the rows hold** (a 3-token post into 4-token rows, a short eager verify). Expected:
-   the host reads the count from the table header. It neither assumes `tokens_max` nor reads stale rows. Owner: Task 4,
-   Task 5 (3 tokens in 4-token rows).
+   the host reads the count from the table header. It neither assumes `tokens_max` nor reads stale rows. Owner: Task 5,
+   Task 6 (3 tokens in 4-token rows).
 4. **A token that routes none of a job's lanes, and stale output rows from an earlier record.** Expected:
    - that token's row gets slot −1 everywhere and its partial is exactly 0;
    - the engine zeroes a non-accumulating per-token job's rows itself instead of trusting the kernel to;
    - and the real kernel skips only slot −1, never a zero weight (`forward_plan.hpp:699-702`).
-   Owner: Task 5 (out rows pre-filled with 7.0, tokens that skip lanes).
-5. **More than 32 distinct misses in one layer with spill on** (§33.5: max 36). Expected: the clamp flags it and serves
-   the victims' prefix, exactly as without CPU experts. The post never sees a count above the record's lanes. Owner:
-   Task 7 (`test_spill_clamps_only_a_count_past_the_lanes`).
+   Owner: Task 6 (out rows pre-filled with 7.0, tokens that skip lanes).
+5. **36 distinct misses in one layer.** This cannot overflow, and it is asserted.
+   - With a lane per route, the miss count never exceeds the lanes.
+   - Under spill the gather never calls the clamp, which asserts it is not spilling.
+   - The post still traps on `count > Wire::kLanes`. The updater refuses spill with a narrowed `MISS_LANES`.
+   - Owner: Task 8 (`test_spill_never_clamps`, `test_spill_needs_a_lane_per_route`), Task 11 (a 36-distinct-expert
+     verify, no overflow).
 
 ---
 
@@ -130,26 +187,33 @@ Each needs the owner's call. The plan proceeds on the recommendation and records
 
 | File | Change | Responsibility |
 |---|---|---|
-| `python/sglang/srt/layers/moe/ram_slot_map.py` | modify | Python reference of lane typing: forced lanes, `LaneOverflow` |
-| `python/sglang/kernels/jit/csrc/moe/expert_stream/lease_device.cuh` | modify | device `type_lanes`: forced lanes, returns false on overflow |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/lease_layout.h` | modify | 1..64 lanes; `LaneMask`, `kWideLanes`, mask word counts |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/lane_mask.cuh` | create | `lowest_lane`, `lane_count`, `load_lane_mask` over u32/u64 |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/row_copy_kernels.cuh` | modify | CW/CC on `LaneMask`, wide `ce_mask`/`cpu_lanes` formats |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/lease_layout_probe.cpp` | modify | the 40-lane probe case |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/copy_engine.h` | modify | `CopyJob` masks on `LaneMask` |
+| `python/sglang/kernels/jit/csrc/moe/expert_residency/direct_gather.cuh` | modify | wide destinations kernel; commit templated on mask and width |
+| `python/sglang/srt/layers/moe/ram_slot_map.py` | modify | reference typing: forced lanes (hit: RAM slot; miss: slot −1), `LaneOverflow` |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/lease_device.cuh` | modify | device `type_lanes`: forced lanes; false only when no CPU lane is possible |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/lease_kernels.cuh` | modify | post: spill fallback, M-token staging, token table |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/cpu_token_table.h` | create | the token table's layout constants, shared by device and host |
-| `python/sglang/kernels/ops/moe/expert_lease_block.py` | modify | `cpu_row_bytes`, the Python mirror of the row layout |
-| `python/sglang/kernels/ops/moe/expert_stream_transport.py` | modify | `ExpertStreamDevice.post` (`spill`, M tokens), both `enable_cpu_experts` (4-dim rows) |
+| `python/sglang/kernels/ops/moe/expert_lease_block.py` | modify | `MAX_LANES = 64`, `cpu_row_bytes` |
+| `python/sglang/kernels/ops/moe/expert_stream_transport.py` | modify | device `post` (`spill`, M tokens), both `enable_cpu_experts`, wide mask tensors, calibration lanes |
 | `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h` | modify | `CpuJob.per_token/lanes`, `CpuExpertConfig.tokens`, `run_job` expansion |
-| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h` | modify | record jobs carry their lanes and `per_token` |
-| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h` | modify | `enable_cpu_experts(tokens)` |
-| `python/sglang/kernels/jit/csrc/moe/exl3/exl3_route_tables.cuh` | modify | lift the one-token CPU refusal |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h` | modify | `LaneMask` masks; record jobs carry lanes; host-placed forced misses |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/split_calibration.h` | modify | calibrate up to a runtime lane count |
+| `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h` | modify | `enable_cpu_experts(tokens)`, `calibrate_cpu_split(lanes)` |
+| `python/sglang/kernels/jit/csrc/moe/exl3/exl3_route_tables.cuh` | modify | wide CPU mask; lift the one-token CPU refusal |
 | `python/sglang/srt/layers/quantization/exl3/fused_moe.py` | modify | lift `m != 1` with `cpu` |
 | `python/sglang/srt/environ.py` | modify | `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES` |
-| `python/sglang/srt/layers/moe/expert_residency_gpu.py` | modify | victim cap, idle destinations, clamp under spill, floor 2V |
-| `python/sglang/kernels/jit/csrc/moe/expert_residency/direct_gather.cuh` | modify | idle destination params |
-| `python/sglang/kernels/ops/moe/expert_residency_direct_gather.py` | modify | pass them |
+| `python/sglang/srt/layers/moe/expert_residency_gpu.py` | modify | victim cap, idle destinations, spill reads the flag, clamp assert, floor 2V |
+| `python/sglang/kernels/ops/moe/expert_residency_direct_gather.py` | modify | idle destination arguments |
 | `python/sglang/srt/layers/moe/expert_hot_cache.py` | modify | allocator floor 2V |
 | `python/sglang/srt/layers/moe/exl3_expert_format.py` | modify | plan the staging width V |
-| `python/sglang/srt/layers/moe/exl3_ram_miss.py` | modify | staging width, CPU rows by tokens, attach, spill words |
-| `python/sglang/srt/layers/moe/cpu_experts/service.py` | modify | rows sized by tokens |
+| `python/sglang/srt/layers/moe/exl3_ram_miss.py` | modify | staging width, CPU rows by tokens, attach, spill words, capacity check |
+| `python/sglang/srt/layers/moe/cpu_experts/service.py` | modify | rows sized by tokens, calibration lanes |
 | `python/sglang/srt/arg_groups/expert_stream_requirements_exl3.py` | modify | the gate |
+| `scripts/dsv41/bs1_build_digest.py` | create | SASS and `.text` digests of the one-token build |
 | `benchmarks/dsv41_baseline/arm_env.py`, `launch_prod.sh` | modify | DSpark mode, `PROD_DSPARK` |
 | `scripts/expert_prediction/benchmarks/run_capture_sessions.py` | modify | record `sglext.spec_tokens_details` |
 | `scripts/dsv41/dspark_text_band.py` | create | the §33.2/§33.9 near-tie text bar |
@@ -216,7 +280,750 @@ Expected: `EXIT=0`. Record the pass counts with the command.
 
 ---
 
-### Task 2: The reference types forced lanes
+### Task 2: Widen the wire to 64 lanes, with the one-token build unchanged
+
+**Why 40 lanes.** A 6-token verify at top-6 routes at most 36 distinct experts per layer. A record with a lane per route
+therefore never overflows, and Task 8 asserts it. `LeaseLayout` rounds lanes up to 8, because its lane arrays are i16
+and whole 16-byte stores (`lease_layout.h:38-39`), so 36 builds as 40. The type limit moves to 64, one u64 mask.
+
+**What changes** (research inventory, 2026-10-06). Every offset in `LeaseLayout` is already derived from `kLanes`; the
+only fixed values are the `<8,1>` pins at `lease_layout.h:128-131`. The 32-lane limits are:
+- **Per-build code**, compiled with `-DSGLANG_EXPERT_STREAM_LANES`:
+  - the `static_assert` at `lease_layout.h:36`;
+  - CW and CC (`row_copy_kernels.cuh:264, 278-295, 313-314, 326-356, 487-492`), with `uint32_t` lane masks and the
+    `ce_mask[3]`/`cpu_lanes[2]` words;
+  - the host's `CopyJob::mask/cpu_mask` (`copy_engine.h:44,49`) and `CpuMissBatch::sent` (`ram_tier.h:1602`) with
+    their shifts (`ram_tier.h:1672,1677,1717,1791,1796`).
+- **Shared by every build:**
+  - `direct_gather.cuh`: a 32-thread destinations kernel, the commit's 32-entry arrays, and a `uint32_t` read of
+    `cpu_lanes[0]`;
+  - `exl3_route_tables.cuh:75-83`: a `uint32_t` CPU mask.
+- **Python:** `expert_lease_block.MAX_LANES = 32`.
+
+**Unaffected:**
+- PieceMask, the delta block and the protect list scale with `kLanes`.
+- §33.3's "8-bit masks" are piece bits (`kRowPieces = 8`), not lane bits.
+- The dedup route planner already takes 64 routes.
+
+**How the one-token build stays byte-identical:**
+- The mask type is `LaneMask = std::conditional_t<(kLanes > 32), uint64_t, uint32_t>`, and wide-only words sit under
+  `if constexpr`.
+- The shared kernels are templated on the mask, and their narrow instantiation is the old code.
+- The destinations kernel keeps its 32-thread body untouched, and a new 64-thread kernel serves wider shortlists.
+- This task's first step records the BS1 build's SASS per kernel and its host `.text`, before any source change. Its
+  test then requires both to be unchanged.
+
+**Files:**
+- Create: `scripts/dsv41/bs1_build_digest.py`, `test/manual/dsv41/test_bs1_build_digest.py`,
+  `test/manual/dsv41/golden/bs1_build_digest.json`, `python/sglang/kernels/jit/csrc/moe/expert_stream/lane_mask.cuh`,
+  `test/manual/dsv41/test_direct_gather_wide_gpu.py`
+- Modify:
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/lease_layout.h`, `lease_layout_probe.cpp`, `row_copy_kernels.cuh`
+  - `python/sglang/kernels/jit/csrc/moe/expert_stream/host/copy_engine.h`, `host/ram_tier.h`
+  - `python/sglang/kernels/jit/csrc/moe/expert_residency/direct_gather.cuh`
+  - `python/sglang/kernels/jit/csrc/moe/exl3/exl3_route_tables.cuh`
+  - `python/sglang/kernels/ops/moe/expert_lease_block.py`, `python/sglang/kernels/ops/moe/expert_stream_transport.py`
+- Test:
+  - `test/registered/unit/kernels/test_expert_stream_lease_layout.py`
+  - `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`
+  - `test/manual/dsv41/test_exl3_lease_kernels_cuda.py`
+  - `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py`
+  - `test/manual/dsv41/test_exl3_moe_split_parity_cuda.py`
+
+**Interfaces:**
+- Produces:
+  - `LeaseLayout::kWideLanes`, `::LaneMask`, `::kCeMaskWords` (3, or 5 wide), `::kCpuLaneWords` (2, or 3 wide);
+  - Python `WireLayout.wide_lanes`, `.ce_mask_words`, `.cpu_lane_words`;
+  - `MAX_LANES = 64`.
+  - Wide word formats keep the narrow words in place and append the high halves:
+    - `ce_mask = {copy|cpu lo, cpu lo, parts, copy|cpu hi, cpu hi}`;
+    - `cpu_lanes = {cpu lo, parts, cpu hi}`.
+  - `direct_gather_destinations` takes shortlists of 1-64 entries; `direct_commit_gather` takes 1-64 lanes and a 2- or
+    3-word `cpu_lanes`.
+
+- [ ] **Step 1: Record the one-token build's digest before any change**
+
+Create `scripts/dsv41/bs1_build_digest.py`:
+```python
+"""The one-token (BS1) build's machine code, digested (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 2).
+
+Widening the wire past 32 lanes edits source the BS1 build compiles too. Its instantiations must compile to the same
+machine code, which is what keeps BS1 outputs and timing unchanged. This runs the BS1 suites into a fresh JIT cache (so
+every module they load is built here), then records:
+  - for every kernel in the BS1 device modules and the shared DIRECT and route-table modules: the sha256 of its SASS
+    (cuobjdump -sass), instruction words and encodings, addresses stripped, keyed by its demangled name with the wide
+    template arguments this plan adds normalised away;
+  - for every 8-lane host module: the sha256 of its .text section.
+Run on divix01 under cc-gpu.lock from the worktree root:
+    python scripts/dsv41/bs1_build_digest.py --write OUT.json      (record)
+    python scripts/dsv41/bs1_build_digest.py --compare GOLDEN.json (exit 1 on any difference; keys only in the new
+                                                                    build, the wide kernels, are ignored)
+    ... --compare GOLDEN.json --permanent   the kernels no later task of the plan changes: every device kernel but the
+                                            post (Tasks 4-5 change it on purpose, inert at one token), no host .text
+                                            (Tasks 6 and 9 change the host on purpose; test_expert_stream_hotpath_golden
+                                            pins its behaviour)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SUITES = [
+    "test/manual/dsv41/test_exl3_lease_kernels_cuda.py",
+    "test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py",
+    "test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py",
+    "test/manual/dsv41/test_exl3_moe_split_parity_cuda.py",
+    "test/registered/unit/kernels/test_expert_stream_prod_build_symbols.py",
+]
+DEVICE = re.compile(r"^(expert_stream_exl3_l8(_n2)?|expert_residency_direct_.*|exl3_moe_route_tables.*)$")
+HOST = re.compile(r"^expert_stream_host_exl3_(prod|instr)_l8(_n2)?$")
+# The wide template arguments this plan adds to shared kernels; their narrow instantiation is the old kernel.
+RENAMES = [
+    (re.compile(r"direct_commit_gather_kernel<unsigned int, 32>"), "direct_commit_gather_kernel"),
+    (re.compile(r"(exl3_moe_route_tables_kernel<[^<>]*?), unsigned int>"), r"\1>"),
+]
+
+
+def _demangle(name: str) -> str:
+    out = subprocess.run(["c++filt", name], capture_output=True, text=True, check=True).stdout.strip()
+    for pattern, repl in RENAMES:
+        out = pattern.sub(repl, out)
+    return out
+
+
+def _sass(so: str) -> dict[str, str]:
+    text = subprocess.run(["cuobjdump", "-sass", so], capture_output=True, text=True, check=True).stdout
+    digests, name, lines = {}, None, []
+
+    def close():
+        if name is not None:
+            digests[_demangle(name)] = hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+    for line in text.splitlines():
+        match = re.match(r"\s*Function : (\S+)", line)
+        if match:
+            close()
+            name, lines = match.group(1), []
+        elif name is not None and "/*" in line:
+            lines.append(re.sub(r"/\*[0-9a-f]{4,}\*/", "", line).strip())  # drop the address column
+    close()
+    return digests
+
+
+def _text(so: str) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".bin") as out:
+        subprocess.run(["objcopy", "-O", "binary", "--only-section=.text", so, out.name], check=True)
+        return hashlib.sha256(open(out.name, "rb").read()).hexdigest()
+
+
+def collect() -> dict:
+    cache = os.path.join(REPO, ".bs1-digest-cache")
+    shutil.rmtree(cache, ignore_errors=True)
+    env = os.environ | {"SGLANG_JIT_CACHE_DIR": cache, "PYTHONPATH": os.path.join(REPO, "python")}
+    rc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *SUITES], env=env, cwd=REPO).returncode
+    if rc != 0:
+        raise SystemExit(f"the BS1 suites failed (exit {rc}); a digest of a red build proves nothing")
+    result = {"nvcc": subprocess.run(["nvcc", "--version"], capture_output=True, text=True).stdout.splitlines()[-1],
+              "device": {}, "host": {}}
+    import torch
+
+    result["arch"] = "sm_%d%d" % torch.cuda.get_device_capability()
+    for root, _, files in os.walk(cache):
+        for f in files:
+            if not f.endswith(".so"):
+                continue
+            module, path = f[:-3], os.path.join(root, f)
+            if DEVICE.match(module):
+                for kernel, digest in _sass(path).items():
+                    result["device"][f"{module}::{kernel}"] = digest
+            elif HOST.match(module):
+                result["host"][module] = _text(path)
+    shutil.rmtree(cache, ignore_errors=True)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--write")
+    group.add_argument("--compare")
+    parser.add_argument("--permanent", action="store_true")
+    args = parser.parse_args()
+    now = collect()
+    if args.write:
+        with open(args.write, "w") as f:
+            json.dump(now, f, indent=1, sort_keys=True)
+        return
+    with open(args.compare) as f:
+        golden = json.load(f)
+    if (golden["arch"], golden["nvcc"]) != (now["arch"], now["nvcc"]):
+        print(f"toolchain differs: golden {golden['arch']} {golden['nvcc']}, now {now['arch']} {now['nvcc']}")
+        raise SystemExit(2)
+    kinds = ("device",) if args.permanent else ("device", "host")
+    diffs = [f"{kind} {key}" for kind in kinds for key, digest in golden[kind].items()
+             if now[kind].get(key) != digest and not (args.permanent and "exl3_ram_miss_post_kernel" in key)]
+    print("\n".join(diffs) or "BS1 build unchanged")
+    raise SystemExit(1 if diffs else 0)
+
+
+if __name__ == "__main__":
+    main()
+```
+Create `test/manual/dsv41/test_bs1_build_digest.py`:
+```python
+"""The one-token build's kernels compile to the machine code recorded before the wire was widened (plan
+2026-10-06-dsv41-dspark-both-cpu-experts Task 2): the SASS of every BS1 kernel the widening touched (CW, CC, the DIRECT
+destinations and commit kernels, the route tables) and of the unchanged ones (C1, S). Same machine code, same outputs
+and timing. The post kernel and the host .text are compared in Task 2 only (bs1_build_digest.py --permanent): later
+tasks change them on purpose, inert at one token. Skips on another GPU arch or nvcc than the golden's. Run on divix01
+under cc-gpu.lock (it runs the BS1 suites)."""
+
+import os
+import subprocess
+import sys
+
+import pytest
+import torch
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+GOLDEN = os.path.join(os.path.dirname(__file__), "golden", "bs1_build_digest.json")
+
+
+def test_the_one_token_build_is_unchanged():
+    run = subprocess.run(
+        [sys.executable, os.path.join(REPO, "scripts", "dsv41", "bs1_build_digest.py"), "--compare", GOLDEN, "--permanent"],
+        capture_output=True, text=True, cwd=REPO,
+    )
+    if run.returncode == 2:
+        pytest.skip(run.stdout.strip())
+    assert run.returncode == 0, run.stdout + run.stderr
+```
+Run it once at the unmodified commit, which is the merge from Task 1:
+```bash
+cd /data/models/slang/nvfp4-work/wt-both-cpu   # checked out at the Task 1 merge plus these two new files, no source change
+mkdir -p test/manual/dsv41/golden
+flock /data/models/slang/nvfp4-work/cc-gpu.lock taskset -c 32-63 env PYTHONPATH=$PWD/python \
+  /data/models/slang/.venv/bin/python scripts/dsv41/bs1_build_digest.py --write test/manual/dsv41/golden/bs1_build_digest.json
+```
+Expected: exit 0. The golden lists the kernels of `expert_stream_exl3_l8`, `expert_stream_exl3_l8_n2` and
+`expert_residency_direct_*`, plus `exl3_moe_route_tables*`, and the `.text` digests of the 8-lane host modules. Copy
+the golden back to the laptop worktree with `scp` (a generated test fixture, not a working tree). Commit the script,
+the test and the golden before Step 3 touches any source:
+```bash
+git add scripts/dsv41/bs1_build_digest.py test/manual/dsv41/test_bs1_build_digest.py test/manual/dsv41/golden/bs1_build_digest.json
+git commit -m "test(expert-stream): record the one-token build's SASS and host .text before the wire widens
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
+```
+
+- [ ] **Step 2: Write the failing wide-wire tests**
+
+`test_expert_stream_lease_layout.py`:
+- `GRID` becomes `[(lanes, nodes) for lanes in (1, 6, 8, 13, 24, 32, 40) for nodes in (1, 2)]`.
+- `test_a_lane_count_outside_1_to_32_is_refused` becomes:
+  ```python
+  @pytest.mark.parametrize("lanes", [0, 65])
+  def test_a_lane_count_outside_1_to_64_is_refused(lanes):
+      with pytest.raises(ValueError, match="1..64"):
+          lease.wire_layout(lanes)
+  ```
+- Add:
+  ```python
+  def test_a_verify_wire_is_40_lanes_with_wide_masks():
+      """36 routes (6 tokens at top-6) round up to 40 lanes. Its record and blocks follow from the formulas; its lane
+      masks are u64, so CW's and CC's words gain the high halves. Every build up to 32 keeps the narrow words."""
+      w = lease.wire_layout(36, 2)
+      assert w.lanes == 40 and w.wide_lanes and (w.ce_mask_words, w.cpu_lane_words) == (5, 3)
+      assert (w.record_bytes, w.page_bytes, w.lease_block_bytes) == (640, 10368, 86016)
+      assert (w.copy_done, w.copy_gate, w.copy_armed, w.split) == (81920, 82048, 82176, 82304)
+      assert (w.delta_max_entries, w.delta_stride) == (80, 512)
+      assert not w.packed_counts
+      for lanes in (8, 16, 24, 32):
+          narrow = lease.wire_layout(lanes, 2)
+          assert not narrow.wide_lanes and (narrow.ce_mask_words, narrow.cpu_lane_words) == (3, 2)
+  ```
+
+`test_exl3_ram_miss_attach_lanes.py`:
+- add `(36, 40), (40, 40)` to the `rows, lanes` parametrization of `test_a_gather_within_the_planned_lanes_attaches`;
+- in `test_a_gather_wider_than_32_is_refused_when_planned`, plan `65` and match `"1..64"`, and rename it `..._wider_than_64_...`.
+
+`test_exl3_lease_kernels_cuda.py`: `@pytest.mark.parametrize("lanes", [8, 16, 32, 40])` on
+`test_each_miss_takes_the_next_staging_slot_of_its_home_node`.
+
+`test_exl3_cpu_lane_order_cuda.py`: add the following test. `Chain` takes `staging=36` so the eager gather that loads
+36 experts into RAM has a staging slot per miss.
+```python
+def test_a_40_lane_build_carries_36_cpu_lanes_through_cw_and_cc(tmp_path):
+    """Lanes 32-35 live in the masks' high words: CW marks all 36 RAM-hit lanes CPU, CC publishes {low, parts, high},
+    and the host's cpu_mask hands all 36 RAM slots to one CPU job. Mutation: keep CW's mask a u32 -- lanes 32-35 are
+    lost and the copy wait never covers them."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    row, lanes, experts = 0, 40, list(range(36))
+    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=80, staging=36)
+    try:
+        x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
+        out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), list(range(lanes + 1)), cores, x_rows,
+                                  out_rows, threads=2)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
+        backend, plan, dev = c.backends[row], c.plans[row], c.dev
+        assert (dev.ce_mask.numel(), dev.cpu_lanes.numel()) == (5, 3)
+        c.plan(experts, row)
+        c.gather(row)
+        torch.cuda.synchronize()
+        assert c.handled() and set(experts) <= c.resident(row)
+        with paused(c.host):
+            ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        c.host.arm_copy_engine()
+        backend._stage_planned(plan)
+        x = torch.randn(1, HIDDEN, device="cuda").half()
+        dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True,
+                 cpu_input=(x, torch.ones(36, device="cuda")))
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+        assert _until(lambda: len(c.host.test_kernel_calls()) == 1)
+        torch.cuda.synchronize()
+        assert c.kinds(36) == [int(LaneKind.HIT_CPU)] * 36
+        assert dev.cpu_lanes.tolist() == [-1, PART_HITS, 0xF]
+        (call,) = c.host.test_kernel_calls()
+        assert sorted(call["slots"]) == sorted(ram_slot[e] for e in experts)
+    finally:
+        c.close()
+```
+
+`test_exl3_moe_split_parity_cuda.py`, after `test_cpu_lanes_with_a_zero_partial_are_the_gpu_run_without_them`:
+```python
+def test_cpu_lanes_past_32_rank_their_routes_out(slot_rows):
+    """A 40-lane build's cpu_lanes is {low, parts, high}: CPU lanes 32-35 (their dst_slots entries the routes' slots,
+    lanes 0-31 naming no slot) leave the fused MoE exactly as low lanes do, bit for bit against the masked run.
+    Mutation: read only the low word -- the routes stay in."""
+    device = slot_rows["w13_trellis"].device
+    fused = _fused(slot_rows, device, True)
+    hidden = slot_rows["w13_suh"].shape[-1]
+    zero = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
+    keep = torch.ones(1, device=device)
+    gen = torch.Generator().manual_seed(933)
+    for trial in range(TRIALS * 4):
+        x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
+        high = int(torch.randint(1, 16, (1,), generator=gen))  # which of lanes 32-35 are the CPU's
+        dst = torch.full((36,), -1, dtype=torch.int32, device=device)
+        dst[32:36] = remap[:4].to(torch.int32)  # lane 32 + i names route i's slot
+        lanes = torch.tensor([0, PART_HITS, high], dtype=torch.int32, device=device)
+        on_cpu = torch.tensor([i < 4 and bool(high >> i & 1) for i in range(TOP_K)], device=device)
+        want = fused.run(x, torch.where(on_cpu, torch.zeros_like(weights), weights), remap, keep, ACT_LIMIT).clone()
+        got = fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=(lanes, dst, zero.data_ptr(), 0)).clone()
+        assert torch.equal(_bits(got), _bits(want)), f"high={high:#x} remap={remap.tolist()}"
+```
+
+Create `test/manual/dsv41/test_direct_gather_wide_gpu.py`:
+```python
+"""DIRECT's kernels at a verify's width (33-64 lanes): the 64-thread destinations kernel equals the torch chain
+(GpuResidencyUpdater.gather_destinations) on random shortlists, and the commit leaves out CPU lanes named by a 3-word
+cpu_lanes, high word included (GPU, plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 2)."""
+
+import pytest
+import torch
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+WIDTH, SLOTS, EXPERTS = 36, 64, 96
+
+
+def _chain(route_slots, victims, valid, miss_count, remap, base):
+    """The torch chain of GpuResidencyUpdater.gather_destinations, without spill."""
+    hazard = (route_slots.unsqueeze(1) == victims.unsqueeze(0)).any(dim=0)
+    order = torch.argsort((hazard | ~valid).to(torch.uint8), stable=True)
+    usable, usable_valid = victims.index_select(0, order), (valid & ~hazard).index_select(0, order)
+    live = (torch.arange(victims.numel(), device="cuda") < miss_count) & usable_valid
+    destinations = torch.where(live, usable, torch.zeros_like(usable))
+    rank = (remap - base).clamp(min=0, max=victims.numel() - 1)
+    return destinations, live, torch.where(remap >= base, destinations.index_select(0, rank), remap)
+
+
+def test_the_wide_destinations_kernel_is_the_torch_chain():
+    from sglang.kernels.ops.moe.expert_residency_direct_gather import direct_gather_destinations
+
+    gen = torch.Generator().manual_seed(36)
+    for trial in range(200):
+        ids = torch.randint(0, EXPERTS, (WIDTH,), generator=gen).cuda()
+        expert_to_slot = torch.where(torch.rand(EXPERTS, generator=gen) < 0.4,
+                                     torch.randint(0, SLOTS, (EXPERTS,), generator=gen), torch.full((EXPERTS,), -1)).cuda()
+        victims = torch.randperm(SLOTS, generator=gen)[:WIDTH].cuda()
+        valid = (torch.rand(WIDTH, generator=gen) < 0.8).cuda()
+        miss_count = torch.randint(0, WIDTH + 1, (1,), generator=gen, dtype=torch.int32).cuda()
+        remap = torch.where(torch.rand(WIDTH, generator=gen) < 0.5, torch.randint(0, SLOTS, (WIDTH,), generator=gen),
+                            SLOTS + torch.randint(0, WIDTH, (WIDTH,), generator=gen)).cuda()
+        want = _chain(expert_to_slot[ids], victims, valid, miss_count, remap, SLOTS)
+        slots_out = torch.zeros(WIDTH, dtype=torch.int32, device="cuda")
+        dest_out = torch.zeros(WIDTH, dtype=torch.int64, device="cuda")
+        live_out = torch.zeros(WIDTH, dtype=torch.bool, device="cuda")
+        remap_out = torch.zeros(WIDTH, dtype=torch.int64, device="cuda")
+        direct_gather_destinations(ids, expert_to_slot, victims, valid, miss_count, remap, SLOTS, slots_out, dest_out,
+                                   live_out, remap_out)
+        assert torch.equal(dest_out, want[0]) and torch.equal(live_out, want[1]) and torch.equal(remap_out, want[2]), trial
+        assert torch.equal(slots_out, want[0].to(torch.int32)), trial
+
+
+def test_the_commit_leaves_out_cpu_lanes_past_32():
+    from sglang.kernels.ops.moe.expert_residency_direct_gather import direct_commit_gather
+
+    cuda = dict(device="cuda")
+    destinations = torch.arange(WIDTH, dtype=torch.int64, **cuda)
+    live = torch.ones(WIDTH, dtype=torch.bool, **cuda)
+    new_experts = torch.arange(10, 10 + WIDTH, dtype=torch.int64, **cuda)
+    mapping = torch.full((EXPERTS + 1,), -1, dtype=torch.int64, **cuda)
+    slot_to_expert = torch.full((SLOTS + 1,), -1, dtype=torch.int64, **cuda)
+    slot_state = torch.zeros(SLOTS + 1, dtype=torch.uint8, **cuda)
+    generations = torch.zeros(SLOTS + 1, dtype=torch.int64, **cuda)
+    counters = [torch.zeros(1, dtype=torch.int64, **cuda) for _ in range(3)]
+    cpu_lanes = torch.tensor([1, 1, 0b1010], dtype=torch.int32, **cuda)  # lanes 0, 33 and 35 are the CPU's
+    direct_commit_gather(
+        destinations, live, new_experts, mapping, slot_to_expert, slot_state, generations, *counters,
+        torch.tensor([WIDTH], dtype=torch.int32, **cuda), torch.ones(1, **cuda), torch.tensor([WIDTH], dtype=torch.int32, **cuda),
+        ready=3, free_state=0, cpu_lanes=cpu_lanes,
+    )
+    cpu = {0, 33, 35}
+    assert [int(mapping[10 + j]) for j in range(WIDTH)] == [-1 if j in cpu else j for j in range(WIDTH)]
+    assert int(counters[0].item()) == WIDTH - 3 and int(counters[2].item()) == 0  # insertions; nothing truncated
+```
+
+- [ ] **Step 3: Run and see them fail**
+
+On divix01:
+- CPU: `test/registered/unit/kernels/test_expert_stream_lease_layout.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`.
+  Expected: `ValueError: a demand record carries 1..32 lanes, not 36`.
+- GPU lock: `test/manual/dsv41/test_direct_gather_wide_gpu.py` (expected `the shortlist must hold 1-32 entries`) and
+  the new lane-order and split-parity tests.
+
+- [ ] **Step 4: The layout** (`lease_layout.h`, `lease_layout_probe.cpp`, `expert_lease_block.py`)
+
+In `lease_layout.h`, add `#include <type_traits>`. Change the assert to
+`static_assert(1 <= NumLanes && NumLanes <= 64, "a record carries 1..64 lanes");`. After `kNodes`, add:
+```cpp
+  // A mask with a bit per lane: one u32 up to 32 lanes, so the narrow builds' code is unchanged, else one u64.
+  static constexpr bool kWideLanes = kLanes > 32;
+  using LaneMask = std::conditional_t<kWideLanes, uint64_t, uint32_t>;
+  // CW's words for CC (ce_mask: copy | cpu, cpu, parts) and CC's for the fused MoE and the DIRECT commit (cpu_lanes:
+  // cpu, parts); a wide build appends the masks' high halves, so the narrow words keep their places.
+  static constexpr int kCeMaskWords = kWideLanes ? 5 : 3;
+  static constexpr int kCpuLaneWords = kWideLanes ? 3 : 2;
+```
+In `lease_layout_probe.cpp`, add `case 40: return for_nodes<40>(nodes);` to `probe` and
+`case 40: return channel_for_nodes<40>(nodes);` to `channel_probe`.
+
+`expert_lease_block.py`: `MAX_LANES = 64`. Add to `WireLayout`:
+```python
+    @property
+    def wide_lanes(self) -> bool:
+        """Lane masks are u64 (LeaseLayout::kWideLanes): more than 32 lanes."""
+        return self.lanes > 32
+
+    @property
+    def ce_mask_words(self) -> int:
+        return 5 if self.wide_lanes else 3
+
+    @property
+    def cpu_lane_words(self) -> int:
+        return 3 if self.wide_lanes else 2
+```
+
+- [ ] **Step 5: Mask helpers** — create `python/sglang/kernels/jit/csrc/moe/expert_stream/lane_mask.cuh`:
+```cpp
+// Lane masks of the RAM-miss wire (lease_layout.h LaneMask): one u32 up to 32 lanes, one u64 above. The u32 overloads
+// are the intrinsics the narrow code always used, so a narrow build compiles to what it did.
+#pragma once
+
+#include <cstdint>
+
+namespace sglang::expert_stream {
+
+__device__ __forceinline__ int lowest_lane(uint32_t mask) {
+  return __ffs(mask) - 1;
+}
+__device__ __forceinline__ int lowest_lane(uint64_t mask) {
+  return __ffsll(static_cast<long long>(mask)) - 1;
+}
+__device__ __forceinline__ int lane_count(uint32_t mask) {
+  return __popc(mask);
+}
+__device__ __forceinline__ int lane_count(uint64_t mask) {
+  return __popcll(mask);
+}
+
+// A lane mask from its words: `lo`, and for a u64 mask `hi` as the high half.
+template <typename MaskT>
+__device__ __forceinline__ MaskT load_lane_mask(const int32_t* lo, const int32_t* hi) {
+  if constexpr (sizeof(MaskT) == 8) {
+    return static_cast<MaskT>(static_cast<uint32_t>(*lo)) | static_cast<MaskT>(static_cast<uint32_t>(*hi)) << 32;
+  } else {
+    return static_cast<uint32_t>(*lo);
+  }
+}
+
+}  // namespace sglang::expert_stream
+```
+
+- [ ] **Step 6: CW and CC** (`row_copy_kernels.cuh`)
+
+Add `#include "lane_mask.cuh"`. Replace the two `static_assert`s with
+```cpp
+static_assert(device::expert_stream::Wire::kLanes <= 64, "a lane mask is one u64");
+static_assert(2 * device::expert_stream::Wire::kNodes <= 32, "a part mask is one u32");
+```
+In `CopyCommitParams`, replace the comment of `cpu_lanes` with "CPU experts: Wire::kCpuLaneWords words, {the lanes the
+CPU computed (low half), the output parts holding their partial sums (bit 2g + 0: group g's CPU hits', bit 2g + 1: its
+CPU misses'), the lanes' high half in a wide build}, else 0; null when off."
+
+In CW, at the top: `using LaneMask = Wire::LaneMask;`. Make these replacements:
+- `__shared__ uint32_t copying;` → `__shared__ LaneMask copying;`
+- `__shared__ uint32_t cpu;` → `__shared__ LaneMask cpu;`
+- `uint32_t c = 0, u = 0, parts = 0;` → `LaneMask c = 0, u = 0;` plus `uint32_t parts = 0;`
+- `u |= 1u << lane;` → `u |= LaneMask{1} << lane;`
+- `c |= 1u << lane;` → `c |= LaneMask{1} << lane;`
+- the copy loop becomes
+  `for (LaneMask lanes = copying; lanes != 0; lanes &= lanes - 1) { const int lane = expert_stream::lowest_lane(lanes); ...`
+Replace the tail from `p.ce_mask[0] = p.ce_mask[1] = p.ce_mask[2] = 0;` through `p.ce_mask[2] = ...;` with:
+```cpp
+  p.ce_mask[0] = p.ce_mask[1] = p.ce_mask[2] = 0;
+  if constexpr (Wire::kWideLanes) p.ce_mask[3] = p.ce_mask[4] = 0;
+  if (planned_count == 0) return;
+  const LaneMask mask = copying | cpu;
+  if (mask == 0) return;
+  // CC reads these after the stream's wait, stream-ordered; nothing on the host reads them.
+  p.ce_mask[0] = static_cast<int32_t>(static_cast<uint32_t>(mask));
+  p.ce_mask[1] = static_cast<int32_t>(static_cast<uint32_t>(cpu));
+  p.ce_mask[2] = static_cast<int32_t>(cpu_parts);
+  if constexpr (Wire::kWideLanes) {
+    p.ce_mask[3] = static_cast<int32_t>(static_cast<uint32_t>(mask >> 32));
+    p.ce_mask[4] = static_cast<int32_t>(static_cast<uint32_t>(cpu >> 32));
+  }
+```
+In CC, replace from `const uint32_t armed = ...` to the end of the kernel:
+```cpp
+  using LaneMask = Wire::LaneMask;
+  const LaneMask armed = expert_stream::load_lane_mask<LaneMask>(p.ce_mask, p.ce_mask + 3);
+  if (p.cpu_lanes != nullptr) {
+    p.cpu_lanes[0] = p.cpu_lanes[1] = 0;
+    if constexpr (Wire::kWideLanes) p.cpu_lanes[2] = 0;
+  }
+  if (armed == 0) return;
+  const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
+  const uint64_t generation = pending_generation(p.state);
+  // Only a teardown opens a gate without CopyDone: the service is gone, and the copies may not have landed.
+  channel::commit_or_trap<TargetChannel>(p.lease, seq, generation);
+  if (p.cpu_lanes != nullptr) {
+    p.cpu_lanes[0] = p.ce_mask[1];
+    p.cpu_lanes[1] = p.ce_mask[2];
+    if constexpr (Wire::kWideLanes) p.cpu_lanes[2] = p.ce_mask[4];
+  }
+}
+```
+(In a narrow build `load_lane_mask<uint32_t>` reads `ce_mask[0]` only, as before.)
+In the launcher, `TensorMatcher({3})` for `ce_mask` becomes `TensorMatcher({Wire::kCeMaskWords})`, and the cpu_lanes
+check becomes:
+```cpp
+    RuntimeCheck(
+        cpu_lanes.size(0) == 0 || cpu_lanes.size(0) == Wire::kCpuLaneWords,
+        "cpu_lanes: Wire::kCpuLaneWords words, or empty when CPU experts are off");
+```
+`expert_stream_transport.py` (`ExpertStreamDevice.__init__`):
+- `self.ce_mask = torch.zeros(3, ...)` → `torch.zeros(self.wire.ce_mask_words, ...)`;
+- `self.cpu_lanes = torch.zeros(2, ...)` → `torch.zeros(self.wire.cpu_lane_words, ...)`.
+Their comments gain "; a wide wire appends the masks' high halves".
+
+- [ ] **Step 7: Host masks** (`copy_engine.h`, `ram_tier.h`)
+
+`copy_engine.h` `CopyJob`: `uint32_t mask = 0;` → `Wire::LaneMask mask = 0;` and `uint32_t cpu_mask = 0;` →
+`Wire::LaneMask cpu_mask = 0;`.
+`ram_tier.h`:
+- `uint32_t sent = 0;  // bit i: miss i went to the CPU` → `Wire::LaneMask sent = 0;  // bit i: miss i went to the CPU`;
+- `job.cpu_mask |= 1u << j;` → `job.cpu_mask |= Wire::LaneMask{1} << j;`;
+- `job.mask |= 1u << j;` → `job.mask |= Wire::LaneMask{1} << j;`;
+- `__builtin_popcount(job.cpu_mask)` → `std::popcount(job.cpu_mask)`;
+- `misses->sent |= 1u << i;` → `misses->sent |= Wire::LaneMask{1} << i;`.
+The tests `(job.cpu_mask >> lane.lane & 1u)` and `(misses->sent >> i & 1u)` stay correct for either type. Then
+`grep -n "1u << \(j\|i\|lane\)" python/sglang/kernels/jit/csrc/moe/expert_stream/host/*.h`. Expected: no lane shift left
+on a `uint32_t` (node masks such as `1u << job.group` stay).
+
+- [ ] **Step 8: The shared kernels**
+
+`direct_gather.cuh`, after the existing destinations kernel, add the wide kernel:
+```cpp
+// The same for a shortlist of 33-64 entries (a verify with a lane per route): two warps, thread j owns entry j, and the
+// usable entries' order crosses the warps through per-warp counts. Same outputs as the torch chain; the narrow kernel
+// above is left as it was for the one-token build.
+template <typename IdT, typename RemapInT, typename RemapOutT>
+__global__ __launch_bounds__(2 * kDirectGatherWarp, 1) void direct_gather_destinations_wide_kernel(
+    const IdT* __restrict__ topk_ids,
+    int top_k,
+    const int64_t* __restrict__ expert_to_slot,
+    const int64_t* __restrict__ victims,
+    const bool* __restrict__ victim_valid,
+    int width,
+    const int32_t* __restrict__ miss_count,
+    const RemapInT* __restrict__ remap_in,
+    int64_t scratch_base,
+    int32_t* __restrict__ destination_slots_out,
+    int64_t* __restrict__ destinations_out,
+    bool* __restrict__ live_out,
+    RemapOutT* __restrict__ remap_out) {
+  constexpr int kThreads = 2 * kDirectGatherWarp;
+  __shared__ int64_t usable[kThreads];
+  __shared__ bool usable_valid[kThreads];
+  __shared__ int64_t destinations[kThreads];
+  __shared__ int warp_good[2], warp_bad[2];
+  const int t = static_cast<int>(threadIdx.x);
+  const int warp = t / kDirectGatherWarp;
+  const unsigned lane = static_cast<unsigned>(t % kDirectGatherWarp);
+  const bool entry = t < width;
+  const int64_t victim = entry ? victims[t] : 0;
+  const bool valid = entry && victim_valid[t];
+  bool hazard = false;
+  if (entry) {
+    for (int i = 0; i < top_k; ++i) {
+      hazard |= expert_to_slot[static_cast<int64_t>(topk_ids[i])] == victim;
+    }
+  }
+  const bool good = valid && !hazard;
+  const unsigned good_mask = __ballot_sync(0xffffffffu, entry && good);
+  const unsigned bad_mask = __ballot_sync(0xffffffffu, entry && !good);
+  if (lane == 0) {
+    warp_good[warp] = __popc(good_mask);
+    warp_bad[warp] = __popc(bad_mask);
+  }
+  __syncthreads();
+  const unsigned earlier = (1u << lane) - 1u;
+  const int goods = warp_good[0] + warp_good[1];
+  const int good_before = (warp == 1 ? warp_good[0] : 0) + __popc(good_mask & earlier);
+  const int bad_before = (warp == 1 ? warp_bad[0] : 0) + __popc(bad_mask & earlier);
+  if (entry) {
+    const int position = good ? good_before : goods + bad_before;
+    usable[position] = victim;
+    usable_valid[position] = good;
+  }
+  __syncthreads();
+  if (entry) {
+    const bool live = t < miss_count[0] && usable_valid[t];
+    const int64_t destination = live ? usable[t] : 0;
+    destinations[t] = destination;
+    destinations_out[t] = destination;
+    destination_slots_out[t] = static_cast<int32_t>(destination);
+    live_out[t] = live;
+  }
+  __syncthreads();
+  for (int i = t; i < top_k; i += kThreads) {
+    const int64_t remap = static_cast<int64_t>(remap_in[i]);
+    int64_t rank = remap - scratch_base;
+    rank = rank < 0 ? 0 : (rank > width - 1 ? width - 1 : rank);
+    remap_out[i] = static_cast<RemapOutT>(remap >= scratch_base ? destinations[rank] : remap);
+  }
+}
+```
+In `direct_gather_destinations_gpu`:
+- the width check becomes `RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= 2 * kDirectGatherWarp, "the shortlist must hold 1-64 entries");`;
+- the launch becomes:
+  ```cpp
+  const bool wide = W_.unwrap() > kDirectGatherWarp;
+  host::LaunchKernel(1, wide ? 2 * kDirectGatherWarp : kDirectGatherWarp, stream)(
+      wide ? direct_gather_destinations_wide_kernel<IdT, RemapInT, RemapOutT>
+           : direct_gather_destinations_kernel<IdT, RemapInT, RemapOutT>,
+      ...the same arguments...);
+  ```
+Commit kernel: make it `template <typename MaskT, int kMaxWidth> __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(...)`. Inside:
+- replace the first line's read with
+  `const MaskT cpu = cpu_lanes != nullptr ? expert_stream::load_lane_mask<MaskT>(cpu_lanes, cpu_lanes + 2) : MaskT{0};`;
+- the arrays `[kDirectGatherWarp]` become `[kMaxWidth]`;
+- `(cpu >> j & 1u)` becomes `(cpu >> j & MaskT{1})`;
+- `__popc(cpu)` becomes `expert_stream::lane_count(cpu)`.
+Include `../expert_stream/lane_mask.cuh`. In `direct_commit_gather_gpu`, the width check becomes `<= 2 * kDirectGatherWarp`
+("the commit must cover 1-64 lanes"), and `cpu_lanes` accepts `{2}` or `{3}`:
+```cpp
+    const int64_t words = cpu_lanes.value().size(0);
+    RuntimeCheck(words == 2 || words == 3, "cpu_lanes: two words, or three for a wide wire");
+    expert_stream::verify_named(
+        "cpu_lanes", TensorMatcher({words}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes.value());
+```
+Launch `direct_commit_gather_kernel<uint32_t, kDirectGatherWarp>` when the width is at most 32 and `cpu_lanes` is absent
+or 2 words, else `direct_commit_gather_kernel<uint64_t, 2 * kDirectGatherWarp>`.
+
+`exl3_route_tables.cuh`: give `exl3_moe_route_tables_kernel` a fourth template parameter `typename MaskT`. Replace
+```cpp
+  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
+```
+with `const MaskT cpu = cpu_lanes != nullptr ? expert_stream::load_lane_mask<MaskT>(cpu_lanes, cpu_lanes + 2) : MaskT{0};`
+(`parts` still reads `cpu_lanes[1]`). In `ranked`, the loop becomes
+`for (MaskT lanes = cpu; lanes != 0; lanes &= lanes - 1) { const int lane = expert_stream::lowest_lane(lanes); ...`.
+In the launcher:
+- the cpu_lanes size check accepts 0, 2 or 3 words;
+- `cpu_on` is `cpu_lanes.size(0) >= 2`;
+- launch `<RemapT, WeightT, XT, uint64_t>` when the size is 3, else `<RemapT, WeightT, XT, uint32_t>`.
+Include `../expert_stream/lane_mask.cuh`.
+
+- [ ] **Step 9: Python caps and docs**
+
+- `exl3_ram_miss.py`: `plan_gather_width`'s docstring "outside 1..32" becomes "outside 1..64".
+- `expert_stream.py:1489`: "at most 32 routes of one token or 64 of several" is unchanged; it is the planner's limit,
+  which already holds 36 routes.
+- The gate's 1-32 stays until Task 12.
+
+- [ ] **Step 10: Run and pass, then prove the one-token build unchanged**
+
+On divix01:
+- CPU: the two registered files of Step 2, plus `test/registered/unit/kernels/test_lease_channel_layout.py`,
+  `test_exl3_lease_block.py` and `test_expert_stream_hotpath_golden.py` (host behaviour of the 8-lane build, pinned).
+- GPU lock:
+  - `test/manual/dsv41/test_direct_gather_wide_gpu.py test/manual/dsv41/test_exl3_lease_kernels_cuda.py test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py test/manual/dsv41/test_exl3_moe_split_parity_cuda.py test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py`;
+  - then `test/manual/dsv41/test_bs1_build_digest.py`;
+  - and the full comparison, host `.text` and post kernel included:
+    `python scripts/dsv41/bs1_build_digest.py --compare test/manual/dsv41/golden/bs1_build_digest.json`.
+
+Expected: `EXIT=0` for all, and both digest runs print `BS1 build unchanged`. Record the full comparison's output in
+the commit message: it is this task's evidence that the BS1 outputs and timing are unchanged.
+
+If a host `.text` digest differs, diff `objdump -d --no-show-raw-insn` of the two `.so` files. Record whether every
+difference is an address operand (a moved `.rodata` string) or a real instruction change. A real change in a narrow
+instantiation is a defect in Steps 6-8, to be fixed, not waived. If a kernel's SASS differs, do the same with
+`cuobjdump -sass -fun <name>`.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add python/sglang/kernels/jit/csrc/moe/expert_stream/lease_layout.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/lease_layout_probe.cpp \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/lane_mask.cuh \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/row_copy_kernels.cuh \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/copy_engine.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h \
+  python/sglang/kernels/jit/csrc/moe/expert_residency/direct_gather.cuh \
+  python/sglang/kernels/jit/csrc/moe/exl3/exl3_route_tables.cuh \
+  python/sglang/kernels/ops/moe/expert_lease_block.py python/sglang/kernels/ops/moe/expert_stream_transport.py \
+  python/sglang/srt/layers/moe/exl3_ram_miss.py \
+  test/registered/unit/kernels/test_expert_stream_lease_layout.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py \
+  test/manual/dsv41/test_exl3_lease_kernels_cuda.py test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py \
+  test/manual/dsv41/test_exl3_moe_split_parity_cuda.py test/manual/dsv41/test_direct_gather_wide_gpu.py
+git commit -m "feat(expert-stream): the wire carries up to 64 lanes (u64 masks above 32); the one-token build is unchanged
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
+```
+
+---
+
+### Task 3: The reference types forced lanes
 
 `ram_slot_map.type_lanes` is the host reference the device typing transcribes, and the CUDA parity suite compares
 against it. It learns **forced lanes**: the lanes from `forced_from` on found no VRAM victim and must be CPU lanes.
@@ -226,8 +1033,13 @@ against it. It learns **forced lanes**: the lanes from `forced_from` on found no
 - Test: `test/registered/unit/kernels/test_ram_slot_map.py`
 
 **Interfaces:**
-- Produces: `type_lanes(..., forced_from: Optional[int] = None)`. It returns `(kinds, slots)` as before, and raises
-  `LaneOverflow(ValueError)` when a forced lane cannot be the CPU's. The split counts only lanes `< forced_from`.
+- Consumes: Task 2's `wire_layout` up to 64 lanes.
+- Produces: `type_lanes(..., forced_from: Optional[int] = None)`, returning `(kinds, slots)` as before.
+  - A forced hit is `HIT_CPU` at its RAM slot.
+  - A forced miss is `MISS_CPU` with slot −1, and never takes a staging slot: the host places it (Task 9).
+  - The split counts only lanes `< forced_from`.
+  - It raises `LaneOverflow(ValueError)` only when no forced lane can be the CPU's: no host lanes, or no CPU layer.
+  - An unforced miss with no staging slot still raises a plain `ValueError` (the device traps).
 
 - [ ] **Step 1: Write the failing tests** (append to `test_ram_slot_map.py`; add `LaneOverflow` to the import)
 
@@ -237,14 +1049,30 @@ from sglang.srt.layers.moe.ram_slot_map import LaneKind, LaneOverflow, MapReplic
 
 def test_forced_lanes_are_cpu_lanes_outside_the_split():
     """Lanes 0-1 found VRAM victims, lanes 2-3 did not (spill). The split sees only lane 0, the one eligible unforced
-    lane (split[1] = 1), so it is the CPU's; lane 1, an unforced miss, stays on the GPU; the forced hit and the forced
-    miss are CPU lanes whatever the split, the miss in the next staging slot."""
+    lane (split[1] = 1), so it is the CPU's; lane 1, an unforced miss, stays on the GPU in staging slot 9. The forced
+    hit is a CPU lane at its RAM slot; the forced miss is a CPU miss with slot -1, though staging slot 10 is free: the
+    host reads it into a RAM victim (Task 9), so staging only ever holds live misses."""
     ram = [-1] * 16
     ram[1], ram[2] = 4, 5
     staging = [9, 10] + [-1] * 6
     kinds, slots = _type([1, 0, 2, 7], ram, staging, cpu_on=True, forced_from=2)
     assert kinds == [LaneKind.HIT_CPU, LaneKind.MISS_GPU, LaneKind.HIT_CPU, LaneKind.MISS_CPU]
-    assert slots == [4, 9, 5, 10]
+    assert slots == [4, 9, 5, -1]
+
+
+def test_36_forced_misses_on_one_node_need_no_staging():
+    """Review Focus 2 at the record's full width: 36 lanes on a 40-lane, 2-node wire, 8 of them with VRAM victims,
+    every lane an NVMe miss homed on node 0 (even experts). The 8 live misses take node 0's 8 staging slots; the 28
+    forced ones take none. No LaneOverflow, whatever one node holds."""
+    lanes, nodes = 40, 2
+    experts = [2 * e for e in range(36)]
+    staging = list(range(100, 108)) + [-1] * (lanes - 8) + [-1] * lanes  # node 0's list, then node 1's
+    kinds, slots = type_lanes(
+        experts, [-1] * 80, staging, [0] * (nodes * (lanes + 1)), lanes=lanes, captured=True, copy_armed=True,
+        hit_copy="ce", cpu_on=True, cpu_misses=False, nodes=nodes, forced_from=8,
+    )
+    assert kinds == [LaneKind.MISS_GPU] * 8 + [LaneKind.MISS_CPU] * 28
+    assert slots == list(range(100, 108)) + [-1] * 28
 
 
 def test_forced_from_the_count_forces_nothing():
@@ -266,9 +1094,9 @@ def test_a_forced_lane_that_cannot_be_the_cpus_overflows(changes):
         _type([1, 2], ram, forced_from=1, **{"cpu_on": True, **changes})
 
 
-def test_a_forced_miss_without_staging_overflows_and_an_unforced_one_still_raises_plainly():
-    with pytest.raises(LaneOverflow):
-        _type([0, 7], [-1] * 16, [9] + [-1] * 7, cpu_on=True, forced_from=1)
+def test_an_unforced_miss_without_staging_still_raises_plainly():
+    """A live miss always has a staging slot (live <= victim lanes = staging per node): its absence is a broken
+    invariant, a plain ValueError (the device traps), never an overflow."""
     with pytest.raises(ValueError) as refused:
         _type([0, 7], [-1] * 16, NO_STAGING, cpu_on=True, forced_from=1)
     assert not isinstance(refused.value, LaneOverflow)
@@ -286,16 +1114,18 @@ In `ram_slot_map.py`, add above `type_lanes`:
 
 ```python
 class LaneOverflow(ValueError):
-    """A forced lane (one DIRECT found no VRAM victim for, the post's spill) cannot be a CPU lane. The post then serves
-    the unforced prefix and flags the forward (exl3_ram_miss_post_kernel)."""
+    """Forced lanes (DIRECT found them no VRAM victim, the post's spill) cannot be CPU lanes: no host lanes (the copy
+    engine is not armed) or no CPU layer. The post then serves the unforced prefix and flags the forward
+    (exl3_ram_miss_post_kernel)."""
 ```
 
 Add `forced_from: Optional[int] = None` as the last keyword of `type_lanes`. Append to its docstring:
 
 ```
     Lanes from ``forced_from`` on (spill, SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES) found no VRAM victim: each is a
-    CPU lane whatever the split, a hit or a miss with a staging slot, and the split counts only the lanes before it.
-    Raises LaneOverflow when one cannot be (no host lanes, no CPU layer, no staging slot on its node).
+    CPU lane whatever the split. A forced hit runs from its RAM slot; a forced miss gets slot -1 and no staging slot,
+    since the host reads it into a RAM victim (RamTier::reserve_victims_locked). The split counts only the lanes before
+    ``forced_from``. Raises LaneOverflow when forced lanes cannot be CPU lanes (no host lanes, no CPU layer).
 ```
 
 Replace the body from `home = wire_layout(lanes, nodes).home` through the end of the `for j in reversed(...)` loop:
@@ -310,11 +1140,13 @@ Replace the body from `home = wire_layout(lanes, nodes).home` through the end of
             slots.append(s)
             hit.append(True)
             continue
+        if j >= forced_from:
+            slots.append(-1)  # host-placed: read into a RAM victim, never a staging slot
+            hit.append(False)
+            continue
         node = home(e)
         m = taken[node]
         if m >= lanes or staging[node * lanes + m] < 0:
-            if j >= forced_from:
-                raise LaneOverflow(f"forced lane {j} has no staging slot on node {node}")
             raise ValueError(f"a miss lane has no staging slot on node {node}")
         slots.append(staging[node * lanes + m])
         hit.append(False)
@@ -345,7 +1177,7 @@ Same command. Expected: `EXIT=0`, every earlier test in the file still passing.
 
 ```bash
 git add python/sglang/srt/layers/moe/ram_slot_map.py test/registered/unit/kernels/test_ram_slot_map.py
-git commit -m "feat(exl3-ram-miss): the lane-typing reference takes forced lanes (spill) and raises LaneOverflow
+git commit -m "feat(exl3-ram-miss): the lane-typing reference takes forced lanes (spill): CPU lanes, misses host-placed
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
@@ -353,7 +1185,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 3: The post types forced lanes on the device and falls back to the victims' prefix
+### Task 4: The post types forced lanes on the device and falls back to the victims' prefix
 
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/lease_device.cuh` (`LanePlan`, `type_lanes`)
@@ -363,13 +1195,15 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 - Test: `test/manual/dsv41/test_exl3_slot_map_kernels_cuda.py`
 
 **Interfaces:**
-- Consumes: Task 2's `type_lanes(..., forced_from=)` and `LaneOverflow`.
+- Consumes: Task 3's `type_lanes(..., forced_from=)` and `LaneOverflow`.
 - Produces:
   - `ExpertStreamDevice.post(..., spill=None)`, where `spill = (overflow_flag int32[1], gather_overflow int64[1])`
     on the device;
   - the post's FFI tail `..., cpu_weights, spill, overflow_flag, gather_overflow, use_pdl`;
-  - with `spill`, a lane whose `dst_slots` entry is −1 is forced. On a forced lane that cannot be the CPU's, the post
-    writes `count[0] = live`, sets `*overflow_flag = 1`, and adds 1 to `*gather_overflow`.
+  - with `spill`, a lane whose `dst_slots` entry is −1 is forced. A forced miss is `MISS_CPU` with lane slot −1.
+  - When forced lanes cannot be CPU lanes (unarmed, or no CPU layer: case 1, the only overflow), the post writes
+    `count[0] = live`, sets `*overflow_flag = 1`, and adds 1 to `*gather_overflow`.
+  - A live miss without a staging slot traps: live ≤ V = staging per node, so it is an assert.
 
 - [ ] **Step 1: Write the failing tests** (append to `test_exl3_slot_map_kernels_cuda.py`)
 
@@ -395,9 +1229,10 @@ def _post_spill(c, experts, forced_from, flag, overflows, row=0):
 
 @pytest.mark.parametrize("armed", [True, False], ids=["armed", "unarmed"])
 def test_post_spills_forced_lanes_like_the_reference(tmp_path, armed):
-    """200 random maps, plans and spill points. Armed, every forced lane becomes a CPU lane whatever the split and the
-    count stands. Unarmed (Review Focus 1), any forced lane overflows: the post serves the live prefix, writes its
-    count, sets the flag and counts the overflow once. Mutation: type a forced lane by the split -- red."""
+    """200 random maps, plans and spill points. Armed, every forced lane becomes a CPU lane whatever the split (a
+    forced miss with slot -1, never a staging slot) and the count stands. Unarmed (Review Focus 1, the one overflow
+    left), any forced lane overflows: the post serves the live prefix, writes its count, sets the flag and counts the
+    overflow once. Mutations: type a forced lane by the split; give a forced miss a staging slot -- red."""
     c = Chain(tmp_path, start=False, copy_engine=True, hit_copy="ce", cpu_misses=False)
     try:
         hidden = 64
@@ -439,24 +1274,39 @@ def test_post_spills_forced_lanes_like_the_reference(tmp_path, armed):
         c.close()
 
 
-def test_a_forced_miss_without_staging_overflows_not_traps(tmp_path):
-    """Review Focus 2: one staging slot; an unforced miss takes it, a forced miss finds none. The post serves the
-    prefix (2 lanes: a hit and the unforced miss) and flags the forward instead of trapping."""
-    c = Chain(tmp_path, start=False, copy_engine=True, hit_copy="ce")
+def test_a_40_lane_post_makes_36_forced_misses_on_one_node_cpu_lanes(tmp_path):
+    """Review Focus 2 at the record's full width: 36 distinct NVMe misses on one node of a 40-lane wire, 8 with VRAM
+    victims. The 8 live misses take the node's 8 staging slots; the 28 forced ones are CPU misses with slot -1 (the
+    host places them, Task 9). Count 36 stands, no flag, no trap: however many misses one node has, nothing overflows.
+    Mutation: let a forced miss draw from staging -- the 9th traps."""
+    w = lease.wire_layout(40)
+    c = Chain(tmp_path, start=False, copy_engine=True, lanes=40, top_k=36, dst_rows=36, experts=48, capacity=24)
     try:
         c.dev.cpu_x_rows = torch.zeros((2, 128), dtype=torch.uint8).pin_memory()
         c.dev.set_row_cpu(0)
-        _set_host_words(c, armed=True, split=ALL_CPU)
-        _write_delta(c, 0, 1, [9])
-        c.dev.map_bulk_apply(torch.tensor([[0, 1, 4]], dtype=torch.int32))
+        _set_host_words(c, armed=True, split=[0] * (w.lanes + 1), w=w)
+        staging = list(range(10, 18))
+        _write_delta(c, 0, 1, staging, w=w)
         flag = torch.zeros(1, dtype=torch.int32, device="cuda")
         overflows = torch.zeros(1, dtype=torch.int64, device="cuda")
-        count, kinds, slots = _post_spill(c, [1, 0, 7], 2, flag, overflows)
-        assert (count, int(flag.item()), int(overflows.item())) == (2, 1, 1)
-        assert slots == [4, 9]
+        experts = list(range(36))
+        c.plan(experts)
+        backend, plan = c.backends[0], c.plans[0]
+        plan.slots[:8] = torch.arange(8, dtype=torch.int32, device=plan.slots.device)
+        plan.slots[8:36] = -1
+        backend._stage_planned(plan)
+        cpu_input = (torch.zeros(1, 64, device="cuda"), torch.ones(36, device="cuda"))
+        c.dev.post(0, backend.planned, plan.count, backend.routes, plan.slots, captured=True, cpu_input=cpu_input,
+                   spill=(flag, overflows))
+        torch.cuda.synchronize()
+        assert (int(plan.count[0]), int(flag.item()), int(overflows.item())) == (36, 0, 0)
+        assert c.kinds(36) == [int(LaneKind.MISS_GPU)] * 8 + [int(LaneKind.MISS_CPU)] * 28
+        assert c.dev.lane_slot[:36].tolist() == staging + [-1] * 28
     finally:
         c.close()
 ```
+`_write_delta` and `_set_host_words` take the wire as a keyword: add `w=W` to both signatures and use `w` for every
+`W.` inside them, so the existing 8-lane callers are unchanged.
 
 - [ ] **Step 2: Run and see them fail**
 
@@ -490,13 +1340,14 @@ The `expert`/`dst`/`ram`/`staging` loads and the `take` computation stay as they
 ```cpp
 // Types each lane of the plan: its kind and source slot. Transcribes ram_slot_map.type_lanes, the host reference.
 //
-// A hit takes its RAM slot, and a miss the next slot of its home node's staging list. Node n's CPU takes the last
-// split[n][k] of its k eligible unforced lanes in plan order; a forced lane (j >= plan.forced_from) is a CPU lane
-// whatever the split. Traps where the reference raises ValueError: a plan wider than Wire::kLanes, an expert out of
-// range or repeated, a hit slot past the row's capacity, an unforced miss with no staging slot on its node, a split
-// entry above its n. Returns false where the reference raises LaneOverflow: a forced lane that cannot be the CPU's (no
-// host lanes, no CPU layer, no staging slot); `out` is then partial. Reads no host memory; the caller loads the split
-// table into the policy.
+// A hit takes its RAM slot, and an unforced miss the next slot of its home node's staging list. Node n's CPU takes the
+// last split[n][k] of its k eligible unforced lanes in plan order. A forced lane (j >= plan.forced_from) is a CPU lane
+// whatever the split: a hit at its RAM slot, a miss with slot -1 and no staging slot, which the host reads into a RAM
+// victim (RamTier::reserve_victims_locked). Traps where the reference raises ValueError: a plan wider than
+// Wire::kLanes, an expert out of range or repeated, a hit slot past the row's capacity, an unforced miss with no
+// staging slot on its node (live misses <= victim lanes = staging per node: an assert), a split entry above its n.
+// Returns false where the reference raises LaneOverflow: forced lanes with no host lanes or no CPU layer; `out` is then
+// partial. Reads no host memory; the caller loads the split table into the policy.
 SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
 ```
 
@@ -520,11 +1371,10 @@ The first per-lane loop becomes:
     if (hit[j]) {
       if (static_cast<uint32_t>(ram[j]) >= map.row_capacity) __trap();
       out.slot[j] = ram[j];
+    } else if (forced) {
+      out.slot[j] = -1;  // host-placed: the host reads it into a RAM victim of its node
     } else {
-      if (m[node] >= Wire::kLanes || staging[node * Wire::kLanes + m[node]] < 0) {
-        if (forced) return false;
-        __trap();
-      }
+      if (m[node] >= Wire::kLanes || staging[node * Wire::kLanes + m[node]] < 0) __trap();
       out.slot[j] = staging[node * Wire::kLanes + m[node]++];
     }
     if (forced && !can_cpu) return false;
@@ -562,9 +1412,9 @@ and append after `cpu_weights_count`:
 
 ```cpp
   // Spill (GpuResidencyUpdater.victim_lanes below its miss lanes, CPU experts on): a lane whose dst_slots entry is -1
-  // found no VRAM victim and must be a CPU lane. When one cannot be, the post serves the live prefix, writes it to
-  // count and flags the forward in DIRECT's words: overflow_flag (int32, sticky) and gather_overflow (this layer's
-  // int64 counter). Both unused when spill is 0.
+  // found no VRAM victim and must be a CPU lane. When forced lanes cannot be (copy engine unarmed, no CPU layer), the
+  // post serves the live prefix, writes it to count and flags the forward in DIRECT's words: overflow_flag (int32,
+  // sticky) and gather_overflow (this layer's int64 counter). Both unused when spill is 0.
   int64_t spill;
   int32_t* overflow_flag;
   int64_t* gather_overflow;
@@ -592,8 +1442,9 @@ with
               map,
               policy,
               typed)) {
-        // A forced lane cannot be the CPU's: serve the live prefix and flag the forward, as clamp_gather_misses does
-        // without CPU experts. S, CW, CC and the DIRECT commit read the count written here.
+        // Forced lanes cannot be the CPU's (the copy engine is not armed, or no CPU layer yet): serve the live prefix
+        // and flag the forward, as clamp_gather_misses does without CPU experts. S, CW, CC and the DIRECT commit read
+        // the count written here.
         count = live;
         p.count[0] = static_cast<int32_t>(live);
         *p.overflow_flag = 1;
@@ -702,7 +1553,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 4: The post stages every token and writes the token table
+### Task 5: The post stages every token and writes the token table
 
 **Files:**
 - Create: `python/sglang/kernels/jit/csrc/moe/expert_stream/cpu_token_table.h`
@@ -713,7 +1564,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 - Test: `test/manual/dsv41/test_exl3_slot_map_kernels_cuda.py`
 
 **Interfaces:**
-- Consumes: Task 3's FFI tail.
+- Consumes: Task 4's FFI tail.
 - Produces:
   - FFI tail `..., cpu_weights, cpu_tokens_max, cpu_x_token_bytes, spill, overflow_flag, gather_overflow, use_pdl`.
   - `expert_lease_block.cpu_row_bytes(hidden, tokens, lanes) -> int`, `CPU_TOKEN_TABLE_HEADER = 16`,
@@ -778,7 +1629,7 @@ def test_a_verify_post_stages_every_token_and_the_token_table(idle):
 
 - [ ] **Step 2: Run and see it fail**
 
-Same command as Task 3 Step 2 with `-k "every_token"`. Expected: `ImportError: cannot import name 'CPU_TOKEN_TABLE_HEADER'`.
+Same command as Task 4 Step 2 with `-k "every_token"`. Expected: `ImportError: cannot import name 'CPU_TOKEN_TABLE_HEADER'`.
 
 - [ ] **Step 3: Create `cpu_token_table.h`**
 
@@ -870,7 +1721,7 @@ Replace the lane-weight block (`weight[j] = 0.0f; if (p.cpu_x_dst != nullptr) { 
       if (table != nullptr) st_relaxed_sys<uint32_t>(table + expert_stream::CpuTokenTable::kHeaderBytes + 4 * j, routed);
     }
 ```
-In the launcher, add parameters after `cpu_weights,` (before Task 3's `spill`): `int64_t cpu_tokens_max, int64_t cpu_x_token_bytes,`.
+In the launcher, add parameters after `cpu_weights,` (before Task 4's `spill`): `int64_t cpu_tokens_max, int64_t cpu_x_token_bytes,`.
 Replace the check `RuntimeCheck(cpu_x.dim() == 2 && cpu_x.size(0) == 1, ...)` with:
 ```cpp
       RuntimeCheck(
@@ -955,11 +1806,11 @@ def cpu_row_bytes(hidden: int, tokens: int, lanes: int) -> int:
 
 - [ ] **Step 6: Raw calls again** (`test_exl3_lease_kernels_cuda.py`)
 
-Insert `1, 16,` right after the CPU triple in both calls, before Task 3's three spill arguments. The first call's tail
+Insert `1, 16,` right after the CPU triple in both calls, before Task 4's three spill arguments. The first call's tail
 becomes `no_i32, 0, no_i32, 1, 16, 0, torch.zeros(1, ...int32...), torch.zeros(1, ...int64...), 0,`. The second's
 becomes `*cpu_args, 1, 32, 0, ...` (its CPU input is `[1, 8]` fp32, so 16 bytes of fp16 suffice; 32 is fine too).
 
-- [ ] **Step 7: Run and pass** — same suites as Task 3 Step 7. Expected: `EXIT=0`.
+- [ ] **Step 7: Run and pass** — same suites as Task 4 Step 7. Expected: `EXIT=0`.
 
 - [ ] **Step 8: Commit**
 
@@ -976,7 +1827,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 5: The CPU expert thread runs one M-row forward per job
+### Task 6: The CPU expert thread runs one M-row forward per job
 
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts.h`
@@ -986,7 +1837,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 - Test: `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py`
 
 **Interfaces:**
-- Consumes: Task 4's row layout and `cpu_row_bytes`.
+- Consumes: Task 5's row layout and `cpu_row_bytes`.
 - Produces:
   - `CpuJob.per_token` (bool) and `CpuJob.lanes[kLanes]`;
   - `CpuExpertConfig.tokens`, `.x_token_bytes`;
@@ -1060,7 +1911,7 @@ Token 2 (`[5, 8, 12, 9, 13, 10]`) routes expert 5 only: lanes 3 and 7 get −1 t
 
 - [ ] **Step 2: Run and see it fail**
 
-`-k "one_forward_of_its_tokens"` under the GPU lock, as in Task 3. Expected: a `ValueError` from
+`-k "one_forward_of_its_tokens"` under the GPU lock, as in Task 4. Expected: a `ValueError` from
 `ExpertStreamHost.enable_cpu_experts` (`out_rows must be ... tensor`).
 
 - [ ] **Step 3: `cpu_experts.h`**
@@ -1237,7 +2088,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 6: The route tables seed every token from its own partial
+### Task 7: The route tables seed every token from its own partial
 
 **Files:**
 - Modify: `python/sglang/kernels/jit/csrc/moe/exl3/exl3_route_tables.cuh`
@@ -1245,7 +2096,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 - Test: `test/manual/dsv41/test_exl3_moe_split_parity_cuda.py`
 
 **Interfaces:**
-- Consumes: Task 5's part layout. Part p's token t is at `cpu_out + p * part_stride + t * hidden`, with
+- Consumes: Task 6's part layout. Part p's token t is at `cpu_out + p * part_stride + t * hidden`, with
   `part_stride = tokens * hidden`.
 - Produces: `Exl3FusedMoE.run(x [M, H], ..., cpu=(cpu_lanes, dst_slots, cpu_out, part_stride))` for any
   `1 <= M <= tokens`.
@@ -1343,39 +2194,51 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 7: DIRECT gives victims to the first V lanes only
+### Task 8: DIRECT gives victims to the first V lanes of a lane-per-route record
+
+Spill always runs with one lane per route: `SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES` is unset, so the miss width is
+the routes (36). The lane count therefore never falls below the distinct misses (Review Focus 5). The gather calls
+`clamp_gather_misses` only when the miss width is below the routes (`expert_stream.py:1578-1580`), so under spill it
+never runs, and the clamp asserts so. The overflow flag must still be read after every verify, because the post can set
+it (case 1), so `narrow_gather` covers spill too.
 
 **Files:**
 - Modify: `python/sglang/srt/environ.py` (next to `SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES`, line ~524)
 - Modify: `python/sglang/srt/layers/moe/expert_residency_gpu.py` (`_init_insert_direct`, `_rank_victims`, `gather_destinations`, `fused_gather_destinations`, `clamp_gather_misses`)
-- Modify: `python/sglang/kernels/jit/csrc/moe/expert_residency/direct_gather.cuh` (destinations kernel and launcher)
+- Modify: `python/sglang/kernels/jit/csrc/moe/expert_residency/direct_gather.cuh` (the wide destinations kernel and its launcher)
 - Modify: `python/sglang/kernels/ops/moe/expert_residency_direct_gather.py` (`direct_gather_destinations`)
 - Modify: `python/sglang/srt/layers/moe/expert_hot_cache.py` (allocator floors)
 - Modify: `python/sglang/srt/layers/moe/exl3_expert_format.py` (`plan_graph_gather`)
 - Modify: `python/sglang/srt/layers/moe/exl3_ram_miss.py` (`plan_staging_width`, `staging_width`)
-- Test: `test/registered/unit/layers/moe/test_expert_residency_gpu.py`, `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`
+- Test: `test/registered/unit/layers/moe/test_expert_residency_gpu.py`, `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`, `test/manual/dsv41/test_direct_gather_wide_gpu.py`
 
 **Interfaces:**
+- Consumes: Task 2's wide destinations kernel.
 - Produces:
   - `envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES` (`EnvInt(0)`);
   - `GpuResidencyUpdater.victim_lanes: int`, equal to `miss_rows` when the env is unset;
-  - a lane that is not live gets destination `max_capacity` and destination slot −1 when
-    `victim_lanes < miss_rows` (the post's spill marker), and (0, 0) otherwise;
-  - `direct_gather_destinations(..., idle_destination=0, idle_slot=0)`;
+  - spill (`victim_lanes < miss_rows`) requires `miss_rows` equal to every layer's routes. It sets `narrow_gather`.
+  - Under spill a lane that is not live gets destination `max_capacity` and destination slot −1 (the post's spill
+    marker); otherwise (0, 0) as before.
+  - `direct_gather_destinations(..., idle_destination=0, idle_slot=0)`. Nonzero idle values always run the wide
+    kernel, so the narrow BS1 kernel stays untouched.
   - `Exl3RamMissService.plan_staging_width(rows)`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `TestInsertOnMiss` in `test_expert_residency_gpu.py` (the class holding `_narrow`):
+Append to `TestInsertOnMiss` in `test_expert_residency_gpu.py` (the class holding `_narrow`). Two tokens of top-2 route
+4 ids a layer, so `_narrow(model, 0, fused)` builds a lane-per-route gather of width 4.
 
 ```python
-    # ----- spill: victims for the first V lanes only (SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES) -----
+    # ----- spill: victims for the first V lanes of a lane-per-route gather (SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES) -----
 
-    def _spill(self, fused):
+    def _spill(self, fused, lanes=0, victims=1):
         from sglang.srt.environ import envs
 
-        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(1):
-            return self._narrow(_model(), 2, fused)
+        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(
+            victims
+        ):
+            return self._narrow(_model(), lanes, fused)
 
     def test_victim_lanes_need_cpu_experts_and_a_value_below_the_lanes(self):
         from sglang.srt.environ import envs
@@ -1383,86 +2246,117 @@ Append to `TestInsertOnMiss` in `test_expert_residency_gpu.py` (the class holdin
         with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(1), self.assertRaisesRegex(
             ValueError, "VICTIM_LANES=1 needs SGLANG_DSV41_CPU_EXPERTS=1"
         ):
-            self._narrow(_model(), 2, False)
-        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(
-            2
-        ), self.assertRaisesRegex(ValueError, "below the 2 miss lanes"):
-            self._narrow(_model(), 2, False)
+            self._narrow(_model(), 0, False)
+        with self.assertRaisesRegex(ValueError, "below the 4 miss lanes"):
+            self._spill(False, victims=4)
+
+    def test_spill_needs_a_lane_per_route(self):
+        """Review Focus 5 by construction: a narrowed MISS_LANES could leave more misses than lanes, so spill refuses it."""
+        with self.assertRaisesRegex(ValueError, "unset SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"):
+            self._spill(False, lanes=2)
 
     def test_victim_lanes_cap_the_shortlist_and_the_floor(self):
-        """Only shortlist column 0 is ever a victim once a boundary ranks; the floor is twice the victim lanes."""
+        """Only shortlist column 0 is ever a victim once a boundary ranks; the floor is twice the victim lanes, and the
+        manager reads the overflow flag after every verify (the post can set it: case 1)."""
         for fused in (False, True):
             self.model = _model()
             manager = self._spill(fused)
             updater = manager.gpu_residency
-            self.assertEqual((updater.miss_rows, updater.victim_lanes), (2, 1))
+            self.assertEqual((updater.miss_rows, updater.victim_lanes), (4, 1))
+            self.assertTrue(updater.narrow_gather and manager.narrow_graph_gather)
             graph, static, outputs = self.capture(manager, tokens=2)
-            self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=False)
-            self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=False)
+            for _ in range(2):
+                self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=False)
             self.assertFalse(bool(updater.victim_valid[:, 1:].any()))
             self.assertTrue(bool(updater.victim_valid[:, 0].all()))
 
     def test_victimless_lanes_take_the_idle_destination_in_both_paths(self):
-        """Two misses, one victim: lane 0 is live at the victim, lane 1 is not and gets (slot_dump, -1), the marker the
-        post spills to the CPU; its routes remap past every slot column. The torch chain and the fused kernel agree."""
+        """Two misses, one victim: lane 0 is live at the victim, lanes 1-3 are not and get (slot_dump, -1), the marker
+        the post spills to the CPU; their routes remap past every slot column. The torch chain and the fused (wide)
+        kernel agree."""
         from sglang.kernels.ops.moe.expert_residency_direct_gather import direct_gather_destinations
 
         manager = self._spill(False)
         updater, streamer = manager.gpu_residency, manager.streamers[0]
         dump = updater.max_capacity
         base = streamer.row_planner.scratch_base
-        updater.victims[0].copy_(torch.tensor([3, 5], device="cuda"))
-        updater.victim_valid[0].copy_(torch.tensor([True, False], device="cuda"))
+        updater.victims[0].copy_(torch.tensor([3, 5, 6, 7], device="cuda"))
+        updater.victim_valid[0].copy_(torch.tensor([True, False, False, False], device="cuda"))
         streamer._graph_miss_count.fill_(2)
         remap = torch.tensor([base, base + 1, base + 1, base], dtype=torch.int64, device="cuda")
-        route_slots = torch.full((4,), -1, dtype=torch.int64, device="cuda")
-        got = updater.gather_destinations(0, remap, route_slots, base)
+        got = updater.gather_destinations(0, remap, torch.full((4,), -1, dtype=torch.int64, device="cuda"), base)
         _, _, destinations, live = updater._pending_commit
-        self.assertEqual(destinations.tolist(), [3, dump])
-        self.assertEqual(live.tolist(), [True, False])
-        self.assertEqual(streamer._graph_destination_slots[:2].tolist(), [3, -1])
+        self.assertEqual(destinations.tolist(), [3, dump, dump, dump])
+        self.assertEqual(live.tolist(), [True, False, False, False])
+        self.assertEqual(streamer._graph_destination_slots[:4].tolist(), [3, -1, -1, -1])
         self.assertEqual(got.tolist(), [3, dump, dump, 3])
         ids = torch.tensor([7, 9, 9, 7], dtype=torch.int64, device="cuda")
         expert_to_slot = torch.full((EXPERTS,), -1, dtype=torch.int64, device="cuda")
-        slots_out = torch.zeros(2, dtype=torch.int32, device="cuda")
-        dest_out = torch.zeros(2, dtype=torch.int64, device="cuda")
-        live_out = torch.zeros(2, dtype=torch.bool, device="cuda")
+        slots_out = torch.zeros(4, dtype=torch.int32, device="cuda")
+        dest_out = torch.zeros(4, dtype=torch.int64, device="cuda")
+        live_out = torch.zeros(4, dtype=torch.bool, device="cuda")
         remap_out = torch.zeros(4, dtype=torch.int64, device="cuda")
         direct_gather_destinations(
             ids, expert_to_slot, updater.victims[0], updater.victim_valid[0], streamer._graph_miss_count, remap, base,
             slots_out, dest_out, live_out, remap_out, idle_destination=dump, idle_slot=-1,
         )
-        self.assertEqual((slots_out.tolist(), dest_out.tolist(), live_out.tolist()), ([3, -1], [3, dump], [True, False]))
+        self.assertEqual(slots_out.tolist(), [3, -1, -1, -1])
+        self.assertEqual(dest_out.tolist(), [3, dump, dump, dump])
+        self.assertEqual(live_out.tolist(), [True, False, False, False])
         self.assertEqual(remap_out.tolist(), got.tolist())
 
-    def test_spill_clamps_only_a_count_past_the_lanes(self):
-        """Review Focus 5. With spill the post decides the victimless lanes, so the clamp leaves a count within the
-        lanes alone (no flag) and flags only one past them, serving the live prefix as without CPU experts."""
-        manager = self._spill(False)
-        updater, streamer = manager.gpu_residency, manager.streamers[0]
-        base = streamer.row_planner.scratch_base
-        updater.victims[0].copy_(torch.tensor([3, 5], device="cuda"))
-        updater.victim_valid[0].copy_(torch.tensor([True, False], device="cuda"))
-        remap = torch.tensor([base, base + 1, base + 1, base], dtype=torch.int64, device="cuda")
-        for count, flagged, kept in ((2, 0, 2), (3, 1, 1)):
-            updater.overflow_flag.zero_()
-            streamer._graph_miss_count.fill_(count)
-            updater.gather_destinations(0, remap, torch.full((4,), -1, dtype=torch.int64, device="cuda"), base)
-            updater.clamp_gather_misses()
-            self.assertEqual(int(updater.overflow_flag.item()), flagged, count)
-            self.assertEqual(int(streamer._graph_miss_count.item()), kept, count)
+    def test_spill_never_clamps(self):
+        """Review Focus 5: a lane per route leaves no count past the lanes, so the gather never calls the clamp; four
+        misses into one victim post with the count intact. Mutation: call the clamp under spill -- its assert fires."""
+        from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
+
+        for fused in (False, True):
+            self.model = _model()
+            manager = self._spill(fused)
+            with unittest.mock.patch.object(GpuResidencyUpdater, "clamp_gather_misses", side_effect=AssertionError):
+                graph, static, outputs = self.capture(manager, tokens=2)
+                mapping = manager.caches[0].expert_to_slot.tolist()
+                outsiders = [e for e, s in enumerate(mapping) if s < 0]
+                hits = [
+                    [[e for e, s in enumerate(manager.caches[layer].expert_to_slot.tolist()) if s >= 0][:TOP_K]] * 2
+                    for layer in range(1, LAYERS)
+                ]
+                self.replay_verify(manager, graph, static, outputs, [[outsiders[0:2], outsiders[2:4]]] + hits,
+                                   check_outputs=False)
+            self.assertEqual(int(manager.streamers[0]._graph_miss_count.item()), 4, f"fused={fused}")
+            self.assertEqual(int(manager.gpu_residency.overflow_flag.item()), 0, f"fused={fused}")
 ```
-`EXPERTS` (12) is the module constant. Victims 3 and 5 are slot ids under the 8-slot layers `_narrow` builds.
+`EXPERTS` (12) is the module constant. The victims are slot ids under the 8-slot layers `_narrow` builds. The NVFP4
+harness has no post, so the victimless routes' rows are not checked (`check_outputs=False`).
+
+Append to `test/manual/dsv41/test_direct_gather_wide_gpu.py`:
+```python
+def test_idle_destinations_run_the_wide_kernel_at_any_width():
+    """At a width the narrow kernel could take, nonzero idle values still give (idle, idle_slot) for every lane that
+    is not live, so the narrow BS1 kernel never needs them."""
+    from sglang.kernels.ops.moe.expert_residency_direct_gather import direct_gather_destinations
+
+    cuda = dict(device="cuda")
+    ids = torch.tensor([1, 2, 3, 4], **cuda)
+    expert_to_slot = torch.full((8,), -1, dtype=torch.int64, **cuda)
+    out = [torch.zeros(4, dtype=t, **cuda) for t in (torch.int32, torch.int64, torch.bool, torch.int64)]
+    direct_gather_destinations(
+        ids, expert_to_slot, torch.tensor([3, 5, 6, 7], **cuda), torch.tensor([True, False, False, False], **cuda),
+        torch.tensor([4], dtype=torch.int32, **cuda), torch.tensor([20, 21, 22, 23], **cuda), 20, *out,
+        idle_destination=99, idle_slot=-1,
+    )
+    assert out[0].tolist() == [3, -1, -1, -1] and out[1].tolist() == [3, 99, 99, 99]
+```
 
 Append to `test_exl3_ram_miss_attach_lanes.py`:
 ```python
 def test_victim_lanes_stage_their_width_not_the_lanes(tiers):
-    """Spill: the post types up to 32 lanes, but only the V victim lanes and the CPU's forced misses stage, and a forced
-    miss with no slot overflows. So a row reserves V staging slots (Exl3ExpertFormat.plan_graph_gather plans it)."""
+    """Spill: the post types up to 36 lanes, but only the V victim lanes stage (a forced miss never does), so a row
+    reserves V staging slots (Exl3ExpertFormat.plan_graph_gather plans it)."""
     service, streamers = tiers
     with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(2):
-        streamers[0].format.plan_graph_gather(streamers[0], 32)
-    assert service.resolved_lanes() == 32
+        streamers[0].format.plan_graph_gather(streamers[0], 36)
+    assert service.resolved_lanes() == 40
     assert service.staging_width() == 2
     assert service.staging_for(CAPACITY) == 2
 ```
@@ -1470,16 +2364,17 @@ def test_victim_lanes_stage_their_width_not_the_lanes(tiers):
 - [ ] **Step 2: Run and see them fail**
 
 On divix01:
-- GPU lock, `test/registered/unit/layers/moe/test_expert_residency_gpu.py -k "victim or spill"`;
-- CPU, `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py -k victim_lanes`.
-Expected: `AttributeError: ... SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES`.
+- GPU lock: `test/registered/unit/layers/moe/test_expert_residency_gpu.py -k "victim or spill"` and
+  `test/manual/dsv41/test_direct_gather_wide_gpu.py`;
+- CPU: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py -k victim_lanes`.
+Expected: `AttributeError: ... SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES`, and a `TypeError` on `idle_destination`.
 
 - [ ] **Step 3: The env** (`environ.py`, right after `SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES = EnvInt(0)`)
 
 ```python
-    # Spill (SGLANG_DSV41_CPU_EXPERTS with a narrowed verify gather): only the first V of a gather's miss lanes in plan
-    # order take a VRAM victim and a staging slot; the post makes every later lane a CPU lane, or flags the forward
-    # when one cannot be. 0: every miss lane may take a victim. 1 <= V < MISS_LANES.
+    # Spill (SGLANG_DSV41_CPU_EXPERTS, a DSpark verify with a lane per route: MISS_LANES unset): only the first V of a
+    # gather's miss lanes in plan order take a VRAM victim and a staging slot; the post makes every later lane a CPU
+    # lane, a miss of which the host reads into a RAM victim. 0: every miss lane may take a victim. 1 <= V < the routes.
     SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)
 ```
 
@@ -1497,14 +2392,28 @@ In `_init_insert_direct`, right after `width = self.miss_rows`:
             raise ValueError(
                 f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} must be below the {width} miss lanes"
             )
+        if victims and any(s.graph_miss_width != s.graph_gather_rows for s in self.streamers):
+            # A lane per route: a verify's distinct misses never outnumber its lanes, so nothing is clamped.
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"
+            )
         # Lanes that may take a victim; the rest are the CPU's (the post's spill).
         self.victim_lanes = victims or width
 ```
-Change the floor check to `if cache.capacity < 2 * self.victim_lanes:`. In its message, "twice its graph-gather
-miss lanes; layer {layer_id} has {cache.capacity} slots for {width} lanes" becomes "twice its graph-gather victim lanes;
-layer {layer_id} has {cache.capacity} slots for {self.victim_lanes} lanes".
-Append to the docstring: "With spill (``victim_lanes`` below ``miss_rows``) only the first ``victim_lanes`` shortlist
-columns are victims, so the floor is ``2 * victim_lanes``."
+Change the floor check to `if cache.capacity < 2 * self.victim_lanes:`. In its message, "twice its graph-gather miss
+lanes; layer {layer_id} has {cache.capacity} slots for {width} lanes" becomes "twice its graph-gather victim lanes;
+layer {layer_id} has {cache.capacity} slots for {self.victim_lanes} lanes". Change the `self.narrow_gather = any(...)`
+line to:
+```python
+        # The overflow flag is read after every verify that can set it: a narrowed gather's clamp, or spill's post
+        # (forced lanes before the copy engine arms).
+        self.narrow_gather = self.victim_lanes < width or any(
+            streamer.graph_miss_width < streamer.graph_gather_rows for streamer in self.streamers
+        )
+```
+Append to the docstring: "With spill (``victim_lanes`` below ``miss_rows``, a lane per route) only the first
+``victim_lanes`` shortlist columns are victims, so the floor is ``2 * victim_lanes``."
 
 In `_rank_victims`, after `self.victim_valid.copy_(ranked.values[:, :width] < never)`:
 ```python
@@ -1535,40 +2444,36 @@ with
             torch.where(live, destinations, torch.full_like(destinations, idle_slot)).to(torch.int32)
         )
 ```
-In `fused_gather_destinations`, pass
-`idle_destination=self._idle_destination()[0], idle_slot=self._idle_destination()[1]` to `direct_gather_destinations`.
+In `fused_gather_destinations`, compute `idle, idle_slot = self._idle_destination()` first and pass
+`idle_destination=idle, idle_slot=idle_slot` to `direct_gather_destinations`.
 
-Replace `clamp_gather_misses`'s body after `served = live.sum(dtype=torch.int32)`:
+At the top of `clamp_gather_misses`, add:
 ```python
-        # Spill: every lane up to the record's width is posted, and the post makes the victimless ones CPU lanes or
-        # flags the forward (exl3_ram_miss_post_kernel); only a count past the lanes is the clamp's.
-        over = count > (self.miss_rows if self.victim_lanes < self.miss_rows else served)
-        self.gather_overflow[row].add_(over.sum())
-        self.overflow_flag.bitwise_or_(over.to(torch.int32))
-        count.copy_(torch.where(over, served, count))
+        # Spill gives every route a lane (_init_insert_direct), so its gathers never call this.
+        assert self.victim_lanes == self.miss_rows, "spill never clamps: its gather has a lane per route"
 ```
-Without spill this is the old `minimum(count, served)`: `over` is `count > served`. Append to the docstring: "With
-spill (``victim_lanes`` below ``miss_rows``) it flags only a count past the miss lanes."
+The body is otherwise unchanged.
 
 - [ ] **Step 5: The kernel** (`direct_gather.cuh`, `expert_residency_direct_gather.py`)
 
-Kernel: add parameters `int64_t idle_destination, int32_t idle_slot` after `remap_out`. Replace
+The narrow (32-thread) destinations kernel is not touched. The wide kernel from Task 2 gains
+`int64_t idle_destination, int32_t idle_slot` after `remap_out`, and its live block becomes:
 ```cpp
-    const int64_t destination = live ? usable[lane] : 0;
-    destinations[lane] = destination;
-    destinations_out[lane] = destination;
-    destination_slots_out[lane] = static_cast<int32_t>(destination);
+  if (entry) {
+    const bool live = t < miss_count[0] && usable_valid[t];
+    const int64_t destination = live ? usable[t] : idle_destination;
+    destinations[t] = destination;
+    destinations_out[t] = destination;
+    destination_slots_out[t] = live ? static_cast<int32_t>(destination) : idle_slot;
+    live_out[t] = live;
+  }
 ```
-with
-```cpp
-    const int64_t destination = live ? usable[lane] : idle_destination;
-    destinations[lane] = destination;
-    destinations_out[lane] = destination;
-    destination_slots_out[lane] = live ? static_cast<int32_t>(destination) : idle_slot;
-```
-In the kernel comment, "any other lane's is 0" becomes "any other lane's is idle_destination (0, or slot_dump with
-spill), its destination slot idle_slot (0, or -1 with spill)". In the launcher, add the same two parameters after
-`remap_out` and pass them last.
+Its comment gains: "A lane that is not live gets idle_destination and idle_slot (0 and 0, or slot_dump and -1 under
+spill: GpuResidencyUpdater._idle_destination)." In `direct_gather_destinations_gpu`:
+- add `int64_t idle_destination, int64_t idle_slot` after `remap_out`;
+- set `const bool wide = W_.unwrap() > kDirectGatherWarp || idle_destination != 0 || idle_slot != 0;`;
+- pass `idle_destination, static_cast<int32_t>(idle_slot)` to the wide kernel only.
+
 Python: `direct_gather_destinations(..., remap_out, idle_destination: int = 0, idle_slot: int = 0)`. Pass
 `int(idle_destination), int(idle_slot)` after `remap_out` in `.run(...)`.
 
@@ -1579,14 +2484,15 @@ Python: `direct_gather_destinations(..., remap_out, idle_destination: int = 0, i
         # Spill: only the victim lanes need VRAM slots (GpuResidencyUpdater._init_insert_direct's floor).
         victim_lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
 ```
-and change the floor expression to `2 * (min(miss_lanes[layer_id], victim_lanes) if victim_lanes else miss_lanes[layer_id]) if direct else 0`.
-Change "(twice its graph-gather miss lanes)" in the refusal text to "(twice its graph-gather victim lanes)".
+Change the floor expression to
+`2 * (min(miss_lanes[layer_id], victim_lanes) if victim_lanes else miss_lanes[layer_id]) if direct else 0`, and
+"(twice its graph-gather miss lanes)" in the refusal text to "(twice its graph-gather victim lanes)".
 
 `exl3_ram_miss.py`, in `Exl3RamMissService` after `plan_gather_width`:
 ```python
     def plan_staging_width(self, rows: int) -> None:
-        """Plan the staging slots a row reserves when fewer lanes than the record's take a victim (spill): the victim
-        lanes. Only valid before the service starts; the widest plan wins."""
+        """Plan the staging slots a row reserves under spill: the victim lanes, since only live misses stage (a forced
+        miss is read into a RAM victim). Only valid before the service starts; the widest plan wins."""
         if self.host is not None:
             raise RuntimeError("exl3 RAM miss: the staging width was planned after the service started")
         planned = max(1, int(rows))
@@ -1606,9 +2512,11 @@ Import `envs` there if the module does not already.
 
 - [ ] **Step 7: Run and pass**
 
-GPU lock: the whole `test/registered/unit/layers/moe/test_expert_residency_gpu.py`,
-`test/manual/dsv41/test_exl3_verify_miss_lanes_gpu.py` and `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py`.
-CPU: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`. Expected: `EXIT=0`.
+- GPU lock: the whole `test/registered/unit/layers/moe/test_expert_residency_gpu.py`, plus
+  `test/manual/dsv41/test_direct_gather_wide_gpu.py`, `test/manual/dsv41/test_exl3_verify_miss_lanes_gpu.py`,
+  `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py` and `test/manual/dsv41/test_bs1_build_digest.py`.
+- CPU: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`.
+Expected: `EXIT=0`, and the digest test still `BS1 build unchanged`.
 
 - [ ] **Step 8: Commit**
 
@@ -1617,8 +2525,9 @@ git add python/sglang/srt/environ.py python/sglang/srt/layers/moe/expert_residen
   python/sglang/kernels/jit/csrc/moe/expert_residency/direct_gather.cuh \
   python/sglang/kernels/ops/moe/expert_residency_direct_gather.py python/sglang/srt/layers/moe/expert_hot_cache.py \
   python/sglang/srt/layers/moe/exl3_expert_format.py python/sglang/srt/layers/moe/exl3_ram_miss.py \
-  test/registered/unit/layers/moe/test_expert_residency_gpu.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py
-git commit -m "feat(moe-residency): SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives victims to the first V lanes; the rest are marked for the CPU
+  test/registered/unit/layers/moe/test_expert_residency_gpu.py test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py \
+  test/manual/dsv41/test_direct_gather_wide_gpu.py
+git commit -m "feat(moe-residency): SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives victims to the first V of a lane-per-route record
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
@@ -1626,57 +2535,268 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 8: The service sizes CPU rows for the verify and wires the spill words
+### Task 9: The host reads a forced CPU miss into a RAM victim
+
+A forced NVMe miss arrives with lane slot −1. The host takes a RAM victim from the record's node range
+(`take_victim_locked`) **before** the staging misses take theirs. It reads the row there, hands that slot to the CPU
+(a part-1 job, as any CPU miss), and maps the expert in the tier and the delta, so it stays cached. No staging slot is
+used, no pinned RAM is added, and nothing overflows.
+
+**Why a victim always exists.** A node's range of a layer holds:
+- its staging slots S (state `kStaging`, never victims);
+- the record's routed experts that are resident (`wanted`, never victims);
+- VRAM-hot experts (`tier.hot`, never victims);
+- the rest, which are victims.
+
+Let D ≤ 36 be the distinct routes and h the forced misses placed on the node. At most D − h routes are resident, and at
+most H (the layer's VRAM capacity) are hot. The victims number at least `(hi − lo) − S − (D − h) − H`, which is ≥ h
+whenever `hi − lo ≥ S + D + H`. Task 10 checks `hi − lo ≥ staging + lanes + VRAM capacity` for every layer and node at
+start-up, and refuses the launch otherwise. Under the recipe that is 8 + 36 + ~24 = 68 against ~80 slots per node per
+layer: 161-162 tier rows per layer from 80 GiB of 13,315,584-byte rows, split 1:1 by `split_rows`. Victims for forced
+misses are taken first, so the bound covers them. Staging misses that find no victim keep today's behaviour: read,
+not cached. A missing victim for a forced miss is therefore a broken invariant: `fail_record`.
 
 **Files:**
-- Modify: `python/sglang/srt/layers/moe/cpu_experts/service.py` (`CpuExpertService.__init__`, `CpuExpertGroups.__init__`)
-- Modify: `python/sglang/srt/layers/moe/exl3_ram_miss.py` (`_start_cpu_experts`, `attach`, `Exl3RamMissRowBackend.__init__`/`.post`)
-- Modify: `python/sglang/test/dsv41_ram_miss_fixtures.py` (`DirectUpdaterStandIn`)
-- Modify: `analysis/dsv41-drive/LEASE_PROTOCOL.md` (CPU expert section)
-- Test: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`
+- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h` (`classify_lanes_locked`, `reserve_victims_locked`, `serve_record`)
+- Test: `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py`
 
 **Interfaces:**
-- Consumes: Tasks 3-7.
-- Produces:
-  - `CpuExpertService(..., tokens: int = 1)` and `CpuExpertGroups(..., tokens: int = 1)`;
-  - `Exl3RamMissRowBackend.spill`, `None` or `(overflow_flag, gather_overflow[row : row + 1])`;
-  - `attach` accepts CPU experts at a narrowed (verify) gather.
+- Consumes: Task 4's forced `MISS_CPU` lanes with slot −1; Task 2's 40-lane wire.
+- Produces: a record may carry `kKindMissCpu` lanes with slot −1. The host reads each into a RAM victim of its home
+  node's range, computes it there, and maps it in the tier and the record's delta.
 
-- [ ] **Step 1: Write the failing tests** (in `test_exl3_ram_miss_attach_lanes.py`)
+- [ ] **Step 1: Write the failing test** (append to `test_exl3_cpu_lane_order_cuda.py`)
 
-Delete `test_cpu_experts_refuse_a_miss_width_below_the_routes`. Add:
 ```python
-def test_cpu_experts_attach_a_verify_gather_and_wire_its_spill_words(tiers, monkeypatch):
-    """Six tokens of top-6 at 32 miss lanes, 8 of them victim lanes: the layer attaches with CPU experts on, and its
-    backend posts with DIRECT's overflow flag and its own row of the overflow counter (a view: the post's increment is
-    the updater's)."""
-    service, streamers = tiers
-    service.plan_gather_width(32)
-    service.ensure_started()
-    built = []
-    monkeypatch.setattr(
-        module, "Exl3RamMissRowBackend", lambda *args, **kwargs: built.append(kwargs) or SimpleNamespace()
-    )
-    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
+def test_36_forced_cpu_misses_on_one_node_are_read_into_ram_victims(tmp_path):
+    """Review Focus 2 at the record's full width: 36 cold experts on one node, every lane forced (no VRAM victim:
+    MISS_CPU, slot -1). The host reads each into a RAM victim of the row's own tier, the CPU computes it there (part 1),
+    and the tier maps it afterwards. No staging slot is touched, nothing overflows, the device's count stands.
+    Mutations: read a forced miss into a staging slot (the 7th of the 6 collides); skip the insert (the experts are not
+    resident afterwards)."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    row, lanes, experts = 0, 40, list(range(36))
+    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=48)
+    try:
+        x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
+        out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), [0] * (lanes + 1), cores, x_rows, out_rows,
+                                  threads=2)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        c.host.arm_copy_engine()
+        backend, plan, dev = c.backends[row], c.plans[row], c.dev
+        with paused(c.host):
+            staging_before = [s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if state == STAGING_STATE]
+        c.plan(experts, row)
+        plan.slots[:36] = -1  # every lane forced
+        backend._stage_planned(plan)
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        overflows = torch.zeros(1, dtype=torch.int64, device="cuda")
+        x = torch.randn(1, HIDDEN, device="cuda").half()
+        dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True,
+                 cpu_input=(x, torch.ones(36, device="cuda")), spill=(flag, overflows))
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+        torch.cuda.synchronize()
+        assert c.handled()
+        assert (int(plan.count[0]), int(flag.item())) == (36, 0)
+        assert c.kinds(36) == [int(LaneKind.MISS_CPU)] * 36
+        assert dev.cpu_lanes.tolist() == [-1, PART_MISSES, 0xF]
+        assert set(experts) <= c.resident(row), "every forced miss is cached in the RAM victim it was read into"
+        with paused(c.host):
+            info = c.host.slot_info(row)
+            slot_of = {e: s for s, (state, e, _) in enumerate(info) if e >= 0}
+            staging_after = [s for s, (state, e, _) in enumerate(info) if state == STAGING_STATE]
+        assert staging_after == staging_before, "no staging slot was used"
+        computed = sorted(s for call in c.host.test_kernel_calls() for s in call["slots"])
+        assert computed == sorted(slot_of[e] for e in experts)
+    finally:
+        c.close()
+```
+Define `STAGING_STATE = 3  # slot_info's state of a staging slot (tier_protocol.h: kFree 0, kReady 2, kStaging 3)`
+next to `READY_STATE` in the test file. `READY_STATE, FREE_STATE = 3, 0` there are the residency updater's codes, not
+the tier's. The `Chain` default reserves 6 staging slots and 48 slots, so `48 − 6 = 42 ≥ 36` victims exist with
+nothing hot.
+
+- [ ] **Step 2: Run and see it fail**
+
+GPU lock: `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py -k forced_cpu_misses`. Expected: a fail-stop
+`... (expert 0, slot -1) is not a staging slot` from `classify_lanes_locked`.
+
+- [ ] **Step 3: Implement** (`ram_tier.h`)
+
+In `classify_lanes_locked`, replace the head of the miss branch:
+```cpp
+      if (is_miss(lane.kind)) {
+        if (!listed(own.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
+        if (listed(plan->slots, static_cast<int64_t>(lane.slot))) fail(" shares its staging slot with another miss");
+```
+with
+```cpp
+      if (is_miss(lane.kind)) {
+        if (lane.slot < 0) {
+          // A forced CPU miss (spill): no staging slot; reserve_victims_locked reads it into a RAM victim.
+          if (lane.kind != Wire::kKindMissCpu) fail(" is a GPU miss without a staging slot");
+        } else {
+          if (!listed(own.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
+          if (listed(plan->slots, static_cast<int64_t>(lane.slot))) fail(" shares its staging slot with another miss");
+        }
+```
+The rest of the branch is unchanged (the tier check, `late_cpu`, the pushes).
+
+Change `reserve_victims_locked` to take `RecordPlan& plan` (not `const`), and put this loop at its start, before the
+existing one over `plan.missing`:
+```cpp
+    // Forced CPU misses first (spill, slot -1): each is read straight into a victim, which it takes over, so it is
+    // cached with no staging slot. The start-up capacity check (Exl3RamMissService.attach) leaves every node range a
+    // victim for each, so none missing is a broken invariant, not a skipped insert.
+    bool placed[Wire::kLanes] = {};
+    for (size_t i = 0; i < plan.missing.size(); ++i) {
+      if (plan.slots[i] >= 0) continue;
+      int32_t old = -1;
+      const int64_t victim = take_victim_locked(group, request.row, plan.wanted, &old);
+      if (victim < 0) fail_record(request, "a forced CPU miss found no RAM victim on its node");
+      if (old >= 0) {
+        part.entries[part.count][0] = old;
+        part.entries[part.count][1] = -1;
+        ++part.count;
+      }
+      part.entries[part.count][0] = plan.missing[i];
+      part.entries[part.count][1] = static_cast<int32_t>(victim);
+      ++part.count;
+      tier.state[victim] = kStaging;  // being read; commit_inserted_locked makes it READY
+      plan.slots[i] = victim;
+      placed[i] = true;
+      inserted[i] = true;
+    }
+```
+Start the existing loop's body with `if (placed[i]) continue;`. `part` and `own` are declared above both loops, as
+they are now. The delta holds at most two entries per miss, 72 at 36 misses, within `kDeltaMaxEntries = 80` at 40
+lanes. In `serve_record`, `RecordPlan plan;` is already mutable, so the call is unchanged.
+`take_victim_locked` excludes `kStaging`, non-READY, hot and wanted slots, so a slot just taken is never taken again in
+the same record.
+
+- [ ] **Step 4: Run and pass**
+
+GPU lock: `test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py test/manual/dsv41/test_exl3_slot_map_kernels_cuda.py test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py test/manual/dsv41/test_bs1_build_digest.py`.
+CPU: `test/registered/unit/kernels/test_expert_stream_hotpath_golden.py test/registered/unit/kernels/test_exl3_ram_miss_slot_map.py test/registered/unit/kernels/test_exl3_ram_miss_tier.py`.
+
+Expected: `EXIT=0`. The digest test compares device kernels only (`--permanent`), and those are untouched here. The
+host's BS1 behaviour stays pinned by `test_expert_stream_hotpath_golden.py`, which must pass unchanged.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h test/manual/dsv41/test_exl3_cpu_lane_order_cuda.py
+git commit -m "feat(exl3-ram-miss): a forced CPU miss is read into a RAM victim of its node and cached, never staged
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
+```
+
+---
+
+### Task 10: The service sizes CPU rows for the verify, wires the spill words, guarantees room for forced misses, and caps calibration
+
+**Files:**
+- Modify: `python/sglang/srt/layers/moe/cpu_experts/service.py` (`CpuExpertService.__init__`/`.calibrate`, `CpuExpertGroups.__init__`)
+- Modify: `python/sglang/srt/layers/moe/cpu_experts/policy.py` (`capped_split`)
+- Modify: `python/sglang/srt/layers/moe/exl3_ram_miss.py` (`ensure_started`, `_start_cpu_experts`, `attach`, `spill_room_shortfall`, `Exl3RamMissRowBackend.__init__`/`.post`)
+- Modify: `python/sglang/kernels/jit/csrc/moe/expert_stream/host/split_calibration.h`, `host/ram_tier.h` (`calibrate_cpu_split`), `host/ffi_exports.h`
+- Modify: `python/sglang/kernels/ops/moe/expert_stream_transport.py` (`ExpertStreamHost.calibrate_cpu_split`)
+- Modify: `analysis/dsv41-drive/LEASE_PROTOCOL.md` (CPU expert section)
+- Test: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py`, `test/registered/unit/kernels/test_exl3_cpu_split_calibration.py`
+
+**Interfaces:**
+- Consumes: Tasks 2-9.
+- Produces:
+  - `CpuExpertService(..., tokens: int = 1, calibration_lanes: Optional[int] = None)` and
+    `CpuExpertGroups(..., tokens=1, calibration_lanes=None)`;
+  - `Exl3RamMissRowBackend.spill`, `None` or `(overflow_flag, gather_overflow[row : row + 1])`;
+  - `attach` accepts CPU experts at a verify gather. Under spill it refuses a layer whose node ranges cannot hold
+    `staging + lanes + VRAM capacity` slots.
+  - `exl3_ram_miss.spill_room_shortfall(ranges, staging, lanes, hot) -> list[tuple[int, int, int]]`;
+  - `ExpertStreamHost.calibrate_cpu_split(..., lanes: Optional[int] = None)`;
+  - `policy.capped_split(grid, width, configured) -> list[int]`.
+
+The calibration cap: the split is indexed by the eligible unforced lanes, which under spill are the live lanes, at most
+V. A 40-lane calibration would time 860 cells, and on the GPU it would need 40 experts of scratch (40 × 13,315,584 B ≈
+508 MiB of VRAM at arming). Calibrating to V = 8 times the 60 cells of today's BS1 grid in a 106 MiB scratch, and keeps
+the configured split above V. Those entries are never indexed.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `test_exl3_ram_miss_attach_lanes.py`, delete `test_cpu_experts_refuse_a_miss_width_below_the_routes` and add:
+```python
+def _spill_updater():
     updater = DirectUpdaterStandIn(LAYERS, CAPACITY, EXPERTS)
-    updater.miss_rows, updater.victim_lanes = 32, 8
+    updater.miss_rows, updater.victim_lanes = 36, 8
     updater.overflow_flag = torch.zeros(1, dtype=torch.int32)
     updater.gather_overflow = torch.zeros(LAYERS, dtype=torch.int64)
-    manager = SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater)
+    return updater
+
+
+def _attach_verify(service, streamer, updater):
+    streamer._graph_pinned_tier = True
+    streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
+    streamer.graph_gather_rows, streamer.graph_miss_lanes = 36, 0  # a lane per route
+    streamer.residency_row = 1
+    streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
+    service.attach(SimpleNamespace(register_fail_stop_check=lambda check: None, gpu_residency=updater), streamer)
+
+
+def test_cpu_experts_attach_a_verify_gather_and_wire_its_spill_words(tiers, monkeypatch):
+    """Six tokens of top-6 with a lane per route (36 on a 40-lane wire), 8 of them victim lanes: the layer attaches with
+    CPU experts on, and its backend posts with DIRECT's overflow flag and its own row of the overflow counter (a view:
+    the post's increment is the updater's). The room check is the next test's."""
+    service, streamers = tiers
+    service.plan_gather_width(36)
+    service.ensure_started()
+    monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(service, "_check_spill_room", lambda row, streamer, width: None)
+    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
+    updater = _spill_updater()
     try:
-        streamer = streamers[0]
-        streamer._graph_pinned_tier = True
-        streamer.hot_cache = SimpleNamespace(device="cpu", capacity=CAPACITY)
-        streamer.graph_gather_rows, streamer.graph_miss_lanes = 36, 32
-        streamer.residency_row = 1
-        streamer.row_backend = SimpleNamespace(segments={0: None}, host_row_map=torch.full((EXPERTS,), -1, dtype=torch.int64))
-        service.attach(manager, streamer)
+        _attach_verify(service, streamers[0], updater)
     finally:
         service.cpu_experts = None
-    flag, counter = streamer.row_backend.spill
+    flag, counter = streamers[0].row_backend.spill
     assert flag is updater.overflow_flag
     counter.add_(1)
     assert updater.gather_overflow.tolist() == [0, 1]
+
+
+def test_spill_refuses_a_tier_without_a_victim_for_every_forced_miss(tiers, monkeypatch):
+    """Review Focus 2 at start-up: a forced CPU miss is read into a RAM victim, so every node range of the layer must hold
+    staging + 36 lanes + the VRAM-hot slots. These 3-slot tiers cannot: refused at attach, not fail-stopped mid-verify."""
+    service, streamers = tiers
+    service.plan_gather_width(36)
+    service.ensure_started()
+    monkeypatch.setattr(module, "Exl3RamMissRowBackend", lambda *args, **kwargs: SimpleNamespace())
+    service.cpu_experts = SimpleNamespace(attach_device=lambda device_side: None)
+    try:
+        with pytest.raises(ValueError, match="reads every forced CPU miss into a RAM victim"):
+            _attach_verify(service, streamers[0], _spill_updater())
+    finally:
+        service.cpu_experts = None
+
+
+@pytest.mark.parametrize(
+    "ranges, short",
+    [
+        ([(0, 80), (80, 161)], []),  # the recipe: 80 and 81 slots, 8 + 36 + 24 = 68 needed
+        ([(0, 60), (60, 161)], [(0, 60, 68)]),
+        ([(0, 161)], []),  # one node
+    ],
+)
+def test_spill_room_is_staging_plus_lanes_plus_hot_per_node(ranges, short):
+    assert module.spill_room_shortfall(ranges, staging=8, lanes=36, hot=24) == short
 
 
 def test_a_captured_cpu_expert_gather_posts_its_spill_words(monkeypatch):
@@ -1693,31 +2813,60 @@ def test_cpu_rows_hold_the_verify_tokens():
     hidden]; one token keeps today's shapes."""
     from sglang.srt.layers.moe.cpu_experts.service import CpuExpertService
 
+    cores = sorted(os.sched_getaffinity(0))[:2]
     for tokens, out_shape in ((1, (2, 2, 64)), (6, (2, 2, 6, 64))):
-        enabled = {}
         host = SimpleNamespace(
-            wire=lease.wire_layout(32), nodes=1, enable_cpu_experts=lambda *a, **k: enabled.update(args=a),
-            cpu_stats=lambda group: {},
+            wire=lease.wire_layout(40), nodes=1, enable_cpu_experts=lambda *a, **k: None, cpu_stats=lambda group: {},
         )
         trait = SimpleNamespace(check_environment=lambda: None, kernel_address=lambda: 1, name="t")
         service = CpuExpertService(
-            host, trait, {0: {}, 1: {}}, hidden=64, cores=[0, 1], threads=2, split=[0] * 33, pin=False, tokens=tokens,
+            host, trait, {0: {}, 1: {}}, hidden=64, cores=cores, threads=2, split=[0] * 41, pin=False, tokens=tokens,
         )
         assert tuple(service.out_rows.shape) == out_shape
-        assert service.x_rows.shape[1] == lease.cpu_row_bytes(64, tokens, 32)
+        assert service.x_rows.shape[1] == lease.cpu_row_bytes(64, tokens, 40)
 ```
-`CpuExpertService.__init__` calls `check_engine_cores(cores, threads)`. If cores 0-1 are refused on the test host
-(reserved or absent), name two cores from `os.sched_getaffinity(0)`.
+Add `import os` to the file's imports if missing.
+
+In `test_exl3_cpu_split_calibration.py`, add:
+```python
+def test_a_capped_calibration_times_only_its_lanes(tmp_path):
+    """Spill caps calibration at the victim lanes (the split is only indexed below them): a 16-lane host told 4 lanes
+    times the 4-lane cells, leaves every other cell 0, and needs 4 experts of scratch."""
+    _, host, _, _keep = _host(tmp_path, capacity=20, lanes=16)
+    jobs_before = host.cpu_stats()["jobs"]
+    scratch = torch.zeros(4 * host.copy_expert_bytes(ROW), dtype=torch.uint8)
+    grid = host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=scratch, lanes=4)
+    assert tuple(grid.shape) == (18, 17)
+    assert all(grid[0, k] > 0 for k in range(1, 5)) and not any(grid[0, 5:])
+    for n in range(1, 17):
+        row = grid[1 + n]
+        assert all(row[k] > 0 for k in range(n + 1)) if n <= 4 else not any(row), n
+    assert host.cpu_stats()["jobs"] - jobs_before == (4 + 10) * 2
+
+
+def test_the_capped_split_keeps_the_configured_entries_above_the_cap():
+    from sglang.srt.layers.moe.cpu_experts.policy import capped_split, split_from_grid
+
+    grid = [[0.0] * 17 for _ in range(18)]
+    for n in range(1, 5):
+        for k in range(n + 1):
+            grid[1 + n][k] = 10.0 - k  # more CPU lanes are faster: split[n] = n
+    configured = list(range(100, 117))
+    assert capped_split(grid, 4, configured) == [0, 1, 2, 3, 4] + configured[5:]
+    assert capped_split(grid, 4, configured)[:5] == split_from_grid([r[:5] for r in grid[:6]])
+```
 
 - [ ] **Step 2: Run and see them fail**
 
-CPU: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py -k "spill or verify_tokens or verify_gather"`.
-Expected: failures on `spill` (no attribute) and `tokens` (unexpected keyword).
+CPU: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py -k "spill or verify_tokens or verify_gather"` and
+`test/registered/unit/kernels/test_exl3_cpu_split_calibration.py -k capped`. Expected: failures on `spill` (no
+attribute), `tokens` (unexpected keyword), `spill_room_shortfall`, `lanes` (unexpected keyword) and `capped_split`.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement the service rows and the spill words**
 
 `service.py`:
-- `CpuExpertService.__init__` gains `tokens: int = 1` after `shared`.
+- `CpuExpertService.__init__` gains `tokens: int = 1, calibration_lanes: Optional[int] = None` after `shared`, and
+  stores `self.calibration_lanes = min(int(calibration_lanes or self.lanes), self.lanes)`.
 - Replace the row allocation in the `else:` branch:
   ```python
               # Row layout is in the class doc; pinned so the device reaches them by UVA. A verify's rows hold its tokens
@@ -1728,16 +2877,22 @@ Expected: failures on `spill` (no attribute) and `tokens` (unexpected keyword).
   ```
   Import `cpu_row_bytes` from `sglang.kernels.ops.moe.expert_lease_block`.
 - Class doc: after "Each output row has two parts, ..." add "A verify's rows (``tokens`` > 1) hold each token's input
-  and output, and the post's token table after the inputs."
-- `CpuExpertGroups.__init__` gains `tokens: int = 1` and passes `tokens=tokens` to each `CpuExpertService`.
+  and output, and the post's token table after the inputs. Under spill, calibration stops at ``calibration_lanes``
+  (the victim lanes), the most eligible lanes a split entry is ever read for."
+- `CpuExpertGroups.__init__` gains `tokens: int = 1, calibration_lanes: Optional[int] = None` and passes both to each
+  `CpuExpertService`.
 
 `exl3_ram_miss.py`:
 - `_start_cpu_experts`: before `return CpuExpertGroups(`:
   ```python
           # A DSpark verify gathers tokens x top_k routes a layer; the CPU rows hold that many tokens.
           tokens = max((s.graph_gather_rows // s.layer.top_k for s in streamers.values() if s.graph_gather_rows), default=1)
+          # Spill: a split entry is only read for the live lanes, at most the victim lanes.
+          victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get() or None
   ```
-  Pass `tokens=tokens`. Drop "(a verify)" refusals from its docstring if any.
+  Pass `tokens=tokens, calibration_lanes=victims`.
+- `ensure_started`: after `node_ranges = group_ranges(...)` (or `None` at one node), store
+  `self._node_ranges = node_ranges`. Initialize `self._node_ranges = None` in `__init__`.
 - `attach`: delete the block
   ```python
         if self.cpu_experts is not None and width < streamer.graph_gather_rows:
@@ -1750,52 +2905,129 @@ Expected: failures on `spill` (no attribute) and `tokens` (unexpected keyword).
         victims = getattr(manager.gpu_residency, "victim_lanes", None)
         want = max(1, min(streamer.graph_miss_width, victims) if victims else streamer.graph_miss_width)
   ```
-  Its comment gains "; under spill, the victim lanes".
+  Its comment gains "; under spill, the victim lanes (only live misses stage)".
 - Right after `streamer.row_backend = Exl3RamMissRowBackend(...)`:
   ```python
         updater = manager.gpu_residency
         if self.cpu_experts is not None and getattr(updater, "victim_lanes", width) < width:
-            # Spill: the post flags this layer itself when a victimless lane cannot be the CPU's.
+            # Spill: forced CPU misses land in RAM victims (RamTier::reserve_victims_locked), so the layer must have
+            # room for them; the post flags this layer itself only before the copy engine arms.
+            self._check_spill_room(row, streamer, width)
             residency_row = streamer.residency_row
             streamer.row_backend.spill = (
                 updater.overflow_flag,
                 updater.gather_overflow[residency_row : residency_row + 1],
             )
   ```
-  `width` here is the `streamer.graph_miss_width` read earlier in `attach`.
+  `width` here is the `streamer.graph_miss_width` read earlier in `attach`, and `row` the service row computed there.
+- Add the module-level function and the method:
+  ```python
+  def spill_room_shortfall(ranges, *, staging: int, lanes: int, hot: int) -> list[tuple[int, int, int]]:
+      """The node ranges of a layer that cannot give every forced CPU miss a RAM victim, as (group, slots, needed).
+
+      A forced miss is read into a victim of its node's range: neither a staging slot (`staging`), nor an expert the
+      record routes (at most `lanes` less the forced misses themselves), nor a VRAM-hot expert (at most `hot`). So a
+      range of at least staging + lanes + hot slots always has one (plan 2026-10-06, Task 9)."""
+      need = staging + lanes + hot
+      return [(g, hi - lo, need) for g, (lo, hi) in enumerate(ranges) if hi - lo < need]
+  ```
+  ```python
+      def _check_spill_room(self, row: int, streamer, width: int) -> None:
+          """Refuse a layer whose node ranges cannot place every forced CPU miss (spill_room_shortfall)."""
+          capacity = int(self.host.tables.capacity[row])
+          ranges = self._node_ranges[row] if self._node_ranges is not None else [(0, capacity)]
+          short = spill_room_shortfall(
+              ranges, staging=self.staging_for(capacity), lanes=width, hot=int(streamer.hot_cache.capacity)
+          )
+          if short:
+              raise ValueError(
+                  f"exl3 RAM miss: spill reads every forced CPU miss into a RAM victim; layer {streamer.layer_id}'s "
+                  f"node ranges (group, slots, needed) {short} are too small: raise SGLANG_MOE_PINNED_HOST_NUMA_MB or "
+                  "lower SGLANG_MOE_HOT_GPU_MB"
+              )
+  ```
+  If `ensure_started` builds the per-row ranges under another name than `node_ranges`, bind that list. It is the one
+  passed to `ExpertStreamHost(..., node_ranges=...)`.
 - `Exl3RamMissRowBackend.__init__`: after `self.cpu_input = None` add
   `self.spill = None  # DIRECT's (overflow flag, this layer's counter) under spill; set by Exl3RamMissService.attach`.
 - `Exl3RamMissRowBackend.post`: add `spill=self.spill,` to `side.post(...)`.
 
-`dsv41_ram_miss_fixtures.py` `DirectUpdaterStandIn`: nothing to add. `attach` reads `victim_lanes` with `getattr`.
+- [ ] **Step 4: Implement the calibration cap**
 
-`LEASE_PROTOCOL.md`, at the end of the CPU expert thread section, add:
+`split_calibration.h`:
+- add `int lanes = kCalibLanes;  // the most lanes measured, 1..kCalibLanes (spill: the victim lanes)` to
+  `CalibrationSetup`;
+- in `calibrate_split`, the three loops' bound `kCalibLanes` becomes `s.lanes`. The grid keeps its
+  `kCalibRows × kCalibCols` shape, with the unmeasured cells 0.
+
+`ram_tier.h` `calibrate_cpu_split`:
+- add `int64_t lanes,` after `reps`;
+- after the `reps` check add
+  `if (lanes < 1 || lanes > kCalibLanes) throw std::runtime_error(prefix + "lanes must be 1.." + std::to_string(kCalibLanes));`;
+- the slot check and the scratch `need` use `lanes` in place of `kCalibLanes`;
+- set `s.lanes = static_cast<int>(lanes);`.
+
+`ffi_exports.h` `calibrate_cpu_split`: add `int64_t lanes,` after `int64_t reps,` and pass `lanes` after `reps`.
+`ExpertStreamHost.calibrate_cpu_split`: add `lanes: Optional[int] = None`. Pass `int(lanes or self.wire.lanes)` after
+`int(reps),`. Docstring: "``lanes`` caps the lanes measured (default the wire's); cells past it stay 0, and
+``scratch`` needs that many experts."
+
+`policy.py`:
+```python
+def capped_split(grid, width: int, configured) -> list[int]:
+    """The split from a grid measured up to `width` lanes: split_from_grid's entries 0..width, then the configured
+    entries above, which a split capped at the live lanes never reads."""
+    return split_from_grid([row[: width + 1] for row in grid[: width + 2]]) + list(configured[width + 1 :])
+```
+`CpuExpertService.calibrate`:
+- use `width = self.calibration_lanes` in place of `self.lanes` for `calibration_row(..., width)` and the scratch size
+  (`width * expert_bytes`);
+- pass `lanes=width` to `calibrate_cpu_split`;
+- set `split = capped_split(grid, width, self.split)`. The `format_calibration` call takes the sliced grid
+  `[row[: width + 1] for row in grid[: width + 2]]`.
+
+- [ ] **Step 5: LEASE_PROTOCOL.md**
+
+At the end of the CPU expert thread section, add:
 ```markdown
-**A verify's CPU lanes (plan 2026-10-06-dsv41-dspark-both-cpu-experts).** A row's pinned input holds the verify's
-tokens (`cpu_tokens_max`, 6 at `speculative_dspark_block_size=5`), then a token table the post writes for every lane:
-the token count, a mask of the tokens that route the lane's expert, and each such token's weight
-(`cpu_token_table.h`). A record's CPU job runs one forward of the record's tokens from it, and each token's partial is
-its own `[hidden]` row of the part, which the route tables add to that token. The record's summed lane weight still
-serves one-token rows.
+**A verify's CPU lanes (plan 2026-10-06-dsv41-dspark-both-cpu-experts).** A verify gathers with a lane per route (36
+at 6 tokens of top-6, on a 40-lane wire whose lane masks are u64). A row's pinned input holds the verify's tokens
+(`cpu_tokens_max`, 6 at `speculative_dspark_block_size=5`), then a token table the post writes for every lane: the token
+count, a mask of the tokens that route the lane's expert, and each such token's weight (`cpu_token_table.h`). A record's
+CPU job runs one forward of the record's tokens from it, and each token's partial is its own `[hidden]` row of the part,
+which the route tables add to that token. The record's summed lane weight still serves one-token rows.
 
-**Spill.** With `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES` below the miss lanes, DIRECT marks the lanes past its
-victims with destination slot -1. The post makes each one a CPU lane, outside the split. When one cannot be (copy
-engine unarmed, no CPU layer, a miss with no staging slot), the post serves the live prefix, writes that count, and
-sets DIRECT's overflow flag and the layer's counter, and the DSpark worker re-runs the verify eagerly. The draft (the
-second client) is untouched: separate channel, areas, thread and cores, on the same stream strictly before the verify.
+**Spill.** With `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES` (V) below the lanes, DIRECT gives VRAM victims and
+staging slots to the first V lanes only and marks the rest with destination slot -1. The post makes each marked lane a
+CPU lane, outside the split: a RAM hit runs from its RAM slot, and an NVMe miss gets slot -1. The host reads each such
+miss into a RAM victim of its node's range, taken before the staging misses take theirs. The CPU computes it there,
+and the tier keeps it (the record's delta maps it). Every node range is checked at attach to hold staging + lanes +
+VRAM-hot slots, so a victim always exists, and a live miss always has its staging slot (live <= V = staging per node).
+Both are asserted (fail_record, __trap), never handled. The post overflows only when forced lanes cannot be CPU lanes
+at all: before the copy engine arms (or before a row's CPU layer is registered). Then it serves the live prefix,
+writes that count, and sets DIRECT's overflow flag and the layer's counter, and the DSpark worker re-runs the verify
+eagerly. The draft (the second client) is untouched: separate channel, areas, thread and cores, on the same stream
+strictly before the verify.
 ```
 
-- [ ] **Step 4: Run and pass**
+- [ ] **Step 6: Run and pass**
 
-CPU: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_service.py`.
-Expected: `EXIT=0`.
+CPU: `test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py test/registered/unit/kernels/test_exl3_ram_miss_cpu_experts.py test/registered/unit/kernels/test_cpu_expert_service.py test/registered/unit/kernels/test_exl3_cpu_split_calibration.py`.
+GPU lock: `test/manual/dsv41/test_cpu_split_calibration_cuda.py`. Expected: `EXIT=0`. A registered test that calls
+`expert_stream_calibrate_cpu_split` directly with the old arity gets `lanes` added after `reps`. List each such file in
+the commit.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add python/sglang/srt/layers/moe/cpu_experts/service.py python/sglang/srt/layers/moe/exl3_ram_miss.py \
-  analysis/dsv41-drive/LEASE_PROTOCOL.md test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py
-git commit -m "feat(exl3-cpu-experts): CPU rows hold a verify's tokens; a verify gather attaches with CPU experts and posts the spill words
+git add python/sglang/srt/layers/moe/cpu_experts/service.py python/sglang/srt/layers/moe/cpu_experts/policy.py \
+  python/sglang/srt/layers/moe/exl3_ram_miss.py \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/split_calibration.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/ram_tier.h \
+  python/sglang/kernels/jit/csrc/moe/expert_stream/host/ffi_exports.h \
+  python/sglang/kernels/ops/moe/expert_stream_transport.py analysis/dsv41-drive/LEASE_PROTOCOL.md \
+  test/registered/unit/kernels/test_exl3_ram_miss_attach_lanes.py test/registered/unit/kernels/test_exl3_cpu_split_calibration.py
+git commit -m "feat(exl3-cpu-experts): verify-sized CPU rows, spill words, room for every forced miss, calibration capped at the victim lanes
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
@@ -1803,30 +3035,38 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 9: End to end on the GPU: a captured 6-token verify with CPU experts and spill
+### Task 11: End to end on the GPU: a captured 6-token verify with CPU experts and spill
 
-The real EXL3 lease chain, the real optimized CPU kernel and a captured verify, the D2-2 rig
-(`test_exl3_verify_miss_lanes_gpu.py`) with CPU experts on.
+This task runs the D2-2 rig (`test_exl3_verify_miss_lanes_gpu.py`) with CPU experts on: the real EXL3 lease chain, the
+real optimized CPU kernel, a captured verify, and a lane per route on a 40-lane wire. It is the end-to-end proof of
+the owner's goal: in steady state no verify overflows. Two cases matter:
+- 36 distinct experts (Review Focus 5);
+- every non-victim lane an NVMe miss on one node (Review Focus 2).
+Only the replay before the copy engine arms overflows (Review Focus 1).
 
 **Files:**
 - Create: `test/manual/dsv41/test_exl3_verify_cpu_spill_gpu.py`
 
 **Interfaces:**
-- Consumes: everything above. `Exl3MoEMethod._apply_graph`, `_apply_streamed`, `ExpertHotCacheManager.from_model(...,
-  graph_gather_miss_lanes=)`, `manager.take_verify_overflow()`, `manager.suspend_graph_gather()`,
-  `exl3_ram_miss.COPY_ENGINE_ARM_DECODES`.
+- Consumes:
+  - everything above;
+  - `Exl3MoEMethod._apply_graph`, `_apply_streamed`;
+  - `ExpertHotCacheManager.from_model(..., graph_gather_miss_lanes=0)`;
+  - `manager.take_verify_overflow()`, `manager.suspend_graph_gather()`;
+  - `exl3_ram_miss.COPY_ENGINE_ARM_DECODES`.
 
 - [ ] **Step 1: Write the test**
 
 ```python
 """A captured 6-token verify through the real EXL3 lease chain with CPU experts and spill (GPU, real CPU kernel).
 
-Plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 9. Eight miss lanes, two of them victim lanes. A verify whose
-union of misses are RAM hits serves two on the GPU and the rest on the CPU, with no overflow, and every token's output
-is within the CPU kernel's bar of the fp32 reference. A replay before the copy engine arms overflows instead (Review
-Focus 1), and the eager re-run is exact. A union with more NVMe misses than the node's staging overflows (Review Focus
-2) and re-runs exactly.
-
+Plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 11. A lane per route (36 on a 40-lane wire), two victim lanes.
+  - Before the copy engine arms, forced lanes cannot be the CPU's: the replay overflows (Review Focus 1, the one
+    overflow left) and the eager re-run is exact.
+  - Armed, 36 distinct RAM-resident experts (Review Focus 5) are served with no overflow: two on the GPU, the rest on
+    the CPU, every token within the CPU kernel's bar of the fp32 reference.
+  - Armed, 36 distinct cold experts, all NVMe misses on the one node (Review Focus 2) are served with no overflow:
+    the live misses stage, the forced ones are read into RAM victims and computed there, and stay cached.
 Run on divix01 from the pushed worktree, holding rowimg-disk.lock then cc-gpu.lock, on the recipe's server cores (the
 CPU expert team derives node 0's 6-15):
   CUDA_MODULE_LOADING=EAGER SGLANG_DSV41_CPU_EXPERTS=1 EXL3_MOE_CPU_PIN=0 SGLANG_EXL3_SRC=... SGLANG_EXL3_CPU_CXX=...
@@ -1848,11 +3088,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 ACT_LIMIT = 10.0
-TOP_K, TOKENS, LANES, VICTIMS, EXPERTS = 6, 6, 8, 2, 48
+TOP_K, TOKENS, VICTIMS, EXPERTS = 6, 6, 2, 128
+LANES = TOKENS * TOP_K  # 36: a lane per route
+HOT = 8  # VRAM slots per layer; the DIRECT floor is 2 * VICTIMS
+TIER = 64  # pinned rows: >= staging (2) + 36 lanes + HOT (8) = 46, Task 10's room check
 CPU_BOUND = 2e-2  # the CPU kernel's own bar (test_exl3_moe_split_parity_cuda.py)
 
 
-def test_a_verify_spills_its_victimless_lanes_to_the_cpu(tmp_path):
+def _distinct(experts):
+    """Six tokens of top-6 over 36 distinct experts: token t routes experts[6t .. 6t + 5]."""
+    return [experts[TOP_K * t : TOP_K * (t + 1)] for t in range(TOKENS)]
+
+
+def test_a_verify_spills_every_victimless_lane_to_the_cpu_and_never_overflows_once_armed(tmp_path):
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import exl3_ram_miss as service_module
     from sglang.srt.layers.moe.exl3_expert_format import Exl3ExpertFormat
@@ -1885,19 +3133,19 @@ def test_a_verify_spills_its_victimless_lanes_to_the_cpu(tmp_path):
             model, layer = torch.nn.Module(), torch.nn.Module()
             layer.layer_id, layer.top_k = 0, TOP_K
             fmt = Exl3ExpertFormat(layout, 0, source_root=str(tmp_path))
-            fmt.max_gather_rows = LANES
+            fmt.max_gather_rows = 8
             streamer = ExpertStreamer(layer, fmt.names, layer_id=0, format=fmt)
             layer._nvfp4_expert_streamer = streamer
             model.add_module("expert_layer", layer)
-            ExpertPinnedHostCache(streamer, 4 * LANES, **fmt.pinned_tier_options(layer))
+            ExpertPinnedHostCache(streamer, TIER, **fmt.pinned_tier_options(layer))
             manager = ExpertHotCacheManager.from_model(
-                model, budget_bytes=2 * LANES * streamer.bytes_per_expert, seed_path=None, dynamic=True,
+                model, budget_bytes=HOT * streamer.bytes_per_expert, seed_path=None, dynamic=True,
                 update_prefill_tokens=16, min_residence_forwards=0, benefit_ratio=0.0,
-                graph_gather_batch_size=TOKENS, graph_gather_miss_lanes=LANES, update_decode_forwards=1,
+                graph_gather_batch_size=TOKENS, graph_gather_miss_lanes=0, update_decode_forwards=1,
                 gpu_residency_update=True, insert_on_miss=2,
             )
             updater = manager.gpu_residency
-            assert (updater.miss_rows, updater.victim_lanes) == (LANES, VICTIMS)
+            assert streamer.graph_miss_width == LANES and (updater.miss_rows, updater.victim_lanes) == (LANES, VICTIMS)
             assert service.staging_width() == VICTIMS
 
             generator = torch.Generator(device="cpu").manual_seed(41)
@@ -1909,7 +3157,7 @@ def test_a_verify_spills_its_victimless_lanes_to_the_cpu(tmp_path):
             with torch.cuda.graph(graph):
                 out = Exl3MoEMethod._apply_graph(layer, streamer, x, weights, ids, ACT_LIMIT)
             manager.discard_graph_capture_routes()
-            assert service.cpu_experts is not None and service.cpu_experts.x_rows.shape[0] == 1
+            assert service.lanes == 40 and service.cpu_experts is not None
 
             def outsiders():
                 mapping = updater.mapping[0, :EXPERTS].cpu().tolist()
@@ -1920,7 +3168,6 @@ def test_a_verify_spills_its_victimless_lanes_to_the_cpu(tmp_path):
                 with manager.suspend_graph_gather():
                     for start in range(0, len(experts), TOP_K):
                         chunk = experts[start : start + TOP_K]
-                        chunk = chunk + [e for e in range(EXPERTS) if e not in chunk][: TOP_K - len(chunk)]
                         Exl3MoEMethod._apply_streamed(
                             layer, streamer, x[:1], weights[:1], torch.tensor([chunk], device="cuda", dtype=torch.int32),
                             ACT_LIMIT,
@@ -1936,59 +3183,54 @@ def test_a_verify_spills_its_victimless_lanes_to_the_cpu(tmp_path):
                 assert updater.insertion_truncated[0].item() == 0
                 return int(updater.overflow_flag.item())
 
-            def rerun_is_exact(routes):
-                assert manager.take_verify_overflow()
-                with manager.suspend_graph_gather():
-                    eager = Exl3MoEMethod._apply_streamed(layer, streamer, x, weights, ids, ACT_LIMIT)
-                torch.cuda.synchronize()
+            def exact(result, routes):
                 for t, route in enumerate(routes):
                     ref = _reference(x[t : t + 1], weights[t], torch.tensor(route), source_cuda)
-                    assert _rel(eager[t : t + 1], ref) <= CPU_BOUND, (t, route)
+                    assert _rel(result[t : t + 1], ref) <= CPU_BOUND, (t, route)
 
-            # Eight RAM-resident outsiders, routed by every token in turn: a union of 8 misses, all RAM hits.
-            ram_set = outsiders()[:LANES]
-            in_ram(ram_set)
-            routes = [[ram_set[(t + k) % LANES] for k in range(TOP_K)] for t in range(TOKENS)]
+            def served_without_overflow(routes):
+                inserted = updater.gather_insertions[0].item()
+                assert replay(routes) == 0, "an armed verify overflowed"
+                count = int(streamer._graph_miss_count.item())
+                kinds = service.device_side.lane_kind[:count].tolist()
+                cpu = sum(k in (int(LaneKind.HIT_CPU), int(LaneKind.MISS_CPU)) for k in kinds)
+                live = updater.gather_insertions[0].item() - inserted
+                assert count == LANES and live <= VICTIMS and cpu >= LANES - VICTIMS, (count, live, kinds)
+                exact(out, routes)
 
-            # Review Focus 1: before the copy engine arms, no forced lane can be the CPU's.
+            # Review Focus 1: before the copy engine arms, forced lanes cannot be the CPU's; the re-run is exact.
+            warm = outsiders()[:LANES]
+            in_ram(warm)
+            routes = _distinct(warm)
             assert replay(routes) == 1
-            rerun_is_exact(routes)
+            assert manager.take_verify_overflow()
+            with manager.suspend_graph_gather():
+                eager = Exl3MoEMethod._apply_streamed(layer, streamer, x, weights, ids, ACT_LIMIT)
+            torch.cuda.synchronize()
+            exact(eager, routes)
 
             service._copy_decodes = service_module.COPY_ENGINE_ARM_DECODES
             service._arm_copy_engine()
             assert service._copy_armed
-            inserted = updater.gather_insertions[0].item()
-            assert replay(routes) == 0, "a union of RAM hits spills, it does not overflow"
-            count = int(streamer._graph_miss_count.item())
-            kinds = service.device_side.lane_kind[:count].tolist()
-            cpu = sum(k in (int(LaneKind.HIT_CPU), int(LaneKind.MISS_CPU)) for k in kinds)
-            live = updater.gather_insertions[0].item() - inserted
-            assert count == LANES and live <= VICTIMS and cpu >= LANES - VICTIMS, (count, live, kinds)
-            mapping = updater.mapping[0, :EXPERTS].cpu()
-            for t, route in enumerate(routes):
-                ref = _reference(x[t : t + 1], weights[t], torch.tensor(route), source_cuda)
-                assert _rel(out[t : t + 1], ref) <= CPU_BOUND, (t, route)
-
-            # Review Focus 2: more NVMe misses than the node's VICTIMS staging slots. Forced misses past the staging
-            # overflow (never trap); each flagged verify re-runs exactly, and the post counted each flag once.
             before = updater.gather_overflow[0].item()
-            flagged = 0
-            for extra in range(2, 2 + LANES - VICTIMS):
-                cold = [e for e in outsiders() if e not in ram_set][: VICTIMS + extra]
-                routes = [[cold[(t + k) % len(cold)] if k < 2 else ram_set[(t + k) % LANES] for k in range(TOP_K)]
-                          for t in range(TOKENS)]
-                if replay(routes):
-                    flagged += 1
-                    rerun_is_exact(routes)
-                    break
-            assert flagged == 1, "no union of cold misses exhausted the staging"
-            assert updater.gather_overflow[0].item() - before == flagged
+
+            # Review Focus 5: 36 distinct RAM-resident experts, a lane each.
+            in_ram(warm)
+            served_without_overflow(_distinct(warm))
+
+            # Review Focus 2: 36 distinct cold experts, every one an NVMe miss on the one node. The live ones stage, the
+            # forced ones are read into RAM victims, and all stay cached in the tier afterwards.
+            cold = [e for e in outsiders() if e not in warm][:LANES]
+            assert len(cold) == LANES
+            served_without_overflow(_distinct(cold))
+            resident = {e for e, s in enumerate(service.host.mapping(0).tolist()) if s >= 0}
+            assert len(set(cold) - resident) <= VICTIMS, "the forced misses are cached in their RAM victims"
+            assert updater.gather_overflow[0].item() == before, "no armed verify overflowed"
     finally:
         service.shutdown()
 ```
-The last block widens the cold set until a forced miss finds no staging slot. Which plan lanes DIRECT makes live (and
-so which misses take staging first) is not known in advance. The bar is fixed: never a trap (`fail_stop_check`), an
-exact re-run when flagged (`rerun_is_exact`), and one counter increment per flag. Record the routes that tripped it.
+`service.host.mapping(row)` is the host mirror of a row's expert→RAM-slot map (`ExpertStreamHost.mapping`, used by
+`lease_chain_rig.Chain`). Staging misses whose victim the tier skipped may be uncached, hence the `<= VICTIMS`.
 
 - [ ] **Step 2: Run on divix01**
 
@@ -2005,17 +3247,17 @@ PYTHONPATH=$PWD/python CUDA_MODULE_LOADING=EAGER SGLANG_DSV41_CPU_EXPERTS=1 EXL3
   2>&1 | tail -20; echo "EXIT=${PIPESTATUS[0]}"
 ```
 Expected: `EXIT=0`. If it fails, debug with `superpowers:systematic-debugging` before changing the bar. A
-`fail_stop` or `__trap` is a defect in Tasks 3-8. It is never a reason to drop an assertion.
+`fail_stop` or `__trap` is a defect in Tasks 2-10. It is never a reason to drop an assertion.
 
 - [ ] **Step 3: Re-run the D2-2 rig and the BS1 graph suites** (same locks, cores 32-63):
-`test/manual/dsv41/test_exl3_verify_miss_lanes_gpu.py test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py test/manual/dsv41/test_exl3_graph_apply_gpu.py`.
+`test/manual/dsv41/test_exl3_verify_miss_lanes_gpu.py test/manual/dsv41/test_exl3_ram_miss_graph_gpu.py test/manual/dsv41/test_exl3_graph_apply_gpu.py test/manual/dsv41/test_bs1_build_digest.py`.
 Expected: `EXIT=0`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add test/manual/dsv41/test_exl3_verify_cpu_spill_gpu.py
-git commit -m "test(exl3-cpu-experts): a captured 6-token verify spills its victimless lanes to the CPU, end to end
+git commit -m "test(exl3-cpu-experts): a 36-lane verify spills to the CPU end to end and never overflows once armed
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
@@ -2023,13 +3265,15 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 10: The gate admits the target's CPU experts under a graphed DSpark verify
+### Task 12: The gate admits the target's CPU experts under a graphed DSpark verify
 
 The refusal at `expert_stream_requirements_exl3.py:171-181` dates from `3937a8833a` (2026-09-30), before a verify
 could run in the breakable graph. The narrowest change:
 - CPU experts still require the breakable decode graph.
-- Under speculation they ride `_check_graphed_verify`, which already admits only DSpark, static verify, DIRECT, and 1-32
-  miss lanes, with a remedy that does not point at eager decode.
+- Under speculation they ride `_check_graphed_verify`, which already admits only DSpark, static verify and DIRECT,
+  with a remedy that does not point at eager decode.
+- Its miss-lane rule follows Task 2's wider wire. `MISS_LANES` may be 1-64, or unset (a lane per route) when
+  `VICTIM_LANES` is set. Spill always has a lane per route, so the gate refuses `VICTIM_LANES` with `MISS_LANES` set.
 - A non-speculative launch takes exactly today's path.
 
 **Files:**
@@ -2037,13 +3281,17 @@ could run in the breakable graph. The narrowest change:
 - Test: `test/registered/unit/test_expert_stream_requirements_exl3.py`
 
 **Interfaces:**
-- Produces: `_check_graphed_verify(cfg, remedy: str = _EAGER_VERIFY_REMEDY)`, `_CPU_EXPERTS_VERIFY_REMEDY`.
+- Produces: `_check_graphed_verify(cfg, remedy: str = _EAGER_VERIFY_REMEDY)`, `_CPU_EXPERTS_VERIFY_REMEDY`,
+  `_check_victim_lanes()`.
 
 - [ ] **Step 1: Update and add tests**
 
-In the parametrize of `test_a_graphed_dspark_verify_needs_its_configuration`, replace the last row with
-`({}, {**GRAPHED_VERIFY, "SGLANG_DSV41_CPU_EXPERTS": True}, "SGLANG_DSV41_CPU_EXPERTS needs"),` and change the
-function's tail to:
+In the parametrize of `test_a_graphed_dspark_verify_needs_its_configuration`:
+- the `MISS_LANES` 0 row now matches `"MISS_LANES=1-64"`;
+- the `MISS_LANES` 33 row becomes 65, matching `"MISS_LANES=1-64"`;
+- the last row is replaced with
+  `({}, {**GRAPHED_VERIFY, "SGLANG_DSV41_CPU_EXPERTS": True}, "SGLANG_DSV41_CPU_EXPERTS needs"),`.
+Then change the function's tail to:
 ```python
     if match != "SGLANG_DSV41_CPU_EXPERTS needs":
         assert "--cuda-graph-backend-decode disabled" in str(raised.value)
@@ -2067,21 +3315,20 @@ def test_cpu_experts_need_the_breakable_decode_graph(model_dir, changes, env):
 
 
 DSPARK_BREAKABLE = dict(speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1)
+# The recipe's DSpark mode: a lane per route (MISS_LANES unset), 8 victim lanes.
+SPILL = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True, **DIRECT, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": 8}
 
 
 def test_cpu_experts_with_a_graphed_dspark_verify_pass(model_dir):
     _gate(_launch(model_dir, **DSPARK_BREAKABLE), **CPU_EXPERTS_ENV, **GRAPHED_VERIFY)
-    _gate(
-        _launch(model_dir, **DSPARK_BREAKABLE), **CPU_EXPERTS_ENV, **GRAPHED_VERIFY,
-        SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES=32, SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES=8,
-    )
+    _gate(_launch(model_dir, **DSPARK_BREAKABLE), **CPU_EXPERTS_ENV, **SPILL)
 
 
 @pytest.mark.parametrize(
     "launch, env, match",
     [
         ({"speculative_algorithm": "EAGLE"}, GRAPHED_VERIFY, "graphs the verify of DSpark only"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-32"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-64"),
         ({}, {**GRAPHED_VERIFY, "SGLANG_RAGGED_VERIFY_MODE": "compact"}, "SGLANG_RAGGED_VERIFY_MODE=static"),
     ],
 )
@@ -2097,15 +3344,16 @@ def test_cpu_experts_under_speculation_need_the_graphed_dspark_verify(model_dir,
 @pytest.mark.parametrize(
     "env, match",
     [
-        ({"SGLANG_DSV41_CPU_EXPERTS": False, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": 4}, "needs SGLANG_DSV41_CPU_EXPERTS=1"),
-        ({"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": 8}, "below SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"),
+        ({"SGLANG_DSV41_CPU_EXPERTS": False}, "needs SGLANG_DSV41_CPU_EXPERTS=1"),
+        ({"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 36}, "unset SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"),
     ],
 )
-def test_victim_lanes_need_cpu_experts_and_fewer_than_the_miss_lanes(model_dir, env, match):
+def test_victim_lanes_need_cpu_experts_and_a_lane_per_route(model_dir, env, match):
+    """Spill's victimless lanes are the CPU's, and its record has a lane per route, so a 6-token verify never
+    outnumbers its lanes (Review Focus 5)."""
     with pytest.raises(ValueError, match=match):
-        _gate(_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **GRAPHED_VERIFY, **env})
+        _gate(_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **SPILL, **env})
 ```
-`GRAPHED_VERIFY` has `MISS_LANES` 8, so V = 8 is not below it.
 
 - [ ] **Step 2: Run and see them fail** — `test/registered/unit/test_expert_stream_requirements_exl3.py`, CPU.
 Expected: failures in the new tests, still refused "without speculative decoding".
@@ -2120,22 +3368,33 @@ _CPU_EXPERTS_VERIFY_REMEDY = "SGLANG_DSV41_CPU_EXPERTS serves the DSpark verify 
 
 def _check_graphed_verify(cfg, remedy: str = _EAGER_VERIFY_REMEDY) -> None:
 ```
-Inside, replace each `{_EAGER_VERIFY_REMEDY}` with `{remedy}`. Then:
+Inside, replace each `{_EAGER_VERIFY_REMEDY}` with `{remedy}`. Replace the lane rule
+`and 1 <= lanes <= 32` with
+```python
+        and (1 <= lanes <= 64 or (lanes == 0 and envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get() > 0))
+```
+In its message, `f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES=1-32 (got {lanes}): a verify routes more experts than the
+32 lanes; {remedy}"` becomes `f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES=1-64, or unset with
+SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES (got {lanes}): a lane per route needs spill's CPU lanes; {remedy}"`.
+Then:
 ```python
 def _check_victim_lanes() -> None:
-    """SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES: spill needs the CPU to take the victimless lanes."""
+    """SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES (spill): the CPU takes the lanes past the victims, and every route has
+    a lane, so a verify's distinct misses never outnumber its lanes."""
     victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
     if not victims:
         return
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         raise ValueError(f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} needs SGLANG_DSV41_CPU_EXPERTS=1")
     lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
-    if not 1 <= victims < lanes:
+    if lanes:
         raise ValueError(
-            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} must be below "
-            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES={lanes}"
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES (got {lanes})"
         )
 ```
+(`victims` below the routes is the updater's check, `GpuResidencyUpdater._init_insert_direct`: the gate does not know the
+verify width.)
 In `_check`, replace the CPU-experts refusal and the speculative block:
 ```python
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
@@ -2154,8 +3413,9 @@ In `_check`, replace the CPU-experts refusal and the speculative block:
 Module docstring: replace the speculative bullet with:
 ```
 * Speculative decoding as DSpark: its verify eager (decode graphs disabled), or in the breakable decode graph on DIRECT
-  residency at 1-32 miss lanes with a static verify (§33.8). The target's CPU experts serve that graphed verify; with
-  SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES below the miss lanes, the lanes past the victims are theirs (spill).
+  residency at 1-64 miss lanes with a static verify (§33.8). The target's CPU experts serve that graphed verify; with
+  SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES (and a lane per route: MISS_LANES unset) the lanes past the victims are
+  theirs (spill).
 ```
 In `_check_dspark_cpu_experts`, the comment "SGLANG_DSV41_CPU_EXPERTS, which also selects it, is refused under
 speculation, so these two defines are the way in" becomes "SGLANG_DSV41_CPU_EXPERTS also selects it, but a draft-only
@@ -2175,17 +3435,17 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 11: The recipe's DSpark mode and the production switch
+### Task 13: The recipe's DSpark mode and the production switch
 
 Which of the DSpark arms' overrides are still required with a graphed verify, and why (research, 2026-10-06):
 
 | Override in `ab_cpu_draft.COMMON` | Verdict for this mode | Evidence |
 |---|---|---|
-| `SGLANG_DSV41_CPU_EXPERTS=0` | **Dropped**: the point of this plan | Tasks 3-10 |
+| `SGLANG_DSV41_CPU_EXPERTS=0` | **Dropped**: the point of this plan | Tasks 2-12 |
 | `SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS=0` | **Required** | `layer_major/gate.py:38-50` refuses any speculative algorithm |
 | `SGLANG_DSV41_ENABLE_PREFILL_FILLS=0` | **Dropped** | refused only without graph gather (`exl3_expert_format.py:226-231`); `graphed_verify.py` already keeps 1 |
 | `SGLANG_MOE_EXPERT_GRAPH_GATHER/GPU_RESIDENCY_UPDATE/INSERT_ON_MISS_STAGE/FUSED_PLAN=0` | **Dropped** | the graphed verify needs them on (`_check_graphed_verify`) |
-| `SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING=0`, `..._ENGRAM_DEVICE_WAIT=0` | **Dropped**, with a fallback | A verify never takes the native captured lookup (`engram.py:124-139`: one token, decode mode); it runs the eager break, and the uring store serves N tokens (`engram_file_table.py:147-163`). Device wait engages only in a one-token decode capture, which a DSpark target never captures. No DSpark run has had them on, so Task 13's smoke checks them, with the fallback named there. |
+| `SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING=0`, `..._ENGRAM_DEVICE_WAIT=0` | **Dropped**, with a fallback | A verify never takes the native captured lookup (`engram.py:124-139`: one token, decode mode); it runs the eager break, and the uring store serves N tokens (`engram_file_table.py:147-163`). Device wait engages only in a one-token decode capture, which a DSpark target never captures. No DSpark run has had them on, so Task 15's smoke checks them, with the fallback named there. |
 | `SGLANG_SM120_FLASHMLA_BACKEND=triton` | **Kept** | No refusal: flashinfer handles up to 64 query rows (`flash_mla_sm120.py:212, 317-341`). But every DSpark text result (§33.2, §33.8, §33.9) is triton, and §33.2 names the sm120 attention at 6 rows as a drift suspect. Dropping it is its own A/B. |
 | `SGLANG_EXL3_CPU_ACT_RESIDUAL=1`, `SGLANG_EXL3_CPU_ACT_BLOCK=128` | **Kept** | `_check_dspark_cpu_experts` requires them; with CPU experts on they equal the build's own values (`ext.py:76-89`) |
 
@@ -2208,7 +3468,7 @@ Which of the DSpark arms' overrides are still required with a graphed verify, an
 `benchmarks/dsv41_baseline/test_dspark_recipe.py`:
 ```python
 """The DSpark mode of the recipe: both CPU-expert clients on, the graphed verify's configuration, and argv the server
-parses as DSpark (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 11)."""
+parses as DSpark (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 13)."""
 
 import argparse
 
@@ -2220,7 +3480,8 @@ def test_dspark_env_turns_both_cpu_expert_clients_on_with_spill():
     assert env["SGLANG_DSV41_CPU_EXPERTS"] == "1"
     assert env["SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS"] == "1"
     assert env["SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES"] == "12-15"
-    assert (env["SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"], env["SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES"]) == ("32", "8")
+    assert "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES" not in env  # a lane per route: 36 on a 40-lane wire
+    assert env["SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES"] == "8"
     assert env["SGLANG_RAGGED_VERIFY_MODE"] == "static"
     assert env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "0"
     assert env["SGLANG_MOE_HOT_GPU_MB"] == "12040"
@@ -2274,7 +3535,7 @@ Expected: `AttributeError: module 'arm_env' has no attribute 'dspark_env'`. The 
 After `PROD_HOST`:
 ```python
 # DSpark with both CPU-expert clients (plan 2026-10-06-dsv41-dspark-both-cpu-experts). Production serves it only once
-# PROD_DSPARK is True (Owner decision 1, the A/B of that plan's Task 13).
+# PROD_DSPARK is True (Owner decision 1, the A/B of that plan's Task 15).
 PROD_DSPARK = False
 DSPARK_DRAFT = f"{CC}/dsv41-dspark-draft"
 # Each stage's top-32 draft experts stay on the GPU, the other 96 on the CPU (§33.4).
@@ -2291,10 +3552,10 @@ DSPARK_ARGV = (
 
 def dspark_env() -> dict[str, str]:
     """The DSpark mode's overrides on base_env: the graphed verify with the target's CPU experts and spill, and the
-    draft's CPU experts. Every value's reason is in the plan's Task 11 table."""
+    draft's CPU experts. Every value's reason is in the plan's Task 13 table."""
     return {
-        # The verify in the breakable decode graph at a 32-lane record, 8 of them VRAM victims; the rest are CPU lanes.
-        "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": "32",
+        # The verify in the breakable decode graph with a lane per route (MISS_LANES unset: 36 lanes, a 40-lane wire),
+        # the first 8 VRAM victims; the rest are CPU lanes, a miss among them read into a RAM victim (Owner decision 3).
         "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": "8",
         "SGLANG_RAGGED_VERIFY_MODE": "static",
         # Layer-major prefill refuses speculative decoding (layer_major/gate.py).
@@ -2348,7 +3609,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 12: A/B tooling: accept length from the driver, the text band, the three-arm driver
+### Task 14: A/B tooling: accept length from the driver, the text band, the three-arm driver
 
 **Files:**
 - Modify: `scripts/expert_prediction/benchmarks/run_capture_sessions.py`
@@ -2526,7 +3787,7 @@ if __name__ == "__main__":
 
 `analysis/dsv41-drive/dspark/both_cpu_ab.py`:
 ```python
-"""Server A/B (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 13): today's production recipe against DSpark with
+"""Server A/B (plan 2026-10-06-dsv41-dspark-both-cpu-experts Task 15): today's production recipe against DSpark with
 both CPU-expert clients, and DSpark with the draft's only (the target's CPU experts off, §33.9's configuration in a
 server) to isolate them.
 
@@ -2660,6 +3921,7 @@ def summarize(out: str) -> dict:
             graphed = last.get("counters", {}).get("graphed_verify")
             if graphed and graphed.get("graphed_verify_ct"):
                 entry["reverify_rate"] = graphed["verify_overflow_ct"] / graphed["graphed_verify_ct"]
+                entry["reverify_ct"] = graphed["verify_overflow_ct"]
         probes = {a: os.path.join(out, f"{a}.probe.json") for a in ("prod", arm)}
         if arm != "prod" and all(os.path.exists(p) for p in probes.values()):
             with open(probes["prod"]) as f:
@@ -2708,7 +3970,7 @@ Claude-Session: https://claude.ai/code/session_01Y3EXKJdMpP7nwX3qcBi8Vq"
 
 ---
 
-### Task 13: Smoke, then the server A/B on divix01, then §33.10
+### Task 15: Smoke, then the server A/B on divix01, then §33.10
 
 Needs a GPU window: production down, owned by the owner. The executor waits on the locks.
 
@@ -2733,8 +3995,9 @@ absence as a failure:
 3. The decode graph captured as `TARGET_VERIFY`, and `exl3 RAM miss copy engine armed after`.
 4. No `fail-stop`, `__trap`, `RemoteDisconnected`, `CUDA error`, or `out of memory`.
 5. The KV pool line (`max_total_num_tokens`). Record it for Step 2's bar.
-6. The CPU calibration line (`CPU experts group N: ... split`, or the `calibration skipped/failed` warning), with how
-   long startup took from `Load weight end` to `/health` 200.
+6. The wire and room: the service logs a 40-lane build, and no layer was refused by the spill room check (Task 10). The
+   CPU calibration line (`CPU experts group N: ... split`, measured to 8 lanes, or the `calibration skipped/failed`
+   warning), and how long startup took from `Load weight end` to `/health` 200.
 
 Engram fallback: if the log shows an Engram failure (`engram` in a traceback), re-run with
 `SGLANG_DSV41_ENGRAM_HOST_NODE_CACHE_URING=0 SGLANG_DSV41_ENABLE_ENGRAM_DEVICE_WAIT=0` appended. Then commit that pair
@@ -2750,8 +4013,14 @@ Bars, each recorded from `$G/ab/summary.json` and the logs:
 1. All three arms finish with `rc=0`, with no fail-stop or trap.
 2. `dspark-both` and `dspark-draft-only` both have `text_vs_prod.pass` true: every first divergence from production
    is within 1.4 nats of production's argmax (§33.2, §33.9). Report the flips and `max_gap`.
-3. `dspark-both.reverify_rate` is strictly below `dspark-draft-only.reverify_rate` (which §33.8/§33.9 put at 1.00).
-   That is the spill working.
+3. **No verify re-runs in steady state.** Two checks on `dspark-both`:
+   - `reverify_ct` must not exceed the verifies the server ran before its copy engine armed. That count is the `N` of
+     `exl3 RAM miss copy engine armed after N decode forwards` in the server log, plus one for the warm-up's stale
+     flag.
+   - `gather_overflow` must not grow after the armed line. Read the per-layer counters from the metrics file's first
+     and last records after arming.
+   For contrast, report `dspark-draft-only.reverify_rate`, which §33.8/§33.9 put at 1.00. Any armed overflow is a
+   failed bar and a defect in Tasks 2-10, not noise.
 4. `dspark-both`'s server log shows nonzero target CPU-expert jobs (the periodic `CPU experts group` stats).
 5. `dspark-both`'s KV pool is at least the `prod` arm's.
 6. Report for all three: `ms_per_token_median` with the per-session list, `accept_length`, and the reverify rate.
@@ -2761,7 +4030,7 @@ A failed bar is reported as failed, with its numbers. Do not re-run an arm to ge
 
 - [ ] **Step 3: Write §33.10** in `DSV41_REFERENCE.md`, after §33.9's "What this plan does not do" list:
   - the commit and the plan;
-  - what changed (Tasks 2-11, one line each);
+  - what changed (Tasks 2-13, one line each);
   - Steps 1-2's commands;
   - a table of the three arms × (ms/token median, accept length, reverify rate, text pass and max gap, KV pool);
   - each bar's verdict;
@@ -2783,7 +4052,7 @@ git push origin dsv41-dspark-both-cpu
 
 ---
 
-### Task 14: Flip production to DSpark (owner-gated)
+### Task 16: Flip production to DSpark (owner-gated)
 
 Run only on the owner's go (Owner decision 1), given in their own words after reading §33.10.
 
@@ -2820,24 +4089,33 @@ git push origin dsv41-dspark-both-cpu
 
 ---
 
-## Self-review notes (writer's pass, 2026-10-06)
+## Self-review notes (writer's pass, 2026-10-06, after amendments A and B)
 
 - **Spec coverage.**
-  - Both clients at once: Tasks 3-11.
-  - The verify, graphed (Tasks 3-9) and eager re-verify: unchanged and GPU-only (Owner decision 5), its rate measured
-    in Task 13.
-  - The overflow fallback: Tasks 3 and 7.
+  - Both clients at once: Tasks 2-13.
+  - The verify, graphed: Tasks 2-11. The eager re-verify is unchanged and GPU-only, and in steady state it never runs
+    (Owner decision 5). Task 15 bounds its count by the pre-arming verifies.
+  - Amendment A, a record a 6-token verify cannot exceed: Task 2 (40-lane wire, u64 masks, shared kernels, BS1 digest)
+    and Task 8 (spill requires a lane per route; the clamp asserts).
+  - Amendment B, forced misses always land: Tasks 3-4 (no staging for forced misses), Task 9 (host-placed into RAM
+    victims) and Task 10 (start-up room check). The costs are in Owner decision 3.
+  - The one overflow left (case 1): Tasks 4 and 11.
   - Prefill: unchanged. The target's CPU experts type lanes only on a captured post (`lease_kernels.cuh:151`), prefill
     is eager, and the DSpark draft does not run at prefill (`dspark_worker_v2.py:653-745`).
-  - Cores: Owner decision 2 and Task 11's layout test.
+  - Cores: Owner decision 2 and Task 13's layout test.
   - Lease and pinned-tier interplay: separate channels and areas (`LEASE_PROTOCOL.md:71`); strictly sequential on one
-    stream; draft weights pageable, not tier rows (`exl3.py:431-441`). Task 8 documents it.
-  - Gate: Task 10. Recipe and launch: Task 11. Validation: Tasks 2-9, 12, 13.
+    stream; draft weights pageable, not tier rows (`exl3.py:431-441`). Forced misses take tier victims only in the
+    target's own rows. Task 10 documents it.
+  - Gate: Task 12. Recipe and launch: Task 13. Validation: Tasks 2-11, 14, 15.
 - **Type consistency.**
-  - The FFI tail order is `cpu_x, cpu_x_dst, cpu_weights, cpu_tokens_max, cpu_x_token_bytes, spill, overflow_flag,
-    gather_overflow, use_pdl` in Tasks 3, 4 and 6's raw calls.
-  - `victim_lanes` is used in Tasks 7, 8 and 10.
-  - `cpu_row_bytes(hidden, tokens, lanes)` is used in Tasks 4, 5 and 8.
-  - `spill = (overflow_flag, gather_overflow[row:row+1])` is used in Tasks 3 and 8.
-- **Known open item, not a placeholder.** Task 9's last block cannot know in advance which plan lanes DIRECT makes
-  live, so it widens the cold set until staging runs out. Its bar is fixed; the routes that trip it are recorded.
+  - The post's FFI tail order is `cpu_x, cpu_x_dst, cpu_weights, cpu_tokens_max, cpu_x_token_bytes, spill,
+    overflow_flag, gather_overflow, use_pdl` in Tasks 4 and 5 and their raw-call edits.
+  - The mask words are `ce_mask` {lo, cpu lo, parts, hi, cpu hi} and `cpu_lanes` {cpu lo, parts, cpu hi}, in Task 2's
+    CW/CC, route tables, commit and transport.
+  - `victim_lanes` is used in Tasks 8, 10 and 12.
+  - `cpu_row_bytes(hidden, tokens, lanes)` is used in Tasks 5, 6 and 10.
+  - `spill = (overflow_flag, gather_overflow[row:row+1])` is used in Tasks 4 and 10.
+  - Lane slot −1 for a forced miss is used in Tasks 3, 4 and 9.
+- **Known open item, not a placeholder.** The BS1 digest's host `.text` comparison is meaningful only within Task 2.
+  Tasks 6 and 9 change the host on purpose, so the permanent test compares device kernels, and the host's BS1
+  behaviour stays pinned by `test_expert_stream_hotpath_golden.py`.
