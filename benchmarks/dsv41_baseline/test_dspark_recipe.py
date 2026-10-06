@@ -16,7 +16,8 @@ def test_dspark_env_turns_both_cpu_expert_clients_on_with_spill():
     assert env["SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES"] == "8"
     assert env["SGLANG_RAGGED_VERIFY_MODE"] == "static"
     assert env["SGLANG_LAYER_MAJOR_PREFILL_MIN_TOKENS"] == "0"
-    assert env["SGLANG_MOE_HOT_GPU_MB"] == "12040"
+    # Budget A (mem-budget-report.md L2): the DSpark arms trade hot cache for prefill headroom.
+    assert env["SGLANG_MOE_HOT_GPU_MB"] == "10840"
     assert env["SGLANG_DSV41_ENABLE_PREFILL_FILLS"] == "1"  # the recipe's, kept
 
 
@@ -24,6 +25,17 @@ def test_prod_is_unchanged_until_the_switch():
     assert arm_env.PROD_DSPARK is False
     assert arm_env.prod_env() == arm_env.base_env()
     assert "--speculative-algorithm" not in arm_env.ServerArgs.prod().argv()
+    assert arm_env.prod_env()["SGLANG_MOE_HOT_GPU_MB"] == "16080"
+    prod = arm_env.ServerArgs.prod().argv()
+    assert prod[prod.index("--mem-fraction-static") + 1] == "0.875"
+
+
+def test_dspark_server_args_use_the_dspark_mem_fraction():
+    assert arm_env.DSPARK_MEM_FRACTION_STATIC == "0.78"
+    argv = arm_env.ServerArgs(port=1, dspark=True).argv()
+    assert argv[argv.index("--mem-fraction-static") + 1] == "0.78"
+    argv = arm_env.ServerArgs(port=1).argv()
+    assert argv[argv.index("--mem-fraction-static") + 1] == "0.875"
 
 
 def test_the_dspark_argv_parses_as_dspark_at_block_size_5():

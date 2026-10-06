@@ -43,3 +43,17 @@ def test_a_dspark_arm_gets_a_health_budget_past_its_measured_startup_and_run_arm
     script = open(os.path.join(ROOT, "benchmarks", "dsv41_baseline", "run_arm.sh")).read()
     assert "${DSV41_HEALTH_TIMEOUT_S:-900}" in script
     assert "seq 1 $((health_timeout_s / 5))" in script
+
+
+def test_the_timed_dspark_arms_take_the_recipes_mem_fraction_and_prod_does_not(monkeypatch):
+    ab = _ab()
+    monkeypatch.delenv("DSV41_MEM_FRACTION_STATIC", raising=False)
+    envs = {}
+    monkeypatch.setattr(
+        ab.subprocess, "run", lambda cmd, env, cwd: envs.update({cmd[1]: env}) or type("R", (), {"returncode": 0})()
+    )
+    for arm in ab.ARMS:
+        ab.run_timed(arm, "/out")
+    assert envs["dspark-both"]["DSV41_MEM_FRACTION_STATIC"] == "0.78"
+    assert envs["dspark-draft-only"]["DSV41_MEM_FRACTION_STATIC"] == "0.78"
+    assert "DSV41_MEM_FRACTION_STATIC" not in envs["prod"]
