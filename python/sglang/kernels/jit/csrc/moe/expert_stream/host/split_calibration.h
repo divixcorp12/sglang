@@ -53,6 +53,7 @@ struct CalibrationSetup {
   HostCopyBackend* host_backend = nullptr;  // set: release each mark (the test backend completes only released ones)
   uint64_t scratch = 0;                     // `lanes` experts: entry e's rows at its own offset
   int lanes = kCalibLanes;  // the most lanes measured, 1..kCalibLanes (spill: the victim lanes)
+  int tokens = 1;           // above 1: the CPU jobs are per_token, of this many rows (a verify's), as a record's are
   int reps = 1;                             // timed repetitions per cell, after one discarded warm-up
   int64_t timeout_ns = 0;                   // per measurement
 };
@@ -65,7 +66,7 @@ inline int64_t calibration_expert_bytes(std::span<const CopyEntry> entries) {
   return bytes;
 }
 
-// Runs k CPU lanes on host slots first_slot.. first_slot + k - 1 and the DMA of m experts from the k slots after them,
+// Runs k CPU lanes (per_token jobs of s.tokens rows when that is above 1) on host slots first_slot.. first_slot + k - 1 and the DMA of m experts from the k slots after them,
 // started together, and returns the ns from the start until both are observed done (queueing and wake-up included).
 // Either side may be empty. Throws on a failed copy, a full CPU ring, or past the timeout.
 inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
@@ -76,9 +77,11 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
     job.row = s.row;
     job.part = 0;
     job.k = k;
+    job.per_token = s.tokens > 1;  // the token table (write_calibration_table) routes every token to every lane
     for (int i = 0; i < k; ++i) {
       job.slots[i] = static_cast<int32_t>(s.first_slot + i);
       job.weights[i] = 1.0f;
+      job.lanes[i] = i;
     }
     job.seq = seq = s.cpu->claim(1);
     if (!s.cpu->submit(job)) throw std::runtime_error("calibration: the CPU expert ring is full");

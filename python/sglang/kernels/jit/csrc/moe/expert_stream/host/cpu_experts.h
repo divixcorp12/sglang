@@ -223,6 +223,34 @@ class CpuExpertEngine {
     return config_.layers->get(row) != nullptr;
   }
 
+  /// Tokens a row holds (CpuExpertConfig::tokens).
+  int64_t tokens() const {
+    return config_.tokens;
+  }
+
+  /// Calibration only (the tier's owner, copy engine not armed, so no record writes or reads the row): makes `row`'s
+  /// token table that of a verify of `tokens` tokens that routes every job lane with weight 1, so a per_token CpuJob
+  /// whose lanes[i] = i runs `tokens` rows of all its k lanes. The row's staged inputs are left as they are: the
+  /// timing does not depend on them. The tables are the pinned rows the Python service owns and the post kernel writes
+  /// (cpu_token_table.h); the const is only the engine's own read-only view of them.
+  void write_calibration_table(int64_t row, int64_t tokens) const {
+    constexpr int64_t kLanes = wire::Wire::kLanes;
+    if (tokens < 1 || tokens > config_.tokens)
+      throw std::runtime_error(
+          prefix_ + "calibration tokens " + std::to_string(tokens) + " is not within the rows' 1.." +
+          std::to_string(config_.tokens));
+    if (tokens == 1) return;
+    uint8_t* table = const_cast<uint8_t*>(config_.x_base) + row * config_.x_stride + config_.tokens * config_.x_token_bytes;
+    const auto store = [](uint8_t* at, uint32_t v) { std::memcpy(at, &v, sizeof v); };
+    store(table, static_cast<uint32_t>(tokens));
+    const uint32_t mask = tokens == 32 ? ~0u : (1u << tokens) - 1u;
+    for (int64_t lane = 0; lane < kLanes; ++lane)
+      store(table + CpuTokenTable::kHeaderBytes + 4 * lane, mask);
+    for (int64_t t = 0; t < tokens; ++t)
+      for (int64_t lane = 0; lane < kLanes; ++lane)
+        store(table + CpuTokenTable::kHeaderBytes + 4 * kLanes + 4 * (t * kLanes + lane), std::bit_cast<uint32_t>(1.0f));
+  }
+
   /// Tier owner only: the first of `n` consecutive sequences for jobs it will submit, in order. An unsubmitted sequence
   /// is skipped (done() of a later one covers it), so a record can claim one per possible job.
   uint32_t claim(int n) {

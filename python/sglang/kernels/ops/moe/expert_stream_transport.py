@@ -1894,6 +1894,7 @@ class ExpertStreamHost:
         timeout_s: float = 1.0,
         group: int = 0,
         lanes: Optional[int] = None,
+        tokens: int = 1,
     ) -> torch.Tensor:
         """Run the CPU split's startup calibration on ``row``, on group ``group``'s engine and RAM slots.
 
@@ -1901,7 +1902,9 @@ class ExpertStreamHost:
         row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no
         thread). ``device`` -1 copies with the test backend; ``scratch`` holds
         one expert per lane (``wire.lanes`` of them) on that device. ``lanes`` caps the lanes measured (default the
-        wire's); cells past it stay 0, and ``scratch`` needs that many experts. Raises RuntimeError on failure.
+        wire's); cells past it stay 0, and ``scratch`` needs that many experts. ``tokens`` above 1 times per-token CPU jobs
+        of that many rows with every token routing every lane, the job a verify's record runs (at most the rows' tokens).
+        Raises RuntimeError on failure.
         """
         out = torch.zeros(calibration_shape(self.wire.lanes), dtype=torch.float64)
         self._module.expert_stream_calibrate_cpu_split(
@@ -1911,6 +1914,7 @@ class ExpertStreamHost:
             int(device),
             int(reps),
             int(lanes or self.wire.lanes),
+            int(tokens),
             scratch.data_ptr(),
             scratch.numel() * scratch.element_size(),
             int(timeout_s * 1e9),

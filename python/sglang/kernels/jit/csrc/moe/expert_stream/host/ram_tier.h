@@ -818,7 +818,8 @@ class RamTier {
 
   // Runs the startup calibration of the CPU split (split_calibration.h) and fills `out`, float64
   // [kCalibRows][kCalibCols] in ms. The caller must own the tier, since it claims CPU job sequences, which are the
-  // owner's. device -1 copies with the test backend; `scratch` holds `lanes` experts on that device. Throws on bad
+  // owner's. `tokens` above 1 measures per_token CPU jobs of that many rows, a verify's. device -1 copies with the test
+  // backend; `scratch` holds `lanes` experts on that device. Throws on bad
   // arguments, a failed copy or a timeout.
   void calibrate_cpu_split(
       int g,
@@ -826,6 +827,7 @@ class RamTier {
       int64_t device,
       int64_t reps,
       int64_t lanes,
+      int64_t tokens,
       uint64_t scratch,
       int64_t scratch_bytes,
       int64_t timeout_ns,
@@ -848,6 +850,10 @@ class RamTier {
     if (reps < 1 || timeout_ns <= 0) throw std::runtime_error(prefix + "reps and the timeout must be positive");
     if (lanes < 1 || lanes > kCalibLanes)
       throw std::runtime_error(prefix + "lanes must be 1.." + std::to_string(kCalibLanes));
+    if (tokens < 1 || tokens > cpu->tokens())
+      throw std::runtime_error(
+          prefix + "tokens " + std::to_string(tokens) + " is not within the CPU rows' 1.." +
+          std::to_string(cpu->tokens()));
     CalibrationSetup s;
     s.cpu = cpu.get();
     s.first_slot = own.lo;
@@ -879,6 +885,8 @@ class RamTier {
     s.scratch = scratch;
     s.reps = static_cast<int>(reps);
     s.lanes = static_cast<int>(lanes);
+    s.tokens = static_cast<int>(tokens);
+    cpu->write_calibration_table(row, tokens);
     s.timeout_ns = timeout_ns;
     calibrate_split(s, out);
     shutdown.idle = true;

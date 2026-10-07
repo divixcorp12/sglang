@@ -119,6 +119,7 @@ class CpuExpertService:
         self.slabs_by_row = dict(slabs_by_row)
         self.hidden, self.cores, self.threads = int(hidden), tuple(cores), int(threads)
         self.split = list(split)
+        self.tokens = int(tokens)  # a verify's tokens per row: calibration times jobs of this shape
         self.calibration_lanes = min(int(calibration_lanes or self.lanes), self.lanes)
         self.calibrated = False
         self._calibration_stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
@@ -305,7 +306,8 @@ class CpuExpertService:
                 device="cpu" if device < 0 else torch.device("cuda", device),
             )
             grid = self.host.calibrate_cpu_split(
-                row, device=device, reps=reps, scratch=scratch, group=self.group, lanes=width
+                row, device=device, reps=reps, scratch=scratch, group=self.group, lanes=width,
+                tokens=self.tokens,
             ).tolist()
         except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
             # A timed-out DMA may still write into the scratch: keep its block out of
