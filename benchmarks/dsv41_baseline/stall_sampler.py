@@ -87,8 +87,18 @@ def main():
                         # Linux comm may truncate the process title to 15 bytes.
                         if not directory.joinpath("comm").read_text().strip().startswith("sglang::sched"):
                             continue
-                        if wanted in directory.joinpath("environ").read_bytes().split(b"\0"):
-                            selected = directory
+                        # setproctitle can rewrite the scheduler's original environ area. Its launch ancestor
+                        # retains the exact unique prefix; inspect ancestors without dumping their environments.
+                        ancestor = directory
+                        for _ in range(4):
+                            if wanted in ancestor.joinpath("environ").read_bytes().split(b"\0"):
+                                selected = directory
+                                break
+                            parent = ancestor.joinpath("stat").read_text().rsplit(")", 1)[1].split()[1]
+                            if parent == "0":
+                                break
+                            ancestor = Path("/proc") / parent
+                        if selected is not None:
                             break
                     except OSError:
                         continue
