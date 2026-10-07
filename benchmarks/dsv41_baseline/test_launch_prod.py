@@ -83,13 +83,15 @@ def test_stop_with_nothing_running_succeeds(tmp_path):
 def test_stop_fails_while_another_job_still_holds_the_gpu_lock(tmp_path):
     lock = tmp_path / "gpu.lock"
     holder = subprocess.Popen(["flock", str(lock), "sleep", "300"])
+    prod = _stand_in(PORT)
     try:
         time.sleep(0.3)
         r = _run(tmp_path, "stop", LAUNCH_PROD_LOCK_WAIT_S=1)
+        assert _gone(prod)
         assert r.returncode != 0
         assert "cc-gpu.lock" in r.stderr
     finally:
-        _kill(holder)
+        _kill(holder, prod)
 
 
 def test_a_dry_run_restart_stops_and_starts_nothing(tmp_path):
