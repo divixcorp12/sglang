@@ -314,8 +314,13 @@ mem_fraction=${DSV41_MEM_FRACTION_STATIC:-}
 [ -z "$mem_fraction" ] || echo "mem-fraction-static override: $mem_fraction" | tee -a "$log"
 # DSV41_EXTRA_SERVER_ARGS (shell-split) is appended to this arm's argv only.
 [ -z "${DSV41_EXTRA_SERVER_ARGS:-}" ] || echo "extra server args: $DSV41_EXTRA_SERVER_ARGS" | tee -a "$log"
+# Opt-in, server-only startup diagnostic; inherited by fresh Python children.
+server_pythonpath="$worktree/python"
+if [ "${DSV41_OMP_BOOTSTRAP:-0}" = 1 ]; then
+    server_pythonpath="$worktree/test/manual/dsv41/omp_bootstrap:$server_pythonpath"
+fi
 taskset -c "$server_cores" "${nsys_prefix[@]}" env "${env_argv[@]}" \
-    PYTHONPATH="$worktree/python" PYTHONUNBUFFERED=1 \
+    PYTHONPATH="$server_pythonpath" PYTHONUNBUFFERED=1 \
     "$py" -c "
 import sys
 sys.path.insert(0, '$here')
@@ -518,6 +523,14 @@ with open('$boundary_path', 'a') as f:
 #     event. Samples clock, server cpu_s (process_tree_cpu_s of the SERVER pid, not
 #     this driver process, since the server is where the decode work happens), and a
 #     boundary sample bracketing each session. ---
+if [ -n "${DSV41_TIMED_START_FILE:-}" ]; then
+    echo "waiting for timed capture gate: $DSV41_TIMED_START_FILE"
+    for _ in $(seq 1 600); do
+        [ -f "$DSV41_TIMED_START_FILE" ] && break
+        sleep 0.1
+    done
+    [ -f "$DSV41_TIMED_START_FILE" ] || { stop_server; abort "timed capture gate expired"; }
+fi
 clocks_path=$run_dir/clocks.jsonl
 compile_path=$run_dir/compile.jsonl
 cpu_path=$run_dir/cpu.jsonl
