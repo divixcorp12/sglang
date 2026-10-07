@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 import json
 from pathlib import Path
 import statistics
+import sqlite3
 
 
 def records(path):
@@ -148,7 +149,7 @@ def analyze(root):
         matrices = [p for f in fs for p in f['phases'] if p['phase'] in (1, 3)]
         scratches = [f['scratch'] for f in fs if f['scratch']]
         tails = [max(p['tail'] for p in f['phases']) for f in fs]
-        output['groups'][str(group)] = dict(forwards=len(fs), matched_jobs=sum(f['job'] is not None for f in fs),
+        output['groups'][str(group)] = dict(leaders=sorted({f['leader'] for f in fs}), forwards=len(fs), matched_jobs=sum(f['job'] is not None for f in fs),
             forward_us=stats([f['wall'] for f in fs]), entry_us=stats([f['entry'] for f in fs]),
             join_us=stats([f['join'] for f in fs]), barrier_tail_us=stats(tails),
             barrier_over_1ms=sum(t > 1000000 for t in tails),
@@ -213,11 +214,60 @@ def analyze(root):
     return output
 
 
+
+def scheduler_analysis(root, result):
+    """Bounded SCHED_EVENTS scan; no generic ftrace joins or CPU stack sampling."""
+    low, high = result['window_ns']
+    windows = []
+    for f in result['top_forwards'][:10]:
+        for p in f['phases']:
+            if p['phase'] in (1, 3):
+                w = p['last_worker']
+                windows.append(dict(kind='matrix', group=f['group'], forward=f['forward'],
+                    phase=p['phase'], tid=w['tid'], begin=w['begin'], end=w['end']))
+    for g, info in result['groups'].items():
+        leader = info['leaders'][0]
+        for j in info['top_available_to_start'][:3]:
+            windows.append(dict(kind='available_to_start', group=int(g), seq=j['seq'], tid=leader,
+                begin=j['begin'] - j['available_to_start'], end=j['begin']))
+    tids = sorted({w['tid'] for w in windows})
+    with sqlite3.connect('file:' + str(root / 'scheduler.sqlite') + '?mode=ro', uri=True) as db:
+        offset = db.execute('SELECT systemClockNs FROM TARGET_INFO_SESSION_START_TIME').fetchone()[0]
+        coverage = db.execute('SELECT min(start),max(start) FROM SCHED_EVENTS').fetchone()
+        if not offset + coverage[0] <= low <= high <= offset + coverage[1]:
+            raise ValueError('scheduler coverage does not enclose timed window')
+        query = ('SELECT start,isSchedIn,(globalTid & 16777215) FROM SCHED_EVENTS '
+                 'WHERE start BETWEEN ? AND ? AND (globalTid & 16777215) IN (' +
+                 ','.join('?' for _ in tids) + ') ORDER BY start')
+        pending, gaps = {}, defaultdict(list)
+        count = 0
+        for ns, incoming, tid in db.execute(query, [max(coverage[0], low-offset-50000000),
+                                                   high-offset+50000000, *tids]):
+            ns += offset
+            count += 1
+            if not incoming:
+                pending[tid] = ns
+            elif tid in pending:
+                gaps[tid].append((pending.pop(tid), ns))
+        for w in windows:
+            overlaps = [max(0, min(b, w['end']) - max(a, w['begin'])) for a, b in gaps[w['tid']]
+                        if a < w['end'] and b > w['begin']]
+            w['off_cpu_us'] = sum(overlaps) / 1000
+            w['longest_off_cpu_us'] = max(overlaps, default=0) / 1000
+            w['switch_gaps'] = len(overlaps)
+        diagnostics = db.execute('SELECT * FROM DIAGNOSTIC_EVENT').fetchall()
+    return dict(clock_offset_ns=offset, relative_coverage_ns=coverage, query=query,
+                selected_events=count, windows=windows, diagnostics=diagnostics,
+                limit='No sleep/runqueue classification, CPU stacks, or hardware memory-stall counters.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', type=Path)
     args = parser.parse_args()
     result = analyze(args.root)
+    if (args.root / 'scheduler.sqlite').exists():
+        result['scheduler'] = scheduler_analysis(args.root, result)
     (args.root / 'scratch-analysis.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result['groups'], indent=2))
 
