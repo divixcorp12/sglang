@@ -1,7 +1,8 @@
 """Gate a user CPU replay inside a bounded, privileged Nsight scheduler capture.
 
 Uses the existing NOPASSWD nsys-profile collector. Does not alter host permissions,
-run benchmark code as root, inject CUDA tracing, or change production settings.
+run benchmark code as root, or inject CUDA tracing. Optional affinity isolation
+is temporary, identity checked, and restored by a separate guardian if needed.
 """
 import argparse
 import json
@@ -19,6 +20,7 @@ def main():
     p.add_argument("--reference", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--library", type=Path, required=True)
+    p.add_argument("--isolate-manifest", type=Path, help="Opt-in temporary cAdvisor/Ray thread affinity isolation")
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, **json.loads(args.reference.read_text())}
@@ -37,6 +39,10 @@ def main():
     capture = ["sudo", "-n", "/usr/local/sbin/nsys-profile", "profile", "--trace=none", "--sample=none",
                "--cpuctxsw=system-wide", "--ftrace=sched/sched_switch,sched/sched_wakeup", "--duration=10",
                "--force-overwrite=true", "--output=" + str(args.output / "scheduler"), "/usr/bin/sleep", "10"]
+    if args.isolate_manifest:
+        capture[-2:] = ["--kill=none", "--stop-on-exit=false", sys.executable,
+                        str(Path(__file__).with_name("exl3_cpu_affinity_isolation.py")),
+                        "--manifest", str(args.isolate_manifest), "--directory", str(args.output)]
     metadata = {"arm_command": command, "capture_command": capture, "start_ns": time.monotonic_ns(),
                 "epoch_ns": time.time_ns(), "head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()}
     collector = None
@@ -57,7 +63,7 @@ def main():
             os.close(slave)
             collected = ""
             deadline = time.monotonic() + 15
-            while "Collecting data" not in collected:
+            while "Collecting data" not in collected or (args.isolate_manifest and not (args.output / "affinity-ready.json").exists()):
                 if collector.poll() is not None:
                     raise RuntimeError("collector exited before readiness; inspect collector.log")
                 if time.monotonic() > deadline:
@@ -82,6 +88,9 @@ def main():
             os.close(master)
             if metadata["arm_status"] or metadata["collector_status"]:
                 raise RuntimeError("capture/arm failed; inspect logs")
+            if args.isolate_manifest:
+                restored = json.loads((args.output / "affinity-restoration.json").read_text())
+                assert restored["restored"], "affinities were not restored"
         finally:
             if arm.poll() is None:
                 arm.terminate()
