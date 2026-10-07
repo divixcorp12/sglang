@@ -1930,6 +1930,9 @@ class Envs:
     # LRU row, not one of decode's. A row stops being prefill-owned when decode uses it. Read once at service start.
     # Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_SHARE = EnvBool(False)
+    # Test only: test/manual/dsv41/test_bs1_build_digest.py skips, instead of failing, when nvcc or the GPU arch differs
+    # from its golden's (the golden is then stale: re-record it). Off by default.
+    SGLANG_TEST_BS1_DIGEST_TOOLCHAIN_ACKNOWLEDGED = EnvBool(False)
     # Prefill route plan (plan 2026-09-25-dsv41-prefill-route-plan): the eager streamed MoE reads a layer's topk_ids
     # to the host once, before any of its gathers, groups the routes by expert, and takes each chunk's expert ids and
     # row_of_source as host lists, so no readback sits between a chunk's gather and its compute and the host runs
