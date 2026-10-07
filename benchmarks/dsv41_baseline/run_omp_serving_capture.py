@@ -191,7 +191,7 @@ def main():
                                                if line.split()[-1] == str(exe))
                                 selected_address -= exe_base - base_vaddr
                         profile_command = [str(args.magic_trace.resolve()), "attach", "-pid", str(tid),
-                            "-trigger", "addr:" + hex(selected_address), "-snapshot-size", "256K",
+                            "-trigger", "addr:" + hex(selected_address), "-snapshot-size", "4M",
                             "-working-directory", str(output / "magic-work"),
                             "-output", str(output / "draft-delay.fxt.gz")]
                         (output / "magic-command.json").write_text(json.dumps(dict(command=profile_command,

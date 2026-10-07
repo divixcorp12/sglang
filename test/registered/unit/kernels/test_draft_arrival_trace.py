@@ -91,7 +91,7 @@ def test_magic_trace_trigger_and_decode(arrival_probe, tmp_path):
     try:
         assert probe.stdout.readline().strip() == "ready"
         trace = subprocess.Popen([tool,"attach","-pid",str(probe.pid),"-trigger","sglang_draft_delay_trigger",
-            "-snapshot-size","256K","-working-directory",str(tmp_path/"magic-work"),
+            "-snapshot-size",os.environ.get("SGLANG_TEST_MAGIC_SNAPSHOT_SIZE","256K"),"-working-directory",str(tmp_path/"magic-work"),
             "-output",str(tmp_path/"trigger.fxt.gz")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         log = ""
         deadline = time.monotonic()+20
