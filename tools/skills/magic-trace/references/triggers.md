@@ -19,6 +19,10 @@ Record reason, elapsed duration, request sequence and TID in a bounded buffer wh
 
 For main-executable symbols use the stable `extern "C"` name, retained/exported (e.g. probe `-rdynamic`). C++ selectors otherwise need a mangled name or fuzzy lookup. Main-executable lookup need not search `dlopen` libraries.
 
+## Hit metadata is not a C/C++ argument decoder
+
+In v1.2.4, `hits.sexp`'s function-entry hit, TID and instruction address can establish which trigger ran, but **`passed_timestamp` and `passed_val` are not raw C/C++ arguments**. The [breakpoint stub](https://github.com/janestreet/magic-trace/blob/v1.2.4/src/breakpoint_stubs.c#L154-L171) unconditionally applies OCaml `Long_val` untagging to captured registers, then converts one as a TSC. The [writer](https://github.com/janestreet/magic-trace/blob/v1.2.4/src/trace_writer.ml#L271-L280) explicitly limits their meaning to its special stop-symbol ABI. A plain C/C++ integer can therefore appear halved, and a request sequence interpreted as a timestamp can be meaningless. Do not infer elapsed time, sequence or reason from these fields without verifying the exact ABI/register mapping. Use the application's bounded marker or shutdown trigger report as authoritative; retain the hit's TID/IP to correlate that report with the snapshot.
+
 ## Loaded library/JIT definitions
 
 Inspect maps after loading; select by exact path, role and build identity, or an app-published function pointer. Several variants can export the same name. An arbitrary matching address can be executable but never called.

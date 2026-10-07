@@ -63,6 +63,14 @@ To use nsys refer to '/opt/nvidia/nsight-systems/2026.5.1/skills/nsight-systems/
   extra clock reads or event buffers. Optional
   `SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX` saves one trigger result at
   shutdown. Label this trigger-only, detailed-counters-off capture precisely.
+- `magic-work/hits.sexp` establishes the native trigger entry/TID/IP, but its
+  `passed_timestamp` and `passed_val` fields use magic-trace v1.2.4's OCaml
+  register decoding, not our C++ `(seq, elapsed_ns, reason)` signature. In the
+  counters-off capture, the native report's 5,044,085 ns elapsed appeared as
+  2,522,042 in `passed_val`; the passed timestamp was meaningless. Read the
+  `SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX` shutdown report (or detailed app
+  marker) for sequence, elapsed time, reason and threshold. The portable skill's
+  trigger reference links the verified upstream decoder implementation.
 - Resolve the active instrumented **host** JIT DSO from the live engine's
   ownership, build identity and mappings. Multiple loaded host libraries can
   export the same trigger, including unused variants. Do not select the last
