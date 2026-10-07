@@ -15,6 +15,7 @@ from pathlib import Path
 import pty
 import select
 import signal
+import struct
 import shutil
 import subprocess
 import sys
@@ -173,8 +174,24 @@ def main():
                                     address = int(fields[0].split("-")[0], 16) + int(symbol.split()[0], 16)
                         if address is None:
                             raise RuntimeError("optimized JIT trigger symbol is missing")
+                        # magic-trace treats addr: as an ELF address in /proc/TID/exe,
+                        # and adds that executable's PIE load bias. Undo it for this DSO address.
+                        exe = (Path("/proc") / str(pid) / "exe").resolve()
+                        with exe.open("rb") as binary:
+                            header = binary.read(64)
+                            selected_address = address
+                            if struct.unpack_from("<H", header, 16)[0] == 3:
+                                phoff = struct.unpack_from("<Q", header, 32)[0]
+                                size,count = struct.unpack_from("<HH", header, 54)
+                                binary.seek(phoff)
+                                entries = [binary.read(size) for _ in range(count)]
+                                base_vaddr = min(struct.unpack_from("<Q", e, 16)[0] for e in entries
+                                                 if struct.unpack_from("<I",e,0)[0] == 1)
+                                exe_base = min(int(line.split("-",1)[0],16) for line in mappings
+                                               if line.split()[-1] == str(exe))
+                                selected_address -= exe_base - base_vaddr
                         profile_command = [str(args.magic_trace.resolve()), "attach", "-pid", str(tid),
-                            "-trigger", "addr:" + hex(address), "-snapshot-size", "256K",
+                            "-trigger", "addr:" + hex(selected_address), "-snapshot-size", "256K",
                             "-working-directory", str(output / "magic-work"),
                             "-output", str(output / "draft-delay.fxt.gz")]
                         (output / "magic-command.json").write_text(json.dumps(dict(command=profile_command,
@@ -216,6 +233,15 @@ def main():
             if master is not None:
                 os.close(master)
             trace_gate.close()
+        if args.magic_trace and gate_opened and arm.returncode == 0:
+            info = json.loads((output / "magic-command.json").read_text())
+            clock_path = output / f"events.{info['pid']}.draft-clock-end.json"
+            clock_env = {**env, "PYTHONPATH": str(ROOT/"python"),
+                         "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(output/"events")}
+            with (output/"clock-end.log").open("w") as clock_log:
+                subprocess.run(["flock", "/data/models/slang/nvfp4-work/cc-gpu.lock", "taskset", "-c", "32-63",
+                    sys.executable, str(ROOT/"benchmarks/dsv41_baseline/draft_clock_anchor.py"), str(clock_path)],
+                    env=clock_env, stdout=clock_log, stderr=subprocess.STDOUT, check=True, timeout=180)
         status = dict(arm_status=arm.returncode, profiler_status=profiler.returncode if profiler else None,
                       gate_opened=gate_opened, scheduler_report=str(report) + ".nsys-rep")
         (output / "omp-status.json").write_text(json.dumps(status) + "\n")

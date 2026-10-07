@@ -155,6 +155,7 @@ namespace expert_stream::draft {
 struct DraftChannelKernels {
   // Calibration only, outside capture: host brackets launch+completion with CLOCK_MONOTONIC.
   static void clock(tvm::ffi::TensorView state, int64_t out) {
+    using namespace host;
     RuntimeCheck(state.device().device_type == kDLCUDA && out != 0, "draft clock needs CUDA state and pinned out");
     LaunchKernel(1, 32, state.device())(device::expert_stream::draft::draft_clock_kernel,
                                        reinterpret_cast<int64_t*>(out));

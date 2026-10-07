@@ -94,6 +94,28 @@ def device_module() -> Module:
     )
 
 
+def calibrate_gpu_clock(module, state, path: str) -> dict:
+    samples = []
+    out = torch.zeros(1, dtype=torch.int64, pin_memory=True)
+    with torch.cuda.device(state.device):
+        module.clock(state, out.data_ptr())
+        torch.cuda.synchronize()
+        for _ in range(64):
+            before = time.monotonic_ns()
+            module.clock(state, out.data_ptr())
+            torch.cuda.synchronize()
+            after = time.monotonic_ns()
+            samples.append(dict(before=before, gpu=int(out[0]), after=after))
+    data = dict(clock="GPU globaltimer ns vs CLOCK_MONOTONIC", samples=samples,
+                offset_low=max(s["before"] - s["gpu"] for s in samples),
+                offset_high=min(s["after"] - s["gpu"] for s in samples))
+    if data["offset_low"] > data["offset_high"]:
+        raise RuntimeError("GPU/CPU clock calibration intervals do not overlap")
+    Path(path).write_text(json.dumps(data, indent=2) + "\n")
+    return data
+
+
+
 class DraftCpuDevice:
     """The device side: `state` int32 [6] on the GPU (the channel's words), `on_cpu` uint8 [stages, E] (which experts
     of each stage the host computes)."""
@@ -108,28 +130,8 @@ class DraftCpuDevice:
         prefix = os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
         if prefix:
             # Calibration IO is initialization only, never post()/finish() or graph replay.
-            anchor = self.calibrate_clock(str(prefix) + f".{os.getpid()}.draft-clock.json")
+            anchor = calibrate_gpu_clock(self.module, self.state, str(prefix) + f".{os.getpid()}.draft-clock.json")
             self.areas.channel[1024:1032].view(torch.int64)[0] = anchor["offset_high"]
-
-    def calibrate_clock(self, path: str) -> dict:
-        samples = []
-        out = torch.zeros(1, dtype=torch.int64, pin_memory=True)
-        with torch.cuda.device(self.state.device):
-            self.module.clock(self.state, out.data_ptr())
-            torch.cuda.synchronize()
-            for _ in range(64):
-                before = time.monotonic_ns()
-                self.module.clock(self.state, out.data_ptr())
-                torch.cuda.synchronize()
-                after = time.monotonic_ns()
-                samples.append(dict(before=before, gpu=int(out[0]), after=after))
-        data = dict(clock="GPU globaltimer ns vs CLOCK_MONOTONIC", samples=samples,
-                    offset_low=max(s["before"] - s["gpu"] for s in samples),
-                    offset_high=min(s["after"] - s["gpu"] for s in samples))
-        if data["offset_low"] > data["offset_high"]:
-            raise RuntimeError("GPU/CPU clock calibration intervals do not overlap")
-        Path(path).write_text(json.dumps(data, indent=2) + "\n")
-        return data
 
     def post(self, stage: int, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
         """Stage `x` [M, H] and the CPU-owned routes of `topk_ids`/`topk_weights` [M, k]; publish a record if any."""
