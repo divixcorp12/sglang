@@ -544,6 +544,19 @@ if [ -n "${DSV41_TIMED_START_FILE:-}" ]; then
     done
     [ -f "$DSV41_TIMED_START_FILE" ] || { stop_server; abort "timed capture gate expired"; }
 fi
+if [ -n "${DSV41_STEADY_TRACE_READY_FILE:-}" ]; then
+    # Formal warm-up passed above; the client adds a decode burn-in inside this
+    # one long request. It does not produce a benchmark verdict.
+    "${driver_pin[@]}" env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "$py" \
+        "$here/steady_decode_trace.py" --port "$port" --sessions "$synthetic_sessions" \
+        --session-id "$warmup_session_id" --output "$run_dir/steady-decode" \
+        --ready-file "$DSV41_STEADY_TRACE_READY_FILE" --stop-file "$DSV41_STEADY_TRACE_STOP_FILE" \
+        --server-log "$log"
+    rc=$?
+    stop_server
+    echo "steady decode native trace diagnostic completed rc=$rc; no benchmark verdict"
+    exit "$rc"
+fi
 clocks_path=$run_dir/clocks.jsonl
 compile_path=$run_dir/compile.jsonl
 cpu_path=$run_dir/cpu.jsonl

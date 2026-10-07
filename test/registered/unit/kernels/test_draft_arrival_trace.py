@@ -8,6 +8,37 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[4]
 
+def test_decode_admission_excludes_prefill_and_requires_all_burnin_bounds(monkeypatch):
+    import importlib.util
+    path = ROOT / "benchmarks/dsv41_baseline/steady_decode_trace.py"
+    monkeypatch.syspath_prepend(str(path.parent))
+    spec = importlib.util.spec_from_file_location("steady_decode", path)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    gate = module.DecodeBurnIn()
+    # Prefill/role/usage-only messages cannot start the decode clock or consume updates.
+    assert gate.observe(0, 0, False) is None
+    assert gate.observe(20_000_000_000, None, True) is None
+    assert gate.first_ns is None
+    first = 50_000_000_000
+    for i in range(100):
+        assert gate.observe(first + i * 100_000_000, i + 1, True) is None
+    assert gate.updates == 100
+    assert gate.observe(first + 31_000_000_000, 100, True) is None  # duplicate count
+    assert gate.observe(first + 31_000_000_000, 101, True) is None  # too few tokens
+    ready = gate.observe(first + 32_000_000_000, 256, True)
+    assert ready["first_content_ns"] == first and ready["decode_seconds"] == 32
+    assert ready["completion_tokens"] == 256 and ready["progress_updates"] == 102
+    # Speculative multi-token updates satisfy the token bound but not the update bound.
+    gate = module.DecodeBurnIn()
+    assert gate.observe(first, 300, True) is None
+    assert gate.observe(first + 40_000_000_000, 600, True) is None
+    assert gate.updates == 2
+    # Enough tokens/updates still cannot bypass the elapsed decode-time bound.
+    gate = module.DecodeBurnIn()
+    for i in range(100):
+        assert gate.observe(first + i * 100_000_000, (i + 1) * 4, True) is None
+    assert gate.observe(first + 31_000_000_000, 404, True) is not None
+
 @pytest.fixture(scope="module")
 def trigger_only_probe(tmp_path_factory):
     work = tmp_path_factory.mktemp("trigger-only")

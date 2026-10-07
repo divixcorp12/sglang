@@ -107,9 +107,13 @@ def main():
     parser.add_argument("--draft-forward-trigger-us", type=int, default=5000)
     parser.add_argument("--magic-health-diagnostic", action="store_true",
                         help="Capture a warm-up after HTTP health, stop after snapshot; never a benchmark")
+    parser.add_argument("--magic-steady-decode", action="store_true",
+                        help="Retain formal warm-up gate; arm after 30s, 256 tokens and 100 stream updates in a long decode")
     args = parser.parse_args()
     if args.magic_health_diagnostic and not args.magic_trace:
         parser.error("magic-health-diagnostic requires magic-trace")
+    if args.magic_steady_decode and (not args.magic_trace or args.magic_health_diagnostic):
+        parser.error("magic-steady-decode requires magic-trace and excludes magic-health-diagnostic")
     if args.no_instrumentation and (not args.magic_trace or args.draft_pending_trigger_us or args.draft_arrival_trigger_us):
         parser.error("no-instrumentation requires magic-trace and zero pending/arrival thresholds")
     if not 10 <= args.seconds <= 120:
@@ -133,6 +137,10 @@ def main():
            "DSV41_TIMED_START_FILE": str(gate), "DSV41_MAX_SESSIONS": "1"}
     if args.magic_health_diagnostic:
         env["DSV41_DIAGNOSTIC_STOP_FILE"] = str(output / "diagnostic.stop")
+    if args.magic_steady_decode:
+        env.pop("DSV41_DIAGNOSTIC_STOP_FILE", None)
+        env["DSV41_STEADY_TRACE_READY_FILE"] = str(output / "steady-decode.ready.json")
+        env["DSV41_STEADY_TRACE_STOP_FILE"] = str(output / "steady-decode.stop")
     # These are inherited by the server; existing capture adds its own prefixes.
     env["SGLANG_CPU_EXPERT_TRACE_GATE"] = str(trace_gate_path)
     if not args.no_instrumentation:
@@ -156,7 +164,7 @@ def main():
                        "--duration=" + str(args.seconds), "--force-overwrite=true",
                        "--output=" + str(report), "/usr/bin/sleep", str(args.seconds)]
     (output / "omp-command.json").write_text(json.dumps(dict(command=command,
-        diagnostic_env={k: v for k, v in env.items() if k.startswith("DSV41_OMP") or
+        diagnostic_env={k: v for k, v in env.items() if k.startswith(("DSV41_OMP", "DSV41_STEADY")) or
                         k in ("DSV41_TIMED_START_FILE", "SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX",
                               "SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY", "SGLANG_CPU_EXPERT_TRACE_GATE",
                               "SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX")},
@@ -166,6 +174,8 @@ def main():
     gate_opened = False
     profiler_ready = False
     profiler_stop_requested = False
+    workload_started = False
+    workload_started_at = capture_started_at = None
     profile_text = ""
     with (output / "driver.log").open("w") as log, \
          (output / "runtime-samples.jsonl").open("w") as samples, \
@@ -239,17 +249,35 @@ def main():
                         profile_text += chunk
                         profile_log.write(chunk); profile_log.flush()
                         profiler_ready |= ("[ Attached." in profile_text if args.magic_trace else "Collecting data" in profile_text)
-                if profiler_ready and not gate_opened:
+                if profiler_ready and not workload_started:
                     stamp = time.monotonic_ns()
+                    gate.write_text(json.dumps(dict(ns=stamp, trace_gate=str(trace_gate_path),
+                                                   trigger_closed_for_decode_burnin=args.magic_steady_decode)) + "\n")
+                    workload_started = True
+                    workload_started_at = time.monotonic()
+                    print("profiler attached; workload gate open", flush=True)
+                steady_marker = output / "steady-decode.ready.json"
+                if workload_started and not gate_opened and (not args.magic_steady_decode or steady_marker.exists()):
+                    admission = json.loads(steady_marker.read_text()) if args.magic_steady_decode else {}
+                    stamp = time.monotonic_ns()
+                    if args.magic_steady_decode:
+                        if (not admission.get("formal_warmup_passed") or admission["decode_seconds"] < 30 or
+                                admission["completion_tokens"] < 256 or admission["progress_updates"] < 100):
+                            raise RuntimeError("invalid steady decode admission evidence")
+                        (output / "steady-trace-armed.json").write_text(json.dumps(dict(
+                            ns=stamp, admission=admission, trace_gate=str(trace_gate_path)), indent=2) + "\n")
                     ctypes.c_uint32.from_buffer(trace_gate).value = 1
-                    gate.write_text(json.dumps(dict(ns=stamp, trace_gate=str(trace_gate_path))) + "\n")
                     gate_opened = True
-                    print("scheduler collecting; timed gate open", flush=True)
-                if profiler is not None and not gate_opened and (
+                    capture_started_at = time.monotonic()
+                    print("trigger gate open" + (" after steady decode burn-in" if args.magic_steady_decode else ""), flush=True)
+                if profiler is not None and not profiler_ready and (
                         profiler.poll() is not None or time.monotonic() - profile_started > 45):
                     raise RuntimeError("scheduler profiler did not become ready; gate remains closed")
+                if (args.magic_steady_decode and workload_started and not gate_opened and
+                        (arm.poll() is not None or profiler.poll() is not None or time.monotonic() - workload_started_at > 600)):
+                    raise RuntimeError("steady decode admission failed; trigger gate remains closed")
                 if (args.magic_trace and gate_opened and profiler.poll() is None and not profiler_stop_requested
-                        and "Snapshot taken" not in profile_text and time.monotonic() - profile_started > args.seconds):
+                        and "Snapshot taken" not in profile_text and time.monotonic() - capture_started_at > args.seconds):
                     profiler_stop_requested = True
                     # v1.2.4 SIGINT alone can yield AUX bookkeeping without PT
                     # bytes. Snapshot only this collector's recorder first.
@@ -263,12 +291,16 @@ def main():
                     profiler.send_signal(signal.SIGINT)  # bounded fallback snapshot if no threshold fired
                 if args.magic_health_diagnostic and gate_opened and profiler.poll() is not None:
                     (output / "diagnostic.stop").touch()
+                if args.magic_steady_decode and gate_opened and profiler.poll() is not None:
+                    (output / "steady-decode.stop").touch()
                 time.sleep(.25)
         finally:
             if arm.poll() is None:
                 os.killpg(arm.pid, signal.SIGTERM)
                 arm.wait(timeout=180)
             if profiler is not None and profiler.poll() is None:
+                if not gate_opened:
+                    profiler.send_signal(signal.SIGINT)
                 profiler.wait(timeout=150)
             if master is not None:
                 os.close(master)
@@ -283,7 +315,8 @@ def main():
                     sys.executable, str(ROOT/"benchmarks/dsv41_baseline/draft_clock_anchor.py"), str(clock_path)],
                     env=clock_env, stdout=clock_log, stderr=subprocess.STDOUT, check=True, timeout=180)
         status = dict(arm_status=arm.returncode, profiler_status=profiler.returncode if profiler else None,
-                      diagnostic_only=args.magic_health_diagnostic,
+                      diagnostic_only=args.magic_health_diagnostic or args.magic_steady_decode,
+                      steady_decode=args.magic_steady_decode,
                       instrumentation=not args.no_instrumentation,
                       gate_opened=gate_opened, scheduler_report=str(report) + ".nsys-rep")
         if args.magic_trace:

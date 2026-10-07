@@ -32,6 +32,15 @@ To use nsys refer to '/opt/nvidia/nsight-systems/2026.5.1/skills/nsight-systems/
 
 ## magic-trace / DSpark CPU traces
 
+- For steady decode, use `--magic-steady-decode` instead of
+  `--magic-health-diagnostic`. It retains the formal clock/throughput/compile-quiet
+  warm-up gate, attaches with the trigger closed, and starts one long streaming
+  request. `steady_decode_trace.py` requires 30 seconds since first content,
+  256 generated tokens and 100 increasing stream updates before admission.
+  `steady-decode.ready.json`, `steady-trace-armed.json` and the progress log prove
+  the snapshot followed that boundary. Stream updates are not engine iterations.
+  The run remains a trace diagnostic, not a throughput benchmark verdict.
+
 - The portable skill lives in `tools/skills/magic-trace/` and is installed on
   the laptop as `~/.codex/skills/magic-trace/`. Invoke it with “magic-trace
   <binary>” or `$magic-trace`. Keep download/setup, Intel PT/perf compatibility,
