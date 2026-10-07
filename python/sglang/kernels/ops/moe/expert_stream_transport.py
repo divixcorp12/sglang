@@ -182,21 +182,25 @@ def _host_module(
         )
     if variant not in LAYOUTS[layout].host_sources:
         raise ValueError(f"layout {layout!r} has no {variant!r} host build variant")
-    return _host_module_cached(layout, variant, lanes, nodes)
+    trigger_only = os.environ.get("SGLANG_DRAFT_DELAY_TRIGGER_ONLY", "0") == "1"
+    if trigger_only and variant != "prod":
+        raise ValueError("SGLANG_DRAFT_DELAY_TRIGGER_ONLY requires the production host build")
+    return _host_module_cached(layout, variant, lanes, nodes, trigger_only)
 
 
 @cache_once
-def _host_module_cached(layout: str, variant: str, lanes: int, nodes: int) -> Module:
+def _host_module_cached(layout: str, variant: str, lanes: int, nodes: int, trigger_only: bool = False) -> Module:
     # Hidden visibility keeps HostExports' registries and members private to each
     # module's .so; only the TVM_FFI_DLL_EXPORT entry points are exported.
     return load_jit(
-        f"expert_stream_host_{layout}_{variant}{_suffix(lanes, nodes)}",
+        f"expert_stream_host_{layout}_{variant}{'_trigger' if trigger_only else ''}{_suffix(lanes, nodes)}",
         cpp_files=[LAYOUTS[layout].host_sources[variant]],
         extra_cflags=[
             "-fvisibility=hidden",
             "-fvisibility-inlines-hidden",
             f"-DSGLANG_EXPERT_STREAM_LANES={lanes}",
             f"-DSGLANG_EXPERT_STREAM_NODES={nodes}",
+            *(["-DSGLANG_DRAFT_DELAY_TRIGGER_ONLY=1"] if trigger_only else []),
         ],
         extra_ldflags=["-luring", "-lpthread", "-ldl"],
         header_only=False,

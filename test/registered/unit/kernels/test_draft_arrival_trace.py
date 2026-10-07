@@ -8,6 +8,64 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[4]
 
+@pytest.fixture(scope="module")
+def trigger_only_probe(tmp_path_factory):
+    work = tmp_path_factory.mktemp("trigger-only")
+    source = work / "probe.cpp"
+    source.write_text(r'''
+#include "job_trace.h"
+using namespace sglang::expert_stream;
+static_assert(!ProdBuild::kMetrics);
+static_assert(std::is_empty_v<JobTrace<false>>);
+static_assert(std::is_empty_v<Stats<false, 8>>);
+int main() {
+  DraftDelayTrigger<kDraftDelayTriggerOnly> trigger("engine");
+  trigger.finished(1, 6000000); // gate closed: must not consume the one-shot
+  puts("ready"); fflush(stdout); getchar();
+  trigger.finished(2, 999999);
+  trigger.finished(3, 6000000);
+  trigger.finished(4, 7000000); // must retain the first admitted crossing
+}
+''')
+    binaries = []
+    for enabled in (False, True):
+        binary = work / str(enabled)
+        subprocess.run(["g++", "-std=c++20", "-O3", "-rdynamic",
+                        f"-DSGLANG_DRAFT_DELAY_TRIGGER_ONLY={int(enabled)}", "-I",
+                        str(ROOT / "python/sglang/kernels/jit/csrc/moe/expert_stream/host"),
+                        str(source), "-o", str(binary)], check=True, capture_output=True)
+        binaries.append(binary)
+    return binaries
+
+
+@pytest.mark.parametrize("enabled,threshold", [(False, 1000), (True, 1000), (True, 0)])
+def test_independent_trigger_retained_without_metrics_and_gate(trigger_only_probe, tmp_path, enabled, threshold):
+    import mmap
+    gate = tmp_path / "gate"
+    gate.write_bytes(bytes(4))
+    with gate.open("r+b") as file, mmap.mmap(file.fileno(), 4) as flag:
+        binary = trigger_only_probe[int(enabled)]
+        process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "SGLANG_CPU_EXPERT_TRACE_GATE": str(gate),
+                 "SGLANG_DRAFT_FORWARD_TRIGGER_US": str(threshold),
+                 "SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX": str(tmp_path / "trigger")})
+        try:
+            assert process.stdout.readline().strip() == "ready"
+            flag[:] = (1).to_bytes(4, "little")
+            process.communicate("x", timeout=10)
+            assert process.returncode == 0
+        finally:
+            if process.poll() is None:
+                process.terminate(); process.wait(timeout=10)
+    reports = list(tmp_path.glob("trigger.*.json"))
+    assert len(reports) == int(enabled)
+    if enabled:
+        report = json.loads(reports[0].read_text())
+        assert report["metrics"] is False and report["trigger_only"] is True
+        assert (report["seq"], report["elapsed_ns"]) == ((3, 6000000) if threshold else (0, 0))
+    symbols = subprocess.check_output(["nm", "--defined-only", str(binary)], text=True)
+    assert ("sglang_draft_delay_trigger" in symbols) == enabled
+
 
 @pytest.fixture(scope="module")
 def arrival_probe(tmp_path_factory):

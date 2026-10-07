@@ -14,6 +14,18 @@ import time
 
 import generations
 
+DIAGNOSTIC_PREFIXES = (
+    "SGLANG_DSV41_EXPERT_JOB_", "SGLANG_DSV41_EXPERT_TRACE_",
+    "SGLANG_EXL3_CPU_WORKER_TRACE_", "SGLANG_EXL3_CPU_SCRATCH_TRACE_",
+    "SGLANG_CPU_EXPERT_HOLD_TRACE_", "SGLANG_DRAFT_PENDING_TRIGGER_",
+    "SGLANG_DRAFT_ARRIVAL_TRIGGER_", "SGLANG_DRAFT_FORWARD_TRIGGER_",
+    "SGLANG_DRAFT_DELAY_TRIGGER_",
+)
+
+def diagnostic_key(key):
+    return key.startswith(DIAGNOSTIC_PREFIXES) or key in (
+        "SGLANG_MOE_HOT_METRICS_FILE", "SGLANG_TEST_DSV41_RAM_MISS_FAULT")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -21,6 +33,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=30029)
     parser.add_argument("--no-nsys", action="store_true", help="collect job resources and /proc only")
+    parser.add_argument("--no-instrumentation", action="store_true", help="production host/kernel with forward threshold trigger only")
     parser.add_argument("--worker-phases", action="store_true", help="compile EXL3 per-worker phase diagnostics")
     parser.add_argument("--worker-min-us", type=int, default=6000)
     parser.add_argument("--worker-capacity", type=int, default=131072)
@@ -29,6 +42,8 @@ def main():
     parser.add_argument("--draft-arrival-trigger-us", type=int, default=0)
     parser.add_argument("--draft-forward-trigger-us", type=int, default=0)
     args = parser.parse_args()
+    if args.no_instrumentation and (args.worker_phases or args.draft_pending_trigger_us or args.draft_arrival_trigger_us):
+        parser.error("no-instrumentation permits only the forward threshold trigger")
     if not 0 <= args.worker_min_us <= 1000000000:
         parser.error("worker-min-us must be in [0, 1000000000]")
     if any(not 1 <= c <= 1048576 for c in (args.worker_capacity, args.job_capacity)):
@@ -48,15 +63,17 @@ def main():
            "NSYS_SAMPLE": "none", "NSYS_CPUCTXSW": "none", "NSYS_SYSTEM_CPU": "1"}
     if args.no_nsys:
         env.update(NSYS_TRACE="0", NSYS_GPU_METRICS="0", NSYS_SYSTEM_CPU="0")
+    if args.no_instrumentation:
+        env = {k: v for k, v in env.items() if not diagnostic_key(k)}
     prefix = str(args.output / "events")
     overrides = [arg for arg in reference["command"][4:]
-                 if not arg.startswith(("SGLANG_MOE_HOT_METRICS_FILE=", "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=",
-                                        "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=",
-                                        "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY=",
-                                        "SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=",
-                                        "SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US=",
-                                        "SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY="))]
-    overrides += ["SGLANG_MOE_HOT_METRICS_FILE=" + str(args.output / "metrics.jsonl"),
+                 if not diagnostic_key(arg.split("=", 1)[0])]
+    if args.no_instrumentation:
+        overrides += ["SGLANG_DRAFT_DELAY_TRIGGER_ONLY=1",
+                      "SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX=" + str(args.output / "trigger-only"),
+                      "SGLANG_EXL3_BUILD_DIR=" + str(args.output / "exl3-build")]
+    else:
+        overrides += ["SGLANG_MOE_HOT_METRICS_FILE=" + str(args.output / "metrics.jsonl"),
                   "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=" + prefix,
                   "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=1",
                   "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY=" + str(args.job_capacity)]
@@ -75,7 +92,8 @@ def main():
     if Path(imported).resolve() != root / "python/sglang/__init__.py":
         raise SystemExit("unexpected sglang import: " + imported)
     metadata = {"head": head, "sglang_file": imported, "command": command,
-                "harness_env": {k: env[k] for k in reference["harness_env"]},
+                "harness_env": {k: env[k] for k in reference["harness_env"] if k in env},
+                "instrumentation": not args.no_instrumentation,
                 "extra_harness_env": {k: env[k] for k in ("NSYS_TRACE", "NSYS_GPU_METRICS", "NSYS_SYSTEM_CPU")},
                 "reference": str(args.reference),
                 "start_ns": time.monotonic_ns(), "epoch_ns": time.time_ns()}
@@ -92,7 +110,7 @@ def main():
                     break
                 except BlockingIOError:
                     time.sleep(5)
-        sampler = subprocess.Popen(["taskset", "-c", "30", sys.executable,
+        sampler = None if args.no_instrumentation else subprocess.Popen(["taskset", "-c", "30", sys.executable,
                                     str(root / "benchmarks/dsv41_baseline/stall_sampler.py"),
                                     "--prefix", prefix, "--output", str(args.output / "system-samples.jsonl"),
                                     "--stop-file", str(marker)], env=env, cwd=root)
@@ -100,9 +118,10 @@ def main():
             status = subprocess.call(command, env=env, cwd=root)
         finally:
             marker.touch()
-            sampler.wait(timeout=10)
+            if sampler is not None:
+                sampler.wait(timeout=10)
         (args.output / "exit-status.json").write_text(json.dumps({"status": status,
-                "end_ns": time.monotonic_ns(), "sampler_status": sampler.returncode}) + "\n")
+                "end_ns": time.monotonic_ns(), "sampler_status": sampler.returncode if sampler else None}) + "\n")
         raise SystemExit(status)
 
 

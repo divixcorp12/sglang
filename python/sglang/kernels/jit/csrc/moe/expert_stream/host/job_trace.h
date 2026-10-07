@@ -21,6 +21,57 @@ void sglang_draft_delay_trigger(uint32_t seq, int64_t delay_ns, int reason) {
   asm volatile("" : : "r"(seq), "r"(delay_ns), "r"(reason) : "memory");
 }
 
+#ifndef SGLANG_DRAFT_DELAY_TRIGGER_ONLY
+#define SGLANG_DRAFT_DELAY_TRIGGER_ONLY 0
+#endif
+inline constexpr bool kDraftDelayTriggerOnly = SGLANG_DRAFT_DELAY_TRIGGER_ONLY != 0;
+
+// Independent of Build::kMetrics: reuse the production forward clocks, with no
+// event buffers, counters or extra clock reads. The default specialization is empty.
+template <bool On> class DraftDelayTrigger;
+template <> class DraftDelayTrigger<false> {
+ public:
+  explicit DraftDelayTrigger(const std::string&) {}
+  void finished(uint32_t, int64_t) {}
+};
+template <> class DraftDelayTrigger<true> {
+ public:
+  explicit DraftDelayTrigger(const std::string& name) {
+    if (const char* value = std::getenv("SGLANG_DRAFT_FORWARD_TRIGGER_US")) {
+      const std::string_view text(value);
+      if (text.empty() || text.find_first_not_of("0123456789") != std::string_view::npos)
+        throw std::invalid_argument("SGLANG_DRAFT_FORWARD_TRIGGER_US must be an integer in [0, 1000000000]");
+      char* end = nullptr;
+      const auto parsed = std::strtoull(value, &end, 10);
+      if (*end || parsed > 1000000000)
+        throw std::invalid_argument("SGLANG_DRAFT_FORWARD_TRIGGER_US must be an integer in [0, 1000000000]");
+      threshold_ns_ = static_cast<int64_t>(parsed) * 1000;
+    }
+    if (const char* prefix = std::getenv("SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX"); prefix && *prefix)
+      report_ = std::string(prefix) + "." + std::to_string(getpid()) + "." + name + ".json";
+  }
+  ~DraftDelayTrigger() {
+    if (report_.empty()) return;
+    if (FILE* out = std::fopen(report_.c_str(), "w")) {
+      std::fprintf(out, "{\"metrics\":false,\"trigger_only\":true,\"threshold_ns\":%lld,\"seq\":%u,\"elapsed_ns\":%lld,\"reason\":1}\n",
+                   static_cast<long long>(threshold_ns_), seq_, static_cast<long long>(elapsed_ns_));
+      std::fclose(out);
+    }
+  }
+  void finished(uint32_t seq, int64_t elapsed) {
+    if (!threshold_ns_ || elapsed < threshold_ns_ || seq_ || !gate_.enabled()) return;
+    seq_ = seq;
+    elapsed_ns_ = elapsed;
+    sglang_draft_delay_trigger(seq, elapsed, 1);
+  }
+ private:
+  TraceGate gate_;
+  std::string report_;
+  int64_t threshold_ns_ = 0, elapsed_ns_ = 0;
+  uint32_t seq_ = 0;
+};
+static_assert(std::is_empty_v<DraftDelayTrigger<false>>);
+
 
 template <bool On>
 class JobTrace;

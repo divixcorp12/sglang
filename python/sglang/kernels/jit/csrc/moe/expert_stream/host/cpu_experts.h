@@ -653,6 +653,7 @@ class BasicCpuExpertEngine {
     channel::complete<DraftChannel>(d.channel, seq, static_cast<uint64_t>(epoch) << 32 | seq);
     draft_completed_.store(seq, std::memory_order_release);
     if constexpr (Build::kMetrics) trace_.draft_finished(end - start, stage, epoch, seq);
+    delay_trigger_.finished(seq, end - start);
     return end;
   }
 
@@ -699,6 +700,7 @@ class BasicCpuExpertEngine {
   std::string prefix_;
   std::string thread_name_;
   [[no_unique_address]] JobTrace<Build::kMetrics> trace_;
+  [[no_unique_address]] DraftDelayTrigger<kDraftDelayTriggerOnly && !Build::kMetrics> delay_trigger_{thread_name_};
   std::thread thread_;
   std::promise<std::string> started_;  // the thread's pin result, for start()
   SpscRing<CpuJob, kRing> jobs_;

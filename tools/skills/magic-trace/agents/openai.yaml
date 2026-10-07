@@ -1,0 +1,4 @@
+interface:
+  display_name: "Magic Trace"
+  short_description: "Capture and inspect native CPU execution with Intel PT"
+  default_prompt: "Use $magic-trace to capture a bounded trace of the specified binary or running process and verify the viewer artifact."

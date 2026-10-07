@@ -39,7 +39,7 @@ def select_engine_leader(rows):
     return min(candidates)
 
 
-def sample_runtime(directory, out):
+def sample_runtime(directory, out, counters=True):
     """Only processes proven to belong to this unique bootstrap directory."""
     manifests = {}
     for path in directory.glob("*.json"):
@@ -73,12 +73,14 @@ def sample_runtime(directory, out):
                      if line.split()[2] == "00000000" and line.endswith(data["runtime"])]
             if len(bases) != 1:
                 raise RuntimeError("runtime mapping differs in scheduler")
-            fd = os.open(proc / "mem", os.O_RDONLY)
-            try:
-                values = {name: int.from_bytes(os.pread(fd, 8, bases[0] + offset), "little")
-                          for name, offset in OFFSETS.items()}
-            finally:
-                os.close(fd)
+            values = {}
+            if counters:
+                fd = os.open(proc / "mem", os.O_RDONLY)
+                try:
+                    values = {name: int.from_bytes(os.pread(fd, 8, bases[0] + offset), "little")
+                              for name, offset in OFFSETS.items()}
+                finally:
+                    os.close(fd)
             threads = [dict(tid=int(p.name), comm=(p / "comm").read_text().strip(),
                             affinity=sorted(os.sched_getaffinity(int(p.name))))
                        for p in (proc / "task").iterdir()
@@ -99,6 +101,7 @@ def main():
     parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--magic-trace", type=Path, help="Use Intel PT on node 0 engine leader instead of Nsight")
     parser.add_argument("--magic-host-module", help="Exact loaded JIT DSO basename owning the CPU engine; required if ambiguous")
+    parser.add_argument("--no-instrumentation", action="store_true", help="compile metrics out; retain only independent forward trigger")
     parser.add_argument("--draft-pending-trigger-us", type=int, default=500)
     parser.add_argument("--draft-arrival-trigger-us", type=int, default=500)
     parser.add_argument("--draft-forward-trigger-us", type=int, default=5000)
@@ -107,6 +110,8 @@ def main():
     args = parser.parse_args()
     if args.magic_health_diagnostic and not args.magic_trace:
         parser.error("magic-health-diagnostic requires magic-trace")
+    if args.no_instrumentation and (not args.magic_trace or args.draft_pending_trigger_us or args.draft_arrival_trigger_us):
+        parser.error("no-instrumentation requires magic-trace and zero pending/arrival thresholds")
     if not 10 <= args.seconds <= 120:
         parser.error("seconds must be in [10, 120]")
     output = args.output.resolve()
@@ -129,15 +134,17 @@ def main():
     if args.magic_health_diagnostic:
         env["DSV41_DIAGNOSTIC_STOP_FILE"] = str(output / "diagnostic.stop")
     # These are inherited by the server; existing capture adds its own prefixes.
-    env.update(SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX=str(output / "hold"),
+    env["SGLANG_CPU_EXPERT_TRACE_GATE"] = str(trace_gate_path)
+    if not args.no_instrumentation:
+        env.update(SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX=str(output / "hold"),
                SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY="65536",
                SGLANG_CPU_EXPERT_TRACE_GATE=str(trace_gate_path),
                SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX=str(output / "scratch"))
     command = [sys.executable, str(Path(__file__).with_name("run_stall_capture.py")),
                "--reference", str(args.reference), "--output", str(output),
-               "--port", str(args.port), "--no-nsys", "--worker-phases",
-               "--worker-min-us", "0", "--worker-capacity", "262144",
-               "--job-capacity", "1048576"]
+               "--port", str(args.port), "--no-nsys"]
+    command += (["--no-instrumentation"] if args.no_instrumentation else
+                ["--worker-phases", "--worker-min-us", "0", "--worker-capacity", "262144", "--job-capacity", "1048576"])
     if args.magic_trace:
         command += ["--draft-arrival-trigger-us", str(args.draft_arrival_trigger_us),
                     "--draft-pending-trigger-us", str(args.draft_pending_trigger_us),
@@ -167,7 +174,8 @@ def main():
                                start_new_session=True)
         try:
             while arm.poll() is None or (profiler is not None and profiler.poll() is None):
-                sample_runtime(manifest_dir, samples)
+                if not args.no_instrumentation or profiler is None:
+                    sample_runtime(manifest_dir, samples, counters=not args.no_instrumentation)
                 ready = any('"label": "server_ready"' in p.read_text()
                             for p in output.glob("servers/*/*/boundary-samples.jsonl"))
                 if args.magic_health_diagnostic:
@@ -182,7 +190,7 @@ def main():
                         addresses = {}
                         for line in mappings:
                             fields = line.split()
-                            if len(fields) < 6 or fields[2] != "00000000" or "expert_stream_host_exl3_instr" not in fields[-1]:
+                            if len(fields) < 6 or fields[2] != "00000000" or "expert_stream_host_exl3_" not in fields[-1]:
                                 continue
                             if args.magic_host_module and Path(fields[-1]).name != args.magic_host_module:
                                 continue
@@ -243,6 +251,15 @@ def main():
                 if (args.magic_trace and gate_opened and profiler.poll() is None and not profiler_stop_requested
                         and "Snapshot taken" not in profile_text and time.monotonic() - profile_started > args.seconds):
                     profiler_stop_requested = True
+                    # v1.2.4 SIGINT alone can yield AUX bookkeeping without PT
+                    # bytes. Snapshot only this collector's recorder first.
+                    helper_spec = importlib.util.spec_from_file_location("magic_capture",
+                        ROOT / "tools/skills/magic-trace/scripts/capture.py")
+                    sys.path.insert(0, str(ROOT / "tools/skills/magic-trace/scripts"))
+                    helper = importlib.util.module_from_spec(helper_spec); helper_spec.loader.exec_module(helper)
+                    recorder = helper.owned_perf(profiler.pid, output / "magic-work/perf.data")
+                    os.kill(recorder, signal.SIGUSR2)
+                    time.sleep(.5)
                     profiler.send_signal(signal.SIGINT)  # bounded fallback snapshot if no threshold fired
                 if args.magic_health_diagnostic and gate_opened and profiler.poll() is not None:
                     (output / "diagnostic.stop").touch()
@@ -256,7 +273,7 @@ def main():
             if master is not None:
                 os.close(master)
             trace_gate.close()
-        if args.magic_trace and gate_opened and arm.returncode == 0:
+        if args.magic_trace and gate_opened and arm.returncode == 0 and not args.no_instrumentation:
             info = json.loads((output / "magic-command.json").read_text())
             clock_path = output / f"events.{info['pid']}.draft-clock-end.json"
             clock_env = {**env, "PYTHONPATH": str(ROOT/"python"),
@@ -267,6 +284,7 @@ def main():
                     env=clock_env, stdout=clock_log, stderr=subprocess.STDOUT, check=True, timeout=180)
         status = dict(arm_status=arm.returncode, profiler_status=profiler.returncode if profiler else None,
                       diagnostic_only=args.magic_health_diagnostic,
+                      instrumentation=not args.no_instrumentation,
                       gate_opened=gate_opened, scheduler_report=str(report) + ".nsys-rep")
         if args.magic_trace:
             trace = output / "draft-delay.fxt.gz"
@@ -278,6 +296,10 @@ def main():
             raise SystemExit(1)
         if args.magic_trace and status["trace_bytes"] <= 100:
             raise SystemExit("magic-trace decoded an empty timeline")
+        if args.magic_trace:
+            subprocess.run([sys.executable, str(ROOT / "tools/skills/magic-trace/scripts/verify_trace.py"),
+                            str(output / "draft-delay.fxt.gz"), "--perf-data", str(output / "magic-work/perf.data"),
+                            "--log", str(output / "scheduler.log"), "--output", str(output / "trace-verification.json")], check=True)
 
 
 if __name__ == "__main__":

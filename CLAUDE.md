@@ -29,3 +29,71 @@ To use nsys refer to '/opt/nvidia/nsight-systems/2026.5.1/skills/nsight-systems/
   the cache-resident benchmark above. HBM and PCIe ceilings both work for this.
 - PCIe transfers cannot be flattered by L2, so H2D figures are unaffected; this
   applies to device-to-device work.
+
+## magic-trace / DSpark CPU traces
+
+- The portable skill lives in `tools/skills/magic-trace/` and is installed on
+  the laptop as `~/.codex/skills/magic-trace/`. Invoke it with “magic-trace
+  <binary>” or `$magic-trace`. Keep download/setup, Intel PT/perf compatibility,
+  ELF/PIE address resolution, validated snapshots, laptop copying and viewer
+  instructions in the skill; the points below describe this repository.
+- Start from the normal optimized JIT build. The exported
+  `sglang_draft_delay_trigger` uses `noinline` plus volatile asm so its real call
+  survives optimization. The original call sites lived inside
+  `if constexpr (Build::kMetrics)`; disabling metrics discarded those branches.
+  That is compile-time elimination, not an inlining bug. A counters-off capture
+  needs an independent trigger build switch and reachable call site; preserving
+  the function symbol alone does not establish that the engine can call it.
+- `benchmarks/dsv41_baseline/run_omp_serving_capture.py` is the existing serving
+  capture driver. `--magic-trace PATH` selects Intel PT, and
+  `--draft-arrival-trigger-us`, `--draft-pending-trigger-us`, and
+  `--draft-forward-trigger-us` select threshold reasons 2, 0 and 1 respectively.
+  The original metrics mode uses
+  `SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX` and a bounded mapped trace gate. Wait
+  for the collector's `[ Attached.` before opening that gate. A
+  `--magic-health-diagnostic` capture starts at HTTP health and is diagnostic
+  only; it does not establish steady-state throughput or bypass benchmark gates.
+- For detailed-counters-off comparisons, the driver's `--no-instrumentation`
+  selects `SGLANG_DRAFT_DELAY_TRIGGER_ONLY=1` and a separately cached
+  `prod_trigger` host DSO with metrics false. It retains
+  `SGLANG_DRAFT_FORWARD_TRIGGER_US` and the
+  `SGLANG_CPU_EXPERT_TRACE_GATE` admission gate; arrival/pending thresholds are
+  unavailable in this mode. The trigger reuses production forward start/end
+  clocks, checks the gate once per completed forward and fires once, with no
+  extra clock reads or event buffers. Optional
+  `SGLANG_DRAFT_DELAY_TRIGGER_REPORT_PREFIX` saves one trigger result at
+  shutdown. Label this trigger-only, detailed-counters-off capture precisely.
+- Resolve the active instrumented **host** JIT DSO from the live engine's
+  ownership, build identity and mappings. Multiple loaded host libraries can
+  export the same trigger, including unused variants. Do not select the last
+  matching mapping. The trigger's printed attach address must match the live
+  address after PIE adjustment. OpenMP workers inherit `exl3-cpu-exp0`/`1`
+  names: a matching `comm` alone does not identify the engine leader. Use the
+  runtime manifest, owning scheduler and affinity/creation model to select its
+  actual TID. Save this resolution with the capture.
+- GPU publication uses `%globaltimer`; CPU markers use `CLOCK_MONOTONIC`.
+  Correlate them with the saved `draft-clock*.json` anchors and retain their
+  uncertainty/drift limits. `draft_start` follows request reading/compaction;
+  use `draft_observed`, `draft_selected`, `draft_record_ready` and
+  `draft_payload_ready` to inspect preceding delay. Do not interpret the GPU
+  publication timestamp as the exact release/head-store instant.
+- The divix01 tool tested here is
+  `/data/models/slang/nvfp4-work/tools/magic-trace-v1.2.4`. Its perf 6.12 decoder
+  needs the narrow `tr strt jmp` adapter:
+  `MAGIC_TRACE_PERF_PATH=$PWD/benchmarks/dsv41_baseline/magic_trace_perf_compat.py`.
+  The portable skill has its own independent adapter. Keep raw `perf.data`.
+  A tiny FXT/exit 0/“Snapshot taken” can still mean no events and no saved PT
+  payload; validate both the timeline and AUXTRACE records before delivery.
+- Reference model capture (2026-10-07): laptop
+  `~/Downloads/dsv41-magic-trace-20261007/model-capture/draft-delay.fxt.gz`,
+  SHA256 `ed80ce216b381489348cbda09553033a3faf9163e0ded021010e118647ebe319`,
+  91,928 events. It triggered after a 5.04 ms draft forward and has five PT
+  overflows, so gaps are not evidence of continuous execution. Siblings named
+  `failed-worker-capture` and `failed-trigger-capture` are rejected attempts,
+  not usable timelines. Seeing `keep_warm_either` frames establishes control
+  flow, not the cause of a memory or scheduling stall.
+- Follow `.claude/rules/divix01-run-protocol.md`: commit/push/pull code into a
+  private worktree, cap CPU jobs to cores 0–63 with `OMP_NUM_THREADS`, and use
+  the disk/GPU locks for serving. Write artifacts to disk, preserve failed
+  attempts separately, and checksum completed laptop copies. Shut down normally
+  when bounded application buffers need flushing.
