@@ -47,10 +47,12 @@ int main() {
     production = work / "production.cpp"
     production.write_text(r'''
 #include "worker_trace.hpp"
+#include "moe/expert_stream/host/cpu_experts/team.hpp"
 using namespace sglang::exl3_cpu::worker_trace;
 static_assert(std::is_empty_v<Capture<false>>);
 int main() { Capture<false> c(4,6,3); c.team_start(); c.worker_start(0);
- c.begin(0,0); c.add_work(0,0,3); c.work_end(0,0); c.end(0,0); c.worker_end(0); c.finish(); }
+ c.begin(0,0); c.add_work(0,0,3); c.work_end(0,0); c.end(0,0); c.worker_end(0); c.finish();
+ sglang::cpu_experts::run_team(1, [](int, int) {}); }
 ''')
     outputs = []
     for name, src, flags in [("probe", source, ["-DON=true"]), ("production", production, [])]:
