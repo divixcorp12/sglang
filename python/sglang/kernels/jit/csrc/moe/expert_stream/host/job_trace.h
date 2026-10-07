@@ -30,7 +30,8 @@ class JobTrace<true> {
   explicit JobTrace(const std::string& name) {
     const char* prefix = std::getenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX");
     if (!prefix || !*prefix) return;
-    path_ = std::string(prefix) + "." + std::to_string(getpid()) + "." + name + ".jsonl";
+    path_ = std::string(prefix) + "." + std::to_string(getpid()) + "." + name + "." +
+            std::to_string(instances_.fetch_add(1, std::memory_order_relaxed)) + ".jsonl";
     events_ = std::make_unique<Event[]>(kCapacity);
     monotonic_ns_ = clock_ns();
     timespec wall{};
@@ -76,6 +77,7 @@ class JobTrace<true> {
     int group;
     int64_t a, b, c;
   };
+  inline static std::atomic<size_t> instances_{0};
   static constexpr size_t kCapacity = 131072;
   std::string path_;
   std::unique_ptr<Event[]> events_;

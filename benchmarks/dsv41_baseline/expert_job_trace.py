@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 
 
-def summarize(pattern):
+def summarize(pattern, start_ns=None, end_ns=None):
     cpus, copies, gates = {}, defaultdict(dict), {}
     clocks, events = [], []
     for filename in sorted(glob.glob(pattern)):
@@ -30,7 +30,10 @@ def summarize(pattern):
             kind = e["event"]
             if kind.startswith("cpu_"):
                 e["group"] = cpu_group
-                cpus.setdefault((cpu_group, e["seq"], e["row"]), {})[kind] = e
+                job = cpus.setdefault((cpu_group, e["seq"], e["row"]), {})
+                if kind in job:
+                    raise ValueError("duplicate CPU identity; select one process/service per input pattern")
+                job[kind] = e
             elif kind == "gate_open":
                 gates[e["gen"]] = e
             elif kind.startswith("copy_") or kind == "group_done":
@@ -40,6 +43,10 @@ def summarize(pattern):
         needed = {"copy_submit", "copy_issue", "copy_dma_observed", "group_done"}
         if not needed <= record.keys() or gen not in gates:
             raise ValueError(f"incomplete copy record: {gen}, {group}")
+        if start_ns is not None and gates[gen]["ns"] < start_ns:
+            continue
+        if end_ns is not None and gates[gen]["ns"] > end_ns:
+            continue
         submit, dma, issue = (record[k] for k in ("copy_submit", "copy_dma_observed", "copy_issue"))
         last_seq = submit["a"] if submit["b"] else submit["seq"]
         jobs = [job for (g, seq, row), job in cpus.items()
@@ -88,8 +95,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pattern")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--start-ns", type=int)
+    parser.add_argument("--end-ns", type=int)
     args = parser.parse_args()
-    result, events = summarize(args.pattern)
+    result, events = summarize(args.pattern, args.start_ns, args.end_ns)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     # Chrome/Perfetto importable companion. Original event labels/fields remain available on each instant.
     origin = min(e["ns"] for e in events)
