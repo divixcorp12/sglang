@@ -5,6 +5,7 @@ Run after shutdown: python expert_job_trace.py '/path/events.*.jsonl' --output f
 """
 
 import argparse
+import bisect
 from collections import Counter, defaultdict
 import glob
 import json
@@ -38,6 +39,12 @@ def summarize(pattern, start_ns=None, end_ns=None):
                 gates[e["gen"]] = e
             elif kind.startswith("copy_") or kind == "group_done":
                 copies[e["gen"], e["group"]][kind] = e
+    cpu_index = defaultdict(list)
+    for (group, seq, row), job in cpus.items():
+        cpu_index[group, row].append((seq, job))
+    for key, values in cpu_index.items():
+        values.sort(key=lambda item: item[0])
+        cpu_index[key] = ([item[0] for item in values], [item[1] for item in values])
     rows = []
     for (gen, group), record in copies.items():
         needed = {"copy_submit", "copy_issue", "copy_dma_observed", "group_done"}
@@ -49,8 +56,8 @@ def summarize(pattern, start_ns=None, end_ns=None):
             continue
         submit, dma, issue = (record[k] for k in ("copy_submit", "copy_dma_observed", "copy_issue"))
         last_seq = submit["a"] if submit["b"] else submit["seq"]
-        jobs = [job for (g, seq, row), job in cpus.items()
-                if g == group and row == submit["row"] and submit["seq"] <= seq <= last_seq]
+        sequences, candidates = cpu_index.get((group, submit["row"]), ([], []))
+        jobs = candidates[bisect.bisect_left(sequences, submit["seq"]):bisect.bisect_right(sequences, last_seq)]
         has_cpu = bool(submit["b"] or submit["c"])
         if has_cpu and (not jobs or any(not {"cpu_submit", "cpu_start", "cpu_end", "cpu_shape"} <= j.keys() for j in jobs)):
             raise ValueError(f"incomplete CPU record: {gen}, {group}")
@@ -89,9 +96,37 @@ def summarize(pattern, start_ns=None, end_ns=None):
     if not rows:
         raise ValueError("no completed copy records")
     rows.sort(key=lambda r: (r["gen"], r["group"]))
+    layers = []
+    by_gen = defaultdict(list)
+    for row in rows:
+        by_gen[row["gen"]].append(row)
+    for gen, groups in by_gen.items():
+        required = gates[gen]["a"]
+        if required and sum(1 << g["group"] for g in groups) != required:
+            raise ValueError(f"missing NUMA group: {gen}")
+        cpu_end = max(g["cpu_end_ns"] for g in groups)
+        dma_groups = [g for g in groups if g["dma_bytes"]]
+        dma_upper = max((g["dma_done_observed_ns"] for g in dma_groups), default=0)
+        dma_lower = max((g["dma_pending_ns"] for g in dma_groups), default=0)
+        if not cpu_end:
+            last = "dma_only" if dma_groups else "no_work"
+        elif not dma_groups:
+            last = "cpu_only"
+        elif cpu_end > dma_upper + 10_000:
+            last = "cpu_last_confirmed"
+        elif dma_lower > cpu_end + 10_000:
+            last = "dma_last_confirmed"
+        else:
+            last = "ambiguous"
+        layers.append({"gen": gen, "row": groups[0]["row"], "last": last,
+                       "gate_ns": gates[gen]["ns"],
+                       "host_to_gate_ms": (gates[gen]["ns"] - min(g["submit_ns"] for g in groups)) / 1e6,
+                       "cpu_end_ns": cpu_end, "dma_pending_ns": dma_lower, "dma_done_observed_ns": dma_upper})
     return {"clock": "CLOCK_MONOTONIC", "clock_anchors": clocks,
             "classification_tolerance_ns": 10_000, "group_records": len(rows),
-            "classifications": dict(Counter(r["last"] for r in rows)), "rows": rows}, events
+            "classifications": dict(Counter(r["last"] for r in rows)), "rows": rows,
+            "layer_records": len(layers), "layer_classifications": dict(Counter(r["last"] for r in layers)),
+            "layer_rows": layers}, events
 
 
 def main():
@@ -109,7 +144,7 @@ def main():
                "tid": e["group"], "ts": (e["ns"] - origin) / 1000,
                "args": e} for e in events]
     args.output.with_suffix(".timeline.json").write_text(json.dumps({"traceEvents": chrome}))
-    print(json.dumps({k: v for k, v in result.items() if k not in ("rows", "clock_anchors")}, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k not in ("rows", "layer_rows", "clock_anchors")}, indent=2))
 
 
 if __name__ == "__main__":

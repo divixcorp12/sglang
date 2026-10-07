@@ -74,6 +74,7 @@ def test_classifier_respects_dma_completion_interval(tmp_path):
               event("group_done", 210000), event("gate_open", 220000)])
         result, _ = module.summarize(str(tmp_path / "events.*.jsonl"))
         assert result["rows"][0]["last"] == expected
+        assert result["layer_rows"][0]["last"] == expected
         assert result["rows"][0]["token_expert_routes"] == 1
     write("events.1.copy.jsonl", [event("copy_submit", 1000)])
     with pytest.raises(ValueError, match="incomplete copy"):
