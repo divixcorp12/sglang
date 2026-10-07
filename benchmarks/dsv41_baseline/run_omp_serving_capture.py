@@ -141,6 +141,7 @@ def main():
     master = slave = None
     gate_opened = False
     profiler_ready = False
+    profiler_stop_requested = False
     profile_text = ""
     with (output / "driver.log").open("w") as log, \
          (output / "runtime-samples.jsonl").open("w") as samples, \
@@ -221,7 +222,9 @@ def main():
                 if profiler is not None and not gate_opened and (
                         profiler.poll() is not None or time.monotonic() - profile_started > 45):
                     raise RuntimeError("scheduler profiler did not become ready; gate remains closed")
-                if args.magic_trace and gate_opened and profiler.poll() is None and time.monotonic() - profile_started > args.seconds:
+                if (args.magic_trace and gate_opened and profiler.poll() is None and not profiler_stop_requested
+                        and "Snapshot taken" not in profile_text and time.monotonic() - profile_started > args.seconds):
+                    profiler_stop_requested = True
                     profiler.send_signal(signal.SIGINT)  # bounded fallback snapshot if no threshold fired
                 time.sleep(.25)
         finally:

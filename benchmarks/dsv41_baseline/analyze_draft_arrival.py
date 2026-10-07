@@ -5,7 +5,6 @@ from pathlib import Path
 
 
 def summarize(root):
-    anchors = [json.loads(p.read_text()) for p in root.glob("events.*.draft-clock*.json")]
     clocks = {}
     for p in root.glob("events.*.draft-clock*.json"):
         pid = int(p.name.split(".")[1])

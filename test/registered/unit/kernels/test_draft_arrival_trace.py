@@ -123,3 +123,34 @@ def test_perf_compat_preserves_data_and_only_normalizes_trace_start():
     assert len(result)==len(line)
     assert module.normalize(line.replace("tr strt jmp", "return"))==line.replace("tr strt jmp", "return")
     assert module.normalize("symbol containing tr strt jmp\n")=="symbol containing tr strt jmp\n"
+
+
+def test_arrival_analysis_joins_epochs_and_bounds_clock_uncertainty(tmp_path):
+    import importlib.util
+    spec=importlib.util.spec_from_file_location("arrival",ROOT/"benchmarks/dsv41_baseline/analyze_draft_arrival.py")
+    module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    events=[]
+    names=["draft_observed","draft_selected","draft_record_ready","draft_payload_ready","draft_start","draft_end"]
+    for epoch in (1,2):
+        for i,name in enumerate(names):
+            events.append(dict(event=name,ns=110000+i*1000,row=0,gen=epoch,seq=1,group=-1,a=100000,b=99,c=0))
+    path=tmp_path/"events.42.engine.jsonl"
+    def write(footer):
+        path.write_text("\n".join(json.dumps(e) for e in [*reversed(events),*footer]))
+    write([dict(dropped=0)])
+    (tmp_path/"events.42.draft-clock.json").write_text(json.dumps(dict(offset_low=1000,offset_high=3000)))
+    (tmp_path/"events.42.draft-clock-end.json").write_text(json.dumps(dict(offset_low=2000,offset_high=2500)))
+    result=module.summarize(tmp_path)
+    assert len(result["requests"])==2 and {r["epoch"] for r in result["requests"]}=={1,2}
+    assert all(r["publication_to_observe_us"]==[7.5,8.0] for r in result["requests"])
+    assert result["stats"]["select_us"]["max"]==1.0
+    write([dict(dropped=1)])
+    with pytest.raises(ValueError,match="overflow"):
+        module.summarize(tmp_path)
+    write([])
+    with pytest.raises(ValueError,match="footer"):
+        module.summarize(tmp_path)
+    write([dict(dropped=0)])
+    (tmp_path/"events.42.draft-clock-end.json").write_text(json.dumps(dict(offset_low=4000,offset_high=4500)))
+    with pytest.raises(ValueError,match="clock anchor intervals disagree"):
+        module.summarize(tmp_path)
