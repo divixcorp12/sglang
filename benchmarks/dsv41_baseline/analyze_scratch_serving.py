@@ -7,6 +7,7 @@ import argparse
 import bisect
 from collections import Counter, defaultdict
 import json
+import math
 from pathlib import Path
 import statistics
 import sqlite3
@@ -24,7 +25,7 @@ def stats(values, scale=1000):
     if not values:
         return None
     return dict(n=len(values), median=statistics.median(values) / scale,
-                p95=values[int((len(values) - 1) * .95)] / scale,
+                p95=values[math.ceil(len(values) * .95) - 1] / scale,
                 max=values[-1] / scale, sum=sum(values) / scale)
 
 
@@ -153,6 +154,8 @@ def analyze(root):
             forward_us=stats([f['wall'] for f in fs]), entry_us=stats([f['entry'] for f in fs]),
             join_us=stats([f['join'] for f in fs]), barrier_tail_us=stats(tails),
             barrier_over_1ms=sum(t > 1000000 for t in tails),
+            worker_minor_faults=sum(w['minflt'] for f in fs for w in f['phases'][0]['workers']),
+            worker_major_faults=sum(w['majflt'] for f in fs for w in f['phases'][0]['workers']),
             scratch_us=stats([r['end'] - r['begin'] for r in scratches]),
             scratch_with_growth=sum(bool(r['growths']) for r in scratches),
             scratch_without_growth_us=stats([r['end'] - r['begin'] for r in scratches if not r['growths']]),
