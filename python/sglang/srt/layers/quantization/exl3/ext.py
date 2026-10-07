@@ -118,6 +118,17 @@ def build_flavor(defines: list[str]) -> str:
     return flavor
 
 
+def worker_trace_defines() -> list[str]:
+    """A separate diagnostic CPU build; normal forwards compile no worker trace state or clock reads."""
+    if not os.environ.get("SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX"):
+        return []
+    if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        raise ValueError("EXL3 worker tracing requires the optimized CPU expert kernel")
+    if not os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"):
+        raise ValueError("EXL3 worker tracing requires instrumented expert job tracing for attribution")
+    return ["-DEXL3_MOE_CPU_WORKER_TRACE=1"]
+
+
 def extension_sources(ext_dir: str, cpu_kernel: str | None = None) -> list[str]:
     """Every C/C++/CUDA source under ``ext_dir``; ``cpu_kernel`` replaces upstream's cpu/moe_mul1.cpp."""
     upstream = os.path.join(ext_dir, _UPSTREAM_CPU_KERNEL)
@@ -160,6 +171,10 @@ def exl3_ext():
     build_dir = os.path.expanduser(envs.SGLANG_EXL3_BUILD_DIR.get())
     if flavor:
         build_dir = os.path.join(build_dir, flavor.lstrip("_"))
+    trace_defines = worker_trace_defines()
+    if trace_defines:
+        # Same extension name/CUDA flags, separate build directory: CUDA objects may be reused, CPU flags differ.
+        build_dir = os.path.join(build_dir, "worker_trace")
     os.makedirs(build_dir, exist_ok=True)
     # sm_120 only: the RTX 5090 is the one target, and an unset list makes torch
     # probe the GPU, which a CPU-only build must not touch.
@@ -181,6 +196,7 @@ def exl3_ext():
             extra_include_paths=[ext_dir] + ([os.path.join(ext_dir, "cpu")] if flavor else []),
             extra_cflags=_EXTRA_CFLAGS
             + defines
+            + trace_defines
             + (["-march=native", "-std=c++20", "-fopenmp", "-pthread"] if optimized else []),
             extra_ldflags=["-fopenmp"] if optimized else [],
             extra_cuda_cflags=_EXTRA_CUDA_CFLAGS,

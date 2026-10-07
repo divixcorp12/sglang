@@ -14,6 +14,7 @@
 #include "math_avx2.hpp"
 #include "math_scalar.hpp"
 #include "shapes.hpp"
+#include "worker_trace.hpp"
 #include <c10/util/Half.h>
 #include <algorithm>
 #include <array>
@@ -442,7 +443,7 @@ struct PlanTraits<Dsv41Shape, Isa::Bw>
 
 // Profile: time each phase (its barrier included) on worker 0 and print "moe_cpu phases(us)" after the forward. Off,
 // the plan holds no timing code at all.
-template <class Shape, Isa I, bool Profile = false>
+template <class Shape, Isa I, bool Profile = false, bool Trace = EXL3_MOE_CPU_WORKER_TRACE != 0>
 struct ForwardPlan
 {
     using Traits = PlanTraits<Shape, I>;
@@ -450,11 +451,14 @@ struct ForwardPlan
     // Sizes this call's scratch from the arena, runs the team, and returns. ctx.chunks must be non-empty.
     static void run(ForwardCtx& ctx, const Experts<Shape>& E, ForwardArena& ar, int threads)
     {
+        worker_trace::Capture<Trace> trace(threads > 0 ? threads : 1, ctx.m_total, int(ctx.chunks.size()));
         prepare_scratch(ctx, ar);
         const int nc = static_cast<int>(ctx.chunks.size());
         const bool grouped = Traits::kGroupedTraversal && nc == 1;
         const bool wide = Traits::kWideSingleExpert && ctx.m_total == 1 && nc == 1;
-        run_team(ctx, E, threads > 0 ? threads : 1, grouped, wide);
+        trace.team_start();
+        run_team(ctx, E, threads > 0 ? threads : 1, grouped, wide, trace);
+        trace.finish();
     }
 
 private:
@@ -535,17 +539,20 @@ private:
 
     // The phases on the framework's pinned team (team.hpp's run_team), which throws when the team is short or a
     // worker cannot be pinned.
-    static void run_team(ForwardCtx& ctx, const Experts<Shape>& E, int count, bool grouped, bool wide)
+    static void run_team(ForwardCtx& ctx, const Experts<Shape>& E, int count, bool grouped, bool wide,
+                         worker_trace::Capture<Trace>& trace)
     {
         [[maybe_unused]] double phase_us[6]{};
         ::sglang::cpu_experts::run_team(count, [&](int worker, int n) {
+            trace.worker_start(worker);
             if (ctx.zero_out && worker == 0)
                 std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->hidden * sizeof(float));
-            step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us);
-            step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us);
-            step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us);
-            step<Phase::Down>(ctx, E, worker, n, grouped, wide, phase_us);
-            step<Phase::Accumulate>(ctx, E, worker, n, grouped, wide, phase_us);
+            step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::Down>(ctx, E, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::Accumulate>(ctx, E, worker, n, grouped, wide, phase_us, trace);
+            trace.worker_end(worker);
         });
         if constexpr (Profile)
             printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",
@@ -557,15 +564,18 @@ private:
     // phase's value; otherwise it is untouched.
     template <Phase P>
     static void step(ForwardCtx& ctx, const Experts<Shape>& E, int worker, int n, bool grouped, bool wide,
-                     [[maybe_unused]] double* phase_us)
+                     [[maybe_unused]] double* phase_us, worker_trace::Capture<Trace>& trace)
     {
         using Clock = std::chrono::steady_clock;
         [[maybe_unused]] Clock::time_point begin;
         if constexpr (Profile) begin = Clock::now();
-        phase<P>(ctx, E, worker, n, grouped, wide);
+        trace.begin(worker, static_cast<int>(P));
+        phase<P>(ctx, E, worker, n, grouped, wide, trace);
+        trace.work_end(worker, static_cast<int>(P));
         if constexpr (P != Phase::Accumulate) {
             #pragma omp barrier
         }
+        trace.end(worker, static_cast<int>(P));
         if constexpr (Profile) {
             if (worker == 0)
                 phase_us[static_cast<int>(P)] = std::chrono::duration<double, std::micro>(Clock::now() - begin).count();
@@ -574,7 +584,8 @@ private:
 
     // One phase for this worker; P picks the phase at compile time, so each instantiation holds one phase's code.
     template <Phase P>
-    static void phase(ForwardCtx& c, const Experts<Shape>& E, int worker, int num_workers, bool grouped, bool wide)
+    static void phase(ForwardCtx& c, const Experts<Shape>& E, int worker, int num_workers, bool grouped, bool wide,
+                      worker_trace::Capture<Trace>& trace)
     {
         [[maybe_unused]] const int nc = static_cast<int>(c.chunks.size());
         [[maybe_unused]] const int H = Shape::hidden(*c.layer);
@@ -609,6 +620,7 @@ private:
                 const Exl3Projection& mat = up ? E.up(ch.expert) : E.gate(ch.expert);
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
+                trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
                 run_tiles<I>(mat, p, tout, ch.m, t0, t1, grouped);
             });
         }
@@ -637,6 +649,7 @@ private:
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
+                trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
                 run_tiles<I>(E.down(ch.expert), c.prep_d[j], tout, ch.m, t0, t1, grouped);
                 if constexpr (Traits::kSplitTiles == 8) {
                     transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,t0,t1);

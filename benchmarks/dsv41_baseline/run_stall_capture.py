@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=30029)
     parser.add_argument("--no-nsys", action="store_true", help="collect job resources and /proc only")
+    parser.add_argument("--worker-phases", action="store_true", help="compile EXL3 per-worker phase diagnostics")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     args.output = args.output.resolve()
@@ -41,11 +42,18 @@ def main():
     overrides = [arg for arg in reference["command"][4:]
                  if not arg.startswith(("SGLANG_MOE_HOT_METRICS_FILE=", "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=",
                                         "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=",
-                                        "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY="))]
+                                        "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY=",
+                                        "SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=",
+                                        "SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US=",
+                                        "SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY="))]
     overrides += ["SGLANG_MOE_HOT_METRICS_FILE=" + str(args.output / "metrics.jsonl"),
                   "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=" + prefix,
                   "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=1",
                   "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY=524288"]
+    if args.worker_phases:
+        overrides += ["SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=" + str(args.output / "worker-phases"),
+                      "SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US=6000",
+                      "SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY=131072"]
     command = ["bash", str(root / "benchmarks/dsv41_baseline/run_arm.sh"), "stall-cpu-s2",
                str(args.port), *overrides]
     imported = subprocess.check_output([sys.executable, "-c", "import sglang; print(sglang.__file__)"],
