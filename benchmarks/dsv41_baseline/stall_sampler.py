@@ -84,7 +84,8 @@ def main():
                     if not directory.name.isdecimal():
                         continue
                     try:
-                        if directory.joinpath("comm").read_text().strip() != "sglang::scheduler":
+                        # Linux comm may truncate the process title to 15 bytes.
+                        if not directory.joinpath("comm").read_text().strip().startswith("sglang::sched"):
                             continue
                         if wanted in directory.joinpath("environ").read_bytes().split(b"\0"):
                             selected = directory
