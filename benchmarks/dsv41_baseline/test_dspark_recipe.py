@@ -21,13 +21,14 @@ def test_dspark_env_turns_both_cpu_expert_clients_on_with_spill():
     assert env["SGLANG_DSV41_ENABLE_PREFILL_FILLS"] == "1"  # the recipe's, kept
 
 
-def test_prod_is_unchanged_until_the_switch():
-    assert arm_env.PROD_DSPARK is False
-    assert arm_env.prod_env() == arm_env.base_env()
-    assert "--speculative-algorithm" not in arm_env.ServerArgs.prod().argv()
-    assert arm_env.prod_env()["SGLANG_MOE_HOT_GPU_MB"] == "16080"
-    prod = arm_env.ServerArgs.prod().argv()
-    assert prod[prod.index("--mem-fraction-static") + 1] == "0.875"
+def test_prod_serves_the_dspark_mode():
+    assert arm_env.PROD_DSPARK is True
+    assert arm_env.prod_env() == arm_env.arm_env(arm_env.dspark_env())
+    argv = arm_env.ServerArgs.prod().argv()
+    assert argv[argv.index("--speculative-algorithm") + 1] == "DSPARK"
+    # Budget A (§33.11) comes with the mode.
+    assert arm_env.prod_env()["SGLANG_MOE_HOT_GPU_MB"] == "10840"
+    assert argv[argv.index("--mem-fraction-static") + 1] == "0.78"
 
 
 def test_dspark_server_args_use_the_dspark_mem_fraction():
