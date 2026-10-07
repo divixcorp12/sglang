@@ -2,7 +2,7 @@
 #pragma once
 
 #include "build_policy.h"
-#include "reader_base.h"
+#include <time.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -32,7 +32,7 @@ class JobTrace<true> {
     if (!prefix || !*prefix) return;
     path_ = std::string(prefix) + "." + std::to_string(getpid()) + "." + name + ".jsonl";
     events_ = std::make_unique<Event[]>(kCapacity);
-    monotonic_ns_ = now_ns();
+    monotonic_ns_ = clock_ns();
     timespec wall{};
     clock_gettime(CLOCK_REALTIME, &wall);
     epoch_ns_ = static_cast<int64_t>(wall.tv_sec) * 1'000'000'000 + wall.tv_nsec;
@@ -58,11 +58,16 @@ class JobTrace<true> {
   void emit(const char* kind, int64_t row, uint64_t gen, uint32_t seq, int group,
             int64_t a = 0, int64_t b = 0, int64_t c = 0) {
     if (!events_) return;
-    const int64_t ns = now_ns();
+    const int64_t ns = clock_ns();
     const size_t slot = next_.fetch_add(1, std::memory_order_relaxed);
     if (slot < kCapacity) events_[slot] = Event{kind, ns, row, gen, seq, group, a, b, c};
   }
  private:
+  static int64_t clock_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+  }
   struct Event {
     const char* kind;
     int64_t ns, row;
