@@ -602,6 +602,9 @@ class BasicCpuExpertEngine {
       uint64_t gpu_ns = 0;
       std::memcpy(&gpu_ns, raw + draft::kRecPublishNs, sizeof(gpu_ns));
       trace_.draft_selected(selected, stage, epoch, seq, gpu_ns);
+      int64_t offset_high = 0;
+      std::memcpy(&offset_high, d.channel + draft::kClockOffsetHigh, sizeof(offset_high));
+      trace_.draft_arrival(stage, epoch, seq, gpu_ns, offset_high);
     }
     // The slot and weight areas are kMaxK wide per token; the kernel reads [rows, k] contiguous, so compact them.
     int32_t slots[draft::kMaxRows * draft::kMaxK];

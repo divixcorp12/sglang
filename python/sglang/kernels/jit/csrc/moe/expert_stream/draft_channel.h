@@ -24,6 +24,8 @@ constexpr int64_t kRecK = 7;
 constexpr int64_t kRecEpoch = 8;
 // Diagnostic device-clock marker before the record/head release. Zero in uninstrumented records.
 constexpr int64_t kRecPublishNs = 16;
+// Diagnostic host clock calibration, initialized before any post. No production reader.
+constexpr int64_t kClockOffsetHigh = 1024;
 
 using DraftChannel = channel::ChannelSpec</*Head*/ 0, /*Ring*/ 128, /*Records*/ 4, /*RecordBytes*/ 128,
                                           /*Done*/ 640, /*Gate*/ 768>;

@@ -109,3 +109,15 @@ def test_magic_trace_trigger_and_decode(arrival_probe, tmp_path):
         for process in (probe,trace):
             if process is not None and process.poll() is None:
                 process.terminate(); process.wait(timeout=10)
+
+
+def test_perf_compat_preserves_data_and_only_normalizes_trace_start():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("compat", ROOT/"benchmarks/dsv41_baseline/magic_trace_perf_compat.py")
+    module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    line=" 807316/807316  737088.440126849:          1 branches:u:   tr strt jmp       0 [unknown] ([unknown]) =>     7f37efe45b61 read+0x11 (/usr/lib64/libc.so.6)\n"
+    result=module.normalize(line)
+    assert result == line.replace("tr strt jmp", "tr strt    ")
+    assert len(result)==len(line)
+    assert module.normalize(line.replace("tr strt jmp", "return"))==line.replace("tr strt jmp", "return")
+    assert module.normalize("symbol containing tr strt jmp\n")=="symbol containing tr strt jmp\n"

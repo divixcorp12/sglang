@@ -108,7 +108,8 @@ class DraftCpuDevice:
         prefix = os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
         if prefix:
             # Calibration IO is initialization only, never post()/finish() or graph replay.
-            self.calibrate_clock(str(prefix) + f".{os.getpid()}.draft-clock.json")
+            anchor = self.calibrate_clock(str(prefix) + f".{os.getpid()}.draft-clock.json")
+            self.areas.channel[1024:1032].view(torch.int64)[0] = anchor["offset_high"]
 
     def calibrate_clock(self, path: str) -> dict:
         samples = []

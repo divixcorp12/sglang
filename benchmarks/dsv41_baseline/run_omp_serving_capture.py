@@ -88,6 +88,7 @@ def main():
     parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--magic-trace", type=Path, help="Use Intel PT on node 0 engine leader instead of Nsight")
     parser.add_argument("--draft-pending-trigger-us", type=int, default=500)
+    parser.add_argument("--draft-arrival-trigger-us", type=int, default=500)
     parser.add_argument("--draft-forward-trigger-us", type=int, default=5000)
     args = parser.parse_args()
     if not 10 <= args.seconds <= 120:
@@ -120,7 +121,8 @@ def main():
                "--worker-min-us", "0", "--worker-capacity", "262144",
                "--job-capacity", "1048576"]
     if args.magic_trace:
-        command += ["--draft-pending-trigger-us", str(args.draft_pending_trigger_us),
+        command += ["--draft-arrival-trigger-us", str(args.draft_arrival_trigger_us),
+                    "--draft-pending-trigger-us", str(args.draft_pending_trigger_us),
                     "--draft-forward-trigger-us", str(args.draft_forward_trigger_us)]
     report = Path("/mnt/nvme1/dsv41-nsys") / (output.name + "-scheduler")
     profile_command = ["sudo", "-n", "/usr/local/sbin/nsys-profile", "profile",

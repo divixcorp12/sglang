@@ -55,6 +55,7 @@ class JobTrace<true> {
       capacity_ = static_cast<size_t>(parsed);
     }
     pending_threshold_ = threshold("SGLANG_DRAFT_PENDING_TRIGGER_US");
+    arrival_threshold_ = threshold("SGLANG_DRAFT_ARRIVAL_TRIGGER_US");
     forward_threshold_ = threshold("SGLANG_DRAFT_FORWARD_TRIGGER_US");
     events_ = std::make_unique<Event[]>(capacity_);
     const char* resources = std::getenv("SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE");
@@ -95,6 +96,13 @@ class JobTrace<true> {
     emit_at("draft_observed", observed_ns_, stage, epoch, seq, -1, gpu_ns, syscall(SYS_gettid));
     emit_at("draft_selected", selected, stage, epoch, seq, -1);
     emit("draft_record_ready", stage, epoch, seq, -1);
+  }
+  // Startup-correlated arrival estimate. The lower endpoint is conservative for the
+  // measured offset interval, but later clock drift must be checked by the analysis.
+  void draft_arrival(int stage, uint32_t epoch, uint32_t seq, uint64_t gpu_ns, int64_t offset_high) {
+    if (observed_ns_ && active() && gpu_ns && offset_high)
+      trigger(2, observed_ns_ - static_cast<int64_t>(gpu_ns) - offset_high,
+              arrival_threshold_, stage, epoch, seq);
   }
   void draft_prepared(int64_t ready, int stage, uint32_t epoch, uint32_t seq) {
     if (!observed_ns_ || !active()) return;
@@ -175,7 +183,7 @@ class JobTrace<true> {
   int resource_tid_ = 0;
   const void* observed_source_ = nullptr;
   uint32_t observed_seq_ = 0;
-  int64_t observed_ns_ = 0, pending_threshold_ = 0, forward_threshold_ = 0;
+  int64_t observed_ns_ = 0, pending_threshold_ = 0, forward_threshold_ = 0, arrival_threshold_ = 0;
   bool triggered_ = false;
 };
 
