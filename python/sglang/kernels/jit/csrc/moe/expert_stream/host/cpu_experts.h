@@ -457,6 +457,7 @@ class BasicCpuExpertEngine {
   int64_t run_job(const CpuJob& job) {
     const int64_t start = now_ns();
     if constexpr (Build::kMetrics) trace_.emit("cpu_start", job.row, 0, job.seq, -1, job.part, job.k);
+    if constexpr (Build::kMetrics) trace_.resources("cpu_faults_start", "cpu_switches_start", job.row, 0, job.seq);
     cpu_experts::ForwardCall call;
     call.rows = 1;
     call.k = job.k;
@@ -498,6 +499,7 @@ class BasicCpuExpertEngine {
     add(compute_ns_, end - start);
     add(jobs_done_, 1);
     add(lanes_done_, job.k);
+    if constexpr (Build::kMetrics) trace_.resources("cpu_faults_end", "cpu_switches_end", job.row, 0, job.seq);
     if constexpr (Build::kMetrics) trace_.emit("cpu_end", job.row, 0, job.seq, -1, job.part, job.k);
     done_.store(job.seq, std::memory_order_release);
     return end;
@@ -610,6 +612,7 @@ class BasicCpuExpertEngine {
     busy(kDraftJob, seq);
     const int64_t start = now_ns();
     if constexpr (Build::kMetrics) trace_.emit("draft_start", stage, epoch, seq, -1, rows, k, shared);
+    if constexpr (Build::kMetrics) trace_.resources("draft_faults_start", "draft_switches_start", stage, epoch, seq);
     try {
       layer.kernel->forward(layer, call);
     } catch (const std::exception& e) {
@@ -626,6 +629,7 @@ class BasicCpuExpertEngine {
       add(draft_shared_routes_, shared);
       add(draft_collided_forward_ns_, end - start);
     }
+    if constexpr (Build::kMetrics) trace_.resources("draft_faults_end", "draft_switches_end", stage, epoch, seq);
     if constexpr (Build::kMetrics) trace_.emit("draft_end", stage, epoch, seq, -1, rows, k, shared);
     channel::complete<DraftChannel>(d.channel, seq, static_cast<uint64_t>(epoch) << 32 | seq);
     draft_completed_.store(seq, std::memory_order_release);

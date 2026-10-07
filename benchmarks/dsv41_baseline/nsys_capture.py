@@ -32,21 +32,34 @@ GPU_METRICS_FIX = (
 )
 
 
-def gpu_metrics_args(requested: str | None) -> list[str]:
+def gpu_metrics_args(requested: str | None, system_cpu: str = "0") -> list[str]:
     """`nsys start` options for the root metrics-only session; NSYS_GPU_METRICS is 1 (the default) or 0."""
     value = (requested or "1").strip()
+    if system_cpu not in ("0", "1"):
+        raise ValueError("NSYS_SYSTEM_CPU must be 0 or 1")
     if value == "0":
+        if system_cpu == "1":
+            raise ValueError("NSYS_SYSTEM_CPU=1 needs NSYS_GPU_METRICS=1 for the root companion session")
         return []
     if value != "1":
         raise ValueError(f"NSYS_GPU_METRICS={requested!r}: must be 0 or 1")
     # sudo's env_reset drops CUDA_VISIBLE_DEVICES, so select every GPU; divix01 has one.
-    return [
+    args = [
         "--sample=none",
         "--cpuctxsw=none",
         "--gpu-metrics-devices=all",
         f"--gpu-metrics-set={GPU_METRICS_SET}",
         "--force-overwrite=true",
     ]
+    if system_cpu == "1":
+        args[:2] = [
+            "--sample=system-wide", "--cpuctxsw=system-wide", "--sampling-period=4000000",
+            "--samples-per-backtrace=4",
+            "--ftrace=sched/sched_switch,sched/sched_wakeup,vmscan/mm_vmscan_direct_reclaim_begin,"
+            "vmscan/mm_vmscan_direct_reclaim_end,compaction/mm_compaction_begin,"
+            "compaction/mm_compaction_end,exceptions/page_fault_user",
+        ]
+    return args
 
 
 def gpu_metrics_unavailable(devices_help: str) -> str | None:

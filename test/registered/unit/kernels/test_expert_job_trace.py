@@ -17,9 +17,19 @@ def trace_probe(tmp_path_factory):
 #include "job_trace.h"
 #include <thread>
 using namespace sglang::expert_stream;
-int main() {
-  { JobTrace<false> prod("prod"); prod.emit("forbidden", 0, 0, 0, 0); }
+int main(int argc, char**) {
+  { JobTrace<false> prod("prod"); prod.emit("forbidden", 0, 0, 0, 0);
+    prod.resources("forbidden", "forbidden", 0, 0, 0); }
   JobTrace<true> trace("probe");
+  if (argc > 1) {
+    trace.resources("cpu_faults_start", "cpu_switches_start", 0, 0, 1);
+    volatile char* memory = new char[4 << 20];
+    for (int i=0; i<(4 << 20); i+=4096) memory[i] = 1;
+    usleep(2000);
+    delete[] memory;
+    trace.resources("cpu_faults_end", "cpu_switches_end", 0, 0, 1);
+    return 0;
+  }
   std::thread a([&] { for (int i=0; i<70000; ++i) trace.emit("a", i, 1, i, 0); });
   std::thread b([&] { for (int i=0; i<70000; ++i) trace.emit("b", i, 1, i, 1); });
   a.join(); b.join();
@@ -53,6 +63,20 @@ def test_disabled_trace_writes_nothing(trace_probe, tmp_path):
     env.pop("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", None)
     subprocess.run([str(trace_probe)], check=True, env=env, cwd=tmp_path)
     assert not list(tmp_path.iterdir())
+
+
+def test_thread_resource_snapshots_observe_faults_and_sleep(trace_probe, tmp_path):
+    subprocess.run([str(trace_probe), "resources"], check=True, env={**os.environ,
+                   "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
+                   "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE": "1"})
+    records = [json.loads(line) for line in next(tmp_path.glob("events.*.jsonl")).read_text().splitlines()]
+    events = {r["event"]: r for r in records[1:-1]}
+    assert len(events) == 4 and records[-1]["dropped"] == 0
+    assert events["cpu_faults_end"]["a"] > events["cpu_faults_start"]["a"]
+    assert events["cpu_faults_end"]["b"] >= events["cpu_faults_start"]["b"]
+    assert events["cpu_faults_end"]["c"] == events["cpu_faults_start"]["c"] > 0
+    assert events["cpu_switches_end"]["a"] > events["cpu_switches_start"]["a"]
+    assert events["cpu_switches_end"]["c"] >= events["cpu_switches_start"]["c"]
 
 
 def test_classifier_respects_dma_completion_interval(tmp_path):

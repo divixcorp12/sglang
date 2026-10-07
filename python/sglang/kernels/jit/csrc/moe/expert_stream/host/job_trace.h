@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace sglang::expert_stream {
@@ -20,6 +22,7 @@ class JobTrace<false> {
   explicit JobTrace(const std::string&) {}
   bool enabled() const { return false; }
   void emit(const char*, int64_t, uint64_t, uint32_t, int, int64_t = 0, int64_t = 0, int64_t = 0) {}
+  void resources(const char*, const char*, int64_t, uint64_t, uint32_t) {}
 };
 
 // Writers reserve distinct slots; no reader touches them until every producer and consumer has joined.
@@ -33,6 +36,8 @@ class JobTrace<true> {
     path_ = std::string(prefix) + "." + std::to_string(getpid()) + "." + name + "." +
             std::to_string(instances_.fetch_add(1, std::memory_order_relaxed)) + ".jsonl";
     events_ = std::make_unique<Event[]>(kCapacity);
+    const char* resources = std::getenv("SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE");
+    resources_ = resources && std::string_view(resources) == "1";
     monotonic_ns_ = clock_ns();
     timespec wall{};
     clock_gettime(CLOCK_REALTIME, &wall);
@@ -63,6 +68,21 @@ class JobTrace<true> {
     const size_t slot = next_.fetch_add(1, std::memory_order_relaxed);
     if (slot < kCapacity) events_[slot] = Event{kind, ns, row, gen, seq, group, a, b, c};
   }
+  // Only the engine's owning CPU thread calls this. These are its counters, not the worker team's sum.
+  void resources(const char* faults, const char* switches, int64_t row, uint64_t gen, uint32_t seq) {
+    if (!resources_) return;
+    if (!resource_tid_) resource_tid_ = static_cast<int>(syscall(SYS_gettid));
+    rusage usage{};
+    if (getrusage(RUSAGE_THREAD, &usage) != 0) {
+      emit(faults, row, gen, seq, -1, -1, -1, resource_tid_);
+      emit(switches, row, gen, seq, -1, -1, -1, -1);
+      return;
+    }
+    const int64_t cpu_ns = (static_cast<int64_t>(usage.ru_utime.tv_sec) + usage.ru_stime.tv_sec) * 1'000'000'000 +
+                           (static_cast<int64_t>(usage.ru_utime.tv_usec) + usage.ru_stime.tv_usec) * 1000;
+    emit(faults, row, gen, seq, -1, usage.ru_minflt, usage.ru_majflt, resource_tid_);
+    emit(switches, row, gen, seq, -1, usage.ru_nvcsw, usage.ru_nivcsw, cpu_ns);
+  }
  private:
   static int64_t clock_ns() {
     timespec ts{};
@@ -83,6 +103,8 @@ class JobTrace<true> {
   std::unique_ptr<Event[]> events_;
   std::atomic<size_t> next_{0};
   int64_t monotonic_ns_ = 0, epoch_ns_ = 0;
+  bool resources_ = false;
+  int resource_tid_ = 0;
 };
 
 static_assert(std::is_empty_v<JobTrace<false>>, "production job tracing is empty");

@@ -270,10 +270,10 @@ except ValueError as error:
 import sys
 import nsys_capture
 try:
-    print(' '.join(nsys_capture.gpu_metrics_args(sys.argv[1])))
+    print(' '.join(nsys_capture.gpu_metrics_args(sys.argv[1], sys.argv[2])))
 except ValueError as e:
     sys.exit(str(e))
-" "${NSYS_GPU_METRICS:-}") || abort "$arm: bad NSYS_GPU_METRICS"
+" "${NSYS_GPU_METRICS:-}" "${NSYS_SYSTEM_CPU:-0}") || abort "$arm: bad NSYS_GPU_METRICS/NSYS_SYSTEM_CPU"
     # shellcheck disable=SC2206
     nsys_gpu_metrics=($nsys_gpu_metrics_line)
     nsys_sudo=(sudo -n "$(pyrun -c "import nsys_capture; print(nsys_capture.NSYS_SUDO_WRAPPER)")")
