@@ -53,7 +53,8 @@ def main():
     if args.worker_phases:
         overrides += ["SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=" + str(args.output / "worker-phases"),
                       "SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US=6000",
-                      "SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY=131072"]
+                      "SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY=131072",
+                      "SGLANG_EXL3_BUILD_DIR=" + str(args.output / "exl3-build")]
     command = ["bash", str(root / "benchmarks/dsv41_baseline/run_arm.sh"), "stall-cpu-s2",
                str(args.port), *overrides]
     imported = subprocess.check_output([sys.executable, "-c", "import sglang; print(sglang.__file__)"],
