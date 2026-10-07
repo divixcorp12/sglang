@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "linux" or not LIBRARY,
 
 
 def environment(tmp_path):
-    return {**os.environ, "PYTHONPATH": str(BOOTSTRAP),
+    return {**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT / "python"), str(BOOTSTRAP))),
             "DSV41_OMP_INIT_CPUS": ",".join(map(str, range(64))),
             "DSV41_OMP_LIBRARY": LIBRARY,
             "DSV41_OMP_MANIFEST_DIR": str(tmp_path / "manifests")}
@@ -27,11 +27,14 @@ def environment(tmp_path):
 def test_spawn_inherits_budget_and_restores_affinity(tmp_path):
     script = tmp_path / "spawn_probe.py"
     script.write_text('''
-import multiprocessing, os
+import multiprocessing, os, sglang
+from pathlib import Path
 def child():
     assert os.sched_getaffinity(0) == {6}
+    assert Path(sglang.__file__).resolve().parent == Path(os.environ["PYTHONPATH"].split(os.pathsep)[0]) / "sglang"
 if __name__ == '__main__':
     assert os.sched_getaffinity(0) == {6}
+    assert Path(sglang.__file__).resolve().parent == Path(os.environ["PYTHONPATH"].split(os.pathsep)[0]) / "sglang"
     p = multiprocessing.get_context('spawn').Process(target=child)
     p.start(); p.join(10)
     assert p.exitcode == 0

@@ -317,7 +317,7 @@ mem_fraction=${DSV41_MEM_FRACTION_STATIC:-}
 # Opt-in, server-only startup diagnostic; inherited by fresh Python children.
 server_pythonpath="$worktree/python"
 if [ "${DSV41_OMP_BOOTSTRAP:-0}" = 1 ]; then
-    server_pythonpath="$worktree/test/manual/dsv41/omp_bootstrap:$server_pythonpath"
+    server_pythonpath="$server_pythonpath:$worktree/test/manual/dsv41/omp_bootstrap"
 fi
 taskset -c "$server_cores" "${nsys_prefix[@]}" env "${env_argv[@]}" \
     PYTHONPATH="$server_pythonpath" PYTHONUNBUFFERED=1 \
