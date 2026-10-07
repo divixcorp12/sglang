@@ -18,7 +18,7 @@ def arrival_probe(tmp_path_factory):
 #include <thread>
 using namespace sglang::expert_stream;
 int64_t ns() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000000000LL+t.tv_nsec; }
-int main() {
+int run() {
 #ifdef PROD
   JobTrace<false> trace("prod"); trace.emit("forbidden",0,0,0,0);
 #else
@@ -36,6 +36,11 @@ int main() {
     trace.draft_finished(6000000, 2, 7, seq);
   }
 #endif
+  return 0;
+}
+int main() {
+  if (getenv("WORKER_PROBE")) { std::thread worker(run); worker.join(); return 0; }
+  return run();
 }
 ''')
     binaries = []
@@ -78,19 +83,23 @@ def test_trigger_survives_optimized_build_and_compiles_out_of_prod(arrival_probe
     assert "call" in assembly and "<sglang_draft_delay_trigger>" in assembly
 
 
-def test_magic_trace_trigger_and_decode(arrival_probe, tmp_path):
+@pytest.mark.parametrize("worker", [False, True])
+def test_magic_trace_trigger_and_decode(arrival_probe, tmp_path, worker):
     import select
     import time
     tool = os.environ.get("SGLANG_TEST_MAGIC_TRACE")
     if not tool:
         pytest.skip("set SGLANG_TEST_MAGIC_TRACE for a live Intel PT smoke capture")
     probe = subprocess.Popen([str(arrival_probe[0])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        text=True, env={**os.environ, "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path/"events"),
+        text=True, env={**os.environ, **({"WORKER_PROBE":"1"} if worker else {}),
+                       "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path/"events"),
                        "SGLANG_DRAFT_PENDING_TRIGGER_US":"1000"})
     trace = None
     try:
         assert probe.stdout.readline().strip() == "ready"
-        trace = subprocess.Popen([tool,"attach","-pid",str(probe.pid),"-trigger","sglang_draft_delay_trigger",
+        tids = [int(p.name) for p in Path(f"/proc/{probe.pid}/task").iterdir() if int(p.name)!=probe.pid]
+        tid = tids[0] if worker else probe.pid
+        trace = subprocess.Popen([tool,"attach","-pid",str(tid),"-trigger","sglang_draft_delay_trigger",
             "-snapshot-size",os.environ.get("SGLANG_TEST_MAGIC_SNAPSHOT_SIZE","256K"),"-working-directory",str(tmp_path/"magic-work"),
             "-output",str(tmp_path/"trigger.fxt.gz")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         log = ""

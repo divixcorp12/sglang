@@ -98,6 +98,7 @@ def main():
     parser.add_argument("--port", type=int, default=30034)
     parser.add_argument("--seconds", type=int, default=60)
     parser.add_argument("--magic-trace", type=Path, help="Use Intel PT on node 0 engine leader instead of Nsight")
+    parser.add_argument("--magic-host-module", help="Exact loaded JIT DSO basename owning the CPU engine; required if ambiguous")
     parser.add_argument("--draft-pending-trigger-us", type=int, default=500)
     parser.add_argument("--draft-arrival-trigger-us", type=int, default=500)
     parser.add_argument("--draft-forward-trigger-us", type=int, default=5000)
@@ -178,17 +179,20 @@ def main():
                         pid, tid = select_engine_leader(rows)
                         # Optimized JIT code is a dlopen DSO; resolve the uprobe address from its own mapping.
                         mappings = (Path("/proc") / str(pid) / "maps").read_text().splitlines()
-                        address = None
+                        addresses = {}
                         for line in mappings:
                             fields = line.split()
                             if len(fields) < 6 or fields[2] != "00000000" or "expert_stream_host_exl3_instr" not in fields[-1]:
                                 continue
+                            if args.magic_host_module and Path(fields[-1]).name != args.magic_host_module:
+                                continue
                             symbols = subprocess.check_output(["nm", "-D", "--defined-only", fields[-1]], text=True)
                             for symbol in symbols.splitlines():
                                 if symbol.endswith(" sglang_draft_delay_trigger"):
-                                    address = int(fields[0].split("-")[0], 16) + int(symbol.split()[0], 16)
-                        if address is None:
-                            raise RuntimeError("optimized JIT trigger symbol is missing")
+                                    addresses[fields[-1]] = int(fields[0].split("-")[0], 16) + int(symbol.split()[0], 16)
+                        if len(addresses) != 1:
+                            raise RuntimeError(f"expected one trigger DSO, select --magic-host-module: {list(addresses)}")
+                        trigger_module, address = next(iter(addresses.items()))
                         # magic-trace treats addr: as an ELF address in /proc/TID/exe,
                         # and adds that executable's PIE load bias. Undo it for this DSO address.
                         exe = (Path("/proc") / str(pid) / "exe").resolve()
@@ -210,7 +214,7 @@ def main():
                             "-working-directory", str(output / "magic-work"),
                             "-output", str(output / "draft-delay.fxt.gz")]
                         (output / "magic-command.json").write_text(json.dumps(dict(command=profile_command,
-                            pid=pid, tid=tid, trigger_address=address), indent=2) + "\n")
+                            pid=pid, tid=tid, trigger_address=address, trigger_module=trigger_module), indent=2) + "\n")
                     master, slave = pty.openpty()
                     profiler = subprocess.Popen(profile_command, stdout=slave, stderr=slave)
                     os.close(slave)
