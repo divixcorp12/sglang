@@ -1,0 +1,82 @@
+"""Repeat a saved diagnostic arm with job resources, /proc samples and root CPU tracing.
+
+Run on divix01 from a pushed private worktree. The reference is a previous capture-command.json.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+import generations
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--port", type=int, default=30029)
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[2]
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=True)
+    marker = args.output / "sampler.stop"
+    if marker.exists() or (args.output / "capture-command.json").exists():
+        raise SystemExit("refusing to overwrite an earlier capture")
+    reference = json.loads(args.reference.read_text())
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD:python"], cwd=root, text=True).strip()
+    generations.register(tree, "expert-stall-resources-" + head[:10])
+    env = {**os.environ, **reference["harness_env"], "PYTHONPATH": str(root / "python"),
+           "DSV41_WORKTREE": str(root), "DSV41_RUN_ROOT": str(args.output), "EXPECT_SHA": head,
+           "NSYS_SAMPLE": "none", "NSYS_CPUCTXSW": "none", "NSYS_SYSTEM_CPU": "1"}
+    prefix = str(args.output / "events")
+    overrides = [arg for arg in reference["command"][4:]
+                 if not arg.startswith(("SGLANG_MOE_HOT_METRICS_FILE=", "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=",
+                                        "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE="))]
+    overrides += ["SGLANG_MOE_HOT_METRICS_FILE=" + str(args.output / "metrics.jsonl"),
+                  "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=" + prefix,
+                  "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=1"]
+    command = ["bash", str(root / "benchmarks/dsv41_baseline/run_arm.sh"), "stall-cpu-s2",
+               str(args.port), *overrides]
+    imported = subprocess.check_output([sys.executable, "-c", "import sglang; print(sglang.__file__)"],
+                                       cwd=root, env=env, text=True).strip()
+    if Path(imported).resolve() != root / "python/sglang/__init__.py":
+        raise SystemExit("unexpected sglang import: " + imported)
+    metadata = {"head": head, "sglang_file": imported, "command": command,
+                "harness_env": {k: env[k] for k in reference["harness_env"]},
+                "extra_harness_env": {"NSYS_SYSTEM_CPU": "1"}, "reference": str(args.reference),
+                "start_ns": time.monotonic_ns(), "epoch_ns": time.time_ns()}
+    (args.output / "capture-command.json").write_text(json.dumps(metadata, indent=2))
+    with open("/data/models/slang/nvfp4-work/rowimg-disk.lock", "w") as disk:
+        print("waiting for rowimg-disk.lock", flush=True)
+        fcntl.flock(disk, fcntl.LOCK_EX)
+        with open("/data/models/slang/nvfp4-work/cc-gpu.lock", "w") as gpu:
+            print("waiting for cc-gpu.lock availability", flush=True)
+            while True:
+                try:
+                    fcntl.flock(gpu, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(gpu, fcntl.LOCK_UN)
+                    break
+                except BlockingIOError:
+                    time.sleep(5)
+        sampler = subprocess.Popen(["taskset", "-c", "30", sys.executable,
+                                    str(root / "benchmarks/dsv41_baseline/stall_sampler.py"),
+                                    "--prefix", prefix, "--output", str(args.output / "system-samples.jsonl"),
+                                    "--stop-file", str(marker)], env=env, cwd=root)
+        try:
+            status = subprocess.call(command, env=env, cwd=root)
+        finally:
+            marker.touch()
+            sampler.wait(timeout=10)
+        (args.output / "exit-status.json").write_text(json.dumps({"status": status,
+                "end_ns": time.monotonic_ns(), "sampler_status": sampler.returncode}) + "\n")
+        raise SystemExit(status)
+
+
+if __name__ == "__main__":
+    main()
