@@ -1497,3 +1497,22 @@ def test_draft_host_names_the_placement_when_the_gpu_node_has_no_group(tiers, mo
             service.draft_host([], fatal_wait_s=1.0)
     finally:
         service.cpu_experts = None
+
+
+def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypatch):
+    """M3. Every real DSV4.1 streamer's layer has top_k; a stand-in without it must give a named RuntimeError at
+    service start, not an AttributeError out of the token count."""
+    from sglang.srt.layers.moe.cpu_experts import service as cpu_service
+
+    monkeypatch.setattr(cpu_service, "cpu_trait_for", lambda key: SimpleNamespace(hidden_size=lambda slabs: 8))
+    cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
+    streamers = {
+        3: SimpleNamespace(
+            pinned_host_cache=SimpleNamespace(tensors={}), layer=SimpleNamespace(layer_id=3), graph_gather_rows=36
+        )
+    }
+    with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(True):
+        with pytest.raises(RuntimeError, match="layer 3.*top_k"):
+            module.Exl3RamMissService._start_cpu_experts(
+                cfg, object(), SimpleNamespace(key="exl3"), streamers, False, None, planned_routes=36
+            )

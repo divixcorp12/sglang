@@ -23,7 +23,7 @@ LANES = lease.wire_layout(8).lanes
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
-def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD_NS, lanes=8, tokens=1):
+def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD_NS, lanes=8, tokens=1, max_rows=None):
     s = ram_miss_setup(tmp_path, capacity=capacity, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     host = attached_host(s, new_page(pin=False, wire=lease.wire_layout(lanes)), k=3, lanes=lanes)
     host.enable_copy_engine(-1)
@@ -40,7 +40,10 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
         x_rows = torch.zeros((ROWS, lease.cpu_row_bytes(HIDDEN, tokens, host.wire.lanes)), dtype=torch.uint8)
         out_rows = torch.zeros((ROWS, 2, tokens, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_kernel_address(forward_ns), [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2)
+    kernel = host.test_kernel_address(forward_ns)
+    if max_rows is not None:
+        host.test_kernel_max_rows(max_rows)
+    host.enable_cpu_experts(kernel, [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2)
     if register:
         host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     row_bytes = [t[0].numel() * t.element_size() for t in s.slabs[ROW].values()]
@@ -236,3 +239,11 @@ def test_a_calibration_asks_for_no_more_tokens_than_the_rows_hold(tmp_path, held
     _, host, _, _keep = _host(tmp_path, tokens=held)
     with pytest.raises(RuntimeError, match="tokens"):
         host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), tokens=asked)
+
+
+def test_a_kernel_that_takes_fewer_rows_than_the_verify_has_tokens_is_refused_at_enable(tmp_path):
+    """M1. Mutation: validate() skips the tokens <= kernel max_rows check; the engine then enables, and the first
+    verify's job fails its forward mid-serve (fail-stop) instead of the enable refusing."""
+    with pytest.raises(RuntimeError, match="rows per forward"):
+        _host(tmp_path, tokens=6, max_rows=5)
+    _host(tmp_path, tokens=6, max_rows=6)  # the same kernel at exactly the verify's tokens enables

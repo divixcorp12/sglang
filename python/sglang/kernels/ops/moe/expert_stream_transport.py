@@ -123,6 +123,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "test_kernel_address",
     "test_kernel_calls",
     "test_kernel_hold",
+    "test_kernel_max_rows",
     "test_keep_warm_calls",
     "test_keep_warm_either_calls",
     "test_keep_warm_core",
@@ -1953,6 +1954,12 @@ class ExpertStreamHost:
         """Test only: hold (or release) the fake forwards whose worker-0 core is ``core``."""
         _refuse_test_only("test_kernel_hold", self.variant)
         self._module.expert_stream_test_kernel_hold(int(core), int(bool(on)))
+
+    def test_kernel_max_rows(self, rows: int) -> None:
+        """Test only: the fake kernel's max_rows (restored by :meth:`test_kernel_address`); call it before the engine
+        is enabled, whose validation reads it."""
+        _refuse_test_only("test_kernel_max_rows", self.variant)
+        self._module.expert_stream_test_kernel_max_rows(int(rows))
 
     def test_keep_warm_calls(self) -> int:
         """Test only: calls of the fake kernel's keep-warm since :meth:`test_kernel_address`."""
