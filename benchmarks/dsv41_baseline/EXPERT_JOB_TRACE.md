@@ -57,20 +57,25 @@ The GPU marker precedes record/head publication, so its interval includes releas
 It is compiled into the device post kernel only when the job trace prefix selects the diagnostic build.
 
 `SGLANG_DRAFT_PENDING_TRIGGER_US` measures first observation to payload-ready; `SGLANG_DRAFT_FORWARD_TRIGGER_US`
-measures kernel-forward wall time. Zero disables each threshold. The first admitted threshold crossing per engine
-emits `draft_trigger` (a: reason 0 pending / 1 forward, b: measured ns, c: threshold ns) and calls the exported
+measures kernel-forward wall time. `SGLANG_DRAFT_ARRIVAL_TRIGGER_US` uses the startup-correlated publication-to-first-observation lower estimate. Zero disables each threshold. The first admitted threshold crossing per engine
+emits `draft_trigger` (a: reason 0 pending / 1 forward / 2 arrival, b: measured ns, c: threshold ns) and calls the exported
 `sglang_draft_delay_trigger`. Its `noinline` attribute and volatile asm preserve an actual call in optimized builds.
 Warm-up while the trace gate is closed cannot consume the trigger. Production host builds compile this path out.
 
 `run_omp_serving_capture.py --magic-trace /absolute/path/magic-trace ...` replaces the scheduler-only Nsight
 collector with a bounded Intel PT snapshot on the proven-owned node 0 engine leader. It resolves the trigger's
 address in the loaded JIT DSO, waits for attachment before opening the timed gate, and retains raw perf data.
-The initial thresholds are 500us pending and 5000us forward. If no crossing occurs, the capture stops after
+The initial thresholds are 500us arrival, 500us pending and 5000us forward. If no crossing occurs, the capture stops after
 `--seconds`; this is a fallback, not evidence of a triggered stall. Keep the normal optimized compile settings first.
 
 `analyze_draft_arrival.py <capture-directory>` checks completeness/overflow and joins the timings.
 Initialization writes 64 host-bracketed GPU clock samples to `events.<pid>.draft-clock.json`.
 The intersection of offset intervals gives correlation uncertainty assuming a stable nanosecond clock offset;
 a startup anchor alone does not bound later drift. Report raw GPU and CPU clocks and that limitation.
-The pending threshold cannot detect time before the first CPU observation; inspect the calibrated publication
-interval for that. Intel PT explains native control flow, not GPU execution or DRAM stall causes.
+The arrival trigger uses the startup offset and therefore requires the same drift checks as the analysis.
+The capture harness records a second clock anchor after shutdown; reject precise GPU correlations if the offset intervals disagree. Intel PT explains native control flow, not GPU execution or DRAM stall causes.
+
+On divix01, magic-trace v1.2.4 initially failed to parse perf 6.12's `tr strt jmp` flag.
+Set `MAGIC_TRACE_PERF_PATH=$PWD/benchmarks/dsv41_baseline/magic_trace_perf_compat.py` to canonicalize only
+that alias to `tr strt`, matching upstream master's decoding semantics. Recording uses `/usr/bin/perf`
+unchanged; raw perf data is retained. This adapter is not a blanket parser-error filter.

@@ -30,6 +30,7 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(3));
     trace.draft_observe(&trace, seq); // must preserve the first observation
     trace.draft_selected(ns(), 2, 7, seq, 123456);
+    trace.draft_arrival(2, 7, seq, 123456, ns() - 123456 - 10000000);
     trace.draft_prepared(ns(), 2, 7, seq);
     trace.emit("draft_start", 2, 7, seq, -1);
     trace.draft_finished(6000000, 2, 7, seq);
@@ -48,11 +49,12 @@ int main() {
     return binaries
 
 
-@pytest.mark.parametrize("pending,forward,reason", [(1000,0,0), (0,1000,1), (10000,10000,None)])
+@pytest.mark.parametrize("pending,forward,reason", [(1000,0,0), (0,1000,1), (0,0,2), (10000,10000,None)])
 def test_first_observation_and_threshold(arrival_probe, tmp_path, pending, forward, reason):
     subprocess.run([str(arrival_probe[0])], input="x", text=True, check=True, env={**os.environ,
         "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
-        "SGLANG_DRAFT_PENDING_TRIGGER_US": str(pending), "SGLANG_DRAFT_FORWARD_TRIGGER_US": str(forward)})
+        "SGLANG_DRAFT_PENDING_TRIGGER_US": str(pending), "SGLANG_DRAFT_FORWARD_TRIGGER_US": str(forward),
+        "SGLANG_DRAFT_ARRIVAL_TRIGGER_US": "1000" if reason == 2 else "0"})
     records = [json.loads(l) for l in next(tmp_path.glob("events.*")).read_text().splitlines()]
     events = records[1:-1]
     assert records[-1] == {"dropped": 0}
