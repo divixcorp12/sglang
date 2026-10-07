@@ -17,6 +17,7 @@
 #include "fixture.h"
 #include "kernel.h"
 #include "moe_mul1.h"
+#include "tile_assignment.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -64,6 +65,8 @@ struct Options {
   std::vector<std::string> routed;  // --routed=M:k:pattern,...: routed workloads (optimized build only)
   int routed_slots = 48;
   int routed_layers = 2;
+  fs::path routed_references;
+  bool write_routed_references = false;
 };
 
 // Parses a non-negative decimal integer; throws on anything else.
@@ -122,6 +125,10 @@ Options parse_options(int& argc, char** argv) {
       opt.routed_slots = number(value("--routed-slots="));
     else if (arg.starts_with("--routed-layers="))
       opt.routed_layers = number(value("--routed-layers="));
+    else if (arg.starts_with("--routed-reference-dir="))
+      opt.routed_references = value("--routed-reference-dir=");
+    else if (arg == "--write-routed-references")
+      opt.write_routed_references = true;
     else if (arg == "--validate-only")
       opt.validate_only = true;
     else if (arg == "--help") {
@@ -130,7 +137,9 @@ Options parse_options(int& argc, char** argv) {
                    "--fixture=FILE --reference-dir=DIR --cpus=18-33 --workers=N\n"
                    "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
                    "--warmup-forwards=128 --gap-us=0 --validate-only\n"
-                   "--routed=M:k:shared<G>|random,... --routed-slots=48 --routed-layers=2 (optimized build)\n"
+                   "--routed=M:k:shared<G>|random|countsN-N-...,... (optimized build)\n"
+                   "--routed-slots=48 --routed-layers=2\n"
+                   "--routed-reference-dir=DIR [--write-routed-references] checks cross-build bit parity\n"
                    "Google Benchmark flags are also accepted.\n";
       argv[remaining++] = argv[i];
     } else
@@ -327,7 +336,8 @@ using RoutedLayers = std::vector<std::unique_ptr<SlabLayer>>;
 // One --routed=M:k:pattern workload: M token rows of k routes each, rotating over the routed layers. Token t's input
 // is its layer's fixture input rotated by 641 * t elements. Patterns: shared<G> (tokens in groups of G share all k
 // slots, so every chunk holds min(G, CHUNK_M) tokens; shared1 shares nothing), random (each token k distinct slots,
-// seeded). No frozen reference: validate checks the outputs are finite and that a second run repeats them bit for bit.
+// seeded), countsN-N-... (explicit expert multiplicities, with unused routes marked -1).
+// Validation checks finite, repeatable outputs and, optionally, cross-build reference bytes.
 struct RoutedWorkload {
   const Fixture& fixture;
   const Options& options;
@@ -348,18 +358,41 @@ struct RoutedWorkload {
     rows = number(m);
     k = number(kk);
     const int capacity = opt.routed_slots;
+    std::vector<int> counts;
+    if (pattern.starts_with("counts")) {
+      std::stringstream values(pattern.substr(6));
+      for (std::string value; std::getline(values, value, '-');) counts.push_back(number(value));
+      if (counts.empty() || std::any_of(counts.begin(), counts.end(), [&](int n) { return n < 1 || n > rows; }))
+        throw std::runtime_error("counts needs positive multiplicities <= rows");
+    }
     int group = 0;  // shared<G>: G; random: 0
     if (pattern.starts_with("shared"))
       group = number(pattern.substr(6));
-    else if (pattern != "random")
+    else if (pattern != "random" && counts.empty())
       throw std::runtime_error("Unknown routed pattern: " + pattern);
     if (pattern.starts_with("shared") && group < 1) throw std::runtime_error("shared<G> needs G >= 1: " + spec);
-    const int needed = group ? (rows + group - 1) / group * k : k;
+    const int needed = !counts.empty() ? int(counts.size()) : group ? (rows + group - 1) / group * k : k;
     if (rows < 1 || k < 1 || needed > capacity)
       throw std::runtime_error(spec + " needs " + std::to_string(needed) + " slots of " + std::to_string(capacity));
+    if (k > capacity || std::accumulate(counts.begin(), counts.end(), 0) > rows * k)
+      throw std::runtime_error("routed multiplicities exceed row capacity");
     std::mt19937 rng(20261006u + 1000u * rows + k);
     std::vector<int32_t> pool(capacity);
-    for (int t = 0; t < rows; ++t) {
+    if (!counts.empty()) {
+      slots.assign(size_t(rows) * k, -1);
+      weights.resize(size_t(rows) * k);
+      std::vector<int> used(rows);
+      int token = 0;
+      for (int expert = 0; expert < int(counts.size()); ++expert)
+        for (int r = 0; r < counts[expert]; ++r) {
+          const int t = token++ % rows;
+          const int lane = used[t]++;
+          slots[size_t(t) * k + lane] = expert;
+        }
+      for (int t = 0; t < rows; ++t)
+        for (int j = 0; j < k; ++j)
+          weights[size_t(t) * k + j] = 0.071234f + (k == 1 ? 0.0f : 0.23f * j / (k - 1));
+    } else for (int t = 0; t < rows; ++t) {
       std::iota(pool.begin(), pool.end(), 0);
       for (int j = 0; j < k; ++j) {
         int32_t slot;
@@ -402,6 +435,7 @@ struct RoutedWorkload {
   }
 
   void validate() {
+    std::vector<float> joined;
     for (size_t layer = 0; layer < layers.size(); ++layer) {
       forward(layer);
       const std::vector<float> first = output;
@@ -410,6 +444,17 @@ struct RoutedWorkload {
       forward(layer);
       if (std::memcmp(first.data(), output.data(), first.size() * sizeof(float)))
         throw std::runtime_error("A routed forward did not repeat bit for bit");
+      joined.insert(joined.end(), first.begin(), first.end());
+    }
+    if (!options.routed_references.empty()) {
+      const auto file = options.routed_references / (std::to_string(rows) + "-" + std::to_string(k) + "-" + pattern + ".bin");
+      if (options.write_routed_references && !fs::exists(file)) {
+        fs::create_directories(options.routed_references);
+        std::ofstream out(file, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(joined.data()), joined.size() * sizeof(float));
+        if (!out) throw std::runtime_error("Cannot write routed reference");
+      }
+      compare_reference(file, joined);
     }
   }
 
@@ -552,6 +597,7 @@ int main(int argc, char** argv) {
       benchmark::AddCustomContext("memory_policy", "inherited; no benchmark membind");
       benchmark::AddCustomContext("compiler", __VERSION__);
 #ifndef EXL3_BENCH_BASELINE
+      benchmark::AddCustomContext("row_weighted_assignment", std::to_string(EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT));
       benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::exl3_cpu_chunk_m()));
 #endif
       for (auto& workload : workloads) {

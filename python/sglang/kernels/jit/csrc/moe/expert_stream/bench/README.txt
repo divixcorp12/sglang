@@ -310,3 +310,29 @@ processes over EXL3_BENCH_ROUNDS rounds (default 8), 512 calls per benchmark,
 writes environment.txt, logs, Google JSON and status.txt, and exits 1 when any
 process failed. Without NEW_RESULTS_DIR it writes to EXL3BENCH_RESULTS (the
 service's directory). Do not run it while a production server uses CPUs 16-33.
+
+Row-weighted assignment experiment (bare optimized forward)
+-----------------------------------------------------------
+Configure two Release build directories at the same commit, changing only
+-DEXL3_ROW_WEIGHTED_ASSIGNMENT=OFF / ON, and build exl3_cpu_optimized in each.
+The default remains OFF. This switch affects the bare optimized benchmark only.
+
+Run from the repository root on divix01, with no serving/profiling CPU workload:
+  taskset -c 0-63 env OMP_NUM_THREADS=10 python \
+    benchmarks/dsv41_baseline/run_row_weighted_experiment.py \
+    --a=BUILD_A/exl3_cpu_optimized --b=BUILD_B/exl3_cpu_optimized \
+    --output=NEW_RESULTS_DIRECTORY
+
+The runner serially alternates AB/BA on each NUMA node, ten workers pinned to
+6-15 / 18-27 and memory bound to the matching node. Eight layers and twelve
+expert slots per layer exceed the shared L2 capacity. The original 24 frozen
+outputs are checked, and A writes routed output references that every later
+process must match bit-exactly before and after timing. Results include means,
+p50/p95/p99, per-process ranges, binary/fixture hashes, and exact commands.
+
+counts2-1-1-1-1-1-1-1-1-1 reconstructs the captured six-row, ten-chunk,
+eleven-route multiplicities. Counts are assigned cyclically to token rows;
+unused k lanes are -1. This preserves chunk work sizes, not the original token
+activations or expert identities. Controls include uniform and random routes.
+It measures isolated native forwards without optional trace counters, not live
+decode throughput, GPU transfer overlap, or simultaneous use of both groups.

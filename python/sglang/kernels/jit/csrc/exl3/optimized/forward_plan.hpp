@@ -15,6 +15,7 @@
 #include "math_scalar.hpp"
 #include "shapes.hpp"
 #include "worker_trace.hpp"
+#include "tile_assignment.hpp"
 #include <c10/util/Half.h>
 #include <algorithm>
 #include <array>
@@ -256,36 +257,6 @@ __attribute__((noipa)) void transform_out(const Exl3Projection& mat, float* tout
     }
 }
 
-
-// Assign this worker its share of a phase's `total` GEMVs (all of one width, tiles_n tiles),
-// calling gemv(j, t0, t1) per tile range. Few GEMVs (decode, small batches; each expert read
-// once): the GEMVs' tiles form one flat range, split evenly across workers in 8-tile groups so
-// no piece crosses a group of its GEMV (the swizzled band kernels' invariant; n % 128 == 0
-// makes every tiles_n a multiple of 8). Whole-GEMV assignment left a 2:1 imbalance whenever
-// 2 * cold experts fell between multiples of the worker count (16 gate/up GEMVs on 20 workers:
-// twelve single-worker GEMVs set the phase time while eight workers idled half of it). Many
-// GEMVs (prefill): whole GEMVs strided across workers, so all workers stream the same expert's
-// chunks together and L3 serves the repeats; the imbalance there is at most one GEMV in four.
-constexpr int FLAT_MAX_GEMVS_PER_WORKER = 4;
-
-// Unit is the flat split's granularity in tiles: 8 (one 128-output group, which the swizzled kernels need) or, for
-// a plan whose kernels take any tile pair, 2 (finer balance: 36 gate/up groups over 16 workers leave the slowest
-// worker 3 groups against a mean of 2.25, where 144 pairs give every worker 9).
-template <int Unit = 8, typename Gemv>
-inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Gemv gemv)
-{
-    static_assert(Unit == 2 || Unit == 8);
-    if (total > FLAT_MAX_GEMVS_PER_WORKER * num_workers)
-    {
-        for (int j = worker; j < total; j += num_workers) gemv(j, 0, tiles_n);
-        return;
-    }
-    const int64_t groups = static_cast<int64_t>(total) * (tiles_n / Unit);
-    const int f0 = static_cast<int>(groups * worker / num_workers) * Unit;
-    const int f1 = static_cast<int>(groups * (worker + 1) / num_workers) * Unit;
-    for (int j = f0 / tiles_n; j * tiles_n < f1; ++j)
-        gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
-}
 
 // The gated SiLU, into g: act(g) * u. A nonzero act_limit clamps the up path symmetrically and the activated gate from
 // above, BEFORE the multiply (matching the GPU act_mul kernels). DS4 ships swiglu_limit = 10 with plain silu: hidden
@@ -612,7 +583,8 @@ private:
         {
             // Gate + up GEMVs (see assign_gemvs)
             const int gu = 2;
-            assign_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16, [&](int j, int t0, int t1)
+            assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc * gu, I_ / 16,
+                [&](int j) { return c.chunks[j / gu].m; }, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j / gu];
                 const bool up = j % gu;
@@ -644,7 +616,8 @@ private:
         else if constexpr (P == Phase::Down)
         {
             // Down GEMVs
-            assign_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
+            assign_plan_gemvs<Traits::kSplitTiles>(worker, num_workers, nc, H / 16,
+                [&](int j) { return c.chunks[j].m; }, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j];
                 float* tout = c.tout_d + static_cast<size_t>(j) * MAX_M * H;
