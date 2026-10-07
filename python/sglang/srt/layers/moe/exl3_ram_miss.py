@@ -782,7 +782,8 @@ class Exl3RamMissService:
         self.tables: dict[int, NativePinnedSlotTable] = {}
         self.host: Optional[ExpertStreamHost] = None
         # The wire group of the GPU's node, whose CPU expert engine serves the DSpark draft (set by ensure_started).
-        self.gpu_group = 0
+        self.gpu_group: Optional[int] = None
+        self._gpu_node_placement: Optional[tuple[int, list[int]]] = None
         self.device_side: Optional[ExpertStreamDevice] = None
         self.page = None
         self.slot_map = None
@@ -939,6 +940,12 @@ class Exl3RamMissService:
         self.ensure_started()
         if self.cpu_experts is None:
             raise RuntimeError("exl3 RAM miss: the draft shares the CPU expert team, but SGLANG_DSV41_CPU_EXPERTS is off")
+        if self.gpu_group is None:
+            gpu_node, nodes = self._gpu_node_placement
+            raise RuntimeError(
+                f"exl3 RAM miss: the draft runs on the GPU's node {gpu_node} CPU expert team, but the tier's placement "
+                f"(SGLANG_MOE_PINNED_HOST_NUMA_MB) covers only nodes {nodes}; place the tier on node {gpu_node} too"
+            )
         return self.host.draft_source(areas, fatal_wait_s=fatal_wait_s, group=self.gpu_group)
 
     def ensure_started(self) -> None:
@@ -1003,7 +1010,9 @@ class Exl3RamMissService:
             cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
             device=torch.cuda.current_device() if torch.cuda.is_available() else None,
         )
-        self.gpu_group = next(p.group for p in numa.plans if p.node == numa.gpu_node)
+        # None when the tier's placement leaves out the GPU's node: only the DSpark draft needs the group (draft_host).
+        self.gpu_group = next((p.group for p in numa.plans if p.node == numa.gpu_node), None)
+        self._gpu_node_placement = (numa.gpu_node, [p.node for p in numa.plans])
         for line in numa.log_lines():
             logger.info("exl3 RAM miss %s", line)
         node_ranges = None
