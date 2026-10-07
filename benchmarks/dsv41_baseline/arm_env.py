@@ -146,7 +146,9 @@ PROD_HOST = "0.0.0.0"
 
 # DSpark with both CPU-expert clients (plan 2026-10-06-dsv41-dspark-both-cpu-experts). Production serves it only once
 # PROD_DSPARK is True (Owner decision 1, the A/B of that plan's Task 17).
-PROD_DSPARK = False
+# On since 2026-10-07, on the owner's go ("Merge + flip prod to DSpark") after DSV41_REFERENCE.md §33.11: all six
+# bars pass; the median decode is 7.6% above the non-DSpark recipe (95.05 vs 88.30 ms/token, the addendum's A/B).
+PROD_DSPARK = True
 DSPARK_DRAFT = f"{CC}/dsv41-dspark-draft"
 # Each stage's top-32 draft experts stay on the GPU, the other 96 on the CPU (§33.4).
 DSPARK_RESIDENT = f"{CC}/analysis/dsv41-dspark/cpu-draft-routes/resident-top32.json"
