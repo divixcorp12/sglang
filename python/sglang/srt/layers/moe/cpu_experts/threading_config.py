@@ -251,9 +251,9 @@ class ThreadingConfig:
         """Every node's plan by the design's rules, validated; raises ValueError naming the node and the rule."""
         affinity = frozenset(affinity)
         if settings.cpu_experts and settings.draft and (settings.draft_cores or settings.draft_threads):
-            # One team per node (plan 2026-10-06 Task 11): the draft is a job source on node 0's CPU expert team.
+            # One team per node (plan 2026-10-06 Task 11): the draft is a job source on the GPU node's CPU expert team.
             raise ValueError(
-                "the DSpark draft shares node 0's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
+                "the DSpark draft shares the GPU node's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
                 "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"
             )
         gpu = gpu_node if gpu_node is not None else nodes[0]

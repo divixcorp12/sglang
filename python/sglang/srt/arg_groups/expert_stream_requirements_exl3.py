@@ -23,6 +23,7 @@ module runs during server-args processing, so it imports only the gate module,
 """
 
 import dataclasses
+import json
 import os
 
 from sglang.srt.arg_groups.expert_stream_requirements import (
@@ -79,7 +80,7 @@ def _check_dspark_cpu_experts(cfg) -> None:
         envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get() or envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get()
     ):
         raise ValueError(
-            "the DSpark draft shares node 0's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
+            "the DSpark draft shares the GPU node's CPU expert team under SGLANG_DSV41_CPU_EXPERTS; unset "
             "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES and SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS"
         )
     # Unset cores are derived by ThreadingConfig when the draft starts; named ones are checked here.
@@ -150,14 +151,47 @@ def _check_graphed_verify(cfg, remedy: str = _EAGER_VERIFY_REMEDY) -> None:
             "EXL3 expert caching runs a DSpark verify in the decode graph with SGLANG_RAGGED_VERIFY_MODE=static only "
             f"(compact mode reads the host); {remedy}"
         )
+    if envs.SGLANG_DSV41_CPU_EXPERTS.get() and not envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get():
+        # The tested shape is a lane per route plus VICTIM_LANES; a narrowed MISS_LANES verify with CPU experts and no
+        # spill has never run on a GPU.
+        raise ValueError(
+            "a graphed DSpark verify with SGLANG_DSV41_CPU_EXPERTS needs SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES "
+            "(a lane per route: unset SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES)"
+        )
 
 
-def _check_victim_lanes() -> None:
+def _verify_routes(cfg) -> "int | None":
+    """Routes a DSpark verify gathers a layer (tokens x top-k), or None when the gate cannot know them.
+
+    The verify has ``--speculative-num-draft-tokens``, else block size + 1, tokens; top-k is the checkpoint's
+    ``num_experts_per_tok`` in a local ``config.json``. A block size left to the draft's config or a remote model path
+    gives None, and the bound is left to ``GpuResidencyUpdater._init_insert_direct`` at startup.
+    """
+    tokens = getattr(cfg, "speculative_num_draft_tokens", None)
+    if tokens is None and getattr(cfg, "speculative_dspark_block_size", None) is not None:
+        tokens = int(cfg.speculative_dspark_block_size) + 1
+    model_path = getattr(cfg, "model_path", None)
+    if tokens is None or not isinstance(model_path, str):
+        return None
+    try:
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as stream:
+            top_k = json.load(stream).get("num_experts_per_tok")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return int(tokens) * int(top_k) if isinstance(top_k, int) and top_k > 0 else None
+
+
+def _check_victim_lanes(cfg) -> None:
     """SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES (spill): the CPU takes the lanes past the victims, and every route has
     a lane, so a verify's distinct misses never outnumber its lanes."""
     victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
     if not victims:
         return
+    if str(getattr(cfg, "speculative_algorithm", None)).upper() != "DSPARK":
+        raise ValueError(
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} spills the graphed DSpark verify; "
+            "pass --speculative-algorithm DSPARK or unset it"
+        )
     if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
         raise ValueError(f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} needs SGLANG_DSV41_CPU_EXPERTS=1")
     lanes = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES.get()
@@ -165,6 +199,13 @@ def _check_victim_lanes() -> None:
         raise ValueError(
             f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
             f"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES (got {lanes})"
+        )
+    routes = _verify_routes(cfg)
+    if routes is not None and victims >= routes:
+        # GpuResidencyUpdater._init_insert_direct refuses 1 <= V < miss lanes after the 7-15 minute load.
+        raise ValueError(
+            f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} must be below the {routes} routes of the DSpark "
+            "verify (its tokens x the model's top-k)"
         )
 
 
@@ -207,7 +248,7 @@ def _check(cfg, budgets) -> None:
         )
     if speculative and graph.decode.backend != Backend.DISABLED:
         _check_graphed_verify(cfg, _CPU_EXPERTS_VERIFY_REMEDY if cpu_experts else _EAGER_VERIFY_REMEDY)
-    _check_victim_lanes()
+    _check_victim_lanes(cfg)
     if graph.decode.backend == Backend.DISABLED:
         _EAGER.check(cfg, budgets)
         return

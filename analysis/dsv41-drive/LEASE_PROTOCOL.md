@@ -301,7 +301,7 @@ Both are asserted (fail_record, __trap), never handled. The post overflows only 
 at all: before the copy engine arms (or before a row's CPU layer is registered). Then it serves the live prefix,
 writes that count, and sets DIRECT's overflow flag and the layer's counter, and the DSpark worker re-runs the verify
 eagerly. The draft (the second client) keeps its own channel and areas, on the same stream strictly before the
-verify. From Task 11 on it shares node 0's CPU expert team: one thread, one job at a time, its hold watching the
+verify. From Task 11 on it shares the GPU node's CPU expert team: one thread, one job at a time, its hold watching the
 doorbell and the channel head.
 
 ## Fail-stop

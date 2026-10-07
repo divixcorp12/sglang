@@ -2,7 +2,7 @@
 
 With ``SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS`` each draft stage's ``FusedMoE`` loads its experts into host RAM and
 keeps only its resident set (``draft_resident.py``) and any fused shared expert on the GPU (``DraftResidentMoe``). The
-rest run on node 0's CPU expert engine (host/cpu_experts.h, one team per node), or, with the target's CPU experts off,
+rest run on the GPU node's CPU expert engine (host/cpu_experts.h, one team per node), or, with the target's CPU experts off,
 on a draft-only engine, over the draft channel (``dspark_draft_cpu.py``): the
 stage's call posts its CPU share (device-only), runs its GPU share, then its finish waits on the channel's gate and
 adds the CPU rows, all on the stream, so a CUDA graph captures the whole call. The stages register here as they finish
@@ -119,7 +119,7 @@ class DraftCpuExperts:
         self.areas = DraftCpuAreas(len(keys), hidden.pop(), pin=torch.cuda.is_available())
         fatal_wait_s = watchdog_wait_s(envs.SGLANG_DSV41_RAM_MISS_TIMEOUT_MS.get())
         if envs.SGLANG_DSV41_CPU_EXPERTS.get():
-            # One team per node: node 0's CPU expert engine serves the draft channel too.
+            # One team per node: the GPU node's CPU expert engine serves the draft channel too.
             self.host = _ram_miss_service().draft_host(self.areas, fatal_wait_s=fatal_wait_s)
         else:
             self.host = _new_host(
@@ -234,7 +234,7 @@ class DraftCpuExpertsRegistry:
                 logger.info(
                     "DSpark CPU experts: %d draft stages on %s; %s experts on the CPU",
                     len(self._layers),
-                    f"cores {cores}, {threads} threads" if cores else "node 0's CPU expert team",
+                    f"cores {cores}, {threads} threads" if cores else "the GPU node's CPU expert team",
                     [int(layer.on_cpu.sum()) for layer in self._layers.values()],
                 )
             return self._runtime
