@@ -417,6 +417,8 @@ class BasicCpuExpertEngine {
       // Read before the pop and the head load: a submit or a post after them moves a word the hold watches.
       const uint32_t kick = doorbell_.word().load(std::memory_order_acquire);
       const uint32_t head = draft != nullptr ? channel::head<DraftChannel>(draft->channel) : 0u;
+      if constexpr (Build::kMetrics)
+        if (draft && head && channel::reached(head, draft_next_)) trace_.draft_observe(draft, head);
       CpuJob job;
       if (jobs_.pop(&job)) {
         warm_until = run_job(job) + config_.keep_warm_ns;
@@ -582,6 +584,8 @@ class BasicCpuExpertEngine {
   /// Reads draft record `seq`, runs its forward on the team, completes it through the channel; returns the forward's
   /// end. A torn or malformed record, or a refused forward, fail-stops.
   int64_t serve_draft(const DraftSource& d, uint32_t seq) {
+    int64_t selected = 0;
+    if constexpr (Build::kMetrics) selected = now_ns();
     alignas(64) uint8_t raw[DraftChannel::kRecordBytes];
     const uint8_t* rec = channel::record_at<DraftChannel>(d.channel, seq);
     if (!channel::read_seqlocked<DraftChannel>(rec, seq, raw))
@@ -594,6 +598,11 @@ class BasicCpuExpertEngine {
     if (stage >= static_cast<int>(d.layers.size()) || rows < 1 || rows > draft::kMaxRows || k < 1 || k > draft::kMaxK)
       fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(seq) + " malformed (stage " +
                 std::to_string(stage) + ", rows " + std::to_string(rows) + ", k " + std::to_string(k) + ")");
+    if constexpr (Build::kMetrics) {
+      uint64_t gpu_ns = 0;
+      std::memcpy(&gpu_ns, raw + draft::kRecPublishNs, sizeof(gpu_ns));
+      trace_.draft_selected(selected, stage, epoch, seq, gpu_ns);
+    }
     // The slot and weight areas are kMaxK wide per token; the kernel reads [rows, k] contiguous, so compact them.
     int32_t slots[draft::kMaxRows * draft::kMaxK];
     float weights[draft::kMaxRows * draft::kMaxK];
@@ -615,6 +624,7 @@ class BasicCpuExpertEngine {
     call.slots = slots;
     call.weights = weights;
     call.out = d.out + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden;
+    if constexpr (Build::kMetrics) trace_.draft_prepared(now_ns(), stage, epoch, seq);
     busy(kDraftJob, seq);
     const int64_t start = now_ns();
     if constexpr (Build::kMetrics) trace_.emit("draft_start", stage, epoch, seq, -1, rows, k, shared);
@@ -639,6 +649,7 @@ class BasicCpuExpertEngine {
     if constexpr (Build::kMetrics) trace_.emit("draft_end", stage, epoch, seq, -1, rows, k, shared);
     channel::complete<DraftChannel>(d.channel, seq, static_cast<uint64_t>(epoch) << 32 | seq);
     draft_completed_.store(seq, std::memory_order_release);
+    if constexpr (Build::kMetrics) trace_.draft_finished(end - start, stage, epoch, seq);
     return end;
   }
 

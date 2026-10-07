@@ -22,6 +22,8 @@ constexpr int64_t kRecStage = 4;
 constexpr int64_t kRecRows = 6;
 constexpr int64_t kRecK = 7;
 constexpr int64_t kRecEpoch = 8;
+// Diagnostic device-clock marker before the record/head release. Zero in uninstrumented records.
+constexpr int64_t kRecPublishNs = 16;
 
 using DraftChannel = channel::ChannelSpec</*Head*/ 0, /*Ring*/ 128, /*Records*/ 4, /*RecordBytes*/ 128,
                                           /*Done*/ 640, /*Gate*/ 768>;

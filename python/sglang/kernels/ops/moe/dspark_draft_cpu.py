@@ -14,6 +14,10 @@ draft's.
 from __future__ import annotations
 
 import atexit
+import json
+import os
+import time
+from pathlib import Path
 import sys
 import weakref
 from dataclasses import dataclass
@@ -81,9 +85,11 @@ def device_module() -> Module:
     return load_jit(
         "dspark_draft_channel",
         cuda_files=["moe/expert_stream/draft_kernels.cuh"],
+        extra_cuda_cflags=["-DSGLANG_DRAFT_REQUEST_TRACE=1"] if os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX") else [],
         cuda_wrappers=[
             ("post", "expert_stream::draft::DraftChannelKernels::post"),
             ("finish", "expert_stream::draft::DraftChannelKernels::finish"),
+            ("clock", "expert_stream::draft::DraftChannelKernels::clock"),
         ],
     )
 
@@ -99,6 +105,30 @@ class DraftCpuDevice:
         self.state = torch.zeros(_STATE_WORDS, dtype=torch.int32, device=device)
         self.on_cpu = on_cpu.to(device=device, dtype=torch.uint8).contiguous()
         self.module = device_module()
+        prefix = os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
+        if prefix:
+            # Calibration IO is initialization only, never post()/finish() or graph replay.
+            self.calibrate_clock(str(prefix) + f".{os.getpid()}.draft-clock.json")
+
+    def calibrate_clock(self, path: str) -> dict:
+        samples = []
+        out = torch.zeros(1, dtype=torch.int64, pin_memory=True)
+        with torch.cuda.device(self.state.device):
+            self.module.clock(self.state, out.data_ptr())
+            torch.cuda.synchronize()
+            for _ in range(64):
+                before = time.monotonic_ns()
+                self.module.clock(self.state, out.data_ptr())
+                torch.cuda.synchronize()
+                after = time.monotonic_ns()
+                samples.append(dict(before=before, gpu=int(out[0]), after=after))
+        data = dict(clock="GPU globaltimer ns vs CLOCK_MONOTONIC", samples=samples,
+                    offset_low=max(s["before"] - s["gpu"] for s in samples),
+                    offset_high=min(s["after"] - s["gpu"] for s in samples))
+        if data["offset_low"] > data["offset_high"]:
+            raise RuntimeError("GPU/CPU clock calibration intervals do not overlap")
+        Path(path).write_text(json.dumps(data, indent=2) + "\n")
+        return data
 
     def post(self, stage: int, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
         """Stage `x` [M, H] and the CPU-owned routes of `topk_ids`/`topk_weights` [M, k]; publish a record if any."""

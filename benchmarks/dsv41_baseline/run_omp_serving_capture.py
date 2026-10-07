@@ -86,6 +86,9 @@ def main():
     parser.add_argument("--seed-build", type=Path, required=True)
     parser.add_argument("--port", type=int, default=30034)
     parser.add_argument("--seconds", type=int, default=60)
+    parser.add_argument("--magic-trace", type=Path, help="Use Intel PT on node 0 engine leader instead of Nsight")
+    parser.add_argument("--draft-pending-trigger-us", type=int, default=500)
+    parser.add_argument("--draft-forward-trigger-us", type=int, default=5000)
     args = parser.parse_args()
     if not 10 <= args.seconds <= 120:
         parser.error("seconds must be in [10, 120]")
@@ -116,6 +119,9 @@ def main():
                "--port", str(args.port), "--no-nsys", "--worker-phases",
                "--worker-min-us", "0", "--worker-capacity", "262144",
                "--job-capacity", "1048576"]
+    if args.magic_trace:
+        command += ["--draft-pending-trigger-us", str(args.draft_pending_trigger_us),
+                    "--draft-forward-trigger-us", str(args.draft_forward_trigger_us)]
     report = Path("/mnt/nvme1/dsv41-nsys") / (output.name + "-scheduler")
     profile_command = ["sudo", "-n", "/usr/local/sbin/nsys-profile", "profile",
                        "--trace=none", "--sample=none", "--cpuctxsw=system-wide",
@@ -144,6 +150,33 @@ def main():
                 ready = any('"label": "server_ready"' in p.read_text()
                             for p in output.glob("servers/*/*/boundary-samples.jsonl"))
                 if ready and profiler is None:
+                    if args.magic_trace:
+                        # The bootstrap manifests prove ownership before selecting a TID.
+                        rows = [json.loads(line) for line in (output / "runtime-samples.jsonl").read_text().splitlines()]
+                        candidates = [(r["pid"], t["tid"]) for r in rows[-4:] for t in r["expert_threads"]
+                                      if t["comm"] == "exl3-cpu-exp0"]
+                        if not candidates:
+                            raise RuntimeError("no node 0 engine leader in owned server")
+                        pid, tid = candidates[-1]
+                        # Optimized JIT code is a dlopen DSO; resolve the uprobe address from its own mapping.
+                        mappings = (Path("/proc") / str(pid) / "maps").read_text().splitlines()
+                        address = None
+                        for line in mappings:
+                            fields = line.split()
+                            if len(fields) < 6 or fields[2] != "00000000" or "expert_stream_host_exl3_instr" not in fields[-1]:
+                                continue
+                            symbols = subprocess.check_output(["nm", "-D", "--defined-only", fields[-1]], text=True)
+                            for symbol in symbols.splitlines():
+                                if symbol.endswith(" sglang_draft_delay_trigger"):
+                                    address = int(fields[0].split("-")[0], 16) + int(symbol.split()[0], 16)
+                        if address is None:
+                            raise RuntimeError("optimized JIT trigger symbol is missing")
+                        profile_command = [str(args.magic_trace.resolve()), "attach", "-pid", str(tid),
+                            "-trigger", "addr:" + hex(address), "-snapshot-size", "256K",
+                            "-working-directory", str(output / "magic-work"),
+                            "-output", str(output / "draft-delay.fxt.gz")]
+                        (output / "magic-command.json").write_text(json.dumps(dict(command=profile_command,
+                            pid=pid, tid=tid, trigger_address=address), indent=2) + "\n")
                     master, slave = pty.openpty()
                     profiler = subprocess.Popen(profile_command, stdout=slave, stderr=slave)
                     os.close(slave)
@@ -159,7 +192,7 @@ def main():
                     if chunk:
                         profile_text += chunk
                         profile_log.write(chunk); profile_log.flush()
-                        profiler_ready |= "Collecting data" in profile_text
+                        profiler_ready |= ("Attached" in profile_text if args.magic_trace else "Collecting data" in profile_text)
                 if profiler_ready and not gate_opened:
                     stamp = time.monotonic_ns()
                     ctypes.c_uint32.from_buffer(trace_gate).value = 1
@@ -169,6 +202,8 @@ def main():
                 if profiler is not None and not gate_opened and (
                         profiler.poll() is not None or time.monotonic() - profile_started > 45):
                     raise RuntimeError("scheduler profiler did not become ready; gate remains closed")
+                if args.magic_trace and gate_opened and profiler.poll() is None and time.monotonic() - profile_started > args.seconds:
+                    profiler.send_signal(signal.SIGINT)  # bounded fallback snapshot if no threshold fired
                 time.sleep(.25)
         finally:
             if arm.poll() is None:

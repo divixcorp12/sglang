@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--worker-min-us", type=int, default=6000)
     parser.add_argument("--worker-capacity", type=int, default=131072)
     parser.add_argument("--job-capacity", type=int, default=524288)
+    parser.add_argument("--draft-pending-trigger-us", type=int, default=0)
+    parser.add_argument("--draft-forward-trigger-us", type=int, default=0)
     args = parser.parse_args()
     if not 0 <= args.worker_min_us <= 1000000000:
         parser.error("worker-min-us must be in [0, 1000000000]")
@@ -57,6 +59,8 @@ def main():
                   "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=" + prefix,
                   "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=1",
                   "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY=" + str(args.job_capacity)]
+    overrides += ["SGLANG_DRAFT_PENDING_TRIGGER_US=" + str(args.draft_pending_trigger_us),
+                  "SGLANG_DRAFT_FORWARD_TRIGGER_US=" + str(args.draft_forward_trigger_us)]
     if args.worker_phases:
         overrides += ["SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX=" + str(args.output / "worker-phases"),
                       "SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US=" + str(args.worker_min_us),

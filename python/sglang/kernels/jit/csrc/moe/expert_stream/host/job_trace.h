@@ -14,6 +14,14 @@
 
 namespace sglang::expert_stream {
 
+// A stable uprobe target in optimized builds. The asm prevents an empty-call elimination;
+// noinline keeps the call boundary. Arguments also identify the matching buffered event.
+extern "C" __attribute__((noinline, visibility("default"))) inline
+void sglang_draft_delay_trigger(uint32_t seq, int64_t delay_ns, int reason) {
+  asm volatile("" : : "r"(seq), "r"(delay_ns), "r"(reason) : "memory");
+}
+
+
 template <bool On>
 class JobTrace;
 
@@ -46,6 +54,8 @@ class JobTrace<true> {
         throw std::invalid_argument("expert job trace capacity must be an integer in [1, 1048576]");
       capacity_ = static_cast<size_t>(parsed);
     }
+    pending_threshold_ = threshold("SGLANG_DRAFT_PENDING_TRIGGER_US");
+    forward_threshold_ = threshold("SGLANG_DRAFT_FORWARD_TRIGGER_US");
     events_ = std::make_unique<Event[]>(capacity_);
     const char* resources = std::getenv("SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE");
     resources_ = resources && std::string_view(resources) == "1";
@@ -72,10 +82,38 @@ class JobTrace<true> {
     std::fclose(out);
   }
   bool enabled() const { return events_ != nullptr; }
+  bool active() const { return events_ && gate_.enabled(); }
+  // Called only on a pending head, before target-queue selection. No clock read per idle poll.
+  void draft_observe(const void* source, uint32_t seq) {
+    if (source == observed_source_ && seq == observed_seq_) return;
+    observed_source_ = source;
+    observed_seq_ = seq;
+    observed_ns_ = active() ? clock_ns() : 0;
+  }
+  void draft_selected(int64_t selected, int stage, uint32_t epoch, uint32_t seq, uint64_t gpu_ns) {
+    if (!observed_ns_ || !active()) return;
+    emit_at("draft_observed", observed_ns_, stage, epoch, seq, -1, gpu_ns, syscall(SYS_gettid));
+    emit_at("draft_selected", selected, stage, epoch, seq, -1);
+    emit("draft_record_ready", stage, epoch, seq, -1);
+  }
+  void draft_prepared(int64_t ready, int stage, uint32_t epoch, uint32_t seq) {
+    if (!observed_ns_ || !active()) return;
+    emit_at("draft_payload_ready", ready, stage, epoch, seq, -1);
+    trigger(0, ready - observed_ns_, pending_threshold_, stage, epoch, seq);
+  }
+  void draft_finished(int64_t elapsed, int stage, uint32_t epoch, uint32_t seq) {
+    if (observed_ns_ && active()) trigger(1, elapsed, forward_threshold_, stage, epoch, seq);
+    observed_ns_ = 0;
+    observed_seq_ = 0;
+  }
   void emit(const char* kind, int64_t row, uint64_t gen, uint32_t seq, int group,
             int64_t a = 0, int64_t b = 0, int64_t c = 0) {
     if (!events_ || !gate_.enabled()) return;
-    const int64_t ns = clock_ns();
+    emit_at(kind, clock_ns(), row, gen, seq, group, a, b, c);
+  }
+  void emit_at(const char* kind, int64_t ns, int64_t row, uint64_t gen, uint32_t seq, int group,
+               int64_t a = 0, int64_t b = 0, int64_t c = 0) {
+    if (!active()) return;
     const size_t slot = next_.fetch_add(1, std::memory_order_relaxed);
     if (slot < capacity_) events_[slot] = Event{kind, ns, row, gen, seq, group, a, b, c};
   }
@@ -95,6 +133,24 @@ class JobTrace<true> {
     emit(switches, row, gen, seq, -1, usage.ru_nvcsw, usage.ru_nivcsw, cpu_ns);
   }
  private:
+  static int64_t threshold(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return 0;
+    const std::string_view text(value);
+    if (text.empty() || text.find_first_not_of("0123456789") != std::string_view::npos)
+      throw std::invalid_argument(std::string(name) + " must be an integer in [0, 1000000000]");
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (*end || parsed > 1000000000)
+      throw std::invalid_argument(std::string(name) + " must be an integer in [0, 1000000000]");
+    return static_cast<int64_t>(parsed) * 1000;
+  }
+  void trigger(int reason, int64_t elapsed, int64_t threshold_ns, int stage, uint32_t epoch, uint32_t seq) {
+    if (!threshold_ns || elapsed < threshold_ns || triggered_) return;
+    triggered_ = true;  // one snapshot per engine; admission gate keeps warm-up from consuming it
+    emit("draft_trigger", stage, epoch, seq, -1, reason, elapsed, threshold_ns);
+    sglang_draft_delay_trigger(seq, elapsed, reason);
+  }
   static int64_t clock_ns() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -117,6 +173,10 @@ class JobTrace<true> {
   int64_t monotonic_ns_ = 0, epoch_ns_ = 0;
   bool resources_ = false;
   int resource_tid_ = 0;
+  const void* observed_source_ = nullptr;
+  uint32_t observed_seq_ = 0;
+  int64_t observed_ns_ = 0, pending_threshold_ = 0, forward_threshold_ = 0;
+  bool triggered_ = false;
 };
 
 static_assert(std::is_empty_v<JobTrace<false>>, "production job tracing is empty");

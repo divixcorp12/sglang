@@ -26,6 +26,10 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
+#ifndef SGLANG_DRAFT_REQUEST_TRACE
+#define SGLANG_DRAFT_REQUEST_TRACE 0
+#endif
+
 namespace sglang {
 namespace device::expert_stream::draft {
 
@@ -46,6 +50,16 @@ struct PostParams {
   int32_t* slots_dst;      // pinned: [kMaxRows, kMaxK], the CPU route's expert id or -1
   float* weights_dst;      // pinned: [kMaxRows, kMaxK], its weight, 0 for a -1 slot
 };
+
+SGL_DEVICE uint64_t global_ns() {
+  uint64_t ns;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ns));
+  return ns;
+}
+
+__global__ void draft_clock_kernel(int64_t* out) {
+  if (threadIdx.x == 0) __stwt(out, static_cast<int64_t>(global_ns()));
+}
 
 SGL_DEVICE float input_value(const void* src, int32_t dtype, int64_t i) {
   if (dtype == 0) return __half2float(static_cast<const __half*>(src)[i]);
@@ -89,6 +103,8 @@ __global__ void draft_post_kernel(const __grid_constant__ PostParams p) {
       (static_cast<uint32_t>(p.stage) & 0xFFFFu) | (static_cast<uint32_t>(p.rows) & 0xFFu) << 16 |
           (static_cast<uint32_t>(p.k) & 0xFFu) << 24);
   st_relaxed_sys<uint32_t>(record + kRecEpoch, epoch);
+  if constexpr (SGLANG_DRAFT_REQUEST_TRACE != 0)
+    st_relaxed_sys<uint64_t>(record + kRecPublishNs, global_ns());
   ch::end_record<DraftChannel>(record, seq);
   ch::publish_head<DraftChannel>(p.channel, seq);
   p.state[ch::kPending] = static_cast<int32_t>(seq);
@@ -137,6 +153,12 @@ namespace expert_stream::draft {
 /// \brief Checked launchers for the draft channel's kernels. Each queues on the current stream of its tensors'
 /// device, so a capture records post, then (in finish) the close, the wait node and the commit, in order.
 struct DraftChannelKernels {
+  // Calibration only, outside capture: host brackets launch+completion with CLOCK_MONOTONIC.
+  static void clock(tvm::ffi::TensorView state, int64_t out) {
+    RuntimeCheck(state.device().device_type == kDLCUDA && out != 0, "draft clock needs CUDA state and pinned out");
+    LaunchKernel(1, 32, state.device())(device::expert_stream::draft::draft_clock_kernel,
+                                       reinterpret_cast<int64_t*>(out));
+  }
   /// `x` [M, H] fp16/bf16/fp32, `ids` [M, k] int64, `weights` [M, k] fp32, `on_cpu` [E] uint8 and `state` [6] int32,
   /// all on one CUDA device; M <= kMaxRows, k <= kMaxK, H % 8 == 0. `channel`, `x_dst`, `slots_dst` and
   /// `weights_dst` are pinned host addresses of the channel buffer and this stage's areas.
