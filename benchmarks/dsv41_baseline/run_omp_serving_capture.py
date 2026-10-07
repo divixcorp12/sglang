@@ -192,7 +192,7 @@ def main():
                     if chunk:
                         profile_text += chunk
                         profile_log.write(chunk); profile_log.flush()
-                        profiler_ready |= ("Attached" in profile_text if args.magic_trace else "Collecting data" in profile_text)
+                        profiler_ready |= ("[ Attached." in profile_text if args.magic_trace else "Collecting data" in profile_text)
                 if profiler_ready and not gate_opened:
                     stamp = time.monotonic_ns()
                     ctypes.c_uint32.from_buffer(trace_gate).value = 1

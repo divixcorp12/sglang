@@ -74,3 +74,38 @@ def test_trigger_survives_optimized_build_and_compiles_out_of_prod(arrival_probe
         assert ("sglang_draft_delay_trigger" in symbols) == expected
     assembly = subprocess.check_output(["objdump", "-d", str(arrival_probe[0])], text=True)
     assert "call" in assembly and "<sglang_draft_delay_trigger>" in assembly
+
+
+def test_magic_trace_trigger_and_decode(arrival_probe, tmp_path):
+    import select
+    import time
+    tool = os.environ.get("SGLANG_TEST_MAGIC_TRACE")
+    if not tool:
+        pytest.skip("set SGLANG_TEST_MAGIC_TRACE for a live Intel PT smoke capture")
+    probe = subprocess.Popen([str(arrival_probe[0])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        text=True, env={**os.environ, "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path/"events"),
+                       "SGLANG_DRAFT_PENDING_TRIGGER_US":"1000"})
+    trace = None
+    try:
+        assert probe.stdout.readline().strip() == "ready"
+        trace = subprocess.Popen([tool,"attach","-pid",str(probe.pid),"-trigger","sglang_draft_delay_trigger",
+            "-snapshot-size","256K","-working-directory",str(tmp_path/"magic-work"),
+            "-output",str(tmp_path/"trigger.fxt.gz")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        log = ""
+        deadline = time.monotonic()+20
+        while "[ Attached." not in log:
+            assert trace.poll() is None, log
+            assert time.monotonic()<deadline, log
+            if select.select([trace.stdout],[],[],.1)[0]:
+                log += trace.stdout.readline()
+        probe.communicate("x",timeout=10)
+        tail,_=trace.communicate(timeout=60)
+        log+=tail
+        (tmp_path/"magic.log").write_text(log)
+        assert trace.returncode == 0, log
+        assert "Snapshot taken" in log, log
+        assert (tmp_path/"trigger.fxt.gz").stat().st_size > 100
+    finally:
+        for process in (probe,trace):
+            if process is not None and process.poll() is None:
+                process.terminate(); process.wait(timeout=10)

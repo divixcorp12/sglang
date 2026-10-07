@@ -46,3 +46,31 @@ Each forward records worker-local phase start, work completion and barrier exit 
 Only forwards exceeding `SGLANG_EXL3_CPU_WORKER_TRACE_MIN_US` (default 6000) are retained. The default `SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY=65536` bounds phase records per calling thread; the driver uses 131072. A whole forward is admitted or dropped, with explicit footer counts. Buffers allocate once per calling thread and flush at thread exit to `<prefix>.<pid>.<leader-tid>.jsonl`; no allocation, formatting or IO occurs while retaining a forward. Up to 64 workers are supported. Join a frame to the enclosing CPU/draft job by its leader TID and monotonic interval. Always check footers and distinguish retained tails from all-job statistics.
 
 For each phase compare latest worker work completion with barrier exits. A worker whose work wall time greatly exceeds CPU time was blocked or descheduled; CPU time tracking work wall time suggests active execution. Unequal weighted tile assignments can explain unequal work, but units do not model every kernel's cost. A large delay after every worker finished suggests barrier/wake-up overhead. These are measurements with observer overhead: thread-CPU-clock and resource syscalls themselves can perturb scheduling, and their sampling edges are sequential.
+
+## Draft arrival and magic-trace
+
+The instrumented host also records `draft_observed` (first pending head read, before target-queue selection),
+`draft_selected` (serve entry), `draft_record_ready` (seqlock read/validation), and `draft_payload_ready`
+(compacted routes and constructed forward call). Their row/gen/seq identify stage/epoch/request;
+`draft_observed.a` is the raw GPU `%globaltimer` marker and `.b` the engine leader TID.
+The GPU marker precedes record/head publication, so its interval includes release work and visibility.
+It is compiled into the device post kernel only when the job trace prefix selects the diagnostic build.
+
+`SGLANG_DRAFT_PENDING_TRIGGER_US` measures first observation to payload-ready; `SGLANG_DRAFT_FORWARD_TRIGGER_US`
+measures kernel-forward wall time. Zero disables each threshold. The first admitted threshold crossing per engine
+emits `draft_trigger` (a: reason 0 pending / 1 forward, b: measured ns, c: threshold ns) and calls the exported
+`sglang_draft_delay_trigger`. Its `noinline` attribute and volatile asm preserve an actual call in optimized builds.
+Warm-up while the trace gate is closed cannot consume the trigger. Production host builds compile this path out.
+
+`run_omp_serving_capture.py --magic-trace /absolute/path/magic-trace ...` replaces the scheduler-only Nsight
+collector with a bounded Intel PT snapshot on the proven-owned node 0 engine leader. It resolves the trigger's
+address in the loaded JIT DSO, waits for attachment before opening the timed gate, and retains raw perf data.
+The initial thresholds are 500us pending and 5000us forward. If no crossing occurs, the capture stops after
+`--seconds`; this is a fallback, not evidence of a triggered stall. Keep the normal optimized compile settings first.
+
+`analyze_draft_arrival.py <capture-directory>` checks completeness/overflow and joins the timings.
+Initialization writes 64 host-bracketed GPU clock samples to `events.<pid>.draft-clock.json`.
+The intersection of offset intervals gives correlation uncertainty assuming a stable nanosecond clock offset;
+a startup anchor alone does not bound later drift. Report raw GPU and CPU clocks and that limitation.
+The pending threshold cannot detect time before the first CPU observation; inspect the calibrated publication
+interval for that. Intel PT explains native control flow, not GPU execution or DRAM stall causes.
