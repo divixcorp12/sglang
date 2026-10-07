@@ -79,3 +79,9 @@ On divix01, magic-trace v1.2.4 initially failed to parse perf 6.12's `tr strt jm
 Set `MAGIC_TRACE_PERF_PATH=$PWD/benchmarks/dsv41_baseline/magic_trace_perf_compat.py` to canonicalize only
 that alias to `tr strt`, matching upstream master's decoding semantics. Recording uses `/usr/bin/perf`
 unchanged; raw perf data is retained. This adapter is not a blanket parser-error filter.
+
+If the existing 12-round throughput-stability gate fails, retain that failed arm. An explicit
+`--magic-health-diagnostic` capture can instead attach after HTTP health and record a warm-up request.
+It waits for the current request to complete after the profiler stops, then shuts down normally.
+It writes `diagnostic.start` and `diagnostic-completion.json`, and produces no timed benchmark or PASS verdict.
+Use this to investigate fluctuating execution; it cannot establish steady-state throughput.

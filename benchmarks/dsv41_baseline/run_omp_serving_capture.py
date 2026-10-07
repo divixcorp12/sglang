@@ -91,7 +91,11 @@ def main():
     parser.add_argument("--draft-pending-trigger-us", type=int, default=500)
     parser.add_argument("--draft-arrival-trigger-us", type=int, default=500)
     parser.add_argument("--draft-forward-trigger-us", type=int, default=5000)
+    parser.add_argument("--magic-health-diagnostic", action="store_true",
+                        help="Capture a warm-up after HTTP health, stop after snapshot; never a benchmark")
     args = parser.parse_args()
+    if args.magic_health_diagnostic and not args.magic_trace:
+        parser.error("magic-health-diagnostic requires magic-trace")
     if not 10 <= args.seconds <= 120:
         parser.error("seconds must be in [10, 120]")
     output = args.output.resolve()
@@ -100,7 +104,7 @@ def main():
     if hashlib.sha256(library.read_bytes()).hexdigest() != RUNTIME_SHA:
         raise SystemExit("runtime hash differs: re-audit before running")
     shutil.copytree(args.seed_build, output / "exl3-build")
-    gate = output / "timed.start"
+    gate = output / ("diagnostic.start" if args.magic_health_diagnostic else "timed.start")
     # Keep this inode and size unchanged while the server maps the flag.
     trace_gate_path = output / "trace.gate"
     trace_gate_path.write_bytes(bytes(4))
@@ -111,6 +115,8 @@ def main():
            "DSV41_OMP_INIT_CPUS": ",".join(map(str, range(64))),
            "DSV41_OMP_LIBRARY": str(library), "DSV41_OMP_MANIFEST_DIR": str(manifest_dir),
            "DSV41_TIMED_START_FILE": str(gate), "DSV41_MAX_SESSIONS": "1"}
+    if args.magic_health_diagnostic:
+        env["DSV41_DIAGNOSTIC_STOP_FILE"] = str(output / "diagnostic.stop")
     # These are inherited by the server; existing capture adds its own prefixes.
     env.update(SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX=str(output / "hold"),
                SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY="65536",
@@ -153,6 +159,8 @@ def main():
                 sample_runtime(manifest_dir, samples)
                 ready = any('"label": "server_ready"' in p.read_text()
                             for p in output.glob("servers/*/*/boundary-samples.jsonl"))
+                if args.magic_health_diagnostic:
+                    ready = "stall-cpu-s2 healthy" in (output / "driver.log").read_text()
                 if ready and profiler is None:
                     if args.magic_trace:
                         # The bootstrap manifests prove ownership before selecting a TID.
@@ -226,6 +234,8 @@ def main():
                         and "Snapshot taken" not in profile_text and time.monotonic() - profile_started > args.seconds):
                     profiler_stop_requested = True
                     profiler.send_signal(signal.SIGINT)  # bounded fallback snapshot if no threshold fired
+                if args.magic_health_diagnostic and gate_opened and profiler.poll() is not None:
+                    (output / "diagnostic.stop").touch()
                 time.sleep(.25)
         finally:
             if arm.poll() is None:
@@ -246,6 +256,7 @@ def main():
                     sys.executable, str(ROOT/"benchmarks/dsv41_baseline/draft_clock_anchor.py"), str(clock_path)],
                     env=clock_env, stdout=clock_log, stderr=subprocess.STDOUT, check=True, timeout=180)
         status = dict(arm_status=arm.returncode, profiler_status=profiler.returncode if profiler else None,
+                      diagnostic_only=args.magic_health_diagnostic,
                       gate_opened=gate_opened, scheduler_report=str(report) + ".nsys-rep")
         (output / "omp-status.json").write_text(json.dumps(status) + "\n")
         print(json.dumps(status), flush=True)

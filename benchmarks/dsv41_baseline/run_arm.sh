@@ -447,6 +447,19 @@ for round in $(seq 1 "$max_warmup_rounds"); do
         --max-tokens "$max_tokens" --results "$round_results" --rid-suffix="-w$round"
     rc=$?
     [ "$rc" = 0 ] || { stop_server; abort "$arm warm-up round $round rc=$rc"; }
+    # Explicit native-trace diagnostic: finish the current HTTP request before teardown.
+    # This path produces no timed result, run manifest, or benchmark PASS verdict.
+    if [ -n "${DSV41_DIAGNOSTIC_STOP_FILE:-}" ] && [ -f "$DSV41_DIAGNOSTIC_STOP_FILE" ]; then
+        pyrun -c "
+import json
+json.dump({'diagnostic_only': True, 'warmup_round': $round, 'results': '$round_results',
+           'reason': 'health-ready native trace; throughput stability not established'},
+          open('$run_dir/diagnostic-completion.json', 'w'))
+"
+        stop_server
+        echo "diagnostic capture completed after warm-up round $round; no benchmark verdict"
+        exit 0
+    fi
     new_compile_count=$(pyrun -c "import compile_watch as cw; print(cw.compile_events_in_range('$log', start_byte=0))")
     clock=$(pyrun -c "import clock_ramp as cr; print(cr.sample_sm_clock_mhz())")
     tok_s=$(pyrun -c "
@@ -479,7 +492,7 @@ print(1 if cr.is_stable(clocks) else 0, 1 if cr.is_stable(tok_s_samples) else 0)
     quiet=$([ "$new_compile_count" = "$prev_compile_count" ] && echo 1 || echo 0)
     echo "warm-up round $round: SM clock ${clock}MHz stable=$clock_stable  decode ${tok_s} tok/s stable=$tok_s_stable  compile_events_total=$new_compile_count quiet=$quiet"
     prev_compile_count=$new_compile_count
-    if [ "$clock_stable" = 1 ] && [ "$tok_s_stable" = 1 ] && [ "$quiet" = 1 ]; then
+    if [ -z "${DSV41_DIAGNOSTIC_STOP_FILE:-}" ] && [ "$clock_stable" = 1 ] && [ "$tok_s_stable" = 1 ] && [ "$quiet" = 1 ]; then
         ready=1
         break
     fi
