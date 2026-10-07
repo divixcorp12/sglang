@@ -6,6 +6,7 @@ at the timed request. CUDA node tracing is deliberately absent from this arm.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -18,8 +19,11 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "test/manual/dsv41/omp_bootstrap"))
-from sitecustomize import OFFSETS, RUNTIME_SHA
+_spec = importlib.util.spec_from_file_location(
+    "diagnostic_omp_bootstrap", ROOT / "test/manual/dsv41/omp_bootstrap/sitecustomize.py")
+_bootstrap = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_bootstrap)
+OFFSETS, RUNTIME_SHA = _bootstrap.OFFSETS, _bootstrap.RUNTIME_SHA
 
 
 def sample_runtime(directory, out):
