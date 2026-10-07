@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+import pty
+import select
 import subprocess
 import sys
 import time
@@ -48,18 +50,36 @@ def main():
                 if time.monotonic() > deadline:
                     raise RuntimeError("arm readiness timed out")
                 time.sleep(.1)
-            collector = subprocess.Popen(capture, stdout=collector_log, stderr=subprocess.STDOUT)
+            # A pipe/file buffers Nsight's readiness line until profiling has stopped.
+            # A PTY makes it line-buffered; stream the bytes into the persistent log.
+            master, slave = pty.openpty()
+            collector = subprocess.Popen(capture, stdout=slave, stderr=subprocess.STDOUT)
+            os.close(slave)
+            collected = ""
             deadline = time.monotonic() + 15
-            while "Collecting data" not in (args.output / "collector.log").read_text():
+            while "Collecting data" not in collected:
                 if collector.poll() is not None:
                     raise RuntimeError("collector exited before readiness; inspect collector.log")
                 if time.monotonic() > deadline:
                     raise RuntimeError("collector readiness timed out")
-                time.sleep(.1)
+                if select.select([master], [], [], .1)[0]:
+                    chunk = os.read(master, 65536).decode(errors="replace")
+                    collected += chunk
+                    collector_log.write(chunk)
+                    collector_log.flush()
             metadata["release_ns"] = time.monotonic_ns()
             start.touch()
             metadata["arm_status"] = arm.wait(timeout=30)
             metadata["collector_status"] = collector.wait(timeout=45)
+            while select.select([master], [], [], 0)[0]:
+                try:
+                    chunk = os.read(master, 65536).decode(errors="replace")
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                collector_log.write(chunk)
+            os.close(master)
             if metadata["arm_status"] or metadata["collector_status"]:
                 raise RuntimeError("capture/arm failed; inspect logs")
         finally:
