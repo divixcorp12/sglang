@@ -90,7 +90,8 @@ def host_variant() -> str:
     """Return the host build a new service loads.
 
     The instrumented build when this process writes a stream trace
-    (``SGLANG_DSV41_EXPERT_TRACE_PATH``) or injects a RAM-miss fault
+    (``SGLANG_DSV41_EXPERT_TRACE_PATH`` or ``SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX``)
+    or injects a RAM-miss fault
     (``SGLANG_TEST_DSV41_RAM_MISS_FAULT``); production otherwise.
     """
     if _DEFAULT_VARIANT is not None:

@@ -69,7 +69,8 @@ def summarize(pattern, start_ns=None, end_ns=None):
             last = "dma_last_confirmed"
         else:
             last = "ambiguous"
-        ms = lambda ns: ns / 1e6
+        def ms(ns):
+            return ns / 1e6
         rows.append({
             "gen": gen, "group": group, "row": submit["row"], "last": last,
             "submit_ns": submit["ns"], "gate_ns": gates[gen]["ns"],
@@ -77,6 +78,8 @@ def summarize(pattern, start_ns=None, end_ns=None):
             "dma_bytes": issue["a"], "dma_lanes": issue["b"], "forced_cpu_lanes": submit["b"],
             "cpu_lanes": sum(j["cpu_shape"]["b"] for j in jobs),
             "token_expert_routes": sum(j["cpu_shape"]["c"] for j in jobs),
+            "cpu_parts": [j["cpu_submit"]["a"] for j in jobs],
+            "cpu_ready_after_copy_submit_ms": [ms(j["cpu_submit"]["ns"] - submit["ns"]) for j in jobs],
             "cpu_queue_ms": [ms(j["cpu_start"]["ns"] - j["cpu_submit"]["ns"]) for j in jobs],
             "cpu_compute_ms": [ms(j["cpu_end"]["ns"] - j["cpu_start"]["ns"]) for j in jobs],
             "cpu_end_ns": cpu_end, "dma_pending_ns": dma["a"], "dma_done_observed_ns": dma["ns"],
