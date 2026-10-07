@@ -29,6 +29,16 @@ _spec.loader.exec_module(_bootstrap)
 OFFSETS, RUNTIME_SHA = _bootstrap.OFFSETS, _bootstrap.RUNTIME_SHA
 
 
+def select_engine_leader(rows):
+    candidates = {(r["pid"], t["tid"]) for r in rows[-4:] for t in r["expert_threads"]
+                  if t["comm"] == "exl3-cpu-exp0"}
+    if len({pid for pid, _ in candidates}) != 1:
+        raise RuntimeError("expected one owned node 0 CPU engine")
+    # OpenMP workers inherit the caller's comm. The engine starts before it
+    # creates its team, so the oldest matching TID is the engine leader.
+    return min(candidates)
+
+
 def sample_runtime(directory, out):
     """Only processes proven to belong to this unique bootstrap directory."""
     manifests = {}
@@ -165,11 +175,7 @@ def main():
                     if args.magic_trace:
                         # The bootstrap manifests prove ownership before selecting a TID.
                         rows = [json.loads(line) for line in (output / "runtime-samples.jsonl").read_text().splitlines()]
-                        candidates = [(r["pid"], t["tid"]) for r in rows[-4:] for t in r["expert_threads"]
-                                      if t["comm"] == "exl3-cpu-exp0"]
-                        if not candidates:
-                            raise RuntimeError("no node 0 engine leader in owned server")
-                        pid, tid = candidates[-1]
+                        pid, tid = select_engine_leader(rows)
                         # Optimized JIT code is a dlopen DSO; resolve the uprobe address from its own mapping.
                         mappings = (Path("/proc") / str(pid) / "maps").read_text().splitlines()
                         address = None
@@ -258,10 +264,16 @@ def main():
         status = dict(arm_status=arm.returncode, profiler_status=profiler.returncode if profiler else None,
                       diagnostic_only=args.magic_health_diagnostic,
                       gate_opened=gate_opened, scheduler_report=str(report) + ".nsys-rep")
+        if args.magic_trace:
+            trace = output / "draft-delay.fxt.gz"
+            status["trace_bytes"] = trace.stat().st_size if trace.exists() else 0
+            status["fallback_snapshot"] = profiler_stop_requested
         (output / "omp-status.json").write_text(json.dumps(status) + "\n")
         print(json.dumps(status), flush=True)
         if arm.returncode or profiler is None or profiler.returncode or not gate_opened:
             raise SystemExit(1)
+        if args.magic_trace and status["trace_bytes"] <= 100:
+            raise SystemExit("magic-trace decoded an empty timeline")
 
 
 if __name__ == "__main__":

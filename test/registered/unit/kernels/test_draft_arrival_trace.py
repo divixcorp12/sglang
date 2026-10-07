@@ -125,6 +125,17 @@ def test_perf_compat_preserves_data_and_only_normalizes_trace_start():
     assert module.normalize("symbol containing tr strt jmp\n")=="symbol containing tr strt jmp\n"
 
 
+def test_magic_selects_engine_before_inherited_openmp_worker_names():
+    import importlib.util
+    spec=importlib.util.spec_from_file_location("capture",ROOT/"benchmarks/dsv41_baseline/run_omp_serving_capture.py")
+    module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    threads=[dict(tid=tid,comm="exl3-cpu-exp0") for tid in (861080,861071,861072)]
+    rows=[dict(pid=858012,expert_threads=threads)]*4
+    assert module.select_engine_leader(rows)==(858012,861071)
+    with pytest.raises(RuntimeError,match="one owned"):
+        module.select_engine_leader([*rows,dict(pid=123,expert_threads=threads)])
+
+
 def test_arrival_analysis_joins_epochs_and_bounds_clock_uncertainty(tmp_path):
     import importlib.util
     spec=importlib.util.spec_from_file_location("arrival",ROOT/"benchmarks/dsv41_baseline/analyze_draft_arrival.py")
