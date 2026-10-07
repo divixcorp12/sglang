@@ -1194,6 +1194,12 @@ class Exl3RamMissService:
             )
         # A DSpark verify gathers tokens x top_k routes a layer; the CPU rows hold that many tokens.
         # The service starts before the streamers enable their graph gather, so the planned routes stand in for it.
+        for layer_id, s in streamers.items():
+            if (s.graph_gather_rows or planned_routes) and getattr(s.layer, "top_k", None) is None:
+                raise RuntimeError(
+                    f"exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS sizes its rows from each layer's top_k, and layer "
+                    f"{layer_id}'s experts module has none"
+                )
         tokens = max(
             (
                 (s.graph_gather_rows or planned_routes) // s.layer.top_k
@@ -1784,6 +1790,17 @@ class Exl3RamMissService:
             return f"the device synchronize failed: {outcome['error']!r}"
         return None
 
+    def _log_draft_stats(self) -> None:
+        """The shared DSpark draft host's counters, read before ``host.stop()`` closes the handle (its ``stats()`` is
+        ``{}`` afterwards): a both-mode server has no other place that reports them."""
+        draft = getattr(self.host, "_draft_keep", None)
+        if draft is None:
+            return
+        try:
+            logger.info("DSpark CPU experts: %s", draft[1].stats())
+        except Exception as error:  # noqa: BLE001 - a diagnostic must not change the shutdown's outcome
+            logger.warning("exl3 RAM miss: reading the DSpark draft's counters failed: %r", error)
+
     def shutdown(self, *, at_exit: bool = False) -> None:
         """Shut the service down: free the tiers if safe, else quarantine them.
 
@@ -1841,6 +1858,7 @@ class Exl3RamMissService:
                 # stops before anything is freed. A thread hung in a read ends this in
                 # the service watchdog's abort.
                 if self.host is not None:
+                    self._log_draft_stats()
                     logger.info(
                         "exl3 RAM miss: stopping the service thread; a read that hangs ends in the watchdog's abort "
                         "after max(30 s, 3 x the wait timeout)"

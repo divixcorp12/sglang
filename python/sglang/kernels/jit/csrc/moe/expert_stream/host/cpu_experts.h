@@ -373,6 +373,11 @@ class CpuExpertEngine {
         throw std::runtime_error(prefix_ + "the CPU expert output rows are smaller than the hidden size");
       if (c.tokens < 1 || c.tokens > CpuTokenTable::kMaxTokens || (c.tokens > 1 && c.x_token_bytes < 2 * c.hidden))
         throw std::runtime_error(prefix_ + "the CPU expert rows hold 1-32 tokens of the hidden size");
+      // A per_token job runs `tokens` rows through one forward: a kernel with fewer would fail at the first verify.
+      if (c.tokens > c.kernel->max_rows())
+        throw std::runtime_error(
+            prefix_ + "kernel " + c.kernel->name() + " takes " + std::to_string(c.kernel->max_rows()) +
+            " rows per forward, a job up to " + std::to_string(c.tokens));
     }
     check_cpu_expert_team(prefix_, c.cores, c.threads);
   }
