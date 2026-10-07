@@ -56,7 +56,13 @@ def arm(args):
     torch.set_num_threads(1)
     fixture.CAP = CAPACITY
     print(f"sglang {sglang.__file__}", flush=True)
-    ext = exl3_ext()
+    if args.library:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(args.library.stem, args.library)
+        ext = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ext)
+    else:
+        ext = exl3_ext()
     if not ext.exl3_moe_cpu_has_avx512_bw():
         raise RuntimeError("expected BW optimized CPU tier")
     slabs = fixture.random_slabs(torch, HIDDEN, 2304, seed=719)
@@ -74,6 +80,9 @@ def arm(args):
         "trace_prefix": os.environ.get("SGLANG_EXL3_CPU_WORKER_TRACE_PREFIX"),
         "tid": __import__("threading").get_native_id(),
         "case_order_seed": 619,
+        "library": ext.__file__,
+        "library_sha256": hashlib.sha256(Path(ext.__file__).read_bytes()).hexdigest(),
+        "chunk_m": torch.ops.sglang_exl3_cpu.chunk_m(),
     }
     jobs = []
     outputs = {}
@@ -81,6 +90,14 @@ def arm(args):
     # Randomize case blocks reproducibly; every policy sees the same ordering.
     import random
     random.Random(619).shuffle(cases)
+    if args.ready_file:
+        args.ready_file.write_text(json.dumps({"pid": os.getpid(), "metadata": metadata}) + "\n")
+    if args.start_file:
+        deadline = time.monotonic() + 30
+        while not args.start_file.exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError("start-file gate timed out after 30s")
+            time.sleep(.01)
     try:
         for name, route in cases:
             rows, k = len(route), len(route[0])
@@ -123,6 +140,7 @@ def arm(args):
     summary = [{"case": key[0], "reuse": key[1], "gap_s": key[2], "n": len(values),
                 "p50_ms": statistics.median(values), "p95_ms": quantile(values, .95),
                 "max_ms": max(values)} for key, values in sorted(bycase.items())]
+    metadata["plan_calls"] = list(torch.ops.sglang_exl3_cpu.plan_calls())
     args.output.write_text(json.dumps({"metadata": metadata, "summary": summary, "output_hashes": outputs,
                                       "jobs": jobs}, indent=2) + "\n")
     print(json.dumps({"output": str(args.output), "jobs": len(jobs), "summary": summary}), flush=True)
@@ -141,9 +159,10 @@ def matrix(args):
                OPENBLAS_NUM_THREADS="1", MAX_JOBS="4", EXL3_MOE_CPU_PIN="0",
                SGLANG_EXL3_BUILD_DIR=str(args.output / "exl3-build"))
     # Reuse CUDA build artifacts, never copy a source checkout. Changed CPU sources are rebuilt by ninja.
-    import shutil
-    source = Path(reference["SGLANG_EXL3_BUILD_DIR"])
-    shutil.copytree(source, args.output / "exl3-build")
+    if not args.prebuilt_base:
+        import shutil
+        source = Path(reference["SGLANG_EXL3_BUILD_DIR"])
+        shutil.copytree(source, args.output / "exl3-build")
     commands = []
     matrix_start = time.monotonic_ns()
     for measurement in ("cost", "wake"):
@@ -167,6 +186,9 @@ def matrix(args):
                     command = [sys.executable, __file__, "arm", "--measurement", measurement,
                                "--group", str(group), "--reps", str(args.reps), "--warmups", "5",
                                "--output", str(args.output / f"{name}.json")]
+                    library = args.prebuilt_trace if trace else args.prebuilt_base
+                    if library:
+                        command += ["--library", str(library)]
                     record = {"name": name, "command": command, "start_ns": time.monotonic_ns()}
                     print(f"START {name}", flush=True)
                     with (args.output / f"{name}.log").open("w") as log:
@@ -190,13 +212,20 @@ def main():
     a.add_argument("--reps", type=int, default=30)
     a.add_argument("--warmups", type=int, default=5)
     a.add_argument("--output", type=Path, required=True)
+    a.add_argument("--library", type=Path, help="load an explicitly identified prebuilt extension without JIT")
+    a.add_argument("--ready-file", type=Path)
+    a.add_argument("--start-file", type=Path)
     m = sub.add_parser("matrix")
     m.add_argument("--reference", type=Path, required=True)
     m.add_argument("--output", type=Path, required=True)
     m.add_argument("--reps", type=int, default=30)
+    m.add_argument("--prebuilt-base", type=Path)
+    m.add_argument("--prebuilt-trace", type=Path)
     args = p.parse_args()
     if not 5 <= args.reps <= 100:
         p.error("reps must be between 5 and 100")
+    if args.command == "matrix" and bool(args.prebuilt_base) != bool(args.prebuilt_trace):
+        p.error("provide both prebuilt variants or neither")
     matrix(args) if args.command == "matrix" else arm(args)
 
 
