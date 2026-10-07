@@ -75,6 +75,14 @@ def analyze(root):
             raise ValueError(f'missing job footer: {path}')
     for js in jobs.values():
         js.sort(key=lambda j: j['begin'])
+        previous = None
+        for job in js:
+            if job['submit'] is not None:
+                available = max(job['submit'], previous['end'] if previous else job['submit'])
+                job['available_to_start'] = job['begin'] - available
+                job['previous_kind'] = previous['kind'] if previous else None
+                job['previous_end'] = previous['end'] if previous else None
+            previous = job
     starts = {g: [j['begin'] for j in js] for g, js in jobs.items()}
     scratch = {}
     for path in root.glob('scratch.*.jsonl'):
@@ -154,7 +162,14 @@ def analyze(root):
                                        if p['units_cpu_correlation'] is not None], scale=1),
             jobs_us={kind: stats([j['end'] - j['begin'] for j in jobs[group] if j['kind'] == kind])
                      for kind in ('cpu', 'draft')},
-            submit_to_start_us=stats([j['begin'] - j['submit'] for j in jobs[group] if j['submit']]))
+            submit_to_start_us=stats([j['begin'] - j['submit'] for j in jobs[group] if j['submit']]),
+            available_to_start_us=stats([j['available_to_start'] for j in jobs[group] if j['submit']]),
+            queue_over_1ms=sum(j['begin'] - j['submit'] > 1000000 for j in jobs[group] if j['submit']),
+            available_to_start_over_1ms=sum(j['available_to_start'] > 1000000 for j in jobs[group] if j['submit']),
+            top_queues=sorted([j for j in jobs[group] if j['submit']],
+                              key=lambda j: j['begin'] - j['submit'], reverse=True)[:10],
+            top_available_to_start=sorted([j for j in jobs[group] if j['submit']],
+                                          key=lambda j: j['available_to_start'], reverse=True)[:10])
         shaped = defaultdict(list)
         for f in fs:
             key = (f['job']['kind'] if f['job'] else 'unknown', f['rows'], f['chunks'])
