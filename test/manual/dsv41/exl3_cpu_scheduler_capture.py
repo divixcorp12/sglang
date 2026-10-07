@@ -40,7 +40,7 @@ def main():
                "--cpuctxsw=system-wide", "--ftrace=sched/sched_switch,sched/sched_wakeup", "--duration=10",
                "--force-overwrite=true", "--output=" + str(args.output / "scheduler"), "/usr/bin/sleep", "10"]
     if args.isolate_manifest:
-        capture[-2:] = ["--kill=none", "--stop-on-exit=false", sys.executable,
+        capture[-2:] = ["--kill=none", "--stop-on-exit=false", "--run-as=root", sys.executable,
                         str(Path(__file__).with_name("exl3_cpu_affinity_isolation.py")),
                         "--manifest", str(args.isolate_manifest), "--directory", str(args.output)]
     metadata = {"arm_command": command, "capture_command": capture, "start_ns": time.monotonic_ns(),
@@ -69,7 +69,10 @@ def main():
                 if time.monotonic() > deadline:
                     raise RuntimeError("collector readiness timed out")
                 if select.select([master], [], [], .1)[0]:
-                    chunk = os.read(master, 65536).decode(errors="replace")
+                    try:
+                        chunk = os.read(master, 65536).decode(errors="replace")
+                    except OSError as error:
+                        raise RuntimeError("collector closed before readiness; inspect collector.log") from error
                     collected += chunk
                     collector_log.write(chunk)
                     collector_log.flush()
