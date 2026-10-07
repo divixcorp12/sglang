@@ -1197,8 +1197,8 @@ class Exl3RamMissService:
         for layer_id, s in streamers.items():
             if (s.graph_gather_rows or planned_routes) and getattr(s.layer, "top_k", None) is None:
                 raise RuntimeError(
-                    f"exl3 RAM miss: SGLANG_DSV41_CPU_EXPERTS sizes its rows from each layer's top_k, and layer "
-                    f"{layer_id}'s experts module has none"
+                    f"exl3 RAM miss: layer {layer_id}'s experts module has no top_k, which SGLANG_DSV41_CPU_EXPERTS "
+                    "sizes its rows from"
                 )
         tokens = max(
             (
