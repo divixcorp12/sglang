@@ -4,6 +4,8 @@ Set `SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=/absolute/disk/path/events` on a diagn
 
 Each CPU engine and copy engine reserves 131,072 event slots once. Events contain host `CLOCK_MONOTONIC` timestamps and are written to `<prefix>.<pid>.<thread-name>.<instance>.jsonl` after engine shutdown. The parent directory must already exist. Normal shutdown is required; an aborted process cannot flush its buffers. A footer reports overflow, and the analysis command refuses incomplete or dropped-event files.
 
+`SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY` optionally changes the per-engine bound (1–1,048,576 events). The diagnostic driver uses 524,288 so resource snapshots during readiness warm-ups do not exhaust the timed request's buffer. This allocates about 32 MiB per engine; always inspect every overflow footer. Production does not read this setting or allocate a buffer.
+
 The first line contains a monotonic/Unix epoch clock anchor for approximate alignment with Nsight session timestamps. Its two sequential clock reads have a small alignment uncertainty. CPU and copy attribution itself uses the shared monotonic clock.
 
 ```bash
@@ -32,3 +34,5 @@ Also set `SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=1` to record `cpu_faults_start/
 Run `stall_sampler.py --prefix <same-prefix> --output <samples.jsonl> --stop-file <stop-marker>` in parallel, pinned to a spare core outside the expert teams and IRQ cores. It selects the scheduler by the exact trace-prefix environment entry, then samples named EXL3 threads' faults, context switches, scheduler runtime/runqueue delay, state and wait channel every 50 ms, plus global/per-node memory counters every 250 ms. Touch the stop marker when the arm ends. The default hard bounds are 40 minutes and 128 MiB; its footer reports limits and inaccessible reads. A zero/empty wait channel is inconclusive, and waits shorter than the sampling interval may be missed.
 
 For a short Nsight arm, `NSYS_SYSTEM_CPU=1` extends the existing root `-pcie.nsys-rep` companion with system-wide CPU sampling/scheduling and ftrace scheduler, user-fault, direct-reclaim and compaction events. It requires `NSYS_TRACE=1` and `NSYS_GPU_METRICS=1` plus the existing root Nsight wrapper. The normal main report can use `NSYS_SAMPLE=none NSYS_CPUCTXSW=none` to avoid duplicate CPU sampling. Verify ftrace event availability with a short capture first. This companion still contains PCIe metrics; it is no longer metrics-only in this mode. The root collector's scratch remains on the root volume, so keep the capture short and check disk space.
+
+`run_stall_capture.py --no-nsys --reference <capture-command.json> --output <new-directory>` repeats the same serving recipe with just job resources and the bounded `/proc` sampler. It disables Nsight entirely, including CUDA/OSRT injection and root metrics collection. Use this to investigate profiler effects; instrumentation still has overhead, so it is not a production throughput baseline.

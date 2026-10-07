@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=30029)
+    parser.add_argument("--no-nsys", action="store_true", help="collect job resources and /proc only")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     args.output = args.output.resolve()
@@ -34,13 +35,17 @@ def main():
     env = {**os.environ, **reference["harness_env"], "PYTHONPATH": str(root / "python"),
            "DSV41_WORKTREE": str(root), "DSV41_RUN_ROOT": str(args.output), "EXPECT_SHA": head,
            "NSYS_SAMPLE": "none", "NSYS_CPUCTXSW": "none", "NSYS_SYSTEM_CPU": "1"}
+    if args.no_nsys:
+        env.update(NSYS_TRACE="0", NSYS_GPU_METRICS="0", NSYS_SYSTEM_CPU="0")
     prefix = str(args.output / "events")
     overrides = [arg for arg in reference["command"][4:]
                  if not arg.startswith(("SGLANG_MOE_HOT_METRICS_FILE=", "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=",
-                                        "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE="))]
+                                        "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=",
+                                        "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY="))]
     overrides += ["SGLANG_MOE_HOT_METRICS_FILE=" + str(args.output / "metrics.jsonl"),
                   "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX=" + prefix,
-                  "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=1"]
+                  "SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE=1",
+                  "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY=524288"]
     command = ["bash", str(root / "benchmarks/dsv41_baseline/run_arm.sh"), "stall-cpu-s2",
                str(args.port), *overrides]
     imported = subprocess.check_output([sys.executable, "-c", "import sglang; print(sglang.__file__)"],
@@ -49,7 +54,8 @@ def main():
         raise SystemExit("unexpected sglang import: " + imported)
     metadata = {"head": head, "sglang_file": imported, "command": command,
                 "harness_env": {k: env[k] for k in reference["harness_env"]},
-                "extra_harness_env": {"NSYS_SYSTEM_CPU": "1"}, "reference": str(args.reference),
+                "extra_harness_env": {k: env[k] for k in ("NSYS_TRACE", "NSYS_GPU_METRICS", "NSYS_SYSTEM_CPU")},
+                "reference": str(args.reference),
                 "start_ns": time.monotonic_ns(), "epoch_ns": time.time_ns()}
     (args.output / "capture-command.json").write_text(json.dumps(metadata, indent=2))
     with open("/data/models/slang/nvfp4-work/rowimg-disk.lock", "w") as disk:

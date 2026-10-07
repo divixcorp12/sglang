@@ -65,6 +65,28 @@ def test_disabled_trace_writes_nothing(trace_probe, tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_configured_capacity_bounds_concurrent_writers(trace_probe, tmp_path):
+    subprocess.run([str(trace_probe)], check=True, env={**os.environ,
+                   "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
+                   "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": "512"})
+    records = [json.loads(line) for line in next(tmp_path.glob("events.*.jsonl")).read_text().splitlines()]
+    assert len(records[1:-1]) == 512 and records[-1] == {"dropped": 140000 - 512}
+    assert len({(r["group"], r["seq"]) for r in records[1:-1]}) == 512
+
+
+@pytest.mark.parametrize("capacity", ["0", "1048577", "-1", "", "2x", "999999999999999999999999"])
+def test_invalid_capacity_is_rejected(trace_probe, tmp_path, capacity):
+    import resource
+    def no_core():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    result = subprocess.run([str(trace_probe)], cwd=tmp_path, preexec_fn=no_core, capture_output=True,
+                            env={**os.environ, "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
+                                 "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": capacity})
+    assert result.returncode != 0
+    assert b"trace capacity must be" in result.stderr
+    assert not list(tmp_path.iterdir())
+
+
 def test_thread_resource_snapshots_observe_faults_and_sleep(trace_probe, tmp_path):
     subprocess.run([str(trace_probe), "resources"], check=True, env={**os.environ,
                    "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),

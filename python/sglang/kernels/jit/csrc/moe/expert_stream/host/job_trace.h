@@ -35,7 +35,17 @@ class JobTrace<true> {
     if (!prefix || !*prefix) return;
     path_ = std::string(prefix) + "." + std::to_string(getpid()) + "." + name + "." +
             std::to_string(instances_.fetch_add(1, std::memory_order_relaxed)) + ".jsonl";
-    events_ = std::make_unique<Event[]>(kCapacity);
+    if (const char* value = std::getenv("SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY")) {
+      const std::string_view text(value);
+      if (text.empty() || text.find_first_not_of("0123456789") != std::string_view::npos)
+        throw std::invalid_argument("expert job trace capacity must be an integer in [1, 1048576]");
+      char* end = nullptr;
+      const unsigned long long parsed = std::strtoull(value, &end, 10);
+      if (*end || parsed < 1 || parsed > 1048576)
+        throw std::invalid_argument("expert job trace capacity must be an integer in [1, 1048576]");
+      capacity_ = static_cast<size_t>(parsed);
+    }
+    events_ = std::make_unique<Event[]>(capacity_);
     const char* resources = std::getenv("SGLANG_DSV41_EXPERT_JOB_RESOURCE_TRACE");
     resources_ = resources && std::string_view(resources) == "1";
     monotonic_ns_ = clock_ns();
@@ -50,14 +60,14 @@ class JobTrace<true> {
     std::fprintf(out, "{\"schema\":1,\"clock\":\"CLOCK_MONOTONIC\",\"monotonic_ns\":%lld,\"epoch_ns\":%lld}\n",
                  static_cast<long long>(monotonic_ns_), static_cast<long long>(epoch_ns_));
     const size_t count = next_.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < std::min(count, kCapacity); ++i) {
+    for (size_t i = 0; i < std::min(count, capacity_); ++i) {
       const Event& e = events_[i];
       std::fprintf(out, "{\"event\":\"%s\",\"ns\":%lld,\"row\":%lld,\"gen\":%llu,\"seq\":%u,\"group\":%d,\"a\":%lld,\"b\":%lld,\"c\":%lld}\n",
                    e.kind, static_cast<long long>(e.ns), static_cast<long long>(e.row),
                    static_cast<unsigned long long>(e.gen), e.seq, e.group,
                    static_cast<long long>(e.a), static_cast<long long>(e.b), static_cast<long long>(e.c));
     }
-    std::fprintf(out, "{\"dropped\":%llu}\n", static_cast<unsigned long long>(count > kCapacity ? count - kCapacity : 0));
+    std::fprintf(out, "{\"dropped\":%llu}\n", static_cast<unsigned long long>(count > capacity_ ? count - capacity_ : 0));
     std::fclose(out);
   }
   bool enabled() const { return events_ != nullptr; }
@@ -66,7 +76,7 @@ class JobTrace<true> {
     if (!events_) return;
     const int64_t ns = clock_ns();
     const size_t slot = next_.fetch_add(1, std::memory_order_relaxed);
-    if (slot < kCapacity) events_[slot] = Event{kind, ns, row, gen, seq, group, a, b, c};
+    if (slot < capacity_) events_[slot] = Event{kind, ns, row, gen, seq, group, a, b, c};
   }
   // Only the engine's owning CPU thread calls this. These are its counters, not the worker team's sum.
   void resources(const char* faults, const char* switches, int64_t row, uint64_t gen, uint32_t seq) {
@@ -98,7 +108,7 @@ class JobTrace<true> {
     int64_t a, b, c;
   };
   inline static std::atomic<size_t> instances_{0};
-  static constexpr size_t kCapacity = 131072;
+  size_t capacity_ = 131072;
   std::string path_;
   std::unique_ptr<Event[]> events_;
   std::atomic<size_t> next_{0};
