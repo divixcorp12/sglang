@@ -7351,6 +7351,39 @@ the Tasks 2-12 work brought from 1.00 to 0.031. It removes the draft-only arm's 
 the text band, so it is a working configuration, not a win. Whether the 5240 MiB of hot cache it gave up (budget A) is
 what keeps it behind is unmeasured; option C is what would test that.
 
+**§33.11 addendum: per-token calibration.** The CPU split under spill was calibrated with one-token CPU jobs while a
+verify's record jobs are `per_token` with 6 tokens (final-review finding I2). `a67c5a8e6c` makes the calibration's
+`cpu[k]` and `both[n][k]` jobs per-token jobs of the verify's token count, with a synthetic all-routed token table
+(`CpuExpertEngine::write_calibration_table`); one-token launches are unchanged. A/B rerun at `c1aa74bfd6` (python tree
+`8949a90bbc`), `ab-fix/`, budget A, the same 8 sessions, arms `prod` and `dspark-both` only, all `rc=0`, no fail-stop,
+trap, OOM or Traceback in any log.
+
+| Arm | ms/token median | mean | accept length | reverify_ct | KV pool |
+|---|---|---|---|---|---|
+| `prod` | 88.30 | 113.5 | n/a | n/a | 270,848 |
+| `dspark-both` (calibrated at 6 tokens) | 95.05 | 106.3 | 3.588 | 9 (2.2% of 410 graphed verifies) | 402,944 |
+
+Per-session ms/token, sessions 0-7: `prod` 107.5, 81.0, 81.2, 283.3, 89.6, 85.3, 87.0, 93.2; `dspark-both` 143.0, 75.5,
+64.2, 152.5, 87.3, 102.8, 86.4, 138.7. `prod`'s session 3 (283.3 ms/token against 91.0 in the first A/B) is the outlier
+that lifts its mean; it was not re-run. Against the first A/B's `dspark-both` (median 93.55, mean 103.2, accept 3.671)
+the median is 1.5 ms/token higher and the mean 3.1 higher, inside the sessions' spread. The median gap to `prod`
+is 6.75 ms/token (7.6%), against 8.2 (9.6%) before.
+
+- **Split, group 0 / group 1, n = 0..8 (the victim lanes).** One-token calibration (first A/B's log) `0 1 1 2 3 3 4 4 5`
+  / `0 1 1 2 3 3 4 5 5`; 6-token calibration `0 0 0 1 1 1 2 2 2` / `0 0 1 1 1 2 2 2 3`. At n = 8 the CPU takes 2 and 3
+  lanes instead of 5 and 5; over n = 1..8 the CPU's share drops from 23 and 24 lane-slots to 9 and 12. The old figures
+  come from a separate server run, so they carry run-to-run calibration noise.
+- **Measured CPU cost per k (group 0, ms, k = 1..8).** First A/B (one token) `0.59 1.11 1.67 2.33 2.80 3.75 4.53
+  6.64`; here, in the 6-token grid, `2.33 4.73 8.06 10.79 12.39 10.41 13.86 14.55`: about 4 times the one-token cost.
+- **Bars.** 1 pass (both `rc=0`, none of fail-stop, `__trap`, `RemoteDisconnected`, `CUDA error`, out of memory,
+  Traceback). 2 pass (3 flips of 354 tokens, max gap 0.25). 3 pass: `reverify_ct` 9 against a limit of 17;
+  `gather_overflow` summed over the layers 378 in all seven metrics records (graphed verifies 39 to 410), no growth.
+  4 pass: group 0 reports 36,114 CPU-expert jobs (67,441 lanes, 0.677 ms per lane) at its last stats line. 5 pass:
+  402,944 against `prod`'s 270,848 from the same run. 6 reported above.
+- **Reading.** The mis-split moved victim lanes off the CPU by a third to a half, and the A/B did not move: the median
+  stayed within 1.5 ms/token of the first run. The "do not flip" verdict does not rest on the one-token calibration.
+  The hot-cache difference (budget A) is still unseparated.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
