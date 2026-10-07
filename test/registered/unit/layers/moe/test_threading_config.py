@@ -322,7 +322,7 @@ def test_under_cpu_experts_the_draft_has_no_cores_of_its_own(divix01):
 
 @pytest.mark.parametrize("settings", [{"draft_cores": "12-15"}, {"draft_threads": 4}])
 def test_under_cpu_experts_named_draft_cores_are_refused(divix01, settings):
-    with pytest.raises(ValueError, match="shares node 0's CPU expert team"):
+    with pytest.raises(ValueError, match="shares the GPU node's CPU expert team"):
         resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, spin_core=17, draft=True, **settings)
 
 
