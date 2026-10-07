@@ -7376,11 +7376,11 @@ is 6.75 ms/token (7.6%), against 8.2 (9.6%) before.
 - **Measured CPU cost per k (group 0, ms, k = 1..8).** First A/B (one token) `0.59 1.11 1.67 2.33 2.80 3.75 4.53
   6.64`; here, in the 6-token grid, `2.33 4.73 8.06 10.79 12.39 10.41 13.86 14.55`: about 4 times the one-token cost.
 - **Bars.** 1 pass (both `rc=0`, none of fail-stop, `__trap`, `RemoteDisconnected`, `CUDA error`, out of memory,
-  Traceback). 2 pass (3 flips of 354 tokens, max gap 0.25). 3 pass: `reverify_ct` 9 against a limit of 17;
+  Traceback). 2 pass (3 flips, max gap 0.25). 3 pass: `reverify_ct` 9 against a limit of 17;
   `gather_overflow` summed over the layers 378 in all seven metrics records (graphed verifies 39 to 410), no growth.
   4 pass: group 0 reports 36,114 CPU-expert jobs (67,441 lanes, 0.677 ms per lane) at its last stats line. 5 pass:
   402,944 against `prod`'s 270,848 from the same run. 6 reported above.
-- **Reading.** The mis-split moved victim lanes off the CPU by a third to a half, and the A/B did not move: the median
+- **Reading.** The 6-token calibration took the CPU's share of the victim lanes down by 39% (group 1) to 61% (group 0) across n = 1..8, and the A/B did not move: the median
   stayed within 1.5 ms/token of the first run. The "do not flip" verdict does not rest on the one-token calibration.
   The hot-cache difference (budget A) is still unseparated.
 
