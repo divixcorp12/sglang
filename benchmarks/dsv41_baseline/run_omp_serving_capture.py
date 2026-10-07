@@ -52,6 +52,10 @@ def sample_runtime(directory, out):
             if not data:
                 continue
             maps = (proc / "maps").read_text().splitlines()
+            # A zombie retains its comm/stat while Linux has already removed its mappings.
+            # It is a normal shutdown observation, not a changed runtime binary.
+            if not maps:
+                continue
             bases = [int(line.split("-", 1)[0], 16) for line in maps
                      if line.split()[2] == "00000000" and line.endswith(data["runtime"])]
             if len(bases) != 1:

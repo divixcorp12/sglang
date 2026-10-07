@@ -1,9 +1,12 @@
 """Fresh-process and multiprocessing-spawn checks for the diagnostic-only hook."""
 import json
+import importlib.util
+import io
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -61,3 +64,27 @@ def test_disabled_hook_does_not_load_runtime(tmp_path):
                     "from pathlib import Path; assert 'libgomp' not in Path('/proc/self/maps').read_text()"],
                    env=env, check=True, timeout=10)
     assert not (tmp_path / "manifests").exists()
+
+
+def test_sampler_ignores_exited_scheduler_with_empty_maps(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "omp_capture", ROOT / "benchmarks/dsv41_baseline/run_omp_serving_capture.py")
+    capture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(capture)
+    child = subprocess.Popen([sys.executable, "-c", """
+import ctypes, os
+ctypes.CDLL(None).prctl(15, b'sglang::sched', 0, 0, 0)
+os._exit(0)
+"""], env=environment(tmp_path))
+    try:
+        proc = Path('/proc') / str(child.pid)
+        deadline = time.monotonic() + 10
+        while proc.joinpath('stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z':
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        assert proc.joinpath('maps').read_text() == ''
+        output = io.StringIO()
+        capture.sample_runtime(tmp_path / 'manifests', output)
+        assert output.getvalue() == ''
+    finally:
+        child.wait(timeout=10)
