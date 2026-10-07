@@ -5,6 +5,8 @@ from /proc/PID/mem outside the server and gates a root scheduler-only Nsight cap
 at the timed request. CUDA node tracing is deliberately absent from this arm.
 """
 import argparse
+import ctypes
+import mmap
 import hashlib
 import importlib.util
 import json
@@ -94,6 +96,11 @@ def main():
         raise SystemExit("runtime hash differs: re-audit before running")
     shutil.copytree(args.seed_build, output / "exl3-build")
     gate = output / "timed.start"
+    # Keep this inode and size unchanged while the server maps the flag.
+    trace_gate_path = output / "trace.gate"
+    trace_gate_path.write_bytes(bytes(4))
+    with trace_gate_path.open("r+b") as trace_gate_file:
+        trace_gate = mmap.mmap(trace_gate_file.fileno(), 4)
     manifest_dir = output / "runtime-init"
     env = {**os.environ, "DSV41_OMP_BOOTSTRAP": "1",
            "DSV41_OMP_INIT_CPUS": ",".join(map(str, range(64))),
@@ -101,10 +108,14 @@ def main():
            "DSV41_TIMED_START_FILE": str(gate), "DSV41_MAX_SESSIONS": "1"}
     # These are inherited by the server; existing capture adds its own prefixes.
     env.update(SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX=str(output / "hold"),
-               SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY="1048576")
+               SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY="65536",
+               SGLANG_CPU_EXPERT_TRACE_GATE=str(trace_gate_path),
+               SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX=str(output / "scratch"))
     command = [sys.executable, str(Path(__file__).with_name("run_stall_capture.py")),
                "--reference", str(args.reference), "--output", str(output),
-               "--port", str(args.port), "--no-nsys", "--worker-phases"]
+               "--port", str(args.port), "--no-nsys", "--worker-phases",
+               "--worker-min-us", "0", "--worker-capacity", "262144",
+               "--job-capacity", "1048576"]
     report = Path("/mnt/nvme1/dsv41-nsys") / (output.name + "-scheduler")
     profile_command = ["sudo", "-n", "/usr/local/sbin/nsys-profile", "profile",
                        "--trace=none", "--sample=none", "--cpuctxsw=system-wide",
@@ -114,7 +125,8 @@ def main():
     (output / "omp-command.json").write_text(json.dumps(dict(command=command,
         diagnostic_env={k: v for k, v in env.items() if k.startswith("DSV41_OMP") or
                         k in ("DSV41_TIMED_START_FILE", "SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX",
-                              "SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY")},
+                              "SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY", "SGLANG_CPU_EXPERT_TRACE_GATE",
+                              "SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX")},
         scheduler_command=profile_command), indent=2) + "\n")
     profiler = None
     master = slave = None
@@ -149,7 +161,9 @@ def main():
                         profile_log.write(chunk); profile_log.flush()
                         profiler_ready |= "Collecting data" in profile_text
                 if profiler_ready and not gate_opened:
-                    gate.write_text(json.dumps(dict(ns=time.monotonic_ns())) + "\n")
+                    stamp = time.monotonic_ns()
+                    ctypes.c_uint32.from_buffer(trace_gate).value = 1
+                    gate.write_text(json.dumps(dict(ns=stamp, trace_gate=str(trace_gate_path))) + "\n")
                     gate_opened = True
                     print("scheduler collecting; timed gate open", flush=True)
                 if profiler is not None and not gate_opened and (
@@ -164,6 +178,7 @@ def main():
                 profiler.wait(timeout=150)
             if master is not None:
                 os.close(master)
+            trace_gate.close()
         status = dict(arm_status=arm.returncode, profiler_status=profiler.returncode if profiler else None,
                       gate_opened=gate_opened, scheduler_report=str(report) + ".nsys-rep")
         (output / "omp-status.json").write_text(json.dumps(status) + "\n")

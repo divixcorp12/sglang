@@ -452,7 +452,7 @@ struct ForwardPlan
     static void run(ForwardCtx& ctx, const Experts<Shape>& E, ForwardArena& ar, int threads)
     {
         worker_trace::Capture<Trace> trace(threads > 0 ? threads : 1, ctx.m_total, int(ctx.chunks.size()));
-        prepare_scratch(ctx, ar);
+        prepare_scratch(ctx, ar, trace);
         const int nc = static_cast<int>(ctx.chunks.size());
         const bool grouped = Traits::kGroupedTraversal && nc == 1;
         const bool wide = Traits::kWideSingleExpert && ctx.m_total == 1 && nc == 1;
@@ -462,37 +462,37 @@ struct ForwardPlan
     }
 
 private:
-    static void prepare_scratch(ForwardCtx& ctx, ForwardArena& ar)
+    static void prepare_scratch(ForwardCtx& ctx, ForwardArena& ar, worker_trace::Capture<Trace>& trace)
     {
         constexpr bool compact = Traits::kCompactScratch;
         const int nc = static_cast<int>(ctx.chunks.size());
         const int H = Shape::hidden(*ctx.layer);
         const int I_ = Shape::intermediate(*ctx.layer);
-        auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
-        grow(ar.tin_g, static_cast<size_t>(nc) * MAX_M * H);
-        grow(ar.tin_u, static_cast<size_t>(nc) * MAX_M * H);
-        grow(ar.tin_d, static_cast<size_t>(nc) * MAX_M * I_);
+        auto grow = [&](auto& v, size_t n, const char* name) { trace.grow(v, n, name); };
+        grow(ar.tin_g, static_cast<size_t>(nc) * MAX_M * H, "ar.tin_g");
+        grow(ar.tin_u, static_cast<size_t>(nc) * MAX_M * H, "ar.tin_u");
+        grow(ar.tin_d, static_cast<size_t>(nc) * MAX_M * I_, "ar.tin_d");
 
         if(!compact) {
-            grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H);
-            grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H);
-            grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I_);
-            grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H);
-            grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H);
-            grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I_);
+            grow(ar.splat_g, static_cast<size_t>(nc) * MAX_M * H, "ar.splat_g");
+            grow(ar.splat_u, static_cast<size_t>(nc) * MAX_M * H, "ar.splat_u");
+            grow(ar.splat_d, static_cast<size_t>(nc) * MAX_M * I_, "ar.splat_d");
+            grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_M * H, "ar.splat_dup_g");
+            grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_M * H, "ar.splat_dup_u");
+            grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_M * I_, "ar.splat_dup_d");
         } else {
             // Compact: each chunk's ACT_ROWS * m rows follow the previous chunk's (a call of one-token chunks keeps chunk
             // j at j * ACT_ROWS rows).
             size_t rows = 0;
             for (const Chunk& ch : ctx.chunks) rows += size_t(ACT_ROWS) * ch.m;
-            grow(ar.compact_g,rows*H);
-            grow(ar.compact_u,rows*H);
-            grow(ar.compact_d,rows*I_);
+            grow(ar.compact_g, rows*H, "ar.compact_g");
+            grow(ar.compact_u, rows*H, "ar.compact_u");
+            grow(ar.compact_d, rows*I_, "ar.compact_d");
         }
-        grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I_);
-        grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I_);
-        grow(ar.tout_d, static_cast<size_t>(nc) * MAX_M * H);
-        grow(ctx.prep_g, nc); grow(ctx.prep_u, nc); grow(ctx.prep_d, nc);
+        grow(ar.tout_g, static_cast<size_t>(nc) * MAX_M * I_, "ar.tout_g");
+        grow(ar.tout_u, static_cast<size_t>(nc) * MAX_M * I_, "ar.tout_u");
+        grow(ar.tout_d, static_cast<size_t>(nc) * MAX_M * H, "ar.tout_d");
+        grow(ctx.prep_g, nc, "ctx.prep_g"); grow(ctx.prep_u, nc, "ctx.prep_u"); grow(ctx.prep_d, nc, "ctx.prep_d");
         ctx.tout_g = ar.tout_g.data();
         ctx.tout_u = ar.tout_u.data();
         ctx.tout_d = ar.tout_d.data();
@@ -518,7 +518,7 @@ private:
         if constexpr (Traits::kSplitTiles < 8)
         {
             const size_t blocks = static_cast<size_t>(nc) * (H / 128);
-            grow(ar.down_tiles_done, blocks);
+            grow(ar.down_tiles_done, blocks, "ar.down_tiles_done");
             std::fill_n(ar.down_tiles_done.data(), blocks, 0);
             ctx.down_tiles_done = ar.down_tiles_done.data();
         }
@@ -526,8 +526,8 @@ private:
         {
             // Sized for one block per 16 inputs, the smallest B allows; only k / B entries are used
             const size_t sh = static_cast<size_t>(MAX_M) * (H / 16), si = static_cast<size_t>(MAX_M) * (I_ / 16);
-            grow(ar.bq_g, nc * sh); grow(ar.bq_u, nc * sh); grow(ar.bq_d, nc * si);
-            grow(ar.bsum_g, nc * sh); grow(ar.bsum_u, nc * sh); grow(ar.bsum_d, nc * si);
+            grow(ar.bq_g, nc * sh, "ar.bq_g"); grow(ar.bq_u, nc * sh, "ar.bq_u"); grow(ar.bq_d, nc * si, "ar.bq_d");
+            grow(ar.bsum_g, nc * sh, "ar.bsum_g"); grow(ar.bsum_u, nc * sh, "ar.bsum_u"); grow(ar.bsum_d, nc * si, "ar.bsum_d");
             for (int j = 0; j < nc; ++j)
             {
                 ctx.prep_g[j].bq = ar.bq_g.data() + j * sh; ctx.prep_g[j].bsum = ar.bsum_g.data() + j * sh;

@@ -1,6 +1,7 @@
 // Optional per-worker timing of keep-warm's parallel-region exit and implicit join.
 // No worker-side allocation or IO. Normal quant builds instantiate the empty specialization.
 #pragma once
+#include "../trace_gate.h"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -76,6 +77,7 @@ class Buffer {
                      (long long)seen, (long long)dropped, used);
         std::fclose(out);
     }
+    expert_stream::TraceGate gate;
     std::string path;
     std::unique_ptr<Record[]> records;
     size_t capacity = 65536, used = 0;
@@ -92,11 +94,13 @@ template<> struct Capture<true> {
             int64_t warm, int64_t release)
         : b(buffer()), n(n), a(a), other(other), seen_a(seen_a), seen_b(seen_b), warm(warm), release(release) {
         if (n < 1 || n > kWorkers) throw std::invalid_argument("hold tracing supports 1..64 workers");
-        begin = now();
+        active = b.records && b.gate.enabled();
+        begin = active ? now() : 0;
     }
-    void enter(int w) { workers[w].enter = now(); workers[w].tid = int(syscall(SYS_gettid)); }
-    void ready(int w) { workers[w].ready = now(); workers[w].cpu = sched_getcpu(); }
+    void enter(int w) { if (!active) return; workers[w].enter = now(); workers[w].tid = int(syscall(SYS_gettid)); }
+    void ready(int w) { if (!active) return; workers[w].ready = now(); workers[w].cpu = sched_getcpu(); }
     void exit(int w) {
+        if (!active) return;
         auto& s = workers[w];
         s.exit = now();
         s.a = __atomic_load_n(a, __ATOMIC_ACQUIRE);
@@ -104,7 +108,7 @@ template<> struct Capture<true> {
     }
     void finish() {
         const int64_t end = now(), serial = ++b.seen;
-        if (!b.records) return;
+        if (!active) return;
         if (b.used + size_t(n) > b.capacity) { ++b.dropped; return; }
         for (int w = 0; w < n; ++w)
             b.records[b.used++] = Record{workers[w], serial, begin, end, warm, release,
@@ -112,6 +116,7 @@ template<> struct Capture<true> {
     }
     Buffer& b;
     std::array<Worker, kWorkers> workers{};
+    bool active = false;
     int n;
     const uint32_t* a;
     const uint32_t* other;

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "build_policy.h"
+#include "trace_gate.h"
 #include <time.h>
 #include <algorithm>
 #include <cstdio>
@@ -73,14 +74,14 @@ class JobTrace<true> {
   bool enabled() const { return events_ != nullptr; }
   void emit(const char* kind, int64_t row, uint64_t gen, uint32_t seq, int group,
             int64_t a = 0, int64_t b = 0, int64_t c = 0) {
-    if (!events_) return;
+    if (!events_ || !gate_.enabled()) return;
     const int64_t ns = clock_ns();
     const size_t slot = next_.fetch_add(1, std::memory_order_relaxed);
     if (slot < capacity_) events_[slot] = Event{kind, ns, row, gen, seq, group, a, b, c};
   }
   // Only the engine's owning CPU thread calls this. These are its counters, not the worker team's sum.
   void resources(const char* faults, const char* switches, int64_t row, uint64_t gen, uint32_t seq) {
-    if (!resources_) return;
+    if (!resources_ || !gate_.enabled()) return;
     if (!resource_tid_) resource_tid_ = static_cast<int>(syscall(SYS_gettid));
     rusage usage{};
     if (getrusage(RUSAGE_THREAD, &usage) != 0) {
@@ -108,6 +109,7 @@ class JobTrace<true> {
     int64_t a, b, c;
   };
   inline static std::atomic<size_t> instances_{0};
+  TraceGate gate_;
   size_t capacity_ = 131072;
   std::string path_;
   std::unique_ptr<Event[]> events_;

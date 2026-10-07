@@ -20,10 +20,14 @@ def probes(tmp_path_factory):
 #include "worker_trace.hpp"
 #include "moe/expert_stream/host/cpu_experts/team.hpp"
 #include <omp.h>
+#include <vector>
 using namespace sglang::exl3_cpu::worker_trace;
 int main() {
+  std::vector<float> scratch;
   for (int f=0; f<2; ++f) {
     Capture<ON> capture(4, 6, 3);
+    capture.grow(scratch, 1048576, "probe");
+    if (scratch.size()!=1048576 || scratch.back()!=0) return 3;
     capture.team_start();
     sglang::cpu_experts::run_team(4, [&](int w, int) {
       for (int p : {0,1,2,3,5}) {
@@ -49,8 +53,10 @@ int main() {
 #include "worker_trace.hpp"
 #include "moe/expert_stream/host/cpu_experts/team.hpp"
 using namespace sglang::exl3_cpu::worker_trace;
+#include <vector>
 static_assert(std::is_empty_v<Capture<false>>);
-int main() { Capture<false> c(4,6,3); c.team_start(); c.worker_start(0);
+int main() { Capture<false> c(4,6,3); std::vector<int> v; c.grow(v,8,"production");
+ if(v.size()!=8 || v.back()!=0) return 3; c.team_start(); c.worker_start(0);
  c.begin(0,0); c.add_work(0,0,3); c.work_end(0,0); c.end(0,0); c.worker_end(0); c.finish();
  sglang::cpu_experts::run_team(1, [](int, int) {}); }
 ''')
@@ -123,3 +129,28 @@ def test_build_flag_requires_job_attribution(monkeypatch):
         worker_trace_defines()
     monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", "/diagnostic/events")
     assert worker_trace_defines() == ["-DEXL3_MOE_CPU_WORKER_TRACE=1"]
+
+
+def test_scratch_growth_is_attributed_before_team_entry(probes, tmp_path):
+    run(probes, tmp_path, SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX=str(tmp_path / "scratch"))
+    data = [json.loads(line) for line in next(tmp_path.glob("scratch.*.jsonl")).open()]
+    summaries = [r for r in data if r.get("kind") == "scratch"]
+    growth = [r for r in data if r.get("kind") == "growth"]
+    assert [r["growths"] for r in summaries] == [1, 0]
+    assert len(growth) == 1 and growth[0]["forward"] == 1
+    assert growth[0]["old_size"] == growth[0]["old_capacity"] == 0
+    assert growth[0]["size"] == 1048576 and growth[0]["moved"]
+    assert summaries[0]["initialized_bytes"] == 4 * 1048576
+    assert summaries[0]["minflt"] >= growth[0]["minflt"] > 0
+    assert all(r["begin"] <= r["end"] and r["cpu_begin"] <= r["cpu_end"] for r in summaries + growth)
+    assert summaries[0]["begin"] <= growth[0]["begin"] <= growth[0]["end"] <= summaries[0]["end"]
+    assert data[-1]["dropped_growths"] == 0
+
+
+def test_closed_gate_does_not_consume_worker_capacity(probes, tmp_path):
+    gate = tmp_path / "gate"
+    gate.write_bytes(bytes(4))
+    data = run(probes, tmp_path, SGLANG_CPU_EXPERT_TRACE_GATE=str(gate),
+               SGLANG_EXL3_CPU_WORKER_TRACE_CAPACITY="1")
+    assert len(data) == 2 and data[-1]["dropped_forwards"] == 0
+    assert data[-1]["forwards_seen"] == 2

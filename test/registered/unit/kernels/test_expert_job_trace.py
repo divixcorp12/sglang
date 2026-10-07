@@ -17,10 +17,17 @@ def trace_probe(tmp_path_factory):
 #include "job_trace.h"
 #include <thread>
 using namespace sglang::expert_stream;
-int main(int argc, char**) {
+int main(int argc, char** argv) {
   { JobTrace<false> prod("prod"); prod.emit("forbidden", 0, 0, 0, 0);
     prod.resources("forbidden", "forbidden", 0, 0, 0); }
   JobTrace<true> trace("probe");
+  if (argc > 1 && std::string_view(argv[1]) == "gate") {
+    for (int i=0; i<140000; ++i) trace.emit("closed", i, 0, 0, 0);
+    puts("ready"); fflush(stdout);
+    getchar();
+    trace.emit("open", 1, 0, 0, 0);
+    return 0;
+  }
   if (argc > 1) {
     trace.resources("cpu_faults_start", "cpu_switches_start", 0, 0, 1);
     volatile char* memory = new char[4 << 20];
@@ -130,3 +137,42 @@ def test_classifier_respects_dma_completion_interval(tmp_path):
     write("events.1.copy.jsonl", [event("copy_submit", 1000)])
     with pytest.raises(ValueError, match="incomplete copy"):
         module.summarize(str(tmp_path / "events.*.jsonl"))
+
+
+def test_gate_opens_across_process_without_spending_closed_capacity(trace_probe, tmp_path):
+    import ctypes
+    import mmap
+    gate = tmp_path / "gate"
+    gate.write_bytes(bytes(4))
+    with gate.open("r+b") as fd, mmap.mmap(fd.fileno(), 4) as flag:
+        child = subprocess.Popen([str(trace_probe), "gate"], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, text=True, env={**os.environ,
+            "SGLANG_CPU_EXPERT_TRACE_GATE": str(gate),
+            "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events"),
+            "SGLANG_DSV41_EXPERT_JOB_TRACE_CAPACITY": "1"})
+        try:
+            assert child.stdout.readline().strip() == "ready"
+            ctypes.c_uint32.from_buffer(flag).value = 1
+            child.communicate("x", timeout=10)
+            assert child.returncode == 0
+        finally:
+            if child.poll() is None:
+                child.kill(); child.wait()
+    data = [json.loads(line) for line in next(tmp_path.glob("events.*.jsonl")).open()]
+    assert data[-1]["dropped"] == 0
+    assert [r["event"] for r in data[1:-1]] == ["open"]
+
+
+@pytest.mark.parametrize("contents", [b"", bytes(3), bytes(8), (2).to_bytes(4, "little"), None])
+def test_gate_invalid_or_missing_file_refuses_capture(trace_probe, tmp_path, contents):
+    import resource
+    def no_core():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    gate = tmp_path / "gate"
+    if contents is not None:
+        gate.write_bytes(contents)
+    child = subprocess.run([str(trace_probe)], capture_output=True, preexec_fn=no_core,
+                           env={**os.environ, "SGLANG_CPU_EXPERT_TRACE_GATE": str(gate),
+                                "SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX": str(tmp_path / "events")})
+    assert child.returncode != 0 and b"trace gate" in child.stderr
+    assert not list(tmp_path.glob("events.*"))

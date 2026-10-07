@@ -49,11 +49,11 @@ int main() { uint32_t word=0; Capture<false> c(4,&word,0,nullptr,0,0,0);
     return result
 
 
-def run(binaries, tmp_path, capacity="65536"):
+def run(binaries, tmp_path, capacity="65536", **options):
     subprocess.run([str(binaries[0])], check=True,
                    env={**os.environ, "OMP_NUM_THREADS": "4", "OMP_DYNAMIC": "FALSE",
                         "SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX": str(tmp_path / "hold"),
-                        "SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY": capacity})
+                        "SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY": capacity, **options})
     return [json.loads(line) for line in next(tmp_path.glob("hold.*.jsonl")).read_text().splitlines()]
 
 
@@ -83,3 +83,11 @@ def test_disabled_capture_has_no_trace_symbols_or_files(binaries, tmp_path):
     assert not list(tmp_path.iterdir())
     symbols = subprocess.check_output(["nm", "-u", str(binaries[1])], text=True)
     assert not any(s in symbols for s in ("clock_gettime", "fopen", "getenv", "syscall"))
+
+
+def test_closed_gate_does_not_consume_hold_capacity(binaries, tmp_path):
+    gate = tmp_path / "gate"
+    gate.write_bytes(bytes(4))
+    data = run(binaries, tmp_path, capacity="1", SGLANG_CPU_EXPERT_TRACE_GATE=str(gate))
+    assert len(data) == 2 and data[-1]["dropped_holds"] == 0
+    assert data[-1]["holds_seen"] == 2
