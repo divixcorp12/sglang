@@ -19,6 +19,8 @@ For copies, `gen` identifies the target record across both NUMA groups. `copy_su
 
 `copy_dma_observed.a` is the timestamp before the last poll that returned pending, and `.ns` is the first observed done timestamp. Actual DMA completion lies in that interval. `copy_cpu_observed` is an independent observation of CPU completion. The observer checks every in-flight group, so FIFO retirement cannot hide a group that completed earlier. These are host observations, not GPU transfer timestamps.
 
+For earlier captures missing the observer-done marker, retirement supplies a conservative upper bound with an unknown lower bound; `dma_bound_source` flags this fallback.
+
 The classifier confirms CPU-last only when CPU end is later than the DMA upper bound, and DMA-last only when the last pending poll follows CPU end. It uses a 10 microsecond margin and leaves overlapping intervals ambiguous. Copy-only and CPU-only groups have separate classifications. Results do not include the earlier GPU-post-to-host-submit delay or GPU work after the gate.
 
 Instrumented tracing adds polling and clock overhead. It measures dependency order and workload shape; use an untraced run to measure production throughput. Keep other benchmarks and builds idle during a capture and follow the disk/GPU lock order in `.claude/rules/divix01-run-protocol.md`.

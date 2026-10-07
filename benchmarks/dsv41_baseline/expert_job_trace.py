@@ -47,14 +47,17 @@ def summarize(pattern, start_ns=None, end_ns=None):
         cpu_index[key] = ([item[0] for item in values], [item[1] for item in values])
     rows = []
     for (gen, group), record in copies.items():
-        needed = {"copy_submit", "copy_issue", "copy_dma_observed", "group_done"}
+        needed = {"copy_submit", "copy_issue", "group_done"}
         if not needed <= record.keys() or gen not in gates:
             raise ValueError(f"incomplete copy record: {gen}, {group}")
         if start_ns is not None and gates[gen]["ns"] < start_ns:
             continue
         if end_ns is not None and gates[gen]["ns"] > end_ns:
             continue
-        submit, dma, issue = (record[k] for k in ("copy_submit", "copy_dma_observed", "copy_issue"))
+        submit, issue = (record[k] for k in ("copy_submit", "copy_issue"))
+        # Older captures may retire a copy between the observer's poll and the retirement query.
+        # Retirement proves completion by then; without a recorded pending poll the lower bound stays unknown.
+        dma = record.get("copy_dma_observed", {"ns": record["group_done"]["ns"], "a": 0})
         last_seq = submit["a"] if submit["b"] else submit["seq"]
         sequences, candidates = cpu_index.get((group, submit["row"]), ([], []))
         jobs = candidates[bisect.bisect_left(sequences, submit["seq"]):bisect.bisect_right(sequences, last_seq)]
@@ -82,6 +85,7 @@ def summarize(pattern, start_ns=None, end_ns=None):
             "gen": gen, "group": group, "row": submit["row"], "last": last,
             "submit_ns": submit["ns"], "gate_ns": gates[gen]["ns"],
             "host_to_gate_ms": ms(gates[gen]["ns"] - submit["ns"]),
+            "dma_bound_source": "poll" if "copy_dma_observed" in record else "retirement_fallback",
             "dma_bytes": issue["a"], "dma_lanes": issue["b"], "forced_cpu_lanes": submit["b"],
             "cpu_lanes": sum(j["cpu_shape"]["b"] for j in jobs),
             "token_expert_routes": sum(j["cpu_shape"]["c"] for j in jobs),

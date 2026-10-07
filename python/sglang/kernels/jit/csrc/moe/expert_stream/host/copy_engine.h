@@ -536,6 +536,20 @@ class CopyEngine {
         set_stall(*seq, head.group, kStallCpu);
         break;
       }
+      if constexpr (Build::kMetrics) {
+        if (trace_.enabled()) {
+          // A dependency can finish between observe_jobs and the retirement queries. Preserve its interval here.
+          auto& seen = observations_.slots[head.idx][head.group];
+          if (!seen.dma) {
+            seen.dma = true;
+            trace_.emit("copy_dma_observed", head.row, head.gen, head.cpu_seq, head.group, seen.pending_ns);
+          }
+          if (!seen.cpu) {
+            seen.cpu = true;
+            trace_.emit("copy_cpu_observed", head.row, head.gen, head.cpu_seq, head.group, head.late_seq);
+          }
+        }
+      }
       complete(head);
       in_flight.pop_front();
       completed = true;
