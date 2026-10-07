@@ -46,6 +46,7 @@ struct alignas(64) WorkerStamp {
     std::array<PhaseStamp, kPhases> phase;
     rusage initial{};
     int64_t minflt = 0, majflt = 0, nvcsw = 0, nivcsw = 0;
+    int64_t enter = 0, ready = 0;
     int tid = 0, cpu = 0;
 };
 struct Record {
@@ -53,6 +54,7 @@ struct Record {
     int64_t forward_begin, forward_end, team_begin, team_end, serial;
     int64_t minflt, majflt, nvcsw, nivcsw;
     int worker, phase, tid, cpu, threads, rows, chunks;
+    int64_t enter, ready;
 };
 
 // One writer: the forward's calling thread, after its team joined. A separate buffer per OS leader in this DSO.
@@ -75,10 +77,11 @@ class Buffer {
         std::fprintf(out, "{\"schema\":1,\"clock\":\"CLOCK_MONOTONIC\",\"cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\",\"min_ns\":%lld,\"capacity\":%zu}\n", (long long)min_ns, capacity);
         for (size_t i = 0; i < used; ++i) {
             const auto& r = events[i]; const auto& s = r.stamp;
-            std::fprintf(out, "{\"forward\":%lld,\"forward_begin\":%lld,\"forward_end\":%lld,\"team_begin\":%lld,\"team_end\":%lld,\"worker\":%d,\"phase\":%d,\"tid\":%d,\"cpu\":%d,\"threads\":%d,\"rows\":%d,\"chunks\":%d,\"begin\":%lld,\"work_end\":%lld,\"end\":%lld,\"cpu_begin\":%lld,\"cpu_work_end\":%lld,\"cpu_end\":%lld,\"units\":%lld,\"minflt\":%lld,\"majflt\":%lld,\"nvcsw\":%lld,\"nivcsw\":%lld}\n",
+            std::fprintf(out, "{\"forward\":%lld,\"forward_begin\":%lld,\"forward_end\":%lld,\"team_begin\":%lld,\"team_end\":%lld,\"worker\":%d,\"phase\":%d,\"tid\":%d,\"cpu\":%d,\"threads\":%d,\"rows\":%d,\"chunks\":%d,\"enter\":%lld,\"ready\":%lld,\"begin\":%lld,\"work_end\":%lld,\"end\":%lld,\"cpu_begin\":%lld,\"cpu_work_end\":%lld,\"cpu_end\":%lld,\"units\":%lld,\"minflt\":%lld,\"majflt\":%lld,\"nvcsw\":%lld,\"nivcsw\":%lld}\n",
                 (long long)r.serial, (long long)r.forward_begin, (long long)r.forward_end,
                 (long long)r.team_begin, (long long)r.team_end, r.worker, r.phase, r.tid, r.cpu,
-                r.threads, r.rows, r.chunks, (long long)s.begin, (long long)s.work_end, (long long)s.end,
+                r.threads, r.rows, r.chunks, (long long)r.enter, (long long)r.ready,
+                (long long)s.begin, (long long)s.work_end, (long long)s.end,
                 (long long)s.cpu_begin, (long long)s.cpu_work_end, (long long)s.cpu_end, (long long)s.units,
                 (long long)r.minflt, (long long)r.majflt, (long long)r.nvcsw, (long long)r.nivcsw);
         }
@@ -98,6 +101,7 @@ template<bool On> struct Capture;
 template<> struct Capture<false> {
     Capture(int, int, int) {}
     void team_start() {} void worker_start(int) {} void worker_end(int) {}
+    void worker_enter(int) {} void worker_ready(int) {}
     void begin(int, int) {} void work_end(int, int) {} void end(int, int) {}
     void add_work(int, int, int64_t) {} void finish() {}
 };
@@ -107,11 +111,13 @@ template<> struct Capture<true> {
         forward_begin = clock_ns();
     }
     void team_start() { team_begin = clock_ns(); }
-    void worker_start(int w) {
+    void worker_enter(int w) {
         auto& s = workers[w];
-        s.tid = int(syscall(SYS_gettid)); s.cpu = sched_getcpu();
+        s.enter = clock_ns(); s.tid = int(syscall(SYS_gettid));
         if (getrusage(RUSAGE_THREAD, &s.initial)) s.initial.ru_minflt = -1;
     }
+    void worker_ready(int w) { workers[w].ready = clock_ns(); workers[w].cpu = sched_getcpu(); }
+    void worker_start(int w) { worker_enter(w); worker_ready(w); }
     void worker_end(int w) {
         auto& s = workers[w]; rusage last{};
         if (s.initial.ru_minflt < 0 || getrusage(RUSAGE_THREAD, &last))
@@ -143,7 +149,7 @@ template<> struct Capture<true> {
             if (p == 4) continue;
             const auto& s = workers[w];
             b.events[b.used++] = Record{s.phase[p], forward_begin, stop, team_begin, stop, serial,
-                s.minflt, s.majflt, s.nvcsw, s.nivcsw, w, p, s.tid, s.cpu, n, rows, chunks};
+                s.minflt, s.majflt, s.nvcsw, s.nivcsw, w, p, s.tid, s.cpu, n, rows, chunks, s.enter, s.ready};
         }
     }
     Buffer& b;

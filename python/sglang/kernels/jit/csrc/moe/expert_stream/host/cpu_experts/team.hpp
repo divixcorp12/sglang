@@ -67,8 +67,12 @@ inline void pin(int worker, std::span<const int> cores, std::atomic<int>& error)
 // body(worker, workers) on every worker of a team of `threads` on call_cores(). Every pin precedes a barrier and the
 // body runs only on a full, fully pinned team, so all workers take the same branch; body must not throw (it runs
 // inside an OpenMP region).
-template <class Body>
-void run_team(int threads, Body&& body)
+struct NoTeamObserver {
+    void worker_enter(int) {} void worker_ready(int) {}
+};
+
+template <class Body, class Observer = NoTeamObserver>
+void run_team(int threads, Body&& body, Observer&& observer = NoTeamObserver{})
 {
     if (threads < 1) throw std::runtime_error("CPU expert team needs at least one worker");
     const std::span<const int> cores = call_cores();  // the caller's: a worker's call_cores() is its own thread's
@@ -76,12 +80,14 @@ void run_team(int threads, Body&& body)
         throw std::runtime_error("CPU expert worker count exceeds the call's cores");
     std::atomic<int> pin_error{0};
     std::atomic<int> actual_workers{0};
-    #pragma omp parallel num_threads(threads) shared(body, cores, pin_error, actual_workers)
+    #pragma omp parallel num_threads(threads) shared(body, cores, pin_error, actual_workers, observer)
     {
         const int worker = omp_get_thread_num(), n = omp_get_num_threads();
+        observer.worker_enter(worker);
         if (worker == 0) actual_workers.store(n, std::memory_order_relaxed);
         pin(worker, cores, pin_error);
         #pragma omp barrier
+        observer.worker_ready(worker);
         if (n == threads && !pin_error.load(std::memory_order_relaxed)) body(worker, n);
     }
     if (pin_error.load()) throw std::runtime_error("cannot pin CPU expert worker to its core");

@@ -18,16 +18,14 @@ def probes(tmp_path_factory):
     source = work / "probe.cpp"
     source.write_text(r'''
 #include "worker_trace.hpp"
+#include "moe/expert_stream/host/cpu_experts/team.hpp"
 #include <omp.h>
 using namespace sglang::exl3_cpu::worker_trace;
 int main() {
   for (int f=0; f<2; ++f) {
     Capture<ON> capture(4, 6, 3);
     capture.team_start();
-    #pragma omp parallel num_threads(4)
-    {
-      int w=omp_get_thread_num();
-      capture.worker_start(w);
+    sglang::cpu_experts::run_team(4, [&](int w, int) {
       for (int p : {0,1,2,3,5}) {
         capture.begin(w,p);
         if (p==0 && w==3) usleep(20000);
@@ -41,7 +39,7 @@ int main() {
         capture.end(w,p);
       }
       capture.worker_end(w);
-    }
+    }, capture);
     capture.finish();
   }
 }
@@ -59,6 +57,7 @@ int main() { Capture<false> c(4,6,3); c.team_start(); c.worker_start(0);
         binary = work / name
         subprocess.run(["g++", "-std=c++20", "-O2", "-fopenmp", *flags, "-I",
                         str(root / "python/sglang/kernels/jit/csrc/exl3/optimized"),
+                        "-I", str(root / "python/sglang/kernels/jit/csrc"),
                         str(src), "-o", str(binary)], check=True, capture_output=True)
         outputs.append(binary)
     return outputs
@@ -89,6 +88,7 @@ def test_workers_distinguish_sleep_from_compute(probes, tmp_path):
     assert len({r["tid"] for r in first}) == 4
     assert all(r["units"] == r["worker"] + 1 for r in first)
     assert all(r["begin"] <= r["work_end"] <= r["end"] for r in first)
+    assert all(r["team_begin"] <= r["enter"] <= r["ready"] <= r["begin"] for r in first)
 
 
 def test_capacity_admits_only_complete_forwards(probes, tmp_path):

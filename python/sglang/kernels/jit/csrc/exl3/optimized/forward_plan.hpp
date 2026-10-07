@@ -544,7 +544,6 @@ private:
     {
         [[maybe_unused]] double phase_us[6]{};
         ::sglang::cpu_experts::run_team(count, [&](int worker, int n) {
-            trace.worker_start(worker);
             if (ctx.zero_out && worker == 0)
                 std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->hidden * sizeof(float));
             step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us, trace);
@@ -553,7 +552,7 @@ private:
             step<Phase::Down>(ctx, E, worker, n, grouped, wide, phase_us, trace);
             step<Phase::Accumulate>(ctx, E, worker, n, grouped, wide, phase_us, trace);
             trace.worker_end(worker);
-        });
+        }, trace);
         if constexpr (Profile)
             printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",
                    phase_us[0], phase_us[1], phase_us[2], phase_us[3], phase_us[4], phase_us[5]);
