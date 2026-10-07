@@ -300,6 +300,7 @@ static_assert(
 /// it go to copy_failed.
 template <class Build, class Owner>
 class CopyEngine {
+  using CpuExpertEngine = BasicCpuExpertEngine<Build>;
   static_assert(BuildPolicy<Build>);
 
  public:
@@ -325,7 +326,7 @@ class CopyEngine {
         owner_(owner),
         prefix_(std::move(prefix)),
         thread_name_(thread_name.substr(0, 15)),
-        cpus_(std::move(cpus)) {
+        trace_(thread_name_), cpus_(std::move(cpus)) {
     for (int g = 0; g < groups; ++g)
       jobs_.push_back(std::make_unique<SpscRing<CopyJob, kCopyRing>>());
   }
@@ -372,6 +373,8 @@ class CopyEngine {
   /// Hands group `group`'s job to the copy thread; called only by that group's tier owner. A full ring is impossible
   /// under the outstanding-job bound (kCopyRing), so it fails stop.
   void submit(int group, const CopyJob& job) {
+    if constexpr (Build::kMetrics)
+      trace_.emit("copy_submit", job.row, job.gen, job.cpu_seq, job.group, job.late_seq, job.late_cpu, job.cpu_mask);
     if (!jobs_[group]->push(job)) {
       owner_->copy_failed(job, kRingOverflow);
       return;
@@ -517,6 +520,9 @@ class CopyEngine {
   /// one. Whether any completed. For CudaCopyBackend a poll is one acquire load, not a driver call: the cuEventQuery it
   /// replaced took a libcuda mutex per call, ~2,300-3,200 times per job (analysis/dsv41-drive/hotpath/results.md 9a).
   bool retire_completed(Queue& in_flight) {
+    if constexpr (Build::kMetrics) {
+      if (trace_.enabled()) observe_jobs(in_flight);
+    }
     bool completed = false;
     while (!in_flight.empty() && broken_ == 0) {
       const CopyJob& head = in_flight.front();
@@ -543,6 +549,33 @@ class CopyEngine {
     return completed;
   }
 
+  // Observe each group's dependencies independently of the retirement FIFO. These are upper bounds on completion,
+  // not GPU DMA timestamps: the observer can be descheduled. Never change retirement or publish gates here.
+  void observe_jobs(Queue& queue) {
+    if constexpr (Build::kMetrics) {
+      for (size_t i = 0; i < queue.size(); ++i) {
+        const CopyJob& job = queue[i];
+        auto& seen = observations_.slots[job.idx][job.group];
+        if (seen.gen != job.gen) seen = Observation{job.gen, false, false, 0};
+        if (!seen.dma) {
+          const int64_t before = now_ns();
+          const int state = job.token == kNoToken ? CopyBackend::kDone : backend_->query(job.token);
+          // Timestamp before the acquire query: a pending result brackets completion after this point.
+          if (state == CopyBackend::kDone) {
+            seen.dma = true;
+            trace_.emit("copy_dma_observed", job.row, job.gen, job.cpu_seq, job.group, seen.pending_ns);
+          } else if (state == CopyBackend::kPending) {
+            seen.pending_ns = before;
+          }
+        }
+        if (!seen.cpu && !cpu_pending(job)) {
+          seen.cpu = true;
+          trace_.emit("copy_cpu_observed", job.row, job.gen, job.cpu_seq, job.group, job.late_seq);
+        }
+      }
+    }
+  }
+
   /// The sequence of `job`'s first CPU job that is not done yet, if any.
   std::optional<uint32_t> cpu_pending(const CopyJob& job) const {
     if (job.cpu_mask == 0 && job.late_cpu == 0) return std::nullopt;
@@ -554,12 +587,14 @@ class CopyEngine {
 
   /// Records one group's part of a record as done, and hands the record to the owner once every part is.
   void complete(const CopyJob& job) {
+    if constexpr (Build::kMetrics) trace_.emit("group_done", job.row, job.gen, job.cpu_seq, job.group, job.late_seq);
     record_latency(job);
     Assembly& record = assembly_[job.idx];
     if (record.gen != job.gen) record = Assembly{job.gen, 0};
     record.got |= 1u << job.group;
     if (record.got == job.groups) {
       owner_->copy_completed(job);
+      if constexpr (Build::kMetrics) trace_.emit("gate_open", job.row, job.gen, job.cpu_seq, job.group, job.groups);
       stall_.store(0, std::memory_order_relaxed);
     } else {
       set_stall(0, __builtin_ctz(job.groups & ~record.got), kStallNoPart);
@@ -603,10 +638,13 @@ class CopyEngine {
       }
     }
     if (!copied) {
+      if constexpr (Build::kMetrics) trace_.emit("copy_issue", job.row, job.gen, job.cpu_seq, job.group, 0, 0, kNoToken);
       job.token = kNoToken;
       return 0;
     }
     const int r = backend_->mark(&job.token);
+    if constexpr (Build::kMetrics)
+      trace_.emit("copy_issue", job.row, job.gen, job.cpu_seq, job.group, bytes, job.count - std::popcount(job.cpu_mask), job.token);
     if constexpr (Build::kMetrics) {
       count<kCopyIssueNs>(now_ns() - start);
       count<kCopyBytes>(bytes);
@@ -642,6 +680,11 @@ class CopyEngine {
     finished_.store(finished_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
   }
 
+  struct Observation { uint64_t gen = 0; bool dma = false, cpu = false; int64_t pending_ns = 0; };
+  struct Observations { std::array<std::array<Observation, Wire::kNodes>, Wire::kDemandRecords> slots{}; };
+  struct NoObservations {};
+  [[no_unique_address]] std::conditional_t<Build::kMetrics, Observations, NoObservations> observations_;
+  static_assert(Build::kMetrics || std::is_empty_v<decltype(observations_)>);
   std::unique_ptr<CopyBackend> backend_;
   std::array<std::atomic<CpuExpertEngine*>, Wire::kNodes> cpu_{};
   std::vector<Table> tables_;
@@ -650,6 +693,7 @@ class CopyEngine {
   Owner* owner_;
   std::string prefix_;
   std::string thread_name_;
+  [[no_unique_address]] JobTrace<Build::kMetrics> trace_;
   std::vector<int> cpus_;
   std::thread thread_;
   std::promise<std::string> started_;  // the thread's init result, for start()

@@ -20,6 +20,7 @@ struct GroupRow {
 // it runs, and the caller that paused every group (or called pump()) otherwise.
 template <class Source>
 struct NumaGroup {
+  using CpuExpertEngine = BasicCpuExpertEngine<typename Source::BuildType>;
   NumaGroup(int index, int sq_thread_cpu, Tables tables, bool direct, std::vector<GroupRow> rows)
       : index(index), sq_thread_cpu(sq_thread_cpu), reader(std::move(tables), direct), rows(std::move(rows)) {}
 

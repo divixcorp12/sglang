@@ -44,8 +44,9 @@ constexpr int kCalibRows = kCalibLanes + 2;
 // for timing; the bytes are real pinned memory of the real size and format. The DMA goes through `backend`, a private
 // CopyBackend with its own stream and completion word, and lands in `scratch`, so calibration touches no destination
 // tensor and no CopyJob.
-struct CalibrationSetup {
-  CpuExpertEngine* cpu = nullptr;
+template <BuildPolicy Build = ProdBuild>
+struct BasicCalibrationSetup {
+  BasicCpuExpertEngine<Build>* cpu = nullptr;
   int64_t row = 0;
   int64_t first_slot = 0;  // the first of the kCalibLanes host slots measured (a NUMA group's lowest)
   std::vector<CopyEntry> entries;  // the entries production's DMA copies
@@ -58,6 +59,8 @@ struct CalibrationSetup {
   int64_t timeout_ns = 0;                   // per measurement
 };
 
+using CalibrationSetup = BasicCalibrationSetup<ProdBuild>;
+
 // The bytes of one expert that the DMA moves: the sum over the copy-table entries.
 inline int64_t calibration_expert_bytes(std::span<const CopyEntry> entries) {
   int64_t bytes = 0;
@@ -69,7 +72,8 @@ inline int64_t calibration_expert_bytes(std::span<const CopyEntry> entries) {
 // Runs k CPU lanes (per_token jobs of s.tokens rows when that is above 1) on host slots first_slot.. first_slot + k - 1 and the DMA of m experts from the k slots after them,
 // started together, and returns the ns from the start until both are observed done (queueing and wake-up included).
 // Either side may be empty. Throws on a failed copy, a full CPU ring, or past the timeout.
-inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
+template <BuildPolicy Build>
+inline int64_t calibration_run(const BasicCalibrationSetup<Build>& s, int k, int m) {
   const int64_t start = now_ns();
   uint32_t seq = 0;
   if (k > 0) {
@@ -128,7 +132,8 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
 }
 
 // The mean of s.reps runs of calibration_run, in ms.
-inline double calibration_mean_ms(const CalibrationSetup& s, int k, int m) {
+template <BuildPolicy Build>
+inline double calibration_mean_ms(const BasicCalibrationSetup<Build>& s, int k, int m) {
   calibration_run(s, k, m);  // warm-up: page faults, the engine's wake from its futex sleep
   int64_t sum = 0;
   for (int r = 0; r < s.reps; ++r)
@@ -137,7 +142,8 @@ inline double calibration_mean_ms(const CalibrationSetup& s, int k, int m) {
 }
 
 // Fills `out` (kCalibRows x kCalibCols doubles, layout above) with the mean ms of every cell.
-inline void calibrate_split(const CalibrationSetup& s, double* out) {
+template <BuildPolicy Build>
+inline void calibrate_split(const BasicCalibrationSetup<Build>& s, double* out) {
   std::fill(out, out + kCalibRows * kCalibCols, 0.0);
   for (int k = 1; k <= s.lanes; ++k)
     out[k] = calibration_mean_ms(s, k, 0);

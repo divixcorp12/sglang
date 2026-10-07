@@ -24,6 +24,7 @@ from __future__ import annotations
 import atexit
 import functools
 import json
+import os
 import struct
 import sys
 import weakref
@@ -96,6 +97,7 @@ def host_variant() -> str:
         return _DEFAULT_VARIANT
     if (
         envs.SGLANG_DSV41_EXPERT_TRACE_PATH.get()
+        or os.environ.get("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX")
         or envs.SGLANG_TEST_DSV41_RAM_MISS_FAULT.get()
     ):
         return "instr"

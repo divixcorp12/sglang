@@ -33,6 +33,7 @@ using tvm::ffi::TensorView;
 template <ExpertRowLayout Layout, AsyncFileReader Reader, class Build>
 struct HostExports {
   static_assert(BuildPolicy<Build>);
+  using CpuExpertEngine = BasicCpuExpertEngine<Build>;
   using Source = RowReader<Layout, Reader, Build>;
   using Tier = RamTier<Source>;
   using Thread = RamThread<Tier>;
@@ -670,7 +671,7 @@ struct HostExports {
     if (d->engine) d->engine->stop();
   }
 
-  static void write_draft_stats(const CpuExpertEngine::DraftStats& st, TensorView out) {
+  static void write_draft_stats(const typename CpuExpertEngine::DraftStats& st, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
     expert_stream::verify_named("out", TensorMatcher({7}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
@@ -688,7 +689,7 @@ struct HostExports {
   // draft_cpu_start.
   static void draft_cpu_stats(int64_t handle, TensorView out) {
     const auto d = find_draft(handle);
-    write_draft_stats(d->engine ? d->engine->draft_stats() : CpuExpertEngine::DraftStats{}, out);
+    write_draft_stats(d->engine ? d->engine->draft_stats() : typename CpuExpertEngine::DraftStats{}, out);
   }
 
   // The DSpark draft channel as group `group`'s CPU expert engine's second job source (one team per node): the areas as

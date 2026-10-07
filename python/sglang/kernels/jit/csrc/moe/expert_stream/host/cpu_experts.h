@@ -7,6 +7,7 @@
 #include "../lease_layout.h"
 #include "cpu_experts/kernel.hpp"
 #include "lease_channel.h"
+#include "job_trace.h"
 #include "reader_base.h"
 #include "spsc_ring.h"
 #include "tier_protocol.h"
@@ -183,18 +184,19 @@ struct CpuExpertConfig {
 /// With a DSpark draft source (attach_draft) the thread serves the draft channel too, one job at a time with the
 /// target's; its idle hold watches the doorbell and the channel head, and its poll sleeps 50 us at a time since the GPU
 /// cannot ring the futex. A draft-only engine (CpuExpertConfig::draft_only) has only that source.
-class CpuExpertEngine {
+template <BuildPolicy Build>
+class BasicCpuExpertEngine {
  public:
   /// A record has at most one CPU-hit job and one job per CPU miss: the ring holds every job that can be outstanding.
   static constexpr size_t kRing =
       std::bit_ceil(static_cast<size_t>(wire::Wire::kDemandRecords) * (wire::Wire::kLanes + 1));
 
-  CpuExpertEngine(CpuExpertConfig config, std::string prefix, std::string thread_name)
-      : config_(std::move(config)), prefix_(std::move(prefix)), thread_name_(thread_name.substr(0, 15)) {
+  BasicCpuExpertEngine(CpuExpertConfig config, std::string prefix, std::string thread_name)
+      : config_(std::move(config)), prefix_(std::move(prefix)), thread_name_(thread_name.substr(0, 15)), trace_(thread_name_) {
     validate();
   }
 
-  ~CpuExpertEngine() {
+  ~BasicCpuExpertEngine() {
     stop();
   }
 
@@ -262,6 +264,7 @@ class CpuExpertEngine {
   /// Tier owner only, with job.seq claimed and above every earlier submit's. False when the ring is full, which kRing
   /// rules out: the caller fails stop.
   bool submit(const CpuJob& job) {
+    if constexpr (Build::kMetrics) trace_.emit("cpu_submit", job.row, 0, job.seq, -1, job.part, job.k);
     if (!jobs_.push(job)) return false;
     doorbell_.ring();
     return true;
@@ -453,6 +456,7 @@ class CpuExpertEngine {
   /// Runs one forward and publishes it in done_; returns the clock at its end.
   int64_t run_job(const CpuJob& job) {
     const int64_t start = now_ns();
+    if constexpr (Build::kMetrics) trace_.emit("cpu_start", job.row, 0, job.seq, -1, job.part, job.k);
     cpu_experts::ForwardCall call;
     call.rows = 1;
     call.k = job.k;
@@ -473,6 +477,13 @@ class CpuExpertEngine {
       if (!job.accumulate) std::memset(call.out, 0, static_cast<size_t>(call.rows) * config_.hidden * sizeof(float));
       call.accumulate = true;
     }
+    if constexpr (Build::kMetrics) {
+      if (trace_.enabled()) {
+        int live = 0;
+        for (int i = 0; i < call.rows * call.k; ++i) live += call.slots[i] >= 0;
+        trace_.emit("cpu_shape", job.row, 0, job.seq, -1, call.rows, call.k, live);
+      }
+    }
     busy(kTargetJob, job.row);
     try {
       const cpu_experts::ExpertLayer* layer = config_.layers->get(job.row);
@@ -487,6 +498,7 @@ class CpuExpertEngine {
     add(compute_ns_, end - start);
     add(jobs_done_, 1);
     add(lanes_done_, job.k);
+    if constexpr (Build::kMetrics) trace_.emit("cpu_end", job.row, 0, job.seq, -1, job.part, job.k);
     done_.store(job.seq, std::memory_order_release);
     return end;
   }
@@ -597,6 +609,7 @@ class CpuExpertEngine {
     call.out = d.out + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden;
     busy(kDraftJob, seq);
     const int64_t start = now_ns();
+    if constexpr (Build::kMetrics) trace_.emit("draft_start", stage, epoch, seq, -1, rows, k, shared);
     try {
       layer.kernel->forward(layer, call);
     } catch (const std::exception& e) {
@@ -613,6 +626,7 @@ class CpuExpertEngine {
       add(draft_shared_routes_, shared);
       add(draft_collided_forward_ns_, end - start);
     }
+    if constexpr (Build::kMetrics) trace_.emit("draft_end", stage, epoch, seq, -1, rows, k, shared);
     channel::complete<DraftChannel>(d.channel, seq, static_cast<uint64_t>(epoch) << 32 | seq);
     draft_completed_.store(seq, std::memory_order_release);
     return end;
@@ -660,6 +674,7 @@ class CpuExpertEngine {
   CpuExpertConfig config_;
   std::string prefix_;
   std::string thread_name_;
+  [[no_unique_address]] JobTrace<Build::kMetrics> trace_;
   std::thread thread_;
   std::promise<std::string> started_;  // the thread's pin result, for start()
   SpscRing<CpuJob, kRing> jobs_;
@@ -688,5 +703,7 @@ class CpuExpertEngine {
   std::atomic<int64_t> draft_jobs_{0}, draft_rows_{0}, draft_forward_ns_{0}, draft_holds_{0}, draft_collided_jobs_{0},
       draft_shared_routes_{0}, draft_collided_forward_ns_{0};
 };
+
+using CpuExpertEngine = BasicCpuExpertEngine<ProdBuild>;
 
 }  // namespace sglang::expert_stream

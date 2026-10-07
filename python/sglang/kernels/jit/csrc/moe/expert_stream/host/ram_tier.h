@@ -85,6 +85,7 @@ template <class Source>
 class RamTier {
  public:
   using Layout = typename Source::LayoutType;
+  using CpuExpertEngine = BasicCpuExpertEngine<typename Source::BuildType>;
   using Build = typename Source::BuildType;  // ProdBuild or InstrBuild (build_policy.h)
   using Engine = CopyEngine<Build, RamTier>;
   using Group = NumaGroup<Source>;
@@ -754,7 +755,7 @@ class RamTier {
   void draft_stop(int g) {
     draft_cpu(g).detach_draft();
   }
-  CpuExpertEngine::DraftStats draft_stats(int g) {
+  typename CpuExpertEngine::DraftStats draft_stats(int g) {
     return draft_cpu(g).draft_stats();
   }
 
@@ -854,7 +855,7 @@ class RamTier {
       throw std::runtime_error(
           prefix + "tokens " + std::to_string(tokens) + " is not within the CPU rows' 1.." +
           std::to_string(cpu->tokens()));
-    CalibrationSetup s;
+    BasicCalibrationSetup<Build> s;
     s.cpu = cpu.get();
     s.first_slot = own.lo;
     s.row = row;
