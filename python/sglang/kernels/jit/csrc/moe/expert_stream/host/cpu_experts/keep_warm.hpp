@@ -5,6 +5,7 @@
 #pragma once
 #include "isa.hpp"
 #include "team.hpp"
+#include "hold_trace.hpp"
 #include <immintrin.h>
 #include <omp.h>
 #include <algorithm>
@@ -144,13 +145,19 @@ void keep_warm(Isa isa, std::span<const int> cores, int32_t threads, const uint3
     if (threads < 1 || word == nullptr || (!cores.empty() && size_t(threads) > cores.size()))
         throw std::invalid_argument("CPU expert keep-warm needs a worker, a word and no more workers than its cores");
     std::atomic<int> pin_error{0};
+    hold_trace::Capture<hold_trace::kOn> trace(threads, word, seen, nullptr, 0, warm_until_ns, release_ns);
     #pragma omp parallel num_threads(threads) shared(cores, pin_error)
     {
+        const int worker = omp_get_thread_num();
+        trace.enter(worker);
         pin(omp_get_thread_num(), cores, pin_error);
+        trace.ready(worker);
         const int32_t warm = keep_warm_loop<Top>(isa, word, seen, std::min(warm_until_ns, release_ns));
         keep_warm_detail::sink.fetch_add(warm, std::memory_order_relaxed);
         keep_warm_detail::scalar(word, seen, release_ns);
+        trace.exit(worker);
     }
+    trace.finish();
     if (pin_error.load(std::memory_order_relaxed)) throw std::runtime_error("cannot pin CPU expert worker to its core");
 }
 
@@ -162,9 +169,13 @@ void keep_warm_either(Isa isa, std::span<const int> cores, int32_t threads, cons
     if (threads < 1 || word_a == nullptr || word_b == nullptr || (!cores.empty() && size_t(threads) > cores.size()))
         throw std::invalid_argument("CPU expert keep-warm needs a worker, two words and no more workers than its cores");
     std::atomic<int> pin_error{0};
+    hold_trace::Capture<hold_trace::kOn> trace(threads, word_a, seen_a, word_b, seen_b, warm_until_ns, release_ns);
     #pragma omp parallel num_threads(threads) shared(cores, pin_error)
     {
+        const int worker = omp_get_thread_num();
+        trace.enter(worker);
         pin(omp_get_thread_num(), cores, pin_error);
+        trace.ready(worker);
         const int64_t warm_deadline = std::min(warm_until_ns, release_ns);
         int32_t warm = 0;
         if constexpr (Top >= Isa::Bw) {
@@ -179,7 +190,9 @@ void keep_warm_either(Isa isa, std::span<const int> cores, int32_t threads, cons
         }
         keep_warm_detail::sink.fetch_add(warm, std::memory_order_relaxed);
         keep_warm_detail::scalar_either(word_a, seen_a, word_b, seen_b, release_ns);
+        trace.exit(worker);
     }
+    trace.finish();
     if (pin_error.load(std::memory_order_relaxed)) throw std::runtime_error("cannot pin CPU expert worker to its core");
 }
 

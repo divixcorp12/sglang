@@ -441,13 +441,17 @@ class BasicCpuExpertEngine {
         if (++idle < spin_iters) {
           _mm_pause();
         } else {
+          if constexpr (Build::kMetrics) trace_.emit("cpu_wait_begin", -1, 0, kick, -1, 50'000, head);
           doorbell_.sleep_unless([this] { return !jobs_.empty() || stop_.load(std::memory_order_acquire); }, 50'000);
+          if constexpr (Build::kMetrics) trace_.emit("cpu_wait_end", -1, 0, kick, -1, 50'000, head);
         }
       } else {
+        if constexpr (Build::kMetrics) trace_.emit("cpu_wait_begin", -1, 0, kick, -1, 1'000'000, head);
         doorbell_.sleep_unless([this] {
           return !jobs_.empty() || stop_.load(std::memory_order_acquire) ||
                  draft_.load(std::memory_order_acquire) != nullptr;
         });
+        if constexpr (Build::kMetrics) trace_.emit("cpu_wait_end", -1, 0, kick, -1, 1'000'000, head);
       }
     }
     exited_.store(true, std::memory_order_release);
@@ -537,6 +541,7 @@ class BasicCpuExpertEngine {
   /// Holds the team until the doorbell's word moves past `kick`, the draft head (with a draft source) past `head`, or
   /// the clock reaches release_at. Without a draft source this is today's one-word hold.
   void hold(uint32_t kick, const DraftSource* draft, uint32_t head, int64_t warm_until, int64_t release_at) {
+    if constexpr (Build::kMetrics) trace_.emit("cpu_hold_begin", -1, 0, kick, -1, head, warm_until, release_at);
     try {
       if (draft == nullptr) {
         config_.kernel->keep_warm(
@@ -561,6 +566,7 @@ class BasicCpuExpertEngine {
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert keep-warm failed: " + e.what());
     }
+    if constexpr (Build::kMetrics) trace_.emit("cpu_hold_end", -1, 0, kick, -1, head);
   }
 
   static constexpr int32_t kTargetJob = 1, kDraftJob = 2;
