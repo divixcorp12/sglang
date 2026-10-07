@@ -38,6 +38,7 @@ if(NOT EXPERT_STREAM_NODES MATCHES "^[0-9]+$" OR EXPERT_STREAM_NODES LESS 1 OR E
   message(FATAL_ERROR "EXPERT_STREAM_NODES must be 1..8")
 endif()
 add_compile_definitions(SGLANG_EXPERT_STREAM_NODES=${EXPERT_STREAM_NODES})
+set(EXL3_MAX_M "" CACHE STRING "EXL3_MOE_CPU_MAX_M for the optimized kernel (even, 2..8); empty: the source default")
 
 option(EXL3_FETCH_BENCHMARK "Download pinned Google Benchmark when not installed" ON)
 find_package(benchmark 1.9 QUIET CONFIG)
@@ -83,6 +84,9 @@ foreach(BACKEND baseline optimized)
   target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE
     EXL3_MOE_CPU_ACT_RESIDUAL=1 EXL3_MOE_CPU_ACT_BLOCK=128
     EXL3_BENCH_BACKEND="${BACKEND}" EXL3_BENCH_DEFAULT_WORKERS=${DEFAULT_WORKERS} ${BASELINE_DEFINE})
+  if(EXL3_MAX_M AND NOT BACKEND STREQUAL "baseline")
+    target_compile_definitions(exl3_cpu_${BACKEND} PRIVATE EXL3_MOE_CPU_MAX_M=${EXL3_MAX_M})
+  endif()
   # Kernel flags match the selected study. Keep the harness's NaN/error checks
   # outside fast-math; kernel and harness are distinct translation units.
   set_source_files_properties("${KERNEL}" PROPERTIES COMPILE_OPTIONS "-Ofast;-march=native")
@@ -121,6 +125,9 @@ if(EXL3_TVM_FFI_ROOT)
     target_compile_definitions(${TARGET} PRIVATE
       EXL3_MOE_CPU_ACT_RESIDUAL=1 EXL3_MOE_CPU_ACT_BLOCK=128
       EXL3_FULL_STACK_INSTR=${INSTR} EXL3_BENCH_BACKEND="full-stack-${VARIANT}")
+    if(EXL3_MAX_M)
+      target_compile_definitions(${TARGET} PRIVATE EXL3_MOE_CPU_MAX_M=${EXL3_MAX_M})
+    endif()
     target_compile_options(${TARGET} PRIVATE -O3 -g)
     target_link_libraries(${TARGET} PRIVATE benchmark::benchmark OpenMP::OpenMP_CXX Threads::Threads
       "${TORCH_CPU}" "${C10}" "${TVM_FFI}" "${URING}")

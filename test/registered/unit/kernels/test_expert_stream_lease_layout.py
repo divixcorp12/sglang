@@ -11,7 +11,7 @@ from sglang.test.expert_stream_sources import device_sources, host_sources, wire
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
-GRID = [(lanes, nodes) for lanes in (1, 6, 8, 13, 24, 32) for nodes in (1, 2)]
+GRID = [(lanes, nodes) for lanes in (1, 6, 8, 13, 24, 32, 40) for nodes in (1, 2)]
 
 
 @pytest.mark.parametrize("lanes, nodes", GRID)
@@ -44,10 +44,24 @@ def test_lanes_round_up_to_eight(lanes, rounded):
     assert lease.wire_layout(lanes).lanes == rounded
 
 
-@pytest.mark.parametrize("lanes", [0, 33])
-def test_a_lane_count_outside_1_to_32_is_refused(lanes):
-    with pytest.raises(ValueError, match="1..32"):
+@pytest.mark.parametrize("lanes", [0, 65])
+def test_a_lane_count_outside_1_to_64_is_refused(lanes):
+    with pytest.raises(ValueError, match="1..64"):
         lease.wire_layout(lanes)
+
+
+def test_a_verify_wire_is_40_lanes_with_wide_masks():
+    """36 routes (6 tokens at top-6) round up to 40 lanes. Its record and blocks follow from the formulas; its lane
+    masks are u64, so CW's and CC's words gain the high halves. Every build up to 32 keeps the narrow words."""
+    w = lease.wire_layout(36, 2)
+    assert w.lanes == 40 and w.wide_lanes and (w.ce_mask_words, w.cpu_lane_words) == (5, 3)
+    assert (w.record_bytes, w.page_bytes, w.lease_block_bytes) == (640, 10368, 86016)
+    assert (w.copy_done, w.copy_gate, w.copy_armed, w.split) == (81920, 82048, 82176, 82304)
+    assert (w.delta_max_entries, w.delta_stride) == (80, 512)
+    assert not w.packed_counts
+    for lanes in (8, 16, 24, 32):
+        narrow = lease.wire_layout(lanes, 2)
+        assert not narrow.wide_lanes and (narrow.ce_mask_words, narrow.cpu_lane_words) == (3, 2)
 
 
 def test_wider_records_round_to_whole_line_pairs():

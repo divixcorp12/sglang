@@ -12,6 +12,7 @@
 #include <sgl_kernel/tensor.h>
 
 #include "lease_device.cuh"
+#include "cpu_token_table.h"
 #include "tensor_checks.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -24,7 +25,7 @@ struct PostParams {
   uint8_t* page;
   int32_t* state;
   const int64_t* planned;
-  const int32_t* count;
+  int32_t* count;  // the plan's miss count; a spill overflow lowers it
   int64_t lanes;  // the plan's buffers: planned and dst_slots hold this many
   const int64_t* routes;
   int64_t route_count;
@@ -70,6 +71,18 @@ struct PostParams {
   const void* cpu_weights;
   int64_t cpu_weights_dtype;
   int64_t cpu_weights_count;
+  // A verify's tokens (cpu_x's rows; 1 for one token), the host rows' token capacity (1: one-token rows with no token
+  // table) and the bytes between two tokens' staged inputs (cpu_token_table.h).
+  int64_t cpu_tokens;
+  int64_t cpu_tokens_max;
+  int64_t cpu_x_token_bytes;
+  // Spill (GpuResidencyUpdater.victim_lanes below its miss lanes, CPU experts on): a lane whose dst_slots entry is -1
+  // found no VRAM victim and must be a CPU lane. When forced lanes cannot be (copy engine unarmed, no CPU layer), the
+  // post serves the live prefix, writes it to count and flags the forward in DIRECT's words: overflow_flag (int32,
+  // sticky) and gather_overflow (this layer's int64 counter). Both unused when spill is 0.
+  int64_t spill;
+  int32_t* overflow_flag;
+  int64_t* gather_overflow;
 };
 
 // Element dtypes of the CPU experts' staged input and routing weights (PostParams).
@@ -84,17 +97,20 @@ SGL_DEVICE float cpu_input_value(const void* src, int64_t dtype, int64_t i) {
   return static_cast<const float*>(src)[i];
 }
 
-// Stages the layer's input row as fp16 into the host row, 8 elements per 16-byte store, using the whole block. The
-// launcher checks hidden % 8 == 0 and the alignment. Each thread fences its own stores at system scope before the
-// barrier, so thread 0's later release of the record and demand_head orders all of them.
+// Stages the layer's input rows as fp16 into the host row, token t at t * cpu_x_token_bytes, 8 elements per 16-byte
+// store, using the whole block. The launcher checks hidden % 8 == 0 and the alignment. Each thread fences its own
+// stores at system scope before the barrier, so thread 0's later release of the record and demand_head orders all.
 SGL_DEVICE void stage_cpu_input(const PostParams& p) {
   const int64_t vectors = p.cpu_hidden / 8;
-  for (int64_t v = threadIdx.x; v < vectors; v += blockDim.x) {
+  for (int64_t v = threadIdx.x; v < p.cpu_tokens * vectors; v += blockDim.x) {
+    const int64_t t = v / vectors, c = v % vectors;
     __align__(16) __half h[8];
 #pragma unroll
     for (int k = 0; k < 8; ++k)
-      h[k] = __float2half_rn(cpu_input_value(p.cpu_x_src, p.cpu_x_dtype, 8 * v + k));
-    __stwt(reinterpret_cast<uint4*>(p.cpu_x_dst + 16 * v), *reinterpret_cast<const uint4*>(h));
+      h[k] = __float2half_rn(cpu_input_value(p.cpu_x_src, p.cpu_x_dtype, t * p.cpu_hidden + 8 * c + k));
+    __stwt(
+        reinterpret_cast<uint4*>(p.cpu_x_dst + t * p.cpu_x_token_bytes + 16 * c),
+        *reinterpret_cast<const uint4*>(h));
   }
   __threadfence_system();
   __syncthreads();
@@ -117,7 +133,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   __shared__ TypedLanes typed;
   int32_t* __restrict__ const state = p.state;
   const uint64_t deadline = global_ns() + static_cast<uint64_t>(p.timeout_ns);
-  const int64_t count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
+  int64_t count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
   if (threadIdx.x == 0) {
     if (count > Wire::kLanes || count > p.lanes) __trap();  // the record and the plan's buffers hold no more
     any_cpu = 0;
@@ -150,7 +166,30 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       // Ordered after the tag's acquire; issued while the delta's loads are in flight.
       policy.host_lanes = p.captured != 0 && ld_acquire_sys(p.lease + Wire::kCopyArmed) == 1u;
       if (pending) apply_map_delta(d, map);
-      type_lanes(LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count}, map, policy, typed);
+      // Spill: DIRECT gives the lanes past its victims destination -1 (GpuResidencyUpdater.gather_destinations), and
+      // the live lanes are a prefix.
+      int64_t live = count;
+      if (p.spill != 0)
+        for (int64_t j = 0; j < count; ++j)
+          if (p.dst_slots[j] < 0) {
+            live = j;
+            break;
+          }
+      if (!type_lanes(
+              LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = count, .forced_from = live},
+              map,
+              policy,
+              typed)) {
+        // Forced lanes cannot be the CPU's (the copy engine is not armed, or no CPU layer yet): serve the live prefix
+        // and flag the forward, as clamp_gather_misses does without CPU experts. S, CW, CC and the DIRECT commit read
+        // the count written here.
+        count = live;
+        p.count[0] = static_cast<int32_t>(live);
+        *p.overflow_flag = 1;
+        *p.gather_overflow += 1;
+        type_lanes(
+            LanePlan{.planned = p.planned, .dst = p.dst_slots, .count = live, .forced_from = live}, map, policy, typed);
+      }
       for (int64_t j = 0; j < count; ++j)
         any_cpu |= is_cpu_kind(typed.kind[j]) ? 1 : 0;
     }
@@ -161,6 +200,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     stage_cpu_input(p);
   }
   if (threadIdx.x != 0) return;
+  // A multi-token row's token table (cpu_token_table.h): written for every lane before the record's release.
+  uint8_t* const table = p.cpu_x_dst != nullptr && p.cpu_tokens_max > 1
+                             ? p.cpu_x_dst + p.cpu_tokens_max * p.cpu_x_token_bytes
+                             : nullptr;
+  const int64_t top_k = p.cpu_tokens > 0 ? p.cpu_weights_count / p.cpu_tokens : 0;
+  if (table != nullptr) st_relaxed_sys<uint32_t>(table, static_cast<uint32_t>(p.cpu_tokens));
   int32_t protect[Wire::kLanes];
   int protect_count = 0;
   for (int64_t i = 0; i < p.route_count && protect_count < Wire::kLanes; ++i) {
@@ -199,13 +244,24 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
       p.dst_slots_1[go] = p.dst_slots[j];
       ++go;
     }
-    // The lane expert's routing weight: its route's (batch-size-1 routes are distinct experts). 0 when CPU experts
-    // are off.
+    // The lane expert's routing weight summed over the routes that name it (one route at batch size 1), and for a
+    // multi-token row each token's own weight and the mask of tokens that route it. 0 when CPU experts are off.
     weight[j] = 0.0f;
     if (p.cpu_x_dst != nullptr) {
+      uint32_t routed = 0;
       for (int64_t r = 0; r < p.route_count && r < p.cpu_weights_count; ++r) {
-        if (p.routes[r] == p.planned[j]) weight[j] += cpu_input_value(p.cpu_weights, p.cpu_weights_dtype, r);
+        if (p.routes[r] != p.planned[j]) continue;
+        const float w = cpu_input_value(p.cpu_weights, p.cpu_weights_dtype, r);
+        weight[j] += w;
+        if (table != nullptr) {
+          const int64_t t = r / top_k;
+          routed |= 1u << t;
+          st_relaxed_sys<uint32_t>(
+              table + expert_stream::CpuTokenTable::kHeaderBytes + 4 * Wire::kLanes + 4 * (t * Wire::kLanes + j),
+              __float_as_uint(w));
+        }
       }
+      if (table != nullptr) st_relaxed_sys<uint32_t>(table + expert_stream::CpuTokenTable::kHeaderBytes + 4 * j, routed);
     }
   }
   p.go_1[0] = static_cast<int32_t>(go);
@@ -335,6 +391,11 @@ struct LeaseProtocolKernel {
       tvm::ffi::TensorView cpu_x,
       int64_t cpu_x_dst,
       tvm::ffi::TensorView cpu_weights,
+      int64_t cpu_tokens_max,
+      int64_t cpu_x_token_bytes,
+      int64_t spill,
+      tvm::ffi::TensorView overflow_flag,
+      tvm::ffi::TensorView gather_overflow,
       int64_t use_pdl) {
     using namespace host;
     using namespace expert_stream::wire;
@@ -401,7 +462,7 @@ struct LeaseProtocolKernel {
     expert_stream::verify_named(
         "host_rows_1", TensorMatcher({Wire::kLanes}).with_dtype<int64_t>().with_device<kDLCUDA>(device), host_rows_1);
     RuntimeCheck(experts > 0, "experts: must be positive");
-    // CPU experts: cpu_x is the layer's input row [1, hidden] (empty when off), cpu_weights the routes' weights.
+    // CPU experts: cpu_x is the layer's input rows [tokens, hidden] (empty when off), cpu_weights the routes' weights.
     auto cpu_dtype = [](tvm::ffi::TensorView t) -> int64_t {
       const DLDataType d = t.dtype();
       if (d.code == kDLFloat && d.bits == 16) return kCpuDtypeF16;
@@ -420,9 +481,18 @@ struct LeaseProtocolKernel {
           cpu_x.is_contiguous() && cpu_weights.is_contiguous(),
           "CPU experts: cpu_x and cpu_weights must be contiguous");
       RuntimeCheck(cpu_dtype(cpu_x) >= 0 && cpu_dtype(cpu_weights) >= 0, "CPU experts: fp16, bf16 or fp32 inputs");
-      RuntimeCheck(cpu_x.dim() == 2 && cpu_x.size(0) == 1, "CPU experts: cpu_x is one row [1, hidden]");
+      RuntimeCheck(
+          cpu_tokens_max >= 1 && cpu_tokens_max <= expert_stream::CpuTokenTable::kMaxTokens,
+          "CPU experts: the rows hold 1-32 tokens");
+      RuntimeCheck(
+          cpu_x.dim() == 2 && cpu_x.size(0) >= 1 && cpu_x.size(0) <= cpu_tokens_max,
+          "CPU experts: cpu_x is [tokens, hidden] with at most the rows' tokens");
+      RuntimeCheck(cpu_weights.numel() % cpu_x.size(0) == 0, "CPU experts: cpu_weights holds top_k weights a token");
       cpu_hidden = cpu_x.size(1);
       RuntimeCheck(cpu_hidden > 0 && cpu_hidden % 8 == 0, "CPU experts: the hidden size must be a multiple of 8");
+      RuntimeCheck(
+          cpu_x_token_bytes >= 2 * cpu_hidden && cpu_x_token_bytes % 16 == 0,
+          "CPU experts: cpu_x_token_bytes holds one fp16 row, in 16-byte steps");
       RuntimeCheck(cpu_x_dst % 16 == 0, "CPU experts: the staged row must be 16-byte aligned");
     }
     RuntimeCheck(cpu_on == 0 || cpu_input || captured == 0, "CPU experts: a captured post needs the CPU input");
@@ -430,12 +500,19 @@ struct LeaseProtocolKernel {
         lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
         "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
 
+    if (spill != 0) {
+      expert_stream::verify_named(
+          "overflow_flag", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), overflow_flag);
+      expert_stream::verify_named(
+          "gather_overflow", TensorMatcher({1}).with_dtype<int64_t>().with_device<kDLCUDA>(device), gather_overflow);
+    }
+
     const auto stream = LaunchKernel::resolve_device(state.device());
     const auto params = PostParams{
         .page = static_cast<uint8_t*>(page.data_ptr()),
         .state = static_cast<int32_t*>(state.data_ptr()),
         .planned = static_cast<const int64_t*>(planned.data_ptr()),
-        .count = static_cast<const int32_t*>(count.data_ptr()),
+        .count = static_cast<int32_t*>(count.data_ptr()),
         .lanes = std::min<int64_t>(planned.size(0), dst_slots.size(0)),
         .routes = static_cast<const int64_t*>(routes.data_ptr()),
         .route_count = routes.size(0),
@@ -473,6 +550,12 @@ struct LeaseProtocolKernel {
         .cpu_weights = cpu_input ? cpu_weights.data_ptr() : nullptr,
         .cpu_weights_dtype = cpu_input ? cpu_dtype(cpu_weights) : 0,
         .cpu_weights_count = cpu_input ? cpu_weights.numel() : 0,
+        .cpu_tokens = cpu_input ? cpu_x.size(0) : 1,
+        .cpu_tokens_max = cpu_tokens_max,
+        .cpu_x_token_bytes = cpu_x_token_bytes,
+        .spill = spill,
+        .overflow_flag = spill != 0 ? static_cast<int32_t*>(overflow_flag.data_ptr()) : nullptr,
+        .gather_overflow = spill != 0 ? static_cast<int64_t*>(gather_overflow.data_ptr()) : nullptr,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)
         .enable_pdl(use_pdl != 0)(

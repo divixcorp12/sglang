@@ -363,8 +363,29 @@ class GpuResidencyUpdater:
         narrower width loses it: ``H + M`` may exceed ``miss_rows``. Its gathers serve
         the misses that find a victim and flag the rest (:meth:`clamp_gather_misses`),
         so the floor stays ``2 * miss_rows``.
+
+        With spill (``victim_lanes`` below ``miss_rows``, a lane per route) only the first
+        ``victim_lanes`` shortlist columns are victims, so the floor is ``2 * victim_lanes``.
         """
         width = self.miss_rows
+        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get()
+        if victims and not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+            raise ValueError(
+                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} needs SGLANG_DSV41_CPU_EXPERTS=1: only the "
+                "CPU serves the lanes that take no victim"
+            )
+        if victims and not 1 <= victims < width:
+            raise ValueError(
+                f"SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES={victims} must be below the {width} miss lanes"
+            )
+        if victims and any(s.graph_miss_width != s.graph_gather_rows for s in self.streamers):
+            # A lane per route: a verify's distinct misses never outnumber its lanes, so nothing is clamped.
+            raise ValueError(
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES gives every route a lane: unset "
+                "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"
+            )
+        # Lanes that may take a victim; the rest are the CPU's (the post's spill).
+        self.victim_lanes = victims or width
         for layer_id, streamer in zip(self.layer_ids, self.streamers):
             # A layer with no host-source tensor would put its full expert rows on the
             # segment kernel, which cannot size its grid to a device-side count: 0.125
@@ -380,11 +401,11 @@ class GpuResidencyUpdater:
                     f"layer {layer_id} keeps every streamed tensor on the device"
                 )
         for layer_id, cache in zip(self.layer_ids, self.caches):
-            if cache.capacity < 2 * width:
+            if cache.capacity < 2 * self.victim_lanes:
                 raise ValueError(
                     "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE=2 needs every layer to hold at least "
-                    f"twice its graph-gather miss lanes; layer {layer_id} has {cache.capacity} "
-                    f"slots for {width} lanes. Raise SGLANG_MOE_HOT_GPU_MB or use stage 1."
+                    f"twice its graph-gather victim lanes; layer {layer_id} has {cache.capacity} "
+                    f"slots for {self.victim_lanes} lanes. Raise SGLANG_MOE_HOT_GPU_MB or use stage 1."
                 )
         device, layers = self.device, self.num_layers
         # Shortlisted slots per layer, and which of those columns name a real slot.
@@ -401,7 +422,9 @@ class GpuResidencyUpdater:
         # that says this forward's output is not a verify result (clamp_gather_misses).
         self.gather_overflow = torch.zeros(layers, dtype=torch.long, device=device)
         self.overflow_flag = torch.zeros(1, dtype=torch.int32, device=device)
-        self.narrow_gather = any(
+        # The overflow flag is read after every verify that can set it: a narrowed gather's clamp, or spill's post
+        # (forced lanes before the copy engine arms).
+        self.narrow_gather = self.victim_lanes < width or any(
             streamer.graph_miss_width < streamer.graph_gather_rows for streamer in self.streamers
         )
         # SGLANG_DSV41_ENABLE_LAYER_FUSION fuses gather_destinations and commit_gather
@@ -874,9 +897,18 @@ class GpuResidencyUpdater:
         ranked = torch.sort(keys, dim=1)
         self.victims.copy_(ranked.indices[:, :width].clamp(max=slot_dump))
         self.victim_valid.copy_(ranked.values[:, :width] < never)
+        if self.victim_lanes < width:
+            # Spill: only the first victim_lanes columns are victims; the post sends the other lanes to the CPU.
+            self.victim_valid[:, self.victim_lanes :] = False
         self.victims_fresh = True
         if self.miss_keys is not None:
             self.miss_keys.copy_(expert_keys)
+
+    def _idle_destination(self) -> tuple[int, int]:
+        """(destination, destination slot) of a lane that is not live. (0, 0) normally, a slot the clamp keeps any copy
+        out of. With spill (slot_dump, -1): -1 tells the post the lane found no victim, and a route remapped to
+        slot_dump is past every slot column, so the fused MoE skips it and the commit writes only the dump column."""
+        return (self.max_capacity, -1) if self.victim_lanes < self.miss_rows else (0, 0)
 
     def enable_miss_order(self) -> None:
         """Keep ``miss_keys``, int64 ``[layers, experts]``, updated with each ranking.
@@ -940,9 +972,12 @@ class GpuResidencyUpdater:
         # Lanes past the miss count are never copied (the copy reads the same count) or
         # remapped to. A counted lane that is not live would copy to slot 0; the full
         # shortlist rules that out and _commit_gather counts it if it happens.
-        destinations = torch.where(live, usable, torch.zeros_like(usable))
+        idle, idle_slot = self._idle_destination()
+        destinations = torch.where(live, usable, torch.full_like(usable, idle))
         # The plan's slot buffer has a row per route; the lanes are the first miss_rows.
-        streamer._graph_destination_slots[: self.miss_rows].copy_(destinations.to(torch.int32))
+        streamer._graph_destination_slots[: self.miss_rows].copy_(
+            torch.where(live, destinations, torch.full_like(destinations, idle_slot)).to(torch.int32)
+        )
         self._pending_commit = (row, streamer, destinations, live)
         # The fused planner keeps the router's native ids, so remap may be int32, but
         # index_select takes int64 only. The caller casts the result back.
@@ -970,6 +1005,7 @@ class GpuResidencyUpdater:
         )
 
         streamer = self.streamers[row]
+        idle, idle_slot = self._idle_destination()
         destinations, live = self.fused_destinations[row], self.fused_live[row]
         remap_out = self.fused_remaps[remap_dtype][row, : flat.numel()]
         direct_gather_destinations(
@@ -984,6 +1020,8 @@ class GpuResidencyUpdater:
             destinations,
             live,
             remap_out,
+            idle_destination=idle,
+            idle_slot=idle_slot,
         )
         self._pending_commit = (row, streamer, destinations, live)
         return remap_out
@@ -1000,6 +1038,8 @@ class GpuResidencyUpdater:
         be free and hold any bytes. The forward's output, NaN or Inf included, is not a verify result and must not
         be kept; ``overflow_flag`` says so. Device only, capture-safe.
         """
+        # Spill gives every route a lane (_init_insert_direct), so its gathers never call this.
+        assert self.victim_lanes == self.miss_rows, "spill never clamps: its gather has a lane per route"
         row, streamer, _, live = self._pending_commit
         count = streamer._graph_miss_count
         served = live.sum(dtype=torch.int32)

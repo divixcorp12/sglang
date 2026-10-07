@@ -154,6 +154,17 @@ class Doorbell {
     sleeping_.store(false, std::memory_order_relaxed);
   }
 
+  /// sleep_unless, waking after `timeout_ns` at the latest: for a consumer that must also poll a word nobody rings
+  /// (the DSpark draft channel's head, which the GPU stores).
+  template <class Ready>
+  void sleep_unless(Ready ready, int64_t timeout_ns) {
+    const uint32_t seen = word_.load(std::memory_order_acquire);
+    sleeping_.store(true, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!ready()) futex_wait(&word_, seen, timeout_ns);
+    sleeping_.store(false, std::memory_order_relaxed);
+  }
+
   /// Moves on every ring(): a consumer busy elsewhere can watch it for new work.
   const std::atomic<uint32_t>& word() const {
     return word_;

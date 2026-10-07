@@ -12,6 +12,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include "../expert_stream/lane_mask.cuh"
 #include "../expert_stream/tensor_checks.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -39,14 +40,14 @@ __device__ __forceinline__ float route_tables_to_float(__nv_bfloat16 v) {
 // each), and token_sorted_out (when non-null) receives each rank's token, which exllamav3's fused MoE reads as
 // token_sorted.
 //
-// CPU experts (plan 2026-09-29-dsv41-cpu-experts; cpu_lanes non-null; one token only): the lanes of cpu_lanes[0] were
+// CPU experts (plan 2026-09-29-dsv41-cpu-experts; cpu_lanes non-null; any M tokens, plan 2026-10-06-dsv41-dspark-both-cpu-experts): the lanes of cpu_lanes[0] were
 // computed by the CPU expert thread, whose partial sums seed the output instead of zero: part p at cpu_out + p *
-// part_stride (host memory, [hidden] fp32) for every bit p of cpu_lanes[1]: bit 2g group g's CPU hits', bit 2g + 1 its
+// part_stride (host memory, [tokens][hidden] fp32) for every bit p of cpu_lanes[1]: bit 2g group g's CPU hits', bit 2g + 1 its
 // CPU misses'. A part whose bit is clear holds an earlier record's sum and is never read. A route
 // whose slot is such a lane's dst_slots entry is ranked as if its slot were past every column: its slot's count is 0
 // (the fused kernel and the gather skip it) and every other slot's start, which the fused kernel recomputes as a
 // running sum of the counts to index weight_sorted, is unchanged by it. Its remap64_out entry keeps the real slot.
-template <typename RemapT, typename WeightT, typename XT>
+template <typename RemapT, typename WeightT, typename XT, typename MaskT>
 __global__ void exl3_moe_route_tables_kernel(
     const RemapT* __restrict__ remap,
     int routes,
@@ -72,20 +73,20 @@ __global__ void exl3_moe_route_tables_kernel(
   const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   const bool kept = keep[0] > 0.0f;
-  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
+  const MaskT cpu = cpu_lanes != nullptr ? expert_stream::load_lane_mask<MaskT>(cpu_lanes, cpu_lanes + 2) : MaskT{0};
   const uint32_t parts = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[1]) : 0u;
   // A one-part row holds part 0 only.
   if ((parts >> 1) != 0u && part_stride == 0) __trap();
   // A route's slot as the tables rank it: past every column when the CPU computed it.
   auto ranked = [&](int i) -> int64_t {
     const int64_t r = static_cast<int64_t>(remap[i]);
-    for (uint32_t lanes = cpu; lanes != 0; lanes &= lanes - 1) {
-      const int lane = __ffs(lanes) - 1;
+    for (MaskT lanes = cpu; lanes != 0; lanes &= lanes - 1) {
+      const int lane = expert_stream::lowest_lane(lanes);
       if (lane < dst_count && static_cast<int64_t>(dst_slots[lane]) == r) return columns;
     }
     return r;
   };
-  // CPU experts run one token, so a seeded part is read only where i < hidden.
+  // Each token's partial is its own [hidden] row of each part, so element i of the output reads element i of each.
   for (int64_t i = tid; i < tokens * hidden; i += stride) {
     x16_out[i] = __float2half_rn(route_tables_to_float(x[i]));
     float seed = 0.0f;
@@ -182,16 +183,16 @@ void exl3_moe_route_tables_gpu(
   RuntimeCheck(
       token_sorted_out.size(0) == 0 || token_sorted_out.size(0) == K_.unwrap(),
       "token_sorted_out: one entry per route, or empty");
-  // CPU experts: cpu_lanes is two words (empty when off), dst_slots the plan's lane slots, cpu_out the host row.
+  // CPU experts: cpu_lanes is two words, three for a wide wire (empty when off), dst_slots the plan's lane slots, cpu_out the host row.
   expert_stream::verify_named(
       "cpu_lanes", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes);
   expert_stream::verify_named(
       "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
-  const bool cpu_on = cpu_lanes.size(0) == 2;
+  const bool cpu_on = cpu_lanes.size(0) >= 2;
   RuntimeCheck(
-      cpu_lanes.size(0) == 0 || cpu_lanes.size(0) == 2, "cpu_lanes: two words, or empty when CPU experts are off");
+      cpu_lanes.size(0) == 0 || cpu_lanes.size(0) == 2 || cpu_lanes.size(0) == 3,
+      "cpu_lanes: two words (three for a wide wire), or empty when CPU experts are off");
   RuntimeCheck(!cpu_on || (cpu_out != 0 && cpu_out % 16 == 0), "cpu_out: the CPU partial's host row, 16-byte aligned");
-  RuntimeCheck(!cpu_on || M_.unwrap() == 1, "CPU experts run one token (x has one row)");
   RuntimeCheck(cpu_part_stride >= 0 && cpu_part_stride % 4 == 0, "cpu_part_stride: floats between parts, 16-byte steps");
   const auto stream = host::LaunchKernel::resolve_device(remap.device());
   const int64_t tokens = x.size(0);
@@ -201,7 +202,8 @@ void exl3_moe_route_tables_gpu(
   const int64_t work = tokens * hidden > columns ? tokens * hidden : columns;
   const int blocks = static_cast<int>((work + kThreads - 1) / kThreads);
   host::LaunchKernel(blocks, kThreads, stream)(
-      exl3_moe_route_tables_kernel<RemapT, WeightT, XT>,
+      cpu_lanes.size(0) == 3 ? exl3_moe_route_tables_kernel<RemapT, WeightT, XT, uint64_t>
+                             : exl3_moe_route_tables_kernel<RemapT, WeightT, XT, uint32_t>,
       static_cast<const RemapT*>(remap.data_ptr()),
       static_cast<int>(remap.numel()),
       static_cast<const WeightT*>(weights.data_ptr()),

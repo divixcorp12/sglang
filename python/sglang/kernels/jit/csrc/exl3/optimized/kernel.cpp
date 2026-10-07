@@ -27,6 +27,13 @@ const ::sglang::cpu_experts::CpuExpertKernel& exl3_cpu_kernel()
     static const ::sglang::cpu_experts::ExpertForward<Exl3Quant> kernel{};
     return kernel;
 }
+
+SglangExl3CpuPlanCalls exl3_cpu_plan_calls()
+{
+    return {g_plan_calls[0].load(std::memory_order_relaxed), g_plan_calls[1].load(std::memory_order_relaxed)};
+}
+
+int32_t exl3_cpu_chunk_m() { return CHUNK_M; }
 }  // namespace sglang::exl3_cpu
 
 // Kept for upstream's bindings. Phase timing is compile-time here (ForwardPlan's Profile, forward_plan.hpp).

@@ -119,6 +119,13 @@ public:
     {
         ::sglang::cpu_experts::keep_warm<Quant::kTopIsa>(isa(), cores, threads, word, seen, warm_until_ns, release_ns);
     }
+    void keep_warm_either(std::span<const int> cores, int32_t threads, const uint32_t* word_a, uint32_t seen_a,
+                          const uint32_t* word_b, uint32_t seen_b, int64_t warm_until_ns,
+                          int64_t release_ns) const override
+    {
+        ::sglang::cpu_experts::keep_warm_either<Quant::kTopIsa>(isa(), cores, threads, word_a, seen_a, word_b, seen_b,
+                                                                 warm_until_ns, release_ns);
+    }
 
 private:
     // Out of line and cold, so forward's failure path costs it one predicted branch.

@@ -458,3 +458,26 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_shutdown_reads_the_shared_draft_hosts_counters_before_closing_the_host(world, monkeypatch, caplog):
+    """M12. Mutation: the service never reads the draft's stats. SharedDraftHost.stats() is {} once the host is closed,
+    so a both-mode server would then never report the draft's counters. The stats are read after admission closed and
+    before the host's stop, once (shutdown is idempotent), and logged like the draft-only path's line."""
+    service, caches, order = world
+    counters = {"jobs": 7, "rows": 42, "forward_ns": 1234}
+
+    class Draft:
+        def stats(self):
+            order.append("draft_stats")
+            return counters
+
+    service.host._draft_keep = (None, Draft())
+    _barrier(service, monkeypatch, order, lambda: None)
+    with caplog.at_level("INFO", logger=module.logger.name):
+        service.shutdown()
+        service.shutdown()
+    assert order == ["synchronize", "close_admission", "draft_stats", "stop", "free0", "free1"]
+    assert [r.getMessage() for r in caplog.records if "DSpark CPU experts" in r.getMessage()] == [
+        f"DSpark CPU experts: {counters}"
+    ]

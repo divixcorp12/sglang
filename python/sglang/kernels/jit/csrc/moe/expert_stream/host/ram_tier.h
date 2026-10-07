@@ -15,6 +15,8 @@
 // See analysis/dsv41-drive/LEASE_PROTOCOL.md, "The host per record".
 #pragma once
 
+#include <bit>
+
 #include "../row_layout.h"
 #include "copy_engine.h"
 #include "host_copy_backend.h"
@@ -728,6 +730,34 @@ class RamTier {
     return cpu_kernel_;
   }
 
+  // The DSpark draft channel on group g's CPU expert engine (CpuExpertEngine::attach_draft): draft_open makes the
+  // source, draft_set_layer fills a stage's layer, draft_start attaches it, draft_stop detaches it.
+  void draft_open(int g, std::unique_ptr<DraftSource> source, int64_t fatal_wait_ns) {
+    draft_cpu(g);
+    pending_draft_[g] = std::move(source);
+    draft_fatal_ns_[g] = fatal_wait_ns;
+  }
+  void draft_set_layer(int g, int stage, const cpu_experts::ExpertLayer& layer) {
+    DraftSource* d = pending_draft_[g].get();
+    if (d == nullptr) throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "draft_open first");
+    if (stage < 0 || stage >= static_cast<int>(d->layers.size()))
+      throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "stage " + std::to_string(stage) + " is out of range");
+    d->layers[stage] = layer;
+  }
+  void draft_start(int g) {
+    if (pending_draft_[g] == nullptr) throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "draft_open first");
+    for (size_t s = 0; s < pending_draft_[g]->layers.size(); ++s)
+      if (pending_draft_[g]->layers[s].kernel == nullptr)
+        throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "stage " + std::to_string(s) + " has no layer");
+    draft_cpu(g).attach_draft(std::move(pending_draft_[g]), draft_fatal_ns_[g]);
+  }
+  void draft_stop(int g) {
+    draft_cpu(g).detach_draft();
+  }
+  CpuExpertEngine::DraftStats draft_stats(int g) {
+    return draft_cpu(g).draft_stats();
+  }
+
   void check_cpu_layer_row(int64_t row) const {
     if (row < 0 || row >= layers_)
       throw std::runtime_error(error_prefix<Layout>() + "CPU expert layer for row " + std::to_string(row) + " of " +
@@ -788,13 +818,16 @@ class RamTier {
 
   // Runs the startup calibration of the CPU split (split_calibration.h) and fills `out`, float64
   // [kCalibRows][kCalibCols] in ms. The caller must own the tier, since it claims CPU job sequences, which are the
-  // owner's. device -1 copies with the test backend; `scratch` holds kCalibLanes experts on that device. Throws on bad
+  // owner's. `tokens` above 1 measures per_token CPU jobs of that many rows, a verify's. device -1 copies with the test
+  // backend; `scratch` holds `lanes` experts on that device. Throws on bad
   // arguments, a failed copy or a timeout.
   void calibrate_cpu_split(
       int g,
       int64_t row,
       int64_t device,
       int64_t reps,
+      int64_t lanes,
+      int64_t tokens,
       uint64_t scratch,
       int64_t scratch_bytes,
       int64_t timeout_ns,
@@ -810,17 +843,23 @@ class RamTier {
     if (!cpu->eligible(row))
       throw std::runtime_error(prefix + "row " + std::to_string(row) + " has no registered CPU layer");
     const GroupRow& own = dist_.group(g).rows[row];
-    if (own.hi - own.lo < kCalibLanes)
+    if (own.hi - own.lo < lanes)
       throw std::runtime_error(
-          prefix + "it needs " + std::to_string(kCalibLanes) + " RAM slots of group " + std::to_string(g) + " in row " +
+          prefix + "it needs " + std::to_string(lanes) + " RAM slots of group " + std::to_string(g) + " in row " +
           std::to_string(row) + ", the group has " + std::to_string(own.hi - own.lo));
     if (reps < 1 || timeout_ns <= 0) throw std::runtime_error(prefix + "reps and the timeout must be positive");
+    if (lanes < 1 || lanes > kCalibLanes)
+      throw std::runtime_error(prefix + "lanes must be 1.." + std::to_string(kCalibLanes));
+    if (tokens < 1 || tokens > cpu->tokens())
+      throw std::runtime_error(
+          prefix + "tokens " + std::to_string(tokens) + " is not within the CPU rows' 1.." +
+          std::to_string(cpu->tokens()));
     CalibrationSetup s;
     s.cpu = cpu.get();
     s.first_slot = own.lo;
     s.row = row;
     s.entries = copy_engine_->dma_entries(row);
-    const int64_t need = kCalibLanes * calibration_expert_bytes(s.entries);
+    const int64_t need = lanes * calibration_expert_bytes(s.entries);
     if (need == 0) throw std::runtime_error(prefix + "row " + std::to_string(row) + " copies no bytes");
     if (scratch == 0 || scratch_bytes < need)
       throw std::runtime_error(
@@ -845,6 +884,9 @@ class RamTier {
     s.backend = backend.get();
     s.scratch = scratch;
     s.reps = static_cast<int>(reps);
+    s.lanes = static_cast<int>(lanes);
+    s.tokens = static_cast<int>(tokens);
+    cpu->write_calibration_table(row, tokens);
     s.timeout_ns = timeout_ns;
     calibrate_split(s, out);
     shutdown.idle = true;
@@ -1599,7 +1641,7 @@ class RamTier {
 
   // The record's CPU-miss jobs still to submit, advanced as rows land.
   struct CpuMissBatch {
-    uint32_t sent = 0;  // bit i: miss i went to the CPU
+    Wire::LaneMask sent = 0;  // bit i: miss i went to the CPU
     int left = 0;
     uint32_t next = 0;  // the next CPU-miss job's sequence, short of the last (job.late_seq)
   };
@@ -1646,8 +1688,13 @@ class RamTier {
                 std::to_string(lane.slot) + ")" + why);
       };
       if (is_miss(lane.kind)) {
-        if (!listed(own.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
-        if (listed(plan->slots, static_cast<int64_t>(lane.slot))) fail(" shares its staging slot with another miss");
+        if (lane.slot < 0) {
+          // A forced CPU miss (spill): no staging slot; reserve_victims_locked reads it into a RAM victim.
+          if (lane.kind != Wire::kKindMissCpu) fail(" is a GPU miss without a staging slot");
+        } else {
+          if (!listed(own.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
+          if (listed(plan->slots, static_cast<int64_t>(lane.slot))) fail(" shares its staging slot with another miss");
+        }
         if (tier.expert_slot[lane.expert] >= 0) fail(" misses an expert the tier holds");
         if (lane.kind == Wire::kKindMissCpu) {
           if (!cpu_row || group.cpu->parts() < 2) fail(": a CPU miss on a row without CPU experts' miss part");
@@ -1669,12 +1716,12 @@ class RamTier {
           fail(": a copy-engine lane on an ineligible row");
       } else if (lane.kind == Wire::kKindHitCpu) {
         if (!cpu_row) fail(": a CPU lane on a row without CPU experts");
-        job.cpu_mask |= 1u << j;
+        job.cpu_mask |= Wire::LaneMask{1} << j;
       } else {
         continue;  // Wire::kKindHitSm: the device's SM kernel copies it, the host has nothing to do
       }
       job.lanes[job.count++] = CopyLane{static_cast<int32_t>(j), lane.slot, lane.dst, lane.weight};
-      job.mask |= 1u << j;
+      job.mask |= Wire::LaneMask{1} << j;
     }
     if (NumaNodeDistributor<Source>::miss_nodes(request) != 0) {
       // A group's own miss is checked against the row's last published delta, which is exact: the device waits for the
@@ -1714,7 +1761,7 @@ class RamTier {
     if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric
     this->template count<kCopyJobs>(group);
     this->template count<kCopyLanes>(group, job.count + job.late_cpu);
-    const int cpu_hits = __builtin_popcount(job.cpu_mask);
+    const int cpu_hits = std::popcount(job.cpu_mask);
     this->template count<kCpuLanes>(group, cpu_hits + job.late_cpu);
     if (cpu_hits > 0 || job.late_cpu > 0) {
       // One sequence per job the record can need: the hits' and one per CPU miss. The last miss job takes the last,
@@ -1728,11 +1775,13 @@ class RamTier {
         cpu_job.row = request.row;
         cpu_job.part = 0;
         cpu_job.seq = first;
+        cpu_job.per_token = true;
         for (int i = 0; i < job.count; ++i) {
           const CopyLane& lane = job.lanes[i];
           if ((job.cpu_mask >> lane.lane & 1u) == 0) continue;
           cpu_job.slots[cpu_job.k] = lane.host_slot;
           cpu_job.weights[cpu_job.k] = lane.weight;
+          cpu_job.lanes[cpu_job.k] = lane.lane;
           ++cpu_job.k;
         }
         submit_cpu_job(group, request, cpu_job);
@@ -1746,11 +1795,34 @@ class RamTier {
   // miss lands in its staging slot whatever happens here; whether it is cached is the victim's question. inserted[i] is
   // set when miss i took a victim and is cached once read.
   void reserve_victims_locked(
-      Group& group, Tier& tier, const Request& request, const RecordPlan& plan, bool* inserted) {
+      Group& group, Tier& tier, const Request& request, RecordPlan& plan, bool* inserted) {
     GroupRow& own = group.rows[request.row];
     DeltaReport part;
     part.staging = own.staging;
+    // Forced CPU misses first (spill, slot -1): each is read straight into a victim, which it takes over, so it is
+    // cached with no staging slot. The start-up capacity check (Exl3RamMissService.attach) leaves every node range a
+    // victim for each, so none missing is a broken invariant, not a skipped insert.
+    bool placed[Wire::kLanes] = {};
     for (size_t i = 0; i < plan.missing.size(); ++i) {
+      if (plan.slots[i] >= 0) continue;
+      int32_t old = -1;
+      const int64_t victim = take_victim_locked(group, request.row, plan.wanted, &old);
+      if (victim < 0) fail_record(request, "a forced CPU miss found no RAM victim on its node");
+      if (old >= 0) {
+        part.entries[part.count][0] = old;
+        part.entries[part.count][1] = -1;
+        ++part.count;
+      }
+      part.entries[part.count][0] = plan.missing[i];
+      part.entries[part.count][1] = static_cast<int32_t>(victim);
+      ++part.count;
+      tier.state[victim] = kStaging;  // being read; commit_inserted_locked makes it READY
+      plan.slots[i] = victim;
+      placed[i] = true;
+      inserted[i] = true;
+    }
+    for (size_t i = 0; i < plan.missing.size(); ++i) {
+      if (placed[i]) continue;
       int32_t old = -1;
       const int64_t victim = take_victim_locked(group, request.row, plan.wanted, &old);
       if (victim < 0) {
@@ -1786,14 +1858,16 @@ class RamTier {
     cpu_job.row = request.row;
     cpu_job.part = 1;
     cpu_job.accumulate = misses->left < job.late_cpu;
+    cpu_job.per_token = true;
     for (size_t i = 0; i < plan.missing.size(); ++i) {
       const Lane& lane = request.lanes[plan.miss_lane[i]];
       if (lane.kind != Wire::kKindMissCpu || (misses->sent >> i & 1u) != 0) continue;
       if (!(i < group.packed.size() && group.packed[i] != 0)) continue;
       cpu_job.slots[cpu_job.k] = static_cast<int32_t>(plan.slots[i]);
       cpu_job.weights[cpu_job.k] = lane.weight;
+      cpu_job.lanes[cpu_job.k] = static_cast<int32_t>(plan.miss_lane[i]);
       ++cpu_job.k;
-      misses->sent |= 1u << i;
+      misses->sent |= Wire::LaneMask{1} << i;
     }
     if (cpu_job.k == 0) return;
     misses->left -= cpu_job.k;
@@ -1956,6 +2030,14 @@ class RamTier {
   int64_t experts_;
   // Every row's CPU expert layer, shared by every group's engine; declared before dist_, so destroyed after the engines.
   std::unique_ptr<CpuExpertLayers> cpu_layers_;
+  CpuExpertEngine& draft_cpu(int g) {
+    if (g < 0 || g >= groups() || dist_.group(g).cpu == nullptr)
+      throw std::runtime_error(std::string(CpuExpertEngine::kDraftPrefix) + "group " + std::to_string(g) +
+                               " has no CPU expert engine (SGLANG_DSV41_CPU_EXPERTS)");
+    return *dist_.group(g).cpu;
+  }
+  std::array<std::unique_ptr<DraftSource>, Wire::kNodes> pending_draft_;
+  std::array<int64_t, Wire::kNodes> draft_fatal_ns_{};
   const cpu_experts::CpuExpertKernel* cpu_kernel_ = nullptr;  // every group's engine runs this one kernel
   // The NUMA groups: each one's reader, serve state and CPU experts (when enabled, group 0's, after the copy engine and
   // before the service threads; stopped after the copy thread). Declared before tiers_: the groups' ranges are checked

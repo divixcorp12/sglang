@@ -281,11 +281,14 @@ SGL_DEVICE void apply_map_delta(const MapDelta& d, const RowMap& map) {
   *map.map_applied = *map.map_chain;
 }
 
-// The plan as the post reads it, in device memory: `count` planned experts and their VRAM destination slots.
+// The plan as the post reads it, in device memory: `count` planned experts and their VRAM destination slots. Lanes
+// from forced_from on found no VRAM victim (spill: DIRECT's narrowed verify with CPU experts) and must be CPU lanes;
+// forced_from == count forces none.
 struct LanePlan {
   const int64_t* planned;
   const int32_t* dst;
   int64_t count;
+  int64_t forced_from;
 };
 
 // Everything besides the map that decides a lane's kind, loaded before type_lanes runs.
@@ -323,11 +326,15 @@ SGL_DEVICE void load_split(const uint8_t* split, int32_t (&out)[Wire::kNodes][Wi
 
 // Types each lane of the plan: its kind and source slot. Transcribes ram_slot_map.type_lanes, the host reference.
 //
-// A hit takes its RAM slot, and a miss the next slot of its home node's staging list. Node n's CPU takes the last
-// split[n][k] of its k eligible lanes in plan order. Traps where the reference raises: a plan wider than Wire::kLanes,
-// an expert out of range or repeated, a hit slot past the row's capacity, a miss with no staging slot on its node, a
-// split entry above its n. Reads no host memory; the caller loads the split table into the policy.
-SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
+// A hit takes its RAM slot, and an unforced miss the next slot of its home node's staging list. Node n's CPU takes the
+// last split[n][k] of its k eligible unforced lanes in plan order. A forced lane (j >= plan.forced_from) is a CPU lane
+// whatever the split: a hit at its RAM slot, a miss with slot -1 and no staging slot, which the host reads into a RAM
+// victim (RamTier::reserve_victims_locked). Traps where the reference raises ValueError: a plan wider than
+// Wire::kLanes, an expert out of range or repeated, a hit slot past the row's capacity, an unforced miss with no
+// staging slot on its node (live misses <= victim lanes = staging per node: an assert), a split entry above its n.
+// Returns false where the reference raises LaneOverflow: forced lanes with no host lanes or no CPU layer; `out` is then
+// partial. Reads no host memory; the caller loads the split table into the policy.
+SGL_DEVICE bool type_lanes(const LanePlan& plan, const RowMap& map, const LanePolicy& policy, TypedLanes& out) {
   if (plan.count > Wire::kLanes) __trap();
   int64_t expert[Wire::kLanes];
   int32_t dst[Wire::kLanes];
@@ -351,22 +358,27 @@ SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
   bool eligible[Wire::kLanes];
   int m[Wire::kNodes] = {};
   int n[Wire::kNodes] = {};
+  const bool can_cpu = policy.host_lanes && policy.cpu_on && policy.cpu_ok;
 #pragma unroll
   for (int j = 0; j < Wire::kLanes; ++j) {
     if (j >= plan.count) break;
     for (int i = 0; i < j; ++i)
       if (expert[i] == expert[j]) __trap();
     const int node = Wire::home(expert[j]);
+    const bool forced = j >= plan.forced_from;
     out.node[j] = node;
     hit[j] = ram[j] >= 0;
     if (hit[j]) {
       if (static_cast<uint32_t>(ram[j]) >= map.row_capacity) __trap();
       out.slot[j] = ram[j];
+    } else if (forced) {
+      out.slot[j] = -1;  // host-placed: the host reads it into a RAM victim of its node
     } else {
       if (m[node] >= Wire::kLanes || staging[node * Wire::kLanes + m[node]] < 0) __trap();
       out.slot[j] = staging[node * Wire::kLanes + m[node]++];
     }
-    eligible[j] = policy.host_lanes && policy.cpu_on && policy.cpu_ok && (hit[j] || policy.cpu_misses);
+    if (forced && !can_cpu) return false;
+    eligible[j] = !forced && can_cpu && (hit[j] || policy.cpu_misses);
     n[node] += eligible[j] ? 1 : 0;
   }
   int take[Wire::kNodes];
@@ -378,8 +390,9 @@ SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
   const bool copy_ok = policy.host_lanes && policy.hit_copy_ce && policy.ce_ok;
   for (int64_t j = plan.count - 1; j >= 0; --j) {
     const int node = out.node[j];
-    const bool cpu = take[node] > 0 && eligible[j];
-    if (cpu) --take[node];
+    const bool forced = j >= plan.forced_from;
+    const bool cpu = forced || (take[node] > 0 && eligible[j]);
+    if (cpu && !forced) --take[node];
     uint8_t kind;
     if (cpu) {
       kind = hit[j] ? Wire::kKindHitCpu : Wire::kKindMissCpu;
@@ -390,6 +403,7 @@ SGL_DEVICE void type_lanes(const LanePlan& plan, const RowMap& map, const LanePo
     }
     out.kind[j] = kind;
   }
+  return true;
 }
 
 }  // namespace device::expert_stream

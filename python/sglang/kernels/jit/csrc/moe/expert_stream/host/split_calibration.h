@@ -51,7 +51,9 @@ struct CalibrationSetup {
   std::vector<CopyEntry> entries;  // the entries production's DMA copies
   CopyBackend* backend = nullptr;
   HostCopyBackend* host_backend = nullptr;  // set: release each mark (the test backend completes only released ones)
-  uint64_t scratch = 0;                     // kCalibLanes experts: entry e's rows at its own offset
+  uint64_t scratch = 0;                     // `lanes` experts: entry e's rows at its own offset
+  int lanes = kCalibLanes;  // the most lanes measured, 1..kCalibLanes (spill: the victim lanes)
+  int tokens = 1;           // above 1: the CPU jobs are per_token, of this many rows (a verify's), as a record's are
   int reps = 1;                             // timed repetitions per cell, after one discarded warm-up
   int64_t timeout_ns = 0;                   // per measurement
 };
@@ -64,7 +66,7 @@ inline int64_t calibration_expert_bytes(std::span<const CopyEntry> entries) {
   return bytes;
 }
 
-// Runs k CPU lanes on host slots first_slot.. first_slot + k - 1 and the DMA of m experts from the k slots after them,
+// Runs k CPU lanes (per_token jobs of s.tokens rows when that is above 1) on host slots first_slot.. first_slot + k - 1 and the DMA of m experts from the k slots after them,
 // started together, and returns the ns from the start until both are observed done (queueing and wake-up included).
 // Either side may be empty. Throws on a failed copy, a full CPU ring, or past the timeout.
 inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
@@ -75,9 +77,11 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
     job.row = s.row;
     job.part = 0;
     job.k = k;
+    job.per_token = s.tokens > 1;  // the token table (write_calibration_table) routes every token to every lane
     for (int i = 0; i < k; ++i) {
       job.slots[i] = static_cast<int32_t>(s.first_slot + i);
       job.weights[i] = 1.0f;
+      job.lanes[i] = i;
     }
     job.seq = seq = s.cpu->claim(1);
     if (!s.cpu->submit(job)) throw std::runtime_error("calibration: the CPU expert ring is full");
@@ -92,7 +96,7 @@ inline int64_t calibration_run(const CalibrationSetup& s, int k, int m) {
         if (const int r = s.backend->issue(base + static_cast<uint64_t>(j) * bytes, src, entry.bytes))
           throw std::runtime_error("calibration: a DMA issue failed (" + std::to_string(r) + ")");
       }
-      base += static_cast<uint64_t>(kCalibLanes) * bytes;
+      base += static_cast<uint64_t>(s.lanes) * bytes;
     }
     if (const int r = s.backend->mark(&token))
       throw std::runtime_error("calibration: a DMA mark failed (" + std::to_string(r) + ")");
@@ -135,11 +139,11 @@ inline double calibration_mean_ms(const CalibrationSetup& s, int k, int m) {
 // Fills `out` (kCalibRows x kCalibCols doubles, layout above) with the mean ms of every cell.
 inline void calibrate_split(const CalibrationSetup& s, double* out) {
   std::fill(out, out + kCalibRows * kCalibCols, 0.0);
-  for (int k = 1; k <= kCalibLanes; ++k)
+  for (int k = 1; k <= s.lanes; ++k)
     out[k] = calibration_mean_ms(s, k, 0);
-  for (int m = 1; m <= kCalibLanes; ++m)
+  for (int m = 1; m <= s.lanes; ++m)
     out[kCalibCols + m] = calibration_mean_ms(s, 0, m);
-  for (int n = 1; n <= kCalibLanes; ++n)
+  for (int n = 1; n <= s.lanes; ++n)
     for (int k = 0; k <= n; ++k)
       out[(1 + n) * kCalibCols + k] = calibration_mean_ms(s, k, n - k);
 }

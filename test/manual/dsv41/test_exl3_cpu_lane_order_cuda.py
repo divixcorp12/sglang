@@ -28,6 +28,7 @@ from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer, paused  # noqa: 
 
 HIDDEN = 64
 READY_STATE, FREE_STATE = 3, 0  # expert_residency_gpu's _READY and _FREE
+STAGING_STATE = 3  # slot_info's state of a staging slot (tier_protocol.h: kFree 0, kReady 2, kStaging 3)
 
 
 def _until(predicate, timeout_s=10.0):
@@ -364,6 +365,163 @@ def test_cpu_lanes_past_bit_7_reach_the_route_tables_and_the_direct_gather(miss_
     torch.cuda.synchronize()
     assert slot_to_expert[:count].tolist() == list(range(8)) + [experts - 1 - s for s in range(8, count)]
     assert (insertions.item(), truncated.item()) == (8, 0)
+
+
+def test_a_40_lane_build_carries_36_cpu_lanes_through_cw_and_cc(tmp_path):
+    """Lanes 32-35 live in the masks' high words: CW marks all 36 RAM-hit lanes CPU, CC publishes {low, parts, high},
+    and the host's cpu_mask hands all 36 RAM slots to one CPU job. Mutation: keep CW's mask a u32 -- lanes 32-35 are
+    lost and the copy wait never covers them."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    row, lanes, experts = 0, 40, list(range(36))
+    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=80, staging=36,
+              experts=40)  # the rig's default 16 experts would leave 36 routes past the slot map
+    try:
+        x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
+        out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), list(range(lanes + 1)), cores, x_rows,
+                                  out_rows, threads=2)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
+        backend, plan, dev = c.backends[row], c.plans[row], c.dev
+        assert (dev.ce_mask.numel(), dev.cpu_lanes.numel()) == (5, 3)
+        c.plan(experts, row)
+        c.gather(row)
+        torch.cuda.synchronize()
+        assert c.handled() and set(experts) <= c.resident(row)
+        with paused(c.host):
+            ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        c.host.arm_copy_engine()
+        backend._stage_planned(plan)
+        x = torch.randn(1, HIDDEN, device="cuda").half()
+        dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True,
+                 cpu_input=(x, torch.ones(36, device="cuda")))
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+        assert _until(lambda: len(c.host.test_kernel_calls()) == 1)
+        torch.cuda.synchronize()
+        assert c.kinds(36) == [int(LaneKind.HIT_CPU)] * 36
+        assert dev.cpu_lanes.tolist() == [-1, PART_HITS, 0xF]
+        (call,) = c.host.test_kernel_calls()
+        assert sorted(call["slots"]) == sorted(ram_slot[e] for e in experts)
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("tokens", [1, 3])
+def test_a_verify_records_cpu_lanes_run_one_forward_of_its_tokens(tmp_path, tokens):
+    """Three RAM hits, every lane the CPU's (split[3] = 3), in rows that hold 4 tokens. The record's CPU job runs one
+    forward of `tokens` rows: row t names a lane's RAM slot only where token t routes its expert (-1 elsewhere, Review
+    Focus 4) with t's own weight, and its output row is t's partial alone, over stale bytes (7.0). One token in 4-token
+    rows reads the table too. Mutations: every row the record's summed weight; the slot kept where t does not route;
+    no zeroing of a non-accumulating job's rows."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    row, experts, tokens_max = 0, [3, 5, 7], 4
+    lanes = lease.wire_layout(8).lanes
+    c = Chain(tmp_path, copy_engine=True, start=False)
+    try:
+        x_rows = torch.zeros((LAYERS, lease.cpu_row_bytes(HIDDEN, tokens_max, lanes)), dtype=torch.uint8).pin_memory()
+        out_rows = torch.full((LAYERS, 2, tokens_max, HIDDEN), 7.0, dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(), list(range(lanes + 1)), cores, x_rows, out_rows,
+                                  threads=2)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
+        backend, plan, dev = c.backends[row], c.plans[row], c.dev
+        c.plan(experts, row)
+        c.gather(row)
+        torch.cuda.synchronize()
+        assert c.handled() and set(experts) <= c.resident(row)
+        with paused(c.host):
+            ram_slot = {e: s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if e >= 0}
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        c.host.arm_copy_engine()
+
+        c.plan(experts, row)
+        backend._stage_planned(plan)
+        planned = backend.planned[:3].tolist()
+        routes = [[3, 5, 8, 9, 10, 11], [7, 3, 12, 13, 14, 15], [5, 8, 12, 9, 13, 10]][:tokens]
+        weights = torch.tensor([[0.01 * (10 * t + i + 1) for i in range(TOP_K)] for t in range(tokens)], device="cuda")
+        route_ids = torch.tensor(sum(routes, []), dtype=torch.int64, device="cuda")
+        x = torch.randn(tokens, HIDDEN, device="cuda").half()
+        dev.post(row, backend.planned, plan.count, route_ids, plan.slots, captured=True, cpu_input=(x, weights))
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+        assert _until(lambda: len(c.host.test_kernel_calls()) == tokens)
+        torch.cuda.synchronize()
+
+        assert c.kinds(3) == [LaneKind.HIT_CPU] * 3
+        assert dev.cpu_lanes.tolist() == [0b111, PART_HITS]
+        for t, call in enumerate(c.host.test_kernel_calls()):
+            want_slots = [ram_slot[e] if e in routes[t] else -1 for e in planned]
+            want_weights = [float(weights[t, routes[t].index(e)]) if e in routes[t] else 0.0 for e in planned]
+            assert call["slots"] == want_slots, (t, call)
+            assert call["weights"] == pytest.approx(want_weights), (t, call)
+            assert call["accumulate"], "a per-token job accumulates into the rows the engine zeroed"
+            partial = sum(w * (s + 1) for s, w in zip(want_slots, want_weights))
+            assert torch.allclose(out_rows[row, 0, t], torch.full((HIDDEN,), partial), atol=1e-4), t
+    finally:
+        c.close()
+
+
+def test_36_forced_cpu_misses_on_one_node_are_read_into_ram_victims(tmp_path):
+    """Review Focus 2 at the record's full width: 36 cold experts on one node, every lane forced (no VRAM victim:
+    MISS_CPU, slot -1). The host reads each into a RAM victim of the row's own tier, the CPU computes it there (part 1),
+    and the tier maps it afterwards. No staging slot is touched, nothing overflows, the device's count stands.
+    Mutations: read a forced miss into a staging slot (the 7th of the 6 collides); skip the insert (the experts are not
+    resident afterwards)."""
+    from sglang.kernels.ops.moe.expert_cache_transfer import copy_expert_row_segments_gpu
+
+    row, lanes, experts = 0, 40, list(range(36))
+    c = Chain(tmp_path, copy_engine=True, start=False, lanes=lanes, top_k=36, dst_rows=36, capacity=48,
+              experts=40)  # the rig's default 16 experts would leave 36 routes past the slot map
+    try:
+        x_rows = torch.zeros((LAYERS, 2 * HIDDEN), dtype=torch.uint8).pin_memory()
+        out_rows = torch.zeros((LAYERS, 2, HIDDEN), dtype=torch.float32).pin_memory()
+        cores = sorted(os.sched_getaffinity(0))[:2]
+        c.host.enable_cpu_experts(c.host.test_kernel_address(zero=True), [0] * (lanes + 1), cores, x_rows, out_rows,
+                                  threads=2)
+        c.host.start_thread(fatal_wait_s=60.0)
+        c.dev.enable_cpu_experts(x_rows, out_rows)
+        c.dev.set_row_cpu(row)
+        c.host.set_cpu_layer(row, fake_cpu_layer(HIDDEN))
+        c.host.arm_copy_engine()
+        backend, plan, dev = c.backends[row], c.plans[row], c.dev
+        with paused(c.host):
+            staging_before = [s for s, (state, e, _) in enumerate(c.host.slot_info(row)) if state == STAGING_STATE]
+        c.plan(experts, row)
+        plan.slots[:36] = -1  # every lane forced
+        backend._stage_planned(plan)
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        overflows = torch.zeros(1, dtype=torch.int64, device="cuda")
+        x = torch.randn(1, HIDDEN, device="cuda").half()
+        dev.post(row, backend.planned, plan.count, backend.routes, plan.slots, captured=True,
+                 cpu_input=(x, torch.ones(36, device="cuda")), spill=(flag, overflows))
+        copy_expert_row_segments_gpu(backend.segments[0], dev.host_rows_1, dev.dst_slots_1, dev.go_1)
+        dev.stream(row, backend.planned, plan.count, plan.slots, backend.segments[0], backend.stream_maps[0])
+        dev.copy_wait(plan.count, plan.slots, backend.copy_sm_table)
+        torch.cuda.synchronize()
+        assert c.handled()
+        assert (int(plan.count[0]), int(flag.item())) == (36, 0)
+        assert c.kinds(36) == [int(LaneKind.MISS_CPU)] * 36
+        assert dev.cpu_lanes.tolist() == [-1, PART_MISSES, 0xF]
+        assert set(experts) <= c.resident(row), "every forced miss is cached in the RAM victim it was read into"
+        with paused(c.host):
+            info = c.host.slot_info(row)
+            slot_of = {e: s for s, (state, e, _) in enumerate(info) if e >= 0}
+            staging_after = [s for s, (state, e, _) in enumerate(info) if state == STAGING_STATE]
+        assert staging_after == staging_before, "no staging slot was used"
+        computed = sorted(s for call in c.host.test_kernel_calls() for s in call["slots"])
+        assert computed == sorted(slot_of[e] for e in experts)
+    finally:
+        c.close()
 
 
 if __name__ == "__main__":

@@ -2,8 +2,9 @@
 exl3_moe_loop on the GPU, at the target's 3 and the draft's 4 bits; a captured call replays what eager computes; an eager
 call reads nothing from the device.
 
-Run on divix01 with the GPU lock, EXL3_MOE_CPU_PIN=0, SGLANG_DSV41_CPU_EXPERTS=1 and SGLANG_EXL3_SRC set (the
-optimized CPU kernel's build):
+Run on divix01 with the GPU lock, EXL3_MOE_CPU_PIN=0, SGLANG_EXL3_CPU_ACT_RESIDUAL=1, SGLANG_EXL3_CPU_ACT_BLOCK=128 and
+SGLANG_EXL3_SRC set (the optimized CPU kernel's build). Not SGLANG_DSV41_CPU_EXPERTS=1: that puts the draft on the
+RAM-miss service's team, and this is the draft-only shape:
   flock .../cc-gpu.lock taskset -c 6-17,32-63 python -m pytest test/manual/dsv41/test_dspark_hybrid_draft_gpu.py -s
 """
 

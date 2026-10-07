@@ -1,6 +1,7 @@
 """The expert-caching server-args gate accepts Window C's EXL3 launches (CPU)."""
 
 import json
+import os
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -169,19 +170,19 @@ def test_dspark_verify_in_the_breakable_decode_graph_passes(model_dir):
     "launch_changes, env_changes, match",
     [
         ({"speculative_algorithm": "EAGLE"}, GRAPHED_VERIFY, "graphs the verify of DSpark only"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-32"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 33}, "MISS_LANES=1-32"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-64"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 65}, "MISS_LANES=1-64"),
         ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_HOT_INSERT_ON_MISS_STAGE": 1}, "INSERT_ON_MISS_STAGE=2"),
         ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER": False}, "SGLANG_MOE_EXPERT_GRAPH_GATHER=1"),
         ({}, {**GRAPHED_VERIFY, "SGLANG_RAGGED_VERIFY_MODE": "compact"}, "SGLANG_RAGGED_VERIFY_MODE=static"),
-        ({}, {**GRAPHED_VERIFY, "SGLANG_DSV41_CPU_EXPERTS": True}, "without speculative decoding"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_DSV41_CPU_EXPERTS": True}, "SGLANG_DSV41_CPU_EXPERTS needs"),
     ],
 )
 def test_a_graphed_dspark_verify_needs_its_configuration(model_dir, launch_changes, env_changes, match):
     launch = dict(speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1) | launch_changes
     with pytest.raises(ValueError, match=match) as raised:
         _gate(_launch(model_dir, **launch), **env_changes)
-    if match != "without speculative decoding":
+    if match != "SGLANG_DSV41_CPU_EXPERTS needs":
         assert "--cuda-graph-backend-decode disabled" in str(raised.value)
 
 
@@ -419,18 +420,16 @@ _EAGER_DECODE = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": False}
     [
         ({}, _EAGER_DECODE),  # both phases disabled
         ({"cuda_graph_config": FULL_BS1}, {}),
-        ({"speculative_algorithm": "DSPARK", "cuda_graph_config": BREAKABLE_BS1}, {}),
         ({"speculative_algorithm": "DSPARK"}, _EAGER_DECODE),
     ],
-    ids=["disabled", "full", "spec-breakable", "spec-disabled"],
+    ids=["disabled", "full", "spec-disabled"],
 )
-def test_cpu_experts_need_the_breakable_decode_graph_without_speculation(model_dir, changes, env):
-    """Refused before the speculative and backend rules, which would each send the launch to the other's backend.
-
-    The refusal never suggests disabled decode graphs.
-    """
-    with pytest.raises(ValueError, match="breakable, without speculative decoding") as refused:
-        _gate(_launch(model_dir, **changes), **{**CPU_EXPERTS_ENV, **env})
+def test_cpu_experts_need_the_breakable_decode_graph(model_dir, changes, env):
+    """Refused before the speculative and backend rules; the refusal never suggests disabled decode graphs."""
+    args = _launch(model_dir, **changes)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    with pytest.raises(ValueError, match="pass --cuda-graph-backend-decode breakable") as refused:
+        _gate(args, **{**CPU_EXPERTS_ENV, **env})
     assert "disabled" not in str(refused.value)
 
 
@@ -544,3 +543,133 @@ def test_dspark_cpu_experts_need_the_optimized_cpu_kernel_build(model_dir, cpu_p
     fail at its first step, after the model loaded."""
     with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ACT_RESIDUAL=1"):
         _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **{**DSPARK_CPU_ENV, **unset})
+
+
+DSPARK_BREAKABLE = dict(speculative_algorithm="DSPARK", cuda_graph_config=BREAKABLE_BS1)
+# The recipe's DSpark mode: a lane per route (MISS_LANES unset), 8 victim lanes.
+SPILL = {"SGLANG_MOE_EXPERT_GRAPH_GATHER": True, **DIRECT, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": 8}
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [("SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES", "12-15"), ("SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS", 4)],
+)
+def test_draft_cores_are_refused_when_the_draft_shares_the_cpu_team(model_dir, name, value):
+    env = {
+        **CPU_EXPERTS_ENV,
+        **SPILL,
+        "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": True,
+        "SGLANG_EXL3_CPU_ACT_RESIDUAL": True,
+        "SGLANG_EXL3_CPU_ACT_BLOCK": 128,
+        name: value,
+    }
+    # The refusal is an EXL3 rule, so matching it also shows the gate resolved the EXL3 requirements, not the NVFP4
+    # fallback a non-directory model_path gets.
+    with pytest.raises(ValueError, match="shares the GPU node's CPU expert team"):
+        _gate(_launch(model_dir, **DSPARK_BREAKABLE), **env)
+
+
+def _exl3_launch(model_dir, **changes):
+    # Assert the resolved format first: a gate that silently fell back to NVFP4 proves nothing (divix01-run-protocol).
+    args = _launch(model_dir, **changes)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    return args
+
+
+def test_cpu_experts_with_a_graphed_dspark_verify_pass(model_dir):
+    # The envs share SGLANG_MOE_EXPERT_GRAPH_GATHER and the DIRECT pair, so they merge rather than splat twice.
+    _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **SPILL})
+
+
+def test_a_graphed_dspark_verify_with_cpu_experts_needs_victim_lanes(model_dir):
+    """A narrowed MISS_LANES verify with CPU experts and no spill was never run on a GPU; the tested shape is a lane per
+    route plus VICTIM_LANES."""
+    with pytest.raises(ValueError, match="SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES") as refused:
+        _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **GRAPHED_VERIFY})
+    assert "graphed DSpark verify" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "launch, env, match",
+    [
+        ({"speculative_algorithm": "EAGLE"}, GRAPHED_VERIFY, "graphs the verify of DSpark only"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 0}, "MISS_LANES=1-64"),
+        ({}, {**GRAPHED_VERIFY, "SGLANG_RAGGED_VERIFY_MODE": "compact"}, "SGLANG_RAGGED_VERIFY_MODE=static"),
+    ],
+)
+def test_cpu_experts_under_speculation_need_the_graphed_dspark_verify(model_dir, launch, env, match):
+    """The graphed verify's own rules, with a remedy for a CPU-experts launch: the verify must be graphed, so the
+    eager-decode remedy is never offered."""
+    with pytest.raises(ValueError, match=match) as refused:
+        _gate(_exl3_launch(model_dir, **(DSPARK_BREAKABLE | launch)), **{**CPU_EXPERTS_ENV, **env})
+    assert "--cuda-graph-backend-decode disabled" not in str(refused.value)
+    assert "SGLANG_DSV41_CPU_EXPERTS" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "env, match",
+    [
+        ({"SGLANG_DSV41_CPU_EXPERTS": False}, "needs SGLANG_DSV41_CPU_EXPERTS=1"),
+        ({"SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES": 36}, "unset SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"),
+    ],
+)
+def test_victim_lanes_need_cpu_experts_and_a_lane_per_route(model_dir, env, match):
+    """Spill's victimless lanes are the CPU's, and its record has a lane per route, so a 6-token verify never
+    outnumbers its lanes (Review Focus 5)."""
+    with pytest.raises(ValueError, match=match):
+        _gate(_exl3_launch(model_dir, **DSPARK_BREAKABLE), **{**CPU_EXPERTS_ENV, **SPILL, **env})
+
+
+def test_victim_lanes_need_a_dspark_launch(model_dir):
+    """Spill is the graphed DSpark verify's mode; on a non-speculative batch-size-1 launch V=4 would spill two of six
+    routes, an untested mode."""
+    with pytest.raises(ValueError, match="--speculative-algorithm DSPARK"):
+        _gate(_exl3_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**CPU_EXPERTS_ENV, **SPILL})
+
+
+@pytest.fixture
+def top_k_6_model_dir(model_dir):
+    path = os.path.join(model_dir, "config.json")
+    with open(path) as stream:
+        config = json.load(stream)
+    config["num_experts_per_tok"] = 6
+    with open(path, "w") as stream:
+        json.dump(config, stream)
+    return model_dir
+
+
+@pytest.mark.parametrize("victims, passes", [(35, True), (36, False), (64, False)])
+def test_victim_lanes_stay_below_the_verify_routes(top_k_6_model_dir, victims, passes):
+    """Block size 5 verifies 6 tokens x top-k 6 = 36 routes; _init_insert_direct refuses V >= 36 after the load, so the
+    gate refuses it first."""
+    launch = _exl3_launch(top_k_6_model_dir, speculative_dspark_block_size=5, **DSPARK_BREAKABLE)
+    env = {**CPU_EXPERTS_ENV, **SPILL, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": victims}
+    if passes:
+        _gate(launch, **env)
+    else:
+        with pytest.raises(ValueError, match="below the 36 routes"):
+            _gate(launch, **env)
+
+
+def test_victim_lanes_are_unbounded_when_the_top_k_is_unknown(model_dir):
+    """A config.json without num_experts_per_tok gives the gate no top-k; it bounds nothing rather than guess."""
+    launch = _exl3_launch(model_dir, speculative_dspark_block_size=5, **DSPARK_BREAKABLE)
+    _gate(launch, **{**CPU_EXPERTS_ENV, **SPILL, "SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES": 64})
+
+
+def test_the_recipe_budget_a_passes_with_both_cpu_expert_clients(top_k_6_model_dir, cpu_pin_off):
+    """benchmarks/dsv41_baseline/arm_env.py dspark_env(): block size 5 (6 tokens x top-k 6 = 36 lanes), 8 victim lanes,
+    the target's and the draft's CPU experts together on the optimized build."""
+    launch = _exl3_launch(top_k_6_model_dir, speculative_dspark_block_size=5, **DSPARK_BREAKABLE)
+    _gate(
+        launch,
+        **{
+            **CPU_EXPERTS_ENV,
+            **SPILL,
+            "SGLANG_RAGGED_VERIFY_MODE": "static",
+            "SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS": True,
+            "SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES": "",
+            "SGLANG_EXL3_CPU_ACT_RESIDUAL": True,
+            "SGLANG_EXL3_CPU_ACT_BLOCK": 128,
+        },
+    )

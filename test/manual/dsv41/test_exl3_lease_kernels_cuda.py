@@ -288,7 +288,8 @@ def test_the_post_record_round_trips_at_every_lane_width(lanes, count):
         torch.ones(1, dtype=torch.int64, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda"),
         zeros_u8, zeros_u8.clone(), torch.zeros(1, dtype=torch.int32, device="cuda"), row_capacity, 0, 0, 0,
         out["kind"], out["slot"], torch.zeros(w.lanes, dtype=torch.int32, device="cuda"),
-        torch.zeros(1, dtype=torch.int32, device="cuda"), host_rows_1, out["dst_1"], no_i32, 0, no_i32, 0,
+        torch.zeros(1, dtype=torch.int32, device="cuda"), host_rows_1, out["dst_1"], no_i32, 0, no_i32, 1, 16, 0,
+        torch.zeros(1, dtype=torch.int32, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda"), 0,
     )
     torch.cuda.synchronize()
     record = page[w.demand_ring : w.demand_ring + w.record_bytes].clone()
@@ -349,14 +350,15 @@ def _raw_post(lanes, nodes, planned, ram, staging, split=None, captured=False, c
         torch.ones(1, dtype=torch.int64, **cuda), torch.zeros(1, dtype=torch.int64, **cuda),
         zeros_u8, torch.ones(1, dtype=torch.uint8, **cuda), torch.full((1,), w.lanes, dtype=torch.int32, **cuda), 64,
         0, int(cpu_on), 0, out["kind"], out["slot"], out["node"], torch.zeros(1, dtype=torch.int32, **cuda),
-        torch.zeros(w.lanes, dtype=torch.int64, **cuda), out["dst_1"], *cpu_args, 0,
+        torch.zeros(w.lanes, dtype=torch.int64, **cuda), out["dst_1"], *cpu_args, 1, 32, 0,
+        torch.zeros(1, dtype=torch.int32, **cuda), torch.zeros(1, dtype=torch.int64, **cuda), 0,
     )
     torch.cuda.synchronize()
     del cpu_buf
     return [out[n][:count].tolist() for n in ("kind", "slot", "node")]
 
 
-@pytest.mark.parametrize("lanes", [8, 16, 32])
+@pytest.mark.parametrize("lanes", [8, 16, 32, 40])
 @pytest.mark.parametrize("nodes", [1, 2])
 def test_each_miss_takes_the_next_staging_slot_of_its_home_node(lanes, nodes):
     """The device's typing equals ram_slot_map.type_lanes's on random plans of hits and misses on every node."""

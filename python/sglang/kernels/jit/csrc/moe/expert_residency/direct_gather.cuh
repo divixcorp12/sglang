@@ -13,6 +13,7 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>
 
+#include "../expert_stream/lane_mask.cuh"
 #include "../expert_stream/tensor_checks.h"
 #include <stdint.h>
 #include <type_traits>
@@ -86,6 +87,79 @@ __global__ __launch_bounds__(kDirectGatherWarp, 1) void direct_gather_destinatio
   }
 }
 
+// The same for a shortlist of 33-64 entries (a verify with a lane per route): two warps, thread j owns entry j, and the
+// usable entries' order crosses the warps through per-warp counts. Same outputs as the torch chain; the narrow kernel
+// above is left as it was for the one-token build. A lane that is not live gets idle_destination and idle_slot (0 and
+// 0, or slot_dump and -1 under spill: GpuResidencyUpdater._idle_destination).
+template <typename IdT, typename RemapInT, typename RemapOutT>
+__global__ __launch_bounds__(2 * kDirectGatherWarp, 1) void direct_gather_destinations_wide_kernel(
+    const IdT* __restrict__ topk_ids,
+    int top_k,
+    const int64_t* __restrict__ expert_to_slot,
+    const int64_t* __restrict__ victims,
+    const bool* __restrict__ victim_valid,
+    int width,
+    const int32_t* __restrict__ miss_count,
+    const RemapInT* __restrict__ remap_in,
+    int64_t scratch_base,
+    int32_t* __restrict__ destination_slots_out,
+    int64_t* __restrict__ destinations_out,
+    bool* __restrict__ live_out,
+    RemapOutT* __restrict__ remap_out,
+    int64_t idle_destination,
+    int32_t idle_slot) {
+  constexpr int kThreads = 2 * kDirectGatherWarp;
+  __shared__ int64_t usable[kThreads];
+  __shared__ bool usable_valid[kThreads];
+  __shared__ int64_t destinations[kThreads];
+  __shared__ int warp_good[2], warp_bad[2];
+  const int t = static_cast<int>(threadIdx.x);
+  const int warp = t / kDirectGatherWarp;
+  const unsigned lane = static_cast<unsigned>(t % kDirectGatherWarp);
+  const bool entry = t < width;
+  const int64_t victim = entry ? victims[t] : 0;
+  const bool valid = entry && victim_valid[t];
+  bool hazard = false;
+  if (entry) {
+    for (int i = 0; i < top_k; ++i) {
+      hazard |= expert_to_slot[static_cast<int64_t>(topk_ids[i])] == victim;
+    }
+  }
+  const bool good = valid && !hazard;
+  const unsigned good_mask = __ballot_sync(0xffffffffu, entry && good);
+  const unsigned bad_mask = __ballot_sync(0xffffffffu, entry && !good);
+  if (lane == 0) {
+    warp_good[warp] = __popc(good_mask);
+    warp_bad[warp] = __popc(bad_mask);
+  }
+  __syncthreads();
+  const unsigned earlier = (1u << lane) - 1u;
+  const int goods = warp_good[0] + warp_good[1];
+  const int good_before = (warp == 1 ? warp_good[0] : 0) + __popc(good_mask & earlier);
+  const int bad_before = (warp == 1 ? warp_bad[0] : 0) + __popc(bad_mask & earlier);
+  if (entry) {
+    const int position = good ? good_before : goods + bad_before;
+    usable[position] = victim;
+    usable_valid[position] = good;
+  }
+  __syncthreads();
+  if (entry) {
+    const bool live = t < miss_count[0] && usable_valid[t];
+    const int64_t destination = live ? usable[t] : idle_destination;
+    destinations[t] = destination;
+    destinations_out[t] = destination;
+    destination_slots_out[t] = live ? static_cast<int32_t>(destination) : idle_slot;
+    live_out[t] = live;
+  }
+  __syncthreads();
+  for (int i = t; i < top_k; i += kThreads) {
+    const int64_t remap = static_cast<int64_t>(remap_in[i]);
+    int64_t rank = remap - scratch_base;
+    rank = rank < 0 ? 0 : (rank > width - 1 ? width - 1 : rank);
+    remap_out[i] = static_cast<RemapOutT>(remap >= scratch_base ? destinations[rank] : remap);
+  }
+}
+
 // GpuResidencyUpdater.commit_gather + _commit_gather, for one layer. One thread, in the torch chain's order: the
 // chain is a sequence of scatters whose later writes overwrite earlier ones on shared indices (the dump columns), so
 // running it serially is what keeps every final value, dump columns included, identical.
@@ -95,6 +169,7 @@ __global__ __launch_bounds__(kDirectGatherWarp, 1) void direct_gather_destinatio
 // cpu_lanes (CPU experts, plan 2026-09-29-dsv41-cpu-experts; null when off): lanes the CPU expert thread computed from
 // the pinned tier. Nothing copied their destination slots, which still hold their old experts, so they are not live:
 // the mapping keeps the old expert and the expert stays in the pinned tier. They count as delivered, not truncated.
+template <typename MaskT, int kMaxWidth>
 __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
     const int64_t* __restrict__ destinations,
     const bool* __restrict__ live_in,
@@ -115,16 +190,16 @@ __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
     const int32_t* __restrict__ cpu_lanes,
     uint8_t ready,
     uint8_t free_state) {
-  // Word 0 of CC's pair: the CPU lanes.
-  const uint32_t cpu = cpu_lanes != nullptr ? static_cast<uint32_t>(cpu_lanes[0]) : 0u;
-  bool live[kDirectGatherWarp];
-  bool evicted[kDirectGatherWarp];
-  int64_t old_expert[kDirectGatherWarp];
+  // Word 0 of CC's words: the CPU lanes' low half; a wide build's word 2 is the high half.
+  const MaskT cpu = cpu_lanes != nullptr ? expert_stream::load_lane_mask<MaskT>(cpu_lanes, cpu_lanes + 2) : MaskT{0};
+  bool live[kMaxWidth];
+  bool evicted[kMaxWidth];
+  int64_t old_expert[kMaxWidth];
   const bool good = delivered == nullptr || keep[0] > 0.0f;
   int64_t live_sum = 0;
   int64_t evicted_sum = 0;
   for (int j = 0; j < width; ++j) {
-    live[j] = live_in[j] && (delivered == nullptr || (j < delivered[0] && good)) && (cpu >> j & 1u) == 0;
+    live[j] = live_in[j] && (delivered == nullptr || (j < delivered[0] && good)) && (cpu >> j & MaskT{1}) == 0;
     old_expert[j] = slot_to_expert[destinations[j]];
     evicted[j] = live[j] && old_expert[j] >= 0;
     live_sum += live[j];
@@ -151,7 +226,7 @@ __global__ __launch_bounds__(1, 1) void direct_commit_gather_kernel(
   gather_insertions[0] += live_sum;
   gather_evictions[0] += evicted_sum;
   if (delivered != nullptr) {
-    insertion_truncated[0] += (static_cast<int64_t>(delivered[0]) - __popc(cpu) > live_sum) && good;
+    insertion_truncated[0] += (static_cast<int64_t>(delivered[0]) - expert_stream::lane_count(cpu) > live_sum) && good;
   } else {
     insertion_truncated[0] += static_cast<int64_t>(miss_count[0]) > live_sum;
   }
@@ -180,7 +255,9 @@ void direct_gather_destinations_gpu(
     tvm::ffi::TensorView destination_slots_out,
     tvm::ffi::TensorView destinations_out,
     tvm::ffi::TensorView live_out,
-    tvm::ffi::TensorView remap_out) {
+    tvm::ffi::TensorView remap_out,
+    int64_t idle_destination,
+    int64_t idle_slot) {
   using namespace host;
   static_assert(
       (std::is_same_v<IdT, int32_t> || std::is_same_v<IdT, int64_t>) &&
@@ -210,29 +287,37 @@ void direct_gather_destinations_gpu(
   verify_bool_named("live_out", TensorMatcher({W_}).with_device<kDLCUDA>(device), live_out);
   expert_stream::verify_named(
       "remap_out", TensorMatcher({K_}).with_dtype<RemapOutT>().template with_device<kDLCUDA>(device), remap_out);
-  RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= kDirectGatherWarp, "the shortlist must hold 1-32 entries");
+  RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= 2 * kDirectGatherWarp, "the shortlist must hold 1-64 entries");
   RuntimeCheck(0 < K_.unwrap() && K_.unwrap() <= kDirectGatherMaxRoutes, "the routes must hold 1-64 entries");
   const auto stream = host::LaunchKernel::resolve_device(topk_ids.device());
-  host::LaunchKernel(1, kDirectGatherWarp, stream)(
-      direct_gather_destinations_kernel<IdT, RemapInT, RemapOutT>,
-      static_cast<const IdT*>(topk_ids.data_ptr()),
-      static_cast<int>(topk_ids.numel()),
-      static_cast<const int64_t*>(expert_to_slot.data_ptr()),
-      static_cast<const int64_t*>(victims.data_ptr()),
-      static_cast<const bool*>(victim_valid.data_ptr()),
-      static_cast<int>(victims.numel()),
-      static_cast<const int32_t*>(miss_count.data_ptr()),
-      static_cast<const RemapInT*>(remap_in.data_ptr()),
-      scratch_base,
-      static_cast<int32_t*>(destination_slots_out.data_ptr()),
-      static_cast<int64_t*>(destinations_out.data_ptr()),
-      static_cast<bool*>(live_out.data_ptr()),
-      static_cast<RemapOutT*>(remap_out.data_ptr()));
+  const bool wide = W_.unwrap() > kDirectGatherWarp || idle_destination != 0 || idle_slot != 0;
+  const auto ids = static_cast<const IdT*>(topk_ids.data_ptr());
+  const int routes = static_cast<int>(topk_ids.numel());
+  const auto to_slot = static_cast<const int64_t*>(expert_to_slot.data_ptr());
+  const auto victim_ids = static_cast<const int64_t*>(victims.data_ptr());
+  const auto valid = static_cast<const bool*>(victim_valid.data_ptr());
+  const int width = static_cast<int>(victims.numel());
+  const auto count = static_cast<const int32_t*>(miss_count.data_ptr());
+  const auto remap = static_cast<const RemapInT*>(remap_in.data_ptr());
+  const auto slots = static_cast<int32_t*>(destination_slots_out.data_ptr());
+  const auto dests = static_cast<int64_t*>(destinations_out.data_ptr());
+  const auto live = static_cast<bool*>(live_out.data_ptr());
+  const auto out = static_cast<RemapOutT*>(remap_out.data_ptr());
+  if (wide) {
+    host::LaunchKernel(1, 2 * kDirectGatherWarp, stream)(
+        direct_gather_destinations_wide_kernel<IdT, RemapInT, RemapOutT>,
+        ids, routes, to_slot, victim_ids, valid, width, count, remap, scratch_base, slots, dests, live, out,
+        idle_destination, static_cast<int32_t>(idle_slot));
+  } else {
+    host::LaunchKernel(1, kDirectGatherWarp, stream)(
+        direct_gather_destinations_kernel<IdT, RemapInT, RemapOutT>,
+        ids, routes, to_slot, victim_ids, valid, width, count, remap, scratch_base, slots, dests, live, out);
+  }
 }
 
 /// \brief Checked launcher for `direct_commit_gather_kernel`: one layer's DIRECT residency commit.
 ///
-/// The width bound keeps the kernel's 32-entry lane arrays in range. Precondition, not checked (it would need a
+/// The width bound keeps the kernel's lane arrays (32 entries, 64 when wide) in range. Precondition, not checked (it would need a
 /// device sync): every `destinations` entry indexes `slot_to_expert`, and every live lane's `new_experts` entry
 /// indexes `mapping`; the gather kernel and the planner produce both.
 void direct_commit_gather_gpu(
@@ -289,17 +374,22 @@ void direct_commit_gather_gpu(
   }
   expert_stream::verify_named(
       "miss_count", TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), miss_count);
-  RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= kDirectGatherWarp, "the commit must cover 1-32 lanes");
+  RuntimeCheck(0 < W_.unwrap() && W_.unwrap() <= 2 * kDirectGatherWarp, "the commit must cover 1-64 lanes");
+  int64_t words = 0;
   if (cpu_lanes.has_value()) {
     RuntimeCheck(delivered.has_value(), "cpu_lanes needs the leased delivery count");
+    words = cpu_lanes.value().size(0);
+    RuntimeCheck(words == 2 || words == 3, "cpu_lanes: two words, or three for a wide wire");
     expert_stream::verify_named(
-        "cpu_lanes", TensorMatcher({2}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes.value());
+        "cpu_lanes", TensorMatcher({words}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes.value());
   }
+  const bool narrow = W_.unwrap() <= kDirectGatherWarp && words != 3;
   RuntimeCheck(num_experts == E_.unwrap() - 1, "num_experts must be mapping's size minus the dump column");
   RuntimeCheck(slot_dump == S_.unwrap() - 1, "slot_dump must be slot_to_expert's last column");
   const auto stream = host::LaunchKernel::resolve_device(destinations.device());
   host::LaunchKernel(1, 1, stream)(
-      direct_commit_gather_kernel,
+      narrow ? direct_commit_gather_kernel<uint32_t, kDirectGatherWarp>
+             : direct_commit_gather_kernel<uint64_t, 2 * kDirectGatherWarp>,
       static_cast<const int64_t*>(destinations.data_ptr()),
       static_cast<const bool*>(live.data_ptr()),
       static_cast<const int64_t*>(new_experts.data_ptr()),

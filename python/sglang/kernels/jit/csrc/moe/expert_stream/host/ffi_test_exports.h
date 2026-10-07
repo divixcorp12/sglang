@@ -10,10 +10,11 @@
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
-//   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_keep_warm_calls, test_keep_warm_core,
+//   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows, test_keep_warm_calls, test_keep_warm_either_calls,
+//              test_keep_warm_core,
 //              pause_ns
 //   draft      draft_test_post, draft_test_tear, draft_test_finish_close: the draft channel's device half on the host;
-//              draft_test_poll_pause: the draft CPU thread's poll path sleeps between its stop and head loads
+//              draft_test_poll_pause: the draft source's poll path sleeps between its stop and head loads
 //   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: any kernel's make_layer and forward, by layer id;
 //              in both builds, as the DSpark draft's CPU experts call them (cpu_experts/draft.py)
 //
@@ -671,8 +672,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       fail_.store(fail, std::memory_order_relaxed);
       zero_.store(zero, std::memory_order_relaxed);
       held_core_.store(-1, std::memory_order_release);
+      max_rows_.store(1 << 16, std::memory_order_relaxed);
       warm_calls_.store(0, std::memory_order_relaxed);
       warm_core_.store(-1, std::memory_order_relaxed);
+      either_calls_.store(0, std::memory_order_relaxed);
     }
 
     const char* name() const noexcept override {
@@ -688,7 +691,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       return Wire::kLanes;
     }
     int32_t max_rows() const noexcept override {
-      return 1 << 16;
+      return max_rows_.load(std::memory_order_relaxed);
+    }
+    void set_max_rows(int32_t rows) {
+      max_rows_.store(rows, std::memory_order_relaxed);
     }
     void check(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall&) const override {
       if (layer.kernel != this) throw std::invalid_argument("fake CPU expert kernel: another kernel's layer");
@@ -741,6 +747,16 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         _mm_pause();
     }
 
+    void keep_warm_either(std::span<const int> cores, int32_t, const uint32_t* word_a, uint32_t seen_a,
+                          const uint32_t* word_b, uint32_t seen_b, int64_t, int64_t release_ns) const override {
+      warm_calls_.fetch_add(1, std::memory_order_relaxed);
+      either_calls_.fetch_add(1, std::memory_order_relaxed);
+      warm_core_.store(cores.empty() ? -1 : cores.front(), std::memory_order_relaxed);
+      while (__atomic_load_n(word_a, __ATOMIC_ACQUIRE) == seen_a && __atomic_load_n(word_b, __ATOMIC_ACQUIRE) == seen_b &&
+             now_ns() < release_ns)
+        _mm_pause();
+    }
+
     std::vector<Call> calls() const {
       std::lock_guard<std::mutex> lock(mutex_);
       return calls_;
@@ -754,13 +770,18 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     int64_t warm_core() const {
       return warm_core_.load(std::memory_order_relaxed);
     }
+    int64_t either_calls() const {
+      return either_calls_.load(std::memory_order_relaxed);
+    }
 
    private:
     mutable std::mutex mutex_;
     mutable std::vector<Call> calls_;
     std::atomic<int64_t> ns_{0}, fail_{0}, held_core_{-1};
     std::atomic<bool> zero_{false};
+    std::atomic<int32_t> max_rows_{1 << 16};
     mutable std::atomic<int64_t> warm_calls_{0}, warm_core_{-1};
+    mutable std::atomic<int64_t> either_calls_{0};
   };
   static FakeKernel& fake_kernel() {
     static FakeKernel kernel;
@@ -815,11 +836,27 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       fake_kernel().hold(core, on != 0);
     }
   }
+  // Test only: the fake's max_rows (a real kernel's kMaxRows is 65536), set after test_kernel_address, which restores it.
+  static void test_kernel_max_rows(int64_t rows) {
+    if constexpr (!Build::kFaults) {
+      test_only("test_kernel_max_rows");
+    } else {
+      fake_kernel().set_max_rows(static_cast<int32_t>(rows));
+    }
+  }
   static int64_t test_keep_warm_calls() {
     if constexpr (!Build::kFaults) {
       test_only("test_keep_warm_calls");
     } else {
       return fake_kernel().warm_calls();
+    }
+  }
+  // Test only: how many of the fake's keep-warm calls were keep_warm_either (the two-word hold).
+  static int64_t test_keep_warm_either_calls() {
+    if constexpr (!Build::kFaults) {
+      test_only("test_keep_warm_either_calls");
+    } else {
+      return fake_kernel().either_calls();
     }
   }
   // Test only: the first core the fake keep-warm's last call took (-1 before any call since test_kernel_address).
@@ -1233,7 +1270,9 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_address, Exports::test_kernel_address);   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_calls, Exports::test_kernel_calls);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_hold, Exports::test_kernel_hold);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_max_rows, Exports::test_kernel_max_rows);   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_calls, Exports::test_keep_warm_calls); \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_either_calls, Exports::test_keep_warm_either_calls); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_core, Exports::test_keep_warm_core);   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_post, Exports::draft_test_post);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_tear, Exports::draft_test_tear);           \

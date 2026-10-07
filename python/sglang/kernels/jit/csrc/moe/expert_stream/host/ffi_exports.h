@@ -18,7 +18,6 @@
 #include "../tensor_checks.h"
 #include "build_policy.h"
 #include "core_topology.h"
-#include "draft_cpu_thread.h"
 #include "ram_thread.h"
 #include "row_reader.h"
 
@@ -440,6 +439,7 @@ struct HostExports {
       TensorView out_rows,
       int64_t hidden,
       int64_t parts,
+      int64_t tokens,
       int64_t threads,
       int64_t spin_ns,
       int64_t keep_warm_ns) {
@@ -466,11 +466,22 @@ struct HostExports {
       throw std::runtime_error(error_prefix<Layout>() + "CPU experts write 1 or 2 output parts");
     if (group < 0 || group >= expert_stream::Wire::kNodes)
       throw std::runtime_error(error_prefix<Layout>() + "CPU experts name a group the build does not have");
-    if (out_rows.size(1) < expert_stream::Wire::kNodes * parts * hidden)
+    if (tokens < 1 || tokens > expert_stream::CpuTokenTable::kMaxTokens)
+      throw std::runtime_error(error_prefix<Layout>() + "CPU expert rows hold 1-32 tokens");
+    if (tokens > 1 && parts != 2)
+      throw std::runtime_error(error_prefix<Layout>() + "a multi-token CPU expert row has two parts per group");
+    config.tokens = tokens;
+    config.x_token_bytes = (2 * hidden + 15) / 16 * 16;
+    const int64_t table = tokens > 1 ? expert_stream::CpuTokenTable::kHeaderBytes +
+                                           4 * expert_stream::Wire::kLanes * (1 + tokens)
+                                     : 0;
+    if (x_rows.size(1) < tokens * config.x_token_bytes + table)
+      throw std::runtime_error(error_prefix<Layout>() + "x_rows is narrower than its tokens and token table");
+    if (out_rows.size(1) < expert_stream::Wire::kNodes * parts * tokens * hidden)
       throw std::runtime_error(error_prefix<Layout>() + "out_rows is narrower than every group's parts");
-    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr()) + group * parts * hidden * sizeof(float);
+    config.out_base = static_cast<uint8_t*>(out_rows.data_ptr()) + group * parts * tokens * hidden * sizeof(float);
     config.out_stride = out_rows.size(1) * static_cast<int64_t>(sizeof(float));
-    config.out_part_stride = parts == 2 ? hidden * static_cast<int64_t>(sizeof(float)) : 0;
+    config.out_part_stride = parts == 2 ? tokens * hidden * static_cast<int64_t>(sizeof(float)) : 0;
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
     config.spin_ns = spin_ns;
@@ -498,26 +509,71 @@ struct HostExports {
         row, layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params));
   }
 
-  // The DSpark draft's CPU threads (draft_cpu_thread.h), by handle. Shared so a stop on one thread and stats on another
-  // never free a thread under a call.
+  // A DSpark draft-only launch's engine (the target's CPU experts off): node 0's team with the draft channel its only
+  // job source (CpuExpertConfig::draft_only), built at draft_cpu_start once every stage has a layer.
+  struct DraftOnly {
+    CpuExpertConfig config;
+    std::unique_ptr<DraftSource> source;
+    int64_t fatal_wait_ns = 0;
+    std::unique_ptr<CpuExpertEngine> engine;
+  };
+
+  // The draft-only launch's engines, by handle. Shared so a stop on one thread and stats on another never free an
+  // engine under a call.
   static std::mutex& draft_mutex() {
     static std::mutex mutex;
     return mutex;
   }
-  static std::map<int64_t, std::shared_ptr<draft::DraftCpuThread>>& draft_registry() {
-    static std::map<int64_t, std::shared_ptr<draft::DraftCpuThread>> threads;
-    return threads;
+  static std::map<int64_t, std::shared_ptr<DraftOnly>>& draft_registry() {
+    static std::map<int64_t, std::shared_ptr<DraftOnly>> engines;
+    return engines;
   }
-  static std::shared_ptr<draft::DraftCpuThread> find_draft(int64_t handle) {
+  static std::shared_ptr<DraftOnly> find_draft(int64_t handle) {
     std::lock_guard<std::mutex> guard(draft_mutex());
     const auto found = draft_registry().find(handle);
     if (found == draft_registry().end()) throw std::runtime_error("DSpark draft CPU experts: no thread " + std::to_string(handle));
     return found->second;
   }
 
-  // Opens a draft CPU thread over a DraftCpuAreas (dspark_draft_cpu.py): `channel` uint8 [kChannelBytes], 128-byte
-  // aligned; `x` fp16 [stages, kMaxRows, hidden]; `slots` int32 and `weights` fp32 [stages, kMaxRows, kMaxK]; `out` fp32
-  // [stages, kMaxRows, hidden], all in host memory and alive until draft_cpu_stop. `cores` int64 [n] as
+  // The draft channel's areas as a DraftSource (dspark_draft_cpu.py's DraftCpuAreas): `channel` uint8 [kChannelBytes],
+  // 128-byte aligned; `x` fp16 [stages, kMaxRows, hidden]; `slots` int32 and `weights` fp32 [stages, kMaxRows, kMaxK];
+  // `out` fp32 [stages, kMaxRows, hidden], all in host memory and alive until the source is stopped. Its layers are
+  // set afterwards, one per stage.
+  static std::unique_ptr<DraftSource> make_draft_source(
+      TensorView channel, TensorView x, TensorView slots, TensorView weights, TensorView out, int64_t hidden, int64_t stages) {
+    using namespace host;
+    auto host_mem = SymbolicDevice{};
+    const int64_t rows = draft::kMaxRows, k = draft::kMaxK;
+    expert_stream::verify_named(
+        "channel",
+        TensorMatcher({draft::kChannelBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem),
+        channel);
+    // fp16 has no host-side dtype trait (fp16_t is CUDA-only), so the dtype is checked by hand.
+    expert_stream::verify_named("x", TensorMatcher({stages, rows, hidden}).with_device<kDLCPU, kDLCUDAHost>(host_mem), x);
+    if (x.dtype().code != kDLFloat || x.dtype().bits != 16 || x.dtype().lanes != 1)
+      throw std::runtime_error("DSpark draft CPU experts: x must be float16");
+    expert_stream::verify_named(
+        "slots", TensorMatcher({stages, rows, k}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), slots);
+    expert_stream::verify_named(
+        "weights", TensorMatcher({stages, rows, k}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_mem), weights);
+    expert_stream::verify_named(
+        "out", TensorMatcher({stages, rows, hidden}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_mem), out);
+    if (reinterpret_cast<uintptr_t>(channel.data_ptr()) % 128 != 0)
+      throw std::runtime_error("DSpark draft CPU experts: the channel is not 128-byte aligned");
+    if (hidden <= 0 || stages < 1) throw std::runtime_error("DSpark draft CPU experts: no stage or no hidden size");
+    auto source = std::make_unique<DraftSource>();
+    source->channel = static_cast<uint8_t*>(channel.data_ptr());
+    source->x = static_cast<const uint8_t*>(x.data_ptr());
+    source->slots = static_cast<const int32_t*>(slots.data_ptr());
+    source->weights = static_cast<const float*>(weights.data_ptr());
+    source->out = static_cast<float*>(out.data_ptr());
+    source->hidden = hidden;
+    source->layers.resize(static_cast<size_t>(stages));
+    source->test_hooks = Build::kFaults;
+    return source;
+  }
+
+  // Opens a draft-only engine over a DraftCpuAreas: the areas as make_draft_source's. `cores` int64 [n] as
   // enable_cpu_experts' (check_cpu_expert_team). Idle as enable_cpu_experts' engine; `fatal_wait_ns` bounds how long a
   // posted record may stay incomplete.
   static int64_t draft_cpu_open(
@@ -535,47 +591,34 @@ struct HostExports {
       int64_t fatal_wait_ns) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    auto host_mem = SymbolicDevice{};
-    const int64_t rows = draft::kMaxRows, k = draft::kMaxK;
-    expert_stream::verify_named(
-        "channel",
-        TensorMatcher({draft::kChannelBytes}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem),
-        channel);
-    // fp16 has no host-side dtype trait (fp16_t is CUDA-only), so the dtype is checked by hand.
-    expert_stream::verify_named("x", TensorMatcher({stages, rows, hidden}).with_device<kDLCPU, kDLCUDAHost>(host_mem), x);
-    if (x.dtype().code != kDLFloat || x.dtype().bits != 16 || x.dtype().lanes != 1)
-      throw std::runtime_error("DSpark draft CPU experts: x must be float16");
-    expert_stream::verify_named(
-        "slots", TensorMatcher({stages, rows, k}).with_dtype<int32_t>().with_device<kDLCPU, kDLCUDAHost>(host_mem), slots);
-    expert_stream::verify_named(
-        "weights", TensorMatcher({stages, rows, k}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_mem), weights);
-    expert_stream::verify_named(
-        "out", TensorMatcher({stages, rows, hidden}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>(host_mem), out);
     expert_stream::verify_named("cores", TensorMatcher({-1}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), cores);
-    if (reinterpret_cast<uintptr_t>(channel.data_ptr()) % 128 != 0)
-      throw std::runtime_error("DSpark draft CPU experts: the channel is not 128-byte aligned");
-    draft::DraftCpuThread::Config config;
-    config.channel = static_cast<uint8_t*>(channel.data_ptr());
-    config.x = static_cast<const uint8_t*>(x.data_ptr());
-    config.slots = static_cast<const int32_t*>(slots.data_ptr());
-    config.weights = static_cast<const float*>(weights.data_ptr());
-    config.out = static_cast<float*>(out.data_ptr());
-    config.hidden = hidden;
-    config.stages = static_cast<int>(stages);
-    config.threads = static_cast<int>(threads);
+    auto d = std::make_shared<DraftOnly>();
+    d->source = make_draft_source(channel, x, slots, weights, out, hidden, stages);
+    if (keep_warm_ns < 0 || fatal_wait_ns <= 0)
+      throw std::runtime_error("DSpark draft CPU experts: the keep-warm window is negative or the fatal wait not positive");
+    d->config.threads = static_cast<int>(threads);
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int64_t i = 0; i < cores.size(0); ++i)
-      config.cores.push_back(static_cast<int>(c[i]));
-    config.spin_ns = spin_ns;
-    config.keep_warm_ns = keep_warm_ns;
-    config.fatal_wait_ns = fatal_wait_ns;
-    config.test_hooks = Build::kFaults;
-    auto thread = std::make_shared<draft::DraftCpuThread>(std::move(config));
+      d->config.cores.push_back(static_cast<int>(c[i]));
+    d->config.spin_ns = spin_ns;
+    d->config.keep_warm_ns = keep_warm_ns;
+    d->config.draft_only = true;
+    d->fatal_wait_ns = fatal_wait_ns;
+    check_cpu_expert_team(CpuExpertEngine::kDraftPrefix, d->config.cores, d->config.threads);
     static std::atomic<int64_t> next_handle{1};
     const int64_t handle = next_handle.fetch_add(1);
     std::lock_guard<std::mutex> guard(draft_mutex());
-    draft_registry()[handle] = std::move(thread);
+    draft_registry()[handle] = std::move(d);
     return handle;
+  }
+
+  // The layer of `stage` made by `kernel`'s make_layer (the arguments as set_cpu_layer's).
+  static cpu_experts::ExpertLayer make_draft_layer(
+      int64_t kernel, TensorView slabs, int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation,
+      double act_limit, TensorView params) {
+    if (kernel == 0) throw std::runtime_error("DSpark draft CPU experts need the format's kernel");
+    const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
+    return k->make_layer(layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params));
   }
 
   // `stage`'s layer, made by `kernel`'s make_layer (the arguments as set_cpu_layer's); before draft_cpu_start.
@@ -590,41 +633,83 @@ struct HostExports {
       int64_t activation,
       double act_limit,
       TensorView params) {
-    if (kernel == 0) throw std::runtime_error("DSpark draft CPU experts need the format's kernel");
-    const auto* k = reinterpret_cast<const cpu_experts::CpuExpertKernel*>(static_cast<intptr_t>(kernel));
-    find_draft(handle)->set_layer(
-        static_cast<int>(stage),
-        k->make_layer(layer_shape(slabs, capacity, hidden, intermediate, activation, act_limit), params_bytes(params)));
+    const auto d = find_draft(handle);
+    if (d->engine) throw std::runtime_error("DSpark draft CPU experts: set_layer after start");
+    if (stage < 0 || stage >= static_cast<int64_t>(d->source->layers.size()))
+      throw std::runtime_error("DSpark draft CPU experts: stage " + std::to_string(stage) + " is out of range");
+    cpu_experts::ExpertLayer layer =
+        make_draft_layer(kernel, slabs, capacity, hidden, intermediate, activation, act_limit, params);
+    for (const cpu_experts::ExpertLayer& other : d->source->layers)
+      if (other.kernel != nullptr && other.kernel != layer.kernel)
+        throw std::runtime_error("DSpark draft CPU experts: every stage runs on one kernel");
+    d->source->layers[static_cast<size_t>(stage)] = std::move(layer);
   }
 
   static void draft_cpu_start(int64_t handle) {
-    find_draft(handle)->start();
+    const auto d = find_draft(handle);
+    if (d->engine) throw std::runtime_error("DSpark draft CPU experts: already started");
+    for (size_t s = 0; s < d->source->layers.size(); ++s)
+      if (d->source->layers[s].kernel == nullptr)
+        throw std::runtime_error("DSpark draft CPU experts: stage " + std::to_string(s) + " has no layer");
+    d->config.kernel = d->source->layers[0].kernel;
+    d->engine = std::make_unique<CpuExpertEngine>(d->config, CpuExpertEngine::kDraftPrefix, "dspark-cpu");
+    d->engine->start();
+    d->engine->attach_draft(std::move(d->source), d->fatal_wait_ns);
   }
 
-  // Stops the thread (draft_cpu_thread.h's stop) and forgets the handle; a second stop does nothing.
+  // Stops the engine and forgets the handle; a second stop does nothing.
   static void draft_cpu_stop(int64_t handle) {
-    std::shared_ptr<draft::DraftCpuThread> thread;
+    std::shared_ptr<DraftOnly> d;
     {
       std::lock_guard<std::mutex> guard(draft_mutex());
       const auto found = draft_registry().find(handle);
       if (found == draft_registry().end()) return;
-      thread = std::move(found->second);
+      d = std::move(found->second);
       draft_registry().erase(found);
     }
-    thread->stop();
+    if (d->engine) d->engine->stop();
   }
 
-  // int64 [4]: jobs, rows, forward ns, keep-warm holds.
-  static void draft_cpu_stats(int64_t handle, TensorView out) {
+  static void write_draft_stats(const CpuExpertEngine::DraftStats& st, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("out", TensorMatcher({4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
-    const std::shared_ptr<draft::DraftCpuThread> thread = find_draft(handle);
+    expert_stream::verify_named("out", TensorMatcher({7}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     auto* o = static_cast<int64_t*>(out.data_ptr());
-    o[0] = thread->jobs();
-    o[1] = thread->rows();
-    o[2] = thread->forward_ns();
-    o[3] = thread->holds();
+    o[0] = st.jobs;
+    o[1] = st.rows;
+    o[2] = st.forward_ns;
+    o[3] = st.holds;
+    o[4] = st.collided_jobs;
+    o[5] = st.shared_routes;
+    o[6] = st.collided_forward_ns;
+  }
+
+  // int64 [7]: jobs, rows, forward ns, keep-warm holds, collided jobs, shared routes, collided forward ns. Zeros before
+  // draft_cpu_start.
+  static void draft_cpu_stats(int64_t handle, TensorView out) {
+    const auto d = find_draft(handle);
+    write_draft_stats(d->engine ? d->engine->draft_stats() : CpuExpertEngine::DraftStats{}, out);
+  }
+
+  // The DSpark draft channel as group `group`'s CPU expert engine's second job source (one team per node): the areas as
+  // draft_cpu_open's; then draft_set_layer per stage (the arguments as draft_cpu_set_layer's), draft_start; draft_stop
+  // detaches it. stats: int64 [7] as draft_cpu_stats.
+  static void draft_open(int64_t handle, int64_t group, TensorView channel, TensorView x, TensorView slots,
+                         TensorView weights, TensorView out, int64_t hidden, int64_t stages, int64_t fatal_wait_ns) {
+    find(handle)->draft_open(static_cast<int>(group), make_draft_source(channel, x, slots, weights, out, hidden, stages),
+                             fatal_wait_ns);
+  }
+  static void draft_set_layer(int64_t handle, int64_t group, int64_t stage, int64_t kernel, TensorView slabs,
+                              int64_t capacity, int64_t hidden, int64_t intermediate, int64_t activation,
+                              double act_limit, TensorView params) {
+    find(handle)->draft_set_layer(
+        static_cast<int>(group), static_cast<int>(stage),
+        make_draft_layer(kernel, slabs, capacity, hidden, intermediate, activation, act_limit, params));
+  }
+  static void draft_start(int64_t handle, int64_t group) { find(handle)->draft_start(static_cast<int>(group)); }
+  static void draft_stop(int64_t handle, int64_t group) { find(handle)->draft_stop(static_cast<int>(group)); }
+  static void draft_stats(int64_t handle, int64_t group, TensorView out) {
+    write_draft_stats(find(handle)->draft_stats(static_cast<int>(group)), out);
   }
 
   // Reserves every row's staging slots (up to k, fewer on a small tier) and publishes its first map delta
@@ -675,6 +760,8 @@ struct HostExports {
       int64_t row,
       int64_t device,
       int64_t reps,
+      int64_t lanes,
+      int64_t tokens,
       int64_t scratch,
       int64_t scratch_bytes,
       int64_t timeout_ns,
@@ -692,6 +779,8 @@ struct HostExports {
         row,
         device,
         reps,
+        lanes,
+        tokens,
         static_cast<uint64_t>(scratch),
         scratch_bytes,
         timeout_ns,
@@ -967,4 +1056,9 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_cpu_set_layer, Exports::draft_cpu_set_layer); \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_cpu_start, Exports::draft_cpu_start);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_cpu_stop, Exports::draft_cpu_stop);           \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_cpu_stats, Exports::draft_cpu_stats);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_cpu_stats, Exports::draft_cpu_stats);             \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_open, Exports::draft_open);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_set_layer, Exports::draft_set_layer);           \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_start, Exports::draft_start);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_stop, Exports::draft_stop);                     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_stats, Exports::draft_stats);

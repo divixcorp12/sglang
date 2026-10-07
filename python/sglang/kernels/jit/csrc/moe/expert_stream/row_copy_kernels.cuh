@@ -11,6 +11,7 @@
 
 #include <sgl_kernel/tensor.h>
 
+#include "lane_mask.cuh"
 #include "lease_device.cuh"
 #include "stream_wait.h"
 #include "row_layout.h"
@@ -248,7 +249,8 @@ struct CopyWaitParams {
   const int32_t* dst_slots;
   const int64_t* sm_table;
   int64_t sm_count;
-  int32_t* ce_mask;  // for CC, three u32 words: {copy-engine and CPU lanes, CPU lanes, CPU output parts}; all 0: none
+  int32_t* ce_mask;  // for CC, Wire::kCeMaskWords u32 words: {copy-engine and CPU lanes, CPU lanes, CPU output parts}, then
+                     // a wide build's high halves of the first two; all 0: none
 };
 
 // Arguments of CC, the commit kernel that follows the stream's wait on the gate.
@@ -256,12 +258,13 @@ struct CopyCommitParams {
   const int32_t* state;
   const uint8_t* lease;
   const int32_t* ce_mask;
-  // CPU experts, two words: {the lanes the CPU computed, the output parts holding their partial sums (bit 2g + 0: group
-  // g's CPU hits', bit 2g + 1: its CPU misses')}, else 0; null when off.
+  // CPU experts: Wire::kCpuLaneWords words, {the lanes the CPU computed (low half), the output parts holding their
+  // partial sums (bit 2g + 0: group g's CPU hits', bit 2g + 1: its CPU misses'), the lanes' high half in a wide
+  // build}, else 0; null when off.
   int32_t* cpu_lanes;
 };
 
-static_assert(device::expert_stream::Wire::kLanes <= 32, "a lane mask is one u32");
+static_assert(device::expert_stream::Wire::kLanes <= 64, "a lane mask is one u64");
 static_assert(2 * device::expert_stream::Wire::kNodes <= 32, "a part mask is one u32");
 
 // CW: see CopyWaitParams. Closes the gate only when a copy-engine or CPU lane exists, and opens it itself when
@@ -273,10 +276,11 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   device::PDLWaitPrimary<kUsePDL>();
   device::PDLTriggerSecondary<kUsePDL>();
   using namespace device::expert_stream;
+  using LaneMask = Wire::LaneMask;
   __shared__ int32_t sm_host[Wire::kLanes];
   __shared__ int32_t sm_dst[Wire::kLanes];
-  __shared__ uint32_t copying;    // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
-  __shared__ uint32_t cpu;        // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
+  __shared__ LaneMask copying;    // kHitCopy lanes: their DMA and, with sm_count, these reads fill the slot
+  __shared__ LaneMask cpu;        // kHitCpu and kMissCpu lanes: the CPU expert thread computes them
   // bit 2g: a kHitCpu lane of node g (output part 2g); bit 2g + 1: a kMissCpu lane (part 2g + 1)
   __shared__ uint32_t cpu_parts;
   const int64_t planned_count = max(static_cast<int64_t>(p.count[0]), static_cast<int64_t>(0));
@@ -284,15 +288,16 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   const uint64_t generation = pending_generation(p.state);
   uint8_t* const lease = p.lease;
   if (threadIdx.x == 0) {
-    uint32_t c = 0, u = 0, parts = 0;
+    LaneMask c = 0, u = 0;
+    uint32_t parts = 0;
     for (int64_t lane = 0; lane < planned_count && lane < Wire::kLanes; ++lane) {
       const uint32_t kind = static_cast<uint32_t>(p.lane_kind[lane]);
-      if (is_cpu_kind(kind)) u |= 1u << lane;
+      if (is_cpu_kind(kind)) u |= LaneMask{1} << lane;
       const uint32_t pair = 2u * static_cast<uint32_t>(p.lane_node[lane]);
       if (kind == Wire::kKindHitCpu) parts |= 1u << pair;
       if (kind == Wire::kKindMissCpu) parts |= 2u << pair;
       if (kind != Wire::kKindHitCopy) continue;
-      c |= 1u << lane;
+      c |= LaneMask{1} << lane;
       sm_host[lane] = p.lane_slot[lane];
       sm_dst[lane] = p.dst_slots[lane];
     }
@@ -310,8 +315,8 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
       }
     }
 #endif
-    for (uint32_t lanes = copying; lanes != 0; lanes &= lanes - 1) {
-      const int lane = __ffs(lanes) - 1;
+    for (LaneMask lanes = copying; lanes != 0; lanes &= lanes - 1) {
+      const int lane = expert_stream::lowest_lane(lanes);
       for (int64_t k = 0; k < p.sm_count; ++k) {
         const int64_t* e = p.sm_table + 3 * k;
         copy_wait_read(
@@ -324,13 +329,18 @@ __global__ __launch_bounds__(device::expert_stream::kCopyWaitThreads, 1) void ex
   __syncthreads();  // every thread's SM reads before the gate below
   if (threadIdx.x != 0) return;
   p.ce_mask[0] = p.ce_mask[1] = p.ce_mask[2] = 0;
+  if constexpr (Wire::kWideLanes) p.ce_mask[3] = p.ce_mask[4] = 0;
   if (planned_count == 0) return;
-  const uint32_t mask = copying | cpu;
+  const LaneMask mask = copying | cpu;
   if (mask == 0) return;
   // CC reads these after the stream's wait, stream-ordered; nothing on the host reads them.
-  p.ce_mask[0] = static_cast<int32_t>(mask);
-  p.ce_mask[1] = static_cast<int32_t>(cpu);
+  p.ce_mask[0] = static_cast<int32_t>(static_cast<uint32_t>(mask));
+  p.ce_mask[1] = static_cast<int32_t>(static_cast<uint32_t>(cpu));
   p.ce_mask[2] = static_cast<int32_t>(cpu_parts);
+  if constexpr (Wire::kWideLanes) {
+    p.ce_mask[3] = static_cast<int32_t>(static_cast<uint32_t>(mask >> 32));
+    p.ce_mask[4] = static_cast<int32_t>(static_cast<uint32_t>(cpu >> 32));
+  }
   // Dekker with the copy thread (RamTier::copy_completed, the channel's complete): the close is ordered before the
   // CopyDone load, so one side always sees the other's store and opens the gate.
   channel::close_gate<TargetChannel>(lease, seq, generation);
@@ -344,8 +354,12 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
     const __grid_constant__ CopyCommitParams p) {
   using namespace device::expert_stream;
   if (threadIdx.x != 0) return;
-  const uint32_t armed = static_cast<uint32_t>(p.ce_mask[0]);
-  if (p.cpu_lanes != nullptr) p.cpu_lanes[0] = p.cpu_lanes[1] = 0;
+  using LaneMask = Wire::LaneMask;
+  const LaneMask armed = expert_stream::load_lane_mask<LaneMask>(p.ce_mask, p.ce_mask + 3);
+  if (p.cpu_lanes != nullptr) {
+    p.cpu_lanes[0] = p.cpu_lanes[1] = 0;
+    if constexpr (Wire::kWideLanes) p.cpu_lanes[2] = 0;
+  }
   if (armed == 0) return;
   const uint32_t seq = static_cast<uint32_t>(p.state[kPending]);
   const uint64_t generation = pending_generation(p.state);
@@ -354,6 +368,7 @@ __global__ __launch_bounds__(device::expert_stream::kBlock, 1) void exl3_ram_mis
   if (p.cpu_lanes != nullptr) {
     p.cpu_lanes[0] = p.ce_mask[1];
     p.cpu_lanes[1] = p.ce_mask[2];
+    if constexpr (Wire::kWideLanes) p.cpu_lanes[2] = p.ce_mask[4];
   }
 }
 
@@ -484,12 +499,13 @@ struct RowCopyKernel {
     expert_stream::verify_named(
         "dst_slots", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), dst_slots);
     expert_stream::verify_named(
-        "ce_mask", TensorMatcher({3}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ce_mask);
+        "ce_mask", TensorMatcher({Wire::kCeMaskWords}).with_dtype<int32_t>().with_device<kDLCUDA>(device), ce_mask);
     // CPU experts off: an empty tensor, and CC writes no CPU lanes.
     expert_stream::verify_named(
         "cpu_lanes", TensorMatcher({-1}).with_dtype<int32_t>().with_device<kDLCUDA>(device), cpu_lanes);
     RuntimeCheck(
-        cpu_lanes.size(0) == 0 || cpu_lanes.size(0) == 2, "cpu_lanes: two words, or empty when CPU experts are off");
+        cpu_lanes.size(0) == 0 || cpu_lanes.size(0) == Wire::kCpuLaneWords,
+        "cpu_lanes: Wire::kCpuLaneWords words, or empty when CPU experts are off");
     RuntimeCheck(
         lease_address != 0 && lease_address % Wire::kLeaseBlockAlign == 0,
         "lease_address: must be a nonzero multiple of Wire::kLeaseBlockAlign");
@@ -526,7 +542,7 @@ struct RowCopyKernel {
         .state = static_cast<const int32_t*>(state.data_ptr()),
         .lease = reinterpret_cast<const uint8_t*>(lease_address),
         .ce_mask = static_cast<const int32_t*>(ce_mask.data_ptr()),
-        .cpu_lanes = cpu_lanes.size(0) == 2 ? static_cast<int32_t*>(cpu_lanes.data_ptr()) : nullptr,
+        .cpu_lanes = cpu_lanes.size(0) != 0 ? static_cast<int32_t*>(cpu_lanes.data_ptr()) : nullptr,
     };
     LaunchKernel(1, device::expert_stream::kBlock, stream)(exl3_ram_miss_lease_copy_commit_kernel, commit);
   }

@@ -116,12 +116,12 @@ def test_the_scalar_cap_runs_the_scalar_tier(tmp_path):
 
 
 # Functions allowed to hold AVX registers: the AVX2 tier's dot product and its helpers, the plan's AVX2 entries (which
-# inline them), and the framework's AVX2 keep-warm loop. Matched on demangled names, with any GCC clone suffix.
+# inline them), and the framework's AVX2 keep-warm loops (one word, or either of two). Matched on demangled names, with any GCC clone suffix.
 AVX2_TIER = [
     re.compile(r"DotRows<\(sglang::cpu_experts::\(anonymous namespace\)::Isa\)1>::rows<"),
     re.compile(r"::avx2_detail::"),
     re.compile(r"ForwardPlan<[^>]*Isa\)1>::(gate_up|down)_avx2\("),
-    re.compile(r"::keep_warm_detail::avx2\("),
+    re.compile(r"::keep_warm_detail::avx2(_either)?\("),
 ]
 
 

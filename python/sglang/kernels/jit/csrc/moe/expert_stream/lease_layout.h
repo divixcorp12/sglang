@@ -13,6 +13,7 @@
 
 #include "lease_channel_layout.h"
 #include <cstdint>
+#include <type_traits>
 
 // The lane count of this build: every JIT build of the device kernels and the host passes -DSGLANG_EXPERT_STREAM_LANES.
 #ifndef SGLANG_EXPERT_STREAM_LANES
@@ -33,11 +34,18 @@ constexpr int64_t wire_round_up(int64_t value, int64_t align) {
 
 template <int NumLanes, int NumNodes = 1>
 struct LeaseLayout {
-  static_assert(1 <= NumLanes && NumLanes <= 32, "a record carries 1..32 lanes");
+  static_assert(1 <= NumLanes && NumLanes <= 64, "a record carries 1..64 lanes");
   static_assert(NumNodes >= 1, "at least one NUMA node");
   // Lane arrays are i16, so a multiple of 8 lanes is whole 16-byte vector loads and stores.
   static constexpr int kLanes = static_cast<int>(wire_round_up(NumLanes, 8));
   static constexpr int kNodes = NumNodes;
+  // A mask with a bit per lane: one u32 up to 32 lanes, so the narrow builds' code is unchanged, else one u64.
+  static constexpr bool kWideLanes = kLanes > 32;
+  using LaneMask = std::conditional_t<kWideLanes, uint64_t, uint32_t>;
+  // CW's words for CC (ce_mask: copy | cpu, cpu, parts) and CC's for the fused MoE and the DIRECT commit (cpu_lanes:
+  // cpu, parts); a wide build appends the masks' high halves, so the narrow words keep their places.
+  static constexpr int kCeMaskWords = kWideLanes ? 5 : 3;
+  static constexpr int kCpuLaneWords = kWideLanes ? 3 : 2;
 
   // The node whose group serves `expert`: its staging list, its CPU split and its slots. The one home rule, so a
   // popularity table can replace it here without touching a caller.

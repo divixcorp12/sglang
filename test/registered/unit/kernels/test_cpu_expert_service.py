@@ -211,11 +211,13 @@ class FakeHost:
         self.stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
         self.grid = None  # calibrate_cpu_split's answer; an Exception instance is raised instead
         self.calibrations = []
+        self.calibration_tokens = []  # the tokens each calibrate_cpu_split call asked for
 
     def copy_expert_bytes(self, row):
         return 1024
 
-    def calibrate_cpu_split(self, row, *, device, reps, scratch, timeout_s=1.0, group=0):
+    def calibrate_cpu_split(self, row, *, device, reps, scratch, timeout_s=1.0, group=0, lanes=None, tokens=1):
+        self.calibration_tokens.append(tokens)
         self.calibrations.append((row, device, reps, scratch.numel(), str(scratch.device), group))
         self.scratch = scratch
         # Calibration's own jobs show in the stats, also those of a calibration that then fails.
@@ -413,12 +415,15 @@ def test_format_calibration_prints_the_tables_and_the_split():
     assert lines[4] == "  split n=0..8: " + " ".join(str(k) for k in split)
 
 
-def _calibrating_service(host, capacity=9):
+def _calibrating_service(host, capacity=9, tokens=1):
     from sglang.srt.layers.moe.cpu_experts.service import CpuExpertService
 
     trait = FakeServiceTrait()
     slabs = {row: _fake_slabs(capacity) for row in range(2)}
-    svc = CpuExpertService(host, trait, slabs, hidden=8, cores=[4, 5, 6], threads=2, split=[0] * (host.wire.lanes + 1), pin=False)
+    svc = CpuExpertService(
+        host, trait, slabs, hidden=8, cores=[4, 5, 6], threads=2, split=[0] * (host.wire.lanes + 1), pin=False,
+        tokens=tokens,
+    )
     svc.register(0, 10.0)
     svc.register(1, 10.0)
     return svc
@@ -440,6 +445,20 @@ def test_calibration_pushes_the_measured_split_once_and_stops_retuning(capsys):
     assert svc._last_stats == host.stats
     host.stats = {"jobs": 2000, "lanes": 2000, "forward_ns": 2000 * 10_000_000}
     assert svc.retune() is None and host.splits == [split]
+
+
+@pytest.mark.parametrize("tokens", [1, 6])
+def test_calibration_measures_the_job_shape_the_split_decides(tokens):
+    """A verify's record jobs run `tokens` rows (per_token), so the grid is measured with jobs of that many tokens; a
+    one-token service keeps the one-token jobs."""
+    from sglang.srt.environ import envs
+
+    host = FakeHost()
+    host.grid = _grid(lambda n, k: max(0.5 * k, 1.0 * (n - k)))
+    svc = _calibrating_service(host, tokens=tokens)
+    with envs.SGLANG_DSV41_CPU_EXPERTS_CALIBRATION_REPS.override(1):
+        svc.calibrate(-1)
+    assert host.calibration_tokens == [tokens]
 
 
 def test_a_16_lane_service_calibrates_a_16_lane_grid_with_16_experts_of_scratch(caplog, capsys):

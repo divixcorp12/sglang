@@ -228,7 +228,10 @@ def _gather_harness(manager, tokens=1):
         for layer, streamer in enumerate(streamers):
             compact, tensors = streamer.gather(static[layer])
             for name, output in outputs[layer].items():
-                output.copy_(tensors[name][compact.reshape(-1).long()])
+                # Spill remaps a victimless route to slot_dump, past every slot row (the fused MoE skips such a route);
+                # clamping keeps this stand-in's read in range, and its row is not checked.
+                rows = compact.reshape(-1).long().clamp(max=tensors[name].shape[0] - 1)
+                output.copy_(tensors[name][rows])
 
     return static, outputs, forward
 
@@ -2058,6 +2061,102 @@ class TestInsertOnMissDirect(unittest.TestCase):
             self.assertEqual(cache.scratch_rows, TOP_K)
         for streamer in manager.streamers.values():
             self.assertNotEqual(streamer._graph_device_pairs, ())
+
+    # ----- spill: victims for the first V lanes of a lane-per-route gather (SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES) -----
+
+    def _spill(self, fused, lanes=0, victims=1):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True), envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(
+            victims
+        ):
+            return self._narrow(_model(), lanes, fused)
+
+    def test_victim_lanes_need_cpu_experts_and_a_value_below_the_lanes(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.override(1), self.assertRaisesRegex(
+            ValueError, "VICTIM_LANES=1 needs SGLANG_DSV41_CPU_EXPERTS=1"
+        ):
+            self._narrow(_model(), 0, False)
+        with self.assertRaisesRegex(ValueError, "below the 4 miss lanes"):
+            self._spill(False, victims=4)
+
+    def test_spill_needs_a_lane_per_route(self):
+        """Review Focus 5 by construction: a narrowed MISS_LANES could leave more misses than lanes, so spill refuses it."""
+        with self.assertRaisesRegex(ValueError, "unset SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES"):
+            self._spill(False, lanes=2)
+
+    def test_victim_lanes_cap_the_shortlist_and_the_floor(self):
+        """Only shortlist column 0 is ever a victim once a boundary ranks; the floor is twice the victim lanes, and the
+        manager reads the overflow flag after every verify (the post can set it: case 1)."""
+        for fused in (False, True):
+            self.model = _model()
+            manager = self._spill(fused)
+            updater = manager.gpu_residency
+            self.assertEqual((updater.miss_rows, updater.victim_lanes), (4, 1))
+            self.assertTrue(updater.narrow_gather and manager.narrow_graph_gather)
+            graph, static, outputs = self.capture(manager, tokens=2)
+            for _ in range(2):
+                self.replay_verify(manager, graph, static, outputs, [[[0, 1], [0, 1]]] * LAYERS, check_outputs=False)
+            self.assertFalse(bool(updater.victim_valid[:, 1:].any()))
+            self.assertTrue(bool(updater.victim_valid[:, 0].all()))
+
+    def test_victimless_lanes_take_the_idle_destination_in_both_paths(self):
+        """Two misses, one victim: lane 0 is live at the victim, lanes 1-3 are not and get (slot_dump, -1), the marker
+        the post spills to the CPU; their routes remap past every slot column. The torch chain and the fused (wide)
+        kernel agree."""
+        from sglang.kernels.ops.moe.expert_residency_direct_gather import direct_gather_destinations
+
+        manager = self._spill(False)
+        updater, streamer = manager.gpu_residency, manager.streamers[0]
+        dump = updater.max_capacity
+        base = streamer.row_planner.scratch_base
+        updater.victims[0].copy_(torch.tensor([3, 5, 6, 7], device="cuda"))
+        updater.victim_valid[0].copy_(torch.tensor([True, False, False, False], device="cuda"))
+        streamer._graph_miss_count.fill_(2)
+        remap = torch.tensor([base, base + 1, base + 1, base], dtype=torch.int64, device="cuda")
+        got = updater.gather_destinations(0, remap, torch.full((4,), -1, dtype=torch.int64, device="cuda"), base)
+        _, _, destinations, live = updater._pending_commit
+        self.assertEqual(destinations.tolist(), [3, dump, dump, dump])
+        self.assertEqual(live.tolist(), [True, False, False, False])
+        self.assertEqual(streamer._graph_destination_slots[:4].tolist(), [3, -1, -1, -1])
+        self.assertEqual(got.tolist(), [3, dump, dump, 3])
+        ids = torch.tensor([7, 9, 9, 7], dtype=torch.int64, device="cuda")
+        expert_to_slot = torch.full((EXPERTS,), -1, dtype=torch.int64, device="cuda")
+        slots_out = torch.zeros(4, dtype=torch.int32, device="cuda")
+        dest_out = torch.zeros(4, dtype=torch.int64, device="cuda")
+        live_out = torch.zeros(4, dtype=torch.bool, device="cuda")
+        remap_out = torch.zeros(4, dtype=torch.int64, device="cuda")
+        direct_gather_destinations(
+            ids, expert_to_slot, updater.victims[0], updater.victim_valid[0], streamer._graph_miss_count, remap, base,
+            slots_out, dest_out, live_out, remap_out, idle_destination=dump, idle_slot=-1,
+        )
+        self.assertEqual(slots_out.tolist(), [3, -1, -1, -1])
+        self.assertEqual(dest_out.tolist(), [3, dump, dump, dump])
+        self.assertEqual(live_out.tolist(), [True, False, False, False])
+        self.assertEqual(remap_out.tolist(), got.tolist())
+
+    def test_spill_never_clamps(self):
+        """Review Focus 5: a lane per route leaves no count past the lanes, so the gather never calls the clamp; four
+        misses into one victim post with the count intact. Mutation: call the clamp under spill -- its assert fires."""
+        from sglang.srt.layers.moe.expert_residency_gpu import GpuResidencyUpdater
+
+        for fused in (False, True):
+            self.model = _model()
+            manager = self._spill(fused)
+            with unittest.mock.patch.object(GpuResidencyUpdater, "clamp_gather_misses", side_effect=AssertionError):
+                graph, static, outputs = self.capture(manager, tokens=2)
+                mapping = manager.caches[0].expert_to_slot.tolist()
+                outsiders = [e for e, s in enumerate(mapping) if s < 0]
+                hits = [
+                    [[e for e, s in enumerate(manager.caches[layer].expert_to_slot.tolist()) if s >= 0][:TOP_K]] * 2
+                    for layer in range(1, LAYERS)
+                ]
+                self.replay_verify(manager, graph, static, outputs, [[outsiders[0:2], outsiders[2:4]]] + hits,
+                                   check_outputs=False)
+            self.assertEqual(int(manager.streamers[0]._graph_miss_count.item()), 4, f"fused={fused}")
+            self.assertEqual(int(manager.gpu_residency.overflow_flag.item()), 0, f"fused={fused}")
 
 
 if __name__ == "__main__":

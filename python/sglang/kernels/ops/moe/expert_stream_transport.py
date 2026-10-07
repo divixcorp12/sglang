@@ -34,6 +34,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe import expert_lease_block
+from sglang.kernels.ops.moe.expert_lease_block import CPU_TOKENS_MAX, cpu_row_bytes
 from sglang.srt.environ import envs
 
 # Rows per io_uring batch and per bounce bank. The C++ reader has kBanks = 2 banks of
@@ -122,7 +123,9 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "test_kernel_address",
     "test_kernel_calls",
     "test_kernel_hold",
+    "test_kernel_max_rows",
     "test_keep_warm_calls",
+    "test_keep_warm_either_calls",
     "test_keep_warm_core",
     "draft_test_post",
     "draft_test_tear",
@@ -1787,7 +1790,9 @@ class ExpertStreamHost:
         references to both. The idle thread holds its workers in the kernel's keep-warm, in
         register work for ``keep_warm_us`` after each job and in PAUSE for ``spin_us`` after
         that, then releases them and sleeps until the next submit; -1 holds them until the
-        next submit (``SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US`` in a server).
+        next submit (``SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US`` in a server). With ``[rows,
+        2 * nodes, tokens, hidden]`` rows a record's CPU job runs one forward of its tokens
+        from the row's token table.
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -1807,13 +1812,15 @@ class ExpertStreamHost:
             or not out_rows.is_contiguous()
             or not (
                 (out_rows.dim() == 2 and self.nodes == 1)
-                or (out_rows.dim() == 3 and out_rows.shape[1] == 2 * self.nodes)
+                or (out_rows.dim() in (3, 4) and out_rows.shape[1] == 2 * self.nodes)
             )
         ):
             raise ValueError(
-                "out_rows must be a contiguous host float32 [rows, hidden] at one node or [rows, 2 * nodes, hidden] tensor"
+                "out_rows must be a contiguous host float32 [rows, hidden] at one node, [rows, 2 * nodes, hidden], or "
+                "[rows, 2 * nodes, tokens, hidden] for multi-token rows"
             )
         parts = 1 if out_rows.dim() == 2 else 2
+        tokens = int(out_rows.shape[2]) if out_rows.dim() == 4 else 1
         hidden = int(out_rows.shape[-1])
         self._module.expert_stream_enable_cpu_experts(
             self.handle,
@@ -1825,11 +1832,19 @@ class ExpertStreamHost:
             out_rows.view(out_rows.shape[0], -1),
             hidden,
             parts,
+            int(tokens),
             int(threads),
             _spin_ns(spin_us),
             int(keep_warm_us * 1e3),
         )
         self.cpu_rows = (x_rows, out_rows)
+
+    def draft_source(self, areas, *, fatal_wait_s: float, group: int = 0):
+        """The DSpark draft channel over ``areas`` (a ``DraftCpuAreas``) as group ``group``'s CPU expert engine's second
+        job source: a ``SharedDraftHost``; set its stages' layers, then ``start``. After enable_cpu_experts."""
+        from sglang.kernels.ops.moe.dspark_draft_cpu import SharedDraftHost
+
+        return SharedDraftHost(self, areas, group=group, fatal_wait_s=fatal_wait_s)
 
     def set_cpu_layer(self, row: int, spec) -> None:
         """Make ``row``'s layer with the enabled kernel from ``spec`` (a ``CpuExpertLayerSpec``).
@@ -1879,13 +1894,18 @@ class ExpertStreamHost:
         scratch: torch.Tensor,
         timeout_s: float = 1.0,
         group: int = 0,
+        lanes: Optional[int] = None,
+        tokens: int = 1,
     ) -> torch.Tensor:
         """Run the CPU split's startup calibration on ``row``, on group ``group``'s engine and RAM slots.
 
         Returns float64 ``calibration_shape(wire.lanes)`` mean ms: row 0 is ``cpu[k]``, row 1 ``link[m]`` and
         row ``1 + n`` ``both[n][k]`` (k <= n). The caller owns the tier (paused, or no
         thread). ``device`` -1 copies with the test backend; ``scratch`` holds
-        one expert per lane (``wire.lanes`` of them) on that device. Raises RuntimeError on failure.
+        one expert per lane (``wire.lanes`` of them) on that device. ``lanes`` caps the lanes measured (default the
+        wire's); cells past it stay 0, and ``scratch`` needs that many experts. ``tokens`` above 1 times per-token CPU jobs
+        of that many rows with every token routing every lane, the job a verify's record runs (at most the rows' tokens).
+        Raises RuntimeError on failure.
         """
         out = torch.zeros(calibration_shape(self.wire.lanes), dtype=torch.float64)
         self._module.expert_stream_calibrate_cpu_split(
@@ -1894,6 +1914,8 @@ class ExpertStreamHost:
             int(row),
             int(device),
             int(reps),
+            int(lanes or self.wire.lanes),
+            int(tokens),
             scratch.data_ptr(),
             scratch.numel() * scratch.element_size(),
             int(timeout_s * 1e9),
@@ -1933,10 +1955,21 @@ class ExpertStreamHost:
         _refuse_test_only("test_kernel_hold", self.variant)
         self._module.expert_stream_test_kernel_hold(int(core), int(bool(on)))
 
+    def test_kernel_max_rows(self, rows: int) -> None:
+        """Test only: the fake kernel's max_rows (restored by :meth:`test_kernel_address`); call it before the engine
+        is enabled, whose validation reads it."""
+        _refuse_test_only("test_kernel_max_rows", self.variant)
+        self._module.expert_stream_test_kernel_max_rows(int(rows))
+
     def test_keep_warm_calls(self) -> int:
         """Test only: calls of the fake kernel's keep-warm since :meth:`test_kernel_address`."""
         _refuse_test_only("test_keep_warm_calls", self.variant)
         return int(self._module.expert_stream_test_keep_warm_calls())
+
+    def test_keep_warm_either_calls(self) -> int:
+        """Test only: how many of those calls were the two-word ``keep_warm_either`` (a draft source's hold)."""
+        _refuse_test_only("test_keep_warm_either_calls", self.variant)
+        return int(self._module.expert_stream_test_keep_warm_either_calls())
 
     def test_keep_warm_core(self) -> int:
         """Test only: the first core the fake keep-warm's last call took (-1 before any call)."""
@@ -2424,6 +2457,11 @@ class ExpertStreamDevice:
         # Stable sentinels for absent tensors (see the class doc on graph capture).
         self._no_hot_slots = torch.empty(0, dtype=torch.int64, device=device)
         self._no_cpu = torch.empty(0, dtype=torch.int32, device=device)
+        # The spill words of a post without spill: never read (the post's spill is 0).
+        self._no_spill = (
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int64, device=device),
+        )
         self._module = None
         self._layout = layout
         self.hot_page = hot_page
@@ -2472,15 +2510,20 @@ class ExpertStreamDevice:
         self.go_1 = torch.zeros(1, dtype=torch.int32, device=device)
         self.host_rows_1 = torch.zeros(self.wire.lanes, dtype=torch.int64, device=device)
         self.dst_slots_1 = torch.zeros(self.wire.lanes, dtype=torch.int32, device=device)
-        # CW's words for CC: the lanes it armed the gate for, the CPU lanes, the CPU output parts; 0: none.
-        self.ce_mask = torch.zeros(3, dtype=torch.int32, device=device)
-        # CPU experts, written by CC: the lanes the CPU computed, then the output parts holding their partial sums (0: none).
-        self.cpu_lanes = torch.zeros(2, dtype=torch.int32, device=device)
+        # CW's words for CC: the lanes it armed the gate for, the CPU lanes, the CPU output parts; 0: none; a wide wire
+        # appends the masks' high halves.
+        self.ce_mask = torch.zeros(self.wire.ce_mask_words, dtype=torch.int32, device=device)
+        # CPU experts, written by CC: the lanes the CPU computed, then the output parts holding their partial sums (0: none);
+        # a wide wire appends the lanes' high half.
+        self.cpu_lanes = torch.zeros(self.wire.cpu_lane_words, dtype=torch.int32, device=device)
         # CPU experts (``enable_cpu_experts``): the host rows the post stages each
         # layer's input into, and those the CPU expert thread writes each layer's
         # partial sum to; None when off.
         self.cpu_x_rows = None
         self.cpu_out_rows = None
+        # The rows' token capacity and the bytes between two tokens' staged inputs (enable_cpu_experts); 1 and 0
+        # until then.
+        self.cpu_tokens_max, self.cpu_x_token_bytes = 1, 0
         # Set by the row backend when it captures a post that lets the service copy; the
         # service arms its copy engine on it.
         self.copy_engine_captured = False
@@ -2497,7 +2540,9 @@ class ExpertStreamDevice:
     def enable_cpu_experts(self, x_rows: torch.Tensor, out_rows: torch.Tensor) -> None:
         """Take the same pinned rows the host's ``enable_cpu_experts`` took.
 
-        There is one row per layer, readable through UVA.
+        There is one row per layer, readable through UVA. A multi-token row's ``out_rows`` is
+        ``[layers, 2 * nodes, tokens, hidden]``; ``x_rows`` then holds
+        ``expert_lease_block.cpu_row_bytes`` a row (the token table follows the inputs).
         """
         for rows, name in ((x_rows, "x_rows"), (out_rows, "out_rows")):
             if (
@@ -2519,7 +2564,17 @@ class ExpertStreamDevice:
             or (out_rows.stride(0) * 4) % 16
         ):
             raise ValueError("the CPU expert rows must be 16-byte aligned")
+        tokens = int(out_rows.shape[2]) if out_rows.dim() == 4 else 1
+        hidden = int(out_rows.shape[-1])
+        if not 1 <= tokens <= CPU_TOKENS_MAX:
+            raise ValueError(f"CPU expert rows hold 1-{CPU_TOKENS_MAX} tokens, not {tokens}")
+        if x_rows.shape[1] < cpu_row_bytes(hidden, tokens, self.wire.lanes):
+            raise ValueError(
+                f"x_rows holds {x_rows.shape[1]} bytes a row; {tokens} tokens of {hidden} need "
+                f"{cpu_row_bytes(hidden, tokens, self.wire.lanes)}"
+            )
         self.cpu_x_rows, self.cpu_out_rows = x_rows, out_rows
+        self.cpu_tokens_max, self.cpu_x_token_bytes = tokens, -(-2 * hidden // 16) * 16
 
     def set_row_copy(self, row: int, dst_rows: int) -> None:
         """Record that the row's copy table is registered with ``dst_rows`` rows.
@@ -2571,9 +2626,9 @@ class ExpertStreamDevice:
     def cpu_out_part_stride(self) -> int:
         """Return the floats from a row's part 0 (CPU hits) to its part 1 (CPU misses).
 
-        0 for one-part rows.
+        0 for one-part rows. (``tokens * hidden`` for a multi-token row.)
         """
-        return int(self.cpu_out_rows.stride(1)) if self.cpu_out_rows.dim() == 3 else 0
+        return int(self.cpu_out_rows.stride(1)) if self.cpu_out_rows.dim() >= 3 else 0
 
     def _check_row(self, row: int) -> None:
         """Raise ValueError for a row outside ``[0, layers)``."""
@@ -2608,6 +2663,7 @@ class ExpertStreamDevice:
         hot_capacity: int = 0,
         captured: bool = False,
         cpu_input=None,
+        spill=None,
     ) -> None:
         """Post the layer's request.
 
@@ -2619,6 +2675,10 @@ class ExpertStreamDevice:
         ``cpu_input`` is ``(x [1, hidden], route weights aligned with routes)``, for CPU
         experts and only with ``captured``: the post stages x in the row's host row when
         a lane is the CPU's, and the weights in the record.
+
+        ``spill`` is DIRECT's ``(overflow_flag int32 [1], gather_overflow int64 [1])`` for this row, given when lanes
+        may have no VRAM victim (SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES): a lane whose ``dst_slots`` entry is -1
+        becomes a CPU lane, or, when one cannot, the post serves the live prefix, lowers ``count`` and flags both words.
         """
         self._check_row(row)
         self._check_buffers(
@@ -2640,14 +2700,28 @@ class ExpertStreamDevice:
             if not captured:
                 raise ValueError("only a captured post stages the CPU experts' input")
             cpu_x, cpu_weights = cpu_input
+            tokens = cpu_x.shape[0] if cpu_x.dim() == 2 else 1
+            if tokens > self.cpu_tokens_max:
+                raise ValueError(f"a {tokens}-token input does not fit rows of {self.cpu_tokens_max} tokens")
             if cpu_x.shape[-1] * 2 > self.cpu_x_rows.shape[1]:
                 raise ValueError(
                     f"a {cpu_x.shape[-1]}-wide input does not fit the {self.cpu_x_rows.shape[1]}-byte row"
                 )
-            cpu_x, cpu_weights = cpu_x.reshape(1, -1), cpu_weights.reshape(-1)
+            cpu_x, cpu_weights = cpu_x.reshape(tokens, -1), cpu_weights.reshape(-1)
             cpu_x_dst = int(self.cpu_x_rows[row].data_ptr())
+        spill_on, (overflow_flag, gather_overflow) = 0, self._no_spill
+        if spill is not None:
+            overflow_flag, gather_overflow = spill
+            for name, t, dtype in (
+                ("overflow_flag", overflow_flag, torch.int32),
+                ("gather_overflow", gather_overflow, torch.int64),
+            ):
+                if t.dtype != dtype or t.numel() != 1 or t.device != self.state.device:
+                    raise ValueError(f"{name} must be one {dtype} word on {self.state.device}")
+            spill_on = 1
         bank = self.map_bank
         cpu_on = self.cpu_x_rows is not None
+        token_bytes = self.cpu_x_token_bytes or -(-2 * int(cpu_x.shape[-1]) // 16) * 16
         self._kernels().expert_stream_post(
             self.page,
             self.state,
@@ -2684,6 +2758,11 @@ class ExpertStreamDevice:
             cpu_x,
             cpu_x_dst,
             cpu_weights,
+            self.cpu_tokens_max,
+            token_bytes,
+            spill_on,
+            overflow_flag,
+            gather_overflow,
             int(self.lease_pdl),
         )
 

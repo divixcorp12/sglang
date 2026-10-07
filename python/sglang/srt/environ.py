@@ -522,6 +522,10 @@ class Envs:
     # route. A gather with more serves the lanes that find a victim and sets the residency's overflow flag; its output
     # is then not a verify result. 0 keeps one lane per route.
     SGLANG_MOE_EXPERT_GRAPH_GATHER_MISS_LANES = EnvInt(0)
+    # Spill (SGLANG_DSV41_CPU_EXPERTS, a DSpark verify with a lane per route: MISS_LANES unset): only the first V of a
+    # gather's miss lanes in plan order take a VRAM victim and a staging slot; the post makes every later lane a CPU
+    # lane, a miss of which the host reads into a RAM victim. 0: every miss lane may take a victim. 1 <= V < the routes.
+    SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES = EnvInt(0)
     # Debug only: write Qwen4-Exp MoE routing tensors of eager decode forwards to
     # this directory (see sglang.srt.models.qwen4_exp_route_trace); empty disables.
     SGLANG_MOE_ROUTE_TRACE_DIR = EnvStr("")
@@ -1282,6 +1286,10 @@ class Envs:
     # separately cached extension; with both off the build is upstream's.
     SGLANG_EXL3_CPU_ACT_RESIDUAL = EnvBool(False)
     SGLANG_EXL3_CPU_ACT_BLOCK = EnvInt(0)
+    # Build-time: the optimized EXL3 CPU kernel's quantized activation rows per chunk (EXL3_MOE_CPU_MAX_M, even in
+    # [2, 8]; a chunk holds half as many tokens). 0 keeps the kernel's default. Any other value builds into its own
+    # extension (flavor _m<N>). SGLANG_DSV41_CPU_EXPERTS only: the vendored kernel keeps its own.
+    SGLANG_EXL3_CPU_MAX_M = EnvInt(0)
     # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
     # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
     SGLANG_EXL3_CPU_CXX = EnvStr("")
@@ -1922,6 +1930,9 @@ class Envs:
     # LRU row, not one of decode's. A row stops being prefill-owned when decode uses it. Read once at service start.
     # Off by default.
     SGLANG_DSV41_ENABLE_PREFILL_SHARE = EnvBool(False)
+    # Test only: test/manual/dsv41/test_bs1_build_digest.py skips, instead of failing, when nvcc or the GPU arch differs
+    # from its golden's (the golden is then stale: re-record it). Off by default.
+    SGLANG_TEST_BS1_DIGEST_TOOLCHAIN_ACKNOWLEDGED = EnvBool(False)
     # Prefill route plan (plan 2026-09-25-dsv41-prefill-route-plan): the eager streamed MoE reads a layer's topk_ids
     # to the host once, before any of its gathers, groups the routes by expert, and takes each chunk's expert ids and
     # row_of_source as host lists, so no readback sits between a chunk's gather and its compute and the host runs

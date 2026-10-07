@@ -59,8 +59,12 @@ def direct_gather_destinations(
     destinations_out: torch.Tensor,
     live_out: torch.Tensor,
     remap_out: torch.Tensor,
+    idle_destination: int = 0,
+    idle_slot: int = 0,
 ) -> None:
     """One layer's DIRECT gather destinations; see ``GpuResidencyUpdater.gather_destinations``.
+
+    A lane that is not live gets ``idle_destination`` and ``idle_slot``; nonzero values always run the wide kernel.
 
     ``topk_ids`` and ``remap`` are this forward's flat routes and the planner's remap (int32 or int64);
     ``remap_out`` may be either dtype. ``victims``/``victim_valid`` are the layer's shortlist row.
@@ -86,6 +90,8 @@ def direct_gather_destinations(
         destinations_out,
         live_out,
         remap_out,
+        int(idle_destination),
+        int(idle_slot),
     )
 
 
@@ -112,7 +118,7 @@ def direct_commit_gather(
 
     ``mapping`` is the layer's ``[experts + 1]`` row (last column the dump), ``slot_*`` its ``[slots + 1]`` rows (last
     column the dump). ``delivered`` and ``keep`` are the leased backend's delivered count and keep flag, both or
-    neither; without them the truncation tripwire compares ``miss_count``. ``cpu_lanes`` (int32 ``[2]``: CPU lanes, then the part bits; CPU experts) is
+    neither; without them the truncation tripwire compares ``miss_count``. ``cpu_lanes`` (int32 ``[2]`` (``[3]`` on a wide wire): CPU lanes, then the part bits, then the lanes' high half; CPU experts) is
     the mask of lanes the CPU computed: never inserted, and not counted as truncated.
     """
     _commit_module().run(

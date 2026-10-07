@@ -1,5 +1,6 @@
-"""The draft CPU thread (host/draft_cpu_thread.h): the host half of the DSpark draft channel, on the instr build's fake
-CPU expert kernel.
+"""The DSpark draft channel's host half (a CpuExpertEngine's draft source, host/cpu_experts.h), on the instr build's fake
+CPU expert kernel, in both shapes the shared CPU team allows: a draft-only engine and group 0's engine of a host whose
+CPU experts are on (plan 2026-10-06 Task 11).
 
 The device half is played by test exports: draft_test_post writes what draft_post_kernel's thread 0 writes (the record
 under its seqlock, then the head), and _finish closes the gate with the device's Dekker half (draft_test_finish_close),
@@ -18,11 +19,12 @@ import torch
 from sglang.kernels.ops.moe import expert_lease_block as lease
 from sglang.kernels.ops.moe import expert_stream_transport as ops
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer, spawn_child
+from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer, spawn_child
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 H, STAGES, VARIANT, LANES = 64, 3, "instr", 8
+MODES = ["draft_only", "shared"]
 CAPACITY = 1 << 20  # stage s's layer has capacity CAPACITY + s, which the fake records per call
 
 
@@ -87,27 +89,33 @@ def _cores():
     return sorted(os.sched_getaffinity(0))[:2]
 
 
-def _host(request, *, spin_us=-1, keep_warm_us=0, fatal_wait_s=30.0, ns_per_expert=0):
-    from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas, DraftCpuHost
+def _host(request, mode, *, spin_us=-1, keep_warm_us=0, fatal_wait_s=30.0, ns_per_expert=0):
+    from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 
     areas = DraftCpuAreas(STAGES, H, pin=False)
     kernel = int(_module().expert_stream_test_kernel_address(ns_per_expert, 0, 0))
-    host = DraftCpuHost(areas, cores=_cores(), threads=2, spin_us=spin_us, keep_warm_us=keep_warm_us,
-                        fatal_wait_s=fatal_wait_s, variant=VARIANT)
+    host = draft_cpu_host(mode, areas, kernel, cores=_cores(), threads=2, spin_us=spin_us, keep_warm_us=keep_warm_us,
+                          fatal_wait_s=fatal_wait_s, tmp_path=request.getfixturevalue("tmp_path"))
     for stage in range(STAGES):
         host.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(H), capacity=CAPACITY + stage))
     host.start()
+    if mode == "shared":
+        request.addfinalizer(host.expert_host.stop)
     request.addfinalizer(host.stop)  # the fake's counters are per process: no thread may outlive its test
     return areas, host
 
 
-def _draft_cpu_s() -> float:
-    """The draft CPU thread's user + system time, from /proc."""
+# The shared engine's thread: RamTier::enable_cpu_experts names it "<layout>-cpu-exp" (one node: no group suffix).
+THREAD = {"draft_only": "dspark-cpu", "shared": "exl3-cpu-exp"}
+
+
+def _draft_cpu_s(mode) -> float:
+    """The draft channel's CPU thread's user + system time, from /proc."""
     for task in Path("/proc/self/task").iterdir():
-        if (task / "comm").read_text().strip() == "dspark-cpu":
+        if (task / "comm").read_text().strip() == THREAD[mode]:
             fields = (task / "stat").read_text().rsplit(")", 1)[1].split()
             return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
-    raise AssertionError("no draft CPU thread")
+    raise AssertionError("no CPU expert thread for the draft channel")
 
 
 def _until(predicate, timeout_s=2.0):
@@ -117,8 +125,9 @@ def _until(predicate, timeout_s=2.0):
         time.sleep(0.001)
 
 
-def test_one_stage_serves_m_rows(request):
-    areas, host = _host(request)
+@pytest.mark.parametrize("mode", MODES)
+def test_one_stage_serves_m_rows(request, mode):
+    areas, host = _host(request, mode)
     rows, k = 5, 3
     _stage(areas, 1, rows, k)
     _post(areas, 1, rows, k, seq=1)
@@ -133,8 +142,32 @@ def test_one_stage_serves_m_rows(request):
     assert (stats["jobs"], stats["rows"]) == (1, rows)
 
 
-def test_three_stages_in_turn_each_run_their_own_layer(request):
-    areas, host = _host(request)
+@pytest.mark.parametrize("mode", MODES)
+def test_stats_count_the_jobs_whose_routes_share_a_slot(request, mode):
+    """The EXL3 kernel groups a call's live routes by slot (up to CHUNK_M tokens per chunk), so a job whose routes name
+    one slot twice runs a chunk of several tokens: collided_jobs counts those jobs, shared_routes the routes past each slot's first, and
+    collided_forward_ns their forward time. -1 is not a route."""
+    areas, host = _host(request, mode, ns_per_expert=1000)
+    k = 3
+    jobs = [
+        [[0, 1, 2], [3, 4, 5]],  # every slot once
+        [[0, 1, 2], [2, -1, 5]],  # slot 2 twice
+        [[7, 7, -1]],  # one token routed twice to slot 7
+    ]
+    for seq, slots in enumerate(jobs, start=1):
+        rows = len(slots)
+        _stage(areas, 0, rows, k, seed=seq)
+        areas.slots[0, :rows, :k] = torch.tensor(slots, dtype=areas.slots.dtype)
+        _post(areas, 0, rows, k, seq=seq)
+        _finish(areas, seq)
+    stats = host.stats()
+    assert (stats["jobs"], stats["collided_jobs"], stats["shared_routes"]) == (3, 2, 2)
+    assert 0 < stats["collided_forward_ns"] < stats["forward_ns"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_three_stages_in_turn_each_run_their_own_layer(request, mode):
+    areas, host = _host(request, mode)
     for seq, stage in enumerate(range(STAGES), start=1):
         _stage(areas, stage, 2, 4, seed=seq)
         _post(areas, stage, 2, 4, seq=seq, epoch=7)
@@ -145,12 +178,13 @@ def test_three_stages_in_turn_each_run_their_own_layer(request):
     assert host.stats()["jobs"] == STAGES
 
 
-def test_the_head_store_ends_the_hold(request):
-    areas, host = _host(request, spin_us=-1, keep_warm_us=500_000)
+@pytest.mark.parametrize("mode", MODES)
+def test_the_head_store_ends_the_hold(request, mode):
+    areas, host = _host(request, mode, spin_us=-1, keep_warm_us=500_000)
     _stage(areas, 0, 1, 2)
     _post(areas, 0, 1, 2, seq=1)
     _finish(areas, 1)
-    m = _module()
+    m = _module()  # the fake counts keep_warm and keep_warm_either calls in one counter
     _until(lambda: int(m.expert_stream_test_keep_warm_calls()) >= 1)
     before = int(m.expert_stream_test_keep_warm_calls())
     _post(areas, 0, 1, 2, seq=2)
@@ -160,22 +194,24 @@ def test_the_head_store_ends_the_hold(request):
     assert int(m.expert_stream_test_keep_warm_calls()) == before + 1
 
 
-def test_an_idle_thread_sleeps_and_still_serves(request):
-    areas, host = _host(request, spin_us=20_000, keep_warm_us=0)
+@pytest.mark.parametrize("mode", MODES)
+def test_an_idle_thread_sleeps_and_still_serves(request, mode):
+    areas, host = _host(request, mode, spin_us=20_000, keep_warm_us=0)
     _stage(areas, 0, 1, 2)
     _post(areas, 0, 1, 2, seq=1)
     _finish(areas, 1)
     time.sleep(0.1)  # past the hold and the spin budget
-    before = _draft_cpu_s()
+    before = _draft_cpu_s(mode)
     time.sleep(0.3)
-    assert _draft_cpu_s() - before < 0.05
+    assert _draft_cpu_s(mode) - before < 0.05
     _post(areas, 0, 1, 2, seq=2)
     assert _finish(areas, 2) < 0.02
 
 
-def test_stop_with_a_closed_gate_returns_and_leaves_it_open(request):
+@pytest.mark.parametrize("mode", MODES)
+def test_stop_with_a_closed_gate_returns_and_leaves_it_open(request, mode):
     # No record is posted, so no forward completes and opens the gate: only stop() can.
-    areas, host = _host(request)
+    areas, host = _host(request, mode)
     _module().expert_stream_draft_test_finish_close(areas.channel.data_ptr(), 1, 0)
     assert _u32(areas.channel, areas.wire.gate) == lease.gate_word(1, "closed")
     started = time.monotonic()
@@ -188,14 +224,17 @@ _CHILD = """
 import dataclasses, os, sys, time
 import torch
 from sglang.kernels.ops.moe import expert_stream_transport as ops
-from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas, DraftCpuHost
-from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
+from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
+from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 case = sys.argv[1]
 m = ops._host_module("exl3", "instr")
 areas = DraftCpuAreas(3, 64, pin=False)
 kernel = int(m.expert_stream_test_kernel_address(0, 1 if case == "fail" else 0, 0))
 cores = sorted(os.sched_getaffinity(0))[:2]
-host = DraftCpuHost(areas, cores=cores, threads=2, spin_us=-1, keep_warm_us=0, fatal_wait_s=0.5, variant="instr")
+import tempfile
+mode = sys.argv[2]
+host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, spin_us=-1, keep_warm_us=0, fatal_wait_s=0.5,
+                      tmp_path=__import__("pathlib").Path(tempfile.mkdtemp(dir=os.getcwd())))
 for stage in range(3):
     host.set_layer(stage, kernel, fake_cpu_layer(64))
 host.start()
@@ -212,13 +251,14 @@ print("survived", flush=True)
 """
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize(
     "case, says",
     [("fail", ["DSpark draft CPU experts", "record 1", "failed"]), ("tear", ["DSpark draft CPU experts", "torn"]),
      ("hold", ["DSpark draft CPU experts", "record 1", "0.5"])],
 )
-def test_a_failure_fail_stops(case, says):
-    result = spawn_child(_CHILD, case, timeout_s=60, variant=VARIANT)
+def test_a_failure_fail_stops(case, says, mode):
+    result = spawn_child(_CHILD, case, mode, timeout_s=60, variant=VARIANT)
     assert "late" not in result.stdout, (result.stdout, result.stderr[-2000:])
     assert result.returncode != 0
     for text in says:
@@ -230,16 +270,19 @@ def test_a_failure_fail_stops(case, says):
 _STOP_CHILD = """
 import os, sys, time
 from sglang.kernels.ops.moe import expert_stream_transport as ops
-from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas, DraftCpuHost
-from sglang.test.dsv41_ram_miss_fixtures import fake_cpu_layer
+import tempfile
+from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
+from sglang.test.dsv41_ram_miss_fixtures import draft_cpu_host, fake_cpu_layer
 case = sys.argv[1]
+mode = sys.argv[2]
 m = ops._host_module("exl3", "instr")
 areas = DraftCpuAreas(3, 64, pin=False)
 kernel = int(m.expert_stream_test_kernel_address(0, 0, 0))
 cores = sorted(os.sched_getaffinity(0))[:2]
 polling = case == "poll"
-host = DraftCpuHost(areas, cores=cores, threads=2, spin_us=0 if polling else -1, keep_warm_us=0,
-                    fatal_wait_s=30.0 if polling else 0.5, variant="instr")
+host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, spin_us=0 if polling else -1, keep_warm_us=0,
+                      fatal_wait_s=30.0 if polling else 0.5,
+                      tmp_path=__import__("pathlib").Path(tempfile.mkdtemp(dir=os.getcwd())))
 for stage in range(3):
     host.set_layer(stage, kernel, fake_cpu_layer(64))
 host.start()
@@ -255,20 +298,22 @@ print("stopped" if polling else "late", flush=True)
 """
 
 
-def test_a_stop_between_the_poll_loads_is_not_a_torn_record():
+@pytest.mark.parametrize("mode", MODES)
+def test_a_stop_between_the_poll_loads_is_not_a_torn_record(mode):
     # stop() lands after the run loop read stop_ (false) and before it reads the head: the head word it bumped must
     # not be read as a posted record.
-    result = spawn_child(_STOP_CHILD, "poll", timeout_s=60, variant=VARIANT)
+    result = spawn_child(_STOP_CHILD, "poll", mode, timeout_s=60, variant=VARIANT)
     assert result.returncode == 0, result.stderr[-2000:]
     assert "stopped" in result.stdout
     assert "FATAL" not in result.stderr and "torn" not in result.stderr, result.stderr[-2000:]
 
 
-def test_a_stop_during_a_hung_forward_still_fail_stops():
+@pytest.mark.parametrize("mode", MODES)
+def test_a_stop_during_a_hung_forward_still_fail_stops(mode):
     # The watchdog outlives stop(): a forward that never returns aborts within the fatal wait instead of hanging
     # the join.
     try:
-        result = spawn_child(_STOP_CHILD, "hung", timeout_s=20, variant=VARIANT)
+        result = spawn_child(_STOP_CHILD, "hung", mode, timeout_s=20, variant=VARIANT)
     except subprocess.TimeoutExpired:
         pytest.fail("stop() hung behind a forward that never returned: the watchdog had stopped")
     assert "late" not in result.stdout, (result.stdout, result.stderr[-2000:])

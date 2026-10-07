@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Production DSV4.1 server (port 7867): the arm_env base recipe, unchanged, from the checkout this script lives in.
+# Production DSV4.1 server (port 7867): arm_env.prod_env(): the base recipe, plus the
+# DSpark mode when arm_env.PROD_DSPARK is set, from the checkout this script lives in.
 # Every flag and env var comes from arm_env.py, so production and the benchmark arms cannot drift apart.
 #
 # Usage: launch_prod.sh >> server.log 2>&1
@@ -22,7 +23,8 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
     PYTHONPATH="$repo/python:$here" "$py" -c '
 import arm_env, sglang
 print("sglang:", sglang.__file__)
-for k, v in sorted(arm_env.base_env().items()):
+print("dspark:", arm_env.PROD_DSPARK)
+for k, v in sorted(arm_env.prod_env().items()):
     print(f"env {k}={v}")
 print("argv:", " ".join(arm_env.ServerArgs.prod().argv()))
 '
@@ -49,7 +51,7 @@ import os
 import arm_env
 
 env = os.environ.copy()
-env.update(arm_env.base_env())
+env.update(arm_env.prod_env())
 argv = arm_env.ServerArgs.prod().argv()
 os.execvpe(argv[0], argv, env)
 '

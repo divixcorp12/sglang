@@ -54,7 +54,7 @@ struct Exl3Quant
     static constexpr const char* kName = "exl3";
     static constexpr int kSlabs = kSlabNames;
     static constexpr uint32_t kOptionalSlabs = 0;
-    static constexpr int kMaxRoutes = 32;     // the forward's k limit
+    static constexpr int kMaxRoutes = 64;     // the forward's k limit: a job's lanes, up to the wire's 64 (dispatch sizes everything from k)
     static constexpr int kMaxRows = 65536;    // the forward's rows limit
     // The library holds every tier and runs min(host, EXL3_MOE_CPU_MAX_ISA).
     static constexpr Isa kTopIsa = Isa::Vbmi;

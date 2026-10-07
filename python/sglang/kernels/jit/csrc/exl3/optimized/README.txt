@@ -7,14 +7,19 @@ There is no persistent weight repacking or increase in expert weight storage.
 
 Selection
 ---------
-For a single chunk with H=5120, I=2304, one token, residual activation rows,
+For a call whose chunks each hold 1..CHUNK_M tokens (CHUNK_M = MAX_M / 2; MAX_M is
+EXL3_MOE_CPU_MAX_M, default 4), with H=5120, I=2304, residual activation rows,
 128-element quantization blocks, 3-bit unswizzled matrices and AVX512BW:
-  one expert: range3_unroll (range-aware neighboring-band traversal);
-  multiple experts: unroll_small (one-band traversal).
-The measured multiple-expert counts are 3 and 5; counts 2, 4 and above 5
-use the same default but have no measured performance claim. Invalid/duplicate
-routes and multi-token chunks retain the generic path. Existing scalar, AVX2
-and other ISA/bit-width fallbacks are retained.
+  one expert, one token: range3_unroll (range-aware neighboring-band traversal);
+  other one-token chunks: unroll_small (one-band traversal);
+  chunks of M > 1 tokens: register_tiles<M>, all M tokens sharing each decoded tile,
+  kRegisterBudget[M - 1].pairs tile pairs per call.
+kRegisterBudget (math_avx512.hpp) holds one entry per M and a static_assert keeps each
+within 32 zmm; raising MAX_M needs an entry per new M. The measured multiple-expert
+counts are 3 and 5; counts 2, 4 and above 5 use the same default but have no
+measured performance claim. Every chunk size is bit-identical to the generic plan
+(test_exl3_cpu_dsv41_plan_multitoken.py). Invalid routes retain the generic path.
+Existing scalar, AVX2 and other ISA/bit-width fallbacks are retained.
 
 Both selections include the register decoder, hoisted coefficients, register Hadamard, parallel 128-element
 preparation/middle stages, fused down output transform, cache-line output ownership, compact activation scratch,
@@ -90,7 +95,9 @@ The tier is min(host, EXL3_MOE_CPU_MAX_ISA), read at the first forward or tier q
 "exl3 isa <tier>" to stderr then. A forward is ForwardPlan<Shape, Isa>::run (forward_plan.hpp),
 picked once per call in Exl3Quant::dispatch: ForwardPlan<Dsv41Shape, Isa::Bw> when Dsv41Shape::accepts the call on
 an AVX-512BW host, else ForwardPlan<GenericShape, I> for the host's tier. PlanTraits<Dsv41Shape, Isa::Bw> is the one
-specialization: compact scratch, grouped traversal, wide single-expert quantization. A plan reads every layer fact
+specialization: compact scratch (chunks of 1..CHUNK_M tokens), grouped traversal and wide single-expert quantization (one token).
+MAX_M (math.hpp) is one build-time constant, EXL3_MOE_CPU_MAX_M; the generic tiers' tile tables (kTiles) and the
+register dispatch (register_tiles_for) are generated from it. A plan reads every layer fact
 through its Shape (shapes.hpp): GenericShape from the ExpertLayer, Dsv41Shape as compile-time constants (5120/2304,
 3-bit unswizzled, activation limit 10; a layer with any other value takes the generic plan). Every layer is gated SiLU.
 Plans read experts through Experts<Shape> (quant.hpp): slot e's gate, up and down, each an Exl3Projection over the

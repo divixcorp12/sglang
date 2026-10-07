@@ -210,10 +210,10 @@ def test_the_service_builds_for_the_widest_planned_gather(tiers, width, lanes):
     assert service.resolved_lanes() == lanes
 
 
-def test_a_gather_wider_than_32_is_refused(tiers):
+def test_a_gather_wider_than_64_is_refused(tiers):
     service, _, _ = tiers
-    with pytest.raises(ValueError, match="1..32"):
-        service.plan_gather_width(33)
+    with pytest.raises(ValueError, match="1..64"):
+        service.plan_gather_width(65)
     assert service.resolved_lanes() == 8, "a refused width leaves the plan as it was"
 
 
@@ -1444,3 +1444,75 @@ def test_the_prefill_share_refuses_the_no_op_recorder(tiers, monkeypatch):
     with envs.SGLANG_DSV41_ENABLE_PREFILL_SHARE.override(True):
         with pytest.raises(RuntimeError, match="SGLANG_DSV41_ENABLE_PREFILL_SHARE"):
             service.ensure_started()
+
+
+def _place_tier_off_the_gpu_node(monkeypatch):
+    """The tier's plans cover nodes the GPU's node (99 here, on no machine) is not among."""
+    import dataclasses
+
+    from_env = module.ThreadingConfig.from_env.__func__
+    monkeypatch.setattr(
+        module.ThreadingConfig,
+        "from_env",
+        classmethod(lambda cls, **kw: dataclasses.replace(from_env(cls, **kw), gpu_node=99)),
+    )
+
+
+def test_draft_host_starts_the_service_first(tiers, monkeypatch):
+    """A draft prepared before the target's first gather reaches draft_host with the service unstarted."""
+    service, _, _ = tiers
+    started = []
+    ensure_started = service.ensure_started
+    monkeypatch.setattr(service, "ensure_started", lambda: (started.append(True), ensure_started())[1])
+    with pytest.raises(RuntimeError, match="SGLANG_DSV41_CPU_EXPERTS is off"):
+        service.draft_host([], fatal_wait_s=1.0)
+    assert started == [True]
+    assert service.host is not None
+
+
+def test_draft_host_refuses_without_cpu_experts(tiers):
+    service, _, _ = tiers
+    service.ensure_started()
+    assert service.cpu_experts is None
+    with pytest.raises(RuntimeError, match="SGLANG_DSV41_CPU_EXPERTS is off"):
+        service.draft_host([], fatal_wait_s=1.0)
+
+
+def test_a_tier_placement_without_the_gpu_node_starts_without_a_draft(tiers, monkeypatch):
+    """The GPU node's group is needed only by the DSpark draft: a launch whose SGLANG_MOE_PINNED_HOST_NUMA_MB leaves the
+    GPU's node out must still start (it did before the draft channel existed)."""
+    service, _, _ = tiers
+    _place_tier_off_the_gpu_node(monkeypatch)
+    service.ensure_started()
+    assert service.host is not None
+
+
+def test_draft_host_names_the_placement_when_the_gpu_node_has_no_group(tiers, monkeypatch):
+    service, _, _ = tiers
+    _place_tier_off_the_gpu_node(monkeypatch)
+    service.ensure_started()
+    service.cpu_experts = object()  # as if the CPU experts had started
+    try:
+        with pytest.raises(RuntimeError, match=r"GPU's node 99.*SGLANG_MOE_PINNED_HOST_NUMA_MB"):
+            service.draft_host([], fatal_wait_s=1.0)
+    finally:
+        service.cpu_experts = None
+
+
+def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypatch):
+    """M3. Every real DSV4.1 streamer's layer has top_k; a stand-in without it must give a named RuntimeError at
+    service start, not an AttributeError out of the token count."""
+    from sglang.srt.layers.moe.cpu_experts import service as cpu_service
+
+    monkeypatch.setattr(cpu_service, "cpu_trait_for", lambda key: SimpleNamespace(hidden_size=lambda slabs: 8))
+    cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
+    streamers = {
+        3: SimpleNamespace(
+            pinned_host_cache=SimpleNamespace(tensors={}), layer=SimpleNamespace(layer_id=3), graph_gather_rows=36
+        )
+    }
+    with envs.SGLANG_MOE_EXPERT_FUSED_PLAN.override(True):
+        with pytest.raises(RuntimeError, match="layer 3.*top_k"):
+            module.Exl3RamMissService._start_cpu_experts(
+                cfg, object(), SimpleNamespace(key="exl3"), streamers, False, None, planned_routes=36
+            )

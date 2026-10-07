@@ -23,7 +23,7 @@ LANES = lease.wire_layout(8).lanes
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
-def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD_NS, lanes=8):
+def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD_NS, lanes=8, tokens=1, max_rows=None):
     s = ram_miss_setup(tmp_path, capacity=capacity, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     host = attached_host(s, new_page(pin=False, wire=lease.wire_layout(lanes)), k=3, lanes=lanes)
     host.enable_copy_engine(-1)
@@ -33,10 +33,17 @@ def _host(tmp_path, *, capacity=12, sm_mask=0, register=True, forward_ns=FORWARD
         dtype=torch.int64,
     )
     host.set_copy_table(ROW, table, DST_ROWS, sm_mask=sm_mask)
-    x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
-    out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
+    if tokens == 1:
+        x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
+        out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
+    else:  # a verify's rows: the tokens' inputs and the token table (cpu_token_table.h)
+        x_rows = torch.zeros((ROWS, lease.cpu_row_bytes(HIDDEN, tokens, host.wire.lanes)), dtype=torch.uint8)
+        out_rows = torch.zeros((ROWS, 2, tokens, HIDDEN), dtype=torch.float32)
     cores = sorted(os.sched_getaffinity(0))[:2]
-    host.enable_cpu_experts(host.test_kernel_address(forward_ns), [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2)
+    kernel = host.test_kernel_address(forward_ns)
+    if max_rows is not None:
+        host.test_kernel_max_rows(max_rows)
+    host.enable_cpu_experts(kernel, [0] * (host.wire.lanes + 1), cores, x_rows, out_rows, threads=2)
     if register:
         host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     row_bytes = [t[0].numel() * t.element_size() for t in s.slabs[ROW].values()]
@@ -160,3 +167,83 @@ def test_calibration_runs_on_the_first_row_with_a_slot_per_lane(capacities, lane
     from sglang.srt.layers.moe.cpu_experts.service import calibration_row
 
     assert calibration_row(capacities, lanes) == row
+
+
+def test_a_capped_calibration_times_only_its_lanes(tmp_path):
+    """Spill caps calibration at the victim lanes (the split is only indexed below them): a 16-lane host told 4 lanes
+    times the 4-lane cells, leaves every other cell 0, and needs 4 experts of scratch."""
+    _, host, _, _keep = _host(tmp_path, capacity=20, lanes=16)
+    jobs_before = host.cpu_stats()["jobs"]
+    scratch = torch.zeros(4 * host.copy_expert_bytes(ROW), dtype=torch.uint8)
+    grid = host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=scratch, lanes=4)
+    assert tuple(grid.shape) == (18, 17)
+    assert all(grid[0, k] > 0 for k in range(1, 5)) and not any(grid[0, 5:])
+    for n in range(1, 17):
+        row = grid[1 + n]
+        assert all(row[k] > 0 for k in range(n + 1)) if n <= 4 else not any(row), n
+    assert host.cpu_stats()["jobs"] - jobs_before == (4 + 10) * 2
+
+
+def test_the_capped_split_keeps_the_configured_entries_above_the_cap():
+    from sglang.srt.layers.moe.cpu_experts.policy import capped_split, split_from_grid
+
+    grid = [[0.0] * 17 for _ in range(18)]
+    for n in range(1, 5):
+        for k in range(n + 1):
+            grid[1 + n][k] = 10.0 - k  # more CPU lanes are faster: split[n] = n
+    configured = list(range(100, 117))
+    assert capped_split(grid, 4, configured) == [0, 1, 2, 3, 4] + configured[5:]
+    assert capped_split(grid, 4, configured)[:5] == split_from_grid([r[:5] for r in grid[:6]])
+
+
+def _calls_per_job(host, jobs_before, run):
+    run()
+    jobs = host.cpu_stats()["jobs"] - jobs_before
+    return jobs, host.test_kernel_calls()
+
+
+def test_a_one_token_calibration_runs_one_row_jobs(tmp_path):
+    """tokens == 1 (BS1, no spill) is today's calibration: one forward row per job, as before."""
+    _, host, _, _keep = _host(tmp_path)
+    jobs_before = host.cpu_stats()["jobs"]
+    jobs, calls = _calls_per_job(
+        host, jobs_before, lambda: host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), lanes=4)
+    )
+    assert jobs > 0 and len(calls) == jobs
+
+
+def test_a_verify_calibration_runs_per_token_jobs_of_the_verifys_tokens(tmp_path):
+    """The split decides per_token jobs of the verify's token count, so the calibration's CPU jobs are per_token with
+    that many rows, each token routing every lane (a synthetic all-routed mask)."""
+    tokens = 6
+    _, host, _, _keep = _host(tmp_path, capacity=20, lanes=16, tokens=tokens)
+    jobs_before = host.cpu_stats()["jobs"]
+    scratch = torch.zeros(4 * host.copy_expert_bytes(ROW), dtype=torch.uint8)
+    jobs, calls = _calls_per_job(
+        host,
+        jobs_before,
+        lambda: host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=scratch, lanes=4, tokens=tokens),
+    )
+    assert jobs == (4 + 10) * 2
+    assert len(calls) == jobs * tokens
+    for first in range(0, len(calls), tokens):
+        job = calls[first : first + tokens]
+        k = len(job[0]["slots"])
+        assert 1 <= k <= 4
+        for call in job:  # every token holds all k lanes: none is -1, weight 1
+            assert len(call["slots"]) == k and -1 not in call["slots"] and call["weights"] == [1.0] * k
+
+
+@pytest.mark.parametrize("held, asked", [(6, 0), (6, 7), (1, 2)])
+def test_a_calibration_asks_for_no_more_tokens_than_the_rows_hold(tmp_path, held, asked):
+    _, host, _, _keep = _host(tmp_path, tokens=held)
+    with pytest.raises(RuntimeError, match="tokens"):
+        host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), tokens=asked)
+
+
+def test_a_kernel_that_takes_fewer_rows_than_the_verify_has_tokens_is_refused_at_enable(tmp_path):
+    """M1. Mutation: validate() skips the tokens <= kernel max_rows check; the engine then enables, and the first
+    verify's job fails its forward mid-serve (fail-stop) instead of the enable refusing."""
+    with pytest.raises(RuntimeError, match="rows per forward"):
+        _host(tmp_path, tokens=6, max_rows=5)
+    _host(tmp_path, tokens=6, max_rows=6)  # the same kernel at exactly the verify's tokens enables

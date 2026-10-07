@@ -21,10 +21,11 @@ from typing import Mapping, Optional, Sequence
 
 import torch
 
+from sglang.kernels.ops.moe.expert_lease_block import cpu_row_bytes
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.cpu_experts.policy import (
+    capped_split,
     format_calibration,
-    split_from_grid,
     split_table,
 )
 
@@ -84,6 +85,10 @@ class CpuExpertService:
     At several NUMA nodes there is one service per group (``CpuExpertGroups``): each runs
     its own engine on its node's cores and writes its own two output parts of a row. A
     service made with ``shared`` uses that service's pinned rows and layer specs.
+
+    A verify's rows (``tokens`` > 1) hold each token's input and output, and the post's token table after the inputs.
+    Under spill, calibration stops at ``calibration_lanes`` (the victim lanes), the most eligible lanes a split entry is
+    ever read for.
     """
 
     def __init__(
@@ -99,6 +104,8 @@ class CpuExpertService:
         pin: bool = True,
         group: int = 0,
         shared: Optional["CpuExpertService"] = None,
+        tokens: int = 1,
+        calibration_lanes: Optional[int] = None,
     ):
         from sglang.srt.layers.moe.cpu_experts.threading_config import check_engine_cores
 
@@ -112,6 +119,8 @@ class CpuExpertService:
         self.slabs_by_row = dict(slabs_by_row)
         self.hidden, self.cores, self.threads = int(hidden), tuple(cores), int(threads)
         self.split = list(split)
+        self.tokens = int(tokens)  # a verify's tokens per row: calibration times jobs of this shape
+        self.calibration_lanes = min(int(calibration_lanes or self.lanes), self.lanes)
         self.calibrated = False
         self._calibration_stats = {"jobs": 0, "lanes": 0, "forward_ns": 0}
         self._calibration_scratch: Optional[torch.Tensor] = None
@@ -123,10 +132,11 @@ class CpuExpertService:
         if shared is not None:
             self.x_rows, self.out_rows, self.layers = shared.x_rows, shared.out_rows, shared.layers
         else:
-            # Row layout is in the class doc; pinned so the device reaches them by UVA.
-            x_bytes = -(-2 * self.hidden // 16) * 16
-            self.x_rows = torch.zeros((rows, x_bytes), dtype=torch.uint8)
-            self.out_rows = torch.zeros((rows, 2 * host.nodes, self.hidden), dtype=torch.float32)
+            # Row layout is in the class doc; pinned so the device reaches them by UVA. A verify's rows hold its tokens
+            # and the token table (cpu_token_table.h).
+            self.x_rows = torch.zeros((rows, cpu_row_bytes(self.hidden, tokens, self.lanes)), dtype=torch.uint8)
+            shape = (2 * host.nodes, self.hidden) if tokens == 1 else (2 * host.nodes, tokens, self.hidden)
+            self.out_rows = torch.zeros((rows, *shape), dtype=torch.float32)
             if pin:
                 self.x_rows, self.out_rows = (
                     self.x_rows.pin_memory(),
@@ -275,12 +285,13 @@ class CpuExpertService:
             or not envs.SGLANG_DSV41_ENABLE_CPU_EXPERTS_CALIBRATION.get()
         ):
             return None
-        row = calibration_row({r: self._group_slots(r) for r in self.layers}, self.lanes)
+        width = self.calibration_lanes
+        row = calibration_row({r: self._group_slots(r) for r in self.layers}, width)
         if row is None:
             logger.warning(
                 "CPU experts group %d calibration skipped: no registered row has %d RAM slots; keeping split %s",
                 self.group,
-                self.lanes,
+                width,
                 self.split,
             )
             return None
@@ -290,12 +301,13 @@ class CpuExpertService:
         try:
             expert_bytes = self.host.copy_expert_bytes(row)
             scratch = torch.empty(
-                self.lanes * expert_bytes,
+                width * expert_bytes,
                 dtype=torch.uint8,
                 device="cpu" if device < 0 else torch.device("cuda", device),
             )
             grid = self.host.calibrate_cpu_split(
-                row, device=device, reps=reps, scratch=scratch, group=self.group
+                row, device=device, reps=reps, scratch=scratch, group=self.group, lanes=width,
+                tokens=self.tokens,
             ).tolist()
         except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
             # A timed-out DMA may still write into the scratch: keep its block out of
@@ -310,11 +322,11 @@ class CpuExpertService:
             )
             return None
         self._exclude_calibration_stats(before)
-        split = split_from_grid(grid)
+        split = capped_split(grid, width, self.split)
         self.split, self.calibrated = split, True
         self.host.set_cpu_split(split, group=self.group)
         report = format_calibration(
-            grid, split, row=row, expert_bytes=expert_bytes, reps=reps
+            [r[: width + 1] for r in grid[: width + 2]], split[: width + 1], row=row, expert_bytes=expert_bytes, reps=reps
         )
         print(report, flush=True)
         logger.info("%s", report)
@@ -351,7 +363,10 @@ class CpuExpertGroups:
     split is configured, re-tuned and calibrated per group.
     """
 
-    def __init__(self, host, trait, slabs_by_row, *, hidden: int, plans, split: Sequence[int], pin: bool = True):
+    def __init__(
+        self, host, trait, slabs_by_row, *, hidden: int, plans, split: Sequence[int], pin: bool = True,
+        tokens: int = 1, calibration_lanes: Optional[int] = None,
+    ):
         self.services: list[CpuExpertService] = []
         for plan in plans:
             self.services.append(
@@ -366,6 +381,8 @@ class CpuExpertGroups:
                     pin=pin,
                     group=plan.group,
                     shared=self.services[0] if self.services else None,
+                    tokens=tokens,
+                    calibration_lanes=calibration_lanes,
                 )
             )
         self.x_rows, self.out_rows = self.services[0].x_rows, self.services[0].out_rows

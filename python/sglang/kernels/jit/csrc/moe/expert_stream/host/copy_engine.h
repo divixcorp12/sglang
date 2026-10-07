@@ -41,12 +41,12 @@ struct CopyJob {
   uint64_t gen = 0;
   int64_t idx = 0;
   int64_t row = 0;
-  uint32_t mask = 0;
+  Wire::LaneMask mask = 0;
   int count = 0;
   CopyLane lanes[Wire::kLanes];
   int64_t submit_ns = 0;
   int64_t token = kNoToken;  // the backend's mark after the job's last copy
-  uint32_t cpu_mask = 0;
+  Wire::LaneMask cpu_mask = 0;
   uint32_t cpu_seq = 0;
   int late_cpu = 0;
   uint32_t late_seq = 0;

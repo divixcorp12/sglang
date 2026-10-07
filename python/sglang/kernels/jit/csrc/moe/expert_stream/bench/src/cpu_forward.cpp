@@ -7,7 +7,7 @@
 // compared bit-exactly with the frozen references; setup, warmup and checks are excluded from the reported latency.
 //
 //   Options / parse_options   the command line
-//   Workload                  one expert count's layers, slots and routing weights
+//   Workload / RoutedWorkload   one expert count's layers (frozen references) / one routed M-row workload
 //   full_forward              the Google Benchmark body and its p50/p95/p99 counters
 //
 // See python/sglang/kernels/jit/csrc/moe/expert_stream/bench/README.txt.
@@ -26,13 +26,17 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <omp.h>
+#include <random>
 #include <sched.h>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #ifdef EXL3_BENCH_BASELINE
 #include <c10/util/Half.h>
@@ -57,6 +61,9 @@ struct Options {
   int warmup = 128;
   int gap_us = 0;
   bool validate_only = false;
+  std::vector<std::string> routed;  // --routed=M:k:pattern,...: routed workloads (optimized build only)
+  int routed_slots = 48;
+  int routed_layers = 2;
 };
 
 // Parses a non-negative decimal integer; throws on anything else.
@@ -107,6 +114,14 @@ Options parse_options(int& argc, char** argv) {
       opt.warmup = number(value("--warmup-forwards="));
     else if (arg.starts_with("--gap-us="))
       opt.gap_us = number(value("--gap-us="));
+    else if (arg.starts_with("--routed=")) {
+      std::stringstream list(value("--routed="));
+      for (std::string item; std::getline(list, item, ',');)
+        opt.routed.push_back(item);
+    } else if (arg.starts_with("--routed-slots="))
+      opt.routed_slots = number(value("--routed-slots="));
+    else if (arg.starts_with("--routed-layers="))
+      opt.routed_layers = number(value("--routed-layers="));
     else if (arg == "--validate-only")
       opt.validate_only = true;
     else if (arg == "--help") {
@@ -115,6 +130,7 @@ Options parse_options(int& argc, char** argv) {
                    "--fixture=FILE --reference-dir=DIR --cpus=18-33 --workers=N\n"
                    "--numa-node=1 verifies CPU topology only; does not bind memory.\n"
                    "--warmup-forwards=128 --gap-us=0 --validate-only\n"
+                   "--routed=M:k:shared<G>|random,... --routed-slots=48 --routed-layers=2 (optimized build)\n"
                    "Google Benchmark flags are also accepted.\n";
       argv[remaining++] = argv[i];
     } else
@@ -154,7 +170,7 @@ void verify_workers(const std::set<int>& before, const std::vector<int32_t>& cor
 }
 
 #ifndef EXL3_BENCH_BASELINE
-// One fixture layer's first `experts` experts as the pinned tier holds them, expert e in slot e of six slabs
+// One fixture layer as the pinned tier holds it: `slots` slots, slot s holding fixture expert s % 5, in six slabs
 // (w13_trellis, w13_suh, w13_svh, w2_trellis, w2_suh, w2_svh; w13 rows hold gate then up), and the kernel's layer
 // over them.
 struct SlabLayer {
@@ -166,9 +182,10 @@ struct SlabLayer {
   std::array<std::unique_ptr<uint8_t, Free>, 6> slabs;
   ::sglang::cpu_experts::ExpertLayer layer;
 
-  SlabLayer(const LayerFixture& f, int hidden, int experts) {
+  SlabLayer(const LayerFixture& f, int hidden, int slots) {
+    const int experts = static_cast<int>(f.matrices[0].size());
     ::sglang::cpu_experts::ExpertLayer shape;
-    shape.capacity = experts;
+    shape.capacity = slots;
     shape.hidden = hidden;
     shape.intermediate = static_cast<int32_t>(f.matrices[0][0].size(1)) * 16;
     shape.activation = 0;
@@ -181,12 +198,12 @@ struct SlabLayer {
       else parts = {&f.matrices[3 + n]};
       size_t row = 0;
       for (const auto* part : parts) row += (*part)[0].nbytes();
-      slabs[n].reset(static_cast<uint8_t*>(std::aligned_alloc(64, (experts * row + 63) / 64 * 64)));
+      slabs[n].reset(static_cast<uint8_t*>(std::aligned_alloc(64, (slots * row + 63) / 64 * 64)));
       if (!slabs[n]) throw std::runtime_error("Cannot allocate a slab");
-      for (int e = 0; e < experts; ++e) {
-        uint8_t* dst = slabs[n].get() + e * row;
+      for (int s = 0; s < slots; ++s) {
+        uint8_t* dst = slabs[n].get() + s * row;
         for (const auto* part : parts) {
-          const at::Tensor t = (*part)[e].contiguous();
+          const at::Tensor t = (*part)[s % experts].contiguous();
           std::memcpy(dst, t.data_ptr(), t.nbytes());
           dst += t.nbytes();
         }
@@ -266,6 +283,10 @@ struct Workload {
     return fixture.layers.size();
   }
 
+  void label(benchmark::State& state) const {
+    state.counters["experts"] = experts;
+  }
+
   // One full forward on `layer`, writing `output`. Throws if the call fails.
   void forward(size_t layer) {
 #ifdef EXL3_BENCH_BASELINE
@@ -299,6 +320,106 @@ struct Workload {
   }
 };
 
+#ifndef EXL3_BENCH_BASELINE
+// The slab layers every routed workload shares: the first --routed-layers fixture layers, --routed-slots slots each.
+using RoutedLayers = std::vector<std::unique_ptr<SlabLayer>>;
+
+// One --routed=M:k:pattern workload: M token rows of k routes each, rotating over the routed layers. Token t's input
+// is its layer's fixture input rotated by 641 * t elements. Patterns: shared<G> (tokens in groups of G share all k
+// slots, so every chunk holds min(G, CHUNK_M) tokens; shared1 shares nothing), random (each token k distinct slots,
+// seeded). No frozen reference: validate checks the outputs are finite and that a second run repeats them bit for bit.
+struct RoutedWorkload {
+  const Fixture& fixture;
+  const Options& options;
+  const RoutedLayers& layers;
+  int rows = 0, k = 0;
+  std::string pattern;
+  std::vector<std::vector<at::Half>> inputs;  // per layer, [rows][hidden]
+  std::vector<int32_t> slots;
+  std::vector<float> weights;
+  std::vector<float> output;
+
+  RoutedWorkload(const Fixture& f, const Options& opt, const RoutedLayers& l, const std::string& spec)
+      : fixture(f), options(opt), layers(l) {
+    std::stringstream fields(spec);
+    std::string m, kk;
+    if (!std::getline(fields, m, ':') || !std::getline(fields, kk, ':') || !std::getline(fields, pattern))
+      throw std::runtime_error("--routed takes M:k:pattern, not " + spec);
+    rows = number(m);
+    k = number(kk);
+    const int capacity = opt.routed_slots;
+    int group = 0;  // shared<G>: G; random: 0
+    if (pattern.starts_with("shared"))
+      group = number(pattern.substr(6));
+    else if (pattern != "random")
+      throw std::runtime_error("Unknown routed pattern: " + pattern);
+    if (pattern.starts_with("shared") && group < 1) throw std::runtime_error("shared<G> needs G >= 1: " + spec);
+    const int needed = group ? (rows + group - 1) / group * k : k;
+    if (rows < 1 || k < 1 || needed > capacity)
+      throw std::runtime_error(spec + " needs " + std::to_string(needed) + " slots of " + std::to_string(capacity));
+    std::mt19937 rng(20261006u + 1000u * rows + k);
+    std::vector<int32_t> pool(capacity);
+    for (int t = 0; t < rows; ++t) {
+      std::iota(pool.begin(), pool.end(), 0);
+      for (int j = 0; j < k; ++j) {
+        int32_t slot;
+        if (group)
+          slot = t / group * k + j;
+        else {
+          std::swap(pool[j], pool[j + rng() % (capacity - j)]);
+          slot = pool[j];
+        }
+        slots.push_back(slot);
+        weights.push_back(0.071234f + (k == 1 ? 0.0f : 0.23f * j / (k - 1)));
+      }
+    }
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+      const auto* x = static_cast<const at::Half*>(fixture.layers[layer].input.data_ptr());
+      std::vector<at::Half> rows_x(static_cast<size_t>(rows) * f.hidden);
+      for (int t = 0; t < rows; ++t)
+        for (int i = 0; i < f.hidden; ++i)
+          rows_x[static_cast<size_t>(t) * f.hidden + i] = x[(i + 641 * t) % f.hidden];
+      inputs.push_back(std::move(rows_x));
+    }
+    output.resize(static_cast<size_t>(rows) * f.hidden);
+  }
+
+  size_t layer_count() const {
+    return layers.size();
+  }
+
+  void forward(size_t layer) {
+    ::sglang::cpu_experts::ForwardCall call;
+    call.rows = rows;
+    call.k = k;
+    call.threads = options.workers;
+    call.x = inputs[layer].data();
+    call.slots = slots.data();
+    call.weights = weights.data();
+    call.out = output.data();
+    call.cores = g_cores;
+    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call);
+  }
+
+  void validate() {
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+      forward(layer);
+      const std::vector<float> first = output;
+      for (float value : first)
+        if (!std::isfinite(value)) throw std::runtime_error("Non-finite routed output");
+      forward(layer);
+      if (std::memcmp(first.data(), output.data(), first.size() * sizeof(float)))
+        throw std::runtime_error("A routed forward did not repeat bit for bit");
+    }
+  }
+
+  void label(benchmark::State& state) const {
+    state.counters["rows"] = rows;
+    state.counters["k"] = k;
+  }
+};
+#endif
+
 // The `fraction` quantile of `samples` in microseconds (nearest rank); reorders `samples`.
 double quantile(std::vector<double>& samples, double fraction) {
   const size_t index = size_t(fraction * (samples.size() - 1));
@@ -308,11 +429,15 @@ double quantile(std::vector<double>& samples, double fraction) {
 
 // The benchmark body: validate, warm up, time `forward` per iteration, validate again. A failure marks the benchmark
 // skipped with the error and fails the process.
-void full_forward(benchmark::State& state, Workload& workload) {
+template <class W>
+void full_forward(benchmark::State& state, W& workload) {
   try {
     workload.validate();
     for (int i = 0; i < workload.options.warmup; ++i)
       workload.forward(i % workload.layer_count());
+#ifndef EXL3_BENCH_BASELINE
+    const SglangExl3CpuPlanCalls before = ::sglang::exl3_cpu::exl3_cpu_plan_calls();
+#endif
     std::vector<double> samples;
     size_t layer = 0;
     for (auto _ : state) {
@@ -327,13 +452,18 @@ void full_forward(benchmark::State& state, Workload& workload) {
       layer = (layer + 1) % workload.layer_count();
       benchmark::DoNotOptimize(workload.output.data());
     }
+#ifndef EXL3_BENCH_BASELINE
+    const SglangExl3CpuPlanCalls after = ::sglang::exl3_cpu::exl3_cpu_plan_calls();
+    state.counters["dsv41_calls"] = static_cast<double>(after.dsv41 - before.dsv41);
+    state.counters["generic_calls"] = static_cast<double>(after.generic - before.generic);
+#endif
     workload.validate();
     if (!samples.empty()) {
       state.counters["p50_us"] = quantile(samples, 0.50);
       state.counters["p95_us"] = quantile(samples, 0.95);
       state.counters["p99_us"] = quantile(samples, 0.99);
     }
-    state.counters["experts"] = workload.experts;
+    workload.label(state);
     state.counters["workers"] = workload.options.workers;
     state.counters["layers"] = workload.layer_count();
   } catch (const std::exception& error) {
@@ -385,6 +515,23 @@ int main(int argc, char** argv) {
       workload->validate();
       workloads.push_back(std::move(workload));
     }
+#ifndef EXL3_BENCH_BASELINE
+    RoutedLayers routed_layers;
+    std::vector<std::unique_ptr<RoutedWorkload>> routed;
+    if (!options.routed.empty()) {
+      if (options.routed_layers < 1 || options.routed_layers > int(fixture.layers.size()) || options.routed_slots < 1)
+        throw std::runtime_error("Invalid --routed-layers or --routed-slots");
+      for (int layer = 0; layer < options.routed_layers; ++layer)
+        routed_layers.push_back(std::make_unique<SlabLayer>(fixture.layers[layer], fixture.hidden, options.routed_slots));
+      for (const auto& spec : options.routed) {
+        routed.push_back(std::make_unique<RoutedWorkload>(fixture, options, routed_layers, spec));
+        routed.back()->validate();
+      }
+      std::cerr << "Verified " << routed.size() << " routed workloads repeat bit for bit\n";
+    }
+#else
+    if (!options.routed.empty()) throw std::runtime_error("--routed runs on the optimized build only");
+#endif
     verify_workers(before, cores);
     std::cerr << "Verified 24 bit-exact layer outputs; individually pinned worker CPUs: ";
     for (int cpu : cores)
@@ -404,6 +551,9 @@ int main(int argc, char** argv) {
       benchmark::AddCustomContext("gap_us", std::to_string(options.gap_us));
       benchmark::AddCustomContext("memory_policy", "inherited; no benchmark membind");
       benchmark::AddCustomContext("compiler", __VERSION__);
+#ifndef EXL3_BENCH_BASELINE
+      benchmark::AddCustomContext("chunk_m", std::to_string(::sglang::exl3_cpu::exl3_cpu_chunk_m()));
+#endif
       for (auto& workload : workloads) {
         auto* w = workload.get();
         benchmark::RegisterBenchmark(
@@ -412,6 +562,16 @@ int main(int argc, char** argv) {
             ->UseManualTime()
             ->Unit(benchmark::kMicrosecond);
       }
+#ifndef EXL3_BENCH_BASELINE
+      for (auto& workload : routed) {
+        auto* w = workload.get();
+        benchmark::RegisterBenchmark((std::string(EXL3_BENCH_BACKEND) + "/rows:" + std::to_string(w->rows) + "/k:" +
+                                      std::to_string(w->k) + "/" + w->pattern).c_str(),
+                                     [w](benchmark::State& state) { full_forward(state, *w); })
+            ->UseManualTime()
+            ->Unit(benchmark::kMicrosecond);
+      }
+#endif
       benchmark::RunSpecifiedBenchmarks();
       benchmark::Shutdown();
       verify_workers(before, cores);

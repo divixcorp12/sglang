@@ -101,6 +101,12 @@ def _echo(text):
     print(text, end="", flush=True)
 
 
+def chunk_spec_details(chunk: dict):
+    """A speculative server's per-request details (spec_verify_ct, spec_accept_length, ...) from its sglext chunk, or
+    None (return_spec_tokens_details; a non-speculative server sends none)."""
+    return (chunk.get("sglext") or {}).get("spec_tokens_details")
+
+
 def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
     body = json.dumps(
         {
@@ -111,6 +117,7 @@ def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
             "stream": True,
             "stream_options": {"include_usage": True},
             "rid": rid,
+            "return_spec_tokens_details": True,
         }
     ).encode()
     request = urllib.request.Request(
@@ -126,6 +133,7 @@ def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
     content_parts = []
     finish_reason = None
     usage = None
+    spec_details = None
     # Raw per-chunk arrival times (seconds since `start`), one per reasoning/content
     # delta. Client-side observation only (detokenizer, serialization, socket, event
     # loop and client scheduling are all inside it) -- never call this "step latency",
@@ -142,6 +150,7 @@ def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
             if payload == "[DONE]":
                 break
             chunk = json.loads(payload)
+            spec_details = chunk_spec_details(chunk) or spec_details
             usage_chunk = chunk.get("usage")
             if usage_chunk:
                 usage = usage_chunk
@@ -179,6 +188,7 @@ def _stream_chat(port, messages, rid, max_tokens, timeout=1800, echo=False):
         "finish_reason": finish_reason,
         "usage": usage,
         "chunk_times": chunk_times,
+        "spec_tokens_details": spec_details,
     }
 
 
@@ -309,6 +319,7 @@ def main():
                     "expected": expected,
                     "correct": correct,
                     "chunk_times": result["chunk_times"],
+                    "spec_tokens_details": result["spec_tokens_details"],
                 }
                 results_f.write(json.dumps(record) + "\n")
                 results_f.flush()

@@ -57,7 +57,7 @@ def _cpu_experts_defines(**flags):
     """cpu_act_defines with SGLANG_DSV41_CPU_EXPERTS on and only the given SGLANG_EXL3_CPU_ACT_* flags set."""
     with contextlib.ExitStack() as stack:
         stack.enter_context(exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(True))
-        for name in ("SGLANG_EXL3_CPU_ACT_RESIDUAL", "SGLANG_EXL3_CPU_ACT_BLOCK"):
+        for name in ("SGLANG_EXL3_CPU_ACT_RESIDUAL", "SGLANG_EXL3_CPU_ACT_BLOCK", "SGLANG_EXL3_CPU_MAX_M"):
             field = getattr(exl3_ext.envs, name)
             if name in flags:
                 stack.enter_context(field.override(flags[name]))
@@ -83,6 +83,25 @@ def test_cpu_experts_always_build_the_optimized_kernel(flags):
 def test_cpu_experts_refuse_another_accuracy_flavor(flags):
     with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_EXPERTS"):
         _cpu_experts_defines(**flags)
+
+
+def test_cpu_max_m_maps_to_a_define_and_its_own_flavor():
+    defines = _cpu_experts_defines(SGLANG_EXL3_CPU_MAX_M=8)
+    assert defines == ["-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128", "-DEXL3_MOE_CPU_MAX_M=8"]
+    assert exl3_ext.optimized_cpu(defines) and exl3_ext.build_flavor(defines) == "_resid_b128_m8_cpu_v1"
+
+
+@pytest.mark.parametrize("max_m", [1, 3, 10, -2])
+def test_cpu_max_m_must_be_even_in_2_to_8(max_m):
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_MAX_M"):
+        _cpu_experts_defines(SGLANG_EXL3_CPU_MAX_M=max_m)
+
+
+def test_cpu_max_m_needs_the_optimized_kernel():
+    """The vendored kernel (moe_mul1.cpp) keeps its own MAX_M: setting the variable without CPU experts is refused."""
+    with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(False), exl3_ext.envs.SGLANG_EXL3_CPU_MAX_M.override(8):
+        with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_MAX_M"):
+            exl3_ext.cpu_act_defines()
 
 
 @pytest.mark.parametrize("block", [8, 100, -16])
@@ -149,7 +168,7 @@ def test_flavored_build_has_its_own_name_directory_and_kernel(tmp_path, monkeypa
     kw, ext_dir = _load_args(tmp_path, monkeypatch, True, 128)
     assert kw["name"] == "sglang_exl3_ext_resid_b128_cpu_v1"
     assert kw["build_directory"] == str(tmp_path / "build" / "resid_b128_cpu_v1")
-    assert kw["sources"] == [exl3_ext.OPTIMIZED_CPU_KERNEL]
+    assert kw["sources"] == [exl3_ext.OPTIMIZED_CPU_KERNEL, exl3_ext.OPTIMIZED_TORCH_OPS]
     assert kw["extra_cflags"] == ["-Ofast", "-DEXL3_MOE_CPU_ACT_RESIDUAL=1", "-DEXL3_MOE_CPU_ACT_BLOCK=128", "-march=native", "-std=c++20", "-fopenmp", "-pthread"]
     assert kw["extra_ldflags"] == ["-fopenmp"]
     assert kw["extra_include_paths"] == [str(ext_dir), str(ext_dir / "cpu")]
@@ -168,7 +187,7 @@ def test_cpu_experts_build_the_optimized_extension(tmp_path, monkeypatch):
     with exl3_ext.envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
         kw, _ = _load_args(tmp_path, monkeypatch, None, None)
     assert kw["name"] == "sglang_exl3_ext_resid_b128_cpu_v1"
-    assert kw["sources"] == [exl3_ext.OPTIMIZED_CPU_KERNEL]
+    assert kw["sources"] == [exl3_ext.OPTIMIZED_CPU_KERNEL, exl3_ext.OPTIMIZED_TORCH_OPS]
 
 
 def test_other_accuracy_flavors_keep_the_generic_kernel(tmp_path, monkeypatch):

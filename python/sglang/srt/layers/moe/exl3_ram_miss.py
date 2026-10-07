@@ -519,6 +519,16 @@ def padded_plan_width(capacity: int, lanes: int) -> int:
     return max(capacity, lanes)
 
 
+def spill_room_shortfall(ranges, *, staging: int, lanes: int, hot: int) -> list[tuple[int, int, int]]:
+    """The node ranges of a layer that cannot give every forced CPU miss a RAM victim, as (group, slots, needed).
+
+    A forced miss is read into a victim of its node's range: neither a staging slot (`staging`), nor an expert the
+    record routes (at most `lanes` less the forced misses themselves), nor a VRAM-hot expert (at most `hot`). So a
+    range of at least staging + lanes + hot slots always has one (plan 2026-10-06, Task 9)."""
+    need = staging + lanes + hot
+    return [(g, hi - lo, need) for g, (lo, hi) in enumerate(ranges) if hi - lo < need]
+
+
 class Exl3RamMissRowBackend(PinnedTierRowBackend):
     """``PinnedTierRowBackend`` whose gather is the lease chain.
 
@@ -593,6 +603,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             )
         self.cpu_experts = cpu_experts
         self.cpu_input = None
+        self.spill = None  # DIRECT's (overflow flag, this layer's counter) under spill; set by Exl3RamMissService.attach
         self.streamer_of = streamer_of
         self._delivered: Optional[torch.Tensor] = None
 
@@ -655,6 +666,7 @@ class Exl3RamMissRowBackend(PinnedTierRowBackend):
             self.hot_capacity,
             captured=captured,
             cpu_input=self.cpu_input if captured and self.cpu_experts else None,
+            spill=self.spill,
         )
         side.copy_engine_captured |= captured
         copy_expert_row_segments_gpu(
@@ -769,9 +781,13 @@ class Exl3RamMissService:
     def __init__(self) -> None:
         self.tables: dict[int, NativePinnedSlotTable] = {}
         self.host: Optional[ExpertStreamHost] = None
+        # The wire group of the GPU's node, whose CPU expert engine serves the DSpark draft (set by ensure_started).
+        self.gpu_group: Optional[int] = None
+        self._gpu_node_placement: Optional[tuple[int, list[int]]] = None
         self.device_side: Optional[ExpertStreamDevice] = None
         self.page = None
         self.slot_map = None
+        self._node_ranges = None
         self._rows: dict[int, int] = {}
         self._manager = None
         # The only caller of host.pause()/resume(), which are not reentrant.
@@ -805,6 +821,10 @@ class Exl3RamMissService:
         self.lease_pdl = False
         # The widest gather any layer planned (plan_gather_width); None until one does.
         self._gather_planned: Optional[int] = None
+        # The most routes one layer's graph gather takes (a verify's tokens x top_k); the CPU expert rows size from it.
+        self._gather_routes_planned = 0
+        # The victim lanes a spill gather plans (plan_staging_width); None without spill.
+        self._staging_planned: Optional[int] = None
         # The build's wire, fixed at start from the planned width.
         self._wire: Optional[WireLayout] = None
         self._copy_armed = False
@@ -828,15 +848,18 @@ class Exl3RamMissService:
             )
         self.tables[layer_id] = table
 
-    def plan_gather_width(self, rows: int) -> None:
+    def plan_gather_width(self, rows: int, routes: int = 0) -> None:
         """Plan a layer whose graph gather misses ``rows`` ids; the widest layer sets the build's lane count.
 
-        Only valid before the service starts. Raises ValueError for a width outside 1..32.
+        ``routes`` is the layer's gather routes when they exceed its miss lanes: the service starts before the streamers
+        enable their graph gather, so the CPU expert rows learn the verify's token count here.
+        Only valid before the service starts. Raises ValueError for a width outside 1..64.
         """
         if self.host is not None:
             raise RuntimeError(
                 "exl3 RAM miss: the graph gather width was planned after the service started"
             )
+        self._gather_routes_planned = max(self._gather_routes_planned, int(routes))
         planned = max(1, int(rows))
         wire_layout(planned)
         self._gather_planned = (
@@ -844,6 +867,14 @@ class Exl3RamMissService:
             if self._gather_planned is None
             else max(self._gather_planned, planned)
         )
+
+    def plan_staging_width(self, rows: int) -> None:
+        """Plan the staging slots a row reserves under spill: the victim lanes, since only live misses stage (a forced
+        miss is read into a RAM victim). Only valid before the service starts; the widest plan wins."""
+        if self.host is not None:
+            raise RuntimeError("exl3 RAM miss: the staging width was planned after the service started")
+        planned = max(1, int(rows))
+        self._staging_planned = planned if self._staging_planned is None else max(self._staging_planned, planned)
 
     @property
     def wire(self) -> WireLayout:
@@ -864,8 +895,24 @@ class Exl3RamMissService:
         return wire_layout(self._gather_planned or 1).lanes
 
     def staging_width(self) -> int:
-        """The staging slots every row asks for: the planned gather width, else the build's lanes."""
-        return self._gather_planned or self.resolved_lanes()
+        """The staging slots every row asks for: the planned victim lanes under spill, the planned gather width, else
+        the build's lanes."""
+        return self._staging_planned or self._gather_planned or self.resolved_lanes()
+
+    def _check_spill_room(self, row: int, streamer, width: int) -> None:
+        """Refuse a layer whose node ranges cannot place every forced CPU miss (spill_room_shortfall)."""
+        capacity = int(self.host.tables.capacity[row])
+        # group_ranges is per group, then per row.
+        ranges = [group[row] for group in self._node_ranges] if self._node_ranges is not None else [(0, capacity)]
+        short = spill_room_shortfall(
+            ranges, staging=self.staging_for(capacity), lanes=width, hot=int(streamer.hot_cache.capacity)
+        )
+        if short:
+            raise ValueError(
+                f"exl3 RAM miss: spill reads every forced CPU miss into a RAM victim; layer {streamer.layer_id}'s "
+                f"node ranges (group, slots, needed) {short} are too small: raise SGLANG_MOE_PINNED_HOST_NUMA_MB or "
+                "lower SGLANG_MOE_HOT_GPU_MB"
+            )
 
     def staging_for(self, capacity: int) -> int:
         """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""
@@ -886,6 +933,20 @@ class Exl3RamMissService:
             raise RuntimeError(
                 "exl3 RAM miss: the option C service was shut down; its pinned tiers are closed"
             )
+
+    def draft_host(self, areas, *, fatal_wait_s: float):
+        """The DSpark draft channel on the GPU node's CPU expert engine (one team per node): a SharedDraftHost. Starts
+        the service first when the draft is prepared before the target's first gather."""
+        self.ensure_started()
+        if self.cpu_experts is None:
+            raise RuntimeError("exl3 RAM miss: the draft shares the CPU expert team, but SGLANG_DSV41_CPU_EXPERTS is off")
+        if self.gpu_group is None:
+            gpu_node, nodes = self._gpu_node_placement
+            raise RuntimeError(
+                f"exl3 RAM miss: the draft runs on the GPU's node {gpu_node} CPU expert team, but the tier's placement "
+                f"(SGLANG_MOE_PINNED_HOST_NUMA_MB) covers only nodes {nodes}; place the tier on node {gpu_node} too"
+            )
+        return self.host.draft_source(areas, fatal_wait_s=fatal_wait_s, group=self.gpu_group)
 
     def ensure_started(self) -> None:
         """Start the service on first use; a no-op once started.
@@ -949,6 +1010,9 @@ class Exl3RamMissService:
             cpu_experts=envs.SGLANG_DSV41_CPU_EXPERTS.get(),
             device=torch.cuda.current_device() if torch.cuda.is_available() else None,
         )
+        # None when the tier's placement leaves out the GPU's node: only the DSpark draft needs the group (draft_host).
+        self.gpu_group = next((p.group for p in numa.plans if p.node == numa.gpu_node), None)
+        self._gpu_node_placement = (numa.gpu_node, [p.node for p in numa.plans])
         for line in numa.log_lines():
             logger.info("exl3 RAM miss %s", line)
         node_ranges = None
@@ -961,6 +1025,7 @@ class Exl3RamMissService:
                 ],
                 [plan.node for plan in numa.plans],
             )
+        self._node_ranges = node_ranges
         pin = torch.cuda.is_available()
         self._wire = wire_layout(lanes, numa.nodes)
         page = new_page(pin=pin, wire=self._wire)
@@ -1002,7 +1067,9 @@ class Exl3RamMissService:
                 )
             cpu_experts = None
             if envs.SGLANG_DSV41_CPU_EXPERTS.get():
-                cpu_experts = self._start_cpu_experts(cfg, host, fmt, streamers, pin, numa)
+                cpu_experts = self._start_cpu_experts(
+                    cfg, host, fmt, streamers, pin, numa, self._gather_routes_planned
+                )
             if get_exl3_stream_trace().enabled:
                 # Before the thread starts: without a trace file it takes no timestamps.
                 host.enable_trace()
@@ -1080,7 +1147,9 @@ class Exl3RamMissService:
         )
 
     @staticmethod
-    def _start_cpu_experts(cfg, host, fmt, streamers, pin: bool, numa: ThreadingConfig):
+    def _start_cpu_experts(
+        cfg, host, fmt, streamers, pin: bool, numa: ThreadingConfig, planned_routes: int = 0
+    ):
         """Build the CPU expert service for ``SGLANG_DSV41_CPU_EXPERTS``.
 
         Runs after the copy engine is enabled and before the service thread starts. CPU
@@ -1123,6 +1192,24 @@ class Exl3RamMissService:
             raise RuntimeError(
                 f"exl3 RAM miss: CPU experts need one hidden size, the layers have {hidden}"
             )
+        # A DSpark verify gathers tokens x top_k routes a layer; the CPU rows hold that many tokens.
+        # The service starts before the streamers enable their graph gather, so the planned routes stand in for it.
+        for layer_id, s in streamers.items():
+            if (s.graph_gather_rows or planned_routes) and getattr(s.layer, "top_k", None) is None:
+                raise RuntimeError(
+                    f"exl3 RAM miss: layer {layer_id}'s experts module has no top_k, which SGLANG_DSV41_CPU_EXPERTS "
+                    "sizes its rows from"
+                )
+        tokens = max(
+            (
+                (s.graph_gather_rows or planned_routes) // s.layer.top_k
+                for s in streamers.values()
+                if s.graph_gather_rows or planned_routes
+            ),
+            default=1,
+        )
+        # Spill: a split entry is only read for the live lanes, at most the victim lanes.
+        victims = envs.SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES.get() or None
         return CpuExpertGroups(
             host,
             trait,
@@ -1131,6 +1218,8 @@ class Exl3RamMissService:
             plans=numa.plans,
             split=configured_split(host.wire.lanes),
             pin=pin,
+            tokens=tokens,
+            calibration_lanes=victims,
         )
 
     def before_host_use(self) -> None:
@@ -1209,11 +1298,6 @@ class Exl3RamMissService:
                 f"exl3 RAM miss: layer {streamer.layer_id} gathers up to {streamer.graph_gather_rows} rows "
                 f"({width} miss lanes) per call but the service requests at most {self.lanes} lanes"
             )
-        if self.cpu_experts is not None and width < streamer.graph_gather_rows:
-            raise ValueError(
-                f"exl3 RAM miss: CPU experts serve one token; layer {streamer.layer_id}'s gather serves {width} "
-                f"misses of {streamer.graph_gather_rows} routes (a verify)"
-            )
         cache = streamer.hot_cache
         if self.cpu_experts is not None:
             # The fused plan sorts this layer's miss lanes by residency key, highest
@@ -1276,8 +1360,10 @@ class Exl3RamMissService:
         self.routed_rows_per_step += streamer.graph_gather_rows
         row = self.row_of(streamer.layer_id)
         # The host staged staging_for(capacity) slots for the row at start. A post requests
-        # at most the miss width (a verify's clamp keeps its count there), not the routes.
-        want = max(1, streamer.graph_miss_width)
+        # at most the miss width (a verify's clamp keeps its count there), not the routes; under spill, the victim
+        # lanes (only live misses stage).
+        victims = getattr(manager.gpu_residency, "victim_lanes", None)
+        want = max(1, min(streamer.graph_miss_width, victims) if victims else streamer.graph_miss_width)
         staged = self.staging_for(int(self.host.tables.capacity[row]))
         if staged < want:
             logger.warning(
@@ -1327,6 +1413,16 @@ class Exl3RamMissService:
             cpu_experts=self.cpu_experts is not None,
             streamer_of=self.tables[streamer.layer_id].streamer_of,
         )
+        updater = manager.gpu_residency
+        if self.cpu_experts is not None and getattr(updater, "victim_lanes", width) < width:
+            # Spill: forced CPU misses land in RAM victims (RamTier::reserve_victims_locked), so the layer must have
+            # room for them; the post flags this layer itself only before the copy engine arms.
+            self._check_spill_room(row, streamer, width)
+            residency_row = streamer.residency_row
+            streamer.row_backend.spill = (
+                updater.overflow_flag,
+                updater.gather_overflow[residency_row : residency_row + 1],
+            )
         if self.copy_engine:
             dst_rows = min(
                 int(destination.shape[0]) for _, destination in segments.pairs
@@ -1694,6 +1790,17 @@ class Exl3RamMissService:
             return f"the device synchronize failed: {outcome['error']!r}"
         return None
 
+    def _log_draft_stats(self) -> None:
+        """The shared DSpark draft host's counters, read before ``host.stop()`` closes the handle (its ``stats()`` is
+        ``{}`` afterwards): a both-mode server has no other place that reports them."""
+        draft = getattr(self.host, "_draft_keep", None)
+        if draft is None:
+            return
+        try:
+            logger.info("DSpark CPU experts: %s", draft[1].stats())
+        except Exception as error:  # noqa: BLE001 - a diagnostic must not change the shutdown's outcome
+            logger.warning("exl3 RAM miss: reading the DSpark draft's counters failed: %r", error)
+
     def shutdown(self, *, at_exit: bool = False) -> None:
         """Shut the service down: free the tiers if safe, else quarantine them.
 
@@ -1751,6 +1858,7 @@ class Exl3RamMissService:
                 # stops before anything is freed. A thread hung in a read ends this in
                 # the service watchdog's abort.
                 if self.host is not None:
+                    self._log_draft_stats()
                     logger.info(
                         "exl3 RAM miss: stopping the service thread; a read that hangs ends in the watchdog's abort "
                         "after max(30 s, 3 x the wait timeout)"

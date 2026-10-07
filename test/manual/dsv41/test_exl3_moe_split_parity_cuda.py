@@ -386,6 +386,28 @@ def test_cpu_lanes_with_a_zero_partial_are_the_gpu_run_without_them(slot_rows):
                 assert torch.equal(_cpu_run(fused, x, weights, remap, keep, mask, seed), torch.zeros_like(want))
 
 
+def test_cpu_lanes_past_32_rank_their_routes_out(slot_rows):
+    """A 40-lane build's cpu_lanes is {low, parts, high}: CPU lanes 32-35 (their dst_slots entries the routes' slots,
+    lanes 0-31 naming no slot) leave the fused MoE exactly as low lanes do, bit for bit against the masked run.
+    Mutation: read only the low word -- the routes stay in."""
+    device = slot_rows["w13_trellis"].device
+    fused = _fused(slot_rows, device, True)
+    hidden = slot_rows["w13_suh"].shape[-1]
+    zero = torch.zeros((1, hidden), dtype=torch.float32).pin_memory()
+    keep = torch.ones(1, device=device)
+    gen = torch.Generator().manual_seed(933)
+    for trial in range(TRIALS * 4):
+        x, weights, remap, _ = _inputs(gen, fused.slots, hidden, device, 0)
+        high = int(torch.randint(1, 16, (1,), generator=gen))  # which of lanes 32-35 are the CPU's
+        dst = torch.full((36,), -1, dtype=torch.int32, device=device)
+        dst[32:36] = remap[:4].to(torch.int32)  # lane 32 + i names route i's slot
+        lanes = torch.tensor([0, PART_HITS, high], dtype=torch.int32, device=device)
+        on_cpu = torch.tensor([i < 4 and bool(high >> i & 1) for i in range(TOP_K)], device=device)
+        want = fused.run(x, torch.where(on_cpu, torch.zeros_like(weights), weights), remap, keep, ACT_LIMIT).clone()
+        got = fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=(lanes, dst, zero.data_ptr(), 0)).clone()
+        assert torch.equal(_bits(got), _bits(want)), f"high={high:#x} remap={remap.tolist()}"
+
+
 def test_the_cpu_partial_seeds_the_output(slot_rows):
     """The GPU's own partial of the CPU routes, fed back as the CPU partial, reproduces the full run up to fp32
     reassociation."""
@@ -474,3 +496,49 @@ def test_the_cpu_kernels_partial_stands_in_for_the_gpu_routes(slot_rows, monkeyp
             assert err < 2e-2 and err < 0.1 * drop, f"mask={mask:#x}: {err:.2e} vs dropped {drop:.2e}"
     finally:
         es.kernel_drop(layer, variant="instr")
+
+
+VERIFY_TOKENS = 4
+
+
+def _fused_tokens(slot_rows, device, tokens):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.quantization.exl3.fused_moe import Exl3FusedMoE
+
+    with envs.SGLANG_DSV41_ENABLE_LAYER_FUSION.override(True):
+        return Exl3FusedMoE(
+            slot_rows, slot_rows["w13_trellis"].shape[0], hidden=slot_rows["w13_suh"].shape[-1],
+            inter=slot_rows["w2_suh"].shape[-1], top_k=TOP_K, device=device, tokens=tokens,
+        )
+
+
+def test_a_verify_cpu_partial_seeds_every_token(slot_rows):
+    """M = 4 tokens of a DSpark verify. The CPU lanes are distinct slots of the routes' union (lane i's dst_slots
+    entry is its slot), so every route on one leaves the fused MoE in every token, and token t's [hidden] partial seeds
+    token t. With a zero partial the run is, bit for bit, the run with those routes' weights zeroed; with the GPU's own
+    per-token partial of those routes it is the full run up to fp32 reassociation. Mutation: seed only i < hidden (the
+    one-token kernel) -- tokens 1-3 lose their partial."""
+    device = slot_rows["w13_trellis"].device
+    fused = _fused_tokens(slot_rows, device, VERIFY_TOKENS)
+    hidden = slot_rows["w13_suh"].shape[-1]
+    partial = torch.zeros((VERIFY_TOKENS, hidden), dtype=torch.float32).pin_memory()
+    zero = torch.zeros_like(partial).pin_memory()
+    keep = torch.ones(1, device=device)
+    gen = torch.Generator().manual_seed(932)
+    for trial in range(TRIALS * 4):
+        remap = torch.cat([torch.randperm(fused.slots, generator=gen)[:TOP_K] for _ in range(VERIFY_TOKENS)]).to(device)
+        weights = torch.softmax(torch.randn(VERIFY_TOKENS, TOP_K, generator=gen), 1).reshape(-1).to(device)
+        x = (torch.randn((VERIFY_TOKENS, hidden), generator=gen) * 0.5).to(device)
+        union = sorted(set(remap.tolist()))
+        picked = [s for s in union if int(torch.randint(0, 2, (1,), generator=gen))] or union[:1]
+        lanes = torch.tensor(picked, dtype=torch.int32, device=device)
+        on_cpu = torch.isin(remap, lanes.long())
+        words = torch.tensor([(1 << len(picked)) - 1, PART_HITS], dtype=torch.int32, device=device)
+        want = fused.run(x, weights, remap, keep, ACT_LIMIT).clone()
+        without = fused.run(x, torch.where(on_cpu, torch.zeros_like(weights), weights), remap, keep, ACT_LIMIT).clone()
+        partial.copy_(fused.run(x, torch.where(on_cpu, weights, torch.zeros_like(weights)), remap, keep, ACT_LIMIT))
+        got_zero = fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=(words, lanes, zero.data_ptr(), 0)).clone()
+        assert torch.equal(_bits(got_zero), _bits(without)), f"picked={picked}"
+        got = fused.run(x, weights, remap, keep, ACT_LIMIT, cpu=(words, lanes, partial.data_ptr(), 0)).clone()
+        scale = float(want.abs().max())
+        assert torch.allclose(got, want, rtol=1e-5, atol=1e-5 * scale), f"picked={picked}"

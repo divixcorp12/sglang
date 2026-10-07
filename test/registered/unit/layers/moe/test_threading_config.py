@@ -309,3 +309,23 @@ def test_a_given_role_on_a_named_draft_core_is_refused(divix01, settings, match)
 def test_too_few_cores_left_for_the_draft_is_refused(divix01):
     with pytest.raises(ValueError, match=r"node 0: \[15\] is left for the DSpark draft's CPU experts"):
         resolve(divix01, affinity=RECIPE_SERVER | frozenset(range(6, 15)), draft=True)
+
+
+def test_under_cpu_experts_the_draft_has_no_cores_of_its_own(divix01):
+    """One team per node: with the target's CPU experts on, the draft is a job source on node 0's team, so the plan
+    derives no draft role and node 0's team keeps every free core (the recipe's 6-15)."""
+    config = resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, spin_core=17, draft=True)
+    assert config.draft_cpus == ()
+    assert [(p.ram, p.cpu) for p in config.plans] == [(17, tuple(range(6, 16))), (35, tuple(range(18, 28)))]
+    assert config.copy_cpus == (16,)
+
+
+@pytest.mark.parametrize("settings", [{"draft_cores": "12-15"}, {"draft_threads": 4}])
+def test_under_cpu_experts_named_draft_cores_are_refused(divix01, settings):
+    with pytest.raises(ValueError, match="shares the GPU node's CPU expert team"):
+        resolve(divix01, affinity=RECIPE_SERVER, cpu_experts=True, threads=10, spin_core=17, draft=True, **settings)
+
+
+def test_a_draft_only_launch_still_derives_the_draft_cores(divix01):
+    config = resolve(divix01, affinity=RECIPE_SERVER, draft=True)
+    assert config.draft_cpus == tuple(range(6, 16))

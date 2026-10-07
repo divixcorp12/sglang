@@ -7247,6 +7247,143 @@ run is in `crashed-run/`).
 - the epilogue under a narrowed gather;
 - a draft CPU forward ms per stage (see the gap).
 
+### 33.11 DSpark with both CPU-expert clients: the server A/B against production (2026-10-06)
+
+Plan `docs/superpowers/plans/2026-10-06-dsv41-dspark-both-cpu-experts.md`, branch `dsv41-dspark-both-cpu`, measured at
+`ddcb2abbec` (python tree `1fa3c4263b`) on divix01 with production down. It runs the DSpark verify and draft in the
+decode graph with the target's CPU experts and the draft's CPU experts together, both on node 0's CPU expert team.
+
+**What changed (Tasks 2-15).**
+- Task 2: the wire holds 64 lanes, with the one-token build byte-identical (BS1 digest).
+- Task 3: the reference types forced lanes; Task 4: the post types them on the device and falls back to the victims.
+- Task 5: the post stages every token and writes the token table; Task 6: a CPU job runs one M-row forward.
+- Task 7: the route tables seed every token from its own partial.
+- Task 8: the first V lanes of a lane-per-route record get the victims; Task 9: a forced CPU miss is read into a RAM victim.
+- Task 10: the service sizes CPU rows for the verify, wires the spill words, checks the spill room, caps calibration.
+- Task 11: one CPU expert team per node serves the draft channel as a second job source (`SharedDraftHost`).
+- Task 12: the shared team in `ThreadingConfig`, the gate and the draft registry; Task 14: the gate admits the target's
+  CPU experts under a graphed DSpark verify.
+- Task 13: a captured 6-token verify with CPU experts and spill, end to end on the GPU.
+- Task 15: the recipe's DSpark mode (`arm_env.dspark_env()`, `DSPARK_ARGV`); Task 16: A/B tooling.
+- Task 17 fix-ups: `DSV41_HEALTH_TIMEOUT_S` (2700 s for a DSpark arm); budget A (below); the shared draft host's `stop`
+  and `stats` are no-ops once the service closed its host (below).
+
+**Budget: `MEM_FRACTION_STATIC` 0.78 and a 10840 MiB hot cache, for the DSpark arms only.** Production and the prod
+arm keep 0.875 and 16080 MiB. Owner decision 4 asked for 0.82 and 12040 MiB; that does not start.
+- **Why.** `SGLANG_SM120_FLASHMLA_BACKEND=triton` sends prefill attention through `flash_mla_sparse_decode_triton`,
+  whose SWA/c4/c128 merge and sink run in fp32 torch ops: about 0.9 GiB at a 2048-token chunk and 1.75 GiB at 4096
+  over production's flashinfer path. The prefill warm-up of attempt 2 died in that merge (`_merge_partial_attn`).
+- **Init headroom is set by the fraction alone.** Cutting only the hot cache grew the KV pool (attempt 3: 2.70 M
+  tokens) and left 2.36 GB of headroom. At 0.78 / 10840 the headroom is 5.21 GB, the 4096 warm-up leaves 508 MiB
+  (`both-cpu/mem-budget/L2`, report `mem-budget-report.md`).
+- **Cost.** 1200 MiB less hot cache than Owner decision 4 (853 slots, 21.3 per layer, against 948 and 23.7), and
+  5240 MiB less than production (16080 MiB). That raises the DSpark arms' VRAM-miss rate; the bias in the A/B below is
+  not measured.
+- **Option C, the owner's TODO.** TODO(owner, 2026-10-06): the real fix is option C: chunk the triton fp32 prefill merge
+  over tokens (bit-identical math), then return the DSpark arms to `MEM_FRACTION_STATIC` 0.82 and the full 12040 MiB
+  hot cache (Owner decision 4). flashinfer is not an alternative: it refuses the 5-token draft capture
+  (`num_tokens > 64`). **The plan's Task 15 table was wrong to say flashinfer has no refusal there:** launch L3
+  (flashinfer, 0.78 / 10840) exited `LAUNCH_RC=1` at the draft graph capture.
+
+**Shutdown defect, fixed (`ddcb2abbec`).** Every DSpark shutdown logged `Exception ignored in atexit callback
+DraftCpuExpertsRegistry.close` with `exl3 RAM miss: unknown handle` and `LAUNCH_RC=0`.
+- **Root cause.** With `SGLANG_DSV41_CPU_EXPERTS=1` the draft is a `SharedDraftHost` on the service's host. The
+  scheduler's graceful shutdown stops the service first, which closes the host's native handle. The registry's atexit
+  `close` then read `stats()` and called `stop()` on the dead handle.
+- **Fix.** `SharedDraftHost.stop` is a no-op and `stats` returns the last snapshot once the host is closed (the host's
+  `_close.alive` is false). Tests: `test_dspark_draft_cpu_experts.py`, written first and RED on the raising close.
+- **Consequence.** Nothing reads the draft's counters after the service closes, so the shutdown line is
+  `DSpark CPU experts: {}` on both smoke and A/B (no read happened before). **The draft CPU forward ms is still
+  unmeasured** (§33.9).
+
+**Commands.**
+```bash
+# smoke (2 sessions), the recipe's fraction and env
+DSV41_RUN_ROOT=$G/smoke-budgetA DSV41_HEALTH_TIMEOUT_S=2700 DSV41_MAX_SESSIONS=2 \
+  DSV41_MEM_FRACTION_STATIC=0.78 DSV41_EXTRA_SERVER_ARGS="<DSPARK_ARGV>" \
+  flock rowimg-disk.lock benchmarks/dsv41_baseline/run_arm.sh dspark-both 30017 <dspark_env K=V...>
+# A/B: it sets DSV41_MEM_FRACTION_STATIC=0.78 for the dspark arms itself
+flock rowimg-disk.lock python analysis/dsv41-drive/dspark/both_cpu_ab.py $G/ab    # EXIT=0
+```
+`G=/data/models/slang/nvfp4-work/cc-expert-prediction/analysis/dsv41-dspark/both-cpu`.
+
+**Smoke (`smoke-budgetA`, `LAUNCH_RC=0`).** `DSpark: EXL3 draft graphs on (3 draft MoE layers prepared)`; CPU experts
+groups on cores `[6..15]` and `[18..27]` (10 threads each), the draft on node 0's team and no `numa dspark draft` line;
+`Capture target verify CUDA graph` (6 tokens) and `copy engine armed after 16 decode forwards`; no `fail-stop`,
+`__trap`, `RemoteDisconnected`, `CUDA error`, `out of memory` or Traceback; `max_total_num_tokens=371712` with
+5.22 GB headroom; target `Load weight end` 18:19:25 to `/health` 18:24:02. No log line states the 40-lane build or the
+spill room check, and none refuses a layer; the calibration lines are `CPU experts calibration: row 0, expert 12.7 MiB,
+10 reps` with each group's split, and no `calibration skipped/failed` warning.
+
+**The A/B (`ab/summary.json`, 8 sessions; all three arms `rc=0`).**
+
+| Arm | hot cache | ms/token median | ms/token mean | accept length | reverify rate | text vs prod | KV pool |
+|---|---|---|---|---|---|---|---|
+| `prod` | 16080 MiB | 85.34 | 88.0 | n/a | n/a | n/a | 291,072 |
+| `dspark-draft-only` | 10840 MiB | 353.44 | 339.9 | 3.583 | 1.00 (244) | pass, 3 flips of 354, max gap 0.25 | 435,968 |
+| `dspark-both` | 10840 MiB | 93.55 | 103.2 | 3.671 | 0.031 (9) | pass, 2 flips of 448, max gap 0.75 | 392,448 |
+
+Per-session ms/token, sessions 0-7: `prod` 108.1, 81.3, 82.1, 91.0, 86.6, 84.1, 80.6, 90.6; `dspark-draft-only` 413.2,
+234.6, 208.7, 454.4, 283.0, 293.6, 414.6, 416.8; `dspark-both` 143.8, 72.8, 61.5, 149.5, 79.2, 101.1, 86.0, 131.6.
+`dspark-both` is faster than `prod` in sessions 1, 2 and 4, slower in the other five.
+
+**Bars.**
+1. Pass: three `rc=0`, no fail-stop or trap in any server log.
+2. Pass: `dspark-both` and `dspark-draft-only` have `text_vs_prod.pass` true, every flip within 1.4 nats (max gaps
+   0.75 and 0.25).
+3. Pass. `reverify_ct` 9 against a limit of 17 (16 forwards before the engine armed, plus the warm-up's stale flag).
+   `gather_overflow` summed over the 40 layers is 379 in all five metrics records (graphed verifies 39 to 286), with
+   `verify_overflow_ct` 9 throughout: no growth. `dspark-draft-only.reverify_rate` is 1.00 (244 re-verifies).
+4. Pass: `dspark-both` group 0 reports 27,068 CPU-expert jobs (64,765 lanes, 0.639 ms per lane) at its last stats line.
+5. Pass against the prod arm of this run: 392,448 against 291,072.
+6. Reported in the table.
+
+**The gaps.**
+- The draft CPU forward ms is unmeasured (above).
+- The CPU split is calibrated per one-token job.
+- The hot cache differs: 10840 MiB for both DSpark arms against 16080 for `prod`; the cost in decode is not separated.
+- 8 sessions, so the medians carry the sessions' spread (61.5 to 149.5 ms/token for `dspark-both`).
+- `prod` has no accept length or reverify rate, so no ratio against it is claimed for those.
+
+**Recommendation for Owner decision 1.** Do not flip production to DSpark on this run. The `dspark-both` median is
+8.2 ms/token (9.6%) above `prod` and its mean 15.2 ms/token above, with accept length 3.67 and a re-verify rate that
+the Tasks 2-12 work brought from 1.00 to 0.031. It removes the draft-only arm's collapse (353 ms/token) and is within
+the text band, so it is a working configuration, not a win. Whether the 5240 MiB of hot cache it gave up (budget A) is
+what keeps it behind is unmeasured; option C is what would test that.
+
+**§33.11 addendum: per-token calibration.** The CPU split under spill was calibrated with one-token CPU jobs while a
+verify's record jobs are `per_token` with 6 tokens (final-review finding I2). `a67c5a8e6c` makes the calibration's
+`cpu[k]` and `both[n][k]` jobs per-token jobs of the verify's token count, with a synthetic all-routed token table
+(`CpuExpertEngine::write_calibration_table`); one-token launches are unchanged. A/B rerun at `c1aa74bfd6` (python tree
+`8949a90bbc`), `ab-fix/`, budget A, the same 8 sessions, arms `prod` and `dspark-both` only, all `rc=0`, no fail-stop,
+trap, OOM or Traceback in any log.
+
+| Arm | ms/token median | mean | accept length | reverify_ct | KV pool |
+|---|---|---|---|---|---|
+| `prod` | 88.30 | 113.5 | n/a | n/a | 270,848 |
+| `dspark-both` (calibrated at 6 tokens) | 95.05 | 106.3 | 3.588 | 9 (2.2% of 410 graphed verifies) | 402,944 |
+
+Per-session ms/token, sessions 0-7: `prod` 107.5, 81.0, 81.2, 283.3, 89.6, 85.3, 87.0, 93.2; `dspark-both` 143.0, 75.5,
+64.2, 152.5, 87.3, 102.8, 86.4, 138.7. `prod`'s session 3 (283.3 ms/token against 91.0 in the first A/B) is the outlier
+that lifts its mean; it was not re-run. Against the first A/B's `dspark-both` (median 93.55, mean 103.2, accept 3.671)
+the median is 1.5 ms/token higher and the mean 3.1 higher, inside the sessions' spread. The median gap to `prod`
+is 6.75 ms/token (7.6%), against 8.2 (9.6%) before.
+
+- **Split, group 0 / group 1, n = 0..8 (the victim lanes).** One-token calibration (first A/B's log) `0 1 1 2 3 3 4 4 5`
+  / `0 1 1 2 3 3 4 5 5`; 6-token calibration `0 0 0 1 1 1 2 2 2` / `0 0 1 1 1 2 2 2 3`. At n = 8 the CPU takes 2 and 3
+  lanes instead of 5 and 5; over n = 1..8 the CPU's share drops from 23 and 24 lane-slots to 9 and 12. The old figures
+  come from a separate server run, so they carry run-to-run calibration noise.
+- **Measured CPU cost per k (group 0, ms, k = 1..8).** First A/B (one token) `0.59 1.11 1.67 2.33 2.80 3.75 4.53
+  6.64`; here, in the 6-token grid, `2.33 4.73 8.06 10.79 12.39 10.41 13.86 14.55`: about 4 times the one-token cost.
+- **Bars.** 1 pass (both `rc=0`, none of fail-stop, `__trap`, `RemoteDisconnected`, `CUDA error`, out of memory,
+  Traceback). 2 pass (3 flips, max gap 0.25). 3 pass: `reverify_ct` 9 against a limit of 17;
+  `gather_overflow` summed over the layers 378 in all seven metrics records (graphed verifies 39 to 410), no growth.
+  4 pass: group 0 reports 36,114 CPU-expert jobs (67,441 lanes, 0.677 ms per lane) at its last stats line. 5 pass:
+  402,944 against `prod`'s 270,848 from the same run. 6 reported above.
+- **Reading.** The 6-token calibration took the CPU's share of the victim lanes down by 39% (group 1) to 61% (group 0) across n = 1..8, and the A/B did not move: the median
+  stayed within 1.5 ms/token of the first run. The "do not flip" verdict does not rest on the one-token calibration.
+  The hot-cache difference (budget A) is still unseparated.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

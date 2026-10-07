@@ -46,6 +46,7 @@ def kernel_body(name: str, kernel: str) -> str:
 def test_the_device_headers_are_found():
     assert sorted(HEADERS) == [
         "draft_kernels.cuh",
+        "lane_mask.cuh",
         "lease_channel.cuh",
         "lease_device.cuh",
         "lease_kernels.cuh",

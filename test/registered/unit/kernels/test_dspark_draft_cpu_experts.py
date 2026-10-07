@@ -181,3 +181,89 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def test_with_target_cpu_experts_the_draft_attaches_to_the_services_gpu_group(monkeypatch):
+    """One team per node: the registry builds no thread of its own, it asks the RAM-miss service for its GPU-node
+    group's engine (starting the service first), and drives it through DraftCpuHost's interface."""
+    from sglang.srt.environ import envs
+
+    asked = {}
+
+    class Service:
+        def draft_host(self, areas, *, fatal_wait_s):
+            asked["fatal_wait_s"] = fatal_wait_s
+            return _Host(areas)
+
+    monkeypatch.setattr(draft, "_ram_miss_service", lambda: Service())
+    monkeypatch.setattr(draft, "_new_host", lambda *a, **k: pytest.fail("built a draft-only engine"))
+    with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+        runtime = draft.DraftCpuExperts(
+            _Kernel(), {0: draft.DraftLayer(_slabs(), _on_cpu(), 10.0)}, cores=[], threads=0, device=None
+        )
+    assert asked["fatal_wait_s"] > 0 and runtime.host.started
+
+
+class _NativeModule:
+    """The tvm module: every draft call on a closed host handle raises, as the C++ registry does."""
+
+    def __init__(self, host):
+        self.host, self.calls = host, []
+
+    def _check(self, name, handle):
+        if not self.host._close.alive:
+            raise RuntimeError("exl3 RAM miss: unknown handle")
+        self.calls.append(name)
+
+    def expert_stream_draft_open(self, handle, *a):
+        self._check("open", handle)
+
+    def expert_stream_draft_stop(self, handle, group):
+        self._check("stop", handle)
+
+    def expert_stream_draft_stats(self, handle, group, out):
+        self._check("stats", handle)
+        out[0] = 7
+
+
+class _ServiceHost:
+    """An ExpertStreamHost: ``stop`` closes its handle (``_close.alive`` false) and the draft source dies with it."""
+
+    handle = 3
+
+    def __init__(self):
+        self._close = type("Close", (), {"alive": True})()
+        self._module = _NativeModule(self)
+
+    def stop(self):
+        self._close.alive = False
+
+
+def _shared_registry():
+    from sglang.kernels.ops.moe.dspark_draft_cpu import SharedDraftHost
+
+    host = _ServiceHost()
+    areas = type("Areas", (), {"channel": 0, "x": 0, "slots": 0, "weights": 0, "out": 0, "hidden": 8, "stages": 1})()
+    shared = SharedDraftHost(host, areas, group=0, fatal_wait_s=1.0)
+    registry = DraftCpuExpertsRegistry()
+    registry._runtime = type("Runtime", (), {"stats": shared.stats, "close": shared.stop})()
+    return host, shared, registry
+
+
+def test_the_draft_registry_closes_quietly_after_the_service_closed_its_host():
+    """The scheduler's graceful shutdown stops the RAM-miss service (closing the host handle) before the draft
+    registry's atexit close; close must not raise "unknown handle" then (2026-10-06 L1/L2 shutdown logs)."""
+    host, shared, registry = _shared_registry()
+    host.stop()
+    registry.close()
+    registry.close()  # and again: idempotent
+    assert registry._runtime is None
+
+
+def test_the_draft_registry_closes_before_the_service_too_and_reports_its_last_stats():
+    host, shared, registry = _shared_registry()
+    registry.close()
+    assert shared._module.calls[-2:] == ["stats", "stop"]
+    host.stop()
+    assert shared.stats()["jobs"] == 7  # the last snapshot survives the host
+    shared.stop()  # a second stop after the host closed is a no-op

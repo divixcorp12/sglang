@@ -82,6 +82,7 @@ std::string channel_probe(int64_t lanes, int64_t nodes) {
     case 8: return channel_for_nodes<8>(nodes);
     case 24: return channel_for_nodes<24>(nodes);
     case 32: return channel_for_nodes<32>(nodes);
+    case 40: return channel_for_nodes<40>(nodes);
     default: return "";
   }
 }
@@ -95,6 +96,7 @@ std::string probe(int64_t lanes, int64_t nodes) {
     case 13: return for_nodes<13>(nodes);
     case 24: return for_nodes<24>(nodes);
     case 32: return for_nodes<32>(nodes);
+    case 40: return for_nodes<40>(nodes);
     default: return "";
   }
 }

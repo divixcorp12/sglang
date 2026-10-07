@@ -72,7 +72,8 @@ if [[ $mode == check ]]; then
   step full-stack-validate "$build/exl3_full_stack_prod" --validate-only "--image-dir=$out/images"
   unset EXL3_MOE_CPU_MAX_ISA
   step pytest taskset -c 0-63 "$PY" -m pytest -q -p no:randomly \
-    test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_cpu_expert_service.py
+    test/manual/dsv41/test_cpu_expert_engines_exl3.py test/registered/unit/kernels/test_cpu_expert_service.py \
+    test/manual/dsv41/test_exl3_cpu_dsv41_plan_multitoken.py
 fi
 
 if ((${#failed[@]})); then

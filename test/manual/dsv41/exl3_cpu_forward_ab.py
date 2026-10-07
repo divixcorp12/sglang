@@ -25,13 +25,21 @@ CAP = 6
 # generic plan at the DSV4.1 shape.
 LIMITS = (10.0, 7.0)
 THREADS = 4
-# (tokens, experts per token) -> routes. Two tokens sharing expert 0 and 4 make m=2 chunks, which the DSV4.1 plan
-# refuses: at the DSV4.1 shape that case runs the generic plan.
+# (tokens, experts per token) -> routes. Tokens sharing an expert make chunks of up to CHUNK_M tokens: (2, 3) shares
+# experts 0 and 4; (2, 1) is one expert's chunk of two; (3, 1) one expert's three tokens; (1, 2) routes one token twice
+# to expert 1; (6, 3) and (16, 3) mix chunk sizes, as a DSpark draft call does ((16, 3) fills chunks of 4 at MAX_M 8).
+# The DSV4.1 plan takes chunks of 1..CHUNK_M tokens, so at the DSV4.1 shape these cases run it. A dump made
+# before 2026-10-06 ran them on the generic plan, and the two must agree bit for bit.
 ROUTES = {
     (1, 1): [[2]],
     (1, 3): [[4, 0, 5]],
     (1, 5): [[1, 3, 0, 5, 2]],
     (2, 3): [[4, 0, 5], [0, 2, 4]],
+    (1, 2): [[1, 1]],
+    (2, 1): [[3], [3]],
+    (3, 1): [[2], [2], [2]],
+    (6, 3): [[(t + 2 * j) % CAP for j in range(3)] for t in range(6)],
+    (16, 3): [[(5 * t + j) % CAP for j in range(3)] for t in range(16)],
 }
 WEIGHTS = (0.5, 0.3, 0.2, 0.15, 0.1)
 SCALES = (1.0, 8.0)

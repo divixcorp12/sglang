@@ -284,6 +284,26 @@ fused MoE through the CPU thread's done word, the copy thread, the CopyDone rele
 **Teardown.** With no copy thread left, a closed gate would hold its stream forever. `stop_thread` and close call
 `open_closed_gate`, whose CC then traps unless CopyDone is there.
 
+**A verify's CPU lanes (plan 2026-10-06-dsv41-dspark-both-cpu-experts).** A verify gathers with a lane per route (36
+at 6 tokens of top-6, on a 40-lane wire whose lane masks are u64). A row's pinned input holds the verify's tokens
+(`cpu_tokens_max`, 6 at `speculative_dspark_block_size=5`), then a token table the post writes for every lane: the token
+count, a mask of the tokens that route the lane's expert, and each such token's weight (`cpu_token_table.h`). A record's
+CPU job runs one forward of the record's tokens from it, and each token's partial is its own `[hidden]` row of the part,
+which the route tables add to that token. The record's summed lane weight still serves one-token rows.
+
+**Spill.** With `SGLANG_MOE_EXPERT_GRAPH_GATHER_VICTIM_LANES` (V) below the lanes, DIRECT gives VRAM victims and
+staging slots to the first V lanes only and marks the rest with destination slot -1. The post makes each marked lane a
+CPU lane, outside the split: a RAM hit runs from its RAM slot, and an NVMe miss gets slot -1. The host reads each such
+miss into a RAM victim of its node's range, taken before the staging misses take theirs. The CPU computes it there,
+and the tier keeps it (the record's delta maps it). Every node range is checked at attach to hold staging + lanes +
+VRAM-hot slots, so a victim always exists, and a live miss always has its staging slot (live <= V = staging per node).
+Both are asserted (fail_record, __trap), never handled. The post overflows only when forced lanes cannot be CPU lanes
+at all: before the copy engine arms (or before a row's CPU layer is registered). Then it serves the live prefix,
+writes that count, and sets DIRECT's overflow flag and the layer's counter, and the DSpark worker re-runs the verify
+eagerly. The draft (the second client) keeps its own channel and areas, on the same stream strictly before the
+verify. From Task 11 on it shares the GPU node's CPU expert team: one thread, one job at a time, its hold watching the
+doorbell and the channel head.
+
 ## Fail-stop
 
 Every failure ends the process; the protocol carries no error state.

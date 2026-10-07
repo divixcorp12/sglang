@@ -58,7 +58,7 @@ def exl3_moe_route_tables(
     (``x`` as fp16), zeroes ``out_zero``, and fills ``expert_count`` [slots + 1], ``inv_order``, ``weight_sorted``
     (fp16) and ``det`` [3, slots + 1]. ``token_sorted_out`` (int64 ``[routes]``, optional) receives each rank's token.
 
-    CPU experts (one token only): ``cpu_lanes`` (int32 ``[2]``: CPU lanes, then the part bits) masks the plan lanes the CPU computed and
+    CPU experts (one token only): ``cpu_lanes`` (int32 ``[2]`` (``[3]`` on a wide wire): CPU lanes, then the part bits, then the lanes' high half) masks the plan lanes the CPU computed and
     flags the output parts holding their partial sums, a bit per part: bit 2g group g's CPU hits', bit 2g + 1 its CPU
     misses'; ``dst_slots`` (int32) are the plan's lane slots, ``cpu_out`` the address of the row's part 0 and
     ``cpu_part_stride`` the floats between consecutive parts (0 for a one-part row). The flagged parts' sum, lowest
