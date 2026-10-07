@@ -231,11 +231,8 @@ def test_a_verify_calibration_runs_per_token_jobs_of_the_verifys_tokens(tmp_path
             assert len(call["slots"]) == k and -1 not in call["slots"] and call["weights"] == [1.0] * k
 
 
-def test_a_calibration_asks_for_no_more_tokens_than_the_rows_hold(tmp_path):
-    _, host, _, _keep = _host(tmp_path, tokens=6)
-    for tokens in (0, 7):
-        with pytest.raises(RuntimeError, match="tokens"):
-            host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), tokens=tokens)
-    _, one, _, _keep1 = _host(tmp_path / "one")
+@pytest.mark.parametrize("held, asked", [(6, 0), (6, 7), (1, 2)])
+def test_a_calibration_asks_for_no_more_tokens_than_the_rows_hold(tmp_path, held, asked):
+    _, host, _, _keep = _host(tmp_path, tokens=held)
     with pytest.raises(RuntimeError, match="tokens"):
-        one.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(one), tokens=2)
+        host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=_scratch(host), tokens=asked)
