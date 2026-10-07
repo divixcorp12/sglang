@@ -30,6 +30,7 @@ def main():
                 footer = r
     assert footer and footer['dropped_forwards'] == 0
     tids = sorted({r['tid'] for rs in frames.values() for r in rs})
+    cpu_by_tid = {r['tid']:r['cpu'] for rs in frames.values() for r in rs}
     connection = sqlite3.connect(root / "scheduler.sqlite")
     connection.execute("PRAGMA cache_size=-65536")
     connection.execute("PRAGMA temp_store=FILE")
@@ -70,8 +71,9 @@ def main():
             if out is None:
                 continue
             wake = next((w for w in bytid[tid] if out['ns'] <= w['ns'] <= e['ns']), None)
-            # State 0 is runnable. Other Linux prev_state values denote non-running states.
-            runnable = out['ns'] if out['prev_state'] == 0 else wake['ns'] if wake else None
+            # This capture's ftrace format marks preempted runnable tasks with
+            # TASK_REPORT_MAX (256, printed as R+). It is not a sleeping state.
+            runnable = out['ns'] if out['prev_state'] in (0, 256) else wake['ns'] if wake else None
             intervals[tid].append({'out_ns':out['ns'], 'in_ns':e['ns'], 'state':out['prev_state'],
                                    'wake_ns':wake['ns'] if wake else None, 'runnable_ns':runnable,
                                    'next_pid_on_out':out['next_pid'], 'waker_tid':wake['common_pid'] if wake else None})
@@ -112,9 +114,22 @@ def main():
         joined.append(record)
     assert len(joined) == len(jobs) == 600
     barrier = sorted([{'forward':f['forward'],'job':f['job'],**p} for f in joined for p in f['phases']],key=lambda p:p['release_tail_ms'],reverse=True)
+    competitors = {}
+    for b in barrier[:10]:
+        tid = b['last_exit_tid']
+        b['cpu'] = cpu_by_tid[tid]
+        lo = b['all_work_done_ns'] - system - 3_000_000
+        hi = b['last_exit_ns'] - system + 10_000
+        context = connection.execute("SELECT start,cpu,isSchedIn,globalTid%16777216 FROM SCHED_EVENTS WHERE cpu=? AND start BETWEEN ? AND ? ORDER BY start LIMIT 100",(b['cpu'],lo,hi)).fetchall()
+        b['core_schedule'] = [{'ns':system+ts,'cpu':cpu,'sched_in':bool(inside),'tid':peer} for ts,cpu,inside,peer in context]
+        for _,_,_,peer in context:
+            if peer in tids or peer == 0 or peer in competitors:
+                continue
+            competitors[peer] = connection.execute("SELECT s.value FROM ThreadNames n JOIN StringIds s ON s.id=n.nameId WHERE n.globalTid%16777216=?",(peer,)).fetchall()
     evidence={'system_clock_ns':system,'utc_epoch_ns':epoch,'scheduler_range_ns':list(sched_range),'job_relative_range_ns':relative,
               'coverage_valid':True,'timed_jobs':len(joined),'worker_footer':footer,'target_tids':tids,
               'switch_count':len(switches),'wake_count':len(wakes),
+              'competing_thread_names':competitors,
               'diagnostics':connection.execute("SELECT timestamp,severity,text FROM DIAGNOSTIC_EVENT").fetchall(),
               'top_barriers':barrier[:20], 'top_entries':sorted(joined,key=lambda f:f['entry']['delay_ms'],reverse=True)[:10]}
     (root/'scheduler-analysis.json').write_text(json.dumps(evidence,indent=2)+'\n')
