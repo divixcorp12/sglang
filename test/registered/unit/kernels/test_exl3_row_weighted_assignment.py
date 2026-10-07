@@ -28,7 +28,8 @@ std::vector<int> check(const std::vector<int>& rows, int tiles, int workers, boo
   for (int w = 0; w < workers; ++w) {
     auto visit = [&](int j, int a, int b) {
       assert(j >= 0 && j < int(rows.size()));
-      assert(a >= 0 && a < b && b <= tiles && a % Unit == 0 && b % Unit == 0);
+      // The original partition can issue an empty range when workers exceed groups.
+      assert(a >= 0 && a <= b && b <= tiles && a % Unit == 0 && b % Unit == 0);
       for (int t = a; t < b; ++t) {
         assert(owners[j * tiles + t] == -1);
         owners[j * tiles + t] = w;
