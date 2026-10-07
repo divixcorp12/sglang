@@ -325,7 +325,7 @@ Run from the repository root on divix01, with no serving/profiling CPU workload:
 
 The runner serially alternates AB/BA on each NUMA node, ten workers pinned to
 6-15 / 18-27 and memory bound to the matching node. Eight layers and twelve
-expert slots per layer exceed the shared L2 capacity. The original 24 frozen
+expert slots per layer exceed the shared L3 capacity. The original 24 frozen
 outputs are checked, and A writes routed output references that every later
 process must match bit-exactly before and after timing. Results include means,
 p50/p95/p99, per-process ranges, binary/fixture hashes, and exact commands.
