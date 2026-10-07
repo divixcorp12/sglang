@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
+import sys
 import time
 
 
@@ -51,6 +53,26 @@ def restore(directory):
         raise RuntimeError("affinity restoration mismatch")
 
 
+def guard(directory, parent, parent_birth):
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        marker = directory / "affinity-restoration.json"
+        if marker.exists() and json.loads(marker.read_text())["restored"]:
+            return
+        try:
+            if identity(parent) != parent_birth:
+                break
+        except FileNotFoundError:
+            break
+        time.sleep(.1)
+    try:
+        if identity(parent) == parent_birth:
+            os.kill(parent, signal.SIGKILL)
+    except (ProcessLookupError, FileNotFoundError):
+        pass
+    restore(directory)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -58,6 +80,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=9.)
     args = parser.parse_args()
     assert os.geteuid() == 0 and 0 < args.seconds <= 10
+    os.umask(0o022)
     manifest = json.loads(args.manifest.read_text())
     assert sorted(p["comm"] for p in manifest) == ["cadvisor", "ray::DashboardA"]
     excluded = set()
@@ -84,30 +107,11 @@ def main():
     snapshot = dict(processes=processes, excluded_cpus=sorted(excluded), temporary_cpus=sorted(allowed))
     write_json(args.directory / "affinity-snapshot.json", snapshot)
     parent, parent_birth = os.getpid(), identity(os.getpid())
-    guardian = os.fork()
-    if guardian == 0:
-        # Detached from the collector's process group; hard deadline also covers
-        # a killed collector/SSH session. Never runs any benchmark work as root.
-        os.setsid()
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            if (args.directory / "affinity-restoration.json").exists():
-                os._exit(0)
-            try:
-                if identity(parent) != parent_birth:
-                    break
-            except FileNotFoundError:
-                break
-            time.sleep(.1)
-        try:
-            if identity(parent) == parent_birth:
-                os.kill(parent, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except FileNotFoundError:
-            pass
-        restore(args.directory)
-        os._exit(0)
+    # Exec a fresh interpreter: Nsight can inject threads even with --trace=none,
+    # making Python work in a raw fork child unsafe. Detach the recovery process
+    # from the collector's process group, with its own hard restoration deadline.
+    guardian = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--guardian",
+                                 str(args.directory), str(parent), str(parent_birth)], start_new_session=True)
 
     def interrupted(signum, frame):
         raise InterruptedError(f"signal {signum}")
@@ -143,8 +147,12 @@ def main():
     finally:
         restore(args.directory)
         write_json(args.directory / "affinity-checks.json", dict(thread_checks=checks, end_ns=time.monotonic_ns()))
-        os.waitpid(guardian, 0)
+        guardian.wait(timeout=25)
+        assert guardian.returncode == 0, "affinity recovery guardian failed"
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 5 and sys.argv[1] == "--guardian":
+        guard(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
+    else:
+        main()
