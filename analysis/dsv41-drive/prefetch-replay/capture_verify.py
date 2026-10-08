@@ -27,6 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "benchmarks", "dsv41_baseline"))
 sys.path.insert(0, os.path.join(REPO, "scripts", "dsv41"))
+sys.path.insert(0, os.path.join(REPO, "analysis", "dsv41-drive", "router-capture"))
 import arm_env  # noqa: E402
 import session_subset  # noqa: E402
 
@@ -55,6 +56,9 @@ def server_env(out_dir: str) -> dict:
 
 
 def check_capture(out_dir: str) -> dict:
+    """Refuse a capture the replay would mis-read: lost forwards, a verify without its router record or live token
+    count, or side files whose records and live counts disagree with the route log."""
+    import router_score
     from tier_sim import load_forwards
 
     loaded = load_forwards(os.path.join(out_dir, "trace.jsonl"), allow_dropped=True)
@@ -64,10 +68,38 @@ def check_capture(out_dir: str) -> dict:
     without = [f["seq"] for f in verifies if f.get("router") is None]
     if without:
         raise RuntimeError(f"{len(without)} verify forwards have no router record (first seq {without[0]})")
-    with open(os.path.join(out_dir, "router.json")) as f:
-        header = json.load(f)
-    return {"verify_forwards": len(verifies), "forwards": len(loaded["forwards"]), "tokens": header["tokens"],
-            "layers": len(header["layer_ids"])}
+    capture = router_score.load_capture(os.path.join(out_dir, "router"))
+    width, records = int(capture.header["tokens"]), len(capture.x)
+    for f in verifies:
+        if f["router"] >= records:
+            raise RuntimeError(f"verify seq {f['seq']} names router record {f['router']} of {records}")
+        live = int(capture.tokens[f["router"]])
+        if not 1 <= f["tokens"] <= width or f["tokens"] != live:
+            raise RuntimeError(
+                f"verify seq {f['seq']}: live token count {f['tokens']} in the route log, {live} in the side "
+                f"files, graph width {width}"
+            )
+    return {"verify_forwards": len(verifies), "forwards": len(loaded["forwards"]), "tokens": width,
+            "layers": len(capture.header["layer_ids"])}
+
+
+def stop_server(server: subprocess.Popen, timeout: float = 300) -> None:
+    """SIGTERM the launcher alone, then kill whatever of its group outlives it.
+
+    The launcher's handler drains and shuts the scheduler down, which runs the route
+    log's final read; a group SIGTERM kills the scheduler first and loses the last
+    ring entries without marking them dropped.
+    """
+    os.kill(server.pid, signal.SIGTERM)
+    try:
+        server.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(server.pid, signal.SIGKILL)
+        server.wait()
+    try:
+        os.killpg(server.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def _healthy(port: int, deadline: float) -> bool:
@@ -109,13 +141,7 @@ def main() -> int:
                  "--top-logprobs", "1", "--out", os.path.join(a.out_dir, "probe.json")], cwd=REPO,
             ).returncode
         finally:
-            # A normal shutdown runs the route log's final read; a SIGKILL would lose the last ring entries.
-            os.killpg(server.pid, signal.SIGTERM)
-            try:
-                server.wait(timeout=300)
-            except subprocess.TimeoutExpired:
-                os.killpg(server.pid, signal.SIGKILL)
-                server.wait()
+            stop_server(server)
     if rc != 0:
         return rc
     summary = check_capture(a.out_dir)
