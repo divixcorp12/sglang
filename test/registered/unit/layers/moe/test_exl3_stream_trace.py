@@ -270,6 +270,18 @@ def test_a_verify_forwards_live_count_comes_from_its_verify_layout():
     assert log.current_meta()["tokens"] == 3
 
 
+def test_a_static_verify_without_a_layout_counts_every_draft_row_live():
+    """The recipe's static verify (run_non_compact) attaches no ragged layout: every request verifies
+    draft_token_num rows, all of them live."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    batch = _batch("target_verify", ["a", "b"], 0)
+    batch.batch_size, batch.spec_info = 2, SimpleNamespace(ragged_verify_layout=None, draft_token_num=6)
+    log = module.GraphRouteLog(layers=1, width=8, device="cpu", depth=8, margin=2)
+    log.on_pre_forward(1, batch)
+    assert log.current_meta()["tokens"] == 12
+
+
 def test_phase_comes_from_the_forward_mode_not_the_token_count(tmp_path):
     """A prompt whose prefix is cached can prefill one token, which the graph gather serves and the ring
     logs like a decode step. Its phase must still say extend, and a replay must not score it as decode.
