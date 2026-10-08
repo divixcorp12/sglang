@@ -519,13 +519,14 @@ def padded_plan_width(capacity: int, lanes: int) -> int:
     return max(capacity, lanes)
 
 
-def spill_room_shortfall(ranges, *, staging: int, lanes: int, hot: int) -> list[tuple[int, int, int]]:
+def spill_room_shortfall(ranges, *, staging: int, lanes: int, hot: int, pool: int = 0) -> list[tuple[int, int, int]]:
     """The node ranges of a layer that cannot give every forced CPU miss a RAM victim, as (group, slots, needed).
 
-    A forced miss is read into a victim of its node's range: neither a staging slot (`staging`), nor an expert the
-    record routes (at most `lanes` less the forced misses themselves), nor a VRAM-hot expert (at most `hot`). So a
-    range of at least staging + lanes + hot slots always has one (plan 2026-10-06, Task 9)."""
-    need = staging + lanes + hot
+    A forced miss is read into a victim of its node's range: neither a staging slot (`staging`), nor a speculative pool
+    slot (`pool`, SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE), nor an expert the record routes (at most `lanes` less the
+    forced misses themselves), nor a VRAM-hot expert (at most `hot`). So a range of at least
+    staging + pool + lanes + hot slots always has one (plan 2026-10-06, Task 9)."""
+    need = staging + pool + lanes + hot
     return [(g, hi - lo, need) for g, (lo, hi) in enumerate(ranges) if hi - lo < need]
 
 
@@ -788,6 +789,8 @@ class Exl3RamMissService:
         self.page = None
         self.slot_map = None
         self._node_ranges = None
+        # The RAM prefetch's pool slots per row and group, set at start (0: no pool).
+        self._spec_share = 0
         self._rows: dict[int, int] = {}
         self._manager = None
         # The only caller of host.pause()/resume(), which are not reentrant.
@@ -905,7 +908,11 @@ class Exl3RamMissService:
         # group_ranges is per group, then per row.
         ranges = [group[row] for group in self._node_ranges] if self._node_ranges is not None else [(0, capacity)]
         short = spill_room_shortfall(
-            ranges, staging=self.staging_for(capacity), lanes=width, hot=int(streamer.hot_cache.capacity)
+            ranges,
+            staging=self.staging_for(capacity),
+            lanes=width,
+            hot=int(streamer.hot_cache.capacity),
+            pool=self._spec_share,
         )
         if short:
             raise ValueError(

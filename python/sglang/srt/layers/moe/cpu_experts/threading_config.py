@@ -10,6 +10,7 @@ on any topology; ``from_env`` gathers the machine's.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from dataclasses import dataclass
 from itertools import combinations
@@ -163,6 +164,7 @@ class CoreSettings:
     draft: bool = False  # SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS
     draft_cores: str = ""  # SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES; empty derives them on the GPU's node
     draft_threads: int = 0  # SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS, 0: no cap on the derived cores
+    ram_prefetch: bool = False  # SGLANG_DSV41_RAM_PREFETCH: each group's speculative thread needs cores
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,7 @@ class NodePlan:
     cpu: tuple[int, ...]  # the CPU expert engine's cores, cpu[0] its thread (worker 0); () without CPU experts
     sq: Optional[int]  # the io_uring SQPOLL thread's core; None unpinned
     busy_poll: bool
+    spec: tuple[int, ...] = ()  # the RAM prefetch's speculative thread's cores; () without the prefetch
 
     @property
     def threads(self) -> int:
@@ -184,7 +187,8 @@ class NodePlan:
     def log_line(self) -> str:
         ram = "-" if self.ram is None else str(self.ram)
         sq = "-" if self.sq is None else str(self.sq)
-        return f"numa node{self.node}: ram={ram} cpu={_format_cpus(self.cpu)} ({self.threads}) sq={sq}"
+        spec = f" spec={_format_cpus(self.spec)}" if self.spec else ""
+        return f"numa node{self.node}: ram={ram} cpu={_format_cpus(self.cpu)} ({self.threads}) sq={sq}{spec}"
 
 
 @dataclass(frozen=True)
@@ -225,6 +229,7 @@ class ThreadingConfig:
             draft=envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get(),
             draft_cores=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get(),
             draft_threads=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get(),
+            ram_prefetch=envs.SGLANG_DSV41_RAM_PREFETCH.get(),
         )
         placement = parse_placement(envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.get())
         gpu_node = gpu_numa_node(device)
@@ -324,6 +329,9 @@ class ThreadingConfig:
         draft: tuple[int, ...] = ()
         if settings.draft and not settings.cpu_experts:
             draft = tuple(named_draft) or _derive_draft(gpu, topology, affinity, settings, taken)
+        if settings.ram_prefetch:
+            assigned = taken | {s for c in draft for s in topology.siblings[c]}
+            plans = [dataclasses.replace(plan, spec=_spec_cores(plan, topology, affinity, assigned)) for plan in plans]
         return ThreadingConfig(tuple(plans), (copy,), gpu, draft)
 
 
@@ -348,6 +356,13 @@ def _derive_draft(gpu, topology, affinity, settings, taken) -> tuple[int, ...]:
             raise ValueError(f"SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS on node {gpu}: {refusal}") from None
         free = free[: settings.draft_threads]
     return tuple(free)
+
+
+def _spec_cores(plan: NodePlan, topology: Topology, affinity: frozenset[int], assigned: set[int]) -> tuple[int, ...]:
+    """A group's speculative-thread cores: the server's affinity on its node less every assigned core and its SMT
+    sibling. With none spare it shares the RAM thread's core (spec 2026-10-08-dsv41-ram-prefetch-design)."""
+    spare = tuple(c for c in topology.node_cpus[plan.node] if c in affinity and not (topology.siblings[c] & assigned))
+    return spare or ((plan.ram,) if plan.ram is not None else ())
 
 
 def _copy_core(gpu, overrides, topology, affinity, draft=()) -> int:

@@ -1999,6 +1999,15 @@ class Envs:
     # 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03: a 1 ms or
     # 3 ms gap then costs nothing). 0: PAUSE only. The team never sleeps either way.
     SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
+    # NVMe-to-RAM prefetch: per NUMA group a thread scores the next layer's gate and reads its pick into a pool of RAM
+    # slots the device never maps; a forced CPU miss on a pooled expert swaps it in. Needs SGLANG_DSV41_CPU_EXPERTS.
+    SGLANG_DSV41_RAM_PREFETCH = EnvBool(False)
+    # Candidates per live token, in its score order past the hot, mapped and pooled experts.
+    SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN = EnvInt(1)
+    # Speculative rows per layer over both NUMA groups: the replay's best budget (DSV41_REFERENCE.md section 33.13).
+    SGLANG_DSV41_RAM_PREFETCH_PER_LAYER = EnvInt(1)
+    # Pool slots per row and NUMA group, taken out of the tier at start.
+    SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE = EnvInt(2)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

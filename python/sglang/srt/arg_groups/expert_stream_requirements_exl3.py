@@ -254,6 +254,7 @@ def _check(cfg, budgets) -> None:
     if envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get():
         _check_dspark_cpu_experts(cfg)
     _check_row_weighted_assignment()
+    _check_ram_prefetch()
     cpu_experts = envs.SGLANG_DSV41_CPU_EXPERTS.get()
     speculative = getattr(cfg, "speculative_algorithm", None) is not None
     if cpu_experts and graph.decode.backend != Backend.BREAKABLE:
@@ -334,6 +335,28 @@ def _check_slot_map() -> None:
         raise ValueError(
             "SGLANG_DSV41_CPU_EXPERTS_MISSES needs SGLANG_DSV41_CPU_EXPERTS=1"
         )
+
+
+def _check_ram_prefetch() -> None:
+    """``SGLANG_DSV41_RAM_PREFETCH``'s prerequisite and its options' bounds, which the host refuses at enable too.
+
+    Checked before the backend rules: a disabled decode graph returns early, and the option must not pass silently.
+    """
+    if not envs.SGLANG_DSV41_RAM_PREFETCH.get():
+        return
+    if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
+        # Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool.
+        raise ValueError("SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS=1")
+    from sglang.srt.layers.moe import ram_prefetch
+
+    for name, high in (
+        ("SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN", ram_prefetch.MAX_PER_TOKEN),
+        ("SGLANG_DSV41_RAM_PREFETCH_PER_LAYER", ram_prefetch.MAX_PER_LAYER),
+        ("SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE", ram_prefetch.MAX_SPEC_SHARE),
+    ):
+        value = getattr(envs, name).get()
+        if not 1 <= value <= high:
+            raise ValueError(f"{name} must be in [1, {high}], got {value}")
 
 
 def _check_direct_residency(budgets) -> None:
