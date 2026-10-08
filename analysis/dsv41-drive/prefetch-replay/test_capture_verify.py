@@ -42,3 +42,79 @@ def test_the_driver_refuses_a_capture_with_dropped_forwards(tmp_path):
     (tmp_path / "router.json").write_text(json.dumps({"schema": 2, "layer_ids": [0], "tokens": 6, "hidden": 4, "topk": 2}))
     with pytest.raises(RuntimeError, match="lost 4 graph forwards"):
         cv.check_capture(str(tmp_path))
+
+
+def _capture(tmp_path, forward_tokens, live, routers=None, M=6):
+    """A schema-2 capture of len(forward_tokens) verify forwards: trace lines and router side files."""
+    import numpy as np
+
+    n = len(forward_tokens)
+    routers = list(range(n)) if routers is None else routers
+    lines = [{"kind": "graph_routes_header", "schema": 3, "run": "r", "layer_ids": [0], "hot_capacity": [1]}]
+    lines += [{"kind": "graph_routes", "schema": 3, "seq": s, "forward_pass_id": s + 1, "phase": "target_verify",
+               "rids": ["a"], "forward_tokens": t, "routes": [[1]], "misses": [0], "router": r}
+              for s, (t, r) in enumerate(zip(forward_tokens, routers))]
+    (tmp_path / "trace.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
+    prefix = str(tmp_path / "router")
+    (tmp_path / "router.json").write_text(json.dumps({"schema": 2, "layer_ids": [0], "tokens": M, "hidden": 4, "topk": 2}))
+    np.zeros((n, 1, M, 4), dtype=np.uint16).tofile(prefix + ".x.bin")
+    np.zeros((n, 1, M, 2), dtype=np.int32).tofile(prefix + ".ids.bin")
+    np.zeros((n, 1, M, 2), dtype=np.float32).tofile(prefix + ".w.bin")
+    np.stack([np.arange(n), np.arange(n) + 1, np.asarray(live)], axis=1).astype(np.int64).tofile(prefix + ".seq.bin")
+
+
+def test_check_capture_accepts_a_capture_whose_live_counts_agree(tmp_path):
+    _capture(tmp_path, [6, 4], [6, 4])
+    assert cv.check_capture(str(tmp_path))["verify_forwards"] == 2
+
+
+def test_check_capture_refuses_a_verify_without_its_live_token_count(tmp_path):
+    """A verify logged with 0 tokens (no live count reached the meta) cannot be ranked or budgeted."""
+    _capture(tmp_path, [6, 0], [6, 0])
+    with pytest.raises(RuntimeError, match="live token count"):
+        cv.check_capture(str(tmp_path))
+
+
+def test_check_capture_refuses_a_trace_and_side_files_that_disagree(tmp_path):
+    _capture(tmp_path, [6, 4], [6, 5])
+    with pytest.raises(RuntimeError, match="live token count"):
+        cv.check_capture(str(tmp_path))
+    _capture(tmp_path, [6, 4], [6, 4], routers=[0, 2])
+    with pytest.raises(RuntimeError, match="router record"):
+        cv.check_capture(str(tmp_path))
+
+
+def test_stop_server_signals_the_launcher_alone_before_cleaning_up_its_group(tmp_path):
+    """SIGTERM to the whole group would kill the scheduler before its shutdown runs the route log's final read;
+    only the launcher is signalled, and whatever outlives it is killed afterwards."""
+    import os
+    import subprocess
+    import textwrap
+    import time
+
+    child = textwrap.dedent(f"""
+        import os, signal, time
+        signal.signal(signal.SIGTERM, lambda *a: (open({str(tmp_path / 'child-term')!r}, 'w').close(), os._exit(0)))
+        time.sleep(60)
+    """)
+    leader = textwrap.dedent(f"""
+        import os, signal, subprocess, sys, time
+        kid = subprocess.Popen([sys.executable, "-c", {child!r}])
+        open({str(tmp_path / 'child.pid')!r}, "w").write(str(kid.pid))
+        signal.signal(signal.SIGTERM, lambda *a: (time.sleep(0.3), os._exit(0)))
+        time.sleep(60)
+    """)
+    proc = subprocess.Popen([sys.executable, "-c", leader], start_new_session=True)
+    pid_file = tmp_path / "child.pid"
+    deadline = time.monotonic() + 30
+    while not (pid_file.exists() and pid_file.read_text()):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    time.sleep(0.3)  # the child's handler is installed
+    kid = int(pid_file.read_text())
+    cv.stop_server(proc, timeout=10)
+    assert proc.returncode == 0
+    assert not (tmp_path / "child-term").exists()
+    time.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(kid, 0)
