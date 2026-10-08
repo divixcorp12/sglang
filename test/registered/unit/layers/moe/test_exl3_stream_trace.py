@@ -242,9 +242,10 @@ def test_graph_route_log_says_where_a_lagging_reader_lost_forwards(tmp_path):
 
 
 def _batch(mode, rids, tokens):
+    extend = mode in ("extend", "target_verify")
     return SimpleNamespace(
-        forward_mode=SimpleNamespace(name=mode.upper(), is_extend=lambda: mode == "extend"),
-        rids=rids, batch_size=1, extend_num_tokens=tokens if mode == "extend" else None,
+        forward_mode=SimpleNamespace(name=mode.upper(), is_extend=lambda: extend),
+        rids=rids, batch_size=1, extend_num_tokens=tokens if extend else None,
     )
 
 
@@ -355,21 +356,34 @@ def test_graph_route_log_records_each_replay_of_a_captured_graph(tmp_path, monke
         assert line["misses"] == [(step + row) % 4 for row in range(layers)]
 
 
-def _router_input(step, row, hidden=16, topk=6):
-    """A step- and layer-dependent router input (exact in bf16) and top-k weights."""
-    x = torch.arange(hidden, dtype=torch.float32) + 100 * step + 1000 * row
-    return x.to(torch.bfloat16).reshape(1, hidden), torch.full((1, topk), 0.5 * step + row, dtype=torch.float32)
+def _router_input(step, row, hidden=16, topk=6, tokens=1):
+    """A step-, layer- and token-dependent router input (exact in bf16), top-k ids and weights."""
+    base = torch.arange(hidden, dtype=torch.float32) + 100.0 * step + 1000.0 * row
+    x = torch.stack([base + 10000.0 * t for t in range(tokens)]).to(torch.bfloat16)
+    ids = torch.stack([(torch.arange(topk) + step + row + t) % 64 for t in range(tokens)]).long()
+    w = torch.stack([torch.linspace(0.1, 0.6, topk) + 0.01 * t for t in range(tokens)]).float()
+    return x, ids, w
 
 
 def _load_router(prefix):
     import numpy as np
 
-    header = json.loads(open(prefix + ".json").read())
-    layers, hidden, topk = len(header["layer_ids"]), header["hidden"], header["topk"]
-    x = torch.from_numpy(np.fromfile(prefix + ".x.bin", dtype=np.int16)).view(torch.bfloat16)
-    w = np.fromfile(prefix + ".w.bin", dtype=np.float32).reshape(-1, layers, topk)
-    keys = np.fromfile(prefix + ".seq.bin", dtype=np.int64).reshape(-1, 2)
-    return header, x.reshape(-1, layers, hidden), torch.from_numpy(w), keys
+    with open(prefix + ".json") as f:
+        header = json.load(f)
+    layers, tokens = len(header["layer_ids"]), header["tokens"]
+    hidden, topk = header["hidden"], header["topk"]
+    x = np.fromfile(prefix + ".x.bin", dtype=np.uint16).reshape(-1, layers, tokens, hidden)
+    ids = np.fromfile(prefix + ".ids.bin", dtype=np.int32).reshape(-1, layers, tokens, topk)
+    w = np.fromfile(prefix + ".w.bin", dtype=np.float32).reshape(-1, layers, tokens, topk)
+    keys = np.fromfile(prefix + ".seq.bin", dtype=np.int64).reshape(-1, 3)
+    return header, x, ids, w, keys
+
+
+def _assert_router_record(x, ids, w, step, row, want):
+    want_x, want_ids, want_w = want
+    assert torch.equal(torch.from_numpy(x[step, row].astype("int16")).view(torch.bfloat16), want_x)
+    assert torch.equal(torch.from_numpy(ids[step, row]).long(), want_ids)
+    assert torch.allclose(torch.from_numpy(w[step, row]), want_w)
 
 
 def _decode_batch(rid):
@@ -397,7 +411,7 @@ def test_router_capture_writes_each_serving_forward_once_joined_to_its_route_lin
     monkeypatch.setattr(module, "capturing_graphs", lambda: True)
     forward(99)  # warmup: sizes the rings, never written
     monkeypatch.setattr(module, "capturing_graphs", lambda: False)
-    assert log.router_x.shape == (8, layers, 16) and log.router_w.shape == (8, layers, 6)
+    assert log.router_x.shape == (8, layers, 1, 16) and log.router_w.shape == (8, layers, 1, 6)
     for step in range(20):
         log.on_pre_forward(500 + step, _decode_batch("r"))
         forward(step)
@@ -409,15 +423,15 @@ def test_router_capture_writes_each_serving_forward_once_joined_to_its_route_lin
     assert lines[0]["router_prefix"] == prefix and lines[0]["schema"] == module.ROUTE_LOG_SCHEMA
     steps = lines[1:]
     assert [line["router"] for line in steps] == list(range(20))
-    header, x, w, keys = _load_router(prefix)
+    header, x, ids, w, keys = _load_router(prefix)
     assert header["layer_ids"] == [4, 5, 9] and header["schema"] == module.ROUTER_CAPTURE_SCHEMA
-    assert x.shape[0] == w.shape[0] == keys.shape[0] == 20
+    assert x.shape[0] == ids.shape[0] == w.shape[0] == keys.shape[0] == 20
     assert keys[:, 0].tolist() == [line["seq"] for line in steps]
     assert keys[:, 1].tolist() == [500 + step for step in range(20)]
+    assert keys[:, 2].tolist() == [1] * 20
     for step in range(20):
         for row in range(layers):
-            want_x, want_w = _router_input(step, row)
-            assert torch.equal(x[step, row], want_x[0]) and torch.equal(w[step, row], want_w[0])
+            _assert_router_record(x, ids, w, step, row, _router_input(step, row))
 
 
 def test_route_log_without_router_capture_has_no_router_ring_or_field(tmp_path):
@@ -433,22 +447,6 @@ def test_route_log_without_router_capture_has_no_router_ring_or_field(tmp_path):
     trace.close()
     header, line = [json.loads(text) for text in path.read_text().splitlines()]
     assert "router_prefix" not in header and "router" not in line
-
-
-def test_router_capture_refuses_a_second_token_and_a_ring_sized_after_reads(tmp_path):
-    from sglang.srt.layers.moe import exl3_stream_trace as module
-
-    log = module.GraphRouteLog(layers=1, width=8, device="cpu", depth=4, margin=1)
-    log.enable_router(str(tmp_path / "router"))
-    log.record(0, torch.zeros(6, dtype=torch.int64), torch.zeros(1, dtype=torch.int32))
-    log.record_router(0, torch.zeros((1, 16), dtype=torch.bfloat16), torch.zeros((1, 6)))
-    with pytest.raises(ValueError, match="one token"):
-        log.record_router(0, torch.zeros((2, 16), dtype=torch.bfloat16), torch.zeros((2, 6)))
-    late = module.GraphRouteLog(layers=1, width=8, device="cpu", depth=4, margin=1)
-    late.enable_router(str(tmp_path / "late"))
-    late._host = []  # a read already sized its pinned copies without the router rings
-    with pytest.raises(RuntimeError, match="warmup forward"):
-        late.record_router(0, torch.zeros((1, 16), dtype=torch.bfloat16), torch.zeros((1, 6)))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
@@ -467,12 +465,13 @@ def test_router_capture_records_each_replay_of_a_captured_graph(tmp_path, monkey
     routes = [torch.full((6,), -1, dtype=torch.int64, device="cuda") for _ in range(layers)]
     counts = [torch.zeros(1, dtype=torch.int32, device="cuda") for _ in range(layers)]
     xs = [torch.zeros((1, hidden), dtype=torch.bfloat16, device="cuda") for _ in range(layers)]
+    ids = [torch.zeros((1, 6), dtype=torch.int64, device="cuda") for _ in range(layers)]
     ws = [torch.zeros((1, 6), dtype=torch.float32, device="cuda") for _ in range(layers)]
 
     def forward():
         for row in range(layers):
             log.record(row, routes[row], counts[row])
-            log.record_router(row, xs[row], ws[row])
+            log.record_router(row, xs[row], ids[row], ws[row])
 
     side = torch.cuda.Stream()
     monkeypatch.setattr(module, "capturing_graphs", lambda: True)
@@ -489,8 +488,9 @@ def test_router_capture_records_each_replay_of_a_captured_graph(tmp_path, monkey
         with torch.cuda.stream(side):
             for row in range(layers):
                 routes[row].copy_(torch.tensor(_forward_routes(step, layers)[row], device="cuda"), non_blocking=True)
-                want_x, want_w = _router_input(step, row, hidden=hidden)
+                want_x, want_ids, want_w = _router_input(step, row, hidden=hidden)
                 xs[row].copy_(want_x.cuda(), non_blocking=True)
+                ids[row].copy_(want_ids.cuda(), non_blocking=True)
                 ws[row].copy_(want_w.cuda(), non_blocking=True)
             graph.replay()
         log.poll(trace)  # the current stream is not the replay stream
@@ -500,10 +500,68 @@ def test_router_capture_records_each_replay_of_a_captured_graph(tmp_path, monkey
     lines = [json.loads(line) for line in path.read_text().splitlines()][1:]
     assert [line["seq"] for line in lines] == list(range(1, steps + 1))
     assert [line["router"] for line in lines] == list(range(steps))
-    _, x, w, keys = _load_router(prefix)
+    _, x, got_ids, w, keys = _load_router(prefix)
     assert keys[:, 0].tolist() == list(range(1, steps + 1))
     for step in range(steps):
         assert lines[step]["routes"] == _forward_routes(step, layers)
         for row in range(layers):
-            want_x, want_w = _router_input(step, row, hidden=hidden)
-            assert torch.equal(x[step, row], want_x[0]) and torch.equal(w[step, row], want_w[0])
+            _assert_router_record(x, got_ids, w, step, row, _router_input(step, row, hidden=hidden))
+
+
+def test_router_capture_holds_every_token_of_a_verify_forward(tmp_path, monkeypatch):
+    """A verify forward records [M, H] inputs, [M, topk] ids and weights per layer, and the forward's live token
+    count beside its seq, so a replay can score each token's next layer."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    path, prefix = tmp_path / "trace.jsonl", str(tmp_path / "router")
+    trace = module.Exl3StreamTrace(str(path))
+    layers, tokens = 3, 4
+    log = module.GraphRouteLog(layers=layers, width=8, device="cpu", depth=8, margin=2)
+    log.enable_router(prefix)
+    for row, layer in enumerate((4, 5, 9)):
+        log.bind(row, layer, 28)
+    trace.graph_seq_source, trace.forward_meta_source = log.read_seq, log.current_meta
+
+    def forward(step):
+        for row, routes in enumerate(_forward_routes(step, layers)):
+            log.record(row, torch.tensor(routes, dtype=torch.int64), torch.tensor([1], dtype=torch.int32))
+            log.record_router(row, *_router_input(step, row, tokens=tokens))
+
+    monkeypatch.setattr(module, "capturing_graphs", lambda: True)
+    forward(99)  # warmup: sizes the rings at the graph's widest verify, never written
+    monkeypatch.setattr(module, "capturing_graphs", lambda: False)
+    assert log.router_x.shape == (8, layers, tokens, 16) and log.router_ids.shape == (8, layers, tokens, 6)
+    live = [tokens, tokens - 1, tokens, tokens - 1, tokens]
+    for step in range(5):
+        log.on_pre_forward(10 + step, _batch("target_verify", ["req-a"], live[step]))
+        forward(step)
+        log.poll(trace)
+    log.poll(trace, final=True)
+    trace.close()
+    header, x, ids, w, keys = _load_router(prefix)
+    assert header["schema"] == 2 and header["tokens"] == tokens
+    assert x.shape == (5, layers, tokens, 16) and ids.shape == w.shape == (5, layers, tokens, 6)
+    assert keys[:, 2].tolist() == live
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    steps = [line for line in lines if line["kind"] == "graph_routes"]
+    assert [line["router"] for line in steps] == list(range(5))
+    assert [line["phase"] for line in steps] == ["target_verify"] * 5 and [line["forward_tokens"] for line in steps] == live
+    for step in range(5):
+        for row in range(layers):
+            _assert_router_record(x, ids, w, step, row, _router_input(step, row, tokens=tokens))
+
+
+def test_router_capture_refuses_a_different_token_count_and_a_ring_sized_after_reads(tmp_path):
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    log = module.GraphRouteLog(layers=2, width=8, device="cpu", depth=8, margin=2)
+    log.enable_router(str(tmp_path / "router"))
+    log.record(0, torch.tensor([1], dtype=torch.int64), torch.tensor([0], dtype=torch.int32))
+    log.record_router(0, *_router_input(0, 0, tokens=3))
+    with pytest.raises(ValueError, match="holds 3 tokens"):
+        log.record_router(0, *_router_input(0, 0, tokens=2))
+    late = module.GraphRouteLog(layers=2, width=8, device="cpu", depth=8, margin=2)
+    late.enable_router(str(tmp_path / "late"))
+    late._host = []  # a read already sized its pinned copies without the router rings
+    with pytest.raises(RuntimeError, match="warmup forward"):
+        late.record_router(0, *_router_input(0, 0, tokens=1))
