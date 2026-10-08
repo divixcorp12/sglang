@@ -609,3 +609,41 @@ def test_the_pool_and_the_c_abi_mirrors_are_gone():
         importlib.import_module("sglang.srt.layers.moe.cpu_experts.pool")
     assert {"kernel_address", "layer_spec"} <= set(dir(CpuExpertQuantTrait))
     assert not {"register_layer", "free_layer", "forward", "native_forward"} & set(dir(CpuExpertQuantTrait))
+
+
+@pytest.mark.parametrize(
+    "value, sources",
+    [("", frozenset()), ("draft", {"draft"}), ("target", {"target"}), ("both", {"draft", "target"})],
+)
+def test_row_weighted_assignment_names_the_sources_it_weights(value, sources):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
+
+    with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override(value):
+        assert row_weighted_sources() == frozenset(sources)
+
+
+@pytest.mark.parametrize("value", ["1", "on", "Draft", "draft,target"])
+def test_row_weighted_assignment_refuses_any_other_value(value):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
+
+    with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override(value):
+        with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT"):
+            row_weighted_sources()
+
+
+def test_the_trait_weights_only_the_source_the_option_names(caplog):
+    """The draft's and the target's traits come from one option: draft-only weights the draft's layers and logs it,
+    the target's layers keep the original assignment."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.cpu_experts.service import cpu_trait_for
+
+    ext = type("Ext", (), {"__file__": "/build/sglang_exl3_ext.so"})()
+    with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override("draft"):
+        with caplog.at_level("INFO", logger="sglang.srt.layers.moe.cpu_experts.service"):
+            draft, target = cpu_trait_for("exl3", ext, source="draft"), cpu_trait_for("exl3", ext, source="target")
+    assert (draft.row_weighted, target.row_weighted) == (True, False)
+    assert "draft" in caplog.text and "row-weighted" in caplog.text and "/build/sglang_exl3_ext.so" in caplog.text
+    with envs.SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT.override(""):
+        assert cpu_trait_for("exl3", ext, source="draft").row_weighted is False

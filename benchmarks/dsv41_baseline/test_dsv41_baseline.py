@@ -1412,3 +1412,8 @@ def test_run_arm_cancels_and_shuts_down_the_pcie_session_on_abort():
     helper = script[script.index("stop_pcie_session() {") :]
     helper = helper[: helper.index("\n}\n")]
     assert 'shutdown --session="$pcie_session"' in helper
+
+
+def test_dspark_env_names_the_row_weighted_assignment_off():
+    """The arm's environment states the option, so a captured shell cannot leave a B's weighting on in an A."""
+    assert arm_env.dspark_env()["SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT"] == ""

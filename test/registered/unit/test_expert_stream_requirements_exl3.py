@@ -673,3 +673,18 @@ def test_the_recipe_budget_a_passes_with_both_cpu_expert_clients(top_k_6_model_d
             "SGLANG_EXL3_CPU_ACT_BLOCK": 128,
         },
     )
+
+
+def test_row_weighted_assignment_needs_the_cpu_experts_it_names(model_dir, cpu_pin_off):
+    """The option weights the EXL3 kernel's tiles for the draft's or the target's layers; naming a source whose CPU
+    experts are off would log a change no kernel runs."""
+    draft = dict(DSPARK_CPU_ENV, SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT="draft")
+    _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **draft)
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT=target needs SGLANG_DSV41_CPU_EXPERTS"):
+        _gate(_launch(model_dir, speculative_algorithm="DSPARK"), **{**draft, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "target"})
+    target = dict(CPU_EXPERTS_ENV, SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT="target")
+    _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **target)
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT=both needs SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**target, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "both"})
+    with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**target, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "1"})

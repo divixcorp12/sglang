@@ -106,14 +106,81 @@ def test_the_extension_hands_out_one_kernel_address():
 
 
 def test_the_extension_packs_the_params_make_layer_reads():
-    """sglang_exl3_cpu::params is SglangExl3CpuParams {int32 bits, int32 swizzled}, little-endian."""
+    """sglang_exl3_cpu::params is SglangExl3CpuParams {int32 bits, int32 swizzled, int32 row_weighted}, little-endian."""
     import struct
 
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     trait, _ = _kernel()
     swizzled = Exl3CpuQuantTrait(trait.ext, act_limit=10.0, swizzled=True)
-    assert trait._params(3) == struct.pack("<ii", 3, 0) and swizzled._params(4) == struct.pack("<ii", 4, 1)
+    weighted = Exl3CpuQuantTrait(trait.ext, act_limit=10.0, row_weighted=True)
+    assert trait._params(3) == struct.pack("<iii", 3, 0, 0)
+    assert swizzled._params(4) == struct.pack("<iii", 4, 1, 0)
+    assert weighted._params(3) == struct.pack("<iii", 3, 0, 1)
+
+
+def test_the_kernel_refuses_a_row_weighted_value_other_than_0_or_1():
+    import dataclasses
+    import struct
+
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+
+    trait, _ = _kernel()
+    spec = trait.layer_spec(_random_slabs(20261008, HIDDEN, INTER), CAP)
+    with pytest.raises(Exception, match="row_weighted must be 0 or 1"):
+        es.kernel_layer(trait.kernel_address(), dataclasses.replace(spec, params=struct.pack("<iii", 3, 0, 2)), variant="prod")
+
+
+# Six rows whose chunks hold one and two rows: the shape on which row weighting moves tiles between workers
+# (test_exl3_row_weighted_assignment). k=1 puts two rows on expert 0; k=3 repeats experts across rows as a draft call does.
+MIXED_ROUTES = [
+    ([[0], [0], [1], [2], [3], [4]], [[1.0]] * 6),
+    ([[0, 1, 2], [0, 3, 4], [1, 2, 5], [3, 4, 5], [1, 3, 0], [2, 4, 5]], [[0.5, 0.3, 0.2]] * 6),
+]
+
+
+@pytest.mark.parametrize("slots, weights", MIXED_ROUTES)
+@pytest.mark.parametrize("threads", [2, 4])
+def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slots, weights, threads):
+    """Row weighting changes which worker owns an output tile (tile_assignment.hpp), never a tile's arithmetic: on
+    the production build, a layer made with row_weighted gives the original layer's output bit for bit, through the
+    DSV4.1 plan the serving kernel runs."""
+    from sglang.kernels.ops.moe import expert_stream_transport as es
+    from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
+
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
+    trait, cores = _kernel()
+    weighted = Exl3CpuQuantTrait(trait.ext, act_limit=LIMIT, row_weighted=True)
+    slabs = _random_slabs(20261008, HIDDEN, INTER)
+    layers = {
+        name: es.kernel_layer(t.kernel_address(), t.layer_spec(slabs, CAP), variant="prod")
+        for name, t in [("original", trait), ("weighted", weighted)]
+    }
+    g = torch.Generator().manual_seed(20261008)
+    x = (torch.randn(len(slots), HIDDEN, generator=g) * 4.0).half()
+
+    def forward(layer):
+        out = torch.full((len(slots), HIDDEN), float("nan"))
+        status, why = es.kernel_forward(
+            layer, x, torch.tensor(slots, dtype=torch.int32), torch.tensor(weights, dtype=torch.float32), out,
+            threads=threads, cores=cores[:threads], variant="prod",
+        )
+        assert (status, why) == (0, "")
+        return out
+
+    def run(_):
+        before = trait._op("plan_calls")()[0]
+        outs = [forward(layers["original"]), forward(layers["weighted"]), forward(layers["original"])]
+        return outs, trait._op("plan_calls")()[0] - before
+
+    try:
+        ((original, weighted_out, again), dsv41_calls),  = _on_threads(run, [None])
+        assert dsv41_calls == 3, "the DSV4.1 plan is the one serving runs"
+        assert torch.isfinite(original).all() and torch.equal(original, again)
+        assert torch.equal(weighted_out, original)
+    finally:
+        for layer in layers.values():
+            es.kernel_drop(layer, variant="prod")
 
 
 def test_two_core_groups_at_once_match_one_group_bit_for_bit(monkeypatch):
