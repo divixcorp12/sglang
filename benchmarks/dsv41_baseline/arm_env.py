@@ -131,9 +131,14 @@ FREE_CORES = "64-71"  # never touched; NVMe completion interrupts are pinned the
 # Since 2026-10-02 node 0's share is 40 GiB (80 GiB in all): co-tenants on node 0 (QuestDB,
 # a Ray cluster) left ~52 GiB free, so the 60 GiB share no longer fit beside the weights.
 # Decode at 80 GiB is not comparable to cells measured at 100 GiB.
-PINNED_HOST_MB = "81920"  # 80 GiB
-PINNED_HOST_NUMA_MB = "0:40960,1:40960"
-NODE0_FREE_MIB = 81869  # measured 2026-09-24 14:08, production and every arm down
+#
+# Since 2026-10-08 the tier is 104 GiB, 56 on node 0 and 48 on node 1 (DSV41_REFERENCE.md section 33.12). At 80 GiB,
+# 35% of a DSpark verify's VRAM misses were RAM misses too, and their NVMe reads set the per-layer lease gate that was
+# 61% of the step; at 104 GiB the RAM-miss share is 15% and the median decode 24% faster. The margin is thin: startup
+# swaps ~12 GiB out and MemFree sits near 1 GiB while serving.
+PINNED_HOST_MB = "106496"  # 104 GiB
+PINNED_HOST_NUMA_MB = "0:57344,1:49152"
+NODE0_FREE_MIB = 74849  # measured 2026-10-08 00:00, production and every arm down
 WEIGHTS_AND_OVERHEAD_MIB = 12288  # ~9.94 GiB of weights, plus slack
 
 HEALTH_TIMEOUT_S = 900  # /health runs a real generation; slow cold. Never shorten this.

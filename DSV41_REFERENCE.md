@@ -7413,6 +7413,79 @@ decode critical path, since the CPU work overlaps the transfers and not the GPU 
 wait (`docs/superpowers/plans/2026-10-07-dsv41-cpu-calibration-experiment.md`, "Verified starting point"). The
 calibration now prices a lane at its served cost; the throughput lever is elsewhere.
 
+### 33.12 The decode critical path: the lease gate, set by forced NVMe misses; a 104 GiB tier (2026-10-08)
+
+Two measurements on `a9fec053ae` (production recipe, budget A, idle GPU), artifacts under
+`divix01:/data/models/slang/nvfp4-work/critical-path-trace/` (`findings.md`, the analysis scripts) and
+`.../ram-tier-ab/`.
+
+**The trace.** `dspark-both` under node-mode Nsight (graph mode is refused with the copy engine on), 2 timed sessions
+(`DSV41_MAX_SESSIONS=2`; 7 and 103 tokens, accept 3.5 / 4.29); report
+`/mnt/nvme1/dsv41-nsys/dspark-both-20261008-000548.{nsys-rep,sqlite}`. Per verify step, p50 over 26 steps:
+
+| segment | ms |
+|---|---:|
+| step wall (first kernel of a verify graph to the next verify's) | 437 (98 ms/token x 4.3 accept, consistent with the untraced runs) |
+| the verify graph, 3 breakable segments of 1 + 13 + 26 layers | 416 |
+| of which GPU idle inside the graph | **268** (64% of the graph, 61% of the step) |
+| of which kernels | ~150 (`copy_wait` 12.5, `lease_stream` 12.1, attention 4.6, `exl3_moe` 3.3, gemm 1.8, post 1.4, route tables 1.1) |
+| host between the segments | 9 |
+| verify end to the next verify's first kernel | 11.5 (the draft graph 5.8, 3.3 of it idle on its CPU wait) |
+
+Every idle gap inside the verify graph follows the `copy_wait` kernel (1,056 of 1,056 gaps over 20 us): it is the
+lease gate, `cuStreamWaitValue32` on the record's gate word. Per layer p10 1.4, p50 5.3, p90 23, p99 36, max 56 ms.
+Node mode costs 1.0-2.6 ms per `cudaGraphLaunch` (3,731 nodes per verify), ~6 ms per verify, reported not removed.
+
+**What the gate waits on**, from the 2026-10-07 22:03 production-mask capture's instrumented host (persistent team
+at `282074649e`, the all-routed calibration, one session; `events.*.exl3-copy-eng.0.jsonl` joined with the two CPU
+engines' event logs per group, a copy group waiting for the CPU jobs with `cpu_seq <= seq <= late_seq`). From
+`copy_submit`, per group: the DMA lanes are observed done at 1.2 ms p50; the hit job (part 0, 4.4 lanes) ends at
+2.5-2.6 ms; a forced NVMe miss's job (part 1, one lane) is submitted as its row lands at 4.3-4.7 ms p50 (p90 10-11,
+p99 19) and ends at 5.3-5.5; the gate opens at 4.9 p50, 9.5 p90, 19.5 p99. The group's last finisher is a **forced
+NVMe miss 63%** of the time, the hit job 28%, the DMA 9%. Forced misses per group per layer: none in 35%, 1 in 30%, 2
+in 18%, 3 in 9%, 4 or more in 8% (mean 1.32, 2.6 per layer); the last row lands at 2.2 ms (1 miss), 4.4 (2), 6.7
+(3), 11.1 ms (4+): 13.3 MB per 2.2 ms is 6 GB/s per group, the expert mirrors' Gen3 line rate (§27) shared by the two
+groups. The reader already batches a plan's rows (`kBounceRows` 8). Over the traced run 25,597 of 73,343 VRAM misses
+were RAM misses too (35%), and group 0 evicted 51,039 rows against group 1's 9,553 (`no_victim` 301, group 0 only).
+Trace cross-check at the 1.25-token calibration: a gate wait in which DMA rows landed stayed closed another 4.4 ms
+p50 (19 p90) after the last row; the 27% of waits with no DMA row were 3.2 ms p50.
+
+This is why neither split A/B moved ms/token: the split balances the hit job (~2.5 ms) against the DMA (~1 ms per
+row), both shorter than the forced misses' landing, and forced misses always go to the CPU. The split and the
+row-weighted assignment can only show once the misses are gone, when the hit job (2.5 ms per layer, 100 ms per
+verify) is the floor.
+
+**The A/B: pinned tier 40 + 40 -> 56 + 48 GiB** (`SGLANG_MOE_PINNED_HOST_MB=106496`,
+`SGLANG_MOE_PINNED_HOST_NUMA_MB=0:57344,1:49152`; node 0 had 74,849 MiB free idle), the same 8 sessions, untraced,
+against the 1.25-token calibration run of addendum 2 (24 h earlier, same python tree):
+
+| session | 80 GiB ms/token | 104 GiB | change |
+|---|---:|---:|---:|
+| 0 CDW | 139.3 | 118.7 | -14.8% |
+| 1 ETR | 97.7 | 69.0 | -29.3% |
+| 2 TSCO | 61.8 | 55.9 | -9.5% |
+| 3 BKR | 145.7 | 125.0 | -14.2% |
+| 4 K | 86.1 | 64.3 | -25.3% |
+| 5 DISCA | 99.1 | 80.1 | -19.2% |
+| 6 WRK | 78.7 | 69.7 | -11.5% |
+| 7 VLO | 135.8 | 112.8 | -16.9% |
+| **median** | **98.38** | **74.89** | **-24%** |
+| mean | 105.5 | 86.9 | -18% |
+
+Every session faster; TTFT 11.5 -> 9.1 s. RAM misses fell to 16,486 of 108,491 VRAM misses (15%). Accept lengths
+within the near-tie band (sessions 1 and 7 changed text, session 1 ran 63 -> 101 tokens, as in earlier draft A/Bs).
+No fail-stop, trap, OOM or Traceback. 74.9 is below the non-DSpark recipe's 88.3 (§33.11) for the first time.
+
+- **Memory.** Host 188 GB. Startup pushed ~12 GiB to swap (the 80 GiB recipe pushed ~9, §1 of the 2026-10-07 stalls
+  handoff); through the timed set MemFree was 0.9-1.2 GiB and MemAvailable 26-27 GiB, with 0.4 GiB swapped out, 0
+  allocation stalls and 46k major faults in 136 s. Startup refuses a node that cannot hold its share, so a co-tenant
+  that grows makes the launch fail loudly rather than stall. There is no room for a larger tier without freeing
+  something else (the HiCache host pools are ~12.6 GB).
+- **Not done.** A same-day 80 GiB control (the A is 24 h older); the text-band probe; a production soak at 104 GiB.
+- **Next levers**, in order: node 0's residency (it does 84% of the evictions; the draft's resident set shares the
+  node); hiding the remaining misses (prefetch is off, and `SGLANG_MOE_EXPERT_GRAPH_GATHER` refuses it); then the
+  hit-job floor, where the split and the row-weighted assignment apply.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
