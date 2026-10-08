@@ -196,11 +196,22 @@ class BasicCpuExpertEngine {
     return config_.tokens;
   }
 
+  /// The tokens that route calibration lane `lane` of a `tokens`-token verify: token lane % tokens, and for every
+  /// fourth lane the next token too. 1.25 tokens per lane is the 1.23 the target's CPU jobs measure (cpu_shape events,
+  /// DSpark production, 2026-10-07): a lane routed by all 6 tokens is three kernel chunks instead of one, and priced
+  /// the CPU at 3x.
+  static uint32_t calibration_lane_mask(int64_t lane, int64_t tokens) {
+    uint32_t mask = 1u << (lane % tokens);
+    if (lane % 4 == 3) mask |= 1u << ((lane + 1) % tokens);
+    return mask;
+  }
+
   /// Calibration only (the tier's owner, copy engine not armed, so no record writes or reads the row): makes `row`'s
-  /// token table that of a verify of `tokens` tokens that routes every job lane with weight 1, so a per_token CpuJob
-  /// whose lanes[i] = i runs `tokens` rows of all its k lanes. The row's staged inputs are left as they are: the
-  /// timing does not depend on them. The tables are the pinned rows the Python service owns and the post kernel writes
-  /// (cpu_token_table.h); the const is only the engine's own read-only view of them.
+  /// token table that of a verify of `tokens` tokens routing lane j by calibration_lane_mask(j) with weight 1, so a
+  /// per_token CpuJob whose lanes[i] = i runs `tokens` rows of its k lanes at a served verify's cost. The row's staged
+  /// inputs are left as they are: the timing does not depend on them. The tables are the pinned rows the Python
+  /// service owns and the post kernel writes (cpu_token_table.h); the const is only the engine's own read-only view of
+  /// them.
   void write_calibration_table(int64_t row, int64_t tokens) const {
     constexpr int64_t kLanes = wire::Wire::kLanes;
     if (tokens < 1 || tokens > config_.tokens)
@@ -211,9 +222,8 @@ class BasicCpuExpertEngine {
     uint8_t* table = const_cast<uint8_t*>(config_.x_base) + row * config_.x_stride + config_.tokens * config_.x_token_bytes;
     const auto store = [](uint8_t* at, uint32_t v) { std::memcpy(at, &v, sizeof v); };
     store(table, static_cast<uint32_t>(tokens));
-    const uint32_t mask = tokens == 32 ? ~0u : (1u << tokens) - 1u;
     for (int64_t lane = 0; lane < kLanes; ++lane)
-      store(table + CpuTokenTable::kHeaderBytes + 4 * lane, mask);
+      store(table + CpuTokenTable::kHeaderBytes + 4 * lane, calibration_lane_mask(lane, tokens));
     for (int64_t t = 0; t < tokens; ++t)
       for (int64_t lane = 0; lane < kLanes; ++lane)
         store(table + CpuTokenTable::kHeaderBytes + 4 * kLanes + 4 * (t * kLanes + lane), std::bit_cast<uint32_t>(1.0f));

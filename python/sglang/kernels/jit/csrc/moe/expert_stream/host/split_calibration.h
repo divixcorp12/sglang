@@ -81,7 +81,7 @@ inline int64_t calibration_run(const BasicCalibrationSetup<Build>& s, int k, int
     job.row = s.row;
     job.part = 0;
     job.k = k;
-    job.per_token = s.tokens > 1;  // the token table (write_calibration_table) routes every token to every lane
+    job.per_token = s.tokens > 1;  // the token table (write_calibration_table) routes 1.25 tokens per lane
     for (int i = 0; i < k; ++i) {
       job.slots[i] = static_cast<int32_t>(s.first_slot + i);
       job.weights[i] = 1.0f;

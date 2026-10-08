@@ -212,9 +212,15 @@ def test_a_one_token_calibration_runs_one_row_jobs(tmp_path):
     assert jobs > 0 and len(calls) == jobs
 
 
+def _routed(lane, token, tokens):
+    """calibration_lane_mask (cpu_experts.h): lane % tokens routes the lane, and every fourth lane the next token too."""
+    return token == lane % tokens or (lane % 4 == 3 and token == (lane + 1) % tokens)
+
+
 def test_a_verify_calibration_runs_per_token_jobs_of_the_verifys_tokens(tmp_path):
     """The split decides per_token jobs of the verify's token count, so the calibration's CPU jobs are per_token with
-    that many rows, each token routing every lane (a synthetic all-routed mask)."""
+    that many rows, each lane routed by 1.25 tokens on average, as the target's served jobs measure, not by all of
+    them: a lane routed by every token costs three kernel chunks instead of one."""
     tokens = 6
     _, host, _, _keep = _host(tmp_path, capacity=20, lanes=16, tokens=tokens)
     jobs_before = host.cpu_stats()["jobs"]
@@ -230,8 +236,14 @@ def test_a_verify_calibration_runs_per_token_jobs_of_the_verifys_tokens(tmp_path
         job = calls[first : first + tokens]
         k = len(job[0]["slots"])
         assert 1 <= k <= 4
-        for call in job:  # every token holds all k lanes: none is -1, weight 1
-            assert len(call["slots"]) == k and -1 not in call["slots"] and call["weights"] == [1.0] * k
+        live = 0
+        for token, call in enumerate(job):  # a token holds the lanes it routes, -1 and weight 0 for the others
+            assert len(call["slots"]) == k
+            for lane, (slot, weight) in enumerate(zip(call["slots"], call["weights"])):
+                routed = _routed(lane, token, tokens)
+                assert (slot >= 0) == routed and weight == (1.0 if routed else 0.0)
+                live += routed
+        assert live == k + k // 4
 
 
 @pytest.mark.parametrize("held, asked", [(6, 0), (6, 7), (1, 2)])

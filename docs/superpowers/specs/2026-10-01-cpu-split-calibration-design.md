@@ -44,7 +44,10 @@ format. Each measurement is repeated 10 times after one discarded warm-up, and t
 
 1. **CPU pass: `cpu[k]`, k = 1..8.** A `CpuJob` with `k` lanes (slots 0..k-1, weight 1) submitted to the live
    `CpuExpertEngine` and waited for with `done(seq)`. Timed from submit to observed done, so queueing and wake-up are
-   included. Output goes to the row's part-0 output buffer, which nothing reads before the copy engine is armed.
+   included. When a verify's rows hold several tokens (DSpark), the job is per-token with the verify's token count,
+   lane j routed by token j % tokens and every fourth lane by the next token too: 1.25 tokens per lane, the 1.23 the
+   target's served CPU jobs measure (2026-10-07). Routing every token to every lane would price a lane at three kernel
+   chunks instead of one. Output goes to the row's part-0 output buffer, which nothing reads before the copy engine is armed.
 2. **Link pass: `link[m]`, m = 1..8.** The DMA of `m` experts' bytes from the row's pinned host slots into a scratch
    VRAM buffer, through a dedicated `CudaCopyBackend` (its own stream and completion word): the same
    `cuMemcpyAsync` per copy-table entry that the copy engine issues, then `mark` and poll `query`. Timed from the

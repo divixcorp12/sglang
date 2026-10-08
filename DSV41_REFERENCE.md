@@ -7354,7 +7354,9 @@ what keeps it behind is unmeasured; option C is what would test that.
 **§33.11 addendum: per-token calibration.** The CPU split under spill was calibrated with one-token CPU jobs while a
 verify's record jobs are `per_token` with 6 tokens (final-review finding I2). `a67c5a8e6c` makes the calibration's
 `cpu[k]` and `both[n][k]` jobs per-token jobs of the verify's token count, with a synthetic all-routed token table
-(`CpuExpertEngine::write_calibration_table`); one-token launches are unchanged. A/B rerun at `c1aa74bfd6` (python tree
+(`CpuExpertEngine::write_calibration_table`); one-token launches are unchanged. (2026-10-08: the all-routed table
+priced every lane at 6 tokens, three kernel chunks, where the `cpu_shape` events of two production captures put the
+target's CPU jobs at 1.23 tokens per lane; `write_calibration_table` now routes 1.25 tokens per lane, §30.1.) A/B rerun at `c1aa74bfd6` (python tree
 `8949a90bbc`), `ab-fix/`, budget A, the same 8 sessions, arms `prod` and `dspark-both` only, all `rc=0`, no fail-stop,
 trap, OOM or Traceback in any log.
 
