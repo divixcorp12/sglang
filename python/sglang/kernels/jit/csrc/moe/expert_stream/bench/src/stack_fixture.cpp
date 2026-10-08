@@ -159,7 +159,7 @@ void StackFixture::write_x(int64_t row) const {
 // by the EXL3 kernel. Views only: the fixture's slabs outlive it.
 ::sglang::cpu_experts::ExpertLayer StackFixture::make_layer(int64_t row) const {
   const Impl& f = *impl_;
-  const SglangExl3CpuParams params{3, 0};  // bits, swizzled
+  const SglangExl3CpuParams params{3, 0};  // bits, swizzled, row_weighted
   ::sglang::cpu_experts::ExpertLayer d;
   d.capacity = static_cast<int32_t>(capacity());
   d.hidden = static_cast<int32_t>(f.hidden);

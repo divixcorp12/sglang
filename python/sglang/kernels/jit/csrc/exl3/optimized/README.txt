@@ -53,7 +53,7 @@ accessor exl3_cpu_kernel() (kernel.h, hidden: never interposed across libraries)
 optimized extension's torch op sglang_exl3_cpu::kernel_address (torch_ops.cpp), and the expert-stream host makes each
 streamed layer with the kernel's make_layer (ExpertStreamHost.set_cpu_layer) from a CpuExpertLayerSpec
 (Exl3CpuQuantTrait.layer_spec): the pinned tier's six slab base pointers and per-slot strides, with SglangExl3CpuParams
-(bits, swizzled; kernel.h) as its params bytes, packed by the torch op sglang_exl3_cpu::params. A layer (ExpertLayer,
+(bits, swizzled, row_weighted; kernel.h) as its params bytes, packed by the torch op sglang_exl3_cpu::params. A layer (ExpertLayer,
 kernel.hpp) is a value of views with its params stored in it: the caller keeps the slabs alive. Every forward and
 keep-warm carries its worker cores (distinct, in [0, CPU_SETSIZE)); a core that cannot be pinned fails the call. A
 refused call throws std::invalid_argument and a failed one another std::exception, leaving out untouched.

@@ -4,7 +4,12 @@ Imported by the launch gate, so it reads only the environment."""
 
 from sglang.srt.environ import envs
 
-SOURCES = {"": frozenset(), "draft": frozenset({"draft"}), "target": frozenset({"target"}), "both": frozenset({"draft", "target"})}
+SOURCES = {
+    "": frozenset(),
+    "draft": frozenset({"draft"}),
+    "target": frozenset({"target"}),
+    "both": frozenset({"draft", "target"}),
+}
 
 
 def row_weighted_sources() -> frozenset[str]:

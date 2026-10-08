@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe.cpu_experts import draft
-from sglang.srt.layers.moe.cpu_experts.draft import DraftCpuExpertsRegistry, cpu_slots
+from sglang.srt.layers.moe.cpu_experts.draft import DraftCpuExpertsRegistry, cpu_slots, draft_kernel_for
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -266,3 +266,17 @@ def test_the_draft_registry_closes_before_the_service_too_and_reports_its_last_s
     host.stop()
     assert shared.stats()["jobs"] == 7  # the last snapshot survives the host
     shared.stop()  # a second stop after the host closed is a no-op
+
+
+def test_the_draft_asks_for_its_own_cpu_trait(monkeypatch):
+    """The draft's kernel is built for source "draft", the one per-source choice row weighting keys on; "target"
+    would silently weight the wrong layers."""
+    sources = []
+
+    class _Trait:
+        def check_environment(self):
+            pass
+
+    monkeypatch.setattr(draft, "cpu_trait_for", lambda key, *, source: sources.append(source) or _Trait())
+    draft_kernel_for("exl3", 10.0)
+    assert sources == ["draft"]

@@ -27,6 +27,9 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
         gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
 }
 
+// For non-uniform rows at total > 4 * num_workers, each worker here takes contiguous tile ranges and so drops
+// assign_gemvs's whole-GEMV striding. That changes cache locality on large calls, not any tile's arithmetic, so a
+// weighted A/B on such calls carries it as a confound.
 // A group costs rows(j) units. Round shared boundaries up to whole aligned
 // groups; adjacent workers use the same boundary, so every tile has one owner.
 template <int Unit = 8, typename Rows, typename Gemv>

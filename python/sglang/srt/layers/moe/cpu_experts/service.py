@@ -16,6 +16,7 @@ arithmetic is in ``cpu_experts/policy.py``.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Mapping, Optional, Sequence
 
@@ -33,6 +34,17 @@ from sglang.srt.layers.moe.cpu_experts.policy import (
 logger = logging.getLogger(__name__)
 
 
+def _short_sha256(path: Optional[str]) -> str:
+    """First 12 hex digits of the file's sha256, so a log line names the exact shared object that served an arm."""
+    if not path:
+        return "?"
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return "?"
+
+
 def cpu_trait_for(format_key: str, ext=None, *, source: str):
     """The quant trait of a streamed expert format for ``source``'s layers ("draft" or "target"); only EXL3 has a
     CPU kernel today. Row weighting (SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT) is the one per-source choice."""
@@ -43,11 +55,14 @@ def cpu_trait_for(format_key: str, ext=None, *, source: str):
         if ext is None:
             ext = exl3_ext()
         row_weighted = source in row_weighted_sources()
-        if row_weighted:
-            logger.info(
-                "CPU experts: the %s's EXL3 layers use row-weighted tile assignment (extension %s)",
-                source, getattr(ext, "__file__", "?"),
-            )
+        path = getattr(ext, "__file__", None)
+        logger.info(
+            "CPU experts: the %s's EXL3 layers use %s tile assignment (extension %s, sha256 %s)",
+            source,
+            "row-weighted" if row_weighted else "even",
+            path,
+            _short_sha256(path),
+        )
         return Exl3CpuQuantTrait(ext, act_limit=None, row_weighted=row_weighted)
     raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
 
