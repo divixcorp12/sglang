@@ -7486,6 +7486,64 @@ No fail-stop, trap, OOM or Traceback. 74.9 is below the non-DSpark recipe's 88.3
   node); hiding the remaining misses (prefetch is off, and `SGLANG_MOE_EXPERT_GRAPH_GATHER` refuses it); then the
   hit-job floor, where the split and the row-weighted assignment apply.
 
+### 33.13 NVMe-to-RAM prefetch under DSpark: the replay go/no-go (2026-10-08)
+
+**Decision: go to Phase 1** (the live predictor), by the owner's rule: `gate` h=1 at its best budget saves 0.62 of
+what `oracle` h=1 saves on the suite capture and 0.65 on the held-out one (bar 0.5 / 0.4). These are replay
+numbers, not a server measurement; Phase 1's A/B is the measurement.
+
+**Why it was reopened.** `NVME_PINNED_PREFETCH_HANDOFF.md` closed this at ~2 ms/token on three premises that DSpark
+with CPU experts overturned (spec `docs/superpowers/specs/2026-10-08-dsv41-ram-prefetch-design.md`): a forced miss is
+now computed on the CPU after it lands, so its whole 2.2 ms row is exposed; a verify layer is ~4x one decode layer,
+so an h=1 read has time to land; and there are ~94-104 forced misses per verify step, not 11 per token.
+
+**Capture** (`a3f8bbf`, `dspark-both`, 104 GiB tier, 8 sessions x 128 tokens, a diagnostic run). The stage trace's
+router capture now holds every verify token (schema 2: `[records, 40, 6, 5120]` inputs, ids, weights and each
+forward's live count). Suite (corpus rows 0-7): 140 verify forwards; held-out (rows 9-16): 110. No forward lost. The
+gate on the captured input reproduces the captured top-6 for 99.5% / 99.4% of (token, layer); every mismatch is one
+expert at a rank-6/7 tie within bf16 resolution. Two attempts failed before this and are kept on divix01: the
+router rings refused the one-token prefill warmup, and the static verify has no ragged layout, so its live count read
+0 (both fixed with tests).
+
+**Model** (`analysis/dsv41-drive/prefetch-replay/verify_replay.py`). Per verify layer and NUMA group: the hit job
+(DMA or the calibrated CPU split), forced misses as demand reads on one priority NVMe queue, each landing followed by
+a serial CPU miss job; the gate opens at the slower group. Speculative reads for layer T+h are issued at layer T's
+post, at most `--budget` per layer, one in flight, cold-admitted, spec-share 4. Validation against the server's own
+counters: 93.5 replayed RAM misses per verify against 109.4 measured (-14.5%, inside the 15% bar; the replay is
+optimistic), tier admissions -7%. Calibration (`calib/sweep.txt`): `--nvme-row-ms 2.2 --miss-job-ms 0.8 --gpu-ms 1.5
+--step-ms 20` gives a 340.8 ms step against 337.2 measured and gate p50 5.2 ms (4.9 measured), but p90 / p99 of
+11.8 / 29.4 against 9.5 / 19.5: the model's gate tail is heavier, which favours prefetch in absolute terms.
+
+**Results** at that calibration (saved ms/token against the no-prefetch replay, 79.3 suite / 84.3 held-out):
+
+| arm | suite | held-out | precision | drive busy |
+|---|---:|---:|---:|---:|
+| `oracle` h=1, budget 4 (b2 best: 12.10 / 12.47) | 11.91 | 12.18 | 1.00 | 0.73 |
+| `oracle` h=2 | 13.83 | 14.17 | 1.00 | 0.75 |
+| **`gate` h=1 k=1, budget 1** | **7.33** | **7.94** | 0.60 | 0.76 |
+| `gate` h=1 k=1, budget 2 | 6.03 | 6.46 | 0.54 | 0.83 |
+| `gate` h=1 k=1 depth 3, budget 4 | 5.09 | 5.51 | 0.70 | 0.72 |
+| `gate` h=1 k=1, budget 4 | 2.68 | 2.85 | 0.50 | 0.87 |
+| `gate` h=1 k=2, budget 8 | 0.10 | -0.07 | 0.48 | 0.92 |
+| `gate` h=2 k=1 | 1.82 | 1.51 | 0.42 | 0.90 |
+| `gate` h=1 k=1 FIFO queue | -0.53 | -0.53 | 0.50 | 0.83 |
+| `gate` h=1 k=1 at 1.3 ms/row (a fourth mirror) | 4.16 | 4.53 | 0.50 | 0.67 |
+
+The gate's precision is 0.5-0.6, and every wrong row costs drive time and an eviction, so less is more: the best
+arm issues one row per layer. A second calibration (2.0 ms/row, `calib/alt.txt`) gives ratios 0.54 / 0.57. FIFO goes
+negative, as in the 2026-09-26 study: the reader's priority class is required.
+
+**What the model leaves out.** Both groups share one NVMe queue; there is no latency tail on a read; the hit job's
+lane count follows the calibration split, not the live one, and counts unique experts, not production's
+(token, expert) lanes; node 0's draft slabs are outside the tier; a full tier crashes an arm rather than counting
+`no_victim` (271 in the server's run); a wrong prefetch's eviction cost is bounded by spec-share, as the live design
+will be.
+
+**Pointers.** Code: `analysis/dsv41-drive/prefetch-replay/{verify_gate_rankings,verify_replay,capture_verify}.py`,
+`verify.arms`, `verify_arms.sh`, `verify_table.py`; plan `docs/superpowers/plans/2026-10-08-dsv41-ram-prefetch-phase0.md`.
+divix01 `/data/models/slang/nvfp4-work/ram-prefetch/`: `capture-{suite,heldout}/` (trace, router side files,
+`rank.npz`, `server.log`), `calib/`, `arms-*/table.md`, `budget-*/table.md`, `findings.md`.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

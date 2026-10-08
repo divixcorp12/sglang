@@ -1,5 +1,7 @@
 # NVMe → pinned-host-tier prefetch: investigation handoff (2026-09-26)
 
+Revisited 2026-10-08 under DSpark with CPU-served misses: DSV41_REFERENCE.md §33.13 (replay go).
+
 **Status: closed, no-go.** Prefetching predicted expert rows from NVMe into the pinned host tier would save about
 **2 ms/token (~2%)** with the best realistic predictor. Even a perfect predictor saves at most **~6 ms/token**. Both
 are below the 8 ms/token bar that earlier prefetch studies used to decide whether to build.
