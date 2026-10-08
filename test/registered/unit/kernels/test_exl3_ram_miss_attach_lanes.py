@@ -420,3 +420,9 @@ def test_cpu_rows_hold_the_verify_tokens():
         )
         assert tuple(service.out_rows.shape) == out_shape
         assert service.x_rows.shape[1] == lease.cpu_row_bytes(64, tokens, 40)
+
+
+def test_the_speculative_pool_adds_its_share_to_the_spill_room():
+    """The pool's kSpec slots are never victims, so a forced miss's room needs them on top (RAM prefetch)."""
+    assert module.spill_room_shortfall([(0, 69), (69, 139)], staging=8, lanes=36, hot=24, pool=2) == [(0, 69, 70)]
+    assert module.spill_room_shortfall([(0, 80), (80, 161)], staging=8, lanes=36, hot=24, pool=2) == []

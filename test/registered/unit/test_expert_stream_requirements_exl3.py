@@ -688,3 +688,39 @@ def test_row_weighted_assignment_needs_the_cpu_experts_it_names(model_dir, cpu_p
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**target, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "both"})
     with pytest.raises(ValueError, match="SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT"):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **{**target, "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "1"})
+
+
+def test_ram_prefetch_options_default_off_at_the_replays_budget():
+    """Off until a served A/B is accepted; one candidate per token, one row per layer (DSV41_REFERENCE.md 33.13)."""
+    assert envs.SGLANG_DSV41_RAM_PREFETCH.get() is False
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN.get() == 1
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_PER_LAYER.get() == 1
+    assert envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.get() == 2
+
+
+def test_ram_prefetch_needs_cpu_experts(model_dir):
+    """Only a record with a CPU lane stages the input the scorer reads, and only a forced CPU miss uses the pool."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS=1"):
+        _gate(args, SGLANG_DSV41_RAM_PREFETCH=True)
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN", 0),
+        ("SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN", 13),
+        ("SGLANG_DSV41_RAM_PREFETCH_PER_LAYER", 0),
+        ("SGLANG_DSV41_RAM_PREFETCH_PER_LAYER", 9),
+        ("SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE", 0),
+        ("SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE", 5),
+    ],
+)
+def test_ram_prefetch_options_outside_the_hosts_bounds_are_refused(model_dir, name, value):
+    """Refused at launch, not at the service's start, where the host would refuse the same bound."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    with pytest.raises(ValueError, match=f"{name} must be in"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, **{name: value})

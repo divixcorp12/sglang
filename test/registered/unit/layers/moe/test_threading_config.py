@@ -238,7 +238,8 @@ def test_from_env_reads_every_core_setting(monkeypatch):
             envs.SGLANG_MOE_PINNED_HOST_NUMA_MB.override("1:1024,0:1024"), \
             envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.override(True), \
             envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.override("6-11"), \
-            envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.override(3):
+            envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.override(3), \
+            envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
         assert ThreadingConfig.from_env(cpu_experts=True, device=None) == "resolved"
     assert seen == {
         "nodes": [1, 0],
@@ -247,7 +248,7 @@ def test_from_env_reads_every_core_setting(monkeypatch):
         "topology": "topology",
         "settings": CoreSettings(
             cpu_experts=True, cores="18-29", threads=4, spin_core=17, sqpoll=True, sq_thread_cpu=15,
-            numa_cores="1:ram=35,cpu=18-33", draft=True, draft_cores="6-11", draft_threads=3,
+            numa_cores="1:ram=35,cpu=18-33", draft=True, draft_cores="6-11", draft_threads=3, ram_prefetch=True,
         ),
     }
 
@@ -327,3 +328,21 @@ def test_under_cpu_experts_named_draft_cores_are_refused(divix01, settings):
 def test_a_draft_only_launch_still_derives_the_draft_cores(divix01):
     config = resolve(divix01, affinity=RECIPE_SERVER, draft=True)
     assert config.draft_cpus == tuple(range(6, 16))
+
+
+def test_ram_prefetch_takes_each_nodes_spare_affinity_cores_or_its_ram_core(divix01):
+    """Spare: the server's affinity on the node less every assigned core and its SMT sibling (CPU experts 8-14 take
+    44-50 with them, the copy core 15 takes 51). Node 1 has no affinity core, so its thread shares the RAM core."""
+    config = resolve(divix01, cpu_experts=True, threads=16, ram_prefetch=True)
+    assert config.plans[0].spec == (*range(0, 8), 16, *range(36, 44), 52)
+    assert config.plans[1].spec == (35,)
+    assert config.log_lines()[:2] == [
+        "numa node0: ram=17 cpu=8-14 (7) sq=- spec=0-7,16,36-43,52",
+        "numa node1: ram=35 cpu=18-33 (16) sq=- spec=35",
+    ]
+
+
+def test_without_ram_prefetch_no_plan_names_spec_cores(divix01):
+    config = resolve(divix01, cpu_experts=True, threads=16)
+    assert [plan.spec for plan in config.plans] == [(), ()]
+    assert "spec=" not in " ".join(config.log_lines())
