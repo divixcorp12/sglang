@@ -288,11 +288,10 @@ class Replay:
                 continue
             s += 1
             step_start, step_gate = now, 0.0
-            budget = [a.budget]
             for li in range(len(self.layer_ids)):
                 self.nvme.advance(now)
                 if a.predictor != "none":
-                    self.issue(s, fwd, li, now, budget)
+                    self.issue(s, fwd, li, now, [a.budget])
                 gate, gates = self.layer(s, fwd, li, now)
                 self.per_layer_exposed[li] += gate
                 self.per_group_gate += gates
