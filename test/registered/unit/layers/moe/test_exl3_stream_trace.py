@@ -241,12 +241,33 @@ def test_graph_route_log_says_where_a_lagging_reader_lost_forwards(tmp_path):
     assert _tier_sim().load_forwards(str(path), allow_dropped=True)["dropped"] == 2
 
 
-def _batch(mode, rids, tokens):
-    extend = mode in ("extend", "target_verify")
+def _batch(mode, rids, tokens, layout_on_host=True):
+    """A ForwardBatch as init_new builds it: a target verify is an extend mode whose extend_num_tokens stays None;
+    its live count is only in the DSpark verify layout, on the host or (layout_on_host=False) the device."""
+    verify = mode == "target_verify"
+    extend = mode == "extend" or verify
+    spec_info = None
+    if verify:
+        spec_info = SimpleNamespace(ragged_verify_layout=SimpleNamespace(
+            verify_lens=torch.tensor([tokens], dtype=torch.int32),
+            verify_lens_cpu=[tokens] if layout_on_host else None,
+        ))
     return SimpleNamespace(
-        forward_mode=SimpleNamespace(name=mode.upper(), is_extend=lambda: extend),
-        rids=rids, batch_size=1, extend_num_tokens=tokens if extend else None,
+        forward_mode=SimpleNamespace(name=mode.upper(), is_extend=lambda: extend, is_target_verify=lambda: verify),
+        rids=rids, batch_size=1, extend_num_tokens=tokens if mode == "extend" else None, spec_info=spec_info,
     )
+
+
+def test_a_verify_forwards_live_count_comes_from_its_verify_layout():
+    """init_new leaves extend_num_tokens None for a target verify, so the meta must read the DSpark layout's
+    verify lengths: on the host when the planner kept them, else from the device copy."""
+    from sglang.srt.layers.moe import exl3_stream_trace as module
+
+    log = module.GraphRouteLog(layers=1, width=8, device="cpu", depth=8, margin=2)
+    log.on_pre_forward(1, _batch("target_verify", ["a"], 5))
+    assert log.current_meta()["tokens"] == 5
+    log.on_pre_forward(2, _batch("target_verify", ["a"], 3, layout_on_host=False))
+    assert log.current_meta()["tokens"] == 3
 
 
 def test_phase_comes_from_the_forward_mode_not_the_token_count(tmp_path):
