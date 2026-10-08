@@ -47,25 +47,36 @@ TOPK = 6
 
 
 class RouterCapture(msgspec.Struct):
-    """The side files, indexed by record: ``x`` bf16 as uint16 ``[records, layers, hidden]`` (memory-mapped),
-    ``w`` fp32 ``[records, layers, topk]``, and ``record_of_seq``."""
+    """A router capture's header, its ``x`` memmap ``[records, layers, tokens, hidden]`` (bf16 words), ``ids``
+    ``[records, layers, tokens, topk]`` (-1 for a schema-1 capture), ``w`` ``[records, layers, tokens, topk]``,
+    each record's live token count and the record of each graph seq."""
 
     header: dict
     x: np.ndarray
+    ids: np.ndarray
     w: np.ndarray
-    record_of_seq: dict
+    tokens: np.ndarray
+    record_of_seq: dict[int, int]
 
 
 def load_capture(prefix: str) -> RouterCapture:
     with open(prefix + ".json") as f:
         header = json.load(f)
     layers, hidden, topk = len(header["layer_ids"]), header["hidden"], header["topk"]
-    x = np.memmap(prefix + ".x.bin", dtype=np.uint16, mode="r").reshape(-1, layers, hidden)
-    w = np.fromfile(prefix + ".w.bin", dtype=np.float32).reshape(-1, layers, topk)
-    keys = np.fromfile(prefix + ".seq.bin", dtype=np.int64).reshape(-1, 2)
-    if not (len(x) == len(w) == len(keys)):
+    tokens = int(header.get("tokens", 1))
+    x = np.memmap(prefix + ".x.bin", dtype=np.uint16, mode="r").reshape(-1, layers, tokens, hidden)
+    w = np.fromfile(prefix + ".w.bin", dtype=np.float32).reshape(-1, layers, tokens, topk)
+    if header.get("schema", 1) >= 2:
+        ids = np.fromfile(prefix + ".ids.bin", dtype=np.int32).reshape(-1, layers, tokens, topk)
+        keys = np.fromfile(prefix + ".seq.bin", dtype=np.int64).reshape(-1, 3)
+        live = keys[:, 2]
+    else:
+        ids = np.full(w.shape, -1, dtype=np.int32)
+        keys = np.fromfile(prefix + ".seq.bin", dtype=np.int64).reshape(-1, 2)
+        live = np.ones(len(keys), dtype=np.int64)
+    if not (len(x) == len(w) == len(keys) == len(ids)):
         raise ValueError(f"{prefix}: side files disagree on the record count ({len(x)}, {len(w)}, {len(keys)})")
-    return RouterCapture(header, x, w, {int(seq): i for i, seq in enumerate(keys[:, 0])})
+    return RouterCapture(header, x, ids, w, live, {int(seq): i for i, seq in enumerate(keys[:, 0])})
 
 
 def bf16_to_f32(words: np.ndarray) -> np.ndarray:
@@ -152,7 +163,7 @@ def self_check(stream, x_of, W, bias, capture: RouterCapture, records: np.ndarra
         ids = torch.topk(scores + bias[target], TOPK, dim=-1).indices.numpy()
         captured = stream.routes[:, target]
         same_set[:, target] = [set(a) == set(b) for a, b in zip(ids, captured)]
-        w = capture.w[records, target]  # route order, as captured
+        w = capture.w[records, target, 0]  # route order, as captured
         want = np.take_along_axis(scores.numpy(), captured, axis=1)
         want = want / want.sum(axis=1, keepdims=True)
         sums = w.sum(axis=1, keepdims=True)
@@ -279,7 +290,7 @@ def main() -> None:
     torch.set_num_threads(min(32, os.cpu_count() or 1))
 
     def x_of(step_index: np.ndarray, layer: int) -> np.ndarray:
-        return bf16_to_f32(np.asarray(capture.x[records[step_index], layer]))
+        return bf16_to_f32(np.asarray(capture.x[records[step_index], layer, 0]))
 
     report: dict = {"trace": args.trace, "router_prefix": args.router_prefix, "run": loaded["run"],
                     "decode_steps": steps, "train_steps": int(train.sum()), "test_steps": int(test.sum())}

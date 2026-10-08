@@ -86,7 +86,7 @@ def main() -> None:
 
     # x per source layer, loaded once per layer (fp32 [steps, hidden], ~126 MB).
     for src_layer in range(layers):
-        x = torch.from_numpy(router_score.bf16_to_f32(np.asarray(capture.x[records, src_layer])))
+        x = torch.from_numpy(router_score.bf16_to_f32(np.asarray(capture.x[records, src_layer, 0])))
         for h in range(H + 1):
             # Targets whose source is this layer at horizon h: same step T = src + h, or next step T = src + h - 40.
             for target, same_step in ((src_layer + h, True), (src_layer + h - layers, False)):

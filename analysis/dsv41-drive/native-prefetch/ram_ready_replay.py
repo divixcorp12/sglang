@@ -227,7 +227,7 @@ def main() -> None:
     torch.set_num_threads(min(32, os.cpu_count() or 1))
 
     def x_of(step_index: np.ndarray, layer: int) -> np.ndarray:
-        return router_score.bf16_to_f32(np.asarray(capture.x[records[step_index], layer]))
+        return router_score.bf16_to_f32(np.asarray(capture.x[records[step_index], layer, 0]))
 
     router_score._RANKINGS[1] = router_score.rank_horizon(stream, x_of, W, bias, 1, 6)
     del W, bias
