@@ -1029,8 +1029,8 @@ class RamTier {
     return pool_ == nullptr ? 0 : pool_->share();
   }
 
-  // Writes {group, slot, state, expert} per pool entry of `row`, group-major; expert -1 for an empty entry. Any
-  // thread: each group's entries under its mutex.
+  // Writes {group, slot, state, expert} per pool entry of `row`, group-major; expert -1 for an empty or swapped entry.
+  // Any thread: each group's entries under its mutex.
   void spec_pool(int64_t row, int64_t* out) {
     row_capacity(row);
     if (pool_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "no speculative pool (reserve_spec_pool)");
@@ -1043,7 +1043,8 @@ class RamTier {
         out[k++] = g;
         out[k++] = entry.slot;
         out[k++] = pool_state(word);
-        out[k++] = word == kPoolEmpty ? -1 : pool_expert(word);
+        const uint32_t state = pool_state(word);
+        out[k++] = state == kPoolEmpty || state == kPoolSwapped ? -1 : pool_expert(word);
       }
     }
   }
@@ -1912,8 +1913,9 @@ class RamTier {
     return misses;
   }
 
-  // A forced miss's pool row: when group g's pool of the row holds `expert` landed, the entry's slot is returned and
-  // the entry takes `victim` (empty) in its place; else -1 and the miss is read. Under the group's pool mutex.
+  // A forced miss's pool row: when group g's pool of the row holds `expert` landed, returns the entry's slot and gives
+  // the entry `victim`, swapped until the record's delta publishes (release_swapped); else -1 and the miss is read.
+  // Takes the group's pool mutex itself; the caller holds the tier lock.
   int32_t take_pooled_locked(Group& group, const Request& request, int32_t expert, int32_t victim) {
     const int g = group.index;
     const int i = pool_->find(request.row, g, expert);
@@ -1923,9 +1925,24 @@ class RamTier {
     if (entry.word.load(std::memory_order_acquire) != pool_word(kPoolLanded, expert)) return -1;
     const int32_t slot = entry.slot;
     entry.slot = victim;
-    entry.word.store(kPoolEmpty, std::memory_order_release);
+    entry.freed_at = request.chain;
+    entry.word.store(pool_word(kPoolSwapped, kPoolNoExpert), std::memory_order_release);
     count<kSpecUsed>(group);
     return slot;
+  }
+
+  // The row's publisher, right after it publishes `request`'s delta: every group's entry swapped by this record becomes
+  // empty, so no speculative read lands in a victim the device may still map. A reporter's swaps precede its report,
+  // which the publisher's report acquires, so each is in place by now.
+  void release_swapped(const Request& request) {
+    for (int g = 0; g < dist_.size(); ++g) {
+      std::lock_guard<std::mutex> lock(pool_->mutex(g));
+      for (int i = 0; i < pool_->share(); ++i) {
+        PoolEntry& entry = pool_->entry(request.row, g, i);
+        if (pool_state(entry.word.load(std::memory_order_relaxed)) == kPoolSwapped && entry.freed_at == request.chain)
+          entry.word.store(kPoolEmpty, std::memory_order_release);
+      }
+    }
   }
 
   // Picks the victims and publishes the delta, before any read, so a served chain always has its delta published. A
@@ -1950,7 +1967,7 @@ class RamTier {
         part.entries[part.count][1] = -1;
         ++part.count;
       }
-      // A pooled row is mapped where it landed, and the victim takes its place in the pool.
+      // A pooled row is mapped where it landed, and the victim takes its place in the pool once the delta publishes.
       const int32_t pooled =
           pool_ != nullptr ? take_pooled_locked(group, request, plan.missing[i], static_cast<int32_t>(victim)) : -1;
       const int64_t slot = pooled >= 0 ? pooled : victim;
@@ -1990,8 +2007,11 @@ class RamTier {
     }
     own.staging = part.staging;
     const uint32_t reporters = NumaNodeDistributor<Source>::miss_nodes(request);
-    if (dist_.report(request, group.index, part, reporters) && !dist_.publish(lease_, request, reporters))
-      fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
+    if (dist_.report(request, group.index, part, reporters)) {
+      if (!dist_.publish(lease_, request, reporters))
+        fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
+      if (pool_ != nullptr) release_swapped(request);
+    }
   }
 
   // The rows the record's misses read: a miss swapped in from the pool reads none.

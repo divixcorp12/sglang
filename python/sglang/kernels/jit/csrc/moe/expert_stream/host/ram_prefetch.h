@@ -2,11 +2,14 @@
 // Phase 1).
 //
 //   SpecPool   per streamed row and NUMA group, `share` RAM-tier slots in state kSpec that the device never maps; an
-//              entry is empty, reading expert e, or landed with expert e
+//              entry is empty, reading expert e, landed with expert e, or swapped: holding a swap's victim until the
+//              row's delta that evicts it is published
 //
-// Threads. An entry's word, for_seq and landed are atomics any thread may load. Its slot, and every transition of its
-// word out of empty or landed, is under its group's mutex: the group's speculative thread claims entries, the group's
-// service thread swaps them (RamTier::take_pooled_locked). Only the claimer stores a reading word's successor.
+// Threads. An entry's word, for_seq and landed are atomics any thread may load. Its slot, freed_at, and every
+// transition of its word out of empty, landed or swapped, is under its group's mutex: the group's speculative thread
+// claims entries, the group's service thread swaps them (RamTier::take_pooled_locked), and the row's publisher, any
+// group's service thread, releases swapped ones (RamTier::release_swapped). Only the claimer stores a reading word's
+// successor.
 #pragma once
 
 #include <atomic>
@@ -16,7 +19,10 @@
 
 namespace sglang::expert_stream {
 
-enum : uint32_t { kPoolEmpty = 0, kPoolReading = 1, kPoolLanded = 2 };
+enum : uint32_t { kPoolEmpty = 0, kPoolReading = 1, kPoolLanded = 2, kPoolSwapped = 3 };
+
+// A swapped entry's expert bits: 0xFFFF names no expert, since reserve_spec_pool refuses 65536 experts or more.
+constexpr int32_t kPoolNoExpert = 0xFFFF;
 
 // An entry's word: the state above bit 16, the expert below (RamTier::reserve_spec_pool refuses 65536 experts or more).
 inline uint32_t pool_word(uint32_t state, int32_t expert) {
@@ -34,6 +40,7 @@ struct PoolEntry {
   std::atomic<uint32_t> word{kPoolEmpty};
   std::atomic<uint32_t> for_seq{0};  // the target record the read was issued for
   std::atomic<uint64_t> landed{0};   // landing order: with no empty entry, the oldest landed one is reclaimed
+  uint64_t freed_at = 0;             // swapped: the map chain whose delta evicts the victim; under the group's mutex
 };
 
 class SpecPool {

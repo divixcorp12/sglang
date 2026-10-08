@@ -1143,8 +1143,8 @@ CORE_COUNTERS = (
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
-# A speculative pool entry's states (host/ram_prefetch.h kPoolEmpty, kPoolReading, kPoolLanded).
-SPEC_POOL_STATES = ("empty", "reading", "landed")
+# A speculative pool entry's states (host/ram_prefetch.h kPoolEmpty, kPoolReading, kPoolLanded, kPoolSwapped).
+SPEC_POOL_STATES = ("empty", "reading", "landed", "swapped")
 
 
 def seqlock_stress(
@@ -1700,7 +1700,7 @@ class ExpertStreamHost:
 
     def spec_pool(self, row: int) -> list[dict]:
         """Every pool entry of ``row``, group-major: ``group``, ``slot``, ``state`` (one of ``SPEC_POOL_STATES``) and
-        ``expert`` (-1 when empty). Any time."""
+        ``expert`` (-1 when empty or swapped). Any time."""
         self._check(row)
         share = int(self._module.expert_stream_spec_share(self.handle))
         out = torch.empty((self.nodes * share, 4), dtype=torch.int64)
