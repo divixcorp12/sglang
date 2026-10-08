@@ -427,9 +427,8 @@ struct HostExports {
   // `cores` is int64 [n], the CPU expert thread's affinity (may be empty). `x_rows` is uint8 [rows, stride] in host
   // memory, where the post kernel writes a row's input; `out_rows` is float32 [rows, >= Wire::kNodes * parts * hidden]
   // in host memory, where the device reads a row's CPU partial sums (group g's part 0 the CPU hits', part 1 the CPU
-  // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. The idle engine holds its
-  // team in the kernel's keep_warm, in register work for `keep_warm_ns` after each job and in PAUSE for `spin_ns` after
-  // that, then sleeps until the next submit; `spin_ns` < 0 holds the team until the next submit, however long.
+  // misses' when parts is 2, at parts 2g and 2g + 1). Both tensors must outlive the service. The idle engine keeps
+  // its team in register work for `keep_warm_ns` after each job and in PAUSE after that, until the next submit.
   static void enable_cpu_experts(
       int64_t handle,
       int64_t group,
@@ -442,7 +441,6 @@ struct HostExports {
       int64_t parts,
       int64_t tokens,
       int64_t threads,
-      int64_t spin_ns,
       int64_t keep_warm_ns) {
     using namespace host;
     auto cpu = SymbolicDevice{};
@@ -485,7 +483,6 @@ struct HostExports {
     config.out_part_stride = parts == 2 ? tokens * hidden * static_cast<int64_t>(sizeof(float)) : 0;
     config.hidden = hidden;
     config.threads = static_cast<int>(threads);
-    config.spin_ns = spin_ns;
     if (keep_warm_ns < 0) throw std::runtime_error(error_prefix<Layout>() + "the keep-warm window is negative");
     config.keep_warm_ns = keep_warm_ns;
     const auto* sp = static_cast<const int64_t*>(split.data_ptr());
@@ -587,7 +584,6 @@ struct HostExports {
       int64_t stages,
       int64_t threads,
       TensorView cores,
-      int64_t spin_ns,
       int64_t keep_warm_ns,
       int64_t fatal_wait_ns) {
     using namespace host;
@@ -601,7 +597,6 @@ struct HostExports {
     const auto* c = static_cast<const int64_t*>(cores.data_ptr());
     for (int64_t i = 0; i < cores.size(0); ++i)
       d->config.cores.push_back(static_cast<int>(c[i]));
-    d->config.spin_ns = spin_ns;
     d->config.keep_warm_ns = keep_warm_ns;
     d->config.draft_only = true;
     d->fatal_wait_ns = fatal_wait_ns;
@@ -674,19 +669,17 @@ struct HostExports {
   static void write_draft_stats(const typename CpuExpertEngine::DraftStats& st, TensorView out) {
     using namespace host;
     auto cpu = SymbolicDevice{};
-    expert_stream::verify_named("out", TensorMatcher({7}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    expert_stream::verify_named("out", TensorMatcher({6}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
     auto* o = static_cast<int64_t*>(out.data_ptr());
     o[0] = st.jobs;
     o[1] = st.rows;
     o[2] = st.forward_ns;
-    o[3] = st.holds;
-    o[4] = st.collided_jobs;
-    o[5] = st.shared_routes;
-    o[6] = st.collided_forward_ns;
+    o[3] = st.collided_jobs;
+    o[4] = st.shared_routes;
+    o[5] = st.collided_forward_ns;
   }
 
-  // int64 [7]: jobs, rows, forward ns, keep-warm holds, collided jobs, shared routes, collided forward ns. Zeros before
-  // draft_cpu_start.
+  // int64 [6]: jobs, rows, forward ns, collided jobs, shared routes, collided forward ns. Zeros before draft_cpu_start.
   static void draft_cpu_stats(int64_t handle, TensorView out) {
     const auto d = find_draft(handle);
     write_draft_stats(d->engine ? d->engine->draft_stats() : typename CpuExpertEngine::DraftStats{}, out);
@@ -694,7 +687,7 @@ struct HostExports {
 
   // The DSpark draft channel as group `group`'s CPU expert engine's second job source (one team per node): the areas as
   // draft_cpu_open's; then draft_set_layer per stage (the arguments as draft_cpu_set_layer's), draft_start; draft_stop
-  // detaches it. stats: int64 [7] as draft_cpu_stats.
+  // detaches it. stats: int64 [6] as draft_cpu_stats.
   static void draft_open(int64_t handle, int64_t group, TensorView channel, TensorView x, TensorView slots,
                          TensorView weights, TensorView out, int64_t hidden, int64_t stages, int64_t fatal_wait_ns) {
     find(handle)->draft_open(static_cast<int>(group), make_draft_source(channel, x, slots, weights, out, hidden, stages),

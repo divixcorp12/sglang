@@ -144,9 +144,7 @@ def main():
     # These are inherited by the server; existing capture adds its own prefixes.
     env["SGLANG_CPU_EXPERT_TRACE_GATE"] = str(trace_gate_path)
     if not args.no_instrumentation:
-        env.update(SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX=str(output / "hold"),
-               SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY="65536",
-               SGLANG_CPU_EXPERT_TRACE_GATE=str(trace_gate_path),
+        env.update(SGLANG_CPU_EXPERT_TRACE_GATE=str(trace_gate_path),
                SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX=str(output / "scratch"))
     command = [sys.executable, str(Path(__file__).with_name("run_stall_capture.py")),
                "--reference", str(args.reference), "--output", str(output),
@@ -165,8 +163,7 @@ def main():
                        "--output=" + str(report), "/usr/bin/sleep", str(args.seconds)]
     (output / "omp-command.json").write_text(json.dumps(dict(command=command,
         diagnostic_env={k: v for k, v in env.items() if k.startswith(("DSV41_OMP", "DSV41_STEADY")) or
-                        k in ("DSV41_TIMED_START_FILE", "SGLANG_CPU_EXPERT_HOLD_TRACE_PREFIX",
-                              "SGLANG_CPU_EXPERT_HOLD_TRACE_CAPACITY", "SGLANG_CPU_EXPERT_TRACE_GATE",
+                        k in ("DSV41_TIMED_START_FILE", "SGLANG_CPU_EXPERT_TRACE_GATE",
                               "SGLANG_EXL3_CPU_SCRATCH_TRACE_PREFIX")},
         scheduler_command=profile_command), indent=2) + "\n")
     profiler = None

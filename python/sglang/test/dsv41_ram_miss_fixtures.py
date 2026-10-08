@@ -251,7 +251,7 @@ def fake_cpu_layer(hidden: int = 8):
     return CpuExpertLayerSpec(capacity=1 << 20, hidden=hidden, intermediate=0, act_limit=0.0, slabs=(), params=b"")
 
 
-def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, spin_us: int, keep_warm_us: int,
+def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, keep_warm_us: int,
                    fatal_wait_s: float, tmp_path, variant: str = "instr", ns_per_expert: int = 0):
     """A DSpark draft channel server, unstarted, with DraftCpuHost's interface, in one of the two shapes the shared CPU
     team allows (plan 2026-10-06 Task 11):
@@ -267,7 +267,7 @@ def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, spin_u
     from sglang.test.dsv41_chain_sim import ChainSim
 
     if mode == "draft_only":
-        return DraftCpuHost(areas, cores=cores, threads=threads, spin_us=spin_us, keep_warm_us=keep_warm_us,
+        return DraftCpuHost(areas, cores=cores, threads=threads, keep_warm_us=keep_warm_us,
                             fatal_wait_s=fatal_wait_s, variant=variant)
     if mode != "shared":
         raise ValueError(mode)
@@ -285,8 +285,7 @@ def draft_cpu_host(mode: str, areas, kernel: int, *, cores, threads: int, spin_u
     out_rows = torch.zeros((2, 2, 8), dtype=torch.float32)
     split = [0] * (host.wire.lanes + 1)
     split[1] = 1  # one eligible hit lane: the CPU's
-    host.enable_cpu_experts(kernel, split, cores, x_rows, out_rows, threads=threads, spin_us=spin_us,
-                            keep_warm_us=keep_warm_us)
+    host.enable_cpu_experts(kernel, split, cores, x_rows, out_rows, threads=threads, keep_warm_us=keep_warm_us)
     # The target's layer holds fewer slots than a draft stage's (>= 1 << 20), which the fake kernel records per call: a test
     # tells a target forward from a draft one by it.
     host.set_cpu_layer(row, dataclasses.replace(fake_cpu_layer(8), capacity=1024))

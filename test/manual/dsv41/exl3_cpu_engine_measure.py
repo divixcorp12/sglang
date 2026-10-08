@@ -105,7 +105,7 @@ def arm(args):
     u64p = ctypes.POINTER(ctypes.c_uint64)
     i64p = ctypes.POINTER(ctypes.c_int64)
     library.engine_measure.argtypes = [ctypes.c_uint64, u64p, u64p, u64p, u64p,
-                                      *([ctypes.c_int] * 7), u64p, i64p, ctypes.c_char_p, ctypes.c_size_t]
+                                      *([ctypes.c_int] * 6), u64p, i64p, ctypes.c_char_p, ctypes.c_size_t]
     library.engine_measure.restype = ctypes.c_int
     as_array = lambda values: (ctypes.c_uint64 * len(values))(*values)
     jobs, cells = [], []
@@ -127,7 +127,7 @@ def arm(args):
         start = time.monotonic_ns()
         status = library.engine_measure(trait.kernel_address(), as_array(pointers), as_array(sizes),
                                         as_array(inputs), as_array(outputs), rows, routes, reps, gap,
-                                        2000, 100000, 1, as_array(addresses), records, error, len(error))
+                                        2000, 1, as_array(addresses), records, error, len(error))
         end = time.monotonic_ns()
         if status:
             raise RuntimeError(error.value.decode())

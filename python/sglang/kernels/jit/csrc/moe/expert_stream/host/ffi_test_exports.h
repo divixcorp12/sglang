@@ -10,8 +10,7 @@
 //   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
-//   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows, test_keep_warm_calls, test_keep_warm_either_calls,
-//              test_keep_warm_core,
+//   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
 //              pause_ns
 //   draft      draft_test_post, draft_test_tear, draft_test_finish_close: the draft channel's device half on the host;
 //              draft_test_poll_pause: the draft source's poll path sleeps between its stop and head loads
@@ -654,8 +653,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   // their hidden (and capacity, which a call records). A forward spins k * ns_per_expert, waits while its worker-0 core
   // is held (test_kernel_hold), throws when made failing, else for each row t < max(rows, 1) writes out[t * hidden + j]
   // for j < max(hidden, 1) -- (accumulate ? out[..] : j) + sum_i weights[t * k + i] * (slots[t * k + i] + 1), or a zero
-  // partial (accumulate ? out[..] : 0) when made zeroing -- and records one call per row. A keep-warm counts its calls
-  // and records its first core, then spins until its word moves or its deadline passes.
+  // partial (accumulate ? out[..] : 0) when made zeroing -- and records one call per row. Its warm loop PAUSEs until
+  // its word moves or its deadline passes.
   class FakeKernel final : public cpu_experts::CpuExpertKernel {
    public:
     struct Call {
@@ -673,9 +672,6 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       zero_.store(zero, std::memory_order_relaxed);
       held_core_.store(-1, std::memory_order_release);
       max_rows_.store(1 << 16, std::memory_order_relaxed);
-      warm_calls_.store(0, std::memory_order_relaxed);
-      warm_core_.store(-1, std::memory_order_relaxed);
-      either_calls_.store(0, std::memory_order_relaxed);
     }
 
     const char* name() const noexcept override {
@@ -699,7 +695,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     void check(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall&) const override {
       if (layer.kernel != this) throw std::invalid_argument("fake CPU expert kernel: another kernel's layer");
     }
-    void forward(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall& c) const override {
+    using cpu_experts::CpuExpertKernel::forward;
+    void forward(const cpu_experts::ExpertLayer& layer, const cpu_experts::ForwardCall& c,
+                 cpu_experts::Team& team) const override {
+      team.run([](int, int) {});  // one job through the team's dispatch and end barrier, as a real forward
       const int32_t core = c.cores.empty() ? -1 : c.cores.front();
       const int64_t until = now_ns() + c.k * ns_.load(std::memory_order_relaxed);
       while (now_ns() < until)
@@ -739,22 +738,10 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         calls_.push_back(call);
       }
     }
-    void keep_warm(std::span<const int> cores, int32_t, const uint32_t* word, uint32_t seen, int64_t,
-                   int64_t release_ns) const override {
-      warm_calls_.fetch_add(1, std::memory_order_relaxed);
-      warm_core_.store(cores.empty() ? -1 : cores.front(), std::memory_order_relaxed);
-      while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < release_ns)
+    int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) const override {
+      while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < deadline_ns)
         _mm_pause();
-    }
-
-    void keep_warm_either(std::span<const int> cores, int32_t, const uint32_t* word_a, uint32_t seen_a,
-                          const uint32_t* word_b, uint32_t seen_b, int64_t, int64_t release_ns) const override {
-      warm_calls_.fetch_add(1, std::memory_order_relaxed);
-      either_calls_.fetch_add(1, std::memory_order_relaxed);
-      warm_core_.store(cores.empty() ? -1 : cores.front(), std::memory_order_relaxed);
-      while (__atomic_load_n(word_a, __ATOMIC_ACQUIRE) == seen_a && __atomic_load_n(word_b, __ATOMIC_ACQUIRE) == seen_b &&
-             now_ns() < release_ns)
-        _mm_pause();
+      return 0;
     }
 
     std::vector<Call> calls() const {
@@ -764,31 +751,19 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     void hold(int64_t core, bool on) {
       held_core_.store(on ? core : -1, std::memory_order_release);
     }
-    int64_t warm_calls() const {
-      return warm_calls_.load(std::memory_order_relaxed);
-    }
-    int64_t warm_core() const {
-      return warm_core_.load(std::memory_order_relaxed);
-    }
-    int64_t either_calls() const {
-      return either_calls_.load(std::memory_order_relaxed);
-    }
-
    private:
     mutable std::mutex mutex_;
     mutable std::vector<Call> calls_;
     std::atomic<int64_t> ns_{0}, fail_{0}, held_core_{-1};
     std::atomic<bool> zero_{false};
     std::atomic<int32_t> max_rows_{1 << 16};
-    mutable std::atomic<int64_t> warm_calls_{0}, warm_core_{-1};
-    mutable std::atomic<int64_t> either_calls_{0};
   };
   static FakeKernel& fake_kernel() {
     static FakeKernel kernel;
     return kernel;
   }
 
-  // Test only: the fake kernel's address, its calls and keep-warm counts reset; `fail` nonzero makes every forward
+  // Test only: the fake kernel's address, its calls reset; `fail` nonzero makes every forward
   // throw, `zero` makes it write a zero partial.
   static int64_t test_kernel_address(int64_t ns_per_expert, int64_t fail, int64_t zero) {
     if constexpr (!Build::kFaults) {
@@ -844,30 +819,6 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       fake_kernel().set_max_rows(static_cast<int32_t>(rows));
     }
   }
-  static int64_t test_keep_warm_calls() {
-    if constexpr (!Build::kFaults) {
-      test_only("test_keep_warm_calls");
-    } else {
-      return fake_kernel().warm_calls();
-    }
-  }
-  // Test only: how many of the fake's keep-warm calls were keep_warm_either (the two-word hold).
-  static int64_t test_keep_warm_either_calls() {
-    if constexpr (!Build::kFaults) {
-      test_only("test_keep_warm_either_calls");
-    } else {
-      return fake_kernel().either_calls();
-    }
-  }
-  // Test only: the first core the fake keep-warm's last call took (-1 before any call since test_kernel_address).
-  static int64_t test_keep_warm_core() {
-    if constexpr (!Build::kFaults) {
-      test_only("test_keep_warm_core");
-    } else {
-      return fake_kernel().warm_core();
-    }
-  }
-
   // Test only: the draft channel's device half on the host (draft_kernels.cuh), at the pinned channel's address.
   // draft_test_post writes what draft_post_kernel's thread 0 writes, in its order: the record's seqlock open, the
   // stage|rows|k word and the epoch, the seq, then the head.
@@ -1271,9 +1222,6 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_calls, Exports::test_kernel_calls);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_hold, Exports::test_kernel_hold);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_kernel_max_rows, Exports::test_kernel_max_rows);   \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_calls, Exports::test_keep_warm_calls); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_either_calls, Exports::test_keep_warm_either_calls); \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_test_keep_warm_core, Exports::test_keep_warm_core);   \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_post, Exports::draft_test_post);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_tear, Exports::draft_test_tear);           \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_draft_test_finish_close, Exports::draft_test_finish_close); \

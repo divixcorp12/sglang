@@ -152,7 +152,6 @@ class CpuExpertService:
             self.out_rows,
             threads=self.threads,
             group=self.group,
-            spin_us=envs.SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US.get(),
             keep_warm_us=max(keep_warm_us, 0),
         )
         self._last_stats = host.cpu_stats(self.group)

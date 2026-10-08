@@ -175,7 +175,6 @@ class Stack {
       cpu.hidden = config_.hidden;
       cpu.threads = static_cast<int>(group.cores.size());
       cpu.cores = group.cores;
-      cpu.spin_ns = -1;
       cpu.keep_warm_ns = config_.keep_warm_ns;
       tier_->enable_cpu_experts(g, std::move(cpu), std::vector<int64_t>(group.split.begin(), group.split.end()));
       service_cpus.push_back(group.service_cpu);

@@ -6,6 +6,7 @@
 #include "../draft_channel.h"
 #include "../lease_layout.h"
 #include "cpu_experts/kernel.hpp"
+#include "cpu_experts/team.hpp"
 #include "lease_channel.h"
 #include "job_trace.h"
 #include "reader_base.h"
@@ -22,6 +23,7 @@
 #include <future>
 #include <immintrin.h>
 #include <memory>
+#include <optional>
 #include <pthread.h>
 #include <sched.h>
 #include <span>
@@ -158,8 +160,7 @@ struct CpuExpertConfig {
   int64_t x_token_bytes = 0;  // bytes between two tokens' staged inputs
   int threads = 1;
   std::vector<int> cores;  // worker i runs on cores[i]; the engine's own thread on cores[0]
-  int64_t keep_warm_ns = 0;  // how long after each job the held team runs register work instead of PAUSE
-  int64_t spin_ns = -1;      // how long the team is held in PAUSE after that before the engine sleeps; < 0: never
+  int64_t keep_warm_ns = 0;  // how long after each job the idle team runs register work instead of PAUSE
   bool check_calls = false;  // run the kernel's check() before every forward (the instr build)
   bool draft_only = false;   // a DSpark draft-only launch: no rows, layers or ring jobs; the draft source is the only one
 };
@@ -175,15 +176,15 @@ struct CpuExpertConfig {
 /// order and done_ only increases, so done(seq) is a single compare any thread may make. The copy thread reads only
 /// done(), so CopyDone and the copy wait's gate keep their single publisher.
 ///
-/// Idle: the thread holds its team in the kernel's keep_warm, which runs register work at the forward's width for
-/// keep_warm_ns after each job and then PAUSE, until a submit or stop() rings the doorbell, so a job inside the hold
-/// never waits for a worker to wake. spin_ns after the warm window (and spin_ns after start, before the first job) the
-/// hold releases the team to OpenMP's idle wait and the thread sleeps on the doorbell; the next submit wakes it. A
-/// negative spin_ns holds the team until the next submit, however long.
+/// The team (cpu_experts/team.hpp) is the thread's own for its lifetime: threads - 1 workers pinned to cores[1..],
+/// itself worker 0 on cores[0]. Nothing here sleeps. Between jobs the workers run the kernel's register work for
+/// keep_warm_ns after each job and then PAUSE, watching the team's job word; the thread does the same on the submit
+/// word, a quantum (kIdleQuantumNs) at a time, re-reading the draft head, stop() and detach_draft() between quanta,
+/// since no host thread can ring those. So a job never waits for a worker to wake, and no state read before a wait
+/// can go stale across it.
 ///
 /// With a DSpark draft source (attach_draft) the thread serves the draft channel too, one job at a time with the
-/// target's; its idle hold watches the doorbell and the channel head, and its poll sleeps 50 us at a time since the GPU
-/// cannot ring the futex. A draft-only engine (CpuExpertConfig::draft_only) has only that source.
+/// target's, the target's ring first. A draft-only engine (CpuExpertConfig::draft_only) has only that source.
 template <BuildPolicy Build>
 class BasicCpuExpertEngine {
  public:
@@ -266,7 +267,7 @@ class BasicCpuExpertEngine {
   bool submit(const CpuJob& job) {
     if constexpr (Build::kMetrics) trace_.emit("cpu_submit", job.row, 0, job.seq, -1, job.part, job.k);
     if (!jobs_.push(job)) return false;
-    doorbell_.ring();
+    kick_.fetch_add(1, std::memory_order_release);
     return true;
   }
 
@@ -315,8 +316,7 @@ class BasicCpuExpertEngine {
     draft_next_ = channel::skip_zero(head + 1u);  // the run thread reads it after acquiring draft_
     fatal_wait_ns_ = fatal_wait_ns;
     draft_owned_ = std::move(source);
-    draft_.store(draft_owned_.get(), std::memory_order_release);
-    doorbell_.ring();  // a sleeping thread starts watching the channel
+    draft_.store(draft_owned_.get(), std::memory_order_release);  // the run thread sees it within a quantum
     watchdog_ = std::thread([this] { watch(); });
   }
 
@@ -327,20 +327,18 @@ class BasicCpuExpertEngine {
     DraftSource* d = draft_.load(std::memory_order_acquire);
     if (d == nullptr) return;
     draft_detach_.store(true, std::memory_order_seq_cst);
-    doorbell_.ring();
     while (draft_.load(std::memory_order_acquire) != nullptr && !exited_.load(std::memory_order_acquire))
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     channel::open_closed_gate<DraftChannel>(d->channel);
   }
 
   struct DraftStats {
-    int64_t jobs, rows, forward_ns, holds, collided_jobs, shared_routes, collided_forward_ns;
+    int64_t jobs, rows, forward_ns, collided_jobs, shared_routes, collided_forward_ns;
   };
   DraftStats draft_stats() const {
     return {draft_jobs_.load(std::memory_order_relaxed), draft_rows_.load(std::memory_order_relaxed),
-            draft_forward_ns_.load(std::memory_order_relaxed), draft_holds_.load(std::memory_order_relaxed),
-            draft_collided_jobs_.load(std::memory_order_relaxed), draft_shared_routes_.load(std::memory_order_relaxed),
-            draft_collided_forward_ns_.load(std::memory_order_relaxed)};
+            draft_forward_ns_.load(std::memory_order_relaxed), draft_collided_jobs_.load(std::memory_order_relaxed),
+            draft_shared_routes_.load(std::memory_order_relaxed), draft_collided_forward_ns_.load(std::memory_order_relaxed)};
   }
 
   /// Stops and joins the thread, then the watchdog (a hung forward still fail-stops meanwhile), then opens a draft gate
@@ -348,7 +346,6 @@ class BasicCpuExpertEngine {
   void stop() {
     if (!thread_.joinable()) return;
     stop_.store(true, std::memory_order_release);
-    doorbell_.ring();
     thread_.join();
     watchdog_stop_.store(true, std::memory_order_seq_cst);
     if (watchdog_.joinable()) watchdog_.join();
@@ -356,10 +353,6 @@ class BasicCpuExpertEngine {
   }
 
  private:
-  static_assert(
-      sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
-      "the keep-warm reads the doorbell's word as a plain uint32_t");
-
   /// Refuses a config the forwards would refuse later, since a refused forward aborts the process.
   void validate() const {
     const CpuExpertConfig& c = config_;
@@ -395,16 +388,23 @@ class BasicCpuExpertEngine {
     return sched_setaffinity(0, sizeof(set), &set) == 0 ? "" : "cannot pin the CPU expert thread to its caller core";
   }
 
+  /// How long one idle wait on the submit word lasts before the thread re-reads the draft head, stop() and
+  /// detach_draft(), which no host thread rings: the bound on noticing any of them. Short against a forward (0.5 ms
+  /// and up), long against the clock read that ends it.
+  static constexpr int64_t kIdleQuantumNs = 2'000;
+
   void run() {
-    const std::string error = pin();
+    std::string error = pin();
+    if (error.empty()) {
+      try {
+        team_.emplace(config_.cores, config_.threads, config_.kernel, config_.keep_warm_ns, thread_name_.c_str());
+      } catch (const std::exception& e) {
+        error = std::string("CPU expert team: ") + e.what();
+      }
+    }
     started_.set_value(error);
     if (!error.empty()) return;
-    constexpr int64_t kNever = INT64_MAX;
     int64_t warm_until = 0;  // the register-work window after the last job; 0 before the first
-    // When the hold releases the team; 0 once it has and the thread sleeps between jobs.
-    int64_t release_at = config_.spin_ns < 0 ? kNever : now_ns() + config_.spin_ns;
-    const uint64_t spin_iters = idle_budget(config_.spin_ns);
-    uint64_t idle = 0;
     while (!stop_.load(std::memory_order_acquire)) {
       DraftSource* draft = draft_.load(std::memory_order_acquire);
       if (draft != nullptr && draft_detach_.load(std::memory_order_acquire)) {
@@ -414,48 +414,29 @@ class BasicCpuExpertEngine {
       if (draft != nullptr && draft->test_hooks)
         if (const int64_t pause = draft::g_test_poll_pause_us.load(std::memory_order_relaxed); pause > 0)
           std::this_thread::sleep_for(std::chrono::microseconds(pause));
-      // Read before the pop and the head load: a submit or a post after them moves a word the hold watches.
-      const uint32_t kick = doorbell_.word().load(std::memory_order_acquire);
+      // Read before the pop: a submit after it moves the word the idle wait watches.
+      const uint32_t kick = kick_.load(std::memory_order_acquire);
       const uint32_t head = draft != nullptr ? channel::head<DraftChannel>(draft->channel) : 0u;
       if constexpr (Build::kMetrics)
         if (draft && head && channel::reached(head, draft_next_)) trace_.draft_observe(draft, head);
       CpuJob job;
       if (jobs_.pop(&job)) {
         warm_until = run_job(job) + config_.keep_warm_ns;
-        release_at = config_.spin_ns < 0 ? kNever : warm_until + config_.spin_ns;
-        idle = 0;
-      } else if (draft != nullptr && head != 0 && channel::reached(head, draft_next_)) {
+        continue;
+      }
+      if (draft != nullptr && head != 0 && channel::reached(head, draft_next_)) {
         if (head != draft_next_)
           fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(draft_next_) + " lapped (head " +
                     std::to_string(head) + "); the device posts one record per wait");
         warm_until = serve_draft(*draft, draft_next_) + config_.keep_warm_ns;
-        release_at = config_.spin_ns < 0 ? kNever : warm_until + config_.spin_ns;
         draft_next_ = channel::skip_zero(draft_next_ + 1u);
-        idle = 0;
-      } else if (release_at != 0) {
-        hold(kick, draft, head, warm_until, release_at);
-        const bool moved = doorbell_.word().load(std::memory_order_acquire) != kick ||
-                           (draft != nullptr && channel::head<DraftChannel>(draft->channel) != head);
-        if (!moved) release_at = 0;  // ran out: sleep (or, with a draft source, poll) from now on
-      } else if (draft != nullptr) {
-        // The GPU cannot ring the futex: spin the idle budget, then sleep 50 us at a time; a submit, an attach or
-        // stop() cuts a sleep short.
-        if (++idle < spin_iters) {
-          _mm_pause();
-        } else {
-          if constexpr (Build::kMetrics) trace_.emit("cpu_wait_begin", -1, 0, kick, -1, 50'000, head);
-          doorbell_.sleep_unless([this] { return !jobs_.empty() || stop_.load(std::memory_order_acquire); }, 50'000);
-          if constexpr (Build::kMetrics) trace_.emit("cpu_wait_end", -1, 0, kick, -1, 50'000, head);
-        }
-      } else {
-        if constexpr (Build::kMetrics) trace_.emit("cpu_wait_begin", -1, 0, kick, -1, 1'000'000, head);
-        doorbell_.sleep_unless([this] {
-          return !jobs_.empty() || stop_.load(std::memory_order_acquire) ||
-                 draft_.load(std::memory_order_acquire) != nullptr;
-        });
-        if constexpr (Build::kMetrics) trace_.emit("cpu_wait_end", -1, 0, kick, -1, 1'000'000, head);
+        continue;
       }
+      // Idle, as the workers are on their job word: register work until warm_until, then PAUSE, on the submit word,
+      // one quantum at a time.
+      team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);
     }
+    team_.reset();
     exited_.store(true, std::memory_order_release);
   }
 
@@ -496,7 +477,7 @@ class BasicCpuExpertEngine {
       const cpu_experts::ExpertLayer* layer = config_.layers->get(job.row);
       if (layer == nullptr) throw std::invalid_argument("the row has no registered layer");
       if (config_.check_calls) config_.kernel->check(*layer, call);
-      config_.kernel->forward(*layer, call);
+      config_.kernel->forward(*layer, call, *team_);
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + e.what());
     }
@@ -538,37 +519,6 @@ class BasicCpuExpertEngine {
     uint32_t v;
     std::memcpy(&v, p, sizeof v);
     return v;
-  }
-
-  /// Holds the team until the doorbell's word moves past `kick`, the draft head (with a draft source) past `head`, or
-  /// the clock reaches release_at. Without a draft source this is today's one-word hold.
-  void hold(uint32_t kick, const DraftSource* draft, uint32_t head, int64_t warm_until, int64_t release_at) {
-    if constexpr (Build::kMetrics) trace_.emit("cpu_hold_begin", -1, 0, kick, -1, head, warm_until, release_at);
-    try {
-      if (draft == nullptr) {
-        config_.kernel->keep_warm(
-            config_.cores,
-            config_.threads,
-            reinterpret_cast<const uint32_t*>(&doorbell_.word()),
-            kick,
-            warm_until,
-            release_at);
-      } else {
-        add(draft_holds_, 1);
-        config_.kernel->keep_warm_either(
-            config_.cores,
-            config_.threads,
-            reinterpret_cast<const uint32_t*>(&doorbell_.word()),
-            kick,
-            reinterpret_cast<const uint32_t*>(draft->channel + DraftChannel::kHead),
-            head,
-            warm_until,
-            release_at);
-      }
-    } catch (const std::exception& e) {
-      fail_stop(prefix_ + "CPU expert keep-warm failed: " + e.what());
-    }
-    if constexpr (Build::kMetrics) trace_.emit("cpu_hold_end", -1, 0, kick, -1, head);
   }
 
   static constexpr int32_t kTargetJob = 1, kDraftJob = 2;
@@ -633,7 +583,7 @@ class BasicCpuExpertEngine {
     if constexpr (Build::kMetrics) trace_.emit("draft_start", stage, epoch, seq, -1, rows, k, shared);
     if constexpr (Build::kMetrics) trace_.resources("draft_faults_start", "draft_switches_start", stage, epoch, seq);
     try {
-      layer.kernel->forward(layer, call);
+      layer.kernel->forward(layer, call, *team_);
     } catch (const std::exception& e) {
       fail_stop(std::string(kDraftPrefix) + "forward of record " + std::to_string(seq) + " (stage " +
                 std::to_string(stage) + ") failed: " + e.what());
@@ -704,7 +654,8 @@ class BasicCpuExpertEngine {
   std::thread thread_;
   std::promise<std::string> started_;  // the thread's pin result, for start()
   SpscRing<CpuJob, kRing> jobs_;
-  Doorbell doorbell_;  // rung by every submit and by stop(); its word ends the hold
+  alignas(64) std::atomic<uint32_t> kick_{0};  // moved by every submit; the thread's idle wait watches it
+  std::optional<cpu_experts::Team> team_;      // the run thread's, from its start to its exit
   uint32_t claimed_ = 0;  // tier owner only
   std::atomic<uint32_t> done_{0};
   std::atomic<int64_t> jobs_done_{0};
@@ -726,7 +677,7 @@ class BasicCpuExpertEngine {
   // The job running now, for the watchdog (busy()): its start (0: none), kind and id.
   std::atomic<int64_t> job_started_ns_{0}, job_id_{0};
   std::atomic<int32_t> job_kind_{0};
-  std::atomic<int64_t> draft_jobs_{0}, draft_rows_{0}, draft_forward_ns_{0}, draft_holds_{0}, draft_collided_jobs_{0},
+  std::atomic<int64_t> draft_jobs_{0}, draft_rows_{0}, draft_forward_ns_{0}, draft_collided_jobs_{0},
       draft_shared_routes_{0}, draft_collided_forward_ns_{0};
 };
 

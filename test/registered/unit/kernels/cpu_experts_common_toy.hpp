@@ -36,7 +36,7 @@ struct ToyQuant {
     static bool usable(const ExpertLayer&, const Params&, int) { return true; }
     // The toy's typed view of a slot: its row of floats.
     static const float* expert(const ExpertRow& r) { return reinterpret_cast<const float*>(r.slab[0]); }
-    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa)
+    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team)
     {
         const RouteTable r = RouteTable::build(c.slots, c.weights, c.rows, c.k);
         last_isa = isa;
@@ -48,8 +48,8 @@ struct ToyQuant {
         }
         // The caller's copy: a worker naming last_cpus would reach its own thread's.
         std::vector<int>& cpus = last_cpus;
-        cpus.assign(size_t(c.threads), -1);
-        run_team(c.threads, [&](int worker, int workers) {
+        cpus.assign(size_t(team.workers()), -1);
+        team.run([&](int worker, int workers) {
             cpus[size_t(worker)] = sched_getcpu();
             for (int h = worker; h < l.hidden; h += workers)
                 for (int t = 0; t < c.rows; ++t) {

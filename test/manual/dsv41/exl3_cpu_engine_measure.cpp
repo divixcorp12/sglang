@@ -10,12 +10,12 @@ namespace ce = sglang::cpu_experts;
 // Fixed DSV4.1/3-bit synthetic fixture. Pointers are process-local and owned by the caller throughout this call.
 extern "C" int engine_measure(uint64_t kernel_address, const uint64_t* slab_ptrs, const uint64_t* slab_bytes,
                               const uint64_t* inputs, const uint64_t* outputs, int rows, int routes, int reps,
-                              int gap_us, int warm_us, int spin_us, int draft_group0,
+                              int gap_us, int warm_us, int draft_group0,
                               const uint64_t* runtime_counters, int64_t* records, char* error, size_t error_bytes) {
     try {
         constexpr int hidden = 5120, intermediate = 2304, capacity = 12, workers = 10, columns = 8;
         if (rows < 1 || rows > 6 || routes < 1 || routes > es::wire::Wire::kLanes || reps < 1 || reps > 200 ||
-            gap_us < 0 || gap_us > 200000 || warm_us < 0 || spin_us < 0)
+            gap_us < 0 || gap_us > 200000 || warm_us < 0)
             throw std::invalid_argument("measurement arguments out of bounds");
         auto* kernel = reinterpret_cast<const ce::CpuExpertKernel*>(kernel_address);
         if (!kernel) throw std::invalid_argument("missing kernel");
@@ -68,7 +68,7 @@ extern "C" int engine_measure(uint64_t kernel_address, const uint64_t* slab_ptrs
                 config.out_base = reinterpret_cast<uint8_t*>(outputs[group]);
                 config.out_stride = 4 * rows * hidden; config.hidden = hidden;
                 config.threads = workers; config.cores = cores;
-                config.keep_warm_ns = int64_t(warm_us) * 1000; config.spin_ns = int64_t(spin_us) * 1000;
+                config.keep_warm_ns = int64_t(warm_us) * 1000;
                 config.check_calls = false;
                 es::BasicCpuExpertEngine<es::InstrBuild> engine(config, "engine-measure: ", "measure-g" + std::to_string(group));
                 engine.write_calibration_table(0, rows);

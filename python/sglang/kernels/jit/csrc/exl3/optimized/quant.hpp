@@ -86,7 +86,7 @@ struct Exl3Quant
     static bool usable(const ExpertLayer&, const Params&, int) { return true; }
 
     // Defined at the end of forward_plan.hpp.
-    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa);
+    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team);
 };
 
 // The layer's experts as the plans read them: slot e's gate, up and down, each a Exl3Projection over the slot's

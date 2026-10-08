@@ -240,12 +240,10 @@ NON_TRACE_CLOCK_READS = {
     # CopyEngine), so neither the service nor the copy thread reads the clock to pace itself.
     "const int64_t t0 = now_ns();": 1,
     "const int64_t per_pause = std::max<int64_t>(1, (now_ns() - t0) / kProbe);": 1,
-    # CpuExpertEngine's first release time (cpu_experts.h): once, when its thread starts; the CPU expert thread only.
-    # The native test keep-warm (test only) spins on its release time on that thread too, and its two-word variant
-    # (keep_warm_either) the same. A draft source on that engine (attach_draft) shares the thread and its release time.
-    "int64_t release_at = config_.spin_ns < 0 ? kNever : now_ns() + config_.spin_ns;": 1,
-    "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < release_ns)": 1,
-    "now_ns() < release_ns)": 1,
+    # CpuExpertEngine's idle wait (cpu_experts.h): one read per quantum on the CPU expert thread between jobs, never
+    # on the service or copy thread. The native test kernel's warm loop (test only) spins on its deadline there too.
+    "team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);": 1,
+    "while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && now_ns() < deadline_ns)": 1,
     # busy() (cpu_experts.h): the start of each job, on the CPU expert thread, for the engine's watchdog.
     "job_started_ns_.store(now_ns(), std::memory_order_release);": 1,
     # The watchdog's poll (D6): it times how long one busy episode persists, on its own thread. The CPU expert engine's

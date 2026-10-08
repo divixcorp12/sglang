@@ -29,7 +29,9 @@ int main() {
     capture.grow(scratch, 1048576, "probe");
     if (scratch.size()!=1048576 || scratch.back()!=0) return 3;
     capture.team_start();
-    sglang::cpu_experts::run_team(4, [&](int w, int) {
+    sglang::cpu_experts::Team team({}, 4, nullptr, 0);
+    team.run([&](int w, int) {
+      capture.worker_start(w);
       for (int p : {0,1,2,3,5}) {
         capture.begin(w,p);
         if (p==0 && w==3) usleep(20000);
@@ -39,11 +41,11 @@ int main() {
         }
         capture.add_work(w,p,w+1);
         capture.work_end(w,p);
-        #pragma omp barrier
+        team.barrier();
         capture.end(w,p);
       }
       capture.worker_end(w);
-    }, capture);
+    });
     capture.finish();
   }
 }
@@ -58,7 +60,7 @@ static_assert(std::is_empty_v<Capture<false>>);
 int main() { Capture<false> c(4,6,3); std::vector<int> v; c.grow(v,8,"production");
  if(v.size()!=8 || v.back()!=0) return 3; c.team_start(); c.worker_start(0);
  c.begin(0,0); c.add_work(0,0,3); c.work_end(0,0); c.end(0,0); c.worker_end(0); c.finish();
- sglang::cpu_experts::run_team(1, [](int, int) {}); }
+ sglang::cpu_experts::Team t({}, 1, nullptr, 0); t.run([](int, int) {}); }
 ''')
     outputs = []
     for name, src, flags in [("probe", source, ["-DON=true"]), ("production", production, [])]:

@@ -160,9 +160,9 @@ class DraftCpuDevice:
 class DraftCpuHost:
     """The host half: one draft CPU thread over `areas`, on `cores` with `threads` workers (the first core its own).
 
-    Idle as the target's CPU expert engine: the team is held `keep_warm_us` in register work after each job, then
-    `spin_us` in PAUSE (-1: until the next post), then the thread polls the head with 50 us sleeps. A record that stays
-    incomplete for `fatal_wait_s` ends the process. Set every stage's layer, then `start`; `stop` is idempotent.
+    Idle as the target's CPU expert engine: the team runs `keep_warm_us` of register work after each job, then PAUSE,
+    until the next post; it never sleeps. A record that stays incomplete for `fatal_wait_s` ends the process. Set
+    every stage's layer, then `start`; `stop` is idempotent.
     """
 
     def __init__(
@@ -171,7 +171,6 @@ class DraftCpuHost:
         *,
         cores: Sequence[int],
         threads: int,
-        spin_us: int,
         keep_warm_us: int,
         fatal_wait_s: float,
         variant: Optional[str] = None,
@@ -194,7 +193,6 @@ class DraftCpuHost:
                 int(areas.stages),
                 int(threads),
                 torch.tensor(list(cores), dtype=torch.int64),
-                ops._spin_ns(int(spin_us)),
                 int(keep_warm_us * 1000),
                 int(fatal_wait_s * 1e9),
             )
@@ -225,14 +223,13 @@ class DraftCpuHost:
         self._module.expert_stream_draft_cpu_stop(self.handle)
 
     def stats(self) -> dict:
-        out = torch.zeros(7, dtype=torch.int64)
+        out = torch.zeros(6, dtype=torch.int64)
         self._module.expert_stream_draft_cpu_stats(self.handle, out)
-        jobs, rows, forward_ns, holds, collided_jobs, shared_routes, collided_forward_ns = (int(v) for v in out.tolist())
+        jobs, rows, forward_ns, collided_jobs, shared_routes, collided_forward_ns = (int(v) for v in out.tolist())
         return {
             "jobs": jobs,
             "rows": rows,
             "forward_ns": forward_ns,
-            "keep_warm_calls": holds,
             "collided_jobs": collided_jobs,
             "shared_routes": shared_routes,
             "collided_forward_ns": collided_forward_ns,
@@ -284,10 +281,10 @@ class SharedDraftHost:
         """The counters; once the host is closed, the last ones read here (``{}`` if none was)."""
         if not self._host_open():
             return self._last_stats
-        out = torch.zeros(7, dtype=torch.int64)
+        out = torch.zeros(6, dtype=torch.int64)
         self._module.expert_stream_draft_stats(self.host.handle, self.group, out)
-        jobs, rows, forward_ns, holds, collided_jobs, shared_routes, collided_forward_ns = (int(v) for v in out.tolist())
-        self._last_stats = {"jobs": jobs, "rows": rows, "forward_ns": forward_ns, "keep_warm_calls": holds,
+        jobs, rows, forward_ns, collided_jobs, shared_routes, collided_forward_ns = (int(v) for v in out.tolist())
+        self._last_stats = {"jobs": jobs, "rows": rows, "forward_ns": forward_ns,
                             "collided_jobs": collided_jobs, "shared_routes": shared_routes,
                             "collided_forward_ns": collided_forward_ns}
         return self._last_stats

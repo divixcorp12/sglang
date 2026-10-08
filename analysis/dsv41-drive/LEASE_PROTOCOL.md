@@ -60,12 +60,11 @@ call sits inside the draft's decode graph as one post, one gate wait and one com
 - **One record per wait.** The draft posts at most one record before its finish waits on the gate, so the ring never
   laps. The host takes a head that is more than one past the record it expects (a lap), and a record whose seq word
   does not match (torn), as protocol failures and fail-stops.
-- **Completer.** `DraftCpuThread`, the OpenMP master of the draft's team. It reads the record, runs the stage's M-row
+- **Completer.** The CPU expert engine thread, worker 0 of its team. It reads the record, runs the stage's M-row
   forward over the staged x and routes, and calls `channel::complete` (done[G], then the Dekker open of the gate).
-- **Idle.** After a job the thread holds its team in the CPU kernel's `keep_warm`, which watches the channel's head
-  word. The GPU's release store of the next head ends the hold, with no syscall. Past the warm window and
-  `spin_ns` the team is released and the thread polls the head (spinning, then 50 us sleeps), because the GPU cannot
-  ring a futex.
+- **Idle.** The thread polls the channel's head between quanta of its own idle wait (`cpu_experts.h`,
+  `kIdleQuantumNs`): the GPU's release store of the next head is seen within one, with no syscall. Nothing sleeps,
+  because the GPU cannot ring a futex.
 - **Failure.** A watchdog checks every 20 ms and fail-stops a record that stays incomplete for `fatal_wait_ns`.
   `stop()` joins both threads and then opens a gate still held closed (`open_closed_gate`), as at the target's teardown.
 - **Not shared.** The two clients share the protocol only: separate buffers, areas and threads.
@@ -89,10 +88,11 @@ call sits inside the draft's decode graph as one post, one gate wait and one com
   through the CPU expert thread, and publishes CopyDone. Idle, it spins with PAUSE on a core of its own
   (`ThreadingConfig.copy_cpus`) for `SGLANG_DSV41_RAM_MISS_COPY_IDLE_SPIN_US` (default 5 ms), then sleeps on a futex
   doorbell that every submit and `stop()` ring (a syscall only while it sleeps); -1 never sleeps.
-- **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row. Between jobs it
-  holds its OpenMP team in the kernel's keep-warm (register work for `SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US`, then
-  PAUSE) until the next submit or, `SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US` (default 100 ms) after the warm window,
-  releases the team and sleeps on its futex doorbell until the next submit; -1 never releases it.
+- **CPU expert thread** (`host/cpu_experts.h`). Computes CPU lanes; its output is two parts per row. Its team
+  (`host/cpu_experts/team.hpp`) is its own for its lifetime: `threads - 1` pinned workers that never sleep, the thread
+  itself worker 0. Between jobs every worker runs the kernel's register work for
+  `SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US`, then PAUSE, until the next job; the thread polls the submit word, the draft
+  head, stop and detach the same way. No OpenMP runtime is on the path.
 - **Watchdog** (`host/ram_thread.h`, `watch`). Samples every 20 ms; aborts on a busy episode held past `fatal_wait` or
   a gate held closed past the copy-wait timeout.
 

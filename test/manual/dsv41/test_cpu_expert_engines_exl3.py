@@ -218,9 +218,9 @@ print("rcs", sorted(set(rcs)))
 
 
 def test_two_full_teams_run_at_once_at_a_thread_limit_of_their_sum(monkeypatch):
-    """Review Focus 3: OMP_THREAD_LIMIT equal to the two core groups' workers (2 + 2) leaves neither team short (a short
-    team is status 1, which run_team returns rather than run), the bound ThreadingConfig enforces. libgomp reads the
-    limit at load, so this runs in a child."""
+    """Review Focus 3: OMP_THREAD_LIMIT equal to the two core groups' workers (2 + 2) leaves neither team short: the
+    teams are the engine's own threads (team.hpp), which no OpenMP limit counts. libgomp reads the limit at load, so
+    this runs in a child."""
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     _kernel()  # skips here, not in the child
     env = dict(os.environ, OMP_THREAD_LIMIT="4", EXL3_MOE_CPU_PIN="0")

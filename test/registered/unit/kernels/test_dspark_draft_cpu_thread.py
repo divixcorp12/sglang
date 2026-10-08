@@ -89,12 +89,12 @@ def _cores():
     return sorted(os.sched_getaffinity(0))[:2]
 
 
-def _host(request, mode, *, spin_us=-1, keep_warm_us=0, fatal_wait_s=30.0, ns_per_expert=0):
+def _host(request, mode, *, keep_warm_us=0, fatal_wait_s=30.0, ns_per_expert=0):
     from sglang.kernels.ops.moe.dspark_draft_cpu import DraftCpuAreas
 
     areas = DraftCpuAreas(STAGES, H, pin=False)
     kernel = int(_module().expert_stream_test_kernel_address(ns_per_expert, 0, 0))
-    host = draft_cpu_host(mode, areas, kernel, cores=_cores(), threads=2, spin_us=spin_us, keep_warm_us=keep_warm_us,
+    host = draft_cpu_host(mode, areas, kernel, cores=_cores(), threads=2, keep_warm_us=keep_warm_us,
                           fatal_wait_s=fatal_wait_s, tmp_path=request.getfixturevalue("tmp_path"))
     for stage in range(STAGES):
         host.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(H), capacity=CAPACITY + stage))
@@ -179,33 +179,30 @@ def test_three_stages_in_turn_each_run_their_own_layer(request, mode):
 
 
 @pytest.mark.parametrize("mode", MODES)
-def test_the_head_store_ends_the_hold(request, mode):
-    areas, host = _host(request, mode, spin_us=-1, keep_warm_us=500_000)
+def test_the_head_store_ends_the_idle_wait_inside_the_warm_window(request, mode):
+    areas, host = _host(request, mode, keep_warm_us=500_000)
     _stage(areas, 0, 1, 2)
     _post(areas, 0, 1, 2, seq=1)
     _finish(areas, 1)
-    m = _module()  # the fake counts keep_warm and keep_warm_either calls in one counter
-    _until(lambda: int(m.expert_stream_test_keep_warm_calls()) >= 1)
-    before = int(m.expert_stream_test_keep_warm_calls())
+    time.sleep(0.02)  # inside the warm window of the first job
     _post(areas, 0, 1, 2, seq=2)
     assert _finish(areas, 2) < 0.005
-    _until(lambda: int(m.expert_stream_test_keep_warm_calls()) == before + 1)
-    time.sleep(0.05)
-    assert int(m.expert_stream_test_keep_warm_calls()) == before + 1
 
 
 @pytest.mark.parametrize("mode", MODES)
-def test_an_idle_thread_sleeps_and_still_serves(request, mode):
-    areas, host = _host(request, mode, spin_us=20_000, keep_warm_us=0)
+def test_an_idle_thread_never_sleeps_and_still_serves(request, mode):
+    """Long after its last job the thread still spins (PAUSE, past its warm window), and the next record is served
+    at once: no idle sleep, no poll timeout. Mutant: sleep in the idle wait -- red (the thread's CPU time stalls)."""
+    areas, host = _host(request, mode, keep_warm_us=0)
     _stage(areas, 0, 1, 2)
     _post(areas, 0, 1, 2, seq=1)
     _finish(areas, 1)
-    time.sleep(0.1)  # past the hold and the spin budget
+    time.sleep(0.1)
     before = _draft_cpu_s(mode)
     time.sleep(0.3)
-    assert _draft_cpu_s(mode) - before < 0.05
+    assert _draft_cpu_s(mode) - before > 0.2
     _post(areas, 0, 1, 2, seq=2)
-    assert _finish(areas, 2) < 0.02
+    assert _finish(areas, 2) < 0.005
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -233,7 +230,7 @@ kernel = int(m.expert_stream_test_kernel_address(0, 1 if case == "fail" else 0, 
 cores = sorted(os.sched_getaffinity(0))[:2]
 import tempfile
 mode = sys.argv[2]
-host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, spin_us=-1, keep_warm_us=0, fatal_wait_s=0.5,
+host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, keep_warm_us=0, fatal_wait_s=0.5,
                       tmp_path=__import__("pathlib").Path(tempfile.mkdtemp(dir=os.getcwd())))
 for stage in range(3):
     host.set_layer(stage, kernel, fake_cpu_layer(64))
@@ -280,7 +277,7 @@ areas = DraftCpuAreas(3, 64, pin=False)
 kernel = int(m.expert_stream_test_kernel_address(0, 0, 0))
 cores = sorted(os.sched_getaffinity(0))[:2]
 polling = case == "poll"
-host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, spin_us=0 if polling else -1, keep_warm_us=0,
+host = draft_cpu_host(mode, areas, kernel, cores=cores, threads=2, keep_warm_us=0,
                       fatal_wait_s=30.0 if polling else 0.5,
                       tmp_path=__import__("pathlib").Path(tempfile.mkdtemp(dir=os.getcwd())))
 for stage in range(3):

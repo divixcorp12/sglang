@@ -36,7 +36,7 @@ def _until(predicate, timeout_s=5.0):
 def _shared(tmp_path, request, fatal_wait_s=30.0):
     areas = DraftCpuAreas(STAGES, H, pin=False)
     kernel = int(_m().expert_stream_test_kernel_address(0, 0, 0))
-    draft = draft_cpu_host("shared", areas, kernel, cores=_cores(), threads=2, spin_us=-1, keep_warm_us=0,
+    draft = draft_cpu_host("shared", areas, kernel, cores=_cores(), threads=2, keep_warm_us=0,
                            fatal_wait_s=fatal_wait_s, tmp_path=tmp_path)
     for stage in range(STAGES):
         draft.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(H), capacity=CAPACITY + stage))
@@ -114,7 +114,7 @@ slow = when == "slow"
 kernel = int(m.expert_stream_test_kernel_address(200_000_000 if slow else 0, 0, 0))
 areas = DraftCpuAreas(3, 64, pin=False)
 cores = sorted(os.sched_getaffinity(0))[:2]
-draft = draft_cpu_host("shared", areas, kernel, cores=cores, threads=2, spin_us=-1, keep_warm_us=0,
+draft = draft_cpu_host("shared", areas, kernel, cores=cores, threads=2, keep_warm_us=0,
                        fatal_wait_s=5.0 if slow else 0.5, tmp_path=pathlib.Path(tempfile.mkdtemp(dir=os.getcwd())))
 for stage in range(3):
     draft.set_layer(stage, kernel, dataclasses.replace(fake_cpu_layer(64), capacity=(1 << 20) + stage))
@@ -171,9 +171,8 @@ def test_stop_during_a_job_of_either_kind_lets_it_complete(kind):
     assert "FATAL" not in result.stderr, result.stderr[-2000:]
 
 
-def test_a_launch_without_a_draft_source_holds_on_the_doorbell_alone(tmp_path, request):
-    """The non-DSpark engine is today's: no watchdog thread, and its holds call the one-word keep_warm (the fake counts
-    which). Mutation: always hold on both words -- the two-word count moves."""
+def test_a_launch_without_a_draft_source_has_no_watchdog(tmp_path, request):
+    """The non-DSpark engine starts its thread and its team's workers, and no watchdog thread."""
     from sglang.test.dsv41_ram_miss_fixtures import attached_host, ram_miss_setup
 
     s = ram_miss_setup(tmp_path, capacity=7, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
@@ -183,7 +182,5 @@ def test_a_launch_without_a_draft_source_holds_on_the_doorbell_alone(tmp_path, r
     kernel = int(_m().expert_stream_test_kernel_address(0, 0, 0))
     threads_before = len(os.listdir("/proc/self/task"))
     host.enable_cpu_experts(kernel, [0] * (host.wire.lanes + 1), _cores(), torch.zeros((2, 16), dtype=torch.uint8),
-                            torch.zeros((2, 2, 8), dtype=torch.float32), threads=2, spin_us=-1, keep_warm_us=0)
-    _until(lambda: int(_m().expert_stream_test_keep_warm_calls()) >= 1)
-    assert int(_m().expert_stream_test_keep_warm_either_calls()) == 0
-    assert len(os.listdir("/proc/self/task")) - threads_before == 1, "the engine thread only, no watchdog"
+                            torch.zeros((2, 2, 8), dtype=torch.float32), threads=2, keep_warm_us=0)
+    assert len(os.listdir("/proc/self/task")) - threads_before == 2, "the engine thread and its worker, no watchdog"

@@ -369,36 +369,37 @@ int main()
 
     {
         uint32_t word = 5;
-        auto warm = [&](std::span<const int> on, int32_t threads, const uint32_t* w, uint32_t seen, int64_t until,
-                        int64_t release = INT64_MAX) {
-            return status_of([&] { kernel.keep_warm(on, threads, w, seen, until, release); });
+        auto warm = [&](const uint32_t* w, uint32_t seen, int64_t deadline) {
+            return status_of([&] { kernel.warm(w, seen, deadline); });
         };
-        CHECK(warm(cores, 0, &word, 5, now_ns() + 1000000000) == 2);
-        CHECK(warm(cores, 1, nullptr, 5, now_ns() + 1000000000) == 2);
-        CHECK(warm(cores, team + 1, &word, 5, now_ns() + 1000000000) == 2);
-        CHECK(warm({}, team + 1, &word, 4, now_ns() - 1) == 0);  // no cores: no core limit
-        // The hold returns only when the word moves: inside the warm window, and after it (the PAUSE phase).
-        for (const int64_t window : {60LL * 1000000000, -1LL}) {
+        // The register work returns when the word moves, inside its deadline.
+        {
             word = 5;
             const int64_t start = now_ns();
             std::thread mover([&] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
             });
-            const int r = warm(cores, team, &word, 5, window < 0 ? start - 1 : start + window);
+            const int r = warm(&word, 5, start + 60LL * 1000000000);
             mover.join();
             CHECK(r == 0);
             CHECK(now_ns() - start >= 2000000 && now_ns() - start < 1000000000);
         }
-        // Without a move the hold ends at its release time, after the warm window (1 ms warm, 3 ms release).
+        // Without a move it returns at its deadline (3 ms).
         {
             word = 5;
             const int64_t start = now_ns();
-            CHECK(warm(cores, team, &word, 5, start + 1000000, start + 3000000) == 0);
+            CHECK(warm(&word, 5, start + 3000000) == 0);
             CHECK(now_ns() - start >= 3000000 && now_ns() - start < 1000000000);
         }
-        // Every tier's loop, as far as this CPU runs them, through the free function: 1 ms warm, then PAUSE until
-        // the word moves.
+        // A word that moved already returns at once.
+        {
+            word = 6;
+            const int64_t start = now_ns();
+            CHECK(warm(&word, 5, start + 60LL * 1000000000) == 0);
+            CHECK(now_ns() - start < 100000000);
+        }
+        // Every tier's loop, as far as this CPU runs them, through the free function.
         for (Isa tier : {Isa::Scalar, Isa::Avx2, Isa::Bw, Isa::Vnni, Isa::Vbmi}) {
             if (tier > sglang::cpu_experts::detect_isa(Isa::Vbmi, nullptr)) break;
             word = 5;
@@ -406,10 +407,28 @@ int main()
                 std::this_thread::sleep_for(std::chrono::milliseconds(3));
                 __atomic_store_n(&word, 6u, __ATOMIC_RELEASE);
             });
-            sglang::cpu_experts::keep_warm<Isa::Vbmi>(tier, {}, team, &word, 5, now_ns() + 1000000, INT64_MAX);
+            sglang::cpu_experts::keep_warm_loop<Isa::Vbmi>(tier, &word, 5, now_ns() + 60LL * 1000000000);
             mover.join();
         }
-        ok("keep_warm_returns_when_the_word_moves");
+        ok("warm_returns_when_the_word_moves");
+    }
+
+    {
+        // A team's barrier orders its phases: what every worker wrote before it, every worker reads after it, job
+        // after job on the one team.
+        sglang::cpu_experts::Team t(cores, team, &kernel, 0);
+        std::vector<int> seen(size_t(team), -1), sum(size_t(team), 0);
+        for (int rep = 0; rep < 1000; ++rep) {
+            t.run([&](int w, int n) {
+                seen[size_t(w)] = rep;
+                t.barrier();
+                int s = 0;
+                for (int i = 0; i < n; ++i) s += seen[size_t(i)];
+                sum[size_t(w)] = s;
+            });
+            for (int w = 0; w < team; ++w) CHECK(sum[size_t(w)] == rep * team);
+        }
+        ok("a_team_barrier_orders_its_phases");
     }
 
     std::printf("all ok\n");

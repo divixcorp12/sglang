@@ -7,7 +7,7 @@
 //   row_bytes(layer, params)             the fewest bytes one slot's row of each slab holds
 //   validate(layer, params)              nullptr when the quant runs the layer, else why not; may normalize params
 //   usable(layer, params, slot)          whether a routed slot's contents can be run (check() only)
-//   dispatch(layer, params, call, isa)   the forward: 0, 2 when the input refuses, else a failure status
+//   dispatch(layer, params, call, isa, team)   the forward on the team: 0, 2 when the input refuses, else a failure status
 #pragma once
 #include "isa.hpp"
 #include "keep_warm.hpp"
@@ -36,6 +36,8 @@ public:
     using Params = typename Quant::Params;
     static_assert(std::is_trivially_copyable_v<Params> && sizeof(Params) <= kMaxParamBytes,
                   "params are stored in the layer as bytes");
+
+    using CpuExpertKernel::forward;
 
     // Computed at the first call, so a test may set the cap variable before it. Then, when Quant::kIsaReportEnv (may
     // be null) is "1", prints "<kName> isa <tier>" to stderr, once.
@@ -103,28 +105,18 @@ public:
         }
     }
 
-    void forward(const ExpertLayer& layer, const ForwardCall& c) const override
+    void forward(const ExpertLayer& layer, const ForwardCall& c, Team& team) const override
     {
-        const CallCores on_cores(c.cores);
-        const int status = Quant::dispatch(layer, layer.params_as<Params>(), c, isa());
+        const int status = Quant::dispatch(layer, layer.params_as<Params>(), c, isa(), team);
 
         if (status != 0) [[unlikely]]
             failed(status);
     }
 
-    // keep_warm (keep_warm.hpp) at this quant's tier, compiling only the loops up to kTopIsa. The cores are the
-    // caller's, checked where they were configured (the engine checks them when it is built).
-    void keep_warm(std::span<const int> cores, int32_t threads, const uint32_t* word, uint32_t seen,
-                   int64_t warm_until_ns, int64_t release_ns) const override
+    // The register work at this quant's tier, compiling only the loops up to kTopIsa.
+    int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) const override
     {
-        ::sglang::cpu_experts::keep_warm<Quant::kTopIsa>(isa(), cores, threads, word, seen, warm_until_ns, release_ns);
-    }
-    void keep_warm_either(std::span<const int> cores, int32_t threads, const uint32_t* word_a, uint32_t seen_a,
-                          const uint32_t* word_b, uint32_t seen_b, int64_t warm_until_ns,
-                          int64_t release_ns) const override
-    {
-        ::sglang::cpu_experts::keep_warm_either<Quant::kTopIsa>(isa(), cores, threads, word_a, seen_a, word_b, seen_b,
-                                                                 warm_until_ns, release_ns);
+        return keep_warm_loop<Quant::kTopIsa>(isa(), word, seen, deadline_ns);
     }
 
 private:

@@ -127,9 +127,6 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "test_kernel_calls",
     "test_kernel_hold",
     "test_kernel_max_rows",
-    "test_keep_warm_calls",
-    "test_keep_warm_either_calls",
-    "test_keep_warm_core",
     "draft_test_post",
     "draft_test_tear",
     "draft_test_finish_close",
@@ -1780,7 +1777,6 @@ class ExpertStreamHost:
         *,
         threads: int,
         group: int = 0,
-        spin_us: int = -1,
         keep_warm_us: int = 0,
     ) -> None:
         """Start NUMA group ``group``'s CPU expert thread (after the copy engine, before the service).
@@ -1794,12 +1790,10 @@ class ExpertStreamHost:
         group g's CPU-hit and CPU-miss partial sums are parts ``2g`` and ``2g + 1``) are
         pinned host rows: the post kernel stages a row's input in the first, the CPU
         writes its partial sums to the second and the device reads them. The host keeps
-        references to both. The idle thread holds its workers in the kernel's keep-warm, in
-        register work for ``keep_warm_us`` after each job and in PAUSE for ``spin_us`` after
-        that, then releases them and sleeps until the next submit; -1 holds them until the
-        next submit (``SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US`` in a server). With ``[rows,
-        2 * nodes, tokens, hidden]`` rows a record's CPU job runs one forward of its tokens
-        from the row's token table.
+        references to both. The thread's team never sleeps: its workers run the kernel's
+        register work for ``keep_warm_us`` after each job and PAUSE after that, until the
+        next submit. With ``[rows, 2 * nodes, tokens, hidden]`` rows a record's CPU job runs
+        one forward of its tokens from the row's token table.
         """
         lanes = self.wire.lanes
         if len(split) != lanes + 1:
@@ -1841,7 +1835,6 @@ class ExpertStreamHost:
             parts,
             int(tokens),
             int(threads),
-            _spin_ns(spin_us),
             int(keep_warm_us * 1e3),
         )
         self.cpu_rows = (x_rows, out_rows)
@@ -1967,21 +1960,6 @@ class ExpertStreamHost:
         is enabled, whose validation reads it."""
         _refuse_test_only("test_kernel_max_rows", self.variant)
         self._module.expert_stream_test_kernel_max_rows(int(rows))
-
-    def test_keep_warm_calls(self) -> int:
-        """Test only: calls of the fake kernel's keep-warm since :meth:`test_kernel_address`."""
-        _refuse_test_only("test_keep_warm_calls", self.variant)
-        return int(self._module.expert_stream_test_keep_warm_calls())
-
-    def test_keep_warm_either_calls(self) -> int:
-        """Test only: how many of those calls were the two-word ``keep_warm_either`` (a draft source's hold)."""
-        _refuse_test_only("test_keep_warm_either_calls", self.variant)
-        return int(self._module.expert_stream_test_keep_warm_either_calls())
-
-    def test_keep_warm_core(self) -> int:
-        """Test only: the first core the fake keep-warm's last call took (-1 before any call)."""
-        _refuse_test_only("test_keep_warm_core", self.variant)
-        return int(self._module.expert_stream_test_keep_warm_core())
 
     def copy_engine_idle(self, timeout_s: float) -> bool:
         """Return whether every job given to the copy thread finished in ``timeout_s``.

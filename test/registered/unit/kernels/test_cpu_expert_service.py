@@ -227,12 +227,11 @@ class FakeHost:
         return torch.tensor(self.grid, dtype=torch.float64)
 
     def enable_cpu_experts(
-        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, spin_us=-1, keep_warm_us=0
+        self, kernel, split, cores, x_rows, out_rows, *, threads, group=0, keep_warm_us=0
     ):
         self.enabled = (kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads, group)
         self.enables.append((group, kernel, list(split), list(cores), tuple(x_rows.shape), tuple(out_rows.shape), threads))
         self.keep_warm_us = keep_warm_us
-        self.spin_us = spin_us
 
     def set_cpu_layer(self, row, spec):
         self.layers[row] = spec
@@ -311,18 +310,6 @@ def test_service_keeps_the_cpu_warm_for_2_ms_by_default_and_not_at_0():
         host = FakeHost()
         _service(host, FakeServiceTrait())
     assert host.keep_warm_us == 0
-
-
-def test_service_releases_the_idle_cpu_team_after_100_ms_by_default_and_never_at_minus_1():
-    from sglang.srt.environ import envs
-
-    host = FakeHost()
-    _service(host, FakeServiceTrait())
-    assert host.spin_us == 100_000
-    with envs.SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US.override(-1):
-        host = FakeHost()
-        _service(host, FakeServiceTrait())
-    assert host.spin_us == -1
 
 
 def test_service_retunes_from_the_measured_cost_only_after_enough_lanes():

@@ -135,7 +135,7 @@ struct Nvfp4Quant
     }
 
     // Defined in kernel.cpp after forward_plan.hpp.
-    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa);
+    static int dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team);
 };
 
 }  // namespace

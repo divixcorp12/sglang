@@ -1,11 +1,10 @@
-"""CPU expert keep-warm, the engine half (CPU).
+"""The CPU expert engine's team between jobs (CPU).
 
-An idle CPU expert thread never sleeps: it holds its workers in the format's keep-warm until the next submit or stop.
-For ``keep_warm_us`` after each job the hold runs register work, so the next job finds the cores at the AVX-512
-license rather than paying the ramp back (about 50 us per call on SKX after a 1 ms gap), and PAUSE after that, so no
-job ever waits for a worker to wake. The forward and the keep-warm are the instr build's fake kernel; its keep-warm
-counts its calls (from 0 at each test_kernel_address) and spins until its word moves. Jobs come from the startup
-calibration, which submits them through the live engine.
+The engine's team is its own for its lifetime and never sleeps: between jobs the workers run the format's register
+work for ``keep_warm_us`` (so the next job finds the cores at the AVX-512 license rather than paying the ramp back,
+about 50 us per call on SKX after a 1 ms gap), then PAUSE, until the next job, and the engine thread polls the same
+way. No job ever waits for a worker to wake, and no OpenMP runtime policy decides when a worker spins. The forward is
+the instr build's fake kernel; jobs come from the startup calibration, which submits them through the live engine.
 """
 
 import os
@@ -22,11 +21,11 @@ from sglang.test.dsv41_ram_miss_fixtures import attached_host, fake_cpu_layer, r
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-ROW, ROWS, DST_ROWS, HIDDEN, LANES = 1, 2, 6, 8, 8
+ROW, ROWS, DST_ROWS, HIDDEN, LANES, THREADS = 1, 2, 6, 8, 8, 2
 FORWARD_NS = 200_000  # 0.2 ms per expert
 
 
-def _host(tmp_path, request, keep_warm_us, spin_us=-1):
+def _host(tmp_path, request, keep_warm_us):
     s = ram_miss_setup(tmp_path, capacity=12, mirror_weights=(1.0, 1.0), hidden=256, inter=512)
     host = attached_host(s, new_page(pin=False, wire=wire_layout(8)), k=3)
     host.enable_copy_engine(-1)
@@ -38,29 +37,42 @@ def _host(tmp_path, request, keep_warm_us, spin_us=-1):
     host.set_copy_table(ROW, table, DST_ROWS)
     x_rows = torch.zeros((ROWS, 2 * HIDDEN), dtype=torch.uint8)
     out_rows = torch.zeros((ROWS, 2, HIDDEN), dtype=torch.float32)
-    cores = sorted(os.sched_getaffinity(0))[:2]
+    cores = sorted(os.sched_getaffinity(0))[:THREADS]
     host.enable_cpu_experts(
         host.test_kernel_address(FORWARD_NS),
         [0] * (lease.wire_layout(8).lanes + 1),
         cores,
         x_rows,
         out_rows,
-        threads=2,
-        spin_us=spin_us,
+        threads=THREADS,
         keep_warm_us=keep_warm_us,
     )
     host.set_cpu_layer(ROW, fake_cpu_layer(HIDDEN))
     request.addfinalizer(host.stop)  # the fake's call count is per process: no engine may outlive its test
-    return s, host, (dst, x_rows, out_rows)
+    return s, host, cores, (dst, x_rows, out_rows)
 
 
-def _engine_cpu_s() -> float:
-    """The CPU expert thread's user + system time, from /proc."""
-    for task in Path("/proc/self/task").iterdir():
-        if "-cpu-exp" in (task / "comm").read_text():
-            fields = (task / "stat").read_text().rsplit(")", 1)[1].split()
-            return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
-    raise AssertionError("no CPU expert thread")
+def _team_threads() -> list[Path]:
+    """The engine thread and its workers, which carry its name."""
+    return [task for task in Path("/proc/self/task").iterdir() if "-cpu-exp" in (task / "comm").read_text()]
+
+
+def _cpu_s(task: Path) -> float:
+    """A thread's user + system time, from /proc."""
+    fields = (task / "stat").read_text().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def _allowed(task: Path) -> list[int]:
+    for line in (task / "status").read_text().splitlines():
+        if line.startswith("Cpus_allowed_list:"):
+            spec = line.split(":", 1)[1].strip()
+            cores: list[int] = []
+            for part in spec.split(","):
+                lo, _, hi = part.partition("-")
+                cores.extend(range(int(lo), int(hi or lo) + 1))
+            return cores
+    raise AssertionError(f"no Cpus_allowed_list for {task}")
 
 
 def _run_jobs(host):
@@ -69,104 +81,59 @@ def _run_jobs(host):
     return host.calibrate_cpu_split(ROW, device=-1, reps=1, scratch=scratch)
 
 
-def test_the_engine_holds_its_team_before_the_first_job(tmp_path, request):
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000)
+def _jobs_run_at_once(host):
+    grid = _run_jobs(host)
+    for k in range(1, LANES + 1):
+        assert grid[0, k] < k * FORWARD_NS / 1e6 + 5, (k, grid[0].tolist())
+
+
+def test_the_team_is_made_at_start_and_pinned_to_the_engines_cores(tmp_path, request):
+    """The engine thread and threads - 1 workers exist before the first job, each on its own core of the config's.
+    Mutant: make the team with empty cores in CpuExpertEngine::run -- red (the workers inherit the process mask)."""
+    _, host, cores, _keep = _host(tmp_path, request, keep_warm_us=0)
     time.sleep(0.05)
-    assert host.test_keep_warm_calls() == 1
+    team = _team_threads()
+    assert len(team) == THREADS
+    assert sorted(core for task in team for core in _allowed(task)) == sorted(cores)
 
 
-def test_an_idle_engine_keeps_warm_after_a_job(tmp_path, request):
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000)
+def test_the_idle_team_never_sleeps(tmp_path, request):
+    """Long past its warm window, every thread of the team is still on its CPU (PAUSE is on-CPU time), and the next
+    job still runs at once. Mutant: let the workers' idle wait sleep -- red (their CPU time stalls)."""
+    _, host, _cores, _keep = _host(tmp_path, request, keep_warm_us=20_000)
+    _run_jobs(host)
+    time.sleep(0.1)
+    before = {task: _cpu_s(task) for task in _team_threads()}
+    time.sleep(0.5)
+    for task, cpu in before.items():
+        assert _cpu_s(task) - cpu > 0.3, task
+    _jobs_run_at_once(host)
+
+
+def test_a_job_runs_at_once_inside_its_warm_window(tmp_path, request):
+    """A 2 s window: register work that ran on to its deadline instead of yielding to the job would hold each job for
+    up to 2 s."""
+    _, host, _cores, _keep = _host(tmp_path, request, keep_warm_us=2_000_000)
+    _jobs_run_at_once(host)
+    time.sleep(0.02)
+    _jobs_run_at_once(host)
+
+
+def test_the_team_outlives_its_jobs(tmp_path, request):
+    """One team for the engine's lifetime: no thread is made or lost by a job."""
+    _, host, _cores, _keep = _host(tmp_path, request, keep_warm_us=0)
+    time.sleep(0.02)
+    before = sorted(task.name for task in _team_threads())
+    _run_jobs(host)
+    _run_jobs(host)
+    assert sorted(task.name for task in _team_threads()) == before
+
+
+def test_stop_ends_an_idle_team_at_once(tmp_path, request):
+    _, host, _cores, _keep = _host(tmp_path, request, keep_warm_us=60_000_000)
     _run_jobs(host)
     time.sleep(0.02)
-    assert host.test_keep_warm_calls() >= 1
-
-
-def test_a_job_ends_the_keep_warm_at_once(tmp_path, request):
-    # A 2 s window: a keep-warm that ran on to its deadline would hold each job for up to 2 s.
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=2_000_000)
-    _run_jobs(host)
-    time.sleep(0.02)
-    calls = host.test_keep_warm_calls()
-    assert calls >= 1
-    grid = _run_jobs(host)
-    assert host.test_keep_warm_calls() > calls
-    for k in range(1, LANES + 1):
-        assert grid[0, k] < k * FORWARD_NS / 1e6 + 5, (k, grid[0].tolist())
-
-
-def test_the_hold_outlasts_its_warm_window(tmp_path, request):
-    """Past its 20 ms of register work the hold goes on: one call that keeps the thread on its core until the next
-    job, which still runs at once. Mutant: let CpuExpertEngine::run sleep once warm_until passes -- red (the idle
-    thread uses no CPU)."""
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=20_000)
-    _run_jobs(host)
-    time.sleep(0.1)
-    calls = host.test_keep_warm_calls()
-    assert calls >= 1
-    before = _engine_cpu_s()
-    time.sleep(0.5)
-    assert _engine_cpu_s() - before > 0.3
-    assert host.test_keep_warm_calls() == calls
-    grid = _run_jobs(host)
-    for k in range(1, LANES + 1):
-        assert grid[0, k] < k * FORWARD_NS / 1e6 + 5, (k, grid[0].tolist())
-
-
-def test_a_spin_budget_releases_the_team_and_the_engine_sleeps(tmp_path, request):
-    """With spin_us the hold ends spin_us after the warm window: the engine releases its team and sleeps on its
-    doorbell, using no CPU, and the next job still runs (the submit wakes it). Mutant: ignore the release deadline in
-    keep_warm -- red (the idle thread keeps its core)."""
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=10_000, spin_us=20_000)
-    _run_jobs(host)
-    time.sleep(0.1)
-    calls = host.test_keep_warm_calls()
-    assert calls >= 1
-    before = _engine_cpu_s()
-    time.sleep(0.5)
-    assert _engine_cpu_s() - before < 0.1
-    assert host.test_keep_warm_calls() == calls
-    grid = _run_jobs(host)
-    for k in range(1, LANES + 1):
-        assert grid[0, k] < k * FORWARD_NS / 1e6 + 5, (k, grid[0].tolist())
-    assert host.test_keep_warm_calls() > calls
-
-
-def test_a_sleeping_engine_spins_its_budget_before_the_first_job(tmp_path, request):
-    """Before any job the engine holds its team for its spin budget, then releases it and sleeps."""
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000, spin_us=20_000)
-    time.sleep(0.1)
-    assert host.test_keep_warm_calls() == 1
-    before = _engine_cpu_s()
-    time.sleep(0.3)
-    assert _engine_cpu_s() - before < 0.06
-    assert host.test_keep_warm_calls() == 1
-
-
-def test_stop_wakes_a_sleeping_engine(tmp_path, request):
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=0, spin_us=0)
-    _run_jobs(host)
-    time.sleep(0.05)
     start = time.monotonic()
     host.stop()
     assert time.monotonic() - start < 5
-
-
-def test_stop_ends_a_running_keep_warm(tmp_path, request):
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=60_000_000)
-    _run_jobs(host)
-    time.sleep(0.02)
-    assert host.test_keep_warm_calls() >= 1
-    start = time.monotonic()
-    host.stop()
-    assert time.monotonic() - start < 5
-
-
-def test_the_idle_thread_keeps_its_own_cores_warm(tmp_path, request):
-    """The keep-warm pins its workers to the group's cores, which must be the ones enable_cpu_experts took. Mutant:
-    pass empty cores to keep_warm in CpuExpertEngine::run -- red (core -1)."""
-    _, host, _keep = _host(tmp_path, request, keep_warm_us=500_000)
-    _run_jobs(host)
-    time.sleep(0.02)
-    assert host.test_keep_warm_calls() >= 1
-    assert host.test_keep_warm_core() == sorted(os.sched_getaffinity(0))[0]
+    assert _team_threads() == []

@@ -1982,24 +1982,17 @@ class Envs:
     SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES = EnvStr("")
     # Worker threads of the draft's CPU expert kernel, at most one per core. 0 takes one per core.
     SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS = EnvInt(0)
-    # How long the idle draft CPU thread holds its workers in PAUSE after each job before it releases them and polls the
-    # draft channel's head with 50 us sleeps (the GPU cannot ring a futex). -1: never release.
-    SGLANG_DSV41_DSPARK_CPU_EXPERTS_IDLE_SPIN_US = EnvInt(100_000)
     # Keeps an EXL3 DSpark draft eager (no decode graph); the draft MoE then runs the same graph-safe path eagerly.
     # For A/B only.
     SGLANG_DSV41_DISABLE_DSPARK_DRAFT_GRAPH = EnvBool(False)
     # The draft experts kept on the GPU, per stage (analysis/dsv41-drive/dspark/draft_resident_set.py).
     # Empty keeps none: every routed draft expert runs on the CPU.
     SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH = EnvStr("")
-    # For this many us after its last job, the idle CPU expert thread holds its workers in the kernel's register-only
-    # AVX-512 loop instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap
-    # costs about 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03:
-    # a 1 ms or 3 ms gap then costs nothing). 0: PAUSE only.
+    # For this many us after its last job, the idle CPU expert team runs the kernel's register-only AVX-512 loop
+    # instead of PAUSE, so the next layer's job starts at the AVX-512 license: on SKX a 1 ms idle gap costs about
+    # 50 us per call to ramp back. 2 ms covers the gap between decode layers (full-stack bench 2026-10-03: a 1 ms or
+    # 3 ms gap then costs nothing). 0: PAUSE only. The team never sleeps either way.
     SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US = EnvInt(2000)
-    # How long after that window the idle CPU expert thread keeps holding its workers in PAUSE before it releases them
-    # (to OpenMP's idle wait) and sleeps on a futex until the next job. -1: never release, so the cores stay busy and
-    # no job waits for a worker to wake.
-    SGLANG_DSV41_CPU_EXPERTS_IDLE_SPIN_US = EnvInt(100_000)
 
     # Layer-major prefill (plan 2026-09-27-dsv41-layer-major-prefill-phase1): a request whose uncached prompt suffix is
     # at least this many tokens runs every chunk through a layer before the next layer, so each layer's experts

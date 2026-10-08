@@ -420,15 +420,15 @@ struct ForwardPlan
     using Traits = PlanTraits<Shape, I>;
 
     // Sizes this call's scratch from the arena, runs the team, and returns. ctx.chunks must be non-empty.
-    static void run(ForwardCtx& ctx, const Experts<Shape>& E, ForwardArena& ar, int threads)
+    static void run(ForwardCtx& ctx, const Experts<Shape>& E, ForwardArena& ar, Team& team)
     {
-        worker_trace::Capture<Trace> trace(threads > 0 ? threads : 1, ctx.m_total, int(ctx.chunks.size()));
+        worker_trace::Capture<Trace> trace(team.workers(), ctx.m_total, int(ctx.chunks.size()));
         prepare_scratch(ctx, ar, trace);
         const int nc = static_cast<int>(ctx.chunks.size());
         const bool grouped = Traits::kGroupedTraversal && nc == 1;
         const bool wide = Traits::kWideSingleExpert && ctx.m_total == 1 && nc == 1;
         trace.team_start();
-        run_team(ctx, E, threads > 0 ? threads : 1, grouped, wide, trace);
+        run_team(ctx, E, team, grouped, wide, trace);
         trace.finish();
     }
 
@@ -508,32 +508,31 @@ private:
         }
     }
 
-    // The phases on the framework's pinned team (team.hpp's run_team), which throws when the team is short or a
-    // worker cannot be pinned.
-    static void run_team(ForwardCtx& ctx, const Experts<Shape>& E, int count, bool grouped, bool wide,
+    // The phases on the engine's team (team.hpp), every worker in step, the team's owner as worker 0.
+    static void run_team(ForwardCtx& ctx, const Experts<Shape>& E, Team& team, bool grouped, bool wide,
                          worker_trace::Capture<Trace>& trace)
     {
         [[maybe_unused]] double phase_us[6]{};
-        ::sglang::cpu_experts::run_team(count, [&](int worker, int n) {
+        team.run([&](int worker, int n) {
+            trace.worker_start(worker);
             if (ctx.zero_out && worker == 0)
                 std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * ctx.layer->hidden * sizeof(float));
-            step<Phase::PrepareGateUp>(ctx, E, worker, n, grouped, wide, phase_us, trace);
-            step<Phase::GateUp>(ctx, E, worker, n, grouped, wide, phase_us, trace);
-            step<Phase::Middle>(ctx, E, worker, n, grouped, wide, phase_us, trace);
-            step<Phase::Down>(ctx, E, worker, n, grouped, wide, phase_us, trace);
-            step<Phase::Accumulate>(ctx, E, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::PrepareGateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::GateUp>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::Middle>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::Down>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
+            step<Phase::Accumulate>(ctx, E, team, worker, n, grouped, wide, phase_us, trace);
             trace.worker_end(worker);
-        }, trace);
+        });
         if constexpr (Profile)
             printf("moe_cpu phases(us): %.1f %.1f %.1f %.1f %.1f %.1f\n",
                    phase_us[0], phase_us[1], phase_us[2], phase_us[3], phase_us[4], phase_us[5]);
     }
 
-    // One phase of the team's sequence: run it, then wait for the whole team unless it is the last. Called inside
-    // run_team's parallel region (an orphaned barrier binds to that team). Profile: phase_us is indexed by the
-    // phase's value; otherwise it is untouched.
+    // One phase of the team's sequence: run it, then wait for the whole team unless it is the last. Profile: phase_us
+    // is indexed by the phase's value; otherwise it is untouched.
     template <Phase P>
-    static void step(ForwardCtx& ctx, const Experts<Shape>& E, int worker, int n, bool grouped, bool wide,
+    static void step(ForwardCtx& ctx, const Experts<Shape>& E, Team& team, int worker, int n, bool grouped, bool wide,
                      [[maybe_unused]] double* phase_us, worker_trace::Capture<Trace>& trace)
     {
         using Clock = std::chrono::steady_clock;
@@ -542,9 +541,7 @@ private:
         trace.begin(worker, static_cast<int>(P));
         phase<P>(ctx, E, worker, n, grouped, wide, trace);
         trace.work_end(worker, static_cast<int>(P));
-        if constexpr (P != Phase::Accumulate) {
-            #pragma omp barrier
-        }
+        if constexpr (P != Phase::Accumulate) team.barrier();
         trace.end(worker, static_cast<int>(P));
         if constexpr (Profile) {
             if (worker == 0)
@@ -662,22 +659,22 @@ private:
 std::atomic<int64_t> g_plan_calls[2];
 
 // Runs the call's plan at tier `isa`: the DSV4.1 plan when it accepts the call, else the generic plan at the tier.
-void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, int threads, Isa isa)
+void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, Team& team, Isa isa)
 {
     const ExpertLayer& l = *ctx.layer;
     if (isa == Isa::Bw && Dsv41Shape::accepts(l, p, ctx.chunks)) {
         g_plan_calls[0].fetch_add(1, std::memory_order_relaxed);
-        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, Experts<Dsv41Shape>{&l, p}, ar, threads);
+        ForwardPlan<Dsv41Shape, Isa::Bw>::run(ctx, Experts<Dsv41Shape>{&l, p}, ar, team);
         return;
     }
     g_plan_calls[1].fetch_add(1, std::memory_order_relaxed);
     const Experts<GenericShape> E{&l, p};
     switch (isa) {
-        case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, threads); return;
-        case Isa::Avx2:   ForwardPlan<GenericShape, Isa::Avx2>::run(ctx, E, ar, threads); return;
-        case Isa::Bw:     ForwardPlan<GenericShape, Isa::Bw>::run(ctx, E, ar, threads); return;
-        case Isa::Vnni:   ForwardPlan<GenericShape, Isa::Vnni>::run(ctx, E, ar, threads); return;
-        case Isa::Vbmi:   ForwardPlan<GenericShape, Isa::Vbmi>::run(ctx, E, ar, threads); return;
+        case Isa::Scalar: ForwardPlan<GenericShape, Isa::Scalar>::run(ctx, E, ar, team); return;
+        case Isa::Avx2:   ForwardPlan<GenericShape, Isa::Avx2>::run(ctx, E, ar, team); return;
+        case Isa::Bw:     ForwardPlan<GenericShape, Isa::Bw>::run(ctx, E, ar, team); return;
+        case Isa::Vnni:   ForwardPlan<GenericShape, Isa::Vnni>::run(ctx, E, ar, team); return;
+        case Isa::Vbmi:   ForwardPlan<GenericShape, Isa::Vbmi>::run(ctx, E, ar, team); return;
     }
 }
 
@@ -685,7 +682,7 @@ void run_plan(ForwardCtx& ctx, const Exl3Quant::Params& p, ForwardArena& ar, int
 // framework's RouteTable, fixes EXL3's accumulation order (expert ascending, then token, then route), so it reads the
 // call's slots as given and runs zero-weight routes. Each weight is rounded to FP16, the registered kernel's
 // convention. ExpertForward has validated the call (every slot in [-1, capacity), finite weights, rows and k in range).
-int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa)
+int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall& c, Isa isa, Team& team)
 {
     ForwardCtx ctx;
     ctx.layer = &l;
@@ -725,7 +722,7 @@ int Exl3Quant::dispatch(const ExpertLayer& l, const Params& p, const ForwardCall
     if (ctx.chunks.empty()) {
         if (ctx.zero_out) std::memset(ctx.out, 0, static_cast<size_t>(ctx.m_total) * l.hidden * sizeof(float));
     } else {
-        run_plan(ctx, p, ar, c.threads, isa);
+        run_plan(ctx, p, ar, team, isa);
     }
     give_back();
     return 0;

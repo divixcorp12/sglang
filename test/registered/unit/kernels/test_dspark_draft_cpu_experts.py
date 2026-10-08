@@ -94,7 +94,6 @@ def test_prepare_builds_the_runtime_once(monkeypatch):
             (host,) = _Host.built
             assert host.started == 1 and sorted(host.layers) == [0, 1] and host.layers[0] == ("spec", E)
             assert (host.areas.stages, host.areas.hidden) == (2, H)
-            assert host.kw["spin_us"] == envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_IDLE_SPIN_US.get()
             assert runtime.stats() == host.stats()
         finally:
             registry.close()

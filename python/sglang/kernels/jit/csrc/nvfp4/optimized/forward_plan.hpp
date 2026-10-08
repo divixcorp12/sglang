@@ -111,10 +111,10 @@ std::pair<int64_t, int64_t> share(int64_t total, int worker, int workers)
 template <class Shape, Isa I>
 struct ForwardPlan
 {
-    // Runs the call's routes through layer l on c.threads workers (the caller is worker 0). Returns 0, or 2 when Q8_0
-    // cannot represent an input or an intermediate (out is then untouched). Throws when the team is short or a worker
-    // cannot be pinned.
-    static int run(const ExpertLayer& l, const Nvfp4Quant::Params& p, const ForwardCall& c, const RouteTable& r)
+    // Runs the call's routes through layer l on `team` (its owner is worker 0). Returns 0, or 2 when Q8_0 cannot
+    // represent an input or an intermediate (out is then untouched).
+    static int run(const ExpertLayer& l, const Nvfp4Quant::Params& p, const ForwardCall& c, const RouteTable& r,
+                   Team& team)
     {
         ForwardArena& ar = ForwardArena::get();
         ForwardCtx ctx;
@@ -126,13 +126,13 @@ struct ForwardPlan
         ctx.accumulate = c.accumulate != 0;
         ctx.routes = r;
         bind_routes(ctx, l, ar);
-        prepare_scratch(ctx, ar, c.threads);
-        run_team(c.threads, [&ctx](int worker, int n) {
-            step<Phase::PrepareInput>(ctx, worker, n);
+        prepare_scratch(ctx, ar, team.workers());
+        team.run([&ctx, &team](int worker, int n) {
+            step<Phase::PrepareInput>(ctx, team, worker, n);
             // `invalid` is read only after a barrier, so every worker takes the same branch.
             if (!ctx.invalid.load(std::memory_order_relaxed)) {
-                step<Phase::GateUp>(ctx, worker, n);
-                step<Phase::Middle>(ctx, worker, n);
+                step<Phase::GateUp>(ctx, team, worker, n);
+                step<Phase::Middle>(ctx, team, worker, n);
                 if (!ctx.invalid.load(std::memory_order_relaxed)) phase<Phase::Down>(ctx, worker, n);
             }
         });
@@ -281,13 +281,12 @@ private:
         down_rows(c, partial, h0, h1);
     }
 
-    // One phase, then wait for the whole team. Called inside run_team's parallel region (team.hpp; an orphaned barrier
-    // binds to that team).
+    // One phase, then wait for the whole team (team.hpp's barrier).
     template <Phase P>
-    static void step(ForwardCtx& c, int worker, int workers)
+    static void step(ForwardCtx& c, Team& team, int worker, int workers)
     {
         phase<P>(c, worker, workers);
-        #pragma omp barrier
+        team.barrier();
     }
 
     // One phase for this worker; P picks the phase at compile time.

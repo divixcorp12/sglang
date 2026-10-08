@@ -126,7 +126,6 @@ class DraftCpuExperts:
                 self.areas,
                 cores=self.cores,
                 threads=threads,
-                spin_us=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_IDLE_SPIN_US.get(),
                 keep_warm_us=envs.SGLANG_DSV41_CPU_EXPERTS_KEEP_WARM_US.get(),
                 fatal_wait_s=fatal_wait_s,
             )

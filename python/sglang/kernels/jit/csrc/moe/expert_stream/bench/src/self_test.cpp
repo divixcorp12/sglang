@@ -536,7 +536,9 @@ class FakeKernel final : public ce::CpuExpertKernel {
   void check(const ce::ExpertLayer& layer, const ce::ForwardCall&) const override {
     if (layer.kernel != this) throw std::invalid_argument("bench fake: another kernel's layer");
   }
-  void forward(const ce::ExpertLayer&, const ce::ForwardCall& c) const override {
+  using ce::CpuExpertKernel::forward;
+  void forward(const ce::ExpertLayer&, const ce::ForwardCall& c, ce::Team& team) const override {
+    team.run([](int, int) {});
     uint16_t x0;
     std::memcpy(&x0, c.x, 2);
     float sum = 0.0f;
@@ -552,16 +554,9 @@ class FakeKernel final : public ce::CpuExpertKernel {
          c.accumulate,
          c.cores.empty() ? -1 : c.cores.front()});
   }
-  void keep_warm(std::span<const int>, int32_t, const uint32_t* word, uint32_t seen, int64_t, int64_t release_ns)
-      const override {
-    while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && es::now_ns() < release_ns) _mm_pause();
-  }
-
-  void keep_warm_either(std::span<const int>, int32_t, const uint32_t* word_a, uint32_t seen_a, const uint32_t* word_b,
-                        uint32_t seen_b, int64_t, int64_t release_ns) const override {
-    while (__atomic_load_n(word_a, __ATOMIC_ACQUIRE) == seen_a && __atomic_load_n(word_b, __ATOMIC_ACQUIRE) == seen_b &&
-           es::now_ns() < release_ns)
-      _mm_pause();
+  int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) const override {
+    while (__atomic_load_n(word, __ATOMIC_ACQUIRE) == seen && es::now_ns() < deadline_ns) _mm_pause();
+    return 0;
   }
 
   mutable std::mutex mutex;

@@ -19,6 +19,7 @@ inline constexpr int kMaxSlabs = 8;
 inline constexpr size_t kMaxParamBytes = 16;
 
 class CpuExpertKernel;
+class Team;  // team.hpp: the workers a forward runs on
 
 // One expert slot's bytes: its row's first byte in each slab, null for an absent optional slab.
 struct ExpertRow {
@@ -56,7 +57,9 @@ struct ExpertLayer {
 };
 
 // One forward: `rows` token rows; row t's experts are slots[t*k+i] weighted by weights[t*k+i], -1 skipped. out (fp32
-// [rows][hidden]) is overwritten, or added to when accumulate. Worker i runs on cores[i]; empty: unpinned workers.
+// [rows][hidden]) is overwritten, or added to when accumulate. `threads` and `cores` are the team the call is checked
+// against, and the team a standalone forward (CpuExpertKernel::forward without a Team) makes: worker i on cores[i],
+// empty: unpinned.
 struct ForwardCall {
   int32_t rows = 0, k = 0, threads = 1;
   const void* x = nullptr;
@@ -82,21 +85,15 @@ class CpuExpertKernel {
   // capacity or unusable, a non-finite weight. forward checks none of it; a caller whose calls are not built to fit
   // (a test, a harness) calls check first.
   virtual void check(const ExpertLayer&, const ForwardCall&) const = 0;
-  // Runs a call check would pass. Throws std::invalid_argument when the input itself refuses (the quant cannot
-  // represent it), std::runtime_error for a failure; out is untouched when it throws. Pins the calling thread and its
-  // workers to cores.
-  virtual void forward(const ExpertLayer&, const ForwardCall&) const = 0;
-  // Holds `threads` workers pinned to cores until *word != seen or CLOCK_MONOTONIC reaches release_ns
-  // (keep_warm.hpp): register-only work at the forward's vector width until warm_until_ns, then PAUSE. The cores are
-  // not checked (in range, distinct): the caller passes cores it has checked, as forward's. Throws for no worker, no
-  // word or more workers than cores.
-  virtual void keep_warm(std::span<const int> cores, int32_t threads, const uint32_t* word, uint32_t seen,
-                         int64_t warm_until_ns, int64_t release_ns) const = 0;
-  // keep_warm watching two words: holds until *word_a != seen_a, *word_b != seen_b or CLOCK_MONOTONIC reaches
-  // release_ns. A CPU expert engine with a second job source (the DSpark draft channel) holds on its doorbell and the
-  // channel's head together; one without calls keep_warm, whose code this leaves as it was.
-  virtual void keep_warm_either(std::span<const int> cores, int32_t threads, const uint32_t* word_a, uint32_t seen_a,
-                                const uint32_t* word_b, uint32_t seen_b, int64_t warm_until_ns,
-                                int64_t release_ns) const = 0;
+  // Runs a call check would pass on `team`: every worker of the team, the caller (the team's owner) as worker 0.
+  // Throws std::invalid_argument when the input itself refuses (the quant cannot represent it), std::runtime_error
+  // for a failure; out is untouched when it throws.
+  virtual void forward(const ExpertLayer&, const ForwardCall&, Team& team) const = 0;
+  // Register-only work at the forward's vector width (keep_warm.hpp) until *word != seen or CLOCK_MONOTONIC reaches
+  // deadline_ns: a Team's idle loop, so a core keeps the license the forward runs at. Returns a value for the caller
+  // to sink.
+  virtual int32_t warm(const uint32_t* word, uint32_t seen, int64_t deadline_ns) const = 0;
+  // forward on a team made for this call alone (team.hpp), for a caller that holds no Team.
+  void forward(const ExpertLayer&, const ForwardCall&) const;
 };
 }  // namespace sglang::cpu_experts

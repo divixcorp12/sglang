@@ -17,6 +17,7 @@
 #include "fixture.h"
 #include "kernel.h"
 #include "moe_mul1.h"
+#include "../../moe/expert_stream/host/cpu_experts/team.hpp"
 #include "tile_assignment.hpp"
 #include <algorithm>
 #include <chrono>
@@ -51,6 +52,15 @@ void exl3_moe_cpu_baseline_set_cores(const int* cores, int n);
 namespace {
 namespace fs = std::filesystem;
 std::vector<int> g_cores;  // the bench's worker cores, worker 0 first
+
+// The bench's one team on g_cores, made at the first forward and kept for the process: a team per call would time
+// thread creation.
+::sglang::cpu_experts::Team& bench_team(int workers) {
+  static std::unique_ptr<::sglang::cpu_experts::Team> team;
+  if (!team)
+    team = std::make_unique<::sglang::cpu_experts::Team>(g_cores, workers, &::sglang::exl3_cpu::exl3_cpu_kernel(), 0);
+  return *team;
+}
 bool benchmark_failed = false;
 // The command line; the defaults are the reference machine's.
 struct Options {
@@ -311,7 +321,7 @@ struct Workload {
     call.weights = weights.data();
     call.out = output.data();
     call.cores = g_cores;
-    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call);
+    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call, bench_team(options.workers));
 #endif
   }
 
@@ -431,7 +441,7 @@ struct RoutedWorkload {
     call.weights = weights.data();
     call.out = output.data();
     call.cores = g_cores;
-    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call);
+    ::sglang::exl3_cpu::exl3_cpu_kernel().forward(layers[layer]->layer, call, bench_team(options.workers));
   }
 
   void validate() {
