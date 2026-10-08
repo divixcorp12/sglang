@@ -36,9 +36,10 @@ cannot be reached within a step.
   together (no contention), so a row split in equal thirds waits for the SPCC's 4.4 MB at 2.8 GB/s, 1.6 ms, which is
   the 1.7 ms QD1 isolation figure; serving adds ~0.5 ms of record-to-issue and landing-to-submit latency.
 - **A fourth mirror on `/mnt/nvme1`** (Crucial P310, Gen3 x4, 2.8 GB/s, 414 GB free against 191 GB of row images;
-  it also holds the 64 GB swapfile). Four-way split lands a row in ~1.2-1.3 ms, an estimated 5-7 ms/token. It is
+  it also holds the 64 GB swapfile). Four-way split cuts the slowest share to 3.3 MB, ~1.2 ms at 2.8 GB/s, so a row lands in ~1.7 ms with the ~0.5 ms
+  of serving latency (bandwidth alone scales 2.2 to ~1.65; all three current mirrors are Gen3 x4). It is
   independent of this design and is run as its own env-only A/B; the replay here carries it as a timing variant
-  (`--nvme-row-ms 1.3`).
+  (`--nvme-row-ms 1.3`, optimistic against the ~1.7 ms above).
 - **Mirror re-weighting.** Tested 2026-09-29 (`analysis/dsv41-drive/mirror-scaling/weight-pair.md`): +0.4 ms/token,
   noise. Not repeated.
 - **Prefetch into VRAM** and **device-selected candidates on the lease wire** (the retired
@@ -89,59 +90,81 @@ the route ring's width accepts the verify's lane count. `tier_sim.load_forwards`
 2.2 ms/row calibration. The findings go to `divix01:/data/models/slang/nvfp4-work/ram-prefetch/findings.md`, to
 Hindsight, and to `DSV41_REFERENCE.md` §33 whichever way the rule falls.
 
-### Phase 1: host-scored, group-local speculative reads
+### Phase 0 result (2026-10-08): go
+
+`DSV41_REFERENCE.md` §33.13. At the 2.2 ms/row calibration `gate` h=1, one candidate per token, **one speculative row
+per layer** (the replay's `--budget 1`, a single budget per layer shared by both groups, the highest-margin
+candidate wherever it is homed) saves 7.33 / 7.94 ms/token (suite / held-out) against `oracle` h=1's best 12.10 /
+12.47: ratios 0.62 / 0.65, against the bar's 0.5 / 0.4. Precision 0.60. Budget 2 saves 6.03, budget 4 2.68, two
+per token at budget 8 nothing, h=2 1.82, a FIFO queue -0.53. The alternative calibration (2.0 ms/row) gives 0.54 /
+0.57. The replay is optimistic in absolute terms (its gate tail is heavier than measured, and it leaves out the
+scoring and issue costs), so the expected live gain is **4-6 ms/token**, not 7.3. Phase 1 below is trimmed to that
+arm: h=1 only, one candidate per token, one row per layer.
+
+### Phase 1: host-scored speculative reads, one layer-wide budget
 
 **Input, no device change.** The post kernel (`exl3_ram_miss_post_kernel`, `lease_kernels.cuh`) already stages each
 record's `[M, H]` layer input as fp16 for the CPU experts (`cpu_x_dst`, `cpu_hidden`), and each record carries its
 layer's hot bitmap (`apply_gpu_hot`). The host additionally loads the 40 gates (`layers.N.ffn.gate.weight` and
-`.bias`, 126 MB) at service start, one copy per NUMA node, through the service's FFI. The option therefore requires
+`.bias`, 126 MB) once, on NUMA node 0, at service start through the service's FFI. The option therefore requires
 `SGLANG_DSV41_CPU_EXPERTS=1`, which the DSpark recipe has.
 
-**Scout, one per group.** A pinned thread on the group's node, on a reserved core from `ThreadingConfig`, fed by the
-service thread over an SPSC ring (`spsc_ring.h`) with each record's seq once its input is staged. Per token it scores
-layer T+h's gate (`sqrt(softplus(W x)) + b`, M x 384 x 4096 fp16, ~0.1 ms at M=5), ranks by margin to the 6th score,
-and filters: not VRAM-hot (`tier.hot` for row T+h, one record stale), not RAM-resident, not filling, homed on this
-group, not layer 0. It emits up to K per token above `_MIN_MARGIN`, in rank order, over a second SPSC ring. It touches
-no tier state.
+**One scout.** A single pinned thread on node 0, on a reserved core from `ThreadingConfig`, fed over an SPSC ring
+(`spsc_ring.h`) with each verify record's seq and layer once its input is staged. For record (seq, layer T) it scores
+layer T+1's gate per live token (`sqrt(softplus(W x)) + b`, M x 384 x 4096 fp16, ~0.1 ms at M=6), takes each token's
+`PER_TOKEN` candidates by margin to its 6th score, forms the union ranked by margin, filters (not VRAM-hot by the
+record's hot bitmap for layer T+1, one record stale; not layer 0), and emits the top `PER_LAYER` survivors. Each
+candidate goes to its **home group's** candidate ring (`expert % 2`, as the tier homes rows), so the budget is
+layer-wide across both groups, as the replay's was. The scout touches no tier state: RAM residency and `filling` are
+checked at admission, where the tier lives; a candidate admission rejects does not return budget to the scout.
+
+A single scout, not one per group: the scoring is ~0.1 ms against a ~11 ms verify layer, and a per-group budget of
+one row is two rows per layer, which the replay puts near its budget-2 arm (6.0 rather than 7.3 ms/token). If the
+cross-group ring proves awkward, two scouts with a per-group budget is the fallback, at that cost.
 
 **Admission, on the service thread.** The tier is owned by its group's service thread, so admission stays there. In
-the poll loop, when the demand head shows no new record, it pops scout candidates, claims a victim by the existing
-rule (`filling` set, never a victim, cold stamp), and submits the row to a **speculative reader**: a second
-`RowReader` on its own io_uring ring, in-flight bytes capped at `_INFLIGHT_ROWS` rows (default 1). Completions are
-reaped in the same loop; a landed row is vetted through the demand path's digest check, then becomes kReady,
-cold-stamped, and counts against the layer's `_SPEC_SHARE` of unused speculative rows (admitting beyond it evicts the
-oldest unused speculative row, never a demand row).
+the poll loop, when the demand head shows no new record, it pops candidates from its ring, drops any already
+RAM-resident or `filling`, claims a victim by the existing rule (`filling` set, never a victim, cold stamp), and
+submits the row to a **speculative reader**: a second `RowReader` on its own io_uring ring, in-flight rows capped at
+`INFLIGHT_ROWS` per group (default 1). Candidates that arrive while the cap is full wait in the ring, oldest first,
+and are dropped once their target layer's demand record has been served. Completions are reaped in the same loop;
+a landed row is vetted through the demand path's digest check, then becomes kReady, cold-stamped, and counts against
+the layer's `SPEC_SHARE` of unused speculative rows per group (admitting beyond it evicts the oldest unused
+speculative row, never a demand row).
 
 **Demand priority.** A demand record is served exactly as today on the demand reader. Speculative legs are never
 submitted while a demand read runs (the service thread is inside `read_misses` then), and the in-flight cap bounds
-the device-queue delay a demand read can see to one row (~1.4 ms at 9.3 GB/s aggregate, ~1.1 ms with a fourth
-mirror). A demand lane whose expert is `filling` waits for that landing instead of reading again (promotion), bounded
-by the same cap; the lane is typed kKindMissCpu with the filling slot as its staging slot and its CPU job is
-submitted when the row lands, through `submit_landed_cpu_misses`.
+the device-queue delay a demand read can see to one row (~1.4 ms at the three mirrors' ~9.3 GB/s). A demand lane whose
+expert is `filling` waits for that landing instead of reading again (promotion), bounded by the same cap; the lane is
+typed kKindMissCpu with the filling slot as its staging slot and its CPU job is submitted when the row lands, through
+`submit_landed_cpu_misses`.
 
 **Failure handling.** A failed speculative read releases the slot and unmaps the expert (nothing waited on it) and
 counts `spec_failed`; a failure during promotion is a demand failure and fail-stops like any demand read
 (`fail_record`). The speculative reader holds the watchdog's busy episode while it has legs in flight, so a hung ring
-aborts the process as a hung demand does. Shutdown drains the speculative ring before joining the demand reader, as
-`fill_join` does for the fill thread.
+aborts the process as a hung demand does. Shutdown stops the scout, then drains the speculative ring before joining
+the demand reader, as `fill_join` does for the fill thread.
 
 **Options**, in `environ.py` under the env-var conventions, default off until a serving arm accepts them:
 
-| Variable | Meaning |
-|---|---|
-| `SGLANG_DSV41_RAM_PREFETCH` | on/off |
-| `SGLANG_DSV41_RAM_PREFETCH_LOOKAHEAD` | h, 1 or 2 |
-| `SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN` | K candidates per token |
-| `SGLANG_DSV41_RAM_PREFETCH_MIN_MARGIN` | confidence floor on the margin to the 6th score |
-| `SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE` | unused speculative rows a layer may hold per group |
-| `SGLANG_DSV41_RAM_PREFETCH_INFLIGHT_ROWS` | speculative rows in flight per group |
+| Variable | Default | Meaning |
+|---|---:|---|
+| `SGLANG_DSV41_RAM_PREFETCH` | off | on/off |
+| `SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN` | 1 | candidates per live token, by margin |
+| `SGLANG_DSV41_RAM_PREFETCH_PER_LAYER` | 1 | speculative rows the scout emits per layer, both groups together |
+| `SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE` | 4 | unused speculative rows a layer may hold per group |
+| `SGLANG_DSV41_RAM_PREFETCH_INFLIGHT_ROWS` | 1 | speculative rows in flight per group |
+
+Lookahead is fixed at one layer and there is no margin floor: h=2 and wider budgets lost in the replay, and the best
+arm had no floor. Both are left out rather than made options.
 
 The launch gate (`expert_stream_requirements_exl3.py`) refuses the option without target CPU experts or row images.
-With the option off the request path is today's: no scout, no second ring, no clock reads.
+With the option off the request path is today's: no scout, no gate copy, no second ring, no clock reads.
 
 **Observability.** Per-group counters on the service's metrics line: issued, used at target, used later, evicted
-unused, failed, demand lanes delayed by a speculative leg, promotions. InstrBuild events `spec_submit`, `spec_land`,
-`spec_use` with the record's seq and row, so the job-trace joins (`miss_latency.py` and kin) attribute them.
+unused, failed, dropped (stale or already resident), demand lanes delayed by a speculative leg, promotions; the
+scout's candidates per layer and scoring time. InstrBuild events `spec_submit`, `spec_land`, `spec_use` with the
+record's seq and row, so the job-trace joins (`miss_latency.py` and kin) attribute them.
 
 ## Invariants
 
@@ -150,7 +173,7 @@ unused, failed, demand lanes delayed by a speculative leg, promotions. InstrBuil
 - No speculative leg is submitted while a demand read is in progress.
 - In-flight speculative bytes never exceed the cap.
 - A demand lane on a `filling` expert yields the same bytes as a fresh read.
-- The scout touches no tier state.
+- The scout touches no tier state, and emits at most `PER_LAYER` candidates per layer across both groups.
 - With the option off, the service's request path is unchanged, and `traced_clock_reads()` stays at today's count.
 
 ## Testing
@@ -158,12 +181,13 @@ unused, failed, demand lanes delayed by a speculative leg, promotions. InstrBuil
 - **Phase 0.** `record_router` and `RouterCapture` with M > 1 (shapes, token count, a replay reading them back);
   `load_forwards` on a verify trace; the simulator's chain model against a hand-computed layer (one miss, two misses,
   a speculative row that lands before and after its demand); the tier model's per-node capacities and `no_victim`.
-- **Phase 1, host C++** through the existing `HostCopyBackend` and `DeviceSim` fixtures: the scout's ranking against a
+- **Phase 1, host C++** through the existing `HostCopyBackend` and `DeviceSim` fixtures: the scout's ranking and layer-wide budget against a
   torch reference gate on captured inputs (routes reproduced, as §18.4's self-check did); admission and the spec-share
   cap on a scripted tier; promotion; the in-flight cap under a demand arrival (the `inject`/`inject_fault` hooks delay
   a speculative leg and the test asserts the demand's delay bound); a failed speculative read; shutdown with legs in
   flight. Mutants that must be caught: release of a filling slot, a speculative submit during a demand read, publish
-  before vet, a victim taken from a filling slot, the cap ignored.
+  before vet, a victim taken from a filling slot, the cap ignored, a layer's budget exceeded, a candidate sent to
+  the wrong group.
 - **Python.** Option parsing and refusals, the launch gate, the metrics line.
 - **Full stack.** The expert-stream full-stack benchmark with the speculative reader on, bit-exact against off.
 
@@ -172,12 +196,12 @@ unused, failed, demand lanes delayed by a speculative leg, promotions. InstrBuil
 The standard 8-session `dspark-both` suite at 104 GiB through `analysis/dsv41-drive/dspark/both_cpu_ab.py`: arm
 `dspark-both` (A) against `dspark-both-prefetch` (B, the replay's best h and K), same run protocol as the row-weighted
 arms (private worktree, private `SGLANG_EXL3_BUILD_DIR`, counters off, extension path and hash logged). The fourth
-mirror is a separate pair, since it moves the same number. Acceptance: a median ms/token gain beyond the suite's
+mirror is a separate pair, since it moves the same number. Expected: 4-6 ms/token (Phase 0 result). Acceptance: a median ms/token gain beyond the suite's
 ~3% run-to-run spread, outputs within the near-tie band, RAM misses per token down, with `demand delayed` and
 `harmful evictions` reported. The default stays off until the owner accepts it for production.
 
 ## Out of scope
 
-Prefetch into VRAM; a device-side candidate kernel; next-token or frequency predictors; layer 0; the trained LLaPor
+Prefetch into VRAM; a device-side candidate kernel; lookahead beyond one layer; next-token or frequency predictors; layer 0; the trained LLaPor
 and APEX scorers (1.3-3.3 ms/token of in-graph scoring, and their capture refuses speculative decoding); any change to
 the demand reader's own issue order.
