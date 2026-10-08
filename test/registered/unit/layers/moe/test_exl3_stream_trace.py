@@ -565,3 +565,21 @@ def test_router_capture_refuses_a_different_token_count_and_a_ring_sized_after_r
     late._host = []  # a read already sized its pinned copies without the router rings
     with pytest.raises(RuntimeError, match="warmup forward"):
         late.record_router(0, *_router_input(0, 0, tokens=1))
+
+
+def test_load_forwards_marks_verify_forwards_and_keeps_their_router_record(tmp_path):
+    """A DSpark verify forward is a graph forward in phase target_verify with M tokens; the replay treats it as the
+    decode step, and its router capture record travels with it."""
+    path = tmp_path / "trace.jsonl"
+    lines = [
+        {"kind": "graph_routes_header", "schema": 3, "run": "r", "layer_ids": [0, 1], "hot_capacity": [4, 4]},
+        {"kind": "graph_routes", "schema": 3, "seq": 0, "forward_pass_id": 7, "phase": "target_verify",
+         "rids": ["a"], "forward_tokens": 6, "routes": [[1, 2], [3]], "misses": [1, 0], "router": 0},
+        {"kind": "graph_routes", "schema": 3, "seq": 1, "forward_pass_id": 8, "phase": "decode",
+         "rids": ["a"], "forward_tokens": 1, "routes": [[1], [3]], "misses": [0, 0]},
+    ]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    forwards = _tier_sim().load_forwards(str(path))["forwards"]
+    assert [f["verify"] for f in forwards] == [True, False]
+    assert [f["router"] for f in forwards] == [0, None]
+    assert forwards[0]["tokens"] == 6
