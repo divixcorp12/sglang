@@ -13,10 +13,12 @@ Tier: per layer two Tiers, ``round(rows * --node-share)`` slots for group 0 and 
 victim rule (lowest stamp, not hot, not wanted, not filling). Prefill forwards replay their admissions untimed.
 
 Predictors, issued at a layer's post for layer T + h of the same verify (there is no cross-step source):
-``oracle`` (the target's true forced misses), ``gate`` (verify_gate_rankings.py: every live token's top-depth at
-horizon h, ordered by best score, not hot / in RAM / filling), ``noisy`` (oracle rows right with probability p).
-``--budget`` speculative rows per layer, ``--k`` per live token, ``--spec-share`` unused rows a layer's group may hold,
-``--admit cold|mru``.
+``oracle`` (the target's true forced misses), ``gate`` (verify_gate_rankings.py: the union over live tokens of up
+to ``--k`` per token from its top-depth at horizon h, skipping hot / in RAM / filling rows, ordered by margin to the
+token's 6th score), ``noisy`` (oracle rows right with probability p). ``--budget`` speculative rows per layer,
+``--k`` per live token, ``--spec-share`` unused rows a layer's group may hold, ``--admit cold|mru``. At most
+``--inflight-rows`` speculative rows are submitted to the drive at once (the live RowReader's cap); the rest wait
+and are submitted as earlier ones land, and a demand for a waiting row submits it as a demand read.
 
 Report: per-step and per-token (``--accept`` tokens per verify) times, the gate per layer and group, RAM misses,
 speculative precision, late, harmful evictions, demand delay, NVMe busy, and gate percentiles for calibration.
@@ -29,6 +31,7 @@ import json
 import os
 import random
 import sys
+from collections import deque
 
 import numpy as np
 
@@ -73,6 +76,8 @@ class Replay:
         self.gates: list[float] = []
         self.per_step_gate: list[float] = []
         self.per_step_ms: list[float] = []
+        self.spec_backlog: deque = deque()
+        self.spec_inflight = 0
 
     def _next(self) -> int:
         self.tick += 1
@@ -105,10 +110,42 @@ class Replay:
         def on_done(j, tier=tier, slot=slot, expert=expert):
             if tier.slot_expert[slot] == expert and tier.job[slot] is j:
                 tier.ready[slot] = j["done"]
+            if j.pop("inflight", False):
+                self.spec_inflight -= 1
+                if self.spec_backlog:
+                    nxt = self.spec_backlog.popleft()
+                    nxt["t"] = max(nxt["t"], j["done"])
+                    self.submit_spec(nxt)
 
         job["on_done"] = on_done
-        self.nvme.submit(job)
+        if kind == "spec":
+            self.submit_spec(job)
+        else:
+            self.nvme.submit(job)
         return job
+
+    def submit_spec(self, job: dict) -> None:
+        cap = self.a.inflight_rows
+        if cap and self.spec_inflight >= cap:
+            job["held"] = True
+            self.spec_backlog.append(job)
+            return
+        job["held"] = False
+        job["inflight"] = True
+        self.spec_inflight += 1
+        self.nvme.submit(job)
+
+    def demand_filling(self, job: dict, now: float) -> None:
+        """A demand for a row still filling: promote its queued read, or submit a held one as a demand read."""
+        if job.get("held"):
+            self.spec_backlog.remove(job)
+            job["held"] = False
+            job["kind"] = "demand"
+            job["promoted"] = True
+            job["t"] = now
+            self.nvme.submit(job)
+            return
+        self.nvme.promote(job)
 
     def where(self, li: int, expert: int):
         tier = self.tiers[li][group_of(expert)]
@@ -118,21 +155,30 @@ class Replay:
     # ---- prediction
 
     def candidates(self, s: int, fwd, target_li: int) -> list[int]:
-        a = self.a
-        if a.predictor == "gate":
-            if not self.ranks["valid"][s, target_li, a.h]:
-                return []
-            order = self.ranks["order"][s, target_li, :, a.h, : a.depth]  # [M, depth]
-            score = self.ranks["score"][s, target_li, :, a.h, : a.depth]
-            best: dict[int, float] = {}
-            for m in range(int(self.ranks["tokens"][s])):
-                for e, sc in zip(order[m].tolist(), score[m].tolist()):
-                    if e >= 0 and sc > best.get(e, -1e30):
-                        best[e] = sc
-            return [e for e, _ in sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))]
-        if a.predictor in ("oracle", "noisy"):
+        if self.a.predictor in ("oracle", "noisy"):
             return list(dict.fromkeys(fwd["routes"][self.layer_ids[target_li]]))
         return []
+
+    def gate_choice(self, s: int, target_li: int, hot: set) -> list[int]:
+        """Up to k per live token, in its rank order, of rows not hot and not in RAM; the union ordered by margin."""
+        a = self.a
+        if not self.ranks["valid"][s, target_li, a.h]:
+            return []
+        order = self.ranks["order"][s, target_li, :, a.h]  # [M, npz depth]
+        score = self.ranks["score"][s, target_li, :, a.h]
+        if score.shape[-1] < 6:
+            raise ValueError("the rankings need depth >= 6 for the margin to the 6th score")
+        best: dict[int, float] = {}
+        for m in range(int(self.ranks["tokens"][s])):
+            sixth, picked = float(score[m, 5]), 0
+            for e, sc in zip(order[m, : a.depth].tolist(), score[m, : a.depth].tolist()):
+                if e < 0 or picked >= a.k:
+                    break
+                if e in hot or self.where(target_li, e)[1] is not None:
+                    continue
+                best[e] = max(best.get(e, -1e30), sc - sixth)
+                picked += 1
+        return [e for e, _ in sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))]
 
     def issue(self, s: int, fwd, li: int, now: float, budget: list) -> None:
         a = self.a
@@ -141,8 +187,10 @@ class Replay:
             return
         target_layer = self.layer_ids[target_li]
         hot = set(fwd["hot"][target_layer]) if fwd.get("hot") else set()
-        want = a.k * max(int(fwd.get("tokens", 1)), 1)
         chosen = []
+        if a.predictor == "gate":
+            chosen = self.gate_choice(s, target_li, hot)
+        want = a.k * max(int(fwd.get("tokens", 1)), 1)
         for e in self.candidates(s, fwd, target_li):
             if len(chosen) >= want:
                 break
@@ -200,7 +248,7 @@ class Replay:
                 tier.stamp[slot] = self._next()
                 if tier.ready[slot] > now:
                     job = tier.job[slot]
-                    self.nvme.promote(job)
+                    self.demand_filling(job, now)
                     landing[g].append(job)
                     self.st["spec_late"] += 1
                 else:
@@ -321,6 +369,7 @@ def parse(argv=None):
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--p", type=float, default=0.5)
     p.add_argument("--budget", type=int, default=4, help="speculative rows per layer")
+    p.add_argument("--inflight-rows", type=int, default=1, help="speculative rows on the drive at once; 0 uncaps")
     p.add_argument("--queue", default="prio", choices=["prio", "fifo"])
     p.add_argument("--admit", default="cold", choices=["mru", "cold"])
     p.add_argument("--spec-share", type=int, default=4)
