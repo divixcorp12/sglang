@@ -1254,6 +1254,7 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
         static_cast<const uint8_t*>(x.data_ptr()), x.size(0), x.size(1), static_cast<const uint16_t*>(w.data_ptr()),
         static_cast<const float*>(bias.data_ptr()), experts, hidden, static_cast<int>(top_k),
         static_cast<int>(per_token), static_cast<int>(per_layer), static_cast<const uint8_t*>(skip.data_ptr()), chosen);
+    if (n < 0 || n > per_layer) throw std::logic_error("score_gate: the scorer chose more than per_layer experts");
     auto* result = static_cast<int64_t*>(out.data_ptr());
     for (int i = 0; i < n; ++i)
       result[i] = chosen[i];
