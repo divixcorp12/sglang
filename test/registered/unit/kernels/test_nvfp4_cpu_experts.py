@@ -1,8 +1,8 @@
-"""The NVFP4 CPU expert kernel under its OpenMP team, through the expert-stream host's kernel test exports (Linux, GCC
-with OpenMP).
+"""The NVFP4 CPU expert kernel under its team (cpu_experts/team.hpp), through the expert-stream host's kernel test
+exports (Linux, GCC).
 
-Each case runs in its own process: the OpenMP environment is read when the team first forms. The child makes
-the sanitizer harness's 80 x 80 layer (every weight nibble 1.0, every scale 1.0) and prints one line per call.
+Each case runs in its own process: the ISA cap and a preloaded pin shim are process-wide. The child makes the sanitizer
+harness's 80 x 80 layer (every weight nibble 1.0, every scale 1.0) and prints one line per call.
 """
 
 import importlib.util
@@ -141,10 +141,6 @@ def _allowed(count):
 
 def test_a_later_forward_may_use_more_workers_than_the_first(library):
     assert _run(library, "1,3") == ["forward 1 0 written", "forward 3 0 written"]
-
-
-def test_a_team_smaller_than_requested_fails_the_forward_and_leaves_out_untouched(library):
-    assert _run(library, "4", OMP_THREAD_LIMIT="2") == ["forward 4 1 untouched"]
 
 
 def test_more_workers_than_cores_is_refused_and_leaves_out_untouched(library):
