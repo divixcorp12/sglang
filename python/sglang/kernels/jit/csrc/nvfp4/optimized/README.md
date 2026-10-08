@@ -107,17 +107,17 @@ blocks whose delta rounds to zero contribute zero.
 
 ## Threading and lifetime
 
-Each forward runs one OpenMP team of `threads` workers, the calling engine thread as worker 0, in four phases
-separated by barriers: every token's input to Q8_0; every routed expert's gate/up rows and SiLU; every intermediate to
-Q8_0; every expert's down rows, each token's summed in its routing order into its row of `out`. Create an engine
-Pass distinct Linux cores in the call's `cores`; worker i is pinned to cores[i] (once, then re-checked cheaply), and
-no cores runs unpinned workers. A forward may use any team size up to its cores (more is refused:
-`std::invalid_argument`). If OpenMP forms a smaller team (`OMP_THREAD_LIMIT`, `OMP_DYNAMIC`), the forward throws and
-leaves `out` untouched. For latency set `OMP_WAIT_POLICY=ACTIVE
-GOMP_SPINCOUNT=INFINITE OMP_DYNAMIC=FALSE` and leave `OMP_PROC_BIND` unset. Forwards on any cores run at once from
-different threads. The kernel's `keep_warm` holds the same pinned team in register-only work at the forward's vector
-width between calls. Stop/join the engine before freeing layers or slab storage; do not unload the library while the
-host holds its kernel's address. The kernel requires Linux and OpenMP.
+Each forward runs on a `Team` (`expert_stream/host/cpu_experts/team.hpp`) of `threads` workers, the calling thread
+as worker 0, in four phases separated by the team's barriers: every token's input to Q8_0; every routed expert's
+gate/up rows and SiLU; every intermediate to Q8_0; every expert's down rows, each token's summed in its routing order
+into its row of `out`. The CPU expert engine keeps one team for its lifetime and passes it to every forward; the
+two-argument `forward(layer, call)` (tests, the bench) makes a team for the call alone, pinning worker i to
+`cores[i]` (no cores: unpinned). A forward may use any team size up to its cores (more is refused:
+`std::invalid_argument`); a worker that cannot be pinned fails the call and leaves `out` untouched. No OpenMP
+variable reaches the team. Forwards on any cores run at once from different threads. Between jobs the engine's team
+runs the kernel's `warm` loop, register-only work at the forward's vector width, then PAUSE. Stop/join the engine
+before freeing layers or slab storage; do not unload the library while the host holds its kernel's address. The
+kernel requires Linux.
 
 The forward takes one `ForwardCall` (`kernel.hpp`, shared with the EXL3 kernel): up to 65536 token rows of up
 to eight lanes each. It skips -1 slots, preserves each row's routing order

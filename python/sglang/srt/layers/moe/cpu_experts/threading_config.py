@@ -160,7 +160,6 @@ class CoreSettings:
     sqpoll: bool = False  # SGLANG_EXPERT_STREAM_URING_MODE names a sqpoll mode
     sq_thread_cpu: Optional[int] = None  # SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU
     numa_cores: str = ""  # SGLANG_EXPERT_NUMA_CORES
-    omp_thread_limit: Optional[int] = None  # OMP_THREAD_LIMIT
     draft: bool = False  # SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS
     draft_cores: str = ""  # SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES; empty derives them on the GPU's node
     draft_threads: int = 0  # SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS, 0: no cap on the derived cores
@@ -215,7 +214,6 @@ class ThreadingConfig:
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.host_numa import parse_placement
 
-        limit = os.environ.get("OMP_THREAD_LIMIT")  # OpenMP's own variable, outside Envs
         settings = CoreSettings(
             cpu_experts=cpu_experts,
             cores=envs.SGLANG_DSV41_CPU_EXPERTS_CORES.get(),
@@ -224,7 +222,6 @@ class ThreadingConfig:
             sqpoll="sqpoll" in envs.SGLANG_EXPERT_STREAM_URING_MODE.get(),
             sq_thread_cpu=envs.SGLANG_EXPERT_STREAM_URING_SQ_THREAD_CPU.get(),
             numa_cores=envs.SGLANG_EXPERT_NUMA_CORES.get(),
-            omp_thread_limit=int(limit) if limit else None,
             draft=envs.SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS.get(),
             draft_cores=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_CORES.get(),
             draft_threads=envs.SGLANG_DSV41_DSPARK_CPU_EXPERTS_THREADS.get(),
@@ -324,12 +321,6 @@ class ThreadingConfig:
             _check_plan(plan, topology, affinity, settings)
             taken.update(s for c in plan.cores() for s in topology.siblings[c])
             plans.append(plan)
-        workers = sum(p.threads for p in plans)
-        if settings.omp_thread_limit is not None and settings.omp_thread_limit < workers:
-            raise ValueError(
-                f"OMP_THREAD_LIMIT={settings.omp_thread_limit} is below the {workers} CPU expert workers of all nodes; "
-                "two engines' teams run at once"
-            )
         draft: tuple[int, ...] = ()
         if settings.draft and not settings.cpu_experts:
             draft = tuple(named_draft) or _derive_draft(gpu, topology, affinity, settings, taken)

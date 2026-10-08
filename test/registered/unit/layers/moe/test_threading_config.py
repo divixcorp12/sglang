@@ -133,7 +133,6 @@ def test_a_server_affinity_covering_a_node_is_refused(divix01):
         ({"cores": "10-11,20-21"}, "two nodes"),
         ({"cores": "18-29", "nodes": (0,)}, "core 18 is on node 1"),
         ({"spin_core": 8}, "core 8 shares a physical core with the server's affinity"),
-        ({"omp_thread_limit": 16}, "OMP_THREAD_LIMIT"),
         ({"affinity": SERVER | frozenset(range(8, 18))}, "node 0 has no core .* for the copy thread"),
         ({"numa_cores": "1:ram=35,cpu=18-33,sq=34"}, "node 1 sets an SQPOLL core, but .* is not sqpoll"),
         (
@@ -230,7 +229,6 @@ def test_from_env_reads_every_core_setting(monkeypatch):
     monkeypatch.setattr(Topology, "from_sysfs", classmethod(lambda cls, root=tc.SYSFS: "topology"))
     monkeypatch.setattr(tc, "_affinity", lambda: frozenset({0, 1}))
     monkeypatch.setattr(tc, "gpu_numa_node", lambda device: None)
-    monkeypatch.setenv("OMP_THREAD_LIMIT", "24")
     with envs.SGLANG_DSV41_CPU_EXPERTS_CORES.override("18-29"), \
             envs.SGLANG_DSV41_CPU_EXPERTS_THREADS.override(4), \
             envs.SGLANG_DSV41_RAM_MISS_SPIN_CORE.override(17), \
@@ -249,7 +247,7 @@ def test_from_env_reads_every_core_setting(monkeypatch):
         "topology": "topology",
         "settings": CoreSettings(
             cpu_experts=True, cores="18-29", threads=4, spin_core=17, sqpoll=True, sq_thread_cpu=15,
-            numa_cores="1:ram=35,cpu=18-33", omp_thread_limit=24, draft=True, draft_cores="6-11", draft_threads=3,
+            numa_cores="1:ram=35,cpu=18-33", draft=True, draft_cores="6-11", draft_threads=3,
         ),
     }
 
