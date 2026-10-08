@@ -7,7 +7,8 @@
 //
 //   reader     read_rows, read_rows_traced, read_rows_faulted, read_rows_sqes, read_rows_pieces, piece_geometry,
 //              publish_piece: one synchronous read through the reader, with traces and injected faults
-//   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault, trace_clock_reads
+//   tier       pump, pump_group, slot_info, handled_through, victim_census, busy_episode, inject, inject_fault,
+//              trace_clock_reads, spec_place
 //   copy       copy_engine_idle, copy_engine_release, copy_engine_fail, copy_engine_marked, copy_engine_ballast
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
@@ -1175,6 +1176,17 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     }
   }
 
+  // Test only (RamTier::spec_place): lands `expert`'s row of `row` in a pool entry, as a speculative read does; returns
+  // the slot. InstrBuild only.
+  static int64_t spec_place(int64_t handle, int64_t row, int64_t expert) {
+    if constexpr (!Build::kFaults) {
+      (void)handle, (void)row, (void)expert;
+      test_only("spec_place");
+    } else {
+      return find(handle)->spec_place(row, expert);
+    }
+  }
+
   // Test only: a full ReadFault for the tier's reader (the reader tests' fault tensor; see RamTier::inject_fault).
   static void inject_fault(int64_t handle, TensorView fault) {
     if constexpr (!Build::kFaults) {
@@ -1253,5 +1265,6 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject, Exports::inject);                             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_fault, Exports::inject_fault);                 \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_group_stall, Exports::inject_group_stall);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_place, Exports::spec_place);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);

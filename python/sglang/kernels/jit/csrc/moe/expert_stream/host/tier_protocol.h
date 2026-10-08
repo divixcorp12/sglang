@@ -51,11 +51,24 @@ enum Counter : int {
   // CPU experts: CPU jobs (one per part of a record) and their lanes.
   kCpuJobs,
   kCpuLanes,
+  // RAM prefetch (ram_prefetch.h): speculative reads started, landed; pool rows a forced miss swapped in, and of those
+  // the ones whose read was still in flight (promoted); candidates dropped (stale, mapped or pooled since scoring, or
+  // a full ring); reads failed; demand reads that waited at the reader's turn for a speculative read.
+  kSpecIssued,
+  kSpecLanded,
+  kSpecUsed,
+  kSpecPromoted,
+  kSpecDropped,
+  kSpecFailed,
+  kSpecDelayed,
+  // ... the scorer's records scored and their scoring time in ns (metrics).
+  kSpecScored,
+  kSpecScoreNs,
   kCounterCount,
 };
 
 // True for the counters the production build keeps: the shutdown line's served, rows and errors, the admission
-// policy's outcomes, and the functional version.
+// policy's outcomes, the RAM prefetch's outcomes (a counters-off A/B reports them), and the functional version.
 constexpr bool is_core_counter(int k) {
   switch (k) {
     case kServedRequests:
@@ -69,6 +82,13 @@ constexpr bool is_core_counter(int k) {
     case kRunning:
     case kSpinCpu:
     case kRamInsertSkipped:
+    case kSpecIssued:
+    case kSpecLanded:
+    case kSpecUsed:
+    case kSpecPromoted:
+    case kSpecDropped:
+    case kSpecFailed:
+    case kSpecDelayed:
       return true;
     default:
       return false;

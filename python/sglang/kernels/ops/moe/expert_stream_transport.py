@@ -116,6 +116,7 @@ TEST_ONLY_EXPORTS: tuple[str, ...] = (
     "inject",
     "inject_fault",
     "inject_group_stall",
+    "spec_place",
     "copy_engine_fail",
     "copy_engine_ballast",
     "trace_clock_reads",
@@ -1102,10 +1103,21 @@ COUNTERS = (
     # CPU experts.
     "cpu_jobs",
     "cpu_lanes",
+    # RAM prefetch.
+    "spec_issued",
+    "spec_landed",
+    "spec_used",
+    "spec_promoted",
+    "spec_dropped",
+    "spec_failed",
+    "spec_delayed",
+    "spec_scored",
+    "spec_score_ns",
 )
 
 # The counters a production host keeps: the shutdown line's served, rows and errors,
-# the admission policy's outcomes, and the functional version, in ``COUNTERS`` order.
+# the admission policy's outcomes, the RAM prefetch's outcomes, and the functional
+# version, in ``COUNTERS`` order.
 # ``is_core_counter`` in ``host/tier_protocol.h`` defines the set and
 # ``expert_stream_core_counter_mask`` checks it. Every other counter is a metric the
 # production build does not compile: its ``counters()`` has no such key.
@@ -1121,6 +1133,13 @@ CORE_COUNTERS = (
     "running",
     "spin_cpu",
     "ram_insert_skipped",
+    "spec_issued",
+    "spec_landed",
+    "spec_used",
+    "spec_promoted",
+    "spec_dropped",
+    "spec_failed",
+    "spec_delayed",
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
@@ -2093,6 +2112,13 @@ class ExpertStreamHost:
         """Test only: NUMA group ``group``'s service thread sleeps ``seconds`` before it reads its next record."""
         _refuse_test_only("inject_group_stall", self.variant)
         self._module.expert_stream_inject_group_stall(self.handle, int(group), int(seconds * 1e9))
+
+    def spec_place(self, row: int, expert: int) -> int:
+        """Test only: land ``expert``'s row of ``row`` in an empty pool entry of its home group, as a speculative read
+        does, and return the slot. Paused or pumping only; nothing is mapped."""
+        _refuse_test_only("spec_place", self.variant)
+        self._check(row, expert)
+        return int(self._module.expert_stream_spec_place(self.handle, row, expert))
 
     def piece_runs(self) -> torch.Tensor:
         """Return the stream kernel's piece table.

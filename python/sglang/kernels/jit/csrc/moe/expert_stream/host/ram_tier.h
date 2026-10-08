@@ -1210,6 +1210,45 @@ class RamTier {
     }
   }
 
+  // Test only (InstrBuild): lands `expert`'s row of `row` in an empty pool entry of its home group, as a speculative
+  // read would, and returns the slot. On the owner; nothing is mapped or published.
+  int64_t spec_place(int64_t row, int64_t expert)
+    requires(Build::kFaults)
+  {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("spec_place");
+    row_capacity(row);
+    const std::string prefix = error_prefix<Layout>() + "spec_place: ";
+    if (pool_ == nullptr) throw std::runtime_error(prefix + "no speculative pool (reserve_spec_pool)");
+    if (expert < 0 || expert >= experts_) throw std::runtime_error(prefix + "expert out of range");
+    if (tiers_[row].expert_slot[expert] >= 0) throw std::runtime_error(prefix + "the tier maps the expert");
+    const int g = Wire::home(expert);
+    const int32_t id = static_cast<int32_t>(expert);
+    int i = -1;
+    int64_t slot = -1;
+    {
+      std::lock_guard<std::mutex> lock(pool_->mutex(g));
+      for (int k = 0; k < pool_->share() && i < 0; ++k)
+        if (pool_->entry(row, g, k).word.load(std::memory_order_relaxed) == kPoolEmpty) i = k;
+      if (i < 0) throw std::runtime_error(prefix + "no empty pool entry");
+      slot = pool_->entry(row, g, i).slot;
+      pool_->entry(row, g, i).word.store(pool_word(kPoolReading, id), std::memory_order_release);
+    }
+    std::vector<uint8_t> packed;
+    const int result = dist_.group(g).reader.read(
+        row, std::span<const int32_t>(&id, 1), std::span<const int64_t>(&slot, 1), 1, [](size_t) { return false; },
+        nullptr, &packed);
+    _mm_sfence();
+    PoolEntry& entry = pool_->entry(row, g, i);
+    if (result != 1) {
+      entry.word.store(kPoolEmpty, std::memory_order_release);
+      throw std::runtime_error(prefix + "the read failed");
+    }
+    entry.landed.store(pool_->next_landing(), std::memory_order_relaxed);
+    entry.word.store(pool_word(kPoolLanded, id), std::memory_order_release);
+    return slot;
+  }
+
   // Writes every counter with relaxed reads: a core counter is the sum of its writers' blocks (each word has one
   // writer; kSpinCpu is group 0's alone), a metric is stats_'s (always 0 in ProdBuild; Python reports only the core
   // counters of a production host).
@@ -1602,8 +1641,8 @@ class RamTier {
   }
 
   // An eager admission's slot, in the range of `expert`'s home group: a kFree one, else the LRU kReady one that is not
-  // hot, protected or filling, which is evicted; never kStaging. With `fallback`, a protected slot is evicted when
-  // nothing else qualifies. Returns -1 when no slot can be taken; `*evicted` is the displaced expert or -1.
+  // hot, protected or filling, which is evicted; never kStaging or kSpec. With `fallback`, a protected slot is evicted
+  // when nothing else qualifies. Returns -1 when no slot can be taken; `*evicted` is the displaced expert or -1.
   int64_t take_slot_locked(
       int64_t row, int64_t expert, std::span<const int32_t> protect, bool fallback, int64_t* evicted) {
     Tier& tier = tiers_[row];
@@ -1711,7 +1750,13 @@ class RamTier {
     FixedVec<int32_t, kWanted> wanted;
     FixedVec<int32_t, Wire::kLanes> missing;
     FixedVec<int64_t, Wire::kLanes> slots;
-    FixedVec<int32_t, Wire::kLanes> miss_lane;  // the lane index of each read row
+    FixedVec<int32_t, Wire::kLanes> miss_lane;  // the lane index of each miss
+    Wire::LaneMask pooled = 0;  // bit i: miss i was swapped in from the speculative pool and is not read
+    // With a pooled miss, the rows read_misses reads, in miss order, and each miss's read ordinal (-1: pooled).
+    FixedVec<int32_t, Wire::kLanes> read_experts;
+    FixedVec<int64_t, Wire::kLanes> read_slots;
+    FixedVec<int32_t, Wire::kLanes> read_lanes;
+    FixedVec<int32_t, Wire::kLanes> ordinal;
   };
 
   // The record's CPU-miss jobs still to submit, advanced as rows land.
@@ -1764,7 +1809,8 @@ class RamTier {
       };
       if (is_miss(lane.kind)) {
         if (lane.slot < 0) {
-          // A forced CPU miss (spill): no staging slot; reserve_victims_locked reads it into a RAM victim.
+          // A forced CPU miss (spill): no staging slot; reserve_victims_locked reads it into a RAM victim or swaps
+          // in its pool row.
           if (lane.kind != Wire::kKindMissCpu) fail(" is a GPU miss without a staging slot");
         } else {
           if (!listed(own.staging, lane.slot) || tier.state[lane.slot] != kStaging) fail(" is not a staging slot");
@@ -1866,6 +1912,22 @@ class RamTier {
     return misses;
   }
 
+  // A forced miss's pool row: when group g's pool of the row holds `expert` landed, the entry's slot is returned and
+  // the entry takes `victim` (empty) in its place; else -1 and the miss is read. Under the group's pool mutex.
+  int32_t take_pooled_locked(Group& group, const Request& request, int32_t expert, int32_t victim) {
+    const int g = group.index;
+    const int i = pool_->find(request.row, g, expert);
+    if (i < 0) return -1;
+    PoolEntry& entry = pool_->entry(request.row, g, i);
+    std::lock_guard<std::mutex> lock(pool_->mutex(g));
+    if (entry.word.load(std::memory_order_acquire) != pool_word(kPoolLanded, expert)) return -1;
+    const int32_t slot = entry.slot;
+    entry.slot = victim;
+    entry.word.store(kPoolEmpty, std::memory_order_release);
+    count<kSpecUsed>(group);
+    return slot;
+  }
+
   // Picks the victims and publishes the delta, before any read, so a served chain always has its delta published. A
   // miss lands in its staging slot whatever happens here; whether it is cached is the victim's question. inserted[i] is
   // set when miss i took a victim and is cached once read.
@@ -1874,9 +1936,9 @@ class RamTier {
     GroupRow& own = group.rows[request.row];
     DeltaReport part;
     part.staging = own.staging;
-    // Forced CPU misses first (spill, slot -1): each is read straight into a victim, which it takes over, so it is
-    // cached with no staging slot. The start-up capacity check (Exl3RamMissService.attach) leaves every node range a
-    // victim for each, so none missing is a broken invariant, not a skipped insert.
+    // Forced CPU misses first (spill, slot -1): each is read straight into a victim, which it takes over, or swapped in
+    // from the pool, so it is cached with no staging slot. The start-up capacity check (Exl3RamMissService.attach)
+    // leaves every node range a victim for each, so none missing is a broken invariant, not a skipped insert.
     bool placed[Wire::kLanes] = {};
     for (size_t i = 0; i < plan.missing.size(); ++i) {
       if (plan.slots[i] >= 0) continue;
@@ -1888,11 +1950,19 @@ class RamTier {
         part.entries[part.count][1] = -1;
         ++part.count;
       }
+      // A pooled row is mapped where it landed, and the victim takes its place in the pool.
+      const int32_t pooled =
+          pool_ != nullptr ? take_pooled_locked(group, request, plan.missing[i], static_cast<int32_t>(victim)) : -1;
+      const int64_t slot = pooled >= 0 ? pooled : victim;
       part.entries[part.count][0] = plan.missing[i];
-      part.entries[part.count][1] = static_cast<int32_t>(victim);
+      part.entries[part.count][1] = static_cast<int32_t>(slot);
       ++part.count;
-      tier.state[victim] = kStaging;  // being read; commit_inserted_locked makes it READY
-      plan.slots[i] = victim;
+      tier.state[slot] = kStaging;  // being read, or landed in the pool; commit_inserted_locked makes it READY
+      if (pooled >= 0) {
+        tier.state[victim] = kSpec;
+        plan.pooled |= Wire::LaneMask{1} << i;
+      }
+      plan.slots[i] = slot;
       placed[i] = true;
       inserted[i] = true;
     }
@@ -1924,6 +1994,19 @@ class RamTier {
       fail_record(request, "the row's previous map delta is not chain " + std::to_string(request.chain - 1));
   }
 
+  // The rows the record's misses read: a miss swapped in from the pool reads none.
+  static int64_t rows_read(const RecordPlan& plan) {
+    return static_cast<int64_t>(plan.missing.size()) - std::popcount(plan.pooled);
+  }
+
+  // True once miss i's row is in RAM: swapped in from the pool, or packed by the read (indexed by its read ordinal when
+  // some miss was pooled).
+  static bool miss_landed(const Group& group, const RecordPlan& plan, size_t i) {
+    if ((plan.pooled >> i & 1u) != 0) return true;
+    const size_t at = plan.pooled != 0 ? static_cast<size_t>(plan.ordinal[i]) : i;
+    return at < group.packed.size() && group.packed[at] != 0;
+  }
+
   // Submits the CPU misses whose rows landed since the last call as one part-1 job. Called from read()'s progress hook
   // and after the read. Every job after the record's first adds into the part.
   void submit_landed_cpu_misses(Group& group, const Request& request, const RecordPlan& plan, CpuMissBatch* misses) {
@@ -1937,7 +2020,7 @@ class RamTier {
     for (size_t i = 0; i < plan.missing.size(); ++i) {
       const Lane& lane = request.lanes[plan.miss_lane[i]];
       if (lane.kind != Wire::kKindMissCpu || (misses->sent >> i & 1u) != 0) continue;
-      if (!(i < group.packed.size() && group.packed[i] != 0)) continue;
+      if (!miss_landed(group, plan, i)) continue;
       cpu_job.slots[cpu_job.k] = static_cast<int32_t>(plan.slots[i]);
       cpu_job.weights[cpu_job.k] = lane.weight;
       cpu_job.lanes[cpu_job.k] = static_cast<int32_t>(plan.miss_lane[i]);
@@ -1951,12 +2034,45 @@ class RamTier {
     submit_cpu_job(group, request, cpu_job);
   }
 
-  // Reads the misses into their staging slots, each CPU miss going to the CPU as its row lands. Fail-stops on a failed
-  // read. Returns the stage status.
+  // Reads the misses into their staging slots, each CPU miss going to the CPU as its row lands. A miss swapped in from
+  // the speculative pool is not read and its CPU job goes first. Fail-stops on a failed read. Returns the stage status.
   int64_t read_misses(
-      Group& group, const Request& request, const RecordPlan& plan, CpuMissBatch* misses, StageRecord* cur) {
+      Group& group, const Request& request, RecordPlan& plan, CpuMissBatch* misses, StageRecord* cur) {
     group.packed.clear();
-    const bool publishing = init_piece_words_locked(group, request, plan.miss_lane, plan.idx);
+    const bool pooled = plan.pooled != 0;
+    if (pooled) {
+      for (size_t i = 0; i < plan.missing.size(); ++i) {
+        if ((plan.pooled >> i & 1u) != 0) {
+          plan.ordinal.push_back(-1);
+          continue;
+        }
+        plan.ordinal.push_back(static_cast<int32_t>(plan.read_experts.size()));
+        plan.read_experts.push_back(plan.missing[i]);
+        plan.read_slots.push_back(plan.slots[i]);
+        plan.read_lanes.push_back(plan.miss_lane[i]);
+      }
+      submit_landed_cpu_misses(group, request, plan, misses);
+    }
+    const std::span<const int32_t> experts = pooled ? plan.read_experts.span() : plan.missing.span();
+    const std::span<const int64_t> slots = pooled ? plan.read_slots.span() : plan.slots.span();
+    const std::span<const int32_t> lanes = pooled ? plan.read_lanes.span() : plan.miss_lane.span();
+    if (!experts.empty()) read_rows(group, request, plan, experts, slots, lanes, misses, cur);
+    submit_landed_cpu_misses(group, request, plan, misses);
+    if (misses->left != 0) fail_record(request, "a CPU miss's row never landed");
+    return kStatusServed;
+  }
+
+  // read_misses' demand read of `experts` into `slots` (`lanes` their record lanes), in read order.
+  void read_rows(
+      Group& group,
+      const Request& request,
+      const RecordPlan& plan,
+      std::span<const int32_t> experts,
+      std::span<const int64_t> slots,
+      std::span<const int32_t> lanes,
+      CpuMissBatch* misses,
+      StageRecord* cur) {
+    const bool publishing = init_piece_words_locked(group, request, lanes, plan.idx);
     bool fail_reads = false;
     if constexpr (Build::kFaults) {  // the test faults (inject, inject_fault): InstrBuild only
       apply_pending_fault(group);
@@ -1967,8 +2083,8 @@ class RamTier {
     if (fail_reads) fail_record(request, "a test fault failed the read");
     const int result = group.reader.read(
         request.row,
-        plan.missing,
-        plan.slots,
+        experts,
+        slots,
         kBounceRows,
         [](size_t) { return false; },
         cur,
@@ -1987,12 +2103,9 @@ class RamTier {
     }
     ++group.demands_read;
     _mm_sfence();  // the pieces' memcpy stores land before the mirror publishes them
-    submit_landed_cpu_misses(group, request, plan, misses);
-    if (misses->left != 0) fail_record(request, "a CPU miss's row never landed");
-    return kStatusServed;
   }
 
-  // Maps each read miss that took a victim into the tier and the host mirror.
+  // Maps each miss that took a victim (read, or swapped in from the pool) into the tier and the host mirror.
   void commit_inserted_locked(
       Group& group, Tier& tier, const Request& request, const RecordPlan& plan, const bool* inserted) {
     for (size_t i = 0; i < plan.missing.size(); ++i) {
@@ -2004,17 +2117,18 @@ class RamTier {
       publish_mirror(request.row, plan.missing[i], static_cast<int32_t>(plan.slots[i]));
     }
     // Any group adds, layer_rows reads lock-free: relaxed.
-    std::atomic_ref<int64_t>(tier.rows_demand)
-        .fetch_add(static_cast<int64_t>(plan.missing.size()), std::memory_order_relaxed);
+    const int64_t read = rows_read(plan);
+    std::atomic_ref<int64_t>(tier.rows_demand).fetch_add(read, std::memory_order_relaxed);
     count<kVersion>(group);
-    count<kRowsRead>(group, static_cast<int64_t>(plan.missing.size()));
+    count<kRowsRead>(group, read);
   }
 
   // Serves a record with lanes (analysis/dsv41-drive/LEASE_PROTOCOL.md, "The host per record"). The device typed every
   // lane from its copy of the map, so the host checks each against the tier and fail-stops on any disagreement.
   //
   // Order: stamps, checks, the copy job (hits start at once), victims and the map delta (before any read, so a served
-  // chain always has its delta published), then the misses' reads. Sets `*rows` to the number of rows read.
+  // chain always has its delta published), then the misses' reads. Sets `*rows` to the number of rows read: a miss
+  // swapped in from the pool reads none.
   void serve_record(Group& group, const Request& request, int64_t* rows) {
     StageRecord* const cur = stage_record(group);  // null in ProdBuild, so every `if (cur)` below folds away
     if (cur) cur->lanes = static_cast<int64_t>(request.lanes.size());
@@ -2031,14 +2145,15 @@ class RamTier {
     if (cur) cur->reserved = stamp(cur);
     const int64_t status = reads ? read_misses(group, request, plan, &misses, cur) : kStatusNoRead;
     if (reads) commit_inserted_locked(group, tier, request, plan, inserted);
+    const int64_t read = rows_read(plan);
     if (cur) {
       cur->mapped = stamp(cur);
       cur->row = request.row;
       cur->ok = 1;
       cur->status = status;
-      cur->rows = static_cast<int64_t>(plan.missing.size());
+      cur->rows = read;
     }
-    *rows = static_cast<int64_t>(plan.missing.size());
+    *rows = read;
   }
 
   // Stores piece_word(gen) into the readiness word of every kMissGpu lane, fences, and records those words as the
