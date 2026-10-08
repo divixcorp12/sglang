@@ -332,7 +332,8 @@ class GraphRouteLog:
             device = self.routes.device
             shape = (self.depth, self.layers, tokens)
             self.router_x = torch.zeros((*shape, hidden), dtype=torch.bfloat16, device=device)
-            self.router_ids = torch.zeros((*shape, topk), dtype=torch.int32, device=device)
+            # The router's own id dtype: a cast here would add a kernel to the captured graph.
+            self.router_ids = torch.zeros((*shape, topk), dtype=topk_ids.dtype, device=device)
             self.router_w = torch.zeros((*shape, topk), dtype=torch.float32, device=device)
         want = tuple(self.router_x.shape[-2:]), tuple(self.router_w.shape[-2:])
         if (tokens, hidden) != want[0] or (tokens, topk) != want[1]:
@@ -344,7 +345,7 @@ class GraphRouteLog:
             0, self.slot, x.reshape(1, tokens, hidden).to(torch.bfloat16)
         )
         self.router_ids[:, row].index_copy_(
-            0, self.slot, topk_ids.reshape(1, tokens, topk).to(torch.int32)
+            0, self.slot, topk_ids.reshape(1, tokens, topk).to(self.router_ids.dtype)
         )
         self.router_w[:, row].index_copy_(
             0, self.slot, topk_weights.reshape(1, tokens, topk).float()
