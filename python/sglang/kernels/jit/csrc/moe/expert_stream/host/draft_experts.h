@@ -108,14 +108,13 @@ class DraftExperts {
     source_.store(owned_.get(), std::memory_order_release);
   }
 
-  /// Host: stops the engine thread serving the channel (it finishes a job in progress and lets go of the source), then
-  /// opens the gate a wait still holds closed (no completer is left). Idempotent; after the engine thread exited, the
-  /// source is already let go of and stop() opens the gate (open_gate).
+  /// Host: stops the engine thread serving the channel (it finishes a job in progress and lets go of the source, or
+  /// has already, on its exit), then opens the gate a wait still holds closed (no completer is left). Idempotent.
   void detach() {
+    if (owned_ == nullptr) return;
     DraftSource* d = source_.load(std::memory_order_acquire);
     while (d != nullptr && d != detaching() && !source_.compare_exchange_weak(d, detaching(), std::memory_order_seq_cst)) {
     }
-    if (d == nullptr) return;
     while (source_.load(std::memory_order_acquire) != nullptr) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     channel::open_closed_gate<DraftChannel>(owned_->channel);
   }
