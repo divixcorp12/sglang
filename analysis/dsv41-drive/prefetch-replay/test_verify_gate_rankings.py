@@ -66,4 +66,6 @@ def test_live_tokens_only_are_ranked(tmp_path):
     W, bias = _gates()
     loaded, cap, _ = _capture(tmp_path, W, bias, [2])
     out = rank_verify(loaded, cap, W, bias, horizons=1, depth=TOPK)
-    assert (out["order"][0, :, 2] == -1).all() and (out["order"][0, :, :2] >= 0).all()
+    assert (out["order"][0, :, 2] == -1).all()
+    live = out["order"][0, :, :2].transpose(0, 2, 1, 3)  # [layers, H+1, live tokens, depth]
+    assert (live[out["valid"][0]] >= 0).all()  # target 0 at h=1 has no source layer and stays -1
