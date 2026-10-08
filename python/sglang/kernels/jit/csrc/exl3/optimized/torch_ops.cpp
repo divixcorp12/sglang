@@ -12,9 +12,10 @@
 namespace {
 int64_t kernel_address() { return reinterpret_cast<int64_t>(&::sglang::exl3_cpu::exl3_cpu_kernel()); }
 
-at::Tensor params(int64_t bits, int64_t swizzled)
+at::Tensor params(int64_t bits, int64_t swizzled, int64_t row_weighted)
 {
-    const SglangExl3CpuParams p{static_cast<int32_t>(bits), static_cast<int32_t>(swizzled)};
+    const SglangExl3CpuParams p{
+        static_cast<int32_t>(bits), static_cast<int32_t>(swizzled), static_cast<int32_t>(row_weighted)};
     at::Tensor out = at::empty({static_cast<int64_t>(sizeof(p))}, at::TensorOptions().dtype(at::kByte));
     std::memcpy(out.data_ptr(), &p, sizeof(p));
     return out;
@@ -32,7 +33,7 @@ int64_t chunk_m() { return ::sglang::exl3_cpu::exl3_cpu_chunk_m(); }
 TORCH_LIBRARY(sglang_exl3_cpu, m)
 {
     m.def("kernel_address() -> int", &kernel_address);
-    m.def("params(int bits, int swizzled) -> Tensor", &params);
+    m.def("params(int bits, int swizzled, int row_weighted) -> Tensor", &params);
     m.def("plan_calls() -> int[]", &plan_calls);
     m.def("chunk_m() -> int", &chunk_m);
 }

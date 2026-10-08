@@ -590,7 +590,7 @@ private:
                 float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_M * I_;
                 trace.add_work(worker, static_cast<int>(P), int64_t(t1 - t0) * ch.m);
                 run_tiles<I>(mat, p, tout, ch.m, t0, t1, grouped);
-            });
+            }, E.params.row_weighted != 0);
         }
         else if constexpr (P == Phase::Middle)
         {
@@ -632,7 +632,7 @@ private:
                             transform_owned_blocks<I>(E.down(ch.expert),tout,ch.m,b*8,b*8+8);
                     }
                 }
-            });
+            }, E.params.row_weighted != 0);
         }
         else
         {

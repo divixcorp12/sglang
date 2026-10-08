@@ -18,8 +18,10 @@ struct SglangExl3CpuPlanCalls {
 // in, w13 rows holding gate then up. hidden and intermediate are multiples of 128 in [128, 8192]; activation 0 (gated SiLU, clamped
 // at act_limit when it is nonzero). A layer stores views.
 struct SglangExl3CpuParams {
-    int32_t bits;      // trellis bits per weight, 1..8
-    int32_t swizzled;  // 0 or 1: band-contiguous trellis layout; make_layer stores 0 at 8 bits, never swizzled
+    int32_t bits;          // trellis bits per weight, 1..8
+    int32_t swizzled;      // 0 or 1: band-contiguous trellis layout; make_layer stores 0 at 8 bits, never swizzled
+    int32_t row_weighted;  // 0 or 1: the layer's gate/up and down tiles are split by chunk row count
+                           // (tile_assignment.hpp), the same arithmetic in another worker's hands
 };
 
 namespace sglang::exl3_cpu {

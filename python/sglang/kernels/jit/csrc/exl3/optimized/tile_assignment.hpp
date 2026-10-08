@@ -61,10 +61,13 @@ inline void assign_row_weighted_gemvs(int worker, int num_workers, int total, in
     }
 }
 
+// `weighted` is the layer's choice (SglangExl3CpuParams::row_weighted): one kernel serves the target's and the
+// draft's layers, so the choice travels with the layer. EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT, the bench's build
+// switch, weights every call.
 template <int Unit = 8, typename Rows, typename Gemv>
-inline void assign_plan_gemvs(int worker, int num_workers, int total, int tiles_n, Rows rows, Gemv gemv)
+inline void assign_plan_gemvs(int worker, int num_workers, int total, int tiles_n, Rows rows, Gemv gemv, bool weighted)
 {
-    if constexpr (EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT != 0)
+    if (EXL3_MOE_CPU_ROW_WEIGHTED_ASSIGNMENT != 0 || weighted)
         assign_row_weighted_gemvs<Unit>(worker, num_workers, total, tiles_n, rows, gemv);
     else
         assign_gemvs<Unit>(worker, num_workers, total, tiles_n, gemv);

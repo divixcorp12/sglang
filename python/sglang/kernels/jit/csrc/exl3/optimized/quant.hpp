@@ -74,6 +74,7 @@ struct Exl3Quant
     {
         if (p.bits < 1 || p.bits > 8 || (p.swizzled != 0 && p.swizzled != 1))
             return "bits must be in [1, 8] and swizzled 0 or 1";
+        if (p.row_weighted != 0 && p.row_weighted != 1) return "row_weighted must be 0 or 1";
         if (l.hidden < 128 || l.intermediate < 128 || l.hidden % 128 || l.intermediate % 128 || l.hidden > 8192
             || l.intermediate > 8192)
             return "hidden and intermediate must be multiples of 128 in [128, 8192]";

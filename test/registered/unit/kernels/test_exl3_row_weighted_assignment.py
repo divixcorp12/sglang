@@ -88,3 +88,57 @@ int main() { exercise<2>(); exercise<8>(); }
         check=True,
     )
     subprocess.run([str(executable)], check=True)
+
+
+def test_plan_assignment_is_chosen_per_call(tmp_path):
+    """The plan's entry takes the layer's choice at run time: false keeps the original mapping, true balances by rows.
+
+    One kernel serves the target's and the draft's layers, so the choice travels with the layer (its params), not
+    the build."""
+    header = MOE.parent / "exl3/optimized/tile_assignment.hpp"
+    source = tmp_path / "per_call.cpp"
+    source.write_text(
+        r'''
+#include "tile_assignment.hpp"
+#include <algorithm>
+#include <cassert>
+#include <vector>
+using namespace sglang::exl3_cpu;
+
+// Per-worker work units and ownership for the captured ten-chunk shape (chunk 0 holds two rows), gate and up.
+static std::vector<int> run(bool weighted, std::vector<int>* owners_out) {
+  std::vector<int> rows;
+  for (int j = 0; j < 10; ++j) for (int gu = 0; gu < 2; ++gu) rows.push_back(j == 0 ? 2 : 1);
+  const int tiles = 144, workers = 10;
+  std::vector<int> owners(rows.size() * tiles, -1), work(workers);
+  for (int w = 0; w < workers; ++w)
+    assign_plan_gemvs<8>(w, workers, rows.size(), tiles, [&](int j) { return rows[j]; },
+                         [&](int j, int a, int b) { for (int t = a; t < b; ++t) { owners[j * tiles + t] = w; work[w] += rows[j]; } },
+                         weighted);
+  for (int owner : owners) assert(owner >= 0);
+  if (owners_out) *owners_out = owners;
+  return work;
+}
+
+int main() {
+  std::vector<int> original_owners, weighted_owners;
+  auto a = run(false, &original_owners);
+  auto b = run(true, &weighted_owners);
+  assert(*std::max_element(a.begin(), a.end()) == 576);
+  assert(*std::max_element(b.begin(), b.end()) <= 336);
+  assert(original_owners != weighted_owners);
+  // false is the original partition, tile for tile.
+  std::vector<int> owners(original_owners.size(), -1);
+  for (int w = 0; w < 10; ++w)
+    assign_gemvs<8>(w, 10, 20, 144, [&](int j, int a, int b) { for (int t = a; t < b; ++t) owners[j * 144 + t] = w; });
+  assert(owners == original_owners);
+  return 0;
+}
+'''
+    )
+    executable = tmp_path / "per_call"
+    subprocess.run(
+        [os.environ.get("CXX", "c++"), "-std=c++20", "-O2", "-I", str(header.parent), str(source), "-o", str(executable)],
+        check=True,
+    )
+    subprocess.run([str(executable)], check=True)
