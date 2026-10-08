@@ -83,8 +83,9 @@ def load_forwards(path: str, *, allow_dropped: bool = False) -> dict:
 
     Returns ``run``, ``layer_ids``, ``hot_capacity`` per layer, ``hot_layer_ids``, ``dropped`` and
     ``forwards``, each ``{"kind": "graph"|"eager", "phase", "tokens", "rids", "forward_pass_id",
-    "misses": {layer: n}}`` plus, for a graph forward, ``seq``, ``routes: {layer: [ids]}`` and ``hot:
-    {layer: [ids]}`` (or None), and for an eager one ``forward`` and ``counts: {layer: (ids, counts)}``.
+    "misses": {layer: n}}`` plus, for a graph forward, ``seq``, ``routes: {layer: [ids]}``, ``hot:
+    {layer: [ids]}`` (or None), ``router`` (its router capture record, or None) and ``verify`` (a DSpark
+    target verify: the step of a speculative decode), and for an eager one ``forward`` and ``counts: {layer: (ids, counts)}``.
     """
     headers = []
     graph, eager, dropped = [], {}, 0
@@ -128,6 +129,8 @@ def load_forwards(path: str, *, allow_dropped: bool = False) -> dict:
             "routes": dict(zip(layer_ids, line["routes"])),
             "misses": dict(zip(layer_ids, line["misses"])),
             "hot": dict(zip(hot_layer_ids, hot)) if hot is not None else None,
+            "router": line.get("router"),
+            "verify": line.get("phase") == "target_verify",
         }))
     for forward, calls in eager.items():
         seqs = {call.get("graph_seq") for call in calls}
