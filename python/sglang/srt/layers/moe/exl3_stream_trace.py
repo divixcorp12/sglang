@@ -82,7 +82,7 @@ RAM_MISS_TRACE_SCHEMA = 7
 #    keeps its meaning.
 ROUTE_LOG_SCHEMA = 2
 # The RouterCapture side files' own layout; <prefix>.json states it.
-ROUTER_CAPTURE_SCHEMA = 1
+ROUTER_CAPTURE_SCHEMA = 2
 
 
 def _stream_capturing() -> bool:
@@ -95,13 +95,16 @@ class RouterCapture:
 
     One record per forward, in ``seq`` order, appended by ``GraphRouteLog``:
 
-    * ``<prefix>.x.bin``: bf16 ``[records, layers, hidden]`` (raw little-endian
-      16-bit words), each streamed layer's normalized MoE input as its gate saw it.
-    * ``<prefix>.w.bin``: fp32 ``[records, layers, topk]``, the top-k weights in
-      route order.
-    * ``<prefix>.seq.bin``: int64 ``[records, 2]``, the forward's ``seq`` and pass
-      id, the keys of its ``graph_routes`` line (which names the record as
-      ``router``).
+    * ``<prefix>.x.bin``: bf16 ``[records, layers, tokens, hidden]`` (raw
+      little-endian 16-bit words), each streamed layer's normalized MoE input as its
+      gate saw it, for every token row of the graph (``tokens`` is the graph's width).
+    * ``<prefix>.ids.bin``: int32 ``[records, layers, tokens, topk]``, the top-k ids.
+    * ``<prefix>.w.bin``: fp32 ``[records, layers, tokens, topk]``, the top-k
+      weights in route order.
+    * ``<prefix>.seq.bin``: int64 ``[records, 3]``, the forward's ``seq``, pass id
+      and live token count; the first two are the keys of its ``graph_routes`` line
+      (which names the record as ``router``), and rows past the live count are the
+      graph's padding.
     * ``<prefix>.json``: the shapes and layer ids. The record count is the files'
       size.
     """
@@ -116,21 +119,27 @@ class RouterCapture:
         log: GraphRouteLog,
         seq: int,
         pass_id: int,
+        tokens: int,
         x: torch.Tensor,
+        ids: torch.Tensor,
         weights: torch.Tensor,
     ) -> int:
         """Append one forward's record for ``log``; returns its record number.
 
-        The first call writes the ``.json`` header and opens the data files.
+        ``x`` is ``[layers, M_max, hidden]``, ``ids`` and ``weights`` ``[layers, M_max, topk]``; ``tokens`` is the
+        forward's live count, the rows past it being the graph's padding. The first call writes the ``.json``
+        header and opens the data files.
         """
         if self._files is None:
             header = {
                 "schema": ROUTER_CAPTURE_SCHEMA,
                 "run": log.run,
                 "layer_ids": list(log.layer_ids),
+                "tokens": int(x.shape[-2]),
                 "hidden": int(x.shape[-1]),
                 "topk": int(weights.shape[-1]),
                 "x_dtype": "bfloat16",
+                "ids_dtype": "int32",
                 "w_dtype": "float32",
                 "depth": log.depth,
             }
@@ -138,13 +147,14 @@ class RouterCapture:
                 json.dump(header, f)
             self._files = [
                 open(self.prefix + suffix, "ab")
-                for suffix in (".x.bin", ".w.bin", ".seq.bin")
+                for suffix in (".x.bin", ".ids.bin", ".w.bin", ".seq.bin")
             ]
-        x_file, w_file, seq_file = self._files
+        x_file, ids_file, w_file, seq_file = self._files
         x_file.write(x.contiguous().view(torch.int16).numpy().tobytes())
+        ids_file.write(ids.contiguous().to(torch.int32).numpy().tobytes())
         w_file.write(weights.contiguous().numpy().tobytes())
         seq_file.write(
-            torch.tensor([seq, pass_id], dtype=torch.int64).numpy().tobytes()
+            torch.tensor([seq, pass_id, tokens], dtype=torch.int64).numpy().tobytes()
         )
         self.records += 1
         return self.records - 1
@@ -184,8 +194,8 @@ class GraphRouteLog:
     ``dropped_before``; a replay must refuse such a run. ``final`` (after shutdown's
     device barrier) reads everything.
 
-    ``enable_router`` adds two rings on the same slots: ``record_router`` copies each
-    layer's router input and top-k weights into them, and every emitted forward is
+    ``enable_router`` adds three rings on the same slots: ``record_router`` copies each
+    layer's router input, top-k ids and top-k weights for every token into them, and every emitted forward is
     also written to the RouterCapture side files. Without it no router tensor exists
     and nothing calls ``record_router``.
 
@@ -225,6 +235,7 @@ class GraphRouteLog:
         self._pending = False
         self.router: Optional[RouterCapture] = None
         self.router_x: Optional[torch.Tensor] = None
+        self.router_ids: Optional[torch.Tensor] = None
         self.router_w: Optional[torch.Tensor] = None
 
     def bind(self, row: int, layer_id: int, capacity: int) -> None:
@@ -244,7 +255,7 @@ class GraphRouteLog:
         )
 
     def enable_router(self, prefix: str) -> None:
-        """Also capture each layer's router input and top-k weights into ``prefix`` files.
+        """Also capture each layer's router input, top-k ids and weights into ``prefix`` files.
 
         The rings are sized by the first ``record_router`` call, a warmup forward's.
         """
@@ -302,37 +313,41 @@ class GraphRouteLog:
         self.misses[:, row].index_copy_(0, self.slot, count.reshape(-1)[:1])
 
     def record_router(
-        self, row: int, x: torch.Tensor, topk_weights: torch.Tensor
+        self, row: int, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor
     ) -> None:
-        """Log one layer's router input and top-k weights (one token) into the slot.
+        """Log one layer's router input, top-k ids and weights for every token of the forward into the slot.
 
         Captured in the graph. Must follow the layer's ``record``: row 0's takes the
-        slot.
+        slot. The rings take the first call's token count: a graph is captured at its
+        widest verify, so every replay writes that many rows and the live count travels
+        in the forward's meta.
         """
+        tokens, hidden = int(x.shape[0]) if x.dim() > 1 else 1, int(x.shape[-1])
+        topk = int(topk_weights.shape[-1])
         if self.router_x is None:
             if _stream_capturing() or self._host is not None:
                 raise RuntimeError(
                     "the router rings must be allocated by a warmup forward, before capture and reads"
                 )
             device = self.routes.device
-            shape = (self.depth, self.layers)
-            self.router_x = torch.zeros(
-                (*shape, x.shape[-1]), dtype=torch.bfloat16, device=device
-            )
-            self.router_w = torch.zeros(
-                (*shape, topk_weights.shape[-1]), dtype=torch.float32, device=device
-            )
-        hidden, topk = self.router_x.shape[-1], self.router_w.shape[-1]
-        if x.numel() != hidden or topk_weights.numel() != topk:
+            shape = (self.depth, self.layers, tokens)
+            self.router_x = torch.zeros((*shape, hidden), dtype=torch.bfloat16, device=device)
+            self.router_ids = torch.zeros((*shape, topk), dtype=torch.int32, device=device)
+            self.router_w = torch.zeros((*shape, topk), dtype=torch.float32, device=device)
+        want = tuple(self.router_x.shape[-2:]), tuple(self.router_w.shape[-2:])
+        if (tokens, hidden) != want[0] or (tokens, topk) != want[1]:
             raise ValueError(
-                f"router capture holds one token of [{hidden}] and [{topk}], got {tuple(x.shape)} and "
-                f"{tuple(topk_weights.shape)}"
+                f"router capture holds {want[0][0]} tokens of [{want[0][1]}] and [{want[1][1]}], got "
+                f"{tokens} tokens of {tuple(x.shape)} and {tuple(topk_weights.shape)}"
             )
         self.router_x[:, row].index_copy_(
-            0, self.slot, x.reshape(1, hidden).to(torch.bfloat16)
+            0, self.slot, x.reshape(1, tokens, hidden).to(torch.bfloat16)
+        )
+        self.router_ids[:, row].index_copy_(
+            0, self.slot, topk_ids.reshape(1, tokens, topk).to(torch.int32)
         )
         self.router_w[:, row].index_copy_(
-            0, self.slot, topk_weights.reshape(1, topk).float()
+            0, self.slot, topk_weights.reshape(1, tokens, topk).float()
         )
 
     def read_seq(self) -> int:
@@ -346,7 +361,11 @@ class GraphRouteLog:
         """The device buffers read back together, ``seq`` first."""
         ring = [self.seq, self.routes, self.misses, self.pass_ids]
         ring += [self.hot] if self.hot is not None else []
-        ring += [self.router_x, self.router_w] if self.router_x is not None else []
+        ring += (
+            [self.router_x, self.router_ids, self.router_w]
+            if self.router_x is not None
+            else []
+        )
         return ring
 
     def tensors(self) -> list[torch.Tensor]:
@@ -399,7 +418,9 @@ class GraphRouteLog:
             self._header_written = True
         seq_tensor, routes, misses, pass_ids = ring[:4]
         hot = ring[4] if self.hot is not None else None
-        router_x, router_w = ring[-2:] if self.router_x is not None else (None, None)
+        router_x, router_ids, router_w = (
+            ring[-3:] if self.router_x is not None else (None, None, None)
+        )
         seq = int(seq_tensor[0])
         end = seq if complete else seq - 1
         start = max(self.next_seq, self.warmup)
@@ -416,7 +437,13 @@ class GraphRouteLog:
             record = None
             if router_x is not None:
                 record = self.router.write(
-                    self, s, pass_id, router_x[slot], router_w[slot]
+                    self,
+                    s,
+                    pass_id,
+                    int((meta or {}).get("tokens", 0)) or router_x.shape[-2],
+                    router_x[slot],
+                    router_ids[slot],
+                    router_w[slot],
                 )
             trace.record_graph_route_step(
                 s,
