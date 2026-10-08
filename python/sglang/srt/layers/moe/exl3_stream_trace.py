@@ -334,9 +334,10 @@ class GraphRouteLog:
         """Log one layer's router input, top-k ids and weights for every token of the forward into the slot.
 
         Captured in the graph. Must follow the layer's ``record``: row 0's takes the
-        slot. The rings take the first call's token count: a graph is captured at its
-        widest verify, so every replay writes that many rows and the live count travels
-        in the forward's meta.
+        slot. The rings take the first call's token count, the verify graph's width; a
+        narrower graph forward through the same layers (a one-token prefill warmup or
+        decode) writes only its first rows, and every forward's live count travels in
+        its meta.
         """
         tokens, hidden = int(x.shape[0]) if x.dim() > 1 else 1, int(x.shape[-1])
         topk = int(topk_weights.shape[-1])
@@ -351,19 +352,20 @@ class GraphRouteLog:
             # The router's own id dtype: a cast here would add a kernel to the captured graph.
             self.router_ids = torch.zeros((*shape, topk), dtype=topk_ids.dtype, device=device)
             self.router_w = torch.zeros((*shape, topk), dtype=torch.float32, device=device)
-        want = tuple(self.router_x.shape[-2:]), tuple(self.router_w.shape[-2:])
-        if (tokens, hidden) != want[0] or (tokens, topk) != want[1]:
+        width = self.router_x.shape[-2]
+        if tokens > width or hidden != self.router_x.shape[-1] or topk != self.router_w.shape[-1]:
             raise ValueError(
-                f"router capture holds {want[0][0]} tokens of [{want[0][1]}] and [{want[1][1]}], got "
-                f"{tokens} tokens of {tuple(x.shape)} and {tuple(topk_weights.shape)}"
+                f"router capture holds {width} tokens of [{self.router_x.shape[-1]}] and "
+                f"[{self.router_w.shape[-1]}], got {tokens} tokens of {tuple(x.shape)} and "
+                f"{tuple(topk_weights.shape)}"
             )
-        self.router_x[:, row].index_copy_(
+        self.router_x[:, row, :tokens].index_copy_(
             0, self.slot, x.reshape(1, tokens, hidden).to(torch.bfloat16)
         )
-        self.router_ids[:, row].index_copy_(
+        self.router_ids[:, row, :tokens].index_copy_(
             0, self.slot, topk_ids.reshape(1, tokens, topk).to(self.router_ids.dtype)
         )
-        self.router_w[:, row].index_copy_(
+        self.router_w[:, row, :tokens].index_copy_(
             0, self.slot, topk_weights.reshape(1, tokens, topk).float()
         )
 
