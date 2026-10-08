@@ -2,6 +2,7 @@
 // its own accessor (TOY_KERNEL): the CpuExpertKernel interface crosses the .so boundary. Built by
 // test_cpu_experts_common.py.
 #include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/kernel.hpp"
+#include "../../../../python/sglang/kernels/jit/csrc/moe/expert_stream/host/cpu_experts/team.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>

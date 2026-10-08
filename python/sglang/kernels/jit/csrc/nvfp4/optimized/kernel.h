@@ -1,7 +1,7 @@
 // The NVFP4 CPU expert kernel of this library (kernel.cpp): the CpuExpertKernel the tvm-ffi export
 // nvfp4_cpu_kernel_address hands to Python, and the one the benches link.
 #pragma once
-#include "../../moe/expert_stream/host/cpu_experts/kernel.hpp"
+#include "../../moe/expert_stream/host/cpu_experts/team.hpp"
 #include <cstdint>
 
 // A layer's params: make_layer's `params` bytes are this struct, as the library's tvm-ffi export nvfp4_cpu_params

@@ -2,7 +2,7 @@
 // sglang_exl3_cpu::kernel_address op hands to Python, and the one the benches link. Its layers are slab layers only
 // (make_layer); upstream's per-expert tensor API (exl3_moe_cpu_make_layer and its forwards) refuses.
 #pragma once
-#include "../../moe/expert_stream/host/cpu_experts/kernel.hpp"
+#include "../../moe/expert_stream/host/cpu_experts/team.hpp"
 #include <cstdint>
 
 // Forwards since load by the plan they took (forward_plan.hpp's run_plan): dsv41, ForwardPlan<Dsv41Shape, Bw>;
