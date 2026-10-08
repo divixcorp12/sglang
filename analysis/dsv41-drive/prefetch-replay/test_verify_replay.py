@@ -142,3 +142,11 @@ def test_a_demand_on_a_row_held_behind_the_in_flight_cap_is_read_at_once_and_is_
     out = _run([_verify(0, {0: [0], 1: [2, 4]})], ram_rows=ROWS, gpu_ms=0.0, step_ms=0.0, predictor="oracle", h=1,
                k=1, nvme_row_ms=50.0, miss_job_ms=1.0)
     assert out["late_per_step"] == 2 and out["ram_misses_per_step"] == 1
+
+
+def test_the_speculative_budget_is_per_layer_not_per_step():
+    """--budget caps the speculative rows issued at each layer's post: with a budget of 1, layers 0 and 1 each
+    prefetch their next layer's miss."""
+    out = _run([_verify(0, {0: [0], 1: [2], 2: [4]})], ram_rows=ROWS, gpu_ms=3.0, step_ms=0.0, predictor="oracle",
+               h=1, k=1, budget=1)
+    assert out["spec_rows_per_step"] == 2 and out["budget_capped_per_step"] == 0
