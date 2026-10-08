@@ -131,16 +131,27 @@ def test_the_kernel_refuses_a_row_weighted_value_other_than_0_or_1():
         es.kernel_layer(trait.kernel_address(), dataclasses.replace(spec, params=struct.pack("<iii", 3, 0, 2)), variant="prod")
 
 
-# Six rows whose chunks hold one and two rows: the shape on which row weighting moves tiles between workers
-# (test_exl3_row_weighted_assignment). k=1 puts two rows on expert 0; k=3 repeats experts across rows as a draft call does.
+def _seeded_routes(seed, rows, k):
+    g = torch.Generator().manual_seed(seed)
+    slots = [sorted(torch.randperm(CAP, generator=g)[:k].tolist()) for _ in range(rows)]
+    weights = [torch.softmax(torch.randn(k, generator=g), 0).tolist() for _ in range(rows)]
+    return slots, weights
+
+
+# Shapes whose chunks hold different row counts: the ones on which row weighting moves tiles between workers
+# (test_exl3_row_weighted_assignment). Six rows as a verify, five as a draft block; experts repeated across rows as
+# the DSpark calls repeat them, plus seeded random routing.
 MIXED_ROUTES = [
     ([[0], [0], [1], [2], [3], [4]], [[1.0]] * 6),
     ([[0, 1, 2], [0, 3, 4], [1, 2, 5], [3, 4, 5], [1, 3, 0], [2, 4, 5]], [[0.5, 0.3, 0.2]] * 6),
+    ([[0, 1, 2], [0, 3, 4], [1, 2, 5], [3, 4, 5], [0, 1, 2]], [[0.5, 0.3, 0.2]] * 5),
+    _seeded_routes(20261008, 5, 3),
+    _seeded_routes(20261009, 6, 4),
 ]
 
 
 @pytest.mark.parametrize("slots, weights", MIXED_ROUTES)
-@pytest.mark.parametrize("threads", [2, 4])
+@pytest.mark.parametrize("threads", [2, 4, 10])
 def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slots, weights, threads):
     """Row weighting changes which worker owns an output tile (tile_assignment.hpp), never a tile's arithmetic: on
     the production build, a layer made with row_weighted gives the original layer's output bit for bit, through the
@@ -149,7 +160,10 @@ def test_a_row_weighted_layer_matches_the_original_bit_for_bit(monkeypatch, slot
     from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
 
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
-    trait, cores = _kernel()
+    trait, _ = _kernel()
+    if len(CORES) < threads:
+        pytest.skip(f"needs {threads} cores in the affinity mask")
+    cores = CORES[:threads]  # ten workers: a serving group's team
     weighted = Exl3CpuQuantTrait(trait.ext, act_limit=LIMIT, row_weighted=True)
     slabs = _random_slabs(20261008, HIDDEN, INTER)
     layers = {

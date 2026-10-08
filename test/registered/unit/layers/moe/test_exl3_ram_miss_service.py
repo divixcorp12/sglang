@@ -1504,7 +1504,7 @@ def test_a_streamer_without_top_k_is_refused_by_name_under_cpu_experts(monkeypat
     service start, not an AttributeError out of the token count."""
     from sglang.srt.layers.moe.cpu_experts import service as cpu_service
 
-    monkeypatch.setattr(cpu_service, "cpu_trait_for", lambda key: SimpleNamespace(hidden_size=lambda slabs: 8))
+    monkeypatch.setattr(cpu_service, "cpu_trait_for", lambda key, *, source: SimpleNamespace(hidden_size=lambda slabs: 8))
     cfg = SimpleNamespace(enable_ram_miss_copy_engine=True, enable_layer_fusion=True)
     streamers = {
         3: SimpleNamespace(
