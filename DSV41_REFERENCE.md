@@ -7386,6 +7386,33 @@ is 6.75 ms/token (7.6%), against 8.2 (9.6%) before.
   stayed within 1.5 ms/token of the first run. The "do not flip" verdict does not rest on the one-token calibration.
   The hot-cache difference (budget A) is still unseparated.
 
+**§33.11 addendum 2: calibration at the served token multiplicity (2026-10-08).** The 6-token table routed every
+verify token to every calibration lane, three kernel chunks per lane at `CHUNK_M=2`, where the target's served CPU
+jobs carry 1.23 tokens per lane: the `cpu_shape` events (rows, lanes, live routes) of two production captures,
+`persistent-team-stall-20261008` (hit jobs: 20,295 / 19,582 lanes on nodes 0 / 1, mean 1.227 / 1.238, 46% of jobs with
+every lane at one token, 2.7% averaging above 2; forced-miss jobs 1.158 / 1.151) and `no-nsys-stall-20261007`
+(1.211 / 1.217). That priced the CPU at about 3x the link. `12c13f64ee` (`calibration_lane_mask`) routes lane j by
+token j % tokens and every fourth lane by the next token too, 1.25 tokens per lane, one chunk each. A/B on divix01,
+`dspark-both` only, budget A, the same 8 sessions, the two arms back to back on an idle GPU, one run each
+(`/data/models/slang/nvfp4-work/calibration-mask-ab/{new,old,findings.md}`): `new` = `wt-calibration-mask` @
+`12c13f64ee`, `old` = `wt-persistent-team` @ `282074649e` (master's code), both `rc=0`, no fail-stop, `__trap`, CUDA
+error, out of memory or Traceback.
+
+| Arm | cpu ms k=1 / k=8 (g0) | split n=0..8 (both nodes) | ms/token median | mean | accept length | reverify_ct |
+|---|---|---|---|---|---|---|
+| `old` (6 tokens routed) | 1.73 / 14.51 | `0 0 1 1 1 2 2 2 3` | 98.54 | 103.8 | 3.587 | 9 |
+| `new` (1.25 tokens/lane) | 0.43 / 4.67 | `0 1 2 2 3 3 4 5 5` | 98.38 | 105.5 | 3.429 | 9 |
+
+Per-session ms/token, sessions 0-7: `new` 139.3, 97.7, 61.8, 145.7, 86.1, 99.1, 78.7, 135.8; `old` 133.0, 74.9, 60.8,
+144.6, 83.5, 106.8, 90.3, 136.5 (differences -11.6 to +22.8). The link measured 0.97 ms/expert in both. The served
+cost per lane was 0.62 / 0.59 ms (`new`) against 0.615 / 0.610 (`old`), and at the same job count (~21.4-21.9k per
+node) the CPU served 53.8k / 53.0k lanes against 41.4k / 40.7k: 27% more victim lanes on the CPU, and decode did
+not move (median -0.16 ms/token, inside the per-session spread). Second A/B in which a large split move left
+ms/token unchanged (the first: 5 -> 2-3 CPU lanes at n = 8, above): at this load the target's split is not on the
+decode critical path, since the CPU work overlaps the transfers and not the GPU expert pass that follows the copy
+wait (`docs/superpowers/plans/2026-10-07-dsv41-cpu-calibration-experiment.md`, "Verified starting point"). The
+calibration now prices a lane at its served cost; the throughput lever is elsewhere.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).
