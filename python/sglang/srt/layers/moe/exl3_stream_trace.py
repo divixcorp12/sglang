@@ -90,6 +90,21 @@ def _stream_capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
+def _verify_tokens(forward_batch) -> int:
+    """A target verify's live token count, the graph's padding excluded.
+
+    init_new leaves ``extend_num_tokens`` None for a verify; only the DSpark verify
+    layout knows how many rows are real. Its host copy is used when the planner kept
+    one; otherwise the device lengths are read, a sync this diagnostic path accepts.
+    """
+    layout = getattr(forward_batch.spec_info, "ragged_verify_layout", None)
+    if layout is None:
+        return 0
+    if layout.verify_lens_cpu is not None:
+        return int(sum(layout.verify_lens_cpu))
+    return int(layout.verify_lens.sum())
+
+
 class RouterCapture:
     """Binary side files of every graph forward's router input.
 
@@ -272,11 +287,12 @@ class GraphRouteLog:
         forward is queued, on its stream, outside any capture.
         """
         mode = forward_batch.forward_mode
-        tokens = (
-            forward_batch.extend_num_tokens
-            if mode.is_extend()
-            else forward_batch.batch_size
-        )
+        if not mode.is_extend():
+            tokens = forward_batch.batch_size
+        elif mode.is_target_verify():
+            tokens = _verify_tokens(forward_batch)
+        else:
+            tokens = forward_batch.extend_num_tokens
         meta = {
             "forward_pass_id": int(forward_pass_id),
             "phase": mode.name.lower(),
@@ -441,7 +457,7 @@ class GraphRouteLog:
                     self,
                     s,
                     pass_id,
-                    int((meta or {}).get("tokens", 0)) or router_x.shape[-2],
+                    int((meta or {}).get("tokens", 0)),
                     router_x[slot],
                     router_ids[slot],
                     router_w[slot],
