@@ -4,7 +4,8 @@
 * ``DraftCpuAreas`` owns the channel buffer and the per-stage pinned areas the host thread reads and writes;
 * ``DraftCpuDevice`` queues the device half: ``post`` (stage the CPU share, publish a record) and ``finish`` (close the
   gate, the stream's wait, add the host's rows). Both are device-only, so a graph captures them;
-* ``DraftCpuHost`` runs the host half, the draft-only CPU expert engine (host/cpu_experts.h), in the expert-stream host module;
+* ``DraftCpuHost`` runs the host half, the draft-only CPU expert engine (host/cpu_experts.h, its draft source host/draft_experts.h), in the
+  expert-stream host module;
 * ``SharedDraftHost`` serves the channel from an ``ExpertStreamHost`` group's CPU expert engine instead (one team per node).
 
 The protocol is the lease channel's (LEASE_PROTOCOL.md, "The lease channel"); only the record and the areas are the

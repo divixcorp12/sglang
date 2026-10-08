@@ -30,7 +30,8 @@ One `Team` per engine, owned by the engine thread for its lifetime (`host/cpu_ex
 - Between jobs the workers run the kernel's register-work loop (`keep_warm.hpp`, unchanged code) for `keep_warm_ns`
   after each job and PAUSE after that, watching the job word. They never sleep and never leave the team.
 - The engine thread idles the same way on its submit word, a quantum (`kIdleQuantumNs`, 2 us) at a time, and between
-  quanta re-reads the target ring, the draft head, `stop_` and `draft_detach_`. Nothing in the engine sleeps.
+  quanta re-reads the target ring, the draft source word and head (`draft_experts.h`) and `stop_`. Nothing in the
+  engine sleeps.
 
 The kernel vtable (`kernel.hpp`) becomes `forward(layer, call, Team&)` plus `warm(word, seen, deadline)`; a
 non-virtual `forward(layer, call)` builds a team for the call alone (tests, bench, harnesses). `keep_warm`,

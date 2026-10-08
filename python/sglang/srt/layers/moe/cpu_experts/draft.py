@@ -2,7 +2,8 @@
 
 With ``SGLANG_DSV41_ENABLE_DSPARK_CPU_EXPERTS`` each draft stage's ``FusedMoE`` loads its experts into host RAM and
 keeps only its resident set (``draft_resident.py``) and any fused shared expert on the GPU (``DraftResidentMoe``). The
-rest run on the GPU node's CPU expert engine (host/cpu_experts.h, one team per node), or, with the target's CPU experts off,
+rest run on the GPU node's CPU expert engine (host/cpu_experts.h with host/draft_experts.h, one team per node), or, with the
+target's CPU experts off,
 on a draft-only engine, over the draft channel (``dspark_draft_cpu.py``): the
 stage's call posts its CPU share (device-only), runs its GPU share, then its finish waits on the channel's gate and
 adds the CPU rows, all on the stream, so a CUDA graph captures the whole call. The stages register here as they finish

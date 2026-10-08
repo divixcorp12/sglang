@@ -3,10 +3,10 @@
 #pragma once
 
 #include "../cpu_token_table.h"
-#include "../draft_channel.h"
 #include "../lease_layout.h"
 #include "cpu_experts/kernel.hpp"
 #include "cpu_experts/team.hpp"
+#include "draft_experts.h"
 #include "lease_channel.h"
 #include "job_trace.h"
 #include "reader_base.h"
@@ -33,28 +33,6 @@
 #include <vector>
 
 namespace sglang::expert_stream {
-
-namespace draft {
-
-/// Instr build only (DraftSource::test_hooks): how long the draft poll path sleeps between its loads, to make the
-/// teardown interleaving deterministic (draft_test_poll_pause).
-inline std::atomic<int64_t> g_test_poll_pause_us{0};
-
-/// The call's live routes (slot >= 0) past each slot's first. Outside the timed forward; at most kMaxRows * kMaxK.
-inline int count_shared_routes(const int32_t* slots, int n) {
-  int32_t live[kMaxRows * kMaxK];
-  int count = 0;
-  for (int i = 0; i < n; ++i)
-    if (slots[i] >= 0) live[count++] = slots[i];
-  std::sort(live, live + count);
-  int shared = 0;
-  for (int i = 1; i < count; ++i) shared += live[i] == live[i - 1];
-  return shared;
-}
-
-}  // namespace draft
-
-using draft::DraftChannel;
 
 /// Every row's CPU expert layer, one per RamTier and shared by every group's engine (a layer addresses its row's whole
 /// slab). Set once per row from any thread, read lock-free by the engines, and destroyed with the tier after every
@@ -131,20 +109,6 @@ struct CpuJob {
   int32_t lanes[wire::Wire::kLanes] = {};  // each job lane's record lane
 };
 
-/// The DSpark draft channel (draft_channel.h) as a CpuExpertEngine's second job source (plan 2026-10-06 Task 11): each
-/// posted record is a stage's M-row forward over the stage's pinned areas, completed through the lease channel (done,
-/// then the Dekker open of the gate). The stages' layers read the draft's own slabs (pageable host memory).
-struct DraftSource {
-  uint8_t* channel = nullptr;      // draft::kChannelBytes, pinned: the page and the completion block
-  const uint8_t* x = nullptr;      // fp16 [stages, kMaxRows, hidden]
-  const int32_t* slots = nullptr;  // [stages, kMaxRows, kMaxK]
-  const float* weights = nullptr;  // [stages, kMaxRows, kMaxK]
-  float* out = nullptr;            // [stages, kMaxRows, hidden]
-  int64_t hidden = 0;
-  std::vector<cpu_experts::ExpertLayer> layers;  // one per stage, each on the engine's kernel
-  bool test_hooks = false;                       // the instr build's: honour draft::g_test_poll_pause_us
-};
-
 /// The pinned tables a CpuExpertEngine reads and writes, and how it runs. Row r's input is at x_base + r * x_stride
 /// (written by the post kernel); its part p fp32 output at out_base + r * out_stride + p * out_part_stride.
 struct CpuExpertConfig {
@@ -183,8 +147,9 @@ struct CpuExpertConfig {
 /// since no host thread can ring those. So a job never waits for a worker to wake, and no state read before a wait
 /// can go stale across it.
 ///
-/// With a DSpark draft source (attach_draft) the thread serves the draft channel too, one job at a time with the
-/// target's, the target's ring first. A draft-only engine (CpuExpertConfig::draft_only) has only that source.
+/// With a DSpark draft source (attach_draft, draft_experts.h) the thread serves the draft channel too, one job at a
+/// time with the target's, the target's ring first. A draft-only engine (CpuExpertConfig::draft_only) has only that
+/// source.
 template <BuildPolicy Build>
 class BasicCpuExpertEngine {
  public:
@@ -288,57 +253,30 @@ class BasicCpuExpertEngine {
     return compute_ns_.load(std::memory_order_relaxed);
   }
 
-  static constexpr const char* kDraftPrefix = "DSpark draft CPU experts: ";
+  static constexpr const char* kDraftPrefix = DraftExperts<Build>::kPrefix;
+  using DraftStats = typename DraftExperts<Build>::Stats;
 
-  /// Makes the DSpark draft channel this engine's second job source: from then on the thread also serves each posted
-  /// record, one job at a time with the target's, never two at once. Starts the watchdog, which fail-stops a job of
-  /// either kind that runs past fatal_wait_ns and a posted record left unserved that long. After start(); once.
+  /// Makes the DSpark draft channel this engine's second job source (draft_experts.h): from then on the thread also
+  /// serves each posted record, one job at a time with the target's, never two at once. Starts the watchdog, which
+  /// fail-stops a job of either kind that runs past fatal_wait_ns and a posted record left unserved that long. After
+  /// start(); once.
   void attach_draft(std::unique_ptr<DraftSource> source, int64_t fatal_wait_ns) {
-    if (draft_owned_ != nullptr) throw std::runtime_error(std::string(kDraftPrefix) + "a draft source is attached already");
     if (!thread_.joinable()) throw std::runtime_error(std::string(kDraftPrefix) + "attach after the engine started");
     if (fatal_wait_ns <= 0) throw std::runtime_error(std::string(kDraftPrefix) + "the fatal wait must be positive");
-    const DraftSource& d = *source;
-    if (!d.channel || !d.x || !d.slots || !d.weights || !d.out || d.hidden <= 0 || d.layers.empty())
-      throw std::runtime_error(std::string(kDraftPrefix) + "the channel, the stage areas and a layer per stage are required");
-    for (size_t s = 0; s < d.layers.size(); ++s) {
-      if (d.layers[s].kernel != config_.kernel)
-        throw std::runtime_error(std::string(kDraftPrefix) + "stage " + std::to_string(s) +
-                                 " runs on another kernel than the team's");
-      if (d.layers[s].hidden != d.hidden)
-        throw std::runtime_error(std::string(kDraftPrefix) + "stage " + std::to_string(s) + "'s layer has hidden " +
-                                 std::to_string(d.layers[s].hidden) + ", the areas " + std::to_string(d.hidden));
-    }
-    if (config_.kernel->max_routes() < draft::kMaxK || config_.kernel->max_rows() < draft::kMaxRows)
-      throw std::runtime_error(std::string(kDraftPrefix) + "kernel " + config_.kernel->name() +
-                               " takes fewer rows or routes than a draft call");
-    const uint32_t head = channel::head<DraftChannel>(d.channel);
-    draft_completed_.store(head, std::memory_order_relaxed);
-    draft_next_ = channel::skip_zero(head + 1u);  // the run thread reads it after acquiring draft_
+    draft_.attach(std::move(source));  // the thread sees it within a quantum
     fatal_wait_ns_ = fatal_wait_ns;
-    draft_owned_ = std::move(source);
-    draft_.store(draft_owned_.get(), std::memory_order_release);  // the run thread sees it within a quantum
     watchdog_ = std::thread([this] { watch(); });
   }
 
-  /// Stops serving the draft channel: the thread finishes a draft job in progress and drops the source, then the gate
-  /// a wait still holds closed is opened (no completer is left). The watchdog runs on, so a hung job still fail-stops.
-  /// Idempotent; stop() opens the gate too.
+  /// Stops serving the draft channel: the thread finishes a draft job in progress and lets go of the source, then the
+  /// gate a wait still holds closed is opened (no completer is left). The watchdog runs on, so a hung job still
+  /// fail-stops. Idempotent; stop() opens the gate too.
   void detach_draft() {
-    DraftSource* d = draft_.load(std::memory_order_acquire);
-    if (d == nullptr) return;
-    draft_detach_.store(true, std::memory_order_seq_cst);
-    while (draft_.load(std::memory_order_acquire) != nullptr && !exited_.load(std::memory_order_acquire))
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    channel::open_closed_gate<DraftChannel>(d->channel);
+    draft_.detach();
   }
 
-  struct DraftStats {
-    int64_t jobs, rows, forward_ns, collided_jobs, shared_routes, collided_forward_ns;
-  };
   DraftStats draft_stats() const {
-    return {draft_jobs_.load(std::memory_order_relaxed), draft_rows_.load(std::memory_order_relaxed),
-            draft_forward_ns_.load(std::memory_order_relaxed), draft_collided_jobs_.load(std::memory_order_relaxed),
-            draft_shared_routes_.load(std::memory_order_relaxed), draft_collided_forward_ns_.load(std::memory_order_relaxed)};
+    return draft_.stats();
   }
 
   /// Stops and joins the thread, then the watchdog (a hung forward still fail-stops meanwhile), then opens a draft gate
@@ -349,7 +287,7 @@ class BasicCpuExpertEngine {
     thread_.join();
     watchdog_stop_.store(true, std::memory_order_seq_cst);
     if (watchdog_.joinable()) watchdog_.join();
-    if (draft_owned_ != nullptr) channel::open_closed_gate<DraftChannel>(draft_owned_->channel);
+    draft_.open_gate();
   }
 
  private:
@@ -406,38 +344,29 @@ class BasicCpuExpertEngine {
     if (!error.empty()) return;
     int64_t warm_until = 0;  // the register-work window after the last job; 0 before the first
     while (!stop_.load(std::memory_order_acquire)) {
-      DraftSource* draft = draft_.load(std::memory_order_acquire);
-      if (draft != nullptr && draft_detach_.load(std::memory_order_acquire)) {
-        draft_.store(nullptr, std::memory_order_release);  // detach_draft waits for this
-        draft = nullptr;
-      }
-      if (draft != nullptr && draft->test_hooks)
-        if (const int64_t pause = draft::g_test_poll_pause_us.load(std::memory_order_relaxed); pause > 0)
-          std::this_thread::sleep_for(std::chrono::microseconds(pause));
+      DraftSource* draft = draft_.source();
       // Read before the pop: a submit after it moves the word the idle wait watches.
       const uint32_t kick = kick_.load(std::memory_order_acquire);
-      const uint32_t head = draft != nullptr ? channel::head<DraftChannel>(draft->channel) : 0u;
-      if constexpr (Build::kMetrics)
-        if (draft && head && channel::reached(head, draft_next_)) trace_.draft_observe(draft, head);
+      const uint32_t record = draft != nullptr ? draft_.pending(*draft) : 0u;
       CpuJob job;
       if (jobs_.pop(&job)) {
+        busy(kTargetJob, job.row);
         warm_until = run_job(job) + config_.keep_warm_ns;
+        idle();
         continue;
       }
-      if (draft != nullptr && head != 0 && channel::reached(head, draft_next_)) {
-        if (head != draft_next_)
-          fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(draft_next_) + " lapped (head " +
-                    std::to_string(head) + "); the device posts one record per wait");
-        warm_until = serve_draft(*draft, draft_next_) + config_.keep_warm_ns;
-        draft_next_ = channel::skip_zero(draft_next_ + 1u);
+      if (record != 0) {
+        busy(kDraftJob, record);
+        warm_until = draft_.serve(*draft, record, *team_) + config_.keep_warm_ns;
+        idle();
         continue;
       }
       // Idle, as the workers are on their job word: register work until warm_until, then PAUSE, on the submit word,
       // one quantum at a time.
       team_->wait(reinterpret_cast<const uint32_t*>(&kick_), kick, warm_until, now_ns() + kIdleQuantumNs);
     }
+    draft_.leave();
     team_.reset();
-    exited_.store(true, std::memory_order_release);
   }
 
   /// Runs one forward and publishes it in done_; returns the clock at its end.
@@ -472,7 +401,6 @@ class BasicCpuExpertEngine {
         trace_.emit("cpu_shape", job.row, 0, job.seq, -1, call.rows, call.k, live);
       }
     }
-    busy(kTargetJob, job.row);
     try {
       const cpu_experts::ExpertLayer* layer = config_.layers->get(job.row);
       if (layer == nullptr) throw std::invalid_argument("the row has no registered layer");
@@ -481,7 +409,6 @@ class BasicCpuExpertEngine {
     } catch (const std::exception& e) {
       fail_stop(prefix_ + "CPU expert forward of row " + std::to_string(job.row) + " failed: " + e.what());
     }
-    job_started_ns_.store(0, std::memory_order_release);
     const int64_t end = now_ns();
     add(compute_ns_, end - start);
     add(jobs_done_, 1);
@@ -530,81 +457,8 @@ class BasicCpuExpertEngine {
     job_id_.store(id, std::memory_order_relaxed);
     job_started_ns_.store(now_ns(), std::memory_order_release);
   }
-
-  /// Reads draft record `seq`, runs its forward on the team, completes it through the channel; returns the forward's
-  /// end. A torn or malformed record, or a refused forward, fail-stops.
-  int64_t serve_draft(const DraftSource& d, uint32_t seq) {
-    int64_t selected = 0;
-    if constexpr (Build::kMetrics) selected = now_ns();
-    alignas(64) uint8_t raw[DraftChannel::kRecordBytes];
-    const uint8_t* rec = channel::record_at<DraftChannel>(d.channel, seq);
-    if (!channel::read_seqlocked<DraftChannel>(rec, seq, raw))
-      fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(seq) + " torn");
-    uint32_t word, epoch;
-    std::memcpy(&word, raw + draft::kRecStage, 4);
-    std::memcpy(&epoch, raw + draft::kRecEpoch, 4);
-    const int stage = static_cast<int>(word & 0xFFFFu), rows = static_cast<int>((word >> 16) & 0xFFu),
-              k = static_cast<int>(word >> 24);
-    if (stage >= static_cast<int>(d.layers.size()) || rows < 1 || rows > draft::kMaxRows || k < 1 || k > draft::kMaxK)
-      fail_stop(std::string(kDraftPrefix) + "record " + std::to_string(seq) + " malformed (stage " +
-                std::to_string(stage) + ", rows " + std::to_string(rows) + ", k " + std::to_string(k) + ")");
-    if constexpr (Build::kMetrics) {
-      uint64_t gpu_ns = 0;
-      std::memcpy(&gpu_ns, raw + draft::kRecPublishNs, sizeof(gpu_ns));
-      trace_.draft_selected(selected, stage, epoch, seq, gpu_ns);
-      int64_t offset_high = 0;
-      std::memcpy(&offset_high, d.channel + draft::kClockOffsetHigh, sizeof(offset_high));
-      trace_.draft_arrival(stage, epoch, seq, gpu_ns, offset_high);
-    }
-    // The slot and weight areas are kMaxK wide per token; the kernel reads [rows, k] contiguous, so compact them.
-    int32_t slots[draft::kMaxRows * draft::kMaxK];
-    float weights[draft::kMaxRows * draft::kMaxK];
-    const int32_t* s = d.slots + static_cast<int64_t>(stage) * draft::kMaxRows * draft::kMaxK;
-    const float* w = d.weights + static_cast<int64_t>(stage) * draft::kMaxRows * draft::kMaxK;
-    for (int t = 0; t < rows; ++t)
-      for (int i = 0; i < k; ++i) {
-        slots[t * k + i] = s[t * draft::kMaxK + i];
-        weights[t * k + i] = w[t * draft::kMaxK + i];
-      }
-    const int shared = draft::count_shared_routes(slots, rows * k);
-    const cpu_experts::ExpertLayer& layer = d.layers[stage];
-    cpu_experts::ForwardCall call;
-    call.rows = rows;
-    call.k = k;
-    call.threads = config_.threads;
-    call.cores = config_.cores;
-    call.x = d.x + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden * 2;
-    call.slots = slots;
-    call.weights = weights;
-    call.out = d.out + static_cast<int64_t>(stage) * draft::kMaxRows * d.hidden;
-    if constexpr (Build::kMetrics) trace_.draft_prepared(now_ns(), stage, epoch, seq);
-    busy(kDraftJob, seq);
-    const int64_t start = now_ns();
-    if constexpr (Build::kMetrics) trace_.emit("draft_start", stage, epoch, seq, -1, rows, k, shared);
-    if constexpr (Build::kMetrics) trace_.resources("draft_faults_start", "draft_switches_start", stage, epoch, seq);
-    try {
-      layer.kernel->forward(layer, call, *team_);
-    } catch (const std::exception& e) {
-      fail_stop(std::string(kDraftPrefix) + "forward of record " + std::to_string(seq) + " (stage " +
-                std::to_string(stage) + ") failed: " + e.what());
-    }
-    const int64_t end = now_ns();
+  void idle() {
     job_started_ns_.store(0, std::memory_order_release);
-    add(draft_forward_ns_, end - start);
-    add(draft_jobs_, 1);
-    add(draft_rows_, rows);
-    if (shared > 0) {
-      add(draft_collided_jobs_, 1);
-      add(draft_shared_routes_, shared);
-      add(draft_collided_forward_ns_, end - start);
-    }
-    if constexpr (Build::kMetrics) trace_.resources("draft_faults_end", "draft_switches_end", stage, epoch, seq);
-    if constexpr (Build::kMetrics) trace_.emit("draft_end", stage, epoch, seq, -1, rows, k, shared);
-    channel::complete<DraftChannel>(d.channel, seq, static_cast<uint64_t>(epoch) << 32 | seq);
-    draft_completed_.store(seq, std::memory_order_release);
-    if constexpr (Build::kMetrics) trace_.draft_finished(end - start, stage, epoch, seq);
-    delay_trigger_.finished(seq, end - start);
-    return end;
   }
 
   /// Every 20 ms, once a draft source is attached: fail-stops a job of either kind that has run for fatal_wait_ns, and
@@ -625,9 +479,8 @@ class BasicCpuExpertEngine {
                     " s (fatal wait)");
         fail_stop(prefix_ + "the CPU job of row " + std::to_string(id) + " incomplete after " + wait + " s (fatal wait)");
       }
-      const DraftSource* d = draft_.load(std::memory_order_acquire);
-      const uint32_t head = d != nullptr ? channel::head<DraftChannel>(d->channel) : 0u;
-      if (head == 0 || head == draft_completed_.load(std::memory_order_acquire)) {
+      const uint32_t head = draft_.unserved_head();
+      if (head == 0) {
         watched = 0;
         continue;
       }
@@ -665,20 +518,15 @@ class BasicCpuExpertEngine {
   std::array<int32_t, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_slots_{};
   std::array<float, CpuTokenTable::kMaxTokens * wire::Wire::kLanes> token_weights_{};
   std::atomic<bool> stop_{false};
-  // The DSpark draft source (attach_draft): owned here, published to the run thread through draft_ (null: none, or
-  // detached). draft_next_ is the run thread's after the publication.
-  std::unique_ptr<DraftSource> draft_owned_;
-  std::atomic<DraftSource*> draft_{nullptr};
-  std::atomic<bool> draft_detach_{false}, watchdog_stop_{false}, exited_{false};
-  uint32_t draft_next_ = 0;
-  std::atomic<uint32_t> draft_completed_{0};
+  // The DSpark draft source and its read of the channel (attach_draft): the team's kernel, threads and cores, and the
+  // engine's trace and trigger, are its.
+  DraftExperts<Build> draft_{config_.kernel, config_.threads, config_.cores, trace_, delay_trigger_};
+  std::atomic<bool> watchdog_stop_{false};
   int64_t fatal_wait_ns_ = 0;
   std::thread watchdog_;
-  // The job running now, for the watchdog (busy()): its start (0: none), kind and id.
+  // The job running now, for the watchdog (busy(), idle()): its start (0: none), kind and id.
   std::atomic<int64_t> job_started_ns_{0}, job_id_{0};
   std::atomic<int32_t> job_kind_{0};
-  std::atomic<int64_t> draft_jobs_{0}, draft_rows_{0}, draft_forward_ns_{0}, draft_collided_jobs_{0},
-      draft_shared_routes_{0}, draft_collided_forward_ns_{0};
 };
 
 using CpuExpertEngine = BasicCpuExpertEngine<ProdBuild>;
