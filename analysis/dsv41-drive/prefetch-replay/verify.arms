@@ -1,0 +1,18 @@
+none
+none_r13 --nvme-row-ms 1.3
+oracle_h1 --predictor oracle --h 1 --k 1
+oracle_h1_k2 --predictor oracle --h 1 --k 2 --budget 8
+oracle_h2 --predictor oracle --h 2 --k 1
+oracle_h1_r13 --predictor oracle --h 1 --k 1 --nvme-row-ms 1.3
+gate_h1_k1 --predictor gate --h 1 --k 1
+gate_h1_k1_b2 --predictor gate --h 1 --k 1 --budget 2
+gate_h1_k2 --predictor gate --h 1 --k 2 --budget 8
+gate_h1_k1_d3 --predictor gate --h 1 --k 1 --depth 3
+gate_h1_k1_mru --predictor gate --h 1 --k 1 --admit mru
+gate_h1_k1_s0 --predictor gate --h 1 --k 1 --spec-share 0
+gate_h1_k1_fifo --predictor gate --h 1 --k 1 --queue fifo
+gate_h2_k1 --predictor gate --h 2 --k 1
+gate_h1_k1_r13 --predictor gate --h 1 --k 1 --nvme-row-ms 1.3
+noisy_h1_p25 --predictor noisy --h 1 --k 1 --p 0.25
+noisy_h1_p40 --predictor noisy --h 1 --k 1 --p 0.4
+noisy_h1_p60 --predictor noisy --h 1 --k 1 --p 0.6
