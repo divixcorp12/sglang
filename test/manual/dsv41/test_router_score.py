@@ -129,7 +129,7 @@ def test_schema_2_capture_loads_every_token_with_its_live_count(tmp_path):
     assert cap.x.shape == (3, 2, 2, 4) and cap.ids.shape == cap.w.shape == (3, 2, 2, 3)
     assert cap.tokens.tolist() == [2, 1, 2]
     assert cap.record_of_seq == {0: 0, 1: 1, 2: 2}
-    assert cap.ids[1, 0, 1].tolist() == [9, 10, 11]
+    assert cap.ids[1, 0, 1].tolist() == [15, 16, 17]  # record 1, layer 0, token 1: flat offset 12 + 3
 
 
 def test_schema_1_capture_loads_as_one_token(tmp_path):
