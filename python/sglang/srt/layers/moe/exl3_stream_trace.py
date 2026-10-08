@@ -93,13 +93,15 @@ def _stream_capturing() -> bool:
 def _verify_tokens(forward_batch) -> int:
     """A target verify's live token count, the graph's padding excluded.
 
-    init_new leaves ``extend_num_tokens`` None for a verify; only the DSpark verify
-    layout knows how many rows are real. Its host copy is used when the planner kept
-    one; otherwise the device lengths are read, a sync this diagnostic path accepts.
+    init_new leaves ``extend_num_tokens`` None for a verify. A ragged verify's layout
+    knows how many rows are real: its host copy when the planner kept one, else the
+    device lengths, a sync this diagnostic path accepts. A static verify carries no
+    layout and every request verifies ``draft_token_num`` live rows.
     """
-    layout = getattr(forward_batch.spec_info, "ragged_verify_layout", None)
+    spec_info = forward_batch.spec_info
+    layout = getattr(spec_info, "ragged_verify_layout", None)
     if layout is None:
-        return 0
+        return int(getattr(spec_info, "draft_token_num", 0)) * int(forward_batch.batch_size)
     if layout.verify_lens_cpu is not None:
         return int(sum(layout.verify_lens_cpu))
     return int(layout.verify_lens.sum())
