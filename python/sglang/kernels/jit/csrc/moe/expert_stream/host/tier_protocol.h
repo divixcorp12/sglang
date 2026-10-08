@@ -1,6 +1,6 @@
 // The service's side of the lease protocol: lane kinds and slot states, counters, request records and the stage ring.
 //
-//   kFree / kReady / kStaging   slot states of a RAM-tier row
+//   kFree / kReady / kStaging / kSpec   slot states of a RAM-tier row
 //   Counter / is_core_counter   the service's counters, and the subset ProdBuild keeps
 //   load_acquire / store_release   word access to the lease blocks shared with the device
 //   Lane / Request / read_record   one demand record as the service thread reads it, with a torn-read check
@@ -21,8 +21,9 @@ namespace expert_stream {
 using namespace ::sglang::expert_stream::wire;
 
 // Slot states. kStaging is one of the row's K staging slots, never mapped; an NVMe miss is read into it
-// (analysis/dsv41-drive/LEASE_PROTOCOL.md).
-enum : uint8_t { kFree = 0, kReady = 2, kStaging = 3 };
+// (analysis/dsv41-drive/LEASE_PROTOCOL.md). kSpec is a slot of the speculative pool (ram_prefetch.h): never mapped,
+// never a victim, never released.
+enum : uint8_t { kFree = 0, kReady = 2, kStaging = 3, kSpec = 4 };
 
 static_assert(kPieceTargets >= Wire::kLanes, "a row's pieces are published to at most one word per lane");
 

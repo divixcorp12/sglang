@@ -21,6 +21,7 @@
 #include "copy_engine.h"
 #include "host_copy_backend.h"
 #include "numa_distributor.h"
+#include "ram_prefetch.h"
 #include "split_calibration.h"
 
 namespace sglang {
@@ -28,9 +29,10 @@ namespace expert_stream {
 
 // The slot state of one streamed row. Every member is the tier owner's, except `rows_demand`, which other threads read.
 //
-// Slots are indexed 0..capacity-1 and are kFree, kReady (holds an expert's bytes, mapped), or kStaging (a landing
-// place for a miss, never mapped). `slot_to_expert` and `expert_slot` are inverse maps, -1 where unset. `stamp` is the
-// slot's last-use tick, the LRU order.
+// Slots are indexed 0..capacity-1 and are kFree, kReady (holds an expert's bytes, mapped), kStaging (a landing
+// place for a miss, never mapped), or kSpec (a speculative pool slot, never mapped; RamTier::reserve_spec_pool).
+// `slot_to_expert` and `expert_slot` are inverse maps, -1 where unset. `stamp` is the slot's last-use tick, the LRU
+// order.
 //
 // Prefill share: `prefill_owned[slot]` is 1 while a row a prefill admitted has not been used by decode, and the
 // owning group's GroupRow::owned counts them. Only take_admit_slot_locked sets it, so both stay zero with the share
@@ -393,13 +395,18 @@ class RamTier {
     return slot;
   }
 
-  // Frees `slot` and unmaps its expert. Throws for a staging slot or one a fill is still writing.
+  // Frees `slot` and unmaps its expert. Throws for a staging or pool slot, or one a fill is still writing.
   void release(int64_t row, int64_t slot) {
     std::lock_guard<std::mutex> caller(caller_mutex_);
     require_owner("release");
     if (tiers_[row].state[slot] == kStaging) {
       throw std::runtime_error(
           error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) + ": it is a staging slot");
+    }
+    if (tiers_[row].state[slot] == kSpec) {
+      throw std::runtime_error(
+          error_prefix<Layout>() + "release of pinned slot " + std::to_string(slot) +
+          ": it is a speculative pool slot");
     }
     if (tiers_[row].filling[slot]) {
       throw std::runtime_error(
@@ -971,6 +978,73 @@ class RamTier {
         dist_.seed(row, g, own.staging);
       }
       dist_.publish_seed(lease_, row);
+    }
+  }
+
+  // Reserves every row's speculative pool (ram_prefetch.h): in each group's range, the first `share` kFree slots after
+  // its staging slots become kSpec. Once, on the owner, after reserve_staging and before any slot is filled or the
+  // service thread starts; nothing is published, since the device never maps a pool slot. A range left with fewer
+  // than 2 slots to serve from is refused.
+  void reserve_spec_pool(int64_t share) {
+    std::lock_guard<std::mutex> caller(caller_mutex_);
+    require_owner("reserve_spec_pool");
+    const std::string prefix = error_prefix<Layout>() + "speculative pool: ";
+    if (threaded_.load()) throw std::runtime_error(prefix + "reserve it before the service thread starts");
+    if (pool_ != nullptr) throw std::runtime_error(prefix + "reserve_spec_pool is once");
+    if (share < 1 || share > SpecPool::kMaxShare)
+      throw std::runtime_error(prefix + "a row has 1.." + std::to_string(SpecPool::kMaxShare) + " slots per group");
+    if (experts_ > 0xFFFF) throw std::runtime_error(prefix + "an entry names experts below 65536");
+    for (int64_t row = 0; row < layers_; ++row) {
+      const Tier& tier = tiers_[row];
+      for (int g = 0; g < dist_.size(); ++g) {
+        const GroupRow& own = dist_.group(g).rows[row];
+        if (!own.staging_reserved) throw std::runtime_error(prefix + "reserve_spec_pool is after reserve_staging");
+        if (own.hi - own.lo - static_cast<int64_t>(own.staging.size()) - share < 2)
+          throw std::runtime_error(
+              prefix + "row " + std::to_string(row) + " has too few slots for a speculative pool of " +
+              std::to_string(share) + (dist_.size() > 1 ? " in group " + std::to_string(g) : std::string()));
+        for (int64_t slot = own.lo; slot < own.hi; ++slot)
+          if (tier.state[slot] != kFree && tier.state[slot] != kStaging)
+            throw std::runtime_error(prefix + "reserve_spec_pool is before any slot is filled");
+      }
+    }
+    auto pool = std::make_unique<SpecPool>(layers_, dist_.size(), static_cast<int>(share));
+    for (int64_t row = 0; row < layers_; ++row) {
+      Tier& tier = tiers_[row];
+      for (int g = 0; g < dist_.size(); ++g) {
+        const GroupRow& own = dist_.group(g).rows[row];
+        int taken = 0;
+        for (int64_t slot = own.lo; slot < own.hi && taken < share; ++slot) {
+          if (tier.state[slot] != kFree) continue;
+          tier.state[slot] = kSpec;
+          pool->entry(row, g, taken++).slot = static_cast<int32_t>(slot);
+        }
+      }
+    }
+    pool_ = std::move(pool);
+  }
+
+  // Pool slots per row and group; 0 without a pool.
+  int64_t spec_share() const {
+    return pool_ == nullptr ? 0 : pool_->share();
+  }
+
+  // Writes {group, slot, state, expert} per pool entry of `row`, group-major; expert -1 for an empty entry. Any
+  // thread: each group's entries under its mutex.
+  void spec_pool(int64_t row, int64_t* out) {
+    row_capacity(row);
+    if (pool_ == nullptr) throw std::runtime_error(error_prefix<Layout>() + "no speculative pool (reserve_spec_pool)");
+    int64_t k = 0;
+    for (int g = 0; g < dist_.size(); ++g) {
+      std::lock_guard<std::mutex> lock(pool_->mutex(g));
+      for (int i = 0; i < pool_->share(); ++i) {
+        const PoolEntry& entry = pool_->entry(row, g, i);
+        const uint32_t word = entry.word.load(std::memory_order_acquire);
+        out[k++] = g;
+        out[k++] = entry.slot;
+        out[k++] = pool_state(word);
+        out[k++] = word == kPoolEmpty ? -1 : pool_expert(word);
+      }
     }
   }
 
@@ -2059,6 +2133,8 @@ class RamTier {
   int fill_result_ = 0;           // run_fill's read result: the fill thread's, read by the owner after the join
   bool fill_unfinished_ = false;  // an epilogue is owed (fill_begin started a thread); caller_mutex_ / the owner's
   std::vector<Tier> tiers_;       // the owner's, with every other non-atomic member: the tier has no mutex
+  // The speculative pool, once reserved (reserve_spec_pool); null with the RAM prefetch off.
+  std::unique_ptr<SpecPool> pool_;
   std::atomic<int64_t> prefill_share_{0};  // any thread stores it, relaxed; see set_prefill_share
   std::atomic<bool> threaded_{false};
   // The pausing caller owns the tier while parked_ (see caller_owns). caller_mutex_ serializes Python-side callers

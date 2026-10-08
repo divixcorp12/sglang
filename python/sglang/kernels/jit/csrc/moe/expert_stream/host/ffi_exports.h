@@ -713,6 +713,28 @@ struct HostExports {
     find(handle)->reserve_staging(k);
   }
 
+  // Reserves every row's speculative pool, `share` slots per group after its staging slots
+  // (RamTier::reserve_spec_pool). Once, after reserve_staging, before any slot fills or the thread starts.
+  static void reserve_spec_pool(int64_t handle, int64_t share) {
+    find(handle)->reserve_spec_pool(share);
+  }
+
+  static int64_t spec_share(int64_t handle) {
+    return find(handle)->spec_share();
+  }
+
+  // Writes {group, slot, state, expert} per pool entry of `row` into out int64 [groups * share, 4]. Any thread.
+  static void spec_pool(int64_t handle, int64_t row, TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    const auto tier = find(handle);
+    expert_stream::verify_named(
+        "out",
+        TensorMatcher({tier->groups() * tier->spec_share(), 4}).with_dtype<int64_t>().with_device<kDLCPU>(cpu),
+        out);
+    tier->spec_pool(row, static_cast<int64_t*>(out.data_ptr()));
+  }
+
   // The eager paths' map changes since the last call: bulk_delta_count, then take_bulk_delta into int32 [that, 3] of
   // {row, expert, slot}. A paused caller only; the count call joins a running fill first, so its unmaps are counted.
   static int64_t bulk_delta_count(int64_t handle) {
@@ -1025,6 +1047,9 @@ struct HostExports {
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_layer, Exports::set_cpu_layer);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_set_cpu_split, Exports::set_cpu_split);             \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_reserve_staging, Exports::reserve_staging);         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_reserve_spec_pool, Exports::reserve_spec_pool);     \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_share, Exports::spec_share);                   \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_pool, Exports::spec_pool);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_bulk_delta_count, Exports::bulk_delta_count);       \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_take_bulk_delta, Exports::take_bulk_delta);         \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_cpu_stats, Exports::cpu_stats);                     \

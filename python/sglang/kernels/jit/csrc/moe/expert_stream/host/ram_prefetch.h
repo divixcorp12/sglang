@@ -1,0 +1,108 @@
+// The NVMe-to-RAM prefetch's shared state (spec docs/superpowers/specs/2026-10-08-dsv41-ram-prefetch-design.md,
+// Phase 1).
+//
+//   SpecPool   per streamed row and NUMA group, `share` RAM-tier slots in state kSpec that the device never maps; an
+//              entry is empty, reading expert e, or landed with expert e
+//
+// Threads. An entry's word, for_seq and landed are atomics any thread may load. Its slot, and every transition of its
+// word out of empty or landed, is under its group's mutex: the group's speculative thread claims entries, the group's
+// service thread swaps them (RamTier::take_pooled_locked). Only the claimer stores a reading word's successor.
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+
+namespace sglang::expert_stream {
+
+enum : uint32_t { kPoolEmpty = 0, kPoolReading = 1, kPoolLanded = 2 };
+
+// An entry's word: the state above bit 16, the expert below (RamTier::reserve_spec_pool refuses 65536 experts or more).
+inline uint32_t pool_word(uint32_t state, int32_t expert) {
+  return state << 16 | (static_cast<uint32_t>(expert) & 0xFFFFu);
+}
+inline uint32_t pool_state(uint32_t word) {
+  return word >> 16;
+}
+inline int32_t pool_expert(uint32_t word) {
+  return static_cast<int32_t>(word & 0xFFFFu);
+}
+
+struct PoolEntry {
+  int32_t slot = -1;  // under the group's mutex
+  std::atomic<uint32_t> word{kPoolEmpty};
+  std::atomic<uint32_t> for_seq{0};  // the target record the read was issued for
+  std::atomic<uint64_t> landed{0};   // landing order: with no empty entry, the oldest landed one is reclaimed
+};
+
+class SpecPool {
+ public:
+  static constexpr int kMaxShare = 4;  // Python mirror: ram_prefetch.MAX_SPEC_SHARE
+
+  SpecPool(int64_t rows, int groups, int share)
+      : groups_(groups),
+        share_(share),
+        entries_(std::make_unique<PoolEntry[]>(static_cast<size_t>(rows * groups * share))),
+        mutexes_(std::make_unique<std::mutex[]>(static_cast<size_t>(groups))) {}
+
+  int share() const {
+    return share_;
+  }
+  PoolEntry& entry(int64_t row, int g, int i) {
+    return entries_[(row * groups_ + g) * share_ + i];
+  }
+  const PoolEntry& entry(int64_t row, int g, int i) const {
+    return entries_[(row * groups_ + g) * share_ + i];
+  }
+  std::mutex& mutex(int g) {
+    return mutexes_[g];
+  }
+
+  // Group g's entry of `row` holding `expert`, reading or landed, or -1. Atomic loads: any thread.
+  int find(int64_t row, int g, int32_t expert) const {
+    for (int i = 0; i < share_; ++i) {
+      const uint32_t word = entry(row, g, i).word.load(std::memory_order_acquire);
+      if (word != kPoolEmpty && pool_expert(word) == expert) return i;
+    }
+    return -1;
+  }
+
+  // True when some group's entry of `row` holds `expert` for a record other than `seq`. The scorer skips such an
+  // expert; one issued for `seq` itself stays ranked, so both groups' lists agree whichever group read first.
+  bool pooled_before(int64_t row, int32_t expert, uint32_t seq) const {
+    for (int g = 0; g < groups_; ++g) {
+      const int i = find(row, g, expert);
+      if (i >= 0 && entry(row, g, i).for_seq.load(std::memory_order_relaxed) != seq) return true;
+    }
+    return false;
+  }
+
+  // Under mutex(g): an empty entry of `row`, else its oldest landed one, else -1.
+  int claimable_locked(int64_t row, int g) const {
+    int oldest = -1;
+    for (int i = 0; i < share_; ++i) {
+      const PoolEntry& e = entry(row, g, i);
+      const uint32_t state = pool_state(e.word.load(std::memory_order_relaxed));
+      if (state == kPoolEmpty) return i;
+      if (state == kPoolLanded &&
+          (oldest < 0 || e.landed.load(std::memory_order_relaxed) <
+                             entry(row, g, oldest).landed.load(std::memory_order_relaxed)))
+        oldest = i;
+    }
+    return oldest;
+  }
+
+  uint64_t next_landing() {
+    return landings_.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+ private:
+  int groups_;
+  int share_;
+  std::unique_ptr<PoolEntry[]> entries_;
+  std::unique_ptr<std::mutex[]> mutexes_;
+  std::atomic<uint64_t> landings_{0};
+};
+
+}  // namespace sglang::expert_stream

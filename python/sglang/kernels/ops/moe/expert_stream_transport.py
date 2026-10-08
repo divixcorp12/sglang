@@ -1124,6 +1124,9 @@ CORE_COUNTERS = (
 )
 assert CORE_COUNTERS == tuple(sorted(CORE_COUNTERS, key=COUNTERS.index))
 
+# A speculative pool entry's states (host/ram_prefetch.h kPoolEmpty, kPoolReading, kPoolLanded).
+SPEC_POOL_STATES = ("empty", "reading", "landed")
+
 
 def seqlock_stress(
     seconds: float,
@@ -1648,7 +1651,7 @@ class ExpertStreamHost:
         return bool(self._module.expert_stream_fill_end(self.handle))
 
     def slot_info(self, row: int) -> list[tuple[int, int, int]]:
-        """Return ``(state, expert, stamp)`` per slot; state 0 FREE, 2 READY, 3 STAGING.
+        """Return ``(state, expert, stamp)`` per slot; state 0 FREE, 2 READY, 3 STAGING, 4 SPEC (the prefetch pool).
 
         Paused or pumping only.
         """
@@ -1669,6 +1672,24 @@ class ExpertStreamHost:
         """
         k = self.wire.lanes if k is None else k
         self._module.expert_stream_reserve_staging(self.handle, int(k))
+
+    def reserve_spec_pool(self, share: int) -> None:
+        """Reserve every row's speculative pool (SGLANG_DSV41_RAM_PREFETCH): ``share`` slots per row and NUMA group
+        after its staging slots, never mapped, never a victim, never released. Once, after ``reserve_staging``, before
+        any slot fills and before the thread starts."""
+        self._module.expert_stream_reserve_spec_pool(self.handle, int(share))
+
+    def spec_pool(self, row: int) -> list[dict]:
+        """Every pool entry of ``row``, group-major: ``group``, ``slot``, ``state`` (one of ``SPEC_POOL_STATES``) and
+        ``expert`` (-1 when empty). Any time."""
+        self._check(row)
+        share = int(self._module.expert_stream_spec_share(self.handle))
+        out = torch.empty((self.nodes * share, 4), dtype=torch.int64)
+        self._module.expert_stream_spec_pool(self.handle, row, out)
+        return [
+            {"group": g, "slot": slot, "state": SPEC_POOL_STATES[state], "expert": expert}
+            for g, slot, state, expert in out.tolist()
+        ]
 
     def take_bulk_delta(self) -> torch.Tensor:
         """Return the eager paths' map changes since the last call.
