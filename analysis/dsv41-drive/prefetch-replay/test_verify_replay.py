@@ -99,3 +99,46 @@ def test_the_tier_splits_rows_between_the_two_groups_by_node_share():
     a = _args(ram_rows=10, node_share=0.6)
     tiers = vr.make_tiers(a, LAYERS)
     assert [[t.capacity for t in pair] for pair in tiers] == [[2, 2], [2, 1], [2, 1]]  # rows per layer 4, 3, 3
+
+
+def _ranks(target_li, h, per_token):
+    """A verify_gate_rankings npz for one step: ``per_token`` is each live token's (order, score) at target_li, h."""
+    import numpy as np
+
+    M, depth = len(per_token), len(per_token[0][0])
+    order = np.full((1, len(LAYERS), M, h + 1, depth), -1, dtype=np.int16)
+    score = np.zeros(order.shape, dtype=np.float32)
+    valid = np.zeros((1, len(LAYERS), h + 1), dtype=bool)
+    for m, (o, sc) in enumerate(per_token):
+        order[0, target_li, m, h] = o
+        score[0, target_li, m, h] = sc
+    valid[0, target_li, h] = True
+    return {"order": order, "score": score, "valid": valid, "tokens": np.asarray([M]), "seq": np.asarray([0])}
+
+
+def test_gate_takes_up_to_k_per_token_ranked_by_margin_to_the_sixth_score():
+    """The spec's gate: the union over tokens of up to K per token. A token whose raw scores are all high must not
+    take the other token's row: with K=1 each token contributes its top candidate."""
+    ranks = _ranks(1, 1, [
+        ([10, 12, 14, 16, 18, 20], [9.0, 8.9, 8.8, 8.7, 8.6, 1.0]),
+        ([30, 32, 34, 36, 38, 40], [3.0, 2.9, 2.8, 2.7, 2.6, 2.5]),
+    ])
+    a = _args(ram_rows=ROWS, gpu_ms=3.0, step_ms=0.0, predictor="gate", h=1, k=1, depth=6, budget=4)
+    out = vr.run_one(a, _loaded([_verify(0, {0: [0], 1: [10, 30]})]), ranks)
+    assert out["spec_rows_per_step"] == 2 and out["precision_target"] == 1.0
+
+
+def test_speculative_reads_in_flight_are_capped_at_one_row():
+    """Two speculative rows issued at layer 0's post, then layer 0's demand row, all FIFO: the second speculative
+    row is submitted only when the first lands (2.2), behind the demand row, which lands at 4.4, not 6.6."""
+    out = _run([_verify(0, {0: [0], 1: [2, 4]})], ram_rows=ROWS, gpu_ms=0.0, step_ms=0.0, predictor="oracle", h=1,
+               k=1, queue="fifo", nvme_row_ms=2.2, miss_job_ms=1.0)
+    assert out["spec_rows_per_step"] == 2
+    assert out["per_layer_exposed_ms"][0] == approx(4.4 + 1.0)
+
+
+def test_a_demand_on_a_row_held_behind_the_in_flight_cap_is_read_at_once_and_is_late():
+    """A speculative row not yet submitted (held by the cap) that is demanded becomes a demand read, counted late."""
+    out = _run([_verify(0, {0: [0], 1: [2, 4]})], ram_rows=ROWS, gpu_ms=0.0, step_ms=0.0, predictor="oracle", h=1,
+               k=1, nvme_row_ms=50.0, miss_job_ms=1.0)
+    assert out["late_per_step"] == 2 and out["ram_misses_per_step"] == 1
