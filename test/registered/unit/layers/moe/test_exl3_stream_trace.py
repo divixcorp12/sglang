@@ -572,21 +572,28 @@ def test_router_capture_holds_every_token_of_a_verify_forward(tmp_path, monkeypa
             _assert_router_record(x, ids, w, step, row, _router_input(step, row, tokens=tokens))
 
 
-def test_router_capture_refuses_a_different_token_count_and_a_ring_sized_after_reads(tmp_path):
+def test_router_capture_writes_a_narrower_forward_into_its_first_rows_and_refuses_a_wider_one(tmp_path):
+    """The verify graph sizes the rings; a one-token graph forward (prefill warmup, decode) through the same layers
+    writes only its own rows, its live count in the meta. A forward wider than the rings cannot be held."""
     from sglang.srt.layers.moe import exl3_stream_trace as module
 
     log = module.GraphRouteLog(layers=2, width=8, device="cpu", depth=8, margin=2)
     log.enable_router(str(tmp_path / "router"))
     log.record(0, torch.tensor([1], dtype=torch.int64), torch.tensor([0], dtype=torch.int32))
     log.record_router(0, *_router_input(0, 0, tokens=3))
+    log.record(0, torch.tensor([1], dtype=torch.int64), torch.tensor([0], dtype=torch.int32))
+    x, ids, w = _router_input(5, 0, tokens=1)
+    log.record_router(0, x, ids, w)
+    slot = int(log.slot)
+    assert torch.equal(log.router_x[slot, 0, :1], x) and torch.equal(log.router_ids[slot, 0, :1], ids)
+    assert torch.equal(log.router_w[slot, 0, :1], w)
     with pytest.raises(ValueError, match="holds 3 tokens"):
-        log.record_router(0, *_router_input(0, 0, tokens=2))
+        log.record_router(0, *_router_input(0, 0, tokens=4))
     late = module.GraphRouteLog(layers=2, width=8, device="cpu", depth=8, margin=2)
     late.enable_router(str(tmp_path / "late"))
     late._host = []  # a read already sized its pinned copies without the router rings
     with pytest.raises(RuntimeError, match="warmup forward"):
         late.record_router(0, *_router_input(0, 0, tokens=1))
-
 
 def test_load_forwards_marks_verify_forwards_and_keeps_their_router_record(tmp_path):
     """A DSpark verify forward is a graph forward in phase target_verify with M tokens; the replay treats it as the
