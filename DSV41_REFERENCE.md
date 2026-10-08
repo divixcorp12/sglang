@@ -62,7 +62,7 @@ needs a measurement before anyone quotes it).
 - **~90 GB host RAM**, used as a *cache* tier.
 - Expert weights and Engram tables read from NVMe with our io_uring reader.
 - The original plan was to move experts to `/mnt/nvme1` (Gen3 x4) and keep Engram
-  tables on `/mnt/nvme2` (Gen3 x2). The live recipe instead reads the EXL3 shards on
+  tables on `/mnt/nvme2` (then Gen3 x2; x4 since, §2). The live recipe instead reads the EXL3 shards on
   `/mnt/nvme2` and uses expert-row mirrors on `/mnt/nvme0` and `/mnt/nvme4` (and on `/mnt/nvme2` as a third root since
   2026-09-28, §29.3).
 
@@ -221,7 +221,8 @@ not overrides and should not be passed on the command line.
    - For experts the NVMe read is on the critical path whatever the mechanism (the
      route is only known at the layer). For Engram layer 1 it can overlap layer 0, but
      only with a split-submit or device-poll design.
-4. **Drives.** `/mnt/nvme2` is Gen3 x2, ~1.9 GB/s, ~7 ms per expert [measured link].
+4. **Drives.** `/mnt/nvme2` was Gen3 x2, ~1.9 GB/s, ~7 ms per expert [measured link]; it negotiates x4 as of
+   2026-10-08 (§2).
    `/mnt/nvme1` is Gen3 x4, ~3.4 ms per expert on an *idle* drive [estimate]. It is not
    idle: an `op-reth` node's datadir lives on it, alongside other workloads, and the
    P310 is a DRAM-less QLC drive. The live EXL3 source remains on `/mnt/nvme2`, with
@@ -300,13 +301,15 @@ The other 46 official shards (backbone FP8 + MXFP4 experts) are **not** download
 
 | Mount | Drive | Link now | Max | Free | Role / co-tenants |
 |---|---|---|---|---|---|
-| `/mnt/nvme2` | Samsung 990 EVO Plus 2 TB | **Gen3 x2** (~1.9 GB/s) | Gen5 x4 | 219 GB | **Engram tables.** Production's PLE cache also reads from it |
+| `/mnt/nvme2` | Samsung 990 EVO Plus 2 TB | Gen3 x4 (~3.9 GB/s; x2 until fixed, see below) | Gen5 x4 | 219 GB | **Engram tables.** Production's PLE cache also reads from it |
 | `/mnt/nvme1` | Crucial P310 4 TB (DRAM-less QLC) | Gen3 x4 (~3.9 GB/s) | Gen4 x4 | 1.7 TB | **Experts (after the copy).** Shared with `op-reth` (write load bursty: 50–1,800 IOPS observed), `questdb-import`, `inductor_cache`, `okx_backfill_temp` |
 | `/mnt/nvme0` | Samsung 990 EVO Plus 2 TB | Gen3 x4 | Gen5 x4 | 518 GB | — |
 | `/mnt/nvme4` | SPCC 2 TB | Gen3 x4 | Gen4 x4 | 623 GB | Holds the swapfile |
 
-The same Samsung model negotiates x4 in `nvme0`, so nvme2's x2 is a property of the slot
-or its wiring.
+The same Samsung model negotiates x4 in `nvme0`, so nvme2's x2 was a property of the slot
+or its wiring. *Updated 2026-10-08:* sysfs now reads 8 GT/s x4 for nvme2 (0000:88:00.0, kernel
+controller `nvme1`, block `nvme1n1`), as for nvme0 and nvme4, so all three expert mirror roots are Gen3 x4.
+Measurements in this file taken before the fix (§§16, 18, 23) ran nvme2 at x2.
 
 **The expert copy.** Reading 205 GB off nvme2 takes ~2 min at line rate (1.9 GB/s). The P310's
 sustained QLC write rate after its SLC cache fills is unknown and could make the copy
@@ -2904,7 +2907,7 @@ without root): 0000:88:00.0 (nvme2) `current_link_width` 2 against
 `max_link_width` 4, the other three at 4; its root port 0000:85:02.0 likewise
 negotiated x2 of 4. PCIe Advanced Error Reporting correctable counters 0. One snapshot, so a transient
 downtrain is not excluded. The 1.9 GB/s figure is the Gen3 x2 spec ceiling;
-nvme2's throughput was not measured here.
+nvme2's throughput was not measured here. The link has since been fixed: x4 on 2026-10-08 (§2).
 
 #### Three defects found on the way
 
@@ -3858,7 +3861,7 @@ Both are on in `arm_env`, and both are byte-identical to the unfused recipe.
 
 | Study | Result | Plan |
 |---|---|---|
-| Link and NUMA | HPE DL380 Gen10: the GPU is on a Gen3 x16 slot, the only kind the board has. The copy engine gets 13.67 GB/s and an SM zero-copy 12.23 GB/s, the same from either NUMA node. CPU memory load on the GPU's node cuts H2D 27–43%; load on the other node has no effect. All NVMe is on socket 1; nvme2 (the Engram table) runs at x2 | `analysis/dsv41-drive/numa-h2d/` |
+| Link and NUMA | HPE DL380 Gen10: the GPU is on a Gen3 x16 slot, the only kind the board has. The copy engine gets 13.67 GB/s and an SM zero-copy 12.23 GB/s, the same from either NUMA node. CPU memory load on the GPU's node cuts H2D 27–43%; load on the other node has no effect. All NVMe is on socket 1; nvme2 (the Engram table) ran at x2, x4 as of 2026-10-08 (§2) | `analysis/dsv41-drive/numa-h2d/` |
 | VRAM headroom (Track A) | None to spare. A 30k prompt peaked at 31.0 of 31.8 GiB, with allocator retries driven by the torch prefill indexer's score tensor. Keep the hot cache at 14336 MiB. Candidates, not built: cap the score tensor (~2 GiB), keep the dense modules quantized (2.8 GiB), move the embedding to host (1.23 GiB) | `analysis/dsv41-drive/hot-cache-size/` |
 | Residency policy (Track B) | An exact replay matches measurement (G 78.783). The current policy is the best online policy found. Each +1 GiB of hot cache saves 2–2.7 misses per token. Belady's bound is 31 misses per token lower | `2026-09-25-dsv41-prefetch-study.md` |
 | Side stream for the shared expert and `commit_gather` (1a) | Overlaps correctly, saves nothing at the wall; the flag stays off | `…-copy-compute-overlap.md` |
@@ -5659,8 +5662,7 @@ byte-identical, reads ~33% per drive.
 
 **Known gaps.** No `results.md` for this pair is committed; the figures above are in the recipe commit's message
 (`4fe0c37a41`) and in `arm_env.py`'s comment, with raw data at `divix01:/mnt/nvme1/mirror3-20260928-121453`.
-`arm_env.py` says `/mnt/nvme2` is "now x4"; §1 lists it as Gen3 x2, and no link-width reading is recorded in the
-analysis files.
+`arm_env.py` says `/mnt/nvme2` is "now x4". Confirmed from sysfs on 2026-10-08: 8 GT/s x4 (§2).
 
 **Evidence:** `4fe0c37a41`; `analysis/dsv41-drive/mirror3/` (driver, `mirror3_report.py`); plan
 `docs/superpowers/plans/2026-09-28-mirror3-piece-stream.md`.
@@ -7527,11 +7529,13 @@ optimistic), tier admissions -7%. Calibration (`calib/sweep.txt`): `--nvme-row-m
 | `gate` h=1 k=2, budget 8 | 0.10 | -0.07 | 0.48 | 0.92 |
 | `gate` h=2 k=1 | 1.82 | 1.51 | 0.42 | 0.90 |
 | `gate` h=1 k=1 FIFO queue | -0.53 | -0.53 | 0.50 | 0.83 |
-| `gate` h=1 k=1 at 1.3 ms/row (a fourth mirror) | 4.16 | 4.53 | 0.50 | 0.67 |
+| `gate` h=1 k=1 at 1.3 ms/row (a fourth mirror; optimistic, see below) | 4.16 | 4.53 | 0.50 | 0.67 |
 
 The gate's precision is 0.5-0.6, and every wrong row costs drive time and an eviction, so less is more: the best
 arm issues one row per layer. A second calibration (2.0 ms/row, `calib/alt.txt`) gives ratios 0.54 / 0.57. FIFO goes
-negative, as in the 2026-09-26 study: the reader's priority class is required.
+negative, as in the 2026-09-26 study: the reader's priority class is required. The 1.3 ms/row arm is optimistic for a
+fourth mirror: the three current roots are all Gen3 x4, so a fourth equal drive adds a third of the bandwidth and
+scales 2.2 ms/row to ~1.65, not 1.3.
 
 **What the model leaves out.** Both groups share one NVMe queue; there is no latency tail on a read; the hit job's
 lane count follows the calibration split, not the live one, and counts unique experts, not production's
