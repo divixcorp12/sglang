@@ -633,7 +633,7 @@ def _apply_graph_ops(monkeypatch, route_log, layer_fusion):
 @pytest.mark.parametrize("layer_fusion", [False, True], ids=["unfused", "fused"])
 def test_apply_graph_adds_nothing_unless_router_capture_is_on(monkeypatch, tmp_path, layer_fusion):
     """Trace off (no route log) and trace on without router capture build the same captured chain; router
-    capture adds exactly its two ring copies. A regression here puts kernels in the production graph."""
+    capture adds exactly its three ring copies. A regression here puts kernels in the production graph."""
     from collections import Counter
 
     from sglang.srt.layers.moe.exl3_stream_trace import GraphRouteLog
@@ -643,16 +643,18 @@ def test_apply_graph_adds_nothing_unless_router_capture_is_on(monkeypatch, tmp_p
     assert routes_only == off
     log = GraphRouteLog(1, 8, "cpu", depth=32)
     log.enable_router(str(tmp_path / "router"))
-    log.router_x = torch.zeros((32, 1, 16), dtype=torch.bfloat16)  # as the warmup forward sizes them
-    log.router_w = torch.zeros((32, 1, 6))
+    log.router_x = torch.zeros((32, 1, 1, 16), dtype=torch.bfloat16)  # as the warmup forward sizes them
+    log.router_ids = torch.zeros((32, 1, 1, 6), dtype=torch.int64)
+    log.router_w = torch.zeros((32, 1, 1, 6))
     captured = _apply_graph_ops(monkeypatch, log, layer_fusion)
     added = Counter(captured) - Counter(off)
-    assert added["aten.index_copy_.default"] == 2
+    assert added["aten.index_copy_.default"] == 3
     views = {"aten.select.int", "aten.slice.Tensor", "aten.view.default", "aten._unsafe_view.default",
              "aten.reshape.default", "aten.alias.default"}
     assert set(added) - {"aten.index_copy_.default"} <= views, added
     assert not Counter(off) - Counter(captured)
-    assert log.router_x[0, 0].tolist() == list(range(16)) and log.router_w[0, 0].tolist() == [0.25] * 6
+    assert log.router_x[0, 0, 0].tolist() == list(range(16)) and log.router_w[0, 0, 0].tolist() == [0.25] * 6
+    assert log.router_ids[0, 0, 0].tolist() == list(range(6))
 
 
 def tier_sim_load_forwards(path):
