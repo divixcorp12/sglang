@@ -13,6 +13,7 @@
 //   protocol   seqlock_stress, read_record_fields
 //   misc       test_kernel_address, test_kernel_calls, test_kernel_hold, test_kernel_max_rows,
 //              pause_ns
+//   prefetch   score_gate: the RAM prefetch's gate scorer on given tensors, in both builds
 //   draft      draft_test_post, draft_test_tear, draft_test_finish_close: the draft channel's device half on the host;
 //              draft_test_poll_pause: the draft source's poll path sleeps between its stop and head loads
 //   kernel     kernel_layer, kernel_forward, kernel_error, kernel_drop: any kernel's make_layer and forward, by layer id;
@@ -23,6 +24,7 @@
 #pragma once
 
 #include "ffi_exports.h"
+#include "gate_scorer.h"
 #include <algorithm>
 #include <array>
 #include <mutex>
@@ -1222,6 +1224,41 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
       return static_cast<double>(now_ns() - start) / kProbe;
     }
   }
+  // x uint8 [tokens, 2 * hidden] (fp16 rows), w uint8 [experts, 2 * hidden] (bf16), bias f32 [experts], skip uint8
+  // [experts]; writes the chosen experts to out int64 [per_layer] and returns how many. Both builds: a pure function.
+  static int64_t score_gate(
+      TensorView x, TensorView w, TensorView bias, TensorView skip, int64_t top_k, int64_t per_token, int64_t per_layer,
+      TensorView out) {
+    using namespace host;
+    auto cpu = SymbolicDevice{};
+    auto T = SymbolicSize{"tokens"};
+    auto E = SymbolicSize{"experts"};
+    auto B = SymbolicSize{"row bytes"};
+    expert_stream::verify_named("x", TensorMatcher({T, B}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), x);
+    expert_stream::verify_named("w", TensorMatcher({E, B}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), w);
+    expert_stream::verify_named("bias", TensorMatcher({E}).with_dtype<float>().with_device<kDLCPU>(cpu), bias);
+    expert_stream::verify_named("skip", TensorMatcher({E}).with_dtype<uint8_t>().with_device<kDLCPU>(cpu), skip);
+    expert_stream::verify_named("out", TensorMatcher({per_layer}).with_dtype<int64_t>().with_device<kDLCPU>(cpu), out);
+    const int64_t experts = w.size(0);
+    const int64_t hidden = x.size(1) / 2;
+    if (x.size(1) % 2 != 0 || hidden < 1) throw std::runtime_error("score_gate: x rows are fp16");
+    try {
+      expert_stream::check_gate_choice(experts, top_k, per_token, per_layer);
+    } catch (const std::invalid_argument& error) {
+      throw std::runtime_error(std::string("score_gate: ") + error.what());
+    }
+    expert_stream::GateScorer scorer;
+    scorer.reserve(x.size(0), hidden, experts);
+    int32_t chosen[expert_stream::GateScorer::kMaxPerLayer];
+    const int n = scorer.choose(
+        static_cast<const uint8_t*>(x.data_ptr()), x.size(0), x.size(1), static_cast<const uint16_t*>(w.data_ptr()),
+        static_cast<const float*>(bias.data_ptr()), experts, hidden, static_cast<int>(top_k),
+        static_cast<int>(per_token), static_cast<int>(per_layer), static_cast<const uint8_t*>(skip.data_ptr()), chosen);
+    auto* result = static_cast<int64_t*>(out.data_ptr());
+    for (int i = 0; i < n; ++i)
+      result[i] = chosen[i];
+    return n;
+  }
 };
 
 }  // namespace sglang::expert_stream
@@ -1267,4 +1304,5 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_inject_group_stall, Exports::inject_group_stall);     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_spec_place, Exports::spec_place);                     \
   TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_trace_clock_reads, Exports::trace_clock_reads);       \
-  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_pause_ns, Exports::pause_ns);                         \
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(expert_stream_score_gate, Exports::score_gate);

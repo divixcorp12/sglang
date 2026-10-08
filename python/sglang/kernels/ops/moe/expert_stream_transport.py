@@ -1293,6 +1293,39 @@ def pause_ns(*, layout: str = "exl3", variant: Optional[str] = None) -> float:
     return float(_host_module(layout, variant).expert_stream_pause_ns())
 
 
+def score_gate(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor,
+    skip: Sequence[bool],
+    *,
+    top_k: int,
+    per_token: int,
+    per_layer: int,
+    layout: str = "exl3",
+    variant: Optional[str] = None,
+) -> list[int]:
+    """The RAM prefetch's gate scorer (``host/gate_scorer.h``): ``x`` fp16 ``[tokens, hidden]``, ``w`` bf16
+    ``[experts, hidden]``, ``bias`` fp32 ``[experts]``, skipping ``skip``; returns the chosen experts, best first. Both
+    builds."""
+    if x.dtype != torch.float16 or w.dtype != torch.bfloat16 or bias.dtype != torch.float32:
+        raise ValueError("score_gate takes an fp16 x, a bf16 w and an fp32 bias")
+    out = torch.full((int(per_layer),), -1, dtype=torch.int64)
+    n = int(
+        _host_module(layout, variant).expert_stream_score_gate(
+            x.contiguous().view(torch.uint8),
+            w.contiguous().view(torch.uint8),
+            bias.contiguous(),
+            torch.tensor([bool(s) for s in skip], dtype=torch.uint8),
+            int(top_k),
+            int(per_token),
+            int(per_layer),
+            out,
+        )
+    )
+    return out[:n].tolist()
+
+
 def new_page(*, pin: bool, wire: expert_lease_block.WireLayout) -> torch.Tensor:
     """A zeroed request page of ``wire``; pinned (device-readable through UVA) for a real device."""
     return torch.zeros(wire.page_bytes, dtype=torch.uint8, pin_memory=pin)
