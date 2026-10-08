@@ -56,7 +56,7 @@ class DraftKernel:
 
 def draft_kernel_for(format_key: str, act_limit: Optional[float]) -> DraftKernel:
     """The draft's kernel for ``format_key``, with the stages' SwiGLU clamp."""
-    trait = cpu_trait_for(format_key)
+    trait = cpu_trait_for(format_key, source="draft")
     trait.check_environment()
     trait.act_limit = act_limit
     return DraftKernel(trait)

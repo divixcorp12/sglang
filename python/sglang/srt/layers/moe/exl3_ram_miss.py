@@ -1186,7 +1186,7 @@ class Exl3RamMissService:
             row: s.pinned_host_cache.tensors
             for row, (_, s) in enumerate(sorted(streamers.items()))
         }
-        trait = cpu_trait_for(fmt.key)
+        trait = cpu_trait_for(fmt.key, source="target")
         hidden = {trait.hidden_size(slabs) for slabs in caches.values()}
         if len(hidden) != 1:
             raise RuntimeError(

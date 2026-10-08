@@ -1290,6 +1290,11 @@ class Envs:
     # [2, 8]; a chunk holds half as many tokens). 0 keeps the kernel's default. Any other value builds into its own
     # extension (flavor _m<N>). SGLANG_DSV41_CPU_EXPERTS only: the vendored kernel keeps its own.
     SGLANG_EXL3_CPU_MAX_M = EnvInt(0)
+    # Experiment (plan 2026-10-07-dsv41-row-weighted-serving-experiment): whose EXL3 CPU expert layers split their
+    # gate/up and down output tiles by chunk row count instead of evenly (csrc/exl3/optimized/tile_assignment.hpp):
+    # "draft", "target" or "both"; empty keeps the original assignment everywhere. Per layer at run time, not a build
+    # flavor: the same arithmetic in another worker's hands. The launch gate requires the named source's CPU experts.
+    SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT = EnvStr("")
     # The C++ compiler for the EXL3 extension's optimized CPU kernel build, which must be GCC 15
     # (exl3/ext.py check_cpu_compiler). Scoped to that build: the server's other JIT builds keep CXX. Empty uses CXX.
     SGLANG_EXL3_CPU_CXX = EnvStr("")

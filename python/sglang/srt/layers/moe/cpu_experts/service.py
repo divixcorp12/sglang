@@ -23,6 +23,7 @@ import torch
 
 from sglang.kernels.ops.moe.expert_lease_block import cpu_row_bytes
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.cpu_experts.assignment import row_weighted_sources
 from sglang.srt.layers.moe.cpu_experts.policy import (
     capped_split,
     format_calibration,
@@ -32,13 +33,22 @@ from sglang.srt.layers.moe.cpu_experts.policy import (
 logger = logging.getLogger(__name__)
 
 
-def cpu_trait_for(format_key: str, ext=None):
-    """The quant trait of a streamed expert format; only EXL3 has a CPU kernel today."""
+def cpu_trait_for(format_key: str, ext=None, *, source: str):
+    """The quant trait of a streamed expert format for ``source``'s layers ("draft" or "target"); only EXL3 has a
+    CPU kernel today. Row weighting (SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT) is the one per-source choice."""
     if format_key == "exl3":
         from sglang.srt.layers.quantization.exl3.schemes import Exl3CpuQuantTrait
         from sglang.srt.layers.quantization.exl3.ext import exl3_ext
 
-        return Exl3CpuQuantTrait(ext if ext is not None else exl3_ext(), act_limit=None)
+        if ext is None:
+            ext = exl3_ext()
+        row_weighted = source in row_weighted_sources()
+        if row_weighted:
+            logger.info(
+                "CPU experts: the %s's EXL3 layers use row-weighted tile assignment (extension %s)",
+                source, getattr(ext, "__file__", "?"),
+            )
+        return Exl3CpuQuantTrait(ext, act_limit=None, row_weighted=row_weighted)
     raise ValueError(f"CPU experts have no kernel for expert format {format_key!r}")
 
 

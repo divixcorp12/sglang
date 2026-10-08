@@ -39,6 +39,9 @@ ARMS = {
     "prod": ({}, False),
     "dspark-draft-only": ({**arm_env.dspark_env(), **DRAFT_ONLY}, True),
     "dspark-both": (arm_env.dspark_env(), True),
+    # Plan 2026-10-07-dsv41-row-weighted-serving-experiment: B arms, one source at a time.
+    "dspark-both-rw-draft": ({**arm_env.dspark_env(), "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "draft"}, True),
+    "dspark-both-rw-target": ({**arm_env.dspark_env(), "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "target"}, True),
 }
 
 

@@ -21,7 +21,8 @@ class Exl3CpuQuantTrait:
     ``ext`` is the EXL3 extension module. ``act_limit`` is the SwiGLU clamp the layers
     run with; the RAM-miss service fills it in at the first registration when it is
     ``None``. ``swizzled`` selects the band-contiguous weight layout, which is
-    bit-identical to the native one.
+    bit-identical to the native one. ``row_weighted`` splits the layers' output tiles among the workers by chunk row
+    count (tile_assignment.hpp), bit-identical too.
     """
 
     name = "exl3"
@@ -30,10 +31,11 @@ class Exl3CpuQuantTrait:
     weights_dtype = torch.float16
     out_dtype = torch.float32
 
-    def __init__(self, ext: Any, act_limit: Optional[float], swizzled: bool = False):
+    def __init__(self, ext: Any, act_limit: Optional[float], swizzled: bool = False, row_weighted: bool = False):
         self.ext = ext
         self.act_limit = act_limit
         self.swizzled = swizzled
+        self.row_weighted = row_weighted
 
     def check_environment(self) -> None:
         """Require ``EXL3_MOE_CPU_PIN=0``; else the kernel pins to the first cores."""
@@ -98,10 +100,11 @@ class Exl3CpuQuantTrait:
 
     def _params(self, bits: int) -> bytes:
         """``SglangExl3CpuParams``' bytes as the extension packs them (its torch op ``sglang_exl3_cpu::params``)."""
-        return self._op("params")(bits, int(self.swizzled)).numpy().tobytes()
+        return self._op("params")(bits, int(self.swizzled), int(self.row_weighted)).numpy().tobytes()
 
     def layer_spec(self, slabs: Mapping[str, torch.Tensor], capacity: int) -> CpuExpertLayerSpec:
-        """The layer's six slabs by base pointer and row size, and ``SglangExl3CpuParams``' bytes ({bits, swizzled})."""
+        """The layer's six slabs by base pointer and row size, and ``SglangExl3CpuParams``' bytes
+        ({bits, swizzled, row_weighted})."""
         hidden, intermediate, bits = self._dims(slabs, capacity)
         views = [slabs[name] for name in self.slab_names]
         return CpuExpertLayerSpec(

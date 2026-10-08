@@ -295,6 +295,9 @@ def dspark_env() -> dict[str, str]:
         "SGLANG_DSV41_DSPARK_DRAFT_RESIDENT_PATH": DSPARK_RESIDENT,
         "SGLANG_EXL3_CPU_ACT_RESIDUAL": "1",
         "SGLANG_EXL3_CPU_ACT_BLOCK": "128",
+        # Stated off: the row-weighted B arms (analysis/dsv41-drive/dspark/both_cpu_ab.py) override it, and a captured
+        # shell must not carry one into an A.
+        "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "",
         # Budget A, with DSPARK_MEM_FRACTION_STATIC (reasons and the owner's option-C TODO at DSPARK_MEM_FRACTION_STATIC).
         "SGLANG_MOE_HOT_GPU_MB": DSPARK_HOT_GPU_MB,
         # Every DSpark text result so far ran triton attention (§33.2, §33.8, §33.9).
