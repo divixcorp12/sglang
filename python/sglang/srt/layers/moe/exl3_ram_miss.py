@@ -925,6 +925,19 @@ class Exl3RamMissService:
         """The RAM prefetch pool's slots in every row: its share per NUMA group."""
         return self._spec_share * self.host.nodes if self._spec_share else 0
 
+    def _check_pool_room(self, tables, share: int, nodes: int) -> None:
+        """Refuse a pool share that leaves a row fewer than 2 assignable slots per NUMA group (the host's own bound,
+        which it checks per group range)."""
+        for row, layer_id in enumerate(tables.layer_ids):
+            capacity = int(tables.capacity[row])
+            staging = self.staging_for(capacity)
+            if capacity - staging - share * nodes < 2 * nodes:
+                raise RuntimeError(
+                    f"exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE={share} leaves layer {layer_id}'s "
+                    f"{capacity}-slot row fewer than {2 * nodes} assignable slots after {staging} staging and "
+                    f"{share * nodes} pool slots: lower the share or raise the pinned tier"
+                )
+
     def staging_for(self, capacity: int) -> int:
         """The staging slots a row of ``capacity`` slots keeps: the planned width, and never its last slot."""
         return min(self.staging_width(), capacity - 1)
@@ -1070,6 +1083,7 @@ class Exl3RamMissService:
             if spec_share:
                 if not envs.SGLANG_DSV41_CPU_EXPERTS.get():
                     raise RuntimeError("exl3 RAM miss: SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS")
+                self._check_pool_room(tables, spec_share, numa.nodes)
                 # Right after the staging slots, before the hot cache fills any slot.
                 host.reserve_spec_pool(spec_share)
             copy_engine = cfg.enable_ram_miss_copy_engine
