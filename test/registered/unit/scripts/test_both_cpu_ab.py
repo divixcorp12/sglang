@@ -60,14 +60,25 @@ def test_the_timed_dspark_arms_take_the_recipes_mem_fraction_and_prod_does_not(m
     assert "DSV41_MEM_FRACTION_STATIC" not in envs["prod"]
 
 
-def test_the_prefetch_arm_is_dspark_both_with_the_prefetch_on_and_its_a_states_it_off():
+def test_the_prefetch_arm_is_dspark_both_with_the_prefetch_on_and_its_a_states_it_off(monkeypatch):
     ab = _ab()
+    options = {
+        "SGLANG_DSV41_RAM_PREFETCH": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "1",
+        "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
+    }
     a, b = ab.ARMS["dspark-both"][0], ab.ARMS["dspark-both-prefetch"][0]
-    assert a["SGLANG_DSV41_RAM_PREFETCH"] == "0" and b["SGLANG_DSV41_RAM_PREFETCH"] == "1"
+    assert a["SGLANG_DSV41_RAM_PREFETCH"] == "0"
+    assert {k: b[k] for k in options} == options
     assert {k: v for k, v in a.items() if k != "SGLANG_DSV41_RAM_PREFETCH"} == {
-        k: v for k, v in b.items() if k != "SGLANG_DSV41_RAM_PREFETCH"
+        k: v for k, v in b.items() if k not in options
     }
     assert ab.ARMS["dspark-both-prefetch"][1] is True
+    for k in options:
+        monkeypatch.setenv(k, "9")
+    assert {k: ab._overrides("dspark-both-prefetch", "/out")[k] for k in options} == options
+    assert ab._overrides("dspark-both", "/out")["SGLANG_DSV41_RAM_PREFETCH"] == "0"
 
 
 def test_the_private_build_caches_reach_every_arms_server(monkeypatch):
