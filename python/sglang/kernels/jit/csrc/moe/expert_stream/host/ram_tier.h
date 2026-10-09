@@ -2075,10 +2075,15 @@ class RamTier {
     spec.bell.ring();
   }
 
-  // True once the group served a record of `target` after `source_seq`: the read would land behind its own record.
-  static bool spec_stale(const SpecGroup& spec, int64_t target, uint32_t source_seq) {
-    const uint32_t last = spec.row_seq[target].load(std::memory_order_acquire);
-    return last != 0 && reached(last, skip_zero(source_seq + 1u));
+  // True once the group served a record of `target`, or of the source row (a lapped target record leaves no trace),
+  // after `source_seq`: the read would land behind the record it was for.
+  static bool spec_stale(const SpecGroup& spec, int64_t source, int64_t target, uint32_t source_seq) {
+    const uint32_t next = skip_zero(source_seq + 1u);
+    for (const int64_t row : {source, target}) {
+      const uint32_t last = spec.row_seq[row].load(std::memory_order_acquire);
+      if (last != 0 && reached(last, next)) return true;
+    }
+    return false;
   }
 
   // The scorer's skips for `target`: an expert VRAM-hot there, mapped there (the host mirror), or pooled from another
@@ -2098,7 +2103,7 @@ class RamTier {
     SpecGroup& spec = *spec_->groups[g];
     const RamPrefetchConfig& config = spec_->config;
     const int64_t target = config.target[job.row];
-    if (spec_stale(spec, target, job.seq)) {
+    if (spec_stale(spec, job.row, target, job.seq)) {
       spec_count<kSpecDropped>(spec);
       return;
     }
@@ -2110,15 +2115,15 @@ class RamTier {
         config.gates + gate * experts_ * config.hidden, config.bias + gate * experts_, experts_, config.hidden,
         config.top_k, config.per_token, config.per_layer, spec.skip.data(), chosen);
     for (int i = 0; i < n; ++i)
-      if (Wire::home(chosen[i]) == g) spec_read(g, target, job.seq, chosen[i]);
+      if (Wire::home(chosen[i]) == g) spec_read(g, job.row, target, job.seq, chosen[i]);
   }
 
   // Reads `expert`'s row of `target` into a pool entry of group g under the group's reader turn, so a demand read
   // waits for at most this one row. Dropped when stale, or when the expert was mapped or pooled meanwhile.
-  void spec_read(int g, int64_t target, uint32_t source_seq, int32_t expert) {
+  void spec_read(int g, int64_t source, int64_t target, uint32_t source_seq, int32_t expert) {
     SpecGroup& spec = *spec_->groups[g];
     std::lock_guard<std::mutex> turn(spec.turn);
-    if (spec_stale(spec, target, source_seq) ||
+    if (spec_stale(spec, source, target, source_seq) ||
         __atomic_load_n(map_ + target * experts_ + expert, __ATOMIC_ACQUIRE) >= 0 ||
         pool_->find(target, g, expert) >= 0) {
       spec_count<kSpecDropped>(spec);
@@ -2127,8 +2132,8 @@ class RamTier {
     int i = -1;
     {
       std::lock_guard<std::mutex> lock(pool_->mutex(g));
-      i = pool_->claimable_locked(target, g);  // never a swapped entry: its victim may still be mapped
-      if (i < 0) {
+      i = pool_->claimable_locked(target, g, source_seq);  // never a swapped entry: its victim may still be mapped
+      if (i < 0) {  // every entry reading, swapped, or this job's own pick
         spec_count<kSpecDropped>(spec);
         return;
       }
@@ -2140,6 +2145,7 @@ class RamTier {
     spec.busy.store(++spec.episodes, std::memory_order_release);
     bool fail = false;
     if constexpr (Build::kFaults) {
+      apply_pending_fault(dist_.group(g));  // inject_fault reaches the reader under the turn, as for a demand read
       if (const int64_t ns = faults_.spec_delay_ns.load()) fault_delay(ns);
       fail = faults_.spec_fail.load();
     }

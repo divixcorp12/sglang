@@ -86,14 +86,15 @@ class SpecPool {
     return false;
   }
 
-  // Under mutex(g): an empty entry of `row`, else its oldest landed one, else -1.
-  int claimable_locked(int64_t row, int g) const {
+  // Under mutex(g): an empty entry of `row`, else its oldest landed one not issued from `seq`, else -1. A job never
+  // reclaims its own pick.
+  int claimable_locked(int64_t row, int g, uint32_t seq) const {
     int oldest = -1;
     for (int i = 0; i < share_; ++i) {
       const PoolEntry& e = entry(row, g, i);
       const uint32_t state = pool_state(e.word.load(std::memory_order_relaxed));
       if (state == kPoolEmpty) return i;
-      if (state == kPoolLanded &&
+      if (state == kPoolLanded && e.for_seq.load(std::memory_order_relaxed) != seq &&
           (oldest < 0 || e.landed.load(std::memory_order_relaxed) <
                              entry(row, g, oldest).landed.load(std::memory_order_relaxed)))
         oldest = i;
