@@ -53,7 +53,7 @@ def busy_within(intervals, t0, t1) -> float:
 
 def _load_engine(path):
     jobs = collections.defaultdict(dict)
-    busy, draft_open = [], None
+    busy, drafts, draft_open = [], [], None
     for e in _events(path):
         kind = e["event"]
         if kind in ("cpu_submit", "cpu_start", "cpu_end"):
@@ -63,12 +63,12 @@ def _load_engine(path):
         elif kind == "draft_start":
             draft_open = e["ns"]
         elif kind == "draft_end" and draft_open is not None:
-            busy.append((draft_open, e["ns"]))
+            drafts.append((draft_open, e["ns"]))
             draft_open = None
     for j in jobs.values():
         if "start" in j and "end" in j:
             busy.append((j["start"], j["end"]))
-    return jobs, busy
+    return jobs, busy + drafts, drafts
 
 
 def records(out_dir: str) -> list[dict]:
@@ -92,7 +92,7 @@ def records(out_dir: str) -> list[dict]:
         late, g = s["b"], s["group"]
         if late == 0 or g not in engines or key not in done:
             continue
-        jobs, busy = engines[g]
+        jobs, busy, drafts = engines[g]
         mine = [jobs.get(q) for q in range(s["seq"], s["a"] + 1)]
         mine = [j for j in mine if j]
         hit = [j for j in mine if j["part"] == 0]
@@ -103,6 +103,7 @@ def records(out_dir: str) -> list[dict]:
         land0, land1 = miss[0]["submit"], miss[-1]["submit"]
         hit_end = hit[0]["end"] if hit else None
         chain_end = max(j["end"] for j in miss)
+        lw0, lw1 = land1, miss[-1]["start"]
         out.append({
             "gen": key[0], "group": g, "row": s["row"], "misses": late, "hits": bin(s["c"]).count("1"),
             "batches": len(miss),
@@ -115,8 +116,23 @@ def records(out_dir: str) -> list[dict]:
             "hit_ms": ms(hit[0]["end"] - hit[0]["start"]) if hit else None,
             "last": "cpu" if key not in dma or chain_end >= dma[key] else "dma",
             "done_ms": ms(done[key] - t0),
+            "done_ns": done[key],
+            # The last landed row's wait for the thread: what kept the record from ending one lane after its last read.
+            "last_wait_ms": ms(lw1 - lw0),
+            "last_wait_hit_ms": ms(busy_within([(hit[0]["start"], hit[0]["end"])], lw0, lw1)) if hit else 0.0,
+            "last_wait_draft_ms": ms(busy_within(drafts, lw0, lw1)),
         })
     return sorted(out, key=lambda r: (r["gen"], r["group"]))
+
+
+def layer_gain_ms(recs: list[dict]) -> dict:
+    """Per record gen: how much sooner its later group would finish without its own CPU-hit job's share of the last
+    landed row's wait (every other time held fixed: an upper bound for moving the hits to the DMA)."""
+    by_gen = collections.defaultdict(list)
+    for r in recs:
+        by_gen[r["gen"]].append(r)
+    return {gen: (max(r["done_ns"] for r in rs) - max(r["done_ns"] - r["last_wait_hit_ms"] * 1e6 for r in rs)) / 1e6
+            for gen, rs in by_gen.items()}
 
 
 def summarize(recs: list[dict]) -> dict:
@@ -129,7 +145,9 @@ def summarize(recs: list[dict]) -> dict:
     for r in recs:
         by_m[min(r["misses"], 8)].append(r)
     keys = ("land_first_ms", "land_last_ms", "first_wait_ms", "hit_blocked_ms", "idle_before_land_ms", "tail_ms",
-            "done_ms")
+            "done_ms", "last_wait_ms", "last_wait_hit_ms", "last_wait_draft_ms")
+    mean = lambda xs: round(statistics.mean(xs), 3) if xs else None
+    gain = layer_gain_ms(recs)
     return {
         "records": len(recs),
         "median": {k: med([r[k] for r in recs]) for k in keys + ("miss_ms_per_lane",)},
@@ -138,6 +156,10 @@ def summarize(recs: list[dict]) -> dict:
         "hit_blocked_share": round(sum(r["hit_blocked_ms"] > 0 for r in recs) / len(recs), 3),
         "hit_blocked_ms_mean": round(statistics.mean(r["hit_blocked_ms"] for r in recs), 3),
         "last_side": {k: round(v / len(recs), 3) for k, v in sorted(side.items())},
+        "mean": {k: mean([r[k] for r in recs]) for k in ("last_wait_ms", "last_wait_hit_ms", "last_wait_draft_ms")},
+        "cpu_bound_share": round(sum(r["last_wait_ms"] > 0.05 for r in recs) / len(recs), 3),
+        "layer_gain_ms_total": round(sum(gain.values()), 1),
+        "layers_with_misses": len(gain),
         "by_misses": {str(m): {"records": len(rs), **{k: med([r[k] for r in rs]) for k in keys},
                                "batches": med([r["batches"] for r in rs])}
                       for m, rs in sorted(by_m.items())},

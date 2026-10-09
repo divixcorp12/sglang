@@ -61,6 +61,16 @@ def test_record_timeline(trace):
     assert r["tail_ms"] == pytest.approx(2.5)  # last miss job ends 5, last row landed 2.5
     assert r["miss_ms_per_lane"] == pytest.approx(1.0)
     assert r["last"] == "cpu"  # the miss chain (5) ends after the DMA (1)
+    # The last row landed at 2.5 and its job started at 4: 0.5 ms behind the hit job, 1 ms behind the first miss.
+    assert r["last_wait_ms"] == pytest.approx(1.5)
+    assert r["last_wait_hit_ms"] == pytest.approx(0.5)
+    assert r["last_wait_draft_ms"] == pytest.approx(0.0)
+
+
+def test_layer_gain_takes_the_later_group(trace):
+    recs = mt.records(str(trace))
+    # One group: the layer ends 0.5 ms sooner when the hit job's share of the last wait goes.
+    assert mt.layer_gain_ms(recs) == {7: pytest.approx(0.5)}
 
 
 def test_summary_counts_together_landings(trace):
