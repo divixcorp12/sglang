@@ -164,15 +164,17 @@ def test_both_groups_read_the_same_list_and_each_its_own_experts(tmp_path):
 
 
 def test_the_layer_budget_holds_over_both_groups(tmp_path):
-    """per_layer 2 over [2, 4 (both group 0), 3 (group 1)]: group 0 reads both, group 1 nothing."""
-    rig = prefetch_rig(tmp_path, nodes=2, share=2)
+    """per_layer 2 over [2, 4 (both group 0), 3 (group 1)]: both of the budget's candidates are group 0's, so group 1
+    reads nothing. A two-node rig holds one pooled row per group, so group 0 lands 2 and drops 4 for room; 4 still
+    counts toward the budget. Mutant: count only the candidates that land -- red (group 1 reads 3)."""
+    rig = prefetch_rig(tmp_path, nodes=2, share=1)
     try:
         page = enable_gpu(rig, per_layer=2)
         req = _record(rig)
         write_candidate_slot(page, req.seq, [(2, 0, 1.0), (4, 1, 0.5), (3, 0, 0.25)])
         assert rig.host.spec_pump(0) and rig.host.spec_pump(1)
-        assert _landed(rig.host, 1, 0) == [2, 4] and _landed(rig.host, 1, 1) == []
-        assert _counts(rig, "spec_issued") == (2,)
+        assert _landed(rig.host, 1, 0) == [2] and _landed(rig.host, 1, 1) == []
+        assert _counts(rig, "spec_issued") == (1,)
     finally:
         rig.host.stop()
 
