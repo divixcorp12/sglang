@@ -226,6 +226,11 @@ def summarize(out: str) -> dict:
             entry["warmup_rounds"] = len(warmups)
             entry["lifetime_tokens"] = lifetime
             entry["ram_rows_per_token_lifetime"] = counters["rows_read"] / lifetime if lifetime else None
+            # Drive load next to the saving: every NVMe row, and the speculative rows read but never used.
+            if lifetime and "spec_issued" in counters:
+                entry["nvme_rows_per_token_lifetime"] = (counters["rows_read"] + counters["spec_issued"]) / lifetime
+            if lifetime and "spec_landed" in counters and "spec_used" in counters:
+                entry["spec_wasted_per_token_lifetime"] = (counters["spec_landed"] - counters["spec_used"]) / lifetime
         reference = REFERENCE.get(arm)
         ref_probes = {a: os.path.join(out, f"{a}.probe.json") for a in (reference, arm)} if reference else {}
         if reference and not os.path.exists(ref_probes[reference]):
