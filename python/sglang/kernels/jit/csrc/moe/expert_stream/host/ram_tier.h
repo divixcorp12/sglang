@@ -2115,16 +2115,22 @@ class RamTier {
       while (entry.word.load(std::memory_order_acquire) == pool_word(kPoolReading, expert))
         _mm_pause();
     }
-    std::lock_guard<std::mutex> lock(pool_->mutex(g));
-    if (entry.word.load(std::memory_order_acquire) != pool_word(kPoolLanded, expert)) return -1;
-    const int32_t slot = entry.slot;
-    entry.slot = victim;
-    entry.freed_at = request.chain;
-    entry.word.store(pool_word(kPoolSwapped, kPoolNoExpert), std::memory_order_release);
-    count<kSpecUsed>(group);
+    int32_t slot;
+    [[maybe_unused]] uint32_t for_seq;  // read by the InstrBuild event only
+    {
+      std::lock_guard<std::mutex> lock(pool_->mutex(g));
+      if (entry.word.load(std::memory_order_acquire) != pool_word(kPoolLanded, expert)) return -1;
+      slot = entry.slot;
+      for_seq = entry.for_seq.load(std::memory_order_relaxed);
+      entry.slot = victim;
+      entry.freed_at = request.chain;
+      entry.word.store(pool_word(kPoolSwapped, kPoolNoExpert), std::memory_order_release);
+      count<kSpecUsed>(group);
+    }
     if constexpr (Build::kMetrics) {
+      // seq = the demand record that swapped it in, a = expert, b = slot, c = the entry's source seq (spec_submit's seq).
       if (spec_ != nullptr)  // the pool exists without the speculative state in some tests
-        spec_->groups[g]->trace.emit("spec_use", request.row, request.gen, request.seq, g, expert, slot);
+        spec_->groups[g]->trace.emit("spec_use", request.row, request.gen, request.seq, g, expert, slot, for_seq);
     }
     return slot;
   }
@@ -2257,10 +2263,12 @@ class RamTier {
       return;
     }
     spec_count<kSpecIssued>(spec);
-    // The target row's record that follows the source's; the slot is stable until a swap, which takes a landed entry.
-    const uint32_t target_seq = skip_zero(source_seq + 1u);
-    const int64_t slot = pool_->entry(target, g, i).slot;
-    if constexpr (Build::kMetrics) spec.trace.emit("spec_submit", target, 0, target_seq, g, expert, slot);
+    [[maybe_unused]] int64_t slot = 0;  // set and read by the InstrBuild events only
+    if constexpr (Build::kMetrics) {
+      slot = pool_->entry(target, g, i).slot;  // stable until a swap, which takes a landed entry
+      // row = target row, seq = source record seq, a = expert, b = slot, c = source row; spec_use's c joins on seq.
+      spec.trace.emit("spec_submit", target, 0, source_seq, g, expert, slot, source);
+    }
     spec.busy.store(++spec.episodes, std::memory_order_release);
     bool fail = false;
     if constexpr (Build::kFaults) {
@@ -2276,7 +2284,7 @@ class RamTier {
     spec.busy.store(0, std::memory_order_release);
     if (result == 1) {
       spec_count<kSpecLanded>(spec);
-      if constexpr (Build::kMetrics) spec.trace.emit("spec_land", target, 0, target_seq, g, expert, slot);
+      if constexpr (Build::kMetrics) spec.trace.emit("spec_land", target, 0, source_seq, g, expert, slot, source);
     } else {
       spec_count<kSpecFailed>(spec);
     }
