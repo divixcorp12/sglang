@@ -260,7 +260,8 @@ NON_TRACE_CLOCK_READS = {
     "while (now_ns() < deadline) {": 1,
     # Metrics, compiled only into InstrBuild (each inside `if constexpr (Build::kMetrics)`): copy_issue_ns, and the copy
     # latency's submit and completion reads.
-    "if constexpr (Build::kMetrics) start = now_ns();": 1,
+    "if constexpr (Build::kMetrics) start = now_ns();": 2,  # copy_issue_ns, and the RAM prefetch scorer's time
+    "stats_.add(kSpecScoreNs, now_ns() - start);": 1,  # the scorer's time, a metric on the speculative thread
     "count<kCopyIssueNs>(now_ns() - start);": 1,
     "if constexpr (Build::kMetrics) job.submit_ns = now_ns();  // copy_latency_ns, a metric": 1,
     "const int64_t latency = now_ns() - job.submit_ns;": 1,

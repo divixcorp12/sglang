@@ -2122,6 +2122,8 @@ class RamTier {
     entry.freed_at = request.chain;
     entry.word.store(pool_word(kPoolSwapped, kPoolNoExpert), std::memory_order_release);
     count<kSpecUsed>(group);
+    if constexpr (Build::kMetrics)
+      spec_->groups[g]->trace.emit("spec_use", request.row, request.gen, request.seq, g, expert, slot);
     return slot;
   }
 
@@ -2198,6 +2200,8 @@ class RamTier {
       spec_count<kSpecDropped>(spec);
       return;
     }
+    int64_t start = 0;
+    if constexpr (Build::kMetrics) start = now_ns();
     fill_spec_skip(target, job.seq, spec.skip.data());
     const int64_t gate = config.gate[job.row];
     int32_t chosen[GateScorer::kMaxPerLayer];
@@ -2205,6 +2209,10 @@ class RamTier {
         spec_->x_base + job.row * spec_->x_stride, job.tokens, spec_->x_token_bytes,
         config.gates + gate * experts_ * config.hidden, config.bias + gate * experts_, experts_, config.hidden,
         config.top_k, config.per_token, config.per_layer, spec.skip.data(), chosen);
+    if constexpr (Build::kMetrics) {
+      stats_.add(kSpecScored);
+      stats_.add(kSpecScoreNs, now_ns() - start);
+    }
     for (int i = 0; i < n; ++i) {
       if (Wire::home(chosen[i]) != g) continue;
       if (threaded && !spec_wait_unheld(spec)) return;  // a quiescer waits for one row, not the whole job
@@ -2247,6 +2255,10 @@ class RamTier {
       return;
     }
     spec_count<kSpecIssued>(spec);
+    // The target row's record that follows the source's; the slot is stable until a swap, which takes a landed entry.
+    const uint32_t target_seq = skip_zero(source_seq + 1u);
+    const int64_t slot = pool_->entry(target, g, i).slot;
+    if constexpr (Build::kMetrics) spec.trace.emit("spec_submit", target, 0, target_seq, g, expert, slot);
     spec.busy.store(++spec.episodes, std::memory_order_release);
     bool fail = false;
     if constexpr (Build::kFaults) {
@@ -2262,6 +2274,7 @@ class RamTier {
     spec.busy.store(0, std::memory_order_release);
     if (result == 1) {
       spec_count<kSpecLanded>(spec);
+      if constexpr (Build::kMetrics) spec.trace.emit("spec_land", target, 0, target_seq, g, expert, slot);
     } else {
       spec_count<kSpecFailed>(spec);
     }
@@ -2505,8 +2518,11 @@ class RamTier {
         count<kSpecDelayed>(group);
         std::atomic<int>& waiting = spec_->groups[group.index]->demand_waiting;
         waiting.fetch_add(1, std::memory_order_seq_cst);  // spec_read yields the turn to a waiting demand
+        struct Lower {  // a throwing lock must not leave the count raised
+          std::atomic<int>& count;
+          ~Lower() { count.fetch_sub(1, std::memory_order_relaxed); }
+        } lower{waiting};
         turn.lock();
-        waiting.fetch_sub(1, std::memory_order_relaxed);
       }
     }
     const bool publishing = init_piece_words_locked(group, request, lanes, plan.idx);
