@@ -36,14 +36,17 @@ def _until(predicate, timeout_s=10.0):
 def _spec_tids():
     tids = []
     for tid in os.listdir("/proc/self/task"):
-        with open(f"/proc/self/task/{tid}/comm") as f:
-            if f.read().strip().startswith("exl3-spec"):
-                tids.append(int(tid))
+        try:
+            with open(f"/proc/self/task/{tid}/comm") as f:
+                if f.read().strip().startswith("exl3-spec"):
+                    tids.append(int(tid))
+        except (FileNotFoundError, ProcessLookupError):
+            pass  # the thread exited mid-scan
     return tids
 
 
-def _started(tmp_path, *, delay_s=0.0, cores=None, per_token=1, per_layer=1):
-    rig = prefetch_rig(tmp_path)
+def _started(tmp_path, *, delay_s=0.0, cores=None, per_token=1, per_layer=1, rows=2):
+    rig = prefetch_rig(tmp_path, rows=rows)
     enable(rig, LOGITS, cores=cores, per_token=per_token, per_layer=per_layer)
     if delay_s:
         rig.host.inject_spec(delay_s=delay_s)
@@ -90,6 +93,37 @@ def test_a_demand_read_waits_for_at_most_the_speculative_row_in_flight(tmp_path)
         c = rig.host.counters()
         assert c["spec_landed"] == 1, "the demand read ran beside the speculative read"
         assert c["spec_delayed"] == 1 and waited < 2.0
+    finally:
+        rig.host.stop()
+
+
+def test_a_demand_waiting_at_the_turn_goes_before_the_jobs_next_read(tmp_path):
+    """Picks 2 then 4; a GPU miss of row 2 (neither the job's source nor its target, so the job stays live) arrives
+    while 2 reads. Mutant: no demand_waiting gate -- red (the thread retakes the turn and reads 4 first)."""
+    rig = _started(tmp_path, delay_s=0.4, per_token=2, per_layer=2, rows=3)
+    try:
+        trigger(rig)
+        assert _until(lambda: rig.host.counters()["spec_issued"] == 1)
+        req = rig.sim.post(2, [3])
+        assert rig.sim.wait_served(req, timeout_s=5.0)
+        c = rig.host.counters()
+        assert (c["spec_landed"], c["spec_delayed"]) == (1, 1), "the demand waited for more than one speculative read"
+        assert _until(lambda: rig.host.counters()["spec_landed"] == 2)
+    finally:
+        rig.host.stop()
+
+
+def test_a_forced_miss_whose_pool_read_fails_reads_the_row_itself(tmp_path):
+    rig = _started(tmp_path, delay_s=0.4)
+    try:
+        rig.host.inject_spec(delay_s=0.4, fail=True)
+        trigger(rig)
+        assert _until(lambda: rig.host.counters()["spec_issued"] == 1)
+        rows = rig.host.counters()["rows_read"]
+        forced(rig, 1, [2])
+        c = rig.host.counters()
+        assert (c["spec_promoted"], c["spec_failed"], c["spec_used"], c["rows_read"]) == (1, 1, 0, rows + 1)
+        assert rig.host.mapping(1)[2] >= 0 and all(e["state"] == "empty" for e in rig.host.spec_pool(1))
     finally:
         rig.host.stop()
 
