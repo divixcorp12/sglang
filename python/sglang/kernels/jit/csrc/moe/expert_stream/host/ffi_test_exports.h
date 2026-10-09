@@ -1264,6 +1264,8 @@ struct HostTestExports<HostExports<Layout, Reader, Build>> : HostExports<Layout,
     const int64_t hidden = w.size(1) / 2;
     if (w.size(1) % 2 != 0 || hidden < 1) throw std::runtime_error("score_gate: w rows are bf16");
     if (x.size(1) < 2 * hidden) throw std::runtime_error("score_gate: x rows are shorter than w's");
+    if (x.size(1) % 2 != 0 || reinterpret_cast<uintptr_t>(x.data_ptr()) % 2 != 0)
+      throw std::runtime_error("score_gate: x rows are fp16, an even number of bytes apart and aligned");
     try {
       expert_stream::check_gate_choice(experts, top_k, per_token, per_layer);
     } catch (const std::invalid_argument& error) {

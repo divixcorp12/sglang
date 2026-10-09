@@ -89,6 +89,15 @@ def _bare(tmp_path, capacity=7, k=3):
     return s, page, attached_host(s, page, k=k)
 
 
+def test_spec_pool_without_a_reserved_pool_is_refused(tmp_path):
+    s, page, host = _bare(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="no speculative pool"):
+            host.spec_pool(0)
+    finally:
+        host.stop()
+
+
 @pytest.mark.parametrize("share", [0, 5])
 def test_a_share_outside_one_to_four_is_refused(tmp_path, share):
     s, page, host = _bare(tmp_path)

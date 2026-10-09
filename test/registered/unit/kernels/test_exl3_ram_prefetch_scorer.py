@@ -17,6 +17,7 @@ DEPTH = 12
 def reference(x, w, bias, skip, *, top_k, per_token, per_layer):
     logits = x.float() @ w.float().T
     scores = torch.where(logits > 20, logits, torch.log1p(torch.exp(logits))).sqrt() + bias
+    scores = torch.where(scores.isnan(), torch.tensor(float("-inf")), scores)  # a NaN score ranks below every other
     best = {}
     experts = w.shape[0]
     for m in range(x.shape[0]):
@@ -29,7 +30,8 @@ def reference(x, w, bias, skip, *, top_k, per_token, per_layer):
                 break
             if skip[e]:
                 continue
-            margin = float(s[e] - kth)  # an fp32 subtraction, as the host's
+            # an fp32 subtraction, as the host's; equal scores (also two infinities) give 0, -inf stays above unpicked
+            margin = 0.0 if s[e] == kth else max(float(s[e] - kth), -3.4028234663852886e38)
             best[e] = max(best.get(e, float("-inf")), margin)
             picked += 1
     return [e for e, _ in sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))][:per_layer]
@@ -140,3 +142,109 @@ def test_a_choice_outside_the_hosts_bounds_is_refused(kw, why):
     x, w, bias = _exact_case(0)
     with pytest.raises(Exception, match=why):
         es.score_gate(x, w, bias, [False] * 16, **kw)
+
+
+def _lead_case(seed, tokens=3, experts=16, hidden=16):
+    """_exact_case with a lead term of 128, so x may go negative while every logit stays an exact integer above 20."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randint(-2, 4, (tokens, hidden), generator=g).to(torch.float16)
+    x[:, 0] = 1
+    w = torch.randint(0, 4, (experts, hidden), generator=g).to(torch.bfloat16)
+    w[:, 0] = 128
+    bias = torch.randperm(experts, generator=g).float() * 1e-3
+    return x, w, bias
+
+
+KW = dict(top_k=6, per_token=2, per_layer=4)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_negative_fp16_inputs_rank_as_the_reference(seed):
+    x, w, bias = _lead_case(seed)
+    assert (x < 0).any()
+    assert es.score_gate(x, w, bias, [False] * 16, **KW) == reference(x, w, bias, [False] * 16, **KW)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_subnormal_fp16_inputs_are_not_flushed(seed):
+    """x's second column is 2^-24 * a (fp16 subnormals) against w = 2^30 * b: terms of 64 * a * b that reorder the
+    experts if the host flushed or mis-scaled a subnormal."""
+    x, w, bias = _lead_case(seed)
+    g = torch.Generator().manual_seed(50 + seed)
+    a = torch.randint(1, 4, (x.shape[0],), generator=g)
+    b = torch.randint(0, 4, (w.shape[0],), generator=g)
+    x[:, 1] = (a.float() * 2.0**-24).to(torch.float16)
+    w[:, 1] = (b.float() * 2.0**30).to(torch.bfloat16)
+    assert 0 < float(x[0, 1]) < 2.0**-14
+    assert es.score_gate(x, w, bias, [False] * 16, **KW) == reference(x, w, bias, [False] * 16, **KW)
+
+
+def test_an_infinite_input_ranks_as_the_reference_with_nan_scores_last():
+    """x[:, 2] = inf: an expert with w > 0 there scores +inf, one with w == 0 scores NaN (inf * 0) and ranks last."""
+    x, w, bias = _lead_case(1)
+    x[:, 2] = float("inf")
+    w[:, 2] = torch.tensor([0, 1, 2, 3] * 4, dtype=torch.bfloat16)
+    chosen = es.score_gate(x, w, bias, [False] * 16, top_k=6, per_token=12, per_layer=8)
+    assert chosen == reference(x, w, bias, [False] * 16, top_k=6, per_token=12, per_layer=8)
+    assert all(e % 4 != 0 for e in chosen)  # the 4 NaN experts never beat the 12 infinite ones
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_nan_scores_rank_last_in_id_order_whatever_the_comparison_sort_does(seed):
+    """A NaN bias on half the experts, ids shuffled: NaN breaks the sort's strict weak ordering unless it is mapped."""
+    x, w, bias = _exact_case(seed, hidden=16)
+    g = torch.Generator().manual_seed(200 + seed)
+    bias[torch.randperm(16, generator=g)[:8]] = float("nan")
+    kw = dict(top_k=3, per_token=12, per_layer=8)
+    chosen = es.score_gate(x, w, bias, [False] * 16, **kw)
+    assert chosen == reference(x, w, bias, [False] * 16, **kw)
+    assert chosen == es.score_gate(x, w, bias, [False] * 16, **kw)
+
+
+def _raw(x, w, bias, skip, *, top_k=6, per_token=2, per_layer=4):
+    """The FFI as a direct caller sees it: x, w as raw bytes, no wrapper to even the strides."""
+    out = torch.full((per_layer,), -1, dtype=torch.int64)
+    return es._host_module("exl3", None).expert_stream_score_gate(
+        x, w, bias, torch.tensor(skip, dtype=torch.uint8), top_k, per_token, per_layer, out
+    )
+
+
+def _bytes(x, w):
+    return x.contiguous().view(torch.uint8), w.contiguous().view(torch.uint8)
+
+
+def test_the_raw_ffi_scores_what_the_wrapper_scores():
+    x, w, bias = _exact_case(0)
+    xb, wb = _bytes(x, w)
+    assert _raw(xb, wb, bias, [False] * 16) == len(es.score_gate(x, w, bias, [False] * 16, **KW))
+
+
+def test_an_odd_x_row_stride_is_refused():
+    x, w, bias = _exact_case(0)
+    xb, wb = _bytes(x, w)
+    odd = torch.cat([xb, torch.zeros(xb.shape[0], 1, dtype=torch.uint8)], dim=1)
+    with pytest.raises(Exception, match="x rows are fp16"):
+        _raw(odd, wb, bias, [False] * 16)
+
+
+def test_x_rows_shorter_than_w_are_refused():
+    x, w, bias = _exact_case(0)
+    xb, wb = _bytes(x, w)
+    with pytest.raises(Exception, match="x rows are shorter"):
+        _raw(xb[:, : xb.shape[1] - 2].contiguous(), wb, bias, [False] * 16)
+
+
+def test_odd_w_rows_are_refused():
+    x, w, bias = _exact_case(0)
+    xb, wb = _bytes(x, w)
+    with pytest.raises(Exception, match="w rows are bf16"):
+        _raw(xb, torch.cat([wb, torch.zeros(wb.shape[0], 1, dtype=torch.uint8)], dim=1), bias, [False] * 16)
+
+
+def test_a_bias_or_skip_of_the_wrong_length_is_refused():
+    x, w, bias = _exact_case(0)
+    xb, wb = _bytes(x, w)
+    with pytest.raises(Exception):
+        _raw(xb, wb, bias[:8].contiguous(), [False] * 16)
+    with pytest.raises(Exception):
+        _raw(xb, wb, bias, [False] * 8)

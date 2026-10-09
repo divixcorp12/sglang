@@ -55,6 +55,9 @@ class GateScorer {
 
   // Sizes the scratch once, so choose() allocates nothing.
   void reserve(int64_t tokens, int64_t hidden, int64_t experts) {
+    tokens_ = tokens;
+    hidden_ = hidden;
+    experts_ = experts;
     x_.assign(static_cast<size_t>(tokens * hidden), 0.0f);
     score_.assign(static_cast<size_t>(tokens * experts), 0.0f);
     best_.assign(static_cast<size_t>(experts), 0.0f);
@@ -64,6 +67,8 @@ class GateScorer {
 
   // Scores fp16 rows `x_token_bytes` apart against bf16 `w` [experts, hidden] plus `bias`, passing over `skip[e] != 0`;
   // writes up to per_layer experts to `out`, best margin first, and returns how many. Call check_gate_choice first.
+  // A NaN score (a NaN input or bias) ranks below every other, in id order; a margin between equal scores is 0.
+  // Throws std::invalid_argument for sizes beyond what reserve() sized.
   int choose(
       const uint8_t* x,
       int64_t tokens,
@@ -77,6 +82,8 @@ class GateScorer {
       int per_layer,
       const uint8_t* skip,
       int32_t* out) {
+    if (tokens < 0 || tokens > tokens_ || hidden != hidden_ || experts != experts_)
+      throw std::invalid_argument("the scorer was reserved for other sizes");
     for (int64_t t = 0; t < tokens; ++t) {
       const auto* row = reinterpret_cast<const uint16_t*>(x + t * x_token_bytes);
       for (int64_t h = 0; h < hidden; ++h)
@@ -84,8 +91,10 @@ class GateScorer {
     }
     for (int64_t e = 0; e < experts; ++e) {
       const uint16_t* we = w + e * hidden;
-      for (int64_t t = 0; t < tokens; ++t)
-        score_[t * experts + e] = std::sqrt(softplus(dot(we, &x_[t * hidden], hidden))) + bias[e];
+      for (int64_t t = 0; t < tokens; ++t) {
+        const float score = std::sqrt(softplus(dot(we, &x_[t * hidden], hidden))) + bias[e];
+        score_[t * experts + e] = std::isnan(score) ? -std::numeric_limits<float>::infinity() : score;
+      }
     }
     std::fill(best_.begin(), best_.begin() + experts, -std::numeric_limits<float>::infinity());
     const int64_t depth = std::min<int64_t>(kDepth, experts);
@@ -100,7 +109,9 @@ class GateScorer {
       for (int64_t i = 0; i < depth && picked < per_token; ++i) {
         const int32_t e = order_[i];
         if (skip[e]) continue;
-        best_[e] = std::max(best_[e], s[e] - kth);
+        // Equal scores (also two infinities) give 0, and -inf - finite stays above best_'s unpicked sentinel.
+        const float margin = s[e] == kth ? 0.0f : std::max(s[e] - kth, std::numeric_limits<float>::lowest());
+        best_[e] = std::max(best_[e], margin);
         ++picked;
       }
     }
@@ -131,6 +142,7 @@ class GateScorer {
     return sum;
   }
 
+  int64_t tokens_ = 0, hidden_ = 0, experts_ = 0;  // reserve()'s sizes
   std::vector<float> x_;      // [tokens, hidden]
   std::vector<float> score_;  // [tokens, experts]
   std::vector<float> best_;   // [experts]: an expert's best margin over the tokens, -inf when not picked

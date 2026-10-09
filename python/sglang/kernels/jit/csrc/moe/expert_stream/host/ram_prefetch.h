@@ -67,7 +67,8 @@ class SpecPool {
     return mutexes_[g];
   }
 
-  // Group g's entry of `row` holding `expert`, reading or landed, or -1. Atomic loads: any thread.
+  // Group g's entry of `row` holding `expert`, reading or landed, or -1. A kPoolSwapped entry (its slot went into the
+  // row's mapping) carries kPoolNoExpert, so it never matches. Atomic loads: any thread.
   int find(int64_t row, int g, int32_t expert) const {
     for (int i = 0; i < share_; ++i) {
       const uint32_t word = entry(row, g, i).word.load(std::memory_order_acquire);
