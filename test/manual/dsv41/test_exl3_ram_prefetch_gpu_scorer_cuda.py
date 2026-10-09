@@ -234,3 +234,31 @@ def test_a_captured_post_and_its_scoring_replay_the_reference_candidates(tmp_pat
         assert c.handled()
     finally:
         c.close()
+
+
+@pytest.mark.parametrize("w_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("hidden", [60, 62, 64, 1032])
+def test_hidden_sizes_off_the_vector_width_rank_as_the_reference(hidden, w_dtype):
+    """The score kernel's vector loads cover hidden // width chunks and a scalar loop the rest; 62 is off both widths."""
+    x, w, bias = exact_gate_case(3, hidden=hidden)
+    got = _candidates(x.to(BF16), w.to(w_dtype), bias, top_k=6, per_token=2)
+    assert list(got.picks) == gate_reference(x, w, bias, [False] * 16, top_k=6, per_token=2, per_layer=KEEP, meta=True)
+
+
+def test_an_input_off_16_byte_alignment_ranks_as_the_reference():
+    """x two bytes into its allocation: the kernel must not take its 16-byte vector path."""
+    x, w, bias = exact_gate_case(4)
+    flat = torch.empty(x.numel() + 1, dtype=BF16, device="cuda")
+    shifted = flat[1:].view(x.shape)
+    shifted.copy_(x.to(BF16))
+    assert shifted.data_ptr() % 16 != 0
+    got = _candidates(shifted, w, bias, top_k=6, per_token=2)
+    assert list(got.picks) == gate_reference(x, w, bias, [False] * 16, top_k=6, per_token=2, per_layer=KEEP, meta=True)
+
+
+@pytest.mark.parametrize("tokens", [9, 17])
+def test_records_wider_than_one_token_tile_rank_as_the_reference(tokens):
+    """More tokens than the kernel accumulates per pass over a gate row: each pass reuses the block's partial sums."""
+    x, w, bias = exact_gate_case(5, tokens=tokens)
+    got = _candidates(x.to(BF16), w, bias, top_k=6, per_token=1, tokens_max=tokens)
+    assert list(got.picks) == gate_reference(x, w, bias, [False] * 16, top_k=6, per_token=1, per_layer=KEEP, meta=True)
