@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 
+import pytest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -68,6 +70,7 @@ def test_the_prefetch_arm_is_dspark_both_with_the_prefetch_on_and_its_a_states_i
         "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "1",
         "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
         "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY": "0",
+        "SGLANG_DSV41_RAM_PREFETCH_SCORER": "cpu",
     }
     a, b = ab.ARMS["dspark-both"][0], ab.ARMS["dspark-both-prefetch"][0]
     assert a["SGLANG_DSV41_RAM_PREFETCH"] == "0"
@@ -189,3 +192,61 @@ def test_a_missing_reference_probe_is_recorded(tmp_path):
     summary = ab.summarize(str(tmp_path))
     assert summary["dspark-both-prefetch"]["text_vs_reference"] == "missing reference probe"
     assert "text_vs_reference" not in summary["dspark-both"]
+
+
+def test_the_gpu_arm_differs_from_the_prefetch_arm_in_the_scorer_alone(monkeypatch):
+    ab = _ab()
+    b, g = ab.ARMS["dspark-both-prefetch"][0], ab.ARMS["dspark-both-prefetch-gpu"][0]
+    assert (b["SGLANG_DSV41_RAM_PREFETCH_SCORER"], g["SGLANG_DSV41_RAM_PREFETCH_SCORER"]) == ("cpu", "gpu")
+    assert {k: v for k, v in g.items() if k != "SGLANG_DSV41_RAM_PREFETCH_SCORER"} == {
+        k: v for k, v in b.items() if k != "SGLANG_DSV41_RAM_PREFETCH_SCORER"
+    }
+    assert ab.ARMS["dspark-both-prefetch-gpu"][1] is True and ab.REFERENCE["dspark-both-prefetch-gpu"] == "dspark-both"
+    t = ab.ARMS["dspark-both-prefetch-gpu-topk"][0]
+    assert {k: v for k, v in t.items() if k != "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"} == {
+        k: v for k, v in g.items() if k != "SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"
+    }
+    assert t["SGLANG_DSV41_RAM_PREFETCH_TOP_K_ONLY"] == "1"
+    monkeypatch.setenv("SGLANG_DSV41_RAM_PREFETCH_SCORER", "cpu")
+    assert ab._overrides("dspark-both-prefetch-gpu", "/out")["SGLANG_DSV41_RAM_PREFETCH_SCORER"] == "gpu"
+
+
+def test_the_driver_runs_the_arms_in_the_order_given(monkeypatch, tmp_path):
+    """The reversed A/B (B first) relies on it."""
+    ab = _ab()
+    ran = []
+    monkeypatch.setattr(ab, "run_timed", lambda arm, out: ran.append(("timed", arm)) or 0)
+    monkeypatch.setattr(ab, "run_probe", lambda arm, out: ran.append(("probe", arm)) or 0)
+    monkeypatch.setattr(ab, "summarize", lambda out: {})
+    monkeypatch.setattr(ab.sys, "argv", ["both_cpu_ab.py", str(tmp_path), "dspark-both-prefetch-gpu", "dspark-both"])
+    ab.main()
+    assert ran == [
+        ("timed", "dspark-both-prefetch-gpu"),
+        ("probe", "dspark-both-prefetch-gpu"),
+        ("timed", "dspark-both"),
+        ("probe", "dspark-both"),
+    ]
+
+
+def _session_rows(root, arm, ms):
+    run = root / "servers" / arm / "run-1"
+    run.mkdir(parents=True)
+    (run / "results.jsonl").write_text(
+        "".join(
+            json.dumps({"session_id": f"s{i}", "decode_tokens_per_sec": 1000.0 / v, "completion_tokens": 10,
+                        "spec_tokens_details": {}}) + "\n"
+            for i, v in enumerate(ms)
+        )
+    )
+    counters = {"rows_read": 100, "spec_used": 50, "spec_promoted": 5, "spec_late": 3}
+    (run / "server.log").write_text("exl3 RAM miss thread counters " + json.dumps(counters) + "\n")
+
+
+def test_the_summary_pairs_sessions_and_reports_reads_still_in_flight(tmp_path):
+    ab = _ab()
+    _session_rows(tmp_path, "dspark-both", [100.0, 200.0, 50.0])
+    _session_rows(tmp_path, "dspark-both-prefetch-gpu", [90.0, 210.0, 40.0])
+    g = ab.summarize(str(tmp_path))["dspark-both-prefetch-gpu"]
+    assert g["paired_gain_pct_vs_reference"] == pytest.approx({"s0": 10.0, "s1": -5.0, "s2": 20.0})
+    assert g["paired_gain_pct_median"] == pytest.approx(10.0)
+    assert g["spec_in_flight_at_use"] == pytest.approx(0.1) and g["ram"]["spec_late"] == 3
