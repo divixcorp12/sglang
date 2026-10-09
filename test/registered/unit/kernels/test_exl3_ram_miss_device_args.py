@@ -387,6 +387,37 @@ def test_the_device_side_passes_each_rows_capacity_to_the_post_launch():
     assert [(name, args[22]) for name, args in recorder.calls] == [("expert_stream_post", 5), ("expert_stream_post", 7)]
 
 
+@pytest.mark.parametrize("kwargs, want", [({}, (0, 3)), ({"miss_cut": 1, "miss_cut_max": 2}, (1, 2))])
+def test_the_device_side_passes_the_split_miss_cut_after_cpu_misses(kwargs, want):
+    """SGLANG_DSV41_CPU_SPLIT_MISS_CUT / _MAX reach the post as the two arguments after cpu_misses (index 25); off,
+    the cut is 0 and the post types lanes as before it existed."""
+    dev = _device(**kwargs)
+    recorder = _Recorder()
+    dev._kernels = lambda: recorder
+    _post(dev, _args())
+    ((_, args),) = recorder.calls
+    assert (args[26], args[27]) == want
+
+
+@pytest.mark.parametrize("name", ["miss_cut", "miss_cut_max"])
+def test_a_negative_split_miss_cut_is_refused(name):
+    with pytest.raises(ValueError, match=name):
+        _device(**{name: -1})
+
+
+def test_the_service_builds_its_device_side_with_the_split_miss_cut_env():
+    """exl3_ram_miss reads the two env vars where it reads SGLANG_DSV41_CPU_EXPERTS_MISSES."""
+    import sglang.srt.layers.moe.exl3_ram_miss as service
+
+    tree = ast.parse(Path(service.__file__).read_text())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "ExpertStreamDevice"]
+    assert calls
+    for call in calls:
+        kw = {k.arg: ast.unparse(k.value) for k in call.keywords}
+        assert kw["miss_cut"] == "envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get()"
+        assert kw["miss_cut_max"] == "envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get()"
+
+
 def test_the_chain_has_no_hit_wait_and_the_post_fills_c1s_compaction():
     """The post types the lanes and writes C1's compacted SM hits itself: there is no W1 to launch."""
     dev = _device()

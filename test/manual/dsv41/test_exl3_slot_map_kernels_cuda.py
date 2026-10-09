@@ -289,6 +289,47 @@ def test_post_spills_forced_lanes_like_the_reference(tmp_path, armed):
         c.close()
 
 
+# (experts, ram hits among them, forced_from): two unforced RAM hits (n = 2, SPLIT[2] = 1), then forced lanes.
+MISS_CUT_CASES = [
+    ([0, 1], [0, 1], 2),  # no forced miss: the split stands
+    ([0, 1, 2], [0, 1], 2),  # 1 forced miss: cut
+    ([0, 1, 2, 3], [0, 1], 2),  # 2
+    ([0, 1, 2, 3, 4], [0, 1], 2),  # 3
+    ([0, 1, 2, 3, 4, 5], [0, 1], 2),  # 4: past miss_cut_max, the split stands
+    ([0, 1, 2, 3], [0, 1, 2, 3], 2),  # forced hits are not misses: the split stands
+]
+
+
+@pytest.mark.parametrize("experts, hits, forced_from", MISS_CUT_CASES)
+def test_the_split_miss_cut_types_lanes_like_the_reference(tmp_path, experts, hits, forced_from):
+    """Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1, _MAX=3): the CUDA typing is ram_slot_map.type_lanes's with the
+    cut, and the cut changes the kinds exactly where the reference says. Mutations: drop the miss_cut_max bound (the
+    4-miss case goes red); count forced hits as misses (the forced-hit case goes red)."""
+    c = Chain(tmp_path, start=False, copy_engine=True, hit_copy="ce", cpu_misses=False, miss_cut=1, miss_cut_max=3)
+    try:
+        c.dev.cpu_x_rows = torch.zeros((2, 128), dtype=torch.uint8).pin_memory()
+        c.dev.set_row_cpu(0)
+        _set_host_words(c, armed=True)
+        staging = list(range(8, 14))
+        _write_delta(c, 0, 1, staging)
+        ram = [-1] * EXPERTS
+        for e in hits:
+            ram[e] = e
+        c.dev.map_bulk_apply(torch.tensor([[0, e, s] for e, s in enumerate(ram)], dtype=torch.int32))
+        flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+        overflows = torch.zeros(1, dtype=torch.int64, device="cuda")
+        got = _post_spill(c, experts, forced_from, flag, overflows)
+        ref = dict(captured=True, copy_armed=True, hit_copy="ce", cpu_on=True, cpu_misses=False, lanes=W.lanes,
+                   forced_from=forced_from)
+        kinds, slots = type_lanes(experts, ram, staging, SPLIT, miss_cut=1, miss_cut_max=3, **ref)
+        assert got == (len(experts), [int(k) for k in kinds], slots) and int(flag.item()) == 0
+        uncut, _ = type_lanes(experts, ram, staging, SPLIT, **ref)
+        forced_misses = sum(1 for e in experts[forced_from:] if ram[e] < 0)
+        assert (kinds != uncut) == (1 <= forced_misses <= 3)
+    finally:
+        c.close()
+
+
 def test_a_40_lane_post_makes_36_forced_misses_on_one_node_cpu_lanes(tmp_path):
     """Review Focus 2 at the record's full width: 36 distinct NVMe misses on one node of a 40-lane wire, 8 with VRAM
     victims. The 8 live misses take the node's 8 staging slots; the 28 forced ones are CPU misses with slot -1 (the

@@ -206,3 +206,48 @@ def test_an_unforced_miss_without_staging_still_raises_plainly():
     with pytest.raises(ValueError) as refused:
         _type([0, 7], [-1] * 16, NO_STAGING, cpu_on=True, forced_from=1)
     assert not isinstance(refused.value, LaneOverflow)
+
+
+def _cut_post(forced, *, unforced=(0, 2, 4, 6), miss_cut=1, miss_cut_max=3, ram_hits=()):
+    """Unforced RAM hits on node 0 (even experts: n = 4, split[4] = 3), then the ``forced`` lanes (spill). Experts in
+    ``ram_hits`` are RAM hits, every other forced lane an NVMe miss. Returns how many unforced lanes the CPU takes."""
+    lanes, nodes = 8, 2
+    ram = [-1] * 16
+    for e in (*unforced, *ram_hits):
+        ram[e] = e
+    experts = [*unforced, *forced]
+    kinds, _ = type_lanes(
+        experts, ram, _staging(nodes, lanes, [0, 0]), SPLIT * nodes, lanes=lanes, captured=True, copy_armed=True,
+        hit_copy="ce", cpu_on=True, cpu_misses=False, nodes=nodes, forced_from=len(unforced),
+        miss_cut=miss_cut, miss_cut_max=miss_cut_max,
+    )
+    assert all(k in (LaneKind.HIT_CPU, LaneKind.MISS_CPU) for k in kinds[len(unforced):])  # forced lanes stay CPU
+    return sum(k == LaneKind.HIT_CPU for k in kinds[: len(unforced)])
+
+
+@pytest.mark.parametrize("forced, take", [((), 3), ((8,), 2), ((8, 10), 2), ((8, 10, 12), 2), ((8, 10, 12, 14), 3)])
+def test_the_miss_cut_takes_one_cpu_lane_off_a_node_with_one_to_three_forced_misses(forced, take):
+    """Experiment (SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1, _MAX=3): a forced CPU miss queues behind the record's CPU-hit
+    job, so a node with 1..3 of them gives one of its split's lanes back to the GPU; 0 or 4 keep the split."""
+    assert _cut_post(forced) == take
+
+
+def test_the_miss_cut_floors_at_zero():
+    assert _cut_post((8,), unforced=(0,), miss_cut=2) == 0  # split[1] = 1, minus 2
+
+
+def test_a_forced_miss_on_another_node_does_not_cut_this_one():
+    assert _cut_post((9, 11)) == 3  # node 1's misses; node 1 has no unforced lanes
+
+
+def test_forced_hits_are_not_misses_for_the_cut():
+    assert _cut_post((8, 10), ram_hits=(8, 10)) == 3
+
+
+def test_a_zero_cut_is_todays_typing():
+    assert _cut_post((8, 10), miss_cut=0) == 3
+    ram = [-1] * 16
+    ram[1], ram[2] = 4, 5
+    staging = [9, 10] + [-1] * 6
+    assert _type([1, 0, 2, 7], ram, staging, cpu_on=True, forced_from=2, miss_cut=0, miss_cut_max=3) == _type(
+        [1, 0, 2, 7], ram, staging, cpu_on=True, forced_from=2)

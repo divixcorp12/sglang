@@ -41,7 +41,8 @@ class Chain:
     def __init__(
         self, tmp_path, *, capacity=CAPACITY, staging=STAGING, mirror_weights=None, timeout_ms=2000, lease_pdl=False,
         copy_engine=False, sm_small_copies=False, copy_wait_ms=2000, start=True, variant="instr", hit_copy="ce",
-        cpu_misses=False, gpu_hot=False, lanes=8, experts=EXPERTS, top_k=TOP_K, dst_rows=DST_ROWS,
+        cpu_misses=False, gpu_hot=False, lanes=8, experts=EXPERTS, top_k=TOP_K, dst_rows=DST_ROWS, miss_cut=0,
+        miss_cut_max=3,
     ):
         """``lanes`` is the build's lane count; ``top_k`` is each row's plan width and ``dst_rows`` its destination
         rows (both at least the widest plan the test posts)."""
@@ -90,6 +91,7 @@ class Chain:
                 timeout_ms=timeout_ms, piece_runs=self.host.piece_runs(),
                 row_capacities=[int(c) for c in self.tables.capacity], lease_pdl=lease_pdl,
                 hit_copy=hit_copy, cpu_misses=cpu_misses, hot_page=self.hot_page, lanes=lanes,
+                miss_cut=miss_cut, miss_cut_max=miss_cut_max,
             )
             if copy_engine:
                 for row in range(LAYERS):

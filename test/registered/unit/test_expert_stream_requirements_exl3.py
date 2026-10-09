@@ -441,6 +441,27 @@ def test_cpu_misses_need_cpu_experts(model_dir):
         _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), SGLANG_DSV41_CPU_EXPERTS_MISSES=True)
 
 
+def test_the_split_miss_cut_needs_cpu_experts(model_dir):
+    """SGLANG_DSV41_CPU_SPLIT_MISS_CUT trims the CPU's split; without CPU experts there is no split to trim, so a set
+    cut is a launch typo. With CPU experts it passes, and a zero cut passes either way."""
+    launch = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    _gate(launch, **CPU_EXPERTS_ENV, SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1, SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX=3)
+    _gate(launch, SGLANG_DSV41_CPU_SPLIT_MISS_CUT=0)
+    with pytest.raises(ValueError, match="SGLANG_DSV41_CPU_SPLIT_MISS_CUT needs SGLANG_DSV41_CPU_EXPERTS=1"):
+        _gate(launch, SGLANG_DSV41_CPU_SPLIT_MISS_CUT=1)
+
+
+@pytest.mark.parametrize("name", ["SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX"])
+def test_a_negative_split_miss_cut_option_is_refused(model_dir, name):
+    with pytest.raises(ValueError, match=f"{name} must be >= 0, got -1"):
+        _gate(_launch(model_dir, cuda_graph_config=BREAKABLE_BS1), **CPU_EXPERTS_ENV, **{name: -1})
+
+
+def test_the_split_miss_cut_is_off_by_default():
+    assert envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT.get() == 0
+    assert envs.SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX.get() == 3
+
+
 @pytest.mark.parametrize("value", ["ce", "sm"])
 def test_either_hit_copy_passes_with_cpu_experts(model_dir, value):
     """CPU completion uses the copy thread and the gate whichever way the hits are copied."""
