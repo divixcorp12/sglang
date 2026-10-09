@@ -51,9 +51,8 @@ enum Counter : int {
   // CPU experts: CPU jobs (one per part of a record) and their lanes.
   kCpuJobs,
   kCpuLanes,
-  // RAM prefetch (ram_prefetch.h): speculative reads started, landed; pool rows a forced miss swapped in, and of those
-  // the ones whose read was still in flight (promoted); candidates dropped (stale, mapped or pooled since scoring, or
-  // a full ring); reads failed; demand reads that waited at the reader's turn for a speculative read.
+  // RAM prefetch (ram_prefetch.h): speculative reads started, landed; pool rows a forced miss swapped in (promoted:
+  // still reading); candidates dropped (stale, mapped, pooled or a full ring); failed reads; demands that waited a turn.
   kSpecIssued,
   kSpecLanded,
   kSpecUsed,
