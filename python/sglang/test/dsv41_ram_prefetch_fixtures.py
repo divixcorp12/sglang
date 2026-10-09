@@ -168,10 +168,10 @@ def trigger(rig: PrefetchRig, *, tokens: int = 1, resident: int = 5) -> SimReque
     return req
 
 
-def enable_gpu(rig: PrefetchRig, *, targets=None, top_k=2, per_token=1, per_layer=1) -> torch.Tensor:
+def enable_gpu(rig: PrefetchRig, *, targets=None, top_k=2, per_token=1, per_layer=1, min_margin=None) -> torch.Tensor:
     """The GPU scorer on the rig (spec 2026-10-09-dsv41-ram-prefetch-gpu-scorer-design): row 0 targets row 1 unless
     `targets` (int64 [rows, 2]) says otherwise. Returns the candidate page, which the test writes as the select kernel
-    would (write_candidate_slot)."""
+    would (write_candidate_slot). `min_margin` (fp32 [rows]) is the per-target-row margin floor."""
     rows = rig.x_rows.shape[0]
     if targets is None:
         targets = torch.tensor([[1, 0]] + [[-1, -1]] * (rows - 1), dtype=torch.int64)
@@ -185,6 +185,7 @@ def enable_gpu(rig: PrefetchRig, *, targets=None, top_k=2, per_token=1, per_laye
         per_layer=per_layer,
         cores=[[] for _ in range(rig.host.nodes)],
         candidates=page,
+        min_margin=min_margin,
     )
     return page
 

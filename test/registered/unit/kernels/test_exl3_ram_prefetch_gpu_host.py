@@ -16,6 +16,7 @@ from sglang.test.dsv41_ram_prefetch_fixtures import (
     LOGITS,
     enable,
     enable_gpu,
+    gate,
     load,
     prefetch_rig,
     trigger,
@@ -245,5 +246,68 @@ def test_a_gpu_scorer_takes_no_host_gates_and_a_page_of_the_slots_size(tmp_path)
                 targets, None, None, top_k=2, per_token=1, per_layer=1, cores=cores,
                 candidates=torch.zeros(1024, dtype=torch.uint8),
             )
+    finally:
+        rig.host.stop()
+
+
+def _floors(rig, **by_row):
+    floors = torch.full((rig.x_rows.shape[0],), float("-inf"), dtype=torch.float32)
+    for row, value in by_row.items():
+        floors[int(row[1:])] = value
+    return floors
+
+
+def test_a_candidate_under_its_target_rows_floor_is_skipped_without_spending_the_budget(tmp_path):
+    """Row 0 targets row 1, whose floor is 0.4: 3 (margin 0.3) is skipped, and the budget of 2 still reads 1 after 2.
+    Row 0's own floor (5.0) must not apply. Mutants: count a skipped candidate toward per_layer -- red (reads 2 only);
+    index the floor by the source row -- red (reads nothing)."""
+    rig = prefetch_rig(tmp_path, capacity=9, share=3)
+    try:
+        page = enable_gpu(rig, per_layer=2, min_margin=_floors(rig, r0=5.0, r1=0.4))
+        req = _record(rig)
+        write_candidate_slot(page, req.seq, [(2, 0, 1.0), (3, 1, 0.3), (1, 2, 0.45)])
+        assert rig.host.spec_pump(0) and not rig.host.spec_pump(0)
+        assert _landed(rig.host, 1) == [1, 2]
+        assert _counts(rig, "spec_issued", "spec_dropped") == (2, 0)
+    finally:
+        rig.host.stop()
+
+
+def test_an_infinite_floor_reads_nothing_and_a_floor_equal_to_the_margin_reads(tmp_path):
+    rig = prefetch_rig(tmp_path, capacity=9, share=3)
+    try:
+        page = enable_gpu(rig, per_layer=2, min_margin=_floors(rig, r1=0.5))
+        req = _record(rig)
+        write_candidate_slot(page, req.seq, [(2, 0, 0.5)])
+        assert rig.host.spec_pump(0)
+        assert _landed(rig.host, 1) == [2]
+    finally:
+        rig.host.stop()
+    rig = prefetch_rig(tmp_path / "inf", capacity=9, share=3)
+    try:
+        page = enable_gpu(rig, per_layer=2, min_margin=_floors(rig, r1=float("inf")))
+        req = _record(rig)
+        write_candidate_slot(page, req.seq, [(2, 0, 9.0)])
+        assert rig.host.spec_pump(0)
+        assert _landed(rig.host, 1) == [] and _counts(rig, "spec_issued") == (0,)
+    finally:
+        rig.host.stop()
+
+
+def test_a_margin_floor_needs_the_gpu_scorer_and_one_fp32_entry_per_row(tmp_path):
+    rig = prefetch_rig(tmp_path, capacity=9, share=3)
+    try:
+        rows = rig.x_rows.shape[0]
+        with pytest.raises(ValueError, match="min_margin"):
+            enable_gpu(rig, min_margin=torch.zeros(rows + 1, dtype=torch.float32))
+        with pytest.raises(ValueError, match="min_margin"):
+            enable_gpu(rig, min_margin=torch.zeros(rows, dtype=torch.float64))
+        with pytest.raises(ValueError, match="min_margin"):
+            enable_gpu(rig, min_margin=torch.full((rows,), float("nan")))
+        w, bias = gate(LOGITS)
+        with pytest.raises(ValueError, match="min_margin needs the GPU scorer"):
+            rig.host.enable_ram_prefetch(
+                torch.tensor([[1, 0]] + [[-1, -1]] * (rows - 1), dtype=torch.int64), w, bias, top_k=2, per_token=1,
+                per_layer=1, cores=[[] for _ in range(rig.host.nodes)], min_margin=torch.zeros(rows))
     finally:
         rig.host.stop()

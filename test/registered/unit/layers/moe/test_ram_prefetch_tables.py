@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.ram_prefetch import (
     GpuScorer,
     RouterGate,
     clear_router_gates,
+    load_margin_floors,
     prefetch_tables,
     prefetch_targets,
     register_moe_gates,
@@ -124,7 +125,7 @@ def test_the_gpu_scorer_enables_the_host_with_a_candidate_page_and_no_host_gate_
     assert targets.tolist() == [[1, 0], [-1, -1]] and gates is None and bias is None
     page = kw.pop("candidates")
     assert page.dtype == torch.uint8 and page.numel() == CAND_PAGE_BYTES and not page.is_pinned()
-    assert kw == dict(top_k=6, per_token=1, per_layer=1, cores=[[0, 1]], top_k_only=False)
+    assert kw == dict(top_k=6, per_token=1, per_layer=1, cores=[[0, 1]], top_k_only=False, min_margin=None)
     assert scorer.candidates is page and scorer.picked.gates[0].weight is gate.weight
     assert (scorer.per_token, scorer.top_k_only, scorer.picked.top_k) == (1, False, 6)
 
@@ -192,3 +193,37 @@ def test_the_candidate_page_and_the_score_scratch_are_quarantined(monkeypatch):
     monkeypatch.setattr(module, "quarantine_host_slabs", owned.extend)
     svc._quarantine("test")
     assert any(t is page for t in owned)
+
+
+def _floors_file(tmp_path, min_margin, **extra):
+    import json
+
+    path = tmp_path / "floors.json"
+    path.write_text(json.dumps({"min_margin": min_margin, **extra}))
+    return str(path)
+
+
+def test_margin_floors_load_per_target_row_and_a_row_the_file_omits_keeps_every_read(tmp_path):
+    floors = load_margin_floors(_floors_file(tmp_path, {"1": 0.25, "3": float("inf")}, floor=0.3), rows=4)
+    assert floors.dtype == torch.float32
+    assert floors.tolist() == [float("-inf"), 0.25, float("-inf"), float("inf")]
+
+
+@pytest.mark.parametrize("min_margin", [{"4": 0.1}, {"-1": 0.1}, {"1": float("nan")}, {"x": 0.1}, {"1": "0.1"}])
+def test_margin_floors_refuse_a_row_out_of_range_or_a_value_that_is_not_a_number(tmp_path, min_margin):
+    with pytest.raises(ValueError, match="margin floors"):
+        load_margin_floors(_floors_file(tmp_path, min_margin), rows=4)
+
+
+def test_the_gpu_scorer_passes_the_margin_floors_file_to_the_host(tmp_path):
+    gate = _gate()
+    register_router_gate(1, gate.weight, gate.bias, 6)
+    calls = []
+    host = SimpleNamespace(enable_ram_prefetch=lambda *a, **kw: calls.append((a, kw)))
+    cpu = SimpleNamespace(services=[SimpleNamespace(hidden=8)])
+    path = _floors_file(tmp_path, {"1": 0.5})
+    with envs.SGLANG_DSV41_RAM_PREFETCH_SCORER.override("gpu"), envs.SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS.override(
+        path
+    ):
+        module.Exl3RamMissService._enable_ram_prefetch(host, [0, 1], _numa(), cpu)
+    assert calls[0][1]["min_margin"].tolist() == [float("-inf"), 0.5]

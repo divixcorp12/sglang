@@ -749,3 +749,17 @@ def test_an_unknown_ram_prefetch_scorer_is_refused_whether_or_not_the_prefetch_i
     args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
     with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_SCORER must be one of"):
         _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=prefetch, SGLANG_DSV41_RAM_PREFETCH_SCORER="tpu")
+
+
+def test_margin_floors_need_the_gpu_scorer_and_a_readable_file(model_dir, tmp_path):
+    """The floors filter the GPU scorer's candidate page; the CPU scorer would ignore them silently."""
+    args = _launch(model_dir, cuda_graph_config=BREAKABLE_BS1)
+    assert expert_stream_requirements_for(args, args).label == "EXL3"
+    path = tmp_path / "floors.json"
+    path.write_text('{"min_margin": {"1": 0.25}}')
+    gpu = dict(**CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_SCORER="gpu")
+    _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS needs SGLANG_DSV41_RAM_PREFETCH_SCORER=gpu"):
+        _gate(args, **CPU_EXPERTS_ENV, SGLANG_DSV41_RAM_PREFETCH=True, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(path))
+    with pytest.raises(ValueError, match="SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"):
+        _gate(args, **gpu, SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS=str(tmp_path / "missing.json"))
