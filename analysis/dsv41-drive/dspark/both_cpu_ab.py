@@ -44,8 +44,17 @@ ARMS = {
     "dspark-both-rw-draft": ({**arm_env.dspark_env(), "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "draft"}, True),
     "dspark-both-rw-target": ({**arm_env.dspark_env(), "SGLANG_EXL3_CPU_ROW_WEIGHTED_ASSIGNMENT": "target"}, True),
     # NVMe-to-RAM prefetch (spec 2026-10-08-dsv41-ram-prefetch-design, The A/B): the replay's best arm, h=1, one
-    # candidate per token, one row per layer, a pool of 2 per row and group (the options' defaults).
-    "dspark-both-prefetch": ({**arm_env.dspark_env(), "SGLANG_DSV41_RAM_PREFETCH": "1"}, True),
+    # candidate per token, one row per layer, a pool of 2 per row and group; all pinned so a shell cannot leak.
+    "dspark-both-prefetch": (
+        {
+            **arm_env.dspark_env(),
+            "SGLANG_DSV41_RAM_PREFETCH": "1",
+            "SGLANG_DSV41_RAM_PREFETCH_PER_TOKEN": "1",
+            "SGLANG_DSV41_RAM_PREFETCH_PER_LAYER": "1",
+            "SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE": "2",
+        },
+        True,
+    ),
 }
 # Build caches an experiment keeps private (run protocol): passed to every arm's server when set in the driver's env.
 PASSTHROUGH = ("SGLANG_JIT_CACHE_DIR", "SGLANG_EXL3_BUILD_DIR")
