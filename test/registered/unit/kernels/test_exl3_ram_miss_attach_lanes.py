@@ -433,3 +433,20 @@ def test_a_rows_reserved_slots_count_the_speculative_pool():
     service = SimpleNamespace(staging_for=lambda capacity: 8, _spec_share=2, host=SimpleNamespace(nodes=2))
     service.pool_slots = lambda: module.Exl3RamMissService.pool_slots(service)
     assert module.NativePinnedSlotTable.reserved_rows.fget(SimpleNamespace(service=service, capacity=40)) == 12
+
+
+@pytest.mark.parametrize(
+    "ranges, width, short",
+    [
+        ([(0, 10), (10, 20)], 7, [(0, 0, 10, 7), (1, 10, 20, 7)]),  # each group stages 7, not 7 for the row
+        ([(0, 4), (4, 20)], 1, [(0, 0, 4, 1)]),  # skewed: the small group runs out
+        ([(0, 5), (5, 20)], 1, []),
+        ([(0, 10), (10, 20)], 6, []),
+    ],
+)
+def test_the_pool_room_is_checked_per_group_as_the_host_reserves_it(ranges, width, short):
+    """Each group stages min(width, its slots - 1) and keeps 2 assignable slots past its pool (ram_tier.h
+    reserve_staging, reserve_spec_pool); the row's totals would accept every case here."""
+    capacity, nodes = ranges[-1][1], len(ranges)
+    assert capacity - min(width, capacity - 1) - 2 * nodes >= 2 * nodes
+    assert module.pool_room_shortfall(ranges, staging_width=width, share=2) == short

@@ -1567,7 +1567,7 @@ def test_a_ram_prefetch_share_that_leaves_a_row_too_few_slots_is_refused_at_star
     _prefetch_with_cpu_expert_stand_in(service, monkeypatch)
     with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
         with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
-            refused = r"SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE=2 leaves layer 0's 4-slot row"
+            refused = r"SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE=2 leaves layer 0's group 0 slots \[0, 4\)"
             with pytest.raises(RuntimeError, match=refused):
                 service.ensure_started()
     assert service.host is None
