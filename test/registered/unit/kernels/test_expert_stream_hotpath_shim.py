@@ -163,13 +163,17 @@ def test_characterize_the_hot_path(shim, tmp_path):
     print("HOTPATH per request", per)
 
 
-def test_the_prod_service_thread_reads_no_clock_per_request(shim, tmp_path):
+def test_the_prod_service_thread_reads_the_clock_only_for_the_drive_load(shim, tmp_path):
     """Spec M3/M4/M8 and D6: the watchdog's episode word, turn-counted progress and iteration-budget pacing leave
-    the service thread no clock read while it serves (the watchdog thread reads the clock instead)."""
+    the service thread no clock read of its own while it serves (the watchdog thread reads the clock instead). The one
+    exception is the drive load (host/drive_load.h, design 2026-10-09-dsv41-drive-aware-reads step 1): a root's busy
+    time reads the clock when a kind's in-flight count crosses zero, at most once per refill or reap turn, and counts
+    every read it takes, so the service thread's clock reads are exactly that count."""
     counts = hotpath_shim.run_child(shim, variant="prod", tmp=tmp_path)
     # A zero from a shim that never recognized the thread would prove nothing.
     assert counts["requests"] == REQUESTS and counts["threads"] == {"service": 1, "copy": 1}, counts
-    assert counts["service"]["clock"] == 0, counts
+    assert counts["drive_clock_reads"] > 0, counts  # the misses were read, so their roots went busy and idle
+    assert counts["service"]["clock"] == counts["drive_clock_reads"], counts
 
 
 @pytest.mark.parametrize("variant", ["prod", "instr"])
@@ -254,10 +258,12 @@ def test_the_service_and_copy_threads_take_no_lock_and_never_wait_on_a_condvar(s
         assert counts[thread]["malloc"] == 0 and counts[thread]["free"] == 0, counts
     for thread in ("service", "copy"):
         assert counts[thread]["sleep"] == 0 and counts[thread]["futex"] == 0, counts
+    # The service thread's drive-load clock reads (host/drive_load.h), in both builds.
+    drive = counts["drive_clock_reads"]
     if variant == "prod":
-        assert counts["service"]["clock"] == 0 and counts["copy"]["clock"] == 0, counts
+        assert counts["service"]["clock"] == drive and counts["copy"]["clock"] == 0, counts
     else:
         # InstrBuild's metrics, and nothing else: copy_latency_ns's submit stamp on the service thread (one per job),
         # and on the copy thread copy_issue_ns's pair plus copy_latency_ns's completion stamp (three per job).
-        assert counts["service"]["clock"] == counts["copy_jobs"], counts
+        assert counts["service"]["clock"] == counts["copy_jobs"] + drive, counts
         assert counts["copy"]["clock"] == 3 * counts["copy_jobs"], counts

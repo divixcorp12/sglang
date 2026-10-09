@@ -286,6 +286,13 @@ NON_TRACE_CLOCK_READS = {
     # flush_as_nops(): the NOP drain's soft-error retry window, reached only when a read failed with SQEs unconsumed.
     "const auto give_up = std::chrono::steady_clock::now() + kNopRetryWindow;": 1,
     "if (!soft_error(rc) || std::chrono::steady_clock::now() >= give_up) {": 1,
+    # The drive load (drive_load.h), functional state in both builds: its origin, once per DriveLoad; a root's busy time
+    # when a kind's in-flight count crosses zero, at most once per refill or reap turn on the reading thread (counted in
+    # its clock_reads, which test_expert_stream_hotpath_shim.py matches against the service thread's clock count); and
+    # a snapshot's now, on the caller's thread.
+    "DriveLoad() : origin_(now_ns()) {}": 1,
+    "now = std::max<int64_t>(1, now_ns() - origin_);": 1,
+    "const int64_t now = std::max<int64_t>(1, now_ns() - origin_);": 1,
 }
 CLOCK_READ = re.compile(r"\bnow_ns\(\)|\b(?:steady|system|high_resolution)_clock::now\b|\bclock_gettime\s*\(")
 

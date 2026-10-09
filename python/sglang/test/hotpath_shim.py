@@ -9,7 +9,9 @@ takes: a kHitCopy lane and a copy job) and whose second lane is a new miss (read
 copy job's mark is released by that step, one mark at a time, after the request was served; the step then waits until
 the copy thread retired it and CopyDone is published. The window therefore covers hits, misses with their victims and
 map deltas, copy jobs and the copy thread's completions; the child reports how many of each it saw (``copy_jobs`` =
-marks the copy thread recorded, ``copies_done`` = requests whose CopyDone the service published, ``posts``).
+marks the copy thread recorded, ``copies_done`` = requests whose CopyDone the service published, ``posts``), and
+``drive_clock_reads``: the clock reads the readers' drive load (host/drive_load.h) took over the window, the service
+thread's only clock reads in the production build.
 
 ``service_spin_us`` and ``copy_spin_us`` are the two threads' idle spin budgets (``start_thread`` and
 ``enable_copy_engine``'s ``spin_us``). At -1, the default, neither thread ever sleeps, so their ``sleep`` and ``futex``
@@ -92,12 +94,14 @@ CHILD = textwrap.dedent(
     for key in seen:
         seen[key] = 0
     marked = host.copy_engine_marked()
+    drive_clock = host.drive_load()["clock_reads"]
     shim.hotpath_shim_reset()
     shim.hotpath_shim_arm(1)
     for i in range(warmup, warmup + requests):
         step(i)
     shim.hotpath_shim_arm(0)
     seen["copy_jobs"] = host.copy_engine_marked() - marked
+    seen["drive_clock_reads"] = host.drive_load()["clock_reads"] - drive_clock
     counts = {name: {kind: shim.hotpath_shim_count(th, k) for k, kind in enumerate(%r)}
               for th, name in enumerate(%r)}
     threads = {name: shim.hotpath_shim_threads(th) for th, name in enumerate(%r)}
