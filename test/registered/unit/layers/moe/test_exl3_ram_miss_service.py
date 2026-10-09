@@ -1531,3 +1531,42 @@ def test_ram_prefetch_without_cpu_experts_is_refused_at_start(tiers):
     with envs.SGLANG_DSV41_RAM_PREFETCH.override(True):
         with pytest.raises(RuntimeError, match="SGLANG_DSV41_RAM_PREFETCH needs SGLANG_DSV41_CPU_EXPERTS"):
             service.ensure_started()
+
+
+def _prefetch_with_cpu_expert_stand_in(service, monkeypatch):
+    """SGLANG_DSV41_CPU_EXPERTS on, with a stand-in engine (hidden ROW_IMAGE_DIM) and plans without CPU cores."""
+    from sglang.srt.layers.moe.ram_prefetch import clear_router_gates
+
+    clear_router_gates()
+    from_env = module.ThreadingConfig.from_env.__func__
+    monkeypatch.setattr(
+        module.ThreadingConfig, "from_env", classmethod(lambda cls, **kw: from_env(cls, **{**kw, "cpu_experts": False}))
+    )
+    stand_in = SimpleNamespace(services=[SimpleNamespace(hidden=ROW_IMAGE_DIM)])
+    monkeypatch.setattr(service, "_start_cpu_experts", lambda *a, **kw: stand_in)
+
+
+def test_a_failed_ram_prefetch_enable_stops_the_host_and_leaves_the_service_unstarted(tiers, monkeypatch):
+    """No gate is registered, so the enable step raises after the CPU experts started; closing the host joins them."""
+    service, _, _ = tiers
+    _prefetch_with_cpu_expert_stand_in(service, monkeypatch)
+    stopped = []
+    stop = module.ExpertStreamHost.stop
+    monkeypatch.setattr(module.ExpertStreamHost, "stop", lambda host: (stopped.append(host), stop(host))[1])
+    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(1):
+        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+            with pytest.raises(ValueError, match="no streamed row has a next layer"):
+                service.ensure_started()
+    assert len(stopped) == 1 and not stopped[0]._close.alive
+    assert service.host is None and service.cpu_experts is None and service.pool_slots() == 0
+
+
+def test_a_ram_prefetch_share_that_leaves_a_row_too_few_slots_is_refused_at_start(tiers, monkeypatch):
+    """CAPACITY + 1 slots, one staging: a share of 2 leaves one assignable slot, the host needs 2 per group."""
+    service, _, _ = tiers
+    _prefetch_with_cpu_expert_stand_in(service, monkeypatch)
+    with envs.SGLANG_DSV41_RAM_PREFETCH.override(True), envs.SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE.override(2):
+        with envs.SGLANG_DSV41_CPU_EXPERTS.override(True):
+            with pytest.raises(RuntimeError, match=r"SGLANG_DSV41_RAM_PREFETCH_SPEC_SHARE=2 leaves layer 0's 4-slot row"):
+                service.ensure_started()
+    assert service.host is None
