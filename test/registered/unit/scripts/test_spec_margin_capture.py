@@ -52,3 +52,14 @@ def test_the_capture_runs_any_ab_arm_and_leaves_its_scorer_alone_unless_asked():
     assert floors["SGLANG_DSV41_RAM_PREFETCH_SCORER"] == "gpu"
     assert floors["SGLANG_DSV41_RAM_PREFETCH_MARGIN_FLOORS"].endswith("ram_prefetch_margin_floors.json")
     assert off["SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX"] == "/out/events"
+
+
+def test_the_capture_logs_routes_router_inputs_and_verify_accepts_unless_told_not_to():
+    cap = _capture()
+    on = cap.server_env("/out", False, arm="dspark-both")
+    assert on["SGLANG_DSV41_EXPERT_TRACE_PATH"] == "/out/stages.jsonl"
+    assert on["SGLANG_DSV41_ROUTER_CAPTURE_PATH"] == "/out/router"
+    assert on["SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH"] == "/out/verify-accept"
+    off = cap.server_env("/out", False, arm="dspark-both", verify_split=False)
+    assert not any(k in off for k in ("SGLANG_DSV41_EXPERT_TRACE_PATH", "SGLANG_DSV41_ROUTER_CAPTURE_PATH",
+                                      "SGLANG_DSV41_VERIFY_ACCEPT_LOG_PATH"))

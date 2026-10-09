@@ -107,3 +107,21 @@ def test_spec_submit_carries_the_picks_rank_and_margin_in_gen(tmp_path, monkeypa
     expected = f32(f32(math.sqrt(40.0)) - f32(math.sqrt(35.0)))
     assert (submit["a"], rank) == (2, 0)
     assert margin == expected
+
+
+def test_every_forced_miss_leaves_a_miss_expert_event_on_its_group(tmp_path, monkeypatch):
+    """miss_expert: row, gen and seq of the record, a = the expert, b = its lane in the record. A hit leaves none. The
+    group's trace is built with the tier, so the prefix is set before the rig."""
+    monkeypatch.setenv("SGLANG_DSV41_EXPERT_JOB_TRACE_PREFIX", str(tmp_path / "jobs"))
+    (tmp_path / "rig").mkdir()
+    rig = prefetch_rig(tmp_path / "rig")
+    try:
+        load(rig, 1, [4])
+        req = forced(rig, 1, [2, 4, 5])
+    finally:
+        rig.host.stop()
+    files = list(tmp_path.glob("jobs.*.exl3-tier0.*.jsonl"))
+    assert len(files) == 1
+    events = [e for e in map(json.loads, files[0].read_text().splitlines()[1:-1]) if e["event"] == "miss_expert"]
+    assert sorted((e["row"], e["gen"], e["seq"], e["a"], e["b"]) for e in events) == [
+        (1, req.gen, req.seq, 2, 0), (1, req.gen, req.seq, 5, 2)]
