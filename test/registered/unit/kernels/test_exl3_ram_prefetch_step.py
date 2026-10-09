@@ -195,6 +195,27 @@ def test_a_group_that_skips_the_record_still_gets_its_job(tmp_path):
         rig.host.stop()
 
 
+def test_a_fault_met_by_a_failed_speculative_read_is_spent_not_left_for_the_demand(tmp_path):
+    """inject_spec(fail=True) replaces the pool read, so the pending reader fault that read would have met goes with it.
+    Mutant: leave the fault installed after a failed speculative read -- the demand read below meets it (red)."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        enable(rig, LOGITS)
+        load(rig, 0, [5])
+        rig.host.inject_spec(fail=True)
+        rig.host.inject_fault(part=0, part_error=5)
+        trigger(rig)
+        assert rig.host.spec_pump(0)
+        c = rig.host.counters()
+        assert (c["spec_issued"], c["spec_failed"], c["spec_landed"], c["read_errors"]) == (1, 1, 0, 0)
+        rows = c["rows_read"]
+        forced(rig, 1, [2])
+        c = rig.host.counters()
+        assert c["rows_read"] == rows + 1 and c["read_errors"] == 0
+    finally:
+        rig.host.stop()
+
+
 def test_a_failed_speculative_read_empties_its_entry_and_the_demand_reads_the_row(tmp_path):
     rig = prefetch_rig(tmp_path)
     try:

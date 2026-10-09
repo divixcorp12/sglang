@@ -1549,19 +1549,21 @@ class RamTier {
   }
 
   // Service thread, before a read: installs the fault inject_fault() left, on the group's reader only this thread
-  // drives. The first group to read takes it. ProdBuild: nothing.
-  void apply_pending_fault(Group& group) {
+  // drives. The first group to read takes it. Returns true when it installed one. ProdBuild: nothing.
+  bool apply_pending_fault(Group& group) {
     if constexpr (Build::kFaults) {
-      if (!faults_.fault_pending.load(std::memory_order_acquire)) return;
+      if (!faults_.fault_pending.load(std::memory_order_acquire)) return false;
       ReadFault fault;
       {
         std::lock_guard<std::mutex> guard(faults_.fault_mutex);
-        if (!faults_.fault_pending.load(std::memory_order_relaxed)) return;  // another group's reader took it
+        if (!faults_.fault_pending.load(std::memory_order_relaxed)) return false;  // another group's reader took it
         fault = faults_.pending_fault;
         faults_.fault_pending.store(false, std::memory_order_relaxed);
       }
       group.reader.set_fault(fault);
+      return true;
     }
+    return false;
   }
 
   // Completes and pushes the stage record begun by begin_stage, if any.
@@ -2110,7 +2112,8 @@ class RamTier {
     PoolEntry& entry = pool_->entry(request.row, g, i);
     if (entry.word.load(std::memory_order_acquire) == pool_word(kPoolReading, expert)) {
       // Promotion: the demand waits for the one speculative read in flight rather than read the row again; the
-      // service's busy episode times the wait.
+      // service's busy episode times the wait. The caller holds the row's tier state meanwhile, for at most that one
+      // row read.
       count<kSpecPromoted>(group);
       while (entry.word.load(std::memory_order_acquire) == pool_word(kPoolReading, expert))
         _mm_pause();
@@ -2177,7 +2180,9 @@ class RamTier {
   }
 
   // True once the group served a record of `target`, or of the source row (a lapped target record leaves no trace),
-  // after `source_seq`: the read would land behind the record it was for.
+  // after `source_seq`: the read would land behind the record it was for. Each group judges by its own row_seq, so a
+  // job in flight can be stale for one group and live for the other: the layer then reads fewer than per_layer rows,
+  // never more.
   static bool spec_stale(const SpecGroup& spec, int64_t source, int64_t target, uint32_t source_seq) {
     const uint32_t next = skip_zero(source_seq + 1u);
     for (const int64_t row : {source, target}) {
@@ -2233,6 +2238,7 @@ class RamTier {
   void spec_read(int g, int64_t source, int64_t target, uint32_t source_seq, int32_t expert) {
     SpecGroup& spec = *spec_->groups[g];
     // A demand blocked on the turn goes first: the unlocking thread would otherwise retake it before the woken demand.
+    // Unbounded, but by the one demand read the flag stands for, which the watchdog times.
     while (spec.demand_waiting.load(std::memory_order_seq_cst) != 0)
       _mm_pause();
     std::lock_guard<std::mutex> turn(spec.turn);
@@ -2272,9 +2278,11 @@ class RamTier {
     spec.busy.store(++spec.episodes, std::memory_order_release);
     bool fail = false;
     if constexpr (Build::kFaults) {
-      apply_pending_fault(dist_.group(g));  // inject_fault reaches the reader under the turn, as for a demand read
+      const bool installed = apply_pending_fault(dist_.group(g));  // reaches the reader under the turn, as for a demand
       if (const int64_t ns = faults_.spec_delay_ns.load()) fault_delay(ns);
       fail = faults_.spec_fail.load();
+      // The failed read replaces the one that would have met the fault: spend it, not leave it for the next demand.
+      if (fail && installed) dist_.group(g).reader.set_fault(ReadFault{});
     }
     int result = 0;
     if (fail)
@@ -2504,7 +2512,14 @@ class RamTier {
     const std::span<const int32_t> experts = pooled ? plan.read_experts.span() : plan.missing.span();
     const std::span<const int64_t> slots = pooled ? plan.read_slots.span() : plan.slots.span();
     const std::span<const int32_t> lanes = pooled ? plan.read_lanes.span() : plan.miss_lane.span();
-    if (!experts.empty()) read_rows(group, request, plan, experts, slots, lanes, misses, cur);
+    if (!experts.empty()) {
+      read_rows(group, request, plan, experts, slots, lanes, misses, cur);
+    } else {
+      // Every miss came from the pool: a read of no rows. It counts as a demand, and its read stamps sit at the
+      // reservation (no clock read), so the stage order holds and the record shows no read time.
+      ++group.demands_read;
+      if (cur) cur->submit = cur->first_cqe = cur->last_cqe = cur->pack_start = cur->pack_end = cur->reserved;
+    }
     submit_landed_cpu_misses(group, request, plan, misses);
     if (misses->left != 0) fail_record(request, "a CPU miss's row never landed");
     return kStatusServed;

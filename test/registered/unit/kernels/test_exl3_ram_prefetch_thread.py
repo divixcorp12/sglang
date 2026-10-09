@@ -10,15 +10,18 @@ import time
 import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, spawn_child
-from sglang.test.dsv41_ram_prefetch_fixtures import LOGITS, enable, forced, prefetch_rig, trigger
+from sglang.test.dsv41_ram_miss_fixtures import assert_aborted, spawn_child, warm_host_modules
+from sglang.test.dsv41_ram_prefetch_fixtures import LANES, LOGITS, enable, forced, prefetch_rig, trigger
 
 register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
 def hang_guard():
-    # Joins and handshakes run in C++: dump every stack and exit instead of hanging the suite.
+    # Joins and handshakes run in C++: dump every stack and exit instead of hanging the suite. A cold JIT build takes
+    # 50-100 s, so the rigs' two builds load first, outside the guard.
+    for nodes in (1, 2):
+        warm_host_modules("instr", lanes=LANES, nodes=nodes)
     faulthandler.dump_traceback_later(120, exit=True)
     yield
     faulthandler.cancel_dump_traceback_later()

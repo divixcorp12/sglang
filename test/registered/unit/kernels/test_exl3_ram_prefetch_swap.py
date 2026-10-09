@@ -2,6 +2,8 @@
 landed in the row's pool takes its victim as today, maps the pool slot, gives the victim to the pool, reads nothing and
 goes to the CPU at once. spec_place lands a pool row as a speculative read would (CPU, ChainSim)."""
 
+import time
+
 from sglang.kernels.ops.moe.expert_stream_transport import piece_word
 from sglang.srt.layers.moe.ram_slot_map import LaneKind
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -66,6 +68,38 @@ def test_a_record_whose_misses_all_came_from_the_pool_counts_served_and_reads_no
         after = rig.host.counters()
         assert after["served"] == before["served"] + 1 and after["touch_only"] == before["touch_only"]
         assert after["rows_read"] == before["rows_read"]
+    finally:
+        rig.host.stop()
+
+
+def test_a_record_served_wholly_from_the_pool_stamps_a_zero_width_read(tmp_path):
+    """No read ran, but the stage record carries its read stamps at the reservation, in order. Mutant: leave them 0 --
+    red."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        rig.host.enable_trace()
+        rig.host.spec_place(1, 4)
+        forced(rig, 1, [4])
+        (record,) = [r for r in rig.host.drain_trace() if r["kind"] == 0 and r["rows"] == 0 and r["status"] == 1]
+        assert record["reserved"] > 0
+        for stamp in ("submit", "first_cqe", "last_cqe", "pack_start", "pack_end"):
+            assert record[stamp] == record["reserved"], stamp
+        assert record["observed"] <= record["reserved"] <= record["mapped"] <= record["done"]
+    finally:
+        rig.host.stop()
+
+
+def test_a_record_served_wholly_from_the_pool_counts_as_a_demand_read(tmp_path):
+    """inject(delay_after_demands=1) delays the second demand read: the pooled record is the first. Mutant: count only
+    reads that ran -- the later read is not delayed (red)."""
+    rig = prefetch_rig(tmp_path)
+    try:
+        rig.host.spec_place(1, 4)
+        forced(rig, 1, [4])
+        rig.host.inject(delay_s=0.4, delay_after_demands=1)
+        start = time.monotonic()
+        load(rig, 0, [5])
+        assert time.monotonic() - start >= 0.3
     finally:
         rig.host.stop()
 
