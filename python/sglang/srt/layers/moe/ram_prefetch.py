@@ -71,7 +71,8 @@ def prefetch_tables(
 ) -> PrefetchTables:
     """Row r targets row r + 1 when that row is the next layer (layer_ids[r] + 1) and its gate has a bias; the last row,
     a non-consecutive layer and a hash-routed one target nothing. Each target's gate is copied to host memory once,
-    bound to NUMA ``node`` when given."""
+    bound to NUMA ``node`` when given. The host scorer reads bf16, so an fp32 router (``router_fp32``) is rounded to bf16
+    here: its ranking can differ slightly from the model's, which costs prefetch hit rate and never correctness."""
     picks = []
     for row in range(len(layer_ids) - 1):
         nxt = layer_ids[row + 1]
