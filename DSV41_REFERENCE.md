@@ -7548,6 +7548,54 @@ will be.
 divix01 `/data/models/slang/nvfp4-work/ram-prefetch/`: `capture-{suite,heldout}/` (trace, router side files,
 `rank.npz`, `server.log`), `calib/`, `arms-*/table.md`, `budget-*/table.md`, `findings.md`.
 
+### 33.14 NVMe-to-RAM prefetch under DSpark: the live A/B (2026-10-08)
+
+**Verdict: accepted by the spec's rule, but not credible as measured; the default stays off.** The median moved
+111.66 -> 82.72 ms/token (28.95 ms, 25.9%, against the 4-6 ms/token Phase 0 expected), the text is within the
+near-tie band, and RAM misses per token fell. But paired session by session the prefetch arm is slower in 5 of 8
+sessions (paired median -1.9%); the median gain comes from two sessions (6: 175.3 -> 86.4, 7: 111.5 -> 76.0)
+crossing the middle of an 8-sample set. One A/B, one order, no repeat: a second A/B with the arm order reversed is
+needed before believing any gain, and a gain several times Phase 0's prediction is itself a reason to doubt it.
+
+**What runs** (spec `docs/superpowers/specs/2026-10-08-dsv41-ram-prefetch-design.md`, plan
+`docs/superpowers/plans/2026-10-08-dsv41-ram-prefetch-phase1.md`). Per NUMA group a speculative thread scores the
+next layer's gate (`sqrt(softplus(W x)) + b`) on a CPU record's staged input and picks one row per layer over both
+groups. It reads that row under the group reader's turn (demand reads take priority) into a private `kSpec` pool,
+2 slots per row and group, that the device never maps. A forced CPU miss on a landed row swaps it in without a read.
+A forced miss on a row still being read waits for it (promoted). Staleness is checked per group by sequence number.
+A wrong prediction costs a read and a pool slot, never an eviction.
+
+**Result** (`dspark-both` A vs `dspark-both-prefetch` B; 8 sessions, 104 GiB tier, counters off, private caches):
+
+| arm | ms/token (median) | ms/token (mean) | accept length | RAM rows / token | NVMe rows / token |
+|---|---:|---:|---:|---:|---:|
+| `dspark-both` (A) | 111.66 | 105.77 | 3.54 | 20.7 | 20.7 |
+| `dspark-both-prefetch` (B) | 82.72 | 93.87 | 3.60 | 17.2 | 29.1 |
+
+Paired per-session gain (A -> B, % of A): -2.4, +3.4, -11.6, -9.2, -1.4, +50.7, +31.8, -8.4. Text B vs A:
+pass, 393 tokens compared, 4 flips all within the band, max gap 0.5. B's speculative rows (server lifetime):
+issued 17117, landed 17117, used 7342, promoted 2432, dropped 226, failed 0, demand reads delayed 1489; precision
+at use 0.43 (Phase 0's replay assumed 0.60). Group 0: issued 6685, used 2693; group 1: issued 10432, used 4649.
+The prefetch adds NVMe traffic: 6.8 wasted rows per token, so NVMe rows per token rise from 20.7 to 29.1 while RAM
+misses fall from 20.7 to 17.2. Per-token rates are over the server's lifetime (7 warm-up rounds plus the timed
+set; 1463 / 1439 tokens). Node 1 had no spare core, so its speculative thread shares the polling RAM thread's core
+35 (a warning in the log). That costs node 1 latency the A/B does not separate out.
+
+**Provenance.** Commit `3f81cc0a25` (python tree `7854da561e`, registered as `ram-prefetch-phase1-3f81cc0a25`).
+A/B `divix01:/data/models/slang/nvfp4-work/ram-prefetch/ab-20261008-223431/` (`summary.json`, `verdict.json`,
+`host-modules.sha256`, `exl3-ext.sha256`). The first attempt `ab-20261008-223358-failed-unregistered-gen` stopped at
+the generation gate. Smoke `.../smoke-20261008-215647/`: both probes rc 0, text band pass, 403 tokens. Its counters
+check moved to the timed server, because the probe server is killed by process group and never logs counters. Host
+modules (prod l40 `295bf224...`, prod l40_n2 `d3db7fc1...`, prod l8 `9d58ce92...`), EXL3 extension `debed6b8...`.
+`server-env-actual.json` shows PREFETCH 0 / 1, per-token 1, per-layer 1, spec-share 2, and the private JIT cache for
+both arms. Units: the plan's selection grouped by directory, 378 passed; after the final fix pass, 588 passed. The
+only red is the pre-existing clock-guard test, whose failure is identical at the base.
+
+**Pointers.** Code: `host/ram_prefetch.h` (pool), `host/gate_scorer.h`, `ram_tier.h` (swap-on-use, the speculative
+state and threads), `ram_thread.h` (pause and watchdog), `python/sglang/srt/layers/moe/ram_prefetch.py`,
+`exl3_ram_miss.py` (`_enable_ram_prefetch`). Tests: `test_exl3_ram_prefetch_{pool,swap,scorer,step,thread,events}.py`,
+`test_ram_prefetch_tables.py`. Driver arm: `analysis/dsv41-drive/dspark/both_cpu_ab.py` `dspark-both-prefetch`.
+
 ## Sources
 
 - Official repo snapshot and tech report (paths in §1).

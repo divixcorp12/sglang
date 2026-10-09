@@ -486,3 +486,11 @@ also imports `analysis/dsv41-drive/router-capture/router_score.py` and `prefetch
 - **The NUMA cost** of ~1.3 GB/s of extra DMA writes into node 0 on H2D bandwidth is unmeasured.
 - **Better predictors:** anything that beats 0.40 precision on not-in-RAM rows at h=1. The noisy-oracle rows give the
   payoff curve: p=0.6 saves ~2.5 ms, p=0.8 saves ~3.9 ms.
+
+## 13. 2026-10: the live prefetch under DSpark
+
+DSpark with CPU experts reopened this study (spec `docs/superpowers/specs/2026-10-08-dsv41-ram-prefetch-design.md`,
+replay go in `DSV41_REFERENCE.md` §33.13), because a forced miss now exposes its whole NVMe row. The live A/B is
+accepted by the spec's rule, at 28.95 ms/token (25.9%) on the median with `spec_used/spec_landed` 0.43. It is not
+credible yet: B is slower in 5 of 8 paired sessions, so the gain needs a repeat with the arm order reversed. Details
+in §33.14. The default stays off unless the owner accepts it for production.
