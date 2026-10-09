@@ -1,6 +1,7 @@
 """The both-CPU-experts server A/B driver: the probe server must not write into the timed server's metrics file (CPU)."""
 
 import importlib.util
+import json
 import os
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -57,3 +58,42 @@ def test_the_timed_dspark_arms_take_the_recipes_mem_fraction_and_prod_does_not(m
     assert envs["dspark-both"]["DSV41_MEM_FRACTION_STATIC"] == "0.78"
     assert envs["dspark-draft-only"]["DSV41_MEM_FRACTION_STATIC"] == "0.78"
     assert "DSV41_MEM_FRACTION_STATIC" not in envs["prod"]
+
+
+def test_the_prefetch_arm_is_dspark_both_with_the_prefetch_on_and_its_a_states_it_off():
+    ab = _ab()
+    a, b = ab.ARMS["dspark-both"][0], ab.ARMS["dspark-both-prefetch"][0]
+    assert a["SGLANG_DSV41_RAM_PREFETCH"] == "0" and b["SGLANG_DSV41_RAM_PREFETCH"] == "1"
+    assert {k: v for k, v in a.items() if k != "SGLANG_DSV41_RAM_PREFETCH"} == {
+        k: v for k, v in b.items() if k != "SGLANG_DSV41_RAM_PREFETCH"
+    }
+    assert ab.ARMS["dspark-both-prefetch"][1] is True
+
+
+def test_the_private_build_caches_reach_every_arms_server(monkeypatch):
+    ab = _ab()
+    monkeypatch.setenv("SGLANG_JIT_CACHE_DIR", "/private/jit")
+    monkeypatch.setenv("SGLANG_EXL3_BUILD_DIR", "/private/exl3")
+    for arm in ab.ARMS:
+        overrides = ab._overrides(arm, "/out")
+        assert overrides["SGLANG_JIT_CACHE_DIR"] == "/private/jit"
+        assert overrides["SGLANG_EXL3_BUILD_DIR"] == "/private/exl3"
+
+
+def test_summarize_reports_the_ram_counters_and_the_prefetch_arms_text_against_its_a(tmp_path):
+    ab = _ab()
+    for arm, rows_read, used in (("dspark-both", 3000, 0), ("dspark-both-prefetch", 2000, 700)):
+        run = tmp_path / "servers" / arm / "run-1"
+        run.mkdir(parents=True)
+        (run / "results.jsonl").write_text(
+            json.dumps({"decode_tokens_per_sec": 2.0, "completion_tokens": 100, "spec_tokens_details": {}}) + "\n"
+        )
+        counters = {"rows_read": rows_read, "spec_issued": 900, "spec_used": used}
+        (run / "server.log").write_text("noise\nexl3 RAM miss thread counters " + json.dumps(counters) + "\n")
+        probe = [{"session_id": "s0", "tokens": [{"token": 1, "top": [[1, -0.1], [2, -2.0]]}]}]
+        (tmp_path / f"{arm}.probe.json").write_text(json.dumps(probe))
+    summary = ab.summarize(str(tmp_path))
+    b = summary["dspark-both-prefetch"]
+    assert b["ram"]["spec_used"] == 700 and b["ram"]["rows_read"] == 2000
+    assert b["ram_rows_per_timed_token"] == 20.0 and summary["dspark-both"]["ram_rows_per_timed_token"] == 30.0
+    assert b["text_vs_reference"]["pass"] is True
