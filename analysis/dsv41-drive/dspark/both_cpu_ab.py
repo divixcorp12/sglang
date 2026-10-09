@@ -10,10 +10,12 @@ only: run_arm.sh takes cc-gpu.lock itself, and the probe phase takes it here (lo
     flock /data/models/slang/nvfp4-work/rowimg-disk.lock python analysis/dsv41-drive/dspark/both_cpu_ab.py OUT [ARM ...]
 """
 
+import argparse
 import fcntl
 import json
 import os
 import shlex
+import shutil
 import signal
 import statistics
 import subprocess
@@ -302,15 +304,53 @@ def summarize(out: str) -> dict:
                 entry["paired_gain_pct_vs_reference"] = paired
                 entry["paired_gain_pct_median"] = statistics.median(paired.values())
         summary[arm] = entry
+    baseline = os.path.join(out, "baseline.json")
+    if os.path.exists(baseline):
+        with open(baseline) as f:
+            provenance = json.load(f)
+        if provenance["arm"] in summary:
+            summary[provenance["arm"]]["baseline_from"] = {"dir": provenance["dir"], "commit": provenance["commit"]}
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     return summary
 
 
+def import_baseline(source: str, arm: str, out: str) -> None:
+    """Copies `arm`'s timed run, probe and metrics from an earlier A/B's directory into `out`, so the arms that name it
+    as their reference compare against it without rerunning it, and records where it came from in baseline.json. The
+    baseline is no longer measured in the same window as the arm: drift between the two runs reads as the arm's."""
+    needed = [os.path.join("servers", arm), f"{arm}.probe.json", f"{arm}.metrics.jsonl"]
+    missing = [name for name in needed if not os.path.exists(os.path.join(source, name))]
+    if missing:
+        sys.exit(f"baseline {source}: missing {', '.join(missing)}")
+    runs = sorted(os.listdir(os.path.join(source, "servers", arm)))
+    if not runs:
+        sys.exit(f"baseline {source}: no timed run of {arm}")
+    shutil.copytree(os.path.join(source, "servers", arm, runs[-1]), os.path.join(out, "servers", arm, runs[-1]))
+    for name in needed[1:]:
+        shutil.copy2(os.path.join(source, name), os.path.join(out, name))
+    commit = os.path.join(source, "commit.txt")
+    with open(commit) if os.path.exists(commit) else open(os.devnull) as f:
+        provenance = {"arm": arm, "dir": source, "commit": f.read().strip() or None}
+    with open(os.path.join(out, "baseline.json"), "w") as f:
+        json.dump(provenance, f, indent=2)
+
+
 def main():
-    out = os.path.abspath(sys.argv[1])
-    arms = sys.argv[2:] or list(ARMS)
+    p = argparse.ArgumentParser(description="Serve A/B arms in the order given, then summarize them.")
+    p.add_argument("out")
+    p.add_argument("arms", nargs="*")
+    p.add_argument("--baseline", help="an earlier A/B's directory whose reference arm is imported, not rerun")
+    a = p.parse_args()
+    out = os.path.abspath(a.out)
+    arms = a.arms or list(ARMS)
+    if a.baseline:
+        references = {REFERENCE[arm] for arm in arms if arm in REFERENCE}
+        if len(references) != 1 or references & set(arms):
+            sys.exit(f"--baseline imports one reference arm the arms share and none of them reruns; got {references}")
     os.makedirs(out, exist_ok=True)
+    if a.baseline:
+        import_baseline(os.path.abspath(a.baseline), references.pop(), out)
     for arm in arms:
         for step in (run_timed, run_probe):
             rc = step(arm, out)
