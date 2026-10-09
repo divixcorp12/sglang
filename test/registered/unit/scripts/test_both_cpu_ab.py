@@ -330,12 +330,20 @@ def test_the_miss_cut_arm_is_dspark_both_with_the_cut_on_against_dspark_both():
     assert ab.REFERENCE["dspark-both-misscut"] == "dspark-both"
 
 
+def test_the_prefetch_miss_cut_arm_is_the_gpu_prefetch_arm_with_the_cut_on():
+    ab = _ab()
+    a, c = ab.ARMS["dspark-both-prefetch-gpu"][0], ab.ARMS["dspark-both-prefetch-gpu-misscut"][0]
+    assert {k: c[k] for k in MISS_CUT} == MISS_CUT
+    assert {k: v for k, v in c.items() if k not in MISS_CUT} == {k: v for k, v in a.items() if k not in MISS_CUT}
+    assert ab.REFERENCE["dspark-both-prefetch-gpu-misscut"] == "dspark-both"
+
+
 def test_every_arm_but_the_miss_cut_pins_it_off_against_an_exported_shell(monkeypatch):
     ab = _ab()
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT", "2")
     monkeypatch.setenv("SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX", "5")
     for arm in ab.ARMS:
-        want = MISS_CUT if arm == "dspark-both-misscut" else {
+        want = MISS_CUT if arm.endswith("-misscut") else {
             "SGLANG_DSV41_CPU_SPLIT_MISS_CUT": "0", "SGLANG_DSV41_CPU_SPLIT_MISS_CUT_MAX": "3"}
         for overrides in (ab._overrides(arm, "/out"), ab._probe_overrides(arm, "/out")):
             assert {k: overrides[k] for k in want} == want, arm
